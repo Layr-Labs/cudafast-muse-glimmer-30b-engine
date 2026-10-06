@@ -846,7 +846,9 @@ def classify(conclusion, passed, error: str, failed_step: str, have_score: bool,
         return "band_refused"  # box health (control leg drifted), not the submission
     # benchd boots this leg with the label "serial-control" (main.rs boot_leg).
     if e.startswith("LEG-SERVE-BOOT-FAILED: the serial-control leg"):
-        # When paired_legs is present, pair 2's control boot is final (pair 1 sealed).
+        # benchd omits paired_legs while it is empty and always seals the completed
+        # pairs on a boot refusal, so a pair-2 control boot always carries pair 1
+        # and stays final; absent or [] is pair 1, the case measure-and-score retries.
         if paired_legs is not None and len(paired_legs) > 0:
             pass  # fall through to have_score -> refused
         else:

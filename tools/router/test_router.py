@@ -461,6 +461,7 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(c("failure", 0, boot, "", True), "boot_failed")
         ctl_boot = "LEG-SERVE-BOOT-FAILED: the serial-control leg's resident did not boot (1): abcd"
         self.assertEqual(c("failure", 0, ctl_boot, "", True), "control_failed")
+        self.assertEqual(c("failure", 0, ctl_boot, "", True, paired_legs=[]), "control_failed")
         self.assertEqual(
             c("failure", 0, ctl_boot, "", True, paired_legs=[{"pair": 1}]),
             "refused",
