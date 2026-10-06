@@ -3,7 +3,7 @@
   "track_id": "nemotron3.5-lightning-30b-a3b-cuda-v1",
   "track_name": "Nemotron 3.5 Lightning 30B-A3B NVFP4 CUDA -- composite paired speedup",
   "official_scoring_enabled": false,
-  "official_pairs": 2,
+  "official_pairs": 3,
   "runner": {
     "provider": "github-actions",
     "workflow": "benchmark.yml",
@@ -41,330 +41,132 @@
   "timed_replay_off_argmax_per_thousand": 100,
   "vocab_size": 131072,
   "num_hidden_layers": 52,
-  "seed_tokens": 4096,
+  "seed_tokens": 496,
   "golden_model_type": "nemotron_h",
   "decode_steps": 128,
   "token_tolerance_budget": 0.1,
-  "live_golden": "botany",
-  "live_golden_rotation": {
-    "mode": "per_job_random",
-    "pool": [
-      "botany",
-      "beagle",
-      "plutarch",
-      "medicine",
-      "travel",
-      "drama",
-      "essays",
-      "republic"
-    ],
-    "pending": [],
-    "_note": "The scored prompt is drawn per ranked job from `pool` (tools/draw-live-golden.sh). A prompt joins `pool` only after its serial golden and all six per-depth oracles are pinned here and staged, by moving its name from `pending` to `pool`; see docs/pool-refresh-and-final-rescore.md."
-  },
-  "baseline_reference_commit": "3a9a41cc48720394fc50da8f345eb3d5e97fe125",
+  "live_goldens": [
+    "pool-9",
+    "pool-10",
+    "pool-11"
+  ],
+  "baseline_reference_commit": "c726979b9a4e7d351a426e3601fabba56fa9314a",
   "timed_prompt_pool": [
     {
-      "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/beagle.golden.json",
-      "sha256": "e5c5c4d5320a41c075f8e21e48af461bdc07033e58b7c31cc2e4e0700a091d8f",
-      "bytes": 175402
+      "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.golden.json",
+      "sha256": "4c659a7fd2329f3e68821f1c7efc72958ee32d21853eba9480b86fca05362537",
+      "bytes": 27219
     },
     {
-      "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/plutarch.golden.json",
-      "sha256": "d9088f8f31b6f063a32801d1cb3c3c01c2511da0fa7bafd762ba8746ddcdd3f8",
-      "bytes": 174783
+      "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.golden.json",
+      "sha256": "f376bebe9d7a6633392129a08212dd9bc28e80b12383b854b665e30b4713b5b5",
+      "bytes": 26455
     },
     {
-      "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/medicine.golden.json",
-      "sha256": "c62b06b9ba74d8c596e11394fbe5801c81020d2e70866c956e45aa186709badc",
-      "bytes": 175773
-    },
-    {
-      "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/travel.golden.json",
-      "sha256": "4e6f69d5641fb5fd8a8b76308f0eacaf4aeec6640236ee5fcf211e940e6b29cc",
-      "bytes": 174855
-    },
-    {
-      "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/drama.golden.json",
-      "sha256": "9a3444a3ddb242e945f1caa90ddfbd2f15bb5066c6d692cef41db09817ce8ea8",
-      "bytes": 174995
-    },
-    {
-      "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/essays.golden.json",
-      "sha256": "3379132a8b1ea78d597d9b0c06512bd4058ab08a3dc3abc30bacf6b6c11c3428",
-      "bytes": 175108
-    },
-    {
-      "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/botany.golden.json",
-      "sha256": "95a0f23f855a08ae0628a19e283f811d540950fe01fd2993ed67408aee59ebd5",
-      "bytes": 174944
-    },
-    {
-      "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/republic.golden.json",
-      "sha256": "ed507fd794c00bb07149c3ee6b37ba3174f85527cf918148c35fe2644bef41e0",
-      "bytes": 174967
+      "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.golden.json",
+      "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
+      "bytes": 25051
     }
   ],
   "hidden_correctness_golden": {
-    "sha256": "95a0f23f855a08ae0628a19e283f811d540950fe01fd2993ed67408aee59ebd5",
-    "bytes": 174944
+    "sha256": "4c659a7fd2329f3e68821f1c7efc72958ee32d21853eba9480b86fca05362537",
+    "bytes": 27219
   },
-  "calibration_prompt": "botany",
-  "calibration_prompt_note": "Every box calibration band (tools/calibrate-box.sh) is captured on this prompt, and benchd checks the serial-control leg against it whichever pool prompt the job drew. Across the rotation pool, per-token time was measured within 0.5% (decode) and 1.3% (prefill) of this prompt, inside the band (prefill band +/-5%), so one band per box applies.",
   "speculative_oracles": {
-    "botany": {
+    "pool-9": {
       "mtp1": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/botany.mtp1.golden.json",
-        "sha256": "33c706211f4071726a91c7d5e42990a4fd022dbce00389860f10745f06e033b3",
-        "bytes": 174945
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.mtp1.golden.json",
+        "sha256": "41d0353318966ef01b7aeaa539cab24520034088ae3e713571642fec4795da19",
+        "bytes": 27216
       },
       "mtp2": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/botany.mtp2.golden.json",
-        "sha256": "33c706211f4071726a91c7d5e42990a4fd022dbce00389860f10745f06e033b3",
-        "bytes": 174945
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.mtp2.golden.json",
+        "sha256": "41d0353318966ef01b7aeaa539cab24520034088ae3e713571642fec4795da19",
+        "bytes": 27216
       },
       "mtp3": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/botany.mtp3.golden.json",
-        "sha256": "87d2fbf3e462106b433aef4e7b95303e7b82ba30059135bcd753433935d3c0fe",
-        "bytes": 174948
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.mtp3.golden.json",
+        "sha256": "41d0353318966ef01b7aeaa539cab24520034088ae3e713571642fec4795da19",
+        "bytes": 27216
       },
       "mtp4": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/botany.mtp4.golden.json",
-        "sha256": "8df4153b73d7ce4a38c37507cdfef2d484769abe432343c9e5be339ce009fce9",
-        "bytes": 174947
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.mtp4.golden.json",
+        "sha256": "41d0353318966ef01b7aeaa539cab24520034088ae3e713571642fec4795da19",
+        "bytes": 27216
       },
       "mtp5": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/botany.mtp5.golden.json",
-        "sha256": "8df4153b73d7ce4a38c37507cdfef2d484769abe432343c9e5be339ce009fce9",
-        "bytes": 174947
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.mtp5.golden.json",
+        "sha256": "41d0353318966ef01b7aeaa539cab24520034088ae3e713571642fec4795da19",
+        "bytes": 27216
       },
       "mtp6": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/botany.mtp6.golden.json",
-        "sha256": "8df4153b73d7ce4a38c37507cdfef2d484769abe432343c9e5be339ce009fce9",
-        "bytes": 174947
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.mtp6.golden.json",
+        "sha256": "41d0353318966ef01b7aeaa539cab24520034088ae3e713571642fec4795da19",
+        "bytes": 27216
       }
     },
-    "beagle": {
+    "pool-10": {
       "mtp1": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/beagle.mtp1.golden.json",
-        "sha256": "5ef6501b579fb7a624b3d6fee42e7af4a18790dd3e7f00f2b3d45391973d8b63",
-        "bytes": 175400
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.mtp1.golden.json",
+        "sha256": "9cf59219f214dbdfc6406bd2e2995fdca5c8fc9413f641174f22a2ecf5cabdb9",
+        "bytes": 26460
       },
       "mtp2": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/beagle.mtp2.golden.json",
-        "sha256": "5ef6501b579fb7a624b3d6fee42e7af4a18790dd3e7f00f2b3d45391973d8b63",
-        "bytes": 175400
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.mtp2.golden.json",
+        "sha256": "9cf59219f214dbdfc6406bd2e2995fdca5c8fc9413f641174f22a2ecf5cabdb9",
+        "bytes": 26460
       },
       "mtp3": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/beagle.mtp3.golden.json",
-        "sha256": "5ef6501b579fb7a624b3d6fee42e7af4a18790dd3e7f00f2b3d45391973d8b63",
-        "bytes": 175400
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.mtp3.golden.json",
+        "sha256": "9cf59219f214dbdfc6406bd2e2995fdca5c8fc9413f641174f22a2ecf5cabdb9",
+        "bytes": 26460
       },
       "mtp4": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/beagle.mtp4.golden.json",
-        "sha256": "777e43892eea4e51796733c5ddbccac7ede36aa7a597965c940f618b300a1ff3",
-        "bytes": 175398
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.mtp4.golden.json",
+        "sha256": "012d4ace74e0d8f41062252d6ab328f67123708ed931deec92959cc75a111984",
+        "bytes": 26460
       },
       "mtp5": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/beagle.mtp5.golden.json",
-        "sha256": "777e43892eea4e51796733c5ddbccac7ede36aa7a597965c940f618b300a1ff3",
-        "bytes": 175398
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.mtp5.golden.json",
+        "sha256": "012d4ace74e0d8f41062252d6ab328f67123708ed931deec92959cc75a111984",
+        "bytes": 26460
       },
       "mtp6": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/beagle.mtp6.golden.json",
-        "sha256": "777e43892eea4e51796733c5ddbccac7ede36aa7a597965c940f618b300a1ff3",
-        "bytes": 175398
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.mtp6.golden.json",
+        "sha256": "012d4ace74e0d8f41062252d6ab328f67123708ed931deec92959cc75a111984",
+        "bytes": 26460
       }
     },
-    "drama": {
+    "pool-11": {
       "mtp1": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/drama.mtp1.golden.json",
-        "sha256": "c19e7bb8290287130548d850ea8597edf33195c13f8c1c40e816fe9c3b7a40ce",
-        "bytes": 174997
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.mtp1.golden.json",
+        "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
+        "bytes": 25051
       },
       "mtp2": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/drama.mtp2.golden.json",
-        "sha256": "c19e7bb8290287130548d850ea8597edf33195c13f8c1c40e816fe9c3b7a40ce",
-        "bytes": 174997
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.mtp2.golden.json",
+        "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
+        "bytes": 25051
       },
       "mtp3": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/drama.mtp3.golden.json",
-        "sha256": "c19e7bb8290287130548d850ea8597edf33195c13f8c1c40e816fe9c3b7a40ce",
-        "bytes": 174997
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.mtp3.golden.json",
+        "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
+        "bytes": 25051
       },
       "mtp4": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/drama.mtp4.golden.json",
-        "sha256": "2698c8afd697a35026a86a28b01fe5572731de738dc455d959e9087beb88dbdf",
-        "bytes": 174995
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.mtp4.golden.json",
+        "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
+        "bytes": 25051
       },
       "mtp5": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/drama.mtp5.golden.json",
-        "sha256": "2698c8afd697a35026a86a28b01fe5572731de738dc455d959e9087beb88dbdf",
-        "bytes": 174995
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.mtp5.golden.json",
+        "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
+        "bytes": 25051
       },
       "mtp6": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/drama.mtp6.golden.json",
-        "sha256": "4f43121e7f336e4738e1a8e8c5ed35002573b4b650c17cc3645eed898112f1fc",
-        "bytes": 174995
-      }
-    },
-    "essays": {
-      "mtp1": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/essays.mtp1.golden.json",
-        "sha256": "372a8fc16711c4b66e1daa957e8b7676437a06d11c6807a8a54013856af57b79",
-        "bytes": 175111
-      },
-      "mtp2": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/essays.mtp2.golden.json",
-        "sha256": "372a8fc16711c4b66e1daa957e8b7676437a06d11c6807a8a54013856af57b79",
-        "bytes": 175111
-      },
-      "mtp3": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/essays.mtp3.golden.json",
-        "sha256": "372a8fc16711c4b66e1daa957e8b7676437a06d11c6807a8a54013856af57b79",
-        "bytes": 175111
-      },
-      "mtp4": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/essays.mtp4.golden.json",
-        "sha256": "7eb9f8874ec33120d241a05b3e7d6d313789d48c0a42171d38207fdca53f306d",
-        "bytes": 175094
-      },
-      "mtp5": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/essays.mtp5.golden.json",
-        "sha256": "e7eacf9e508a39bc60bcef5fcd0dce0d4f0afcad94f2e6c3816ec5dd43e104ce",
-        "bytes": 175101
-      },
-      "mtp6": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/essays.mtp6.golden.json",
-        "sha256": "e7eacf9e508a39bc60bcef5fcd0dce0d4f0afcad94f2e6c3816ec5dd43e104ce",
-        "bytes": 175101
-      }
-    },
-    "medicine": {
-      "mtp1": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/medicine.mtp1.golden.json",
-        "sha256": "0e9dd1859bd91d6d4561e035b11ce2c626f7c2c41a7c7240f1ea729d3039b109",
-        "bytes": 175768
-      },
-      "mtp2": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/medicine.mtp2.golden.json",
-        "sha256": "0e9dd1859bd91d6d4561e035b11ce2c626f7c2c41a7c7240f1ea729d3039b109",
-        "bytes": 175768
-      },
-      "mtp3": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/medicine.mtp3.golden.json",
-        "sha256": "0e9dd1859bd91d6d4561e035b11ce2c626f7c2c41a7c7240f1ea729d3039b109",
-        "bytes": 175768
-      },
-      "mtp4": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/medicine.mtp4.golden.json",
-        "sha256": "a26a7d3a0dba043981fa8837fc4ceb96582a0ae4faf0f1b2efaa1528a9c141fa",
-        "bytes": 175767
-      },
-      "mtp5": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/medicine.mtp5.golden.json",
-        "sha256": "a26a7d3a0dba043981fa8837fc4ceb96582a0ae4faf0f1b2efaa1528a9c141fa",
-        "bytes": 175767
-      },
-      "mtp6": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/medicine.mtp6.golden.json",
-        "sha256": "a26a7d3a0dba043981fa8837fc4ceb96582a0ae4faf0f1b2efaa1528a9c141fa",
-        "bytes": 175767
-      }
-    },
-    "plutarch": {
-      "mtp1": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/plutarch.mtp1.golden.json",
-        "sha256": "0765360d61745fec717ede1076857a9f8de66429649e2f82e13b7b3cfac236a4",
-        "bytes": 174784
-      },
-      "mtp2": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/plutarch.mtp2.golden.json",
-        "sha256": "5536925da62f63a4e70dc288775e25c0cdbaa218e704f96bf95679a7d1694b45",
-        "bytes": 174791
-      },
-      "mtp3": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/plutarch.mtp3.golden.json",
-        "sha256": "83c8d6eaf25aea9910125f958adcd4061e8107831a240deedca93fc3e9299ee8",
-        "bytes": 174786
-      },
-      "mtp4": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/plutarch.mtp4.golden.json",
-        "sha256": "7ea0eeae563fcfb37e782c7d8e96dcf502fee6b4b8bfe33fae02aa2efbc16871",
-        "bytes": 174788
-      },
-      "mtp5": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/plutarch.mtp5.golden.json",
-        "sha256": "7ea0eeae563fcfb37e782c7d8e96dcf502fee6b4b8bfe33fae02aa2efbc16871",
-        "bytes": 174788
-      },
-      "mtp6": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/plutarch.mtp6.golden.json",
-        "sha256": "9efcb20e7593d2e2604a0896bc61c32021e406e857530b83902a57ec3fe6f978",
-        "bytes": 174792
-      }
-    },
-    "republic": {
-      "mtp1": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/republic.mtp1.golden.json",
-        "sha256": "2551aebb8227e2a1ed0a59bd95c615bcfc2db6fc5c677f80fc219489380f00a9",
-        "bytes": 174968
-      },
-      "mtp2": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/republic.mtp2.golden.json",
-        "sha256": "2551aebb8227e2a1ed0a59bd95c615bcfc2db6fc5c677f80fc219489380f00a9",
-        "bytes": 174968
-      },
-      "mtp3": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/republic.mtp3.golden.json",
-        "sha256": "2551aebb8227e2a1ed0a59bd95c615bcfc2db6fc5c677f80fc219489380f00a9",
-        "bytes": 174968
-      },
-      "mtp4": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/republic.mtp4.golden.json",
-        "sha256": "64ee20d39c5a1187df76d1afaec437ed7f898f233166be35c0dc4afe7b7837ca",
-        "bytes": 174968
-      },
-      "mtp5": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/republic.mtp5.golden.json",
-        "sha256": "50abc5f8b6682e66ebc807fc01cbf9dcec8f9ee0791d0db36cb68f8724971457",
-        "bytes": 174969
-      },
-      "mtp6": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/republic.mtp6.golden.json",
-        "sha256": "50abc5f8b6682e66ebc807fc01cbf9dcec8f9ee0791d0db36cb68f8724971457",
-        "bytes": 174969
-      }
-    },
-    "travel": {
-      "mtp1": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/travel.mtp1.golden.json",
-        "sha256": "5411cfae9ae618af3dd6c9e6d40b5b9c3fc50cc4d6655950974f2e548b80f773",
-        "bytes": 174862
-      },
-      "mtp2": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/travel.mtp2.golden.json",
-        "sha256": "5411cfae9ae618af3dd6c9e6d40b5b9c3fc50cc4d6655950974f2e548b80f773",
-        "bytes": 174862
-      },
-      "mtp3": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/travel.mtp3.golden.json",
-        "sha256": "5411cfae9ae618af3dd6c9e6d40b5b9c3fc50cc4d6655950974f2e548b80f773",
-        "bytes": 174862
-      },
-      "mtp4": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/travel.mtp4.golden.json",
-        "sha256": "0ad56af13cfc170ecefef3ae4af2a62acb33551e1259806f93994bad80d211ed",
-        "bytes": 174870
-      },
-      "mtp5": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/travel.mtp5.golden.json",
-        "sha256": "0ad56af13cfc170ecefef3ae4af2a62acb33551e1259806f93994bad80d211ed",
-        "bytes": 174870
-      },
-      "mtp6": {
-        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/travel.mtp6.golden.json",
-        "sha256": "0ad56af13cfc170ecefef3ae4af2a62acb33551e1259806f93994bad80d211ed",
-        "bytes": 174870
+        "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.mtp6.golden.json",
+        "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
+        "bytes": 25051
       }
     }
   },
@@ -879,6 +681,6 @@
     ]
   },
   "scoring_semantics": {
-    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = baseline_aggregate / candidate_aggregate (serial-anchored -- a faster candidate scores > 1). The run is PAIRED on the box: official_pairs pairs, each one serial-control leg on the organizer-staged reference tree and one candidate leg at the declared draft depth, single-stream, over the SAME live_golden prompt. aggregate = the per-token time summed over the pairs, for prefill and decode separately, per role. Floors and the ceiling apply to the aggregate."
+    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = control / candidate per-token time (serial-anchored -- a faster candidate scores > 1). The run is PAIRED on the box: official_pairs pairs, each one serial-control leg on the organizer-staged reference tree and one candidate leg at the declared draft depth, single-stream. Pair k measures live_goldens[(k - 1) mod N], so each live golden gets the same number of pairs. The score is the pair with the lower-median composite. Floors and the ceiling apply to that pair."
   }
 }

@@ -125,7 +125,12 @@ jq -n --arg c "${BENCHD_COMMIT}" '{sha256: "aa", bytes: 1, source_commit: $c}' \
 FIXTURE="${WORK}/fixture.json"
 jq --arg c "${REF_COMMIT}" '.baseline_reference_commit = $c' \
   "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" > "${FIXTURE}"
-LIVE_GOLDEN="$(jq -r '.calibration_prompt // .live_golden' "${FIXTURE}")"
+mapfile -t LIVE_GOLDENS < <(jq -r '.live_goldens[]' "${FIXTURE}")
+# One --golden/--prompt pair per live golden, in fixture order.
+GOLDEN_NEEDLES=()
+for name in "${LIVE_GOLDENS[@]}"; do
+  GOLDEN_NEEDLES+=("--golden ${WORK}/goldens/${name}.golden.json --prompt ${name}")
+done
 
 # The staged golden pool. The track goldens are organizer material published in
 # R2 and staged on the box, so there is no copy in this checkout to point at:
@@ -134,7 +139,7 @@ LIVE_GOLDEN="$(jq -r '.calibration_prompt // .live_golden' "${FIXTURE}")"
 # benchd's business, and benchd is a stub in this suite.
 GOLDEN_DIR="${WORK}/goldens"
 mkdir -p "${GOLDEN_DIR}"
-echo '{}' > "${GOLDEN_DIR}/${LIVE_GOLDEN}.golden.json"
+for name in "${LIVE_GOLDENS[@]}"; do echo '{}' > "${GOLDEN_DIR}/${name}.golden.json"; done
 
 WEIGHTS="${WORK}/weights"; mkdir -p "${WEIGHTS}"
 LOCK="${WORK}/never-taken.lock"
@@ -173,12 +178,11 @@ DRY_FLAGS=(
   "--baseline-workspace ${WS}"
   "--engine .build/release/mlxfast-runtime-worker"
   "--weights ${WEIGHTS}"
-  "--golden ${GOLDEN_DIR}/${LIVE_GOLDEN}.golden.json"
+  "${GOLDEN_NEEDLES[@]}"
   "--out ${WORK}/out1/baseline-calibration.json"
   "--passes 4"
   "--box ${BOX}"
   "--track nemotron3.5-lightning-30b-a3b-cuda-v1"
-  "--prompt ${LIVE_GOLDEN}"
   "--reference-commit ${REF_COMMIT}"
   "--benchd-source-commit ${BENCHD_COMMIT}"
 )
@@ -222,9 +226,9 @@ run_missing=0
 for needle in "--baseline-workspace ${WS}" \
               "--engine .build/release/mlxfast-runtime-worker" \
               "--weights ${WEIGHTS}" \
-              "--golden ${GOLDEN_DIR}/${LIVE_GOLDEN}.golden.json" \
+              "${GOLDEN_NEEDLES[@]}" \
               "--out ${OUT}" "--passes 4" "--box ${BOX}" \
-              "--track nemotron3.5-lightning-30b-a3b-cuda-v1" "--prompt ${LIVE_GOLDEN}" \
+              "--track nemotron3.5-lightning-30b-a3b-cuda-v1" \
               "--reference-commit ${REF_COMMIT}" \
               "--benchd-source-commit ${BENCHD_COMMIT}"; do
   case "${cal}" in

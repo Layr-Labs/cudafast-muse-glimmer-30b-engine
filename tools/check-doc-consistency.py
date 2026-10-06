@@ -65,7 +65,7 @@ def main() -> int:
     serve_depths = sorted(fixture["serve_configuration"]["depths"])
     need(serve_depths == sorted(["serial"] + [f"mtp{d}" for d in depths]),
          f"fixture: serve_configuration.depths {serve_depths} do not cover serial + every permitted depth")
-    rotation_pool = fixture.get("live_golden_rotation", {}).get("pool", [fixture["live_golden"]])
+    rotation_pool = fixture.get("live_goldens") or fixture.get("live_golden_rotation", {}).get("pool", [fixture.get("live_golden")])
     for prompt in rotation_pool:
         need(sorted(fixture.get("speculative_oracles", {}).get(prompt, {})) == sorted(f"mtp{d}" for d in depths),
              f"fixture: speculative_oracles.{prompt} does not carry exactly one oracle per permitted depth")
@@ -74,6 +74,14 @@ def main() -> int:
         for name in ("TASK.md", "README.md", "docs/participant-contract.md"):
             need("drawn at random" in docs[name],
                  f"{name}: does not say the scored prompt is drawn at random per job (live_golden_rotation)")
+
+    # 2c. Every job measures every live golden; the participant documents say so.
+    if "live_goldens" in fixture:
+        for name in ("TASK.md", "docs/participant-contract.md"):
+            need("every live golden" in docs[name],
+                 f"{name}: does not say every job measures every live golden (live_goldens)")
+            need(f"{fixture['seed_tokens']}-token" in docs[name],
+                 f"{name}: does not state the {fixture['seed_tokens']}-token prompt (seed_tokens)")
 
     # 3. Scoring constants appear in TASK.md and the contract.
     for name in ("TASK.md", "docs/participant-contract.md"):

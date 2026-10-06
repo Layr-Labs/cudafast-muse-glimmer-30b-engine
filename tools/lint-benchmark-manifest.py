@@ -703,9 +703,16 @@ class Linter:
             self.ok(f"contractPath: track_id matches trackId ({m.get('trackId')})")
 
         pool = contract.get("timed_prompt_pool", [])
+        live_goldens = contract.get("live_goldens")
+        if isinstance(live_goldens, list) and live_goldens:
+            # Every job measures every live golden, so the pool is the live goldens.
+            if len(pool) >= len(live_goldens):
+                self.ok(f"contractPath: timed_prompt_pool has {len(pool)} prompts (>= {len(live_goldens)} live goldens)")
+            else:
+                self.fail(f"contractPath: timed_prompt_pool has {len(pool)} prompts, fewer than the {len(live_goldens)} live goldens")
         # At least the original 8; a pool refresh (tools/pool-refresh.sh) pins each
         # new generation of 8 beside them until the old one is retired.
-        if len(pool) >= 8:
+        elif len(pool) >= 8:
             self.ok(f"contractPath: timed_prompt_pool has {len(pool)} prompts (>= 8)")
         else:
             self.fail(f"contractPath: timed_prompt_pool has {len(pool)} prompts, expected at least 8")
@@ -784,6 +791,9 @@ class Linter:
         """
         rotation = contract.get("live_golden_rotation")
         live = contract.get("live_golden")
+        if "live_goldens" in contract:
+            self.check_live_goldens(contract)
+            return
         if rotation is None:
             self.ok("rotation: no live_golden_rotation; the scored prompt is live_golden")
             return
@@ -844,6 +854,69 @@ class Linter:
             self.ok(
                 f"rotation: {len(pool)} pool prompt(s) {pool}, each with a pinned serial golden "
                 f"and {len(depths)} pinned per-depth oracle(s)"
+            )
+
+    def check_live_goldens(self, contract: dict) -> None:
+        """Every live golden is fully pinned, and the pairs cover them evenly.
+
+        Every ranked job measures every name in live_goldens: pair k measures
+        live_goldens[(k - 1) mod N] (tools/nemotron35-measure-and-score.sh), so
+        official_pairs must be a multiple of N. Each name needs a pinned serial
+        golden in timed_prompt_pool and one pinned oracle per permitted draft
+        depth in speculative_oracles.<name>. A job draws nothing, so the rotation
+        keys must be absent.
+        """
+        names = contract.get("live_goldens")
+        if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names):
+            self.fail("live_goldens: must be a non-empty list of names")
+            return
+        if len(set(names)) != len(names):
+            self.fail(f"live_goldens: repeats a name: {names}")
+        for key in ("live_golden_rotation", "live_golden", "calibration_prompt"):
+            if key in contract:
+                self.fail(f"live_goldens: the fixture also declares {key}; every job measures every live golden")
+        pairs = contract.get("official_pairs")
+        if not isinstance(pairs, int) or isinstance(pairs, bool) or pairs < 1 or pairs % len(names):
+            self.fail(f"live_goldens: official_pairs {pairs!r} is not a multiple of the {len(names)} live goldens")
+        serial = {
+            e["r2_path"].rsplit("/", 1)[-1]: e
+            for e in contract.get("timed_prompt_pool", [])
+            if isinstance(e, dict) and isinstance(e.get("r2_path"), str)
+        }
+        depths = contract.get("mtp_head", {}).get("permitted_draft_depths", [])
+        oracles = contract.get("speculative_oracles", {})
+
+        def pinned(e: object) -> bool:
+            return (
+                isinstance(e, dict)
+                and isinstance(e.get("sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", e["sha256"]) is not None
+                and isinstance(e.get("bytes"), int)
+                and e["bytes"] > 0
+            )
+
+        bad = 0
+        for name in names:
+            if not re.fullmatch(r"[a-z0-9_-]+", name):
+                self.fail(f"live_goldens: name '{name}' is not [a-z0-9_-]+")
+                bad += 1
+                continue
+            if not pinned(serial.get(f"{name}.golden.json")):
+                self.fail(f"live_goldens: '{name}' has no pinned serial golden in timed_prompt_pool")
+                bad += 1
+            per = oracles.get(name, {}) if isinstance(oracles, dict) else {}
+            for d in depths:
+                e = per.get(f"mtp{d}") if isinstance(per, dict) else None
+                if not pinned(e) or not str(e.get("r2_path", "")).endswith(f"/{name}.mtp{d}.golden.json"):
+                    self.fail(
+                        f"live_goldens: '{name}' has no pinned oracle "
+                        f"speculative_oracles.{name}.mtp{d} at {name}.mtp{d}.golden.json"
+                    )
+                    bad += 1
+        if not bad:
+            self.ok(
+                f"live_goldens: {len(names)} prompt(s) {names}, each with a pinned serial golden "
+                f"and {len(depths)} pinned per-depth oracle(s); {pairs} pairs"
             )
 
     # -- 5b ----------------------------------------------------------------

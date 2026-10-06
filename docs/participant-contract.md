@@ -251,12 +251,13 @@ gain      = baseline_aggregate / candidate_aggregate
 The run is PAIRED on one box, and the pairs run one after the other, never
 overlapping:
 
-- **Pairs.** A ranked job runs `official_pairs` = 2 pairs.
+- **Pairs.** A ranked job runs `official_pairs` = 3 pairs.
 - **Legs.** Each pair is one SERIAL CONTROL leg on the organizer-staged
   reference tree at `baseline_reference_commit`, then one CANDIDATE leg on the
   submission at its declared depth.
-- **Aggregation.** Per role (prefill, decode), benchd sums each leg's
-  per-token time over the pairs, and each gain is the ratio of the two sums.
+- **Aggregation.** benchd computes one composite per pair. The score is the
+  pair with the lower-median composite, and the floors and the ceiling apply
+  to that pair.
 
 No baseline is stored anywhere; the control leg measures it next to the
 candidate.
@@ -272,7 +273,7 @@ benchd splits its own clock at the verb boundary:
 
 What the engine owes:
 
-1. `free_decode_begin` runs the FULL 4096-token seed prefill with the requested
+1. `free_decode_begin` runs the FULL 496-token seed prefill with the requested
    spec resolved, and replies only after that work has completed. The reply is
    the greedy seed token and the echoed `effective_spec`.
 2. `free_decode_run` never re-prefills. It decodes from the state `begin` left.
@@ -289,40 +290,38 @@ The seed token's index: `seed_token` is `expected_decode_seed_token`;
 
 | Quantity | Value |
 |---|---|
-| Seed tokens per stream | 4096 |
+| Seed tokens per stream | 496 |
 | Unmeasured prefill warm-up passes before the timed prefill | 1 (same prompt, same phase, computed in full) |
 | Timed prefill passes per phase | 5; the phase's prefill time is their median |
 | Checked decode steps | 128 |
-| Golden shape | 4096 `prompt_tokens` and 1024 `expected_tokens` per case, plus the free-run `benchmark` block |
+| Golden shape | 496 `prompt_tokens` and an answer of at most 1024 `expected_tokens` per case (the answer ends at the first end-of-turn token), plus the free-run `benchmark` block |
 | Streams per window | 1 |
-| Timed prompts per leg | 1, drawn at random per ranked job from `live_golden_rotation.pool` (section 5.2.1) |
-| Prompts in the pinned correctness pool | 8 |
-| Pairs per ranked job | 2 |
-| Legs per ranked job | 4 |
+| Timed prompts per leg | 1; pair k measures `live_goldens[(k - 1) mod 3]` (section 5.2.1) |
+| Prompts in the pinned correctness pool | 3 |
+| Pairs per ranked job | 3 |
+| Legs per ranked job | 6 |
 
 Every timed phase waits behind benchd's GPU cool-down gate. The ranked job
 waits for the box to go quiescent first, and refuses to run with no
 temperature reader.
 
-### 5.2.1 The scored prompt is drawn per job
+### 5.2.1 Every job measures every live golden
 
-The scored prompt is drawn at random per ranked job from the fixture's
-`live_golden_rotation.pool`, a subset of the hidden pool. The workflow draws it
-after `./setup.sh`, from `/dev/urandom`, and keeps it in a runner-private file
-your code cannot read. Both legs of every pair in the job measure that one
-prompt, so the ratio compares like with like and scores stay comparable across
-jobs. `score.json` never names the prompt; it identifies the golden only by its
-sha256 (`metrics.baseline_golden_sha256`). The
-fixture's `live_golden` is the default, used when no rotation is declared.
+The fixture's `live_goldens` lists three hidden coding prompts. Each one is a
+user message rendered through the pinned `chat_template.jinja` with thinking
+off, and is exactly `seed_tokens` long. Every job measures every live golden:
+pair k measures `live_goldens[(k - 1) mod 3]`, and both legs of a pair measure
+the same prompt, so the ratio compares like with like. The score is the pair
+with the lower-median composite. `score.json` never names a prompt; it
+identifies a golden only by its sha256.
 
-Why: submissions are unlimited and your engine sees the prompt at run time. A
-fixed scored prompt is one target that many runs could reconstruct; a drawn
-one is not. Every pool prompt carries its own serial golden and one timed
-oracle per draft depth, and benchd refuses a pool prompt that lacks any of
-them.
+Why: one pair per prompt makes the score depend on all three prompts, and the
+lower median keeps one slow or fast prompt from deciding the score alone.
+Every live golden carries its own serial golden and one timed oracle per draft
+depth, and the run refuses a declared depth that has no oracle.
 
-The per-box calibration band is captured on the fixture's
-`calibration_prompt` and gates the control leg whichever prompt was drawn.
+The per-box calibration file carries one band per live golden, and benchd
+gates each control leg with the band of the prompt that leg measured.
 
 ### 5.3 The parameters
 
@@ -456,7 +455,7 @@ cannot change.
 | Object | Where it lives | Can you have it? |
 |---|---|---|
 | `correctness_prompts/public_longcopy_gate_english_4096.txt` | git | Yes: the public prompt text |
-| `correctness_prompts/public-longcopy-gate-english-4096.golden.json` | git | Yes: for local runs |
+| `correctness_prompts/public-longcopy-gate-english-496.golden.json` | git | Yes: for local runs |
 | `timed_prompt_pool[]`, 8 tapes | organizer storage, staged on the box | No |
 | `speculative_oracles{}`, 6 per-depth oracles per pool prompt | organizer storage, staged on the box | No |
 | `hidden_correctness_golden` | the default live golden's serial tape, pinned by digest | No |
@@ -467,9 +466,8 @@ file's byte count and sha256 against its pin before a ranked run. The fixture's
 
 ### 5.7 Pool refresh and final ranking
 
-- **Per job.** Each ranked job scores one prompt drawn at random from the live
-  pool (section 5.2.1).
-- **Refresh.** The live pool is replaced by prompts no submission has seen
+- **Per job.** Each ranked job measures every live golden (section 5.2.1).
+- **Refresh.** The live goldens are replaced by prompts no submission has seen
   every 3 to 4 days during the contest.
 - **Submissions** are unlimited.
 - **Final ranking.** At the close, each team's best submission is taken: the

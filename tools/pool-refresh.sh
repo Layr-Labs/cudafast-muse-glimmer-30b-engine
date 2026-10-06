@@ -13,9 +13,10 @@
 #   stage    install the 56 goldens next to the current ones on every box
 #            (root:bench 0640), verified by sha256; every install is logged to
 #            .mlxfast-private/refresh/staging.log first
-#   pin      edit the fixture: pin the generation, point live_golden_rotation.pool
-#            (and live_golden / hidden_correctness_golden) at it; calibration_prompt
-#            is left alone. Prints the commit and push commands; pushes nothing
+#   pin      edit the fixture: pin the generation and make it live_goldens (and
+#            hidden_correctness_golden). official_pairs must already be a multiple
+#            of the generation size, because every job measures every live golden.
+#            Prints the commit and push commands; pushes nothing
 #   verify   once the pin is on origin/main: every box holds every pinned golden
 #            with matching sha256 and nothing unpinned (REFRESH_PREFLIGHT_CMD, if
 #            set, is also run on each box from its checkout at origin/main)
@@ -52,8 +53,9 @@ COUNT=8
 
 # pin_fixture FIXTURE LABEL PINS_JSON -- pin <label>-<n>.golden.json and
 # <label>-<n>.mtp<d>.golden.json from PINS_JSON ({file: {sha256, bytes}}) and
-# make that generation the rotation pool, the default live golden and the hidden
-# correctness golden. Refuses a prompt missing its serial golden or any depth.
+# make that generation the live_goldens and the hidden correctness golden.
+# Refuses a prompt missing its serial golden or any depth, and an official_pairs
+# that is not a multiple of the generation size.
 pin_fixture() {
   local fx="$1" label="$2" pins="$3" out
   out="$(jq --slurpfile p "${pins}" --arg label "${label}" '
@@ -70,9 +72,11 @@ pin_fixture() {
     | reduce ($p | to_entries[] | select(.key | test("^" + $label + "-[0-9]+\\.mtp[0-9]+\\.golden\\.json$"))) as $o (.;
         ($o.key | split(".")) as $k
         | .speculative_oracles[$k[0]][$k[1]] = ({r2_path: "\($prefix)/\($o.key)"} + $o.value))
-    | .live_golden_rotation.pool = $names
-    | .live_golden_rotation.pending = ((.live_golden_rotation.pending // []) - $names)
-    | .live_golden = $names[0]
+    | if (.official_pairs % ($names | length)) != 0
+      then error("official_pairs \(.official_pairs) is not a multiple of the \($names | length) prompts of \($label); every job measures every live golden, so set official_pairs first")
+      else . end
+    | .live_goldens = $names
+    | del(.live_golden, .live_golden_rotation, .calibration_prompt)
     | .hidden_correctness_golden = $p["\($names[0]).golden.json"]' "${fx}")" \
     || die "pin-fixture: refused (above)"
   printf '%s\n' "${out}" > "${fx}.tmp" && mv "${fx}.tmp" "${fx}"
@@ -306,8 +310,8 @@ step_verify() {
   [[ "${DRY}" == 1 ]] && { log "would verify every box against origin/main's fixture"; return; }
   local fx="${GEN}/origin-fixture.json" box
   origin_fixture "${fx}"
-  jq -e --argjson n "$(printf '%s\n' "${NAMES[@]}" | jq -R . | jq -s .)" '.live_golden_rotation.pool == $n' "${fx}" >/dev/null \
-    || die "verify: origin/main's rotation pool is not ${LABEL} yet; push the pin commit first"
+  jq -e --argjson n "$(printf '%s\n' "${NAMES[@]}" | jq -R . | jq -s .)" '.live_goldens == $n' "${fx}" >/dev/null \
+    || die "verify: origin/main's live_goldens are not ${LABEL} yet; push the pin commit first"
   for box in "${BOXES[@]}"; do
     check_box_against "${fx}" "${box}"
     if [[ -n "${REFRESH_PREFLIGHT_CMD:-}" ]]; then
@@ -325,8 +329,8 @@ step_retire() {
   [[ "${LABEL}" != final ]] || die "final is not a contest generation; nothing to retire"
   is_done retired && { log "retire: done"; return; }
   local re="^${LABEL}-[0-9]+(\\.mtp[0-9]+)?\\.golden\\.json\$"
-  jq -e --arg l "${LABEL}-" 'any(.live_golden_rotation.pool[]; startswith($l))' "${FIXTURE}" >/dev/null \
-    && die "retire: ${LABEL} is still the rotation pool; refresh to the next generation first"
+  jq -e --arg l "${LABEL}-" 'any(.live_goldens[]?; startswith($l))' "${FIXTURE}" >/dev/null \
+    && die "retire: ${LABEL} is still the live goldens; refresh to the next generation first"
   if jq -e --arg re "${re}" 'any(.timed_prompt_pool[]; .r2_path | split("/")[-1] | test($re))' "${FIXTURE}" >/dev/null; then
     [[ "${DRY}" == 1 ]] && { log "would unpin ${LABEL} from ${FIXTURE}"; return; }
     jq --arg re "${re}" --arg l "${LABEL}-" '

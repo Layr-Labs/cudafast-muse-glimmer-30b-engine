@@ -33,7 +33,7 @@ Every point links to the document that has the detail.
    - the static review (byte caps, surface);
    - the box preflight (staged assets, pins, no credentials);
    - the engine build, inside the sandbox.
-3. **Measurement.** benchd (the pinned, trusted measurement binary) runs 2
+3. **Measurement.** benchd (the pinned, trusted measurement binary) runs 3
    pairs. Each pair is a trusted serial-control leg, then the candidate leg,
    on the same box and the same prompt.
 4. **Result.** benchd seals `score.json` during measurement. After sandbox
@@ -94,11 +94,11 @@ Every point links to the document that has the detail.
   sealed no valid score is the team's failure, never infrastructure.
   - **Why:** otherwise a team could print a fake score line to void any run it
     did not like.
-- **Hidden, rotating prompts.** Each ranked job scores one prompt drawn at
-  random from a live pool of 8.
+- **Hidden, rotating prompts.** Each ranked job measures every live golden:
+  three hidden coding prompts, one pair per prompt.
   - The pool is replaced every 3–4 days.
-  - New prompts are stitched from paragraphs of at least 4 different books,
-    so a leaked fragment does not identify a prompt.
+  - Each prompt is a coding task, rendered as a user message in the model's
+    own chat template.
   - **Why:** a prompt learned through timing side channels, and hard-coded,
     loses its value within days.
 - **Final re-score.**

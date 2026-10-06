@@ -100,7 +100,7 @@ verifies it.
 
 This command boots a resident for your declared depth. It then runs benchd's
 local-iterate leg over the public golden,
-`correctness_prompts/public-longcopy-gate-english-4096.golden.json`, which the
+`correctness_prompts/public-longcopy-gate-english-496.golden.json`, which the
 organizer recorded on a Spark. A local run seals `score: null`: only the paired
 ranked path produces a score.
 
@@ -164,10 +164,9 @@ two jobs:
    runs these steps in order:
    - `tools/ranked-box-preflight.sh`
    - `./setup.sh`
-   - `tools/draw-live-golden.sh`: the scored prompt is drawn at random for
-     this job from the fixture's `live_golden_rotation.pool`, from
-     `/dev/urandom`, into a runner-private file. Both legs of every pair
-     measure it; `score.json` identifies it only by the golden's sha256.
+   - `tools/draw-live-golden.sh`: the fixture declares `live_goldens`, so
+     nothing is drawn. Every job measures every live golden, one pair per
+     prompt; `score.json` identifies a golden only by its sha256.
    - under the box-wide GPU lock and a quiescence wait,
      `tools/nemotron35-measure-and-score.sh`, which execs
      `benchd iterate --mode official` and seals `score.json`

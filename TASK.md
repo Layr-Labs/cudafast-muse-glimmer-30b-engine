@@ -112,19 +112,19 @@ gain      = baseline_aggregate / candidate_aggregate
 
 The score is serial-anchored, so a faster candidate scores above 1.
 
-- **Pairs.** A ranked run measures 2 pairs on one box in one job. Each pair is
+- **Pairs.** A ranked run measures 3 pairs on one box in one job. Each pair is
   one serial-control leg on the organizer-staged reference tree, then one
   candidate leg at your declared depth.
-- **Workload.** Every leg is single-stream: a 4096-token seed (one unmeasured
+- **Workload.** Every leg is single-stream: a 496-token prompt (one unmeasured
   warm-up prefill, then five timed prefills of the same prompt, scored by their
-  median) and a 128-step
-  decode, on one prompt from the hidden pool. The scored prompt is
-  drawn at random per ranked job from the fixture's
-  `live_golden_rotation.pool`, and both legs of every pair measure that same
-  prompt, so the ratio stays comparable. `score.json` records which prompt was
-  drawn.
-- **Aggregation.** Per role, the per-token times are summed over the pairs, and
-  each gain is the ratio of the two sums.
+  median) and a 128-step decode. The prompts are the fixture's `live_goldens`:
+  three hidden coding prompts. Each one is a user message in the model's own
+  chat template, with thinking off.
+- **Every job measures every live golden.** Pair k measures prompt
+  (k - 1) mod 3. Both legs of a pair measure the same prompt, so the ratio
+  stays comparable.
+- **Aggregation.** Each pair has its own composite. The score is the pair with
+  the lower-median composite.
 - **Bounds.** Both floors are 0.95, so a candidate that regresses prefill or
   decode by more than 5 percent is refused. The ceiling is 5.0.
 - **Correctness.** The per-stream token-tolerance gate prices divergence from
@@ -136,9 +136,9 @@ The score is serial-anchored, so a faster candidate scores above 1.
 
 ## Ranking
 
-- **Each ranked job scores one prompt** drawn at random from the live pool.
-- **The live pool is replaced every 3 to 4 days** by prompts no submission has
-  seen.
+- **Each ranked job measures every live golden** (one pair per prompt).
+- **The live goldens are replaced every 3 to 4 days** by prompts no submission
+  has seen.
 - **Submissions are unlimited.**
 - **The final ranking is a re-measurement.** At the close, each team's best
   submission is taken: the mean contest score counts every run that scored or

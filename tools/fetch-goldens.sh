@@ -95,7 +95,7 @@ must stay that way -- keep it in your .env, never in a file you commit.
 NO PUBLIC GOLDEN IS PINNED FOR THIS TRACK YET, so there is currently nothing a
 participant should be fetching with this. The correctness golden local runs
 already use is checked into the clone at
-correctness_prompts/public-longcopy-gate-english-4096.golden.json.
+correctness_prompts/public-longcopy-gate-english-496.golden.json.
 
 THE HIDDEN GUARD: every pin in fixtures/nemotron35_lightning_30b_a3b_track.json (the
 timed_prompt_pool tapes, the per-depth oracles and hidden_correctness_golden)
@@ -245,7 +245,7 @@ If you are the organizer staging a box, use --all --out DIR, which stages the
 whole pinned set (credentials are required as well); --allow-hidden lifts this
 refusal for one object. If you are looking for a golden to iterate against
 locally, the checked-in one is
-correctness_prompts/public-longcopy-gate-english-4096.golden.json -- no fetch
+correctness_prompts/public-longcopy-gate-english-496.golden.json -- no fetch
 needed.
 EOF
   exit 1

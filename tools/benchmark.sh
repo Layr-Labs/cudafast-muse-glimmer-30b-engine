@@ -143,7 +143,7 @@ selected implicitly. For a local run, use a checked-in public fixture --
 The public golden for this track is recorded on a DGX Spark from the
 reference tree with the pinned tokenizer and engine:
 
-  correctness_prompts/public-longcopy-gate-english-4096.golden.json
+  correctness_prompts/public-longcopy-gate-english-496.golden.json
 
 (tools/local-baseline.sh uses it by default; its source text is
 correctness_prompts/public_longcopy_gate_english_4096.txt).

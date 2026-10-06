@@ -474,9 +474,12 @@ jobs:
           } >> "${GITHUB_ENV}"
 
       - name: Draw the scored prompt (per job, /dev/urandom, runner-private)
-        # The scored prompt is drawn per ranked job from the fixture's
-        # live_golden_rotation.pool, uniformly, from /dev/urandom -- never from a
-        # run id, a sha or anything a participant sees. It is drawn AFTER Setup,
+        # A fixture that declares live_goldens measures every live golden in
+        # every job, so the draw prints nothing and the measurement refuses a
+        # non-empty choice. Otherwise the scored prompt is drawn per ranked job
+        # from the fixture's live_golden_rotation.pool, uniformly, from
+        # /dev/urandom -- never from a run id, a sha or anything a participant
+        # sees. It is drawn AFTER Setup,
         # so no participant build step runs while it exists, and it is kept in
         # RUNNER_TEMP (0600; the sandbox step denies nemosub RUNNER_TEMP). Both
         # legs of every pair of this job measure the one name drawn here, and

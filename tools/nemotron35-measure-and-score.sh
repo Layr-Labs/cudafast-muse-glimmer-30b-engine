@@ -15,7 +15,7 @@
 # inside its own archive.
 #
 # PAIRED, WITH A PER-BOX BASELINE (contract §5.1). The scored model is TWO
-# LEGS on the SAME box in the SAME job, over the ONE live golden:
+# LEGS on the SAME box in the SAME job, over ONE live golden per pair:
 #
 #   leg 1  the SERIAL CONTROL, on the organizer-staged REFERENCE tree
 #          (--baseline-workspace), speculation off, always;
@@ -30,10 +30,9 @@
 # only -- benchd refuses the run when leg 1 lands outside this box's band -- and
 # it is never divided by.
 #
-# The LIVE golden is read FROM the fixture, never hardcoded: the fixture's
-# `live_golden` names the default, `live_golden_rotation` (when declared) the
-# pool the ranked workflow draws this job's prompt from, and the prompt's
-# `timed_prompt_pool[]` entry pins it ({sha256, bytes}). The pins are forwarded to benchd as
+# The LIVE goldens are read FROM the fixture, never hardcoded: the fixture's
+# `live_goldens` lists them, pair k measures golden (k - 1) mod N, and each
+# prompt's `timed_prompt_pool[]` entry pins it ({sha256, bytes}). The pins are forwarded to benchd as
 # --golden-sha256/--golden-bytes, which re-verifies the raw bytes BEFORE parse
 # and refuses on any mismatch (the integrity pin). --contract carries the arm
 # gate: benchd refuses, pre-GPU, to seal an official artifact unless the fixture
@@ -64,16 +63,12 @@
 #                                     denominator. Written by tools/calibrate-box.sh.
 #                                     REQUIRED on a real run; refused by name when
 #                                     unset.
-#   MLXFAST_LIVE_GOLDEN_CHOICE        The prompt the ranked workflow drew for this
-#                                     job (tools/draw-live-golden.sh). REQUIRED on
-#                                     a real run when the fixture declares
-#                                     live_golden_rotation, and refused unless it
-#                                     is in live_golden_rotation.pool. Forwarded
-#                                     to benchd as --live-prompt, which re-resolves
-#                                     its pins from the fixture and seals the name.
+#   MLXFAST_LIVE_GOLDEN_CHOICE        Must be unset or empty: every job measures
+#                                     every live golden, so a drawn prompt is
+#                                     refused by name.
 #   MLXFAST_NEMOTRON35_GOLDEN_DIR         Directory holding the staged timed-pool
-#                                     golden files. The LIVE golden is resolved
-#                                     from it as <live_golden>.golden.json (the
+#                                     golden files. Each live golden is resolved
+#                                     from it as <name>.golden.json (the
 #                                     basename of the fixture entry's r2_path).
 #                                     Box-only, staged out of band and
 #                                     pin-verified by tools/ranked-box-preflight.sh.
@@ -122,7 +117,7 @@ for arg in "$@"; do
   esac
 done
 
-# jq is required for reading the fixture (live_golden + pins) and the trackId.
+# jq is required for reading the fixture (live_goldens + pins) and the trackId.
 if ! command -v jq >/dev/null 2>&1; then
   echo "nemotron35-measure-and-score.sh: jq is required (it reads the fixture pins and trackId)." >&2
   exit 1
@@ -175,65 +170,31 @@ fi
 export MLXFAST_QWEN_MTP_TRACK_ID="${MANIFEST_TRACK_ID}"
 
 # ---------------------------------------------------------------------------
-# THE LIVE GOLDEN + ITS PIN, read FROM the fixture (never hardcoded). The
-# fixture's `live_golden` names the DEFAULT prompt. When the fixture declares
-# `live_golden_rotation`, the scored prompt is instead the one the ranked
-# workflow drew for THIS job (tools/draw-live-golden.sh, /dev/urandom), handed
-# in as MLXFAST_LIVE_GOLDEN_CHOICE; it must be a member of
-# live_golden_rotation.pool. Both legs of every pair measure that one prompt.
-# Its timed_prompt_pool[] entry -- matched by the basename of its r2_path
-# (<name>.golden.json) -- carries the {sha256, bytes} pin.
-DEFAULT_LIVE_GOLDEN="$(jq -r '.live_golden // empty' "${CONTRACT}")"
-CHOICE="${MLXFAST_LIVE_GOLDEN_CHOICE:-}"
-if [[ "$(jq -r 'has("live_golden_rotation")' "${CONTRACT}")" == "true" ]]; then
-  if [[ -z "${CHOICE}" ]]; then
-    if [[ "${PREFLIGHT_ONLY}" != "1" ]]; then
-      echo "nemotron35-measure-and-score.sh: the fixture declares live_golden_rotation but MLXFAST_LIVE_GOLDEN_CHOICE is unset; the ranked workflow draws the scored prompt per job (tools/draw-live-golden.sh). Refusing rather than scoring a prompt nobody drew." >&2
-      exit 1
-    fi
-    CHOICE="${DEFAULT_LIVE_GOLDEN}"
-  fi
-  if ! jq -e --arg c "${CHOICE}" '.live_golden_rotation.pool // [] | index($c) != null' "${CONTRACT}" >/dev/null; then
-    echo "nemotron35-measure-and-score.sh: MLXFAST_LIVE_GOLDEN_CHOICE='${CHOICE}' is not in live_golden_rotation.pool ($(jq -c '.live_golden_rotation.pool' "${CONTRACT}")); refusing." >&2
-    exit 1
-  fi
-  LIVE_GOLDEN_NAME="${CHOICE}"
-else
-  # No rotation: live_golden, exactly as before rotation existed.
-  if [[ -n "${CHOICE}" && "${CHOICE}" != "${DEFAULT_LIVE_GOLDEN}" ]]; then
-    echo "nemotron35-measure-and-score.sh: MLXFAST_LIVE_GOLDEN_CHOICE='${CHOICE}' but the fixture declares no live_golden_rotation; the only scored prompt is live_golden '${DEFAULT_LIVE_GOLDEN}'. Refusing." >&2
-    exit 1
-  fi
-  LIVE_GOLDEN_NAME="${DEFAULT_LIVE_GOLDEN}"
-fi
-if [[ -z "${LIVE_GOLDEN_NAME}" ]]; then
-  echo "nemotron35-measure-and-score.sh: fixture declares no live_golden; there is no golden to score over." >&2
+# THE LIVE GOLDENS + THEIR PINS, read FROM the fixture (never hardcoded). The
+# fixture's `live_goldens` lists the prompts this track scores, in order. Each
+# name's timed_prompt_pool[] entry -- matched by the basename of its r2_path
+# (<name>.golden.json) -- carries the {sha256, bytes} pin. A change to the list
+# needs no edit here.
+#
+# benchd measures the pairs in turn: pair k measures golden (k - 1) mod N, so
+# official_pairs is a multiple of N and every live golden gets the same number
+# of pairs. The score is the lower-median pair. Every golden flag below is
+# repeated once per live golden, in fixture order, and benchd matches the flags
+# by position.
+#
+# NO PROMPT IS DRAWN. Every job measures every live golden, so a prompt choice
+# handed in by the workflow (MLXFAST_LIVE_GOLDEN_CHOICE) is refused: it would
+# name one prompt where the run measures all of them.
+if [[ -n "${MLXFAST_LIVE_GOLDEN_CHOICE:-}" ]]; then
+  echo "nemotron35-measure-and-score.sh: MLXFAST_LIVE_GOLDEN_CHOICE='${MLXFAST_LIVE_GOLDEN_CHOICE}' is set, but every job measures every live golden ($(jq -c '.live_goldens' "${CONTRACT}")); refusing." >&2
   exit 1
 fi
-
-LIVE_GOLDEN_BASENAME="${LIVE_GOLDEN_NAME}.golden.json"
-# The pool entry whose r2_path ends in /<live_golden>.golden.json. Its pin is the
-# integrity pin forwarded to benchd.
-live_golden_entry="$(jq -c --arg base "/${LIVE_GOLDEN_BASENAME}" \
-  'first(.timed_prompt_pool[] | select(.r2_path | endswith($base)))' "${CONTRACT}")"
-if [[ -z "${live_golden_entry}" || "${live_golden_entry}" == "null" ]]; then
-  echo "nemotron35-measure-and-score.sh: live_golden '${LIVE_GOLDEN_NAME}' has no timed_prompt_pool entry (looked for an r2_path ending in /${LIVE_GOLDEN_BASENAME})." >&2
-  exit 1
-fi
-LIVE_GOLDEN_SHA256="$(printf '%s' "${live_golden_entry}" | jq -r '.sha256 // empty')"
-LIVE_GOLDEN_BYTES="$(printf '%s' "${live_golden_entry}" | jq -r '.bytes // empty')"
-
-# THE SERIAL GOLDEN, kept aside before any per-depth override below. The
-# serial-control leg (leg 1) is serial by construction, so benchd verifies it
-# against THIS tape (--control-golden); the per-depth tape is the candidate
-# leg's oracle only. On the MLX engine the depth-1 tape forks from the serial
-# tape at step 1, so a control leg checked against it dies at step 1.
-SERIAL_GOLDEN_BASENAME="${LIVE_GOLDEN_BASENAME}"
-SERIAL_GOLDEN_SHA256="${LIVE_GOLDEN_SHA256}"
-SERIAL_GOLDEN_BYTES="${LIVE_GOLDEN_BYTES}"
-if ! printf '%s' "${LIVE_GOLDEN_SHA256}" | grep -Eq '^[0-9a-f]{64}$' \
-  || ! printf '%s' "${LIVE_GOLDEN_BYTES}" | grep -Eq '^[1-9][0-9]*$'; then
-  echo "nemotron35-measure-and-score.sh: live_golden '${LIVE_GOLDEN_NAME}' is unarmed or malformed (sha256='${LIVE_GOLDEN_SHA256}', bytes='${LIVE_GOLDEN_BYTES}'); nothing can be pin-verified against it." >&2
+LIVE_GOLDEN_NAMES=()
+while IFS= read -r name; do
+  LIVE_GOLDEN_NAMES+=("${name}")
+done < <(jq -r '(.live_goldens // [])[]' "${CONTRACT}")
+if [[ ${#LIVE_GOLDEN_NAMES[@]} -eq 0 ]]; then
+  echo "nemotron35-measure-and-score.sh: fixture declares no live_goldens; there is no golden to score over." >&2
   exit 1
 fi
 
@@ -241,49 +202,73 @@ fi
 # declared speculative spec, and a free-run trajectory forks from the serial one
 # at near-tie argmaxes (docs/participant-contract.md section 11.4(c)). So the
 # timed oracle must be authored under the SAME spec the leg replays: the serial
-# golden resolved above is the launch reference (MTP-0), and each permitted MTP
-# draft depth has its OWN golden. The spec label is derived through the one
-# trusted deriver that ALSO boots the serve (tools/spec-declaration.sh describe
-# -> serial|mtp1..mtp6), so the oracle can never disagree with the draft
-# depth that actually ran. This overrides ONLY the timed-oracle file and its pin;
-# the correctness gate is untouched, because every per-depth golden carries the
+# golden is the launch reference (MTP-0), and each permitted MTP draft depth has
+# its OWN golden per prompt. The spec label is derived through the one trusted
+# deriver that ALSO boots the serve (tools/spec-declaration.sh describe ->
+# serial|mtp1..mtp6), so the oracle can never disagree with the draft depth
+# that actually ran. This overrides ONLY the timed-oracle file and its pin; the
+# correctness gate is untouched, because every per-depth golden carries the
 # SAME serial cases[] oracle, so token fidelity is still measured against serial.
+#
+# A declared depth with no speculative_oracles.<prompt>.<label> entry is
+# REFUSED: there is no timed oracle authored for it, and scoring it against the
+# serial oracle would fail at step 0.
 SPEC_DESC="$("${SCRIPT_DIR}/tools/spec-declaration.sh" describe)"
-if [[ "${SPEC_DESC}" != "serial" ]]; then
-  # speculative_oracles.<prompt> maps a spec label to that prompt's per-depth
-  # golden's {r2_path, sha256, bytes}. A declared depth with no entry is REFUSED -- there
-  # is no timed oracle authored for it, and scoring it against the serial oracle
-  # would fail at step 0 (the very divergence this map exists to resolve). The
-  # depth is already envelope-checked by spec-declaration.sh; this is the
-  # oracle-existence half of the same fail-closed posture.
-  spec_entry="$(jq -c --arg n "${LIVE_GOLDEN_NAME}" --arg k "${SPEC_DESC}" '.speculative_oracles[$n][$k] // empty' "${CONTRACT}")"
-  if [[ -z "${spec_entry}" || "${spec_entry}" == "null" ]]; then
-    echo "nemotron35-measure-and-score.sh: declared spec '${SPEC_DESC}' has no speculative_oracles['${LIVE_GOLDEN_NAME}'] entry in ${CONTRACT}; no timed oracle is authored for that prompt at that draft depth. Refusing rather than scoring it against the serial oracle." >&2
-    exit 1
-  fi
-  LIVE_GOLDEN_BASENAME="$(printf '%s' "${spec_entry}" | jq -r '.r2_path // empty')"
-  LIVE_GOLDEN_BASENAME="${LIVE_GOLDEN_BASENAME##*/}"
-  LIVE_GOLDEN_SHA256="$(printf '%s' "${spec_entry}" | jq -r '.sha256 // empty')"
-  LIVE_GOLDEN_BYTES="$(printf '%s' "${spec_entry}" | jq -r '.bytes // empty')"
-  if ! printf '%s' "${LIVE_GOLDEN_SHA256}" | grep -Eq '^[0-9a-f]{64}$' \
-    || ! printf '%s' "${LIVE_GOLDEN_BYTES}" | grep -Eq '^[1-9][0-9]*$' \
-    || [[ -z "${LIVE_GOLDEN_BASENAME}" || "${LIVE_GOLDEN_BASENAME}" != *.golden.json ]]; then
-    echo "nemotron35-measure-and-score.sh: speculative_oracles['${LIVE_GOLDEN_NAME}']['${SPEC_DESC}'] is unarmed or malformed (file='${LIVE_GOLDEN_BASENAME}', sha256='${LIVE_GOLDEN_SHA256}', bytes='${LIVE_GOLDEN_BYTES}')." >&2
-    exit 1
-  fi
-  echo "nemotron35-measure-and-score.sh: declared spec ${SPEC_DESC}; timed oracle is ${LIVE_GOLDEN_BASENAME} (sha256 ${LIVE_GOLDEN_SHA256}, ${LIVE_GOLDEN_BYTES} bytes)" >&2
-fi
 
-# ---------------------------------------------------------------------------
-# The LIVE golden FILE, resolved from the existing box staging convention:
-# MLXFAST_NEMOTRON35_GOLDEN_DIR holds the staged pool, and the live golden is
-# <live_golden>.golden.json within it. The goldens are box-only, staged out of
-# band and pin-verified by tools/ranked-box-preflight.sh.
+# For each live golden: the timed oracle the candidate leg verifies against
+# (the serial tape, or the per-depth oracle), and the serial tape the
+# serial-control leg verifies against (--control-golden).
+GOLDEN_BASENAMES=()
+GOLDEN_SHA256S=()
+GOLDEN_BYTES_LIST=()
+SERIAL_GOLDEN_BASENAMES=()
+SERIAL_GOLDEN_SHA256S=()
+SERIAL_GOLDEN_BYTES_LIST=()
+for name in "${LIVE_GOLDEN_NAMES[@]}"; do
+  serial_base="${name}.golden.json"
+  pool_entry="$(jq -c --arg base "/${serial_base}" \
+    'first(.timed_prompt_pool[] | select(.r2_path | endswith($base)))' "${CONTRACT}")"
+  if [[ -z "${pool_entry}" || "${pool_entry}" == "null" ]]; then
+    echo "nemotron35-measure-and-score.sh: live golden '${name}' has no timed_prompt_pool entry (looked for an r2_path ending in /${serial_base})." >&2
+    exit 1
+  fi
+  serial_sha="$(printf '%s' "${pool_entry}" | jq -r '.sha256 // empty')"
+  serial_bytes="$(printf '%s' "${pool_entry}" | jq -r '.bytes // empty')"
+  timed_base="${serial_base}" timed_sha="${serial_sha}" timed_bytes="${serial_bytes}"
+  if [[ "${SPEC_DESC}" != "serial" ]]; then
+    spec_entry="$(jq -c --arg n "${name}" --arg k "${SPEC_DESC}" '.speculative_oracles[$n][$k] // empty' "${CONTRACT}")"
+    if [[ -z "${spec_entry}" || "${spec_entry}" == "null" ]]; then
+      echo "nemotron35-measure-and-score.sh: declared spec '${SPEC_DESC}' has no speculative_oracles['${name}'] entry in ${CONTRACT}; no timed oracle is authored for that prompt at that draft depth. Refusing rather than scoring it against the serial oracle." >&2
+      exit 1
+    fi
+    timed_base="$(printf '%s' "${spec_entry}" | jq -r '.r2_path // empty')"
+    timed_base="${timed_base##*/}"
+    timed_sha="$(printf '%s' "${spec_entry}" | jq -r '.sha256 // empty')"
+    timed_bytes="$(printf '%s' "${spec_entry}" | jq -r '.bytes // empty')"
+    if [[ -z "${timed_base}" || "${timed_base}" != *.golden.json ]]; then
+      echo "nemotron35-measure-and-score.sh: speculative_oracles['${name}']['${SPEC_DESC}'] names no *.golden.json (r2_path='${timed_base}')." >&2
+      exit 1
+    fi
+    echo "nemotron35-measure-and-score.sh: declared spec ${SPEC_DESC}; timed oracle for ${name} is ${timed_base} (sha256 ${timed_sha}, ${timed_bytes} bytes)" >&2
+  fi
+  for pin in "${serial_sha} ${serial_bytes}" "${timed_sha} ${timed_bytes}"; do
+    if ! printf '%s' "${pin% *}" | grep -Eq '^[0-9a-f]{64}$' \
+      || ! printf '%s' "${pin#* }" | grep -Eq '^[1-9][0-9]*$'; then
+      echo "nemotron35-measure-and-score.sh: live golden '${name}' is unarmed or malformed (pin '${pin}'); nothing can be pin-verified against it." >&2
+      exit 1
+    fi
+  done
+  GOLDEN_BASENAMES+=("${timed_base}")
+  GOLDEN_SHA256S+=("${timed_sha}")
+  GOLDEN_BYTES_LIST+=("${timed_bytes}")
+  SERIAL_GOLDEN_BASENAMES+=("${serial_base}")
+  SERIAL_GOLDEN_SHA256S+=("${serial_sha}")
+  SERIAL_GOLDEN_BYTES_LIST+=("${serial_bytes}")
+done
+
+# The goldens are box-only, staged out of band into MLXFAST_NEMOTRON35_GOLDEN_DIR
+# and pin-verified by tools/ranked-box-preflight.sh.
 GOLDEN_DIR="${MLXFAST_NEMOTRON35_GOLDEN_DIR:-}"
-LIVE_GOLDEN_PATH=""
-if [[ -n "${GOLDEN_DIR}" ]]; then
-  LIVE_GOLDEN_PATH="${GOLDEN_DIR}/${LIVE_GOLDEN_BASENAME}"
-fi
 
 # ---------------------------------------------------------------------------
 # --preflight-only: a pre-GPU DRY RUN that exercises the arm gate and (when the
@@ -302,22 +287,23 @@ if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
     echo "  benchd refuses to seal an official scoring artifact for an unarmed track; this dry-run mirrors that refusal." >&2
     exit 1
   fi
-  echo "nemotron35-measure-and-score.sh: preflight -- arm gate OK (official_scoring_enabled: true), live_golden ${LIVE_GOLDEN_NAME} (sha256 ${LIVE_GOLDEN_SHA256}, ${LIVE_GOLDEN_BYTES} bytes)" >&2
+  echo "nemotron35-measure-and-score.sh: preflight -- arm gate OK (official_scoring_enabled: true), live goldens ${LIVE_GOLDEN_NAMES[*]}" >&2
 
-  # INTEGRITY PIN: when the live golden is staged, validate-golden re-verifies its
+  # INTEGRITY PIN: for each staged live golden, validate-golden re-verifies its
   # raw bytes against the pin AND load-validates it (reference-model pin from
-  # --contract), with NO engine spawned. When it is not staged (e.g. an off-box
-  # pre-submit), the pin is still enforced by benchd on the real run -- the old
-  # measure-job --preflight-only never checked the golden either, so this is not a
-  # weakening; it is a stronger check whenever the golden is present.
-  if [[ -n "${LIVE_GOLDEN_PATH}" && -f "${LIVE_GOLDEN_PATH}" ]]; then
-    exec "${BENCHD}" validate-golden \
-      --golden "${LIVE_GOLDEN_PATH}" \
-      --golden-sha256 "${LIVE_GOLDEN_SHA256}" \
-      --golden-bytes "${LIVE_GOLDEN_BYTES}" \
-      --contract "${CONTRACT}"
-  fi
-  echo "nemotron35-measure-and-score.sh: preflight -- live golden not staged (MLXFAST_NEMOTRON35_GOLDEN_DIR unset or ${LIVE_GOLDEN_BASENAME} absent); benchd re-verifies the {sha256, bytes} pin on the real run." >&2
+  # --contract), with NO engine spawned. When one is not staged (e.g. an
+  # off-box pre-submit), the pin is still enforced by benchd on the real run.
+  for i in "${!GOLDEN_BASENAMES[@]}"; do
+    if [[ -n "${GOLDEN_DIR}" && -f "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" ]]; then
+      "${BENCHD}" validate-golden \
+        --golden "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" \
+        --golden-sha256 "${GOLDEN_SHA256S[$i]}" \
+        --golden-bytes "${GOLDEN_BYTES_LIST[$i]}" \
+        --contract "${CONTRACT}"
+    else
+      echo "nemotron35-measure-and-score.sh: preflight -- live golden not staged (MLXFAST_NEMOTRON35_GOLDEN_DIR unset or ${GOLDEN_BASENAMES[$i]} absent); benchd re-verifies the {sha256, bytes} pin on the real run." >&2
+    fi
+  done
   exit 0
 fi
 
@@ -371,21 +357,25 @@ for var in DS4_RESIDENT_SOCKET BENCH_WORKER_RESIDENT_SOCKET; do
   fi
 done
 
-# A REAL RUN needs the staged live golden.
+# A REAL RUN needs every staged live golden.
 if [[ -z "${GOLDEN_DIR}" || ! -d "${GOLDEN_DIR}" ]]; then
   cat >&2 <<EOF
 nemotron35-measure-and-score.sh: MLXFAST_NEMOTRON35_GOLDEN_DIR is unset or missing.
-  The live golden (${LIVE_GOLDEN_BASENAME}) is staged onto the box out of band
+  The live goldens (${GOLDEN_BASENAMES[*]}) are staged onto the box out of band
   (docs/nemotron35-port-notes.md section 7) and this job holds no credential
-  to fetch it. There is nothing this script can do here except refuse.
+  to fetch them. There is nothing this script can do here except refuse.
 EOF
   exit 1
 fi
-if [[ ! -f "${LIVE_GOLDEN_PATH}" ]]; then
-  echo "nemotron35-measure-and-score.sh: live golden not found at ${LIVE_GOLDEN_PATH}" >&2
-  echo "  live_golden is '${LIVE_GOLDEN_NAME}' (fixtures/nemotron35_lightning_30b_a3b_track.json); stage ${LIVE_GOLDEN_BASENAME} into MLXFAST_NEMOTRON35_GOLDEN_DIR." >&2
-  exit 1
-fi
+GOLDEN_ARGS=()
+for i in "${!GOLDEN_BASENAMES[@]}"; do
+  if [[ ! -f "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" ]]; then
+    echo "nemotron35-measure-and-score.sh: live golden not found at ${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" >&2
+    echo "  live_goldens names '${LIVE_GOLDEN_NAMES[$i]}' (fixtures/nemotron35_lightning_30b_a3b_track.json); stage ${GOLDEN_BASENAMES[$i]} into MLXFAST_NEMOTRON35_GOLDEN_DIR." >&2
+    exit 1
+  fi
+  GOLDEN_ARGS+=(--golden "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" --golden-sha256 "${GOLDEN_SHA256S[$i]}" --golden-bytes "${GOLDEN_BYTES_LIST[$i]}")
+done
 
 # --engine. `iterate` spawns the Engine Protocol v1 adapter, which connects to
 # the leg's vLLM resident. Default to the fixed staged path
@@ -455,19 +445,22 @@ SCORE_PATH="${MLXFAST_SCORE_PATH:-score.json}"
 # --baseline-calibration carries this box's HEALTH BAND: benchd refuses the run
 # when the control leg lands outside it, and never divides by it.
 
-# --control-golden: the serial tape for the serial-control leg. A benchd that
-# does not know the flag verifies leg 1 against the candidate's per-depth tape,
-# which is only the same tape at depth 0; a speculative declaration on such a
-# benchd is refused rather than measured against the wrong oracle.
-CONTROL_GOLDEN_PATH="${GOLDEN_DIR}/${SERIAL_GOLDEN_BASENAME}"
+# --control-golden: the serial tape for the serial-control leg, one per live
+# golden, in the same order as --golden. A benchd that does not know the flag
+# verifies leg 1 against the candidate's per-depth tape, which is only the same
+# tape at depth 0; a speculative declaration on such a benchd is refused rather
+# than measured against the wrong oracle.
 CONTROL_ARGS=()
 if "${BENCHD}" iterate --help 2>&1 | grep -q -- '--control-golden'; then
-  if [[ ! -f "${CONTROL_GOLDEN_PATH}" ]]; then
-    echo "nemotron35-measure-and-score.sh: serial golden not found at ${CONTROL_GOLDEN_PATH}; the serial-control leg has no tape to verify against." >&2
-    exit 1
-  fi
-  CONTROL_ARGS=(--control-golden "${CONTROL_GOLDEN_PATH}" --control-golden-sha256 "${SERIAL_GOLDEN_SHA256}" --control-golden-bytes "${SERIAL_GOLDEN_BYTES}")
-  echo "nemotron35-measure-and-score.sh: serial-control leg verifies against ${SERIAL_GOLDEN_BASENAME} (sha256 ${SERIAL_GOLDEN_SHA256}, ${SERIAL_GOLDEN_BYTES} bytes)" >&2
+  for i in "${!SERIAL_GOLDEN_BASENAMES[@]}"; do
+    control_path="${GOLDEN_DIR}/${SERIAL_GOLDEN_BASENAMES[$i]}"
+    if [[ ! -f "${control_path}" ]]; then
+      echo "nemotron35-measure-and-score.sh: serial golden not found at ${control_path}; the serial-control leg has no tape to verify against." >&2
+      exit 1
+    fi
+    CONTROL_ARGS+=(--control-golden "${control_path}" --control-golden-sha256 "${SERIAL_GOLDEN_SHA256S[$i]}" --control-golden-bytes "${SERIAL_GOLDEN_BYTES_LIST[$i]}")
+    echo "nemotron35-measure-and-score.sh: serial-control leg for ${LIVE_GOLDEN_NAMES[$i]} verifies against ${SERIAL_GOLDEN_BASENAMES[$i]} (sha256 ${SERIAL_GOLDEN_SHA256S[$i]}, ${SERIAL_GOLDEN_BYTES_LIST[$i]} bytes)" >&2
+  done
 elif [[ "${SPEC_DESC}" != "serial" ]]; then
   echo "nemotron35-measure-and-score.sh: REFUSING -- the declaration is ${SPEC_DESC} but this benchd has no --control-golden; the serial-control leg would be verified against the ${SPEC_DESC} tape." >&2
   exit 1
@@ -476,32 +469,14 @@ iterate_official=(
   "${BENCHD}" iterate
   --engine "${ENGINE_BIN}"
   --weights "${WEIGHTS_PATH}"
-  --golden "${LIVE_GOLDEN_PATH}"
+  "${GOLDEN_ARGS[@]}"
   --mode official
   --score-path "${SCORE_PATH}"
-  --golden-sha256 "${LIVE_GOLDEN_SHA256}"
-  --golden-bytes "${LIVE_GOLDEN_BYTES}"
   --contract "${CONTRACT}"
   --baseline-workspace "${BASELINE_WORKSPACE}"
   --baseline-calibration "${BASELINE_CALIBRATION}"
 )
 iterate_official+=( ${CONTROL_ARGS[@]+"${CONTROL_ARGS[@]}"} )
-
-# --live-prompt names the prompt this job scores. benchd resolves that prompt's
-# serial pin and its per-depth oracle pin from --contract itself, refuses any
-# rotation-pool prompt the fixture does not fully pin, checks the pins above
-# against its own. benchd logs the name but never seals it (a prompt name hints
-# at the hidden text); the sealed record identifies the golden only by its sha256
-# (metrics.baseline_golden_sha256). A benchd that does
-# not know the flag can score only the default live_golden.
-if "${BENCHD}" iterate --help 2>&1 | grep -q -- '--live-prompt'; then
-  if [[ "$(jq -r 'has("live_golden_rotation")' "${CONTRACT}")" == "true" ]]; then
-    iterate_official+=( --live-prompt "${LIVE_GOLDEN_NAME}" )
-  fi
-elif [[ "${LIVE_GOLDEN_NAME}" != "${DEFAULT_LIVE_GOLDEN}" ]]; then
-  echo "nemotron35-measure-and-score.sh: REFUSING -- this job drew '${LIVE_GOLDEN_NAME}' but the pinned benchd has no --live-prompt, so it can neither resolve that prompt's pins nor seal its name." >&2
-  exit 1
-fi
 
 # --box names the runner the band is checked against. benchd reads RUNNER_NAME
 # when the flag is absent, so this is the explicit form of what would happen
