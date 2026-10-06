@@ -8,14 +8,16 @@
 #
 #   1. one SERIAL resident: for every timed_prompt_pool entry, a golden with the
 #      teacher-forced cases[] and the free-run benchmark block (the serial
-#      timed oracle). The live golden's serial tape is also the hidden
-#      correctness golden.
+#      timed oracle). The first live golden's serial tape is also the hidden
+#      correctness golden. A case is the ANSWER: it ends at the first
+#      end-of-turn token (the eos_token_id list of the snapshot's pinned
+#      generation_config.json), and it is at most ANSWER_MAX_TOKENS long.
 #   2. one resident per permitted MTP depth d: each oracle prompt's free-run
 #      benchmark block recorded UNDER THAT SPEC (author-with-what-you-replay),
 #      with the SERIAL cases[] spliced in, so every per-depth golden carries
-#      the same token-fidelity oracle. The oracle prompts are the live prompt
-#      by default, or the --oracles-for names (every live_golden_rotation.pool
-#      prompt needs all six before it may be drawn).
+#      the same token-fidelity oracle. The oracle prompts are the live_goldens
+#      by default, or the --oracles-for names (every live golden needs all six
+#      before a run may declare a depth).
 #   3. every golden re-validated by `benchd validate-golden --contract` (model
 #      identity + provenance), then its {sha256, bytes} printed -- and, with
 #      --apply, written into the fixture.
@@ -35,7 +37,7 @@
 #     oracle carries, so a re-recorded serial tape is never spliced in. Then
 #     one resident per depth records <name>.mtp<d>.golden.json for every name.
 #     --apply writes speculative_oracles.<name>.mtp<d>; adding <name> to
-#     live_golden_rotation.pool (after the R2 upload) stays a reviewed edit.
+#     live_goldens stays a reviewed edit.
 #   tools/record-goldens.sh --prompts <DIR> --out <DIR> --only <name>... [--steps serial,1,...]
 #     A NEW GENERATION not yet in the fixture (tools/pool-refresh.sh): records
 #     only the --only names (repeatable), and only the --steps asked for
@@ -78,7 +80,22 @@ OUT="$(cd -- "${OUT}" && pwd -P)"
 TRACK="$(jq -r .trackId "${ROOT}/benchmark.json")"
 REPO="$(jq -r .target.upstream_model_id "${FIXTURE}")"
 REV="$(jq -r .target.upstream_revision "${FIXTURE}")"
-LIVE="$(jq -r .live_golden "${FIXTURE}")"
+mapfile -t LIVE_NAMES < <(jq -r '(.live_goldens // [])[]' "${FIXTURE}")
+[[ "${#LIVE_NAMES[@]}" -gt 0 ]] || die "the fixture declares no live_goldens"
+LIVE="${LIVE_NAMES[0]}"
+# The answer: at most ANSWER_MAX_TOKENS, ended by the first end-of-turn token.
+ANSWER_MAX_TOKENS=1024
+GENCFG="${SNAP}/generation_config.json"
+want_gencfg="$(jq -r '.target.files[] | select(.path == "generation_config.json") | .sha256' "${FIXTURE}")"
+[[ -f "${GENCFG}" && "$(sha256sum "${GENCFG}" | cut -d' ' -f1)" == "${want_gencfg}" ]] \
+  || die "${GENCFG} does not match its fixture pin; the end-of-turn tokens come from the pinned file only"
+mapfile -t STOP_IDS < <(jq -r '.eos_token_id | if type == "array" then .[] else . end' "${GENCFG}")
+[[ "${#STOP_IDS[@]}" -gt 0 ]] || die "${GENCFG} declares no eos_token_id"
+STOP_ARGS=()
+for t in "${STOP_IDS[@]}"; do
+  [[ "${t}" =~ ^[0-9]+$ ]] || die "${GENCFG}: eos_token_id ${t} is not a token id"
+  STOP_ARGS+=(--stop-token "${t}")
+done
 mapfile -t NAMES < <(jq -r '.timed_prompt_pool[].r2_path | split("/")[-1] | sub("\\.golden\\.json$"; "")' "${FIXTURE}")
 mapfile -t DEPTHS < <(jq -r '.mtp_head.permitted_draft_depths[]' "${FIXTURE}")
 ENGINE_REL=".build/release/mlxfast-runtime-worker"
@@ -108,7 +125,7 @@ if [[ "${#ONLY[@]}" -gt 0 ]]; then
 elif [[ -n "${STEPS}" ]]; then
   die "--steps needs --only"
 elif [[ "${#ORACLES_FOR[@]}" -eq 0 ]]; then
-  ORACLE_NAMES=("${LIVE}")
+  ORACLE_NAMES=("${LIVE_NAMES[@]}")
   for n in "${NAMES[@]}"; do [[ -f "${PROMPTS}/${n}.tokens.json" ]] || die "no ${PROMPTS}/${n}.tokens.json"; done
 else
   if [[ " ${ORACLES_FOR[*]} " == *" all "* ]]; then ORACLE_NAMES=("${NAMES[@]}"); else ORACLE_NAMES=("${ORACLES_FOR[@]}"); fi
@@ -134,6 +151,7 @@ record() { # record NAME OUTFILE
   (cd "${ROOT}" && BENCH_WORKER_RESIDENT_SOCKET="${SOCKET}" "${RECORDER}" \
      --worker-bin "${ENGINE_REL}" --weights "${SNAP}" \
      --prompt-tokens "${PROMPTS}/$1.tokens.json" --case-name "$1" \
+     --steps "${ANSWER_MAX_TOKENS}" "${STOP_ARGS[@]}" \
      --benchmark-free-run --track "${TRACK}" --contract "${FIXTURE}" \
      --model-provenance-repo "${REPO}" --model-provenance-rev "${REV}" --out "$2") >&2
 }
@@ -148,8 +166,8 @@ if [[ "${#ORACLES_FOR[@]}" -eq 0 && "${DO_SERIAL}" == 1 ]]; then
   for n in "${NAMES[@]}"; do record "${n}" "${OUT}/${n}.golden.json"; done
   if [[ "${#ONLY[@]}" -eq 0 && -f "${PROMPTS}/public.tokens.json" ]]; then
     mkdir -p "${OUT}/public"
-    record public "${OUT}/public/public-longcopy-gate-english-4096.golden.json"
-    validate "${OUT}/public/public-longcopy-gate-english-4096.golden.json" || die "benchd refused the public golden"
+    record public "${OUT}/public/public-longcopy-gate-english-496.golden.json"
+    validate "${OUT}/public/public-longcopy-gate-english-496.golden.json" || die "benchd refused the public golden"
   fi
   stop_resident
 fi
@@ -188,5 +206,5 @@ if [[ "${APPLY}" == "1" ]]; then
     | if $p[$live] then .hidden_correctness_golden = $p[$live] else . end' "${FIXTURE}" > "${FIXTURE}.tmp"
   mv "${FIXTURE}.tmp" "${FIXTURE}"
   log "pinned ${FIXTURE}; review the diff, then commit"
-  log "a prompt may be drawn only once it is in live_golden_rotation.pool: after the R2 upload, move each fully pinned name from .pending to .pool"
+  log "a prompt is scored only once it is in live_goldens: add each fully pinned name there"
 fi
