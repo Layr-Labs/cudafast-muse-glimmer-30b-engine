@@ -237,6 +237,74 @@ tools/box-runner/setup-sandbox-user.sh --check
 `tools/ranked-box-preflight.sh` runs this check and refuses a ranked job when it
 fails.
 
+## A second runner on one box
+
+A second runner on the same box sets its own value for each sandbox name. The
+table with every variable is in `docs/sandbox-design.md` section 6b. The values
+for the Layr-Labs runner beside the first runner on a Spark are:
+
+```sh
+RUNNER_USER=layrbench
+SANDBOX_USER=layrsub
+SHARE_GROUP=layrshare
+SANDBOX_ROOT=/var/lib/layrbench/sandbox
+SANDBOX_ETC=/etc/layrbench-sandbox
+SUDOERS_NAME=layrbench-sandbox
+EGRESS_UNIT=layrbench-sandbox-egress.service
+ACL_UNIT=layrbench-sandbox-acl.service
+RUST_DIR=/opt/layrbench-rust
+SERVE_UP_LOG_DIR=/var/lib/layrbench/serve-log
+SERVE_UP_CONTAINER_PREFIX=layr-serve-up-
+```
+
+1. Put these lines in `~layrbench/actions-runner/.env`, together with the
+   staged-asset paths the workflow needs (`MLXFAST_TARGET_SNAPSHOT_DIR`,
+   `BENCHD_BIN_DIR`, `MLXFAST_BASELINE_WORKSPACE`,
+   `MLXFAST_BASELINE_CALIBRATION`, `MLXFAST_NEMOTRON35_GOLDEN_DIR`).
+2. As root, run the setup with the same values. Use `sudo env`, so that sudo
+   does not remove the variables:
+
+   ```sh
+   sudo env RUNNER_USER=layrbench SANDBOX_USER=layrsub SHARE_GROUP=layrshare \
+     SANDBOX_ROOT=/var/lib/layrbench/sandbox SANDBOX_ETC=/etc/layrbench-sandbox \
+     SUDOERS_NAME=layrbench-sandbox EGRESS_UNIT=layrbench-sandbox-egress.service \
+     ACL_UNIT=layrbench-sandbox-acl.service RUST_DIR=/opt/layrbench-rust \
+     tools/box-runner/setup-sandbox-user.sh
+   ```
+
+   The setup reads `SERVE_UP_LOG_DIR` from `~layrbench/actions-runner/.env`.
+   It changes no user, file, rule or unit of the first runner.
+
+### The plain persistent runner
+
+The second runner is the standard self-hosted runner. It does not use
+`supervisor.sh`, `gh-app-mint.sh` or a GitHub App key. No GitHub credential
+stays on the box.
+
+1. As the runner account, unpack the actions-runner release in
+   `~layrbench/actions-runner`.
+2. On the operator machine, make a registration token (valid for one hour) and
+   send it on stdin to `config.sh`. The runner reads the token from
+   `ACTIONS_RUNNER_INPUT_TOKEN`, so the token is not on a command line. The
+   runner adds the labels `self-hosted`, `Linux` and `ARM64` itself.
+
+   ```sh
+   gh api -X POST repos/<owner>/<repo>/actions/runners/registration-token -q .token \
+     | ssh <box> 'sudo -u layrbench bash -c "cd ~layrbench/actions-runner \
+         && IFS= read -r ACTIONS_RUNNER_INPUT_TOKEN && export ACTIONS_RUNNER_INPUT_TOKEN \
+         && ./config.sh --unattended --url https://github.com/<owner>/<repo> \
+              --name <box>-layrbench --labels nemotron3.5-lightning-30b-a3b-cuda-v1"'
+   ```
+
+3. As root, install and start the runner's own service with its `svc.sh`:
+
+   ```sh
+   cd ~layrbench/actions-runner && sudo ./svc.sh install layrbench && sudo ./svc.sh start
+   ```
+
+   The service is `actions.runner.<owner>-<repo>.<box>-layrbench.service`. The
+   runner reads `actions-runner/.env` when it starts.
+
 ## Restore / uninstall
 
 ```sh

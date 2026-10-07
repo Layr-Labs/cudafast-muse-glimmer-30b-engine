@@ -28,9 +28,12 @@
 #     [patch]/[replace] or other registry is named; the vendored tree may hold
 #     no symlink or special file. The build runs under prlimit
 #     (CARGO_NPROC_LIMIT, CARGO_AS_LIMIT bytes; default 4096 and 64 GiB);
-#   - the kernels container runs as SANDBOX_USER:nemoshare with the checkout
+#   - the kernels container runs as SANDBOX_USER:SHARE_GROUP (default
+#     nemoshare) with the checkout
 #     mounted read-only, writes only <job>/kernels-out, and is CPU/memory/pid
 #     limited (KERNELS_CPUS, KERNELS_MEMORY, KERNELS_PIDS_LIMIT).
+# cargo uses the sandbox toolchain in RUST_DIR (default /opt/rust). SHARE_GROUP
+# and RUST_DIR are tools/box-runner/setup-sandbox-user.sh's names.
 # With SANDBOX_USER unset, everything runs as the caller, as before.
 #
 # Needs cargo, docker (with the NVIDIA runtime) and jq.
@@ -146,8 +149,8 @@ else
   log "building as ${SANDBOX_USER}, offline"
   # prlimit runs INSIDE the sudo, so the limits bind the sandbox user's build.
   sudo -n -u "${SANDBOX_USER}" -- prlimit --nproc="${CARGO_NPROC_LIMIT:-4096}" \
-    --as="${CARGO_AS_LIMIT:-68719476736}" env PATH=/opt/rust/cargo/bin:/usr/bin:/bin \
-    RUSTUP_HOME=/opt/rust/rustup CARGO_HOME="${JOB}/cargo-home" \
+    --as="${CARGO_AS_LIMIT:-68719476736}" env PATH="${RUST_DIR:-/opt/rust}/cargo/bin:/usr/bin:/bin" \
+    RUSTUP_HOME="${RUST_DIR:-/opt/rust}/rustup" CARGO_HOME="${JOB}/cargo-home" \
     CARGO_TARGET_DIR="${JOB}/target" ENGINE_CUDA_ARCH="${ARCH}" \
     cargo build --release --locked --offline --manifest-path "${MANIFEST}"
   sandbox_quiet
@@ -178,9 +181,9 @@ if [[ -f "${KERNELS_SRC}/build.sh" ]]; then
     RUN_ARGS=(--user "$(id -u):$(id -g)" --mount "type=bind,src=${ROOT_DIR},dst=${ROOT_DIR}")
   else
     KERNELS_OUT="${JOB}/kernels-out"
-    NEMOSHARE_GID="$(getent group nemoshare | cut -d: -f3)"
-    [[ -n "${NEMOSHARE_GID}" ]] || die "group nemoshare does not exist"
-    RUN_ARGS=(--user "$(id -u "${SANDBOX_USER}"):${NEMOSHARE_GID}"
+    SHARE_GID="$(getent group "${SHARE_GROUP:-nemoshare}" | cut -d: -f3)"
+    [[ -n "${SHARE_GID}" ]] || die "group ${SHARE_GROUP:-nemoshare} does not exist"
+    RUN_ARGS=(--user "$(id -u "${SANDBOX_USER}"):${SHARE_GID}"
       --mount "type=bind,src=${ROOT_DIR},dst=${ROOT_DIR},readonly"
       --mount "type=bind,src=${KERNELS_OUT},dst=${KERNELS_OUT}"
       # GB10: 20 cores, 128 GB unified memory.

@@ -206,6 +206,9 @@ escape, the same as any shared GPU host.
 
 ## 6a. Shared contract (every task uses exactly these names)
 
+The names below are the defaults. Section 6b gives the environment variable
+that changes each name for a second runner on the same box.
+
 | Thing | Value |
 |---|---|
 | Sandbox user | `nemosub`: system user, shell `/usr/sbin/nologin`, home `/var/lib/nemosub` (0700), NOT in `docker`, `bench` or `sudo` |
@@ -224,7 +227,7 @@ escape, the same as any shared GPU host.
 | Adapter limits | `prlimit --fsize=67108864 --nproc` (default 4096, `ADAPTER_NPROC_LIMIT`) `--as` (default 16 GiB, `ADAPTER_AS_LIMIT` in bytes) on the adapter in `tools/run-engine-sandboxed.sh`; the build uses separate `CARGO_NPROC_LIMIT` / `CARGO_AS_LIMIT` |
 | Resident logs | `SERVE_UP_LOG_DIR` (from `actions-runner/.env`, else `/var/lib/nemotron35/serve-log`) `runner:runner` 0750, nothing in it other-readable; `serve-up.sh` writes resident logs 0600, the identity file 0640 |
 | Checkout access | per job, as `runner`: `setfacl -R -P -m u:nemosub:rX` (and `-d`) on `$GITHUB_WORKSPACE`, `--x` on each parent up to `runner`'s home, `---` on every other entry directly under each of those parents (all but the component leading to the checkout), on `RUNNER_TEMP` and on `_work/_actions` and `_work/_tool` when present; setup gives `--x` on `runner`'s home, `actions-runner`, `_work` and `---` on every entry under the first two but the next one down and on `_work/_*`. Files `runner` writes under the checkout are `nemosub`-readable (default ACL): never a secret there |
-| Workflow env | `SANDBOX_USER=nemosub`, `SANDBOX_ROOT=/var/lib/nemotron35/sandbox`, `SANDBOX_JOB=<run_id>-<run_attempt>`, `SERVE_UP_CONTAINER_USER=nemosub` (candidate side only; the reference serve-up ignores it) |
+| Workflow env | `SANDBOX_USER` and `SANDBOX_ROOT` from the runner environment, else `nemosub` and `/var/lib/nemotron35/sandbox` (the first step of the ranked job resolves them into `GITHUB_ENV`), `SANDBOX_JOB=<run_id>-<run_attempt>`, `SERVE_UP_CONTAINER_USER=$SANDBOX_USER` (candidate side only; the reference serve-up ignores it) |
 | Box check | `tools/box-runner/setup-sandbox-user.sh --check` exits 0 only if all of the above holds |
 
 benchd spawns `tools/serve-up.sh --stop` with its own environment (it does not
@@ -251,6 +254,55 @@ step plus that gate.
    The trusted measure-and-score and candidate serve-up steps run the same wipe
    (with a preceding kill where needed) at the points listed in the Wipe row;
    no per-job operator action is needed.
+
+## 6b. A second runner on one box
+
+Two runners can serve jobs on one box. Each runner has its own runner account,
+sandbox user, share group, units and files. The GPU lock
+`/tmp/mtplx-gpu-exclusive.lock` is shared, so the two runners never measure at
+the same time. A job of one runner never kills, wipes or reads the processes
+and files of the other runner's sandbox user.
+
+Each name in section 6a comes from one environment variable. If a variable is
+not set, the tools use the section 6a value. A box with one runner sets none of
+them.
+
+| Variable | Default | Second runner (example) | Read by |
+|---|---|---|---|
+| `RUNNER_USER` | `runner` | `layrbench` | `setup-sandbox-user.sh` |
+| `SANDBOX_USER` | `nemosub` | `layrsub` | setup, workflow, every sandbox tool |
+| `SHARE_GROUP` | `nemoshare` | `layrshare` | setup, `tools/engine/build.sh`, `tools/serve-up.sh` |
+| `SANDBOX_ROOT` | `/var/lib/nemotron35/sandbox` | `/var/lib/layrbench/sandbox` | setup, workflow |
+| `SANDBOX_ETC` | `/etc/nemotron35-sandbox` | `/etc/layrbench-sandbox` | setup (`wipe-dirs`, `egress.sh`), `tools/sandbox-wipe.sh` |
+| `SUDOERS_NAME` | `nemotron35-sandbox` | `layrbench-sandbox` | setup (a file in `/etc/sudoers.d`; no dot in the name) |
+| `EGRESS_UNIT` | `nemotron35-sandbox-egress.service` | `layrbench-sandbox-egress.service` | setup |
+| `ACL_UNIT` | `nemotron35-sandbox-acl.service` | `layrbench-sandbox-acl.service` | setup |
+| `RUST_DIR` | `/opt/rust` | `/opt/layrbench-rust` | setup, `tools/engine/build.sh` |
+| `SERVE_UP_LOG_DIR` | `/var/lib/nemotron35/serve-log` (setup) | `/var/lib/layrbench/serve-log` | setup (from the runner's `actions-runner/.env`), `tools/serve-up.sh` |
+| `SERVE_UP_CONTAINER_PREFIX` | `serve-up-` | `layr-serve-up-` | `tools/serve-up.sh`, `tools/box-runner/supervisor.sh` |
+
+The sandbox home is always `/var/lib/<SANDBOX_USER>`.
+
+To add the second runner:
+
+1. Write each value as one `NAME=value` line in the second runner's
+   `actions-runner/.env`. Every job of that runner gets them. Restart the
+   runner service after a change.
+2. As root, run the setup with the same values:
+   `sudo env RUNNER_USER=layrbench SANDBOX_USER=layrsub SHARE_GROUP=layrshare ... tools/box-runner/setup-sandbox-user.sh`.
+3. As the second runner account, run the check with the same values. The
+   ranked preflight runs it again for each job.
+
+The setup of the second runner adds its own group, user, directories, sudoers
+file, units, `iptables` rules, wipe list and toolchain. It removes or replaces
+only rules for its own sandbox user. In the shared files `/etc/cron.deny`,
+`/etc/at.deny` and the resolver socket ACLs, it adds an entry for its own
+sandbox user and changes no other entry.
+
+The workflow resolves `SANDBOX_USER` and `SANDBOX_ROOT` in its first step,
+because a step `env:` block cannot read the runner process environment. The
+tools read the other names from the runner environment. The workflow and
+`tools/` are outside `editablePaths`, so a submission cannot change a name.
 
 ## 7. Adversarial review findings
 
