@@ -68,6 +68,9 @@
 #                             python3 and RESIDENT_BACKEND from the environment.
 #                             tools/ranked-box-preflight.sh refuses it set.
 #   SERVE_UP_CONTAINER_USER   the SANDBOX user (docs/sandbox-design.md 6a: nemosub).
+#   SERVE_UP_SANDBOX_TREE     the ranked workflow's form of the above: the
+#                             candidate checkout. Only the tree at this path
+#                             takes SANDBOX_USER as SERVE_UP_CONTAINER_USER.
 #   SHARE_GROUP               its share group (default nemoshare; 6b).
 #   SERVE_UP_CONTAINER_PREFIX the resident container name is this prefix and the
 #                             run tag (default serve-up-, so serve-up-<pid>-<time>).
@@ -108,6 +111,22 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)
 log() { printf 'serve-up.sh: %s\n' "$*" >&2; }
 die() { printf 'serve-up.sh: %s\n' "$*" >&2; exit 1; }
 CONTAINER_PREFIX="${SERVE_UP_CONTAINER_PREFIX:-serve-up-}"
+
+# THE SANDBOXED TREE IS NAMED, NOT INHERITED. benchd boots BOTH legs of a paired
+# run with one environment. Only the CANDIDATE's resident runs as the sandbox
+# user: the serial-control leg's worker is benchd's own and runs as the runner,
+# so it cannot open a sandboxed resident's 0600 socket. The ranked workflow names
+# the candidate checkout in SERVE_UP_SANDBOX_TREE. The tree at that path takes
+# SANDBOX_USER as SERVE_UP_CONTAINER_USER; every other tree (the reference tree)
+# runs its resident as the runner, as calibrate-box.sh measures it.
+if [[ -z "${SERVE_UP_CONTAINER_USER:-}" && -n "${SERVE_UP_SANDBOX_TREE:-}" ]]; then
+  sandbox_tree="$(cd -- "${SERVE_UP_SANDBOX_TREE}" >/dev/null 2>&1 && pwd -P)" \
+    || die "SERVE_UP_SANDBOX_TREE '${SERVE_UP_SANDBOX_TREE}' is not a directory"
+  if [[ "${sandbox_tree}" == "${SCRIPT_DIR}" ]]; then
+    [[ -n "${SANDBOX_USER:-}" ]] || die "SERVE_UP_SANDBOX_TREE names this tree, but SANDBOX_USER is unset"
+    SERVE_UP_CONTAINER_USER="${SANDBOX_USER}"
+  fi
+fi
 
 # After a sandboxed candidate leg's container is stopped: kill stragglers, wipe
 # shared dirs, then wait for memory (docs/sandbox-design.md).
