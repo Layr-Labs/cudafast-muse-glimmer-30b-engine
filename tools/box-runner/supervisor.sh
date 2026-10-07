@@ -234,7 +234,8 @@ spawn_job() {
 remove_stray_residents() {
   command -v docker >/dev/null 2>&1 || return 0
   local stray
-  stray="$(docker ps -q --filter name=^serve-up- 2>/dev/null || true)"
+  # SERVE_UP_CONTAINER_PREFIX: the prefix tools/serve-up.sh names residents with.
+  stray="$(docker ps -q --filter "name=^${SERVE_UP_CONTAINER_PREFIX:-serve-up-}" 2>/dev/null || true)"
   [ -n "${stray}" ] || return 0
   # shellcheck disable=SC2086  # one id per word
   docker rm -f ${stray} >/dev/null 2>&1 || alert "could not remove serve-up container(s) ${stray}"

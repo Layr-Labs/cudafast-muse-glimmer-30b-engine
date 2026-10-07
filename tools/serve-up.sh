@@ -68,10 +68,16 @@
 #                             python3 and RESIDENT_BACKEND from the environment.
 #                             tools/ranked-box-preflight.sh refuses it set.
 #   SERVE_UP_CONTAINER_USER   the SANDBOX user (docs/sandbox-design.md 6a: nemosub).
+#   SHARE_GROUP               its share group (default nemoshare; 6b).
+#   SERVE_UP_CONTAINER_PREFIX the resident container name is this prefix and the
+#                             run tag (default serve-up-, so serve-up-<pid>-<time>).
+#                             A second runner on one box sets its own prefix, so
+#                             a cleanup by name prefix never removes the other
+#                             runner's residents (docs/sandbox-design.md 6b).
 #                             Set by the workflow for the CANDIDATE leg only; unset,
 #                             nothing below changes. Set, it needs SANDBOX_ROOT and
 #                             SANDBOX_JOB and the docker launcher; the container runs
-#                             as that user's uid and nemoshare's gid, and its ONLY
+#                             as that user's uid and SHARE_GROUP's gid, and its ONLY
 #                             writable mount is a fresh per-leg directory
 #                             $SANDBOX_ROOT/$SANDBOX_JOB/sock/<run tag>/ (2770) holding
 #                             the socket, HOME and the caches. The resident log and
@@ -101,6 +107,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
 log() { printf 'serve-up.sh: %s\n' "$*" >&2; }
 die() { printf 'serve-up.sh: %s\n' "$*" >&2; exit 1; }
+CONTAINER_PREFIX="${SERVE_UP_CONTAINER_PREFIX:-serve-up-}"
 
 # After a sandboxed candidate leg's container is stopped: kill stragglers, wipe
 # shared dirs, then wait for memory (docs/sandbox-design.md).
@@ -207,7 +214,7 @@ if [[ "${MODE}" == "stop" ]]; then
     stop_tag="$(basename -- "$(dirname -- "${STOP_SOCKET}")")"
     stop_container=""
     [[ "$(basename -- "${STOP_SOCKET}")" != "vllm-resident.sock" || ! "${stop_tag}" =~ ^[0-9]+-[0-9]{8}T[0-9]{6}Z$ ]] \
-      || stop_container="serve-up-${stop_tag}"
+      || stop_container="${CONTAINER_PREFIX}${stop_tag}"
     if [[ -n "${stop_container}" ]] && docker stop -t 10 "${stop_container}" >/dev/null 2>&1; then
       log "resident container ${stop_container} stopped"
     else
@@ -249,8 +256,8 @@ if [[ "${MODE}" == "stop" ]]; then
   fi
   # The container is named in the sidecar; remove it even if its docker client
   # is already gone, so a killed client can never leave the engine holding the
-  # GPU. The name is ours (serve-up-<pid>-<time>), never a guess.
-  if [[ "${stop_container}" =~ ^serve-up-[0-9]+-[0-9TZ]+$ ]] && command -v docker >/dev/null 2>&1; then
+  # GPU. The name is ours (<prefix><pid>-<time>), never a guess.
+  if [[ "${stop_container}" =~ ^"${CONTAINER_PREFIX}"[0-9]+-[0-9TZ]+$ ]] && command -v docker >/dev/null 2>&1; then
     docker rm -f "${stop_container}" >/dev/null 2>&1 || true
   fi
   rm -f "${STOP_SOCKET}" "${stop_pidfile}" 2>/dev/null || true
@@ -318,13 +325,13 @@ SANDBOX_USER_ID=""
 if [[ -n "${SERVE_UP_CONTAINER_USER:-}" ]]; then
   [[ "${SERVE_UP_LAUNCHER}" == "docker" ]] || die "SERVE_UP_CONTAINER_USER runs the resident in the container; it cannot be combined with SERVE_UP_LAUNCHER=${SERVE_UP_LAUNCHER}"
   [[ -n "${SANDBOX_ROOT:-}" && -n "${SANDBOX_JOB:-}" ]] || die "SERVE_UP_CONTAINER_USER needs SANDBOX_ROOT and SANDBOX_JOB (the per-job socket directory)"
-  # The per-job socket directory is tools/engine/build.sh's (2750, group nemoshare); a
+  # The per-job socket directory is tools/engine/build.sh's (2750, group SHARE_GROUP); a
   # missing one is refused rather than created here with the wrong owner.
   SERVE_UP_SOCKET_DIR="${SANDBOX_ROOT}/${SANDBOX_JOB}/sock"
   [[ -d "${SERVE_UP_SOCKET_DIR}" ]] || die "the per-job socket directory ${SERVE_UP_SOCKET_DIR} is missing (tools/engine/build.sh creates it)"
   sandbox_uid="$(id -u "${SERVE_UP_CONTAINER_USER}")" || die "no such user: ${SERVE_UP_CONTAINER_USER}"
-  sandbox_gid="$(getent group nemoshare | cut -d: -f3)"
-  [[ -n "${sandbox_gid}" ]] || die "no nemoshare group on this box (tools/box-runner/setup-sandbox-user.sh creates it)"
+  sandbox_gid="$(getent group "${SHARE_GROUP:-nemoshare}" | cut -d: -f3)"
+  [[ -n "${sandbox_gid}" ]] || die "no ${SHARE_GROUP:-nemoshare} group on this box (tools/box-runner/setup-sandbox-user.sh creates it)"
   SANDBOX_USER_ID="${sandbox_uid}:${sandbox_gid}"
 fi
 mkdir -p "${SERVE_UP_LOG_DIR}" "${SERVE_UP_SOCKET_DIR}"
@@ -365,7 +372,7 @@ if [[ "${SERVE_UP_LAUNCHER}" == "docker" ]]; then
 fi
 
 RUN_TAG="$$-$(date -u +%Y%m%dT%H%M%SZ)"
-CONTAINER_NAME="serve-up-${RUN_TAG}"
+CONTAINER_NAME="${CONTAINER_PREFIX}${RUN_TAG}"
 SOCKET_PATH="${SERVE_UP_SOCKET_DIR}/vllm-resident.${RUN_TAG}.sock"
 READY_FILE="${SERVE_UP_LOG_DIR}/vllm-resident.${RUN_TAG}.ready"
 # A fresh run directory per boot: HOME and every compile cache live here, so a

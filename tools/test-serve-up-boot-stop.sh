@@ -371,6 +371,7 @@ STUBEOF
 cat > "${STUB}/bin/getent" <<STUBEOF
 #!/usr/bin/env bash
 [[ "\$*" == "group nemoshare" ]] && { echo 'nemoshare:x:4343:runner,nemosub'; exit 0; }
+[[ "\$*" == "group layrshare" ]] && { echo 'layrshare:x:5353:layrbench,layrsub'; exit 0; }
 exec $(command -v getent 2>/dev/null || echo false) "\$@"
 STUBEOF
 chmod +x "${STUB}/bin/"*
@@ -540,6 +541,50 @@ rc=$?
   && grep -q 'sandbox wipe after candidate-leg --stop failed' "${WORK}/stop10.out" \
   && ok "case 10: a failing sandbox wipe makes sandboxed --stop exit non-zero" \
   || { fail "case 10: expected wipe failure on --stop (rc=${rc})"; sed 's/^/    /' "${WORK}/stop10.out" >&2; }
+
+# --- case 11: a second runner's names (docs/sandbox-design.md 6b) -----------
+# SHARE_GROUP, SANDBOX_ETC and SERVE_UP_CONTAINER_PREFIX set: the container runs
+# with that group's gid under the prefixed name, --stop stops it by that name,
+# and the wipe reads $SANDBOX_ETC/wipe-dirs.
+mkdir -p "${WORK}/sbx-etc"
+cp "${WORK}/sbx-wipe-dirs" "${WORK}/sbx-etc/wipe-dirs"
+second() {
+  dserve SERVE_UP_CONTAINER_USER="${ME}" SANDBOX_ROOT="${SBXROOT}" SANDBOX_JOB=42-1 \
+    SHARE_GROUP=layrshare SANDBOX_ETC="${WORK}/sbx-etc" SERVE_UP_CONTAINER_PREFIX=layr-serve-up- \
+    STUB_IPC="${WORK}/sbx-ipc" STUB_PGREP_USER="${ME}" "$@"
+}
+second "${TREE}/tools/serve-up.sh" --boot --spec serial --draft-len 0 \
+  --socket-out "${WORK}/leg11/socket.txt" > "${WORK}/boot11.out" 2>&1 \
+  || { fail "case 11: --boot exited non-zero"; sed 's/^/    /' "${WORK}/boot11.out" >&2; }
+SOCKET11="$(head -1 "${WORK}/leg11/socket.txt" 2>/dev/null)"
+TAG11="$(basename -- "$(dirname -- "${SOCKET11}")")"
+[[ "$(run_arg_after --name)" == "layr-serve-up-${TAG11}" && "$(run_arg_after --user)" == "4242:5353" ]] \
+  && ok "case 11: the container is layr-serve-up-<tag> and runs with layrshare's gid" \
+  || fail "case 11: docker run --name '$(run_arg_after --name)' --user '$(run_arg_after --user)'"
+echo second-leftover > "${WORK}/sbx-wipe/shm/second-leftover"
+second WAIT_FOR_MEMORY_TIMEOUT_S=0.1 WAIT_FOR_MEMORY_POLL_S=0.01 \
+  "${TREE}/tools/serve-up.sh" --stop --socket "${SOCKET11}" > "${WORK}/stop11.out" 2>&1 \
+  || fail "case 11: --stop exited non-zero"
+grep -qxF "stop -t 10 layr-serve-up-${TAG11}" "${STUB}/docker.log" \
+  && [[ ! -e "${STUB}/container.layr-serve-up-${TAG11}" ]] \
+  && ok "case 11: --stop stopped layr-serve-up-<tag> by name" \
+  || { fail "case 11: --stop did not stop layr-serve-up-${TAG11}"; sed 's/^/    /' "${WORK}/stop11.out" >&2; }
+[[ ! -f "${WORK}/sbx-wipe/shm/second-leftover" ]] \
+  && ok "case 11: the wipe read \$SANDBOX_ETC/wipe-dirs" \
+  || fail "case 11: the wipe did not use \$SANDBOX_ETC/wipe-dirs"
+# Unsandboxed: the sidecar names the prefixed container and --stop removes it.
+dserve SERVE_UP_CONTAINER_PREFIX=layr-serve-up- "${TREE}/tools/serve-up.sh" --boot --spec serial --draft-len 0 \
+  --socket-out "${WORK}/leg11b/socket.txt" > "${WORK}/boot11b.out" 2>&1 \
+  || { fail "case 11: unsandboxed --boot exited non-zero"; sed 's/^/    /' "${WORK}/boot11b.out" >&2; }
+SOCKET11B="$(head -1 "${WORK}/leg11b/socket.txt" 2>/dev/null)"
+NAME11B="$(sed -n 3p "${SOCKET11B}.pid" 2>/dev/null)"
+[[ "${NAME11B}" == layr-serve-up-* ]] \
+  && ok "case 11: the unsandboxed sidecar names layr-serve-up-<tag>" \
+  || fail "case 11: the unsandboxed sidecar names '${NAME11B}'"
+dserve SERVE_UP_CONTAINER_PREFIX=layr-serve-up- "${TREE}/tools/serve-up.sh" --stop --socket "${SOCKET11B}" > "${WORK}/stop11b.out" 2>&1
+grep -qxF "rm -f ${NAME11B}" "${STUB}/docker.log" && [[ ! -e "${STUB}/container.${NAME11B}" ]] \
+  && ok "case 11: unsandboxed --stop removed the prefixed container" \
+  || fail "case 11: unsandboxed --stop did not remove ${NAME11B}"
 
 if [[ "${failures}" -eq 0 ]]; then
   echo "PASS: test-serve-up-boot-stop.sh"

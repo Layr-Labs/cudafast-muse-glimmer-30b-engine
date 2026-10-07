@@ -11,6 +11,8 @@
 #      per-job dirs have the contract modes; the outputs are staged, the
 #      adapter as <staged>.sandboxed and a shim at the staged path that execs
 #      tools/run-engine-sandboxed.sh on it.
+#   2b. a second runner's SHARE_GROUP and RUST_DIR (docs/sandbox-design.md
+#      6b): the build uses that toolchain and the kernels container that gid.
 #   3. SANDBOX_USER set but sudo to it fails: refused before anything builds.
 #   4. stage-cuda-engine.sh refuses a symlink or a binary the sandbox user
 #      does not own, and re-checks its COPY (a source swapped for a symlink
@@ -29,7 +31,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
 VERBOSE=0
 [[ "${1:-}" == "-v" ]] && VERBOSE=1
 
-EXPECTED_MIN_ASSERTIONS=46
+EXPECTED_MIN_ASSERTIONS=49
 PASSED=0; FAILED=0; FAILURES=()
 pass() { PASSED=$((PASSED+1)); [[ "${VERBOSE}" == "1" ]] && echo "ok    $1"; return 0; }
 fail() { FAILED=$((FAILED+1)); FAILURES+=("$1"); echo "FAIL  $1" >&2; }
@@ -122,7 +124,7 @@ done
 exit 0
 EOF
 printf '#!/usr/bin/env bash\nexit 1\n' > "${STUBS}/pgrep"
-printf '#!/usr/bin/env bash\necho nemoshare:x:4242:\n' > "${STUBS}/getent"
+printf '#!/usr/bin/env bash\n[[ "$2" == layrshare ]] && { echo layrshare:x:5353:; exit 0; }\necho nemoshare:x:4242:\n' > "${STUBS}/getent"
 chmod +x "${STUBS}"/*
 export PATH="${STUBS}:${PATH}"
 
@@ -198,6 +200,22 @@ exec ${REPO}/tools/run-engine-sandboxed.sh \"\$@\""
 check "the shim bakes in PATH, the SANDBOX_* values and the log dir, then execs the wrapper" \
   test "$(cat "${STAGED}")" == "${EXPECTED_SHIM}"
 check "kernels-out copied into .build/kernels" test -f "${REPO}/.build/kernels/k.so"
+
+# ---- 2b. a second runner's names: SHARE_GROUP and RUST_DIR -------------------
+rm -rf "${REPO}/.build"
+: > "${LOG}"
+if SANDBOX_USER="${ME}" SANDBOX_ROOT="${WORK}/sandbox" SANDBOX_JOB=42-2 \
+     SHARE_GROUP=layrshare RUST_DIR=/opt/layrsub-rust \
+     "${REPO}/tools/engine/build.sh" > "${WORK}/out2b" 2>&1; then
+  pass "second-runner sandboxed build succeeds"
+else
+  fail "second-runner sandboxed build succeeds ($(tail -3 "${WORK}/out2b"))"
+fi
+JOB2="${WORK}/sandbox/42-2"
+check "second runner: cargo uses RUST_DIR's toolchain" \
+  logged "sudo cwd=${REPO} -n -u ${ME} -- prlimit --nproc=4096 --as=68719476736 env PATH=/opt/layrsub-rust/cargo/bin:/usr/bin:/bin RUSTUP_HOME=/opt/layrsub-rust/rustup CARGO_HOME=${JOB2}/cargo-home CARGO_TARGET_DIR=${JOB2}/target ENGINE_CUDA_ARCH=sm_121 cargo build --release --locked --offline --manifest-path ${MANIFEST}"
+check "second runner: the kernels container runs with SHARE_GROUP's gid" \
+  grep -qF -- "docker run --rm --gpus all --network none --user $(id -u):5353 " "${LOG}"
 
 # ---- 3. sudo to the sandbox user fails: refuse --------------------------------
 : > "${LOG}"

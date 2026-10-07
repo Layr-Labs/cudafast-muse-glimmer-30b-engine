@@ -36,7 +36,7 @@ VERBOSE=0
 # This floor is the only thing that notices a section silently stopping (an
 # early `exit`, a deleted block) under `set -uo pipefail` without `-e`, where a
 # truncated suite otherwise reports "0 failed" and looks green.
-EXPECTED_MIN_ASSERTIONS=109
+EXPECTED_MIN_ASSERTIONS=122
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/box-runner-test.XXXXXX")"
 # shellcheck disable=SC2329  # invoked indirectly via `trap cleanup EXIT` below
@@ -555,6 +555,10 @@ case "$*" in
   "-nG nemosub") echo "nemosub nemoshare" ;;
   "-nG runner") echo "runner docker nemoshare" ;;
   nemosub|runner) echo "uid=999" ;;
+  "-u layrsub") echo 998 ;;
+  "-nG layrsub") echo "layrsub layrshare" ;;
+  "-nG layrbench") echo "layrbench docker layrshare" ;;
+  layrsub|layrbench) echo "uid=998" ;;
   *) exit 1 ;;
 esac
 EOF
@@ -564,6 +568,9 @@ case "$*" in
   "passwd nemosub") echo "nemosub:x:999:999::${SBX_FS}/var/lib/nemosub:/usr/sbin/nologin" ;;
   "passwd runner") echo "runner:x:1001:1001::${SBX_FS}/home/runner:/bin/bash" ;;
   "group nemoshare") echo "nemoshare:x:4343:runner,nemosub" ;;
+  "passwd layrsub") echo "layrsub:x:998:998::${SBX_FS}/var/lib/layrsub:/usr/sbin/nologin" ;;
+  "passwd layrbench") echo "layrbench:x:1002:1002::${SBX_FS}/home/layrbench:/bin/bash" ;;
+  "group layrshare") echo "layrshare:x:4444:layrbench,layrsub" ;;
   *) exit 2 ;;
 esac
 EOF
@@ -779,6 +786,45 @@ rm -rf "${FS}/home/runner/actions-runner/_work"
 out="$(sbx_check)"
 assert_true "sandbox --check: no _work yet is a warning, not a failure" \
   bash -c "grep -q '^WARN  .*_work does not exist yet' <<<\"\$0\" && ! grep -q '^FAIL  nemosub can traverse .*/_work' <<<\"\$0\"" "${out}"
+
+# =========================================================================
+# 8. setup-sandbox-user.sh for a SECOND runner on the same box
+#    (docs/sandbox-design.md 6b): every name set to the second runner's value.
+#    The setup adds its own user, rules, units and files, and changes nothing
+#    of the first runner's: not its files, not its iptables rules (an older
+#    loopback-exempt nemosub rule included), not its ACLs.
+# =========================================================================
+mkdir -p "${FS}/home/layrbench/actions-runner/_work" "${FS}/opt/layrsub-rust/cargo/bin" "${FS}/opt/layrsub-rust/rustup"
+printf 'SERVE_UP_LOG_DIR=%s\n' "${FS}/var/lib/layrbench/serve-log" > "${FS}/home/layrbench/actions-runner/.env"
+printf '#!/usr/bin/env bash\necho "rustup $*" >> "${SBX_LOG}"\n' > "${FS}/opt/layrsub-rust/cargo/bin/rustup"
+chmod +x "${FS}/opt/layrsub-rust/cargo/bin/rustup"
+echo "iptables ${old_rule}" >> "${SBX_IPT}"
+first_files=("${FS}/etc/nemotron35-sandbox/egress.sh" "${FS}/etc/nemotron35-sandbox/wipe-dirs"
+  "${FS}/etc/systemd/system/nemotron35-sandbox-egress.service" "${FS}/etc/systemd/system/nemotron35-sandbox-acl.service"
+  "${FS}/etc/sudoers.d/nemotron35-sandbox")
+first_sums="$(sha256sum "${first_files[@]}" 2>&1)"
+first_rules="$(grep -F -- '--uid-owner nemosub' "${SBX_IPT}")"
+: > "${SBX_LOG}"
+sbx_run env RUNNER_USER=layrbench SANDBOX_USER=layrsub SHARE_GROUP=layrshare \
+  SANDBOX_ROOT="${FS}/var/lib/layrbench/sandbox" SANDBOX_ETC="${FS}/etc/layrbench-sandbox" \
+  SUDOERS_NAME=layrbench-sandbox EGRESS_UNIT=layrbench-sandbox-egress.service \
+  ACL_UNIT=layrbench-sandbox-acl.service RUST_DIR="${FS}/opt/layrsub-rust" \
+  "${sbx}/setup-sandbox-user.sh" > "${sbx}/setup-second.out" 2>&1
+assert_true "second runner: setup ran to its closing --check" grep -q '^setup-sandbox-user.sh --check' "${sbx}/setup-second.out"
+assert_eq "second runner: the first runner's files are unchanged" "${first_sums}" "$(sha256sum "${first_files[@]}" 2>&1)"
+assert_eq "second runner: the first runner's iptables rules are unchanged" "${first_rules}" "$(grep -F -- '--uid-owner nemosub' "${SBX_IPT}")"
+assert_eq "second runner: no call names nemosub, runner or nemoshare" "" "$(grep -E 'nemosub|nemoshare|/home/runner|runner:' "${SBX_LOG}")"
+assert_eq "second runner: its iptables REJECT is first" "iptables OUTPUT -m owner --uid-owner layrsub -j REJECT" "$(grep '^iptables ' "${SBX_IPT}" | head -1)"
+assert_true "second runner: its own egress script and unit" \
+  bash -c "grep -qE '/ip6tables -I OUTPUT 1 -m owner --uid-owner layrsub -j REJECT$' '${FS}/etc/layrbench-sandbox/egress.sh' && grep -qx 'ExecStart=${FS}/etc/layrbench-sandbox/egress.sh' '${FS}/etc/systemd/system/layrbench-sandbox-egress.service'"
+assert_true "second runner: its own resolver ACL unit" \
+  grep -qE "^ExecStart=-.*setfacl -m u:layrsub:--- ${FS}/run/nscd/socket$" "${FS}/etc/systemd/system/layrbench-sandbox-acl.service"
+assert_true "second runner: its own sudoers file" grep -qxF 'layrbench ALL=(layrsub) NOPASSWD:SETENV: ALL' "${FS}/etc/sudoers.d/layrbench-sandbox"
+assert_true "second runner: its own wipe list" grep -qxF "${FS}/tmp" "${FS}/etc/layrbench-sandbox/wipe-dirs"
+assert_true "second runner: its sandbox root is layrbench:layrshare" grep -qxF "chown layrbench:layrshare ${FS}/var/lib/layrbench/sandbox" "${SBX_LOG}"
+assert_true "second runner: its own toolchain dir" grep -q '^rustup default ' "${SBX_LOG}"
+assert_true "second runner: traverse ACL on its own runner home" grep -qxF "setfacl -m u:layrsub:--x ${FS}/home/layrbench" "${SBX_LOG}"
+assert_eq "second runner: at.deny lists both sandbox users" "nemosub layrsub" "$(grep -xE 'nemosub|layrsub' "${FS}/etc/at.deny" | paste -sd' ' -)"
 
 # =========================================================================
 printf '\n%d passed, %d failed (floor: %d assertions)\n' "${PASSED}" "${FAILED}" "${EXPECTED_MIN_ASSERTIONS}"

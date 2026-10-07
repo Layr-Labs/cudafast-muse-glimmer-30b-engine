@@ -248,6 +248,23 @@ jobs:
     # is OPTIONAL and is likewise left to the runner service; the script falls
     # back to ~/.cache/cudafast-engine-build.
     steps:
+      - name: Sandbox names (from the runner environment)
+        # docs/sandbox-design.md 6b. The runner's actions-runner/.env may set
+        # SANDBOX_USER and SANDBOX_ROOT (a second runner on one box does); a
+        # runner that sets neither uses nemosub and /var/lib/nemotron35/sandbox.
+        # A step `env:` cannot read the runner process environment, so this step
+        # resolves the two names once and GITHUB_ENV gives them to every later
+        # step. The other names (SHARE_GROUP, SANDBOX_ETC, RUST_DIR, RUNNER_USER)
+        # reach the tools from the runner environment directly, with the same
+        # defaults in each tool. It is the first step, so the always() cleanup
+        # step has the names even when a later step fails.
+        run: |
+          set -euo pipefail
+          {
+            printf 'SANDBOX_USER=%s\n' "${SANDBOX_USER:-nemosub}"
+            printf 'SANDBOX_ROOT=%s\n' "${SANDBOX_ROOT:-/var/lib/nemotron35/sandbox}"
+          } >> "${GITHUB_ENV}"
+
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           # The DISPATCHED commit, per the Yukon workflow author guide -- not
@@ -375,9 +392,8 @@ jobs:
         # _actions and _tool by name.
         # The default ACL makes every file runner writes under GITHUB_WORKSPACE
         # readable by nemosub: NEVER write a secret, a golden or a hidden prompt
-        # there; runner-private files go in RUNNER_TEMP.
-        env:
-          SANDBOX_USER: nemosub
+        # there; runner-private files go in RUNNER_TEMP. SANDBOX_USER comes
+        # from the "Sandbox names" step.
         run: |
           set -euo pipefail
           ./tools/sandbox-wipe.sh
@@ -453,10 +469,8 @@ jobs:
         # non-zero rather than proceed without either.
         env:
           ENGINE_BUILD_OFFLINE: "1"
-          SANDBOX_USER: nemosub
-          SANDBOX_ROOT: /var/lib/nemotron35/sandbox
           SANDBOX_JOB: ${{ github.run_id }}-${{ github.run_attempt }}
-          SERVE_UP_CONTAINER_USER: nemosub
+          SERVE_UP_CONTAINER_USER: ${{ env.SANDBOX_USER }}
         run: ./setup.sh
 
       - name: Record the dispatched candidate sha (author-at-seal)
@@ -494,10 +508,8 @@ jobs:
 
       - name: GPU-exclusive measurement (lock, quiesce, benchd iterate --mode official, seal)
         env:
-          SANDBOX_USER: nemosub
-          SANDBOX_ROOT: /var/lib/nemotron35/sandbox
           SANDBOX_JOB: ${{ github.run_id }}-${{ github.run_attempt }}
-          SERVE_UP_CONTAINER_USER: nemosub
+          SERVE_UP_CONTAINER_USER: ${{ env.SANDBOX_USER }}
         # The whole GPU window runs in THIS one step, under the box-wide GPU lock,
         # because the idle assertion below is only meaningful while no other GPU
         # work can start. The order is the box order, condensed: take the lock
@@ -680,8 +692,6 @@ jobs:
       - name: Sandbox cleanup (kill nemosub processes, remove per-job dirs)
         if: always()
         env:
-          SANDBOX_USER: nemosub
-          SANDBOX_ROOT: /var/lib/nemotron35/sandbox
           SANDBOX_JOB: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -uo pipefail

@@ -44,26 +44,43 @@
 # --check changes nothing and prints one PASS/FAIL line per item (WARN for an
 # item only root can read). It runs as runner or root.
 #
+# Names (env; the default is the name used above). A second runner on the same
+# box sets its own value for each, so its setup adds its own user, rules, units
+# and files and never changes the first runner's (docs/sandbox-design.md 6b):
+#   RUNNER_USER   runner                        the runner account
+#   SANDBOX_USER  nemosub                       the sandbox user (home /var/lib/<name>)
+#   SHARE_GROUP   nemoshare                     the group of the two
+#   SANDBOX_ROOT  /var/lib/nemotron35/sandbox   the per-job sandbox root
+#   SANDBOX_ETC   /etc/nemotron35-sandbox       holds wipe-dirs and egress.sh
+#   SUDOERS_NAME  nemotron35-sandbox            the file in /etc/sudoers.d (no dot)
+#   EGRESS_UNIT   nemotron35-sandbox-egress.service
+#   ACL_UNIT      nemotron35-sandbox-acl.service
+#   RUST_DIR      /opt/rust                     the sandbox user's Rust toolchain
+# --check reads the same names, so the runner's jobs must have them too
+# (actions-runner/.env).
+#
 # Exit: 0 all checks passed; 1 a check failed; 78 usage or setup error.
 set -euo pipefail
 
-SANDBOX_USER=nemosub
-RUNNER_USER=runner
-SHARE_GROUP=nemoshare
-SANDBOX_HOME=/var/lib/nemosub
-SANDBOX_ROOT=/var/lib/nemotron35/sandbox
-SUDOERS_FILE=/etc/sudoers.d/nemotron35-sandbox
+SANDBOX_USER="${SANDBOX_USER:-nemosub}"
+RUNNER_USER="${RUNNER_USER:-runner}"
+SHARE_GROUP="${SHARE_GROUP:-nemoshare}"
+SANDBOX_HOME="/var/lib/${SANDBOX_USER}"
+SANDBOX_ROOT="${SANDBOX_ROOT:-/var/lib/nemotron35/sandbox}"
+SANDBOX_ETC="${SANDBOX_ETC:-/etc/nemotron35-sandbox}"
+SUDOERS_NAME="${SUDOERS_NAME:-nemotron35-sandbox}"
+SUDOERS_FILE="/etc/sudoers.d/${SUDOERS_NAME}"
 SUDOERS_LINE="${RUNNER_USER} ALL=(${SANDBOX_USER}) NOPASSWD:SETENV: ALL"
-RUST_DIR=/opt/rust
+RUST_DIR="${RUST_DIR:-/opt/rust}"
 FORBIDDEN_GROUPS=(docker bench sudo)
 EGRESS_RULE=(OUTPUT -m owner --uid-owner "${SANDBOX_USER}" -j REJECT)
 # The rule an earlier version of this script installed (loopback exempt).
 OLD_EGRESS_RULE=(OUTPUT -m owner --uid-owner "${SANDBOX_USER}" ! -o lo -j REJECT)
 RESOLVER_SOCKETS=(/run/systemd/resolve/io.systemd.Resolve /run/nscd/socket)
-ACL_UNIT=/etc/systemd/system/nemotron35-sandbox-acl.service
-EGRESS_UNIT=/etc/systemd/system/nemotron35-sandbox-egress.service
+ACL_UNIT="/etc/systemd/system/${ACL_UNIT:-nemotron35-sandbox-acl.service}"
+EGRESS_UNIT="/etc/systemd/system/${EGRESS_UNIT:-nemotron35-sandbox-egress.service}"
 DENY_FILES=(/etc/cron.deny /etc/at.deny)
-WIPE_LIST=/etc/nemotron35-sandbox/wipe-dirs
+WIPE_LIST="${SANDBOX_ETC}/wipe-dirs"
 # Local filesystems scanned for world-writable directories (the kernel and
 # container-image trees are not: /proc and /sys are pseudo filesystems, and
 # docker's and containerd's layers sit under root-only directories).
@@ -317,7 +334,7 @@ setup_sudoers() {
   sudoers_ok && return 0
   # sudo skips names containing a dot, so the temp file is inert until the rename.
   local tmp
-  tmp="$(mktemp "$(dirname "${SUDOERS_FILE}")/.nemotron35-sandbox.XXXXXX")"
+  tmp="$(mktemp "$(dirname "${SUDOERS_FILE}")/.${SUDOERS_NAME}.XXXXXX")"
   printf '%s\n' "${SUDOERS_LINE}" > "${tmp}"
   chmod 0440 "${tmp}"
   visudo -cf "${tmp}" >/dev/null || { rm -f "${tmp}"; fail "visudo rejected the sudoers drop-in; nothing installed"; }
@@ -397,7 +414,7 @@ setup_egress_unit() {
   # The rules go into a small root-owned script the unit runs by path: systemd
   # does not parse quoting the way bash does, so no rule text is embedded in
   # the unit file itself.
-  script=/etc/nemotron35-sandbox/egress.sh
+  script="${SANDBOX_ETC}/egress.sh"
   install -d -m 0755 -o root -g root "$(dirname -- "${script}")"
   tmp="$(mktemp)"
   {
