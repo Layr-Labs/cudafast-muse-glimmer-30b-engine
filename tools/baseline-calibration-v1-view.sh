@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Flatten baseline calibration JSON to the v1 field layout readers expect.
-# Version 1 is passed through; version 2 merges top-level metadata with the
-# prompts[] entry whose prompt matches CALIBRATION_PROMPT.
+# Version 3 merges the top-level metadata with the prompts[] entry whose prompt
+# matches CALIBRATION_PROMPT. Versions 1 and 2 are refused: their decode mean is
+# the whole window (seed prefill plus decode, over N), not the decode window.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
@@ -15,10 +16,7 @@ cal_prompt="$2"
 cal_version="$(jq -r '.version // empty' "${cal_file}")"
 
 case "${cal_version}" in
-  1)
-    jq -c '.' "${cal_file}"
-    ;;
-  2)
+  3)
     count="$(jq -r --arg p "${cal_prompt}" '[.prompts[]? | select(.prompt == $p)] | length' "${cal_file}")"
     if [[ "${count}" -eq 0 ]]; then
       echo "no prompts[] entry for prompt '${cal_prompt}'" >&2

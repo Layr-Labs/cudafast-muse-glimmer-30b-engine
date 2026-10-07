@@ -7,14 +7,14 @@ team.
 ## Why
 
 A candidate engine necessarily sees the scored prompt at run time. The sealed
-record carries no engine text and only a few engine-chosen bits
-(docs/sandbox-design.md), but timing itself is a slow side channel, and teams
-may submit without limit. A prompt learned that way could be hard-coded into an
-engine for a fake speed-up. Three layers limit the damage:
+record names a prompt only by its sha256, but it can carry engine-chosen
+values. Timing is a slow side channel too, and teams may submit without limit.
+A prompt learned that way could be hard-coded into an engine for a fake
+speed-up. Three layers limit the damage:
 
 1. **Every live golden per job**: each ranked job measures every prompt of
-   the fixture's `live_goldens`, one pair per prompt, and scores the
-   lower-median pair.
+   the fixture's `live_goldens`, one pair per prompt, and scores the mean of
+   the per-pair composites.
 2. **Pool refresh every 3-4 days** (4 refreshes in two weeks): the live pool is
    replaced by 8 prompts no submission has seen.
 3. **Final re-score**: at the close, the top submissions are re-measured on a

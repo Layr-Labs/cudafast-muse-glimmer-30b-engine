@@ -89,17 +89,13 @@ holds the first three in CI.
 
 ## 5. Open items (external)
 
-1. **benchd — this track runs its OWN benchd.** It is the GumbiiDigital fork
-   `GumbiiDigital/mlxfast-bench`, branch `gumbii/nemotron35-own`: upstream
-   `main` @ `a0c95cd` plus this track's contract-oracle entry and two
-   behavioural changes (section 7.7): the 60 °C GB10 cool gate and the
-   fixture-declared median of several timed prefill passes.
-   `tools/fetch-benchd.sh` pins dist commit `1dfdf28` (source `ad17f32`,
-   linux-aarch64 only, rebuilt with no cache to the same bytes) and refuses any
-   other `source_commit`. The fork's workspace suite passes (1207 tests). The
-   bench-runner "Text file busy" test flake is upstream's; it passes
-   single-threaded. The earlier upstream PR branch
-   (`track/nemotron35-lightning-contract-fixture`) is superseded.
+1. **benchd — Layr-Labs bench-dev `main`.** `tools/fetch-benchd.sh` pins dist
+   commit `e4e3110` (bench pull request 386), built from source `44f1fda`, and
+   refuses any other `source_commit`. The source is main `ecd66fe` plus the two
+   changes this track needs: the 60 °C GB10 cool gate and the fixture-declared
+   median of several timed prefill passes (section 7.7). The track used the
+   GumbiiDigital fork (`gumbii/nemotron35-own`) until 2026-10-07. Section 7.13
+   lists what changed when it moved.
 2. **Goldens — recorded, pinned and staged.**
    The 56 live-pool goldens (8 prompts, each a serial golden plus six
    per-depth oracles) and the public golden are recorded, pinned and staged on
@@ -116,7 +112,8 @@ holds the first three in CI.
    the median of five timed passes. The gate is 60 °C.
 5. **GB10 temperature — resolved.** `nvidia-smi` reports a GPU temperature on
    all eight Sparks, and the cool gate is 60 °C (section 7.5).
-6. **Logit ties — resolved by the timed reference replay (section 7.8).**
+6. **Logit ties — open.** The current benchd has no timed reference replay, so
+   the timed window is an exact match (sections 7.8 and 7.13).
 
 ## 6. Verification on the Spark cluster (before arming)
 
@@ -136,7 +133,7 @@ holds the first three in CI.
    - serial twice gives identical tokens;
    - serial against mtp1 to mtp6 stays inside the 10% budget;
    - the same holds across boxes.
-5. **Calibration:** `tools/calibrate-box.sh` on every box, 4 passes, a CV of 1%
+5. **Calibration:** `tools/calibrate-box.sh` on every box, 3 passes, a CV of 1%
    or less.
 6. **Null control:** the reference against itself scores about 1.000 on every
    box. The same tree with MTP depth 3 declared scores above 1.
@@ -377,8 +374,14 @@ holds the first three in CI.
   published reference commit is pinned. Rerun `tools/calibrate-box.sh` then;
   the numbers should not move.
 
-### 7.8 Logit ties make the timed window's exact-match check brittle (resolved: reference replay)
+### 7.8 Logit ties make the timed window's exact-match check brittle (fork replay, not in the current benchd)
 
+- **Status (2026-10-07).** The reference replay below was built in the
+  GumbiiDigital fork benchd. The current benchd (Layr-Labs bench main, section
+  7.13) does not have it, and the fixture no longer declares
+  `timed_replay_max_logit_gap` or `timed_replay_off_argmax_per_thousand`. The
+  timed decode window is an exact match against the per-depth oracle. Main has
+  its own timed token tolerance, which this track does not enable.
 - **What was found.**
   - The target's logits come out of the NVFP4 `lm_head` in BF16. Near the top
     of the distribution their resolution is 1/16 to 1/8, so the top two
@@ -602,7 +605,8 @@ good draws reached the ranking. All three are fixed and tested on the boxes.
 - **Sealed refusal text.** benchd's out-of-band refusal no longer seals
   control-leg timings, calibration numbers or the box name in the text. A
   refused run seals no timings at all: benchd source `9403e9f`, dist
-  `a8fafeb`.
+  `a8fafeb`. This was a fork change. The current benchd does not have it
+  (section 7.13).
 - **The egress rule did not survive reboots.**
   - What happened: a wifi-controller firmware update power-cycled all 8
     boxes. The rule that rejects all `nemosub` traffic had been persisted only
@@ -633,3 +637,34 @@ good draws reached the ranking. All three are fixed and tested on the boxes.
     own timing.
 - **Router PATH.** After a `gh` upgrade, the router found no `gh` and
   dispatched nothing for 4 hours. Its PATH now uses mise's stable shims.
+
+### 7.13 benchd moves from the fork to Layr-Labs bench main (2026-10-07)
+
+- **What changed.** `tools/fetch-benchd.sh` resolves Layr-Labs bench-dev
+  `main`, dist `e4e3110`, source `44f1fda`. Before, it resolved the
+  GumbiiDigital fork, branch `gumbii/nemotron35-own`, dist `a8fafeb`, source
+  `9403e9f`.
+- **What the new benchd adds.**
+
+  | Change | Effect on this track |
+  |---|---|
+  | Decode is the decode window (`ecd66fe`) | Decode seconds per token = the time of `free_decode_run(N)` / N, with no seed prefill. The decode gain, the band and the floors use it. |
+  | Calibration file version 3 (`ecd66fe`) | benchd and `tools/ranked-box-preflight.sh` refuse versions 1 and 2. Every box must recalibrate. |
+  | `official_pair_combine` (`1aa7721`) | The fixture declares `mean`. The score is the mean of the 3 per-pair composites, and every pair is gated. |
+  | 3 calibration passes | `tools/calibrate-box.sh` defaults to 3 passes, not 4 (David 2026-10-06). |
+
+- **What the fork had and main does not have.**
+
+  | Fork change | Now |
+  |---|---|
+  | Timed-divergence reference replay (section 7.8) | Removed from the fixture. The timed window is an exact match. |
+  | `iterate --live-prompt` rotation | Not used. Every job measures every live golden. |
+  | 0.97–1.03 decode band default | Main's default is 0.98–1.02. The fixture still declares a 3% up tolerance, which main reads. |
+  | Stricter sealing (section 7.12) | Not in main. The sealed record can carry engine-chosen values. |
+  | This track's contract-oracle entry | Not in main. benchd reads the fixture. |
+
+- **Kept.** The 60 °C GB10 cool gate and `official_prefill_timed_runs` (the
+  median of 5 timed prefill passes) are in main at `44f1fda`.
+- **Fixture parse check.** `bench-core` at `44f1fda` parses the fixture and
+  certifies it: `official_pair_combine` = mean, 3 pairs, 5 timed prefill passes
+  and 1 warm-up, floors 0.95, bands 5% prefill and 3% decode (up only).

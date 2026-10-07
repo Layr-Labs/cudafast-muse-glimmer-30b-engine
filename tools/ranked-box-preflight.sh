@@ -634,16 +634,23 @@ ok "reference workspace carries its engine build (vLLM overlay) and the staged a
 jq -e . >/dev/null 2>&1 < "${BASELINE_CALIBRATION}" \
   || fail "the baseline calibration is not valid JSON: ${BASELINE_CALIBRATION}"
 
+# Version 3 holds one entry for each prompt in prompts[], and its decode mean is
+# the DECODE WINDOW per token: decode-run time / N, with no seed prefill in it
+# (benchd ecd66fe, David 2026-10-07). Versions 1 and 2 recorded the whole window
+# (seed prefill plus decode, over N) as decode, so their band does not describe
+# the control leg benchd measures now.
 cal_version="$(jq -r '.version // empty' "${BASELINE_CALIBRATION}")"
-[[ "${cal_version}" == "1" || "${cal_version}" == "2" ]] \
-  || fail "the baseline calibration declares version '${cal_version}'; this preflight reads version 1 and 2 only"
+[[ "${cal_version}" != "1" && "${cal_version}" != "2" ]] \
+  || fail "the baseline calibration declares version '${cal_version}': it recorded decode as the whole window (seed prefill plus decode, over N), and decode is now the decode window only (decode-run time / N). Recalibrate this box with tools/calibrate-box.sh and a benchd at or after ecd66fe, which writes version 3"
+[[ "${cal_version}" == "3" ]] \
+  || fail "the baseline calibration declares version '${cal_version}'; this preflight reads version 3 only"
 
 # THE CALIBRATION PROMPTS. Under live_goldens every listed prompt carries its
 # own band, and benchd gates each control leg with the band of the prompt it
 # measured. Otherwise the band is captured on the fixture's calibration_prompt
 # (default: live_golden) and gates the serial-control leg on whichever pool
-# prompt the job drew. Version 2 stores per-prompt bands in prompts[]; flatten
-# to the v1 field layout before the per-prompt checks.
+# prompt the job drew. Version 3 stores per-prompt bands in prompts[]; flatten
+# one entry and the file header into one object before the per-prompt checks.
 if [[ "$(jq -r 'has("live_goldens")' "${CONTRACT}")" == "true" ]]; then
   mapfile -t CALIBRATION_PROMPTS < <(jq -r '.live_goldens[]' "${CONTRACT}")
 else
@@ -673,7 +680,7 @@ cal_ref="$(jq -r '.reference_commit // empty' "${BASELINE_CALIBRATION}")"
 check_band() { # check_band PROMPT -- the band checks for one calibration prompt
 CALIBRATION_PROMPT="$1"
 CAL_FOR_CHECKS="${BASELINE_CALIBRATION}"
-if [[ "${cal_version}" == "2" ]]; then
+if [[ "${cal_version}" == "3" ]]; then
   cal_view_tmp="$(mktemp "${TMPDIR:-/tmp}/baseline-cal.XXXXXX")"
   trap 'rm -f "${cal_view_tmp:-}"' EXIT  # removed on every refusal path too
   cal_view_err="$(mktemp "${TMPDIR:-/tmp}/baseline-cal-err.XXXXXX")"

@@ -73,8 +73,8 @@
 #
 # BOTH MANIFEST SHAPES ARE LIVE, so both are handled here:
 #
-#   * NO `binaries` entry for the recorder (the legacy six-field manifest, and
-#     what the nemotron3.5-lightning-30b-a3b-v1 channel still serves until its republish):
+#   * NO `binaries` entry for the recorder (the legacy six-field manifest that
+#     older channels serve):
 #     benchd only, byte for byte the behaviour this script always had. The
 #     recorder is not fetched, not required, and not staged.
 #   * AN ENTRY IS PRESENT: the recorder is taken from the SAME platform
@@ -129,14 +129,13 @@
 # stderr), so callers can do:  BENCHD="$(./tools/fetch-benchd.sh)"
 #
 # Env:
-#   BENCHD_BRANCH       channel branch the manifest must name. Default:
-#                       gumbii/nemotron35-own. This track runs its OWN benchd:
-#                       the GumbiiDigital fork of mlxfast-bench. Its
-#                       behavioural changes from upstream main: the 60 C GB10
-#                       cool gate, the fixture-declared median of several
-#                       timed prefill passes, and the fixture-declared
-#                       timed-divergence reference replay
-#                       (docs/nemotron35-port-notes.md sections 7.5, 7.7, 7.8).
+#   BENCHD_BRANCH       channel branch the manifest must name. Default: main.
+#                       benchd is published from Layr-Labs bench-dev main.
+#                       There is no per-track bench branch. Main carries the
+#                       two changes this track needs: the fixture-declared
+#                       median of several timed prefill passes and the 60 C
+#                       GB10 cool gate (docs/nemotron35-port-notes.md
+#                       sections 7.5, 7.7 and 7.13).
 #   BENCHD_COMMIT       the bench commit whose dist/ is fetched. Default: the
 #                       PINNED commit below. The pin is the whole point: the
 #                       channel tip can move, a commit cannot. Advancing benchd
@@ -164,27 +163,32 @@
 #                       directory.
 #   BENCHD_DIST_BASE_URL
 #                       raw host + repo prefix. Default:
-#                       https://raw.githubusercontent.com/GumbiiDigital/mlxfast-bench
-#                       -- the public fork that owns this track's benchd and
-#                       its dist channel. It is public, so a fetch needs no
-#                       token. It publishes linux-aarch64 only (the Spark).
+#                       https://raw.githubusercontent.com/Layr-Labs/mlxfast-bench-dev
+#                       -- the DEVELOPMENT bench repository, which holds this
+#                       track's dist channel while the track is internal. It is
+#                       PRIVATE, so a fetch needs BENCHD_DIST_TOKEN/GITHUB_TOKEN,
+#                       or a verified pair through BENCHD_DIST_LOCAL or in
+#                       benchd-bin/ (the offline path). At launch this default
+#                       changes to the public repository.
 #   BENCHD_DIST_TOKEN / GITHUB_TOKEN
 #                       bearer token for a private channel repo.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BRANCH="${BENCHD_BRANCH:-gumbii/nemotron35-own}"
-# THE PIN. GumbiiDigital/mlxfast-bench gumbii/nemotron35-own @ a8fafeb
-# publishes dist/linux-aarch64 and dist/linux-x86_64 built from source_commit
-# 9403e9f: upstream main 17254d4 (2026-09-28 snapshot) merged with this track's
-# contract oracle + the 60 C GB10 cool gate + the fixture-declared median of
-# timed prefill passes + the fixture-declared timed-divergence reference replay
-# + the 0.97-1.03 serial-control decode band + per-job scored-prompt rotation
-# via iterate --live-prompt + sealed records that carry no engine-controlled
-# text, no golden or engine token ids, no prompt names, and engine-chosen
-# numbers only bucketed or rounded, and no timings at all on a band refusal.
-PINNED_COMMIT="a8fafeb8daef0168eb80b40fbb875b957bb999eb"
-PINNED_SOURCE_COMMIT="9403e9f9ae036a7c2b7195f55a05f25fb58b9692"
+BRANCH="${BENCHD_BRANCH:-main}"
+# THE PIN. Layr-Labs/mlxfast-bench-dev main @ e4e3110 (bench pull request 386)
+# publishes dist/ (aarch64-apple-darwin), dist/linux-aarch64 and
+# dist/linux-x86_64, built from source_commit 44f1fda. That source is main
+# ecd66fe plus two changes:
+#   * ecd66fe: decode is the decode window (decode-run time / N, with no seed
+#     prefill), the calibration file is version 3, and the fixture's
+#     official_pair_combine selects the mean of the per-pair composites;
+#   * 44f1fda: the fixture-declared median of the timed prefill passes
+#     (official_prefill_timed_runs) and the 60 C GB10 cool gate.
+# This benchd has no timed-divergence reference replay: the timed decode window
+# is an exact match against the per-depth oracle.
+PINNED_COMMIT="e4e3110e9e3b28129731c2459e8ed825a5863b58"
+PINNED_SOURCE_COMMIT="44f1fdafb38cf82c1baed81d77ca0cd59d6aba39"
 COMMIT="${BENCHD_COMMIT:-${PINNED_COMMIT}}"
 SOURCE_COMMIT_PIN="${BENCHD_SOURCE_COMMIT:-${PINNED_SOURCE_COMMIT}}"
 DEST_DIR="${BENCHD_BIN_DIR:-${REPO_ROOT}/benchd-bin}"
@@ -194,9 +198,9 @@ DEST_MANIFEST="${DEST_DIR}/benchd.manifest.json"
 # the manifest's `binaries` key and the name in the same platform directory.
 RECORDER_NAME="record-correctness-golden"
 DEST_RECORDER="${DEST_DIR}/${RECORDER_NAME}"
-# The public bench repository is the default channel. See the
-# BENCHD_DIST_BASE_URL note above.
-BASE_URL="${BENCHD_DIST_BASE_URL:-https://raw.githubusercontent.com/GumbiiDigital/mlxfast-bench}"
+# The DEVELOPMENT bench repository is the default channel while the track is
+# internal. See the BENCHD_DIST_BASE_URL note above.
+BASE_URL="${BENCHD_DIST_BASE_URL:-https://raw.githubusercontent.com/Layr-Labs/mlxfast-bench-dev}"
 
 die() {
   echo "fetch-benchd.sh: $*" >&2

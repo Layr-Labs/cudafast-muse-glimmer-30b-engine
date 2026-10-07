@@ -178,7 +178,7 @@ export MLXFAST_QWEN_MTP_TRACK_ID="${MANIFEST_TRACK_ID}"
 #
 # benchd measures the pairs in turn: pair k measures golden (k - 1) mod N, so
 # official_pairs is a multiple of N and every live golden gets the same number
-# of pairs. The score is the lower-median pair. Every golden flag below is
+# of pairs. The score is the mean of the per-pair composites. Every golden flag below is
 # repeated once per live golden, in fixture order, and benchd matches the flags
 # by position.
 #

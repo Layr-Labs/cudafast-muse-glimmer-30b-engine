@@ -45,10 +45,11 @@
 #                                 the control leg must land inside
 #
 # PAIRED, WITH A PER-BOX BASELINE (contract §5.1). A ranked run measures the
-# fixture's `official_pairs` PAIRS OF LEGS on THIS box in THIS job over the ONE
+# fixture's `official_pairs` PAIRS OF LEGS on THIS box in THIS job, one pair per
 # live golden: each pair is a SERIAL CONTROL leg on the reference tree and a
-# CANDIDATE leg on the dispatched commit. Per role the per-token times are summed
-# over the pairs, and the score is the ratio of those sums. No pair is stored
+# CANDIDATE leg on the dispatched commit. Each pair has its own composite, and
+# the score is the mean of the per-pair composites (official_pair_combine:
+# mean). Decode is the decode window: decode-run time / N. No pair is stored
 # anywhere -- not in a benchd constant, not in the fixture, not in a golden -- so
 # a box that is missing either variable is refused before any work rather than
 # scored against a number from somewhere else.

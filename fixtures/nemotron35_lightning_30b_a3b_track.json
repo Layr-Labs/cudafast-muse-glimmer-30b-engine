@@ -4,6 +4,7 @@
   "track_name": "Nemotron 3.5 Lightning 30B-A3B NVFP4 CUDA -- composite paired speedup",
   "official_scoring_enabled": false,
   "official_pairs": 3,
+  "official_pair_combine": "mean",
   "runner": {
     "provider": "github-actions",
     "workflow": "benchmark.yml",
@@ -37,8 +38,6 @@
   "local_submit_benchmark_decode_steps": 1023,
   "official_prefill_warmup_runs": 1,
   "official_prefill_timed_runs": 5,
-  "timed_replay_max_logit_gap": 2.0,
-  "timed_replay_off_argmax_per_thousand": 100,
   "vocab_size": 131072,
   "num_hidden_layers": 52,
   "seed_tokens": 496,
@@ -681,6 +680,6 @@
     ]
   },
   "scoring_semantics": {
-    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = control / candidate per-token time (serial-anchored -- a faster candidate scores > 1). The run is PAIRED on the box: official_pairs pairs, each one serial-control leg on the organizer-staged reference tree and one candidate leg at the declared draft depth, single-stream. Pair k measures live_goldens[(k - 1) mod N], so each live golden gets the same number of pairs. The score is the pair with the lower-median composite. Floors and the ceiling apply to that pair."
+    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = control / candidate per-token time (serial-anchored -- a faster candidate scores > 1). Decode per-token time is the decode window: decode-run time / N, with no seed prefill in it. The run is PAIRED on the box: official_pairs pairs, each one serial-control leg on the organizer-staged reference tree and one candidate leg at the declared draft depth, single-stream. Pair k measures live_goldens[(k - 1) mod N], so each live golden gets the same number of pairs. The score is the mean of the per-pair composites (official_pair_combine: mean). Floors and the ceiling apply to every pair."
   }
 }

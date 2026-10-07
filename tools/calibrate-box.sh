@@ -32,11 +32,11 @@
 # `tools/serve-up.sh --boot --spec serial --draft-len 0` from that workspace,
 # reads the socket back, injects it into that pass's worker spawn, measures the
 # pass, and `--stop`s the resident before the next pass boots. ONE RESIDENT PER
-# PASS, never one shared across the four.
+# PASS, never one shared across the three.
 #
 # THAT IS DELIBERATE, and it is what makes the band describe the scored leg. A
 # scored run boots its control leg's resident once and measures it once, so a
-# pass measured on a resident that four passes had already warmed would not be
+# pass measured on a resident that earlier passes had already warmed would not be
 # the same measurement. Paying the load per pass buys a band whose passes are
 # each shaped like the leg they certify -- and it is also what makes the CV
 # meaningful, because load-to-load variation is inside the sample instead of
@@ -86,7 +86,7 @@ export CALIBRATE_BOX_SETSID=1
 
 FIXTURE="${REPO_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
 MANIFEST="${REPO_DIR}/benchmark.json"
-PASSES=4
+PASSES=3
 LOCK_PATH=/tmp/mtplx-gpu-exclusive.lock
 LOCK_WAIT=600
 DRY_RUN=0
@@ -107,7 +107,7 @@ usage: calibrate-box.sh <box> <out> [options]
                    attributed to a box is a band from anywhere
   <out>            where the calibration file is written
 
-  --passes N       control-leg passes (default 4). At least 2: the CV is
+  --passes N       control-leg passes (default 3). At least 2: the CV is
                    undefined below two
   --fixture FILE   track fixture (default: this repo's)
   --lock PATH      GPU lock (default /tmp/mtplx-gpu-exclusive.lock)

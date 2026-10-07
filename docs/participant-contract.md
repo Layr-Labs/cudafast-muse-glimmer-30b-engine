@@ -26,6 +26,10 @@ The benchmarker is a prebuilt `benchd` binary. `./tools/fetch-benchd.sh`
 resolves it from the bench repository's release channel for this track, and
 verifies it against the channel's `benchd.manifest.json` (`{branch,
 source_commit, sha256, bytes}`). A submission cannot change what measures it.
+While the track is internal, the channel is the `main` branch of the
+DEVELOPMENT bench repository. That repository is private, so the fetch needs
+`GITHUB_TOKEN` (or `BENCHD_DIST_TOKEN`), or a verified pair through
+`BENCHD_DIST_LOCAL`. At launch the channel moves to the public repository.
 
 ## 2. What the track measures
 
@@ -255,12 +259,22 @@ overlapping:
 - **Legs.** Each pair is one SERIAL CONTROL leg on the organizer-staged
   reference tree at `baseline_reference_commit`, then one CANDIDATE leg on the
   submission at its declared depth.
-- **Aggregation.** benchd computes one composite per pair. The score is the
-  pair with the lower-median composite, and the floors and the ceiling apply
-  to that pair.
+- **Aggregation.** benchd computes one composite per pair. The fixture
+  declares `official_pair_combine: "mean"`, so the score is the arithmetic
+  mean of the 3 per-pair composites. The floors and the bands gate every pair
+  on its own, each against its own control leg. The first pair that fails
+  stops the run. Every pair stays in `metrics.paired_legs` as measured.
 
 No baseline is stored anywhere; the control leg measures it next to the
 candidate.
+
+**What decode means.** Decode seconds per token is the decode window: the time
+of `free_decode_run(N)` divided by N. The seed prefill of the prompt is not
+part of it. Prefill is its own phase, timed on its own. `decode_gain` is the
+control leg's decode window per token divided by the candidate leg's. The
+calibration band and the floors use the same figure. benchd seals the seed
+prefill window as a report-only figure under
+`*_seed_prefill_window_seconds_per_token`.
 
 #### 5.1.1 Where the prefill window is, and why you cannot move work out of it
 
@@ -279,9 +293,10 @@ What the engine owes:
 2. `free_decode_run` never re-prefills. It decodes from the state `begin` left.
 3. Nothing prefills before `free_decode_begin` arrives.
 
-**Moving work between windows is a scoring defect, not an optimisation.** The
-composite weights prefill 0.25 and decode 0.75, so shifting work from one
-window to the other moves the score without saving anything.
+**Moving work between windows is a scoring defect, not an optimisation.**
+Deferred seed work lands in the decode window and makes decode slower. Decode
+work done early, inside `free_decode_begin`, leaves the decode window and is
+not scored, which breaks obligations 1 and 2 above.
 
 The seed token's index: `seed_token` is `expected_decode_seed_token`;
 `free_decode_run` returns the N tokens after it, so `tokens[0]` = `expected_decode_tokens[0]`.
@@ -311,12 +326,12 @@ The fixture's `live_goldens` lists three hidden coding prompts. Each one is a
 user message rendered through the pinned `chat_template.jinja` with thinking
 off, and is exactly `seed_tokens` long. Every job measures every live golden:
 pair k measures `live_goldens[(k - 1) mod 3]`, and both legs of a pair measure
-the same prompt, so the ratio compares like with like. The score is the pair
-with the lower-median composite. `score.json` never names a prompt; it
-identifies a golden only by its sha256.
+the same prompt, so the ratio compares like with like. The score is the mean
+of the per-pair composites. `metrics.paired_legs` identifies each pair's
+prompt by its sha256.
 
 Why: one pair per prompt makes the score depend on all three prompts, and the
-lower median keeps one slow or fast prompt from deciding the score alone.
+mean gives each prompt the same weight.
 Every live golden carries its own serial golden and one timed oracle per draft
 depth, and the run refuses a declared depth that has no oracle.
 
@@ -347,37 +362,19 @@ the serial tape. Every per-depth golden carries the SAME serial `cases[]`
 against serial. The gate accepts similar output. It does not certify lossless
 output.
 
-### 5.4.1 The timed window: exact match, then a reference replay
+### 5.4.1 The timed window: exact match
 
 The timed decode window is checked token by token against the timed golden for
-your declared depth. A token that differs is NOT an immediate failure. The
-logits of this checkpoint are BF16, so the reference's top two tokens tie
+your declared depth. Every committed token must match. A token that differs
+fails the run. The ranked run and the local modes apply the same rule.
+
+The logits of this checkpoint are BF16, so the reference's top two tokens tie
 exactly, or sit one BF16 step apart, several times in every 128 tokens. A
 faster kernel, or a speculative verify that quantizes activations over several
-tokens at once, can resolve such a tie differently.
+tokens at once, can resolve such a tie differently and fail the run.
 
-So benchd records your committed stream from the first divergence. After the
-pairs, it boots the reference engine and replays that stream through it,
-teacher-forced. The run passes only when:
-
-- every committed token that is in the reference's top 8 at its position is
-  at most **2.0 logits** below the reference's top logit there
-  (`timed_replay_max_logit_gap`); and
-- at most **100 per thousand** of the window's positions (12 of 129) are
-  off-argmax: more than one BF16 step below the top logit, or outside the top 8
-  (`timed_replay_off_argmax_per_thousand`).
-
-Otherwise the run seals `TIMED-REPLAY-REJECTED`, naming the pair (not the
-position: the sealed record carries no engine-chosen step or token). The two
-numbers are measured, not argued: the reference's own MTP-3 and MTP-6 streams
-on all 8 pool prompts, replayed the same way, stay within a 1.625-logit gap and
-9 off-argmax positions.
-
-A replay costs one more reference boot (about 4 minutes), and only in a job
-whose timed window diverged. The prefill phase's token gets the same treatment.
-The local modes (`tools/local-baseline.sh`, `--local-iterate`) have no reference
-to replay against, so they keep the exact match: a local failure that names a
-tie position may still pass the ranked replay.
+The benchmarker has no timed-divergence reference replay. The fixture declares
+no timed token tolerance, so none applies.
 
 ### 5.5 Arming
 
@@ -424,7 +421,7 @@ change.
 #### 5.5.1 The per-box calibration
 
 Each ranked box carries a calibration file, named by
-`MLXFAST_BASELINE_CALIBRATION` and written by `tools/calibrate-box.sh` (4
+`MLXFAST_BASELINE_CALIBRATION` and written by `tools/calibrate-box.sh` (3
 passes, one resident boot per pass). It is a HEALTH BAND for the control leg,
 never a denominator. A control leg outside the band fails the run by name. A box
 whose passes spread by more than 1% gets no band.
@@ -432,6 +429,8 @@ whose passes spread by more than 1% gets no band.
 `tools/ranked-box-preflight.sh` section 8b refuses a calibration file in any of
 these cases:
 
+- its `version` is not 3. Versions 1 and 2 recorded decode as the whole window
+  (seed prefill plus decode, over N), and the refusal says to recalibrate;
 - it names another track, box or reference commit, or a prompt other than the
   fixture's `calibration_prompt`;
 - it is dated before the reference commit or in the future;
@@ -609,6 +608,5 @@ trajectory;
 (c) a free-run trajectory can fork from the serial one at a near-tie, which is
 why each depth has its own timed oracle and why the gate prices divergence
 rather than forbidding it;
-(d) your engine can fork from the reference's trajectory at a near-tie, which is
-why the timed window replays a divergence through the reference
-(section 5.4.1) rather than failing it.
+(d) your engine can fork from the reference's trajectory at a near-tie, and the
+timed window then fails, because it requires an exact match (section 5.4.1).

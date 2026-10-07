@@ -123,8 +123,11 @@ The score is serial-anchored, so a faster candidate scores above 1.
 - **Every job measures every live golden.** Pair k measures prompt
   (k - 1) mod 3. Both legs of a pair measure the same prompt, so the ratio
   stays comparable.
-- **Aggregation.** Each pair has its own composite. The score is the pair with
-  the lower-median composite.
+- **Decode.** Decode time per token is the decode window: the time of
+  `free_decode_run(N)` divided by N. The seed prefill is not part of it.
+  Prefill is its own phase.
+- **Aggregation.** Each pair has its own composite. The score is the mean of
+  the 3 per-pair composites. Every pair must clear both floors.
 - **Bounds.** Both floors are 0.95, so a candidate that regresses prefill or
   decode by more than 5 percent is refused. The ceiling is 5.0.
 - **Correctness.** The per-stream token-tolerance gate prices divergence from
