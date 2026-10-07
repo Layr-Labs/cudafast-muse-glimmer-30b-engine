@@ -536,11 +536,13 @@ jobs:
         # this file's header; the preflight already refused the run if it is
         # absent.)
         #
-        # benchmark.json's benchmarkCommand runs character for character at the
-        # end: the golden pool, the reference workspace and this box's
-        # calibration file come from the runner environment, which the preflight
-        # has already verified; the dispatch sha comes from the step above via
-        # GITHUB_ENV.
+        # The ranked half of benchmark.json's benchmarkCommand runs at the end.
+        # That command runs tools/nemotron35-yukon-run.sh, which replaces itself
+        # with the same measure script when GITHUB_ACTIONS is "true". This step
+        # calls the measure script directly. The golden pool, the reference
+        # workspace and this box's calibration file come from the runner
+        # environment, which the preflight has already verified; the dispatch
+        # sha comes from the step above via GITHUB_ENV.
         #
         # ONE SERVE AT A TIME. The paired run measures 2 pairs, so 4 legs, and
         # each leg has its OWN resident engine. benchd boots each one through the
@@ -683,7 +685,7 @@ jobs:
           done
           echo "paired baseline: workspace=${MLXFAST_BASELINE_WORKSPACE} calibration=${MLXFAST_BASELINE_CALIBRATION}"
 
-          # -- measure and score (benchmark.json benchmarkCommand) ----------
+          # -- measure and score (ranked half of benchmarkCommand) ---------
           # measure-and-score.sh forwards the two as benchd's
           # --baseline-workspace and --baseline-calibration, and refuses by name
           # when either is unset.

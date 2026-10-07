@@ -107,6 +107,21 @@ local-iterate leg over the public golden,
 organizer recorded on a Spark. A local run seals `score: null`: only the paired
 ranked path produces a score.
 
+```bash
+yukon setup
+```
+
+This command runs `setupCommand`: `./tools/fetch-benchd.sh`, then
+`./setup.sh`.
+
+```bash
+yukon run
+```
+
+This command runs `benchmarkCommand`. Off a ranked box it runs
+`./tools/local-baseline.sh` and seals `score.json` with `"score": null`. Only
+the ranked runner gives a score.
+
 ## Iterating without a GPU
 
 ```bash

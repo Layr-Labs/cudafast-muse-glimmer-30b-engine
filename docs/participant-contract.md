@@ -489,7 +489,18 @@ file's byte count and sha256 against its pin before a ranked run. The fixture's
 
 ## 6. Running the benchmark
 
-`benchmarkCommand` runs `tools/nemotron35-measure-and-score.sh`, which execs:
+`benchmarkCommand` runs `tools/nemotron35-yukon-run.sh`. That script selects
+one of two paths:
+
+| Condition | Path |
+|---|---|
+| `GITHUB_ACTIONS` is `true`, or one or more of `MLXFAST_NEMOTRON35_GOLDEN_DIR`, `MLXFAST_BASELINE_WORKSPACE` and `MLXFAST_BASELINE_CALIBRATION` is set | Ranked. The script replaces itself with `tools/nemotron35-measure-and-score.sh`. |
+| None of these | Local. The script runs `tools/local-baseline.sh`, which runs `./benchmark.sh --local-iterate` over the public golden at the declared depth. The result has `"score": null`. |
+
+The ranked workflow calls `tools/nemotron35-measure-and-score.sh` directly.
+Both scripts are trusted-side tooling.
+
+The ranked script execs:
 
 ```text
 benchd iterate --mode official \

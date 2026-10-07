@@ -18,6 +18,7 @@ push (`AGENTS.md`, "Checks before you submit"). It holds no credential.
 | participant engine edit | the editable list, benchd's harness-hash roster, and that a `vllm/vllm/` edit reaches the staged overlay while compiled extensions survive |
 | serve-up boot/stop, memory plan | the real `serve-up.sh` and the real resident (fake backend) |
 | facade, local baseline, setup onboarding | the entry points, through a real resident boot |
+| yukon run | `benchmarkCommand` reaches the ranked script on a ranked box and `tools/local-baseline.sh` off one |
 | spec declaration | the declaration envelope |
 | ranked preflight | every environment refusal, and the section 8 paired-baseline refusals on a scaffolded box |
 | calibrator, stager, golden fetcher, box runner | their mechanics, with stub collaborators |
