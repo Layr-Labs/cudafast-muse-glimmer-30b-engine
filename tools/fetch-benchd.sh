@@ -176,19 +176,21 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRANCH="${BENCHD_BRANCH:-main}"
-# THE PIN. Layr-Labs/mlxfast-bench-dev main @ e4e3110 (bench pull request 386)
+# THE PIN. Layr-Labs/mlxfast-bench-dev main @ 4574a99 (bench pull request 390)
 # publishes dist/ (aarch64-apple-darwin), dist/linux-aarch64 and
-# dist/linux-x86_64, built from source_commit 44f1fda. That source is main
-# ecd66fe plus two changes:
+# dist/linux-x86_64, built from source_commit d6c7af8. That source includes:
 #   * ecd66fe: decode is the decode window (decode-run time / N, with no seed
 #     prefill), the calibration file is version 3, and the fixture's
 #     official_pair_combine selects the mean of the per-pair composites;
 #   * 44f1fda: the fixture-declared median of the timed prefill passes
-#     (official_prefill_timed_runs) and the 60 C GB10 cool gate.
+#     (official_prefill_timed_runs) and the 60 C GB10 cool gate;
+#   * bench pull requests 387 and 389: the local modes seal the decode-window
+#     and seed keys, and one implementation each of decode, prefill, gain,
+#     composite and combine (no value changes).
 # This benchd has no timed-divergence reference replay: the timed decode window
 # is an exact match against the per-depth oracle.
-PINNED_COMMIT="e4e3110e9e3b28129731c2459e8ed825a5863b58"
-PINNED_SOURCE_COMMIT="44f1fdafb38cf82c1baed81d77ca0cd59d6aba39"
+PINNED_COMMIT="4574a9970809355ba7541e388fb086b621be8bb5"
+PINNED_SOURCE_COMMIT="d6c7af85eac6b5ef2e92dbed60177f81a42db8b7"
 COMMIT="${BENCHD_COMMIT:-${PINNED_COMMIT}}"
 SOURCE_COMMIT_PIN="${BENCHD_SOURCE_COMMIT:-${PINNED_SOURCE_COMMIT}}"
 DEST_DIR="${BENCHD_BIN_DIR:-${REPO_ROOT}/benchd-bin}"

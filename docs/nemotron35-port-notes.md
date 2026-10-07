@@ -90,9 +90,9 @@ holds the first three in CI.
 ## 5. Open items (external)
 
 1. **benchd — Layr-Labs bench-dev `main`.** `tools/fetch-benchd.sh` pins dist
-   commit `e4e3110` (bench pull request 386), built from source `44f1fda`, and
-   refuses any other `source_commit`. The source is main `ecd66fe` plus the two
-   changes this track needs: the 60 °C GB10 cool gate and the fixture-declared
+   commit `4574a99` (bench pull request 390), built from source `d6c7af8`, and
+   refuses any other `source_commit`. The source has main `ecd66fe` and the two
+   changes this track needs (bench pull request 386): the 60 °C GB10 cool gate and the fixture-declared
    median of several timed prefill passes (section 7.7). The track used the
    GumbiiDigital fork (`gumbii/nemotron35-own`) until 2026-10-07. Section 7.13
    lists what changed when it moved.
