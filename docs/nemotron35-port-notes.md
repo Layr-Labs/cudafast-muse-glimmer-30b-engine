@@ -90,7 +90,7 @@ holds the first three in CI.
 ## 5. Open items (external)
 
 1. **benchd — Layr-Labs bench-dev `main`.** `tools/fetch-benchd.sh` pins dist
-   commit `4574a99` (bench pull request 390), built from source `d6c7af8`, and
+   commit `84bfefe` (bench pull request 394), built from source `73f35b4`, and
    refuses any other `source_commit`. The source has main `ecd66fe` and the two
    changes this track needs (bench pull request 386): the 60 °C GB10 cool gate and the fixture-declared
    median of several timed prefill passes (section 7.7). The track used the
