@@ -6,7 +6,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import py_compile
 import random
+import shutil
 import subprocess
 import sys
 import sqlite3
@@ -584,6 +586,25 @@ class ScoreFromLogTest(unittest.TestCase):
 
     def test_no_block_returns_none(self):
         self.assertIsNone(router.score_from_log(self._gh("nothing here")))
+
+
+class NegBootFailVariantTest(unittest.TestCase):
+    def test_apply_variant_and_expect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resident = root / "harness/vllm_resident/resident.py"
+            resident.parent.mkdir(parents=True)
+            shutil.copy(REPO_ROOT / "harness/vllm_resident/resident.py", resident)
+            note = loadgen.apply_variant(root, "neg_boot_fail", random.Random(1))
+            text = resident.read_text()
+            self.assertIn("acceptance-test variant: refusing to boot", text)
+            self.assertIn("return 1", text)
+            self.assertLess(text.index("return 1"), text.index("loading the model"))
+            py_compile.compile(str(resident), doraise=True)
+            self.assertEqual(
+                note, "candidate resident exits at boot (exercises the pair-1 boot retry and teardown)")
+        self.assertEqual(router.EXPECT["boot_failed"], {"boot_failed"})
+        self.assertTrue(router.meets("boot_failed", "boot_failed"))
 
 
 class VariantsApplyTest(unittest.TestCase):

@@ -39,6 +39,7 @@ MIX = [
     (4, "neg_big_file", "refused"),
     (4, "neg_depth7", "refused"),
     (3, "neg_vllm_env", "measure"),         # observe-only: the contract relies on review here
+    (3, "neg_boot_fail", "boot_failed"),
     # Attack variants (weight 0: run them with --only):
     (0, "neg_forge_log", "pass"),           # fake score lines in the build log must not replace the real seal
     (0, "neg_shm_fill", "pass"),            # /dev/shm filled after each candidate leg must be wiped before the next reference leg
@@ -121,6 +122,13 @@ def apply_variant(root: Path, name: str, rng: random.Random) -> str:
         (k / "build.sh").write_text("#!/bin/sh\n" + "".join(f"printf '%s\\n' '{l}'\n" for l in lines) + "exit 0\n")
         (k / "build.sh").chmod(0o755)
         return "build.rs and kernels/build.sh print a fake score marker and a fake reveal block"
+    if name == "neg_boot_fail":
+        p = root / "harness/vllm_resident/resident.py"
+        edit(p, "    signal.signal(signal.SIGTERM, on_signal)\n",
+             "    signal.signal(signal.SIGTERM, on_signal)\n"
+             "    log('acceptance-test variant: refusing to boot')\n"
+             "    return 1\n")
+        return "candidate resident exits at boot (exercises the pair-1 boot retry and teardown)"
     if name == "neg_shm_fill":
         p = root / "harness/vllm_resident/resident.py"
         edit(p, "    signal.signal(signal.SIGTERM, on_signal)\n",

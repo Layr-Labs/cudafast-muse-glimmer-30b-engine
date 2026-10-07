@@ -880,6 +880,7 @@ def classify(conclusion, passed, error: str, failed_step: str, have_score: bool,
 EXPECT = {
     "pass": {"pass"},
     "replay_rejected": {"replay_rejected"},
+    "boot_failed": {"boot_failed"},
     "refused": {"surface_refused", "preflight_refused", "refused", "unsealed", "watchdog_timeout"},
     "measure": None,  # any terminal outcome is acceptable; the number is the point
 }
