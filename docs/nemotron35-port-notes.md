@@ -486,9 +486,10 @@ holds the first three in CI.
   - A cancelled job left its resident container on the GPU. The supervisor
     now removes `serve-up-*` containers on every path that ends a job.
   - The router read no box name, and did not parse the log score.
-- **No hosted runners, no artifacts.** The pipeline uses no GitHub-hosted
-  runner and uploads no artifact: the surface check runs on a box runner, and
-  the score reaches the dispatcher through the job log
+- **No hosted runners, one artifact.** The pipeline uses no GitHub-hosted
+  runner: the surface check runs on a box runner. The score reaches the
+  dispatcher as the sealed `score.json` artifact Yukon reads
+  (`benchmark-results-<run_id>/score.json`) and in the job log
   (`tools/router/README.md`). `ci.yml` is manual-only.
 - **Participant code ran as `runner` (resolved).** During this test untrusted
   build and engine code ran as the box's `runner` user, which is

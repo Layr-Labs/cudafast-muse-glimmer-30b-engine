@@ -48,7 +48,7 @@ as a script here; §9 says what covers each on this track:
 |---|---|---|
 | `.github/scripts/verify-trusted-source-scope.sh` | re-verifies the trusted source scope before the trusted build; refuses any `editablePaths` entry overlapping it | the intake service reads `editablePaths` from the trusted base only; the linter refuses an editable entry over the scorer's pin (A1); participant code runs as a user that cannot write the checkout (`docs/sandbox-design.md`) |
 | `.github/scripts/pin-trusted-harness.sh` | content pins over the built trusted and worker artifacts | benchd is fetched and sha256-verified by `tools/fetch-benchd.sh`; the staged engine shim is byte-checked by `tools/nemotron35-measure-and-score.sh`; participant builds cannot write trusted paths (`docs/sandbox-design.md`) |
-| `.github/scripts/deny-private-artifacts.sh` | refuses artifact/cache uploads that could leak hidden data | the ranked workflow uploads no artifact and uses no cache; the score is read from the job log |
+| `.github/scripts/deny-private-artifacts.sh` | refuses artifact/cache uploads that could leak hidden data | the ranked workflow uploads only the sealed `score.json` after sandbox cleanup and uses no cache; the score is read from that artifact and the job log |
 
 ## 1. Layer map
 
@@ -339,8 +339,9 @@ ranked workflow) is responsible for:
   `tools/nemotron35-measure-and-score.sh`; participant builds run as `nemosub`
   and cannot write any trusted path.
 - **Artifact exfiltration** (upstream `deny-private-artifacts.sh`). The ranked
-  workflow uploads no artifact and uses no cache; the score reaches the
-  dispatcher through the job log.
+  workflow uploads exactly one artifact, the sealed `score.json` after sandbox
+  cleanup, and uses no cache. `tools/ci-workflow-egress-scan.sh` fails any
+  other upload.
 
 **Not ported:**
 

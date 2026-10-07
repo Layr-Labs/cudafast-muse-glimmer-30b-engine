@@ -5,13 +5,13 @@
 # no-credential surface check runs first, and only if it passes does the
 # measurement reach the box.
 #
-# NO PAID GITHUB FEATURE (2026-09-27). Both jobs run on the box runners, not
-# GitHub-hosted runners, and the pipeline uploads no artifact. The score is
-# benchd's own output in the ranked job's log: the one-line
-# `benchd iterate: wrote score.json (passed=..., score=...)` marker, and the
-# score.json that the last step prints. The router reads that marker (tools/router/README.md).
-# benchmark.json's scoreArtifact field is kept for the shared manifest schema
-# and names no uploaded artifact.
+# Both jobs run on the box runners, not GitHub-hosted runners. The score is
+# benchd's own output: the ranked job prints the sealed score.json in its log
+# (the `benchd iterate: wrote score.json (passed=..., score=...)` marker and the
+# nonce-bound block; tools/router/README.md), and uploads that same file as the
+# one artifact Yukon reads back, benchmark.json's scoreArtifact
+# `benchmark-results-<run_id>/score.json`. The upload happens only after
+# sandbox cleanup, and only of the file the reveal step trusted.
 #
 # THIS IS THE SCORING PIPELINE, NOT THE ENGINE. The box orchestration here is
 # Linux/CUDA (the GB10 Spark). The measured engine -- the Engine Protocol v1
@@ -743,6 +743,7 @@ jobs:
           exit "${rc}"
 
       - name: Reveal the sealed score
+        id: reveal
         # After sandbox cleanup: no participant process can still be alive. The
         # nonce binds the printed JSON so earlier log lines cannot forge a block.
         if: always()
@@ -759,9 +760,21 @@ jobs:
               hash="$(sha256sum score.json | awk '{print $1}')"
               bytes="$(wc -c < score.json | tr -d '[:space:]')"
               echo "NEMOTRON35-SCORE-END ${nonce} sha256=${hash} bytes=${bytes}"
+              echo "upload=1" >> "${GITHUB_OUTPUT}"
             else
               echo "NEMOTRON35-SCORE-END ${nonce} none"
             fi
           else
             echo "NEMOTRON35-SCORE-END ${nonce} none"
           fi
+
+      - name: Upload score artifact
+        # The one artifact Yukon reads: benchmark.json scoreArtifact
+        # `benchmark-results-<run_id>/score.json`. Only the score.json the reveal
+        # step printed after a clean sandbox cleanup is uploaded.
+        if: always() && steps.reveal.outputs.upload == '1'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: score.json
+          if-no-files-found: error
