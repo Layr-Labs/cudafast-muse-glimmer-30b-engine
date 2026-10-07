@@ -31,6 +31,9 @@ class AdapterEndToEnd(unittest.TestCase):
     def boot(self, depth: int) -> tuple[subprocess.Popen, str]:
         d = tempfile.mkdtemp()
         sock, ready = os.path.join(d, "r.sock"), os.path.join(d, "ready")
+        self.log_path = os.path.join(d, "resident.log")
+        self.log_file = open(self.log_path, "w")
+        self.addCleanup(self.log_file.close)
         env = dict(
             os.environ,
             RESIDENT_BACKEND="fake",
@@ -39,7 +42,7 @@ class AdapterEndToEnd(unittest.TestCase):
             RESIDENT_READY_FILE=ready,
         )
         proc = subprocess.Popen(
-            [sys.executable, os.path.join(HERE, "resident.py")], env=env, stderr=subprocess.DEVNULL
+            [sys.executable, os.path.join(HERE, "resident.py")], env=env, stderr=self.log_file
         )
         deadline = time.time() + 20
         while not os.path.exists(ready):
@@ -83,6 +86,38 @@ class AdapterEndToEnd(unittest.TestCase):
                 if depth:
                     self.assertEqual(begin["effective_spec"]["mtp"]["depth"], depth)
                     self.assertGreater(run["drafted_total"], 0)
+
+    def resident_log(self) -> list[str]:
+        self.log_file.flush()
+        with open(self.log_path) as fp:
+            return [l.strip() for l in fp]
+
+    def test_nothing_runs_on_after_a_phase(self):
+        """benchd keeps ONE worker for a whole leg, so the resident sees no new
+        connection between phases. The phase close must stop the run-on decode
+        itself, inside the same connection: a timed prefill leaves nothing
+        running, and a free run is stopped at its phase_diagnostics."""
+        _, sock = self.boot(3)
+        spec = {"mode": "mtp", "mtp": {"depth": 3}}
+        replies = self.phase(
+            sock,
+            [
+                {"id": 1, "kind": "prefill", "prompt_tokens": PROMPT},
+                {"id": 2, "kind": "prefill", "prompt_tokens": PROMPT},
+                {"id": 3, "kind": "phase_diagnostics"},
+                {"id": 4, "kind": "free_decode_begin", "seed_tokens": PROMPT, "spec": spec},
+                {"id": 5, "kind": "free_decode_run", "count": 32},
+                {"id": 6, "kind": "phase_diagnostics"},
+            ],
+        )
+        self.assertTrue(all(r.get("ok", True) for r in replies[1:]), replies)
+        self.assertEqual(replies[5]["tokens"], serial_stream(32))
+        time.sleep(0.2)
+        log = self.resident_log()
+        stops = [i for i, l in enumerate(log) if "stopped a request" in l]
+        closed = next(i for i, l in enumerate(log) if "phase 1 closed" in l)
+        self.assertEqual(len(stops), 1, log)
+        self.assertLess(stops[0], closed, "the free run is stopped inside its own connection")
 
     def test_correctness_phase_reports_top8(self):
         _, sock = self.boot(0)

@@ -83,6 +83,45 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(s.ctx, PROMPT + [forced])
         self.assertEqual(backend.starts, 2)
 
+    def test_a_bounded_sync_leaves_the_engine_idle(self):
+        backend = FakeBackend(depth=0)
+        s = Session(backend)
+        s.sync(PROMPT, max_tokens=1)
+        self.assertFalse(backend.abort(), "a 1-token request must have finished on its own")
+
+    def test_an_unbounded_sync_is_stopped_by_invalidate(self):
+        s = Session(FakeBackend(depth=3))
+        seed = s.sync(PROMPT)
+        s.spec_run(seed, 16)
+        s.invalidate()
+        self.assertEqual(s.stopped, 1, "the run-on request is stopped and counted")
+        s.sync(PROMPT, max_tokens=1)
+        s.invalidate()
+        self.assertEqual(s.stopped, 1, "a finished request needs no stop")
+
+    def test_a_bounded_sequence_that_goes_on_is_still_the_serial_stream(self):
+        want = serial_stream(40)
+        s = Session(FakeBackend(depth=0))
+        t, got = s.sync(PROMPT, max_tokens=1), []
+        for _ in range(40):
+            t = s.eval(t)
+            got.append(t)
+        self.assertEqual(got, want)
+        for depth in range(1, IMPLEMENTED_DEPTH + 1):
+            s = Session(FakeBackend(depth=depth))
+            seed = s.sync(PROMPT, max_tokens=1)
+            rounds, frontiers = s.spec_run(seed, 40)
+            got = []
+            for r, f in zip(rounds, frontiers):
+                got.extend(r[1:])
+                got.append(f)
+            self.assertEqual(got, want, f"depth {depth}")
+
+    def test_a_non_positive_bound_is_refused(self):
+        s = Session(FakeBackend(depth=0))
+        with self.assertRaises(RefusedError):
+            s.sync(PROMPT, max_tokens=0)
+
     def test_top_logits_are_the_frontiers(self):
         s = Session(FakeBackend(depth=0))
         first = s.sync(PROMPT)
@@ -168,6 +207,11 @@ class WireTests(unittest.TestCase):
             self.assertEqual(run["frontiers"][-1], run["token"])
             top = self.call(conn, reader, {"op": "top_logits", "k": 8})
             self.assertEqual(len(top["ids"]), 8)
+            bounded = self.call(conn, reader, {"op": "sync", "tokens": PROMPT, "max_tokens": 1})
+            self.assertEqual(bounded["token"], seed)
+            self.assertFalse(
+                self.call(conn, reader, {"op": "sync", "tokens": PROMPT, "max_tokens": 0})["ok"]
+            )
             bad = self.call(conn, reader, {"op": "nope"})
             self.assertFalse(bad["ok"])
             self.assertTrue(self.call(conn, reader, {"op": "bye"})["ok"])

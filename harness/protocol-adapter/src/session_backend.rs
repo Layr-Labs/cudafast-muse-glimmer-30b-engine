@@ -79,6 +79,12 @@ pub trait EngineSession: Send {
     fn mtp_armed(&self) -> bool;
     /// Synchronize the session to `tokens`; logits for the last position follow.
     fn sync(&mut self, tokens: &[i64]) -> Result<(), String>;
+    /// [`EngineSession::sync`] for a caller that needs the frontier token and
+    /// nothing after it (a timed prefill): the engine may stop generating at the
+    /// frontier, so no decode runs on after the phase has its answer.
+    fn sync_to_frontier(&mut self, tokens: &[i64]) -> Result<(), String> {
+        self.sync(tokens)
+    }
     /// Append and evaluate one token; logits for the new position follow.
     fn eval(&mut self, token: i64) -> Result<(), String>;
     /// The greedy token of the current logits.
@@ -107,7 +113,8 @@ pub trait EngineSession: Send {
     fn eos_token(&self) -> Option<i64> {
         None
     }
-    /// Drop the live prefix so the next `sync` forwards the whole prompt.
+    /// Drop the live prefix so the next `sync` forwards the whole prompt, and
+    /// stop whatever the engine is still generating for it.
     fn invalidate(&mut self) {}
 }
 
@@ -218,6 +225,19 @@ impl SessionEngine {
     }
 }
 
+/// THE PHASE CLOSE. The adapter drops a phase's engine at the phase's
+/// `phase_diagnostics` barrier (and on any fail-closed discard). benchd keeps
+/// ONE worker, so one resident connection, for a whole leg, so the resident
+/// sees no accept between phases; without this the phase's last request ran
+/// on to the context limit with nobody reading it, and the GPU stayed busy
+/// through benchd's quiescence gate before the next phase. Invalidating here
+/// stops it the moment the phase is complete.
+impl Drop for SessionEngine {
+    fn drop(&mut self) {
+        self.lock().invalidate();
+    }
+}
+
 impl Engine for SessionEngine {
     fn drain_to_zero(&mut self) -> Result<u64, EngineError> {
         // One process per phase, so there is no allocator to drain. What a
@@ -229,8 +249,12 @@ impl Engine for SessionEngine {
     }
 
     fn prefill(&mut self, prompt: &[i64]) -> Result<i64, EngineError> {
+        // A prefill phase wants the frontier token only. Bounding the sync
+        // there means the engine is idle again when the reply comes back:
+        // the next timed pass does not start behind a decode step, and the
+        // GPU is quiet when benchd gates the next phase.
         let mut s = self.lock();
-        Self::fault(s.sync(prompt))?;
+        Self::fault(s.sync_to_frontier(prompt))?;
         Ok(s.argmax())
     }
 
