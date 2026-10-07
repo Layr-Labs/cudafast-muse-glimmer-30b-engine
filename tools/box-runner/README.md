@@ -254,13 +254,25 @@ EGRESS_UNIT=layrbench-sandbox-egress.service
 ACL_UNIT=layrbench-sandbox-acl.service
 RUST_DIR=/opt/layrbench-rust
 SERVE_UP_LOG_DIR=/var/lib/layrbench/serve-log
+SERVE_UP_SOCKET_DIR=/var/lib/layrbench/sock
 SERVE_UP_CONTAINER_PREFIX=layr-serve-up-
+PATH=/home/layrbench/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ```
 
 1. Put these lines in `~layrbench/actions-runner/.env`, together with the
    staged-asset paths the workflow needs (`MLXFAST_TARGET_SNAPSHOT_DIR`,
    `BENCHD_BIN_DIR`, `MLXFAST_BASELINE_WORKSPACE`,
    `MLXFAST_BASELINE_CALIBRATION`, `MLXFAST_NEMOTRON35_GOLDEN_DIR`).
+   Make the file mode 0600.
+   - `SERVE_UP_SOCKET_DIR` is the resident socket directory of a leg that
+     runs outside the per-job sandbox: the calibration and the local checks.
+     Without it the socket goes to `/tmp`, which the engine container hides,
+     and the leg does not boot. Make the directory one time, as root:
+     `install -d -o layrbench -g layrbench -m 0700 /var/lib/layrbench/sock`.
+   - `PATH` must hold `cargo`, because the workflow checks for it. Install the
+     runner account's own toolchain with rustup, as that account, at the
+     version that `rustup show active-toolchain` gives for the first runner.
+     The setup in step 2 copies that version to `RUST_DIR`.
 2. As root, run the setup with the same values. Use `sudo env`, so that sudo
    does not remove the variables:
 
@@ -274,6 +286,14 @@ SERVE_UP_CONTAINER_PREFIX=layr-serve-up-
 
    The setup reads `SERVE_UP_LOG_DIR` from `~layrbench/actions-runner/.env`.
    It changes no user, file, rule or unit of the first runner.
+3. Calibrate as the runner account with the same environment, so the
+   control leg uses the same socket directory and container prefix as a
+   ranked job:
+
+   ```sh
+   sudo -u layrbench -H bash -c 'set -a; . ~/actions-runner/.env; set +a; \
+     cd <engine checkout> && tools/calibrate-box.sh <runner name> "$MLXFAST_BASELINE_CALIBRATION"'
+   ```
 
 ### The plain persistent runner
 

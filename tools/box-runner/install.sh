@@ -134,7 +134,7 @@ install_actions_runner() {
 
   if [ "${IS_ROOT}" -eq 1 ]; then
     if id "${RUNNER_USER}" >/dev/null 2>&1; then
-      chown -R "${RUNNER_USER}" "${RUNNER_DIR}"
+      chown -R "${RUNNER_USER}:" "${RUNNER_DIR}"
       info "chowned ${RUNNER_DIR} to ${RUNNER_USER}"
     else
       fail "running as root but RUNNER_USER '${RUNNER_USER}' does not exist -- create the account first (out of scope for this script), then re-run install.sh"
