@@ -8,7 +8,7 @@ push (`AGENTS.md`, "Checks before you submit"). It holds no credential.
 
 | Step | What it proves |
 |---|---|
-| egress scan | no workflow references a secret, inherits one, asks for write permission, or uploads anything but the ranked `score.json` (the ranked workflow currently uploads nothing) |
+| egress scan | no workflow references a secret, inherits one, asks for write permission, or uploads anything but the ranked `score.json` (the ranked workflow uploads that one file, after sandbox cleanup) |
 | actionlint | the workflows parse and type-check (pinned binary, sha256-verified) |
 | shellcheck | every tracked `*.sh` outside `vllm/` passes at warning severity |
 | manifest lint | `benchmark.json` against the fixture: schema, paths, commands, scoring constants, byte-budget fallbacks, per-leg serve verbs |

@@ -164,8 +164,8 @@ Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
   final pool lives only in the organizer's private archive until the close.
   Goldens are never committed to this repository, because participant code can
   read the checkout ([pool refresh doc](docs/pool-refresh-and-final-rescore.md#where-the-goldens-live)).
-- **Cost.** No paid GitHub feature is used: no artifact upload, and CI is
-  manual only.
+- **Cost.** No GitHub-hosted runner is used, and CI is manual only. The
+  ranked job uploads one artifact: the sealed `score.json` that Yukon reads.
 
 ## Before launch
 

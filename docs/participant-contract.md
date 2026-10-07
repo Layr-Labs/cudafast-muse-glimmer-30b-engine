@@ -518,17 +518,17 @@ benchd iterate --mode official \
 ```
 
 benchd seals `score.json`, its `.sha256` sidecar and the integrity sidecar
-itself. The script converts nothing. The ranked workflow uploads no artifact.
+itself. The script converts nothing.
 Before any participant code runs, the job draws a 64-hex nonce into
 runner-private storage. After sandbox cleanup, **Reveal the sealed score**
 prints that nonce once, the sealed `score.json` if it exists, and an end line
 that binds the nonce to the file digest and length. The intake service parses
 that block only ([submission-restriction-spec.md](submission-restriction-spec.md) §10); arbitrary text in the same log does not count.
 
-> **Open item for the intake service:** `benchmark.json` `scoreArtifact` names
-> an uploaded artifact, but the ranked workflow uploads none; the sealed
-> `score.json` reaches the dispatcher only through the job-log reveal block.
-> The intake service confirms which source it reads before launch.
+When the reveal step prints a sealed `score.json`, the ranked workflow then
+uploads that same file as the one artifact `benchmark.json` `scoreArtifact`
+names (`benchmark-results-<run_id>/score.json`). This is the score Yukon reads.
+No other file is uploaded (`tools/ci-workflow-egress-scan.sh`).
 
 The rest of the command surface:
 
