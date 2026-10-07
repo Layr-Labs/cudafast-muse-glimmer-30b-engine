@@ -2,7 +2,7 @@
   "schema_version": 1,
   "track_id": "nemotron3.5-lightning-30b-a3b-cuda-v1",
   "track_name": "Nemotron 3.5 Lightning 30B-A3B NVFP4 CUDA -- composite paired speedup",
-  "official_scoring_enabled": false,
+  "official_scoring_enabled": true,
   "official_pairs": 3,
   "official_pair_combine": "mean",
   "runner": {
@@ -49,7 +49,7 @@
     "pool-10",
     "pool-11"
   ],
-  "baseline_reference_commit": "c726979b9a4e7d351a426e3601fabba56fa9314a",
+  "baseline_reference_commit": "eb86feceb0ae55871ac2e9d046ed33f893397b7a",
   "timed_prompt_pool": [
     {
       "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.golden.json",

@@ -155,8 +155,8 @@ Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
 
 - **Boxes.** All 8 are set up, sandboxed, calibrated and have the goldens
   staged. Runners register through a GitHub App.
-- **Branches.** `main` is the unarmed contest base
-  (`official_scoring_enabled: false`).
+- **Branches.** `main` is the armed contest base
+  (`official_scoring_enabled: true`, reference tree `eb86fec`).
 - **Where the goldens live.** Scoring reads only each Spark's local copy
   (`/srv/nemotron35/goldens`, unreadable by the sandbox user); a ranked job
   never fetches goldens. The live pool is also kept in an
