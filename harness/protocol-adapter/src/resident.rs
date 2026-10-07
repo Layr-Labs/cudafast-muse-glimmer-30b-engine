@@ -335,6 +335,13 @@ impl EngineSession for ResidentSession {
         self.take_frontier(&reply)
     }
 
+    fn sync_to_frontier(&mut self, tokens: &[i64]) -> Result<(), String> {
+        // `max_tokens: 1`: the resident's request finishes at the frontier
+        // token, so the engine is idle when this reply arrives.
+        let reply = self.call(json!({"op": "sync", "tokens": tokens, "max_tokens": 1}))?;
+        self.take_frontier(&reply)
+    }
+
     fn eval(&mut self, token: i64) -> Result<(), String> {
         let reply = self.call(json!({"op": "eval", "token": token}))?;
         self.take_frontier(&reply)

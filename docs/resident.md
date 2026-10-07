@@ -50,7 +50,7 @@ The transport is NDJSON over `AF_UNIX`/`SOCK_STREAM`:
 | --- | --- | --- |
 | `hello` | — | `vocab_size`, `eos_token`, `mtp_armed`, `draft_tokens` (depth + 1), `ctx_size`, `load_epoch` (ms timestamp of the load), `spec_run`, `ident`, `model_path`, `mtp_head_path` |
 | `invalidate` | — | — |
-| `sync` | `tokens` | `token` (the frontier argmax) |
+| `sync` | `tokens`, optional `max_tokens` | `token` (the frontier argmax) |
 | `eval` | `token` | `token` |
 | `argmax` | — | `token` |
 | `top_logits` | `k` | `ids`, `logits` (raw logits, highest first) |
@@ -105,6 +105,20 @@ the client's first byte. `invalidate` aborts the live request and drains the
 engine. vLLM's prefix cache is off in the scored configuration, so no prefill
 survives into the next phase. Reusing work across phases is prohibited
 (contract section 8), whatever mechanism does it.
+
+benchd keeps ONE worker, so one connection, for a whole leg. vLLM's engine
+core steps a live request until it finishes, whether or not anyone reads the
+tokens. Two rules stop the engine when a phase has what it asked for:
+
+- The adapter sends `invalidate` when it closes each phase (the
+  `phase_diagnostics` barrier, or a fail-closed discard).
+- A timed prefill sends `sync` with `max_tokens: 1`. Its request ends at the
+  frontier token, so the next timed pass does not start behind a decode step.
+  A bounded sequence that is fed on is prefilled again from its context.
+
+Without these rules the last request of a phase decoded on to the context
+limit (about 7,700 tokens, about 100 s on GB10). The GPU stayed busy through
+benchd's quiescence gate before the next phase.
 
 ## 6. The memory plan
 

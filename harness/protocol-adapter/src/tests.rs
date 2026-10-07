@@ -1829,6 +1829,38 @@ mod session {
         assert_eq!(session.lock().unwrap().invalidated, 2);
     }
 
+    /// THE PHASE CLOSE STOPS THE ENGINE. benchd keeps one worker per leg, so
+    /// the next phase's opener comes only after benchd's quiescence gate. The
+    /// phase_diagnostics barrier must invalidate by itself, or the phase's last
+    /// request keeps generating through that gate.
+    #[test]
+    fn phase_close_invalidates_the_live_request() {
+        let session = Arc::new(Mutex::new(Scripted::default()));
+        let resp = run(
+            session.clone(),
+            &[
+                r#"{"id":1,"kind":"prefill","prompt_tokens":[1,2,3]}"#,
+                r#"{"id":2,"kind":"phase_diagnostics"}"#,
+            ],
+        );
+        assert_eq!(resp[2]["ok"], true, "{resp:?}");
+        let invalidated = session.lock().unwrap().invalidated;
+        assert_eq!(
+            invalidated, 2,
+            "one invalidate at the opener, one at the close"
+        );
+        let resp = run(
+            session.clone(),
+            &[
+                r#"{"id":1,"kind":"free_decode_begin","seed_tokens":[1,2,3]}"#,
+                r#"{"id":2,"kind":"free_decode_run","count":4}"#,
+                r#"{"id":3,"kind":"phase_diagnostics"}"#,
+            ],
+        );
+        assert_eq!(resp[3]["ok"], true, "{resp:?}");
+        assert_eq!(session.lock().unwrap().invalidated, 4);
+    }
+
     #[test]
     fn mtp_refused_by_name_when_drafter_not_armed() {
         let session = Arc::new(Mutex::new(Scripted::default()));
@@ -2249,6 +2281,25 @@ mod resident {
         assert_eq!(seen[3]["k"], 8);
         assert_eq!(seen[4]["first_token"], 40);
         assert_eq!(seen[4]["budget"], 4);
+    }
+
+    /// A timed prefill asks the resident for the frontier token only, so the
+    /// resident's request ends there and the engine is idle at the reply.
+    #[test]
+    fn a_prefill_sync_is_bounded_to_the_frontier() {
+        let server = Server::start(scripted);
+        let mut session = server.connect();
+        session.sync_to_frontier(&[1, 2, 3]).unwrap();
+        assert_eq!(session.argmax(), 501);
+        session.sync(&[1, 2, 3]).unwrap();
+        drop(session);
+        let seen = server.finish();
+        assert_eq!(seen[1]["op"], "sync");
+        assert_eq!(seen[1]["max_tokens"], 1);
+        assert!(
+            seen[2].get("max_tokens").is_none(),
+            "a decode or correctness sync is unbounded"
+        );
     }
 
     /// A resident that offers `spec_run` in its hello takes the whole free run

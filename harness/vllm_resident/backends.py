@@ -4,6 +4,9 @@ A backend owns ONE live greedy request at a time and exposes it as a stream of
 engine steps. `start(tokens)` prefills `tokens` and returns the first step's
 emitted tokens; `step()` runs one more engine step (one verify cycle when
 speculation is on) and returns what it emitted; `abort()` drops the request.
+`start(tokens, max_tokens)` bounds the request: the engine emits at most
+`max_tokens` tokens and then stops on its own, so nothing decodes on after the
+caller has what it asked for.
 
 Every emitted token carries the top-k RAW LOGITS of the position that produced
 it (highest first), so the resident can answer `top_logits` for whatever
@@ -51,11 +54,13 @@ class Backend(Protocol):
     ident: str
     model_path: str
 
-    def start(self, tokens: list[int]) -> list[Emit]: ...
+    def start(self, tokens: list[int], max_tokens: int | None = None) -> list[Emit]: ...
 
     def step(self) -> list[Emit]: ...
 
-    def abort(self) -> None: ...
+    def abort(self) -> bool:
+        """Drop the request. True when it was still generating."""
+        ...
 
     def close(self) -> None: ...
 
@@ -178,10 +183,11 @@ class VllmBackend:
                 self.step()
             self.abort()
 
-    def _params(self, prompt_len: int):
+    def _params(self, prompt_len: int, max_tokens: int | None = None):
+        room = max(1, self.ctx_size - prompt_len - self.depth - 1)
         return self._SamplingParams(
             temperature=0.0,
-            max_tokens=max(1, self.ctx_size - prompt_len - self.depth - 1),
+            max_tokens=room if max_tokens is None else min(room, max_tokens),
             ignore_eos=True,
             logprobs=TOP_K,
             detokenize=False,
@@ -203,14 +209,14 @@ class VllmBackend:
                 emitted.append(Emit(int(token), top))
         return emitted
 
-    def start(self, tokens: list[int]) -> list[Emit]:
+    def start(self, tokens: list[int], max_tokens: int | None = None) -> list[Emit]:
         self.abort()
         if len(tokens) + self.depth + 2 > self.ctx_size:
             raise RuntimeError(f"{len(tokens)} tokens do not fit the {self.ctx_size}-token context")
         self._rid += 1
         self._live = f"r{self._rid}"
         self._engine.add_request(
-            self._live, {"prompt_token_ids": list(tokens)}, self._params(len(tokens))
+            self._live, {"prompt_token_ids": list(tokens)}, self._params(len(tokens), max_tokens)
         )
         emitted: list[Emit] = []
         while not emitted:
@@ -229,13 +235,16 @@ class VllmBackend:
             emitted = self._collect()
         return emitted
 
-    def abort(self) -> None:
+    def abort(self) -> bool:
+        running = False
         if self._live is not None:
+            running = self._engine.has_unfinished_requests()
             self._engine.abort_request([self._live])
             # Drain the abort so the next request starts on an idle engine.
             while self._engine.has_unfinished_requests():
                 self._engine.step()
             self._live = None
+        return running
 
     def close(self) -> None:
         self.abort()
@@ -261,6 +270,7 @@ class FakeBackend:
         self.model_path = "/fake/model"
         self._ctx: list[int] | None = None
         self._cycle = 0
+        self._left: int | None = None
         self.starts = 0
 
     def _next(self, ctx: list[int]) -> int:
@@ -275,12 +285,13 @@ class FakeBackend:
         )
         return Emit(token, top)
 
-    def start(self, tokens: list[int]) -> list[Emit]:
+    def start(self, tokens: list[int], max_tokens: int | None = None) -> list[Emit]:
         if len(tokens) + self.depth + 2 > self.ctx_size:
             raise RuntimeError("context full")
         self.starts += 1
         self._ctx = list(tokens)
         self._cycle = 0
+        self._left = None if max_tokens is None else max_tokens - 1
         first = self._emit(self._ctx)
         self._ctx.append(first.token)
         return [first]
@@ -288,8 +299,14 @@ class FakeBackend:
     def step(self) -> list[Emit]:
         if self._ctx is None:
             raise RuntimeError("step with no live request")
+        # vLLM finishes a request at its max_tokens; so does the fake.
+        if self._left == 0:
+            raise RuntimeError("the request reached its max_tokens")
         self._cycle += 1
         n = 1 + (self._cycle % (self.depth + 1)) if self.depth else 1
+        if self._left is not None:
+            n = min(n, self._left)
+            self._left -= n
         out = []
         for _ in range(n):
             e = self._emit(self._ctx)
@@ -297,8 +314,10 @@ class FakeBackend:
             out.append(e)
         return out
 
-    def abort(self) -> None:
+    def abort(self) -> bool:
+        running = self._ctx is not None and self._left != 0
         self._ctx = None
+        return running
 
     def close(self) -> None:
         self.abort()

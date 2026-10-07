@@ -11,7 +11,9 @@ line, every reply carrying "ok" (and "error" when false).
 
   hello                          identity, vocab, EOS, depth, load epoch (ms)
   invalidate                     drop the live request
-  sync {tokens}                  prefill; reply carries the frontier argmax
+  sync {tokens[,max_tokens]}     prefill; reply carries the frontier argmax.
+                                 max_tokens bounds what the engine generates
+                                 for this sequence (a timed prefill asks for 1)
   eval {token}                   append one token; reply carries the argmax
   argmax                         the frontier token
   top_logits {k}                 the frontier position's top-k raw logits
@@ -32,6 +34,15 @@ forward pass. A fed token that is NOT the frontier (teacher forcing) re-prefills
 
 PHASE RESET. Every accepted connection starts from an invalidated session, so a
 phase can never inherit the previous phase's state.
+
+NOTHING RUNS ON AFTER A PHASE. vLLM's engine core steps a live request until it
+finishes, whether or not anyone reads the tokens. benchd holds ONE connection
+for a whole leg, so an accept never comes between its phases. Two things end
+the request when the phase has what it asked for: the adapter sends
+`invalidate` when it closes each phase, and a timed prefill syncs with
+`max_tokens: 1`, so its request finishes at the frontier token. Without them the
+last request of a phase decoded on to the context limit (about 7,700 tokens,
+about 100 s on GB10) and kept the GPU busy through benchd's quiescence gate.
 """
 
 from __future__ import annotations
@@ -74,12 +85,19 @@ class Session:
         self.spec_run_offered = spec_run
         self.drafts = 0
         self.hits = 0
+        # Tokens the live request may still emit; None = unbounded.
+        self.left: int | None = None
+        # Invalidates that found the engine still generating.
+        self.stopped = 0
         self.invalidate()
 
     # ---- state ---------------------------------------------------------- #
 
     def invalidate(self) -> None:
-        self.b.abort()
+        if self.b.abort():
+            self.stopped += 1
+            log(f"stopped a request that was still generating ({self.stopped} so far)")
+        self.left = None
         self.ctx: list[int] = []
         self.frontier: Emit | None = None
         self.ahead: deque[Emit] = deque()
@@ -96,13 +114,22 @@ class Session:
         if self.b.depth > 0:
             self.drafts += self.b.depth
             self.hits += len(emitted) - 1
+        if self.left is not None:
+            self.left -= len(emitted)
         return emitted
 
-    def sync(self, tokens: list[int]) -> int:
+    def _spent(self) -> bool:
+        """The bounded request emitted all it may; the engine has stopped."""
+        return not self.ahead and self.left is not None and self.left <= 0
+
+    def sync(self, tokens: list[int], max_tokens: int | None = None) -> int:
         if not tokens:
             raise RefusedError("sync needs a non-empty token list")
+        if max_tokens is not None and max_tokens < 1:
+            raise RefusedError("sync max_tokens must be positive")
         self._check_ids(tokens)
-        emitted = self.b.start(tokens)
+        emitted = self.b.start(tokens, max_tokens)
+        self.left = None if max_tokens is None else max_tokens - len(emitted)
         self.ctx = list(tokens)
         self.frontier = emitted[0]
         self.ahead = deque(emitted[1:])
@@ -111,7 +138,9 @@ class Session:
     def _feed(self, token: int) -> None:
         """Consume `token` at the frontier and advance to the next one."""
         frontier = self._need_frontier()
-        if token != frontier.token:
+        if token != frontier.token or self._spent():
+            # Teacher forcing, or a bounded sequence asked to go on: prefill
+            # again from the context. Correct, and deliberately not fast.
             self.sync(self.ctx + [token])
             return
         self.ctx.append(token)
@@ -135,7 +164,7 @@ class Session:
             raise RefusedError("a cycle needs a positive budget")
         self._check_ids([fed])
         frontier = self._need_frontier()
-        if fed != frontier.token:
+        if fed != frontier.token or self._spent():
             self.sync(self.ctx + [fed])
             return [fed]
         if not self.ahead:
@@ -209,7 +238,10 @@ class Session:
             tokens = req.get("tokens")
             if not isinstance(tokens, list):
                 raise RefusedError('sync needs a "tokens" integer array')
-            return {"ok": True, "token": self.sync(tokens)}, True
+            bound = None
+            if "max_tokens" in req:
+                bound = int_field("max_tokens")
+            return {"ok": True, "token": self.sync(tokens, bound)}, True
         if op == "eval":
             return {"ok": True, "token": self.eval(int_field("token"))}, True
         if op == "argmax":
