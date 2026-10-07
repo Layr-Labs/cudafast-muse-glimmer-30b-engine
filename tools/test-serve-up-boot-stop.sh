@@ -521,6 +521,40 @@ sbx SERVE_UP_NO_CAP_DROP=1 SERVE_UP_ALLOW_NEW_PRIVS=1 "${TREE}/tools/serve-up.sh
   || fail "case 8: the off switches left: $(run_arg_after --security-opt) $(run_arg_after --cap-drop)"
 sbx "${TREE}/tools/serve-up.sh" --stop --socket "$(head -1 "${WORK}/leg8c/socket.txt" 2>/dev/null)" > /dev/null 2>&1 || true
 
+# --- case 8e: SERVE_UP_SANDBOX_TREE sandboxes the named tree only ----------
+# benchd boots both legs of a paired run with one environment. The tree the
+# workflow names (the candidate checkout) runs as SANDBOX_USER; any other tree
+# (the reference tree) runs as the invoking user, so benchd's own control-leg
+# worker can open its socket.
+named() {
+  dserve SANDBOX_USER="${ME}" SANDBOX_ROOT="${SBXROOT}" SANDBOX_JOB=42-1 \
+    SANDBOX_WIPE_LIST="${WORK}/sbx-wipe-dirs" SANDBOX_WIPE_HOME="${WORK}/sbx-home" \
+    STUB_IPC="${WORK}/sbx-ipc" STUB_PGREP_USER="${ME}" \
+    WAIT_FOR_MEMORY_TIMEOUT_S=0.1 WAIT_FOR_MEMORY_POLL_S=0.01 "$@"
+}
+named SERVE_UP_SANDBOX_TREE="${TREE}" "${TREE}/tools/serve-up.sh" --boot --spec mtp --draft-len 3 \
+  --socket-out "${WORK}/leg8e/socket.txt" > "${WORK}/boot8e.out" 2>&1 \
+  || { fail "case 8e: --boot of the named tree exited non-zero"; sed 's/^/    /' "${WORK}/boot8e.out" >&2; }
+SOCKET8E="$(head -1 "${WORK}/leg8e/socket.txt" 2>/dev/null)"
+[[ "${SOCKET8E}" == "${SBXROOT}/42-1/sock/"*/vllm-resident.sock && "$(run_arg_after --user)" == "4242:4343" ]] \
+  && ok "case 8e: the tree SERVE_UP_SANDBOX_TREE names boots sandboxed, as SANDBOX_USER" \
+  || fail "case 8e: the named tree booted at '${SOCKET8E}' as '$(run_arg_after --user)'"
+named SERVE_UP_SANDBOX_TREE="${TREE}" "${TREE}/tools/serve-up.sh" --stop --socket "${SOCKET8E}" > /dev/null 2>&1 \
+  || fail "case 8e: --stop of the named tree exited non-zero"
+named SERVE_UP_SANDBOX_TREE="${WORK}" "${TREE}/tools/serve-up.sh" --boot --spec serial --draft-len 0 \
+  --socket-out "${WORK}/leg8f/socket.txt" > "${WORK}/boot8f.out" 2>&1 \
+  || { fail "case 8e: --boot of another tree exited non-zero"; sed 's/^/    /' "${WORK}/boot8f.out" >&2; }
+SOCKET8F="$(head -1 "${WORK}/leg8f/socket.txt" 2>/dev/null)"
+[[ "${SOCKET8F}" == "${SOCKDIR}"/vllm-resident.*.sock && "$(run_arg_after --user)" == "$(id -u):$(id -g)" ]] \
+  && ok "case 8e: a tree SERVE_UP_SANDBOX_TREE does not name boots unsandboxed, as the invoking user" \
+  || fail "case 8e: the other tree booted at '${SOCKET8F}' as '$(run_arg_after --user)'"
+named SERVE_UP_SANDBOX_TREE="${WORK}" "${TREE}/tools/serve-up.sh" --stop --socket "${SOCKET8F}" > "${WORK}/stop8f.out" 2>&1
+[[ ! -e "${SOCKET8F}" ]] && ! grep -q 'sandbox-wipe.sh' "${WORK}/stop8f.out" \
+  && ok "case 8e: the other tree's --stop is the unsandboxed stop" \
+  || fail "case 8e: the other tree's --stop misbehaved"
+refuse "a named tree without SANDBOX_USER" "SANDBOX_USER is unset" \
+  named SANDBOX_USER= SERVE_UP_SANDBOX_TREE="${TREE}" "${TREE}/tools/serve-up.sh" --boot --spec serial --draft-len 0 --socket-out "${WORK}/x.txt"
+
 # --- case 9: the sandbox refusals -------------------------------------------
 refuse "sandbox on the host launcher" "cannot be combined with SERVE_UP_LAUNCHER=host" \
   sbx SERVE_UP_LAUNCHER=host "${TREE}/tools/serve-up.sh" --boot --spec serial --draft-len 0 --socket-out "${WORK}/x.txt"

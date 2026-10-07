@@ -509,7 +509,10 @@ jobs:
       - name: GPU-exclusive measurement (lock, quiesce, benchd iterate --mode official, seal)
         env:
           SANDBOX_JOB: ${{ github.run_id }}-${{ github.run_attempt }}
-          SERVE_UP_CONTAINER_USER: ${{ env.SANDBOX_USER }}
+          # benchd boots both legs with this environment. Only the tree at this
+          # path (the candidate checkout) runs its resident as SANDBOX_USER;
+          # the reference tree's resident runs as the runner (tools/serve-up.sh).
+          SERVE_UP_SANDBOX_TREE: ${{ github.workspace }}
         # The whole GPU window runs in THIS one step, under the box-wide GPU lock,
         # because the idle assertion below is only meaningful while no other GPU
         # work can start. The order is the box order, condensed: take the lock

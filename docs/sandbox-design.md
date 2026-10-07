@@ -99,8 +99,11 @@ nothing to the timed path (a native process with plain pipes).
    before setup continues. This closes the "rewrite the trusted tools" hole on
    its own.
 3. **Resident (E3), candidate leg only.** `serve-up.sh` runs the candidate's
-   container as `nemosub` (`SERVE_UP_CONTAINER_USER`, set by the
-   workflow). Sockets are split per leg: the base socket directory stays
+   container as `nemosub`. The workflow names the candidate checkout in
+   `SERVE_UP_SANDBOX_TREE`. benchd boots both legs with one environment, so
+   only the tree at that path takes `SANDBOX_USER` as `SERVE_UP_CONTAINER_USER`.
+   The reference tree runs its resident as `runner`, because benchd's
+   control-leg worker runs as `runner` and must open its socket. Sockets are split per leg: the base socket directory stays
    `runner`-owned and not writable by `nemosub` (mode `0711`, so `nemosub` can
    only reach a path it is given); each candidate leg gets its own subdirectory
    that `nemosub` can write. The control leg's socket, and every `.pid`
@@ -183,7 +186,8 @@ nothing to the timed path (a native process with plain pipes).
      anything from an earlier step cannot fill `/dev/shm` before pair 1's
      control leg);
    - **after every candidate leg**, when `serve-up.sh --stop` tears down a
-     sandboxed resident (`SERVE_UP_CONTAINER_USER` is set, or the socket path
+     sandboxed resident (`SERVE_UP_CONTAINER_USER` is set or derived from
+     `SERVE_UP_SANDBOX_TREE`, or the socket path
      lies under `$SANDBOX_ROOT/$SANDBOX_JOB/sock/`): after the container is
      gone, the same kill-and-verify step, then the wipe, then
      `tools/wait-for-memory.sh` (`--stop` fails if any step fails; the wipe
@@ -227,12 +231,12 @@ that changes each name for a second runner on the same box.
 | Adapter limits | `prlimit --fsize=67108864 --nproc` (default 4096, `ADAPTER_NPROC_LIMIT`) `--as` (default 16 GiB, `ADAPTER_AS_LIMIT` in bytes) on the adapter in `tools/run-engine-sandboxed.sh`; the build uses separate `CARGO_NPROC_LIMIT` / `CARGO_AS_LIMIT` |
 | Resident logs | `SERVE_UP_LOG_DIR` (from `actions-runner/.env`, else `/var/lib/nemotron35/serve-log`) `runner:runner` 0750, nothing in it other-readable; `serve-up.sh` writes resident logs 0600, the identity file 0640 |
 | Checkout access | per job, as `runner`: `setfacl -R -P -m u:nemosub:rX` (and `-d`) on `$GITHUB_WORKSPACE`, `--x` on each parent up to `runner`'s home, `---` on every other entry directly under each of those parents (all but the component leading to the checkout), on `RUNNER_TEMP` and on `_work/_actions` and `_work/_tool` when present; setup gives `--x` on `runner`'s home, `actions-runner`, `_work` and `---` on every entry under the first two but the next one down and on `_work/_*`. Files `runner` writes under the checkout are `nemosub`-readable (default ACL): never a secret there |
-| Workflow env | `SANDBOX_USER` and `SANDBOX_ROOT` from the runner environment, else `nemosub` and `/var/lib/nemotron35/sandbox` (the first step of the ranked job resolves them into `GITHUB_ENV`), `SANDBOX_JOB=<run_id>-<run_attempt>`, `SERVE_UP_CONTAINER_USER=$SANDBOX_USER` (candidate side only; the reference serve-up ignores it) |
+| Workflow env | `SANDBOX_USER` and `SANDBOX_ROOT` from the runner environment, else `nemosub` and `/var/lib/nemotron35/sandbox` (the first step of the ranked job resolves them into `GITHUB_ENV`), `SANDBOX_JOB=<run_id>-<run_attempt>`, `SERVE_UP_SANDBOX_TREE=$GITHUB_WORKSPACE` in the measurement step: only the candidate checkout's serve-up takes `SANDBOX_USER` as its container user, and the reference tree's serve-up runs as `runner` |
 | Box check | `tools/box-runner/setup-sandbox-user.sh --check` exits 0 only if all of the above holds |
 
 benchd spawns `tools/serve-up.sh --stop` with its own environment (it does not
 call `env_clear`; see `crates/benchd/src/legserve.rs`), so the workflow's
-`SANDBOX_*` and `SERVE_UP_CONTAINER_USER` reach the stop path on candidate
+`SANDBOX_*` and `SERVE_UP_SANDBOX_TREE` reach the stop path on candidate
 legs. A failed `--stop` is only logged by benchd; the pre-measurement wipe and
 the job-end cleanup are the backstops if a per-leg stop misses something. benchd
 also re-checks load and GPU utilisation before every timed phase (its
