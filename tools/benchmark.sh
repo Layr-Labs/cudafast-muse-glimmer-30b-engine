@@ -354,7 +354,7 @@ FACADE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # BEFORE the gates-only branch, so `--local-iterate` and `--official` alike refused with
 # "no track_id" while this repository exported it nowhere. The value is the trusted
 # manifest's `trackId` (the PLATFORM id, nemotron3.5-lightning-30b-a3b-cuda-v1 -- NOT the bench
-# channel `nemotron3.5-lightning-30b-a3b-v1`, which names the PROJECT; see tools/fetch-benchd.sh).
+# channel branch, which is `main`; see tools/fetch-benchd.sh).
 # It is read from benchmark.json beside this file's parent, never taken from the
 # caller: benchd treats env != contract as a hard error, so a caller that pre-set a
 # DIFFERENT value is refused here rather than silently overridden, and a manifest

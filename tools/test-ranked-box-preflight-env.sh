@@ -279,7 +279,7 @@ EOF
   calibration_band_fields() {
     jq -n '
       {
-        passes: 4,
+        passes: 3,
         prefill_seconds_per_token_mean: 0.0006282488193359375,
         decode_seconds_per_token_mean: 0.0329116748046875,
         prefill_cv: 0.004,
@@ -291,29 +291,15 @@ EOF
       }'
   }
 
+  # Version 3: a header and one prompts[] entry per prompt. Its decode mean is
+  # the decode window per token (decode-run time / N, no seed prefill).
   write_calibration() { # write_calibration PATH [jq filter]
     local path="$1" filter="${2:-.}"
     jq -n --arg track "${TRACK_ID}" --arg box "${RUNNER}" --arg ref "${REF_COMMIT}" \
           --arg prompt "${LIVE_GOLDEN}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           --argjson band "$(calibration_band_fields)" '
       {
-        version: 1,
-        track_id: $track,
-        box: $box,
-        reference_commit: $ref,
-        prompt: $prompt,
-        captured_at: $at,
-        benchd_source_commit: "1111111111111111111111111111111111111111"
-      } + $band' | jq "${filter}" > "${path}"
-  }
-
-  write_calibration_v2() { # write_calibration_v2 PATH [jq filter]
-    local path="$1" filter="${2:-.}"
-    jq -n --arg track "${TRACK_ID}" --arg box "${RUNNER}" --arg ref "${REF_COMMIT}" \
-          --arg prompt "${LIVE_GOLDEN}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-          --argjson band "$(calibration_band_fields)" '
-      {
-        version: 2,
+        version: 3,
         track_id: $track,
         box: $box,
         reference_commit: $ref,
@@ -365,15 +351,6 @@ EOF
     echo "ok    section 8 / control: a correctly staged box passes every check"
   else
     fail "section 8 / control: a correctly staged box did not pass; got: $(tail -3 <<<"${control8}")"
-  fi
-
-  CAL_OK_V2="${WORK}/baseline-calibration-v2.json"
-  write_calibration_v2 "${CAL_OK_V2}"
-  control8v2="$(run_preflight "MLXFAST_BASELINE_CALIBRATION=${CAL_OK_V2}")"
-  if grep -q 'ranked-box-preflight: all checks passed' <<<"${control8v2}"; then
-    echo "ok    section 8 / control v2: a version-2 band on the calibration prompt passes"
-  else
-    fail "section 8 / control v2: did not pass; got: $(tail -3 <<<"${control8v2}")"
   fi
 
   expect_refusal "workspace unset" \
@@ -432,32 +409,27 @@ EOF
     expect_refusal "${label}" "${needle}" "MLXFAST_BASELINE_CALIBRATION=${path}"
   }
 
-  cal_case "calibration version" '.version = 3' "reads version 1 and 2 only"
-  cal_case_v2() { # cal_case_v2 LABEL JQ_FILTER NEEDLE
-    local label="$1" filter="$2" needle="$3"
-    local path
-    path="${WORK}/cal-v2-$(printf '%s' "${label}" | tr -c 'a-z0-9' '-').json"
-    write_calibration_v2 "${path}" "${filter}"
-    expect_refusal "${label}" "${needle}" "MLXFAST_BASELINE_CALIBRATION=${path}"
-  }
-  cal_case_v2 "calibration v2 prompt missing" '.prompts = [{prompt: "other-prompt", passes: 4, prefill_seconds_per_token_mean: 0.001, decode_seconds_per_token_mean: 0.03, prefill_cv: 0.004, decode_cv: 0.002, prefill_band_low: 0.95, prefill_band_high: 1.05, decode_band_low: 0.98, decode_band_high: 1.02}]' \
+  cal_case "calibration version" '.version = 4' "reads version 3 only"
+  cal_case "calibration version 2 recorded the whole window as decode" '.version = 2' \
+    "decode is now the decode window only (decode-run time / N)"
+  cal_case "calibration version 1 recorded the whole window as decode" \
+    '.version = 1 | . + .prompts[0] | del(.prompts)' "Recalibrate this box"
+  cal_case "calibration prompt missing" '.prompts[0].prompt = "other-prompt"' \
     "has no prompts[] entry for prompt"
-  cal_case_v2 "calibration v2 prompt duplicated" '.prompts = [.prompts[0], .prompts[0]]' \
+  cal_case "calibration prompt duplicated" '.prompts = [.prompts[0], .prompts[0]]' \
     "more than one prompts[] entry for prompt"
   cal_case "calibration track" '.track_id = "another-track-v1"' "names track 'another-track-v1'"
   cal_case "calibration box" '.box = "another-box"' "was captured on box 'another-box'"
   cal_case "calibration reference commit" \
     '.reference_commit = "0000000000000000000000000000000000000000"' \
     "was captured against reference commit"
-  cal_case "calibration prompt" '.prompt = "not-the-live-golden"' \
-    "was captured on prompt 'not-the-live-golden'"
-  cal_case "calibration passes" '.passes = 1' "a band needs at least two"
-  cal_case "calibration mean" '.decode_seconds_per_token_mean = 0' \
+  cal_case "calibration passes" '.prompts[0].passes = 1' "a band needs at least two"
+  cal_case "calibration mean" '.prompts[0].decode_seconds_per_token_mean = 0' \
     "is not a plausible per-token time"
-  cal_case "calibration cv" '.decode_cv = 0.05' "above the 1 % stability gate"
-  cal_case "calibration band does not bracket 1" '.decode_band_high = 0.99' \
+  cal_case "calibration cv" '.prompts[0].decode_cv = 0.05' "above the 1 % stability gate"
+  cal_case "calibration band does not bracket 1" '.prompts[0].decode_band_high = 0.99' \
     "is not a usable band"
-  cal_case "calibration band admits a half-speed box" '.prefill_band_high = 2.5' \
+  cal_case "calibration band admits a half-speed box" '.prompts[0].prefill_band_high = 2.5' \
     "is not a usable band"
   cal_case "calibration benchd" '.benchd_source_commit = "unknown"' \
     "cannot be traced to the code that measured it"
@@ -501,7 +473,7 @@ EOF
   rotation_case "rotation pool empty" '.live_golden_rotation.pool = []' \
     "live_golden_rotation.pool is empty"
   rotation_case "calibration prompt is not the band's" ".calibration_prompt = \"${SECOND}\"" \
-    "the fixture's calibration_prompt is '${SECOND}'"
+    "has no prompts[] entry for prompt '${SECOND}'"
   # The control: a second prompt fully pinned and staged joins the pool.
   GOLDEN_DIR2="${WORK}/goldens2"
   cp -R "${GOLDEN_DIR}" "${GOLDEN_DIR2}"
@@ -549,10 +521,10 @@ ROTEOF
     "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR3}"
 
   # THE SHIPPED SHAPE (sections 4b and 8b): live_goldens. Every job measures
-  # every live golden, so every one needs its own band in a version-2 file.
+  # every live golden, so every one needs its own band in the calibration file.
   cp "${SCAFFOLD_CONTRACT}.live-goldens" "${SCAFFOLD_CONTRACT}"
   CAL_ALL="${WORK}/baseline-calibration-all.json"
-  write_calibration_v2 "${CAL_ALL}" "$(jq -nc --args '$ARGS.positional' "${LIVE_NAMES[@]}") as \$names | .prompts = [\$names[] as \$n | .prompts[0] + {prompt: \$n}]"
+  write_calibration "${CAL_ALL}" "$(jq -nc --args '$ARGS.positional' "${LIVE_NAMES[@]}") as \$names | .prompts = [\$names[] as \$n | .prompts[0] + {prompt: \$n}]"
   control_lg="$(run_preflight "MLXFAST_BASELINE_CALIBRATION=${CAL_ALL}")"
   if grep -q 'ranked-box-preflight: all checks passed' <<<"${control_lg}" \
     && grep -q "every rotation pool prompt (${LIVE_NAMES[*]})" <<<"${control_lg}"; then
@@ -564,8 +536,8 @@ ROTEOF
   jq --arg n "${LIVE_NAMES[2]}" '.prompts |= map(select(.prompt != $n))' "${CAL_ALL}" > "${CAL_MISSING}"
   expect_refusal "live_goldens: one prompt has no band" \
     "has no prompts[] entry for prompt '${LIVE_NAMES[2]}'" "MLXFAST_BASELINE_CALIBRATION=${CAL_MISSING}"
-  expect_refusal "live_goldens: a version-1 band covers one prompt only" \
-    "was captured on prompt '${LIVE_GOLDEN}' but the fixture's calibration_prompt is '${SECOND}'"
+  expect_refusal "live_goldens: a band for one prompt only" \
+    "has no prompts[] entry for prompt '${SECOND}'"
   jq '.live_golden_rotation = {mode: "per_job_random", pool: .live_goldens}' \
     "${SCAFFOLD_CONTRACT}.live-goldens" > "${SCAFFOLD_CONTRACT}"
   expect_refusal "live_goldens with a rotation block" \

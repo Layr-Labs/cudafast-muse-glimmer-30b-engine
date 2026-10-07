@@ -49,10 +49,9 @@ changing what it computes beyond the 10% token-tolerance budget.
   The timed prefill follows one unmeasured warm-up prefill of the same prompt
   in the same phase; compute both in full and carry nothing between them.
 - **Never move prefill work out of `free_decode_begin`** (contract section 5.1.1).
-- **A timed divergence is replayed, not forgiven.** If your timed stream leaves
-  the golden at a tie, benchd replays it through the reference: every token
-  must be one the reference nearly chose (contract section 5.4.1). The local
-  modes cannot replay, so they still demand an exact match.
+- **The timed window demands an exact match.** If your timed stream leaves
+  the golden at any token, even at a logit tie, the run fails (contract
+  section 5.4.1). The ranked run and the local modes apply the same rule.
 - **Keep the engine reproducible.** Run `tools/determinism-probe.py` against a
   booted resident; it must report one stream at serial and at your depth. The
   stock Marlin MoE is NOT reproducible on GB10

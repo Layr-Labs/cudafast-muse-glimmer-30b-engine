@@ -17,7 +17,7 @@ single stream, without changing what the model computes.
 | **Hardware** | NVIDIA DGX Spark (GB10, sm_121, 128 GB unified memory) |
 | **Engine** | vLLM v0.27.1 in a pinned container; teams edit `vllm/`, `harness/` and the speculation depth |
 | **Score** | `prefill_gain^0.25 × decode_gain^0.75`, each gain measured against a trusted reference run on the same box, same prompt, same job |
-| **Correctness** | output must match the reference golden within a 10% token budget; near-tie divergences are replayed through the reference |
+| **Correctness** | output must match the reference golden within a 10% token budget; the timed decode window must match its per-depth oracle exactly |
 | **Fairness** | an unchanged engine scores 0.996 on average (sd 0.005, all 8 boxes) |
 | **Integrity** | sandboxed, network-less execution; hidden prompts rotated every 3–4 days; final ranking re-measured on a held-out pool |
 | **Track** | `nemotron3.5-lightning-30b-a3b-cuda-v1` |
@@ -66,7 +66,10 @@ A DGX Spark has all of them after the standard DGX OS setup plus rustup.
 ```
 
 This command resolves the pinned benchd from its release channel and verifies
-the bytes against the channel manifest.
+the bytes against the channel manifest. The channel is the `main` branch of the
+DEVELOPMENT bench repository while the track is internal. That repository is
+private, so the fetch needs `GITHUB_TOKEN` (or `BENCHD_DIST_TOKEN`). A verified
+pair in `benchd-bin/` or in `BENCHD_DIST_LOCAL` needs no token.
 
 ```bash
 ./setup.sh

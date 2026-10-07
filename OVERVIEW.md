@@ -53,11 +53,10 @@ Every point links to the document that has the detail.
 - **Correctness.**
   - The candidate's tokens must match the reference golden within the token
     budget.
-  - Where the candidate leaves the golden at a near-tie, benchd replays the
-    stream through the reference. Every token must be one the reference
-    nearly chose.
-  - **Why:** BF16 logit ties make exact matching brittle for honest engines,
-    while replay still rejects garbage.
+  - The timed decode window must match the per-depth oracle exactly. benchd
+    has no near-tie replay.
+  - **Risk:** BF16 logit ties make an exact match brittle for honest engines.
+    A kernel change that resolves a tie differently fails the run.
 - **Box health band.** Each box is calibrated. A control leg that runs slower
   than its calibration (by more than 5% on prefill or 3% on decode) means the
   box is unhealthy, and no score is sealed.
@@ -83,10 +82,13 @@ Every point links to the document that has the detail.
     every candidate leg, between control-leg retry attempts, and at job end.
   - **Why:** without it, a submission could read the hidden prompts and
     goldens, or rewrite the measuring tools.
-- **Sealed score.** `score.json` carries no engine text, no token ids, no
-  prompt names and no exact engine-chosen numbers: counts are bucketed, gaps
-  rounded, digests become match/valid, and a refused run seals no timings.
-  - **Why:** so a submission cannot use its score to smuggle out what it saw.
+- **Sealed score.** `score.json` names each prompt only by its sha256. It
+  carries no prompt text. The current benchd does not have the stricter
+  sealing of the earlier fork benchd (engineering log section 7.12). A
+  failed correctness check can seal the first failing step and its expected
+  and actual token ids, and a refusal can seal its error text.
+  - **Risk:** a submission can use a failed run to send out a small amount of
+    what it saw.
 - **A score that cannot be forged or erased from the log.** Participant code
   can print into the same job log, so the score is revealed only after
   sandbox cleanup, tagged with a per-job secret drawn before any participant
@@ -141,6 +143,10 @@ Every point links to the document that has the detail.
 | Cross-prompt calibration | every prompt within 0.5% (decode) and 1.3% (prefill) of the calibration prompt, so one band per box holds |
 | Attack tests on the boxes | fake score lines in the build log ignored (real score kept); a 50 GiB `/dev/shm` flood by the sandbox user wiped and memory restored before the next reference leg; garbage rejected by replay |
 | Fairness after all fixes (40 unchanged engines, all 8 boxes) | 39 pass, mean 0.9956, sd 0.0049; one GPU-transient boot failure (now re-run, see above) |
+
+These tests ran on the earlier fork benchd, which had the timed replay and the
+stricter sealing. The track now uses Layr-Labs bench main, which has neither
+(engineering log section 7.13).
 
 Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
 7.9–7.12.

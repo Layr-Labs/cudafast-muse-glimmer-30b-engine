@@ -17,7 +17,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FETCH="${REPO_ROOT}/tools/fetch-benchd.sh"
-BRANCH="nemotron3.5-lightning-30b-a3b-v1"
+BRANCH="main"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT

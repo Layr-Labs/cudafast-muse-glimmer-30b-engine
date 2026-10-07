@@ -86,7 +86,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "${out}" ] || exit 1
-printf '{"version":1}\n' > "${out}"
+printf '{"version":3}\n' > "${out}"
 exit 0
 EOF
 chmod 755 "${BIN}"/*
@@ -180,7 +180,7 @@ DRY_FLAGS=(
   "--weights ${WEIGHTS}"
   "${GOLDEN_NEEDLES[@]}"
   "--out ${WORK}/out1/baseline-calibration.json"
-  "--passes 4"
+  "--passes 3"
   "--box ${BOX}"
   "--track nemotron3.5-lightning-30b-a3b-cuda-v1"
   "--reference-commit ${REF_COMMIT}"
@@ -227,7 +227,7 @@ for needle in "--baseline-workspace ${WS}" \
               "--engine .build/release/mlxfast-runtime-worker" \
               "--weights ${WEIGHTS}" \
               "${GOLDEN_NEEDLES[@]}" \
-              "--out ${OUT}" "--passes 4" "--box ${BOX}" \
+              "--out ${OUT}" "--passes 3" "--box ${BOX}" \
               "--track nemotron3.5-lightning-30b-a3b-cuda-v1" \
               "--reference-commit ${REF_COMMIT}" \
               "--benchd-source-commit ${BENCHD_COMMIT}"; do

@@ -7,8 +7,8 @@
 # manifest's six top-level fields WERE the benchd pin. bench pull request
 # #255 adds `record-correctness-golden` beside benchd and declares it in a
 # `binaries` object, without moving those six fields. So TWO MANIFEST SHAPES
-# ARE LIVE at once -- the nemotron3.5-lightning-30b-a3b-v1 channel still serves the legacy
-# one until its republish -- and the resolver has to read both:
+# ARE LIVE at once -- older channels still serve the legacy one -- and the
+# resolver has to read both:
 #
 #   * the legacy shape must behave EXACTLY as it did: benchd alone, no
 #     recorder fetched, no recorder required;
@@ -26,7 +26,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FETCH="${REPO_ROOT}/tools/fetch-benchd.sh"
-BRANCH="nemotron3.5-lightning-30b-a3b-v1"
+BRANCH="main"
 TRIPLE="aarch64-unknown-linux-gnu"
 RECORDER="record-correctness-golden"
 
