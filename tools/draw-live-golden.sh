@@ -19,7 +19,12 @@
 # The pool is the fixture's live_golden_rotation.pool. A fixture with no
 # rotation block prints live_golden, exactly as before rotation existed.
 #
-# Usage: tools/draw-live-golden.sh [FIXTURE]     prints one prompt name
+# A fixture that declares live_goldens scores EVERY listed prompt in every job
+# (one pair per prompt, tools/nemotron35-measure-and-score.sh), so there is
+# nothing to draw: this prints nothing, and the measurement refuses a non-empty
+# MLXFAST_LIVE_GOLDEN_CHOICE.
+#
+# Usage: tools/draw-live-golden.sh [FIXTURE]     prints one prompt name, or nothing
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
@@ -29,6 +34,11 @@ die() { printf 'draw-live-golden: %s\n' "$*" >&2; exit 1; }
 [[ -f "${FIXTURE}" ]] || die "fixture not found: ${FIXTURE}"
 command -v jq >/dev/null 2>&1 || die "jq is required"
 
+if [[ "$(jq -r 'has("live_goldens")' "${FIXTURE}")" == "true" ]]; then
+  [[ "$(jq -r 'has("live_golden_rotation")' "${FIXTURE}")" != "true" ]] \
+    || die "the fixture declares both live_goldens and live_golden_rotation; a job either measures every live golden or draws one prompt"
+  exit 0
+fi
 if [[ "$(jq -r 'has("live_golden_rotation")' "${FIXTURE}")" != "true" ]]; then
   live="$(jq -r '.live_golden // empty' "${FIXTURE}")"
   [[ -n "${live}" ]] || die "the fixture declares neither live_golden_rotation nor live_golden"

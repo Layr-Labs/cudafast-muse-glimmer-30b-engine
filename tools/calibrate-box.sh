@@ -22,9 +22,10 @@
 #      not take it, and a resident engine holds GPU memory for as long as this
 #      driver runs.
 #   3. `benchd calibrate-baseline` runs the control leg --passes times under the
-#      full official methodology (cool gate per pass, same prompt, the fixture's
-#      live golden), writes the file, and refuses when the per-axis CV exceeds
-#      1 % -- the box was not stable, so no band describes it.
+#      full official methodology (cool gate per pass), once for EACH of the
+#      fixture's live_goldens, writes the file with one band per prompt, and
+#      refuses when a per-axis CV exceeds 1 % -- the box was not stable, so no
+#      band describes it.
 #
 # THIS DRIVER BOOTS NO SERVE. benchd owns the residency, and it boots the
 # resident INSIDE THE PASS LOOP: for each pass it runs the REFERENCE tree's own
@@ -229,21 +230,25 @@ TRACK_ID="$(jq -r '.trackId // empty' "${MANIFEST}")"
 # MLXFAST_QWEN_MTP_TRACK_ID: legacy variable name required by benchd.
 export MLXFAST_QWEN_MTP_TRACK_ID="${TRACK_ID}"
 
-# --- the golden the band is captured on -------------------------------------
-# The fixture's calibration_prompt (default: live_golden), resolved from the
-# staged pool exactly as tools/nemotron35-measure-and-score.sh resolves a
-# prompt. The scored prompt is drawn per job from live_golden_rotation.pool,
-# and this one band gates the control leg whichever prompt is drawn. Cross-prompt
-# calibration was measured across the pool and one band per box holds (see
-# docs/nemotron35-port-notes.md section 7.10).
-LIVE_GOLDEN="$(jq -r '.calibration_prompt // .live_golden // empty' "${FIXTURE}")"
-[ -n "${LIVE_GOLDEN}" ] || refuse missing-live-golden "${FIXTURE} declares neither calibration_prompt nor live_golden"
+# --- the goldens the bands are captured on -----------------------------------
+# Every name in the fixture's live_goldens, in fixture order, resolved from the
+# staged pool exactly as tools/nemotron35-measure-and-score.sh resolves them.
+# A ranked run measures every live golden, and benchd gates each control leg
+# with the band of the prompt that leg measured, so each prompt gets its own
+# band. Each one reaches benchd as a --golden and --prompt pair.
 GOLDEN_DIR="${MLXFAST_NEMOTRON35_GOLDEN_DIR:-}"
 [ -n "${GOLDEN_DIR}" ] || refuse missing-golden \
-  "MLXFAST_NEMOTRON35_GOLDEN_DIR is unset; the live golden is staged on the box out of band and this script fetches nothing"
-GOLDEN_PATH="${GOLDEN_DIR}/${LIVE_GOLDEN}.golden.json"
-[ -r "${GOLDEN_PATH}" ] || refuse missing-golden \
-  "cannot read the live golden ${GOLDEN_PATH}; stage the pool into MLXFAST_NEMOTRON35_GOLDEN_DIR"
+  "MLXFAST_NEMOTRON35_GOLDEN_DIR is unset; the live goldens are staged on the box out of band and this script fetches nothing"
+LIVE_GOLDENS="$(jq -r '(.live_goldens // [])[]' "${FIXTURE}")"
+[ -n "${LIVE_GOLDENS}" ] || refuse missing-live-golden "${FIXTURE} declares no live_goldens"
+GOLDEN_ARGS=()
+for name in ${LIVE_GOLDENS}; do
+  case "${name}" in *[!a-z0-9_-]*) refuse missing-live-golden "live_goldens name '${name}' is not [a-z0-9_-]+" ;; esac
+  [ -r "${GOLDEN_DIR}/${name}.golden.json" ] || refuse missing-golden \
+    "cannot read the live golden ${GOLDEN_DIR}/${name}.golden.json; stage the pool into MLXFAST_NEMOTRON35_GOLDEN_DIR"
+  GOLDEN_ARGS+=(--golden "${GOLDEN_DIR}/${name}.golden.json" --prompt "${name}")
+done
+LIVE_GOLDEN="$(printf '%s' "${LIVE_GOLDENS}" | tr '\n' ' ')"
 
 # --- benchd -----------------------------------------------------------------
 # Honoured as-is when the caller sets it, exactly as measure-and-score.sh does.
@@ -292,13 +297,12 @@ CALIBRATE_ARGV=(
   --baseline-workspace "${WORKSPACE}"
   --engine "${ENGINE_REL}"
   --weights "${WEIGHTS_DIR}"
-  --golden "${GOLDEN_PATH}"
+  "${GOLDEN_ARGS[@]}"
   --out "${OUT}"
   --passes "${PASSES}"
   --box "${BOX}"
   --track "${TRACK_ID}"
   --contract "${FIXTURE}"
-  --prompt "${LIVE_GOLDEN}"
   --reference-commit "${WANT_REF_COMMIT}"
   --benchd-source-commit "${BENCHD_SOURCE_COMMIT}"
 )
@@ -313,8 +317,8 @@ box                  ${BOX}
 reference workspace  ${WORKSPACE} (HEAD ${HAVE_REF_COMMIT})
 reference commit     ${WANT_REF_COMMIT}
 weights              ${WEIGHTS_DIR}
-golden               ${GOLDEN_PATH}
-prompt               ${LIVE_GOLDEN}
+goldens              ${GOLDEN_DIR}/<prompt>.golden.json
+prompts              ${LIVE_GOLDEN}
 passes               ${PASSES}
 engine (in workspace) ${ENGINE_REL}
 benchd               ${BENCHD}

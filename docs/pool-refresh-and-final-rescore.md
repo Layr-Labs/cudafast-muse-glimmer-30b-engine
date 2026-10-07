@@ -12,8 +12,9 @@ record carries no engine text and only a few engine-chosen bits
 may submit without limit. A prompt learned that way could be hard-coded into an
 engine for a fake speed-up. Three layers limit the damage:
 
-1. **Per-job rotation**: each ranked job scores one prompt
-   drawn at random from the live pool of 8.
+1. **Every live golden per job**: each ranked job measures every prompt of
+   the fixture's `live_goldens`, one pair per prompt, and scores the
+   lower-median pair.
 2. **Pool refresh every 3-4 days** (4 refreshes in two weeks): the live pool is
    replaced by 8 prompts no submission has seen.
 3. **Final re-score**: at the close, the top submissions are re-measured on a
@@ -52,7 +53,7 @@ Idempotent steps, each refusing on any mismatch:
    (`/srv/nemotron35/goldens`, root:bench 0750), verified by sha256. The old
    generation stays in place, so in-flight jobs are unaffected.
 4. **Pin and switch**: one commit to the trusted fixture that pins the new
-   goldens and sets the rotation pool to the new generation, pushed to `main`
+   goldens and sets `live_goldens` to the new generation, pushed to `main`
    (and to the armed base branch the dispatcher overlays onto). Jobs
    dispatched after the push use the new pool; jobs already running keep the
    pool of the commit they were dispatched at.
@@ -65,13 +66,13 @@ Timing: fleet time is spent in step 2 (and a short drain). The script
 records its progress so a crash resumes where it stopped. It never touches the
 calibration (see below).
 
-Calibration: the box band is captured on one prompt (the fixture's
-`calibration_prompt`). The cross-prompt check has been run (engineering log,
-section 7.10): on every box measured, decode lands within 0.5% and prefill
-within 1.3% of the calibration prompt, well inside the ±5% prefill band, and
-each score is a ratio against a control leg on the same prompt in the same job.
-One band per box therefore holds for every prompt, and a refresh needs no
-re-calibration.
+Calibration: the box calibration file carries one band per live golden
+(`tools/calibrate-box.sh`), and benchd gates each control leg with the band of
+the prompt it measured. A new generation has no bands yet, so every box must be
+calibrated again on the new live goldens before the pin commit is pushed;
+otherwise the ranked preflight refuses every job. The pin step also refuses an
+`official_pairs` that is not a multiple of the generation size, because every
+job measures every live golden.
 
 ## Final re-score (`router.py rescore`, operator-run at the close)
 
@@ -88,7 +89,7 @@ re-calibration.
    submission; then the top N teams (N set by the organizer; default 10).
 4. **Stage and pin**: stage the `final` goldens on all boxes; build a
    `rescore/base` branch = the contest's final base plus one fixture commit
-   whose rotation pool is the `final` generation.
+   whose `live_goldens` are the `final` generation.
 5. **Re-measure**: each selected submission's editable paths are overlaid onto
    `rescore/base` (the same REPLACE overlay as normal submission) and dispatched
    K times (default K = 5), one run per slot, spread across different boxes, so
@@ -174,7 +175,7 @@ tools/pool-refresh.sh --label g2 --corpus .mlxfast-private/corpus --snapshot <SN
 #   one step alone: --step author|record|stage|pin|verify|retire
 # review the fixture diff, then run the printed commands:
 git add fixtures/nemotron35_lightning_30b_a3b_track.json
-git commit -m "pool refresh: pin g2 and switch the rotation pool"
+git commit -m "pool refresh: pin g2 and switch the live goldens"
 git push origin HEAD:main && git push origin HEAD:<armed-base>
 tools/pool-refresh.sh --label g2 --step verify      # every box matches origin/main's pins
 # once no job dispatched before the switch is still queued or running:
@@ -182,10 +183,9 @@ tools/pool-refresh.sh --label g1 --step retire      # unpins g1: commit and push
 tools/pool-refresh.sh --label g1 --step retire      # after that push drains: removes g1 from the boxes
 ```
 
-The pin commit sets `live_golden_rotation.pool` to the 8 new prompts and, so
-that the default stays drawable, `live_golden` to `<label>-1` and
-`hidden_correctness_golden` to its serial tape. `calibration_prompt` stays
-`botany`. The old generation stays pinned and staged until it is retired, so
+The pin commit sets `live_goldens` to the new prompts and
+`hidden_correctness_golden` to the serial tape of `<label>-1`. The old
+generation stays pinned and staged until it is retired, so
 jobs queued at the old commit keep passing. The ranked preflight tolerates
 unpinned `g<N>-*` goldens (staged ahead of their pin) and nothing else, so a
 `final-*` golden on a box before the close fails every job.

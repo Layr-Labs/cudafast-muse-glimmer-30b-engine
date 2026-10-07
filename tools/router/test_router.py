@@ -109,9 +109,8 @@ class TeamFreezeRescoreTest(unittest.TestCase):
         (src / "mtp-head.manifest.json").write_text("{}\n")
         (src / router.FIXTURE_REL).write_text(json.dumps({
             "timed_prompt_pool": [{"r2_path": "cp/t/botany.golden.json", "sha256": "a" * 64, "bytes": 1}],
-            "mtp_head": {"permitted_draft_depths": [1, 2]}, "live_golden": "botany",
-            "calibration_prompt": "botany", "speculative_oracles": {},
-            "live_golden_rotation": {"mode": "per_job_random", "pool": ["botany"]},
+            "mtp_head": {"permitted_draft_depths": [1, 2]}, "official_pairs": 2,
+            "speculative_oracles": {}, "live_goldens": ["botany"],
             "hidden_correctness_golden": {"sha256": "a" * 64, "bytes": 1}}, indent=1))
         git("init", "-q", "-b", "main", cwd=src)
         git("add", "-A", cwd=src)
@@ -205,8 +204,8 @@ class TeamFreezeRescoreTest(unittest.TestCase):
         plan = self.r.rescore("origin/main", self.pins, self.log, top=2, runs=2)
         self.assertEqual([s["submission"] for s in plan["selected"]], [a, b])
         fx = json.loads(git("show", f"rescore/base:{router.FIXTURE_REL}", cwd=self.r.clone))
-        self.assertEqual(fx["live_golden_rotation"]["pool"], ["final-1", "final-2"])
-        self.assertEqual(fx["calibration_prompt"], "botany")
+        self.assertEqual(fx["live_goldens"], ["final-1", "final-2"])
+        self.assertNotIn("live_golden_rotation", fx)
         self.assertIn("push origin rescore/base", plan["push"])
         rows = self.r.db.execute("SELECT * FROM submissions WHERE rescore='final' ORDER BY created").fetchall()
         self.assertEqual([(r["team"], r["source"], r["state"]) for r in rows],
@@ -214,7 +213,7 @@ class TeamFreezeRescoreTest(unittest.TestCase):
         for r in rows:
             engine = git("show", f"{r['branch']}:harness/engine.txt", cwd=self.bare)
             self.assertEqual(engine, {"A": "a-engine", "B": "b-engine"}[r["team"]])
-            pool = json.loads(git("show", f"{r['branch']}:{router.FIXTURE_REL}", cwd=self.bare))["live_golden_rotation"]["pool"]
+            pool = json.loads(git("show", f"{r['branch']}:{router.FIXTURE_REL}", cwd=self.bare))["live_goldens"]
             self.assertEqual(pool, ["final-1", "final-2"])
         with self.assertRaisesRegex(RuntimeError, "already queued"):
             self.r.rescore("origin/main", self.pins, self.log, top=2, runs=2)

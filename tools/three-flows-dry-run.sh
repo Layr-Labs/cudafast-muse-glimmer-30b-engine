@@ -26,7 +26,7 @@
 #
 # THE TRACK. benchd main is contract-first: every verb gets --contract, and the
 # fixture declares the model identity (nemotron_h, 131072, 52 layers, a
-# 4096-token seed) and the measurement window. The fake backend emits ids far
+# seed_tokens-long prompt) and the measurement window. The fake backend emits ids far
 # inside the vocabulary, so its goldens load under that identity.
 #
 # Env:
@@ -79,7 +79,7 @@ cargo build --release --locked -q --manifest-path "${ROOT_DIR}/harness/protocol-
 "${ROOT_DIR}/tools/stage-cuda-engine.sh" >/dev/null || die "the adapter did not stage"
 ENGINE_REL=".build/release/mlxfast-runtime-worker"
 
-python3 -c "print(list(range(100, 1124)))" > "${WORK}/prompt.json"
+python3 -c "import sys; print(list(range(100, 100 + int(sys.argv[1]))))" "$(jq -r .seed_tokens "${FIXTURE}")" > "${WORK}/prompt.json"
 
 # --- FLOW A: golden authoring -----------------------------------------------
 say "flow A: record-correctness-golden over the resident (serial, mtp${DEPTH})"

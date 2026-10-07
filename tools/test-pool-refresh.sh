@@ -105,6 +105,11 @@ mv "${WORK}/fx" "${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
 git -C "${ROOT}" -c user.name=t -c user.email=t@t commit -qam "legacy pins" && git -C "${ROOT}" push -q origin HEAD:main
 
 FX="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+# A generation is 8 prompts, and every job measures every live golden, so the
+# fixture this suite pins into runs 8 pairs.
+jq '.official_pairs = 8' "${FX}" > "${WORK}/fx" && mv "${WORK}/fx" "${FX}"
+SHIPPED_POOL="$(jq '.timed_prompt_pool | length' "${FX}")"
+SHIPPED_LIVE="$(jq -c '.live_goldens' "${FX}")"
 refresh() {
   env PATH="${STUB}:${PATH}" REFRESH_BOXES="${BOXES}" REFRESH_PRIVATE="${PRIV}" \
     REFRESH_BOX_GOLDENS='$HOME/goldens' REFRESH_PYTHON="${WORK}/fake-stitch" \
@@ -139,12 +144,12 @@ for b in ${BOXES}; do
 done
 ok "all boxes staged"
 grep -c " g1 " "${PRIV}/refresh/staging.log" | grep -qx 168 && ok "staging log records every install (56 x 3 boxes)" || fail "staging log count"
-if [[ "$(jq -c '.live_golden_rotation.pool' "${FX}")" == '["g1-1","g1-2","g1-3","g1-4","g1-5","g1-6","g1-7","g1-8"]' ]] \
-  && [[ "$(jq -r '.calibration_prompt, .live_golden' "${FX}" | tr '\n' ' ')" == "botany g1-1 " ]] \
-  && [[ "$(jq '.timed_prompt_pool | length' "${FX}")" == 16 ]] \
+if [[ "$(jq -c '.live_goldens' "${FX}")" == '["g1-1","g1-2","g1-3","g1-4","g1-5","g1-6","g1-7","g1-8"]' ]] \
+  && [[ "$(jq -c '[has("live_golden_rotation", "live_golden", "calibration_prompt")]' "${FX}")" == '[false,false,false]' ]] \
+  && [[ "$(jq '.timed_prompt_pool | length' "${FX}")" == $((SHIPPED_POOL + 8)) ]] \
   && [[ "$(jq '.speculative_oracles["g1-8"] | length' "${FX}")" == 6 ]] \
   && [[ "$(jq -r '.hidden_correctness_golden.sha256' "${FX}")" == "$(jq -r '.["g1-1.golden.json"].sha256' "${PRIV}/refresh/g1/pins.json")" ]]; then
-  ok "pin: pool, live_golden, hidden golden and oracles point at g1; calibration_prompt unchanged"
+  ok "pin: live_goldens, hidden golden and oracles point at g1; no rotation keys"
 else
   fail "pin: fixture not as expected"
 fi
@@ -190,10 +195,10 @@ grep -q " final b1 final-1.golden.json " "${PRIV}/refresh/staging.log" && ok "fi
 
 # --- retire ------------------------------------------------------------------------
 out="$(refresh --label g1 --step retire)" && fail "retired the live generation"
-grep -q "still the rotation pool" <<<"${out}" && ok "retire refuses the live generation" || fail "retire: ${out}"
-jq '.live_golden_rotation.pool = ["botany"] | .live_golden = "botany"' "${FX}" > "${WORK}/fx" && mv "${WORK}/fx" "${FX}"
+grep -q "still the live goldens" <<<"${out}" && ok "retire refuses the live generation" || fail "retire: ${out}"
+jq --argjson l "${SHIPPED_LIVE}" '.live_goldens = $l' "${FX}" > "${WORK}/fx" && mv "${WORK}/fx" "${FX}"
 out="$(refresh --label g1 --step retire)" || fail "retire unpin: $(tail -3 <<<"${out}")"
-[[ "$(jq '.timed_prompt_pool | length' "${FX}")" == 8 && "$(jq 'has("speculative_oracles") and (.speculative_oracles | has("g1-1") | not)' "${FX}")" == true ]] \
+[[ "$(jq '.timed_prompt_pool | length' "${FX}")" == "${SHIPPED_POOL}" && "$(jq 'has("speculative_oracles") and (.speculative_oracles | has("g1-1") | not)' "${FX}")" == true ]] \
   && [[ "$(nf "${FAKE}/b1/home/goldens/g1-*")" -gt 0 ]] && ok "retire phase 1 unpins g1 and leaves the boxes alone" || fail "retire phase 1"
 out="$(refresh --label g1 --step retire)" && fail "retire removed goldens before the unpin was pushed"
 git -C "${ROOT}" -c user.name=t -c user.email=t@t commit -qam "retire g1" && git -C "${ROOT}" push -q origin HEAD:main

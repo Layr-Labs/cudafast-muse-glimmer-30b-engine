@@ -115,7 +115,12 @@ trap 'rm -rf "${WORK}"' EXIT
 FIXTURE="${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
 TRACK_ID="$(jq -r '.track_id' "${FIXTURE}")"
 REF_COMMIT="$(jq -r '.baseline_reference_commit' "${FIXTURE}")"
-LIVE_GOLDEN="$(jq -r '.live_golden' "${FIXTURE}")"
+# The shipped fixture declares live_goldens. Most cases below run the scaffold
+# in the per-job rotation shape over the same prompts (live_golden = the first
+# one); the live_goldens cases near the end run the shipped shape.
+mapfile -t LIVE_NAMES < <(jq -r '.live_goldens[]' "${FIXTURE}")
+LIVE_GOLDEN="${LIVE_NAMES[0]}"
+SECOND="${LIVE_NAMES[1]}"
 IMAGE_REF="$(jq -r '.serve_configuration.container_image | split(":")[0]' "${FIXTURE}")@$(jq -r '.serve_configuration.container_digest' "${FIXTURE}")"
 DRIVER_PIN="$(jq -r '.serve_configuration.toolchain.driver_min' "${FIXTURE}")"
 RUNNER="test-box-nemotron35-cuda"
@@ -207,12 +212,21 @@ for entry in contract.get("timed_prompt_pool", []):
 for oracles in (contract.get("speculative_oracles") or {}).values():
     for entry in oracles.values():
         entry["sha256"], entry["bytes"] = stage(entry["r2_path"])
+names = contract["live_goldens"]
 live = next(e for e in contract["timed_prompt_pool"]
-            if e["r2_path"].endswith("/" + contract["live_golden"] + ".golden.json"))
+            if e["r2_path"].endswith("/" + names[0] + ".golden.json"))
 contract["hidden_correctness_golden"] = {"sha256": live["sha256"], "bytes": live["bytes"]}
 # The copy is ARMED: section 5 refuses an unarmed fixture, and the suite is
 # about what comes after it.
 contract["official_scoring_enabled"] = True
+# The shipped live_goldens shape, kept for the live_goldens cases.
+with open(dst + ".live-goldens", "w", encoding="utf-8") as fh:
+    json.dump(contract, fh, indent=2)
+    fh.write("\n")
+# The per-job rotation shape over the same prompts, for every other case.
+del contract["live_goldens"]
+contract["live_golden"] = names[0]
+contract["live_golden_rotation"] = {"mode": "per_job_random", "pool": names, "pending": []}
 with open(dst, "w", encoding="utf-8") as fh:
     json.dump(contract, fh, indent=2)
     fh.write("\n")
@@ -465,57 +479,57 @@ EOF
     expect_refusal "${label}" "${needle}" "$@"
     cp "${WORK}/contract.orig.json" "${SCAFFOLD_CONTRACT}"
   }
-  # beagle is in the shipped pool with its oracles pinned. The two cases below
-  # construct the broken state explicitly: beagle stays in the pool, its own
+  # SECOND is in the pool with its oracles pinned. The two cases below
+  # construct the broken state explicitly: SECOND stays in the pool, its own
   # oracle pins are removed or replaced, and its oracle files are not staged
   # (a staged file with no pin is refused on its own, before these checks).
-  GOLDEN_DIR_NO_BEAGLE="${WORK}/goldens-no-beagle-oracles"
-  cp -R "${GOLDEN_DIR}" "${GOLDEN_DIR_NO_BEAGLE}"
-  rm -f "${GOLDEN_DIR_NO_BEAGLE}"/beagle.mtp*.golden.json
-  BEAGLE_IN_POOL='.live_golden_rotation.pool |= ((. - ["beagle"]) + ["beagle"])'
+  GOLDEN_DIR_NO_SECOND="${WORK}/goldens-no-second-oracles"
+  cp -R "${GOLDEN_DIR}" "${GOLDEN_DIR_NO_SECOND}"
+  rm -f "${GOLDEN_DIR_NO_SECOND}/${SECOND}".mtp*.golden.json
+  SECOND_IN_POOL=".live_golden_rotation.pool |= ((. - [\"${SECOND}\"]) + [\"${SECOND}\"])"
   rotation_case "rotation prompt without per-depth oracles" \
-    "${BEAGLE_IN_POOL} | del(.speculative_oracles.beagle)" \
-    "has no pinned per-depth oracle speculative_oracles[beagle][mtp1]" \
-    "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR_NO_BEAGLE}"
+    "${SECOND_IN_POOL} | del(.speculative_oracles[\"${SECOND}\"])" \
+    "has no pinned per-depth oracle speculative_oracles[${SECOND}][mtp1]" \
+    "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
   rotation_case "rotation prompt outside timed_prompt_pool" \
     '.live_golden_rotation.pool += ["nosuch"]' \
     "rotation pool prompt 'nosuch' names no timed_prompt_pool entry"
   rotation_case "rotation prompt borrowing another prompt's oracles" \
-    "${BEAGLE_IN_POOL} | .speculative_oracles.beagle = (.speculative_oracles.botany | del(.mtp6))" \
-    "speculative_oracles[beagle][mtp1] points at botany.mtp1.golden.json" \
-    "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR_NO_BEAGLE}"
+    "${SECOND_IN_POOL} | .speculative_oracles[\"${SECOND}\"] = (.speculative_oracles[\"${LIVE_GOLDEN}\"] | del(.mtp6))" \
+    "speculative_oracles[${SECOND}][mtp1] points at ${LIVE_GOLDEN}.mtp1.golden.json" \
+    "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
   rotation_case "rotation pool empty" '.live_golden_rotation.pool = []' \
     "live_golden_rotation.pool is empty"
-  rotation_case "calibration prompt is not the band's" '.calibration_prompt = "beagle"' \
-    "the fixture's calibration_prompt is 'beagle'"
+  rotation_case "calibration prompt is not the band's" ".calibration_prompt = \"${SECOND}\"" \
+    "the fixture's calibration_prompt is '${SECOND}'"
   # The control: a second prompt fully pinned and staged joins the pool.
   GOLDEN_DIR2="${WORK}/goldens2"
   cp -R "${GOLDEN_DIR}" "${GOLDEN_DIR2}"
-  python3 - "${WORK}/contract.orig.json" "${GOLDEN_DIR2}" "${SCAFFOLD_CONTRACT}" <<'ROTEOF'
+  python3 - "${WORK}/contract.orig.json" "${GOLDEN_DIR2}" "${SCAFFOLD_CONTRACT}" "${LIVE_GOLDEN}" "${SECOND}" <<'ROTEOF'
 import hashlib, json, os, sys
-src, golden_dir, dst = sys.argv[1:4]
+src, golden_dir, dst, first, second = sys.argv[1:6]
 c = json.load(open(src, encoding="utf-8"))
-c["live_golden_rotation"]["pool"] = ["botany", "beagle"]
+c["live_golden_rotation"]["pool"] = [first, second]
 prefix = c["timed_prompt_pool"][0]["r2_path"].rsplit("/", 1)[0]
-c["speculative_oracles"]["beagle"] = {}
+c["speculative_oracles"][second] = {}
 for d in c["mtp_head"]["permitted_draft_depths"]:
-    base = f"beagle.mtp{d}.golden.json"
-    data = (json.dumps({"synthetic_golden": base}) + "\n").encode()
+    base = f"{second}.mtp{d}.golden.json"
+    data = (json.dumps({"synthetic_golden": base, "restaged": True}) + "\n").encode()
     open(os.path.join(golden_dir, base), "wb").write(data)
-    c["speculative_oracles"]["beagle"][f"mtp{d}"] = {
+    c["speculative_oracles"][second][f"mtp{d}"] = {
         "r2_path": f"{prefix}/{base}", "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
 json.dump(c, open(dst, "w", encoding="utf-8"), indent=2)
 ROTEOF
   control_rot="$(run_preflight "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR2}")"
   if grep -q 'ranked-box-preflight: all checks passed' <<<"${control_rot}" \
-    && grep -q "every rotation pool prompt (botany beagle)" <<<"${control_rot}"; then
+    && grep -q "every rotation pool prompt (${LIVE_GOLDEN} ${SECOND})" <<<"${control_rot}"; then
     echo "ok    section 4b / control: a two-prompt pool, fully pinned and staged, passes"
   else
     fail "section 4b / control: a fully pinned two-prompt pool did not pass; got: $(tail -3 <<<"${control_rot}")"
   fi
   # ...and the same pool with one oracle left unstaged is refused by name.
-  rm "${GOLDEN_DIR2}/beagle.mtp4.golden.json"
-  expect_refusal "rotation oracle not staged" "beagle.mtp4.golden.json" \
+  rm "${GOLDEN_DIR2}/${SECOND}.mtp4.golden.json"
+  expect_refusal "rotation oracle not staged" "${SECOND}.mtp4.golden.json" \
     "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR2}"
   cp "${WORK}/contract.orig.json" "${SCAFFOLD_CONTRACT}"
 
@@ -533,6 +547,30 @@ ROTEOF
   echo '{}' > "${GOLDEN_DIR3}/final-1.golden.json"
   expect_refusal "held-out final golden staged" "final-1.golden.json" \
     "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR3}"
+
+  # THE SHIPPED SHAPE (sections 4b and 8b): live_goldens. Every job measures
+  # every live golden, so every one needs its own band in a version-2 file.
+  cp "${SCAFFOLD_CONTRACT}.live-goldens" "${SCAFFOLD_CONTRACT}"
+  CAL_ALL="${WORK}/baseline-calibration-all.json"
+  write_calibration_v2 "${CAL_ALL}" "$(jq -nc --args '$ARGS.positional' "${LIVE_NAMES[@]}") as \$names | .prompts = [\$names[] as \$n | .prompts[0] + {prompt: \$n}]"
+  control_lg="$(run_preflight "MLXFAST_BASELINE_CALIBRATION=${CAL_ALL}")"
+  if grep -q 'ranked-box-preflight: all checks passed' <<<"${control_lg}" \
+    && grep -q "every rotation pool prompt (${LIVE_NAMES[*]})" <<<"${control_lg}"; then
+    echo "ok    section 4b+8b / control live_goldens: every live golden staged with its own band passes"
+  else
+    fail "section 4b+8b / control live_goldens: did not pass; got: $(tail -3 <<<"${control_lg}")"
+  fi
+  CAL_MISSING="${WORK}/baseline-calibration-missing-one.json"
+  jq --arg n "${LIVE_NAMES[2]}" '.prompts |= map(select(.prompt != $n))' "${CAL_ALL}" > "${CAL_MISSING}"
+  expect_refusal "live_goldens: one prompt has no band" \
+    "has no prompts[] entry for prompt '${LIVE_NAMES[2]}'" "MLXFAST_BASELINE_CALIBRATION=${CAL_MISSING}"
+  expect_refusal "live_goldens: a version-1 band covers one prompt only" \
+    "was captured on prompt '${LIVE_GOLDEN}' but the fixture's calibration_prompt is '${SECOND}'"
+  jq '.live_golden_rotation = {mode: "per_job_random", pool: .live_goldens}' \
+    "${SCAFFOLD_CONTRACT}.live-goldens" > "${SCAFFOLD_CONTRACT}"
+  expect_refusal "live_goldens with a rotation block" \
+    "declares both live_goldens and live_golden_rotation" "MLXFAST_BASELINE_CALIBRATION=${CAL_ALL}"
+  cp "${WORK}/contract.orig.json" "${SCAFFOLD_CONTRACT}"
 
   # Section 9: a box without the sandbox user is refused, naming the failed check.
   expect_refusal "sandbox user not set up" \

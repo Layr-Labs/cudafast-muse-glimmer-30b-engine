@@ -24,7 +24,7 @@ cp "${REPO_ROOT}/tools/"{local-baseline,benchmark,spec-declaration,serve-up}.sh 
 cp "${REPO_ROOT}/benchmark.json" "${REPO_ROOT}/mtp-head.manifest.json" "${TEST_ROOT}/"
 cp "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" "${TEST_ROOT}/fixtures/"
 # The public golden is recorded on a Spark; the stub benchd never reads it.
-echo '{}' > "${TEST_ROOT}/correctness_prompts/public-longcopy-gate-english-4096.golden.json"
+echo '{}' > "${TEST_ROOT}/correctness_prompts/public-longcopy-gate-english-496.golden.json"
 
 cat > "${WORK}/benchd" <<'STUB'
 #!/usr/bin/env bash
@@ -75,7 +75,7 @@ run_case defaults "${TEST_ROOT}/tools/local-baseline.sh"
 assert_arg defaults --mode local-iterate
 assert_arg defaults --engine .build/release/mlxfast-runtime-worker
 assert_arg defaults --weights reference_weights/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
-assert_arg defaults --golden correctness_prompts/public-longcopy-gate-english-4096.golden.json
+assert_arg defaults --golden correctness_prompts/public-longcopy-gate-english-496.golden.json
 assert_arg defaults --score-path score.local-iterate.json
 grep -Fxq -- '--cool-gate' "${WORK}/defaults.argv"
 grep -q 'public local baseline (unranked)' "${WORK}/defaults.stderr"
@@ -88,7 +88,7 @@ run_case snapshot_env MLXFAST_TARGET_SNAPSHOT_DIR='box snapshot' "${TEST_ROOT}/t
 assert_arg snapshot_env --weights 'box snapshot'
 
 cp "${WORK}/benchd" "${TEST_ROOT}/custom engine"
-cp "${TEST_ROOT}/correctness_prompts/public-longcopy-gate-english-4096.golden.json" "${TEST_ROOT}/custom golden.json"
+cp "${TEST_ROOT}/correctness_prompts/public-longcopy-gate-english-496.golden.json" "${TEST_ROOT}/custom golden.json"
 synthetic_window_weights "${TEST_ROOT}/custom weights"
 run_case overrides MLXFAST_ENGINE_BIN='custom engine' \
   MLXFAST_CORRECTNESS_GOLDEN_PATH='custom golden.json' \

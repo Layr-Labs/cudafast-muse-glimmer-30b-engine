@@ -360,18 +360,24 @@ else
 fi
 
 # --- 4b. every prompt the ranked run may score is pinned and staged --------
-# The ranked run scores ONE prompt per job: the one the workflow draws from
-# live_golden_rotation.pool (tools/draw-live-golden.sh), or the fixture's
-# live_golden when it declares no rotation. Any pool prompt can be drawn, so
-# EVERY one must carry its serial golden (a timed_prompt_pool entry) and one
+# A fixture that declares live_goldens scores EVERY listed prompt in every job.
+# Otherwise the ranked run scores ONE prompt per job: the one the workflow
+# draws from live_golden_rotation.pool (tools/draw-live-golden.sh), or the
+# fixture's live_golden when it declares no rotation. Every prompt a job can
+# measure must carry its serial golden (a timed_prompt_pool entry) and one
 # per-depth oracle for every permitted draft depth, all pinned and staged. The
 # loops above already pin-verified what is pinned; this refuses, by name, a
-# pool prompt with any of the seven missing, pre-GPU rather than in the one job
-# that happens to draw it.
-LIVE_GOLDEN_NAME="$(jq -r '.live_golden // ""' "${CONTRACT}")"
-[[ -n "${LIVE_GOLDEN_NAME}" ]] \
-  || fail "the fixture declares no live_golden; there is no default golden for the ranked run to score over"
-if [[ "$(jq -r 'has("live_golden_rotation")' "${CONTRACT}")" == "true" ]]; then
+# prompt with any of the seven missing, pre-GPU rather than in the one job
+# that happens to measure it.
+if [[ "$(jq -r 'has("live_goldens")' "${CONTRACT}")" == "true" ]]; then
+  [[ "$(jq -r 'has("live_golden_rotation")' "${CONTRACT}")" != "true" ]] \
+    || fail "the fixture declares both live_goldens and live_golden_rotation; a job either measures every live golden or draws one prompt"
+  mapfile -t ROTATION_POOL < <(jq -r '.live_goldens // [] | .[]' "${CONTRACT}")
+  [[ "${#ROTATION_POOL[@]}" -ge 1 ]] || fail "live_goldens is empty; there is nothing to score"
+  LIVE_GOLDEN_NAME="${ROTATION_POOL[0]}"
+elif ! LIVE_GOLDEN_NAME="$(jq -r '.live_golden // ""' "${CONTRACT}")" || [[ -z "${LIVE_GOLDEN_NAME}" ]]; then
+  fail "the fixture declares neither live_goldens nor live_golden; there is no golden for the ranked run to score over"
+elif [[ "$(jq -r 'has("live_golden_rotation")' "${CONTRACT}")" == "true" ]]; then
   rot_mode="$(jq -r '.live_golden_rotation.mode // ""' "${CONTRACT}")"
   [[ "${rot_mode}" == "per_job_random" ]] \
     || fail "live_golden_rotation.mode is '${rot_mode}'; only per_job_random is defined"
@@ -632,12 +638,40 @@ cal_version="$(jq -r '.version // empty' "${BASELINE_CALIBRATION}")"
 [[ "${cal_version}" == "1" || "${cal_version}" == "2" ]] \
   || fail "the baseline calibration declares version '${cal_version}'; this preflight reads version 1 and 2 only"
 
-# THE CALIBRATION PROMPT. The band is captured on the fixture's
-# calibration_prompt (default: live_golden) and gates the serial-control leg on
-# whichever pool prompt the job drew. Version 2 stores per-prompt bands in
-# prompts[]; flatten to the v1 field layout before the checks below.
-CALIBRATION_PROMPT="$(jq -r '.calibration_prompt // .live_golden // ""' "${CONTRACT}")"
+# THE CALIBRATION PROMPTS. Under live_goldens every listed prompt carries its
+# own band, and benchd gates each control leg with the band of the prompt it
+# measured. Otherwise the band is captured on the fixture's calibration_prompt
+# (default: live_golden) and gates the serial-control leg on whichever pool
+# prompt the job drew. Version 2 stores per-prompt bands in prompts[]; flatten
+# to the v1 field layout before the per-prompt checks.
+if [[ "$(jq -r 'has("live_goldens")' "${CONTRACT}")" == "true" ]]; then
+  mapfile -t CALIBRATION_PROMPTS < <(jq -r '.live_goldens[]' "${CONTRACT}")
+else
+  CALIBRATION_PROMPTS=("$(jq -r '.calibration_prompt // .live_golden // ""' "${CONTRACT}")")
+fi
 cal_view_tmp=""
+
+TRACK_ID="$(jq -r '.track_id // empty' "${CONTRACT}")"
+cal_track="$(jq -r '.track_id // empty' "${BASELINE_CALIBRATION}")"
+[[ "${cal_track}" == "${TRACK_ID}" ]] \
+  || fail "the baseline calibration names track '${cal_track}' but this track is '${TRACK_ID}'; a band from another track does not describe this leg"
+
+# THE BOX NAMES ITSELF. A band is a property of ONE machine, so it is attributed
+# to the runner it was captured on. An unnamed runner is refused rather than
+# waved through: a band that cannot be attributed is a band from anywhere.
+cal_box="$(jq -r '.box // empty' "${BASELINE_CALIBRATION}")"
+[[ -n "${cal_box}" ]] || fail "the baseline calibration names no box; a per-box band must say which box"
+[[ -n "${RUNNER_NAME:-}" ]] \
+  || fail "the baseline calibration names box '${cal_box}' but this job has no RUNNER_NAME; a per-box band cannot be attributed to a runner that does not identify itself"
+[[ "${cal_box}" == "${RUNNER_NAME}" ]] \
+  || fail "the baseline calibration was captured on box '${cal_box}' but this job runs on '${RUNNER_NAME}'; another box's band does not describe this box"
+
+cal_ref="$(jq -r '.reference_commit // empty' "${BASELINE_CALIBRATION}")"
+[[ "${cal_ref}" == "${WANT_REF_COMMIT}" ]] \
+  || fail "the baseline calibration was captured against reference commit '${cal_ref}' but the fixture pins ${WANT_REF_COMMIT}; re-calibrate this box against the promoted reference"
+
+check_band() { # check_band PROMPT -- the band checks for one calibration prompt
+CALIBRATION_PROMPT="$1"
 CAL_FOR_CHECKS="${BASELINE_CALIBRATION}"
 if [[ "${cal_version}" == "2" ]]; then
   cal_view_tmp="$(mktemp "${TMPDIR:-/tmp}/baseline-cal.XXXXXX")"
@@ -662,25 +696,6 @@ if [[ "${cal_version}" == "2" ]]; then
   rm -f "${cal_view_err}"
   CAL_FOR_CHECKS="${cal_view_tmp}"
 fi
-
-TRACK_ID="$(jq -r '.track_id // empty' "${CONTRACT}")"
-cal_track="$(jq -r '.track_id // empty' "${BASELINE_CALIBRATION}")"
-[[ "${cal_track}" == "${TRACK_ID}" ]] \
-  || fail "the baseline calibration names track '${cal_track}' but this track is '${TRACK_ID}'; a band from another track does not describe this leg"
-
-# THE BOX NAMES ITSELF. A band is a property of ONE machine, so it is attributed
-# to the runner it was captured on. An unnamed runner is refused rather than
-# waved through: a band that cannot be attributed is a band from anywhere.
-cal_box="$(jq -r '.box // empty' "${BASELINE_CALIBRATION}")"
-[[ -n "${cal_box}" ]] || fail "the baseline calibration names no box; a per-box band must say which box"
-[[ -n "${RUNNER_NAME:-}" ]] \
-  || fail "the baseline calibration names box '${cal_box}' but this job has no RUNNER_NAME; a per-box band cannot be attributed to a runner that does not identify itself"
-[[ "${cal_box}" == "${RUNNER_NAME}" ]] \
-  || fail "the baseline calibration was captured on box '${cal_box}' but this job runs on '${RUNNER_NAME}'; another box's band does not describe this box"
-
-cal_ref="$(jq -r '.reference_commit // empty' "${BASELINE_CALIBRATION}")"
-[[ "${cal_ref}" == "${WANT_REF_COMMIT}" ]] \
-  || fail "the baseline calibration was captured against reference commit '${cal_ref}' but the fixture pins ${WANT_REF_COMMIT}; re-calibrate this box against the promoted reference"
 
 LIVE_GOLDEN_NAME_CAL="$(jq -r '.prompt // empty' "${CAL_FOR_CHECKS}")"
 [[ "${LIVE_GOLDEN_NAME_CAL}" == "${CALIBRATION_PROMPT}" ]] \
@@ -718,6 +733,11 @@ for axis in prefill decode; do
     || fail "the ${axis} band [${low}, ${high}] is not a usable band: it must bracket 1 and stay inside (0.5, 2), or it either rejects a healthy box or admits one running at half speed"
 done
 
+[[ -z "${cal_view_tmp}" ]] || rm -f "${cal_view_tmp}"
+cal_view_tmp=""
+}
+for prompt in "${CALIBRATION_PROMPTS[@]}"; do check_band "${prompt}"; done
+
 cal_benchd="$(jq -r '.benchd_source_commit // empty' "${BASELINE_CALIBRATION}")"
 [[ "${cal_benchd}" =~ ^[0-9a-f]{40}$ ]] \
   || fail "the baseline calibration records benchd_source_commit '${cal_benchd}'; a band captured by an unattributable benchd cannot be traced to the code that measured it"
@@ -726,7 +746,7 @@ cal_benchd="$(jq -r '.benchd_source_commit // empty' "${BASELINE_CALIBRATION}")"
 # a band captured before the reference tree existed describes a different engine
 # -- and it may not be dated in the future, which is a clock fault on the box.
 cal_at="$(jq -r '.captured_at // empty' "${BASELINE_CALIBRATION}")"
-cal_epoch="$(jq -r '(.captured_at // "") | try fromdateiso8601 catch empty' "${CAL_FOR_CHECKS}")"
+cal_epoch="$(jq -r '(.captured_at // "") | try fromdateiso8601 catch empty' "${BASELINE_CALIBRATION}")"
 [[ -n "${cal_epoch}" ]] \
   || fail "the baseline calibration's captured_at ('${cal_at}') is not an RFC 3339 UTC timestamp; the band cannot be dated"
 ref_epoch="$(git -C "${BASELINE_WORKSPACE}" show -s --format=%ct HEAD 2>/dev/null || true)"
@@ -738,8 +758,7 @@ now_epoch="$(date -u +%s)"
 (( cal_epoch <= now_epoch + 300 )) \
   || fail "the baseline calibration is dated ${cal_at}, in the future; the box clock is wrong and every age check here is meaningless"
 cal_sha="$(shasum -a 256 "${BASELINE_CALIBRATION}" | awk '{print $1}')"
-ok "box band for ${cal_box}: ${cal_passes} passes on ${LIVE_GOLDEN_NAME_CAL}, captured ${cal_at} against ${WANT_REF_COMMIT:0:12} (sha256 ${cal_sha:0:12})"
-[[ -z "${cal_view_tmp}" ]] || rm -f "${cal_view_tmp}"
+ok "box band for ${cal_box}: ${cal_passes} passes on ${CALIBRATION_PROMPTS[*]}, captured ${cal_at} against ${WANT_REF_COMMIT:0:12} (sha256 ${cal_sha:0:12})"
 
 # --- 9. participant code has a sandbox to run in ----------------------------
 # docs/sandbox-design.md: every participant-built execution point runs as the

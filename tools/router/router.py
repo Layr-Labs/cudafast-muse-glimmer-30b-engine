@@ -20,7 +20,7 @@ sections 1 and 4), then drives GitHub Actions the way Yukon does:
   freeze   stop accepting submissions (the contest deadline); `unfreeze` undoes it.
   rescore  the final re-score (docs/pool-refresh-and-final-rescore.md): each
            team's best submission by mean score, top N, overlaid onto a
-           `rescore/base` whose rotation pool is the held-out `final`
+           `rescore/base` whose live_goldens are the held-out `final`
            generation, queued K times for the `run` daemon; `rescore-report`
            ranks them by mean score once they are done.
 
@@ -473,7 +473,7 @@ class Router:
                                f"tools/pool-refresh.sh --label final --step stage --final-after-freeze {self.frozen_flag}")
 
     def build_rescore_base(self, base_ref: str, final_pins: Path) -> str:
-        """rescore/base = base_ref + one fixture commit pointing the rotation pool at `final`."""
+        """rescore/base = base_ref + one fixture commit pointing live_goldens at `final`."""
         sh(["git", "fetch", "-q", "origin"], cwd=str(self.clone), retry=True)
         with tempfile.TemporaryDirectory(prefix="router-rescore-") as tmp:
             wt = Path(tmp) / "wt"
@@ -481,7 +481,7 @@ class Router:
             try:
                 sh([str(ROOT / "tools/pool-refresh.sh"), "pin-fixture", str(wt / FIXTURE_REL), "final", str(final_pins)])
                 sh(["git", "-c", "user.name=nemotron35-router", "-c", "user.email=router@localhost",
-                    "commit", "-q", "-am", "rescore: rotation pool = the held-out final generation"], cwd=str(wt))
+                    "commit", "-q", "-am", "rescore: live_goldens = the held-out final generation"], cwd=str(wt))
                 commit = sh(["git", "rev-parse", "HEAD"], cwd=str(wt)).strip()
             finally:
                 sh(["git", "worktree", "remove", "--force", str(wt)], cwd=str(self.clone), check=False)
