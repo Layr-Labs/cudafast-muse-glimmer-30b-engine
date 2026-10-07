@@ -66,8 +66,9 @@ because its submodule is not checked out to an UNVERIFIED line instead of a
 FAIL. NO COMMAND TARGET IS INSIDE A SUBMODULE ANY MORE: benchd stopped being a
 source submodule when it became a pinned prebuilt, and every command target now
 lives in this repository (./setup.sh, ./tools/fetch-benchd.sh,
-./tools/nemotron35-measure-and-score.sh), so the downgrade currently applies to
-nothing and all three commands are fully verified in CI. The flag is kept for
+./tools/nemotron35-measure-and-score.sh, ./tools/nemotron35-yukon-run.sh), so
+the downgrade currently applies to nothing and all three commands are fully
+verified in CI. The flag is kept for
 the next submodule, not removed as dead.
 """
 

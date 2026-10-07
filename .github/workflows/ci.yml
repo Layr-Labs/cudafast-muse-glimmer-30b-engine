@@ -208,6 +208,9 @@ jobs:
       - name: Local baseline entry point reaches benchd
         run: tools/test-local-baseline.sh
 
+      - name: yukon run selects the ranked or the local path
+        run: tools/test-yukon-run.sh
+
       - name: Speculative declaration envelope
         run: tools/test-spec-declaration.sh
 
