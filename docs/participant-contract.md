@@ -348,7 +348,7 @@ gates each control leg with the band of the prompt that leg measured.
 | `pairsPerCohort` | 2 |
 | `minPairsPerCohort` | 2 |
 | `decodeSpeedupFloor` | 0.95 |
-| `prefillSpeedupFloor` | 0.8 |
+| `prefillSpeedupFloor` | 0.95 |
 | `decodeSpeedupCeiling` | 5.0 |
 | `kvBackend` | `vllm-paged` |
 
