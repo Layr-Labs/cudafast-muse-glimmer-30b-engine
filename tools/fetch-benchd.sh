@@ -176,9 +176,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRANCH="${BENCHD_BRANCH:-main}"
-# THE PIN. Layr-Labs/mlxfast-bench-dev main @ 84bfefe (bench pull request 394)
+# THE PIN. Layr-Labs/mlxfast-bench-dev main @ 0802611 (bench pull request 397)
 # publishes dist/ (aarch64-apple-darwin), dist/linux-aarch64 and
-# dist/linux-x86_64, built from source_commit 73f35b4. That source includes:
+# dist/linux-x86_64, built from source_commit 1adac75. That source includes:
 #   * ecd66fe: decode is the decode window (decode-run time / N, with no seed
 #     prefill), the calibration file is version 3, and the fixture's
 #     official_pair_combine selects the mean of the per-pair composites;
@@ -188,11 +188,14 @@ BRANCH="${BENCHD_BRANCH:-main}"
 #     and seed keys, and one implementation each of decode, prefill, gain,
 #     composite and combine (no value changes);
 #   * bench pull requests 391 and 393: the sealed output and the failure
-#     messages name no token value.
+#     messages name no token value;
+#   * bench pull request 396: the health band of the serial-control leg comes
+#     from the track fixture (decode up 0.03, prefill up 0.05 here), not from
+#     the band fields of the calibration file. Version 3 files stay valid.
 # This benchd has no timed-divergence reference replay: the timed decode window
 # is an exact match against the per-depth oracle.
-PINNED_COMMIT="84bfefea30ca6ce4af78be739021f123b8623f9d"
-PINNED_SOURCE_COMMIT="73f35b41fd1ff9f71bd9cd51c64787d5a6ee565d"
+PINNED_COMMIT="0802611961a61605e19d05d82a67b20960557b57"
+PINNED_SOURCE_COMMIT="1adac7586a8a14c1137cf44cbed2bfb763782e01"
 COMMIT="${BENCHD_COMMIT:-${PINNED_COMMIT}}"
 SOURCE_COMMIT_PIN="${BENCHD_SOURCE_COMMIT:-${PINNED_SOURCE_COMMIT}}"
 DEST_DIR="${BENCHD_BIN_DIR:-${REPO_ROOT}/benchd-bin}"
