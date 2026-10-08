@@ -4547,7 +4547,24 @@ class GPUModelRunner(
         return (
             common_attn_metadata.max_seq_len + num_drafter_query_tokens
             <= self.effective_drafter_max_model_len
-        )
+        ) and self._drafts_can_be_verified()
+
+    def _drafts_can_be_verified(self) -> bool:
+        """False when every request in the batch has max_tokens == 1.
+
+        Such a request finishes on the token this step samples, so a draft
+        proposed now is never verified. Running the drafter anyway costs its
+        full pass over the prompt plus every draft step, and the sampled token
+        cannot reach the CPU until that work ends. Skipping it is token-exact.
+        """
+        req_ids = self.input_batch.req_ids
+        if not req_ids:
+            return True
+        for req_id in req_ids:
+            params = self.requests[req_id].sampling_params
+            if params is None or params.max_tokens != 1:
+                return True
+        return False
 
     @torch.inference_mode
     def sample_tokens(
