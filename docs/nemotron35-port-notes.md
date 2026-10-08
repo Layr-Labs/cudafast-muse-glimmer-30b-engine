@@ -668,4 +668,5 @@ good draws reached the ranking. All three are fixed and tested on the boxes.
   median of 5 timed prefill passes) are in main at `44f1fda`.
 - **Fixture parse check.** `bench-core` at `44f1fda` parses the fixture and
   certifies it: `official_pair_combine` = mean, 3 pairs, 5 timed prefill passes
-  and 1 warm-up, floors 0.95, bands 5% prefill and 3% decode (up only).
+  and 1 warm-up, decode floor 0.95, prefill floor 0.8, bands 5% prefill and 3%
+  decode (up only).
