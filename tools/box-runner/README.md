@@ -287,6 +287,12 @@ calibration file or re-points a reference tree: remove one deliberately, then
 apply. The last unit runs `tools/ranked-box-preflight.sh` as the runner with
 the runner `.env`, which is the check a ranked job runs first.
 
+A box with two tracks (for example this track and Bonsai 9B on spark-2) has
+one box file in each engine repository. The script is the same file in both.
+Each track's sandbox setup denies its sandbox user every entry in the runner
+home but its own runner install, so after an apply of one track that adds an
+entry there (a runner install, a staging root), apply the other track too.
+
 The container test is `tools/box/test/test-converge.sh`.
 
 ## Restore / uninstall
