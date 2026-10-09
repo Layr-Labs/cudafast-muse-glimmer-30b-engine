@@ -15,6 +15,10 @@
 #      fixed by apply
 #   7. a value given on --secrets-stdin is in no file afterwards
 #   8. apply refuses while a job of the runner account runs
+#   9. a second track of the same account (its own runner dir, a box-built
+#      engine image, provisional golden pins): apply exits 0 and reports the
+#      pending items, its .env names RUNNER_DIR and the extra keys, --check
+#      exits 1 on the pending items, and the first track's --check stays clean
 # The units that need a GPU, the network or GitHub (rust apply, reference,
 # runner-install, sandbox, preflight) are not in this test: the engine tools
 # they run have their own tests, and the box apply proves them.
@@ -55,8 +59,11 @@ esac
 EOF
 cat > "${STUB}/bin/docker" <<'EOF'
 #!/bin/bash
+# image inspect --format {{.Id}} <id> prints the built Id; plain inspect = the pulled image.
 case "$1 $2" in
-  "image inspect") [[ -f /stub/state/image ]] ;;
+  "image inspect")
+    if [[ "$3" == --format ]]; then [[ -f /stub/state/built && "$5" == "$(cat /stub/state/built)" ]] && { cat /stub/state/built; exit 0; }; exit 1; fi
+    [[ -f /stub/state/image ]] ;;
   "pull -q") touch /stub/state/image ;;
   *) exit 1 ;;
 esac
@@ -110,6 +117,7 @@ BOX_SNAPSHOT_DIR="/srv/t/track/snapshot"
 BOX_WEIGHTS_BASE_URL="file://${SRC}"
 BOX_GOLDEN_DIR="${ST}/goldens"
 BOX_BASELINE_WORKSPACE="${ST}/baseline/workspace"
+BOX_REFERENCE_BUILT=".build/x"
 BOX_BASELINE_CALIBRATION="${ST}/baseline/baseline-calibration.json"
 BOX_ACTIONS_RUNNER_DIR="${RH}/actions-runner"
 BOX_RUNNER_REPO_URL="https://github.com/o/r"
@@ -133,6 +141,26 @@ EOF
 }
 cp "${SRC}/fixture.json" "${BOXDIR}/test/fixture.json"
 write_box
+# The second track: provisional goldens, no container digest, a "source" file.
+jq '.golden_pins_provisional = true | del(.serve_configuration.container_digest)
+    | .target.files[1].source = "x/other@r2"' "${SRC}/fixture.json" > "${BOXDIR}/test/fixture2.json"
+sed -e 's#^BOX_TRACK_FIXTURE=.*#BOX_TRACK_FIXTURE="tools/box/test/fixture2.json"#' \
+    -e 's#^BOX_STAGING_ROOT=.*#BOX_STAGING_ROOT="'"${RH}"'/track2"#' \
+    -e 's#^BOX_GOLDEN_DIR=.*#BOX_GOLDEN_DIR="'"${RH}"'/track2/goldens"#' \
+    -e 's#^BOX_BENCHD_BIN_DIR=.*#BOX_BENCHD_BIN_DIR="'"${ST}"'/benchd-bin"#' \
+    -e 's#^BOX_SNAPSHOT_DIR=.*#BOX_SNAPSHOT_DIR="/srv/t/track2/weights"#' \
+    -e 's#^BOX_BASELINE_CALIBRATION=.*#BOX_BASELINE_CALIBRATION="'"${RH}"'/track2/baseline/baseline-calibration.json"#' \
+    -e 's#^BOX_ACTIONS_RUNNER_DIR=.*#BOX_ACTIONS_RUNNER_DIR="'"${RH}"'/actions-runner-two"#' \
+    -e 's#^BOX_RUNNER_REPO_URL=.*#BOX_RUNNER_REPO_URL="https://github.com/o/r2"#' \
+    -e 's#^BOX_SERVE_UP_SOCKET_DIR=.*#BOX_SERVE_UP_SOCKET_DIR="/var/lib/t2/sock"#' \
+    "${BOXDIR}/testbox.env" > "${BOXDIR}/testbox2.env"
+printf '%s\n' 'BOX_IMAGE_ID_FILE="/srv/t/track2/engine-image.id"' 'BOX_ENV_EXTRA="T2_IMAGE_ID_FILE=/srv/t/track2/engine-image.id T2_GGUF=/srv/t/track2/weights/a.bin"' >> "${BOXDIR}/testbox2.env"
+mkdir -p "${OPREPO}/tools/engine"
+cat > "${OPREPO}/tools/engine/build-image.sh" <<'EOF'
+#!/bin/bash
+id="sha256:$(printf '%064d' 7)"; printf '%s\n' "${id}" > /stub/state/built; printf '%s\n' "${id}" > "$1"
+EOF
+chmod +x "${OPREPO}/tools/engine/build-image.sh"
 git -C "${OPREPO}" init -q -b main
 git -C "${OPREPO}" -c user.name=t -c user.email=t@t add -A
 git -C "${OPREPO}" -c user.name=t -c user.email=t@t commit -q -m test
@@ -233,6 +261,27 @@ set +e; out="$("${CONV}" testbox "${UNITS[@]}" 2>&1)"; rc=$?; set -e
 kill "${busy}" 2>/dev/null || true; wait "${busy}" 2>/dev/null || true
 [[ "${rc}" -ne 0 && "${out}" == *"apply at a quiet moment"* ]] && ! grep -q CONVERGED <<<"${out}" \
   && pass "apply refuses while a job of ${RU} runs" || fail "busy refusal rc ${rc}: ${out}"
+
+# 9. a second track of the same account
+CONV2=(testbox2 "${UNITS[@]}")
+install -d -o "${RU}" -g "${RU}" "${RH}/track2" "${RH}/actions-runner-two"
+cp "${RH}/actions-runner/config.sh" "${RH}/actions-runner/run.sh" "${RH}/actions-runner-two/"
+printf '{"agentName":"tbox","gitHubUrl":"https://github.com/o/r2"}\n' > "${RH}/actions-runner-two/.runner"
+printf '[Service]\nUser=%s\n' "${RU}" > "${CONVERGE_SYSTEMD_DIR}/actions.runner.o-r2.tbox.service"
+chown -R "${RU}:${RU}" "${RH}/actions-runner-two"
+set +e; out="$("${CONV}" "${CONV2[@]}" 2>&1)"; rc=$?; set -e
+[[ "${rc}" -eq 0 ]] && pass "second track: apply exits 0" || fail "second track apply rc ${rc}: ${out}"
+grep -q 'engine image: tools/engine/build-image.sh' <<<"${out}" && [[ "$(cat /srv/t/track2/engine-image.id)" == "sha256:$(printf '%064d' 7)" ]] \
+  && pass "second track: the box-built image Id is written" || fail "second track image: ${out}"
+grep -q 'NOTE .*pending: the fixture.s golden pins are provisional' <<<"${out}" && grep -q 'NOTE .*pending: calibration: waits' <<<"${out}" \
+  && pass "second track: apply reports the goldens and the calibration as pending" || fail "second track pending: ${out}"
+grep -qx "RUNNER_DIR=${RH}/actions-runner-two" "${RH}/actions-runner-two/.env" && grep -qx 'T2_GGUF=/srv/t/track2/weights/a.bin' "${RH}/actions-runner-two/.env" \
+  && pass "second track: .env names RUNNER_DIR and the BOX_ENV_EXTRA keys" || fail "second track .env"
+set +e; out="$("${CONV}" testbox2 --check "${UNITS[@]}" 2>&1)"; rc=$?; set -e
+[[ "${rc}" -eq 1 ]] && grep -q 'WOULD-CHANGE .*pending' <<<"${out}" && [[ "$(grep -c 'WOULD-CHANGE' <<<"${out}")" -eq 2 ]] \
+  && pass "second track: --check exits 1 on the two pending items only" || fail "second track check rc ${rc}: ${out}"
+set +e; out="$("${CONV}" testbox --check "${UNITS[@]}" 2>&1)"; rc=$?; set -e
+[[ "${rc}" -eq 0 ]] && pass "first track --check stays clean beside the second track" || fail "first track after second rc ${rc}: ${out}"
 
 echo "test-converge.sh: ${PASS} passed, ${FAILN} failed"
 [[ "${FAILN}" -eq 0 ]]

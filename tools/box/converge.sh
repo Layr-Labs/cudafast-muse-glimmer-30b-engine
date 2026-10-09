@@ -141,7 +141,7 @@ need BOX_HOST BOX_TRACK_ID BOX_TRACK_FIXTURE BOX_GOLDEN_ENV BOX_RUNNER_USER BOX_
   BOX_BASELINE_WORKSPACE BOX_BASELINE_CALIBRATION BOX_ACTIONS_RUNNER_DIR BOX_RUNNER_REPO_URL \
   BOX_RUNNER_NAME BOX_RUNNER_LABELS BOX_GPU_LOCK BOX_LOCK_GROUP BOX_SANDBOX_USER BOX_SHARE_GROUP \
   BOX_SANDBOX_ROOT BOX_SANDBOX_ETC BOX_SUDOERS_NAME BOX_EGRESS_UNIT BOX_ACL_UNIT BOX_RUST_DIR \
-  BOX_SERVE_UP_LOG_DIR BOX_SERVE_UP_SOCKET_DIR BOX_SERVE_UP_CONTAINER_PREFIX
+  BOX_SERVE_UP_LOG_DIR BOX_SERVE_UP_SOCKET_DIR BOX_SERVE_UP_CONTAINER_PREFIX BOX_REFERENCE_BUILT
 
 RU="${BOX_RUNNER_USER}"
 RH="${BOX_RUNNER_HOME}"
@@ -218,6 +218,11 @@ SERVE_UP_LOG_DIR=${BOX_SERVE_UP_LOG_DIR}
 SERVE_UP_SOCKET_DIR=${BOX_SERVE_UP_SOCKET_DIR}
 SERVE_UP_CONTAINER_PREFIX=${BOX_SERVE_UP_CONTAINER_PREFIX}
 EOF
+  # A second runner of the account names its own install (setup-sandbox-user.sh).
+  [[ "${BOX_ACTIONS_RUNNER_DIR}" == "${RH}/actions-runner" ]] || printf 'RUNNER_DIR=%s\n' "${BOX_ACTIONS_RUNNER_DIR}"
+  # BOX_ENV_EXTRA: KEY=VALUE pairs, space separated, that the engine's own tools read.
+  local kv
+  for kv in ${BOX_ENV_EXTRA:-}; do printf '%s\n' "${kv}"; done
 }
 WORK="$(mktemp -d /tmp/box-converge.XXXXXX)"
 trap 'rm -rf "${WORK}"' EXIT
@@ -431,13 +436,15 @@ unit_benchd() {
 
 unit_weights() {
   local pins n=0 missing=() wrong=() rel bytes sha f
-  pins="$(jq -r '.target.files[] | [.path, (.bytes|tostring), .sha256] | @tsv' "${FIXTURE}")"
+  # A file with a "source" ("<repo>@<revision>") comes from that repository;
+  # every other file from the target's upstream_model_id @ upstream_revision.
+  pins="$(jq -r '.target.files[] | [.path, (.bytes|tostring), .sha256, (.source // "")] | @tsv' "${FIXTURE}")"
   [[ -n "${pins}" ]] || { bad "the fixture pins no target files"; return 1; }
   install_parent_dirs "$(dirname "${BOX_SNAPSHOT_DIR}")"
   want_dir "$(dirname "${BOX_SNAPSHOT_DIR}")" 755 root:root
   want_dir "${BOX_SNAPSHOT_DIR}" 755 root:root
   # Bytes first; then every sha256, 8 at a time.
-  while IFS=$'\t' read -r rel bytes sha; do
+  while IFS=$'\t' read -r rel bytes sha _; do
     n=$((n + 1)); f="${BOX_SNAPSHOT_DIR}/${rel}"
     if [[ ! -f "${f}" || "$(bytes_of "${f}")" != "${bytes}" ]]; then missing+=("${rel}"); continue; fi
     printf '%s\t%s\n' "${f}" "${sha}"
@@ -449,15 +456,18 @@ unit_weights() {
   if [[ ${#missing[@]} -eq 0 && ${#wrong[@]} -eq 0 ]]; then
     ok "target snapshot: ${n} pinned files, bytes + sha256"
   else
-    local base; base="${BOX_WEIGHTS_BASE_URL:-https://huggingface.co/$(jq -r '.target.upstream_model_id' "${FIXTURE}")/resolve/$(jq -r '.target.upstream_revision' "${FIXTURE}")}"
+    local base src url; base="https://huggingface.co/$(jq -r '.target.upstream_model_id' "${FIXTURE}")/resolve/$(jq -r '.target.upstream_revision' "${FIXTURE}")"
     if [[ "${CHECK}" -eq 1 ]]; then would "target snapshot: fetch ${#missing[@]} missing, ${#wrong[@]} wrong of ${n} from the fixture's upstream"
     else
       local r ok_all=1
       for r in "${wrong[@]}"; do rm -f "${BOX_SNAPSHOT_DIR}/${r}"; done
-      while IFS=$'\t' read -r rel bytes sha; do
+      while IFS=$'\t' read -r rel bytes sha src; do
         f="${BOX_SNAPSHOT_DIR}/${rel}"
         [[ -f "${f}" && "$(bytes_of "${f}")" == "${bytes}" ]] && continue
-        curl -fL --retry 5 --retry-delay 5 -C - -s -o "${f}.partial" "${base}/${rel}" \
+        url="${base}/${rel}"
+        [[ -n "${src}" ]] && url="https://huggingface.co/${src%@*}/resolve/${src##*@}/${rel}"
+        [[ -n "${BOX_WEIGHTS_BASE_URL:-}" ]] && url="${BOX_WEIGHTS_BASE_URL}/${rel}"
+        curl -fL --retry 5 --retry-delay 5 -C - -s -o "${f}.partial" "${url}" \
           && [[ "$(bytes_of "${f}.partial")" == "${bytes}" && "$(sha256_of "${f}.partial")" == "${sha}" ]] \
           && chmod 0644 "${f}.partial" && mv -f "${f}.partial" "${f}" \
           || { rm -f "${f}.partial"; ok_all=0; bad "target file ${rel}: download or pin check failed"; }
@@ -474,14 +484,42 @@ unit_weights() {
 unit_image() {
   local img dig ref
   img="$(jq -r '.serve_configuration.container_image' "${FIXTURE}")"
-  dig="$(jq -r '.serve_configuration.container_digest' "${FIXTURE}")"
-  ref="${img%%:*}@${dig}"
-  if docker image inspect "${ref}" >/dev/null 2>&1; then ok "engine image ${img} ${dig:0:19}"
-  else change "engine image: docker pull ${ref}" bash -c 'docker pull -q "$1" >/dev/null' _ "${ref}"; fi
+  dig="$(jq -r '.serve_configuration.container_digest // empty' "${FIXTURE}")"
+  if [[ -n "${dig}" ]]; then
+    # A pinned public image: pulled by digest.
+    ref="${img%%:*}@${dig}"
+    if docker image inspect "${ref}" >/dev/null 2>&1; then ok "engine image ${img} ${dig:0:19}"
+    else change "engine image: docker pull ${ref}" bash -c 'docker pull -q "$1" >/dev/null' _ "${ref}"; fi
+    return 0
+  fi
+  # A box-built image: tools/engine/build-image.sh builds it and writes its Id
+  # to BOX_IMAGE_ID_FILE, which the ranked job reads.
+  [[ -n "${BOX_IMAGE_ID_FILE:-}" ]] || { bad "the fixture pins no container_digest and the box file sets no BOX_IMAGE_ID_FILE"; return 1; }
+  local id got
+  id="$(tr -d '[:space:]' < "${BOX_IMAGE_ID_FILE}" 2>/dev/null)"
+  got="$(docker image inspect --format '{{.Id}}' "${id:-none}" 2>/dev/null)"
+  if [[ "${id}" =~ ^sha256:[0-9a-f]{64}$ && "${got}" == "${id}" ]]; then
+    ok "engine image ${img} built on this box, Id ${id:7:12} = ${BOX_IMAGE_ID_FILE}"
+  else
+    install_parent_dirs "${BOX_IMAGE_ID_FILE}"
+    change "engine image: tools/engine/build-image.sh ${BOX_IMAGE_ID_FILE}" \
+      bash -c 'cd "$1" && tools/engine/build-image.sh "$2" >/dev/null && chmod 0644 "$2"' _ "${REPO_DIR}" "${BOX_IMAGE_ID_FILE}"
+  fi
 }
 
+# pending <what>: an item that waits for other work (the track's goldens):
+# --check reports it as a difference; apply reports it and goes on.
+pending() {
+  if [[ "${CHECK}" -eq 1 ]]; then would "pending: $*"; else note "pending: $*"; fi
+}
+GOLDENS_READY=1
 unit_goldens() {
   user_exists "${RU}" || { would "no account ${RU} yet"; return 1; }
+  if [[ "$(jq -r '.golden_pins_provisional // false' "${FIXTURE}")" == "true" ]]; then
+    GOLDENS_READY=0
+    pending "the fixture's golden pins are provisional; record the goldens (tools/record-goldens.sh), pin them, then apply"
+    return 0
+  fi
   local pins n=0 bad_n=0 key sha bytes f
   pins="$(jq -r '
     [ (.timed_prompt_pool // [])[],
@@ -493,6 +531,7 @@ unit_goldens() {
     n=$((n + 1)); f="${BOX_GOLDEN_DIR}/${key##*/}"
     [[ -f "${f}" && "$(bytes_of "${f}")" == "${bytes}" && "$(sha256_of "${f}")" == "${sha}" ]] || bad_n=$((bad_n + 1))
   done <<< "${pins}"
+  [[ "${bad_n}" -eq 0 ]] || GOLDENS_READY=0
   if [[ "${bad_n}" -eq 0 ]]; then ok "goldens: ${n} pinned files, bytes + sha256"
   elif [[ "${CHECK}" -eq 1 ]]; then would "goldens: stage ${bad_n} of ${n} (tools/fetch-goldens.sh --all)"
   elif [[ -z "${R2_ENDPOINT_IN}" || -z "${R2_ID_IN}" || -z "${R2_SECRET_IN}" ]]; then
@@ -502,6 +541,7 @@ unit_goldens() {
     if printf '%s\n%s\n%s\n' "${R2_ENDPOINT_IN}" "${R2_ID_IN}" "${R2_SECRET_IN}" | as_runner bash -c \
         'IFS= read -r R2_BUCKET_ENDPOINT; IFS= read -r R2_ACCESS_KEY_ID; IFS= read -r R2_SECRET_ACCESS_KEY; export R2_BUCKET_ENDPOINT R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY; cd "$1" && tools/fetch-goldens.sh --all --out "$2" >/dev/null 2>&1' _ "${REPO_DIR}" "${BOX_GOLDEN_DIR}"; then
       conv "goldens: tools/fetch-goldens.sh --all staged ${bad_n} of ${n}"
+      GOLDENS_READY=1
     else bad "goldens: tools/fetch-goldens.sh --all failed"; fi
   fi
   [[ -d "${BOX_GOLDEN_DIR}" ]] || return 0
@@ -523,7 +563,7 @@ unit_reference() {
     runner_git "${ws}" diff --quiet HEAD 2>/dev/null && ok "reference tree at ${want:0:12}, clean" \
       || bad "the reference tree has changes: remove ${ws} deliberately and apply"
     local rel built=1
-    for rel in .build/release/mlxfast-runtime-worker .build/vllm-overlay/vllm/__init__.py; do [[ -f "${ws}/${rel}" ]] || built=0; done
+    for rel in ${BOX_REFERENCE_BUILT}; do [[ -f "${ws}/${rel}" ]] || built=0; done
     [[ "${built}" -eq 1 ]] && ok "reference tree is built" || bad "the reference tree is not built: remove ${ws} deliberately and apply"
     return 0
   fi
@@ -604,6 +644,7 @@ unit_calibration() {
     ok "calibration ${c##*/}: box $(jq -r '.box // "?"' "${c}"), captured $(jq -r '.captured_at // "?"' "${c}"), sha256 $(sha256_of "${c}" | cut -c1-12) (the preflight unit checks the band)"
     return 0
   fi
+  if [[ "${GOLDENS_READY}" -ne 1 ]]; then pending "calibration: waits for the goldens"; return 0; fi
   if [[ "${CHECK}" -eq 1 ]]; then would "calibration: run tools/calibrate-box.sh ${BOX_RUNNER_NAME} (about 35 min, takes the GPU lock)"; return 1; fi
   if with_runner_env bash -c 'cd "$1" && tools/calibrate-box.sh "$2" "$3" --lock-wait 7200' _ "${REPO_DIR}" "${BOX_RUNNER_NAME}" "${c}"; then
     conv "calibration: tools/calibrate-box.sh wrote ${c} (sha256 $(sha256_of "${c}" | cut -c1-12))"
@@ -614,6 +655,7 @@ sandbox_names() {
   printf '%s\n' RUNNER_USER="${RU}" SANDBOX_USER="${BOX_SANDBOX_USER}" SHARE_GROUP="${BOX_SHARE_GROUP}" \
     SANDBOX_ROOT="${BOX_SANDBOX_ROOT}" SANDBOX_ETC="${BOX_SANDBOX_ETC}" SUDOERS_NAME="${BOX_SUDOERS_NAME}" \
     EGRESS_UNIT="${BOX_EGRESS_UNIT}" ACL_UNIT="${BOX_ACL_UNIT}" RUST_DIR="${BOX_RUST_DIR}"
+  [[ "${BOX_ACTIONS_RUNNER_DIR}" == "${RH}/actions-runner" ]] || printf '%s\n' RUNNER_DIR="${BOX_ACTIONS_RUNNER_DIR}"
 }
 unit_sandbox() {
   user_exists "${RU}" || { would "no account ${RU} yet"; return 1; }
@@ -649,6 +691,7 @@ unit_service() {
 
 unit_preflight() {
   user_exists "${RU}" || { would "no account ${RU} yet"; return 1; }
+  if [[ "${GOLDENS_READY}" -ne 1 ]]; then pending "tools/ranked-box-preflight.sh: waits for the goldens"; return 0; fi
   local out rc
   out="$(with_runner_env env RUNNER_NAME="${BOX_RUNNER_NAME}" MLXFAST_BOX_NAME="${BOX_RUNNER_NAME}" \
     bash -c 'cd "$1" && tools/ranked-box-preflight.sh' _ "${REPO_DIR}" 2>&1)"; rc=$?
