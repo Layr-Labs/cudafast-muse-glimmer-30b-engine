@@ -454,7 +454,8 @@ cannot change.
 | Object | Where it lives | Can you have it? |
 |---|---|---|
 | `correctness_prompts/public_longcopy_gate_english_4096.txt` | git | Yes: the public prompt text |
-| `correctness_prompts/public-longcopy-gate-english-496.golden.json` | git | Yes: for local runs |
+| `correctness_prompts/public-longcopy-gate-english-496.golden.json` | git | Yes: for local serial runs |
+| `correctness_prompts/public-longcopy-gate-english-496.mtp<N>.golden.json`, one per depth 1 to 6 | git | Yes: for local runs at depth N |
 | `timed_prompt_pool[]`, 8 tapes | organizer storage, staged on the box | No |
 | `speculative_oracles{}`, 6 per-depth oracles per pool prompt | organizer storage, staged on the box | No |
 | `hidden_correctness_golden` | the default live golden's serial tape, pinned by digest | No |
