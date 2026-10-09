@@ -237,93 +237,57 @@ tools/box-runner/setup-sandbox-user.sh --check
 `tools/ranked-box-preflight.sh` runs this check and refuses a ranked job when it
 fails.
 
-## A second runner on one box
+## A second runner on one box: tools/box/converge.sh
 
-A second runner on the same box sets its own value for each sandbox name. The
-table with every variable is in `docs/sandbox-design.md` section 6b. The values
-for the Layr-Labs runner beside the first runner on a Spark are:
+A second runner on the same box sets its own value for each sandbox name (the
+table is in `docs/sandbox-design.md` section 6b). The Layr-Labs runner beside
+the first runner on a Spark is DECLARED in a box file, `tools/box/<box>.env`
+(values only), and `tools/box/converge.sh` makes the box match it. Every step
+that was done by hand before (the account, the GPU lock, the socket directory
+0700, the runner's own rustup and `PATH`, the runner `.env`, the target
+snapshot, the engine image, the goldens, the reference tree, the calibration,
+the sandbox user, the registration and the systemd service) is a unit of that
+script. It runs the tools of this repository; it adds no other mechanism.
 
 ```sh
-RUNNER_USER=layrbench
-SANDBOX_USER=layrsub
-SHARE_GROUP=layrshare
-SANDBOX_ROOT=/var/lib/layrbench/sandbox
-SANDBOX_ETC=/etc/layrbench-sandbox
-SUDOERS_NAME=layrbench-sandbox
-EGRESS_UNIT=layrbench-sandbox-egress.service
-ACL_UNIT=layrbench-sandbox-acl.service
-RUST_DIR=/opt/layrbench-rust
-SERVE_UP_LOG_DIR=/var/lib/layrbench/serve-log
-SERVE_UP_SOCKET_DIR=/var/lib/layrbench/sock
-SERVE_UP_CONTAINER_PREFIX=layr-serve-up-
-PATH=/home/layrbench/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Prove that the box matches its box file. Changes nothing; exit 0 = match.
+sudo /home/layrbench/nemotron35/engine/tools/box/converge.sh spark-2 --check
+
+# Make the box match. Apply refuses while a job of the runner runs.
+sudo /home/layrbench/nemotron35/engine/tools/box/converge.sh spark-2
 ```
 
-1. Put these lines in `~layrbench/actions-runner/.env`, together with the
-   staged-asset paths the workflow needs (`MLXFAST_TARGET_SNAPSHOT_DIR`,
-   `BENCHD_BIN_DIR`, `MLXFAST_BASELINE_WORKSPACE`,
-   `MLXFAST_BASELINE_CALIBRATION`, `MLXFAST_NEMOTRON35_GOLDEN_DIR`).
-   Make the file mode 0600.
-   - `SERVE_UP_SOCKET_DIR` is the resident socket directory of a leg that
-     runs outside the per-job sandbox: the calibration and the local checks.
-     Without it the socket goes to `/tmp`, which the engine container hides,
-     and the leg does not boot. Make the directory one time, as root:
-     `install -d -o layrbench -g layrbench -m 0700 /var/lib/layrbench/sock`.
-   - `PATH` must hold `cargo`, because the workflow checks for it. Install the
-     runner account's own toolchain with rustup, as that account, at the
-     version that `rustup show active-toolchain` gives for the first runner.
-     The setup in step 2 copies that version to `RUST_DIR`.
-2. As root, run the setup with the same values. Use `sudo env`, so that sudo
-   does not remove the variables:
+The engine checkout that the script runs from is the engine commit of the box.
+To move the box to a newer main: apply with `--secrets-stdin` and a
+`GITHUB_TOKEN` (the engine unit fetches the mirror and reports the new main),
+advance the checkout with the command that unit prints (a local git command,
+no credential), then apply again from the advanced checkout.
 
-   ```sh
-   sudo env RUNNER_USER=layrbench SANDBOX_USER=layrsub SHARE_GROUP=layrshare \
-     SANDBOX_ROOT=/var/lib/layrbench/sandbox SANDBOX_ETC=/etc/layrbench-sandbox \
-     SUDOERS_NAME=layrbench-sandbox EGRESS_UNIT=layrbench-sandbox-egress.service \
-     ACL_UNIT=layrbench-sandbox-acl.service RUST_DIR=/opt/layrbench-rust \
-     tools/box-runner/setup-sandbox-user.sh
-   ```
+A unit that needs a credential (a fresh box: the mirror, benchd, the
+registration; the goldens) reads it only with `--secrets-stdin`, as `KEY=VALUE`
+lines: `GITHUB_TOKEN` (reads the repositories and makes the one-hour
+registration token), `R2_BUCKET_ENDPOINT`, `R2_ACCESS_KEY_ID`,
+`R2_SECRET_ACCESS_KEY`. Each value goes to the one command that needs it, in
+that command's environment. No credential is written on the box; the runner
+keeps only its own registration.
 
-   The setup reads `SERVE_UP_LOG_DIR` from `~layrbench/actions-runner/.env`.
-   It changes no user, file, rule or unit of the first runner.
-3. Calibrate as the runner account with the same environment, so the
-   control leg uses the same socket directory and container prefix as a
-   ranked job:
+On a FRESH box, run the script one time from any checkout of this repository
+(for example a clone in the operator's home). It makes the account, the
+mirror and the box engine checkout, then stops; run every later apply from the
+box engine checkout:
 
-   ```sh
-   sudo -u layrbench -H bash -c 'set -a; . ~/actions-runner/.env; set +a; \
-     cd <engine checkout> && tools/calibrate-box.sh <runner name> "$MLXFAST_BASELINE_CALIBRATION"'
-   ```
+```sh
+printf 'GITHUB_TOKEN=%s\n' "$(gh auth token)" \
+  | ssh <box> 'sudo <checkout>/tools/box/converge.sh <box> --secrets-stdin'
+```
 
-### The plain persistent runner
+Apply calibrates (`tools/calibrate-box.sh`, about 35 minutes, it takes the GPU
+lock) only when the calibration file is absent. It never replaces a
+calibration file or re-points a reference tree: remove one deliberately, then
+apply. The last unit runs `tools/ranked-box-preflight.sh` as the runner with
+the runner `.env`, which is the check a ranked job runs first.
 
-The second runner is the standard self-hosted runner. It does not use
-`supervisor.sh`, `gh-app-mint.sh` or a GitHub App key. No GitHub credential
-stays on the box.
-
-1. As the runner account, unpack the actions-runner release in
-   `~layrbench/actions-runner`.
-2. On the operator machine, make a registration token (valid for one hour) and
-   send it on stdin to `config.sh`. The runner reads the token from
-   `ACTIONS_RUNNER_INPUT_TOKEN`, so the token is not on a command line. The
-   runner adds the labels `self-hosted`, `Linux` and `ARM64` itself.
-
-   ```sh
-   gh api -X POST repos/<owner>/<repo>/actions/runners/registration-token -q .token \
-     | ssh <box> 'sudo -u layrbench bash -c "cd ~layrbench/actions-runner \
-         && IFS= read -r ACTIONS_RUNNER_INPUT_TOKEN && export ACTIONS_RUNNER_INPUT_TOKEN \
-         && ./config.sh --unattended --url https://github.com/<owner>/<repo> \
-              --name <box>-layrbench --labels nemotron3.5-lightning-30b-a3b-cuda-v1"'
-   ```
-
-3. As root, install and start the runner's own service with its `svc.sh`:
-
-   ```sh
-   cd ~layrbench/actions-runner && sudo ./svc.sh install layrbench && sudo ./svc.sh start
-   ```
-
-   The service is `actions.runner.<owner>-<repo>.<box>-layrbench.service`. The
-   runner reads `actions-runner/.env` when it starts.
+The container test is `tools/box/test/test-converge.sh`.
 
 ## Restore / uninstall
 
