@@ -25,6 +25,10 @@ cp "${REPO_ROOT}/benchmark.json" "${REPO_ROOT}/mtp-head.manifest.json" "${TEST_R
 cp "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" "${TEST_ROOT}/fixtures/"
 # The public golden is recorded on a Spark; the stub benchd never reads it.
 echo '{}' > "${TEST_ROOT}/correctness_prompts/public-longcopy-gate-english-496.golden.json"
+for d in 1 2 3 4 5 6; do echo '{}' > "${TEST_ROOT}/correctness_prompts/public-longcopy-gate-english-496.mtp${d}.golden.json"; done
+# The cases below run serial unless they say otherwise.
+SERIAL_DECL='{"version":1,"source":"pinned","spec":{"enabled":false,"num_speculative_tokens":0}}'
+printf '%s\n' "${SERIAL_DECL}" > "${TEST_ROOT}/mtp-head.manifest.json"
 
 cat > "${WORK}/benchd" <<'STUB'
 #!/usr/bin/env bash
@@ -81,6 +85,14 @@ grep -Fxq -- '--cool-gate' "${WORK}/defaults.argv"
 grep -q 'public local baseline (unranked)' "${WORK}/defaults.stderr"
 grep -q 'score=null is expected' "${WORK}/defaults.stderr"
 [[ "$(cat "${WORK}/defaults.stdout")" == '{"score":null,"passed":true,"metrics":{"decode_seconds_per_token":0.05}}' ]]
+
+# A declared depth picks the public golden of that depth.
+printf '%s\n' '{"version":1,"source":"pinned","spec":{"enabled":true,"num_speculative_tokens":3}}' > "${TEST_ROOT}/mtp-head.manifest.json"
+run_case depth3 "${TEST_ROOT}/tools/local-baseline.sh"
+[[ "${rc}" == 0 ]]
+assert_arg depth3 --golden correctness_prompts/public-longcopy-gate-english-496.mtp3.golden.json
+assert_arg depth3 --mtp-depth 3
+printf '%s\n' "${SERIAL_DECL}" > "${TEST_ROOT}/mtp-head.manifest.json"
 
 synthetic_window_weights "${TEST_ROOT}/box snapshot"
 run_case snapshot_env MLXFAST_TARGET_SNAPSHOT_DIR='box snapshot' "${TEST_ROOT}/tools/local-baseline.sh"

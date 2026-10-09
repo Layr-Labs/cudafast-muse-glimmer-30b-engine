@@ -102,10 +102,12 @@ verifies it.
 ```
 
 This command boots a resident for your declared depth. It then runs benchd's
-local-iterate leg over the public golden,
-`correctness_prompts/public-longcopy-gate-english-496.golden.json`, which the
-organizer recorded on a Spark. A local run seals `score: null`: only the paired
-ranked path produces a score.
+local-iterate leg over the public golden of that depth, which the organizer
+recorded on a Spark: `correctness_prompts/public-longcopy-gate-english-496.golden.json`
+for serial, `correctness_prompts/public-longcopy-gate-english-496.mtp<N>.golden.json`
+for depth N. On this engine a depth-N run takes another token path than the
+serial run, so each depth has its own golden. A local run seals `score: null`:
+only the paired ranked path produces a score.
 
 ```bash
 yukon setup
