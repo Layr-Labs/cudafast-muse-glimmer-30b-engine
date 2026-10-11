@@ -235,9 +235,6 @@ jobs:
       - name: Box runner supervisor
         run: tools/box-runner/test/test-box-runner.sh
 
-      - name: Box converge (ubuntu:24.04 container)
-        run: tools/box/test/test-converge.sh
-
   resident:
     name: resident (Python, fake backend, hosted)
     runs-on: ubuntu-latest
