@@ -237,63 +237,25 @@ tools/box-runner/setup-sandbox-user.sh --check
 `tools/ranked-box-preflight.sh` runs this check and refuses a ranked job when it
 fails.
 
-## A second runner on one box: tools/box/converge.sh
+## The box setup: cuda-setup-scripts
+
+The box configuration of a Spark that runs this track is in the internal
+repository [`Layr-Labs/cuda-setup-scripts`](https://github.com/Layr-Labs/cuda-setup-scripts).
+Its box files declare the runner account, the GPU lock, the runner, the
+sandbox names and the pins of this track. Its `converge/converge.sh` makes the
+box match the box files. With `--check` it changes nothing and reports each
+difference. The script runs the tools of this repository from the box engine
+checkout: `tools/fetch-benchd.sh`, `tools/fetch-goldens.sh`,
+`tools/stage-baseline-workspace.sh`, `tools/calibrate-box.sh`,
+`tools/ranked-box-preflight.sh` and `tools/box-runner/`. The procedure from a
+fresh Spark to a ranked runner is in its `docs/runbook.md`.
+
+```sh
+sudo /opt/cuda-setup-scripts/converge/converge.sh spark-2 nemotron3.5-lightning-30b-a3b-cuda-v1 --check
+```
 
 A second runner on the same box sets its own value for each sandbox name (the
-table is in `docs/sandbox-design.md` section 6b). The Layr-Labs runner beside
-the first runner on a Spark is DECLARED in a box file, `tools/box/<box>.env`
-(values only), and `tools/box/converge.sh` makes the box match it. Every step
-that was done by hand before (the account, the GPU lock, the socket directory
-0700, the runner's own rustup and `PATH`, the runner `.env`, the target
-snapshot, the engine image, the goldens, the reference tree, the calibration,
-the sandbox user, the registration and the systemd service) is a unit of that
-script. It runs the tools of this repository; it adds no other mechanism.
-
-```sh
-# Prove that the box matches its box file. Changes nothing; exit 0 = match.
-sudo /home/layrbench/nemotron35/engine/tools/box/converge.sh spark-2 --check
-
-# Make the box match. Apply refuses while a job of the runner runs.
-sudo /home/layrbench/nemotron35/engine/tools/box/converge.sh spark-2
-```
-
-The engine checkout that the script runs from is the engine commit of the box.
-To move the box to a newer main: apply with `--secrets-stdin` and a
-`GITHUB_TOKEN` (the engine unit fetches the mirror and reports the new main),
-advance the checkout with the command that unit prints (a local git command,
-no credential), then apply again from the advanced checkout.
-
-A unit that needs a credential (a fresh box: the mirror, benchd, the
-registration; the goldens) reads it only with `--secrets-stdin`, as `KEY=VALUE`
-lines: `GITHUB_TOKEN` (reads the repositories and makes the one-hour
-registration token), `R2_BUCKET_ENDPOINT`, `R2_ACCESS_KEY_ID`,
-`R2_SECRET_ACCESS_KEY`. Each value goes to the one command that needs it, in
-that command's environment. No credential is written on the box; the runner
-keeps only its own registration.
-
-On a FRESH box, run the script one time from any checkout of this repository
-(for example a clone in the operator's home). It makes the account, the
-mirror and the box engine checkout, then stops; run every later apply from the
-box engine checkout:
-
-```sh
-printf 'GITHUB_TOKEN=%s\n' "$(gh auth token)" \
-  | ssh <box> 'sudo <checkout>/tools/box/converge.sh <box> --secrets-stdin'
-```
-
-Apply calibrates (`tools/calibrate-box.sh`, about 35 minutes, it takes the GPU
-lock) only when the calibration file is absent. It never replaces a
-calibration file or re-points a reference tree: remove one deliberately, then
-apply. The last unit runs `tools/ranked-box-preflight.sh` as the runner with
-the runner `.env`, which is the check a ranked job runs first.
-
-A box with two tracks (for example this track and Bonsai 9B on spark-2) has
-one box file in each engine repository. The script is the same file in both.
-Each track's sandbox setup denies its sandbox user every entry in the runner
-home but its own runner install, so after an apply of one track that adds an
-entry there (a runner install, a staging root), apply the other track too.
-
-The container test is `tools/box/test/test-converge.sh`.
+table is in `docs/sandbox-design.md` section 6b).
 
 ## Restore / uninstall
 
