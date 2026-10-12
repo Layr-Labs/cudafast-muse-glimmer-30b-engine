@@ -311,7 +311,9 @@ while IFS='	' read -r r2_path want_sha want_bytes; do
   [[ -n "${r2_path}" ]] || continue
   name="${r2_path##*/}"
   verify_pin "${GOLDEN_DIR}/${name}" "${want_sha}" "${want_bytes}" "per-depth oracle ${name}"
-  if ! printf '%s' "${expected_list}" | grep -Fxq "${name}"; then
+  # A here-string, not printf | grep -q: under pipefail, grep -q exits on the
+  # first match, printf can then die of SIGPIPE, and the test reads as "absent".
+  if ! grep -Fxq -- "${name}" <<<"${expected_list}"; then
     expected_list="${expected_list}${name}
 "
   fi
@@ -339,7 +341,7 @@ for staged in "${GOLDEN_DIR}"/*.json; do
   [[ -e "${staged}" ]] || continue
   staged_name="${staged##*/}"
   [[ "${staged_name}" =~ ^g[0-9]+-[0-9]+(\.mtp[0-9]+)?\.golden\.json$ ]] && continue
-  if ! printf '%s' "${expected_list}" | grep -Fxq "${staged_name}"; then
+  if ! grep -Fxq -- "${staged_name}" <<<"${expected_list}"; then
     unexpected="${unexpected} ${staged_name}"
   fi
 done
