@@ -36,7 +36,7 @@ VERBOSE=0
 # This floor is the only thing that notices a section silently stopping (an
 # early `exit`, a deleted block) under `set -uo pipefail` without `-e`, where a
 # truncated suite otherwise reports "0 failed" and looks green.
-EXPECTED_MIN_ASSERTIONS=122
+EXPECTED_MIN_ASSERTIONS=126
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/box-runner-test.XXXXXX")"
 # shellcheck disable=SC2329  # invoked indirectly via `trap cleanup EXIT` below
@@ -544,8 +544,9 @@ sed -e "s#/etc/#${FS}/etc/#g" -e "s#/var/#${FS}/var/#g" -e "s#/opt/rust#${FS}/op
     -e "s#^WIPE_ALWAYS=.*#WIPE_ALWAYS=(${FS}/dev/shm ${FS}/dev/mqueue)#" \
   "${BOX_RUNNER_DIR}/setup-sandbox-user.sh" > "${sbx}/setup-sandbox-user.sh"
 chmod +x "${sbx}/setup-sandbox-user.sh"
-export SBX_LOG="${sbx}/calls.log" SBX_IPT="${sbx}/iptables.rules" SBX_FS="${FS}" SBX_ACL="${sbx}/acl.log"
+export SBX_LOG="${sbx}/calls.log" SBX_IPT="${sbx}/iptables.rules" SBX_FS="${FS}" SBX_ACL="${sbx}/acl.log" SBX_DEFAULT_ACL="${sbx}/default-acl.log"
 : > "${SBX_ACL}"
+: > "${SBX_DEFAULT_ACL}"
 cat > "${SBIN}/id" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
@@ -648,13 +649,38 @@ for t in loginctl atq useradd usermod groupadd gpasswd visudo curl chown su netf
   printf '#!/usr/bin/env bash\necho "%s $*" >> "${SBX_LOG}"\n' "${t}" > "${SBIN}/${t}"
 done
 # setfacl: logged; a u:nemosub:--- target is also recorded for the sudo stub.
+# Default ACL (-d -m u:…:---) is recorded for the getfacl stub and --check.
 cat > "${SBIN}/setfacl" <<'EOF'
 #!/usr/bin/env bash
 echo "setfacl $*" >> "${SBX_LOG}"
-[[ "$1 $2" == "-m u:nemosub:---" ]] && echo "$3" >> "${SBX_ACL}"
+if [[ "$1" == -n && "$2" == -d && "$3" == -m && "$4" == u:*:--- ]]; then
+  echo "$5 $4" >> "${SBX_DEFAULT_ACL}"
+elif [[ "$1" == -m && "$2" == u:*:--- ]]; then
+  echo "$3" >> "${SBX_ACL}"
+fi
 exit 0
 EOF
 cp "${SBIN}/setfacl" "${sbx}/setfacl.stub"
+cat > "${SBIN}/getfacl" <<'EOF'
+#!/usr/bin/env bash
+default_only=0 path=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--default) default_only=1; shift ;;
+    -*) shift ;;
+    *) path="$1"; shift ;;
+  esac
+done
+[[ -n "${path}" && -f "${SBX_DEFAULT_ACL:-}" ]] || exit 0
+while IFS= read -r rec; do
+  set -- ${rec}
+  [[ "$1" == "${path}" ]] || continue
+  user="${2#u:}"; user="${user%:---}"
+  # Like real getfacl: -d prints the default entries without the default: prefix.
+  if [[ "${default_only}" == 1 ]]; then echo "user:${user}:---"; else echo "default:user:${user}:---"; fi
+done < "${SBX_DEFAULT_ACL}"
+exit 0
+EOF
 # findmnt: the scratch tree is the one local filesystem.
 printf '#!/usr/bin/env bash\necho "%s"\n' "${FS}" > "${SBIN}/findmnt"
 printf '#!/usr/bin/env bash\necho "rustup $*" >> "${SBX_LOG}"\n' > "${FS}/opt/rust/cargo/bin/rustup"
@@ -699,6 +725,8 @@ assert_true "sandbox setup: egress unit enabled and run" \
 for d in "" /actions-runner /actions-runner/_work; do
   assert_true "sandbox setup: traverse-only ACL on runner home${d}" grep -qxF "setfacl -m u:nemosub:--x ${FS}/home/runner${d}" "${SBX_LOG}"
 done
+assert_true "sandbox setup: default deny ACL on runner home (new entries inherit)" \
+  grep -qxF "setfacl -n -d -m u:nemosub:--- ${FS}/home/runner" "${SBX_LOG}"
 # F4: every entry beside the path to the checkout is denied; the path itself is not.
 for d in /.cache /actions-runner/.env /actions-runner/_diag /actions-runner/bin /actions-runner/_work/_actions /actions-runner/_work/_temp; do
   assert_true "sandbox setup: deny ACL on runner home${d}" grep -qxF "setfacl -m u:nemosub:--- ${FS}/home/runner${d}" "${SBX_LOG}"
@@ -754,6 +782,8 @@ assert_true "sandbox --check: cron.deny and at.deny list nemosub" \
   bash -c "grep -q '^PASS  nemosub is listed in .*/cron.deny' <<<\"\$0\" && grep -q '^PASS  nemosub is listed in .*/at.deny' <<<\"\$0\"" "${out}"
 assert_true "sandbox --check: no linger" grep -q '^PASS  nemosub does not linger' <<<"${out}"
 assert_true "sandbox --check: nemosub can traverse _work" grep -q '^PASS  nemosub can traverse .*/_work' <<<"${out}"
+assert_true "sandbox --check: runner home carries default deny ACL for nemosub" \
+  grep -q "^PASS  runner home ${FS}/home/runner has default ACL default:user:nemosub:---" <<<"${out}"
 for p in actions-runner/.env actions-runner/_diag .cache; do
   assert_true "sandbox --check: nemosub cannot read ~runner/${p}" grep -q "^PASS  nemosub cannot read ${FS}/home/runner/${p}\$" <<<"${out}"
 done
@@ -767,6 +797,11 @@ cp "${SBX_ACL}" "${sbx}/acl.saved"; : > "${SBX_ACL}"; chmod 0755 "${sl}"
 out="$(sbx_check SBX_SANDBOX_UID="$(id -u)")"
 assert_true "sandbox --check: a nemosub-owned file left in a wipe-list dir fails" grep -q '^FAIL  nothing nemosub-owned in any wipe-list directory' <<<"${out}"
 assert_true "sandbox --check: a readable actions-runner/.env fails" grep -q "^FAIL  nemosub cannot read ${FS}/home/runner/actions-runner/.env\$" <<<"${out}"
+: > "${SBX_DEFAULT_ACL}"
+out="$(sbx_check)"
+assert_true "sandbox --check: missing runner home default deny ACL fails" \
+  grep -q "^FAIL  runner home ${FS}/home/runner has default ACL default:user:nemosub:---" <<<"${out}"
+echo "${FS}/home/runner u:nemosub:---" >> "${SBX_DEFAULT_ACL}"
 assert_true "sandbox --check: a readable resident log dir fails" grep -q '^FAIL  nemosub cannot read the resident log dir' <<<"${out}"
 rm -f "${FS}/run/lock/leftover"; cp "${sbx}/acl.saved" "${SBX_ACL}"; chmod 0750 "${sl}"
 mv "${wl}" "${wl}.off"
@@ -824,6 +859,8 @@ assert_true "second runner: its own wipe list" grep -qxF "${FS}/tmp" "${FS}/etc/
 assert_true "second runner: its sandbox root is layrbench:layrshare" grep -qxF "chown layrbench:layrshare ${FS}/var/lib/layrbench/sandbox" "${SBX_LOG}"
 assert_true "second runner: its own toolchain dir" grep -q '^rustup default ' "${SBX_LOG}"
 assert_true "second runner: traverse ACL on its own runner home" grep -qxF "setfacl -m u:layrsub:--x ${FS}/home/layrbench" "${SBX_LOG}"
+assert_true "second runner: default deny ACL on its runner home" \
+  grep -qxF "setfacl -n -d -m u:layrsub:--- ${FS}/home/layrbench" "${SBX_LOG}"
 assert_eq "second runner: at.deny lists both sandbox users" "nemosub layrsub" "$(grep -xE 'nemosub|layrsub' "${FS}/etc/at.deny" | paste -sd' ' -)"
 
 # =========================================================================
