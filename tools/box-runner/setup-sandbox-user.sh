@@ -189,6 +189,12 @@ no_linger() {
     && [[ "$(loginctl show-user "${SANDBOX_USER}" -p Linger --value 2>/dev/null)" != yes ]]
 }
 in_deny_file() { grep -qxF "${SANDBOX_USER}" "$1" 2>/dev/null; }
+# runner_home_default_deny -- the runner home carries default:user:SANDBOX_USER:---
+# so new entries (for example ~/.cache) inherit a deny without re-running setup.
+runner_home_default_deny() {
+  # Plain getfacl prints default entries with the default: prefix (getfacl -d omits it).
+  getfacl -p "$(runner_home)" 2>/dev/null | grep -qxF "default:user:${SANDBOX_USER}:---"
+}
 
 # ----------------------------------------------------------------------------
 # --check
@@ -282,6 +288,7 @@ run_check() {
   else
     warn "${work} does not exist yet (no job has run); the workflow grants ${SANDBOX_USER} its ACLs per job"
   fi
+  check "runner home ${home} has default ACL default:user:${SANDBOX_USER}:--- (new entries inherit deny)" runner_home_default_deny
   for p in "${home}/actions-runner/.env" "${home}/actions-runner/_diag" "${home}/.cache"; do
     [[ -e "${p}" ]] && check "${SANDBOX_USER} cannot read ${p}" sandbox_cannot_read "${p}"
   done
@@ -504,12 +511,26 @@ setup_no_persistence() {
 # path to the checkout gets an explicit deny. Under _work the job's checkout
 # dir is not known here; the runner's own dirs there are all _-prefixed. The
 # workflow grants rX on the checkout itself and repeats the deny per job.
+#
+# A default deny on the runner home covers entries created later (for example
+# ~/.cache after a job): new subdirectories inherit default:user:${SANDBOX_USER}:---
+# (side effect a). The job checkout is unaffected: benchmark.yml grants rX on the
+# workspace recursively and sets default:user:${SANDBOX_USER}:rX on it per job
+# (.github/workflows/benchmark.yml setfacl -R -P -m / -R -P -d -m). Side effect
+# (b): inside a directory with a default ACL the process umask is not applied to
+# new entries; the requested mode is limited by the default ACL's base entries,
+# which come from the home's own mode. So the runner's own group can read new
+# entries if the home grants the group read. This script does not set the home's
+# mode.
 setup_work_traverse() {
   local home d
   home="$(runner_home)"
   for d in "${home}" "${home}/actions-runner" "${home}/actions-runner/_work"; do
     [[ -d "${d}" ]] && setfacl -m "u:${SANDBOX_USER}:--x" "${d}"
   done
+  # -n: keep any existing default mask (setfacl -m recalculates it, which can widen
+  # access for other named entries in an existing default ACL).
+  setfacl -n -d -m "u:${SANDBOX_USER}:---" "${home}"
   deny_entries "${home}" ! -name actions-runner
   deny_entries "${home}/actions-runner" ! -name _work
   deny_entries "${home}/actions-runner/_work" -name '_*'
