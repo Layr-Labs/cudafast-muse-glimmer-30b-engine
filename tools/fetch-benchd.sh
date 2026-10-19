@@ -176,9 +176,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRANCH="${BENCHD_BRANCH:-main}"
-# THE PIN. Layr-Labs/mlxfast-bench-dev main @ 673cdfc (bench pull request 399)
+# THE PIN. Layr-Labs/mlxfast-bench-dev main @ 43a9a16 (bench pull request 425)
 # publishes dist/ (aarch64-apple-darwin), dist/linux-aarch64 and
-# dist/linux-x86_64, built from source_commit ff98ea4. That source includes:
+# dist/linux-x86_64, built from source_commit b65af98. That source includes:
 #   * ecd66fe: decode is the decode window (decode-run time / N, with no seed
 #     prefill), the calibration file is version 3, and the fixture's
 #     official_pair_combine selects the mean of the per-pair composites;
@@ -195,10 +195,15 @@ BRANCH="${BENCHD_BRANCH:-main}"
 #   * bench pull request 398: the speedup floors (0.95 decode, 0.80 prefill
 #     here) are the only gate on a slow candidate. The candidate band has no
 #     slow side; *_band_up_tolerance is the control leg's health band only.
+#   * bench pull requests 421-424: engine-written text, audit fields, the hello
+#     identity and engine-derived numbers are kept out of the sealed output
+#     (digests, or omitted; a full copy only to BENCHD_PRIVATE_AUDIT_PATH);
+#   * the calibration stability gate is the fixture's
+#     calibration_max_cv_percent (2.0 here) instead of a fixed 1 %.
 # This benchd has no timed-divergence reference replay: the timed decode window
 # is an exact match against the per-depth oracle.
-PINNED_COMMIT="673cdfcf668e911f0ea3971834a3597f829d8c45"
-PINNED_SOURCE_COMMIT="ff98ea4076b187060fb4a9a69a0ba7b138e783fe"
+PINNED_COMMIT="43a9a1642cc22c3fb2f71b9c707699cd3a9602c7"
+PINNED_SOURCE_COMMIT="b65af98c2a060df12f2ced849c68528b825fecdb"
 COMMIT="${BENCHD_COMMIT:-${PINNED_COMMIT}}"
 SOURCE_COMMIT_PIN="${BENCHD_SOURCE_COMMIT:-${PINNED_SOURCE_COMMIT}}"
 DEST_DIR="${BENCHD_BIN_DIR:-${REPO_ROOT}/benchd-bin}"
