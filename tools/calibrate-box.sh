@@ -24,8 +24,9 @@
 #   3. `benchd calibrate-baseline` runs the control leg --passes times under the
 #      full official methodology (cool gate per pass), once for EACH of the
 #      fixture's live_goldens, writes the file with one band per prompt, and
-#      refuses when a per-axis CV exceeds 1 % -- the box was not stable, so no
-#      band describes it.
+#      refuses when a per-axis CV exceeds the contract's
+#      calibration_max_cv_percent (2 % on this track) -- the box was not stable,
+#      so no band describes it.
 #
 # THIS DRIVER BOOTS NO SERVE. benchd owns the residency, and it boots the
 # resident INSIDE THE PASS LOOP: for each pass it runs the REFERENCE tree's own

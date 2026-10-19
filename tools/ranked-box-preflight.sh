@@ -715,19 +715,26 @@ cal_passes="$(jq -r '.passes // empty' "${CAL_FOR_CHECKS}")"
   || fail "the baseline calibration records ${cal_passes:-no} pass(es); a band needs at least two, because the CV is undefined below two"
 
 # THE NUMBERS. A mean that is zero, negative or absent is not a band, and a CV
-# above 1 % means the box was not stable when it was calibrated -- the same gate
-# the calibrator applies, re-applied here so a hand-edited file cannot widen it.
+# above the contract's calibration_max_cv_percent means the box was not stable
+# when it was calibrated -- the same gate the calibrator applies, re-applied
+# here so a hand-edited file cannot widen it.
 for key in prefill_seconds_per_token_mean decode_seconds_per_token_mean; do
   value="$(jq -r --arg k "${key}" '.[$k] // empty' "${CAL_FOR_CHECKS}")"
   [[ -n "${value}" ]] || fail "the baseline calibration carries no ${key}; there is no band centre on that axis"
   [[ "$(jq -n --argjson v "${value}" '$v > 0 and $v < 60')" == "true" ]] \
     || fail "the baseline calibration's ${key} is ${value} s/tok, which is not a plausible per-token time; the band centre is unusable"
 done
+# The stability gate is the contract's calibration_max_cv_percent. Read the
+# same value here as benchd calibrate-baseline. Absent, the historical 2 % holds.
+cv_max_percent="$(jq -r 'if has("calibration_max_cv_percent") and .calibration_max_cv_percent != null then .calibration_max_cv_percent else 2 end' "${CONTRACT}")"
+[[ "$(jq -r 'if has("calibration_max_cv_percent") and .calibration_max_cv_percent != null then .calibration_max_cv_percent else 2 end | type == "number" and . > 0 and . <= 100' "${CONTRACT}")" == "true" ]] \
+  || fail "the track contract's calibration_max_cv_percent is '${cv_max_percent}', not a usable percentage"
+cv_max="$(jq -n --argjson p "${cv_max_percent}" '$p / 100')"
 for key in prefill_cv decode_cv; do
   value="$(jq -r --arg k "${key}" '.[$k] // empty' "${CAL_FOR_CHECKS}")"
   [[ -n "${value}" ]] || fail "the baseline calibration carries no ${key}; there is no evidence the mean describes this box"
-  [[ "$(jq -n --argjson v "${value}" '$v >= 0 and $v <= 0.01')" == "true" ]] \
-    || fail "the baseline calibration's ${key} is ${value}, above the 1 % stability gate; this box was not stable when it was calibrated, so re-calibrate it"
+  [[ "$(jq -n --argjson v "${value}" --argjson m "${cv_max}" '$v >= 0 and $v <= $m')" == "true" ]] \
+    || fail "the baseline calibration's ${key} is ${value}, above the ${cv_max_percent} % stability gate (the track contract's calibration_max_cv_percent); this box was not stable when it was calibrated, so re-calibrate it"
 done
 
 # THE BANDS MUST BE ABLE TO FAIL. A band that does not bracket 1 rejects a

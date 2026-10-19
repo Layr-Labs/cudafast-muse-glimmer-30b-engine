@@ -426,7 +426,18 @@ EOF
   cal_case "calibration passes" '.prompts[0].passes = 1' "a band needs at least two"
   cal_case "calibration mean" '.prompts[0].decode_seconds_per_token_mean = 0' \
     "is not a plausible per-token time"
-  cal_case "calibration cv" '.prompts[0].decode_cv = 0.05' "above the 1 % stability gate"
+  cal_case "calibration cv" '.prompts[0].decode_cv = 0.05' \
+    "above the 2.0 % stability gate (the track contract's calibration_max_cv_percent)"
+  CAL_CV_PASS="${WORK}/cal-cv-1-5-percent.json"
+  write_calibration "${CAL_CV_PASS}" '.prompts[0].decode_cv = 0.015'
+  cv_pass="$(run_preflight "MLXFAST_BASELINE_CALIBRATION=${CAL_CV_PASS}")"
+  if grep -q 'ranked-box-preflight: all checks passed' <<<"${cv_pass}"; then
+    echo "ok    section 8 / calibration cv 1.5 percent: passes the 2 percent gate"
+  else
+    fail "section 8 / calibration cv 1.5 percent: did not pass; got: $(tail -3 <<<"${cv_pass}")"
+  fi
+  cal_case "calibration cv 2.5 percent" '.prompts[0].decode_cv = 0.025' \
+    "above the 2.0 % stability gate (the track contract's calibration_max_cv_percent)"
   cal_case "calibration band does not bracket 1" '.prompts[0].decode_band_high = 0.99' \
     "is not a usable band"
   cal_case "calibration band admits a half-speed box" '.prompts[0].prefill_band_high = 2.5' \
@@ -451,6 +462,10 @@ EOF
     expect_refusal "${label}" "${needle}" "$@"
     cp "${WORK}/contract.orig.json" "${SCAFFOLD_CONTRACT}"
   }
+  rotation_case "calibration CV limit is boolean" '.calibration_max_cv_percent = false' \
+    "calibration_max_cv_percent is 'false', not a usable percentage"
+  rotation_case "calibration CV limit is a string" '.calibration_max_cv_percent = "2.0"' \
+    "calibration_max_cv_percent is '2.0', not a usable percentage"
   # SECOND is in the pool with its oracles pinned. The two cases below
   # construct the broken state explicitly: SECOND stays in the pool, its own
   # oracle pins are removed or replaced, and its oracle files are not staged

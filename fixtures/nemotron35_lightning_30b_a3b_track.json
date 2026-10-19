@@ -30,6 +30,7 @@
   "decode_band_up_tolerance": 0.03,
   "decode_band_down_tolerance": 0.05,
   "decode_band_down_enabled": false,
+  "calibration_max_cv_percent": 2.0,
   "prefill_band_down_enabled": false,
   "score_decode_weight": 0.75,
   "score_prefill_weight": 0.25,

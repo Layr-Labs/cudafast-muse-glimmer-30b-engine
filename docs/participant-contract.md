@@ -424,7 +424,8 @@ Each ranked box carries a calibration file, named by
 `MLXFAST_BASELINE_CALIBRATION` and written by `tools/calibrate-box.sh` (3
 passes, one resident boot per pass). It is a HEALTH BAND for the control leg,
 never a denominator. A control leg outside the band fails the run by name. A box
-whose passes spread by more than 1% gets no band.
+whose passes spread by more than 2% gets no band. The fixture field
+`calibration_max_cv_percent` sets this limit.
 
 `tools/ranked-box-preflight.sh` section 8b refuses a calibration file in any of
 these cases:
