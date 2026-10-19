@@ -208,6 +208,28 @@ writing only its own per-job directories. The adapter's stderr is not
 returned, the score record carries no engine-supplied text, and nothing
 persists between jobs or legs.
 
+### The ranked box toolchain
+
+| | |
+|---|---|
+| **Hardware** | NVIDIA DGX Spark (GB10, aarch64) |
+| **OS** | Ubuntu 24.04.4 LTS, kernel 6.17.0-1026-nvidia |
+| **Driver** | NVIDIA 580.159.03 (the fixture's `driver_min`), CUDA driver API 13.0; Docker 29.2.1, NVIDIA Container Toolkit 1.19.1 |
+| **Engine image** | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` (Ubuntu 22.04.5 LTS) |
+| **In the image** | vLLM 0.27.1, PyTorch 2.13.0+cu130, FlashInfer 0.6.16.post3, Python 3.12.13; CUDA 13.0 (nvcc V13.0.88), gcc 11.4.0 |
+| **CUDA arch** | `sm_121` (the fixture's `serve_configuration.toolchain.cuda_arch`) |
+| **Rust on the host** | 1.98.1 (`1.98.1-aarch64-unknown-linux-gnu`), offline `cargo build --release --locked` on vendored crates.io dependencies |
+
+The host has no nvcc. `harness/kernels/build.sh`, when present, runs inside the
+pinned image. The adapter (`harness/protocol-adapter`) builds on the host. The
+vLLM Python and Triton source in `vllm/vllm/` runs on the compiled extensions
+of the pinned image.
+
+The hosted CI does not run the engine on a GPU. A green hosted CI does not
+prove that your kernels compile for `sm_121` with nvcc 13.0, or that the
+resident boots. The ranked job builds your candidate in `./setup.sh`; a build
+failure there fails the submission before any scoring.
+
 ## Organizer runbook
 
 1. **Stage each Spark.**
