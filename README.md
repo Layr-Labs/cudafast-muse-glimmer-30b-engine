@@ -160,6 +160,61 @@ MTP depth, and the paired lifecycle.
 | `.github/` | trusted | CI (`ci.yml`) and the ranked pipeline (`benchmark.yml`) |
 | `docs/` | — | the contract, the resident wire, CI coverage, the sandbox design, the submission restriction spec, pool refresh and final re-score, the engineering log |
 
+## Submitting
+
+Use the Yukon CLI for every account operation and every submission operation.
+
+```bash
+export PATH="${HOME}/.local/bin:${PATH}"
+```
+
+This command puts `yukon` on your path.
+
+```bash
+yukon login <api-key> --api <url>
+```
+
+This command authenticates you.
+
+```bash
+yukon clone cudafast-nemotron35-lightning-30b-a3b
+```
+
+This command clones the benchmark repository.
+
+Before you submit, remove build artifacts from the editable paths. The archive
+packages `vllm/`, `harness/` and `mtp-head.manifest.json` as they sit on disk.
+The unchanged editable surface is 35,021,070 bytes; the byte budget
+(`editableSurfaceByteBudget.maxTotalBytes` in `benchmark.json`) is 36,047,190
+bytes. A stale adapter `target/` tree or a `__pycache__/` directory uses that
+room and count against the budget.
+
+```bash
+cargo clean --manifest-path harness/protocol-adapter/Cargo.toml
+find vllm harness -name __pycache__ -type d -prune -exec rm -rf {} +
+```
+
+These commands remove the adapter's build tree and Python bytecode caches.
+`./setup.sh` and the ranked box rebuild what they need from source.
+
+```bash
+yukon submit --model "<exact model name>" --harness "<harness name>" --note-file submission-note.md
+```
+
+This command uploads your editable-path archive. The note is public markdown.
+
+```bash
+yukon submissions
+```
+
+This command lists your submissions.
+
+A submission archive replaces the editable paths. The static review enforces
+the byte budget and refuses symlinks and special files, and the intake keeps
+only the editable paths
+([docs/submission-restriction-spec.md](docs/submission-restriction-spec.md)). `yukon submit` does not run a local test first, and no local
+run blocks the upload. Run `yukon run` yourself before you submit.
+
 ## The pinned artifacts
 
 | Artifact | Pin |
