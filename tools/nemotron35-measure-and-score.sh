@@ -551,15 +551,21 @@ fi
 #   (b) a pair-1 CANDIDATE resident boot failure before any candidate timing is
 #       sealed (LEG-SERVE-BOOT-FAILED: the candidate leg's ... with
 #       metrics.paired_legs empty — pair 2's candidate boot keeps pair 1 in
-#       paired_legs and is never retried).
-# Either cause re-runs the whole measurement once from scratch after the
+#       paired_legs and is never retried), or
+#   (c) a pair-1 SERIAL-CONTROL resident boot failure before any pair completes
+#       (LEG-SERVE-BOOT-FAILED: the serial-control leg's ... with
+#       metrics.paired_legs empty — pair 2's control boot keeps pair 1 in
+#       paired_legs and is never retried; a candidate could provoke it after
+#       its own leg ran).
+# Any of these re-runs the whole measurement once from scratch after the
 # teardown below. The second attempt's seal is the result; the first attempt's
 # timings are discarded, never compared. Every other failure is final,
 # INCLUDING the other control-leg failures (spawn, session, protocol, cool
 # gate, memory): pair 2's control leg runs after the candidate's leg, so a
 # candidate could provoke those on purpose to buy a second draw. A second
-# control-leg token divergence exits 75: an infrastructure outcome, not a
-# submission failure. The attempt count is logged as control_leg_attempts=N; it
+# control-leg token divergence or a second pair-1 serial-control boot failure
+# exits 75: an infrastructure outcome, not a submission failure. The attempt
+# count is logged as control_leg_attempts=N; it
 # is not sealed, because score.json is pinned by its .sha256 and
 # benchmark-integrity.json and only benchd writes it.
 #
@@ -604,8 +610,17 @@ pair1_candidate_boot_failed() {
     "${SCORE_PATH}" >/dev/null 2>&1
 }
 
+# Pair 1 only: same paired_legs empty/absent rule as pair1_candidate_boot_failed.
+pair1_serial_control_boot_failed() {
+  [[ -f "${HELD}/marker" ]] || return 1
+  jq -e '.passed == false
+    and ((.metrics.error // "") | test("^LEG-SERVE-BOOT-FAILED: the serial-control leg"))
+    and ((.metrics.paired_legs // []) | length == 0)' \
+    "${SCORE_PATH}" >/dev/null 2>&1
+}
+
 measurement_retry_warranted() {
-  control_leg_diverged || pair1_candidate_boot_failed
+  control_leg_diverged || pair1_candidate_boot_failed || pair1_serial_control_boot_failed
 }
 remove_seal() { rm -f -- "${SCORE_PATH}" "${SCORE_PATH}.sha256" "${INTEGRITY_PATH}"; }
 
@@ -637,13 +652,22 @@ sandbox_reset_shared() {
 
 clear_sandbox_job_dirs() {
   [[ -n "${SANDBOX_ROOT:-}" && -n "${SANDBOX_JOB:-}" ]] || return 1
-  local sub
-  for sub in cargo-home target kernels-out sock adapter-home; do
-    sub="${SANDBOX_ROOT}/${SANDBOX_JOB}/${sub}"
+  local job_dir="${SANDBOX_ROOT}/${SANDBOX_JOB}"
+  local name sub count
+  for name in cargo-home target kernels-out sock adapter-home; do
+    sub="${job_dir}/${name}"
     [[ -d "${sub}" ]] || continue
+    # Same five dirs as .github/workflows/benchmark.yml sandbox cleanup; -P never
+    # follows symlinks out of the sub dir; -mindepth 1 keeps the sub dir itself.
     sudo -n -u "${SANDBOX_USER}" -- chmod -R u+rwX "${sub}" >/dev/null 2>&1 || true
-    sudo -n -u "${SANDBOX_USER}" -- find "${sub}" -mindepth 1 -delete || return 1
-    [[ -z "$(find "${sub}" -mindepth 1 -print -quit)" ]] || return 1
+    # Each user removes what it owns; only the count below decides success.
+    sudo -n -u "${SANDBOX_USER}" -- find -P "${sub}" -mindepth 1 -delete >/dev/null 2>&1 || true
+    find -P "${sub}" -mindepth 1 -delete >/dev/null 2>&1 || true
+    count="$(find -P "${sub}" -mindepth 1 -printf . 2>/dev/null | wc -c)" || return 1
+    if (( count != 0 )); then
+      echo "nemotron35-measure-and-score.sh: sandbox job subdirectory ${name} is not empty after cleanup ($((count)) leftover entries)" >&2
+      return 1
+    fi
   done
 }
 
@@ -670,6 +694,8 @@ run_attempt || rc=$?
 if [[ "${rc}" -ne 0 ]] && measurement_retry_warranted; then
   if control_leg_diverged; then
     echo "nemotron35-measure-and-score.sh: attempt 1 DISCARDED, the serial control leg diverged: $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
+  elif pair1_serial_control_boot_failed; then
+    echo "nemotron35-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 serial-control resident did not boot (no pair timing sealed): $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
   else
     echo "nemotron35-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 candidate resident did not boot (no candidate timing sealed): $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
   fi
@@ -687,6 +713,10 @@ if [[ -f "${HELD}/marker" ]]; then cat -- "${HELD}/marker" >&2; fi
 echo "nemotron35-measure-and-score.sh: control_leg_attempts=${attempts}" >&2
 if [[ "${rc}" -ne 0 && "${attempts}" -eq 2 ]] && control_leg_diverged; then
   echo "::error title=Serial control leg diverged twice::infrastructure outcome, not a submission failure; re-dispatch this job" >&2
+  exit 75
+fi
+if [[ "${rc}" -ne 0 && "${attempts}" -eq 2 ]] && pair1_serial_control_boot_failed; then
+  echo "::error title=Serial-control leg boot failed twice::infrastructure outcome, not a submission failure; re-dispatch this job" >&2
   exit 75
 fi
 exit "${rc}"

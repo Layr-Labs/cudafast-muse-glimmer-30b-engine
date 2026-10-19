@@ -76,7 +76,7 @@ ROOT="${WORK}/root"
 mkdir -p "${ROOT}/tools" "${ROOT}/fixtures"
 for entry in "${REPO_ROOT}"/tools/*; do ln -s "${entry}" "${ROOT}/tools/$(basename "${entry}")"; done
 ln -s "${REPO_ROOT}/benchmark.json" "${ROOT}/benchmark.json"
-cp "${REPO_ROOT}/mtp-head.manifest.json" "${ROOT}/mtp-head.manifest.json"
+jq '.spec = {enabled: false, num_speculative_tokens: 0}' "${REPO_ROOT}/mtp-head.manifest.json" > "${ROOT}/mtp-head.manifest.json"
 jq '.spec = {enabled: true, num_speculative_tokens: 3}' "${REPO_ROOT}/mtp-head.manifest.json" > "${WORK}/mtp3.manifest.json"
 CONTRACT="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
 
@@ -119,6 +119,8 @@ case "${what}" in
   floor) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"performance floor failed: decode_speedup=0.9\"}}" ;;
   boot) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"LEG-SERVE-BOOT-FAILED: the candidate leg's resident did not boot (1): abcd1234\", \"paired_legs\": []}}" ;;
   boot2) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"LEG-SERVE-BOOT-FAILED: the candidate leg's resident did not boot (1): abcd1234\", \"paired_legs\": [{\"pair\": 1, \"prompt_sha256\": \"deadbeef\", \"control_prefill_seconds_per_token\": 1.0, \"control_decode_seconds_per_token\": 2.0, \"candidate_prefill_seconds_per_token\": 1.1, \"candidate_decode_seconds_per_token\": 2.1}]}}" ;;
+  boot_ctl) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"LEG-SERVE-BOOT-FAILED: the serial-control leg's resident did not boot (1): abcd1234\", \"paired_legs\": []}}" ;;
+  boot_ctl2) json="{\"passed\": false, \"score\": null, \"metrics\": {\"error\": \"LEG-SERVE-BOOT-FAILED: the serial-control leg's resident did not boot (1): abcd1234\", \"paired_legs\": [{\"pair\": 1, \"prompt_sha256\": \"deadbeef\", \"control_prefill_seconds_per_token\": 1.0, \"control_decode_seconds_per_token\": 2.0, \"candidate_prefill_seconds_per_token\": 1.1, \"candidate_decode_seconds_per_token\": 2.1}]}}" ;;
 esac
 echo "stub benchd run ${n}: ${what}" >&2
 printf '%s\n' "${json}" | tee "${score}"
@@ -262,6 +264,25 @@ plan boot2 pass
   && ok "retry: pair-2 candidate boot failure (paired_legs non-empty) is never retried" \
   || fail "retry: boot2: rc=${rc} runs=${runs} out: $(tail -3 <<<"${out}")"
 
+plan boot_ctl pass
+[[ "${rc}" -eq 0 && "${runs}" == "boot_ctl pass " && "$(markers)" -eq 1 ]] \
+  && grep -q "control_leg_attempts=2" <<<"${out}" && grep -q "pair-1 serial-control resident did not boot" <<<"${out}" \
+  && jq -e '.score == 1.2' "${ROOT}/score.json" >/dev/null \
+  && ok "retry: pair-1 serial-control boot failure then pass is scored from attempt 2" \
+  || fail "retry: boot_ctl+pass: rc=${rc} runs=${runs} out: $(tail -5 <<<"${out}")"
+
+plan boot_ctl boot_ctl
+[[ "${rc}" -eq 75 && "${runs}" == "boot_ctl boot_ctl " && "$(markers)" -eq 1 ]] \
+  && grep -q "Serial-control leg boot failed twice" <<<"${out}" && grep -q "control_leg_attempts=2" <<<"${out}" \
+  && ok "retry: two pair-1 serial-control boot failures end as infrastructure (exit 75)" \
+  || fail "retry: boot_ctl twice: rc=${rc} runs=${runs} out: $(tail -3 <<<"${out}")"
+
+plan boot_ctl2 pass
+[[ "${rc}" -eq 1 && "${runs}" == "boot_ctl2 " && "$(markers)" -eq 1 ]] \
+  && grep -q "control_leg_attempts=1" <<<"${out}" \
+  && ok "retry: pair-2 serial-control boot failure (paired_legs non-empty) is never retried" \
+  || fail "retry: boot_ctl2: rc=${rc} runs=${runs} out: $(tail -3 <<<"${out}")"
+
 plan control boot
 [[ "${rc}" -eq 1 && "${runs}" == "control boot " && "$(markers)" -eq 1 ]] \
   && grep -q "control_leg_attempts=2" <<<"${out}" \
@@ -290,13 +311,45 @@ JOBDIR="${SB}/root/42-1"
 mkdir -p "${SB}/bin" "${SB}/tmp" "${SB}/home" "${SB}/runner-temp"
 for d in cargo-home target kernels-out sock adapter-home; do mkdir -p "${JOBDIR}/${d}"; done
 printf '%s\n' "${SB}/tmp" > "${SB}/wipe-dirs"
-cat > "${SB}/bin/sudo" <<'EOF'
+REAL_FIND="$(command -v find)"
+cat > "${SB}/bin/sudo" <<EOF
 #!/usr/bin/env bash
-[[ "$1 $2" == "-n -u" && "$4" == "--" ]] || exit 97
+[[ "\$1 \$2" == "-n -u" && "\$4" == "--" ]] || exit 97
 shift 4
-[[ "$1" == kill ]] && exit 0
-exec "$@"
+[[ "\$1" == kill ]] && exit 0
+if [[ "\$1" == find ]]; then
+  # nemosub cannot delete runner-owned socket dirs left by a crashed resident.
+  shift
+  echo 'zz-sudo-find-stderr-forbidden' >&2
+  args=()
+  for a in "\$@"; do
+    if [[ "\$a" == -delete ]]; then
+      args+=( ! -name 'runner-sock-leftover' ! -name 'zz-candidate-log-forbidden-dir' ! -name 'zz-candidate-log-forbidden-child' -delete )
+    else
+      args+=( "\$a" )
+    fi
+  done
+  exec ${REAL_FIND@Q} "\${args[@]}"
+fi
+exec "\$@"
 EOF
+cat > "${SB}/bin/find" <<EOF
+#!/usr/bin/env bash
+args=()
+for a in "\$@"; do
+  if [[ "\$a" == -delete ]]; then
+    echo 'zz-find-stderr-forbidden' >&2
+    args+=( ! -name 'zz-candidate-log-forbidden-dir' ! -name 'zz-candidate-log-forbidden-child' -delete )
+  elif [[ "\$a" == -printf ]]; then
+    echo 'zz-find-stderr-forbidden' >&2
+    args+=( "\$a" )
+  else
+    args+=( "\$a" )
+  fi
+done
+exec ${REAL_FIND@Q} "\${args[@]}"
+EOF
+chmod +x "${SB}/bin/find"
 cat > "${SB}/bin/pgrep" <<EOF
 #!/usr/bin/env bash
 [[ "\$1 \$2" == "-u $(id -un)" ]] && exit 1
@@ -321,6 +374,30 @@ plan control pass
   && ok "retry: every file attempt 1 planted in the five per-job sandbox dirs is gone when attempt 2 starts" \
   || fail "retry: sandboxed teardown: rc=${rc} runs=${runs} seen=$(tr '\n' ' ' < "${WORK}/runs.seen" 2>/dev/null) out: $(tail -4 <<<"${out}")"
 
+echo runner-owned > "${JOBDIR}/sock/runner-sock-leftover"
+PLAN_ENV=("${SB_ENV[@]}" MLXFAST_ENGINE_BIN="${SB}/engine" STUB_JOBDIR="${JOBDIR}")
+plan boot_ctl pass
+[[ "${rc}" -eq 0 && "${runs}" == "boot_ctl pass " && ! -e "${JOBDIR}/sock/runner-sock-leftover" ]] \
+  && ok "retry: clear_sandbox_job_dirs removes runner-owned leftovers the sandbox user could not delete" \
+  || fail "retry: runner-owned sock cleanup: rc=${rc} runs=${runs} leftover=$(test -e "${JOBDIR}/sock/runner-sock-leftover" && echo yes || echo no)"
+
+LOG_FORBIDDEN_DIR='zz-candidate-log-forbidden-dir'
+LOG_FORBIDDEN_CHILD='zz-candidate-log-forbidden-child'
+mkdir "${JOBDIR}/target/${LOG_FORBIDDEN_DIR}"
+echo x > "${JOBDIR}/target/${LOG_FORBIDDEN_DIR}/${LOG_FORBIDDEN_CHILD}"
+PLAN_ENV=("${SB_ENV[@]}" MLXFAST_ENGINE_BIN="${SB}/engine" STUB_JOBDIR="${JOBDIR}")
+plan boot_ctl pass
+[[ "${rc}" -eq 75 && "${runs}" == "boot_ctl " ]] \
+  && grep -q 'sandbox job subdirectory target is not empty after cleanup (2 leftover entries)' <<<"${out}" \
+  && ! grep -qF "${LOG_FORBIDDEN_DIR}" <<<"${out}" \
+  && ! grep -qF "${LOG_FORBIDDEN_CHILD}" <<<"${out}" \
+  && ! grep -qF "${JOBDIR}" <<<"${out}" \
+  && ! grep -qE 'zz-(sudo-)?find-stderr-forbidden' <<<"${out}" \
+  && ok "retry: fail-closed cleanup logs only the job sub-dir name and a count, never entry names" \
+  || fail "retry: fail-closed cleanup log: rc=${rc} runs=${runs} out: $(tail -5 <<<"${out}")"
+
+rm -f "${JOBDIR}/target/${LOG_FORBIDDEN_DIR}/${LOG_FORBIDDEN_CHILD}"
+rmdir "${JOBDIR}/target/${LOG_FORBIDDEN_DIR}"
 for d in cargo-home target kernels-out sock adapter-home; do rm -f "${JOBDIR}/${d}"/*; done
 PLAN_ENV=("${SB_ENV[@]}" SANDBOX_WIPE_LIST="${SB}/no-such-list" MLXFAST_ENGINE_BIN="${SB}/engine")
 plan pass
