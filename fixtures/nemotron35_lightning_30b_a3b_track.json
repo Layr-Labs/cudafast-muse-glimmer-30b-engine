@@ -53,119 +53,119 @@
   "timed_prompt_pool": [
     {
       "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.golden.json",
-      "sha256": "4c659a7fd2329f3e68821f1c7efc72958ee32d21853eba9480b86fca05362537",
-      "bytes": 27219
+      "sha256": "b27728b6a0763ac45c861a4d59c2c5b11dc45b105bf4929ea4193ad059316768",
+      "bytes": 35849
     },
     {
       "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.golden.json",
-      "sha256": "f376bebe9d7a6633392129a08212dd9bc28e80b12383b854b665e30b4713b5b5",
-      "bytes": 26455
+      "sha256": "c4b018c4323e67d60300dbdc207dfb60a2fae24991eccaf6a8ed83ea271bf3a1",
+      "bytes": 35779
     },
     {
       "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.golden.json",
-      "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
-      "bytes": 25051
+      "sha256": "a0ad8a3cce5ddd145f9b0f220fa102ce8f2fe35c3d7c054cdacd460b6687836a",
+      "bytes": 35824
     }
   ],
   "hidden_correctness_golden": {
-    "sha256": "4c659a7fd2329f3e68821f1c7efc72958ee32d21853eba9480b86fca05362537",
-    "bytes": 27219
+    "sha256": "b27728b6a0763ac45c861a4d59c2c5b11dc45b105bf4929ea4193ad059316768",
+    "bytes": 35849
   },
   "speculative_oracles": {
     "pool-9": {
       "mtp1": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.mtp1.golden.json",
-        "sha256": "41d0353318966ef01b7aeaa539cab24520034088ae3e713571642fec4795da19",
-        "bytes": 27216
+        "sha256": "b27728b6a0763ac45c861a4d59c2c5b11dc45b105bf4929ea4193ad059316768",
+        "bytes": 35849
       },
       "mtp2": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.mtp2.golden.json",
-        "sha256": "41d0353318966ef01b7aeaa539cab24520034088ae3e713571642fec4795da19",
-        "bytes": 27216
+        "sha256": "b27728b6a0763ac45c861a4d59c2c5b11dc45b105bf4929ea4193ad059316768",
+        "bytes": 35849
       },
       "mtp3": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.mtp3.golden.json",
-        "sha256": "41d0353318966ef01b7aeaa539cab24520034088ae3e713571642fec4795da19",
-        "bytes": 27216
+        "sha256": "b27728b6a0763ac45c861a4d59c2c5b11dc45b105bf4929ea4193ad059316768",
+        "bytes": 35849
       },
       "mtp4": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.mtp4.golden.json",
-        "sha256": "41d0353318966ef01b7aeaa539cab24520034088ae3e713571642fec4795da19",
-        "bytes": 27216
+        "sha256": "b27728b6a0763ac45c861a4d59c2c5b11dc45b105bf4929ea4193ad059316768",
+        "bytes": 35849
       },
       "mtp5": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.mtp5.golden.json",
-        "sha256": "41d0353318966ef01b7aeaa539cab24520034088ae3e713571642fec4795da19",
-        "bytes": 27216
+        "sha256": "b27728b6a0763ac45c861a4d59c2c5b11dc45b105bf4929ea4193ad059316768",
+        "bytes": 35849
       },
       "mtp6": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-9.mtp6.golden.json",
-        "sha256": "41d0353318966ef01b7aeaa539cab24520034088ae3e713571642fec4795da19",
-        "bytes": 27216
+        "sha256": "b27728b6a0763ac45c861a4d59c2c5b11dc45b105bf4929ea4193ad059316768",
+        "bytes": 35849
       }
     },
     "pool-10": {
       "mtp1": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.mtp1.golden.json",
-        "sha256": "9cf59219f214dbdfc6406bd2e2995fdca5c8fc9413f641174f22a2ecf5cabdb9",
-        "bytes": 26460
+        "sha256": "7e17efd28b10faa10c297215b947409897c99098e445a67c17398c02046b7d5a",
+        "bytes": 35788
       },
       "mtp2": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.mtp2.golden.json",
-        "sha256": "9cf59219f214dbdfc6406bd2e2995fdca5c8fc9413f641174f22a2ecf5cabdb9",
-        "bytes": 26460
+        "sha256": "7e17efd28b10faa10c297215b947409897c99098e445a67c17398c02046b7d5a",
+        "bytes": 35788
       },
       "mtp3": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.mtp3.golden.json",
-        "sha256": "9cf59219f214dbdfc6406bd2e2995fdca5c8fc9413f641174f22a2ecf5cabdb9",
-        "bytes": 26460
+        "sha256": "7e17efd28b10faa10c297215b947409897c99098e445a67c17398c02046b7d5a",
+        "bytes": 35788
       },
       "mtp4": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.mtp4.golden.json",
-        "sha256": "012d4ace74e0d8f41062252d6ab328f67123708ed931deec92959cc75a111984",
-        "bytes": 26460
+        "sha256": "4e74a013c3a07ce6fa923dec3372d72b95e476fa324f36a7191c74befef2903d",
+        "bytes": 35784
       },
       "mtp5": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.mtp5.golden.json",
-        "sha256": "012d4ace74e0d8f41062252d6ab328f67123708ed931deec92959cc75a111984",
-        "bytes": 26460
+        "sha256": "4e74a013c3a07ce6fa923dec3372d72b95e476fa324f36a7191c74befef2903d",
+        "bytes": 35784
       },
       "mtp6": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-10.mtp6.golden.json",
-        "sha256": "012d4ace74e0d8f41062252d6ab328f67123708ed931deec92959cc75a111984",
-        "bytes": 26460
+        "sha256": "0647f11c9b6df6c0b81c0f6222c3c469c9becf62df43e7dc670a8d904663560d",
+        "bytes": 35782
       }
     },
     "pool-11": {
       "mtp1": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.mtp1.golden.json",
-        "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
-        "bytes": 25051
+        "sha256": "35655a5e9d9780414a7ed6823ae34676a4fac45dbcec38bc74a00d6c787be873",
+        "bytes": 35825
       },
       "mtp2": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.mtp2.golden.json",
-        "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
-        "bytes": 25051
+        "sha256": "b627a537b3470675df8327fdf6bc71518939a38023c020f615f8df33a04351c6",
+        "bytes": 35825
       },
       "mtp3": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.mtp3.golden.json",
-        "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
-        "bytes": 25051
+        "sha256": "35655a5e9d9780414a7ed6823ae34676a4fac45dbcec38bc74a00d6c787be873",
+        "bytes": 35825
       },
       "mtp4": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.mtp4.golden.json",
-        "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
-        "bytes": 25051
+        "sha256": "d54b23cf65230a72608a891d9c7df3d5f54beed26f11fe7e74131e0956737529",
+        "bytes": 35826
       },
       "mtp5": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.mtp5.golden.json",
-        "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
-        "bytes": 25051
+        "sha256": "d54b23cf65230a72608a891d9c7df3d5f54beed26f11fe7e74131e0956737529",
+        "bytes": 35826
       },
       "mtp6": {
         "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/pool-11.mtp6.golden.json",
-        "sha256": "64c927ef8b6fdd268b61328bdb96344906d4fab99e789fe6960ba9cb4f45a3d3",
-        "bytes": 25051
+        "sha256": "d54b23cf65230a72608a891d9c7df3d5f54beed26f11fe7e74131e0956737529",
+        "bytes": 35826
       }
     }
   },
