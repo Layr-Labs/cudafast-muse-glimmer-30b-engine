@@ -15,7 +15,7 @@
 #           speculative counters and the engine_backend identity.
 #   FLOW C  the paired path's lifecycle: benchd calibrate-baseline boots the
 #           REFERENCE tree's own serve-up.sh per pass. The fake engine's
-#           microsecond timings cannot meet the 1% CV gate, so the expected
+#           microsecond timings cannot meet the 2% CV gate, so the expected
 #           outcome is a CALIBRATION-CV-EXCEEDED refusal AFTER both passes were
 #           measured -- which is what proves the per-leg boot works.
 #
