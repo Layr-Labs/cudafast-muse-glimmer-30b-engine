@@ -145,16 +145,22 @@ Every point links to the document that has the detail.
 | Fairness after all fixes (40 unchanged engines, all 8 boxes) | 39 pass, mean 0.9956, sd 0.0049; one GPU-transient boot failure (now re-run, see above) |
 
 These tests ran on the earlier fork benchd, which had the timed replay and the
-stricter sealing. The track now uses Layr-Labs bench main, which has neither
-(engineering log section 7.13).
+stricter sealing. The track now uses Layr-Labs bench-dev (engineering log
+section 7.13). Its `main` has the stricter sealing again since 2026-10-19
+(engine text, audit fields and hello identity seal as digests), but not the
+timed replay. The dist that `tools/fetch-benchd.sh` pins predates that
+sealing until it is republished and re-pinned.
 
 Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
 7.9–7.12.
 
 ## Fleet state
 
-- **Boxes.** All 8 are set up, sandboxed, calibrated and have the goldens
-  staged. Runners register through a GitHub App.
+- **Boxes.** All 8 were set up, sandboxed, calibrated and staged for the
+  October soak. Runners register through a GitHub App. Re-verify each ranked
+  box before launch: runner registration, the staged `pool-9/10/11` goldens
+  and a version-3 calibration. On 2026-10-19 Sparks 3 and 4 had no
+  `pool-9/10/11` goldens staged.
 - **Branches.** `main` is the armed contest base
   (`official_scoring_enabled: true`, reference tree `5be35aa`).
 - **Where the goldens live.** Scoring reads only each Spark's local copy

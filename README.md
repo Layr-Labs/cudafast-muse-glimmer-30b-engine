@@ -249,9 +249,12 @@ two jobs:
      sealed score** prints a commit-reveal block to the job log: a per-job
      nonce drawn before sandbox start (runner-private, never printed earlier),
      the exact bytes of `score.json` if present, and an end line binding
-     nonce to the file's sha256 and byte length (or `none` when absent). No
-     artifact is uploaded; the intake service reads the score only from that
-     block ([docs/submission-restriction-spec.md](docs/submission-restriction-spec.md)
+     nonce to the file's sha256 and byte length (or `none` when absent).
+   - **Upload score artifact** then uploads that same `score.json` as
+     `benchmark-results-<run_id>/score.json` (the `benchmark.json`
+     `scoreArtifact`), only when the reveal step printed it after a clean
+     sandbox cleanup. The reveal block stays the tamper-evident record
+     ([docs/submission-restriction-spec.md](docs/submission-restriction-spec.md)
      §10).
 
 The ranked job holds no credential. Goldens, the reference workspace, the
