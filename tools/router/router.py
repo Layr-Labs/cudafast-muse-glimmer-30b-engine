@@ -363,9 +363,14 @@ class Router:
                     break
             if failed_step:
                 break
+        paired_legs = None
+        if result:
+            pl = (result.get("metrics") or {}).get("paired_legs")
+            if pl is not None:
+                paired_legs = pl
         outcome = classify(run.get("conclusion"), passed, error, failed_step,
                            ranked is not None and bool(result), setup_ran(ranked),
-                           incident=row["incident"] or "")
+                           incident=row["incident"] or "", paired_legs=paired_legs)
         self._update(row["id"], state="done", finished_at=time.time(), conclusion=run.get("conclusion"),
                      passed=passed, score=score, error=error or failed_step, outcome=outcome,
                      result=json.dumps(result) if result else None,
@@ -830,7 +835,8 @@ def setup_ran(ranked) -> bool:
 
 
 def classify(conclusion, passed, error: str, failed_step: str, have_score: bool,
-             setup_ran_flag: bool = False, incident: str = "") -> str:
+             setup_ran_flag: bool = False, incident: str = "",
+             paired_legs=None) -> str:
     e = error or ""
     if passed:
         return "pass"
@@ -838,6 +844,15 @@ def classify(conclusion, passed, error: str, failed_step: str, have_score: bool,
         return "control_failed"  # reference leg failed twice (measure-and-score retries once): infra
     if "OUTSIDE-BAND" in e:
         return "band_refused"  # box health (control leg drifted), not the submission
+    # benchd boots this leg with the label "serial-control" (main.rs boot_leg).
+    if e.startswith("LEG-SERVE-BOOT-FAILED: the serial-control leg"):
+        # benchd omits paired_legs while it is empty and always seals the completed
+        # pairs on a boot refusal, so a pair-2 control boot always carries pair 1
+        # and stays final; absent or [] is pair 1, the case measure-and-score retries.
+        if paired_legs is not None and len(paired_legs) > 0:
+            pass  # fall through to have_score -> refused
+        else:
+            return "control_failed"  # pair 1 or unknown audit trail: infra
     # benchd boots this leg with the label "candidate" (main.rs boot_leg).
     if e.startswith("LEG-SERVE-BOOT-FAILED: the candidate leg"):
         return "boot_failed"
@@ -865,6 +880,7 @@ def classify(conclusion, passed, error: str, failed_step: str, have_score: bool,
 EXPECT = {
     "pass": {"pass"},
     "replay_rejected": {"replay_rejected"},
+    "boot_failed": {"boot_failed"},
     "refused": {"surface_refused", "preflight_refused", "refused", "unsealed", "watchdog_timeout"},
     "measure": None,  # any terminal outcome is acceptable; the number is the point
 }
