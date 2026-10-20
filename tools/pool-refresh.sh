@@ -6,11 +6,11 @@
 # Steps, each idempotent and recorded in <gen>/state so a crash resumes where
 # it stopped (<gen> = .mlxfast-private/refresh/<label>, or .mlxfast-private/final):
 #
-#   author   tools/stitch-prompts.py: 8 stitched prompts <label>-1..8
-#   record   serial + MTP-1..6 goldens for every prompt (8 x 7 = 56), each on TWO
+#   author   stitched OR --texts chat prompts <label>-1..N
+#   record   serial + MTP-1..6 goldens for every prompt (N x 7), each on TWO
 #            boxes with tools/record-goldens.sh --only in the box's checkout,
 #            under the box GPU lock; the two copies must be byte-identical
-#   stage    install the 56 goldens next to the current ones on every box
+#   stage    install the N x 7 goldens next to the current ones on every box
 #            (root:bench 0640), verified by sha256; every install is logged to
 #            .mlxfast-private/refresh/staging.log first
 #   pin      edit the fixture: pin the generation and make it live_goldens (and
@@ -32,7 +32,8 @@
 #
 # Usage:
 #   tools/pool-refresh.sh --label g2 [--step STEP] [--dry-run]
-#                         [--corpus DIR] [--snapshot DIR] [--final-after-freeze FILE]
+#                         [--count N] [--texts DIR] [--corpus DIR] [--snapshot DIR]
+#                         [--final-after-freeze FILE]
 #   tools/pool-refresh.sh pin-fixture FIXTURE LABEL PINS_JSON   (the fixture edit alone)
 #
 # Env: REFRESH_BOXES (ssh host names of the fleet, at least two; default
@@ -49,7 +50,6 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
 FIXTURE="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
 log() { printf 'pool-refresh: %s\n' "$*" >&2; }
 die() { printf 'pool-refresh: %s\n' "$*" >&2; exit 1; }
-COUNT=8
 
 # pin_fixture FIXTURE LABEL PINS_JSON -- pin <label>-<n>.golden.json and
 # <label>-<n>.mtp<d>.golden.json from PINS_JSON ({file: {sha256, bytes}}) and
@@ -88,12 +88,14 @@ if [[ "${1:-}" == pin-fixture ]]; then
   exit 0
 fi
 
-LABEL="" STEP="" DRY=0 CORPUS="" SNAPSHOT="" FROZEN=""
+LABEL="" STEP="" DRY=0 COUNT="" COUNT_SET=0 TEXTS="" CORPUS="" SNAPSHOT="" FROZEN=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --label) LABEL="$2"; shift 2 ;;
     --step) STEP="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
+    --count) COUNT="$2"; COUNT_SET=1; shift 2 ;;
+    --texts) TEXTS="$2"; shift 2 ;;
     --corpus) CORPUS="$2"; shift 2 ;;
     --snapshot) SNAPSHOT="$2"; shift 2 ;;
     --final-after-freeze) FROZEN="$2"; shift 2 ;;
@@ -102,6 +104,20 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "${LABEL}" =~ ^(g[0-9]+|final)$ ]] || die "--label must be g<N> or final"
 case "${STEP}" in ""|author|record|stage|pin|verify|retire) ;; *) die "--step ${STEP}: not author|record|stage|pin|verify|retire" ;; esac
+
+normalize_count() {
+  local supplied="$1" normalized="$1"
+  if [[ ! "${normalized}" =~ ^[0-9]+$ ]]; then
+    [[ -n "${supplied}" ]] || supplied="''"
+    die "--count ${supplied}: use an integer from 1 through 64"
+  fi
+  while [[ "${normalized}" == 0* && "${#normalized}" -gt 1 ]]; do normalized="${normalized#0}"; done
+  [[ "${#normalized}" -le 2 ]] || die "--count ${supplied}: use an integer from 1 through 64"
+  (( 10#${normalized} >= 1 && 10#${normalized} <= 64 )) \
+    || die "--count ${supplied}: use an integer from 1 through 64"
+  printf '%d\n' "$((10#${normalized}))"
+}
+[[ "${COUNT_SET}" == 0 ]] || COUNT="$(normalize_count "${COUNT}")"
 
 PRIV="${REFRESH_PRIVATE:-${ROOT}/.mlxfast-private}"
 read -ra BOXES <<<"${REFRESH_BOXES:-spark-1 spark-2 spark-3 spark-4 spark-5 spark-6 spark-7 spark-8}"
@@ -114,6 +130,15 @@ STAGING_LOG="${PRIV}/refresh/staging.log"
 if [[ "${LABEL}" == final ]]; then GEN="${PRIV}/final"; else GEN="${PRIV}/refresh/${LABEL}"; fi
 STATE="${GEN}/state"
 REMOTE="nemotron35-refresh/${LABEL}"   # relative to the box home
+if [[ -f "${GEN}/count" ]]; then
+  STORED_COUNT="$(normalize_count "$(<"${GEN}/count")")"
+  if [[ "${COUNT_SET}" == 1 && "${COUNT}" != "${STORED_COUNT}" ]]; then
+    die "count conflict: stored count ${STORED_COUNT}; supplied count ${COUNT}"
+  fi
+  COUNT="${STORED_COUNT}"
+elif [[ "${COUNT_SET}" == 0 ]]; then
+  COUNT="$(normalize_count "$(jq -r 'if has("live_goldens") then (.live_goldens | length) else 8 end' "${FIXTURE}")")"
+fi
 mapfile -t DEPTHS < <(jq -r '.mtp_head.permitted_draft_depths[]' "${FIXTURE}")
 NAMES=()
 for n in $(seq 1 "${COUNT}"); do NAMES+=("${LABEL}-${n}"); done
@@ -128,11 +153,28 @@ sha() { sha256sum "$1" | cut -d' ' -f1; }
 # ---- 1. author ---------------------------------------------------------------
 step_author() {
   is_done author && { log "author: done"; return; }
-  [[ -d "${CORPUS}" && -d "${SNAPSHOT}" ]] || die "author needs --corpus DIR and --snapshot DIR (the verified target snapshot)"
-  run "${REFRESH_PYTHON:-python3}" "${ROOT}/tools/stitch-prompts.py" --corpus "${CORPUS}" --snapshot "${SNAPSHOT}" \
-    --label "${LABEL}" --count "${COUNT}" --out "${GEN}/prompts" --ledger "${PRIV}/refresh/ledger.json"
+  if [[ -n "${TEXTS}" ]]; then
+    [[ -d "${SNAPSHOT}" ]] || die "author with --texts needs --snapshot DIR (the verified target snapshot)"
+    [[ -d "${TEXTS}" ]] || die "author: no --texts directory ${TEXTS}"
+    local chats=() n text
+    for n in "${NAMES[@]}"; do
+      text="${TEXTS}/${n}.txt"
+      [[ -f "${text}" ]] || die "author: no ${text}"
+      chats+=("${n}=${text}")
+    done
+    run "${REFRESH_PYTHON:-python3}" "${ROOT}/tools/author-prompts.py" --snapshot "${SNAPSHOT}" \
+      --out "${GEN}/prompts" --chat "${chats[@]}"
+  else
+    [[ -d "${CORPUS}" && -d "${SNAPSHOT}" ]] || die "author needs --corpus DIR and --snapshot DIR (the verified target snapshot)"
+    run "${REFRESH_PYTHON:-python3}" "${ROOT}/tools/stitch-prompts.py" --corpus "${CORPUS}" --snapshot "${SNAPSHOT}" \
+      --label "${LABEL}" --count "${COUNT}" --out "${GEN}/prompts" --ledger "${PRIV}/refresh/ledger.json"
+  fi
   [[ "${DRY}" == 1 ]] && return
   for n in "${NAMES[@]}"; do [[ -f "${GEN}/prompts/${n}.tokens.json" ]] || die "author: no ${n}.tokens.json"; done
+  if [[ -n "${TEXTS}" ]]; then
+    for n in "${NAMES[@]}"; do cp "${TEXTS}/${n}.txt" "${GEN}/prompts/"; done
+  fi
+  printf '%s\n' "${COUNT}" > "${GEN}/count"
   mark author
 }
 
