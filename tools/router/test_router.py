@@ -599,7 +599,8 @@ class NegBootFailVariantTest(unittest.TestCase):
             text = resident.read_text()
             self.assertIn("acceptance-test variant: refusing to boot", text)
             self.assertIn("return 1", text)
-            self.assertLess(text.index("return 1"), text.index("loading the model"))
+            self.assertLess(text.index("return 1", text.index("acceptance-test variant: refusing to boot")),
+                            text.index("loading the model"))
             py_compile.compile(str(resident), doraise=True)
             self.assertEqual(
                 note, "candidate resident exits at boot (exercises the pair-1 boot retry and teardown)")
