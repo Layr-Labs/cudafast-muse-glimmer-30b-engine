@@ -9,10 +9,12 @@ This repository keeps the rule set of
 
 ## 1. What carried over unchanged
 
-- **Scoring:** composite `prefill^0.25 * decode^0.75`, 2 pairs, per-box paired
+- **Scoring:** composite `prefill^0.25 * decode^0.75`, per-box paired
   baseline, floors 0.95 and ceiling 5.0, batch size 1, 128 decode steps, the
-  10% token-tolerance gate, and depths 1 to 6. (The seed is 4096 tokens here,
-  not 1024; see section 7.7.)
+  10% token-tolerance gate, and depths 1 to 6. (Now: 3 pairs, one per live
+  golden, the score the mean of the per-pair composites, and a 496-token chat
+  seed. The 2-pair, 4096-token setup of sections 7.7 to 7.11 is history; see
+  section 7.14.)
 - **The surface:** Engine Protocol v1 and the adapter's verb logic, counters
   and fail-closed checks (`harness/protocol-adapter/src/{protocol,adapter,engine,mock,tests,resident}.rs`).
 - **The resident:** the resident socket wire and the per-leg
@@ -89,27 +91,29 @@ holds the first three in CI.
 
 ## 5. Open items (external)
 
+State on 2026-10-20 (section 7.14 has the record).
+
 1. **benchd — Layr-Labs bench-dev `main`.** `tools/fetch-benchd.sh` pins dist
-   commit `673cdfc` (bench pull request 399), built from source `ff98ea4`, and
-   refuses any other `source_commit`. The source has main `ecd66fe` and the two
-   changes this track needs (bench pull request 386): the 60 °C GB10 cool gate and the fixture-declared
-   median of several timed prefill passes (section 7.7). The track used the
-   GumbiiDigital fork (`gumbii/nemotron35-own`) until 2026-10-07. Section 7.13
-   lists what changed when it moved.
-2. **Goldens — recorded, pinned and staged.**
-   The 56 live-pool goldens (8 prompts, each a serial golden plus six
-   per-depth oracles) and the public golden are recorded, pinned and staged on
-   the boxes (sections 7.4, 7.7 and 7.10). R2 is not used: the live pool is
-   kept on the jump box and the held-out pool in the organizer archive (see
+   commit `43a9a1642cc22c3fb2f71b9c707699cd3a9602c7` (bench pull request 425),
+   built from source `b65af98c2a060df12f2ced849c68528b825fecdb`, and refuses
+   any other `source_commit`. The source adds the stricter sealing of bench
+   pull requests 421 to 424 to the cool gate and prefill median of section
+   7.13. A no-cache rebuild matches the dist byte for byte
+   ([reproduce.md, section 1](reproduce.md#1-rebuild-benchd-from-source)).
+2. **Goldens — recorded, pinned and staged.** The live pool is `pool-9`,
+   `pool-10` and `pool-11`: three 496-token chat-template coding prompts, each
+   a serial golden plus six per-depth oracles, 21 files pinned in the fixture
+   (PR #33). They are staged on spark-1 to spark-4 and on the jump box. R2 is
+   not used: the live pool is kept on the jump box, and the held-out pool and
+   the prompt texts in the organizer archive (see
    docs/pool-refresh-and-final-rescore.md, "Where the goldens live").
-3. **`baseline_reference_commit` — pinned.** The repository is published
-   (private) as `GumbiiDigital/cudafast-nemotron35-lightning-30b-a3b-engine`.
-   The fixture pins the reference tree at `3a9a41c`, whose engine paths
-   (harness, vllm, serve-up, the MTP manifest) are identical to the tree the
-   round-3 calibrations measured (`4e4c0be`).
-4. **Timing noise — addressed; see section 7.7 for the calibration.** The
-   seed is 4096 tokens, and the prefill phase is one warm-up pass followed by
-   the median of five timed passes. The gate is 60 °C.
+3. **`baseline_reference_commit` — pinned** at
+   `5be35aa395283b14d1887cec70a37d6e6bdeac9c` (2026-10-07, the resident
+   phase-close fix), in this repository.
+4. **Timing noise — addressed.** The prefill phase is one warm-up pass followed
+   by the median of five timed passes, and the gate is 60 °C (section 7.7).
+   Every box is calibrated with a CV limit of 2% (`calibration_max_cv_percent`,
+   PR #34); the measured CVs are all under 1% (section 7.14).
 5. **GB10 temperature — resolved.** `nvidia-smi` reports a GPU temperature on
    all eight Sparks, and the cool gate is 60 °C (section 7.5).
 6. **Logit ties — open.** The current benchd has no timed reference replay, so
@@ -644,6 +648,9 @@ good draws reached the ranking. All three are fixed and tested on the boxes.
 
 ### 7.13 benchd moves from the fork to Layr-Labs bench main (2026-10-07)
 
+(History. Section 7.14 supersedes the pin and the sealing rows below: since
+PR #35 the pinned benchd has the stricter sealing again.)
+
 - **What changed.** `tools/fetch-benchd.sh` resolves Layr-Labs bench-dev
   `main`, dist `e4e3110`, source `44f1fda`. Before, it resolved the
   GumbiiDigital fork, branch `gumbii/nemotron35-own`, dist `a8fafeb`, source
@@ -672,3 +679,120 @@ good draws reached the ranking. All three are fixed and tested on the boxes.
 - **Fixture parse check.** `bench-core` at `44f1fda` parses the fixture and
   certifies it: `official_pair_combine` = mean, 3 pairs, 5 timed prefill passes
   and 1 warm-up, floors 0.95, bands 5% prefill and 3% decode (up only).
+
+### 7.14 Dev refresh and ranked acceptance (2026-10-19/20)
+
+The commands for benchd, the goldens, calibration and a ranked score are in
+[reproduce.md](reproduce.md). The depth runs and the load test used the
+workflow on test branches and `tools/router/loadgen.py --hours 3 --seed 20260927
+--backlog 4` on the router (`tools/router/README.md`).
+
+- **Change ledger** (all merged into this repository's `main` with signed
+  merge commits).
+
+  | PR | Merge | Change |
+  |---|---|---|
+  | #28 | `1c94f52` | measure-and-score retries a pair-1 serial-control boot failure once, then exits 75 (contract section 5.5) |
+  | #30, #31, #32 | `3063107`, `ea3e0d9`, `c4b03d4` | README: the ranked box toolchain, how to submit; docs: the score artifact upload, the sealing, the fleet state |
+  | #33 | `78c0067` | new `pool-9/10/11` goldens: the organizer's own three coding prompts, same names and 496-token length; only the 21 pins change |
+  | #34 | `49b5068` | the calibration CV limit is the fixture field `calibration_max_cv_percent`, set to 2.0 (it was a fixed 1% in benchd; a spark-3 calibration was refused at 1.20%) |
+  | #35 | `c1ef8de` | benchd pin: bench-dev dist `43a9a16` (bench PR 425), source `b65af98`, which adds bench PRs 421-424 (engine text, audit fields, hello identity and engine-derived numbers kept out of the sealed output) and the fixture CV limit |
+  | #36 | `e9dfccb` | the organizer router records a pair-1 serial-control boot failure as `control_failed` (infrastructure); a `neg_boot_fail` load-test variant |
+  | #37 | `c39f90c` | `tools/pool-refresh.sh --count` (default: the fixture's `live_goldens`) and `--texts` (chat prompts); the count persists across resumed steps |
+
+- **Pinned execution set.** Engine image `vllm/vllm-openai:v0.27.1` @
+  `sha256:1c8e60a0…b228c`; snapshot `bee75962…16b8`; reference tree
+  `5be35aa`; benchd dist `43a9a16` / source `b65af98`; 3 pairs, one per live
+  golden, mean of the per-pair composites; seed 496 tokens; 1 warm-up and the
+  median of 5 timed prefill passes; 128 decode steps; floors 0.95, ceiling
+  5.0; control health band 5% prefill and 3% decode (slow side only).
+
+- **benchd rebuild.** A no-cache rebuild of the Linux aarch64 pair from source
+  `b65af98` (`scripts/build-dist-linux.sh`, 2026-10-20) gave `benchd` sha256
+  `ff4017e9…338c` (3,898,160 bytes) and `record-correctness-golden`
+  `bbe18e01…c596` (1,640,408 bytes), equal to the published dist.
+
+- **Live pool and custody.** Three coding tasks (Python, Rust, TypeScript),
+  each one user message through the pinned chat template, exactly 496 tokens
+  (`tools/author-prompts.py --chat`). Recorded on spark-3 and spark-4
+  (serial plus MTP 1 to 6): 21 files, byte-identical on both boxes, pinned by
+  #33. Input hashes are in reproduce.md, section 2. The texts, token files
+  and goldens are in the organizer archive; the live goldens are also on the
+  jump box. On 2026-10-20 the copies on spark-1 to spark-4 and the jump box
+  were checked: the same 21 files on all five.
+  On 2026-10-20 the pool was recorded again from the same token files, with
+  the pinned benchd `b65af98`, on spark-4 and spark-2: all 21 files equal the
+  fixture pins on both boxes.
+
+- **Calibration** (version 3, 3 passes, reference `5be35aa`, benchd
+  `b65af98`). CV in % (prefill / decode):
+
+  | Box | Runner name | pool-9 | pool-10 | pool-11 |
+  |---|---|---|---|---|
+  | spark-1 | `nemotron35-box-spark-ab31` | 0.32 / 0.27 | 0.80 / 0.69 | 0.27 / 0.25 |
+  | spark-2 | `spark-2` | 0.57 / 0.91 | 0.14 / 0.53 | 0.62 / 0.19 |
+  | spark-3 | `nemotron35-box-spark-5e49` | 0.65 / 0.36 | 0.47 / 0.23 | 0.36 / 0.36 |
+  | spark-4 | `nemotron35-box-spark-7829` | 0.64 / 0.08 | 0.56 / 0.19 | 0.43 / 0.43 |
+
+  The box name must be the runner name: a band captured as `spark-4` was
+  refused by the preflight on the runner `nemotron35-box-spark-7829`, and the
+  box was recalibrated under that name.
+
+- **Ranked acceptance** (unchanged engine, `main` declares MTP depth 3).
+
+  | Run | Box | Result |
+  |---|---|---|
+  | dev repository 39448053054, `c1ef8de` | spark-2 | every step succeeded; `passed: true`, score 1.3099; decode gain 1.445, prefill gain 0.980; artifact uploaded |
+  | organizer test repository 39448081400, same tree | spark-1 | `passed: true`, score 1.3095 |
+  | organizer test repository, depths 1 to 6 | spark-3, spark-4 | 1.164 / 1.114 / 1.316 / 1.189 / 1.131 / 1.104, all pass correctness |
+  | organizer test repository 39373190899, wrong tokens | spark-4 | refused, no score |
+  | Yukon participant test: submission 09da1f4f to the dev row, depth 2, built by Yukon as `80581d1` on `main` `c39f90c`; dev run 39519754376 | spark-2 | `passed: true`, score 1.0970; artifact = reveal line; Yukon: "did not improve current best" |
+
+  The same engine scored 1.4376 to 1.4427 on this repository before #33 (four
+  runs on the previous prompts). The pool changed, not the engine: the MTP
+  decode gain depends on the text the head drafts.
+
+- **Held-out final pool.** The September pool (8 stitched prompts, 4096
+  tokens) did not fit the 3-pair, 496-token fixture, so it was retired. The
+  new pool is three organizer-written coding tasks (`final-1` Go, `final-2`
+  TypeScript, `final-3` Python), each exactly 496 tokens through the chat
+  template. Recorded on 2026-10-20 on spark-4 and spark-2 at `c1ef8de` with
+  benchd `b65af98`: 21 goldens, byte-identical on both boxes. It is kept in
+  the organizer's private state and archive and is not on any golden
+  directory of a box; the rescore reads its `pins.json`.
+
+- **Load test** (2026-10-20 16:21-19:21 UTC, then drain; `tools/router/loadgen.py`
+  seed 20260927, backlog 4, base = dev `c1ef8de`; organizer test repository;
+  spark-1, spark-3 and, from 17:35, spark-4).
+
+  | Variant | Outcome |
+  |---|---|
+  | null (unchanged engine) | 11 pass: mean 1.3142, sd 0.0043, range 1.3077 to 1.3216; per box 1.3106 (spark-1), 1.3140 (spark-3), 1.3181 (spark-4) |
+  | MTP | 3 pass (1.1535, 1.3102, 1.1016) |
+  | trusted paths smuggled | 1 pass (1.3124): the router dropped the paths |
+  | 3 MB file | 2 refused by the static review |
+  | Marlin | 3 failed correctness |
+  | CUDA graphs | 1 failed correctness |
+  | garbage | 1 failed correctness (the fixture has no timed replay, so a token mismatch is the refusal) |
+
+  22 jobs finished and 4 expired unrun at the window's end. No
+  infrastructure failure (no `infra_failed`, `control_failed`, `band_refused`
+  or `unsealed`). The Marlin and CUDA-graphs variants are measured, not
+  expected to pass; under the exact-match timed window they now fail
+  correctness, where in the September soak (4096-token seed, timed replay) most
+  CUDA-graphs runs passed. A dev-row baseline on spark-2 the same evening
+  scored 1.2911 (Yukon run 39511022143), 1.4% under the spark-2 run of the
+  morning; not yet explained.
+
+- **Checks.** At `c1ef8de`, on spark-4 (and the Mac and KodaBox for the three
+  checks whose tools spark-4 lacks): adapter `cargo fmt`, `clippy -D
+  warnings`, `cargo test` and the release build; the resident and router unit
+  tests; the manifest lint; `check-doc-consistency.py`; the workflow egress
+  scan; and every `tools/test-*.sh` and box-runner test. All pass. The
+  preflight's section 8 paired-baseline cases need a checkout with history
+  (they skip in an archive copy) and pass in a full clone.
+
+- **Limits.** Branch
+  protection on `main` is the org's signed-commit ruleset only. The organizer
+  archive is a private repository; a reviewer needs read access to it to
+  check the prompt texts.

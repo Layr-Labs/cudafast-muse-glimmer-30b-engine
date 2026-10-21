@@ -18,7 +18,7 @@ single stream, without changing what the model computes.
 | **Engine** | vLLM v0.27.1 in a pinned container; teams edit `vllm/`, `harness/` and the speculation depth |
 | **Score** | `prefill_gain^0.25 × decode_gain^0.75`, each gain measured against a trusted reference run on the same box, same prompt, same job |
 | **Correctness** | output must match the reference golden within a 10% token budget; the timed decode window must match its per-depth oracle exactly |
-| **Fairness** | an unchanged engine scores 0.996 on average (sd 0.005, all 8 boxes) |
+| **Fairness** | run-to-run spread is small: the unchanged engine (MTP 3) scores 1.314 on average, sd 0.004 (11 runs, 3 boxes, 2026-10-20); the reference against itself scored 0.996, sd 0.005 (September soak, 8 boxes) |
 | **Integrity** | sandboxed, network-less execution; hidden prompts rotated every 3–4 days; final ranking re-measured on a held-out pool |
 | **Track** | `nemotron3.5-lightning-30b-a3b-cuda-v1` |
 
@@ -223,8 +223,8 @@ run blocks the upload. Run `yukon run` yourself before you submit.
 | MTP head | the `mtp.*` tensors inside `model-00052-of-00052.safetensors` (BF16, 2,670,652,160 bytes) |
 | Engine source | vLLM `v0.27.1` @ `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` |
 | Engine image | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` (arm64) |
-| benchd | the channel manifest `tools/fetch-benchd.sh` resolves |
-| Goldens | `timed_prompt_pool`, `hidden_correctness_golden` and `speculative_oracles` in the fixture (staged on each box, never committed; see [OVERVIEW.md](OVERVIEW.md)) |
+| benchd | `Layr-Labs/mlxfast-bench-dev` dist `43a9a1642cc22c3fb2f71b9c707699cd3a9602c7`, built from source `b65af98c2a060df12f2ced849c68528b825fecdb` (`PINNED_COMMIT` and `PINNED_SOURCE_COMMIT` in `tools/fetch-benchd.sh`); the dist's `dist/linux-aarch64/benchd.manifest.json` pins each binary's sha256 and bytes |
+| Goldens | `timed_prompt_pool[]` (the 3 serial goldens that `live_goldens` names: `pool-9`, `pool-10`, `pool-11`, three 496-token chat-template coding prompts), `speculative_oracles` (18 per-depth oracles) and `hidden_correctness_golden` (the `pool-9` serial pin) in the fixture: 21 files pinned by sha256 and bytes (staged on each box, never committed; see [OVERVIEW.md](OVERVIEW.md)) |
 
 ## The ranked run
 
@@ -306,7 +306,11 @@ failure there fails the submission before any scoring.
 3. **Stage the reference tree** on every box with
    `tools/stage-baseline-workspace.sh`, at the fixture's
    `baseline_reference_commit`.
-4. **Calibrate every box** with `tools/calibrate-box.sh <box> <out>`.
+4. **Calibrate every box** with `tools/calibrate-box.sh <runner name> <out>`
+   (3 passes; the box name must be the box's runner name, which the ranked
+   job passes as `--box`). Every per-prompt CV must be at most the fixture's
+   `calibration_max_cv_percent` (2%), or the file gets no band
+   ([reproduce, section 3](docs/reproduce.md#3-recalibrate-a-box)).
 5. **Arm the track:** set `official_scoring_enabled: true` once the null
    control lands at about 1.000 ([contract, section 5.5](docs/participant-contract.md#55-arming)).
 6. **Run the contest.** The intake service dispatches `benchmark.yml` once per
@@ -332,4 +336,5 @@ engineering log) records the cluster verification and the load-test findings.
 | What a submission may contain, and who enforces it | `docs/submission-restriction-spec.md` |
 | Pool refresh and final re-score | `docs/pool-refresh-and-final-rescore.md` |
 | How this track was derived, and what was measured | `docs/nemotron35-port-notes.md` (engineering log) |
+| How to reproduce benchd, the goldens, a calibration and a ranked score | `docs/reproduce.md` |
 | What a measured run executes | benchd, resolved from the pinned channel by `tools/fetch-benchd.sh` |

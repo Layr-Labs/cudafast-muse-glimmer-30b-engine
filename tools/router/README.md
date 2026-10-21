@@ -24,12 +24,14 @@ submission's goal (`router.py` `EXPECT`):
 |---|---|
 | `pass` | `pass` |
 | `replay_rejected` | `replay_rejected` |
+| `boot_failed` | `boot_failed` (the candidate resident did not boot; load-test variant `neg_boot_fail`) |
 | `refused` | `surface_refused`, `preflight_refused`, `refused`, `unsealed`, `watchdog_timeout` |
 | `measure` | any terminal outcome (acceptance load test) |
 
 Team-side failures after participant code ran include **`unsealed`** (no valid
 sealed score after Setup) and **`watchdog_timeout`** (router watchdog cancelled
-the run). Manual **`cancelled`** is infrastructure.
+the run). Manual **`cancelled`** is infrastructure. So is **`control_failed`**: the reference
+(serial-control) leg diverged twice, or failed to boot twice in pair 1.
 
 Requirements: the `gh` CLI logged in with `repo` scope, SSH push access to the
 repository, and a base branch whose fixture is armed.

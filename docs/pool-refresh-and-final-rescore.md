@@ -16,7 +16,8 @@ speed-up. Three layers limit the damage:
    the fixture's `live_goldens`, one pair per prompt, and scores the mean of
    the per-pair composites.
 2. **Pool refresh every 3-4 days** (4 refreshes in two weeks): the live pool is
-   replaced by 8 prompts no submission has seen.
+   replaced by a new generation of the same size (now 3 prompts) that no
+   submission has seen.
 3. **Final re-score**: at the close, the top submissions are re-measured on a
    held-out pool that was never staged on a box during the contest. The final
    ranking comes only from this. Anything leaked during the contest is worth
@@ -24,7 +25,19 @@ speed-up. Three layers limit the damage:
 
 ## Prompt generation (both the refresh and the held-out pool)
 
-Prompts must not be recoverable from a leaked fragment. The first live pool's
+**Current form (since 2026-10-19): organizer-written chat prompts.** The live
+pool (`pool-9`, `pool-10`, `pool-11`) and the held-out `final` pool are coding
+tasks, each written as one user message and rendered through the snapshot's
+pinned chat template with thinking off. `tools/author-prompts.py --chat`
+renders each text and refuses any rendering that is not exactly `seed_tokens`
+(496) ids; a chat prompt is never trimmed, so the organizer edits the text
+until it fits. `tools/pool-refresh.sh --texts DIR` runs this step for a
+generation (`DIR/<label>-<n>.txt`). Each new text must be a task not used in
+any earlier generation; the texts, their token files and their hashes go to
+the organizer archive ([reproduce.md, section 2](reproduce.md#2-re-record-the-hidden-goldens)).
+
+**Earlier form: stitched book passages** (the 4096-token pools of September,
+and the default of `tools/pool-refresh.sh` without `--texts`). The first live pool's
 prompts are single passages of public-domain books, so a few leaked tokens
 identify the book and therefore the whole prompt. New prompts are **stitched**:
 
@@ -44,12 +57,14 @@ identify the book and therefore the whole prompt. New prompts are **stitched**:
 
 Idempotent steps, each refusing on any mismatch:
 
-1. **Author**: 8 stitched prompts for the next generation (above).
+1. **Author**: N prompts for the next generation (above). N is `--count`,
+   by default the number of `live_goldens` in the fixture (3 now); use
+   `--texts DIR` for chat prompts.
 2. **Record**: serial golden plus MTP-1…6 oracles for every prompt
-   (8 × 7 = 56 goldens), spread across the fleet with `tools/record-goldens.sh`,
+   (N × 7 goldens, 21 for 3 prompts), spread across the fleet with `tools/record-goldens.sh`,
    each one on **two** boxes and required to be byte-identical (the engine is
    deterministic; a mismatch means a broken box or engine).
-3. **Stage**: install the new goldens next to the current ones on all 8 boxes
+3. **Stage**: install the new goldens next to the current ones on every box of `REFRESH_BOXES`
    (`/srv/nemotron35/goldens`, root:bench 0750), verified by sha256. The old
    generation stays in place, so in-flight jobs are unaffected.
 4. **Pin and switch**: one commit to the trusted fixture that pins the new
@@ -63,29 +78,37 @@ Idempotent steps, each refusing on any mismatch:
    goldens from the boxes; keep a private archive (for disputes).
 
 Timing: fleet time is spent in step 2 (and a short drain). The script
-records its progress so a crash resumes where it stopped. It never touches the
-calibration (see below).
+records its progress so a crash resumes where it stopped. The script itself
+never calibrates; the organizer does, between stage and pin (below).
 
 Calibration: the box calibration file carries one band per live golden
 (`tools/calibrate-box.sh`), and benchd gates each control leg with the band of
-the prompt it measured. A new generation has no bands yet, so every box must be
-calibrated again on the new live goldens before the pin commit is pushed;
-otherwise the ranked preflight refuses every job. The pin step also refuses an
+the prompt it measured. A new generation has no bands yet, so after the stage
+step every box must be calibrated again on the new live goldens
+([reproduce.md, section 3](reproduce.md#3-recalibrate-a-box)), and the new
+files installed, before the pin commit is pushed; otherwise the ranked
+preflight refuses every job. The pin step also refuses an
 `official_pairs` that is not a multiple of the generation size, because every
 job measures every live golden.
 
 ## Final re-score (`router.py rescore`, operator-run at the close)
 
-1. **Held-out pool**: generation `final` is authored and recorded: 8 stitched
-   prompts × 7 goldens = 56 goldens, each agreed byte for byte by two boxes.
+1. **Held-out pool**: generation `final` is authored and recorded: 3
+   organizer-written 496-token coding prompts × 7 goldens = 21 goldens,
+   agreed byte for byte by two boxes (spark-4 and spark-2, 2026-10-20). It
+   replaces the September pool of 8 stitched 4096-token prompts, which does
+   not fit the 3-pair, 496-token fixture.
    It is kept off the boxes: goldens and prompts live only in
-   `.mlxfast-private/final/` on the organizer workstation (never in git, never
-   staged, never pinned in a pushed fixture) until the close; the box-side
-   recordings were deleted.
+   `.mlxfast-private/final/` on the organizer workstation and in the organizer
+   archive (never in git, never staged, never pinned in a pushed fixture)
+   until the close; the box-side recordings are deleted after the two-box
+   check. The pool must have as many prompts as `official_pairs` (or a
+   divisor of it), because the re-score fixture makes it the `live_goldens`.
 2. **Freeze**: at the deadline the router stops accepting submissions.
 3. **Select**: for each team, its best submission by mean contest score over
    runs that scored or failed because of the submission (a team failure counts
-   as 0.0; infrastructure runs are excluded). Ties go to the most recent
+   as 0.0; a post-setup `control_failed` or `band_refused` run also counts as
+   0.0; other infrastructure runs are excluded). Ties go to the most recent
    submission; then the top N teams (N set by the organizer; default 10).
 4. **Stage and pin**: stage the `final` goldens on all boxes; build a
    `rescore/base` branch = the contest's final base plus one fixture commit
@@ -119,8 +142,9 @@ job measures every live golden.
 
 ## Checks
 
-- A generated prompt never contains a paragraph that appears in any earlier
-  generation or in the held-out pool (the generator refuses reuse).
+- A stitched prompt never contains a paragraph that appears in any earlier
+  generation or in the held-out pool (the generator refuses reuse). A chat
+  prompt is a new task, checked by the organizer against the archive.
 - The refresh never stages the `final` generation; the rescore refuses to run
   if any `final` golden was ever staged before the freeze (the staging log is
   the evidence).
@@ -142,7 +166,7 @@ from the jump box, verify with `sha256sum -c SHA256SUMS`.
 
 ## Runbook (organizer commands, from the organizer workstation's checkout)
 
-Tools: `tools/stitch-prompts.py` (authoring), `tools/pool-refresh.sh` (refresh),
+Tools: `tools/author-prompts.py --chat` or `tools/stitch-prompts.py` (authoring), `tools/pool-refresh.sh` (refresh),
 `tools/router/router.py freeze|rescore|rescore-retry|rescore-report`. Private state lives
 under `.mlxfast-private/`: `refresh/<label>/` per generation (state file,
 prompts, provenance, per-box recordings, agreed goldens, `pins.json`),
@@ -150,7 +174,7 @@ prompts, provenance, per-box recordings, agreed goldens, `pins.json`),
 used) and `refresh/staging.log` (every golden installed on a box, with time).
 
 Box-side assumptions (override by env): boxes `spark-1`…`spark-8`
-(`REFRESH_BOXES`), checkout `~/nemotron35/repo` (`REFRESH_BOX_REPO`, must be at a
+(`REFRESH_BOXES`; the current fleet is `spark-1 spark-2 spark-3 spark-4`), checkout `~/nemotron35/repo` (`REFRESH_BOX_REPO`, must be at a
 commit that has `record-goldens.sh --only`), goldens `/srv/nemotron35/goldens`
 (`REFRESH_BOX_GOLDENS`), snapshot `REFRESH_BOX_SNAPSHOT`, GPU lock
 `/tmp/mtplx-gpu-exclusive.lock`. Stitching needs the `tokenizers` package:
@@ -160,17 +184,28 @@ commit that has `record-goldens.sh --only`), goldens `/srv/nemotron35/goldens`
 contest; kept for a replacement pool or the next contest).
 
 ```bash
-tools/pool-refresh.sh --label final --dry-run --corpus .mlxfast-private/corpus --snapshot <SNAPSHOT>
-tools/pool-refresh.sh --label final --corpus .mlxfast-private/corpus --snapshot <SNAPSHOT>
+tools/pool-refresh.sh --label final --dry-run --texts <DIR with final-1..3.txt> --snapshot <SNAPSHOT>
+tools/pool-refresh.sh --label final --texts <DIR with final-1..3.txt> --snapshot <SNAPSHOT>
 # -> .mlxfast-private/final/{prompts,goldens,pins.json}; nothing is staged or pinned
 ```
 
 **Each refresh (every 3-4 days), generation g<N>:**
 
 ```bash
-tools/pool-refresh.sh --label g2 --dry-run --corpus .mlxfast-private/corpus --snapshot <SNAPSHOT>
-tools/pool-refresh.sh --label g2 --corpus .mlxfast-private/corpus --snapshot <SNAPSHOT>
-#   author -> record (56 goldens x 2 boxes, byte-identical) -> stage (all boxes) -> pin
+tools/pool-refresh.sh --label g2 --dry-run --texts <DIR with g2-1..3.txt> --snapshot <SNAPSHOT>
+tools/pool-refresh.sh --label g2 --step author --texts <DIR> --snapshot <SNAPSHOT>
+tools/pool-refresh.sh --label g2 --step record
+tools/pool-refresh.sh --label g2 --step stage
+#   bands for the NEW prompts: calibrate against a proposed fixture, not the live one
+cp fixtures/nemotron35_lightning_30b_a3b_track.json /tmp/next-fixture.json
+tools/pool-refresh.sh pin-fixture /tmp/next-fixture.json g2 .mlxfast-private/refresh/g2/pins.json
+#   copy /tmp/next-fixture.json to every box, then on each box:
+#   tools/calibrate-box.sh <runner name> <new file> --fixture <next-fixture> --passes 3
+#   keep the old calibration in place until the switch: the live fixture needs its bands
+tools/pool-refresh.sh --label g2 --step pin
+#   at the switch: drain (no job queued or running), install every box's new
+#   calibration file, then push the pin commit
+#   record: 21 goldens x 2 boxes, byte-identical
 #   a crash or a failed box: fix it and re-run the same command; finished work is skipped
 #   one step alone: --step author|record|stage|pin|verify|retire
 # review the fixture diff, then run the printed commands:
@@ -190,6 +225,16 @@ jobs queued at the old commit keep passing. The ranked preflight tolerates
 unpinned `g<N>-*` goldens (staged ahead of their pin) and nothing else, so a
 `final-*` golden on a box before the close fails every job.
 
+**On Yukon** this track is a scalar row with a GitHub Actions runner, so every
+new submission is built on the tip of the row's branch (Yukon
+`src/execution/github-actions.ts`: `pinSource` is set only for Pareto rows).
+A pin commit pushed to `main` therefore reaches the next Yukon submission
+without any change to the row; the submission test of 2026-10-21 was built
+on the then-current `main`. A pin push does not recompute the baseline
+or past submission scores. Winning submissions can update the current best.
+To recompute the baseline and replay eligible submissions, pause, drain, and
+call `POST /api/benchmarks/<id>/reorg`.
+
 The armed base branch is the branch the dispatcher overlays submissions onto.
 Its name is configurable: `router.py --base` for the router and
 `REFRESH_ARMED_BASE` for the refresh script (both carry a default in the code;
@@ -206,6 +251,11 @@ determinism probe), delete that job's `done job <key>` line from
 tools/router/router.py freeze
 tools/router/router.py status        # wait until nothing is queued, dispatched or running
 tools/pool-refresh.sh --label final --step stage --final-after-freeze ~/nemotron35-router/FROZEN
+#   bands for the final prompts: a private proposed fixture, then every box
+cp fixtures/nemotron35_lightning_30b_a3b_track.json /tmp/final-fixture.json
+tools/pool-refresh.sh pin-fixture /tmp/final-fixture.json final .mlxfast-private/final/pins.json
+#   on each box: tools/calibrate-box.sh <runner name> <file> --fixture <final-fixture> --passes 3,
+#   install the file at the runner's MLXFAST_BASELINE_CALIBRATION
 tools/router/router.py rescore --base-ref origin/main --top 10 --runs 5
 git -C ~/nemotron35-router/clone push origin rescore/base   # as printed; the sub/ branches carry it anyway
 # repeat until rescore-report is complete (no incomplete teams):

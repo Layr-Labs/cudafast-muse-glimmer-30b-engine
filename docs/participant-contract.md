@@ -345,14 +345,17 @@ gates each control leg with the band of the prompt that leg measured.
 | `scoredBatchSize` | 1 |
 | `prefillGainExponent` | 0.25 |
 | `decodeGainExponent` | 0.75 |
-| `pairsPerCohort` | 2 |
-| `minPairsPerCohort` | 2 |
+| `pairsPerCohort` | 3 |
+| `minPairsPerCohort` | 3 |
 | `decodeSpeedupFloor` | 0.95 |
 | `prefillSpeedupFloor` | 0.95 |
 | `decodeSpeedupCeiling` | 5.0 |
 | `kvBackend` | `vllm-paged` |
 
-There is no median. The floors and the ceiling apply to the aggregate gains.
+The score is the mean of the three per-pair composites
+(`official_pair_combine`: `mean`). The floors and the ceiling gate every pair.
+Timed prefill is the median of five passes after one unmeasured warm-up pass
+(`official_prefill_timed_runs` = 5, `official_prefill_warmup_runs` = 1).
 
 ### 5.4 Token fidelity
 
@@ -396,27 +399,34 @@ leg's resident itself, from that leg's own tree, with
 `tools/serve-up.sh --boot --spec serial|mtp --draft-len N --socket-out FILE`,
 and stops it with `--stop --socket PATH`.
 
-A control leg that fails (`SERIAL-CONTROL-LEG-FAILED`) is never your fault,
-and the router records it as `control_failed`, an infrastructure outcome, not
-a failed submission. The measurement driver keeps one retry budget per job.
+A control leg that fails (`SERIAL-CONTROL-LEG-FAILED`) is not a fault of your
+code, and the router records it as `control_failed`. How it counts: in the
+contest, a finished post-setup `control_failed` or `band_refused` run counts
+as 0.0 toward selection, with no automatic re-dispatch; in the final re-score
+its slot is re-dispatched, and it counts as 0.0 only if it still fails after
+the retries (section 5.7). A serial-control boot failure in a later pair is
+final (`refused`). The measurement driver keeps one retry budget per job.
 It re-runs the whole measurement, both legs of every pair, exactly once when
-either (1) the reference's own token divergence
+one of three causes fires: (1) the reference's own token divergence
 (`SERIAL-CONTROL-LEG-FAILED: benchmark prefill|free-run decode seed|free-run
-decode token mismatch`, in the timed or the warm-up leg), or (2) the pair-1
+decode token mismatch`, in the timed or the warm-up leg); (2) the pair-1
 candidate resident fails to boot before any candidate timing is sealed
-(`LEG-SERVE-BOOT-FAILED: the candidate leg's ...` with an empty
-`metrics.paired_legs` audit trail). A pair-2 candidate boot failure is never
+(`LEG-SERVE-BOOT-FAILED: the candidate leg's ...` with an empty or absent
+`metrics.paired_legs` audit trail); or (3) the pair-1 serial-control resident
+fails to boot (`LEG-SERVE-BOOT-FAILED: the serial-control leg's ...`, with an
+empty or absent `metrics.paired_legs`). A boot failure in a later pair is never
 retried: pair 1 is already in `paired_legs`, so a second attempt would be a
 best-of-two on your engine. Whichever cause fires first consumes the budget;
-a control divergence on attempt 1 followed by a pair-1 boot failure on attempt
-2 is final. In every retriable case the driver wipes the sandbox, including
-all five per-job directories, before the second run. The second attempt alone
-is the result; the first attempt's timings are discarded, never compared. A
-second control-leg token divergence exits 75. Every other failure is final,
-including every other control-leg failure (spawn, session, protocol, cool
-gate, memory), because pair 2's control leg runs after your leg. The log
-records `control_leg_attempts=1` or `2`; the sealed `score.json` does not
-change.
+for example, a control divergence on attempt 1 followed by a pair-1 boot
+failure on attempt 2 is final. In every retriable case the driver wipes the
+sandbox, including all five per-job directories, before the second run. The
+second attempt alone is the result; the first attempt's timings are discarded,
+never compared. A second control-leg token divergence, or a second pair-1
+serial-control boot failure, exits 75 (an infrastructure outcome), and the router records it as `control_failed`. Every other failure
+is final, including every other control-leg failure (spawn, session,
+protocol, cool gate, memory), because the next pair's control leg runs after
+your leg. The log records `control_leg_attempts=1` or `2`; the sealed
+`score.json` does not change.
 
 #### 5.5.1 The per-box calibration
 
@@ -432,8 +442,8 @@ these cases:
 
 - its `version` is not 3. Versions 1 and 2 recorded decode as the whole window
   (seed prefill plus decode, over N), and the refusal says to recalibrate;
-- it names another track, box or reference commit, or a prompt other than the
-  fixture's `calibration_prompt`;
+- it names another track, box or reference commit, or it has no `prompts[]`
+  entry for one of the fixture's `live_goldens` (one band per live golden);
 - it is dated before the reference commit or in the future;
 - its band cannot fail.
 
@@ -457,8 +467,8 @@ cannot change.
 | `correctness_prompts/public_longcopy_gate_english_4096.txt` | git | Yes: the public prompt text |
 | `correctness_prompts/public-longcopy-gate-english-496.golden.json` | git | Yes: for local serial runs |
 | `correctness_prompts/public-longcopy-gate-english-496.mtp<N>.golden.json`, one per depth 1 to 6 | git | Yes: for local runs at depth N |
-| `timed_prompt_pool[]`, 8 tapes | organizer storage, staged on the box | No |
-| `speculative_oracles{}`, 6 per-depth oracles per pool prompt | organizer storage, staged on the box | No |
+| `timed_prompt_pool[]`: the 3 serial tapes that `live_goldens` (`pool-9`, `pool-10`, `pool-11`) names, three 496-token chat-template coding prompts | organizer storage, staged on the box | No |
+| `speculative_oracles{}`, 6 per-depth oracles per live golden (18 in all) | organizer storage, staged on the box | No |
 | `hidden_correctness_golden` | the default live golden's serial tape, pinned by digest | No |
 
 The organizer stages the set on each box, and the preflight checks every
@@ -502,22 +512,32 @@ one of two paths:
 The ranked workflow calls `tools/nemotron35-measure-and-score.sh` directly.
 Both scripts are trusted-side tooling.
 
-The ranked script execs:
+The ranked script builds one `benchd iterate --mode official` command. It
+passes one `--golden` triple (the timed golden of the declared depth) and one
+`--control-golden` triple (that prompt's serial tape) for every live golden,
+in the fixture's `live_goldens` order (`pool-9`, `pool-10`, `pool-11`), so
+pair k measures `live_goldens[k-1]`. With depth 3 declared, the shape is:
 
 ```text
-benchd iterate --mode official \
+benchd iterate \
+  --engine <adapter binary> --weights $MLXFAST_TARGET_SNAPSHOT_DIR \
+  --golden $GOLDEN_DIR/pool-9.mtp3.golden.json  --golden-sha256 <pin> --golden-bytes <pin> \
+  --golden $GOLDEN_DIR/pool-10.mtp3.golden.json --golden-sha256 <pin> --golden-bytes <pin> \
+  --golden $GOLDEN_DIR/pool-11.mtp3.golden.json --golden-sha256 <pin> --golden-bytes <pin> \
+  --mode official --score-path score.json \
   --contract fixtures/nemotron35_lightning_30b_a3b_track.json \
-  --engine .build/release/mlxfast-runtime-worker \
-  --weights $MLXFAST_TARGET_SNAPSHOT_DIR \
-  --golden $MLXFAST_NEMOTRON35_GOLDEN_DIR/<drawn prompt>.golden.json \
-  --golden-sha256 <pin> --golden-bytes <pin> \
-  --control-golden <serial live golden> --control-golden-sha256 <pin> --control-golden-bytes <pin> \
   --baseline-workspace $MLXFAST_BASELINE_WORKSPACE \
   --baseline-calibration $MLXFAST_BASELINE_CALIBRATION \
-  --live-prompt <drawn prompt> \
-  [--mtp-depth <declared depth>] [--box $RUNNER_NAME] \
-  --score-path score.json
+  --control-golden $GOLDEN_DIR/pool-9.golden.json  --control-golden-sha256 <pin> --control-golden-bytes <pin> \
+  --control-golden $GOLDEN_DIR/pool-10.golden.json --control-golden-sha256 <pin> --control-golden-bytes <pin> \
+  --control-golden $GOLDEN_DIR/pool-11.golden.json --control-golden-sha256 <pin> --control-golden-bytes <pin> \
+  --box $RUNNER_NAME --mtp-depth 3
 ```
+
+The pins come from the fixture. Do not type this command by hand to
+reproduce a score: dispatch `.github/workflows/benchmark.yml`, which adds the
+GPU lock, the sandbox, the cleanup and the nonce-bound reveal
+([reproduce.md, section 4](reproduce.md#4-reproduce-a-ranked-score)).
 
 benchd seals `score.json`, its `.sha256` sidecar and the integrity sidecar
 itself. The script converts nothing.
@@ -554,7 +574,7 @@ The rest of the command surface:
 | Engine source | vLLM `v0.27.1` @ `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` (`vllm/VENDOR.json`) |
 | Engine image | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` |
 | Driver floor | `580.159.03` |
-| benchd | the channel manifest for this track |
+| benchd | `Layr-Labs/mlxfast-bench-dev` dist commit `43a9a1642cc22c3fb2f71b9c707699cd3a9602c7`, built from source `b65af98c2a060df12f2ced849c68528b825fecdb`; `dist/linux-aarch64/benchd.manifest.json` there gives each binary's sha256 and bytes. `tools/fetch-benchd.sh` (`PINNED_SOURCE_COMMIT`) is the authority. |
 
 ## 8. Prohibited techniques
 

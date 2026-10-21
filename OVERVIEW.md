@@ -83,12 +83,14 @@ Every point links to the document that has the detail.
   - **Why:** without it, a submission could read the hidden prompts and
     goldens, or rewrite the measuring tools.
 - **Sealed score.** `score.json` names each prompt only by its sha256. It
-  carries no prompt text. The current benchd does not have the stricter
-  sealing of the earlier fork benchd (engineering log section 7.12). A
-  failed correctness check can seal the first failing step and its expected
-  and actual token ids, and a refusal can seal its error text.
-  - **Risk:** a submission can use a failed run to send out a small amount of
-    what it saw.
+  carries no prompt text. The pinned benchd (source `b65af98`, bench pull
+  requests 421 to 424) keeps engine-written text, audit fields, the hello
+  identity and engine-derived numbers out of the sealed output: they are
+  sealed as digests or omitted, and a full copy goes only to a private audit
+  file on the box. The sealed output and the failure messages name no token
+  value.
+  - **Remaining risk:** whether a run failed, and the kind of failure, stay
+    visible, so a failed run can still carry a very small signal.
 - **A score that cannot be forged or erased from the log.** Participant code
   can print into the same job log, so the score is revealed only after
   sandbox cleanup, tagged with a per-job secret drawn before any participant
@@ -125,14 +127,37 @@ Every point links to the document that has the detail.
   counts ([contract §5.5](docs/participant-contract.md)).
   - The same single re-run covers a candidate that fails to boot before any
     of its timing exists (pair 1), which an honest engine can hit from a GPU
-    or driver transient.
-  - Any other failure of the reference leg, or a second divergence, is an
-    infrastructure outcome, not the team's failure.
+    or driver transient, and a pair-1 reference (serial-control) leg that
+    fails to boot (PR #28).
+  - A second divergence, or a second pair-1 reference boot failure, ends the
+    job as an infrastructure outcome (exit 75). In the contest such a
+    post-setup reference-leg or band failure counts as 0.0 toward selection;
+    in the final re-score its slot is re-dispatched first. A reference boot
+    failure in a later pair is final (`refused`).
   - **Why:** a team must never lose a run to a fault in our own reference.
   - **Why so narrow:** a submission cannot turn a crash or out-of-memory into
     a free second timing draw.
 
-## How it was tested (on all 8 Sparks)
+## How it was tested
+
+### On the current setup (2026-10-19/20, spark-1 to spark-4)
+
+| Test | Result |
+|---|---|
+| Ranked run on this repository (spark-2, unchanged engine, MTP 3) | every step succeeded, `passed: true`, score 1.310, artifact uploaded |
+| Same tree on spark-1 | `passed: true`, score 1.310 |
+| MTP depths 1 to 6 | 1.164 / 1.114 / 1.316 / 1.189 / 1.131 / 1.104, all pass correctness |
+| Engine that returns wrong tokens | refused, no score |
+| Calibration, 4 boxes, 3 prompts each | every CV under 1% (limit 2%) |
+| Goldens | 21 files byte-identical on two recording boxes, on all 4 staged boxes and on the jump box |
+| benchd | a no-cache rebuild from source equals the pinned dist byte for byte |
+| GPU-free checks | all pass (adapter fmt, clippy, tests and build; resident and router tests; manifest lint; doc consistency; every `tools/test-*.sh`) |
+| 3-hour load test (spark-1, 3, 4; seeded mix; organizer router) | 22 jobs, 0 infrastructure failures; unchanged engine 11/11 pass, mean 1.3142, sd 0.0043; oversize file refused; trusted-path edits dropped; Marlin (3) and CUDA-graphs (1) variants fail correctness (exact-match timed window) |
+
+The commands and the full data are in [docs/reproduce.md](docs/reproduce.md)
+and the engineering log, section 7.14.
+
+### October soak (all 8 Sparks, the earlier setup: 2 pairs, 4096-token seed, fork benchd)
 
 | Test | Result |
 |---|---|
@@ -146,10 +171,8 @@ Every point links to the document that has the detail.
 
 These tests ran on the earlier fork benchd, which had the timed replay and the
 stricter sealing. The track now uses Layr-Labs bench-dev (engineering log
-section 7.13). Its `main` has the stricter sealing again since 2026-10-19
-(engine text, audit fields and hello identity seal as digests), but not the
-timed replay. The dist that `tools/fetch-benchd.sh` pins predates that
-sealing until it is republished and re-pinned.
+section 7.13). The pinned dist (`43a9a16`, source `b65af98`) has the stricter
+sealing again (bench pull requests 421 to 424), but not the timed replay.
 
 Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
 7.9–7.12.
@@ -159,8 +182,9 @@ Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
 - **Boxes.** All 8 were set up, sandboxed, calibrated and staged for the
   October soak. Runners register through a GitHub App. Re-verify each ranked
   box before launch: runner registration, the staged `pool-9/10/11` goldens
-  and a version-3 calibration. On 2026-10-19 Sparks 3 and 4 had no
-  `pool-9/10/11` goldens staged.
+  and a version-3 calibration. On 2026-10-20 spark-1 to spark-4 had all 21
+  goldens staged, a version-3 calibration under 2%, the reference tree
+  `5be35aa` and benchd `b65af98`.
 - **Branches.** `main` is the armed contest base
   (`official_scoring_enabled: true`, reference tree `5be35aa`).
 - **Where the goldens live.** Scoring reads only each Spark's local copy
