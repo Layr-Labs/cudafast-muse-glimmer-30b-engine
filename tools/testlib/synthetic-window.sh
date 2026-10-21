@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # shellcheck shell=bash
 # synthetic-window.sh -- a stand-in target snapshot for off-box tests.
 #
