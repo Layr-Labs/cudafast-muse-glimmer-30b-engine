@@ -268,6 +268,12 @@ overlapping:
 No baseline is stored anywhere; the control leg measures it next to the
 candidate.
 
+**Direction, rounding and ties.** Higher is better: `benchmark.json` sets
+`direction` to `+`. benchd does not round the score: `score.json` holds the full
+double-precision value, so two runs tie only when the two values are equal. The
+platform, not this repository, decides whether a submission improves the
+current best.
+
 **What decode means.** Decode seconds per token is the decode window: the time
 of `free_decode_run(N)` divided by N. The seed prefill of the prompt is not
 part of it. Prefill is its own phase, timed on its own. `decode_gain` is the
