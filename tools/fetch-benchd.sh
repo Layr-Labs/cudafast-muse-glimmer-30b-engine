@@ -192,7 +192,7 @@ BRANCH="${BENCHD_BRANCH:-main}"
 #   * bench pull request 396: the health band of the serial-control leg comes
 #     from the track fixture (decode up 0.03, prefill up 0.05 here), not from
 #     the band fields of the calibration file. Version 3 files stay valid;
-#   * bench pull request 398: the speedup floors (0.95 decode, 0.80 prefill
+#   * bench pull request 398: the speedup floors (0.95 decode, 0.95 prefill
 #     here) are the only gate on a slow candidate. The candidate band has no
 #     slow side; *_band_up_tolerance is the control leg's health band only.
 #   * bench pull requests 421-424: engine-written text, audit fields, the hello
