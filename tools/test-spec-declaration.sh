@@ -103,20 +103,21 @@ expect_refuse "unknown-key-refused" '{"spec":{"enabled":true,"num_speculative_to
 expect_refuse "bad-enabled-refused" '{"spec":{"enabled":"yes","num_speculative_tokens":1}}' "must be a boolean"
 
 # --- the declaration AROUND the spec block (issue #24 work item A) ----------
-# docs/participant-contract.md 4.1 promises two things this validator did not
-# check, because it read `.spec` and nothing else: `pinned` is the only accepted
-# source, and there is no `arm` key. Each promise gets its refusal case and the
+# docs/participant-contract.md 4.1 promises that the accepted `source` is the
+# CONTRACT's own `mtp_head.source` -- `none` on this serial-only track -- and
+# that there is no `arm` key. Each promise gets its refusal case and the
 # accepting side gets one too, so a fix that simply refused everything would not
 # pass. max_bytes is recorded, not read, so any value passes.
-expect_refuse "source-remote-refused"    '{"source":"remote"}'    'the only accepted source is "pinned"'
+expect_refuse "source-remote-refused"    '{"source":"remote"}'    'is not accepted'
 expect_refuse "source-in-branch-refused" '{"source":"in_branch"}' 'source "in_branch" is not accepted'
+expect_refuse "source-pinned-refused"    '{"source":"pinned"}'    'the contract'"'"'s mtp_head.source is "none"'
 expect_refuse "unknown-top-key-refused"    '{"version":1,"arm":"dflash","spec":{"enabled":true,"num_speculative_tokens":1}}' \
   "unknown top-level key(s): arm"
 # The shipped declaration is legal, a max_bytes above the staged head's size is
 # legal too (the key is not read), and a declaration that states only a version
 # and a spec block is the ordinary case.
-expect_ok "shipped-declaration-accepted" '{"source":"pinned","max_bytes":2147483648}' describe serial
-expect_ok "max-bytes-not-read"           '{"source":"pinned","max_bytes":3000000000}' describe serial
+expect_ok "shipped-declaration-accepted" '{"source":"none","max_bytes":2147483648}' describe serial
+expect_ok "max-bytes-not-read"           '{"source":"none","max_bytes":3000000000}' describe serial
 # version + spec is the ordinary shape, but a spec that ARMS a depth is refused
 # on this serial-only track (see the mtp cases above).
 expect_refuse "version-plus-spec-refused" '{"version":1,"spec":{"enabled":true,"num_speculative_tokens":1}}' "not a contract-permitted draft depth"

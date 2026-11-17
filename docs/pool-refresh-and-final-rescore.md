@@ -30,7 +30,7 @@ pool (`pool-9`, `pool-10`, `pool-11`) and the held-out `final` pool are coding
 tasks, each written as one user message and rendered through the snapshot's
 pinned chat template with thinking off. `tools/author-prompts.py --chat`
 renders each text and refuses any rendering that is not exactly `seed_tokens`
-(496) ids; a chat prompt is never trimmed, so the organizer edits the text
+(512) ids; a chat prompt is never trimmed, so the organizer edits the text
 until it fits. `tools/pool-refresh.sh --texts DIR` runs this step for a
 generation (`DIR/<label>-<n>.txt`). Each new text must be a task not used in
 any earlier generation; the texts, their token files and their hashes go to
@@ -60,12 +60,13 @@ Idempotent steps, each refusing on any mismatch:
 1. **Author**: N prompts for the next generation (above). N is `--count`,
    by default the number of `live_goldens` in the fixture (3 now); use
    `--texts DIR` for chat prompts.
-2. **Record**: serial golden plus MTP-1…6 oracles for every prompt
-   (N × 7 goldens, 21 for 3 prompts), spread across the fleet with `tools/record-goldens.sh`,
-   each one on **two** boxes and required to be byte-identical (the engine is
-   deterministic; a mismatch means a broken box or engine).
+2. **Record**: one serial golden for every prompt (N goldens, 3 for 3
+   prompts; this track is serial only, so there are no per-depth oracles),
+   spread across the fleet with `tools/record-goldens.sh`, each one on **two**
+   boxes and required to be byte-identical (the engine is deterministic; a
+   mismatch means a broken box or engine).
 3. **Stage**: install the new goldens next to the current ones on every box of `REFRESH_BOXES`
-   (`/srv/nemotron35/goldens`, root:bench 0750), verified by sha256. The old
+   (`/srv/muse-glimmer/goldens`, root:bench 0750), verified by sha256. The old
    generation stays in place, so in-flight jobs are unaffected.
 4. **Pin and switch**: one commit to the trusted fixture that pins the new
    goldens and sets `live_goldens` to the new generation, pushed to `main`
@@ -93,11 +94,10 @@ job measures every live golden.
 
 ## Final re-score (`router.py rescore`, operator-run at the close)
 
-1. **Held-out pool**: generation `final` is authored and recorded: 3
-   organizer-written 496-token coding prompts × 7 goldens = 21 goldens,
-   agreed byte for byte by two boxes (spark-4 and spark-2, 2026-10-20). It
-   replaces the September pool of 8 stitched 4096-token prompts, which does
-   not fit the 3-pair, 496-token fixture.
+1. **Held-out pool**: generation `final` is authored and recorded as 3
+   organizer-written 512-token coding prompts, each with one serial golden,
+   agreed byte for byte by two boxes. The pool fits the 3-pair, 512-token
+   fixture.
    It is kept off the boxes: goldens and prompts live only in
    `.mlxfast-private/final/` on the organizer workstation and in the organizer
    archive (never in git, never staged, never pinned in a pushed fixture)
@@ -154,8 +154,8 @@ job measures every live golden.
 
 | Copy | Holds | Purpose |
 |---|---|---|
-| Each Spark, `/srv/nemotron35/goldens` (root:bench, unreadable by the sandbox user) | the live pool (and the next generation once staged) | the only copy scoring reads; a ranked job never fetches goldens |
-| Jump box, `~ubuntu/nemotron35-goldens/live` (0700) | the live pool, with `SHA256SUMS` from the fixture pins | the source for restaging a rebuilt box |
+| Each Spark, `/srv/muse-glimmer/goldens` (root:bench, unreadable by the sandbox user) | the live pool (and the next generation once staged) | the only copy scoring reads; a ranked job never fetches goldens |
+| Jump box, `~ubuntu/muse-glimmer-goldens/live` (0700) | the live pool, with `SHA256SUMS` from the fixture pins | the source for restaging a rebuilt box |
 | Organizer archive (a private repository, organizer only) | the live pool, every retired generation, the held-out `final` pool, the paragraph ledger | backup and dispute evidence |
 
 The held-out `final` pool never goes to the jump box or a Spark before the
@@ -174,8 +174,8 @@ prompts, provenance, per-box recordings, agreed goldens, `pins.json`),
 used) and `refresh/staging.log` (every golden installed on a box, with time).
 
 Box-side assumptions (override by env): boxes `spark-1`…`spark-8`
-(`REFRESH_BOXES`; the current fleet is `spark-1 spark-2 spark-3 spark-4`), checkout `~/nemotron35/repo` (`REFRESH_BOX_REPO`, must be at a
-commit that has `record-goldens.sh --only`), goldens `/srv/nemotron35/goldens`
+(`REFRESH_BOXES`; the current fleet is `spark-1 spark-2 spark-3 spark-4`), checkout `~/muse-glimmer/repo` (`REFRESH_BOX_REPO`, must be at a
+commit that has `record-goldens.sh --only`), goldens `/srv/muse-glimmer/goldens`
 (`REFRESH_BOX_GOLDENS`), snapshot `REFRESH_BOX_SNAPSHOT`, GPU lock
 `/tmp/mtplx-gpu-exclusive.lock`. Stitching needs the `tokenizers` package:
 `REFRESH_PYTHON` may name a python that has it (the pinned image does).
@@ -205,7 +205,7 @@ tools/pool-refresh.sh pin-fixture /tmp/next-fixture.json g2 .mlxfast-private/ref
 tools/pool-refresh.sh --label g2 --step pin
 #   at the switch: drain (no job queued or running), install every box's new
 #   calibration file, then push the pin commit
-#   record: 21 goldens x 2 boxes, byte-identical
+#   record: 3 serial goldens x 2 boxes, byte-identical
 #   a crash or a failed box: fix it and re-run the same command; finished work is skipped
 #   one step alone: --step author|record|stage|pin|verify|retire
 # review the fixture diff, then run the printed commands:
@@ -250,15 +250,15 @@ determinism probe), delete that job's `done job <key>` line from
 ```bash
 tools/router/router.py freeze
 tools/router/router.py status        # wait until nothing is queued, dispatched or running
-tools/pool-refresh.sh --label final --step stage --final-after-freeze ~/nemotron35-router/FROZEN
+tools/pool-refresh.sh --label final --step stage --final-after-freeze ~/muse-glimmer-router/FROZEN
 #   bands for the final prompts: a private proposed fixture, then every box
 cp fixtures/muse_glimmer_30b_cuda_v1_track.json /tmp/final-fixture.json
 tools/pool-refresh.sh pin-fixture /tmp/final-fixture.json final .mlxfast-private/final/pins.json
 #   on each box: tools/calibrate-box.sh <runner name> <file> --fixture <final-fixture> --passes 3,
 #   install the file at the runner's MLXFAST_BASELINE_CALIBRATION
 tools/router/router.py rescore --base-ref origin/main --top 10 --runs 5
-git -C ~/nemotron35-router/clone push origin rescore/base   # as printed; the sub/ branches carry it anyway
+git -C ~/muse-glimmer-router/clone push origin rescore/base   # as printed; the sub/ branches carry it anyway
 # repeat until rescore-report is complete (no incomplete teams):
 tools/router/router.py rescore-retry --tag final --max-infra-retries 2   # infra + one boot retry per slot
-tools/router/router.py rescore-report --wait    # ~/nemotron35-router/rescore-final/rescore.{json,html}
+tools/router/router.py rescore-report --wait    # ~/muse-glimmer-router/rescore-final/rescore.{json,html}
 ```

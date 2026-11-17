@@ -154,7 +154,7 @@ drive() { # drive OUTFILE [args...]
       CALIBRATE_BOX_SETSID=1 \
       MLXFAST_BASELINE_WORKSPACE="${WS_OVERRIDE-${WS}}" \
       MLXFAST_TARGET_SNAPSHOT_DIR="${WEIGHTS}" \
-      MLXFAST_NEMOTRON35_GOLDEN_DIR="${GOLDEN_DIR_OVERRIDE-${GOLDEN_DIR}}" \
+      MLXFAST_MUSE_GLIMMER_GOLDEN_DIR="${GOLDEN_DIR_OVERRIDE-${GOLDEN_DIR}}" \
       BENCHD_BIN_DIR="${BENCHD_DIR}" \
       STUB_SERVE_LOG="${WORK}/serve.log" \
       STUB_BENCHD_LOG="${WORK}/benchd.log" \
@@ -355,7 +355,7 @@ mkdir -p "${BAD_BENCHD_DIR}"
 printf '{"sha256":"aa","bytes":1}\n' > "${BAD_BENCHD_DIR}/benchd.manifest.json"
 env PATH="${BIN}:${PATH}" CALIBRATE_BOX_SETSID=1 \
     MLXFAST_BASELINE_WORKSPACE="${WS}" MLXFAST_TARGET_SNAPSHOT_DIR="${WEIGHTS}" \
-    MLXFAST_NEMOTRON35_GOLDEN_DIR="${GOLDEN_DIR}" \
+    MLXFAST_MUSE_GLIMMER_GOLDEN_DIR="${GOLDEN_DIR}" \
     BENCHD_BIN_DIR="${BAD_BENCHD_DIR}" \
     STUB_SERVE_LOG="${WORK}/serve.log" STUB_BENCHD_LOG="${WORK}/benchd.log" \
     BENCHD="${BIN}/benchd" \
@@ -372,9 +372,9 @@ grep -q 'REFUSE unattributable-benchd' "${WORK}/benchdcommit.out" \
 GOLDEN_DIR_OVERRIDE="" \
 drive "${WORK}/case11.out" "${BOX}" "${WORK}/out11.json" --dry-run
 [ $? -ne 0 ] || fail "case 11: the driver ran with no staged golden pool"
-grep -q "MLXFAST_NEMOTRON35_GOLDEN_DIR is unset" "${WORK}/case11.out" \
+grep -q "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR is unset" "${WORK}/case11.out" \
   && ok "case 11: an unstaged golden pool refuses by name" \
-  || fail "case 11: the refusal did not name MLXFAST_NEMOTRON35_GOLDEN_DIR"
+  || fail "case 11: the refusal did not name MLXFAST_MUSE_GLIMMER_GOLDEN_DIR"
 
 if [ "${failures}" -eq 0 ]; then
   echo "PASS: test-calibrate-box.sh"

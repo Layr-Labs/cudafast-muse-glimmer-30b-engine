@@ -13,8 +13,8 @@
 #   BENCHD=/path/to/benchd ./benchmark.sh ...   # use another benchd, unverified
 #
 # The ranked commands in benchmark.json reach
-# tools/nemotron35-measure-and-score.sh (preSubmitCommand directly,
-# benchmarkCommand through tools/nemotron35-yukon-run.sh). Off a ranked box,
+# tools/muse-glimmer-measure-and-score.sh (preSubmitCommand directly,
+# benchmarkCommand through tools/muse-glimmer-yukon-run.sh). Off a ranked box,
 # `yukon run` reaches this file through that wrapper and
 # tools/local-baseline.sh with --local-iterate. This file is also the developer
 # entry point.

@@ -175,16 +175,16 @@ OV="${WORK}/overlay-repo"
 mkdir -p "${OV}/tools" "${OV}/fixtures" "${OV}/vllm/vllm/model_executor"
 cp "${REPO_ROOT}/tools/stage-vllm-overlay.sh" "${OV}/tools/"
 cp "${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" "${OV}/fixtures/"
-printf 'EDITED = True\n' > "${OV}/vllm/vllm/model_executor/nemotron_probe.py"
+printf 'EDITED = True\n' > "${OV}/vllm/vllm/model_executor/muse_glimmer_probe.py"
 printf '__version__ = "tree"\n' > "${OV}/vllm/vllm/__init__.py"
 BASE="${WORK}/base"
 mkdir -p "${BASE}/vllm/model_executor"
 printf 'ELF' > "${BASE}/vllm/_C.abi3.so"
-printf 'EDITED = False\n' > "${BASE}/vllm/model_executor/nemotron_probe.py"
+printf 'EDITED = False\n' > "${BASE}/vllm/model_executor/muse_glimmer_probe.py"
 printf 'generated\n' > "${BASE}/vllm/_version.py"
 if STAGE_VLLM_OVERLAY_BASE="${BASE}" "${OV}/tools/stage-vllm-overlay.sh" > "${WORK}/overlay.out" 2>&1; then
   staged="${OV}/.build/vllm-overlay/vllm"
-  if grep -q 'EDITED = True' "${staged}/model_executor/nemotron_probe.py"; then
+  if grep -q 'EDITED = True' "${staged}/model_executor/muse_glimmer_probe.py"; then
     pass "a vllm/vllm/ edit is what the staged overlay carries"
   else
     fail "a vllm/vllm/ edit is what the staged overlay carries"

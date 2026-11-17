@@ -1,4 +1,4 @@
-# Nemotron 3.5 Lightning challenge: overview
+# Muse Glimmer 30B NVFP4 challenge: overview
 
 A one-page summary of the challenge: what it is, how a submission is scored,
 what was built and why, how it was tested, and what is left before launch.
@@ -6,14 +6,15 @@ Every point links to the document that has the detail.
 
 ## The challenge
 
-- **Task.** Make `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` prefill and
+- **Task.** Make `nvidia/Muse-Glimmer-30B-NVFP4` prefill and
   decode faster on a DGX Spark, single stream, without changing what it
-  computes beyond a 10% token-tolerance budget.
-- **Track.** `nemotron3.5-lightning-30b-a3b-cuda-v1`, on 8 DGX Sparks
+  computes: the token-tolerance budget is `0.0`.
+- **Track.** `muse-glimmer-30b-cuda-v1`, on 8 DGX Sparks
   (`spark-1` … `spark-8`).
 - **What a team may edit.** Only `vllm/`, `harness/` and
-  `mtp-head.manifest.json` (the speculation depth, 1 to 6). Everything else is
-  trusted and is replaced by the organizer's copy.
+  `mtp-head.manifest.json` (a declaration that must stay `none`: the track is
+  serial only). Everything else is trusted and is replaced by the organizer's
+  copy.
 - **What a team may not change.** The numerical formats
   ([contract §3.4](docs/participant-contract.md)).
 - **Where to start.** [TASK.md](TASK.md) is the one-page rules;
@@ -51,10 +52,10 @@ Every point links to the document that has the detail.
 - **Speed floor.** Both prefill and decode must reach at least 0.95× the
   reference, or the run fails the floor.
 - **Correctness.**
-  - The candidate's tokens must match the reference golden within the token
-    budget.
-  - The timed decode window must match the per-depth oracle exactly. benchd
-    has no near-tie replay.
+  - The candidate's tokens must match the reference golden exactly: the
+    token-tolerance budget is `0.0`.
+  - There is one mode, so one tape: every leg replays the serial golden.
+    benchd has no near-tie replay.
   - **Risk:** BF16 logit ties make an exact match brittle for honest engines.
     A kernel change that resolves a tie differently fails the run.
 - **Box health band.** Each box is calibrated. A control leg that runs slower
@@ -62,10 +63,12 @@ Every point links to the document that has the detail.
   box is unhealthy, and no score is sealed.
   - **Why:** a slow or hot box must never decide a ranking. The bands were set
     from measured variation (3% on decode after 2% refused good runs).
-- **Determinism.** The reference engine is made byte-reproducible (pinned
-  MoE and Mamba kernel configs; the stock Marlin MoE is not reproducible on
-  GB10), so the goldens are stable
-  ([engineering log §7.2](docs/nemotron35-port-notes.md)).
+- **Determinism.** The reference engine is made byte-reproducible: the
+  fixture disables `FlashInferFP8ScaledMMLinearKernel`, because this
+  checkpoint quantizes its attention projections to FP8 and that kernel is not
+  batch-invariant, and every boot is pinned (context, batched tokens, memory
+  fraction, seed), so the goldens are stable
+  ([port log](docs/muse-glimmer-port-notes.md)).
 
 ## Security: what stops cheating
 
@@ -140,55 +143,58 @@ Every point links to the document that has the detail.
 
 ## How it was tested
 
-### On the current setup (2026-10-19/20, spark-1 to spark-4)
+### This track (local cycle, 2026-11-17)
 
 | Test | Result |
 |---|---|
-| Ranked run on this repository (spark-2, unchanged engine, MTP 3) | every step succeeded, `passed: true`, score 1.310, artifact uploaded |
-| Same tree on spark-1 | `passed: true`, score 1.310 |
-| MTP depths 1 to 6 | 1.164 / 1.114 / 1.316 / 1.189 / 1.131 / 1.104, all pass correctness |
+| Engine tree builds in the pinned container (CUDA-L04B) | two boots of the same tree identical, 2222 tensors |
+| Candidate vs vendor runtime (CUDA-LE5) | parity 0.0 over 384 tokens |
+| Resident boot and serve on spark-3 (CUDA-LE2) | boot completes, requests served, load and request exit 0 |
+| Reference vs candidate, ranked path | not yet run: the local cycle stops at the owner's contract approval (CUDA-LE4) |
+
+The local cycle's numbers, commands and receipts are in the challenge folder
+(`cuda/HANDOFF.md`, `cuda/artifacts/`). The engineering log records what the
+port changed and every finding ([port log](docs/muse-glimmer-port-notes.md)).
+
+### The engine base it derives from (2026-10-19/20, spark-1 to spark-4)
+
+| Test | Result |
+|---|---|
+| Ranked run on the base repository (unchanged engine) | every step succeeded, `passed: true`, artifact uploaded; the base track's own score |
 | Engine that returns wrong tokens | refused, no score |
-| Calibration, 4 boxes, 3 prompts each | every CV under 1% (limit 2%) |
-| Goldens | 21 files byte-identical on two recording boxes, on all 4 staged boxes and on the jump box |
+| Calibration, 4 boxes, 3 prompts each | every CV under 1% (limit 1% at v9.1.1) |
+| Goldens | byte-identical on two recording boxes and on every staged box |
 | benchd | a no-cache rebuild from source equals the pinned dist byte for byte |
-| GPU-free checks | all pass (adapter fmt, clippy, tests and build; resident and router tests; manifest lint; doc consistency; every `tools/test-*.sh`) |
-| 3-hour load test (spark-1, 3, 4; seeded mix; organizer router) | 22 jobs, 0 infrastructure failures; unchanged engine 11/11 pass, mean 1.3142, sd 0.0043; oversize file refused; trusted-path edits dropped; Marlin (3) and CUDA-graphs (1) variants fail correctness (exact-match timed window) |
+| GPU-free checks | adapter fmt, clippy, tests and build; resident and router tests; manifest lint; doc consistency; every `tools/test-*.sh` |
+| 3-hour load test (spark-1, 3, 4; seeded mix; organizer router) | 22 jobs, 0 infrastructure failures; oversize file refused; trusted-path edits dropped; variants fail correctness (exact-match timed window) |
 
-The commands and the full data are in [docs/reproduce.md](docs/reproduce.md)
-and the engineering log, section 7.14.
+Those runs measured the base engine and its own goldens. This track re-proves
+every check it inherits at its own pin (`cuda/HANDOFF.md`).
 
-### October soak (all 8 Sparks, the earlier setup: 2 pairs, 4096-token seed, fork benchd)
+### Base-engine soak (all 8 Sparks, 4096-token seed, fork benchd)
 
 | Test | Result |
 |---|---|
 | 8-hour load test (186 jobs, realistic submission mix) | unchanged engines score mean 0.9959, sd 0.0058; every variant ended as expected |
 | Fairness (unchanged engine vs itself) | 19/19 pass, mean 0.9955, sd 0.0046 |
 | Rotation smoke test and 3-hour soak (81 submissions, all 8 prompts) | unchanged engines 30/31 pass, mean 0.9959; garbage 10/10 rejected by replay; depth-7, oversize-file and trusted-path submissions refused or dropped; no infrastructure failures |
-| Goldens | all 56 live-pool goldens and 56 held-out goldens recorded on two boxes each, byte-identical |
-| Cross-prompt calibration | every prompt within 0.5% (decode) and 1.3% (prefill) of the calibration prompt, so one band per box holds |
+| Goldens | every live-pool and held-out golden recorded on two boxes each, byte-identical |
 | Attack tests on the boxes | fake score lines in the build log ignored (real score kept); a 50 GiB `/dev/shm` flood by the sandbox user wiped and memory restored before the next reference leg; garbage rejected by replay |
-| Fairness after all fixes (40 unchanged engines, all 8 boxes) | 39 pass, mean 0.9956, sd 0.0049; one GPU-transient boot failure (now re-run, see above) |
 
-These tests ran on the earlier fork benchd, which had the timed replay and the
-stricter sealing. The track now uses Layr-Labs bench-dev (engineering log
-section 7.13). The pinned dist (`43a9a16`, source `b65af98`) has the stricter
-sealing again (bench pull requests 421 to 424), but not the timed replay.
-
-Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
-7.9–7.12.
+These are the engine base's soak results, kept as the port's design evidence;
+the full data is in the base repository's own engineering log.
 
 ## Fleet state
 
-- **Boxes.** All 8 were set up, sandboxed, calibrated and staged for the
-  October soak. Runners register through a GitHub App. Re-verify each ranked
-  box before launch: runner registration, the staged `pool-9/10/11` goldens
-  and a version-3 calibration. On 2026-10-20 spark-1 to spark-4 had all 21
-  goldens staged, a version-3 calibration under 2%, the reference tree
-  `5be35aa` and benchd `b65af98`.
-- **Branches.** `main` is the armed contest base
-  (`official_scoring_enabled: true`, reference tree `5be35aa`).
+- **Boxes.** This track stages its boxes in the dev cycle. Re-verify each
+  ranked box before launch: runner registration, the staged `pool-9/10/11`
+  goldens and a version-3 calibration. spark-3 is the lane's box (idle,
+  GPU free, 121 GB memory, 3.3 TB disk).
+- **Branches.** `main` is the contest base. `official_scoring_enabled` is
+  `true` in the fixture, and the reference tree is the fixture's
+  `baseline_reference_commit`.
 - **Where the goldens live.** Scoring reads only each Spark's local copy
-  (`/srv/nemotron35/goldens`, unreadable by the sandbox user); a ranked job
+  (`/srv/muse-glimmer/goldens`, unreadable by the sandbox user); a ranked job
   never fetches goldens. The live pool is also kept in an
   owner-only folder on the jump box, used to restage a box. The held-out
   final pool lives only in the organizer's private archive until the close.
@@ -218,5 +224,5 @@ Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
 | Intake responsibilities | [docs/submission-restriction-spec.md](docs/submission-restriction-spec.md) |
 | Pool refresh and final re-score (runbook) | [docs/pool-refresh-and-final-rescore.md](docs/pool-refresh-and-final-rescore.md) |
 | What CI checks | [docs/ci-coverage.md](docs/ci-coverage.md) |
-| Engineering findings and test results | [docs/nemotron35-port-notes.md](docs/nemotron35-port-notes.md) |
+| Engineering findings and test results | [docs/muse-glimmer-port-notes.md](docs/muse-glimmer-port-notes.md) |
 | Pins, bands, pool, depths | `fixtures/muse_glimmer_30b_cuda_v1_track.json` |

@@ -50,7 +50,7 @@ What it asserts, in order:
                         prebuilt binary now, not a source tree this linter could
                         grep, so a check of that shape has nowhere to read from. The honest, load-bearing
                         instrument for that class of drift is
-                        docs/nemotron35-port-notes.md (benchmark.json
+                        docs/muse-glimmer-port-notes.md (benchmark.json
                         and its contract fixture carry values only, no prose
                         fields), not a linter
                         check.
@@ -66,7 +66,7 @@ because its submodule is not checked out to an UNVERIFIED line instead of a
 FAIL. NO COMMAND TARGET IS INSIDE A SUBMODULE ANY MORE: benchd stopped being a
 source submodule when it became a pinned prebuilt, and every command target now
 lives in this repository (./setup.sh, ./tools/fetch-benchd.sh,
-./tools/nemotron35-measure-and-score.sh, ./tools/nemotron35-yukon-run.sh), so
+./tools/muse-glimmer-measure-and-score.sh, ./tools/muse-glimmer-yukon-run.sh), so
 the downgrade currently applies to nothing and all three commands are fully
 verified in CI. The flag is kept for
 the next submodule, not removed as dead.
@@ -86,26 +86,18 @@ import sys
 # check_scoring looks up the CURRENT manifest's trackId. A track with no entry
 # is reported as an explicit gap, never waved through.
 #
-# nemotron3.5-lightning-30b-a3b-cuda-v1: the reference track's ruled regime,
+# muse-glimmer-30b-cuda-v1: the reference track's ruled regime,
 # carried over unchanged except the KV backend.
 #   mode              the benchd channel's single-stream paired scoring mode
 #                     for this track (the benchd branch must emit this name)
 #   scoredBatchSize   1: single stream
-#   kvBackend         vllm-paged: the engine is vLLM (docs/nemotron35-port-notes.md)
+#   kvBackend         vllm-paged: the engine is vLLM (docs/muse-glimmer-port-notes.md)
 #   decodeSpeedupCeiling / scoredExponents
 #                     the composite prefill^0.25 * decode^0.75, ceiling 5.0
 # pairsPerCohort, minPairsPerCohort and both floors are NOT pinned here: they
 # are track settings whose enforced values live in the fixture
 # (official_pairs, decode_speedup_floor, prefill_speedup_floor), and
 # check_scoring fails when benchmark.json disagrees with them.
-_NEMOTRON35_LIGHTNING_CUDA_V1_SCORING = {
-    "mode": "nemotron-native-mtp-paired-decode-only",
-    "scoredBatchSize": 1,
-    "kvBackend": "vllm-paged",
-    "decodeSpeedupCeiling": 5.0,
-    "scoredExponents": {"prefillGainExponent": 0.25, "decodeGainExponent": 0.75},
-}
-
 # muse-glimmer-30b-cuda-v1: the serial arm of the same ruled regime. The mode
 # name is NOT a new vocabulary token: it is the string benchd writes into every
 # score.json (crates/benchd/src/overlay.rs SCORING_MODE, and
@@ -120,7 +112,6 @@ _MUSE_GLIMMER_30B_CUDA_V1_SCORING = {
 }
 
 EXPECTED_SCORING_BY_TRACK = {
-    "nemotron3.5-lightning-30b-a3b-cuda-v1": _NEMOTRON35_LIGHTNING_CUDA_V1_SCORING,
     "muse-glimmer-30b-cuda-v1": _MUSE_GLIMMER_30B_CUDA_V1_SCORING,
 }
 
@@ -741,7 +732,7 @@ class Linter:
         timed-pool tapes and the per-depth oracles are published in R2 at the
         r2_path keys the contract pins, and the ranked box stages them out of
         band into the directory its runner service exports as
-        MLXFAST_NEMOTRON35_GOLDEN_DIR. tools/ranked-box-preflight.sh verifies every
+        MLXFAST_MUSE_GLIMMER_GOLDEN_DIR. tools/ranked-box-preflight.sh verifies every
         staged file against the contract's {sha256, bytes} and refuses an extra
         *.json there.
 
@@ -784,13 +775,13 @@ class Linter:
                 self.fail(
                     f"goldens: {rel} is present in this repository. The track tapes are "
                     "organizer material: they are published in R2 at the pinned r2_path "
-                    "keys and staged on the ranked box as MLXFAST_NEMOTRON35_GOLDEN_DIR, and "
+                    "keys and staged on the ranked box as MLXFAST_MUSE_GLIMMER_GOLDEN_DIR, and "
                     "they are never in git. Delete the file"
                 )
             return
         self.ok(
             f"goldens: none of the {len(pinned)} pinned track golden(s) is in this tree "
-            "(they live in R2 and on the box, staged as MLXFAST_NEMOTRON35_GOLDEN_DIR)"
+            "(they live in R2 and on the box, staged as MLXFAST_MUSE_GLIMMER_GOLDEN_DIR)"
         )
 
     # -- 5a ----------------------------------------------------------------
@@ -875,7 +866,7 @@ class Linter:
         """Every live golden is fully pinned, and the pairs cover them evenly.
 
         Every ranked job measures every name in live_goldens: pair k measures
-        live_goldens[(k - 1) mod N] (tools/nemotron35-measure-and-score.sh), so
+        live_goldens[(k - 1) mod N] (tools/muse-glimmer-measure-and-score.sh), so
         official_pairs must be a multiple of N. Each name needs a pinned serial
         golden in timed_prompt_pool and one pinned oracle per permitted draft
         depth in speculative_oracles.<name>. A job draws nothing, so the rotation
@@ -1097,7 +1088,7 @@ class Linter:
             self.ok(
                 f"scoring: trackId {track_id!r} has no entry in EXPECTED_SCORING_BY_TRACK "
                 "(tools/lint-benchmark-manifest.py) -- register one there the same way "
-                "nemotron3.5-lightning-30b-a3b-cuda-v1 is, rather than leave a "
+                "muse-glimmer-30b-cuda-v1 is, rather than leave a "
                 "new track's scoring constants unchecked indefinitely"
             )
         else:

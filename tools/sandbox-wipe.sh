@@ -23,7 +23,7 @@
 # A missing or empty wipe list is a failure: the box was never set up.
 #
 # Env: SANDBOX_USER (default nemosub) and SANDBOX_ETC (default
-# /etc/nemotron35-sandbox), the names tools/box-runner/setup-sandbox-user.sh
+# /etc/muse-glimmer-sandbox), the names tools/box-runner/setup-sandbox-user.sh
 # uses. SANDBOX_WIPE_LIST (default $SANDBOX_ETC/wipe-dirs) and
 # SANDBOX_WIPE_HOME (default /var/lib/$SANDBOX_USER) are for tests.
 # No -e: every step's status is checked explicitly; the delete passes are
@@ -31,7 +31,7 @@
 set -uo pipefail
 
 SANDBOX_USER="${SANDBOX_USER:-nemosub}"
-WIPE_LIST="${SANDBOX_WIPE_LIST:-${SANDBOX_ETC:-/etc/nemotron35-sandbox}/wipe-dirs}"
+WIPE_LIST="${SANDBOX_WIPE_LIST:-${SANDBOX_ETC:-/etc/muse-glimmer-sandbox}/wipe-dirs}"
 [[ -f "${WIPE_LIST}" && -r "${WIPE_LIST}" ]] \
   || { echo "sandbox-wipe.sh: no wipe list ${WIPE_LIST}; run tools/box-runner/setup-sandbox-user.sh as root" >&2; exit 1; }
 # One absolute path per line; anything else in the list is ignored.

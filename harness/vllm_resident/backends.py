@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-# DETERMINISM (measured on GB10, docs/nemotron35-port-notes.md "Findings").
+# DETERMINISM (measured on GB10, docs/muse-glimmer-port-notes.md "Findings").
 # With vLLM's default kernels the same prompt gives different logits run to
 # run: the Marlin NVFP4 MoE is nondeterministic even on a fixed input, and this
 # checkpoint's FP8-quantized activations amplify a last-bit difference into a

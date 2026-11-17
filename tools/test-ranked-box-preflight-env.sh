@@ -28,7 +28,7 @@ fail() {
 
 # Every name the two gates refuse. The environment is cleared of all of them for
 # each case, so one case sets exactly one.
-CREDENTIALS=(R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY MLXFAST_NEMOTRON35_R2_DOWNLOADER BENCHD_DIST_TOKEN)
+CREDENTIALS=(R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY MLXFAST_MUSE_GLIMMER_R2_DOWNLOADER BENCHD_DIST_TOKEN)
 OVERRIDES=(BENCHD MLXFAST_SKIP_WEIGHTS_DOWNLOAD SKIP_MODEL_DOWNLOAD MLXFAST_LOCAL_COOL_GATE
            MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT MLXFAST_SKIP_ENGINE_BUILD MLXFAST_SKIP_WEIGHTS_SHA256
            SERVE_UP_LAUNCHER SERVE_UP_NO_CAP_DROP SERVE_UP_ALLOW_NEW_PRIVS
@@ -123,7 +123,7 @@ LIVE_GOLDEN="${LIVE_NAMES[0]}"
 SECOND="${LIVE_NAMES[1]}"
 IMAGE_REF="$(jq -r '.serve_configuration.container_image | split(":")[0]' "${FIXTURE}")@$(jq -r '.serve_configuration.container_digest' "${FIXTURE}")"
 DRIVER_PIN="$(jq -r '.serve_configuration.toolchain.driver_min' "${FIXTURE}")"
-RUNNER="test-box-nemotron35-cuda"
+RUNNER="test-box-muse-glimmer-cuda"
 
 # The scaffold is only buildable where the pinned reference commit is reachable
 # from this checkout. That is the normal case (it is a commit of this
@@ -321,7 +321,7 @@ EOF
         MLXFAST_GPU_TEMP_CMD="echo 42" \
         BENCHD_BIN_DIR="${BENCHD_DIR}" \
         RUNNER_NAME="${RUNNER}" \
-        MLXFAST_NEMOTRON35_GOLDEN_DIR="${GOLDEN_DIR}" \
+        MLXFAST_MUSE_GLIMMER_GOLDEN_DIR="${GOLDEN_DIR}" \
         MLXFAST_BASELINE_WORKSPACE="${WS}" \
         MLXFAST_BASELINE_CALIBRATION="${CAL_OK}" \
         "$@" "${PREFLIGHT8}" 2>&1
@@ -366,9 +366,9 @@ EOF
   # The staged goldens. They are not in any checkout, so an unset name has
   # nothing to fall back on and an extra *.json changes the measured cohort.
   expect_refusal "goldens unstaged" \
-    "MLXFAST_NEMOTRON35_GOLDEN_DIR is unset" MLXFAST_NEMOTRON35_GOLDEN_DIR=
+    "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR is unset" MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=
   expect_refusal "goldens directory absent" \
-    "does not exist or is not a directory" "MLXFAST_NEMOTRON35_GOLDEN_DIR=${WORK}/no-such-goldens"
+    "does not exist or is not a directory" "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${WORK}/no-such-goldens"
   expect_refusal "runner unnamed" \
     "has no RUNNER_NAME" RUNNER_NAME=
 
@@ -484,7 +484,7 @@ EOF
     rotation_case "rotation prompt without per-depth oracles" \
       "${SECOND_IN_POOL} | del(.speculative_oracles[\"${SECOND}\"])" \
       "has no pinned per-depth oracle speculative_oracles[${SECOND}][mtp1]" \
-      "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
+      "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
   fi
   rotation_case "rotation prompt outside timed_prompt_pool" \
     '.live_golden_rotation.pool += ["nosuch"]' \
@@ -495,7 +495,7 @@ EOF
     rotation_case "rotation prompt borrowing another prompt's oracles" \
       "${SECOND_IN_POOL} | .speculative_oracles[\"${SECOND}\"] = (.speculative_oracles[\"${LIVE_GOLDEN}\"] | del(.mtp6))" \
       "speculative_oracles[${SECOND}][mtp1] points at ${LIVE_GOLDEN}.mtp1.golden.json" \
-      "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
+      "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
   fi
   rotation_case "rotation pool empty" '.live_golden_rotation.pool = []' \
     "live_golden_rotation.pool is empty"
@@ -519,7 +519,7 @@ for d in c["mtp_head"]["permitted_draft_depths"]:
         "r2_path": f"{prefix}/{base}", "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
 json.dump(c, open(dst, "w", encoding="utf-8"), indent=2)
 ROTEOF
-  control_rot="$(run_preflight "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR2}")"
+  control_rot="$(run_preflight "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR2}")"
   if grep -q 'ranked-box-preflight: all checks passed' <<<"${control_rot}" \
     && grep -q "every rotation pool prompt (${LIVE_GOLDEN} ${SECOND})" <<<"${control_rot}"; then
     echo "ok    section 4b / control: a two-prompt pool, fully pinned and staged, passes"
@@ -532,7 +532,7 @@ ROTEOF
   else
     rm "${GOLDEN_DIR2}/${SECOND}.mtp4.golden.json"
     expect_refusal "rotation oracle not staged" "${SECOND}.mtp4.golden.json" \
-      "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR2}"
+      "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR2}"
   fi
   cp "${WORK}/contract.orig.json" "${SCAFFOLD_CONTRACT}"
 
@@ -542,14 +542,14 @@ ROTEOF
   cp -R "${GOLDEN_DIR}" "${GOLDEN_DIR3}"
   echo '{}' > "${GOLDEN_DIR3}/g2-5.golden.json"
   echo '{}' > "${GOLDEN_DIR3}/g2-5.mtp3.golden.json"
-  if run_preflight "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR3}" | grep -q 'ranked-box-preflight: all checks passed'; then
+  if run_preflight "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR3}" | grep -q 'ranked-box-preflight: all checks passed'; then
     echo "ok    section 4 / a refresh generation staged ahead of its pin passes"
   else
     fail "section 4 / a refresh generation staged ahead of its pin was refused"
   fi
   echo '{}' > "${GOLDEN_DIR3}/final-1.golden.json"
   expect_refusal "held-out final golden staged" "final-1.golden.json" \
-    "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR3}"
+    "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR3}"
 
   # THE SHIPPED SHAPE (sections 4b and 8b): live_goldens. Every job measures
   # every live golden, so every one needs its own band in the calibration file.

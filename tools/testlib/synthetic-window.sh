@@ -12,7 +12,7 @@
 synthetic_window_weights() {
   local dir="$1"
   mkdir -p "${dir}" || return 1
-  printf '{"model_type":"nemotron_h","vocab_size":131072}\n' > "${dir}/config.json"
+  printf '{"model_type":"muse_glimmer","vocab_size":202048}\n' > "${dir}/config.json"
   printf '{"weight_map":{"x":"model-00001-of-00001.safetensors"}}\n' > "${dir}/model.safetensors.index.json"
   printf '{"quantization":{"quant_algo":"MIXED_PRECISION"}}\n' > "${dir}/hf_quant_config.json"
   head -c 4096 /dev/zero > "${dir}/model-00001-of-00001.safetensors"

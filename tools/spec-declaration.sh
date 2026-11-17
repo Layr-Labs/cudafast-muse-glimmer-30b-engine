@@ -106,8 +106,13 @@ if [[ -f "${MANIFEST}" ]]; then
 
   if [[ "$(jq -r 'has("source")' "${MANIFEST}")" == "true" ]]; then
     declared_source="$(jq -r '.source | if type == "string" then . else tojson end' "${MANIFEST}")"
-    [[ "${declared_source}" == "pinned" ]] \
-      || fail "source \"${declared_source}\" is not accepted; the head is the organizer-staged pinned head, so the only accepted source is \"pinned\""
+    # The CONTRACT names the only source this track can carry: a track whose
+    # checkpoint ships a pinned head declares "pinned"; a serial-only track
+    # whose checkpoint ships none declares "none". Anything else is refused,
+    # never waved through.
+    accepted_source="$(jq -r '.mtp_head.source // "pinned"' "${CONTRACT}")"
+    [[ "${declared_source}" == "${accepted_source}" ]] \
+      || fail "source \"${declared_source}\" is not accepted; the contract's mtp_head.source is \"${accepted_source}\", so the only accepted source is \"${accepted_source}\""
   fi
 
   # max_bytes, bytes and sha256 are recorded, not read: nothing bounds a load

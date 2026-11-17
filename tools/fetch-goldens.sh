@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # fetch-goldens.sh -- fetch pin-verified golden objects from the track's R2
-# bucket for track nemotron3.5-lightning-30b-a3b-cuda-v1.
+# bucket for track muse-glimmer-30b-cuda-v1.
 #
 # THE SCRIPT HAS TWO MODES.
 #
@@ -16,7 +16,7 @@
 #        tools/fetch-goldens.sh --all --out DIR
 #      It reads the contract, then fetches every timed_prompt_pool tape and
 #      every speculative_oracles oracle into DIR. DIR is the directory the
-#      box's runner service exports as MLXFAST_NEMOTRON35_GOLDEN_DIR. These objects
+#      box's runner service exports as MLXFAST_MUSE_GLIMMER_GOLDEN_DIR. These objects
 #      are organizer material, so this mode needs R2 credentials and refuses
 #      without them. Run tools/ranked-box-preflight.sh afterwards: it verifies
 #      the staged set against the contract again.
@@ -53,7 +53,7 @@
 #   R2_SECRET_ACCESS_KEY   object they are optional: unset means a plain
 #                        anonymous HTTPS GET, which is all a public object
 #                        needs.
-#   MLXFAST_NEMOTRON35_R2_DOWNLOADER
+#   MLXFAST_MUSE_GLIMMER_R2_DOWNLOADER
 #                        Path to a `download-r2-object.sh KEY DEST` compatible
 #                        signer. It overrides the vendored signer at
 #                        tools/download-r2-object.sh, which is the default.
@@ -78,7 +78,7 @@ Fetch one object from the track's R2 bucket and accept it only if it matches
 the supplied {sha256, bytes} pin exactly. The file is removed on any mismatch,
 so a failed run never leaves half-verified bytes behind.
 
-  --r2-path KEY   Object key, e.g. correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/NAME.json
+  --r2-path KEY   Object key, e.g. correctness_prompts/muse-glimmer-30b-cuda-v1/NAME.json
                   The BUCKET IS NOT PART OF THIS -- it is in R2_BUCKET_ENDPOINT.
   --sha256 HEX    64 lowercase hex characters. Required: there is no unpinned fetch.
   --bytes N       Exact byte count. Required, and checked before the hash.
@@ -95,7 +95,7 @@ must stay that way -- keep it in your .env, never in a file you commit.
 NO PUBLIC GOLDEN IS PINNED FOR THIS TRACK YET, so there is currently nothing a
 participant should be fetching with this. The correctness golden local runs
 already use is checked into the clone at
-correctness_prompts/public-longcopy-gate-english-496.golden.json.
+correctness_prompts/public-longcopy-gate-english-512.golden.json.
 
 THE HIDDEN GUARD: every pin in fixtures/muse_glimmer_30b_cuda_v1_track.json (the
 timed_prompt_pool tapes, the per-depth oracles and hidden_correctness_golden)
@@ -115,7 +115,7 @@ among the staged files.
   --all           Stage the whole pinned set. Needs R2_ACCESS_KEY_ID and
                   R2_SECRET_ACCESS_KEY.
   --out DIR       The staging directory. Export it to the runner service as
-                  MLXFAST_NEMOTRON35_GOLDEN_DIR, then run
+                  MLXFAST_MUSE_GLIMMER_GOLDEN_DIR, then run
                   tools/ranked-box-preflight.sh.
 EOF
 }
@@ -139,7 +139,7 @@ done
 
 if [[ "${FETCH_ALL}" == "1" ]]; then
   if [[ -z "${OUT_PATH}" ]]; then
-    echo "fetch-goldens.sh: --all needs --out DIR (the staging directory the box exports as MLXFAST_NEMOTRON35_GOLDEN_DIR)" >&2
+    echo "fetch-goldens.sh: --all needs --out DIR (the staging directory the box exports as MLXFAST_MUSE_GLIMMER_GOLDEN_DIR)" >&2
     exit 2
   fi
   if [[ -n "${R2_PATH}" || -n "${WANT_SHA}" || -n "${WANT_BYTES}" ]]; then
@@ -245,7 +245,7 @@ If you are the organizer staging a box, use --all --out DIR, which stages the
 whole pinned set (credentials are required as well); --allow-hidden lifts this
 refusal for one object. If you are looking for a golden to iterate against
 locally, the checked-in one is
-correctness_prompts/public-longcopy-gate-english-496.golden.json -- no fetch
+correctness_prompts/public-longcopy-gate-english-512.golden.json -- no fetch
 needed.
 EOF
   exit 1
@@ -289,14 +289,14 @@ fi
 # --- the signer -------------------------------------------------------------
 # Credentialed objects need a SigV4 signer. The vendored one at
 # tools/download-r2-object.sh is the default, so staging a box needs nothing
-# else on it. MLXFAST_NEMOTRON35_R2_DOWNLOADER overrides it with any
+# else on it. MLXFAST_MUSE_GLIMMER_R2_DOWNLOADER overrides it with any
 # `download-r2-object.sh KEY DEST` compatible script.
 DOWNLOADER=""
 if [[ "${have_credentials}" == "1" ]]; then
-  DOWNLOADER="${MLXFAST_NEMOTRON35_R2_DOWNLOADER:-${DEFAULT_DOWNLOADER}}"
+  DOWNLOADER="${MLXFAST_MUSE_GLIMMER_R2_DOWNLOADER:-${DEFAULT_DOWNLOADER}}"
   if [[ ! -x "${DOWNLOADER}" ]]; then
     echo "fetch-goldens.sh: the signer is not executable: ${DOWNLOADER}" >&2
-    echo "fetch-goldens.sh: (set MLXFAST_NEMOTRON35_R2_DOWNLOADER to a 'download-r2-object.sh KEY DEST' script, or restore tools/download-r2-object.sh)" >&2
+    echo "fetch-goldens.sh: (set MLXFAST_MUSE_GLIMMER_R2_DOWNLOADER to a 'download-r2-object.sh KEY DEST' script, or restore tools/download-r2-object.sh)" >&2
     exit 1
   fi
 fi
@@ -455,7 +455,7 @@ EOF
   fi
 
   echo "fetch-goldens.sh: staged ${staged} object(s), kept ${kept} already-pinned file(s), in ${OUT_PATH}"
-  echo "fetch-goldens.sh: export it as MLXFAST_NEMOTRON35_GOLDEN_DIR, then run tools/ranked-box-preflight.sh"
+  echo "fetch-goldens.sh: export it as MLXFAST_MUSE_GLIMMER_GOLDEN_DIR, then run tools/ranked-box-preflight.sh"
   exit 0
 fi
 

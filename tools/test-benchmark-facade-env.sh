@@ -183,38 +183,35 @@ if [[ ! -f "${WORK}/case5.env" ]] || [[ "$(cat "${WORK}/case5.env")" != "${EXPEC
   fail "case 5: benchd did not see the expected track id"
 fi
 
-# Case 6: an mtp1 declaration puts --mtp-depth 1 on the argv. Without it benchd
-# sends free_decode_begin with no spec, the adapter resolves serial, and the
-# declared leg is timed as a serial one.
+# Case 6: an armed declaration never reaches benchd. This track is serial
+# only (permitted_draft_depths is empty), so the facade's own spec derivation
+# refuses the depth by name and no leg is measured under it.
 EXTRA_ENV=(MLXFAST_NO_SANDBOX=1 "SPEC_DECLARATION_MANIFEST=${MTP1_MANIFEST}")
 run_facade case6 "${FACADE}" --local-iterate
-if [[ "${rc}" -ne 0 ]]; then
-  fail "case 6: facade exited ${rc} on an mtp1 declaration; output: $(cat "${WORK}/case6.out")"
+if [[ "${rc}" -eq 0 ]]; then
+  fail "case 6: facade ran an armed declaration on a serial-only track"
 fi
-if [[ ! -f "${WORK}/case6.argv" ]]; then
-  fail "case 6: benchd was never spawned"
-else
-  if ! grep -qx -- '--mtp-depth' "${WORK}/case6.argv"; then
-    fail "case 6: argv carries no --mtp-depth under an mtp1 declaration: $(tr '\n' ' ' < "${WORK}/case6.argv")"
-  fi
-  depth="$(grep -A1 -x -- '--mtp-depth' "${WORK}/case6.argv" | tail -n 1)"
-  if [[ "${depth}" != "1" ]]; then
-    fail "case 6: --mtp-depth is '${depth}', expected 1"
-  fi
+if ! grep -q 'not a contract-permitted draft depth' "${WORK}/case6.out"; then
+  fail "case 6: refusal does not name the draft depth; got: $(cat "${WORK}/case6.out")"
+fi
+if [[ -f "${WORK}/case6.argv" ]]; then
+  fail "case 6: benchd was spawned under an armed declaration"
 fi
 
-# Case 7: the same declaration against a benchd whose help does not list the
-# flag. A serial run under an mtp declaration is the failure this refuses.
-EXTRA_ENV=(MLXFAST_NO_SANDBOX=1 "SPEC_DECLARATION_MANIFEST=${MTP1_MANIFEST}" STUB_HELP=)
+# Case 7: the declaration's SOURCE is the contract's own. This checkpoint ships
+# no head, so `pinned` is refused the same way an armed depth is.
+PINNED_MANIFEST="${WORK}/pinned.manifest.json"
+echo '{"version":1,"source":"pinned","spec":{"enabled":false,"num_speculative_tokens":0}}' > "${PINNED_MANIFEST}"
+EXTRA_ENV=(MLXFAST_NO_SANDBOX=1 "SPEC_DECLARATION_MANIFEST=${PINNED_MANIFEST}")
 run_facade case7 "${FACADE}" --local-iterate
 if [[ "${rc}" -eq 0 ]]; then
-  fail "case 7: facade ran an mtp1 declaration on a benchd with no --mtp-depth"
+  fail "case 7: facade ran a \"pinned\" declaration on a track whose contract source is \"none\""
 fi
-if ! grep -q -- '--mtp-depth' "${WORK}/case7.out"; then
-  fail "case 7: refusal does not name --mtp-depth; got: $(cat "${WORK}/case7.out")"
+if ! grep -q 'is not accepted' "${WORK}/case7.out"; then
+  fail "case 7: refusal does not name the source; got: $(cat "${WORK}/case7.out")"
 fi
 if [[ -f "${WORK}/case7.argv" ]]; then
-  fail "case 7: benchd was spawned for the run despite the refusal"
+  fail "case 7: benchd was spawned under a refused declaration"
 fi
 
 # Case 8: the run goes THROUGH tools/serve-up.sh, so the window boots one

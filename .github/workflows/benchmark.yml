@@ -1,4 +1,4 @@
-# nemotron3.5-lightning-30b-a3b-cuda-v1 RANKED BENCHMARK -- Linux aarch64 (GB10) box.
+# muse-glimmer-30b-cuda-v1 RANKED BENCHMARK -- Linux aarch64 (GB10) box.
 #
 # benchmark.json's runner.workflow names this file. Yukon dispatches it once per
 # submission; the two jobs below are the whole ranked pipeline. A no-GPU,
@@ -33,8 +33,8 @@
 # submission cannot move the pins it is measured against.
 #
 # THE STAGING CONVENTION IS THE EXISTING ONE. The ranked steps read
-# MLXFAST_NEMOTRON35_GOLDEN_DIR out of the self-hosted runner's own process
-# environment -- the same name tools/nemotron35-measure-and-score.sh and
+# MLXFAST_MUSE_GLIMMER_GOLDEN_DIR out of the self-hosted runner's own process
+# environment -- the same name tools/muse-glimmer-measure-and-score.sh and
 # tools/ranked-box-preflight.sh already read (docs/participant-contract.md
 # section 6). The paired path adds two more of the same shape, and no others:
 #
@@ -55,7 +55,7 @@
 # scored against a number from somewhere else.
 #
 # THE RUNNER LABEL IS THE TRACK ID. `runs-on: [self-hosted, Linux, ARM64,
-# nemotron3.5-lightning-30b-a3b-cuda-v1]` -- the fourth label is branch = track = R2 key
+# muse-glimmer-30b-cuda-v1]` -- the fourth label is branch = track = R2 key
 # prefix (the canonical decoder-neutral naming construction). Linux and ARM64
 # name the GB10 box's operating system and architecture; the same pair the
 # aarch64-unknown-linux-gnu benchd dist is published for. tools/box-runner/
@@ -63,7 +63,7 @@
 # surface between this file and the runner side, and a mismatch strands a
 # dispatch with no runner rather than failing it. (tools/box-runner/ itself is
 # still the macOS launchd supervisor; a Linux/systemd runner-provisioning port
-# is a separate box-ops lane -- see docs/nemotron35-port-notes.md.)
+# is a separate box-ops lane -- see docs/muse-glimmer-port-notes.md.)
 #
 # ONE GPU WINDOW PER BOX AT A TIME -- THE BOX LOCK, NOT A CONCURRENCY GROUP.
 # The timed step holds the box-wide GPU lock the spark-gate harness uses,
@@ -88,7 +88,7 @@
 #      pool, any entry whose sha256 is not 64 hex / bytes is not positive, or a
 #      fixture that does not declare official_scoring_enabled: true: refused,
 #      because there would be no armed pin to verify a staged file against.
-#   3. Missing staged asset. MLXFAST_NEMOTRON35_GOLDEN_DIR unset or absent, a pool
+#   3. Missing staged asset. MLXFAST_MUSE_GLIMMER_GOLDEN_DIR unset or absent, a pool
 #      golden missing, the live golden not staged, the pinned benchd /
 #      benchd.manifest.json pair not staged, the reference workspace absent, not
 #      at baseline_reference_commit, edited or unbuilt, or this box's calibration
@@ -128,7 +128,7 @@
 #   - organization Actions enabled for this repository;
 #   - a registered Linux/aarch64 self-hosted runner on each GB10 box advertising
 #     the four labels below (tools/box-runner/, systemd);
-#   - box staging: the pinned pool goldens in MLXFAST_NEMOTRON35_GOLDEN_DIR (the
+#   - box staging: the pinned pool goldens in MLXFAST_MUSE_GLIMMER_GOLDEN_DIR (the
 #     live golden among them), benchd-bin/{benchd, benchd.manifest.json}
 #     matching the channel's aarch64-unknown-linux-gnu manifest (placed out of
 #     band; this job holds no dist token), the pinned engine image present BY
@@ -147,7 +147,7 @@
 # `push` or `schedule` trigger -- Yukon dispatches a submission explicitly, and
 # a pull_request trigger would run every submission twice on the one box.
 
-name: Nemotron 3.5 Lightning 30B-A3B CUDA ranked benchmark
+name: Muse Glimmer 30B NVFP4 CUDA ranked benchmark
 
 on:
   workflow_dispatch:
@@ -162,7 +162,7 @@ jobs:
   # before the dispatch to the ranked box.
   surface-check:
     name: editable-surface + static review (box runner, no GPU, no credential)
-    runs-on: [self-hosted, Linux, ARM64, nemotron3.5-lightning-30b-a3b-cuda-v1]
+    runs-on: [self-hosted, Linux, ARM64, muse-glimmer-30b-cuda-v1]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -197,12 +197,12 @@ jobs:
   # The ranked measurement. `needs: surface-check` so a submission that fails
   # the static review never reaches the box at all.
   ranked:
-    name: ranked measurement (self-hosted, nemotron3.5-lightning-30b-a3b-cuda-v1 GB10 box)
+    name: ranked measurement (self-hosted, muse-glimmer-30b-cuda-v1 GB10 box)
     needs: surface-check
     # The fourth label IS the track id (= the branch name = the R2 key prefix).
     # Linux + ARM64 name the GB10 box. tools/box-runner RUNNER_LABELS must
     # advertise the set.
-    runs-on: [self-hosted, Linux, ARM64, nemotron3.5-lightning-30b-a3b-cuda-v1]
+    runs-on: [self-hosted, Linux, ARM64, muse-glimmer-30b-cuda-v1]
     # A cold run fetches the pinned checkpoint before it measures anything, and
     # then every timed phase waits behind benchd's per-phase cool-down that can
     # legitimately spend up to 900 s. THE COUNT IS DERIVED FROM THE RULED PAIR
@@ -234,7 +234,7 @@ jobs:
     #
     #   MLXFAST_TARGET_SNAPSHOT_DIR   the ~21.6 GB safetensors target snapshot
     #   BENCHD_BIN_DIR                the pinned benchd pair
-    #   MLXFAST_NEMOTRON35_GOLDEN_DIR     the staged track goldens. They are
+    #   MLXFAST_MUSE_GLIMMER_GOLDEN_DIR     the staged track goldens. They are
     #                                 organizer material published in R2 and
     #                                 staged on the box out of band, so no
     #                                 checkout carries them and there is nothing
@@ -251,7 +251,7 @@ jobs:
       - name: Sandbox names (from the runner environment)
         # docs/sandbox-design.md 6b. The runner's actions-runner/.env may set
         # SANDBOX_USER and SANDBOX_ROOT (a second runner on one box does); a
-        # runner that sets neither uses nemosub and /var/lib/nemotron35/sandbox.
+        # runner that sets neither uses nemosub and /var/lib/muse-glimmer/sandbox.
         # A step `env:` cannot read the runner process environment, so this step
         # resolves the two names once and GITHUB_ENV gives them to every later
         # step. The other names (SHARE_GROUP, SANDBOX_ETC, RUST_DIR, RUNNER_USER)
@@ -262,7 +262,7 @@ jobs:
           set -euo pipefail
           {
             printf 'SANDBOX_USER=%s\n' "${SANDBOX_USER:-nemosub}"
-            printf 'SANDBOX_ROOT=%s\n' "${SANDBOX_ROOT:-/var/lib/nemotron35/sandbox}"
+            printf 'SANDBOX_ROOT=%s\n' "${SANDBOX_ROOT:-/var/lib/muse-glimmer/sandbox}"
           } >> "${GITHUB_ENV}"
 
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -294,11 +294,11 @@ jobs:
           # REFERENCE tree the serial-control leg runs on: under the paired
           # model there is no stored pair to fall back on, so a box without it
           # cannot produce a score at all and is refused here.
-          # MLXFAST_NEMOTRON35_GOLDEN_DIR holds the staged track goldens. They are
+          # MLXFAST_MUSE_GLIMMER_GOLDEN_DIR holds the staged track goldens. They are
           # organizer material published in R2 and staged on the box out of
           # band; they are never in the checkout, so an unset variable here has
           # no in-repo copy to fall back on and is refused.
-          for var in MLXFAST_TARGET_SNAPSHOT_DIR BENCHD_BIN_DIR MLXFAST_BASELINE_WORKSPACE MLXFAST_NEMOTRON35_GOLDEN_DIR; do
+          for var in MLXFAST_TARGET_SNAPSHOT_DIR BENCHD_BIN_DIR MLXFAST_BASELINE_WORKSPACE MLXFAST_MUSE_GLIMMER_GOLDEN_DIR; do
             eval "value=\${${var}:-}"
             if [[ -z "${value}" ]]; then
               echo "::error::${var} is not exported by the runner service environment (fleet-bootstrap stages the asset and exports its path)" >&2
@@ -322,7 +322,7 @@ jobs:
             command -v "${tool}" >/dev/null 2>&1 || { echo "::error::${tool} is not on the runner service PATH (fleet-bootstrap owns the unit's PATH)" >&2; fail=1; }
           done
           [[ "${fail}" == "0" ]] || exit 1
-          echo "runner environment ok: snapshot=${MLXFAST_TARGET_SNAPSHOT_DIR} benchd=${BENCHD_BIN_DIR} reference=${MLXFAST_BASELINE_WORKSPACE} calibration=${MLXFAST_BASELINE_CALIBRATION} goldens=${MLXFAST_NEMOTRON35_GOLDEN_DIR} docker=$(command -v docker) cargo=$(command -v cargo)"
+          echo "runner environment ok: snapshot=${MLXFAST_TARGET_SNAPSHOT_DIR} benchd=${BENCHD_BIN_DIR} reference=${MLXFAST_BASELINE_WORKSPACE} calibration=${MLXFAST_BASELINE_CALIBRATION} goldens=${MLXFAST_MUSE_GLIMMER_GOLDEN_DIR} docker=$(command -v docker) cargo=$(command -v cargo)"
 
       - name: Reference workspace is the pinned baseline, and it is built
         # THE SERIAL CONTROL LEG RUNS ON THIS TREE. Under the paired model the
@@ -540,7 +540,7 @@ jobs:
         # absent.)
         #
         # The ranked half of benchmark.json's benchmarkCommand runs at the end.
-        # That command runs tools/nemotron35-yukon-run.sh, which replaces itself
+        # That command runs tools/muse-glimmer-yukon-run.sh, which replaces itself
         # with the same measure script when GITHUB_ACTIONS is "true". This step
         # calls the measure script directly. The golden pool, the reference
         # workspace and this box's calibration file come from the runner
@@ -650,7 +650,7 @@ jobs:
             printf '%s\n' "${foreign}" >&2
             exit 1
           fi
-          echo "nemotron35-cuda-ranked: quiescent after ${waited}s (load=${load} gpu_util=${util}); the per-phase thermal gate is enforced inside the pinned measure-job"
+          echo "muse-glimmer-cuda-ranked: quiescent after ${waited}s (load=${load} gpu_util=${util}); the per-phase thermal gate is enforced inside the pinned measure-job"
 
           # -- the candidate leg's spec, for the log only --------------------
           # The CANDIDATE leg follows the submission's declared spec, and the
@@ -692,7 +692,7 @@ jobs:
           # measure-and-score.sh forwards the two as benchd's
           # --baseline-workspace and --baseline-calibration, and refuses by name
           # when either is unset.
-          MLXFAST_SCORE_PATH=score.json ./tools/nemotron35-measure-and-score.sh
+          MLXFAST_SCORE_PATH=score.json ./tools/muse-glimmer-measure-and-score.sh
 
       - name: Sandbox cleanup (kill nemosub processes, remove per-job dirs)
         if: always()
@@ -750,7 +750,7 @@ jobs:
         run: |
           set -euo pipefail
           nonce="$(cat "${RUNNER_TEMP}/score-nonce")"
-          echo "NEMOTRON35-SCORE-BEGIN ${nonce}"
+          echo "MUSE-GLIMMER-SCORE-BEGIN ${nonce}"
           if [[ -f "${RUNNER_TEMP}/cleanup-ok" ]]; then
             if [[ -f score.json ]]; then
               cat score.json
@@ -759,13 +759,13 @@ jobs:
               fi
               hash="$(sha256sum score.json | awk '{print $1}')"
               bytes="$(wc -c < score.json | tr -d '[:space:]')"
-              echo "NEMOTRON35-SCORE-END ${nonce} sha256=${hash} bytes=${bytes}"
+              echo "MUSE-GLIMMER-SCORE-END ${nonce} sha256=${hash} bytes=${bytes}"
               echo "upload=1" >> "${GITHUB_OUTPUT}"
             else
-              echo "NEMOTRON35-SCORE-END ${nonce} none"
+              echo "MUSE-GLIMMER-SCORE-END ${nonce} none"
             fi
           else
-            echo "NEMOTRON35-SCORE-END ${nonce} none"
+            echo "MUSE-GLIMMER-SCORE-END ${nonce} none"
           fi
 
       - name: Upload score artifact

@@ -209,7 +209,7 @@ run_supervisor() {
   env \
     RUNNER_SU_ENABLED=0 \
     RUNNER_DIR="${run_dir}" \
-    RUNNER_LABELS="nemotron35-box" \
+    RUNNER_LABELS="muse-glimmer-box" \
     GH_APP_MINT="${SCRIPT_DIR}/mock-gh-app-mint.sh" \
     LOG_DIR="${sup_log_dir}" \
     STATE_DIR="${sup_state_dir}" \
@@ -377,7 +377,7 @@ install_stage="${WORK}/install-stage"
 mkdir -p "${install_stage}"
 cp "${BOX_RUNNER_DIR}/install.sh" \
    "${BOX_RUNNER_DIR}/box-runner.env.example" \
-   "${BOX_RUNNER_DIR}/nemotron35-box-runner.service.template" \
+   "${BOX_RUNNER_DIR}/muse-glimmer-box-runner.service.template" \
    "${install_stage}/"
 
 install_runner_dir="${WORK}/install-runner-dir"
@@ -441,12 +441,12 @@ assert_eq "install.sh: first install records the pinned runner version" \
 assert_true "install.sh: first install seeds box-runner.env" \
   test -f "${install_stage}/box-runner.env"
 assert_true "install.sh: first install renders the systemd unit" \
-  test -f "${install_stage}/nemotron35-box-runner.service"
-install_svc="${install_stage}/nemotron35-box-runner.service"
+  test -f "${install_stage}/muse-glimmer-box-runner.service"
+install_svc="${install_stage}/muse-glimmer-box-runner.service"
 assert_true "install: box-runner unit requires the egress block" \
-  grep -qx 'Requires=nemotron35-sandbox-egress.service' "${install_svc}"
+  grep -qx 'Requires=muse-glimmer-sandbox-egress.service' "${install_svc}"
 assert_true "install: box-runner unit starts after egress block" \
-  grep -q '^After=.*nemotron35-sandbox-egress.service' "${install_svc}"
+  grep -q '^After=.*muse-glimmer-sandbox-egress.service' "${install_svc}"
 assert_true "install: box-runner refuses start without iptables egress" \
   grep -q '^ExecStartPre=/usr/sbin/iptables -C OUTPUT -m owner --uid-owner nemosub -j REJECT' "${install_svc}"
 assert_true "install: box-runner refuses start without ip6tables egress" \
@@ -475,7 +475,7 @@ assert_true "supervisor: exports BOX_RUNNER_APP_ENV from a sourced config" \
 # Regression: `timeout 3600 ./run.sh` once killed every job at 60 minutes.
 recycle_case() {  # $1 = MOCK_JOB_STARTED value; prints the logged exit status
   local st="${WORK}/recycle-$1"; rm -rf "${st}"; mkdir -p "${st}"
-  env RUNNER_SU_ENABLED=0 RUNNER_DIR="${run_dir}" RUNNER_LABELS=nemotron35-box \
+  env RUNNER_SU_ENABLED=0 RUNNER_DIR="${run_dir}" RUNNER_LABELS=muse-glimmer-box \
     GH_APP_MINT="${SCRIPT_DIR}/mock-gh-app-mint.sh" LOG_DIR="${st}/log" STATE_DIR="${st}/state" \
     MOCK_STATE_DIR="${st}/mock" MOCK_JOB_STARTED="$1" IDLE_RECYCLE_SECONDS=5 \
     PAUSE_BETWEEN_JOBS=1 BOX_RUNNER_MAX_ITERATIONS=1 BOX_RUNNER_CONFIG=/nonexistent \
@@ -484,7 +484,7 @@ recycle_case() {  # $1 = MOCK_JOB_STARTED value; prints the logged exit status
   sleep 16
   grep -o 'runner exited status=[0-9]*' "${st}/log/supervisor.log" 2>/dev/null | tail -1
   env RUNNER_SU_ENABLED=0 RUNNER_DIR="${run_dir}" LOG_DIR="${st}/log" STATE_DIR="${st}/state" \
-    RUNNER_LABELS=nemotron35-box GH_APP_MINT="${SCRIPT_DIR}/mock-gh-app-mint.sh" \
+    RUNNER_LABELS=muse-glimmer-box GH_APP_MINT="${SCRIPT_DIR}/mock-gh-app-mint.sh" \
     BOX_RUNNER_CONFIG=/nonexistent "${BOX_RUNNER_DIR}/supervisor.sh" stop >/dev/null 2>&1
   kill "${sp}" 2>/dev/null; wait "${sp}" 2>/dev/null
   [ -f "${st}/mock/orphan.pid" ] && kill "$(cat "${st}/mock/orphan.pid")" 2>/dev/null
@@ -503,7 +503,7 @@ FAKE
 chmod +x "${fake_bin}/docker"
 : > "${WORK}/fake-docker.log"
 env PATH="${fake_bin}:${PATH}" FAKE_DOCKER_LOG="${WORK}/fake-docker.log" RUNNER_SU_ENABLED=0 \
-  RUNNER_DIR="${run_dir}" RUNNER_LABELS=nemotron35-box GH_APP_MINT="${SCRIPT_DIR}/mock-gh-app-mint.sh" \
+  RUNNER_DIR="${run_dir}" RUNNER_LABELS=muse-glimmer-box GH_APP_MINT="${SCRIPT_DIR}/mock-gh-app-mint.sh" \
   LOG_DIR="${WORK}/stray-log" STATE_DIR="${WORK}/stray-state" BOX_RUNNER_CONFIG=/nonexistent \
   "${BOX_RUNNER_DIR}/supervisor.sh" stop >/dev/null 2>&1
 assert_true "stop (idle): removes stray serve-up container" grep -q '^rm -f abc123' "${WORK}/fake-docker.log"
@@ -511,11 +511,11 @@ assert_true "stop (idle): removes stray serve-up container" grep -q '^rm -f abc1
 # --- stable per-box runner name ---------------------------------------------
 # The ranked preflight requires calibration.box == RUNNER_NAME, so the minted
 # name must be the SAME on every job: <prefix>-<host>, never a timestamped name.
-stable_name="nemotron35-box-$(hostname -s)"
+stable_name="muse-glimmer-box-$(hostname -s)"
 assert_true "supervisor: minted the stable per-box name ${stable_name}" \
   grep -q "minted JIT config for ${stable_name} " "${sup_log_dir}/supervisor.log"
 assert_true "supervisor: no timestamped runner name is minted" \
-  bash -c "! grep -qE 'minted JIT config for nemotron35-box-[0-9]{14}-' '${sup_log_dir}/supervisor.log'"
+  bash -c "! grep -qE 'minted JIT config for muse-glimmer-box-[0-9]{14}-' '${sup_log_dir}/supervisor.log'"
 
 # =========================================================================
 # 7. setup-sandbox-user.sh: egress migration, resolver ACL unit, cron/at deny,
@@ -532,14 +532,14 @@ mkdir -p "${SBIN}" "${FS}/etc/sudoers.d" "${FS}/etc/systemd/system" "${FS}/var/s
   "${FS}/dev/shm" "${FS}/var/lib/docker/overlay2/l1/diff/tmp" "${FS}/var/lib/nemosub" \
   "${FS}/home/runner/.cache" "${FS}/home/runner/actions-runner/_diag" "${FS}/home/runner/actions-runner/bin" \
   "${FS}/home/runner/actions-runner/_work/_actions" "${FS}/home/runner/actions-runner/_work/_temp" \
-  "${FS}/home/runner/actions-runner/_work/cudafast/cudafast" "${FS}/var/lib/nemotron35/serve-log-env/old"
+  "${FS}/home/runner/actions-runner/_work/cudafast/cudafast" "${FS}/var/lib/muse-glimmer/serve-log-env/old"
 # World-writable, as on a Spark (a docker layer's tmp is one too, but pruned).
 chmod 1777 "${FS}/run/lock" "${FS}/var/tmp" "${FS}/tmp" "${FS}/dev/shm" "${FS}/var/lib/docker/overlay2/l1/diff/tmp"
 chmod 3777 "${FS}/var/crash"
 # runner's .env names the resident log dir; an older world-readable log is in it.
-printf 'LANG=C.UTF-8\nSERVE_UP_LOG_DIR=%s\n' "${FS}/var/lib/nemotron35/serve-log-env" > "${FS}/home/runner/actions-runner/.env"
-echo prompt > "${FS}/var/lib/nemotron35/serve-log-env/old/vllm-resident.x.log"
-chmod 0755 "${FS}/var/lib/nemotron35/serve-log-env"; chmod 0644 "${FS}/var/lib/nemotron35/serve-log-env/old/vllm-resident.x.log"
+printf 'LANG=C.UTF-8\nSERVE_UP_LOG_DIR=%s\n' "${FS}/var/lib/muse-glimmer/serve-log-env" > "${FS}/home/runner/actions-runner/.env"
+echo prompt > "${FS}/var/lib/muse-glimmer/serve-log-env/old/vllm-resident.x.log"
+chmod 0755 "${FS}/var/lib/muse-glimmer/serve-log-env"; chmod 0644 "${FS}/var/lib/muse-glimmer/serve-log-env/old/vllm-resident.x.log"
 sed -e "s#/etc/#${FS}/etc/#g" -e "s#/var/#${FS}/var/#g" -e "s#/opt/rust#${FS}/opt/rust#g" -e "s#/run/#${FS}/run/#g" \
     -e "s#^WIPE_ALWAYS=.*#WIPE_ALWAYS=(${FS}/dev/shm ${FS}/dev/mqueue)#" \
   "${BOX_RUNNER_DIR}/setup-sandbox-user.sh" > "${sbx}/setup-sandbox-user.sh"
@@ -701,18 +701,18 @@ assert_eq "sandbox setup: a second run adds no duplicate rule" 2 "$(grep -cF -- 
 for f in cron.deny at.deny; do
   assert_eq "sandbox setup: nemosub listed once in ${f}" 1 "$(grep -cx nemosub "${FS}/etc/${f}" 2>/dev/null)"
 done
-unit="${FS}/etc/systemd/system/nemotron35-sandbox-acl.service"
+unit="${FS}/etc/systemd/system/muse-glimmer-sandbox-acl.service"
 assert_true "sandbox setup: ACL unit re-applies the deny on the resolved varlink socket" \
   grep -qE "^ExecStart=-.*setfacl -m u:nemosub:--- ${FS}/run/systemd/resolve/io.systemd.Resolve$" "${unit}"
 assert_true "sandbox setup: ACL unit covers nscd's socket" grep -qE "^ExecStart=-.*setfacl -m u:nemosub:--- ${FS}/run/nscd/socket$" "${unit}"
 assert_true "sandbox setup: ACL unit runs after resolved, at boot" \
   bash -c "grep -qx 'After=systemd-resolved.service nscd.service' '${unit}' && grep -qx 'WantedBy=multi-user.target' '${unit}'"
 assert_true "sandbox setup: ACL unit enabled and run" \
-  bash -c "grep -qx 'systemctl enable nemotron35-sandbox-acl.service' '${SBX_LOG}' && grep -qx 'systemctl restart nemotron35-sandbox-acl.service' '${SBX_LOG}'"
-egress_unit="${FS}/etc/systemd/system/nemotron35-sandbox-egress.service"
+  bash -c "grep -qx 'systemctl enable muse-glimmer-sandbox-acl.service' '${SBX_LOG}' && grep -qx 'systemctl restart muse-glimmer-sandbox-acl.service' '${SBX_LOG}'"
+egress_unit="${FS}/etc/systemd/system/muse-glimmer-sandbox-egress.service"
 assert_true "sandbox setup: egress unit runs after network-pre and ufw, before box-runner" \
-  bash -c "grep -qx 'After=network-pre.target ufw.service' '${egress_unit}' && grep -qx 'Before=nemotron35-box-runner.service' '${egress_unit}'"
-egress_script="${FS}/etc/nemotron35-sandbox/egress.sh"
+  bash -c "grep -qx 'After=network-pre.target ufw.service' '${egress_unit}' && grep -qx 'Before=muse-glimmer-box-runner.service' '${egress_unit}'"
+egress_script="${FS}/etc/muse-glimmer-sandbox/egress.sh"
 assert_true "sandbox setup: egress unit runs the installed script by path (no shell text in the unit)" \
   grep -qx "ExecStart=${egress_script}" "${egress_unit}"
 assert_true "sandbox setup: egress script checks then inserts the iptables rule idempotently" \
@@ -721,7 +721,7 @@ assert_true "sandbox setup: egress script covers ip6tables" \
   grep -qE "/ip6tables -I OUTPUT 1 -m owner --uid-owner nemosub -j REJECT$" "${egress_script}"
 assert_true "sandbox setup: egress script is valid sh" sh -n "${egress_script}"
 assert_true "sandbox setup: egress unit enabled and run" \
-  bash -c "grep -qx 'systemctl enable nemotron35-sandbox-egress.service' '${SBX_LOG}' && grep -qx 'systemctl restart nemotron35-sandbox-egress.service' '${SBX_LOG}'"
+  bash -c "grep -qx 'systemctl enable muse-glimmer-sandbox-egress.service' '${SBX_LOG}' && grep -qx 'systemctl restart muse-glimmer-sandbox-egress.service' '${SBX_LOG}'"
 for d in "" /actions-runner /actions-runner/_work; do
   assert_true "sandbox setup: traverse-only ACL on runner home${d}" grep -qxF "setfacl -m u:nemosub:--x ${FS}/home/runner${d}" "${SBX_LOG}"
 done
@@ -736,14 +736,14 @@ for d in /actions-runner /actions-runner/_work /actions-runner/_work/cudafast; d
     "$(grep -xF "setfacl -m u:nemosub:--- ${FS}/home/runner${d}" "${SBX_LOG}")"
 done
 # F3: the wipe list holds each world-writable dir nemosub can reach, and /dev/shm.
-wl="${FS}/etc/nemotron35-sandbox/wipe-dirs"
+wl="${FS}/etc/muse-glimmer-sandbox/wipe-dirs"
 for d in /tmp /var/tmp /run/lock /var/crash /dev/shm; do
   assert_true "sandbox setup: wipe list has ${d}" grep -qxF "${FS}${d}" "${wl}"
 done
 assert_eq "sandbox setup: wipe list skips docker's layers and an unmounted mqueue" "" "$(grep -E 'docker|mqueue' "${wl}")"
 assert_eq "sandbox setup: wipe list is mode 0644" 644 "$(stat -c %a "${wl}")"
 # serve-log: the .env's dir, 0750, runner:runner, nothing in it readable by others.
-sl="${FS}/var/lib/nemotron35/serve-log-env"
+sl="${FS}/var/lib/muse-glimmer/serve-log-env"
 assert_eq "sandbox setup: the .env's resident log dir is 0750" 750 "$(stat -c %a "${sl}")"
 assert_true "sandbox setup: the resident log dir is chowned runner:runner" grep -qxF "chown runner:runner ${sl}" "${SBX_LOG}"
 assert_eq "sandbox setup: an older log in it loses other-read" 640 "$(stat -c %a "${sl}/old/vllm-resident.x.log")"
@@ -772,11 +772,11 @@ assert_true "sandbox --check: name resolution fails" grep -q '^PASS  nemosub can
 # The systemctl stub reports a unit enabled only if the call log records its enable.
 out_root="$(env PATH="${SBIN}:${PATH}" "${sbx}/setup-sandbox-user.sh" --check 2>&1)"
 assert_true "sandbox --check (root): a disabled egress unit fails" \
-  grep -q '^FAIL  nemotron35-sandbox-egress.service is enabled' <<<"${out_root}"
-echo "systemctl enable nemotron35-sandbox-egress.service" >> "${SBX_LOG}"
+  grep -q '^FAIL  muse-glimmer-sandbox-egress.service is enabled' <<<"${out_root}"
+echo "systemctl enable muse-glimmer-sandbox-egress.service" >> "${SBX_LOG}"
 out_root="$(env PATH="${SBIN}:${PATH}" "${sbx}/setup-sandbox-user.sh" --check 2>&1)"
 assert_true "sandbox --check (root): egress unit enabled" \
-  grep -q '^PASS  nemotron35-sandbox-egress.service is enabled' <<<"${out_root}"
+  grep -q '^PASS  muse-glimmer-sandbox-egress.service is enabled' <<<"${out_root}"
 assert_true "sandbox --check: cron refuses nemosub" grep -q '^PASS  cron refuses nemosub' <<<"${out}"
 assert_true "sandbox --check: cron.deny and at.deny list nemosub" \
   bash -c "grep -q '^PASS  nemosub is listed in .*/cron.deny' <<<\"\$0\" && grep -q '^PASS  nemosub is listed in .*/at.deny' <<<\"\$0\"" "${out}"
@@ -789,7 +789,7 @@ for p in actions-runner/.env actions-runner/_diag .cache; do
 done
 assert_true "sandbox --check: the wipe list exists" grep -q '^PASS  wipe list .* exists' <<<"${out}"
 assert_true "sandbox --check: nothing nemosub-owned in the wipe-list dirs" grep -q '^PASS  nothing nemosub-owned in any wipe-list directory' <<<"${out}"
-assert_true "sandbox --check: nemosub cannot read the resident log dir" grep -q "^PASS  nemosub cannot read the resident log dir ${FS}/var/lib/nemotron35/serve-log-env\$" <<<"${out}"
+assert_true "sandbox --check: nemosub cannot read the resident log dir" grep -q "^PASS  nemosub cannot read the resident log dir ${FS}/var/lib/muse-glimmer/serve-log-env\$" <<<"${out}"
 # Negative: a file "nemosub" (here: this user) left in /run/lock fails the check;
 # lifting the home denies and opening the log dir fail theirs.
 touch "${FS}/run/lock/leftover"
@@ -834,9 +834,9 @@ printf 'SERVE_UP_LOG_DIR=%s\n' "${FS}/var/lib/layrbench/serve-log" > "${FS}/home
 printf '#!/usr/bin/env bash\necho "rustup $*" >> "${SBX_LOG}"\n' > "${FS}/opt/layrsub-rust/cargo/bin/rustup"
 chmod +x "${FS}/opt/layrsub-rust/cargo/bin/rustup"
 echo "iptables ${old_rule}" >> "${SBX_IPT}"
-first_files=("${FS}/etc/nemotron35-sandbox/egress.sh" "${FS}/etc/nemotron35-sandbox/wipe-dirs"
-  "${FS}/etc/systemd/system/nemotron35-sandbox-egress.service" "${FS}/etc/systemd/system/nemotron35-sandbox-acl.service"
-  "${FS}/etc/sudoers.d/nemotron35-sandbox")
+first_files=("${FS}/etc/muse-glimmer-sandbox/egress.sh" "${FS}/etc/muse-glimmer-sandbox/wipe-dirs"
+  "${FS}/etc/systemd/system/muse-glimmer-sandbox-egress.service" "${FS}/etc/systemd/system/muse-glimmer-sandbox-acl.service"
+  "${FS}/etc/sudoers.d/muse-glimmer-sandbox")
 first_sums="$(sha256sum "${first_files[@]}" 2>&1)"
 first_rules="$(grep -F -- '--uid-owner nemosub' "${SBX_IPT}")"
 : > "${SBX_LOG}"

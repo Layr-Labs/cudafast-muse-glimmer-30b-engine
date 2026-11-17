@@ -3,7 +3,7 @@
 #
 # TRUSTED, runner-side. .github/workflows/benchmark.yml runs it after Setup and
 # before the GPU-exclusive measurement step, writes the name to a runner-private
-# file under RUNNER_TEMP, and hands it to tools/nemotron35-measure-and-score.sh
+# file under RUNNER_TEMP, and hands it to tools/muse-glimmer-measure-and-score.sh
 # as MLXFAST_LIVE_GOLDEN_CHOICE. Both legs of every pair of the job measure the
 # one name drawn here.
 #
@@ -20,7 +20,7 @@
 # rotation block prints live_golden, exactly as before rotation existed.
 #
 # A fixture that declares live_goldens scores EVERY listed prompt in every job
-# (one pair per prompt, tools/nemotron35-measure-and-score.sh), so there is
+# (one pair per prompt, tools/muse-glimmer-measure-and-score.sh), so there is
 # nothing to draw: this prints nothing, and the measurement refuses a non-empty
 # MLXFAST_LIVE_GOLDEN_CHOICE.
 #

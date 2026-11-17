@@ -4,7 +4,7 @@
 # Covers tools/draw-live-golden.sh (uniform over a rotation pool, refusal of a
 # pool name outside timed_prompt_pool, fallback to live_golden when no rotation
 # is declared, and no draw at all under live_goldens) and
-# tools/nemotron35-measure-and-score.sh under the shipped live_goldens: every
+# tools/muse-glimmer-measure-and-score.sh under the shipped live_goldens: every
 # live golden handed to benchd in fixture order, with its serial control golden
 # and, at a declared depth, its per-depth oracle; a drawn prompt refused; and
 # the one measurement retry. benchd is a stub that records its argv. No GPU, no
@@ -136,9 +136,9 @@ measure() { # measure FIXTURE [env...]  -> stdout+stderr; argv in ${WORK}/argv
   env -u MLXFAST_LIVE_GOLDEN_CHOICE -u SANDBOX_USER -u MLXFAST_QWEN_MTP_TRACK_ID \
     BENCHD="${WORK}/benchd" STUB_ARGV="${WORK}/argv" \
     MLXFAST_BASELINE_WORKSPACE="${WORK}/ws" MLXFAST_BASELINE_CALIBRATION="${WORK}/cal.json" \
-    MLXFAST_NEMOTRON35_GOLDEN_DIR="${GOLDENS}" MLXFAST_ENGINE_BIN="${WORK}/engine" \
+    MLXFAST_MUSE_GLIMMER_GOLDEN_DIR="${GOLDENS}" MLXFAST_ENGINE_BIN="${WORK}/engine" \
     MLXFAST_WEIGHTS_PATH="${WORK}/weights" SPEC_DECLARATION_MANIFEST="${ROOT}/mtp-head.manifest.json" \
-    "$@" "${ROOT}/tools/nemotron35-measure-and-score.sh" ${MS_ARGS[@]+"${MS_ARGS[@]}"} 2>&1
+    "$@" "${ROOT}/tools/muse-glimmer-measure-and-score.sh" ${MS_ARGS[@]+"${MS_ARGS[@]}"} 2>&1
 }
 MS_ARGS=()
 argv_has() { grep -qxF -- "$1" "${WORK}/argv" 2>/dev/null; }

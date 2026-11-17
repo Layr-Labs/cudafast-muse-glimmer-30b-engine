@@ -23,7 +23,7 @@
 #
 # Environment:
 #   MLXFAST_TARGET_SNAPSHOT_DIR   the target snapshot. Set: verify only. Unset:
-#                                 reference_weights/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+#                                 reference_weights/Muse-Glimmer-30B-NVFP4
 #                                 under this checkout, which setup fills.
 #   MLXFAST_TARGET_BASE_URL       where a missing file is fetched from on the
 #                                 default path. Default: the fixture's
@@ -46,7 +46,7 @@ command -v jq >/dev/null 2>&1 || die "jq is required"
 # The public model repository the target was pinned from, at that revision
 # (the fixture's upstream_model_id / upstream_revision). Its files are flat at
 # the repository root and the snapshot keeps them flat.
-DEFAULT_SNAPSHOT_DIR="${ROOT_DIR}/reference_weights/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+DEFAULT_SNAPSHOT_DIR="${ROOT_DIR}/reference_weights/Muse-Glimmer-30B-NVFP4"
 
 resolve_target_source() {
   # Read once, in step 2, when the default path may fetch.

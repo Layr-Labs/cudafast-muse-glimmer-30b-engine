@@ -109,7 +109,7 @@ nothing to the timed path (a native process with plain pipes).
    that `nemosub` can write. The control leg's socket, and every `.pid`
    sidecar, stay where `nemosub` cannot write, so a leftover candidate process
    cannot swap the control socket or steer `--stop` into signalling a `runner`
-   process. The resident log dir (`SERVE_UP_LOG_DIR`, `/var/lib/nemotron35/serve-log` on
+   process. The resident log dir (`SERVE_UP_LOG_DIR`, `/var/lib/muse-glimmer/serve-log` on
    a box) is `runner:runner` 0750 (setup strips other-access from what is
    already there) and `serve-up.sh` creates each resident log 0600 and the
    identity file 0640, so a later job's `nemosub` cannot read what an earlier
@@ -153,10 +153,10 @@ nothing to the timed path (a native process with plain pipes).
    not exempt because the host resolver (`127.0.0.53`) forwards names, which
    is a way out. Kernel netfilter rules are not persistent across reboot unless
    `iptables-persistent` is installed, so a boot-time oneshot unit
-   (`nemotron35-sandbox-egress.service`) re-applies the block; the box-runner
+   (`muse-glimmer-sandbox-egress.service`) re-applies the block; the box-runner
    unit refuses to start without it. The resolver's Unix sockets (`systemd-resolved`'s varlink
    socket, `nscd`'s) are denied to `nemosub` by ACL; `/run` is a tmpfs, so a
-   boot-time oneshot unit (`nemotron35-sandbox-acl.service`) re-applies it,
+   boot-time oneshot unit (`muse-glimmer-sandbox-acl.service`) re-applies it,
    and `--check` proves `getent hosts` fails as `nemosub`. The containers run
    `--network none` and are unaffected.
 6. **What `nemosub` can still do.** Read world-readable files (public repo,
@@ -181,7 +181,7 @@ nothing to the timed path (a native process with plain pipes).
    verifies none remain. It runs:
    - at **job start** and **job end** (the ranked workflow);
    - **before the timed measurement**, when `SANDBOX_USER` is set:
-     `tools/nemotron35-measure-and-score.sh` kills every `nemosub` process,
+     `tools/muse-glimmer-measure-and-score.sh` kills every `nemosub` process,
      runs the wipe, then `tools/wait-for-memory.sh` (so setup leftovers and
      anything from an earlier step cannot fill `/dev/shm` before pair 1's
      control leg);
@@ -217,21 +217,21 @@ that changes each name for a second runner on the same box.
 |---|---|
 | Sandbox user | `nemosub`: system user, shell `/usr/sbin/nologin`, home `/var/lib/nemosub` (0700), NOT in `docker`, `bench` or `sudo` |
 | Shared group | `nemoshare`: members `runner` and `nemosub` |
-| Sandbox root | `/var/lib/nemotron35/sandbox`, owner `runner:nemoshare`, mode `2750` (nemosub can traverse and read, not write) |
+| Sandbox root | `/var/lib/muse-glimmer/sandbox`, owner `runner:nemoshare`, mode `2750` (nemosub can traverse and read, not write) |
 | Per-job dirs (created by `runner` under the root, removed at job end) | `<root>/<job>/vendor` and `<root>/<job>/sock` `2750` (read-only to nemosub; `serve-up.sh` creates each leg's `sock/<tag>/` itself, `2770`); `<root>/<job>/cargo-home`, `<root>/<job>/target`, `<root>/<job>/kernels-out`, `<root>/<job>/adapter-home` all `2770` (nemosub writes; `adapter-home` is the adapter's `HOME` and `TMPDIR`) |
 | Rust for nemosub | `/opt/rust/cargo` + `/opt/rust/rustup`, root-owned, world-readable, same toolchain as `runner`'s (`rustup show active-toolchain` as runner); callers set `PATH=/opt/rust/cargo/bin:...` AND `RUSTUP_HOME=/opt/rust/rustup` |
-| sudoers | `/etc/sudoers.d/nemotron35-sandbox`: `runner ALL=(nemosub) NOPASSWD:SETENV: ALL` |
+| sudoers | `/etc/sudoers.d/muse-glimmer-sandbox`: `runner ALL=(nemosub) NOPASSWD:SETENV: ALL` |
 | Drop to sandbox | `sudo -n -u nemosub --preserve-env=VAR1,VAR2 -- cmd …` (never a shell string) |
 | Kill every sandbox process | `sudo -n -u nemosub -- kill -KILL -1`, then verify `pgrep -u nemosub` is empty |
-| Egress | `iptables` and `ip6tables`: `OUTPUT -m owner --uid-owner nemosub -j REJECT` (no loopback exemption; setup deletes the older `! -o lo` rule); re-applied at boot by `nemotron35-sandbox-egress.service` |
-| Resolver | ACL `u:nemosub:---` on `/run/systemd/resolve/io.systemd.Resolve` and `/run/nscd/socket` when present, re-applied at boot by `nemotron35-sandbox-acl.service` |
+| Egress | `iptables` and `ip6tables`: `OUTPUT -m owner --uid-owner nemosub -j REJECT` (no loopback exemption; setup deletes the older `! -o lo` rule); re-applied at boot by `muse-glimmer-sandbox-egress.service` |
+| Resolver | ACL `u:nemosub:---` on `/run/systemd/resolve/io.systemd.Resolve` and `/run/nscd/socket` when present, re-applied at boot by `muse-glimmer-sandbox-acl.service` |
 | No persistence | `nemosub` in `/etc/cron.deny` and `/etc/at.deny`; no crontab, no at job, no linger |
-| Wipe list | `/etc/nemotron35-sandbox/wipe-dirs`, root 0644, one directory per line: every world-writable directory on a local filesystem that `nemosub` can enter and write, plus `/dev/shm` and `/dev/mqueue`; written by `setup-sandbox-user.sh` (re-run it after adding a mount) |
-| Wipe | `tools/sandbox-wipe.sh`: every `nemosub`-owned file under each wipe-list directory (a missing one is skipped) and `/var/lib/nemosub`, and its SysV IPC, then verified gone; a missing or empty wipe list fails it. The workflow runs it at job start and end; `nemotron35-measure-and-score.sh` runs kill + wipe + `wait-for-memory.sh` before the first timed attempt and again between control-leg retries (plus clears per-job sandbox dirs on retry); candidate `serve-up.sh --stop` runs kill + wipe + `wait-for-memory.sh` when the stop tears down a sandboxed leg (see item 4) |
+| Wipe list | `/etc/muse-glimmer-sandbox/wipe-dirs`, root 0644, one directory per line: every world-writable directory on a local filesystem that `nemosub` can enter and write, plus `/dev/shm` and `/dev/mqueue`; written by `setup-sandbox-user.sh` (re-run it after adding a mount) |
+| Wipe | `tools/sandbox-wipe.sh`: every `nemosub`-owned file under each wipe-list directory (a missing one is skipped) and `/var/lib/nemosub`, and its SysV IPC, then verified gone; a missing or empty wipe list fails it. The workflow runs it at job start and end; `muse-glimmer-measure-and-score.sh` runs kill + wipe + `wait-for-memory.sh` before the first timed attempt and again between control-leg retries (plus clears per-job sandbox dirs on retry); candidate `serve-up.sh --stop` runs kill + wipe + `wait-for-memory.sh` when the stop tears down a sandboxed leg (see item 4) |
 | Adapter limits | `prlimit --fsize=67108864 --nproc` (default 4096, `ADAPTER_NPROC_LIMIT`) `--as` (default 16 GiB, `ADAPTER_AS_LIMIT` in bytes) on the adapter in `tools/run-engine-sandboxed.sh`; the build uses separate `CARGO_NPROC_LIMIT` / `CARGO_AS_LIMIT` |
-| Resident logs | `SERVE_UP_LOG_DIR` (from `actions-runner/.env`, else `/var/lib/nemotron35/serve-log`) `runner:runner` 0750, nothing in it other-readable; `serve-up.sh` writes resident logs 0600, the identity file 0640 |
+| Resident logs | `SERVE_UP_LOG_DIR` (from `actions-runner/.env`, else `/var/lib/muse-glimmer/serve-log`) `runner:runner` 0750, nothing in it other-readable; `serve-up.sh` writes resident logs 0600, the identity file 0640 |
 | Checkout access | per job, as `runner`: `setfacl -R -P -m u:nemosub:rX` (and `-d`) on `$GITHUB_WORKSPACE`, `--x` on each parent up to `runner`'s home, `---` on every other entry directly under each of those parents (all but the component leading to the checkout), on `RUNNER_TEMP` and on `_work/_actions` and `_work/_tool` when present; setup gives `--x` on `runner`'s home, `actions-runner`, `_work` and `---` on every entry under the first two but the next one down and on `_work/_*`. Files `runner` writes under the checkout are `nemosub`-readable (default ACL): never a secret there |
-| Workflow env | `SANDBOX_USER` and `SANDBOX_ROOT` from the runner environment, else `nemosub` and `/var/lib/nemotron35/sandbox` (the first step of the ranked job resolves them into `GITHUB_ENV`), `SANDBOX_JOB=<run_id>-<run_attempt>`, `SERVE_UP_SANDBOX_TREE=$GITHUB_WORKSPACE` in the measurement step: only the candidate checkout's serve-up takes `SANDBOX_USER` as its container user, and the reference tree's serve-up runs as `runner` |
+| Workflow env | `SANDBOX_USER` and `SANDBOX_ROOT` from the runner environment, else `nemosub` and `/var/lib/muse-glimmer/sandbox` (the first step of the ranked job resolves them into `GITHUB_ENV`), `SANDBOX_JOB=<run_id>-<run_attempt>`, `SERVE_UP_SANDBOX_TREE=$GITHUB_WORKSPACE` in the measurement step: only the candidate checkout's serve-up takes `SANDBOX_USER` as its container user, and the reference tree's serve-up runs as `runner` |
 | Box check | `tools/box-runner/setup-sandbox-user.sh --check` exits 0 only if all of the above holds |
 
 benchd spawns `tools/serve-up.sh --stop` with its own environment (it does not
@@ -276,13 +276,13 @@ them.
 | `RUNNER_USER` | `runner` | `layrbench` | `setup-sandbox-user.sh` |
 | `SANDBOX_USER` | `nemosub` | `layrsub` | setup, workflow, every sandbox tool |
 | `SHARE_GROUP` | `nemoshare` | `layrshare` | setup, `tools/engine/build.sh`, `tools/serve-up.sh` |
-| `SANDBOX_ROOT` | `/var/lib/nemotron35/sandbox` | `/var/lib/layrbench/sandbox` | setup, workflow |
-| `SANDBOX_ETC` | `/etc/nemotron35-sandbox` | `/etc/layrbench-sandbox` | setup (`wipe-dirs`, `egress.sh`), `tools/sandbox-wipe.sh` |
-| `SUDOERS_NAME` | `nemotron35-sandbox` | `layrbench-sandbox` | setup (a file in `/etc/sudoers.d`; no dot in the name) |
-| `EGRESS_UNIT` | `nemotron35-sandbox-egress.service` | `layrbench-sandbox-egress.service` | setup |
-| `ACL_UNIT` | `nemotron35-sandbox-acl.service` | `layrbench-sandbox-acl.service` | setup |
+| `SANDBOX_ROOT` | `/var/lib/muse-glimmer/sandbox` | `/var/lib/layrbench/sandbox` | setup, workflow |
+| `SANDBOX_ETC` | `/etc/muse-glimmer-sandbox` | `/etc/layrbench-sandbox` | setup (`wipe-dirs`, `egress.sh`), `tools/sandbox-wipe.sh` |
+| `SUDOERS_NAME` | `muse-glimmer-sandbox` | `layrbench-sandbox` | setup (a file in `/etc/sudoers.d`; no dot in the name) |
+| `EGRESS_UNIT` | `muse-glimmer-sandbox-egress.service` | `layrbench-sandbox-egress.service` | setup |
+| `ACL_UNIT` | `muse-glimmer-sandbox-acl.service` | `layrbench-sandbox-acl.service` | setup |
 | `RUST_DIR` | `/opt/rust` | `/opt/layrbench-rust` | setup, `tools/engine/build.sh` |
-| `SERVE_UP_LOG_DIR` | `/var/lib/nemotron35/serve-log` (setup) | `/var/lib/layrbench/serve-log` | setup (from the runner's `actions-runner/.env`), `tools/serve-up.sh` |
+| `SERVE_UP_LOG_DIR` | `/var/lib/muse-glimmer/serve-log` (setup) | `/var/lib/layrbench/serve-log` | setup (from the runner's `actions-runner/.env`), `tools/serve-up.sh` |
 | `SERVE_UP_CONTAINER_PREFIX` | `serve-up-` | `layr-serve-up-` | `tools/serve-up.sh`, `tools/box-runner/supervisor.sh` |
 
 The sandbox home is always `/var/lib/<SANDBOX_USER>`.

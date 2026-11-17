@@ -5,7 +5,7 @@ ranked benchmark: mint a just-in-time (JIT), single-use runner registration,
 run exactly one job with it, verify the job's whole process tree is gone,
 repeat. This directory owns the **runner side** only. The workflow file that
 dispatches jobs against it is `.github/workflows/benchmark.yml`
-(`runs-on: [self-hosted, Linux, ARM64, nemotron3.5-lightning-30b-a3b-cuda-v1]`); the coupling between
+(`runs-on: [self-hosted, Linux, ARM64, muse-glimmer-30b-cuda-v1]`); the coupling between
 the two sides is exactly the `RUNNER_LABELS` value described below, and
 nothing else.
 
@@ -19,7 +19,7 @@ nothing else.
 | `install.sh` | Idempotent box setup: checksum-pinned actions-runner download, directories, config seed, systemd unit render (never installed automatically). |
 | `setup-sandbox-user.sh` | One-time root setup of the `nemosub` sandbox user; `--check` verifies it (see "Sandbox user" below). |
 | `box-runner.env.example` | Config template; `install.sh` seeds `box-runner.env` from it once. |
-| `nemotron35-box-runner.service.template` | systemd unit template `install.sh` renders. |
+| `muse-glimmer-box-runner.service.template` | systemd unit template `install.sh` renders. |
 | `test/test-box-runner.sh` | Dry-run suite exercising all of the above against mock processes; no network, no root, no real actions-runner. |
 
 ## The orphan bug this fixes (read this before changing spawn/stop)
@@ -83,7 +83,7 @@ of these (fail-closed):**
 | Var | Meaning |
 |---|---|
 | `RUNNER_DIR` | Path to the actions-runner install (`install.sh` creates it). |
-| `RUNNER_LABELS` | JIT registration labels. **Must match** the `runs-on:` list in `.github/workflows/benchmark.yml` — `Linux,ARM64,nemotron3.5-lightning-30b-a3b-cuda-v1` (`self-hosted` is force-included by `gh-app-mint.sh`). This is the entire coupling surface between the two sides — get it wrong and every dispatched job silently finds no runner. The seeded `box-runner.env` ships it empty and `supervisor.sh` refuses to start until an operator sets it. |
+| `RUNNER_LABELS` | JIT registration labels. **Must match** the `runs-on:` list in `.github/workflows/benchmark.yml` — `Linux,ARM64,muse-glimmer-30b-cuda-v1` (`self-hosted` is force-included by `gh-app-mint.sh`). This is the entire coupling surface between the two sides — get it wrong and every dispatched job silently finds no runner. The seeded `box-runner.env` ships it empty and `supervisor.sh` refuses to start until an operator sets it. |
 | `GH_APP_ID`, `GH_APP_KEY`, `GH_RUNNER_REPO` | Required by `gh-app-mint.sh` (see its own header); set via env or `BOX_RUNNER_APP_ENV`. |
 
 **Optional (sane defaults, see `box-runner.env.example` for every one):**
@@ -174,9 +174,9 @@ tools/box-runner/install.sh
 # GH_APP_KEY / GH_RUNNER_REPO (env or BOX_RUNNER_APP_ENV).
 
 # Go live (operator, as root):
-sudo install -m 0644 -o root -g root tools/box-runner/nemotron35-box-runner.service /etc/systemd/system/
+sudo install -m 0644 -o root -g root tools/box-runner/muse-glimmer-box-runner.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now nemotron35-box-runner.service
+sudo systemctl enable --now muse-glimmer-box-runner.service
 
 # Check what the box is doing right now:
 tools/box-runner/supervisor.sh status
@@ -199,16 +199,16 @@ sudo tools/box-runner/setup-sandbox-user.sh
 It is idempotent. It creates group `nemoshare` (adds `runner` to it, leaving
 `runner`'s other groups alone), system user `nemosub` (`/usr/sbin/nologin`,
 home `/var/lib/nemosub` 0700, not in `docker`/`bench`/`sudo`),
-`/var/lib/nemotron35/sandbox` (`runner:nemoshare` 2750),
-`/etc/sudoers.d/nemotron35-sandbox` (`runner ALL=(nemosub) NOPASSWD:SETENV: ALL`,
+`/var/lib/muse-glimmer/sandbox` (`runner:nemoshare` 2750),
+`/etc/sudoers.d/muse-glimmer-sandbox` (`runner ALL=(nemosub) NOPASSWD:SETENV: ALL`,
 checked with `visudo` before it is installed), a Rust toolchain in `/opt/rust`
 matching `runner`'s, and `iptables`/`ip6tables` rules that reject every packet
 `nemosub` sends, loopback included (an older loopback-exempt rule is removed),
-re-applied at every boot by `nemotron35-sandbox-egress.service` (it also saves
+re-applied at every boot by `muse-glimmer-sandbox-egress.service` (it also saves
 with `netfilter-persistent` when that package is installed). It denies `nemosub`
 the resolver sockets
 (`systemd-resolved`'s varlink socket, `nscd`'s) by ACL, re-applied at every boot
-by `nemotron35-sandbox-acl.service` because `/run` is a tmpfs; lists `nemosub`
+by `muse-glimmer-sandbox-acl.service` because `/run` is a tmpfs; lists `nemosub`
 in `/etc/cron.deny` and `/etc/at.deny` and disables its linger; and gives
 `nemosub` traverse-only (`--x`) ACLs on `runner`'s home, `actions-runner` and
 `_work`, with an explicit deny on every other entry directly under them
@@ -216,11 +216,11 @@ in `/etc/cron.deny` and `/etc/at.deny` and disables its linger; and gives
 read on each job's checkout and repeats the deny per job). It records every
 directory `nemosub` can write (world-writable dirs on each local filesystem,
 plus `/dev/shm` and `/dev/mqueue`) in
-`/etc/nemotron35-sandbox/wipe-dirs` (root, 0644, in its own 0755 directory;
+`/etc/muse-glimmer-sandbox/wipe-dirs` (root, 0644, in its own 0755 directory;
 the App-key directory is never opened), which `tools/sandbox-wipe.sh` wipes at
 every job start and end; **re-run setup after adding a mount or a world-writable
 directory.** It makes the resident log dir (`SERVE_UP_LOG_DIR` from
-`actions-runner/.env`, else `/var/lib/nemotron35/serve-log`) `runner:runner`
+`actions-runner/.env`, else `/var/lib/muse-glimmer/serve-log`) `runner:runner`
 0750 and strips other-access from what is already in it. It needs `setfacl`
 (package `acl`) and `findmnt`. It ends by running the check below.
 
@@ -251,7 +251,7 @@ checkout: `tools/fetch-benchd.sh`, `tools/fetch-goldens.sh`,
 fresh Spark to a ranked runner is in its `docs/runbook.md`.
 
 ```sh
-sudo /opt/cuda-setup-scripts/converge/converge.sh spark-2 nemotron3.5-lightning-30b-a3b-cuda-v1 --check
+sudo /opt/cuda-setup-scripts/converge/converge.sh spark-2 muse-glimmer-30b-cuda-v1 --check
 ```
 
 A second runner on the same box sets its own value for each sandbox name (the
@@ -263,14 +263,14 @@ table is in `docs/sandbox-design.md` section 6b).
 # Take the daemon down. The unit's ExecStop runs `supervisor.sh stop`, which
 # reaps an in-flight job's `su -`-spawned tree; run it again by hand to be
 # sure after a crash:
-sudo systemctl disable --now nemotron35-box-runner.service
+sudo systemctl disable --now muse-glimmer-box-runner.service
 tools/box-runner/supervisor.sh stop
 
 # Confirm quiescence:
 tools/box-runner/supervisor.sh status   # expect: idle
 
 # Full removal:
-sudo rm /etc/systemd/system/nemotron35-box-runner.service && sudo systemctl daemon-reload
+sudo rm /etc/systemd/system/muse-glimmer-box-runner.service && sudo systemctl daemon-reload
 rm -rf tools/box-runner/state tools/box-runner/log
 # RUNNER_DIR (the actions-runner install itself) is left in place
 # deliberately -- remove it by hand if the box is being fully decommissioned.

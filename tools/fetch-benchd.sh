@@ -134,7 +134,7 @@
 #                       There is no per-track bench branch. Main carries the
 #                       two changes this track needs: the fixture-declared
 #                       median of several timed prefill passes and the 60 C
-#                       GB10 cool gate (docs/nemotron35-port-notes.md
+#                       GB10 cool gate (docs/muse-glimmer-port-notes.md
 #                       sections 7.5, 7.7 and 7.13).
 #   BENCHD_COMMIT       the bench commit whose dist/ is fetched. Default: the
 #                       PINNED commit below. The pin is the whole point: the

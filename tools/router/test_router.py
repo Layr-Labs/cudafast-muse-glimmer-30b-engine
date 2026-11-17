@@ -504,7 +504,7 @@ class ScoreFromLogTest(unittest.TestCase):
     def _sealed(cls, nonce: str, raw: bytes, *, extra_newline: bool = False) -> str:
         h = hashlib.sha256(raw).hexdigest()
         n = len(raw)
-        lines = [cls._gh(f"NEMOTRON35-SCORE-BEGIN {nonce}")]
+        lines = [cls._gh(f"MUSE-GLIMMER-SCORE-BEGIN {nonce}")]
         if raw:
             text = raw.decode()
             for ln in text.splitlines():
@@ -513,7 +513,7 @@ class ScoreFromLogTest(unittest.TestCase):
                 pass
             elif extra_newline:
                 lines.append(cls._gh(""))
-        end = cls._gh(f"NEMOTRON35-SCORE-END {nonce} sha256={h} bytes={n}")
+        end = cls._gh(f"MUSE-GLIMMER-SCORE-END {nonce} sha256={h} bytes={n}")
         return "\n".join(lines + [end])
 
     def test_accepts_real_reveal(self):
@@ -560,17 +560,17 @@ class ScoreFromLogTest(unittest.TestCase):
     def test_bad_sha256_returns_none(self):
         nonce = "f" * 64
         raw = b'{"metrics": {"error": ""}, "passed": true, "score": 0.1}'
-        lines = [self._gh(f"NEMOTRON35-SCORE-BEGIN {nonce}")]
+        lines = [self._gh(f"MUSE-GLIMMER-SCORE-BEGIN {nonce}")]
         for ln in raw.decode().splitlines():
             lines.append(self._gh(ln))
-        lines.append(self._gh(f"NEMOTRON35-SCORE-END {nonce} sha256={'0' * 64} bytes={len(raw)}"))
+        lines.append(self._gh(f"MUSE-GLIMMER-SCORE-END {nonce} sha256={'0' * 64} bytes={len(raw)}"))
         self.assertIsNone(router.score_from_log("\n".join(lines)))
 
     def test_none_end_returns_empty_dict(self):
         nonce = "0" * 64
         log = "\n".join([
-            self._gh(f"NEMOTRON35-SCORE-BEGIN {nonce}"),
-            self._gh(f"NEMOTRON35-SCORE-END {nonce} none"),
+            self._gh(f"MUSE-GLIMMER-SCORE-BEGIN {nonce}"),
+            self._gh(f"MUSE-GLIMMER-SCORE-END {nonce} none"),
         ])
         self.assertEqual(router.score_from_log(log), {})
 
@@ -581,7 +581,7 @@ class ScoreFromLogTest(unittest.TestCase):
         for end_nonce in (nonce, other):
             with self.subTest(end_nonce=end_nonce):
                 log = self._sealed(nonce, raw) + "\n" + self._gh(
-                    f"NEMOTRON35-SCORE-END {end_nonce} none")
+                    f"MUSE-GLIMMER-SCORE-END {end_nonce} none")
                 self.assertEqual(router.score_from_log(log), {})
 
     def test_no_block_returns_none(self):

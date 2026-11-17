@@ -143,7 +143,7 @@ selected implicitly. For a local run, use a checked-in public fixture --
 The public golden for this track is recorded on a DGX Spark from the
 reference tree with the pinned tokenizer and engine:
 
-  correctness_prompts/public-longcopy-gate-english-496.golden.json
+  correctness_prompts/public-longcopy-gate-english-512.golden.json
 
 (tools/local-baseline.sh uses it by default; its source text is
 correctness_prompts/public_longcopy_gate_english_4096.txt).
@@ -353,7 +353,7 @@ FACADE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # official baseline pair and the acceptance bands, and the official path resolves it
 # BEFORE the gates-only branch, so `--local-iterate` and `--official` alike refused with
 # "no track_id" while this repository exported it nowhere. The value is the trusted
-# manifest's `trackId` (the PLATFORM id, nemotron3.5-lightning-30b-a3b-cuda-v1 -- NOT the bench
+# manifest's `trackId` (the PLATFORM id, muse-glimmer-30b-cuda-v1 -- NOT the bench
 # channel branch, which is `main`; see tools/fetch-benchd.sh).
 # It is read from benchmark.json beside this file's parent, never taken from the
 # caller: benchd treats env != contract as a hard error, so a caller that pre-set a
@@ -439,7 +439,7 @@ fi
 # the draft depth rode the Engine Protocol wire per request. This track's engine
 # is vLLM, which fixes its speculative config when the ENGINE IS BUILT, and
 # benchd spawns a fresh worker for every phase. So the facade has to do the same two things
-# tools/nemotron35-measure-and-score.sh does on the ranked path, or the
+# tools/muse-glimmer-measure-and-score.sh does on the ranked path, or the
 # entry this repository documents as the measured one measures something the
 # ranked run does not:
 #

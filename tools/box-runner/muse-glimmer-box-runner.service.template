@@ -1,4 +1,4 @@
-# nemotron35-box-runner.service -- the box's GitHub Actions supervisor.
+# muse-glimmer-box-runner.service -- the box's GitHub Actions supervisor.
 #
 # Runs as root: root is required to read the GitHub App private key (via
 # gh-app-mint.sh, GH_APP_KEY) and to su to the unprivileged runner account.
@@ -11,10 +11,10 @@
 # (lib/pidtree.sh) is what reaps it; ExecStop runs that before systemd
 # considers the unit stopped.
 [Unit]
-Description=Nemotron 3.5 Lightning ranked-box GitHub Actions supervisor
+Description=Muse Glimmer 30B NVFP4 ranked-box GitHub Actions supervisor
 Wants=network-online.target docker.service
-Requires=nemotron35-sandbox-egress.service
-After=network-online.target docker.service nemotron35-sandbox-egress.service
+Requires=muse-glimmer-sandbox-egress.service
+After=network-online.target docker.service muse-glimmer-sandbox-egress.service
 
 [Service]
 Type=simple

@@ -38,7 +38,7 @@ pass() { echo "ok: $1"; }
 
 # --- a stand-in bucket ------------------------------------------------------
 # Mirrors the real key convention: correctness_prompts/<track_id>/<name>.json.
-KEY="correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/test-object.json"
+KEY="correctness_prompts/muse-glimmer-30b-cuda-v1/test-object.json"
 mkdir -p "${WORK}/bucket/$(dirname "${KEY}")"
 printf '{"version":1,"note":"synthetic fetch-goldens test object"}\n' \
   > "${WORK}/bucket/${KEY}"
@@ -153,7 +153,7 @@ cat > "${WORK}/armed/fixtures/muse_glimmer_30b_cuda_v1_track.json" <<ARMEDJSON
 {
   "timed_prompt_pool": [
     {
-      "r2_path": "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/armed-pool-object.json",
+      "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/armed-pool-object.json",
       "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
       "bytes": 1
     }
@@ -180,7 +180,7 @@ fi
 
 # --- case 4b: the same guard refuses a declared POOL key ---------------------
 out="${WORK}/case4b.json"
-ARMED_KEY="correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/armed-pool-object.json"
+ARMED_KEY="correctness_prompts/muse-glimmer-30b-cuda-v1/armed-pool-object.json"
 if R2_BUCKET_ENDPOINT="${ENDPOINT}" "${WORK}/armed/tools/fetch-goldens-loopback.sh" \
      --r2-path "${ARMED_KEY}" --sha256 "${GOOD_SHA}" --bytes "${GOOD_BYTES}" \
      --out "${out}" >"${WORK}/case4b.log" 2>&1; then
@@ -275,7 +275,7 @@ fi
 # --- case 9: a missing object is refused, with no file left ------------------
 out="${WORK}/case9.json"
 if R2_BUCKET_ENDPOINT="${ENDPOINT}" "${RELAXED}" \
-     --r2-path "correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/absent.json" \
+     --r2-path "correctness_prompts/muse-glimmer-30b-cuda-v1/absent.json" \
      --sha256 "${GOOD_SHA}" --bytes "${GOOD_BYTES}" \
      --out "${out}" >"${WORK}/case9.log" 2>&1; then
   fail "case 9: accepted a 404"
@@ -311,9 +311,9 @@ fi
 # STUB signer -- the vendored one speaks SigV4 to real R2, which this test must
 # never do -- so what is under test here is the staging loop: what it fetches,
 # what it verifies, what it refuses, and what it leaves behind.
-ALL_KEY_A="correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/all-pool-a.golden.json"
-ALL_KEY_B="correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/all-pool-b.golden.json"
-ALL_KEY_C="correctness_prompts/nemotron3.5-lightning-30b-a3b-cuda-v1/all-oracle-mtp1.golden.json"
+ALL_KEY_A="correctness_prompts/muse-glimmer-30b-cuda-v1/all-pool-a.golden.json"
+ALL_KEY_B="correctness_prompts/muse-glimmer-30b-cuda-v1/all-pool-b.golden.json"
+ALL_KEY_C="correctness_prompts/muse-glimmer-30b-cuda-v1/all-oracle-mtp1.golden.json"
 printf '{"version":1,"case":"all-pool-a"}\n' > "${WORK}/bucket/${ALL_KEY_A}"
 printf '{"version":1,"case":"all-pool-b"}\n' > "${WORK}/bucket/${ALL_KEY_B}"
 printf '{"version":1,"case":"all-oracle-mtp1"}\n' > "${WORK}/bucket/${ALL_KEY_C}"
@@ -364,7 +364,7 @@ all_root "${WORK}/allrepo" "${B_BYTES}"
 ALL_OUT="${WORK}/staged"
 if R2_BUCKET_ENDPOINT="${ENDPOINT}" \
    R2_ACCESS_KEY_ID="stub-key" R2_SECRET_ACCESS_KEY="stub-secret" \
-   MLXFAST_NEMOTRON35_R2_DOWNLOADER="${SIGNER}" \
+   MLXFAST_MUSE_GLIMMER_R2_DOWNLOADER="${SIGNER}" \
    "${WORK}/allrepo/tools/fetch-goldens-loopback.sh" --all --out "${ALL_OUT}" \
    >"${WORK}/case11.log" 2>&1; then
   ok11=1
@@ -394,7 +394,7 @@ fi
 before="$(shasum -a 256 "${ALL_OUT}"/*.json | shasum -a 256 | awk '{print $1}')"
 if R2_BUCKET_ENDPOINT="${ENDPOINT}" \
    R2_ACCESS_KEY_ID="stub-key" R2_SECRET_ACCESS_KEY="stub-secret" \
-   MLXFAST_NEMOTRON35_R2_DOWNLOADER="${SIGNER}" \
+   MLXFAST_MUSE_GLIMMER_R2_DOWNLOADER="${SIGNER}" \
    "${WORK}/allrepo/tools/fetch-goldens-loopback.sh" --all --out "${ALL_OUT}" \
    >"${WORK}/case12.log" 2>&1; then
   after="$(shasum -a 256 "${ALL_OUT}"/*.json | shasum -a 256 | awk '{print $1}')"
@@ -414,7 +414,7 @@ all_root "${WORK}/allrepo-short" "$((B_BYTES + 1))"
 SHORT_OUT="${WORK}/staged-short"
 if R2_BUCKET_ENDPOINT="${ENDPOINT}" \
    R2_ACCESS_KEY_ID="stub-key" R2_SECRET_ACCESS_KEY="stub-secret" \
-   MLXFAST_NEMOTRON35_R2_DOWNLOADER="${SIGNER}" \
+   MLXFAST_MUSE_GLIMMER_R2_DOWNLOADER="${SIGNER}" \
    "${WORK}/allrepo-short/tools/fetch-goldens-loopback.sh" --all --out "${SHORT_OUT}" \
    >"${WORK}/case13.log" 2>&1; then
   fail "case 13: --all accepted an object that is a byte short of its pin"
@@ -432,7 +432,7 @@ fi
 # The default signer speaks SigV4, so there is no anonymous way to stage this
 # material. The refusal must name what is missing rather than fail inside curl.
 NOCRED_OUT="${WORK}/staged-nocred"
-if env -u R2_ACCESS_KEY_ID -u R2_SECRET_ACCESS_KEY -u MLXFAST_NEMOTRON35_R2_DOWNLOADER \
+if env -u R2_ACCESS_KEY_ID -u R2_SECRET_ACCESS_KEY -u MLXFAST_MUSE_GLIMMER_R2_DOWNLOADER \
    R2_BUCKET_ENDPOINT="${ENDPOINT}" \
    "${WORK}/allrepo/tools/fetch-goldens-loopback.sh" --all --out "${NOCRED_OUT}" \
    >"${WORK}/case14.log" 2>&1; then

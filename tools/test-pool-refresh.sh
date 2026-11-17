@@ -2,7 +2,7 @@
 # test-pool-refresh.sh -- tools/pool-refresh.sh against stubbed boxes.
 #
 # ssh/scp/sudo/install/flock are stubs: each "box" is a directory with a home
-# (holding a stub tools/record-goldens.sh in nemotron35/repo) and a goldens
+# (holding a stub tools/record-goldens.sh in muse-glimmer/repo) and a goldens
 # directory. The script runs from a throwaway repo whose fixture it may edit,
 # with a local bare origin. No network, no GPU, no real box.
 set -uo pipefail
@@ -96,8 +96,8 @@ chmod +x "${STUB}"/* "${RECORD_STUB}" "${WORK}/fake-stitch"
 
 BOXES="b1 b2 b3"
 for b in ${BOXES}; do
-  mkdir -p "${FAKE}/${b}/home/nemotron35/repo/tools" "${FAKE}/${b}/home/goldens"
-  cp "${RECORD_STUB}" "${FAKE}/${b}/home/nemotron35/repo/tools/record-goldens.sh"
+  mkdir -p "${FAKE}/${b}/home/muse-glimmer/repo/tools" "${FAKE}/${b}/home/goldens"
+  cp "${RECORD_STUB}" "${FAKE}/${b}/home/muse-glimmer/repo/tools/record-goldens.sh"
   cp /dev/null "${FAKE}/${b}/home/goldens/.keep"
 done
 

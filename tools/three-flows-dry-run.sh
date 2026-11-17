@@ -25,7 +25,7 @@
 # and every timing are meaningless.
 #
 # THE TRACK. benchd main is contract-first: every verb gets --contract, and the
-# fixture declares the model identity (nemotron_h, 131072, 52 layers, a
+# fixture declares the model identity (muse_glimmer, 202048, 52 layers, a
 # seed_tokens-long prompt) and the measurement window. The fake backend emits ids far
 # inside the vocabulary, so its goldens load under that identity.
 #

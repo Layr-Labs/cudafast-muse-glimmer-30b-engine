@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # ranked-box-preflight.sh -- the fail-closed gate the ranked job runs BEFORE
-# ./setup.sh and before any measurement, for track nemotron3.5-lightning-30b-a3b-cuda-v1.
+# ./setup.sh and before any measurement, for track muse-glimmer-30b-cuda-v1.
 #
 # WHAT IT IS FOR. The ranked job holds NO CREDENTIAL by design (bundles-no-keys:
 # a box receives staged bundles, never keys), so the hidden material this track
@@ -17,9 +17,9 @@
 #
 # THE STAGING CONVENTION IS THE EXISTING ONE, not a new one. The golden path
 # comes from the runner process environment under the name
-# tools/nemotron35-measure-and-score.sh already reads:
+# tools/muse-glimmer-measure-and-score.sh already reads:
 #
-#   MLXFAST_NEMOTRON35_GOLDEN_DIR          directory holding the staged track goldens
+#   MLXFAST_MUSE_GLIMMER_GOLDEN_DIR          directory holding the staged track goldens
 #                                      (the live golden this leg scores over plus
 #                                      the rotation set). Required: nothing here
 #                                      is in the checkout.
@@ -73,7 +73,7 @@ ok() {
 }
 
 # --- 0. tools ---------------------------------------------------------------
-# jq is already a hard requirement of tools/nemotron35-measure-and-score.sh
+# jq is already a hard requirement of tools/muse-glimmer-measure-and-score.sh
 # (it reads the fixture pins and the trackId), so a box that cannot run this
 # cannot finish a ranked run either.
 command -v jq >/dev/null 2>&1 || fail "jq is required to read the track contract"
@@ -88,7 +88,7 @@ ok "track contract readable and parses: fixtures/muse_glimmer_30b_cuda_v1_track.
 # through the RUNNER's environment would defeat the same invariant without ever
 # appearing in the workflow file. R2 keys and a signer are what would let this
 # job pull hidden material itself instead of measuring the staged bundle.
-for var in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY MLXFAST_NEMOTRON35_R2_DOWNLOADER BENCHD_DIST_TOKEN; do
+for var in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY MLXFAST_MUSE_GLIMMER_R2_DOWNLOADER BENCHD_DIST_TOKEN; do
   eval "value=\${${var}:-}"
   # shellcheck disable=SC2154  # assigned by the eval above
   [[ -z "${value}" ]] || fail "${var} is set in the ranked job's environment; this job must hold no credential (boxes get staged bundles, never keys)"
@@ -100,7 +100,7 @@ ok "no R2 credential, signer, or dist token in the job environment"
 # ranked box any of them would silently change what is measured or what is
 # accepted, so their presence is a refusal rather than a warning.
 #
-#   BENCHD                            tools/nemotron35-measure-and-score.sh honours a
+#   BENCHD                            tools/muse-glimmer-measure-and-score.sh honours a
 #                                     caller-supplied benchd WITHOUT the
 #                                     channel-manifest hash check (deliberate, for
 #                                     benchd development) -- so on a ranked run
@@ -210,7 +210,7 @@ ok "temperature reader is plausible (${GPU_TEMP_SOURCE}: ${first_temp}C)"
 #
 # THIS TRACK'S SENTINEL IS SPELLED IN FULL. The refusal matches the substring,
 # so an unarmed pool of ANY spelling refuses, and names this track's sentinel.
-TRACK_SENTINEL="NEMOTRON35-LIGHTNING-CUDA-PENDING-ORGANIZER"
+TRACK_SENTINEL="MUSE-GLIMMER-CUDA-PENDING-ORGANIZER"
 
 if grep -q 'PENDING-ORGANIZER' "${CONTRACT}"; then
   fail "the track contract still carries ${TRACK_SENTINEL} sentinels; the timed pool is unarmed and nothing can be pin-verified against it"
@@ -251,15 +251,15 @@ ok "timed pool armed: ${pool_count} pinned pool golden(s) + a pinned hidden corr
 # --- 4. the staged tapes match the pins -------------------------------------
 # THE TAPES ARE NEVER IN THE CHECKOUT. They are organizer material published in
 # R2 at the contract's r2_path keys, and the ranked box stages them out of band
-# into the directory its runner service exports as MLXFAST_NEMOTRON35_GOLDEN_DIR.
+# into the directory its runner service exports as MLXFAST_MUSE_GLIMMER_GOLDEN_DIR.
 # There is no in-repo default to fall back on, so an unset name is a refusal
 # rather than a quiet substitution. Whatever directory is named, every golden is
 # verified byte-then-sha against the contract pins below.
-GOLDEN_DIR="${MLXFAST_NEMOTRON35_GOLDEN_DIR:-}"
+GOLDEN_DIR="${MLXFAST_MUSE_GLIMMER_GOLDEN_DIR:-}"
 [[ -n "${GOLDEN_DIR}" ]] \
-  || fail "MLXFAST_NEMOTRON35_GOLDEN_DIR is unset; the track goldens are staged onto the box out of band and this job holds no credential to fetch them"
+  || fail "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR is unset; the track goldens are staged onto the box out of band and this job holds no credential to fetch them"
 [[ -d "${GOLDEN_DIR}" ]] \
-  || fail "MLXFAST_NEMOTRON35_GOLDEN_DIR does not exist or is not a directory: ${GOLDEN_DIR}"
+  || fail "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR does not exist or is not a directory: ${GOLDEN_DIR}"
 
 verify_pin() {
   # verify_pin <path> <want_sha256> <want_bytes> <label>
@@ -287,7 +287,7 @@ ok "all ${pool_count} staged pool goldens match their contract pins (bytes then 
 
 # PER-DEPTH TIMED ORACLES. speculative_oracles.<prompt> maps each permitted MTP
 # draft depth (mtp1..mtp6) to that prompt's OWN timed-oracle golden
-# {r2_path, sha256, bytes}; tools/nemotron35-measure-and-score.sh selects one by
+# {r2_path, sha256, bytes}; tools/muse-glimmer-measure-and-score.sh selects one by
 # the drawn prompt and the declared depth.
 # Each must be pin-verified here AND allowed to exist in the staging directory
 # (the "only pinned *.json" check below refuses any name absent from
@@ -346,7 +346,7 @@ for staged in "${GOLDEN_DIR}"/*.json; do
   fi
 done
 [[ -z "${unexpected}" ]] \
-  || fail "MLXFAST_NEMOTRON35_GOLDEN_DIR holds *.json file(s) that are not pinned in timed_prompt_pool:${unexpected} (an unpinned golden staged where the pool lives is unattributed material; this directory carries pinned goldens only)"
+  || fail "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR holds *.json file(s) that are not pinned in timed_prompt_pool:${unexpected} (an unpinned golden staged where the pool lives is unattributed material; this directory carries pinned goldens only)"
 ok "no unpinned *.json in the staging directory"
 
 # The hidden correctness oracle is pinned by digest only -- the contract gives
@@ -557,8 +557,12 @@ grep -qF -- "weight_owner:\"${want_owner}\"" "${REPO_ROOT}/tools/serve-up.sh" \
   || fail "harness/vllm_resident/resident.py is absent; the serve would have no weight owner to boot"
 ok "weight owner ${want_owner}: the fixture and the serve script agree the checkpoint loads once per leg"
 
-# DEPTHS: serial plus every permitted MTP depth, each with its own timed oracle.
-want_depths="serial=0 $(jq -r '.mtp_head.permitted_draft_depths | map("mtp\(.)=\(.)") | join(" ")' "${CONTRACT}")"
+# DEPTHS: serial, plus every permitted draft depth (this track permits none, so
+# the pin is exactly serial). The join of an empty list leaves a trailing space,
+# which is why the extra depths are appended only when there are any.
+want_depths="serial=0"
+extra_depths="$(jq -r '.mtp_head.permitted_draft_depths | map("mtp\(.)=\(.)") | join(" ")' "${CONTRACT}")"
+[[ -z "${extra_depths}" ]] || want_depths="${want_depths} ${extra_depths}"
 depth_pins="$(jq -r '(.serve_configuration.depths // {}) | to_entries | map(.key + "=" + (.value.num_speculative_tokens|tostring)) | join(" ")' "${CONTRACT}")"
 [[ "${depth_pins}" == "${want_depths}" ]] \
   || fail "serve_configuration.depths must pin exactly '${want_depths}' (got '${depth_pins}')"
@@ -570,7 +574,7 @@ ok "serve configuration pins verified (${want_depths})"
 #
 #   leg 1  the SERIAL control, on the organizer-staged REFERENCE tree
 #          (MLXFAST_BASELINE_WORKSPACE), speculation off, always;
-#   leg 2  the candidate, on this checkout, at its declared draft depth.
+#   leg 2  the candidate, on this checkout, serial like leg 1 on this track.
 #
 # The score is the ratio of the two legs. NOTHING stores the pair: not a
 # constant, not the fixture, not a golden (section 3's goldens are checked for
@@ -607,11 +611,24 @@ WANT_REF_COMMIT="$(jq -r '.baseline_reference_commit // empty' "${CONTRACT}")"
 [[ "${WANT_REF_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
   || fail "fixtures/muse_glimmer_30b_cuda_v1_track.json carries no 40-hex baseline_reference_commit (got '${WANT_REF_COMMIT}'); the serial-control leg has no reference tree to run on"
 have_ref_commit="$(git -C "${BASELINE_WORKSPACE}" rev-parse HEAD 2>/dev/null || true)"
-[[ "${have_ref_commit}" == "${WANT_REF_COMMIT}" ]] \
-  || fail "the reference workspace is at ${have_ref_commit:-no git HEAD} but the fixture pins ${WANT_REF_COMMIT}; re-stage it with tools/stage-baseline-workspace.sh"
+# ANCESTOR RULE (F-CUDA-30). The contract's reference_engine_commit names the
+# tree the lane stages, and it cannot be the same commit as this fixture pin: a
+# commit cannot contain its own sha, so the fixture pin is always one organizer
+# commit behind the tree that carries it. Accepting an ancestor keeps BOTH
+# guards honest without letting anything slide: the staged tree must still be
+# CLEAN (below), and the runbook's L-04B receipt records the tree it staged, so
+# two boxes still run one control. An unrelated or forked tree is refused.
+if [[ "${have_ref_commit}" != "${WANT_REF_COMMIT}" ]]; then
+  [[ -n "${have_ref_commit}" ]] \
+    || fail "the reference workspace has no git HEAD; re-stage it with tools/stage-baseline-workspace.sh"
+  git -C "${BASELINE_WORKSPACE}" merge-base --is-ancestor "${WANT_REF_COMMIT}" "${have_ref_commit}" 2>/dev/null \
+    || fail "the reference workspace is at ${have_ref_commit} but the fixture pins ${WANT_REF_COMMIT}, which is not an ancestor of it; re-stage it with tools/stage-baseline-workspace.sh"
+  printf 'WARN ranked-box-preflight: reference workspace HEAD %s carries the fixture pin %s as an ancestor (F-CUDA-30: a commit cannot carry its own sha)\n' \
+    "${have_ref_commit:0:12}" "${WANT_REF_COMMIT:0:12}" >&2
+fi
 git -C "${BASELINE_WORKSPACE}" diff --quiet HEAD 2>/dev/null \
   || fail "the reference workspace has uncommitted changes; leg 1 must run the pinned reference tree, not an edited one"
-ok "reference workspace at ${WANT_REF_COMMIT:0:12}, clean: ${BASELINE_WORKSPACE}"
+ok "reference workspace at ${have_ref_commit:0:12} (fixture pin ${WANT_REF_COMMIT:0:12}), clean: ${BASELINE_WORKSPACE}"
 
 # THE REFERENCE TREE MUST BE BUILT. A staged-but-unbuilt reference tree fails
 # only when serve-up.sh boots it -- after the candidate has already paid for the

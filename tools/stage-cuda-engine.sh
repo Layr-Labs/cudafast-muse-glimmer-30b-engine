@@ -55,7 +55,7 @@ STAGED_ENGINE_BIN="$(repository_path ".build/${BUILD_CONFIGURATION}/mlxfast-runt
 # environment, so everything the wrapper needs is baked in as literal exports,
 # validated here first. PATH is fixed too (SANDBOX_ENGINE_PATH is only a test
 # seam for stubbed sudo/pgrep). `--print-shim` prints the expected content so
-# tools/nemotron35-measure-and-score.sh can byte-check the staged shim.
+# tools/muse-glimmer-measure-and-score.sh can byte-check the staged shim.
 sandbox_shim() {
   local user="${SANDBOX_USER:-}" root="${SANDBOX_ROOT:-}" job="${SANDBOX_JOB:-}" log_dir="${RUNNER_TEMP:-}"
   [[ "${user}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] \
