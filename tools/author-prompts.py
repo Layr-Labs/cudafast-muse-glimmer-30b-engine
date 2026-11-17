@@ -98,7 +98,7 @@ def main() -> int:
     ap.add_argument("--snapshot", required=True, help="the verified target snapshot (holds tokenizer.json)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--fixture", default=os.path.join(os.path.dirname(__file__), "..", "fixtures",
-                                                      "nemotron35_lightning_30b_a3b_track.json"))
+                                                      "muse_glimmer_30b_cuda_v1_track.json"))
     ap.add_argument("--chat", action="store_true",
                     help="each text is one user message, rendered through the pinned chat template")
     ap.add_argument("pairs", nargs="+", metavar="NAME=TEXT_FILE")

@@ -47,7 +47,7 @@
 # measured control leg. The band only says whether that leg landed where this box
 # has landed before; outside it, the run dies and seals nothing.
 #
-# WHAT THE PINS ARE. fixtures/nemotron35_lightning_30b_a3b_track.json is trusted-side (not an
+# WHAT THE PINS ARE. fixtures/muse_glimmer_30b_cuda_v1_track.json is trusted-side (not an
 # editable path), and its timed_prompt_pool[] carries {r2_path, sha256, bytes}
 # per golden plus hidden_correctness_golden's {sha256, bytes}. A staged file is
 # accepted only when its byte count AND its sha256 equal the contract's -- byte
@@ -61,7 +61,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-CONTRACT="${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+CONTRACT="${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 
 fail() {
   echo "ranked-box-preflight: REFUSING -- $*" >&2
@@ -80,7 +80,7 @@ command -v jq >/dev/null 2>&1 || fail "jq is required to read the track contract
 command -v shasum >/dev/null 2>&1 || fail "shasum is required to verify staged assets"
 [[ -r "${CONTRACT}" ]] || fail "cannot read the track contract at ${CONTRACT}"
 jq -e . >/dev/null 2>&1 < "${CONTRACT}" || fail "the track contract is not valid JSON: ${CONTRACT}"
-ok "track contract readable and parses: fixtures/nemotron35_lightning_30b_a3b_track.json"
+ok "track contract readable and parses: fixtures/muse_glimmer_30b_cuda_v1_track.json"
 
 # --- 1. the job holds no credential -----------------------------------------
 # The workflow references no secret (tools/ci-workflow-egress-scan.sh is the
@@ -484,7 +484,7 @@ decl_draft="$("${REPO_ROOT}/tools/spec-declaration.sh" draft-len)"
 if [[ "${decl_spec}" == "1" ]]; then
   armed="$(jq -r '.official_scoring_enabled // false' "${CONTRACT}")"
   [[ "${armed}" == "true" ]] \
-    || fail "the declaration enables MTP speculation (num_speculative_tokens=${decl_draft}) but fixtures/nemotron35_lightning_30b_a3b_track.json is not armed (official_scoring_enabled != true); the arm gate opens only for a valid declaration on an armed fixture"
+    || fail "the declaration enables MTP speculation (num_speculative_tokens=${decl_draft}) but fixtures/muse_glimmer_30b_cuda_v1_track.json is not armed (official_scoring_enabled != true); the arm gate opens only for a valid declaration on an armed fixture"
   ok "serve spec is the declared MTP config (num_speculative_tokens=${decl_draft}) and the fixture is armed"
 else
   ok "serve spec is the serial launch reference (SERVE_UP_SPECULATIVE=0; declaration absent or disabled)"
@@ -502,7 +502,7 @@ fi
 # pinned container is on the box BY DIGEST, and that the driver meets the floor.
 want_engine_pin="$(jq -r '.serve_configuration.engine_pin // empty' "${CONTRACT}")"
 [[ "${want_engine_pin}" =~ ^[0-9a-f]{40}$ ]] \
-  || fail "serve_configuration.engine_pin is unarmed or malformed in fixtures/nemotron35_lightning_30b_a3b_track.json (got '${want_engine_pin}')"
+  || fail "serve_configuration.engine_pin is unarmed or malformed in fixtures/muse_glimmer_30b_cuda_v1_track.json (got '${want_engine_pin}')"
 [[ -f "${REPO_ROOT}/vllm/VENDOR.json" ]] \
   || fail "vllm/VENDOR.json is absent; the engine tree carries no provenance"
 have_engine_pin="$(jq -r '.commit // empty' "${REPO_ROOT}/vllm/VENDOR.json" 2>/dev/null || true)"
@@ -605,7 +605,7 @@ baseline_real="$(cd "${BASELINE_WORKSPACE}" && pwd -P)"
 # promoted baseline every box's leg 1 runs, so one board compares one control.
 WANT_REF_COMMIT="$(jq -r '.baseline_reference_commit // empty' "${CONTRACT}")"
 [[ "${WANT_REF_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
-  || fail "fixtures/nemotron35_lightning_30b_a3b_track.json carries no 40-hex baseline_reference_commit (got '${WANT_REF_COMMIT}'); the serial-control leg has no reference tree to run on"
+  || fail "fixtures/muse_glimmer_30b_cuda_v1_track.json carries no 40-hex baseline_reference_commit (got '${WANT_REF_COMMIT}'); the serial-control leg has no reference tree to run on"
 have_ref_commit="$(git -C "${BASELINE_WORKSPACE}" rev-parse HEAD 2>/dev/null || true)"
 [[ "${have_ref_commit}" == "${WANT_REF_COMMIT}" ]] \
   || fail "the reference workspace is at ${have_ref_commit:-no git HEAD} but the fixture pins ${WANT_REF_COMMIT}; re-stage it with tools/stage-baseline-workspace.sh"

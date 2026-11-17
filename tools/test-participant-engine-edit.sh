@@ -174,7 +174,7 @@ fi
 OV="${WORK}/overlay-repo"
 mkdir -p "${OV}/tools" "${OV}/fixtures" "${OV}/vllm/vllm/model_executor"
 cp "${REPO_ROOT}/tools/stage-vllm-overlay.sh" "${OV}/tools/"
-cp "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" "${OV}/fixtures/"
+cp "${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" "${OV}/fixtures/"
 printf 'EDITED = True\n' > "${OV}/vllm/vllm/model_executor/nemotron_probe.py"
 printf '__version__ = "tree"\n' > "${OV}/vllm/vllm/__init__.py"
 BASE="${WORK}/base"

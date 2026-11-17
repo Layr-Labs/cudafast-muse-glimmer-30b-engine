@@ -149,7 +149,7 @@ fi
 # shipped fixture.
 mkdir -p "${WORK}/armed/tools" "${WORK}/armed/fixtures"
 ARMED_SHA="f8eb3e0faf960154eacef498aa5f1c0be19d11e08054af37cc59a4f28ca5911b"
-cat > "${WORK}/armed/fixtures/nemotron35_lightning_30b_a3b_track.json" <<ARMEDJSON
+cat > "${WORK}/armed/fixtures/muse_glimmer_30b_cuda_v1_track.json" <<ARMEDJSON
 {
   "timed_prompt_pool": [
     {
@@ -209,7 +209,7 @@ SENTINEL_KEY="$(awk '
     print value
     exit
   }
-' "${SCRIPT_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json")"
+' "${SCRIPT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json")"
 if [[ -z "${SENTINEL_KEY}" ]]; then
   fail "case 5: could not read a timed_prompt_pool r2_path out of the shipped fixture"
 elif R2_BUCKET_ENDPOINT="${ENDPOINT}" "${RELAXED}" \
@@ -356,7 +356,7 @@ all_root() { # all_root DIR B_BYTES -- a stand-in repo root with the copy + cont
   mkdir -p "$1/tools" "$1/fixtures"
   cp "${RELAXED}" "$1/tools/fetch-goldens-loopback.sh"
   chmod +x "$1/tools/fetch-goldens-loopback.sh"
-  write_all_contract "$1/fixtures/nemotron35_lightning_30b_a3b_track.json" "$2"
+  write_all_contract "$1/fixtures/muse_glimmer_30b_cuda_v1_track.json" "$2"
 }
 
 # --- case 11: --all stages and verifies the whole pinned set -----------------

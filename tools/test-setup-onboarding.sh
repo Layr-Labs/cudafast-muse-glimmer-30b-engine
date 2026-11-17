@@ -40,7 +40,7 @@ for f in "${FILES[@]}"; do
 done
 write_fixture() {
   jq -n --argjson files "$1" '{target:{upstream_model_id:"example/model", upstream_revision:"0000000", files:$files}}' \
-    > "${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+    > "${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 }
 write_fixture "${pins}"
 

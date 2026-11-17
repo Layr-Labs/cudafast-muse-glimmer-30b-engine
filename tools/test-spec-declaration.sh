@@ -7,11 +7,13 @@
 # WHAT THIS PROVES, and it is the part worth having: the envelope REFUSALS. The
 # CUDA track's draft depth is a serve-BOOT parameter, and this script is the one
 # trusted bridge that turns the participant's declaration into that parameter --
-# so an enabled depth outside the contract's permitted_draft_depths must be
-# REFUSED here, before any serve boots. The accept cases pin 1/2/3; the refuse
-# cases pin 7..8 (contract-permitted membership) and 9 (structural ceiling). If a
-# future fixture edit ever WIDENS mtp_head.permitted_draft_depths past 6, the
-# depth-7 case below turns this test red -- that is the tripwire.
+# so a non-serial declaration on a SERIAL-ONLY track must be REFUSED here,
+# before any serve boots. muse-glimmer-30b-cuda-v1 declares
+# mtp_head.permitted_draft_depths [] (contract supported_optimization_modes
+# [serial], and the checkpoint ships no MTP tensors), so every depth 1..9 is
+# refused and only the serial forms are accepted. If a future fixture edit ever
+# arms a draft depth, the depth-1 case below turns this test red -- that is the
+# tripwire, in the other direction.
 #
 # It also pins the rest of the DECLARATION, which the same script validates:
 # source, the max_bytes cap and the top-level key set (issue #24 work item A).
@@ -22,7 +24,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 DECL="${SCRIPT_DIR}/tools/spec-declaration.sh"
-CONTRACT="${SCRIPT_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+CONTRACT="${SCRIPT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
@@ -69,8 +71,8 @@ expect_refuse() {
 # The whole point is to read the SHIPPING envelope, not a copy. Assert it up
 # front so a reader knows exactly what the accept/refuse split below rests on.
 permitted="$(jq -c '.mtp_head.permitted_draft_depths' "${CONTRACT}")"
-if [[ "${permitted}" != "[1,2,3,4,5,6]" ]]; then
-  echo "FAIL contract envelope: mtp_head.permitted_draft_depths is ${permitted}, expected [1,2,3,4,5,6] -- the track's draft-depth envelope changed; update this test deliberately or revert the fixture"
+if [[ "${permitted}" != "[]" ]]; then
+  echo "FAIL contract envelope: mtp_head.permitted_draft_depths is ${permitted}, expected [] -- this track is serial only (contract supported_optimization_modes [serial]); update this test deliberately or revert the fixture"
   fails=$((fails + 1))
 fi
 
@@ -79,21 +81,16 @@ expect_ok  "absent-spec-is-serial"        '{}' describe serial
 expect_ok  "disabled-is-serial"           '{"spec":{"enabled":false,"num_speculative_tokens":0}}' describe serial
 expect_ok  "enabled-zero-is-serial"       '{"spec":{"enabled":true,"num_speculative_tokens":0}}'  describe serial
 
-# --- the six permitted mtp depths ------------------------------------------
-expect_ok  "mtp1-permitted"  '{"spec":{"enabled":true,"num_speculative_tokens":1}}' describe  mtp1
-expect_ok  "mtp1-draftlen"   '{"spec":{"enabled":true,"num_speculative_tokens":1}}' draft-len 1
-expect_ok  "mtp2-permitted"  '{"spec":{"enabled":true,"num_speculative_tokens":2}}' describe  mtp2
-expect_ok  "mtp3-permitted"  '{"spec":{"enabled":true,"num_speculative_tokens":3}}' describe  mtp3
-expect_ok  "mtp3-speculative" '{"spec":{"enabled":true,"num_speculative_tokens":3}}' speculative 1
-expect_ok  "mtp4-permitted"  '{"spec":{"enabled":true,"num_speculative_tokens":4}}' describe  mtp4
-expect_ok  "mtp5-permitted"  '{"spec":{"enabled":true,"num_speculative_tokens":5}}' describe  mtp5
-expect_ok  "mtp6-permitted"  '{"spec":{"enabled":true,"num_speculative_tokens":6}}' describe  mtp6
-expect_ok  "mtp6-draftlen"   '{"spec":{"enabled":true,"num_speculative_tokens":6}}' draft-len 6
-
-# --- the restriction: depths ABOVE 6 are refused, never clamped -------------
-# 7 and 8 are inside the structural 0..8 ceiling but OUTSIDE permitted_draft_depths,
-# so they must be refused by the contract-membership check. This is the tripwire
-# for "cap mtp at 6": widening permitted_draft_depths reddens it.
+# --- the serial-only restriction: every draft depth is refused --------------
+# 1..8 are inside the structural 0..8 ceiling but OUTSIDE permitted_draft_depths
+# (empty), so they must be refused by the contract-membership check. This is the
+# tripwire for "no speculative arm": arming a depth reddens the depth-1 case.
+expect_refuse "mtp1-refused"  '{"spec":{"enabled":true,"num_speculative_tokens":1}}' "not a contract-permitted draft depth"
+expect_refuse "mtp2-refused"  '{"spec":{"enabled":true,"num_speculative_tokens":2}}' "not a contract-permitted draft depth"
+expect_refuse "mtp3-refused"  '{"spec":{"enabled":true,"num_speculative_tokens":3}}' "not a contract-permitted draft depth"
+expect_refuse "mtp4-refused"  '{"spec":{"enabled":true,"num_speculative_tokens":4}}' "not a contract-permitted draft depth"
+expect_refuse "mtp5-refused"  '{"spec":{"enabled":true,"num_speculative_tokens":5}}' "not a contract-permitted draft depth"
+expect_refuse "mtp6-refused"  '{"spec":{"enabled":true,"num_speculative_tokens":6}}' "not a contract-permitted draft depth"
 expect_refuse "mtp7-refused"  '{"spec":{"enabled":true,"num_speculative_tokens":7}}' "not a contract-permitted draft depth"
 expect_refuse "mtp8-refused"  '{"spec":{"enabled":true,"num_speculative_tokens":8}}' "not a contract-permitted draft depth"
 # 9 is beyond the structural ceiling and refuses there, before the membership check.
@@ -120,7 +117,9 @@ expect_refuse "unknown-top-key-refused"    '{"version":1,"arm":"dflash","spec":{
 # and a spec block is the ordinary case.
 expect_ok "shipped-declaration-accepted" '{"source":"pinned","max_bytes":2147483648}' describe serial
 expect_ok "max-bytes-not-read"           '{"source":"pinned","max_bytes":3000000000}' describe serial
-expect_ok "version-plus-spec-accepted" '{"version":1,"spec":{"enabled":true,"num_speculative_tokens":1}}' describe mtp1
+# version + spec is the ordinary shape, but a spec that ARMS a depth is refused
+# on this serial-only track (see the mtp cases above).
+expect_refuse "version-plus-spec-refused" '{"version":1,"spec":{"enabled":true,"num_speculative_tokens":1}}' "not a contract-permitted draft depth"
 
 if [[ ${fails} -eq 0 ]]; then
   echo "OK: all spec-declaration envelope cases passed"

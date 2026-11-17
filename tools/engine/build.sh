@@ -44,7 +44,7 @@ cd "${ROOT_DIR}"
 log() { printf 'engine/build.sh: %s\n' "$*"; }
 die() { printf 'engine/build.sh: %s\n' "$*" >&2; exit 1; }
 
-FIXTURE="${ROOT_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${ROOT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 for tool in cargo docker jq; do command -v "${tool}" >/dev/null 2>&1 || die "${tool} is required"; done
 IMAGE="$(jq -r '.serve_configuration.container_image' "${FIXTURE}")"
 DIGEST="$(jq -r '.serve_configuration.container_digest' "${FIXTURE}")"

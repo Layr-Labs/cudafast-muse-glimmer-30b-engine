@@ -70,7 +70,7 @@ def default_repo() -> str:
         return repo
     return subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
                           cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
-FIXTURE_REL = "fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE_REL = "fixtures/muse_glimmer_30b_cuda_v1_track.json"
 TRACK_LABEL = "nemotron3.5-lightning-30b-a3b-cuda-v1"
 WATCHDOG_SECONDS = 90 * 60
 POLL_SECONDS = 60

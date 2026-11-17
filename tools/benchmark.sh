@@ -419,7 +419,7 @@ fi
 # refuses (WINDOW-SHAPE-UNDECLARED-FOR-TRACK). In official mode it is also the
 # ARM GATE: benchd refuses to seal an official artifact unless the fixture
 # declares official_scoring_enabled: true.
-CONTRACT_FIXTURE="${FACADE_DIR}/../fixtures/nemotron35_lightning_30b_a3b_track.json"
+CONTRACT_FIXTURE="${FACADE_DIR}/../fixtures/muse_glimmer_30b_cuda_v1_track.json"
 if [[ ! -f "${CONTRACT_FIXTURE}" ]]; then
   echo "benchmark.sh: runs require the track contract fixture at ${CONTRACT_FIXTURE}" >&2
   exit 1

@@ -140,7 +140,7 @@ def main() -> int:
     ap.add_argument("--count", type=int, default=8)
     ap.add_argument("--out", required=True)
     ap.add_argument("--ledger", default=str(ROOT / ".mlxfast-private/refresh/ledger.json"))
-    ap.add_argument("--fixture", default=str(ROOT / "fixtures/nemotron35_lightning_30b_a3b_track.json"))
+    ap.add_argument("--fixture", default=str(ROOT / "fixtures/muse_glimmer_30b_cuda_v1_track.json"))
     a = ap.parse_args()
 
     def die(msg):

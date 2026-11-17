@@ -22,7 +22,7 @@ cp -R "${REPO_ROOT}/harness/vllm_resident" "${TEST_ROOT}/harness/"
 cp "${REPO_ROOT}/benchmark.sh" "${TEST_ROOT}/"
 cp "${REPO_ROOT}/tools/"{local-baseline,benchmark,spec-declaration,serve-up}.sh "${TEST_ROOT}/tools/"
 cp "${REPO_ROOT}/benchmark.json" "${REPO_ROOT}/mtp-head.manifest.json" "${TEST_ROOT}/"
-cp "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" "${TEST_ROOT}/fixtures/"
+cp "${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" "${TEST_ROOT}/fixtures/"
 # The public golden is recorded on a Spark; the stub benchd never reads it.
 echo '{}' > "${TEST_ROOT}/correctness_prompts/public-longcopy-gate-english-496.golden.json"
 for d in 1 2 3 4 5 6; do echo '{}' > "${TEST_ROOT}/correctness_prompts/public-longcopy-gate-english-496.mtp${d}.golden.json"; done

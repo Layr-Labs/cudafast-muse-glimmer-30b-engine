@@ -53,7 +53,7 @@ mkdir -p "${REPO}/tools/engine" "${REPO}/fixtures" "${REPO}/harness/protocol-ada
   "${REPO}/harness/kernels" "${STUBS}"
 cp "${REPO_ROOT}/tools/engine/build.sh" "${REPO}/tools/engine/build.sh"
 cp "${REPO_ROOT}/tools/stage-cuda-engine.sh" "${REPO}/tools/stage-cuda-engine.sh"
-cp "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" "${REPO}/fixtures/"
+cp "${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" "${REPO}/fixtures/"
 printf '#!/usr/bin/env bash\nexit 0\n' > "${REPO}/tools/stage-vllm-overlay.sh"; chmod +x "${REPO}/tools/stage-vllm-overlay.sh"
 touch "${REPO}/harness/kernels/build.sh"
 GOOD_TOML='[package]
@@ -130,7 +130,7 @@ chmod +x "${STUBS}"/*
 export PATH="${STUBS}:${PATH}"
 
 ME="$(id -un)"
-IMAGE_REF="docker.io/vllm/vllm-openai@$(jq -r '.serve_configuration.container_digest' "${REPO}/fixtures/nemotron35_lightning_30b_a3b_track.json")"
+IMAGE_REF="docker.io/vllm/vllm-openai@$(jq -r '.serve_configuration.container_digest' "${REPO}/fixtures/muse_glimmer_30b_cuda_v1_track.json")"
 MANIFEST="${REPO}/harness/protocol-adapter/Cargo.toml"
 TAIL="--env TORCH_CUDA_ARCH_LIST=12.1a --env PYTHONPATH=${REPO}/.build/vllm-overlay --workdir ${REPO}/harness/kernels --entrypoint bash ${IMAGE_REF} ./build.sh"
 STAGED="${REPO}/.build/release/mlxfast-runtime-worker"

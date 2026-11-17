@@ -47,7 +47,7 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
-FIXTURE="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 log() { printf 'pool-refresh: %s\n' "$*" >&2; }
 die() { printf 'pool-refresh: %s\n' "$*" >&2; exit 1; }
 
@@ -318,7 +318,7 @@ step_pin() {
   mark pin
   cat <<EOF
 pool-refresh: pinned ${LABEL} in ${FIXTURE}; review the diff, then:
-  git -C ${ROOT} add fixtures/nemotron35_lightning_30b_a3b_track.json
+  git -C ${ROOT} add fixtures/muse_glimmer_30b_cuda_v1_track.json
   git -C ${ROOT} commit -m "pool refresh: pin ${LABEL} and switch the rotation pool"
   git -C ${ROOT} push origin HEAD:main
   git -C ${ROOT} push origin HEAD:${REFRESH_ARMED_BASE:-loadtest/base}
@@ -343,7 +343,7 @@ check_box_against() {
 
 origin_fixture() { # the fixture on origin/main, into a temp file
   git -C "${ROOT}" fetch -q origin main || die "cannot fetch origin main"
-  git -C "${ROOT}" show origin/main:fixtures/nemotron35_lightning_30b_a3b_track.json > "$1"
+  git -C "${ROOT}" show origin/main:fixtures/muse_glimmer_30b_cuda_v1_track.json > "$1"
 }
 
 step_verify() {

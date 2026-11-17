@@ -197,7 +197,7 @@ tools/pool-refresh.sh --label g2 --step author --texts <DIR> --snapshot <SNAPSHO
 tools/pool-refresh.sh --label g2 --step record
 tools/pool-refresh.sh --label g2 --step stage
 #   bands for the NEW prompts: calibrate against a proposed fixture, not the live one
-cp fixtures/nemotron35_lightning_30b_a3b_track.json /tmp/next-fixture.json
+cp fixtures/muse_glimmer_30b_cuda_v1_track.json /tmp/next-fixture.json
 tools/pool-refresh.sh pin-fixture /tmp/next-fixture.json g2 .mlxfast-private/refresh/g2/pins.json
 #   copy /tmp/next-fixture.json to every box, then on each box:
 #   tools/calibrate-box.sh <runner name> <new file> --fixture <next-fixture> --passes 3
@@ -209,7 +209,7 @@ tools/pool-refresh.sh --label g2 --step pin
 #   a crash or a failed box: fix it and re-run the same command; finished work is skipped
 #   one step alone: --step author|record|stage|pin|verify|retire
 # review the fixture diff, then run the printed commands:
-git add fixtures/nemotron35_lightning_30b_a3b_track.json
+git add fixtures/muse_glimmer_30b_cuda_v1_track.json
 git commit -m "pool refresh: pin g2 and switch the live goldens"
 git push origin HEAD:main && git push origin HEAD:<armed-base>
 tools/pool-refresh.sh --label g2 --step verify      # every box matches origin/main's pins
@@ -252,7 +252,7 @@ tools/router/router.py freeze
 tools/router/router.py status        # wait until nothing is queued, dispatched or running
 tools/pool-refresh.sh --label final --step stage --final-after-freeze ~/nemotron35-router/FROZEN
 #   bands for the final prompts: a private proposed fixture, then every box
-cp fixtures/nemotron35_lightning_30b_a3b_track.json /tmp/final-fixture.json
+cp fixtures/muse_glimmer_30b_cuda_v1_track.json /tmp/final-fixture.json
 tools/pool-refresh.sh pin-fixture /tmp/final-fixture.json final .mlxfast-private/final/pins.json
 #   on each box: tools/calibrate-box.sh <runner name> <file> --fixture <final-fixture> --passes 3,
 #   install the file at the runner's MLXFAST_BASELINE_CALIBRATION

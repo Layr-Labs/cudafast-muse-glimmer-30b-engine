@@ -17,7 +17,7 @@ changing what it computes beyond the 10% token-tolerance budget.
 | Question | File |
 |---|---|
 | What you may edit | `benchmark.json` `editablePaths`: `vllm`, `harness`, `mtp-head.manifest.json` |
-| Pins, engine configuration, depths, scoring | `fixtures/nemotron35_lightning_30b_a3b_track.json` |
+| Pins, engine configuration, depths, scoring | `fixtures/muse_glimmer_30b_cuda_v1_track.json` |
 | Why the rules say what they say | `docs/participant-contract.md` |
 | The resident wire | `docs/resident.md` |
 

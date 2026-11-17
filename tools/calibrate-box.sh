@@ -85,7 +85,7 @@ if [ "${CALIBRATE_BOX_SETSID:-0}" != "1" ] && command -v setsid >/dev/null 2>&1;
 fi
 export CALIBRATE_BOX_SETSID=1
 
-FIXTURE="${REPO_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${REPO_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 MANIFEST="${REPO_DIR}/benchmark.json"
 PASSES=3
 LOCK_PATH=/tmp/mtplx-gpu-exclusive.lock

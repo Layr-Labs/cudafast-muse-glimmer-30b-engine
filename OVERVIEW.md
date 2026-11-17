@@ -219,4 +219,4 @@ Details are in the [engineering log](docs/nemotron35-port-notes.md), sections
 | Pool refresh and final re-score (runbook) | [docs/pool-refresh-and-final-rescore.md](docs/pool-refresh-and-final-rescore.md) |
 | What CI checks | [docs/ci-coverage.md](docs/ci-coverage.md) |
 | Engineering findings and test results | [docs/nemotron35-port-notes.md](docs/nemotron35-port-notes.md) |
-| Pins, bands, pool, depths | `fixtures/nemotron35_lightning_30b_a3b_track.json` |
+| Pins, bands, pool, depths | `fixtures/muse_glimmer_30b_cuda_v1_track.json` |

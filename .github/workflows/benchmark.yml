@@ -27,7 +27,7 @@
 # calibration file) is STAGED ONTO THE BOX out of band by the organizer. A box receives bundles, never keys
 # (bundles-no-keys, ruled 2026-08-21). What replaces the credential is
 # verification: tools/ranked-box-preflight.sh re-checks every staged asset
-# against fixtures/nemotron35_lightning_30b_a3b_track.json's own {sha256, bytes} pins --
+# against fixtures/muse_glimmer_30b_cuda_v1_track.json's own {sha256, bytes} pins --
 # byte count first, then digest -- before ./setup.sh runs, and refuses on any
 # miss. The contract fixture is trusted-side (not an editable path), so a
 # submission cannot move the pins it is measured against.
@@ -139,7 +139,7 @@
 #   - a GPU temperature reader for benchd's cool gate (nvidia-smi on the box, or
 #     MLXFAST_GPU_TEMP_CMD); tools/ranked-box-preflight.sh fails closed without
 #     one;
-#   - the track ARMED: fixtures/nemotron35_lightning_30b_a3b_track.json sets
+#   - the track ARMED: fixtures/muse_glimmer_30b_cuda_v1_track.json sets
 #     official_scoring_enabled to true only after the goldens are recorded and
 #     pinned; the preflight and benchd refuse to seal while it is false.
 #
@@ -339,9 +339,9 @@ jobs:
         run: |
           set -euo pipefail
           ws="${MLXFAST_BASELINE_WORKSPACE}"
-          want="$(jq -r '.baseline_reference_commit // empty' fixtures/nemotron35_lightning_30b_a3b_track.json)"
+          want="$(jq -r '.baseline_reference_commit // empty' fixtures/muse_glimmer_30b_cuda_v1_track.json)"
           if [[ ! "${want}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error title=no reference commit::fixtures/nemotron35_lightning_30b_a3b_track.json carries no 40-hex baseline_reference_commit; the serial-control leg has no reference tree to run on" >&2
+            echo "::error title=no reference commit::fixtures/muse_glimmer_30b_cuda_v1_track.json carries no 40-hex baseline_reference_commit; the serial-control leg has no reference tree to run on" >&2
             exit 1
           fi
           have="$(git -C "${ws}" rev-parse HEAD 2>/dev/null || true)"

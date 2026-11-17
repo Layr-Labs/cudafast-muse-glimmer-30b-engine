@@ -171,7 +171,7 @@ smoke signal, not as a prediction. The ranked box run is the authority.
 | Question | File |
 |---|---|
 | Editable paths, commands, scoring values | `benchmark.json` |
-| Pins, engine configuration, depths, scoring semantics | `fixtures/nemotron35_lightning_30b_a3b_track.json` |
+| Pins, engine configuration, depths, scoring semantics | `fixtures/muse_glimmer_30b_cuda_v1_track.json` |
 | Why each rule says what it says | `docs/participant-contract.md` |
 | What a measured run executes | the channel benchmarker (`tools/fetch-benchd.sh`) |
 

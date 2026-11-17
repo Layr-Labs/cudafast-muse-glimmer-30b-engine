@@ -112,7 +112,7 @@ scaffold_failures_before="${failures}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
-FIXTURE="${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 TRACK_ID="$(jq -r '.track_id' "${FIXTURE}")"
 REF_COMMIT="$(jq -r '.baseline_reference_commit' "${FIXTURE}")"
 # The shipped fixture declares live_goldens. Most cases below run the scaffold
@@ -190,7 +190,7 @@ EOF
   # depth envelope and baseline_reference_commit stay under test.
   GOLDEN_DIR="${WORK}/goldens"
   mkdir -p "${GOLDEN_DIR}"
-  python3 - "${FIXTURE}" "${GOLDEN_DIR}" "${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" <<'REPINEOF'
+  python3 - "${FIXTURE}" "${GOLDEN_DIR}" "${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" <<'REPINEOF'
 import hashlib, json, os, sys
 
 src, golden_dir, dst = sys.argv[1:4]
@@ -231,7 +231,7 @@ with open(dst, "w", encoding="utf-8") as fh:
     json.dump(contract, fh, indent=2)
     fh.write("\n")
 REPINEOF
-  [[ -s "${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" ]] \
+  [[ -s "${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" ]] \
     || { echo "FAIL: could not re-pin the contract onto the synthetic golden pool" >&2; exit 1; }
 
   STUB="${WORK}/bin"
@@ -454,8 +454,12 @@ EOF
   # THE ROTATION POOL (section 4b). Every prompt the workflow can draw must
   # carry its serial golden and one oracle per permitted depth, pinned and
   # staged. Each case rewrites the scaffold's contract, runs, and restores it.
-  SCAFFOLD_CONTRACT="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+  SCAFFOLD_CONTRACT="${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
   cp "${SCAFFOLD_CONTRACT}" "${WORK}/contract.orig.json"
+  # The per-depth oracle cases need a speculative arm. This track declares
+  # mtp_head.permitted_draft_depths [], so there is no oracle to pin or stage
+  # and those cases are reported as not-applicable rather than run red.
+  mtp_depths="$(jq -c '.mtp_head.permitted_draft_depths' "${WORK}/contract.orig.json")"
   rotation_case() { # rotation_case LABEL JQ_FILTER NEEDLE [env overrides...]
     local label="$1" filter="$2" needle="$3"; shift 3
     jq "${filter}" "${WORK}/contract.orig.json" > "${SCAFFOLD_CONTRACT}"
@@ -474,17 +478,25 @@ EOF
   cp -R "${GOLDEN_DIR}" "${GOLDEN_DIR_NO_SECOND}"
   rm -f "${GOLDEN_DIR_NO_SECOND}/${SECOND}".mtp*.golden.json
   SECOND_IN_POOL=".live_golden_rotation.pool |= ((. - [\"${SECOND}\"]) + [\"${SECOND}\"])"
-  rotation_case "rotation prompt without per-depth oracles" \
-    "${SECOND_IN_POOL} | del(.speculative_oracles[\"${SECOND}\"])" \
-    "has no pinned per-depth oracle speculative_oracles[${SECOND}][mtp1]" \
-    "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
+  if [[ "${mtp_depths}" == "[]" ]]; then
+    echo "ok    section 4b / rotation prompt without per-depth oracles: not applicable (serial-only track, no permitted draft depth)"
+  else
+    rotation_case "rotation prompt without per-depth oracles" \
+      "${SECOND_IN_POOL} | del(.speculative_oracles[\"${SECOND}\"])" \
+      "has no pinned per-depth oracle speculative_oracles[${SECOND}][mtp1]" \
+      "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
+  fi
   rotation_case "rotation prompt outside timed_prompt_pool" \
     '.live_golden_rotation.pool += ["nosuch"]' \
     "rotation pool prompt 'nosuch' names no timed_prompt_pool entry"
-  rotation_case "rotation prompt borrowing another prompt's oracles" \
-    "${SECOND_IN_POOL} | .speculative_oracles[\"${SECOND}\"] = (.speculative_oracles[\"${LIVE_GOLDEN}\"] | del(.mtp6))" \
-    "speculative_oracles[${SECOND}][mtp1] points at ${LIVE_GOLDEN}.mtp1.golden.json" \
-    "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
+  if [[ "${mtp_depths}" == "[]" ]]; then
+    echo "ok    section 4b / rotation prompt borrowing another prompt's oracles: not applicable (serial-only track, no permitted draft depth)"
+  else
+    rotation_case "rotation prompt borrowing another prompt's oracles" \
+      "${SECOND_IN_POOL} | .speculative_oracles[\"${SECOND}\"] = (.speculative_oracles[\"${LIVE_GOLDEN}\"] | del(.mtp6))" \
+      "speculative_oracles[${SECOND}][mtp1] points at ${LIVE_GOLDEN}.mtp1.golden.json" \
+      "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
+  fi
   rotation_case "rotation pool empty" '.live_golden_rotation.pool = []' \
     "live_golden_rotation.pool is empty"
   rotation_case "calibration prompt is not the band's" ".calibration_prompt = \"${SECOND}\"" \
@@ -515,9 +527,13 @@ ROTEOF
     fail "section 4b / control: a fully pinned two-prompt pool did not pass; got: $(tail -3 <<<"${control_rot}")"
   fi
   # ...and the same pool with one oracle left unstaged is refused by name.
-  rm "${GOLDEN_DIR2}/${SECOND}.mtp4.golden.json"
-  expect_refusal "rotation oracle not staged" "${SECOND}.mtp4.golden.json" \
-    "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR2}"
+  if [[ "${mtp_depths}" == "[]" ]]; then
+    echo "ok    section 4b / rotation oracle not staged: not applicable (serial-only track, no per-depth oracle exists)"
+  else
+    rm "${GOLDEN_DIR2}/${SECOND}.mtp4.golden.json"
+    expect_refusal "rotation oracle not staged" "${SECOND}.mtp4.golden.json" \
+      "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR2}"
+  fi
   cp "${WORK}/contract.orig.json" "${SCAFFOLD_CONTRACT}"
 
   # A refresh generation staged ahead of its pin passes (tools/pool-refresh.sh

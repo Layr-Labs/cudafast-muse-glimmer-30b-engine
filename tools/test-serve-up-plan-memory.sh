@@ -24,7 +24,7 @@ set -uo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
 SERVE_UP="${ROOT_DIR}/tools/serve-up.sh"
-FIXTURE="${ROOT_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${ROOT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 # shellcheck source=tools/testlib/synthetic-window.sh
 . "${ROOT_DIR}/tools/testlib/synthetic-window.sh"
 synthetic_window_env

@@ -51,7 +51,7 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
-FIXTURE="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 log() { printf 'record-goldens: %s\n' "$*" >&2; }
 die() { printf 'record-goldens: %s\n' "$*" >&2; exit 1; }
 

@@ -362,7 +362,7 @@ SERVE_UP_SOCKET_DIR="$(cd -- "${SERVE_UP_SOCKET_DIR}" && pwd -P)"
   || die "SERVE_UP_SOCKET_DIR (or TMPDIR) resolves to /tmp, which the container's own /tmp hides; set SERVE_UP_SOCKET_DIR to another short directory"
 
 # --- the fixture is the authority for the engine configuration ---------------
-TRACK_FIXTURE="${SCRIPT_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+TRACK_FIXTURE="${SCRIPT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 [[ -f "${TRACK_FIXTURE}" ]] || die "the track fixture is missing: ${TRACK_FIXTURE}"
 IMAGE="$(jq -r '.serve_configuration.container_image // empty' "${TRACK_FIXTURE}")"
 DIGEST="$(jq -r '.serve_configuration.container_digest // empty' "${TRACK_FIXTURE}")"

@@ -102,7 +102,7 @@ for b in ${BOXES}; do
 done
 
 ln -s "${REPO_ROOT}/tools/pool-refresh.sh" "${ROOT}/tools/pool-refresh.sh"
-cp "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" "${ROOT}/fixtures/"
+cp "${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" "${ROOT}/fixtures/"
 git -C "${ROOT}" init -q -b main
 git -C "${ROOT}" add -A
 git -C "${ROOT}" -c user.name=t -c user.email=t@t commit -qm base
@@ -112,16 +112,16 @@ git -C "${ROOT}" fetch -q origin
 # The legacy pins must be "staged" on each box for verify.
 for b in ${BOXES}; do
   jq -r '[.timed_prompt_pool[], (.speculative_oracles[] | .[])] | .[].r2_path | split("/")[-1]' \
-    "${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" | sort -u | while read -r f; do echo legacy > "${FAKE}/${b}/home/goldens/${f}"; done
+    "${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" | sort -u | while read -r f; do echo legacy > "${FAKE}/${b}/home/goldens/${f}"; done
 done
 # ...with the sha256 the verify step compares: rewrite the fixture pins to match.
 LEGACY_SHA="$(echo legacy | sha256sum | cut -d' ' -f1)"
 jq --arg s "${LEGACY_SHA}" '.timed_prompt_pool[].sha256 = $s | .speculative_oracles[][].sha256 = $s
-    | .hidden_correctness_golden.sha256 = $s' "${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" > "${WORK}/fx"
-mv "${WORK}/fx" "${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+    | .hidden_correctness_golden.sha256 = $s' "${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" > "${WORK}/fx"
+mv "${WORK}/fx" "${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 git -C "${ROOT}" -c user.name=t -c user.email=t@t commit -qam "legacy pins" && git -C "${ROOT}" push -q origin HEAD:main
 
-FX="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FX="${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 # This scaffold has three live goldens. The default refresh count must match it.
 jq '.official_pairs = 3 | .live_goldens = ["pool-9", "pool-10", "pool-11"]' "${FX}" > "${WORK}/fx" && mv "${WORK}/fx" "${FX}"
 SHIPPED_POOL="$(jq '.timed_prompt_pool | length' "${FX}")"

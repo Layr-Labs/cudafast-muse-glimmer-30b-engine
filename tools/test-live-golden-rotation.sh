@@ -12,7 +12,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
-FIXTURE="${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 DRAW="${REPO_ROOT}/tools/draw-live-golden.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
@@ -78,7 +78,7 @@ for entry in "${REPO_ROOT}"/tools/*; do ln -s "${entry}" "${ROOT}/tools/$(basena
 ln -s "${REPO_ROOT}/benchmark.json" "${ROOT}/benchmark.json"
 jq '.spec = {enabled: false, num_speculative_tokens: 0}' "${REPO_ROOT}/mtp-head.manifest.json" > "${ROOT}/mtp-head.manifest.json"
 jq '.spec = {enabled: true, num_speculative_tokens: 3}' "${REPO_ROOT}/mtp-head.manifest.json" > "${WORK}/mtp3.manifest.json"
-CONTRACT="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+CONTRACT="${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 
 GOLDENS="${WORK}/goldens"
 mkdir -p "${GOLDENS}" "${WORK}/ws" "${WORK}/weights"
@@ -157,22 +157,29 @@ else
   fail "measure: serial run did not hand benchd every live golden; out: $(tail -2 <<<"${out}"); argv: $(tr '\n' ' ' < "${WORK}/argv" 2>/dev/null)"
 fi
 
-out="$(measure "${WORK}/full.json" SPEC_DECLARATION_MANIFEST="${WORK}/mtp3.manifest.json")"
-if [[ "$(argv_all --golden)" == "$(want_list .mtp3.golden.json)" ]] \
-  && [[ "$(argv_all --golden-sha256 | sort -u)" == "$(printf '3%.0s' $(seq 64))" ]] \
-  && [[ "$(argv_all --control-golden)" == "$(want_list .golden.json)" ]] \
-  && [[ "$(argv_all --control-golden-sha256 | sort -u)" == "$(printf 'a%.0s' $(seq 64))" ]] \
-  && [[ "$(argv_after --mtp-depth)" == 3 ]] && ! argv_has --live-prompt; then
-  ok "measure: at mtp3 each candidate oracle is speculative_oracles.<prompt>.mtp3 and each control golden is the serial tape"
+# The per-depth oracle cases need a speculative arm. This track declares
+# mtp_head.permitted_draft_depths [], so a mtp3 declaration is refused by
+# spec-declaration before benchd is reached; report them as not applicable.
+if jq -e '.mtp_head.permitted_draft_depths | index(3) | not' "${WORK}/full.json" >/dev/null 2>&1; then
+  ok "measure: per-depth oracle cases not applicable (serial-only track, no permitted draft depth)"
 else
-  fail "measure: mtp3 run did not use the per-depth oracles; out: $(tail -2 <<<"${out}"); argv: $(tr '\n' ' ' < "${WORK}/argv" 2>/dev/null)"
-fi
+  out="$(measure "${WORK}/full.json" SPEC_DECLARATION_MANIFEST="${WORK}/mtp3.manifest.json")"
+  if [[ "$(argv_all --golden)" == "$(want_list .mtp3.golden.json)" ]] \
+    && [[ "$(argv_all --golden-sha256 | sort -u)" == "$(printf '3%.0s' $(seq 64))" ]] \
+    && [[ "$(argv_all --control-golden)" == "$(want_list .golden.json)" ]] \
+    && [[ "$(argv_all --control-golden-sha256 | sort -u)" == "$(printf 'a%.0s' $(seq 64))" ]] \
+    && [[ "$(argv_after --mtp-depth)" == 3 ]] && ! argv_has --live-prompt; then
+    ok "measure: at mtp3 each candidate oracle is speculative_oracles.<prompt>.mtp3 and each control golden is the serial tape"
+  else
+    fail "measure: mtp3 run did not use the per-depth oracles; out: $(tail -2 <<<"${out}"); argv: $(tr '\n' ' ' < "${WORK}/argv" 2>/dev/null)"
+  fi
 
-jq --arg n "${NAMES[1]}" 'del(.speculative_oracles[$n].mtp3)' "${WORK}/full.json" > "${WORK}/no-oracle.json"
-out="$(measure "${WORK}/no-oracle.json" SPEC_DECLARATION_MANIFEST="${WORK}/mtp3.manifest.json")"
-[[ ! -f "${WORK}/argv" ]] && grep -q "declared spec 'mtp3' has no speculative_oracles\['${NAMES[1]}'\] entry" <<<"${out}" \
-  && ok "measure: a declared depth with no oracle for one live golden is refused by name" \
-  || fail "measure: a missing oracle was not refused: $(tail -2 <<<"${out}")"
+  jq --arg n "${NAMES[1]}" 'del(.speculative_oracles[$n].mtp3)' "${WORK}/full.json" > "${WORK}/no-oracle.json"
+  out="$(measure "${WORK}/no-oracle.json" SPEC_DECLARATION_MANIFEST="${WORK}/mtp3.manifest.json")"
+  [[ ! -f "${WORK}/argv" ]] && grep -q "declared spec 'mtp3' has no speculative_oracles\['${NAMES[1]}'\] entry" <<<"${out}" \
+    && ok "measure: a declared depth with no oracle for one live golden is refused by name" \
+    || fail "measure: a missing oracle was not refused: $(tail -2 <<<"${out}")"
+fi
 
 out="$(measure "${WORK}/full.json" MLXFAST_LIVE_GOLDEN_CHOICE="${FIRST}")"
 [[ ! -f "${WORK}/argv" ]] && grep -q "every job measures every live golden" <<<"${out}" \

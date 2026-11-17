@@ -145,7 +145,7 @@ if [[ ! -x "${BENCHD}" ]]; then
   exit 1
 fi
 
-CONTRACT="${SCRIPT_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+CONTRACT="${SCRIPT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 if [[ ! -f "${CONTRACT}" ]]; then
   echo "nemotron35-measure-and-score.sh: track contract fixture missing: ${CONTRACT}" >&2
   exit 1
@@ -283,7 +283,7 @@ if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
   # dry-run honest rather than a rubber stamp.
   armed="$(jq -r '.official_scoring_enabled // false' "${CONTRACT}")"
   if [[ "${armed}" != "true" ]]; then
-    echo "nemotron35-measure-and-score.sh: preflight REFUSING -- fixtures/nemotron35_lightning_30b_a3b_track.json does not declare official_scoring_enabled: true (got '${armed}')." >&2
+    echo "nemotron35-measure-and-score.sh: preflight REFUSING -- fixtures/muse_glimmer_30b_cuda_v1_track.json does not declare official_scoring_enabled: true (got '${armed}')." >&2
     echo "  benchd refuses to seal an official scoring artifact for an unarmed track; this dry-run mirrors that refusal." >&2
     exit 1
   fi
@@ -371,7 +371,7 @@ GOLDEN_ARGS=()
 for i in "${!GOLDEN_BASENAMES[@]}"; do
   if [[ ! -f "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" ]]; then
     echo "nemotron35-measure-and-score.sh: live golden not found at ${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" >&2
-    echo "  live_goldens names '${LIVE_GOLDEN_NAMES[$i]}' (fixtures/nemotron35_lightning_30b_a3b_track.json); stage ${GOLDEN_BASENAMES[$i]} into MLXFAST_NEMOTRON35_GOLDEN_DIR." >&2
+    echo "  live_goldens names '${LIVE_GOLDEN_NAMES[$i]}' (fixtures/muse_glimmer_30b_cuda_v1_track.json); stage ${GOLDEN_BASENAMES[$i]} into MLXFAST_NEMOTRON35_GOLDEN_DIR." >&2
     exit 1
   fi
   GOLDEN_ARGS+=(--golden "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" --golden-sha256 "${GOLDEN_SHA256S[$i]}" --golden-bytes "${GOLDEN_BYTES_LIST[$i]}")

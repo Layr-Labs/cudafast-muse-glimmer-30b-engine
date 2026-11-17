@@ -1,0 +1,305 @@
+{
+  "schema_version": 1,
+  "track_id": "muse-glimmer-30b-cuda-v1",
+  "track_name": "Muse Glimmer 30B NVFP4 CUDA -- serial paired speedup",
+  "official_scoring_enabled": true,
+  "official_pairs": 3,
+  "official_pair_combine": "mean",
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml",
+    "maxConcurrentWorkflows": 1
+  },
+  "allowed_modes": [
+    "serial"
+  ],
+  "benchmark_name": "cudafast-muse-glimmer-30b",
+  "kv_backend": "vllm-paged",
+  "scored_batch_size": 1,
+  "decode_speedup_floor": 0.95,
+  "prefill_speedup_floor": 0.95,
+  "scored_exponents": {
+    "prefill_gain_exponent": 0.25,
+    "decode_gain_exponent": 0.75
+  },
+  "scores_against_live_control_leg": true,
+  "paired_flow_retired": true,
+  "prefill_band_up_tolerance": 0.05,
+  "prefill_band_down_tolerance": 0.05,
+  "decode_band_up_tolerance": 0.03,
+  "decode_band_down_tolerance": 0.05,
+  "decode_band_down_enabled": false,
+  "calibration_max_cv_percent": 1.0,
+  "prefill_band_down_enabled": false,
+  "score_decode_weight": 0.75,
+  "score_prefill_weight": 0.25,
+  "correctness_steps": 64,
+  "benchmark_decode_steps": 128,
+  "local_submit_benchmark_decode_steps": 1023,
+  "official_prefill_warmup_runs": 1,
+  "official_prefill_timed_runs": 5,
+  "vocab_size": 202048,
+  "num_hidden_layers": 52,
+  "seed_tokens": 512,
+  "golden_model_type": "muse_glimmer_text",
+  "decode_steps": 128,
+  "token_tolerance_budget": 0.0,
+  "live_goldens": [
+    "pool-9",
+    "pool-10",
+    "pool-11"
+  ],
+  "baseline_reference_commit": "2ba41bff7a27c861a3f1a32fd8ca8780402181bf",
+  "pool_status": "not recorded: the CUDA-L09 recording pins the pool generation (these entries name the paths; their pins arrive with that row)",
+  "timed_prompt_pool": [
+    {
+      "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-9.golden.json"
+    },
+    {
+      "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-10.golden.json"
+    },
+    {
+      "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-11.golden.json"
+    }
+  ],
+  "speculative_oracles": {},
+  "serve_configuration": {
+    "engine": "vllm",
+    "engine_pin": "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac",
+    "engine_tag": "v0.27.1",
+    "container_image": "docker.io/vllm/vllm-openai:v0.27.1",
+    "container_digest": "sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c",
+    "toolchain": {
+      "platform": "linux/arm64",
+      "driver_min": "580.159.03",
+      "cuda_arch": "sm_121"
+    },
+    "weight_owner": "vllm-resident",
+    "engine_env": {
+      "RESIDENT_CTX_SIZE": "8192",
+      "RESIDENT_MAX_NUM_BATCHED_TOKENS": "8192",
+      "RESIDENT_GPU_MEMORY_UTILIZATION": "0.45",
+      "RESIDENT_KV_CACHE_MEMORY_BYTES": "4294967296",
+      "HF_HUB_OFFLINE": "1",
+      "TRANSFORMERS_OFFLINE": "1",
+      "VLLM_NO_USAGE_STATS": "1",
+      "DO_NOT_TRACK": "1"
+    },
+    "engine_args": {
+      "max_num_seqs": 1,
+      "enable_prefix_caching": false,
+      "kv_cache_dtype": "auto",
+      "logprobs_mode": "raw_logits",
+      "max_logprobs": 8,
+      "seed": 0,
+      "deterministic_kernels": {
+        "VLLM_DISABLED_KERNELS": "FlashInferFP8ScaledMMLinearKernel"
+      }
+    },
+    "depths": {
+      "serial": {
+        "num_speculative_tokens": 0,
+        "resident_spec_depth": 0,
+        "timed_oracle": "timed_prompt_pool[<live prompt>]"
+      }
+    }
+  },
+  "target": {
+    "upstream_model_id": "nvidia/Muse-Glimmer-30B-NVFP4",
+    "upstream_revision": "47818374517751c48c55cde2621594926b1888b6",
+    "format": "safetensors-modelopt",
+    "engine": "vllm",
+    "architecture": "MuseGlimmerForConditionalGeneration",
+    "model_type": "muse_glimmer",
+    "text_model_type": "muse_glimmer_text",
+    "num_hidden_layers": 52,
+    "hidden_size": 6656,
+    "intermediate_size": 19968,
+    "vocab_size": 202048,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 2,
+    "head_dim": 128,
+    "tie_word_embeddings": false,
+    "max_position_embeddings": 131072,
+    "sliding_window": 2048,
+    "layer_types": [
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "full_attention"
+    ],
+    "full_attention_layer_indices": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23,
+      27,
+      31,
+      35,
+      39,
+      43,
+      47,
+      51
+    ],
+    "bos_token_id": 200000,
+    "eos_token_ids": [
+      200001,
+      200008
+    ],
+    "pad_token_id": 200018,
+    "image_token_id": 200092,
+    "video_token_id": 200091,
+    "vision_tower": {
+      "model_type": "muse_glimmer_vision",
+      "num_hidden_layers": 50,
+      "hidden_size": 1536,
+      "out_hidden_size": 6144,
+      "patch_size": 14,
+      "merge_size": 2
+    },
+    "quantization": {
+      "producer": "modelopt",
+      "quant_algo": "MIXED_PRECISION",
+      "quant_method": "modelopt",
+      "quantized_layer_count": 393,
+      "w4a16_nvfp4_layer_count": 213,
+      "fp8_layer_count": 180,
+      "mlp": "W4A16_NVFP4 (group 16) on every layer's mlp.{gate,up,down}_proj",
+      "self_attn": "FP8 (w8a8 float8) and W4A16_NVFP4 per quantized_layers",
+      "lm_head": "W4A16_NVFP4 (group 16)",
+      "kv_cache": "the resident's kv_cache_dtype (engine_args), not a checkpoint format",
+      "authority": "config.json quantization_config of the pinned snapshot"
+    },
+    "files": [
+      {
+        "path": "LICENSE",
+        "bytes": 11358,
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      },
+      {
+        "path": "README.md",
+        "bytes": 13973,
+        "sha256": "b0c600f9f2c429567b795f2b5b17291267bce8ffd132e098b8bc972169638749"
+      },
+      {
+        "path": "USAGE_POLICY.md",
+        "bytes": 5230,
+        "sha256": "98a14dab9fd97de1666dc8589d399efab1e7fc3ba4e6230d037d6637ba9481d3"
+      },
+      {
+        "path": "chat_template.jinja",
+        "bytes": 7167,
+        "sha256": "114f55ebdc1804c1af371197b9fdf2d6bb925966c9dfe46b73782a71bc07965e"
+      },
+      {
+        "path": "config.json",
+        "bytes": 88682,
+        "sha256": "f3add3cfff62038fc7087e72f7df5a560660707aba7c8e65761bfa6bf8f08774"
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 190,
+        "sha256": "9d62b496fee012cd1981b8b0fa70fc6493859d18153dc4cc3a4813b981db1fe1"
+      },
+      {
+        "path": "hf_quant_config.json",
+        "bytes": 54217,
+        "sha256": "97b68b91007adab31b684c102b5f2c22253a66c80a7fe497ed6b70848e1b139c"
+      },
+      {
+        "path": "model-00001-of-00003.safetensors",
+        "bytes": 9961191764,
+        "sha256": "0e260a8f2c5e16bcc2ad8e90a8a59f1e889431b0de82f4c490c31d9ea9114ce4"
+      },
+      {
+        "path": "model-00002-of-00003.safetensors",
+        "bytes": 9963335980,
+        "sha256": "6a04e8f3e9e68b9d7e0ed8a5d762694eb73e76d2a13ad4951d909238059a6cc5"
+      },
+      {
+        "path": "model-00003-of-00003.safetensors",
+        "bytes": 4745091980,
+        "sha256": "017293c10a76b131f36116c597f6a4eb9a4dd52d8773318b8df4b6afcc625132"
+      },
+      {
+        "path": "model.safetensors.index.json",
+        "bytes": 213580,
+        "sha256": "71823cd92701dfd1632fe37bb7dfcf432a0d068cee2cc26dcc1b94189c3c3b04"
+      },
+      {
+        "path": "processor_config.json",
+        "bytes": 1084,
+        "sha256": "97e2a486dd9866b81f40cf4b8bc0c9ced9a7cd8a5bc65aa4cc2f4de0712dae77"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 28129897,
+        "sha256": "c9dbee66967b58f31a7c27f723c3760da3526ccd0427578e8905b0abb0031c4d"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 79978,
+        "sha256": "ee60d284ed7857ba89155f437cc915951e16056453ca7ae2491c5ae87a395c39"
+      }
+    ]
+  },
+  "mtp_head": {
+    "role": "spec_decode_mtp_head",
+    "source": "none",
+    "note": "serial-only track (contract supported_optimization_modes [serial]): the checkpoint ships no MTP tensors (model.safetensors.index.json has none) and no speculative depth is permitted",
+    "permitted_draft_depths": []
+  },
+  "scoring_semantics": {
+    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = control / candidate per-token time (serial-anchored -- a faster candidate scores > 1). Decode per-token time is the decode window: decode-run time / N, with no seed prefill in it. The run is PAIRED on the box: official_pairs pairs, each one serial-control leg on the organizer-staged reference tree and one candidate leg, single-stream (serial only -- this track declares no speculative arm). Pair k measures live_goldens[(k - 1) mod N], so each live golden gets the same number of pairs. The score is the mean of the per-pair composites (official_pair_combine: mean). Floors and the ceiling apply to every pair."
+  }
+}

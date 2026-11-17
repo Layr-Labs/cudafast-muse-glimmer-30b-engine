@@ -153,7 +153,7 @@ MTP depth, and the paired lifecycle.
 | `harness/vllm_resident/` | editable | the resident: `resident.py` (wire, bookkeeping), `backends.py` (vLLM + fake) |
 | `harness/kernels/` | editable, optional | custom CUDA/C++ kernels built by `harness/kernels/build.sh` |
 | `mtp-head.manifest.json` | editable | the speculative-decoding declaration |
-| `fixtures/nemotron35_lightning_30b_a3b_track.json` | trusted | the track contract: pins, engine configuration, depths, scoring semantics |
+| `fixtures/muse_glimmer_30b_cuda_v1_track.json` | trusted | the track contract: pins, engine configuration, depths, scoring semantics |
 | `benchmark.json` | trusted | editable paths, commands, byte budget, scoring constants |
 | `setup.sh`, `benchmark.sh`, `tools/` | trusted | build, serve, preflight, measure, calibrate, stage, organizer tools |
 | `correctness_prompts/` | trusted | the public prompt text and the public golden |
@@ -328,7 +328,7 @@ engineering log) records the cluster verification and the load-test findings.
 | Question | File |
 |---|---|
 | Editable paths, commands, scoring values | `benchmark.json` |
-| Pins, engine configuration, scoring semantics | `fixtures/nemotron35_lightning_30b_a3b_track.json` |
+| Pins, engine configuration, scoring semantics | `fixtures/muse_glimmer_30b_cuda_v1_track.json` |
 | Why the rules say what they say | `docs/participant-contract.md` |
 | The resident wire | `docs/resident.md` |
 | What CI covers | `docs/ci-coverage.md` |

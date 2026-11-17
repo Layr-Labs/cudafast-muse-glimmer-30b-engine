@@ -106,8 +106,22 @@ _NEMOTRON35_LIGHTNING_CUDA_V1_SCORING = {
     "scoredExponents": {"prefillGainExponent": 0.25, "decodeGainExponent": 0.75},
 }
 
+# muse-glimmer-30b-cuda-v1: the serial arm of the same ruled regime. The mode
+# name is NOT a new vocabulary token: it is the string benchd writes into every
+# score.json (crates/benchd/src/overlay.rs SCORING_MODE, and
+# crates/benchd/src/measure_job.rs MEASURE_JOB_MODE), so a track that declares
+# anything else declares a channel benchd never emits.
+_MUSE_GLIMMER_30B_CUDA_V1_SCORING = {
+    "mode": "qwen-native-mtp-paired-decode-only",
+    "scoredBatchSize": 1,
+    "kvBackend": "vllm-paged",
+    "decodeSpeedupCeiling": 5.0,
+    "scoredExponents": {"prefillGainExponent": 0.25, "decodeGainExponent": 0.75},
+}
+
 EXPECTED_SCORING_BY_TRACK = {
     "nemotron3.5-lightning-30b-a3b-cuda-v1": _NEMOTRON35_LIGHTNING_CUDA_V1_SCORING,
+    "muse-glimmer-30b-cuda-v1": _MUSE_GLIMMER_30B_CUDA_V1_SCORING,
 }
 
 # Tracks whose scoring.seriesNote must document non-comparability against a

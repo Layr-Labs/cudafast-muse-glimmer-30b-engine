@@ -34,7 +34,7 @@ ok()   { echo "ok: $*"; }
 
 command -v jq >/dev/null 2>&1 || { echo "test-stage-baseline-workspace.sh: jq is required" >&2; exit 1; }
 
-FIXTURE="${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 REF_COMMIT="$(jq -r '.baseline_reference_commit' "${FIXTURE}")"
 
 # A stand-in for the organizer-staged local source. It is never read: --dry-run

@@ -8,7 +8,7 @@
 #   1. ONE OBJECT, for participants:
 #        tools/fetch-goldens.sh --r2-path KEY --sha256 HEX --bytes N --out FILE
 #      It fetches one object and keeps it only when the bytes match the pin.
-#      A pin that fixtures/nemotron35_lightning_30b_a3b_track.json declares hidden is
+#      A pin that fixtures/muse_glimmer_30b_cuda_v1_track.json declares hidden is
 #      refused, by key and by digest, so a pin copied out of the contract
 #      cannot pull organizer material onto a participant machine.
 #
@@ -60,7 +60,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-CONTRACT="${SCRIPT_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+CONTRACT="${SCRIPT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 
 R2_PATH=""
 WANT_SHA=""
@@ -97,7 +97,7 @@ participant should be fetching with this. The correctness golden local runs
 already use is checked into the clone at
 correctness_prompts/public-longcopy-gate-english-496.golden.json.
 
-THE HIDDEN GUARD: every pin in fixtures/nemotron35_lightning_30b_a3b_track.json (the
+THE HIDDEN GUARD: every pin in fixtures/muse_glimmer_30b_cuda_v1_track.json (the
 timed_prompt_pool tapes, the per-depth oracles and hidden_correctness_golden)
 is organizer material. This script refuses to fetch any of them by key OR by
 digest, so a copy-pasted pin from the contract cannot quietly pull that
@@ -236,7 +236,7 @@ fetch-goldens.sh: REFUSING -- that pin is hidden, box-only material.
   requested sha : ${WANT_SHA}
 
 It matches a timed_prompt_pool[] tape, a speculative_oracles oracle or hidden_correctness_golden in
-fixtures/nemotron35_lightning_30b_a3b_track.json. Those objects are organizer-side: the GETs
+fixtures/muse_glimmer_30b_cuda_v1_track.json. Those objects are organizer-side: the GETs
 are credentialed, the tapes are a benchd format local --golden modes cannot
 load, and the anti-lottery cohort stops being hidden the moment a participant
 holds all eight.

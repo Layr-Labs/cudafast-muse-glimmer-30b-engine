@@ -54,7 +54,7 @@ mkdir -p "${WORK}"
 SOCKDIR="$(mktemp -d /tmp/3flows.XXXXXX)"
 trap 'rm -rf "${SOCKDIR}"' EXIT
 TRACK="$(jq -r .trackId "${ROOT_DIR}/benchmark.json")"
-FIXTURE="${ROOT_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${ROOT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 REPO="$(jq -r .target.upstream_model_id "${FIXTURE}")"
 REV="$(jq -r .target.upstream_revision "${FIXTURE}")"
 DEPTH="${DRY_RUN_DEPTH:-3}"

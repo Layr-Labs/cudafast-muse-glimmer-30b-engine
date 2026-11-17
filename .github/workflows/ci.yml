@@ -267,8 +267,8 @@ jobs:
       - name: Stage the overlay and import the Nemotron model code through it
         run: |
           set -euo pipefail
-          image="$(jq -r '.serve_configuration.container_image' fixtures/nemotron35_lightning_30b_a3b_track.json)"
-          digest="$(jq -r '.serve_configuration.container_digest' fixtures/nemotron35_lightning_30b_a3b_track.json)"
+          image="$(jq -r '.serve_configuration.container_image' fixtures/muse_glimmer_30b_cuda_v1_track.json)"
+          digest="$(jq -r '.serve_configuration.container_digest' fixtures/muse_glimmer_30b_cuda_v1_track.json)"
           docker pull "${image%%:*}@${digest}"
           tools/stage-vllm-overlay.sh
           docker run --rm --network none --user "$(id -u):$(id -g)" \

@@ -4,7 +4,7 @@ This document states the terms that bind a submission to track
 `nemotron3.5-lightning-30b-a3b-cuda-v1`.
 
 `benchmark.json` is the Yukon track manifest.
-`fixtures/nemotron35_lightning_30b_a3b_track.json` is the track contract fixture.
+`fixtures/muse_glimmer_30b_cuda_v1_track.json` is the track contract fixture.
 Both carry values, paths, commands and pins only. This document explains them.
 It never overrides them.
 
@@ -13,7 +13,7 @@ It never overrides them.
 Apply these in order. The higher entry wins.
 
 1. The ranked run on the official runner. It is the authority on any score.
-2. `fixtures/nemotron35_lightning_30b_a3b_track.json` and `benchmark.json`.
+2. `fixtures/muse_glimmer_30b_cuda_v1_track.json` and `benchmark.json`.
 3. This document.
 4. `README.md`, `TASK.md` and `AGENTS.md`.
 
@@ -531,7 +531,7 @@ benchd iterate \
   --golden $GOLDEN_DIR/pool-10.mtp3.golden.json --golden-sha256 <pin> --golden-bytes <pin> \
   --golden $GOLDEN_DIR/pool-11.mtp3.golden.json --golden-sha256 <pin> --golden-bytes <pin> \
   --mode official --score-path score.json \
-  --contract fixtures/nemotron35_lightning_30b_a3b_track.json \
+  --contract fixtures/muse_glimmer_30b_cuda_v1_track.json \
   --baseline-workspace $MLXFAST_BASELINE_WORKSPACE \
   --baseline-calibration $MLXFAST_BASELINE_CALIBRATION \
   --control-golden $GOLDEN_DIR/pool-9.golden.json  --control-golden-sha256 <pin> --control-golden-bytes <pin> \
