@@ -176,8 +176,15 @@ class VllmBackend:
         self._SamplingParams = SamplingParams
         self._delta = RequestOutputKind.DELTA
         hf = self._engine.model_config.hf_config
-        self.vocab_size = int(hf.vocab_size)
-        eos = hf.eos_token_id
+        # PORT DRIFT (Muse Glimmer 30B): a composite config keeps vocab_size and
+        # eos_token_id in its text sub-config, not at the top level. Read the
+        # text config when the top level does not carry them, so the same code
+        # serves a flat text-only config and a nested multimodal one.
+        text_hf = hf
+        if not hasattr(hf, "vocab_size") and hasattr(hf, "get_text_config"):
+            text_hf = hf.get_text_config()
+        self.vocab_size = int(text_hf.vocab_size)
+        eos = text_hf.eos_token_id
         self.eos_token = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
         self.depth = cfg.depth
         self.ctx_size = cfg.ctx_size
