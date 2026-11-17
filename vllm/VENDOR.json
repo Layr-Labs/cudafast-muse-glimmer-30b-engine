@@ -23,5 +23,24 @@
       "file": "vllm/v1/worker/gpu_model_runner.py",
       "why": "skip the MTP drafter when every request in the batch has max_tokens == 1: its drafts are never verified, and the drafter's pass over the prompt delayed the sampled token (the timed prefill)"
     }
-  ]
+  ],
+  "carried_from": {
+    "why": "Muse Glimmer 30B support is not in v0.27.1; it landed upstream after this base (PR #51655). The five model files are carried byte-for-byte from the vendor runtime that already serves this checkpoint on GB10 (finding F-CUDA-01), and the four registry lines are re-applied to this tree.",
+    "vendor": "vllm/vllm-openai:muse-glimmer",
+    "vendor_vllm_version": "0.26.1rc1.dev608+g99a10304d",
+    "files": {
+      "vllm/vllm/model_executor/models/muse_glimmer.py": "84c17993719945c86733aeb5f075afb19730edefc63cc554bfba46ae8f27e5e5",
+      "vllm/vllm/transformers_utils/configs/muse_glimmer.py": "244b49a081c5d702bbd069f1ecdc533c4ad495a2050a0ec5b412b47b6c3409c5",
+      "vllm/vllm/transformers_utils/processors/muse_glimmer.py": "50cec28101c93f5f8f1cb603b7b116b478ab2717413dc5be6d8442567751c8a9",
+      "vllm/vllm/tool_parsers/muse_glimmer_tool_parser.py": "3116692180e3580b439b81941fa305c1eecf5136a2a510a5a67db036f7ec84e7",
+      "vllm/vllm/reasoning/muse_glimmer_reasoning_parser.py": "93dbbb24110ea459d7e42e696ab047b4baa1a7c3fadac4b912b05e026b878d8e"
+    },
+    "registry_lines": [
+      "vllm/vllm/model_executor/models/registry.py: MuseGlimmerForCausalLM and MuseGlimmerForConditionalGeneration in _TEXT_GENERATION_MODELS; MuseGlimmerAssistantModel and DFlashMuseGlimmerAssistantModel in the qwen3_dflash draft block",
+      "vllm/vllm/transformers_utils/config.py: muse_glimmer, muse_glimmer_text, muse_glimmer_vision, muse_glimmer_assistant in _CONFIG_REGISTRY",
+      "vllm/vllm/transformers_utils/configs/__init__.py: the four config classes in the lazy import table and __all__",
+      "vllm/vllm/reasoning/__init__.py: muse_glimmer -> MuseGlimmerReasoningParser",
+      "vllm/vllm/tool_parsers/__init__.py: muse_glimmer -> MuseGlimmerToolParser"
+    ]
+  }
 }
