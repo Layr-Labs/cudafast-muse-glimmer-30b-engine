@@ -49,7 +49,7 @@
     "pool-10",
     "pool-11"
   ],
-  "baseline_reference_commit": "2ba41bff7a27c861a3f1a32fd8ca8780402181bf",
+  "baseline_reference_commit": "81cdc3bf9372353fb6e5bbc1d61ac8c945e5c442",
   "pool_status": "not recorded: the CUDA-L09 recording pins the pool generation (these entries name the paths; their pins arrive with that row)",
   "timed_prompt_pool": [
     {
