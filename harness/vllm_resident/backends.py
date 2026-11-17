@@ -106,6 +106,23 @@ class VllmConfig:
         )
 
 
+def _checkpoint_is_multimodal(model_dir: str) -> bool:
+    """True when the checkpoint's config.json declares a vision tower.
+
+    Read from the snapshot on disk, never from the model registry: the engine
+    must decide before vLLM is imported whether the renderer will need a
+    tokenizer (see the PORT DRIFT note in VllmBackend).
+    """
+    import json
+
+    try:
+        with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
+            config = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return isinstance(config.get("vision_config"), dict)
+
+
 class VllmBackend:
     """One `LLMEngine`, one greedy request at a time.
 
@@ -123,10 +140,18 @@ class VllmBackend:
         spec = None
         if cfg.depth > 0:
             spec = {"method": "mtp", "num_speculative_tokens": cfg.depth}
+        # PORT DRIFT (vLLM 0.27.1, Muse Glimmer 30B): a multimodal checkpoint
+        # needs a tokenizer even when the caller only sends token IDs, because
+        # the renderer builds the model's multimodal processor at engine start
+        # and that processor raises "You cannot pass text prompts when
+        # `skip_tokenizer_init=True`". A text-only checkpoint keeps the old
+        # pinned shape (tokenizer skipped); a checkpoint whose config carries a
+        # vision tower loads the tokenizer and still takes token-ID prompts.
+        multimodal = _checkpoint_is_multimodal(cfg.model_dir)
         args = EngineArgs(
             model=cfg.model_dir,
             tokenizer=cfg.model_dir,
-            skip_tokenizer_init=True,
+            skip_tokenizer_init=not multimodal,
             trust_remote_code=False,
             dtype="auto",
             seed=0,
