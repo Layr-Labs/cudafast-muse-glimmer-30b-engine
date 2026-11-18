@@ -49,17 +49,23 @@
     "pool-10",
     "pool-11"
   ],
-  "baseline_reference_commit": "81cdc3bf9372353fb6e5bbc1d61ac8c945e5c442",
+  "baseline_reference_commit": "f5d7c2a50cca7ef0d89b73026d4ab4354461c93d",
   "pool_status": "not recorded: the CUDA-L09 recording pins the pool generation (these entries name the paths; their pins arrive with that row)",
   "timed_prompt_pool": [
     {
-      "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-9.golden.json"
+      "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-9.golden.json",
+      "bytes": 28297,
+      "sha256": "46613eb5049d567630695ccde3190c12591b95fdb40e2c13e2ef10dd47b05cda"
     },
     {
-      "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-10.golden.json"
+      "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-10.golden.json",
+      "bytes": 35284,
+      "sha256": "f83f4a5da2f98db086f6e8dc5593442d829f636448294d880500be75c4412005"
     },
     {
-      "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-11.golden.json"
+      "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-11.golden.json",
+      "bytes": 35308,
+      "sha256": "2c5593f6d7dc0e3afc2c970138072c111dcda7fe0eff09e3d2476d67bc5ad0ce"
     }
   ],
   "speculative_oracles": {},
@@ -301,5 +307,18 @@
   },
   "scoring_semantics": {
     "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = control / candidate per-token time (serial-anchored -- a faster candidate scores > 1). Decode per-token time is the decode window: decode-run time / N, with no seed prefill in it. The run is PAIRED on the box: official_pairs pairs, each one serial-control leg on the organizer-staged reference tree and one candidate leg, single-stream (serial only -- this track declares no speculative arm). Pair k measures live_goldens[(k - 1) mod N], so each live golden gets the same number of pairs. The score is the mean of the per-pair composites (official_pair_combine: mean). Floors and the ceiling apply to every pair."
+  },
+  "hidden_correctness_golden": {
+    "bytes": 28297,
+    "sha256": "46613eb5049d567630695ccde3190c12591b95fdb40e2c13e2ef10dd47b05cda"
+  },
+  "goldens": {
+    "status": "RECORDED",
+    "hidden_correctness_golden": {
+      "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-9.golden.json",
+      "bytes": 28297,
+      "sha256": "46613eb5049d567630695ccde3190c12591b95fdb40e2c13e2ef10dd47b05cda"
+    },
+    "warmup_golden": "byte-equal copy of the first live golden staged beside the pool"
   }
 }
