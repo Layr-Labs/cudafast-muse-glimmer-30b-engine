@@ -115,6 +115,10 @@ trap 'rm -rf "${WORK}"' EXIT
 FIXTURE="${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 TRACK_ID="$(jq -r '.track_id' "${FIXTURE}")"
 REF_COMMIT="$(jq -r '.baseline_reference_commit' "${FIXTURE}")"
+# The stability gate is the contract's own calibration_max_cv_percent (1.0 on
+# this track since the v9.1.1 default), so the cv cases below are built from it
+# rather than from a number that would go stale on the next contract move.
+CV_MAX="$(jq -r '.calibration_max_cv_percent // 2' "${FIXTURE}")"
 # The shipped fixture declares live_goldens. Most cases below run the scaffold
 # in the per-job rotation shape over the same prompts (live_golden = the first
 # one); the live_goldens cases near the end run the shipped shape.
@@ -372,18 +376,23 @@ EOF
   expect_refusal "runner unnamed" \
     "has no RUNNER_NAME" RUNNER_NAME=
 
-  # A reference tree at the wrong commit.
+  # A reference tree at a commit the fixture pin does not descend from. The
+  # preflight accepts a tree that CARRIES the pin as an ancestor (F-CUDA-30: a
+  # commit cannot carry its own sha), so the wrong-commit case has to sit on an
+  # OLDER commit -- the repository's root -- rather than on this checkout's HEAD,
+  # which is a descendant of the pin and therefore accepted.
   WS_OLD="${WORK}/reference-old"
+  OLD_COMMIT="$(git -C "${REPO_ROOT}" rev-list --max-parents=0 HEAD | tail -1)"
   git clone --quiet --shared --no-checkout "${REPO_ROOT}" "${WS_OLD}" 2>/dev/null
-  if git -C "${WS_OLD}" checkout --quiet --detach HEAD 2>/dev/null; then
+  if git -C "${WS_OLD}" checkout --quiet --detach "${OLD_COMMIT}" 2>/dev/null; then
     mkdir -p "${WS_OLD}/.build/vllm-overlay/vllm" "${WS_OLD}/.build/release"
     : > "${WS_OLD}/.build/vllm-overlay/vllm/__init__.py"
     : > "${WS_OLD}/.build/release/mlxfast-runtime-worker"
     chmod +x "${WS_OLD}/.build/release/mlxfast-runtime-worker"
-    expect_refusal "workspace at the wrong commit" \
+    expect_refusal "workspace at a commit the pin does not descend from" \
       "but the fixture pins ${REF_COMMIT}" "MLXFAST_BASELINE_WORKSPACE=${WS_OLD}"
   else
-    fail "section 8 / workspace at the wrong commit: cannot check out HEAD"
+    fail "section 8 / workspace at a wrong commit: cannot check out ${OLD_COMMIT}"
   fi
 
   # A reference tree that was staged but never built.
@@ -426,18 +435,19 @@ EOF
   cal_case "calibration passes" '.prompts[0].passes = 1' "a band needs at least two"
   cal_case "calibration mean" '.prompts[0].decode_seconds_per_token_mean = 0' \
     "is not a plausible per-token time"
-  cal_case "calibration cv" '.prompts[0].decode_cv = 0.05' \
-    "above the 2.0 % stability gate (the track contract's calibration_max_cv_percent)"
-  CAL_CV_PASS="${WORK}/cal-cv-1-5-percent.json"
-  write_calibration "${CAL_CV_PASS}" '.prompts[0].decode_cv = 0.015'
+  cal_case "calibration cv" ".prompts[0].decode_cv = $(awk -v c="${CV_MAX}" 'BEGIN{printf "%.6f", (c + 1) / 100}')" \
+    "above the ${CV_MAX} % stability gate (the track contract's calibration_max_cv_percent)"
+  CAL_CV_PASS="${WORK}/cal-cv-below-gate.json"
+  write_calibration "${CAL_CV_PASS}" ".prompts[0].decode_cv = $(awk -v c="${CV_MAX}" 'BEGIN{printf "%.6f", c / 200}')"
   cv_pass="$(run_preflight "MLXFAST_BASELINE_CALIBRATION=${CAL_CV_PASS}")"
   if grep -q 'ranked-box-preflight: all checks passed' <<<"${cv_pass}"; then
-    echo "ok    section 8 / calibration cv 1.5 percent: passes the 2 percent gate"
+    echo "ok    section 8 / calibration cv half the gate: passes the ${CV_MAX} percent gate"
   else
-    fail "section 8 / calibration cv 1.5 percent: did not pass; got: $(tail -3 <<<"${cv_pass}")"
+    fail "section 8 / calibration cv half the gate: did not pass; got: $(tail -3 <<<"${cv_pass}")"
   fi
-  cal_case "calibration cv 2.5 percent" '.prompts[0].decode_cv = 0.025' \
-    "above the 2.0 % stability gate (the track contract's calibration_max_cv_percent)"
+  cal_case "calibration cv well above the gate" \
+    ".prompts[0].decode_cv = $(awk -v c="${CV_MAX}" 'BEGIN{printf "%.6f", (c + 1.5) / 100}')" \
+    "above the ${CV_MAX} % stability gate (the track contract's calibration_max_cv_percent)"
   cal_case "calibration band does not bracket 1" '.prompts[0].decode_band_high = 0.99' \
     "is not a usable band"
   cal_case "calibration band admits a half-speed box" '.prompts[0].prefill_band_high = 2.5' \
