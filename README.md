@@ -183,7 +183,7 @@ This command clones the benchmark repository.
 Before you submit, remove build artifacts from the editable paths. The archive
 packages `vllm/`, `harness/` and `mtp-head.manifest.json` as they sit on disk.
 The unchanged editable surface on this tree is 35,168,624 bytes; the byte budget
-(`editableSurfaceByteBudget.maxTotalBytes` in `benchmark.json`) is 36,047,190
+(`editableSurfaceByteBudget.maxTotalBytes` in `benchmark.json`) is 41,943,040
 bytes. A stale adapter `target/` tree or a `__pycache__/` directory uses that
 room and counts against the budget.
 

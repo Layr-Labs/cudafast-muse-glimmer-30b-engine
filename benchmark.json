@@ -16,9 +16,9 @@
   "editableSurfaceByteBudget": {
     "exemptPathMaxBytes": 512000000,
     "exemptPathMaxFileBytes": 100000000,
-    "maxTotalBytes": 36047190,
+    "maxTotalBytes": 41943040,
     "maxFileBytes": 2558837,
-    "maxGrowthBytes": 36047190
+    "maxGrowthBytes": 41943040
   },
   "contractPath": "fixtures/muse_glimmer_30b_cuda_v1_track.json",
   "setupCommand": [

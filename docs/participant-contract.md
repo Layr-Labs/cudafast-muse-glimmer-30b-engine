@@ -92,9 +92,9 @@ the caps:
 
 | Cap | Value | Derivation |
 |---|---|---|
-| `maxTotalBytes` | 36,047,190 | the surface at rest on this tree, 35,168,624, plus the growth headroom the vendoring commit leaves |
+| `maxTotalBytes` | 41,943,040 | the surface at rest on this tree, 35,168,624, plus the growth headroom the vendoring commit leaves; raised from 36,047,190 to 40 MiB on the owner's words "Raise the limit" (2026-11-18, F-CUDA-55) |
 | `maxFileBytes` | 2,558,837 | the largest file at rest, 1,510,261, plus 1 MiB |
-| `maxGrowthBytes` | 36,047,190 | equal to the total: the vendoring commit is the growth |
+| `maxGrowthBytes` | 41,943,040 | equal to the total: the vendoring commit is the growth |
 
 The cap exists so that source cannot hide lookup tables. It also refuses
 symlinks and special files anywhere under an editable path.
