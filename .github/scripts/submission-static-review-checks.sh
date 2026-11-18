@@ -212,17 +212,19 @@ resolve_cap() { # resolve_cap VAR_NAME CONTRACT_KEY FALLBACK
 # the contract says is in budget, a LARGER one admits bytes the contract does
 # not, and either way the two enforcers stop agreeing about what the budget is.
 #
-# THE CAPS ARE DERIVED BY THE 1 MiB-MARGIN METHOD over this repository's
-# editable surface (vllm/, harness/, mtp-head.manifest.json) at rest:
-# 34,998,614 bytes + 1,048,576 margin = 36,047,190 total, and the largest
-# editable file (vllm/vllm/entrypoints/serve/instrumentator/static/
-# swagger-ui-bundle.js, 1,510,261) + 1,048,576 = 2,558,837 per file.
+# THE CAPS ARE 40 MiB (41,943,040), total and growth alike: the owner raised
+# them on 2026-11-18 ("Raise the limit", F-CUDA-55), and
+# docs/participant-contract.md carries the arithmetic over this repository's
+# editable surface (vllm/, harness/, mtp-head.manifest.json) at rest.
 # maxGrowthBytes matches the total because the commit that vendors vLLM IS the
-# growth. tools/lint-benchmark-manifest.py checks these fallbacks against
+# growth. The per-file cap keeps its own 1 MiB margin over the largest editable
+# file (vllm/vllm/entrypoints/serve/instrumentator/static/swagger-ui-bundle.js,
+# 1,510,261) + 1,048,576 = 2,558,837.
+# tools/lint-benchmark-manifest.py checks these fallbacks against
 # benchmark.json -- do not edit a number below without editing benchmark.json.
-resolve_cap MAX_BYTES maxTotalBytes 36047190
+resolve_cap MAX_BYTES maxTotalBytes 41943040
 resolve_cap MAX_FILE_BYTES maxFileBytes 2558837
-resolve_cap MAX_GROWTH_BYTES maxGrowthBytes 36047190
+resolve_cap MAX_GROWTH_BYTES maxGrowthBytes 41943040
 
 for cap_name in MAX_BYTES MAX_FILE_BYTES MAX_GROWTH_BYTES; do
   if ! [[ "${!cap_name}" =~ ^[1-9][0-9]*$ ]]; then
