@@ -46,7 +46,7 @@
 #   * `enabled` that is not a boolean, or `num_speculative_tokens` not an integer;
 #   * a value outside the structural range 0..8 (the structural sanity ceiling);
 #   * an ENABLED depth that is not in the contract's permitted_draft_depths
-#     (fixtures/nemotron35_lightning_30b_a3b_track.json `mtp_head.permitted_draft_depths`,
+#     (fixtures/muse_glimmer_30b_cuda_v1_track.json `mtp_head.permitted_draft_depths`,
 #     the same envelope harness/protocol-adapter/src/session_backend.rs mirrors as
 #     MTP_MIN_DEPTH..=MTP_MAX_DEPTH). An out-of-envelope depth is REFUSED, never
 #     clamped -- so the serve that boots and the `effective_spec` the adapter
@@ -63,7 +63,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 MANIFEST="${SPEC_DECLARATION_MANIFEST:-${REPO_ROOT}/mtp-head.manifest.json}"
-CONTRACT="${SPEC_DECLARATION_CONTRACT:-${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json}"
+CONTRACT="${SPEC_DECLARATION_CONTRACT:-${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json}"
 
 # The structural sanity ceiling for a declared draft length (the
 # knob accepts a declared integer 0..8, not a hardcoded value). The contract's
@@ -106,8 +106,13 @@ if [[ -f "${MANIFEST}" ]]; then
 
   if [[ "$(jq -r 'has("source")' "${MANIFEST}")" == "true" ]]; then
     declared_source="$(jq -r '.source | if type == "string" then . else tojson end' "${MANIFEST}")"
-    [[ "${declared_source}" == "pinned" ]] \
-      || fail "source \"${declared_source}\" is not accepted; the head is the organizer-staged pinned head, so the only accepted source is \"pinned\""
+    # The CONTRACT names the only source this track can carry: a track whose
+    # checkpoint ships a pinned head declares "pinned"; a serial-only track
+    # whose checkpoint ships none declares "none". Anything else is refused,
+    # never waved through.
+    accepted_source="$(jq -r '.mtp_head.source // "pinned"' "${CONTRACT}")"
+    [[ "${declared_source}" == "${accepted_source}" ]] \
+      || fail "source \"${declared_source}\" is not accepted; the contract's mtp_head.source is \"${accepted_source}\", so the only accepted source is \"${accepted_source}\""
   fi
 
   # max_bytes, bytes and sha256 are recorded, not read: nothing bounds a load

@@ -85,7 +85,7 @@ if [ "${CALIBRATE_BOX_SETSID:-0}" != "1" ] && command -v setsid >/dev/null 2>&1;
 fi
 export CALIBRATE_BOX_SETSID=1
 
-FIXTURE="${REPO_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${REPO_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 MANIFEST="${REPO_DIR}/benchmark.json"
 PASSES=3
 LOCK_PATH=/tmp/mtplx-gpu-exclusive.lock
@@ -120,7 +120,7 @@ usage: calibrate-box.sh <box> <out> [options]
 ENV:
   MLXFAST_BASELINE_WORKSPACE     the built reference tree (required)
   MLXFAST_TARGET_SNAPSHOT_DIR    the pinned target snapshot (required)
-  MLXFAST_NEMOTRON35_GOLDEN_DIR      the staged goldens. Required: they are box material
+  MLXFAST_MUSE_GLIMMER_GOLDEN_DIR      the staged goldens. Required: they are box material
   BENCHD                         a benchd to use as-is (default: tools/fetch-benchd.sh)
   BENCHD_BIN_DIR                 where benchd.manifest.json is read for the
                                  benchd source commit (default: <repo>/benchd-bin)
@@ -233,20 +233,20 @@ export MLXFAST_QWEN_MTP_TRACK_ID="${TRACK_ID}"
 
 # --- the goldens the bands are captured on -----------------------------------
 # Every name in the fixture's live_goldens, in fixture order, resolved from the
-# staged pool exactly as tools/nemotron35-measure-and-score.sh resolves them.
+# staged pool exactly as tools/muse-glimmer-measure-and-score.sh resolves them.
 # A ranked run measures every live golden, and benchd gates each control leg
 # with the band of the prompt that leg measured, so each prompt gets its own
 # band. Each one reaches benchd as a --golden and --prompt pair.
-GOLDEN_DIR="${MLXFAST_NEMOTRON35_GOLDEN_DIR:-}"
+GOLDEN_DIR="${MLXFAST_MUSE_GLIMMER_GOLDEN_DIR:-}"
 [ -n "${GOLDEN_DIR}" ] || refuse missing-golden \
-  "MLXFAST_NEMOTRON35_GOLDEN_DIR is unset; the live goldens are staged on the box out of band and this script fetches nothing"
+  "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR is unset; the live goldens are staged on the box out of band and this script fetches nothing"
 LIVE_GOLDENS="$(jq -r '(.live_goldens // [])[]' "${FIXTURE}")"
 [ -n "${LIVE_GOLDENS}" ] || refuse missing-live-golden "${FIXTURE} declares no live_goldens"
 GOLDEN_ARGS=()
 for name in ${LIVE_GOLDENS}; do
   case "${name}" in *[!a-z0-9_-]*) refuse missing-live-golden "live_goldens name '${name}' is not [a-z0-9_-]+" ;; esac
   [ -r "${GOLDEN_DIR}/${name}.golden.json" ] || refuse missing-golden \
-    "cannot read the live golden ${GOLDEN_DIR}/${name}.golden.json; stage the pool into MLXFAST_NEMOTRON35_GOLDEN_DIR"
+    "cannot read the live golden ${GOLDEN_DIR}/${name}.golden.json; stage the pool into MLXFAST_MUSE_GLIMMER_GOLDEN_DIR"
   GOLDEN_ARGS+=(--golden "${GOLDEN_DIR}/${name}.golden.json" --prompt "${name}")
 done
 LIVE_GOLDEN="$(printf '%s' "${LIVE_GOLDENS}" | tr '\n' ' ')"

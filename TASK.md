@@ -1,19 +1,21 @@
-# The task — Nemotron 3.5 Lightning 30B-A3B NVFP4 on DGX Spark
+# The task — Muse Glimmer 30B NVFP4 on DGX Spark
 
 Make the target model run faster on a DGX Spark (GB10, sm_121), single stream.
 
-The target is `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` at revision
-`bee7596271d1495f6992ae224aefde4410e816b8`. It is a 52-layer hybrid: 23
-Mamba-2 layers, 23 MoE layers (128 routed experts, 6 per token, plus a shared
-expert) and 6 attention layers, with one native MTP layer embedded in the
-checkpoint.
+The target is `nvidia/Muse-Glimmer-30B-NVFP4` at revision
+`47818374517751c48c55cde2621594926b1888b6`. It is a ModelOpt
+mixed-precision checkpoint of a 52-layer text decoder: 39 sliding-attention
+layers (window 2048) and 13 full-attention layers, a dense MLP (intermediate
+19968, hidden 6656, 32 heads, 2 KV heads, vocab 202048), plus a BF16 vision
+tower that the scored text track does not exercise. The checkpoint ships no
+speculative tensors.
 
 The engine is vLLM v0.27.1. Its Python source is vendored at `vllm/vllm/`, and
 it runs on top of the compiled extensions in the pinned engine container. The
 scored binary is the Engine Protocol v1 adapter (`harness/protocol-adapter`).
 It attaches to one vLLM resident per leg (`harness/vllm_resident`).
 
-The ranked track is `nemotron3.5-lightning-30b-a3b-cuda-v1`. Read
+The ranked track is `muse-glimmer-30b-cuda-v1`. Read
 [README.md](README.md) for setup. Read
 [`docs/participant-contract.md`](docs/participant-contract.md) for the reasons
 behind every rule.
@@ -26,7 +28,7 @@ those paths and nothing else.
 
 | Path | What it is |
 |---|---|
-| `vllm/` | The vendored vLLM Python and Triton source: model code (`nemotron_h.py`, `nemotron_h_mtp.py`), Mamba and MoE layers, attention backends, the scheduler, the speculative-decoding loop. |
+| `vllm/` | The vendored vLLM Python and Triton source: model code (`muse_glimmer.py`), attention backends, the scheduler, the KV cache. |
 | `harness/` | The Rust protocol adapter, the Python resident, and optional custom CUDA/C++ kernels under `harness/kernels/`. A `harness/kernels/build.sh` runs in the pinned container at setup, and its output goes on the resident's `PYTHONPATH`. |
 | `mtp-head.manifest.json` | The speculative-decoding declaration: `spec.enabled` and `spec.num_speculative_tokens`. |
 
@@ -39,31 +41,28 @@ benchd.
 ## What stays fixed
 
 > **WARNING — the target's numerical formats are frozen.**
-> The checkpoint's own `hf_quant_config.json` declares the formats. Routed and
-> shared experts and `lm_head` are NVFP4 weight-only, which means W4A16:
-> 16-element blocks with an FP8 E4M3 scale and an FP32 global scale. The Mamba
-> in/out projections are FP8. The KV cache is FP8. The Mamba SSM state is
-> float32.
+> The checkpoint's own `config.json` `quantization_config` declares the
+> formats: 213 layers (the MLP projections and `lm_head`) are
+> `W4A16_NVFP4` weight-only, 16-element blocks with an FP8 E4M3 scale and an
+> FP32 global scale; 180 layers (the attention projections) are `FP8 w8a8`;
+> the vision tower and the embeddings are BF16. The KV cache is the fixture's
+> `kv_cache_dtype` (`auto`, the checkpoint's own dtype).
 >
 > Do not re-quantize, re-represent or change the format of any target weight,
 > activation path or cache. That includes quantizing activations to FP4.
 > This holds even when the result passes the correctness gate. You may write
 > faster kernels that compute the same formats: fused dequant-GEMM, a better
-> MoE, a better Mamba scan, CUDA graphs, fusion, scheduling.
+> attention kernel, CUDA graphs, fusion, scheduling.
 
-> **WARNING — the MTP head is the organizer's pinned weights.**
-> The head is the `mtp.*` tensors in the pinned checkpoint: BF16, 270 tensors,
-> 2,670,652,160 bytes. You may not replace it, re-quantize it, or ship head
-> weights of your own. `mtp-head.manifest.json` accepts `"source": "pinned"`
-> only.
+> **WARNING — this track is serial only: it has no speculative arm.**
+> The checkpoint ships no MTP or draft tensors, and the fixture's
+> `allowed_modes` is `[serial]`. `mtp-head.manifest.json` must declare
+> `"source": "none"`; a declaration that arms speculation is refused. DSpark,
+> DFlash and Eagle drafters are not part of this track.
 
 - **The scored batch size is 1.** It is not a tunable.
-- **The only speculative arm is the native MTP head,** run as vLLM's `mtp`
-  method. DSpark, DFlash and Eagle drafters are not part of this track.
-- **The draft depth is yours to choose, from 1 to 6.** A disabled declaration
-  or depth 0 runs serial. The non-editable envelope refuses 7 and above. Each
-  run seals `effective_spec_mode` and `effective_spec_depth`, along with the
-  per-cycle `acceptance_lengths` and `spec_acceptance_rate`.
+- **Every leg runs serial.** `serve_configuration.depths` declares `serial`
+  only, and each run seals `effective_spec_mode = serial`.
 - **The engine configuration comes from the fixture:**
   `serve_configuration.engine_env` sets the context of 8192 tokens, the
   batched-token budget and the memory fraction. The resident's own code decides
@@ -114,8 +113,8 @@ The score is serial-anchored, so a faster candidate scores above 1.
 
 - **Pairs.** A ranked run measures 3 pairs on one box in one job. Each pair is
   one serial-control leg on the organizer-staged reference tree, then one
-  candidate leg at your declared depth.
-- **Workload.** Every leg is single-stream: a 496-token prompt (one unmeasured
+  candidate leg.
+- **Workload.** Every leg is single-stream: a 512-token prompt (one unmeasured
   warm-up prefill, then five timed prefills of the same prompt, scored by their
   median) and a 128-step decode. The prompts are the fixture's `live_goldens`:
   three hidden coding prompts. Each one is a user message in the model's own
@@ -130,12 +129,11 @@ The score is serial-anchored, so a faster candidate scores above 1.
   the 3 per-pair composites. Every pair must clear both floors.
 - **Bounds.** Both floors are 0.95, so a candidate that regresses prefill or
   decode by more than 5 percent is refused. The ceiling is 5.0.
-- **Correctness.** The per-stream token-tolerance gate prices divergence from
-  the serial tape against a 10% budget.
+- **Correctness.** The token-tolerance budget is `0.0`: your stream must
+  reproduce the serial tape token for token.
 
-> **WARNING — the gate accepts similar output, not identical output.** The
-> track does not require token-for-token equality with the serial trajectory,
-> but a change that moves the numerics far enough fails the gate.
+> **WARNING — the gate demands an exact match.** A candidate whose stream
+> leaves the golden at any token, even at a logit tie, fails the run.
 
 ## Ranking
 
@@ -171,7 +169,7 @@ smoke signal, not as a prediction. The ranked box run is the authority.
 | Question | File |
 |---|---|
 | Editable paths, commands, scoring values | `benchmark.json` |
-| Pins, engine configuration, depths, scoring semantics | `fixtures/nemotron35_lightning_30b_a3b_track.json` |
+| Pins, engine configuration, serve depths, scoring semantics | `fixtures/muse_glimmer_30b_cuda_v1_track.json` |
 | Why each rule says what it says | `docs/participant-contract.md` |
 | What a measured run executes | the channel benchmarker (`tools/fetch-benchd.sh`) |
 

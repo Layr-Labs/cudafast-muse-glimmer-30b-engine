@@ -1,23 +1,24 @@
-# Agent guide — Nemotron 3.5 Lightning 30B-A3B NVFP4 engine
+# Agent guide — Muse Glimmer 30B NVFP4 engine
 
 This file is the working contract for coding agents in this repository.
 `CLAUDE.md` is a symbolic link to it.
 
 Read [README.md](README.md) first and [TASK.md](TASK.md) second. This file adds
 the operational rules for iterating here. The ranked track is
-`nemotron3.5-lightning-30b-a3b-cuda-v1`.
+`muse-glimmer-30b-cuda-v1`.
 
 ## Goal
 
 Make the target prefill and decode faster on a DGX Spark, single stream, without
-changing what it computes beyond the 10% token-tolerance budget.
+changing what it computes: the output must match the golden token for token
+(the token-tolerance budget is `0.0`).
 
 ## Authorities
 
 | Question | File |
 |---|---|
 | What you may edit | `benchmark.json` `editablePaths`: `vllm`, `harness`, `mtp-head.manifest.json` |
-| Pins, engine configuration, depths, scoring | `fixtures/nemotron35_lightning_30b_a3b_track.json` |
+| Pins, engine configuration, serve depths, scoring | `fixtures/muse_glimmer_30b_cuda_v1_track.json` |
 | Why the rules say what they say | `docs/participant-contract.md` |
 | The resident wire | `docs/resident.md` |
 
@@ -25,14 +26,16 @@ changing what it computes beyond the 10% token-tolerance budget.
 
 | Lever | Where |
 |---|---|
-| Speculation depth | `mtp-head.manifest.json` `spec` (1 to 6) |
 | Engine arguments (CUDA graphs, compile level, scheduler, async scheduling) | `harness/vllm_resident/backends.py` `VllmBackend` |
 | Per-step overhead between benchd and vLLM | `harness/vllm_resident/resident.py`, `harness/protocol-adapter/src/` |
-| Model code | `vllm/vllm/model_executor/models/nemotron_h.py`, `nemotron_h_mtp.py` |
-| Mamba-2 | `vllm/vllm/model_executor/layers/mamba/` |
-| MoE (NVFP4 W4A16) | `vllm/vllm/model_executor/layers/fused_moe/`, `.../quantization/` |
-| Speculative loop | `vllm/vllm/v1/spec_decode/`, `vllm/vllm/v1/worker/gpu/spec_decode/` |
+| Model code (the 52-layer decoder) | `vllm/vllm/model_executor/models/muse_glimmer.py` |
+| Attention (sliding window, FP8 projections) | `vllm/vllm/model_executor/layers/attention/`, `.../quantization/` |
+| Dense MLP (NVFP4 W4A16) | `vllm/vllm/model_executor/layers/linear.py`, `.../quantization/` |
 | New CUDA kernels | `harness/kernels/` + `harness/kernels/build.sh` |
+
+This track is serial only: `allowed_modes` is `[serial]` and there is no
+speculative lever. `mtp-head.manifest.json` is still an editable path, but it
+must declare `"source": "none"`.
 
 ## Rules
 
@@ -41,8 +44,9 @@ changing what it computes beyond the 10% token-tolerance budget.
   `correctness_prompts/`, all trusted. A submission that touches them is
   refused.
 - **Never change a numerical format.** Section 3.4 of the contract lists them.
-  Keep NVFP4 W4A16 experts and `lm_head`, FP8 Mamba projections, the FP8 KV
-  cache, the fp32 SSM state and the BF16 MTP head exactly as declared.
+  Keep the MLP and `lm_head` at W4A16_NVFP4 (group 16), the attention
+  projections at FP8 w8a8, the vision tower and embeddings at BF16, and the
+  KV cache at the fixture's `kv_cache_dtype`, exactly as declared.
 - **Never reuse work across requests or phases.** That rules out prefix
   caching, memoized prompts and state kept across `sync`. The resident's
   `invalidate` must leave the engine with nothing from the previous phase.
@@ -53,12 +57,13 @@ changing what it computes beyond the 10% token-tolerance budget.
   the golden at any token, even at a logit tie, the run fails (contract
   section 5.4.1). The ranked run and the local modes apply the same rule.
 - **Keep the engine reproducible.** Run `tools/determinism-probe.py` against a
-  booted resident; it must report one stream at serial and at your depth. The
-  stock Marlin MoE is NOT reproducible on GB10
-  (`docs/nemotron35-port-notes.md` section 7.2).
+  booted resident; it must report one stream at serial; this track has no other
+  mode. The fixture disables `FlashInferFP8ScaledMMLinearKernel` because this
+  checkpoint quantizes its attention projections to FP8
+  (`docs/muse-glimmer-port-notes.md`).
 - **Keep the resident wire intact.** The Rust client in
   `harness/protocol-adapter/src/resident.rs` and `resident.py` must agree.
-  `test_adapter_e2e.py` proves it at every depth.
+  `test_adapter_e2e.py` proves it on the serial path.
 - **Keep `IMPLEMENTED_DEPTH` in `resident.py` and `ENGINE_IMPLEMENTED_DEPTH` in
   `session_backend.rs` equal.** Tests on both sides check it.
 - **Report raw counters only.** The adapter never reports a rate, a time or a

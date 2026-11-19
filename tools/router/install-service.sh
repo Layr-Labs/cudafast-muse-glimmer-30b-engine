@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install-service.sh -- install the router and fleet-watcher user units
-# (systemd/nemotron35-router.service, nemotron35-watch.service) from this checkout.
+# (systemd/muse-glimmer-router.service, muse-glimmer-watch.service) from this checkout.
 #
 # Usage:
 #   tools/router/install-service.sh                     # render, enable and start both
@@ -12,7 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-UNITS=(nemotron35-router.service nemotron35-watch.service)
+UNITS=(muse-glimmer-router.service muse-glimmer-watch.service)
 
 usage() {
   echo "Usage: $0 [--uninstall | --render DIRECTORY | --help]"
@@ -51,7 +51,7 @@ values = {"@REPO@": escape(repo), "@EXEC_REPO@": escape(repo, command=True),
           "@PATH@": escape(":".join(dirs))}
 destination = Path(output)
 destination.mkdir(parents=True, exist_ok=True)
-for name in ("nemotron35-router.service", "nemotron35-watch.service"):
+for name in ("muse-glimmer-router.service", "muse-glimmer-watch.service"):
     text = (Path(source) / "systemd" / name).read_text()
     # One pass avoids interpreting placeholder-like text inside a path.
     text = re.sub(r"@(?:EXEC_REPO|REPO|PATH)@", lambda m: values[m[0]], text)
@@ -91,7 +91,7 @@ case "${1:-}" in
       fi
     done
     systemctl --user daemon-reload
-    echo "Services removed; ~/nemotron35-router state and reports retained."
+    echo "Services removed; ~/muse-glimmer-router state and reports retained."
     exit 0
     ;;
   "") [[ $# -eq 0 ]] || { usage >&2; exit 2; } ;;

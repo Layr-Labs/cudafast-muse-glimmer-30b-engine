@@ -1,7 +1,7 @@
 //! The session backend: the real engine behind `cuda-engine` on the box.
 //!
 //! The engine is the pinned vLLM build (vendored at `vllm/`) running the pinned
-//! Nemotron 3.5 Lightning checkpoint inside ONE resident process per benchmark
+//! Muse Glimmer 30B checkpoint inside ONE resident process per benchmark
 //! window (`harness/vllm_resident/`, booted by `tools/serve-up.sh`). The
 //! per-phase `cuda-engine` process drives it through the [`EngineSession`]
 //! seam over a Unix socket (`src/resident.rs`); nothing is loaded here.
@@ -119,7 +119,7 @@ pub trait EngineSession: Send {
 }
 
 /// The end-of-sequence ids the correctness free-run reference stops on:
-/// `ENGINE_EOS_IDS` when set, else the model's own EOS plus Nemotron's two
+/// `ENGINE_EOS_IDS` when set, else the model's own EOS plus the checkpoint's two
 /// stop ids (`</s>` = 2 and `<|im_end|>` = 11, generation_config.json).
 fn eos_ids(engine_eos: Option<i64>) -> Vec<i64> {
     let from_env = std::env::var("ENGINE_EOS_IDS")

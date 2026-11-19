@@ -2,7 +2,7 @@
 # test-pool-refresh.sh -- tools/pool-refresh.sh against stubbed boxes.
 #
 # ssh/scp/sudo/install/flock are stubs: each "box" is a directory with a home
-# (holding a stub tools/record-goldens.sh in nemotron35/repo) and a goldens
+# (holding a stub tools/record-goldens.sh in muse-glimmer/repo) and a goldens
 # directory. The script runs from a throwaway repo whose fixture it may edit,
 # with a local bare origin. No network, no GPU, no real box.
 set -uo pipefail
@@ -96,13 +96,13 @@ chmod +x "${STUB}"/* "${RECORD_STUB}" "${WORK}/fake-stitch"
 
 BOXES="b1 b2 b3"
 for b in ${BOXES}; do
-  mkdir -p "${FAKE}/${b}/home/nemotron35/repo/tools" "${FAKE}/${b}/home/goldens"
-  cp "${RECORD_STUB}" "${FAKE}/${b}/home/nemotron35/repo/tools/record-goldens.sh"
+  mkdir -p "${FAKE}/${b}/home/muse-glimmer/repo/tools" "${FAKE}/${b}/home/goldens"
+  cp "${RECORD_STUB}" "${FAKE}/${b}/home/muse-glimmer/repo/tools/record-goldens.sh"
   cp /dev/null "${FAKE}/${b}/home/goldens/.keep"
 done
 
 ln -s "${REPO_ROOT}/tools/pool-refresh.sh" "${ROOT}/tools/pool-refresh.sh"
-cp "${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" "${ROOT}/fixtures/"
+cp "${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" "${ROOT}/fixtures/"
 git -C "${ROOT}" init -q -b main
 git -C "${ROOT}" add -A
 git -C "${ROOT}" -c user.name=t -c user.email=t@t commit -qm base
@@ -112,20 +112,29 @@ git -C "${ROOT}" fetch -q origin
 # The legacy pins must be "staged" on each box for verify.
 for b in ${BOXES}; do
   jq -r '[.timed_prompt_pool[], (.speculative_oracles[] | .[])] | .[].r2_path | split("/")[-1]' \
-    "${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" | sort -u | while read -r f; do echo legacy > "${FAKE}/${b}/home/goldens/${f}"; done
+    "${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" | sort -u | while read -r f; do echo legacy > "${FAKE}/${b}/home/goldens/${f}"; done
 done
 # ...with the sha256 the verify step compares: rewrite the fixture pins to match.
 LEGACY_SHA="$(echo legacy | sha256sum | cut -d' ' -f1)"
 jq --arg s "${LEGACY_SHA}" '.timed_prompt_pool[].sha256 = $s | .speculative_oracles[][].sha256 = $s
-    | .hidden_correctness_golden.sha256 = $s' "${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" > "${WORK}/fx"
-mv "${WORK}/fx" "${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+    | .hidden_correctness_golden.sha256 = $s' "${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" > "${WORK}/fx"
+mv "${WORK}/fx" "${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 git -C "${ROOT}" -c user.name=t -c user.email=t@t commit -qam "legacy pins" && git -C "${ROOT}" push -q origin HEAD:main
 
-FX="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FX="${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 # This scaffold has three live goldens. The default refresh count must match it.
 jq '.official_pairs = 3 | .live_goldens = ["pool-9", "pool-10", "pool-11"]' "${FX}" > "${WORK}/fx" && mv "${WORK}/fx" "${FX}"
 SHIPPED_POOL="$(jq '.timed_prompt_pool | length' "${FX}")"
 SHIPPED_LIVE="$(jq -c '.live_goldens' "${FX}")"
+# F-CUDA-61: the expected job and golden counts come from the track's own
+# declaration, never from a hard-coded six-depth list. A serial-only track
+# (mtp_head.permitted_draft_depths []) records ONE golden per prompt; a track
+# with N permitted depths records N+1. tools/pool-refresh.sh already reads that
+# same list, so the suite and the tool cannot disagree about the job set.
+DEPTHS_N="$(jq '.mtp_head.permitted_draft_depths | length' "${FX}")"
+LIVE_N="$(jq '.live_goldens | length' "${FX}")"
+TOTAL_PINS=$((LIVE_N * (1 + DEPTHS_N)))
+BOX_N=0; for _b in ${BOXES}; do BOX_N=$((BOX_N + 1)); done
 refresh_raw() {
   env PATH="${STUB}:${PATH}" REFRESH_BOXES="${BOXES}" REFRESH_PRIVATE="${PRIV}" \
     REFRESH_BOX_GOLDENS='$HOME/goldens' REFRESH_PYTHON="${WORK}/fake-stitch" \
@@ -148,13 +157,16 @@ grep -q 'stitch-prompts.py.*--label g7 --count 8' <<<"${out}" \
 mv "${WORK}/fx-with-live" "${FX}"
 
 out="$(refresh --label g1 --dry-run)"
+# F-CUDA-61: a serial-only track puts the prompts on more than one box, so the
+# plan never prints all three names on ONE line; compare the union, not a line.
+planned="$(grep -o 'g1-[0-9][0-9]*\.tokens\.json' <<<"${out}" | sed 's/\.tokens\.json$//' | sort -u | tr '\n' ' ')"
 if grep -q 'stitch-prompts.py.*--label g1 --count 3' <<<"${out}" \
-  && grep -q 'g1-1.*g1-2.*g1-3' <<<"${out}" && ! grep -q 'g1-4' <<<"${out}" \
+  && [[ "${planned}" == "g1-1 g1-2 g1-3 " ]] && ! grep -q 'g1-4' <<<"${out}" \
   && [[ ! -e "${PRIV}/refresh/g1/count" ]] \
   && [[ ! -s "${PRIV}/refresh/g1/state" ]] && [[ "$(records)" == 0 ]]; then
   ok "default count plans author and record for the three live goldens only"
 else
-  fail "default count plan is wrong: $(tail -3 <<<"${out}")"
+  fail "default count plan is wrong: planned='${planned}' :: $(tail -3 <<<"${out}")"
 fi
 
 out="$(refresh --label g8 --dry-run --count 2)"
@@ -232,27 +244,34 @@ out="$(refresh_raw --label final --step author --count 2 --snapshot "${WORK}" --
   && ok "final --texts stores its count" || fail "final --texts did not store count 2"
 
 # --- a crash mid-record resumes without re-recording finished jobs ---------------
-touch "${FAKE}/fail-b2-3"
+# F-CUDA-61: the failing job must be one this track really dispatches. A track
+# with permitted depths has an mtp3 job on b2; a serial-only track has only the
+# per-box serial jobs, so the crash is injected into b2's serial job.
+if [[ "${DEPTHS_N}" -gt 0 ]]; then CRASH_STEPS=3; CRASH_LINE="mtp3@b2 on b2 failed"
+else CRASH_STEPS=serial; CRASH_LINE="serial@b2 on b2 failed"; fi
+touch "${FAKE}/fail-b2-${CRASH_STEPS}"
 out="$(refresh --label g1)" && fail "a failed box job did not fail the run"
-grep -q "mtp3@b2 on b2 failed" <<<"${out}" && ok "a failed box job is named" || fail "no failed-job message: $(tail -3 <<<"${out}")"
+grep -q "${CRASH_LINE}" <<<"${out}" && ok "a failed box job is named" || fail "no failed-job message: $(tail -3 <<<"${out}")"
 before="$(records)"
-rm "${FAKE}/fail-b2-3"
+rm "${FAKE}/fail-b2-${CRASH_STEPS}"
 out="$(refresh --label g1)" || fail "resume failed: $(tail -5 <<<"${out}")"
 after="$(records)"
-# 3 serial + 12 oracle jobs total; the resume re-runs only the failed one
-# (plus any job its box had not reached yet).
-[[ $((after - before)) -lt 12 ]] && ok "resume re-ran $((after - before)) job(s), not the whole record step" \
+# Every prompt sits on the track's own job set; the resume re-runs only the
+# failed job (plus any job its box had not reached yet).
+[[ $((after - before)) -lt "${TOTAL_PINS}" ]] && ok "resume re-ran $((after - before)) job(s), not the whole record step" \
   || fail "resume re-ran $((after - before)) jobs"
-[[ "$(jq length "${PRIV}/refresh/g1/pins.json")" == 21 ]] && ok "21 goldens pinned (3 prompts x serial+mtp1..6)" || fail "pins.json incomplete"
+[[ "$(jq length "${PRIV}/refresh/g1/pins.json")" == "${TOTAL_PINS}" ]] \
+  && ok "${TOTAL_PINS} goldens pinned (${LIVE_N} prompts x 1 serial + ${DEPTHS_N} depth(s))" || fail "pins.json incomplete"
 for b in ${BOXES}; do
-  [[ "$(nf "${FAKE}/${b}/home/goldens/g1-*")" == 21 ]] || fail "${b}: g1 not staged"
+  [[ "$(nf "${FAKE}/${b}/home/goldens/g1-*")" == "${TOTAL_PINS}" ]] || fail "${b}: g1 not staged"
 done
 ok "all boxes staged"
-grep -c " g1 " "${PRIV}/refresh/staging.log" | grep -qx 63 && ok "staging log records every install (21 x 3 boxes)" || fail "staging log count"
+grep -c " g1 " "${PRIV}/refresh/staging.log" | grep -qx "$((TOTAL_PINS * BOX_N))" \
+  && ok "staging log records every install (${TOTAL_PINS} x ${BOX_N} boxes)" || fail "staging log count"
 if [[ "$(jq -c '.live_goldens' "${FX}")" == '["g1-1","g1-2","g1-3"]' ]] \
   && [[ "$(jq -c '[has("live_golden_rotation", "live_golden", "calibration_prompt")]' "${FX}")" == '[false,false,false]' ]] \
   && [[ "$(jq '.timed_prompt_pool | length' "${FX}")" == $((SHIPPED_POOL + 3)) ]] \
-  && [[ "$(jq '.speculative_oracles["g1-3"] | length' "${FX}")" == 6 ]] \
+  && [[ "$(jq --argjson n "${DEPTHS_N}" '(.speculative_oracles // {}) | if $n == 0 then length == 0 else (.["g1-3"] | length) == $n end' "${FX}")" == true ]] \
   && [[ "$(jq -r '.hidden_correctness_golden.sha256' "${FX}")" == "$(jq -r '.["g1-1.golden.json"].sha256' "${PRIV}/refresh/g1/pins.json")" ]]; then
   ok "pin: live_goldens, hidden golden and oracles point at g1; no rotation keys"
 else
@@ -308,7 +327,7 @@ out="$(refresh --label g1 --step retire)" || fail "retire unpin: $(tail -3 <<<"$
 out="$(refresh --label g1 --step retire)" && fail "retire removed goldens before the unpin was pushed"
 git -C "${ROOT}" -c user.name=t -c user.email=t@t commit -qam "retire g1" && git -C "${ROOT}" push -q origin HEAD:main
 out="$(refresh --label g1 --step retire)" || fail "retire phase 2: $(tail -3 <<<"${out}")"
-[[ "$(nf "${FAKE}/*/home/goldens/g1-*")" == 0 && "$(nf "${PRIV}/refresh/g1/goldens/*")" == 21 ]] \
+[[ "$(nf "${FAKE}/*/home/goldens/g1-*")" == 0 && "$(nf "${PRIV}/refresh/g1/goldens/*")" == "${TOTAL_PINS}" ]] \
   && ok "retire phase 2 removes g1 from every box; the private archive stays" || fail "retire phase 2 left files"
 
 if [[ "${failures}" -eq 0 ]]; then

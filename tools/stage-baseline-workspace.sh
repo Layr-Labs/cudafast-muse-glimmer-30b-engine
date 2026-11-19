@@ -40,7 +40,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
 
-FIXTURE="${REPO_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${REPO_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 SOURCE="${MLXFAST_BASELINE_SOURCE:-}"
 DRY_RUN=0
 DEST=""

@@ -40,7 +40,7 @@ for f in "${FILES[@]}"; do
 done
 write_fixture() {
   jq -n --argjson files "$1" '{target:{upstream_model_id:"example/model", upstream_revision:"0000000", files:$files}}' \
-    > "${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+    > "${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 }
 write_fixture "${pins}"
 
@@ -56,7 +56,7 @@ run_setup() {
   ) > "${WORK}/${name}.log" 2>&1 || rc=$?
 }
 downloads() { grep -c 'downloading ' "${WORK}/$1.log" || true; }
-DEFAULT_DIR="${ROOT}/reference_weights/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+DEFAULT_DIR="${ROOT}/reference_weights/Muse-Glimmer-30B-NVFP4"
 
 # 1. Fresh machine, no MLXFAST_TARGET_SNAPSHOT_DIR: the default directory is
 #    filled from the source, verified, and marked.

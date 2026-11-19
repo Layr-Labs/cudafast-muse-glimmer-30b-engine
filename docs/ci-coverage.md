@@ -26,8 +26,8 @@ push (`AGENTS.md`, "Checks before you submit"). It holds no credential.
 ## `resident` (x86 ubuntu)
 
 The Python resident's unit and wire tests, and `test_adapter_e2e.py`. That test
-runs the real `cuda-engine` against the real resident at depths 0 to 6 and
-requires the serial stream at every depth.
+runs the real `cuda-engine` against the real resident and requires the serial
+stream.
 
 ## `engine-overlay` (arm64 ubuntu, no GPU)
 
@@ -35,7 +35,7 @@ This job does three things:
 
 1. pulls the pinned engine image by digest;
 2. runs `tools/stage-vllm-overlay.sh`;
-3. imports `vllm.model_executor.models.nemotron_h` and `nemotron_h_mtp` through
+3. imports `vllm.model_executor.models.muse_glimmer` through
    the overlay, asserting that vLLM resolved from the overlay.
 
 ## What CI cannot cover
@@ -48,7 +48,7 @@ Anything that needs a GPU:
 - calibration;
 - the ranked run.
 
-The engineering log (`docs/nemotron35-port-notes.md`) section 6 lists the
+The engineering log (`docs/muse-glimmer-port-notes.md`) section 6 lists the
 on-box verification, and section 7 the measured findings.
 `tools/three-flows-dry-run.sh` runs the real benchd binaries over the fake
 resident. It is not in CI, because it downloads benchd.

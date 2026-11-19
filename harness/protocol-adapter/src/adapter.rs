@@ -101,7 +101,7 @@ pub struct Adapter<F: EngineFactory> {
     phase: Option<PhaseKind>,
     /// The routes this worker advertises as runnable, in hello order. This
     /// track declares `serial` and `mtp` (`allowed_modes` in
-    /// `fixtures/nemotron35_lightning_30b_a3b_track.json`), and the ENGINE is what decides
+    /// `fixtures/muse_glimmer_30b_cuda_v1_track.json`), and the ENGINE is what decides
     /// whether a declared mode is actually runnable on a given instance -- so
     /// a mode advertised here can still be refused by name at resolution.
     spec_modes: Vec<Route>,

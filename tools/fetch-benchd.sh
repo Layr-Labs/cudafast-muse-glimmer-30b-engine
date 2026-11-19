@@ -134,7 +134,7 @@
 #                       There is no per-track bench branch. Main carries the
 #                       two changes this track needs: the fixture-declared
 #                       median of several timed prefill passes and the 60 C
-#                       GB10 cool gate (docs/nemotron35-port-notes.md
+#                       GB10 cool gate (docs/muse-glimmer-port-notes.md
 #                       sections 7.5, 7.7 and 7.13).
 #   BENCHD_COMMIT       the bench commit whose dist/ is fetched. Default: the
 #                       PINNED commit below. The pin is the whole point: the
@@ -163,7 +163,7 @@
 #                       directory.
 #   BENCHD_DIST_BASE_URL
 #                       raw host + repo prefix. Default:
-#                       https://raw.githubusercontent.com/Layr-Labs/mlxfast-bench-dev
+#                       https://raw.githubusercontent.com/Layr-Labs/muse-glimmer-30b-benchd-dev
 #                       -- the DEVELOPMENT bench repository, which holds this
 #                       track's dist channel while the track is internal. It is
 #                       PRIVATE, so a fetch needs BENCHD_DIST_TOKEN/GITHUB_TOKEN,
@@ -176,34 +176,14 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRANCH="${BENCHD_BRANCH:-main}"
-# THE PIN. Layr-Labs/mlxfast-bench-dev main @ 43a9a16 (bench pull request 425)
-# publishes dist/ (aarch64-apple-darwin), dist/linux-aarch64 and
-# dist/linux-x86_64, built from source_commit b65af98. That source includes:
-#   * ecd66fe: decode is the decode window (decode-run time / N, with no seed
-#     prefill), the calibration file is version 3, and the fixture's
-#     official_pair_combine selects the mean of the per-pair composites;
-#   * 44f1fda: the fixture-declared median of the timed prefill passes
-#     (official_prefill_timed_runs) and the 60 C GB10 cool gate;
-#   * bench pull requests 387 and 389: the local modes seal the decode-window
-#     and seed keys, and one implementation each of decode, prefill, gain,
-#     composite and combine (no value changes);
-#   * bench pull requests 391 and 393: the sealed output and the failure
-#     messages name no token value;
-#   * bench pull request 396: the health band of the serial-control leg comes
-#     from the track fixture (decode up 0.03, prefill up 0.05 here), not from
-#     the band fields of the calibration file. Version 3 files stay valid;
-#   * bench pull request 398: the speedup floors (0.95 decode, 0.95 prefill
-#     here) are the only gate on a slow candidate. The candidate band has no
-#     slow side; *_band_up_tolerance is the control leg's health band only.
-#   * bench pull requests 421-424: engine-written text, audit fields, the hello
-#     identity and engine-derived numbers are kept out of the sealed output
-#     (digests, or omitted; a full copy only to BENCHD_PRIVATE_AUDIT_PATH);
-#   * the calibration stability gate is the fixture's
-#     calibration_max_cv_percent (2.0 here) instead of a fixed 1 %.
-# This benchd has no timed-divergence reference replay: the timed decode window
-# is an exact match against the per-depth oracle.
-PINNED_COMMIT="43a9a1642cc22c3fb2f71b9c707699cd3a9602c7"
-PINNED_SOURCE_COMMIT="b65af98c2a060df12f2ced849c68528b825fecdb"
+# THE PIN. Layr-Labs/muse-glimmer-30b-benchd-dev main @ d0500fc (bench pull
+# request 1) publishes dist/ (aarch64-apple-darwin) and dist/linux-aarch64,
+# built from source_commit 8ce0ca7. That source is the reviewed benchd that
+# measured this track's calibration, nulls and local end-to-end runs.
+# dist/linux-x86_64 there is not rebuilt from 8ce0ca7 and is not part of this
+# pin.
+PINNED_COMMIT="d0500fc89cfaa339ba647a36602b028987d99c1d"
+PINNED_SOURCE_COMMIT="8ce0ca7821e9c882f2ff1e1cbd1e2ce561040729"
 COMMIT="${BENCHD_COMMIT:-${PINNED_COMMIT}}"
 SOURCE_COMMIT_PIN="${BENCHD_SOURCE_COMMIT:-${PINNED_SOURCE_COMMIT}}"
 DEST_DIR="${BENCHD_BIN_DIR:-${REPO_ROOT}/benchd-bin}"
@@ -215,7 +195,7 @@ RECORDER_NAME="record-correctness-golden"
 DEST_RECORDER="${DEST_DIR}/${RECORDER_NAME}"
 # The DEVELOPMENT bench repository is the default channel while the track is
 # internal. See the BENCHD_DIST_BASE_URL note above.
-BASE_URL="${BENCHD_DIST_BASE_URL:-https://raw.githubusercontent.com/Layr-Labs/mlxfast-bench-dev}"
+BASE_URL="${BENCHD_DIST_BASE_URL:-https://raw.githubusercontent.com/Layr-Labs/muse-glimmer-30b-benchd-dev}"
 
 die() {
   echo "fetch-benchd.sh: $*" >&2

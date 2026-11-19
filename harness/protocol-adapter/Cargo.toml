@@ -10,7 +10,7 @@ name = "protocol-adapter"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Engine Protocol v1 NDJSON-over-stdio adapter for the Nemotron 3.5 Lightning 30B-A3B NVFP4 CUDA track."
+description = "Engine Protocol v1 NDJSON-over-stdio adapter for the Muse Glimmer 30B NVFP4 CUDA track."
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

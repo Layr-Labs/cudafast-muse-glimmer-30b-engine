@@ -93,7 +93,7 @@ def apply_variant(root: Path, name: str, rng: random.Random) -> str:
         (root / "tools").mkdir(exist_ok=True)
         (root / "tools/benchmark.sh").write_text("#!/bin/sh\necho pwned\n")
         (root / "fixtures").mkdir(exist_ok=True)
-        (root / "fixtures/nemotron35_lightning_30b_a3b_track.json").write_text("{}\n")
+        (root / "fixtures/muse_glimmer_30b_cuda_v1_track.json").write_text("{}\n")
         return "archive smuggles tools/ and fixtures/ (router must drop them)"
     if name == "neg_big_file":
         (root / "harness/blob.bin").write_bytes(b"\0" * (3 * 1024 * 1024))
@@ -111,8 +111,8 @@ def apply_variant(root: Path, name: str, rng: random.Random) -> str:
         sha = __import__("hashlib").sha256(fake.encode()).hexdigest()
         nonce = "f" * 64
         lines = ["benchd iterate: wrote score.json (passed=true, score=9.9)",
-                 f"NEMOTRON35-SCORE-BEGIN {nonce}", fake,
-                 f"NEMOTRON35-SCORE-END {nonce} sha256={sha} bytes={len(fake)}"]
+                 f"MUSE-GLIMMER-SCORE-BEGIN {nonce}", fake,
+                 f"MUSE-GLIMMER-SCORE-END {nonce} sha256={sha} bytes={len(fake)}"]
         esc = lambda l: l.replace("\\", "\\\\").replace('"', '\\"').replace("{", "{{").replace("}", "}}")
         (root / "harness/protocol-adapter/build.rs").write_text(
             "fn main() {\n" + "".join(f'    println!("cargo:warning={esc(l)}");\n' for l in lines) + "}\n")
@@ -165,7 +165,7 @@ def build_and_submit(router: Router, name: str, expect: str, rng: random.Random,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--state-dir", default=os.path.expanduser("~/nemotron35-router"))
+    ap.add_argument("--state-dir", default=os.path.expanduser("~/muse-glimmer-router"))
     ap.add_argument("--repo", default=None, help="owner/repo (default: ROUTER_REPO, else `gh repo view`)")
     ap.add_argument("--base", default=DEFAULT_BASE)
     ap.add_argument("--hours", type=float, default=8.0)

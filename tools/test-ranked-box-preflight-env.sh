@@ -28,7 +28,7 @@ fail() {
 
 # Every name the two gates refuse. The environment is cleared of all of them for
 # each case, so one case sets exactly one.
-CREDENTIALS=(R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY MLXFAST_NEMOTRON35_R2_DOWNLOADER BENCHD_DIST_TOKEN)
+CREDENTIALS=(R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY MLXFAST_MUSE_GLIMMER_R2_DOWNLOADER BENCHD_DIST_TOKEN)
 OVERRIDES=(BENCHD MLXFAST_SKIP_WEIGHTS_DOWNLOAD SKIP_MODEL_DOWNLOAD MLXFAST_LOCAL_COOL_GATE
            MLXFAST_LOCAL_ALLOW_GOLDEN_DRIFT MLXFAST_SKIP_ENGINE_BUILD MLXFAST_SKIP_WEIGHTS_SHA256
            SERVE_UP_LAUNCHER SERVE_UP_NO_CAP_DROP SERVE_UP_ALLOW_NEW_PRIVS
@@ -112,9 +112,13 @@ scaffold_failures_before="${failures}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
-FIXTURE="${REPO_ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 TRACK_ID="$(jq -r '.track_id' "${FIXTURE}")"
 REF_COMMIT="$(jq -r '.baseline_reference_commit' "${FIXTURE}")"
+# The stability gate is the contract's own calibration_max_cv_percent (1.0 on
+# this track since the v9.1.1 default), so the cv cases below are built from it
+# rather than from a number that would go stale on the next contract move.
+CV_MAX="$(jq -r '.calibration_max_cv_percent // 2' "${FIXTURE}")"
 # The shipped fixture declares live_goldens. Most cases below run the scaffold
 # in the per-job rotation shape over the same prompts (live_golden = the first
 # one); the live_goldens cases near the end run the shipped shape.
@@ -123,7 +127,7 @@ LIVE_GOLDEN="${LIVE_NAMES[0]}"
 SECOND="${LIVE_NAMES[1]}"
 IMAGE_REF="$(jq -r '.serve_configuration.container_image | split(":")[0]' "${FIXTURE}")@$(jq -r '.serve_configuration.container_digest' "${FIXTURE}")"
 DRIVER_PIN="$(jq -r '.serve_configuration.toolchain.driver_min' "${FIXTURE}")"
-RUNNER="test-box-nemotron35-cuda"
+RUNNER="test-box-muse-glimmer-cuda"
 
 # The scaffold is only buildable where the pinned reference commit is reachable
 # from this checkout. That is the normal case (it is a commit of this
@@ -190,7 +194,7 @@ EOF
   # depth envelope and baseline_reference_commit stay under test.
   GOLDEN_DIR="${WORK}/goldens"
   mkdir -p "${GOLDEN_DIR}"
-  python3 - "${FIXTURE}" "${GOLDEN_DIR}" "${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" <<'REPINEOF'
+  python3 - "${FIXTURE}" "${GOLDEN_DIR}" "${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" <<'REPINEOF'
 import hashlib, json, os, sys
 
 src, golden_dir, dst = sys.argv[1:4]
@@ -231,7 +235,7 @@ with open(dst, "w", encoding="utf-8") as fh:
     json.dump(contract, fh, indent=2)
     fh.write("\n")
 REPINEOF
-  [[ -s "${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json" ]] \
+  [[ -s "${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" ]] \
     || { echo "FAIL: could not re-pin the contract onto the synthetic golden pool" >&2; exit 1; }
 
   STUB="${WORK}/bin"
@@ -321,7 +325,7 @@ EOF
         MLXFAST_GPU_TEMP_CMD="echo 42" \
         BENCHD_BIN_DIR="${BENCHD_DIR}" \
         RUNNER_NAME="${RUNNER}" \
-        MLXFAST_NEMOTRON35_GOLDEN_DIR="${GOLDEN_DIR}" \
+        MLXFAST_MUSE_GLIMMER_GOLDEN_DIR="${GOLDEN_DIR}" \
         MLXFAST_BASELINE_WORKSPACE="${WS}" \
         MLXFAST_BASELINE_CALIBRATION="${CAL_OK}" \
         "$@" "${PREFLIGHT8}" 2>&1
@@ -366,24 +370,29 @@ EOF
   # The staged goldens. They are not in any checkout, so an unset name has
   # nothing to fall back on and an extra *.json changes the measured cohort.
   expect_refusal "goldens unstaged" \
-    "MLXFAST_NEMOTRON35_GOLDEN_DIR is unset" MLXFAST_NEMOTRON35_GOLDEN_DIR=
+    "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR is unset" MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=
   expect_refusal "goldens directory absent" \
-    "does not exist or is not a directory" "MLXFAST_NEMOTRON35_GOLDEN_DIR=${WORK}/no-such-goldens"
+    "does not exist or is not a directory" "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${WORK}/no-such-goldens"
   expect_refusal "runner unnamed" \
     "has no RUNNER_NAME" RUNNER_NAME=
 
-  # A reference tree at the wrong commit.
+  # A reference tree at a commit the fixture pin does not descend from. The
+  # preflight accepts a tree that CARRIES the pin as an ancestor (F-CUDA-30: a
+  # commit cannot carry its own sha), so the wrong-commit case has to sit on an
+  # OLDER commit -- the repository's root -- rather than on this checkout's HEAD,
+  # which is a descendant of the pin and therefore accepted.
   WS_OLD="${WORK}/reference-old"
+  OLD_COMMIT="$(git -C "${REPO_ROOT}" rev-list --max-parents=0 HEAD | tail -1)"
   git clone --quiet --shared --no-checkout "${REPO_ROOT}" "${WS_OLD}" 2>/dev/null
-  if git -C "${WS_OLD}" checkout --quiet --detach HEAD 2>/dev/null; then
+  if git -C "${WS_OLD}" checkout --quiet --detach "${OLD_COMMIT}" 2>/dev/null; then
     mkdir -p "${WS_OLD}/.build/vllm-overlay/vllm" "${WS_OLD}/.build/release"
     : > "${WS_OLD}/.build/vllm-overlay/vllm/__init__.py"
     : > "${WS_OLD}/.build/release/mlxfast-runtime-worker"
     chmod +x "${WS_OLD}/.build/release/mlxfast-runtime-worker"
-    expect_refusal "workspace at the wrong commit" \
+    expect_refusal "workspace at a commit the pin does not descend from" \
       "but the fixture pins ${REF_COMMIT}" "MLXFAST_BASELINE_WORKSPACE=${WS_OLD}"
   else
-    fail "section 8 / workspace at the wrong commit: cannot check out HEAD"
+    fail "section 8 / workspace at a wrong commit: cannot check out ${OLD_COMMIT}"
   fi
 
   # A reference tree that was staged but never built.
@@ -426,18 +435,19 @@ EOF
   cal_case "calibration passes" '.prompts[0].passes = 1' "a band needs at least two"
   cal_case "calibration mean" '.prompts[0].decode_seconds_per_token_mean = 0' \
     "is not a plausible per-token time"
-  cal_case "calibration cv" '.prompts[0].decode_cv = 0.05' \
-    "above the 2.0 % stability gate (the track contract's calibration_max_cv_percent)"
-  CAL_CV_PASS="${WORK}/cal-cv-1-5-percent.json"
-  write_calibration "${CAL_CV_PASS}" '.prompts[0].decode_cv = 0.015'
+  cal_case "calibration cv" ".prompts[0].decode_cv = $(awk -v c="${CV_MAX}" 'BEGIN{printf "%.6f", (c + 1) / 100}')" \
+    "above the ${CV_MAX} % stability gate (the track contract's calibration_max_cv_percent)"
+  CAL_CV_PASS="${WORK}/cal-cv-below-gate.json"
+  write_calibration "${CAL_CV_PASS}" ".prompts[0].decode_cv = $(awk -v c="${CV_MAX}" 'BEGIN{printf "%.6f", c / 200}')"
   cv_pass="$(run_preflight "MLXFAST_BASELINE_CALIBRATION=${CAL_CV_PASS}")"
   if grep -q 'ranked-box-preflight: all checks passed' <<<"${cv_pass}"; then
-    echo "ok    section 8 / calibration cv 1.5 percent: passes the 2 percent gate"
+    echo "ok    section 8 / calibration cv half the gate: passes the ${CV_MAX} percent gate"
   else
-    fail "section 8 / calibration cv 1.5 percent: did not pass; got: $(tail -3 <<<"${cv_pass}")"
+    fail "section 8 / calibration cv half the gate: did not pass; got: $(tail -3 <<<"${cv_pass}")"
   fi
-  cal_case "calibration cv 2.5 percent" '.prompts[0].decode_cv = 0.025' \
-    "above the 2.0 % stability gate (the track contract's calibration_max_cv_percent)"
+  cal_case "calibration cv well above the gate" \
+    ".prompts[0].decode_cv = $(awk -v c="${CV_MAX}" 'BEGIN{printf "%.6f", (c + 1.5) / 100}')" \
+    "above the ${CV_MAX} % stability gate (the track contract's calibration_max_cv_percent)"
   cal_case "calibration band does not bracket 1" '.prompts[0].decode_band_high = 0.99' \
     "is not a usable band"
   cal_case "calibration band admits a half-speed box" '.prompts[0].prefill_band_high = 2.5' \
@@ -454,8 +464,12 @@ EOF
   # THE ROTATION POOL (section 4b). Every prompt the workflow can draw must
   # carry its serial golden and one oracle per permitted depth, pinned and
   # staged. Each case rewrites the scaffold's contract, runs, and restores it.
-  SCAFFOLD_CONTRACT="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+  SCAFFOLD_CONTRACT="${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
   cp "${SCAFFOLD_CONTRACT}" "${WORK}/contract.orig.json"
+  # The per-depth oracle cases need a speculative arm. This track declares
+  # mtp_head.permitted_draft_depths [], so there is no oracle to pin or stage
+  # and those cases are reported as not-applicable rather than run red.
+  mtp_depths="$(jq -c '.mtp_head.permitted_draft_depths' "${WORK}/contract.orig.json")"
   rotation_case() { # rotation_case LABEL JQ_FILTER NEEDLE [env overrides...]
     local label="$1" filter="$2" needle="$3"; shift 3
     jq "${filter}" "${WORK}/contract.orig.json" > "${SCAFFOLD_CONTRACT}"
@@ -474,17 +488,25 @@ EOF
   cp -R "${GOLDEN_DIR}" "${GOLDEN_DIR_NO_SECOND}"
   rm -f "${GOLDEN_DIR_NO_SECOND}/${SECOND}".mtp*.golden.json
   SECOND_IN_POOL=".live_golden_rotation.pool |= ((. - [\"${SECOND}\"]) + [\"${SECOND}\"])"
-  rotation_case "rotation prompt without per-depth oracles" \
-    "${SECOND_IN_POOL} | del(.speculative_oracles[\"${SECOND}\"])" \
-    "has no pinned per-depth oracle speculative_oracles[${SECOND}][mtp1]" \
-    "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
+  if [[ "${mtp_depths}" == "[]" ]]; then
+    echo "ok    section 4b / rotation prompt without per-depth oracles: not applicable (serial-only track, no permitted draft depth)"
+  else
+    rotation_case "rotation prompt without per-depth oracles" \
+      "${SECOND_IN_POOL} | del(.speculative_oracles[\"${SECOND}\"])" \
+      "has no pinned per-depth oracle speculative_oracles[${SECOND}][mtp1]" \
+      "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
+  fi
   rotation_case "rotation prompt outside timed_prompt_pool" \
     '.live_golden_rotation.pool += ["nosuch"]' \
     "rotation pool prompt 'nosuch' names no timed_prompt_pool entry"
-  rotation_case "rotation prompt borrowing another prompt's oracles" \
-    "${SECOND_IN_POOL} | .speculative_oracles[\"${SECOND}\"] = (.speculative_oracles[\"${LIVE_GOLDEN}\"] | del(.mtp6))" \
-    "speculative_oracles[${SECOND}][mtp1] points at ${LIVE_GOLDEN}.mtp1.golden.json" \
-    "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
+  if [[ "${mtp_depths}" == "[]" ]]; then
+    echo "ok    section 4b / rotation prompt borrowing another prompt's oracles: not applicable (serial-only track, no permitted draft depth)"
+  else
+    rotation_case "rotation prompt borrowing another prompt's oracles" \
+      "${SECOND_IN_POOL} | .speculative_oracles[\"${SECOND}\"] = (.speculative_oracles[\"${LIVE_GOLDEN}\"] | del(.mtp6))" \
+      "speculative_oracles[${SECOND}][mtp1] points at ${LIVE_GOLDEN}.mtp1.golden.json" \
+      "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
+  fi
   rotation_case "rotation pool empty" '.live_golden_rotation.pool = []' \
     "live_golden_rotation.pool is empty"
   rotation_case "calibration prompt is not the band's" ".calibration_prompt = \"${SECOND}\"" \
@@ -507,7 +529,7 @@ for d in c["mtp_head"]["permitted_draft_depths"]:
         "r2_path": f"{prefix}/{base}", "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
 json.dump(c, open(dst, "w", encoding="utf-8"), indent=2)
 ROTEOF
-  control_rot="$(run_preflight "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR2}")"
+  control_rot="$(run_preflight "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR2}")"
   if grep -q 'ranked-box-preflight: all checks passed' <<<"${control_rot}" \
     && grep -q "every rotation pool prompt (${LIVE_GOLDEN} ${SECOND})" <<<"${control_rot}"; then
     echo "ok    section 4b / control: a two-prompt pool, fully pinned and staged, passes"
@@ -515,9 +537,13 @@ ROTEOF
     fail "section 4b / control: a fully pinned two-prompt pool did not pass; got: $(tail -3 <<<"${control_rot}")"
   fi
   # ...and the same pool with one oracle left unstaged is refused by name.
-  rm "${GOLDEN_DIR2}/${SECOND}.mtp4.golden.json"
-  expect_refusal "rotation oracle not staged" "${SECOND}.mtp4.golden.json" \
-    "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR2}"
+  if [[ "${mtp_depths}" == "[]" ]]; then
+    echo "ok    section 4b / rotation oracle not staged: not applicable (serial-only track, no per-depth oracle exists)"
+  else
+    rm "${GOLDEN_DIR2}/${SECOND}.mtp4.golden.json"
+    expect_refusal "rotation oracle not staged" "${SECOND}.mtp4.golden.json" \
+      "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR2}"
+  fi
   cp "${WORK}/contract.orig.json" "${SCAFFOLD_CONTRACT}"
 
   # A refresh generation staged ahead of its pin passes (tools/pool-refresh.sh
@@ -526,14 +552,14 @@ ROTEOF
   cp -R "${GOLDEN_DIR}" "${GOLDEN_DIR3}"
   echo '{}' > "${GOLDEN_DIR3}/g2-5.golden.json"
   echo '{}' > "${GOLDEN_DIR3}/g2-5.mtp3.golden.json"
-  if run_preflight "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR3}" | grep -q 'ranked-box-preflight: all checks passed'; then
+  if run_preflight "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR3}" | grep -q 'ranked-box-preflight: all checks passed'; then
     echo "ok    section 4 / a refresh generation staged ahead of its pin passes"
   else
     fail "section 4 / a refresh generation staged ahead of its pin was refused"
   fi
   echo '{}' > "${GOLDEN_DIR3}/final-1.golden.json"
   expect_refusal "held-out final golden staged" "final-1.golden.json" \
-    "MLXFAST_NEMOTRON35_GOLDEN_DIR=${GOLDEN_DIR3}"
+    "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR3}"
 
   # THE SHIPPED SHAPE (sections 4b and 8b): live_goldens. Every job measures
   # every live golden, so every one needs its own band in the calibration file.

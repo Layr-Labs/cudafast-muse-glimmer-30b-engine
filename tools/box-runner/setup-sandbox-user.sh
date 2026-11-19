@@ -9,19 +9,19 @@
 #   - group nemoshare (members runner and nemosub; runner's other groups untouched)
 #   - system user nemosub: shell /usr/sbin/nologin, home /var/lib/nemosub 0700,
 #     not in docker, bench or sudo
-#   - /var/lib/nemotron35/sandbox, runner:nemoshare 2750
-#   - /etc/sudoers.d/nemotron35-sandbox (validated with visudo, installed by rename)
+#   - /var/lib/muse-glimmer/sandbox, runner:nemoshare 2750
+#   - /etc/sudoers.d/muse-glimmer-sandbox (validated with visudo, installed by rename)
 #   - a Rust toolchain in /opt/rust (root-owned, world-readable), the same
 #     toolchain runner uses. Callers set RUSTUP_HOME=/opt/rust/rustup and put
 #     /opt/rust/cargo/bin on PATH.
 #   - iptables + ip6tables: nemosub may send NO TCP/UDP at all, loopback
 #     included (it only ever needs the resident's Unix socket); the older
 #     loopback-exempt rule is removed if a previous run installed it.
-#     Re-applied at every boot by nemotron35-sandbox-egress.service (netfilter
+#     Re-applied at every boot by muse-glimmer-sandbox-egress.service (netfilter
 #     rules are not persistent unless iptables-persistent is installed).
 #   - an ACL denying nemosub the host resolver sockets (systemd-resolved's
 #     varlink socket, nscd's), re-applied at every boot by
-#     nemotron35-sandbox-acl.service, because /run is a tmpfs
+#     muse-glimmer-sandbox-acl.service, because /run is a tmpfs
 #   - nemosub in /etc/cron.deny and /etc/at.deny, no crontab, no at job, no
 #     linger: nothing it schedules can outlive `kill -1`
 #   - traverse-only (--x) ACLs for nemosub on runner's home, the runner
@@ -31,13 +31,13 @@
 #     otherwise open every world-readable entry in it to a guessed name. The
 #     workflow grants read on each job's checkout itself and repeats the deny
 #     per job (setfacl, package acl, is required)
-#   - the wipe list /etc/nemotron35-sandbox/wipe-dirs (root, 0644):
+#   - the wipe list /etc/muse-glimmer-sandbox/wipe-dirs (root, 0644):
 #     every directory on the box nemosub can write (world-writable: /tmp,
 #     /var/tmp, /run/lock, /var/crash, ... plus /dev/shm and /dev/mqueue), which
 #     tools/sandbox-wipe.sh clears of nemosub's files at every job start and end.
 #     Re-run setup after adding a mount or a world-writable directory.
 #   - the resident log dir (SERVE_UP_LOG_DIR from runner's actions-runner/.env,
-#     else /var/lib/nemotron35/serve-log) runner:runner 0750, other access
+#     else /var/lib/muse-glimmer/serve-log) runner:runner 0750, other access
 #     removed from everything already in it: a candidate resident's log must not
 #     be readable by a later job's nemosub
 #
@@ -50,11 +50,11 @@
 #   RUNNER_USER   runner                        the runner account
 #   SANDBOX_USER  nemosub                       the sandbox user (home /var/lib/<name>)
 #   SHARE_GROUP   nemoshare                     the group of the two
-#   SANDBOX_ROOT  /var/lib/nemotron35/sandbox   the per-job sandbox root
-#   SANDBOX_ETC   /etc/nemotron35-sandbox       holds wipe-dirs and egress.sh
-#   SUDOERS_NAME  nemotron35-sandbox            the file in /etc/sudoers.d (no dot)
-#   EGRESS_UNIT   nemotron35-sandbox-egress.service
-#   ACL_UNIT      nemotron35-sandbox-acl.service
+#   SANDBOX_ROOT  /var/lib/muse-glimmer/sandbox   the per-job sandbox root
+#   SANDBOX_ETC   /etc/muse-glimmer-sandbox       holds wipe-dirs and egress.sh
+#   SUDOERS_NAME  muse-glimmer-sandbox            the file in /etc/sudoers.d (no dot)
+#   EGRESS_UNIT   muse-glimmer-sandbox-egress.service
+#   ACL_UNIT      muse-glimmer-sandbox-acl.service
 #   RUST_DIR      /opt/rust                     the sandbox user's Rust toolchain
 #   RUNNER_DIR    <runner home>/actions-runner  the runner install, directly under
 #                                               the runner home (a second runner of
@@ -69,9 +69,9 @@ SANDBOX_USER="${SANDBOX_USER:-nemosub}"
 RUNNER_USER="${RUNNER_USER:-runner}"
 SHARE_GROUP="${SHARE_GROUP:-nemoshare}"
 SANDBOX_HOME="/var/lib/${SANDBOX_USER}"
-SANDBOX_ROOT="${SANDBOX_ROOT:-/var/lib/nemotron35/sandbox}"
-SANDBOX_ETC="${SANDBOX_ETC:-/etc/nemotron35-sandbox}"
-SUDOERS_NAME="${SUDOERS_NAME:-nemotron35-sandbox}"
+SANDBOX_ROOT="${SANDBOX_ROOT:-/var/lib/muse-glimmer/sandbox}"
+SANDBOX_ETC="${SANDBOX_ETC:-/etc/muse-glimmer-sandbox}"
+SUDOERS_NAME="${SUDOERS_NAME:-muse-glimmer-sandbox}"
 SUDOERS_FILE="/etc/sudoers.d/${SUDOERS_NAME}"
 SUDOERS_LINE="${RUNNER_USER} ALL=(${SANDBOX_USER}) NOPASSWD:SETENV: ALL"
 RUST_DIR="${RUST_DIR:-/opt/rust}"
@@ -80,8 +80,8 @@ EGRESS_RULE=(OUTPUT -m owner --uid-owner "${SANDBOX_USER}" -j REJECT)
 # The rule an earlier version of this script installed (loopback exempt).
 OLD_EGRESS_RULE=(OUTPUT -m owner --uid-owner "${SANDBOX_USER}" ! -o lo -j REJECT)
 RESOLVER_SOCKETS=(/run/systemd/resolve/io.systemd.Resolve /run/nscd/socket)
-ACL_UNIT="/etc/systemd/system/${ACL_UNIT:-nemotron35-sandbox-acl.service}"
-EGRESS_UNIT="/etc/systemd/system/${EGRESS_UNIT:-nemotron35-sandbox-egress.service}"
+ACL_UNIT="/etc/systemd/system/${ACL_UNIT:-muse-glimmer-sandbox-acl.service}"
+EGRESS_UNIT="/etc/systemd/system/${EGRESS_UNIT:-muse-glimmer-sandbox-egress.service}"
 DENY_FILES=(/etc/cron.deny /etc/at.deny)
 WIPE_LIST="${SANDBOX_ETC}/wipe-dirs"
 # Local filesystems scanned for world-writable directories (the kernel and
@@ -89,7 +89,7 @@ WIPE_LIST="${SANDBOX_ETC}/wipe-dirs"
 # docker's and containerd's layers sit under root-only directories).
 WIPE_FS_TYPES=ext2,ext3,ext4,xfs,btrfs,f2fs,vfat,tmpfs
 WIPE_ALWAYS=(/dev/shm /dev/mqueue)
-DEFAULT_SERVE_LOG=/var/lib/nemotron35/serve-log
+DEFAULT_SERVE_LOG=/var/lib/muse-glimmer/serve-log
 PUBLIC_V4=1.1.1.1
 PUBLIC_V6=2606:4700:4700::1111
 
@@ -455,7 +455,7 @@ setup_egress_unit() {
     echo "[Unit]"
     echo "Description=Reject all ${SANDBOX_USER} egress (re-applied every boot)"
     echo "After=network-pre.target ufw.service"
-    echo "Before=nemotron35-box-runner.service"
+    echo "Before=muse-glimmer-box-runner.service"
     echo "[Service]"
     echo "Type=oneshot"
     echo "RemainAfterExit=yes"
@@ -578,7 +578,7 @@ setup_wipe_list() {
     | sort -u > "${tmp}"
   [[ -s "${tmp}" ]] || { rm -f "${tmp}"; fail "found no directory ${SANDBOX_USER} can write (not even /tmp); refusing an empty wipe list"; }
   # Its own root-owned 0755 directory, never the App-key directory
-  # (/etc/nemotron35-box-runner stays root-only).
+  # (/etc/muse-glimmer-box-runner stays root-only).
   install -d -m 0755 -o root -g root "$(dirname "${WIPE_LIST}")"
   install -m 0644 -o root -g root "${tmp}" "${WIPE_LIST}"
   rm -f "${tmp}"

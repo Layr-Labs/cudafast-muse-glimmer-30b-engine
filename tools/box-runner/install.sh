@@ -9,7 +9,7 @@
 #      STATE_DIR) and, if running as root, hand RUNNER_DIR to RUNNER_USER.
 #   3. Seed box-runner.env from box-runner.env.example WITHOUT overwriting an
 #      existing one.
-#   4. Render nemotron35-box-runner.service.template into a ready-to-copy
+#   4. Render muse-glimmer-box-runner.service.template into a ready-to-copy
 #      systemd unit. This script NEVER calls `systemctl` itself -- it prints
 #      the exact install commands for an operator to run by hand. Installing
 #      the runner binary and installing a running daemon are deliberately
@@ -164,8 +164,8 @@ ensure_env_file() {
 
 # --- Step 4: systemd unit, rendered but NOT installed ------------------------
 render_unit() {
-  local template="${SCRIPT_DIR}/nemotron35-box-runner.service.template"
-  local out="${SCRIPT_DIR}/nemotron35-box-runner.service"
+  local template="${SCRIPT_DIR}/muse-glimmer-box-runner.service.template"
+  local out="${SCRIPT_DIR}/muse-glimmer-box-runner.service"
   [ -f "${template}" ] || fail "missing unit template: ${template}"
 
   sed \
@@ -180,13 +180,13 @@ render_unit() {
 
 install.sh does NOT install or start the daemon. To go live, an operator runs:
 
-  sudo install -m 0644 -o root -g root "${out}" /etc/systemd/system/nemotron35-box-runner.service
+  sudo install -m 0644 -o root -g root "${out}" /etc/systemd/system/muse-glimmer-box-runner.service
   sudo systemctl daemon-reload
-  sudo systemctl enable --now nemotron35-box-runner.service
+  sudo systemctl enable --now muse-glimmer-box-runner.service
 
 To take it back down:
 
-  sudo systemctl disable --now nemotron35-box-runner.service
+  sudo systemctl disable --now muse-glimmer-box-runner.service
 
 The unit's ExecStop runs '${SCRIPT_DIR}/supervisor.sh stop', which reaps any
 in-flight job tree (lib/pidtree.sh); KillMode=process keeps systemd from

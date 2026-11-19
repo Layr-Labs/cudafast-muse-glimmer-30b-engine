@@ -51,7 +51,7 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
-FIXTURE="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 log() { printf 'record-goldens: %s\n' "$*" >&2; }
 die() { printf 'record-goldens: %s\n' "$*" >&2; exit 1; }
 
@@ -166,8 +166,8 @@ if [[ "${#ORACLES_FOR[@]}" -eq 0 && "${DO_SERIAL}" == 1 ]]; then
   for n in "${NAMES[@]}"; do record "${n}" "${OUT}/${n}.golden.json"; done
   if [[ "${#ONLY[@]}" -eq 0 && -f "${PROMPTS}/public.tokens.json" ]]; then
     mkdir -p "${OUT}/public"
-    record public "${OUT}/public/public-longcopy-gate-english-496.golden.json"
-    validate "${OUT}/public/public-longcopy-gate-english-496.golden.json" || die "benchd refused the public golden"
+    record public "${OUT}/public/public-longcopy-gate-english-512.golden.json"
+    validate "${OUT}/public/public-longcopy-gate-english-512.golden.json" || die "benchd refused the public golden"
   fi
   stop_resident
 fi

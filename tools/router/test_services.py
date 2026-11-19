@@ -28,14 +28,14 @@ class ServiceRenderTest(unittest.TestCase):
         subprocess.run(command, check=True, capture_output=True, text=True, env=env)
         self.assertEqual(first, {path.name: path.read_bytes()
                                  for path in output.glob("*.service")})
-        self.assertEqual(set(first), {"nemotron35-router.service", "nemotron35-watch.service"})
+        self.assertEqual(set(first), {"muse-glimmer-router.service", "muse-glimmer-watch.service"})
         for name, interpreter, script, args in (
             ("router", "/usr/bin/python3", "router.py", ["run"]),
             ("watch", "/usr/bin/bash", "watch.sh", []),
         ):
             with self.subTest(service=name):
                 unit = configparser.ConfigParser(interpolation=None)
-                unit.read(output / f"nemotron35-{name}.service")
+                unit.read(output / f"muse-glimmer-{name}.service")
                 service = unit["Service"]
                 self.assertEqual(service["Restart"], "on-failure")
                 self.assertEqual(service["RestartSec"], "30")

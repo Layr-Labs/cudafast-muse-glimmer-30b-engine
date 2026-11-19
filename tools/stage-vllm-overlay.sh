@@ -22,7 +22,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
 die() { printf 'stage-vllm-overlay.sh: %s\n' "$*" >&2; exit 1; }
-FIXTURE="${ROOT_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${ROOT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 IMAGE="$(jq -r '.serve_configuration.container_image' "${FIXTURE}")"
 DIGEST="$(jq -r '.serve_configuration.container_digest' "${FIXTURE}")"
 IMAGE_REF="${IMAGE%%:*}@${DIGEST}"

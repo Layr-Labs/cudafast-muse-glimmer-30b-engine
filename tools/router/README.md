@@ -11,7 +11,7 @@ Organizer tooling, trusted side, outside `editablePaths`. It covers three jobs:
 
 | File | Purpose |
 |---|---|
-| `router.py` | `submit` (keep only `editablePaths`, REPLACE overlay onto the base, push `sub/<id>`), `run` (dispatch one waiting run per online runner, watch, 90-minute watchdog, download `score.json`, classify), `status`, `report` (JSON + HTML). State: SQLite in `~/nemotron35-router`. |
+| `router.py` | `submit` (keep only `editablePaths`, REPLACE overlay onto the base, push `sub/<id>`), `run` (dispatch one waiting run per online runner, watch, 90-minute watchdog, download `score.json`, classify), `status`, `report` (JSON + HTML). State: SQLite in `~/muse-glimmer-router`. |
 | `loadgen.py` | Seeded synthetic submissions for the acceptance load test: null, MTP depths, numerics variants, garbage (replay must reject) and negatives, each with a declared expectation. |
 | `test_router.py` | Overlay semantics, classification, every variant applying to the real tree, teams, freeze and the re-score. No network. |
 
@@ -46,7 +46,7 @@ repository, and a base branch whose fixture is armed.
 python3 -m unittest discover -s tools/router
 tools/router/loadgen.py --only null,garbage       # smoke test
 tools/router/loadgen.py --hours 8                 # the acceptance load test
-tools/router/router.py report                     # ~/nemotron35-router/report/
+tools/router/router.py report                     # ~/muse-glimmer-router/report/
 ```
 
 ## Teams, freeze and the final re-score
@@ -55,7 +55,7 @@ Every submission belongs to a **team** (`submit --team T`, `loadgen.py --team T`
 default: the `--variant` label). Older databases gain the `team` column on
 start, filled from the label.
 
-`router.py freeze` writes `~/nemotron35-router/FROZEN` (the deadline, epoch
+`router.py freeze` writes `~/muse-glimmer-router/FROZEN` (the deadline, epoch
 seconds); from then on `submit` refuses. The daemon still finishes what was
 already queued. `router.py unfreeze` removes the flag.
 
@@ -90,7 +90,7 @@ that exhaust retries count as 0.0 (`penalized`); pre-setup infra leaves the slot
 Idempotent.
 
 `router.py rescore-report [--wait] [--max-infra-retries 2]` writes
-`~/nemotron35-router/rescore-final/` (`rescore.json` + `rescore.html`): every
+`~/muse-glimmer-router/rescore-final/` (`rescore.json` + `rescore.html`): every
 run (team, box, prompt, score, outcome, `off_pool`) and a ranking by mean over
 K slots (score, 0.0 on team failure, or 0.0 when post-setup infra exhausts
 retries). Each slot records its attempts; a team with any slot pending or
@@ -124,7 +124,7 @@ This renders the templates in `systemd/` into `~/.config/systemd/user` (or
 `$XDG_CONFIG_HOME/systemd/user`), replaces same-name transient units, reloads
 systemd, and enables and starts both services. Re-running it updates and
 restarts them. Stop any separately backgrounded router or old
-`~/nemotron35-router/watch.sh` process first to avoid duplicate daemons.
+`~/muse-glimmer-router/watch.sh` process first to avoid duplicate daemons.
 `loadgen.py` remains manual.
 
 The installer records the absolute checkout path and the installing shell's
@@ -135,17 +135,17 @@ use the account's existing credentials; no credentials are copied into units.
 
 Both services retain the sleep/idle inhibitor and restart after failures with a
 30-second delay. Router logs and watcher snapshots go to the journal; the
-copied watcher no longer appends to `~/nemotron35-router/watch.log`.
+copied watcher no longer appends to `~/muse-glimmer-router/watch.log`.
 
 ```bash
-systemctl --user status nemotron35-router.service nemotron35-watch.service
-journalctl --user -u nemotron35-router.service -f
-journalctl --user -u nemotron35-watch.service -f
-systemctl --user stop nemotron35-router.service nemotron35-watch.service
-systemctl --user start nemotron35-router.service nemotron35-watch.service
+systemctl --user status muse-glimmer-router.service muse-glimmer-watch.service
+journalctl --user -u muse-glimmer-router.service -f
+journalctl --user -u muse-glimmer-watch.service -f
+systemctl --user stop muse-glimmer-router.service muse-glimmer-watch.service
+systemctl --user start muse-glimmer-router.service muse-glimmer-watch.service
 ```
 
-The router reopens `~/nemotron35-router/state.db` on startup, watches stored
+The router reopens `~/muse-glimmer-router/state.db` on startup, watches stored
 `dispatched`/`running` jobs and dispatches queued submissions. Stop/start,
 updates, and uninstall preserve the database and reports.
 
@@ -161,7 +161,7 @@ Remove the services, or render and test without a systemd session:
 
 ```bash
 tools/router/install-service.sh --uninstall
-tools/router/install-service.sh --render /tmp/nemotron35-router-units
+tools/router/install-service.sh --render /tmp/muse-glimmer-router-units
 python3 tools/router/test_router.py
 python3 tools/router/test_services.py
 ```

@@ -8,4 +8,4 @@
 # step: the label IS the track id.
 self-hosted-runner:
   labels:
-    - nemotron3.5-lightning-30b-a3b-cuda-v1
+    - muse-glimmer-30b-cuda-v1

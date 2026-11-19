@@ -1,9 +1,8 @@
 {
   "version": 1,
-  "source": "pinned",
-  "max_bytes": 3221225472,
+  "source": "none",
   "spec": {
-    "enabled": true,
-    "num_speculative_tokens": 3
+    "enabled": false,
+    "num_speculative_tokens": 0
   }
 }

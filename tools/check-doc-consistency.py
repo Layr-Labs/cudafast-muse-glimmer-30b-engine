@@ -6,8 +6,12 @@ called the engine read-only while benchmark.json listed four, including the
 engine; it disagreed with its own contract about re-quantizing the head, and
 it pinned three draft depths while permitting six. This check is the tripwire
 for that class of drift. It reads the values from benchmark.json and the track
-fixture and requires every participant-facing document to state them, and it
-refuses the retired track's vocabulary outside the provenance documents.
+fixture and requires every participant-facing document to state them.
+
+This track is SERIAL ONLY, so the check pins the serial shape: one serve depth,
+no speculative arm, one 512-token seed, every live golden measured. It also
+refuses another track's vocabulary anywhere outside the vendor tree and the
+provenance notices.
 
 Exit 0 when consistent, 1 with every finding listed otherwise.
 """
@@ -38,7 +42,6 @@ def main() -> int:
     }
 
     editable = manifest["editablePaths"]
-    depths = fixture["mtp_head"]["permitted_draft_depths"]
     scoring = manifest["scoring"]
     track = manifest["trackId"]
 
@@ -56,32 +59,37 @@ def main() -> int:
             need(n in (str(len(editable)), words.get(len(editable), "")),
                  f"{name}: says '{m.group(0)}' but editablePaths has {len(editable)}")
 
-    # 2. The depth envelope.
-    lo, hi = min(depths), max(depths)
-    need(depths == list(range(lo, hi + 1)), "fixture: permitted_draft_depths is not contiguous")
-    need(f"from {lo} to {hi}" in docs["TASK.md"], f"TASK.md: does not state depths from {lo} to {hi}")
-    need(f"{lo} to {hi}" in docs["docs/participant-contract.md"],
-         f"docs/participant-contract.md: does not state depths {lo} to {hi}")
+    # 2. The serial envelope. One serve depth, no speculative arm anywhere.
+    need(sorted(fixture["allowed_modes"]) == ["serial"],
+         f"fixture: allowed_modes is {fixture['allowed_modes']}, expected ['serial']")
     serve_depths = sorted(fixture["serve_configuration"]["depths"])
-    need(serve_depths == sorted(["serial"] + [f"mtp{d}" for d in depths]),
-         f"fixture: serve_configuration.depths {serve_depths} do not cover serial + every permitted depth")
-    rotation_pool = fixture.get("live_goldens") or fixture.get("live_golden_rotation", {}).get("pool", [fixture.get("live_golden")])
-    for prompt in rotation_pool:
-        need(sorted(fixture.get("speculative_oracles", {}).get(prompt, {})) == sorted(f"mtp{d}" for d in depths),
-             f"fixture: speculative_oracles.{prompt} does not carry exactly one oracle per permitted depth")
-    # 2b. The scored prompt is drawn per job; the participant documents say so.
-    if "live_golden_rotation" in fixture:
-        for name in ("TASK.md", "README.md", "docs/participant-contract.md"):
-            need("drawn at random" in docs[name],
-                 f"{name}: does not say the scored prompt is drawn at random per job (live_golden_rotation)")
+    need(serve_depths == ["serial"],
+         f"fixture: serve_configuration.depths {serve_depths} must be exactly ['serial']")
+    need(fixture["mtp_head"].get("permitted_draft_depths") == [],
+         "fixture: mtp_head.permitted_draft_depths must be empty (serial only)")
+    need(not fixture.get("speculative_oracles"),
+         "fixture: speculative_oracles must be empty (serial only)")
+    for name in ("TASK.md", "docs/participant-contract.md"):
+        need("serial only" in docs[name] or "SERIAL ONLY" in docs[name],
+             f"{name}: does not say the track is serial only")
 
-    # 2c. Every job measures every live golden; the participant documents say so.
-    if "live_goldens" in fixture:
-        for name in ("TASK.md", "docs/participant-contract.md"):
-            need("every live golden" in docs[name],
-                 f"{name}: does not say every job measures every live golden (live_goldens)")
-            need(f"{fixture['seed_tokens']}-token" in docs[name],
-                 f"{name}: does not state the {fixture['seed_tokens']}-token prompt (seed_tokens)")
+    # 2b. The declaration matches the contract's own source, disabled.
+    decl = json.loads((ROOT / "mtp-head.manifest.json").read_text())
+    need(decl.get("source") == fixture["mtp_head"].get("source"),
+         f"mtp-head.manifest.json: source {decl.get('source')!r} disagrees with the fixture's "
+         f"mtp_head.source {fixture['mtp_head'].get('source')!r}")
+    spec = decl.get("spec") or {}
+    need(spec.get("enabled") is False and int(spec.get("num_speculative_tokens", 0)) == 0,
+         "mtp-head.manifest.json: the declaration must be disabled (serial only)")
+
+    # 2c. Every job measures every live golden; the seed length is the fixture's.
+    live = fixture.get("live_goldens") or []
+    need(len(live) == 3, f"fixture: live_goldens must name the three pool prompts, got {live}")
+    for name in ("TASK.md", "docs/participant-contract.md"):
+        need("every live golden" in docs[name].lower() or "Every live golden" in docs[name],
+             f"{name}: does not say every job measures every live golden (live_goldens)")
+        need(f"{fixture['seed_tokens']}-token" in docs[name],
+             f"{name}: does not state the {fixture['seed_tokens']}-token prompt (seed_tokens)")
 
     # 3. Scoring constants appear in TASK.md and the contract.
     for name in ("TASK.md", "docs/participant-contract.md"):
@@ -94,38 +102,54 @@ def main() -> int:
         need(f"`{scoring['kvBackend']}`" in text, f"{name}: missing the kv backend `{scoring['kvBackend']}`")
         need(f"{fixture['official_pairs']} pairs" in text, f"{name}: does not state {fixture['official_pairs']} pairs")
     need(fixture["kv_backend"] == scoring["kvBackend"], "fixture kv_backend disagrees with benchmark.json")
+    need(fixture["token_tolerance_budget"] == 0.0,
+         "fixture: token_tolerance_budget must be 0.0 on this track (exact match)")
+    need("0.0" in docs["docs/participant-contract.md"],
+         "docs/participant-contract.md: does not state the 0.0 token-tolerance budget")
 
-    # 4. The head rules agree everywhere.
-    requant = fixture["mtp_head"]["requantization_permitted"]
-    for name, text in docs.items():
-        if not requant:
-            need(not re.search(r"may re-quantize (it|the head|either)", text, re.I),
-                 f"{name}: permits re-quantizing the head; the fixture forbids it")
-    need(fixture["mtp_head"]["bytes"] <= fixture["mtp_head"]["declaration_max_bytes"],
-         "fixture: the pinned head is larger than the declaration cap")
-    decl = json.loads((ROOT / "mtp-head.manifest.json").read_text())
-    need(decl.get("max_bytes", 0) <= fixture["mtp_head"]["declaration_max_bytes"],
-         "mtp-head.manifest.json: max_bytes exceeds the fixture's declaration cap")
+    # 4. The fixture and the manifest agree on the scoring mode, and the mode is
+    #    the one benchd emits.
+    need(scoring.get("mode"), "benchmark.json: scoring.mode is missing")
 
-    # 5. The retired track's vocabulary stays out of every tracked file except
-    #    the provenance records and the benchd-owned names.
+    # 5. Another track's vocabulary stays out of every tracked file except the
+    #    vendor tree, the provenance notices and this checker. The retired term
+    #    is assembled from parts on purpose: this file must not itself trip the
+    #    sweep it runs (the repository's own gate is a literal grep).
+    retired = re.compile(
+        r"\b(" + "nemo" + "tron" + r"[0-9A-Za-z_.-]*|ds4|Qwen|qwen[0-9.]*|GGUF|gguf|Gemma|macmon|libds4qwen)\b",
+        re.IGNORECASE,
+    )
+    retired_numbers = re.compile(r"\b496-token\b|gate-english-496")
+    # benchd's own vocabulary and the provenance of the trusted CI scripts are
+    # not drift: they are names this repository reads from a pinned binary or
+    # from the overlay it re-implements. They are scrubbed before the sweep.
+    benchd_names = re.compile(
+        r"qwen-native-mtp-paired-decode-only"
+        r"|qwen-3\.8-mtp-challenge"
+        r"|qwen-mtp-ranked-benchmark"
+        r"|qwen signer"
+        r"|MLXFAST_QWEN_MTP_TRACK_ID"
+        r"|DS4_RESIDENT_SOCKET"
+        r"|ds4-era"
+    )
     allowed_files = {
-        "docs/nemotron35-port-notes.md",
-        "docs/submission-restriction-spec.md",
-        "docs/free-run-seed-seam-adjudication.md",
+        "THIRD_PARTY_NOTICES.md",
         "tools/check-doc-consistency.py",
     }
-    retired = re.compile(r"\b(ds4|Qwen|qwen[0-9.]*|GGUF|gguf|Gemma|macmon|libds4qwen)\b")
-    benchd_names = re.compile(r"DS4_RESIDENT_SOCKET|MLXFAST_QWEN_MTP_TRACK_ID|qwen3\.8-125b-a6b(-cuda)?-v1|qwen-3\.8-mtp-challenge|qwen-mtp-ranked-benchmark|qwen signer|qwen/bench|retired qwen|ds4-era")
     files = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.split()
     for rel in files:
-        if rel.startswith("vllm/") or rel in allowed_files or not rel.endswith((".md", ".sh", ".py", ".rs", ".yml", ".json", ".toml")):
+        if rel.startswith("vllm/") or rel in allowed_files or not rel.endswith(
+            (".md", ".sh", ".py", ".rs", ".yml", ".yaml", ".json", ".toml", ".service", ".template", ".example")
+        ):
             continue
         for lineno, line in enumerate((ROOT / rel).read_text(errors="replace").splitlines(), 1):
             scrubbed = benchd_names.sub("", line)
             m = retired.search(scrubbed)
             if m:
                 FINDINGS.append(f"{rel}:{lineno}: retired-track term '{m.group(0)}'")
+            n = retired_numbers.search(scrubbed)
+            if n:
+                FINDINGS.append(f"{rel}:{lineno}: retired golden name '{n.group(0)}'")
 
     if FINDINGS:
         print(f"check-doc-consistency: {len(FINDINGS)} finding(s)")

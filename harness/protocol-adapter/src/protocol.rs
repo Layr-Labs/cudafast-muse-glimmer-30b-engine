@@ -176,7 +176,7 @@ pub struct WorkerRequest {
 
 /// The requested speculative spec, a tagged union over `mode`. This track
 /// admits `serial` and `mtp` ONLY -- `allowed_modes` in
-/// `fixtures/nemotron35_lightning_30b_a3b_track.json` is the authority, and any other mode
+/// `fixtures/muse_glimmer_30b_cuda_v1_track.json` is the authority, and any other mode
 /// is refused BY NAME rather than silently run as serial.
 ///
 /// THE ENVELOPE IS OPEN, AND THAT IS WHAT MAKES THE REFUSAL READABLE. This

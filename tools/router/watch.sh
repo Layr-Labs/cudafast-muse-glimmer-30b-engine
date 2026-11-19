@@ -30,7 +30,7 @@ while :; do
       "$(df --output=pcent / | tail -1 | tr -d " ")" \
       "$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | head -1)" \
       "$(docker ps -q 2>/dev/null | wc -l)" \
-      "$(sudo -n du -sh /var/lib/nemotron35/serve-log 2>/dev/null | cut -f1)"' || echo "$h UNREACHABLE"
+      "$(sudo -n du -sh /var/lib/muse-glimmer/serve-log 2>/dev/null | cut -f1)"' || echo "$h UNREACHABLE"
   done
   sleep 1800
 done

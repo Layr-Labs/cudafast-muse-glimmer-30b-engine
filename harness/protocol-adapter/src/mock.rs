@@ -108,7 +108,7 @@ pub const PREFILL_BASE: i64 = 100_000;
 pub const SEED_BASE: i64 = 200_000;
 
 /// The MTP envelope's ceiling on this track: permitted depths are 1 to 6
-/// (`fixtures/nemotron35_lightning_30b_a3b_track.json` `mtp_head.permitted_draft_depths`).
+/// (`fixtures/muse_glimmer_30b_cuda_v1_track.json` `mtp_head.permitted_draft_depths`).
 /// An EXPLICITLY REQUESTED depth outside 1...6 is REFUSED (benchd echoes an
 /// explicit request verbatim, so a clamp would read as divergence); an ABSENT
 /// depth is the engine's to choose, and it chooses inside this bound.

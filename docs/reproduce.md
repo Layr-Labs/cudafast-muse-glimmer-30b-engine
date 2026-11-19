@@ -1,71 +1,41 @@
 # Reproduce the track's results
 
 Organizer document. Each section gives the commands that re-create one input
-of a ranked score, and the recorded result to compare against. The values are
-for dev `main` after PR #37 (fixture unchanged since `c1ef8de`), recorded
-2026-10-19/20.
+of a ranked score, and the recorded result to compare against.
 
 | Input | Section | Recorded result |
 |---|---|---|
-| benchd binaries | [1](#1-rebuild-benchd-from-source) | byte-identical rebuild of dist `43a9a16` from source `b65af98` |
-| Hidden goldens | [2](#2-re-record-the-hidden-goldens) | 21 files, byte-identical on two Sparks, all pinned in the fixture |
-| Box calibration | [3](#3-recalibrate-a-box) | 4 Sparks, every CV under 1% (limit 2%) |
-| Ranked score | [4](#4-reproduce-a-ranked-score) | dev run 39448053054: `passed: true`, score 1.310 |
+| benchd binaries | [1](#1-rebuild-benchd-from-source) | byte-identical rebuild of the pinned dist from its pinned source |
+| Hidden goldens | [2](#2-re-record-the-hidden-goldens) | not yet for this track: the organizer recording is CUDA-L09 |
+| Box calibration | [3](#3-recalibrate-a-box) | not yet for this track: calibrating a box is a dev-cycle step |
+| Ranked score | [4](#4-reproduce-a-ranked-score) | not yet for this track: no ranked job has run |
 
 ## 1. Rebuild benchd from source
 
-benchd is pinned in `tools/fetch-benchd.sh`:
+benchd is pinned in `tools/fetch-benchd.sh`. Its `PINNED_COMMIT` is the dist
+commit and `PINNED_SOURCE_COMMIT` the source commit that dist was built from;
+`dist/linux-aarch64/benchd.manifest.json` in that dist pins each binary's
+sha256 and bytes.
 
-| Pin | Value |
-|---|---|
-| Repository | `Layr-Labs/mlxfast-bench-dev` (private; read access is needed) |
-| `PINNED_COMMIT` (dist) | `43a9a1642cc22c3fb2f71b9c707699cd3a9602c7` |
-| `PINNED_SOURCE_COMMIT` | `b65af98c2a060df12f2ced849c68528b825fecdb` |
-| `dist/linux-aarch64/benchd` | sha256 `ff4017e9b41ee69a41efa3c7866b33bc3524dd2be6b6a22cafd1225cb608338c`, 3,898,160 bytes |
-| `dist/linux-aarch64/record-correctness-golden` | sha256 `bbe18e01de6fac2336ff9c17a2b79e7aba7c4ca4271a392f4eb0a45b12d4c596`, 1,640,408 bytes |
-
-The bench repository builds the Linux binaries in a pinned container
-(`deploy/Dockerfile.dist-linux`), which fetches the source commit by sha. To
-rebuild with no layer cache, from a clone of the bench repository at the dist
-commit, on a host with Docker and a token that can read the bench repository:
-
-```bash
-git checkout 43a9a1642cc22c3fb2f71b9c707699cd3a9602c7
-BENCHD_DIST_NO_CACHE=1 BENCHD_DIST_BRANCH=main \
-  ./scripts/build-dist-linux.sh b65af98c2a060df12f2ced849c68528b825fecdb
-git diff --stat -- dist/linux-aarch64   # no output: the rebuilt bytes equal the published ones
-```
-
-The script prints each binary's sha256 and bytes. Compare them with the table.
-
-**Recorded result (2026-10-20, an x86_64 Linux host, Docker, no layer
-cache):** both binaries matched the table byte for byte.
+**Recorded result:** the engine base's organizers rebuilt the pinned dist from
+its source on an x86_64 Linux host with Docker and no layer cache, and both
+binaries matched the manifest byte for byte. Re-run it with
+`tools/fetch-benchd.sh` when the pin moves.
 
 ## 2. Re-record the hidden goldens
 
 The live pool is `pool-9`, `pool-10` and `pool-11`: three coding prompts, each
 one user message rendered through the snapshot's pinned chat template with
-thinking off, exactly 496 tokens. Each prompt has a serial golden and six
-per-depth oracles (MTP 1 to 6), 21 files in all. The fixture pins every file
-by sha256 and bytes: `timed_prompt_pool[]` pins the three serial goldens,
-`speculative_oracles` pins the 18 per-depth oracles, and
-`hidden_correctness_golden` repeats the `pool-9` serial pin.
+thinking off, exactly 512 tokens. This track is serial only, so each prompt
+has ONE serial golden — there are no per-depth oracles. The fixture pins every
+file by sha256 and bytes: `timed_prompt_pool[]` pins the three serial goldens
+and the hidden correctness pin repeats the default live golden's serial tape.
 
 **Where the inputs live.** The prompt texts and token files are organizer
 material and are never committed here, because sandboxed participant code can
 read the ranked checkout. The organizer archive (a private repository; access
 by the organizer) holds the texts, the token files, the goldens and
 `SHA256SUMS` (see [pool refresh, "Where the goldens live"](pool-refresh-and-final-rescore.md#where-the-goldens-live)).
-The input hashes:
-
-| File | sha256 |
-|---|---|
-| `pool-9.txt` | `037a676d462577477562277a677d7f7fea16736faefd030f93951499e705d0d9` |
-| `pool-10.txt` | `aedb5f3d561e58829dc6df56bfa4c74bc31fa85e508b26c5dfe29ba2aae4567a` |
-| `pool-11.txt` | `b65a9862eb5cebb42cdb1522a07b5da0c0ff7862fbe5517bb16d2368113e681e` |
-| `pool-9.tokens.json` | `36f5d8256728c4ced104eccb5aa73f228f8c0a780a9b83f0444f0caae2e2448a` |
-| `pool-10.tokens.json` | `a4e2b5b55d26fb61d78bee1eff0f3dfbf2e6ecfb5bf078fa355d35e59fe72141` |
-| `pool-11.tokens.json` | `daeea88e15b9de0a6bcf1ca2e92648278b3e65d074fa3f57b82512b30cf43b2f` |
 
 **Steps**, on two Sparks, each with this repository checked out, the snapshot
 staged, the pinned benchd pair in `benchd-bin/`, and the engine built
@@ -86,11 +56,11 @@ TOKENS="$HOME/rec/tokens"; OUT="$HOME/rec/goldens"; mkdir -p "$TOKENS" "$OUT"
      --entrypoint python3 docker.io/vllm/vllm-openai@sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c \
      tools/author-prompts.py --snapshot "$S" --out "$TOKENS" --chat \
        pool-9=pool-9.txt pool-10=pool-10.txt pool-11=pool-11.txt
-   sha256sum "$TOKENS"/*.tokens.json   # must equal the table
+   sha256sum "$TOKENS"/*.tokens.json   # record these with the generation
    ```
 
    `author-prompts.py --chat` refuses a rendering that is not exactly
-   `seed_tokens` (496) ids; it never trims a chat prompt.
+   `seed_tokens` (512) ids; it never trims a chat prompt.
 
 2. Record, under the box's GPU lock:
 
@@ -100,35 +70,28 @@ TOKENS="$HOME/rec/tokens"; OUT="$HOME/rec/goldens"; mkdir -p "$TOKENS" "$OUT"
        --only pool-9 --only pool-10 --only pool-11
    ```
 
-   One serial resident records the three serial goldens; then one resident per
-   depth records that depth's oracles, with the serial `cases[]` spliced in.
-   Every file is re-validated with `benchd validate-golden --contract`.
+   One serial resident records the three serial goldens; the serial step is
+   the only step this track runs, and `--steps serial` is implied. Every file
+   is re-validated with `benchd validate-golden --contract`.
 
 3. Compare. `(cd "$OUT" && sha256sum *.json)` on both boxes must give the same
-   21 lines, and each sha256 and byte count must equal the fixture's pin.
+   3 lines, and each sha256 and byte count must equal the fixture's pin once
+   the pool is pinned.
 
-**Recorded result (2026-10-19):** recorded on spark-3 and spark-4 with the
-pinned image and snapshot, and with the benchd pair staged before PR #35 (so
-not yet `b65af98`); the 21 files were byte-identical on both boxes and are the
-fixture's pins (PR #33). The pinned benchd `b65af98` validates and scores
-against them (section 4). The staged copies on spark-1 to spark-4 and the
-jump-box copy were re-checked on 2026-10-20: the same 21 files on all five.
-
-**Re-recorded with the pinned benchd (2026-10-20, 17:01-17:34 UTC):** the same
-token files, recorded again on spark-4 and spark-2 at `c1ef8de` with benchd
-`b65af98`, gave 21 files that are byte-identical on both boxes and equal to
-the fixture's pins.
+**Recorded result:** none yet for this track. The organizer recording is the
+runbook's CUDA-L09 step, which also fills `timed_prompt_pool[]`'s pins and
+replaces the `MUSE-GLIMMER-CUDA-PENDING-ORGANIZER` sentinels; before it runs,
+the preflight refuses a ranked job by name.
 
 ## 3. Recalibrate a box
 
 A calibration file is the box's health band for the serial-control leg.
 
-1. Stage the reference tree at the fixture's `baseline_reference_commit`
-   (`5be35aa395283b14d1887cec70a37d6e6bdeac9c`), from a local bundle or mirror
-   (the ranked job holds no credential):
+1. Stage the reference tree at the fixture's `baseline_reference_commit`,
+   from a local bundle or mirror (the ranked job holds no credential):
 
    ```bash
-   REF="$HOME/nemotron35/reference"     # absolute path
+   REF="$HOME/muse-glimmer/reference"     # absolute path
    tools/stage-baseline-workspace.sh "$REF" --source <bundle-or-mirror>
    ```
 
@@ -137,10 +100,10 @@ A calibration file is the box's health band for the serial-control leg.
 
    ```bash
    export MLXFAST_TARGET_SNAPSHOT_DIR=<snapshot> \
-          MLXFAST_NEMOTRON35_GOLDEN_DIR=<staged goldens> \
+          MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=<staged goldens> \
           MLXFAST_BASELINE_WORKSPACE="$REF" BENCHD_BIN_DIR=<benchd pair> \
           SERVE_UP_SOCKET_DIR="$HOME/rsock"
-   NEW="$HOME/nemotron35/calibration.new.json"   # absolute path
+   NEW="$HOME/muse-glimmer/calibration.new.json"   # absolute path
    tools/calibrate-box.sh <runner name> "$NEW" --passes 3
    # for a pool that is not yet live (refresh, final re-score), add
    # --fixture <proposed fixture> so the bands are for the new prompts
@@ -152,23 +115,17 @@ A calibration file is the box's health band for the serial-control leg.
 3. Check the file: `version` is 3, `reference_commit` and
    `benchd_source_commit` are the pins, there is one `prompts[]` entry per live
    golden, and every `prefill_cv` and `decode_cv` is at most
-   `calibration_max_cv_percent` / 100 (0.02).
+   `calibration_max_cv_percent` / 100 (0.01).
 4. Install it at the path the runner's `MLXFAST_BASELINE_CALIBRATION` names,
    keep the old file under a dated name, and run
    `tools/ranked-box-preflight.sh` with the runner environment.
 
 Recalibrate after any change to the live pool, the reference commit or benchd.
 
-**Recorded result:**
-
-| Box | Runner name | Captured (UTC) | File sha256 | CV % prefill / decode: pool-9, pool-10, pool-11 |
-|---|---|---|---|---|
-| spark-1 | `nemotron35-box-spark-ab31` | 2026-10-20 15:21 | `6fd0d46f…4383b3` | 0.32/0.27, 0.80/0.69, 0.27/0.25 |
-| spark-2 | `spark-2` | 2026-10-20 15:21 | `ea5e5da9…79a2c25` | 0.57/0.91, 0.14/0.53, 0.62/0.19 |
-| spark-3 | `nemotron35-box-spark-5e49` | 2026-10-19 22:07 | `c9a37374…6657371` | 0.65/0.36, 0.47/0.23, 0.36/0.36 |
-| spark-4 | `nemotron35-box-spark-7829` | 2026-10-19 22:08 | `f9c0374f…fb77b51` | 0.64/0.08, 0.56/0.19, 0.43/0.43 |
-
-All four: version 3, reference `5be35aa`, benchd source `b65af98`.
+**Recorded result:** none yet. Calibrating a box is a dev-cycle step for this
+track (`CUDA-D-*`); the local cycle stops at the owner's contract approval.
+Until then a box has no band, and `tools/ranked-box-preflight.sh` refuses a
+ranked job on it.
 
 ## 4. Reproduce a ranked score
 
@@ -188,7 +145,8 @@ the cleanup and the nonce-bound reveal.
 2. Wait for the run. Both jobs, the measurement step and **Sandbox cleanup**
    must succeed.
 3. Read the score from the reveal block, which binds a per-job nonce to the
-   file's sha256 and length:
+   file's sha256 and length (`MUSE-GLIMMER-SCORE-BEGIN` /
+   `MUSE-GLIMMER-SCORE-END`):
 
    ```bash
    gh run view <run_id> --repo <repo> --log | cut -f3- > job.log
@@ -205,36 +163,11 @@ the cleanup and the nonce-bound reveal.
    ```bash
    gh run download <run_id> --repo <repo> -n benchmark-results-<run_id> -D art
    sha256sum art/score.json; wc -c < art/score.json
-   grep -o 'NEMOTRON35-SCORE-END .*' job.log | tail -1
+   grep -o 'MUSE-GLIMMER-SCORE-END .*' job.log | tail -1
    ```
 
-   For run 39448053054 both give sha256
-   `533217192a497b4bf92d41f286c79054cab5c754f81f6038a08d6d30e560efa6` and
-   8,018 bytes, and the parser returns `passed: true`, score
-   1.3098707780322463.
-
-**Recorded results** (the unchanged engine of dev `main`, which declares MTP
-depth 3):
-
-| Run | Box | Result |
-|---|---|---|
-| [39448053054](https://github.com/Layr-Labs/cudafast-nemotron35-lightning-30b-a3b-engine-dev/actions/runs/39448053054) (dev repo, `c1ef8de`) | spark-2 | every step succeeded; `passed: true`, score 1.3099; reveal sha256 `53321719…`, 8,018 bytes; artifact uploaded |
-| 39448081400 (organizer test repo, same tree) | spark-1 | `passed: true`, score 1.3095 (only the artifact upload failed, on that account's storage quota) |
-
-A participant submission through Yukon dev (2026-10-21, `yukon submit` to
-the dev row, MTP depth 2) was built by Yukon on `main` `c39f90c` and scored
-`passed: true`, 1.0970 in dev run
-[39519754376](https://github.com/Layr-Labs/cudafast-nemotron35-lightning-30b-a3b-engine-dev/actions/runs/39519754376);
-its artifact equals the reveal line (sha256 `d858782f…`, 8,013 bytes).
-
-The two boxes agree to 0.03%. Depths 1 to 6 on the same tree scored 1.164,
-1.114, 1.316, 1.189, 1.131 and 1.104, all passing correctness, and an engine
-that returns wrong tokens was refused with no score (organizer test repo,
-2026-10-19/20).
-
-**Why 1.31 and not 1.44.** The same unchanged engine scored 1.44 on dev
-`main` before 2026-10-19 (four runs, 1.4376 to 1.4427). The score is measured
-on the live pool, and PR #33 replaced the three prompts behind `pool-9`,
-`pool-10` and `pool-11` with the organizer's own coding prompts (same names,
-same 496-token length, new goldens). The decode gain of MTP depends on how well the head drafts the text, so
-a new pool moves the reference point; the band and the floors are unchanged.
+**Recorded results.** None for this track: no ranked job has run on it. The
+local cycle's own receipts (boot, parity, contract) are in the challenge
+folder's `cuda/` tree, and the engine base's ranked runs are recorded in the
+base repository. When this track's first ranked job runs, record the run id,
+the box, the score and the reveal digest here.

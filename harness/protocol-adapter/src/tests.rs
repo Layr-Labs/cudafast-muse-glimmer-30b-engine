@@ -1961,7 +1961,7 @@ mod session {
         let session = Arc::new(Mutex::new(Scripted::default()));
         let mut e = engine(&session);
         // The scripted model predicts last+1, so start just below an EOS id.
-        // Nemotron's stop ids are `</s>` = 2 and `<|im_end|>` = 11.
+        // The scripted resident's stop ids are `<s>` = 2 and `<|im_end|>` = 11.
         let out = e.correctness_freerun(&[10], 10).unwrap();
         assert_eq!(out, vec![11], "stopped on the first EOS id");
         let out = e.correctness_freerun(&[1, 2], 3).unwrap();

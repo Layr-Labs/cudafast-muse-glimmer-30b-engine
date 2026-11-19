@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""router.py -- the submission router for the Nemotron 3.5 Lightning track.
+"""router.py -- the submission router for the Muse Glimmer 30B NVFP4 track.
 
 ORGANIZER TOOL, trusted side (outside editablePaths). It does what Yukon's
 service does for a ranked submission (docs/submission-restriction-spec.md
@@ -24,7 +24,7 @@ sections 1 and 4), then drives GitHub Actions the way Yukon does:
            generation, queued K times for the `run` daemon; `rescore-report`
            ranks them by mean score once they are done.
 
-State lives in SQLite (--state-dir, default ~/nemotron35-router), so a restart
+State lives in SQLite (--state-dir, default ~/muse-glimmer-router), so a restart
 resumes where it stopped. The `gh` CLI must be logged in with repo scope.
 
     tools/router/router.py submit <dir|tar.gz> --variant null --expect pass
@@ -70,8 +70,8 @@ def default_repo() -> str:
         return repo
     return subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
                           cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
-FIXTURE_REL = "fixtures/nemotron35_lightning_30b_a3b_track.json"
-TRACK_LABEL = "nemotron3.5-lightning-30b-a3b-cuda-v1"
+FIXTURE_REL = "fixtures/muse_glimmer_30b_cuda_v1_track.json"
+TRACK_LABEL = "muse-glimmer-30b-cuda-v1"
 WATCHDOG_SECONDS = 90 * 60
 POLL_SECONDS = 60
 
@@ -223,7 +223,7 @@ class Router:
                         t.unlink()
                     shutil.copytree(s, t) if s.is_dir() else shutil.copy2(s, t)
                 sh(["git", "add", "-A"], cwd=str(wt))
-                sh(["git", "-c", "user.name=nemotron35-router", "-c", "user.email=router@localhost",
+                sh(["git", "-c", "user.name=muse-glimmer-router", "-c", "user.email=router@localhost",
                     "commit", "-q", "--allow-empty", "-m", f"submission {sid} ({variant})"], cwd=str(wt))
                 commit = sh(["git", "rev-parse", "HEAD"], cwd=str(wt)).strip()
                 branch = f"sub/{sid}"
@@ -485,7 +485,7 @@ class Router:
             sh(["git", "worktree", "add", "-q", "--detach", str(wt), base_ref], cwd=str(self.clone))
             try:
                 sh([str(ROOT / "tools/pool-refresh.sh"), "pin-fixture", str(wt / FIXTURE_REL), "final", str(final_pins)])
-                sh(["git", "-c", "user.name=nemotron35-router", "-c", "user.email=router@localhost",
+                sh(["git", "-c", "user.name=muse-glimmer-router", "-c", "user.email=router@localhost",
                     "commit", "-q", "-am", "rescore: live_goldens = the held-out final generation"], cwd=str(wt))
                 commit = sh(["git", "rev-parse", "HEAD"], cwd=str(wt)).strip()
             finally:
@@ -766,7 +766,7 @@ def contest_run_value(row: dict) -> float | None:
 
 
 _SCORE_END_RE = re.compile(
-    r"^NEMOTRON35-SCORE-END ([0-9a-f]{64}) (sha256=([0-9a-f]{64}) bytes=(\d+)|none)$"
+    r"^MUSE-GLIMMER-SCORE-END ([0-9a-f]{64}) (sha256=([0-9a-f]{64}) bytes=(\d+)|none)$"
 )
 
 
@@ -805,7 +805,7 @@ def score_from_log(log: str) -> dict | None:
     if end_m.group(2) == "none":
         return {}
     expected_hash, expected_bytes = end_m.group(3), int(end_m.group(4))
-    begin_re = re.compile(rf"^NEMOTRON35-SCORE-BEGIN {re.escape(nonce)}$")
+    begin_re = re.compile(rf"^MUSE-GLIMMER-SCORE-BEGIN {re.escape(nonce)}$")
     begin_idx = None
     for i in range(end_idx - 1, -1, -1):
         if begin_re.match(lines[i]):
@@ -913,7 +913,7 @@ def render_html(summary, rows, head=None) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--state-dir", default=os.path.expanduser("~/nemotron35-router"))
+    ap.add_argument("--state-dir", default=os.path.expanduser("~/muse-glimmer-router"))
     ap.add_argument("--repo", default=None, help="owner/repo (default: ROUTER_REPO, else `gh repo view`)")
     ap.add_argument("--base", default=DEFAULT_BASE, help="base branch (default: ROUTER_BASE, else loadtest/base)")
     sub = ap.add_subparsers(dest="cmd", required=True)

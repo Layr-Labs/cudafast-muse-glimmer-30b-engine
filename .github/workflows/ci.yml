@@ -17,7 +17,7 @@
 #                     resident (fake backend) end to end at every depth.
 #   `engine-overlay`  hosted aarch64 ubuntu: pulls the pinned engine image BY
 #                     DIGEST, stages the vLLM overlay the box would run
-#                     (tools/stage-vllm-overlay.sh) and imports the Nemotron
+#                     (tools/stage-vllm-overlay.sh) and imports the Muse Glimmer
 #                     model code through it. No GPU: this proves the tree's
 #                     vLLM source layers onto the pinned build and imports,
 #                     nothing about execution.
@@ -264,11 +264,11 @@ jobs:
           submodules: false
           persist-credentials: false
 
-      - name: Stage the overlay and import the Nemotron model code through it
+      - name: Stage the overlay and import the Muse Glimmer model code through it
         run: |
           set -euo pipefail
-          image="$(jq -r '.serve_configuration.container_image' fixtures/nemotron35_lightning_30b_a3b_track.json)"
-          digest="$(jq -r '.serve_configuration.container_digest' fixtures/nemotron35_lightning_30b_a3b_track.json)"
+          image="$(jq -r '.serve_configuration.container_image' fixtures/muse_glimmer_30b_cuda_v1_track.json)"
+          digest="$(jq -r '.serve_configuration.container_digest' fixtures/muse_glimmer_30b_cuda_v1_track.json)"
           docker pull "${image%%:*}@${digest}"
           tools/stage-vllm-overlay.sh
           docker run --rm --network none --user "$(id -u):$(id -g)" \
@@ -276,7 +276,7 @@ jobs:
             --env HOME=/tmp --env "PYTHONPATH=${GITHUB_WORKSPACE}/.build/vllm-overlay" \
             --entrypoint python3 "${image%%:*}@${digest}" -c '
           import os, vllm
-          from vllm.model_executor.models import nemotron_h, nemotron_h_mtp  # noqa: F401
+          from vllm.model_executor.models import muse_glimmer  # noqa: F401
           here = os.path.dirname(vllm.__file__)
           assert here.startswith(os.environ["PYTHONPATH"]), here
           print("vllm", vllm.__version__, "from", here)

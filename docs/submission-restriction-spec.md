@@ -47,7 +47,7 @@ as a script here; §9 says what covers each on this track:
 | Upstream file | Role upstream | Here |
 |---|---|---|
 | `.github/scripts/verify-trusted-source-scope.sh` | re-verifies the trusted source scope before the trusted build; refuses any `editablePaths` entry overlapping it | the intake service reads `editablePaths` from the trusted base only; the linter refuses an editable entry over the scorer's pin (A1); participant code runs as a user that cannot write the checkout (`docs/sandbox-design.md`) |
-| `.github/scripts/pin-trusted-harness.sh` | content pins over the built trusted and worker artifacts | benchd is fetched and sha256-verified by `tools/fetch-benchd.sh`; the staged engine shim is byte-checked by `tools/nemotron35-measure-and-score.sh`; participant builds cannot write trusted paths (`docs/sandbox-design.md`) |
+| `.github/scripts/pin-trusted-harness.sh` | content pins over the built trusted and worker artifacts | benchd is fetched and sha256-verified by `tools/fetch-benchd.sh`; the staged engine shim is byte-checked by `tools/muse-glimmer-measure-and-score.sh`; participant builds cannot write trusted paths (`docs/sandbox-design.md`) |
 | `.github/scripts/deny-private-artifacts.sh` | refuses artifact/cache uploads that could leak hidden data | the ranked workflow uploads only the sealed `score.json` after sandbox cleanup and uses no cache; the score is read from that artifact and the job log |
 
 ## 1. Layer map
@@ -336,7 +336,7 @@ ranked workflow) is responsible for:
 - **Trusted-binary pins** (upstream `pin-trusted-harness.sh`). benchd is
   resolved offline from the staged pair and verified by
   `tools/fetch-benchd.sh`; the staged engine shim is byte-checked by
-  `tools/nemotron35-measure-and-score.sh`; participant builds run as `nemosub`
+  `tools/muse-glimmer-measure-and-score.sh`; participant builds run as `nemosub`
   and cannot write any trusted path.
 - **Artifact exfiltration** (upstream `deny-private-artifacts.sh`). The ranked
   workflow uploads exactly one artifact, the sealed `score.json` after sandbox
@@ -371,14 +371,14 @@ per-job sandbox directory; only when every check in that step passes does it
 write `${RUNNER_TEMP}/cleanup-ok` (`umask 077`) as its last action. After
 cleanup, **Reveal the sealed score** prints, in order:
 
-1. `NEMOTRON35-SCORE-BEGIN <nonce>`
+1. `MUSE-GLIMMER-SCORE-BEGIN <nonce>`
 2. when `cleanup-ok` exists: the exact bytes of `score.json` if the file exists
    (the step may append one trailing newline when the file has no final
-   newline), then `NEMOTRON35-SCORE-END <nonce> sha256=<sha256 of score.json>
-   bytes=<n>`, or `NEMOTRON35-SCORE-END <nonce> none` when `score.json` is
+   newline), then `MUSE-GLIMMER-SCORE-END <nonce> sha256=<sha256 of score.json>
+   bytes=<n>`, or `MUSE-GLIMMER-SCORE-END <nonce> none` when `score.json` is
    absent
 3. when `cleanup-ok` is missing (cleanup did not fully succeed): only
-   `NEMOTRON35-SCORE-END <nonce> none` after the `BEGIN` line — even if
+   `MUSE-GLIMMER-SCORE-END <nonce> none` after the `BEGIN` line — even if
    `score.json` is still on disk
 
 The nonce is unknown until this step, so earlier log lines cannot forge a valid
@@ -390,14 +390,14 @@ timestamp prefix from each log line (everything after the first space on the
 line). Then:
 
 1. Find the **last** line matching
-   `^NEMOTRON35-SCORE-END ([0-9a-f]{64}) (sha256=([0-9a-f]{64}) bytes=(\d+)|none)$`.
+   `^MUSE-GLIMMER-SCORE-END ([0-9a-f]{64}) (sha256=([0-9a-f]{64}) bytes=(\d+)|none)$`.
    If none, there is no sealed score (`None`).
 2. Let `<nonce>` be the first capture group. If the line ends with `none`, the
    reveal explicitly sealed no file: treat as an empty score (`{}`), not a
    parse failure. If there is no matching `END` line at all, parsing yields
    `None` (no valid block — forged or truncated text must not count).
 3. Otherwise take every line **strictly between** the last
-   `NEMOTRON35-SCORE-BEGIN <nonce>` before that end line and the end line;
+   `MUSE-GLIMMER-SCORE-BEGIN <nonce>` before that end line and the end line;
    join with `\n`. Require a JSON object with `passed` and `metrics`. Require
    its sha256 and byte length to match the end line, allowing for at most one
    trailing-newline difference either way (the reveal step may add a newline

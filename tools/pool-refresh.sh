@@ -38,8 +38,8 @@
 #
 # Env: REFRESH_BOXES (ssh host names of the fleet, at least two; default
 #      "spark-1 ... spark-8"), REFRESH_PRIVATE (<repo>/.mlxfast-private),
-#      REFRESH_BOX_REPO (nemotron35/repo, relative to the box home),
-#      REFRESH_BOX_GOLDENS (/srv/nemotron35/goldens), REFRESH_BOX_SNAPSHOT (the box's
+#      REFRESH_BOX_REPO (muse-glimmer/repo, relative to the box home),
+#      REFRESH_BOX_GOLDENS (/srv/muse-glimmer/goldens), REFRESH_BOX_SNAPSHOT (the box's
 #      verified snapshot; else the box login env's MLXFAST_TARGET_SNAPSHOT_DIR),
 #      REFRESH_GPU_LOCK (/tmp/mtplx-gpu-exclusive.lock), REFRESH_LOCK_WAIT (14400 s),
 #      REFRESH_PYTHON (python3 with `tokenizers`, for author), REFRESH_ARMED_BASE
@@ -47,7 +47,7 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
-FIXTURE="${ROOT}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+FIXTURE="${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 log() { printf 'pool-refresh: %s\n' "$*" >&2; }
 die() { printf 'pool-refresh: %s\n' "$*" >&2; exit 1; }
 
@@ -122,14 +122,14 @@ normalize_count() {
 PRIV="${REFRESH_PRIVATE:-${ROOT}/.mlxfast-private}"
 read -ra BOXES <<<"${REFRESH_BOXES:-spark-1 spark-2 spark-3 spark-4 spark-5 spark-6 spark-7 spark-8}"
 [[ "${#BOXES[@]}" -ge 2 ]] || die "REFRESH_BOXES needs at least two boxes (every golden is recorded twice)"
-BOX_REPO="${REFRESH_BOX_REPO:-nemotron35/repo}"
-BOX_GOLDENS="${REFRESH_BOX_GOLDENS:-/srv/nemotron35/goldens}"
+BOX_REPO="${REFRESH_BOX_REPO:-muse-glimmer/repo}"
+BOX_GOLDENS="${REFRESH_BOX_GOLDENS:-/srv/muse-glimmer/goldens}"
 LOCK="${REFRESH_GPU_LOCK:-/tmp/mtplx-gpu-exclusive.lock}"
 LOCK_WAIT="${REFRESH_LOCK_WAIT:-14400}"
 STAGING_LOG="${PRIV}/refresh/staging.log"
 if [[ "${LABEL}" == final ]]; then GEN="${PRIV}/final"; else GEN="${PRIV}/refresh/${LABEL}"; fi
 STATE="${GEN}/state"
-REMOTE="nemotron35-refresh/${LABEL}"   # relative to the box home
+REMOTE="muse-glimmer-refresh/${LABEL}"   # relative to the box home
 if [[ -f "${GEN}/count" ]]; then
   STORED_COUNT="$(normalize_count "$(<"${GEN}/count")")"
   if [[ "${COUNT_SET}" == 1 && "${COUNT}" != "${STORED_COUNT}" ]]; then
@@ -201,7 +201,7 @@ box_job() { # box_job BOX KEY STEPS FILE_SUFFIX NAME...
   [[ -z "${REFRESH_BOX_SNAPSHOT:-}" ]] || snap="MLXFAST_TARGET_SNAPSHOT_DIR=${REFRESH_BOX_SNAPSHOT}"
   # serve-up refuses a /tmp socket under docker, and the operator's shell has no
   # SERVE_UP_* or BENCHD_BIN_DIR: give the recording private dirs and the staged benchd.
-  rsh "${box}" "mkdir -p \$HOME/rsock \$HOME/${dir}/log && cd ${BOX_REPO} && ${snap} SERVE_UP_SOCKET_DIR=\$HOME/rsock SERVE_UP_LOG_DIR=\$HOME/${dir}/log BENCHD_BIN_DIR=${REFRESH_BOX_BENCHD:-/srv/nemotron35/benchd-bin} flock -w ${LOCK_WAIT} ${LOCK} tools/record-goldens.sh" \
+  rsh "${box}" "mkdir -p \$HOME/rsock \$HOME/${dir}/log && cd ${BOX_REPO} && ${snap} SERVE_UP_SOCKET_DIR=\$HOME/rsock SERVE_UP_LOG_DIR=\$HOME/${dir}/log BENCHD_BIN_DIR=${REFRESH_BOX_BENCHD:-/srv/muse-glimmer/benchd-bin} flock -w ${LOCK_WAIT} ${LOCK} tools/record-goldens.sh" \
     "--prompts \$HOME/${dir}/prompts --out \$HOME/${dir}/out ${only[*]} --steps ${steps}" \
     >"${logf}" 2>&1 || { log "record: ${key} on ${box} failed; see ${GEN}/rec-${key}.log"; return 1; }
   run mkdir -p "${GEN}/rec/${key}"
@@ -318,7 +318,7 @@ step_pin() {
   mark pin
   cat <<EOF
 pool-refresh: pinned ${LABEL} in ${FIXTURE}; review the diff, then:
-  git -C ${ROOT} add fixtures/nemotron35_lightning_30b_a3b_track.json
+  git -C ${ROOT} add fixtures/muse_glimmer_30b_cuda_v1_track.json
   git -C ${ROOT} commit -m "pool refresh: pin ${LABEL} and switch the rotation pool"
   git -C ${ROOT} push origin HEAD:main
   git -C ${ROOT} push origin HEAD:${REFRESH_ARMED_BASE:-loadtest/base}
@@ -343,7 +343,7 @@ check_box_against() {
 
 origin_fixture() { # the fixture on origin/main, into a temp file
   git -C "${ROOT}" fetch -q origin main || die "cannot fetch origin main"
-  git -C "${ROOT}" show origin/main:fixtures/nemotron35_lightning_30b_a3b_track.json > "$1"
+  git -C "${ROOT}" show origin/main:fixtures/muse_glimmer_30b_cuda_v1_track.json > "$1"
 }
 
 step_verify() {

@@ -1,10 +1,10 @@
-# Nemotron 3.5 Lightning 30B-A3B NVFP4 — participant contract
+# Muse Glimmer 30B NVFP4 — participant contract
 
 This document states the terms that bind a submission to track
-`nemotron3.5-lightning-30b-a3b-cuda-v1`.
+`muse-glimmer-30b-cuda-v1`.
 
 `benchmark.json` is the Yukon track manifest.
-`fixtures/nemotron35_lightning_30b_a3b_track.json` is the track contract fixture.
+`fixtures/muse_glimmer_30b_cuda_v1_track.json` is the track contract fixture.
 Both carry values, paths, commands and pins only. This document explains them.
 It never overrides them.
 
@@ -13,7 +13,7 @@ It never overrides them.
 Apply these in order. The higher entry wins.
 
 1. The ranked run on the official runner. It is the authority on any score.
-2. `fixtures/nemotron35_lightning_30b_a3b_track.json` and `benchmark.json`.
+2. `fixtures/muse_glimmer_30b_cuda_v1_track.json` and `benchmark.json`.
 3. This document.
 4. `README.md`, `TASK.md` and `AGENTS.md`.
 
@@ -36,35 +36,37 @@ DEVELOPMENT bench repository. That repository is private, so the fetch needs
 The track measures single-stream prefill and decode speed of the target on a
 DGX Spark (GB10, sm_121, 128 GB unified memory).
 
-The target is `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` at revision
-`bee7596271d1495f6992ae224aefde4410e816b8`: a ModelOpt mixed-precision
-checkpoint of `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16`.
+The target is `nvidia/Muse-Glimmer-30B-NVFP4` at revision
+`47818374517751c48c55cde2621594926b1888b6`: a ModelOpt mixed-precision
+checkpoint of a 52-layer text decoder, with a vision tower that the scored
+text track does not exercise.
 
 | Property | Value |
 |---|---|
-| Architecture | `NemotronHForCausalLM`, `model_type` `nemotron_h` |
-| Layers | 52: 23 Mamba-2, 23 MoE, 6 attention (indices 5, 12, 19, 26, 33, 42) |
-| Hidden size | 2688 |
+| Architecture | `MuseGlimmerForConditionalGeneration`, `model_type` `muse_glimmer` |
+| Layers | 52 text layers: 39 sliding-attention (window 2048), 13 full attention |
+| Hidden size | 6656 |
+| MLP | dense, intermediate 19968 |
 | Attention | 32 query heads, 2 KV heads, head dimension 128 |
-| Mamba-2 | 64 heads of dimension 64, SSM state 128, conv kernel 4, 8 groups |
-| MoE | 128 routed experts, 6 per token, intermediate 1856, plus a shared expert of 3712 |
-| Vocabulary | 131072, untied embeddings |
-| Tokens | BOS 1; EOS `</s>` 2 and `<|im_end|>` 11 |
-| MTP | 1 native next-token layer (`mtp.*`: attention + MoE), BF16 |
+| Vision tower | 50 layers, hidden 1536, patch 14 (not scored by this track) |
+| Vocabulary | 202048, untied embeddings |
+| Tokens | BOS 200000; EOS 200001 and 200008; PAD 200018 |
+| Speculation | none: the checkpoint ships no MTP or draft tensors |
 
-The checkpoint's `hf_quant_config.json` is the authority on formats:
+The checkpoint's `config.json` `quantization_config` is the authority on
+formats:
 
 | Tensors | Format |
 |---|---|
-| Routed and shared experts, `lm_head` | NVFP4, weight-only (W4A16): 16-element blocks, FP8 E4M3 block scale, FP32 global scale |
-| Mamba `in_proj` / `out_proj` | FP8 |
-| KV cache | FP8 |
-| Mamba SSM state | float32 (`mamba_ssm_cache_dtype`) |
-| MTP head | BF16 |
+| MLP projections and `lm_head` (213 layers) | NVFP4, weight-only (W4A16): 16-element blocks (group 16), FP8 E4M3 block scale, FP32 global scale |
+| Attention projections (180 layers) | FP8 (w8a8 float8) |
+| Vision tower, embeddings | BF16 |
+| KV cache | the fixture's `kv_cache_dtype` (`auto`: the checkpoint's own dtype) |
 
-The engine is vLLM `v0.27.1`. The speculative arm is vLLM's `mtp` method over
-the native MTP layer. The KV backend is `vllm-paged`, pinned in the fixture and
-in `benchmark.json`.
+The engine is vLLM `v0.27.1`. The track is SERIAL ONLY: the fixture's
+`allowed_modes` is `[serial]` and `serve_configuration.depths` declares
+`serial` alone (section 4). The KV backend is `vllm-paged`, pinned in the
+fixture and in `benchmark.json`.
 
 ## 3. What you may edit
 
@@ -76,11 +78,11 @@ paths.
 |---|---|
 | `vllm/` | vLLM v0.27.1's Python package (`vllm/vllm/`), `vllm/VENDOR.json`, `vllm/LICENSE` |
 | `harness/` | `protocol-adapter/` (Rust), `vllm_resident/` (Python), optional `kernels/` |
-| `mtp-head.manifest.json` | the speculative declaration (section 4) |
+| `mtp-head.manifest.json` | the speculation declaration (section 4): on this track it declares `"source": "none"` |
 
 ### 3.1 Optional paths
 
-`mtp-head.manifest.json` is optional. An archive that omits it runs serial.
+`mtp-head.manifest.json` is optional. The shipped declaration is `"source": "none"` with speculation disabled, and every leg of this track runs serial (section 4).
 
 ### 3.2 The byte budget
 
@@ -90,9 +92,9 @@ the caps:
 
 | Cap | Value | Derivation |
 |---|---|---|
-| `maxTotalBytes` | 36,047,190 | the surface at rest, 34,998,614, plus 1 MiB |
+| `maxTotalBytes` | 41,943,040 | the surface at rest on this tree, 35,168,624, plus the growth headroom the vendoring commit leaves; raised from 36,047,190 to 40 MiB on the owner's words "Raise the limit" (2026-11-18, F-CUDA-55) |
 | `maxFileBytes` | 2,558,837 | the largest file at rest, 1,510,261, plus 1 MiB |
-| `maxGrowthBytes` | 36,047,190 | equal to the total: the vendoring commit is the growth |
+| `maxGrowthBytes` | 41,943,040 | equal to the total: the vendoring commit is the growth |
 
 The cap exists so that source cannot hide lookup tables. It also refuses
 symlinks and special files anywhere under an editable path.
@@ -110,11 +112,12 @@ weight, activation path, cache or recurrent state. Section 2 lists the formats.
 This holds even when the result passes the correctness gate.
 
 - **What is legal:** kernels that compute the SAME formats faster. That includes
-  a fused NVFP4 dequant-GEMM or MoE, a better Mamba-2 scan or state update,
-  attention kernels, CUDA graphs, fusion, and scheduling and memory layout.
-- **Activations are part of the format.** The experts are declared W4A16, so
-  quantizing their activations to FP4 or FP8 is a change of format. On GB10 this
-  rules out native FP4 MMA with on-the-fly activation quantization.
+  a fused NVFP4 dequant-GEMM, a paged-attention kernel with a sliding window,
+  CUDA graphs, fusion, and scheduling and memory layout.
+- **Activations are part of the format.** The MLP and `lm_head` are declared
+  W4A16, so quantizing their activations to FP4 or FP8 is a change of format.
+  On GB10 this rules out native FP4 MMA with on-the-fly activation
+  quantization.
 - **A load-time repack is also legal**, under two conditions. It must be
   input-independent (for example a weight layout swizzle), and it must preserve
   every value exactly.
@@ -149,12 +152,12 @@ benchd seals a harness hash over a fixed root set that includes `vllm` and
 **Your engine must stay REPRODUCIBLE.** The same prompt must give the same
 tokens on every run and on every box. The serial control leg and every timed
 leg are checked against recorded tapes, and on this checkpoint a last-bit
-difference becomes a different greedy token within a few steps: the
-activations are FP8-quantized, which amplifies it. vLLM's stock Marlin MoE is
-not reproducible on GB10, which is why the reference engine runs the humming
-MoE in its batch-invariant mode (`docs/nemotron35-port-notes.md` section 7.2).
-Check any kernel change with `tools/determinism-probe.py` before submitting:
-it must report one stream.
+difference becomes a different greedy token within a few steps: the attention
+activations are FP8-quantized, which amplifies it. The fixture therefore
+disables `FlashInferFP8ScaledMMLinearKernel` (it is not batch-invariant) and
+pins every boot setting, which is what makes the goldens stable
+([port log](muse-glimmer-port-notes.md)). Check any kernel change with
+`tools/determinism-probe.py` before submitting: it must report one stream.
 
 ### 3.6 Where your code runs
 
@@ -185,20 +188,22 @@ box.
   on anything surviving from a previous leg or job; section 8 forbids the
   reuse anyway.
 
-## 4. The MTP head
+## 4. The speculation declaration
 
-The head is the `mtp.*` tensors inside the pinned
-`model-00052-of-00052.safetensors`. The fixture's `mtp_head` block records it:
-270 tensors, BF16, 2,670,652,160 bytes. No submission carries head weights.
+This track has no speculative arm. The checkpoint ships no MTP or draft
+tensors, the fixture's `mtp_head` block records `"source": "none"` with an
+empty `permitted_draft_depths`, and `serve_configuration.depths` declares
+`serial` alone. `mtp-head.manifest.json` stays an editable path only because a
+submission archive replaces whole paths; its one accepted value is the
+disabled one.
 
 ### 4.1 What you may declare
 
 ```json
 {
   "version": 1,
-  "source": "pinned",
-  "max_bytes": 3221225472,
-  "spec": { "enabled": true, "num_speculative_tokens": 3 }
+  "source": "none",
+  "spec": { "enabled": false, "num_speculative_tokens": 0 }
 }
 ```
 
@@ -206,42 +211,26 @@ The head is the `mtp.*` tensors inside the pinned
 
 - **Allowed keys.** It accepts `version`, `source`, `max_bytes`, `bytes`,
   `sha256` and `spec`, and refuses any other key.
-- **Source.** It refuses any `source` except `"pinned"`, which rules out
-  `"remote"` and `"in_branch"`.
-- **Depth.** It refuses an enabled depth outside `mtp_head.permitted_draft_depths`,
-  which is 1 to 6.
+- **Source.** The accepted `source` is the contract's own `mtp_head.source`,
+  which is `"none"` on this track. `"pinned"`, `"remote"` and `"in_branch"` are
+  refused.
+- **Depth.** An enabled depth must be in `mtp_head.permitted_draft_depths`,
+  which is empty here, so any enabled depth is refused, never clamped.
 - **Serial.** A declaration that is absent, disabled, or has 0 tokens derives
-  serial.
-- **Recorded, not enforced.** `max_bytes`, `bytes` and `sha256` are recorded
-  only. The fixture's `declaration_max_bytes` is 3 GiB, so the pinned head
-  fits the cap.
-
-The shipped declaration is disabled: the reference tree runs serial, and the
-reference scored against itself is a null control of about 1.000.
+  serial, which is what every leg of this track runs.
 
 ### 4.2 What you may not do
 
-- Replace the head, or load any other drafter (DSpark, DFlash, Eagle,
-  n-gram).
-- Re-quantize the head: `mtp_head.requantization_permitted` is `false`.
-- Ship head weights, or fetch anything at run time; the resident has no
-  network.
+- Load a drafter of any kind (MTP, DSpark, DFlash, Eagle, n-gram).
+- Declare head weights as your own (`bytes`/`sha256` are recorded, not read, and
+  nothing loads from a declaration).
+- Fetch anything at run time; the resident has no network.
 
-### 4.3 What the size cap does and does not do
+### 4.3 What the head does in a run
 
-The cap is a declaration limit only. Nothing loads from a declaration. The head
-always comes from the verified snapshot.
-
-### 4.4 What the head does in a run
-
-At depth d, vLLM runs the one MTP layer recursively to propose d tokens per
-cycle, and the target verifies them in one forward. The target decides every
-emitted token.
-
-The adapter reports the cycles as `acceptance_lengths`, and the drafted,
-accepted and committed totals. benchd seals `effective_spec_mode`,
-`effective_spec_depth`, `spec_rounds`, `spec_drafted_total`,
-`spec_accepted_total` and `spec_acceptance_rate`.
+Nothing: no leg boots a speculative config. Every phase — warm-up, timed
+prefill, timed decode, correctness — runs the serial path, and benchd seals
+`effective_spec_mode` as `serial` with depth 0.
 
 ## 5. Scoring
 
@@ -258,7 +247,7 @@ overlapping:
 - **Pairs.** A ranked job runs `official_pairs` = 3 pairs.
 - **Legs.** Each pair is one SERIAL CONTROL leg on the organizer-staged
   reference tree at `baseline_reference_commit`, then one CANDIDATE leg on the
-  submission at its declared depth.
+  submission. Both legs are serial.
 - **Aggregation.** benchd computes one composite per pair. The fixture
   declares `official_pair_combine: "mean"`, so the score is the arithmetic
   mean of the 3 per-pair composites. The floors and the bands gate every pair
@@ -293,9 +282,9 @@ benchd splits its own clock at the verb boundary:
 
 What the engine owes:
 
-1. `free_decode_begin` runs the FULL 496-token seed prefill with the requested
-   spec resolved, and replies only after that work has completed. The reply is
-   the greedy seed token and the echoed `effective_spec`.
+1. `free_decode_begin` runs the FULL 512-token seed prefill, and replies only
+   after that work has completed. The reply is the greedy seed token and the
+   echoed `effective_spec` (always `serial`).
 2. `free_decode_run` never re-prefills. It decodes from the state `begin` left.
 3. Nothing prefills before `free_decode_begin` arrives.
 
@@ -311,11 +300,11 @@ The seed token's index: `seed_token` is `expected_decode_seed_token`;
 
 | Quantity | Value |
 |---|---|
-| Seed tokens per stream | 496 |
+| Seed tokens per stream | 512 |
 | Unmeasured prefill warm-up passes before the timed prefill | 1 (same prompt, same phase, computed in full) |
 | Timed prefill passes per phase | 5; the phase's prefill time is their median |
 | Checked decode steps | 128 |
-| Golden shape | 496 `prompt_tokens` and an answer of at most 1024 `expected_tokens` per case (the answer ends at the first end-of-turn token), plus the free-run `benchmark` block |
+| Golden shape | 512 `prompt_tokens` and an answer of at most 1024 `expected_tokens` per case (the answer ends at the first end-of-turn token), plus the free-run `benchmark` block |
 | Streams per window | 1 |
 | Timed prompts per leg | 1; pair k measures `live_goldens[(k - 1) mod 3]` (section 5.2.1) |
 | Prompts in the pinned correctness pool | 3 |
@@ -338,8 +327,8 @@ prompt by its sha256.
 
 Why: one pair per prompt makes the score depend on all three prompts, and the
 mean gives each prompt the same weight.
-Every live golden carries its own serial golden and one timed oracle per draft
-depth, and the run refuses a declared depth that has no oracle.
+Every live golden carries its own serial tape, and the run refuses a golden
+that is missing or off its pin.
 
 The per-box calibration file carries one band per live golden, and benchd
 gates each control leg with the band of the prompt that leg measured.
@@ -365,22 +354,20 @@ Timed prefill is the median of five passes after one unmeasured warm-up pass
 
 ### 5.4 Token fidelity
 
-benchd applies a per-stream token-tolerance gate with a **10% budget** against
-the serial tape. Every per-depth golden carries the SAME serial `cases[]`
-(`tools/record-goldens.sh` splices them), so fidelity is always measured
-against serial. The gate accepts similar output. It does not certify lossless
-output.
+benchd applies a per-stream token-tolerance gate with a **0.0 budget** against
+the serial tape: the fixture's `token_tolerance_budget` is `0.0`, so the
+candidate's stream must match the tape token for token. There is one mode, so
+there is one tape, and every leg is checked against it.
 
 ### 5.4.1 The timed window: exact match
 
-The timed decode window is checked token by token against the timed golden for
-your declared depth. Every committed token must match. A token that differs
-fails the run. The ranked run and the local modes apply the same rule.
+The timed decode window is checked token by token against the timed serial
+golden. Every committed token must match. A token that differs fails the run.
+The ranked run and the local modes apply the same rule.
 
 The logits of this checkpoint are BF16, so the reference's top two tokens tie
 exactly, or sit one BF16 step apart, several times in every 128 tokens. A
-faster kernel, or a speculative verify that quantizes activations over several
-tokens at once, can resolve such a tie differently and fail the run.
+faster kernel that resolves such a tie differently fails the run.
 
 The benchmarker has no timed-divergence reference replay. The fixture declares
 no timed token tolerance, so none applies.
@@ -394,16 +381,15 @@ refuses to seal an official artifact while it is `false` or absent, and so does
 The fixture ships UNARMED. It is armed only after four steps are done:
 
 1. every golden is recorded on a Spark and pinned (the pending entries carry the
-   sentinel `NEMOTRON35-LIGHTNING-CUDA-PENDING-ORGANIZER`, which the preflight
+   sentinel `MUSE-GLIMMER-CUDA-PENDING-ORGANIZER`, which the preflight
    refuses);
 2. `baseline_reference_commit` names the promoted reference;
 3. every box is calibrated;
 4. the null control, the reference scored against itself, lands at about 1.000.
 
-The control leg is serial whatever the candidate declares. benchd boots each
-leg's resident itself, from that leg's own tree, with
-`tools/serve-up.sh --boot --spec serial|mtp --draft-len N --socket-out FILE`,
-and stops it with `--stop --socket PATH`.
+Every leg is serial. benchd boots each leg's resident itself, from that leg's
+own tree, with `tools/serve-up.sh --boot --spec serial --draft-len 0
+--socket-out FILE`, and stops it with `--stop --socket PATH`.
 
 A control leg that fails (`SERIAL-CONTROL-LEG-FAILED`) is not a fault of your
 code, and the router records it as `control_failed`. How it counts: in the
@@ -440,7 +426,7 @@ Each ranked box carries a calibration file, named by
 `MLXFAST_BASELINE_CALIBRATION` and written by `tools/calibrate-box.sh` (3
 passes, one resident boot per pass). It is a HEALTH BAND for the control leg,
 never a denominator. A control leg outside the band fails the run by name. A box
-whose passes spread by more than 2% gets no band. The fixture field
+whose passes spread by more than 1% gets no band. The fixture field
 `calibration_max_cv_percent` sets this limit.
 
 `tools/ranked-box-preflight.sh` section 8b refuses a calibration file in any of
@@ -471,10 +457,8 @@ cannot change.
 | Object | Where it lives | Can you have it? |
 |---|---|---|
 | `correctness_prompts/public_longcopy_gate_english_4096.txt` | git | Yes: the public prompt text |
-| `correctness_prompts/public-longcopy-gate-english-496.golden.json` | git | Yes: for local serial runs |
-| `correctness_prompts/public-longcopy-gate-english-496.mtp<N>.golden.json`, one per depth 1 to 6 | git | Yes: for local runs at depth N |
-| `timed_prompt_pool[]`: the 3 serial tapes that `live_goldens` (`pool-9`, `pool-10`, `pool-11`) names, three 496-token chat-template coding prompts | organizer storage, staged on the box | No |
-| `speculative_oracles{}`, 6 per-depth oracles per live golden (18 in all) | organizer storage, staged on the box | No |
+| `correctness_prompts/public-longcopy-gate-english-512.golden.json` | git | Yes: for local serial runs |
+| `timed_prompt_pool[]`: the 3 serial tapes that `live_goldens` (`pool-9`, `pool-10`, `pool-11`) names, three 512-token chat-template coding prompts | organizer storage, staged on the box | No |
 | `hidden_correctness_golden` | the default live golden's serial tape, pinned by digest | No |
 
 The organizer stages the set on each box, and the preflight checks every
@@ -507,37 +491,37 @@ file's byte count and sha256 against its pin before a ranked run. The fixture's
 
 ## 6. Running the benchmark
 
-`benchmarkCommand` runs `tools/nemotron35-yukon-run.sh`. That script selects
+`benchmarkCommand` runs `tools/muse-glimmer-yukon-run.sh`. That script selects
 one of two paths:
 
 | Condition | Path |
 |---|---|
-| `GITHUB_ACTIONS` is `true`, or one or more of `MLXFAST_NEMOTRON35_GOLDEN_DIR`, `MLXFAST_BASELINE_WORKSPACE` and `MLXFAST_BASELINE_CALIBRATION` is set | Ranked. The script replaces itself with `tools/nemotron35-measure-and-score.sh`. |
-| None of these | Local. The script runs `tools/local-baseline.sh`, which runs `./benchmark.sh --local-iterate` over the public golden at the declared depth. The result has `"score": null`. |
+| `GITHUB_ACTIONS` is `true`, or one or more of `MLXFAST_MUSE_GLIMMER_GOLDEN_DIR`, `MLXFAST_BASELINE_WORKSPACE` and `MLXFAST_BASELINE_CALIBRATION` is set | Ranked. The script replaces itself with `tools/muse-glimmer-measure-and-score.sh`. |
+| None of these | Local. The script runs `tools/local-baseline.sh`, which runs `./benchmark.sh --local-iterate` over the public serial golden. The result has `"score": null`. |
 
-The ranked workflow calls `tools/nemotron35-measure-and-score.sh` directly.
+The ranked workflow calls `tools/muse-glimmer-measure-and-score.sh` directly.
 Both scripts are trusted-side tooling.
 
 The ranked script builds one `benchd iterate --mode official` command. It
-passes one `--golden` triple (the timed golden of the declared depth) and one
-`--control-golden` triple (that prompt's serial tape) for every live golden,
-in the fixture's `live_goldens` order (`pool-9`, `pool-10`, `pool-11`), so
-pair k measures `live_goldens[k-1]`. With depth 3 declared, the shape is:
+passes one `--golden` triple (the prompt's serial tape) and one
+`--control-golden` triple (the same tape, as the control) for every live
+golden, in the fixture's `live_goldens` order (`pool-9`, `pool-10`,
+`pool-11`), so pair k measures `live_goldens[k-1]`. The shape is:
 
 ```text
 benchd iterate \
   --engine <adapter binary> --weights $MLXFAST_TARGET_SNAPSHOT_DIR \
-  --golden $GOLDEN_DIR/pool-9.mtp3.golden.json  --golden-sha256 <pin> --golden-bytes <pin> \
-  --golden $GOLDEN_DIR/pool-10.mtp3.golden.json --golden-sha256 <pin> --golden-bytes <pin> \
-  --golden $GOLDEN_DIR/pool-11.mtp3.golden.json --golden-sha256 <pin> --golden-bytes <pin> \
+  --golden $GOLDEN_DIR/pool-9.golden.json  --golden-sha256 <pin> --golden-bytes <pin> \
+  --golden $GOLDEN_DIR/pool-10.golden.json --golden-sha256 <pin> --golden-bytes <pin> \
+  --golden $GOLDEN_DIR/pool-11.golden.json --golden-sha256 <pin> --golden-bytes <pin> \
   --mode official --score-path score.json \
-  --contract fixtures/nemotron35_lightning_30b_a3b_track.json \
+  --contract fixtures/muse_glimmer_30b_cuda_v1_track.json \
   --baseline-workspace $MLXFAST_BASELINE_WORKSPACE \
   --baseline-calibration $MLXFAST_BASELINE_CALIBRATION \
   --control-golden $GOLDEN_DIR/pool-9.golden.json  --control-golden-sha256 <pin> --control-golden-bytes <pin> \
   --control-golden $GOLDEN_DIR/pool-10.golden.json --control-golden-sha256 <pin> --control-golden-bytes <pin> \
   --control-golden $GOLDEN_DIR/pool-11.golden.json --control-golden-sha256 <pin> --control-golden-bytes <pin> \
-  --box $RUNNER_NAME --mtp-depth 3
+  --box $RUNNER_NAME
 ```
 
 The pins come from the fixture. Do not type this command by hand to
@@ -564,7 +548,7 @@ The rest of the command surface:
   checks the arm gate and the golden pin without measuring.
 - **The ranked pipeline** is `.github/workflows/benchmark.yml`, dispatched
   only by `workflow_dispatch`. It runs on
-  `[self-hosted, Linux, ARM64, nemotron3.5-lightning-30b-a3b-cuda-v1]`, one
+  `[self-hosted, Linux, ARM64, muse-glimmer-30b-cuda-v1]`, one
   ranked run per box at a time.
 - **Sockets.** Nothing in the job may export `DS4_RESIDENT_SOCKET` or
   `BENCH_WORKER_RESIDENT_SOCKET` (benchd's names), and nothing may preset
@@ -575,12 +559,12 @@ The rest of the command surface:
 
 | Artifact | Identity |
 |---|---|
-| Target | 60 files at the pinned revision, each by bytes and sha256 (`target.files`) |
-| MTP head | `mtp.*` in `model-00052-of-00052.safetensors` |
+| Target | 14 files at the pinned revision, each by bytes and sha256 (`target.files`), 24.7 GB |
+| Speculation | none: `allowed_modes` is `[serial]` and the checkpoint ships no draft tensors |
 | Engine source | vLLM `v0.27.1` @ `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` (`vllm/VENDOR.json`) |
 | Engine image | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` |
 | Driver floor | `580.159.03` |
-| benchd | `Layr-Labs/mlxfast-bench-dev` dist commit `43a9a1642cc22c3fb2f71b9c707699cd3a9602c7`, built from source `b65af98c2a060df12f2ced849c68528b825fecdb`; `dist/linux-aarch64/benchd.manifest.json` there gives each binary's sha256 and bytes. `tools/fetch-benchd.sh` (`PINNED_SOURCE_COMMIT`) is the authority. |
+| benchd | `Layr-Labs/muse-glimmer-30b-benchd-dev` dist commit `d0500fc89cfaa339ba647a36602b028987d99c1d`, built from source `8ce0ca7821e9c882f2ff1e1cbd1e2ce561040729`; `dist/linux-aarch64/benchd.manifest.json` there gives each binary's sha256 and bytes. `tools/fetch-benchd.sh` (`PINNED_SOURCE_COMMIT`) is the authority. |
 
 ## 8. Prohibited techniques
 
@@ -591,8 +575,8 @@ catches it:
   input tokens, or carried between requests or phases, whose only possible hit
   is the harness repeating a computation. That includes turning vLLM's prefix
   caching back on, since benchd's phases replay the same prompt. It also
-  includes keeping KV or Mamba state across a `sync`, or answering from a
-  recorded stream. Bit-identical output does not make it legitimate.
+  includes keeping KV state across a `sync`, or answering from a recorded
+  stream. Bit-identical output does not make it legitimate.
   It also covers the prefill warm-up pass: the timed prefill follows one
   unmeasured prefill of the SAME prompt in the SAME phase, and each pass must
   be computed in full. Carrying anything from the warm-up pass into the timed
@@ -601,8 +585,8 @@ catches it:
 - **Timing and protocol tricks.** Timing shortcuts, protocol injection, moving
   work across the prefill/decode boundary (section 5.1.1), network access, and
   filesystem exfiltration.
-- **Format changes.** Any change to a frozen format (section 3.4) or to the MTP
-  head (section 4.2).
+- **Format changes.** Any change to a frozen format (section 3.4) or to the
+  speculation declaration (section 4.2).
 - **Out-of-surface edits.** Any change outside `editablePaths`.
 
 Input-independent work stays legal: weight repacks, precomputed shape-keyed
@@ -620,32 +604,30 @@ submission.
 
 ## 10. License
 
-The pinned checkpoint is NVIDIA's, under the OpenMDW License Agreement v1.1
-(OpenMDW-1.1) that ships with it at the pinned revision. vLLM is Apache-2.0 (`vllm/LICENSE`). This
-repository distributes no model weights.
+The pinned checkpoint is NVIDIA's, under the Apache License 2.0 that ships with
+it at the pinned revision. vLLM is Apache-2.0 (`vllm/LICENSE`). This repository
+distributes no model weights.
 
-## 11. Speculative decoding and the serial stream
+## 11. The serial stream
 
-11.1 The target decides every token. A speculative cycle commits only drafts
-equal to the target's own greedy choice, plus the target's bonus token.
+11.1 There is one mode. Every leg boots the serial path, and the target decides
+every token it emits.
 
-11.2 The verify forward runs d + 1 positions in one pass, and the serial path
-runs one. They are different kernels over the same weights. On this checkpoint
-they also quantize the activations to FP8 with scales computed over the whole
-batch, so their logits differ by more than the last bits: replayed through the
-serial engine, the reference's own MTP streams sit up to 1.6 logits below the
-serial top logit.
+11.2 The serial path is one forward over the seed, then one token per decode
+step. The reference engine and your engine run the same kernels over the same
+weights; the fixture's pinned boot settings (`engine_env`, `engine_args`,
+`deterministic_kernels`) are what keep the two numerically identical.
 
-11.3 Such a difference changes a token only where the top logits are close. BF16
-logits make exact ties common (section 5.4.1).
+11.3 BF16 logits make exact ties common (section 5.4.1). A kernel that resolves
+a tie differently changes the token, and the timed window — which requires an
+exact match — fails the run.
 
-11.4 Four consequences follow for the timed oracles:
-(a) the serial tape is the fidelity oracle for every depth (section 5.4);
-(b) the timed free-run oracle is authored under the same spec the leg replays,
-one golden per depth, so a leg is never checked against another depth's
-trajectory;
-(c) a free-run trajectory can fork from the serial one at a near-tie, which is
-why each depth has its own timed oracle and why the gate prices divergence
-rather than forbidding it;
-(d) your engine can fork from the reference's trajectory at a near-tie, and the
+11.4 Consequences:
+
+(a) the serial tape is the fidelity oracle for every leg (section 5.4);
+
+(b) there is no per-depth oracle and no speculative verify to price, because
+this track declares no other mode;
+
+(c) your engine can fork from the reference's trajectory at a near-tie, and the
 timed window then fails, because it requires an exact match (section 5.4.1).

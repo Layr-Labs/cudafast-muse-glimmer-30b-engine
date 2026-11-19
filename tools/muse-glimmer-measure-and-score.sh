@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# nemotron35-measure-and-score.sh -- benchmark.json's benchmarkCommand /
-# preSubmitCommand entry point for track nemotron3.5-lightning-30b-a3b-cuda-v1.
+# muse-glimmer-measure-and-score.sh -- benchmark.json's benchmarkCommand /
+# preSubmitCommand entry point for track muse-glimmer-30b-cuda-v1.
 #
 # It drives `benchd iterate --mode official` -- the SOLE scored path -- against
 # the track's LIVE golden. `iterate --mode official` is timed-first, spawns the
@@ -38,11 +38,11 @@
 # gate: benchd refuses, pre-GPU, to seal an official artifact unless the fixture
 # declares official_scoring_enabled: true.
 #
-# The design rationale lives in docs/nemotron35-port-notes.md section 9.
+# The design rationale lives in docs/muse-glimmer-port-notes.md section 9.
 #
 # Usage:
-#   ./tools/nemotron35-measure-and-score.sh                 # full measure + seal
-#   ./tools/nemotron35-measure-and-score.sh --preflight-only # pre-GPU dry-run, no engine
+#   ./tools/muse-glimmer-measure-and-score.sh                 # full measure + seal
+#   ./tools/muse-glimmer-measure-and-score.sh --preflight-only # pre-GPU dry-run, no engine
 #
 # Env:
 #   MLXFAST_SCORE_PATH               Where benchd seals the {score, metrics} JSON
@@ -66,7 +66,7 @@
 #   MLXFAST_LIVE_GOLDEN_CHOICE        Must be unset or empty: every job measures
 #                                     every live golden, so a drawn prompt is
 #                                     refused by name.
-#   MLXFAST_NEMOTRON35_GOLDEN_DIR         Directory holding the staged timed-pool
+#   MLXFAST_MUSE_GLIMMER_GOLDEN_DIR         Directory holding the staged timed-pool
 #                                     golden files. Each live golden is resolved
 #                                     from it as <name>.golden.json (the
 #                                     basename of the fixture entry's r2_path).
@@ -111,7 +111,7 @@ for arg in "$@"; do
   case "${arg}" in
     --preflight-only) PREFLIGHT_ONLY=1 ;;
     *)
-      echo "nemotron35-measure-and-score.sh: unrecognized argument: ${arg}" >&2
+      echo "muse-glimmer-measure-and-score.sh: unrecognized argument: ${arg}" >&2
       exit 2
       ;;
   esac
@@ -119,7 +119,7 @@ done
 
 # jq is required for reading the fixture (live_goldens + pins) and the trackId.
 if ! command -v jq >/dev/null 2>&1; then
-  echo "nemotron35-measure-and-score.sh: jq is required (it reads the fixture pins and trackId)." >&2
+  echo "muse-glimmer-measure-and-score.sh: jq is required (it reads the fixture pins and trackId)." >&2
   exit 1
 fi
 
@@ -139,15 +139,15 @@ if [[ -z "${BENCHD:-}" ]]; then
   BENCHD="$("${SCRIPT_DIR}/tools/fetch-benchd.sh")"
 fi
 if [[ ! -x "${BENCHD}" ]]; then
-  echo "nemotron35-measure-and-score.sh: benchd not found at ${BENCHD}." >&2
+  echo "muse-glimmer-measure-and-score.sh: benchd not found at ${BENCHD}." >&2
   echo "  fetch it: ./tools/fetch-benchd.sh   (resolves the dist channel, verifies the manifest)" >&2
   echo "  or set BENCHD to an existing binary." >&2
   exit 1
 fi
 
-CONTRACT="${SCRIPT_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+CONTRACT="${SCRIPT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 if [[ ! -f "${CONTRACT}" ]]; then
-  echo "nemotron35-measure-and-score.sh: track contract fixture missing: ${CONTRACT}" >&2
+  echo "muse-glimmer-measure-and-score.sh: track contract fixture missing: ${CONTRACT}" >&2
   exit 1
 fi
 
@@ -160,11 +160,11 @@ fi
 # refused here rather than silently overridden.
 MANIFEST_TRACK_ID="$(jq -r '.trackId // empty' "${SCRIPT_DIR}/benchmark.json" 2>/dev/null || true)"
 if [[ -z "${MANIFEST_TRACK_ID}" ]]; then
-  echo "nemotron35-measure-and-score.sh: benchmark.json carries no trackId; benchd iterate requires MLXFAST_QWEN_MTP_TRACK_ID and this script will not guess one." >&2
+  echo "muse-glimmer-measure-and-score.sh: benchmark.json carries no trackId; benchd iterate requires MLXFAST_QWEN_MTP_TRACK_ID and this script will not guess one." >&2
   exit 1
 fi
 if [[ -n "${MLXFAST_QWEN_MTP_TRACK_ID:-}" && "${MLXFAST_QWEN_MTP_TRACK_ID}" != "${MANIFEST_TRACK_ID}" ]]; then
-  echo "nemotron35-measure-and-score.sh: MLXFAST_QWEN_MTP_TRACK_ID is set to '${MLXFAST_QWEN_MTP_TRACK_ID}' but benchmark.json trackId is '${MANIFEST_TRACK_ID}'; the track id is ONE value and this script will not override either." >&2
+  echo "muse-glimmer-measure-and-score.sh: MLXFAST_QWEN_MTP_TRACK_ID is set to '${MLXFAST_QWEN_MTP_TRACK_ID}' but benchmark.json trackId is '${MANIFEST_TRACK_ID}'; the track id is ONE value and this script will not override either." >&2
   exit 1
 fi
 export MLXFAST_QWEN_MTP_TRACK_ID="${MANIFEST_TRACK_ID}"
@@ -186,7 +186,7 @@ export MLXFAST_QWEN_MTP_TRACK_ID="${MANIFEST_TRACK_ID}"
 # handed in by the workflow (MLXFAST_LIVE_GOLDEN_CHOICE) is refused: it would
 # name one prompt where the run measures all of them.
 if [[ -n "${MLXFAST_LIVE_GOLDEN_CHOICE:-}" ]]; then
-  echo "nemotron35-measure-and-score.sh: MLXFAST_LIVE_GOLDEN_CHOICE='${MLXFAST_LIVE_GOLDEN_CHOICE}' is set, but every job measures every live golden ($(jq -c '.live_goldens' "${CONTRACT}")); refusing." >&2
+  echo "muse-glimmer-measure-and-score.sh: MLXFAST_LIVE_GOLDEN_CHOICE='${MLXFAST_LIVE_GOLDEN_CHOICE}' is set, but every job measures every live golden ($(jq -c '.live_goldens' "${CONTRACT}")); refusing." >&2
   exit 1
 fi
 LIVE_GOLDEN_NAMES=()
@@ -194,7 +194,7 @@ while IFS= read -r name; do
   LIVE_GOLDEN_NAMES+=("${name}")
 done < <(jq -r '(.live_goldens // [])[]' "${CONTRACT}")
 if [[ ${#LIVE_GOLDEN_NAMES[@]} -eq 0 ]]; then
-  echo "nemotron35-measure-and-score.sh: fixture declares no live_goldens; there is no golden to score over." >&2
+  echo "muse-glimmer-measure-and-score.sh: fixture declares no live_goldens; there is no golden to score over." >&2
   exit 1
 fi
 
@@ -229,7 +229,7 @@ for name in "${LIVE_GOLDEN_NAMES[@]}"; do
   pool_entry="$(jq -c --arg base "/${serial_base}" \
     'first(.timed_prompt_pool[] | select(.r2_path | endswith($base)))' "${CONTRACT}")"
   if [[ -z "${pool_entry}" || "${pool_entry}" == "null" ]]; then
-    echo "nemotron35-measure-and-score.sh: live golden '${name}' has no timed_prompt_pool entry (looked for an r2_path ending in /${serial_base})." >&2
+    echo "muse-glimmer-measure-and-score.sh: live golden '${name}' has no timed_prompt_pool entry (looked for an r2_path ending in /${serial_base})." >&2
     exit 1
   fi
   serial_sha="$(printf '%s' "${pool_entry}" | jq -r '.sha256 // empty')"
@@ -238,7 +238,7 @@ for name in "${LIVE_GOLDEN_NAMES[@]}"; do
   if [[ "${SPEC_DESC}" != "serial" ]]; then
     spec_entry="$(jq -c --arg n "${name}" --arg k "${SPEC_DESC}" '.speculative_oracles[$n][$k] // empty' "${CONTRACT}")"
     if [[ -z "${spec_entry}" || "${spec_entry}" == "null" ]]; then
-      echo "nemotron35-measure-and-score.sh: declared spec '${SPEC_DESC}' has no speculative_oracles['${name}'] entry in ${CONTRACT}; no timed oracle is authored for that prompt at that draft depth. Refusing rather than scoring it against the serial oracle." >&2
+      echo "muse-glimmer-measure-and-score.sh: declared spec '${SPEC_DESC}' has no speculative_oracles['${name}'] entry in ${CONTRACT}; no timed oracle is authored for that prompt at that draft depth. Refusing rather than scoring it against the serial oracle." >&2
       exit 1
     fi
     timed_base="$(printf '%s' "${spec_entry}" | jq -r '.r2_path // empty')"
@@ -246,15 +246,15 @@ for name in "${LIVE_GOLDEN_NAMES[@]}"; do
     timed_sha="$(printf '%s' "${spec_entry}" | jq -r '.sha256 // empty')"
     timed_bytes="$(printf '%s' "${spec_entry}" | jq -r '.bytes // empty')"
     if [[ -z "${timed_base}" || "${timed_base}" != *.golden.json ]]; then
-      echo "nemotron35-measure-and-score.sh: speculative_oracles['${name}']['${SPEC_DESC}'] names no *.golden.json (r2_path='${timed_base}')." >&2
+      echo "muse-glimmer-measure-and-score.sh: speculative_oracles['${name}']['${SPEC_DESC}'] names no *.golden.json (r2_path='${timed_base}')." >&2
       exit 1
     fi
-    echo "nemotron35-measure-and-score.sh: declared spec ${SPEC_DESC}; timed oracle for ${name} is ${timed_base} (sha256 ${timed_sha}, ${timed_bytes} bytes)" >&2
+    echo "muse-glimmer-measure-and-score.sh: declared spec ${SPEC_DESC}; timed oracle for ${name} is ${timed_base} (sha256 ${timed_sha}, ${timed_bytes} bytes)" >&2
   fi
   for pin in "${serial_sha} ${serial_bytes}" "${timed_sha} ${timed_bytes}"; do
     if ! printf '%s' "${pin% *}" | grep -Eq '^[0-9a-f]{64}$' \
       || ! printf '%s' "${pin#* }" | grep -Eq '^[1-9][0-9]*$'; then
-      echo "nemotron35-measure-and-score.sh: live golden '${name}' is unarmed or malformed (pin '${pin}'); nothing can be pin-verified against it." >&2
+      echo "muse-glimmer-measure-and-score.sh: live golden '${name}' is unarmed or malformed (pin '${pin}'); nothing can be pin-verified against it." >&2
       exit 1
     fi
   done
@@ -266,9 +266,9 @@ for name in "${LIVE_GOLDEN_NAMES[@]}"; do
   SERIAL_GOLDEN_BYTES_LIST+=("${serial_bytes}")
 done
 
-# The goldens are box-only, staged out of band into MLXFAST_NEMOTRON35_GOLDEN_DIR
+# The goldens are box-only, staged out of band into MLXFAST_MUSE_GLIMMER_GOLDEN_DIR
 # and pin-verified by tools/ranked-box-preflight.sh.
-GOLDEN_DIR="${MLXFAST_NEMOTRON35_GOLDEN_DIR:-}"
+GOLDEN_DIR="${MLXFAST_MUSE_GLIMMER_GOLDEN_DIR:-}"
 
 # ---------------------------------------------------------------------------
 # --preflight-only: a pre-GPU DRY RUN that exercises the arm gate and (when the
@@ -283,11 +283,11 @@ if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
   # dry-run honest rather than a rubber stamp.
   armed="$(jq -r '.official_scoring_enabled // false' "${CONTRACT}")"
   if [[ "${armed}" != "true" ]]; then
-    echo "nemotron35-measure-and-score.sh: preflight REFUSING -- fixtures/nemotron35_lightning_30b_a3b_track.json does not declare official_scoring_enabled: true (got '${armed}')." >&2
+    echo "muse-glimmer-measure-and-score.sh: preflight REFUSING -- fixtures/muse_glimmer_30b_cuda_v1_track.json does not declare official_scoring_enabled: true (got '${armed}')." >&2
     echo "  benchd refuses to seal an official scoring artifact for an unarmed track; this dry-run mirrors that refusal." >&2
     exit 1
   fi
-  echo "nemotron35-measure-and-score.sh: preflight -- arm gate OK (official_scoring_enabled: true), live goldens ${LIVE_GOLDEN_NAMES[*]}" >&2
+  echo "muse-glimmer-measure-and-score.sh: preflight -- arm gate OK (official_scoring_enabled: true), live goldens ${LIVE_GOLDEN_NAMES[*]}" >&2
 
   # INTEGRITY PIN: for each staged live golden, validate-golden re-verifies its
   # raw bytes against the pin AND load-validates it (reference-model pin from
@@ -301,7 +301,7 @@ if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
         --golden-bytes "${GOLDEN_BYTES_LIST[$i]}" \
         --contract "${CONTRACT}"
     else
-      echo "nemotron35-measure-and-score.sh: preflight -- live golden not staged (MLXFAST_NEMOTRON35_GOLDEN_DIR unset or ${GOLDEN_BASENAMES[$i]} absent); benchd re-verifies the {sha256, bytes} pin on the real run." >&2
+      echo "muse-glimmer-measure-and-score.sh: preflight -- live golden not staged (MLXFAST_MUSE_GLIMMER_GOLDEN_DIR unset or ${GOLDEN_BASENAMES[$i]} absent); benchd re-verifies the {sha256, bytes} pin on the real run." >&2
     fi
   done
   exit 0
@@ -315,21 +315,21 @@ fi
 BASELINE_WORKSPACE="${MLXFAST_BASELINE_WORKSPACE:-}"
 BASELINE_CALIBRATION="${MLXFAST_BASELINE_CALIBRATION:-}"
 if [[ -z "${BASELINE_WORKSPACE}" ]]; then
-  echo "nemotron35-measure-and-score.sh: MLXFAST_BASELINE_WORKSPACE is unset." >&2
+  echo "muse-glimmer-measure-and-score.sh: MLXFAST_BASELINE_WORKSPACE is unset." >&2
   echo "  The scored path is PAIRED: the serial-control leg runs on the staged reference tree at the fixture's baseline_reference_commit. Stage it with tools/stage-baseline-workspace.sh and export the path. Refusing rather than scoring against a stored pair." >&2
   exit 1
 fi
 if [[ ! -d "${BASELINE_WORKSPACE}" ]]; then
-  echo "nemotron35-measure-and-score.sh: MLXFAST_BASELINE_WORKSPACE=${BASELINE_WORKSPACE} is not a directory." >&2
+  echo "muse-glimmer-measure-and-score.sh: MLXFAST_BASELINE_WORKSPACE=${BASELINE_WORKSPACE} is not a directory." >&2
   exit 1
 fi
 if [[ -z "${BASELINE_CALIBRATION}" ]]; then
-  echo "nemotron35-measure-and-score.sh: MLXFAST_BASELINE_CALIBRATION is unset." >&2
+  echo "muse-glimmer-measure-and-score.sh: MLXFAST_BASELINE_CALIBRATION is unset." >&2
   echo "  Every ranked box carries its own calibration file -- the health band the serial-control leg must land inside. Calibrate this box with tools/calibrate-box.sh and export the path." >&2
   exit 1
 fi
 if [[ ! -f "${BASELINE_CALIBRATION}" ]]; then
-  echo "nemotron35-measure-and-score.sh: MLXFAST_BASELINE_CALIBRATION=${BASELINE_CALIBRATION} is not a file." >&2
+  echo "muse-glimmer-measure-and-score.sh: MLXFAST_BASELINE_CALIBRATION=${BASELINE_CALIBRATION} is not a file." >&2
   exit 1
 fi
 
@@ -339,7 +339,7 @@ fi
 # serial whatever the candidate declares. So it is refused here as well as in
 # tools/ranked-box-preflight.sh section 7.
 if [[ -n "${SERVE_UP_SPECULATIVE:-}" ]]; then
-  echo "nemotron35-measure-and-score.sh: SERVE_UP_SPECULATIVE=${SERVE_UP_SPECULATIVE} is preset in the environment; on the paired path it would reach the serial-control leg's serve too, and that leg is serial regardless of the candidate's declaration." >&2
+  echo "muse-glimmer-measure-and-score.sh: SERVE_UP_SPECULATIVE=${SERVE_UP_SPECULATIVE} is preset in the environment; on the paired path it would reach the serial-control leg's serve too, and that leg is serial regardless of the candidate's declaration." >&2
   exit 1
 fi
 
@@ -352,7 +352,7 @@ fi
 for var in DS4_RESIDENT_SOCKET BENCH_WORKER_RESIDENT_SOCKET; do
   eval "value=\${${var}:-}"
   if [[ -n "${value}" ]]; then
-    echo "nemotron35-measure-and-score.sh: ${var}=${value} is set in the environment; benchd boots each leg's resident and injects its socket, so an inherited one would point both legs' workers at a resident neither leg booted." >&2
+    echo "muse-glimmer-measure-and-score.sh: ${var}=${value} is set in the environment; benchd boots each leg's resident and injects its socket, so an inherited one would point both legs' workers at a resident neither leg booted." >&2
     exit 1
   fi
 done
@@ -360,9 +360,9 @@ done
 # A REAL RUN needs every staged live golden.
 if [[ -z "${GOLDEN_DIR}" || ! -d "${GOLDEN_DIR}" ]]; then
   cat >&2 <<EOF
-nemotron35-measure-and-score.sh: MLXFAST_NEMOTRON35_GOLDEN_DIR is unset or missing.
+muse-glimmer-measure-and-score.sh: MLXFAST_MUSE_GLIMMER_GOLDEN_DIR is unset or missing.
   The live goldens (${GOLDEN_BASENAMES[*]}) are staged onto the box out of band
-  (docs/nemotron35-port-notes.md section 7) and this job holds no credential
+  (docs/muse-glimmer-port-notes.md section 7) and this job holds no credential
   to fetch them. There is nothing this script can do here except refuse.
 EOF
   exit 1
@@ -370,8 +370,8 @@ fi
 GOLDEN_ARGS=()
 for i in "${!GOLDEN_BASENAMES[@]}"; do
   if [[ ! -f "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" ]]; then
-    echo "nemotron35-measure-and-score.sh: live golden not found at ${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" >&2
-    echo "  live_goldens names '${LIVE_GOLDEN_NAMES[$i]}' (fixtures/nemotron35_lightning_30b_a3b_track.json); stage ${GOLDEN_BASENAMES[$i]} into MLXFAST_NEMOTRON35_GOLDEN_DIR." >&2
+    echo "muse-glimmer-measure-and-score.sh: live golden not found at ${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" >&2
+    echo "  live_goldens names '${LIVE_GOLDEN_NAMES[$i]}' (fixtures/muse_glimmer_30b_cuda_v1_track.json); stage ${GOLDEN_BASENAMES[$i]} into MLXFAST_MUSE_GLIMMER_GOLDEN_DIR." >&2
     exit 1
   fi
   GOLDEN_ARGS+=(--golden "${GOLDEN_DIR}/${GOLDEN_BASENAMES[$i]}" --golden-sha256 "${GOLDEN_SHA256S[$i]}" --golden-bytes "${GOLDEN_BYTES_LIST[$i]}")
@@ -383,7 +383,7 @@ done
 # self-sufficient; MLXFAST_ENGINE_BIN overrides it for engine development.
 ENGINE_BIN="${MLXFAST_ENGINE_BIN:-${SCRIPT_DIR}/.build/release/mlxfast-runtime-worker}"
 if [[ ! -x "${ENGINE_BIN}" ]]; then
-  echo "nemotron35-measure-and-score.sh: engine binary missing or not executable: ${ENGINE_BIN}" >&2
+  echo "muse-glimmer-measure-and-score.sh: engine binary missing or not executable: ${ENGINE_BIN}" >&2
   echo "  build + stage it (./setup.sh, or tools/stage-cuda-engine.sh), or set MLXFAST_ENGINE_BIN." >&2
   exit 1
 fi
@@ -391,7 +391,7 @@ fi
 SANDBOX_WRAPPER="${SCRIPT_DIR}/tools/run-engine-sandboxed.sh"
 if [[ -n "${SANDBOX_USER:-}" ]]; then
   if [[ ! -x "${SANDBOX_WRAPPER}" ]]; then
-    echo "nemotron35-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but the engine wrapper is missing or not executable: ${SANDBOX_WRAPPER}" >&2
+    echo "muse-glimmer-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but the engine wrapper is missing or not executable: ${SANDBOX_WRAPPER}" >&2
     exit 1
   fi
   # The staged engine must be exactly the shim stage-cuda-engine.sh writes, and
@@ -402,22 +402,22 @@ if [[ -n "${SANDBOX_USER:-}" ]]; then
   real_engine="$(cd "$(dirname -- "${ENGINE_BIN}")" && pwd -P)/$(basename -- "${ENGINE_BIN}").sandboxed"
   expected_shim="$("${SCRIPT_DIR}/tools/stage-cuda-engine.sh" --print-shim)" || exit 1
   if [[ -L "${ENGINE_BIN}" || "$(cat -- "${ENGINE_BIN}" 2>/dev/null)" != "${expected_shim}" ]]; then
-    echo "nemotron35-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but ${ENGINE_BIN} is not the sandbox shim; stage it with SANDBOX_USER set (tools/engine/build.sh)." >&2
+    echo "muse-glimmer-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but ${ENGINE_BIN} is not the sandbox shim; stage it with SANDBOX_USER set (tools/engine/build.sh)." >&2
     exit 1
   fi
   if [[ -L "${real_engine}" || ! -f "${real_engine}" || ! -x "${real_engine}" ]]; then
-    echo "nemotron35-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but the sandboxed adapter is missing or not a regular executable file: ${real_engine}" >&2
+    echo "muse-glimmer-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but the sandboxed adapter is missing or not a regular executable file: ${real_engine}" >&2
     exit 1
   fi
   if ! command -v sudo >/dev/null 2>&1; then
-    echo "nemotron35-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but sudo is not on PATH." >&2
+    echo "muse-glimmer-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but sudo is not on PATH." >&2
     exit 1
   fi
   if ! sudo -n -u "${SANDBOX_USER}" -- true 2>/dev/null; then
-    echo "nemotron35-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but passwordless sudo to that user is unusable (docs/sandbox-design.md section 6a)." >&2
+    echo "muse-glimmer-measure-and-score.sh: SANDBOX_USER=${SANDBOX_USER} but passwordless sudo to that user is unusable (docs/sandbox-design.md section 6a)." >&2
     exit 1
   fi
-  echo "nemotron35-measure-and-score.sh: candidate leg engine ${ENGINE_BIN} is the sandbox shim (adapter ${real_engine} as ${SANDBOX_USER})" >&2
+  echo "muse-glimmer-measure-and-score.sh: candidate leg engine ${ENGINE_BIN} is the sandbox shim (adapter ${real_engine} as ${SANDBOX_USER})" >&2
 fi
 
 # --weights. benchd resolves the target weights from `--weights`. Default to the
@@ -425,7 +425,7 @@ fi
 # (MLXFAST_TARGET_SNAPSHOT_DIR); MLXFAST_WEIGHTS_PATH overrides.
 WEIGHTS_PATH="${MLXFAST_WEIGHTS_PATH:-${MLXFAST_TARGET_SNAPSHOT_DIR:-}}"
 if [[ -z "${WEIGHTS_PATH}" || ! -d "${WEIGHTS_PATH}" ]]; then
-  echo "nemotron35-measure-and-score.sh: the target weights directory is missing or unset: '${WEIGHTS_PATH}'" >&2
+  echo "muse-glimmer-measure-and-score.sh: the target weights directory is missing or unset: '${WEIGHTS_PATH}'" >&2
   echo "  Set MLXFAST_TARGET_SNAPSHOT_DIR to the on-box target snapshot (./setup.sh verifies it), or MLXFAST_WEIGHTS_PATH to override." >&2
   exit 1
 fi
@@ -455,14 +455,14 @@ if "${BENCHD}" iterate --help 2>&1 | grep -q -- '--control-golden'; then
   for i in "${!SERIAL_GOLDEN_BASENAMES[@]}"; do
     control_path="${GOLDEN_DIR}/${SERIAL_GOLDEN_BASENAMES[$i]}"
     if [[ ! -f "${control_path}" ]]; then
-      echo "nemotron35-measure-and-score.sh: serial golden not found at ${control_path}; the serial-control leg has no tape to verify against." >&2
+      echo "muse-glimmer-measure-and-score.sh: serial golden not found at ${control_path}; the serial-control leg has no tape to verify against." >&2
       exit 1
     fi
     CONTROL_ARGS+=(--control-golden "${control_path}" --control-golden-sha256 "${SERIAL_GOLDEN_SHA256S[$i]}" --control-golden-bytes "${SERIAL_GOLDEN_BYTES_LIST[$i]}")
-    echo "nemotron35-measure-and-score.sh: serial-control leg for ${LIVE_GOLDEN_NAMES[$i]} verifies against ${SERIAL_GOLDEN_BASENAMES[$i]} (sha256 ${SERIAL_GOLDEN_SHA256S[$i]}, ${SERIAL_GOLDEN_BYTES_LIST[$i]} bytes)" >&2
+    echo "muse-glimmer-measure-and-score.sh: serial-control leg for ${LIVE_GOLDEN_NAMES[$i]} verifies against ${SERIAL_GOLDEN_BASENAMES[$i]} (sha256 ${SERIAL_GOLDEN_SHA256S[$i]}, ${SERIAL_GOLDEN_BYTES_LIST[$i]} bytes)" >&2
   done
 elif [[ "${SPEC_DESC}" != "serial" ]]; then
-  echo "nemotron35-measure-and-score.sh: REFUSING -- the declaration is ${SPEC_DESC} but this benchd has no --control-golden; the serial-control leg would be verified against the ${SPEC_DESC} tape." >&2
+  echo "muse-glimmer-measure-and-score.sh: REFUSING -- the declaration is ${SPEC_DESC} but this benchd has no --control-golden; the serial-control leg would be verified against the ${SPEC_DESC} tape." >&2
   exit 1
 fi
 iterate_official=(
@@ -495,9 +495,9 @@ if [[ "${SPEC_DESC}" != "serial" ]]; then
   DECLARED_DEPTH="$("${SCRIPT_DIR}/tools/spec-declaration.sh" draft-len)"
   if "${BENCHD}" iterate --help 2>&1 | grep -q -- '--mtp-depth'; then
     iterate_official+=( --mtp-depth "${DECLARED_DEPTH}" )
-    echo "nemotron35-measure-and-score.sh: benchd will request the declared spec (--mtp-depth ${DECLARED_DEPTH})" >&2
+    echo "muse-glimmer-measure-and-score.sh: benchd will request the declared spec (--mtp-depth ${DECLARED_DEPTH})" >&2
   else
-    echo "nemotron35-measure-and-score.sh: the pinned benchd does not accept --mtp-depth, so it cannot request the declared ${SPEC_DESC} leg; refusing rather than measuring a serial leg against the ${SPEC_DESC} oracle" >&2
+    echo "muse-glimmer-measure-and-score.sh: the pinned benchd does not accept --mtp-depth, so it cannot request the declared ${SPEC_DESC} leg; refusing rather than measuring a serial leg against the ${SPEC_DESC} oracle" >&2
     exit 1
   fi
 fi
@@ -643,7 +643,7 @@ sandbox_reset_shared() {
     sleep 0.5
   done
   if [[ -n "${left// /}" ]]; then
-    echo "nemotron35-measure-and-score.sh: ${SANDBOX_USER} processes survived kill -KILL -1: ${left}" >&2
+    echo "muse-glimmer-measure-and-score.sh: ${SANDBOX_USER} processes survived kill -KILL -1: ${left}" >&2
     return 1
   fi
   "${SCRIPT_DIR}/tools/sandbox-wipe.sh" || return 1
@@ -665,7 +665,7 @@ clear_sandbox_job_dirs() {
     find -P "${sub}" -mindepth 1 -delete >/dev/null 2>&1 || true
     count="$(find -P "${sub}" -mindepth 1 -printf . 2>/dev/null | wc -c)" || return 1
     if (( count != 0 )); then
-      echo "nemotron35-measure-and-score.sh: sandbox job subdirectory ${name} is not empty after cleanup ($((count)) leftover entries)" >&2
+      echo "muse-glimmer-measure-and-score.sh: sandbox job subdirectory ${name} is not empty after cleanup ($((count)) leftover entries)" >&2
       return 1
     fi
   done
@@ -693,24 +693,24 @@ fi
 run_attempt || rc=$?
 if [[ "${rc}" -ne 0 ]] && measurement_retry_warranted; then
   if control_leg_diverged; then
-    echo "nemotron35-measure-and-score.sh: attempt 1 DISCARDED, the serial control leg diverged: $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
+    echo "muse-glimmer-measure-and-score.sh: attempt 1 DISCARDED, the serial control leg diverged: $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
   elif pair1_serial_control_boot_failed; then
-    echo "nemotron35-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 serial-control resident did not boot (no pair timing sealed): $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
+    echo "muse-glimmer-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 serial-control resident did not boot (no pair timing sealed): $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
   else
-    echo "nemotron35-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 candidate resident did not boot (no candidate timing sealed): $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
+    echo "muse-glimmer-measure-and-score.sh: attempt 1 DISCARDED, the pair-1 candidate resident did not boot (no candidate timing sealed): $(jq -r '.metrics.error' "${SCORE_PATH}")" >&2
   fi
   if ! between_attempts; then
     echo "::error title=Measurement retry teardown failed::the box could not be reset after a retriable infrastructure failure; infrastructure outcome, not a submission failure" >&2
     exit 75
   fi
-  echo "nemotron35-measure-and-score.sh: re-running the whole measurement once (attempt 2 of 2)" >&2
+  echo "muse-glimmer-measure-and-score.sh: re-running the whole measurement once (attempt 2 of 2)" >&2
   attempts=2
   rc=0
   run_attempt || rc=$?
 fi
 cat -- "${HELD}/stdout"
 if [[ -f "${HELD}/marker" ]]; then cat -- "${HELD}/marker" >&2; fi
-echo "nemotron35-measure-and-score.sh: control_leg_attempts=${attempts}" >&2
+echo "muse-glimmer-measure-and-score.sh: control_leg_attempts=${attempts}" >&2
 if [[ "${rc}" -ne 0 && "${attempts}" -eq 2 ]] && control_leg_diverged; then
   echo "::error title=Serial control leg diverged twice::infrastructure outcome, not a submission failure; re-dispatch this job" >&2
   exit 75

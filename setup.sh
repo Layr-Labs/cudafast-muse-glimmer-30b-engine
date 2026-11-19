@@ -10,7 +10,7 @@
 #      vLLM overlay (the container's compiled vLLM with vllm/vllm/ on top) and
 #      the optional kernels/. Needs cargo, docker and jq.
 #   2. verify the pinned target snapshot against the pins in
-#      fixtures/nemotron35_lightning_30b_a3b_track.json: every safetensors
+#      fixtures/muse_glimmer_30b_cuda_v1_track.json: every safetensors
 #      shard, the index, the configs and the tokenizer, byte count first, then
 #      sha256. With MLXFAST_TARGET_SNAPSHOT_DIR set (a ranked box,
 #      organizer-staged) the directory and every file must already be there:
@@ -23,7 +23,7 @@
 #
 # Environment:
 #   MLXFAST_TARGET_SNAPSHOT_DIR   the target snapshot. Set: verify only. Unset:
-#                                 reference_weights/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+#                                 reference_weights/Muse-Glimmer-30B-NVFP4
 #                                 under this checkout, which setup fills.
 #   MLXFAST_TARGET_BASE_URL       where a missing file is fetched from on the
 #                                 default path. Default: the fixture's
@@ -40,13 +40,13 @@ cd "${ROOT_DIR}"
 log() { printf 'setup.sh: %s\n' "$*"; }
 die() { printf 'setup.sh: %s\n' "$*" >&2; exit 1; }
 
-CONTRACT="${ROOT_DIR}/fixtures/nemotron35_lightning_30b_a3b_track.json"
+CONTRACT="${ROOT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
 command -v jq >/dev/null 2>&1 || die "jq is required"
 
 # The public model repository the target was pinned from, at that revision
 # (the fixture's upstream_model_id / upstream_revision). Its files are flat at
 # the repository root and the snapshot keeps them flat.
-DEFAULT_SNAPSHOT_DIR="${ROOT_DIR}/reference_weights/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+DEFAULT_SNAPSHOT_DIR="${ROOT_DIR}/reference_weights/Muse-Glimmer-30B-NVFP4"
 
 resolve_target_source() {
   # Read once, in step 2, when the default path may fetch.
@@ -181,7 +181,7 @@ else
     verified_by_marker=0
   fi
 
-  log "verifying the pinned target snapshot at ${SNAPSHOT_DIR} against fixtures/nemotron35_lightning_30b_a3b_track.json"
+  log "verifying the pinned target snapshot at ${SNAPSHOT_DIR} against fixtures/muse_glimmer_30b_cuda_v1_track.json"
   # Byte counts first (cheap, names a truncated file), then sha256 of every
   # file. The files are hashed CONCURRENTLY, one process per file, bounded by
   # MLXFAST_VERIFY_JOBS (default 8): the same digests, compared against the

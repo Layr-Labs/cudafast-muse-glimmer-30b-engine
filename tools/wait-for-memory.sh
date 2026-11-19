@@ -48,7 +48,7 @@ def read_memory(path):
 
 try:
     root = Path(sys.argv[1])
-    fixture = json.loads((root / "fixtures/nemotron35_lightning_30b_a3b_track.json").read_text())
+    fixture = json.loads((root / "fixtures/muse_glimmer_30b_cuda_v1_track.json").read_text())
     util = float(fixture["serve_configuration"]["engine_env"]["RESIDENT_GPU_MEMORY_UTILIZATION"])
     if not 0 < util <= 1:
         raise ValueError("fixture RESIDENT_GPU_MEMORY_UTILIZATION must be in (0, 1]")

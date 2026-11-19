@@ -72,10 +72,10 @@ if [ -n "${BOX_RUNNER_APP_ENV:-}" ]; then export BOX_RUNNER_APP_ENV; fi
 RUNNER_USER="${RUNNER_USER:-runner}"          # unprivileged runner account
 RUNNER_DIR="${RUNNER_DIR:-}"                  # actions-runner install, owned by RUNNER_USER
 GH_APP_MINT="${GH_APP_MINT:-${SCRIPT_DIR}/gh-app-mint.sh}"
-RUNNER_NAME_PREFIX="${RUNNER_NAME_PREFIX:-nemotron35-box}"
+RUNNER_NAME_PREFIX="${RUNNER_NAME_PREFIX:-muse-glimmer-box}"
 # NO DEFAULT. Must equal (a subset of) the `runs-on:` labels in
 # .github/workflows/benchmark.yml, today
-# `[self-hosted, Linux, ARM64, nemotron3.5-lightning-30b-a3b-cuda-v1]` (gh-app-mint.sh adds
+# `[self-hosted, Linux, ARM64, muse-glimmer-30b-cuda-v1]` (gh-app-mint.sh adds
 # `self-hosted` itself). A wrong or missing value silently strands every job
 # dispatched against this runner rather than failing loudly at dispatch time,
 # so this refuses to start instead of guessing.

@@ -1,8 +1,8 @@
-# Nemotron 3.5 Lightning on DGX Spark: inference speed challenge
+# Muse Glimmer 30B NVFP4 on DGX Spark: inference speed challenge
 
-A ranked engineering challenge: make NVIDIA's
-`Nemotron-3.5-Lightning-30B-A3B-NVFP4` prefill and decode faster on a DGX Spark,
-single stream, without changing what the model computes.
+A ranked engineering challenge: make NVIDIA's `Muse-Glimmer-30B-NVFP4`
+prefill and decode faster on a DGX Spark, single stream, without changing what
+the model computes.
 
 **[Overview](OVERVIEW.md)** · **[Task and rules](TASK.md)** ·
 **[Participant contract](docs/participant-contract.md)** ·
@@ -13,14 +13,14 @@ single stream, without changing what the model computes.
 
 | | |
 |---|---|
-| **Model** | [`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4), pinned by revision and per-file sha256 |
+| **Model** | [`nvidia/Muse-Glimmer-30B-NVFP4`](https://huggingface.co/nvidia/Muse-Glimmer-30B-NVFP4), pinned by revision and per-file sha256 |
 | **Hardware** | NVIDIA DGX Spark (GB10, sm_121, 128 GB unified memory) |
-| **Engine** | vLLM v0.27.1 in a pinned container; teams edit `vllm/`, `harness/` and the speculation depth |
+| **Engine** | vLLM v0.27.1 in a pinned container; teams edit `vllm/` and `harness/` |
 | **Score** | `prefill_gain^0.25 × decode_gain^0.75`, each gain measured against a trusted reference run on the same box, same prompt, same job |
-| **Correctness** | output must match the reference golden within a 10% token budget; the timed decode window must match its per-depth oracle exactly |
-| **Fairness** | run-to-run spread is small: the unchanged engine (MTP 3) scores 1.314 on average, sd 0.004 (11 runs, 3 boxes, 2026-10-20); the reference against itself scored 0.996, sd 0.005 (September soak, 8 boxes) |
+| **Correctness** | output must match the reference golden token for token: the token-tolerance budget is `0.0` |
+| **Fairness** | run-to-run spread is small: the engine base's reference against itself scored 0.996, sd 0.005 (8-box soak of the base engine); this track's null control is measured at CUDA-L12 |
 | **Integrity** | sandboxed, network-less execution; hidden prompts rotated every 3–4 days; final ranking re-measured on a held-out pool |
-| **Track** | `nemotron3.5-lightning-30b-a3b-cuda-v1` |
+| **Track** | `muse-glimmer-30b-cuda-v1` |
 
 [OVERVIEW.md](OVERVIEW.md) explains each of these in one page: how scoring
 works, what prevents cheating, and how the system was tested.
@@ -91,8 +91,8 @@ come from crates.io, and are vendored before an offline build; `build.sh` may
 write only to `$KERNELS_OUT`. [The contract, section
 3.6](docs/participant-contract.md#36-where-your-code-runs) lists the rules.
 
-The snapshot step downloads the 60 pinned files (about 21.6 GB) into
-`reference_weights/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4/`. Each file
+The snapshot step downloads the 14 pinned files (about 24.7 GB) into
+`reference_weights/Muse-Glimmer-30B-NVFP4/`. Each file
 must match its pinned byte count and sha256. On a ranked box the snapshot is
 pre-staged and named by `MLXFAST_TARGET_SNAPSHOT_DIR`, and `setup.sh` only
 verifies it.
@@ -101,13 +101,11 @@ verifies it.
 ./tools/local-baseline.sh
 ```
 
-This command boots a resident for your declared depth. It then runs benchd's
-local-iterate leg over the public golden of that depth, which the organizer
-recorded on a Spark: `correctness_prompts/public-longcopy-gate-english-496.golden.json`
-for serial, `correctness_prompts/public-longcopy-gate-english-496.mtp<N>.golden.json`
-for depth N. On this engine a depth-N run takes another token path than the
-serial run, so each depth has its own golden. A local run seals `score: null`:
-only the paired ranked path produces a score.
+This command boots a serial resident and runs benchd's local-iterate leg over
+the public golden, which the organizer recorded on a Spark:
+`correctness_prompts/public-longcopy-gate-english-512.golden.json`. The track
+is serial only, so one golden covers every local run. A local run seals
+`score: null`: only the paired ranked path produces a score.
 
 ```bash
 yukon setup
@@ -134,15 +132,15 @@ python3 -m unittest discover -s harness/vllm_resident -v
 
 These commands test the adapter against its mock engine, and the resident's
 wire and bookkeeping against a fake backend. `test_adapter_e2e` drives the real
-adapter binary against the real resident at every depth from 0 to 6.
+adapter binary against the real resident on the serial path.
 
 ```bash
 tools/three-flows-dry-run.sh
 ```
 
 This command runs the real benchd binaries (the pinned `main` channel) over the
-same fake resident. It covers golden authoring, a local leg at serial and at an
-MTP depth, and the paired lifecycle.
+same fake resident. It covers golden authoring, a local serial leg and the
+paired lifecycle.
 
 ## Repository structure
 
@@ -152,8 +150,8 @@ MTP depth, and the paired lifecycle.
 | `harness/protocol-adapter/` | editable | Engine Protocol v1 adapter (Rust) |
 | `harness/vllm_resident/` | editable | the resident: `resident.py` (wire, bookkeeping), `backends.py` (vLLM + fake) |
 | `harness/kernels/` | editable, optional | custom CUDA/C++ kernels built by `harness/kernels/build.sh` |
-| `mtp-head.manifest.json` | editable | the speculative-decoding declaration |
-| `fixtures/nemotron35_lightning_30b_a3b_track.json` | trusted | the track contract: pins, engine configuration, depths, scoring semantics |
+| `mtp-head.manifest.json` | editable | the speculation declaration; on this serial-only track it must stay `"source": "none"` |
+| `fixtures/muse_glimmer_30b_cuda_v1_track.json` | trusted | the track contract: pins, engine configuration, serve depths, scoring semantics |
 | `benchmark.json` | trusted | editable paths, commands, byte budget, scoring constants |
 | `setup.sh`, `benchmark.sh`, `tools/` | trusted | build, serve, preflight, measure, calibrate, stage, organizer tools |
 | `correctness_prompts/` | trusted | the public prompt text and the public golden |
@@ -177,17 +175,17 @@ yukon login <api-key> --api <url>
 This command authenticates you.
 
 ```bash
-yukon clone cudafast-nemotron35-lightning-30b-a3b
+yukon clone cudafast-muse-glimmer-30b
 ```
 
 This command clones the benchmark repository.
 
 Before you submit, remove build artifacts from the editable paths. The archive
 packages `vllm/`, `harness/` and `mtp-head.manifest.json` as they sit on disk.
-The unchanged editable surface is 35,021,070 bytes; the byte budget
-(`editableSurfaceByteBudget.maxTotalBytes` in `benchmark.json`) is 36,047,190
+The unchanged editable surface on this tree is 35,168,624 bytes; the byte budget
+(`editableSurfaceByteBudget.maxTotalBytes` in `benchmark.json`) is 41,943,040
 bytes. A stale adapter `target/` tree or a `__pycache__/` directory uses that
-room and count against the budget.
+room and counts against the budget.
 
 ```bash
 cargo clean --manifest-path harness/protocol-adapter/Cargo.toml
@@ -219,12 +217,12 @@ run blocks the upload. Run `yukon run` yourself before you submit.
 
 | Artifact | Pin |
 |---|---|
-| Target | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` @ `bee7596271d1495f6992ae224aefde4410e816b8`, 60 files by bytes + sha256 |
-| MTP head | the `mtp.*` tensors inside `model-00052-of-00052.safetensors` (BF16, 2,670,652,160 bytes) |
+| Target | `nvidia/Muse-Glimmer-30B-NVFP4` @ `47818374517751c48c55cde2621594926b1888b6`, 14 files by bytes + sha256 (24.7 GB) |
+| Speculation | none: the checkpoint ships no draft tensors and the fixture's `allowed_modes` is `[serial]` |
 | Engine source | vLLM `v0.27.1` @ `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` |
 | Engine image | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` (arm64) |
-| benchd | `Layr-Labs/mlxfast-bench-dev` dist `43a9a1642cc22c3fb2f71b9c707699cd3a9602c7`, built from source `b65af98c2a060df12f2ced849c68528b825fecdb` (`PINNED_COMMIT` and `PINNED_SOURCE_COMMIT` in `tools/fetch-benchd.sh`); the dist's `dist/linux-aarch64/benchd.manifest.json` pins each binary's sha256 and bytes |
-| Goldens | `timed_prompt_pool[]` (the 3 serial goldens that `live_goldens` names: `pool-9`, `pool-10`, `pool-11`, three 496-token chat-template coding prompts), `speculative_oracles` (18 per-depth oracles) and `hidden_correctness_golden` (the `pool-9` serial pin) in the fixture: 21 files pinned by sha256 and bytes (staged on each box, never committed; see [OVERVIEW.md](OVERVIEW.md)) |
+| benchd | `Layr-Labs/muse-glimmer-30b-benchd-dev` dist `d0500fc89cfaa339ba647a36602b028987d99c1d`, built from source `8ce0ca7821e9c882f2ff1e1cbd1e2ce561040729` (`PINNED_COMMIT` and `PINNED_SOURCE_COMMIT` in `tools/fetch-benchd.sh`); the dist's `dist/linux-aarch64/benchd.manifest.json` pins each binary's sha256 and bytes |
+| Goldens | `timed_prompt_pool[]` (the 3 serial goldens that `live_goldens` names: `pool-9`, `pool-10`, `pool-11`, three 512-token chat-template coding prompts) and the hidden correctness pin in the fixture. The pool's `sha256`/`bytes` arrive with the organizer recording (CUDA-L09); each is staged on every box and never committed (see [OVERVIEW.md](OVERVIEW.md)) |
 
 ## The ranked run
 
@@ -235,7 +233,7 @@ two jobs:
    the manifest lint and the static review of the editable surface, which
    enforces the byte budget and refuses symlinks and special files.
 2. **A `ranked` job on a self-hosted Spark** labelled
-   `[self-hosted, Linux, ARM64, nemotron3.5-lightning-30b-a3b-cuda-v1]`. It
+   `[self-hosted, Linux, ARM64, muse-glimmer-30b-cuda-v1]`. It
    runs these steps in order:
    - `tools/ranked-box-preflight.sh`
    - `./setup.sh`
@@ -243,7 +241,7 @@ two jobs:
      nothing is drawn. Every job measures every live golden, one pair per
      prompt; `score.json` identifies a golden only by its sha256.
    - under the box-wide GPU lock and a quiescence wait,
-     `tools/nemotron35-measure-and-score.sh`, which execs
+     `tools/muse-glimmer-measure-and-score.sh`, which execs
      `benchd iterate --mode official` and seals `score.json`
    - after sandbox cleanup (no participant process remains), **Reveal the
      sealed score** prints a commit-reveal block to the job log: a per-job
@@ -299,7 +297,7 @@ failure there fails the submission before any scoring.
    - Stage the snapshot and export `MLXFAST_TARGET_SNAPSHOT_DIR`.
    - Stage benchd with `tools/fetch-benchd.sh`.
 2. **Stage the goldens** on every box. The fixture pins every golden of the
-   live pool (serial golden plus six per-depth oracles per prompt);
+   live pool (one serial golden per prompt, no per-depth oracles);
    `tools/pool-refresh.sh` records, stages and pins a new generation, and
    a box is restaged from the jump box copy
    ([where the goldens live](docs/pool-refresh-and-final-rescore.md#where-the-goldens-live)).
@@ -309,7 +307,7 @@ failure there fails the submission before any scoring.
 4. **Calibrate every box** with `tools/calibrate-box.sh <runner name> <out>`
    (3 passes; the box name must be the box's runner name, which the ranked
    job passes as `--box`). Every per-prompt CV must be at most the fixture's
-   `calibration_max_cv_percent` (2%), or the file gets no band
+   `calibration_max_cv_percent` (1%), or the file gets no band
    ([reproduce, section 3](docs/reproduce.md#3-recalibrate-a-box)).
 5. **Arm the track:** set `official_scoring_enabled: true` once the null
    control lands at about 1.000 ([contract, section 5.5](docs/participant-contract.md#55-arming)).
@@ -320,7 +318,7 @@ failure there fails the submission before any scoring.
    `tools/router/` is the organizer's own dispatcher, used for load tests and
    for the final re-score (`tools/router/README.md`).
 
-[`docs/nemotron35-port-notes.md`](docs/nemotron35-port-notes.md) (the
+[`docs/muse-glimmer-port-notes.md`](docs/muse-glimmer-port-notes.md) (the
 engineering log) records the cluster verification and the load-test findings.
 
 ## Documentation
@@ -328,13 +326,13 @@ engineering log) records the cluster verification and the load-test findings.
 | Question | File |
 |---|---|
 | Editable paths, commands, scoring values | `benchmark.json` |
-| Pins, engine configuration, scoring semantics | `fixtures/nemotron35_lightning_30b_a3b_track.json` |
+| Pins, engine configuration, scoring semantics | `fixtures/muse_glimmer_30b_cuda_v1_track.json` |
 | Why the rules say what they say | `docs/participant-contract.md` |
 | The resident wire | `docs/resident.md` |
 | What CI covers | `docs/ci-coverage.md` |
 | How participant code is sandboxed on a box | `docs/sandbox-design.md` |
 | What a submission may contain, and who enforces it | `docs/submission-restriction-spec.md` |
 | Pool refresh and final re-score | `docs/pool-refresh-and-final-rescore.md` |
-| How this track was derived, and what was measured | `docs/nemotron35-port-notes.md` (engineering log) |
+| How this track was derived, and what was measured | `docs/muse-glimmer-port-notes.md` (engineering log) |
 | How to reproduce benchd, the goldens, a calibration and a ranked score | `docs/reproduce.md` |
 | What a measured run executes | benchd, resolved from the pinned channel by `tools/fetch-benchd.sh` |

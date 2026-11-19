@@ -18,7 +18,7 @@ import json, os, subprocess, sys, time
 sock, prompt_file, reps = sys.argv[1], sys.argv[2], int(sys.argv[3])
 spec = json.loads(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else None
 prompt = json.load(open(prompt_file))
-eng = os.path.expanduser("~/nemotron35/repo/.build/release/mlxfast-runtime-worker")
+eng = os.path.expanduser("~/muse-glimmer/repo/.build/release/mlxfast-runtime-worker")
 streams, dec = [], []
 for i in range(reps):
     p = subprocess.Popen([eng], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,

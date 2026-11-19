@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-# DETERMINISM (measured on GB10, docs/nemotron35-port-notes.md "Findings").
+# DETERMINISM (measured on GB10, docs/muse-glimmer-port-notes.md "Findings").
 # With vLLM's default kernels the same prompt gives different logits run to
 # run: the Marlin NVFP4 MoE is nondeterministic even on a fixed input, and this
 # checkpoint's FP8-quantized activations amplify a last-bit difference into a
@@ -106,6 +106,23 @@ class VllmConfig:
         )
 
 
+def _checkpoint_is_multimodal(model_dir: str) -> bool:
+    """True when the checkpoint's config.json declares a vision tower.
+
+    Read from the snapshot on disk, never from the model registry: the engine
+    must decide before vLLM is imported whether the renderer will need a
+    tokenizer (see the PORT DRIFT note in VllmBackend).
+    """
+    import json
+
+    try:
+        with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
+            config = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return isinstance(config.get("vision_config"), dict)
+
+
 class VllmBackend:
     """One `LLMEngine`, one greedy request at a time.
 
@@ -123,10 +140,18 @@ class VllmBackend:
         spec = None
         if cfg.depth > 0:
             spec = {"method": "mtp", "num_speculative_tokens": cfg.depth}
+        # PORT DRIFT (vLLM 0.27.1, Muse Glimmer 30B): a multimodal checkpoint
+        # needs a tokenizer even when the caller only sends token IDs, because
+        # the renderer builds the model's multimodal processor at engine start
+        # and that processor raises "You cannot pass text prompts when
+        # `skip_tokenizer_init=True`". A text-only checkpoint keeps the old
+        # pinned shape (tokenizer skipped); a checkpoint whose config carries a
+        # vision tower loads the tokenizer and still takes token-ID prompts.
+        multimodal = _checkpoint_is_multimodal(cfg.model_dir)
         args = EngineArgs(
             model=cfg.model_dir,
             tokenizer=cfg.model_dir,
-            skip_tokenizer_init=True,
+            skip_tokenizer_init=not multimodal,
             trust_remote_code=False,
             dtype="auto",
             seed=0,
@@ -151,8 +176,15 @@ class VllmBackend:
         self._SamplingParams = SamplingParams
         self._delta = RequestOutputKind.DELTA
         hf = self._engine.model_config.hf_config
-        self.vocab_size = int(hf.vocab_size)
-        eos = hf.eos_token_id
+        # PORT DRIFT (Muse Glimmer 30B): a composite config keeps vocab_size and
+        # eos_token_id in its text sub-config, not at the top level. Read the
+        # text config when the top level does not carry them, so the same code
+        # serves a flat text-only config and a nested multimodal one.
+        text_hf = hf
+        if not hasattr(hf, "vocab_size") and hasattr(hf, "get_text_config"):
+            text_hf = hf.get_text_config()
+        self.vocab_size = int(text_hf.vocab_size)
+        eos = text_hf.eos_token_id
         self.eos_token = int(eos[0] if isinstance(eos, (list, tuple)) else eos)
         self.depth = cfg.depth
         self.ctx_size = cfg.ctx_size
