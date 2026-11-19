@@ -46,7 +46,10 @@ permissions:
 jobs:
   lint:
     name: lint (repo hygiene, hosted)
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: the ubuntu-26.04 image ships uutils mkdir, which
+    # drops the setgid bit of `mkdir -m 2770` (tools/test-serve-up-boot-stop.sh
+    # case 8). The ranked boxes run GNU coreutils.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -92,7 +95,7 @@ jobs:
         # actionlint_<version>_checksums.txt.
         env:
           ACTIONLINT_VERSION: 1.7.12
-          # linux amd64 because this job is `runs-on: ubuntu-latest`. Pick the
+          # linux amd64 because this job is `runs-on: ubuntu-24.04`. Pick the
           # asset that matches the runner if that ever changes.
           ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
         run: |
