@@ -86,8 +86,7 @@ Every point links to the document that has the detail.
   - **Why:** without it, a submission could read the hidden prompts and
     goldens, or rewrite the measuring tools.
 - **Sealed score.** `score.json` names each prompt only by its sha256. It
-  carries no prompt text. The pinned benchd (source `b65af98`, bench pull
-  requests 421 to 424) keeps engine-written text, audit fields, the hello
+  carries no prompt text. The pinned benchd (source `8ce0ca7`) keeps engine-written text, audit fields, the hello
   identity and engine-derived numbers out of the sealed output: they are
   sealed as digests or omitted, and a full copy goes only to a private audit
   file on the box. The sealed output and the failure messages name no token
