@@ -349,6 +349,10 @@ gates each control leg with the band of the prompt that leg measured.
 
 The score is the mean of the three per-pair composites
 (`official_pair_combine`: `mean`). The floors and the ceiling gate every pair.
+The fixture declares the ceiling as `decode_speedup_ceiling` = 5.0. A pair
+whose decode gain is above 5.0 refuses the run with `SPEEDUP-ABOVE-CEILING`
+and seals `score: null`; a gain of exactly 5.0 passes. There is no prefill
+ceiling.
 Timed prefill is the median of five passes after one unmeasured warm-up pass
 (`official_prefill_timed_runs` = 5, `official_prefill_warmup_runs` = 1).
 
@@ -378,11 +382,12 @@ no timed token tolerance, so none applies.
 refuses to seal an official artifact while it is `false` or absent, and so does
 `tools/ranked-box-preflight.sh`.
 
-The fixture ships UNARMED. It is armed only after four steps are done:
+The fixture is armed: `official_scoring_enabled` is `true`. It was armed
+after four steps were done:
 
-1. every golden is recorded on a Spark and pinned (the pending entries carry the
+1. every golden is recorded on a Spark and pinned (a pending entry carries the
    sentinel `MUSE-GLIMMER-CUDA-PENDING-ORGANIZER`, which the preflight
-   refuses);
+   refuses; the fixture has none);
 2. `baseline_reference_commit` names the promoted reference;
 3. every box is calibrated;
 4. the null control, the reference scored against itself, lands at about 1.000.
