@@ -224,7 +224,7 @@ run blocks the upload. Run `yukon run` yourself before you submit.
 | Engine source | vLLM `v0.27.1` @ `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` |
 | Engine image | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` (arm64) |
 | benchd | `Layr-Labs/muse-glimmer-30b-benchd-dev` dist `d0500fc89cfaa339ba647a36602b028987d99c1d`, built from source `8ce0ca7821e9c882f2ff1e1cbd1e2ce561040729` (`PINNED_COMMIT` and `PINNED_SOURCE_COMMIT` in `tools/fetch-benchd.sh`); the dist's `dist/linux-aarch64/benchd.manifest.json` pins each binary's sha256 and bytes |
-| Goldens | `timed_prompt_pool[]` (the 3 serial goldens that `live_goldens` names: `pool-9`, `pool-10`, `pool-11`, three 512-token chat-template coding prompts) and the hidden correctness pin in the fixture. The pool's `sha256`/`bytes` arrive with the organizer recording (CUDA-L09); each is staged on every box and never committed (see [OVERVIEW.md](OVERVIEW.md)) |
+| Goldens | `timed_prompt_pool[]` (the 3 serial goldens that `live_goldens` names: `pool-9`, `pool-10`, `pool-11`, three 512-token chat-template coding prompts) and the hidden correctness pin in the fixture. The fixture pins each pool golden's `sha256` and `bytes`; each is staged on every box and never committed (see [OVERVIEW.md](OVERVIEW.md)) |
 
 ## The ranked run
 

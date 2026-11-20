@@ -141,10 +141,8 @@ report one stream. Run it after any kernel change.
 
 ## 7. Test state on a control host
 
-- `python3 tools/lint-benchmark-manifest.py`: 30 checks pass, 3 FAIL
-  (`live_goldens pool-9/10/11 have no pinned serial golden in
-  timed_prompt_pool`). That is true until the organizer records the pool
-  (CUDA-L09) and pins it; it is not a defect of this tree.
+- `python3 tools/lint-benchmark-manifest.py`: all 31 checks pass
+  (2026-11-20); the fixture pins `pool-9/10/11` in `timed_prompt_pool`.
 - `python3 -m unittest discover -s harness/vllm_resident`: 22 tests, OK
   (7 skipped).
 - `python3 tools/check-doc-consistency.py`: passes; it is the tripwire that the
@@ -157,9 +155,9 @@ report one stream. Run it after any kernel change.
 
 ## 8. What is still open
 
-1. **The pool recording** (CUDA-L09): the three serial goldens, recorded on a
-   Spark and pinned in the fixture; until then the preflight refuses a ranked
-   job by name.
+1. **The pool recording**: done. The fixture pins the three serial goldens
+   (`goldens.status` is `RECORDED`). Its `pool_status` text still says
+   "not recorded"; that text is stale.
 2. **The reference pins**: `reference_engine_commit` names the tree
    that carries the fixture, and the fixture's `baseline_reference_commit`
    names the commit that first carries it, so the fixture pin is one organizer

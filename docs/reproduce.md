@@ -6,7 +6,7 @@ of a ranked score, and the recorded result to compare against.
 | Input | Section | Recorded result |
 |---|---|---|
 | benchd binaries | [1](#1-rebuild-benchd-from-source) | byte-identical rebuild of the pinned dist from its pinned source |
-| Hidden goldens | [2](#2-re-record-the-hidden-goldens) | not yet for this track: the organizer recording is CUDA-L09 |
+| Hidden goldens | [2](#2-re-record-the-hidden-goldens) | pinned in the fixture; the recording log is not in this repository |
 | Box calibration | [3](#3-recalibrate-a-box) | not yet for this track: calibrating a box is a dev-cycle step |
 | Ranked score | [4](#4-reproduce-a-ranked-score) | not yet for this track: no ranked job has run |
 
@@ -19,8 +19,9 @@ sha256 and bytes.
 
 **Recorded result:** the engine base's organizers rebuilt the pinned dist from
 its source on an x86_64 Linux host with Docker and no layer cache, and both
-binaries matched the manifest byte for byte. Re-run it with
-`tools/fetch-benchd.sh` when the pin moves.
+binaries matched the manifest byte for byte. `tools/fetch-benchd.sh` does not
+rebuild: it fetches the pinned dist and verifies each binary against that
+manifest. The source build command is not published in this repository.
 
 ## 2. Re-record the hidden goldens
 
@@ -78,10 +79,11 @@ TOKENS="$HOME/rec/tokens"; OUT="$HOME/rec/goldens"; mkdir -p "$TOKENS" "$OUT"
    3 lines, and each sha256 and byte count must equal the fixture's pin once
    the pool is pinned.
 
-**Recorded result:** none yet for this track. The organizer recording is the
-runbook's CUDA-L09 step, which also fills `timed_prompt_pool[]`'s pins and
-replaces the `MUSE-GLIMMER-CUDA-PENDING-ORGANIZER` sentinels; before it runs,
-the preflight refuses a ranked job by name.
+**Recorded result:** the fixture pins the three pool goldens (`goldens.status`
+is `RECORDED`, and each `timed_prompt_pool[]` entry carries `bytes` and
+`sha256`). The recording log is held by the organizer, not in this repository.
+The preflight refuses by name a fixture that still carries a
+`MUSE-GLIMMER-CUDA-PENDING-ORGANIZER` sentinel.
 
 ## 3. Recalibrate a box
 
