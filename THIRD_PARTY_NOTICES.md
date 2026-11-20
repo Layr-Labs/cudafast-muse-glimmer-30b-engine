@@ -6,16 +6,16 @@ credited below. No model weights are distributed in this repository:
 `setup.sh` downloads the pinned artifacts from their upstream repository and
 verifies each against its pinned sha256.
 
-## NVIDIA Nemotron 3.5 Lightning 30B-A3B
+## Muse Glimmer 30B NVFP4
 
 | Artifact | Upstream | License |
 |---|---|---|
-| `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` @ `bee7596271d1495f6992ae224aefde4410e816b8` (the pinned target and its embedded MTP head) | NVIDIA | OpenMDW-1.1 |
-| `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` (the base the target quantizes) | NVIDIA | OpenMDW-1.1 |
+| `nvidia/Muse-Glimmer-30B-NVFP4` @ `47818374517751c48c55cde2621594926b1888b6` (the pinned target) | <https://huggingface.co/nvidia/Muse-Glimmer-30B-NVFP4> | the checkpoint's own `LICENSE` and `USAGE_POLICY.md` at the pinned revision |
 
-The license text ships with the checkpoint at the pinned revision (`LICENSE`)
-and is published at <https://openmdw.ai/license/1-1/>. Anyone redistributing
-the model or weights derived from it must satisfy those terms.
+The license text ships with the checkpoint at the pinned revision as
+`LICENSE`; the track fixture pins its sha256
+(`cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30`). Anyone
+redistributing the model or weights derived from it must satisfy those terms.
 
 ## vLLM
 

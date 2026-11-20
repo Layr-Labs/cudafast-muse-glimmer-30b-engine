@@ -22,8 +22,8 @@ SOFTWARE.
 
 ---
 
-This license covers the mlxfast challenge harness, benchmark pipeline, model
+This license covers the challenge harness, benchmark pipeline, model
 runtime, transform, tests, and documentation in this repository. Model
-weights are NOT distributed in this repository; the Poolside Laguna models
-this harness downloads and benchmarks are third-party works — see
-THIRD_PARTY_NOTICES.md for their licenses and attribution.
+weights are NOT distributed in this repository; the Muse Glimmer 30B model
+this harness downloads and benchmarks is a third-party work — see
+THIRD_PARTY_NOTICES.md for its license and attribution.

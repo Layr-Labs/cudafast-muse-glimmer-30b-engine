@@ -604,8 +604,9 @@ submission.
 
 ## 10. License
 
-The pinned checkpoint is NVIDIA's, under the Apache License 2.0 that ships with
-it at the pinned revision. vLLM is Apache-2.0 (`vllm/LICENSE`). This repository
+The pinned checkpoint (`nvidia/Muse-Glimmer-30B-NVFP4`) is a third-party work,
+under the `LICENSE` and `USAGE_POLICY.md` that ship with it at the pinned
+revision (`THIRD_PARTY_NOTICES.md`). vLLM is Apache-2.0 (`vllm/LICENSE`). This repository
 distributes no model weights.
 
 ## 11. The serial stream
