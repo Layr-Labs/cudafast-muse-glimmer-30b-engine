@@ -3,14 +3,12 @@
 # fetch-benchd.sh -- resolve the `benchd` measurement harness from its release
 # channel.
 #
-# THE PIN IS REMOVED (docs/participant-contract.md section 1). benchd used to be frozen here by
-# ./benchd.pin ({branch, commit, sha256, bytes}), which made every benchd bug
-# fix require an engine-repo pin-advance commit before it could reach a box --
-# the depth/echo fix sat merged in the bench repo while the served pin still
-# carried the bug. That coupling is gone: this repository names only the CHANNEL
-# (the bench repo + branch), and the channel's tip is what runs. Fixing a
-# measurement bug is now: merge it bench-side, republish dist, done -- zero
-# engine commits.
+# THE PIN. PINNED_COMMIT (a dist commit of the bench channel) and
+# PINNED_SOURCE_COMMIT (the benchd source that dist was built from), set below,
+# name the benchd that runs. The script fetches that dist commit, not the
+# channel's tip, and refuses a manifest whose source_commit is not the pin. A
+# benchd fix reaches a box only after a commit here moves both pins. (The
+# retired ./benchd.pin file and an earlier run-the-tip design are gone.)
 #
 # WHAT REPLACES THE PIN'S GUARANTEES, stated honestly:
 #
@@ -19,10 +17,8 @@
 #     source_commit, sha256, bytes}, written by the bench repo's
 #     scripts/build-dist.sh). The binary is verified against THAT manifest --
 #     fetched from the same organizer-controlled channel -- and nothing
-#     unverified is ever installed or returned. What this no longer defends
-#     against is the channel itself moving, which is the point: the channel is
-#     the organizer's bench repo, participants cannot write to it, and its tip
-#     is now the intended source of truth.
+#     unverified is ever installed or returned. The channel is the organizer's
+#     bench repo, and participants cannot write to it.
 #   * PROVENANCE (knowing which benchd measured a run): recorded, not pinned.
 #     The resolved {branch, source_commit, sha256} is logged loudly on every
 #     resolve and the manifest is installed beside the binary
@@ -45,8 +41,8 @@
 #      OFFLINE path: the ranked box gets both files placed together. A binary
 #      with no manifest, or a pair that disagrees, refuses loudly (a bare
 #      unattributable binary is exactly what this script must never run).
-#      Set BENCHD_REFRESH=1 to discard the local pair and re-resolve the
-#      channel tip.
+#      Set BENCHD_REFRESH=1 to discard the local pair and fetch the pinned
+#      dist again.
 #   2. Otherwise obtain the PAIR -- from BENCHD_DIST_LOCAL (file/dir, for
 #      air-gapped boxes) or by downloading manifest-then-binary from the
 #      channel -- verify the binary against its manifest, and install both.
@@ -153,7 +149,7 @@
 #   BENCHD_BIN_DIR      install directory. Default: <repo>/benchd-bin
 #                       (gitignored; a fetched artifact, not repository content).
 #   BENCHD_REFRESH      set to 1 to discard an already-installed pair and
-#                       re-resolve the channel tip. A staged
+#                       fetch the pinned dist again. A staged
 #                       record-correctness-golden is discarded with it.
 #   BENCHD_DIST_LOCAL   path to an already-obtained dist (a directory holding
 #                       benchd + benchd.manifest.json, or the benchd file
@@ -478,7 +474,7 @@ if [[ -n "${BENCHD_DIST_LOCAL:-}" ]]; then
 else
   command -v curl >/dev/null 2>&1 || die "curl is required to download benchd (or set BENCHD_DIST_LOCAL)."
 
-  # The channel: this host's dist directory on the bench branch tip (see
+  # The channel: this host's dist directory at the pinned COMMIT (see
   # dist_subpath_for above). The manifest is fetched FIRST,
   # then the binary from the same directory, and the binary must match the
   # manifest -- so a half-updated publish (one file at the old build) refuses
