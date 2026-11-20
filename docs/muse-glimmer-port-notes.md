@@ -63,7 +63,7 @@ Commands behind every number:
 
 ```bash
 # the 14 weight-file pins
-ssh spark3-primary 'cd /home/gumbiidigital/muse-glimmer-30b/weights && sha256sum -c SHA256SUMS'
+ssh <box> 'cd $HOME/muse-glimmer-30b/weights && sha256sum -c SHA256SUMS'
   -> 14 lines "OK"
 # tokenizer.json = c9dbee66967b58f31a7c27f723c3760da3526ccd0427578e8905b0abb0031c4d
 ```
