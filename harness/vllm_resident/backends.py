@@ -19,6 +19,7 @@ resident's wire and bookkeeping are tested with no GPU and no vLLM install.
 
 from __future__ import annotations
 
+import heapq
 import os
 from dataclasses import dataclass, field
 
@@ -236,8 +237,10 @@ class VllmBackend:
             for token, lp in zip(comp.token_ids, lps):
                 top: tuple[tuple[int, float], ...] = ()
                 if lp:
-                    ranked = sorted(lp.items(), key=lambda kv: kv[1].logprob, reverse=True)
-                    top = tuple((int(t), float(v.logprob)) for t, v in ranked[:TOP_K])
+                    # Only the TOP_K best are kept: heapq.nlargest is documented as equal to
+                    # sorted(..., reverse=True)[:n] (same order, ties included), without the full sort.
+                    ranked = heapq.nlargest(TOP_K, lp.items(), key=lambda kv: kv[1].logprob)
+                    top = tuple((int(t), float(v.logprob)) for t, v in ranked)
                 emitted.append(Emit(int(token), top))
         return emitted
 
