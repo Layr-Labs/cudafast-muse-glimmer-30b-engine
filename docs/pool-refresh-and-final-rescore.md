@@ -108,8 +108,8 @@ job measures every live golden.
 3. **Select**: for each team, its best submission by mean contest score over
    runs that scored or failed because of the submission (a team failure counts
    as 0.0; a post-setup `control_failed` or `band_refused` run also counts as
-   0.0; other infrastructure runs are excluded). Ties go to the most recent
-   submission; then the top N teams (N set by the organizer; default 10).
+   0.0; other infrastructure runs are excluded). Equal means go to the most
+   recent submission; then the top N teams (N set by the organizer; default 10).
 4. **Stage and pin**: stage the `final` goldens on all boxes; build a
    `rescore/base` branch = the contest's final base plus one fixture commit
    whose `live_goldens` are the `final` generation.
@@ -137,7 +137,8 @@ job measures every live golden.
    team failure, or 0.0 for a penalized post-setup infrastructure slot). A team
    with any slot still pending or unresolved has no mean and status `incomplete`;
    incomplete teams are listed after every complete team and are never ranked
-   above them. `rescore-report` lists every run and, per team, each slot's run
+   above them. Equal means are ordered by team name, and each complete team
+   gets its own rank. `rescore-report` lists every run and, per team, each slot's run
    ids, outcomes, and value so the ranking can be audited.
 
 ## Checks

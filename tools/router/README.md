@@ -68,7 +68,7 @@ staged, none of them before the freeze. Then it:
 1. picks each team's best submission: for each editable tree, the mean contest
    score counts runs that scored or failed because of the submission (failure =
    0.0; post-setup control or band failure = 0.0; other infrastructure runs are
-   excluded); the best mean wins, ties go to the most recent; then the top N
+   excluded); the best mean wins, equal means go to the most recent; then the top N
    teams;
 2. builds the local branch `rescore/base` = `--base-ref` plus one fixture commit
    (`tools/pool-refresh.sh pin-fixture ... final .mlxfast-private/final/pins.json`)

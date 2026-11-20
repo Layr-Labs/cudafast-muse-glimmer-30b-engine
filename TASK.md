@@ -128,7 +128,9 @@ The score is serial-anchored, so a faster candidate scores above 1.
 - **Aggregation.** Each pair has its own composite. The score is the mean of
   the 3 per-pair composites. Every pair must clear both floors.
 - **Bounds.** Both floors are 0.95, so a candidate that regresses prefill or
-  decode by more than 5 percent is refused. The ceiling is 5.0.
+  decode by more than 5 percent is refused. `benchmark.json` states a decode
+  ceiling of 5.0, but the fixture declares no ceiling, so no gain ceiling is
+  applied today ([scoring contract](docs/scoring-contract.md), section 2).
 - **Correctness.** The token-tolerance budget is `0.0`: your stream must
   reproduce the serial tape token for token.
 

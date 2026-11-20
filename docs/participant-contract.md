@@ -348,16 +348,23 @@ gates each control leg with the band of the prompt that leg measured.
 | `kvBackend` | `vllm-paged` |
 
 The score is the mean of the three per-pair composites
-(`official_pair_combine`: `mean`). The floors and the ceiling gate every pair.
+(`official_pair_combine`: `mean`). The floors gate every pair. The fixture
+declares no ceiling, so the 5.0 above is not applied today
+([scoring contract](scoring-contract.md), section 2).
 Timed prefill is the median of five passes after one unmeasured warm-up pass
 (`official_prefill_timed_runs` = 5, `official_prefill_warmup_runs` = 1).
 
 ### 5.4 Token fidelity
 
-benchd applies a per-stream token-tolerance gate with a **0.0 budget** against
-the serial tape: the fixture's `token_tolerance_budget` is `0.0`, so the
-candidate's stream must match the tape token for token. There is one mode, so
-there is one tape, and every leg is checked against it.
+The timed window must match the serial tape token for token (section 5.4.1).
+That rule comes from benchd: the fixture declares no
+`timed_token_tolerance_per_thousand`, so benchd allows no different token. The
+fixture's `token_tolerance_budget` is `0.0`, but benchd does not read it. The
+untimed correctness gate is a separate check: each teacher-forced case of 64
+steps passes with at most 10% of its steps not accepted, and a top-logit tie
+within 1e-6 is accepted ([scoring contract](scoring-contract.md), row 5 and
+section 2). There is one mode, so there is one tape, and every leg is checked
+against it.
 
 ### 5.4.1 The timed window: exact match
 
@@ -378,7 +385,8 @@ no timed token tolerance, so none applies.
 refuses to seal an official artifact while it is `false` or absent, and so does
 `tools/ranked-box-preflight.sh`.
 
-The fixture ships UNARMED. It is armed only after four steps are done:
+The fixture is armed today: `official_scoring_enabled` is `true`. The arming
+rule is that four steps come first:
 
 1. every golden is recorded on a Spark and pinned (the pending entries carry the
    sentinel `MUSE-GLIMMER-CUDA-PENDING-ORGANIZER`, which the preflight
@@ -475,7 +483,7 @@ file's byte count and sha256 against its pin before a ranked run. The fixture's
   mean contest score counts every contest run of that submission that scored or
   failed because of the submission (a team failure counts as 0.0; a
   post-setup reference-leg or band failure counts as 0.0; other infrastructure
-  runs are excluded). Ties go to the most recent submission. The top N teams
+  runs are excluded). Equal means go to the most recent submission. The top N teams
   (default 10) are selected. Each selected submission is re-measured K times
   (default 5), one run per slot, across different boxes on a held-out pool
   that was never staged during the contest. Each slot is its first run that
@@ -487,7 +495,8 @@ file's byte count and sha256 against its pin before a ranked run. The fixture's
   counts as 0.0 for that slot. The final ranking is the mean of the K slot values (the score, or
   0.0 for a team failure or penalized post-setup infrastructure slot). A team
   with any slot still pending or unresolved is incomplete and is not ranked
-  above a complete team. Contest scores decide only who is re-measured.
+  above a complete team. Equal final means are ordered by team name, and each
+  complete team gets its own rank. Contest scores decide only who is re-measured.
 
 ## 6. Running the benchmark
 
