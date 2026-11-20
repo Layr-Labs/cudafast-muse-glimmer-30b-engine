@@ -54,7 +54,7 @@ GPU host.
 
 **A. bubblewrap around E1 and E4.** Rejected: DGX OS sets
 `kernel.apparmor_restrict_unprivileged_userns=1`, and `bwrap` fails with
-"setting up uid map: Permission denied" (tested on spark-2). Making it work
+"setting up uid map: Permission denied" (tested on a ranked box). Making it work
 needs an AppArmor profile on every box and still leaves E2.
 
 **B. Everything participant-built runs in containers.** Build the adapter in a

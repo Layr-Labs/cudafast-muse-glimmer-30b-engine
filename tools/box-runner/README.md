@@ -251,7 +251,7 @@ checkout: `tools/fetch-benchd.sh`, `tools/fetch-goldens.sh`,
 fresh Spark to a ranked runner is in its `docs/runbook.md`.
 
 ```sh
-sudo /opt/cuda-setup-scripts/converge/converge.sh spark-2 muse-glimmer-30b-cuda-v1 --check
+sudo /opt/cuda-setup-scripts/converge/converge.sh <box> muse-glimmer-30b-cuda-v1 --check
 ```
 
 A second runner on the same box sets its own value for each sandbox name (the

@@ -9,8 +9,7 @@ Every point links to the document that has the detail.
 - **Task.** Make `nvidia/Muse-Glimmer-30B-NVFP4` prefill and
   decode faster on a DGX Spark, single stream, without changing what it
   computes: the token-tolerance budget is `0.0`.
-- **Track.** `muse-glimmer-30b-cuda-v1`, on 8 DGX Sparks
-  (`spark-1` … `spark-8`).
+- **Track.** `muse-glimmer-30b-cuda-v1`, on 8 DGX Sparks.
 - **What a team may edit.** Only `vllm/`, `harness/` and
   `mtp-head.manifest.json` (a declaration that must stay `none`: the track is
   serial only). Everything else is trusted and is replaced by the organizer's
@@ -146,16 +145,16 @@ Every point links to the document that has the detail.
 
 | Test | Result |
 |---|---|
-| Engine tree builds in the pinned container (CUDA-L04B) | two boots of the same tree identical, 2222 tensors |
-| Candidate vs vendor runtime (CUDA-LE5) | parity 0.0 over 384 tokens |
-| Resident boot and serve on spark-3 (CUDA-LE2) | boot completes, requests served, load and request exit 0 |
-| Reference vs candidate, ranked path | not yet run: the local cycle stops at the owner's contract approval (CUDA-LE4) |
+| Engine tree builds in the pinned container | two boots of the same tree identical, 2222 tensors |
+| Candidate vs vendor runtime | parity 0.0 over 384 tokens |
+| Resident boot and serve on a ranked box | boot completes, requests served, load and request exit 0 |
+| Reference vs candidate, ranked path | not yet run in the local cycle |
 
-The local cycle's numbers, commands and receipts are in the challenge folder
-(`cuda/HANDOFF.md`, `cuda/artifacts/`). The engineering log records what the
+The local cycle's receipts are held by the organizer and are not part of this
+repository. The engineering log records what the
 port changed and every finding ([port log](docs/muse-glimmer-port-notes.md)).
 
-### The engine base it derives from (2026-10-19/20, spark-1 to spark-4)
+### The engine base it derives from (2026-10-19/20, four boxes)
 
 | Test | Result |
 |---|---|
@@ -165,10 +164,10 @@ port changed and every finding ([port log](docs/muse-glimmer-port-notes.md)).
 | Goldens | byte-identical on two recording boxes and on every staged box |
 | benchd | a no-cache rebuild from source equals the pinned dist byte for byte |
 | GPU-free checks | adapter fmt, clippy, tests and build; resident and router tests; manifest lint; doc consistency; every `tools/test-*.sh` |
-| 3-hour load test (spark-1, 3, 4; seeded mix; organizer router) | 22 jobs, 0 infrastructure failures; oversize file refused; trusted-path edits dropped; variants fail correctness (exact-match timed window) |
+| 3-hour load test (three boxes; seeded mix; organizer router) | 22 jobs, 0 infrastructure failures; oversize file refused; trusted-path edits dropped; variants fail correctness (exact-match timed window) |
 
 Those runs measured the base engine and its own goldens. This track re-proves
-every check it inherits at its own pin (`cuda/HANDOFF.md`).
+every check it inherits at its own pin.
 
 ### Base-engine soak (all 8 Sparks, 4096-token seed, fork benchd)
 
@@ -187,8 +186,7 @@ the full data is in the base repository's own engineering log.
 
 - **Boxes.** This track stages its boxes in the dev cycle. Re-verify each
   ranked box before launch: runner registration, the staged `pool-9/10/11`
-  goldens and a version-3 calibration. spark-3 is the lane's box (idle,
-  GPU free, 121 GB memory, 3.3 TB disk).
+  goldens and a version-3 calibration.
 - **Branches.** `main` is the contest base. `official_scoring_enabled` is
   `true` in the fixture, and the reference tree is the fixture's
   `baseline_reference_commit`.

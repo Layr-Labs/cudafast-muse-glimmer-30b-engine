@@ -119,10 +119,10 @@ report one stream. Run it after any kernel change.
 
 | Measurement | Result | Where |
 |---|---|---|
-| Engine build in the pinned container | 2222 tensors, two boots of the same tree identical | CUDA-L04B receipt |
-| Candidate vs vendor runtime parity | 0.0 divergence over 384 tokens | CUDA-LE5 receipt |
-| Resident boot + serve on spark-3 | boot completes, requests served, load and request exit 0 | CUDA-LE2 receipt |
-| Ranked pair (control vs candidate) | not yet: the local cycle stops at the owner's contract approval | `cuda/HANDOFF.md` |
+| Engine build in the pinned container | 2222 tensors, two boots of the same tree identical | organizer receipt |
+| Candidate vs vendor runtime parity | 0.0 divergence over 384 tokens | organizer receipt |
+| Resident boot + serve on a ranked box | boot completes, requests served, load and request exit 0 | organizer receipt |
+| Ranked pair (control vs candidate) | not yet run in the local cycle | — |
 
 ## 6. Container and host facts that cost time
 
@@ -160,7 +160,7 @@ report one stream. Run it after any kernel change.
 1. **The pool recording** (CUDA-L09): the three serial goldens, recorded on a
    Spark and pinned in the fixture; until then the preflight refuses a ranked
    job by name.
-2. **The reference pins** (F-CUDA-30): `reference_engine_commit` names the tree
+2. **The reference pins**: `reference_engine_commit` names the tree
    that carries the fixture, and the fixture's `baseline_reference_commit`
    names the commit that first carries it, so the fixture pin is one organizer
    commit behind by construction. `tools/ranked-box-preflight.sh` accepts the

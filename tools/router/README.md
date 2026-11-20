@@ -40,7 +40,7 @@ repository, and a base branch whose fixture is armed.
 |---|---|
 | `ROUTER_REPO` | owner/repo; else `gh repo view` for this checkout (`--repo` overrides) |
 | `ROUTER_BASE` | base branch, `loadtest/base` (`--base` overrides) |
-| `WATCH_HOSTS` | hosts `watch.sh` probes, `spark-1 ... spark-8` |
+| `WATCH_HOSTS` | hosts `watch.sh` probes; set it to your ranked boxes (the built-in default names the organizer's own hosts) |
 
 ```bash
 python3 -m unittest discover -s tools/router

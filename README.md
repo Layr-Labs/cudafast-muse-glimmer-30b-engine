@@ -19,7 +19,7 @@ the model computes.
 | **Engine** | vLLM v0.27.1 in a pinned container; teams edit `vllm/` and `harness/` |
 | **Score** | `prefill_gain^0.25 × decode_gain^0.75`, each gain measured against a trusted reference run on the same box, same prompt, same job |
 | **Correctness** | output must match the reference golden token for token: the token-tolerance budget is `0.0` |
-| **Fairness** | run-to-run spread is small: the engine base's reference against itself scored 0.996, sd 0.005 (8-box soak of the base engine); this track's null control is measured at CUDA-L12 |
+| **Fairness** | run-to-run spread is small: the engine base's reference against itself scored 0.996, sd 0.005 (8-box soak of the base engine); this track's own null control is an organizer step and is not published here |
 | **Integrity** | sandboxed, network-less execution; hidden prompts rotated every 3–4 days; final ranking re-measured on a held-out pool |
 | **Track** | `muse-glimmer-30b-cuda-v1` |
 
@@ -183,7 +183,8 @@ This command clones the benchmark repository.
 
 Before you submit, remove build artifacts from the editable paths. The archive
 packages `vllm/`, `harness/` and `mtp-head.manifest.json` as they sit on disk.
-The unchanged editable surface on this tree is 35,168,624 bytes; the byte budget
+The unchanged editable surface on this tree is 35,168,595 bytes (the summed blob
+sizes of `git ls-tree -r -l HEAD -- vllm harness mtp-head.manifest.json`); the byte budget
 (`editableSurfaceByteBudget.maxTotalBytes` in `benchmark.json`) is 41,943,040
 bytes. A stale adapter `target/` tree or a `__pycache__/` directory uses that
 room and counts against the budget.

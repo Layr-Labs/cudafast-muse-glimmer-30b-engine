@@ -173,8 +173,9 @@ prompts, provenance, per-box recordings, agreed goldens, `pins.json`),
 `final/` for the held-out pool, `refresh/ledger.json` (every paragraph ever
 used) and `refresh/staging.log` (every golden installed on a box, with time).
 
-Box-side assumptions (override by env): boxes `spark-1`…`spark-8`
-(`REFRESH_BOXES`; the current fleet is `spark-1 spark-2 spark-3 spark-4`), checkout `~/muse-glimmer/repo` (`REFRESH_BOX_REPO`, must be at a
+Box-side assumptions (override by env): boxes from `REFRESH_BOXES` (at least
+two ssh host names; set it to your ranked boxes, because the built-in default
+names the organizer's own hosts), checkout `~/muse-glimmer/repo` (`REFRESH_BOX_REPO`, must be at a
 commit that has `record-goldens.sh --only`), goldens `/srv/muse-glimmer/goldens`
 (`REFRESH_BOX_GOLDENS`), snapshot `REFRESH_BOX_SNAPSHOT`, GPU lock
 `/tmp/mtplx-gpu-exclusive.lock`. Stitching needs the `tokenizers` package:
