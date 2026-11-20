@@ -58,9 +58,11 @@ must declare `"source": "none"`.
   section 5.4.1). The ranked run and the local modes apply the same rule.
 - **Keep the engine reproducible.** Run `tools/determinism-probe.py` against a
   booted resident; it must report one stream at serial; this track has no other
-  mode. The fixture disables `FlashInferFP8ScaledMMLinearKernel` because this
-  checkpoint quantizes its attention projections to FP8
-  (`docs/muse-glimmer-port-notes.md`).
+  mode. Today the probe starts the worker at a fixed path
+  (`~/muse-glimmer/repo/.build/release/mlxfast-runtime-worker`), not a binary
+  of the current checkout. The fixture disables
+  `FlashInferFP8ScaledMMLinearKernel` because this checkpoint quantizes its
+  attention projections to FP8 (`docs/muse-glimmer-port-notes.md`).
 - **Keep the resident wire intact.** The Rust client in
   `harness/protocol-adapter/src/resident.rs` and `resident.py` must agree.
   `test_adapter_e2e.py` proves it on the serial path.
