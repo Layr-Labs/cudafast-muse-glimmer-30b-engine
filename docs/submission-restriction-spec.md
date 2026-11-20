@@ -16,12 +16,8 @@ below as reference only; it does not run here.
 
 ## 0. Provenance of every citation
 
-The reference is the challenge repository of an earlier Layr-Labs track,
-read-only:
-
-```text
-<earlier challenge repository>   main @ bfab0de58d43453e506523707e1720a3485570f4
-```
+The rule set was first written for an earlier Layr-Labs track and carried over
+to this one.
 
 Citations are written `<path>@bfab0de:<line>`; every one is reproducible with:
 

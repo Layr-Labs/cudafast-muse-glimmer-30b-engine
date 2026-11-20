@@ -176,7 +176,7 @@ used) and `refresh/staging.log` (every golden installed on a box, with time).
 
 Box-side assumptions (override by env): boxes from `REFRESH_BOXES` (at least
 two ssh host names; set it to your ranked boxes, because the built-in default
-names the organizer's own hosts), checkout `~/muse-glimmer/repo` (`REFRESH_BOX_REPO`, must be at a
+names the organizer's own hosts), checkout named by `REFRESH_BOX_REPO` (must be at a
 commit that has `record-goldens.sh --only`), goldens `/srv/muse-glimmer/goldens`
 (`REFRESH_BOX_GOLDENS`), snapshot `REFRESH_BOX_SNAPSHOT`, GPU lock
 `/tmp/mtplx-gpu-exclusive.lock`. Stitching needs the `tokenizers` package:

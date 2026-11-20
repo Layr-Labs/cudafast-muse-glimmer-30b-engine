@@ -83,7 +83,3 @@ __pycache__/
 
 *.pyc
 .claude/
-
-# Process ID files
-*.pid
-.pid

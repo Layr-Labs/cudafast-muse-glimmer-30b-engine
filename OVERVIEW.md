@@ -146,7 +146,7 @@ Every point links to the document that has the detail.
 | Test | Result |
 |---|---|
 | Engine tree builds in the pinned container | two boots of the same tree identical, 2222 tensors |
-| Candidate vs vendor runtime | parity 0.0 over 384 tokens |
+| Candidate vs vendor runtime | parity 0.0 over 384 tokens (organizer measurement; the receipt is not published in this repository) |
 | Resident boot and serve on a ranked box | boot completes, requests served, load and request exit 0 |
 | Reference vs candidate, ranked path | not yet run in the local cycle |
 

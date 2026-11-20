@@ -119,9 +119,9 @@ report one stream. Run it after any kernel change.
 
 | Measurement | Result | Where |
 |---|---|---|
-| Engine build in the pinned container | 2222 tensors, two boots of the same tree identical | organizer receipt |
-| Candidate vs vendor runtime parity | 0.0 divergence over 384 tokens | organizer receipt |
-| Resident boot + serve on a ranked box | boot completes, requests served, load and request exit 0 | organizer receipt |
+| Engine build in the pinned container | 2222 tensors, two boots of the same tree identical | organizer measurement; receipt not published in this repository, not verifiable from it |
+| Candidate vs vendor runtime parity | 0.0 divergence over 384 tokens | organizer measurement; receipt not published in this repository, not verifiable from it |
+| Resident boot + serve on a ranked box | boot completes, requests served, load and request exit 0 | organizer measurement; receipt not published in this repository, not verifiable from it |
 | Ranked pair (control vs candidate) | not yet run in the local cycle | — |
 
 ## 6. Container and host facts that cost time

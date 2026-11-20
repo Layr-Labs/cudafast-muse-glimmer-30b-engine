@@ -58,8 +58,8 @@ must declare `"source": "none"`.
   section 5.4.1). The ranked run and the local modes apply the same rule.
 - **Keep the engine reproducible.** Run `tools/determinism-probe.py` against a
   booted resident; it must report one stream at serial; this track has no other
-  mode. Today the probe starts the worker at a fixed path
-  (`~/muse-glimmer/repo/.build/release/mlxfast-runtime-worker`), not a binary
+  mode. Today the probe starts the worker at a hard-coded
+  worker path, not a binary
   of the current checkout. The fixture disables
   `FlashInferFP8ScaledMMLinearKernel` because this checkpoint quantizes its
   attention projections to FP8 (`docs/muse-glimmer-port-notes.md`).
