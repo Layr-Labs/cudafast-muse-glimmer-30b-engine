@@ -38,6 +38,17 @@ This job does three things:
 3. imports `vllm.model_executor.models.muse_glimmer` through
    the overlay, asserting that vLLM resolved from the overlay.
 
+## Tool tests that CI does not run
+
+These GPU-free tests are in the repository but not in `ci.yml`:
+
+- `tools/test-engine-build-sandbox.sh`
+- `tools/test-run-engine-sandboxed.sh`
+- `tools/test-sandbox-wipe.sh`
+- `tools/test-wait-for-memory.sh`
+- `tools/router/test_router.py`
+- `tools/router/test_services.py`
+
 ## What CI cannot cover
 
 Anything that needs a GPU:

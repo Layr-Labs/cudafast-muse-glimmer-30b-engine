@@ -103,9 +103,11 @@ verifies it.
 ```
 
 This command boots a serial resident and runs benchd's local-iterate leg over
-the public golden, which the organizer recorded on a Spark:
-`correctness_prompts/public-longcopy-gate-english-512.golden.json`. The track
-is serial only, so one golden covers every local run. A local run seals
+the public golden
+`correctness_prompts/public-longcopy-gate-english-512.golden.json`. That file
+is not in this repository yet, so on a clean checkout the run stops with
+`correctness golden not found`. The track is serial only, so one golden covers
+every local run. A local run seals
 `score: null`: only the paired ranked path produces a score.
 
 ```bash
@@ -141,7 +143,8 @@ tools/three-flows-dry-run.sh
 
 This command runs the real benchd binaries (the pinned `main` channel) over the
 same fake resident. It covers golden authoring, a local serial leg and the
-paired lifecycle.
+paired lifecycle. Its `B5`-`B8` cases still expect a speculative (MTP) leg to
+run; this track allows only `serial`, so those cases are out of date.
 
 ## Repository structure
 
