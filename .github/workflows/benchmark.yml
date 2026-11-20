@@ -1,4 +1,6 @@
 # muse-glimmer-30b-cuda-v1 RANKED BENCHMARK -- Linux aarch64 (GB10) box.
+# (Production repository: GitHub registers a workflow only on a default-branch push that changes
+#  that file; this comment is that change. No job, step or trigger changed.)
 #
 # benchmark.json's runner.workflow names this file. Yukon dispatches it once per
 # submission; the two jobs below are the whole ranked pipeline. A no-GPU,
