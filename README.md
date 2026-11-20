@@ -6,6 +6,7 @@ the model computes.
 
 **[Overview](OVERVIEW.md)** · **[Task and rules](TASK.md)** ·
 **[Participant contract](docs/participant-contract.md)** ·
+**[Scoring contract](docs/scoring-contract.md)** ·
 **[Sandbox design](docs/sandbox-design.md)** ·
 **[Pool refresh and final ranking](docs/pool-refresh-and-final-rescore.md)**
 
@@ -327,6 +328,7 @@ engineering log) records the cluster verification and the load-test findings.
 |---|---|
 | Editable paths, commands, scoring values | `benchmark.json` |
 | Pins, engine configuration, scoring semantics | `fixtures/muse_glimmer_30b_cuda_v1_track.json` |
+| The score formula, direction, units, rounding, correctness gate and variance limits, each with its source | `docs/scoring-contract.md` |
 | Why the rules say what they say | `docs/participant-contract.md` |
 | The resident wire | `docs/resident.md` |
 | What CI covers | `docs/ci-coverage.md` |
