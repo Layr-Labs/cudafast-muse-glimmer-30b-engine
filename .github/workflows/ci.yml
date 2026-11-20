@@ -1,4 +1,6 @@
 # Engine CI -- build and test only, hosted, with no credential.
+# (Production repository: GitHub registers workflows only on a default-branch push that changes a
+#  workflow file; this comment is that change. No job changed.)
 #
 #   - no credential of any kind, and a step below trips if a workflow in this
 #     tree starts referencing one, inheriting the caller's, or asking for a
