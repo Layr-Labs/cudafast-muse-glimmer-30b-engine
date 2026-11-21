@@ -236,6 +236,7 @@ class VllmBackend:
             for token, lp in zip(comp.token_ids, lps):
                 top: tuple[tuple[int, float], ...] = ()
                 if lp:
+                    _entry_p1 = None
                     ranked = sorted(lp.items(), key=lambda kv: kv[1].logprob, reverse=True)
                     top = tuple((int(t), float(v.logprob)) for t, v in ranked[:TOP_K])
                 emitted.append(Emit(int(token), top))
