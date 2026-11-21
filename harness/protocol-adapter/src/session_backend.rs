@@ -19,9 +19,10 @@
 //!   with them;
 //! * `step(input)` -> `eval(input)` then argmax + top-8 logits;
 //!   `correctness_step` and `decode_step` share it;
-//! * `free_decode_run(count)` -> on the SERIAL route, `count` plain evals; on
-//!   the MTP route, speculative cycles (one `spec_run` request when the
-//!   resident offers it) until `count` tokens are committed. Each cycle
+//! * `free_decode_run(count)` -> on the SERIAL route, `count` plain evals
+//!   (one `serial_run` request when the resident offers it); on the MTP route,
+//!   speculative cycles (one `spec_run` request when offered) until `count`
+//!   tokens are committed. Each cycle
 //!   commits its input token plus every draft the target's own argmax
 //!   confirmed, so the stream is the serial stream up to kernel numerics.
 //!
@@ -102,6 +103,12 @@ pub trait EngineSession: Send {
     }
     /// Append and evaluate one token; logits for the new position follow.
     fn eval(&mut self, token: i64) -> Result<(), String>;
+    /// Advance `count` times by feeding the latest argmax, starting with
+    /// `first_token`. Return the frontier after each eval, in order, and
+    /// leave the last frontier current. `None` means drive the evals individually.
+    fn serial_run(&mut self, _first_token: i64, _count: i64) -> Option<Result<Vec<i64>, String>> {
+        None
+    }
     /// The greedy token of the current logits.
     fn argmax(&mut self) -> i64;
     /// The top-k logits of the current position, highest first.
@@ -354,24 +361,32 @@ impl Engine for SessionEngine {
                 "free_decode_run count {count} is not positive"
             )));
         }
-        let mut tokens: Vec<i64> = Vec::with_capacity(count as usize);
-        let mut acceptance_lengths: Vec<i64> = Vec::new();
+        let mut tokens;
+        let mut acceptance_lengths;
         let (drafted_total, accepted_total, verify_replay_disagreements) = {
             let mut s = self.lock();
             match route {
                 Route::Serial => {
-                    for _ in 0..count {
-                        Self::fault(s.eval(pending))?;
+                    if let Some(run) = s.serial_run(pending, count) {
+                        tokens = Self::fault(run)?;
                         pending = s.argmax();
-                        tokens.push(pending);
-                        acceptance_lengths.push(1);
+                    } else {
+                        tokens = Vec::with_capacity(count as usize);
+                        for _ in 0..count {
+                            Self::fault(s.eval(pending))?;
+                            pending = s.argmax();
+                            tokens.push(pending);
+                        }
                     }
+                    acceptance_lengths = vec![1; count as usize];
                     // The serial route reads no engine counters at all, so it
                     // reports no disagreement count rather than reporting one
                     // it never measured.
                     (0, 0, None)
                 }
                 Route::Mtp => {
+                    tokens = Vec::with_capacity(count as usize);
+                    acceptance_lengths = Vec::new();
                     let before = s.spec_counters();
                     // ONE REQUEST FOR THE WHOLE RUN when the session offers it
                     // (the resident does): the engine loops the cycles itself

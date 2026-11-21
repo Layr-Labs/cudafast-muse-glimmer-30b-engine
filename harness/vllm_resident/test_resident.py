@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import DEFAULT, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -37,6 +38,53 @@ class SessionTests(unittest.TestCase):
         first = s.sync(PROMPT)
         self.assertEqual(s.eval(first), s.frontier.token)
         self.assertEqual(s.ctx, PROMPT + [first])
+
+    def test_split_serial_run_preserves_steps_and_top_k_mode(self):
+        for argmax_only in (False, True):
+            with self.subTest(argmax_only=argmax_only):
+                backend = FakeBackend()
+                session = Session(backend)
+                reference = Session(FakeBackend())
+                pending = session.sync(PROMPT, argmax_only=argmax_only)
+                expected_pending = reference.sync(PROMPT)
+                self.assertEqual(pending, expected_pending)
+
+                steps = 0
+                with patch.object(backend, "step", wraps=backend.step) as step:
+                    for count in (1, 31, 96):
+                        expected = []
+                        for _ in range(count):
+                            expected_pending = reference.eval(expected_pending)
+                            expected.append(expected_pending)
+                        tokens = session.serial_run(pending, count)
+                        pending = tokens[-1]
+                        steps += count
+                        self.assertEqual(tokens, expected)
+                        self.assertEqual(step.call_count, steps)
+                        self.assertEqual(session.ctx, reference.ctx)
+                        self.assertEqual(session.argmax_only, argmax_only)
+                        if argmax_only:
+                            self.assertEqual(session.frontier.top, ())
+                            with self.assertRaisesRegex(RefusedError, "argmax_only"):
+                                session.top_logits(8)
+                        else:
+                            self.assertEqual(session.top_logits(8), reference.top_logits(8))
+                self.assertEqual(backend.start_modes, [not argmax_only])
+
+    def test_a_failed_serial_run_drops_the_partially_advanced_sequence(self):
+        backend = FakeBackend()
+        session = Session(backend)
+        seed = session.sync(PROMPT)
+        failure = RuntimeError("the request reached the context limit")
+        with patch.object(backend, "step", wraps=backend.step, side_effect=[DEFAULT, failure]):
+            with self.assertRaisesRegex(RuntimeError, "context limit"):
+                session.serial_run(seed, 2)
+
+        self.assertFalse(session.ctx)
+        with self.assertRaisesRegex(RefusedError, "no live sequence"):
+            session.top_logits(8)
+        self.assertEqual(session.sync(PROMPT), seed)
+        self.assertEqual(session.serial_run(seed, 2), serial_stream(2))
 
     def test_spec_run_equals_the_serial_stream_at_every_depth(self):
         want = serial_stream(128)

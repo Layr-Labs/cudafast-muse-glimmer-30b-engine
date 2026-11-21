@@ -89,6 +89,54 @@ class AdapterEndToEnd(unittest.TestCase):
                     self.assertEqual(begin["effective_spec"]["mtp"]["depth"], depth)
                     self.assertGreater(run["drafted_total"], 0)
 
+    def test_split_serial_run_keeps_counters_and_restores_raw_logits_at_the_gate(self):
+        _, sock = self.boot(0)
+        counts = (1, 31, 96)
+        reference = Session(FakeBackend())
+        seed = reference.sync(PROMPT)
+        want_gate = reference.top_logits(8)
+        forced = seed + 1
+        want_gate_token = reference.eval(forced)
+        want_step = reference.top_logits(8)
+        want = serial_stream(sum(counts))
+        requests = [
+            {"kind": "free_decode_begin", "seed_tokens": PROMPT},
+            *({"kind": "free_decode_run", "count": count} for count in counts),
+            {"kind": "phase_diagnostics"},
+            {"kind": "free_decode_begin", "seed_tokens": PROMPT},
+            {"kind": "free_decode_run", "count": 1},
+            {"kind": "phase_diagnostics"},
+            {"kind": "correctness_begin", "prompt_tokens": PROMPT},
+            {"kind": "correctness_step", "token": forced},
+            {"kind": "phase_diagnostics"},
+        ]
+        replies = self.phase(sock, [dict(r, id=i) for i, r in enumerate(requests, 1)])
+        self.assertTrue(all(r["ok"] for r in replies[1:]), replies)
+        _, begin, *runs, close = replies[:6]
+        fresh_begin, fresh_run, fresh_close, gate, gate_step, gate_close = replies[6:]
+        self.assertEqual(begin["seed_token"], seed)
+        self.assertEqual(begin["effective_spec"], {"mode": "serial"})
+        offset = 0
+        for count, run in zip(counts, runs):
+            self.assertEqual(run["tokens"], want[offset : offset + count])
+            self.assertEqual(run["acceptance_lengths"], [1] * count)
+            self.assertEqual(run["committed_total"], count)
+            self.assertEqual(run["drafted_total"], 0)
+            self.assertEqual(run["accepted_total"], 0)
+            self.assertNotIn("verify_replay_disagreements", run)
+            offset += count
+        self.assertEqual(close["completed_work"], 1 + sum(counts))
+        self.assertEqual(fresh_begin["seed_token"], seed)
+        self.assertEqual(fresh_run["tokens"], want[:1])
+        self.assertEqual(fresh_close["completed_work"], 2)
+        self.assertEqual(gate["token"], seed)
+        self.assertEqual(gate_step["token"], want_gate_token)
+        self.assertEqual(gate_close["completed_work"], 2)
+        for reply, (ids, logits) in ((gate, want_gate), (gate_step, want_step)):
+            self.assertEqual(
+                reply["top_logits"], [{"token": t, "logit": v} for t, v in zip(ids, logits)]
+            )
+
     def resident_log(self) -> list[str]:
         self.log_file.flush()
         with open(self.log_path) as fp:

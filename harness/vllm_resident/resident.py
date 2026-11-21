@@ -5,9 +5,8 @@ timed decode, correctness). Loading the checkpoint in each would put a model
 load between every phase, so the weights live here instead, loaded once, and
 each phase's worker connects over a Unix socket (`src/resident.rs`).
 
-THE WIRE is the reference track's resident wire, verb for verb, so the Rust
-client is unchanged: NDJSON over AF_UNIX, one request per line, one reply per
-line, every reply carrying "ok" (and "error" when false).
+THE WIRE is NDJSON over AF_UNIX, one request per line, one reply per line,
+every reply carrying "ok" (and "error" when false).
 
   hello                          identity, vocab, EOS, depth, load epoch (ms)
   invalidate                     drop the live request
@@ -22,6 +21,8 @@ line, every reply carrying "ok" (and "error" when false).
                                  it. Absent or false: every position carries
                                  its top-k, as before
   eval {token}                   append one token; reply carries the argmax
+  serial_run {first_token,count} append count tokens one at a time; reply
+                                 carries each resulting frontier argmax
   argmax                         the frontier token
   top_logits {k}                 the frontier position's top-k raw logits
                                  (refused on an argmax_only sequence)
@@ -191,6 +192,19 @@ class Session:
         self._feed(token)
         return self.frontier.token  # type: ignore[union-attr]
 
+    def serial_run(self, token: int, count: int) -> list[int]:
+        self._check_ids([token])
+        tokens = []
+        try:
+            for _ in range(count):
+                token = self.eval(token)
+                tokens.append(token)
+        except (RefusedError, ValueError, RuntimeError):
+            # A failed request can have consumed part of the continuation.
+            self.invalidate()
+            raise
+        return tokens
+
     def cycle(self, fed: int, budget: int) -> list[int]:
         """One verify cycle on `fed` with `budget` tokens still wanted.
 
@@ -253,6 +267,7 @@ class Session:
             "draft_tokens": self.b.depth + 1,
             "ctx_size": self.b.ctx_size,
             "load_epoch": LOAD_EPOCH,
+            "serial_run": True,
             "spec_run": self.spec_run_offered,
             "ident": self.b.ident,
             "model_path": self.b.model_path,
@@ -290,6 +305,11 @@ class Session:
             return {"ok": True, "token": self.sync(tokens, bound, argmax_only)}, True
         if op == "eval":
             return {"ok": True, "token": self.eval(int_field("token"))}, True
+        if op == "serial_run":
+            count = int_field("count")
+            if not 1 <= count <= MAX_RUN:
+                raise RefusedError(f'serial_run needs a "count" in 1..{MAX_RUN}')
+            return {"ok": True, "tokens": self.serial_run(int_field("first_token"), count)}, True
         if op == "argmax":
             return {"ok": True, "token": self._need_frontier().token}, True
         if op == "top_logits":

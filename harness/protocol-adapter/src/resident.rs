@@ -18,14 +18,12 @@
 //! OpenAI-style HTTP server could not carry it: it has no teacher-forced eval,
 //! no raw top-k logits per position and no per-cycle speculative accounting.
 //!
-//! ## ONE ROUND TRIP PER DECODED TOKEN
+//! ## RESIDENT FREE RUNS
 //!
 //! Every state-advancing verb replies with the frontier argmax, which
-//! [`ResidentSession`] caches, so [`EngineSession::argmax`] costs nothing. That
-//! matters because `free_decode_run`'s loop sits INSIDE benchd's timed window:
-//! a decoded token is one `eval` (or one `eval_speculative`) and no more. The
-//! argmax is a pure read of logits the same call left ready, so returning it
-//! eagerly changes no semantics.
+//! [`ResidentSession`] caches, so [`EngineSession::argmax`] costs nothing.
+//! The `serial_run` and `spec_run` verbs return every frontier in one reply.
+//! Their loops still do the same work inside benchd's timed decode window.
 //!
 //! ## FAIL-CLOSED
 //!
@@ -87,6 +85,8 @@ pub struct ResidentHello {
     pub ident: String,
     pub model_path: String,
     pub mtp_head_path: String,
+    /// Whether the resident runs the serial eval loop in one request.
+    pub serial_run: bool,
     /// Whether the resident runs a whole speculative free run in one request
     /// (`spec_run`). A resident that does not say so is driven one cycle per
     /// request.
@@ -161,6 +161,7 @@ impl ResidentSession {
                 ident: String::new(),
                 model_path: String::new(),
                 mtp_head_path: String::new(),
+                serial_run: false,
                 spec_run: false,
             },
             frontier: None,
@@ -183,6 +184,10 @@ impl ResidentSession {
             ident: string_field(&reply, "ident")?,
             model_path: string_field(&reply, "model_path")?,
             mtp_head_path: string_field(&reply, "mtp_head_path")?,
+            serial_run: reply
+                .get("serial_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             spec_run: reply
                 .get("spec_run")
                 .and_then(Value::as_bool)
@@ -250,6 +255,22 @@ impl ResidentSession {
     /// Record a failure an infallible verb cannot return.
     fn poison_with(&mut self, err: String) {
         self.poison.get_or_insert(err);
+    }
+
+    fn serial_run_call(&mut self, first_token: i64, count: i64) -> Result<Vec<i64>, String> {
+        self.frontier = None;
+        let mut reply =
+            self.call(json!({"op": "serial_run", "first_token": first_token, "count": count}))?;
+        let tokens: Vec<i64> = serde_json::from_value(reply["tokens"].take())
+            .map_err(|err| format!("invalid tokens in the resident's serial_run reply: {err}"))?;
+        if tokens.len() as i64 != count {
+            return Err(format!(
+                "the resident's serial_run returned {} of {count} tokens",
+                tokens.len()
+            ));
+        }
+        self.frontier = tokens.last().copied();
+        Ok(tokens)
     }
 
     /// `spec_run`: the resident loops the speculative cycles itself and replies
@@ -355,6 +376,13 @@ impl EngineSession for ResidentSession {
     fn eval(&mut self, token: i64) -> Result<(), String> {
         let reply = self.call(json!({"op": "eval", "token": token}))?;
         self.take_frontier(&reply)
+    }
+
+    fn serial_run(&mut self, first_token: i64, count: i64) -> Option<Result<Vec<i64>, String>> {
+        if !self.hello.serial_run {
+            return None;
+        }
+        Some(self.serial_run_call(first_token, count))
     }
 
     fn argmax(&mut self) -> i64 {

@@ -24,6 +24,10 @@
       "why": "when the optional l2pf kernel package (harness/kernels/l2pf) is importable, the FULL CUDA graph gets one extra side-stream node per GEMM that L2-prefetches the first tiles of the next GEMM's weights; the GEMM sites are recorded on the warm-up run before the capture, only model parameters are prefetched, and no kernel on the main stream changes (L2PF=0 turns it off)"
     },
     {
+      "file": "vllm/_custom_ops.py, vllm/model_executor/kernels/linear/scaled_mm/cutlass.py, vllm/model_executor/layers/quantization/utils/glimmer_fp8.py",
+      "why": "the accepted glimmer_fp8_ext G2 tile serves the supported small FP8 GEMMs on GB10 with the stock accumulation order and scale rounding. L2 prefetch records the actual native launch or the stock CUTLASS overload with the same model weight pointer"
+    },
+    {
       "file": "vllm/model_executor/layers/mamba/ops/ssd_pinned_configs.py (+ pins in ssd_state_passing.py, ssd_bmm.py, ssd_chunk_scan.py, ssd_chunk_state.py)",
       "why": "Triton autotune picked different SSD tile configs per boot on GB10, making the same prompt yield one of two token streams; each kernel is pinned to one config (VLLM_MAMBA_SSD_AUTOTUNE=1 restores autotuning)"
     },

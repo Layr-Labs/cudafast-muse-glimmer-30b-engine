@@ -2191,13 +2191,14 @@ mod resident {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use serde_json::{json, Value};
 
     use crate::resident::ResidentSession;
-    use crate::session_backend::{EngineSession, SpecCounters, SpecRound};
+    use crate::session_backend::{EngineSession, SessionEngine, SpecCounters, SpecRound};
+    use crate::{Engine, Route};
 
     /// A scripted resident: answers every request from `replies` keyed by op,
     /// counting what it was asked. Serves one connection, then exits.
@@ -2508,14 +2509,107 @@ mod resident {
         server.finish();
     }
 
-    /// ONE ROUND TRIP PER DECODED TOKEN. `free_decode_run`'s serial loop is
-    /// `eval` then `argmax`; the eager argmax in the eval reply must make the
-    /// second one free, or the timed window pays two round trips a token.
+    fn scripted_serial_run(request: &Value) -> Value {
+        match request["op"].as_str().unwrap_or("") {
+            "hello" => {
+                let mut hello = scripted(request);
+                hello["serial_run"] = json!(true);
+                hello
+            }
+            "serial_run" => {
+                let first = request["first_token"].as_i64().unwrap();
+                let count = request["count"].as_i64().unwrap();
+                let tokens: Vec<_> = (first + 1..=first + count).collect();
+                json!({"ok": true, "tokens": tokens})
+            }
+            _ => scripted(request),
+        }
+    }
+
+    #[test]
+    fn serial_free_decode_run_sends_one_resident_request_each_time() {
+        let schedules: &[&[i64]] = &[&[128], &[1, 31, 96]];
+        for &counts in schedules {
+            let server = Server::start(scripted_serial_run);
+            let mut engine = SessionEngine::new(Arc::new(Mutex::new(server.connect())));
+            let (mut pending, _) = engine
+                .free_decode_begin(&[1, 2, 3], Route::Serial, None)
+                .unwrap();
+            let mut calls = vec![
+                json!({"op": "hello"}),
+                json!({"op": "sync", "tokens": [1, 2, 3], "argmax_only": true}),
+            ];
+
+            for &count in counts {
+                let run = engine.free_decode_run(count).unwrap();
+                assert_eq!(
+                    run.tokens,
+                    (pending + 1..=pending + count).collect::<Vec<_>>()
+                );
+                calls.push(json!({"op": "serial_run", "first_token": pending, "count": count}));
+                pending += count;
+            }
+            drop(engine);
+            calls.extend([json!({"op": "invalidate"}), json!({"op": "bye"})]);
+            assert_eq!(server.finish(), calls, "requests for schedule {counts:?}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_resident_free_run_uses_argmax_only_and_one_eval_per_token() {
+        let server = Server::start(scripted);
+        let mut engine = SessionEngine::new(Arc::new(Mutex::new(server.connect())));
+        let (seed, _) = engine
+            .free_decode_begin(&[1, 2, 3], Route::Serial, None)
+            .unwrap();
+        assert_eq!(engine.free_decode_run(1).unwrap().tokens, vec![777]);
+        assert_eq!(engine.free_decode_run(2).unwrap().tokens, vec![777; 2]);
+        drop(engine);
+
+        assert_eq!(
+            server.finish(),
+            [
+                json!({"op": "hello"}),
+                json!({"op": "sync", "tokens": [1, 2, 3], "argmax_only": true}),
+                json!({"op": "eval", "token": seed}),
+                json!({"op": "eval", "token": 777}),
+                json!({"op": "eval", "token": 777}),
+                json!({"op": "invalidate"}),
+                json!({"op": "bye"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_short_serial_run_reply_is_refused() {
+        fn broken(request: &Value) -> Value {
+            if request["op"] == "serial_run" {
+                json!({"ok": true, "tokens": [502]})
+            } else {
+                scripted_serial_run(request)
+            }
+        }
+        let server = Server::start(broken);
+        let mut engine = SessionEngine::new(Arc::new(Mutex::new(server.connect())));
+        engine
+            .free_decode_begin(&[1, 2, 3], Route::Serial, None)
+            .unwrap();
+        let err = engine.free_decode_run(2).unwrap_err().to_string();
+        assert!(err.contains("returned 1 of 2 tokens"), "{err}");
+        drop(engine);
+        let seen = server.finish();
+        let ops: Vec<&str> = seen.iter().map(|r| r["op"].as_str().unwrap()).collect();
+        assert_eq!(ops, ["hello", "sync", "serial_run", "invalidate", "bye"]);
+    }
+
+    /// Eagerly returning the frontier keeps individual evals to one round
+    /// trip each, including when a legacy resident drives the serial run.
     #[test]
     fn argmax_after_a_state_advancing_verb_costs_no_round_trip() {
         let server = Server::start(scripted);
         let mut session = server.connect();
         assert_eq!(server.requests(), 1); // hello
+        assert!(session.serial_run(5, 10).is_none());
 
         session.sync(&[1, 2, 3]).unwrap();
         assert_eq!(session.argmax(), 501);

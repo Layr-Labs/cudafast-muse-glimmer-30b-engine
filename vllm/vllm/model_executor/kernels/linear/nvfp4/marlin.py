@@ -26,6 +26,11 @@ try:
 except ImportError:
     marlinw = None
 
+try:
+    from muse_marlin_gemv import prepare_decode_layout
+except (ImportError, OSError):
+    prepare_decode_layout = None
+
 logger = init_logger(__name__)
 
 # Prompt-sized calls of NVFP4 weights much larger than L2 (MLP gate_up and
@@ -85,7 +90,18 @@ def _marlin_fp4_single(
     workspace: torch.Tensor,
     size_n: int,
     size_k: int,
+    decode_weight: torch.Tensor | None = None,
+    decode_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if (
+        x.shape[0] == 1
+        and x.dtype == torch.bfloat16
+        and decode_weight is not None
+        and decode_scales is not None
+    ):
+        return torch.ops.vllm.marlin_tiled_decode.default(
+            x, decode_weight, decode_scales, weight_global_scale, workspace, size_n, size_k
+        )
     return apply_fp4_marlin_linear(
         input=x,
         weight=weight,
@@ -158,11 +174,13 @@ def _marlin_fp4_wide(
     workspace: torch.Tensor,
     size_n: int,
     size_k: int,
+    decode_weight: torch.Tensor | None = None,
+    decode_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _log_prompt_stats()
     args = (x, weight, weight_scale, weight_global_scale, workspace, size_n, size_k)
     out = _marlin_fp4_wide_gemm(*args)
-    return out if out is not None else _marlin_fp4_single(*args)
+    return out if out is not None else _marlin_fp4_single(*args, decode_weight, decode_scales)
 
 
 def _marlin_fp4_wide_fake(
@@ -173,9 +191,17 @@ def _marlin_fp4_wide_fake(
     workspace: torch.Tensor,
     size_n: int,
     size_k: int,
+    decode_weight: torch.Tensor | None = None,
+    decode_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], size_n))
 
+
+direct_register_custom_op(
+    op_name="marlin_fp4_single_or_tiled",
+    op_func=_marlin_fp4_single,
+    fake_impl=_marlin_fp4_wide_fake,
+)
 
 direct_register_custom_op(
     op_name="marlin_fp4_wide",
@@ -252,6 +278,8 @@ def _marlin_fp4_col_sliced(
     size_n: int,
     size_k: int,
     sms: int,
+    decode_weight: torch.Tensor | None = None,
+    decode_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _log_prompt_stats()
     if _marlin_fp4_col_sliced_rows(
@@ -267,7 +295,8 @@ def _marlin_fp4_col_sliced(
             size_k,
         )
     return _marlin_fp4_single(
-        x, weight, weight_scale, weight_global_scale, workspace, size_n, size_k
+        x, weight, weight_scale, weight_global_scale, workspace, size_n, size_k,
+        decode_weight, decode_scales,
     )
 
 
@@ -282,6 +311,8 @@ def _marlin_fp4_col_sliced_fake(
     size_n: int,
     size_k: int,
     sms: int,
+    decode_weight: torch.Tensor | None = None,
+    decode_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], size_n))
 
@@ -454,6 +485,8 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
         )
         prepare_fp4_layer_for_marlin(layer)
         _prepare_prompt_gemm(layer)
+        if prepare_decode_layout is not None and USE_FP32_REDUCE_DEFAULT:
+            prepare_decode_layout(layer)
 
     def apply_weights(
         self,
@@ -462,31 +495,19 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         path = getattr(layer, "marlin_prompt_path", None)
-        if bias is None and path is not None:
+        decode_weight = getattr(layer, "_marlin_decode_weight", None)
+        if bias is None and (path is not None or decode_weight is not None):
             size_n = layer.output_size_per_partition
-            args = (
-                x.reshape(-1, x.shape[-1]),
-                layer.weight,
-                layer.weight_scale,
-            )
-            if path[0] == "wide":
-                out = torch.ops.vllm.marlin_fp4_wide(
-                    *args,
-                    layer.weight_global_scale,
-                    layer.workspace,
-                    size_n,
-                    layer.input_size_per_partition,
-                )
+            args = (x.reshape(-1, x.shape[-1]), layer.weight, layer.weight_scale)
+            tail = (layer.weight_global_scale, layer.workspace, size_n, layer.input_size_per_partition)
+            decode = (decode_weight, getattr(layer, "_marlin_decode_scales", None))
+            if path is None:
+                out = torch.ops.vllm.marlin_fp4_single_or_tiled(*args, *tail, *decode)
+            elif path[0] == "wide":
+                out = torch.ops.vllm.marlin_fp4_wide(*args, *tail, *decode)
             else:
                 out = torch.ops.vllm.marlin_fp4_col_sliced(
-                    *args,
-                    path[1],
-                    path[2],
-                    layer.weight_global_scale,
-                    layer.workspace,
-                    size_n,
-                    layer.input_size_per_partition,
-                    path[3],
+                    *args, path[1], path[2], *tail, path[3], *decode
                 )
             return out.reshape(x.shape[:-1] + (size_n,))
         return apply_fp4_marlin_linear(

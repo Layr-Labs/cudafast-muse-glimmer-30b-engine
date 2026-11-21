@@ -1,7 +1,8 @@
 """Prefetch the first bytes of every GEMM's weights in a captured CUDA graph.
 
 While a graph is captured, the GEMM entry points the compiled model calls
-(``torch.ops._C.marlin_gemm``, ``torch.ops._C.cutlass_scaled_mm`` and Inductor's
+(``torch.ops._C.marlin_gemm``, ``torch.ops._C.cutlass_scaled_mm``,
+``glimmer_fp8_ext.gemm`` and Inductor's
 ``extern_kernels.mm``) are wrapped. Right after GEMM i is enqueued, a side
 stream forks from the capture stream, waits for it, and queues an L2 prefetch
 of the first tiles GEMM i+1 will read; the side stream joins back right after
@@ -230,6 +231,14 @@ def _targets():
             continue
         out.append((pkt, "default", kind, False))
     try:
+        import glimmer_fp8_ext
+    except (ImportError, OSError):
+        pass
+    else:
+        # Wrap the actual launch, so falling back from the Python FP8 op
+        # records only the stock CUTLASS site through its default overload.
+        out.append((glimmer_fp8_ext, "gemm", "cutlass_fp8", False))
+    try:
         from torch._inductor.select_algorithm import extern_kernels
 
         if hasattr(extern_kernels, "mm"):
@@ -242,6 +251,11 @@ def _targets():
         out.append((ns, "unified_attention_with_output", "attn", True))
     except (AttributeError, RuntimeError):
         pass
+    try:
+        tiled = torch.ops.vllm.marlin_tiled_decode
+        out.append((tiled, "default", "marlin_tiled", False))
+    except (AttributeError, RuntimeError):
+        pass
     return out
 
 
@@ -251,8 +265,10 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[2], args[4])
         if kind == "cutlass":
             return (args[2],)
-        if kind == "mm":
+        if kind in ("cutlass_fp8", "mm"):
             return (args[1],)
+        if kind == "marlin_tiled":
+            return (args[1], args[2])
     except IndexError:
         return None
     return None
