@@ -44,15 +44,19 @@ from torch import nn
 from transformers import BatchFeature
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import (
     divide,
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+    FP8ScaledMMLinearKernel,
+)
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention, MMEncoderAttention
 from vllm.model_executor.layers.linear import (
@@ -63,6 +67,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.modelopt import (
+    ModelOptFp8LinearMethod,
+    ModelOptFp8PcPtLinearMethod,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -80,10 +88,18 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
+from vllm.platforms import current_platform
 from vllm.renderers import TokenizeParams
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processors.muse_glimmer import MuseGlimmerProcessor
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    aux_stream,
+    direct_register_custom_op,
+)
 
 from .interfaces import (
     EagleModelMixin,
@@ -1092,6 +1108,93 @@ class MuseGlimmerMLP(nn.Module):
         return x
 
 
+_GATE_LAYERS: dict[str, "MuseGlimmerAttention"] = {}
+
+
+def _gate_overlap_enabled() -> bool:
+    if (
+        is_forward_context_available()
+        and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+    ):
+        return False
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    return not BreakableCUDAGraphCapture.is_active()
+
+
+def muse_glimmer_gate_fork(
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    after: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    """Launch the output-gate GEMM on the aux stream once everything already
+    queued on the main stream (the QKV GEMM, `after`) is issued. Returns an
+    empty token that orders the join after this fork."""
+    self = _GATE_LAYERS[_resolve_layer_name(layer_name)]
+    self._gate_pending = None
+    if _gate_overlap_enabled():
+        start, done = self._gate_events
+        start.record()
+        with torch.cuda.stream(self._gate_stream):
+            start.wait()
+            gate = self._gate_mm(x_q, x_s)
+            done.record()
+        self._gate_pending = gate
+    return x_q.new_empty(0)
+
+
+def muse_glimmer_gate_fork_fake(
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    after: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return x_q.new_empty(0)
+
+
+def muse_glimmer_gate_join(
+    token: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    """Return the gate projection: wait for the aux-stream GEMM when the fork
+    launched one, otherwise run the GEMM here on the main stream. `x_q` stays
+    alive until this point, so the aux stream never reads a recycled buffer."""
+    self = _GATE_LAYERS[_resolve_layer_name(layer_name)]
+    gate = self._gate_pending
+    if gate is None:
+        return self._gate_mm(x_q, x_s)
+    self._gate_pending = None
+    self._gate_events[1].wait()
+    return gate
+
+
+def muse_glimmer_gate_join_fake(
+    token: torch.Tensor,
+    x_q: torch.Tensor,
+    x_s: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    self = _GATE_LAYERS[_resolve_layer_name(layer_name)]
+    return x_q.new_empty(
+        (x_q.shape[0], self._gate_width), dtype=self._gate_out_dtype
+    )
+
+
+direct_register_custom_op(
+    op_name="muse_glimmer_gate_fork",
+    op_func=muse_glimmer_gate_fork,
+    fake_impl=muse_glimmer_gate_fork_fake,
+)
+direct_register_custom_op(
+    op_name="muse_glimmer_gate_join",
+    op_func=muse_glimmer_gate_join,
+    fake_impl=muse_glimmer_gate_join_fake,
+)
+
+
 class MuseGlimmerAttention(nn.Module):
     def __init__(
         self,
@@ -1151,6 +1254,7 @@ class MuseGlimmerAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        self._gate_overlap = False
 
         self.use_output_gate = _muse_glimmer_use_attn_output_gate(config)
         if self.use_output_gate:
@@ -1162,6 +1266,7 @@ class MuseGlimmerAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.output_gate_proj",
             )
+            self._gate_overlap = self._init_gate_overlap(prefix)
 
         self.rotary_emb = (
             get_rope(
@@ -1190,12 +1295,66 @@ class MuseGlimmerAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+    def _init_gate_overlap(self, prefix: str) -> bool:
+        if not current_platform.is_cuda():
+            return False
+        quant_method = self.output_gate_proj.quant_method
+        if not isinstance(
+            quant_method, (ModelOptFp8LinearMethod, ModelOptFp8PcPtLinearMethod)
+        ):
+            return False
+        fp8 = quant_method.fp8_linear
+        if (
+            not isinstance(fp8, FP8ScaledMMLinearKernel)
+            or type(fp8).apply_weights is not FP8ScaledMMLinearKernel.apply_weights
+        ):
+            return False
+        out_dtype = fp8.config.out_dtype
+        self._gate_fp8 = fp8
+        self._gate_width = self.output_gate_proj.output_size_per_partition
+        self._gate_out_dtype = torch.bfloat16 if out_dtype is None else out_dtype
+        self._gate_stream = aux_stream()
+        self._gate_events = (torch.cuda.Event(), torch.cuda.Event())
+        self._gate_pending: torch.Tensor | None = None
+        self._gate_layer_name = _encode_layer_name(prefix)
+        _GATE_LAYERS[prefix] = self
+        return True
+
+    def _gate_mm(self, x_q: torch.Tensor, x_s: torch.Tensor) -> torch.Tensor:
+        """The output-gate GEMM exactly as `FP8ScaledMMLinearKernel.apply_weights`
+        issues it after quantizing (no bias on this projection)."""
+        w, w_s, _, _ = self._gate_fp8._get_layer_params(self.output_gate_proj)
+        return self._gate_fp8.apply_scaled_mm(
+            A=x_q,
+            B=w,
+            out_dtype=self._gate_out_dtype,
+            As=x_s,
+            Bs=w_s,
+            bias=None,
+            output_shape=[x_q.shape[0], w.shape[1]],
+        )
+
+    def _fork_output_gate(
+        self, hidden_states: torch.Tensor, after: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        _, _, x_s, x_s_ub = self._gate_fp8._get_layer_params(self.output_gate_proj)
+        x_2d = hidden_states.view(-1, hidden_states.shape[-1])
+        x_f32 = (x_2d.view(torch.int16).to(torch.int32) << 16).view(torch.float32)
+        x_q, x_s = self._gate_fp8.quant_fp8(x_f32, x_s, x_s_ub)
+        token = torch.ops.vllm.muse_glimmer_gate_fork(
+            x_q, x_s, after, self._gate_layer_name
+        )
+        return token, x_q, x_s
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        gate_fork = None
+        if self._gate_overlap and hidden_states.dtype == torch.bfloat16:
+            gate_fork = self._fork_output_gate(hidden_states, qkv)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if self.use_qk_norm:
@@ -1214,7 +1373,12 @@ class MuseGlimmerAttention(nn.Module):
 
         if self.use_output_gate:
             # Gate reads the layer input hidden states (not the attn output).
-            gate, _ = self.output_gate_proj(hidden_states)
+            if gate_fork is not None:
+                gate = torch.ops.vllm.muse_glimmer_gate_join(
+                    *gate_fork, self._gate_layer_name
+                )
+            else:
+                gate, _ = self.output_gate_proj(hidden_states)
             attn_output = torch.sigmoid(gate) * attn_output
 
         output, _ = self.o_proj(attn_output)

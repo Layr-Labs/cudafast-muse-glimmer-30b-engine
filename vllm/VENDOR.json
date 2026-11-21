@@ -22,6 +22,10 @@
     {
       "file": "vllm/v1/worker/gpu_model_runner.py",
       "why": "skip the MTP drafter when every request in the batch has max_tokens == 1: its drafts are never verified, and the drafter's pass over the prompt delayed the sampled token (the timed prefill)"
+    },
+    {
+      "file": "vllm/model_executor/models/muse_glimmer.py",
+      "why": "the attention output-gate FP8 GEMM (input: the layer input, independent of q/k/v) is forked onto an auxiliary CUDA stream right after the QKV GEMM and joined before the sigmoid multiply, overlapping QK-norm, RoPE, the KV-cache write and attention; same quantization code on the same bf16 bits and the same scaled-MM kernel on the same operands (bitwise identical); serial under piecewise CUDA graphs. The carried_from sha256 of this file names the unpatched vendor copy"
     }
   ],
   "carried_from": {
