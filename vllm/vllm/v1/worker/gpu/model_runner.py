@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -105,6 +106,7 @@ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
+from vllm.v1.worker.gpu.prefill_graph import PrefillGraph, capture_prefill_graph
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -122,6 +124,11 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 
 logger = init_logger(__name__)
+
+# No-draft decode builds two constant device tensors every step
+# (cu_num_logits = arange(num_reqs + 1), expanded_local_pos = zeros(num_reqs)).
+# Every consumer only reads them, so reuse one cached copy per num_reqs.
+_CACHE_DECODE_CONSTS = os.environ.get("VLLM_MUSE_CACHE_DECODE_CONSTS", "1") != "0"
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -262,6 +269,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
+        # LOCAL PATCH (prefill graph): whole-forward graph for one fresh
+        # prefill of a fixed length (vllm/v1/worker/gpu/prefill_graph.py).
+        self.prefill_graph: PrefillGraph | None = None
 
         # LoRA-related workers.
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
@@ -323,6 +333,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
+
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -783,6 +794,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculator is not None:
                 self.speculator.capture()
 
+        # LOCAL PATCH (prefill graph): captured apart from the dispatcher's
+        # graphs, so decode dispatch and compile ranges stay unchanged.
+        self.prefill_graph = capture_prefill_graph(self)
+
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
         elapsed_time = end_time - start_time
@@ -962,13 +977,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_draft_tokens = 0
             total_num_logits = num_reqs
             cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
-            cu_num_logits = torch.arange(
-                num_reqs + 1, device=self.device, dtype=torch.int32
-            )
             expanded_idx_mapping = idx_mapping
-            expanded_local_pos = torch.zeros(
-                num_reqs, dtype=torch.int32, device=self.device
-            )
+            consts = None
+            if _CACHE_DECODE_CONSTS and self.speculator is None:
+                cache = self.__dict__.setdefault("_muse_decode_consts", {})
+                consts = cache.get(num_reqs)
+                if consts is None:
+                    consts = cache[num_reqs] = (
+                        torch.arange(
+                            num_reqs + 1, device=self.device, dtype=torch.int32
+                        ),
+                        torch.zeros(num_reqs, dtype=torch.int32, device=self.device),
+                    )
+            if consts is not None:
+                cu_num_logits, expanded_local_pos = consts
+            else:
+                cu_num_logits = torch.arange(
+                    num_reqs + 1, device=self.device, dtype=torch.int32
+                )
+                expanded_local_pos = torch.zeros(
+                    num_reqs, dtype=torch.int32, device=self.device
+                )
         else:
             num_draft_tokens_per_req = np.fromiter(
                 (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
@@ -1420,7 +1449,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                 else:
                     # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                    model_output = None
+                    # LOCAL PATCH (prefill graph): a fresh, unpadded,
+                    # one-request prefill of the captured length replays
+                    # the boot graph; try_replay refuses any other step.
+                    prefill_graph = self.prefill_graph
+                    if (
+                        prefill_graph is not None
+                        and not dummy_run
+                        and not skip_compiled
+                        and num_tokens_across_dp is None
+                        and input_batch.num_reqs == 1
+                        and input_batch.num_draft_tokens == 0
+                        and input_batch.num_tokens == prefill_graph.num_tokens
+                        and input_batch.num_tokens_after_padding
+                        == prefill_graph.num_tokens
+                        and int(input_batch.num_computed_tokens_np[0]) == 0
+                    ):
+                        model_output = prefill_graph.try_replay(
+                            attn_metadata,
+                            slot_mappings_by_layer,
+                            model_inputs,
+                            input_batch.is_padding,
+                            batch_descriptor,
+                        )
+                    if model_output is None:
+                        model_output = self.model(**model_inputs)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

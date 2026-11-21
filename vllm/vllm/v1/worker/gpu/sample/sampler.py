@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import numpy as np
 import torch
 
@@ -25,6 +27,11 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.states import RequestState
+
+# The sampler's `input_ids` gather is only read by apply_sampling_params when
+# a request needs logits processing (penalties, bad words, ...). Defer it so
+# the plain greedy path launches no index kernel for an unused tensor.
+_LAZY_SAMPLER_INPUT_IDS = os.environ.get("VLLM_MUSE_LAZY_SAMPLER_IDS", "1") != "0"
 
 
 class Sampler:
@@ -77,7 +84,11 @@ class Sampler:
         cu_num_logits_np = input_batch.cu_num_logits_np
         expanded_local_pos = input_batch.expanded_local_pos
         pos = input_batch.positions[input_batch.logits_indices]
-        input_ids = input_batch.input_ids[input_batch.logits_indices]
+        if _LAZY_SAMPLER_INPUT_IDS:
+            _ids, _idx = input_batch.input_ids, input_batch.logits_indices
+            input_ids = lambda: _ids[_idx]  # noqa: E731
+        else:
+            input_ids = input_batch.input_ids[input_batch.logits_indices]
 
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
@@ -154,6 +165,8 @@ class Sampler:
     ) -> torch.Tensor:
         if not self._requires_logits_processing(idx_mapping_np):
             return logits
+        if callable(input_ids):
+            input_ids = input_ids()
 
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)

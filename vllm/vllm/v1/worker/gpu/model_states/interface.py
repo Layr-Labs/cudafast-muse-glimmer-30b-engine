@@ -68,6 +68,10 @@ class ModelState(ABC):
                 dtype=self.dtype,
                 device=self.device,
             )
+            # The embed-graph replay assumes static per-step host state (no
+            # LoRA mapping) and a real CUDA device.
+            if vllm_config.lora_config is not None or self.device.type != "cuda":
+                self.encoder_runner.embed_graph_enabled = False
 
     def get_supported_generation_tasks(self) -> tuple[GenerationTask, ...]:
         from vllm.model_executor.models.interfaces import (

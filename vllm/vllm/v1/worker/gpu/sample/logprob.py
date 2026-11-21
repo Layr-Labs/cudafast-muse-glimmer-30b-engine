@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import numpy as np
 import torch
 
@@ -11,6 +13,13 @@ from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
 # Upper bound on the topk kernel's per-iteration gather width.
 _MAX_TOPK_BLOCK = 1024
+
+# Fused fast path: one kernel replaces cat(sampled, topk) + gather (+ f32 cast)
+# + the full-vocab _ranks_kernel pass. The rank is still exact: it is counted
+# over the top-k columns when the sampled logit is strictly above the smallest
+# top-k logit (then no logit outside the top-k can be >= it), and otherwise the
+# kernel falls back to the same full-vocab count as _ranks_kernel.
+_FUSED_TOPK_RANK = os.environ.get("VLLM_MUSE_FUSED_TOPK_RANK", "1") != "0"
 
 
 @triton.jit
@@ -80,6 +89,62 @@ def _ranks_kernel(
     tl.store(output_ptr + req_idx, n)
 
 
+@triton.jit
+def _topk_ids_scores_rank_kernel(
+    out_ids_ptr,  # [batch_size, 1 + topk] int64
+    out_scores_ptr,  # [batch_size, 1 + topk] fp32 (written when LOGITS_MODE)
+    out_rank_ptr,  # [batch_size] int64
+    logits_ptr,
+    logits_stride,
+    sampled_ptr,  # [batch_size] int64
+    topk_ids_ptr,  # [batch_size, topk] int64 (torch.topk indices, contiguous)
+    topk,
+    vocab_size,
+    TOPK_BLOCK: tl.constexpr,
+    LOGITS_MODE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0).to(tl.int64)
+    row_ptr = logits_ptr + req_idx * logits_stride
+    ncols = topk + 1
+
+    sampled = tl.load(sampled_ptr + req_idx)
+    x = tl.load(row_ptr + sampled)
+
+    k_offset = tl.arange(0, TOPK_BLOCK)
+    k_mask = k_offset < topk
+    ids = tl.load(topk_ids_ptr + req_idx * topk + k_offset, mask=k_mask, other=0)
+    vals = tl.load(row_ptr + ids, mask=k_mask)
+
+    # Column 0 = sampled token, columns 1.. = topk indices (same as torch.cat).
+    tl.store(out_ids_ptr + req_idx * ncols, sampled)
+    tl.store(out_ids_ptr + req_idx * ncols + 1 + k_offset, ids, mask=k_mask)
+    if LOGITS_MODE:
+        # Same values as logits.gather(-1, ids).to(torch.float32).
+        tl.store(out_scores_ptr + req_idx * ncols, x.to(tl.float32))
+        tl.store(
+            out_scores_ptr + req_idx * ncols + 1 + k_offset,
+            vals.to(tl.float32),
+            mask=k_mask,
+        )
+
+    # Exact rank = #{v in row : v >= x}.
+    vmin = tl.min(tl.where(k_mask, vals, float("inf")))
+    n_nan = tl.sum(((vals != vals) & k_mask).to(tl.int32)) + (x != x).to(tl.int32)
+    n_top = tl.sum(((vals >= x) & k_mask).to(tl.int32))
+    if (n_nan == 0) & (x > vmin):
+        tl.store(out_rank_ptr + req_idx, n_top)
+    else:
+        n = 0
+        for i in range(0, vocab_size, BLOCK_SIZE):
+            block = i + tl.arange(0, BLOCK_SIZE)
+            logits = tl.load(
+                row_ptr + block, mask=block < vocab_size, other=float("-inf")
+            )
+            n += tl.sum((logits >= x).to(tl.int32))
+        tl.store(out_rank_ptr + req_idx, n)
+
+
 def compute_token_logprobs(
     logits: torch.Tensor, token_ids: torch.Tensor
 ) -> torch.Tensor:
@@ -118,6 +183,49 @@ def compute_topk_scores(
 ) -> LogprobsTensors:
     assert num_logprobs >= 0
     batch_size, vocab_size = logits.shape
+
+    if (
+        _FUSED_TOPK_RANK
+        and max_per_req_token_ids == 0
+        and 0 < num_logprobs <= _MAX_TOPK_BLOCK
+    ):
+        topk_indices = torch.topk(logits, num_logprobs, dim=-1).indices.contiguous()
+        sampled_i64 = sampled_token_ids.to(torch.int64).contiguous()
+        logprob_token_ids = torch.empty(
+            (batch_size, 1 + num_logprobs), dtype=torch.int64, device=logits.device
+        )
+        scores = (
+            torch.empty(
+                (batch_size, 1 + num_logprobs),
+                dtype=torch.float32,
+                device=logits.device,
+            )
+            if logits_mode
+            else logprob_token_ids  # placeholder pointer, not written
+        )
+        token_ranks = torch.empty(batch_size, dtype=torch.int64, device=logits.device)
+        _topk_ids_scores_rank_kernel[(batch_size,)](
+            logprob_token_ids,
+            scores,
+            token_ranks,
+            logits,
+            logits.stride(0),
+            sampled_i64,
+            topk_indices,
+            num_logprobs,
+            vocab_size,
+            TOPK_BLOCK=max(2, triton.next_power_of_2(num_logprobs)),
+            LOGITS_MODE=logits_mode,
+            BLOCK_SIZE=8192,  # type: ignore
+        )
+        if not logits_mode:
+            scores = compute_token_logprobs(logits, logprob_token_ids)
+        return LogprobsTensors(
+            logprob_token_ids=logprob_token_ids,
+            logprobs=scores,
+            selected_token_ranks=token_ranks,
+            cu_num_generated_tokens=cu_num_logits,
+        )
 
     if max_per_req_token_ids == 0:
         # Fast path: no request asked for custom logprob_token_ids.

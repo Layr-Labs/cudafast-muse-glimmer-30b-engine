@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import os
 
 import numpy as np
 import torch
@@ -13,6 +14,13 @@ from vllm.v1.outputs import (
     PoolerOutput,
 )
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+# Spinning copy-completion wait (port of dadon's piece, Yukon 03487090): the
+# per-step sampled-token D2H copy event is created without the blocking-sync
+# flag, so get_output()'s synchronize() spins in the driver (GIL released)
+# instead of sleeping on an OS wait. Host wake policy only: same copies, same
+# bytes. VLLM_SPIN_OUTPUT_WAIT=0 restores the blocking (sleep) event.
+_SPIN_OUTPUT_WAIT = os.environ.get("VLLM_SPIN_OUTPUT_WAIT", "1") != "0"
 
 
 class AsyncOutput(AsyncModelRunnerOutput):
@@ -31,8 +39,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.cuda.Event(blocking=True)
+        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock,
+        # unless VLLM_SPIN_OUTPUT_WAIT (default on) asks for a spin wait.
+        self.copy_event = torch.cuda.Event(blocking=not _SPIN_OUTPUT_WAIT)
         self._has_fault: torch.Tensor | None = None
 
         with stream(copy_stream, main_stream):

@@ -29,6 +29,15 @@ from .ScaledMMLinearKernel import (
     Int8ScaledMMLinearLayerConfig,
 )
 
+# kfp8 (harness/kernels/kfp8): a CUTLASS-exact FP8 w8a8 GEMV for small M (<= 16) on the
+# attention projection shapes (qkv 6656->4608, output_gate 6656->4096, o 4096->6656);
+# lineage: ivanfioravanti's fp8small (submission 31d30b53). KFP8=0 disables it;
+# when the package is not built, or a call is outside its guard, stock CUTLASS runs.
+try:
+    import kfp8 as _kfp8
+except ImportError:
+    _kfp8 = None
+
 
 class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     @classmethod
@@ -158,6 +167,7 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]
     ) -> None:
         self.logical_output_size: int | None = None
+        self._kfp8 = False
         super().__init__(c, layer_param_names)
 
     @classmethod
@@ -211,6 +221,13 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         pad_k = (16 - weight.shape[0] % 16) % 16
         pad_n = (16 - weight.shape[1] % 16) % 16
         if pad_k == 0 and pad_n == 0:
+            if (
+                _kfp8 is not None
+                and self.config.activation_quant_key == kFp8StaticTensorSym
+                and self.config.weight_quant_key == kFp8StaticTensorSym
+                and _kfp8.prepare(weight)
+            ):
+                self._kfp8 = True
             return
 
         # B is column-major [K, N]
@@ -256,6 +273,19 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         assert output_size is not None
         pad_k = padded_k - A.shape[1]
         pad_n = padded_n - output_size
+
+        if (
+            self._kfp8
+            and bias is None
+            and out_dtype == torch.bfloat16
+            and pad_k == 0
+            and pad_n == 0
+            and A.dim() == 2
+        ):
+            # Same result as the cutlass_scaled_mm call below (bit for bit); the op's
+            # eager impl picks kfp8 for M <= KFP8_MAX_M and CUTLASS otherwise.
+            output = _kfp8.apply(A, B, As, Bs)
+            return output.view(*output_shape[:-1], output_size)
 
         if pad_k > 0:
             A = self._pad_to_alignment(A, dim=1, alignment=16)

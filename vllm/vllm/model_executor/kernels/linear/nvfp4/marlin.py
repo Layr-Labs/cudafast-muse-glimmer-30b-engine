@@ -14,6 +14,14 @@ from .base import NvFp4LinearKernel, NvFp4LinearLayerConfig
 
 logger = init_logger(__name__)
 
+# kpre (harness/kernels/kpre): vLLM's own Marlin kernel for prefill M (multiple of 64) on the
+# MLP gate_up/down shapes, part-1 tiles visited column-major over the 64-row M slabs (same
+# per-output arithmetic, bit-identical). Every other call runs stock Marlin. KPRE=0 disables it; a missing build or an ineligible call runs the old path.
+try:
+    import kpre as _kpre
+except ImportError:
+    _kpre = None
+
 
 class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
     """NVFP4 weight-only GEMM via Marlin (W4A16)."""
@@ -38,6 +46,8 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
             "performance for compute-heavy workloads."
         )
         prepare_fp4_layer_for_marlin(layer)
+        if _kpre is not None and _kpre.prepare(layer):
+            logger.info_once("kpre: column-major Marlin enabled for prefill M")
 
     def apply_weights(
         self,
@@ -45,6 +55,10 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if bias is None and _kpre is not None:
+            out = _kpre.apply(layer, x)
+            if out is not None:
+                return out
         return apply_fp4_marlin_linear(
             input=x,
             weight=layer.weight,

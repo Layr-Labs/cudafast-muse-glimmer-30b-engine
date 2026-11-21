@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import numpy as np
 import torch
 
@@ -16,6 +18,14 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 logger = init_logger(__name__)
+
+# Text-only decode steps of a multimodal checkpoint run the token embedding
+# (and the model's eager embed ops, e.g. an embed norm) outside the model's
+# CUDA graph, one launch per op. Replay the very same eager ATen kernels from a
+# small CUDA graph instead: same kernels, same shapes, same input/output
+# buffers, so the bytes written to inputs_embeds are identical.
+_EMBED_GRAPH = os.environ.get("VLLM_MUSE_EMBED_GRAPH", "1") != "0"
+_EMBED_GRAPH_MAX_TOKENS = 8
 
 
 class EncoderRunner:
@@ -39,6 +49,9 @@ class EncoderRunner:
         self.inputs_embeds = torch.zeros(
             max_num_tokens, hidden_size, dtype=dtype, device=device
         )
+        self.embed_graph_enabled = _EMBED_GRAPH
+        # n -> (input_ids data_ptr, CUDAGraph | None); None = seen once (warm).
+        self._embed_graphs: dict[int, tuple[int, torch.cuda.CUDAGraph | None]] = {}
 
     def prepare_mm_inputs(
         self, scheduled_encoder_inputs: dict[str, list[int]]
@@ -201,6 +214,42 @@ class EncoderRunner:
         mm_embeds: list[torch.Tensor],
         is_mm_embed: torch.Tensor,
     ) -> torch.Tensor:
+        n = input_ids.shape[0]
+        if (
+            self.embed_graph_enabled
+            and not mm_embeds
+            and not self.is_realtime
+            and 0 < n <= _EMBED_GRAPH_MAX_TOKENS
+            and input_ids.is_cuda
+            and input_ids.is_contiguous()
+        ):
+            # No media in this step, so is_mm_embed is all False and the
+            # text-only embed path computes the same embeddings.
+            ptr = input_ids.data_ptr()
+            entry = self._embed_graphs.get(n)
+            if entry is not None and entry[0] == ptr and entry[1] is not None:
+                entry[1].replay()
+                return self.inputs_embeds
+            if entry is not None and entry[0] == ptr:
+                # Second sighting (kernels already loaded by the eager run):
+                # capture the same eager ops into a graph, then replay it.
+                graph = torch.cuda.CUDAGraph()
+                try:
+                    with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+                        self.inputs_embeds[:n] = self.model.embed_input_ids(input_ids)
+                except Exception as e:  # capture-unsafe embed: stay eager
+                    logger.warning("Embed CUDA graph disabled: %s", e)
+                    self.embed_graph_enabled = False
+                else:
+                    self._embed_graphs[n] = (ptr, graph)
+                    graph.replay()
+                    return self.inputs_embeds
+            else:
+                self._embed_graphs[n] = (ptr, None)
+            x = self.model.embed_input_ids(input_ids)
+            self.inputs_embeds[:n] = x
+            return self.inputs_embeds
+
         x = self.model.embed_input_ids(
             input_ids, multimodal_embeddings=mm_embeds, is_multimodal=is_mm_embed
         )
