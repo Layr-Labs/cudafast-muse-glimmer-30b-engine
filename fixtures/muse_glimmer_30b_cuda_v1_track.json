@@ -58,7 +58,7 @@
     "pool-10",
     "pool-11"
   ],
-  "baseline_reference_commit": "0000000000000000000000000000000000000000",
+  "baseline_reference_commit": "edd5d6c44d3d76d931b7322ac74f3114bbbac748",
   "pool_status": "recorded: each live golden (pool-9, pool-10, pool-11) has one serial golden, recorded on a Spark and pinned below by bytes and sha256",
   "timed_prompt_pool": [
     {

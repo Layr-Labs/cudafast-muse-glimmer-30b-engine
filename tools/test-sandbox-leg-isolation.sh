@@ -16,6 +16,13 @@
 #     directory, REFUSES the leg (LEG-ISOLATION-REFUSED): the adapter never
 #     runs, the wrapper exits non-zero, and only directory names and counts are
 #     printed, never an entry name.
+#   * when benchd SIGKILLs a leg's first wrapper and spawns a second adapter on
+#     the same leg (the pinned correctness worker), the killed adapter's home
+#     (adapter-home/leg.<this leg's tag>.XXXXXX) is wiped and removed before the
+#     second adapter starts (LEG-ISOLATION-CLEARED); that adapter runs on an
+#     empty HOME and reads nothing the first wrote. A home of another leg's
+#     tag, any other name, a symlink, or a home a live process keeps writing
+#     into still REFUSES the leg.
 #
 # Hermetic: sudo and pgrep are stubs on PATH (as in
 # tools/test-run-engine-sandboxed.sh); the stub sudo runs the command as this
@@ -73,7 +80,16 @@ case "$1" in
     ;;
   --probe)
     echo "home=${HOME}"
+    echo "homecount=$(find "${HOME}" -mindepth 1 | wc -l)"
     find "${job}" -name stash -type f -readable 2>/dev/null | sed 's/^/found=/'
+    ;;
+  --plant-and-hang)
+    # A first adapter of a leg that benchd drops: it plants, then waits on
+    # benchd's stdin until EOF. State goes next to the job dir, outside it.
+    echo "leg 1 prompt" > "${HOME}/stash"
+    echo planted > "${job%/*}/hang.state"
+    while read -r _; do :; done
+    echo exited > "${job%/*}/hang.state"
     ;;
 esac
 exit 0
@@ -156,6 +172,107 @@ leg --probe
   && ok "case 3: this leg's own resident directory alone in sock/ is allowed" \
   || fail "case 3: status ${status}, err '${err}'"
 rm -rf "${JOB}/sock/5-20261121T000400Z"
+
+# wait_for CMD -- up to 10 s for CMD to succeed.
+wait_for() { local _i; for _i in $(seq 100); do bash -c "$1" && return 0; sleep 0.1; done; return 1; }
+STATE="${WORK}/sbx/hang.state"
+
+# --- case 4: benchd SIGKILLs the first adapter's wrapper; a second adapter of
+# the SAME leg runs, on a cleared, empty HOME (official.rs:2577-2583 drops the
+# correctness session and spawns the pinned correctness worker; the Drop is a
+# SIGKILL on this wrapper, bench-runner transport.rs:1177-1181) --------------
+TAG4="6-20261121T000500Z"
+mkdir -p "${JOB}/sock/${TAG4}"
+RESIDENT_SOCKET="${JOB}/sock/${TAG4}/vllm-resident.sock"
+mkfifo "${WORK}/stdin.fifo"
+exec 8<>"${WORK}/stdin.fifo"   # benchd's write end of the adapter's stdin
+rm -f "${STATE}"
+: > "${WORK}/sudo.log"
+env PATH="${WORK}/bin:${PATH}" \
+    SANDBOX_USER=nemosub SANDBOX_ENGINE_BIN="${WORK}/adapter" \
+    SANDBOX_ENGINE_LOG_DIR="${WORK}/logs" SANDBOX_ROOT="${WORK}/sbx" SANDBOX_JOB=9-1 \
+    DS4_RESIDENT_SOCKET="${RESIDENT_SOCKET}" BENCH_WORKER_RESIDENT_SOCKET="${RESIDENT_SOCKET}" \
+    STUB_SUDO_LOG="${WORK}/sudo.log" \
+    "${WRAPPER}" --plant-and-hang <"${WORK}/stdin.fifo" >/dev/null 2>"${WORK}/err1" 8>&- &
+wpid=$!
+if wait_for "grep -qsx planted '${STATE}'"; then
+  kill -KILL "${wpid}"; wait "${wpid}" 2>/dev/null
+  exec 8>&-                     # benchd closes the pipe; the orphaned adapter exits
+  wait_for "grep -qsx exited '${STATE}'" || fail "case 4: the first adapter did not exit after stdin closed"
+  left="$(find "${JOB}/adapter-home" -mindepth 1 -maxdepth 1 | wc -l)"
+  [[ "${left}" -eq 1 ]] \
+    && ok "case 4: the killed wrapper left its leg home behind (the fault)" \
+    || fail "case 4: after the kill adapter-home holds ${left} entries, expected 1"
+  leg --probe
+  home4="$(sed -n 's/^home=//p' <<<"${out}")"
+  homecount="$(sed -n 's/^homecount=//p' <<<"${out}")"
+  found="$(grep -c '^found=' <<<"${out}")"
+  if [[ "${status}" -eq 0 ]] && grep -q 'LEG-ISOLATION-CLEARED 1 entries left by a killed leg' <<<"${err}" \
+     && [[ "${homecount}" == 0 && "${found}" -eq 0 && "${home4}" == "${JOB}/adapter-home/leg.${TAG4}."* ]]; then
+    ok "case 4: the second adapter of the leg runs (CLEARED) on an empty HOME and reads nothing the first wrote"
+  else
+    fail "case 4: second adapter status ${status}, home entries '${homecount}', read ${found} file(s), home '${home4}', err '${err}'"
+  fi
+  empty_dir "${JOB}/adapter-home" \
+    && ok "case 4: after the second adapter adapter-home is empty" \
+    || fail "case 4: adapter-home holds '$(ls -A "${JOB}/adapter-home" | tr '\n' ' ')'"
+else
+  kill -KILL "${wpid}" 2>/dev/null; exec 8>&-
+  fail "case 4: the first adapter never planted; err '$(cat "${WORK}/err1")'"
+fi
+rm -rf "${JOB:?}/adapter-home/"* "${JOB}/sock/${TAG4}"
+
+# --- case 5: a killed adapter's home is cleared ONLY by its own leg ----------
+# Another leg's tag, a malformed name of this leg's tag, and a symlink of this
+# leg's pattern all REFUSE: none is this leg's own earlier home.
+TAG5="8-20261121T000700Z"
+mkdir -p "${JOB}/sock/${TAG5}"
+RESIDENT_SOCKET="${JOB}/sock/${TAG5}/vllm-resident.sock"
+mkdir -p "${WORK}/elsewhere"; echo "old prompt" > "${WORK}/elsewhere/stash"
+for name in "leg.7-20261121T000600Z.Ab12Cd" "leg.${TAG5}.Ab12Cd.x" "leg.${TAG5}" "leg.Ab12Cd" "symlink"; do
+  if [[ "${name}" == symlink ]]; then
+    ln -s "${WORK}/elsewhere" "${JOB}/adapter-home/leg.${TAG5}.Zz99Yy"
+  else
+    mkdir -p "${JOB}/adapter-home/${name}"; echo "old prompt" > "${JOB}/adapter-home/${name}/stash"
+  fi
+  : > "${WORK}/sudo.log"
+  leg --probe
+  if [[ "${status}" -ne 0 ]] && ! adapter_ran && grep -q 'LEG-ISOLATION-REFUSED: adapter-home holds 1 entry' <<<"${err}" \
+     && ! grep -q 'LEG-ISOLATION-CLEARED' <<<"${err}" && ! grep -q 'Ab12Cd\|Zz99Yy' <<<"${err}"; then
+    ok "case 5: a leftover '${name}' that is not this leg's own home refuses the leg"
+  else
+    fail "case 5 (${name}): status ${status}, adapter ran: $(adapter_ran && echo yes || echo no), err '${err}'"
+  fi
+  [[ -e "${WORK}/elsewhere/stash" ]] || fail "case 5 (${name}): the symlink target was touched"
+  rm -rf "${JOB:?}/adapter-home/"*
+done
+rm -rf "${JOB}/sock/${TAG5}"
+
+# --- case 6: a live sandbox-user process that keeps writing into this leg's
+# killed home: the clear cannot finish, so the leg REFUSES ---------------------
+TAG6="9-20261121T000800Z"
+mkdir -p "${JOB}/sock/${TAG6}" "${JOB}/adapter-home/leg.${TAG6}.Live01"
+RESIDENT_SOCKET="${JOB}/sock/${TAG6}/vllm-resident.sock"
+writers=()
+for w in 1 2 3; do
+  ( d="${JOB}/adapter-home/leg.${TAG6}.Live01"; while [[ -d "${d}" ]]; do echo "leg 1 prompt" > "${d}/stash${w}" 2>/dev/null; done ) &
+  writers+=("$!")
+done
+sleep 0.2
+: > "${WORK}/sudo.log"
+leg --probe
+found="$(grep -c '^found=' <<<"${out}")"
+if [[ "${status}" -ne 0 ]] && ! adapter_ran && grep -q 'LEG-ISOLATION-REFUSED: adapter-home holds 1 entry' <<<"${err}"; then
+  ok "case 6: a live process holding this leg's killed home refuses the leg"
+elif [[ "${status}" -eq 0 && "${found}" -eq 0 ]] && grep -q 'LEG-ISOLATION-CLEARED' <<<"${err}"; then
+  # Only if all three writers were starved for the whole clear: the home is
+  # gone, and still nothing it held is readable. Isolation holds either way.
+  ok "case 6: the writers were starved, the home was removed, the adapter read nothing (race outcome)"
+else
+  fail "case 6: status ${status}, adapter ran: $(adapter_ran && echo yes || echo no), read ${found} file(s), err '${err}'"
+fi
+kill "${writers[@]}" 2>/dev/null; wait "${writers[@]}" 2>/dev/null
+rm -rf "${JOB:?}/adapter-home/"* "${JOB}/sock/${TAG6}"
 
 if [[ "${failures}" -eq 0 ]]; then
   echo "PASS: test-sandbox-leg-isolation.sh"

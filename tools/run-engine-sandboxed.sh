@@ -35,15 +35,31 @@
 #     (defaults 4096 and 16 GiB; override with ADAPTER_NPROC_LIMIT /
 #     ADAPTER_AS_LIMIT bytes).
 #   * PER-LEG STORAGE. benchd spawns this wrapper once per candidate leg, before
-#     the leg's warm-up and timed phases. The adapter's HOME and TMPDIR is a
+#     the leg's warm-up and timed phases (and once more on the same leg for the
+#     pinned correctness golden, above). The adapter's HOME and TMPDIR is a
 #     FRESH directory made here, $SANDBOX_ROOT/$SANDBOX_JOB/adapter-home/
-#     leg.XXXXXX (2770; adapter-home itself is 2750, made by
-#     tools/engine/build.sh, so the sandbox user cannot plant a name in it).
-#     After the leg, that directory is removed and the job's build scratch dirs
-#     (cargo-home, target, kernels-out: nothing reads them at run time) are
-#     emptied (tools/sandbox-clear-dirs.sh); a failed clear fails the leg.
+#     leg.<tag>.XXXXXX, where <tag> is this leg's resident directory name
+#     (sock/<tag>/, the run tag tools/serve-up.sh --boot makes with an
+#     exclusive mkdir, one per leg); leg.XXXXXX when no such directory is
+#     named. It is 2770; adapter-home itself is 2750, made by
+#     tools/engine/build.sh, so the sandbox user cannot plant, rename or remove
+#     a name in it: every name in adapter-home was made by this wrapper.
+#     After the adapter, that directory is removed and the job's build scratch
+#     dirs (cargo-home, target, kernels-out: nothing reads them at run time)
+#     are emptied (tools/sandbox-clear-dirs.sh); a failed clear fails the leg.
 #     tools/serve-up.sh --stop removes the leg's resident directory under sock/,
 #     and tools/sandbox-wipe.sh clears the shared temp dirs.
+#   * A KILLED ADAPTER OF THIS LEG. benchd ends a session by SIGKILL on this
+#     wrapper (bench-runner transport.rs Drop), so the clear above never runs
+#     for the first adapter when benchd drops it for the pinned correctness
+#     worker. Before the check below, a leg.<tag>.XXXXXX directory of THIS
+#     leg's own tag is that killed adapter's home: it is emptied with the same
+#     tools/sandbox-clear-dirs.sh and removed, one line is logged
+#     (LEG-ISOLATION-CLEARED <n> entries left by a killed leg), and the check
+#     below then runs as before. That is no leak across legs: the earlier
+#     adapter ran on the same resident, for the same candidate, in the same
+#     leg, and its data is wiped before this adapter starts. A home of any
+#     other tag, or of none, is not cleared: it refuses as before.
 #   * LEG ISOLATION CHECK. Before the adapter starts, any entry in adapter-home,
 #     cargo-home, target or kernels-out, or any sock/ entry other than this
 #     leg's resident directory (the one benchd's socket names), is a file an
@@ -82,6 +98,48 @@ CLEAR_DIRS="$(dirname -- "${BASH_SOURCE[0]}")/sandbox-clear-dirs.sh"
 log_dir="${SANDBOX_ENGINE_LOG_DIR:-}"
 [[ -n "${log_dir}" && -d "${log_dir}" ]] || die "SANDBOX_ENGINE_LOG_DIR is not a directory: '${log_dir}'"
 
+# This leg's resident directory: serve-up.sh's sock/<run tag>/vllm-resident.sock,
+# named by the socket benchd injects. serve-up.sh resolves the socket dir with
+# pwd -P, so the parents are compared physically. Nothing else may be in sock/.
+# LEG_TAG names this leg's adapter homes (header): set only when every socket
+# names the same existing, non-symlink directory there with a plain name.
+own=()
+tags=()
+sock_real="$(cd -- "${job_dir}/sock" 2>/dev/null && pwd -P)"
+for s in "${DS4_RESIDENT_SOCKET:-}" "${BENCH_WORKER_RESIDENT_SOCKET:-}"; do
+  [[ -n "${sock_real}" && "$(basename -- "${s}")" == vllm-resident.sock ]] || continue
+  leg_dir="$(dirname -- "${s}")"
+  [[ "$(cd -- "$(dirname -- "${leg_dir}")" 2>/dev/null && pwd -P)" == "${sock_real}" ]] || continue
+  own+=(! -name "$(basename -- "${leg_dir}")")
+  tags+=("$(basename -- "${leg_dir}")")
+done
+LEG_TAG=""
+for tag in "${tags[@]}"; do
+  if [[ "${tag}" =~ ^[A-Za-z0-9_-]+$ && -d "${sock_real}/${tag}" && ! -L "${sock_real}/${tag}" \
+        && ( -z "${LEG_TAG}" || "${LEG_TAG}" == "${tag}" ) ]]; then
+    LEG_TAG="${tag}"
+  else
+    LEG_TAG=""; break
+  fi
+done
+
+# A KILLED ADAPTER OF THIS LEG (header). Only directories whose whole name is
+# this leg's home pattern are cleared; every other entry stays for the check.
+if [[ -n "${LEG_TAG}" ]]; then
+  stale=()
+  while IFS= read -r -d '' p; do
+    [[ "$(basename -- "${p}")" =~ ^leg\.${LEG_TAG}\.[A-Za-z0-9]{6}$ ]] && stale+=("${p}")
+  done < <(find -P "${adapter_homes}" -mindepth 1 -maxdepth 1 -type d -name "leg.${LEG_TAG}.*" -print0 2>/dev/null)
+  if (( ${#stale[@]} > 0 )); then
+    n="$(find -P "${stale[@]}" -mindepth 1 -printf . 2>/dev/null | wc -c)"
+    if "${CLEAR_DIRS}" "${SANDBOX_USER}" "${stale[@]}" && rmdir -- "${stale[@]}"; then
+      echo "run-engine-sandboxed.sh: LEG-ISOLATION-CLEARED ${n} entries left by a killed leg (${#stale[@]} home(s) of an earlier adapter of this same leg, wiped before this adapter runs)" >&2
+    else
+      echo "::error::run-engine-sandboxed.sh: a killed adapter's home of this leg could not be cleared (above)" >&2
+    fi
+  fi
+fi
+
 # THE LEG ISOLATION CHECK (header). Entries are counted, never named.
 refuse_leg() { echo "::error::run-engine-sandboxed.sh: LEG-ISOLATION-REFUSED: $1 holds $2 entr$( (( $2 == 1 )) && echo y || echo ies) an earlier leg may have left; the adapter does not run" >&2; exit 1; }
 entries() { find -P "$1" -mindepth 1 -maxdepth 1 "${@:2}" -printf . 2>/dev/null | wc -c; }
@@ -90,25 +148,15 @@ for d in adapter-home "${SCRATCH_DIRS[@]}"; do
   n="$(entries "${job_dir}/${d}")" || die "cannot list ${d} for the leg isolation check"
   (( n == 0 )) || refuse_leg "${d}" "${n}"
 done
-# This leg's resident directory: serve-up.sh's sock/<run tag>/vllm-resident.sock,
-# named by the socket benchd injects. serve-up.sh resolves the socket dir with
-# pwd -P, so the parents are compared physically. Nothing else may be in sock/.
-own=()
-sock_real="$(cd -- "${job_dir}/sock" 2>/dev/null && pwd -P)"
-for s in "${DS4_RESIDENT_SOCKET:-}" "${BENCH_WORKER_RESIDENT_SOCKET:-}"; do
-  [[ -n "${sock_real}" && "$(basename -- "${s}")" == vllm-resident.sock ]] || continue
-  leg_dir="$(dirname -- "${s}")"
-  [[ "$(cd -- "$(dirname -- "${leg_dir}")" 2>/dev/null && pwd -P)" == "${sock_real}" ]] || continue
-  own+=(! -name "$(basename -- "${leg_dir}")")
-done
 if [[ -n "${sock_real}" ]]; then
   n="$(entries "${job_dir}/sock" "${own[@]}")" || die "cannot list sock for the leg isolation check"
   (( n == 0 )) || refuse_leg sock "${n}"
 fi
 
 # A fresh home for this leg only: mktemp -d makes it exclusively (0700, the
-# caller's), then the sandbox user gets write through the share group.
-adapter_home="$(mktemp -d "${adapter_homes}/leg.XXXXXX")" || die "cannot create this leg's home under ${adapter_homes}"
+# caller's), then the sandbox user gets write through the share group. Its name
+# carries this leg's tag, so a later adapter of the same leg can recognise it.
+adapter_home="$(mktemp -d "${adapter_homes}/leg.${LEG_TAG:+${LEG_TAG}.}XXXXXX")" || die "cannot create this leg's home under ${adapter_homes}"
 chmod 2770 "${adapter_home}" || die "cannot open this leg's home ${adapter_home} to ${SANDBOX_USER}"
 # mktemp creates the file 0600 and exclusively, so a name or symlink planted in a
 # shared directory cannot redirect it.
