@@ -65,6 +65,7 @@ from vllm.v1.fault_tolerance.utils import (
 )
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
+from vllm.v1.worker import hostfast
 
 logger = init_logger(__name__)
 
@@ -315,11 +316,31 @@ class InprocClient(EngineCoreClient):
 
     def __init__(self, *args, **kwargs):
         self.engine_core = EngineCore(*args, **kwargs)
+        logger.info("Engine core runs in the client process")
+
+    def _hostfast_idle_if_finished(self) -> None:
+        # There is no busy loop in this mode: hand the collector back once the
+        # scheduler has nothing left and no batch is still in flight.
+        if (
+            not self.engine_core.scheduler.has_requests()
+            and not self.engine_core.batch_queue
+        ):
+            hostfast.gc_idle()
 
     def get_output(self) -> EngineCoreOutputs:
-        outputs, model_executed = self.engine_core.step_fn()
-        self.engine_core.post_step(model_executed=model_executed)
-        return outputs and outputs.get(0) or EngineCoreOutputs()
+        if hostfast.gc_busy():
+            logger.info_once(
+                "Automatic garbage collection is paused while the engine has work"
+            )
+        try:
+            outputs, model_executed = self.engine_core.step_fn()
+            self.engine_core.post_step(model_executed=model_executed)
+            self._hostfast_idle_if_finished()
+            return outputs and outputs.get(0) or EngineCoreOutputs()
+        except BaseException:
+            # The interpreter outlives this call, including on interruption.
+            hostfast.gc_idle()
+            raise
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.engine_core.get_supported_tasks()
@@ -329,11 +350,30 @@ class InprocClient(EngineCoreClient):
         self.engine_core.add_request(req, request_wave)
 
     def abort_requests(self, request_ids: list[str]) -> None:
-        if len(request_ids) > 0:
-            self.engine_core.abort_requests(request_ids)
+        try:
+            if len(request_ids) > 0:
+                self.engine_core.abort_requests(request_ids)
+            # LLMEngine calls this after every output, including with an empty
+            # list when a bounded request has completed. Its output processor
+            # can already report no unfinished request while the core still
+            # owns a queued batch or finished-request cleanup, and no
+            # background loop settles them in this mode. Drain once the last
+            # live request is gone, before another request can be added; never
+            # advance a different live request.
+            scheduler = self.engine_core.scheduler
+            if not scheduler.has_unfinished_requests():
+                while scheduler.has_requests() or self.engine_core.batch_queue:
+                    self.get_output()
+            self._hostfast_idle_if_finished()
+        except BaseException:
+            hostfast.gc_idle()
+            raise
 
     def shutdown(self, timeout: float | None = None) -> None:
-        self.engine_core.shutdown()
+        try:
+            self.engine_core.shutdown()
+        finally:
+            hostfast.gc_idle()
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         self.engine_core.profile(is_start, profile_prefix)

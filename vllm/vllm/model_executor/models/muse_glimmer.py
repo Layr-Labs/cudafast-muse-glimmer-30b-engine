@@ -32,6 +32,7 @@ adapter/projection stack.
 """
 
 import math
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 from typing import Annotated, Literal
@@ -44,13 +45,20 @@ from torch import nn
 from transformers import BatchFeature
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import (
+    CacheConfig,
+    CompilationMode,
+    CUDAGraphMode,
+    VllmConfig,
+    get_current_vllm_config_or_none,
+)
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import (
     divide,
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -60,6 +68,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -80,10 +89,12 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
+from vllm.platforms import current_platform
 from vllm.renderers import TokenizeParams
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processors.muse_glimmer import MuseGlimmerProcessor
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .interfaces import (
     EagleModelMixin,
@@ -1092,6 +1103,204 @@ class MuseGlimmerMLP(nn.Module):
         return x
 
 
+class _GateSideStream:
+    """Overlaps the attention output gate projection with attention.
+
+    ``output_gate_proj`` reads the layer input, not the attention output, so
+    its weight stream does not have to wait for the latency-bound attention
+    chain (QK-norm, RoPE, KV-cache write and the attention kernel). After the
+    fork the gate projection stays on the current stream and the attention
+    chain moves to a high-priority side stream, so that its small kernels get
+    SMs ahead of the gate GEMM's remaining tiles; the join brings the current
+    stream back and makes it wait for the chain.
+
+    The fork, switch and join ops below are graph splitting points
+    (``CompilationConfig._side_stream_ops``): they run eagerly between the
+    compiled pieces, so the gate projection is a compiled piece of its own and
+    every piece launches its kernels on the stream that is current when it
+    runs. Under a CUDA graph capture the event record/wait pairs become a fork
+    and a join of the captured graph.
+
+    Only launch streams change: the same kernels run on the same inputs.
+    Batches above ``max_tokens`` and piecewise cudagraph runs keep everything
+    on the current stream.
+    """
+
+    def __init__(self) -> None:
+        self.max_tokens = int(
+            os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "16")
+        )
+        self.stream: torch.cuda.Stream | None = None
+        self.fork_event: torch.cuda.Event | None = None
+        self.done_event: torch.cuda.Event | None = None
+        self.main_stream: torch.cuda.Stream | None = None
+        self.active = False
+        self.unavailable = False
+        self.last_layer = -1
+        self.forks = 0
+        self.reported = False
+
+    def _ensure_stream(self) -> bool:
+        if self.stream is None and not self.unavailable:
+            try:
+                _, greatest_priority = torch.cuda.Stream.priority_range()
+                self.stream = torch.cuda.Stream(priority=greatest_priority)
+                self.fork_event = torch.cuda.Event()
+                self.done_event = torch.cuda.Event()
+            except Exception:
+                logger.warning(
+                    "Could not create a side stream for attention; the output "
+                    "gate projection runs in order.",
+                    exc_info=True,
+                )
+                self.stream = None
+                self.unavailable = True
+        return self.stream is not None
+
+    def _count(self, layer_idx: int) -> None:
+        if layer_idx <= self.last_layer:
+            if not self.reported:
+                logger.info(
+                    "Attention output gate projection overlapped attention "
+                    "in %d layers",
+                    self.forks,
+                )
+                self.reported = True
+            self.forks = 0
+        self.forks += 1
+        self.last_layer = layer_idx
+
+    def fork(self, x: torch.Tensor, layer_idx: int) -> None:
+        self.active = False
+        if not x.is_cuda or x.shape[0] > self.max_tokens:
+            return
+        if (
+            is_forward_context_available()
+            and get_forward_context().cudagraph_runtime_mode
+            == CUDAGraphMode.PIECEWISE
+        ):
+            return
+        if not self._ensure_stream():
+            return
+        assert self.stream is not None and self.fork_event is not None
+        main = torch.cuda.current_stream(x.device)
+        self.fork_event.record(main)
+        self.stream.wait_event(self.fork_event)
+        self.main_stream = main
+        self.active = True
+        self._count(layer_idx)
+
+    def switch(self, chain_inputs: list[torch.Tensor]) -> None:
+        if not self.active:
+            return
+        assert self.stream is not None
+        # The chain reads these on the side stream; do not let the allocator
+        # hand their memory to the current stream before the chain is done.
+        for t in chain_inputs:
+            t.record_stream(self.stream)
+        torch.cuda.set_stream(self.stream)
+
+    def join(self) -> None:
+        if not self.active:
+            return
+        assert self.stream is not None and self.done_event is not None
+        assert self.main_stream is not None
+        self.done_event.record(self.stream)
+        torch.cuda.set_stream(self.main_stream)
+        self.main_stream.wait_event(self.done_event)
+        self.main_stream = None
+        self.active = False
+
+
+_gate_side_stream = _GateSideStream()
+
+
+def muse_glimmer_gate_fork(x: torch.Tensor, layer_idx: int) -> torch.Tensor:
+    dep = x.new_empty(0)
+    _gate_side_stream.fork(x, layer_idx)
+    return dep
+
+
+def muse_glimmer_gate_fork_fake(x: torch.Tensor, layer_idx: int) -> torch.Tensor:
+    return torch.empty(0, device=x.device, dtype=x.dtype)
+
+
+def muse_glimmer_gate_switch(
+    gate: torch.Tensor, dep: torch.Tensor, chain_inputs: list[torch.Tensor]
+) -> torch.Tensor:
+    out = dep.new_empty(0)
+    _gate_side_stream.switch(chain_inputs)
+    return out
+
+
+def muse_glimmer_gate_switch_fake(
+    gate: torch.Tensor, dep: torch.Tensor, chain_inputs: list[torch.Tensor]
+) -> torch.Tensor:
+    return torch.empty(0, device=dep.device, dtype=dep.dtype)
+
+
+def muse_glimmer_gate_join(
+    gate: torch.Tensor, x: torch.Tensor, dep: torch.Tensor
+) -> None:
+    # The gate is declared mutated so that nothing reads it before the join.
+    _gate_side_stream.join()
+
+
+def muse_glimmer_gate_join_fake(
+    gate: torch.Tensor, x: torch.Tensor, dep: torch.Tensor
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="muse_glimmer_gate_fork",
+    op_func=muse_glimmer_gate_fork,
+    fake_impl=muse_glimmer_gate_fork_fake,
+    mutates_args=[],
+)
+direct_register_custom_op(
+    op_name="muse_glimmer_gate_switch",
+    op_func=muse_glimmer_gate_switch,
+    fake_impl=muse_glimmer_gate_switch_fake,
+    mutates_args=[],
+)
+direct_register_custom_op(
+    op_name="muse_glimmer_gate_join",
+    op_func=muse_glimmer_gate_join,
+    fake_impl=muse_glimmer_gate_join_fake,
+    mutates_args=["gate"],
+)
+
+
+def _gate_side_stream_fork_point(gate_proj: nn.Module) -> str | None:
+    """Where the output gate branch forks off the attention chain, or None to
+    keep the gate projection in order on the main stream: ``"qkv"`` right
+    after the qkv projection, ``"attn"`` right before the attention op."""
+    mode = os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM", "qkv")
+    if mode not in ("qkv", "attn") or not current_platform.is_cuda():
+        return None
+    # cuBLAS does not promise the same kernel choice while other streams are
+    # active, so unquantized projections stay on the main stream.
+    if isinstance(getattr(gate_proj, "quant_method", None), UnquantizedLinearMethod):
+        return None
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return None
+    compilation_config = vllm_config.compilation_config
+    if compilation_config.mode == CompilationMode.NONE:
+        return mode
+    if (
+        compilation_config.mode != CompilationMode.VLLM_COMPILE
+        or compilation_config.use_inductor_graph_partition
+        or not all(
+            op in (compilation_config.splitting_ops or [])
+            for op in compilation_config._side_stream_ops
+        )
+    ):
+        return None
+    return mode
+
+
 class MuseGlimmerAttention(nn.Module):
     def __init__(
         self,
@@ -1162,6 +1371,11 @@ class MuseGlimmerAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.output_gate_proj",
             )
+        self.gate_fork_point = (
+            _gate_side_stream_fork_point(self.output_gate_proj)
+            if self.use_output_gate
+            else None
+        )
 
         self.rotary_emb = (
             get_rope(
@@ -1190,12 +1404,25 @@ class MuseGlimmerAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+    def _output_gate_before_attention(
+        self, hidden_states: torch.Tensor, chain_inputs: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # The gate projection is launched first; the attention chain that
+        # follows (reading ``chain_inputs``) runs beside it on a side stream.
+        dep = torch.ops.vllm.muse_glimmer_gate_fork(hidden_states, self.layer_idx)
+        gate, _ = self.output_gate_proj(hidden_states)
+        dep = torch.ops.vllm.muse_glimmer_gate_switch(gate, dep, chain_inputs)
+        return gate, dep
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        gate = gate_dep = None
+        if self.gate_fork_point == "qkv":
+            gate, gate_dep = self._output_gate_before_attention(hidden_states, [qkv])
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if self.use_qk_norm:
@@ -1210,11 +1437,19 @@ class MuseGlimmerAttention(nn.Module):
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
 
+        if self.gate_fork_point == "attn":
+            gate, gate_dep = self._output_gate_before_attention(
+                hidden_states, [q, k, v]
+            )
+
         attn_output = self.attn(q, k, v)
 
         if self.use_output_gate:
-            # Gate reads the layer input hidden states (not the attn output).
-            gate, _ = self.output_gate_proj(hidden_states)
+            if gate is None:
+                # Gate reads the layer input hidden states (not the attn output).
+                gate, _ = self.output_gate_proj(hidden_states)
+            else:
+                torch.ops.vllm.muse_glimmer_gate_join(gate, hidden_states, gate_dep)
             attn_output = torch.sigmoid(gate) * attn_output
 
         output, _ = self.o_proj(attn_output)
@@ -1304,6 +1539,20 @@ class MuseGlimmerModel(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        side_gate_layers = [
+            layer.self_attn.gate_fork_point
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+            if layer.self_attn.gate_fork_point is not None
+        ]
+        if side_gate_layers:
+            logger.info(
+                "Attention output gate projection on a side stream in %d of %d "
+                "layers (fork after %s, up to %d tokens)",
+                len(side_gate_layers),
+                self.end_layer - self.start_layer,
+                side_gate_layers[0],
+                _gate_side_stream.max_tokens,
+            )
         # Final norm: weight-as-scale, no offset.
         self.norm = MuseGlimmerRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(

@@ -8,6 +8,10 @@
   "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF).",
   "local_patches": [
     {
+      "file": "vllm/env_override.py, vllm/v1/worker/gpu_worker.py",
+      "why": "back the CUDA caching allocator with expandable (VMM) segments, set before CUDA is initialized and again in Worker.init_device; only the mapping under an allocator segment changes (VLLM_EXPANDABLE_SEGMENTS=0 keeps the default allocator)"
+    },
+    {
       "file": "vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py",
       "why": "GB10 exposes no NVML memory clock; fall back to 273 GB/s for humming's tuning heuristic"
     },
@@ -16,12 +20,28 @@
       "why": "VLLM_HUMMING_BATCH_INVARIANT=1 turns on humming's deterministic MoE kernels without the global batch-invariant mode (which forces CUTLASS W4A4 on W4A16 linears)"
     },
     {
+      "file": "vllm/v1/worker/gpu/cudagraph_utils.py",
+      "why": "when the optional l2pf kernel package (harness/kernels/l2pf) is importable, the FULL CUDA graph gets one extra side-stream node per GEMM that L2-prefetches the first tiles of the next GEMM's weights; the GEMM sites are recorded on the warm-up run before the capture, only model parameters are prefetched, and no kernel on the main stream changes (L2PF=0 turns it off)"
+    },
+    {
       "file": "vllm/model_executor/layers/mamba/ops/ssd_pinned_configs.py (+ pins in ssd_state_passing.py, ssd_bmm.py, ssd_chunk_scan.py, ssd_chunk_state.py)",
       "why": "Triton autotune picked different SSD tile configs per boot on GB10, making the same prompt yield one of two token streams; each kernel is pinned to one config (VLLM_MAMBA_SSD_AUTOTUNE=1 restores autotuning)"
     },
     {
+      "file": "vllm/model_executor/models/muse_glimmer.py, vllm/config/compilation.py",
+      "why": "the attention output gate projection reads the layer input, so for decode-sized batches it is launched before attention and the attention chain (QK-norm, RoPE, KV-cache write, attention) runs beside it on a high-priority side stream; fork, switch and join are graph splitting points, so the gate projection is a compiled piece of its own and the FULL CUDA graph gets a fork and a join; the same kernels run on the same inputs, unquantized (cuBLAS) gate projections keep the stock order (VLLM_MUSE_GLIMMER_GATE_STREAM=0 turns it off)"
+    },
+    {
       "file": "vllm/v1/worker/gpu_model_runner.py",
       "why": "skip the MTP drafter when every request in the batch has max_tokens == 1: its drafts are never verified, and the drafter's pass over the prompt delayed the sampled token (the timed prefill)"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py",
+      "why": "NVFP4 W4A16 weights much larger than L2 (MLP gate_up and down) run calls of 128 rows or more through harness/kernels/marlinw when it is built (the Marlin kernel body on the same work slices as ops.marlin_gemm, handed out column-major); a layer without it runs prompt-sized calls as ops.marlin_gemm on column slices of a slice-major copy of the same prepared weight where both schedules compute every tile whole-K with the same config, else the single call; each path is admitted per layer by a load-time bitwise comparison with the single call"
+    },
+    {
+      "file": "vllm/v1/engine/core_client.py, vllm/v1/worker/hostfast.py (new)",
+      "why": "in-process engine core for the single-request engine loop: InprocClient pauses automatic garbage collection while the engine has work and drains a finished request's queued batch on abort (no busy loop does it in this mode); hostfast.py also restricts the process to the highest-capacity CPU cores when the cores differ, failing soft (VLLM_HOSTFAST_GC=0 and VLLM_HOSTFAST_PIN=0 switch each off)"
     }
   ],
   "carried_from": {

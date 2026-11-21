@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import product
 from typing import Any, NamedTuple, Protocol
@@ -38,6 +39,13 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+try:
+    # Optional kernel package built from harness/kernels (L2 prefetch of the
+    # next GEMM's weights inside the captured FULL graph).
+    from l2pf import sites as l2_prefetch
+except ImportError:
+    l2_prefetch = None
 
 
 class AttentionState(NamedTuple):
@@ -146,7 +154,24 @@ class CudaGraphManager:
         )
         self.breakable_cg_runner: BreakableCUDAGraphWrapper | None = None
 
+        # Memory ranges of the model's weights (set by the model capture) and
+        # the L2 prefetch sessions of the captured FULL graphs.
+        self.weight_ranges: list[tuple[int, int]] | None = None
+        self._l2_prefetch_sessions: list[Any] = []
+
         self._init_candidates()
+
+    def _l2_prefetch_session(self, desc: "BatchExecutionDescriptor") -> Any:
+        if (
+            l2_prefetch is None
+            or desc.cg_mode != CUDAGraphMode.FULL
+            or self.weight_ranges is None
+            or not l2_prefetch.available()
+        ):
+            return None
+        session = l2_prefetch.Session(self.weight_ranges)
+        self._l2_prefetch_sessions.append(session)
+        return session
 
     def _build_lora_dispatch_map(self) -> tuple[dict[int, int], int]:
         """Precompute actual num_active_loras -> effective captured case.
@@ -322,8 +347,10 @@ class CudaGraphManager:
                     # Prepare inputs and get forward function
                     forward_fn = create_forward_fn(desc, warmup=True)
 
-                    # Warmup
-                    forward_fn(CUDAGraphMode.NONE)
+                    # Warmup (also records the GEMM sites for the L2 prefetch)
+                    l2pf = self._l2_prefetch_session(desc)
+                    with l2pf.record() if l2pf is not None else nullcontext():
+                        forward_fn(CUDAGraphMode.NONE)
 
                     # Capture
                     logger.debug(
@@ -351,13 +378,22 @@ class CudaGraphManager:
                             set_graph_pool_id(self.pool)
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
-                        with torch.cuda.graph(graph, self.pool):
+                        with (
+                            torch.cuda.graph(graph, self.pool),
+                            l2pf.apply() if l2pf is not None else nullcontext(),
+                        ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
                             # forks copy_stream, but wait_prefetch only happens in
                             # the next forward pass.
                             get_offloader().join_after_forward()
+                        if l2pf is not None:
+                            logger.info(
+                                "L2 prefetch for num_tokens=%d: %s",
+                                desc.num_tokens,
+                                l2pf.summary(),
+                            )
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
         self._graphs_captured = True
@@ -458,6 +494,8 @@ class ModelCudaGraphManager(CudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+        if l2_prefetch is not None:
+            self.weight_ranges = l2_prefetch.weight_ranges(model)
         if self.use_breakable_cg:
             self.init_breakable_cg_runner(model)
 

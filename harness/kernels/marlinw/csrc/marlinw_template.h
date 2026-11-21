@@ -267,7 +267,12 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
-    int max_shared_mem) {
+    int max_shared_mem,
+    // Work list: block b runs items work_ptr[b] .. work_ptr[b + 1] - 1 in
+    // order. Item i is work[2 * i] = {par_id, slice_col, slice_row,
+    // slice_iters} and work[2 * i + 1] = {slice_idx, slice_count, locks_off,
+    // unused}: one "slice" of the striped partition, computed on the host.
+    const int4* __restrict__ work, const int* __restrict__ work_ptr) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -367,54 +372,15 @@ __global__ void Marlin(
   constexpr int pack_factor = 32 / b_type.size_bits();
   static_assert(thread_m_blocks == 1 || !m_block_size_8);
 
-  // For larger GEMMs we run multiple batchsize 64 versions in parallel for a
-  // better partitioning with less reductions
-  int parallel = 1;
+  // Rows are processed in chunks of `m_block_size`; the work list names the
+  // chunk (par_id) of every slice.
   if (prob_m > m_block_size) {
-    parallel = prob_m / m_block_size;
     prob_m = m_block_size;
   }
 
-  int k_tiles = prob_k / 16 / thread_k_blocks;
-  int n_tiles = prob_n / 16 / thread_n_blocks;
-
-  int global_mn_tiles = parallel * n_tiles;
-  int part2_mn_tiles = global_mn_tiles;
-  int part1_mn_iters = 0;
-  bool in_part2 = false;
-
-  if (global_mn_tiles > gridDim.x) {
-    part2_mn_tiles = global_mn_tiles % gridDim.x;
-    if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
-    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
-  }
-
-  int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
-
-  if constexpr (!has_act_order && group_blocks != -1) {
-    if (group_blocks >= thread_k_blocks) {
-      // Ensure that the number of tiles in each stripe is a multiple of the
-      // groupsize; this avoids an annoying special case where a stripe starts
-      // in the middle of group.
-      iters = (group_blocks / thread_k_blocks) *
-              div_ceil(iters, (group_blocks / thread_k_blocks));
-    }
-  }
-
-  // VAST3 glimmer: when every (slab, n-tile) is computed whole by one block (no split along k anywhere),
-  // walk the `parallel` M-slabs of one n-tile on consecutive tile ids. Each tile's arithmetic is unchanged
-  // (same block-local k order, no cross-block reduce); only which block does it, and when, changes, so the
-  // B tile is read once from DRAM and served from L2 to the other slabs.
-#ifdef GM_REMAP
-  const bool gm_remap = parallel > 1 && (global_mn_tiles % gridDim.x == 0) && iters == k_tiles;
-#else
-  const bool gm_remap = false;
-#endif
   int slice_row = 0;
-  int slice_col_par = blockIdx.x;
-  int slice_col;
-  int slice_iters =
-      k_tiles;  // number of threadblock tiles in the current slice
+  int slice_col = 0;
+  int slice_iters = 0;  // number of threadblock tiles in the current slice
   // total number of active threadblocks in the current slice
   int slice_count = 1;
   // index of threadblock in current slice; numbered bottom to top
@@ -423,123 +389,31 @@ __global__ void Marlin(
   int par_id = 0;
   int locks_off = 0;
 
-  if (part2_mn_tiles >= gridDim.x) {
-    // when part2_mn_tiles >= sms
-    // then there are at most $sms$ conflict tile blocks
-    locks_off = blockIdx.x;
-  } else {
-    locks_off = (iters * blockIdx.x) / k_tiles - 1;
-  }
+  int work_cur = work_ptr[blockIdx.x];
+  const int work_end = work_ptr[blockIdx.x + 1];
 
-  // Compute all information about the current slice which is required for
-  // synchronization.
-  bool first_init = true;
-  auto init_part2_slice = [&]() {
-    slice_iters =
-        iters * (blockIdx.x + 1) - (k_tiles * slice_col_par + slice_row);
-    if (slice_iters < 0 || slice_col_par >= part2_mn_tiles) slice_iters = 0;
-    if (slice_iters == 0) return;
-    if (slice_row + slice_iters > k_tiles) slice_iters = k_tiles - slice_row;
-    slice_count = 1;
-    slice_idx = 0;
-    int col_first = iters * div_ceil(k_tiles * slice_col_par, iters);
-    if (col_first <= k_tiles * (slice_col_par + 1)) {
-      int col_off = col_first - k_tiles * slice_col_par;
-      slice_count = div_ceil(k_tiles - col_off, iters);
-      if (col_off > 0) slice_count++;
-      int delta_first = iters * blockIdx.x - col_first;
-      if (delta_first < 0 || (col_off == 0 && delta_first == 0))
-        slice_idx = slice_count - 1;
-      else {
-        slice_idx = slice_count - 1 - delta_first / iters;
-        if (col_off > 0) slice_idx--;
-      }
+  auto init_slice = [&]() {
+    if (work_cur >= work_end) {
+      slice_iters = 0;
+      return;
     }
-    if (part2_mn_tiles >= gridDim.x) {
-      if (slice_count > 1 && slice_idx == slice_count - 1) {
-        locks_off++;
-      }
-    } else {
-      locks_off++;
-    }
-
-    if (first_init && use_atomic_add && slice_count > 1 && slice_idx == 0) {
-      constexpr int threads_per_m = 16 * thread_n_blocks / 8;
-      int m_per_thread =
-          div_ceil(thread_m_blocks * 16, threads / threads_per_m);
-      if (m_block_size_8) m_per_thread = div_ceil(8, threads / threads_per_m);
-      for (int i = 0; i < m_per_thread; i++) {
-        int row = threads / threads_per_m * i + threadIdx.x / threads_per_m;
-        if (row < prob_m) {
-          int col = slice_col * 16 * thread_n_blocks / 8 +
-                    threadIdx.x % threads_per_m;
-          C[row * prob_n / 8 + col] = {0, 0, 0, 0};
-        }
-      }
-      // After write zero to output, write a negative value to lock.
-      // Every SM that processes the same slice would wait for
-      // the negative value, and then atomicAdd 1 to it.
-      // After all SMs are processed, the lock value would back to 0 again.
-      __syncthreads();
-      if (threadIdx.x == 0) locks[locks_off] = 1 - slice_count;
-    }
-
-    if (slice_col == n_tiles) {
-      A += 16 * thread_m_blocks * lda / (is_a_8bit ? 16 : 8);
-      C += 16 * thread_m_blocks * prob_n / 8;
-      slice_col = 0;
-      par_id++;
-    }
-    if (is_a_8bit && (first_init || slice_col == 0)) {
+    int4 w0 = work[2 * work_cur];
+    int4 w1 = work[2 * work_cur + 1];
+    work_cur++;
+    par_id = w0.x;
+    slice_col = w0.y;
+    slice_row = w0.z;
+    slice_iters = w0.w;
+    slice_idx = w1.x;
+    slice_count = w1.y;
+    locks_off = w1.z;
+    A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
+    C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
+    if (is_a_8bit) {
       __syncthreads();
       int a_s_gl_rd = par_id * 16 * thread_m_blocks + threadIdx.x;
       cp_async1_ca_pred(&sh_a_s[threadIdx.x], &a_scales_ptr[a_s_gl_rd],
                         threadIdx.x < prob_m);
-    }
-  };
-
-  auto init_part1_slice = [&]() {
-    if (part1_mn_iters) {
-      part1_mn_iters--;
-      if (gm_remap) {
-        par_id = slice_col_par % parallel;
-        slice_col = slice_col_par / parallel;
-      } else {
-        par_id = slice_col_par / n_tiles;
-        slice_col = slice_col_par % n_tiles;
-      }
-      slice_iters = k_tiles;
-      A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
-      C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
-      if (is_a_8bit) {
-        __syncthreads();
-        int a_s_gl_rd = par_id * 16 * thread_m_blocks + threadIdx.x;
-        cp_async1_ca_pred(&sh_a_s[threadIdx.x], &a_scales_ptr[a_s_gl_rd],
-                          threadIdx.x < prob_m);
-      }
-    }
-  };
-
-  auto init_slice = [&]() {
-    if (!in_part2 && !part1_mn_iters) {
-      in_part2 = true;
-      slice_col_par = (iters * blockIdx.x) / k_tiles;
-      slice_row = (iters * blockIdx.x) % k_tiles;
-      if (gm_remap) {
-        slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) / parallel;
-        par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) % parallel;
-      } else {
-        slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % n_tiles;
-        par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
-      }
-      A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
-      C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
-    }
-    if (!in_part2) {
-      init_part1_slice();
-    } else {
-      init_part2_slice();
-      first_init = false;
     }
   };
 
@@ -2042,13 +1916,6 @@ __global__ void Marlin(
       if (last || use_atomic_add)
         // only the last block in a slice actually writes the result
         write_result(last);
-      slice_row = 0;
-      if (!in_part2) {
-        slice_col_par += gridDim.x;
-      } else {
-        slice_col_par++;
-        slice_col++;
-      }
       is_first_matmul_in_slice = true;
       init_slice();
 
