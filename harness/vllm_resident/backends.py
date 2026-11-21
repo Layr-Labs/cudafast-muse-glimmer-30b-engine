@@ -10,7 +10,13 @@ caller has what it asked for.
 
 Every emitted token carries the top-k RAW LOGITS of the position that produced
 it (highest first), so the resident can answer `top_logits` for whatever
-frontier it holds without another forward pass.
+frontier it holds without another forward pass. `start(..., top_logits=False)`
+drops them for a request whose caller reads only the greedy tokens (the timed
+prefill and the free run): vLLM then skips the top-k selection over the
+vocabulary, its device-to-host copy and the per-token Logprob objects on every
+step. The tokens are the same either way: with greedy sampling the logprobs are
+a side read of the raw logits, never an input to the argmax or to the
+rejection sampler (vllm/v1/sample/sampler.py, rejection_sampler.py).
 
 `VllmBackend` is the scored engine. `FakeBackend` is a deterministic stand-in
 with the same step semantics (including multi-token speculative steps), so the
@@ -54,7 +60,9 @@ class Backend(Protocol):
     ident: str
     model_path: str
 
-    def start(self, tokens: list[int], max_tokens: int | None = None) -> list[Emit]: ...
+    def start(
+        self, tokens: list[int], max_tokens: int | None = None, top_logits: bool = True
+    ) -> list[Emit]: ...
 
     def step(self) -> list[Emit]: ...
 
@@ -136,6 +144,8 @@ class VllmBackend:
     def __init__(self, cfg: VllmConfig):
         from vllm import EngineArgs, LLMEngine, SamplingParams
         from vllm.sampling_params import RequestOutputKind
+        from vllm.usage.usage_lib import UsageContext
+        from vllm.v1.executor.abstract import Executor
 
         spec = None
         if cfg.depth > 0:
@@ -172,7 +182,24 @@ class VllmBackend:
             moe_backend="humming",
             disable_log_stats=True,
         )
-        self._engine = LLMEngine.from_engine_args(args)
+        # IN-PROCESS ENGINE CORE (spariev 0af883ca carrying jungjipdo 89d14785,
+        # GumbiiDigital/cudafast-nemotron35 track). The default engine core is a
+        # separate process behind ZMQ + msgpack and two helper threads; a
+        # single-request resident gains nothing from it. VLLM_ENABLE_V1_MULTIPROCESSING
+        # (default on) would override from_engine_args(enable_multiprocessing=False),
+        # so build the LLMEngine directly. RESIDENT_INPROC=0 restores the default.
+        if os.environ.get("RESIDENT_INPROC", "1") != "0":
+            usage_context = UsageContext.ENGINE_CONTEXT
+            engine_config = args.create_engine_config(usage_context)
+            self._engine = LLMEngine(
+                vllm_config=engine_config,
+                executor_class=Executor.get_class(engine_config),
+                log_stats=not args.disable_log_stats,
+                usage_context=usage_context,
+                multiprocess_mode=False,
+            )
+        else:
+            self._engine = LLMEngine.from_engine_args(args)
         self._SamplingParams = SamplingParams
         self._delta = RequestOutputKind.DELTA
         hf = self._engine.model_config.hf_config
@@ -206,22 +233,37 @@ class VllmBackend:
     WARMUP_PROMPT_TOKENS = 4096
     WARMUP_DECODE_STEPS = 64
     WARMUP_ROUNDS = 3
+    # One more round at the fixture's seed_tokens length, on the timed shape: a
+    # fresh prefill of exactly this length replays the engine's boot-captured
+    # whole-forward prefill graph (vllm/v1/worker/gpu/prefill_graph.py), so its
+    # first replay and the eager ops around it run here, on synthetic tokens.
+    WARMUP_SEED_TOKENS = 512
+    WARMUP_SEED_DECODE_STEPS = 4
 
     def _warm_up(self) -> None:
         prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_PROMPT_TOKENS)]
-        for _ in range(self.WARMUP_ROUNDS):
-            self.start(prompt)
+        for i in range(self.WARMUP_ROUNDS):
+            # Both request shapes the phases use: the timed phases' greedy-only
+            # requests and the correctness gates' top-k ones (the latter JIT
+            # the logprobs kernels), ending on the timed shape.
+            self.start(prompt, top_logits=(self.WARMUP_ROUNDS - i) % 2 == 0)
             for _ in range(self.WARMUP_DECODE_STEPS):
                 self.step()
             self.abort()
+        self.start(prompt[: self.WARMUP_SEED_TOKENS], top_logits=False)
+        for _ in range(self.WARMUP_SEED_DECODE_STEPS):
+            self.step()
+        self.abort()
 
-    def _params(self, prompt_len: int, max_tokens: int | None = None):
+    def _params(self, prompt_len: int, max_tokens: int | None = None, top_logits: bool = True):
         room = max(1, self.ctx_size - prompt_len - self.depth - 1)
         return self._SamplingParams(
             temperature=0.0,
             max_tokens=room if max_tokens is None else min(room, max_tokens),
             ignore_eos=True,
-            logprobs=TOP_K,
+            # None, not 0: 0 still runs the logprobs path for the sampled
+            # token. None leaves the sampler on its greedy path alone.
+            logprobs=TOP_K if top_logits else None,
             detokenize=False,
             output_kind=self._delta,
         )
@@ -241,14 +283,18 @@ class VllmBackend:
                 emitted.append(Emit(int(token), top))
         return emitted
 
-    def start(self, tokens: list[int], max_tokens: int | None = None) -> list[Emit]:
+    def start(
+        self, tokens: list[int], max_tokens: int | None = None, top_logits: bool = True
+    ) -> list[Emit]:
         self.abort()
         if len(tokens) + self.depth + 2 > self.ctx_size:
             raise RuntimeError(f"{len(tokens)} tokens do not fit the {self.ctx_size}-token context")
         self._rid += 1
         self._live = f"r{self._rid}"
         self._engine.add_request(
-            self._live, {"prompt_token_ids": list(tokens)}, self._params(len(tokens), max_tokens)
+            self._live,
+            {"prompt_token_ids": list(tokens)},
+            self._params(len(tokens), max_tokens, top_logits),
         )
         emitted: list[Emit] = []
         while not emitted:
@@ -303,7 +349,10 @@ class FakeBackend:
         self._ctx: list[int] | None = None
         self._cycle = 0
         self._left: int | None = None
+        self._top = True
         self.starts = 0
+        # The top_logits flag of every start, in order (tests read it).
+        self.start_modes: list[bool] = []
 
     def _next(self, ctx: list[int]) -> int:
         a = ctx[-1] if ctx else 0
@@ -312,15 +361,21 @@ class FakeBackend:
 
     def _emit(self, ctx: list[int]) -> Emit:
         token = self._next(ctx)
+        if not self._top:
+            return Emit(token, ())
         top = tuple(
             (token if i == 0 else (token + i) % self.vocab_size, 10.0 - i) for i in range(TOP_K)
         )
         return Emit(token, top)
 
-    def start(self, tokens: list[int], max_tokens: int | None = None) -> list[Emit]:
+    def start(
+        self, tokens: list[int], max_tokens: int | None = None, top_logits: bool = True
+    ) -> list[Emit]:
         if len(tokens) + self.depth + 2 > self.ctx_size:
             raise RuntimeError("context full")
         self.starts += 1
+        self.start_modes.append(top_logits)
+        self._top = top_logits
         self._ctx = list(tokens)
         self._cycle = 0
         self._left = None if max_tokens is None else max_tokens - 1
