@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "source": "none",
+  "spec": {
+    "enabled": false,
+    "num_speculative_tokens": 0
+  }
+}

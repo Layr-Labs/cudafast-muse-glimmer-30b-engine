@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "name": "cudafast-muse-glimmer-30b",
+  "trackId": "muse-glimmer-30b-cuda-v1",
+  "description": "Muse Glimmer 30B NVFP4 CUDA text inference speedup track on DGX Spark (GB10, sm_121). Target: nvidia/Muse-Glimmer-30B-NVFP4 @ 47818374517751c48c55cde2621594926b1888b6, a ModelOpt MIXED_PRECISION checkpoint (213 layers W4A16_NVFP4 group 16, 180 layers FP8 w8a8, vision tower in BF16) of a 52-layer text decoder: 39 sliding-attention layers (window 2048) and 13 full-attention layers, dense MLP (intermediate 19968), hidden 6656, vocab 202048. The engine is vLLM v0.27.1, its Python package VENDORED at vllm/ and layered over the pinned container's compiled extensions; the scored binary is the Engine Protocol v1 adapter (harness/protocol-adapter) attached to one vLLM resident per leg (harness/vllm_resident). The track is SERIAL ONLY: allowed_modes is [serial], the checkpoint ships no MTP tensors and no speculative arm is scored. The target quantization is frozen. Scoring is single-stream and paired with a per-box baseline: 3 pairs of one serial-control leg on the reference tree and one candidate leg, one pair per prompt of the fixture's live_goldens (three organizer prompts of 512 tokens, one unmeasured prefill warm-up pass, 128-step decode); composite = prefill_gain^0.25 * decode_gain^0.75 for each pair, where decode is the decode window (decode-run time / N, no seed prefill); the score is the mean of the 3 per-pair composites, floors 0.95 on every pair, decode ceiling 5.0, prefill ceiling 2.0. fixtures/muse_glimmer_30b_cuda_v1_track.json is the authority; editablePaths is the authority for what a submission may change.",
+  "category": "cuda",
+  "direction": "+",
+  "editablePaths": [
+    "vllm",
+    "harness",
+    "mtp-head.manifest.json"
+  ],
+  "optionalEditablePaths": [
+    "mtp-head.manifest.json"
+  ],
+  "editableSurfaceByteBudget": {
+    "exemptPathMaxBytes": 512000000,
+    "exemptPathMaxFileBytes": 100000000,
+    "maxTotalBytes": 41943040,
+    "maxFileBytes": 2558837,
+    "maxGrowthBytes": 41943040
+  },
+  "contractPath": "fixtures/muse_glimmer_30b_cuda_v1_track.json",
+  "setupCommand": [
+    "bash",
+    "-c",
+    "./tools/fetch-benchd.sh && ./setup.sh"
+  ],
+  "preSubmitCommand": [
+    "bash",
+    "-c",
+    "./tools/muse-glimmer-measure-and-score.sh --preflight-only"
+  ],
+  "benchmarkCommand": [
+    "bash",
+    "-c",
+    "MLXFAST_SCORE_PATH=score.json ./tools/muse-glimmer-yukon-run.sh"
+  ],
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml"
+  },
+  "scoreArtifact": "benchmark-results-<run_id>/score.json",
+  "scorePath": "score.json",
+  "scoring": {
+    "mode": "qwen-native-mtp-paired-decode-only",
+    "formula": "composite = prefill_gain^0.25 * decode_gain^0.75",
+    "scoredExponents": {
+      "prefillGainExponent": 0.25,
+      "decodeGainExponent": 0.75
+    },
+    "scoredBatchSize": 1,
+    "kvBackend": "vllm-paged",
+    "pairsPerCohort": 3,
+    "minPairsPerCohort": 3,
+    "decodeSpeedupFloor": 0.95,
+    "prefillSpeedupFloor": 0.95,
+    "decodeSpeedupCeiling": 5.0,
+    "prefillSpeedupCeiling": 2.0
+  },
+  "leaderboard": {
+    "namespace": "muse-glimmer-30b-cuda-v1"
+  },
+  "staticReviewTrackId": "muse-glimmer-30b-cuda-v1"
+}

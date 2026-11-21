@@ -1,0 +1,17 @@
+[Unit]
+Description=Muse Glimmer 30B router fleet watcher
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@
+Environment="PATH=@PATH@"
+# WATCH_HOSTS (the ssh hosts to probe) has no default; it comes from this file.
+EnvironmentFile=%h/.config/muse-glimmer/watch.env
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --who=muse-glimmer-watch "--why=Fleet monitoring" /usr/bin/bash "@EXEC_REPO@/tools/router/watch.sh"
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

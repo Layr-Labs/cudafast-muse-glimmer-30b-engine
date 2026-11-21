@@ -1,0 +1,5 @@
+# ci-test-exceptions.tsv -- the test files tools/ci-tests.sh discovers but CI
+# does not run, one per line: <file><TAB><reason>. Only a test that needs a GPU
+# (or anything else a hosted runner lacks) belongs here. tools/ci-tests.sh check
+# and tools/check-doc-consistency.py fail on an entry that names no test file on
+# disk or gives no reason. Every GPU-free test runs; today none is excepted.
