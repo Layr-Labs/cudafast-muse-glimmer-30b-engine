@@ -42,6 +42,10 @@
     {
       "file": "vllm/v1/engine/core_client.py, vllm/v1/worker/hostfast.py (new)",
       "why": "in-process engine core for the single-request engine loop: InprocClient pauses automatic garbage collection while the engine has work and drains a finished request's queued batch on abort (no busy loop does it in this mode); hostfast.py also restricts the process to the highest-capacity CPU cores when the cores differ, failing soft (VLLM_HOSTFAST_GC=0 and VLLM_HOSTFAST_PIN=0 switch each off)"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/scaled_mm/cutlass.py, vllm/model_executor/layers/quantization/utils/glimmer_fp8.py (new)",
+      "why": "decode-sized (M <= 16) bf16, bias-free, per-tensor FP8 linears of the five listed (N, K) shapes run through harness/kernels/glimmer_fp8 (CUTLASS sm120 FP8 with vLLM's ScaledEpilogue arithmetic in a 16x32x128 tile instead of 16x64x128; no split-K, same per-element k order, bitwise identical); every other call and a missing extension run ops.cutlass_scaled_mm unchanged; the op is an l2pf GEMM site so the decode-graph prefetch still covers these weights"
     }
   ],
   "carried_from": {

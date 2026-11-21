@@ -230,6 +230,12 @@ def _targets():
             continue
         out.append((pkt, "default", kind, False))
     try:
+        pkt = torch.ops.glimmer.fp8_scaled_mm
+        pkt.default  # noqa: B018 - materialize the overload
+        out.append((pkt, "default", "fp8x", False))
+    except (AttributeError, RuntimeError):
+        pass
+    try:
         from torch._inductor.select_algorithm import extern_kernels
 
         if hasattr(extern_kernels, "mm"):
@@ -251,6 +257,8 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[2], args[4])
         if kind == "cutlass":
             return (args[2],)
+        if kind == "fp8x":
+            return (args[1],)
         if kind == "mm":
             return (args[1],)
     except IndexError:
