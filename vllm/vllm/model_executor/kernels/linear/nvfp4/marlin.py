@@ -9,6 +9,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     is_fp4_marlin_supported,
     prepare_fp4_layer_for_marlin,
 )
+from vllm.platforms import current_platform
 
 from .base import NvFp4LinearKernel, NvFp4LinearLayerConfig
 
@@ -38,6 +39,18 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
             "performance for compute-heavy workloads."
         )
         prepare_fp4_layer_for_marlin(layer)
+        self._decode = None
+        if (
+            current_platform.is_device_capability(121)
+            and layer.params_dtype == torch.bfloat16
+            # The larger grid improved these projection shapes in cold-cache
+            # measurements. Other shapes retain Marlin's usual tile schedule.
+            and (layer.input_size_per_partition, layer.output_size_per_partition)
+            in {(6656, 4608), (6656, 4096), (19968, 6656), (6656, 202048)}
+        ):
+            from muse_marlin import decode
+
+            self._decode = decode
 
     def apply_weights(
         self,
@@ -45,6 +58,23 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if (
+            self._decode is not None
+            and x.numel() == layer.input_size_per_partition
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and bias is None
+        ):
+            output = self._decode(
+                x.reshape(1, layer.input_size_per_partition),
+                layer.weight,
+                layer.weight_scale,
+                layer.weight_global_scale,
+                layer.workspace,
+                layer.output_size_per_partition,
+                layer.input_size_per_partition,
+            )
+            return output.reshape(*x.shape[:-1], layer.output_size_per_partition)
         return apply_fp4_marlin_linear(
             input=x,
             weight=layer.weight,
