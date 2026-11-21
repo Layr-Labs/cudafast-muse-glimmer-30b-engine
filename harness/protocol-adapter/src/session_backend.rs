@@ -85,6 +85,16 @@ pub trait EngineSession: Send {
     fn sync_to_frontier(&mut self, tokens: &[i64]) -> Result<(), String> {
         self.sync(tokens)
     }
+    /// [`EngineSession::sync`] for a caller that only reads argmax and never
+    /// requests `top_logits` (e.g. `free_decode_begin`).
+    fn sync_no_logprobs(&mut self, tokens: &[i64]) -> Result<(), String> {
+        self.sync(tokens)
+    }
+    /// A whole serial free run of `count` tokens in one engine call, avoiding a
+    /// socket round-trip per decoded token. `None` falls back to `count` evals.
+    fn serial_run(&mut self, _first_token: i64, _count: i64) -> Option<Result<Vec<i64>, String>> {
+        None
+    }
     /// Append and evaluate one token; logits for the new position follow.
     fn eval(&mut self, token: i64) -> Result<(), String>;
     /// The greedy token of the current logits.
@@ -306,7 +316,7 @@ impl Engine for SessionEngine {
     ) -> Result<(i64, EffectiveSpec), EngineError> {
         let mut s = self.lock();
         let depth = Self::resolve(s.mtp_armed(), route, requested_depth)?;
-        Self::fault(s.sync(seed))?;
+        Self::fault(s.sync_no_logprobs(seed))?;
         let seed_token = s.argmax();
         drop(s);
         self.free_run = Some(FreeRun {
@@ -343,11 +353,26 @@ impl Engine for SessionEngine {
             let mut s = self.lock();
             match route {
                 Route::Serial => {
-                    for _ in 0..count {
-                        Self::fault(s.eval(pending))?;
-                        pending = s.argmax();
-                        tokens.push(pending);
-                        acceptance_lengths.push(1);
+                    if let Some(res) = s.serial_run(pending, count) {
+                        let batch = Self::fault(res)?;
+                        if batch.len() as i64 != count {
+                            return Err(EngineError::Fault(format!(
+                                "serial_run returned {} tokens, expected {count}",
+                                batch.len()
+                            )));
+                        }
+                        if let Some(&last) = batch.last() {
+                            pending = last;
+                        }
+                        tokens.extend_from_slice(&batch);
+                        acceptance_lengths.resize(count as usize, 1);
+                    } else {
+                        for _ in 0..count {
+                            Self::fault(s.eval(pending))?;
+                            pending = s.argmax();
+                            tokens.push(pending);
+                            acceptance_lengths.push(1);
+                        }
                     }
                     // The serial route reads no engine counters at all, so it
                     // reports no disagreement count rather than reporting one

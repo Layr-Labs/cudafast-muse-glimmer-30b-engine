@@ -8,7 +8,6 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
-from vllm.model_executor.layers.quantization.utils.glimmer_fp8 import fp8_scaled_mm
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -21,6 +20,56 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
+
+_MUSE_FP8_KERNELS_READY = False
+try:
+    from muse_kernels import load_muse_kernels as _load_muse_kernels
+
+    _MUSE_FP8_KERNELS_READY = _load_muse_kernels()
+except Exception:
+    _MUSE_FP8_KERNELS_READY = False
+
+_FAST_FP8_PACKS: list[tuple[int, torch.Tensor, int]] = []
+
+
+def _muse_fp8_scaled_mm_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    pack_id: int,
+) -> torch.Tensor:
+    orig_ptr, b_pack, n = _FAST_FP8_PACKS[pack_id]
+    if (
+        _MUSE_FP8_KERNELS_READY
+        and a.shape[0] == 1
+        and b.data_ptr() == orig_ptr
+    ):
+        a_c = a if a.is_contiguous() else a.contiguous()
+        return torch.ops.muse_fast.fp8_mma_repacked_m1(
+            a_c, b_pack, scale_a, scale_b, n
+        )
+    return ops.cutlass_scaled_mm(
+        a, b, out_dtype=torch.bfloat16, scale_a=scale_a, scale_b=scale_b, bias=None
+    )
+
+
+def _muse_fp8_scaled_mm_fake(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    pack_id: int,
+) -> torch.Tensor:
+    return torch.empty((a.shape[0], b.shape[1]), dtype=torch.bfloat16, device=a.device)
+
+
+direct_register_custom_op(
+    op_name="muse_fp8_scaled_mm",
+    op_func=_muse_fp8_scaled_mm_impl,
+    fake_impl=_muse_fp8_scaled_mm_fake,
+)
 
 from .BlockScaledMMLinearKernel import Fp8BlockScaledMMLinearKernel
 from .ScaledMMLinearKernel import (
@@ -159,6 +208,7 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]
     ) -> None:
         self.logical_output_size: int | None = None
+        self._muse_fp8_pack_id: int = -1
         super().__init__(c, layer_param_names)
 
     @classmethod
@@ -212,6 +262,7 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         pad_k = (16 - weight.shape[0] % 16) % 16
         pad_n = (16 - weight.shape[1] % 16) % 16
         if pad_k == 0 and pad_n == 0:
+            self._maybe_repack_fp8_for_m1(weight)
             return
 
         # B is column-major [K, N]
@@ -226,6 +277,7 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
                 "weight_loader": self.padded_weight_loader,
             },
         )
+        self._maybe_repack_fp8_for_m1(getattr(layer, weight_name))
 
         weight_scale = getattr(layer, weight_scale_name, None)
         if weight_scale is not None and pad_n > 0 and weight_scale.numel() > 1:
@@ -240,6 +292,23 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
                     "weight_loader": self.padded_weight_loader,
                 },
             )
+
+    def _maybe_repack_fp8_for_m1(self, weight: torch.Tensor) -> None:
+        if (
+            not _MUSE_FP8_KERNELS_READY
+            or not weight.is_cuda
+            or weight.dtype != torch.float8_e4m3fn
+            or weight.dim() != 2
+            or weight.stride(0) != 1
+        ):
+            return
+        k, n = weight.shape
+        if n % 8 != 0 or k % 64 != 0 or k > 24576:
+            return
+        b_pack = torch.ops.muse_fast.repack_fp8_mma(weight)
+        idx = len(_FAST_FP8_PACKS)
+        _FAST_FP8_PACKS.append((weight.data_ptr(), b_pack, n))
+        self._muse_fp8_pack_id = idx
 
     def apply_scaled_mm(
         self,
@@ -263,9 +332,15 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         if pad_n > 0 and bias is not None:
             bias = self._pad_to_alignment(bias, dim=0, alignment=16)
 
-        if bias is None and out_dtype == torch.bfloat16:
-            # glimmer: exact decode FP8 tile configs (shape test inside the op; stock otherwise)
-            output = fp8_scaled_mm(A, B, As, Bs)
+        if (
+            self._muse_fp8_pack_id >= 0
+            and bias is None
+            and out_dtype == torch.bfloat16
+            and As.numel() == 1
+        ):
+            output = torch.ops.vllm.muse_fp8_scaled_mm(
+                A, B, As, Bs, self._muse_fp8_pack_id
+            )
         else:
             output = ops.cutlass_scaled_mm(
                 A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias

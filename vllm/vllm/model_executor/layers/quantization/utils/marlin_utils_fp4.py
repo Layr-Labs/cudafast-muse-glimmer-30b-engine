@@ -24,7 +24,6 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
-from vllm.model_executor.layers.quantization.utils.glimmer_marlin import nvfp4_marlin_gemm
 from vllm.utils.math_utils import round_up
 
 FP4_MARLIN_SUPPORTED_GROUP_SIZES = [16]
@@ -195,32 +194,25 @@ def apply_fp4_marlin_linear(
 
         inputs, a_scales = marlin_quant_input(inputs, torch.float8_e4m3fn)
 
-    if bias is None and a_scales is None and is_nvfp4:
-        # glimmer: prefill-sized M goes through the exact remapped Marlin; everything else stays stock (inside the op).
-        output = nvfp4_marlin_gemm(
-            inputs, weight, weight_scale, weight_global_scale, workspace,
-            reshaped_x.size(0), padded_n, padded_k, use_atomic_add, use_fp32_reduce,
-        )
-    else:
-        output = ops.marlin_gemm(
-            a=inputs,
-            c=None,
-            b_q_weight=weight,
-            b_bias=bias,
-            b_scales=weight_scale,
-            a_scales=a_scales,
-            global_scale=weight_global_scale,
-            b_zeros=None,
-            g_idx=None,
-            perm=None,
-            workspace=workspace,
-            b_q_type=scalar_types.float4_e2m1f,
-            size_m=reshaped_x.size(0),
-            size_n=padded_n,
-            size_k=padded_k,
-            use_atomic_add=use_atomic_add,
-            use_fp32_reduce=use_fp32_reduce,
-        )
+    output = ops.marlin_gemm(
+        a=inputs,
+        c=None,
+        b_q_weight=weight,
+        b_bias=bias,
+        b_scales=weight_scale,
+        a_scales=a_scales,
+        global_scale=weight_global_scale,
+        b_zeros=None,
+        g_idx=None,
+        perm=None,
+        workspace=workspace,
+        b_q_type=scalar_types.float4_e2m1f,
+        size_m=reshaped_x.size(0),
+        size_n=padded_n,
+        size_k=padded_k,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=use_fp32_reduce,
+    )
 
     output = marlin_unpad_output(output, size_n, padded_n)
     return output.reshape(out_shape)

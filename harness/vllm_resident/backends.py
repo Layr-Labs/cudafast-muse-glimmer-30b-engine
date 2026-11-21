@@ -33,9 +33,6 @@ from dataclasses import dataclass, field
 # process inherits them.
 os.environ.setdefault("VLLM_HUMMING_BATCH_INVARIANT", "1")
 os.environ.setdefault("VLLM_DISABLED_KERNELS", "FlashInferFP8ScaledMMLinearKernel")
-# One process: the engine core runs in the resident itself (no ZMQ hop per step / per request).
-# Same kernels, same order; only the host-side transport changes.
-os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 from typing import Protocol
 
 TOP_K = 8
@@ -57,7 +54,12 @@ class Backend(Protocol):
     ident: str
     model_path: str
 
-    def start(self, tokens: list[int], max_tokens: int | None = None) -> list[Emit]: ...
+    def start(
+        self,
+        tokens: list[int],
+        max_tokens: int | None = None,
+        need_logprobs: bool = True,
+    ) -> list[Emit]: ...
 
     def step(self) -> list[Emit]: ...
 
@@ -173,10 +175,9 @@ class VllmBackend:
             max_logprobs=TOP_K,
             speculative_config=spec,
             moe_backend="humming",
+            cudagraph_capture_sizes=[1, 2],
+            enable_flashinfer_autotune=False,
             disable_log_stats=True,
-            # Capture the timed prompt length too: with max_num_seqs=1 vLLM's default capture list is [1, 2],
-            # so every 512-token prefill ran eagerly (one Python launch per kernel). Same kernels, same order.
-            compilation_config={"cudagraph_capture_sizes": [1, 2, 512]},
         )
         self._engine = LLMEngine.from_engine_args(args)
         self._SamplingParams = SamplingParams
@@ -209,25 +210,30 @@ class VllmBackend:
     # class of work as CUDA graph capture at boot. The prompt is the fixture's
     # `seed_tokens` long, so the warm-up JITs the exact shapes the timed
     # prefill runs.
-    WARMUP_PROMPT_TOKENS = 4096
-    WARMUP_DECODE_STEPS = 64
-    WARMUP_ROUNDS = 3
+    WARMUP_PROMPT_TOKENS = 512
+    WARMUP_DECODE_STEPS = 8
+    WARMUP_ROUNDS = 1
 
     def _warm_up(self) -> None:
         prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_PROMPT_TOKENS)]
         for _ in range(self.WARMUP_ROUNDS):
-            self.start(prompt)
+            self.start(prompt, need_logprobs=True)
             for _ in range(self.WARMUP_DECODE_STEPS):
                 self.step()
             self.abort()
 
-    def _params(self, prompt_len: int, max_tokens: int | None = None):
+    def _params(
+        self,
+        prompt_len: int,
+        max_tokens: int | None = None,
+        need_logprobs: bool = True,
+    ):
         room = max(1, self.ctx_size - prompt_len - self.depth - 1)
         return self._SamplingParams(
             temperature=0.0,
             max_tokens=room if max_tokens is None else min(room, max_tokens),
             ignore_eos=True,
-            logprobs=TOP_K,
+            logprobs=TOP_K if need_logprobs else None,
             detokenize=False,
             output_kind=self._delta,
         )
@@ -238,23 +244,34 @@ class VllmBackend:
             if out.request_id != self._live:
                 continue
             comp = out.outputs[0]
-            lps = comp.logprobs or [None] * len(comp.token_ids)
-            for token, lp in zip(comp.token_ids, lps):
-                top: tuple[tuple[int, float], ...] = ()
-                if lp:
-                    ranked = sorted(lp.items(), key=lambda kv: kv[1].logprob, reverse=True)
-                    top = tuple((int(t), float(v.logprob)) for t, v in ranked[:TOP_K])
-                emitted.append(Emit(int(token), top))
+            lps = comp.logprobs
+            if lps:
+                for token, lp in zip(comp.token_ids, lps):
+                    top: tuple[tuple[int, float], ...] = ()
+                    if lp:
+                        ranked = sorted(lp.items(), key=lambda kv: kv[1].logprob, reverse=True)
+                        top = tuple((int(t), float(v.logprob)) for t, v in ranked[:TOP_K])
+                    emitted.append(Emit(int(token), top))
+            else:
+                for token in comp.token_ids:
+                    emitted.append(Emit(int(token), ()))
         return emitted
 
-    def start(self, tokens: list[int], max_tokens: int | None = None) -> list[Emit]:
+    def start(
+        self,
+        tokens: list[int],
+        max_tokens: int | None = None,
+        need_logprobs: bool = True,
+    ) -> list[Emit]:
         self.abort()
         if len(tokens) + self.depth + 2 > self.ctx_size:
             raise RuntimeError(f"{len(tokens)} tokens do not fit the {self.ctx_size}-token context")
         self._rid += 1
         self._live = f"r{self._rid}"
         self._engine.add_request(
-            self._live, {"prompt_token_ids": list(tokens)}, self._params(len(tokens), max_tokens)
+            self._live,
+            {"prompt_token_ids": list(tokens)},
+            self._params(len(tokens), max_tokens, need_logprobs=need_logprobs),
         )
         emitted: list[Emit] = []
         while not emitted:
@@ -323,7 +340,13 @@ class FakeBackend:
         )
         return Emit(token, top)
 
-    def start(self, tokens: list[int], max_tokens: int | None = None) -> list[Emit]:
+    def start(
+        self,
+        tokens: list[int],
+        max_tokens: int | None = None,
+        need_logprobs: bool = True,
+    ) -> list[Emit]:
+        del need_logprobs
         if len(tokens) + self.depth + 2 > self.ctx_size:
             raise RuntimeError("context full")
         self.starts += 1

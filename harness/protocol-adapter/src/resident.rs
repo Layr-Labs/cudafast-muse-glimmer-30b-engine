@@ -91,6 +91,9 @@ pub struct ResidentHello {
     /// (`spec_run`). A resident that does not say so is driven one cycle per
     /// request.
     pub spec_run: bool,
+    /// Whether the resident runs a whole serial free run in one request
+    /// (`serial_run`).
+    pub serial_run: bool,
 }
 
 impl ResidentHello {
@@ -162,6 +165,7 @@ impl ResidentSession {
                 model_path: String::new(),
                 mtp_head_path: String::new(),
                 spec_run: false,
+                serial_run: false,
             },
             frontier: None,
             poison: None,
@@ -185,6 +189,10 @@ impl ResidentSession {
             mtp_head_path: string_field(&reply, "mtp_head_path")?,
             spec_run: reply
                 .get("spec_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            serial_run: reply
+                .get("serial_run")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         };
@@ -338,8 +346,50 @@ impl EngineSession for ResidentSession {
     fn sync_to_frontier(&mut self, tokens: &[i64]) -> Result<(), String> {
         // `max_tokens: 1`: the resident's request finishes at the frontier
         // token, so the engine is idle when this reply arrives.
-        let reply = self.call(json!({"op": "sync", "tokens": tokens, "max_tokens": 1}))?;
+        let reply = self.call(json!({
+            "op": "sync",
+            "tokens": tokens,
+            "max_tokens": 1,
+            "need_logprobs": false
+        }))?;
         self.take_frontier(&reply)
+    }
+
+    fn sync_no_logprobs(&mut self, tokens: &[i64]) -> Result<(), String> {
+        let reply = self.call(json!({
+            "op": "sync",
+            "tokens": tokens,
+            "need_logprobs": false
+        }))?;
+        self.take_frontier(&reply)
+    }
+
+    fn serial_run(&mut self, first_token: i64, count: i64) -> Option<Result<Vec<i64>, String>> {
+        if !self.hello.serial_run {
+            return None;
+        }
+        let res = (|| {
+            let reply = self.call(json!({
+                "op": "serial_run",
+                "first_token": first_token,
+                "count": count
+            }))?;
+            self.take_frontier(&reply)?;
+            reply
+                .get("tokens")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    "the resident engine's serial_run reply carries no \"tokens\" array".to_string()
+                })?
+                .iter()
+                .map(|t| {
+                    t.as_i64().ok_or_else(|| {
+                        "the resident engine's serial_run returned a non-integer token".to_string()
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })();
+        Some(res)
     }
 
     fn eval(&mut self, token: i64) -> Result<(), String> {

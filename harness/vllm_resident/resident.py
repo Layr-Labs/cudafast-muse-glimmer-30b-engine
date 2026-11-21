@@ -122,18 +122,32 @@ class Session:
         """The bounded request emitted all it may; the engine has stopped."""
         return not self.ahead and self.left is not None and self.left <= 0
 
-    def sync(self, tokens: list[int], max_tokens: int | None = None) -> int:
+    def sync(
+        self,
+        tokens: list[int],
+        max_tokens: int | None = None,
+        need_logprobs: bool = True,
+    ) -> int:
         if not tokens:
             raise RefusedError("sync needs a non-empty token list")
         if max_tokens is not None and max_tokens < 1:
             raise RefusedError("sync max_tokens must be positive")
         self._check_ids(tokens)
-        emitted = self.b.start(tokens, max_tokens)
+        emitted = self.b.start(tokens, max_tokens, need_logprobs=need_logprobs)
         self.left = None if max_tokens is None else max_tokens - len(emitted)
         self.ctx = list(tokens)
         self.frontier = emitted[0]
         self.ahead = deque(emitted[1:])
         return self.frontier.token
+
+    def serial_run(self, first: int, count: int) -> list[int]:
+        """Run `count` serial decode steps in one call, avoiding per-token socket round-trips."""
+        tokens: list[int] = []
+        pending = first
+        for _ in range(count):
+            pending = self.eval(pending)
+            tokens.append(pending)
+        return tokens
 
     def _feed(self, token: int) -> None:
         """Consume `token` at the frontier and advance to the next one."""
@@ -211,6 +225,7 @@ class Session:
             "ctx_size": self.b.ctx_size,
             "load_epoch": LOAD_EPOCH,
             "spec_run": self.spec_run_offered,
+            "serial_run": True,
             "ident": self.b.ident,
             "model_path": self.b.model_path,
             # The native MTP layer is embedded in the pinned checkpoint.
@@ -241,9 +256,18 @@ class Session:
             bound = None
             if "max_tokens" in req:
                 bound = int_field("max_tokens")
-            return {"ok": True, "token": self.sync(tokens, bound)}, True
+            need_logprobs = req.get("need_logprobs", True)
+            if not isinstance(need_logprobs, bool):
+                raise RefusedError('sync "need_logprobs" must be a boolean')
+            return {"ok": True, "token": self.sync(tokens, bound, need_logprobs=need_logprobs)}, True
         if op == "eval":
             return {"ok": True, "token": self.eval(int_field("token"))}, True
+        if op == "serial_run":
+            count = int_field("count")
+            if not 1 <= count <= MAX_RUN:
+                raise RefusedError(f'serial_run needs a "count" in 1..{MAX_RUN}')
+            tokens = self.serial_run(int_field("first_token"), count)
+            return {"ok": True, "tokens": tokens, "token": tokens[-1]}, True
         if op == "argmax":
             return {"ok": True, "token": self._need_frontier().token}, True
         if op == "top_logits":
