@@ -33,6 +33,9 @@ from dataclasses import dataclass, field
 # process inherits them.
 os.environ.setdefault("VLLM_HUMMING_BATCH_INVARIANT", "1")
 os.environ.setdefault("VLLM_DISABLED_KERNELS", "FlashInferFP8ScaledMMLinearKernel")
+# One process: the engine core runs in the resident itself (no ZMQ hop per step / per request).
+# Same kernels, same order; only the host-side transport changes.
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 from typing import Protocol
 
 TOP_K = 8
@@ -171,6 +174,9 @@ class VllmBackend:
             speculative_config=spec,
             moe_backend="humming",
             disable_log_stats=True,
+            # Capture the timed prompt length too: with max_num_seqs=1 vLLM's default capture list is [1, 2],
+            # so every 512-token prefill ran eagerly (one Python launch per kernel). Same kernels, same order.
+            compilation_config={"cudagraph_capture_sizes": [1, 2, 512]},
         )
         self._engine = LLMEngine.from_engine_args(args)
         self._SamplingParams = SamplingParams

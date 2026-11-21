@@ -8,6 +8,7 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.quantization.utils.glimmer_fp8 import fp8_scaled_mm
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -262,9 +263,13 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         if pad_n > 0 and bias is not None:
             bias = self._pad_to_alignment(bias, dim=0, alignment=16)
 
-        output = ops.cutlass_scaled_mm(
-            A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias
-        )
+        if bias is None and out_dtype == torch.bfloat16:
+            # glimmer: exact decode FP8 tile configs (shape test inside the op; stock otherwise)
+            output = fp8_scaled_mm(A, B, As, Bs)
+        else:
+            output = ops.cutlass_scaled_mm(
+                A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias
+            )
 
         if pad_n > 0:
             output = output[..., :output_size].contiguous()
