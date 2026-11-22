@@ -19,7 +19,7 @@ logger = init_logger("vllm.muse_bf16_lane")
 _WIDTH = 6656
 _ROWS = (4096, 4608)
 _INDEX_BYTES = 36
-_stats = dict(admitted=0, rejected=0, bytes=0, logged=False)
+_stats = dict(admitted=0, rejected=0, bytes=0, rans=0, logged=False)
 
 
 @cache
@@ -35,6 +35,15 @@ def _lib():
     native.muse_bf16_lane_verify.restype = ctypes.c_int
     native.muse_bf16_lane_gemv.argtypes = [ctypes.c_int, ctypes.c_int] + [ptr] * 5
     native.muse_bf16_lane_gemv.restype = ctypes.c_int
+    if hasattr(native, "muse_bf16_rans_gemv"):
+        native.muse_bf16_rans_hist.argtypes = [ptr, ctypes.c_size_t, ptr, ptr]
+        native.muse_bf16_rans_hist.restype = ctypes.c_int
+        native.muse_bf16_rans_pass1.argtypes = [ptr, ctypes.c_int, ctypes.c_int, ptr, ptr, ptr, ptr]
+        native.muse_bf16_rans_pass1.restype = ctypes.c_int
+        native.muse_bf16_rans_pass2.argtypes = [ptr, ctypes.c_int, ctypes.c_int, ctypes.c_int, ptr, ptr, ptr, ptr, ptr]
+        native.muse_bf16_rans_pass2.restype = ctypes.c_int
+        native.muse_bf16_rans_gemv.argtypes = [ctypes.c_int, ptr, ptr, ptr, ptr]
+        native.muse_bf16_rans_gemv.restype = ctypes.c_int
     return native
 
 
@@ -42,13 +51,105 @@ def _launch(x, payload, index, n):
     out = x.new_empty((1, n))
     with torch.cuda.device(x.device):
         stream = torch.cuda.current_stream(x.device)
-        error = _lib().muse_bf16_lane_gemv(
-            1, n, x.data_ptr(), payload.data_ptr(), index.data_ptr(),
-            out.data_ptr(), stream.cuda_stream,
-        )
+        if index.numel() == 1:
+            error = _lib().muse_bf16_rans_gemv(
+                n, x.data_ptr(), payload.data_ptr(), out.data_ptr(), stream.cuda_stream,
+            )
+        else:
+            error = _lib().muse_bf16_lane_gemv(
+                1, n, x.data_ptr(), payload.data_ptr(), index.data_ptr(),
+                out.data_ptr(), stream.cuda_stream,
+            )
     if error:
         raise RuntimeError(f"muse_bf16_lane launch returned CUDA status {error}")
     return out
+
+
+def _pack_rans(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+    native = _lib()
+    if native is None or not hasattr(native, "muse_bf16_rans_gemv"):
+        return None
+    rows, k = weight.shape
+    tw = 576 if rows == 4608 else (512 if rows == 4096 else rows // 8)
+    if tw <= 0:
+        return None
+    dev = weight.device
+    with torch.cuda.device(dev):
+        st = torch.cuda.current_stream(dev).cuda_stream
+        cnt = torch.zeros(256, dtype=torch.int64, device=dev)
+        if native.muse_bf16_rans_hist(weight.data_ptr(), weight.numel(), cnt.data_ptr(), st):
+            return None
+        ch = cnt.cpu().tolist()
+        tot = sum(ch)
+        if tot <= 0:
+            return None
+        f = [max(1, round(c * 1024 / tot)) if c else 0 for c in ch]
+        diff = 1024 - sum(f)
+        while diff:
+            idx_m = max(range(256), key=lambda i: f[i])
+            step = diff if diff > 0 else max(diff, -(f[idx_m] - 1))
+            if step == 0:
+                return None
+            f[idx_m] += step
+            diff -= step
+        cum = [0] * 256
+        acc = 0
+        for i in range(256):
+            cum[i] = acc
+            acc += f[i]
+        lut = [0] * 1024
+        for s in range(256):
+            fs = f[s]
+            cs = cum[s]
+            for j in range(fs):
+                lut[cs + j] = s | (fs << 8) | (j << 19)
+        fd = torch.tensor(f, dtype=torch.int32, device=dev)
+        cd = torch.tensor(cum, dtype=torch.int32, device=dev)
+        wb = torch.empty(tw, dtype=torch.int32, device=dev)
+        if native.muse_bf16_rans_pass1(weight.data_ptr(), rows, tw, fd.data_ptr(), cd.data_ptr(), wb.data_ptr(), st):
+            return None
+        wb_h = wb.cpu().tolist()
+        woff16 = [0] * (tw + 1)
+        for i in range(tw):
+            woff16[i + 1] = woff16[i] + wb_h[i]
+        G = [(wb_h[i] * 16 + 511) // 512 for i in range(tw)]
+        gmin = min(G)
+        tab = woff16 + [0] * tw
+        t = gmin * tw
+        for i in range(tw):
+            tab[tw + 1 + i] = t
+            t += G[i] - gmin
+        stream_bytes = t * 512
+        soff = ((4112 + len(tab) * 4) + 511) & ~511
+        total = soff + stream_bytes + 64
+        if total >= weight.nbytes:
+            return None
+        blob = torch.zeros(total, dtype=torch.uint8, device=dev)
+        blob[:4096].copy_(torch.tensor(lut, dtype=torch.int32, device=dev).view(torch.uint8))
+        blob[4096:4112].copy_(torch.tensor([rows, tw, gmin, soff], dtype=torch.int32, device=dev).view(torch.uint8))
+        blob[4112 : 4112 + len(tab) * 4].copy_(torch.tensor(tab, dtype=torch.int32, device=dev).view(torch.uint8))
+        bp = blob.data_ptr()
+        if native.muse_bf16_rans_pass2(
+            weight.data_ptr(), rows, tw, gmin, fd.data_ptr(), cd.data_ptr(), bp + 4112, bp + soff, st
+        ):
+            return None
+        torch.cuda.synchronize(dev)
+    marker = torch.zeros((1,), dtype=torch.uint8, device=dev)
+    return blob, marker
+
+
+def _verify_probes(weight: torch.Tensor, packed: torch.Tensor, device_index: torch.Tensor) -> bool:
+    n, k = weight.shape
+    rng = torch.Generator(device=weight.device).manual_seed(720397)
+    for magnitude in (0.02, 1.0, 32.0, 1000.0):
+        x = torch.randn((1, k), generator=rng, device=weight.device)
+        x[:, ::2].mul_(-magnitude)
+        x = x.to(torch.bfloat16)
+        expected = F.linear(x, weight)
+        result = _launch(x, packed, device_index, n)
+        if not torch.equal(expected.view(torch.int16), result.view(torch.int16)):
+            return False
+    return True
 
 
 def _prepare(weight):
@@ -56,6 +157,11 @@ def _prepare(weight):
             or not weight.is_cuda or weight.dtype != torch.bfloat16 or not weight.is_contiguous()
             or torch.cuda.get_device_capability(weight.device) != (12, 1)):
         return None
+    if os.environ.get("MUSE_BF16_RANS", "1") != "0":
+        packed_rans = _pack_rans(weight)
+        if packed_rans is not None and _verify_probes(weight, *packed_rans):
+            _stats["rans"] += 1
+            return packed_rans
     native = _lib()
     n, k = weight.shape
     dense = weight.detach().cpu()
@@ -70,31 +176,25 @@ def _prepare(weight):
         return None
     packed = payload[:size].to(weight.device)
     device_index = index.to(weight.device)
-    rng = torch.Generator(device=weight.device).manual_seed(720397)
-    for magnitude in (0.02, 1.0, 32.0, 1000.0):
-        x = torch.randn((1, k), generator=rng, device=weight.device)
-        x[:, ::2].mul_(-magnitude)
-        x = x.to(torch.bfloat16)
-        expected = F.linear(x, weight)
-        result = _launch(x, packed, device_index, n)
-        if not torch.equal(expected.view(torch.int16), result.view(torch.int16)):
-            return None
+    if not _verify_probes(weight, packed, device_index):
+        return None
     return packed, device_index
 
 
 def _decode(x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor,
             index: torch.Tensor) -> torch.Tensor:
     n = weight.shape[0]
+    idx_ok = index.numel() == 1 or index.shape == (n, _INDEX_BYTES)
     if (x.shape != (1, _WIDTH) or x.dtype != torch.bfloat16
             or not x.is_cuda or not x.is_contiguous() or x.device != packed.device
-            or n not in _ROWS or index.shape != (n, _INDEX_BYTES) or index.device != x.device
+            or n not in _ROWS or not idx_ok or index.device != x.device
             or index.dtype != torch.uint8 or not index.is_contiguous()
             or packed.dtype != torch.uint8 or not packed.is_contiguous() or _lib() is None):
         return F.linear(x, weight)
     if not _stats["logged"]:
         _stats["logged"] = True
-        logger.info("muse_bf16_lane decode GEMV: %d admitted, %d rejected, %d packed bytes",
-                    _stats["admitted"], _stats["rejected"], _stats["bytes"])
+        logger.info("muse_bf16_lane decode GEMV: %d admitted (%d rANS), %d rejected, %d packed bytes",
+                    _stats["admitted"], _stats["rans"], _stats["rejected"], _stats["bytes"])
     return _launch(x, packed, index, n)
 
 

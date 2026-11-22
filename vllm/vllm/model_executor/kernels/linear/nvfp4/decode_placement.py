@@ -94,7 +94,7 @@ def _place_group(decode_linear, layers, n: int, k: int) -> dict | None:
     homes = [layer._buffers[_NAME] for layer in layers]
     count = len(homes)
     payload_bytes = homes[0].numel() * homes[0].element_size()
-    wanted = max(2 if count == 1 else 1, math.ceil(count * SURPLUS)) if SURPLUS > 0 else 0
+    wanted = max(8 if count == 1 else 1, math.ceil(count * SURPLUS)) if SURPLUS > 0 else 0
     spares_count = _spares_allowed(wanted, payload_bytes)
     if spares_count <= 0:
         return None

@@ -86,6 +86,10 @@
     {
       "file": "harness/kernels/l2pf/py/sites.py (outside the vLLM subtree; recorded here for provenance)",
       "why": "L2 prefetch heads ahead of the MLP GEMMs (weights above MAX_WEIGHT): a 2.25 MiB head ahead of gate_up (after a norm) and a 0.5 MiB head ahead of down (after the activation), scales sharing the budget, plus a re-entrancy guard so only the outermost call of a nested wrapped entry point is a site. Taken from ArthurOstapenko's published submission e8fa7600-36f4-49a5-9c70-4190970fa897 (branch commit af81404); our compressed-FP8 prefetch skip (_RANS_SKIP_PREFETCH) is kept. Prefetch only reads weight bytes into L2 on a side stream; no value changes. L2PF_MLP=0 disables the heads."
+    },
+    {
+      "file": "harness/kernels/muserans/csrc/muse_rans.cu; harness/kernels/muse_bf16_lane/{lane.cu,py/__init__.py}; harness/kernels/decode6/{gemv6_srans.cu,marlin/marlin_template.h,muse_marlin6_gemv.py}; harness/kernels/marlinw_down/marlinw_down.py; harness/kernels/marlinw_attn/marlinw_attn.py; harness/kernels/l2pf/py/sites.py; vllm/model_executor/models/muse_glimmer_norm_glue.py; vllm/model_executor/models/muse_glimmer.py; vllm/model_executor/kernels/linear/nvfp4/decode_placement.py",
+      "why": "Continuous per-warp FP8 rANS streams without 4-byte step padding; persistent cp.async NS=4 rANS high-byte BF16 attention GEMV with QKV L2-prefetch skip; in-smem-header rANS block scales for NVFP4 MLP down_proj (40 layers) and compact 704B headers for gate_up (45 layers) with GPU encoder; cached marlinw_down and marlinw_attn scratch buffers; bit-exact post_attn norm glue extended to prefill row counts; M=1 attention-gate side stream overlap extended to deterministic muse_bf16_lane layers (52/52 layers); 8 spare placement candidates for single-buffer lm_head."
     }
   ],
   "carried_from": {

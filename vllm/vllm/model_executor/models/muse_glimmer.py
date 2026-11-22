@@ -1207,6 +1207,7 @@ class _GateSideStream:
         self.last_layer = -1
         self.forks = 0
         self.reported = False
+        self.m1_only_layers: set[int] = set()
 
     def _ensure_stream(self) -> bool:
         if self.stream is None and not self.unavailable:
@@ -1240,7 +1241,8 @@ class _GateSideStream:
 
     def fork(self, x: torch.Tensor, layer_idx: int) -> None:
         self.active = False
-        if not x.is_cuda or x.shape[0] > self.max_tokens:
+        max_tok = 1 if layer_idx in self.m1_only_layers else self.max_tokens
+        if not x.is_cuda or x.shape[0] > max_tok:
             return
         if (
             is_forward_context_available()
@@ -1340,7 +1342,7 @@ direct_register_custom_op(
 )
 
 
-def _gate_side_stream_fork_point(gate_proj: nn.Module) -> str | None:
+def _gate_side_stream_fork_point(gate_proj: nn.Module, layer_idx: int = -1) -> str | None:
     """Where the output gate branch forks off the attention chain, or None to
     keep the gate projection in order on the main stream: ``"qkv"`` right
     after the qkv projection, ``"attn"`` right before the attention op."""
@@ -1348,9 +1350,15 @@ def _gate_side_stream_fork_point(gate_proj: nn.Module) -> str | None:
     if mode not in ("qkv", "attn") or not current_platform.is_cuda():
         return None
     # cuBLAS does not promise the same kernel choice while other streams are
-    # active, so unquantized projections stay on the main stream.
-    if isinstance(getattr(gate_proj, "quant_method", None), UnquantizedLinearMethod):
-        return None
+    # active, so plain unquantized projections stay on the main stream.
+    # Deterministic M=1 BF16 lane GEMV subclasses (muse_bf16_lane) only fork
+    # at M=1 where cuBLAS is never invoked.
+    qm = getattr(gate_proj, "quant_method", None)
+    if isinstance(qm, UnquantizedLinearMethod):
+        if type(qm) is UnquantizedLinearMethod:
+            return None
+        if layer_idx >= 0:
+            _gate_side_stream.m1_only_layers.add(layer_idx)
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
         return None
@@ -1449,7 +1457,7 @@ class MuseGlimmerAttention(nn.Module):
                 if self.use_output_gate:
                     enable_bf16_lane(self.output_gate_proj)
         self.gate_fork_point = (
-            _gate_side_stream_fork_point(self.output_gate_proj)
+            _gate_side_stream_fork_point(self.output_gate_proj, self.layer_idx)
             if self.use_output_gate
             else None
         )
