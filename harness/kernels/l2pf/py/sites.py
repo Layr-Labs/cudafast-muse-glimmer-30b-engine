@@ -444,6 +444,13 @@ class Session:
                         if _scales_ok(sa, sb, n):
                             nbytes = 0
                             site.unassisted = True
+                elif kind == "muse_bf16_lane":
+                    a, weight, packed, index = args
+                    n, k = weight.shape
+                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
+                            and a.is_contiguous() and index.numel() == 1):
+                        nbytes = 0
+                        site.unassisted = True
                 site.descs = weight_descs(ws, nbytes)
             if self.ranges is not None and not _inside(site.descs, self.ranges):
                 site.descs = []

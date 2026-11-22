@@ -53,6 +53,19 @@ except Exception:  # noqa: BLE001 - package absent: stock cutlass for every prom
 # ops.cutlass_scaled_mm on the layer's own weight; any other weight keeps the stock op.
 _prefill_admitted: set[int] = set()
 _prefill_real_checked: set[int] = set()
+
+
+def prefill_admitted(weight: torch.Tensor) -> bool:
+    return _prefill is not None and weight.data_ptr() in _prefill_admitted
+
+
+def prefill_moved(old_ptr: int, new_ptr: int) -> None:
+    if old_ptr in _prefill_admitted:
+        _prefill_admitted.discard(old_ptr)
+        _prefill_admitted.add(new_ptr)
+    if old_ptr in _prefill_real_checked:
+        _prefill_real_checked.discard(old_ptr)
+        _prefill_real_checked.add(new_ptr)
 _prefill_stats = {"admitted": 0, "rejected": 0, "served": 0, "fallback": 0, "real_equal": 0, "real_differ": 0,
                   "logged": False}
 
@@ -114,7 +127,9 @@ def _prefill_gemm(a, b, scale_a, scale_b):
 @torch.library.custom_op("glimmer::fp8_scaled_mm", mutates_args=())
 def fp8_scaled_mm(a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor) -> torch.Tensor:
     if a.size(0) > 16:
-        if a.size(0) == 512 and _fp8ws_maybe_gemm is not None:
+        # A weight admitted to muse_fp8_prefill (bitwise equal to cutlass_scaled_mm on it) is served there first:
+        # its tile beats fp8ws on the 4608x6656 qkv shape (188-194 vs 206-216 us at 512 rows on GB10).
+        if a.size(0) == 512 and _fp8ws_maybe_gemm is not None and b.data_ptr() not in _prefill_admitted:
             out = _fp8ws_maybe_gemm(a, b, scale_a, scale_b)
             if out is not None:
                 return out
