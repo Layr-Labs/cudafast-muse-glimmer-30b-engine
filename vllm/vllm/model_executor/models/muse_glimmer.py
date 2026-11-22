@@ -72,6 +72,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8StaticTensorSym,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -1376,6 +1379,7 @@ class MuseGlimmerAttention(nn.Module):
             if self.use_output_gate
             else None
         )
+        self.shared_fp8_input = False
 
         self.rotary_emb = (
             get_rope(
@@ -1404,13 +1408,96 @@ class MuseGlimmerAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+    def share_fp8_input_if_exact(self) -> bool:
+        """Decides, once the checkpoint is loaded, whether qkv_proj and
+        output_gate_proj can read one FP8 copy of the layer input.
+
+        Both read the same bf16 tensor and both quantize it with a static
+        per-tensor scale. qkv_proj quantizes with max(q, k, v input scales)
+        after loading, the gate with its own scale. When every one of those
+        float32 scales equals the gate's bit for bit, the two quantizations
+        are the same operation on the same input with the same kernel, so the
+        second one is dropped and both GEMMs consume the first one's output.
+        Anything else keeps both quantizations."""
+        self.shared_fp8_input = False
+        if not self.use_output_gate:
+            return False
+        qkv, gate = self.qkv_proj, self.output_gate_proj
+        qkv_kernel = getattr(qkv.quant_method, "fp8_linear", None)
+        gate_kernel = getattr(gate.quant_method, "fp8_linear", None)
+        if (
+            qkv_kernel is None
+            or gate_kernel is None
+            or type(qkv_kernel) is not type(gate_kernel)
+            or type(qkv.quant_method) is not type(gate.quant_method)
+            or qkv_kernel.input_quant_key() != kFp8StaticTensorSym
+            or gate_kernel.input_quant_key() != kFp8StaticTensorSym
+            or getattr(qkv, "input_scale_ub", None) is not None
+            or getattr(gate, "input_scale_ub", None) is not None
+            or qkv.bias is not None
+            or gate.bias is not None
+        ):
+            return False
+        qkv_scale = getattr(qkv, "input_scale", None)
+        gate_scale = getattr(gate, "input_scale", None)
+        if (
+            qkv_scale is None
+            or gate_scale is None
+            or qkv_scale.dtype != torch.float32
+            or gate_scale.dtype != torch.float32
+            or gate_scale.numel() < 1
+        ):
+            return False
+        ref = gate_scale.reshape(-1)[0]
+        if not (
+            bool(ref > 0)
+            and bool((gate_scale == ref).all())
+            and bool((qkv_scale == ref).all())
+        ):
+            return False
+        self.shared_fp8_input = True
+        return True
+
+    def _quantize_input_once(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        kernel = self.qkv_proj.quant_method.fp8_linear
+        _, _, x_s, x_s_ub = kernel._get_layer_params(self.qkv_proj)
+        x_2d = hidden_states.view(-1, hidden_states.shape[-1])
+        return kernel.quant_fp8(x_2d, x_s, x_s_ub)
+
+    @staticmethod
+    def _fp8_project(
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        fp8_input: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> torch.Tensor:
+        if fp8_input is None:
+            out, _ = layer(hidden_states)
+            return out
+        kernel = layer.quant_method.fp8_linear
+        w, w_s, _, _ = kernel._get_layer_params(layer)
+        out_dtype = kernel.config.out_dtype
+        return kernel.apply_scaled_mm(
+            A=fp8_input[0],
+            B=w,
+            out_dtype=hidden_states.dtype if out_dtype is None else out_dtype,
+            As=fp8_input[1],
+            Bs=w_s,
+            bias=None,
+            output_shape=[*hidden_states.shape[:-1], w.shape[1]],
+        )
+
     def _output_gate_before_attention(
-        self, hidden_states: torch.Tensor, chain_inputs: list[torch.Tensor]
+        self,
+        hidden_states: torch.Tensor,
+        fp8_input: tuple[torch.Tensor, torch.Tensor] | None,
+        chain_inputs: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # The gate projection is launched first; the attention chain that
         # follows (reading ``chain_inputs``) runs beside it on a side stream.
         dep = torch.ops.vllm.muse_glimmer_gate_fork(hidden_states, self.layer_idx)
-        gate, _ = self.output_gate_proj(hidden_states)
+        gate = self._fp8_project(self.output_gate_proj, hidden_states, fp8_input)
         dep = torch.ops.vllm.muse_glimmer_gate_switch(gate, dep, chain_inputs)
         return gate, dep
 
@@ -1419,10 +1506,15 @@ class MuseGlimmerAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        fp8_input = (
+            self._quantize_input_once(hidden_states) if self.shared_fp8_input else None
+        )
+        qkv = self._fp8_project(self.qkv_proj, hidden_states, fp8_input)
         gate = gate_dep = None
         if self.gate_fork_point == "qkv":
-            gate, gate_dep = self._output_gate_before_attention(hidden_states, [qkv])
+            gate, gate_dep = self._output_gate_before_attention(
+                hidden_states, fp8_input, [qkv]
+            )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if self.use_qk_norm:
@@ -1439,7 +1531,7 @@ class MuseGlimmerAttention(nn.Module):
 
         if self.gate_fork_point == "attn":
             gate, gate_dep = self._output_gate_before_attention(
-                hidden_states, [q, k, v]
+                hidden_states, fp8_input, [q, k, v]
             )
 
         attn_output = self.attn(q, k, v)
@@ -1447,7 +1539,7 @@ class MuseGlimmerAttention(nn.Module):
         if self.use_output_gate:
             if gate is None:
                 # Gate reads the layer input hidden states (not the attn output).
-                gate, _ = self.output_gate_proj(hidden_states)
+                gate = self._fp8_project(self.output_gate_proj, hidden_states, fp8_input)
             else:
                 torch.ops.vllm.muse_glimmer_gate_join(gate, hidden_states, gate_dep)
             attn_output = torch.sigmoid(gate) * attn_output
@@ -1884,4 +1976,13 @@ class MuseGlimmerForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        attention = [m for m in self.modules() if isinstance(m, MuseGlimmerAttention)]
+        shared = sum(m.share_fp8_input_if_exact() for m in attention)
+        logger.info(
+            "MuseGlimmer: %d of %d attention layers quantize their input to FP8 "
+            "once for qkv_proj and output_gate_proj (equal static input scales)",
+            shared,
+            len(attention),
+        )
+        return loaded
