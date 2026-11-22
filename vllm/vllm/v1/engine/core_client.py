@@ -314,6 +314,11 @@ class InprocClient(EngineCoreClient):
         * pulls EngineCoreOutputs by stepping the EngineCore
     """
 
+    # When True, an empty abort (the call LLMEngine.step makes after every
+    # output) does not drain the core: the owner calls settle() once it has
+    # handed the output on. Class default False: the drain stays inline.
+    defer_settle = False
+
     def __init__(self, *args, **kwargs):
         self.engine_core = EngineCore(*args, **kwargs)
         logger.info("Engine core runs in the client process")
@@ -349,22 +354,38 @@ class InprocClient(EngineCoreClient):
         req, request_wave = self.engine_core.preprocess_add_request(request)
         self.engine_core.add_request(req, request_wave)
 
-    def abort_requests(self, request_ids: list[str]) -> None:
+    def settle(self) -> None:
+        """Drain what the core still owns once the last live request is gone:
+        a queued batch and the finished request's cleanup. No background loop
+        settles them in this mode. Never advances a live request."""
         try:
-            if len(request_ids) > 0:
-                self.engine_core.abort_requests(request_ids)
-            # LLMEngine calls this after every output, including with an empty
-            # list when a bounded request has completed. Its output processor
-            # can already report no unfinished request while the core still
-            # owns a queued batch or finished-request cleanup, and no
-            # background loop settles them in this mode. Drain once the last
-            # live request is gone, before another request can be added; never
-            # advance a different live request.
             scheduler = self.engine_core.scheduler
             if not scheduler.has_unfinished_requests():
                 while scheduler.has_requests() or self.engine_core.batch_queue:
                     self.get_output()
             self._hostfast_idle_if_finished()
+        except BaseException:
+            hostfast.gc_idle()
+            raise
+
+    def abort_requests(self, request_ids: list[str]) -> None:
+        try:
+            if len(request_ids) > 0:
+                self.engine_core.abort_requests(request_ids)
+            elif self.defer_settle:
+                # LLMEngine calls this with an empty list after every output.
+                # With the multiprocess engine the core's own loop cleans up
+                # after a completed request while the output is already on its
+                # way to the caller; here the owner asked for the same order:
+                # it calls settle() after it has passed the output on, and
+                # before it adds another request.
+                return
+            # LLMEngine calls this after every output, including with an empty
+            # list when a bounded request has completed. Its output processor
+            # can already report no unfinished request while the core still
+            # owns a queued batch or finished-request cleanup. Drain once the
+            # last live request is gone, before another request can be added.
+            self.settle()
         except BaseException:
             hostfast.gc_idle()
             raise

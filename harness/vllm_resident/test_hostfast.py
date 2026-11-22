@@ -204,6 +204,34 @@ class InprocClientTests(unittest.TestCase):
         self.assertEqual(self.core.aborted, [])
         self.assertFalse(self.core.batch_queue)
 
+    def test_a_deferred_empty_abort_leaves_the_drain_to_settle(self):
+        self.client.defer_settle = True
+        self.core.batch_queue.append(object())
+        self.core.scheduler.finished_pending = True
+        self.client.abort_requests([])
+        self.assertEqual(self.core.steps, 0, "the output goes out before the cleanup")
+        self.assertEqual(len(self.core.batch_queue), 1)
+        self.client.settle()
+        self.assertFalse(self.core.batch_queue)
+        self.assertFalse(self.core.scheduler.has_requests())
+        self.assertTrue(gc.isenabled())
+
+    def test_a_deferred_client_still_drains_a_real_abort_inline(self):
+        self.client.defer_settle = True
+        self.core.batch_queue.append(object())
+        self.client.abort_requests(["r1"])
+        self.assertEqual(self.core.aborted, [["r1"]])
+        self.assertFalse(self.core.batch_queue)
+        self.assertFalse(self.core.scheduler.has_requests())
+
+    def test_settle_never_advances_a_live_request(self):
+        self.client.defer_settle = True
+        self.core.scheduler.unfinished = True
+        self.core.batch_queue.append(object())
+        self.client.settle()
+        self.assertEqual(self.core.steps, 0)
+        self.assertEqual(len(self.core.batch_queue), 1)
+
     def test_a_live_request_is_never_advanced_by_an_abort(self):
         self.core.scheduler.unfinished = True
         self.core.batch_queue.append(object())
@@ -225,6 +253,51 @@ class InprocClientTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.client.get_output()
         self.assertTrue(gc.isenabled())
+
+
+try:
+    from vllm.v1.worker.gpu import async_utils
+except ImportError:  # no vLLM on this host
+    async_utils = None
+
+
+class FakeEvent:
+    """A CUDA event that completes after `polls` queries (or at once)."""
+
+    def __init__(self, polls=0):
+        self.polls = polls
+        self.queries = 0
+        self.synchronized = 0
+
+    def query(self):
+        self.queries += 1
+        return self.queries > self.polls
+
+    def synchronize(self):
+        self.synchronized += 1
+
+
+@unittest.skipIf(async_utils is None, "vLLM is not importable here")
+class TwoStageWaitTests(unittest.TestCase):
+    def test_a_decode_step_blocks_once_and_never_polls(self):
+        copy = FakeEvent()
+        async_utils.wait_for_output(copy)
+        self.assertEqual((copy.synchronized, copy.queries), (1, 0))
+
+    def test_a_prefill_step_sleeps_through_the_forward_then_polls_the_tail(self):
+        forward, copy = FakeEvent(), FakeEvent(polls=7)
+        async_utils.wait_for_output(copy, forward)
+        self.assertEqual(forward.synchronized, 1)
+        self.assertEqual(copy.queries, 8)
+        self.assertEqual(copy.synchronized, 0, "the copy event was polled, not slept on")
+
+    def test_a_long_tail_falls_back_to_the_blocking_wait(self):
+        forward, copy = FakeEvent(), FakeEvent(polls=10**9)
+        ticks = iter(range(0, 10**12, async_utils._TAIL_POLL_NS // 4))
+        async_utils.wait_for_output(copy, forward, clock=lambda: next(ticks))
+        self.assertEqual(forward.synchronized, 1)
+        self.assertEqual(copy.synchronized, 1)
+        self.assertLess(copy.queries, 10)
 
 
 if __name__ == "__main__":
