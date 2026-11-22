@@ -76,8 +76,10 @@ from collections import deque
 
 try:
     from .backends import Backend, Emit, FakeBackend, VllmBackend, VllmConfig
+    from .settle import settle_and_log
 except ImportError:  # run as a script
     from backends import Backend, Emit, FakeBackend, VllmBackend, VllmConfig  # type: ignore
+    from settle import settle_and_log  # type: ignore
 
 # The depth the resident implements. MUST equal ENGINE_IMPLEMENTED_DEPTH in
 # harness/protocol-adapter/src/session_backend.rs.
@@ -398,6 +400,9 @@ def main() -> int:
     log("loading the model")
     backend = make_backend()
     log(f"model loaded once for this window ({backend.ident}, depth={backend.depth})")
+    # Ready means the timed phases may start: report it on a quiet host (settle.py).
+    if isinstance(backend, VllmBackend):
+        settle_and_log(log)
     session = Session(backend, spec_run=spec_run)
 
     # Bind only after the load, so a connect that succeeds means the weights

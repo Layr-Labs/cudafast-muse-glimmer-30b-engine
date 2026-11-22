@@ -414,6 +414,12 @@ _installed = False
 def install_prompt_glue() -> None:
     """Route long launches of matching compiled kernels to the swaps above."""
     global _installed
+    try:
+        from .muse_glimmer_norm_glue import install_norm_glue
+
+        install_norm_glue()
+    except Exception:
+        logger.info("Decode norm glue not installed", exc_info=True)
     if _installed or os.environ.get("VLLM_MUSE_GLIMMER_PROMPT_GLUE", "1") != "1":
         return
     try:

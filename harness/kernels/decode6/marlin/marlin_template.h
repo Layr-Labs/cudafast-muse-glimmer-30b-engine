@@ -645,8 +645,25 @@ __global__ void Marlin(
         b_gl_stride * (threadIdx.x / b_sh_stride) + (threadIdx.x % b_sh_stride);
   }
 
+#ifdef MUSE_GATE_UP_ILV
+  // Schedule-ordered gate/up layout (muse_marlin6_gemv.to_gate_up_ilv): the k-stage s of this CTA's slice
+  // is chunk ilv_base + 48 * s, so at every stage the 48 co-resident CTAs of a wave read 48 adjacent
+  // chunks; a chunk holds one stage (512 int4 of codes, 48 int4 of 6-bit scale codes). Every thread
+  // fetches the same bytes into the same shared slots at the same stage as with the tiled layout.
+  [[maybe_unused]] int ilv_base = 0;
+  if constexpr (gate_up_grid) {
+    ilv_base = blockIdx.x < 288 ? (blockIdx.x / 48) * 2496 + blockIdx.x % 48
+                                : 14976 + (blockIdx.x - 288);
+    b_gl_rd += b_gl_rd_delta_o * ilv_base;
+    b_gl_rd_delta_o *= 48;
+  } else {
+    b_gl_rd += b_sh_stride * tile_column_stride * slice_col;
+    b_gl_rd += b_gl_rd_delta_o * slice_row;
+  }
+#else
   b_gl_rd += b_sh_stride * tile_column_stride * slice_col;
   b_gl_rd += b_gl_rd_delta_o * slice_row;
+#endif
   auto b_sh_rd = threadIdx.x * b_thread_vecs;
   b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_wr_iters - 1));
 
@@ -670,6 +687,12 @@ __global__ void Marlin(
         // is 3/4 of s_sh_stage int4, stages in K order
         s_gl_rd = (3 * s_sh_stride * tile_column_stride / 4) * slice_col +
                   (3 * s_sh_stage / 4) * slice_row + threadIdx.x;
+  #ifdef MUSE_GATE_UP_ILV
+        if constexpr (gate_up_grid) {
+          s_gl_rd = (3 * s_sh_stage / 4) * ilv_base + threadIdx.x;
+          s_gl_rd_delta *= 48;
+        }
+  #endif
       } else {
         s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
                                  threadIdx.x / s_sh_stride) +
@@ -818,6 +841,87 @@ __global__ void Marlin(
     if (threadIdx.x < 4)
       reinterpret_cast<int4*>(sh_pal)[threadIdx.x] = scale6_palette[threadIdx.x];
   }
+#ifdef MUSE_SCALE_RANS
+  // rANS-coded block scales (fixed gate/up grid only; muse_marlin6_gemv.encode_gate_up_scales, gemv6_srans.cu).
+  // Global operands, carried in pointer arguments this configuration does not otherwise use:
+  //   scales_ptr: per-CTA headers, RANS_HDR bytes each: u32 states[256] (warp-major), u32 off16[64]
+  //               (block X >= 2 starts at var + 16 off16[X]; off16[iters] ends the last), block 0, block 1
+  //   zp_ptr:     the variable region (blocks X >= 2 of every CTA)
+  //   g_idx:      the layer's decode table, u32[1024]: symbol | freq << 6 | (slot - cum) << 17
+  // A block (one k-stage of the CTA's slice): u8 count[8] (16-bit words per warp), then the words of warp 0..7.
+  // Warp w decodes bytes 128 w + lane + 32 m (m = 0..3) of the stage's 1 KB raw scale block into the 8-bit
+  // scale slot of that stage; consumers then read raw scale bytes exactly as the uncompressed kernel does.
+  static_assert(gate_up_grid && scale6, "rANS scales are built for the fixed gate/up grid only");
+  constexpr int RANS_HDR = 3328, RANS_CAP = 1024;
+  unsigned char* sh_rhdr = sh_pal + 64;
+  unsigned char* sh_rslot = sh_rhdr + RANS_HDR;
+  uint32_t* sh_rlut = reinterpret_cast<uint32_t*>(sh_rslot + stages * RANS_CAP);
+  uint64_t* sh_rbar = reinterpret_cast<uint64_t*>(sh_rlut + 1024);
+  const unsigned char* rans_var_g = reinterpret_cast<const unsigned char*>(zp_ptr);
+  const int rans_iters = slice_iters;
+  uint32_t rans_x = 0;
+  int rans_q = 0;
+  auto rans_bar = [&](int i) { return static_cast<uint32_t>(__cvta_generic_to_shared(sh_rbar + i)); };
+  auto rans_bulk = [&](void* dst, const void* src, int bytes, int bar) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(rans_bar(bar)), "r"(bytes) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                     static_cast<uint32_t>(__cvta_generic_to_shared(dst))),
+                 "l"(src), "r"(bytes), "r"(rans_bar(bar))
+                 : "memory");
+  };
+  auto rans_wait = [&](int bar, uint32_t parity) {
+    asm volatile(
+        "{\n\t.reg .pred P1;\n\tRANS_WAIT_%=:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n\t"
+        "@!P1 bra RANS_WAIT_%=;\n\t}" ::"r"(rans_bar(bar)), "r"(parity) : "memory");
+  };
+  // block X >= 2 into slot X % stages; the slot's previous block was decoded two barriers earlier
+  auto rans_issue = [&](int X) {
+    const uint32_t* off = reinterpret_cast<const uint32_t*>(sh_rhdr + 1024);
+    const int bytes = static_cast<int>(off[X + 1] - off[X]) * 16;
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    rans_bulk(sh_rslot + (X % stages) * RANS_CAP, rans_var_g + static_cast<size_t>(off[X]) * 16, bytes,
+              1 + X % stages);
+  };
+  if (threadIdx.x == 0) {
+  #pragma unroll
+    for (int i = 0; i <= stages; i++)
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(rans_bar(i)) : "memory");
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(rans_bar(0)), "r"(RANS_HDR + 4096)
+                 : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                     static_cast<uint32_t>(__cvta_generic_to_shared(sh_rhdr))),
+                 "l"(reinterpret_cast<const unsigned char*>(scales_ptr) + static_cast<size_t>(blockIdx.x) * RANS_HDR),
+                 "r"(RANS_HDR), "r"(rans_bar(0))
+                 : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                     static_cast<uint32_t>(__cvta_generic_to_shared(sh_rlut))),
+                 "l"(g_idx), "r"(4096), "r"(rans_bar(0))
+                 : "memory");
+  }
+  auto rans_decode = [&](int X) {
+    const unsigned char* blk = X < 2 ? sh_rhdr + 1280 + X * RANS_CAP : sh_rslot + (X % stages) * RANS_CAP;
+    const int w = threadIdx.x / 32, lane = threadIdx.x % 32;
+    int start = 4;
+  #pragma unroll
+    for (int i = 0; i < 7; i++) start += i < w ? blk[i] : 0;
+    const uint16_t* words = reinterpret_cast<const uint16_t*>(blk) + start;
+    uint8_t* dst = reinterpret_cast<uint8_t*>(sh_s + s_sh_stage * (X % stages)) + 128 * w + lane;
+    const uint32_t lt = (1u << lane) - 1u;
+    int pos = 0;
+  #pragma unroll
+    for (int m = 0; m < 4; m++) {
+      const uint32_t e = sh_rlut[rans_x & 1023u];
+      rans_x = ((e >> 6) & 2047u) * (rans_x >> 10) + (e >> 17);
+      dst[32 * m] = sh_pal[e & 63u];
+      const bool need = rans_x < 65536u;
+      const uint32_t msk = __ballot_sync(0xffffffffu, need);
+      if (need) rans_x = (rans_x << 16) | words[pos + __popc(msk & lt)];
+      pos += __popc(msk);
+    }
+  };
+#endif
 
   // Register storage for double buffer of shared memory reads.
   FragA frag_a[2][thread_m_blocks];
@@ -892,6 +996,19 @@ __global__ void Marlin(
       }
     }
   };
+#ifdef MUSE_B_EVICT_FIRST
+  // The weight and scale-code streams are read once: insert them in L2 as evict-first so they displace each
+  // other before any other resident line. Same bytes to the same shared slots; only the L2 policy differs.
+  uint64_t stream_policy;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(stream_policy));
+  auto cp_async4_stream = [&](void* smem_ptr, const void* glob_ptr) {
+    const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(smem), "l"(glob_ptr),
+                 "l"(stream_policy));
+  };
+#else
+  auto cp_async4_stream = [&](void* smem_ptr, const void* glob_ptr) { cp_async4(smem_ptr, glob_ptr); };
+#endif
   // Asynchronously fetch the next A, B and s tile from global to the next
   // shared memory pipeline location.
   auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true) {
@@ -912,7 +1029,7 @@ __global__ void Marlin(
             b_gl_rd + (i % count) * threads +
             b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
 
-        cp_async4(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
+        cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
       }
 
       b_gl_rd += b_gl_rd_delta_o;
@@ -938,9 +1055,11 @@ __global__ void Marlin(
 
           // Only fetch scales if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
+#ifndef MUSE_SCALE_RANS
             if (s_sh_wr_pred) {
-              cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
+              cp_async4_stream(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
             }
+#endif
             s_gl_rd += scale6 ? (s_gl_rd_delta * s_tb_groups * 3) / 4
                               : s_gl_rd_delta * s_tb_groups;
           }
@@ -1060,6 +1179,10 @@ __global__ void Marlin(
             reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
                 sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
           } else if constexpr (scale6) {
+#ifdef MUSE_SCALE_RANS
+            reinterpret_cast<int2*>(&frag_s[k % 2])[0] = reinterpret_cast<int2*>(
+                sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
+#else
             // raw byte b of the stage has its code at bits [6b, 6b + 6) of the
             // compressed stage (LSB first); these 8 bytes start at b = 8m, so
             // their 48 code bits sit in 32-bit words floor(1.5m), floor(1.5m)+1
@@ -1078,6 +1201,7 @@ __global__ void Marlin(
             }
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
                 make_int2(static_cast<int>(lo), static_cast<int>(hi));
+#endif
           } else {
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
                 reinterpret_cast<int2*>(
@@ -1847,6 +1971,17 @@ __global__ void Marlin(
 
     zero_accums();
     wait_for_stage();
+#ifdef MUSE_SCALE_RANS
+    rans_wait(0, 0);
+    rans_x = reinterpret_cast<const uint32_t*>(sh_rhdr)[threadIdx.x];
+    rans_decode(0);
+    if (rans_iters > 1) rans_decode(1);
+    if (threadIdx.x == 0) {
+      if (rans_iters > 2) rans_issue(2);
+      if (rans_iters > 3) rans_issue(3);
+    }
+    __syncthreads();
+#endif
     init_same_group(0);
     fetch_to_registers(0, 0);
     fetch_scales_to_registers(0, 0);
@@ -1879,6 +2014,17 @@ __global__ void Marlin(
                           slice_iters >= stages);
           pipe++;
           wait_for_stage();
+#ifdef MUSE_SCALE_RANS
+          // entering stage rans_q: decode stage rans_q + 1 (its block was issued two stages ago),
+          // then issue block rans_q + 3 into the slot of the block decoded two barriers ago
+          rans_q++;
+          if (rans_q + 1 < rans_iters) {
+            const int X = rans_q + 1;
+            if (X >= 2) rans_wait(1 + X % stages, static_cast<uint32_t>(((X - 2) / 4) & 1));
+            rans_decode(X);
+          }
+          if (threadIdx.x == 0 && rans_q + 3 < rans_iters) rans_issue(rans_q + 3);
+#endif
           init_same_group(pipe % stages);
         }
 

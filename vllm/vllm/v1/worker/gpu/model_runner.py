@@ -336,9 +336,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             try:
                 from vllm.model_executor.kernels.linear.nvfp4.decode_placement import (
                     place_decode_weights,
+                    place_prefill_weights,
                 )
 
                 place_decode_weights(self.model)
+                place_prefill_weights(self.model)
             except Exception as err:  # noqa: BLE001 - never part of the load's success
                 logger.warning("Decode weight placement unavailable: %s", err)
         logger.info(
