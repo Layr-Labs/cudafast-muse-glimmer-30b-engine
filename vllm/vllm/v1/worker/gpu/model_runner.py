@@ -105,11 +105,9 @@ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
-from vllm.v1.worker.gpu.prefill_graph import PrefillGraph, capture_prefill_graph
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
-from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -264,9 +262,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
-        # LOCAL PATCH (prefill graph): whole-forward graph for one fresh
-        # prefill of a fixed length (vllm/v1/worker/gpu/prefill_graph.py).
-        self.prefill_graph: PrefillGraph | None = None
 
         # LoRA-related workers.
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
@@ -284,18 +279,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
-
-        # LOCAL PATCH (SP5D, Yukon submission 98c1361e): constant one-request sampling metadata, made once instead
-        # of an arange and a zeros launch every step. Only read downstream (sampler, logits-index kernels).
-        self._cu_num_logits_1_np = np.arange(2, dtype=np.int32)
-        self._cu_num_logits_1_gpu = torch.arange(
-            2, device=self.device, dtype=torch.int32
-        )
-        self._expanded_local_pos_1_gpu = torch.zeros(
-            1, dtype=torch.int32, device=self.device
-        )
-        self._ones_1_i32 = torch.ones(1, dtype=torch.int32, device=self.device)
-        self._zeros_1_i32 = torch.zeros(1, dtype=torch.int32, device=self.device)
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -343,19 +326,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
-        if not load_dummy_weights:
-            # LOCAL PATCH (decode weight placement): move one-row NVFP4 decode
-            # weights off slow device memory; same bytes, checked bitwise.
-            try:
-                from vllm.model_executor.kernels.linear.nvfp4.decode_placement import (
-                    place_decode_weights,
-                    place_prefill_weights,
-                )
-
-                place_decode_weights(self.model)
-                place_prefill_weights(self.model)
-            except Exception as err:  # noqa: BLE001 - never part of the load's success
-                logger.warning("Decode weight placement unavailable: %s", err)
         logger.info(
             "Model loading took %s GiB and %.6f seconds",
             format_gib(m.consumed_memory),
@@ -813,10 +783,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculator is not None:
                 self.speculator.capture()
 
-        # LOCAL PATCH (prefill graph): captured apart from the dispatcher's
-        # graphs, so decode dispatch and compile ranges stay unchanged.
-        self.prefill_graph = capture_prefill_graph(self)
-
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
         elapsed_time = end_time - start_time
@@ -995,20 +961,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # No draft token scheduled (common case).
             total_num_draft_tokens = 0
             total_num_logits = num_reqs
-            if num_reqs == 1:
-                cu_num_logits_np = self._cu_num_logits_1_np
-                cu_num_logits = self._cu_num_logits_1_gpu
-                expanded_idx_mapping = idx_mapping
-                expanded_local_pos = self._expanded_local_pos_1_gpu
-            else:
-                cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
-                cu_num_logits = torch.arange(
-                    num_reqs + 1, device=self.device, dtype=torch.int32
-                )
-                expanded_idx_mapping = idx_mapping
-                expanded_local_pos = torch.zeros(
-                    num_reqs, dtype=torch.int32, device=self.device
-                )
+            cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
+            cu_num_logits = torch.arange(
+                num_reqs + 1, device=self.device, dtype=torch.int32
+            )
+            expanded_idx_mapping = idx_mapping
+            expanded_local_pos = torch.zeros(
+                num_reqs, dtype=torch.int32, device=self.device
+            )
         else:
             num_draft_tokens_per_req = np.fromiter(
                 (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
@@ -1185,61 +1145,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
-        compact_sample: bool = False,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
-        # LOCAL PATCH (SP5D, Yukon submission 98c1361e): a one-request step without draft tokens that completes its
-        # prompt takes its sampling row as a slice (the row logits_indices would gather), and a greedy step without
-        # logprobs, penalties, bias or grammar takes the token from lmpost's fused softcap + argmax.
-        can_single_row = (
-            input_batch.num_reqs == 1
-            and input_batch.num_draft_tokens == 0
-            and int(input_batch.num_computed_tokens_np[0])
-            + int(input_batch.num_scheduled_tokens[0])
-            >= int(input_batch.prefill_len_np[0])
-        )
-        if compact_sample:
-            sample_hidden_states = hidden_states[-1:]
-        elif can_single_row:
-            logits_row = int(input_batch.query_start_loc_np[1]) - 1
-            sample_hidden_states = hidden_states[logits_row : logits_row + 1]
-        else:
-            sample_hidden_states = hidden_states[input_batch.logits_indices]
-        lmpost_argmax = getattr(self.model, "_lmpost_softcap_argmax", None)
-        if (
-            can_single_row
-            and lmpost_argmax is not None
-            and grammar_output is None
-            and self.sampler is not None
-            and not self.sampler.compute_nans
-        ):
-            idx_mapping_np = input_batch.idx_mapping_np
-            states = self.sampler.sampling_states
-            if (
-                states.temperature.np[idx_mapping_np[0]] == 0.0
-                and states.max_num_logprobs(idx_mapping_np) == NO_LOGPROBS
-                and self.sampler.logprob_token_ids_state.max_num_token_ids(idx_mapping_np) == 0
-                and not self.sampler._requires_logits_processing(idx_mapping_np)
-            ):
-                raw_logits = self.model.logits_processor(self.model.lm_head, sample_hidden_states)
-                if raw_logits is not None:
-                    sampled_token_ids = lmpost_argmax(
-                        raw_logits, self.model.output_multiplier, self.model.final_logit_softcapping
-                    )
-                    if sampled_token_ids is not None:
-                        if not getattr(self, "_lmpost_logged", False):
-                            self._lmpost_logged = True
-                            logger.info("lmpost fused softcap + argmax in use (one-row greedy decode)")
-                        return (
-                            SamplerOutput(
-                                sampled_token_ids=sampled_token_ids,
-                                logprobs_tensors=None,
-                                num_nans=None,
-                                num_sampled=self._ones_1_i32,
-                                num_rejected=self._zeros_1_i32,
-                            ),
-                            self._ones_1_i32,
-                            self._zeros_1_i32,
-                        )
+        sample_hidden_states = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
@@ -1351,6 +1258,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_active_loras=num_active_loras,
         )
 
+        # Strict fresh-prefill guard for dedicated whole-forward M=512 FULL CUDA graph.
+        if (
+            self.cudagraph_manager is not None
+            and not dummy_run
+            and not is_profile
+            and not skip_compiled
+            and self.dp_size == 1
+            and num_reqs == 1
+            and num_toks == 512
+            and max_query_len == 512
+            and num_active_loras == 0
+            and not scheduler_output.scheduled_encoder_inputs
+        ):
+            _rid = next(iter(scheduler_output.num_scheduled_tokens))
+            _ridx = self.req_states.req_id_to_index.get(_rid)
+            if (
+                _ridx is not None
+                and int(self.req_states.num_computed_tokens_np[_ridx]) == 0
+                and not self.cudagraph_manager.use_aux_hidden_state_outputs
+            ):
+                _p512_desc = self.cudagraph_manager.get_prefill_full_desc(512)
+                if _p512_desc is not None:
+                    batch_desc = _p512_desc
+
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -1397,19 +1328,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_tables = None
                 slot_mappings = None
 
-        # LOCAL PATCH (SP5D, Yukon submission 98c1361e): a FULL-graph replay reads the persistent input, block-table
-        # and slot-mapping buffers filled above, not the Python metadata objects, so they are not built for it (no
-        # speculator reads them in sample_tokens). FlashAttention-2 metadata building writes no persistent buffer.
-        skip_eager_attn_meta = (
-            not dummy_run
-            and batch_desc.cg_mode == CUDAGraphMode.FULL
-            and self.speculator is None
-            and self.cudagraph_manager is not None
-            and batch_desc in self.cudagraph_manager.graphs
-        )
         attn_metadata = None
         slot_mappings_by_layer = None
-        if not (dummy_run and skip_attn_for_dummy_run) and not skip_eager_attn_meta:
+        if not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
             slot_mappings_by_layer = build_slot_mappings_by_layer(
                 slot_mappings, self.kv_cache_config
@@ -1430,41 +1351,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
-        # LOCAL PATCH (SP5D, Yukon submission 98c1361e; prefill graph only): a text-only, one-request prefill that
-        # the boot prefill graph can replay embeds its token ids inside that graph (prefill_graph.py), so no eager
-        # embedding runs before the replay; the eager embedding is computed only if the replay is refused.
-        graph_embed = False
-        prefill_graph = self.prefill_graph
-        if (
-            self.supports_mm_inputs
-            and self.is_first_pp_rank
-            and not dummy_run
-            and prefill_graph is not None
-            and prefill_graph.embed_input_ids is not None
-            and batch_desc.cg_mode == CUDAGraphMode.NONE
-            and self.lora_config is None
-            and not self.model.requires_raw_input_tokens
-            and not scheduler_output.scheduled_encoder_inputs
-            and (
-                self.encoder_cache is None
-                or not any(
-                    self.encoder_cache.mm_features.get(rid)
-                    for rid in input_batch.req_ids
-                )
-            )
-            and not skip_compiled
-            and num_tokens_across_dp is None
-            and input_batch.num_reqs == 1
-            and input_batch.num_draft_tokens == 0
-            and input_batch.num_tokens == prefill_graph.num_tokens
-            and input_batch.num_tokens_after_padding == prefill_graph.num_tokens
-            and int(input_batch.num_computed_tokens_np[0]) == 0
-        ):
-            graph_embed = True
         if self.supports_mm_inputs and self.is_first_pp_rank:
             # Run MM encoder (if needed) and get multimodal embeddings.
             # Only first PP rank prepares multimodal embeddings.
-            if dummy_run or graph_embed:
+            if dummy_run:
                 # Obtain mm embeddings of correct shape for compiled model.
                 inputs_embeds = self.model_state.dummy_inputs_embeds(
                     input_batch.num_tokens_after_padding
@@ -1517,7 +1407,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
         # Run model.
-        compact_sample = False
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -1555,49 +1444,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                 else:
                     # Eager (NONE): call the raw model directly.
-                    model_output = None
-                    # LOCAL PATCH (prefill graph): a fresh, unpadded,
-                    # one-request prefill of the captured length replays
-                    # the boot graph; try_replay refuses any other step.
-                    prefill_graph = self.prefill_graph
-                    if (
-                        prefill_graph is not None
-                        and not dummy_run
-                        and not skip_compiled
-                        and num_tokens_across_dp is None
-                        and input_batch.num_reqs == 1
-                        and input_batch.num_draft_tokens == 0
-                        and input_batch.num_tokens == prefill_graph.num_tokens
-                        and input_batch.num_tokens_after_padding
-                        == prefill_graph.num_tokens
-                        and int(input_batch.num_computed_tokens_np[0]) == 0
-                        and (not prefill_graph.final_sample_tile or (
-                            self.prompt_logprobs_worker is not None
-                            and not self.prompt_logprobs_worker.uses_prompt_logprobs[input_batch.idx_mapping_np[0]]
-                            and input_batch.cu_num_logits_np[-1] == 1
-                            and self.speculator is None
-                            and self.pcp_manager is None
-                            and not self.use_aux_hidden_state_outputs
-                        ))
-                    ):
-                        model_output = prefill_graph.try_replay(
-                            attn_metadata,
-                            slot_mappings_by_layer,
-                            model_inputs,
-                            input_batch.is_padding,
-                            batch_descriptor,
-                            raw_input_ids=input_batch.input_ids if graph_embed else None,
-                        )
-                        compact_sample = model_output is not None and prefill_graph.final_sample_tile
-                    if model_output is None:
-                        if graph_embed:
-                            # Replay refused: the eager embedding this step skipped.
-                            model_inputs["inputs_embeds"] = self.model_state.get_mm_embeddings(
-                                scheduler_output.scheduled_encoder_inputs,
-                                input_batch,
-                                self.req_states,
-                            )
-                        model_output = self.model(**model_inputs)
+                    model_output = self.model(**model_inputs)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1622,7 +1469,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
-            compact_sample=compact_sample,
         )
 
         if not self.is_last_pp_rank:
@@ -1639,7 +1485,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The prior execute_model call must have failed.
             return None
 
-        compact_sample = self.execute_model_state.compact_sample
         input_batch = self.execute_model_state.input_batch
         attn_metadata = self.execute_model_state.attn_metadata
         slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
@@ -1671,17 +1516,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pcp_manager, hidden_states, input_batch
         )
 
-        # LOCAL PATCH (two-stage output wait, async_utils.wait_for_output): for
-        # a one-request prefill step, mark in stream order where the forward
-        # ends and the sampling tail begins. A decode step needs no mark: the
-        # host waits for it with the next step already queued.
-        forward_done = None
-        if input_batch.num_reqs == 1 and input_batch.num_tokens > 1:
-            forward_done = torch.cuda.Event(blocking=True)
-            forward_done.record(self.main_stream)
-
         sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output, compact_sample=compact_sample
+            hidden_states, input_batch, grammar_output
         )
 
         if self.pp_handler is not None:
@@ -1712,12 +1548,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
-        known_single_token = (
-            input_batch.num_reqs == 1
-            and self.num_speculative_steps == 0
-            and not bool(input_batch.is_prefilling_np[0])
-            and sampler_output.sampled_token_ids.shape == (1, 1)
-        )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
             model_runner_output=model_runner_output,
@@ -1726,8 +1556,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
-            known_single_token=known_single_token,
-            forward_done=forward_done,
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
@@ -1908,7 +1736,6 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
-    compact_sample: bool = False
 
 
 def sort_batch_req_ids(

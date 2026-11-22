@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
-import os
-import time
 
 import numpy as np
 import torch
@@ -16,41 +14,6 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
-# LOCAL PATCH (two-stage output wait). VLLM_TWO_STAGE_WAIT=0 keeps one blocking
-# wait for every step.
-_TWO_STAGE_WAIT = os.environ.get("VLLM_TWO_STAGE_WAIT", "1") != "0"
-# The longest the tail of a step is polled before the wait blocks again.
-_TAIL_POLL_NS = 20_000_000
-
-
-def wait_for_output(copy_event, forward_done=None, clock=time.perf_counter_ns) -> None:
-    """Return once `copy_event` has completed.
-
-    A blocking event wait sleeps in the driver and wakes a few hundred
-    microseconds after the GPU is done (measured on GB10: about 0.33 ms). A
-    decode step does not care: the next step is already queued on the device
-    while the host waits. A prefill step's caller does: nothing else is queued
-    and the reply waits for this wake-up. For such a step the runner passes
-    `forward_done`, an event recorded in stream order after the forward and
-    before the sampling tail (vocabulary head, sampler, output copy, about
-    3 ms). The host sleeps on that one, so the late wake-up lands inside the
-    tail, and then polls the copy event through the rest of the tail. Polling
-    a whole step instead would keep one CPU core busy for its full length,
-    which on a shared CPU/GPU power budget slows the GPU more than the
-    wake-up costs. The same events complete in the same order either way; the
-    wait changes nothing the device computes.
-    """
-    if forward_done is None:
-        copy_event.synchronize()
-        return
-    forward_done.synchronize()
-    deadline = clock() + _TAIL_POLL_NS
-    done = copy_event.query
-    while not done():
-        if clock() > deadline:
-            copy_event.synchronize()
-            return
-
 
 class AsyncOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -61,8 +24,6 @@ class AsyncOutput(AsyncModelRunnerOutput):
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool = False,
-        known_single_token: bool = False,
-        forward_done: torch.cuda.Event | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -70,14 +31,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
-        # LOCAL PATCH (SP5D, Yukon submission 98c1361e; without its spin wait): one request, no draft tokens, a
-        # decode step: exactly one sampled token, so num_sampled_tokens is not copied back and the output is
-        # [[sampled_token_ids[0, 0]]], what the general path below produces from a count of 1.
-        self.known_single_token = known_single_token
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
-        # See wait_for_output: set by the runner for a prefill step only.
-        self.forward_done = forward_done if _TWO_STAGE_WAIT else None
         self._has_fault: torch.Tensor | None = None
 
         with stream(copy_stream, main_stream):
@@ -92,9 +47,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.num_nans: np.ndarray | None = None
             if sampler_output.num_nans is not None:
                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
-            self.num_sampled_tokens_np = (
-                None if known_single_token else async_copy_to_np(num_sampled_tokens)
-            )
+            self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
             self.prompt_logprobs_dict = {
                 k: v.to_cpu_nonblocking() if v is not None else None
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
@@ -105,22 +58,17 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
-        wait_for_output(self.copy_event, self.forward_done)
+        self.copy_event.synchronize()
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.
         # Going forward, we should keep the data structures as NumPy arrays
         # rather than Python lists.
-        if self.known_single_token:
-            self.model_runner_output.sampled_token_ids = [
-                [int(self.sampled_token_ids[0, 0])]
-            ]
-        else:
-            sampled_token_ids: list[list[int]] = self.sampled_token_ids.tolist()
-            num_sampled_tokens: list[int] = self.num_sampled_tokens_np.tolist()
-            for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
-                del token_ids[num_tokens:]
-            self.model_runner_output.sampled_token_ids = sampled_token_ids
+        sampled_token_ids: list[list[int]] = self.sampled_token_ids.tolist()
+        num_sampled_tokens: list[int] = self.num_sampled_tokens_np.tolist()
+        for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
+            del token_ids[num_tokens:]
+        self.model_runner_output.sampled_token_ids = sampled_token_ids
 
         if self.num_nans is not None:
             self.model_runner_output.num_nans_in_logits = dict(

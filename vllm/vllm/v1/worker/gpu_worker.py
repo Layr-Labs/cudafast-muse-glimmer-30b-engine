@@ -366,21 +366,6 @@ class Worker(WorkerBase):
             )
             self.device = torch.device(f"cuda:{visible_device_index}")
             torch.accelerator.set_device_index(self.device)
-            # Back this process's allocations with expandable (CUDA VMM)
-            # segments before any weight is loaded (env_override.py also sets
-            # them before CUDA is initialized). Same bytes and kernels.
-            # VLLM_EXPANDABLE_SEGMENTS=0 keeps the default allocator.
-            if os.environ.get("VLLM_EXPANDABLE_SEGMENTS", "1") != "0":
-                try:
-                    torch._C._accelerator_setAllocatorSettings(
-                        "expandable_segments:True"
-                    )
-                except RuntimeError as e:
-                    logger.warning("Could not set expandable segments: %s", e)
-                logger.info(
-                    "CUDA allocator settings: %s",
-                    torch._C._accelerator_getAllocatorSettings(),
-                )
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
@@ -724,11 +709,7 @@ class Worker(WorkerBase):
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
         # Warmup and tune the kernels used during model execution before
-        # cuda graph capture. LOCAL PATCH (SP5D, Yukon submission 98c1361e): no
-        # FlashInfer autotune pass. On this model it tunes 0 FlashInfer ops (it
-        # saves 0 configs) and only repeats a max-size dummy forward (~50 s of
-        # boot); Inductor's kernel configs are chosen at compile time, before it.
-        self.vllm_config.kernel_config.enable_flashinfer_autotune = False
+        # cuda graph capture.
         kernel_warmup(self)
 
         cuda_graph_memory_bytes = 0

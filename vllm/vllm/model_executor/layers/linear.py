@@ -43,6 +43,54 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
+
+_MUSE_BF16_KERNELS_READY = False
+try:
+    from muse_kernels import load_muse_kernels as _load_muse_bf16_kernels
+
+    _MUSE_BF16_KERNELS_READY = _load_muse_bf16_kernels()
+except Exception:
+    _MUSE_BF16_KERNELS_READY = False
+
+_FAST_BF16_PACKS: list[tuple[int, tuple, int]] = []
+
+
+def _muse_bf16_linear_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    pack_id: int,
+) -> torch.Tensor:
+    orig_ptr, rans_pack, n = _FAST_BF16_PACKS[pack_id]
+    x_2d = x.reshape(-1, x.shape[-1])
+    out_shape = (*x.shape[:-1], n)
+    if (
+        _MUSE_BF16_KERNELS_READY
+        and x_2d.shape[0] == 1
+        and x_2d.dtype == torch.bfloat16
+        and weight.data_ptr() == orig_ptr
+    ):
+        x_c = x_2d if x_2d.is_contiguous() else x_2d.contiguous()
+        sm_pack, exp_stream, tile_chunk_off, init_states, lut = rans_pack
+        return torch.ops.muse_fast.bf16_rans_m1(
+            x_c, sm_pack, exp_stream, tile_chunk_off, init_states, lut, n
+        ).reshape(out_shape)
+    return torch.nn.functional.linear(x, weight, None)
+
+
+def _muse_bf16_linear_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    pack_id: int,
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=x.dtype, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="muse_bf16_linear",
+    op_func=_muse_bf16_linear_impl,
+    fake_impl=_muse_bf16_linear_fake,
+)
 
 logger = init_logger(__name__)
 
@@ -218,6 +266,31 @@ class UnquantizedLinearMethod(LinearMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+            return
+        if _MUSE_BF16_KERNELS_READY and getattr(layer, "bias", None) is None:
+            w = getattr(layer, "weight", None)
+            if (
+                w is not None
+                and w.is_cuda
+                and w.dtype == torch.bfloat16
+                and w.dim() == 2
+                and w.shape[1] == 6656
+                and w.shape[0] in (4096, 4608)
+            ):
+                w_c = w if w.is_contiguous() else w.contiguous()
+                rans_pack = torch.ops.muse_fast.repack_bf16_rans(w_c)
+                gen = torch.Generator(device=w.device)
+                gen.manual_seed(12345)
+                probe_a = torch.randn((1, w.shape[1]), dtype=torch.bfloat16, device=w.device, generator=gen)
+                ref = torch.nn.functional.linear(probe_a, w_c, None)
+                sm_pack, exp_stream, tile_chunk_off, init_states, lut = rans_pack
+                out = torch.ops.muse_fast.bf16_rans_m1(
+                    probe_a, sm_pack, exp_stream, tile_chunk_off, init_states, lut, w.shape[0]
+                )
+                if torch.equal(out, ref):
+                    idx = len(_FAST_BF16_PACKS)
+                    _FAST_BF16_PACKS.append((w.data_ptr(), rans_pack, w.shape[0]))
+                    layer._muse_bf16_pack_id = idx
 
     def apply(
         self,
@@ -227,6 +300,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        if bias is None:
+            pack_id = getattr(layer, "_muse_bf16_pack_id", -1)
+            if pack_id >= 0:
+                return torch.ops.vllm.muse_bf16_linear(x, layer.weight, pack_id)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
 

@@ -65,7 +65,6 @@ from vllm.v1.fault_tolerance.utils import (
 )
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
-from vllm.v1.worker import hostfast
 
 logger = init_logger(__name__)
 
@@ -314,38 +313,13 @@ class InprocClient(EngineCoreClient):
         * pulls EngineCoreOutputs by stepping the EngineCore
     """
 
-    # When True, an empty abort (the call LLMEngine.step makes after every
-    # output) does not drain the core: the owner calls settle() once it has
-    # handed the output on. Class default False: the drain stays inline.
-    defer_settle = False
-
     def __init__(self, *args, **kwargs):
         self.engine_core = EngineCore(*args, **kwargs)
-        logger.info("Engine core runs in the client process")
-
-    def _hostfast_idle_if_finished(self) -> None:
-        # There is no busy loop in this mode: hand the collector back once the
-        # scheduler has nothing left and no batch is still in flight.
-        if (
-            not self.engine_core.scheduler.has_requests()
-            and not self.engine_core.batch_queue
-        ):
-            hostfast.gc_idle()
 
     def get_output(self) -> EngineCoreOutputs:
-        if hostfast.gc_busy():
-            logger.info_once(
-                "Automatic garbage collection is paused while the engine has work"
-            )
-        try:
-            outputs, model_executed = self.engine_core.step_fn()
-            self.engine_core.post_step(model_executed=model_executed)
-            self._hostfast_idle_if_finished()
-            return outputs and outputs.get(0) or EngineCoreOutputs()
-        except BaseException:
-            # The interpreter outlives this call, including on interruption.
-            hostfast.gc_idle()
-            raise
+        outputs, model_executed = self.engine_core.step_fn()
+        self.engine_core.post_step(model_executed=model_executed)
+        return outputs and outputs.get(0) or EngineCoreOutputs()
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.engine_core.get_supported_tasks()
@@ -354,47 +328,12 @@ class InprocClient(EngineCoreClient):
         req, request_wave = self.engine_core.preprocess_add_request(request)
         self.engine_core.add_request(req, request_wave)
 
-    def settle(self) -> None:
-        """Drain what the core still owns once the last live request is gone:
-        a queued batch and the finished request's cleanup. No background loop
-        settles them in this mode. Never advances a live request."""
-        try:
-            scheduler = self.engine_core.scheduler
-            if not scheduler.has_unfinished_requests():
-                while scheduler.has_requests() or self.engine_core.batch_queue:
-                    self.get_output()
-            self._hostfast_idle_if_finished()
-        except BaseException:
-            hostfast.gc_idle()
-            raise
-
     def abort_requests(self, request_ids: list[str]) -> None:
-        try:
-            if len(request_ids) > 0:
-                self.engine_core.abort_requests(request_ids)
-            elif self.defer_settle:
-                # LLMEngine calls this with an empty list after every output.
-                # With the multiprocess engine the core's own loop cleans up
-                # after a completed request while the output is already on its
-                # way to the caller; here the owner asked for the same order:
-                # it calls settle() after it has passed the output on, and
-                # before it adds another request.
-                return
-            # LLMEngine calls this after every output, including with an empty
-            # list when a bounded request has completed. Its output processor
-            # can already report no unfinished request while the core still
-            # owns a queued batch or finished-request cleanup. Drain once the
-            # last live request is gone, before another request can be added.
-            self.settle()
-        except BaseException:
-            hostfast.gc_idle()
-            raise
+        if len(request_ids) > 0:
+            self.engine_core.abort_requests(request_ids)
 
     def shutdown(self, timeout: float | None = None) -> None:
-        try:
-            self.engine_core.shutdown()
-        finally:
-            hostfast.gc_idle()
+        self.engine_core.shutdown()
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
         self.engine_core.profile(is_start, profile_prefix)

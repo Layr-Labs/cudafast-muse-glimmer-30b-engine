@@ -1465,10 +1465,6 @@ mod session {
         /// Offer `spec_run`: run the whole free run in one call, cycle by cycle
         /// through this script's own `eval_speculative`, as the resident does.
         batched_run: bool,
-        /// The live sequence was synced argmax-only. Like the resident, the
-        /// script then has no top-k logits to give: `top_logits` returns
-        /// nothing, which the backend treats as a fault.
-        argmax_only: bool,
     }
 
     impl Scripted {
@@ -1484,13 +1480,6 @@ mod session {
         fn sync(&mut self, tokens: &[i64]) -> Result<(), String> {
             self.log.push(format!("sync({})", tokens.len()));
             self.context = tokens.to_vec();
-            self.argmax_only = false;
-            Ok(())
-        }
-        fn sync_argmax_only(&mut self, tokens: &[i64]) -> Result<(), String> {
-            self.log.push(format!("sync_argmax({})", tokens.len()));
-            self.context = tokens.to_vec();
-            self.argmax_only = true;
             Ok(())
         }
         fn eval(&mut self, token: i64) -> Result<(), String> {
@@ -1502,9 +1491,6 @@ mod session {
             self.frontier()
         }
         fn top_logits(&mut self, k: usize) -> Vec<CorrectnessTraceLogit> {
-            if self.argmax_only {
-                return Vec::new();
-            }
             let top = self.frontier();
             (0..k as i64)
                 .map(|i| CorrectnessTraceLogit::new(top + i, 10.0 - i as f64))
@@ -1576,7 +1562,6 @@ mod session {
         fn invalidate(&mut self) {
             self.invalidated += 1;
             self.context.clear();
-            self.argmax_only = false;
         }
     }
 
@@ -1607,7 +1592,7 @@ mod session {
     fn step_is_teacher_forced_and_carries_top8() {
         let session = Arc::new(Mutex::new(Scripted::default()));
         let mut e = engine(&session);
-        assert_eq!(e.decode_begin(&[10, 11, 12]).unwrap(), 13);
+        assert_eq!(e.prefill(&[10, 11, 12]).unwrap(), 13);
         let step = e.step(100).unwrap();
         assert_eq!(
             step.token, 101,
@@ -1983,87 +1968,6 @@ mod session {
         assert_eq!(out, vec![3, 4, 5]);
     }
 
-    /// TOP-K ONLY WHERE IT IS READ. The phases that read nothing but argmaxes
-    /// (the timed prefill, the free run, the free-run correctness reference)
-    /// sync argmax-only, so the engine skips the top-k on every step of them.
-    /// The teacher-forced gates sync with top-k, because every one of their
-    /// steps reports top-8 logits. The script refuses top-k on an argmax-only
-    /// sequence, as the resident does, so a phase that asked for it would fail
-    /// here.
-    #[test]
-    fn only_the_teacher_forced_gates_sync_with_top_logits() {
-        let session = Arc::new(Mutex::new(Scripted {
-            mtp_armed: true,
-            batched_run: true,
-            ..Default::default()
-        }));
-        let resp = run(
-            session.clone(),
-            &[
-                r#"{"id":1,"kind":"prefill","prompt_tokens":[1,2,3]}"#,
-                r#"{"id":2,"kind":"prefill","prompt_tokens":[1,2,3]}"#,
-                r#"{"id":3,"kind":"phase_diagnostics"}"#,
-                r#"{"id":4,"kind":"free_decode_begin","seed_tokens":[1,2,3],"spec":{"mode":"mtp","mtp":{"depth":1}}}"#,
-                r#"{"id":5,"kind":"free_decode_run","count":6}"#,
-                r#"{"id":6,"kind":"phase_diagnostics"}"#,
-                r#"{"id":7,"kind":"free_decode_begin","seed_tokens":[1,2,3]}"#,
-                r#"{"id":8,"kind":"free_decode_run","count":3}"#,
-                r#"{"id":9,"kind":"phase_diagnostics"}"#,
-                r#"{"id":10,"kind":"correctness","prompt_tokens":[1,2,3],"steps":4}"#,
-                r#"{"id":11,"kind":"phase_diagnostics"}"#,
-                r#"{"id":12,"kind":"correctness_begin","prompt_tokens":[1,2,3]}"#,
-                r#"{"id":13,"kind":"correctness_step","token":4}"#,
-                r#"{"id":14,"kind":"correctness_step","token":9}"#,
-                r#"{"id":15,"kind":"phase_diagnostics"}"#,
-                r#"{"id":16,"kind":"decode_begin","seed_tokens":[1,2,3]}"#,
-                r#"{"id":17,"kind":"decode_step","token":4}"#,
-                r#"{"id":18,"kind":"phase_diagnostics"}"#,
-            ],
-        );
-        for r in &resp {
-            assert_eq!(r["ok"], true, "{resp:?}");
-        }
-        assert_eq!(resp[5]["tokens"], serde_json::json!([5, 6, 7, 8, 9, 10]));
-        assert_eq!(resp[10]["tokens"], serde_json::json!([4, 5, 6, 7]));
-        assert_eq!(resp[12]["top_logits"].as_array().unwrap().len(), 8);
-        assert_eq!(resp[14]["top_logits"].as_array().unwrap().len(), 8);
-        assert_eq!(resp[14]["token"], 10, "the forced token is the context");
-        let syncs: Vec<String> = session
-            .lock()
-            .unwrap()
-            .log
-            .iter()
-            .filter(|l| l.starts_with("sync"))
-            .cloned()
-            .collect();
-        assert_eq!(
-            syncs,
-            vec![
-                "sync_argmax(3)", // warm-up prefill
-                "sync_argmax(3)", // timed prefill
-                "sync_argmax(3)", // free run, mtp
-                "sync_argmax(3)", // free run, serial
-                "sync_argmax(3)", // free-run correctness reference
-                "sync(3)",        // correctness_begin: top-8 per step
-                "sync(3)",        // decode_begin: decode_step shares the gate's forward
-            ]
-        );
-    }
-
-    /// The backend refuses a gate step whose engine returned no top-k rather
-    /// than reporting an empty trace: an argmax-only sequence can never pass
-    /// for a gate.
-    #[test]
-    fn a_gate_step_on_an_argmax_only_sequence_is_a_fault() {
-        let session = Arc::new(Mutex::new(Scripted::default()));
-        let mut e = engine(&session);
-        e.prefill(&[1, 2, 3]).unwrap();
-        match e.step(4).unwrap_err() {
-            EngineError::Fault(m) => assert!(m.contains("top logits"), "{m}"),
-            other => panic!("expected a fault, got {other:?}"),
-        }
-    }
-
     #[test]
     fn adapter_loop_emits_raw_counters_only() {
         let session = Arc::new(Mutex::new(Scripted {
@@ -2191,14 +2095,13 @@ mod resident {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::thread;
 
     use serde_json::{json, Value};
 
     use crate::resident::ResidentSession;
-    use crate::session_backend::{EngineSession, SessionEngine, SpecCounters, SpecRound};
-    use crate::{Engine, Route};
+    use crate::session_backend::{EngineSession, SpecCounters, SpecRound};
 
     /// A scripted resident: answers every request from `replies` keyed by op,
     /// counting what it was asked. Serves one connection, then exits.
@@ -2393,34 +2296,10 @@ mod resident {
         let seen = server.finish();
         assert_eq!(seen[1]["op"], "sync");
         assert_eq!(seen[1]["max_tokens"], 1);
-        assert_eq!(
-            seen[1]["argmax_only"], true,
-            "a prefill reads the frontier token only"
-        );
         assert!(
             seen[2].get("max_tokens").is_none(),
             "a decode or correctness sync is unbounded"
         );
-        assert!(
-            seen[2].get("argmax_only").is_none(),
-            "a plain sync keeps the top-k logits the gates read"
-        );
-    }
-
-    /// The free run's sync tells the resident to skip the top-k logits; it is
-    /// unbounded, because the run decodes on from it.
-    #[test]
-    fn an_argmax_only_sync_says_so_on_the_wire() {
-        let server = Server::start(scripted);
-        let mut session = server.connect();
-        session.sync_argmax_only(&[1, 2, 3]).unwrap();
-        assert_eq!(session.argmax(), 501);
-        drop(session);
-        let seen = server.finish();
-        assert_eq!(seen[1]["op"], "sync");
-        assert_eq!(seen[1]["tokens"], json!([1, 2, 3]));
-        assert_eq!(seen[1]["argmax_only"], true);
-        assert!(seen[1].get("max_tokens").is_none());
     }
 
     /// A resident that offers `spec_run` in its hello takes the whole free run
@@ -2509,107 +2388,14 @@ mod resident {
         server.finish();
     }
 
-    fn scripted_serial_run(request: &Value) -> Value {
-        match request["op"].as_str().unwrap_or("") {
-            "hello" => {
-                let mut hello = scripted(request);
-                hello["serial_run"] = json!(true);
-                hello
-            }
-            "serial_run" => {
-                let first = request["first_token"].as_i64().unwrap();
-                let count = request["count"].as_i64().unwrap();
-                let tokens: Vec<_> = (first + 1..=first + count).collect();
-                json!({"ok": true, "tokens": tokens})
-            }
-            _ => scripted(request),
-        }
-    }
-
-    #[test]
-    fn serial_free_decode_run_sends_one_resident_request_each_time() {
-        let schedules: &[&[i64]] = &[&[128], &[1, 31, 96]];
-        for &counts in schedules {
-            let server = Server::start(scripted_serial_run);
-            let mut engine = SessionEngine::new(Arc::new(Mutex::new(server.connect())));
-            let (mut pending, _) = engine
-                .free_decode_begin(&[1, 2, 3], Route::Serial, None)
-                .unwrap();
-            let mut calls = vec![
-                json!({"op": "hello"}),
-                json!({"op": "sync", "tokens": [1, 2, 3], "argmax_only": true}),
-            ];
-
-            for &count in counts {
-                let run = engine.free_decode_run(count).unwrap();
-                assert_eq!(
-                    run.tokens,
-                    (pending + 1..=pending + count).collect::<Vec<_>>()
-                );
-                calls.push(json!({"op": "serial_run", "first_token": pending, "count": count}));
-                pending += count;
-            }
-            drop(engine);
-            calls.extend([json!({"op": "invalidate"}), json!({"op": "bye"})]);
-            assert_eq!(server.finish(), calls, "requests for schedule {counts:?}");
-        }
-    }
-
-    #[test]
-    fn a_legacy_resident_free_run_uses_argmax_only_and_one_eval_per_token() {
-        let server = Server::start(scripted);
-        let mut engine = SessionEngine::new(Arc::new(Mutex::new(server.connect())));
-        let (seed, _) = engine
-            .free_decode_begin(&[1, 2, 3], Route::Serial, None)
-            .unwrap();
-        assert_eq!(engine.free_decode_run(1).unwrap().tokens, vec![777]);
-        assert_eq!(engine.free_decode_run(2).unwrap().tokens, vec![777; 2]);
-        drop(engine);
-
-        assert_eq!(
-            server.finish(),
-            [
-                json!({"op": "hello"}),
-                json!({"op": "sync", "tokens": [1, 2, 3], "argmax_only": true}),
-                json!({"op": "eval", "token": seed}),
-                json!({"op": "eval", "token": 777}),
-                json!({"op": "eval", "token": 777}),
-                json!({"op": "invalidate"}),
-                json!({"op": "bye"}),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_short_serial_run_reply_is_refused() {
-        fn broken(request: &Value) -> Value {
-            if request["op"] == "serial_run" {
-                json!({"ok": true, "tokens": [502]})
-            } else {
-                scripted_serial_run(request)
-            }
-        }
-        let server = Server::start(broken);
-        let mut engine = SessionEngine::new(Arc::new(Mutex::new(server.connect())));
-        engine
-            .free_decode_begin(&[1, 2, 3], Route::Serial, None)
-            .unwrap();
-        let err = engine.free_decode_run(2).unwrap_err().to_string();
-        assert!(err.contains("returned 1 of 2 tokens"), "{err}");
-        drop(engine);
-        let seen = server.finish();
-        let ops: Vec<&str> = seen.iter().map(|r| r["op"].as_str().unwrap()).collect();
-        assert_eq!(ops, ["hello", "sync", "serial_run", "invalidate", "bye"]);
-    }
-
-    /// Eagerly returning the frontier keeps individual evals to one round
-    /// trip each, including when a legacy resident drives the serial run.
+    /// ONE ROUND TRIP PER DECODED TOKEN. `free_decode_run`'s serial loop is
+    /// `eval` then `argmax`; the eager argmax in the eval reply must make the
+    /// second one free, or the timed window pays two round trips a token.
     #[test]
     fn argmax_after_a_state_advancing_verb_costs_no_round_trip() {
         let server = Server::start(scripted);
         let mut session = server.connect();
         assert_eq!(server.requests(), 1); // hello
-        assert!(session.serial_run(5, 10).is_none());
 
         session.sync(&[1, 2, 3]).unwrap();
         assert_eq!(session.argmax(), 501);

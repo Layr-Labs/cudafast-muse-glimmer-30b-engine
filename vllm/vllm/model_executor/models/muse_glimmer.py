@@ -32,7 +32,6 @@ adapter/projection stack.
 """
 
 import math
-import os
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 from typing import Annotated, Literal
@@ -45,32 +44,24 @@ from torch import nn
 from transformers import BatchFeature
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import (
-    CacheConfig,
-    CompilationMode,
-    CUDAGraphMode,
-    VllmConfig,
-    get_current_vllm_config_or_none,
-)
+from vllm.config import CacheConfig, VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.forward_context import get_forward_context
 from vllm.distributed import (
     divide,
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
-from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym
 from vllm.model_executor.layers.attention import Attention, MMEncoderAttention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
-    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -91,7 +82,6 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
-from vllm.platforms import current_platform
 from vllm.renderers import TokenizeParams
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processors.muse_glimmer import MuseGlimmerProcessor
@@ -114,7 +104,6 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
-from .muse_glimmer_glue import install_prompt_glue
 from .vision import get_fp8_padded_hidden_size, is_vit_use_data_parallel
 
 logger = init_logger(__name__)
@@ -1099,274 +1088,794 @@ class MuseGlimmerMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def _gate_up_activation(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        return self.act_fn(gate_up)
-
-    def _paired_gate_up_activation(self, x: torch.Tensor) -> torch.Tensor:
-        proj = self.gate_up_proj
-        return torch.ops.vllm.marlin_fp4_swiglu(
-            x.contiguous(), proj.weight, proj.weight_scale, proj.weight_global_scale
-        )
-
-    def _regular_swiglu_down(self, x: torch.Tensor) -> torch.Tensor:
-        activation = self._gate_up_activation(x)
-        return self.down_proj(activation)[0]
-
-    def _paired_swiglu_fp8_down(self, x: torch.Tensor) -> torch.Tensor:
-        proj = self.gate_up_proj
-        down = self.down_proj
-        activation = torch.ops.vllm.marlin_fp4_swiglu_fp8(
-            x.contiguous(), proj.weight, proj.weight_scale, proj.weight_global_scale,
-            down.input_scale,
-        )
-        quantized = QuantizedActivation(
-            activation, down.input_scale, x.dtype, activation.shape, kFp8StaticTensorSym
-        )
-        return down(quantized)[0]
-
-    def _registered_fp8_swiglu_down(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        gate = self.gate_up_proj
-        down = self.down_proj
-        data = torch.ops.glimmer.fp8_gate_swiglu(
-            x, gate.paired_fp8_swiglu_weight, scale, gate.weight_scale, down.input_scale,
-        )
-        activation = QuantizedActivation(
-            data, down.input_scale, torch.bfloat16, data.shape, kFp8StaticTensorSym
-        )
-        return down(activation)[0]
-
-    def _regular_fp8_swiglu_down(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        activation = QuantizedActivation(x, scale, torch.bfloat16, x.shape, kFp8StaticTensorSym)
-        gate_up, _ = self.gate_up_proj(activation)
-        return self.down_proj(self.act_fn(gate_up))[0]
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if (torch.compiler.is_compiling() and x.ndim == 2 and x.dtype == torch.bfloat16
-                and hasattr(self.gate_up_proj, "paired_fp8_swiglu_weight")
-                and getattr(self.down_proj, "marlin_swiglu_fp8_input", False)):
-            gate = self.gate_up_proj
-            # Preserve the original producer-to-quantizer boundary on both arms.
-            # Inductor can consume the full-precision normalized intermediate.
-            data, scale = gate.quant_method.fp8_linear.quant_fp8(
-                x.view(-1, x.shape[-1]), gate.input_scale, getattr(gate, "input_scale_ub", None)
+        gu_id = getattr(self.gate_up_proj, "_muse_fast_gate_up_id", -1)
+        if gu_id >= 0 and getattr(self.down_proj, "_muse_fast_down_id", -1) >= 0:
+            x = torch.ops.vllm.muse_nvfp4_gate_up_silu(x, gu_id)
+            x, _ = self.down_proj(x)
+            return x
+        if (
+            gu_id >= 0
+            and getattr(self.down_proj, "_muse_fp8_pack_id", -1) >= 0
+            and getattr(self.down_proj, "bias", None) is None
+            and getattr(self.down_proj, "input_scale", None) is not None
+        ):
+            x_fp8 = torch.ops.vllm.muse_nvfp4_gate_up_silu_fp8quant(
+                x, gu_id, self.down_proj.input_scale
             )
-            return torch.cond(x.shape[0] == 512, self._registered_fp8_swiglu_down,
-                              self._regular_fp8_swiglu_down, (data, scale))
-        if (torch.compiler.is_compiling() and x.ndim == 2
-                and getattr(self.gate_up_proj, "marlin_swiglu_fp8_ready", False)
-                and getattr(self.down_proj, "marlin_swiglu_fp8_input", False)):
-            return torch.cond(x.shape[0] == 512, self._paired_swiglu_fp8_down,
-                              self._regular_swiglu_down, (x,))
-        if (torch.compiler.is_compiling() and x.ndim == 2
-                and getattr(self.gate_up_proj, "marlin_swiglu_ready", False)
-                and getattr(self.down_proj, "marlin_prompt_path", None) is not None):
-            # The down projection consumes BF16 for these layers. Other quantizers
-            # can fold their activation cast into SwiGLU with different boundaries.
-            x = torch.cond(x.shape[0] == 512, self._paired_gate_up_activation,
-                           self._gate_up_activation, (x,))
-        else:
-            x = self._gate_up_activation(x)
+            out = torch.ops.vllm.muse_fp8_scaled_mm(
+                x_fp8.reshape(-1, x_fp8.shape[-1]),
+                self.down_proj.weight,
+                self.down_proj.input_scale,
+                self.down_proj.weight_scale,
+                self.down_proj._muse_fp8_pack_id,
+            )
+            return out.reshape(x.shape[:-1] + (out.shape[-1],))
+        fp8_gu_id = getattr(self.gate_up_proj, "_muse_fp8_gu_id", -1)
+        if (
+            fp8_gu_id >= 0
+            and getattr(self.gate_up_proj, "bias", None) is None
+            and getattr(self.gate_up_proj, "input_scale", None) is not None
+        ):
+            if x.dtype == torch.float8_e4m3fn:
+                x_q = x.reshape(-1, x.shape[-1])
+            else:
+                x_q = (
+                    x.reshape(-1, x.shape[-1]).to(torch.float32)
+                    * torch.reciprocal(self.gate_up_proj.input_scale)
+                ).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            if (
+                getattr(self.down_proj, "_muse_fp8_pack_id", -1) >= 0
+                and getattr(self.down_proj, "bias", None) is None
+                and getattr(self.down_proj, "input_scale", None) is not None
+            ):
+                x_fp8 = torch.ops.vllm.muse_fp8_gate_up_silu_fp8quant(
+                    x_q, fp8_gu_id, self.down_proj.input_scale
+                )
+                out = torch.ops.vllm.muse_fp8_scaled_mm(
+                    x_fp8.reshape(-1, x_fp8.shape[-1]),
+                    self.down_proj.weight,
+                    self.down_proj.input_scale,
+                    self.down_proj.weight_scale,
+                    self.down_proj._muse_fp8_pack_id,
+                )
+                return out.reshape(x.shape[:-1] + (out.shape[-1],))
+            out_gu = torch.ops.vllm.muse_fp8_gate_up_silu(x_q, fp8_gu_id)
+            out_gu = out_gu.reshape(x.shape[:-1] + (out_gu.shape[-1],))
+            x, _ = self.down_proj(out_gu)
+            return x
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
 
-class _GateSideStream:
-    """Overlaps the attention output gate projection with attention.
+_MUSE_GATE_SIDE_STREAM: torch.cuda.Stream | None = None
+_MUSE_GATE_LAYERS: list[nn.Module] = []
+_MUSE_GATE_FORK_EVENTS: list[torch.cuda.Event] = []
+_MUSE_GATE_DONE_EVENTS: list[torch.cuda.Event] = []
+_MUSE_GATE_FORKED: list[bool] = []
 
-    ``output_gate_proj`` reads the layer input, not the attention output, so
-    its weight stream does not have to wait for the latency-bound attention
-    chain (QK-norm, RoPE, KV-cache write and the attention kernel). After the
-    fork the gate projection stays on the current stream and the attention
-    chain moves to a high-priority side stream, so that its small kernels get
-    SMs ahead of the gate GEMM's remaining tiles; the join brings the current
-    stream back and makes it wait for the chain.
-
-    The fork, switch and join ops below are graph splitting points
-    (``CompilationConfig._side_stream_ops``): they run eagerly between the
-    compiled pieces, so the gate projection is a compiled piece of its own and
-    every piece launches its kernels on the stream that is current when it
-    runs. Under a CUDA graph capture the event record/wait pairs become a fork
-    and a join of the captured graph.
-
-    Only launch streams change: the same kernels run on the same inputs.
-    Batches above ``max_tokens`` and piecewise cudagraph runs keep everything
-    on the current stream.
-    """
-
-    def __init__(self) -> None:
-        self.max_tokens = int(
-            os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "16")
-        )
-        self.stream: torch.cuda.Stream | None = None
-        self.fork_event: torch.cuda.Event | None = None
-        self.done_event: torch.cuda.Event | None = None
-        self.main_stream: torch.cuda.Stream | None = None
-        self.active = False
-        self.unavailable = False
-        self.last_layer = -1
-        self.forks = 0
-        self.reported = False
-
-    def _ensure_stream(self) -> bool:
-        if self.stream is None and not self.unavailable:
-            try:
-                _, greatest_priority = torch.cuda.Stream.priority_range()
-                self.stream = torch.cuda.Stream(priority=greatest_priority)
-                self.fork_event = torch.cuda.Event()
-                self.done_event = torch.cuda.Event()
-            except Exception:
-                logger.warning(
-                    "Could not create a side stream for attention; the output "
-                    "gate projection runs in order.",
-                    exc_info=True,
-                )
-                self.stream = None
-                self.unavailable = True
-        return self.stream is not None
-
-    def _count(self, layer_idx: int) -> None:
-        if layer_idx <= self.last_layer:
-            if not self.reported:
-                logger.info(
-                    "Attention output gate projection overlapped attention "
-                    "in %d layers",
-                    self.forks,
-                )
-                self.reported = True
-            self.forks = 0
-        self.forks += 1
-        self.last_layer = layer_idx
-
-    def fork(self, x: torch.Tensor, layer_idx: int) -> None:
-        self.active = False
-        if not x.is_cuda or x.shape[0] > self.max_tokens:
-            return
-        if (
-            is_forward_context_available()
-            and get_forward_context().cudagraph_runtime_mode
-            == CUDAGraphMode.PIECEWISE
-        ):
-            return
-        if not self._ensure_stream():
-            return
-        assert self.stream is not None and self.fork_event is not None
-        main = torch.cuda.current_stream(x.device)
-        self.fork_event.record(main)
-        self.stream.wait_event(self.fork_event)
-        self.main_stream = main
-        self.active = True
-        self._count(layer_idx)
-
-    def switch(self, chain_inputs: list[torch.Tensor]) -> None:
-        if not self.active:
-            return
-        assert self.stream is not None
-        # The chain reads these on the side stream; do not let the allocator
-        # hand their memory to the current stream before the chain is done.
-        for t in chain_inputs:
-            t.record_stream(self.stream)
-        torch.cuda.set_stream(self.stream)
-
-    def join(self) -> None:
-        if not self.active:
-            return
-        assert self.stream is not None and self.done_event is not None
-        assert self.main_stream is not None
-        self.done_event.record(self.stream)
-        torch.cuda.set_stream(self.main_stream)
-        self.main_stream.wait_event(self.done_event)
-        self.main_stream = None
-        self.active = False
+_MUSE_MLP_PF_LAYERS: list[nn.Module] = []
+_MUSE_MLP_PF_FORK_EVENTS: list[torch.cuda.Event] = []
+_MUSE_MLP_PF_DONE_EVENTS: list[torch.cuda.Event] = []
+_MUSE_MLP_PF_FORKED: list[bool] = []
 
 
-_gate_side_stream = _GateSideStream()
-
-
-def muse_glimmer_gate_fork(x: torch.Tensor, layer_idx: int) -> torch.Tensor:
-    dep = x.new_empty(0)
-    _gate_side_stream.fork(x, layer_idx)
-    return dep
-
-
-def muse_glimmer_gate_fork_fake(x: torch.Tensor, layer_idx: int) -> torch.Tensor:
-    return torch.empty(0, device=x.device, dtype=x.dtype)
-
-
-def muse_glimmer_gate_switch(
-    gate: torch.Tensor, dep: torch.Tensor, chain_inputs: list[torch.Tensor]
-) -> torch.Tensor:
-    out = dep.new_empty(0)
-    _gate_side_stream.switch(chain_inputs)
-    return out
-
-
-def muse_glimmer_gate_switch_fake(
-    gate: torch.Tensor, dep: torch.Tensor, chain_inputs: list[torch.Tensor]
-) -> torch.Tensor:
-    return torch.empty(0, device=dep.device, dtype=dep.dtype)
-
-
-def muse_glimmer_gate_join(
-    gate: torch.Tensor, x: torch.Tensor, dep: torch.Tensor
-) -> None:
-    # The gate is declared mutated so that nothing reads it before the join.
-    _gate_side_stream.join()
-
-
-def muse_glimmer_gate_join_fake(
-    gate: torch.Tensor, x: torch.Tensor, dep: torch.Tensor
-) -> None:
-    return
-
-
-direct_register_custom_op(
-    op_name="muse_glimmer_gate_fork",
-    op_func=muse_glimmer_gate_fork,
-    fake_impl=muse_glimmer_gate_fork_fake,
-    mutates_args=[],
-)
-direct_register_custom_op(
-    op_name="muse_glimmer_gate_switch",
-    op_func=muse_glimmer_gate_switch,
-    fake_impl=muse_glimmer_gate_switch_fake,
-    mutates_args=[],
-)
-direct_register_custom_op(
-    op_name="muse_glimmer_gate_join",
-    op_func=muse_glimmer_gate_join,
-    fake_impl=muse_glimmer_gate_join_fake,
-    mutates_args=["gate"],
-)
-
-
-def _gate_side_stream_fork_point(gate_proj: nn.Module) -> str | None:
-    """Where the output gate branch forks off the attention chain, or None to
-    keep the gate projection in order on the main stream: ``"qkv"`` right
-    after the qkv projection, ``"attn"`` right before the attention op."""
-    mode = os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM", "qkv")
-    if mode not in ("qkv", "attn") or not current_platform.is_cuda():
-        return None
-    # cuBLAS does not promise the same kernel choice while other streams are
-    # active, so unquantized projections stay on the main stream.
-    if isinstance(getattr(gate_proj, "quant_method", None), UnquantizedLinearMethod):
-        return None
-    vllm_config = get_current_vllm_config_or_none()
-    if vllm_config is None:
-        return None
-    compilation_config = vllm_config.compilation_config
-    if compilation_config.mode == CompilationMode.NONE:
-        return mode
+def _run_output_gate_layer(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    fp8_id = getattr(layer, "_muse_fp8_pack_id", -1)
     if (
-        compilation_config.mode != CompilationMode.VLLM_COMPILE
-        or compilation_config.use_inductor_graph_partition
-        or not all(
-            op in (compilation_config.splitting_ops or [])
-            for op in compilation_config._side_stream_ops
-        )
+        fp8_id >= 0
+        and getattr(layer, "bias", None) is None
+        and getattr(layer, "input_scale", None) is not None
     ):
-        return None
-    return mode
+        from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+            _muse_fp8_bf16_linear_impl,
+        )
+
+        return _muse_fp8_bf16_linear_impl(
+            x, layer.weight, layer.input_scale, layer.weight_scale, fp8_id
+        )
+    gate, _ = layer(x)
+    return gate
+
+
+def _muse_fork_output_gate_impl(
+    x: torch.Tensor, qkv_dep: torch.Tensor, gate_id: int
+) -> torch.Tensor:
+    global _MUSE_GATE_SIDE_STREAM
+    del qkv_dep
+    layer = _MUSE_GATE_LAYERS[gate_id]
+    # Piecewise CUDA graphs split at self.attn(), so side-stream overlap is only
+    # valid when self.attn() executes in the same stream/graph (M=1 FULL graph).
+    allow_side = (
+        x.is_cuda
+        and x.shape[0] == 1
+        and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
+    )
+    if allow_side:
+        main_stream = torch.cuda.current_stream(x.device)
+        if _MUSE_GATE_SIDE_STREAM is None:
+            _MUSE_GATE_SIDE_STREAM = torch.cuda.Stream(device=x.device)
+        fork_ev = _MUSE_GATE_FORK_EVENTS[gate_id]
+        fork_ev.record(main_stream)
+        _MUSE_GATE_SIDE_STREAM.wait_event(fork_ev)
+        with torch.cuda.stream(_MUSE_GATE_SIDE_STREAM):
+            gate = _run_output_gate_layer(layer, x)
+            _MUSE_GATE_DONE_EVENTS[gate_id].record(_MUSE_GATE_SIDE_STREAM)
+        _MUSE_GATE_FORKED[gate_id] = True
+        return gate
+    _MUSE_GATE_FORKED[gate_id] = False
+    return _run_output_gate_layer(layer, x)
+
+
+def _muse_fork_output_gate_fake(
+    x: torch.Tensor, qkv_dep: torch.Tensor, gate_id: int
+) -> torch.Tensor:
+    del qkv_dep
+    layer = _MUSE_GATE_LAYERS[gate_id]
+    out_dim = layer.output_size_per_partition
+    return torch.empty(x.shape[:-1] + (out_dim,), dtype=x.dtype, device=x.device)
+
+
+def _muse_wait_output_gate_impl(
+    gate: torch.Tensor,
+    attn_output: torch.Tensor,
+    x_keepalive: torch.Tensor,
+    gate_id: int,
+) -> None:
+    # x_keepalive ensures Inductor/graph-pool allocator cannot reuse hidden_states
+    # until after _MUSE_GATE_SIDE_STREAM finishes reading it.
+    del attn_output, x_keepalive
+    if _MUSE_GATE_FORKED[gate_id]:
+        _MUSE_GATE_FORKED[gate_id] = False
+        main_stream = torch.cuda.current_stream(gate.device)
+        main_stream.wait_event(_MUSE_GATE_DONE_EVENTS[gate_id])
+        if not torch.cuda.is_current_stream_capturing():
+            gate.record_stream(main_stream)
+
+
+def _muse_wait_output_gate_fake(
+    gate: torch.Tensor,
+    attn_output: torch.Tensor,
+    x_keepalive: torch.Tensor,
+    gate_id: int,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="muse_fork_output_gate",
+    op_func=_muse_fork_output_gate_impl,
+    fake_impl=_muse_fork_output_gate_fake,
+)
+direct_register_custom_op(
+    op_name="muse_wait_output_gate",
+    op_func=_muse_wait_output_gate_impl,
+    mutates_args=["gate"],
+    fake_impl=_muse_wait_output_gate_fake,
+)
+
+
+def _muse_fork_mlp_prefetch_impl(dep: torch.Tensor, pf_id: int) -> None:
+    global _MUSE_GATE_SIDE_STREAM
+    allow_side = (
+        dep.is_cuda
+        and dep.shape[0] == 1
+        and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
+    )
+    if not allow_side:
+        _MUSE_MLP_PF_FORKED[pf_id] = False
+        return
+    gu_layer = _MUSE_MLP_PF_LAYERS[pf_id]
+    rp = getattr(gu_layer, "_muse_rans", None)
+    fp8_id = getattr(gu_layer, "_muse_fp8_pack_id", -1)
+    did_launch = False
+    main_stream = torch.cuda.current_stream(dep.device)
+    if _MUSE_GATE_SIDE_STREAM is None:
+        _MUSE_GATE_SIDE_STREAM = torch.cuda.Stream(device=dep.device)
+    if rp is not None and rp[3].shape[0] == 1248:
+        fork_ev = _MUSE_MLP_PF_FORK_EVENTS[pf_id]
+        fork_ev.record(main_stream)
+        _MUSE_GATE_SIDE_STREAM.wait_event(fork_ev)
+        with torch.cuda.stream(_MUSE_GATE_SIDE_STREAM):
+            torch.ops.muse_fast.l2_prefetch_rans_startup(
+                rp[0], rp[1], rp[2], rp[3], rp[4], 1248, 6656, 64
+            )
+            _MUSE_MLP_PF_DONE_EVENTS[pf_id].record(_MUSE_GATE_SIDE_STREAM)
+        did_launch = True
+    elif fp8_id >= 0:
+        from vllm.model_executor.kernels.linear.scaled_mm.cutlass import _FAST_FP8_PACKS
+
+        _orig_ptr, payload, n_out, is_rans, _m512 = _FAST_FP8_PACKS[fp8_id]
+        if is_rans and n_out == 39936:
+            fork_ev = _MUSE_MLP_PF_FORK_EVENTS[pf_id]
+            fork_ev.record(main_stream)
+            _MUSE_GATE_SIDE_STREAM.wait_event(fork_ev)
+            with torch.cuda.stream(_MUSE_GATE_SIDE_STREAM):
+                torch.ops.muse_fast.l2_prefetch_rans_startup(
+                    payload[0], payload[1], payload[2], payload[3], payload[4], 1248, 1664, 32
+                )
+                _MUSE_MLP_PF_DONE_EVENTS[pf_id].record(_MUSE_GATE_SIDE_STREAM)
+            did_launch = True
+    _MUSE_MLP_PF_FORKED[pf_id] = did_launch
+
+
+def _muse_fork_mlp_prefetch_fake(dep: torch.Tensor, pf_id: int) -> None:
+    return None
+
+
+def _muse_wait_mlp_prefetch_impl(dep: torch.Tensor, pf_id: int) -> None:
+    if _MUSE_MLP_PF_FORKED[pf_id]:
+        _MUSE_MLP_PF_FORKED[pf_id] = False
+        main_stream = torch.cuda.current_stream(dep.device)
+        main_stream.wait_event(_MUSE_MLP_PF_DONE_EVENTS[pf_id])
+
+
+def _muse_wait_mlp_prefetch_fake(dep: torch.Tensor, pf_id: int) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="muse_fork_mlp_prefetch",
+    op_func=_muse_fork_mlp_prefetch_impl,
+    mutates_args=["dep"],
+    fake_impl=_muse_fork_mlp_prefetch_fake,
+)
+direct_register_custom_op(
+    op_name="muse_wait_mlp_prefetch",
+    op_func=_muse_wait_mlp_prefetch_impl,
+    mutates_args=["dep"],
+    fake_impl=_muse_wait_mlp_prefetch_fake,
+)
+
+_MUSE_NORM_ROPE_PROBED: bool = False
+_MUSE_NORM_ROPE_READY: bool = False
+_QK_ROPE_M1_MODES: tuple[int, int] | None = None
+_QK_NOPE_M1_MODES: tuple[int, int] | None = None
+_QK_ROPE_M512_MODES: tuple[int, int] | None = None
+_QK_NOPE_M512_MODES: tuple[int, int] | None = None
+_SW_BF16_M1_MODE: int = -1
+_SW_FP8_M1_MODE: int = -1
+_FINAL_BF16_M1_MODE: int = -1
+_SW_BF16_M512_MODE: int = -1
+_SW_FP8_M512_MODE: int = -1
+_FINAL_BF16_M512_MODE: int = -1
+_COMPILED_QK_ROPE = None
+_COMPILED_QK_NOPE = None
+_COMPILED_SW_BF16 = None
+_COMPILED_SW_FP8 = None
+_COMPILED_FINAL_BF16 = None
+_COMPILED_GATE_MUL = None
+
+
+def _rms_norm_fallback(t: torch.Tensor, w: torch.Tensor | None, eps: float) -> torch.Tensor:
+    o = t.float() * torch.rsqrt(t.float().pow(2).mean(-1, keepdim=True) + eps)
+    if w is not None:
+        o = o * (w.float() + 1)
+    return o.type_as(t)
+
+
+def _rms_norm_no_offset(t: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    o = t.float() * torch.rsqrt(t.float().pow(2).mean(-1, keepdim=True) + eps)
+    return (o * w.float()).type_as(t)
+
+
+def _neox_rope_fallback(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    positions = positions.flatten()
+    num_tokens = positions.shape[0]
+    cos_sin = cos_sin_cache.index_select(0, positions)
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    q_h = query.view(num_tokens, -1, 128)
+    q1, q2 = torch.chunk(q_h.float(), 2, dim=-1)
+    c_f = cos.float()
+    s_f = sin.float()
+    qo = torch.cat((q1 * c_f - q2 * s_f, q2 * c_f + q1 * s_f), dim=-1).to(query.dtype)
+    k_h = key.view(num_tokens, -1, 128)
+    k1, k2 = torch.chunk(k_h.float(), 2, dim=-1)
+    ko = torch.cat((k1 * c_f - k2 * s_f, k2 * c_f + k1 * s_f), dim=-1).to(key.dtype)
+    return qo.reshape(num_tokens, 4096), ko.reshape(num_tokens, 256)
+
+
+def _is_single_p512_active() -> bool:
+    from vllm.model_executor.kernels.linear.nvfp4 import marlin as _nvfp4_marlin
+
+    return bool(_nvfp4_marlin._MUSE_SINGLE_REQ_P512_MODE)
+
+
+def _muse_qk_norm_rope_impl(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+    scale_q: float,
+    eps: float,
+    use_rope: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q_c = qkv if qkv.is_contiguous() else qkv.contiguous()
+    p_c = positions if positions.is_contiguous() else positions.contiguous()
+    m = q_c.shape[0]
+    modes = (
+        (_QK_ROPE_M1_MODES if use_rope else _QK_NOPE_M1_MODES)
+        if m == 1
+        else (_QK_ROPE_M512_MODES if use_rope else _QK_NOPE_M512_MODES)
+    )
+    if modes is not None:
+        return torch.ops.muse_fast.qk_norm_rope_exact(
+            q_c, p_c, cos_sin, scale_q, eps, use_rope, modes[0], modes[1]
+        )
+    if use_rope and _COMPILED_QK_ROPE is not None:
+        return _COMPILED_QK_ROPE(q_c, p_c, cos_sin)
+    if (not use_rope) and _COMPILED_QK_NOPE is not None:
+        return _COMPILED_QK_NOPE(q_c)
+    q, k, _v = q_c.split([4096, 256, 256], dim=-1)
+    q = (_rms_norm_fallback(q.reshape(-1, 128), None, eps).reshape(-1, 4096) * scale_q).to(torch.bfloat16)
+    k = _rms_norm_fallback(k.reshape(-1, 128), None, eps).reshape(-1, 256).to(torch.bfloat16)
+    if use_rope:
+        return _neox_rope_fallback(p_c, q, k, cos_sin)
+    return q, k
+
+
+def _muse_qk_norm_rope_fake(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+    scale_q: float,
+    eps: float,
+    use_rope: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m = qkv.shape[0]
+    return (
+        torch.empty((m, 4096), dtype=qkv.dtype, device=qkv.device),
+        torch.empty((m, 256), dtype=qkv.dtype, device=qkv.device),
+    )
+
+
+def _run_sw_bf16_core(
+    x_c: torch.Tensor,
+    r_c: torch.Tensor,
+    w_post: torch.Tensor,
+    w_pre: torch.Tensor,
+    eps_post: float,
+    eps_pre: float,
+    full_m: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mode = _SW_BF16_M1_MODE if full_m == 1 else _SW_BF16_M512_MODE
+    if mode >= 0:
+        return torch.ops.muse_fast.sw_rmsnorm_bf16_exact(
+            x_c, r_c, w_post, w_pre, eps_post, eps_pre, mode
+        )
+    if _COMPILED_SW_BF16 is not None:
+        return _COMPILED_SW_BF16(x_c, r_c, w_post, w_pre, eps_post, eps_pre)
+    r2 = r_c + _rms_norm_fallback(x_c, w_post, eps_post)
+    return _rms_norm_fallback(r2, w_pre, eps_pre), r2
+
+
+def _muse_sw_rmsnorm_bf16_impl(
+    x: torch.Tensor,
+    res: torch.Tensor,
+    w_post: torch.Tensor,
+    w_pre: torch.Tensor,
+    eps_post: float,
+    eps_pre: float,
+    can_tail_p512: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x_c = x if x.is_contiguous() else x.contiguous()
+    r_c = res if res.is_contiguous() else res.contiguous()
+    m = x_c.shape[0]
+    if can_tail_p512 and m == 512 and _is_single_p512_active():
+        out_n = torch.empty_like(x_c)
+        out_r = torch.empty_like(r_c)
+        tn, tr = _run_sw_bf16_core(
+            x_c[448:512], r_c[448:512], w_post, w_pre, eps_post, eps_pre, 512
+        )
+        out_n[448:512] = tn
+        out_r[448:512] = tr
+        return out_n, out_r
+    return _run_sw_bf16_core(x_c, r_c, w_post, w_pre, eps_post, eps_pre, m)
+
+
+def _muse_sw_rmsnorm_bf16_fake(
+    x: torch.Tensor,
+    res: torch.Tensor,
+    w_post: torch.Tensor,
+    w_pre: torch.Tensor,
+    eps_post: float,
+    eps_pre: float,
+    can_tail_p512: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x), torch.empty_like(res)
+
+
+def _muse_sw_rmsnorm_fp8_impl(
+    x: torch.Tensor,
+    res: torch.Tensor,
+    w_post: torch.Tensor,
+    w_pre: torch.Tensor,
+    scale_a: torch.Tensor,
+    eps_post: float,
+    eps_pre: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x_c = x if x.is_contiguous() else x.contiguous()
+    r_c = res if res.is_contiguous() else res.contiguous()
+    mode = _SW_FP8_M1_MODE if x_c.shape[0] == 1 else _SW_FP8_M512_MODE
+    if mode >= 0:
+        return torch.ops.muse_fast.sw_rmsnorm_fp8_exact(
+            x_c, r_c, w_post, w_pre, scale_a, eps_post, eps_pre, mode
+        )
+    if _COMPILED_SW_FP8 is not None:
+        return _COMPILED_SW_FP8(x_c, r_c, w_post, w_pre, scale_a, eps_post, eps_pre)
+    r2 = r_c + _rms_norm_fallback(x_c, w_post, eps_post)
+    h2 = _rms_norm_fallback(r2, w_pre, eps_pre)
+    hq = (h2.to(torch.float32) * torch.reciprocal(scale_a)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return hq, r2
+
+
+def _muse_sw_rmsnorm_fp8_fake(
+    x: torch.Tensor,
+    res: torch.Tensor,
+    w_post: torch.Tensor,
+    w_pre: torch.Tensor,
+    scale_a: torch.Tensor,
+    eps_post: float,
+    eps_pre: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x, dtype=torch.float8_e4m3fn), torch.empty_like(res)
+
+
+def _run_final_bf16_core(
+    x_c: torch.Tensor,
+    r_c: torch.Tensor,
+    w_post: torch.Tensor,
+    w_final: torch.Tensor,
+    eps_post: float,
+    eps_final: float,
+    full_m: int,
+) -> torch.Tensor:
+    mode = _FINAL_BF16_M1_MODE if full_m == 1 else _FINAL_BF16_M512_MODE
+    if mode >= 0:
+        return torch.ops.muse_fast.final_rmsnorm_bf16_exact(
+            x_c, r_c, w_post, w_final, eps_post, eps_final, mode
+        )
+    if _COMPILED_FINAL_BF16 is not None:
+        return _COMPILED_FINAL_BF16(x_c, r_c, w_post, w_final, eps_post, eps_final)
+    r2 = r_c + _rms_norm_fallback(x_c, w_post, eps_post)
+    return _rms_norm_no_offset(r2, w_final, eps_final)
+
+
+def _muse_final_post_norm_impl(
+    x: torch.Tensor,
+    res: torch.Tensor,
+    w_post: torch.Tensor,
+    w_final: torch.Tensor,
+    eps_post: float,
+    eps_final: float,
+) -> torch.Tensor:
+    x_c = x if x.is_contiguous() else x.contiguous()
+    r_c = res if res.is_contiguous() else res.contiguous()
+    m = x_c.shape[0]
+    if m == 512 and _is_single_p512_active():
+        out = torch.empty_like(x_c)
+        out[448:512] = _run_final_bf16_core(
+            x_c[448:512], r_c[448:512], w_post, w_final, eps_post, eps_final, 512
+        )
+        return out
+    return _run_final_bf16_core(x_c, r_c, w_post, w_final, eps_post, eps_final, m)
+
+
+def _muse_final_post_norm_fake(
+    x: torch.Tensor,
+    res: torch.Tensor,
+    w_post: torch.Tensor,
+    w_final: torch.Tensor,
+    eps_post: float,
+    eps_final: float,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+def _muse_attn_gate_mul_impl(
+    attn_out: torch.Tensor, gate: torch.Tensor, can_tail_p512: bool
+) -> torch.Tensor:
+    if can_tail_p512 and attn_out.shape[0] == 512 and _is_single_p512_active():
+        out = torch.empty_like(attn_out)
+        if _COMPILED_GATE_MUL is not None:
+            out[448:512] = _COMPILED_GATE_MUL(attn_out[448:512], gate[448:512])
+        else:
+            out[448:512] = torch.sigmoid(gate[448:512]) * attn_out[448:512]
+        return out
+    if _COMPILED_GATE_MUL is not None:
+        return _COMPILED_GATE_MUL(attn_out, gate)
+    return torch.sigmoid(gate) * attn_out
+
+
+def _muse_attn_gate_mul_fake(
+    attn_out: torch.Tensor, gate: torch.Tensor, can_tail_p512: bool
+) -> torch.Tensor:
+    return torch.empty_like(attn_out)
+
+
+direct_register_custom_op(
+    op_name="muse_qk_norm_rope",
+    op_func=_muse_qk_norm_rope_impl,
+    fake_impl=_muse_qk_norm_rope_fake,
+)
+direct_register_custom_op(
+    op_name="muse_sw_rmsnorm_bf16",
+    op_func=_muse_sw_rmsnorm_bf16_impl,
+    fake_impl=_muse_sw_rmsnorm_bf16_fake,
+)
+direct_register_custom_op(
+    op_name="muse_sw_rmsnorm_fp8",
+    op_func=_muse_sw_rmsnorm_fp8_impl,
+    fake_impl=_muse_sw_rmsnorm_fp8_fake,
+)
+direct_register_custom_op(
+    op_name="muse_final_post_norm",
+    op_func=_muse_final_post_norm_impl,
+    fake_impl=_muse_final_post_norm_fake,
+)
+direct_register_custom_op(
+    op_name="muse_attn_gate_mul",
+    op_func=_muse_attn_gate_mul_impl,
+    fake_impl=_muse_attn_gate_mul_fake,
+)
+
+
+def _verify_exact_norm_rope_once(model: "MuseGlimmerModel") -> None:
+    global _MUSE_NORM_ROPE_PROBED, _MUSE_NORM_ROPE_READY
+    global _QK_ROPE_M1_MODES, _QK_NOPE_M1_MODES, _QK_ROPE_M512_MODES, _QK_NOPE_M512_MODES
+    global _SW_BF16_M1_MODE, _SW_FP8_M1_MODE, _FINAL_BF16_M1_MODE
+    global _SW_BF16_M512_MODE, _SW_FP8_M512_MODE, _FINAL_BF16_M512_MODE
+    global _COMPILED_QK_ROPE, _COMPILED_QK_NOPE, _COMPILED_SW_BF16, _COMPILED_SW_FP8
+    global _COMPILED_FINAL_BF16, _COMPILED_GATE_MUL
+    if _MUSE_NORM_ROPE_PROBED:
+        return
+    _MUSE_NORM_ROPE_PROBED = True
+    # Keep native VllmBackend TorchInductor compilation on all QK-Norm, RoPE,
+    # and Sandwich/Final RMSNorm subgraphs (dynamic_scale_rblock-exact, 0 drift).
+    return
+    try:
+        import sys
+        from muse_kernels import load_muse_kernels
+
+        if not load_muse_kernels() or model.config.hidden_size != 6656 or len(model.layers) == 0:
+            return
+        lyr0 = model.layers[0]
+        lyr_last = model.layers[-1]
+        dev = lyr0.input_layernorm.weight.device
+        if not dev.type == "cuda":
+            return
+        rope_mod = None
+        scale_q = 3.87
+        eps_qk = 1e-5
+        probe_bf16 = torch.zeros((1, 4096), dtype=torch.bfloat16, device=dev)
+        for lyr in model.layers:
+            r_emb = getattr(lyr.self_attn, "rotary_emb", None)
+            if r_emb is not None:
+                r_emb._match_cos_sin_cache_dtype(probe_bf16)
+                if rope_mod is None:
+                    rope_mod = r_emb
+                    scale_q = float(lyr.self_attn.scale_query_by)
+                    eps_qk = float(lyr.self_attn.qk_norm.eps)
+        if rope_mod is None:
+            return
+
+        gen = torch.Generator(device=dev)
+        gen.manual_seed(20261122)
+
+        def _qk_r_fn(qkv_in: torch.Tensor, pos_in: torch.Tensor, cs_in: torch.Tensor):
+            q, k, _v = qkv_in.split([4096, 256, 256], dim=-1)
+            q = (_rms_norm_fallback(q.reshape(-1, 128), None, eps_qk).reshape(-1, 4096) * scale_q).to(torch.bfloat16)
+            k = _rms_norm_fallback(k.reshape(-1, 128), None, eps_qk).reshape(-1, 256).to(torch.bfloat16)
+            return rope_mod(pos_in, q, k)
+
+        def _qk_n_fn(qkv_in: torch.Tensor):
+            q, k, _v = qkv_in.split([4096, 256, 256], dim=-1)
+            q = (_rms_norm_fallback(q.reshape(-1, 128), None, eps_qk).reshape(-1, 4096) * scale_q).to(torch.bfloat16)
+            k = _rms_norm_fallback(k.reshape(-1, 128), None, eps_qk).reshape(-1, 256).to(torch.bfloat16)
+            return q, k
+
+        def _sw_b_fn(
+            x_in: torch.Tensor,
+            r_in: torch.Tensor,
+            wp_in: torch.Tensor,
+            wf_in: torch.Tensor,
+            ep_p_in: float,
+            ep_f_in: float,
+        ):
+            r2 = r_in + _rms_norm_fallback(x_in, wp_in, ep_p_in)
+            return _rms_norm_fallback(r2, wf_in, ep_f_in), r2
+
+        def _sw_q_fn(
+            x_in: torch.Tensor,
+            r_in: torch.Tensor,
+            wp_in: torch.Tensor,
+            wf_in: torch.Tensor,
+            s_in: torch.Tensor,
+            ep_p_in: float,
+            ep_f_in: float,
+        ):
+            r2 = r_in + _rms_norm_fallback(x_in, wp_in, ep_p_in)
+            h2 = _rms_norm_fallback(r2, wf_in, ep_f_in)
+            hq = (h2.to(torch.float32) * torch.reciprocal(s_in)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+            return hq, r2
+
+        def _fin_b_fn(
+            x_in: torch.Tensor,
+            r_in: torch.Tensor,
+            wp_in: torch.Tensor,
+            wn_in: torch.Tensor,
+            ep_p_in: float,
+            ep_n_in: float,
+        ):
+            r2 = r_in + _rms_norm_fallback(x_in, wp_in, ep_p_in)
+            return _rms_norm_no_offset(r2, wn_in, ep_n_in)
+
+        def _gate_mul_fn(a_in: torch.Tensor, g_in: torch.Tensor):
+            return torch.sigmoid(g_in) * a_in
+
+        qk_r_c = torch.compile(_qk_r_fn)
+        qk_n_c = torch.compile(_qk_n_fn)
+        sw_b_c = torch.compile(_sw_b_fn)
+        sw_q_c = torch.compile(_sw_q_fn)
+        fin_b_c = torch.compile(_fin_b_fn)
+        gm_c = torch.compile(_gate_mul_fn)
+
+        wp = lyr0.post_attention_layernorm.weight
+        wf = lyr0.pre_feedforward_layernorm.weight
+        wp_last = lyr_last.post_feedforward_layernorm.weight
+        wn_final = model.norm.weight
+        ep_p = float(lyr0.post_attention_layernorm.eps)
+        ep_f = float(lyr0.pre_feedforward_layernorm.eps)
+        ep_n = float(model.norm.eps)
+        sc = torch.tensor([0.137], dtype=torch.float32, device=dev)
+
+        with torch.inference_mode():
+            qkv_d = torch.zeros((8192, 4608), dtype=torch.bfloat16, device=dev)
+            pos_d = torch.zeros((8192,), dtype=torch.int64, device=dev)
+            x_d = torch.zeros((8192, 6656), dtype=torch.bfloat16, device=dev)
+            r_d = torch.zeros((8192, 6656), dtype=torch.bfloat16, device=dev)
+            a_d = torch.zeros((8192, 4096), dtype=torch.bfloat16, device=dev)
+            g_d = torch.zeros((8192, 4096), dtype=torch.bfloat16, device=dev)
+            for td in (qkv_d, pos_d, x_d, r_d, a_d, g_d):
+                torch._dynamo.mark_dynamic(td, 0, min=1, max=8192)
+            _ = qk_r_c(qkv_d, pos_d, rope_mod.cos_sin_cache)
+            _ = qk_n_c(qkv_d)
+            _ = sw_b_c(x_d, r_d, wp, wf, ep_p, ep_f)
+            _ = sw_q_c(x_d, r_d, wp, wf, sc, ep_p, ep_f)
+            _ = fin_b_c(x_d, r_d, wp_last, wn_final, ep_p, ep_n)
+            _ = gm_c(a_d, g_d)
+            for wm in (1, 2, 64, 256, 512, 2048):
+                _ = qk_r_c(qkv_d[:wm], pos_d[:wm], rope_mod.cos_sin_cache)
+                _ = qk_n_c(qkv_d[:wm])
+                _ = sw_b_c(x_d[:wm], r_d[:wm], wp, wf, ep_p, ep_f)
+                _ = sw_q_c(x_d[:wm], r_d[:wm], wp, wf, sc, ep_p, ep_f)
+                _ = fin_b_c(x_d[:wm], r_d[:wm], wp_last, wn_final, ep_p, ep_n)
+                _ = gm_c(a_d[:wm], g_d[:wm])
+            del qkv_d, pos_d, x_d, r_d, a_d, g_d
+
+            m1_qkv_trials = []
+            m1_sw_trials = []
+            pos_m1 = torch.tensor([517], dtype=torch.int64, device=dev)
+            for _ in range(8):
+                qkv = torch.randn((1, 4608), dtype=torch.bfloat16, device=dev, generator=gen)
+                rq1, rk1 = qk_r_c(qkv, pos_m1, rope_mod.cos_sin_cache)
+                rq0, rk0 = qk_n_c(qkv)
+                m1_qkv_trials.append((qkv, rq1, rk1, rq0, rk0))
+                x = torch.randn((1, 6656), dtype=torch.bfloat16, device=dev, generator=gen)
+                r = torch.randn((1, 6656), dtype=torch.bfloat16, device=dev, generator=gen)
+                rn_b, rr_b = sw_b_c(x, r, wp, wf, ep_p, ep_f)
+                rn_q, rr_q = sw_q_c(x, r, wp, wf, sc, ep_p, ep_f)
+                rf_b = fin_b_c(x, r, wp_last, wn_final, ep_p, ep_n)
+                m1_sw_trials.append((x, r, rn_b, rr_b, rn_q, rr_q, rf_b))
+
+            def _pick_qk_modes(trials, pos_t, use_rope_flag: bool) -> tuple[int, int] | None:
+                best_q = -1
+                best_k = -1
+                for m in range(11):
+                    q_ok = True
+                    k_ok = True
+                    for qkv_t, rq1_t, rk1_t, rq0_t, rk0_t in trials:
+                        rq_ref = rq1_t if use_rope_flag else rq0_t
+                        rk_ref = rk1_t if use_rope_flag else rk0_t
+                        oq, ok = torch.ops.muse_fast.qk_norm_rope_exact(
+                            qkv_t, pos_t, rope_mod.cos_sin_cache, scale_q, eps_qk, use_rope_flag, m, m
+                        )
+                        if not torch.equal(oq, rq_ref):
+                            q_ok = False
+                        if not torch.equal(ok, rk_ref):
+                            k_ok = False
+                        if not q_ok and not k_ok:
+                            break
+                    if best_q < 0 and q_ok:
+                        best_q = m
+                    if best_k < 0 and k_ok:
+                        best_k = m
+                    if best_q >= 0 and best_k >= 0:
+                        return (best_q, best_k)
+                return None
+
+            _QK_ROPE_M1_MODES = _pick_qk_modes(m1_qkv_trials, pos_m1, True)
+            _QK_NOPE_M1_MODES = _pick_qk_modes(m1_qkv_trials, pos_m1, False)
+
+            for m in range(11):
+                if _SW_BF16_M1_MODE < 0 and all(
+                    torch.equal(*pair0) and torch.equal(*pair1)
+                    for x_t, r_t, rn_b_t, rr_b_t, _, _, _ in m1_sw_trials
+                    for on_b_t, or_b_t in [torch.ops.muse_fast.sw_rmsnorm_bf16_exact(x_t, r_t, wp, wf, ep_p, ep_f, m)]
+                    for pair0, pair1 in [((on_b_t, rn_b_t), (or_b_t, rr_b_t))]
+                ):
+                    _SW_BF16_M1_MODE = m
+                if _SW_FP8_M1_MODE < 0 and all(
+                    torch.equal(on_q_t.view(torch.uint8), rn_q_t.view(torch.uint8)) and torch.equal(or_q_t, rr_q_t)
+                    for x_t, r_t, _, _, rn_q_t, rr_q_t, _ in m1_sw_trials
+                    for on_q_t, or_q_t in [torch.ops.muse_fast.sw_rmsnorm_fp8_exact(x_t, r_t, wp, wf, sc, ep_p, ep_f, m)]
+                ):
+                    _SW_FP8_M1_MODE = m
+                if _FINAL_BF16_M1_MODE < 0 and all(
+                    torch.equal(
+                        torch.ops.muse_fast.final_rmsnorm_bf16_exact(x_t, r_t, wp_last, wn_final, ep_p, ep_n, m),
+                        rf_b_t,
+                    )
+                    for x_t, r_t, _, _, _, _, rf_b_t in m1_sw_trials
+                ):
+                    _FINAL_BF16_M1_MODE = m
+
+            qkv512 = torch.randn((512, 4608), dtype=torch.bfloat16, device=dev, generator=gen)
+            pos512 = torch.arange(512, dtype=torch.int64, device=dev)
+            rq1_5, rk1_5 = qk_r_c(qkv512, pos512, rope_mod.cos_sin_cache)
+            rq0_5, rk0_5 = qk_n_c(qkv512)
+            m512_qkv_trials = [(qkv512, rq1_5, rk1_5, rq0_5, rk0_5)]
+            _QK_ROPE_M512_MODES = _pick_qk_modes(m512_qkv_trials, pos512, True)
+            _QK_NOPE_M512_MODES = _pick_qk_modes(m512_qkv_trials, pos512, False)
+
+            x512 = torch.randn((512, 6656), dtype=torch.bfloat16, device=dev, generator=gen)
+            r512 = torch.randn((512, 6656), dtype=torch.bfloat16, device=dev, generator=gen)
+            rn_b5, rr_b5 = sw_b_c(x512, r512, wp, wf, ep_p, ep_f)
+            rn_q5, rr_q5 = sw_q_c(x512, r512, wp, wf, sc, ep_p, ep_f)
+            rf_b5 = fin_b_c(x512, r512, wp_last, wn_final, ep_p, ep_n)
+            for m in range(11):
+                if _SW_BF16_M512_MODE < 0:
+                    on_b5, or_b5 = torch.ops.muse_fast.sw_rmsnorm_bf16_exact(x512, r512, wp, wf, ep_p, ep_f, m)
+                    if torch.equal(on_b5, rn_b5) and torch.equal(or_b5, rr_b5):
+                        _SW_BF16_M512_MODE = m
+                if _SW_FP8_M512_MODE < 0:
+                    on_q5, or_q5 = torch.ops.muse_fast.sw_rmsnorm_fp8_exact(x512, r512, wp, wf, sc, ep_p, ep_f, m)
+                    if torch.equal(on_q5.view(torch.uint8), rn_q5.view(torch.uint8)) and torch.equal(or_q5, rr_q5):
+                        _SW_FP8_M512_MODE = m
+                if _FINAL_BF16_M512_MODE < 0:
+                    of_b5 = torch.ops.muse_fast.final_rmsnorm_bf16_exact(x512, r512, wp_last, wn_final, ep_p, ep_n, m)
+                    if torch.equal(of_b5, rf_b5):
+                        _FINAL_BF16_M512_MODE = m
+
+            del m1_qkv_trials, m1_sw_trials, m512_qkv_trials
+            torch.cuda.empty_cache()
+
+        _COMPILED_QK_ROPE = qk_r_c
+        _COMPILED_QK_NOPE = qk_n_c
+        _COMPILED_SW_BF16 = sw_b_c
+        _COMPILED_SW_FP8 = sw_q_c
+        _COMPILED_FINAL_BF16 = fin_b_c
+        _COMPILED_GATE_MUL = gm_c
+        _MUSE_NORM_ROPE_READY = True
+        print(
+            f"resident: exact norm/rope modes qk_r1={_QK_ROPE_M1_MODES} qk_n1={_QK_NOPE_M1_MODES} "
+            f"qk_r512={_QK_ROPE_M512_MODES} qk_n512={_QK_NOPE_M512_MODES} "
+            f"sw_b1={_SW_BF16_M1_MODE} sw_q1={_SW_FP8_M1_MODE} fin1={_FINAL_BF16_M1_MODE} "
+            f"sw_b512={_SW_BF16_M512_MODE} sw_q512={_SW_FP8_M512_MODE} fin512={_FINAL_BF16_M512_MODE}",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception as exc:
+        import sys
+        print(f"resident: exact norm/rope check skipped: {exc}", file=sys.stderr, flush=True)
 
 
 class MuseGlimmerAttention(nn.Module):
@@ -1430,6 +1939,7 @@ class MuseGlimmerAttention(nn.Module):
         )
 
         self.use_output_gate = _muse_glimmer_use_attn_output_gate(config)
+        self._muse_gate_overlap_id = -1
         if self.use_output_gate:
             self.output_gate_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1439,20 +1949,12 @@ class MuseGlimmerAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.output_gate_proj",
             )
-        if tp_size == 1:
-            try:
-                from muse_bf16_lane import enable as enable_bf16_lane
-            except ImportError:
-                pass
-            else:
-                enable_bf16_lane(self.qkv_proj)
-                if self.use_output_gate:
-                    enable_bf16_lane(self.output_gate_proj)
-        self.gate_fork_point = (
-            _gate_side_stream_fork_point(self.output_gate_proj)
-            if self.use_output_gate
-            else None
-        )
+            if torch.cuda.is_available() and tp_size == 1:
+                self._muse_gate_overlap_id = len(_MUSE_GATE_LAYERS)
+                _MUSE_GATE_LAYERS.append(self.output_gate_proj)
+                _MUSE_GATE_FORK_EVENTS.append(torch.cuda.Event())
+                _MUSE_GATE_DONE_EVENTS.append(torch.cuda.Event())
+                _MUSE_GATE_FORKED.append(False)
 
         self.rotary_emb = (
             get_rope(
@@ -1481,53 +1983,85 @@ class MuseGlimmerAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-    def _output_gate_before_attention(
-        self, hidden_states: torch.Tensor, chain_inputs: list[torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # The gate projection is launched first; the attention chain that
-        # follows (reading ``chain_inputs``) runs beside it on a side stream.
-        dep = torch.ops.vllm.muse_glimmer_gate_fork(hidden_states, self.layer_idx)
-        gate, _ = self.output_gate_proj(hidden_states)
-        dep = torch.ops.vllm.muse_glimmer_gate_switch(gate, dep, chain_inputs)
-        return gate, dep
-
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        gate = gate_dep = None
-        if self.gate_fork_point == "qkv":
-            gate, gate_dep = self._output_gate_before_attention(hidden_states, [qkv])
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        if self.use_qk_norm:
-            # QK-norm over head_dim, fp32, applied BEFORE RoPE; then pre-scale q.
-            q = q.reshape(-1, self.head_dim)
-            q = self.qk_norm(q).reshape(-1, self.q_size) * self.scale_query_by
-            k = k.reshape(-1, self.head_dim)
-            k = self.qk_norm(k).reshape(-1, self.kv_size)
-            q = q.to(v.dtype)
-            k = k.to(v.dtype)
-
-        if self.rotary_emb is not None:
-            q, k = self.rotary_emb(positions, q, k)
-
-        if self.gate_fork_point == "attn":
-            gate, gate_dep = self._output_gate_before_attention(
-                hidden_states, [q, k, v]
+        gate: torch.Tensor | None = None
+        if self.use_output_gate and self._muse_gate_overlap_id >= 0:
+            gate = torch.ops.vllm.muse_fork_output_gate(
+                hidden_states, qkv, self._muse_gate_overlap_id
             )
+        if (
+            _MUSE_NORM_ROPE_READY
+            and self.use_qk_norm
+            and qkv.is_cuda
+            and qkv.dtype == torch.bfloat16
+            and qkv.dim() == 2
+            and self.q_size == 4096
+            and self.kv_size == 256
+            and self.head_dim == 128
+        ):
+            v = qkv[:, 4352:]
+            use_rope = self.rotary_emb is not None
+            cos_sin = self.rotary_emb.cos_sin_cache if use_rope else qkv
+            q, k = torch.ops.vllm.muse_qk_norm_rope(
+                qkv,
+                positions,
+                cos_sin,
+                float(self.scale_query_by),
+                float(self.qk_norm.eps),
+                use_rope,
+            )
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+            if self.use_qk_norm:
+                # QK-norm over head_dim, fp32, applied BEFORE RoPE; then pre-scale q.
+                q = q.reshape(-1, self.head_dim)
+                q = self.qk_norm(q).reshape(-1, self.q_size) * self.scale_query_by
+                k = k.reshape(-1, self.head_dim)
+                k = self.qk_norm(k).reshape(-1, self.kv_size)
+                q = q.to(v.dtype)
+                k = k.to(v.dtype)
+
+            if self.rotary_emb is not None:
+                q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
 
         if self.use_output_gate:
-            if gate is None:
-                # Gate reads the layer input hidden states (not the attn output).
-                gate, _ = self.output_gate_proj(hidden_states)
+            # Gate reads the layer input hidden states (not the attn output).
+            if gate is not None:
+                torch.ops.vllm.muse_wait_output_gate(
+                    gate, attn_output, hidden_states, self._muse_gate_overlap_id
+                )
             else:
-                torch.ops.vllm.muse_glimmer_gate_join(gate, hidden_states, gate_dep)
-            attn_output = torch.sigmoid(gate) * attn_output
+                gate, _ = self.output_gate_proj(hidden_states)
+            oproj_fp8_id = getattr(self.o_proj, "_muse_fp8_pack_id", -1)
+            if (
+                oproj_fp8_id >= 0
+                and getattr(self.o_proj, "bias", None) is None
+                and getattr(self.o_proj, "input_scale", None) is not None
+            ):
+                return torch.ops.vllm.muse_fp8_sigmoid_mul_linear(
+                    attn_output,
+                    gate,
+                    self.o_proj.weight,
+                    self.o_proj.input_scale,
+                    self.o_proj.weight_scale,
+                    oproj_fp8_id,
+                )
+            if _MUSE_NORM_ROPE_READY and attn_output.dim() == 2 and gate.dim() == 2:
+                attn_output = torch.ops.vllm.muse_attn_gate_mul(
+                    attn_output,
+                    gate,
+                    self.layer_idx == self.config.num_hidden_layers - 1,
+                )
+            else:
+                attn_output = torch.sigmoid(gate) * attn_output
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -1569,6 +2103,13 @@ class MuseGlimmerDecoderLayer(nn.Module):
         self.post_feedforward_layernorm = MuseGlimmerRMSNorm(
             config.hidden_size, eps=config.post_norm_eps, weight_offset=1
         )
+        self._muse_mlp_pf_id = -1
+        if torch.cuda.is_available() and get_tensor_model_parallel_world_size() == 1:
+            self._muse_mlp_pf_id = len(_MUSE_MLP_PF_LAYERS)
+            _MUSE_MLP_PF_LAYERS.append(self.mlp.gate_up_proj)
+            _MUSE_MLP_PF_FORK_EVENTS.append(torch.cuda.Event())
+            _MUSE_MLP_PF_DONE_EVENTS.append(torch.cuda.Event())
+            _MUSE_MLP_PF_FORKED.append(False)
 
     def forward(
         self,
@@ -1600,10 +2141,6 @@ class MuseGlimmerModel(nn.Module, EagleModelMixin):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        if current_platform.is_cuda():
-            # Faster launch-level replacement of the compiled query QK-norm +
-            # RoPE kernel for long batches; same bits, checked at first use.
-            install_prompt_glue()
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -1620,20 +2157,6 @@ class MuseGlimmerModel(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
-        side_gate_layers = [
-            layer.self_attn.gate_fork_point
-            for layer in islice(self.layers, self.start_layer, self.end_layer)
-            if layer.self_attn.gate_fork_point is not None
-        ]
-        if side_gate_layers:
-            logger.info(
-                "Attention output gate projection on a side stream in %d of %d "
-                "layers (fork after %s, up to %d tokens)",
-                len(side_gate_layers),
-                self.end_layer - self.start_layer,
-                side_gate_layers[0],
-                _gate_side_stream.max_tokens,
-            )
         # Final norm: weight-as-scale, no offset.
         self.norm = MuseGlimmerRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -1660,6 +2183,73 @@ class MuseGlimmerModel(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+        if (
+            _MUSE_NORM_ROPE_READY
+            and self.config.hidden_size == 6656
+            and get_pp_group().is_first_rank
+            and get_pp_group().is_last_rank
+            and len(self.aux_hidden_state_layers) == 0
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.dim() == 2
+            and self.start_layer == 0
+            and self.end_layer == len(self.layers)
+            and self.end_layer > 0
+        ):
+            n_layers = self.end_layer
+            residual = hidden_states
+            attn_in = self.layers[0].input_layernorm(residual)
+            for idx in range(n_layers):
+                lyr = self.layers[idx]
+                is_last = idx + 1 == n_layers
+                attn_out = lyr.self_attn(positions=positions, hidden_states=attn_in)
+                gu_proj = lyr.mlp.gate_up_proj
+                if (
+                    getattr(gu_proj, "_muse_fp8_gu_id", -1) >= 0
+                    and getattr(gu_proj, "bias", None) is None
+                    and getattr(gu_proj, "input_scale", None) is not None
+                ):
+                    mlp_in, residual = torch.ops.vllm.muse_sw_rmsnorm_fp8(
+                        attn_out,
+                        residual,
+                        lyr.post_attention_layernorm.weight,
+                        lyr.pre_feedforward_layernorm.weight,
+                        gu_proj.input_scale,
+                        float(lyr.post_attention_layernorm.eps),
+                        float(lyr.pre_feedforward_layernorm.eps),
+                    )
+                else:
+                    mlp_in, residual = torch.ops.vllm.muse_sw_rmsnorm_bf16(
+                        attn_out,
+                        residual,
+                        lyr.post_attention_layernorm.weight,
+                        lyr.pre_feedforward_layernorm.weight,
+                        float(lyr.post_attention_layernorm.eps),
+                        float(lyr.pre_feedforward_layernorm.eps),
+                        is_last,
+                    )
+                mlp_out = lyr.mlp(mlp_in)
+                if not is_last:
+                    nxt_lyr = self.layers[idx + 1]
+                    attn_in, residual = torch.ops.vllm.muse_sw_rmsnorm_bf16(
+                        mlp_out,
+                        residual,
+                        lyr.post_feedforward_layernorm.weight,
+                        nxt_lyr.input_layernorm.weight,
+                        float(lyr.post_feedforward_layernorm.eps),
+                        float(nxt_lyr.input_layernorm.eps),
+                        False,
+                    )
+                else:
+                    return torch.ops.vllm.muse_final_post_norm(
+                        mlp_out,
+                        residual,
+                        lyr.post_feedforward_layernorm.weight,
+                        self.norm.weight,
+                        float(lyr.post_feedforward_layernorm.eps),
+                        float(self.norm.eps),
+                    )
+
         aux_hidden_states = self._maybe_add_hidden_state(
             [], self.start_layer, hidden_states, None
         )
@@ -1963,33 +2553,8 @@ class MuseGlimmerForCausalLM(
             logits = cap * torch.tanh(logits / cap)
         return logits
 
-    def prepare_final_sample_tile(self, n: int):
-        if n != 512 or not get_pp_group().is_last_rank or not get_pp_group().is_first_rank:
-            return None
-        try:
-            import muse_final_slab
-        except (ImportError, OSError):
-            return None
-        return muse_final_slab.prepare(self.model.layers[self.model.end_layer - 1].mlp)
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-    def process_weights_after_loading(self) -> None:
-        # LOCAL PATCH (SP5D, Yukon submission 98c1361e; decode argmax only): lmpost's fused softcap + argmax for a
-        # one-row greedy step without logprobs (GPUModelRunner.sample). Its 64K-entry table is this model's
-        # compute_logits chain (x * output_multiplier, then cap * tanh(x / cap)) evaluated by the same torch ops on
-        # every BF16 value; ties go to the lowest index, as the stock greedy sampler's block argmax + argmax.
-        self._lmpost_softcap_argmax = None
-        try:
-            import lmpost
-        except ImportError:
-            return
-        lm_head = getattr(self, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight") or not lmpost.available(lm_head.weight.device):
-            return
-        dev = lm_head.weight.device
-        lmpost._get_lut(dev, self.output_multiplier, self.final_logit_softcapping)
-        lmpost._get_scratch(dev)
-        self._lmpost_softcap_argmax = lmpost.softcap_argmax
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        _verify_exact_norm_rope_once(self.model)
+        return loaded

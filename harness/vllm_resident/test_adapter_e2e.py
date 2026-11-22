@@ -21,8 +21,6 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from backends import FakeBackend  # noqa: E402
-from resident import Session  # noqa: E402
 from test_resident import PROMPT, serial_stream  # noqa: E402
 
 ENGINE = os.path.join(HERE, "..", "protocol-adapter", "target", "release", "cuda-engine")
@@ -89,54 +87,6 @@ class AdapterEndToEnd(unittest.TestCase):
                     self.assertEqual(begin["effective_spec"]["mtp"]["depth"], depth)
                     self.assertGreater(run["drafted_total"], 0)
 
-    def test_split_serial_run_keeps_counters_and_restores_raw_logits_at_the_gate(self):
-        _, sock = self.boot(0)
-        counts = (1, 31, 96)
-        reference = Session(FakeBackend())
-        seed = reference.sync(PROMPT)
-        want_gate = reference.top_logits(8)
-        forced = seed + 1
-        want_gate_token = reference.eval(forced)
-        want_step = reference.top_logits(8)
-        want = serial_stream(sum(counts))
-        requests = [
-            {"kind": "free_decode_begin", "seed_tokens": PROMPT},
-            *({"kind": "free_decode_run", "count": count} for count in counts),
-            {"kind": "phase_diagnostics"},
-            {"kind": "free_decode_begin", "seed_tokens": PROMPT},
-            {"kind": "free_decode_run", "count": 1},
-            {"kind": "phase_diagnostics"},
-            {"kind": "correctness_begin", "prompt_tokens": PROMPT},
-            {"kind": "correctness_step", "token": forced},
-            {"kind": "phase_diagnostics"},
-        ]
-        replies = self.phase(sock, [dict(r, id=i) for i, r in enumerate(requests, 1)])
-        self.assertTrue(all(r["ok"] for r in replies[1:]), replies)
-        _, begin, *runs, close = replies[:6]
-        fresh_begin, fresh_run, fresh_close, gate, gate_step, gate_close = replies[6:]
-        self.assertEqual(begin["seed_token"], seed)
-        self.assertEqual(begin["effective_spec"], {"mode": "serial"})
-        offset = 0
-        for count, run in zip(counts, runs):
-            self.assertEqual(run["tokens"], want[offset : offset + count])
-            self.assertEqual(run["acceptance_lengths"], [1] * count)
-            self.assertEqual(run["committed_total"], count)
-            self.assertEqual(run["drafted_total"], 0)
-            self.assertEqual(run["accepted_total"], 0)
-            self.assertNotIn("verify_replay_disagreements", run)
-            offset += count
-        self.assertEqual(close["completed_work"], 1 + sum(counts))
-        self.assertEqual(fresh_begin["seed_token"], seed)
-        self.assertEqual(fresh_run["tokens"], want[:1])
-        self.assertEqual(fresh_close["completed_work"], 2)
-        self.assertEqual(gate["token"], seed)
-        self.assertEqual(gate_step["token"], want_gate_token)
-        self.assertEqual(gate_close["completed_work"], 2)
-        for reply, (ids, logits) in ((gate, want_gate), (gate_step, want_step)):
-            self.assertEqual(
-                reply["top_logits"], [{"token": t, "logit": v} for t, v in zip(ids, logits)]
-            )
-
     def resident_log(self) -> list[str]:
         self.log_file.flush()
         with open(self.log_path) as fp:
@@ -168,40 +118,6 @@ class AdapterEndToEnd(unittest.TestCase):
         closed = next(i for i, l in enumerate(log) if "phase 1 closed" in l)
         self.assertEqual(len(stops), 1, log)
         self.assertLess(stops[0], closed, "the free run is stopped inside its own connection")
-
-    def test_a_whole_leg_on_one_connection_keeps_the_gate_top8(self):
-        """The leg's order on ONE worker: the timed prefill and the free run
-        sync argmax-only (no top-k computed), then the correctness gate syncs
-        with top-k and reports top-8 on every step."""
-        _, sock = self.boot(3)
-        spec = {"mode": "mtp", "mtp": {"depth": 3}}
-        want = serial_stream(33)
-        seed = Session(FakeBackend(depth=0)).sync(PROMPT)
-        replies = self.phase(
-            sock,
-            [
-                {"id": 1, "kind": "prefill", "prompt_tokens": PROMPT},
-                {"id": 2, "kind": "prefill", "prompt_tokens": PROMPT},
-                {"id": 3, "kind": "phase_diagnostics"},
-                {"id": 4, "kind": "free_decode_begin", "seed_tokens": PROMPT, "spec": spec},
-                {"id": 5, "kind": "free_decode_run", "count": 32},
-                {"id": 6, "kind": "phase_diagnostics"},
-                {"id": 7, "kind": "correctness", "prompt_tokens": PROMPT, "steps": 33},
-                {"id": 8, "kind": "phase_diagnostics"},
-                {"id": 9, "kind": "correctness_begin", "prompt_tokens": PROMPT},
-                {"id": 10, "kind": "correctness_step", "token": seed},
-                {"id": 11, "kind": "phase_diagnostics"},
-            ],
-        )
-        self.assertTrue(all(r.get("ok", True) for r in replies[1:]), replies)
-        self.assertEqual(replies[2]["token"], seed)
-        self.assertEqual(replies[4]["seed_token"], seed)
-        self.assertEqual(replies[5]["tokens"], want[:32])
-        self.assertEqual(replies[7]["tokens"], [seed] + want[:32])
-        self.assertEqual(len(replies[9]["top_logits"]), 8)
-        self.assertEqual(replies[9]["top_logits"][0]["token"], seed)
-        self.assertEqual(replies[10]["token"], want[0])
-        self.assertEqual(len(replies[10]["top_logits"]), 8)
 
     def test_correctness_phase_reports_top8(self):
         _, sock = self.boot(0)

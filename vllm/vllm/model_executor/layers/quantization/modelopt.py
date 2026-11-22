@@ -524,32 +524,6 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
         self.fp8_linear.process_weights_after_loading(layer)
-        if (getattr(layer, "tp_size", None) == 1
-                and list(layer.logical_widths) == [19968, 19968]
-                and getattr(layer, "input_size_per_partition", None) == 6656
-                and getattr(layer, "bias", None) is None
-                and self.input_dtype == self.out_dtype == torch.bfloat16
-                and layer.input_scale.dtype == layer.weight_scale.dtype == torch.float32
-                and layer.input_scale.numel() == layer.weight_scale.numel() == 1
-                and self.fp8_linear.input_quant_key() == kFp8StaticTensorSym):
-            from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
-                CutlassFP8ScaledMMLinearKernel,
-            )
-            from vllm.model_executor.layers.quantization.utils.glimmer_fp8 import (
-                prepare_fp8_swiglu_weight,
-            )
-
-            if isinstance(self.fp8_linear, CutlassFP8ScaledMMLinearKernel):
-                packed = prepare_fp8_swiglu_weight(layer.weight)
-                if packed is not None:
-                    layer.register_buffer("paired_fp8_swiglu_weight", packed, persistent=False)
-        if (getattr(layer, "input_size_per_partition", None) == 19968
-                and getattr(layer, "output_size_per_partition", None) == 6656
-                and getattr(layer, "tp_size", None) == 1
-                and getattr(layer, "input_is_parallel", False)
-                and layer.input_scale.dtype == torch.float32
-                and self.fp8_linear.input_quant_key() == kFp8StaticTensorSym):
-            layer.marlin_swiglu_fp8_input = True
 
     def apply(
         self,
