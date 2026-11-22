@@ -887,7 +887,17 @@ __global__ void Marlin(
           // Only fetch scales if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
             if (s_sh_wr_pred) {
+#if defined(GM_CODED) && GM_CODED
+              {  // 6-bit coded group scales: 8 B low-nibble plane + 4 B 2-bit high plane per 16 scales
+                uint32_t sa = static_cast<uint32_t>(__cvta_generic_to_shared(&sh_s_stage[s_sh_wr]));
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"(sa),
+                             "l"(reinterpret_cast<const int2*>(scales_ptr) + s_gl_rd));
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(sa + 8u),
+                             "l"(reinterpret_cast<const int*>(zp_ptr) + s_gl_rd));
+              }
+#else
               cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
+#endif
             }
             s_gl_rd += s_gl_rd_delta * s_tb_groups;
           }
@@ -1007,9 +1017,26 @@ __global__ void Marlin(
             reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
                 sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
           } else {
+#if defined(GM_CODED) && GM_CODED
+            {  // rebuild the 8 identical scale bytes: code = byte - per-tensor base (codes 0..63)
+              int idx2 = s_sh_rd + cur_group_id * (2 * s_sh_stride);
+              const uint32_t* w = reinterpret_cast<const uint32_t*>(sh_s_stage + (idx2 >> 1));
+              uint32_t lo = w[idx2 & 1];
+              uint32_t hi = w[2] >> (16 * (idx2 & 1));
+              const uint32_t base4 = static_cast<uint32_t>(__ldg(reinterpret_cast<const uint8_t*>(g_idx))) * 0x01010101u;
+              uint32_t l0 = lo & 0xFFFFu, l1 = lo >> 16, h0 = hi & 0xFFu, h1 = (hi >> 8) & 0xFFu;
+              uint32_t c0 = (l0 & 0xFu) | ((l0 & 0xF0u) << 4) | ((l0 & 0xF00u) << 8) | ((l0 & 0xF000u) << 12);
+              uint32_t c1 = (l1 & 0xFu) | ((l1 & 0xF0u) << 4) | ((l1 & 0xF00u) << 8) | ((l1 & 0xF000u) << 12);
+              c0 |= ((h0 & 3u) | ((h0 & 0xCu) << 6) | ((h0 & 0x30u) << 12) | ((h0 & 0xC0u) << 18)) << 4;
+              c1 |= ((h1 & 3u) | ((h1 & 0xCu) << 6) | ((h1 & 0x30u) << 12) | ((h1 & 0xC0u) << 18)) << 4;
+              reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
+                  make_int2(static_cast<int>(__vadd4(c0, base4)), static_cast<int>(__vadd4(c1, base4)));
+            }
+#else
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
                 reinterpret_cast<int2*>(
                     sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
+#endif
           }
         } else if (group_blocks >= b_sh_wr_iters) {
           if constexpr (!is_8bit_scale) {
