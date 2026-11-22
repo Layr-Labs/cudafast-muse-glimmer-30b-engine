@@ -46,6 +46,10 @@
     {
       "file": "vllm/v1/engine/core_client.py, vllm/v1/worker/hostfast.py (new)",
       "why": "in-process engine core for the single-request engine loop: InprocClient pauses automatic garbage collection while the engine has work and drains a finished request's queued batch on abort (no busy loop does it in this mode); hostfast.py also restricts the process to the highest-capacity CPU cores when the cores differ, failing soft (VLLM_HOSTFAST_GC=0 and VLLM_HOSTFAST_PIN=0 switch each off)"
+    },
+    {
+      "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/prefill_graph.py (new)",
+      "why": "whole-forward CUDA graph for one fresh, unpadded, single-request 512-token prefill (the fixture's seed length), captured at boot after the dispatcher's graphs in its own pool from the eager forward's own kernels; a step replays it only when every host scalar of its attention metadata and model inputs equals the captured one and every device tensor has the captured shape, dtype and strides, else it runs eager; logits stay outside the graph (port of kshitij-hash ff28cfe8, itself a V2-runner port of ArthurOstapenko c1e4b913)"
     }
   ],
   "carried_from": {
