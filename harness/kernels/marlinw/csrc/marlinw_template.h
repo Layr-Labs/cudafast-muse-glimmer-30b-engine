@@ -388,8 +388,13 @@ __global__ void Marlin(
 #ifdef MARLINW_SWIGLU
   // Exactly eight 64-row chunks, each with an independent full K reduction.
   // Neighboring CTAs reuse the same gate/up weight columns across those chunks.
+#ifdef MARLINW_SINGLE_SLAB
+  const int par_id = 0;
+  const int slice_col = blockIdx.x;
+#else
   const int par_id = blockIdx.x % 8;
   const int slice_col = blockIdx.x / 8;
+#endif
   constexpr int slice_row = 0, slice_idx = 0, slice_count = 1, locks_off = 0;
   int slice_iters = 6656 / (16 * thread_k_blocks);
   A = A0 + (16 * thread_m_blocks / 8) * par_id * lda;

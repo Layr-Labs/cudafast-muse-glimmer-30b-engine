@@ -47,6 +47,11 @@ except (ImportError, OSError):
     marlinw_down = None
 
 try:
+    import muse_final_slab
+except (ImportError, OSError):
+    muse_final_slab = None
+
+try:
     from muse_marlin_gemv import prepare_decode_layout
 except (ImportError, OSError):
     prepare_decode_layout = None
@@ -242,6 +247,10 @@ def _marlin_fp4_wide(
         if out is not None:
             return out
     if marlinw_down is not None and down_work is not None and down_work_ptr is not None:
+        if muse_final_slab is not None and x.shape[0] == muse_final_slab.ROWS:
+            out = muse_final_slab.down_if_active(x, weight, weight_scale, weight_global_scale)
+            if out is not None:
+                return out
         out = marlinw_down.gemm(
             x, weight, weight_scale, weight_global_scale, down_work, down_work_ptr, down_slots
         )
@@ -305,6 +314,10 @@ direct_register_custom_op(
 def _marlin_fp4_swiglu(
     x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, global_scale: torch.Tensor
 ) -> torch.Tensor:
+    if muse_final_slab is not None and x.shape[0] == muse_final_slab.ROWS:
+        out = muse_final_slab.gate_if_active(x, weight)
+        if out is not None:
+            return out
     return marlin_swiglu.gemm(x, weight, scales, global_scale)
 
 

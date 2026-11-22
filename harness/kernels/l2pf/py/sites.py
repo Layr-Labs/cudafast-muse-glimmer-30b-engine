@@ -59,6 +59,12 @@ MLP = os.environ.get("L2PF_MLP", "1") != "0"
 BYTES_MLP_NORM = _env_bytes("L2PF_MB_MLP_NORM", (9 << 20) // 4)
 BYTES_MLP_ACT = _env_bytes("L2PF_MB_MLP_ACT", 1 << 19)
 
+# Compressed one-row projections measured with the same captured stream edges.
+_RANS_SKIP_PREFETCH = {
+    (6656, 4096, True),
+    (4608, 6656, False),
+}
+
 
 def available() -> bool:
     return ENABLED and lib() is not None
@@ -263,6 +269,12 @@ def _targets():
     except (AttributeError, RuntimeError):
         pass
     try:
+        lane_bf16 = torch.ops.vllm.muse_bf16_lane_linear
+        lane_bf16.default  # noqa: B018
+        out.append((lane_bf16, "default", "muse_bf16_lane", False))
+    except (AttributeError, RuntimeError):
+        pass
+    try:
         from torch._inductor.select_algorithm import extern_kernels
 
         if hasattr(extern_kernels, "mm"):
@@ -297,6 +309,8 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[2],)
         if kind in ("cutlass_fp8", "mm"):
             return (args[1],)
+        if kind == "muse_bf16_lane" and args[0].shape[0] == 1 and args[0].is_contiguous():
+            return (args[2],)
         if kind == "marlin_tiled":
             return (args[1], args[2])
     except IndexError:
@@ -312,6 +326,7 @@ class _Site:
     descs: list = field(default_factory=list)
     off: int = 0
     mlp: str = ""  # "norm" / "act": a GEMM above MAX_WEIGHT after a norm / an activation
+    unassisted: bool = False
 
 
 class Session:
@@ -408,7 +423,17 @@ class Session:
                 site.mlp = "act" if prev_big else "norm"
                 site.descs = weight_descs(ws, mlp_budget(len(ws), prev_big))
             else:
-                site.descs = weight_descs(ws, budget(wbytes, site.after_attn))
+                nbytes = budget(wbytes, site.after_attn)
+                if kind == "musefp8":
+                    a, weight, packed, sa, sb = args
+                    k, n = weight.shape
+                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
+                            and a.is_contiguous() and 0 < packed.numel() != n * k):
+                        from vllm.model_executor.kernels.linear.scaled_mm.muse_fp8 import _scales_ok
+                        if _scales_ok(sa, sb, n):
+                            nbytes = 0
+                            site.unassisted = True
+                site.descs = weight_descs(ws, nbytes)
             if self.ranges is not None and not _inside(site.descs, self.ranges):
                 site.descs = []
         except Exception:  # noqa: BLE001 - a site without ranges is still a site
@@ -488,9 +513,12 @@ class Session:
                    f"{BYTES_MLP_ACT / (1 << 20):.2f} MiB)")
         else:
             big = "skipped"
+        ua = sum(1 for s in self.sites if s.unassisted and s.after_attn)
+        ub = sum(1 for s in self.sites if s.unassisted and not s.after_attn)
         return (f"{self.prefetched} of {len(self.sites)} GEMM sites"
                 f"{' (stopped at a mismatch)' if self.stopped else ''}; "
                 f"{na} after attention at {BYTES_AFTER_ATTN / (1 << 20):.1f} MiB, "
                 f"{nb} others at {BYTES_OTHER / (1 << 20):.1f} MiB, "
                 f"weights above {MAX_WEIGHT / (1 << 20):.0f} MiB: {big}; "
-                f"{mb:.0f} MiB per step")
+                f"{mb:.0f} MiB per step; compressed FP8 sites left without prefetch: "
+                f"{ua} output after attention, {ub} QKV")
