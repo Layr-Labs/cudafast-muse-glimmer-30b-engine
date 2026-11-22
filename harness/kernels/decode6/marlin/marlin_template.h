@@ -1819,21 +1819,14 @@ __global__ void Marlin(
       return;
     }
 
-    // One-row decode (SP5D, Yukon submission 98c1361e): with m_block_size_8 the token index of a C fragment
-    // element is (lane % 4) * 2 + {0, 1} (write_result's c_sh_wr), so only lanes with lane % 4 == 0 hold token 0;
-    // the other lanes carry padded tokens 2..7, which are never stored. They skip the fp32 partial-sum exchange.
-    // Each thread reads back only its own C_tmp slot, so the real lanes add the same values in the same order.
-    // (Without m_block_size_8 the row of an element is lane / 4, so the skip is limited to that layout.)
-    if (m_block_size_8 && prob_m == 1 && (threadIdx.x & 3) != 0) {
-      return;
-    }
-
     if (!first) {
       float* frag_c_ptr = reinterpret_cast<float*>(&frag_c);
   #pragma unroll
       for (int k = 0; k < th_size; k += (m_block_size_8 ? 2 : 1)) {
-        int4 tmp = C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
-        const float* sh_c_ptr = reinterpret_cast<const float*>(&tmp);
+        sh_red[threadIdx.x] =
+            C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
+
+        float* sh_c_ptr = reinterpret_cast<float*>(&sh_red[threadIdx.x]);
   #pragma unroll
         for (int f = 0; f < 4; f++) {
           frag_c_ptr[k * 4 + f] += sh_c_ptr[f];
