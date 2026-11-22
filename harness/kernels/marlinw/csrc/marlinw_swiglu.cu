@@ -25,7 +25,12 @@ extern "C" int swiglu_gemm(const void* x, const void* w, const void* scales,
                            const void* global, void* out, int stride, cudaStream_t stream) {
   constexpr int m = 512, n = 39936, k = 6656;
   if (stride < k || stride % 8) return cudaErrorInvalidValue;
-  kernel<<<(m / 64) * (n / 128), 128, shared, stream>>>(
+#ifdef MARLINW_SINGLE_SLAB
+  constexpr int rows = 64;
+#else
+  constexpr int rows = m;
+#endif
+  kernel<<<(rows / 64) * (n / 128), 128, shared, stream>>>(
       static_cast<const int4*>(x), static_cast<const int4*>(w),
       static_cast<int4*>(out), nullptr, nullptr, nullptr, static_cast<const int4*>(scales),
       static_cast<const float*>(global), nullptr, nullptr, k / 16, m, n, k, stride,

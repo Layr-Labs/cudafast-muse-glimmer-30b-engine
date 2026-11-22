@@ -1439,6 +1439,15 @@ class MuseGlimmerAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.output_gate_proj",
             )
+        if tp_size == 1:
+            try:
+                from muse_bf16_lane import enable as enable_bf16_lane
+            except ImportError:
+                pass
+            else:
+                enable_bf16_lane(self.qkv_proj)
+                if self.use_output_gate:
+                    enable_bf16_lane(self.output_gate_proj)
         self.gate_fork_point = (
             _gate_side_stream_fork_point(self.output_gate_proj)
             if self.use_output_gate
@@ -1953,6 +1962,15 @@ class MuseGlimmerForCausalLM(
             cap = self.final_logit_softcapping
             logits = cap * torch.tanh(logits / cap)
         return logits
+
+    def prepare_final_sample_tile(self, n: int):
+        if n != 512 or not get_pp_group().is_last_rank or not get_pp_group().is_first_rank:
+            return None
+        try:
+            import muse_final_slab
+        except (ImportError, OSError):
+            return None
+        return muse_final_slab.prepare(self.model.layers[self.model.end_layer - 1].mlp)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

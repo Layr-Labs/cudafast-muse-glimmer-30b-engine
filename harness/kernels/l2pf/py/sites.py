@@ -17,12 +17,10 @@ match the recorded ones; on the first mismatch prefetching stops for the rest
 of that capture.
 
 Ranges: the first bytes of the weight (and the same share of Marlin's block
-scales). More bytes go ahead of the GEMM that follows the attention op, the
-longest window. GEMMs whose weights exceed MAX_WEIGHT (the MLP) stream at full
-bandwidth once running, so they get a smaller head sized to the short window
-ahead of them: L2PF_MB_MLP_NORM ahead of a GEMM that follows a norm (gate_up),
-L2PF_MB_MLP_ACT ahead of one that follows another large GEMM's activation
-(down). ``L2PF_MLP=0`` skips them.
+scales). Prefetching a GEMM's head pays only for GEMMs small enough that the
+head stays in the 24 MiB L2 until it is read (attention projections); the MLP
+GEMMs stream at full bandwidth on their own and are skipped. More bytes go
+ahead of the GEMM that follows the attention op, the longest window.
 ``marlin_descs`` (first tiles of each block's stripe) is kept for experiments;
 it is not used by the session.
 """
@@ -48,16 +46,18 @@ def _env_bytes(name: str, default: int) -> int:
 
 # Bytes per site: after an attention op (the long latency-bound window) and
 # after any other GEMM (one fused norm/activation kernel in between). GEMMs
-# whose weights exceed MAX_WEIGHT get the MLP budgets below instead: a head
-# that fits the window ahead of them (the norm before gate_up, the activation
-# before down).
+# whose weights exceed MAX_WEIGHT already run at full DRAM bandwidth from their
+# first microseconds; a prefetch there only competes with them.
 BYTES_AFTER_ATTN = _env_bytes("L2PF_MB_ATTN", 8 << 20)
 BYTES_OTHER = _env_bytes("L2PF_MB_OTHER", 2 << 20)
 MAX_WEIGHT = _env_bytes("L2PF_MAX_WEIGHT_MB", 64 << 20)
 BLOCKS = int(os.environ.get("L2PF_BLOCKS", "1"))
-MLP = os.environ.get("L2PF_MLP", "1") != "0"
-BYTES_MLP_NORM = _env_bytes("L2PF_MB_MLP_NORM", (9 << 20) // 4)
-BYTES_MLP_ACT = _env_bytes("L2PF_MB_MLP_ACT", 1 << 19)
+
+# Compressed one-row projections measured with the same captured stream edges.
+_RANS_SKIP_PREFETCH = {
+    (6656, 4096, True),
+    (4608, 6656, False),
+}
 
 
 def available() -> bool:
@@ -173,15 +173,6 @@ def budget(weight_bytes: int, after_attn: bool) -> int:
     return BYTES_AFTER_ATTN if after_attn else BYTES_OTHER
 
 
-def mlp_budget(n_tensors: int, after_act: bool) -> int:
-    """Bytes of the weight head ahead of a GEMM above MAX_WEIGHT; with block
-    scales (an eighth of the code bytes) the two together take the budget."""
-    if not MLP:
-        return 0
-    nbytes = BYTES_MLP_ACT if after_act else BYTES_MLP_NORM
-    return nbytes * 8 // 9 if n_tensors > 1 else nbytes
-
-
 def weight_descs(ws: tuple[torch.Tensor, ...], nbytes: int) -> list[tuple[int, int, int, int]]:
     """The first nbytes of the weight (ws[0]) and the same share of its block
     scales (ws[1], one byte per 16 four-bit codes: an eighth of the bytes)."""
@@ -263,6 +254,12 @@ def _targets():
     except (AttributeError, RuntimeError):
         pass
     try:
+        lane_bf16 = torch.ops.vllm.muse_bf16_lane_linear
+        lane_bf16.default  # noqa: B018
+        out.append((lane_bf16, "default", "muse_bf16_lane", False))
+    except (AttributeError, RuntimeError):
+        pass
+    try:
         from torch._inductor.select_algorithm import extern_kernels
 
         if hasattr(extern_kernels, "mm"):
@@ -297,6 +294,8 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[2],)
         if kind in ("cutlass_fp8", "mm"):
             return (args[1],)
+        if kind == "muse_bf16_lane" and args[0].shape[0] == 1 and args[0].is_contiguous():
+            return (args[2],)
         if kind == "marlin_tiled":
             return (args[1], args[2])
     except IndexError:
@@ -311,7 +310,7 @@ class _Site:
     after_attn: bool
     descs: list = field(default_factory=list)
     off: int = 0
-    mlp: str = ""  # "norm" / "act": a GEMM above MAX_WEIGHT after a norm / an activation
+    unassisted: bool = False
 
 
 class Session:
@@ -330,7 +329,6 @@ class Session:
         self._i = 0
         self._pending = False
         self._attn = False
-        self._prev_big = False
 
     # -- patching
     @contextlib.contextmanager
@@ -374,7 +372,6 @@ class Session:
         self.sites = []
         self.stopped = False
         self._attn = False
-        self._prev_big = False
         with self._patched(self._on_record, True):
             yield
         if not self.stopped:
@@ -400,15 +397,19 @@ class Session:
         ws = _weights_of(kind, args)
         site = _Site(kind, key, self._attn)
         self._attn = False
-        prev_big, self._prev_big = self._prev_big, False
         try:
             wbytes = sum(_dense_span(w)[1] for w in ws)
-            if wbytes > MAX_WEIGHT:
-                self._prev_big = True
-                site.mlp = "act" if prev_big else "norm"
-                site.descs = weight_descs(ws, mlp_budget(len(ws), prev_big))
-            else:
-                site.descs = weight_descs(ws, budget(wbytes, site.after_attn))
+            nbytes = budget(wbytes, site.after_attn)
+            if kind == "musefp8":
+                a, weight, packed, sa, sb = args
+                k, n = weight.shape
+                if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
+                        and a.is_contiguous() and 0 < packed.numel() != n * k):
+                    from vllm.model_executor.kernels.linear.scaled_mm.muse_fp8 import _scales_ok
+                    if _scales_ok(sa, sb, n):
+                        nbytes = 0
+                        site.unassisted = True
+            site.descs = weight_descs(ws, nbytes)
             if self.ranges is not None and not _inside(site.descs, self.ranges):
                 site.descs = []
         except Exception:  # noqa: BLE001 - a site without ranges is still a site
@@ -477,20 +478,15 @@ class Session:
         self._fork(main, i + 1)
 
     def summary(self) -> str:
-        na = sum(1 for s in self.sites if s.descs and not s.mlp and s.after_attn)
-        nb = sum(1 for s in self.sites if s.descs and not s.mlp and not s.after_attn)
-        ng = sum(1 for s in self.sites if s.descs and s.mlp == "norm")
-        nd = sum(1 for s in self.sites if s.descs and s.mlp == "act")
+        na = sum(1 for s in self.sites if s.descs and s.after_attn)
+        nb = sum(1 for s in self.sites if s.descs and not s.after_attn)
         mb = sum(sg * c for s in self.sites for _, _, sg, c in s.descs) / (1 << 20)
-        if ng or nd:
-            big = (f"{ng + nd} MLP sites ({ng} after a norm at "
-                   f"{BYTES_MLP_NORM / (1 << 20):.2f} MiB, {nd} after an activation at "
-                   f"{BYTES_MLP_ACT / (1 << 20):.2f} MiB)")
-        else:
-            big = "skipped"
+        ua = sum(1 for s in self.sites if s.unassisted and s.after_attn)
+        ub = sum(1 for s in self.sites if s.unassisted and not s.after_attn)
         return (f"{self.prefetched} of {len(self.sites)} GEMM sites"
                 f"{' (stopped at a mismatch)' if self.stopped else ''}; "
                 f"{na} after attention at {BYTES_AFTER_ATTN / (1 << 20):.1f} MiB, "
                 f"{nb} others at {BYTES_OTHER / (1 << 20):.1f} MiB, "
-                f"weights above {MAX_WEIGHT / (1 << 20):.0f} MiB: {big}; "
-                f"{mb:.0f} MiB per step")
+                f"weights above {MAX_WEIGHT / (1 << 20):.0f} MiB skipped; "
+                f"{mb:.0f} MiB per step; compressed FP8 sites left without prefetch: "
+                f"{ua} output after attention, {ub} QKV")
