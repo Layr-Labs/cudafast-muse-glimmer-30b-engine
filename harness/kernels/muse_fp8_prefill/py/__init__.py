@@ -20,7 +20,8 @@ ENABLED = os.environ.get("MUSE_FP8_PREFILL", "1") != "0"
 # (N, K) -> kernel id in csrc/fp8_prefill.cu, chosen by paired GB10 timings at M = 512. Only the FP8 down projection
 # gains (128x192 tiles cut its 4.33-wave grid to 2.92 waves); qkv, attention gate and o_proj stay on the stock op.
 _CFG: dict[tuple[int, int], int] = {
-    (6656, 19968): 1,  # down
+    (6656, 19968): 2,  # down: 128x192x128
+    (6656, 4096): 3,   # o_proj: 128x96x128
 }
 _lib = None
 _tried = False

@@ -1242,6 +1242,15 @@ class _GateSideStream:
         self.active = False
         if not x.is_cuda or x.shape[0] > self.max_tokens:
             return
+        lane_gate = _lane_gates.get(layer_idx)
+        if lane_gate is not None and (
+            x.shape[0] != 1
+            or getattr(lane_gate, "muse_bf16_lane_weight", None) is None
+        ):
+            # An unquantized gate overlaps attention only on its admitted
+            # one-row lane GEMV; cuBLAS (any other row count, or a rejected
+            # layer) stays in order on the main stream.
+            return
         if (
             is_forward_context_available()
             and get_forward_context().cudagraph_runtime_mode
@@ -1281,6 +1290,8 @@ class _GateSideStream:
 
 
 _gate_side_stream = _GateSideStream()
+# layer_idx -> unquantized output gate projection served by muse_bf16_lane.
+_lane_gates: dict[int, nn.Module] = {}
 
 
 def muse_glimmer_gate_fork(x: torch.Tensor, layer_idx: int) -> torch.Tensor:
@@ -1348,8 +1359,14 @@ def _gate_side_stream_fork_point(gate_proj: nn.Module) -> str | None:
     if mode not in ("qkv", "attn") or not current_platform.is_cuda():
         return None
     # cuBLAS does not promise the same kernel choice while other streams are
-    # active, so unquantized projections stay on the main stream.
-    if isinstance(getattr(gate_proj, "quant_method", None), UnquantizedLinearMethod):
+    # active, so unquantized projections stay on the main stream, except those
+    # served by the muse_bf16_lane one-row GEMV, which fork only for that
+    # GEMV (see _GateSideStream.fork).
+    quant_method = getattr(gate_proj, "quant_method", None)
+    if isinstance(quant_method, UnquantizedLinearMethod) and (
+        type(quant_method).__name__ != "_MuseBF16Lane"
+        or os.environ.get("VLLM_MUSE_GLIMMER_LANE_GATE_STREAM", "1") == "0"
+    ):
         return None
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
@@ -1453,6 +1470,10 @@ class MuseGlimmerAttention(nn.Module):
             if self.use_output_gate
             else None
         )
+        if self.gate_fork_point is not None and isinstance(
+            self.output_gate_proj.quant_method, UnquantizedLinearMethod
+        ):
+            _lane_gates[self.layer_idx] = self.output_gate_proj
 
         self.rotary_emb = (
             get_rope(

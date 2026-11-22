@@ -1,41 +1,25 @@
 // =====================================================================================================================
 // muse_rans.cu -- lossless-compressed FP8 (e4m3) weights + bit-exact M=1 GEMV for GB10 (sm_121a).
 //
-//   rans_pack(W)            uint8 cuda [N,K] (FP8 e4m3 bytes, contiguous, N%8==0, K%64==0)  ->  ONE self-describing uint8 cuda blob (~0.83-0.85 x N*K)
+//   rans_pack(W)            uint8 cuda [N,K] (FP8 e4m3 bytes, contiguous, N%8==0, K%64==0)  ->  ONE self-describing uint8 cuda blob (~0.82-0.84 x N*K)
 //   rans_gemv_auto(blob, x, sb, sa, out, N, K)   out[n] = bf16_rn( sa * ( sb[n] * acc_n ) ),  acc_n = fp32 MMA chain over k32 steps (k ascending)
 //   rans_unpack(blob, N, K) -> the original bytes (bit-exact round trip; debug / verification)
 //
 // Output is BIT-IDENTICAL to vLLM cutlass_scaled_mm (SM120 FP8, M<=16 tile) and to the uncompressed kernel M1 (muse_fp8.cu fp8_gemv): the weights are
 // decoded losslessly and fed to the same mma.sync.m16n8k32 e4m3 chain (one accumulator per 8-row chunk, k32 steps in order, activation in row 0).
-// Decode never changes the arithmetic, only the bytes read from DRAM (0.83-0.85x), so M=1 decode (DRAM-bound at ~233 GB/s) gets faster by ~1/ratio.
 //
-// Format (v3 exponent-pair rANS + raw nibble plane).  A weight byte is sign(1) exp(4) man(3).  Sign|mantissa (3.93 bits of entropy) are stored RAW as a
-// 4-bit nibble; the two exponents of every adjacent weight pair form ONE symbol (alphabet 256 = ea<<4|eb, one static 12-bit-probability table per tensor)
-// coded with interleaved 32-bit rANS (L=2^16, 16-bit renormalisation, decode x = f*(x>>12) + (x&4095) - cum).  Entropy of the real FP8 layers
-// (sign 1.0 + exp 2.55 + man 2.93 bits) bounds the ratio at ~0.81; we reach ~0.83 (state headers, 4-B row alignment, 512-B group rounding).
-//   chunk  = 8 consecutive rows x K ("n-block", one MMA n8 tile).  Lane (g=lane>>2, t=lane&3) owns row g; per k32 step s it holds 8 weights:
-//            b0 = bytes k=32s+4t..+3, b1 = bytes k=32s+16+4t..+3 (exactly the MMA B fragment).
-//   stream of a chunk: [128*NS B: 32*NS initial rANS states] then for every step s: [pad to 4 B][32 x u32 nibble row][rANS renorm words of the 4 pair iterations,
-//            taken in (iteration, lane) order with ballot+popc].
-//   blob   = [256 B header][16 KB decode LUT (4096 x u32: sym | (f-1)<<8 | (slot-cum)<<20)][int32 woff16[tw+1] (stream sizes/16 B)][int32 toff[tw]][pad to 512 B][streams]
-//   `tw` virtual warps; warp w decodes chunks w, w+tw, ... (R = ceil(NB/tw) rounds).  Warp streams are cut into 512 B groups; the first gmin groups (gmin = shortest
-//            stream, header word 14) of all warps are interleaved (group g of warp w at (g*tw + w)*512) so the whole GPU streams one contiguous region, longer streams
-//            continue in a per-warp contiguous tail (at toff[w]*512): NO padding to the longest stream.  Each warp prefetches its groups into a private smem ring
-//            with cp.async (L2::evict_first hint).  Stream base is 512 B aligned (16-B-aligned-only bases cost ~25 % bandwidth).
-//   header words (u32): 0 magic 'ARNS', 1 version, 2 N, 3 K, 4 tw, 5 ns, 6 NB, 7 ilv, 8 hdr bytes, 9 woff offset, 10 stream offset, 11 stream bytes, 12/13 total bytes lo/hi, 14 gmin.
-//
-// Other entry points: rans_pack_cfg(W,tw,ns,ilv), rans_gemv_cfg(blob,x,sb,sa,out,N,K,tw,ns,wpb,rg,ilv), rans_cfg_info(N,K) -> {tw,wpb,ns,rg,ilv} of the auto policy,
-//   rans_blob_info(blob) -> {N,K,tw,ns,total_bytes,ilv,gmin} (256 B D2H, load time only), rans_blob_cfg(blob) -> launch cfg from the header, rans_prepare().
-// Contract: rans_gemv_auto assumes the blob was made by rans_pack (auto policy, deterministic in N,K); for rans_pack_cfg blobs use rans_gemv_cfg.
-//   x: uint8 [K] or [1,K] (FP8 e4m3 activations); sb: float32 [N], [N,1] or [1] (scalar); sa: float32 cuda [1]; out: bfloat16 [N] or [1,N] (written, every element).
-//   rans_gemv_* are CUDA-graph capturable (no host sync, no allocation; the one-time smem attribute is set by rans_prepare() or lazily on first launch).
-//   rans_pack* synchronises (3 tiny D2H) and allocates: call at model load, never inside a capture.  M=1 only; N%8==0, K%64==0; K <= ~79K (x is staged in smem); tuned for 48 SMs (GB10); tw <= N/8.
+// Format v7 (continuous per-warp exponent-pair rANS + raw nibble plane, 2-byte step alignment):
+//   Each virtual warp w carries ONE continuous rANS stream across all its R chunks (nb = w, w + tw, ...):
+//   [128*NS B initial rANS states ONCE per warp], then for every chunk nb and every k32 step s:
+//   [32 x u32 nibble row (2-byte aligned, no 4-byte step pad)][rANS renorm u16 words of the 4 pair iterations,
+//   in (iteration, lane) order with ballot+popc], with no inter-chunk state reset or 16-byte chunk padding.
 // =====================================================================================================================
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -69,8 +53,6 @@ __device__ __forceinline__ void rans_cp_wait() { asm volatile("cp.async.wait_gro
 __device__ __forceinline__ uint32_t rans_lds32(uint32_t addr) { uint32_t v; asm volatile("ld.shared.u32 %0, [%1];" : "=r"(v) : "r"(addr)); return v; }
 __device__ __forceinline__ uint32_t rans_lds16(uint32_t addr) { unsigned short v; asm volatile("ld.shared.u16 %0, [%1];" : "=h"(v) : "r"(addr)); return (uint32_t)v; }
 
-// physical byte offset of logical byte `lb` of warp w's stream.  ilv 9: the first `gmin` 512 B groups of every warp are interleaved (group g of warp w at g*tw+w);
-// longer streams continue in a per-warp contiguous tail (group toff[w] + g - gmin, toff = woff16[tw+1+w]) => no padding to the longest warp.
 __device__ __forceinline__ size_t rans_phys(const int* __restrict__ woff16, int tw, int gmin, int ilv, int w, uint32_t lb) {
   if (ilv == 0) return (size_t)woff16[w] * 16 + lb;
   const uint32_t g = lb >> ilv;
@@ -98,7 +80,7 @@ __global__ void rans_hist_kernel(const uint8_t* __restrict__ W, size_t n, unsign
   for (int i = threadIdx.x; i < 256; i += blockDim.x) atomicAdd(&counts[i], (unsigned long long)h[i]);
 }
 
-// ------------------------------------------------------------------------------------------------ encoder
+// ------------------------------------------------------------------------------------------------ continuous-warp encoder
 struct RansEncSym { unsigned long long rcp; uint32_t xmax_m1; uint32_t cum_nf; };
 
 __device__ __forceinline__ uint32_t rans_enc_step(uint32_t x, const RansEncSym& e, bool emit) {
@@ -106,121 +88,118 @@ __device__ __forceinline__ uint32_t rans_enc_step(uint32_t x, const RansEncSym& 
   uint32_t q = e.rcp ? (uint32_t)__umul64hi((unsigned long long)x, e.rcp) : x;
   return x + q * (e.cum_nf >> 16) + (e.cum_nf & 0xffffu);
 }
-__device__ __forceinline__ uint32_t rans_pair(uint32_t b0, uint32_t b1, int q) {  // exponent pair symbol of weights (2q, 2q+1)
+__device__ __forceinline__ uint32_t rans_pair(uint32_t b0, uint32_t b1, int q) {
   const uint32_t w = (q < 2) ? b0 : b1;
   const int sh = 16 * (q & 1);
   return (((w >> (sh + 3)) & 15u) << 4) | ((w >> (sh + 11)) & 15u);
 }
 
 template <int NS>
-__global__ void __launch_bounds__(128) rans_enc_pass1(const uint8_t* __restrict__ W, int NB, int K, const RansEncSym* __restrict__ gtab, uint8_t* __restrict__ cnt, uint32_t* __restrict__ twords) {
+__global__ void __launch_bounds__(128) rans_enc_pass1(const uint8_t* __restrict__ W, int NB, int K, int tw,
+                                                      const RansEncSym* __restrict__ gtab, uint32_t* __restrict__ wwords) {
   __shared__ RansEncSym tab[256];
   for (int i = threadIdx.x; i < 256; i += blockDim.x) tab[i] = gtab[i];
   __syncthreads();
-  const int lane = threadIdx.x & 31, wib = threadIdx.x >> 5;
-  const int nb = blockIdx.x * (blockDim.x >> 5) + wib;
-  if (nb >= NB) return;
+  const int lane = threadIdx.x & 31, w = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (w >= tw) return;
   const int g = lane >> 2, t = lane & 3, S = K >> 5;
-  const uint8_t* row = W + (size_t)(nb * 8 + g) * K;
-  uint8_t* cntp = cnt + (size_t)nb * S * 4;
+  int nblast = w;
+  while (nblast + tw < NB) nblast += tw;
   uint32_t states[NS], total = 0;
 #pragma unroll
   for (int stream = 0; stream < NS; ++stream) states[stream] = RANS_L;
-  for (int s = S - 1; s >= 0; s--) {
-    uint32_t b0 = *(const uint32_t*)(row + 32 * s + 4 * t), b1 = *(const uint32_t*)(row + 32 * s + 16 + 4 * t);
-    uint32_t cb = 0, ws = 0;
+  for (int nb = nblast; nb >= w; nb -= tw) {
+    const uint8_t* row = W + (size_t)(nb * 8 + g) * K;
+    for (int s = S - 1; s >= 0; --s) {
+      uint32_t b0 = *(const uint32_t*)(row + 32 * s + 4 * t), b1 = *(const uint32_t*)(row + 32 * s + 16 + 4 * t);
+      uint32_t ws = 0;
 #pragma unroll
-    for (int q = 3; q >= 0; q--) {
-      uint32_t& x = states[q % NS];
-      RansEncSym e = tab[rans_pair(b0, b1, q)];
-      bool emit = x > e.xmax_m1;
-      uint32_t c = __popc(__ballot_sync(0xffffffffu, emit));
-      cb |= c << (8 * q); ws += c;
-      x = rans_enc_step(x, e, emit);
+      for (int q = 3; q >= 0; --q) {
+        uint32_t& x = states[q % NS];
+        RansEncSym e = tab[rans_pair(b0, b1, q)];
+        bool emit = x > e.xmax_m1;
+        ws += __popc(__ballot_sync(0xffffffffu, emit));
+        x = rans_enc_step(x, e, emit);
+      }
+      total += 64u + ws;
     }
-    if (lane == 0) *(uint32_t*)(cntp + 4 * s) = cb;
-    total += 64u + ws + (ws & 1u);
   }
-  if (lane == 0) twords[nb] = total;
+  if (lane == 0) wwords[w] = total;
 }
 
 template <int NS>
-__global__ void __launch_bounds__(128) rans_enc_pass2(const uint8_t* __restrict__ W, int NB, int K, const RansEncSym* __restrict__ gtab, const uint8_t* __restrict__ cnt, const uint32_t* __restrict__ twords,
-                                                    const int* __restrict__ coff16, const int* __restrict__ woff16, int tw, int gmin, int ilv, uint8_t* __restrict__ stream) {
+__global__ void __launch_bounds__(128) rans_enc_pass2(const uint8_t* __restrict__ W, int NB, int K, int tw, int gmin, int ilv,
+                                                      const RansEncSym* __restrict__ gtab, const uint32_t* __restrict__ wwords,
+                                                      const int* __restrict__ woff16, uint8_t* __restrict__ stream) {
   __shared__ RansEncSym tab[256];
   for (int i = threadIdx.x; i < 256; i += blockDim.x) tab[i] = gtab[i];
   __syncthreads();
-  const int lane = threadIdx.x & 31, wib = threadIdx.x >> 5;
-  const int nb = blockIdx.x * (blockDim.x >> 5) + wib;
-  if (nb >= NB) return;
+  const int lane = threadIdx.x & 31, w = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (w >= tw) return;
   const int g = lane >> 2, t = lane & 3, S = K >> 5;
   const uint32_t lt = (1u << lane) - 1u;
-  const uint8_t* row = W + (size_t)(nb * 8 + g) * K;
-  const uint8_t* cntp = cnt + (size_t)nb * S * 4;
-  const int wrp = nb % tw;
-  const uint32_t lbase = (uint32_t)coff16[nb] * 16u + 128u * NS;  // logical byte offset of the chunk's word region inside its warp stream
-  uint32_t pos_end = twords[nb];                                    // u16 units
+  int nblast = w;
+  while (nblast + tw < NB) nblast += tw;
+  const uint32_t lbase = 128u * NS;
+  uint32_t posw = wwords[w];
   uint32_t states[NS];
 #pragma unroll
-  for (int stream = 0; stream < NS; ++stream) states[stream] = RANS_L;
-  for (int s = S - 1; s >= 0; s--) {
-    uint32_t b0 = *(const uint32_t*)(row + 32 * s + 4 * t), b1 = *(const uint32_t*)(row + 32 * s + 16 + 4 * t);
-    const uint32_t cb = *(const uint32_t*)(cntp + 4 * s);
-    const uint32_t ws = (cb & 255u) + ((cb >> 8) & 255u) + ((cb >> 16) & 255u) + (cb >> 24);
-    const uint32_t base_words = pos_end - (ws & 1u) - ws;
-    const uint32_t row_start = base_words - 64u;
-    uint32_t posw = base_words + ws;
+  for (int st = 0; st < NS; ++st) states[st] = RANS_L;
+  for (int nb = nblast; nb >= w; nb -= tw) {
+    const uint8_t* row = W + (size_t)(nb * 8 + g) * K;
+    for (int s = S - 1; s >= 0; --s) {
+      uint32_t b0 = *(const uint32_t*)(row + 32 * s + 4 * t), b1 = *(const uint32_t*)(row + 32 * s + 16 + 4 * t);
 #pragma unroll
-    for (int q = 3; q >= 0; q--) {
-      uint32_t& x = states[q % NS];
-      RansEncSym e = tab[rans_pair(b0, b1, q)];
-      posw -= (cb >> (8 * q)) & 255u;
-      bool emit = x > e.xmax_m1;
-      uint32_t m = __ballot_sync(0xffffffffu, emit);
-      if (emit) *(uint16_t*)(stream + rans_phys(woff16, tw, gmin, ilv, wrp, lbase + 2u * (posw + __popc(m & lt)))) = (uint16_t)(x & 0xffffu);
-      x = rans_enc_step(x, e, emit);
-    }
-    uint32_t nw = 0;
+      for (int q = 3; q >= 0; --q) {
+        uint32_t& x = states[q % NS];
+        RansEncSym e = tab[rans_pair(b0, b1, q)];
+        bool emit = x > e.xmax_m1;
+        uint32_t m = __ballot_sync(0xffffffffu, emit);
+        posw -= __popc(m);
+        if (emit) *(uint16_t*)(stream + rans_phys(woff16, tw, gmin, ilv, w, lbase + 2u * (posw + __popc(m & lt)))) = (uint16_t)(x & 0xffffu);
+        x = rans_enc_step(x, e, emit);
+      }
+      posw -= 64u;
+      uint32_t nw = 0;
 #pragma unroll
-    for (int i = 0; i < 8; i++) {
-      const uint32_t by = (((i < 4) ? b0 : b1) >> (8 * (i & 3))) & 255u;
-      nw |= ((((by >> 7) << 3) | (by & 7u))) << (4 * i);
+      for (int i = 0; i < 8; i++) {
+        const uint32_t by = (((i < 4) ? b0 : b1) >> (8 * (i & 3))) & 255u;
+        nw |= ((((by >> 7) << 3) | (by & 7u))) << (4 * i);
+      }
+      const uint32_t nboff = lbase + 2u * posw + 4u * lane;
+      *(uint16_t*)(stream + rans_phys(woff16, tw, gmin, ilv, w, nboff)) = (uint16_t)(nw & 0xffffu);
+      *(uint16_t*)(stream + rans_phys(woff16, tw, gmin, ilv, w, nboff + 2u)) = (uint16_t)(nw >> 16);
     }
-    *(uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, wrp, lbase + 2u * row_start + 4u * lane)) = nw;
-    pos_end = row_start;
   }
 #pragma unroll
   for (int state = 0; state < NS; ++state) {
-    const uint32_t offset = lbase - 128u * NS + 128u * state + 4u * lane;
-    *(uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, wrp, offset)) = states[state];
+    *(uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, w, 128u * state + 4u * lane)) = states[state];
   }
 }
 
 // debug unpack: scalar reassembly, direct global reads
 template <int NS>
 __global__ void __launch_bounds__(128) rans_unpack_kernel(const uint8_t* __restrict__ stream, const int* __restrict__ woff16, const uint32_t* __restrict__ lut, uint8_t* __restrict__ out, int NB, int K, int tw, int gmin, int ilv,
-                                                        int* __restrict__ status) {
+                                                          int* __restrict__ status) {
   __shared__ uint32_t lut_s[4096];
   for (int i = threadIdx.x; i < 4096; i += blockDim.x) lut_s[i] = lut[i];
   __syncthreads();
-  const int lane = threadIdx.x & 31, wib = threadIdx.x >> 5;
-  const int w = blockIdx.x * (blockDim.x >> 5) + wib;
+  const int lane = threadIdx.x & 31, w = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
   if (w >= tw) return;
   const int g = lane >> 2, t = lane & 3, S = K >> 5;
   const uint32_t lt = (1u << lane) - 1u;
-  uint32_t P = 0;
-  for (int nb = w; nb < NB; nb += tw) {
-    uint32_t states[NS];
+  uint32_t states[NS];
 #pragma unroll
-    for (int state = 0; state < NS; ++state) {
-      const uint32_t offset = P + 128u * state + 4u * lane;
-      states[state] = *(const uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, w, offset));
-    }
-    uint32_t pos = P + 128u * NS;
+  for (int state = 0; state < NS; ++state) {
+    states[state] = *(const uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, w, 128u * state + 4u * lane));
+  }
+  uint32_t pos = 128u * NS;
+  for (int nb = w; nb < NB; nb += tw) {
     uint8_t* orow = out + (size_t)(nb * 8 + g) * K;
     for (int s = 0; s < S; s++) {
-      pos = (pos + 3u) & ~3u;
-      const uint32_t nw = *(const uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, w, pos + 4u * lane));
+      const uint32_t nboff = pos + 4u * lane;
+      const uint32_t nw = (uint32_t)(*(const uint16_t*)(stream + rans_phys(woff16, tw, gmin, ilv, w, nboff))) |
+                          ((uint32_t)(*(const uint16_t*)(stream + rans_phys(woff16, tw, gmin, ilv, w, nboff + 2u))) << 16);
       pos += 128u;
       uint32_t ex[8];
 #pragma unroll
@@ -241,13 +220,11 @@ __global__ void __launch_bounds__(128) rans_unpack_kernel(const uint8_t* __restr
         orow[32 * s + ((i < 4) ? (4 * t + i) : (12 + 4 * t + i))] = (uint8_t)(((nib >> 3) << 7) | (ex[i] << 3) | (nib & 7u));
       }
     }
-    pos = (pos + 3u) & ~3u;
-    bool bad_state = false;
-#pragma unroll
-    for (int state = 0; state < NS; ++state) bad_state |= states[state] != RANS_L;
-    if (__any_sync(0xffffffffu, bad_state) && lane == 0) atomicAdd(status, 1);
-    P = (pos + 15u) & ~15u;
   }
+  bool bad_state = false;
+#pragma unroll
+  for (int state = 0; state < NS; ++state) bad_state |= states[state] != RANS_L;
+  if (__any_sync(0xffffffffu, bad_state) && lane == 0) atomicAdd(status, 1);
 }
 
 // ------------------------------------------------------------------------------------------------ decode + MMA GEMV
@@ -272,8 +249,7 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   const bool active = w < pb.tw;
   const uint8_t* ws = pb.stream;
   uint32_t wbytes = 0;
-  int gmin = 0, toffw = 0;
-  int issued = 0;
+  int gmin = 0, toffw = 0, issued = 0;
   const uint64_t pol = rans_policy_evict_first();
 #define RANS_ISSUE()                                                                                          \
   {                                                                                                         \
@@ -284,7 +260,7 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
     rans_cp_commit();                                                                                         \
     issued++;                                                                                               \
   }
-  if (active) {  // start streaming the warp's first groups now: their DRAM latency overlaps the LUT / x staging below
+  if (active) {
     ws = pb.stream + (size_t)pb.woff16[w] * 16;
     wbytes = (uint32_t)(pb.woff16[w + 1] - pb.woff16[w]) * 16u;
     gmin = (int)((const uint32_t*)pb.hdr)[14];
@@ -304,20 +280,18 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   const int g = lane >> 2, t = lane & 3;
   const uint32_t lt = (1u << lane) - 1u;
   const int NB = pb.N >> 3;
-  uint32_t P = 0;
-  for (int nb = w; nb < NB; nb += pb.tw) {
-    __syncwarp();
-    while (issued <= (int)(P >> GBS) + (RG - 1)) RANS_ISSUE();
-    rans_cp_wait<RG - 2>();
-    __syncwarp();
-    uint32_t states[NS];
+
+  // Read initial rANS states once for the continuous warp stream
+  rans_cp_wait<RG - 2>();
+  __syncwarp();
+  uint32_t states[NS];
 #pragma unroll
-    for (int state = 0; state < NS; ++state) {
-      const uint32_t offset = P + 128u * state + 4u * lane;
-      states[state] = rans_lds32(ring_s | (offset & (RB - 1u)));
-    }
-    const uint32_t wb = P + 128u * NS;
-    uint32_t pwb = wb;  // byte position (logical, within the warp stream) of the next unread byte
+  for (int state = 0; state < NS; ++state) {
+    states[state] = rans_lds32(ring_s | ((128u * state + 4u * lane) & (RB - 1u)));
+  }
+  uint32_t pwb = 128u * NS;
+
+  for (int nb = w; nb < NB; nb += pb.tw) {
     float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
     for (int s = 0; s < S; s++) {
       __syncwarp();
@@ -325,8 +299,13 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
       while (issued <= curg + (RG - 1)) RANS_ISSUE();
       rans_cp_wait<RG - 2>();
       __syncwarp();
-      pwb = (pwb + 3u) & ~3u;
-      const uint32_t nw = rans_lds32(ring_s | ((pwb + 4u * (uint32_t)lane) & (RB - 1u)));
+      const uint32_t na = pwb + 4u * (uint32_t)lane;
+      uint32_t nw;
+      if ((pwb & 2u) == 0u) {
+        nw = rans_lds32(ring_s | (na & (RB - 1u)));
+      } else {
+        nw = rans_lds16(ring_s | (na & (RB - 1u))) | (rans_lds16(ring_s | ((na + 2u) & (RB - 1u))) << 16);
+      }
       pwb += 128u;
       uint32_t Pw = 0;
 #pragma unroll
@@ -341,7 +320,6 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
         if (need) x = (x << 16) | rans_lds16(ring_s | ((pwb + (__popc(m & lt) << 1)) & (RB - 1u)));
         pwb += __popc(m) << 1;
       }
-      // SIMD-in-register reassembly of weights 0..7 = (sign|mant nibbles from nw) + (exponent pairs from Pw)
       const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
       const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
       const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
@@ -353,8 +331,6 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
       a.x = (g == 0) ? a.x : 0u; a.y = (g == 0) ? a.y : 0u;
       rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
     }
-    pwb = (pwb + 3u) & ~3u;
-    P = (P + 128u * NS + (pwb - wb) + 15u) & ~15u;
     if (lane < 4) {
       const float sa_v = __ldg(pb.sa);
       int n = nb * 8 + 2 * t;
@@ -371,26 +347,32 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
 struct RansCfg { int tw; int wpb; int ns; int rg; int ilv; };
 static inline size_t rans_round16(size_t v) { return (v + 15) & ~(size_t)15; }
 static inline size_t rans_woff_off() { return RANS_HDR_BYTES + RANS_LUT_BYTES; }
-// streams start 512 B aligned: 16-B-aligned-only group reads (cp.async 32 lanes x 16 B) ran 20-25 % slower (misaligned 512 B groups => extra DRAM/L2 sectors)
 static inline size_t rans_stream_off(int tw) { return (rans_woff_off() + (size_t)(2 * tw + 1) * 4 + 511) & ~(size_t)511; }
 static inline size_t rans_dsmem(int K, int wpb, int gbs, int rg) { size_t rb = (size_t)rg << gbs; return rans_round16((size_t)K) + rb + (size_t)wpb * rb; }
 static inline bool rans_fits(int K, int wpb, int gbs, int rg) { return rans_dsmem(K, wpb, gbs, rg) + RANS_LUT_BYTES + 1024 <= (size_t)RANS_MAX_SMEM; }
 
-// Auto policy (pure function of N,K; measured on GB10, 48 SMs): more resident warps is better until DRAM saturates, so use as many as fit:
-// R = number of chunk rounds per warp (R=1 for NB <= 864 chunks => one chunk per warp), tw = ceil(NB/R) virtual warps, wpb = ceil(tw/48) warps/SM (<= 18),
-// two interleaved rANS state sets (ns=2), 4-deep 512 B cp.async ring (rg=4), 512 B-interleaved layout (ilv=9).
+// Four interleaved rANS state sets for every shape (dadon, Yukon submission 8c0ff699): +128 B per chunk, half the
+// dependency chain per state; the GEMV was not slower on any shape. MUSERANS_NS4=0 restores four states for the
+// 6656x19968 down projection only. Read once per process, so pack and launch always agree.
+static bool rans_ns4_everywhere() {
+  static const bool on = [] {
+    const char* e = std::getenv("MUSERANS_NS4");
+    return !(e != nullptr && e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
+
 static RansCfg rans_pick_cfg(int N, int K) {
   const int NB = N / 8;
   for (int wcap = 18; wcap >= 1; wcap--) {
     const int R = (NB + 48 * wcap - 1) / (48 * wcap);
     const int tw = (NB + R - 1) / R, wpb = (tw + 47) / 48;
     if (rans_fits(K, wpb, 9, 4)) {
-      // Real checkpoint rings support four states for the 6656x19968 down projection.
-      const int states = (N == 6656 && K == 19968) ? 4 : 2;
+      const int states = (rans_ns4_everywhere() || (N == 6656 && K == 19968)) ? 4 : 2;
       return RansCfg{tw, wpb, states, 4, 9};
     }
   }
-  return RansCfg{NB, 1, 2, 4, 9};  // K too large for the smem staging of x: the launch check reports it
+  return RansCfg{NB, 1, 2, 4, 9};
 }
 
 static void rans_normalize(const int64_t* counts, int32_t* f) {
@@ -418,7 +400,7 @@ torch::Tensor rans_pack_cfg(torch::Tensor W, int64_t tw, int64_t ns, int64_t ilv
   TORCH_CHECK(N % 8 == 0 && K % 64 == 0, "need N%8==0 and K%64==0");
   TORCH_CHECK(ns == 1 || ns == 2 || ns == 4);
   TORCH_CHECK(ilv == 0 || ilv == 9, "ilv must be 0 or 9");
-  const int NB = N / 8, S = K / 32;
+  const int NB = N / 8;
   auto st = c10::cuda::getCurrentCUDAStream();
   auto dev_u8 = W.options();
   auto counts_d = torch::zeros({256}, W.options().dtype(torch::kInt64));
@@ -440,34 +422,22 @@ torch::Tensor rans_pack_cfg(torch::Tensor W, int64_t tw, int64_t ns, int64_t ilv
   }
   auto tab_d = torch::empty({256 * (int64_t)sizeof(RansEncSym)}, dev_u8);
   cudaMemcpyAsync(tab_d.data_ptr(), tab.data(), 256 * sizeof(RansEncSym), cudaMemcpyHostToDevice, st);
-  cudaStreamSynchronize(st);
-  auto cnt = torch::empty({(int64_t)NB * S * 4}, dev_u8);
-  auto twords_d = torch::empty({NB}, W.options().dtype(torch::kInt32));
-  const int blocks = (NB + 3) / 4;
-  if (ns == 4) rans_enc_pass1<4><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (uint8_t*)cnt.data_ptr(), (uint32_t*)twords_d.data_ptr());
-  else if (ns == 2) rans_enc_pass1<2><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (uint8_t*)cnt.data_ptr(), (uint32_t*)twords_d.data_ptr());
-  else rans_enc_pass1<1><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (uint8_t*)cnt.data_ptr(), (uint32_t*)twords_d.data_ptr());
-  auto twords_h = twords_d.cpu();
-  const int32_t* tw_words = (const int32_t*)twords_h.data_ptr();
-  const int R = (NB + (int)tw - 1) / (int)tw;
-  std::vector<int64_t> warp_tot(tw, 0), coff_in_warp(NB, 0);
-  for (int r = 0; r < R; r++)
-    for (int w = 0; w < tw; w++) {
-      int cidx = r * (int)tw + w;
-      if (cidx >= NB) break;
-      coff_in_warp[cidx] = warp_tot[w];
-      warp_tot[w] += (int64_t)((128 * (int)ns + 2 * (int64_t)tw_words[cidx] + 15) / 16);
-    }
-  std::vector<int32_t> woff16(tw + 1, 0), coff16(NB, 0);
-  for (int w = 0; w < tw; w++) woff16[w + 1] = (int32_t)(woff16[w] + warp_tot[w]);
-  for (int cidx = 0; cidx < NB; cidx++) coff16[cidx] = (int32_t)coff_in_warp[cidx];
+  auto wwords_d = torch::empty({tw}, W.options().dtype(torch::kInt32));
+  const int blocks = ((int)tw + 3) / 4;
+  if (ns == 4) rans_enc_pass1<4><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (int)tw, (const RansEncSym*)tab_d.data_ptr(), (uint32_t*)wwords_d.data_ptr());
+  else if (ns == 2) rans_enc_pass1<2><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (int)tw, (const RansEncSym*)tab_d.data_ptr(), (uint32_t*)wwords_d.data_ptr());
+  else rans_enc_pass1<1><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (int)tw, (const RansEncSym*)tab_d.data_ptr(), (uint32_t*)wwords_d.data_ptr());
+  auto wwords_h = wwords_d.cpu();
+  const uint32_t* ww = (const uint32_t*)wwords_h.data_ptr();
+  std::vector<int32_t> woff16(tw + 1, 0);
+  for (int w = 0; w < tw; w++) woff16[w + 1] = woff16[w] + (int32_t)((128 * (int)ns + 2 * (int64_t)ww[w] + 15) / 16);
   size_t stream_bytes = (size_t)woff16[tw] * 16;
   int32_t gmin = 0;
-  std::vector<int32_t> tab_i((size_t)(2 * tw + 1), 0);  // [woff16[0..tw]] [toff[0..tw-1]] (toff in groups, absolute)
+  std::vector<int32_t> tab_i((size_t)(2 * tw + 1), 0);
   for (int w = 0; w <= tw; w++) tab_i[w] = woff16[w];
   if (ilv > 0) {
     std::vector<int64_t> G(tw);
-    for (int w = 0; w < tw; w++) G[w] = (warp_tot[w] * 16 + ((int64_t)1 << ilv) - 1) >> ilv;
+    for (int w = 0; w < tw; w++) G[w] = ((int64_t)(woff16[w + 1] - woff16[w]) * 16 + ((int64_t)1 << ilv) - 1) >> ilv;
     gmin = (int32_t)(*std::min_element(G.begin(), G.end()));
     int64_t t = (int64_t)gmin * tw;
     for (int w = 0; w < tw; w++) { tab_i[tw + 1 + w] = (int32_t)t; t += G[w] - gmin; }
@@ -478,18 +448,15 @@ torch::Tensor rans_pack_cfg(torch::Tensor W, int64_t tw, int64_t ns, int64_t ilv
   auto blob = torch::zeros({(int64_t)total}, dev_u8);
   uint8_t* base = (uint8_t*)blob.data_ptr();
   uint32_t hdr[64] = {0};
-  hdr[0] = 0x534E5241u; hdr[1] = ns == 4 ? 6 : 4; hdr[2] = N; hdr[3] = K; hdr[4] = (uint32_t)tw; hdr[5] = (uint32_t)ns; hdr[6] = NB; hdr[7] = (uint32_t)ilv;
+  hdr[0] = 0x534E5241u; hdr[1] = 7; hdr[2] = N; hdr[3] = K; hdr[4] = (uint32_t)tw; hdr[5] = (uint32_t)ns; hdr[6] = NB; hdr[7] = (uint32_t)ilv;
   hdr[8] = (uint32_t)RANS_HDR_BYTES; hdr[9] = (uint32_t)rans_woff_off(); hdr[10] = (uint32_t)soff; hdr[11] = (uint32_t)stream_bytes; hdr[12] = (uint32_t)(total & 0xffffffffu); hdr[13] = (uint32_t)(total >> 32); hdr[14] = (uint32_t)gmin;
   cudaMemcpyAsync(base, hdr, sizeof(hdr), cudaMemcpyHostToDevice, st);
   cudaMemcpyAsync(base + RANS_HDR_BYTES, lut.data(), RANS_LUT_BYTES, cudaMemcpyHostToDevice, st);
   cudaMemcpyAsync(base + rans_woff_off(), tab_i.data(), tab_i.size() * sizeof(int32_t), cudaMemcpyHostToDevice, st);
-  auto coff_d = torch::empty({NB}, W.options().dtype(torch::kInt32));
-  cudaMemcpyAsync(coff_d.data_ptr(), coff16.data(), (size_t)NB * sizeof(int32_t), cudaMemcpyHostToDevice, st);
-  cudaStreamSynchronize(st);
   const int* woff_dev = (const int*)(base + rans_woff_off());
-  if (ns == 4) rans_enc_pass2<4><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (const uint8_t*)cnt.data_ptr(), (const uint32_t*)twords_d.data_ptr(), (const int*)coff_d.data_ptr(), woff_dev, (int)tw, (int)gmin, (int)ilv, base + soff);
-  else if (ns == 2) rans_enc_pass2<2><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (const uint8_t*)cnt.data_ptr(), (const uint32_t*)twords_d.data_ptr(), (const int*)coff_d.data_ptr(), woff_dev, (int)tw, (int)gmin, (int)ilv, base + soff);
-  else rans_enc_pass2<1><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (const uint8_t*)cnt.data_ptr(), (const uint32_t*)twords_d.data_ptr(), (const int*)coff_d.data_ptr(), woff_dev, (int)tw, (int)gmin, (int)ilv, base + soff);
+  if (ns == 4) rans_enc_pass2<4><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (int)tw, (int)gmin, (int)ilv, (const RansEncSym*)tab_d.data_ptr(), (const uint32_t*)wwords_d.data_ptr(), woff_dev, base + soff);
+  else if (ns == 2) rans_enc_pass2<2><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (int)tw, (int)gmin, (int)ilv, (const RansEncSym*)tab_d.data_ptr(), (const uint32_t*)wwords_d.data_ptr(), woff_dev, base + soff);
+  else rans_enc_pass2<1><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (int)tw, (int)gmin, (int)ilv, (const RansEncSym*)tab_d.data_ptr(), (const uint32_t*)wwords_d.data_ptr(), woff_dev, base + soff);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   cudaStreamSynchronize(st);
   return blob;
@@ -505,7 +472,7 @@ std::vector<int64_t> rans_blob_info(torch::Tensor blob) {
   auto h = blob.narrow(0, 0, 256).cpu();
   const uint32_t* p = (const uint32_t*)h.data_ptr();
   TORCH_CHECK(p[0] == 0x534E5241u, "bad blob magic");
-  TORCH_CHECK((p[1] == 4 && (p[5] == 1 || p[5] == 2)) || (p[1] == 6 && p[5] == 4), "bad rANS stream format");
+  TORCH_CHECK(p[1] == 7 && (p[5] == 1 || p[5] == 2 || p[5] == 4), "bad rANS stream format");
   return {(int64_t)p[2], (int64_t)p[3], (int64_t)p[4], (int64_t)p[5], (int64_t)(((uint64_t)p[13] << 32) | p[12]), (int64_t)p[7], (int64_t)p[14]};
 }
 
@@ -525,7 +492,6 @@ torch::Tensor rans_unpack(torch::Tensor blob, int64_t N, int64_t K) {
   return out;
 }
 
-// one-time opt-in of the dynamic-smem limit of every kernel instance; legal even while the calling stream is being captured (relaxed capture mode)
 static void rans_set_attrs_once() {
   static bool done = false;
   if (done) return;
@@ -578,14 +544,16 @@ void rans_gemv_auto(torch::Tensor blob, torch::Tensor x, torch::Tensor sb, torch
 
 std::vector<int64_t> rans_cfg_info(int64_t N, int64_t K) { RansCfg c = rans_pick_cfg((int)N, (int)K); return {c.tw, c.wpb, c.ns, c.rg, c.ilv}; }
 
-// launch config {tw, wpb, ns, rg, ilv} of a blob from its header (one 256 B D2H: call at load time, never inside a graph); wpb/rg are launch-time choices
 std::vector<int64_t> rans_blob_cfg(torch::Tensor blob) {
   auto info = rans_blob_info(blob);
+  RansCfg c = rans_pick_cfg((int)info[0], (int)info[1]);
+  if (c.tw == (int)info[2] && c.ns == (int)info[3] && c.ilv == (int)info[5]) {
+    return {c.tw, c.wpb, c.ns, c.rg, c.ilv};
+  }
   const int tw = (int)info[2];
   return {tw, (tw + 47) / 48, info[3], 4, info[5]};
 }
 
-// sets the dynamic-smem opt-in of every kernel instance (also done lazily, capture-safe, by the first launch)
 void rans_prepare() { rans_set_attrs_once(); }
 
 #ifdef MUSE_RANS_STANDALONE_MODULE
