@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Decode (M <= 16) FP8 w8a8 GEMMs through glimmer_fp8_ext (harness/kernels/glimmer_fp8): CUTLASS sm120 FP8 kernels whose
-epilogue is vLLM's ScaledEpilogue arithmetic, D = bf16(scale_a * fp32(scale_b * acc)).
-The one-row measurements select a 16x32x512 tile. M=2..16 uses the 16x32x128 tile.
-The per-element k order is the same for both tiles (no split-K). Only
+epilogue is vLLM's ScaledEpilogue arithmetic, D = bf16(scale_a * fp32(scale_b * acc)), in a 16x32x128 tile instead of vLLM's 16x64x128. The per-element
+k order is the same for every tile shape (no split-K), so the output is bit-identical to ops.cutlass_scaled_mm. Only
 per-tensor scales (both scalars), no bias, bf16 output and the shapes listed in _CFG take this path; everything else, and
 every prefill, calls ops.cutlass_scaled_mm unchanged. The shape test is inside an opaque custom op."""
 import torch
@@ -34,8 +33,6 @@ def fp8_scaled_mm(a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale
             and a.is_contiguous() and b.stride(0) == 1 and b.stride(1) == b.size(0)):
         cfg = _CFG.get((b.size(1), b.size(0)))
         if cfg is not None:
-            if a.size(0) == 1:
-                cfg = 512
             return _ext.gemm(a, b, scale_a.reshape(1), scale_b.reshape(1), cfg)
     return ops.cutlass_scaled_mm(a, b, out_dtype=torch.bfloat16, scale_a=scale_a, scale_b=scale_b, bias=None)
 

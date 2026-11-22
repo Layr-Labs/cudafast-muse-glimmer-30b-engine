@@ -21,7 +21,7 @@
     },
     {
       "file": "vllm/v1/worker/gpu/cudagraph_utils.py",
-      "why": "when the optional l2pf kernel package (harness/kernels/l2pf) is importable, the FULL CUDA graph gets one extra side-stream node per GEMM that L2-prefetches the first tiles of the next GEMM's weights; the GEMM sites are recorded on the warm-up run before the capture, only model parameters are prefetched, and no kernel on the main stream changes (L2PF=0 turns it off)"
+      "why": "when the optional l2pf kernel package (harness/kernels/l2pf) is importable, the FULL CUDA graph gets one extra side-stream node per GEMM that L2-prefetches the first tiles of the next GEMM's weights; the GEMM sites are recorded on the warm-up run before the capture, only model parameters are prefetched, and no kernel on the main stream changes (L2PF=0 turns it off); GEMMs whose weights exceed 64 MiB (the MLP) get a smaller head of the buffer the kernel reads, 2.25 MiB ahead of a GEMM that follows a norm and 0.5 MiB ahead of one that follows an activation (L2PF_MLP=0 skips them)"
     },
     {
       "file": "vllm/_custom_ops.py, vllm/model_executor/kernels/linear/scaled_mm/cutlass.py, vllm/model_executor/layers/quantization/utils/glimmer_fp8.py",
@@ -48,12 +48,40 @@
       "why": "in-process engine core for the single-request engine loop: InprocClient pauses automatic garbage collection while the engine has work and drains a finished request's queued batch on abort (no busy loop does it in this mode); hostfast.py also restricts the process to the highest-capacity CPU cores when the cores differ, failing soft (VLLM_HOSTFAST_GC=0 and VLLM_HOSTFAST_PIN=0 switch each off)"
     },
     {
-      "file": "vllm/model_executor/kernels/linear/scaled_mm/cutlass.py, vllm/model_executor/kernels/linear/scaled_mm/muse_fp8.py (new); harness/kernels/musefp8 (new); harness/kernels/l2pf/py/sites.py; harness/kernels/muserans (new)",
-      "why": "one-token FP8 w8a8 GEMMs (decode) run through musefp8, a hand-written mma.sync m16n8k32 e4m3 GEMV that issues the same instruction chain in the same k order as cutlass_scaled_mm's SM120 M16 kernel and the same ScaledEpilogue (bf16_rn(scale_a * fp32(scale_b * acc))), reading a fragment-ordered copy of each weight (registered as a layer buffer) with L2 evict-first loads; every layer is admitted only after a load-time bitwise comparison with cutlass_scaled_mm; other row counts keep glimmer_fp8 / cutlass; the op is an l2pf site (MUSEFP8=0 disables, MUSEFP8_L2PF=0 drops it from the prefetch chain). When harness/kernels/muserans is built, each FP8 weight is instead stored as an exponent-pair rANS stream with raw sign|mantissa nibbles (lossless, ~0.84 of the bytes on this checkpoint) and decoded inside the same GEMV right before the same mma.sync chain, so the output bits are unchanged and the decode step reads fewer bytes; admitted per layer by the same bitwise check (MUSERANS=0 keeps the uncompressed copy) Imported from zereraz's Yukon submission cdefbb34-137b-48d9-9179-db4b540fbf57 (evaluation source 56791c43d807320c42d93b023678800489f6500c)."
+      "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/prefill_graph.py (new)",
+      "why": "whole-forward CUDA graph for one fresh, unpadded, single-request 512-token prefill (the fixture's seed length), captured at boot after the dispatcher's graphs in its own pool from the eager forward's own kernels; a step replays it only when every host scalar of its attention metadata and model inputs equals the captured one and every device tensor has the captured shape, dtype and strides, else it runs eager; logits stay outside the graph; VLLM_PREFILL_GRAPH=0 switches it off; marlinw keeps a replaced reduction scratch buffer alive, so a captured graph never points at freed memory (port of kshitij-hash ff28cfe8, itself a V2-runner port of ArthurOstapenko c1e4b913)"
     },
     {
-      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py; harness/kernels/decode6 (new)",
-      "why": "Uses zereraz's published 6-bit palette implementation from cdefbb34 / 56791c43 for one-row NVFP4 decode after the per-layer bitwise admission check. The existing BF16 and FP8 SwiGLU prefill and narrow down operation signatures preserve their arguments."
+      "file": "vllm/model_executor/kernels/linear/scaled_mm/cutlass.py, vllm/model_executor/kernels/linear/scaled_mm/muse_fp8.py (new); harness/kernels/musefp8 (new); harness/kernels/l2pf/py/sites.py; harness/kernels/muserans (new)",
+      "why": "one-token FP8 w8a8 GEMMs (decode) run through musefp8, a hand-written mma.sync m16n8k32 e4m3 GEMV that issues the same instruction chain in the same k order as cutlass_scaled_mm's SM120 M16 kernel and the same ScaledEpilogue (bf16_rn(scale_a * fp32(scale_b * acc))), reading a fragment-ordered copy of each weight (registered as a layer buffer) with L2 evict-first loads; every layer is admitted only after a load-time bitwise comparison with cutlass_scaled_mm; other row counts keep glimmer_fp8 / cutlass; the op is an l2pf site (MUSEFP8=0 disables, MUSEFP8_L2PF=0 drops it from the prefetch chain). When harness/kernels/muserans is built, each FP8 weight is instead stored as an exponent-pair rANS stream with raw sign|mantissa nibbles (lossless, ~0.84 of the bytes on this checkpoint) and decoded inside the same GEMV right before the same mma.sync chain, so the output bits are unchanged and the decode step reads fewer bytes; admitted per layer by the same bitwise check (MUSERANS=0 keeps the uncompressed copy)"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py; harness/kernels/decode6 (new); harness/kernels/l2pf/py/sites.py",
+      "why": "the M = 1 tiled NVFP4 decode GEMV reads its block scales as 6-bit codes into a per-layer 64-entry palette (lossless: 130 of 132 merged scale tensors of this checkpoint have at most 64 distinct values; the other layers keep the 8-bit path): the kernel is the same template with the scale fetch shrunk to 3/4 and the 8 scale bytes of a fragment rebuilt from two code words and palette lookups before the unchanged dequant and MMA code, so the bf16 output is bitwise the uncompressed tiled GEMV's; each layer is admitted only after a load-time bitwise comparison with marlin_tiled_decode; the op is an l2pf site"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py",
+      "why": "one-row NVFP4 calls on the tile-major decode copy of a layer without 6-bit block-scale codes run harness/kernels/marlint (the Marlin template with stock template arguments and the same tile-major addresses, persistent reduction scratch) when the layer's output equals ops.marlin_gemm bitwise at load; other such layers keep the M=1 tiled kernel; layers with 6-bit codes run the 6-bit decode GEMV"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py, vllm/model_executor/kernels/linear/scaled_mm/muse_fp8.py",
+      "why": "at load every lossless decode copy is read back and compared bit for bit with the weight tensor the stock kernel reads: each rANS stream is decoded whole (rans_unpack), each fragment-ordered FP8 copy is un-permuted, each tile-major NVFP4 weight and scale copy is moved back, and every 6-bit scale code is decoded through its palette; a copy that differs is not used (the layer keeps the stock path); the counts are logged once"
+    },
+    {
+      "file": "vllm/model_executor/models/muse_glimmer.py",
+      "why": "MuseGlimmerMLP.forward calls the NVFP4 Marlin gate_up projection with SiLU-and-mul fused into its epilogue (marlin_fp4_silu_mul) when the layer was admitted at load and its down_proj reads the activation as stored bf16 (an NVFP4 Marlin down_proj); ahead of an FP8 down_proj the compiled graph fuses the activation quantization into the SiLU-and-mul kernel on the unrounded fp32 product, so those layers keep the compiled glue; the fused activation keeps the arithmetic of the compiled SiluAndMul glue, so the output bits are unchanged"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py",
+      "why": "merged gate_up layers on the marlinw schedule get a custom op computing silu(gate) * up in marlinw's epilogue (or marlinw's standalone kernel after the GEMM for row counts without a fused plan; one-row calls use the tile-major decode GEMM first), with the same fp32 instruction chain and single bf16 rounding as the Inductor kernel it replaces; admitted per layer by a load-time bitwise comparison with the single stock call followed by the standalone kernel, which is itself compared once with a Triton copy of the Inductor kernel over every bf16 gate value"
+    },
+    {
+      "file": "vllm/model_executor/models/muse_glimmer.py, vllm/model_executor/models/muse_glimmer_glue.py (new)",
+      "why": "launches of the compiled query QK-norm + NEOX RoPE kernel with at least 128 tokens run a Triton kernel with the same per-element fp32 chain (same inputs, same operations in the same order, one bf16 rounding at the store) and plain row/head/dim indexing instead of 64-bit remainders by the symbolic token count; the swap is at the Inductor launcher, each compiled kernel object is admitted only after its first long launch outside graph capture gives bit-identical outputs from both kernels on the real inputs and on random inputs; shorter batches (every decode step) run the compiled kernel; VLLM_MUSE_GLIMMER_PROMPT_GLUE=0 switches it off"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py",
+      "why": "for the (N, K) shapes harness/kernels/marlinw lists (the MLP gate_up and down projections), prompt-sized calls on the marlinw schedule run marlinw's MarlinS kernel: the same per-element arithmetic (same code and scale dequantization, the same mma chain per k16 block parity, one fp32 add of the two warp rows, the stock k-split slices and fold order, the same epilogue and fused SiLU-and-mul) on 64 x 128 column tiles at two CTAs per SM for gate_up, each tile the half of a stock 256-column slice, and on the stock 64 x 256 tiles with a deeper cp.async pipeline and the next k16 step's codes dequantized ahead for down; admitted per layer by a load-time bitwise comparison with the single stock call at 512, 4096 and 640 rows and, for the fused op, with the single stock call followed by the standalone SiLU-and-mul kernel; a layer that differs keeps the marlinw kernel; MARLINW_SCHED=0 switches it off"
     }
   ],
   "carried_from": {

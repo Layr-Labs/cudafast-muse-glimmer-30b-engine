@@ -33,6 +33,7 @@ adapter/projection stack.
 
 import math
 import os
+import weakref
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 from typing import Annotated, Literal
@@ -60,10 +61,9 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.inputs import MultiModalDataDict
+from vllm.model_executor.kernels.linear.nvfp4.marlin import marlin_fp4_silu_mul
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
-from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym
 from vllm.model_executor.layers.attention import Attention, MMEncoderAttention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -114,6 +114,7 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+from .muse_glimmer_glue import install_prompt_glue
 from .vision import get_fp8_padded_hidden_size, is_vit_use_data_parallel
 
 logger = init_logger(__name__)
@@ -1097,48 +1098,22 @@ class MuseGlimmerMLP(nn.Module):
                 f"got `{hidden_activation}`."
             )
         self.act_fn = SiluAndMul()
-
-    def _gate_up_activation(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        return self.act_fn(gate_up)
-
-    def _paired_gate_up_activation(self, x: torch.Tensor) -> torch.Tensor:
-        proj = self.gate_up_proj
-        return torch.ops.vllm.marlin_fp4_swiglu(
-            x.contiguous(), proj.weight, proj.weight_scale, proj.weight_global_scale
-        )
-
-    def _regular_swiglu_down(self, x: torch.Tensor) -> torch.Tensor:
-        activation = self._gate_up_activation(x)
-        return self.down_proj(activation)[0]
-
-    def _paired_swiglu_fp8_down(self, x: torch.Tensor) -> torch.Tensor:
-        proj = self.gate_up_proj
-        down = self.down_proj
-        activation = torch.ops.vllm.marlin_fp4_swiglu_fp8(
-            x.contiguous(), proj.weight, proj.weight_scale, proj.weight_global_scale,
-            down.input_scale,
-        )
-        quantized = QuantizedActivation(
-            activation, down.input_scale, x.dtype, activation.shape, kFp8StaticTensorSym
-        )
-        return down(quantized)[0]
+        # Lets the fused gate_up path report whether its consumer reads bf16.
+        self.gate_up_proj.silu_mul_consumer = weakref.ref(self.down_proj)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if (torch.compiler.is_compiling() and x.ndim == 2
-                and getattr(self.gate_up_proj, "marlin_swiglu_fp8_ready", False)
-                and getattr(self.down_proj, "marlin_swiglu_fp8_input", False)):
-            return torch.cond(x.shape[0] == 512, self._paired_swiglu_fp8_down,
-                              self._regular_swiglu_down, (x,))
-        if (torch.compiler.is_compiling() and x.ndim == 2
-                and getattr(self.gate_up_proj, "marlin_swiglu_ready", False)
-                and getattr(self.down_proj, "marlin_prompt_path", None) is not None):
-            # The down projection consumes BF16 for these layers. Other quantizers
-            # can fold their activation cast into SwiGLU with different boundaries.
-            x = torch.cond(x.shape[0] == 512, self._paired_gate_up_activation,
-                           self._gate_up_activation, (x,))
+        if getattr(self.gate_up_proj, "marlin_silu_mul", False) and getattr(
+            self.down_proj, "marlin_bf16_input", False
+        ):
+            # NVFP4 Marlin gate_up with SiLU-and-mul in its epilogue (same bits).
+            # Only when down_proj reads the activation as stored bf16: an FP8
+            # down_proj quantizes it, and the compiled graph fuses that
+            # quantization into the SiLU-and-mul kernel on the unrounded fp32
+            # product, which a bf16 output cannot reproduce.
+            x = marlin_fp4_silu_mul(self.gate_up_proj, x)
         else:
-            x = self._gate_up_activation(x)
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -1563,6 +1538,10 @@ class MuseGlimmerModel(nn.Module, EagleModelMixin):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        if current_platform.is_cuda():
+            # Faster launch-level replacement of the compiled query QK-norm +
+            # RoPE kernel for long batches; same bits, checked at first use.
+            install_prompt_glue()
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,

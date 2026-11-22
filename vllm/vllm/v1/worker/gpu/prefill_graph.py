@@ -1,9 +1,9 @@
-# SPDX-License-Identifier: Apache-2.0
 """Boot-time whole-forward CUDA graph for one fresh prefill of a fixed length
 (V2 model runner).
 
-Port of the whole-forward prefill graph by ArthurOstapenko (Yukon submission
-c1e4b913), adapted to the V2 GPU model runner, to FlashAttention (FA2 on
+Port of the whole-forward prefill graph of Yukon submission c1e4b913
+(ported to this runner in submission ff28cfe8 and onto this tree in b3073f3d),
+adapted to the V2 GPU model runner, to FlashAttention (FA2 on
 sm_12x) and to models that feed the decoder `inputs_embeds` (multimodal
 checkpoints run the text embedding outside the compiled model).
 
@@ -27,8 +27,7 @@ persistent buffers the capture read, so normally nothing is copied; a device
 tensor at a different address is copied into the captured one before replay.
 The logits gather and compute_logits stay outside the graph, unchanged.
 
-Set VLLM_PREFILL_GRAPH=0 to disable; VLLM_PREFILL_GRAPH_TOKENS picks the
-length (default 512).
+The captured length is the track's seed length (PREFILL_GRAPH_TOKENS, 512).
 """
 
 from __future__ import annotations
@@ -51,6 +50,10 @@ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 logger = init_logger(__name__)
+
+PREFILL_GRAPH_TOKENS = 512
+# VLLM_PREFILL_GRAPH=0 keeps every prefill eager.
+PREFILL_GRAPH_ENABLED = os.environ.get("VLLM_PREFILL_GRAPH", "1") != "0"
 
 _SCALARS = (
     int,
@@ -75,7 +78,6 @@ def _plan(dst: Any, src: Any, pairs: list, seen: dict, path: str) -> str | None:
     if isinstance(dst, torch.Tensor):
         prev = seen.get(id(dst))
         if prev is not None:
-            # A tensor the capture shared must be fed one memory region.
             same = prev is src or (
                 prev.data_ptr() == src.data_ptr()
                 and prev.shape == src.shape
@@ -105,7 +107,6 @@ def _plan(dst: Any, src: Any, pairs: list, seen: dict, path: str) -> str | None:
     if isinstance(dst, (dict, list, tuple)) or (
         dataclasses.is_dataclass(dst) and not isinstance(dst, type)
     ):
-        # Per-layer metadata shares one object across the layers of a group.
         if seen.get(("node", id(dst))) is src:
             return None
         seen[("node", id(dst))] = src
@@ -138,7 +139,6 @@ def _plan(dst: Any, src: Any, pairs: list, seen: dict, path: str) -> str | None:
         return None
     if isinstance(dst, _SCALARS):
         return None if dst == src else f"{path}: {dst!r} != {src!r}"
-    # Unknown object: only identity or a plain-bool equality counts.
     try:
         same = dst == src
     except Exception:
@@ -148,8 +148,6 @@ def _plan(dst: Any, src: Any, pairs: list, seen: dict, path: str) -> str | None:
 
 def prefill_graph_unsupported(runner, num_tokens: int) -> str | None:
     """Why the whole-forward prefill graph cannot serve this engine."""
-    if os.environ.get("VLLM_PREFILL_GRAPH", "1") == "0":
-        return "VLLM_PREFILL_GRAPH=0"
     if not 0 < num_tokens <= min(runner.max_num_tokens, runner.max_model_len):
         return f"{num_tokens} tokens do not fit the engine"
     if runner.device.type != "cuda":
@@ -191,7 +189,10 @@ def prefill_graph_unsupported(runner, num_tokens: int) -> str | None:
 
 def capture_prefill_graph(runner) -> PrefillGraph | None:
     """Capture the graph for the runner, or None (with a log line)."""
-    num_tokens = int(os.environ.get("VLLM_PREFILL_GRAPH_TOKENS", "512"))
+    num_tokens = PREFILL_GRAPH_TOKENS
+    if not PREFILL_GRAPH_ENABLED:
+        logger.info("Prefill graph off: VLLM_PREFILL_GRAPH=0")
+        return None
     reason = prefill_graph_unsupported(runner, num_tokens)
     if reason is not None:
         logger.info("Prefill graph off: %s", reason)
@@ -200,7 +201,7 @@ def capture_prefill_graph(runner) -> PrefillGraph | None:
     try:
         with graph_capture(device=runner.device):
             graph = PrefillGraph(runner, num_tokens)
-    except Exception as exc:  # noqa: BLE001 - any failure falls back to eager
+    except Exception as exc:
         logger.warning(
             "Prefill graph off: capture failed (%s: %s); prefills run eager",
             type(exc).__name__,
@@ -208,7 +209,7 @@ def capture_prefill_graph(runner) -> PrefillGraph | None:
         )
         try:
             torch.accelerator.synchronize()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         return None
     logger.info(
@@ -230,13 +231,10 @@ class PrefillGraph:
 
         model_state = runner.model_state
         input_buffers = runner.input_buffers
-        # The step a fresh one-request prefill of n tokens builds
-        # (prepare_inputs): seq_len == query_len == n, nothing computed.
         input_batch = InputBatch.make_dummy(1, n, input_buffers)
         input_batch.prefill_len_np = np.full(1, n, dtype=np.int32)
         input_batch.is_prefilling_np = np.ones(1, dtype=np.bool_)
         block_tables = runner.block_tables.get_dummy_block_tables(1)
-        # PAD slots: the warm-up runs and the capture write no KV.
         slot_mappings = runner.block_tables.get_dummy_slot_mappings(n)
         self.slot_mappings = build_slot_mappings_by_layer(
             slot_mappings, runner.kv_cache_config
@@ -250,7 +248,6 @@ class PrefillGraph:
             runner.kv_cache_config,
             for_capture=False,
         )
-        # Same dict execute_model builds for an eager step.
         dummy = model_state.prepare_dummy_inputs(1, n)
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -272,8 +269,6 @@ class PrefillGraph:
         for _ in range(2):
             self._forward()
         torch.accelerator.synchronize()
-        # Own pool: nothing this graph allocates aliases the decode graphs'
-        # memory, so no replay order between them can clobber an output.
         self.pool = torch.cuda.graph_pool_handle()
         self.graph = torch.cuda.CUDAGraph()
         get_offloader().sync_prev_onload()

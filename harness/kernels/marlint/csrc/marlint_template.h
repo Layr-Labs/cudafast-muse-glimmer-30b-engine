@@ -19,6 +19,10 @@
  * Adapted from https://github.com/IST-DASLab/marlin
  */
 
+#ifndef MARLINT_TILE_MAJOR
+  #define MARLINT_TILE_MAJOR 0
+#endif
+
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin
 #endif
@@ -238,8 +242,7 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float,  // is zero point of float16 type?
-          const bool complete_grid = false
+          const bool is_zp_float   // is zero point of float16 type?
           >
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
@@ -379,12 +382,6 @@ __global__ void Marlin(
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
 
-  unsigned work_block = blockIdx.x;
-  if constexpr (complete_grid) {
-    // Every CTA owns one whole K reduction. Consecutive CTAs reuse one
-    // weight tile across the independently computed activation rows.
-    work_block = (blockIdx.x % parallel) * n_tiles + blockIdx.x / parallel;
-  }
   int global_mn_tiles = parallel * n_tiles;
   int part2_mn_tiles = global_mn_tiles;
   int part1_mn_iters = 0;
@@ -409,7 +406,7 @@ __global__ void Marlin(
   }
 
   int slice_row = 0;
-  int slice_col_par = work_block;
+  int slice_col_par = blockIdx.x;
   int slice_col;
   int slice_iters =
       k_tiles;  // number of threadblock tiles in the current slice
@@ -424,9 +421,9 @@ __global__ void Marlin(
   if (part2_mn_tiles >= gridDim.x) {
     // when part2_mn_tiles >= sms
     // then there are at most $sms$ conflict tile blocks
-    locks_off = work_block;
+    locks_off = blockIdx.x;
   } else {
-    locks_off = (iters * work_block) / k_tiles - 1;
+    locks_off = (iters * blockIdx.x) / k_tiles - 1;
   }
 
   // Compute all information about the current slice which is required for
@@ -434,7 +431,7 @@ __global__ void Marlin(
   bool first_init = true;
   auto init_part2_slice = [&]() {
     slice_iters =
-        iters * (work_block + 1) - (k_tiles * slice_col_par + slice_row);
+        iters * (blockIdx.x + 1) - (k_tiles * slice_col_par + slice_row);
     if (slice_iters < 0 || slice_col_par >= part2_mn_tiles) slice_iters = 0;
     if (slice_iters == 0) return;
     if (slice_row + slice_iters > k_tiles) slice_iters = k_tiles - slice_row;
@@ -445,7 +442,7 @@ __global__ void Marlin(
       int col_off = col_first - k_tiles * slice_col_par;
       slice_count = div_ceil(k_tiles - col_off, iters);
       if (col_off > 0) slice_count++;
-      int delta_first = iters * work_block - col_first;
+      int delta_first = iters * blockIdx.x - col_first;
       if (delta_first < 0 || (col_off == 0 && delta_first == 0))
         slice_idx = slice_count - 1;
       else {
@@ -499,20 +496,8 @@ __global__ void Marlin(
   auto init_part1_slice = [&]() {
     if (part1_mn_iters) {
       part1_mn_iters--;
-      // Interleave row tiles that read the same B tile. The complete tiles
-      // preceding the stock Stream-K tail form full rows and one short row.
-      // Only their visit order changes. Leave the tail and its reductions intact.
-      const int prefix_tiles = global_mn_tiles - part2_mn_tiles;
-      const int rows = prefix_tiles / n_tiles;
-      const int extra = prefix_tiles % n_tiles;
-      const int split = (rows + 1) * extra;
-      if (slice_col_par < split) {
-        par_id = slice_col_par % (rows + 1);
-        slice_col = slice_col_par / (rows + 1);
-      } else {
-        par_id = (slice_col_par - split) % rows;
-        slice_col = extra + (slice_col_par - split) / rows;
-      }
+      par_id = slice_col_par / n_tiles;
+      slice_col = slice_col_par % n_tiles;
       slice_iters = k_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
       C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
@@ -528,8 +513,8 @@ __global__ void Marlin(
   auto init_slice = [&]() {
     if (!in_part2 && !part1_mn_iters) {
       in_part2 = true;
-      slice_col_par = (iters * work_block) / k_tiles;
-      slice_row = (iters * work_block) % k_tiles;
+      slice_col_par = (iters * blockIdx.x) / k_tiles;
+      slice_row = (iters * blockIdx.x) % k_tiles;
       slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % n_tiles;
       par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
@@ -565,9 +550,22 @@ __global__ void Marlin(
   constexpr int a_sh_wr_iters = div_ceil(a_sh_stage, a_sh_wr_delta);
 
   // B sizes/strides
-  int b_gl_stride = 16 * prob_n / (pack_factor * (is_a_8bit ? 2 : 4));
   constexpr int b_sh_stride =
       ((thread_n_blocks * 16) * 16 / pack_factor) / (is_a_8bit ? 2 : 4);
+#if MARLINT_TILE_MAJOR
+  // Tile-major B: the rows of one column tile (16 * thread_n_blocks columns)
+  // are contiguous over the whole K, tile after tile, so a k16 row of the
+  // tile is b_sh_stride int4 wide and the next tile starts prob_k / 16 rows
+  // later. Only the addresses differ from the [k/16, n] layout.
+  static_assert(!is_a_8bit && b_type.size_bits() == 4 && !has_act_order &&
+                    !has_zp && group_blocks == 1,
+                "tile-major layout is implemented for NVFP4 only");
+  int b_gl_stride = b_sh_stride;
+  int b_gl_col_stride = b_sh_stride * (prob_k / 16);
+#else
+  int b_gl_stride = 16 * prob_n / (pack_factor * (is_a_8bit ? 2 : 4));
+  int b_gl_col_stride = b_sh_stride;
+#endif
   constexpr int b_thread_vecs = b_type.size_bits() == 4 ? 1 : 2;
   constexpr int b_sh_stride_threads = b_sh_stride / b_thread_vecs;
 
@@ -578,8 +576,16 @@ __global__ void Marlin(
   constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
 
   // Scale sizes/strides without act_order
-  int s_gl_stride = prob_n / (is_8bit_scale ? 16 : 8);
   constexpr int s_sh_stride = 16 * thread_n_blocks / (is_8bit_scale ? 16 : 8);
+#if MARLINT_TILE_MAJOR
+  // Tile-major scales: same order as B, one group row of a column tile is
+  // s_sh_stride int4 wide.
+  int s_gl_stride = s_sh_stride;
+  int s_gl_col_stride = s_sh_stride * (prob_k / 16);
+#else
+  int s_gl_stride = prob_n / (is_8bit_scale ? 16 : 8);
+  int s_gl_col_stride = s_sh_stride;
+#endif
   constexpr int s_tb_groups =
       !has_act_order && group_blocks != -1 && group_blocks < thread_k_blocks
           ? thread_k_blocks / group_blocks
@@ -629,7 +635,7 @@ __global__ void Marlin(
         b_gl_stride * (threadIdx.x / b_sh_stride) + (threadIdx.x % b_sh_stride);
   }
 
-  b_gl_rd += b_sh_stride * slice_col;
+  b_gl_rd += b_gl_col_stride * slice_col;
   b_gl_rd += b_gl_rd_delta_o * slice_row;
   auto b_sh_rd = threadIdx.x * b_thread_vecs;
   b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_wr_iters - 1));
@@ -651,7 +657,7 @@ __global__ void Marlin(
     } else {
       s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
                                threadIdx.x / s_sh_stride) +
-                s_sh_stride * slice_col + threadIdx.x % s_sh_stride;
+                s_gl_col_stride * slice_col + threadIdx.x % s_sh_stride;
     }
   }
   auto s_sh_wr = threadIdx.x;
@@ -2058,7 +2064,7 @@ __global__ void Marlin(
         a_gl_rd += a_gl_rd_delta_o * slice_row;
         b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride) +
                   (threadIdx.x % b_sh_stride);
-        b_gl_rd += b_sh_stride * slice_col + b_gl_rd_delta_o * slice_row;
+        b_gl_rd += b_gl_col_stride * slice_col + b_gl_rd_delta_o * slice_row;
 
         bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;
         // Update slice k/n for scales loading
@@ -2082,7 +2088,7 @@ __global__ void Marlin(
             s_gl_rd =
                 s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
                                threadIdx.x / s_sh_stride) +
-                s_sh_stride * slice_col + threadIdx.x % s_sh_stride;
+                s_gl_col_stride * slice_col + threadIdx.x % s_sh_stride;
             zp_gl_rd =
                 zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
                                 threadIdx.x / zp_sh_stride) +

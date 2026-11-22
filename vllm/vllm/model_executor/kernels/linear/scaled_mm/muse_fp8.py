@@ -37,6 +37,18 @@ except Exception:  # noqa: BLE001
     _rans = None
 
 _stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False}
+# Every packed weight read back against the loaded weight (_lossless).
+_lossless = {"rans": 0, "frag": 0, "rejected": 0}
+
+
+def _fragments_back(packed: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """Inverse of musefp8's fragment order [n/8][k/64][lane g,t][2 steps][2 halves][4 B]: the [N, K] bytes."""
+    p = packed.view(n // 8, k // 64, 8, 4, 2, 2, 4)
+    return p.permute(0, 2, 1, 4, 5, 3, 6).reshape(n, k)
+
+
+def _same_bytes(back: torch.Tensor, w_nk: torch.Tensor) -> bool:
+    return back.shape == w_nk.shape and torch.equal(back.view(torch.uint8), w_nk.view(torch.uint8))
 
 
 def _cutlass(A: torch.Tensor, B: torch.Tensor, As: torch.Tensor, Bs: torch.Tensor) -> torch.Tensor:
@@ -73,7 +85,12 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
     if _rans is not None:
         try:
             blob = _rans.rans_pack(w.t().contiguous().view(torch.uint8))
-            if _self_check(lambda xq, out: _rans.rans_gemv_auto(blob, xq.view(-1), ws.reshape(-1), xs.reshape(-1), out, n, k), w, ws, xs):
+            # Lossless: every byte of the stream decodes back to the loaded weight.
+            whole = _same_bytes(_rans.rans_unpack(blob, n, k), w.t())
+            if not whole:
+                _lossless["rejected"] += 1
+            if whole and _self_check(lambda xq, out: _rans.rans_gemv_auto(blob, xq.view(-1), ws.reshape(-1), xs.reshape(-1), out, n, k), w, ws, xs):
+                _lossless["rans"] += 1
                 _stats["admitted"] += 1
                 _stats["rans"] += 1
                 # The magic byte 'A' at blob[0] marks the compressed format for the op (one uint8 buffer either way).
@@ -83,7 +100,11 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
             logger.warning("muserans: packing or self-check failed (%s); trying musefp8", e)
     try:
         packed = _mf.pack(w.t().view(torch.uint8))
-        ok = _mf.self_check(packed, w, ws, xs, _cutlass)
+        whole = _same_bytes(_fragments_back(packed, n, k), w.t())
+        if not whole:
+            _lossless["rejected"] += 1
+        ok = whole and _mf.self_check(packed, w, ws, xs, _cutlass)
+        _lossless["frag"] += int(ok)
     except Exception as e:  # noqa: BLE001
         logger.warning("musefp8: packing or self-check failed (%s); using cutlass_scaled_mm", e)
         ok = False
@@ -121,6 +142,11 @@ def _muse_fp8_scaled_mm(
         logger.info(
             "musefp8 decode GEMV: %d FP8 layers admitted (%d of them rANS-compressed), %d rejected",
             _stats["admitted"], _stats["rans"], _stats["rejected"],
+        )
+        logger.info(
+            "musefp8 packed weights: %d rANS streams and %d fragment copies decode bit for bit to the loaded weight, "
+            "%d rejected",
+            _lossless["rans"], _lossless["frag"], _lossless["rejected"],
         )
     k, n = B.shape
     if A.shape[0] == 1 and packed.numel() > 0 and A.is_contiguous() and _scales_ok(As, Bs, n):
