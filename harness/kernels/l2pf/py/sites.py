@@ -248,6 +248,12 @@ def _targets():
     except (AttributeError, RuntimeError):
         pass
     try:
+        lane_bf16 = torch.ops.vllm.muse_bf16_lane_linear
+        lane_bf16.default  # noqa: B018
+        out.append((lane_bf16, "default", "muse_bf16_lane", False))
+    except (AttributeError, RuntimeError):
+        pass
+    try:
         from torch._inductor.select_algorithm import extern_kernels
 
         if hasattr(extern_kernels, "mm"):
@@ -282,6 +288,8 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[2],)
         if kind in ("cutlass_fp8", "mm"):
             return (args[1],)
+        if kind == "muse_bf16_lane" and args[0].shape[0] == 1 and args[0].is_contiguous():
+            return (args[2],)
         if kind == "marlin_tiled":
             return (args[1], args[2])
     except IndexError:

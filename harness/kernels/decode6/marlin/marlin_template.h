@@ -242,7 +242,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           // muse scale6: the group-16 FP8 block scales arrive as 6-bit codes
           // into a 64-entry per-layer palette (3/4 of the bytes); only the
           // M = 1 NVFP4 decode configuration supports it.
-          const bool scale6 = false>
+          const bool scale6 = false,
+          const bool gate_up_grid = false>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -273,6 +274,16 @@ __global__ void Marlin(
     int max_shared_mem,
     // scale6 only: 64 palette bytes (16-byte aligned) of this layer's codes
     const int4* __restrict__ scale6_palette) {
+  if constexpr (gate_up_grid) {
+    static_assert(scale6 && threads == 256 && thread_n_blocks == 8 && thread_k_blocks == 8);
+    prob_m = 1;
+    prob_n = 39936;
+    prob_k = lda = 6656;
+    num_groups = 416;
+    has_bias = false;
+    use_atomic_add = false;
+    use_fp32_reduce = true;
+  }
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -529,7 +540,23 @@ __global__ void Marlin(
     }
   };
 
-  init_slice();
+  if constexpr (gate_up_grid) {
+    // At this shape the 48-CTA schedule has 288 full columns and 24 split
+    // columns. Issue one independent CTA per parent slice. For every split,
+    // the high-K CTA produces the original FP32 partial and the low-K CTA
+    // consumes it through the same lock and final reduction.
+    const int task = blockIdx.x;
+    const int tail = task - 288;
+    const bool split = task >= 288;
+    slice_col = split ? 288 + tail % 24 : task;
+    slice_row = split && tail < 24 ? 26 : 0;
+    slice_iters = split ? 26 : 52;
+    slice_count = split ? 2 : 1;
+    slice_idx = split && tail >= 24 ? 1 : 0;
+    locks_off = split ? tail % 24 : 0;
+  } else {
+    init_slice();
+  }
 
   // A sizes/strides
 
@@ -2071,6 +2098,7 @@ __global__ void Marlin(
       if (last || use_atomic_add)
         // only the last block in a slice actually writes the result
         write_result(last);
+      if constexpr (gate_up_grid) return;
       slice_row = 0;
       if (!in_part2) {
         slice_col_par += gridDim.x;
