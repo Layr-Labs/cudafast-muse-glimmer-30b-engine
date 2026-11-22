@@ -114,6 +114,18 @@
     {
       "file": "vllm/model_executor/models/muse_glimmer.py, vllm/v1/worker/gpu/model_runner.py; harness/kernels/lmpost (new)",
       "why": "A one-row greedy decode step without logprobs, penalties, bias or grammar takes its token from lmpost, taken from SP5D's published Yukon submission 98c1361e-289f-45a3-8471-5df0259bd3b2 (branch commit b520efe): the lm_head output goes through a 64K-entry BF16 table of this model's compute_logits chain (x * output_multiplier, then cap * tanh(x / cap), built by the same torch ops on every BF16 value) fused with a one-pass argmax whose ties go to the lowest index, the stock greedy sampler's rule; the sampling row is taken as a slice. Its in-place softcap hook for compute_logits is not taken, and the token is written to a freshly allocated tensor instead of two alternating persistent ones. LMPOST=0 disables it."
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/decode_placement.py, vllm/model_executor/layers/quantization/utils/glimmer_fp8.py",
+      "why": "Load-time weight placement extended with posix_fadvise(DONTNEED) shard page-cache release, read-only 64 MiB L2 eviction flushes between timing candidates, non-recycling rejected-buffer holds across groups, 3.5x decode surplus (16 lm_head spares) and 2.0x prefill surplus, plus placement for muserans FP8 MLP decode weights and muse_fp8_prefill FP8 down weights. Every moved buffer is compared bitwise with its source before swapping; no weights or kernels change."
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py; harness/kernels/marlinw_down128; harness/kernels/marlinw_attn/marlinw_attn.py; harness/kernels/marlinw_down/marlinw_down.py",
+      "why": "Prefill marlinw_down128 is generalized with zero register spills to serve 18 NVFP4 attention QKV projections (4608x6656) with exact bitwise admission, and marlinw_down128/marlinw_attn/marlinw_down cache their FP32 scratch buffers."
+    },
+    {
+      "file": "vllm/model_executor/models/muse_glimmer_norm_glue.py, vllm/v1/worker/hostfast.py; harness/vllm_resident/backends.py; harness/kernels/l2pf; harness/kernels/muserans; harness/kernels/muse_bf16_lane; harness/kernels/muse_fp8_prefill",
+      "why": "Bit-exact post-attention norm glue extended to prefill row counts (<= 4096); hostfast pins to the single highest-capacity L3 CPU cluster and launches 5 pure-C SCHED_IDLE 1 ms pthread deep-idle ticklers in libl2pf.so (zero Python GIL contention, VLLM_HOSTFAST_TICKLE=0 disables); muserans uses continuous per-warp FP8 rANS streams (117 layers); muse_bf16_lane uses persistent cp.async NS=4 rANS high-byte compression on all 12 BF16 attention weights with L2 prefetch skipped on compressed BF16 QKV; muse_fp8_prefill enables 128x192 tiles on 42 FP8 o_proj prefill layers with real-activation bitwise verification."
     }
   ],
   "carried_from": {
