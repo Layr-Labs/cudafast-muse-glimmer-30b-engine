@@ -62,6 +62,14 @@
     {
       "file": "vllm/model_executor/models/muse_glimmer.py and muse_glimmer_glue.py (new)",
       "why": "Carries only ArthurOstapenko's prompt query normalization and RoPE launcher and installation hook from Yukon submission fa040f4a-ca7e-42dd-8f50-8f1aadfc8d9b (ranked aa3a2e54b58675aa76f633bd31a3d07b0e4d41ab), first published in e7600084-0e57-465b-8c3c-1df33c51dd94. Before replacing a matching compiled kernel, the launcher compares output bits against the actual stock compiler kernel. The default minimum batch size is 128 tokens."
+    },
+    {
+      "file": "vllm/model_executor/models/muse_glimmer.py; harness/kernels/muse_bf16_lane (new); harness/kernels/l2pf/py/sites.py",
+      "why": "The unquantized BF16 Muse Glimmer QKV and output gate on one CUDA device admit the one-row lane-striped GEMV only after a complete lossless weight check and per-layer bitwise cuBLAS comparisons. It keeps the original lane accumulation and warp fold. Larger row counts, bias and other weights retain the stock linear method. The original weights remain the fallback and the L2 site reads only the registered compact buffer. MUSE_BF16_LANE=0 selects the original paths."
+    },
+    {
+      "file": "vllm/model_executor/models/muse_glimmer.py, vllm/model_executor/kernels/linear/nvfp4/marlin.py, vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/prefill_graph.py, harness/kernels/muse_final_slab/",
+      "why": "Keep the full compiled backbone and specialize only the final two independent-row NVFP4 projection launches inside the logits-only prefill capture. Retain both operator output shapes and the ordered K partition for the sampled tile. Full-output consumers use the original projection launches."
     }
   ],
   "carried_from": {
