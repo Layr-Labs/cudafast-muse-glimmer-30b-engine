@@ -47,6 +47,25 @@ except (ImportError, OSError):
     marlinw_down = None
 
 try:
+    import marlinw_down128
+except (ImportError, OSError):
+    marlinw_down128 = None
+
+_down128_weights: set[int] = set()
+
+
+def down128_admitted(weight: torch.Tensor) -> bool:
+    """Muse Glimmer prefill weight placement: True if this down weight runs the 128x128-tile kernel."""
+    return marlinw_down128 is not None and weight.data_ptr() in _down128_weights
+
+
+def down128_moved(old_ptr: int, new_ptr: int) -> None:
+    """A placed down weight moved to another buffer with the same bytes: it keeps its kernel."""
+    if old_ptr in _down128_weights:
+        _down128_weights.discard(old_ptr)
+        _down128_weights.add(new_ptr)
+
+try:
     import muse_final_slab
 except (ImportError, OSError):
     muse_final_slab = None
@@ -85,7 +104,7 @@ logger = init_logger(__name__)
 # ops.marlin_gemm call.
 _PROMPT_CHECK_M = (512, 4096)
 _prompt_stats = {
-    "wide": 0, "narrow": 0, "narrow_down": 0, "sliced": 0, "single": 0, "logged": False,
+    "wide": 0, "narrow": 0, "narrow_down": 0, "down128": 0, "down128_rejected": 0, "sliced": 0, "single": 0, "logged": False,
     # Narrow 512-row NVFP4 attention projections: [admitted, rejected] per shape.
     "attn": {"qkv": [0, 0], "gate": [0, 0], "o": [0, 0]},
 }
@@ -124,6 +143,10 @@ def _log_prompt_stats() -> None:
             logger.info("NVFP4 rANS-coded gate/up block scales: %d layers admitted, %d rejected, %.3f bits per scale",
                         _scale6_stats.get("gate_up_srans", 0), _scale6_stats.get("gate_up_srans_rejected", 0),
                         8.0 * _scale6_stats.get("srans_bytes", 0) / coded if coded else 0.0)
+            coded = _scale6_stats.get("down_srans_scales", 0)
+            logger.info("NVFP4 rANS-coded down block scales: %d layers admitted, %d rejected, %.3f bits per scale",
+                        _scale6_stats.get("down_srans", 0), _scale6_stats.get("down_srans_rejected", 0),
+                        8.0 * _scale6_stats.get("down_srans_bytes", 0) / coded if coded else 0.0)
         logger.info(
             "Marlin NVFP4 prompt GEMM: %d layers on the wide schedule, %d on "
             "column slices, %d on the single call",
@@ -140,6 +163,12 @@ def _log_prompt_stats() -> None:
             logger.info(
                 "Narrow split-K Marlin prefill passed bitwise validation on %d layers",
                 _prompt_stats["narrow_down"],
+            )
+        if _prompt_stats["down128"] or _prompt_stats["down128_rejected"]:
+            logger.info(
+                "128x128-tile down prefill GEMM admitted on %d layers, rejected on %d",
+                _prompt_stats["down128"],
+                _prompt_stats["down128_rejected"],
             )
         attn = _prompt_stats["attn"]
         if any(a + r for a, r in attn.values()):
@@ -268,6 +297,10 @@ def _marlin_fp4_wide(
     if marlinw_down is not None and down_work is not None and down_work_ptr is not None:
         if muse_final_slab is not None and x.shape[0] == muse_final_slab.ROWS:
             out = muse_final_slab.down_if_active(x, weight, weight_scale, weight_global_scale)
+            if out is not None:
+                return out
+        if marlinw_down128 is not None and weight.data_ptr() in _down128_weights:
+            out = marlinw_down128.gemm_auto(x, weight, weight_scale, weight_global_scale)
             if out is not None:
                 return out
         out = marlinw_down.gemm(
@@ -710,6 +743,21 @@ def _prepare_prompt_gemm(layer: torch.nn.Module) -> None:
                 ):
                     down_plan = buffers
                     _prompt_stats["narrow_down"] += 1
+                    if (
+                        marlinw_down128 is not None
+                        and marlinw_down128.ENABLED
+                        and _prompt_check(
+                            layer,
+                            lambda x: marlinw_down128.gemm_auto(
+                                x, weight, weight_scale, global_scale
+                            ),
+                            (marlinw_down.ROWS,),
+                        )
+                    ):
+                        _down128_weights.add(weight.data_ptr())
+                        _prompt_stats["down128"] += 1
+                    else:
+                        _prompt_stats["down128_rejected"] += 1
         if use_narrow and marlin_swiglu is not None:
             layer.marlin_swiglu_ready = marlin_swiglu.prepare(layer)
         if use_narrow and marlin_swiglu_fp8 is not None:
