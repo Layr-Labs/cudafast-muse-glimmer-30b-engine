@@ -254,6 +254,8 @@ class VllmBackend:
     WARMUP_PROMPT_TOKENS = 4096
     WARMUP_DECODE_STEPS = 64
     WARMUP_ROUNDS = 3
+    WARMUP_SEED_TOKENS = 512
+    WARMUP_SEED_DECODE_STEPS = 4
 
     def _warm_up(self) -> None:
         prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_PROMPT_TOKENS)]
@@ -265,6 +267,10 @@ class VllmBackend:
             for _ in range(self.WARMUP_DECODE_STEPS):
                 self.step()
             self.abort()
+        self.start(prompt[: self.WARMUP_SEED_TOKENS], top_logits=False)
+        for _ in range(self.WARMUP_SEED_DECODE_STEPS):
+            self.step()
+        self.abort()
 
     def _params(self, prompt_len: int, max_tokens: int | None = None, top_logits: bool = True):
         room = max(1, self.ctx_size - prompt_len - self.depth - 1)
