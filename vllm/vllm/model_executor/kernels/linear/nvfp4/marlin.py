@@ -47,6 +47,11 @@ except (ImportError, OSError):
     marlinw_down = None
 
 try:
+    import muse_final_slab
+except (ImportError, OSError):
+    muse_final_slab = None
+
+try:
     from muse_marlin_gemv import prepare_decode_layout
 except (ImportError, OSError):
     prepare_decode_layout = None
@@ -106,6 +111,7 @@ def _log_prompt_stats() -> None:
         if _scale6_stats is not None:
             logger.info("NVFP4 decode palette admission: %d compressed, %d kept uncompressed",
                         _scale6_stats["admitted"], _scale6_stats["kept"])
+            logger.info("NVFP4 fixed decode gate/up grid admitted on %d layers", _scale6_stats["fixed_grid"])
         logger.info(
             "Marlin NVFP4 prompt GEMM: %d layers on the wide schedule, %d on "
             "column slices, %d on the single call",
@@ -136,6 +142,7 @@ def _marlin_fp4_single(
     decode_weight: torch.Tensor | None = None,
     decode_scales: torch.Tensor | None = None,
     decode_palette: torch.Tensor | None = None,
+    decode_fixed_grid: bool = False,
 ) -> torch.Tensor:
     if (
         x.shape[0] == 1
@@ -146,7 +153,8 @@ def _marlin_fp4_single(
         if decode_palette is not None:
             # decode_scales holds the layer's 6-bit codes into decode_palette
             return torch.ops.vllm.marlin_tiled_decode6.default(
-                x, decode_weight, decode_scales, decode_palette, weight_global_scale, workspace, size_n, size_k
+                x, decode_weight, decode_scales, decode_palette, weight_global_scale, workspace,
+                size_n, size_k, decode_fixed_grid,
             )
         return torch.ops.vllm.marlin_tiled_decode.default(
             x, decode_weight, decode_scales, weight_global_scale, workspace, size_n, size_k
@@ -230,6 +238,7 @@ def _marlin_fp4_wide(
     down_work_ptr: torch.Tensor | None = None,
     down_slots: int = 0,
     decode_palette: torch.Tensor | None = None,
+    decode_fixed_grid: bool = False,
 ) -> torch.Tensor:
     _log_prompt_stats()
     args = (x, weight, weight_scale, weight_global_scale, workspace, size_n, size_k)
@@ -238,13 +247,19 @@ def _marlin_fp4_wide(
         if out is not None:
             return out
     if marlinw_down is not None and down_work is not None and down_work_ptr is not None:
+        if muse_final_slab is not None and x.shape[0] == muse_final_slab.ROWS:
+            out = muse_final_slab.down_if_active(x, weight, weight_scale, weight_global_scale)
+            if out is not None:
+                return out
         out = marlinw_down.gemm(
             x, weight, weight_scale, weight_global_scale, down_work, down_work_ptr, down_slots
         )
         if out is not None:
             return out
     out = _marlin_fp4_wide_gemm(*args)
-    return out if out is not None else _marlin_fp4_single(*args, decode_weight, decode_scales, decode_palette)
+    return out if out is not None else _marlin_fp4_single(
+        *args, decode_weight, decode_scales, decode_palette, decode_fixed_grid
+    )
 
 
 def _marlin_fp4_wide_fake(
@@ -262,6 +277,7 @@ def _marlin_fp4_wide_fake(
     down_work_ptr: torch.Tensor | None = None,
     down_slots: int = 0,
     decode_palette: torch.Tensor | None = None,
+    decode_fixed_grid: bool = False,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], size_n))
 
@@ -277,6 +293,7 @@ def _marlin_fp4_single_fake(
     decode_weight: torch.Tensor | None = None,
     decode_scales: torch.Tensor | None = None,
     decode_palette: torch.Tensor | None = None,
+    decode_fixed_grid: bool = False,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], size_n))
 
@@ -297,6 +314,10 @@ direct_register_custom_op(
 def _marlin_fp4_swiglu(
     x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, global_scale: torch.Tensor
 ) -> torch.Tensor:
+    if muse_final_slab is not None and x.shape[0] == muse_final_slab.ROWS:
+        out = muse_final_slab.gate_if_active(x, weight)
+        if out is not None:
+            return out
     return marlin_swiglu.gemm(x, weight, scales, global_scale)
 
 
@@ -405,6 +426,7 @@ def _marlin_fp4_col_sliced(
     decode_weight: torch.Tensor | None = None,
     decode_scales: torch.Tensor | None = None,
     decode_palette: torch.Tensor | None = None,
+    decode_fixed_grid: bool = False,
 ) -> torch.Tensor:
     _log_prompt_stats()
     if _marlin_fp4_col_sliced_rows(
@@ -421,7 +443,7 @@ def _marlin_fp4_col_sliced(
         )
     return _marlin_fp4_single(
         x, weight, weight_scale, weight_global_scale, workspace, size_n, size_k,
-        decode_weight, decode_scales, decode_palette,
+        decode_weight, decode_scales, decode_palette, decode_fixed_grid,
     )
 
 
@@ -439,6 +461,7 @@ def _marlin_fp4_col_sliced_fake(
     decode_weight: torch.Tensor | None = None,
     decode_scales: torch.Tensor | None = None,
     decode_palette: torch.Tensor | None = None,
+    decode_fixed_grid: bool = False,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], size_n))
 
@@ -684,13 +707,14 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
                 palette = None
                 scales = getattr(layer, "_marlin_decode_scales", None)
             decode = (decode_weight, scales)
+            fixed_grid = palette is not None and getattr(layer, "marlin_decode6_fixed_grid", False)
             if path is None:
-                out = torch.ops.vllm.marlin_fp4_single_or_tiled(*args, *tail, *decode, palette)
+                out = torch.ops.vllm.marlin_fp4_single_or_tiled(*args, *tail, *decode, palette, fixed_grid)
             elif path[0] == "wide":
-                out = torch.ops.vllm.marlin_fp4_wide(*args, *tail, *decode, path[1], *path[2], palette)
+                out = torch.ops.vllm.marlin_fp4_wide(*args, *tail, *decode, path[1], *path[2], palette, fixed_grid)
             else:
                 out = torch.ops.vllm.marlin_fp4_col_sliced(
-                    *args, path[1], path[2], *tail, path[3], *decode, palette
+                    *args, path[1], path[2], *tail, path[3], *decode, palette, fixed_grid
                 )
             return out.reshape(x.shape[:-1] + (size_n,))
         return apply_fp4_marlin_linear(

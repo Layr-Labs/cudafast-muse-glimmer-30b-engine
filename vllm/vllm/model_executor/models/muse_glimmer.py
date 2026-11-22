@@ -114,6 +114,7 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+from .muse_glimmer_glue import install_prompt_glue
 from .vision import get_fp8_padded_hidden_size, is_vit_use_data_parallel
 
 logger = init_logger(__name__)
@@ -1124,7 +1125,34 @@ class MuseGlimmerMLP(nn.Module):
         )
         return down(quantized)[0]
 
+    def _registered_fp8_swiglu_down(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        gate = self.gate_up_proj
+        down = self.down_proj
+        data = torch.ops.glimmer.fp8_gate_swiglu(
+            x, gate.paired_fp8_swiglu_weight, scale, gate.weight_scale, down.input_scale,
+        )
+        activation = QuantizedActivation(
+            data, down.input_scale, torch.bfloat16, data.shape, kFp8StaticTensorSym
+        )
+        return down(activation)[0]
+
+    def _regular_fp8_swiglu_down(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        activation = QuantizedActivation(x, scale, torch.bfloat16, x.shape, kFp8StaticTensorSym)
+        gate_up, _ = self.gate_up_proj(activation)
+        return self.down_proj(self.act_fn(gate_up))[0]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (torch.compiler.is_compiling() and x.ndim == 2 and x.dtype == torch.bfloat16
+                and hasattr(self.gate_up_proj, "paired_fp8_swiglu_weight")
+                and getattr(self.down_proj, "marlin_swiglu_fp8_input", False)):
+            gate = self.gate_up_proj
+            # Preserve the original producer-to-quantizer boundary on both arms.
+            # Inductor can consume the full-precision normalized intermediate.
+            data, scale = gate.quant_method.fp8_linear.quant_fp8(
+                x.view(-1, x.shape[-1]), gate.input_scale, getattr(gate, "input_scale_ub", None)
+            )
+            return torch.cond(x.shape[0] == 512, self._registered_fp8_swiglu_down,
+                              self._regular_fp8_swiglu_down, (data, scale))
         if (torch.compiler.is_compiling() and x.ndim == 2
                 and getattr(self.gate_up_proj, "marlin_swiglu_fp8_ready", False)
                 and getattr(self.down_proj, "marlin_swiglu_fp8_input", False)):
@@ -1411,6 +1439,15 @@ class MuseGlimmerAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.output_gate_proj",
             )
+        if tp_size == 1:
+            try:
+                from muse_bf16_lane import enable as enable_bf16_lane
+            except ImportError:
+                pass
+            else:
+                enable_bf16_lane(self.qkv_proj)
+                if self.use_output_gate:
+                    enable_bf16_lane(self.output_gate_proj)
         self.gate_fork_point = (
             _gate_side_stream_fork_point(self.output_gate_proj)
             if self.use_output_gate
@@ -1563,6 +1600,10 @@ class MuseGlimmerModel(nn.Module, EagleModelMixin):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        if current_platform.is_cuda():
+            # Faster launch-level replacement of the compiled query QK-norm +
+            # RoPE kernel for long batches; same bits, checked at first use.
+            install_prompt_glue()
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
@@ -1921,6 +1962,15 @@ class MuseGlimmerForCausalLM(
             cap = self.final_logit_softcapping
             logits = cap * torch.tanh(logits / cap)
         return logits
+
+    def prepare_final_sample_tile(self, n: int):
+        if n != 512 or not get_pp_group().is_last_rank or not get_pp_group().is_first_rank:
+            return None
+        try:
+            import muse_final_slab
+        except (ImportError, OSError):
+            return None
+        return muse_final_slab.prepare(self.model.layers[self.model.end_layer - 1].mlp)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
