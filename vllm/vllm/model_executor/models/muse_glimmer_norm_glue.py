@@ -38,6 +38,7 @@ logger = init_logger(__name__)
 
 _H = 6656
 _MAX_ROWS = 16
+_MAX_POST_ATTN_ROWS = 4096
 # Diagnostics only: compare both kernels on every eligible launch made outside graph capture (real
 # activations of short prompts, which run without graphs). Off by default.
 _AUDIT = os.environ.get("VLLM_MUSE_GLIMMER_NORM_GLUE_AUDIT", "0") == "1"
@@ -96,7 +97,8 @@ class _NormSwap:
             rows, width = int(rows), int(width)
         except Exception:
             return None
-        if width != _H or not 0 < rows <= _MAX_ROWS:
+        max_rows = _MAX_POST_ATTN_ROWS if self.op == "post_attn" else _MAX_ROWS
+        if width != _H or not 0 < rows <= max_rows:
             return None
         if not all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in tensors):
             return None
