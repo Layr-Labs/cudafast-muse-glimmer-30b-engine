@@ -53,6 +53,12 @@ BYTES_OTHER = _env_bytes("L2PF_MB_OTHER", 2 << 20)
 MAX_WEIGHT = _env_bytes("L2PF_MAX_WEIGHT_MB", 64 << 20)
 BLOCKS = int(os.environ.get("L2PF_BLOCKS", "1"))
 
+# Compressed one-row projections measured with the same captured stream edges.
+_RANS_SKIP_PREFETCH = {
+    (6656, 4096, True),
+    (4608, 6656, False),
+}
+
 
 def available() -> bool:
     return ENABLED and lib() is not None
@@ -248,6 +254,12 @@ def _targets():
     except (AttributeError, RuntimeError):
         pass
     try:
+        lane_bf16 = torch.ops.vllm.muse_bf16_lane_linear
+        lane_bf16.default  # noqa: B018
+        out.append((lane_bf16, "default", "muse_bf16_lane", False))
+    except (AttributeError, RuntimeError):
+        pass
+    try:
         from torch._inductor.select_algorithm import extern_kernels
 
         if hasattr(extern_kernels, "mm"):
@@ -282,6 +294,8 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[2],)
         if kind in ("cutlass_fp8", "mm"):
             return (args[1],)
+        if kind == "muse_bf16_lane" and args[0].shape[0] == 1 and args[0].is_contiguous():
+            return (args[2],)
         if kind == "marlin_tiled":
             return (args[1], args[2])
     except IndexError:
@@ -296,6 +310,7 @@ class _Site:
     after_attn: bool
     descs: list = field(default_factory=list)
     off: int = 0
+    unassisted: bool = False
 
 
 class Session:
@@ -384,7 +399,17 @@ class Session:
         self._attn = False
         try:
             wbytes = sum(_dense_span(w)[1] for w in ws)
-            site.descs = weight_descs(ws, budget(wbytes, site.after_attn))
+            nbytes = budget(wbytes, site.after_attn)
+            if kind == "musefp8":
+                a, weight, packed, sa, sb = args
+                k, n = weight.shape
+                if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
+                        and a.is_contiguous() and 0 < packed.numel() != n * k):
+                    from vllm.model_executor.kernels.linear.scaled_mm.muse_fp8 import _scales_ok
+                    if _scales_ok(sa, sb, n):
+                        nbytes = 0
+                        site.unassisted = True
+            site.descs = weight_descs(ws, nbytes)
             if self.ranges is not None and not _inside(site.descs, self.ranges):
                 site.descs = []
         except Exception:  # noqa: BLE001 - a site without ranges is still a site
@@ -456,9 +481,12 @@ class Session:
         na = sum(1 for s in self.sites if s.descs and s.after_attn)
         nb = sum(1 for s in self.sites if s.descs and not s.after_attn)
         mb = sum(sg * c for s in self.sites for _, _, sg, c in s.descs) / (1 << 20)
+        ua = sum(1 for s in self.sites if s.unassisted and s.after_attn)
+        ub = sum(1 for s in self.sites if s.unassisted and not s.after_attn)
         return (f"{self.prefetched} of {len(self.sites)} GEMM sites"
                 f"{' (stopped at a mismatch)' if self.stopped else ''}; "
                 f"{na} after attention at {BYTES_AFTER_ATTN / (1 << 20):.1f} MiB, "
                 f"{nb} others at {BYTES_OTHER / (1 << 20):.1f} MiB, "
                 f"weights above {MAX_WEIGHT / (1 << 20):.0f} MiB skipped; "
-                f"{mb:.0f} MiB per step")
+                f"{mb:.0f} MiB per step; compressed FP8 sites left without prefetch: "
+                f"{ua} output after attention, {ub} QKV")

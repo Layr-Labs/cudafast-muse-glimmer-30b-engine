@@ -9,7 +9,11 @@ namespace {
 constexpr int kRows = 512;
 constexpr int kColumns = 6656;
 constexpr int kInner = 19968;
+#ifdef MARLINW_SINGLE_SLAB
+constexpr int kBlocks = kColumns / 128;
+#else
 constexpr int kBlocks = (kRows / 64) * (kColumns / 128);
+#endif
 constexpr int kThreads = 128;
 constexpr int kShared = 45056;
 constexpr auto kKernel =

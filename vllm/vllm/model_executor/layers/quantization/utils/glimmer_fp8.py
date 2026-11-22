@@ -43,3 +43,25 @@ def fp8_scaled_mm(a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale
 @fp8_scaled_mm.register_fake
 def _(a, b, scale_a, scale_b):
     return a.new_empty((a.size(0), b.size(1)), dtype=torch.bfloat16)
+
+try:
+    import muse_fp8_swiglu as _swiglu
+except ImportError:
+    _swiglu = None
+
+
+def prepare_fp8_swiglu_weight(weight: torch.Tensor) -> torch.Tensor | None:
+    return _swiglu.prepare(weight) if _swiglu is not None else None
+
+
+@torch.library.custom_op("glimmer::fp8_gate_swiglu", mutates_args=())
+def fp8_gate_swiglu(
+    a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor,
+    down_scale: torch.Tensor,
+) -> torch.Tensor:
+    return _swiglu.apply(a, b, scale_a, scale_b, down_scale)
+
+
+@fp8_gate_swiglu.register_fake
+def _(a, b, scale_a, scale_b, down_scale):
+    return a.new_empty((a.size(0), b.size(1) // 2))

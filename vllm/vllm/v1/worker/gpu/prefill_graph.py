@@ -197,9 +197,27 @@ def capture_prefill_graph(runner) -> PrefillGraph | None:
         logger.info("Prefill graph off: %s", reason)
         return None
     started = time.perf_counter()
+    graph = None
+    prepare_tile = getattr(runner.model, "prepare_final_sample_tile", None)
+    if prepare_tile is not None:
+        try:
+            sample_tile = prepare_tile(num_tokens)
+            if sample_tile is not None:
+                with graph_capture(device=runner.device):
+                    graph = PrefillGraph(runner, num_tokens, sample_tile=sample_tile)
+        except Exception as exc:  # noqa: BLE001 - retry with the original full graph
+            logger.warning(
+                "Compact prefill graph capture failed (%s: %s); trying the full graph",
+                type(exc).__name__, exc,
+            )
+            try:
+                torch.accelerator.synchronize()
+            except Exception:  # noqa: BLE001
+                pass
     try:
-        with graph_capture(device=runner.device):
-            graph = PrefillGraph(runner, num_tokens)
+        if graph is None:
+            with graph_capture(device=runner.device):
+                graph = PrefillGraph(runner, num_tokens)
     except Exception as exc:  # noqa: BLE001 - any failure falls back to eager
         logger.warning(
             "Prefill graph off: capture failed (%s: %s); prefills run eager",
@@ -220,11 +238,13 @@ def capture_prefill_graph(runner) -> PrefillGraph | None:
 
 
 class PrefillGraph:
-    def __init__(self, runner, num_tokens: int):
+    def __init__(self, runner, num_tokens: int, *, sample_tile=None):
         n = num_tokens
         self.num_tokens = n
         self.vllm_config = runner.vllm_config
         self.model = runner.model
+        self.sample_tile = sample_tile
+        self.final_sample_tile = sample_tile is not None
         self.replays = 0
         self._logged_refusal = False
 
@@ -283,6 +303,8 @@ class PrefillGraph:
         torch.accelerator.synchronize()
         if not isinstance(self.hidden_states, torch.Tensor):
             raise TypeError(f"model returned {type(self.hidden_states).__name__}")
+        if self.final_sample_tile:
+            logger.info("Prefill graph captured both final FFN tiles on the compiled backbone")
 
     def _forward(self):
         with set_forward_context(
@@ -295,7 +317,11 @@ class PrefillGraph:
             slot_mapping=self.slot_mappings,
             is_padding=self.is_padding,
         ):
-            return self.model(**self.model_inputs)
+            if self.sample_tile is None:
+                return self.model(**self.model_inputs)
+            with self.sample_tile.capture():
+                hidden_states = self.model(**self.model_inputs)
+                return hidden_states[-64:]
 
     def try_replay(
         self,

@@ -12,12 +12,16 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
-STATS = {"admitted": 0, "kept": 0, "logged": False}
+STATS = {"admitted": 0, "kept": 0, "fixed_grid": 0, "logged": False}
 
 _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_marlin6.so")))
 _gemv6 = _lib.muse_marlin6_gemv
 _gemv6.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
 _gemv6.restype = ctypes.c_int
+_gate_up = getattr(_lib, "muse_marlin6_gate_up", None)
+if _gate_up is not None:
+    _gate_up.argtypes = _gemv6.argtypes
+    _gate_up.restype = ctypes.c_int
 
 
 def pack_scales6(tiled_scales: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -56,6 +60,7 @@ def decode_linear6(
     workspace: torch.Tensor,
     n: int,
     k: int,
+    fixed_grid: bool = False,
 ) -> torch.Tensor:
     if not STATS["logged"]:
         STATS["logged"] = True
@@ -68,7 +73,9 @@ def decode_linear6(
     tile_n = 128 if n % 128 == 0 else 64
     partials = x.new_empty((blocks, 16, tile_n), dtype=torch.float32)
     with torch.cuda.device(x.device):
-        status = _gemv6(
+        use_grid = fixed_grid and _gate_up is not None and x.numel() == k and (n, k) == (39936, 6656)
+        kernel = _gate_up if use_grid else _gemv6
+        status = kernel(
             x.data_ptr(), tiled_weight.data_ptr(), output.data_ptr(), partials.data_ptr(),
             scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(), n, k, blocks,
             x.device.index, torch.cuda.current_stream().cuda_stream,
@@ -78,14 +85,14 @@ def decode_linear6(
     return output
 
 
-def _decode6_fake(x, tiled_weight, scales6, palette, global_scale, workspace, n, k):
+def _decode6_fake(x, tiled_weight, scales6, palette, global_scale, workspace, n, k, fixed_grid=False):
     return x.new_empty((*x.shape[:-1], n))
 
 
 direct_register_custom_op("marlin_tiled_decode6", decode_linear6, fake_impl=_decode6_fake)
 
 
-def self_check6(layer: torch.nn.Module, reference) -> bool:
+def self_check6(layer: torch.nn.Module, reference, fixed_grid: bool = False) -> bool:
     """decode_linear6 == reference (the uncompressed tiled GEMV) bitwise on the layer's own weight, for activations with
     large and cancelling entries at several magnitudes."""
     n, k = layer.output_size_per_partition, layer.input_size_per_partition
@@ -98,7 +105,7 @@ def self_check6(layer: torch.nn.Module, reference) -> bool:
         x[:, 1::2] = -x[:, ::2]
         x = x.to(torch.bfloat16)
         got = decode_linear6(x, layer._marlin_decode_weight, layer._marlin_decode_scales6, layer._marlin_decode_palette,
-                             layer.weight_global_scale, layer.workspace, n, k)
+                             layer.weight_global_scale, layer.workspace, n, k, fixed_grid)
         ref = reference(x, layer._marlin_decode_weight, layer._marlin_decode_scales, layer.weight_global_scale,
                         layer.workspace, n, k)
         if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
@@ -108,6 +115,7 @@ def self_check6(layer: torch.nn.Module, reference) -> bool:
 
 def prepare_decode_layout6(layer: torch.nn.Module, reference) -> bool:
     """After the board's prepare_decode_layout: add the 6-bit scale codes and palette, check, register. True if admitted."""
+    layer.marlin_decode6_fixed_grid = False
     tiled = getattr(layer, "_marlin_decode_scales", None)
     if tiled is None or getattr(layer, "_marlin_decode_weight", None) is None:
         return False
@@ -123,5 +131,12 @@ def prepare_decode_layout6(layer: torch.nn.Module, reference) -> bool:
         del layer._marlin_decode_scales6, layer._marlin_decode_palette
         STATS["kept"] += 1
         return False
+    if _gate_up is not None and (layer.output_size_per_partition, k) == (39936, 6656):
+        try:
+            layer.marlin_decode6_fixed_grid = self_check6(layer, reference, fixed_grid=True)
+        except (RuntimeError, ValueError) as exc:
+            logger.warning_once("NVFP4 gate/up grid admission failed on this layer: %s", exc)
+        if layer.marlin_decode6_fixed_grid:
+            STATS["fixed_grid"] += 1
     STATS["admitted"] += 1
     return True

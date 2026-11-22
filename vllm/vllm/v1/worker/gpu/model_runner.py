@@ -1153,8 +1153,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
+        compact_sample: bool = False,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
-        sample_hidden_states = hidden_states[input_batch.logits_indices]
+        sample_hidden_states = hidden_states[-1:] if compact_sample else hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
@@ -1391,6 +1392,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
         # Run model.
+        compact_sample = False
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -1444,6 +1446,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         and input_batch.num_tokens_after_padding
                         == prefill_graph.num_tokens
                         and int(input_batch.num_computed_tokens_np[0]) == 0
+                        and (not prefill_graph.final_sample_tile or (
+                            self.prompt_logprobs_worker is not None
+                            and not self.prompt_logprobs_worker.uses_prompt_logprobs[input_batch.idx_mapping_np[0]]
+                            and input_batch.cu_num_logits_np[-1] == 1
+                            and self.speculator is None
+                            and self.pcp_manager is None
+                            and not self.use_aux_hidden_state_outputs
+                        ))
                     ):
                         model_output = prefill_graph.try_replay(
                             attn_metadata,
@@ -1452,6 +1462,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             input_batch.is_padding,
                             batch_descriptor,
                         )
+                        compact_sample = model_output is not None and prefill_graph.final_sample_tile
                     if model_output is None:
                         model_output = self.model(**model_inputs)
 
@@ -1478,6 +1489,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            compact_sample=compact_sample,
         )
 
         if not self.is_last_pp_rank:
@@ -1494,6 +1506,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The prior execute_model call must have failed.
             return None
 
+        compact_sample = self.execute_model_state.compact_sample
         input_batch = self.execute_model_state.input_batch
         attn_metadata = self.execute_model_state.attn_metadata
         slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
@@ -1526,7 +1539,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
+            hidden_states, input_batch, grammar_output, compact_sample=compact_sample
         )
 
         if self.pp_handler is not None:
@@ -1745,6 +1758,7 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    compact_sample: bool = False
 
 
 def sort_batch_req_ids(
