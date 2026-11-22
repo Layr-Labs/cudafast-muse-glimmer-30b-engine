@@ -109,7 +109,6 @@ from vllm.v1.worker.gpu.prefill_graph import PrefillGraph, capture_prefill_graph
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
-from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -294,8 +293,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._expanded_local_pos_1_gpu = torch.zeros(
             1, dtype=torch.int32, device=self.device
         )
-        self._ones_1_i32 = torch.ones(1, dtype=torch.int32, device=self.device)
-        self._zeros_1_i32 = torch.zeros(1, dtype=torch.int32, device=self.device)
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -1187,59 +1184,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
         compact_sample: bool = False,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
-        # LOCAL PATCH (SP5D, Yukon submission 98c1361e): a one-request step without draft tokens that completes its
-        # prompt takes its sampling row as a slice (the row logits_indices would gather), and a greedy step without
-        # logprobs, penalties, bias or grammar takes the token from lmpost's fused softcap + argmax.
-        can_single_row = (
-            input_batch.num_reqs == 1
-            and input_batch.num_draft_tokens == 0
-            and int(input_batch.num_computed_tokens_np[0])
-            + int(input_batch.num_scheduled_tokens[0])
-            >= int(input_batch.prefill_len_np[0])
-        )
-        if compact_sample:
-            sample_hidden_states = hidden_states[-1:]
-        elif can_single_row:
-            logits_row = int(input_batch.query_start_loc_np[1]) - 1
-            sample_hidden_states = hidden_states[logits_row : logits_row + 1]
-        else:
-            sample_hidden_states = hidden_states[input_batch.logits_indices]
-        lmpost_argmax = getattr(self.model, "_lmpost_softcap_argmax", None)
-        if (
-            can_single_row
-            and lmpost_argmax is not None
-            and grammar_output is None
-            and self.sampler is not None
-            and not self.sampler.compute_nans
-        ):
-            idx_mapping_np = input_batch.idx_mapping_np
-            states = self.sampler.sampling_states
-            if (
-                states.temperature.np[idx_mapping_np[0]] == 0.0
-                and states.max_num_logprobs(idx_mapping_np) == NO_LOGPROBS
-                and self.sampler.logprob_token_ids_state.max_num_token_ids(idx_mapping_np) == 0
-                and not self.sampler._requires_logits_processing(idx_mapping_np)
-            ):
-                raw_logits = self.model.logits_processor(self.model.lm_head, sample_hidden_states)
-                if raw_logits is not None:
-                    sampled_token_ids = lmpost_argmax(
-                        raw_logits, self.model.output_multiplier, self.model.final_logit_softcapping
-                    )
-                    if sampled_token_ids is not None:
-                        if not getattr(self, "_lmpost_logged", False):
-                            self._lmpost_logged = True
-                            logger.info("lmpost fused softcap + argmax in use (one-row greedy decode)")
-                        return (
-                            SamplerOutput(
-                                sampled_token_ids=sampled_token_ids,
-                                logprobs_tensors=None,
-                                num_nans=None,
-                                num_sampled=self._ones_1_i32,
-                                num_rejected=self._zeros_1_i32,
-                            ),
-                            self._ones_1_i32,
-                            self._zeros_1_i32,
-                        )
+        sample_hidden_states = hidden_states[-1:] if compact_sample else hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
@@ -1671,15 +1616,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pcp_manager, hidden_states, input_batch
         )
 
-        # LOCAL PATCH (two-stage output wait, async_utils.wait_for_output): for
-        # a one-request prefill step, mark in stream order where the forward
-        # ends and the sampling tail begins. A decode step needs no mark: the
-        # host waits for it with the next step already queued.
-        forward_done = None
-        if input_batch.num_reqs == 1 and input_batch.num_tokens > 1:
-            forward_done = torch.cuda.Event(blocking=True)
-            forward_done.record(self.main_stream)
-
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output, compact_sample=compact_sample
         )
@@ -1727,7 +1663,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             known_single_token=known_single_token,
-            forward_done=forward_done,
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None

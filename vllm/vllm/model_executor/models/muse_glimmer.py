@@ -1975,21 +1975,3 @@ class MuseGlimmerForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-
-    def process_weights_after_loading(self) -> None:
-        # LOCAL PATCH (SP5D, Yukon submission 98c1361e; decode argmax only): lmpost's fused softcap + argmax for a
-        # one-row greedy step without logprobs (GPUModelRunner.sample). Its 64K-entry table is this model's
-        # compute_logits chain (x * output_multiplier, then cap * tanh(x / cap)) evaluated by the same torch ops on
-        # every BF16 value; ties go to the lowest index, as the stock greedy sampler's block argmax + argmax.
-        self._lmpost_softcap_argmax = None
-        try:
-            import lmpost
-        except ImportError:
-            return
-        lm_head = getattr(self, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight") or not lmpost.available(lm_head.weight.device):
-            return
-        dev = lm_head.weight.device
-        lmpost._get_lut(dev, self.output_multiplier, self.final_logit_softcapping)
-        lmpost._get_scratch(dev)
-        self._lmpost_softcap_argmax = lmpost.softcap_argmax

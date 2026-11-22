@@ -110,10 +110,6 @@
     {
       "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py, vllm/model_executor/kernels/linear/nvfp4/decode_placement.py; harness/kernels/marlinw (marlinw_swiglu2.cu, py/swiglu.py, build.sh), harness/kernels/marlinw_down128 (new)",
       "why": "512-row NVFP4 gate/up (paired SwiGLU) and down projections run on 128-row tiles that dequantize each weight fragment once for twice the rows, taken unchanged from e-man07's published Yukon submission a53190a4-8004-4a8b-b026-0cf0964f8af3 (branch commit eb2d466): libmarlinw_swiglu2 is used for a layer only after a bitwise comparison with the 64-row kernel on its own weight (MARLINW_SWIGLU2=0 disables); marlinw_down128 keeps marlinw_down's per-element MMA chains, K cuts and fp32 fold and is admitted per layer by the 512-row prompt check (MARLIN_DOWN128=0 disables). Muse Glimmer addition: the load-time prefill weight placement times the kernel each group will run (the 128-row kernels when every layer of the group was admitted) and a moved weight keeps its admission (both routes are keyed by the weight's address)."
-    },
-    {
-      "file": "vllm/model_executor/models/muse_glimmer.py, vllm/v1/worker/gpu/model_runner.py; harness/kernels/lmpost (new)",
-      "why": "A one-row greedy decode step without logprobs, penalties, bias or grammar takes its token from lmpost, taken from SP5D's published Yukon submission 98c1361e-289f-45a3-8471-5df0259bd3b2 (branch commit b520efe): the lm_head output goes through a 64K-entry BF16 table of this model's compute_logits chain (x * output_multiplier, then cap * tanh(x / cap), built by the same torch ops on every BF16 value) fused with a one-pass argmax whose ties go to the lowest index, the stock greedy sampler's rule; the sampling row is taken as a slice. Its in-place softcap hook for compute_logits is not taken, and the token is written to a freshly allocated tensor instead of two alternating persistent ones. LMPOST=0 disables it."
     }
   ],
   "carried_from": {

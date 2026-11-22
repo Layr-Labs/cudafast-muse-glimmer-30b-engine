@@ -318,6 +318,48 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
         logger.warning("Prefill weight placement failed and was skipped: %s", err)
 
 
+def _compress_decode_down(layers) -> None:
+    """Try the same coded GEMV on two copies of this layer's immutable bytes."""
+    from muse_compressed_vmm import empty_like
+    from muse_marlin6_gemv import DOWN_K, DOWN_N, _down_probes, decode_linear6
+
+    accepted = 0
+    saved_ms = 0.0
+    for layer in layers:
+        if not getattr(layer, "marlin_decode6_down_srans", False):
+            continue
+        old = layer._buffers[_NAME]
+        try:
+            candidate = empty_like(old)
+            if candidate is None:
+                break
+            candidate.copy_(old)
+            if not torch.equal(candidate, old):
+                continue
+            args = (layer._marlin_decode_scales6, layer._marlin_decode_palette,
+                    layer.weight_global_scale, layer.workspace, DOWN_N, DOWN_K)
+            probes = _down_probes(layer)
+            for x in probes:
+                a = decode_linear6(x, old, *args)
+                b = decode_linear6(x, candidate, *args)
+                if not torch.equal(a.view(torch.int16), b.view(torch.int16)):
+                    break
+            else:
+                x = probes[-1]
+                times = _time_calls(lambda w: decode_linear6(x, w, *args),
+                                    [old, candidate], 12)
+                # Require a margin over allocation/clock noise; never retain
+                # both copies. This runs before any CUDA graph capture.
+                if times[1] < 0.97 * times[0]:
+                    layer._buffers[_NAME] = candidate
+                    accepted += 1
+                    saved_ms += times[0] - times[1]
+        except (RuntimeError, ValueError) as err:
+            logger.warning_once("Compressed NVFP4 decode placement skipped: %s", err)
+    logger.info("Compressed NVFP4 decode placement: %d down weights, timed GEMV savings %.3f ms",
+                accepted, saved_ms)
+
+
 def place_decode_weights(model: torch.nn.Module) -> None:
     """Move decode weights that landed on slow device memory; never raises."""
     if not ENABLED or not torch.cuda.is_available():
@@ -367,5 +409,10 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             "Decode weight placement: %d groups, timed GEMV sum reduced by %.3f ms per token, %.2f s",
             len(groups), saved_ms, time.perf_counter() - began,
         )
+        if os.environ.get("MUSE_COMPRESSED_DOWN", "1") != "0":
+            try:
+                _compress_decode_down(layer for group in groups.values() for layer in group)
+            except (ImportError, OSError) as err:
+                logger.info("Compressed NVFP4 decode placement unavailable: %s", err)
     except Exception as err:  # noqa: BLE001 - the load must go on
         logger.warning("Decode weight placement failed and was skipped: %s", err)

@@ -54,26 +54,6 @@ except (ImportError, OSError):
 _down128_weights: set[int] = set()
 
 
-# Which 512-row MLP kernel each call ran (Python runs on eager forwards and on graph capture, not on replay), logged
-# once a full forward's worth (45 paired gate/up, 40 down) has been routed: shows that placement kept the routes.
-_mlp_routes = {"gate_128": 0, "gate_64": 0, "gate_slab": 0, "down128": 0, "slab": 0, "down64": 0, "logged": False}
-
-
-def _count_mlp_route(kind: str) -> None:
-    _mlp_routes[kind] += 1
-    gate = _mlp_routes["gate_128"] + _mlp_routes["gate_64"] + _mlp_routes["gate_slab"]
-    down = _mlp_routes["down128"] + _mlp_routes["slab"] + _mlp_routes["down64"]
-    if not _mlp_routes["logged"] and gate >= 45 and down >= 40:
-        _mlp_routes["logged"] = True
-        logger.info(
-            "512-row MLP routes over the first %d gate/up and %d down calls: gate/up %d on the 128-row paired "
-            "kernel, %d on the 64-row one, %d on the final slab; down %d on the 128x128 tile, %d on the final slab, "
-            "%d on marlinw_down",
-            gate, down, _mlp_routes["gate_128"], _mlp_routes["gate_64"], _mlp_routes["gate_slab"], _mlp_routes["down128"],
-            _mlp_routes["slab"], _mlp_routes["down64"],
-        )
-
-
 def down128_admitted(weight: torch.Tensor) -> bool:
     """Muse Glimmer prefill weight placement: True if this down weight runs the 128x128-tile kernel."""
     return marlinw_down128 is not None and weight.data_ptr() in _down128_weights
@@ -318,18 +298,15 @@ def _marlin_fp4_wide(
         if muse_final_slab is not None and x.shape[0] == muse_final_slab.ROWS:
             out = muse_final_slab.down_if_active(x, weight, weight_scale, weight_global_scale)
             if out is not None:
-                _count_mlp_route("slab")
                 return out
         if marlinw_down128 is not None and weight.data_ptr() in _down128_weights:
             out = marlinw_down128.gemm_auto(x, weight, weight_scale, weight_global_scale)
             if out is not None:
-                _count_mlp_route("down128")
                 return out
         out = marlinw_down.gemm(
             x, weight, weight_scale, weight_global_scale, down_work, down_work_ptr, down_slots
         )
         if out is not None:
-            _count_mlp_route("down64")
             return out
     out = _marlin_fp4_wide_gemm(*args)
     return out if out is not None else _marlin_fp4_single(
@@ -465,10 +442,7 @@ def _marlin_fp4_swiglu(
     if muse_final_slab is not None and x.shape[0] == muse_final_slab.ROWS:
         out = muse_final_slab.gate_if_active(x, weight)
         if out is not None:
-            _count_mlp_route("gate_slab")
             return out
-    uses_128 = getattr(marlin_swiglu, "uses_128", None)
-    _count_mlp_route("gate_128" if uses_128 is not None and uses_128(weight) else "gate_64")
     return marlin_swiglu.gemm(x, weight, scales, global_scale)
 
 

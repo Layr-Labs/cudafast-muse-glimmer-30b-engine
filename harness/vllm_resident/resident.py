@@ -254,15 +254,6 @@ class Session:
         return [t for t, _ in top[:k]], [v for _, v in top[:k]]
 
     def _check_ids(self, tokens: list[int]) -> None:
-        # Plain ints inside the vocabulary pass in three C-level sweeps; anything
-        # else takes the per-token check below, which names the offender.
-        if (
-            tokens
-            and set(map(type, tokens)) == {int}
-            and min(tokens) >= 0
-            and max(tokens) < self.b.vocab_size
-        ):
-            return
         for t in tokens:
             if not isinstance(t, int) or isinstance(t, bool) or not 0 <= t < self.b.vocab_size:
                 raise RefusedError(f"token {t!r} is outside the vocabulary")
@@ -371,19 +362,6 @@ def serve_connection(session: Session, conn: socket.socket, timeout_s: float) ->
             except (RefusedError, ValueError, RuntimeError) as err:
                 reply, keep = {"ok": False, "error": str(err)}, True
             conn.sendall((json.dumps(reply, separators=(",", ":")) + "\n").encode())
-            # The reply is on its way: now finish what a completed request
-            # left in the engine (backends.py, REPLY FIRST, THEN CLEAN UP).
-            # The next request is read only after this returns.
-            try:
-                session.b.settle()
-            except (ValueError, RuntimeError) as err:
-                # Nothing to tell this caller: its reply is gone. Drop the
-                # sequence so the next verb starts clean or reports the fault.
-                log(f"settling after a reply failed: {err}")
-                try:
-                    session.invalidate()
-                except (ValueError, RuntimeError) as again:
-                    log(f"invalidate after a failed settle failed: {again}")
             if not keep:
                 return
     except (socket.timeout, ConnectionError, OSError) as err:

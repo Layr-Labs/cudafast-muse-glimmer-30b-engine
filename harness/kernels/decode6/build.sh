@@ -12,3 +12,7 @@ TMPDIR="$tmp" nvcc -O3 --expt-relaxed-constexpr -std=c++17 --shared --cudart sha
     -Xcompiler=-fPIC -gencode arch=compute_121a,code=sm_121a -I"$torch_include" \
     "$src/gemv6.cu" "$src/gemv6_srans.cu" "$src/gemv6_srans_down.cu" -o "$KERNELS_OUT/libmuse_marlin6.so"
 install -m 0644 "$src/muse_marlin6_gemv.py" "$KERNELS_OUT/muse_marlin6_gemv.py"
+nvcc -O3 -std=c++17 --shared --cudart none -Xcompiler=-fPIC \
+    -I"$torch_include" "$src/compressed_vmm.cu" \
+    -L"${CUDA_HOME:-/usr/local/cuda}/lib64/stubs" -lcuda -o "$KERNELS_OUT/libmuse_compressed_vmm.so"
+install -m 0644 "$src/muse_compressed_vmm.py" "$KERNELS_OUT/muse_compressed_vmm.py"
