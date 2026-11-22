@@ -17,14 +17,24 @@ import torch
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libmuse_fp8_prefill.so")
 ENABLED = os.environ.get("MUSE_FP8_PREFILL", "1") != "0"
-# (N, K) -> kernel id in csrc/fp8_prefill.cu, chosen by paired GB10 timings at M = 512. Only the FP8 down projection
-# gains (128x192 tiles cut its 4.33-wave grid to 2.92 waves); qkv, attention gate and o_proj stay on the stock op.
+# Micro-attribution: The k=128 CUTLASS SM120 Cooperative config choices Cfg2 (128x192x128) for down
+# and Cfg3 (128x96x128) for qkv/o_proj are inspired by @spariev (Yukon submission 262ee4f1);
+# extending Cfg3 coverage to the 28 FP8 output_gate_proj (4096x6656) layers and wave-balanced
+# dispatch on 48-SM GB10 are custom-implemented here.
 _CFG: dict[tuple[int, int], int] = {
-    (6656, 19968): 1,  # down
+    (6656, 19968): 2,  # down: 128x192x128
+    (6656, 4096): 3,   # o_proj: 128x96x128
+    (4608, 6656): 3,   # qkv: 128x96x128 (exact 4 waves on 48 SMs)
+    (4096, 6656): 3,   # output_gate: 128x96x128 (4 tiles/SM max, matching qkv)
 }
+if os.environ.get("MUSE_FP8_PREFILL_QKV", "1") == "0":
+    _CFG.pop((4608, 6656), None)
+if os.environ.get("MUSE_FP8_PREFILL_GATE", "1") == "0":
+    _CFG.pop((4096, 6656), None)
 _lib = None
 _tried = False
 _sms: dict[int, int] = {}
+_scratch_buf: dict[int, torch.Tensor] = {}
 _lock = threading.Lock()
 
 
@@ -67,8 +77,13 @@ def gemm(a: torch.Tensor, b: torch.Tensor, sa: torch.Tensor, sb: torch.Tensor, c
         with _lock:
             _sms[dev] = torch.cuda.get_device_properties(dev).multi_processor_count
     out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
-    # A separate allocation per call follows the caller's capture/stream (as muse_fp8_swiglu).
-    scratch = torch.empty(1 << 20, dtype=torch.uint8, device=a.device)
+    if torch.cuda.is_current_stream_capturing():
+        scratch = torch.empty(1 << 20, dtype=torch.uint8, device=a.device)
+    else:
+        scratch = _scratch_buf.get(dev)
+        if scratch is None:
+            scratch = torch.empty(1 << 20, dtype=torch.uint8, device=a.device)
+            _scratch_buf[dev] = scratch
     status = _lib.fp8_prefill_gemm(
         cfg, m, n, k, a.data_ptr(), b.data_ptr(), sa.data_ptr(), sb.data_ptr(), out.data_ptr(),
         scratch.data_ptr(), scratch.numel(), dev, _sms[dev], torch.cuda.current_stream(a.device).cuda_stream,

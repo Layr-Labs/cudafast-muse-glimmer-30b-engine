@@ -60,10 +60,12 @@ MLP = os.environ.get("L2PF_MLP", "1") != "0"
 BYTES_MLP_NORM = _env_bytes("L2PF_MB_MLP_NORM", (9 << 20) // 4)
 BYTES_MLP_ACT = _env_bytes("L2PF_MB_MLP_ACT", 1 << 19)
 
-# Compressed one-row projections measured with the same captured stream edges.
+# Compressed one-row projections measured with the same captured stream edges, plus output_gate_proj
+# (4096, 6656, False) which launches immediately after qkv_proj on main_stream with 0 lookahead window.
 _RANS_SKIP_PREFETCH = {
     (6656, 4096, True),
     (4608, 6656, False),
+    (4096, 6656, False),
 }
 
 
@@ -444,6 +446,13 @@ class Session:
                         if _scales_ok(sa, sb, n):
                             nbytes = 0
                             site.unassisted = True
+                elif kind == "muse_bf16_lane":
+                    a, weight, packed, index = args
+                    n, k = weight.shape
+                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
+                            and a.is_contiguous() and index.numel() == 1):
+                        nbytes = 0
+                        site.unassisted = True
                 site.descs = weight_descs(ws, nbytes)
             if self.ranges is not None and not _inside(site.descs, self.ranges):
                 site.descs = []

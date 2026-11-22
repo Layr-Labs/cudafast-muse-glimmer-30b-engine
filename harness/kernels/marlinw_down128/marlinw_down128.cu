@@ -78,11 +78,13 @@ __device__ unsigned long long g_prof[512][8];
 #define PROF_T(v)
 #endif
 
-template <int MB>
+template <int MB, int kCols = kColumns, int kIn = kInner>
 __device__ __forceinline__ void tile_body(
     const int4* __restrict__ A0, const int4* __restrict__ B, int4* __restrict__ C0,
     float4* __restrict__ scratch, const int4* __restrict__ scales, float gs, int lda,
     int row0, int col, int slot, int cut_a, int cut_b, int iters) {
+  constexpr int kBStride = kCols / 2;
+  constexpr int kSStride = kCols / 16;
   extern __shared__ int4 sh[];
 #ifdef D128_PROF
   const long long p_k0 = clock64();
@@ -121,8 +123,8 @@ __device__ __forceinline__ void tile_body(
   float acc[MB][2][2][4];
 
   const int4* a_src = A0 + (size_t)a_gl_stride * (row0 + (tid >> 3)) + (tid & 7);
-  const int4* b_src = B + (size_t)kBGlStride * (tid >> 6) + (tid & 63) + 64 * col;
-  const int4* s_src = scales + (size_t)kSGlStride * (tid >> 3) + 8 * col + (tid & 7);
+  const int4* b_src = B + (size_t)kBStride * (tid >> 6) + (tid & 63) + 64 * col;
+  const int4* s_src = scales + (size_t)kSStride * (tid >> 3) + 8 * col + (tid & 7);
   int ftile = 0;
   const uint32_t full_bar = smem_u32(sh + kStages * kStageInt4);
   const uint32_t empty_bar = full_bar + 8 * kStages;
@@ -152,14 +154,14 @@ __device__ __forceinline__ void tile_body(
 #ifdef D128_PF
       if (ftile + D128_PF < iters) {
         if ((tid & 7) == 0)
-          asm volatile("prefetch.global.L2 [%0];" ::"l"(b_src + (size_t)kBGlStride * 4 * D128_PF));
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(b_src + (size_t)kBStride * 4 * D128_PF));
         if (tid < 32 && (tid & 7) == 0)
-          asm volatile("prefetch.global.L2 [%0];" ::"l"(s_src + (size_t)kSGlStride * 4 * D128_PF));
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(s_src + (size_t)kSStride * 4 * D128_PF));
       }
 #endif
       a_src += 8;
-      b_src += kBGlStride * 4;
-      s_src += kSGlStride * 4;
+      b_src += kBStride * 4;
+      s_src += kSStride * 4;
       ftile++;
       mbar_cp_arrive(full_bar + 8 * stage);
     }
@@ -365,8 +367,8 @@ __device__ __forceinline__ void tile_body(
           nv_bfloat162 lo = __halves2bfloat162(__float2bfloat16(c[0] * gs), __float2bfloat16(c[1] * gs));
           nv_bfloat162 hi = __halves2bfloat162(__float2bfloat16(c[2] * gs), __float2bfloat16(c[3] * gs));
           int cc = col0 + 16 * jj + 8 * h;
-          *reinterpret_cast<nv_bfloat162*>(&C[(size_t)(r0 + 16 * i) * kColumns + cc]) = lo;
-          *reinterpret_cast<nv_bfloat162*>(&C[(size_t)(r0 + 16 * i + 8) * kColumns + cc]) = hi;
+          *reinterpret_cast<nv_bfloat162*>(&C[(size_t)(r0 + 16 * i) * kCols + cc]) = lo;
+          *reinterpret_cast<nv_bfloat162*>(&C[(size_t)(r0 + 16 * i + 8) * kCols + cc]) = hi;
         }
   }
 #ifdef D128_PROF
@@ -374,7 +376,8 @@ __device__ __forceinline__ void tile_body(
 #endif
 }
 
-__global__ void __launch_bounds__(kThreads, 1) down128(
+template <int kCols, int kIn>
+__global__ void __launch_bounds__(kThreads, 1) gemm128(
     const int4* __restrict__ A0, const int4* __restrict__ B,
     int4* __restrict__ C0, float4* __restrict__ scratch,
     const int4* __restrict__ scales, const float* __restrict__ gs_ptr,
@@ -383,14 +386,14 @@ __global__ void __launch_bounds__(kThreads, 1) down128(
   const int4 w1 = work[2 * blockIdx.x + 1];
   const float gs = gs_ptr[0];
 #ifdef D128_ONLY8
-  tile_body<8>(A0, B, C0, scratch, scales, gs, lda, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z);
+  tile_body<8, kCols, kIn>(A0, B, C0, scratch, scales, gs, lda, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z);
 #else
   if (w0.z == 8)
-    tile_body<8>(A0, B, C0, scratch, scales, gs, lda, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z);
+    tile_body<8, kCols, kIn>(A0, B, C0, scratch, scales, gs, lda, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z);
   else if (w0.z == 3)
-    tile_body<3>(A0, B, C0, scratch, scales, gs, lda, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z);
+    tile_body<3, kCols, kIn>(A0, B, C0, scratch, scales, gs, lda, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z);
   else
-    tile_body<2>(A0, B, C0, scratch, scales, gs, lda, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z);
+    tile_body<2, kCols, kIn>(A0, B, C0, scratch, scales, gs, lda, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z);
 #endif
 }
 
@@ -398,9 +401,23 @@ __global__ void __launch_bounds__(kThreads, 1) down128(
 
 extern "C" int marlinw_down128_init(int* active_blocks) {
   using namespace marlinw_down128;
-  auto status = cudaFuncSetAttribute(down128, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  auto k = gemm128<6656, 19968>;
+  auto status = cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
   if (status != cudaSuccess) return status;
-  return cudaOccupancyMaxActiveBlocksPerMultiprocessor(active_blocks, down128, kThreads, kShared);
+  return cudaOccupancyMaxActiveBlocksPerMultiprocessor(active_blocks, k, kThreads, kShared);
+}
+
+extern "C" int marlinw_down128_shape_init(int n, int k_in, int* active_blocks) {
+  using namespace marlinw_down128;
+  auto fn = (n == 6656 && k_in == 19968) ? gemm128<6656, 19968>
+          : (n == 4608 && k_in == 6656)  ? gemm128<4608, 6656>
+          : (n == 4096 && k_in == 6656)  ? gemm128<4096, 6656>
+          : (n == 6656 && k_in == 4096)  ? gemm128<6656, 4096>
+          : nullptr;
+  if (!fn) return cudaErrorInvalidValue;
+  auto status = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  if (status != cudaSuccess) return status;
+  return cudaOccupancyMaxActiveBlocksPerMultiprocessor(active_blocks, fn, kThreads, kShared);
 }
 
 #ifdef D128_PROF
@@ -414,7 +431,29 @@ extern "C" int marlinw_down128_main(
     const int4* scales, const float* global_scale, const int4* work, int grid,
     int row_stride, cudaStream_t stream) {
   using namespace marlinw_down128;
-  down128<<<grid, kThreads, kShared, stream>>>(input, weight, output, scratch, scales,
-                                                global_scale, row_stride, work);
+  gemm128<6656, 19968><<<grid, kThreads, kShared, stream>>>(
+      input, weight, output, scratch, scales, global_scale, row_stride, work);
+  return cudaGetLastError();
+}
+
+extern "C" int marlinw_down128_shape_main(
+    const int4* input, const int4* weight, int4* output, float4* scratch,
+    const int4* scales, const float* global_scale, const int4* work, int grid,
+    int n, int k_in, int row_stride, cudaStream_t stream) {
+  using namespace marlinw_down128;
+  if (n == 6656 && k_in == 19968)
+    gemm128<6656, 19968><<<grid, kThreads, kShared, stream>>>(
+        input, weight, output, scratch, scales, global_scale, row_stride, work);
+  else if (n == 4608 && k_in == 6656)
+    gemm128<4608, 6656><<<grid, kThreads, kShared, stream>>>(
+        input, weight, output, scratch, scales, global_scale, row_stride, work);
+  else if (n == 4096 && k_in == 6656)
+    gemm128<4096, 6656><<<grid, kThreads, kShared, stream>>>(
+        input, weight, output, scratch, scales, global_scale, row_stride, work);
+  else if (n == 6656 && k_in == 4096)
+    gemm128<6656, 4096><<<grid, kThreads, kShared, stream>>>(
+        input, weight, output, scratch, scales, global_scale, row_stride, work);
+  else
+    return cudaErrorInvalidValue;
   return cudaGetLastError();
 }

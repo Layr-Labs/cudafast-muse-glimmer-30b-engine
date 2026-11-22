@@ -1957,6 +1957,9 @@ class MuseGlimmerForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is None:
             return None
+        fn = getattr(self, "_lmpost_softcap_inplace", None)
+        if fn is not None and fn(logits, self.output_multiplier, self.final_logit_softcapping):
+            return logits
         logits = logits * self.output_multiplier
         if self.final_logit_softcapping is not None:
             cap = self.final_logit_softcapping
@@ -1977,10 +1980,9 @@ class MuseGlimmerForCausalLM(
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
-        # LOCAL PATCH (SP5D, Yukon submission 98c1361e; decode argmax only): lmpost's fused softcap + argmax for a
-        # one-row greedy step without logprobs (GPUModelRunner.sample). Its 64K-entry table is this model's
-        # compute_logits chain (x * output_multiplier, then cap * tanh(x / cap)) evaluated by the same torch ops on
-        # every BF16 value; ties go to the lowest index, as the stock greedy sampler's block argmax + argmax.
+        # LOCAL PATCH (SP5D, Yukon submission 98c1361e): lmpost's 64K-entry LUT fused softcap_inplace and
+        # softcap + argmax evaluated by the same torch ops on every BF16 value; ties go to the lowest index.
+        self._lmpost_softcap_inplace = None
         self._lmpost_softcap_argmax = None
         try:
             import lmpost
@@ -1992,4 +1994,5 @@ class MuseGlimmerForCausalLM(
         dev = lm_head.weight.device
         lmpost._get_lut(dev, self.output_multiplier, self.final_logit_softcapping)
         lmpost._get_scratch(dev)
+        self._lmpost_softcap_inplace = lmpost.softcap_inplace
         self._lmpost_softcap_argmax = lmpost.softcap_argmax

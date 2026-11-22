@@ -12,6 +12,13 @@
 // multiple of 16.
 #include <cuda_runtime.h>
 #include <cstdint>
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#include <sys/prctl.h>
+#include <time.h>
+#include <atomic>
+#endif
 
 namespace l2pf {
 
@@ -76,5 +83,50 @@ int l2pf_prefetch_desc(const void* desc, int ndesc, int blocks, int threads, voi
       (const unsigned long long*)desc, ndesc);
   return (int)cudaGetLastError();
 }
+
+#ifdef __linux__
+static std::atomic<bool> g_tickle_started{false};
+
+// Micro-attribution: The pure-C SCHED_IDLE 1 ms nanosleep tickler to prevent ARM LPI-3 deep-idle
+// entry on pinned high-capacity cores is inspired by @zereraz (Yukon submission 77795739).
+static void* l2pf_tickle_worker(void* arg) {
+  int cpu = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+  if (cpu >= 0 && cpu < CPU_SETSIZE) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    (void)sched_setaffinity(0, sizeof(set), &set);
+  }
+  (void)prctl(PR_SET_TIMERSLACK, 1UL, 0, 0, 0);
+  struct sched_param sp{};
+  sp.sched_priority = 0;
+  (void)sched_setscheduler(0, SCHED_IDLE, &sp);
+  struct timespec req{};
+  req.tv_sec = 0;
+  req.tv_nsec = 1000000L;  // 1 ms
+  for (;;) {
+    (void)nanosleep(&req, nullptr);
+  }
+  return nullptr;
+}
+
+int l2pf_start_idle_tickle(const int* cpus, int count) {
+  if (!cpus || count <= 0 || count > 64) return 0;
+  bool expected = false;
+  if (!g_tickle_started.compare_exchange_strong(expected, true)) return 0;
+  int started = 0;
+  for (int i = 0; i < count; ++i) {
+    pthread_t th;
+    if (pthread_create(&th, nullptr, l2pf_tickle_worker,
+                       reinterpret_cast<void*>(static_cast<intptr_t>(cpus[i]))) == 0) {
+      pthread_detach(th);
+      ++started;
+    }
+  }
+  return started;
+}
+#else
+int l2pf_start_idle_tickle(const int*, int) { return 0; }
+#endif
 
 }  // extern "C"

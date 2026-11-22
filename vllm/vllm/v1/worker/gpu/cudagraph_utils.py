@@ -565,6 +565,18 @@ class ModelCudaGraphManager(CudaGraphManager):
                         # run_pw_graph).
                         model_output = self.run_pw_graph(model, model_inputs)
                     else:
+                        if (
+                            model_inputs.get("inputs_embeds") is not None
+                            and not getattr(model, "requires_raw_input_tokens", False)
+                        ):
+                            lm = (
+                                model.get_language_model()
+                                if hasattr(model, "get_language_model")
+                                else model
+                            )
+                            model_inputs["inputs_embeds"].copy_(
+                                lm.embed_input_ids(input_buffers.input_ids[:num_tokens])
+                            )
                         model_output = model(**model_inputs)
 
                 if cg_mode == CUDAGraphMode.PIECEWISE:

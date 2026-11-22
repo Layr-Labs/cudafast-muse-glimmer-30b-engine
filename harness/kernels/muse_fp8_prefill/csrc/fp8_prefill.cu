@@ -80,12 +80,21 @@ using Coop = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
 // 1: 128x192x64 tile (auto stage count = 4). Wins only on the FP8 down projection (6656x19968: 208 -> 140 tiles,
 //    4.33 -> 2.92 waves on 48 SMs; +73 us per call, 29/30 rounds); ties or loses on qkv / gate / o, which keep stock.
 using Cfg1 = Fp8Prefill<Shape<_128, _192, _64>, Shape<_64, _32>, Coop>;
+// 2: 128x192x128 tile (k-tile 128). FP8 down projection (6656x19968).
+// 3: 128x96x128 tile. o_proj (6656x4096) and qkv (4608x6656: exact 4.00 waves on 48 SMs).
+// 4: 128x128x128 tile (auto stages) and 5: 128x64x128 tile (for gate/qkv benchmarking).
+// Micro-attribution: Cfg2 (128x192x128) and Cfg3 (128x96x128) CUTLASS SM120 Cooperative tiles are
+// inspired by @spariev (Yukon submission 262ee4f1); adding (4096, 6656) output_gate coverage in __init__.py is custom.
+using Cfg2 = Fp8Prefill<Shape<_128, _192, _128>, Shape<_64, _32>, Coop>;
+using Cfg3 = Fp8Prefill<Shape<_128, _96, _128>, Shape<_64, _32>, Coop>;
 
 extern "C" int fp8_prefill_gemm(int cfg, int m, int n, int k, const void* a, const void* b, const float* sa,
                                 const float* sb, void* d, void* workspace, size_t capacity, int device, int sms,
                                 cudaStream_t stream) {
   switch (cfg) {
     case 1: return Cfg1::run(m, n, k, a, b, sa, sb, d, workspace, capacity, device, sms, stream);
+    case 2: return Cfg2::run(m, n, k, a, b, sa, sb, d, workspace, capacity, device, sms, stream);
+    case 3: return Cfg3::run(m, n, k, a, b, sa, sb, d, workspace, capacity, device, sms, stream);
   }
   return -1;
 }

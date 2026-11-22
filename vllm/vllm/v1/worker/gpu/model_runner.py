@@ -1274,9 +1274,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         query_start_loc: torch.Tensor | None = None,
+        use_output_bin_counts: bool = True,
     ) -> None:
         # Update the number of computed tokens.
-        if self.is_last_pp_rank:
+        if self.is_last_pp_rank and use_output_bin_counts:
             assert self.sampler is not None
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
         else:
@@ -1430,18 +1431,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
-        # LOCAL PATCH (SP5D, Yukon submission 98c1361e; prefill graph only): a text-only, one-request prefill that
-        # the boot prefill graph can replay embeds its token ids inside that graph (prefill_graph.py), so no eager
-        # embedding runs before the replay; the eager embedding is computed only if the replay is refused.
+        # LOCAL PATCH (SP5D, Yukon submission 98c1361e): text-only steps handled by FULL decode graphs
+        # or the boot PrefillGraph compute embed_input_ids inside the graph, falling back to eager
+        # get_mm_embeddings only if PrefillGraph replay refuses.
         graph_embed = False
         prefill_graph = self.prefill_graph
         if (
             self.supports_mm_inputs
             and self.is_first_pp_rank
             and not dummy_run
-            and prefill_graph is not None
-            and prefill_graph.embed_input_ids is not None
-            and batch_desc.cg_mode == CUDAGraphMode.NONE
             and self.lora_config is None
             and not self.model.requires_raw_input_tokens
             and not scheduler_output.scheduled_encoder_inputs
@@ -1452,13 +1450,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     for rid in input_batch.req_ids
                 )
             )
-            and not skip_compiled
-            and num_tokens_across_dp is None
-            and input_batch.num_reqs == 1
-            and input_batch.num_draft_tokens == 0
-            and input_batch.num_tokens == prefill_graph.num_tokens
-            and input_batch.num_tokens_after_padding == prefill_graph.num_tokens
-            and int(input_batch.num_computed_tokens_np[0]) == 0
+            and (
+                (
+                    batch_desc.cg_mode == CUDAGraphMode.FULL
+                    and self.cudagraph_manager is not None
+                    and batch_desc in self.cudagraph_manager.graphs
+                )
+                or (
+                    batch_desc.cg_mode == CUDAGraphMode.NONE
+                    and prefill_graph is not None
+                    and prefill_graph.embed_input_ids is not None
+                    and not skip_compiled
+                    and num_tokens_across_dp is None
+                    and input_batch.num_reqs == 1
+                    and input_batch.num_draft_tokens == 0
+                    and input_batch.num_tokens == prefill_graph.num_tokens
+                    and input_batch.num_tokens_after_padding == prefill_graph.num_tokens
+                    and int(input_batch.num_computed_tokens_np[0]) == 0
+                    and (not prefill_graph.final_sample_tile or (
+                        self.prompt_logprobs_worker is not None
+                        and not self.prompt_logprobs_worker.uses_prompt_logprobs[input_batch.idx_mapping_np[0]]
+                        and input_batch.cu_num_logits_np[-1] == 1
+                        and self.speculator is None
+                        and self.pcp_manager is None
+                        and not self.use_aux_hidden_state_outputs
+                    ))
+                )
+            )
         ):
             graph_embed = True
         if self.supports_mm_inputs and self.is_first_pp_rank:
@@ -1715,7 +1733,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         known_single_token = (
             input_batch.num_reqs == 1
             and self.num_speculative_steps == 0
-            and not bool(input_batch.is_prefilling_np[0])
+            and int(input_batch.cu_num_logits_np[-1]) == 1
+            and int(input_batch.num_computed_tokens_np[0])
+            + int(input_batch.num_scheduled_tokens[0])
+            >= int(input_batch.prefill_len_np[0])
             and sampler_output.sampled_token_ids.shape == (1, 1)
         )
         # Start async output copy here so that it can overlap with speculator proposal.
@@ -1747,12 +1768,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
+        use_output_bin_counts = (
+            self.is_last_pp_rank
+            and self.sampler is not None
+            and bool(
+                np.any(
+                    self.sampler.penalties_state.use_penalty[
+                        input_batch.idx_mapping_np
+                    ]
+                )
+            )
+        )
         self.postprocess_sampled(
             input_batch.idx_mapping,
             sampler_output.sampled_token_ids,
             num_sampled,
             num_rejected,
             input_batch.query_start_loc,
+            use_output_bin_counts=use_output_bin_counts,
         )
 
         if self.speculator is not None:
