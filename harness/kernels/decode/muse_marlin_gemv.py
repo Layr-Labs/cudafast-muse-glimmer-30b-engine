@@ -11,20 +11,6 @@ _gemv = _lib.muse_marlin_gemv
 _gemv.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
 _gemv.restype = ctypes.c_int
 
-try:
-    # The same Marlin template and layout from harness/kernels/marlint, with
-    # persistent reduction scratch; used for a layer only after a load-time
-    # bitwise comparison with ops.marlin_gemm (use_marlint).
-    import marlint
-except (ImportError, OSError):
-    marlint = None
-
-_marlint_weights: set[int] = set()
-
-
-def use_marlint(tiled_weight: torch.Tensor) -> None:
-    _marlint_weights.add(tiled_weight.data_ptr())
-
 
 def prepare_decode_layout(layer: torch.nn.Module) -> None:
     n, k = layer.output_size_per_partition, layer.input_size_per_partition
@@ -69,10 +55,6 @@ def decode_linear(
 ) -> torch.Tensor:
     if not x.is_contiguous() or x.data_ptr() % 16:
         x = x.clone(memory_format=torch.contiguous_format)
-    if marlint is not None and tiled_weight.data_ptr() in _marlint_weights and x.dim() == 2:
-        out = marlint.gemm(x, tiled_weight, tiled_scales, global_scale, n, k)
-        if out is not None:
-            return out
     output = x.new_empty((*x.shape[:-1], n))
     # Stock's stream-K schedule uses one block per SM and one FP32 tile per lock.
     blocks = 48

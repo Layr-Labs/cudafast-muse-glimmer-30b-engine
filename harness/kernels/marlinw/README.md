@@ -60,28 +60,6 @@ Same instructions on the same operands in the same order per element, same
 reduction tree, same epilogue: the same bits. Built without `--use_fast_math`,
 as the stock kernels are.
 
-## Gated-MLP epilogue (`silu_mul`)
-
-For the merged MLP projection (weight `[gate | up]`, N = 2D) the model's
-compiled graph follows `ops.marlin_gemm` with one Inductor (Triton) kernel for
-`SiluAndMul`: it reads the bf16 gate and up values, computes in fp32
-`g / (exp(-g) + 1) * u` with libdevice's `expf` (flush-to-zero variant, its
-final scaling contracted with the `+ 1` into one fma), `div.full.f32` and one
-round to bf16 at the end (the bf16 cast of `silu(g)` in the graph is not
-materialised). `csrc/silu_mul.cuh` issues that instruction sequence verbatim.
-
-`marlinw_gemm(..., silu_mul = 1)` instantiates the same kernel with
-`silu_mul = true`: the work list holds whole-K tiles only, and each block runs
-the gate tile (chunk, c) and then the up tile (chunk, c + N / 512). The gate
-tile's epilogue is unchanged and stores its bf16 values at the output position;
-the up tile's epilogue, after the unchanged rounding of its own values, makes
-every thread read back exactly the elements it stored there and write
-`silu_mul(gate, up)` instead. So the output equals the stock GEMM followed by
-the Inductor kernel, bit for bit, and the [M, 2D] intermediate never reaches
-DRAM. Row counts whose stock partition cuts a gate_up tile along K (M not a
-multiple of 256) use the unfused schedule followed by `marlinw_silu_mul`, the
-standalone kernel with the same arithmetic.
-
 ## Where it is used
 
 `vllm/vllm/model_executor/kernels/linear/nvfp4/marlin.py` routes the NVFP4
@@ -98,9 +76,4 @@ differs, or any error, falls back to the column-sliced schedule of stock
 calls in `marlin.py` where that is exact, else to the single stock call.
 The engine logs one line with the number of layers on each path.
 
-The fused SiLU-and-mul path is admitted per merged layer by comparing it, at
-512, 4096 and 640 rows, with the single stock call followed by
-`marlinw_silu_mul`, after `marlinw_silu_mul` itself was compared once with a
-Triton copy of the Inductor kernel on every bf16 gate value.
-
-`MARLINW=0` disables it; `MARLINW_SILU=0` disables only the fused epilogue.
+`MARLINW=0` disables it.

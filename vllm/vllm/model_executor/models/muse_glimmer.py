@@ -33,7 +33,6 @@ adapter/projection stack.
 
 import math
 import os
-import weakref
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 from typing import Annotated, Literal
@@ -61,7 +60,6 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.inputs import MultiModalDataDict
-from vllm.model_executor.kernels.linear.nvfp4.marlin import marlin_fp4_silu_mul
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention, MMEncoderAttention
@@ -1097,22 +1095,10 @@ class MuseGlimmerMLP(nn.Module):
                 f"got `{hidden_activation}`."
             )
         self.act_fn = SiluAndMul()
-        # Lets the fused gate_up path report whether its consumer reads bf16.
-        self.gate_up_proj.silu_mul_consumer = weakref.ref(self.down_proj)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if getattr(self.gate_up_proj, "marlin_silu_mul", False) and getattr(
-            self.down_proj, "marlin_bf16_input", False
-        ):
-            # NVFP4 Marlin gate_up with SiLU-and-mul in its epilogue (same bits).
-            # Only when down_proj reads the activation as stored bf16: an FP8
-            # down_proj quantizes it, and the compiled graph fuses that
-            # quantization into the SiLU-and-mul kernel on the unrounded fp32
-            # product, which a bf16 output cannot reproduce.
-            x = marlin_fp4_silu_mul(self.gate_up_proj, x)
-        else:
-            gate_up, _ = self.gate_up_proj(x)
-            x = self.act_fn(gate_up)
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 

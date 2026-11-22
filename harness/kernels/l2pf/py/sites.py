@@ -239,12 +239,14 @@ def _targets():
         # records only the stock CUTLASS site through its default overload.
         out.append((glimmer_fp8_ext, "gemm", "cutlass_fp8", False))
     try:
-        import fp8tile
-    except (ImportError, OSError):
+        # Muse Glimmer decode FP8 GEMV (vllm .../scaled_mm/muse_fp8.py): its weight is the packed buffer (args[2]).
+        # MUSEFP8_L2PF=0 leaves these GEMMs out of the prefetch chain.
+        if os.environ.get("MUSEFP8_L2PF", "1") != "0":
+            pkt = torch.ops.vllm.muse_fp8_scaled_mm
+            pkt.default  # noqa: B018
+            out.append((pkt, "default", "musefp8", False))
+    except (AttributeError, RuntimeError):
         pass
-    else:
-        # The small-M FP8 kernel with the narrower tile (same weight operand).
-        out.append((fp8tile, "gemm", "cutlass_fp8", False))
     try:
         from torch._inductor.select_algorithm import extern_kernels
 
@@ -263,6 +265,12 @@ def _targets():
         out.append((tiled, "default", "marlin_tiled", False))
     except (AttributeError, RuntimeError):
         pass
+    try:
+        # the same GEMV with 6-bit block-scale codes: args[1] tiled codes, args[2] scale codes
+        tiled6 = torch.ops.vllm.marlin_tiled_decode6
+        out.append((tiled6, "default", "marlin_tiled", False))
+    except (AttributeError, RuntimeError):
+        pass
     return out
 
 
@@ -270,7 +278,7 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
     try:
         if kind == "marlin":
             return (args[2], args[4])
-        if kind == "cutlass":
+        if kind in ("cutlass", "musefp8"):
             return (args[2],)
         if kind in ("cutlass_fp8", "mm"):
             return (args[1],)

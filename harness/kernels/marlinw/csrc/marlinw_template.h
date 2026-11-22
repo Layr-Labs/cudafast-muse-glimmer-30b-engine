@@ -238,12 +238,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float,  // is zero point of float16 type?
-          // Gated-MLP output: B holds [gate | up] (N = 2 * D), C is
-          // [M, D] = silu(gate) * up. Every slice must be a whole-K tile and
-          // a block must run the gate tile of (chunk, col) before the up tile
-          // of (chunk, col + n_tiles / 2) (see silu_mul_bf16x2 below).
-          const bool silu_mul = false>
+          const bool is_zp_float   // is zero point of float16 type?
+          >
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -412,7 +408,7 @@ __global__ void Marlin(
     slice_count = w1.y;
     locks_off = w1.z;
     A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
-    C = C0 + 16 * thread_m_blocks / 8 * par_id * (silu_mul ? prob_n / 2 : prob_n);
+    C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
     if (is_a_8bit) {
       __syncthreads();
       int a_s_gl_rd = par_id * 16 * thread_m_blocks + threadIdx.x;
@@ -1522,21 +1518,15 @@ __global__ void Marlin(
   // reshuffle matrix fragments in this step, the reduction above is performed
   // in fragment layout.
   auto write_result = [&](bool last) {
-    int c_gl_stride = (silu_mul ? prob_n / 2 : prob_n) / 8;
+    int c_gl_stride = prob_n / 8;
     constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
     int c_gl_wr_delta = c_gl_stride * (threads / (2 * thread_n_blocks));
     constexpr int c_sh_rd_delta =
         c_sh_stride * (threads / (2 * thread_n_blocks));
 
-    // silu_mul: the gate tile (col < n_half) is stored as bf16 at its output
-    // position; the up tile of the same chunk and output column, run later by
-    // the same block, makes every thread read back exactly the elements it
-    // stored there (same index arithmetic) and replace them.
-    const int n_half = prob_n / (32 * thread_n_blocks);
-    const bool up_tile = silu_mul && slice_col >= n_half;
     int c_gl_wr = c_gl_stride * (threadIdx.x / (2 * thread_n_blocks)) +
                   (threadIdx.x % (2 * thread_n_blocks));
-    c_gl_wr += (2 * thread_n_blocks) * (up_tile ? slice_col - n_half : slice_col);
+    c_gl_wr += (2 * thread_n_blocks) * slice_col;
     int c_sh_wr;
     if constexpr (m_block_size_8) {
       c_sh_wr = (8 * c_sh_stride) * ((threadIdx.x % 32) % 4 * 2) +
@@ -1638,15 +1628,6 @@ __global__ void Marlin(
           for (int a = 0; a < 4; a++) {
             atomicAdd(&C_half2[a], sh_red_half2[a]);
           }
-        } else if (up_tile) {
-          int4 g = C[c_gl_wr];
-          int4 u = sh_red[c_sh_rd];
-          int4 r;
-          r.x = marlinw::silu_mul_bf16x2(g.x, u.x);
-          r.y = marlinw::silu_mul_bf16x2(g.y, u.y);
-          r.z = marlinw::silu_mul_bf16x2(g.z, u.z);
-          r.w = marlinw::silu_mul_bf16x2(g.w, u.w);
-          C[c_gl_wr] = r;
         } else {
           C[c_gl_wr] = sh_red[c_sh_rd];
         }
