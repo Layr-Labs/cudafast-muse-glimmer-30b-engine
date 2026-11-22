@@ -13,6 +13,15 @@ protocol and fp32 scratch). See README.md for the arithmetic it preserves.
 ``MARLINW=0`` disables it. Anything the replica does not cover (other
 configurations, the rows of a last partial chunk) runs through the stock op on
 those rows.
+
+``gemm_silu_mul`` computes silu(gate) * up of a [gate | up] weight in the same
+call (see ``silu_mul``); ``MARLINW_SILU=0`` disables that fusion.
+
+A weight registered with ``use_sched`` runs one of the MarlinS configurations
+(csrc/marlinw_sched.h: the same per-element arithmetic on other CTA shapes)
+on the same slices, cut into 128-column halves where the configuration's tile
+is 128 columns wide; ``SCHED_SHAPES`` names the configuration per (N, K) and
+``MARLINW_SCHED=0`` disables them.
 """
 
 from __future__ import annotations
@@ -23,13 +32,19 @@ import threading
 
 import torch
 
-__all__ = ["LIB_PATH", "available", "prepare", "gemm", "plan", "stock_launches",
-           "stock_slices", "MIN_M"]
+__all__ = ["LIB_PATH", "available", "prepare", "gemm", "gemm_silu_mul", "silu_mul",
+           "plan", "stock_launches", "stock_slices", "MIN_M", "sched_index",
+           "sched_ready", "use_sched", "drop_sched", "on_sched"]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libmarlinw.so")
 ENABLED = os.environ.get("MARLINW", "1") != "0"
+SILU_ENABLED = os.environ.get("MARLINW_SILU", "1") != "0"
+SCHED_ENABLED = os.environ.get("MARLINW_SCHED", "1") != "0"
 MIN_M = 128
 GROUP_CHUNKS = 8
+# (N, K) -> index of the MarlinS configuration (MARLINW_SCHED_LIST in
+# csrc/marlinw.cu) for prompt-sized calls of a weight registered with use_sched.
+SCHED_SHAPES = {(39936, 6656): 0, (6656, 19968): 1}
 
 _STAGES = 4
 _LARGE = ((64, 256, 256), (64, 128, 128), (128, 64, 128))
@@ -43,6 +58,9 @@ _lock = threading.Lock()
 _ready: dict[int, int] = {}
 _plans: dict = {}
 _scratch: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_retired: list[tuple[torch.Tensor, torch.Tensor]] = []
+_sched_cfg: dict = {}  # (dev, index) -> (tile_n, grid) or False
+_sched_of: dict = {}  # (weight data_ptr, fused) -> configuration index
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -169,11 +187,28 @@ def stock_slices(rows: int, n: int, k: int, tmb: int, m8: bool, cfg, grid: int):
 
 class Plan:
     __slots__ = ("m", "n", "k", "sms", "rows", "stock_rows", "items", "ptr", "slots",
-                 "work", "work_ptr", "max_load", "min_load")
+                 "work", "work_ptr", "max_load", "min_load", "silu_mul", "tile_n", "grid")
 
 
-def plan(m: int, n: int, k: int, sms: int, smem: int) -> Plan | None:
-    """Work list for the rows the replica covers, or None (stock for all rows)."""
+def plan(m: int, n: int, k: int, sms: int, smem: int,
+         silu_mul: bool = False, tile_n: int = 256, grid: int | None = None) -> Plan | None:
+    """Work list for the rows the replica covers, or None (stock for all rows).
+
+    smem is the device's opt-in shared memory per block (the stock op's
+    configuration choice depends on it), sms its SM count.
+
+    silu_mul: list for the fused gated-MLP epilogue, or None unless every row
+    is covered and every slice is a whole-K tile. A block then runs the gate
+    tile (chunk, c) and next the up tile (chunk, c + n_tiles / 2); pairs are
+    handed out column-major within groups of GROUP_CHUNKS chunks.
+
+    tile_n 128 (sched kernels with 128-column CTAs): every stock slice of a
+    256-column tile becomes the two slices of its column halves with the same
+    chunk, K range, slice_idx and slice_count (k-split halves get a reduction
+    slot each). grid: blocks of the launch (default sms)."""
+    if tile_n not in (128, 256):
+        return None
+    grid = sms if grid is None else grid
     launches = stock_launches(m, n, k, sms, smem)
     if launches is None:
         return None
@@ -188,42 +223,48 @@ def plan(m: int, n: int, k: int, sms: int, smem: int) -> Plan | None:
             stock_rows.append((row0, row0 + rows))
     if not covered:
         return None
+    if silu_mul and (stock_rows or n % 512):
+        return None
     full = []
     split = []
+    halves = 256 // tile_n
     for (row0, rows, tmb, m8, cfg) in covered:
         chunk0 = row0 // 64
         for mine in stock_slices(rows, n, k, tmb, m8, cfg, sms):
             for (par, col, k0, kn, idx, cnt) in mine:
-                if cnt == 1:
+                for h in range(halves):
                     c = chunk0 + par
-                    full.append((c // GROUP_CHUNKS, col, c, k0, kn))
-                else:
-                    split.append((chunk0 + par, col, k0, kn, idx, cnt))
+                    if cnt == 1:
+                        full.append((c // GROUP_CHUNKS, halves * col + h, c, k0, kn))
+                    else:
+                        split.append((c, halves * col + h, k0, kn, idx, cnt))
+    if silu_mul:
+        return _plan_silu_mul(m, n, k, sms, covered, full, split, tile_n, grid)
     slot_of: dict = {}
     for (chunk, col, *_rest) in sorted(split):
         slot_of.setdefault((chunk, col), len(slot_of))
-    lists: list[list] = [[] for _ in range(sms)]
-    load = [0] * sms
+    lists: list[list] = [[] for _ in range(grid)]
+    load = [0] * grid
     # Column-major inside groups of GROUP_CHUNKS chunks: the blocks that run
     # together share weight tiles, and a group's activations stay in L2.
     full.sort()
     for j, (_g, col, chunk, k0, kn) in enumerate(full):
-        b = j % sms
+        b = j % grid
         lists[b].append((chunk, col, k0, kn, 0, 1, 0))
         load[b] += kn
-    tail: list[list] = [[] for _ in range(sms)]
+    tail: list[list] = [[] for _ in range(grid)]
     for (chunk, col, k0, kn, idx, cnt) in sorted(split, key=lambda s: (-s[3], s[4], s[0], s[1])):
-        b = min(range(sms), key=lambda i: (load[i], i))
+        b = min(range(grid), key=lambda i: (load[i], i))
         tail[b].append((chunk, col, k0, kn, idx, cnt, slot_of[(chunk, col)]))
         load[b] += kn
-    for b in range(sms):
+    for b in range(grid):
         # Every block runs its unsynchronised slices first and its reduction
         # slices by increasing index: a slice waits only for slices of lower
         # index, so with all blocks resident every wait ends.
         lists[b].extend(sorted(tail[b], key=lambda s: (s[4], s[0], s[1])))
     items = []
     ptr = [0]
-    for b in range(sms):
+    for b in range(grid):
         for (chunk, col, k0, kn, idx, cnt, slot) in lists[b]:
             items.append((chunk, col, k0, kn, idx, cnt, slot, 0))
         ptr.append(len(items))
@@ -234,6 +275,50 @@ def plan(m: int, n: int, k: int, sms: int, smem: int) -> Plan | None:
     p.items, p.ptr, p.slots = items, ptr, len(slot_of)
     p.max_load, p.min_load = max(load), min(load)
     p.work = p.work_ptr = None
+    p.silu_mul = False
+    p.tile_n, p.grid = tile_n, grid
+    return p
+
+
+def _plan_silu_mul(m, n, k, sms, covered, full, split, tile_n=256,
+                   grid=None) -> Plan | None:
+    if split:
+        return None
+    grid = sms if grid is None else grid
+    half = n // tile_n // 2
+    k_tiles = k // 64
+    tiles = {(chunk, col) for (_g, col, chunk, k0, kn) in full}
+    pairs = []
+    for (g, col, chunk, k0, kn) in sorted(full):
+        if k0 != 0 or kn != k_tiles:
+            return None
+        if col < half:
+            if (chunk, col + half) not in tiles:
+                return None
+            pairs.append((g, col, chunk))
+    if 2 * len(pairs) != len(full):
+        return None
+    lists: list[list] = [[] for _ in range(grid)]
+    for j, (_g, col, chunk) in enumerate(pairs):
+        lists[j % grid].append((chunk, col))
+    items = []
+    ptr = [0]
+    load = []
+    for b in range(grid):
+        for (chunk, col) in lists[b]:
+            items.append((chunk, col, 0, k_tiles, 0, 1, 0, 0))
+            items.append((chunk, col + half, 0, k_tiles, 0, 1, 0, 0))
+        ptr.append(len(items))
+        load.append(2 * k_tiles * len(lists[b]))
+    p = Plan()
+    p.m, p.n, p.k, p.sms = m, n, k, sms
+    p.rows = covered[-1][0] + covered[-1][1]
+    p.stock_rows = []
+    p.items, p.ptr, p.slots = items, ptr, 0
+    p.max_load, p.min_load = max(load), min(load)
+    p.work = p.work_ptr = None
+    p.silu_mul = True
+    p.tile_n, p.grid = tile_n, grid
     return p
 
 
@@ -248,16 +333,31 @@ def _load():
         lib = ctypes.CDLL(LIB_PATH)
         lib.marlinw_init.argtypes = [ctypes.c_int]
         lib.marlinw_init.restype = ctypes.c_int
-        lib.marlinw_regs.argtypes = []
+        lib.marlinw_regs.argtypes = [ctypes.c_int]
         lib.marlinw_regs.restype = ctypes.c_int
         lib.marlinw_gemm.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,  # A B C C_tmp
             ctypes.c_void_p, ctypes.c_void_p,  # scales global_scale
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # M N K lda
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,  # locks work work_ptr
-            ctypes.c_int, ctypes.c_int, ctypes.c_void_p,  # grid smem stream
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,  # grid smem silu stream
         ]
         lib.marlinw_gemm.restype = ctypes.c_int
+        lib.marlinw_silu_mul.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        lib.marlinw_silu_mul.restype = ctypes.c_int
+        lib.marlinw_sched_count.argtypes = []
+        lib.marlinw_sched_count.restype = ctypes.c_int
+        lib.marlinw_sched_init.argtypes = [ctypes.c_int]
+        lib.marlinw_sched_init.restype = ctypes.c_int
+        lib.marlinw_sched_info.argtypes = [ctypes.c_int, ctypes.c_void_p]
+        lib.marlinw_sched_info.restype = ctypes.c_int
+        lib.marlinw_sched_gemm.argtypes = [ctypes.c_int] + lib.marlinw_gemm.argtypes[:14] + [
+            ctypes.c_int, ctypes.c_void_p,  # silu stream
+        ]
+        lib.marlinw_sched_gemm.restype = ctypes.c_int
         _lib = lib
     except OSError as exc:
         _load_error = str(exc)
@@ -291,9 +391,60 @@ def _init(dev: int) -> int | None:
     return smem
 
 
-def _get_plan(m: int, n: int, k: int, device: torch.device):
+def _sched_config(dev: int, v: int):
+    """(tile_n, grid) of MarlinS configuration v on this device, or False when it
+    is not built or fewer CTAs than its plan assumes fit on an SM (k-split
+    slices wait on each other, so every CTA of the grid must be resident)."""
+    key = (dev, v)
+    cfg = _sched_cfg.get(key)
+    if cfg is not None:
+        return cfg
+    lib = _load()
+    if lib is None or torch.cuda.is_current_stream_capturing():
+        return False
+    cfg = False
+    with torch.cuda.device(dev):
+        info = (ctypes.c_int * 8)()
+        if (0 <= v < lib.marlinw_sched_count() and lib.marlinw_sched_init(v) == 0
+                and lib.marlinw_sched_info(v, ctypes.cast(info, ctypes.c_void_p)) == 0):
+            threads, tile_n, min_blocks, _smem, occ, occ_silu = list(info)[:6]
+            if min(occ, occ_silu) >= min_blocks:
+                sms = torch.cuda.get_device_properties(dev).multi_processor_count
+                cfg = (tile_n, min_blocks * sms)
+    _sched_cfg[key] = cfg
+    return cfg
+
+
+def sched_index(n: int, k: int) -> int | None:
+    """MarlinS configuration for an (N, K) weight, or None."""
+    if not (ENABLED and SCHED_ENABLED):
+        return None
+    return SCHED_SHAPES.get((n, k))
+
+
+def sched_ready(device: torch.device, v: int) -> bool:
+    """Whether configuration v can run on this device (call outside capture)."""
+    return _load() is not None and bool(_sched_config(_device_index(device), v))
+
+
+def use_sched(weight: torch.Tensor, v: int, fused: bool = False) -> None:
+    """Prompt-sized calls of this weight (plain, or fused SiLU-and-mul) run
+    configuration v from now on."""
+    _sched_of[(weight.data_ptr(), fused)] = v
+
+
+def drop_sched(weight: torch.Tensor, fused: bool = False) -> None:
+    _sched_of.pop((weight.data_ptr(), fused), None)
+
+
+def on_sched(weight: torch.Tensor, fused: bool = False) -> int | None:
+    return _sched_of.get((weight.data_ptr(), fused))
+
+
+def _get_plan(m: int, n: int, k: int, device: torch.device, silu_mul: bool = False,
+              v: int | None = None):
     dev = _device_index(device)
-    key = (m, n, k, dev)
+    key = (m, n, k, dev, silu_mul, v)
     p = _plans.get(key)
     if p is not None:
         return p
@@ -303,8 +454,15 @@ def _get_plan(m: int, n: int, k: int, device: torch.device):
     if smem is None:
         return None
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    tile_n, grid = 256, sms
+    if v is not None:
+        cfg = _sched_config(dev, v)
+        if not cfg:
+            _plans[key] = False
+            return False
+        tile_n, grid = cfg
     with _lock:
-        p = plan(m, n, k, sms, smem)
+        p = plan(m, n, k, sms, smem, silu_mul, tile_n, grid)
         if p is not None:
             p.work = torch.tensor(p.items, dtype=torch.int32).reshape(-1).to(device)
             p.work_ptr = torch.tensor(p.ptr, dtype=torch.int32).to(device)
@@ -317,6 +475,9 @@ def _ensure_scratch(dev: int, device: torch.device, slots: int):
     cur = _scratch.get(dev)
     if cur is not None and cur[0].numel() >= slots:
         return
+    if cur is not None:
+        # A captured CUDA graph may hold the old buffers: never free them.
+        _retired.append(cur)
     locks = torch.zeros(slots, dtype=torch.int32, device=device)
     c_tmp = torch.empty(slots * 64 * 256, dtype=torch.float32, device=device)
     _scratch[dev] = (locks, c_tmp)
@@ -336,21 +497,70 @@ def gemm(x2: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     if (x2.dtype != torch.bfloat16 or x2.stride(-1) != 1 or x2.stride(0) % 8
             or x2.data_ptr() % 16 or not x2.is_cuda):
         return None
-    p = _get_plan(m, n, k, x2.device)
+    v = on_sched(weight) if SCHED_ENABLED else None
+    p = _get_plan(m, n, k, x2.device, False, v)
     if not p:
         return None
-    dev = _device_index(x2.device)
-    locks, c_tmp = _scratch[dev]
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x2.device)
-    rc = _lib.marlinw_gemm(
-        x2.data_ptr(), weight.data_ptr(), out.data_ptr(), c_tmp.data_ptr(),
-        weight_scale.data_ptr(), global_scale.data_ptr(), p.rows, n, k, x2.stride(0),
-        locks.data_ptr(), p.work.data_ptr(), p.work_ptr.data_ptr(), p.sms, _ready[dev],
-        torch.cuda.current_stream(x2.device).cuda_stream)
-    if rc != 0:
-        raise RuntimeError(f"marlinw_gemm failed: {rc}")
+    _launch(p, v, x2, weight, weight_scale, global_scale, out, n, k, 0)
     for (r0, r1) in p.stock_rows:
         stock(x2[r0:r1], out[r0:r1])
+    return out
+
+
+def _x_ok(x2: torch.Tensor) -> bool:
+    return (x2.dtype == torch.bfloat16 and x2.stride(-1) == 1 and x2.stride(0) % 8 == 0
+            and x2.data_ptr() % 16 == 0 and x2.is_cuda)
+
+
+def gemm_silu_mul(x2: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+                  global_scale: torch.Tensor, n: int, k: int) -> torch.Tensor | None:
+    """x2 [M, K] bf16 -> [M, N / 2] bf16: silu(gate) * up of the [M, N] result
+    [gate | up] of the stock op, bit for bit as silu_mul(stock(x2)); or None
+    (no fused plan for this M)."""
+    m = x2.shape[0]
+    if not (ENABLED and SILU_ENABLED) or m < MIN_M or not _x_ok(x2):
+        return None
+    v = on_sched(weight, True) if SCHED_ENABLED else None
+    p = _get_plan(m, n, k, x2.device, True, v)
+    if not p:
+        return None
+    out = torch.empty((m, n // 2), dtype=torch.bfloat16, device=x2.device)
+    _launch(p, v, x2, weight, weight_scale, global_scale, out, n, k, 1)
+    return out
+
+
+def _launch(p: Plan, v: int | None, x2: torch.Tensor, weight: torch.Tensor,
+            weight_scale: torch.Tensor, global_scale: torch.Tensor, out: torch.Tensor,
+            n: int, k: int, silu: int) -> None:
+    dev = _device_index(x2.device)
+    locks, c_tmp = _scratch[dev]
+    args = (x2.data_ptr(), weight.data_ptr(), out.data_ptr(), c_tmp.data_ptr(),
+            weight_scale.data_ptr(), global_scale.data_ptr(), p.rows, n, k, x2.stride(0),
+            locks.data_ptr(), p.work.data_ptr(), p.work_ptr.data_ptr(), p.grid)
+    stream = torch.cuda.current_stream(x2.device).cuda_stream
+    if v is None:
+        rc = _lib.marlinw_gemm(*args, _ready[dev], silu, stream)
+    else:
+        rc = _lib.marlinw_sched_gemm(v, *args, silu, stream)
+    if rc != 0:
+        raise RuntimeError(f"marlinw gemm failed: {rc}")
+
+
+def silu_mul(y: torch.Tensor) -> torch.Tensor:
+    """y [M, 2D] bf16 (gate | up) -> [M, D] bf16, silu(gate) * up with the
+    arithmetic of the compiled SiluAndMul glue (see csrc/silu_mul.cuh)."""
+    lib = _load()
+    m, n2 = y.shape
+    d = n2 // 2
+    if (lib is None or y.dtype != torch.bfloat16 or n2 % 16 or y.stride(-1) != 1
+            or y.stride(0) % 8 or y.data_ptr() % 16 or not y.is_cuda):
+        raise RuntimeError("marlinw.silu_mul: unsupported input")
+    out = torch.empty((m, d), dtype=torch.bfloat16, device=y.device)
+    rc = lib.marlinw_silu_mul(y.data_ptr(), out.data_ptr(), m, d, y.stride(0),
+                              torch.cuda.current_stream(y.device).cuda_stream)
+    if rc != 0:
+        raise RuntimeError(f"marlinw_silu_mul failed: {rc}")
     return out
 
 

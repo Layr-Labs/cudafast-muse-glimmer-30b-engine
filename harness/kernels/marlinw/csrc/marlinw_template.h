@@ -28,9 +28,6 @@
 #include "dequant.h"
 #include "marlin_mma.h"
 #include "core/scalar_type.hpp"
-#ifdef MARLINW_SWIGLU
-#include "swiglu.cuh"
-#endif
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -241,8 +238,12 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float   // is zero point of float16 type?
-          >
+          const bool is_zp_float,  // is zero point of float16 type?
+          // Gated-MLP output: B holds [gate | up] (N = 2 * D), C is
+          // [M, D] = silu(gate) * up. Every slice must be a whole-K tile and
+          // a block must run the gate tile of (chunk, col) before the up tile
+          // of (chunk, col + n_tiles / 2) (see silu_mul_bf16x2 below).
+          const bool silu_mul = false>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -275,11 +276,7 @@ __global__ void Marlin(
     // order. Item i is work[2 * i] = {par_id, slice_col, slice_row,
     // slice_iters} and work[2 * i + 1] = {slice_idx, slice_count, locks_off,
     // unused}: one "slice" of the striped partition, computed on the host.
-    const int4* __restrict__ work, const int* __restrict__ work_ptr
-#ifdef MARLINW_SWIGLU_FP8
-    , const float* __restrict__ down_input_scale
-#endif
-    ) {
+    const int4* __restrict__ work, const int* __restrict__ work_ptr) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -385,21 +382,6 @@ __global__ void Marlin(
     prob_m = m_block_size;
   }
 
-#ifdef MARLINW_SWIGLU
-  // Exactly eight 64-row chunks, each with an independent full K reduction.
-  // Neighboring CTAs reuse the same gate/up weight columns across those chunks.
-  const int par_id = blockIdx.x % 8;
-  const int slice_col = blockIdx.x / 8;
-  constexpr int slice_row = 0, slice_idx = 0, slice_count = 1, locks_off = 0;
-  int slice_iters = 6656 / (16 * thread_k_blocks);
-  A = A0 + (16 * thread_m_blocks / 8) * par_id * lda;
-#ifdef MARLINW_SWIGLU_FP8
-  C = C0 + thread_m_blocks * par_id * (prob_n / 2);
-#else
-  C = C0 + (16 * thread_m_blocks / 8) * par_id * (prob_n / 2);
-#endif
-  auto init_slice = [&]() { slice_iters = 0; };
-#else
   int slice_row = 0;
   int slice_col = 0;
   int slice_iters = 0;  // number of threadblock tiles in the current slice
@@ -430,7 +412,7 @@ __global__ void Marlin(
     slice_count = w1.y;
     locks_off = w1.z;
     A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
-    C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
+    C = C0 + 16 * thread_m_blocks / 8 * par_id * (silu_mul ? prob_n / 2 : prob_n);
     if (is_a_8bit) {
       __syncthreads();
       int a_s_gl_rd = par_id * 16 * thread_m_blocks + threadIdx.x;
@@ -440,7 +422,6 @@ __global__ void Marlin(
   };
 
   init_slice();
-#endif
 
   // A sizes/strides
 
@@ -551,17 +532,6 @@ __global__ void Marlin(
                 s_sh_stride * slice_col + threadIdx.x % s_sh_stride;
     }
   }
-#ifdef MARLINW_SWIGLU
-  // Remap two virtual 64-column halves to the original gate and up tensors.
-  // Codes and scales keep their existing 64-column internal Marlin permutation.
-  static_assert(b_sh_stride == 64 && s_sh_stride == 8 && threads == 128);
-  b_gl_rd -= (b_sh_stride / 2) * slice_col;
-  s_gl_rd -= (s_sh_stride / 2) * slice_col;
-  if (threadIdx.x & (b_sh_stride / 2))
-    b_gl_rd += (b_gl_stride - b_sh_stride) / 2;
-  if (threadIdx.x & (s_sh_stride / 2))
-    s_gl_rd += (s_gl_stride - s_sh_stride) / 2;
-#endif
   auto s_sh_wr = threadIdx.x;
   bool s_sh_wr_pred = threadIdx.x < s_sh_stage;
 
@@ -1552,15 +1522,21 @@ __global__ void Marlin(
   // reshuffle matrix fragments in this step, the reduction above is performed
   // in fragment layout.
   auto write_result = [&](bool last) {
-    int c_gl_stride = prob_n / 8;
+    int c_gl_stride = (silu_mul ? prob_n / 2 : prob_n) / 8;
     constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
     int c_gl_wr_delta = c_gl_stride * (threads / (2 * thread_n_blocks));
     constexpr int c_sh_rd_delta =
         c_sh_stride * (threads / (2 * thread_n_blocks));
 
+    // silu_mul: the gate tile (col < n_half) is stored as bf16 at its output
+    // position; the up tile of the same chunk and output column, run later by
+    // the same block, makes every thread read back exactly the elements it
+    // stored there (same index arithmetic) and replace them.
+    const int n_half = prob_n / (32 * thread_n_blocks);
+    const bool up_tile = silu_mul && slice_col >= n_half;
     int c_gl_wr = c_gl_stride * (threadIdx.x / (2 * thread_n_blocks)) +
                   (threadIdx.x % (2 * thread_n_blocks));
-    c_gl_wr += (2 * thread_n_blocks) * slice_col;
+    c_gl_wr += (2 * thread_n_blocks) * (up_tile ? slice_col - n_half : slice_col);
     int c_sh_wr;
     if constexpr (m_block_size_8) {
       c_sh_wr = (8 * c_sh_stride) * ((threadIdx.x % 32) % 4 * 2) +
@@ -1649,43 +1625,6 @@ __global__ void Marlin(
     }
     __syncthreads();
 
-#ifdef MARLINW_SWIGLU
-    // Every warp writes two products per lane. Read the producer's already
-    // rounded BF16 fragments from the two halves of each 128-column tile.
-    using Words = uint32_t;
-    constexpr int values = sizeof(Words) / sizeof(__nv_bfloat16);
-    auto shared = reinterpret_cast<const Words*>(sh_red);
-#ifdef MARLINW_SWIGLU_FP8
-    auto out = reinterpret_cast<uint16_t*>(C);
-    float inverse;
-    asm("div.full.f32 %0, 0f3F800000, %1;" : "=f"(inverse) : "f"(*down_input_scale));
-#else
-    auto out = reinterpret_cast<Words*>(C);
-#endif
-    constexpr int warps = threads / 32;
-    constexpr int half_tile = thread_n_blocks * 16 / 2;
-    static_assert(half_tile == 32 * values);
-    const int lane = threadIdx.x % 32;
-    #pragma unroll 1
-    for (int row = threadIdx.x / 32; row < 16 * thread_m_blocks; row += warps) {
-      const int shared_idx = row * (c_sh_stride * sizeof(int4) / sizeof(Words)) + lane;
-      const int out_idx = row * (prob_n / (2 * values)) + slice_col * 32 + lane;
-      const Words gates = shared[shared_idx];
-      const Words ups = shared[shared_idx + 32];
-#ifdef MARLINW_SWIGLU_FP8
-      out[out_idx] = swiglu_fp8_pair(gates, ups, inverse);
-#else
-      Words products;
-      #pragma unroll
-      for (int e = 0; e < values; ++e) {
-        auto gate = reinterpret_cast<const __nv_bfloat16*>(&gates)[e];
-        auto up = reinterpret_cast<const __nv_bfloat16*>(&ups)[e];
-        reinterpret_cast<__nv_bfloat16*>(&products)[e] = swiglu_product(gate, up);
-      }
-      out[out_idx] = products;
-#endif
-    }
-#else
   #pragma unroll
     for (int i = 0;
          i < div_ceil(16 * thread_m_blocks, threads / (2 * thread_n_blocks));
@@ -1699,6 +1638,15 @@ __global__ void Marlin(
           for (int a = 0; a < 4; a++) {
             atomicAdd(&C_half2[a], sh_red_half2[a]);
           }
+        } else if (up_tile) {
+          int4 g = C[c_gl_wr];
+          int4 u = sh_red[c_sh_rd];
+          int4 r;
+          r.x = silu_mul_bf16x2(g.x, u.x);
+          r.y = silu_mul_bf16x2(g.y, u.y);
+          r.z = silu_mul_bf16x2(g.z, u.z);
+          r.w = silu_mul_bf16x2(g.w, u.w);
+          C[c_gl_wr] = r;
         } else {
           C[c_gl_wr] = sh_red[c_sh_rd];
         }
@@ -1706,7 +1654,6 @@ __global__ void Marlin(
         c_sh_rd += c_sh_rd_delta;
       }
     }
-#endif
     __syncthreads();
   };
 
