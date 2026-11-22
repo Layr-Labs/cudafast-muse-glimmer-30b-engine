@@ -11,14 +11,15 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import DEFAULT, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from backends import FakeBackend  # noqa: E402
-from resident import IMPLEMENTED_DEPTH, RefusedError, Session  # noqa: E402
+from backends import FakeBackend, VllmBackend  # noqa: E402
+from resident import IMPLEMENTED_DEPTH, RefusedError, Session, serve_connection  # noqa: E402
 
 PROMPT = list(range(100, 164))
 
@@ -259,6 +260,169 @@ class SessionTests(unittest.TestCase):
         with open(src) as fp:
             line = next(l for l in fp if l.startswith("pub const ENGINE_IMPLEMENTED_DEPTH"))
         self.assertEqual(int(line.split("=")[1].strip().rstrip(";")), IMPLEMENTED_DEPTH)
+
+
+class CheckIdsTests(unittest.TestCase):
+    """The fast sweep accepts and refuses exactly what the per-token check does."""
+
+    def test_the_sweep_and_the_per_token_check_agree(self):
+        class Sub(int):
+            pass
+
+        s = Session(FakeBackend(depth=0))
+        vocab = s.b.vocab_size
+        accepted = [[0], [vocab - 1], list(range(512)), [Sub(7), 3], []]
+        refused = [[vocab], [-1], [3, True], [False], [1.0], ["1"], [None], [Sub(vocab)], [5, vocab, 6]]
+        for tokens in accepted:
+            s._check_ids(tokens)
+        for tokens in refused:
+            with self.assertRaises(RefusedError, msg=repr(tokens)):
+                s._check_ids(tokens)
+
+
+class CountingConn:
+    """A server-side connection that counts the replies written to it."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.sent = 0
+
+    def sendall(self, data):
+        self._conn.sendall(data)
+        self.sent += 1
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class SettleTests(unittest.TestCase):
+    """REPLY FIRST, THEN CLEAN UP: one settle per reply, after it is written."""
+
+    def serve(self, backend):
+        client, server = socket.socketpair()
+        conn = CountingConn(server)
+        session = Session(backend)
+        thread = threading.Thread(target=serve_connection, args=(session, conn, 5.0))
+        thread.start()
+        reader = client.makefile("rb")
+
+        def call(obj):
+            client.sendall((json.dumps(obj) + "\n").encode())
+            return json.loads(reader.readline())
+
+        def close():
+            reader.close()
+            client.close()
+            thread.join(timeout=10)
+            server.close()
+
+        self.addCleanup(close)
+        # The reply reaches the client BEFORE the server settles, so a test
+        # that counts settles first waits for the server to finish the phase.
+        self.server_done = lambda: thread.join(timeout=10)
+        return session, conn, call
+
+    def test_the_resident_settles_once_after_every_reply(self):
+        seen = []
+
+        class Recording(FakeBackend):
+            def settle(inner):
+                seen.append(conn.sent)
+                super().settle()
+
+        backend = Recording(depth=0)
+        session, conn, call = self.serve(backend)
+        seed = call({"op": "sync", "tokens": PROMPT, "max_tokens": 1, "argmax_only": True})["token"]
+        self.assertFalse(call({"op": "nope"})["ok"])
+        self.assertEqual(call({"op": "sync", "tokens": PROMPT, "argmax_only": True})["token"], seed)
+        self.assertEqual(call({"op": "serial_run", "first_token": seed, "count": 8})["tokens"], serial_stream(8))
+        self.assertTrue(call({"op": "invalidate"})["ok"])
+        self.assertTrue(call({"op": "bye"})["ok"])
+        self.server_done()
+        # Settle number i ran when exactly i replies had been written.
+        self.assertEqual(seen, [1, 2, 3, 4, 5, 6])
+        self.assertEqual(backend.settles, 6)
+
+    def test_a_failed_settle_drops_the_sequence_and_keeps_the_phase(self):
+        class Failing(FakeBackend):
+            def settle(inner):
+                super().settle()
+                if inner.settles == 1:
+                    raise RuntimeError("cleanup failed")
+
+        session, conn, call = self.serve(Failing(depth=0))
+        seed = call({"op": "sync", "tokens": PROMPT})["token"]
+        # The sync's own reply was already written; the sequence is gone.
+        self.assertFalse(call({"op": "argmax"})["ok"])
+        self.assertEqual(call({"op": "sync", "tokens": PROMPT})["token"], seed)
+        self.assertEqual(call({"op": "argmax"})["token"], seed)
+
+
+class FakeEngine:
+    """The slice of LLMEngine that VllmBackend.abort and .settle touch."""
+
+    def __init__(self):
+        self.unfinished = False
+        self.aborted: list[list[str]] = []
+        self.steps = 0
+
+    def has_unfinished_requests(self):
+        return self.unfinished
+
+    def abort_request(self, request_ids):
+        self.aborted.append(list(request_ids))
+        self.unfinished = False
+
+    def step(self):
+        self.steps += 1
+        return []
+
+
+class BackendSettleTests(unittest.TestCase):
+    def backend(self, deferred=True):
+        b = VllmBackend.__new__(VllmBackend)
+        b._engine = FakeEngine()
+        b._live = None
+        self.core_settles = 0
+
+        def settle_core():
+            self.core_settles += 1
+
+        b._settle_core = settle_core if deferred else None
+        return b
+
+    def test_settle_finishes_a_request_that_completed_on_its_own(self):
+        b = self.backend()
+        b._live = "r1"
+        b.settle()
+        self.assertIsNone(b._live)
+        self.assertEqual(b._engine.aborted, [["r1"]])
+        self.assertGreaterEqual(self.core_settles, 1)
+        # The next start's abort finds nothing left to do in the engine.
+        self.assertFalse(b.abort())
+        self.assertEqual(b._engine.aborted, [["r1"]])
+
+    def test_settle_never_touches_a_request_that_is_still_generating(self):
+        b = self.backend()
+        b._live = "r1"
+        b._engine.unfinished = True
+        b.settle()
+        self.assertEqual(b._live, "r1")
+        self.assertEqual(b._engine.aborted, [])
+        self.assertTrue(b.abort())
+        self.assertEqual(b._engine.aborted, [["r1"]])
+
+    def test_abort_settles_the_core_even_with_nothing_live(self):
+        b = self.backend()
+        self.assertFalse(b.abort())
+        self.assertEqual(self.core_settles, 1)
+
+    def test_without_the_deferral_settle_is_a_no_op(self):
+        b = self.backend(deferred=False)
+        b._live = "r1"
+        b.settle()
+        self.assertEqual(b._live, "r1")
+        self.assertEqual(b._engine.aborted, [])
 
 
 class WireTests(unittest.TestCase):
