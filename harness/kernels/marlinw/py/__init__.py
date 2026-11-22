@@ -13,6 +13,9 @@ protocol and fp32 scratch). See README.md for the arithmetic it preserves.
 ``MARLINW=0`` disables it. Anything the replica does not cover (other
 configurations, the rows of a last partial chunk) runs through the stock op on
 those rows.
+
+``gemm_silu_mul`` computes silu(gate) * up of a [gate | up] weight in the same
+call (see ``silu_mul``); ``MARLINW_SILU=0`` disables that fusion.
 """
 
 from __future__ import annotations
@@ -23,11 +26,12 @@ import threading
 
 import torch
 
-__all__ = ["LIB_PATH", "available", "prepare", "gemm", "plan", "stock_launches",
-           "stock_slices", "MIN_M"]
+__all__ = ["LIB_PATH", "available", "prepare", "gemm", "gemm_silu_mul", "silu_mul",
+           "plan", "stock_launches", "stock_slices", "MIN_M"]
 
 LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "libmarlinw.so")
 ENABLED = os.environ.get("MARLINW", "1") != "0"
+SILU_ENABLED = os.environ.get("MARLINW_SILU", "1") != "0"
 MIN_M = 128
 GROUP_CHUNKS = 8
 
@@ -169,11 +173,17 @@ def stock_slices(rows: int, n: int, k: int, tmb: int, m8: bool, cfg, grid: int):
 
 class Plan:
     __slots__ = ("m", "n", "k", "sms", "rows", "stock_rows", "items", "ptr", "slots",
-                 "work", "work_ptr", "max_load", "min_load")
+                 "work", "work_ptr", "max_load", "min_load", "silu_mul")
 
 
-def plan(m: int, n: int, k: int, sms: int, smem: int) -> Plan | None:
-    """Work list for the rows the replica covers, or None (stock for all rows)."""
+def plan(m: int, n: int, k: int, sms: int, smem: int,
+         silu_mul: bool = False) -> Plan | None:
+    """Work list for the rows the replica covers, or None (stock for all rows).
+
+    silu_mul: list for the fused gated-MLP epilogue, or None unless every row
+    is covered and every slice is a whole-K tile. A block then runs the gate
+    tile (chunk, c) and next the up tile (chunk, c + n_tiles / 2); pairs are
+    handed out column-major within groups of GROUP_CHUNKS chunks."""
     launches = stock_launches(m, n, k, sms, smem)
     if launches is None:
         return None
@@ -188,6 +198,8 @@ def plan(m: int, n: int, k: int, sms: int, smem: int) -> Plan | None:
             stock_rows.append((row0, row0 + rows))
     if not covered:
         return None
+    if silu_mul and (stock_rows or n % 512):
+        return None
     full = []
     split = []
     for (row0, rows, tmb, m8, cfg) in covered:
@@ -199,6 +211,8 @@ def plan(m: int, n: int, k: int, sms: int, smem: int) -> Plan | None:
                     full.append((c // GROUP_CHUNKS, col, c, k0, kn))
                 else:
                     split.append((chunk0 + par, col, k0, kn, idx, cnt))
+    if silu_mul:
+        return _plan_silu_mul(m, n, k, sms, covered, full, split)
     slot_of: dict = {}
     for (chunk, col, *_rest) in sorted(split):
         slot_of.setdefault((chunk, col), len(slot_of))
@@ -234,6 +248,46 @@ def plan(m: int, n: int, k: int, sms: int, smem: int) -> Plan | None:
     p.items, p.ptr, p.slots = items, ptr, len(slot_of)
     p.max_load, p.min_load = max(load), min(load)
     p.work = p.work_ptr = None
+    p.silu_mul = False
+    return p
+
+
+def _plan_silu_mul(m, n, k, sms, covered, full, split) -> Plan | None:
+    if split:
+        return None
+    half = n // 256 // 2
+    k_tiles = k // 64
+    tiles = {(chunk, col) for (_g, col, chunk, k0, kn) in full}
+    pairs = []
+    for (g, col, chunk, k0, kn) in sorted(full):
+        if k0 != 0 or kn != k_tiles:
+            return None
+        if col < half:
+            if (chunk, col + half) not in tiles:
+                return None
+            pairs.append((g, col, chunk))
+    if 2 * len(pairs) != len(full):
+        return None
+    lists: list[list] = [[] for _ in range(sms)]
+    for j, (_g, col, chunk) in enumerate(pairs):
+        lists[j % sms].append((chunk, col))
+    items = []
+    ptr = [0]
+    load = []
+    for b in range(sms):
+        for (chunk, col) in lists[b]:
+            items.append((chunk, col, 0, k_tiles, 0, 1, 0, 0))
+            items.append((chunk, col + half, 0, k_tiles, 0, 1, 0, 0))
+        ptr.append(len(items))
+        load.append(2 * k_tiles * len(lists[b]))
+    p = Plan()
+    p.m, p.n, p.k, p.sms = m, n, k, sms
+    p.rows = covered[-1][0] + covered[-1][1]
+    p.stock_rows = []
+    p.items, p.ptr, p.slots = items, ptr, 0
+    p.max_load, p.min_load = max(load), min(load)
+    p.work = p.work_ptr = None
+    p.silu_mul = True
     return p
 
 
@@ -248,16 +302,21 @@ def _load():
         lib = ctypes.CDLL(LIB_PATH)
         lib.marlinw_init.argtypes = [ctypes.c_int]
         lib.marlinw_init.restype = ctypes.c_int
-        lib.marlinw_regs.argtypes = []
+        lib.marlinw_regs.argtypes = [ctypes.c_int]
         lib.marlinw_regs.restype = ctypes.c_int
         lib.marlinw_gemm.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,  # A B C C_tmp
             ctypes.c_void_p, ctypes.c_void_p,  # scales global_scale
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,  # M N K lda
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,  # locks work work_ptr
-            ctypes.c_int, ctypes.c_int, ctypes.c_void_p,  # grid smem stream
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,  # grid smem silu stream
         ]
         lib.marlinw_gemm.restype = ctypes.c_int
+        lib.marlinw_silu_mul.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        lib.marlinw_silu_mul.restype = ctypes.c_int
         _lib = lib
     except OSError as exc:
         _load_error = str(exc)
@@ -291,9 +350,9 @@ def _init(dev: int) -> int | None:
     return smem
 
 
-def _get_plan(m: int, n: int, k: int, device: torch.device):
+def _get_plan(m: int, n: int, k: int, device: torch.device, silu_mul: bool = False):
     dev = _device_index(device)
-    key = (m, n, k, dev)
+    key = (m, n, k, dev, silu_mul)
     p = _plans.get(key)
     if p is not None:
         return p
@@ -304,7 +363,7 @@ def _get_plan(m: int, n: int, k: int, device: torch.device):
         return None
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     with _lock:
-        p = plan(m, n, k, sms, smem)
+        p = plan(m, n, k, sms, smem, silu_mul)
         if p is not None:
             p.work = torch.tensor(p.items, dtype=torch.int32).reshape(-1).to(device)
             p.work_ptr = torch.tensor(p.ptr, dtype=torch.int32).to(device)
@@ -346,11 +405,57 @@ def gemm(x2: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
         x2.data_ptr(), weight.data_ptr(), out.data_ptr(), c_tmp.data_ptr(),
         weight_scale.data_ptr(), global_scale.data_ptr(), p.rows, n, k, x2.stride(0),
         locks.data_ptr(), p.work.data_ptr(), p.work_ptr.data_ptr(), p.sms, _ready[dev],
-        torch.cuda.current_stream(x2.device).cuda_stream)
+        0, torch.cuda.current_stream(x2.device).cuda_stream)
     if rc != 0:
         raise RuntimeError(f"marlinw_gemm failed: {rc}")
     for (r0, r1) in p.stock_rows:
         stock(x2[r0:r1], out[r0:r1])
+    return out
+
+
+def _x_ok(x2: torch.Tensor) -> bool:
+    return (x2.dtype == torch.bfloat16 and x2.stride(-1) == 1 and x2.stride(0) % 8 == 0
+            and x2.data_ptr() % 16 == 0 and x2.is_cuda)
+
+
+def gemm_silu_mul(x2: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+                  global_scale: torch.Tensor, n: int, k: int) -> torch.Tensor | None:
+    """x2 [M, K] bf16 -> [M, N / 2] bf16: silu(gate) * up of the [M, N] result
+    [gate | up] of the stock op, bit for bit as silu_mul(stock(x2)); or None
+    (no fused plan for this M)."""
+    m = x2.shape[0]
+    if not (ENABLED and SILU_ENABLED) or m < MIN_M or not _x_ok(x2):
+        return None
+    p = _get_plan(m, n, k, x2.device, True)
+    if not p:
+        return None
+    dev = _device_index(x2.device)
+    locks, c_tmp = _scratch[dev]
+    out = torch.empty((m, n // 2), dtype=torch.bfloat16, device=x2.device)
+    rc = _lib.marlinw_gemm(
+        x2.data_ptr(), weight.data_ptr(), out.data_ptr(), c_tmp.data_ptr(),
+        weight_scale.data_ptr(), global_scale.data_ptr(), p.rows, n, k, x2.stride(0),
+        locks.data_ptr(), p.work.data_ptr(), p.work_ptr.data_ptr(), p.sms, _ready[dev],
+        1, torch.cuda.current_stream(x2.device).cuda_stream)
+    if rc != 0:
+        raise RuntimeError(f"marlinw_gemm failed: {rc}")
+    return out
+
+
+def silu_mul(y: torch.Tensor) -> torch.Tensor:
+    """y [M, 2D] bf16 (gate | up) -> [M, D] bf16, silu(gate) * up with the
+    arithmetic of the compiled SiluAndMul glue (see csrc/silu_mul.cuh)."""
+    lib = _load()
+    m, n2 = y.shape
+    d = n2 // 2
+    if (lib is None or y.dtype != torch.bfloat16 or n2 % 16 or y.stride(-1) != 1
+            or y.stride(0) % 8 or y.data_ptr() % 16 or not y.is_cuda):
+        raise RuntimeError("marlinw.silu_mul: unsupported input")
+    out = torch.empty((m, d), dtype=torch.bfloat16, device=y.device)
+    rc = lib.marlinw_silu_mul(y.data_ptr(), out.data_ptr(), m, d, y.stride(0),
+                              torch.cuda.current_stream(y.device).cuda_stream)
+    if rc != 0:
+        raise RuntimeError(f"marlinw_silu_mul failed: {rc}")
     return out
 
 
