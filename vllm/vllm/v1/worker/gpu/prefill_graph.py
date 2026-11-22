@@ -274,9 +274,13 @@ class PrefillGraph:
         dummy = model_state.prepare_dummy_inputs(1, n)
         input_ids = input_batch.input_ids
         inputs_embeds = None
+        # LOCAL PATCH (SP5D, Yukon submission 98c1361e): a model fed `inputs_embeds` embeds the prompt's token ids
+        # inside the graph (the same eager embed_input_ids, captured), so a replay needs no eager embedding first.
+        self.embed_input_ids: torch.Tensor | None = None
         if runner.supports_mm_inputs and runner.is_first_pp_rank:
             inputs_embeds = dummy.get("inputs_embeds")
             if inputs_embeds is not None and not runner.model.requires_raw_input_tokens:
+                self.embed_input_ids = input_batch.input_ids
                 input_ids = None
         self.model_inputs = {
             "input_ids": input_ids,
@@ -317,6 +321,18 @@ class PrefillGraph:
             slot_mapping=self.slot_mappings,
             is_padding=self.is_padding,
         ):
+            if (
+                self.embed_input_ids is not None
+                and self.model_inputs.get("inputs_embeds") is not None
+            ):
+                lm = (
+                    self.model.get_language_model()
+                    if hasattr(self.model, "get_language_model")
+                    else self.model
+                )
+                self.model_inputs["inputs_embeds"].copy_(
+                    lm.embed_input_ids(self.embed_input_ids)
+                )
             if self.sample_tile is None:
                 return self.model(**self.model_inputs)
             with self.sample_tile.capture():
@@ -330,20 +346,26 @@ class PrefillGraph:
         model_inputs: dict[str, Any],
         is_padding: torch.Tensor,
         batch_descriptor: BatchDescriptor,
+        raw_input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Hidden states from a replay, or None when this step differs from
         the captured one in anything but device bytes."""
+        if self.embed_input_ids is not None and raw_input_ids is None:
+            return None
         pairs: list = []
         seen: dict = {}
         diff = None
         if batch_descriptor != self.batch_descriptor:
             diff = f"batch_descriptor {batch_descriptor}"
-        for name, dst, src in (
+        checks = [
             ("attn_metadata", self.attn_metadata, attn_metadata),
             ("slot_mapping", self.slot_mappings, slot_mappings),
             ("model_inputs", self.model_inputs, model_inputs),
             ("is_padding", self.is_padding, is_padding),
-        ):
+        ]
+        if self.embed_input_ids is not None:
+            checks.append(("raw_input_ids", self.embed_input_ids, raw_input_ids))
+        for name, dst, src in checks:
             if diff is not None:
                 break
             diff = _plan(dst, src, pairs, seen, name)
