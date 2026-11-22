@@ -226,6 +226,10 @@ class VllmBackend:
             if pinned
             else "CPU affinity unchanged"
         )
+        if pinned:
+            tickled = hostfast.start_idle_tickle(pinned)
+            if tickled:
+                _log(f"started {tickled} SCHED_IDLE deep-idle tickler threads")
         # VLLM_RESIDENT_ARGMAX_ONLY=0 keeps the top-k on every request.
         self._argmax_only = os.environ.get("VLLM_RESIDENT_ARGMAX_ONLY", "1") != "0"
         self._SamplingParams = SamplingParams
