@@ -86,6 +86,13 @@
     {
       "file": "harness/kernels/l2pf/py/sites.py (outside the vLLM subtree; recorded here for provenance)",
       "why": "L2 prefetch heads ahead of the MLP GEMMs (weights above MAX_WEIGHT): a 2.25 MiB head ahead of gate_up (after a norm) and a 0.5 MiB head ahead of down (after the activation), scales sharing the budget, plus a re-entrancy guard so only the outermost call of a nested wrapped entry point is a site. Taken from ArthurOstapenko's published submission e8fa7600-36f4-49a5-9c70-4190970fa897 (branch commit af81404); our compressed-FP8 prefetch skip (_RANS_SKIP_PREFETCH) is kept. Prefetch only reads weight bytes into L2 on a side stream; no value changes. L2PF_MLP=0 disables the heads."
+    },
+    {
+      "files": [
+        "harness/kernels/marlinw/csrc/marlinw_swiglu2.cu",
+        "harness/kernels/marlinw_down128/marlinw_down128.cu"
+      ],
+      "what": "128-row prompt GEMMs for the NVFP4 MLP gate_up+SwiGLU and down projections (e-man07)"
     }
   ],
   "carried_from": {
