@@ -54,6 +54,14 @@
     {
       "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py; harness/kernels/decode6 (new)",
       "why": "Uses zereraz's published 6-bit palette implementation from cdefbb34 / 56791c43 for one-row NVFP4 decode after the per-layer bitwise admission check. The existing BF16 and FP8 SwiGLU prefill and narrow down operation signatures preserve their arguments."
+    },
+    {
+      "file": "vllm/model_executor/layers/quantization/modelopt.py, vllm/model_executor/layers/quantization/utils/glimmer_fp8.py, vllm/model_executor/models/muse_glimmer.py",
+      "why": "The single-device 512-row static FP8 MLP gate/up dispatches to harness/kernels/muse_fp8_swiglu when its down projection accepts static FP8. Alternating checkpoint output columns brings the BF16 gate and up values into one CUTLASS thread fragment. The arithmetic uses the G2 scaled-MM multiply order and the existing BF16 SiLU lookup before packing the down-scale E4M3 byte. The input uses its original FP8 quantizer before shape dispatch."
+    },
+    {
+      "file": "vllm/model_executor/models/muse_glimmer.py and muse_glimmer_glue.py (new)",
+      "why": "Carries only ArthurOstapenko's prompt query normalization and RoPE launcher and installation hook from Yukon submission fa040f4a-ca7e-42dd-8f50-8f1aadfc8d9b (ranked aa3a2e54b58675aa76f633bd31a3d07b0e4d41ab), first published in e7600084-0e57-465b-8c3c-1df33c51dd94. Before replacing a matching compiled kernel, the launcher compares output bits against the actual stock compiler kernel. The default minimum batch size is 128 tokens."
     }
   ],
   "carried_from": {
