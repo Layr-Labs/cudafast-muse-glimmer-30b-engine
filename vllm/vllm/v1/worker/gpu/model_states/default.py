@@ -154,8 +154,13 @@ class DefaultModelState(ModelState):
         max_query_len = input_batch.num_scheduled_tokens.max().item()
         seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
         if for_capture:
-            # Capture with worst-case max_seq_len so the graph is valid at any replay.
-            max_seq_len = self.max_model_len
+            # Capture with exact seq_len=512 for the dedicated M=512 fresh-prefill
+            # full CUDA graph so FlashAttention selects the identical kernel schedule,
+            # and worst-case max_model_len for decode full graphs.
+            if num_tokens == 512 and num_reqs == 1 and max_query_len == 512:
+                max_seq_len = 512
+            else:
+                max_seq_len = self.max_model_len
         else:
             max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
         req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None

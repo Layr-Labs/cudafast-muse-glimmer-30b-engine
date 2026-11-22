@@ -18,12 +18,14 @@
 //! OpenAI-style HTTP server could not carry it: it has no teacher-forced eval,
 //! no raw top-k logits per position and no per-cycle speculative accounting.
 //!
-//! ## RESIDENT FREE RUNS
+//! ## ONE ROUND TRIP PER DECODED TOKEN
 //!
 //! Every state-advancing verb replies with the frontier argmax, which
-//! [`ResidentSession`] caches, so [`EngineSession::argmax`] costs nothing.
-//! The `serial_run` and `spec_run` verbs return every frontier in one reply.
-//! Their loops still do the same work inside benchd's timed decode window.
+//! [`ResidentSession`] caches, so [`EngineSession::argmax`] costs nothing. That
+//! matters because `free_decode_run`'s loop sits INSIDE benchd's timed window:
+//! a decoded token is one `eval` (or one `eval_speculative`) and no more. The
+//! argmax is a pure read of logits the same call left ready, so returning it
+//! eagerly changes no semantics.
 //!
 //! ## FAIL-CLOSED
 //!
@@ -85,12 +87,13 @@ pub struct ResidentHello {
     pub ident: String,
     pub model_path: String,
     pub mtp_head_path: String,
-    /// Whether the resident runs the serial eval loop in one request.
-    pub serial_run: bool,
     /// Whether the resident runs a whole speculative free run in one request
     /// (`spec_run`). A resident that does not say so is driven one cycle per
     /// request.
     pub spec_run: bool,
+    /// Whether the resident runs a whole serial free run in one request
+    /// (`serial_run`).
+    pub serial_run: bool,
 }
 
 impl ResidentHello {
@@ -161,8 +164,8 @@ impl ResidentSession {
                 ident: String::new(),
                 model_path: String::new(),
                 mtp_head_path: String::new(),
-                serial_run: false,
                 spec_run: false,
+                serial_run: false,
             },
             frontier: None,
             poison: None,
@@ -184,12 +187,12 @@ impl ResidentSession {
             ident: string_field(&reply, "ident")?,
             model_path: string_field(&reply, "model_path")?,
             mtp_head_path: string_field(&reply, "mtp_head_path")?,
-            serial_run: reply
-                .get("serial_run")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
             spec_run: reply
                 .get("spec_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            serial_run: reply
+                .get("serial_run")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         };
@@ -255,22 +258,6 @@ impl ResidentSession {
     /// Record a failure an infallible verb cannot return.
     fn poison_with(&mut self, err: String) {
         self.poison.get_or_insert(err);
-    }
-
-    fn serial_run_call(&mut self, first_token: i64, count: i64) -> Result<Vec<i64>, String> {
-        self.frontier = None;
-        let mut reply =
-            self.call(json!({"op": "serial_run", "first_token": first_token, "count": count}))?;
-        let tokens: Vec<i64> = serde_json::from_value(reply["tokens"].take())
-            .map_err(|err| format!("invalid tokens in the resident's serial_run reply: {err}"))?;
-        if tokens.len() as i64 != count {
-            return Err(format!(
-                "the resident's serial_run returned {} of {count} tokens",
-                tokens.len()
-            ));
-        }
-        self.frontier = tokens.last().copied();
-        Ok(tokens)
     }
 
     /// `spec_run`: the resident loops the speculative cycles itself and replies
@@ -359,22 +346,21 @@ impl EngineSession for ResidentSession {
     fn sync_to_frontier(&mut self, tokens: &[i64]) -> Result<(), String> {
         // `max_tokens: 1`: the resident's request finishes at the frontier
         // token, so the engine is idle when this reply arrives.
-        // `argmax_only`: the frontier token is all a prefill reads, so the
-        // engine computes no top-k logits for it.
-        let reply = self
-            .call(json!({"op": "sync", "tokens": tokens, "max_tokens": 1, "argmax_only": true}))?;
+        let reply = self.call(json!({
+            "op": "sync",
+            "tokens": tokens,
+            "max_tokens": 1,
+            "need_logprobs": false
+        }))?;
         self.take_frontier(&reply)
     }
 
-    fn sync_argmax_only(&mut self, tokens: &[i64]) -> Result<(), String> {
-        // A resident that predates the flag ignores it and computes the top-k
-        // anyway: slower, never wrong.
-        let reply = self.call(json!({"op": "sync", "tokens": tokens, "argmax_only": true}))?;
-        self.take_frontier(&reply)
-    }
-
-    fn eval(&mut self, token: i64) -> Result<(), String> {
-        let reply = self.call(json!({"op": "eval", "token": token}))?;
+    fn sync_no_logprobs(&mut self, tokens: &[i64]) -> Result<(), String> {
+        let reply = self.call(json!({
+            "op": "sync",
+            "tokens": tokens,
+            "need_logprobs": false
+        }))?;
         self.take_frontier(&reply)
     }
 
@@ -382,7 +368,33 @@ impl EngineSession for ResidentSession {
         if !self.hello.serial_run {
             return None;
         }
-        Some(self.serial_run_call(first_token, count))
+        let res = (|| {
+            let reply = self.call(json!({
+                "op": "serial_run",
+                "first_token": first_token,
+                "count": count
+            }))?;
+            self.take_frontier(&reply)?;
+            reply
+                .get("tokens")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    "the resident engine's serial_run reply carries no \"tokens\" array".to_string()
+                })?
+                .iter()
+                .map(|t| {
+                    t.as_i64().ok_or_else(|| {
+                        "the resident engine's serial_run returned a non-integer token".to_string()
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })();
+        Some(res)
+    }
+
+    fn eval(&mut self, token: i64) -> Result<(), String> {
+        let reply = self.call(json!({"op": "eval", "token": token}))?;
+        self.take_frontier(&reply)
     }
 
     fn argmax(&mut self) -> i64 {

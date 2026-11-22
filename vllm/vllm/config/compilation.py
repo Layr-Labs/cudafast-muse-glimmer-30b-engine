@@ -777,15 +777,6 @@ class CompilationConfig:
         "vllm::hpc_rope_norm_forward",
     ]
 
-    # Stream fork/join points of models that run an independent projection on
-    # a side stream while attention runs; splitting at them keeps the
-    # projection in a compiled piece of its own.
-    _side_stream_ops: ClassVar[list[str]] = [
-        "vllm::muse_glimmer_gate_fork",
-        "vllm::muse_glimmer_gate_switch",
-        "vllm::muse_glimmer_gate_join",
-    ]
-
     def compute_hash(self) -> str:
         """
         Provide a hash that uniquely identifies all the configs
@@ -1191,7 +1182,6 @@ class CompilationConfig:
                         self.pass_config.fuse_qk_norm_rope_kvcache = False
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
-                    self.splitting_ops.extend(self._side_stream_ops)
 
             elif len(self.splitting_ops) == 0:
                 if (

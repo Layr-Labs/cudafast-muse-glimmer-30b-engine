@@ -105,7 +105,6 @@ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
-from vllm.v1.worker.gpu.prefill_graph import PrefillGraph, capture_prefill_graph
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -263,9 +262,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
-        # LOCAL PATCH (prefill graph): whole-forward graph for one fresh
-        # prefill of a fixed length (vllm/v1/worker/gpu/prefill_graph.py).
-        self.prefill_graph: PrefillGraph | None = None
 
         # LoRA-related workers.
         self.lora_state = LoraState(max_num_reqs=self.max_num_reqs)
@@ -787,10 +783,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculator is not None:
                 self.speculator.capture()
 
-        # LOCAL PATCH (prefill graph): captured apart from the dispatcher's
-        # graphs, so decode dispatch and compile ranges stay unchanged.
-        self.prefill_graph = capture_prefill_graph(self)
-
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
         elapsed_time = end_time - start_time
@@ -1266,6 +1258,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_active_loras=num_active_loras,
         )
 
+        # Strict fresh-prefill guard for dedicated whole-forward M=512 FULL CUDA graph.
+        if (
+            self.cudagraph_manager is not None
+            and not dummy_run
+            and not is_profile
+            and not skip_compiled
+            and self.dp_size == 1
+            and num_reqs == 1
+            and num_toks == 512
+            and max_query_len == 512
+            and num_active_loras == 0
+            and not scheduler_output.scheduled_encoder_inputs
+        ):
+            _rid = next(iter(scheduler_output.num_scheduled_tokens))
+            _ridx = self.req_states.req_id_to_index.get(_rid)
+            if (
+                _ridx is not None
+                and int(self.req_states.num_computed_tokens_np[_ridx]) == 0
+            ):
+                _p512_desc = self.cudagraph_manager.get_prefill_full_desc(512)
+                if _p512_desc is not None:
+                    batch_desc = _p512_desc
+
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -1428,32 +1443,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                 else:
                     # Eager (NONE): call the raw model directly.
-                    model_output = None
-                    # LOCAL PATCH (prefill graph): a fresh, unpadded,
-                    # one-request prefill of the captured length replays
-                    # the boot graph; try_replay refuses any other step.
-                    prefill_graph = self.prefill_graph
-                    if (
-                        prefill_graph is not None
-                        and not dummy_run
-                        and not skip_compiled
-                        and num_tokens_across_dp is None
-                        and input_batch.num_reqs == 1
-                        and input_batch.num_draft_tokens == 0
-                        and input_batch.num_tokens == prefill_graph.num_tokens
-                        and input_batch.num_tokens_after_padding
-                        == prefill_graph.num_tokens
-                        and int(input_batch.num_computed_tokens_np[0]) == 0
-                    ):
-                        model_output = prefill_graph.try_replay(
-                            attn_metadata,
-                            slot_mappings_by_layer,
-                            model_inputs,
-                            input_batch.is_padding,
-                            batch_descriptor,
-                        )
-                    if model_output is None:
-                        model_output = self.model(**model_inputs)
+                    model_output = self.model(**model_inputs)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

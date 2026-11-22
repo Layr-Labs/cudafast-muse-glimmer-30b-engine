@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
 from collections.abc import Callable
-from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import product
 from typing import Any, NamedTuple, Protocol
@@ -39,13 +38,6 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
-
-try:
-    # Optional kernel package built from harness/kernels (L2 prefetch of the
-    # next GEMM's weights inside the captured FULL graph).
-    from l2pf import sites as l2_prefetch
-except ImportError:
-    l2_prefetch = None
 
 
 class AttentionState(NamedTuple):
@@ -154,24 +146,7 @@ class CudaGraphManager:
         )
         self.breakable_cg_runner: BreakableCUDAGraphWrapper | None = None
 
-        # Memory ranges of the model's weights (set by the model capture) and
-        # the L2 prefetch sessions of the captured FULL graphs.
-        self.weight_ranges: list[tuple[int, int]] | None = None
-        self._l2_prefetch_sessions: list[Any] = []
-
         self._init_candidates()
-
-    def _l2_prefetch_session(self, desc: "BatchExecutionDescriptor") -> Any:
-        if (
-            l2_prefetch is None
-            or desc.cg_mode != CUDAGraphMode.FULL
-            or self.weight_ranges is None
-            or not l2_prefetch.available()
-        ):
-            return None
-        session = l2_prefetch.Session(self.weight_ranges)
-        self._l2_prefetch_sessions.append(session)
-        return session
 
     def _build_lora_dispatch_map(self) -> tuple[dict[int, int], int]:
         """Precompute actual num_active_loras -> effective captured case.
@@ -314,6 +289,40 @@ class CudaGraphManager:
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
 
+        # Optional dedicated whole-forward FULL prefill graph for M=512 (single request).
+        # Kept outside self._candidates so dispatch() only selects it under strict
+        # fresh-prefill guards in GPUModelRunner.execute_model.
+        self._prefill_full_descs: dict[int, BatchExecutionDescriptor] = {}
+        if (
+            self.cudagraph_mode.has_full_cudagraphs()
+            and 512 in capture_sizes
+            and self.max_num_reqs >= 1
+        ):
+            p512 = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.FULL,
+                num_tokens=512,
+                num_reqs=1,
+                uniform_token_count=512,
+                num_active_loras=0,
+            )
+            if p512 not in descs_by_mode[CUDAGraphMode.FULL]:
+                descs_by_mode[CUDAGraphMode.FULL].append(p512)
+                descs_by_mode[CUDAGraphMode.FULL].sort(
+                    key=lambda d: d.num_tokens, reverse=True
+                )
+                self._capture_descs[CUDAGraphMode.FULL] = descs_by_mode[
+                    CUDAGraphMode.FULL
+                ]
+            self._prefill_full_descs[512] = p512
+
+    def get_prefill_full_desc(self, num_tokens: int) -> BatchExecutionDescriptor | None:
+        if not self._graphs_captured:
+            return None
+        desc = self._prefill_full_descs.get(num_tokens)
+        if desc is not None and desc in self.graphs:
+            return desc
+        return None
+
     def needs_capture(self) -> bool:
         return len(self._capture_descs) > 0
 
@@ -347,10 +356,8 @@ class CudaGraphManager:
                     # Prepare inputs and get forward function
                     forward_fn = create_forward_fn(desc, warmup=True)
 
-                    # Warmup (also records the GEMM sites for the L2 prefetch)
-                    l2pf = self._l2_prefetch_session(desc)
-                    with l2pf.record() if l2pf is not None else nullcontext():
-                        forward_fn(CUDAGraphMode.NONE)
+                    # Warmup
+                    forward_fn(CUDAGraphMode.NONE)
 
                     # Capture
                     logger.debug(
@@ -374,26 +381,20 @@ class CudaGraphManager:
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
-                        if self.pool is not None:
-                            set_graph_pool_id(self.pool)
+                        graph_pool = self.pool
+                        if desc in self._prefill_full_descs.values():
+                            graph_pool = current_platform.graph_pool_handle()
+                        if graph_pool is not None:
+                            set_graph_pool_id(graph_pool)
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
-                        with (
-                            torch.cuda.graph(graph, self.pool),
-                            l2pf.apply() if l2pf is not None else nullcontext(),
-                        ):
+                        with torch.cuda.graph(graph, graph_pool):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
                             # forks copy_stream, but wait_prefetch only happens in
                             # the next forward pass.
                             get_offloader().join_after_forward()
-                        if l2pf is not None:
-                            logger.info(
-                                "L2 prefetch for num_tokens=%d: %s",
-                                desc.num_tokens,
-                                l2pf.summary(),
-                            )
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
         self._graphs_captured = True
@@ -494,8 +495,6 @@ class ModelCudaGraphManager(CudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
-        if l2_prefetch is not None:
-            self.weight_ranges = l2_prefetch.weight_ranges(model)
         if self.use_breakable_cg:
             self.init_breakable_cg_runner(model)
 

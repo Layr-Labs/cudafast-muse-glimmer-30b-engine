@@ -32,7 +32,6 @@ adapter/projection stack.
 """
 
 import math
-import os
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 from typing import Annotated, Literal
@@ -45,32 +44,24 @@ from torch import nn
 from transformers import BatchFeature
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import (
-    CacheConfig,
-    CompilationMode,
-    CUDAGraphMode,
-    VllmConfig,
-    get_current_vllm_config_or_none,
-)
+from vllm.config import CacheConfig, VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.forward_context import get_forward_context
 from vllm.distributed import (
     divide,
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
-from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym
 from vllm.model_executor.layers.attention import Attention, MMEncoderAttention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
-    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -91,7 +82,6 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
-from vllm.platforms import current_platform
 from vllm.renderers import TokenizeParams
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processors.muse_glimmer import MuseGlimmerProcessor
@@ -1098,247 +1088,160 @@ class MuseGlimmerMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def _gate_up_activation(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        return self.act_fn(gate_up)
-
-    def _paired_gate_up_activation(self, x: torch.Tensor) -> torch.Tensor:
-        proj = self.gate_up_proj
-        return torch.ops.vllm.marlin_fp4_swiglu(
-            x.contiguous(), proj.weight, proj.weight_scale, proj.weight_global_scale
-        )
-
-    def _regular_swiglu_down(self, x: torch.Tensor) -> torch.Tensor:
-        activation = self._gate_up_activation(x)
-        return self.down_proj(activation)[0]
-
-    def _paired_swiglu_fp8_down(self, x: torch.Tensor) -> torch.Tensor:
-        proj = self.gate_up_proj
-        down = self.down_proj
-        activation = torch.ops.vllm.marlin_fp4_swiglu_fp8(
-            x.contiguous(), proj.weight, proj.weight_scale, proj.weight_global_scale,
-            down.input_scale,
-        )
-        quantized = QuantizedActivation(
-            activation, down.input_scale, x.dtype, activation.shape, kFp8StaticTensorSym
-        )
-        return down(quantized)[0]
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if (torch.compiler.is_compiling() and x.ndim == 2
-                and getattr(self.gate_up_proj, "marlin_swiglu_fp8_ready", False)
-                and getattr(self.down_proj, "marlin_swiglu_fp8_input", False)):
-            return torch.cond(x.shape[0] == 512, self._paired_swiglu_fp8_down,
-                              self._regular_swiglu_down, (x,))
-        if (torch.compiler.is_compiling() and x.ndim == 2
-                and getattr(self.gate_up_proj, "marlin_swiglu_ready", False)
-                and getattr(self.down_proj, "marlin_prompt_path", None) is not None):
-            # The down projection consumes BF16 for these layers. Other quantizers
-            # can fold their activation cast into SwiGLU with different boundaries.
-            x = torch.cond(x.shape[0] == 512, self._paired_gate_up_activation,
-                           self._gate_up_activation, (x,))
-        else:
-            x = self._gate_up_activation(x)
+        gu_id = getattr(self.gate_up_proj, "_muse_fast_gate_up_id", -1)
+        if gu_id >= 0 and getattr(self.down_proj, "_muse_fast_down_id", -1) >= 0:
+            x = torch.ops.vllm.muse_nvfp4_gate_up_silu(x, gu_id)
+            x, _ = self.down_proj(x)
+            return x
+        if (
+            gu_id >= 0
+            and getattr(self.down_proj, "_muse_fp8_pack_id", -1) >= 0
+            and getattr(self.down_proj, "bias", None) is None
+            and getattr(self.down_proj, "input_scale", None) is not None
+        ):
+            x_fp8 = torch.ops.vllm.muse_nvfp4_gate_up_silu_fp8quant(
+                x, gu_id, self.down_proj.input_scale
+            )
+            out = torch.ops.vllm.muse_fp8_scaled_mm(
+                x_fp8.reshape(-1, x_fp8.shape[-1]),
+                self.down_proj.weight,
+                self.down_proj.input_scale,
+                self.down_proj.weight_scale,
+                self.down_proj._muse_fp8_pack_id,
+            )
+            return out.reshape(x.shape[:-1] + (out.shape[-1],))
+        fp8_gu_id = getattr(self.gate_up_proj, "_muse_fp8_gu_id", -1)
+        if (
+            fp8_gu_id >= 0
+            and getattr(self.gate_up_proj, "bias", None) is None
+            and getattr(self.gate_up_proj, "input_scale", None) is not None
+        ):
+            if (
+                getattr(self.down_proj, "_muse_fp8_pack_id", -1) >= 0
+                and getattr(self.down_proj, "bias", None) is None
+                and getattr(self.down_proj, "input_scale", None) is not None
+            ):
+                x_fp8 = torch.ops.vllm.muse_fp8_gate_up_silu_fp8quant(
+                    x, fp8_gu_id, self.down_proj.input_scale
+                )
+                out = torch.ops.vllm.muse_fp8_scaled_mm(
+                    x_fp8.reshape(-1, x_fp8.shape[-1]),
+                    self.down_proj.weight,
+                    self.down_proj.input_scale,
+                    self.down_proj.weight_scale,
+                    self.down_proj._muse_fp8_pack_id,
+                )
+                return out.reshape(x.shape[:-1] + (out.shape[-1],))
+            x = torch.ops.vllm.muse_fp8_gate_up_silu(x, fp8_gu_id)
+            x, _ = self.down_proj(x)
+            return x
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
 
-class _GateSideStream:
-    """Overlaps the attention output gate projection with attention.
-
-    ``output_gate_proj`` reads the layer input, not the attention output, so
-    its weight stream does not have to wait for the latency-bound attention
-    chain (QK-norm, RoPE, KV-cache write and the attention kernel). After the
-    fork the gate projection stays on the current stream and the attention
-    chain moves to a high-priority side stream, so that its small kernels get
-    SMs ahead of the gate GEMM's remaining tiles; the join brings the current
-    stream back and makes it wait for the chain.
-
-    The fork, switch and join ops below are graph splitting points
-    (``CompilationConfig._side_stream_ops``): they run eagerly between the
-    compiled pieces, so the gate projection is a compiled piece of its own and
-    every piece launches its kernels on the stream that is current when it
-    runs. Under a CUDA graph capture the event record/wait pairs become a fork
-    and a join of the captured graph.
-
-    Only launch streams change: the same kernels run on the same inputs.
-    Batches above ``max_tokens`` and piecewise cudagraph runs keep everything
-    on the current stream.
-    """
-
-    def __init__(self) -> None:
-        self.max_tokens = int(
-            os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "16")
-        )
-        self.stream: torch.cuda.Stream | None = None
-        self.fork_event: torch.cuda.Event | None = None
-        self.done_event: torch.cuda.Event | None = None
-        self.main_stream: torch.cuda.Stream | None = None
-        self.active = False
-        self.unavailable = False
-        self.last_layer = -1
-        self.forks = 0
-        self.reported = False
-
-    def _ensure_stream(self) -> bool:
-        if self.stream is None and not self.unavailable:
-            try:
-                _, greatest_priority = torch.cuda.Stream.priority_range()
-                self.stream = torch.cuda.Stream(priority=greatest_priority)
-                self.fork_event = torch.cuda.Event()
-                self.done_event = torch.cuda.Event()
-            except Exception:
-                logger.warning(
-                    "Could not create a side stream for attention; the output "
-                    "gate projection runs in order.",
-                    exc_info=True,
-                )
-                self.stream = None
-                self.unavailable = True
-        return self.stream is not None
-
-    def _count(self, layer_idx: int) -> None:
-        if layer_idx <= self.last_layer:
-            if not self.reported:
-                logger.info(
-                    "Attention output gate projection overlapped attention "
-                    "in %d layers",
-                    self.forks,
-                )
-                self.reported = True
-            self.forks = 0
-        self.forks += 1
-        self.last_layer = layer_idx
-
-    def fork(self, x: torch.Tensor, layer_idx: int) -> None:
-        self.active = False
-        if not x.is_cuda or x.shape[0] > self.max_tokens:
-            return
-        if (
-            is_forward_context_available()
-            and get_forward_context().cudagraph_runtime_mode
-            == CUDAGraphMode.PIECEWISE
-        ):
-            return
-        if not self._ensure_stream():
-            return
-        assert self.stream is not None and self.fork_event is not None
-        main = torch.cuda.current_stream(x.device)
-        self.fork_event.record(main)
-        self.stream.wait_event(self.fork_event)
-        self.main_stream = main
-        self.active = True
-        self._count(layer_idx)
-
-    def switch(self, chain_inputs: list[torch.Tensor]) -> None:
-        if not self.active:
-            return
-        assert self.stream is not None
-        # The chain reads these on the side stream; do not let the allocator
-        # hand their memory to the current stream before the chain is done.
-        for t in chain_inputs:
-            t.record_stream(self.stream)
-        torch.cuda.set_stream(self.stream)
-
-    def join(self) -> None:
-        if not self.active:
-            return
-        assert self.stream is not None and self.done_event is not None
-        assert self.main_stream is not None
-        self.done_event.record(self.stream)
-        torch.cuda.set_stream(self.main_stream)
-        self.main_stream.wait_event(self.done_event)
-        self.main_stream = None
-        self.active = False
+_MUSE_GATE_SIDE_STREAM: torch.cuda.Stream | None = None
+_MUSE_GATE_LAYERS: list[nn.Module] = []
+_MUSE_GATE_FORK_EVENTS: list[torch.cuda.Event] = []
+_MUSE_GATE_DONE_EVENTS: list[torch.cuda.Event] = []
+_MUSE_GATE_FORKED: list[bool] = []
 
 
-_gate_side_stream = _GateSideStream()
-
-
-def muse_glimmer_gate_fork(x: torch.Tensor, layer_idx: int) -> torch.Tensor:
-    dep = x.new_empty(0)
-    _gate_side_stream.fork(x, layer_idx)
-    return dep
-
-
-def muse_glimmer_gate_fork_fake(x: torch.Tensor, layer_idx: int) -> torch.Tensor:
-    return torch.empty(0, device=x.device, dtype=x.dtype)
-
-
-def muse_glimmer_gate_switch(
-    gate: torch.Tensor, dep: torch.Tensor, chain_inputs: list[torch.Tensor]
-) -> torch.Tensor:
-    out = dep.new_empty(0)
-    _gate_side_stream.switch(chain_inputs)
-    return out
-
-
-def muse_glimmer_gate_switch_fake(
-    gate: torch.Tensor, dep: torch.Tensor, chain_inputs: list[torch.Tensor]
-) -> torch.Tensor:
-    return torch.empty(0, device=dep.device, dtype=dep.dtype)
-
-
-def muse_glimmer_gate_join(
-    gate: torch.Tensor, x: torch.Tensor, dep: torch.Tensor
-) -> None:
-    # The gate is declared mutated so that nothing reads it before the join.
-    _gate_side_stream.join()
-
-
-def muse_glimmer_gate_join_fake(
-    gate: torch.Tensor, x: torch.Tensor, dep: torch.Tensor
-) -> None:
-    return
-
-
-direct_register_custom_op(
-    op_name="muse_glimmer_gate_fork",
-    op_func=muse_glimmer_gate_fork,
-    fake_impl=muse_glimmer_gate_fork_fake,
-    mutates_args=[],
-)
-direct_register_custom_op(
-    op_name="muse_glimmer_gate_switch",
-    op_func=muse_glimmer_gate_switch,
-    fake_impl=muse_glimmer_gate_switch_fake,
-    mutates_args=[],
-)
-direct_register_custom_op(
-    op_name="muse_glimmer_gate_join",
-    op_func=muse_glimmer_gate_join,
-    fake_impl=muse_glimmer_gate_join_fake,
-    mutates_args=["gate"],
-)
-
-
-def _gate_side_stream_fork_point(gate_proj: nn.Module) -> str | None:
-    """Where the output gate branch forks off the attention chain, or None to
-    keep the gate projection in order on the main stream: ``"qkv"`` right
-    after the qkv projection, ``"attn"`` right before the attention op."""
-    mode = os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM", "qkv")
-    if mode not in ("qkv", "attn") or not current_platform.is_cuda():
-        return None
-    # cuBLAS does not promise the same kernel choice while other streams are
-    # active, so unquantized projections stay on the main stream.
-    if isinstance(getattr(gate_proj, "quant_method", None), UnquantizedLinearMethod):
-        return None
-    vllm_config = get_current_vllm_config_or_none()
-    if vllm_config is None:
-        return None
-    compilation_config = vllm_config.compilation_config
-    if compilation_config.mode == CompilationMode.NONE:
-        return mode
+def _run_output_gate_layer(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    fp8_id = getattr(layer, "_muse_fp8_pack_id", -1)
     if (
-        compilation_config.mode != CompilationMode.VLLM_COMPILE
-        or compilation_config.use_inductor_graph_partition
-        or not all(
-            op in (compilation_config.splitting_ops or [])
-            for op in compilation_config._side_stream_ops
-        )
+        fp8_id >= 0
+        and getattr(layer, "bias", None) is None
+        and getattr(layer, "input_scale", None) is not None
     ):
-        return None
-    return mode
+        from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+            _muse_fp8_bf16_linear_impl,
+        )
+
+        return _muse_fp8_bf16_linear_impl(
+            x, layer.weight, layer.input_scale, layer.weight_scale, fp8_id
+        )
+    gate, _ = layer(x)
+    return gate
+
+
+def _muse_fork_output_gate_impl(
+    x: torch.Tensor, qkv_dep: torch.Tensor, gate_id: int
+) -> torch.Tensor:
+    global _MUSE_GATE_SIDE_STREAM
+    del qkv_dep
+    layer = _MUSE_GATE_LAYERS[gate_id]
+    # Piecewise CUDA graphs split at self.attn(), so side-stream overlap is only
+    # valid when self.attn() executes in the same stream/graph (M=1 FULL graph).
+    allow_side = (
+        x.is_cuda
+        and x.shape[0] == 1
+        and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
+    )
+    if allow_side:
+        main_stream = torch.cuda.current_stream(x.device)
+        if _MUSE_GATE_SIDE_STREAM is None:
+            _MUSE_GATE_SIDE_STREAM = torch.cuda.Stream(device=x.device)
+        fork_ev = _MUSE_GATE_FORK_EVENTS[gate_id]
+        fork_ev.record(main_stream)
+        _MUSE_GATE_SIDE_STREAM.wait_event(fork_ev)
+        with torch.cuda.stream(_MUSE_GATE_SIDE_STREAM):
+            gate = _run_output_gate_layer(layer, x)
+            _MUSE_GATE_DONE_EVENTS[gate_id].record(_MUSE_GATE_SIDE_STREAM)
+        _MUSE_GATE_FORKED[gate_id] = True
+        return gate
+    _MUSE_GATE_FORKED[gate_id] = False
+    return _run_output_gate_layer(layer, x)
+
+
+def _muse_fork_output_gate_fake(
+    x: torch.Tensor, qkv_dep: torch.Tensor, gate_id: int
+) -> torch.Tensor:
+    del qkv_dep
+    layer = _MUSE_GATE_LAYERS[gate_id]
+    out_dim = layer.output_size_per_partition
+    return torch.empty(x.shape[:-1] + (out_dim,), dtype=x.dtype, device=x.device)
+
+
+def _muse_wait_output_gate_impl(
+    gate: torch.Tensor,
+    attn_output: torch.Tensor,
+    x_keepalive: torch.Tensor,
+    gate_id: int,
+) -> None:
+    # x_keepalive ensures Inductor/graph-pool allocator cannot reuse hidden_states
+    # until after _MUSE_GATE_SIDE_STREAM finishes reading it.
+    del attn_output, x_keepalive
+    if _MUSE_GATE_FORKED[gate_id]:
+        _MUSE_GATE_FORKED[gate_id] = False
+        main_stream = torch.cuda.current_stream(gate.device)
+        main_stream.wait_event(_MUSE_GATE_DONE_EVENTS[gate_id])
+        if not torch.cuda.is_current_stream_capturing():
+            gate.record_stream(main_stream)
+
+
+def _muse_wait_output_gate_fake(
+    gate: torch.Tensor,
+    attn_output: torch.Tensor,
+    x_keepalive: torch.Tensor,
+    gate_id: int,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="muse_fork_output_gate",
+    op_func=_muse_fork_output_gate_impl,
+    fake_impl=_muse_fork_output_gate_fake,
+)
+direct_register_custom_op(
+    op_name="muse_wait_output_gate",
+    op_func=_muse_wait_output_gate_impl,
+    mutates_args=["gate"],
+    fake_impl=_muse_wait_output_gate_fake,
+)
 
 
 class MuseGlimmerAttention(nn.Module):
@@ -1402,6 +1305,7 @@ class MuseGlimmerAttention(nn.Module):
         )
 
         self.use_output_gate = _muse_glimmer_use_attn_output_gate(config)
+        self._muse_gate_overlap_id = -1
         if self.use_output_gate:
             self.output_gate_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1411,11 +1315,12 @@ class MuseGlimmerAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.output_gate_proj",
             )
-        self.gate_fork_point = (
-            _gate_side_stream_fork_point(self.output_gate_proj)
-            if self.use_output_gate
-            else None
-        )
+            if torch.cuda.is_available() and tp_size == 1:
+                self._muse_gate_overlap_id = len(_MUSE_GATE_LAYERS)
+                _MUSE_GATE_LAYERS.append(self.output_gate_proj)
+                _MUSE_GATE_FORK_EVENTS.append(torch.cuda.Event())
+                _MUSE_GATE_DONE_EVENTS.append(torch.cuda.Event())
+                _MUSE_GATE_FORKED.append(False)
 
         self.rotary_emb = (
             get_rope(
@@ -1444,25 +1349,17 @@ class MuseGlimmerAttention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
-    def _output_gate_before_attention(
-        self, hidden_states: torch.Tensor, chain_inputs: list[torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # The gate projection is launched first; the attention chain that
-        # follows (reading ``chain_inputs``) runs beside it on a side stream.
-        dep = torch.ops.vllm.muse_glimmer_gate_fork(hidden_states, self.layer_idx)
-        gate, _ = self.output_gate_proj(hidden_states)
-        dep = torch.ops.vllm.muse_glimmer_gate_switch(gate, dep, chain_inputs)
-        return gate, dep
-
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        gate = gate_dep = None
-        if self.gate_fork_point == "qkv":
-            gate, gate_dep = self._output_gate_before_attention(hidden_states, [qkv])
+        gate: torch.Tensor | None = None
+        if self.use_output_gate and self._muse_gate_overlap_id >= 0:
+            gate = torch.ops.vllm.muse_fork_output_gate(
+                hidden_states, qkv, self._muse_gate_overlap_id
+            )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if self.use_qk_norm:
@@ -1477,19 +1374,16 @@ class MuseGlimmerAttention(nn.Module):
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
 
-        if self.gate_fork_point == "attn":
-            gate, gate_dep = self._output_gate_before_attention(
-                hidden_states, [q, k, v]
-            )
-
         attn_output = self.attn(q, k, v)
 
         if self.use_output_gate:
-            if gate is None:
-                # Gate reads the layer input hidden states (not the attn output).
-                gate, _ = self.output_gate_proj(hidden_states)
+            # Gate reads the layer input hidden states (not the attn output).
+            if gate is not None:
+                torch.ops.vllm.muse_wait_output_gate(
+                    gate, attn_output, hidden_states, self._muse_gate_overlap_id
+                )
             else:
-                torch.ops.vllm.muse_glimmer_gate_join(gate, hidden_states, gate_dep)
+                gate, _ = self.output_gate_proj(hidden_states)
             attn_output = torch.sigmoid(gate) * attn_output
 
         output, _ = self.o_proj(attn_output)
@@ -1579,20 +1473,6 @@ class MuseGlimmerModel(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
-        side_gate_layers = [
-            layer.self_attn.gate_fork_point
-            for layer in islice(self.layers, self.start_layer, self.end_layer)
-            if layer.self_attn.gate_fork_point is not None
-        ]
-        if side_gate_layers:
-            logger.info(
-                "Attention output gate projection on a side stream in %d of %d "
-                "layers (fork after %s, up to %d tokens)",
-                len(side_gate_layers),
-                self.end_layer - self.start_layer,
-                side_gate_layers[0],
-                _gate_side_stream.max_tokens,
-            )
         # Final norm: weight-as-scale, no offset.
         self.norm = MuseGlimmerRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
