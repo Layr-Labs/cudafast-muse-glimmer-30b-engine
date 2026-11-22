@@ -30,6 +30,7 @@ build_library() {
 }
 build_library marlinw
 build_library marlinw_swiglu
+build_library marlinw_swiglu2
 build_library marlinw_swiglu_fp8
 test -f "$out/libmarlinw.so" || { echo "marlinw: build failed" >&2; exit 1; }
 cp "$here/py/__init__.py" "$here/py/swiglu.py" "$here/py/swiglu_fp8.py" "$out/"
