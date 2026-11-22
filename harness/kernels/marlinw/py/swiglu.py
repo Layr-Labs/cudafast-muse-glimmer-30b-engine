@@ -1,9 +1,11 @@
 """Complete-K paired gate/up and exact compiled SwiGLU for the SM121 prefill.
 
-Two kernels with the same C ABI and the same bits: ``libmarlinw_swiglu`` (64-row
-tiles, the reference) and ``libmarlinw_swiglu2`` (128-row tiles, each weight
-fragment dequantized once for twice the rows). A layer uses the second one only
-after a bitwise comparison with the first on its own weights.
+Three kernels with the same C ABI and the same bits: ``libmarlinw_swiglu`` (64-row
+tiles, the reference), ``libmarlinw_swiglu2`` (128-row tiles, each weight
+fragment dequantized once for twice the rows) and ``libmarlinw_swiglu3`` (the
+128-row tiles with their operands copied to shared memory by TMA instead of by
+the MMA warps). A layer uses the second or third one only after a bitwise
+comparison with the first on its own weights.
 """
 import ctypes
 import os
@@ -14,7 +16,9 @@ import torch
 _ready = set()
 _lib = None
 _lib2 = None
-_fast = set()  # weight data pointers whose layer passed the comparison
+_lib3 = None
+_fast = set()  # weight data pointers whose layer passed the comparison (128-row kernel)
+_fast3 = set()  # the subset that also passed it with the TMA-fed kernel
 
 
 def _load(name):
@@ -49,7 +53,7 @@ def _check_input(gen, device):
 
 
 def prepare(layer):
-    global _lib, _lib2
+    global _lib, _lib2, _lib3
     device = layer.weight.device
     if (device.type != "cuda" or torch.cuda.get_device_capability(device) != (12, 1)
             or torch.cuda.get_device_properties(device).multi_processor_count != 48):
@@ -60,20 +64,52 @@ def prepare(layer):
             return False
         if os.environ.get("MARLINW_SWIGLU2", "1") != "0":
             _lib2 = _load("libmarlinw_swiglu2.so")
+            if os.environ.get("MARLINW_SWIGLU3", "1") != "0":
+                _lib3 = _load("libmarlinw_swiglu3.so")
     if device not in _ready:
         with torch.cuda.device(device):
             if _lib.swiglu_prepare() != 0:
                 return False
             if _lib2 is not None and _lib2.swiglu_prepare() != 0:
                 _lib2 = None
+            if _lib3 is not None and (_lib2 is None or _lib3.swiglu_prepare() != 0):
+                _lib3 = None
         _ready.add(device)
-    if _lib2 is not None and _check(layer):
+    if _lib2 is not None and _check(layer, _lib2):
         _fast.add(layer.weight.data_ptr())
+        if _lib3 is not None and _check(layer, _lib3) and _faster(layer, _lib2, _lib3):
+            _fast3.add(layer.weight.data_ptr())
     return True
 
 
-def _check(layer):
-    """Bitwise comparison of the 128-row kernel with the 64-row one on this layer."""
+def _faster(layer, lib_a, lib_b, rounds=8, margin=0.99):
+    """True if lib_b beats lib_a on this layer's own buffers by at least (1 - margin), interleaved.
+
+    The TMA-fed kernel wins in an isolated probe but was slower in the engine on some boots, so the
+    engine itself decides: the two kernels are bit-identical, so the choice cannot change any output.
+    """
+    try:
+        weight, scales, gs = layer.weight, layer.weight_scale, layer.weight_global_scale
+        gen = torch.Generator(device=weight.device)
+        gen.manual_seed(19968 * 7 + 3)
+        x = _check_input(gen, weight.device)
+        total = [0.0, 0.0]
+        for r in range(rounds):
+            for k in ((0, 1) if r % 2 == 0 else (1, 0)):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                _run(lib_a if k == 0 else lib_b, x, weight, scales, gs)
+                end.record()
+                end.synchronize()
+                total[k] += start.elapsed_time(end)
+        return total[1] < total[0] * margin
+    except Exception:  # noqa: BLE001 - any failure keeps the proven kernel
+        return False
+
+
+def _check(layer, lib):
+    """Bitwise comparison of a 128-row kernel with the 64-row one on this layer."""
     try:
         weight, scales, gs = layer.weight, layer.weight_scale, layer.weight_global_scale
         gen = torch.Generator(device=weight.device)
@@ -81,7 +117,7 @@ def _check(layer):
         for _ in range(2):
             x = _check_input(gen, weight.device)
             a = _run(_lib, x, weight, scales, gs)
-            b = _run(_lib2, x, weight, scales, gs)
+            b = _run(lib, x, weight, scales, gs)
             if not torch.equal(a.view(torch.int16), b.view(torch.int16)):
                 return False
         return True
@@ -94,11 +130,25 @@ def uses_128(weight) -> bool:
     return _lib2 is not None and weight.data_ptr() in _fast
 
 
+def uses_tma(weight) -> bool:
+    """True if this weight's layer also passed the comparison with the TMA-fed kernel (libmarlinw_swiglu3)."""
+    return _lib3 is not None and weight.data_ptr() in _fast3
+
+
+def counts() -> tuple[int, int]:
+    """Layers on the 128-row kernels: (cp.async-fed or TMA-fed, of which TMA-fed)."""
+    return len(_fast), len(_fast3)
+
+
 def gemm_with(x, weight, scales, global_scale, fast: bool):
     """Load-time prefill weight placement: time the kernel the group's layers will run (Muse Glimmer)."""
     if x.device not in _ready:
         raise RuntimeError("Paired SwiGLU was called before layer preparation")
-    return _run(_lib2 if (fast and _lib2 is not None) else _lib, x, weight, scales, global_scale)
+    lib = _lib
+    if fast and _lib2 is not None:
+        # `fast`: the group's layers are on a 128-row kernel; time the one this weight will actually run.
+        lib = _lib3 if (_lib3 is not None and weight.data_ptr() in _fast3) else _lib2
+    return _run(lib, x, weight, scales, global_scale)
 
 
 def moved(old_ptr: int, new_ptr: int) -> None:
@@ -106,6 +156,9 @@ def moved(old_ptr: int, new_ptr: int) -> None:
     if old_ptr in _fast:
         _fast.discard(old_ptr)
         _fast.add(new_ptr)
+    if old_ptr in _fast3:
+        _fast3.discard(old_ptr)
+        _fast3.add(new_ptr)
 
 
 def gemm(x, weight, scales, global_scale):
@@ -114,5 +167,6 @@ def gemm(x, weight, scales, global_scale):
         raise ValueError("Unsupported paired SwiGLU input")
     if x.device not in _ready:
         raise RuntimeError("Paired SwiGLU was called before layer preparation")
-    lib = _lib2 if weight.data_ptr() in _fast else _lib
+    ptr = weight.data_ptr()
+    lib = _lib3 if ptr in _fast3 else (_lib2 if ptr in _fast else _lib)
     return _run(lib, x, weight, scales, global_scale)
