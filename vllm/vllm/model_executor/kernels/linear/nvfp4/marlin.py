@@ -27,6 +27,16 @@ except ImportError:
     marlinw = None
 
 try:
+    import marlin_narrow
+except (ImportError, OSError):
+    marlin_narrow = None
+
+try:
+    import marlinw_down
+except (ImportError, OSError):
+    marlinw_down = None
+
+try:
     from muse_marlin_gemv import prepare_decode_layout
 except (ImportError, OSError):
     prepare_decode_layout = None
@@ -46,7 +56,9 @@ logger = init_logger(__name__)
 # Every other call, and every layer that fails both checks, runs the single
 # ops.marlin_gemm call.
 _PROMPT_CHECK_M = (512, 4096)
-_prompt_stats = {"wide": 0, "sliced": 0, "single": 0, "logged": False}
+_prompt_stats = {
+    "wide": 0, "narrow": 0, "narrow_down": 0, "sliced": 0, "single": 0, "logged": False
+}
 
 # Column-sliced schedule for NVFP4 weights much larger than L2 (prompt-sized M).
 #
@@ -80,6 +92,16 @@ def _log_prompt_stats() -> None:
             _prompt_stats["sliced"],
             _prompt_stats["single"],
         )
+        if _prompt_stats["narrow"]:
+            logger.info(
+                "Narrow Marlin prefill passed bitwise validation on %d layers",
+                _prompt_stats["narrow"],
+            )
+        if _prompt_stats["narrow_down"]:
+            logger.info(
+                "Narrow split-K Marlin prefill passed bitwise validation on %d layers",
+                _prompt_stats["narrow_down"],
+            )
 
 
 def _marlin_fp4_single(
@@ -176,9 +198,23 @@ def _marlin_fp4_wide(
     size_k: int,
     decode_weight: torch.Tensor | None = None,
     decode_scales: torch.Tensor | None = None,
+    use_narrow: bool = False,
+    down_work: torch.Tensor | None = None,
+    down_work_ptr: torch.Tensor | None = None,
+    down_slots: int = 0,
 ) -> torch.Tensor:
     _log_prompt_stats()
     args = (x, weight, weight_scale, weight_global_scale, workspace, size_n, size_k)
+    if use_narrow and marlin_narrow is not None:
+        out = marlin_narrow.gemm(*args)
+        if out is not None:
+            return out
+    if marlinw_down is not None and down_work is not None and down_work_ptr is not None:
+        out = marlinw_down.gemm(
+            x, weight, weight_scale, weight_global_scale, down_work, down_work_ptr, down_slots
+        )
+        if out is not None:
+            return out
     out = _marlin_fp4_wide_gemm(*args)
     return out if out is not None else _marlin_fp4_single(*args, decode_weight, decode_scales)
 
@@ -193,6 +229,10 @@ def _marlin_fp4_wide_fake(
     size_k: int,
     decode_weight: torch.Tensor | None = None,
     decode_scales: torch.Tensor | None = None,
+    use_narrow: bool = False,
+    down_work: torch.Tensor | None = None,
+    down_work_ptr: torch.Tensor | None = None,
+    down_slots: int = 0,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], size_n))
 
@@ -403,7 +443,37 @@ def _prepare_prompt_gemm(layer: torch.nn.Module) -> None:
             layer, lambda x: _marlin_fp4_wide_gemm(x, *args), _PROMPT_CHECK_M
         )
     ):
-        layer.marlin_prompt_path = ("wide",)
+        use_narrow = (
+            marlin_narrow is not None
+            and marlin_narrow.ENABLED
+            and marlin_narrow.eligible(size_n, size_k, weight.device, props)
+            and _prompt_check(
+                layer, lambda x: marlin_narrow.gemm(x, *args), (marlin_narrow.ROWS,)
+            )
+        )
+        down_plan = (None, None, 0)
+        if (
+            marlinw_down is not None
+            and marlinw_down.ENABLED
+            and (size_n, size_k) == (marlinw_down.COLUMNS, marlinw_down.INNER)
+            and sms == marlinw_down.SMS
+            and torch.cuda.get_device_capability(weight.device) == (12, 1)
+        ):
+            try:
+                plan = marlinw_down.prepare(weight.device)
+            except (RuntimeError, ValueError) as exc:
+                logger.warning_once("Narrow split-K Marlin prefill unavailable: %s", exc)
+            else:
+                buffers = (plan.work, plan.work_ptr, plan.scratch_slots)
+                if _prompt_check(
+                    layer,
+                    lambda x: marlinw_down.gemm(x, weight, weight_scale, global_scale, *buffers),
+                    (marlinw_down.ROWS,),
+                ):
+                    down_plan = buffers
+                    _prompt_stats["narrow_down"] += 1
+        layer.marlin_prompt_path = ("wide", use_narrow, down_plan)
+        _prompt_stats["narrow"] += use_narrow
         _prompt_stats["wide"] += 1
         return
 
@@ -504,7 +574,7 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
             if path is None:
                 out = torch.ops.vllm.marlin_fp4_single_or_tiled(*args, *tail, *decode)
             elif path[0] == "wide":
-                out = torch.ops.vllm.marlin_fp4_wide(*args, *tail, *decode)
+                out = torch.ops.vllm.marlin_fp4_wide(*args, *tail, *decode, path[1], *path[2])
             else:
                 out = torch.ops.vllm.marlin_fp4_col_sliced(
                     *args, path[1], path[2], *tail, path[3], *decode
