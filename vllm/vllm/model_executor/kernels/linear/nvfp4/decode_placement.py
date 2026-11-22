@@ -169,7 +169,7 @@ def _time_calls(run, candidates, rounds: int) -> list[float]:
     return [median(values) for values in samples]
 
 
-def _place_prefill_group(layers, run) -> dict | None:
+def _place_prefill_group(layers, run, on_move=None) -> dict | None:
     homes = [layer.weight.data for layer in layers]
     count = len(homes)
     payload_bytes = homes[0].numel() * homes[0].element_size()
@@ -198,6 +198,8 @@ def _place_prefill_group(layers, run) -> dict | None:
         if not torch.equal(target, source):
             continue  # keep the loader's buffer
         layers[home_index].weight.data = target
+        if on_move is not None:
+            on_move(source.data_ptr(), target.data_ptr())
         after[home_index] = times[target_index]
         moved += 1
     before = sorted(times[:count])
@@ -225,6 +227,10 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             import marlinw_down as _down
         except (ImportError, OSError):
             _down = None
+        try:
+            from vllm.model_executor.kernels.linear.nvfp4 import marlin as _route
+        except (ImportError, OSError):
+            _route = None
         gate_layers, down_layers = [], []
         for layer in model.modules():
             weight = getattr(layer, "weight", None)
@@ -257,24 +263,39 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             x = ((torch.arange(512 * 6656, device=ref.weight.device) % 13).float() - 6.0).mul(0.11)
             x = x.to(torch.bfloat16).reshape(512, 6656).contiguous()
 
-            def run_gate(weight, ref=ref, x=x):
-                _swiglu.gemm(x, weight, ref.weight_scale, ref.weight_global_scale)
+            # Time the kernel these layers will run: the 128-row paired kernel (e-man07's libmarlinw_swiglu2) when
+            # every layer of the group passed its comparison, else the 64-row one; a moved weight keeps its kernel.
+            fast = hasattr(_swiglu, "uses_128") and all(_swiglu.uses_128(layer.weight) for layer in gate_layers)
+            if hasattr(_swiglu, "gemm_with"):
+                def run_gate(weight, ref=ref, x=x, fast=fast):
+                    _swiglu.gemm_with(x, weight, ref.weight_scale, ref.weight_global_scale, fast)
+            else:
+                def run_gate(weight, ref=ref, x=x):
+                    _swiglu.gemm(x, weight, ref.weight_scale, ref.weight_global_scale)
 
-            groups.append(("39936x6656", gate_layers, run_gate))
+            groups.append(("39936x6656", gate_layers, run_gate, getattr(_swiglu, "moved", None), fast))
         if len(down_layers) > 1:
             ref = down_layers[0]
             plan = ref.marlin_prompt_path[2]
             x = ((torch.arange(512 * _down.INNER, device=ref.weight.device) % 11).float() - 5.0).mul(0.07)
             x = x.to(torch.bfloat16).reshape(512, _down.INNER).contiguous()
 
-            def run_down(weight, ref=ref, x=x, plan=plan):
-                if _down.gemm(x, weight, ref.weight_scale, ref.weight_global_scale, *plan) is None:
-                    raise RuntimeError("down kernel refused the probe input")
+            # Likewise the 128x128-tile down kernel (e-man07's marlinw_down128) when every layer of the group runs it.
+            fast = _route is not None and all(_route.down128_admitted(layer.weight) for layer in down_layers)
+            if fast:
+                def run_down(weight, ref=ref, x=x):
+                    if _route.marlinw_down128.gemm_auto(x, weight, ref.weight_scale, ref.weight_global_scale) is None:
+                        raise RuntimeError("down128 kernel refused the probe input")
+            else:
+                def run_down(weight, ref=ref, x=x, plan=plan):
+                    if _down.gemm(x, weight, ref.weight_scale, ref.weight_global_scale, *plan) is None:
+                        raise RuntimeError("down kernel refused the probe input")
 
-            groups.append((f"{_down.COLUMNS}x{_down.INNER}", down_layers, run_down))
-        for name, layers, run in groups:
+            groups.append((f"{_down.COLUMNS}x{_down.INNER}", down_layers, run_down,
+                           _route.down128_moved if _route is not None else None, fast))
+        for name, layers, run, on_move, fast in groups:
             try:
-                stats = _place_prefill_group(layers, run)
+                stats = _place_prefill_group(layers, run, on_move)
             except Exception as err:  # noqa: BLE001 - this group stays where it was
                 logger.warning("Prefill weight placement skipped for %s: %s", name, err)
                 continue
@@ -283,9 +304,10 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             b, a, pool = stats["before"], stats["after"], stats["pool"]
             saved_ms += b[3] - a[3]
             logger.info(
-                "Prefill weight placement %s: %d weights of %.0f MiB, %d spare buffers, %d moved; 512-row kernel ms "
+                "Prefill weight placement %s: %d weights of %.0f MiB, %d spare buffers, %d moved; 512-row kernel%s ms "
                 "min/median/max %.3f/%.3f/%.3f -> %.3f/%.3f/%.3f (all candidates %.3f/%.3f/%.3f), sum %.2f -> %.2f ms",
                 name, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
+                " (128-row tile)" if fast else "",
                 b[0], b[1], b[2], a[0], a[1], a[2], pool[0], pool[1], pool[2], b[3], a[3],
             )
         logger.info(
