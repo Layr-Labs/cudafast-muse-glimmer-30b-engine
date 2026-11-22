@@ -8,6 +8,9 @@ every prefill, calls ops.cutlass_scaled_mm unchanged. The shape test is inside a
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 try:
     import glimmer_fp8_ext as _ext  # built into KERNELS_OUT
@@ -54,11 +57,23 @@ def prepare_fp8_swiglu_weight(weight: torch.Tensor) -> torch.Tensor | None:
     return _swiglu.prepare(weight) if _swiglu is not None else None
 
 
+_swiglu_logged = False
+
+
 @torch.library.custom_op("glimmer::fp8_gate_swiglu", mutates_args=())
 def fp8_gate_swiglu(
     a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor,
     down_scale: torch.Tensor,
 ) -> torch.Tensor:
+    global _swiglu_logged
+    if not _swiglu_logged:
+        # First call of the running engine's forward (the load-time check
+        # calls _swiglu.apply directly).
+        _swiglu_logged = True
+        logger.info(
+            "FP8 gate/up SwiGLU prefill in use: one CUTLASS FP8 GEMM with SiLU-and-mul and the "
+            "down projection's FP8 quantization in the epilogue (muse_fp8_swiglu)"
+        )
     return _swiglu.apply(a, b, scale_a, scale_b, down_scale)
 
 
