@@ -152,6 +152,13 @@ class VllmBackend:
         from vllm.usage.usage_lib import UsageContext
         from vllm.v1.executor.abstract import Executor
 
+        try:
+            import muse_sandwich
+        except ModuleNotFoundError:
+            muse_sandwich = None
+        if muse_sandwich is not None:
+            muse_sandwich.install()
+
         spec = None
         if cfg.depth > 0:
             spec = {"method": "mtp", "num_speculative_tokens": cfg.depth}
@@ -241,6 +248,8 @@ class VllmBackend:
         self._rid = 0
         self._live: str | None = None
         self._warm_up()
+        if muse_sandwich is not None and (summary := muse_sandwich.launch_summary()):
+            _log(f"native sandwich dispatch during initialization: {summary}")
 
     # BOOT WARM-UP. The first prefill and the first decode steps after the
     # engine is built run cold (lazy kernel JIT, autotune, allocator growth):
