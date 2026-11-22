@@ -9,7 +9,9 @@ from pathlib import Path
 import torch
 import marlinw_down
 from marlinw import swiglu
+from vllm.logger import init_logger
 
+logger = init_logger("vllm.muse_final_slab")
 ROWS = 512
 TILE_ROWS = 64
 _native = {}
@@ -82,11 +84,53 @@ def prepare(mlp):
     if len(pointers) != 1 + marlinw_down.COLUMNS // 128:
         return None
     admitted_weight = getattr(gate, "swiglu_paired_weight", gate.weight)
-    return SampleTile(
+    plan = SampleTile(
         admitted_weight.data_ptr(), gate.weight, gate.weight_scale, gate.weight_global_scale,
         down.weight.data_ptr(), torch.tensor(work, device=device, dtype=torch.int32),
         torch.tensor(pointers, device=device, dtype=torch.int32), slots,
     )
+    if not _matches_full_launch(plan, gate, down, path[2]):
+        logger.warning("Final-row prefill tile differs from the full 512-row launches; "
+                       "the prefill graph keeps the full final FFN")
+        return None
+    logger.info("Final-row prefill tile matched the full 512-row paired SwiGLU and split-K down "
+                "launches bitwise on the last %d rows (%d inputs)", TILE_ROWS, len(_CHECK_SCALES))
+    return plan
+
+
+_CHECK_SCALES = (0.05, 1.0, 16.0)
+
+
+def _matches_full_launch(plan, gate, down, down_plan):
+    """The single-slab gate/up and down launches against the last TILE_ROWS
+    rows of the full launches the prefill runs otherwise (the paired SwiGLU and
+    the narrow split-K down, each admitted against ops.marlin_gemm at load),
+    bitwise, on this layer's weights and generated inputs."""
+    device = gate.weight.device
+    gen = torch.Generator(device=device)
+    gen.manual_seed(6113)
+    token = _active.set((plan, [0, 0]))
+    try:
+        for scale in _CHECK_SCALES:
+            x = torch.randn((ROWS, marlinw_down.COLUMNS), generator=gen, device=device)
+            x = (x * scale).to(torch.bfloat16)
+            got = gate_if_active(x, gate.weight)
+            full = swiglu.gemm(x, gate.weight, gate.weight_scale, gate.weight_global_scale)
+            if got is None or not torch.equal(got[-TILE_ROWS:].view(torch.int16),
+                                              full[-TILE_ROWS:].view(torch.int16)):
+                return False
+            got = down_if_active(full, down.weight, down.weight_scale, down.weight_global_scale)
+            ref = marlinw_down.gemm(full, down.weight, down.weight_scale, down.weight_global_scale,
+                                    *down_plan)
+            if got is None or ref is None or not torch.equal(got[-TILE_ROWS:].view(torch.int16),
+                                                             ref[-TILE_ROWS:].view(torch.int16)):
+                return False
+        return True
+    except (RuntimeError, ValueError) as error:
+        logger.warning("Final-row prefill tile check failed: %s", error)
+        return False
+    finally:
+        _active.reset(token)
 
 
 def gate_if_active(x, weight):
