@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #define MARLIN_NAMESPACE_NAME muse_marlin
+#include <cstdlib>
 #include "marlin/marlin_template.h"
 
 namespace {
@@ -12,10 +13,21 @@ cudaError_t launch(const int4* input, const int4* weight, int4* output,
         vllm::kFE4M3fn.id(), Threads, 1, TileN / 16, 8, true, 4, 1, false>;
     auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
     if (status != cudaSuccess) return status;
-    kernel<<<blocks, Threads, shared, stream>>>(
-        input, weight, output, partials, nullptr, nullptr, scales, global_scale,
-        nullptr, nullptr, k / 16, 1, n, k, k, locks, false, false, true, shared);
-    return cudaGetLastError();
+    // Programmatic dependent launch: the kernel prefetches weights before its
+    // griddepcontrol.wait, so it may start while the previous kernel drains.
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(blocks);
+    cfg.blockDim = dim3(Threads);
+    cfg.dynamicSmemBytes = shared;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = getenv("MUSE_PDL_OFF") ? 0 : 1;
+    return cudaLaunchKernelEx(&cfg, kernel,
+        input, weight, output, partials, (const int4*)nullptr, (const float*)nullptr, scales, global_scale,
+        (const int4*)nullptr, (const int*)nullptr, k / 16, 1, n, k, k, locks, false, false, true, shared);
 }
 }  // namespace
 

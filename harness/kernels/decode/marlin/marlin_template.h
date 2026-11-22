@@ -455,6 +455,7 @@ __global__ void Marlin(
     }
 
     if (first_init && use_atomic_add && slice_count > 1 && slice_idx == 0) {
+      asm volatile("griddepcontrol.wait;" ::: "memory");
       constexpr int threads_per_m = 16 * thread_n_blocks / 8;
       int m_per_thread =
           div_ceil(thread_m_blocks * 16, threads / threads_per_m);
@@ -525,6 +526,7 @@ __global__ void Marlin(
   };
 
   init_slice();
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
   // A sizes/strides
 
@@ -842,7 +844,10 @@ __global__ void Marlin(
   };
   // Asynchronously fetch the next A, B and s tile from global to the next
   // shared memory pipeline location.
-  auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true) {
+  // PDL split: the A (activation) fetch depends on the previous kernel; the B
+  // (weights / scales) fetch does not and may be issued before the grid
+  // dependency wait.
+  auto fetch_a_to_shared = [&](int pipe, int a_off, bool pred = true) {
     if (pred) {
       int4* sh_a_stage = sh_a + a_sh_stage * pipe;
   #pragma unroll
@@ -852,6 +857,10 @@ __global__ void Marlin(
             &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
             a_sh_wr_pred[i]);
       }
+    }
+  };
+  auto fetch_b_to_shared = [&](int pipe, int a_off, bool pred = true) {
+    if (pred) {
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
   #pragma unroll
       for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++) {
@@ -906,6 +915,10 @@ __global__ void Marlin(
         }
       }
     }
+  };
+  auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true) {
+    fetch_a_to_shared(pipe, a_off, pred);
+    fetch_b_to_shared(pipe, a_off, pred);
     // Insert a fence even when we are winding down the pipeline to ensure that
     // waiting is also correct at this point.
     cp_async_fence();
@@ -1750,6 +1763,23 @@ __global__ void Marlin(
 
   // Start global fetch and register load pipelines.
   auto start_pipes = [&]() {
+  #ifndef MUSE_PF_TILES
+    #define MUSE_PF_TILES 12
+  #endif
+    // Weights are independent of the previous kernel: pull the tiles beyond the
+    // shared-memory pipeline into L2 while the grid-dependency wait is pending.
+    if constexpr (MUSE_PF_TILES > 0) {
+      if (threadIdx.x < MUSE_PF_TILES) {
+        int t = stages - 1 + threadIdx.x;
+        if (t < slice_iters) {
+          const int4* p = B + (size_t)b_sh_stride * tile_column_stride * slice_col +
+                          (size_t)b_gl_rd_delta_o * (slice_row + t);
+          asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p),
+                       "r"((unsigned)(16 * b_sh_stage))
+                       : "memory");
+        }
+      }
+    }
 
   #pragma unroll
     for (int i = 0; i < stages - 1; i++) {
@@ -1770,7 +1800,15 @@ __global__ void Marlin(
           }
         }
       }
-      fetch_to_shared(i, i, i < slice_iters);
+      fetch_b_to_shared(i, i, i < slice_iters);
+    }
+    // Everything above read only weights/scales. The activations (and every
+    // global write) come after the programmatic grid-dependency wait.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  #pragma unroll
+    for (int i = 0; i < stages - 1; i++) {
+      fetch_a_to_shared(i, i, i < slice_iters);
+      cp_async_fence();
     }
 
     zero_accums();

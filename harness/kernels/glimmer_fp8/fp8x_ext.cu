@@ -1,5 +1,7 @@
 // fp8x_ext.cu (glimmer_fp8_ext): CUTLASS 4.5 sm120 FP8 (e4m3 x e4m3 -> fp32 acc -> bf16) GEMMs with vLLM's ScaledEpilogue arithmetic
 // D = bf16(scale_a * fp32(scale_b * acc)) for per-tensor scales, in several tile configs, to find a faster EXACT decode kernel.
+#define CUTLASS_ENABLE_GDC_FOR_SM100 1
+#include <cstdlib>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -14,6 +16,7 @@
 #include "cutlass/epilogue/fusion/sm90_visitor_load_tma_warpspecialized.hpp"
 #include "cutlass/epilogue/fusion/sm90_visitor_compute_tma_warpspecialized.hpp"
 #include "cutlass/util/packed_stride.hpp"
+#include "cutlass/arch/grid_dependency_control.h"
 using namespace cute;
 
 template <class TileShape, class EpiTile, class KernelSchedule>
@@ -39,7 +42,15 @@ struct Fp8Gemm {
       ElementAcc, TileShape, ClusterShape,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
       KernelSchedule, void>::CollectiveOp;
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
+  using GemmKernelBase = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
+  // Same kernel, but every CTA releases the dependent grid at entry (the stock sm120 pingpong kernel only
+  // triggers at exit); the producer warp's griddepcontrol.wait still guards every global read.
+  struct GemmKernel : GemmKernelBase {
+    CUTLASS_DEVICE void operator()(typename GemmKernelBase::Params const& params, char* smem_buf) {
+      cutlass::arch::launch_dependent_grids();
+      GemmKernelBase::operator()(params, smem_buf);
+    }
+  };
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
   static torch::Tensor run(torch::Tensor a, torch::Tensor b, torch::Tensor sa, torch::Tensor sb) {
@@ -68,7 +79,7 @@ struct Fp8Gemm {
     auto w = torch::empty({(int64_t)std::max<size_t>(ws, 1)}, a.options().dtype(at::kByte));
     auto stream = c10::cuda::getCurrentCUDAStream(a.get_device()).stream();
     TORCH_CHECK(op.initialize(args, w.data_ptr(), stream) == cutlass::Status::kSuccess, "fp8x: init");
-    TORCH_CHECK(op.run(stream) == cutlass::Status::kSuccess, "fp8x: run");
+    TORCH_CHECK(op.run(stream, nullptr, !getenv("MUSE_PDL_OFF") /*launch_with_pdl*/) == cutlass::Status::kSuccess, "fp8x: run");
     return d;
   }
 };

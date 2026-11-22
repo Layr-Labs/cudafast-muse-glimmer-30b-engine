@@ -40,6 +40,41 @@ from dataclasses import dataclass, field
 # process inherits them.
 os.environ.setdefault("VLLM_HUMMING_BATCH_INVARIANT", "1")
 os.environ.setdefault("VLLM_DISABLED_KERNELS", "FlashInferFP8ScaledMMLinearKernel")
+
+
+def _enable_inductor_pdl() -> None:
+    """Launch inductor's fused Triton kernels with programmatic dependent launch.
+
+    Every generated kernel executes griddepcontrol.wait before its first
+    instruction (so no data produced by an earlier kernel is read early) and
+    griddepcontrol.launch_dependents right after, letting the next kernel's
+    CTAs (the PDL-launched Marlin GEMV) start prefetching weights while this
+    short latency-bound kernel runs. Arithmetic is untouched."""
+    if os.environ.get("MUSE_PDL_OFF"):
+        return
+    try:
+        import torch._inductor.config as _ic
+        from torch._inductor.codegen.triton import TritonKernel
+    except Exception:
+        return
+    _ic.triton.enable_pdl = True
+    TritonKernel._handle_pdl_before_access = lambda self, *a, **k: None
+    TritonKernel._handle_pdl_after_load = lambda self, *a, **k: None
+
+    def _filter(self, code):
+        lines = code._lines
+        for ln in lines:
+            if type(ln) is str and ln.strip():
+                indent = ln[: len(ln) - len(ln.lstrip())]
+                break
+        else:
+            indent = "    "
+        lines[0:0] = [indent + self.GDC_WAIT, indent + self.GDC_LAUNCH]
+
+    TritonKernel._filter_pdl = _filter
+
+
+_enable_inductor_pdl()
 from typing import Protocol
 
 TOP_K = 8
