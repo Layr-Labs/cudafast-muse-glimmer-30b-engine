@@ -133,6 +133,169 @@ def _place_group(decode_linear, layers, n: int, k: int) -> dict | None:
     }
 
 
+# --------------------------------------------------------------------------- #
+# Prompt-sized (prefill) weights
+# --------------------------------------------------------------------------- #
+# The 512-row NVFP4 MLP kernels re-read every weight tile from L2 once per row
+# block. Whether a tile stays in L2 between two of its reads depends on the
+# physical pages under it, so the same weight in two allocations runs the same
+# kernel in two classes of time, measured 11-17% apart on GB10. The step below
+# times the production 512-row kernel on every prefill weight and on spare
+# buffers of the same size, and moves weights that sit on slow memory, exactly
+# as the decode step does (same bytes, bitwise comparison before the exchange).
+PREFILL_ENABLED = os.environ.get("MUSE_PREFILL_PLACEMENT", "1").strip() not in ("0", "", "false", "no")
+PREFILL_SURPLUS = float(os.environ.get("MUSE_PREFILL_PLACEMENT_SURPLUS", "1.0"))
+PREFILL_ROUNDS = 4
+
+
+def _time_calls(run, candidates, rounds: int) -> list[float]:
+    """Median time (ms) of run(candidate) per candidate, in shuffled rounds."""
+    device = candidates[0].device
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    run(candidates[0])
+    torch.cuda.synchronize(device)
+    samples: list[list[float]] = [[] for _ in candidates]
+    order = list(range(len(candidates)))
+    shuffler = random.Random(20261122)
+    for _ in range(rounds):
+        shuffler.shuffle(order)
+        for index in order:
+            start.record()
+            run(candidates[index])
+            end.record()
+            end.synchronize()
+            samples[index].append(start.elapsed_time(end))
+    return [median(values) for values in samples]
+
+
+def _place_prefill_group(layers, run) -> dict | None:
+    homes = [layer.weight.data for layer in layers]
+    count = len(homes)
+    payload_bytes = homes[0].numel() * homes[0].element_size()
+    wanted = math.ceil(count * PREFILL_SURPLUS) if PREFILL_SURPLUS > 0 else 0
+    spares = []
+    try:
+        for _ in range(_spares_allowed(wanted, payload_bytes)):
+            spare = torch.empty_like(homes[0])
+            spare.copy_(homes[0])  # every page written once before it is timed
+            spares.append(spare)
+    except RuntimeError:  # out of device memory: time what exists
+        pass
+    if not spares:
+        return None
+    candidates = homes + spares
+    times = _time_calls(run, candidates, PREFILL_ROUNDS)
+    ranked = sorted(range(len(candidates)), key=times.__getitem__)
+    kept = set(ranked[:count])
+    free_fast = [index for index in ranked[:count] if index >= count]
+    movers = sorted((index for index in range(count) if index not in kept), key=times.__getitem__, reverse=True)
+    moved = 0
+    after = list(times[:count])
+    for home_index, target_index in zip(movers, free_fast):
+        target, source = candidates[target_index], homes[home_index]
+        target.copy_(source)
+        if not torch.equal(target, source):
+            continue  # keep the loader's buffer
+        layers[home_index].weight.data = target
+        after[home_index] = times[target_index]
+        moved += 1
+    before = sorted(times[:count])
+    after.sort()
+    pool = sorted(times)
+    return {
+        "count": count, "spares": len(spares), "moved": moved, "payload_bytes": payload_bytes,
+        "before": (before[0], median(before), before[-1], sum(before)),
+        "after": (after[0], median(after), after[-1], sum(after)),
+        "pool": (pool[0], median(pool), pool[-1]),
+    }
+
+
+def place_prefill_weights(model: torch.nn.Module) -> None:
+    """Move 512-row NVFP4 MLP weights that landed on slow device memory; never raises."""
+    if not PREFILL_ENABLED or not torch.cuda.is_available():
+        return
+    began = time.perf_counter()
+    try:
+        try:
+            from marlinw import swiglu as _swiglu
+        except (ImportError, OSError):
+            _swiglu = None
+        try:
+            import marlinw_down as _down
+        except (ImportError, OSError):
+            _down = None
+        gate_layers, down_layers = [], []
+        for layer in model.modules():
+            weight = getattr(layer, "weight", None)
+            if (
+                not isinstance(weight, torch.nn.Parameter)
+                or not weight.is_cuda
+                or weight.dtype != torch.int32
+                or not weight.is_contiguous()
+                or weight.numel() * 4 < MIN_PAYLOAD_BYTES
+                or getattr(layer, "weight_scale", None) is None
+                or getattr(layer, "weight_global_scale", None) is None
+            ):
+                continue
+            n = getattr(layer, "output_size_per_partition", 0)
+            k = getattr(layer, "input_size_per_partition", 0)
+            if tuple(weight.shape) != (k // 16, 2 * n):
+                continue
+            path = getattr(layer, "marlin_prompt_path", None)
+            if _swiglu is not None and getattr(layer, "marlin_swiglu_ready", False) and (n, k) == (39936, 6656):
+                gate_layers.append(layer)
+            elif (
+                _down is not None and path is not None and path[0] == "wide" and path[2][0] is not None
+                and (n, k) == (_down.COLUMNS, _down.INNER)
+            ):
+                down_layers.append(layer)
+        saved_ms = 0.0
+        groups = []
+        if len(gate_layers) > 1:
+            ref = gate_layers[0]
+            x = ((torch.arange(512 * 6656, device=ref.weight.device) % 13).float() - 6.0).mul(0.11)
+            x = x.to(torch.bfloat16).reshape(512, 6656).contiguous()
+
+            def run_gate(weight, ref=ref, x=x):
+                _swiglu.gemm(x, weight, ref.weight_scale, ref.weight_global_scale)
+
+            groups.append(("39936x6656", gate_layers, run_gate))
+        if len(down_layers) > 1:
+            ref = down_layers[0]
+            plan = ref.marlin_prompt_path[2]
+            x = ((torch.arange(512 * _down.INNER, device=ref.weight.device) % 11).float() - 5.0).mul(0.07)
+            x = x.to(torch.bfloat16).reshape(512, _down.INNER).contiguous()
+
+            def run_down(weight, ref=ref, x=x, plan=plan):
+                if _down.gemm(x, weight, ref.weight_scale, ref.weight_global_scale, *plan) is None:
+                    raise RuntimeError("down kernel refused the probe input")
+
+            groups.append((f"{_down.COLUMNS}x{_down.INNER}", down_layers, run_down))
+        for name, layers, run in groups:
+            try:
+                stats = _place_prefill_group(layers, run)
+            except Exception as err:  # noqa: BLE001 - this group stays where it was
+                logger.warning("Prefill weight placement skipped for %s: %s", name, err)
+                continue
+            if stats is None:
+                continue
+            b, a, pool = stats["before"], stats["after"], stats["pool"]
+            saved_ms += b[3] - a[3]
+            logger.info(
+                "Prefill weight placement %s: %d weights of %.0f MiB, %d spare buffers, %d moved; 512-row kernel ms "
+                "min/median/max %.3f/%.3f/%.3f -> %.3f/%.3f/%.3f (all candidates %.3f/%.3f/%.3f), sum %.2f -> %.2f ms",
+                name, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
+                b[0], b[1], b[2], a[0], a[1], a[2], pool[0], pool[1], pool[2], b[3], a[3],
+            )
+        logger.info(
+            "Prefill weight placement: %d groups, timed 512-row kernel sum reduced by %.2f ms per prefill, %.2f s",
+            len(groups), saved_ms, time.perf_counter() - began,
+        )
+    except Exception as err:  # noqa: BLE001 - the load must go on
+        logger.warning("Prefill weight placement failed and was skipped: %s", err)
+
+
 def place_decode_weights(model: torch.nn.Module) -> None:
     """Move decode weights that landed on slow device memory; never raises."""
     if not ENABLED or not torch.cuda.is_available():

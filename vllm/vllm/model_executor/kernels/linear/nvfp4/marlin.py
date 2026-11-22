@@ -120,6 +120,10 @@ def _log_prompt_stats() -> None:
             logger.info("NVFP4 decode palette admission: %d compressed, %d kept uncompressed",
                         _scale6_stats["admitted"], _scale6_stats["kept"])
             logger.info("NVFP4 fixed decode gate/up grid admitted on %d layers", _scale6_stats["fixed_grid"])
+            coded = _scale6_stats.get("srans_scales", 0)
+            logger.info("NVFP4 rANS-coded gate/up block scales: %d layers admitted, %d rejected, %.3f bits per scale",
+                        _scale6_stats.get("gate_up_srans", 0), _scale6_stats.get("gate_up_srans_rejected", 0),
+                        8.0 * _scale6_stats.get("srans_bytes", 0) / coded if coded else 0.0)
         logger.info(
             "Marlin NVFP4 prompt GEMM: %d layers on the wide schedule, %d on "
             "column slices, %d on the single call",
