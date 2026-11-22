@@ -851,14 +851,29 @@ __global__ void Marlin(
   // A block (one k-stage of the CTA's slice): u8 count[8] (16-bit words per warp), then the words of warp 0..7.
   // Warp w decodes bytes 128 w + lane + 32 m (m = 0..3) of the stage's 1 KB raw scale block into the 8-bit
   // scale slot of that stage; consumers then read raw scale bytes exactly as the uncompressed kernel does.
+#ifdef MUSE_SCALE_RANS_SK
+  // stream-K variant (one-row down projection, 48 CTAs): a CTA's stages run across up to two column slices; its
+  // rANS lanes, block stream and scale-slot ring continue across the slice boundary (global stage index X), the
+  // header holds 192 block offsets, and the consumers address the slot of global stage X.
+  static_assert(!gate_up_grid && scale6 && threads == 256 && thread_n_blocks == 8,
+                "stream-K rANS scales are built for the one-row 128-column decode configuration");
+  constexpr int RANS_HDR = 3840, RANS_CAP = 1024, RANS_BLK0 = 1792;
+#else
   static_assert(gate_up_grid && scale6, "rANS scales are built for the fixed gate/up grid only");
   constexpr int RANS_HDR = 3328, RANS_CAP = 1024;
+#endif
   unsigned char* sh_rhdr = sh_pal + 64;
   unsigned char* sh_rslot = sh_rhdr + RANS_HDR;
   uint32_t* sh_rlut = reinterpret_cast<uint32_t*>(sh_rslot + stages * RANS_CAP);
   uint64_t* sh_rbar = reinterpret_cast<uint64_t*>(sh_rlut + 1024);
   const unsigned char* rans_var_g = reinterpret_cast<const unsigned char*>(zp_ptr);
+#ifdef MUSE_SCALE_RANS_SK
+  const int rans_iters = min(iters, k_tiles * part2_mn_tiles - static_cast<int>(blockIdx.x) * iters);
+  int rans_slice_base = 0, rans_done = 0;
+  bool rans_started = false;
+#else
   const int rans_iters = slice_iters;
+#endif
   uint32_t rans_x = 0;
   int rans_q = 0;
   auto rans_bar = [&](int i) { return static_cast<uint32_t>(__cvta_generic_to_shared(sh_rbar + i)); };
@@ -901,7 +916,11 @@ __global__ void Marlin(
                  : "memory");
   }
   auto rans_decode = [&](int X) {
+#ifdef MUSE_SCALE_RANS_SK
+    const unsigned char* blk = X < 2 ? sh_rhdr + RANS_BLK0 + X * RANS_CAP : sh_rslot + (X % stages) * RANS_CAP;
+#else
     const unsigned char* blk = X < 2 ? sh_rhdr + 1280 + X * RANS_CAP : sh_rslot + (X % stages) * RANS_CAP;
+#endif
     const int w = threadIdx.x / 32, lane = threadIdx.x % 32;
     int start = 4;
   #pragma unroll
@@ -1173,7 +1192,11 @@ __global__ void Marlin(
           int k_blocks = b_sh_wr_iters * warp_row + k % b_sh_wr_iters;
           int cur_group_id = k_blocks / group_blocks2;
 
+#ifdef MUSE_SCALE_RANS_SK
+          int4* sh_s_stage = sh_s + s_sh_stage * ((rans_slice_base + pipe) & (stages - 1));
+#else
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
+#endif
 
           if constexpr (!is_8bit_scale) {
             reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
@@ -1796,14 +1819,21 @@ __global__ void Marlin(
       return;
     }
 
+    // One-row decode (SP5D, Yukon submission 98c1361e): with m_block_size_8 the token index of a C fragment
+    // element is (lane % 4) * 2 + {0, 1} (write_result's c_sh_wr), so only lanes with lane % 4 == 0 hold token 0;
+    // the other lanes carry padded tokens 2..7, which are never stored. They skip the fp32 partial-sum exchange.
+    // Each thread reads back only its own C_tmp slot, so the real lanes add the same values in the same order.
+    // (Without m_block_size_8 the row of an element is lane / 4, so the skip is limited to that layout.)
+    if (m_block_size_8 && prob_m == 1 && (threadIdx.x & 3) != 0) {
+      return;
+    }
+
     if (!first) {
       float* frag_c_ptr = reinterpret_cast<float*>(&frag_c);
   #pragma unroll
       for (int k = 0; k < th_size; k += (m_block_size_8 ? 2 : 1)) {
-        sh_red[threadIdx.x] =
-            C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
-
-        float* sh_c_ptr = reinterpret_cast<float*>(&sh_red[threadIdx.x]);
+        int4 tmp = C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
+        const float* sh_c_ptr = reinterpret_cast<const float*>(&tmp);
   #pragma unroll
         for (int f = 0; f < 4; f++) {
           frag_c_ptr[k * 4 + f] += sh_c_ptr[f];
@@ -1946,6 +1976,10 @@ __global__ void Marlin(
 
   // Start global fetch and register load pipelines.
   auto start_pipes = [&]() {
+#ifdef MUSE_SCALE_RANS_SK
+    rans_slice_base = rans_done;
+    rans_done += slice_iters;
+#endif
 
   #pragma unroll
     for (int i = 0; i < stages - 1; i++) {
@@ -1972,6 +2006,20 @@ __global__ void Marlin(
     zero_accums();
     wait_for_stage();
 #ifdef MUSE_SCALE_RANS
+  #ifdef MUSE_SCALE_RANS_SK
+    if (rans_started) {
+      // a later slice: entering its first stage is one more stage boundary of the CTA's stream
+      rans_q++;
+      if (rans_q + 1 < rans_iters) {
+        const int X = rans_q + 1;
+        if (X >= 2) rans_wait(1 + X % stages, static_cast<uint32_t>(((X - 2) / 4) & 1));
+        rans_decode(X);
+      }
+      if (threadIdx.x == 0 && rans_q + 3 < rans_iters) rans_issue(rans_q + 3);
+      __syncthreads();
+    } else {
+      rans_started = true;
+  #endif
     rans_wait(0, 0);
     rans_x = reinterpret_cast<const uint32_t*>(sh_rhdr)[threadIdx.x];
     rans_decode(0);
@@ -1981,6 +2029,9 @@ __global__ void Marlin(
       if (rans_iters > 3) rans_issue(3);
     }
     __syncthreads();
+  #ifdef MUSE_SCALE_RANS_SK
+    }
+  #endif
 #endif
     init_same_group(0);
     fetch_to_registers(0, 0);
