@@ -724,7 +724,11 @@ class Worker(WorkerBase):
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
         # Warmup and tune the kernels used during model execution before
-        # cuda graph capture.
+        # cuda graph capture. LOCAL PATCH (SP5D, Yukon submission 98c1361e): no
+        # FlashInfer autotune pass. On this model it tunes 0 FlashInfer ops (it
+        # saves 0 configs) and only repeats a max-size dummy forward (~50 s of
+        # boot); Inductor's kernel configs are chosen at compile time, before it.
+        self.vllm_config.kernel_config.enable_flashinfer_autotune = False
         kernel_warmup(self)
 
         cuda_graph_memory_bytes = 0
