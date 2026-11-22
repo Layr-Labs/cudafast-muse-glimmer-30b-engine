@@ -595,7 +595,19 @@ if [[ "${SERVE_UP_LAUNCHER}" == "docker" ]]; then
     [[ "${SERVE_UP_ALLOW_NEW_PRIVS:-0}" == 1 ]] || hardening+=(--security-opt no-new-privileges)
     [[ "${SERVE_UP_NO_CAP_DROP:-0}" == 1 ]] || hardening+=(--cap-drop ALL)
   fi
-  docker run --rm --init --name "${CONTAINER_NAME}" \
+  # The labels let tools/serve-up-sweep.sh find this container if this script
+  # is SIGKILLed before its EXIT trap runs (a cancelled job): the runner label
+  # says whose runner made it, the job label which job. Both name the
+  # repository, because runners of two repositories on one box may share a
+  # name. Outside a job the container is unlabelled.
+  owner_labels=(--label "mlxfast.serve-up=1")
+  if [[ -n "${GITHUB_REPOSITORY:-}" && -n "${RUNNER_NAME:-}" ]]; then
+    owner_labels+=(--label "mlxfast.serve-up.runner=${GITHUB_REPOSITORY}/${RUNNER_NAME}")
+  fi
+  if [[ -n "${GITHUB_REPOSITORY:-}" && -n "${GITHUB_RUN_ID:-}" ]]; then
+    owner_labels+=(--label "mlxfast.serve-up.job=${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}")
+  fi
+  docker run --rm --init --name "${CONTAINER_NAME}" "${owner_labels[@]}" \
     --gpus all --ipc host --network none \
     --user "${container_user}" "${hardening[@]}" \
     --read-only --tmpfs /tmp:rw,exec,size=8g \

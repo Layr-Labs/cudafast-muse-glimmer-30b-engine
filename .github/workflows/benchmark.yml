@@ -656,6 +656,17 @@ jobs:
           flock 9
           echo "box GPU lock held"
 
+          # -- stale resident sweep ---------------------------------------
+          # A cancelled job can leave a serve-up resident container running:
+          # the runner SIGKILLs the orphaned serve-up.sh, so its EXIT trap
+          # never removes the container (tools/serve-up-sweep.sh header).
+          # Under the box lock, this runner's labelled containers are stale,
+          # and so are unlabelled ones (the pinned reference tree's serve-up.sh
+          # predates the labels) when no other runner's job is alive on the
+          # box. A container another runner labelled is left to that runner;
+          # the idle bookend below refuses if it still holds the GPU.
+          ./tools/serve-up-sweep.sh --locked --runner "${GITHUB_REPOSITORY}/${RUNNER_NAME:?RUNNER_NAME is unset}"
+
           # -- host quiescence ----------------------------------------------
           # load average (1-minute) and GPU utilization must both be low before
           # the clock starts. The build and the checkpoint fetch above leave the
@@ -743,6 +754,22 @@ jobs:
           # --baseline-workspace and --baseline-calibration, and refuses by name
           # when either is unset.
           MLXFAST_SCORE_PATH=score.json ./tools/muse-glimmer-measure-and-score.sh
+
+      - name: Resident teardown (remove this job's serve-up containers, also on cancel)
+        # always() runs on cancel and on failure. Nothing in "Sandbox cleanup"
+        # below touches docker. tools/serve-up.sh labels each container with
+        # this repository, run id and attempt, so this step removes only this
+        # job's containers and needs no lock. The serial-control leg boots
+        # from the pinned reference tree, whose serve-up.sh predates the
+        # labels; its container is left to the next job's locked sweep. A
+        # failure here is a warning, not a failed job: the score is already
+        # sealed, and the next job's locked sweep fails closed on a survivor.
+        if: always()
+        run: |
+          set -uo pipefail
+          if ! ./tools/serve-up-sweep.sh --job "${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"; then
+            echo "::warning::serve-up-sweep.sh could not remove this job's resident containers (above); the next job's locked sweep retries" >&2
+          fi
 
       - name: Sandbox cleanup (kill this runner's sandbox user's processes, remove per-job dirs)
         if: always()
