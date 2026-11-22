@@ -256,6 +256,18 @@ def _targets():
         out.append((tiled, "default", "marlin_tiled", False))
     except (AttributeError, RuntimeError):
         pass
+    # glimmer dec2: the one-row launches that read lossless codes. fp8z_gemm
+    # reads its code buffer (args[1], tile-major in read order); the decsc GEMV
+    # reads the tile-major weight (args[1]) and its 6-bit scale codes (args[2],
+    # same tile-major order as the scales it replaces).
+    for name, kind in (("fp8z_gemm", "fp8z"), ("marlin_tiled_decode_sc6", "marlin_tiled_sc6"),
+                       ("marlin_tiled_decode_sc5", "marlin_tiled_sc6")):
+        try:
+            pkt = getattr(torch.ops.vllm, name)
+            pkt.default  # noqa: B018 - materialize the overload
+            out.append((pkt, "default", kind, False))
+        except (AttributeError, RuntimeError):
+            pass
     return out
 
 
@@ -265,9 +277,9 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[2], args[4])
         if kind == "cutlass":
             return (args[2],)
-        if kind in ("cutlass_fp8", "mm"):
+        if kind in ("cutlass_fp8", "mm", "fp8z"):
             return (args[1],)
-        if kind == "marlin_tiled":
+        if kind in ("marlin_tiled", "marlin_tiled_sc6"):
             return (args[1], args[2])
     except IndexError:
         return None

@@ -212,6 +212,7 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         pad_k = (16 - weight.shape[0] % 16) % 16
         pad_n = (16 - weight.shape[1] % 16) % 16
         if pad_k == 0 and pad_n == 0:
+            self._prepare_fp8z(layer, weight)
             return
 
         # B is column-major [K, N]
@@ -240,6 +241,35 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
                     "weight_loader": self.padded_weight_loader,
                 },
             )
+
+    def _prepare_fp8z(self, layer: torch.nn.Module, weight: torch.Tensor) -> None:
+        """LOCAL PATCH (glimmer dec2): build the verified fp8z code of a static
+        per-tensor FP8 weight (B = W^T, column-major [K, N]) for the one-row
+        GEMM (fp8z.py); any failure keeps the 8-bit path for this layer."""
+        _, weight_scale_name, input_scale_name, _ = self.layer_param_names
+        w_s = getattr(layer, weight_scale_name, None)
+        x_s = getattr(layer, input_scale_name, None)
+        if (
+            self.config.activation_quant_key != kFp8StaticTensorSym
+            or self.config.weight_quant_key != kFp8StaticTensorSym
+            or weight.dtype != torch.float8_e4m3fn
+            or not weight.is_cuda
+            or weight.dim() != 2
+            or weight.stride(0) != 1
+            or weight.stride(1) != weight.shape[0]
+            or w_s is None
+            or w_s.numel() != 1
+            or x_s is None
+            or x_s.numel() != 1
+            or getattr(layer, "bias", None) is not None
+        ):
+            return
+        from .fp8z import prepare_weight
+
+        comp = prepare_weight(weight)
+        if comp is not None:
+            # A buffer of the layer, so the l2pf hooks accept it as a model weight.
+            layer.register_buffer("_fp8z_weight", comp, persistent=False)
 
     def apply_scaled_mm(
         self,

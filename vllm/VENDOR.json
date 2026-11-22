@@ -46,6 +46,22 @@
     {
       "file": "vllm/v1/engine/core_client.py, vllm/v1/worker/hostfast.py (new)",
       "why": "in-process engine core for the single-request engine loop: InprocClient pauses automatic garbage collection while the engine has work and drains a finished request's queued batch on abort (no busy loop does it in this mode); hostfast.py also restricts the process to the highest-capacity CPU cores when the cores differ, failing soft (VLLM_HOSTFAST_GC=0 and VLLM_HOSTFAST_PIN=0 switch each off)"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/scaled_mm/{fp8z.py (new),cutlass.py}, layers/quantization/utils/glimmer_fp8.py; harness/kernels/fp8z; harness/kernels/l2pf/py/sites.py",
+      "why": "fp8z (glimmer dec1/dec2): the one-row (decode) GEMM of the static per-tensor FP8 linears of the shapes in fp8z.SHAPES reads a lossless 7-bit code of the weight bytes. Per output column an 8-exponent window gives the code s|e-e0|mmm; the column's least frequent window code is the escape, escaped bytes are stored raw per 32-column tile (7.13 bits/weight on this checkpoint, 6.22 -> 5.55 GB per token). Load-time and input-independent: the kernel's own decoder rebuilds the whole weight and it is compared byte for byte; a mismatch, an exception overflow or a ratio above 0.95 keeps the 8-bit weight. The kernel issues the arithmetic of ops.cutlass_scaled_mm and of the glimmer_fp8 small-row tile for one row with per-tensor scales (one ascending-K e4m3 m16n8k32 chain per output from +0, fp32 * scale_b, bf16_rn(* scale_a)). glimmer::fp8_scaled_mm looks the code up by the weight's address for one-row calls and launches torch.ops.vllm.fp8z_gemm; every other call keeps its path. The l2pf hooks prefetch the head of the code buffer (tile-major in read order). Derived from our nemotron engine's fp8c/fp8small kernels (generalized from two compile-time shapes to any N % 32 == 0, K % 128 == 0, plus ring/occupancy/warps-per-CTA variants). FP8Z=0 disables; FP8Z_RING selects a variant."
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py (_prepare_sc6, _marlin_fp4_single); harness/kernels/decsc; harness/kernels/decode/marlin/marlin_template.h (MARLIN_SC6 blocks); harness/kernels/l2pf/py/sites.py",
+      "why": "decsc (glimmer dec2): the record's one-row tile-major Marlin NVFP4 GEMV (harness/kernels/decode) reads the FP8 E4M3 block scales of a layer with at most 64 distinct scale bytes from a lossless 6-bit code: a per-layer 64-entry table plus one 6-bit index per scale in the same tile-major order (25% fewer scale bytes, 2.8% fewer bytes per call). The kernel is the decode package's marlin_template.h compiled with MARLIN_SC6 (without the macro the template is token-identical): a stage's codes are cp.async'd to shared memory and, right after the stage lands, rebuilt by table lookup into exactly the bytes the stock cp.async of the scale tile puts there; dequantization, the MMA chain, the partition, the fp32 reduction under locks and the epilogue are the decode GEMV's. Admitted per layer at load only if the codes decode to every scale byte and the output equals the decode GEMV bit for bit on three inputs; other layers keep the decode GEMV. The l2pf hooks prefetch the tile-major weight and the code head. Idea from our nemotron engine's humming_nvsc (6-bit index into a 64-entry table of NVFP4 block scales). DECSC=0 disables. Where a layer admits it (31-entry table, at most 8 escapes per 128x128 stage, checked the same way), a 5-bit code with per-stage escape entries (template MARLIN_SC5) is available with DECSC_BITS=5 (off by default: it measured slower than the 6-bit code on GB10)."
+    },
+    {
+      "file": "vllm/config/compilation.py",
+      "why": "benchmark_combo_kernel False: a compile-time benchmark within noise decided per boot whether the q/k-norm kernels were combined, so the Inductor kernel set changed between boots; every combo the grouping heuristics allow is formed"
+    },
+    {
+      "file": "vllm/compilation/autotune_pin.py (installed from vllm/compilation/wrapper.py)",
+      "why": "Inductor kept the fastest of a kernel's candidate configs at its first launch; for the q/k-norm and input-RMSNorm reductions the candidates differ in R0_BLOCK (summation order) and time within a few percent on GB10, so a boot could compute different bits. A fixed rule (widest reduction block, then most warps) replaces the timing"
     }
   ],
   "carried_from": {

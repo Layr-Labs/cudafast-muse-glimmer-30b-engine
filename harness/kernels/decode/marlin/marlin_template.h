@@ -267,7 +267,24 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
-    int max_shared_mem) {
+    int max_shared_mem
+#ifdef MARLIN_SC6
+    // 6-bit block-scale codes in the tile-major layout of the scales:
+    // [N / tile_n][K / 16][tile_n * 6 / 8 B] (scale j of a tile row is bits
+    // 6j..6j+5, little endian) and the layer's 64-entry table of the original
+    // scale bytes, as 16 u32.
+    , const int4* __restrict__ sc6_ptr, const uint32_t* __restrict__ sc6_tab
+#endif
+#ifdef MARLIN_SC5
+    // 5-bit block-scale codes, one record per (128-column tile, 128-deep
+    // k-tile) stage in tile-major order: 8 group rows x 80 B (scale j of a row
+    // is bits 5j..5j+4, little endian; code 31 = escape), then sc5_esc u32
+    // escape entries (position in the stage | original byte << 16, unused
+    // entries 0xffff), padded to 16 B. The table holds 31 scale bytes.
+    , const int4* __restrict__ sc5_ptr, const uint32_t* __restrict__ sc5_tab,
+    int sc5_esc
+#endif
+    ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -640,6 +657,33 @@ __global__ void Marlin(
   }
   auto s_sh_wr = threadIdx.x;
   bool s_sh_wr_pred = threadIdx.x < s_sh_stage;
+#ifdef MARLIN_SC6
+  static_assert(!has_act_order && group_blocks == 1 && is_8bit_scale &&
+                    s_tb_groups == 8 && thread_m_blocks == 1 &&
+                    (thread_n_blocks == 8 || thread_n_blocks == 4) &&
+                    threads * 4 == s_sh_stage * 16,
+                "sc6: one-row NVFP4 configurations only");
+  // A group row of a tile holds 16 * thread_n_blocks codes = sc_row int4; a
+  // stage's 8 rows are contiguous in the tile-major layout.
+  constexpr int sc_row = 6 * thread_n_blocks / 8;
+  constexpr int sc_stage = s_tb_groups * sc_row;
+  int sc_gl_rd = sc_row * tile_column_stride * slice_col +
+                 sc_row * ((thread_k_blocks * slice_row) / group_blocks) +
+                 threadIdx.x;
+  const bool sc_sh_wr_pred = threadIdx.x < sc_stage;
+#endif
+#ifdef MARLIN_SC5
+  static_assert(!has_act_order && group_blocks == 1 && is_8bit_scale &&
+                    s_tb_groups == 8 && thread_m_blocks == 1 &&
+                    thread_n_blocks == 8 && thread_k_blocks == 8 &&
+                    threads == 256 && s_sh_stage == 64,
+                "sc5: the one-row 128-column configuration only");
+  constexpr int sc5_max_int4 = 40 + 2;  // 8 escape entries at most
+  const int sc5_stage = 40 + (sc5_esc + 3) / 4;
+  int sc_gl_rd = sc5_stage * ((prob_k / 128) * slice_col + slice_row) +
+                 threadIdx.x;
+  const bool sc_sh_wr_pred = threadIdx.x < sc5_stage;
+#endif
 
   // Zero-points
   int zp_gl_rd;
@@ -766,6 +810,14 @@ __global__ void Marlin(
                                           : (stages * s_sh_stage);
   int4* sh_s = sh_zp + (stages * zp_sh_stage);
   int4* sh_a = sh_s + sh_s_size;
+#ifdef MARLIN_SC6
+  int4* sh_sc = sh_a + stages * a_sh_stage;  // stages x sc_stage int4 of codes
+  int4* sh_tab = sh_sc + stages * sc_stage;  // 64-byte table
+#endif
+#ifdef MARLIN_SC5
+  int4* sh_sc = sh_a + stages * a_sh_stage;      // stages x sc5_max_int4
+  int4* sh_tab = sh_sc + stages * sc5_max_int4;  // 32-byte table (31 used)
+#endif
 
   // Register storage for double buffer of shared memory reads.
   FragA frag_a[2][thread_m_blocks];
@@ -886,10 +938,25 @@ __global__ void Marlin(
 
           // Only fetch scales if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
+#if defined(MARLIN_SC6)
+            // The codes of the stage; sc6_decode rebuilds sh_s_stage from them.
+            (void)sh_s_stage;
+            if (sc_sh_wr_pred) {
+              cp_async4(&sh_sc[sc_stage * pipe + threadIdx.x], &sc6_ptr[sc_gl_rd]);
+            }
+            sc_gl_rd += sc_stage;
+#elif defined(MARLIN_SC5)
+            (void)sh_s_stage;
+            if (sc_sh_wr_pred) {
+              cp_async4(&sh_sc[sc5_max_int4 * pipe + threadIdx.x], &sc5_ptr[sc_gl_rd]);
+            }
+            sc_gl_rd += sc5_stage;
+#else
             if (s_sh_wr_pred) {
               cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
             }
             s_gl_rd += s_gl_rd_delta * s_tb_groups;
+#endif
           }
         }
 
@@ -1748,6 +1815,61 @@ __global__ void Marlin(
     __syncthreads();
   };
 
+#ifdef MARLIN_SC6
+  // Rebuild the stage's scale bytes in sh_s from its codes, right after the
+  // stage has landed (wait_for_stage) and before any fetch_scales_to_registers
+  // reads it: thread t writes u32 t of the stage (4 scales of row
+  // t / (4 * thread_n_blocks)), so sh_s holds exactly what the stock cp.async
+  // of the scale tensor would have put there.
+  auto sc6_decode = [&](int stage) {
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(sh_sc + sc_stage * stage);
+    const uint8_t* tab = reinterpret_cast<const uint8_t*>(sh_tab);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(sh_s + s_sh_stage * stage);
+    const int row = threadIdx.x / (4 * thread_n_blocks);
+    const int u = threadIdx.x % (4 * thread_n_blocks);
+    const uint8_t* q = src + row * (12 * thread_n_blocks) + u * 3;
+    const uint32_t c = static_cast<uint32_t>(q[0]) |
+                       (static_cast<uint32_t>(q[1]) << 8) |
+                       (static_cast<uint32_t>(q[2]) << 16);
+    dst[threadIdx.x] = static_cast<uint32_t>(tab[c & 63]) |
+                       (static_cast<uint32_t>(tab[(c >> 6) & 63]) << 8) |
+                       (static_cast<uint32_t>(tab[(c >> 12) & 63]) << 16) |
+                       (static_cast<uint32_t>(tab[(c >> 18) & 63]) << 24);
+    __syncthreads();
+  };
+#endif
+#ifdef MARLIN_SC5
+  // As sc6_decode, from 5-bit codes; a code 31 takes its byte from the stage's
+  // escape entries (matched by position).
+  auto sc6_decode = [&](int stage) {
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(sh_sc + sc5_max_int4 * stage);
+    const uint8_t* tab = reinterpret_cast<const uint8_t*>(sh_tab);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(sh_s + s_sh_stage * stage);
+    const int row = threadIdx.x >> 5, u = threadIdx.x & 31;
+    const uint8_t* q = src + row * 80 + ((u * 20) >> 3);
+    const uint32_t c = (static_cast<uint32_t>(q[0]) |
+                        (static_cast<uint32_t>(q[1]) << 8) |
+                        (static_cast<uint32_t>(q[2]) << 16)) >> ((u & 1) * 4);
+    uint32_t out = 0;
+  #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const uint32_t idx = (c >> (5 * i)) & 31;
+      uint32_t b = tab[idx];
+      if (idx == 31) {
+        const uint32_t* esc = reinterpret_cast<const uint32_t*>(src + 640);
+        const uint32_t pos = row * 128 + u * 4 + i;
+        for (int j = 0; j < sc5_esc; j++) {
+          const uint32_t e = esc[j];
+          if ((e & 0xffffu) == pos) b = e >> 16;
+        }
+      }
+      out |= b << (8 * i);
+    }
+    dst[threadIdx.x] = out;
+    __syncthreads();
+  };
+#endif
+
   // Start global fetch and register load pipelines.
   auto start_pipes = [&]() {
 
@@ -1775,6 +1897,9 @@ __global__ void Marlin(
 
     zero_accums();
     wait_for_stage();
+#if defined(MARLIN_SC6) || defined(MARLIN_SC5)
+    sc6_decode(0);
+#endif
     init_same_group(0);
     fetch_to_registers(0, 0);
     fetch_scales_to_registers(0, 0);
@@ -1784,6 +1909,18 @@ __global__ void Marlin(
       slice_k_start_shared_fetch += tb_k * (stages - 1);
     }
   };
+#ifdef MARLIN_SC6
+  if (threadIdx.x < 16) {
+    reinterpret_cast<uint32_t*>(sh_tab)[threadIdx.x] = sc6_tab[threadIdx.x];
+  }
+  __syncthreads();
+#endif
+#ifdef MARLIN_SC5
+  if (threadIdx.x < 8) {
+    reinterpret_cast<uint32_t*>(sh_tab)[threadIdx.x] = sc5_tab[threadIdx.x];
+  }
+  __syncthreads();
+#endif
   if (slice_iters) {
     start_pipes();
   }
@@ -1807,6 +1944,9 @@ __global__ void Marlin(
                           slice_iters >= stages);
           pipe++;
           wait_for_stage();
+#if defined(MARLIN_SC6) || defined(MARLIN_SC5)
+          sc6_decode(pipe % stages);
+#endif
           init_same_group(pipe % stages);
         }
 
@@ -2067,6 +2207,15 @@ __global__ void Marlin(
                 s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
                                threadIdx.x / s_sh_stride) +
                 s_sh_stride * tile_column_stride * slice_col + threadIdx.x % s_sh_stride;
+#ifdef MARLIN_SC6
+            sc_gl_rd = sc_row * tile_column_stride * slice_col +
+                       sc_row * ((thread_k_blocks * slice_row) / group_blocks) +
+                       threadIdx.x;
+#endif
+#ifdef MARLIN_SC5
+            sc_gl_rd = sc5_stage * ((prob_k / 128) * slice_col + slice_row) +
+                       threadIdx.x;
+#endif
             zp_gl_rd =
                 zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
                                 threadIdx.x / zp_sh_stride) +

@@ -31,6 +31,13 @@ try:
 except (ImportError, OSError):
     prepare_decode_layout = None
 
+# LOCAL PATCH (glimmer dec2): the one-row tile-major GEMV reads 6-bit block-scale
+# codes for layers admitted at load (harness/kernels/decsc); DECSC=0 disables.
+try:
+    import decsc
+except (ImportError, OSError):
+    decsc = None
+
 logger = init_logger(__name__)
 
 # Prompt-sized calls of NVFP4 weights much larger than L2 (MLP gate_up and
@@ -82,6 +89,40 @@ def _log_prompt_stats() -> None:
         )
 
 
+_sc6_logged = [False]
+
+
+def _log_sc6_once() -> None:
+    if _sc6_logged[0]:
+        return
+    _sc6_logged[0] = True
+    s = decsc.stats
+    logger.info(
+        "decsc active: %d NVFP4 layers read block-scale codes at one row (%d 5-bit, "
+        "the rest 6-bit; %.1f MB -> %.1f MB of scales, %d kept 8-bit scales); "
+        "DECSC=0 disables, DECSC_BITS=5 prefers 5-bit codes",
+        s["layers"], s["layers5"], s["scale_bytes"] / 1e6, s["code_bytes"] / 1e6,
+        s["rejected"],
+    )
+
+
+def _prepare_sc6(layer: torch.nn.Module) -> None:
+    if decsc is None or getattr(layer, "_marlin_decode_scales", None) is None:
+        return
+    rejected = decsc.stats["rejected"]
+    try:
+        res = decsc.prepare(layer)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("decsc: prepare failed (%r); this layer keeps 8-bit scales", e)
+        return
+    if res is None:
+        if decsc.stats["rejected"] > rejected:
+            logger.info("decsc: %s; this layer keeps 8-bit scales", decsc.stats["last_reason"])
+        return
+    # A buffer of the layer, so the l2pf hooks accept it as a model weight.
+    layer.register_buffer("_marlin_decode_sc6", res[1], persistent=False)
+
+
 def _marlin_fp4_single(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -99,6 +140,18 @@ def _marlin_fp4_single(
         and decode_weight is not None
         and decode_scales is not None
     ):
+        sc = None if decsc is None else decsc.STATES.get(decode_scales.data_ptr())
+        if sc is not None:
+            _log_sc6_once()
+            if sc[0] == 5:
+                return torch.ops.vllm.marlin_tiled_decode_sc5.default(
+                    x, decode_weight, sc[1], sc[2], weight_global_scale, workspace,
+                    size_n, size_k, sc[3],
+                )
+            return torch.ops.vllm.marlin_tiled_decode_sc6.default(
+                x, decode_weight, sc[1], sc[2], weight_global_scale, workspace,
+                size_n, size_k,
+            )
         return torch.ops.vllm.marlin_tiled_decode.default(
             x, decode_weight, decode_scales, weight_global_scale, workspace, size_n, size_k
         )
@@ -487,6 +540,7 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
         _prepare_prompt_gemm(layer)
         if prepare_decode_layout is not None and USE_FP32_REDUCE_DEFAULT:
             prepare_decode_layout(layer)
+            _prepare_sc6(layer)
 
     def apply_weights(
         self,

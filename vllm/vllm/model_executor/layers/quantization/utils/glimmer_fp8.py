@@ -23,8 +23,27 @@ _CFG: dict[tuple[int, int], int] = {
 }
 
 
+_fp8z = []
+
+
+def _fp8z_lookup(a, b, scale_a, scale_b):
+    # LOCAL PATCH (glimmer dec2): one-row calls of layers with a verified fp8z
+    # code (kernels/linear/scaled_mm/fp8z.py) read the 7-bit code instead of B.
+    # Imported on first use: the scaled_mm package imports this module.
+    if not _fp8z:
+        try:
+            from vllm.model_executor.kernels.linear.scaled_mm import fp8z
+            _fp8z.append(fp8z.lookup)
+        except Exception:  # noqa: BLE001
+            _fp8z.append(None)
+    return None if _fp8z[0] is None else _fp8z[0](a, b, scale_a, scale_b)
+
+
 @torch.library.custom_op("glimmer::fp8_scaled_mm", mutates_args=())
 def fp8_scaled_mm(a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor) -> torch.Tensor:
+    comp = _fp8z_lookup(a, b, scale_a, scale_b) if a.size(0) == 1 else None
+    if comp is not None:
+        return torch.ops.vllm.fp8z_gemm.default(a, comp, scale_a, scale_b, b.size(1), b.size(0))
     if (_ext is not None and 0 < a.size(0) <= 16
             and a.is_cuda and a.device == b.device == scale_a.device == scale_b.device
             and scale_a.numel() == scale_b.numel() == 1
