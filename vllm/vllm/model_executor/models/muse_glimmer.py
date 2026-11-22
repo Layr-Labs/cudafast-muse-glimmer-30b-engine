@@ -114,6 +114,7 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+from .muse_glimmer_glue import install_prompt_glue
 from .vision import get_fp8_padded_hidden_size, is_vit_use_data_parallel
 
 logger = init_logger(__name__)
@@ -1563,6 +1564,10 @@ class MuseGlimmerModel(nn.Module, EagleModelMixin):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        if current_platform.is_cuda():
+            # Faster launch-level replacement of the compiled query QK-norm +
+            # RoPE kernel for long batches; same bits, checked at first use.
+            install_prompt_glue()
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,

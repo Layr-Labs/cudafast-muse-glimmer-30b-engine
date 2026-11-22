@@ -530,7 +530,11 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 and getattr(layer, "input_is_parallel", False)
                 and layer.input_scale.dtype == torch.float32
                 and self.fp8_linear.input_quant_key() == kFp8StaticTensorSym):
-            layer.marlin_swiglu_fp8_input = True
+            # The fused FP8 activation is admitted per MLP after a bitwise check
+            # with this layer's input scale (nvfp4/marlin.py).
+            from vllm.model_executor.kernels.linear.nvfp4.marlin import offer_swiglu_fp8_down
+
+            offer_swiglu_fp8_down(layer)
 
     def apply(
         self,

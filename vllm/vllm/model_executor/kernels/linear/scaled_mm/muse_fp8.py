@@ -36,7 +36,22 @@ try:
 except Exception:  # noqa: BLE001
     _rans = None
 
-_stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False}
+_stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False, "full": 0, "full_bad": 0, "full_bytes": 0}
+_routes_seen: set[str] = set()
+
+
+def _unpack_fragments(packed: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """Inverse of musefp8.pack: [N/8][K/64][lane g*4+t][4 words][4 bytes] holds W[8nb+g][64s2 + 16j + 4t + b]."""
+    return packed.view(n // 8, k // 64, 8, 4, 4, 4).permute(0, 2, 1, 4, 3, 5).reshape(n, k)
+
+
+def _full_check(decoded: torch.Tensor, w_nk: torch.Tensor) -> bool:
+    """Every byte of a decoded copy against the loaded weight the stock GEMM reads (not a sample)."""
+    ok = decoded.shape == w_nk.shape and torch.equal(decoded, w_nk)
+    _stats["full" if ok else "full_bad"] += 1
+    if ok:
+        _stats["full_bytes"] += w_nk.numel()
+    return ok
 
 
 def _cutlass(A: torch.Tensor, B: torch.Tensor, As: torch.Tensor, Bs: torch.Tensor) -> torch.Tensor:
@@ -72,8 +87,9 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
         return None
     if _rans is not None:
         try:
-            blob = _rans.rans_pack(w.t().contiguous().view(torch.uint8))
-            if _self_check(lambda xq, out: _rans.rans_gemv_auto(blob, xq.view(-1), ws.reshape(-1), xs.reshape(-1), out, n, k), w, ws, xs):
+            w_nk = w.t().contiguous().view(torch.uint8)
+            blob = _rans.rans_pack(w_nk)
+            if _full_check(_rans.rans_unpack(blob, n, k), w_nk) and _self_check(lambda xq, out: _rans.rans_gemv_auto(blob, xq.view(-1), ws.reshape(-1), xs.reshape(-1), out, n, k), w, ws, xs):
                 _stats["admitted"] += 1
                 _stats["rans"] += 1
                 # The magic byte 'A' at blob[0] marks the compressed format for the op (one uint8 buffer either way).
@@ -82,8 +98,9 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
         except Exception as e:  # noqa: BLE001
             logger.warning("muserans: packing or self-check failed (%s); trying musefp8", e)
     try:
-        packed = _mf.pack(w.t().view(torch.uint8))
-        ok = _mf.self_check(packed, w, ws, xs, _cutlass)
+        w_nk = w.t().view(torch.uint8)
+        packed = _mf.pack(w_nk)
+        ok = _full_check(_unpack_fragments(packed, n, k), w_nk) and _mf.self_check(packed, w, ws, xs, _cutlass)
     except Exception as e:  # noqa: BLE001
         logger.warning("musefp8: packing or self-check failed (%s); using cutlass_scaled_mm", e)
         ok = False
@@ -122,10 +139,24 @@ def _muse_fp8_scaled_mm(
             "musefp8 decode GEMV: %d FP8 layers admitted (%d of them rANS-compressed), %d rejected",
             _stats["admitted"], _stats["rans"], _stats["rejected"],
         )
+        logger.info(
+            "Lossless FP8 weight check: %d of %d packed weights decoded in full equal to the loaded weight "
+            "(%d bytes compared)",
+            _stats["full"], _stats["full"] + _stats["full_bad"], _stats["full_bytes"],
+        )
     k, n = B.shape
     if A.shape[0] == 1 and packed.numel() > 0 and A.is_contiguous() and _scales_ok(As, Bs, n):
         out = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
-        if packed.numel() == n * k:
+        route = "musefp8" if packed.numel() == n * k else "rans"
+        if route not in _routes_seen:
+            # Once per route, at the first one-row call of the running engine: the decode step's FP8 GEMV.
+            _routes_seen.add(route)
+            logger.info(
+                "FP8 one-row GEMM in use: %s",
+                "fragment-ordered musefp8 GEMV" if route == "musefp8"
+                else "rANS-coded weights decoded inside the GEMV (rans_gemv_kernel)",
+            )
+        if route == "musefp8":
             _mf.gemv(packed, A, Bs, As, out, n, k)
         else:
             _rans.rans_gemv_auto(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)

@@ -54,6 +54,38 @@
     {
       "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py; harness/kernels/decode6 (new)",
       "why": "Uses zereraz's published 6-bit palette implementation from cdefbb34 / 56791c43 for one-row NVFP4 decode after the per-layer bitwise admission check. The existing BF16 and FP8 SwiGLU prefill and narrow down operation signatures preserve their arguments."
+    },
+    {
+      "file": "vllm/model_executor/models/muse_glimmer.py, vllm/model_executor/models/muse_glimmer_glue.py (new)",
+      "why": "launches of the compiled query QK-norm + NEOX RoPE kernel with at least 128 tokens run a Triton kernel with the same per-element fp32 chain (same inputs, same operations in the same order, one bf16 rounding at the store) and plain row/head/dim indexing instead of 64-bit remainders by the symbolic token count; the swap is at the Inductor launcher, each compiled kernel object is admitted only after its first long launch outside graph capture gives bit-identical outputs from both kernels on the real inputs and on random inputs; shorter batches (every decode step) run the compiled kernel; VLLM_MUSE_GLIMMER_PROMPT_GLUE=0 switches it off"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py",
+      "why": "the paired gate/up SwiGLU kernel at 512 rows (harness/kernels/marlinw/csrc/marlinw_swiglu.cu, the mechanism of Yukon entry 95faadcd) is used for a gate_up layer only after a load-time bitwise comparison of its output with the single ops.marlin_gemm call followed by the compiled SiLU-and-mul body (fp32 silu(g) = g / (exp(-g) + 1) times up, one bf16 rounding) on three input families; a layer that differs keeps the projection and the compiled glue"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py, vllm/model_executor/models/muse_glimmer.py (harness/kernels/marlin_narrow, harness/kernels/marlinw_down, harness/kernels/marlinw/csrc/marlinw_swiglu.cu)",
+      "why": "from Yukon entry 95faadcd (its narrow routes derive from entry e786622e), carried in entry 67957adf: at 512 rows the NVFP4 gate_up (39936 x 6656) runs a whole-K 64x128 Marlin tile that halves each stock 256-column tile, the NVFP4 down (6656 x 19968) runs a 64x128 tile whose work list keeps every stock K range, split index and fold order with both halves of a stock tile in one block, each admitted per layer by a load-time bitwise comparison with the single ops.marlin_gemm call; where down_proj is an NVFP4 Marlin layer (bf16 input) the compiled model calls a paired kernel that computes 64 gate and 64 up columns of one CTA over the whole K, rounds each to bf16 as the projection does, and applies silu(gate) * up with the compiled SiLU-and-mul arithmetic (a table of the fp32 silu of every bf16 gate value, fp32 multiply, one bf16 rounding)"
+    },
+    {
+      "file": "vllm/model_executor/layers/quantization/utils/glimmer_fp8.py (harness/kernels/glimmer_fp8/fp8x_ext.cu)",
+      "why": "from Yukon entry 95faadcd (extending the G2 tile of entry 4adc6cad), carried in entry 67957adf: FP8 w8a8 calls of a few rows on the listed checkpoint shapes run the same CUTLASS SM120 pingpong GEMM with a 16x32x512 tile; every output element keeps the ascending sequence of k32 MMA fragments into one fp32 accumulator and the same epilogue, with no split-K"
+    },
+    {
+      "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/prefill_graph.py (new), harness/vllm_resident/backends.py",
+      "why": "whole-forward CUDA graph for one fresh, unpadded, single-request 512-token prefill, captured at boot in its own pool after two eager forwards; a step replays it only when every host scalar of its attention metadata and model inputs equals the captured one, else it runs eager; logits stay outside the graph; the warm-up adds one 512-token seed round; VLLM_PREFILL_GRAPH=0 switches it off (as in Yukon entries 95faadcd and 67957adf; port of entry c1e4b913 via entries ff28cfe8 and b3073f3d)"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py, vllm/model_executor/layers/quantization/modelopt.py, vllm/model_executor/models/muse_glimmer.py (harness/kernels/marlinw/csrc/marlinw_swiglu_fp8.cu, harness/kernels/marlinw/py/swiglu_fp8.py)",
+      "why": "from Yukon entry 67957adf: at 512 rows, where an NVFP4 gate_up is followed by an FP8 down_proj with a per-tensor static input scale (layers 1-4 and 12 of this checkpoint), the paired gate/up kernel computes silu(gate) * up in fp32 from the bf16-rounded projections, multiplies by 1 / scale, clamps to +-448 and stores e4m3, the arithmetic of the compiled SiLU-and-mul plus FP8 quantization (no bf16 rounding of the product); the down projection takes that activation as a QuantizedActivation and skips its own quantization. Each MLP is admitted only after a load-time comparison, byte for byte, of the fused output with the single ops.marlin_gemm call followed by a Triton copy of the compiled SiLU-and-mul FP8 quantization body, with the down projection's own scale, on four input families; an MLP that differs keeps the projection and the compiled glue"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/scaled_mm/muse_fp8.py, vllm/model_executor/kernels/linear/nvfp4/marlin.py",
+      "why": "full decode checks of the lossless decode layouts of Yukon entries cdefbb34 (zereraz) and 67957adf (kaankolcu): an FP8 weight stored as an exponent-pair rANS stream (the 4-bit exponents of two adjacent weights form one symbol of a static 12-bit-probability table per tensor, interleaved 32-bit rANS states; sign and mantissa kept raw as a nibble plane) is decoded in full with rans_unpack, and the fragment-ordered uncompressed copy is put back in row order, and either must equal every byte of the loaded weight before the GEMV check runs; the NVFP4 group-16 block scales stored as 6-bit codes into a 64-entry per-layer palette are expanded in full and must equal the loaded Marlin scales byte for byte (the tile-major weight copy likewise), and the one-row GEMV must then equal ops.marlin_gemm itself on three inputs; boot lines count the layers and bytes compared; a layer that fails keeps the uncompressed path"
+    },
+    {
+      "file": "harness/kernels/l2pf/py/sites.py",
+      "why": "GEMMs whose weights exceed L2PF_MAX_WEIGHT_MB (the MLP) get a weight-head prefetch sized to the window ahead of them: L2PF_MB_MLP_NORM (2.25 MiB) ahead of a GEMM that follows a norm (gate_up), L2PF_MB_MLP_ACT (0.5 MiB) ahead of one that follows the previous large GEMM's activation (down); only the prefetch side branch changes (same main-stream kernels, arguments and order), every range is still checked to lie inside a model tensor; L2PF_MLP=0 restores the skip"
     }
   ],
   "carried_from": {

@@ -43,6 +43,7 @@ _lock = threading.Lock()
 _ready: dict[int, int] = {}
 _plans: dict = {}
 _scratch: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_retired: list[tuple[torch.Tensor, torch.Tensor]] = []
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -317,6 +318,9 @@ def _ensure_scratch(dev: int, device: torch.device, slots: int):
     cur = _scratch.get(dev)
     if cur is not None and cur[0].numel() >= slots:
         return
+    if cur is not None:
+        # A captured CUDA graph may hold the old buffers: never free them.
+        _retired.append(cur)
     locks = torch.zeros(slots, dtype=torch.int32, device=device)
     c_tmp = torch.empty(slots * 64 * 256, dtype=torch.float32, device=device)
     _scratch[dev] = (locks, c_tmp)
