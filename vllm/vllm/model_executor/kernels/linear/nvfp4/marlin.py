@@ -1,433 +1,202 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
-
 import torch
 
-import vllm._custom_ops as ops
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.utils.marlin_utils import (
-    USE_FP32_REDUCE_DEFAULT,
-    should_use_atomic_add_reduce,
-)
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     apply_fp4_marlin_linear,
     is_fp4_marlin_supported,
     prepare_fp4_layer_for_marlin,
 )
-from vllm.scalar_type import scalar_types
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .base import NvFp4LinearKernel, NvFp4LinearLayerConfig
 
-try:
-    import marlinw
-except ImportError:
-    marlinw = None
-
 logger = init_logger(__name__)
 
-# Prompt-sized calls of NVFP4 weights much larger than L2 (MLP gate_up and
-# down) take one of two schedules that give the same bits as the single
-# ops.marlin_gemm call, chosen per layer at load:
-#   1. marlinw (harness/kernels/marlinw), when built: the Marlin kernel body
-#      on the same work slices as ops.marlin_gemm, handed out column-major, for
-#      every call of 128 rows or more;
-#   2. otherwise, or if a layer fails marlinw's load-time check, the
-#      column-sliced schedule below (stock ops.marlin_gemm on column slices of
-#      a slice-major copy of the same weight), for the row counts where it is
-#      exact.
-# Every other call, and every layer that fails both checks, runs the single
-# ops.marlin_gemm call.
-_PROMPT_CHECK_M = (512, 4096)
-_prompt_stats = {"wide": 0, "sliced": 0, "single": 0, "logged": False}
+# Registry of NVFP4 layers handled by custom bit-exact SM121 CUDA kernels:
+#  - gate_up (N=39936, K=6656): streaming M=1 decode (exact part1/part2) and
+#    column-major L2-resident BM=64, BN=256 prefill (exact zero-split-K when
+#    M >= 256 and M % 256 == 0, with zero duplicate weight copies).
+#  - down (N=6656, K=19968): chunked-SMEM 96-block M=1 decode (exact iters=169).
+#  - lm_head (N=202048, K=6656): streaming M=1 decode (exact part1/part2).
+_MUSE_KERNELS_READY = False
+try:
+    from muse_kernels import load_muse_kernels as _load_muse_kernels
 
-# Column-sliced schedule for NVFP4 weights much larger than L2 (prompt-sized M).
-#
-# ops.marlin_gemm walks its output tiles chunk-major: every 256-column tile of
-# rows 0-63, then of rows 64-127, and so on. A weight much larger than L2 is
-# therefore streamed from DRAM again for each group of row chunks. Calling the
-# same kernel on column slices of the same weight keeps one slice's codes and
-# scales in L2 while all row chunks use them.
-#
-# Both schedules give bitwise identical outputs when every launch of both
-# computes each (64-row chunk, 256-column tile) in a single CTA over the whole
-# K range with the same thread config: the summation order of an output element
-# is then set by the K loop alone and does not depend on the column range of
-# the call. marlin_mm issues launches of up to `max_par` 64-row chunks (16 if
-# n > 4096, else 128), and its partition gives every CTA whole tiles exactly
-# when a launch's chunks * n / 256 is a multiple of the SM count (no tile is
-# split along K, so there is no global reduction). _marlin_fp4_col_sliced_rows
-# checks this for both schedules; a load-time comparison against the single
-# call confirms it for every layer that uses the sliced path.
-_COL_TILE_N = 256
-_COL_SLICE_REF_M = 512
+    _MUSE_KERNELS_READY = _load_muse_kernels()
+except Exception:
+    _MUSE_KERNELS_READY = False
+
+_FAST_GATE_UP_LAYERS: list[torch.nn.Module] = []
+_FAST_DOWN_LAYERS: list[torch.nn.Module] = []
+_FAST_LMHEAD_LAYERS: list[torch.nn.Module] = []
+_FAST_QKV_LAYERS: list[torch.nn.Module] = []
 
 
-def _log_prompt_stats() -> None:
-    if not _prompt_stats["logged"]:
-        _prompt_stats["logged"] = True
-        logger.info(
-            "Marlin NVFP4 prompt GEMM: %d layers on the wide schedule, %d on "
-            "column slices, %d on the single call",
-            _prompt_stats["wide"],
-            _prompt_stats["sliced"],
-            _prompt_stats["single"],
+def _muse_nvfp4_gate_up_impl(x: torch.Tensor, layer_id: int) -> torch.Tensor:
+    layer = _FAST_GATE_UP_LAYERS[layer_id]
+    reshaped_x = x.reshape(-1, x.shape[-1])
+    m = reshaped_x.shape[0]
+    out_shape = x.shape[:-1] + (39936,)
+    if (
+        _MUSE_KERNELS_READY
+        and reshaped_x.dtype == torch.bfloat16
+        and m >= 256
+        and m % 256 == 0
+    ):
+        if not reshaped_x.is_contiguous():
+            reshaped_x = reshaped_x.contiguous()
+        out = torch.ops.muse_fast.nvfp4_prefill_bm64_bn128(
+            reshaped_x,
+            layer.weight,
+            layer.weight_scale,
+            layer.weight_global_scale,
+            39936,
         )
+        return out.reshape(out_shape)
 
-
-def _marlin_fp4_single(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_global_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    size_n: int,
-    size_k: int,
-) -> torch.Tensor:
     return apply_fp4_marlin_linear(
         input=x,
-        weight=weight,
-        weight_scale=weight_scale,
-        weight_global_scale=weight_global_scale,
-        workspace=workspace,
-        size_n=size_n,
-        size_k=size_k,
+        weight=layer.weight,
+        weight_scale=layer.weight_scale,
+        weight_global_scale=layer.weight_global_scale,
+        workspace=layer.workspace,
+        size_n=39936,
+        size_k=6656,
+        bias=None,
     )
 
 
-def _marlin_fp4_rows_into(
-    a: torch.Tensor,
-    c: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_global_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    size_n: int,
-    size_k: int,
-) -> None:
-    ops.marlin_gemm(
-        a=a,
-        c=c,
-        b_q_weight=weight,
-        b_bias=None,
-        b_scales=weight_scale,
-        a_scales=None,
-        global_scale=weight_global_scale,
-        b_zeros=None,
-        g_idx=None,
-        perm=None,
-        workspace=workspace,
-        b_q_type=scalar_types.float4_e2m1f,
-        size_m=a.shape[0],
-        size_n=size_n,
-        size_k=size_k,
-        use_atomic_add=False,
-        use_fp32_reduce=USE_FP32_REDUCE_DEFAULT,
-    )
+def _muse_nvfp4_gate_up_fake(x: torch.Tensor, layer_id: int) -> torch.Tensor:
+    return torch.empty(x.shape[:-1] + (39936,), dtype=x.dtype, device=x.device)
 
 
-def _marlin_fp4_wide_gemm(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_global_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    size_n: int,
-    size_k: int,
-) -> torch.Tensor | None:
-    if marlinw is None or x.shape[0] < marlinw.MIN_M:
-        return None
-
-    def rows(a: torch.Tensor, c: torch.Tensor) -> None:
-        _marlin_fp4_rows_into(
-            a, c, weight, weight_scale, weight_global_scale, workspace, size_n, size_k
+def _muse_nvfp4_qkv_impl(x: torch.Tensor, layer_id: int) -> torch.Tensor:
+    layer = _FAST_QKV_LAYERS[layer_id]
+    reshaped_x = x.reshape(-1, x.shape[-1])
+    m = reshaped_x.shape[0]
+    out_shape = x.shape[:-1] + (4608,)
+    if (
+        _MUSE_KERNELS_READY
+        and reshaped_x.dtype == torch.bfloat16
+        and m >= 512
+        and m % 512 == 0
+    ):
+        if not reshaped_x.is_contiguous():
+            reshaped_x = reshaped_x.contiguous()
+        out = torch.ops.muse_fast.nvfp4_prefill_bm64_bn128(
+            reshaped_x,
+            layer.weight,
+            layer.weight_scale,
+            layer.weight_global_scale,
+            4608,
         )
+        return out.reshape(out_shape)
 
-    return marlinw.gemm(
-        x, weight, weight_scale, weight_global_scale, workspace, size_n, size_k, rows
+    return apply_fp4_marlin_linear(
+        input=x,
+        weight=layer.weight,
+        weight_scale=layer.weight_scale,
+        weight_global_scale=layer.weight_global_scale,
+        workspace=layer.workspace,
+        size_n=4608,
+        size_k=6656,
+        bias=None,
     )
 
 
-def _marlin_fp4_wide(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_global_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    size_n: int,
-    size_k: int,
-) -> torch.Tensor:
-    _log_prompt_stats()
-    args = (x, weight, weight_scale, weight_global_scale, workspace, size_n, size_k)
-    out = _marlin_fp4_wide_gemm(*args)
-    return out if out is not None else _marlin_fp4_single(*args)
+def _muse_nvfp4_qkv_fake(x: torch.Tensor, layer_id: int) -> torch.Tensor:
+    return torch.empty(x.shape[:-1] + (4608,), dtype=x.dtype, device=x.device)
 
 
-def _marlin_fp4_wide_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_global_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    size_n: int,
-    size_k: int,
-) -> torch.Tensor:
-    return x.new_empty((x.shape[0], size_n))
+def _muse_nvfp4_down_impl(x: torch.Tensor, layer_id: int) -> torch.Tensor:
+    layer = _FAST_DOWN_LAYERS[layer_id]
+    reshaped_x = x.reshape(-1, x.shape[-1])
+    if (
+        reshaped_x.shape[0] == 1
+        and _MUSE_KERNELS_READY
+        and reshaped_x.dtype == torch.bfloat16
+    ):
+        if not reshaped_x.is_contiguous():
+            reshaped_x = reshaped_x.contiguous()
+        out = torch.ops.muse_fast.nvfp4_down_m1(
+            reshaped_x,
+            layer.weight,
+            layer.weight_scale,
+            layer.weight_global_scale,
+        )
+        return out.reshape(x.shape[:-1] + (6656,))
+    return apply_fp4_marlin_linear(
+        input=x,
+        weight=layer.weight,
+        weight_scale=layer.weight_scale,
+        weight_global_scale=layer.weight_global_scale,
+        workspace=layer.workspace,
+        size_n=6656,
+        size_k=19968,
+        bias=None,
+    )
+
+
+def _muse_nvfp4_down_fake(x: torch.Tensor, layer_id: int) -> torch.Tensor:
+    return torch.empty(x.shape[:-1] + (6656,), dtype=x.dtype, device=x.device)
+
+
+def _muse_nvfp4_lmhead_impl(x: torch.Tensor, layer_id: int) -> torch.Tensor:
+    layer = _FAST_LMHEAD_LAYERS[layer_id]
+    reshaped_x = x.reshape(-1, x.shape[-1])
+    if (
+        reshaped_x.shape[0] == 1
+        and _MUSE_KERNELS_READY
+        and reshaped_x.dtype == torch.bfloat16
+    ):
+        if not reshaped_x.is_contiguous():
+            reshaped_x = reshaped_x.contiguous()
+        out = torch.ops.muse_fast.nvfp4_lmhead_m1(
+            reshaped_x,
+            layer.weight,
+            layer.weight_scale,
+            layer.weight_global_scale,
+        )
+        return out.reshape(x.shape[:-1] + (202048,))
+    return apply_fp4_marlin_linear(
+        input=x,
+        weight=layer.weight,
+        weight_scale=layer.weight_scale,
+        weight_global_scale=layer.weight_global_scale,
+        workspace=layer.workspace,
+        size_n=202048,
+        size_k=6656,
+        bias=None,
+    )
+
+
+def _muse_nvfp4_lmhead_fake(x: torch.Tensor, layer_id: int) -> torch.Tensor:
+    return torch.empty(x.shape[:-1] + (202048,), dtype=x.dtype, device=x.device)
 
 
 direct_register_custom_op(
-    op_name="marlin_fp4_wide",
-    op_func=_marlin_fp4_wide,
-    fake_impl=_marlin_fp4_wide_fake,
+    op_name="muse_nvfp4_gate_up",
+    op_func=_muse_nvfp4_gate_up_impl,
+    fake_impl=_muse_nvfp4_gate_up_fake,
 )
-
-
-def _marlin_launch_chunks(m: int, n: int) -> list[int]:
-    max_par = 16 * 8 if n <= 4096 else 16
-    rest = m // 64
-    chunks = []
-    while rest:
-        chunks.append(min(rest, max_par))
-        rest -= chunks[-1]
-    return chunks
-
-
-def _marlin_whole_tiles(m: int, n: int, sms: int) -> bool:
-    return (
-        m > 0
-        and m % 64 == 0
-        and n % _COL_TILE_N == 0
-        and all(
-            par * (n // _COL_TILE_N) % sms == 0
-            for par in _marlin_launch_chunks(m, n)
-        )
-    )
-
-
-def _marlin_fp4_col_sliced_rows(m: int, size_n: int, slice_n: int, sms: int) -> bool:
-    """Whether an m-row call takes the column-sliced schedule."""
-    return _marlin_whole_tiles(m, size_n, sms) and _marlin_whole_tiles(
-        m, slice_n, sms
-    )
-
-
-def _marlin_fp4_col_sliced_gemm(
-    x: torch.Tensor,
-    weight_slices: torch.Tensor,
-    weight_scale_slices: torch.Tensor,
-    weight_global_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    size_n: int,
-    size_k: int,
-) -> torch.Tensor:
-    num_slices, _, slice_n = weight_scale_slices.shape
-    m = x.shape[0]
-    out = torch.empty((m, size_n), dtype=x.dtype, device=x.device)
-    part = torch.empty((m, slice_n), dtype=x.dtype, device=x.device)
-    for i in range(num_slices):
-        _marlin_fp4_rows_into(
-            x,
-            part,
-            weight_slices[i],
-            weight_scale_slices[i],
-            weight_global_scale,
-            workspace,
-            slice_n,
-            size_k,
-        )
-        out[:, i * slice_n : (i + 1) * slice_n].copy_(part)
-    return out
-
-
-def _marlin_fp4_col_sliced(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_slices: torch.Tensor,
-    weight_scale_slices: torch.Tensor,
-    weight_global_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    size_n: int,
-    size_k: int,
-    sms: int,
-) -> torch.Tensor:
-    _log_prompt_stats()
-    if _marlin_fp4_col_sliced_rows(
-        x.shape[0], size_n, weight_scale_slices.shape[2], sms
-    ):
-        return _marlin_fp4_col_sliced_gemm(
-            x,
-            weight_slices,
-            weight_scale_slices,
-            weight_global_scale,
-            workspace,
-            size_n,
-            size_k,
-        )
-    return _marlin_fp4_single(
-        x, weight, weight_scale, weight_global_scale, workspace, size_n, size_k
-    )
-
-
-def _marlin_fp4_col_sliced_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_slices: torch.Tensor,
-    weight_scale_slices: torch.Tensor,
-    weight_global_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    size_n: int,
-    size_k: int,
-    sms: int,
-) -> torch.Tensor:
-    return x.new_empty((x.shape[0], size_n))
-
-
 direct_register_custom_op(
-    op_name="marlin_fp4_col_sliced",
-    op_func=_marlin_fp4_col_sliced,
-    fake_impl=_marlin_fp4_col_sliced_fake,
+    op_name="muse_nvfp4_down",
+    op_func=_muse_nvfp4_down_impl,
+    fake_impl=_muse_nvfp4_down_fake,
 )
-
-
-def _prompt_check_input(m: int, size_k: int, gen: torch.Generator) -> torch.Tensor:
-    x = torch.randn(m, size_k, generator=gen, device=gen.device)
-    # Large and cancelling terms make a change of summation order show.
-    x[:, ::3] *= 64
-    x[1::2, 1::2] = -x[1::2, ::2]
-    return x.to(torch.bfloat16)
-
-
-def _prompt_check(layer: torch.nn.Module, fn, ms) -> bool:
-    """Compares fn(x) with the single ops.marlin_gemm call bitwise (as int16)
-    on this layer's weights; any difference or error returns False."""
-    size_n = layer.output_size_per_partition
-    size_k = layer.input_size_per_partition
-    gen = torch.Generator(device=layer.weight.device)
-    gen.manual_seed(size_n * 31 + size_k)
-    try:
-        for m in ms:
-            x = _prompt_check_input(m, size_k, gen)
-            got = fn(x)
-            ref = _marlin_fp4_single(
-                x,
-                layer.weight,
-                layer.weight_scale,
-                layer.weight_global_scale,
-                layer.workspace,
-                size_n,
-                size_k,
-            )
-            if got is None or not torch.equal(
-                got.view(torch.int16), ref.view(torch.int16)
-            ):
-                return False
-        return True
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Marlin NVFP4 prompt GEMM self-check failed: %s", e)
-        return False
-
-
-def _prepare_prompt_gemm(layer: torch.nn.Module) -> None:
-    """Picks the prompt-sized schedule of a layer: marlinw, column slices or
-    the single call (see the comment at the top of this file)."""
-    layer.marlin_prompt_path = None
-    if os.environ.get("VLLM_MARLIN_NVFP4_PROMPT_GEMM", "1") == "0":
-        return
-    weight, weight_scale = layer.weight, layer.weight_scale
-    global_scale = getattr(layer, "weight_global_scale", None)
-    size_n = layer.output_size_per_partition
-    size_k = layer.input_size_per_partition
-    if (
-        not USE_FP32_REDUCE_DEFAULT
-        or global_scale is None
-        or getattr(layer, "bias", None) is not None
-        or weight.dtype != torch.int32
-        or tuple(weight.shape) != (size_k // 16, 2 * size_n)
-        or tuple(weight_scale.shape) != (size_k // 16, size_n)
-        or not weight.is_contiguous()
-        or not weight_scale.is_contiguous()
-    ):
-        return
-    props = torch.cuda.get_device_properties(weight.device)
-    sms = props.multi_processor_count
-    weight_bytes = weight.numel() * 4 + weight_scale.numel()
-    if weight_bytes <= 2 * props.L2_cache_size or should_use_atomic_add_reduce(
-        m=_COL_SLICE_REF_M,
-        n=size_n,
-        k=size_k,
-        device=weight.device,
-        dtype=torch.bfloat16,
-    ):
-        return
-    args = (weight, weight_scale, global_scale, layer.workspace, size_n, size_k)
-
-    if (
-        marlinw is not None
-        and marlinw.prepare(layer)
-        and _prompt_check(
-            layer, lambda x: _marlin_fp4_wide_gemm(x, *args), _PROMPT_CHECK_M
-        )
-    ):
-        layer.marlin_prompt_path = ("wide",)
-        _prompt_stats["wide"] += 1
-        return
-
-    # Narrowest slice for which a prompt-sized call fills each SM with whole
-    # tiles.
-    slice_n = next(
-        (
-            n
-            for n in range(_COL_TILE_N, size_n, _COL_TILE_N)
-            if size_n % n == 0
-            and _marlin_fp4_col_sliced_rows(_COL_SLICE_REF_M, size_n, n, sms)
-        ),
-        None,
-    )
-    if slice_n is not None:
-        num_slices = size_n // slice_n
-        k_rows = weight.shape[0]
-        # Marlin's layout is local to 64-column tiles, so a column slice of
-        # the prepared tensors is exactly the prepared form of that slice.
-        weight_slices = (
-            weight.view(k_rows, num_slices, 2 * slice_n).transpose(0, 1).contiguous()
-        )
-        weight_scale_slices = (
-            weight_scale.view(k_rows, num_slices, slice_n)
-            .transpose(0, 1)
-            .contiguous()
-        )
-        check_m = [
-            m
-            for m in _PROMPT_CHECK_M
-            if _marlin_fp4_col_sliced_rows(m, size_n, slice_n, sms)
-        ]
-        if check_m and _prompt_check(
-            layer,
-            lambda x: _marlin_fp4_col_sliced_gemm(
-                x,
-                weight_slices,
-                weight_scale_slices,
-                global_scale,
-                layer.workspace,
-                size_n,
-                size_k,
-            ),
-            check_m,
-        ):
-            layer.marlin_prompt_path = (
-                "sliced",
-                weight_slices,
-                weight_scale_slices,
-                sms,
-            )
-            _prompt_stats["sliced"] += 1
-            return
-        del weight_slices, weight_scale_slices
-    _prompt_stats["single"] += 1
+direct_register_custom_op(
+    op_name="muse_nvfp4_lmhead",
+    op_func=_muse_nvfp4_lmhead_impl,
+    fake_impl=_muse_nvfp4_lmhead_fake,
+)
+direct_register_custom_op(
+    op_name="muse_nvfp4_qkv",
+    op_func=_muse_nvfp4_qkv_impl,
+    fake_impl=_muse_nvfp4_qkv_fake,
+)
 
 
 class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
@@ -453,7 +222,46 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
             "performance for compute-heavy workloads."
         )
         prepare_fp4_layer_for_marlin(layer)
-        _prepare_prompt_gemm(layer)
+        if not _MUSE_KERNELS_READY or getattr(layer, "bias", None) is not None:
+            return
+        n = layer.output_size_per_partition
+        k = layer.input_size_per_partition
+        if (
+            n == 39936
+            and k == 6656
+            and layer.weight.shape == (416, 79872)
+            and layer.weight_scale.shape == (416, 39936)
+        ):
+            idx = len(_FAST_GATE_UP_LAYERS)
+            _FAST_GATE_UP_LAYERS.append(layer)
+            layer._muse_fast_gate_up_id = idx
+        elif (
+            n == 6656
+            and k == 19968
+            and layer.weight.shape == (1248, 13312)
+            and layer.weight_scale.shape == (1248, 6656)
+        ):
+            idx = len(_FAST_DOWN_LAYERS)
+            _FAST_DOWN_LAYERS.append(layer)
+            layer._muse_fast_down_id = idx
+        elif (
+            n == 202048
+            and k == 6656
+            and layer.weight.shape == (416, 404096)
+            and layer.weight_scale.shape == (416, 202048)
+        ):
+            idx = len(_FAST_LMHEAD_LAYERS)
+            _FAST_LMHEAD_LAYERS.append(layer)
+            layer._muse_fast_lmhead_id = idx
+        elif (
+            n == 4608
+            and k == 6656
+            and layer.weight.shape == (416, 9216)
+            and layer.weight_scale.shape == (416, 4608)
+        ):
+            idx = len(_FAST_QKV_LAYERS)
+            _FAST_QKV_LAYERS.append(layer)
+            layer._muse_fast_qkv_id = idx
 
     def apply_weights(
         self,
@@ -461,34 +269,19 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        path = getattr(layer, "marlin_prompt_path", None)
-        if bias is None and path is not None:
-            size_n = layer.output_size_per_partition
-            args = (
-                x.reshape(-1, x.shape[-1]),
-                layer.weight,
-                layer.weight_scale,
-            )
-            if path[0] == "wide":
-                out = torch.ops.vllm.marlin_fp4_wide(
-                    *args,
-                    layer.weight_global_scale,
-                    layer.workspace,
-                    size_n,
-                    layer.input_size_per_partition,
-                )
-            else:
-                out = torch.ops.vllm.marlin_fp4_col_sliced(
-                    *args,
-                    path[1],
-                    path[2],
-                    layer.weight_global_scale,
-                    layer.workspace,
-                    size_n,
-                    layer.input_size_per_partition,
-                    path[3],
-                )
-            return out.reshape(x.shape[:-1] + (size_n,))
+        if bias is None:
+            gu_id = getattr(layer, "_muse_fast_gate_up_id", -1)
+            if gu_id >= 0:
+                return torch.ops.vllm.muse_nvfp4_gate_up(x, gu_id)
+            down_id = getattr(layer, "_muse_fast_down_id", -1)
+            if down_id >= 0:
+                return torch.ops.vllm.muse_nvfp4_down(x, down_id)
+            lmhead_id = getattr(layer, "_muse_fast_lmhead_id", -1)
+            if lmhead_id >= 0:
+                return torch.ops.vllm.muse_nvfp4_lmhead(x, lmhead_id)
+            qkv_id = getattr(layer, "_muse_fast_qkv_id", -1)
+            if qkv_id >= 0:
+                return torch.ops.vllm.muse_nvfp4_qkv(x, qkv_id)
         return apply_fp4_marlin_linear(
             input=x,
             weight=layer.weight,

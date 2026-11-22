@@ -10,13 +10,7 @@ caller has what it asked for.
 
 Every emitted token carries the top-k RAW LOGITS of the position that produced
 it (highest first), so the resident can answer `top_logits` for whatever
-frontier it holds without another forward pass. `start(..., top_logits=False)`
-drops them for a request whose caller reads only the greedy tokens (the timed
-prefill and the free run): vLLM then skips the top-k selection over the
-vocabulary, its device-to-host copy and the per-token Logprob objects on every
-step. The tokens are the same either way: with greedy sampling the logprobs are
-a side read of the raw logits, never an input to the argmax or to the
-rejection sampler (vllm/v1/worker/gpu/sample/sampler.py).
+frontier it holds without another forward pass.
 
 `VllmBackend` is the scored engine. `FakeBackend` is a deterministic stand-in
 with the same step semantics (including multi-token speculative steps), so the
@@ -26,7 +20,6 @@ resident's wire and bookkeeping are tested with no GPU and no vLLM install.
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass, field
 
 # DETERMINISM (measured on GB10, docs/muse-glimmer-port-notes.md "Findings").
@@ -40,13 +33,10 @@ from dataclasses import dataclass, field
 # process inherits them.
 os.environ.setdefault("VLLM_HUMMING_BATCH_INVARIANT", "1")
 os.environ.setdefault("VLLM_DISABLED_KERNELS", "FlashInferFP8ScaledMMLinearKernel")
+os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 from typing import Protocol
 
 TOP_K = 8
-
-
-def _log(msg: str) -> None:
-    print(f"resident: {msg}", file=sys.stderr, flush=True)
 
 
 @dataclass(frozen=True)
@@ -66,7 +56,10 @@ class Backend(Protocol):
     model_path: str
 
     def start(
-        self, tokens: list[int], max_tokens: int | None = None, top_logits: bool = True
+        self,
+        tokens: list[int],
+        max_tokens: int | None = None,
+        need_logprobs: bool = True,
     ) -> list[Emit]: ...
 
     def step(self) -> list[Emit]: ...
@@ -149,8 +142,6 @@ class VllmBackend:
     def __init__(self, cfg: VllmConfig):
         from vllm import EngineArgs, LLMEngine, SamplingParams
         from vllm.sampling_params import RequestOutputKind
-        from vllm.usage.usage_lib import UsageContext
-        from vllm.v1.executor.abstract import Executor
 
         spec = None
         if cfg.depth > 0:
@@ -169,11 +160,6 @@ class VllmBackend:
             skip_tokenizer_init=not multimodal,
             trust_remote_code=False,
             dtype="auto",
-            # Read each checkpoint shard in one pass instead of memory-mapping
-            # it: the same bytes reach the same parameters, in a shorter load.
-            safetensors_load_strategy=(
-                "lazy" if os.environ.get("VLLM_RESIDENT_EAGER_LOAD", "1") == "0" else "eager"
-            ),
             seed=0,
             max_model_len=cfg.ctx_size,
             max_num_seqs=1,
@@ -190,37 +176,12 @@ class VllmBackend:
             max_logprobs=TOP_K,
             speculative_config=spec,
             moe_backend="humming",
+            cudagraph_capture_sizes=[1, 2, 512],
+            enable_flashinfer_autotune=False,
+            async_scheduling=False,
             disable_log_stats=True,
         )
-        # Drive the single-request engine in this process. `from_engine_args`
-        # would ignore `enable_multiprocessing=False` whenever the default-on
-        # VLLM_ENABLE_V1_MULTIPROCESSING flag is set, so build the engine from
-        # its parts: same config, same executor class, but `multiprocess_mode=False`
-        # selects the synchronous in-process client (no engine-core process, no
-        # IPC hop per step). Startup is done afterwards: keep this process on
-        # the fastest cores (a no-op where all cores are alike).
-        if os.environ.get("VLLM_RESIDENT_INPROC", "1") == "0":
-            self._engine = LLMEngine.from_engine_args(args)
-        else:
-            usage_context = UsageContext.ENGINE_CONTEXT
-            engine_config = args.create_engine_config(usage_context)
-            self._engine = LLMEngine(
-                vllm_config=engine_config,
-                executor_class=Executor.get_class(engine_config),
-                log_stats=not args.disable_log_stats,
-                usage_context=usage_context,
-                multiprocess_mode=False,
-            )
-        from vllm.v1.worker import hostfast
-
-        pinned = hostfast.pin_to_fast_cpus()
-        _log(
-            f"process pinned to CPUs {hostfast.format_cpus(pinned)}"
-            if pinned
-            else "CPU affinity unchanged"
-        )
-        # VLLM_RESIDENT_ARGMAX_ONLY=0 keeps the top-k on every request.
-        self._argmax_only = os.environ.get("VLLM_RESIDENT_ARGMAX_ONLY", "1") != "0"
+        self._engine = LLMEngine.from_engine_args(args)
         self._SamplingParams = SamplingParams
         self._delta = RequestOutputKind.DELTA
         hf = self._engine.model_config.hf_config
@@ -240,6 +201,10 @@ class VllmBackend:
         self.model_path = cfg.model_dir
         self._rid = 0
         self._live: str | None = None
+        self._fast_decode_ready = False
+        self._fast_decode_failed = False
+        self._fast_max_steps = 4096
+        self._fast_window_limit = int(getattr(text_hf, "sliding_window", None) or cfg.ctx_size)
         self._warm_up()
 
     # BOOT WARM-UP. The first prefill and the first decode steps after the
@@ -251,30 +216,237 @@ class VllmBackend:
     # class of work as CUDA graph capture at boot. The prompt is the fixture's
     # `seed_tokens` long, so the warm-up JITs the exact shapes the timed
     # prefill runs.
-    WARMUP_PROMPT_TOKENS = 4096
-    WARMUP_DECODE_STEPS = 64
-    WARMUP_ROUNDS = 3
+    WARMUP_PROMPT_TOKENS = 512
+    WARMUP_DECODE_STEPS = 8
+    WARMUP_ROUNDS = 1
 
     def _warm_up(self) -> None:
         prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_PROMPT_TOKENS)]
-        for i in range(self.WARMUP_ROUNDS):
-            # Both request shapes the phases use: the timed phases' greedy-only
-            # requests and the correctness gates' top-k ones (the latter JIT
-            # the logprobs kernels), ending on the timed shape.
-            self.start(prompt, top_logits=(self.WARMUP_ROUNDS - i) % 2 == 0)
+        for _ in range(self.WARMUP_ROUNDS):
+            self.start(prompt, need_logprobs=True)
             for _ in range(self.WARMUP_DECODE_STEPS):
                 self.step()
             self.abort()
+        if self.depth == 0:
+            emitted = self.start(prompt, need_logprobs=False)
+            self._init_fast_decode()
+            if self._fast_decode_ready:
+                warm_toks = self.serial_run_fast(emitted[0].token, 4)
+                import sys
+                print(
+                    f"resident: fast decode warmup {'ok' if warm_toks is not None else 'skipped'}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            self.abort()
 
-    def _params(self, prompt_len: int, max_tokens: int | None = None, top_logits: bool = True):
+    def _init_fast_decode(self) -> None:
+        """Capture lightweight pre-embed and post-logits/argmax CUDA graphs for
+        zero-sync multi-step serial decode (in-process V2 GPUModelRunner)."""
+        if self._fast_decode_ready or self._fast_decode_failed or self.depth != 0:
+            return
+        try:
+            import torch
+            from muse_kernels import load_muse_kernels
+            from vllm.config.compilation import CUDAGraphMode
+
+            if not load_muse_kernels():
+                self._fast_decode_failed = True
+                return
+            ec_client = self._engine.engine_core
+            core = getattr(ec_client, "engine_core", None)
+            if core is None:
+                self._fast_decode_failed = True
+                return
+            runner = core.model_executor.driver_worker.model_runner
+            cg_mgr = getattr(runner, "cudagraph_manager", None)
+            if cg_mgr is None or not cg_mgr.graphs:
+                self._fast_decode_failed = True
+                return
+            full_graph = None
+            for desc, graph in cg_mgr.graphs.items():
+                if desc.cg_mode == CUDAGraphMode.FULL and desc.num_tokens == 1 and desc.num_reqs == 1:
+                    full_graph = graph
+                    break
+            if full_graph is None or cg_mgr.hidden_states is None:
+                self._fast_decode_failed = True
+                return
+
+            device = runner.device
+            self._fast_core = core
+            self._fast_runner = runner
+            self._fast_full_graph = full_graph
+            self._fast_out_tokens = torch.empty(
+                self._fast_max_steps, dtype=torch.int32, device=device
+            )
+            self._fast_step_idx = torch.zeros(1, dtype=torch.int32, device=device)
+            self._fast_step_limit = torch.ones(1, dtype=torch.int32, device=device)
+            self._fast_idx_map = torch.zeros(1, dtype=torch.int32, device=device)
+            self._fast_supports_mm = bool(
+                runner.supports_mm_inputs
+                and hasattr(runner.model_state, "encoder_runner")
+                and runner.model_state.encoder_runner is not None
+            )
+
+            pool = cg_mgr.pool
+            input_ids_1 = runner.input_buffers.input_ids[:1]
+            hidden_1 = cg_mgr.hidden_states[:1]
+
+            def _pre_op() -> None:
+                if self._fast_supports_mm:
+                    emb = runner.model.model.embed_input_ids(input_ids_1)
+                    runner.model_state.encoder_runner.inputs_embeds[:1].copy_(emb)
+
+            def _post_op() -> None:
+                logits = runner.model.compute_logits(hidden_1)
+                torch.ops.muse_fast.greedy_argmax_step_update(
+                    logits,
+                    self._fast_out_tokens,
+                    self._fast_step_idx,
+                    self._fast_step_limit,
+                    runner.input_buffers.input_ids,
+                    runner.input_buffers.positions,
+                    runner.input_buffers.seq_lens,
+                    runner.block_tables.input_block_table_ptrs,
+                    runner.block_tables.block_sizes_tensor,
+                    runner.block_tables.slot_mappings,
+                )
+
+            with torch.inference_mode():
+                # Ensure valid dummy indices during warmup/capture
+                self._fast_step_idx.zero_()
+                self._fast_step_limit.fill_(1)
+                input_ids_1.zero_()
+                runner.input_buffers.positions[:1].zero_()
+                runner.input_buffers.seq_lens[:1].fill_(1)
+                _pre_op()
+                _post_op()
+                torch.cuda.synchronize()
+
+                self._fast_pre_graph = None
+                if self._fast_supports_mm:
+                    pre_g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(pre_g, pool=pool):
+                        _pre_op()
+                    self._fast_pre_graph = pre_g
+
+                post_g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(post_g, pool=pool):
+                    _post_op()
+                self._fast_post_graph = post_g
+                torch.cuda.synchronize()
+
+            self._fast_decode_ready = True
+            import sys
+            print(
+                f"resident: fast decode ready (mm={self._fast_supports_mm}, window={self._fast_window_limit})",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception as err:
+            import sys
+            print(f"resident: fast decode init skipped: {err}", file=sys.stderr, flush=True)
+            self._fast_decode_failed = True
+
+    def serial_run_fast(self, first_token: int, count: int) -> list[int] | None:
+        """Zero-sync on-GPU multi-step serial decode loop.
+
+        Returns the `count` generated tokens `[T_1, ..., T_count]` or None if
+        the request is not eligible (falling back to standard engine steps).
+        """
+        if not self._fast_decode_ready or self._live is None or count < 2:
+            return None
+        if count > self._fast_max_steps:
+            return None
+        core = self._fast_core
+        scheduler = core.scheduler
+        if len(scheduler.running) != 1:
+            return None
+        req = scheduler.running[0]
+        if req.is_finished():
+            return None
+        sp = req.sampling_params
+        if sp is None or sp.temperature != 0.0 or sp.logprobs is not None:
+            return None
+        start_pos = req.num_computed_tokens
+        if start_pos + count + 1 >= min(self.ctx_size, self._fast_window_limit):
+            return None
+        if req.num_output_tokens + count > req.max_tokens:
+            return None
+
+        import torch
+
+        runner = self._fast_runner
+        req_idx = runner.req_states.req_id_to_index.get(req.request_id)
+        if req_idx is None:
+            return None
+
+        # Pre-allocate KV cache blocks for all `count` decode positions at once.
+        new_blocks = scheduler.kv_cache_manager.allocate_slots(req, count)
+        if new_blocks is None:
+            return None
+        new_block_ids = new_blocks.get_block_ids()
+        if any(new_block_ids):
+            runner.block_tables.append_block_ids(req_idx, new_block_ids, overwrite=False)
+            runner.block_tables.apply_staged_writes()
+
+        with torch.inference_mode():
+            self._fast_idx_map.fill_(req_idx)
+            runner.block_tables.gather_block_tables(self._fast_idx_map, num_reqs_padded=1)
+            torch.ops.muse_fast.init_decode_loop(
+                first_token,
+                start_pos,
+                count,
+                self._fast_step_idx,
+                self._fast_step_limit,
+                runner.input_buffers.input_ids,
+                runner.input_buffers.positions,
+                runner.input_buffers.seq_lens,
+                runner.input_buffers.query_start_loc,
+                runner.block_tables.input_block_table_ptrs,
+                runner.block_tables.block_sizes_tensor,
+                runner.block_tables.slot_mappings,
+            )
+
+            pre_g = self._fast_pre_graph
+            full_g = self._fast_full_graph
+            post_g = self._fast_post_graph
+            if pre_g is not None:
+                for _ in range(count):
+                    pre_g.replay()
+                    full_g.replay()
+                    post_g.replay()
+            else:
+                for _ in range(count):
+                    full_g.replay()
+                    post_g.replay()
+
+            tokens = [int(t) for t in self._fast_out_tokens[:count].tolist()]
+
+            # Keep scheduler and runner request states consistent for subsequent
+            # steps or clean abort().
+            new_computed = start_pos + count
+            req.num_computed_tokens = new_computed
+            req.append_output_token_ids(tokens)
+            runner.req_states.num_computed_tokens_np[req_idx] = new_computed
+            runner.req_states.num_computed_tokens.gpu[req_idx] = new_computed
+            runner.req_states.total_len.gpu[req_idx] = new_computed + 1
+            runner.req_states.last_sampled_tokens[req_idx, 0] = tokens[-1]
+
+        return tokens
+
+    def _params(
+        self,
+        prompt_len: int,
+        max_tokens: int | None = None,
+        need_logprobs: bool = True,
+    ):
         room = max(1, self.ctx_size - prompt_len - self.depth - 1)
         return self._SamplingParams(
             temperature=0.0,
             max_tokens=room if max_tokens is None else min(room, max_tokens),
             ignore_eos=True,
-            # None, not 0: 0 still runs the logprobs path for the sampled
-            # token. None leaves the sampler on its greedy path alone.
-            logprobs=TOP_K if top_logits else None,
+            logprobs=TOP_K if need_logprobs else None,
             detokenize=False,
             output_kind=self._delta,
         )
@@ -285,17 +457,24 @@ class VllmBackend:
             if out.request_id != self._live:
                 continue
             comp = out.outputs[0]
-            lps = comp.logprobs or [None] * len(comp.token_ids)
-            for token, lp in zip(comp.token_ids, lps):
-                top: tuple[tuple[int, float], ...] = ()
-                if lp:
-                    ranked = sorted(lp.items(), key=lambda kv: kv[1].logprob, reverse=True)
-                    top = tuple((int(t), float(v.logprob)) for t, v in ranked[:TOP_K])
-                emitted.append(Emit(int(token), top))
+            lps = comp.logprobs
+            if lps:
+                for token, lp in zip(comp.token_ids, lps):
+                    top: tuple[tuple[int, float], ...] = ()
+                    if lp:
+                        ranked = sorted(lp.items(), key=lambda kv: kv[1].logprob, reverse=True)
+                        top = tuple((int(t), float(v.logprob)) for t, v in ranked[:TOP_K])
+                    emitted.append(Emit(int(token), top))
+            else:
+                for token in comp.token_ids:
+                    emitted.append(Emit(int(token), ()))
         return emitted
 
     def start(
-        self, tokens: list[int], max_tokens: int | None = None, top_logits: bool = True
+        self,
+        tokens: list[int],
+        max_tokens: int | None = None,
+        need_logprobs: bool = True,
     ) -> list[Emit]:
         self.abort()
         if len(tokens) + self.depth + 2 > self.ctx_size:
@@ -305,7 +484,7 @@ class VllmBackend:
         self._engine.add_request(
             self._live,
             {"prompt_token_ids": list(tokens)},
-            self._params(len(tokens), max_tokens, top_logits or not self._argmax_only),
+            self._params(len(tokens), max_tokens, need_logprobs=need_logprobs),
         )
         emitted: list[Emit] = []
         while not emitted:
@@ -360,10 +539,7 @@ class FakeBackend:
         self._ctx: list[int] | None = None
         self._cycle = 0
         self._left: int | None = None
-        self._top = True
         self.starts = 0
-        # The top_logits flag of every start, in order (tests read it).
-        self.start_modes: list[bool] = []
 
     def _next(self, ctx: list[int]) -> int:
         a = ctx[-1] if ctx else 0
@@ -372,21 +548,21 @@ class FakeBackend:
 
     def _emit(self, ctx: list[int]) -> Emit:
         token = self._next(ctx)
-        if not self._top:
-            return Emit(token, ())
         top = tuple(
             (token if i == 0 else (token + i) % self.vocab_size, 10.0 - i) for i in range(TOP_K)
         )
         return Emit(token, top)
 
     def start(
-        self, tokens: list[int], max_tokens: int | None = None, top_logits: bool = True
+        self,
+        tokens: list[int],
+        max_tokens: int | None = None,
+        need_logprobs: bool = True,
     ) -> list[Emit]:
+        del need_logprobs
         if len(tokens) + self.depth + 2 > self.ctx_size:
             raise RuntimeError("context full")
         self.starts += 1
-        self.start_modes.append(top_logits)
-        self._top = top_logits
         self._ctx = list(tokens)
         self._cycle = 0
         self._left = None if max_tokens is None else max_tokens - 1

@@ -11,20 +11,12 @@ line, every reply carrying "ok" (and "error" when false).
 
   hello                          identity, vocab, EOS, depth, load epoch (ms)
   invalidate                     drop the live request
-  sync {tokens[,max_tokens][,argmax_only]}
-                                 prefill; reply carries the frontier argmax.
+  sync {tokens[,max_tokens]}     prefill; reply carries the frontier argmax.
                                  max_tokens bounds what the engine generates
-                                 for this sequence (a timed prefill asks for 1).
-                                 argmax_only: true says the caller reads only
-                                 the greedy tokens of this sequence (timed
-                                 prefill, free run), so no top-k logits are
-                                 computed for it and top_logits is refused on
-                                 it. Absent or false: every position carries
-                                 its top-k, as before
+                                 for this sequence (a timed prefill asks for 1)
   eval {token}                   append one token; reply carries the argmax
   argmax                         the frontier token
   top_logits {k}                 the frontier position's top-k raw logits
-                                 (refused on an argmax_only sequence)
   eval_speculative {first_token,budget}
                                  one verify cycle; committed tokens + argmax
   spec_run {first_token,count}   cycles until `count` tokens are committed,
@@ -42,16 +34,6 @@ forward pass. A fed token that is NOT the frontier (teacher forcing) re-prefills
 
 PHASE RESET. Every accepted connection starts from an invalidated session, so a
 phase can never inherit the previous phase's state.
-
-TOP-K ONLY WHERE IT IS READ. The adapter asks for `top_logits` in the
-teacher-forced gates only (`correctness_begin` / `correctness_step`, and
-`decode_step`, which shares their forward). The timed prefill, the free run
-and the free-run correctness reference read nothing but the argmax, so their
-syncs say `argmax_only` and vLLM skips the top-k over the vocabulary on every
-step of them. A sequence keeps its mode until the next sync or invalidate: a
-teacher-forced re-prefill inside it inherits the mode, so a gate sequence
-never loses its top-k. The flag changes no token: greedy sampling never reads
-the logprobs.
 
 NOTHING RUNS ON AFTER A PHASE. vLLM's engine core steps a live request until it
 finishes, whether or not anyone reads the tokens. benchd holds ONE connection
@@ -119,12 +101,6 @@ class Session:
         self.ctx: list[int] = []
         self.frontier: Emit | None = None
         self.ahead: deque[Emit] = deque()
-        # The live sequence computes no top-k logits (sync argmax_only).
-        self.argmax_only = False
-        # Syncs of the open phase by what the engine returned for the frontier:
-        # no top-k (the greedy-only requests) or top-k.
-        self.lean_syncs = 0
-        self.top_syncs = 0
 
     def _need_frontier(self) -> Emit:
         if self.frontier is None:
@@ -147,39 +123,57 @@ class Session:
         return not self.ahead and self.left is not None and self.left <= 0
 
     def sync(
-        self, tokens: list[int], max_tokens: int | None = None, argmax_only: bool = False
+        self,
+        tokens: list[int],
+        max_tokens: int | None = None,
+        need_logprobs: bool = True,
     ) -> int:
         if not tokens:
             raise RefusedError("sync needs a non-empty token list")
         if max_tokens is not None and max_tokens < 1:
             raise RefusedError("sync max_tokens must be positive")
         self._check_ids(tokens)
-        emitted = self.b.start(tokens, max_tokens, top_logits=not argmax_only)
-        self.argmax_only = argmax_only
-        if emitted[0].top:
-            self.top_syncs += 1
-        else:
-            self.lean_syncs += 1
+        emitted = self.b.start(tokens, max_tokens, need_logprobs=need_logprobs)
         self.left = None if max_tokens is None else max_tokens - len(emitted)
         self.ctx = list(tokens)
         self.frontier = emitted[0]
         self.ahead = deque(emitted[1:])
         return self.frontier.token
 
-    def take_sync_counts(self) -> tuple[int, int]:
-        """(syncs without top-k, syncs with top-k) since the last call."""
-        counts = (self.lean_syncs, self.top_syncs)
-        self.lean_syncs = self.top_syncs = 0
-        return counts
+    def serial_run(self, first: int, count: int) -> list[int]:
+        """Run `count` serial decode steps in one call, avoiding per-token socket round-trips."""
+        self._check_ids([first])
+        frontier = self._need_frontier()
+        if (
+            self.b.depth == 0
+            and not self.ahead
+            and first == frontier.token
+            and not self._spent()
+            and (self.left is None or self.left >= count)
+            and hasattr(self.b, "serial_run_fast")
+        ):
+            fast_tokens = self.b.serial_run_fast(first, count)
+            if fast_tokens is not None:
+                self.ctx.append(first)
+                self.ctx.extend(fast_tokens[:-1])
+                self.frontier = Emit(fast_tokens[-1], ())
+                if self.left is not None:
+                    self.left -= count
+                return fast_tokens
+        tokens: list[int] = []
+        pending = first
+        for _ in range(count):
+            pending = self.eval(pending)
+            tokens.append(pending)
+        return tokens
 
     def _feed(self, token: int) -> None:
         """Consume `token` at the frontier and advance to the next one."""
         frontier = self._need_frontier()
         if token != frontier.token or self._spent():
             # Teacher forcing, or a bounded sequence asked to go on: prefill
-            # again from the context. Correct, and deliberately not fast. The
-            # sequence keeps its top-k mode.
-            self.sync(self.ctx + [token], argmax_only=self.argmax_only)
+            # again from the context. Correct, and deliberately not fast.
+            self.sync(self.ctx + [token])
             return
         self.ctx.append(token)
         if not self.ahead:
@@ -203,7 +197,7 @@ class Session:
         self._check_ids([fed])
         frontier = self._need_frontier()
         if fed != frontier.token or self._spent():
-            self.sync(self.ctx + [fed], argmax_only=self.argmax_only)
+            self.sync(self.ctx + [fed])
             return [fed]
         if not self.ahead:
             self.ahead.extend(self._engine_step())
@@ -228,11 +222,6 @@ class Session:
 
     def top_logits(self, k: int) -> tuple[list[int], list[float]]:
         top = self._need_frontier().top
-        if self.argmax_only:
-            raise RefusedError(
-                "the live sequence was synced argmax_only and computed no top logits; "
-                "sync it without argmax_only to read them"
-            )
         if len(top) < k:
             raise RefusedError(f"the engine returned {len(top)} top logits, {k} were asked")
         return [t for t, _ in top[:k]], [v for _, v in top[:k]]
@@ -254,6 +243,7 @@ class Session:
             "ctx_size": self.b.ctx_size,
             "load_epoch": LOAD_EPOCH,
             "spec_run": self.spec_run_offered,
+            "serial_run": True,
             "ident": self.b.ident,
             "model_path": self.b.model_path,
             # The native MTP layer is embedded in the pinned checkpoint.
@@ -284,12 +274,18 @@ class Session:
             bound = None
             if "max_tokens" in req:
                 bound = int_field("max_tokens")
-            argmax_only = req.get("argmax_only", False)
-            if not isinstance(argmax_only, bool):
-                raise RefusedError('sync "argmax_only" must be a boolean')
-            return {"ok": True, "token": self.sync(tokens, bound, argmax_only)}, True
+            need_logprobs = req.get("need_logprobs", True)
+            if not isinstance(need_logprobs, bool):
+                raise RefusedError('sync "need_logprobs" must be a boolean')
+            return {"ok": True, "token": self.sync(tokens, bound, need_logprobs=need_logprobs)}, True
         if op == "eval":
             return {"ok": True, "token": self.eval(int_field("token"))}, True
+        if op == "serial_run":
+            count = int_field("count")
+            if not 1 <= count <= MAX_RUN:
+                raise RefusedError(f'serial_run needs a "count" in 1..{MAX_RUN}')
+            tokens = self.serial_run(int_field("first_token"), count)
+            return {"ok": True, "tokens": tokens, "token": tokens[-1]}, True
         if op == "argmax":
             return {"ok": True, "token": self._need_frontier().token}, True
         if op == "top_logits":
@@ -402,8 +398,6 @@ def main() -> int:
             log(f"phase {phase} connected")
             with conn:
                 serve_connection(session, conn, timeout_s)
-            lean, top = session.take_sync_counts()
-            log(f"phase {phase} syncs: {lean} without top-k, {top} with top-k")
             log(f"phase {phase} closed")
     except KeyboardInterrupt:
         pass
