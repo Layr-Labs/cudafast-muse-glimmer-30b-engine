@@ -41,11 +41,19 @@
     },
     {
       "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py",
-      "why": "NVFP4 W4A16 weights much larger than L2 (MLP gate_up and down) run calls of 128 rows or more through harness/kernels/marlinw when it is built (the Marlin kernel body on the same work slices as ops.marlin_gemm, handed out column-major); a layer without it runs prompt-sized calls as ops.marlin_gemm on column slices of a slice-major copy of the same prepared weight where both schedules compute every tile whole-K with the same config, else the single call; each path is admitted per layer by a load-time bitwise comparison with the single call"
+      "why": "Existing NVFP4 wide, narrow gate/up, split-K down, and stock fallback routes are preserved. Added one-row marlint dispatch and a fused SiLU-and-mul custom op whose narrow fallback performs the separately admitted narrow GEMM before the stock-equivalent standalone SiLU; all fast routes retain per-layer bitwise checks."
     },
     {
       "file": "vllm/v1/engine/core_client.py, vllm/v1/worker/hostfast.py (new)",
       "why": "in-process engine core for the single-request engine loop: InprocClient pauses automatic garbage collection while the engine has work and drains a finished request's queued batch on abort (no busy loop does it in this mode); hostfast.py also restricts the process to the highest-capacity CPU cores when the cores differ, failing soft (VLLM_HOSTFAST_GC=0 and VLLM_HOSTFAST_PIN=0 switch each off)"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/scaled_mm/cutlass.py, vllm/model_executor/kernels/linear/scaled_mm/fp8tile.py (new)",
+      "why": "FP8 w8a8 layers with per-tensor static scales run calls of 1 to 16 rows through harness/kernels/fp8tile: vLLM's SM120 CUTLASS FP8 GEMM for M <= 16 (same element types, layouts, pingpong schedule, persistent scheduler and ScaledEpilogue) with a 16x32x512 output tile; each output element keeps the same ascending-K MMA chain and epilogue; admitted per layer by a load-time bitwise comparison with ops.cutlass_scaled_mm, the existing small-M path otherwise"
+    },
+    {
+      "file": "vllm/model_executor/models/muse_glimmer.py",
+      "why": "MuseGlimmerMLP.forward calls the NVFP4 Marlin gate_up projection with SiLU-and-mul fused into its epilogue (marlin_fp4_silu_mul) when the layer was admitted at load and its down_proj reads the activation as stored bf16 (an NVFP4 Marlin down_proj); ahead of an FP8 down_proj the compiled graph fuses the activation quantization into the SiLU-and-mul kernel on the unrounded fp32 product, so those layers keep the compiled glue; the fused activation keeps the arithmetic of the compiled SiluAndMul glue, so the output bits are unchanged"
     }
   ],
   "carried_from": {

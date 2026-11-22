@@ -159,6 +159,9 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]
     ) -> None:
         self.logical_output_size: int | None = None
+        # The small-M kernel configuration (fp8tile.py), set at load time when it
+        # matched this layer's stock output bit for bit.
+        self._fp8tile_cfg: int | None = None
         super().__init__(c, layer_param_names)
 
     @classmethod
@@ -212,6 +215,7 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         pad_k = (16 - weight.shape[0] % 16) % 16
         pad_n = (16 - weight.shape[1] % 16) % 16
         if pad_k == 0 and pad_n == 0:
+            self._maybe_admit_small_m(layer)
             return
 
         # B is column-major [K, N]
@@ -241,6 +245,23 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
                 },
             )
 
+    def _maybe_admit_small_m(self, layer: torch.nn.Module) -> None:
+        weight_name, weight_scale_name, input_scale_name, _ = self.layer_param_names
+        weight = getattr(layer, weight_name)
+        weight_scale = getattr(layer, weight_scale_name, None)
+        input_scale = getattr(layer, input_scale_name, None)
+        if (
+            self.config.activation_quant_key != kFp8StaticTensorSym
+            or self.config.weight_quant_key != kFp8StaticTensorSym
+            or self.config.out_dtype not in (None, torch.bfloat16)
+            or weight_scale is None
+            or input_scale is None
+        ):
+            return
+        from .fp8tile import prepare
+
+        self._fp8tile_cfg = prepare(weight, input_scale, weight_scale)
+
     def apply_scaled_mm(
         self,
         *,
@@ -263,7 +284,15 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         if pad_n > 0 and bias is not None:
             bias = self._pad_to_alignment(bias, dim=0, alignment=16)
 
-        if bias is None and out_dtype == torch.bfloat16:
+        if (
+            self._fp8tile_cfg is not None
+            and bias is None
+            and pad_k == 0
+            and pad_n == 0
+            and out_dtype == torch.bfloat16
+        ):
+            output = torch.ops.vllm.fp8tile_scaled_mm(A, B, As, Bs, self._fp8tile_cfg)
+        elif bias is None and out_dtype == torch.bfloat16:
             output = fp8_scaled_mm(A, B, As, Bs)
         else:
             output = ops.cutlass_scaled_mm(
