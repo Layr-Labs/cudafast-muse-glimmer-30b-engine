@@ -27,15 +27,37 @@ except ImportError:
     marlinw = None
 
 try:
+    from marlinw import swiglu as marlin_swiglu
+except (ImportError, OSError):
+    marlin_swiglu = None
+
+try:
+    from marlinw import swiglu_fp8 as marlin_swiglu_fp8
+except (ImportError, OSError):
+    marlin_swiglu_fp8 = None
+
+try:
+    import marlin_narrow
+except (ImportError, OSError):
+    marlin_narrow = None
+
+try:
+    import marlinw_down
+except (ImportError, OSError):
+    marlinw_down = None
+
+try:
     from muse_marlin_gemv import prepare_decode_layout
 except (ImportError, OSError):
     prepare_decode_layout = None
 
 try:
     # 6-bit block-scale codes for the tiled decode GEMV (harness/kernels/decode6)
+    from muse_marlin6_gemv import STATS as _scale6_stats
     from muse_marlin6_gemv import prepare_decode_layout6
 except (ImportError, OSError):
     prepare_decode_layout6 = None
+    _scale6_stats = None
 
 logger = init_logger(__name__)
 
@@ -52,7 +74,9 @@ logger = init_logger(__name__)
 # Every other call, and every layer that fails both checks, runs the single
 # ops.marlin_gemm call.
 _PROMPT_CHECK_M = (512, 4096)
-_prompt_stats = {"wide": 0, "sliced": 0, "single": 0, "logged": False}
+_prompt_stats = {
+    "wide": 0, "narrow": 0, "narrow_down": 0, "sliced": 0, "single": 0, "logged": False
+}
 
 # Column-sliced schedule for NVFP4 weights much larger than L2 (prompt-sized M).
 #
@@ -79,6 +103,9 @@ _COL_SLICE_REF_M = 512
 def _log_prompt_stats() -> None:
     if not _prompt_stats["logged"]:
         _prompt_stats["logged"] = True
+        if _scale6_stats is not None:
+            logger.info("NVFP4 decode palette admission: %d compressed, %d kept uncompressed",
+                        _scale6_stats["admitted"], _scale6_stats["kept"])
         logger.info(
             "Marlin NVFP4 prompt GEMM: %d layers on the wide schedule, %d on "
             "column slices, %d on the single call",
@@ -86,6 +113,16 @@ def _log_prompt_stats() -> None:
             _prompt_stats["sliced"],
             _prompt_stats["single"],
         )
+        if _prompt_stats["narrow"]:
+            logger.info(
+                "Narrow Marlin prefill passed bitwise validation on %d layers",
+                _prompt_stats["narrow"],
+            )
+        if _prompt_stats["narrow_down"]:
+            logger.info(
+                "Narrow split-K Marlin prefill passed bitwise validation on %d layers",
+                _prompt_stats["narrow_down"],
+            )
 
 
 def _marlin_fp4_single(
@@ -188,15 +225,48 @@ def _marlin_fp4_wide(
     size_k: int,
     decode_weight: torch.Tensor | None = None,
     decode_scales: torch.Tensor | None = None,
+    use_narrow: bool = False,
+    down_work: torch.Tensor | None = None,
+    down_work_ptr: torch.Tensor | None = None,
+    down_slots: int = 0,
     decode_palette: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _log_prompt_stats()
     args = (x, weight, weight_scale, weight_global_scale, workspace, size_n, size_k)
+    if use_narrow and marlin_narrow is not None:
+        out = marlin_narrow.gemm(*args)
+        if out is not None:
+            return out
+    if marlinw_down is not None and down_work is not None and down_work_ptr is not None:
+        out = marlinw_down.gemm(
+            x, weight, weight_scale, weight_global_scale, down_work, down_work_ptr, down_slots
+        )
+        if out is not None:
+            return out
     out = _marlin_fp4_wide_gemm(*args)
     return out if out is not None else _marlin_fp4_single(*args, decode_weight, decode_scales, decode_palette)
 
 
 def _marlin_fp4_wide_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    decode_weight: torch.Tensor | None = None,
+    decode_scales: torch.Tensor | None = None,
+    use_narrow: bool = False,
+    down_work: torch.Tensor | None = None,
+    down_work_ptr: torch.Tensor | None = None,
+    down_slots: int = 0,
+    decode_palette: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], size_n))
+
+
+def _marlin_fp4_single_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -214,13 +284,53 @@ def _marlin_fp4_wide_fake(
 direct_register_custom_op(
     op_name="marlin_fp4_single_or_tiled",
     op_func=_marlin_fp4_single,
-    fake_impl=_marlin_fp4_wide_fake,
+    fake_impl=_marlin_fp4_single_fake,
 )
 
 direct_register_custom_op(
     op_name="marlin_fp4_wide",
     op_func=_marlin_fp4_wide,
     fake_impl=_marlin_fp4_wide_fake,
+)
+
+
+def _marlin_fp4_swiglu(
+    x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, global_scale: torch.Tensor
+) -> torch.Tensor:
+    return marlin_swiglu.gemm(x, weight, scales, global_scale)
+
+
+def _marlin_fp4_swiglu_fake(
+    x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, global_scale: torch.Tensor
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], scales.shape[-1] // 2))
+
+
+direct_register_custom_op(
+    op_name="marlin_fp4_swiglu",
+    op_func=_marlin_fp4_swiglu,
+    fake_impl=_marlin_fp4_swiglu_fake,
+)
+
+
+def _marlin_fp4_swiglu_fp8(
+    x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, global_scale: torch.Tensor,
+    down_scale: torch.Tensor,
+) -> torch.Tensor:
+    return marlin_swiglu_fp8.gemm(x, weight, scales, global_scale, down_scale)
+
+
+def _marlin_fp4_swiglu_fp8_fake(
+    x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, global_scale: torch.Tensor,
+    down_scale: torch.Tensor,
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], scales.shape[-1] // 2), dtype=torch.float8_e4m3fn)
+
+
+direct_register_custom_op(
+    op_name="marlin_fp4_swiglu_fp8",
+    op_func=_marlin_fp4_swiglu_fp8,
+    fake_impl=_marlin_fp4_swiglu_fp8_fake,
 )
 
 
@@ -419,7 +529,41 @@ def _prepare_prompt_gemm(layer: torch.nn.Module) -> None:
             layer, lambda x: _marlin_fp4_wide_gemm(x, *args), _PROMPT_CHECK_M
         )
     ):
-        layer.marlin_prompt_path = ("wide",)
+        use_narrow = (
+            marlin_narrow is not None
+            and marlin_narrow.ENABLED
+            and marlin_narrow.eligible(size_n, size_k, weight.device, props)
+            and _prompt_check(
+                layer, lambda x: marlin_narrow.gemm(x, *args), (marlin_narrow.ROWS,)
+            )
+        )
+        down_plan = (None, None, 0)
+        if (
+            marlinw_down is not None
+            and marlinw_down.ENABLED
+            and (size_n, size_k) == (marlinw_down.COLUMNS, marlinw_down.INNER)
+            and sms == marlinw_down.SMS
+            and torch.cuda.get_device_capability(weight.device) == (12, 1)
+        ):
+            try:
+                plan = marlinw_down.prepare(weight.device)
+            except (RuntimeError, ValueError) as exc:
+                logger.warning_once("Narrow split-K Marlin prefill unavailable: %s", exc)
+            else:
+                buffers = (plan.work, plan.work_ptr, plan.scratch_slots)
+                if _prompt_check(
+                    layer,
+                    lambda x: marlinw_down.gemm(x, weight, weight_scale, global_scale, *buffers),
+                    (marlinw_down.ROWS,),
+                ):
+                    down_plan = buffers
+                    _prompt_stats["narrow_down"] += 1
+        if use_narrow and marlin_swiglu is not None:
+            layer.marlin_swiglu_ready = marlin_swiglu.prepare(layer)
+        if use_narrow and marlin_swiglu_fp8 is not None:
+            layer.marlin_swiglu_fp8_ready = marlin_swiglu_fp8.prepare(layer)
+        layer.marlin_prompt_path = ("wide", use_narrow, down_plan)
+        _prompt_stats["narrow"] += use_narrow
         _prompt_stats["wide"] += 1
         return
 
@@ -501,6 +645,9 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
         )
         prepare_fp4_layer_for_marlin(layer)
         _prepare_prompt_gemm(layer)
+        # Loading replacement weights must also replace their private scale codes.
+        layer._buffers.pop("_marlin_decode_scales6", None)
+        layer._buffers.pop("_marlin_decode_palette", None)
         if prepare_decode_layout is not None and USE_FP32_REDUCE_DEFAULT:
             prepare_decode_layout(layer)
             if (
@@ -512,7 +659,12 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
                 # bitwise comparison with the uncompressed tiled decode GEMV
                 from muse_marlin_gemv import decode_linear as _tiled_decode
 
-                prepare_decode_layout6(layer, _tiled_decode)
+                try:
+                    prepare_decode_layout6(layer, _tiled_decode)
+                except (RuntimeError, ValueError) as exc:
+                    layer._buffers.pop("_marlin_decode_scales6", None)
+                    layer._buffers.pop("_marlin_decode_palette", None)
+                    logger.warning_once("NVFP4 scale palette admission failed; retaining tiled decode: %s", exc)
 
     def apply_weights(
         self,
@@ -527,18 +679,18 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
             args = (x.reshape(-1, x.shape[-1]), layer.weight, layer.weight_scale)
             tail = (layer.weight_global_scale, layer.workspace, size_n, layer.input_size_per_partition)
             palette = getattr(layer, "_marlin_decode_palette", None)
-            decode = (
-                decode_weight,
-                getattr(layer, "_marlin_decode_scales6" if palette is not None else "_marlin_decode_scales", None),
-                palette,
-            )
+            scales = getattr(layer, "_marlin_decode_scales6", None) if palette is not None else None
+            if scales is None:
+                palette = None
+                scales = getattr(layer, "_marlin_decode_scales", None)
+            decode = (decode_weight, scales)
             if path is None:
-                out = torch.ops.vllm.marlin_fp4_single_or_tiled(*args, *tail, *decode)
+                out = torch.ops.vllm.marlin_fp4_single_or_tiled(*args, *tail, *decode, palette)
             elif path[0] == "wide":
-                out = torch.ops.vllm.marlin_fp4_wide(*args, *tail, *decode)
+                out = torch.ops.vllm.marlin_fp4_wide(*args, *tail, *decode, path[1], *path[2], palette)
             else:
                 out = torch.ops.vllm.marlin_fp4_col_sliced(
-                    *args, path[1], path[2], *tail, path[3], *decode
+                    *args, path[1], path[2], *tail, path[3], *decode, palette
                 )
             return out.reshape(x.shape[:-1] + (size_n,))
         return apply_fp4_marlin_linear(

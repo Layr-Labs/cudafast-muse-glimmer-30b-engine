@@ -263,6 +263,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
+        # LOCAL PATCH (prefill graph): whole-forward graph for one fresh
+        # prefill of a fixed length (vllm/v1/worker/gpu/prefill_graph.py).
         self.prefill_graph: PrefillGraph | None = None
 
         # LoRA-related workers.
@@ -785,6 +787,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculator is not None:
                 self.speculator.capture()
 
+        # LOCAL PATCH (prefill graph): captured apart from the dispatcher's
+        # graphs, so decode dispatch and compile ranges stay unchanged.
         self.prefill_graph = capture_prefill_graph(self)
 
         end_time = time.perf_counter()
@@ -1425,6 +1429,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = None
+                    # LOCAL PATCH (prefill graph): a fresh, unpadded,
+                    # one-request prefill of the captured length replays
+                    # the boot graph; try_replay refuses any other step.
                     prefill_graph = self.prefill_graph
                     if (
                         prefill_graph is not None

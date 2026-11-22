@@ -524,6 +524,13 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
         self.fp8_linear.process_weights_after_loading(layer)
+        if (getattr(layer, "input_size_per_partition", None) == 19968
+                and getattr(layer, "output_size_per_partition", None) == 6656
+                and getattr(layer, "tp_size", None) == 1
+                and getattr(layer, "input_is_parallel", False)
+                and layer.input_scale.dtype == torch.float32
+                and self.fp8_linear.input_quant_key() == kFp8StaticTensorSym):
+            layer.marlin_swiglu_fp8_input = True
 
     def apply(
         self,
