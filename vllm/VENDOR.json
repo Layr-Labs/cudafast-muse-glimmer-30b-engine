@@ -86,6 +86,26 @@
     {
       "file": "harness/kernels/l2pf/py/sites.py (outside the vLLM subtree; recorded here for provenance)",
       "why": "L2 prefetch heads ahead of the MLP GEMMs (weights above MAX_WEIGHT): a 2.25 MiB head ahead of gate_up (after a norm) and a 0.5 MiB head ahead of down (after the activation), scales sharing the budget, plus a re-entrancy guard so only the outermost call of a nested wrapped entry point is a site. Taken from ArthurOstapenko's published submission e8fa7600-36f4-49a5-9c70-4190970fa897 (branch commit af81404); our compressed-FP8 prefetch skip (_RANS_SKIP_PREFETCH) is kept. Prefetch only reads weight bytes into L2 on a side stream; no value changes. L2PF_MLP=0 disables the heads."
+    },
+    {
+      "file": "vllm/config/compilation.py",
+      "why": "benchmark_combo_kernel False: a compile-time benchmark within noise decided per boot whether the q/k-norm kernels were combined, so the Inductor kernel set changed between boots; every combo the grouping heuristics allow is formed"
+    },
+    {
+      "file": "vllm/compilation/autotune_pin.py (installed from vllm/compilation/wrapper.py)",
+      "why": "Inductor kept the fastest of a kernel's candidate configs at its first launch; for the q/k-norm and input-RMSNorm reductions the candidates differ in R0_BLOCK (summation order) and time within a few percent on GB10, so a boot could compute different bits. A fixed rule (widest reduction block, then most warps) replaces the timing"
+    },
+    {
+      "file": "vllm/model_executor/models/muse_glimmer.py",
+      "why": "The six BF16 attention output gate projections that run on the one-row muse_bf16_lane GEMV (harness/kernels/muse_bf16_lane) fork off the attention chain like the FP8 gates: the gate stays on the current stream and the attention chain runs on the side stream. The old exclusion of unquantized gates was about cuBLAS; such a layer forks only for one-row batches and only when its lane was admitted at load, so no cuBLAS call runs beside the side stream. Only launch streams and launch order change; the same kernels run on the same inputs. VLLM_MUSE_GLIMMER_GATE_STREAM_LANE=0 keeps these gates in order on the main stream."
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/scaled_mm/muse_fp8.py",
+      "why": "A rANS-compressed FP8 decode weight (harness/kernels/muserans) is admitted only after a full read-back: rans_unpack of the blob, which also checks that every rANS state ends where the encoder started, must equal every byte of the loaded weight, before the existing bitwise GEMV comparison with cutlass_scaled_mm. Load time only; a layer that fails keeps the uncompressed musefp8 GEMV or cutlass."
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/scaled_mm/muse_fp8.py; harness/kernels/fp8m512 (new)",
+      "why": "The 512-row prompt GEMM of the FP8 down projections (6656x19968) runs through fp8m512, a hand-written mma.sync m16n8k32 e4m3 kernel on 128x128 tiles that reads a tile-ordered copy of the weight made at load. Source of the kernel: public Yukon submission 98cd9fcd-35ae-4820-a97c-e61177a5cdd3 (commit e3f124f6e127f9e7f2986aef48303262ee78672e, harness/kernels/muse_kernels.cu, namespace m512_contig: fp8_linear_contig_m512_kernel and repack_fp8_tile_contig_kernel), device code unchanged. A layer is admitted only after a bitwise comparison with ops.cutlass_scaled_mm on its own weight at 512 rows (quantized rows at four magnitudes with cancelling columns and signed zeros, uniformly random e4m3 rows, rows mixed from all); the copy is kept only for admitted layers. A rejected layer, a missing library, any other shape or row count, and decode keep the existing calls. MUSE_FP8_M512=0 disables it."
     }
   ],
   "carried_from": {

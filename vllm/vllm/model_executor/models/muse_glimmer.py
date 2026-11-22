@@ -1191,13 +1191,18 @@ class _GateSideStream:
 
     Only launch streams change: the same kernels run on the same inputs.
     Batches above ``max_tokens`` and piecewise cudagraph runs keep everything
-    on the current stream.
+    on the current stream. A BF16 gate projection on the one-row
+    ``muse_bf16_lane`` GEMV (``one_row``) forks only for one-row batches of a
+    layer whose lane was admitted at load, so that no cuBLAS call ever runs
+    beside the side stream.
     """
 
     def __init__(self) -> None:
         self.max_tokens = int(
             os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "16")
         )
+        # layer index -> output_gate_proj running on muse_bf16_lane
+        self.one_row: dict[int, nn.Module] = {}
         self.stream: torch.cuda.Stream | None = None
         self.fork_event: torch.cuda.Event | None = None
         self.done_event: torch.cuda.Event | None = None
@@ -1241,6 +1246,11 @@ class _GateSideStream:
     def fork(self, x: torch.Tensor, layer_idx: int) -> None:
         self.active = False
         if not x.is_cuda or x.shape[0] > self.max_tokens:
+            return
+        lane = self.one_row.get(layer_idx)
+        if lane is not None and (
+            x.shape[0] != 1 or getattr(lane, "muse_bf16_lane_weight", None) is None
+        ):
             return
         if (
             is_forward_context_available()
@@ -1340,6 +1350,19 @@ direct_register_custom_op(
 )
 
 
+def _gate_on_bf16_lane(gate_proj: nn.Module) -> bool:
+    """Whether the gate projection's quant method is the one-row
+    muse_bf16_lane GEMV (harness/kernels/muse_bf16_lane) and
+    VLLM_MUSE_GLIMMER_GATE_STREAM_LANE is not 0."""
+    if os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_LANE", "1") == "0":
+        return False
+    try:
+        from muse_bf16_lane import _MuseBF16Lane
+    except ImportError:
+        return False
+    return type(getattr(gate_proj, "quant_method", None)) is _MuseBF16Lane
+
+
 def _gate_side_stream_fork_point(gate_proj: nn.Module) -> str | None:
     """Where the output gate branch forks off the attention chain, or None to
     keep the gate projection in order on the main stream: ``"qkv"`` right
@@ -1348,8 +1371,12 @@ def _gate_side_stream_fork_point(gate_proj: nn.Module) -> str | None:
     if mode not in ("qkv", "attn") or not current_platform.is_cuda():
         return None
     # cuBLAS does not promise the same kernel choice while other streams are
-    # active, so unquantized projections stay on the main stream.
-    if isinstance(getattr(gate_proj, "quant_method", None), UnquantizedLinearMethod):
+    # active, so unquantized projections stay on the main stream, except one on
+    # the one-row muse_bf16_lane GEMV (no cuBLAS call), which forks for
+    # one-row batches only (_GateSideStream.one_row).
+    if isinstance(
+        getattr(gate_proj, "quant_method", None), UnquantizedLinearMethod
+    ) and not _gate_on_bf16_lane(gate_proj):
         return None
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
@@ -1453,6 +1480,10 @@ class MuseGlimmerAttention(nn.Module):
             if self.use_output_gate
             else None
         )
+        if self.gate_fork_point is not None and _gate_on_bf16_lane(
+            self.output_gate_proj
+        ):
+            _gate_side_stream.one_row[self.layer_idx] = self.output_gate_proj
 
         self.rotary_emb = (
             get_rope(
@@ -1628,11 +1659,13 @@ class MuseGlimmerModel(nn.Module, EagleModelMixin):
         if side_gate_layers:
             logger.info(
                 "Attention output gate projection on a side stream in %d of %d "
-                "layers (fork after %s, up to %d tokens)",
+                "layers (fork after %s, up to %d tokens; %d BF16 lane layers "
+                "at one token only)",
                 len(side_gate_layers),
                 self.end_layer - self.start_layer,
                 side_gate_layers[0],
                 _gate_side_stream.max_tokens,
+                len(_gate_side_stream.one_row),
             )
         # Final norm: weight-as-scale, no offset.
         self.norm = MuseGlimmerRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
