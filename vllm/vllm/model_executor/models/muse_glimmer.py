@@ -1096,9 +1096,26 @@ class MuseGlimmerMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _gate_up_activation(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        return self.act_fn(gate_up)
+
+    def _paired_gate_up_activation(self, x: torch.Tensor) -> torch.Tensor:
+        proj = self.gate_up_proj
+        return torch.ops.vllm.marlin_fp4_swiglu(
+            x.contiguous(), proj.weight, proj.weight_scale, proj.weight_global_scale
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (torch.compiler.is_compiling() and x.ndim == 2
+                and getattr(self.gate_up_proj, "marlin_swiglu_ready", False)
+                and getattr(self.down_proj, "marlin_prompt_path", None) is not None):
+            # The down projection consumes BF16 for these layers. Other quantizers
+            # can fold their activation cast into SwiGLU with different boundaries.
+            x = torch.cond(x.shape[0] == 512, self._paired_gate_up_activation,
+                           self._gate_up_activation, (x,))
+        else:
+            x = self._gate_up_activation(x)
         x, _ = self.down_proj(x)
         return x
 

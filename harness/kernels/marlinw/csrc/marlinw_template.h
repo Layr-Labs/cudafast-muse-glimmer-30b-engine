@@ -28,6 +28,9 @@
 #include "dequant.h"
 #include "marlin_mma.h"
 #include "core/scalar_type.hpp"
+#ifdef MARLINW_SWIGLU
+#include "swiglu.cuh"
+#endif
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -378,6 +381,17 @@ __global__ void Marlin(
     prob_m = m_block_size;
   }
 
+#ifdef MARLINW_SWIGLU
+  // Exactly eight 64-row chunks, each with an independent full K reduction.
+  // Neighboring CTAs reuse the same gate/up weight columns across those chunks.
+  const int par_id = blockIdx.x % 8;
+  const int slice_col = blockIdx.x / 8;
+  constexpr int slice_row = 0, slice_idx = 0, slice_count = 1, locks_off = 0;
+  int slice_iters = 6656 / (16 * thread_k_blocks);
+  A = A0 + (16 * thread_m_blocks / 8) * par_id * lda;
+  C = C0 + (16 * thread_m_blocks / 8) * par_id * (prob_n / 2);
+  auto init_slice = [&]() { slice_iters = 0; };
+#else
   int slice_row = 0;
   int slice_col = 0;
   int slice_iters = 0;  // number of threadblock tiles in the current slice
@@ -418,6 +432,7 @@ __global__ void Marlin(
   };
 
   init_slice();
+#endif
 
   // A sizes/strides
 
@@ -528,6 +543,17 @@ __global__ void Marlin(
                 s_sh_stride * slice_col + threadIdx.x % s_sh_stride;
     }
   }
+#ifdef MARLINW_SWIGLU
+  // Remap two virtual 64-column halves to the original gate and up tensors.
+  // Codes and scales keep their existing 64-column internal Marlin permutation.
+  static_assert(b_sh_stride == 64 && s_sh_stride == 8 && threads == 128);
+  b_gl_rd -= (b_sh_stride / 2) * slice_col;
+  s_gl_rd -= (s_sh_stride / 2) * slice_col;
+  if (threadIdx.x & (b_sh_stride / 2))
+    b_gl_rd += (b_gl_stride - b_sh_stride) / 2;
+  if (threadIdx.x & (s_sh_stride / 2))
+    s_gl_rd += (s_gl_stride - s_sh_stride) / 2;
+#endif
   auto s_sh_wr = threadIdx.x;
   bool s_sh_wr_pred = threadIdx.x < s_sh_stage;
 
@@ -1615,6 +1641,33 @@ __global__ void Marlin(
     }
     __syncthreads();
 
+#ifdef MARLINW_SWIGLU
+    // Every warp writes two products per lane. Read the producer's already
+    // rounded BF16 fragments from the two halves of each 128-column tile.
+    using Words = uint32_t;
+    constexpr int values = sizeof(Words) / sizeof(__nv_bfloat16);
+    auto shared = reinterpret_cast<const Words*>(sh_red);
+    auto out = reinterpret_cast<Words*>(C);
+    constexpr int warps = threads / 32;
+    constexpr int half_tile = thread_n_blocks * 16 / 2;
+    static_assert(half_tile == 32 * values);
+    const int lane = threadIdx.x % 32;
+    #pragma unroll 1
+    for (int row = threadIdx.x / 32; row < 16 * thread_m_blocks; row += warps) {
+      const int shared_idx = row * (c_sh_stride * sizeof(int4) / sizeof(Words)) + lane;
+      const int out_idx = row * (prob_n / (2 * values)) + slice_col * 32 + lane;
+      const Words gates = shared[shared_idx];
+      const Words ups = shared[shared_idx + 32];
+      Words products;
+      #pragma unroll
+      for (int e = 0; e < values; ++e) {
+        auto gate = reinterpret_cast<const __nv_bfloat16*>(&gates)[e];
+        auto up = reinterpret_cast<const __nv_bfloat16*>(&ups)[e];
+        reinterpret_cast<__nv_bfloat16*>(&products)[e] = swiglu_product(gate, up);
+      }
+      out[out_idx] = products;
+    }
+#else
   #pragma unroll
     for (int i = 0;
          i < div_ceil(16 * thread_m_blocks, threads / (2 * thread_n_blocks));
@@ -1635,6 +1688,7 @@ __global__ void Marlin(
         c_sh_rd += c_sh_rd_delta;
       }
     }
+#endif
     __syncthreads();
   };
 

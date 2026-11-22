@@ -75,11 +75,13 @@ struct Fp8Gemm {
 using PP = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
 using G0 = Fp8Gemm<Shape<_16, _64, _128>, Shape<_16, _32>, PP>;   // == vLLM sm120_fp8_config_M16
 using G2 = Fp8Gemm<Shape<_16, _32, _128>, Shape<_16, _32>, PP>;
+using G512 = Fp8Gemm<Shape<_16, _32, _512>, Shape<_16, _32>, PP>;
 torch::Tensor fp8x_gemm(torch::Tensor a, torch::Tensor b, torch::Tensor sa, torch::Tensor sb, int64_t cfg) {
   const at::cuda::OptionalCUDAGuard guard(a.device());
   switch (cfg) {
     case 0: return G0::run(a, b, sa, sb);
     case 2: return G2::run(a, b, sa, sb);
+    case 512: return G512::run(a, b, sa, sb);
   }
   TORCH_CHECK(false, "fp8x: bad cfg");
 }
