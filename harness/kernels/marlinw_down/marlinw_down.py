@@ -73,6 +73,20 @@ def prepare(device: torch.device) -> Prepared:
                     slots, active.value)
 
 
+_SCRATCH_CACHE: dict[tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_scratch(device: torch.device, scratch_slots: int) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (device, scratch_slots)
+    cached = _SCRATCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    partial = torch.empty((scratch_slots, 64, 128), dtype=torch.float32, device=device)
+    locks = torch.zeros((scratch_slots,), dtype=torch.int32, device=device)
+    _SCRATCH_CACHE[key] = (partial, locks)
+    return partial, locks
+
+
 def gemm(x, weight, scales, global_scale, work, work_ptr, scratch_slots):
     if (
         x.shape != (ROWS, INNER)
@@ -84,8 +98,7 @@ def gemm(x, weight, scales, global_scale, work, work_ptr, scratch_slots):
     ):
         return None
     out = x.new_empty((ROWS, COLUMNS))
-    partial = x.new_empty((scratch_slots, 64, 128), dtype=torch.float32)
-    locks = x.new_zeros((scratch_slots,), dtype=torch.int32)
+    partial, locks = _get_scratch(x.device, scratch_slots)
     with torch.cuda.device(x.device):
         status = _launch(
             x.data_ptr(), weight.data_ptr(), out.data_ptr(), partial.data_ptr(),

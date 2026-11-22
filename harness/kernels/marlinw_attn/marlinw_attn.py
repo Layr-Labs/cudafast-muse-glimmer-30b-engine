@@ -124,6 +124,20 @@ class Prepared:
 
 
 _plans: dict = {}
+_scratch: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_scratch(device: torch.device, slots: int) -> tuple[torch.Tensor, torch.Tensor]:
+    slots = max(int(slots), 1)
+    key = (device.index or 0, slots)
+    buf = _scratch.get(key)
+    if buf is None:
+        buf = (
+            torch.empty((slots, 64, 128), dtype=torch.float32, device=device),
+            torch.zeros((slots,), dtype=torch.int32, device=device),
+        )
+        _scratch[key] = buf
+    return buf
 
 
 def prepare(device: torch.device, n: int, k: int) -> Prepared:
@@ -170,8 +184,7 @@ def gemm(x, weight, scales, global_scale, work, work_ptr, scratch_slots):
     ):
         return None
     out = x.new_empty((ROWS, n))
-    partial = x.new_empty((max(scratch_slots, 1), 64, 128), dtype=torch.float32)
-    locks = x.new_zeros((max(scratch_slots, 1),), dtype=torch.int32)
+    partial, locks = _get_scratch(x.device, scratch_slots)
     with torch.cuda.device(x.device):
         status = _launch(
             x.data_ptr(), weight.data_ptr(), out.data_ptr(), partial.data_ptr(),
