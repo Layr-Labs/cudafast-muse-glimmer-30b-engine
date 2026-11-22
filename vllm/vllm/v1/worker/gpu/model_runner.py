@@ -330,17 +330,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
-        if not load_dummy_weights:
-            # LOCAL PATCH (decode weight placement): move one-row NVFP4 decode
-            # weights off slow device memory; same bytes, checked bitwise.
-            try:
-                from vllm.model_executor.kernels.linear.nvfp4.decode_placement import (
-                    place_decode_weights,
-                )
-
-                place_decode_weights(self.model)
-            except Exception as err:  # noqa: BLE001 - never part of the load's success
-                logger.warning("Decode weight placement unavailable: %s", err)
         logger.info(
             "Model loading took %s GiB and %.6f seconds",
             format_gib(m.consumed_memory),

@@ -52,11 +52,6 @@ except (ImportError, OSError):
     muse_final_slab = None
 
 try:
-    import marlinw_attn
-except (ImportError, OSError):
-    marlinw_attn = None
-
-try:
     from muse_marlin_gemv import prepare_decode_layout
 except (ImportError, OSError):
     prepare_decode_layout = None
@@ -85,11 +80,8 @@ logger = init_logger(__name__)
 # ops.marlin_gemm call.
 _PROMPT_CHECK_M = (512, 4096)
 _prompt_stats = {
-    "wide": 0, "narrow": 0, "narrow_down": 0, "sliced": 0, "single": 0, "logged": False,
-    # Narrow 512-row NVFP4 attention projections: [admitted, rejected] per shape.
-    "attn": {"qkv": [0, 0], "gate": [0, 0], "o": [0, 0]},
+    "wide": 0, "narrow": 0, "narrow_down": 0, "sliced": 0, "single": 0, "logged": False
 }
-_attn_route_logged: set = set()
 
 # Column-sliced schedule for NVFP4 weights much larger than L2 (prompt-sized M).
 #
@@ -136,13 +128,6 @@ def _log_prompt_stats() -> None:
             logger.info(
                 "Narrow split-K Marlin prefill passed bitwise validation on %d layers",
                 _prompt_stats["narrow_down"],
-            )
-        attn = _prompt_stats["attn"]
-        if any(a + r for a, r in attn.values()):
-            logger.info(
-                "Narrow NVFP4 attention prefill GEMM (admitted/rejected): qkv %d/%d, "
-                "gate %d/%d, o %d/%d",
-                *attn["qkv"], *attn["gate"], *attn["o"],
             )
 
 
@@ -323,79 +308,6 @@ direct_register_custom_op(
     op_name="marlin_fp4_wide",
     op_func=_marlin_fp4_wide,
     fake_impl=_marlin_fp4_wide_fake,
-)
-
-
-def _marlin_fp4_narrow_attn(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_global_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    size_n: int,
-    size_k: int,
-    decode_weight: torch.Tensor | None = None,
-    decode_scales: torch.Tensor | None = None,
-    attn_work: torch.Tensor | None = None,
-    attn_work_ptr: torch.Tensor | None = None,
-    attn_slots: int = 0,
-    decode_palette: torch.Tensor | None = None,
-    decode_fixed_grid: bool = False,
-) -> torch.Tensor:
-    """An admitted NVFP4 attention projection: the narrow plan for exactly
-    512 rows, else (decode and every other row count) the same call as
-    marlin_fp4_single_or_tiled."""
-    if (
-        marlinw_attn is not None
-        and attn_work is not None
-        and attn_work_ptr is not None
-        and x.shape[0] == marlinw_attn.ROWS
-    ):
-        _log_prompt_stats()
-        out = marlinw_attn.gemm(
-            x, weight, weight_scale, weight_global_scale, attn_work, attn_work_ptr, attn_slots
-        )
-        kind = marlinw_attn.SHAPES.get((size_n, size_k), "?")
-        if out is not None:
-            if kind not in _attn_route_logged:
-                _attn_route_logged.add(kind)
-                logger.info("Narrow NVFP4 attention prefill GEMM in use for %s (%dx%d)",
-                            kind, size_n, size_k)
-            return out
-        logger.warning_once(
-            "Narrow NVFP4 attention prefill GEMM declined a %s input (shape %s, strides %s, "
-            "dtype %s); using ops.marlin_gemm",
-            kind, tuple(x.shape), tuple(x.stride()), x.dtype,
-        )
-    return _marlin_fp4_single(
-        x, weight, weight_scale, weight_global_scale, workspace, size_n, size_k,
-        decode_weight, decode_scales, decode_palette, decode_fixed_grid,
-    )
-
-
-def _marlin_fp4_narrow_attn_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_global_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    size_n: int,
-    size_k: int,
-    decode_weight: torch.Tensor | None = None,
-    decode_scales: torch.Tensor | None = None,
-    attn_work: torch.Tensor | None = None,
-    attn_work_ptr: torch.Tensor | None = None,
-    attn_slots: int = 0,
-    decode_palette: torch.Tensor | None = None,
-    decode_fixed_grid: bool = False,
-) -> torch.Tensor:
-    return x.new_empty((x.shape[0], size_n))
-
-
-direct_register_custom_op(
-    op_name="marlin_fp4_narrow_attn",
-    op_func=_marlin_fp4_narrow_attn,
-    fake_impl=_marlin_fp4_narrow_attn_fake,
 )
 
 
@@ -599,41 +511,6 @@ def _prompt_check(layer: torch.nn.Module, fn, ms) -> bool:
         return False
 
 
-def _prepare_narrow_attn(
-    layer: torch.nn.Module, global_scale: torch.Tensor, size_n: int, size_k: int, sms: int
-) -> None:
-    """Admits the narrow 512-row plan (harness/kernels/marlinw_attn) for an
-    L2-sized NVFP4 attention projection after a bitwise comparison with the
-    single ops.marlin_gemm call on the layer's own weights; any difference or
-    error keeps the stock call."""
-    if marlinw_attn is None or not marlinw_attn.ENABLED:
-        return
-    kind = marlinw_attn.SHAPES.get((size_n, size_k))
-    if (
-        kind is None
-        or sms != marlinw_attn.SMS
-        or torch.cuda.get_device_capability(layer.weight.device) != (12, 1)
-    ):
-        return
-    weight, weight_scale = layer.weight, layer.weight_scale
-    try:
-        plan = marlinw_attn.prepare(weight.device, size_n, size_k)
-    except (RuntimeError, ValueError) as exc:
-        logger.warning_once("Narrow NVFP4 attention prefill GEMM unavailable: %s", exc)
-        _prompt_stats["attn"][kind][1] += 1
-        return
-    buffers = (plan.work, plan.work_ptr, plan.scratch_slots)
-    if _prompt_check(
-        layer,
-        lambda x: marlinw_attn.gemm(x, weight, weight_scale, global_scale, *buffers),
-        (marlinw_attn.ROWS,),
-    ):
-        layer.marlin_prompt_path = ("narrow_attn", *buffers)
-        _prompt_stats["attn"][kind][0] += 1
-    else:
-        _prompt_stats["attn"][kind][1] += 1
-
-
 def _prepare_prompt_gemm(layer: torch.nn.Module) -> None:
     """Picks the prompt-sized schedule of a layer: marlinw, column slices or
     the single call (see the comment at the top of this file)."""
@@ -658,8 +535,6 @@ def _prepare_prompt_gemm(layer: torch.nn.Module) -> None:
     props = torch.cuda.get_device_properties(weight.device)
     sms = props.multi_processor_count
     weight_bytes = weight.numel() * 4 + weight_scale.numel()
-    if weight_bytes <= 2 * props.L2_cache_size:
-        _prepare_narrow_attn(layer, global_scale, size_n, size_k, sms)
     if weight_bytes <= 2 * props.L2_cache_size or should_use_atomic_add_reduce(
         m=_COL_SLICE_REF_M,
         n=size_n,
@@ -837,10 +712,6 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
                 out = torch.ops.vllm.marlin_fp4_single_or_tiled(*args, *tail, *decode, palette, fixed_grid)
             elif path[0] == "wide":
                 out = torch.ops.vllm.marlin_fp4_wide(*args, *tail, *decode, path[1], *path[2], palette, fixed_grid)
-            elif path[0] == "narrow_attn":
-                out = torch.ops.vllm.marlin_fp4_narrow_attn(
-                    *args, *tail, *decode, *path[1:], palette, fixed_grid
-                )
             else:
                 out = torch.ops.vllm.marlin_fp4_col_sliced(
                     *args, path[1], path[2], *tail, path[3], *decode, palette, fixed_grid

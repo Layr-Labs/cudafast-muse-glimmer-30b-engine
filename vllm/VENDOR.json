@@ -70,14 +70,6 @@
     {
       "file": "vllm/model_executor/models/muse_glimmer.py, vllm/model_executor/kernels/linear/nvfp4/marlin.py, vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/prefill_graph.py, harness/kernels/muse_final_slab/",
       "why": "Keep the full compiled backbone and specialize only the final two independent-row NVFP4 projection launches inside the logits-only prefill capture. Retain both operator output shapes and the ordered K partition for the sampled tile. Full-output consumers use the original projection launches."
-    },
-    {
-      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py; harness/kernels/marlinw_attn (new)",
-      "why": "The 512-row NVFP4 attention projections (qkv 4608x6656, output gate 4096x6656, o 6656x4096) run the stock ops.marlin_gemm partition on the narrow marlinw_down kernel (same device code, two blocks per SM, one block per 128-column half of each stock slice, unsplit tiles column-major, cut slices longest first). Every slice keeps its chunk, K range, slice_idx and slice_count, so each output element keeps its K16 MMA chains, FP32 split-K order and BF16 epilogue. A layer is admitted only after a bitwise comparison with the single ops.marlin_gemm call on its own weights; others, decode and every other row count keep the stock call. MARLIN_NARROW_ATTN=0 selects the original path."
-    },
-    {
-      "file": "vllm/model_executor/kernels/linear/nvfp4/decode_placement.py (new), vllm/v1/worker/gpu/model_runner.py",
-      "why": "On a unified-memory GPU the rate a one-row NVFP4 GEMV reaches is a property of the physical memory under its weight and differs by several percent between allocations of the same bytes. After the load, every group of same-shaped decode weights is timed with the tiled decode GEMV on its own buffers and on spare buffers of the same size; weights on slow buffers are copied to faster spares and compared bitwise before the buffer is exchanged. No kernel, operand value or prompt-sized weight changes. Any error or a short host leaves the loader's placement. MUSE_DECODE_PLACEMENT=0 disables the step."
     }
   ],
   "carried_from": {
