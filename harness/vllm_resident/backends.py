@@ -75,6 +75,11 @@ class Backend(Protocol):
         """Drop the request. True when it was still generating."""
         ...
 
+    def settle(self) -> None:
+        """Finish the bookkeeping of a request that has completed on its own.
+        The resident calls it after it has written a reply."""
+        ...
+
     def close(self) -> None: ...
 
 
@@ -226,6 +231,22 @@ class VllmBackend:
             if pinned
             else "CPU affinity unchanged"
         )
+        # REPLY FIRST, THEN CLEAN UP. When a bounded request (a timed prefill)
+        # has emitted its last token, the engine core still owns the request's
+        # cleanup and a queued empty batch. The stock engine's core loop does
+        # that work while the output is already on its way to the caller; the
+        # in-process client did it inline, before `start` could return the
+        # token. With `defer_settle` the client leaves it to `settle()`, which
+        # the resident calls right after it has written the reply (and which
+        # `abort`, so every `start`, runs first in any case). The same work
+        # runs, in the stock order. VLLM_RESIDENT_DEFER_SETTLE=0 keeps it inline.
+        client = self._engine.engine_core
+        self._settle_core = None
+        if os.environ.get("VLLM_RESIDENT_DEFER_SETTLE", "1") != "0" and callable(
+            getattr(client, "settle", None)
+        ):
+            client.defer_settle = True
+            self._settle_core = client.settle
         # VLLM_RESIDENT_ARGMAX_ONLY=0 keeps the top-k on every request.
         self._argmax_only = os.environ.get("VLLM_RESIDENT_ARGMAX_ONLY", "1") != "0"
         self._SamplingParams = SamplingParams
@@ -348,7 +369,19 @@ class VllmBackend:
             while self._engine.has_unfinished_requests():
                 self._engine.step()
             self._live = None
+        if self._settle_core is not None:
+            # Nothing is live now: the core may still own a deferred cleanup.
+            self._settle_core()
         return running
+
+    def settle(self) -> None:
+        if self._settle_core is None:
+            return
+        self._settle_core()
+        if self._live is not None and not self._engine.has_unfinished_requests():
+            # The request completed on its own: do now, after the reply, what
+            # the next `start` would otherwise do first inside its window.
+            self.abort()
 
     def close(self) -> None:
         self.abort()
@@ -377,6 +410,8 @@ class FakeBackend:
         self._left: int | None = None
         self._top = True
         self.starts = 0
+        # settle() calls: the resident makes one after every reply.
+        self.settles = 0
         # The top_logits flag of every start, in order (tests read it).
         self.start_modes: list[bool] = []
 
@@ -431,6 +466,9 @@ class FakeBackend:
         running = self._ctx is not None and self._left != 0
         self._ctx = None
         return running
+
+    def settle(self) -> None:
+        self.settles += 1
 
     def close(self) -> None:
         self.abort()
