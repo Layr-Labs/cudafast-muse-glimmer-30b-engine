@@ -239,7 +239,9 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
           const bool is_zp_float,  // is zero point of float16 type?
-          const bool complete_grid = false
+          const bool complete_grid = false,
+          const bool paired_silu = false,
+          const bool gate_shared = true
           >
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
@@ -378,14 +380,17 @@ __global__ void Marlin(
 
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
+  const int mn_tiles = paired_silu ? n_tiles / 2 : n_tiles;
+  const int n_half = n_tiles / 2;
+  bool up_tile = false;
 
   unsigned work_block = blockIdx.x;
   if constexpr (complete_grid) {
-    // Every CTA owns one whole K reduction. Consecutive CTAs reuse one
-    // weight tile across the independently computed activation rows.
-    work_block = (blockIdx.x % parallel) * n_tiles + blockIdx.x / parallel;
+    // Every CTA owns one whole K reduction. In the paired variant it owns
+    // the gate tile and then its up partner, both with complete K.
+    work_block = (blockIdx.x % parallel) * mn_tiles + blockIdx.x / parallel;
   }
-  int global_mn_tiles = parallel * n_tiles;
+  int global_mn_tiles = parallel * mn_tiles;
   int part2_mn_tiles = global_mn_tiles;
   int part1_mn_iters = 0;
   bool in_part2 = false;
@@ -530,10 +535,11 @@ __global__ void Marlin(
       in_part2 = true;
       slice_col_par = (iters * work_block) / k_tiles;
       slice_row = (iters * work_block) % k_tiles;
-      slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % n_tiles;
-      par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
+      slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % mn_tiles;
+      par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / mn_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
-      C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
+      C = C0 + 16 * thread_m_blocks / 8 * par_id *
+          (paired_silu ? prob_n / 2 : prob_n);
     }
     if (!in_part2) {
       init_part1_slice();
@@ -782,6 +788,8 @@ __global__ void Marlin(
                                           : (stages * s_sh_stage);
   int4* sh_s = sh_zp + (stages * zp_sh_stage);
   int4* sh_a = sh_s + sh_s_size;
+  // Per-call scratch after the ordinary GEMM shared storage. Not a cache.
+  int4* sh_gate = sh + max_shared_mem / 16 - sh_red_size;
 
   // Register storage for double buffer of shared memory reads.
   FragA frag_a[2][thread_m_blocks];
@@ -1644,15 +1652,17 @@ __global__ void Marlin(
   // reshuffle matrix fragments in this step, the reduction above is performed
   // in fragment layout.
   auto write_result = [&](bool last) {
-    int c_gl_stride = prob_n / 8;
+    int c_gl_stride = (paired_silu ? prob_n / 2 : prob_n) / 8;
+    up_tile = paired_silu && slice_col >= n_half;
     constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
     int c_gl_wr_delta = c_gl_stride * (threads / (2 * thread_n_blocks));
     constexpr int c_sh_rd_delta =
         c_sh_stride * (threads / (2 * thread_n_blocks));
 
+    up_tile = paired_silu && slice_col >= n_half;
     int c_gl_wr = c_gl_stride * (threadIdx.x / (2 * thread_n_blocks)) +
                   (threadIdx.x % (2 * thread_n_blocks));
-    c_gl_wr += (2 * thread_n_blocks) * slice_col;
+    c_gl_wr += (2 * thread_n_blocks) * (up_tile ? slice_col - n_half : slice_col);
     int c_sh_wr;
     if constexpr (m_block_size_8) {
       c_sh_wr = (8 * c_sh_stride) * ((threadIdx.x % 32) % 4 * 2) +
@@ -1746,7 +1756,24 @@ __global__ void Marlin(
          i < div_ceil(16 * thread_m_blocks, threads / (2 * thread_n_blocks));
          i++) {
       if (c_gl_wr < c_gl_wr_end) {
-        if (use_atomic_add && slice_count > 1) {
+        if constexpr (paired_silu) {
+          if (!up_tile) {
+            if constexpr (gate_shared) {
+              sh_gate[c_sh_rd] = sh_red[c_sh_rd];
+            } else {
+              C[c_gl_wr] = sh_red[c_sh_rd];
+            }
+          } else {
+            int4 g = gate_shared ? sh_gate[c_sh_rd] : C[c_gl_wr];
+            int4 u = sh_red[c_sh_rd];
+            int4 r;
+            r.x = marlinw::silu_mul_bf16x2(g.x, u.x);
+            r.y = marlinw::silu_mul_bf16x2(g.y, u.y);
+            r.z = marlinw::silu_mul_bf16x2(g.z, u.z);
+            r.w = marlinw::silu_mul_bf16x2(g.w, u.w);
+            C[c_gl_wr] = r;
+          }
+        } else if (use_atomic_add && slice_count > 1) {
           c_scalar_t2* C_half2 = reinterpret_cast<c_scalar_t2*>(&C[c_gl_wr]);
           c_scalar_t2* sh_red_half2 =
               reinterpret_cast<c_scalar_t2*>(&sh_red[c_sh_rd]);
@@ -2043,14 +2070,24 @@ __global__ void Marlin(
         // only the last block in a slice actually writes the result
         write_result(last);
       slice_row = 0;
-      if (!in_part2) {
-        slice_col_par += gridDim.x;
+      if constexpr (paired_silu) {
+        if (!up_tile) {
+          // No other CTA participates in this pair.
+          slice_col += n_half;
+          slice_iters = k_tiles;
+        } else {
+          slice_iters = 0;
+        }
       } else {
-        slice_col_par++;
-        slice_col++;
+        if (!in_part2) {
+          slice_col_par += gridDim.x;
+        } else {
+          slice_col_par++;
+          slice_col++;
+        }
+        init_slice();
       }
       is_first_matmul_in_slice = true;
-      init_slice();
 
       if (slice_iters) {
         a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) +

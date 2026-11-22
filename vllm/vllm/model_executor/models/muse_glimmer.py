@@ -60,10 +60,9 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.inputs import MultiModalDataDict
+from vllm.model_executor.kernels.linear.nvfp4.marlin import marlin_fp4_fused_silu
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
-from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym
 from vllm.model_executor.layers.attention import Attention, MMEncoderAttention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -1098,47 +1097,15 @@ class MuseGlimmerMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def _gate_up_activation(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        return self.act_fn(gate_up)
-
-    def _paired_gate_up_activation(self, x: torch.Tensor) -> torch.Tensor:
-        proj = self.gate_up_proj
-        return torch.ops.vllm.marlin_fp4_swiglu(
-            x.contiguous(), proj.weight, proj.weight_scale, proj.weight_global_scale
-        )
-
-    def _regular_swiglu_down(self, x: torch.Tensor) -> torch.Tensor:
-        activation = self._gate_up_activation(x)
-        return self.down_proj(activation)[0]
-
-    def _paired_swiglu_fp8_down(self, x: torch.Tensor) -> torch.Tensor:
-        proj = self.gate_up_proj
-        down = self.down_proj
-        activation = torch.ops.vllm.marlin_fp4_swiglu_fp8(
-            x.contiguous(), proj.weight, proj.weight_scale, proj.weight_global_scale,
-            down.input_scale,
-        )
-        quantized = QuantizedActivation(
-            activation, down.input_scale, x.dtype, activation.shape, kFp8StaticTensorSym
-        )
-        return down(quantized)[0]
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if (torch.compiler.is_compiling() and x.ndim == 2
-                and getattr(self.gate_up_proj, "marlin_swiglu_fp8_ready", False)
-                and getattr(self.down_proj, "marlin_swiglu_fp8_input", False)):
-            return torch.cond(x.shape[0] == 512, self._paired_swiglu_fp8_down,
-                              self._regular_swiglu_down, (x,))
-        if (torch.compiler.is_compiling() and x.ndim == 2
-                and getattr(self.gate_up_proj, "marlin_swiglu_ready", False)
-                and getattr(self.down_proj, "marlin_prompt_path", None) is not None):
-            # The down projection consumes BF16 for these layers. Other quantizers
-            # can fold their activation cast into SwiGLU with different boundaries.
-            x = torch.cond(x.shape[0] == 512, self._paired_gate_up_activation,
-                           self._gate_up_activation, (x,))
+        if getattr(self.gate_up_proj, "marlin_narrow_fused", False) and getattr(
+            self.down_proj, "marlin_bf16_input", False
+        ):
+            # Only bitwise-admitted 512-row BF16 consumers take this path.
+            x = marlin_fp4_fused_silu(self.gate_up_proj, x)
         else:
-            x = self._gate_up_activation(x)
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
