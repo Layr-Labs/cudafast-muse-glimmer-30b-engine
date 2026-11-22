@@ -231,6 +231,10 @@ class VllmBackend:
             if pinned
             else "CPU affinity unchanged"
         )
+        if pinned:
+            tickled = hostfast.start_idle_tickle(pinned)
+            if tickled:
+                _log(f"started {tickled} SCHED_IDLE deep-idle tickler threads")
         # REPLY FIRST, THEN CLEAN UP. When a bounded request (a timed prefill)
         # has emitted its last token, the engine core still owns the request's
         # cleanup and a queued empty batch. The stock engine's core loop does
