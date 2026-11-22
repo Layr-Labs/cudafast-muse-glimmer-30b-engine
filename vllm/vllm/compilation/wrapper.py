@@ -134,6 +134,12 @@ class TorchCompileWithNoGuardsWrapper:
 
         _apply_constrain_to_fx_strides_patch()
 
+        # Inductor's kernel configs by a fixed rule, not by timing: the same
+        # numerics on every boot (vllm/compilation/autotune_pin.py).
+        from vllm.compilation.autotune_pin import install as _pin_autotune
+
+        _pin_autotune()
+
         aot_context = nullcontext()
         if envs.VLLM_USE_AOT_COMPILE:
             if hasattr(torch._dynamo.config, "enable_aot_compile"):

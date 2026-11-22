@@ -36,6 +36,7 @@
 #include <cuda_bf16.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -378,7 +379,19 @@ static inline bool rans_fits(int K, int wpb, int gbs, int rg) { return rans_dsme
 
 // Auto policy (pure function of N,K; measured on GB10, 48 SMs): more resident warps is better until DRAM saturates, so use as many as fit:
 // R = number of chunk rounds per warp (R=1 for NB <= 864 chunks => one chunk per warp), tw = ceil(NB/R) virtual warps, wpb = ceil(tw/48) warps/SM (<= 18),
-// two interleaved rANS state sets (ns=2), 4-deep 512 B cp.async ring (rg=4), 512 B-interleaved layout (ilv=9).
+// four interleaved rANS state sets (ns=4), 4-deep 512 B cp.async ring (rg=4), 512 B-interleaved layout (ilv=9).
+// Four states cost 128 B more per chunk (+0.03 bits per weight at K=6656) and halve each state's dependency chain; on
+// 8 real layers per shape, back to back, the GEMV took qkv -0.7 %, attention gate -1.6 %, o -0.1 %, gate_up -0.3 %
+// against two states. MUSERANS_NS4=0 restores the old choice (four states
+// for the 6656x19968 down projection only, two elsewhere). Read once per process: pack and launch always agree.
+static bool rans_ns4_everywhere() {
+  static const bool on = [] {
+    const char* e = std::getenv("MUSERANS_NS4");
+    return !(e != nullptr && e[0] == '0' && e[1] == '\0');
+  }();
+  return on;
+}
+
 static RansCfg rans_pick_cfg(int N, int K) {
   const int NB = N / 8;
   for (int wcap = 18; wcap >= 1; wcap--) {
@@ -386,7 +399,7 @@ static RansCfg rans_pick_cfg(int N, int K) {
     const int tw = (NB + R - 1) / R, wpb = (tw + 47) / 48;
     if (rans_fits(K, wpb, 9, 4)) {
       // Real checkpoint rings support four states for the 6656x19968 down projection.
-      const int states = (N == 6656 && K == 19968) ? 4 : 2;
+      const int states = (rans_ns4_everywhere() || (N == 6656 && K == 19968)) ? 4 : 2;
       return RansCfg{tw, wpb, states, 4, 9};
     }
   }

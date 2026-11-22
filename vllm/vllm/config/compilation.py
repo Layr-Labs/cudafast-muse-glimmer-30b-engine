@@ -992,7 +992,11 @@ class CompilationConfig:
             # use horizontal fusion, which is useful for fusing qk-norm and
             # qk-rope when query and key have different shapes.
             self.inductor_compile_config["combo_kernels"] = True
-            self.inductor_compile_config["benchmark_combo_kernel"] = True
+            # Form every combo kernel the grouping heuristics allow instead of
+            # keeping it only when a compile-time benchmark finds it faster:
+            # that timing is within noise for some groups, so the kernel set
+            # changed from boot to boot.
+            self.inductor_compile_config["benchmark_combo_kernel"] = False
 
         if self.use_inductor_graph_partition and not is_torch_equal_or_newer(
             "2.9.0.dev"
