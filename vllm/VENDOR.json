@@ -46,6 +46,22 @@
     {
       "file": "vllm/v1/engine/core_client.py, vllm/v1/worker/hostfast.py (new)",
       "why": "in-process engine core for the single-request engine loop: InprocClient pauses automatic garbage collection while the engine has work and drains a finished request's queued batch on abort (no busy loop does it in this mode); hostfast.py also restricts the process to the highest-capacity CPU cores when the cores differ, failing soft (VLLM_HOSTFAST_GC=0 and VLLM_HOSTFAST_PIN=0 switch each off)"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/scaled_mm/cutlass.py, vllm/model_executor/kernels/linear/scaled_mm/fp8tile.py (new)",
+      "why": "FP8 w8a8 layers with per-tensor static scales run calls of 1 to 16 rows through harness/kernels/fp8tile: vLLM's SM120 CUTLASS FP8 GEMM for M <= 16 (same element types, layouts, pingpong schedule, persistent scheduler and ScaledEpilogue) with a 16x32x512 output tile; each output element keeps the same ascending-K MMA chain and epilogue; admitted per layer by a load-time bitwise comparison with ops.cutlass_scaled_mm, the existing small-M path otherwise"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py",
+      "why": "one-row NVFP4 calls on the tile-major decode copy run harness/kernels/marlint (the Marlin template with stock template arguments and the same tile-major addresses, persistent reduction scratch) for every layer whose output equals ops.marlin_gemm bitwise at load; other layers keep the M=1 tiled kernel"
+    },
+    {
+      "file": "vllm/model_executor/models/muse_glimmer.py",
+      "why": "MuseGlimmerMLP.forward calls the NVFP4 Marlin gate_up projection with SiLU-and-mul fused into its epilogue (marlin_fp4_silu_mul) when the layer was admitted at load and its down_proj reads the activation as stored bf16 (an NVFP4 Marlin down_proj); ahead of an FP8 down_proj the compiled graph fuses the activation quantization into the SiLU-and-mul kernel on the unrounded fp32 product, so those layers keep the compiled glue; the fused activation keeps the arithmetic of the compiled SiluAndMul glue, so the output bits are unchanged"
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py",
+      "why": "merged gate_up layers on the marlinw schedule get a custom op computing silu(gate) * up in marlinw's epilogue (or marlinw's standalone kernel after the GEMM for row counts without a fused plan; one-row calls use the tile-major decode GEMM first), with the same fp32 instruction chain and single bf16 rounding as the Inductor kernel it replaces; admitted per layer by a load-time bitwise comparison with the single stock call followed by the standalone kernel, which is itself compared once with a Triton copy of the Inductor kernel over every bf16 gate value"
     }
   ],
   "carried_from": {

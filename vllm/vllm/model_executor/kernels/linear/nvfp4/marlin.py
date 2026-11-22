@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import weakref
 
 import torch
 
@@ -27,8 +28,10 @@ except ImportError:
     marlinw = None
 
 try:
+    import muse_marlin_gemv
     from muse_marlin_gemv import prepare_decode_layout
 except (ImportError, OSError):
+    muse_marlin_gemv = None
     prepare_decode_layout = None
 
 logger = init_logger(__name__)
@@ -99,6 +102,7 @@ def _marlin_fp4_single(
         and decode_weight is not None
         and decode_scales is not None
     ):
+        _log_marlint_stats()
         return torch.ops.vllm.marlin_tiled_decode.default(
             x, decode_weight, decode_scales, weight_global_scale, workspace, size_n, size_k
         )
@@ -461,6 +465,328 @@ def _prepare_prompt_gemm(layer: torch.nn.Module) -> None:
     _prompt_stats["single"] += 1
 
 
+# SiLU-and-mul of the gated MLP fused into the gate_up GEMM.
+#
+# The model's compiled graph computes act = silu(gate) * up on the [M, 2D]
+# bf16 output of gate_up in one Inductor (Triton) kernel: fp32 math on the bf16
+# values, silu(g) = g / (exp(-g) + 1) without rounding to bf16 in between, one
+# round to bf16 at the end. marlinw.silu_mul and marlinw's fused epilogue run
+# the same instruction chain (harness/kernels/marlinw/csrc/silu_mul.cuh) on the
+# same bf16 gate and up values that ops.marlin_gemm writes, so the output is the
+# same bits: the gate tile is rounded to bf16 by the unchanged Marlin epilogue,
+# stored, and read back by the up tile's epilogue. For a layer admitted here
+# the model calls marlin_fp4_silu_mul instead of gate_up_proj + act_fn; calls
+# without a fused plan (fewer than 128 rows, rows not a multiple of 256) run the
+# layer's GEMM path followed by marlinw.silu_mul.
+_silu_stats = {"fused": 0, "rejected": 0, "logged": False, "ref_ok": None}
+_SILU_CHECK_M = (512, 4096, 640)
+
+
+_silu_layers: list = []
+
+
+def _log_silu_stats() -> None:
+    if not _silu_stats["logged"]:
+        _silu_stats["logged"] = True
+        # The model fuses only ahead of a down_proj that reads bf16 (an FP8
+        # down_proj keeps the compiled SiLU-and-mul + quantization glue).
+        fused = glue = 0
+        for ref in _silu_layers:
+            layer = ref()
+            consumer = getattr(layer, "silu_mul_consumer", None) if layer else None
+            down = consumer() if consumer is not None else None
+            if down is not None and getattr(down, "marlin_bf16_input", False):
+                fused += 1
+            else:
+                glue += 1
+        logger.info(
+            "Marlin NVFP4 gate_up with fused SiLU-and-mul: %d layers fused, %d on "
+            "the stock glue (down_proj not bf16-input), %d rejected",
+            fused,
+            glue,
+            _silu_stats["rejected"],
+        )
+
+
+def _silu_mul_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    decode_weight: torch.Tensor | None = None,
+    decode_scales: torch.Tensor | None = None,
+) -> torch.Tensor:
+    out = marlinw.gemm_silu_mul(
+        x, weight, weight_scale, weight_global_scale, size_n, size_k
+    )
+    if out is not None:
+        return out
+    args = (x, weight, weight_scale, weight_global_scale, workspace, size_n, size_k)
+    y = _marlin_fp4_wide_gemm(*args)
+    return marlinw.silu_mul(
+        y if y is not None else _marlin_fp4_single(*args, decode_weight, decode_scales)
+    )
+
+
+def _marlin_fp4_silu_mul(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    decode_weight: torch.Tensor | None = None,
+    decode_scales: torch.Tensor | None = None,
+) -> torch.Tensor:
+    _log_prompt_stats()
+    _log_silu_stats()
+    return _silu_mul_impl(
+        x,
+        weight,
+        weight_scale,
+        weight_global_scale,
+        workspace,
+        size_n,
+        size_k,
+        decode_weight,
+        decode_scales,
+    )
+
+
+def _marlin_fp4_silu_mul_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    decode_weight: torch.Tensor | None = None,
+    decode_scales: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], size_n // 2))
+
+
+direct_register_custom_op(
+    op_name="marlin_fp4_silu_mul",
+    op_func=_marlin_fp4_silu_mul,
+    fake_impl=_marlin_fp4_silu_mul_fake,
+)
+
+
+def marlin_fp4_silu_mul(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """silu(gate) * up of a merged [gate | up] layer admitted at load
+    (layer.marlin_silu_mul)."""
+    size_n = layer.output_size_per_partition
+    out = torch.ops.vllm.marlin_fp4_silu_mul(
+        x.reshape(-1, x.shape[-1]),
+        layer.weight,
+        layer.weight_scale,
+        layer.weight_global_scale,
+        layer.workspace,
+        size_n,
+        layer.input_size_per_partition,
+        getattr(layer, "_marlin_decode_weight", None),
+        getattr(layer, "_marlin_decode_scales", None),
+    )
+    return out.reshape(x.shape[:-1] + (size_n // 2,))
+
+
+def _silu_mul_reference(y: torch.Tensor) -> torch.Tensor:
+    """The compiled graph's SiLU-and-mul kernel body (TorchInductor's Triton
+    code for SiluAndMul.forward_native on bf16), launched directly."""
+    import triton
+    import triton.language as tl
+    from torch._inductor.runtime.triton_helpers import libdevice
+
+    @triton.jit
+    def _kernel(in_ptr0, out_ptr0, xnumel, D: tl.constexpr, XBLOCK: tl.constexpr):
+        xoffset = tl.program_id(0) * XBLOCK
+        xindex = xoffset + tl.arange(0, XBLOCK)[:]
+        xmask = xindex < xnumel
+        x0 = xindex % D
+        x1 = xindex // D
+        tmp0 = tl.load(in_ptr0 + (x0 + 2 * D * x1), xmask).to(tl.float32)
+        tmp8 = tl.load(in_ptr0 + (D + x0 + 2 * D * x1), xmask).to(tl.float32)
+        tmp1 = tmp0.to(tl.float32)
+        tmp2 = -tmp1
+        tmp3 = libdevice.exp(tmp2)
+        tmp4 = tl.full([1], 1.0, tl.float32)
+        tmp5 = tmp3 + tmp4
+        tmp6 = tmp1 / tmp5
+        tmp7 = tmp6.to(tl.float32)
+        tmp9 = tmp7 * tmp8
+        tl.store(out_ptr0 + (xindex), tmp9, xmask)
+
+    m, d = y.shape[0], y.shape[1] // 2
+    out = torch.empty((m, d), dtype=torch.bfloat16, device=y.device)
+    _kernel[(triton.cdiv(m * d, 512),)](y, out, m * d, D=d, XBLOCK=512, num_warps=8)
+    return out
+
+
+def _silu_reference_check(device: torch.device) -> bool:
+    """marlinw.silu_mul against the reference on every bf16 gate value (and
+    random, tiny, huge and special up values); once per process."""
+    if _silu_stats["ref_ok"] is None:
+        try:
+            gate = torch.arange(-32768, 32768, dtype=torch.int32, device=device)
+            gate = gate.to(torch.int16).view(torch.bfloat16)
+            gen = torch.Generator(device=device)
+            gen.manual_seed(1)
+            rows = 48
+            up = torch.randn(rows, gate.numel(), generator=gen, device=device)
+            up[1::4] *= 1e-30
+            up[2::4] *= 1e30
+            up[3::8] = torch.tensor(
+                [0.0, -0.0, float("inf"), float("-inf"), float("nan"), 1.0, -1.0, 3.0],
+                device=device,
+            ).repeat(gate.numel() // 8)
+            y = torch.cat([gate.expand(rows, -1), up.to(torch.bfloat16)], 1).contiguous()
+            got = marlinw.silu_mul(y)
+            ref = _silu_mul_reference(y)
+            _silu_stats["ref_ok"] = bool(
+                torch.equal(got.view(torch.int16), ref.view(torch.int16))
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("SiLU-and-mul reference check failed: %s", e)
+            _silu_stats["ref_ok"] = False
+    return _silu_stats["ref_ok"]
+
+
+def _prepare_silu_mul(layer: torch.nn.Module) -> None:
+    """Admits a merged [gate | up] layer on the wide schedule to the fused
+    SiLU-and-mul op after a bitwise comparison with the single stock call
+    followed by marlinw.silu_mul (itself checked against the reference)."""
+    layer.marlin_silu_mul = False
+    if os.environ.get("VLLM_MARLIN_NVFP4_SILU_MUL", "1") == "0":
+        return
+    path = getattr(layer, "marlin_prompt_path", None)
+    sizes = getattr(layer, "output_partition_sizes", None)
+    if (
+        path is None
+        or path[0] != "wide"
+        or sizes is None
+        or len(sizes) != 2
+        or sizes[0] != sizes[1]
+        or sizes[0] % 256
+    ):
+        return
+    size_n = layer.output_size_per_partition
+    size_k = layer.input_size_per_partition
+    ok = _silu_reference_check(layer.weight.device)
+    gen = torch.Generator(device=layer.weight.device)
+    gen.manual_seed(size_n * 37 + size_k)
+    try:
+        for m in _SILU_CHECK_M if ok else ():
+            x = _prompt_check_input(m, size_k, gen)
+            got = _silu_mul_impl(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                layer.weight_global_scale,
+                layer.workspace,
+                size_n,
+                size_k,
+            )
+            ref = marlinw.silu_mul(
+                _marlin_fp4_single(
+                    x,
+                    layer.weight,
+                    layer.weight_scale,
+                    layer.weight_global_scale,
+                    layer.workspace,
+                    size_n,
+                    size_k,
+                )
+            )
+            if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+                ok = False
+                break
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Marlin NVFP4 fused SiLU-and-mul self-check failed: %s", e)
+        ok = False
+    if ok:
+        layer.marlin_silu_mul = True
+        _silu_stats["fused"] += 1
+        _silu_layers.append(weakref.ref(layer))
+    else:
+        _silu_stats["rejected"] += 1
+
+
+# One-row calls on the tile-major copy run harness/kernels/marlint when a
+# layer's outputs equal ops.marlin_gemm bitwise at load: the same Marlin
+# template, template arguments and tile-major addresses as the M=1 tiled
+# kernel, with reduction scratch that persists across calls.
+_marlint_stats = {"marlint": 0, "tiled": 0, "logged": False}
+
+
+def _log_marlint_stats() -> None:
+    if not _marlint_stats["logged"]:
+        _marlint_stats["logged"] = True
+        logger.info(
+            "Marlin NVFP4 M=1 tile-major decode: %d layers on marlint, %d on the "
+            "tiled kernel",
+            _marlint_stats["marlint"],
+            _marlint_stats["tiled"],
+        )
+
+
+def _admit_marlint(layer: torch.nn.Module) -> None:
+    weight_tm = getattr(layer, "_marlin_decode_weight", None)
+    scale_tm = getattr(layer, "_marlin_decode_scales", None)
+    if weight_tm is None or scale_tm is None:
+        return
+    ok = False
+    try:
+        import marlint
+
+        size_n = layer.output_size_per_partition
+        size_k = layer.input_size_per_partition
+        tn = marlint.eligible(layer) if os.environ.get("MARLINT", "1") != "0" else None
+        if tn is not None and weight_tm.shape[-1] == 2 * tn:
+            gen = torch.Generator(device=layer.weight.device)
+            gen.manual_seed(size_n * 17 + size_k)
+            ok = True
+            for i in range(3):
+                x = torch.randn(1, size_k, generator=gen, device=gen.device)
+                if i == 1:
+                    x[:, ::3] *= 64
+                elif i == 2:
+                    x *= torch.exp(
+                        torch.randn(size_k, generator=gen, device=gen.device) * 2
+                    )
+                x = x.to(torch.bfloat16)
+                got = marlint.gemm(
+                    x, weight_tm, scale_tm, layer.weight_global_scale, size_n, size_k
+                )
+                ref = _marlin_fp4_single(
+                    x,
+                    layer.weight,
+                    layer.weight_scale,
+                    layer.weight_global_scale,
+                    layer.workspace,
+                    size_n,
+                    size_k,
+                )
+                if got is None or not torch.equal(
+                    got.view(torch.int16), ref.view(torch.int16)
+                ):
+                    ok = False
+                    break
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Marlin NVFP4 marlint self-check failed: %s", e)
+        ok = False
+    if ok:
+        muse_marlin_gemv.use_marlint(weight_tm)
+        _marlint_stats["marlint"] += 1
+    else:
+        _marlint_stats["tiled"] += 1
+
+
 class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
     """NVFP4 weight-only GEMM via Marlin (W4A16)."""
 
@@ -484,9 +810,13 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
             "performance for compute-heavy workloads."
         )
         prepare_fp4_layer_for_marlin(layer)
+        # weight-only: the input is read as the bf16/fp16 tensor it is given
+        layer.marlin_bf16_input = True
         _prepare_prompt_gemm(layer)
         if prepare_decode_layout is not None and USE_FP32_REDUCE_DEFAULT:
             prepare_decode_layout(layer)
+            _admit_marlint(layer)
+        _prepare_silu_mul(layer)
 
     def apply_weights(
         self,

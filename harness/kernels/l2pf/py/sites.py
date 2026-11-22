@@ -239,6 +239,13 @@ def _targets():
         # records only the stock CUTLASS site through its default overload.
         out.append((glimmer_fp8_ext, "gemm", "cutlass_fp8", False))
     try:
+        import fp8tile
+    except (ImportError, OSError):
+        pass
+    else:
+        # The small-M FP8 kernel with the narrower tile (same weight operand).
+        out.append((fp8tile, "gemm", "cutlass_fp8", False))
+    try:
         from torch._inductor.select_algorithm import extern_kernels
 
         if hasattr(extern_kernels, "mm"):
