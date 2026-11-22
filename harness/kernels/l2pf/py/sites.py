@@ -17,10 +17,12 @@ match the recorded ones; on the first mismatch prefetching stops for the rest
 of that capture.
 
 Ranges: the first bytes of the weight (and the same share of Marlin's block
-scales). Prefetching a GEMM's head pays only for GEMMs small enough that the
-head stays in the 24 MiB L2 until it is read (attention projections); the MLP
-GEMMs stream at full bandwidth on their own and are skipped. More bytes go
-ahead of the GEMM that follows the attention op, the longest window.
+scales). More bytes go ahead of the GEMM that follows the attention op, the
+longest window. GEMMs whose weights exceed MAX_WEIGHT (the MLP) stream at full
+bandwidth once running, so they get a smaller head sized to the short window
+ahead of them: L2PF_MB_MLP_NORM ahead of a GEMM that follows a norm (gate_up),
+L2PF_MB_MLP_ACT ahead of one that follows another large GEMM's activation
+(down). ``L2PF_MLP=0`` skips them.
 ``marlin_descs`` (first tiles of each block's stripe) is kept for experiments;
 it is not used by the session.
 """
@@ -46,12 +48,16 @@ def _env_bytes(name: str, default: int) -> int:
 
 # Bytes per site: after an attention op (the long latency-bound window) and
 # after any other GEMM (one fused norm/activation kernel in between). GEMMs
-# whose weights exceed MAX_WEIGHT already run at full DRAM bandwidth from their
-# first microseconds; a prefetch there only competes with them.
+# whose weights exceed MAX_WEIGHT get the MLP budgets below instead: a head
+# that fits the window ahead of them (the norm before gate_up, the activation
+# before down).
 BYTES_AFTER_ATTN = _env_bytes("L2PF_MB_ATTN", 8 << 20)
 BYTES_OTHER = _env_bytes("L2PF_MB_OTHER", 2 << 20)
 MAX_WEIGHT = _env_bytes("L2PF_MAX_WEIGHT_MB", 64 << 20)
 BLOCKS = int(os.environ.get("L2PF_BLOCKS", "1"))
+MLP = os.environ.get("L2PF_MLP", "1") != "0"
+BYTES_MLP_NORM = _env_bytes("L2PF_MB_MLP_NORM", (9 << 20) // 4)
+BYTES_MLP_ACT = _env_bytes("L2PF_MB_MLP_ACT", 1 << 19)
 
 
 def available() -> bool:
@@ -167,6 +173,15 @@ def budget(weight_bytes: int, after_attn: bool) -> int:
     return BYTES_AFTER_ATTN if after_attn else BYTES_OTHER
 
 
+def mlp_budget(n_tensors: int, after_act: bool) -> int:
+    """Bytes of the weight head ahead of a GEMM above MAX_WEIGHT; with block
+    scales (an eighth of the code bytes) the two together take the budget."""
+    if not MLP:
+        return 0
+    nbytes = BYTES_MLP_ACT if after_act else BYTES_MLP_NORM
+    return nbytes * 8 // 9 if n_tensors > 1 else nbytes
+
+
 def weight_descs(ws: tuple[torch.Tensor, ...], nbytes: int) -> list[tuple[int, int, int, int]]:
     """The first nbytes of the weight (ws[0]) and the same share of its block
     scales (ws[1], one byte per 16 four-bit codes: an eighth of the bytes)."""
@@ -239,14 +254,12 @@ def _targets():
         # records only the stock CUTLASS site through its default overload.
         out.append((glimmer_fp8_ext, "gemm", "cutlass_fp8", False))
     try:
-        # Muse Glimmer decode FP8 GEMV (vllm .../scaled_mm/muse_fp8.py): its weight is the packed buffer (args[2]).
-        # MUSEFP8_L2PF=0 leaves these GEMMs out of the prefetch chain.
-        if os.environ.get("MUSEFP8_L2PF", "1") != "0":
-            pkt = torch.ops.vllm.muse_fp8_scaled_mm
-            pkt.default  # noqa: B018
-            out.append((pkt, "default", "musefp8", False))
-    except (AttributeError, RuntimeError):
+        import fp8tile
+    except (ImportError, OSError):
         pass
+    else:
+        # The small-M FP8 kernel with the narrower tile (same weight operand).
+        out.append((fp8tile, "gemm", "cutlass_fp8", False))
     try:
         from torch._inductor.select_algorithm import extern_kernels
 
@@ -265,12 +278,6 @@ def _targets():
         out.append((tiled, "default", "marlin_tiled", False))
     except (AttributeError, RuntimeError):
         pass
-    try:
-        # the same GEMV with 6-bit block-scale codes: args[1] tiled codes, args[2] scale codes
-        tiled6 = torch.ops.vllm.marlin_tiled_decode6
-        out.append((tiled6, "default", "marlin_tiled", False))
-    except (AttributeError, RuntimeError):
-        pass
     return out
 
 
@@ -278,7 +285,7 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
     try:
         if kind == "marlin":
             return (args[2], args[4])
-        if kind in ("cutlass", "musefp8"):
+        if kind == "cutlass":
             return (args[2],)
         if kind in ("cutlass_fp8", "mm"):
             return (args[1],)
@@ -296,6 +303,7 @@ class _Site:
     after_attn: bool
     descs: list = field(default_factory=list)
     off: int = 0
+    mlp: str = ""  # "norm" / "act": a GEMM above MAX_WEIGHT after a norm / an activation
 
 
 class Session:
@@ -314,6 +322,7 @@ class Session:
         self._i = 0
         self._pending = False
         self._attn = False
+        self._prev_big = False
 
     # -- patching
     @contextlib.contextmanager
@@ -357,6 +366,7 @@ class Session:
         self.sites = []
         self.stopped = False
         self._attn = False
+        self._prev_big = False
         with self._patched(self._on_record, True):
             yield
         if not self.stopped:
@@ -382,9 +392,15 @@ class Session:
         ws = _weights_of(kind, args)
         site = _Site(kind, key, self._attn)
         self._attn = False
+        prev_big, self._prev_big = self._prev_big, False
         try:
             wbytes = sum(_dense_span(w)[1] for w in ws)
-            site.descs = weight_descs(ws, budget(wbytes, site.after_attn))
+            if wbytes > MAX_WEIGHT:
+                self._prev_big = True
+                site.mlp = "act" if prev_big else "norm"
+                site.descs = weight_descs(ws, mlp_budget(len(ws), prev_big))
+            else:
+                site.descs = weight_descs(ws, budget(wbytes, site.after_attn))
             if self.ranges is not None and not _inside(site.descs, self.ranges):
                 site.descs = []
         except Exception:  # noqa: BLE001 - a site without ranges is still a site
@@ -453,12 +469,20 @@ class Session:
         self._fork(main, i + 1)
 
     def summary(self) -> str:
-        na = sum(1 for s in self.sites if s.descs and s.after_attn)
-        nb = sum(1 for s in self.sites if s.descs and not s.after_attn)
+        na = sum(1 for s in self.sites if s.descs and not s.mlp and s.after_attn)
+        nb = sum(1 for s in self.sites if s.descs and not s.mlp and not s.after_attn)
+        ng = sum(1 for s in self.sites if s.descs and s.mlp == "norm")
+        nd = sum(1 for s in self.sites if s.descs and s.mlp == "act")
         mb = sum(sg * c for s in self.sites for _, _, sg, c in s.descs) / (1 << 20)
+        if ng or nd:
+            big = (f"{ng + nd} MLP sites ({ng} after a norm at "
+                   f"{BYTES_MLP_NORM / (1 << 20):.2f} MiB, {nd} after an activation at "
+                   f"{BYTES_MLP_ACT / (1 << 20):.2f} MiB)")
+        else:
+            big = "skipped"
         return (f"{self.prefetched} of {len(self.sites)} GEMM sites"
                 f"{' (stopped at a mismatch)' if self.stopped else ''}; "
                 f"{na} after attention at {BYTES_AFTER_ATTN / (1 << 20):.1f} MiB, "
                 f"{nb} others at {BYTES_OTHER / (1 << 20):.1f} MiB, "
-                f"weights above {MAX_WEIGHT / (1 << 20):.0f} MiB skipped; "
+                f"weights above {MAX_WEIGHT / (1 << 20):.0f} MiB: {big}; "
                 f"{mb:.0f} MiB per step")

@@ -1,8 +1,9 @@
 """Boot-time whole-forward CUDA graph for one fresh prefill of a fixed length
 (V2 model runner).
 
-Port of the whole-forward prefill graph by ArthurOstapenko (Yukon submission
-c1e4b913), adapted to the V2 GPU model runner, to FlashAttention (FA2 on
+Port of the whole-forward prefill graph of Yukon submission c1e4b913
+(ported to this runner in submission ff28cfe8 and onto this tree in b3073f3d),
+adapted to the V2 GPU model runner, to FlashAttention (FA2 on
 sm_12x) and to models that feed the decoder `inputs_embeds` (multimodal
 checkpoints run the text embedding outside the compiled model).
 
@@ -33,6 +34,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import os
 import time
 from typing import Any
 
@@ -50,6 +52,8 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 logger = init_logger(__name__)
 
 PREFILL_GRAPH_TOKENS = 512
+# VLLM_PREFILL_GRAPH=0 keeps every prefill eager.
+PREFILL_GRAPH_ENABLED = os.environ.get("VLLM_PREFILL_GRAPH", "1") != "0"
 
 _SCALARS = (
     int,
@@ -186,6 +190,9 @@ def prefill_graph_unsupported(runner, num_tokens: int) -> str | None:
 def capture_prefill_graph(runner) -> PrefillGraph | None:
     """Capture the graph for the runner, or None (with a log line)."""
     num_tokens = PREFILL_GRAPH_TOKENS
+    if not PREFILL_GRAPH_ENABLED:
+        logger.info("Prefill graph off: VLLM_PREFILL_GRAPH=0")
+        return None
     reason = prefill_graph_unsupported(runner, num_tokens)
     if reason is not None:
         logger.info("Prefill graph off: %s", reason)
