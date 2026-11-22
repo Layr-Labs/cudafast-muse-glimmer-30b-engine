@@ -24,6 +24,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool = False,
+        known_single_token: bool = False,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -31,6 +32,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
+        # LOCAL PATCH (SP5D, Yukon submission 98c1361e; without its spin wait): one request, no draft tokens, a
+        # decode step: exactly one sampled token, so num_sampled_tokens is not copied back and the output is
+        # [[sampled_token_ids[0, 0]]], what the general path below produces from a count of 1.
+        self.known_single_token = known_single_token
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
@@ -47,7 +52,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.num_nans: np.ndarray | None = None
             if sampler_output.num_nans is not None:
                 self.num_nans = async_copy_to_np(sampler_output.num_nans)
-            self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
+            self.num_sampled_tokens_np = (
+                None if known_single_token else async_copy_to_np(num_sampled_tokens)
+            )
             self.prompt_logprobs_dict = {
                 k: v.to_cpu_nonblocking() if v is not None else None
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
@@ -64,11 +71,16 @@ class AsyncOutput(AsyncModelRunnerOutput):
         # the existing model runner.
         # Going forward, we should keep the data structures as NumPy arrays
         # rather than Python lists.
-        sampled_token_ids: list[list[int]] = self.sampled_token_ids.tolist()
-        num_sampled_tokens: list[int] = self.num_sampled_tokens_np.tolist()
-        for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
-            del token_ids[num_tokens:]
-        self.model_runner_output.sampled_token_ids = sampled_token_ids
+        if self.known_single_token:
+            self.model_runner_output.sampled_token_ids = [
+                [int(self.sampled_token_ids[0, 0])]
+            ]
+        else:
+            sampled_token_ids: list[list[int]] = self.sampled_token_ids.tolist()
+            num_sampled_tokens: list[int] = self.num_sampled_tokens_np.tolist()
+            for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
+                del token_ids[num_tokens:]
+            self.model_runner_output.sampled_token_ids = sampled_token_ids
 
         if self.num_nans is not None:
             self.model_runner_output.num_nans_in_logits = dict(
