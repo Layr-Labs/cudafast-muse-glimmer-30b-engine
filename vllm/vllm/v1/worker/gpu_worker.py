@@ -724,7 +724,10 @@ class Worker(WorkerBase):
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
         # Warmup and tune the kernels used during model execution before
-        # cuda graph capture.
+        # cuda graph capture. Skip FlashInfer autotune (0 tuned ops here, avoids
+        # a redundant 8192-token dummy pass after KV cache allocation).
+        self.vllm_config.kernel_config.enable_flashinfer_autotune = False
+        torch.cuda.empty_cache()
         kernel_warmup(self)
 
         cuda_graph_memory_bytes = 0

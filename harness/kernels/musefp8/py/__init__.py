@@ -74,18 +74,39 @@ LOADS = int(os.environ.get("MUSEFP8_U", "8"))
 # needs 32.5K registers of an SM, so a GEMV block must leave them free (8 warps x 96 registers = 24.6K) or the
 # attention kernel waits for the GEMV to finish.
 _WPB = {(4096, 6656): int(os.environ.get("MUSEFP8_GATE_WPB", "8"))}
+_SM120_CFG = {
+    (4608, 6656): (144, 4),
+    (4096, 6656): (128, 4),
+    (6656, 4096): (139, 6),
+    (6656, 19968): (139, 6),
+}
+_IS_SM120_CACHE: dict[int, bool] = {}
 
 
-def launch_config(n: int, k: int = 0, blocks: int = 0) -> tuple[int, int]:
+def _is_sm120(device: torch.device) -> bool:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    cached = _IS_SM120_CACHE.get(idx)
+    if cached is None:
+        cached = (
+            torch.cuda.get_device_capability(device) == (12, 0)
+            and torch.cuda.get_device_properties(device).multi_processor_count > 48
+        )
+        _IS_SM120_CACHE[idx] = cached
+    return cached
+
+
+def launch_config(n: int, k: int = 0, blocks: int = 0, is_sm120: bool = False) -> tuple[int, int]:
+    if is_sm120 and not blocks and (n, k) in _SM120_CFG:
+        return _SM120_CFG[(n, k)]
     b = blocks or BLOCKS
     wpb = _WPB.get((n, k)) or (n // 8 + b - 1) // b
-    return b, max(4, min(16, wpb))
+    return b, max(4, min(18 if b == 48 else 16, wpb))
 
 
 def gemv(packed: torch.Tensor, x: torch.Tensor, sb: torch.Tensor, sa: torch.Tensor, out: torch.Tensor, n: int, k: int,
          blocks: int = 0) -> None:
     """out[0:n] (bf16) = bf16_rn(sa * (sb * (x . W))) for one e4m3 activation row x[0:k]; sb has 1 or n fp32 entries, sa 1."""
-    b, wpb = launch_config(n, k, blocks)
+    b, wpb = launch_config(n, k, blocks, is_sm120=_is_sm120(x.device))
     rc = lib().musefp8_gemv(
         packed.data_ptr(), x.data_ptr(), sb.data_ptr(), int(sb.numel() == 1), sa.data_ptr(), out.data_ptr(), n, k,
         b, wpb, LOADS, torch.cuda.current_stream(x.device).cuda_stream,

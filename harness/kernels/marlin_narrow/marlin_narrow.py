@@ -28,6 +28,9 @@ def eligible(n: int, k: int, device: torch.device, props) -> bool:
     )
 
 
+_PARTIAL_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
 def gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -48,7 +51,11 @@ def gemm(
         return None
 
     out = x.new_empty((ROWS, n))
-    partial = x.new_empty((SM_COUNT, 64, 256), dtype=torch.float32)
+    key = (x.device, SM_COUNT)
+    partial = _PARTIAL_CACHE.get(key)
+    if partial is None:
+        partial = x.new_empty((SM_COUNT, 64, 256), dtype=torch.float32)
+        _PARTIAL_CACHE[key] = partial
     with torch.cuda.device(x.device):
         # This geometry selects the complete-K branch, which supplies its own
         # dynamic shared-memory size. The last argument is for the wide branch.

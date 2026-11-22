@@ -117,6 +117,9 @@ def trim_heap() -> None:
         pass
 
 
+# Micro-attribution: Trimming freed Python heap pages and waiting for /proc/vmstat compaction/reclaim
+# counters to settle before binding the resident socket is inspired by @kaankolcu (Yukon submission 1ee9c595);
+# the surrounding resident lifecycle and hot-wait transport integration are custom-implemented here.
 def settle(
     max_wait_s: float = MAX_WAIT_S,
     quiet_s: float = QUIET_S,

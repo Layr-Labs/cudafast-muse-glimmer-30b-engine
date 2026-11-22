@@ -24,16 +24,11 @@ __device__ __forceinline__ float swiglu_silu(float gate) {
   return result;
 }
 
-// Entries depend only on the BF16 bit pattern. The table has no model inputs.
-__device__ float bf16_silu[65536];
-__global__ void swiglu_initialize() {
-  unsigned word = 256u * blockIdx.x + threadIdx.x;
-  bf16_silu[word] = swiglu_silu(__uint_as_float(word << 16));
-}
+__global__ void swiglu_initialize() {}
 
 __device__ __forceinline__ __nv_bfloat16 swiglu_product(__nv_bfloat16 gate,
                                                        __nv_bfloat16 up) {
-  float silu = __ldg(bf16_silu + __bfloat16_as_ushort(gate));
+  float silu = swiglu_silu(__bfloat162float(gate));
   return __float2bfloat16_rn(__fmul_rn(silu, __bfloat162float(up)));
 }
 
@@ -44,7 +39,7 @@ __device__ __forceinline__ uint16_t swiglu_fp8_pair(uint32_t gates, uint32_t ups
       for (int e = 0; e < 2; ++e) {
         const auto gate = reinterpret_cast<const __nv_bfloat16*>(&gates)[e];
         const auto up = reinterpret_cast<const __nv_bfloat16*>(&ups)[e];
-        const float silu = __ldg(bf16_silu + __bfloat16_as_ushort(gate));
+        const float silu = swiglu_silu(__bfloat162float(gate));
         const float product = __fmul_rn(silu, __bfloat162float(up));
         const float q = __fmul_rn(product, inverse);
         scaled[e] = q < -448.0f ? -448.0f : (q > 448.0f ? 448.0f : q);

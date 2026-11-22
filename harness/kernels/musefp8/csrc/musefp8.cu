@@ -64,7 +64,7 @@ __global__ void pack_kernel(const uint8_t* __restrict__ W, uint4* __restrict__ P
 }
 
 template <int U>
-__global__ void __launch_bounds__(512, 1)
+__global__ void __launch_bounds__(576, 1)
     gemv_kernel(const uint4* __restrict__ P, const uint8_t* __restrict__ x, const float* __restrict__ sb, int sb_scalar,
                 const float* __restrict__ sa, __nv_bfloat16* __restrict__ out, int N, int K) {
   extern __shared__ uint2 xs[];  // x fragments: xs[s*4 + t] = {x[32s+4t .. +3], x[32s+16+4t .. +3]}
@@ -140,7 +140,7 @@ int musefp8_pack(const void* W, void* P, int N, int K, cudaStream_t st) {
 
 int musefp8_gemv(const void* P, const void* x, const float* sb, int sb_scalar, const float* sa, void* out, int N, int K,
                  int blocks, int wpb, int U, cudaStream_t st) {
-  if (N % 8 || K % 64 || blocks < 1 || wpb < 1 || wpb > 16) return 1;
+  if (N % 8 || K % 64 || blocks < 1 || wpb < 1 || wpb > 18) return 1;
   switch (U) {
     case 4: return launch<4>(P, x, sb, sb_scalar, sa, out, N, K, blocks, wpb, st);
     case 6: return launch<6>(P, x, sb, sb_scalar, sa, out, N, K, blocks, wpb, st);

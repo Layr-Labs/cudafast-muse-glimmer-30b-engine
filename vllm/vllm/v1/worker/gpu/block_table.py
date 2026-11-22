@@ -76,6 +76,7 @@ class BlockTables:
             dtype=torch.int64,
             device=self.device,
         )
+        self._prev_max_slot_tokens = self.max_num_batched_tokens
 
         self.init_block_table_layout_tensors()
 
@@ -182,8 +183,16 @@ class BlockTables:
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
+        pad_limit = (
+            min(
+                slot_mappings.shape[1],
+                max(num_tokens_padded, self._prev_max_slot_tokens),
+            )
+            if out is None
+            else slot_mappings.shape[1]
+        )
         _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
-            slot_mappings.shape[1],
+            pad_limit,
             idx_mapping,
             query_start_loc,
             positions,
@@ -198,6 +207,8 @@ class BlockTables:
             PAD_ID=PAD_SLOT_ID,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
         )
+        if out is None:
+            self._prev_max_slot_tokens = num_tokens_padded
         return slot_mappings[:, :num_tokens_padded]
 
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
@@ -205,6 +216,7 @@ class BlockTables:
         # This is because the padding logic is complex and kernels may access beyond
         # the requested range.
         self.slot_mappings.fill_(PAD_SLOT_ID)
+        self._prev_max_slot_tokens = 0
         # NOTE(woosuk): The output may be used for CUDA graph capture.
         # Therefore, this method must return the persistent tensor
         # with the same memory address as that used during the model's forward pass,
@@ -252,7 +264,7 @@ def _gather_block_tables_kernel(
         tl.store(dst_row_ptr + offset, block_ids, mask=offset < num_blocks)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_num_tokens"])
 def _compute_slot_mappings_kernel(
     max_num_tokens,
     idx_mapping,  # [num_reqs]

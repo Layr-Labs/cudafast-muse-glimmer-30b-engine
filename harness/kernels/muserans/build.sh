@@ -10,6 +10,7 @@ trap 'rm -rf -- "$build_dir"' EXIT
 export MAX_JOBS="${MAX_JOBS:-4}" PYTHONDONTWRITEBYTECODE=1
 
 python3 - "$here" "$build_dir" "$KERNELS_OUT" <<'PY'
+import os
 import pathlib
 import shutil
 import sys
@@ -17,15 +18,17 @@ import sys
 from torch.utils.cpp_extension import load
 
 source, build, out = map(pathlib.Path, sys.argv[1:])
+arch = os.environ.get("TORCH_CUDA_ARCH_LIST", "12.1a").split(";")[0].strip().removesuffix("+PTX")
+sm = arch.replace(".", "")
 name = "muse_rans_ext"
 load(
     name=name,
     sources=[str(source / "csrc" / "muse_rans.cu")],
-    extra_cuda_cflags=["-O3", "-gencode=arch=compute_121a,code=sm_121a", "-DMUSE_RANS_STANDALONE_MODULE", "-lineinfo"],
+    extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{sm},code=sm_{sm}", "-DMUSE_RANS_STANDALONE_MODULE", "-lineinfo"],
     extra_cflags=["-O3"],
     build_directory=str(build),
     verbose=False,
 )
 shutil.copy2(build / f"{name}.so", out / f"{name}.so")
-print(f"muserans: built {out / name}.so for sm_121a")
+print(f"muserans: built {out / name}.so for sm_{sm}")
 PY

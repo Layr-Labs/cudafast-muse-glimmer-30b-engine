@@ -54,6 +54,10 @@ _QROPE_NAME = re.compile(
 )
 
 
+# Micro-attribution: Replacing the symbolic-stride Inductor query QK-norm + RoPE pointwise kernel
+# on prompt batches via a launcher wrapper is inspired by @ArthurOstapenko (Yukon submission fa040f4a);
+# the multi-distribution live+synthetic bitwise admission check and graph-capture guard around it
+# are custom-implemented here.
 @triton.jit
 def _qnorm_rope_kernel(
     qkv_ptr,
@@ -382,7 +386,7 @@ class _QRopeSwap:
 
 
 def _min_tokens() -> int:
-    return int(os.environ.get("VLLM_MUSE_GLIMMER_PROMPT_GLUE_MIN_TOKENS", "128"))
+    return int(os.environ.get("VLLM_MUSE_GLIMMER_PROMPT_GLUE_MIN_TOKENS", "1"))
 
 
 def _classify(kernel) -> _QRopeSwap | None:
@@ -414,12 +418,6 @@ _installed = False
 def install_prompt_glue() -> None:
     """Route long launches of matching compiled kernels to the swaps above."""
     global _installed
-    try:
-        from .muse_glimmer_norm_glue import install_norm_glue
-
-        install_norm_glue()
-    except Exception:
-        logger.info("Decode norm glue not installed", exc_info=True)
     if _installed or os.environ.get("VLLM_MUSE_GLIMMER_PROMPT_GLUE", "1") != "1":
         return
     try:

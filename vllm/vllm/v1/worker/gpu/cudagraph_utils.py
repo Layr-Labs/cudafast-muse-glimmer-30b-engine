@@ -63,6 +63,7 @@ class BatchExecutionDescriptor:
     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
     uniform_token_count: int | None = None
     num_active_loras: int = 0
+    max_kv_len: int | None = None
 
 
 class CreateForwardFn(Protocol):
@@ -83,6 +84,7 @@ def _is_compatible(
     num_tokens: int,
     uniform_token_count: int | None,
     num_active_loras: int,
+    max_kv_len: int | None = None,
 ) -> bool:
     # desc.uniform_token_count=None (PIECEWISE) can handle any uniform_token_count
     # desc.num_reqs=None means no request padding needed (PIECEWISE)
@@ -94,6 +96,10 @@ def _is_compatible(
         and (desc.num_reqs is None or desc.num_reqs >= num_reqs)
         and desc.num_tokens >= num_tokens
         and desc.num_active_loras == num_active_loras
+        and (
+            desc.max_kv_len is None
+            or (max_kv_len is not None and max_kv_len <= desc.max_kv_len)
+        )
     )
 
 
@@ -262,6 +268,26 @@ class CudaGraphManager:
                     ):
                         continue
 
+                    if (
+                        decode_mode == CUDAGraphMode.FULL
+                        and rounded_num_tokens == 1
+                        and self.max_num_reqs == 1
+                        and self.vllm_config.model_config.max_model_len > 1024
+                    ):
+                        short_desc = BatchExecutionDescriptor(
+                            cg_mode=decode_mode,
+                            num_tokens=rounded_num_tokens,
+                            num_reqs=rounded_num_reqs,
+                            uniform_token_count=decode_query_len,
+                            num_active_loras=num_active_loras,
+                            max_kv_len=1024,
+                        )
+                        if short_desc not in descs_by_mode[decode_mode]:
+                            descs_by_mode[decode_mode].append(short_desc)
+                            descs_by_token_lora[
+                                (rounded_num_tokens, num_active_loras)
+                            ].append(short_desc)
+
                     desc = BatchExecutionDescriptor(
                         cg_mode=decode_mode,
                         num_tokens=rounded_num_tokens,
@@ -286,6 +312,22 @@ class CudaGraphManager:
                 num_reqs = None
                 if mixed_mode == CUDAGraphMode.FULL:
                     num_reqs = min(num_tokens, self.max_num_reqs)
+                    if (
+                        num_tokens == 1
+                        and self.max_num_reqs == 1
+                        and self.vllm_config.model_config.max_model_len > 1024
+                    ):
+                        short_desc = BatchExecutionDescriptor(
+                            cg_mode=mixed_mode,
+                            num_tokens=num_tokens,
+                            num_reqs=num_reqs,
+                            num_active_loras=num_active_loras,
+                            max_kv_len=1024,
+                        )
+                        descs_by_mode[mixed_mode].append(short_desc)
+                        descs_by_token_lora[(num_tokens, num_active_loras)].append(
+                            short_desc
+                        )
                 desc = BatchExecutionDescriptor(
                     cg_mode=mixed_mode,
                     num_tokens=num_tokens,
@@ -404,6 +446,7 @@ class CudaGraphManager:
         num_tokens: int,
         uniform_token_count: int | None,
         num_active_loras: int,
+        max_kv_len: int | None = None,
     ) -> BatchExecutionDescriptor:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
 
@@ -417,6 +460,7 @@ class CudaGraphManager:
                     num_tokens,
                     uniform_token_count,
                     effective_loras,
+                    max_kv_len=max_kv_len,
                 ):
                     return desc
         return BatchExecutionDescriptor(
@@ -537,6 +581,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 attn_groups,
                 kv_cache_config,
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
+                max_kv_len=desc.max_kv_len,
             )
 
             # Capture with dummy rows marked as padding.
@@ -565,6 +610,18 @@ class ModelCudaGraphManager(CudaGraphManager):
                         # run_pw_graph).
                         model_output = self.run_pw_graph(model, model_inputs)
                     else:
+                        if (
+                            model_inputs.get("inputs_embeds") is not None
+                            and not getattr(model, "requires_raw_input_tokens", False)
+                        ):
+                            lm = (
+                                model.get_language_model()
+                                if hasattr(model, "get_language_model")
+                                else model
+                            )
+                            model_inputs["inputs_embeds"].copy_(
+                                lm.embed_input_ids(input_buffers.input_ids[:num_tokens])
+                            )
                         model_output = model(**model_inputs)
 
                 if cg_mode == CUDAGraphMode.PIECEWISE:
@@ -628,6 +685,7 @@ def prepare_inputs_to_capture(
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
     full_cudagraph: bool,
+    max_kv_len: int | None = None,
 ) -> AttentionState:
     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
@@ -680,4 +738,11 @@ def prepare_inputs_to_capture(
         kv_cache_config,
         for_capture=full_cudagraph,
     )
+    if max_kv_len is not None and attn_metadata is not None:
+        seen_metas: set[int] = set()
+        for meta in attn_metadata.values():
+            if meta is not None and id(meta) not in seen_metas:
+                seen_metas.add(id(meta))
+                if hasattr(meta, "max_seq_len") and meta.max_seq_len > max_kv_len:
+                    meta.max_seq_len = max_kv_len
     return AttentionState(attn_metadata, slot_mappings_by_layer)

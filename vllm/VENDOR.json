@@ -49,11 +49,11 @@
     },
     {
       "file": "vllm/model_executor/kernels/linear/scaled_mm/cutlass.py, vllm/model_executor/kernels/linear/scaled_mm/muse_fp8.py (new); harness/kernels/musefp8 (new); harness/kernels/l2pf/py/sites.py; harness/kernels/muserans (new)",
-      "why": "one-token FP8 w8a8 GEMMs (decode) run through musefp8, a hand-written mma.sync m16n8k32 e4m3 GEMV that issues the same instruction chain in the same k order as cutlass_scaled_mm's SM120 M16 kernel and the same ScaledEpilogue (bf16_rn(scale_a * fp32(scale_b * acc))), reading a fragment-ordered copy of each weight (registered as a layer buffer) with L2 evict-first loads; every layer is admitted only after a load-time bitwise comparison with cutlass_scaled_mm; other row counts keep glimmer_fp8 / cutlass; the op is an l2pf site (MUSEFP8=0 disables, MUSEFP8_L2PF=0 drops it from the prefetch chain). Compressed one-row QKV sites (4608x6656) and compressed output sites (6656x4096) that follow attention stay in the chain for matching but get no prefetch of their own; the capture log line counts them. When harness/kernels/muserans is built, each FP8 weight is instead stored as an exponent-pair rANS stream with raw sign|mantissa nibbles (lossless, ~0.84 of the bytes on this checkpoint) and decoded inside the same GEMV right before the same mma.sync chain, so the output bits are unchanged and the decode step reads fewer bytes; admitted per layer by the same bitwise check (MUSERANS=0 keeps the uncompressed copy) Imported from zereraz's Yukon submission cdefbb34-137b-48d9-9179-db4b540fbf57 (evaluation source 56791c43d807320c42d93b023678800489f6500c)."
+      "why": "one-token FP8 w8a8 GEMMs (decode) run through musefp8, a hand-written mma.sync m16n8k32 e4m3 GEMV that issues the same instruction chain in the same k order as cutlass_scaled_mm's SM120 M16 kernel and the same ScaledEpilogue (bf16_rn(scale_a * fp32(scale_b * acc))), reading a fragment-ordered copy of each weight (registered as a layer buffer) with L2 evict-first loads; every layer is admitted only after a load-time bitwise comparison with cutlass_scaled_mm; other row counts keep glimmer_fp8 / cutlass; the op is an l2pf site (MUSEFP8=0 disables, MUSEFP8_L2PF=0 drops it from the prefetch chain). When harness/kernels/muserans is built, each FP8 weight is instead stored as an exponent-pair rANS stream with raw sign|mantissa nibbles (lossless, ~0.84 of the bytes on this checkpoint) and decoded inside the same GEMV right before the same mma.sync chain, so the output bits are unchanged and the decode step reads fewer bytes; admitted per layer by the same bitwise check (MUSERANS=0 keeps the uncompressed copy)."
     },
     {
       "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py; harness/kernels/decode6 (new)",
-      "why": "Uses zereraz's published 6-bit palette implementation from cdefbb34 / 56791c43 for one-row NVFP4 decode after the per-layer bitwise admission check. The existing BF16 and FP8 SwiGLU prefill and narrow down operation signatures preserve their arguments."
+      "why": "One-row NVFP4 decode (decode6) packs each layer's 64 unique E4M3 group scales into 6-bit palette codes and pre-dequantizes the 64-entry palette directly into BF16 shared memory (sh_pal16[64]), eliminating per-step FP8-to-BF16 register conversion, with adaptive SM120/SM121 tile-N dispatch, in-place lm_head tiling, 10-bit rANS entropy-coded gate/up block scales (gemv6_srans.cu on 48-SM SM121, MUSE_SCALE_RANS, MUSE_GATE_UP_SRANS=0 disables), and redundant 8-bit scale release after per-layer bitwise admission checks."
     },
     {
       "file": "vllm/model_executor/layers/quantization/modelopt.py, vllm/model_executor/layers/quantization/utils/glimmer_fp8.py, vllm/model_executor/models/muse_glimmer.py",
@@ -61,31 +61,43 @@
     },
     {
       "file": "vllm/model_executor/models/muse_glimmer.py and muse_glimmer_glue.py (new)",
-      "why": "Carries only ArthurOstapenko's prompt query normalization and RoPE launcher and installation hook from Yukon submission fa040f4a-ca7e-42dd-8f50-8f1aadfc8d9b (ranked aa3a2e54b58675aa76f633bd31a3d07b0e4d41ab), first published in e7600084-0e57-465b-8c3c-1df33c51dd94. Before replacing a matching compiled kernel, the launcher compares output bits against the actual stock compiler kernel. The default minimum batch size is 128 tokens."
+      "why": "Prompt-batch query QK-norm and RoPE Triton launcher hook replacing the symbolic-stride compiled pointwise kernel on batches >= 128 tokens after bitwise verification against the stock compiled kernel on live and synthetic inputs."
     },
     {
       "file": "vllm/model_executor/models/muse_glimmer.py; harness/kernels/muse_bf16_lane (new); harness/kernels/l2pf/py/sites.py",
       "why": "The unquantized BF16 Muse Glimmer QKV and output gate on one CUDA device admit the one-row lane-striped GEMV only after a complete lossless weight check and per-layer bitwise cuBLAS comparisons. It keeps the original lane accumulation and warp fold. Larger row counts, bias and other weights retain the stock linear method. The original weights remain the fallback and the L2 site reads only the registered compact buffer. MUSE_BF16_LANE=0 selects the original paths."
     },
     {
-      "file": "vllm/model_executor/models/muse_glimmer.py, vllm/model_executor/kernels/linear/nvfp4/marlin.py, vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/prefill_graph.py, harness/kernels/muse_final_slab/",
-      "why": "Keep the full compiled backbone and specialize only the final two independent-row NVFP4 projection launches inside the logits-only prefill capture. Retain both operator output shapes and the ordered K partition for the sampled tile. Full-output consumers use the original projection launches."
+      "file": "vllm/model_executor/models/muse_glimmer.py, vllm/model_executor/kernels/linear/nvfp4/marlin.py, vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/prefill_graph.py, harness/kernels/muse_final_slab/, harness/kernels/marlinw/",
+      "why": "Keep the full compiled backbone and specialize only the final two independent-row NVFP4 projection launches inside the logits-only prefill capture (using muse_final_slab narrow tiles on SM121 and marlinw.gemm_last_chunk on SM120, plus routing final_slab_shape through marlin_fp4_single_or_tiled). Retain both operator output shapes and the ordered K partition for the sampled tile. Full-output consumers use the original projection launches."
     },
     {
       "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py; harness/kernels/marlinw_attn (new)",
-      "why": "The 512-row NVFP4 attention projections (qkv 4608x6656, output gate 4096x6656, o 6656x4096) run the stock ops.marlin_gemm partition on the narrow marlinw_down kernel (same device code, two blocks per SM, one block per 128-column half of each stock slice, unsplit tiles column-major, cut slices longest first). Every slice keeps its chunk, K range, slice_idx and slice_count, so each output element keeps its K16 MMA chains, FP32 split-K order and BF16 epilogue. A layer is admitted only after a bitwise comparison with the single ops.marlin_gemm call on its own weights; others, decode and every other row count keep the stock call. MARLIN_NARROW_ATTN=0 selects the original path."
+      "why": "The 512-row NVFP4 attention projections (qkv 4608x6656, output gate 4096x6656, o 6656x4096) on 48-SM SM121 run the stock ops.marlin_gemm partition on the narrow marlinw_down kernel (two blocks per SM, one block per 128-column half of each stock slice, unsplit tiles column-major, cut slices longest first). Every slice keeps its chunk, K range, slice_idx and slice_count, so each output element keeps its K16 MMA chains, FP32 split-K order and BF16 epilogue. Admitted only after a bitwise comparison with the single ops.marlin_gemm call; MARLIN_NARROW_ATTN=0 disables it."
     },
     {
       "file": "vllm/model_executor/kernels/linear/nvfp4/decode_placement.py (new), vllm/v1/worker/gpu/model_runner.py",
-      "why": "On a unified-memory GPU the rate a one-row NVFP4 GEMV reaches is a property of the physical memory under its weight and differs by several percent between allocations of the same bytes. After the load, every group of same-shaped decode weights is timed with the tiled decode GEMV on its own buffers and on spare buffers of the same size; weights on slow buffers are copied to faster spares and compared bitwise before the buffer is exchanged. No kernel, operand value or prompt-sized weight changes. Any error or a short host leaves the loader's placement. MUSE_DECODE_PLACEMENT=0 disables the step."
+      "why": "On a 128 GB unified-memory GB10 GPU (SM121), NVFP4 decode GEMV and 512-row prefill MLP bandwidth vary across physical allocations. After model load on SM121, same-shaped decode and 512-row prefill weights above 48 MiB are timed on their home buffers and spare buffers; slower weights are copied to faster spares and verified bit-for-bit before swapping (skipped on discrete-VRAM SM120; MUSE_DECODE_PLACEMENT=0 / MUSE_PREFILL_PLACEMENT=0 disable)."
     },
     {
-      "file": "vllm/model_executor/kernels/linear/nvfp4/decode_placement.py, vllm/v1/worker/gpu/model_runner.py",
-      "why": "The same load-time placement for the prompt-sized NVFP4 MLP weights: the production 512-row fused gate/up and down kernels are timed on every prefill weight and on spare buffers of the same size (the same weight in two allocations runs these kernels 11-17% apart on GB10, because whether a weight tile stays in L2 between its reads depends on the physical pages under it), and weights on slow buffers are copied to faster spares, compared bitwise and exchanged before anything is compiled or captured. MUSE_PREFILL_PLACEMENT=0 disables the step."
+      "file": "vllm/model_executor/kernels/linear/scaled_mm/fp8ws.py (new), vllm/model_executor/layers/quantization/utils/glimmer_fp8.py; harness/kernels/fp8ws (new); harness/kernels/lmpost (new)",
+      "why": "512-row prefill FP8 scaled-MM kernels (fp8ws) and final lm_head softcap+argmax fusion (lmpost) with bitwise load-time checks against stock CUTLASS and logits processor."
     },
     {
-      "file": "harness/kernels/l2pf/py/sites.py (outside the vLLM subtree; recorded here for provenance)",
-      "why": "L2 prefetch heads ahead of the MLP GEMMs (weights above MAX_WEIGHT): a 2.25 MiB head ahead of gate_up (after a norm) and a 0.5 MiB head ahead of down (after the activation), scales sharing the budget, plus a re-entrancy guard so only the outermost call of a nested wrapped entry point is a site. Taken from ArthurOstapenko's published submission e8fa7600-36f4-49a5-9c70-4190970fa897 (branch commit af81404); our compressed-FP8 prefetch skip (_RANS_SKIP_PREFETCH) is kept. Prefetch only reads weight bytes into L2 on a side stream; no value changes. L2PF_MLP=0 disables the heads."
+      "file": "harness/kernels/sandwich (new), harness/vllm_resident/backends.py",
+      "why": "Native CUDA sandwich normalization kernels matching compiled Inductor reductions; admitted per kernel object and row count at first eager launch after bitwise verification across all output buffers against the compiled Triton kernel."
+    },
+    {
+      "file": "harness/vllm_resident/settle.py (new), harness/vllm_resident/resident.py (outside the vLLM subtree; recorded here for provenance)",
+      "why": "After model load and warm-up, trim freed Python heap pages back to the kernel and wait until Linux /proc/vmstat compaction/reclaim counters and background CPU usage settle before reporting ready on the resident socket (RESIDENT_SETTLE=0 skips)."
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py, vllm/model_executor/layers/quantization/modelopt.py, vllm/model_executor/layers/quantization/utils/glimmer_fp8.py, vllm/model_executor/kernels/linear/scaled_mm/muse_fp8.py, harness/kernels/sandwich/muse_sandwich.py, harness/kernels/muse_final_slab/muse_final_slab.py, harness/kernels/l2pf/py/sites.py",
+      "why": "Full load-time/first-use lossless weight checks and bitwise output verifications across muserans/musefp8, decode6 (including fixed-grid gate_up), muse_fp8_swiglu, sandwich, muse_final_slab, and l2pf recursion guard recording each wrapped GEMM site once at the outermost call."
+    },
+    {
+      "file": "vllm/v1/worker/gpu_model_runner.py, vllm/v1/worker/gpu/input_batch.py",
+      "why": "Non-blocking CUDA event + spin-wait synchronization between single-request decode steps (VLLM_SPIN_OUTPUT_WAIT=0 disables), cached single-request metadata tensors skipping redundant per-step H2D copies, and skipping the redundant 8192-token FlashInfer dummy autotune pass when 0 ops are tuned."
     }
   ],
   "carried_from": {

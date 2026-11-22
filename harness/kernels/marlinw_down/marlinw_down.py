@@ -73,6 +73,9 @@ def prepare(device: torch.device) -> Prepared:
                     slots, active.value)
 
 
+_SCRATCH: dict[tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
 def gemm(x, weight, scales, global_scale, work, work_ptr, scratch_slots):
     if (
         x.shape != (ROWS, INNER)
@@ -84,8 +87,15 @@ def gemm(x, weight, scales, global_scale, work, work_ptr, scratch_slots):
     ):
         return None
     out = x.new_empty((ROWS, COLUMNS))
-    partial = x.new_empty((scratch_slots, 64, 128), dtype=torch.float32)
-    locks = x.new_zeros((scratch_slots,), dtype=torch.int32)
+    key = (x.device, int(scratch_slots))
+    scratch = _SCRATCH.get(key)
+    if scratch is None:
+        scratch = (
+            x.new_empty((scratch_slots, 64, 128), dtype=torch.float32),
+            x.new_zeros((scratch_slots,), dtype=torch.int32),
+        )
+        _SCRATCH[key] = scratch
+    partial, locks = scratch
     with torch.cuda.device(x.device):
         status = _launch(
             x.data_ptr(), weight.data_ptr(), out.data_ptr(), partial.data_ptr(),

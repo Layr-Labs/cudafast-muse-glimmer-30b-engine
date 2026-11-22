@@ -17,16 +17,20 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include "swiglu.cuh"
+// Micro-attribution: Interleaving gate and up columns so each register fragment pairs adjacent
+// values and packs one E4M3 output byte across two 4-bit transport lanes is inspired by @kaankolcu
+// (Yukon submission 1c021643); the dual-TMA fp8ws fallback and SM120 VRAM budget orchestration
+// around it are custom-implemented here.
 template<class Fragment> struct PairSwiGLU {
     CUTLASS_DEVICE auto operator()(Fragment const& halves, Fragment const& scale) const {
         constexpr int Num=Fragment::kElements;
         static_assert(Num>=2 && Num%2==0, "Each register fragment must contain an even adjacent N pair");
         cutlass::Array<cutlass::float_e2m1_t,Num> out;
+        float inverse;
+        asm("div.full.f32 %0, %1, %2;" : "=f"(inverse) : "f"(1.0f), "f"(scale[0]));
         #pragma unroll
         for (int i=0;i<Num;i+=2) {
-            const float silu=__ldg(bf16_silu + (__float_as_uint(halves[i])>>16));
-            float inverse;
-            asm("div.full.f32 %0, %1, %2;" : "=f"(inverse) : "f"(1.0f), "f"(scale[i]));
+            const float silu=swiglu_silu(halves[i]);
             const float q=__fmul_rn(__fmul_rn(silu,halves[i+1]),inverse);
             const float clamped=q < -448.f ? -448.f : (q>448.f ? 448.f : q);
             unsigned value=__nv_cvt_float_to_fp8(clamped,__NV_SATFINITE,__NV_E4M3);

@@ -12,6 +12,29 @@ _gemv.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
 _gemv.restype = ctypes.c_int
 
 
+_SMS_CACHE: dict[int, int] = {}
+_PARTIALS_CACHE: dict[tuple[int, int, int], torch.Tensor] = {}
+
+
+def _get_sms(device: torch.device) -> int:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    sms = _SMS_CACHE.get(idx)
+    if sms is None:
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        _SMS_CACHE[idx] = sms
+    return sms
+
+
+def _get_partials(device: torch.device, blocks: int, tile_n: int) -> torch.Tensor:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    key = (idx, blocks, tile_n)
+    buf = _PARTIALS_CACHE.get(key)
+    if buf is None:
+        buf = torch.empty((blocks, 16, tile_n), dtype=torch.float32, device=device)
+        _PARTIALS_CACHE[key] = buf
+    return buf
+
+
 def prepare_decode_layout(layer: torch.nn.Module) -> None:
     n, k = layer.output_size_per_partition, layer.input_size_per_partition
     if (
@@ -25,11 +48,19 @@ def prepare_decode_layout(layer: torch.nn.Module) -> None:
         or layer.weight_scale.element_size() != 1
         or tuple(layer.weight.shape) != (k // 16, n * 2)
         or tuple(layer.weight_scale.shape) != (k // 16, n)
-        or torch.cuda.get_device_capability(layer.weight.device) != (12, 1)
-        or torch.cuda.get_device_properties(layer.weight.device).multi_processor_count != 48
     ):
         return
-    tile_n = 128 if n % 128 == 0 else 64
+    cap = torch.cuda.get_device_capability(layer.weight.device)
+    sms = _get_sms(layer.weight.device)
+    if cap == (12, 1) and sms == 48:
+        pass
+    elif cap == (12, 0) and n == 202048:
+        # On 32 GiB SM120 (170 SMs), only tile lm_head in-place (M=1 always ->
+        # original Marlin buffers can be released once decode6 admits it).
+        pass
+    else:
+        return
+    tile_n = 128 if (n % 128 == 0 and (n // 128) * 4 > sms) else 64
     # Marlin has already permuted and scaled these tensors. Move complete
     # output tiles next to their next K stripe without changing any bits.
     for name, original, width in (
@@ -57,9 +88,9 @@ def decode_linear(
         x = x.clone(memory_format=torch.contiguous_format)
     output = x.new_empty((*x.shape[:-1], n))
     # Stock's stream-K schedule uses one block per SM and one FP32 tile per lock.
-    blocks = 48
-    tile_n = 128 if n % 128 == 0 else 64
-    partials = x.new_empty((blocks, 16, tile_n), dtype=torch.float32)
+    blocks = _get_sms(x.device)
+    tile_n = 128 if (n % 128 == 0 and (n // 128) * 4 > blocks) else 64
+    partials = _get_partials(x.device, blocks, tile_n)
     with torch.cuda.device(x.device):
         status = _gemv(
             x.data_ptr(), tiled_weight.data_ptr(), output.data_ptr(), partials.data_ptr(),
@@ -67,7 +98,7 @@ def decode_linear(
             x.device.index, torch.cuda.current_stream().cuda_stream,
         )
     if status:
-        raise RuntimeError(f"SM121 Marlin GEMV launch failed with CUDA error {status}")
+        raise RuntimeError(f"Marlin GEMV launch failed with CUDA error {status}")
     return output
 
 

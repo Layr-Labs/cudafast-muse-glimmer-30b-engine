@@ -57,15 +57,19 @@ except (ImportError, OSError):
     marlinw_attn = None
 
 try:
+    from muse_marlin_gemv import decode_linear as _decode_linear_direct
     from muse_marlin_gemv import prepare_decode_layout
 except (ImportError, OSError):
+    _decode_linear_direct = None
     prepare_decode_layout = None
 
 try:
     # 6-bit block-scale codes for the tiled decode GEMV (harness/kernels/decode6)
     from muse_marlin6_gemv import STATS as _scale6_stats
+    from muse_marlin6_gemv import decode_linear6 as _decode_linear6_direct
     from muse_marlin6_gemv import prepare_decode_layout6
 except (ImportError, OSError):
+    _decode_linear6_direct = None
     prepare_decode_layout6 = None
     _scale6_stats = None
 
@@ -86,6 +90,8 @@ logger = init_logger(__name__)
 _PROMPT_CHECK_M = (512, 4096)
 _prompt_stats = {
     "wide": 0, "narrow": 0, "narrow_down": 0, "sliced": 0, "single": 0, "logged": False,
+    "swiglu": 0, "swiglu_rejected": 0, "swiglu_fp8": 0, "swiglu_fp8_rejected": 0,
+    "fp8_gate_swiglu": 0, "fp8_gate_swiglu_rejected": 0,
     # Narrow 512-row NVFP4 attention projections: [admitted, rejected] per shape.
     "attn": {"qkv": [0, 0], "gate": [0, 0], "o": [0, 0]},
 }
@@ -119,11 +125,24 @@ def _log_prompt_stats() -> None:
         if _scale6_stats is not None:
             logger.info("NVFP4 decode palette admission: %d compressed, %d kept uncompressed",
                         _scale6_stats["admitted"], _scale6_stats["kept"])
-            logger.info("NVFP4 fixed decode gate/up grid admitted on %d layers", _scale6_stats["fixed_grid"])
+            logger.info("NVFP4 fixed decode gate/up grid admitted on %d layers",
+                        _scale6_stats["fixed_grid"])
             coded = _scale6_stats.get("srans_scales", 0)
             logger.info("NVFP4 rANS-coded gate/up block scales: %d layers admitted, %d rejected, %.3f bits per scale",
                         _scale6_stats.get("gate_up_srans", 0), _scale6_stats.get("gate_up_srans_rejected", 0),
                         8.0 * _scale6_stats.get("srans_bytes", 0) / coded if coded else 0.0)
+            logger.info(
+                "Lossless NVFP4 scale check: %d of %d palette layers decoded in full equal to the "
+                "loaded scales (%d scale bytes, %d tile-major weight bytes compared) and to "
+                "ops.marlin_gemm at one row",
+                _lossless6["full"], _lossless6["full"] + _lossless6["bad"],
+                _lossless6["scale_bytes"], _lossless6["weight_bytes"],
+            )
+            logger.info(
+                "NVFP4 independent gate/up decode tiles: %d of %d layers equal to ops.marlin_gemm "
+                "at one row bitwise, %d kept on the regular decode tiles",
+                _lossless6["grid"], _lossless6["grid"] + _lossless6["grid_bad"], _lossless6["grid_bad"],
+            )
         logger.info(
             "Marlin NVFP4 prompt GEMM: %d layers on the wide schedule, %d on "
             "column slices, %d on the single call",
@@ -148,6 +167,38 @@ def _log_prompt_stats() -> None:
                 "gate %d/%d, o %d/%d",
                 *attn["qkv"], *attn["gate"], *attn["o"],
             )
+        if _prompt_stats["swiglu"] or _prompt_stats["swiglu_rejected"]:
+            logger.info(
+                "Paired SwiGLU prefill matched the single Marlin call plus the "
+                "compiled SiLU-and-mul bitwise on %d layers, %d rejected",
+                _prompt_stats["swiglu"],
+                _prompt_stats["swiglu_rejected"],
+            )
+        if _prompt_stats["swiglu_fp8"] or _prompt_stats["swiglu_fp8_rejected"]:
+            logger.info(
+                "Paired SwiGLU FP8 prefill matched the single Marlin call plus the "
+                "compiled SiLU-and-mul FP8 quantization bitwise on %d layers, %d rejected",
+                _prompt_stats["swiglu_fp8"],
+                _prompt_stats["swiglu_fp8_rejected"],
+            )
+        if _prompt_stats["fp8_gate_swiglu"] or _prompt_stats["fp8_gate_swiglu_rejected"]:
+            logger.info(
+                "FP8 gate/up SwiGLU prefill matched the FP8 GEMM plus the compiled "
+                "SiLU-and-mul FP8 quantization bitwise on %d layers, %d rejected",
+                _prompt_stats["fp8_gate_swiglu"],
+                _prompt_stats["fp8_gate_swiglu_rejected"],
+            )
+
+
+_decode_routes_seen: set[str] = set()
+
+
+def _log_decode_route(route: str) -> None:
+    # Once per route, at the first one-row call of the running engine (decode
+    # warm-up / graph capture): shows which GEMV the decode step records.
+    if route not in _decode_routes_seen:
+        _decode_routes_seen.add(route)
+        logger.info("NVFP4 one-row GEMM in use: tile-major GEMV with %s", route)
 
 
 def _marlin_fp4_single(
@@ -170,14 +221,24 @@ def _marlin_fp4_single(
         and decode_scales is not None
     ):
         if decode_palette is not None:
+            _log_decode_route(
+                "6-bit scale codes expanded inside the GEMV, one CTA per gate/up tile "
+                "(marlin_tiled_decode6)" if decode_fixed_grid
+                else "6-bit scale codes expanded inside the GEMV (marlin_tiled_decode6)"
+            )
             # decode_scales holds the layer's 6-bit codes into decode_palette
             return torch.ops.vllm.marlin_tiled_decode6.default(
                 x, decode_weight, decode_scales, decode_palette, weight_global_scale, workspace,
                 size_n, size_k, decode_fixed_grid,
             )
+        _log_decode_route("8-bit scales (marlin_tiled_decode)")
         return torch.ops.vllm.marlin_tiled_decode.default(
             x, decode_weight, decode_scales, weight_global_scale, workspace, size_n, size_k
         )
+    if muse_final_slab is not None and x.shape[0] == muse_final_slab.ROWS:
+        out = muse_final_slab.wide_if_active(x, weight, weight_scale, weight_global_scale)
+        if out is not None:
+            return out
     return apply_fp4_marlin_linear(
         input=x,
         weight=weight,
@@ -261,6 +322,10 @@ def _marlin_fp4_wide(
 ) -> torch.Tensor:
     _log_prompt_stats()
     args = (x, weight, weight_scale, weight_global_scale, workspace, size_n, size_k)
+    if muse_final_slab is not None and x.shape[0] == muse_final_slab.ROWS:
+        out = muse_final_slab.wide_if_active(x, weight, weight_scale, weight_global_scale)
+        if out is not None:
+            return out
     if use_narrow and marlin_narrow is not None:
         out = marlin_narrow.gemm(*args)
         if out is not None:
@@ -603,6 +668,303 @@ def _prompt_check(layer: torch.nn.Module, fn, ms) -> bool:
         return False
 
 
+_silu_ref_kernel = None
+
+
+def _silu_mul_reference(y: torch.Tensor) -> torch.Tensor:
+    """The compiled graph's SiLU-and-mul kernel body (TorchInductor's Triton
+    code for SiluAndMul.forward_native on bf16 ahead of a bf16-input
+    down_proj), launched directly: fp32 silu(g) = g / (exp(-g) + 1) times up,
+    one bf16 rounding at the store."""
+    global _silu_ref_kernel
+    import triton
+
+    if _silu_ref_kernel is None:
+        import triton.language as tl
+        from torch._inductor.runtime.triton_helpers import libdevice
+
+        @triton.jit
+        def _kernel(in_ptr0, out_ptr0, xnumel, D: tl.constexpr, XBLOCK: tl.constexpr):
+            xoffset = tl.program_id(0) * XBLOCK
+            xindex = xoffset + tl.arange(0, XBLOCK)[:]
+            xmask = xindex < xnumel
+            x0 = xindex % D
+            x1 = xindex // D
+            tmp0 = tl.load(in_ptr0 + (x0 + 2 * D * x1), xmask).to(tl.float32)
+            tmp8 = tl.load(in_ptr0 + (D + x0 + 2 * D * x1), xmask).to(tl.float32)
+            tmp1 = tmp0.to(tl.float32)
+            tmp2 = -tmp1
+            tmp3 = libdevice.exp(tmp2)
+            tmp4 = tl.full([1], 1.0, tl.float32)
+            tmp5 = tmp3 + tmp4
+            tmp6 = tmp1 / tmp5
+            tmp7 = tmp6.to(tl.float32)
+            tmp9 = tmp7 * tmp8
+            tl.store(out_ptr0 + (xindex), tmp9, xmask)
+
+        _silu_ref_kernel = _kernel
+
+    m, d = y.shape[0], y.shape[1] // 2
+    out = torch.empty((m, d), dtype=torch.bfloat16, device=y.device)
+    _silu_ref_kernel[(triton.cdiv(m * d, 512),)](
+        y, out, m * d, D=d, XBLOCK=512, num_warps=8
+    )
+    return out
+
+
+def _swiglu_check(layer: torch.nn.Module) -> bool:
+    """Load-time check of the paired gate/up SwiGLU (marlinw/swiglu.py) on this
+    layer's weights: its output
+    must equal the single ops.marlin_gemm call followed by the compiled
+    SiLU-and-mul body bitwise (as int16); otherwise the layer keeps the
+    projection and the compiled glue."""
+    size_n = layer.output_size_per_partition
+    size_k = layer.input_size_per_partition
+    gen = torch.Generator(device=layer.weight.device)
+    gen.manual_seed(size_n * 43 + size_k)
+    try:
+        for i in range(3):
+            if i == 0:
+                x = _prompt_check_input(512, size_k, gen)
+            else:
+                # Smaller activations put gate values in silu's curved range.
+                x = torch.randn(512, size_k, generator=gen, device=gen.device)
+                x = (x * (0.05 if i == 1 else 0.5)).to(torch.bfloat16)
+            got = marlin_swiglu.gemm(
+                x, layer.weight, layer.weight_scale, layer.weight_global_scale
+            )
+            ref = _silu_mul_reference(
+                _marlin_fp4_single(
+                    x,
+                    layer.weight,
+                    layer.weight_scale,
+                    layer.weight_global_scale,
+                    layer.workspace,
+                    size_n,
+                    size_k,
+                )
+            )
+            if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+                return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Paired SwiGLU prefill self-check failed: %s", e)
+        return False
+
+
+_silu_fp8_ref_kernel = None
+
+
+def _silu_mul_fp8_reference(y: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """The compiled graph's SiLU-and-mul plus static FP8 quantization kernel
+    body (TorchInductor's Triton code ahead of an FP8 down_proj that takes a
+    per-tensor input scale), launched directly: fp32 silu(g) = g / (exp(-g) + 1)
+    times up, times 1 / scale, clamped to [-448, 448], one e4m3 rounding at
+    the store (no bf16 rounding of the product)."""
+    global _silu_fp8_ref_kernel
+    import triton
+
+    if _silu_fp8_ref_kernel is None:
+        import triton.language as tl
+        from torch._inductor.runtime import triton_helpers
+        from torch._inductor.runtime.triton_helpers import libdevice
+
+        @triton.jit
+        def _kernel(in_ptr0, in_ptr1, out_ptr0, xnumel, D: tl.constexpr, XBLOCK: tl.constexpr):
+            xoffset = tl.program_id(0) * XBLOCK
+            xindex = xoffset + tl.arange(0, XBLOCK)[:]
+            xmask = xindex < xnumel
+            x0 = xindex % D
+            x1 = xindex // D
+            tmp0 = tl.load(in_ptr0 + (x0 + 2 * D * x1), xmask).to(tl.float32)
+            tmp8 = tl.load(in_ptr0 + (D + x0 + 2 * D * x1), xmask).to(tl.float32)
+            tmp11 = tl.load(in_ptr1 + (0))
+            tmp12 = tl.broadcast_to(tmp11, [XBLOCK])
+            tmp1 = tmp0.to(tl.float32)
+            tmp2 = -tmp1
+            tmp3 = libdevice.exp(tmp2)
+            tmp4 = tl.full([1], 1.0, tl.float32)
+            tmp5 = tmp3 + tmp4
+            tmp6 = tmp1 / tmp5
+            tmp7 = tmp6.to(tl.float32)
+            tmp9 = tmp7 * tmp8
+            tmp10 = tmp9.to(tl.float32)
+            tmp13 = tmp4 / tmp12
+            tmp14 = tmp10 * tmp13
+            tmp15 = tl.full([1], -448.0, tl.float32)
+            tmp16 = triton_helpers.maximum(tmp14, tmp15)
+            tmp17 = tl.full([1], 448.0, tl.float32)
+            tmp18 = triton_helpers.minimum(tmp16, tmp17)
+            tmp19 = tmp18.to(tl.float8e4nv)
+            tl.store(out_ptr0 + (xindex), tmp19, xmask)
+
+        _silu_fp8_ref_kernel = _kernel
+
+    m, d = y.shape[0], y.shape[1] // 2
+    out = torch.empty((m, d), dtype=torch.float8_e4m3fn, device=y.device)
+    _silu_fp8_ref_kernel[(triton.cdiv(m * d, 512),)](
+        y, scale, out, m * d, D=d, XBLOCK=512, num_warps=8
+    )
+    return out
+
+
+def _swiglu_fp8_check(layer: torch.nn.Module, scale: torch.Tensor) -> bool:
+    """Load-time check of the paired gate/up SwiGLU with FP8 output
+    (marlinw/swiglu_fp8.py) on this
+    layer's weights and the next FP8 linear's own activation scale: its e4m3
+    output must equal the single ops.marlin_gemm call followed by the compiled
+    SiLU-and-mul FP8 quantization body bitwise; otherwise the layer keeps the
+    projection and the compiled glue."""
+    size_n = layer.output_size_per_partition
+    size_k = layer.input_size_per_partition
+    gen = torch.Generator(device=layer.weight.device)
+    gen.manual_seed(size_n * 47 + size_k)
+    try:
+        for i in range(4):
+            if i == 0:
+                x = _prompt_check_input(512, size_k, gen)
+            else:
+                # Smaller activations put gate values in silu's curved range;
+                # larger ones reach the +-448 clamp.
+                x = torch.randn(512, size_k, generator=gen, device=gen.device)
+                x = (x * (0.05, 0.5, 4.0)[i - 1]).to(torch.bfloat16)
+            got = marlin_swiglu_fp8.gemm(
+                x, layer.weight, layer.weight_scale, layer.weight_global_scale, scale
+            )
+            ref = _silu_mul_fp8_reference(
+                _marlin_fp4_single(
+                    x,
+                    layer.weight,
+                    layer.weight_scale,
+                    layer.weight_global_scale,
+                    layer.workspace,
+                    size_n,
+                    size_k,
+                ),
+                scale,
+            )
+            if not torch.equal(got.view(torch.uint8), ref.view(torch.uint8)):
+                return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Paired SwiGLU FP8 prefill self-check failed: %s", e)
+        return False
+
+
+# The FP8 variant needs the next linear's activation scale, which belongs to the
+# sibling down projection: the two halves meet here by layer prefix, in either
+# processing order, and the pair is admitted only after _swiglu_fp8_check.
+_swiglu_fp8_gate_up: dict[str, torch.nn.Module] = {}
+_swiglu_fp8_down: dict[str, torch.nn.Module] = {}
+
+
+def _mlp_prefix(layer: torch.nn.Module, leaf: str) -> str | None:
+    prefix = getattr(layer, "prefix", "") or ""
+    return prefix[: -len(leaf)] if prefix.endswith("." + leaf) else None
+
+
+def _quantize_check_input(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # Test data for both arms of a comparison: any finite e4m3 codes serve.
+    return (x.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+
+def _fp8_gate_swiglu_check(layer: torch.nn.Module, scale: torch.Tensor) -> bool:
+    """Load-time check of the 512-row FP8 gate/up GEMM with SiLU-and-mul and
+    the down projection's static FP8 quantization in its epilogue
+    (harness/kernels/muse_fp8_swiglu)
+    on this layer's weights and the down projection's own input scale: its
+    e4m3 output must equal the FP8 GEMM this layer runs at 512 rows
+    (glimmer::fp8_scaled_mm, which calls ops.cutlass_scaled_mm on the loaded
+    weight) followed by the compiled SiLU-and-mul FP8 quantization body
+    bitwise; otherwise the MLP keeps that GEMM and the compiled glue."""
+    from vllm.model_executor.layers.quantization.utils import glimmer_fp8
+
+    weight = layer.weight
+    size_k = weight.shape[0]
+    gen = torch.Generator(device=weight.device)
+    gen.manual_seed(weight.shape[1] * 53 + size_k)
+    try:
+        for i in range(5):
+            if i < 4:
+                if i == 0:
+                    x = _prompt_check_input(512, size_k, gen)
+                else:
+                    # Smaller activations put gate values in silu's curved
+                    # range; larger ones reach the +-448 clamp.
+                    x = torch.randn(512, size_k, generator=gen, device=gen.device)
+                    x = (x * (0.05, 0.5, 4.0)[i - 1]).to(torch.bfloat16)
+                xq = _quantize_check_input(x, layer.input_scale)
+            else:
+                # Raw e4m3 codes over the whole finite range.
+                codes = torch.randint(0, 256, (512, size_k), generator=gen,
+                                      device=gen.device, dtype=torch.uint8)
+                codes[(codes & 0x7F) == 0x7F] = 0
+                xq = codes.view(torch.float8_e4m3fn)
+            # The body of glimmer::fp8_gate_swiglu, called directly.
+            got = glimmer_fp8._swiglu.apply(
+                xq, layer.paired_fp8_swiglu_weight, layer.input_scale, layer.weight_scale, scale
+            )
+            ref = _silu_mul_fp8_reference(
+                glimmer_fp8.fp8_scaled_mm(xq, weight, layer.input_scale, layer.weight_scale),
+                scale,
+            )
+            if not torch.equal(got.view(torch.uint8), ref.view(torch.uint8)):
+                return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("FP8 gate/up SwiGLU prefill self-check failed: %s", e)
+        return False
+
+
+def _pair_swiglu_fp8(key: str) -> None:
+    gate_up = _swiglu_fp8_gate_up.get(key)
+    down = _swiglu_fp8_down.get(key)
+    if gate_up is None or down is None:
+        return
+    del _swiglu_fp8_gate_up[key], _swiglu_fp8_down[key]
+    if hasattr(gate_up, "paired_fp8_swiglu_weight"):
+        ok = _fp8_gate_swiglu_check(gate_up, down.input_scale)
+        _prompt_stats["fp8_gate_swiglu" if ok else "fp8_gate_swiglu_rejected"] += 1
+        if not ok:
+            del gate_up.paired_fp8_swiglu_weight
+        down.marlin_swiglu_fp8_input = ok
+        return
+    ok = _swiglu_fp8_check(gate_up, down.input_scale)
+    _prompt_stats["swiglu_fp8" if ok else "swiglu_fp8_rejected"] += 1
+    gate_up.marlin_swiglu_fp8_ready = ok
+    down.marlin_swiglu_fp8_input = ok
+
+
+def offer_swiglu_fp8_down(down: torch.nn.Module) -> None:
+    """An FP8 down projection that can take the fused FP8 activation (see
+    ModelOptFp8LinearMethod): stays off until its gate_up passes the check."""
+    down.marlin_swiglu_fp8_input = False
+    key = _mlp_prefix(down, "down_proj")
+    if key is not None:
+        _swiglu_fp8_down[key] = down
+        _pair_swiglu_fp8(key)
+
+
+def _offer_swiglu_fp8_gate_up(layer: torch.nn.Module) -> None:
+    layer.marlin_swiglu_fp8_ready = False
+    key = _mlp_prefix(layer, "gate_up_proj")
+    if key is not None:
+        _swiglu_fp8_gate_up[key] = layer
+        _pair_swiglu_fp8(key)
+
+
+def offer_fp8_gate_up_swiglu(layer: torch.nn.Module) -> None:
+    """An FP8 gate_up with the column-paired copy for muse_fp8_swiglu (see
+    ModelOptFp8LinearMethod): the copy is kept only if the check with its
+    down projection's input scale passes."""
+    key = _mlp_prefix(layer, "gate_up_proj")
+    if key is None:
+        del layer.paired_fp8_swiglu_weight
+        return
+    _swiglu_fp8_gate_up[key] = layer
+    _pair_swiglu_fp8(key)
+
+
 def _prepare_narrow_attn(
     layer: torch.nn.Module, global_scale: torch.Tensor, size_n: int, size_k: int, sms: int
 ) -> None:
@@ -711,9 +1073,15 @@ def _prepare_prompt_gemm(layer: torch.nn.Module) -> None:
                     down_plan = buffers
                     _prompt_stats["narrow_down"] += 1
         if use_narrow and marlin_swiglu is not None:
-            layer.marlin_swiglu_ready = marlin_swiglu.prepare(layer)
+            ready = marlin_swiglu.prepare(layer)
+            if ready:
+                ready = _swiglu_check(layer)
+                _prompt_stats["swiglu" if ready else "swiglu_rejected"] += 1
+            layer.marlin_swiglu_ready = ready
         if use_narrow and marlin_swiglu_fp8 is not None:
-            layer.marlin_swiglu_fp8_ready = marlin_swiglu_fp8.prepare(layer)
+            layer.marlin_swiglu_fp8_ready = False
+            if marlin_swiglu_fp8.prepare(layer):
+                _offer_swiglu_fp8_gate_up(layer)
         layer.marlin_prompt_path = ("wide", use_narrow, down_plan)
         _prompt_stats["narrow"] += use_narrow
         _prompt_stats["wide"] += 1
@@ -773,6 +1141,103 @@ def _prepare_prompt_gemm(layer: torch.nn.Module) -> None:
     _prompt_stats["single"] += 1
 
 
+# Full decode of the 6-bit scale codes of every admitted layer (decode6): all
+# codes through the
+# palette back to the Marlin scale layout, compared byte for byte with the
+# loaded scales (and the tile-major weight with the loaded weight), then the
+# one-row GEMV against ops.marlin_gemm itself, not only the tiled kernel.
+_lossless6 = {"full": 0, "bad": 0, "scale_bytes": 0, "weight_bytes": 0, "grid": 0, "grid_bad": 0}
+
+
+def _drop_decode6_grid(layer: torch.nn.Module) -> None:
+    if getattr(layer, "marlin_decode6_fixed_grid", False):
+        layer.marlin_decode6_fixed_grid = False
+        _scale6_stats["fixed_grid"] -= 1
+
+
+def _decode6_full_check(layer: torch.nn.Module) -> bool:
+    from muse_marlin6_gemv import (
+        _six_bit_codes,
+        decode_linear6,
+        is_gate_up_srans,
+        revert_gate_up_srans,
+    )
+
+    grid = getattr(layer, "marlin_decode6_fixed_grid", False)
+    grid_ok = grid
+    n, k = layer.output_size_per_partition, layer.input_size_per_partition
+    sms = torch.cuda.get_device_properties(layer.weight.device).multi_processor_count
+    tile_n = 128 if (n % 128 == 0 and (n // 128) * 4 > sms) else 64
+    codes = layer._marlin_decode_scales6
+    raw_codes = _six_bit_codes(layer) if is_gate_up_srans(codes) else codes
+    palette = layer._marlin_decode_palette
+    q = raw_codes.view(-1, 3).to(torch.int32)
+    idx = torch.stack(
+        (q[:, 0] & 63, (q[:, 0] >> 6) | ((q[:, 1] & 15) << 2),
+         (q[:, 1] >> 4) | ((q[:, 2] & 3) << 4), q[:, 2] >> 2),
+        1,
+    ).reshape(-1)
+    scales = palette[idx.long()].view(n // tile_n, k // 16, tile_n).transpose(0, 1).reshape(k // 16, n)
+    weight = layer._marlin_decode_weight.transpose(0, 1).reshape(k // 16, 2 * n)
+    if not (
+        torch.equal(scales, layer.weight_scale.view(torch.uint8).reshape(k // 16, n))
+        and torch.equal(weight.view(torch.int32), layer.weight.view(torch.int32))
+    ):
+        return False
+    gen = torch.Generator(device=layer.weight.device)
+    gen.manual_seed(n * 29 + k)
+    for i in range(3):
+        x = torch.randn(1, k, generator=gen, device=gen.device)
+        if i == 1:
+            x[:, ::3] *= 64
+        elif i == 2:
+            x *= torch.exp(torch.randn(k, generator=gen, device=gen.device) * 2)
+        x = x.to(torch.bfloat16)
+        got = decode_linear6(x, layer._marlin_decode_weight, raw_codes, palette,
+                             layer.weight_global_scale, layer.workspace, n, k)
+        ref = _marlin_fp4_single(x, layer.weight, layer.weight_scale, layer.weight_global_scale,
+                                 layer.workspace, n, k)
+        if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+            return False
+        if grid_ok:
+            try:
+                got = decode_linear6(x, layer._marlin_decode_weight, codes, palette,
+                                     layer.weight_global_scale, layer.workspace, n, k, True)
+                grid_ok = torch.equal(got.view(torch.int16), ref.view(torch.int16))
+            except (RuntimeError, ValueError) as e:
+                logger.warning("NVFP4 independent gate/up decode tiles check failed: %s", e)
+                grid_ok = False
+    if grid:
+        _lossless6["grid" if grid_ok else "grid_bad"] += 1
+        if not grid_ok:
+            revert_gate_up_srans(layer)
+            _drop_decode6_grid(layer)
+    _lossless6["scale_bytes"] += scales.numel()
+    _lossless6["weight_bytes"] += weight.numel() * weight.element_size()
+    return True
+
+
+def _admit_decode6(layer: torch.nn.Module, reference) -> None:
+    if not prepare_decode_layout6(layer, reference):
+        return
+    try:
+        ok = _decode6_full_check(layer)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("NVFP4 scale palette full check failed: %s", e)
+        ok = False
+    _lossless6["full" if ok else "bad"] += 1
+    if not ok:
+        _drop_decode6_grid(layer)
+        layer._buffers.pop("_marlin_decode_scales6", None)
+        layer._buffers.pop("_marlin_decode_palette", None)
+        _scale6_stats["admitted"] -= 1
+        _scale6_stats["kept"] += 1
+        return
+    if torch.cuda.get_device_capability(layer.weight.device) == (12, 0):
+        # Free redundant 8-bit tiled scales on 32 GB SM120; retain on SM121 for decode_placement.
+        layer._buffers.pop("_marlin_decode_scales", None)
+
+
 class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
     """NVFP4 weight-only GEMM via Marlin (W4A16)."""
 
@@ -812,7 +1277,7 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
                 from muse_marlin_gemv import decode_linear as _tiled_decode
 
                 try:
-                    prepare_decode_layout6(layer, _tiled_decode)
+                    _admit_decode6(layer, _tiled_decode)
                 except (RuntimeError, ValueError) as exc:
                     layer._buffers.pop("_marlin_decode_scales6", None)
                     layer._buffers.pop("_marlin_decode_palette", None)
@@ -826,10 +1291,19 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
     ) -> torch.Tensor:
         path = getattr(layer, "marlin_prompt_path", None)
         decode_weight = getattr(layer, "_marlin_decode_weight", None)
-        if bias is None and (path is not None or decode_weight is not None):
-            size_n = layer.output_size_per_partition
+        size_n = layer.output_size_per_partition
+        size_k = layer.input_size_per_partition
+        final_slab_shape = (
+            muse_final_slab is not None
+            and marlinw_down is not None
+            and (size_n, size_k) in (
+                (2 * marlinw_down.INNER, marlinw_down.COLUMNS),
+                (marlinw_down.COLUMNS, marlinw_down.INNER),
+            )
+        )
+        if bias is None and (path is not None or decode_weight is not None or final_slab_shape):
             args = (x.reshape(-1, x.shape[-1]), layer.weight, layer.weight_scale)
-            tail = (layer.weight_global_scale, layer.workspace, size_n, layer.input_size_per_partition)
+            tail = (layer.weight_global_scale, layer.workspace, size_n, size_k)
             palette = getattr(layer, "_marlin_decode_palette", None)
             scales = getattr(layer, "_marlin_decode_scales6", None) if palette is not None else None
             if scales is None:
@@ -838,6 +1312,26 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
             decode = (decode_weight, scales)
             fixed_grid = palette is not None and getattr(layer, "marlin_decode6_fixed_grid", False)
             if path is None:
+                if (
+                    x.dim() == 2
+                    and x.shape[0] == 1
+                    and x.dtype == torch.bfloat16
+                    and decode_weight is not None
+                    and scales is not None
+                    and not torch.compiler.is_compiling()
+                ):
+                    if palette is not None and _decode_linear6_direct is not None:
+                        return _decode_linear6_direct(
+                            x, decode_weight, scales, palette,
+                            layer.weight_global_scale, layer.workspace,
+                            size_n, layer.input_size_per_partition, fixed_grid,
+                        ).reshape(x.shape[:-1] + (size_n,))
+                    if palette is None and _decode_linear_direct is not None:
+                        return _decode_linear_direct(
+                            x, decode_weight, scales,
+                            layer.weight_global_scale, layer.workspace,
+                            size_n, layer.input_size_per_partition,
+                        ).reshape(x.shape[:-1] + (size_n,))
                 out = torch.ops.vllm.marlin_fp4_single_or_tiled(*args, *tail, *decode, palette, fixed_grid)
             elif path[0] == "wide":
                 out = torch.ops.vllm.marlin_fp4_wide(*args, *tail, *decode, path[1], *path[2], palette, fixed_grid)

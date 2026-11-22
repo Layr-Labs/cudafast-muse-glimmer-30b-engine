@@ -351,6 +351,13 @@ class InprocClient(EngineCoreClient):
 
     def abort_requests(self, request_ids: list[str]) -> None:
         try:
+            if (
+                not request_ids
+                and not self.engine_core.scheduler.has_requests()
+                and not self.engine_core.batch_queue
+            ):
+                self._hostfast_idle_if_finished()
+                return
             if len(request_ids) > 0:
                 self.engine_core.abort_requests(request_ids)
             # LLMEngine calls this after every output, including with an empty

@@ -400,7 +400,6 @@ def main() -> int:
     log("loading the model")
     backend = make_backend()
     log(f"model loaded once for this window ({backend.ident}, depth={backend.depth})")
-    # Ready means the timed phases may start: report it on a quiet host (settle.py).
     if isinstance(backend, VllmBackend):
         settle_and_log(log)
     session = Session(backend, spec_run=spec_run)

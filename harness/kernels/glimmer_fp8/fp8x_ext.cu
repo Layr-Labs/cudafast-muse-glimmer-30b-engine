@@ -65,9 +65,14 @@ struct Fp8Gemm {
     Gemm op;
     TORCH_CHECK(op.can_implement(args) == cutlass::Status::kSuccess, "fp8x: cannot implement");
     size_t ws = Gemm::get_workspace_size(args);
-    auto w = torch::empty({(int64_t)std::max<size_t>(ws, 1)}, a.options().dtype(at::kByte));
+    torch::Tensor w;
+    void* ws_ptr = nullptr;
+    if (ws > 0) {
+      w = torch::empty({static_cast<int64_t>(ws)}, a.options().dtype(at::kByte));
+      ws_ptr = w.data_ptr();
+    }
     auto stream = c10::cuda::getCurrentCUDAStream(a.get_device()).stream();
-    TORCH_CHECK(op.initialize(args, w.data_ptr(), stream) == cutlass::Status::kSuccess, "fp8x: init");
+    TORCH_CHECK(op.initialize(args, ws_ptr, stream) == cutlass::Status::kSuccess, "fp8x: init");
     TORCH_CHECK(op.run(stream) == cutlass::Status::kSuccess, "fp8x: run");
     return d;
   }

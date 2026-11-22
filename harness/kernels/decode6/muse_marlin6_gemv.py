@@ -84,6 +84,10 @@ def is_gate_up_srans(scales: torch.Tensor) -> bool:
     return scales.dim() == 2 and scales.shape[1] == 16 and scales.dtype == torch.uint8
 
 
+# Micro-attribution: 10-bit rANS entropy coding of the 64-entry NVFP4 gate/up block-scale palette
+# for fixed-grid decode is inspired by @kaankolcu (Yukon submission 1ee9c595) & @sambitcreate
+# (Yukon submission 98cd9fcd); the dual-architecture SM120/SM121 dispatch, pre-dequantized sh_pal16
+# fallback, and full lossless decode checks are custom-implemented here.
 def encode_gate_up_scales(tiled_scales: torch.Tensor, palette: torch.Tensor) -> torch.Tensor:
     """Tiled one-byte gate/up scales [312, 416, 128] and the layer's 64-byte palette -> the coded buffer
     (new tensor; raises ValueError if a stage block exceeds SRANS_CAP)."""
@@ -186,6 +190,29 @@ def pack_scales6(tiled_scales: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     return packed, palette
 
 
+_SMS_CACHE: dict[int, int] = {}
+_PARTIALS_CACHE: dict[tuple[int, int, int], torch.Tensor] = {}
+
+
+def _get_sms(device: torch.device) -> int:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    sms = _SMS_CACHE.get(idx)
+    if sms is None:
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        _SMS_CACHE[idx] = sms
+    return sms
+
+
+def _get_partials(device: torch.device, blocks: int, tile_n: int) -> torch.Tensor:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    key = (idx, blocks, tile_n)
+    buf = _PARTIALS_CACHE.get(key)
+    if buf is None:
+        buf = torch.empty((blocks, 16, tile_n), dtype=torch.float32, device=device)
+        _PARTIALS_CACHE[key] = buf
+    return buf
+
+
 def decode_linear6(
     x: torch.Tensor,
     tiled_weight: torch.Tensor,
@@ -204,24 +231,24 @@ def decode_linear6(
     if not x.is_contiguous() or x.data_ptr() % 16:
         x = x.clone(memory_format=torch.contiguous_format)
     output = x.new_empty((*x.shape[:-1], n))
-    blocks = 48
-    tile_n = 128 if n % 128 == 0 else 64
-    partials = x.new_empty((blocks, 16, tile_n), dtype=torch.float32)
+    blocks = _get_sms(x.device)
+    tile_n = 128 if (n % 128 == 0 and (n // 128) * 4 > blocks) else 64
+    partials = _get_partials(x.device, blocks, tile_n)
+    use_grid = fixed_grid and _gate_up is not None and blocks == 48 and x.numel() == k and (n, k) == (39936, 6656)
+    kernel = _gate_up if use_grid else _gemv6
+    if is_gate_up_srans(scales6):
+        # only the coded-scale kernel can read this scale form
+        if not use_grid or _gate_up_srans is None:
+            raise RuntimeError("rANS-coded gate/up scales outside the one-row fixed grid")
+        kernel = _gate_up_srans
     with torch.cuda.device(x.device):
-        use_grid = fixed_grid and _gate_up is not None and x.numel() == k and (n, k) == (39936, 6656)
-        kernel = _gate_up if use_grid else _gemv6
-        if is_gate_up_srans(scales6):
-            # only the coded-scale kernel can read this scale form
-            if not use_grid or _gate_up_srans is None:
-                raise RuntimeError("rANS-coded gate/up scales outside the one-row fixed grid")
-            kernel = _gate_up_srans
         status = kernel(
             x.data_ptr(), tiled_weight.data_ptr(), output.data_ptr(), partials.data_ptr(),
             scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(), n, k, blocks,
             x.device.index, torch.cuda.current_stream().cuda_stream,
         )
     if status:
-        raise RuntimeError(f"SM121 Marlin GEMV (scale6) launch failed with CUDA error {status}")
+        raise RuntimeError(f"Marlin GEMV (scale6) launch failed with CUDA error {status}")
     return output
 
 
@@ -369,7 +396,7 @@ def prepare_decode_layout6(layer: torch.nn.Module, reference) -> bool:
         del layer._marlin_decode_scales6, layer._marlin_decode_palette
         STATS["kept"] += 1
         return False
-    if _gate_up is not None and (layer.output_size_per_partition, k) == (39936, 6656):
+    if _gate_up is not None and _get_sms(layer.weight.device) == 48 and (layer.output_size_per_partition, k) == (39936, 6656):
         try:
             layer.marlin_decode6_fixed_grid = self_check6(layer, reference, fixed_grid=True)
         except (RuntimeError, ValueError) as exc:

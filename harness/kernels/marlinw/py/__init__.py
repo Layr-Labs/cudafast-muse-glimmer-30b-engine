@@ -42,7 +42,9 @@ _load_error: str | None = None
 _lock = threading.Lock()
 _ready: dict[int, int] = {}
 _plans: dict = {}
+_last_chunk_plans: dict = {}
 _scratch: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_retired: list[tuple[torch.Tensor, torch.Tensor]] = []
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -237,6 +239,58 @@ def plan(m: int, n: int, k: int, sms: int, smem: int) -> Plan | None:
     return p
 
 
+def plan_last_chunk(m: int, n: int, k: int, sms: int, smem: int) -> Plan | None:
+    """Work list for only the last 64-row chunk of an m-row wide prefill, mapped to chunk 0."""
+    launches = stock_launches(m, n, k, sms, smem)
+    if launches is None or len(launches) != 1:
+        return None
+    row0, rows, tmb, m8, cfg = launches[0]
+    if row0 != 0 or rows != m or tmb != _KERNEL_TMB or m8 or cfg != _KERNEL_CFG or m % 64 != 0:
+        return None
+    last_chunk = m // 64 - 1
+    full = []
+    split = []
+    for mine in stock_slices(rows, n, k, tmb, m8, cfg, sms):
+        for (par, col, k0, kn, idx, cnt) in mine:
+            if par != last_chunk:
+                continue
+            if cnt == 1:
+                full.append((0, col, 0, k0, kn))
+            else:
+                split.append((0, col, k0, kn, idx, cnt))
+    slot_of: dict = {}
+    for (chunk, col, *_rest) in sorted(split):
+        slot_of.setdefault((chunk, col), len(slot_of))
+    lists: list[list] = [[] for _ in range(sms)]
+    load = [0] * sms
+    full.sort()
+    for j, (_g, col, chunk, k0, kn) in enumerate(full):
+        b = j % sms
+        lists[b].append((chunk, col, k0, kn, 0, 1, 0))
+        load[b] += kn
+    tail: list[list] = [[] for _ in range(sms)]
+    for (chunk, col, k0, kn, idx, cnt) in sorted(split, key=lambda s: (-s[3], s[4], s[0], s[1])):
+        b = min(range(sms), key=lambda i: (load[i], i))
+        tail[b].append((chunk, col, k0, kn, idx, cnt, slot_of[(chunk, col)]))
+        load[b] += kn
+    for b in range(sms):
+        lists[b].extend(sorted(tail[b], key=lambda s: (s[4], s[0], s[1])))
+    items = []
+    ptr = [0]
+    for b in range(sms):
+        for (chunk, col, k0, kn, idx, cnt, slot) in lists[b]:
+            items.append((chunk, col, k0, kn, idx, cnt, slot, 0))
+        ptr.append(len(items))
+    p = Plan()
+    p.m, p.n, p.k, p.sms = m, n, k, sms
+    p.rows = 64
+    p.stock_rows = []
+    p.items, p.ptr, p.slots = items, ptr, len(slot_of)
+    p.max_load, p.min_load = max(load), min(load)
+    p.work = p.work_ptr = None
+    return p
+
+
 # ----------------------------------------------------------------- library
 
 
@@ -313,10 +367,37 @@ def _get_plan(m: int, n: int, k: int, device: torch.device):
     return p
 
 
+def get_last_chunk_plan(m: int, n: int, k: int, device: torch.device) -> Plan | None:
+    if not ENABLED:
+        return None
+    dev = _device_index(device)
+    key = (m, n, k, dev)
+    p = _last_chunk_plans.get(key)
+    if p is not None:
+        return p or None
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    smem = _init(dev)
+    if smem is None:
+        return None
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    with _lock:
+        p = plan_last_chunk(m, n, k, sms, smem)
+        if p is not None:
+            p.work = torch.tensor(p.items, dtype=torch.int32).reshape(-1).to(device)
+            p.work_ptr = torch.tensor(p.ptr, dtype=torch.int32).to(device)
+            _ensure_scratch(dev, device, max(p.slots, 1))
+        _last_chunk_plans[key] = p if p is not None else False
+    return p
+
+
 def _ensure_scratch(dev: int, device: torch.device, slots: int):
     cur = _scratch.get(dev)
     if cur is not None and cur[0].numel() >= slots:
         return
+    if cur is not None:
+        # A captured CUDA graph may hold the old buffers: never free them.
+        _retired.append(cur)
     locks = torch.zeros(slots, dtype=torch.int32, device=device)
     c_tmp = torch.empty(slots * 64 * 256, dtype=torch.float32, device=device)
     _scratch[dev] = (locks, c_tmp)
@@ -352,6 +433,26 @@ def gemm(x2: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
     for (r0, r1) in p.stock_rows:
         stock(x2[r0:r1], out[r0:r1])
     return out
+
+
+def gemm_last_chunk(
+    tile_64: torch.Tensor,
+    dest_64: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    p: Plan,
+) -> None:
+    dev = _device_index(tile_64.device)
+    locks, c_tmp = _scratch[dev]
+    rc = _lib.marlinw_gemm(
+        tile_64.data_ptr(), weight.data_ptr(), dest_64.data_ptr(), c_tmp.data_ptr(),
+        weight_scale.data_ptr(), global_scale.data_ptr(), p.rows, p.n, p.k, tile_64.stride(0),
+        locks.data_ptr(), p.work.data_ptr(), p.work_ptr.data_ptr(), p.sms, _ready[dev],
+        torch.cuda.current_stream(tile_64.device).cuda_stream,
+    )
+    if rc != 0:
+        raise RuntimeError(f"marlinw_gemm (last chunk) failed: {rc}")
 
 
 def prepare(layer) -> bool:

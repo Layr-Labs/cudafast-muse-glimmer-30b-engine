@@ -11,6 +11,7 @@ _INNER = 19968
 _ROWS = 512
 _library = None
 _sms = {}
+_scratch = {}
 _lock = threading.Lock()
 
 
@@ -31,10 +32,12 @@ def _load():
 
 def prepare(weight):
     """Return a column-major FP8 weight with alternating gate and up columns."""
+    cap = torch.cuda.get_device_capability(weight.device) if weight.is_cuda else (0, 0)
     if (not weight.is_cuda or weight.dtype != torch.float8_e4m3fn
             or tuple(weight.shape) != (_HIDDEN, 2 * _INNER)
             or weight.stride() != (1, _HIDDEN)
-            or torch.cuda.get_device_capability(weight.device) != (12, 1)):
+            or cap not in ((12, 0), (12, 1))
+            or (cap == (12, 0) and torch.cuda.get_device_properties(weight.device).total_memory < 48 * (1024**3))):
         return None
     device = weight.device.index
     with _lock, torch.cuda.device(device):
@@ -50,6 +53,8 @@ def prepare(weight):
             # stream may read the same completed, immutable BF16 SiLU table.
             stream.synchronize()
             _sms[device] = torch.cuda.get_device_properties(device).multi_processor_count
+        if device not in _scratch:
+            _scratch[device] = torch.empty(1 << 20, dtype=torch.uint8, device=weight.device)
     original = weight.t().view(torch.uint8)
     gate, up = original.split(_INNER)
     return torch.stack((gate, up), dim=1).reshape(2 * _INNER, _HIDDEN).view(weight.dtype).t()
@@ -66,8 +71,10 @@ def apply(a, b, scale_a, scale_b, down_scale):
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)
         out = a.new_empty((_ROWS, _INNER))
-        # A separate allocation per call follows the caller's capture/stream.
-        scratch = torch.empty(1 << 20, dtype=torch.uint8, device=a.device)
+        scratch = _scratch.get(device)
+        if scratch is None:
+            scratch = torch.empty(1 << 20, dtype=torch.uint8, device=a.device)
+            _scratch[device] = scratch
         status = _library.prefill(
             _ROWS, 2 * _INNER, _HIDDEN, a.data_ptr(), b.data_ptr(), scale_a.data_ptr(),
             scale_b.data_ptr(), down_scale.data_ptr(), out.data_ptr(), scratch.data_ptr(),

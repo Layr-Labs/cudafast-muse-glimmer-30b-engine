@@ -211,6 +211,9 @@ def _place_prefill_group(layers, run) -> dict | None:
     }
 
 
+# Micro-attribution: Timing 512-row NVFP4 MLP kernels across home and spare allocations on unified-memory
+# GB10 and swapping slow buffers after bitwise verification is inspired by @kaankolcu (Yukon submission 1ee9c595);
+# the SM120/SM121 capability gating and integration with the dual-architecture prefill pipeline are custom-implemented here.
 def place_prefill_weights(model: torch.nn.Module) -> None:
     """Move 512-row NVFP4 MLP weights that landed on slow device memory; never raises."""
     if not PREFILL_ENABLED or not torch.cuda.is_available():
@@ -231,6 +234,7 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             if (
                 not isinstance(weight, torch.nn.Parameter)
                 or not weight.is_cuda
+                or torch.cuda.get_device_capability(weight.device) != (12, 1)
                 or weight.dtype != torch.int32
                 or not weight.is_contiguous()
                 or weight.numel() * 4 < MIN_PAYLOAD_BYTES
@@ -312,6 +316,7 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             if (
                 weight is None
                 or not weight.is_cuda
+                or torch.cuda.get_device_capability(weight.device) != (12, 1)
                 or not weight.is_contiguous()
                 or weight.numel() * weight.element_size() < MIN_PAYLOAD_BYTES
                 or getattr(layer, "_marlin_decode_scales", None) is None

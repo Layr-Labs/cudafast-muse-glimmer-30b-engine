@@ -1144,7 +1144,8 @@ class MuseGlimmerMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (torch.compiler.is_compiling() and x.ndim == 2 and x.dtype == torch.bfloat16
                 and hasattr(self.gate_up_proj, "paired_fp8_swiglu_weight")
-                and getattr(self.down_proj, "marlin_swiglu_fp8_input", False)):
+                and (getattr(self.down_proj, "fp8_swiglu_down_input", False)
+                     or getattr(self.down_proj, "marlin_swiglu_fp8_input", False))):
             gate = self.gate_up_proj
             # Preserve the original producer-to-quantizer boundary on both arms.
             # Inductor can consume the full-precision normalized intermediate.
@@ -1899,10 +1900,36 @@ class MuseGlimmerForCausalLM(
             or self.perception_emb_norm is None
         ):
             raise ValueError("This MuseGlimmer checkpoint has no vision tower")
-        features = self.vision_encoder(pixel_groups)
-        features = self.vision_adapter(features)
-        features = self.vision_projection(features)
-        features = self.perception_emb_norm(features)
+        vision_mods = (
+            self.vision_encoder,
+            self.vision_adapter,
+            self.vision_projection,
+            self.perception_emb_norm,
+        )
+        first_param = next(self.vision_encoder.parameters(), None)
+        target_dev = (
+            pixel_groups[0].device
+            if pixel_groups
+            else torch.device("cuda", torch.cuda.current_device())
+        )
+        offloaded = (
+            first_param is not None
+            and first_param.device.type == "cpu"
+            and target_dev.type != "cpu"
+        )
+        if offloaded:
+            for mod in vision_mods:
+                mod.to(target_dev)
+        try:
+            features = self.vision_encoder(pixel_groups)
+            features = self.vision_adapter(features)
+            features = self.vision_projection(features)
+            features = self.perception_emb_norm(features)
+        finally:
+            if offloaded:
+                for mod in vision_mods:
+                    mod.to("cpu")
+                torch.cuda.empty_cache()
         if features.shape[0] != sum(feature_sizes):
             raise ValueError(
                 f"MuseGlimmer produced {features.shape[0]} vision features for "
@@ -1957,6 +1984,11 @@ class MuseGlimmerForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is None:
             return None
+        fn = getattr(self, "_lmpost_softcap_inplace", None)
+        if fn is not None and fn(
+            logits, self.output_multiplier, self.final_logit_softcapping
+        ):
+            return logits
         logits = logits * self.output_multiplier
         if self.final_logit_softcapping is not None:
             cap = self.final_logit_softcapping
@@ -1974,4 +2006,43 @@ class MuseGlimmerForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        if (
+            self.vision_encoder is not None
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).total_memory
+            < 48 * (1024**3)
+        ):
+            for m in (
+                self.vision_encoder,
+                self.vision_adapter,
+                self.vision_projection,
+                self.perception_emb_norm,
+            ):
+                if m is not None:
+                    m.to("cpu")
+            torch.cuda.empty_cache()
+        return loaded
+
+    def process_weights_after_loading(self) -> None:
+        try:
+            import lmpost
+        except ImportError:
+            lmpost = None
+        lm_head = getattr(self, "lm_head", None)
+        if (
+            lmpost is not None
+            and lm_head is not None
+            and hasattr(lm_head, "weight")
+            and lmpost.available(lm_head.weight.device)
+        ):
+            dev = lm_head.weight.device
+            lmpost._get_lut(dev, self.output_multiplier, self.final_logit_softcapping)
+            lmpost._get_scratch(dev)
+            self._lmpost_softcap_inplace = lmpost.softcap_inplace
+            self._lmpost_softcap_argmax = lmpost.softcap_argmax
+        else:
+            self._lmpost_softcap_inplace = None
+            self._lmpost_softcap_argmax = None

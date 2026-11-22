@@ -543,13 +543,25 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 packed = prepare_fp8_swiglu_weight(layer.weight)
                 if packed is not None:
                     layer.register_buffer("paired_fp8_swiglu_weight", packed, persistent=False)
+                    # Kept only after a bitwise check with the down
+                    # projection's input scale (nvfp4/marlin.py).
+                    from vllm.model_executor.kernels.linear.nvfp4.marlin import (
+                        offer_fp8_gate_up_swiglu,
+                    )
+
+                    offer_fp8_gate_up_swiglu(layer)
         if (getattr(layer, "input_size_per_partition", None) == 19968
                 and getattr(layer, "output_size_per_partition", None) == 6656
                 and getattr(layer, "tp_size", None) == 1
                 and getattr(layer, "input_is_parallel", False)
                 and layer.input_scale.dtype == torch.float32
                 and self.fp8_linear.input_quant_key() == kFp8StaticTensorSym):
-            layer.marlin_swiglu_fp8_input = True
+            layer.fp8_swiglu_down_input = True
+            # The fused FP8 activation is admitted per MLP after a bitwise check
+            # with this layer's input scale (nvfp4/marlin.py).
+            from vllm.model_executor.kernels.linear.nvfp4.marlin import offer_swiglu_fp8_down
+
+            offer_swiglu_fp8_down(layer)
 
     def apply(
         self,

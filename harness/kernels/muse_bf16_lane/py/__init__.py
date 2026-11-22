@@ -40,12 +40,11 @@ def _lib():
 
 def _launch(x, payload, index, n):
     out = x.new_empty((1, n))
-    with torch.cuda.device(x.device):
-        stream = torch.cuda.current_stream(x.device)
-        error = _lib().muse_bf16_lane_gemv(
-            1, n, x.data_ptr(), payload.data_ptr(), index.data_ptr(),
-            out.data_ptr(), stream.cuda_stream,
-        )
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+    error = _lib().muse_bf16_lane_gemv(
+        1, n, x.data_ptr(), payload.data_ptr(), index.data_ptr(),
+        out.data_ptr(), stream,
+    )
     if error:
         raise RuntimeError(f"muse_bf16_lane launch returned CUDA status {error}")
     return out
@@ -54,7 +53,7 @@ def _launch(x, payload, index, n):
 def _prepare(weight):
     if (weight.ndim != 2 or weight.shape[0] not in _ROWS or weight.shape[1] != _WIDTH
             or not weight.is_cuda or weight.dtype != torch.bfloat16 or not weight.is_contiguous()
-            or torch.cuda.get_device_capability(weight.device) != (12, 1)):
+            or torch.cuda.get_device_capability(weight.device) not in ((12, 0), (12, 1))):
         return None
     native = _lib()
     n, k = weight.shape

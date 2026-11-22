@@ -622,6 +622,24 @@ class EngineCore:
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
+    def _can_schedule_more(self) -> bool:
+        sched = self.scheduler
+        if not sched.has_requests():
+            return False
+        if getattr(sched, "waiting", None) or getattr(sched, "finished_req_ids", None):
+            return True
+        running = getattr(sched, "running", None)
+        if running is None:
+            return True
+        for r in running:
+            if not (
+                r.num_output_placeholders > 0
+                and r.num_computed_tokens + 2 - r.num_output_placeholders
+                >= r.num_prompt_tokens + r.max_tokens
+            ):
+                return True
+        return False
+
     def step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
@@ -649,7 +667,7 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        if self.scheduler.has_requests() and (not batch_queue or self._can_schedule_more()):
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
@@ -679,9 +697,7 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
-                if len(batch_queue) < self.batch_queue_size and (
-                    model_executed or self.scheduler.has_requests()
-                ):
+                if len(batch_queue) < self.batch_queue_size and self._can_schedule_more():
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
                     return None, model_executed

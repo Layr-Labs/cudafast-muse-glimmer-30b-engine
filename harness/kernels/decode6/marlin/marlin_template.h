@@ -645,25 +645,8 @@ __global__ void Marlin(
         b_gl_stride * (threadIdx.x / b_sh_stride) + (threadIdx.x % b_sh_stride);
   }
 
-#ifdef MUSE_GATE_UP_ILV
-  // Schedule-ordered gate/up layout (muse_marlin6_gemv.to_gate_up_ilv): the k-stage s of this CTA's slice
-  // is chunk ilv_base + 48 * s, so at every stage the 48 co-resident CTAs of a wave read 48 adjacent
-  // chunks; a chunk holds one stage (512 int4 of codes, 48 int4 of 6-bit scale codes). Every thread
-  // fetches the same bytes into the same shared slots at the same stage as with the tiled layout.
-  [[maybe_unused]] int ilv_base = 0;
-  if constexpr (gate_up_grid) {
-    ilv_base = blockIdx.x < 288 ? (blockIdx.x / 48) * 2496 + blockIdx.x % 48
-                                : 14976 + (blockIdx.x - 288);
-    b_gl_rd += b_gl_rd_delta_o * ilv_base;
-    b_gl_rd_delta_o *= 48;
-  } else {
-    b_gl_rd += b_sh_stride * tile_column_stride * slice_col;
-    b_gl_rd += b_gl_rd_delta_o * slice_row;
-  }
-#else
   b_gl_rd += b_sh_stride * tile_column_stride * slice_col;
   b_gl_rd += b_gl_rd_delta_o * slice_row;
-#endif
   auto b_sh_rd = threadIdx.x * b_thread_vecs;
   b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_wr_iters - 1));
 
@@ -687,12 +670,6 @@ __global__ void Marlin(
         // is 3/4 of s_sh_stage int4, stages in K order
         s_gl_rd = (3 * s_sh_stride * tile_column_stride / 4) * slice_col +
                   (3 * s_sh_stage / 4) * slice_row + threadIdx.x;
-  #ifdef MUSE_GATE_UP_ILV
-        if constexpr (gate_up_grid) {
-          s_gl_rd = (3 * s_sh_stage / 4) * ilv_base + threadIdx.x;
-          s_gl_rd_delta *= 48;
-        }
-  #endif
       } else {
         s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
                                  threadIdx.x / s_sh_stride) +
@@ -829,10 +806,9 @@ __global__ void Marlin(
                                           : (stages * s_sh_stage);
   int4* sh_s = sh_zp + (stages * zp_sh_stage);
   int4* sh_a = sh_s + sh_s_size;
-  // scale6: the 64-byte palette lives after the A stages (the launch reserves
-  // the device's opt-in shared memory, far more than the stages use).
-  [[maybe_unused]] uint8_t* sh_pal =
-      reinterpret_cast<uint8_t*>(sh_a + stages * a_sh_stage);
+#ifdef MUSE_SCALE_RANS
+  [[maybe_unused]] unsigned char* sh_pal =
+      reinterpret_cast<unsigned char*>(sh_a + stages * a_sh_stage);
   if constexpr (scale6) {
     static_assert(group_blocks == 1 && is_8bit_scale && !has_act_order &&
                       !has_zp && !is_a_8bit && thread_k_blocks == 8,
@@ -841,16 +817,15 @@ __global__ void Marlin(
     if (threadIdx.x < 4)
       reinterpret_cast<int4*>(sh_pal)[threadIdx.x] = scale6_palette[threadIdx.x];
   }
-#ifdef MUSE_SCALE_RANS
-  // rANS-coded block scales (fixed gate/up grid only; muse_marlin6_gemv.encode_gate_up_scales, gemv6_srans.cu).
+  // Micro-attribution: Compressing the 6-bit NVFP4 gate/up block scales into a 10-bit rANS stream
+  // decoded asynchronously one stage ahead into shared memory via cp.async.bulk + mbarrier is inspired
+  // by @kaankolcu (Yukon submission 1ee9c595) & @sambitcreate (Yukon submission 98cd9fcd); the dual-mode
+  // sh_pal16 BF16 palette path and SM120/SM121 adaptive dispatch remain custom-implemented here.
   // Global operands, carried in pointer arguments this configuration does not otherwise use:
   //   scales_ptr: per-CTA headers, RANS_HDR bytes each: u32 states[256] (warp-major), u32 off16[64]
   //               (block X >= 2 starts at var + 16 off16[X]; off16[iters] ends the last), block 0, block 1
   //   zp_ptr:     the variable region (blocks X >= 2 of every CTA)
   //   g_idx:      the layer's decode table, u32[1024]: symbol | freq << 6 | (slot - cum) << 17
-  // A block (one k-stage of the CTA's slice): u8 count[8] (16-bit words per warp), then the words of warp 0..7.
-  // Warp w decodes bytes 128 w + lane + 32 m (m = 0..3) of the stage's 1 KB raw scale block into the 8-bit
-  // scale slot of that stage; consumers then read raw scale bytes exactly as the uncompressed kernel does.
   static_assert(gate_up_grid && scale6, "rANS scales are built for the fixed gate/up grid only");
   constexpr int RANS_HDR = 3328, RANS_CAP = 1024;
   unsigned char* sh_rhdr = sh_pal + 64;
@@ -921,6 +896,25 @@ __global__ void Marlin(
       pos += __popc(msk);
     }
   };
+#else
+  // Micro-attribution: Packing 64 unique E4M3 group scales per layer into 6-bit palette indices
+  // (3 bytes per 4 scales) is inspired by @zereraz (Yukon submission cdefbb34); pre-dequantizing
+  // the 64-entry palette directly into BF16 shared memory (`sh_pal16[64]`) to eliminate per-step
+  // FP8->BF16 LOP3/PRMT conversion and the SM120/SM121 adaptive tile dispatch are custom-implemented here.
+  [[maybe_unused]] uint16_t* sh_pal16 =
+      reinterpret_cast<uint16_t*>(sh_a + stages * a_sh_stage);
+  if constexpr (scale6) {
+    static_assert(group_blocks == 1 && s_type == vllm::kFE4M3fn &&
+                      is_8bit_scale && !has_act_order && !has_zp &&
+                      !is_a_8bit && thread_k_blocks == 8,
+                  "scale6 is only built for the M = 1 NVFP4 decode config");
+    // visible to all threads at the __syncthreads of the first wait_for_stage
+    if (threadIdx.x < 64) {
+      uint32_t b = reinterpret_cast<const uint8_t*>(scale6_palette)[threadIdx.x];
+      sh_pal16[threadIdx.x] =
+          static_cast<uint16_t>(((b & 0x80u) << 7) | ((b & 0x7Fu) << 4));
+    }
+  }
 #endif
 
   // Register storage for double buffer of shared memory reads.
@@ -996,19 +990,6 @@ __global__ void Marlin(
       }
     }
   };
-#ifdef MUSE_B_EVICT_FIRST
-  // The weight and scale-code streams are read once: insert them in L2 as evict-first so they displace each
-  // other before any other resident line. Same bytes to the same shared slots; only the L2 policy differs.
-  uint64_t stream_policy;
-  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(stream_policy));
-  auto cp_async4_stream = [&](void* smem_ptr, const void* glob_ptr) {
-    const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(smem), "l"(glob_ptr),
-                 "l"(stream_policy));
-  };
-#else
-  auto cp_async4_stream = [&](void* smem_ptr, const void* glob_ptr) { cp_async4(smem_ptr, glob_ptr); };
-#endif
   // Asynchronously fetch the next A, B and s tile from global to the next
   // shared memory pipeline location.
   auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true) {
@@ -1016,7 +997,7 @@ __global__ void Marlin(
       int4* sh_a_stage = sh_a + a_sh_stage * pipe;
   #pragma unroll
       for (int i = 0; i < a_sh_wr_iters; i++) {
-        cp_async4_pred(
+        cp_async4_ca_pred(
             &sh_a_stage[a_sh_wr_trans[i]],
             &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
             a_sh_wr_pred[i]);
@@ -1029,7 +1010,7 @@ __global__ void Marlin(
             b_gl_rd + (i % count) * threads +
             b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
 
-        cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
+        cp_async4(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
       }
 
       b_gl_rd += b_gl_rd_delta_o;
@@ -1057,7 +1038,7 @@ __global__ void Marlin(
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
 #ifndef MUSE_SCALE_RANS
             if (s_sh_wr_pred) {
-              cp_async4_stream(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
+              cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
             }
 #endif
             s_gl_rd += scale6 ? (s_gl_rd_delta * s_tb_groups * 3) / 4
@@ -1192,15 +1173,15 @@ __global__ void Marlin(
             uint64_t v = static_cast<uint64_t>(cw[wi]) |
                          (static_cast<uint64_t>(cw[wi + 1]) << 32);
             v >>= (m & 1) * 16;
-            uint32_t lo = 0, hi = 0;
-  #pragma unroll
-            for (int j = 0; j < 4; j++) {
-              lo |= static_cast<uint32_t>(sh_pal[(v >> (6 * j)) & 63]) << (8 * j);
-              hi |= static_cast<uint32_t>(sh_pal[(v >> (6 * (j + 4))) & 63])
-                    << (8 * j);
-            }
-            reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
-                make_int2(static_cast<int>(lo), static_cast<int>(hi));
+            uint32_t* fs = reinterpret_cast<uint32_t*>(&frag_s[k % 2]);
+            fs[0] = static_cast<uint32_t>(sh_pal16[v & 63]) |
+                    (static_cast<uint32_t>(sh_pal16[(v >> 12) & 63]) << 16);
+            fs[1] = static_cast<uint32_t>(sh_pal16[(v >> 6) & 63]) |
+                    (static_cast<uint32_t>(sh_pal16[(v >> 18) & 63]) << 16);
+            fs[2] = static_cast<uint32_t>(sh_pal16[(v >> 24) & 63]) |
+                    (static_cast<uint32_t>(sh_pal16[(v >> 36) & 63]) << 16);
+            fs[3] = static_cast<uint32_t>(sh_pal16[(v >> 30) & 63]) |
+                    (static_cast<uint32_t>(sh_pal16[(v >> 42) & 63]) << 16);
 #endif
           } else {
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
@@ -1409,7 +1390,12 @@ __global__ void Marlin(
       }
     }
 
+#ifdef MUSE_SCALE_RANS
     if constexpr (s_type == vllm::kFE4M3fn || s_type == vllm::kFE8M0fnu) {
+#else
+    if constexpr (!(scale6 && s_type == vllm::kFE4M3fn) &&
+                  (s_type == vllm::kFE4M3fn || s_type == vllm::kFE8M0fnu)) {
+#endif
       int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
       int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
 
@@ -1796,14 +1782,16 @@ __global__ void Marlin(
       return;
     }
 
+    if (prob_m == 1 && (threadIdx.x & 3) != 0) {
+      return;
+    }
+
     if (!first) {
       float* frag_c_ptr = reinterpret_cast<float*>(&frag_c);
   #pragma unroll
       for (int k = 0; k < th_size; k += (m_block_size_8 ? 2 : 1)) {
-        sh_red[threadIdx.x] =
-            C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
-
-        float* sh_c_ptr = reinterpret_cast<float*>(&sh_red[threadIdx.x]);
+        int4 tmp = C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
+        const float* sh_c_ptr = reinterpret_cast<const float*>(&tmp);
   #pragma unroll
         for (int f = 0; f < 4; f++) {
           frag_c_ptr[k * 4 + f] += sh_c_ptr[f];

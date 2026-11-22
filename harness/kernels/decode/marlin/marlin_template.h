@@ -847,7 +847,7 @@ __global__ void Marlin(
       int4* sh_a_stage = sh_a + a_sh_stage * pipe;
   #pragma unroll
       for (int i = 0; i < a_sh_wr_iters; i++) {
-        cp_async4_pred(
+        cp_async4_ca_pred(
             &sh_a_stage[a_sh_wr_trans[i]],
             &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
             a_sh_wr_pred[i]);
@@ -1600,14 +1600,16 @@ __global__ void Marlin(
       return;
     }
 
+    if (prob_m == 1 && (threadIdx.x & 3) != 0) {
+      return;
+    }
+
     if (!first) {
       float* frag_c_ptr = reinterpret_cast<float*>(&frag_c);
   #pragma unroll
       for (int k = 0; k < th_size; k += (m_block_size_8 ? 2 : 1)) {
-        sh_red[threadIdx.x] =
-            C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
-
-        float* sh_c_ptr = reinterpret_cast<float*>(&sh_red[threadIdx.x]);
+        int4 tmp = C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
+        const float* sh_c_ptr = reinterpret_cast<const float*>(&tmp);
   #pragma unroll
         for (int f = 0; f < 4; f++) {
           frag_c_ptr[k * 4 + f] += sh_c_ptr[f];

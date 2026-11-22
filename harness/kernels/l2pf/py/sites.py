@@ -22,8 +22,7 @@ longest window. GEMMs whose weights exceed MAX_WEIGHT (the MLP) stream at full
 bandwidth once running, so they get a smaller head sized to the short window
 ahead of them: L2PF_MB_MLP_NORM ahead of a GEMM that follows a norm (gate_up),
 L2PF_MB_MLP_ACT ahead of one that follows another large GEMM's activation
-(down). ``L2PF_MLP=0`` skips them. (MLP heads: ArthurOstapenko's submission
-e8fa7600, commit af81404; the compressed FP8 skip below is ours, kept.)
+(down). ``L2PF_MLP=0`` skips them.
 ``marlin_descs`` (first tiles of each block's stripe) is kept for experiments;
 it is not used by the session.
 """
@@ -59,12 +58,6 @@ BLOCKS = int(os.environ.get("L2PF_BLOCKS", "1"))
 MLP = os.environ.get("L2PF_MLP", "1") != "0"
 BYTES_MLP_NORM = _env_bytes("L2PF_MB_MLP_NORM", (9 << 20) // 4)
 BYTES_MLP_ACT = _env_bytes("L2PF_MB_MLP_ACT", 1 << 19)
-
-# Compressed one-row projections measured with the same captured stream edges.
-_RANS_SKIP_PREFETCH = {
-    (6656, 4096, True),
-    (4608, 6656, False),
-}
 
 
 def available() -> bool:
@@ -326,7 +319,6 @@ class _Site:
     after_attn: bool
     descs: list = field(default_factory=list)
     off: int = 0
-    unassisted: bool = False
     mlp: str = ""  # "norm" / "act": a GEMM above MAX_WEIGHT after a norm / an activation
 
 
@@ -434,17 +426,7 @@ class Session:
                 site.mlp = "act" if prev_big else "norm"
                 site.descs = weight_descs(ws, mlp_budget(len(ws), prev_big))
             else:
-                nbytes = budget(wbytes, site.after_attn)
-                if kind == "musefp8":
-                    a, weight, packed, sa, sb = args
-                    k, n = weight.shape
-                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
-                            and a.is_contiguous() and 0 < packed.numel() != n * k):
-                        from vllm.model_executor.kernels.linear.scaled_mm.muse_fp8 import _scales_ok
-                        if _scales_ok(sa, sb, n):
-                            nbytes = 0
-                            site.unassisted = True
-                site.descs = weight_descs(ws, nbytes)
+                site.descs = weight_descs(ws, budget(wbytes, site.after_attn))
             if self.ranges is not None and not _inside(site.descs, self.ranges):
                 site.descs = []
         except Exception:  # noqa: BLE001 - a site without ranges is still a site
@@ -518,8 +500,6 @@ class Session:
         ng = sum(1 for s in self.sites if s.descs and s.mlp == "norm")
         nd = sum(1 for s in self.sites if s.descs and s.mlp == "act")
         mb = sum(sg * c for s in self.sites for _, _, sg, c in s.descs) / (1 << 20)
-        ua = sum(1 for s in self.sites if s.unassisted and s.after_attn)
-        ub = sum(1 for s in self.sites if s.unassisted and not s.after_attn)
         if ng or nd:
             big = (f"{ng + nd} MLP sites ({ng} after a norm at "
                    f"{BYTES_MLP_NORM / (1 << 20):.2f} MiB, {nd} after an activation at "
@@ -531,5 +511,4 @@ class Session:
                 f"{na} after attention at {BYTES_AFTER_ATTN / (1 << 20):.1f} MiB, "
                 f"{nb} others at {BYTES_OTHER / (1 << 20):.1f} MiB, "
                 f"weights above {MAX_WEIGHT / (1 << 20):.0f} MiB: {big}; "
-                f"{mb:.0f} MiB per step; compressed FP8 sites left without prefetch: "
-                f"{ua} output after attention, {ub} QKV")
+                f"{mb:.0f} MiB per step")

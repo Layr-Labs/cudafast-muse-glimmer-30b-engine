@@ -123,15 +123,13 @@ __global__ void __launch_bounds__(128) rans_enc_pass1(const uint8_t* __restrict_
   const int g = lane >> 2, t = lane & 3, S = K >> 5;
   const uint8_t* row = W + (size_t)(nb * 8 + g) * K;
   uint8_t* cntp = cnt + (size_t)nb * S * 4;
-  uint32_t states[NS], total = 0;
-#pragma unroll
-  for (int stream = 0; stream < NS; ++stream) states[stream] = RANS_L;
+  uint32_t xa = RANS_L, xb = RANS_L, total = 0;
   for (int s = S - 1; s >= 0; s--) {
     uint32_t b0 = *(const uint32_t*)(row + 32 * s + 4 * t), b1 = *(const uint32_t*)(row + 32 * s + 16 + 4 * t);
     uint32_t cb = 0, ws = 0;
 #pragma unroll
     for (int q = 3; q >= 0; q--) {
-      uint32_t& x = states[q % NS];
+      uint32_t& x = (NS == 2 && (q & 1)) ? xb : xa;
       RansEncSym e = tab[rans_pair(b0, b1, q)];
       bool emit = x > e.xmax_m1;
       uint32_t c = __popc(__ballot_sync(0xffffffffu, emit));
@@ -160,9 +158,7 @@ __global__ void __launch_bounds__(128) rans_enc_pass2(const uint8_t* __restrict_
   const int wrp = nb % tw;
   const uint32_t lbase = (uint32_t)coff16[nb] * 16u + 128u * NS;  // logical byte offset of the chunk's word region inside its warp stream
   uint32_t pos_end = twords[nb];                                    // u16 units
-  uint32_t states[NS];
-#pragma unroll
-  for (int stream = 0; stream < NS; ++stream) states[stream] = RANS_L;
+  uint32_t xa = RANS_L, xb = RANS_L;
   for (int s = S - 1; s >= 0; s--) {
     uint32_t b0 = *(const uint32_t*)(row + 32 * s + 4 * t), b1 = *(const uint32_t*)(row + 32 * s + 16 + 4 * t);
     const uint32_t cb = *(const uint32_t*)(cntp + 4 * s);
@@ -172,7 +168,7 @@ __global__ void __launch_bounds__(128) rans_enc_pass2(const uint8_t* __restrict_
     uint32_t posw = base_words + ws;
 #pragma unroll
     for (int q = 3; q >= 0; q--) {
-      uint32_t& x = states[q % NS];
+      uint32_t& x = (NS == 2 && (q & 1)) ? xb : xa;
       RansEncSym e = tab[rans_pair(b0, b1, q)];
       posw -= (cb >> (8 * q)) & 255u;
       bool emit = x > e.xmax_m1;
@@ -189,11 +185,8 @@ __global__ void __launch_bounds__(128) rans_enc_pass2(const uint8_t* __restrict_
     *(uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, wrp, lbase + 2u * row_start + 4u * lane)) = nw;
     pos_end = row_start;
   }
-#pragma unroll
-  for (int state = 0; state < NS; ++state) {
-    const uint32_t offset = lbase - 128u * NS + 128u * state + 4u * lane;
-    *(uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, wrp, offset)) = states[state];
-  }
+  *(uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, wrp, lbase - 128u * NS + 4u * lane)) = xa;
+  if (NS == 2) *(uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, wrp, lbase - 128u * NS + 128u + 4u * lane)) = xb;
 }
 
 // debug unpack: scalar reassembly, direct global reads
@@ -210,12 +203,8 @@ __global__ void __launch_bounds__(128) rans_unpack_kernel(const uint8_t* __restr
   const uint32_t lt = (1u << lane) - 1u;
   uint32_t P = 0;
   for (int nb = w; nb < NB; nb += tw) {
-    uint32_t states[NS];
-#pragma unroll
-    for (int state = 0; state < NS; ++state) {
-      const uint32_t offset = P + 128u * state + 4u * lane;
-      states[state] = *(const uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, w, offset));
-    }
+    uint32_t xa = *(const uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, w, P + 4u * lane));
+    uint32_t xb = (NS == 2) ? *(const uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, w, P + 128u + 4u * lane)) : 0u;
     uint32_t pos = P + 128u * NS;
     uint8_t* orow = out + (size_t)(nb * 8 + g) * K;
     for (int s = 0; s < S; s++) {
@@ -223,9 +212,13 @@ __global__ void __launch_bounds__(128) rans_unpack_kernel(const uint8_t* __restr
       const uint32_t nw = *(const uint32_t*)(stream + rans_phys(woff16, tw, gmin, ilv, w, pos + 4u * lane));
       pos += 128u;
       uint32_t ex[8];
+      // Micro-attribution: Decoding pairs of 4-bit E4M3 exponents from a 12-bit table-driven rANS state
+      // while keeping raw sign|mantissa nibbles inline is inspired by @zereraz (Yukon submission cdefbb34);
+      // the surrounding dual-architecture SM120/SM121 admission pipeline and zero-VRAM prefill integration
+      // are custom-implemented here.
 #pragma unroll
       for (int q = 0; q < 4; q++) {
-        uint32_t& x = states[q % NS];
+        uint32_t& x = (NS == 2 && (q & 1)) ? xb : xa;
         uint32_t e = lut_s[x & 4095u];
         uint32_t xh = x >> 12;
         x = ((e >> 8) & 4095u) * xh + xh + (e >> 20);
@@ -242,10 +235,7 @@ __global__ void __launch_bounds__(128) rans_unpack_kernel(const uint8_t* __restr
       }
     }
     pos = (pos + 3u) & ~3u;
-    bool bad_state = false;
-#pragma unroll
-    for (int state = 0; state < NS; ++state) bad_state |= states[state] != RANS_L;
-    if (__any_sync(0xffffffffu, bad_state) && lane == 0) atomicAdd(status, 1);
+    if ((xa != RANS_L || (NS == 2 && xb != RANS_L)) && lane == 0) atomicAdd(status, 1);
     P = (pos + 15u) & ~15u;
   }
 }
@@ -310,12 +300,8 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
     while (issued <= (int)(P >> GBS) + (RG - 1)) RANS_ISSUE();
     rans_cp_wait<RG - 2>();
     __syncwarp();
-    uint32_t states[NS];
-#pragma unroll
-    for (int state = 0; state < NS; ++state) {
-      const uint32_t offset = P + 128u * state + 4u * lane;
-      states[state] = rans_lds32(ring_s | (offset & (RB - 1u)));
-    }
+    uint32_t xa = rans_lds32(ring_s | ((P + (uint32_t)lane * 4u) & (RB - 1u)));
+    uint32_t xb = (NS == 2) ? rans_lds32(ring_s | ((P + 128u + (uint32_t)lane * 4u) & (RB - 1u))) : 0u;
     const uint32_t wb = P + 128u * NS;
     uint32_t pwb = wb;  // byte position (logical, within the warp stream) of the next unread byte
     float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
@@ -331,7 +317,7 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
       uint32_t Pw = 0;
 #pragma unroll
       for (int q = 0; q < 4; q++) {
-        uint32_t& x = states[q % NS];
+        uint32_t& x = (NS == 2 && (q & 1)) ? xb : xa;
         uint32_t e = ((uint32_t*)lut_s)[x & 4095u];
         uint32_t xh = x >> 12;
         x = ((e >> 8) & 4095u) * xh + xh + (e >> 20);
@@ -384,11 +370,7 @@ static RansCfg rans_pick_cfg(int N, int K) {
   for (int wcap = 18; wcap >= 1; wcap--) {
     const int R = (NB + 48 * wcap - 1) / (48 * wcap);
     const int tw = (NB + R - 1) / R, wpb = (tw + 47) / 48;
-    if (rans_fits(K, wpb, 9, 4)) {
-      // Real checkpoint rings support four states for the 6656x19968 down projection.
-      const int states = (N == 6656 && K == 19968) ? 4 : 2;
-      return RansCfg{tw, wpb, states, 4, 9};
-    }
+    if (rans_fits(K, wpb, 9, 4)) return RansCfg{tw, wpb, 2, 4, 9};
   }
   return RansCfg{NB, 1, 2, 4, 9};  // K too large for the smem staging of x: the launch check reports it
 }
@@ -416,7 +398,7 @@ torch::Tensor rans_pack_cfg(torch::Tensor W, int64_t tw, int64_t ns, int64_t ilv
   TORCH_CHECK(W.is_cuda() && W.scalar_type() == torch::kUInt8 && W.dim() == 2 && W.is_contiguous(), "W must be a contiguous uint8 cuda [N,K] tensor");
   const int N = (int)W.size(0), K = (int)W.size(1);
   TORCH_CHECK(N % 8 == 0 && K % 64 == 0, "need N%8==0 and K%64==0");
-  TORCH_CHECK(ns == 1 || ns == 2 || ns == 4);
+  TORCH_CHECK(ns == 1 || ns == 2);
   TORCH_CHECK(ilv == 0 || ilv == 9, "ilv must be 0 or 9");
   const int NB = N / 8, S = K / 32;
   auto st = c10::cuda::getCurrentCUDAStream();
@@ -444,8 +426,7 @@ torch::Tensor rans_pack_cfg(torch::Tensor W, int64_t tw, int64_t ns, int64_t ilv
   auto cnt = torch::empty({(int64_t)NB * S * 4}, dev_u8);
   auto twords_d = torch::empty({NB}, W.options().dtype(torch::kInt32));
   const int blocks = (NB + 3) / 4;
-  if (ns == 4) rans_enc_pass1<4><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (uint8_t*)cnt.data_ptr(), (uint32_t*)twords_d.data_ptr());
-  else if (ns == 2) rans_enc_pass1<2><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (uint8_t*)cnt.data_ptr(), (uint32_t*)twords_d.data_ptr());
+  if (ns == 2) rans_enc_pass1<2><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (uint8_t*)cnt.data_ptr(), (uint32_t*)twords_d.data_ptr());
   else rans_enc_pass1<1><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (uint8_t*)cnt.data_ptr(), (uint32_t*)twords_d.data_ptr());
   auto twords_h = twords_d.cpu();
   const int32_t* tw_words = (const int32_t*)twords_h.data_ptr();
@@ -478,7 +459,7 @@ torch::Tensor rans_pack_cfg(torch::Tensor W, int64_t tw, int64_t ns, int64_t ilv
   auto blob = torch::zeros({(int64_t)total}, dev_u8);
   uint8_t* base = (uint8_t*)blob.data_ptr();
   uint32_t hdr[64] = {0};
-  hdr[0] = 0x534E5241u; hdr[1] = ns == 4 ? 6 : 4; hdr[2] = N; hdr[3] = K; hdr[4] = (uint32_t)tw; hdr[5] = (uint32_t)ns; hdr[6] = NB; hdr[7] = (uint32_t)ilv;
+  hdr[0] = 0x534E5241u; hdr[1] = 4; hdr[2] = N; hdr[3] = K; hdr[4] = (uint32_t)tw; hdr[5] = (uint32_t)ns; hdr[6] = NB; hdr[7] = (uint32_t)ilv;
   hdr[8] = (uint32_t)RANS_HDR_BYTES; hdr[9] = (uint32_t)rans_woff_off(); hdr[10] = (uint32_t)soff; hdr[11] = (uint32_t)stream_bytes; hdr[12] = (uint32_t)(total & 0xffffffffu); hdr[13] = (uint32_t)(total >> 32); hdr[14] = (uint32_t)gmin;
   cudaMemcpyAsync(base, hdr, sizeof(hdr), cudaMemcpyHostToDevice, st);
   cudaMemcpyAsync(base + RANS_HDR_BYTES, lut.data(), RANS_LUT_BYTES, cudaMemcpyHostToDevice, st);
@@ -487,8 +468,7 @@ torch::Tensor rans_pack_cfg(torch::Tensor W, int64_t tw, int64_t ns, int64_t ilv
   cudaMemcpyAsync(coff_d.data_ptr(), coff16.data(), (size_t)NB * sizeof(int32_t), cudaMemcpyHostToDevice, st);
   cudaStreamSynchronize(st);
   const int* woff_dev = (const int*)(base + rans_woff_off());
-  if (ns == 4) rans_enc_pass2<4><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (const uint8_t*)cnt.data_ptr(), (const uint32_t*)twords_d.data_ptr(), (const int*)coff_d.data_ptr(), woff_dev, (int)tw, (int)gmin, (int)ilv, base + soff);
-  else if (ns == 2) rans_enc_pass2<2><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (const uint8_t*)cnt.data_ptr(), (const uint32_t*)twords_d.data_ptr(), (const int*)coff_d.data_ptr(), woff_dev, (int)tw, (int)gmin, (int)ilv, base + soff);
+  if (ns == 2) rans_enc_pass2<2><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (const uint8_t*)cnt.data_ptr(), (const uint32_t*)twords_d.data_ptr(), (const int*)coff_d.data_ptr(), woff_dev, (int)tw, (int)gmin, (int)ilv, base + soff);
   else rans_enc_pass2<1><<<blocks, 128, 0, st>>>((const uint8_t*)W.data_ptr(), NB, K, (const RansEncSym*)tab_d.data_ptr(), (const uint8_t*)cnt.data_ptr(), (const uint32_t*)twords_d.data_ptr(), (const int*)coff_d.data_ptr(), woff_dev, (int)tw, (int)gmin, (int)ilv, base + soff);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   cudaStreamSynchronize(st);
@@ -505,7 +485,6 @@ std::vector<int64_t> rans_blob_info(torch::Tensor blob) {
   auto h = blob.narrow(0, 0, 256).cpu();
   const uint32_t* p = (const uint32_t*)h.data_ptr();
   TORCH_CHECK(p[0] == 0x534E5241u, "bad blob magic");
-  TORCH_CHECK((p[1] == 4 && (p[5] == 1 || p[5] == 2)) || (p[1] == 6 && p[5] == 4), "bad rANS stream format");
   return {(int64_t)p[2], (int64_t)p[3], (int64_t)p[4], (int64_t)p[5], (int64_t)(((uint64_t)p[13] << 32) | p[12]), (int64_t)p[7], (int64_t)p[14]};
 }
 
@@ -518,8 +497,7 @@ torch::Tensor rans_unpack(torch::Tensor blob, int64_t N, int64_t K) {
   const uint8_t* b = (const uint8_t*)blob.data_ptr();
   auto st = c10::cuda::getCurrentCUDAStream();
   const int NB = (int)(N / 8);
-  if (ns == 4) rans_unpack_kernel<4><<<(tw + 3) / 4, 128, 0, st>>>(b + rans_stream_off(tw), (const int*)(b + rans_woff_off()), (const uint32_t*)(b + RANS_HDR_BYTES), (uint8_t*)out.data_ptr(), NB, (int)K, tw, gmin, ilv, (int*)status.data_ptr());
-  else if (ns == 2) rans_unpack_kernel<2><<<(tw + 3) / 4, 128, 0, st>>>(b + rans_stream_off(tw), (const int*)(b + rans_woff_off()), (const uint32_t*)(b + RANS_HDR_BYTES), (uint8_t*)out.data_ptr(), NB, (int)K, tw, gmin, ilv, (int*)status.data_ptr());
+  if (ns == 2) rans_unpack_kernel<2><<<(tw + 3) / 4, 128, 0, st>>>(b + rans_stream_off(tw), (const int*)(b + rans_woff_off()), (const uint32_t*)(b + RANS_HDR_BYTES), (uint8_t*)out.data_ptr(), NB, (int)K, tw, gmin, ilv, (int*)status.data_ptr());
   else rans_unpack_kernel<1><<<(tw + 3) / 4, 128, 0, st>>>(b + rans_stream_off(tw), (const int*)(b + rans_woff_off()), (const uint32_t*)(b + RANS_HDR_BYTES), (uint8_t*)out.data_ptr(), NB, (int)K, tw, gmin, ilv, (int*)status.data_ptr());
   TORCH_CHECK(status.item<int>() == 0, "rans unpack: final states mismatch (corrupt blob)");
   return out;
@@ -532,7 +510,7 @@ static void rans_set_attrs_once() {
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   cudaThreadExchangeStreamCaptureMode(&mode);
 #define RANS_PREP(NSV, RGV) cudaFuncSetAttribute(rans_gemv_kernel<NSV, 9, RGV>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
-  RANS_PREP(1, 4) RANS_PREP(1, 8) RANS_PREP(2, 4) RANS_PREP(2, 8) RANS_PREP(4, 4) RANS_PREP(4, 8)
+  RANS_PREP(1, 4) RANS_PREP(1, 8) RANS_PREP(2, 4) RANS_PREP(2, 8)
 #undef RANS_PREP
   cudaThreadExchangeStreamCaptureMode(&mode);
   done = true;
@@ -551,14 +529,14 @@ static void rans_launch(const uint8_t* blob, int tw, int ns, int wpb, int rg, in
   RansProb pb;
   pb.hdr = blob; pb.stream = blob + rans_stream_off(tw); pb.woff16 = (const int*)(blob + rans_woff_off()); pb.lut = (const uint32_t*)(blob + RANS_HDR_BYTES);
   pb.x = x; pb.sb = sb; pb.sb_scalar = sb_scalar; pb.sa = sa; pb.out = out; pb.N = N; pb.K = K; pb.tw = tw; pb.ilv = ilv;
-  TORCH_CHECK(tw >= 1 && tw <= N / 8 && wpb >= 1 && wpb <= 32 && (ns == 1 || ns == 2 || ns == 4) && (rg == 4 || rg == 8) && (ilv == 0 || ilv == 9), "bad launch config");
+  TORCH_CHECK(tw >= 1 && tw <= N / 8 && wpb >= 1 && wpb <= 32 && (ns == 1 || ns == 2) && (rg == 4 || rg == 8) && (ilv == 0 || ilv == 9), "bad launch config");
   const int blocks = (tw + wpb - 1) / wpb;
   const size_t dsmem = rans_dsmem(K, wpb, 9, rg);
   TORCH_CHECK(rans_fits(K, wpb, 9, rg), "rans smem too large (K too large for smem staging of x): ", dsmem);
   rans_set_attrs_once();
 #define RANS_L2(NSV, RGV) \
   if (ns == NSV && rg == RGV) rans_gemv_kernel<NSV, 9, RGV><<<blocks, wpb * 32, dsmem, st>>>(pb);
-  RANS_L2(1, 4) RANS_L2(1, 8) RANS_L2(2, 4) RANS_L2(2, 8) RANS_L2(4, 4) RANS_L2(4, 8)
+  RANS_L2(1, 4) RANS_L2(1, 8) RANS_L2(2, 4) RANS_L2(2, 8)
 #undef RANS_L2
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

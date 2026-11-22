@@ -434,14 +434,28 @@ def _is_empty_allocation_node(node: fx.Node) -> bool:
     )
 
 
+def _is_view_only_node(node: fx.Node) -> bool:
+    if node.op != "call_function":
+        return False
+    target = node.target
+    return target in (
+        torch.ops.aten.view.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.sym_size.int,
+    )
+
+
 def _merge_empty_only_subgraphs(
     node_to_subgraph_id: dict[fx.Node, int],
     split_op_graphs: list[int],
 ) -> None:
     """
     Merge a partition that only contains an empty allocation op into the
-    previous partition. This avoids generating standalone empty submodules,
-    which can lead to empty cudagraph captures.
+    previous partition, and merge a partition containing only view/reshape ops
+    into the next non-splitting partition when no intermediate splitting op
+    consumes it. This avoids generating standalone empty submodules, which can
+    lead to empty cudagraph captures.
     """
 
     nodes_by_subgraph_id: dict[int, list[fx.Node]] = defaultdict(list)
@@ -471,6 +485,31 @@ def _merge_empty_only_subgraphs(
             ):
                 node_to_subgraph_id[empty_node] = prev_non_splitting_subgraph_id
                 merged = True
+
+        if not merged and is_non_splitting_subgraph and all(_is_view_only_node(n) for n in nodes):
+            next_non_splitting_subgraph_id = next(
+                (
+                    nid
+                    for nid in range(subgraph_id + 1, max_subgraph_id + 1)
+                    if nid not in splitting_subgraphs and nodes_by_subgraph_id.get(nid)
+                ),
+                None,
+            )
+            if next_non_splitting_subgraph_id is not None:
+                node_set = set(nodes)
+                can_move_forward = all(
+                    user in node_set
+                    or user.op == "output"
+                    or node_to_subgraph_id[user] >= next_non_splitting_subgraph_id
+                    for n in nodes
+                    for user in n.users
+                )
+                if can_move_forward:
+                    for n in nodes:
+                        node_to_subgraph_id[n] = next_non_splitting_subgraph_id
+                    nodes_by_subgraph_id[next_non_splitting_subgraph_id].extend(nodes)
+                    nodes_by_subgraph_id[subgraph_id] = []
+                    merged = True
 
         if not merged and is_non_splitting_subgraph:
             prev_non_splitting_subgraph_id = subgraph_id
