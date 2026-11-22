@@ -14,7 +14,8 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 STATS = {"admitted": 0, "kept": 0, "fixed_grid": 0, "gate_up_srans": 0, "gate_up_srans_rejected": 0,
-         "srans_scales": 0, "srans_bytes": 0, "logged": False}
+         "srans_scales": 0, "srans_bytes": 0, "down_srans": 0, "down_srans_rejected": 0, "down_srans_scales": 0,
+         "down_srans_bytes": 0, "logged": False}
 
 _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_marlin6.so")))
 _gemv6 = _lib.muse_marlin6_gemv
@@ -29,9 +30,15 @@ _gate_up_srans = getattr(_lib, "muse_marlin6_gate_up_srans", None)
 if _gate_up_srans is not None:
     _gate_up_srans.argtypes = _gemv6.argtypes
     _gate_up_srans.restype = ctypes.c_int
+# The 48-CTA stream-K down projection reading rANS-coded block scales (gemv6_srans_down.cu).
+_down_srans = getattr(_lib, "muse_marlin6_down_srans", None)
+if _down_srans is not None:
+    _down_srans.argtypes = _gemv6.argtypes
+    _down_srans.restype = ctypes.c_int
 
 
 GATE_UP_N, GATE_UP_K = 39936, 6656
+DOWN_N, DOWN_K = 6656, 19968
 
 # ---------------------------------------------------------------- rANS-coded gate/up block scales
 # Symbols: the layer's palette indices of the tiled one-byte scales. One table per layer (10-bit probabilities),
@@ -159,6 +166,85 @@ def encode_gate_up_scales(tiled_scales: torch.Tensor, palette: torch.Tensor) -> 
     return coded.view(-1, 16)
 
 
+# ---------------------------------------------------------------- rANS-coded down-projection block scales
+# The same symbols, table, lanes and block format as the gate/up stream, for the 48-CTA stream-K down projection
+# (6656 x 19968; gemv6_srans_down.cu). Stage blocks in tile-major order (column tile t, k-stage s -> 156 t + s:
+# 52 x 156 = 8,112 = 48 x 169); CTA b decodes blocks 169 b .. 169 b + 168 in order across its column slices.
+# Buffer (uint8, rows of 16 bytes):
+#   [decode table: u32[1024]]
+#   [48 headers of 3,840 bytes: u32 states[256] (warp-major), u32 offsets[192] (block X >= 2 at the stage-block
+#    region + 16 * offsets[X], offsets[169] ends the last), block 0 and block 1, each padded to 1 KB]
+#   [stage blocks X >= 2 of every CTA in CTA order]
+SRANS_DOWN_HDR, SRANS_DOWN_CTAS, SRANS_DOWN_ITERS = 3840, 48, 169
+
+
+def encode_down_scales(tiled_scales: torch.Tensor, palette: torch.Tensor) -> torch.Tensor:
+    """Tiled one-byte down-projection scales [52, 1248, 128] and the layer's 64-byte palette -> the coded buffer
+    (new tensor; raises ValueError if a stage block exceeds SRANS_CAP)."""
+    dev = tiled_scales.device
+    G, iters = SRANS_DOWN_CTAS, SRANS_DOWN_ITERS
+    raw = tiled_scales.contiguous().view(torch.uint8).reshape(G * iters, 1024)
+    vals = torch.unique(raw)
+    inv = torch.full((256,), -1, dtype=torch.long, device=dev)
+    pal = palette.long()
+    if not torch.equal(pal[:vals.numel()], vals.long()):
+        raise ValueError("palette does not list the scale bytes in order")
+    inv[pal[:vals.numel()]] = torch.arange(vals.numel(), device=dev)
+    sym = inv[raw.long()]
+    f, cum, lut = _srans_table(torch.bincount(sym.reshape(-1), minlength=64))
+    F, C = f.to(dev), cum.to(dev)
+    steps = iters * 4
+    seq = sym.view(G, iters, 8, 4, 32).permute(0, 2, 4, 1, 3).reshape(G, 8, 32, steps)
+    x = torch.full((G, 8, 32), SRANS_L, dtype=torch.long, device=dev)
+    emit = torch.empty((G, 8, 32, steps), dtype=torch.bool, device=dev)
+    words = torch.empty((G, 8, 32, steps), dtype=torch.long, device=dev)
+    for st in range(steps - 1, -1, -1):
+        sy = seq[..., st]
+        fs, cs = F[sy], C[sy]
+        e = x >= (fs << 22)
+        emit[..., st] = e
+        words[..., st] = x & 0xFFFF
+        x = torch.where(e, x >> 16, x)
+        x = ((x // fs) << SRANS_M_BITS) + (x % fs) + cs
+    E = emit.view(G, 8, 32, iters, 4).permute(0, 3, 1, 4, 2).reshape(G, iters, 1024)
+    Wd = words.view(G, 8, 32, iters, 4).permute(0, 3, 1, 4, 2).reshape(G, iters, 1024)
+    cw = E.view(G, iters, 8, 128).sum(-1)
+    padded = ((4 + cw.sum(-1) + 7) // 8) * 8  # 16-bit words, whole 16-byte rows
+    if int(padded.max()) * 2 > SRANS_CAP:
+        raise ValueError("a stage block exceeds the decode slot")
+
+    def put(dest, starts, Eb, Wb, cb):
+        dest[starts[:, None] + torch.arange(4, device=dev)] = (cb[:, 0::2] | (cb[:, 1::2] << 8)).int()
+        pos = starts[:, None] + 4 + torch.cumsum(Eb.long(), 1) - 1
+        dest[pos[Eb]] = Wb[Eb].int()
+
+    flat = padded[:, 2:].reshape(-1)
+    st = (torch.cumsum(flat, 0) - flat).view(G, iters - 2)
+    hw = SRANS_DOWN_HDR // 2
+    hdr = torch.zeros((G, hw), dtype=torch.int32, device=dev)
+    var = torch.zeros(int(flat.sum()), dtype=torch.int32, device=dev)
+    put(var, st.reshape(-1), E[:, 2:].reshape(-1, 1024), Wd[:, 2:].reshape(-1, 1024), cw[:, 2:].reshape(-1, 8))
+    hs = torch.arange(G, device=dev)[:, None] * hw + 896 + 512 * torch.arange(2, device=dev)[None, :]
+    put(hdr.view(-1), hs.reshape(-1), E[:, :2].reshape(-1, 1024), Wd[:, :2].reshape(-1, 1024),
+        cw[:, :2].reshape(-1, 8))
+    states = x.reshape(G, 256)
+    hdr[:, 0:512:2] = (states & 0xFFFF).int()
+    hdr[:, 1:512:2] = (states >> 16).int()
+    offs = torch.zeros((G, 192), dtype=torch.long, device=dev)
+    offs[:, 2:iters] = st // 8
+    offs[:, iters] = (st[:, -1] + padded[:, -1]) // 8
+    hdr[:, 512:896:2] = (offs & 0xFFFF).int()
+    hdr[:, 513:896:2] = (offs >> 16).int()
+
+    def u16(v):
+        v = v & 0xFFFF
+        return torch.where(v >= 32768, v - 65536, v).to(torch.int16).contiguous().view(torch.uint8)
+
+    lut8 = lut.to(dev).to(torch.int32).contiguous().view(torch.uint8)
+    coded = torch.cat((lut8, u16(hdr.reshape(-1)), u16(var)))
+    return coded.view(-1, 16)
+
+
 def pack_scales6(tiled_scales: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
     """[n/tile_n, k/16, tile_n] one-byte scales (any 1-byte dtype) -> (codes uint8 [3/4 bytes], palette uint8 [64]),
     or None when the layer has more than 64 distinct scale bytes. The code of byte b of the flat tensor sits at bits
@@ -210,7 +296,12 @@ def decode_linear6(
     with torch.cuda.device(x.device):
         use_grid = fixed_grid and _gate_up is not None and x.numel() == k and (n, k) == (39936, 6656)
         kernel = _gate_up if use_grid else _gemv6
-        if is_gate_up_srans(scales6):
+        if is_gate_up_srans(scales6) and (n, k) == (DOWN_N, DOWN_K):
+            # only the stream-K coded-scale kernel can read this scale form
+            if fixed_grid or x.numel() != k or _down_srans is None:
+                raise RuntimeError("rANS-coded down scales outside the one-row 48-CTA GEMV")
+            kernel = _down_srans
+        elif is_gate_up_srans(scales6):
             # only the coded-scale kernel can read this scale form
             if not use_grid or _gate_up_srans is None:
                 raise RuntimeError("rANS-coded gate/up scales outside the one-row fixed grid")
@@ -351,6 +442,107 @@ def admit_gate_up_srans(layer: torch.nn.Module) -> bool:
     return True
 
 
+def _down_probes(layer: torch.nn.Module) -> list[torch.Tensor]:
+    """One-row activations for the coded down-scale admission: the gate/up probe recipe (cancelling entries at three
+    magnitudes, two Gaussian rows) plus a heavy-tailed row shaped like a SwiGLU output, all BF16."""
+    k, dev = layer.input_size_per_partition, layer.weight.device
+    gen = torch.Generator(device=dev)
+    gen.manual_seed(DOWN_N * 7 + k + 1)
+    out = []
+    for mag in (0.01, 1.0, 64.0):
+        x = torch.randn(1, k, generator=gen, device=dev) * mag
+        x[:, ::3] *= 64
+        x[:, 1::2] = -x[:, ::2]
+        out.append(x.to(torch.bfloat16))
+    for mag in (0.5, 4.0):
+        out.append((torch.randn(1, k, generator=gen, device=dev) * mag).to(torch.bfloat16))
+    g = torch.randn(1, k, generator=gen, device=dev) * 2
+    out.append((g * torch.sigmoid(g) * torch.randn(1, k, generator=gen, device=dev)).to(torch.bfloat16))
+    return out
+
+
+def _down_outputs(layer, scales, probes) -> list[torch.Tensor]:
+    n, k = layer.output_size_per_partition, layer.input_size_per_partition
+    return [decode_linear6(x, layer._marlin_decode_weight, scales, layer._marlin_decode_palette,
+                           layer.weight_global_scale, layer.workspace, n, k, False) for x in probes]
+
+
+def check_down_srans(layer: torch.nn.Module) -> bool:
+    """For a layer with rANS-coded down scales: True iff the coded stream-K kernel on the current buffers equals, bit
+    for bit, the six-bit kernel with codes rebuilt from the one-byte scales. Depends only on the buffers' contents."""
+    c = layer._marlin_decode_scales6
+    if not is_gate_up_srans(c) or _down_srans is None:
+        return False
+    probes = _down_probes(layer)
+    return _same_bits(_down_outputs(layer, _six_bit_codes(layer), probes), _down_outputs(layer, c, probes))
+
+
+def _restore_six_bit(layer: torch.nn.Module) -> None:
+    """Register the layer's six-bit codes as _marlin_decode_scales6, written into the storage of the current scale
+    buffer when that storage is exactly the six-bit code buffer the coded bytes were written over."""
+    c = layer._marlin_decode_scales6
+    codes = _six_bit_codes(layer)
+    if c.dtype == torch.uint8 and c.storage_offset() == 0 and c.untyped_storage().nbytes() == codes.numel():
+        home = c.as_strided((codes.numel(),), (1,), 0)
+        home.copy_(codes)
+        codes = home
+    layer.register_buffer("_marlin_decode_scales6", codes, persistent=False)
+
+
+def revert_down_srans(layer: torch.nn.Module) -> None:
+    """Put rANS-coded down scales back to six-bit codes (into the same storage when the coded buffer still lives at
+    the start of the six-bit code buffer it was written into)."""
+    if is_gate_up_srans(layer._marlin_decode_scales6):
+        _restore_six_bit(layer)
+    layer.marlin_decode6_down_srans = False
+
+
+def admit_down_srans(layer: torch.nn.Module) -> bool:
+    """For an admitted six-bit down-projection layer: encode its scales (a pure function of the tiled one-byte
+    scales), write the coded bytes over the start of the layer's own six-bit code buffer and switch to them only if
+    the coded stream-K kernel reproduces every output bit of the six-bit kernel on the probes, before and after the
+    write. Otherwise the six-bit codes stay (rewritten in place if the write happened)."""
+    c = layer._marlin_decode_scales6
+    if is_gate_up_srans(c):  # already coded (e.g. after a placement move): only re-check
+        layer.marlin_decode6_down_srans = check_down_srans(layer)
+        return layer.marlin_decode6_down_srans
+    layer.marlin_decode6_down_srans = False
+    if (_down_srans is None or getattr(layer, "marlin_decode6_fixed_grid", False)
+            or (layer.output_size_per_partition, layer.input_size_per_partition) != (DOWN_N, DOWN_K)
+            or getattr(layer, "_marlin_decode_scales", None) is None
+            or c.dim() != 1 or not c.is_contiguous()):
+        return False
+    probes = _down_probes(layer)
+    expected = _down_outputs(layer, c, probes)
+    coded = encode_down_scales(layer._marlin_decode_scales, layer._marlin_decode_palette)
+    if coded.numel() > c.numel() or not _same_bits(expected, _down_outputs(layer, coded, probes)):
+        return False
+    if int(torch.count_nonzero(layer.workspace)) != 0:
+        return False
+    # write the coded bytes over the start of the six-bit code buffer, so the scale stream keeps the memory the
+    # loader gave it (no late allocation); the temporary is freed
+    nbytes = coded.numel()
+    c[:nbytes].copy_(coded.view(-1))
+    del coded
+    view = c[:nbytes].view(-1, 16)
+    try:
+        ok = _same_bits(expected, _down_outputs(layer, view, probes)) and int(torch.count_nonzero(layer.workspace)) == 0
+    except (RuntimeError, ValueError):
+        ok = False
+    if not ok:
+        try:
+            c.copy_(_six_bit_codes(layer))
+        except (RuntimeError, ValueError):
+            # the six-bit codes cannot be put back: this layer falls back to the uncompressed tiled GEMV
+            del layer._marlin_decode_scales6, layer._marlin_decode_palette
+        return False
+    layer.register_buffer("_marlin_decode_scales6", view, persistent=False)
+    layer.marlin_decode6_down_srans = True
+    STATS["down_srans_scales"] += layer._marlin_decode_scales.numel()
+    STATS["down_srans_bytes"] += nbytes
+    return True
+
+
 def prepare_decode_layout6(layer: torch.nn.Module, reference) -> bool:
     """After the board's prepare_decode_layout: add the 6-bit scale codes and palette, check, register. True if admitted."""
     layer.marlin_decode6_fixed_grid = False
@@ -383,5 +575,13 @@ def prepare_decode_layout6(layer: torch.nn.Module, reference) -> bool:
                     logger.warning_once("NVFP4 rANS gate/up scale admission failed on this layer: %s", exc)
                     coded_ok = False
                 STATS["gate_up_srans" if coded_ok else "gate_up_srans_rejected"] += 1
+    elif (_down_srans is not None and (layer.output_size_per_partition, k) == (DOWN_N, DOWN_K)
+          and os.environ.get("MUSE_DOWN_SRANS", "1") != "0"):
+        try:
+            coded_ok = admit_down_srans(layer)
+        except (RuntimeError, ValueError) as exc:
+            logger.warning_once("NVFP4 rANS down scale admission failed on this layer: %s", exc)
+            coded_ok = False
+        STATS["down_srans" if coded_ok else "down_srans_rejected"] += 1
     STATS["admitted"] += 1
     return True
