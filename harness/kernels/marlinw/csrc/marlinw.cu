@@ -15,6 +15,7 @@
 #include "marlin.cuh"
 #include "marlin_dtypes.cuh"
 #include "core/scalar_type.hpp"
+#include "silu_mul.cuh"
 #include "marlinw_template.h"
 
 namespace marlinw {
@@ -25,7 +26,29 @@ namespace marlinw {
 constexpr auto kKernel =
     Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
            vllm::kFE4M3fn.id(), 256, 4, 16, 4, false, 4, 1, false>;
+// The same kernel writing silu(gate) * up of a [gate | up] weight (C is
+// [M, N / 2]); see silu_mul in marlinw_template.h.
+constexpr auto kKernelSiluMul =
+    Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
+           vllm::kFE4M3fn.id(), 256, 4, 16, 4, false, 4, 1, false, true>;
 constexpr int kThreads = 256;
+
+// out[r, c] = silu(in[r, c]) * in[r, d + c] for bf16 in [m, 2d] (row stride
+// ld_in elements) and out [m, d], 8 elements per thread; d % 8 == 0.
+__global__ void SiluMul(const int4* __restrict__ in, int4* __restrict__ out,
+                        int m, int d8, int ld_in8) {
+  int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= static_cast<int64_t>(m) * d8) return;
+  int r = static_cast<int>(i / d8), c = static_cast<int>(i % d8);
+  int4 g = in[static_cast<int64_t>(r) * ld_in8 + c];
+  int4 u = in[static_cast<int64_t>(r) * ld_in8 + d8 + c];
+  int4 o;
+  o.x = silu_mul_bf16x2(g.x, u.x);
+  o.y = silu_mul_bf16x2(g.y, u.y);
+  o.z = silu_mul_bf16x2(g.z, u.z);
+  o.w = silu_mul_bf16x2(g.w, u.w);
+  out[i] = o;
+}
 
 }  // namespace marlinw
 
@@ -36,30 +59,38 @@ extern "C" {
 int marlinw_init(int smem) {
   cudaError_t e = cudaFuncSetAttribute(
       marlinw::kKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  if (e != cudaSuccess) return static_cast<int>(e);
+  e = cudaFuncSetAttribute(marlinw::kKernelSiluMul,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   return static_cast<int>(e);
 }
 
-int marlinw_regs() {
+int marlinw_regs(int silu_mul) {
   cudaFuncAttributes attr;
-  if (cudaFuncGetAttributes(&attr, marlinw::kKernel) != cudaSuccess) return -1;
+  if (cudaFuncGetAttributes(&attr, silu_mul ? marlinw::kKernelSiluMul
+                                            : marlinw::kKernel) != cudaSuccess)
+    return -1;
   return attr.numRegs;
 }
 
 // A: bf16 [M, lda] (row stride lda elements), B: Marlin-packed fe2m1f
-// [K/16, 2N] int32, C: bf16 [M, N], C_tmp: fp32 scratch of n_slots * 64 * 256,
-// scales: fe4m3fn [K/16, N] (S0E5M3, Marlin order), global_scale: fp32 [1],
-// locks: int32 [n_slots], zero on entry and left zero on exit.
-// work / work_ptr: see marlinw_template.h. grid = number of blocks.
+// [K/16, 2N] int32, C: bf16 [M, N] (silu_mul: [M, N / 2]), C_tmp: fp32 scratch
+// of n_slots * 64 * 256, scales: fe4m3fn [K/16, N] (S0E5M3, Marlin order),
+// global_scale: fp32 [1], locks: int32 [n_slots], zero on entry and left zero
+// on exit. work / work_ptr: see marlinw_template.h. grid = number of blocks.
+// silu_mul != 0: the work list must hold whole-K slices only, each gate tile
+// (col < N / 512) followed later in the same block's list by the up tile of
+// the same chunk at col + N / 512.
 int marlinw_gemm(const void* A, const void* B, void* C, void* C_tmp,
                  const void* scales, const void* global_scale, int prob_m,
                  int prob_n, int prob_k, int lda, void* locks,
                  const void* work, const void* work_ptr, int grid, int smem,
-                 void* stream) {
+                 int silu_mul, void* stream) {
   if (prob_m <= 0 || prob_m % 64 || prob_n % 256 || prob_k % 64 || lda % 8 ||
-      grid <= 0)
+      grid <= 0 || (silu_mul && prob_n % 512))
     return -2;
-  marlinw::kKernel<<<grid, marlinw::kThreads, smem,
-                     static_cast<cudaStream_t>(stream)>>>(
+  auto kernel = silu_mul ? marlinw::kKernelSiluMul : marlinw::kKernel;
+  kernel<<<grid, marlinw::kThreads, smem, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const int4*>(A), static_cast<const int4*>(B),
       static_cast<int4*>(C), static_cast<int4*>(C_tmp), nullptr, nullptr,
       static_cast<const int4*>(scales),
@@ -67,6 +98,22 @@ int marlinw_gemm(const void* A, const void* B, void* C, void* C_tmp,
       prob_k / 16, prob_m, prob_n, prob_k, lda, static_cast<int*>(locks),
       false, false, true, smem, static_cast<const int4*>(work),
       static_cast<const int*>(work_ptr));
+  return static_cast<int>(cudaGetLastError());
+}
+
+// out [m, d] = silu(in[:, :d]) * in[:, d:] (bf16, row stride ld_in elements),
+// the same arithmetic as the silu_mul epilogue above.
+int marlinw_silu_mul(const void* in, void* out, int m, int d, int ld_in,
+                     void* stream) {
+  if (m < 0 || d <= 0 || d % 8 || ld_in % 8 || ld_in < 2 * d) return -2;
+  if (m == 0) return 0;
+  int64_t n = static_cast<int64_t>(m) * (d / 8);
+  int threads = 256;
+  int64_t blocks = (n + threads - 1) / threads;
+  marlinw::SiluMul<<<static_cast<unsigned>(blocks), threads, 0,
+                     static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const int4*>(in), static_cast<int4*>(out), m, d / 8,
+      ld_in / 8);
   return static_cast<int>(cudaGetLastError());
 }
 
