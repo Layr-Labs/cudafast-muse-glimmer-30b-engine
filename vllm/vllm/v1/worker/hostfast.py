@@ -28,6 +28,7 @@ def _flag(name: str, default: str) -> bool:
 
 GC = _flag("VLLM_HOSTFAST_GC", "1")
 PIN = _flag("VLLM_HOSTFAST_PIN", "1")
+SINGLE_CLUSTER = _flag("VLLM_HOSTFAST_SINGLE_CLUSTER", "1")
 
 # --------------------------------------------------------------------------- #
 # GC
@@ -68,6 +69,32 @@ def _read_int(path: str) -> int | None:
         return None
 
 
+def _read_str(path: str) -> str | None:
+    try:
+        with open(path) as fp:
+            return fp.read().strip()
+    except OSError:
+        return None
+
+
+def _pick_single_cluster(fast: set[int], known: dict[int, int], sysfs: str) -> set[int]:
+    """If ``fast`` spans multiple L3/CPU clusters, pick the highest-capacity cluster."""
+    if not SINGLE_CLUSTER or len(fast) < 2:
+        return fast
+    by_cluster: dict[str, set[int]] = {}
+    for c in fast:
+        cl = _read_str(f"{sysfs}/cpu{c}/topology/cluster_cpus_list")
+        if not cl:
+            return fast
+        by_cluster.setdefault(cl, set()).add(c)
+    if len(by_cluster) <= 1:
+        return fast
+    return max(
+        by_cluster.values(),
+        key=lambda grp: (sum(known.get(c, 0) for c in grp), len(grp), max(grp)),
+    )
+
+
 def fast_cpus(
     allowed: set[int],
     sysfs: str = "/sys/devices/system/cpu",
@@ -84,7 +111,7 @@ def fast_cpus(
         top = max(known.values())
         fast = {c for c, v in known.items() if v >= ratio * top}
         if fast and fast != allowed:
-            return fast
+            return _pick_single_cluster(fast, known, sysfs)
     return set()
 
 

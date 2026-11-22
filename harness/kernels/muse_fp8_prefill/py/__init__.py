@@ -21,6 +21,7 @@ ENABLED = os.environ.get("MUSE_FP8_PREFILL", "1") != "0"
 # gains (128x192 tiles cut its 4.33-wave grid to 2.92 waves); qkv, attention gate and o_proj stay on the stock op.
 _CFG: dict[tuple[int, int], int] = {
     (6656, 19968): 1,  # down
+    (6656, 4096): 1,   # o_proj
 }
 _lib = None
 _tried = False

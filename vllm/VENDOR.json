@@ -114,6 +114,22 @@
     {
       "file": "vllm/model_executor/models/muse_glimmer.py, vllm/v1/worker/gpu/model_runner.py; harness/kernels/lmpost (new)",
       "why": "A one-row greedy decode step without logprobs, penalties, bias or grammar takes its token from lmpost, taken from SP5D's published Yukon submission 98c1361e-289f-45a3-8471-5df0259bd3b2 (branch commit b520efe): the lm_head output goes through a 64K-entry BF16 table of this model's compute_logits chain (x * output_multiplier, then cap * tanh(x / cap), built by the same torch ops on every BF16 value) fused with a one-pass argmax whose ties go to the lowest index, the stock greedy sampler's rule; the sampling row is taken as a slice. Its in-place softcap hook for compute_logits is not taken, and the token is written to a freshly allocated tensor instead of two alternating persistent ones. LMPOST=0 disables it."
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/decode_placement.py, vllm/model_executor/layers/quantization/utils/glimmer_fp8.py",
+      "why": "Load-time weight placement extended with posix_fadvise(DONTNEED) shard page-cache release, read-only 64 MiB L2 eviction flushes between timing candidates, selective slow-only quarantine across decode and prefill groups (freeing verified-fast runners-up immediately for downstream groups while holding slow pages until prefill placement completes), largest-first ordering with 4.5x deep surplus on NVFP4 gate_up/down and muserans FP8 MLP weights, 24 spares for lm_head, 3.5x surplus across 13 decode groups down to 10 MiB (including NVFP4/FP8 attention weights and muse_bf16_lane weights, syncing fp8_linear.muse_packed so moved muserans buffers stay active and visible to l2pf), and 2.5x surplus across 4 prefill groups (including muse_fp8_prefill FP8 down and paired_fp8_swiglu_weight). Every moved buffer is verified bitwise equal before swapping."
+    },
+    {
+      "file": "vllm/v1/worker/hostfast.py",
+      "why": "When high-capacity CPU cores span multiple L3 clusters on Grace/GB10, restrict affinity to the single highest-capacity L3 cluster (CPUs 15-19) to avoid cross-cluster L3 bounces (VLLM_HOSTFAST_SINGLE_CLUSTER=0 restores multi-cluster pinning; zero background threads)."
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py; harness/kernels/decode6 (gemv6_tma4.cu, marlin/marlin_template.h, muse_marlin6_gemv.py, build.sh); harness/kernels/marlinw_down128; harness/kernels/marlinw_attn/marlinw_attn.py; harness/kernels/marlinw_down/marlinw_down.py",
+      "why": "Decode6 adds 4-stage hardware TMA super-block rANS block scales (gemv6_tma4.cu) with 2 alternating super-block slots, global L1-cached super-block offsets, and a two-pass GPU encoder, covering gate_up (45 layers), down (40 layers), and lm_head (1 layer) with 4x fewer TMA/mbarrier operations, zero block-0/1 header bloat, and per-layer bitwise admission (MUSE_TMA4=0 reverts to srans/6-bit). Prefill marlinw_down128 is generalized with zero register spills to serve 18 NVFP4 attention QKV projections (4608x6656) with exact bitwise admission, and marlinw_down128/marlinw_attn/marlinw_down cache their FP32 scratch buffers."
+    },
+    {
+      "file": "vllm/model_executor/models/muse_glimmer_norm_glue.py; harness/kernels/l2pf/py/sites.py; harness/kernels/muserans; harness/kernels/muse_bf16_lane; harness/kernels/muse_fp8_prefill",
+      "why": "Bit-exact post-attention norm glue extended to prefill row counts (<= 4096); muserans uses continuous per-warp FP8 rANS streams (117 layers); muse_bf16_lane uses persistent cp.async NS=4 rANS high-byte compression on all 12 BF16 attention weights with L2 prefetch skipped on compressed BF16 QKV; muse_fp8_prefill enables 128x192 tiles on 42 FP8 o_proj prefill layers with real-activation bitwise verification."
     }
   ],
   "carried_from": {

@@ -841,6 +841,100 @@ __global__ void Marlin(
     if (threadIdx.x < 4)
       reinterpret_cast<int4*>(sh_pal)[threadIdx.x] = scale6_palette[threadIdx.x];
   }
+#ifdef MUSE_SCALE_TMA4
+  // 4-stage TMA super-block rANS block scales (gemv6_tma4.cu): hardware cp.async.bulk with 2 alternating
+  // super-block slots, 4x fewer TMA/mbarrier ops, zero block0/1 header bloat, global L1-cached off16[].
+  // Supports gate_up (336x256T), down (48x256T), and lm_head (48x128T).
+  static_assert(scale6 && (threads == 256 || threads == 128),
+                "TMA4 rANS scales require M = 1 decode config (128 or 256 threads)");
+  constexpr int kTmaWarps = threads / 32;
+  constexpr int RANS_CAP = (threads == 256) ? 3072 : 2048;
+  uint32_t* sh_states = reinterpret_cast<uint32_t*>(sh_pal + 64);
+  unsigned char* sh_rslot = reinterpret_cast<unsigned char*>(sh_states + threads);
+  uint32_t* sh_rlut = reinterpret_cast<uint32_t*>(sh_rslot + 2 * RANS_CAP);
+  uint64_t* sh_rbar = reinterpret_cast<uint64_t*>(sh_rlut + 1024);
+  const uint32_t* tma_u32 = reinterpret_cast<const uint32_t*>(g_idx);
+  const uint32_t* tma_blk_sb = tma_u32 + 1024;
+  const uint32_t* tma_blk_it = tma_blk_sb + (gridDim.x + 1);
+  const size_t tma_meta_u32 = ((static_cast<size_t>(2 * gridDim.x + 1) + 3) / 4) * 4;
+  const uint32_t* tma_off16 = tma_u32 + 1024 + tma_meta_u32;
+  const uint32_t tma_sb_base = tma_blk_sb[blockIdx.x];
+  const int tma_num_sbs = static_cast<int>(tma_blk_sb[blockIdx.x + 1] - tma_sb_base);
+  const int tma_iters = static_cast<int>(tma_blk_it[blockIdx.x]);
+  const unsigned char* tma_var_g = reinterpret_cast<const unsigned char*>(zp_ptr);
+  int tma_slice_base = 0, tma_done = 0, tma_q = 0;
+  bool tma_started = false;
+  uint32_t tma_x = 0;
+  const uint16_t* tma_wp = nullptr;
+  auto tma_bar = [&](int i) { return static_cast<uint32_t>(__cvta_generic_to_shared(sh_rbar + i)); };
+  auto tma_bulk = [&](void* dst, const void* src, int bytes, int bar) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(tma_bar(bar)), "r"(bytes) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                     static_cast<uint32_t>(__cvta_generic_to_shared(dst))),
+                 "l"(src), "r"(bytes), "r"(tma_bar(bar))
+                 : "memory");
+  };
+  auto tma_wait = [&](int bar, uint32_t parity) {
+    asm volatile(
+        "{\n\t.reg .pred P1;\n\tTMA4_WAIT_%=:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n\t"
+        "@!P1 bra TMA4_WAIT_%=;\n\t}" ::"r"(tma_bar(bar)), "r"(parity) : "memory");
+  };
+  auto tma_issue = [&](int sb) {
+    const uint32_t gsb = tma_sb_base + sb;
+    const uint32_t o0 = __ldg(tma_off16 + gsb);
+    const uint32_t o1 = __ldg(tma_off16 + gsb + 1);
+    const int bytes = static_cast<int>(o1 - o0) * 16;
+    const int slot = sb & 1;
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    tma_bulk(sh_rslot + slot * RANS_CAP, tma_var_g + static_cast<size_t>(o0) * 16, bytes, 1 + slot);
+  };
+  if (threadIdx.x == 0) {
+  #pragma unroll
+    for (int i = 0; i < 3; i++)
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(tma_bar(i)) : "memory");
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(tma_bar(0)),
+                 "r"(4096 + threads * 4) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                     static_cast<uint32_t>(__cvta_generic_to_shared(sh_rlut))),
+                 "l"(g_idx), "r"(4096), "r"(tma_bar(0)) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                     static_cast<uint32_t>(__cvta_generic_to_shared(sh_states))),
+                 "l"(reinterpret_cast<const unsigned char*>(scales_ptr) +
+                     static_cast<size_t>(blockIdx.x) * threads * 4),
+                 "r"(threads * 4), "r"(tma_bar(0)) : "memory");
+    if (tma_num_sbs > 0) tma_issue(0);
+    if (tma_num_sbs > 1) tma_issue(1);
+  }
+  auto tma_decode = [&](int X) {
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if ((X & 3) == 0) {
+      const int sb = X >> 2;
+      const int slot = sb & 1;
+      if (sb > 0 && threadIdx.x == 0 && sb + 1 < tma_num_sbs) tma_issue(sb + 1);
+      tma_wait(1 + slot, static_cast<uint32_t>((sb >> 1) & 1));
+      const unsigned char* blk = sh_rslot + slot * RANS_CAP;
+      const uint16_t* cw = reinterpret_cast<const uint16_t*>(blk);
+      int start = kTmaWarps;
+  #pragma unroll
+      for (int i = 0; i < kTmaWarps - 1; i++) start += i < w ? cw[i] : 0;
+      tma_wp = reinterpret_cast<const uint16_t*>(blk) + start;
+    }
+    uint8_t* dst = reinterpret_cast<uint8_t*>(sh_s + s_sh_stage * (X & (stages - 1))) + 128 * w + lane;
+    const uint32_t lt = (1u << lane) - 1u;
+  #pragma unroll
+    for (int m = 0; m < 4; m++) {
+      const uint32_t e = sh_rlut[tma_x & 1023u];
+      tma_x = ((e >> 6) & 2047u) * (tma_x >> 10) + (e >> 17);
+      dst[32 * m] = sh_pal[e & 63u];
+      const bool need = tma_x < 65536u;
+      const uint32_t msk = __ballot_sync(0xffffffffu, need);
+      if (need) tma_x = (tma_x << 16) | tma_wp[__popc(msk & lt)];
+      tma_wp += __popc(msk);
+    }
+  };
+#endif
 #ifdef MUSE_SCALE_RANS
   // rANS-coded block scales (fixed gate/up grid only; muse_marlin6_gemv.encode_gate_up_scales, gemv6_srans.cu).
   // Global operands, carried in pointer arguments this configuration does not otherwise use:
@@ -1070,11 +1164,10 @@ __global__ void Marlin(
         }
       } else {
         if constexpr (group_blocks != -1) {
-          int4* sh_s_stage = sh_s + s_sh_stage * pipe;
-
           // Only fetch scales if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
-#ifndef MUSE_SCALE_RANS
+#if !defined(MUSE_SCALE_RANS) && !defined(MUSE_SCALE_TMA4)
+            int4* sh_s_stage = sh_s + s_sh_stage * pipe;
             if (s_sh_wr_pred) {
               cp_async4_stream(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
             }
@@ -1194,6 +1287,8 @@ __global__ void Marlin(
 
 #ifdef MUSE_SCALE_RANS_SK
           int4* sh_s_stage = sh_s + s_sh_stage * ((rans_slice_base + pipe) & (stages - 1));
+#elif defined(MUSE_SCALE_TMA4)
+          int4* sh_s_stage = sh_s + s_sh_stage * ((tma_slice_base + pipe) & (stages - 1));
 #else
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 #endif
@@ -1202,7 +1297,7 @@ __global__ void Marlin(
             reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
                 sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
           } else if constexpr (scale6) {
-#ifdef MUSE_SCALE_RANS
+#if defined(MUSE_SCALE_RANS) || defined(MUSE_SCALE_TMA4)
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] = reinterpret_cast<int2*>(
                 sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
 #else
@@ -1973,6 +2068,10 @@ __global__ void Marlin(
     rans_slice_base = rans_done;
     rans_done += slice_iters;
 #endif
+#ifdef MUSE_SCALE_TMA4
+    tma_slice_base = tma_done;
+    tma_done += slice_iters;
+#endif
 
   #pragma unroll
     for (int i = 0; i < stages - 1; i++) {
@@ -1998,6 +2097,16 @@ __global__ void Marlin(
 
     zero_accums();
     wait_for_stage();
+#ifdef MUSE_SCALE_TMA4
+    if (!tma_started) {
+      tma_started = true;
+      tma_wait(0, 0);
+      tma_x = sh_states[threadIdx.x];
+      if (tma_iters > 0) tma_decode(0);
+      if (tma_iters > 1) tma_decode(1);
+      __syncthreads();
+    }
+#endif
 #ifdef MUSE_SCALE_RANS
   #ifdef MUSE_SCALE_RANS_SK
     if (rans_started) {
@@ -2058,6 +2167,10 @@ __global__ void Marlin(
                           slice_iters >= stages);
           pipe++;
           wait_for_stage();
+#ifdef MUSE_SCALE_TMA4
+          tma_q++;
+          if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
+#endif
 #ifdef MUSE_SCALE_RANS
           // entering stage rans_q: decode stage rans_q + 1 (its block was issued two stages ago),
           // then issue block rans_q + 3 into the slot of the block decoded two barriers ago
