@@ -53,6 +53,19 @@ except Exception:  # noqa: BLE001 - package absent: stock cutlass for every prom
 # ops.cutlass_scaled_mm on the layer's own weight; any other weight keeps the stock op.
 _prefill_admitted: set[int] = set()
 _prefill_real_checked: set[int] = set()
+
+
+def prefill_admitted(weight: torch.Tensor) -> bool:
+    return _prefill is not None and weight.data_ptr() in _prefill_admitted
+
+
+def prefill_moved(old_ptr: int, new_ptr: int) -> None:
+    if old_ptr in _prefill_admitted:
+        _prefill_admitted.discard(old_ptr)
+        _prefill_admitted.add(new_ptr)
+    if old_ptr in _prefill_real_checked:
+        _prefill_real_checked.discard(old_ptr)
+        _prefill_real_checked.add(new_ptr)
 _prefill_stats = {"admitted": 0, "rejected": 0, "served": 0, "fallback": 0, "real_equal": 0, "real_differ": 0,
                   "logged": False}
 
