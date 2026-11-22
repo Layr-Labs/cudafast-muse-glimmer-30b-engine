@@ -37,6 +37,27 @@ except Exception:  # noqa: BLE001
     _rans = None
 
 _stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False}
+# Warps per block of the compressed output gate GEMV (N 4096, K 6656). It runs beside the
+# attention chain on the gate side stream (muse_glimmer.py, _GateSideStream). The auto policy
+# spreads it over 47 blocks of 11 warps, one per SM, and a flash-attention decode CTA (80 KB of
+# shared memory) cannot share an SM with one of them, so attention waited for GEMV blocks to
+# retire. 16 warps per block run the same work on 32 blocks at the same speed and leave 16 SMs
+# to the attention chain. Launch geometry only: every 8-row chunk is still decoded and reduced by
+# one warp from its own stream in the same order. MUSE_RANS_GATE_WPB=0 selects the auto policy.
+_GATE_SHAPE = (4096, 6656)
+_GATE_WPB = int(os.environ.get("MUSE_RANS_GATE_WPB", "16"))
+_rans_cfg_cache: dict[tuple[int, int], list[int]] = {}
+
+
+def _rans_gemv(packed, a, sb, sa, out, n: int, k: int) -> None:
+    if _GATE_WPB > 0 and (n, k) == _GATE_SHAPE:
+        cfg = _rans_cfg_cache.get((n, k))
+        if cfg is None:
+            cfg = _rans_cfg_cache[(n, k)] = [int(v) for v in _rans.rans_cfg_info(n, k)]
+        tw, _wpb, ns, rg, ilv = cfg
+        _rans.rans_gemv_cfg(packed, a, sb, sa, out, n, k, tw, ns, _GATE_WPB, rg, ilv)
+        return
+    _rans.rans_gemv_auto(packed, a, sb, sa, out, n, k)
 
 
 def _cutlass(A: torch.Tensor, B: torch.Tensor, As: torch.Tensor, Bs: torch.Tensor) -> torch.Tensor:
@@ -73,7 +94,7 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
     if _rans is not None:
         try:
             blob = _rans.rans_pack(w.t().contiguous().view(torch.uint8))
-            if _self_check(lambda xq, out: _rans.rans_gemv_auto(blob, xq.view(-1), ws.reshape(-1), xs.reshape(-1), out, n, k), w, ws, xs):
+            if _self_check(lambda xq, out: _rans_gemv(blob, xq.view(-1), ws.reshape(-1), xs.reshape(-1), out, n, k), w, ws, xs):
                 _stats["admitted"] += 1
                 _stats["rans"] += 1
                 # The magic byte 'A' at blob[0] marks the compressed format for the op (one uint8 buffer either way).
@@ -128,7 +149,7 @@ def _muse_fp8_scaled_mm(
         if packed.numel() == n * k:
             _mf.gemv(packed, A, Bs, As, out, n, k)
         else:
-            _rans.rans_gemv_auto(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
+            _rans_gemv(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
         return out
     return _small_row_fp8(A, B, As, Bs)
 

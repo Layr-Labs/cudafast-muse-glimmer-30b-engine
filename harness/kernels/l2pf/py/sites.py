@@ -65,6 +65,17 @@ _RANS_SKIP_PREFETCH = {
     (6656, 4096, True),
     (4608, 6656, False),
 }
+# Head bytes for those compressed sites (0 = no prefetch). The compressed output projection
+# after attention gets a 2 MiB head only when the GEMM before it (the output gate) is a Marlin
+# NVFP4 decode GEMV: a flash-attention decode CTA cannot share an SM with one of its blocks, so
+# in those layers the attention chain still trails the gate GEMV and DRAM idles meanwhile. After
+# a compressed FP8 gate (launched on 32 blocks, muse_fp8._GATE_WPB) attention finishes first and
+# a head would only compete with the projection. Scheduling and memory traffic only.
+_RANS_HEAD_BYTES = {
+    (6656, 4096, True): _env_bytes("L2PF_MB_RANS_ATTN", 2 << 20),
+    (4608, 6656, False): _env_bytes("L2PF_MB_RANS_QKV", 0),
+}
+_RANS_ATTN_AFTER_MARLIN_ONLY = os.environ.get("L2PF_RANS_ATTN_AFTER_MARLIN", "1") != "0"
 
 
 def available() -> bool:
@@ -442,8 +453,12 @@ class Session:
                             and a.is_contiguous() and 0 < packed.numel() != n * k):
                         from vllm.model_executor.kernels.linear.scaled_mm.muse_fp8 import _scales_ok
                         if _scales_ok(sa, sb, n):
-                            nbytes = 0
-                            site.unassisted = True
+                            head = _RANS_HEAD_BYTES[(n, k, site.after_attn)]
+                            if (site.after_attn and _RANS_ATTN_AFTER_MARLIN_ONLY
+                                    and not (self.sites and self.sites[-1].kind == "marlin_tiled")):
+                                head = 0
+                            nbytes = min(nbytes, head)
+                            site.unassisted = nbytes == 0
                 site.descs = weight_descs(ws, nbytes)
             if self.ranges is not None and not _inside(site.descs, self.ranges):
                 site.descs = []
