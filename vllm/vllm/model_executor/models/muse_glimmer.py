@@ -1394,6 +1394,92 @@ def _init_qk_fused() -> bool:
         return False
 
 
+def _muse_bf16_qkv_or_stacked_impl(
+    x: torch.Tensor,
+    w_cat: torch.Tensor,
+    w_qkv: torch.Tensor,
+    packed_qkv: torch.Tensor,
+    idx_qkv: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.ndim == 2 and x.shape == (512, 6656) and x.is_contiguous():
+        out = torch.mm(x, w_cat.t())
+        return out[:, :4608].contiguous(), out[:, 4608:].contiguous()
+    qkv = torch.ops.vllm.muse_bf16_lane_linear.default(x, w_qkv, packed_qkv, idx_qkv)
+    return qkv, x.new_empty((x.shape[0], 4096))
+
+
+def _muse_bf16_qkv_or_stacked_fake(
+    x: torch.Tensor,
+    w_cat: torch.Tensor,
+    w_qkv: torch.Tensor,
+    packed_qkv: torch.Tensor,
+    idx_qkv: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return x.new_empty((x.shape[0], 4608)), x.new_empty((x.shape[0], 4096))
+
+
+def _muse_bf16_gate_fill_impl(
+    gate: torch.Tensor,
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    packed_gate: torch.Tensor,
+    idx_gate: torch.Tensor,
+) -> None:
+    if x.ndim == 2 and x.shape == (512, 6656) and x.is_contiguous():
+        return
+    if (
+        x.shape == (1, 6656)
+        and x.dtype == torch.bfloat16
+        and x.is_cuda
+        and x.is_contiguous()
+        and gate.is_contiguous()
+        and idx_gate.numel() == 1
+    ):
+        import muse_bf16_lane as _bf16
+
+        native = _bf16._lib()
+        if native is not None:
+            with torch.cuda.device(x.device):
+                st = torch.cuda.current_stream(x.device).cuda_stream
+                rc = native.muse_bf16_rans_gemv(
+                    4096,
+                    packed_gate.numel(),
+                    x.data_ptr(),
+                    packed_gate.data_ptr(),
+                    gate.data_ptr(),
+                    st,
+                )
+            if rc == 0:
+                return
+    gate.copy_(
+        torch.ops.vllm.muse_bf16_lane_linear.default(x, w_gate, packed_gate, idx_gate)
+    )
+
+
+def _muse_bf16_gate_fill_fake(
+    gate: torch.Tensor,
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    packed_gate: torch.Tensor,
+    idx_gate: torch.Tensor,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="muse_bf16_qkv_or_stacked",
+    op_func=_muse_bf16_qkv_or_stacked_impl,
+    fake_impl=_muse_bf16_qkv_or_stacked_fake,
+    mutates_args=[],
+)
+direct_register_custom_op(
+    op_name="muse_bf16_gate_fill",
+    op_func=_muse_bf16_gate_fill_impl,
+    fake_impl=_muse_bf16_gate_fill_fake,
+    mutates_args=["gate"],
+)
+
+
 def _gate_side_stream_fork_point(gate_proj: nn.Module, layer_idx: int = -1) -> str | None:
     """Where the output gate branch forks off the attention chain, or None to
     keep the gate projection in order on the main stream: ``"qkv"`` right
@@ -1556,6 +1642,9 @@ class MuseGlimmerAttention(nn.Module):
             per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
         )
+        self._fp8_shared_input_scale = False
+        self._fp8_dual_prefill = False
+        self._bf16_dual_prefill = False
 
     def _output_gate_before_attention(
         self, hidden_states: torch.Tensor, chain_inputs: list[torch.Tensor]
@@ -1572,10 +1661,33 @@ class MuseGlimmerAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
         gate = gate_dep = None
-        if self.gate_fork_point == "qkv":
-            gate, gate_dep = self._output_gate_before_attention(hidden_states, [qkv])
+        if (
+            self._bf16_dual_prefill
+            and hidden_states.ndim == 2
+            and hidden_states.dtype == torch.bfloat16
+            and self.gate_fork_point == "qkv"
+        ):
+            qkv, gate = torch.ops.vllm.muse_bf16_qkv_or_stacked(
+                hidden_states,
+                self._bf16_qkv_gate_w,
+                self.qkv_proj.weight,
+                self.qkv_proj.muse_bf16_lane_weight,
+                self.qkv_proj.muse_bf16_lane_index,
+            )
+            dep = torch.ops.vllm.muse_glimmer_gate_fork(hidden_states, self.layer_idx)
+            torch.ops.vllm.muse_bf16_gate_fill(
+                gate,
+                hidden_states,
+                self.output_gate_proj.weight,
+                self.output_gate_proj.muse_bf16_lane_weight,
+                self.output_gate_proj.muse_bf16_lane_index,
+            )
+            gate_dep = torch.ops.vllm.muse_glimmer_gate_switch(gate, dep, [qkv])
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            if self.gate_fork_point == "qkv":
+                gate, gate_dep = self._output_gate_before_attention(hidden_states, [qkv])
         if self._use_qk_fused and qkv.is_cuda and qkv.dtype == torch.bfloat16:
             v = qkv[:, self.q_size + self.kv_size :]
             cache = (
@@ -2062,7 +2174,7 @@ class MuseGlimmerForCausalLM(
             import muse_final_slab
         except (ImportError, OSError):
             return None
-        return muse_final_slab.prepare(self.model.layers[self.model.end_layer - 1].mlp)
+        return muse_final_slab.prepare(self.model.layers[self.model.end_layer - 1])
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
@@ -2076,12 +2188,71 @@ class MuseGlimmerForCausalLM(
         self._lmpost_softcap_argmax = None
         try:
             import lmpost
+            lm_head = getattr(self, "lm_head", None)
+            if lm_head is not None and hasattr(lm_head, "weight") and lmpost.available(lm_head.weight.device):
+                dev = lm_head.weight.device
+                lmpost._get_lut(dev, self.output_multiplier, self.final_logit_softcapping)
+                lmpost._get_scratch(dev)
+                self._lmpost_softcap_argmax = lmpost.softcap_argmax
         except ImportError:
+            pass
+
+        # Wave-11: (1) Share static FP8 input quantization across qkv_proj & output_gate_proj when their
+        # input_scales are bit-identical, and admit 3-stage fp8ws_dual for M=512 prefill; (2) stack BF16
+        # qkv_proj + output_gate_proj into a single contiguous [8704, 6656] weight (zero extra VRAM via views)
+        # for M=512 prefill after bitwise verification.
+        self._prepare_attn_dual_prefill()
+
+    def _prepare_attn_dual_prefill(self) -> None:
+        if get_tensor_model_parallel_world_size() != 1:
             return
-        lm_head = getattr(self, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight") or not lmpost.available(lm_head.weight.device):
+        want_bf16_stack = os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_PREFILL", "1") != "0"
+        if not want_bf16_stack:
             return
-        dev = lm_head.weight.device
-        lmpost._get_lut(dev, self.output_multiplier, self.final_logit_softcapping)
-        lmpost._get_scratch(dev)
-        self._lmpost_softcap_argmax = lmpost.softcap_argmax
+        bf16_stack_cnt = 0
+        for layer in islice(self.model.layers, self.model.start_layer, self.model.end_layer):
+            attn = layer.self_attn
+            if not attn.use_output_gate or attn.gate_fork_point != "qkv":
+                continue
+            qkv = attn.qkv_proj
+            gate = attn.output_gate_proj
+            qw = getattr(qkv, "weight", None)
+            gw = getattr(gate, "weight", None)
+            if qw is None or gw is None or not qw.is_cuda or not gw.is_cuda:
+                continue
+            if (
+                qw.dtype == torch.bfloat16
+                and gw.dtype == torch.bfloat16
+                and getattr(qkv, "muse_bf16_lane_weight", None) is not None
+                and getattr(gate, "muse_bf16_lane_weight", None) is not None
+                and getattr(qkv, "muse_bf16_lane_index", None) is not None
+                and getattr(gate, "muse_bf16_lane_index", None) is not None
+                and qw.shape == (4608, 6656)
+                and gw.shape == (4096, 6656)
+                and qw.is_contiguous()
+                and gw.is_contiguous()
+                and isinstance(getattr(qkv, "quant_method", None), UnquantizedLinearMethod)
+                and isinstance(getattr(gate, "quant_method", None), UnquantizedLinearMethod)
+            ):
+                try:
+                    w_cat = torch.empty((8704, 6656), dtype=torch.bfloat16, device=qw.device)
+                    w_cat[:4608].copy_(qw.data)
+                    w_cat[4608:].copy_(gw.data)
+                    gen = torch.Generator(device=qw.device).manual_seed(20261123 + attn.layer_idx)
+                    probe = torch.randn((512, 6656), generator=gen, device=qw.device, dtype=torch.bfloat16)
+                    r0 = torch.mm(probe, qw.data.t())
+                    r1 = torch.mm(probe, gw.data.t())
+                    rc = torch.mm(probe, w_cat.t())
+                    if (
+                        torch.equal(r0.view(torch.int16), rc[:, :4608].view(torch.int16))
+                        and torch.equal(r1.view(torch.int16), rc[:, 4608:].view(torch.int16))
+                    ):
+                        qkv.weight.data = w_cat[:4608]
+                        gate.weight.data = w_cat[4608:]
+                        attn.register_buffer("_bf16_qkv_gate_w", w_cat, persistent=False)
+                        attn._bf16_dual_prefill = True
+                        bf16_stack_cnt += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("BF16 stacked qkv+gate prefill skipped on layer %d: %s", attn.layer_idx, exc)
+        if bf16_stack_cnt:
+            logger.info("Attention dual prefill: %d BF16 stacked qkv+gate", bf16_stack_cnt)

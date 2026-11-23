@@ -25,8 +25,10 @@ namespace l2pf {
 constexpr uint32_t kMaxPiece = 1u << 16;
 
 __device__ __forceinline__ void bulk_prefetch(const uint8_t* p, uint32_t n) {
-  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(p), "r"(n)
-               : "memory");
+  uint64_t pol;
+  asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
+  asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;\n"
+               ::"l"(p), "r"(n), "l"(pol) : "memory");
 }
 
 __global__ void prefetch_kernel(const uint8_t* __restrict__ p, size_t bytes, uint32_t chunk) {

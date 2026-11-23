@@ -844,6 +844,7 @@ __global__ void Marlin(
   int4* sh_a = sh_s + sh_s_size;
   // scale6: the 64-byte palette lives after the A stages (the launch reserves
   // the device's opt-in shared memory, far more than the stages use).
+#if defined(MUSE_SCALE_RANS) || defined(MUSE_SCALE_TMA4)
   [[maybe_unused]] uint8_t* sh_pal =
       reinterpret_cast<uint8_t*>(sh_a + stages * a_sh_stage);
   if constexpr (scale6) {
@@ -854,6 +855,20 @@ __global__ void Marlin(
     if (threadIdx.x < 4)
       reinterpret_cast<int4*>(sh_pal)[threadIdx.x] = scale6_palette[threadIdx.x];
   }
+#else
+  // Pre-dequantized BF16 palette in shared memory (eliminates dequant_fp8_scales ALU in mainloop).
+  [[maybe_unused]] uint16_t* sh_pal16 =
+      reinterpret_cast<uint16_t*>(sh_a + stages * a_sh_stage);
+  if constexpr (scale6) {
+    static_assert(group_blocks == 1 && is_8bit_scale && !has_act_order &&
+                      !has_zp && !is_a_8bit && thread_k_blocks == 8,
+                  "scale6 is only built for the M = 1 NVFP4 decode config");
+    if (threadIdx.x < 64) {
+      const uint8_t b = reinterpret_cast<const uint8_t*>(scale6_palette)[threadIdx.x];
+      sh_pal16[threadIdx.x] = static_cast<uint16_t>(((b & 0x80u) << 7) | ((b & 0x7Fu) << 4));
+    }
+  }
+#endif
 #ifdef MUSE_SCALE_TMA4
   // 4-stage TMA super-block rANS block scales (gemv6_tma4.cu): hardware cp.async.bulk with 2 alternating
   // super-block slots, 4x fewer TMA/mbarrier ops, zero block0/1 header bloat, global L1-cached off16[].
@@ -1123,13 +1138,14 @@ __global__ void Marlin(
     }
   };
 #ifdef MUSE_B_EVICT_FIRST
-  // The weight and scale-code streams are read once: insert them in L2 as evict-first so they displace each
-  // other before any other resident line. Same bytes to the same shared slots; only the L2 policy differs.
-  uint64_t stream_policy;
-  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(stream_policy));
+  // The weight and scale-code streams are read once: insert them in L2 as evict-first with 256B sector fetch
+  // so they do not displace L2-resident activations or l2pf prefetched weight heads. Policy is materialized
+  // locally per copy to avoid ptxas odd-UR descriptor allocation on sm_121a.
   auto cp_async4_stream = [&](void* smem_ptr, const void* glob_ptr) {
     const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(smem), "l"(glob_ptr),
+    uint64_t stream_policy;
+    asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(stream_policy));
+    asm volatile("cp.async.cg.shared.global.L2::256B.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(smem), "l"(glob_ptr),
                  "l"(stream_policy));
   };
 #else
@@ -1323,15 +1339,11 @@ __global__ void Marlin(
             uint64_t v = static_cast<uint64_t>(cw[wi]) |
                          (static_cast<uint64_t>(cw[wi + 1]) << 32);
             v >>= (m & 1) * 16;
-            uint32_t lo = 0, hi = 0;
-  #pragma unroll
-            for (int j = 0; j < 4; j++) {
-              lo |= static_cast<uint32_t>(sh_pal[(v >> (6 * j)) & 63]) << (8 * j);
-              hi |= static_cast<uint32_t>(sh_pal[(v >> (6 * (j + 4))) & 63])
-                    << (8 * j);
-            }
-            reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
-                make_int2(static_cast<int>(lo), static_cast<int>(hi));
+            uint32_t* fs = reinterpret_cast<uint32_t*>(&frag_s[k % 2]);
+            fs[0] = static_cast<uint32_t>(sh_pal16[(v >>  0) & 63]) | (static_cast<uint32_t>(sh_pal16[(v >> 12) & 63]) << 16);
+            fs[1] = static_cast<uint32_t>(sh_pal16[(v >>  6) & 63]) | (static_cast<uint32_t>(sh_pal16[(v >> 18) & 63]) << 16);
+            fs[2] = static_cast<uint32_t>(sh_pal16[(v >> 24) & 63]) | (static_cast<uint32_t>(sh_pal16[(v >> 36) & 63]) << 16);
+            fs[3] = static_cast<uint32_t>(sh_pal16[(v >> 30) & 63]) | (static_cast<uint32_t>(sh_pal16[(v >> 42) & 63]) << 16);
 #endif
           } else {
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
@@ -1540,7 +1552,12 @@ __global__ void Marlin(
       }
     }
 
-    if constexpr (s_type == vllm::kFE4M3fn || s_type == vllm::kFE8M0fnu) {
+#if defined(MUSE_SCALE_RANS) || defined(MUSE_SCALE_TMA4)
+    constexpr bool dequant_scales_in_matmul = (s_type == vllm::kFE4M3fn || s_type == vllm::kFE8M0fnu);
+#else
+    constexpr bool dequant_scales_in_matmul = !scale6 && (s_type == vllm::kFE4M3fn || s_type == vllm::kFE8M0fnu);
+#endif
+    if constexpr (dequant_scales_in_matmul) {
       int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
       int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
 

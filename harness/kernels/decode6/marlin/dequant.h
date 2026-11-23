@@ -402,10 +402,10 @@ __device__ inline void dequant<half2, vllm::kFE2M1f.id(), true>(int q,
   constexpr int RIGHT_SHIFT = FP16_EXPONENT - FP4_EXPONENT;
   constexpr int MASK = 0x70007000;
 
-  // Extract and shift FP4 values to FP16 format
-  int Out1 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
+  // Extract and shift FP4 values to FP16 format using 1-instruction LOP3
+  int Out1 = lop3<(0xf0 & 0xcc) | 0xaa>(q, 0x80008000, (q & MASK) >> RIGHT_SHIFT);
   q <<= 4;
-  int Out2 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
+  int Out2 = lop3<(0xf0 & 0xcc) | 0xaa>(q, 0x80008000, (q & MASK) >> RIGHT_SHIFT);
 
   // Note: reverse indexing is intentional because weights are permuted
   frag_b[1] = *reinterpret_cast<const half2*>(&Out1);
@@ -438,10 +438,10 @@ __device__ inline void dequant<nv_bfloat162, vllm::kFE2M1f.id(), true>(
   constexpr int RIGHT_SHIFT = BF16_EXPONENT - FP4_EXPONENT;
   constexpr int MASK = 0x70007000;
 
-  // Extract and shift FP4 values to FP16 format
-  int Out1 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
+  // Extract and shift FP4 values to BF16 format using 1-instruction LOP3
+  int Out1 = lop3<(0xf0 & 0xcc) | 0xaa>(q, 0x80008000, (q & MASK) >> RIGHT_SHIFT);
   q <<= 4;
-  int Out2 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
+  int Out2 = lop3<(0xf0 & 0xcc) | 0xaa>(q, 0x80008000, (q & MASK) >> RIGHT_SHIFT);
 
   // Note: reverse indexing is intentional because weights are permuted
   frag_b[1] = *reinterpret_cast<const nv_bfloat162*>(&Out1);
@@ -537,10 +537,13 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162, vllm::kFE4M3fn.id()>(
   constexpr int RIGHT_SHIFT = BF16_EXPONENT - FP8_EXPONENT;
   constexpr int MASK = 0x7F007F00;
 
-  // Extract and shift FP8 values to BF16 format
-  int Out1 = ((q & 0x80008000) >> 1) | ((q & MASK) >> RIGHT_SHIFT);
+  // Extract and shift FP8 values to BF16 format using 1-instruction LOP3
+  // Preserves exact arithmetic sign-shift equivalence ((q & 0x80008000) >> 1) for all 32-bit inputs.
+  int Out1 = lop3<(0xf0 & 0xcc) | 0xaa>(
+      q >> 1, static_cast<int>(0xC0004000u), (q & MASK) >> RIGHT_SHIFT);
   q <<= 8;
-  int Out2 = ((q & 0x80008000) >> 1) | ((q & MASK) >> RIGHT_SHIFT);
+  int Out2 = lop3<(0xf0 & 0xcc) | 0xaa>(
+      q >> 1, static_cast<int>(0xC0004000u), (q & MASK) >> RIGHT_SHIFT);
 
   // Note: reverse indexing is intentional because weights are permuted
   frag_b[1] = *reinterpret_cast<const nv_bfloat162*>(&Out1);

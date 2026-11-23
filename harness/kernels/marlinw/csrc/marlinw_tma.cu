@@ -100,6 +100,22 @@ __device__ __forceinline__ void mbar_wait(uint32_t a, int parity) {
       "{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
       " @!p bra WAIT_%=;\n}\n" ::"r"(a), "r"(parity) : "memory");
 }
+__device__ __forceinline__ uint64_t tma_pol_el() {
+  uint64_t p;
+  asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(p));
+  return p;
+}
+__device__ __forceinline__ uint64_t tma_pol_ef() {
+  uint64_t p;
+  asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p));
+  return p;
+}
+__device__ __forceinline__ void tma2d_hint(uint32_t dst, const CUtensorMap* map, int x, int y, uint32_t bar,
+                                           uint64_t pol) {
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;"
+      ::"r"(dst), "l"(map), "r"(x), "r"(y), "r"(bar), "l"(pol) : "memory");
+}
 __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* map, int x, int y, uint32_t bar) {
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
@@ -137,7 +153,7 @@ __device__ __forceinline__ void k_loop(
 #pragma unroll
       for (int i = 0; i < kStages; i++) {
         mbar_init(full_bar + 8 * i, 1);
-        mbar_init(empty_bar + 8 * i, kThreads);
+        mbar_init(empty_bar + 8 * i, kThreads / 32);
       }
       asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -232,7 +248,8 @@ __device__ __forceinline__ void k_loop(
         ldsm4(fa[1][i], sa + 2048 * i);
       }
     }
-    mbar_arrive(empty_bar + 8 * s);  // this thread has taken everything it needs from stage s
+    __syncwarp();
+    if (lane == 0) mbar_arrive(empty_bar + 8 * s);  // warp-aggregated empty signal
 #pragma unroll
     for (int i = 0; i < MB; i++) {
       mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
@@ -325,9 +342,9 @@ __device__ __forceinline__ void down_tile(
   };
   auto produce = [&](const int g, const uint32_t dst, const uint32_t bar) {
     mbar_expect_tx(bar, MB * 16 * 128 + kBBytes + kSBytes);
-    tma2d(dst, tmA, 128 * g, row0, bar);                         // bytes, rows
-    tma2d(dst + kABytes, tmB, 256 * col, 4 * g, bar);            // uint32, k16 rows
-    tma2d(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar);  // bytes, k16 rows
+    tma2d_hint(dst, tmA, 128 * g, row0, bar, tma_pol_el());                         // bytes, rows
+    tma2d_hint(dst + kABytes, tmB, 256 * col, 4 * g, bar, tma_pol_ef());            // uint32, k16 rows
+    tma2d_hint(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar, tma_pol_ef());  // bytes, k16 rows
   };
   // codes: int4 (64 g + 32 nb + lane), int2 sh2 of it; scales: int 32 g + 2 (8 nb + lane / 4) + sh2
   k_loop<MB>(acc, k1, kABytes / 4 + 4 * (32 * nb + lane) + 2 * sh2, 256,
@@ -458,11 +475,11 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
     const int g = q - ti * kTiles;
     const int slice_col = col0 + ti;
     mbar_expect_tx(bar, kABytes + kBBytes + kSBytes);
-    tma2d(dst, &tmA, 128 * g, 128 * chunk, bar);                                               // bytes, rows
-    tma2d(dst + kABytes, &tmB, 128 * slice_col, 4 * g, bar);                                   // uint32, k16 rows
-    tma2d(dst + kABytes + kBBytes / 2, &tmB, 128 * slice_col + kFused, 4 * g, bar);
-    tma2d(dst + kABytes + kBBytes, &tmS, 64 * slice_col, 4 * g, bar);                          // bytes, k16 rows
-    tma2d(dst + kABytes + kBBytes + kSBytes / 2, &tmS, 64 * slice_col + kFused / 2, 4 * g, bar);
+    tma2d_hint(dst, &tmA, 128 * g, 128 * chunk, bar, tma_pol_el());                                               // bytes, rows
+    tma2d_hint(dst + kABytes, &tmB, 128 * slice_col, 4 * g, bar, tma_pol_ef());                                   // uint32, k16 rows
+    tma2d_hint(dst + kABytes + kBBytes / 2, &tmB, 128 * slice_col + kFused, 4 * g, bar, tma_pol_ef());
+    tma2d_hint(dst + kABytes + kBBytes, &tmS, 64 * slice_col, 4 * g, bar, tma_pol_ef());                          // bytes, k16 rows
+    tma2d_hint(dst + kABytes + kBBytes + kSBytes / 2, &tmS, 64 * slice_col + kFused / 2, 4 * g, bar, tma_pol_ef());
   };
   // codes: int4 (128 cw + 32 g + lane), int2 jh of it; scales: int 64 cw + 16 g + 2 (lane / 4) + jh
   // Epilogue staging: the start of the window, or (several tiles per CTA) the last stage plus the bytes after it.

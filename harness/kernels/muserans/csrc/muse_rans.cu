@@ -337,13 +337,16 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
         if (need) x = (x << 16) | rans_lds16(ring_s | ((pwb + (__popc(m & lt) << 1)) & (RB - 1u)));
         pwb += __popc(m) << 1;
       }
-      const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
-      const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
+      const uint32_t hiE3 = (Pw >> 1) & 0x78787878u, loE3 = (Pw << 3) & 0x78787878u;
+      const uint32_t E0_3 = __byte_perm(hiE3, loE3, 0x5140), E1_3 = __byte_perm(hiE3, loE3, 0x7362);
       const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
       const uint32_t v0 = (u0 & 0x000F000Fu) | ((u0 >> 4) & 0x0F000F00u);
       const uint32_t v1 = (u1 & 0x000F000Fu) | ((u1 >> 4) & 0x0F000F00u);
-      const uint32_t bw0 = ((v0 << 4) & 0x80808080u) | (v0 & 0x07070707u) | (E0 << 3);
-      const uint32_t bw1 = ((v1 << 4) & 0x80808080u) | (v1 & 0x07070707u) | (E1 << 3);
+      uint32_t sm0, sm1, bw0, bw1;
+      asm("lop3.b32 %0, %1, 0x07070707, %2, 0xEA;" : "=r"(sm0) : "r"(v0), "r"(E0_3));
+      asm("lop3.b32 %0, %1, 0x80808080, %2, 0xEA;" : "=r"(bw0) : "r"(v0 << 4), "r"(sm0));
+      asm("lop3.b32 %0, %1, 0x07070707, %2, 0xEA;" : "=r"(sm1) : "r"(v1), "r"(E1_3));
+      asm("lop3.b32 %0, %1, 0x80808080, %2, 0xEA;" : "=r"(bw1) : "r"(v1 << 4), "r"(sm1));
       uint2 a = xs[s * 4 + t];
       a.x = (g == 0) ? a.x : 0u; a.y = (g == 0) ? a.y : 0u;
       rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
