@@ -421,6 +421,7 @@ def install_prompt_glue() -> None:
     except Exception:
         logger.info("Decode norm glue not installed", exc_info=True)
     if _installed or os.environ.get("VLLM_MUSE_GLIMMER_PROMPT_GLUE", "1") != "1":
+        _install_qk_glue()
         return
     try:
         from torch._inductor.runtime.triton_heuristics import CachingAutotuner
@@ -443,3 +444,14 @@ def install_prompt_glue() -> None:
 
     CachingAutotuner.run = run
     _installed = True
+    _install_qk_glue()
+
+
+def _install_qk_glue() -> None:
+    # Installed last, so its launcher wrapper sees every launch before the swaps above.
+    try:
+        from .muse_glimmer_qk_glue import install_qk_glue
+
+        install_qk_glue()
+    except Exception:
+        logger.info("Prompt q/k norm glue not installed", exc_info=True)

@@ -28,7 +28,9 @@ except Exception:  # noqa: BLE001 - extension absent: stock cutlass everywhere
 
 try:
     # Lossless-compressed variant (harness/kernels/muserans): the same MMA chain and epilogue, fed by weights decoded
-    # from an exponent-pair rANS stream (~0.84 of the bytes). MUSERANS=0 keeps the uncompressed musefp8 GEMV.
+    # from an exponent-pair rANS stream (~0.84 of the bytes). MUSERANS=0 keeps the uncompressed musefp8 GEMV;
+    # MUSERANS_TLB_PREFETCH=0 drops the GEMV's address-translation prefetch (prefetches only, the output is unchanged).
+    # MUSERANS_GATE_32_BLOCKS=0 launches the attention output-gate GEMV on 47 blocks instead of 32 (launch shape only).
     import muse_rans_ext as _rans  # built into KERNELS_OUT
 
     if os.environ.get("MUSERANS", "1") == "0":
@@ -118,9 +120,16 @@ def _muse_fp8_scaled_mm(
 ) -> torch.Tensor:
     if not _stats["logged"]:
         _stats["logged"] = True
+        tpf = _rans.rans_tlb_prefetch() if _rans is not None and hasattr(_rans, "rans_tlb_prefetch") else 0
+        gate_blocks = 0
+        if _rans is not None:
+            tw, wpb = (int(v) for v in _rans.rans_cfg_info(4096, 6656)[:2])
+            gate_blocks = -(-tw // wpb)
         logger.info(
-            "musefp8 decode GEMV: %d FP8 layers admitted (%d of them rANS-compressed), %d rejected",
-            _stats["admitted"], _stats["rans"], _stats["rejected"],
+            "musefp8 decode GEMV: %d FP8 layers admitted (%d of them rANS-compressed, translation prefetch %s), "
+            "%d rejected; attention gate GEMV on %d blocks",
+            _stats["admitted"], _stats["rans"], f"every {1 << (tpf - 10)} KiB" if tpf else "off", _stats["rejected"],
+            gate_blocks,
         )
     k, n = B.shape
     if A.shape[0] == 1 and packed.numel() > 0 and A.is_contiguous() and _scales_ok(As, Bs, n):

@@ -52,6 +52,7 @@ except (ImportError, OSError):
     marlinw_down128 = None
 
 _down128_weights: set[int] = set()
+_attn128_weights: set[int] = set()
 
 
 # Which 512-row MLP kernel each call ran (Python runs on eager forwards and on graph capture, not on replay), logged
@@ -84,6 +85,11 @@ def down128_moved(old_ptr: int, new_ptr: int) -> None:
     if old_ptr in _down128_weights:
         _down128_weights.discard(old_ptr)
         _down128_weights.add(new_ptr)
+        if hasattr(marlinw_down128, "moved"):
+            marlinw_down128.moved(old_ptr, new_ptr)  # its TMA-fed kernel, if admitted
+    if old_ptr in _attn128_weights:
+        _attn128_weights.discard(old_ptr)
+        _attn128_weights.add(new_ptr)
 
 try:
     import muse_final_slab
@@ -190,12 +196,23 @@ def _log_prompt_stats() -> None:
                 _prompt_stats["down128"],
                 _prompt_stats["down128_rejected"],
             )
+        tma = []
+        if marlinw_down128 is not None and hasattr(marlinw_down128, "counts"):
+            offered, passed = marlinw_down128.counts()
+            if offered:
+                tma.append(f"down {passed} of {offered} layers")
+        if marlin_swiglu is not None and hasattr(marlin_swiglu, "counts"):
+            fast, passed = marlin_swiglu.counts()
+            if fast:
+                tma.append(f"gate/up {passed} of {fast} layers")
+        if tma:
+            logger.info("TMA-fed 128-row prefill GEMM admitted: %s", ", ".join(tma))
         attn = _prompt_stats["attn"]
         if any(a + r for a, r in attn.values()):
             logger.info(
                 "Narrow NVFP4 attention prefill GEMM (admitted/rejected): qkv %d/%d, "
-                "gate %d/%d, o %d/%d",
-                *attn["qkv"], *attn["gate"], *attn["o"],
+                "gate %d/%d, o %d/%d (128x128 admitted: %d)",
+                *attn["qkv"], *attn["gate"], *attn["o"], len(_attn128_weights),
             )
 
 
@@ -412,6 +429,12 @@ def _marlin_fp4_narrow_attn(
         and x.shape[0] == marlinw_attn.ROWS
     ):
         _log_prompt_stats()
+        if marlinw_down128 is not None and weight.data_ptr() in _attn128_weights:
+            out = marlinw_down128.gemm_shape(
+                x, weight, weight_scale, weight_global_scale, size_n, size_k
+            )
+            if out is not None:
+                return out
         out = marlinw_attn.gemm(
             x, weight, weight_scale, weight_global_scale, attn_work, attn_work_ptr, attn_slots
         )
@@ -693,6 +716,19 @@ def _prepare_narrow_attn(
     ):
         layer.marlin_prompt_path = ("narrow_attn", *buffers)
         _prompt_stats["attn"][kind][0] += 1
+        if (
+            marlinw_down128 is not None
+            and getattr(marlinw_down128, "ATTN_ENABLED", False)
+            and (size_n, size_k) in getattr(marlinw_down128, "ATTN_SHAPES", {})
+            and _prompt_check(
+                layer,
+                lambda x: marlinw_down128.gemm_shape(
+                    x, weight, weight_scale, global_scale, size_n, size_k
+                ),
+                (marlinw_attn.ROWS,),
+            )
+        ):
+            _attn128_weights.add(weight.data_ptr())
     else:
         _prompt_stats["attn"][kind][1] += 1
 
@@ -782,6 +818,19 @@ def _prepare_prompt_gemm(layer: torch.nn.Module) -> None:
                     ):
                         _down128_weights.add(weight.data_ptr())
                         _prompt_stats["down128"] += 1
+                        # The same tiles fed by TMA (Muse Glimmer): admitted per layer by the same comparison
+                        # with the single stock call; refused or unavailable -> the cp.async-fed 128x128 kernel.
+                        if getattr(marlinw_down128, "TMA_ENABLED", False):
+                            marlinw_down128.admit_tma(
+                                weight,
+                                _prompt_check(
+                                    layer,
+                                    lambda x: marlinw_down128.gemm_tma(
+                                        x, weight, weight_scale, global_scale
+                                    ),
+                                    (marlinw_down.ROWS,),
+                                ),
+                            )
                     else:
                         _prompt_stats["down128_rejected"] += 1
         if use_narrow and marlin_swiglu is not None:
