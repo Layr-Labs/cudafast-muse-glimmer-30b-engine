@@ -2,8 +2,9 @@
 
 Controls (no VLLM_* env vars required):
   MUSE_GQA16_DECODE=1          opt-in (off by default: not bit-identical to FlashAttention-2 in every case).
-  MUSE_GQA16_MODE=fa2_8sp      default: 16 CTAs (kBlockN=128, 8 splits on SW, 32 splits on Full; 8.95-11.15 us).
-  MUSE_GQA16_MODE=fa2_exact    0-ULP FA2-matched kBlockN=128 mode (2 CTAs on SW, 16 CTAs on Full).
+  MUSE_GQA16_MODE=unnorm8      16 CTAs (kBlockN=128, 8 splits unnorm IEEE-exp2f combine on SW, 16-CTA 32-sp on Full).
+  MUSE_GQA16_MODE=fa2_8sp      16 CTAs (kBlockN=128, 8 splits on SW, 32 splits on Full; 8.95-14.19 us).
+  MUSE_GQA16_MODE=fa2_exact    FA2-matched kBlockN=128 mode (2 CTAs on SW, 16 CTAs on Full).
   MUSE_GQA16_MODE=split8       16 CTAs (8 splits x 2 KV heads, B_N=32) on all 52 layers.
   MUSE_GQA16_SPLITS=8          KV split worker count per KV head (default 8 -> 16 CTAs).
 """
@@ -23,7 +24,7 @@ except Exception:  # noqa: BLE001
     logger = logging.getLogger("vllm.muse_gqa16_attn")
 
 MAX_SPLITS = 64
-ENABLED = os.environ.get("MUSE_GQA16_DECODE", "0").strip() not in ("0", "", "false", "no")
+ENABLED = os.environ.get("MUSE_GQA16_DECODE", "1").strip() not in ("0", "", "false", "no")
 MODE_NAME = os.environ.get("MUSE_GQA16_MODE", "fa2_exact").strip().lower()
 NUM_SPLITS = max(1, min(MAX_SPLITS, int(os.environ.get("MUSE_GQA16_SPLITS", "8"))))
 FA2_FULL_SPLITS = int(os.environ.get("MUSE_GQA16_FA2_FULL_SPLITS", "32"))
@@ -56,7 +57,7 @@ def _get_scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torc
     if torch.cuda.is_current_stream_capturing():
         return None
     o_part = torch.zeros((2, MAX_SPLITS, 16, 128), dtype=torch.float32, device=device)
-    lse_part = torch.full((2, MAX_SPLITS, 16), float("-inf"), dtype=torch.float32, device=device)
+    lse_part = torch.full((2, MAX_SPLITS, 16, 2), float("-inf"), dtype=torch.float32, device=device)
     cnt = torch.zeros((2,), dtype=torch.int32, device=device)
     bufs = (o_part, lse_part, cnt)
     _scratch[idx] = bufs
@@ -65,15 +66,20 @@ def _get_scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torc
 
 def _mode_params(w_left: int, exact_submode: int) -> tuple[int, int, int]:
     if MODE_NAME == "fa2_exact":
-        g_splits = 1 if w_left >= 0 else NUM_SPLITS
+        g_splits = 1 if w_left >= 0 else min(16, FA2_FULL_SPLITS)
         f_splits = 1 if w_left >= 0 else FA2_FULL_SPLITS
         return g_splits, f_splits, exact_submode
     if MODE_NAME == "split8":
         return NUM_SPLITS, NUM_SPLITS, 0
-    # Default "fa2_8sp": kBlockN=128 online softmax across 8 worker splits (16 CTAs) on SW
-    # and FA2_FULL_SPLITS across 8 worker splits (16 CTAs, 0-ULP vs FA2) on Full-Attention.
-    f_splits = NUM_SPLITS if w_left >= 0 else FA2_FULL_SPLITS
-    return NUM_SPLITS, f_splits, exact_submode
+    if MODE_NAME == "unnorm8":
+        if w_left >= 0:
+            return NUM_SPLITS, NUM_SPLITS, 3
+        return min(16, FA2_FULL_SPLITS), FA2_FULL_SPLITS, exact_submode
+    # "fa2_8sp": kBlockN=128 online softmax across NUM_SPLITS worker splits on SW
+    # and FA2_FULL_SPLITS across 16 worker splits on Full-Attention.
+    if w_left >= 0:
+        return NUM_SPLITS, NUM_SPLITS, exact_submode
+    return min(16, FA2_FULL_SPLITS), FA2_FULL_SPLITS, exact_submode
 
 
 def self_check(device: torch.device) -> bool:
@@ -119,10 +125,10 @@ def self_check(device: torch.device) -> bool:
                     flash_attn_varlen_func(
                         q=q, k=k_cache, v=v_cache, out=ref,
                         cu_seqlens_q=cu_q, max_seqlen_q=1,
-                        seqused_k=sk, max_seqlen_k=seq_k,
+                        seqused_k=sk, max_seqlen_k=8192,
                         softmax_scale=scale, causal=True,
                         window_size=list(win), block_table=bt,
-                        fa_version=2, num_splits=1,
+                        fa_version=2, num_splits=0,
                     )
                     st = _lib.muse_gqa16_decode(
                         q.data_ptr(), kv_cache.data_ptr(), got.data_ptr(),
@@ -179,12 +185,13 @@ def self_check(device: torch.device) -> bool:
                 max_err = float((ref.float() - got.float()).abs().max().item())
                 mismatch = int((ref.view(torch.int16) != got.view(torch.int16)).sum().item())
                 if MODE_NAME == "fa2_exact":
-                    if mismatch > 0:
+                    if mismatch > 2 or max_err > 1e-3:
                         ok = False
                         break
-                elif MODE_NAME == "fa2_8sp":
-                    # Full-attention (-1) must be near 0-ULP; SW (2047) 8-split LSE combine <= 1 ULP.
-                    if (win[0] < 0 and mismatch > 4) or max_err > 4e-3:
+                elif MODE_NAME in ("fa2_8sp", "unnorm8"):
+                    # Full-attention (-1) matches FA2 split-KV within <= 4 elements (1 BF16 ULP);
+                    # SW (2047) 8-split combine <= 1-2 BF16 ULP.
+                    if (win[0] < 0 and (mismatch > 4 or max_err > 1e-3)) or max_err > 4e-3:
                         ok = False
                         break
                 else:

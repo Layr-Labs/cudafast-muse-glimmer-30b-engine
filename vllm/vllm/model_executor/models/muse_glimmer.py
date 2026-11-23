@@ -1384,6 +1384,89 @@ direct_register_custom_op(
 )
 
 
+_QK_CACHE_FUSED_LAYERS: int = 0
+_QK_CACHE_FUSED_LOGGED: bool = False
+
+
+def _muse_qk_norm_rope_cache_impl(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    qscale: float,
+    use_rope: bool,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global _QK_CACHE_FUSED_LOGGED
+    if not _QK_CACHE_FUSED_LOGGED:
+        _QK_CACHE_FUSED_LOGGED = True
+        logger.info(
+            "muse_glimmer_qk_norm_rope_cache: active across %d attention layers",
+            _QK_CACHE_FUSED_LAYERS,
+        )
+    import muse_qk_glue
+    from vllm.model_executor.layers.attention.attention import (
+        _resolve_layer_name,
+        get_attention_context,
+    )
+
+    resolved = _resolve_layer_name(layer_name)
+    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(resolved)
+    if (
+        layer_slot_mapping is not None
+        and kv_cache is not None
+        and kv_cache.dtype == qkv.dtype
+    ):
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(
+            attn_layer.head_size, dim=-1
+        )
+        q = muse_qk_glue.run_qk_norm_rope_cache(
+            qkv,
+            positions,
+            cos_sin_cache,
+            key_cache,
+            value_cache,
+            layer_slot_mapping,
+            eps,
+            qscale,
+            use_rope,
+        )
+        return q, qkv.new_empty(0)
+    q, k = muse_qk_glue.run_qk_norm_rope(
+        qkv, positions, cos_sin_cache, eps, qscale, use_rope
+    )
+    if layer_slot_mapping is not None and kv_cache is not None:
+        v = qkv[:, 4352:]
+        attn_layer.impl.do_kv_cache_update(
+            attn_layer,
+            k.view(-1, attn_layer.num_kv_heads, attn_layer.head_size),
+            v.view(-1, attn_layer.num_kv_heads, attn_layer.head_size_v),
+            kv_cache,
+            layer_slot_mapping,
+        )
+    return q, qkv.new_empty(0)
+
+
+def _muse_qk_norm_rope_cache_fake(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    qscale: float,
+    use_rope: bool,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return qkv.new_empty((qkv.shape[0], 4096)), qkv.new_empty(0)
+
+
+direct_register_custom_op(
+    op_name="muse_glimmer_qk_norm_rope_cache",
+    op_func=_muse_qk_norm_rope_cache_impl,
+    fake_impl=_muse_qk_norm_rope_cache_fake,
+    mutates_args=[],
+)
+
+
 def _init_qk_fused() -> bool:
     if not current_platform.is_cuda():
         return False
@@ -1391,6 +1474,27 @@ def _init_qk_fused() -> bool:
         import muse_qk_glue
 
         return muse_qk_glue.available(torch.device("cuda"))
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
+def _init_qk_cache_fused() -> bool:
+    if not current_platform.is_cuda():
+        return False
+    if os.environ.get("VLLM_MUSE_GLIMMER_QK_CACHE_FUSED", "0").strip() in (
+        "0",
+        "",
+        "false",
+        "no",
+    ):
+        return False
+    try:
+        import muse_qk_glue
+
+        fn = getattr(muse_qk_glue, "available_cache", None)
+        if callable(fn):
+            return bool(fn(torch.device("cuda")))
+        return False
     except (ImportError, OSError, RuntimeError):
         return False
 
@@ -1654,6 +1758,27 @@ class MuseGlimmerAttention(nn.Module):
         self._fp8_shared_input_scale = False
         self._fp8_dual_prefill = False
         self._bf16_dual_prefill = False
+        from vllm.v1.attention.backend import AttentionType
+        from vllm.v1.kv_cache_interface import is_quantized_kv_cache
+
+        self._use_qk_cache_fused = (
+            self._use_qk_fused
+            and self.gate_fork_point != "attn"
+            and getattr(self.attn, "kv_sharing_target_layer_name", None) is None
+            and not getattr(self.attn, "calculate_kv_scales", False)
+            and getattr(self.attn, "query_quant", None) is None
+            and getattr(self.attn, "attn_type", None) == AttentionType.DECODER
+            and getattr(getattr(self.attn, "impl", None), "dcp_world_size", 1) == 1
+            and not is_quantized_kv_cache(self.attn.kv_cache_dtype)
+            and not self.attn.attn_backend.forward_includes_kv_cache_update
+            and self.attn.attn_backend.get_name() == "FLASH_ATTN"
+            and _init_qk_cache_fused()
+        )
+        if self._use_qk_cache_fused:
+            global _QK_CACHE_FUSED_LAYERS
+            _QK_CACHE_FUSED_LAYERS += 1
+            if _QK_CACHE_FUSED_LAYERS == 1:
+                logger.info("muse_glimmer_qk_norm_rope_cache: enabled at model init")
 
     def _output_gate_before_attention(
         self, hidden_states: torch.Tensor, chain_inputs: list[torch.Tensor]
@@ -1697,42 +1822,66 @@ class MuseGlimmerAttention(nn.Module):
             qkv, _ = self.qkv_proj(hidden_states)
             if self.gate_fork_point == "qkv":
                 gate, gate_dep = self._output_gate_before_attention(hidden_states, [qkv])
-        if self._use_qk_fused and qkv.is_cuda and qkv.dtype == torch.bfloat16:
-            v = qkv[:, self.q_size + self.kv_size :]
+        if self._use_qk_cache_fused and qkv.is_cuda and qkv.dtype == torch.bfloat16:
             cache = (
                 self.rotary_emb.cos_sin_cache
                 if self.rotary_emb is not None
                 else positions
             )
-            q, k = torch.ops.vllm.muse_glimmer_qk_norm_rope(
+            q, kv_dummy_dep = torch.ops.vllm.muse_glimmer_qk_norm_rope_cache(
                 qkv,
                 positions,
                 cache,
                 float(self.qk_norm.eps),
                 float(self.scale_query_by),
                 self.rotary_emb is not None,
+                self.attn.layer_name,
+            )
+            attn_output = self.attn(
+                q,
+                qkv[:, self.q_size : self.q_size + self.kv_size],
+                qkv[:, self.q_size + self.kv_size :],
+                kv_cache_dummy_dep=kv_dummy_dep,
             )
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self._use_qk_fused and qkv.is_cuda and qkv.dtype == torch.bfloat16:
+                v = qkv[:, self.q_size + self.kv_size :]
+                cache = (
+                    self.rotary_emb.cos_sin_cache
+                    if self.rotary_emb is not None
+                    else positions
+                )
+                q, k = torch.ops.vllm.muse_glimmer_qk_norm_rope(
+                    qkv,
+                    positions,
+                    cache,
+                    float(self.qk_norm.eps),
+                    float(self.scale_query_by),
+                    self.rotary_emb is not None,
+                )
+            else:
+                q, k, v = qkv.split(
+                    [self.q_size, self.kv_size, self.kv_size], dim=-1
+                )
 
-            if self.use_qk_norm:
-                # QK-norm over head_dim, fp32, applied BEFORE RoPE; then pre-scale q.
-                q = q.reshape(-1, self.head_dim)
-                q = self.qk_norm(q).reshape(-1, self.q_size) * self.scale_query_by
-                k = k.reshape(-1, self.head_dim)
-                k = self.qk_norm(k).reshape(-1, self.kv_size)
-                q = q.to(v.dtype)
-                k = k.to(v.dtype)
+                if self.use_qk_norm:
+                    # QK-norm over head_dim, fp32, applied BEFORE RoPE; then pre-scale q.
+                    q = q.reshape(-1, self.head_dim)
+                    q = self.qk_norm(q).reshape(-1, self.q_size) * self.scale_query_by
+                    k = k.reshape(-1, self.head_dim)
+                    k = self.qk_norm(k).reshape(-1, self.kv_size)
+                    q = q.to(v.dtype)
+                    k = k.to(v.dtype)
 
-            if self.rotary_emb is not None:
-                q, k = self.rotary_emb(positions, q, k)
+                if self.rotary_emb is not None:
+                    q, k = self.rotary_emb(positions, q, k)
 
-        if self.gate_fork_point == "attn":
-            gate, gate_dep = self._output_gate_before_attention(
-                hidden_states, [q, k, v]
-            )
+            if self.gate_fork_point == "attn":
+                gate, gate_dep = self._output_gate_before_attention(
+                    hidden_states, [q, k, v]
+                )
 
-        attn_output = self.attn(q, k, v)
+            attn_output = self.attn(q, k, v)
 
         if self.use_output_gate:
             if gate is None:

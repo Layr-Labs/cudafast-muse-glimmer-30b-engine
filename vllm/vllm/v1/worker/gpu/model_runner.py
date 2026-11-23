@@ -297,6 +297,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self._ones_1_i32 = torch.ones(1, dtype=torch.int32, device=self.device)
         self._zeros_1_i32 = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self._req_idx_gpu = torch.arange(
+            max(2, self.max_num_reqs), dtype=torch.int32, device=self.device
+        )
+        self._req_idx_views: list[torch.Tensor] = [
+            self._zeros_1_i32,
+            self._ones_1_i32,
+            *[
+                self._req_idx_gpu[i : i + 1]
+                for i in range(2, max(2, self.max_num_reqs))
+            ],
+        ]
+        self._zp_cg_ok: bool | None = None
         self._qsl_const_gpu: dict[int, torch.Tensor] = {}
         for _nt in (1, 2, 512):
             _qsl = [0] + [_nt] * self.max_num_reqs
@@ -980,9 +992,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Mark trailing cudagraph-padding rows so kernels can skip work for
             # them when supported.
             self.input_buffers.is_padding[:num_tokens].fill_(False)
-            self.input_buffers.is_padding[num_tokens:num_tokens_after_padding].fill_(
-                True
-            )
+            if num_tokens < num_tokens_after_padding:
+                self.input_buffers.is_padding[num_tokens:num_tokens_after_padding].fill_(
+                    True
+                )
         num_tokens_per_req = scheduler_output.num_scheduled_tokens
         num_reqs = len(num_tokens_per_req)
 
@@ -993,10 +1006,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
         idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int32, count=num_reqs)
-        if num_reqs == 1 and int(idx_mapping_np[0]) == 0:
-            idx_mapping = self._zeros_1_i32
-        elif num_reqs == 1 and int(idx_mapping_np[0]) == 1:
-            idx_mapping = self._ones_1_i32
+        if num_reqs == 1 and 0 <= int(idx_mapping_np[0]) < len(self._req_idx_views):
+            idx_mapping = self._req_idx_views[int(idx_mapping_np[0])]
         else:
             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
@@ -1362,11 +1373,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             return False
         if self.cudagraph_manager is not None:
-            bd, _ = dispatch_cg_and_sync_dp(
-                self.cudagraph_manager, 1, pg.num_tokens, pg.num_tokens, 1, 0,
-                need_eager=False, num_active_loras=0,
-            )
-            if bd.cg_mode != CUDAGraphMode.NONE or bd.num_tokens != pg.num_tokens:
+            if self._zp_cg_ok is None:
+                bd, _ = dispatch_cg_and_sync_dp(
+                    self.cudagraph_manager, 1, pg.num_tokens, pg.num_tokens, 1, 0,
+                    need_eager=False, num_active_loras=0,
+                )
+                self._zp_cg_ok = (bd.cg_mode == CUDAGraphMode.NONE and bd.num_tokens == pg.num_tokens)
+            if not self._zp_cg_ok:
                 return False
         return True
 
@@ -1375,18 +1388,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert pg is not None
         req_idx = self.req_states.req_id_to_index[req_id]
         idx_mapping_np = np.array([req_idx], dtype=np.int32)
-        if req_idx == 0:
-            idx_mapping = self._zeros_1_i32
-        elif req_idx == 1:
-            idx_mapping = self._ones_1_i32
+        if 0 <= req_idx < len(self._req_idx_views):
+            idx_mapping = self._req_idx_views[req_idx]
         else:
             idx_mapping = torch.tensor([req_idx], dtype=torch.int32, device=self.device)
-        num_sched = np.array([n], dtype=np.int32)
-        qsl_np = np.array([0, n], dtype=np.int32)
-        prefill_len_np = np.array([n], dtype=np.int32)
-        zero_1_np = np.zeros(1, dtype=np.int32)
-        is_pref_np = np.array([True], dtype=np.bool_)
-        seq_ub = torch.from_numpy(num_sched.copy())
         return InputBatch(
             req_ids=[req_id],
             num_reqs=1,
@@ -1395,20 +1400,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping_np=idx_mapping_np,
             expanded_idx_mapping=idx_mapping,
             expanded_local_pos=self._expanded_local_pos_1_gpu,
-            num_scheduled_tokens=num_sched,
+            num_scheduled_tokens=pg._zp_num_sched_np,
             num_tokens=n,
             num_tokens_after_padding=n,
             num_draft_tokens=0,
             num_draft_tokens_per_req=None,
             query_start_loc=self.input_buffers.query_start_loc[:2],
-            query_start_loc_np=qsl_np,
+            query_start_loc_np=pg._zp_qsl_np,
             seq_lens=self.input_buffers.seq_lens[:1],
-            seq_lens_cpu_upper_bound=seq_ub,
+            seq_lens_cpu_upper_bound=pg._zp_seq_ub,
             dcp_local_seq_lens=None,
-            num_computed_tokens_np=zero_1_np,
-            prefill_len_np=prefill_len_np,
-            num_computed_prefill_tokens_np=zero_1_np,
-            is_prefilling_np=is_pref_np,
+            num_computed_tokens_np=pg._zp_zero_1_np,
+            prefill_len_np=pg._zp_prefill_len_np,
+            num_computed_prefill_tokens_np=pg._zp_zero_1_np,
+            is_prefilling_np=pg._zp_is_pref_np,
             max_seq_len_np=None,
             input_ids=self.input_buffers.input_ids[:n],
             positions=self.input_buffers.positions[:n],

@@ -143,9 +143,14 @@ int launch_tma4(const int4* input, const int4* weight, int4* output, int4* parti
   static int cached_shared[16] = {0};
   int shared = (device >= 0 && device < 16) ? cached_shared[device] : 0;
   if (shared == 0) {
-    auto status = cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status != cudaSuccess) return status;
-    status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
+    if constexpr (TileN == 64 && Threads == 128) {
+      // Actual usage is 45,904 B (16 KiB B + 2 KiB S + 16 KiB A + 11.1 KiB TMA4/red); 48 KiB fits 2 CTAs/SM.
+      shared = 48 * 1024;
+    } else {
+      auto status = cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+      if (status != cudaSuccess) return status;
+    }
+    auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
     if (status != cudaSuccess) return status;
     if (device >= 0 && device < 16) cached_shared[device] = shared;
   }

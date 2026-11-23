@@ -367,6 +367,38 @@ class PrefillGraph:
             ]
             self._zp_pin_bt_np = [t.numpy() for t in self._zp_pin_bt]
             self._zp_bs_offsets = [np.arange(bs, dtype=np.int64) for bs in bt.block_sizes]
+            self._zp_num_sched_np = np.array([n], dtype=np.int32)
+            self._zp_qsl_np = np.array([0, n], dtype=np.int32)
+            self._zp_prefill_len_np = np.array([n], dtype=np.int32)
+            self._zp_zero_1_np = np.zeros(1, dtype=np.int32)
+            self._zp_is_pref_np = np.array([True], dtype=np.bool_)
+            self._zp_seq_ub = torch.from_numpy(self._zp_num_sched_np.copy())
+            self._zp_const_graph: torch.cuda.CUDAGraph | None = None
+            self._zp_const_skip_pad = False
+            try:
+                from vllm import envs
+                skip_pad = bool(envs.VLLM_MOE_SKIP_PADDING)
+                raw_pos = ib.positions[:n]
+                raw_pad = ib.is_padding[:n]
+                # Warmup before capture
+                if skip_pad:
+                    raw_pad.fill_(False)
+                raw_pos.copy_(self._zp_positions_gpu, non_blocking=True)
+                ib.seq_lens[:1].copy_(self._zp_seq_lens_gpu[:1], non_blocking=True)
+                ib.query_start_loc[:2].copy_(self._zp_qsl_gpu[:2], non_blocking=True)
+                torch.cuda.synchronize(dev)
+                cg = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(cg):
+                    if skip_pad:
+                        raw_pad.fill_(False)
+                    raw_pos.copy_(self._zp_positions_gpu, non_blocking=True)
+                    ib.seq_lens[:1].copy_(self._zp_seq_lens_gpu[:1], non_blocking=True)
+                    ib.query_start_loc[:2].copy_(self._zp_qsl_gpu[:2], non_blocking=True)
+                torch.cuda.synchronize(dev)
+                self._zp_const_graph = cg
+                self._zp_const_skip_pad = skip_pad
+            except Exception:  # noqa: BLE001
+                self._zp_const_graph = None
         except Exception as exc:  # noqa: BLE001
             logger.warning("Prefill graph zero-prep init skipped: %s", exc)
             self._zp_failed = True
@@ -547,12 +579,15 @@ class PrefillGraph:
             bt_np = self._zp_pin_bt_np[g]
             bt_np[:nb] = bids_arr
         self._zp_pin_ids_np[:] = prefill_token_ids
-        if skip_padding:
-            raw_pad.fill_(False)
+        if self._zp_const_graph is not None and skip_padding == self._zp_const_skip_pad:
+            self._zp_const_graph.replay()
+        else:
+            if skip_padding:
+                raw_pad.fill_(False)
+            raw_pos.copy_(self._zp_positions_gpu, non_blocking=True)
+            input_buffers.seq_lens[:1].copy_(self._zp_seq_lens_gpu[:1], non_blocking=True)
+            input_buffers.query_start_loc[:2].copy_(self._zp_qsl_gpu[:2], non_blocking=True)
         raw_ids.copy_(self._zp_pin_ids, non_blocking=True)
-        raw_pos.copy_(self._zp_positions_gpu, non_blocking=True)
-        input_buffers.seq_lens[:1].copy_(self._zp_seq_lens_gpu[:1], non_blocking=True)
-        input_buffers.query_start_loc[:2].copy_(self._zp_qsl_gpu[:2], non_blocking=True)
         for g in range(block_tables.num_kv_cache_groups):
             nb = len(block_ids[g])
             block_tables.input_block_tables[g][0, :nb].copy_(self._zp_pin_bt[g][:nb], non_blocking=True)

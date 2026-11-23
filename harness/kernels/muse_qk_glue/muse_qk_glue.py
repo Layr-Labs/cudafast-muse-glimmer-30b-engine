@@ -1,6 +1,8 @@
-"""One-pass fused Q/K RMSNorm + query pre-scale + NEOX RoPE for MuseGlimmerAttention.
+"""One-pass fused Q/K RMSNorm + query pre-scale + NEOX RoPE (+ KV cache scatter) for MuseGlimmerAttention.
 
-Kill switch: ``VLLM_MUSE_GLIMMER_QK_FUSED=0`` restores the stock PyTorch/Inductor path.
+Kill switches:
+  ``VLLM_MUSE_GLIMMER_QK_FUSED=0`` restores the stock PyTorch/Inductor QK path.
+  ``VLLM_MUSE_GLIMMER_QK_CACHE_FUSED=0`` keeps ``reshape_and_cache_flash`` separate.
 """
 from __future__ import annotations
 
@@ -13,12 +15,14 @@ import torch
 
 try:
     from vllm.logger import init_logger
-    logger = init_logger(__name__)
+    logger = init_logger("vllm.muse_qk_glue")
 except Exception:  # noqa: BLE001
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger("vllm.muse_qk_glue")
 
 _lib = None
 _multi = None
+_cache_fn = None
+_cache_multi = None
 try:
     _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_qk_glue.so")))
     _lib.muse_qk_norm_rope.argtypes = [
@@ -32,18 +36,40 @@ try:
     if _multi is not None:
         _multi.argtypes = list(_lib.muse_qk_norm_rope.argtypes[:-1]) + [ctypes.c_int, ctypes.c_void_p]
         _multi.restype = ctypes.c_int
+    _cache_fn = getattr(_lib, "muse_qk_norm_rope_cache", None)
+    if _cache_fn is not None:
+        _cache_fn.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ]
+        _cache_fn.restype = ctypes.c_int
+    _cache_multi = getattr(_lib, "muse_qk_norm_rope_cache_multi", None)
+    if _cache_multi is not None:
+        _cache_multi.argtypes = list(_cache_fn.argtypes[:-1]) + [ctypes.c_int, ctypes.c_void_p]
+        _cache_multi.restype = ctypes.c_int
 except OSError:
     _lib = None
     _multi = None
+    _cache_fn = None
+    _cache_multi = None
 
 MULTI_HPW = int(os.environ.get("MUSE_QK_MULTI_HPW", "9"))
 MULTI_MIN_TOKENS = 64
 DECODE_HPW = int(os.environ.get("MUSE_QK_DECODE_HPW", "2"))
+CACHE_MULTI_HPW = MULTI_HPW if MULTI_HPW in (2, 6, 9) else 9
+CACHE_DECODE_HPW = DECODE_HPW if DECODE_HPW in (2, 6, 9) else 2
 _multi_state: dict[str, bool | None] = {"admitted": None}
 _decode_state: dict[str, bool | None] = {"admitted": None}
+_cache_multi_state: dict[str, bool | None] = {"admitted": None}
+_cache_decode_state: dict[str, bool | None] = {"admitted": None}
 
 ENABLED = os.environ.get("VLLM_MUSE_GLIMMER_QK_FUSED", "1").strip() not in ("0", "", "false", "no")
+CACHE_ENABLED = os.environ.get("VLLM_MUSE_GLIMMER_QK_CACHE_FUSED", "0").strip() not in ("0", "", "false", "no")
 _checked: dict[int, bool] = {}
+_cache_checked: dict[int, bool] = {}
 
 
 def _ref_qk_norm_rope(
@@ -155,12 +181,157 @@ def self_check(device: torch.device) -> bool:
     return ok
 
 
+def self_check_cache(device: torch.device) -> bool:
+    """Verify fused Q/K RMSNorm + RoPE + KV-cache scatter matches run_qk_norm_rope + scatter bit-for-bit."""
+    if not ENABLED or not CACHE_ENABLED or _cache_fn is None or device.type != "cuda":
+        return False
+    if not self_check(device):
+        return False
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    cached = _cache_checked.get(idx)
+    if cached is not None:
+        return cached
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    ok = False
+    try:
+        gen = torch.Generator(device=device).manual_seed(20261124)
+        t_idx = torch.arange(128, device=device, dtype=torch.float32)
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, 128, 2, device=device, dtype=torch.float32) / 128.0))
+        freqs = torch.einsum("i,j->ij", t_idx, inv_freq)
+        cache_bf16 = torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(torch.bfloat16).contiguous()
+        cache_fp32 = cache_bf16.float().contiguous()
+        eps, qscale = 1e-5, 3.869140625
+        stream = torch.cuda.current_stream(device).cuda_stream
+        ok = True
+
+        # Test both HND and NHD KV cache layouts, M in {1, 16, 128}, RoPE & NoPE,
+        # FP32 & BF16 cos_sin_cache, -1 PAD_SLOT_ID, and truncated slot_mapping.
+        for layout in ("HND", "NHD"):
+            for m, n_slots in ((1, 1), (16, 12), (128, 120)):
+                qkv = (torch.randn((m, 4608), generator=gen, device=device) * 2.0).to(torch.bfloat16).contiguous()
+                pos = torch.arange(m, dtype=torch.int64, device=device)
+                slots = torch.tensor(
+                    [(-1 if i % 5 == 3 else (i * 7 + 3) % (8 * 16)) for i in range(n_slots)],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                for use_rope in (True, False):
+                    for cs in ((cache_fp32, cache_bf16) if use_rope else (cache_fp32,)):
+                        if layout == "HND":
+                            kv_ref = torch.full((8, 2, 16, 256), 7.5, dtype=torch.bfloat16, device=device)
+                        else:
+                            kv_ref = torch.full((8, 16, 2, 256), 7.5, dtype=torch.bfloat16, device=device).permute(0, 2, 1, 3)
+                        kv_got = kv_ref.clone()
+
+                        rq, rk = run_qk_norm_rope(qkv, pos, cs, eps, qscale, use_rope)
+                        rk_h = rk.view(m, 2, 128)
+                        rv_h = qkv[:, 4352:].view(m, 2, 128)
+                        kc_ref, vc_ref = kv_ref.transpose(1, 2).split(128, dim=-1)
+                        for ti in range(n_slots):
+                            sl = int(slots[ti].item())
+                            if sl >= 0:
+                                b, o = sl // 16, sl % 16
+                                kc_ref[b, o].copy_(rk_h[ti])
+                                vc_ref[b, o].copy_(rv_h[ti])
+
+                        kc_got, vc_got = kv_got.transpose(1, 2).split(128, dim=-1)
+                        cf32 = int(cs.dtype == torch.float32)
+                        c_rows = int(cs.shape[0]) if use_rope else 0
+                        p_ptr = pos.data_ptr() if use_rope else 0
+                        c_ptr = cs.data_ptr() if use_rope else 0
+                        oq = qkv.new_empty((m, 4096))
+                        st = _cache_fn(
+                            qkv.data_ptr(), p_ptr, c_ptr, oq.data_ptr(),
+                            kc_got.data_ptr(), vc_got.data_ptr(), slots.data_ptr(),
+                            m, n_slots, c_rows, 16,
+                            kc_got.stride(0), kc_got.stride(1), kc_got.stride(2),
+                            eps, qscale, int(use_rope), cf32, stream,
+                        )
+                        torch.cuda.synchronize()
+                        if st != 0 or not (
+                            torch.equal(rq.view(torch.int16), oq.view(torch.int16))
+                            and torch.equal(kv_ref.view(torch.int16), kv_got.view(torch.int16))
+                        ):
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    break
+            if not ok:
+                break
+
+        if ok and _cache_multi is not None:
+            for tag, state_dict, n_tok, hpw in (
+                ("decode", _cache_decode_state, 1, CACHE_DECODE_HPW),
+                ("prompt", _cache_multi_state, 128, CACHE_MULTI_HPW),
+            ):
+                mok = True
+                for use_rope in (True, False):
+                    for cs in ((cache_fp32, cache_bf16) if use_rope else (cache_fp32,)):
+                        qkv = (torch.randn((n_tok, 4608), generator=gen, device=device) * 2.0).to(torch.bfloat16).contiguous()
+                        pos = torch.arange(n_tok, dtype=torch.int64, device=device)
+                        slots = torch.arange(n_tok, dtype=torch.int64, device=device)
+                        kv0 = torch.zeros((16, 2, 16, 256), dtype=torch.bfloat16, device=device)
+                        kv1 = kv0.clone()
+                        kc0, vc0 = kv0.transpose(1, 2).split(128, dim=-1)
+                        kc1, vc1 = kv1.transpose(1, 2).split(128, dim=-1)
+                        q0, q1 = qkv.new_empty((n_tok, 4096)), qkv.new_empty((n_tok, 4096))
+                        cf32 = int(cs.dtype == torch.float32)
+                        c_rows = int(cs.shape[0]) if use_rope else 0
+                        p_ptr = pos.data_ptr() if use_rope else 0
+                        c_ptr = cs.data_ptr() if use_rope else 0
+                        st0 = _cache_fn(
+                            qkv.data_ptr(), p_ptr, c_ptr, q0.data_ptr(),
+                            kc0.data_ptr(), vc0.data_ptr(), slots.data_ptr(),
+                            n_tok, n_tok, c_rows, 16,
+                            kc0.stride(0), kc0.stride(1), kc0.stride(2),
+                            eps, qscale, int(use_rope), cf32, stream,
+                        )
+                        st1 = _cache_multi(
+                            qkv.data_ptr(), p_ptr, c_ptr, q1.data_ptr(),
+                            kc1.data_ptr(), vc1.data_ptr(), slots.data_ptr(),
+                            n_tok, n_tok, c_rows, 16,
+                            kc1.stride(0), kc1.stride(1), kc1.stride(2),
+                            eps, qscale, int(use_rope), cf32, hpw, stream,
+                        )
+                        torch.cuda.synchronize()
+                        if st0 or st1 or not (
+                            torch.equal(q0.view(torch.int16), q1.view(torch.int16))
+                            and torch.equal(kv0.view(torch.int16), kv1.view(torch.int16))
+                        ):
+                            mok = False
+                            break
+                    if not mok:
+                        break
+                state_dict["admitted"] = mok
+                logger.info("muse_qk_glue: fused QK+cache %s HPW=%d %s", tag, hpw, "admitted" if mok else "REJECTED")
+    except Exception:  # noqa: BLE001
+        logger.warning("muse_qk_glue: cache self-check raised on cuda:%d", idx, exc_info=True)
+        ok = False
+    _cache_checked[idx] = ok
+    if ok:
+        logger.info("muse_qk_glue: fused Q/K RMSNorm + RoPE + KV-cache scatter admitted on cuda:%d", idx)
+    else:
+        logger.warning("muse_qk_glue: cache self-check failed on cuda:%d; keeping separate cache path", idx)
+    return ok
+
+
 def available(device: torch.device | None = None) -> bool:
     if not ENABLED or _lib is None:
         return False
     if device is None:
         return True
     return self_check(device)
+
+
+def available_cache(device: torch.device | None = None) -> bool:
+    if not ENABLED or not CACHE_ENABLED or _cache_fn is None:
+        return False
+    if device is None:
+        return True
+    return self_check_cache(device)
 
 
 def run_qk_norm_rope(
@@ -215,6 +386,89 @@ def run_qk_norm_rope(
     if st:
         raise RuntimeError(f"muse_qk_norm_rope failed with CUDA error {st}")
     return q_out, k_out
+
+
+def run_qk_norm_rope_cache(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    eps: float,
+    qscale: float,
+    use_rope: bool,
+) -> torch.Tensor:
+    if _cache_fn is None:
+        raise RuntimeError("muse_qk_norm_rope_cache symbol unavailable")
+    if not qkv.is_contiguous():
+        qkv = qkv.contiguous()
+    num_tokens = int(qkv.shape[0])
+    q_out = qkv.new_empty((num_tokens, 4096))
+    if num_tokens == 0:
+        return q_out
+    if (
+        key_cache.dtype != torch.bfloat16
+        or value_cache.dtype != torch.bfloat16
+        or key_cache.ndim != 4
+        or value_cache.ndim != 4
+        or key_cache.shape[2] != 2
+        or key_cache.shape[3] != 128
+        or value_cache.shape[2] != 2
+        or value_cache.shape[3] != 128
+        or key_cache.stride(3) != 1
+        or value_cache.stride(3) != 1
+        or key_cache.stride()[:3] != value_cache.stride()[:3]
+    ):
+        raise RuntimeError(
+            f"Unsupported KV cache layout for fused QK+cache: "
+            f"k_shape={tuple(key_cache.shape)} k_stride={key_cache.stride()} "
+            f"v_shape={tuple(value_cache.shape)} v_stride={value_cache.stride()}"
+        )
+    if slot_mapping.dtype != torch.int64:
+        slot_mapping = slot_mapping.to(torch.int64)
+    if not slot_mapping.is_contiguous():
+        slot_mapping = slot_mapping.contiguous()
+    num_slot_tokens = int(slot_mapping.shape[0])
+    block_size = int(key_cache.shape[1])
+    stride_blk = int(key_cache.stride(0))
+    stride_slot = int(key_cache.stride(1))
+    stride_head = int(key_cache.stride(2))
+
+    if use_rope:
+        assert cos_sin_cache is not None
+        if positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+        if not positions.is_contiguous():
+            positions = positions.contiguous()
+        pos_ptr = positions.data_ptr()
+        cache_ptr = cos_sin_cache.data_ptr()
+        cache_rows = int(cos_sin_cache.shape[0])
+        cache_fp32 = int(cos_sin_cache.dtype == torch.float32)
+    else:
+        pos_ptr = 0
+        cache_ptr = 0
+        cache_rows = 0
+        cache_fp32 = 1
+
+    with torch.cuda.device(qkv.device):
+        stream = torch.cuda.current_stream(qkv.device).cuda_stream
+        args = (
+            qkv.data_ptr(), pos_ptr, cache_ptr, q_out.data_ptr(),
+            key_cache.data_ptr(), value_cache.data_ptr(), slot_mapping.data_ptr(),
+            num_tokens, num_slot_tokens, cache_rows, block_size,
+            stride_blk, stride_slot, stride_head,
+            float(eps), float(qscale), int(use_rope), cache_fp32,
+        )
+        if num_tokens == 1 and CACHE_DECODE_HPW > 0 and _cache_multi is not None and _cache_decode_state["admitted"]:
+            st = _cache_multi(*args, CACHE_DECODE_HPW, stream)
+        elif num_tokens > MULTI_MIN_TOKENS and CACHE_MULTI_HPW > 0 and _cache_multi is not None and _cache_multi_state["admitted"]:
+            st = _cache_multi(*args, CACHE_MULTI_HPW, stream)
+        else:
+            st = _cache_fn(*args, stream)
+    if st:
+        raise RuntimeError(f"muse_qk_norm_rope_cache failed with CUDA error {st}")
+    return q_out
 
 
 def _multi_ok(args, qkv, positions, cos_sin_cache, stream) -> bool:

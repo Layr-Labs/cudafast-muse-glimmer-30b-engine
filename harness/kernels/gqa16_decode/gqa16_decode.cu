@@ -15,8 +15,6 @@
 namespace muse_gqa16 {
 
 constexpr int kMaxSplits = 64;
-constexpr float kLog2e = 1.44269504088896340736f;
-constexpr float kLn2   = 0.69314718055994530942f;
 
 struct __align__(128) SharedStorage {
   uint4 kv[3][32][16];     // 3 x 8 KiB = 24 KiB (128B XOR swizzled: c_phys = c ^ (r & 7))
@@ -289,7 +287,7 @@ __device__ __forceinline__ void combine_splits_epilogue(
     const float lse_s = ld_cg_f32(lse_head + s * 16 + q_local);
     if (lse_s != -INFINITY) {
       sum_exp += Base2LSE ? fast_exp2f(lse_s - lse_max)
-                          : fast_exp2f((lse_s - lse_max) * kLog2e);
+                          : expf(lse_s - lse_max);
     }
   }
 
@@ -317,11 +315,11 @@ __device__ __forceinline__ void combine_splits_epilogue(
   } else {
     const float lse_logsum = (sum_exp == 0.0f || sum_exp != sum_exp)
         ? INFINITY
-        : (fast_log2f(sum_exp) * kLn2 + lse_max);
+        : (logf(sum_exp) + lse_max);
     for (int s = 0; s < active_splits; ++s) {
       const float lse_s = ld_cg_f32(lse_head + s * 16 + q_local);
       if (lse_s == -INFINITY || lse_logsum == INFINITY) continue;
-      const float w = fast_exp2f((lse_s - lse_logsum) * kLog2e);
+      const float w = expf(lse_s - lse_logsum);
       const float* src = o_head + (s * 16 + q_local) * 128 + d_base;
       const float4 v0 = ld_cg_f32x4(src + 0);
       const float4 v1 = ld_cg_f32x4(src + 4);
@@ -342,6 +340,85 @@ __device__ __forceinline__ void combine_splits_epilogue(
   #pragma unroll
   for (int i = 0; i < 8; ++i) {
     __nv_bfloat162 b2 = __floats2bfloat162_rn(acc[2 * i], acc[2 * i + 1]);
+    packed[i] = *reinterpret_cast<const uint32_t*>(&b2);
+  }
+  __nv_bfloat16* dst = out_ptr + static_cast<int64_t>(kv_head * 16 + q_local) * out_head_stride + d_base;
+  *reinterpret_cast<uint4*>(dst)     = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+  *reinterpret_cast<uint4*>(dst + 8) = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+}
+
+template <bool UseFastRcp>
+__device__ __forceinline__ void combine_splits_epilogue_unnorm(
+    __nv_bfloat16* __restrict__ out_ptr,
+    const float* __restrict__ o_partial,
+    const float* __restrict__ max_sum_partial,
+    int32_t* __restrict__ split_cnt,
+    int kv_head,
+    int grid_splits,
+    int active_splits,
+    float scale_log2,
+    int64_t out_head_stride,
+    int tid) {
+  __threadfence();
+  __syncthreads();
+  int is_last = 0;
+  if (tid == 0) {
+    const int prev = atomicAdd(&split_cnt[kv_head], 1);
+    if (prev == grid_splits - 1) {
+      atomicExch(&split_cnt[kv_head], 0);
+      is_last = 1;
+    }
+  }
+  if (!__syncthreads_or(is_last)) return;
+
+  const int q_local = tid >> 3;
+  const int d_base = (tid & 7) << 4;
+  const float* ms_head = max_sum_partial + kv_head * kMaxSplits * 32;
+  const float* o_head  = o_partial       + kv_head * kMaxSplits * 16 * 128;
+
+  float global_max = -INFINITY;
+  for (int s = 0; s < active_splits; ++s) {
+    const float m_s = ld_cg_f32(ms_head + (s * 16 + q_local) * 2);
+    global_max = fmaxf(global_max, m_s);
+  }
+
+  if (global_max == -INFINITY) {
+    __nv_bfloat16* dst = out_ptr + static_cast<int64_t>(kv_head * 16 + q_local) * out_head_stride + d_base;
+    *reinterpret_cast<uint4*>(dst)     = make_uint4(0u, 0u, 0u, 0u);
+    *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0u, 0u, 0u, 0u);
+    return;
+  }
+
+  float global_sum = 0.0f;
+  float acc[16] = {0.f};
+  for (int s = 0; s < active_splits; ++s) {
+    const float* ms_slot = ms_head + (s * 16 + q_local) * 2;
+    const float m_s = ld_cg_f32(ms_slot);
+    if (m_s == -INFINITY) continue;
+    const float sum_s = ld_cg_f32(ms_slot + 1);
+    const float w = exp2f((m_s - global_max) * scale_log2);
+    global_sum = __fmaf_rn(w, sum_s, global_sum);
+    const float* src = o_head + (s * 16 + q_local) * 128 + d_base;
+    const float4 v0 = ld_cg_f32x4(src + 0);
+    const float4 v1 = ld_cg_f32x4(src + 4);
+    const float4 v2 = ld_cg_f32x4(src + 8);
+    const float4 v3 = ld_cg_f32x4(src + 12);
+    acc[0]  = __fmaf_rn(w, v0.x, acc[0]);  acc[1]  = __fmaf_rn(w, v0.y, acc[1]);
+    acc[2]  = __fmaf_rn(w, v0.z, acc[2]);  acc[3]  = __fmaf_rn(w, v0.w, acc[3]);
+    acc[4]  = __fmaf_rn(w, v1.x, acc[4]);  acc[5]  = __fmaf_rn(w, v1.y, acc[5]);
+    acc[6]  = __fmaf_rn(w, v1.z, acc[6]);  acc[7]  = __fmaf_rn(w, v1.w, acc[7]);
+    acc[8]  = __fmaf_rn(w, v2.x, acc[8]);  acc[9]  = __fmaf_rn(w, v2.y, acc[9]);
+    acc[10] = __fmaf_rn(w, v2.z, acc[10]); acc[11] = __fmaf_rn(w, v2.w, acc[11]);
+    acc[12] = __fmaf_rn(w, v3.x, acc[12]); acc[13] = __fmaf_rn(w, v3.y, acc[13]);
+    acc[14] = __fmaf_rn(w, v3.z, acc[14]); acc[15] = __fmaf_rn(w, v3.w, acc[15]);
+  }
+
+  const bool empty = (global_sum == 0.0f || global_sum != global_sum);
+  const float inv_sum = empty ? 0.0f : (UseFastRcp ? fast_rcpf(global_sum) : (1.0f / global_sum));
+  uint32_t packed[8];
+  #pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    __nv_bfloat162 b2 = __floats2bfloat162_rn(acc[2 * i] * inv_sum, acc[2 * i + 1] * inv_sum);
     packed[i] = *reinterpret_cast<const uint32_t*>(&b2);
   }
   __nv_bfloat16* dst = out_ptr + static_cast<int64_t>(kv_head * 16 + q_local) * out_head_stride + d_base;
@@ -590,7 +667,7 @@ __global__ __launch_bounds__(128, 2) void gqa16_split_chunk32_kernel(
       kv_head, grid_splits, grid_splits, out_head_stride, tid);
 }
 
-template <bool UseFastRcp>
+template <bool UseFastRcp, bool UnnormCombine = false>
 __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
     const __nv_bfloat16* __restrict__ kv_ptr,
@@ -650,7 +727,11 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_kernel(
         return;
       }
       if (tid < 16) {
-        st_cg_f32(lse_partial + (kv_head * kMaxSplits + s_slot) * 16 + tid, -INFINITY);
+        if constexpr (UnnormCombine) {
+          st_cg_f32x2(lse_partial + ((kv_head * kMaxSplits + s_slot) * 16 + tid) * 2, -INFINITY, 0.0f);
+        } else {
+          st_cg_f32(lse_partial + (kv_head * kMaxSplits + s_slot) * 16 + tid, -INFINITY);
+        }
       }
       __syncthreads();
       continue;
@@ -660,37 +741,43 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_kernel(
     float row_max0 = -INFINITY, row_max1 = -INFINITY;
     float row_sum0 = 0.0f, row_sum1 = 0.0f;
 
+    // 3-buffer ring pipeline across K[0..3], V[0..3], and next-block K[0..1].
+    const int first_tok_base = (nb_max - 1) << 7;
+    issue_kv_tile_async<false>(smem.kv[0], kv_ptr, block_table, first_tok_base, k_start, seqlen_k,
+                               block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid);
+    cp_async_commit();
+    issue_kv_tile_async<false>(smem.kv[1], kv_ptr, block_table, first_tok_base + 32, k_start, seqlen_k,
+                               block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid);
+    cp_async_commit();
+
+    int ring_base = 0;
     for (int nb = nb_max - 1; nb >= nb_min; --nb) {
       const int block_tok_base = nb << 7;
       float s_frag[4][4] = {0.f};
 
-      issue_kv_tile_async<false>(smem.kv[0], kv_ptr, block_table, block_tok_base, k_start, seqlen_k,
-                                 block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid);
-      cp_async_commit();
       #pragma unroll
       for (int ch = 0; ch < 4; ++ch) {
-        if (ch + 1 < 4) {
-          issue_kv_tile_async<false>(smem.kv[(ch + 1) & 1], kv_ptr, block_table,
-                                     block_tok_base + ((ch + 1) << 5), k_start, seqlen_k,
-                                     block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid);
-          cp_async_commit();
-          cp_async_wait<1>();
-        } else {
-          cp_async_wait<0>();
-        }
+        cp_async_wait<1>();
         __syncthreads();
+        const int cur_buf = (ring_base + ch) % 3;
+        const int next_buf = (ring_base + ch + 2) % 3;
+        if (ch < 2) {
+          issue_kv_tile_async<false>(smem.kv[next_buf], kv_ptr, block_table,
+                                     block_tok_base + ((ch + 2) << 5), k_start, seqlen_k,
+                                     block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid);
+        } else {
+          issue_kv_tile_async<true>(smem.kv[next_buf], kv_ptr, block_table,
+                                    block_tok_base + ((ch - 2) << 5), k_start, seqlen_k,
+                                    block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid);
+        }
+        cp_async_commit();
         #pragma unroll
         for (int ks = 0; ks < 8; ++ks) {
           uint32_t b_frag[2];
-          ldsm2_k_swizzled(b_frag, smem.kv[ch & 1], warp_id, ks, lane);
+          ldsm2_k_swizzled(b_frag, smem.kv[cur_buf], warp_id, ks, lane);
           mma_m16n8k16_bf16(q_frag[ks], b_frag, s_frag[ch]);
         }
-        __syncthreads();
       }
-
-      issue_kv_tile_async<true>(smem.kv[0], kv_ptr, block_table, block_tok_base, k_start, seqlen_k,
-                                block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid);
-      cp_async_commit();
 
       float m0 = -INFINITY, m1 = -INFINITY;
       #pragma unroll
@@ -755,18 +842,29 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_kernel(
             *reinterpret_cast<const uint32_t*>(&pb1);
       }
 
+      const bool has_next_nb = (nb > nb_min);
+      const int next_tok_base = (nb - 1) << 7;
       #pragma unroll
       for (int ch = 0; ch < 4; ++ch) {
-        if (ch + 1 < 4) {
-          issue_kv_tile_async<true>(smem.kv[(ch + 1) & 1], kv_ptr, block_table,
-                                    block_tok_base + ((ch + 1) << 5), k_start, seqlen_k,
-                                    block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid);
-          cp_async_commit();
+        const int cur_buf = (ring_base + 4 + ch) % 3;
+        const int next_buf = (ring_base + 4 + ch + 2) % 3;
+        if (ch < 2 || has_next_nb) {
           cp_async_wait<1>();
         } else {
           cp_async_wait<0>();
         }
         __syncthreads();
+        if (ch < 2) {
+          issue_kv_tile_async<true>(smem.kv[next_buf], kv_ptr, block_table,
+                                    block_tok_base + ((ch + 2) << 5), k_start, seqlen_k,
+                                    block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid);
+          cp_async_commit();
+        } else if (has_next_nb) {
+          issue_kv_tile_async<false>(smem.kv[next_buf], kv_ptr, block_table,
+                                     next_tok_base + ((ch - 2) << 5), k_start, seqlen_k,
+                                     block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid);
+          cp_async_commit();
+        }
         #pragma unroll
         for (int ks_p = 0; ks_p < 2; ++ks_p) {
           uint32_t p_frag[4];
@@ -774,12 +872,12 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_kernel(
           #pragma unroll
           for (int dt = 0; dt < 4; ++dt) {
             uint32_t v_frag[2];
-            ldsm2_v_trans_swizzled(v_frag, smem.kv[ch & 1], warp_id, dt, ks_p, lane);
+            ldsm2_v_trans_swizzled(v_frag, smem.kv[cur_buf], warp_id, dt, ks_p, lane);
             mma_m16n8k16_bf16(p_frag, v_frag, o_frag[dt]);
           }
         }
-        __syncthreads();
       }
+      ring_base = (ring_base + 2) % 3;
     }
 
     row_sum0 += __shfl_xor_sync(0xffffffffu, row_sum0, 2);
@@ -818,26 +916,46 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_kernel(
     }
 
     float* o_slot = o_partial + (kv_head * kMaxSplits + s_slot) * 16 * 128;
-    #pragma unroll
-    for (int dt = 0; dt < 4; ++dt) {
-      const int d_col = (warp_id << 5) + (dt << 3) + (tid_in_grp << 1);
-      st_cg_f32x2(o_slot + group_id * 128 + d_col, o_frag[dt][0] * inv0, o_frag[dt][1] * inv0);
-      st_cg_f32x2(o_slot + (group_id + 8) * 128 + d_col, o_frag[dt][2] * inv1, o_frag[dt][3] * inv1);
-    }
-    if (warp_id == 0 && tid_in_grp == 0) {
-      const float lse0 = empty0 ? -INFINITY : __fmaf_rn(row_max0, softmax_scale, fast_log2f(tot0) * kLn2);
-      const float lse1 = empty1 ? -INFINITY : __fmaf_rn(row_max1, softmax_scale, fast_log2f(tot1) * kLn2);
-      float* lse_slot = lse_partial + (kv_head * kMaxSplits + s_slot) * 16;
-      st_cg_f32(lse_slot + group_id,     lse0);
-      st_cg_f32(lse_slot + group_id + 8, lse1);
+    if constexpr (UnnormCombine) {
+      #pragma unroll
+      for (int dt = 0; dt < 4; ++dt) {
+        const int d_col = (warp_id << 5) + (dt << 3) + (tid_in_grp << 1);
+        st_cg_f32x2(o_slot + group_id * 128 + d_col, o_frag[dt][0], o_frag[dt][1]);
+        st_cg_f32x2(o_slot + (group_id + 8) * 128 + d_col, o_frag[dt][2], o_frag[dt][3]);
+      }
+      if (warp_id == 0 && tid_in_grp == 0) {
+        float* ms_slot = lse_partial + (kv_head * kMaxSplits + s_slot) * 32;
+        st_cg_f32x2(ms_slot + group_id * 2,       empty0 ? -INFINITY : row_max0, empty0 ? 0.0f : tot0);
+        st_cg_f32x2(ms_slot + (group_id + 8) * 2, empty1 ? -INFINITY : row_max1, empty1 ? 0.0f : tot1);
+      }
+    } else {
+      #pragma unroll
+      for (int dt = 0; dt < 4; ++dt) {
+        const int d_col = (warp_id << 5) + (dt << 3) + (tid_in_grp << 1);
+        st_cg_f32x2(o_slot + group_id * 128 + d_col, o_frag[dt][0] * inv0, o_frag[dt][1] * inv0);
+        st_cg_f32x2(o_slot + (group_id + 8) * 128 + d_col, o_frag[dt][2] * inv1, o_frag[dt][3] * inv1);
+      }
+      if (warp_id == 0 && tid_in_grp == 0) {
+        const float lse0 = empty0 ? -INFINITY : __fmaf_rn(row_max0, softmax_scale, logf(tot0));
+        const float lse1 = empty1 ? -INFINITY : __fmaf_rn(row_max1, softmax_scale, logf(tot1));
+        float* lse_slot = lse_partial + (kv_head * kMaxSplits + s_slot) * 16;
+        st_cg_f32(lse_slot + group_id,     lse0);
+        st_cg_f32(lse_slot + group_id + 8, lse1);
+      }
     }
     __syncthreads();
   }
 
   if (fa2_splits > 1) {
-    combine_splits_epilogue<false>(
-        out_ptr, o_partial, lse_partial, split_cnt,
-        kv_head, grid_splits, fa2_splits, out_head_stride, tid);
+    if constexpr (UnnormCombine) {
+      combine_splits_epilogue_unnorm<UseFastRcp>(
+          out_ptr, o_partial, lse_partial, split_cnt,
+          kv_head, grid_splits, fa2_splits, scale_log2, out_head_stride, tid);
+    } else {
+      combine_splits_epilogue<false>(
+          out_ptr, o_partial, lse_partial, split_cnt,
+          kv_head, grid_splits, fa2_splits, out_head_stride, tid);
+    }
   }
 }
 
@@ -888,7 +1006,20 @@ extern "C" int muse_gqa16_decode(
         q_head_stride, out_head_stride,
         stride_block, stride_slot, stride_kv_head);
   } else if (mode == 1) {
-    muse_gqa16::gqa16_fa2_block128_kernel<true><<<grid, block, 0, stream>>>(
+    muse_gqa16::gqa16_fa2_block128_kernel<true, false><<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q_ptr),
+        static_cast<const __nv_bfloat16*>(kv_ptr),
+        static_cast<__nv_bfloat16*>(out_ptr),
+        static_cast<float*>(o_partial_ptr),
+        static_cast<float*>(lse_partial_ptr),
+        static_cast<int32_t*>(split_cnt_ptr),
+        static_cast<const int32_t*>(seqused_k_ptr),
+        static_cast<const int32_t*>(block_table_ptr),
+        block_size, window_left, fa2_splits, softmax_scale, scale_log2,
+        q_head_stride, out_head_stride,
+        stride_block, stride_slot, stride_kv_head);
+  } else if (mode == 3) {
+    muse_gqa16::gqa16_fa2_block128_kernel<true, true><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q_ptr),
         static_cast<const __nv_bfloat16*>(kv_ptr),
         static_cast<__nv_bfloat16*>(out_ptr),
@@ -901,7 +1032,7 @@ extern "C" int muse_gqa16_decode(
         q_head_stride, out_head_stride,
         stride_block, stride_slot, stride_kv_head);
   } else {
-    muse_gqa16::gqa16_fa2_block128_kernel<false><<<grid, block, 0, stream>>>(
+    muse_gqa16::gqa16_fa2_block128_kernel<false, false><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q_ptr),
         static_cast<const __nv_bfloat16*>(kv_ptr),
         static_cast<__nv_bfloat16*>(out_ptr),

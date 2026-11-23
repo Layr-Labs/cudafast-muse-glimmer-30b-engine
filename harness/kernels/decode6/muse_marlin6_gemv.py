@@ -84,12 +84,12 @@ def _nv6_gate_blocks() -> int:
         return int(_get_gate_blocks())
     env = os.environ.get("MUSE_NV6_GATE_BLOCKS", "")
     if not env:
-        return 24
+        return 48
     try:
         v = int(env)
     except ValueError:
-        return 24
-    return v if v in (24, 32, 48) else 24
+        return 48
+    return v if v in (24, 32, 48) else 48
 
 # ---------------------------------------------------------------- rANS-coded gate/up block scales
 # Symbols: the layer's palette indices of the tiled one-byte scales. One table per layer (10-bit probabilities),

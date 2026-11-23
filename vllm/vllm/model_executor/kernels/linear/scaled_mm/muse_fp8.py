@@ -122,7 +122,7 @@ def _muse_fp8_scaled_mm(
         _stats["logged"] = True
         tpf_kb = _rans.rans_tpf_kb() if (_rans is not None and hasattr(_rans, "rans_tpf_kb")) else 0
         tpf_note = f", translation prefetch every {tpf_kb} KiB" if tpf_kb > 0 else ", translation prefetch off"
-        gate_blks = 32 if os.environ.get("MUSERANS_GATE_32_BLOCKS", "1") != "0" else 47
+        gate_blks = 32 if os.environ.get("MUSERANS_GATE_32_BLOCKS", "0") != "0" else 47
         logger.info(
             "musefp8 decode GEMV: %d FP8 layers admitted (%d of them rANS-compressed%s), %d rejected; "
             "attention gate GEMV on %d blocks",

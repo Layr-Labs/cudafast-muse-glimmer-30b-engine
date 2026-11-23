@@ -965,8 +965,8 @@ __global__ void Marlin(
   #pragma unroll
     for (int m = 0; m < 4; m++) {
       const uint32_t e = sh_rlut[tma_x & 1023u];
-      tma_x = ((e >> 6) & 2047u) * (tma_x >> 10) + (e >> 17);
-      dst[32 * m] = sh_pal[e & 63u];
+      tma_x = ((e >> 8) & 2047u) * (tma_x >> 10) + (e >> 19);
+      dst[32 * m] = static_cast<uint8_t>(e);
       const bool need = tma_x < 65536u;
       const uint32_t msk = __ballot_sync(0xffffffffu, need);
       if (need) tma_x = (tma_x << 16) | tma_wp[__popc(msk & lt)];
@@ -2189,6 +2189,11 @@ __global__ void Marlin(
     if (!tma_started) {
       tma_started = true;
       tma_wait(0, 0);
+      for (int i = threadIdx.x; i < 1024; i += threads) {
+        const uint32_t e = sh_rlut[i];
+        sh_rlut[i] = ((e & ~63u) << 2) | static_cast<uint32_t>(sh_pal[e & 63u]);
+      }
+      __syncthreads();
       tma_x = sh_states[threadIdx.x];
       if (tma_iters > 0) tma_decode(0);
       if (tma_iters > 1) tma_decode(1);
@@ -2252,11 +2257,11 @@ __global__ void Marlin(
             fetch_to_shared((pipe + stages - 1) % stages, pipe,
                             total_rem >= stages);
             pipe++;
-            wait_for_stage();
 #ifdef MUSE_SCALE_TMA4
             tma_q++;
             if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
 #endif
+            wait_for_stage();
             init_same_group(pipe % stages);
           }
           matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
@@ -2283,11 +2288,11 @@ __global__ void Marlin(
             fetch_to_shared((pipe + stages - 1) % stages, pipe,
                             slice_iters >= stages);
             pipe++;
-            wait_for_stage();
 #ifdef MUSE_SCALE_TMA4
             tma_q++;
             if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
 #endif
+            wait_for_stage();
 #ifdef MUSE_SCALE_RANS
             rans_q++;
             if (rans_q + 1 < rans_iters) {
