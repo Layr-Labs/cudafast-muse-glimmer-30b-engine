@@ -426,6 +426,11 @@ __global__ void __launch_bounds__(kThreads, 1) down(
     const __grid_constant__ CUtensorMap tmS, int4* __restrict__ C0, float4* __restrict__ scratch,
     const float* __restrict__ gs_ptr, int4* __restrict__ work
     ) {
+  if (threadIdx.x == 0) {
+    asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA8) : "memory");
+    asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
+    asm volatile("prefetch.tensormap [%0];" ::"l"(&tmS) : "memory");
+  }
   const int4 w0 = work[2 * blockIdx.x];
   const int4 w1 = work[2 * blockIdx.x + 1];
   const float gs = gs_ptr[0];
@@ -637,11 +642,7 @@ static bool map2d(CUtensorMap* tm, const void* ptr, int esize, uint64_t width, u
   const CUtensorMapDataType dt = esize == 4 ? CU_TENSOR_MAP_DATA_TYPE_UINT32 : CU_TENSOR_MAP_DATA_TYPE_UINT8;
   return encode(tm, dt, 2, const_cast<void*>(ptr), dims, strides, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
                 swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE,
-#ifdef MARLINW_TMA_GATEUP
                 CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-#else
-                CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-#endif
                 CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 

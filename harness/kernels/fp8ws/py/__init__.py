@@ -36,6 +36,9 @@ def _load():
         if hasattr(lib, "fp8ws_run_dual_a"):
             lib.fp8ws_run_dual_a.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
             lib.fp8ws_run_dual_a.restype = ctypes.c_int
+        if hasattr(lib, "bf16ws_run_dual_stacked"):
+            lib.bf16ws_run_dual_stacked.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
+            lib.bf16ws_run_dual_stacked.restype = ctypes.c_int
         _lib = lib
     except OSError:
         _load_failed = True
@@ -123,6 +126,21 @@ def gemm_dual_a(a0, a1, b0, b1, sa0, sa1, sb0, sb1):
     rc = _lib.fp8ws_run_dual_a(a0.data_ptr(), a1.data_ptr(), b0.data_ptr(), b1.data_ptr(), sa0.data_ptr(),
                                sa1.data_ptr(), sb0.data_ptr(), sb1.data_ptr(), out0.data_ptr(), out1.data_ptr(), M, n0,
                                n1, k, DUAL_A_STAGES, torch.cuda.current_stream(a0.device).cuda_stream)
+    if rc:
+        return None
+    return out0, out1
+
+
+def bf16_gemm_dual_stacked(a: torch.Tensor, w_cat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Compute (a[512, 6656] @ w_cat[:4608].T, a[512, 6656] @ w_cat[4608:].T) directly into contiguous outputs."""
+    if _lib is None or not hasattr(_lib, "bf16ws_run_dual_stacked"):
+        return None
+    out0 = torch.empty((M, 4608), device=a.device, dtype=torch.bfloat16)
+    out1 = torch.empty((M, 4096), device=a.device, dtype=torch.bfloat16)
+    rc = _lib.bf16ws_run_dual_stacked(
+        a.data_ptr(), w_cat.data_ptr(), out0.data_ptr(), out1.data_ptr(),
+        M, 4608, 4096, 6656, torch.cuda.current_stream(a.device).cuda_stream,
+    )
     if rc:
         return None
     return out0, out1

@@ -53,6 +53,7 @@ from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
@@ -296,6 +297,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self._ones_1_i32 = torch.ones(1, dtype=torch.int32, device=self.device)
         self._zeros_1_i32 = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self._qsl_const_gpu: dict[int, torch.Tensor] = {}
+        for _nt in (1, 2, 512):
+            _qsl = [0] + [_nt] * self.max_num_reqs
+            self._qsl_const_gpu[_nt] = torch.tensor(
+                _qsl, dtype=torch.int32, device=self.device
+            )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -986,7 +993,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
         idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int32, count=num_reqs)
-        idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        if num_reqs == 1 and int(idx_mapping_np[0]) == 0:
+            idx_mapping = self._zeros_1_i32
+        elif num_reqs == 1 and int(idx_mapping_np[0]) == 1:
+            idx_mapping = self._ones_1_i32
+        else:
+            idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -1038,7 +1050,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Pad for full CUDA graph mode.
         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
         query_start_loc_np[num_reqs + 1 :] = num_tokens
-        async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
+        _qsl_cached = self._qsl_const_gpu.get(num_tokens) if num_reqs == 1 else None
+        if _qsl_cached is not None:
+            self.input_buffers.query_start_loc.copy_(_qsl_cached, non_blocking=True)
+        else:
+            async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
         prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
@@ -1298,6 +1314,112 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
         )
 
+    def _can_zero_prep_prefill(self, scheduler_output: SchedulerOutput) -> bool:
+        pg = self.prefill_graph
+        if (
+            pg is None
+            or not pg._fast_verified
+            or not pg._zp_enabled
+            or pg._zp_failed
+            or pg.embed_input_ids is None
+            or len(scheduler_output.scheduled_new_reqs) != 1
+            or len(scheduler_output.scheduled_cached_reqs.req_ids) != 0
+            or scheduler_output.total_num_scheduled_tokens != pg.num_tokens
+            or len(scheduler_output.num_scheduled_tokens) != 1
+            or scheduler_output.scheduled_encoder_inputs
+            or scheduler_output.scheduled_spec_decode_tokens
+            or scheduler_output.new_block_ids_to_zero
+            or scheduler_output.kv_cache_block_copies
+            or scheduler_output.has_structured_output_requests
+            or self.lora_config is not None
+            or self.pcp_manager is not None
+            or self.dp_size != 1
+            or not self.is_first_pp_rank
+            or not self.is_last_pp_rank
+            or self.use_dcp
+            or self.use_pp
+            or self.model_config.rswa_window is not None
+            or self.use_aux_hidden_state_outputs
+            or self.speculator is not None
+            or not self.supports_mm_inputs
+            or self.model.requires_raw_input_tokens
+            or self.block_tables.cp_size != 1
+        ):
+            return False
+        for bs, kbs in zip(self.block_tables.block_sizes, self.block_tables.kernel_block_sizes):
+            if bs != kbs or pg.num_tokens % bs != 0:
+                return False
+        nr = scheduler_output.scheduled_new_reqs[0]
+        if (
+            nr.num_computed_tokens != 0
+            or nr.prefill_token_ids is None
+            or nr.prompt_token_ids is None
+            or len(nr.prefill_token_ids) != pg.num_tokens
+            or len(nr.prompt_token_ids) != pg.num_tokens
+            or nr.mm_features
+            or nr.sampling_params is None
+            or nr.sampling_params.prompt_logprobs is not None
+        ):
+            return False
+        if self.cudagraph_manager is not None:
+            bd, _ = dispatch_cg_and_sync_dp(
+                self.cudagraph_manager, 1, pg.num_tokens, pg.num_tokens, 1, 0,
+                need_eager=False, num_active_loras=0,
+            )
+            if bd.cg_mode != CUDAGraphMode.NONE or bd.num_tokens != pg.num_tokens:
+                return False
+        return True
+
+    def _build_zero_prep_batch(self, req_id: str, n: int) -> InputBatch:
+        pg = self.prefill_graph
+        assert pg is not None
+        req_idx = self.req_states.req_id_to_index[req_id]
+        idx_mapping_np = np.array([req_idx], dtype=np.int32)
+        if req_idx == 0:
+            idx_mapping = self._zeros_1_i32
+        elif req_idx == 1:
+            idx_mapping = self._ones_1_i32
+        else:
+            idx_mapping = torch.tensor([req_idx], dtype=torch.int32, device=self.device)
+        num_sched = np.array([n], dtype=np.int32)
+        qsl_np = np.array([0, n], dtype=np.int32)
+        prefill_len_np = np.array([n], dtype=np.int32)
+        zero_1_np = np.zeros(1, dtype=np.int32)
+        is_pref_np = np.array([True], dtype=np.bool_)
+        seq_ub = torch.from_numpy(num_sched.copy())
+        return InputBatch(
+            req_ids=[req_id],
+            num_reqs=1,
+            num_reqs_after_padding=1,
+            idx_mapping=idx_mapping,
+            idx_mapping_np=idx_mapping_np,
+            expanded_idx_mapping=idx_mapping,
+            expanded_local_pos=self._expanded_local_pos_1_gpu,
+            num_scheduled_tokens=num_sched,
+            num_tokens=n,
+            num_tokens_after_padding=n,
+            num_draft_tokens=0,
+            num_draft_tokens_per_req=None,
+            query_start_loc=self.input_buffers.query_start_loc[:2],
+            query_start_loc_np=qsl_np,
+            seq_lens=self.input_buffers.seq_lens[:1],
+            seq_lens_cpu_upper_bound=seq_ub,
+            dcp_local_seq_lens=None,
+            num_computed_tokens_np=zero_1_np,
+            prefill_len_np=prefill_len_np,
+            num_computed_prefill_tokens_np=zero_1_np,
+            is_prefilling_np=is_pref_np,
+            max_seq_len_np=None,
+            input_ids=self.input_buffers.input_ids[:n],
+            positions=self.input_buffers.positions[:n],
+            is_padding=self.input_buffers.is_padding[:n],
+            logits_indices=pg._zp_logits_indices_gpu,
+            cu_num_logits=self._cu_num_logits_1_gpu,
+            cu_num_logits_np=self._cu_num_logits_1_np,
+            has_structured_output_reqs=False,
+            prompt_lens=None,
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1307,6 +1429,53 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if (
+            not dummy_run
+            and not is_profile
+            and self.prefill_graph is not None
+            and self.prefill_graph._zp_verified
+            and self._can_zero_prep_prefill(scheduler_output)
+        ):
+            pg = self.prefill_graph
+            nr = scheduler_output.scheduled_new_reqs[0]
+            self.update_pp_decode_requests()
+            self.finish_requests(scheduler_output)
+            self.free_states(scheduler_output)
+            if pg.stage_zero_prep(
+                self.input_buffers,
+                self.block_tables,
+                nr.prefill_token_ids,  # type: ignore[arg-type]
+                nr.block_ids,
+                PAD_SLOT_ID,
+                bool(envs.VLLM_MOE_SKIP_PADDING),
+            ):
+                self.kv_connector.pre_forward(scheduler_output)
+                model_output = pg.fast_replay()
+                pg._zp_replays += 1
+                if pg._zp_replays == 1:
+                    logger.info("Prefill graph: zero-prep launch active (host prep overlapped behind graph)")
+                # Overlap CPU request/sampler/block-table bookkeeping behind the running 246 ms GPU graph!
+                self.add_requests(scheduler_output)
+                self.update_requests(scheduler_output)
+                self.block_tables.apply_staged_writes()
+                input_batch = self._build_zero_prep_batch(nr.req_id, pg.num_tokens)
+                self.model_state.preprocess_state(
+                    input_batch,
+                    tuple(bt[:1] for bt in self.block_tables.input_block_tables),
+                    self.kv_cache_config,
+                    self.req_states.num_computed_tokens.gpu,
+                )
+                self.execute_model_state = ExecuteModelState(
+                    input_batch=input_batch,
+                    attn_metadata=None,
+                    slot_mappings_by_layer=None,
+                    hidden_states=model_output,
+                    aux_hidden_states=None,
+                    finished_req_ids=scheduler_output.finished_req_ids,
+                    compact_sample=pg.final_sample_tile,
+                )
+                return None
+
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1564,6 +1733,70 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         compact_sample = False
         if fast_prefill_replay:
             assert prefill_graph is not None
+            if (
+                prefill_graph._zp_enabled
+                and not prefill_graph._zp_verified
+                and not prefill_graph._zp_failed
+                and not is_profile
+                and self._can_zero_prep_prefill(scheduler_output)
+            ):
+                try:
+                    n_zp = prefill_graph.num_tokens
+                    nr_zp = scheduler_output.scheduled_new_reqs[0]
+                    ref_ids = self.input_buffers.input_ids[:n_zp].clone()
+                    ref_pos = self.input_buffers.positions[:n_zp].clone()
+                    ref_sl = self.input_buffers.seq_lens[:1].clone()
+                    ref_qsl = self.input_buffers.query_start_loc[:2].clone()
+                    ref_slots = self.block_tables.slot_mappings[:, :n_zp].clone()
+                    ref_bts = [
+                        bt[0, : len(nr_zp.block_ids[g])].clone()
+                        for g, bt in enumerate(self.block_tables.input_block_tables)
+                    ]
+                    ok_stage = prefill_graph.stage_zero_prep(
+                        self.input_buffers,
+                        self.block_tables,
+                        nr_zp.prefill_token_ids,  # type: ignore[arg-type]
+                        nr_zp.block_ids,
+                        PAD_SLOT_ID,
+                        bool(envs.VLLM_MOE_SKIP_PADDING),
+                    )
+                    zp_batch = self._build_zero_prep_batch(nr_zp.req_id, n_zp)
+                    same_zp = (
+                        ok_stage
+                        and torch.equal(ref_ids, self.input_buffers.input_ids[:n_zp])
+                        and torch.equal(ref_pos, self.input_buffers.positions[:n_zp])
+                        and torch.equal(ref_sl, self.input_buffers.seq_lens[:1])
+                        and torch.equal(ref_qsl, self.input_buffers.query_start_loc[:2])
+                        and torch.equal(ref_slots, self.block_tables.slot_mappings[:, :n_zp])
+                        and torch.equal(input_batch.logits_indices, zp_batch.logits_indices)
+                        and all(
+                            torch.equal(
+                                r,
+                                self.block_tables.input_block_tables[g][
+                                    0, : len(nr_zp.block_ids[g])
+                                ],
+                            )
+                            for g, r in enumerate(ref_bts)
+                        )
+                    )
+                    if same_zp:
+                        prefill_graph._zp_verified = True
+                        logger.info("Prefill graph: zero-prep launch verified bitwise and armed")
+                    else:
+                        self.input_buffers.input_ids[:n_zp].copy_(ref_ids)
+                        self.input_buffers.positions[:n_zp].copy_(ref_pos)
+                        self.input_buffers.seq_lens[:1].copy_(ref_sl)
+                        self.input_buffers.query_start_loc[:2].copy_(ref_qsl)
+                        self.block_tables.slot_mappings[:, :n_zp].copy_(ref_slots)
+                        for g, r in enumerate(ref_bts):
+                            self.block_tables.input_block_tables[g][
+                                0, : len(nr_zp.block_ids[g])
+                            ].copy_(r)
+                        prefill_graph._zp_failed = True
+                        logger.warning("Prefill graph: zero-prep verification mismatch; keeping standard fast_replay")
+                except Exception as exc:  # noqa: BLE001
+                    prefill_graph._zp_failed = True
+                    logger.warning("Prefill graph: zero-prep verification raised (%s); keeping standard fast_replay", exc)
             self.kv_connector.pre_forward(scheduler_output)
             model_output = prefill_graph.fast_replay()
             compact_sample = prefill_graph.final_sample_tile

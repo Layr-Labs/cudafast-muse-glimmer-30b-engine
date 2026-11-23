@@ -113,6 +113,25 @@ int l2pf_prefetch_desc(const void* desc, int ndesc, int blocks, int threads, voi
   return (int)cudaGetLastError();
 }
 
+int l2pf_set_persisting_window(const void* base_ptr, size_t num_bytes, size_t limit_bytes, void* stream) {
+  if (limit_bytes > 0) {
+    cudaError_t e = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, limit_bytes);
+    if (e != cudaSuccess) return (int)e;
+  }
+  cudaStreamAttrValue attr{};
+  attr.accessPolicyWindow.base_ptr = const_cast<void*>(base_ptr);
+  attr.accessPolicyWindow.num_bytes = num_bytes;
+  attr.accessPolicyWindow.hitRatio = (num_bytes > 0) ? 1.0f : 0.0f;
+  attr.accessPolicyWindow.hitProp = (num_bytes > 0) ? cudaAccessPropertyPersisting : cudaAccessPropertyNormal;
+  attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+  cudaError_t se = cudaStreamSetAttribute(reinterpret_cast<cudaStream_t>(stream),
+                                          cudaStreamAttributeAccessPolicyWindow, &attr);
+  if (limit_bytes == 0) {
+    (void)cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0);
+  }
+  return (int)se;
+}
+
 #ifdef __linux__
 static std::atomic<bool> g_tickle_started{false};
 

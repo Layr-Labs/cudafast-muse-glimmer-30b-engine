@@ -37,6 +37,8 @@ except Exception:  # noqa: BLE001
     _rans = None
 
 _stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False}
+_decode_gemm_operand = None
+_consume_rans_prologue = None
 
 
 def _cutlass(A: torch.Tensor, B: torch.Tensor, As: torch.Tensor, Bs: torch.Tensor) -> torch.Tensor:
@@ -126,8 +128,19 @@ def _muse_fp8_scaled_mm(
             "attention gate GEMV on %d blocks",
             _stats["admitted"], _stats["rans"], tpf_note, _stats["rejected"], gate_blks,
         )
+    if A.shape[0] <= 16 and _decode_gemm_operand is not None:
+        A = _decode_gemm_operand(A)
     k, n = B.shape
     if A.shape[0] == 1 and packed.numel() > 0 and A.is_contiguous() and _scales_ok(As, Bs, n):
+        if (
+            packed.numel() != n * k
+            and _consume_rans_prologue is not None
+            and _rans is not None
+            and hasattr(_rans, "rans_gemv_fused_auto")
+        ):
+            fused = _consume_rans_prologue(A, As, packed, n, k, Bs)
+            if fused is not None:
+                return fused
         out = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
         if packed.numel() == n * k:
             _mf.gemv(packed, A, Bs, As, out, n, k)

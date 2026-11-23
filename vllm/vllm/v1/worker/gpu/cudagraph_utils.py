@@ -378,16 +378,40 @@ class CudaGraphManager:
                             set_graph_pool_id(self.pool)
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
-                        with (
-                            torch.cuda.graph(graph, self.pool),
-                            l2pf.apply() if l2pf is not None else nullcontext(),
-                        ):
-                            forward_fn(CUDAGraphMode.NONE)
-                            # Join offloader's copy stream after forward to avoid
-                            # unjoined stream error. The last layer's start_prefetch
-                            # forks copy_stream, but wait_prefetch only happens in
-                            # the next forward pass.
-                            get_offloader().join_after_forward()
+                        persist_set = False
+                        cap_stream = current_platform.current_stream()
+                        if desc.num_tokens == 1:
+                            try:
+                                import l2pf as _l2pf_mod
+                                arena = getattr(
+                                    getattr(self, "_capture_model", None),
+                                    "_persisting_norm_arena",
+                                    None,
+                                )
+                                if arena is not None and hasattr(_l2pf_mod, "set_persisting_window"):
+                                    persist_set = _l2pf_mod.set_persisting_window(
+                                        arena.data_ptr(), arena.numel(), 4 << 20, cap_stream
+                                    )
+                            except Exception:
+                                persist_set = False
+                        try:
+                            with (
+                                torch.cuda.graph(graph, self.pool),
+                                l2pf.apply() if l2pf is not None else nullcontext(),
+                            ):
+                                forward_fn(CUDAGraphMode.NONE)
+                                # Join offloader's copy stream after forward to avoid
+                                # unjoined stream error. The last layer's start_prefetch
+                                # forks copy_stream, but wait_prefetch only happens in
+                                # the next forward pass.
+                                get_offloader().join_after_forward()
+                        finally:
+                            if persist_set:
+                                try:
+                                    import l2pf as _l2pf_mod
+                                    _l2pf_mod.set_persisting_window(0, 0, 0, cap_stream)
+                                except Exception:
+                                    pass
                         if l2pf is not None:
                             logger.info(
                                 "L2 prefetch for num_tokens=%d: %s",
@@ -493,6 +517,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
+        self._capture_model = model
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
         if l2_prefetch is not None:
             self.weight_ranges = l2_prefetch.weight_ranges(model)

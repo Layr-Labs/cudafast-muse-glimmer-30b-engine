@@ -17,6 +17,18 @@ def lib():
     native.muse_norm_glue_post_attn.restype = ctypes.c_int
     native.muse_norm_glue_post_ff.argtypes = [ctypes.c_int, ctypes.c_int] + [p] * 10 + [p]
     native.muse_norm_glue_post_ff.restype = ctypes.c_int
+    fg = getattr(native, "muse_norm_glue_post_ff_gate", None)
+    if fg is not None:
+        fg.argtypes = [ctypes.c_int] + [p] * 12 + [ctypes.c_int, p]
+        fg.restype = ctypes.c_int
+    gf = getattr(native, "muse_norm_glue_gate_formula", None)
+    if gf is not None:
+        gf.argtypes = [p, p, p, ctypes.c_int, p]
+        gf.restype = ctypes.c_int
+    ms = getattr(native, "muse_norm_glue_mul_sigmoid_bf16", None)
+    if ms is not None:
+        ms.argtypes = [p, p, p, ctypes.c_int, p]
+        ms.restype = ctypes.c_int
     return native
 
 
@@ -40,3 +52,33 @@ def post_ff(kind, rows, x, d, res, sumsq_x, w_post, w_ff, w_in, scale, out_bf16,
         _ptr(scale), _ptr(out_bf16), _ptr(out_fp8), stream)
     if err:
         raise RuntimeError(f"muse_norm_glue post_ff launch returned CUDA status {err}")
+
+
+def post_ff_gate(rows, x, d, res, sumsq_x, w_post, w_ff, w_in, scale, out_bf16, out_fp8,
+                 gate_scale, out_gate, write_bf16, stream):
+    fn = getattr(lib(), "muse_norm_glue_post_ff_gate", None)
+    if fn is None:
+        raise RuntimeError("muse_norm_glue_post_ff_gate unavailable")
+    err = fn(rows, _ptr(x), _ptr(d), _ptr(res), _ptr(sumsq_x), _ptr(w_post), _ptr(w_ff), _ptr(w_in),
+             _ptr(scale), _ptr(out_bf16), _ptr(out_fp8), _ptr(gate_scale), _ptr(out_gate),
+             int(bool(write_bf16)), stream)
+    if err:
+        raise RuntimeError(f"muse_norm_glue post_ff_gate launch returned CUDA status {err}")
+
+
+def gate_formula(bits, gate_scale, out, n, stream):
+    fn = getattr(lib(), "muse_norm_glue_gate_formula", None)
+    if fn is None:
+        raise RuntimeError("muse_norm_glue_gate_formula unavailable")
+    err = fn(_ptr(bits), _ptr(gate_scale), _ptr(out), n, stream)
+    if err:
+        raise RuntimeError(f"muse_norm_glue gate_formula launch returned CUDA status {err}")
+
+
+def mul_sigmoid_bf16(gate, attn, out, n, stream):
+    fn = getattr(lib(), "muse_norm_glue_mul_sigmoid_bf16", None)
+    if fn is None:
+        raise RuntimeError("muse_norm_glue_mul_sigmoid_bf16 unavailable")
+    err = fn(_ptr(gate), _ptr(attn), _ptr(out), int(n), stream)
+    if err:
+        raise RuntimeError(f"muse_norm_glue mul_sigmoid_bf16 launch returned CUDA status {err}")
