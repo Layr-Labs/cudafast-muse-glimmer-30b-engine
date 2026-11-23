@@ -33,6 +33,9 @@ def _load():
         lib.fp8ws_run.restype = ctypes.c_int
         lib.fp8ws_run_dual.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
         lib.fp8ws_run_dual.restype = ctypes.c_int
+        if hasattr(lib, "fp8ws_run_dual_a"):
+            lib.fp8ws_run_dual_a.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
+            lib.fp8ws_run_dual_a.restype = ctypes.c_int
         _lib = lib
     except OSError:
         _load_failed = True
@@ -102,4 +105,24 @@ def gemm_dual(
     )
     if rc:
         raise RuntimeError(f"fp8ws dual launch failed: {rc} (n0={n0}, n1={n1}, k={k})")
+    return out0, out1
+
+
+DUAL_A_STAGES = 3
+
+
+def gemm_dual_a(a0, a1, b0, b1, sa0, sa1, sb0, sb1):
+    """(a0[512, K] @ b0[K, 4608], a1[512, K] @ b1[K, 4096]) in one persistent launch, two activations with their own
+    scales (prefill3: one layer's qkv and output-gate operands); each output as gemm() computes it."""
+    if _lib is None or not hasattr(_lib, "fp8ws_run_dual_a"):
+        return None
+    k, n0 = b0.shape
+    _, n1 = b1.shape
+    out0 = torch.empty((M, n0), device=a0.device, dtype=torch.bfloat16)
+    out1 = torch.empty((M, n1), device=a0.device, dtype=torch.bfloat16)
+    rc = _lib.fp8ws_run_dual_a(a0.data_ptr(), a1.data_ptr(), b0.data_ptr(), b1.data_ptr(), sa0.data_ptr(),
+                               sa1.data_ptr(), sb0.data_ptr(), sb1.data_ptr(), out0.data_ptr(), out1.data_ptr(), M, n0,
+                               n1, k, DUAL_A_STAGES, torch.cuda.current_stream(a0.device).cuda_stream)
+    if rc:
+        return None
     return out0, out1
