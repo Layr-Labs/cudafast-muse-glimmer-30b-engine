@@ -270,15 +270,36 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
     rans_cp_commit();                                                                                         \
     issued++;                                                                                               \
   }
+#if RANS_PREISSUE
+  const bool fast_preissue = (pb.ilv != 0 && pb.K >= 2048 && RG <= 8);
+#endif
   if (active) {
-    ws = pb.stream + (size_t)pb.woff16[w] * 16;
-    wbytes = (uint32_t)(pb.woff16[w + 1] - pb.woff16[w]) * 16u;
-    gmin = (int)((const uint32_t*)pb.hdr)[14];
-    toffw = pb.woff16[pb.tw + 1 + w];
+#if RANS_PREISSUE
+    if (fast_preissue) {
+#pragma unroll
+      for (int i = 0; i < RG - 1; i++) {
+        _Pragma("unroll") for (uint32_t pc = 0; pc < GB / 512u; pc++) {
+          uint32_t boff = (uint32_t)i * GB + pc * 512u + (uint32_t)lane * 16u;
+          rans_cp_async16_s(
+              ring_s + (boff & (RB - 1u)),
+              pb.stream + ((((size_t)i * pb.tw + w) << GBS) + pc * 512u + (uint32_t)lane * 16u),
+              pol);
+        }
+        rans_cp_commit();
+      }
+      issued = RG - 1;
+    } else
+#endif
+    {
+      ws = pb.stream + (size_t)pb.woff16[w] * 16;
+      wbytes = (uint32_t)(pb.woff16[w + 1] - pb.woff16[w]) * 16u;
+      gmin = (int)((const uint32_t*)pb.hdr)[14];
+      toffw = pb.woff16[pb.tw + 1 + w];
 #if RANS_PREISSUE
 #pragma unroll
-    for (int i = 0; i < RG - 1; i++) RANS_ISSUE();
+      for (int i = 0; i < RG - 1; i++) RANS_ISSUE();
 #endif
+    }
   }
   if (blockIdx.x == 0 && pb.tpf_stride > 0) {
     // Issue one L2 prefetch per 2 MiB of the weight stream to overlap cold GMMU address-translation walks
@@ -292,6 +313,13 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
     int s = i >> 2, tt = i & 3;
     xs[i] = make_uint2(*(const uint32_t*)(pb.x + 32 * s + 4 * tt), *(const uint32_t*)(pb.x + 32 * s + 16 + 4 * tt));
   }
+#if RANS_PREISSUE
+  if (active && fast_preissue) {
+    wbytes = (uint32_t)(pb.woff16[w + 1] - pb.woff16[w]) * 16u;
+    gmin = (int)((const uint32_t*)pb.hdr)[14];
+    toffw = pb.woff16[pb.tw + 1 + w];
+  }
+#endif
   __syncthreads();
   if (!active) return;
   const int g = lane >> 2, t = lane & 3;
@@ -340,10 +368,8 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
       const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
       const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
       const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-      const uint32_t v0 = (u0 & 0x000F000Fu) | ((u0 >> 4) & 0x0F000F00u);
-      const uint32_t v1 = (u1 & 0x000F000Fu) | ((u1 >> 4) & 0x0F000F00u);
-      const uint32_t bw0 = ((v0 << 4) & 0x80808080u) | (v0 & 0x07070707u) | (E0 << 3);
-      const uint32_t bw1 = ((v1 << 4) & 0x80808080u) | (v1 & 0x07070707u) | (E1 << 3);
+      const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
+      const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
       uint2 a = xs[s * 4 + t];
       a.x = (g == 0) ? a.x : 0u; a.y = (g == 0) ? a.y : 0u;
       rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
@@ -376,14 +402,21 @@ static RansCfg rans_pick_cfg(int N, int K) {
     const char* env = std::getenv("MUSERANS_GATE_32_BLOCKS");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
+  static const bool gate_up_even = []() {
+    const char* env = std::getenv("MUSERANS_GATE_UP_EVEN48");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
   if (gate32 && N == 4096 && K == 6656 && NB == 512 && rans_fits(K, 16, 9, 4)) {
-    return RansCfg{512, 16, 2, 4, 9};
+    return RansCfg{512, 16, 4, 4, 9};
+  }
+  if (gate_up_even && N == 39936 && K == 6656 && NB == 4992 && rans_fits(K, 8, 9, 4)) {
+    return RansCfg{384, 8, 4, 4, 9};
   }
   for (int wcap = 18; wcap >= 1; wcap--) {
     const int R = (NB + 48 * wcap - 1) / (48 * wcap);
     const int tw = (NB + R - 1) / R, wpb = (tw + 47) / 48;
     if (rans_fits(K, wpb, 9, 4)) {
-      const int states = (N == 6656 && K == 19968) ? 4 : 2;
+      const int states = ((N == 6656 && K == 19968) || (N == 4608 && K == 6656)) ? 4 : 2;
       return RansCfg{tw, wpb, states, 4, 9};
     }
   }

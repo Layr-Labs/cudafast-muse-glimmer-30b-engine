@@ -18,6 +18,7 @@ except Exception:  # noqa: BLE001
     logger = logging.getLogger(__name__)
 
 _lib = None
+_multi = None
 try:
     _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_qk_glue.so")))
     _lib.muse_qk_norm_rope.argtypes = [
@@ -27,8 +28,19 @@ try:
         ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
     ]
     _lib.muse_qk_norm_rope.restype = ctypes.c_int
+    _multi = getattr(_lib, "muse_qk_norm_rope_multi", None)
+    if _multi is not None:
+        _multi.argtypes = list(_lib.muse_qk_norm_rope.argtypes[:-1]) + [ctypes.c_int, ctypes.c_void_p]
+        _multi.restype = ctypes.c_int
 except OSError:
     _lib = None
+    _multi = None
+
+MULTI_HPW = int(os.environ.get("MUSE_QK_MULTI_HPW", "9"))
+MULTI_MIN_TOKENS = 64
+DECODE_HPW = int(os.environ.get("MUSE_QK_DECODE_HPW", "2"))
+_multi_state: dict[str, bool | None] = {"admitted": None}
+_decode_state: dict[str, bool | None] = {"admitted": None}
 
 ENABLED = os.environ.get("VLLM_MUSE_GLIMMER_QK_FUSED", "1").strip() not in ("0", "", "false", "no")
 _checked: dict[int, bool] = {}
@@ -105,6 +117,33 @@ def self_check(device: torch.device) -> bool:
                     break
             if not ok:
                 break
+        if ok and _multi is not None and DECODE_HPW > 0 and _decode_state["admitted"] is None:
+            dok = True
+            stream = torch.cuda.current_stream(device).cuda_stream
+            pos1 = torch.zeros((1,), dtype=torch.int64, device=device)
+            for use_rope in (True, False):
+                for cache_t in ((cache, cache.float()) if use_rope else (cache,)):
+                    for mag in (1e-3, 0.5, 4.0, 300.0):
+                        r = torch.randn((1, 4608), generator=gen, device=device) * mag
+                        x = (r * torch.exp(torch.randn((1, 4608), generator=gen, device=device))).to(torch.bfloat16)
+                        q0, k0 = torch.empty((1, 4096), dtype=x.dtype, device=device), torch.empty((1, 256), dtype=x.dtype, device=device)
+                        q1, k1 = torch.empty_like(q0), torch.empty_like(k0)
+                        cf32 = int(cache_t.dtype == torch.float32)
+                        c_rows = int(cache_t.shape[0]) if use_rope else 0
+                        p_ptr = pos1.data_ptr() if use_rope else 0
+                        c_ptr = cache_t.data_ptr() if use_rope else 0
+                        st0 = _lib.muse_qk_norm_rope(x.data_ptr(), p_ptr, c_ptr, q0.data_ptr(), k0.data_ptr(), 1, c_rows, eps, qscale, int(use_rope), cf32, stream)
+                        st1 = _multi(x.data_ptr(), p_ptr, c_ptr, q1.data_ptr(), k1.data_ptr(), 1, c_rows, eps, qscale, int(use_rope), cf32, DECODE_HPW, stream)
+                        torch.cuda.synchronize()
+                        if st0 or st1 or not (torch.equal(q0.view(torch.int16), q1.view(torch.int16)) and torch.equal(k0.view(torch.int16), k1.view(torch.int16))):
+                            dok = False
+                            break
+                    if not dok:
+                        break
+                if not dok:
+                    break
+            _decode_state["admitted"] = dok
+            logger.info("muse_qk_glue: M=1 %d-heads-per-warp decode kernel %s", DECODE_HPW, "admitted (2 blocks)" if dok else "REJECTED")
     except Exception:  # noqa: BLE001
         logger.warning("muse_qk_glue: self-check raised on cuda:%d", idx, exc_info=True)
         ok = False
@@ -158,11 +197,65 @@ def run_qk_norm_rope(
         cache_fp32 = 1
     with torch.cuda.device(qkv.device):
         stream = torch.cuda.current_stream(qkv.device).cuda_stream
-        st = _lib.muse_qk_norm_rope(
+        args = (
             qkv.data_ptr(), pos_ptr, cache_ptr, q_out.data_ptr(), k_out.data_ptr(),
-            num_tokens, cache_rows, float(eps), float(qscale),
-            int(use_rope), cache_fp32, stream,
+            num_tokens, cache_rows, float(eps), float(qscale), int(use_rope), cache_fp32,
         )
+        if num_tokens == 1 and DECODE_HPW > 0 and _multi is not None and _decode_state["admitted"]:
+            st = _multi(*args, DECODE_HPW, stream)
+        elif (
+            num_tokens > MULTI_MIN_TOKENS
+            and MULTI_HPW > 0
+            and _multi is not None
+            and _multi_ok(args, qkv, positions, cos_sin_cache, stream)
+        ):
+            st = _multi(*args, MULTI_HPW, stream)
+        else:
+            st = _lib.muse_qk_norm_rope(*args, stream)
     if st:
         raise RuntimeError(f"muse_qk_norm_rope failed with CUDA error {st}")
     return q_out, k_out
+
+
+def _multi_ok(args, qkv, positions, cos_sin_cache, stream) -> bool:
+    """Bitwise equality on the first prompt call (outside capture), adversarial magnitudes, and both RoPE/NoPE."""
+    state = _multi_state["admitted"]
+    if state is not None:
+        return state
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    ok = True
+    try:
+        n = args[5]
+        gen = torch.Generator(device=qkv.device).manual_seed(20261123)
+        cases = [(qkv, bool(args[9]))]
+        for mag in (1e-3, 0.5, 4.0, 300.0):
+            r = torch.randn(qkv.shape, generator=gen, device=qkv.device) * mag
+            cases.append(((r * torch.exp(torch.randn(qkv.shape, generator=gen, device=qkv.device))).to(qkv.dtype), bool(args[9])))
+        alt_r = (torch.randn(qkv.shape, generator=gen, device=qkv.device) * 2.0).to(qkv.dtype)
+        cases.append((alt_r, not bool(args[9])))
+        alt_pos = torch.zeros((n,), dtype=torch.int64, device=qkv.device)
+        alt_cache = torch.ones((1, 128), dtype=torch.float32, device=qkv.device)
+        for x, rope_flag in cases:
+            p_ptr = args[1] if (rope_flag and bool(args[9])) else (alt_pos.data_ptr() if rope_flag else 0)
+            c_ptr = args[2] if (rope_flag and bool(args[9])) else (alt_cache.data_ptr() if rope_flag else 0)
+            c_rows = args[6] if (rope_flag and bool(args[9])) else (1 if rope_flag else 0)
+            c_fp32 = args[10] if (rope_flag and bool(args[9])) else 1
+            outs = []
+            for multi in (False, True):
+                q = torch.empty((n, 4096), dtype=qkv.dtype, device=qkv.device)
+                k = torch.empty((n, 256), dtype=qkv.dtype, device=qkv.device)
+                a = (x.data_ptr(), p_ptr, c_ptr, q.data_ptr(), k.data_ptr(), n, c_rows, args[7], args[8], int(rope_flag), c_fp32)
+                st = _multi(*a, MULTI_HPW, stream) if multi else _lib.muse_qk_norm_rope(*a, stream)
+                if st:
+                    ok = False
+                outs.append((q, k))
+            torch.cuda.synchronize()
+            if not (torch.equal(outs[0][0].view(torch.int16), outs[1][0].view(torch.int16))
+                    and torch.equal(outs[0][1].view(torch.int16), outs[1][1].view(torch.int16))):
+                ok = False
+    except Exception:  # noqa: BLE001
+        ok = False
+    _multi_state["admitted"] = ok
+    logger.info("muse_qk_glue: %d-heads-per-warp prompt kernel %s", MULTI_HPW, "admitted" if ok else "REJECTED")
+    return ok
