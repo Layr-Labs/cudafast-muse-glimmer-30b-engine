@@ -52,7 +52,7 @@ cudaError_t launch(const int4* input, const int4* weight, int4* output,
     kernel<<<grid, Threads, shared, stream>>>(
         input, weight, output, partials, nullptr, nullptr, scales6, global_scale,
         nullptr, nullptr, k / 16, 1, n, k, k, locks, false, false, true, shared, palette,
-        decode6_attn_tpf_stride());
+        decode6_attn_tpf_stride(), nullptr, nullptr, nullptr, 0, nullptr);
     return cudaGetLastError();
 }
 }  // namespace

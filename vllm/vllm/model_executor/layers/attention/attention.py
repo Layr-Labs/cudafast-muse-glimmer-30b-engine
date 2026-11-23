@@ -783,6 +783,10 @@ def unified_kv_cache_update(
     """
     layer_name = _resolve_layer_name(layer_name)
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    if getattr(attn_layer, "_qk_kv_cache_written", False):
+        attn_layer._qk_kv_cache_written = False
+        if key.shape[0] == 1:
+            return key.new_empty(0)
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"

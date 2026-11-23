@@ -133,13 +133,18 @@ __global__ void tma4_pass2_kernel(
   states_out[static_cast<size_t>(b) * Threads + threadIdx.x] = x;
 }
 
-template <int TileN, int Threads, bool GateUpGrid, bool DownIlv = false, bool GateV48 = false>
+template <int TileN, int Threads, bool GateUpGrid, bool DownIlv = false, bool GateV48 = false,
+          bool GateUpSwiglu = false, bool FuseLmPost = false, bool FuseMulSigmoid = false>
 int launch_tma4(const int4* input, const int4* weight, int4* output, int4* partials,
                 const int4* coded, const int4* palette, const float* global_scale,
-                int* locks, int n, int k, int grid, int device, cudaStream_t stream) {
+                int* locks, int n, int k, int grid, int device, cudaStream_t stream,
+                int* pair_locks = nullptr, const uint16_t* lmpost_lut = nullptr,
+                int64_t* lmpost_out = nullptr, int org_vocab_size = 0,
+                const int4* input_aux = nullptr) {
   auto kernel = muse_marlin6_tma4::Marlin<
       vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
-      vllm::kFE4M3fn.id(), Threads, 1, TileN / 16, 8, true, 4, 1, false, true, GateUpGrid, DownIlv, GateV48>;
+      vllm::kFE4M3fn.id(), Threads, 1, TileN / 16, 8, true, 4, 1, false, true,
+      GateUpGrid, DownIlv, GateV48, GateUpSwiglu, FuseLmPost, FuseMulSigmoid>;
   static int cached_shared[16] = {0};
   int shared = (device >= 0 && device < 16) ? cached_shared[device] : 0;
   if (shared == 0) {
@@ -220,7 +225,7 @@ int launch_tma4(const int4* input, const int4* weight, int4* output, int4* parti
   kernel<<<grid, Threads, shared, stream>>>(
       input, weight, output, partials, nullptr, nullptr, states, global_scale,
       var, lut_and_meta, k / 16, 1, n, k, k, locks, false, false, true, shared, palette,
-      decode6_tpf_stride());
+      decode6_tpf_stride(), pair_locks, lmpost_lut, lmpost_out, org_vocab_size, input_aux);
   return cudaGetLastError();
 }
 
@@ -233,6 +238,32 @@ extern "C" int muse_marlin6_gate_up_tma4(const int4* input, const int4* weight, 
   if (n != 39936 || k != 6656 || blocks != 48) return cudaErrorInvalidValue;
   return launch_tma4<128, 256, true>(input, weight, output, partials, coded, palette,
                                      global_scale, locks, n, k, 336, device, stream);
+}
+
+extern "C" int muse_marlin6_gate_up_tma4_swiglu(
+    const int4* input, const int4* weight, int4* output, int4* partials,
+    const int4* coded, const int4* palette, const float* global_scale,
+    int* locks, int* pair_locks, int n, int k, int blocks, int device, cudaStream_t stream) {
+  if (n != 39936 || k != 6656 || blocks != 48 || pair_locks == nullptr)
+    return cudaErrorInvalidValue;
+  return launch_tma4<128, 256, true, false, false, true, false>(
+      input, weight, output, partials, coded, palette, global_scale, locks,
+      n, k, 336, device, stream, pair_locks);
+}
+
+extern "C" int muse_marlin6_sk_tma4_lmpost(
+    const int4* input, const int4* weight, int4* scratch, int4* partials,
+    const int4* coded, const int4* palette, const float* global_scale, int* locks,
+    const uint16_t* lmpost_lut, int64_t* lmpost_out, int org_vocab_size,
+    int n, int k, int blocks, int device, cudaStream_t stream) {
+  if (k % 128 != 0 || n % 128 == 0 || n % 64 != 0 || blocks != 48 ||
+      org_vocab_size <= 0 || org_vocab_size > n ||
+      lmpost_lut == nullptr || lmpost_out == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  return launch_tma4<64, 128, false, false, false, false, true>(
+      input, weight, scratch, partials, coded, palette, global_scale, locks,
+      n, k, 48, device, stream, nullptr, lmpost_lut, lmpost_out, org_vocab_size);
 }
 
 extern "C" int muse_marlin6_sk_tma4(const int4* input, const int4* weight, int4* output,
@@ -274,6 +305,28 @@ extern "C" int muse_marlin6_sk_tma4_ilv(const int4* input, const int4* weight, i
   }
   return launch_tma4<128, 256, false, true, false>(input, weight, output, partials, coded, palette,
                                                    global_scale, locks, n, k, 48, device, stream);
+}
+
+extern "C" int muse_marlin6_sk_tma4_gated(
+    const int4* gate, const int4* attn, const int4* weight, int4* output,
+    int4* partials, const int4* coded, const int4* palette, const float* global_scale,
+    int* locks, int n, int k, int blocks, int device, cudaStream_t stream) {
+  if (n != 6656 || k != 4096 || blocks != 48 || gate == nullptr || attn == nullptr)
+    return cudaErrorInvalidValue;
+  return launch_tma4<128, 256, false, false, false, false, false, true>(
+      gate, weight, output, partials, coded, palette, global_scale, locks,
+      n, k, 48, device, stream, nullptr, nullptr, nullptr, 0, attn);
+}
+
+extern "C" int muse_marlin6_sk_tma4_ilv_gated(
+    const int4* gate, const int4* attn, const int4* weight, int4* output,
+    int4* partials, const int4* coded, const int4* palette, const float* global_scale,
+    int* locks, int n, int k, int blocks, int device, cudaStream_t stream) {
+  if (n != 6656 || k != 4096 || blocks != 48 || gate == nullptr || attn == nullptr)
+    return cudaErrorInvalidValue;
+  return launch_tma4<128, 256, false, true, false, false, false, true>(
+      gate, weight, output, partials, coded, palette, global_scale, locks,
+      n, k, 48, device, stream, nullptr, nullptr, nullptr, 0, attn);
 }
 
 extern "C" int muse_tma4_pass1(const uint8_t* sym_tiled, int k_tiles,
