@@ -244,7 +244,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           // M = 1 NVFP4 decode configuration supports it.
           const bool scale6 = false,
           const bool gate_up_grid = false,
-          const bool down_ilv = false>
+          const bool down_ilv = false,
+          const bool gate_v48 = false>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -401,17 +402,19 @@ __global__ void Marlin(
   int n_tiles = prob_n / 16 / thread_n_blocks;
 
   int global_mn_tiles = parallel * n_tiles;
+  const int vgrid = gate_v48 ? 48 : gridDim.x;
+  int vblk = gate_v48 ? (47 - static_cast<int>(blockIdx.x)) : static_cast<int>(blockIdx.x);
   int part2_mn_tiles = global_mn_tiles;
   int part1_mn_iters = 0;
   bool in_part2 = false;
 
-  if (global_mn_tiles > gridDim.x) {
-    part2_mn_tiles = global_mn_tiles % gridDim.x;
-    if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
-    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
+  if (global_mn_tiles > vgrid) {
+    part2_mn_tiles = global_mn_tiles % vgrid;
+    if (part2_mn_tiles * 3 <= vgrid) part2_mn_tiles += vgrid;
+    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / vgrid;
   }
 
-  int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
+  int iters = div_ceil(k_tiles * part2_mn_tiles, vgrid);
 
   if constexpr (!has_act_order && group_blocks != -1) {
     if (group_blocks >= thread_k_blocks) {
@@ -424,7 +427,7 @@ __global__ void Marlin(
   }
 
   int slice_row = 0;
-  int slice_col_par = blockIdx.x;
+  int slice_col_par = vblk;
   int slice_col;
   int slice_iters =
       k_tiles;  // number of threadblock tiles in the current slice
@@ -436,12 +439,12 @@ __global__ void Marlin(
   int par_id = 0;
   int locks_off = 0;
 
-  if (part2_mn_tiles >= gridDim.x) {
+  if (part2_mn_tiles >= vgrid) {
     // when part2_mn_tiles >= sms
     // then there are at most $sms$ conflict tile blocks
-    locks_off = blockIdx.x;
+    locks_off = vblk;
   } else {
-    locks_off = (iters * blockIdx.x) / k_tiles - 1;
+    locks_off = (iters * vblk) / k_tiles - 1;
   }
 
   // Compute all information about the current slice which is required for
@@ -449,7 +452,7 @@ __global__ void Marlin(
   bool first_init = true;
   auto init_part2_slice = [&]() {
     slice_iters =
-        iters * (blockIdx.x + 1) - (k_tiles * slice_col_par + slice_row);
+        iters * (vblk + 1) - (k_tiles * slice_col_par + slice_row);
     if (slice_iters < 0 || slice_col_par >= part2_mn_tiles) slice_iters = 0;
     if (slice_iters == 0) return;
     if (slice_row + slice_iters > k_tiles) slice_iters = k_tiles - slice_row;
@@ -460,7 +463,7 @@ __global__ void Marlin(
       int col_off = col_first - k_tiles * slice_col_par;
       slice_count = div_ceil(k_tiles - col_off, iters);
       if (col_off > 0) slice_count++;
-      int delta_first = iters * blockIdx.x - col_first;
+      int delta_first = iters * vblk - col_first;
       if (delta_first < 0 || (col_off == 0 && delta_first == 0))
         slice_idx = slice_count - 1;
       else {
@@ -468,7 +471,7 @@ __global__ void Marlin(
         if (col_off > 0) slice_idx--;
       }
     }
-    if (part2_mn_tiles >= gridDim.x) {
+    if (part2_mn_tiles >= vgrid) {
       if (slice_count > 1 && slice_idx == slice_count - 1) {
         locks_off++;
       }
@@ -531,8 +534,8 @@ __global__ void Marlin(
   auto init_slice = [&]() {
     if (!in_part2 && !part1_mn_iters) {
       in_part2 = true;
-      slice_col_par = (iters * blockIdx.x) / k_tiles;
-      slice_row = (iters * blockIdx.x) % k_tiles;
+      slice_col_par = (iters * vblk) / k_tiles;
+      slice_row = (iters * vblk) % k_tiles;
       slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % n_tiles;
       par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
@@ -1123,13 +1126,14 @@ __global__ void Marlin(
     }
   };
 #ifdef MUSE_B_EVICT_FIRST
-  // The weight and scale-code streams are read once: insert them in L2 as evict-first so they displace each
-  // other before any other resident line. Same bytes to the same shared slots; only the L2 policy differs.
-  uint64_t stream_policy;
-  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(stream_policy));
+  // The weight and scale-code streams are read once: insert them in L2 as evict-first with 256B sector fetch
+  // so they do not displace L2-resident activations or l2pf prefetched weight heads. Policy is materialized
+  // locally per copy to avoid ptxas odd-UR descriptor allocation on sm_121a.
   auto cp_async4_stream = [&](void* smem_ptr, const void* glob_ptr) {
     const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(smem), "l"(glob_ptr),
+    uint64_t stream_policy;
+    asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(stream_policy));
+    asm volatile("cp.async.cg.shared.global.L2::256B.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(smem), "l"(glob_ptr),
                  "l"(stream_policy));
   };
 #else
@@ -2452,6 +2456,18 @@ __global__ void Marlin(
       }
       is_first_matmul_in_slice = true;
       init_slice();
+      if constexpr (gate_v48) {
+        if (slice_iters == 0 && vblk >= static_cast<int>(gridDim.x)) {
+          __syncthreads();
+          vblk -= static_cast<int>(gridDim.x);
+          in_part2 = false;
+          first_init = true;
+          slice_row = 0;
+          slice_col_par = vblk;
+          locks_off = (iters * vblk) / k_tiles - 1;
+          init_slice();
+        }
+      }
 
       if (slice_iters) {
         a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) +

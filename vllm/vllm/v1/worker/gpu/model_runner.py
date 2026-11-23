@@ -1397,10 +1397,53 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_tables = None
                 slot_mappings = None
 
+        # Fast-path check for verified 512-token prefill graph replay: skips 52-layer Python
+        # attention metadata construction and recursive _plan() tree walk once the first replay
+        # verified zero-copy persistent buffer identity.
+        prefill_graph = self.prefill_graph
+        fast_prefill_replay = (
+            not dummy_run
+            and prefill_graph is not None
+            and prefill_graph.embed_input_ids is not None
+            and batch_desc.cg_mode == CUDAGraphMode.NONE
+            and self.supports_mm_inputs
+            and self.is_first_pp_rank
+            and self.lora_config is None
+            and not self.model.requires_raw_input_tokens
+            and not scheduler_output.scheduled_encoder_inputs
+            and (
+                self.encoder_cache is None
+                or not any(
+                    self.encoder_cache.mm_features.get(rid)
+                    for rid in input_batch.req_ids
+                )
+            )
+            and not skip_compiled
+            and num_tokens_across_dp is None
+            and input_batch.num_reqs == 1
+            and input_batch.num_draft_tokens == 0
+            and input_batch.num_tokens == prefill_graph.num_tokens
+            and input_batch.num_tokens_after_padding == prefill_graph.num_tokens
+            and int(input_batch.num_computed_tokens_np[0]) == 0
+            and (not prefill_graph.final_sample_tile or (
+                self.prompt_logprobs_worker is not None
+                and not self.prompt_logprobs_worker.uses_prompt_logprobs[input_batch.idx_mapping_np[0]]
+                and input_batch.cu_num_logits_np[-1] == 1
+                and self.speculator is None
+                and self.pcp_manager is None
+                and not self.use_aux_hidden_state_outputs
+            ))
+            and block_tables is not None
+            and slot_mappings is not None
+            and prefill_graph.can_fast_replay(
+                input_batch, block_tables, slot_mappings, input_batch.input_ids
+            )
+        )
+
         # LOCAL PATCH (SP5D, Yukon submission 98c1361e): a FULL-graph replay reads the persistent input, block-table
         # and slot-mapping buffers filled above, not the Python metadata objects, so they are not built for it (no
         # speculator reads them in sample_tokens). FlashAttention-2 metadata building writes no persistent buffer.
-        skip_eager_attn_meta = (
+        skip_eager_attn_meta = fast_prefill_replay or (
             not dummy_run
             and batch_desc.cg_mode == CUDAGraphMode.FULL
             and self.speculator is None
@@ -1461,64 +1504,70 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and int(input_batch.num_computed_tokens_np[0]) == 0
         ):
             graph_embed = True
-        if self.supports_mm_inputs and self.is_first_pp_rank:
-            # Run MM encoder (if needed) and get multimodal embeddings.
-            # Only first PP rank prepares multimodal embeddings.
-            if dummy_run or graph_embed:
-                # Obtain mm embeddings of correct shape for compiled model.
-                inputs_embeds = self.model_state.dummy_inputs_embeds(
-                    input_batch.num_tokens_after_padding
-                )
-            else:
-                scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
-                if self.lora_config is not None:
-                    set_active_mm_loras(
-                        model=self.model,
-                        lora_manager=self.lora_manager,
-                        encoder_cache=self.encoder_cache,
-                        req_id_to_index=self.req_states.req_id_to_index,
-                        lora_state=self.lora_state,
-                        scheduled_encoder_inputs=scheduled_encoder_inputs,
+        if not fast_prefill_replay:
+            if self.supports_mm_inputs and self.is_first_pp_rank:
+                # Run MM encoder (if needed) and get multimodal embeddings.
+                # Only first PP rank prepares multimodal embeddings.
+                if dummy_run or graph_embed:
+                    # Obtain mm embeddings of correct shape for compiled model.
+                    inputs_embeds = self.model_state.dummy_inputs_embeds(
+                        input_batch.num_tokens_after_padding
                     )
-                inputs_embeds = self.model_state.get_mm_embeddings(
-                    scheduled_encoder_inputs, input_batch, self.req_states
-                )
-            if inputs_embeds is not None and not self.model.requires_raw_input_tokens:
-                input_ids = None
+                else:
+                    scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+                    if self.lora_config is not None:
+                        set_active_mm_loras(
+                            model=self.model,
+                            lora_manager=self.lora_manager,
+                            encoder_cache=self.encoder_cache,
+                            req_id_to_index=self.req_states.req_id_to_index,
+                            lora_state=self.lora_state,
+                            scheduled_encoder_inputs=scheduled_encoder_inputs,
+                        )
+                    inputs_embeds = self.model_state.get_mm_embeddings(
+                        scheduled_encoder_inputs, input_batch, self.req_states
+                    )
+                if inputs_embeds is not None and not self.model.requires_raw_input_tokens:
+                    input_ids = None
 
-        model_inputs = {
-            "input_ids": input_ids,
-            "positions": input_batch.positions,
-            "inputs_embeds": inputs_embeds,
-            "intermediate_tensors": None,
-            # NOTE: Values returned by `prepare_inputs` will override the default
-            # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
-        }
-        if not self.is_first_pp_rank:
-            # Update for non-first PP ranks.
-            model_inputs["input_ids"] = None
-            model_inputs["inputs_embeds"] = None
-
-            # Prepare the intermediate tensors.
-            assert intermediate_tensors is not None
-            assert self.intermediate_tensors is not None
-            n = input_batch.num_tokens_after_padding
-            new_tensors = {
-                k: v[:n]
-                if dummy_run
-                else v[:n].copy_(intermediate_tensors.tensors[k][:n])
-                for k, v in self.intermediate_tensors.tensors.items()
+            model_inputs = {
+                "input_ids": input_ids,
+                "positions": input_batch.positions,
+                "inputs_embeds": inputs_embeds,
+                "intermediate_tensors": None,
+                # NOTE: Values returned by `prepare_inputs` will override the default
+                # values above.
+                **self.model_state.prepare_inputs(input_batch, self.req_states),
             }
-            model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
-            del intermediate_tensors
+            if not self.is_first_pp_rank:
+                # Update for non-first PP ranks.
+                model_inputs["input_ids"] = None
+                model_inputs["inputs_embeds"] = None
 
-        # Update the EPLB meta.
-        self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
+                # Prepare the intermediate tensors.
+                assert intermediate_tensors is not None
+                assert self.intermediate_tensors is not None
+                n = input_batch.num_tokens_after_padding
+                new_tensors = {
+                    k: v[:n]
+                    if dummy_run
+                    else v[:n].copy_(intermediate_tensors.tensors[k][:n])
+                    for k, v in self.intermediate_tensors.tensors.items()
+                }
+                model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+                del intermediate_tensors
+
+            # Update the EPLB meta.
+            self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
         # Run model.
         compact_sample = False
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+        if fast_prefill_replay:
+            assert prefill_graph is not None
+            self.kv_connector.pre_forward(scheduler_output)
+            model_output = prefill_graph.fast_replay()
+            compact_sample = prefill_graph.final_sample_tile
+        elif batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
