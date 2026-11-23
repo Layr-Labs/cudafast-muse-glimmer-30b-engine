@@ -1196,6 +1196,122 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _try_lmhead_argmax_graph(
+        self,
+        sample_hidden_states: torch.Tensor,
+        lmpost_argmax: Any,
+        lmpost_into: Any,
+    ) -> torch.Tensor | None:
+        if (
+            lmpost_into is None
+            or envs.os.environ.get("VLLM_LMHEAD_GRAPH", "1") == "0"
+            or self.cudagraph_manager is None
+            or not self.cudagraph_manager._graphs_captured
+            or sample_hidden_states.ndim != 2
+            or sample_hidden_states.shape[0] != 1
+            or not sample_hidden_states.is_contiguous()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        entries = getattr(self, "_lmhead_cg_entries", None)
+        if entries is None:
+            entries = {}
+            self._lmhead_cg_entries = entries
+            self._lmhead_cg_rejected: set[tuple] = set()
+            self._lmhead_cg_pool = torch.cuda.graph_pool_handle()
+            self._lmhead_cg_cap_stream = torch.cuda.Stream(device=self.device)
+            self._lmhead_cg_step = 0
+        sig = (
+            sample_hidden_states.data_ptr(),
+            tuple(sample_hidden_states.shape),
+            tuple(sample_hidden_states.stride()),
+        )
+        entry = entries.get(sig)
+        if entry is not None:
+            graphs, outs = entry
+            slot = self._lmhead_cg_step & 3
+            self._lmhead_cg_step += 1
+            graphs[slot].replay()
+            return outs[slot]
+        if sig in self._lmhead_cg_rejected or len(entries) >= 4:
+            return None
+
+        mult = self.model.output_multiplier
+        cap = self.model.final_logit_softcapping
+        raw_ref = self.model.logits_processor(self.model.lm_head, sample_hidden_states)
+        if raw_ref is None:
+            self._lmhead_cg_rejected.add(sig)
+            return None
+        ref_tok = lmpost_argmax(raw_ref, mult, cap)
+        if ref_tok is None:
+            self._lmhead_cg_rejected.add(sig)
+            return None
+        del raw_ref
+        fused_launch = None
+        try:
+            import lmpost as _lmp
+            import muse_marlin6_gemv as _m6
+            lm_head = self.model.lm_head
+            lp = self.model.logits_processor
+            org_vocab = int(getattr(lp, "org_vocab_size", getattr(lm_head, "org_vocab_size", 0)))
+            if (
+                getattr(lm_head, "tp_size", 1) == 1
+                and getattr(lm_head, "bias", None) is None
+                and not getattr(lp, "logits_as_input", False)
+                and getattr(lp, "soft_cap", None) is None
+                and float(getattr(lp, "scale", 1.0)) == 1.0
+                and sample_hidden_states.dtype == torch.bfloat16
+                and (sample_hidden_states.data_ptr() & 15) == 0
+            ):
+                lut = _lmp._get_lut(self.device, mult, cap)
+                if getattr(lm_head, "marlin_decode6_lmpost_admitted", None) is None:
+                    lm_head.marlin_decode6_lmpost_admitted = _m6.admit_tma4_lmpost(
+                        lm_head, lut, org_vocab, lmpost_argmax, mult, cap
+                    )
+                if lm_head.marlin_decode6_lmpost_admitted:
+                    fused_launch = (lm_head, lut, org_vocab, _m6.launch_lmhead_lmpost6)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Fused lm_head+lmpost setup skipped (%s); using 2-node graph", exc)
+            fused_launch = None
+        try:
+            outs = [torch.empty((1, 1), dtype=torch.int64, device=self.device) for _ in range(4)]
+            graphs: list[torch.cuda.CUDAGraph] = []
+            main_st = torch.cuda.current_stream(self.device)
+            cap_st = self._lmhead_cg_cap_stream
+            cap_st.wait_stream(main_st)
+            with torch.cuda.stream(cap_st):
+                for slot in range(4):
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, pool=self._lmhead_cg_pool, stream=cap_st):
+                        if fused_launch is not None:
+                            lm_h, lut_t, ov, fn_f = fused_launch
+                            if not fn_f(sample_hidden_states, lm_h, lut_t, outs[slot], ov):
+                                raise RuntimeError("fused lm_head+lmpost refused during capture")
+                        else:
+                            raw_g = self.model.logits_processor(self.model.lm_head, sample_hidden_states)
+                            if raw_g is None or not lmpost_into(raw_g, mult, cap, outs[slot]):
+                                raise RuntimeError("lmpost_into refused during capture")
+                    graphs.append(g)
+            main_st.wait_stream(cap_st)
+            outs[0].fill_(-1)
+            graphs[0].replay()
+            if not torch.equal(outs[0], ref_tok):
+                self._lmhead_cg_rejected.add(sig)
+                logger.warning("lm_head+lmpost graph mismatch vs eager; keeping eager path")
+                return ref_tok
+            entries[sig] = (graphs, outs)
+            self._lmhead_cg_step = 1
+            logger.info(
+                "Captured %s lm_head+lmpost_argmax CUDA graph (4-slot ring, shape=%s)",
+                "1-node fused" if fused_launch is not None else "2-node",
+                tuple(sample_hidden_states.shape),
+            )
+            return outs[0]
+        except Exception as exc:  # noqa: BLE001
+            self._lmhead_cg_rejected.add(sig)
+            logger.warning("lm_head+lmpost graph capture skipped (%s); keeping eager path", exc)
+            return ref_tok
+
     def sample(
         self,
         hidden_states: torch.Tensor,
@@ -1236,26 +1352,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 and self.sampler.logprob_token_ids_state.max_num_token_ids(idx_mapping_np) == 0
                 and not self.sampler._requires_logits_processing(idx_mapping_np)
             ):
-                raw_logits = self.model.logits_processor(self.model.lm_head, sample_hidden_states)
-                if raw_logits is not None:
-                    sampled_token_ids = lmpost_argmax(
-                        raw_logits, self.model.output_multiplier, self.model.final_logit_softcapping
-                    )
-                    if sampled_token_ids is not None:
-                        if not getattr(self, "_lmpost_logged", False):
-                            self._lmpost_logged = True
-                            logger.info("lmpost fused softcap + argmax in use (one-row greedy decode)")
-                        return (
-                            SamplerOutput(
-                                sampled_token_ids=sampled_token_ids,
-                                logprobs_tensors=None,
-                                num_nans=None,
-                                num_sampled=self._ones_1_i32,
-                                num_rejected=self._zeros_1_i32,
-                            ),
-                            self._ones_1_i32,
-                            self._zeros_1_i32,
+                lmpost_into = getattr(self.model, "_lmpost_softcap_argmax_into", None)
+                sampled_token_ids = self._try_lmhead_argmax_graph(
+                    sample_hidden_states, lmpost_argmax, lmpost_into
+                )
+                if sampled_token_ids is None:
+                    raw_logits = self.model.logits_processor(self.model.lm_head, sample_hidden_states)
+                    if raw_logits is not None:
+                        sampled_token_ids = lmpost_argmax(
+                            raw_logits, self.model.output_multiplier, self.model.final_logit_softcapping
                         )
+                if sampled_token_ids is not None:
+                    if not getattr(self, "_lmpost_logged", False):
+                        self._lmpost_logged = True
+                        logger.info("lmpost fused softcap + argmax in use (one-row greedy decode)")
+                    return (
+                        SamplerOutput(
+                            sampled_token_ids=sampled_token_ids,
+                            logprobs_tensors=None,
+                            num_nans=None,
+                            num_sampled=self._ones_1_i32,
+                            num_rejected=self._zeros_1_i32,
+                        ),
+                        self._ones_1_i32,
+                        self._zeros_1_i32,
+                    )
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
