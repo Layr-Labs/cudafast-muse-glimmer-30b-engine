@@ -158,8 +158,9 @@ def _get_tma4_sched(
     *,
     gate_v48: bool = False,
     gate_blocks: int = 48,
+    split2: bool = False,
 ):
-    key = (n, k, fixed_grid, gate_v48, gate_blocks, device)
+    key = (n, k, fixed_grid, gate_v48, gate_blocks, split2, device)
     cached = _TMA4_SCHED_CACHE.get(key)
     if cached is not None:
         return cached
@@ -205,6 +206,44 @@ def _get_tma4_sched(
                 v2 = v1 - num_blks
                 for pos in range(iters * v2, min(iters * (v2 + 1), total_p2)):
                     stages.append((pos // k_tiles, pos % k_tiles))
+            blk_off.append(len(stages))
+            it = len(stages) - s_start
+            blk_iters.append(it)
+            blk_sb_off.append(blk_sb_off[-1] + (it + 3) // 4)
+    elif split2:
+        vgrid = 48
+        num_blks = 96
+        part2_mn_tiles = n_tiles
+        part1_mn_iters = 0
+        if n_tiles > vgrid:
+            part2_mn_tiles = n_tiles % vgrid
+            if part2_mn_tiles * 3 <= vgrid:
+                part2_mn_tiles += vgrid
+            part1_mn_iters = (n_tiles - part2_mn_tiles) // vgrid
+        lo_p1 = (part1_mn_iters + 1) // 2
+        iters = (k_tiles * part2_mn_tiles + vgrid - 1) // vgrid
+        base_col = n_tiles - part2_mn_tiles
+        total_p2 = part2_mn_tiles * k_tiles
+        for b in range(vgrid):
+            s_start = len(stages)
+            for p in range(lo_p1):
+                col = b + p * vgrid
+                for kt in range(k_tiles):
+                    stages.append((col, kt))
+            blk_off.append(len(stages))
+            it = len(stages) - s_start
+            blk_iters.append(it)
+            blk_sb_off.append(blk_sb_off[-1] + (it + 3) // 4)
+        for b in range(vgrid):
+            s_start = len(stages)
+            for p in range(lo_p1, part1_mn_iters):
+                col = b + p * vgrid
+                for kt in range(k_tiles):
+                    stages.append((col, kt))
+            p2_start = iters * b
+            p2_end = min(iters * (b + 1), total_p2)
+            for pos in range(p2_start, p2_end):
+                stages.append((base_col + pos // k_tiles, pos % k_tiles))
             blk_off.append(len(stages))
             it = len(stages) - s_start
             blk_iters.append(it)
@@ -280,10 +319,13 @@ def _get_tma4_sched(
     return res
 
 
-def _build_ilv_weight(w: torch.Tensor, n: int, k: int, gate_v48: bool, gate_blocks: int) -> torch.Tensor:
+def _build_ilv_weight(
+    w: torch.Tensor, n: int, k: int, gate_v48: bool, gate_blocks: int, split2: bool = False
+) -> torch.Tensor:
+    tile_n = 128 if n % 128 == 0 else 64
     k_tiles = k // 128
     *_, num_blks, _, _, _, stages, blk_off, blk_iters = _get_tma4_sched(
-        n, k, False, w.device, gate_v48=gate_v48, gate_blocks=gate_blocks
+        n, k, False, w.device, gate_v48=gate_v48, gate_blocks=gate_blocks, split2=split2
     )
     max_it = max(blk_iters)
     perm = []
@@ -292,7 +334,7 @@ def _build_ilv_weight(w: torch.Tensor, n: int, k: int, gate_v48: bool, gate_bloc
             if s < blk_iters[b]:
                 col, kt = stages[blk_off[b] + s]
                 perm.append(col * k_tiles + kt)
-    assert len(perm) == (n // 128) * k_tiles
+    assert len(perm) == (n // tile_n) * k_tiles
     idx_t = torch.tensor(perm, dtype=torch.long, device=w.device)
     return w.reshape(len(perm), -1).index_select(0, idx_t).contiguous().view_as(w)
 
@@ -306,6 +348,7 @@ def encode_tma4_scales(
     *,
     gate_v48: bool = False,
     gate_blocks: int = 48,
+    split2: bool = False,
 ) -> torch.Tensor:
     """Encode tiled one-byte scales into wave/stage-interleaved 4-stage TMA super-block rANS streams (shape (rows, 32) uint8)."""
     if _tma4_p1 is None or _tma4_p2 is None:
@@ -330,7 +373,7 @@ def encode_tma4_scales(
     (
         stage_col_k, blk_stage_off, blk_sb_off, sb_gsb_map,
         blk_iters, sb_row_off, num_blks, threads, total_sbs, max_sbs, *_
-    ) = _get_tma4_sched(n, k, fixed_grid, dev, gate_v48=gate_v48, gate_blocks=gate_blocks)
+    ) = _get_tma4_sched(n, k, fixed_grid, dev, gate_v48=gate_v48, gate_blocks=gate_blocks, split2=split2)
     warps = threads // 32
     rans_cap = 3200 if threads == 256 else 2048
     sb_wc = torch.empty(total_sbs * warps, dtype=torch.int32, device=dev)
@@ -874,20 +917,28 @@ def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
         fixed_grid
         and (n, k) == (GATE_UP_N, GATE_UP_K)
         and _sk_tma4_ilv is not None
-        and os.environ.get("MUSE_GATE_UP_ILV", "0") != "0"
+        and os.environ.get("MUSE_GATE_UP_ILV", "1") != "0"
     )
     gb = _nv6_gate_blocks() if (not fixed_grid and (n, k) == (4096, 6656)) else 48
     is_gate_v48 = (not fixed_grid and (n, k) == (4096, 6656) and gb != 48)
+    want_lm_ilv = (
+        not fixed_grid
+        and (n, k) == (LM_HEAD_N, LM_HEAD_K)
+        and _sk_tma4_ilv is not None
+        and os.environ.get("MUSE_LM_HEAD_ILV", "1") != "0"
+    )
+    want_lm_split2 = want_lm_ilv and os.environ.get("MUSE_LM_HEAD_SPLIT2", "1") != "0"
     coded = encode_tma4_scales(
         layer._marlin_decode_scales, pal, n, k,
         False if want_gu_ilv else fixed_grid,
-        gate_v48=is_gate_v48, gate_blocks=gb,
+        gate_v48=is_gate_v48, gate_blocks=gb, split2=want_lm_split2,
     )
     if coded.numel() > c.numel():
         logger.warning("TMA4 (%dx%d) rejected: coded %d > c %d", n, k, coded.numel(), c.numel())
         return False
     want_ilv = _sk_tma4_ilv is not None and (
         want_gu_ilv
+        or want_lm_ilv
         or (
             not fixed_grid
             and (
@@ -897,7 +948,7 @@ def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
         )
     )
     if want_ilv:
-        w_ilv = _build_ilv_weight(w, n, k, is_gate_v48, gb)
+        w_ilv = _build_ilv_weight(w, n, k, is_gate_v48, gb, split2=want_lm_split2)
         _DOWN_ILV_SCALES.add(coded.data_ptr())
         try:
             got_ilv = [decode_linear6(x, w_ilv, coded, pal, gs, ws, n, k, False) for x in probes]

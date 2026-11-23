@@ -275,12 +275,28 @@ def _tma4_scale_descs(w: torch.Tensor) -> list[tuple[int, int, int, int]]:
     return out
 
 
+def _is_tma4_ilv_site(ws: tuple[torch.Tensor, ...]) -> bool:
+    if len(ws) < 2:
+        return False
+    try:
+        import muse_marlin6_gemv as _m6
+        return _m6.is_tma4_ilv(ws[1])
+    except Exception:
+        return False
+
+
 def weight_descs(ws: tuple[torch.Tensor, ...], nbytes: int) -> list[tuple[int, int, int, int]]:
     """The first nbytes of the weight (ws[0]) and exact TMA4 Wave-0 head (or 1/8 share) of ws[1:]."""
     if nbytes <= 0:
         return []
     w0 = ws[0]
-    if w0.ndim == 3 and w0.shape[1:] == (416, 128) and w0.shape[0] >= 48 and w0.dtype == torch.int32:
+    if (
+        w0.ndim == 3
+        and w0.shape[1:] == (416, 128)
+        and w0.shape[0] >= 48
+        and w0.dtype == torch.int32
+        and not _is_tma4_ilv_site(ws)
+    ):
         base, span = _dense_span(w0)
         if base % 16 == 0 and 47 * 212992 + 16384 <= span:
             out = [(base, 212992, 16384, 48)]

@@ -784,6 +784,7 @@ class CompilationConfig:
         "vllm::muse_glimmer_gate_fork",
         "vllm::muse_glimmer_gate_switch",
         "vllm::muse_glimmer_gate_join",
+        "vllm::muse_glimmer_qk_norm_rope_cache",
     ]
 
     def compute_hash(self) -> str:
