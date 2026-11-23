@@ -49,6 +49,23 @@ def _log(msg: str) -> None:
     print(f"resident: {msg}", file=sys.stderr, flush=True)
 
 
+def _shutdown_inductor_workers() -> None:
+    """Shut down idle torch._inductor compile_worker subprocesses once warmup/capture is done."""
+    if os.environ.get("VLLM_SHUTDOWN_COMPILE_WORKERS", "1") == "0":
+        return
+    try:
+        from torch._inductor import async_compile
+        pool_fn = getattr(async_compile, "_pool_set", None)
+        if pool_fn is not None:
+            for pool in list(pool_fn):
+                shutdown = getattr(pool, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
+            pool_fn.clear()
+    except Exception:
+        pass
+
+
 @dataclass(frozen=True)
 class Emit:
     """One emitted token and the top-k (token, raw logit) of its position."""
@@ -273,8 +290,11 @@ class VllmBackend:
         self._rid = 0
         self._live: str | None = None
         self._warm_up()
+        _shutdown_inductor_workers()
         if muse_sandwich is not None and (summary := muse_sandwich.launch_summary()):
             _log(f"native sandwich dispatch during initialization: {summary}")
+        if muse_sandwich is not None and hasattr(muse_sandwich, "fold_summary"):
+            _log(f"gate-quant fold: {muse_sandwich.fold_summary()}")
 
     # BOOT WARM-UP. The first prefill and the first decode steps after the
     # engine is built run cold (lazy kernel JIT, autotune, allocator growth):

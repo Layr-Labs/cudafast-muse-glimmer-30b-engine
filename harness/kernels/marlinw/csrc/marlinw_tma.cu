@@ -100,6 +100,22 @@ __device__ __forceinline__ void mbar_wait(uint32_t a, int parity) {
       "{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
       " @!p bra WAIT_%=;\n}\n" ::"r"(a), "r"(parity) : "memory");
 }
+__device__ __forceinline__ uint64_t tma_pol_el() {
+  uint64_t p;
+  asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(p));
+  return p;
+}
+__device__ __forceinline__ uint64_t tma_pol_ef() {
+  uint64_t p;
+  asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p));
+  return p;
+}
+__device__ __forceinline__ void tma2d_hint(uint32_t dst, const CUtensorMap* map, int x, int y, uint32_t bar,
+                                           uint64_t pol) {
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;"
+      ::"r"(dst), "l"(map), "r"(x), "r"(y), "r"(bar), "l"(pol) : "memory");
+}
 __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* map, int x, int y, uint32_t bar) {
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
@@ -137,7 +153,7 @@ __device__ __forceinline__ void k_loop(
 #pragma unroll
       for (int i = 0; i < kStages; i++) {
         mbar_init(full_bar + 8 * i, 1);
-        mbar_init(empty_bar + 8 * i, kThreads);
+        mbar_init(empty_bar + 8 * i, kThreads / 32);
       }
       asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -232,7 +248,8 @@ __device__ __forceinline__ void k_loop(
         ldsm4(fa[1][i], sa + 2048 * i);
       }
     }
-    mbar_arrive(empty_bar + 8 * s);  // this thread has taken everything it needs from stage s
+    __syncwarp();
+    if (lane == 0) mbar_arrive(empty_bar + 8 * s);  // warp-aggregated empty signal
 #pragma unroll
     for (int i = 0; i < MB; i++) {
       mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
@@ -325,9 +342,9 @@ __device__ __forceinline__ void down_tile(
   };
   auto produce = [&](const int g, const uint32_t dst, const uint32_t bar) {
     mbar_expect_tx(bar, MB * 16 * 128 + kBBytes + kSBytes);
-    tma2d(dst, tmA, 128 * g, row0, bar);                         // bytes, rows
-    tma2d(dst + kABytes, tmB, 256 * col, 4 * g, bar);            // uint32, k16 rows
-    tma2d(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar);  // bytes, k16 rows
+    tma2d_hint(dst, tmA, 128 * g, row0, bar, tma_pol_el());                         // bytes, rows
+    tma2d_hint(dst + kABytes, tmB, 256 * col, 4 * g, bar, tma_pol_ef());            // uint32, k16 rows
+    tma2d_hint(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar, tma_pol_ef());  // bytes, k16 rows
   };
   // codes: int4 (64 g + 32 nb + lane), int2 sh2 of it; scales: int 32 g + 2 (8 nb + lane / 4) + sh2
   k_loop<MB>(acc, k1, kABytes / 4 + 4 * (32 * nb + lane) + 2 * sh2, 256,
@@ -409,6 +426,11 @@ __global__ void __launch_bounds__(kThreads, 1) down(
     const __grid_constant__ CUtensorMap tmS, int4* __restrict__ C0, float4* __restrict__ scratch,
     const float* __restrict__ gs_ptr, int4* __restrict__ work
     ) {
+  if (threadIdx.x == 0) {
+    asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA8) : "memory");
+    asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
+    asm volatile("prefetch.tensormap [%0];" ::"l"(&tmS) : "memory");
+  }
   const int4 w0 = work[2 * blockIdx.x];
   const int4 w1 = work[2 * blockIdx.x + 1];
   const float gs = gs_ptr[0];
@@ -449,6 +471,11 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int kw = warp >> 2, cw = (warp >> 1) & 1, jh = warp & 1;
   const int chunk = blockIdx.x & 3, col0 = (blockIdx.x >> 2) * kTilesPerCta;
+  if (tid == 0) {
+    asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA) : "memory");
+    asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
+    asm volatile("prefetch.tensormap [%0];" ::"l"(&tmS) : "memory");
+  }
   const float gs = global_scale_ptr[0];
   float c[8][2][2][4];
   // Stage: [activations 16 KiB][gate codes 4 x 512 B][up codes 4 x 512 B][gate scales 4 x 64 B][up scales 4 x 64 B]
@@ -458,11 +485,11 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
     const int g = q - ti * kTiles;
     const int slice_col = col0 + ti;
     mbar_expect_tx(bar, kABytes + kBBytes + kSBytes);
-    tma2d(dst, &tmA, 128 * g, 128 * chunk, bar);                                               // bytes, rows
-    tma2d(dst + kABytes, &tmB, 128 * slice_col, 4 * g, bar);                                   // uint32, k16 rows
-    tma2d(dst + kABytes + kBBytes / 2, &tmB, 128 * slice_col + kFused, 4 * g, bar);
-    tma2d(dst + kABytes + kBBytes, &tmS, 64 * slice_col, 4 * g, bar);                          // bytes, k16 rows
-    tma2d(dst + kABytes + kBBytes + kSBytes / 2, &tmS, 64 * slice_col + kFused / 2, 4 * g, bar);
+    tma2d_hint(dst, &tmA, 128 * g, 128 * chunk, bar, tma_pol_el());                                               // bytes, rows
+    tma2d_hint(dst + kABytes, &tmB, 128 * slice_col, 4 * g, bar, tma_pol_ef());                                   // uint32, k16 rows
+    tma2d_hint(dst + kABytes + kBBytes / 2, &tmB, 128 * slice_col + kFused, 4 * g, bar, tma_pol_ef());
+    tma2d_hint(dst + kABytes + kBBytes, &tmS, 64 * slice_col, 4 * g, bar, tma_pol_ef());                          // bytes, k16 rows
+    tma2d_hint(dst + kABytes + kBBytes + kSBytes / 2, &tmS, 64 * slice_col + kFused / 2, 4 * g, bar, tma_pol_ef());
   };
   // codes: int4 (128 cw + 32 g + lane), int2 jh of it; scales: int 64 cw + 16 g + 2 (lane / 4) + jh
   // Epilogue staging: the start of the window, or (several tiles per CTA) the last stage plus the bytes after it.
@@ -480,18 +507,17 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
   // Reduce the two k-warps: P = A0 (kw 0) + A1 (kw 1).
   int4* red = epi;
   const int t128 = tid & 127;
-#pragma unroll
-  for (int half = 0; half < 2; half++) {
+  if constexpr (kTilesPerCta == 1) {
     if (kw == 1) {
 #pragma unroll
-      for (int q = 0; q < 16; q++) red[q * 128 + t128] = reinterpret_cast<int4*>(&c[4 * half])[q];
+      for (int q = 0; q < 32; q++) red[q * 128 + t128] = reinterpret_cast<int4*>(c)[q];
     }
     __syncthreads();
     if (kw == 0) {
 #pragma unroll
-      for (int q = 0; q < 16; q++) {
+      for (int q = 0; q < 32; q++) {
         const int4 v = red[q * 128 + t128];
-        float* cf = reinterpret_cast<float*>(&c[4 * half]) + 4 * q;
+        float* cf = reinterpret_cast<float*>(c) + 4 * q;
         cf[0] += __int_as_float(v.x);
         cf[1] += __int_as_float(v.y);
         cf[2] += __int_as_float(v.z);
@@ -499,6 +525,27 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
       }
     }
     __syncthreads();
+  } else {
+#pragma unroll
+    for (int half = 0; half < 2; half++) {
+      if (kw == 1) {
+#pragma unroll
+        for (int q = 0; q < 16; q++) red[q * 128 + t128] = reinterpret_cast<int4*>(&c[4 * half])[q];
+      }
+      __syncthreads();
+      if (kw == 0) {
+#pragma unroll
+        for (int q = 0; q < 16; q++) {
+          const int4 v = red[q * 128 + t128];
+          float* cf = reinterpret_cast<float*>(&c[4 * half]) + 4 * q;
+          cf[0] += __int_as_float(v.x);
+          cf[1] += __int_as_float(v.y);
+          cf[2] += __int_as_float(v.z);
+          cf[3] += __int_as_float(v.w);
+        }
+      }
+      __syncthreads();
+    }
   }
 
   if (kw == 0) {
@@ -595,7 +642,8 @@ static bool map2d(CUtensorMap* tm, const void* ptr, int esize, uint64_t width, u
   const CUtensorMapDataType dt = esize == 4 ? CU_TENSOR_MAP_DATA_TYPE_UINT32 : CU_TENSOR_MAP_DATA_TYPE_UINT8;
   return encode(tm, dt, 2, const_cast<void*>(ptr), dims, strides, box, es, CU_TENSOR_MAP_INTERLEAVE_NONE,
                 swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE,
-                CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+                CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
 }  // namespace MARLIN_NAMESPACE_NAME

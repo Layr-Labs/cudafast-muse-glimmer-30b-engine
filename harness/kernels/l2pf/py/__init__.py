@@ -49,8 +49,24 @@ def lib():
         ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
     ]
     h.l2pf_prefetch_desc.restype = ctypes.c_int
+    if hasattr(h, "l2pf_prefetch_desc_spread"):
+        h.l2pf_prefetch_desc_spread.argtypes = h.l2pf_prefetch_desc.argtypes
+        h.l2pf_prefetch_desc_spread.restype = ctypes.c_int
+    if hasattr(h, "l2pf_set_persisting_window"):
+        h.l2pf_set_persisting_window.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p,
+        ]
+        h.l2pf_set_persisting_window.restype = ctypes.c_int
     _lib = h
     return h
+
+
+def set_persisting_window(base_ptr: int, num_bytes: int, limit_bytes: int, stream: torch.cuda.Stream) -> bool:
+    h = lib()
+    if h is None or not hasattr(h, "l2pf_set_persisting_window"):
+        return False
+    rc = h.l2pf_set_persisting_window(base_ptr, int(num_bytes), int(limit_bytes), stream.cuda_stream)
+    return rc == 0
 
 
 def prefetch(t: torch.Tensor, nbytes: int, stream: torch.cuda.Stream,
@@ -67,12 +83,13 @@ def prefetch(t: torch.Tensor, nbytes: int, stream: torch.cuda.Stream,
 
 
 def prefetch_desc(desc_ptr: int, ndesc: int, stream: torch.cuda.Stream,
-                  blocks: int = 1, threads: int = 128) -> None:
+                  blocks: int = 1, threads: int = 128, spread: bool = False) -> None:
     """Queue the prefetches of ndesc descriptors at desc_ptr (device memory)."""
     h = lib()
     if h is None:
         raise RuntimeError("l2pf library not available")
-    rc = h.l2pf_prefetch_desc(desc_ptr, ndesc, blocks, threads, stream.cuda_stream)
+    fn = h.l2pf_prefetch_desc_spread if (spread and hasattr(h, "l2pf_prefetch_desc_spread")) else h.l2pf_prefetch_desc
+    rc = fn(desc_ptr, ndesc, blocks, threads, stream.cuda_stream)
     if rc != 0:
         raise RuntimeError(f"l2pf_prefetch_desc failed: {rc}")
 
