@@ -73,6 +73,9 @@ TLB_UNASSISTED = os.environ.get("L2PF_TLB_UNASSISTED", "1") != "0"
 NORM_HINT: list | None = None
 NORM_PREWARM = os.environ.get("L2PF_NORM_PREWARM", "1") != "0"
 SITES_PER_LAYER = 5
+TAIL_DESCS: list[tuple[int, int, int, int]] = []
+LM_HEAD_TAIL = os.environ.get("L2PF_LM_HEAD_TAIL", "1") != "0"
+LM_HEAD_WAVES = max(1, min(4, int(os.environ.get("L2PF_LM_HEAD_WAVES", "2"))))
 
 # Compressed one-row projections measured with the same captured stream edges.
 _RANS_SKIP_PREFETCH = {
@@ -282,8 +285,9 @@ def weight_descs(ws: tuple[torch.Tensor, ...], nbytes: int) -> list[tuple[int, i
     w0 = ws[0]
     if w0.ndim == 3 and w0.shape[1:] == (416, 128) and w0.shape[0] >= 48 and w0.dtype == torch.int32:
         base, span = _dense_span(w0)
-        if base % 16 == 0 and 47 * 212992 + 16384 <= span:
-            out = [(base, 212992, 16384, 48)]
+        seg = LM_HEAD_WAVES * 16384
+        if base % 16 == 0 and seg <= CHUNK and 47 * 212992 + seg <= span:
+            out = [(base, 212992, seg, 48)]
         else:
             out = head_descs(w0, nbytes)
     else:
@@ -305,12 +309,36 @@ def _inside(descs, ranges) -> bool:
 
 
 def weight_ranges(module: torch.nn.Module) -> list[tuple[int, int]]:
-    """Memory ranges of every parameter and buffer of module."""
+    """Memory ranges of every parameter and buffer of module (plus post-backbone tail descriptors)."""
+    global TAIL_DESCS
     out = []
     for t in list(module.parameters()) + list(module.buffers()):
         if t.is_cuda and t.numel():
             st = t.untyped_storage()
             out.append((st.data_ptr(), st.data_ptr() + st.nbytes()))
+    TAIL_DESCS = []
+    if LM_HEAD_TAIL:
+        try:
+            td: list[tuple[int, int, int, int]] = []
+            inner = getattr(module, "model", None)
+            fnorm = getattr(inner, "norm", None) if inner is not None else None
+            nw = getattr(fnorm, "weight", None)
+            if isinstance(nw, torch.Tensor) and nw.is_cuda and nw.numel():
+                td += head_descs(nw, 16384)
+            lm = getattr(module, "lm_head", None)
+            lm_w = getattr(lm, "_marlin_decode_weight", None)
+            lm_s = getattr(lm, "_marlin_decode_scales6", None)
+            if isinstance(lm_w, torch.Tensor) and lm_w.is_cuda:
+                ws = (lm_w, lm_s) if (isinstance(lm_s, torch.Tensor) and lm_s.is_cuda) else (lm_w,)
+                td += weight_descs(ws, BYTES_MLP_NORM)
+                if TLB_PREFETCH:
+                    td += tlb_descs(lm_w, 0, TLB_STRIDE)
+                    for w_ex in ws[1:]:
+                        td += tlb_descs(w_ex, 0, TLB_STRIDE)
+            if td and _inside(td, out):
+                TAIL_DESCS = td
+        except Exception:  # noqa: BLE001
+            TAIL_DESCS = []
     return out
 
 
@@ -452,6 +480,8 @@ class Session:
         self._attn = False
         self._prev_big = False
         self.norm_sites = 0
+        self.tail_descs: list[tuple[int, int, int, int]] = []
+        self.tail_off = -1
 
     # -- patching
     @contextlib.contextmanager
@@ -624,6 +654,14 @@ class Session:
             s.off = len(flat) // 3
             for base, pitch, seg, cnt in s.descs:
                 flat += [base, pitch, (seg << 32) | cnt]
+        self.tail_descs = []
+        self.tail_off = -1
+        if TAIL_DESCS and len(self.sites) == SITES_PER_LAYER * 52:
+            if self.ranges is None or _inside(TAIL_DESCS, self.ranges):
+                self.tail_off = len(flat) // 3
+                self.tail_descs = list(TAIL_DESCS)
+                for base, pitch, seg, cnt in self.tail_descs:
+                    flat += [base, pitch, (seg << 32) | cnt]
         self.used = sum(1 for s in self.sites if s.descs)
         if flat:
             self.table = torch.tensor(flat, dtype=torch.int64).to(dev)
@@ -677,7 +715,14 @@ class Session:
             self._join(main)
             return
         self._join(main)
-        self._fork(main, i + 1)
+        if i + 1 < len(self.sites):
+            self._fork(main, i + 1)
+        elif self.tail_off >= 0 and self.tail_descs:
+            self.side.wait_stream(main)
+            prefetch_desc(self.table.data_ptr() + 24 * self.tail_off, len(self.tail_descs), self.side,
+                          blocks=BLOCKS, threads=THREADS, spread=SPREAD)
+            self._pending = True
+            self.prefetched += 1
 
     def summary(self) -> str:
         na = sum(1 for s in self.sites if s.descs and not s.mlp and s.after_attn)
@@ -699,4 +744,5 @@ class Session:
                 f"{nb} others at {BYTES_OTHER / (1 << 20):.1f} MiB, "
                 f"weights above {MAX_WEIGHT / (1 << 20):.0f} MiB: {big}; "
                 f"{mb:.0f} MiB per step; compressed FP8 sites left without prefetch: "
-                f"{ua} output after attention, {ub} QKV; norm-weight pre-warm on {self.norm_sites} sites")
+                f"{ua} output after attention, {ub} QKV; norm-weight pre-warm on {self.norm_sites} sites"
+                + (f"; lm_head tail {len(self.tail_descs)} descs" if self.tail_descs else ""))

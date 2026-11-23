@@ -2195,6 +2195,7 @@ class MuseGlimmerForCausalLM(
         # compute_logits chain (x * output_multiplier, then cap * tanh(x / cap)) evaluated by the same torch ops on
         # every BF16 value; ties go to the lowest index, as the stock greedy sampler's block argmax + argmax.
         self._lmpost_softcap_argmax = None
+        self._lmpost_softcap_argmax_into = None
         self._pack_persisting_norm_arena()
         # Gate-quant fold (harness/kernels/sandwich/muse_sandwich.py): register every FP8-attention layer's
         # qkv and output-gate input scales; the 512-row native sandwich of such a layer then also writes the
@@ -2237,6 +2238,7 @@ class MuseGlimmerForCausalLM(
                 lmpost._get_lut(dev, self.output_multiplier, self.final_logit_softcapping)
                 lmpost._get_scratch(dev)
                 self._lmpost_softcap_argmax = lmpost.softcap_argmax
+                self._lmpost_softcap_argmax_into = getattr(lmpost, "softcap_argmax_into", None)
         except ImportError:
             pass
 
