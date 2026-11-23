@@ -5,6 +5,7 @@
 // (336 CTAs x 256T), down (48 CTAs x 256T), and lm_head (48 CTAs x 128T) with zero cp.async contention.
 #define MARLIN_NAMESPACE_NAME muse_marlin6_tma4
 #define MUSE_SCALE_TMA4
+#define MUSE_B_EVICT_FIRST
 #include <cstdlib>
 #include "marlin/marlin_template.h"
 

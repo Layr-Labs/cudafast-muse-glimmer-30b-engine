@@ -59,6 +59,8 @@ BLOCKS = int(os.environ.get("L2PF_BLOCKS", "1"))
 MLP = os.environ.get("L2PF_MLP", "1") != "0"
 BYTES_MLP_NORM = _env_bytes("L2PF_MB_MLP_NORM", (9 << 20) // 4)
 BYTES_MLP_ACT = _env_bytes("L2PF_MB_MLP_ACT", 1 << 19)
+BYTES_RANS_AFTER_ATTN = _env_bytes("L2PF_MB_RANS_ATTN", 0)
+BYTES_RANS_QKV = _env_bytes("L2PF_MB_RANS_QKV", 0)
 TLB_PREFETCH = os.environ.get("L2PF_TLB", "1") != "0"
 TLB_RANS_HEAD = int(os.environ.get("L2PF_TLB_RANS_HEAD_KB", "32")) << 10
 TLB_STRIDE = int(os.environ.get("L2PF_TLB_STRIDE_KB", "2048")) << 10
@@ -293,6 +295,12 @@ def _targets():
         lane_bf16 = torch.ops.vllm.muse_bf16_lane_linear
         lane_bf16.default  # noqa: B018
         out.append((lane_bf16, "default", "muse_bf16_lane", False))
+        try:
+            bgpkt = torch.ops.vllm.muse_bf16_gate_fill
+            bgpkt.default  # noqa: B018
+            out.append((bgpkt, "default", "muse_bf16_gate", False))
+        except (AttributeError, RuntimeError):
+            pass
     except (AttributeError, RuntimeError):
         pass
     try:
@@ -332,6 +340,8 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[1],)
         if kind == "muse_bf16_lane" and args[0].shape[0] == 1 and args[0].is_contiguous():
             return (args[2],)
+        if kind == "muse_bf16_gate" and args[1].shape[0] == 1 and args[1].is_contiguous():
+            return (args[3],)
         if kind == "marlin_tiled":
             return (args[1], args[2])
     except IndexError:
@@ -465,20 +475,23 @@ class Session:
                             and a.is_contiguous() and 0 < packed.numel() != n * k):
                         from vllm.model_executor.kernels.linear.scaled_mm.muse_fp8 import _scales_ok
                         if _scales_ok(sa, sb, n):
-                            nbytes = 0
-                            site.unassisted = True
+                            nbytes = BYTES_RANS_AFTER_ATTN if site.after_attn else BYTES_RANS_QKV
+                            if nbytes == 0:
+                                site.unassisted = True
                 elif kind == "muse_bf16_lane":
                     a, weight, packed, index = args
                     n, k = weight.shape
                     if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
                             and a.is_contiguous() and index.numel() == 1):
-                        nbytes = 0
-                        site.unassisted = True
+                        nbytes = BYTES_RANS_AFTER_ATTN if site.after_attn else BYTES_RANS_QKV
+                        if nbytes == 0:
+                            site.unassisted = True
                 if site.unassisted and TLB_PREFETCH and TLB_UNASSISTED:
                     site.descs = head_descs(ws[0], TLB_RANS_HEAD) + tlb_descs(ws[0], TLB_RANS_HEAD, TLB_STRIDE)
                 else:
                     site.descs = weight_descs(ws, nbytes)
-                    if not site.unassisted and TLB_PREFETCH and (kind in ("musefp8", "muse_bf16_lane") or TLB_ALL):
+                    if not site.unassisted and TLB_PREFETCH and (
+                            kind in ("musefp8", "musefp8_gate", "muse_bf16_lane", "muse_bf16_gate") or TLB_ALL):
                         site.descs += tlb_descs(ws[0], nbytes, TLB_STRIDE)
             if self.ranges is not None and not _inside(site.descs, self.ranges):
                 site.descs = []

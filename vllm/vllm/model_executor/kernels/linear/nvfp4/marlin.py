@@ -439,6 +439,12 @@ def _marlin_fp4_narrow_attn(
             )
             if out is not None:
                 return out
+        if muse_final_slab is not None and x.shape[0] == muse_final_slab.ROWS:
+            out = muse_final_slab.attn_if_active(
+                x, weight, weight_scale, weight_global_scale, size_n, size_k
+            )
+            if out is not None:
+                return out
         out = marlinw_attn.gemm(
             x, weight, weight_scale, weight_global_scale, attn_work, attn_work_ptr, attn_slots
         )
