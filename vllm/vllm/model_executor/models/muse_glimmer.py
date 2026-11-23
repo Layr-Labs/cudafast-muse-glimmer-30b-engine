@@ -1207,6 +1207,10 @@ class _GateSideStream:
         self.last_layer = -1
         self.forks = 0
         self.reported = False
+        # Layers whose output_gate_proj uses a deterministic custom M=1 kernel (muse_bf16_lane)
+        # while M>1 falls back to cuBLAS: restrict side-stream fork strictly to M=1 and require
+        # muse_bf16_lane_weight to be admitted.
+        self.bf16_gate_by_layer: dict[int, nn.Module] = {}
 
     def _ensure_stream(self) -> bool:
         if self.stream is None and not self.unavailable:
@@ -1240,7 +1244,11 @@ class _GateSideStream:
 
     def fork(self, x: torch.Tensor, layer_idx: int) -> None:
         self.active = False
-        if not x.is_cuda or x.shape[0] > self.max_tokens:
+        bf16_gate = self.bf16_gate_by_layer.get(layer_idx)
+        if bf16_gate is not None:
+            if not x.is_cuda or x.shape[0] != 1 or getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
+                return
+        elif not x.is_cuda or x.shape[0] > self.max_tokens:
             return
         if (
             is_forward_context_available()
@@ -1340,7 +1348,7 @@ direct_register_custom_op(
 )
 
 
-def _gate_side_stream_fork_point(gate_proj: nn.Module) -> str | None:
+def _gate_side_stream_fork_point(gate_proj: nn.Module, layer_idx: int = -1) -> str | None:
     """Where the output gate branch forks off the attention chain, or None to
     keep the gate projection in order on the main stream: ``"qkv"`` right
     after the qkv projection, ``"attn"`` right before the attention op."""
@@ -1348,14 +1356,27 @@ def _gate_side_stream_fork_point(gate_proj: nn.Module) -> str | None:
     if mode not in ("qkv", "attn") or not current_platform.is_cuda():
         return None
     # cuBLAS does not promise the same kernel choice while other streams are
-    # active, so unquantized projections stay on the main stream.
-    if isinstance(getattr(gate_proj, "quant_method", None), UnquantizedLinearMethod):
-        return None
+    # active, so unquantized projections stay on the main stream — EXCEPT when
+    # muse_bf16_lane replaces M=1 decode with its deterministic custom rANS GEMV,
+    # in which case we restrict the side-stream fork strictly to M=1.
+    qm = getattr(gate_proj, "quant_method", None)
+    bf16_lane_only = False
+    if isinstance(qm, UnquantizedLinearMethod):
+        if (
+            type(qm) is not UnquantizedLinearMethod
+            and type(qm).__name__ == "_MuseBF16Lane"
+            and os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_BF16", "1") != "0"
+        ):
+            bf16_lane_only = True
+        else:
+            return None
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
         return None
     compilation_config = vllm_config.compilation_config
     if compilation_config.mode == CompilationMode.NONE:
+        if bf16_lane_only and layer_idx >= 0:
+            _gate_side_stream.bf16_gate_by_layer[layer_idx] = gate_proj
         return mode
     if (
         compilation_config.mode != CompilationMode.VLLM_COMPILE
@@ -1366,6 +1387,8 @@ def _gate_side_stream_fork_point(gate_proj: nn.Module) -> str | None:
         )
     ):
         return None
+    if bf16_lane_only and layer_idx >= 0:
+        _gate_side_stream.bf16_gate_by_layer[layer_idx] = gate_proj
     return mode
 
 
@@ -1449,7 +1472,7 @@ class MuseGlimmerAttention(nn.Module):
                 if self.use_output_gate:
                     enable_bf16_lane(self.output_gate_proj)
         self.gate_fork_point = (
-            _gate_side_stream_fork_point(self.output_gate_proj)
+            _gate_side_stream_fork_point(self.output_gate_proj, self.layer_idx)
             if self.use_output_gate
             else None
         )
