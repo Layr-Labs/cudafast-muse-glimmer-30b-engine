@@ -118,13 +118,9 @@ def _muse_fp8_scaled_mm(
 ) -> torch.Tensor:
     if not _stats["logged"]:
         _stats["logged"] = True
-        tpf_kb = _rans.rans_tpf_kb() if (_rans is not None and hasattr(_rans, "rans_tpf_kb")) else 0
-        tpf_note = f", translation prefetch every {tpf_kb} KiB" if tpf_kb > 0 else ", translation prefetch off"
-        gate_blks = 32 if os.environ.get("MUSERANS_GATE_32_BLOCKS", "1") != "0" else 47
         logger.info(
-            "musefp8 decode GEMV: %d FP8 layers admitted (%d of them rANS-compressed%s), %d rejected; "
-            "attention gate GEMV on %d blocks",
-            _stats["admitted"], _stats["rans"], tpf_note, _stats["rejected"], gate_blks,
+            "musefp8 decode GEMV: %d FP8 layers admitted (%d of them rANS-compressed), %d rejected",
+            _stats["admitted"], _stats["rans"], _stats["rejected"],
         )
     k, n = B.shape
     if A.shape[0] == 1 and packed.numel() > 0 and A.is_contiguous() and _scales_ok(As, Bs, n):

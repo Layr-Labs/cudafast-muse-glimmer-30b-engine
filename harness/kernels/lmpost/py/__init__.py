@@ -9,6 +9,7 @@ block until that step's output holder releases it, as for the stock sampler's ou
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 from pathlib import Path
 
@@ -36,6 +37,8 @@ def _load():
         lib.lmpost_softcap_inplace.restype = ci
         lib.lmpost_softcap_argmax.argtypes = [vp, vp, vp, vp, vp, vp, ci, vp]
         lib.lmpost_softcap_argmax.restype = ci
+        lib.lmpost_softcap_argmax_lut.argtypes = [vp, vp, vp, vp, vp, vp, ci, vp]
+        lib.lmpost_softcap_argmax_lut.restype = ci
         _lib = lib
     except OSError:
         _load_failed = True
@@ -107,6 +110,17 @@ def softcap_inplace(logits: torch.Tensor, mult: float, cap: float | None) -> boo
     return True
 
 
+def _is_monotone_transform(mult: float, cap: float | None) -> bool:
+    m = float(mult)
+    if not (math.isfinite(m) and m > 0.0):
+        return False
+    if cap is not None:
+        c = float(cap)
+        if not (math.isfinite(c) and c != 0.0):
+            return False
+    return True
+
+
 def softcap_argmax(logits: torch.Tensor, mult: float, cap: float | None) -> torch.Tensor | None:
     """Compute [1, 1] int64 argmax of ``cap * tanh((logits * mult) / cap)`` directly."""
     if (
@@ -122,7 +136,8 @@ def softcap_argmax(logits: torch.Tensor, mult: float, cap: float | None) -> torc
     lut = _get_lut(dev, mult, cap)
     sv, si, dc, _, _ = _get_scratch(dev)
     out = torch.empty((1, 1), dtype=torch.int64, device=dev)
-    rc = _lib.lmpost_softcap_argmax(
+    fn = _lib.lmpost_softcap_argmax if _is_monotone_transform(mult, cap) else _lib.lmpost_softcap_argmax_lut
+    rc = fn(
         logits.data_ptr(),
         lut.data_ptr(),
         out.data_ptr(),

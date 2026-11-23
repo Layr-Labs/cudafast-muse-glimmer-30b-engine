@@ -39,7 +39,15 @@ import torch
 
 from . import CHUNK, ENABLED, lib, prefetch_desc, self_check
 
-__all__ = ["Session", "budget", "weight_descs", "head_descs", "marlin_descs", "available"]
+__all__ = [
+    "Session",
+    "budget",
+    "weight_descs",
+    "head_descs",
+    "marlin_descs",
+    "verify_descriptors",
+    "available",
+]
 
 
 def _env_bytes(name: str, default: int) -> int:
@@ -59,11 +67,6 @@ BLOCKS = int(os.environ.get("L2PF_BLOCKS", "1"))
 MLP = os.environ.get("L2PF_MLP", "1") != "0"
 BYTES_MLP_NORM = _env_bytes("L2PF_MB_MLP_NORM", (9 << 20) // 4)
 BYTES_MLP_ACT = _env_bytes("L2PF_MB_MLP_ACT", 1 << 19)
-TLB_PREFETCH = os.environ.get("L2PF_TLB", "1") != "0"
-TLB_RANS_HEAD = int(os.environ.get("L2PF_TLB_RANS_HEAD_KB", "32")) << 10
-TLB_STRIDE = int(os.environ.get("L2PF_TLB_STRIDE_KB", "2048")) << 10
-TLB_ALL = os.environ.get("L2PF_TLB_ALL", "1") != "0"
-TLB_UNASSISTED = os.environ.get("L2PF_TLB_UNASSISTED", "0") != "0"
 
 # Compressed one-row projections measured with the same captured stream edges.
 _RANS_SKIP_PREFETCH = {
@@ -107,21 +110,6 @@ def head_descs(t: torch.Tensor, nbytes: int) -> list[tuple[int, int, int, int]]:
     if rem:
         out.append((base + full * CHUNK, 0, rem, 1))
     return out
-
-
-def tlb_descs(t: torch.Tensor, start_bytes: int = 0, stride: int = TLB_STRIDE,
-              seg: int = 128) -> list[tuple[int, int, int, int]]:
-    """One small bulk prefetch per stride across t to warm GMMU page-table entries on the side stream."""
-    if stride <= 0 or seg <= 0 or seg % 16:
-        return []
-    base, span = _dense_span(t)
-    if base % 16 or span <= stride:
-        return []
-    first = ((max(int(start_bytes), stride) + stride - 1) // stride) * stride
-    if first + seg > span:
-        return []
-    cnt = (span - seg - first) // stride + 1
-    return [(base + first, stride, seg, cnt)]
 
 
 def marlin_stripe_starts(n: int, k: int, sms: int, thread_k: int = 128,
@@ -226,6 +214,26 @@ def _inside(descs, ranges) -> bool:
         if not any(a <= lo and hi <= b for a, b in ranges):
             return False
     return True
+
+
+def verify_descriptors(
+    descriptors: list[tuple[int, int, int]],
+    live_ranges: list[tuple[int, int]],
+) -> None:
+    """Assert every packed (base, pitch, (seg << 32) | cnt) descriptor lies inside live_ranges."""
+    live = list(dict.fromkeys(live_ranges))
+    for base, pitch, sc in descriptors:
+        seg = sc >> 32
+        cnt = sc & 0xFFFFFFFF
+        assert (
+            cnt >= 1
+            and pitch >= 0
+            and 16 <= seg <= CHUNK
+            and seg % 16 == 0
+            and base % 16 == 0
+        ), f"invalid l2pf descriptor: base={hex(base)} pitch={pitch} seg={seg} cnt={cnt}"
+        hi = base + (cnt - 1) * pitch + seg
+        assert any(lo <= base < hi_r and hi <= hi_r for lo, hi_r in live), hex(base)
 
 
 def weight_ranges(module: torch.nn.Module) -> list[tuple[int, int]]:
@@ -357,6 +365,7 @@ class Session:
         self.ranges = ranges
         self.storages = None if ranges is None else {a: b for a, b in ranges}
         self.sites: list[_Site] = []
+        self._descs: list[tuple[int, int, int]] = []
         self.table: torch.Tensor | None = None
         self.side: torch.cuda.Stream | None = None
         self.sms = 0
@@ -418,6 +427,8 @@ class Session:
         self.sms = torch.cuda.get_device_properties(dev).multi_processor_count
         self.side = torch.cuda.Stream(device=dev)
         self.sites = []
+        self._descs = []
+        self.table = None
         self.stopped = False
         self._attn = False
         self._prev_big = False
@@ -452,10 +463,7 @@ class Session:
             if wbytes > MAX_WEIGHT:
                 self._prev_big = True
                 site.mlp = "act" if prev_big else "norm"
-                mb_b = mlp_budget(len(ws), prev_big)
-                site.descs = weight_descs(ws, mb_b)
-                if TLB_PREFETCH and (kind == "musefp8" or TLB_ALL):
-                    site.descs += tlb_descs(ws[0], mb_b, TLB_STRIDE)
+                site.descs = weight_descs(ws, mlp_budget(len(ws), prev_big))
             else:
                 nbytes = budget(wbytes, site.after_attn)
                 if kind == "musefp8":
@@ -474,12 +482,7 @@ class Session:
                             and a.is_contiguous() and index.numel() == 1):
                         nbytes = 0
                         site.unassisted = True
-                if site.unassisted and TLB_PREFETCH and TLB_UNASSISTED:
-                    site.descs = head_descs(ws[0], TLB_RANS_HEAD) + tlb_descs(ws[0], TLB_RANS_HEAD, TLB_STRIDE)
-                else:
-                    site.descs = weight_descs(ws, nbytes)
-                    if not site.unassisted and TLB_PREFETCH and (kind in ("musefp8", "muse_bf16_lane") or TLB_ALL):
-                        site.descs += tlb_descs(ws[0], nbytes, TLB_STRIDE)
+                site.descs = weight_descs(ws, nbytes)
             if self.ranges is not None and not _inside(site.descs, self.ranges):
                 site.descs = []
         except Exception:  # noqa: BLE001 - a site without ranges is still a site
@@ -493,8 +496,24 @@ class Session:
             for base, pitch, seg, cnt in s.descs:
                 flat += [base, pitch, (seg << 32) | cnt]
         self.used = sum(1 for s in self.sites if s.descs)
+        self._descs = [
+            (flat[i], flat[i + 1], flat[i + 2]) for i in range(0, len(flat), 3)
+        ]
         if flat:
             self.table = torch.tensor(flat, dtype=torch.int64).to(dev)
+            if self.ranges is not None:
+                verify_descriptors(self._descs, self.ranges)
+
+    def verify_live_ranges(
+        self, live: list[tuple[int, int]] | torch.nn.Module
+    ) -> None:
+        """Assert the built descriptor table targets only live device allocations."""
+        if not self._descs:
+            assert self.table is None
+            return
+        assert self.table is not None and self.table.numel() == 3 * len(self._descs)
+        ranges = weight_ranges(live) if isinstance(live, torch.nn.Module) else live
+        verify_descriptors(self._descs, ranges)
 
     # -- apply (capture)
     @contextlib.contextmanager
@@ -502,6 +521,8 @@ class Session:
         if self.table is None or self.side is None:
             yield
             return
+        if self._descs and self.ranges is not None:
+            verify_descriptors(self._descs, self.ranges)
         self._i = 0
         self._pending = False
         self.stopped = False

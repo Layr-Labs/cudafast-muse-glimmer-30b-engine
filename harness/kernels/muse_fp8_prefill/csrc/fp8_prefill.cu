@@ -82,7 +82,8 @@ using Coop = cutlass::gemm::KernelTmaWarpSpecializedCooperative;
 using Cfg1 = Fp8Prefill<Shape<_128, _192, _64>, Shape<_64, _32>, Coop>;
 // 2: 128x192x128 tile (k-tile 128). FP8 down projection (6656x19968).
 // 3: 128x96x128 tile. o_proj (6656x4096) and qkv (4608x6656: exact 4.00 waves on 48 SMs).
-// 4: 128x128x128 tile (auto stages) and 5: 128x64x128 tile (for gate/qkv benchmarking).
+// Micro-attribution: Cfg2 (128x192x128) and Cfg3 (128x96x128) CUTLASS SM120 Cooperative tiles are
+// inspired by @spariev (Yukon submission 262ee4f1).
 using Cfg2 = Fp8Prefill<Shape<_128, _192, _128>, Shape<_64, _32>, Coop>;
 using Cfg3 = Fp8Prefill<Shape<_128, _96, _128>, Shape<_64, _32>, Coop>;
 

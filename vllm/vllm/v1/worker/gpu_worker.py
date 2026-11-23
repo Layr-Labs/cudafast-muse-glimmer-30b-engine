@@ -487,6 +487,15 @@ class Worker(WorkerBase):
         maybe_apply_startup_plan(self)
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            # Ensure quarantined slow weight pages leave headroom for KV + profile_run.
+            try:
+                from vllm.model_executor.kernels.linear.nvfp4.decode_placement import (
+                    ensure_kv_cache_room,
+                )
+
+                ensure_kv_cache_room(max(24 << 30, int(kv_cache_memory_bytes) * 3))
+            except Exception:  # noqa: BLE001
+                pass
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
             self.model_runner.profile_run()
@@ -509,6 +518,17 @@ class Worker(WorkerBase):
                 self.model_config.multimodal_config,
                 getattr(self.parallel_config, "_api_process_count", 1),
             )
+
+        # Keep _SLOW_HOLD quarantined through KV cache allocation unless host
+        # headroom drops below what profiling + KV cache need.
+        try:
+            from vllm.model_executor.kernels.linear.nvfp4.decode_placement import (
+                ensure_kv_cache_room,
+            )
+
+            ensure_kv_cache_room(24 << 30)
+        except Exception:  # noqa: BLE001
+            pass
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -676,8 +696,32 @@ class Worker(WorkerBase):
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
-        with self._maybe_get_memory_pool_context(tag="kv_cache"):
-            self.model_runner.initialize_kv_cache(kv_cache_config)
+        # Keep _SLOW_HOLD quarantined across KV cache allocation so KV tensors do not
+        # recycle slow pages released at the end of weight placement, trimming only
+        # if host headroom requires it and releasing everything right afterwards.
+        _dp = None
+        try:
+            from vllm.model_executor.kernels.linear.nvfp4 import (
+                decode_placement as _dp,
+            )
+
+            packed_bytes = 0
+            unpacked_bytes = 0
+            for _kv_t in kv_cache_config.kv_cache_tensors:
+                if _kv_t.block_stride > 0:
+                    packed_bytes = max(packed_bytes, _kv_t.size)
+                else:
+                    unpacked_bytes += _kv_t.size
+            _dp.ensure_kv_cache_room(packed_bytes + unpacked_bytes)
+        except Exception:  # noqa: BLE001
+            _dp = None
+
+        try:
+            with self._maybe_get_memory_pool_context(tag="kv_cache"):
+                self.model_runner.initialize_kv_cache(kv_cache_config)
+        finally:
+            if _dp is not None:
+                _dp.release_slow_hold()
 
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()

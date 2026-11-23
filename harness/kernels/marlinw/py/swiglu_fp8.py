@@ -66,6 +66,8 @@ def _check(layer, lib):
         return False
 
 
+# Micro-attribution: The TMA-fed 128-row FP8-output paired SwiGLU loader libmarlinw_swiglu3_fp8 is
+# inspired by @zereraz (Yukon submission d45f9a81).
 def prepare(layer):
     global _lib, _lib3
     device = layer.weight.device

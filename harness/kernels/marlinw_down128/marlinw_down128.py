@@ -23,6 +23,8 @@ SMS = 48
 ENABLED = os.environ.get("MARLIN_DOWN128", "1") == "1"
 ATTN_ENABLED = os.environ.get("MARLIN_ATTN128", "1") == "1"
 _ALL_ATTN_SHAPES = {(4608, 6656): "qkv", (6656, 4096): "o_proj", (4096, 6656): "gate"}
+# Micro-attribution: Multi-shape TMA dispatch and PG=4 column-group L2 locality in marlinw_tma are
+# inspired by @zereraz (Yukon submission d45f9a81); qkv (4608x6656) runs 3 exact waves without K-split.
 _enabled_attn = set(os.environ.get("MARLIN_ATTN128_SHAPES", "qkv").split(","))
 ATTN_SHAPES = {k: v for k, v in _ALL_ATTN_SHAPES.items() if v in _enabled_attn}
 ATTN_TMA_ENABLED = ATTN_ENABLED and os.environ.get("MARLIN_ATTN_TMA", "1") == "1"
@@ -254,6 +256,7 @@ def tma_work_lists(shared_bytes: int, sizes=PIECES):
     n_col = COLUMNS // 128
     assert sum(sizes) == k_tiles and all(v % 8 == 0 for v in starts) and starts[2] < 1024
     assert n_col * 4 == 4 * SMS + SPLIT
+    # Schedule all 4 row-pairs of each column concurrently (PG=4) so weight tiles B (71.5 MiB) stay L2-shared.
     tma_pg = int(os.environ.get("D128_TMA_PG", "4"))
     order = [(col, pair) for g in range(0, 4, tma_pg) for col in range(n_col) for pair in range(g, g + tma_pg)]
     whole, split = order[:-SPLIT], order[-SPLIT:]

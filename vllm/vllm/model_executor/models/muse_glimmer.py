@@ -1207,10 +1207,6 @@ class _GateSideStream:
         self.last_layer = -1
         self.forks = 0
         self.reported = False
-        # Layers whose output_gate_proj uses a deterministic custom M=1 kernel (muse_bf16_lane)
-        # while M>1 falls back to cuBLAS: restrict side-stream fork strictly to M=1 and require
-        # muse_bf16_lane_weight to be admitted.
-        self.bf16_gate_by_layer: dict[int, nn.Module] = {}
 
     def _ensure_stream(self) -> bool:
         if self.stream is None and not self.unavailable:
@@ -1244,11 +1240,7 @@ class _GateSideStream:
 
     def fork(self, x: torch.Tensor, layer_idx: int) -> None:
         self.active = False
-        bf16_gate = self.bf16_gate_by_layer.get(layer_idx)
-        if bf16_gate is not None:
-            if not x.is_cuda or x.shape[0] != 1 or getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
-                return
-        elif not x.is_cuda or x.shape[0] > self.max_tokens:
+        if not x.is_cuda or x.shape[0] > self.max_tokens:
             return
         if (
             is_forward_context_available()
@@ -1348,53 +1340,7 @@ direct_register_custom_op(
 )
 
 
-def _muse_qk_norm_rope_impl(
-    qkv: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    eps: float,
-    qscale: float,
-    use_rope: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    import muse_qk_glue
-
-    return muse_qk_glue.run_qk_norm_rope(
-        qkv, positions, cos_sin_cache, eps, qscale, use_rope
-    )
-
-
-def _muse_qk_norm_rope_fake(
-    qkv: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    eps: float,
-    qscale: float,
-    use_rope: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    n = qkv.shape[0]
-    return qkv.new_empty((n, 4096)), qkv.new_empty((n, 256))
-
-
-direct_register_custom_op(
-    op_name="muse_glimmer_qk_norm_rope",
-    op_func=_muse_qk_norm_rope_impl,
-    fake_impl=_muse_qk_norm_rope_fake,
-    mutates_args=[],
-)
-
-
-def _init_qk_fused() -> bool:
-    if not current_platform.is_cuda():
-        return False
-    try:
-        import muse_qk_glue
-
-        return muse_qk_glue.available(torch.device("cuda"))
-    except (ImportError, OSError, RuntimeError):
-        return False
-
-
-def _gate_side_stream_fork_point(gate_proj: nn.Module, layer_idx: int = -1) -> str | None:
+def _gate_side_stream_fork_point(gate_proj: nn.Module) -> str | None:
     """Where the output gate branch forks off the attention chain, or None to
     keep the gate projection in order on the main stream: ``"qkv"`` right
     after the qkv projection, ``"attn"`` right before the attention op."""
@@ -1402,27 +1348,14 @@ def _gate_side_stream_fork_point(gate_proj: nn.Module, layer_idx: int = -1) -> s
     if mode not in ("qkv", "attn") or not current_platform.is_cuda():
         return None
     # cuBLAS does not promise the same kernel choice while other streams are
-    # active, so unquantized projections stay on the main stream — EXCEPT when
-    # muse_bf16_lane replaces M=1 decode with its deterministic custom rANS GEMV,
-    # in which case we restrict the side-stream fork strictly to M=1.
-    qm = getattr(gate_proj, "quant_method", None)
-    bf16_lane_only = False
-    if isinstance(qm, UnquantizedLinearMethod):
-        if (
-            type(qm) is not UnquantizedLinearMethod
-            and type(qm).__name__ == "_MuseBF16Lane"
-            and os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_BF16", "1") != "0"
-        ):
-            bf16_lane_only = True
-        else:
-            return None
+    # active, so unquantized projections stay on the main stream.
+    if isinstance(getattr(gate_proj, "quant_method", None), UnquantizedLinearMethod):
+        return None
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
         return None
     compilation_config = vllm_config.compilation_config
     if compilation_config.mode == CompilationMode.NONE:
-        if bf16_lane_only and layer_idx >= 0:
-            _gate_side_stream.bf16_gate_by_layer[layer_idx] = gate_proj
         return mode
     if (
         compilation_config.mode != CompilationMode.VLLM_COMPILE
@@ -1433,8 +1366,6 @@ def _gate_side_stream_fork_point(gate_proj: nn.Module, layer_idx: int = -1) -> s
         )
     ):
         return None
-    if bf16_lane_only and layer_idx >= 0:
-        _gate_side_stream.bf16_gate_by_layer[layer_idx] = gate_proj
     return mode
 
 
@@ -1518,16 +1449,9 @@ class MuseGlimmerAttention(nn.Module):
                 if self.use_output_gate:
                     enable_bf16_lane(self.output_gate_proj)
         self.gate_fork_point = (
-            _gate_side_stream_fork_point(self.output_gate_proj, self.layer_idx)
+            _gate_side_stream_fork_point(self.output_gate_proj)
             if self.use_output_gate
             else None
-        )
-        self._use_qk_fused = (
-            self.use_qk_norm
-            and self.q_size == 4096
-            and self.kv_size == 256
-            and self.head_dim == 128
-            and _init_qk_fused()
         )
 
         self.rotary_emb = (
@@ -1576,35 +1500,19 @@ class MuseGlimmerAttention(nn.Module):
         gate = gate_dep = None
         if self.gate_fork_point == "qkv":
             gate, gate_dep = self._output_gate_before_attention(hidden_states, [qkv])
-        if self._use_qk_fused and qkv.is_cuda and qkv.dtype == torch.bfloat16:
-            v = qkv[:, self.q_size + self.kv_size :]
-            cache = (
-                self.rotary_emb.cos_sin_cache
-                if self.rotary_emb is not None
-                else positions
-            )
-            q, k = torch.ops.vllm.muse_glimmer_qk_norm_rope(
-                qkv,
-                positions,
-                cache,
-                float(self.qk_norm.eps),
-                float(self.scale_query_by),
-                self.rotary_emb is not None,
-            )
-        else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-            if self.use_qk_norm:
-                # QK-norm over head_dim, fp32, applied BEFORE RoPE; then pre-scale q.
-                q = q.reshape(-1, self.head_dim)
-                q = self.qk_norm(q).reshape(-1, self.q_size) * self.scale_query_by
-                k = k.reshape(-1, self.head_dim)
-                k = self.qk_norm(k).reshape(-1, self.kv_size)
-                q = q.to(v.dtype)
-                k = k.to(v.dtype)
+        if self.use_qk_norm:
+            # QK-norm over head_dim, fp32, applied BEFORE RoPE; then pre-scale q.
+            q = q.reshape(-1, self.head_dim)
+            q = self.qk_norm(q).reshape(-1, self.q_size) * self.scale_query_by
+            k = k.reshape(-1, self.head_dim)
+            k = self.qk_norm(k).reshape(-1, self.kv_size)
+            q = q.to(v.dtype)
+            k = k.to(v.dtype)
 
-            if self.rotary_emb is not None:
-                q, k = self.rotary_emb(positions, q, k)
+        if self.rotary_emb is not None:
+            q, k = self.rotary_emb(positions, q, k)
 
         if self.gate_fork_point == "attn":
             gate, gate_dep = self._output_gate_before_attention(

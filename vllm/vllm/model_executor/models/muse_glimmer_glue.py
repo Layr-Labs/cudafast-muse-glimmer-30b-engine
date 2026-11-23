@@ -382,7 +382,7 @@ class _QRopeSwap:
 
 
 def _min_tokens() -> int:
-    return int(os.environ.get("VLLM_MUSE_GLIMMER_PROMPT_GLUE_MIN_TOKENS", "1"))
+    return int(os.environ.get("VLLM_MUSE_GLIMMER_PROMPT_GLUE_MIN_TOKENS", "128"))
 
 
 def _classify(kernel) -> _QRopeSwap | None:

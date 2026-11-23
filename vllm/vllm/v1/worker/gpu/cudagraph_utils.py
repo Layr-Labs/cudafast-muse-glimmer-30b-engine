@@ -157,9 +157,21 @@ class CudaGraphManager:
         # Memory ranges of the model's weights (set by the model capture) and
         # the L2 prefetch sessions of the captured FULL graphs.
         self.weight_ranges: list[tuple[int, int]] | None = None
+        self._live_weight_ranges_fn: Callable[[], list[tuple[int, int]]] | None = None
         self._l2_prefetch_sessions: list[Any] = []
 
         self._init_candidates()
+
+    def _verify_l2_prefetch(self, l2pf: Any) -> None:
+        if l2pf is None:
+            return
+        live = (
+            self._live_weight_ranges_fn()
+            if self._live_weight_ranges_fn is not None
+            else self.weight_ranges
+        )
+        if live is not None:
+            l2pf.verify_live_ranges(live)
 
     def _l2_prefetch_session(self, desc: "BatchExecutionDescriptor") -> Any:
         if (
@@ -351,6 +363,7 @@ class CudaGraphManager:
                     l2pf = self._l2_prefetch_session(desc)
                     with l2pf.record() if l2pf is not None else nullcontext():
                         forward_fn(CUDAGraphMode.NONE)
+                    self._verify_l2_prefetch(l2pf)
 
                     # Capture
                     logger.debug(
@@ -378,6 +391,7 @@ class CudaGraphManager:
                             set_graph_pool_id(self.pool)
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
+                        self._verify_l2_prefetch(l2pf)
                         with (
                             torch.cuda.graph(graph, self.pool),
                             l2pf.apply() if l2pf is not None else nullcontext(),
@@ -496,6 +510,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
         if l2_prefetch is not None:
             self.weight_ranges = l2_prefetch.weight_ranges(model)
+            self._live_weight_ranges_fn = lambda: l2_prefetch.weight_ranges(model)
         if self.use_breakable_cg:
             self.init_breakable_cg_runner(model)
 
@@ -601,7 +616,10 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        try:
+            super().capture(create_forward_fn, progress_bar_desc)
+        finally:
+            self._live_weight_ranges_fn = None
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor
