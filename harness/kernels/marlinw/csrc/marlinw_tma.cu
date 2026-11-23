@@ -44,6 +44,7 @@
 #endif
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 #include "marlinw_template.h"
 
 
@@ -137,7 +138,7 @@ __device__ __forceinline__ void k_loop(
 #pragma unroll
       for (int i = 0; i < kStages; i++) {
         mbar_init(full_bar + 8 * i, 1);
-        mbar_init(empty_bar + 8 * i, kThreads);
+        mbar_init(empty_bar + 8 * i, kThreads / 32);
       }
       asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -232,7 +233,8 @@ __device__ __forceinline__ void k_loop(
         ldsm4(fa[1][i], sa + 2048 * i);
       }
     }
-    mbar_arrive(empty_bar + 8 * s);  // this thread has taken everything it needs from stage s
+    __syncwarp();
+    if (lane == 0) mbar_arrive(empty_bar + 8 * s);  // warp has taken everything it needs from stage s
 #pragma unroll
     for (int i = 0; i < MB; i++) {
       mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
@@ -349,24 +351,33 @@ __device__ __forceinline__ void down_tile(
   }
 
   // P = A0 + A1, fold of the K cuts, bf16_rn(P * global_scale): as marlinw_down128.
+  // Symmetric exchange: kw 0 keeps m-blocks [0..kHalf-1] and sends [kHalf..MB-1]; kw 1 keeps [kHalf..MB-1] and
+  // sends [0..kHalf-1], then all 8 warps fold cuts and store C in parallel (still 1 barrier, 64 KiB SMEM).
+  static_assert((MB & 1) == 0, "MB must be even");
+  constexpr int kHalf = MB / 2;
+  constexpr int kHalfVecs = kHalf * 4;
   float4* red = reinterpret_cast<float4*>(sh);
-  if (kw == 1) {
+  const int t128 = tid & 127;
+  auto send_half = [&](auto give_tag) {
+    constexpr int give = decltype(give_tag)::value;
+    float4* const send = red + (kw ? 0 : kHalfVecs * 128);
 #pragma unroll
-    for (int k = 0; k < MB * 4; k++) red[k * 128 + (tid - 128)] = reinterpret_cast<float4*>(acc)[k];
-  }
-  __syncthreads();
-  if (kw == 0) {
+    for (int k = 0; k < kHalfVecs; k++) send[k * 128 + t128] = reinterpret_cast<const float4*>(&acc[give])[k];
+  };
+  auto finish_half = [&](auto keep_tag) {
+    constexpr int keep = decltype(keep_tag)::value;
+    const float4* const recv = red + (kw ? kHalfVecs * 128 : 0);
 #pragma unroll
-    for (int k = 0; k < MB * 4; k++) {
-      const float4 r = red[k * 128 + tid];
-      float* c = reinterpret_cast<float*>(acc) + 4 * k;
+    for (int k = 0; k < kHalfVecs; k++) {
+      const float4 r = recv[k * 128 + t128];
+      float* c = reinterpret_cast<float*>(&acc[keep]) + 4 * k;
       c[0] += r.x; c[1] += r.y; c[2] += r.z; c[3] += r.w;
     }
     if (cut_a >= 0 || cut_b >= 0) {
-      const float4* s0 = scratch + ((size_t)slot * 256 + tid) * 32;
-      const float4* s1 = scratch + ((size_t)slot * 256 + tid + 128) * 32;
+      const float4* s0 = scratch + ((size_t)slot * 256 + t128) * 32;
+      const float4* s1 = scratch + ((size_t)slot * 256 + t128 + 128) * 32;
 #pragma unroll
-      for (int i = 0; i < MB; i++) {
+      for (int i = keep; i < keep + kHalf; i++) {
         const int ci = i < n_first ? cut_a : cut_b;
         if (ci >= 0) {
 #pragma unroll
@@ -385,19 +396,24 @@ __device__ __forceinline__ void down_tile(
     const int r0 = row0 + (lane >> 2);
     const int col0 = 128 * col + 64 * nb + 32 * sh2 + 2 * (lane & 3);
 #pragma unroll
-    for (int i = 0; i < MB; i++)
+    for (int i = keep; i < keep + kHalf; i++)
 #pragma unroll
       for (int jj = 0; jj < 2; jj++)
 #pragma unroll
         for (int h = 0; h < 2; h++) {
           const float* c = acc[i][jj][h];
-          const nv_bfloat162 lo = __halves2bfloat162(__float2bfloat16(c[0] * gs), __float2bfloat16(c[1] * gs));
-          const nv_bfloat162 hi = __halves2bfloat162(__float2bfloat16(c[2] * gs), __float2bfloat16(c[3] * gs));
+          const nv_bfloat162 lo = __floats2bfloat162_rn(c[0] * gs, c[1] * gs);
+          const nv_bfloat162 hi = __floats2bfloat162_rn(c[2] * gs, c[3] * gs);
           const int cc = col0 + 16 * jj + 8 * h;
           *reinterpret_cast<nv_bfloat162*>(&C[(size_t)(r0 + 16 * i) * kCols + cc]) = lo;
           *reinterpret_cast<nv_bfloat162*>(&C[(size_t)(r0 + 16 * i + 8) * kCols + cc]) = hi;
         }
-  }
+  };
+  if (kw == 0) send_half(std::integral_constant<int, kHalf>{});
+  else         send_half(std::integral_constant<int, 0>{});
+  __syncthreads();
+  if (kw == 0) finish_half(std::integral_constant<int, 0>{});
+  else         finish_half(std::integral_constant<int, kHalf>{});
 }
 
 
@@ -434,6 +450,20 @@ __global__ void silu_check() {
   const float direct = swiglu_silu(__bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(word))));
   if (__float_as_uint(direct) != __float_as_uint(bf16_silu[word])) atomicAdd(&silu_differences, 1);
 }
+
+#ifdef MARLINW_TMA_FP8
+__device__ int clamp_differences;
+__global__ void clamp_check() {
+  for (uint64_t w = blockIdx.x * 256ull + threadIdx.x; w < (1ull << 32); w += gridDim.x * 256ull) {
+    const float q = __uint_as_float(static_cast<unsigned>(w));
+    const float c = q < -448.0f ? -448.0f : (q > 448.0f ? 448.0f : q);
+    uint16_t a, b;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %1;" : "=h"(a) : "f"(c));
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %1;" : "=h"(b) : "f"(q));
+    if (a != b) atomicAdd(&clamp_differences, 1);
+  }
+}
+#endif
 
 __global__ void __launch_bounds__(kThreads, 1) gateup(
     const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
@@ -478,38 +508,19 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
   // Reduce the two k-warps: P = A0 (kw 0) + A1 (kw 1).
   int4* red = epi;
   const int t128 = tid & 127;
-#pragma unroll
-  for (int half = 0; half < 2; half++) {
-    if (kw == 1) {
-#pragma unroll
-      for (int q = 0; q < 16; q++) red[q * 128 + t128] = reinterpret_cast<int4*>(&c[4 * half])[q];
-    }
-    __syncthreads();
-    if (kw == 0) {
-#pragma unroll
-      for (int q = 0; q < 16; q++) {
-        const int4 v = red[q * 128 + t128];
-        float* cf = reinterpret_cast<float*>(&c[4 * half]) + 4 * q;
-        cf[0] += __int_as_float(v.x);
-        cf[1] += __int_as_float(v.y);
-        cf[2] += __int_as_float(v.z);
-        cf[3] += __int_as_float(v.w);
-      }
-    }
-    __syncthreads();
-  }
-
-  if (kw == 0) {
+  auto pack_rows = [&](auto keep_tag) {
+    constexpr int keep = decltype(keep_tag)::value;
+    constexpr int count = keep_tag.value == 0 && kTilesPerCta > 1 ? 8 : 4;
     // words (bf16x2) in rows of 68 words
     uint32_t* shw = reinterpret_cast<uint32_t*>(epi);
-    int wr = 68 * (lane >> 2) + (lane & 3) + 32 * cw;
+    int wr = 68 * (lane >> 2) + (lane & 3) + 32 * cw + 16 * 68 * keep;
 #pragma unroll
-    for (int i = 0; i < 8; i++) {
+    for (int i = keep; i < keep + count; i++) {
 #pragma unroll
       for (int jl = 0; jl < 2; jl++) {
         const int j = 2 * jh + jl;
         auto put = [&](int idx, float c0, float c1) {
-          __nv_bfloat162 r = __halves2bfloat162(__float2bfloat16_rn(c0 * gs), __float2bfloat16_rn(c1 * gs));
+          __nv_bfloat162 r = __floats2bfloat162_rn(c0 * gs, c1 * gs);
           shw[idx] = *reinterpret_cast<uint32_t*>(&r);
         };
         const int w = wr + 8 * j;
@@ -520,6 +531,59 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
       }
       wr += 16 * 68;
     }
+  };
+  if constexpr (kTilesPerCta == 1) {
+    // Symmetric 64 KiB exchange (32 KiB per k-half): 3 epilogue barriers total (including shw) instead of 5,
+    // and all 8 warps pack their 4 m-blocks in parallel.
+    auto send_half = [&](auto give_tag) {
+      constexpr int give = decltype(give_tag)::value;
+      int4* const send = red + (kw ? 0 : 16 * 128);
+#pragma unroll
+      for (int q = 0; q < 16; q++) send[q * 128 + t128] = reinterpret_cast<const int4*>(&c[give])[q];
+    };
+    auto add_half = [&](auto keep_tag) {
+      constexpr int keep = decltype(keep_tag)::value;
+      const int4* const recv = red + (kw ? 16 * 128 : 0);
+#pragma unroll
+      for (int q = 0; q < 16; q++) {
+        const int4 v = recv[q * 128 + t128];
+        float* cf = reinterpret_cast<float*>(&c[keep]) + 4 * q;
+        cf[0] += __int_as_float(v.x);
+        cf[1] += __int_as_float(v.y);
+        cf[2] += __int_as_float(v.z);
+        cf[3] += __int_as_float(v.w);
+      }
+    };
+    if (kw == 0) send_half(std::integral_constant<int, 4>{});
+    else         send_half(std::integral_constant<int, 0>{});
+    __syncthreads();
+    if (kw == 0) add_half(std::integral_constant<int, 0>{});
+    else         add_half(std::integral_constant<int, 4>{});
+    __syncthreads();
+    if (kw == 0) pack_rows(std::integral_constant<int, 0>{});
+    else         pack_rows(std::integral_constant<int, 4>{});
+  } else {
+#pragma unroll
+    for (int half = 0; half < 2; half++) {
+      if (kw == 1) {
+#pragma unroll
+        for (int q = 0; q < 16; q++) red[q * 128 + t128] = reinterpret_cast<int4*>(&c[4 * half])[q];
+      }
+      __syncthreads();
+      if (kw == 0) {
+#pragma unroll
+        for (int q = 0; q < 16; q++) {
+          const int4 v = red[q * 128 + t128];
+          float* cf = reinterpret_cast<float*>(&c[4 * half]) + 4 * q;
+          cf[0] += __int_as_float(v.x);
+          cf[1] += __int_as_float(v.y);
+          cf[2] += __int_as_float(v.z);
+          cf[3] += __int_as_float(v.w);
+        }
+      }
+      __syncthreads();
+    }
+    if (kw == 0) pack_rows(std::integral_constant<int, 0>{});
   }
   __syncthreads();
   {
@@ -538,8 +602,7 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
         auto up = reinterpret_cast<const __nv_bfloat16*>(&ups)[e];
         const float silu = swiglu_silu(__bfloat162float(gate));
         const float product = __fmul_rn(silu, __bfloat162float(up));
-        const float q = __fmul_rn(product, inverse);
-        scaled[e] = q < -448.0f ? -448.0f : (q > 448.0f ? 448.0f : q);
+        scaled[e] = __fmul_rn(product, inverse);
       }
       uint16_t converted;
       asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(converted) : "f"(scaled[1]), "f"(scaled[0]));
@@ -550,18 +613,26 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
 #pragma unroll 4
     for (int row = warp; row < 128; row += 8) {
       uint32_t gates = shw[row * 68 + lane], ups = shw[row * 68 + lane + 32];
-      uint32_t prod;
-#pragma unroll
-      for (int e = 0; e < 2; e++) {
-        auto gate = reinterpret_cast<const __nv_bfloat16*>(&gates)[e];
-        auto up = reinterpret_cast<const __nv_bfloat16*>(&ups)[e];
-        // swiglu_product with the table entry replaced by its definition (silu_check: equal for all patterns)
-        reinterpret_cast<__nv_bfloat16*>(&prod)[e] =
-            __float2bfloat16_rn(__fmul_rn(swiglu_silu(__bfloat162float(gate)), __bfloat162float(up)));
-      }
-      o[(size_t)(chunk * 128 + row) * (kFused / 4) + slice_col * 32 + lane] = prod;
+      // swiglu_product with the table entry replaced by its definition (silu_check: equal for all patterns)
+      const auto g0 = reinterpret_cast<const __nv_bfloat16*>(&gates)[0];
+      const auto u0 = reinterpret_cast<const __nv_bfloat16*>(&ups)[0];
+      const auto g1 = reinterpret_cast<const __nv_bfloat16*>(&gates)[1];
+      const auto u1 = reinterpret_cast<const __nv_bfloat16*>(&ups)[1];
+      const __nv_bfloat162 prod = __floats2bfloat162_rn(
+          __fmul_rn(swiglu_silu(__bfloat162float(g0)), __bfloat162float(u0)),
+          __fmul_rn(swiglu_silu(__bfloat162float(g1)), __bfloat162float(u1)));
+      o[(size_t)(chunk * 128 + row) * (kFused / 4) + slice_col * 32 + lane] =
+          *reinterpret_cast<const uint32_t*>(&prod);
     }
 #endif
+  }
+  if constexpr (kTilesPerCta > 1) {
+    if (ti + 1 < kTilesPerCta) {
+      // Order all warps' generic reads from `epi` (stage kStages - 1 + kEpiExtra) before the next
+      // tile's async TMA copy (`q0 + kDist`) overwrites stage kStages - 1.
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      __syncthreads();
+    }
   }
   }  // tiles of this CTA
 }
@@ -674,6 +745,13 @@ extern "C" int swiglu_fp8_prepare() {
   status = cudaMemcpyFromSymbol(&differences, silu_differences, sizeof(int));
   if (status != cudaSuccess) return status;
   if (differences) return cudaErrorUnknown;
+  int clamp_diffs = 0;
+  status = cudaMemcpyToSymbol(clamp_differences, &clamp_diffs, sizeof(int));
+  if (status != cudaSuccess) return status;
+  clamp_check<<<1024, 256>>>();
+  status = cudaMemcpyFromSymbol(&clamp_diffs, clamp_differences, sizeof(int));
+  if (status != cudaSuccess) return status;
+  if (clamp_diffs) return cudaErrorUnknown;
   return cudaDeviceSynchronize();
 }
 extern "C" int swiglu_fp8_gemm(const void* x, const void* w, const void* scales, const void* global,

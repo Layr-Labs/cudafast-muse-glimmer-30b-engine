@@ -7367,6 +7367,16 @@ class GPUModelRunner(
         assert layer_names == set(kv_cache_raw_tensors.keys()), (
             "Some layers are not correctly initialized"
         )
+        try:
+            from vllm.model_executor.kernels.linear.nvfp4.decode_placement import (
+                place_kv_cache_tensors,
+            )
+
+            kv_cache_raw_tensors = place_kv_cache_tensors(
+                kv_cache_raw_tensors, kv_cache_config.num_blocks
+            )
+        except Exception as err:  # noqa: BLE001 - placement never blocks KV init
+            logger.warning("KV cache placement skipped: %s", err)
         return kv_cache_raw_tensors
 
     def _attn_group_iterator(self) -> Iterator[AttentionGroup]:

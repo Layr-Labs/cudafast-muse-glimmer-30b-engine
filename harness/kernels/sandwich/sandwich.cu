@@ -1,10 +1,23 @@
 #include <cuda_runtime.h>
+#include <cstdint>
+#include <type_traits>
 
 namespace {
 constexpr int Columns = 6656;
 constexpr int Threads = 256;
 constexpr int Vectors = Columns / 4;
 constexpr int Tiles = (Vectors + Threads - 1) / Threads;
+constexpr int CacheLineBytes = 128;
+constexpr int RowBytes = Columns * 2;
+constexpr int RowCacheLines = RowBytes / CacheLineBytes;
+static_assert(RowBytes % CacheLineBytes == 0,
+              "Row byte size must be an exact multiple of 128 B for L2 discard");
+static_assert(RowCacheLines <= Threads,
+              "One CTA thread per cache line must cover an entire row");
+
+__device__ __forceinline__ void l2_discard(const void* p) {
+    asm volatile("discard.global.L2 [%0], 128;" :: "l"(p) : "memory");
+}
 
 __device__ float bf16(uint2 packed, int channel) {
     const unsigned bits = channel < 2 ? packed.x : packed.y;
@@ -76,7 +89,7 @@ __device__ unsigned pack_fp8(const float (&values)[4], float scale_inv) {
     return static_cast<unsigned>(low) | (static_cast<unsigned>(high) << 16);
 }
 
-template <bool Quantize, bool Shared>
+template <bool Quantize, bool Shared, bool DiscardDown>
 __global__ __launch_bounds__(Threads) void sandwich(
     uint2* post_attn, const uint2* down, const uint2* residual,
     const float* previous_sum, const uint2* post_attn_weight,
@@ -92,7 +105,7 @@ __global__ __launch_bounds__(Threads) void sandwich(
     for (int tile = 0; tile < Tiles; ++tile) {
         const unsigned offset = tile * Threads + thread;
         if (offset < Vectors) {
-            const uint2 values = down[base + offset];
+            const uint2 values = __ldcs(&down[base + offset]);
             if constexpr (Shared) {
                 shared_row[offset] = values;
             } else {
@@ -107,6 +120,11 @@ __global__ __launch_bounds__(Threads) void sandwich(
     }
     const float down_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-8f);
     const float attn_inverse = inverse_rms(previous_sum[blockIdx.x], 1.e-8f);
+    if constexpr (DiscardDown) {
+        if (thread < RowCacheLines) {
+            l2_discard(reinterpret_cast<const char*>(down + base) + thread * CacheLineBytes);
+        }
+    }
     #pragma unroll
     for (int channel = 0; channel < 4; ++channel) partial[channel] = 0.f;
     #pragma unroll
@@ -120,7 +138,7 @@ __global__ __launch_bounds__(Threads) void sandwich(
                 d = saved[tile];
             }
             const uint2 a = post_attn[base + offset];
-            const uint2 r = residual[base + offset];
+            const uint2 r = __ldcs(&residual[base + offset]);
             const uint2 wa = post_attn_weight[offset];
             const uint2 wd = post_ff_weight[offset];
             float values[4];
@@ -170,15 +188,54 @@ __global__ __launch_bounds__(Threads) void sandwich(
     }
 }
 
+bool span_disjoint(const void* a, size_t a_bytes, const void* b, size_t b_bytes) {
+    const uintptr_t a0 = reinterpret_cast<uintptr_t>(a);
+    const uintptr_t b0 = reinterpret_cast<uintptr_t>(b);
+    return a0 <= b0 ? (b0 - a0 >= a_bytes) : (a0 - b0 >= b_bytes);
+}
+
+template <bool Quantize>
+bool can_discard_down(const void* const* args, int rows) {
+    if (rows <= 0) return false;
+    const void* down = args[1];
+    if ((reinterpret_cast<uintptr_t>(down) & (CacheLineBytes - 1)) != 0) return false;
+    const size_t act_bytes = static_cast<size_t>(rows) * RowBytes;
+    const size_t vec_bytes = RowBytes;
+    const bool disjoint_common =
+        span_disjoint(down, act_bytes, args[0], act_bytes) &&
+        span_disjoint(down, act_bytes, args[2], act_bytes) &&
+        span_disjoint(down, act_bytes, args[3], static_cast<size_t>(rows) * sizeof(float)) &&
+        span_disjoint(down, act_bytes, args[4], vec_bytes) &&
+        span_disjoint(down, act_bytes, args[5], vec_bytes) &&
+        span_disjoint(down, act_bytes, args[6], vec_bytes) &&
+        span_disjoint(down, act_bytes, args[Quantize ? 8 : 7], act_bytes);
+    if (!disjoint_common) return false;
+    if constexpr (Quantize) {
+        return span_disjoint(down, act_bytes, args[7], sizeof(float)) &&
+               span_disjoint(down, act_bytes, args[9], static_cast<size_t>(rows) * Columns);
+    }
+    return true;
+}
+
 template <bool Quantize, bool Shared>
 void launch(const void* const* args, int rows, cudaStream_t stream) {
-    sandwich<Quantize, Shared><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
-        static_cast<uint2*>(const_cast<void*>(args[0])), static_cast<const uint2*>(args[1]),
-        static_cast<const uint2*>(args[2]), static_cast<const float*>(args[3]),
-        static_cast<const uint2*>(args[4]), static_cast<const uint2*>(args[5]),
-        static_cast<const uint2*>(args[6]), Quantize ? static_cast<const float*>(args[7]) : nullptr,
-        static_cast<uint2*>(const_cast<void*>(args[Quantize ? 8 : 7])),
-        Quantize ? static_cast<unsigned*>(const_cast<void*>(args[9])) : nullptr);
+    auto invoke = [&](auto discard_tag) {
+        constexpr bool DiscardDown = decltype(discard_tag)::value;
+        sandwich<Quantize, Shared, DiscardDown><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
+            static_cast<uint2*>(const_cast<void*>(args[0])), static_cast<const uint2*>(args[1]),
+            static_cast<const uint2*>(args[2]), static_cast<const float*>(args[3]),
+            static_cast<const uint2*>(args[4]), static_cast<const uint2*>(args[5]),
+            static_cast<const uint2*>(args[6]), Quantize ? static_cast<const float*>(args[7]) : nullptr,
+            static_cast<uint2*>(const_cast<void*>(args[Quantize ? 8 : 7])),
+            Quantize ? static_cast<unsigned*>(const_cast<void*>(args[9])) : nullptr);
+    };
+    if constexpr (Shared) {
+        if (can_discard_down<Quantize>(args, rows)) {
+            invoke(std::true_type{});
+            return;
+        }
+    }
+    invoke(std::false_type{});
 }
 }
 

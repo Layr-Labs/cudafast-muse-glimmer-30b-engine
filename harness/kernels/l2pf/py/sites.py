@@ -39,7 +39,15 @@ import torch
 
 from . import CHUNK, ENABLED, lib, prefetch_desc, self_check
 
-__all__ = ["Session", "budget", "weight_descs", "head_descs", "marlin_descs", "available"]
+__all__ = [
+    "Session",
+    "budget",
+    "weight_descs",
+    "head_descs",
+    "marlin_descs",
+    "verify_descriptors",
+    "available",
+]
 
 
 def _env_bytes(name: str, default: int) -> int:
@@ -208,6 +216,26 @@ def _inside(descs, ranges) -> bool:
     return True
 
 
+def verify_descriptors(
+    descriptors: list[tuple[int, int, int]],
+    live_ranges: list[tuple[int, int]],
+) -> None:
+    """Assert every packed (base, pitch, (seg << 32) | cnt) descriptor lies inside live_ranges."""
+    live = list(dict.fromkeys(live_ranges))
+    for base, pitch, sc in descriptors:
+        seg = sc >> 32
+        cnt = sc & 0xFFFFFFFF
+        assert (
+            cnt >= 1
+            and pitch >= 0
+            and 16 <= seg <= CHUNK
+            and seg % 16 == 0
+            and base % 16 == 0
+        ), f"invalid l2pf descriptor: base={hex(base)} pitch={pitch} seg={seg} cnt={cnt}"
+        hi = base + (cnt - 1) * pitch + seg
+        assert any(lo <= base < hi_r and hi <= hi_r for lo, hi_r in live), hex(base)
+
+
 def weight_ranges(module: torch.nn.Module) -> list[tuple[int, int]]:
     """Memory ranges of every parameter and buffer of module."""
     out = []
@@ -337,6 +365,7 @@ class Session:
         self.ranges = ranges
         self.storages = None if ranges is None else {a: b for a, b in ranges}
         self.sites: list[_Site] = []
+        self._descs: list[tuple[int, int, int]] = []
         self.table: torch.Tensor | None = None
         self.side: torch.cuda.Stream | None = None
         self.sms = 0
@@ -398,6 +427,8 @@ class Session:
         self.sms = torch.cuda.get_device_properties(dev).multi_processor_count
         self.side = torch.cuda.Stream(device=dev)
         self.sites = []
+        self._descs = []
+        self.table = None
         self.stopped = False
         self._attn = False
         self._prev_big = False
@@ -465,8 +496,24 @@ class Session:
             for base, pitch, seg, cnt in s.descs:
                 flat += [base, pitch, (seg << 32) | cnt]
         self.used = sum(1 for s in self.sites if s.descs)
+        self._descs = [
+            (flat[i], flat[i + 1], flat[i + 2]) for i in range(0, len(flat), 3)
+        ]
         if flat:
             self.table = torch.tensor(flat, dtype=torch.int64).to(dev)
+            if self.ranges is not None:
+                verify_descriptors(self._descs, self.ranges)
+
+    def verify_live_ranges(
+        self, live: list[tuple[int, int]] | torch.nn.Module
+    ) -> None:
+        """Assert the built descriptor table targets only live device allocations."""
+        if not self._descs:
+            assert self.table is None
+            return
+        assert self.table is not None and self.table.numel() == 3 * len(self._descs)
+        ranges = weight_ranges(live) if isinstance(live, torch.nn.Module) else live
+        verify_descriptors(self._descs, ranges)
 
     # -- apply (capture)
     @contextlib.contextmanager
@@ -474,6 +521,8 @@ class Session:
         if self.table is None or self.side is None:
             yield
             return
+        if self._descs and self.ranges is not None:
+            verify_descriptors(self._descs, self.ranges)
         self._i = 0
         self._pending = False
         self.stopped = False

@@ -21,6 +21,7 @@ __all__ = [
     "lib",
     "prefetch",
     "prefetch_desc",
+    "stream_read",
     "self_check",
 ]
 
@@ -49,6 +50,10 @@ def lib():
         ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
     ]
     h.l2pf_prefetch_desc.restype = ctypes.c_int
+    h.l2pf_stream_read.argtypes = [
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+    ]
+    h.l2pf_stream_read.restype = ctypes.c_int
     _lib = h
     return h
 
@@ -77,8 +82,21 @@ def prefetch_desc(desc_ptr: int, ndesc: int, stream: torch.cuda.Stream,
         raise RuntimeError(f"l2pf_prefetch_desc failed: {rc}")
 
 
+def stream_read(t: torch.Tensor, sink: torch.Tensor, stream: torch.cuda.Stream | None = None,
+                blocks: int = 192) -> None:
+    """Pure DRAM streaming read of t (16-byte aligned); never modifies t."""
+    h = lib()
+    if h is None:
+        raise RuntimeError("l2pf library not available")
+    nbytes = t.numel() * t.element_size()
+    s = torch.cuda.current_stream(t.device) if stream is None else stream
+    rc = h.l2pf_stream_read(t.data_ptr(), nbytes, sink.data_ptr(), blocks, s.cuda_stream)
+    if rc != 0:
+        raise RuntimeError(f"l2pf_stream_read failed: {rc}")
+
+
 def self_check(device: torch.device | int | None = None) -> bool:
-    """Run both kernels on a scratch buffer and check that no byte of it or of
+    """Run all kernels on a scratch buffer and check that no byte of it or of
     the descriptor table changed. Also loads the module before any capture."""
     h = lib()
     if h is None:
@@ -94,12 +112,14 @@ def self_check(device: torch.device | int | None = None) -> bool:
         [base, 4096, (1024 << 32) | 64, base + 512 * 1024, 0, (CHUNK << 32) | 4],
         dtype=torch.int64).to(dev)
     dref = desc.clone()
+    sink = torch.zeros((1,), dtype=torch.int32, device=dev)
     s = torch.cuda.Stream(device=dev)
     s.wait_stream(torch.cuda.current_stream(dev))
     with torch.cuda.stream(s):
         rc1 = h.l2pf_prefetch(base, 1 << 20, CHUNK, 2, s.cuda_stream)
         rc2 = h.l2pf_prefetch_desc(desc.data_ptr(), 2, 2, 128, s.cuda_stream)
+        rc3 = h.l2pf_stream_read(buf.data_ptr(), buf.numel(), sink.data_ptr(), 4, s.cuda_stream)
     s.synchronize()
     torch.cuda.current_stream(dev).wait_stream(s)
     torch.cuda.synchronize(dev)
-    return rc1 == 0 and rc2 == 0 and torch.equal(buf, ref) and torch.equal(desc, dref)
+    return rc1 == 0 and rc2 == 0 and rc3 == 0 and torch.equal(buf, ref) and torch.equal(desc, dref)

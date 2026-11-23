@@ -106,13 +106,16 @@ def _get_sched(kind: str, device: torch.device) -> tuple[torch.Tensor, torch.Ten
     return res
 
 
-def _srans_table(counts: torch.Tensor):
+def _srans_table(counts: torch.Tensor, palette: torch.Tensor):
     counts = counts.cpu().long()
+    pal = palette.cpu().long()
     total = int(counts.sum())
     f = torch.zeros(64, dtype=torch.long)
     for s in range(64):
         c = int(counts[s])
         if c:
+            if int(pal[s]) >= 0x80:
+                raise ValueError("rANS embedded BF16 scale LUT requires palette bytes < 0x80")
             f[s] = max(1, round(c * SRANS_M / total))
     diff = SRANS_M - int(f.sum())
     while diff:
@@ -127,7 +130,8 @@ def _srans_table(counts: torch.Tensor):
     for s in range(64):
         if f[s]:
             slots = torch.arange(int(f[s]))
-            lut[int(cum[s]) + slots] = s | (int(f[s]) << 6) | (slots << 17)
+            bf16_scale = (int(pal[s]) & 0x7F) << 4
+            lut[int(cum[s]) + slots] = bf16_scale | (slots << 11) | (int(f[s]) << 21)
     return f, cum, lut
 
 
@@ -154,7 +158,7 @@ def _encode_hdr_srans(tiled_scales: torch.Tensor, palette: torch.Tensor, kind: s
         raise ValueError("palette does not list the scale bytes in order")
     inv[pal[: vals.numel()]] = torch.arange(vals.numel(), device=dev)
     sym = inv[raw.long()].to(torch.uint8).contiguous()
-    f, cum, lut = _srans_table(torch.bincount(sym.reshape(-1).long(), minlength=64))
+    f, cum, lut = _srans_table(torch.bincount(sym.reshape(-1).long(), minlength=64), palette)
     enc_f = f.to(dtype=torch.int32, device=dev)
     enc_c = cum.to(dtype=torch.int32, device=dev)
 

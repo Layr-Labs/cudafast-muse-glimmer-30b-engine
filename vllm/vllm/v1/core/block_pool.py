@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
+import sys
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -177,8 +178,19 @@ class BlockPool:
         ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # enabled). Keep block 0 first as the null block, and order remaining
+        # free blocks from fastest to slowest DRAM pages when KV probes exist.
+        ordered_blocks = self.blocks
+        dp_mod = sys.modules.get(
+            "vllm.model_executor.kernels.linear.nvfp4.decode_placement"
+        )
+        if dp_mod is not None and num_gpu_blocks > 2:
+            get_ranks = getattr(dp_mod, "get_kv_block_ranks", None)
+            ranks = get_ranks(num_gpu_blocks) if callable(get_ranks) else None
+            if ranks is not None and len(ranks) == num_gpu_blocks:
+                rest = sorted(self.blocks[1:], key=lambda b: ranks[b.block_id])
+                ordered_blocks = [self.blocks[0]] + rest
+        self.free_block_queue = FreeKVCacheBlockQueue(ordered_blocks)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
