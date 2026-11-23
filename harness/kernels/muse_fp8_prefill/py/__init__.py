@@ -22,9 +22,9 @@ ENABLED = os.environ.get("MUSE_FP8_PREFILL", "1") != "0"
 _CFG: dict[tuple[int, int], int] = {
     (6656, 19968): 2,  # down: 128x192x128
     (6656, 4096): 3,   # o_proj: 128x96x128
-    (4608, 6656): 3,   # qkv: 128x96x128 (exact 4 waves on 48 SMs)
+    (4608, 6656): 3,   # qkv: 128x96x128 (disabled by default when fp8ws with L2 hints is faster)
 }
-if os.environ.get("MUSE_FP8_PREFILL_QKV", "1") == "0":
+if os.environ.get("MUSE_FP8_PREFILL_QKV", "0") == "0":
     _CFG.pop((4608, 6656), None)
 _lib = None
 _tried = False
