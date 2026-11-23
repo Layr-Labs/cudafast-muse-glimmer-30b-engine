@@ -340,10 +340,8 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
       const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
       const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
       const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-      const uint32_t v0 = (u0 & 0x000F000Fu) | ((u0 >> 4) & 0x0F000F00u);
-      const uint32_t v1 = (u1 & 0x000F000Fu) | ((u1 >> 4) & 0x0F000F00u);
-      const uint32_t bw0 = ((v0 << 4) & 0x80808080u) | (v0 & 0x07070707u) | (E0 << 3);
-      const uint32_t bw1 = ((v1 << 4) & 0x80808080u) | (v1 & 0x07070707u) | (E1 << 3);
+      const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
+      const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
       uint2 a = xs[s * 4 + t];
       a.x = (g == 0) ? a.x : 0u; a.y = (g == 0) ? a.y : 0u;
       rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);

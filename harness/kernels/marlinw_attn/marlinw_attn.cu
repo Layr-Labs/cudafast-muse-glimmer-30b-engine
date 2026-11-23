@@ -33,7 +33,7 @@ extern "C" int marlinw_attn_gemm(
     const int4* scales, const float* global_scale, int* locks,
     const int4* work, const int* work_ptr, int rows, int columns, int inner,
     int row_stride, int grid, cudaStream_t stream) {
-  if (grid <= 0 || rows != 512 || columns % 128 || inner % 64 ||
+  if (grid <= 0 || (rows != 512 && rows != 64) || columns % 128 || inner % 64 ||
       row_stride < inner || row_stride % 8)
     return cudaErrorInvalidValue;
   kKernel<<<grid, kThreads, kShared, stream>>>(

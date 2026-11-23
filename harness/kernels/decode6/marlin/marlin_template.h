@@ -1123,13 +1123,14 @@ __global__ void Marlin(
     }
   };
 #ifdef MUSE_B_EVICT_FIRST
-  // The weight and scale-code streams are read once: insert them in L2 as evict-first so they displace each
-  // other before any other resident line. Same bytes to the same shared slots; only the L2 policy differs.
-  uint64_t stream_policy;
-  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(stream_policy));
+  // The weight and scale-code streams are read once: insert them in L2 as evict-first with 256B sector fetch
+  // so they do not displace L2-resident activations or l2pf prefetched weight heads. Policy is materialized
+  // locally per copy to avoid ptxas odd-UR descriptor allocation on sm_121a.
   auto cp_async4_stream = [&](void* smem_ptr, const void* glob_ptr) {
     const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(smem), "l"(glob_ptr),
+    uint64_t stream_policy;
+    asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(stream_policy));
+    asm volatile("cp.async.cg.shared.global.L2::256B.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(smem), "l"(glob_ptr),
                  "l"(stream_policy));
   };
 #else

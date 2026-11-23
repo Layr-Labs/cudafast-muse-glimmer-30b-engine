@@ -433,6 +433,10 @@ def _marlin_fp4_narrow_attn(
         and x.shape[0] == marlinw_attn.ROWS
     ):
         _log_prompt_stats()
+        if muse_final_slab is not None and hasattr(muse_final_slab, "attn_if_active"):
+            out = muse_final_slab.attn_if_active(x, weight, weight_scale, weight_global_scale)
+            if out is not None:
+                return out
         if marlinw_down128 is not None and weight.data_ptr() in _attn128_weights:
             out = marlinw_down128.gemm_shape(
                 x, weight, weight_scale, weight_global_scale, size_n, size_k
