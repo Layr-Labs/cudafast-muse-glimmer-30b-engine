@@ -102,7 +102,7 @@ def _pack_rans(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None
             fs = f[s]
             cs = cum[s]
             for j in range(fs):
-                lut[cs + j] = s | (fs << 8) | (j << 19)
+                lut[cs + j] = (s << 23) | (fs << 10) | j
         fd = torch.tensor(f, dtype=torch.int32, device=dev)
         cd = torch.tensor(cum, dtype=torch.int32, device=dev)
         wb = torch.empty(tw, dtype=torch.int32, device=dev)

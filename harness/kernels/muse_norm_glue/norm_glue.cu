@@ -205,11 +205,10 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm(
   __nv_bfloat16* x = x_all + row * kHidden;
   const __nv_bfloat16* d = d_all + row * kHidden;
   const __nv_bfloat16* res = res_all + row * kHidden;
-  uint2 ux[kChunks], ud[kChunks], ur[kChunks], uw[kChunks], uf[kChunks], ui[kChunks];
+  uint2 ux[kChunks], ur[kChunks], uw[kChunks], uf[kChunks], ui[kChunks];
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
-      ud[c] = ld8(d, c);
       ux[c] = ld8(x, c);
       ur[c] = ld8(res, c);
       uw[c] = ld8(w_post, c);
@@ -218,6 +217,26 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm(
     }
   }
   const float s_x = sumsq_x[row];
+  const float a = inv_rms(s_x, 1e-08f);
+  float h1[kChunks][4];
+#pragma unroll
+  for (int c = 0; c < kChunks; ++c) {
+    if (chunk_valid(c)) {
+      Row4 xv = unpack(ux[c]), rv = unpack(ur[c]), wv = unpack(uw[c]);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const float t1 = __fmul_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f));
+        h1[c][e] = __fadd_rn(rv.v[e], t1);
+      }
+    }
+  }
+  uint2 ud[kChunks];
+#pragma unroll
+  for (int c = 0; c < kChunks; ++c) {
+    if (chunk_valid(c)) {
+      ud[c] = ld8(d, c);
+    }
+  }
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
@@ -229,19 +248,16 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm(
   }
   const float s_d = row_sum(acc, red[0]);
   const float cd = inv_rms(s_d, 1e-08f);
-  const float a = inv_rms(s_x, 1e-08f);
   float acc2[4] = {0.f, 0.f, 0.f, 0.f};
   uint2 hb[kChunks];
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
-      Row4 xv = unpack(ux[c]), dv = unpack(ud[c]), rv = unpack(ur[c]), wv = unpack(uw[c]), fv = unpack(uf[c]);
+      Row4 dv = unpack(ud[c]), fv = unpack(uf[c]);
       float h2[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
-        const float t1 = __fmul_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f));
-        const float h1 = __fadd_rn(rv.v[e], t1);
-        h2[e] = __fmaf_rn(__fmul_rn(cd, dv.v[e]), __fadd_rn(fv.v[e], 1.0f), h1);
+        h2[e] = __fmaf_rn(__fmul_rn(cd, dv.v[e]), __fadd_rn(fv.v[e], 1.0f), h1[c][e]);
         acc2[e] = __fmaf_rn(h2[e], h2[e], acc2[e]);
       }
       hb[c].x = pack_bf16x2(h2[0], h2[1]);

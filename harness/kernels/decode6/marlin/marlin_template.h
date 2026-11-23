@@ -601,7 +601,11 @@ __global__ void Marlin(
 
   // Scale sizes/strides without act_order
   constexpr int s_gl_stride = (16 * thread_n_blocks) / (is_8bit_scale ? 16 : 8);
+#if defined(MUSE_SCALE_RANS) || defined(MUSE_SCALE_TMA4)
+  constexpr int s_sh_stride = 16 * thread_n_blocks / 8;
+#else
   constexpr int s_sh_stride = 16 * thread_n_blocks / (is_8bit_scale ? 16 : 8);
+#endif
   constexpr int s_tb_groups =
       !has_act_order && group_blocks != -1 && group_blocks < thread_k_blocks
           ? thread_k_blocks / group_blocks
@@ -838,22 +842,43 @@ __global__ void Marlin(
   int4* sh_bias = sh_new + sh_size_b_red_min;
   int4* sh_g_idx = sh_new + sh_b_red_bias_size;
   int4* sh_zp = sh_g_idx + (stages * g_idx_stage);
+#if !defined(MUSE_SCALE_RANS) && !defined(MUSE_SCALE_TMA4)
+  // For non-rANS scale6, keep `stages` packed 6-bit stages (3/4 of s_sh_stage int4 each)
+  // followed by one shared BF16 staging buffer (2 * s_sh_stage int4) populated once per
+  // stage after the existing stage barrier.
+  constexpr int s_sh_stage6 = (s_sh_stage * 3) / 4;
+  constexpr int sh_s_bf16_size = scale6 ? (2 * s_sh_stage) : 0;
+  constexpr int sh_s_size =
+      has_act_order
+          ? (act_s_max_num_groups * s_sh_stride)
+          : (stages * (scale6 ? s_sh_stage6 : s_sh_stage) + sh_s_bf16_size);
+  int4* sh_s = sh_zp + (stages * zp_sh_stage);
+  [[maybe_unused]] int4* sh_s_bf16 = sh_s + (stages * s_sh_stage6);
+#else
   constexpr int sh_s_size = has_act_order ? (act_s_max_num_groups * s_sh_stride)
                                           : (stages * s_sh_stage);
   int4* sh_s = sh_zp + (stages * zp_sh_stage);
+#endif
   int4* sh_a = sh_s + sh_s_size;
-  // scale6: the 64-byte palette lives after the A stages (the launch reserves
-  // the device's opt-in shared memory, far more than the stages use).
+  // scale6: the 64-byte palette lives after the A stages (unused under MUSE_SCALE_RANS
+  // and MUSE_SCALE_TMA4, where pre-converted BF16 scales ((b & 0x7F) << 4) live in sh_rlut).
   [[maybe_unused]] uint8_t* sh_pal =
       reinterpret_cast<uint8_t*>(sh_a + stages * a_sh_stage);
+#if !defined(MUSE_SCALE_RANS) && !defined(MUSE_SCALE_TMA4)
   if constexpr (scale6) {
     static_assert(group_blocks == 1 && is_8bit_scale && !has_act_order &&
                       !has_zp && !is_a_8bit && thread_k_blocks == 8,
                   "scale6 is only built for the M = 1 NVFP4 decode config");
+    static_assert(
+        b_sh_wr_iters == 2 &&
+            ((threads == 256 && thread_n_blocks == 8) ||
+             (threads == 128 && thread_n_blocks == 4)),
+        "cooperative scale6 preconversion assumes 2 k-iters/stage and TileN=64/128");
     // visible to all threads at the __syncthreads of the first wait_for_stage
     if (threadIdx.x < 4)
       reinterpret_cast<int4*>(sh_pal)[threadIdx.x] = scale6_palette[threadIdx.x];
   }
+#endif
 #ifdef MUSE_SCALE_TMA4
   // 4-stage TMA super-block rANS block scales (gemv6_tma4.cu): hardware cp.async.bulk with 2 alternating
   // super-block slots, 4x fewer TMA/mbarrier ops, zero block0/1 header bloat, global L1-cached off16[].
@@ -934,13 +959,14 @@ __global__ void Marlin(
       for (int i = 0; i < kTmaWarps - 1; i++) start += i < w ? cw[i] : 0;
       tma_wp = reinterpret_cast<const uint16_t*>(blk) + start;
     }
-    uint8_t* dst = reinterpret_cast<uint8_t*>(sh_s + s_sh_stage * (X & (stages - 1))) + 128 * w + lane;
+    const int pl = (lane & ~3) | ((lane & 1) << 1) | ((lane >> 1) & 1);
+    uint16_t* dst16 = reinterpret_cast<uint16_t*>(sh_s + s_sh_stage * (X & (stages - 1))) + 128 * w + pl;
     const uint32_t lt = (1u << lane) - 1u;
   #pragma unroll
     for (int m = 0; m < 4; m++) {
       const uint32_t e = sh_rlut[tma_x & 1023u];
-      tma_x = ((e >> 6) & 2047u) * (tma_x >> 10) + (e >> 17);
-      dst[32 * m] = sh_pal[e & 63u];
+      tma_x = (e >> 21) * (tma_x >> 10) + ((e >> 11) & 1023u);
+      dst16[32 * m] = static_cast<uint16_t>(e & 0x07F0u);
       const bool need = tma_x < 65536u;
       const uint32_t msk = __ballot_sync(0xffffffffu, need);
       if (need) tma_x = (tma_x << 16) | tma_wp[__popc(msk & lt)];
@@ -1029,18 +1055,21 @@ __global__ void Marlin(
     const unsigned char* blk = X < 2 ? sh_rhdr + 1280 + X * RANS_CAP : sh_rslot + (X % stages) * RANS_CAP;
 #endif
     const int w = threadIdx.x / 32, lane = threadIdx.x % 32;
-    int start = 4;
-  #pragma unroll
-    for (int i = 0; i < 7; i++) start += i < w ? blk[i] : 0;
+    const uint32_t m_lo = w >= 4 ? ~0u : (1u << (8 * w)) - 1u;
+    const uint32_t m_hi = w <= 4 ? 0u : (1u << (8 * (w - 4))) - 1u;
+    const uint2 cw = *reinterpret_cast<const uint2*>(blk);
+    const int start = static_cast<int>(
+        __dp4a(cw.y & m_hi, 0x01010101u, __dp4a(cw.x & m_lo, 0x01010101u, 4u)));
     const uint16_t* words = reinterpret_cast<const uint16_t*>(blk) + start;
-    uint8_t* dst = reinterpret_cast<uint8_t*>(sh_s + s_sh_stage * (X % stages)) + 128 * w + lane;
+    const int pl = (lane & ~3) | ((lane & 1) << 1) | ((lane >> 1) & 1);
+    uint16_t* dst16 = reinterpret_cast<uint16_t*>(sh_s + s_sh_stage * (X % stages)) + 128 * w + pl;
     const uint32_t lt = (1u << lane) - 1u;
     int pos = 0;
   #pragma unroll
     for (int m = 0; m < 4; m++) {
       const uint32_t e = sh_rlut[rans_x & 1023u];
-      rans_x = ((e >> 6) & 2047u) * (rans_x >> 10) + (e >> 17);
-      dst[32 * m] = sh_pal[e & 63u];
+      rans_x = (e >> 21) * (rans_x >> 10) + ((e >> 11) & 1023u);
+      dst16[32 * m] = static_cast<uint16_t>(e & 0x07F0u);
       const bool need = rans_x < 65536u;
       const uint32_t msk = __ballot_sync(0xffffffffu, need);
       if (need) rans_x = (rans_x << 16) | words[pos + __popc(msk & lt)];
@@ -1048,6 +1077,20 @@ __global__ void Marlin(
     }
   };
 #endif
+
+  // scale6 && m_block_size_8 (M=1): prune epilogue/reduction to the active threads
+  // with (threadIdx.x & 3) == 0 and 8 floats (2 int4) per thread, plus early C_tmp prefetch.
+  constexpr int red_active_threads = 32 * tb_n_warps;
+  constexpr int red_m1_threads = red_active_threads >> 2;
+  constexpr int red_m1_c_size = red_m1_threads * 2;
+#if defined(MUSE_SCALE_TMA4)
+  auto get_sh_ctmp = [&]() { return reinterpret_cast<int4*>(sh_rbar + 4); };
+#elif defined(MUSE_SCALE_RANS)
+  auto get_sh_ctmp = [&]() { return reinterpret_cast<int4*>(sh_rbar + (stages + 2)); };
+#else
+  auto get_sh_ctmp = [&]() { return reinterpret_cast<int4*>(sh_pal + 64); };
+#endif
+  auto get_sh_ctmp_ready = [&]() { return reinterpret_cast<int*>(get_sh_ctmp() + 32); };
 
   // Register storage for double buffer of shared memory reads.
   FragA frag_a[2][thread_m_blocks];
@@ -1180,7 +1223,7 @@ __global__ void Marlin(
           // Only fetch scales if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
 #if !defined(MUSE_SCALE_RANS) && !defined(MUSE_SCALE_TMA4)
-            int4* sh_s_stage = sh_s + s_sh_stage * pipe;
+            int4* sh_s_stage = sh_s + (scale6 ? s_sh_stage6 : s_sh_stage) * pipe;
             if (s_sh_wr_pred) {
               cp_async4_stream(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
             }
@@ -1229,6 +1272,42 @@ __global__ void Marlin(
     cp_async_wait<stages - 2>();
     __syncthreads();
   };
+
+#if !defined(MUSE_SCALE_RANS) && !defined(MUSE_SCALE_TMA4)
+  // Cooperatively pre-convert all 6-bit packed scales of `pipe` to BF16 once per stage.
+  // Each warp owns a disjoint set of 16 int4 scale slots (8 for k=0, 8 for k=1), and each
+  // thread converts 4 scales (1 int2), synchronized warp-locally with __syncwarp().
+  auto preconvert_scales6 = [&](int pipe) {
+    if constexpr (scale6) {
+      const int warp_id = threadIdx.x >> 5;
+      const int lane = threadIdx.x & 31;
+      const int warp_row = warp_id / tb_n_warps;
+      const int m = s_sh_rd +
+                    (2 * warp_row + ((lane >> 1) & 1)) * (2 * s_sh_stride);
+      const int half_idx = (m << 1) | (lane & 1);
+      const int byte_off = 3 * half_idx;
+      const int wi = byte_off >> 2;
+      const int sh = (byte_off & 3) << 3;
+      const uint32_t* cw =
+          reinterpret_cast<const uint32_t*>(sh_s + s_sh_stage6 * pipe);
+      uint32_t v = cw[wi] >> sh;
+      if (sh > 8) {
+        v |= cw[wi + 1] << (32 - sh);
+      }
+      uint32_t fp8_4 = 0;
+  #pragma unroll
+      for (int j = 0; j < 4; j++) {
+        fp8_4 |= static_cast<uint32_t>(sh_pal[(v >> (6 * j)) & 63]) << (8 * j);
+      }
+      c_scalar_t2 bf16_2[2];
+      dequant_fp8_scales<c_scalar_t2, s_type_id>(static_cast<int>(fp8_4),
+                                                 bf16_2);
+      reinterpret_cast<int2*>(sh_s_bf16)[half_idx] =
+          *reinterpret_cast<const int2*>(bf16_2);
+      __syncwarp();
+    }
+  };
+#endif
 
   // Load the next sub-tile from the current location in the shared memory pipe
   // into the current register buffer.
@@ -1311,27 +1390,11 @@ __global__ void Marlin(
                 sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
           } else if constexpr (scale6) {
 #if defined(MUSE_SCALE_RANS) || defined(MUSE_SCALE_TMA4)
-            reinterpret_cast<int2*>(&frag_s[k % 2])[0] = reinterpret_cast<int2*>(
-                sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
+            reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
+                sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
 #else
-            // raw byte b of the stage has its code at bits [6b, 6b + 6) of the
-            // compressed stage (LSB first); these 8 bytes start at b = 8m, so
-            // their 48 code bits sit in 32-bit words floor(1.5m), floor(1.5m)+1
             const int m = s_sh_rd + cur_group_id * (2 * s_sh_stride);
-            const uint32_t* cw = reinterpret_cast<const uint32_t*>(sh_s_stage);
-            const int wi = (3 * m) >> 1;
-            uint64_t v = static_cast<uint64_t>(cw[wi]) |
-                         (static_cast<uint64_t>(cw[wi + 1]) << 32);
-            v >>= (m & 1) * 16;
-            uint32_t lo = 0, hi = 0;
-  #pragma unroll
-            for (int j = 0; j < 4; j++) {
-              lo |= static_cast<uint32_t>(sh_pal[(v >> (6 * j)) & 63]) << (8 * j);
-              hi |= static_cast<uint32_t>(sh_pal[(v >> (6 * (j + 4))) & 63])
-                    << (8 * j);
-            }
-            reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
-                make_int2(static_cast<int>(lo), static_cast<int>(hi));
+            reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_bf16[m];
 #endif
           } else {
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
@@ -1540,7 +1603,8 @@ __global__ void Marlin(
       }
     }
 
-    if constexpr (s_type == vllm::kFE4M3fn || s_type == vllm::kFE8M0fnu) {
+    if constexpr (!scale6 &&
+                  (s_type == vllm::kFE4M3fn || s_type == vllm::kFE8M0fnu)) {
       int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
       int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
 
@@ -1734,6 +1798,61 @@ __global__ void Marlin(
   // multiple warps that accumulate their partial sums of the same output
   // location; which we have to reduce over in the end. We do in shared memory.
   auto thread_block_reduce = [&]() {
+    if constexpr (scale6 && m_block_size_8) {
+      constexpr int red_off = threads / b_sh_stride_threads / 2;
+      if constexpr (red_off >= 1) {
+        const int red_idx = threadIdx.x / b_sh_stride_threads;
+        constexpr int lane_grp = b_sh_stride_threads >> 2;
+        const int tid_grp = (threadIdx.x % b_sh_stride_threads) >> 2;
+        const bool is_row0 = (threadIdx.x & 3) == 0;
+        float4& p0 = reinterpret_cast<float4*>(frag_c)[0];
+        float4& p1 = reinterpret_cast<float4*>(frag_c)[1];
+  #pragma unroll
+        for (int i = red_off; i > 0; i /= 2) {
+          if (is_row0 && i <= red_idx && red_idx < 2 * i) {
+            const int wr_slot = (red_idx - i) * 2 * lane_grp + tid_grp;
+            if (i < red_off) {
+              const int rd_slot = red_idx * 2 * lane_grp + tid_grp;
+              const float4 rd0 =
+                  reinterpret_cast<const float4*>(sh_red)[rd_slot];
+              const float4 rd1 =
+                  reinterpret_cast<const float4*>(sh_red)[rd_slot + lane_grp];
+              const float4 wr0 =
+                  reinterpret_cast<const float4*>(sh_red)[wr_slot];
+              const float4 wr1 =
+                  reinterpret_cast<const float4*>(sh_red)[wr_slot + lane_grp];
+              p0.x += rd0.x + wr0.x;
+              p0.y += rd0.y + wr0.y;
+              p0.z += rd0.z + wr0.z;
+              p0.w += rd0.w + wr0.w;
+              p1.x += rd1.x + wr1.x;
+              p1.y += rd1.y + wr1.y;
+              p1.z += rd1.z + wr1.z;
+              p1.w += rd1.w + wr1.w;
+            }
+            reinterpret_cast<float4*>(sh_red)[wr_slot] = p0;
+            reinterpret_cast<float4*>(sh_red)[wr_slot + lane_grp] = p1;
+          }
+          __syncthreads();
+        }
+        if (is_row0 && red_idx == 0) {
+          const int rd_slot = tid_grp;
+          const float4 rd0 = reinterpret_cast<const float4*>(sh_red)[rd_slot];
+          const float4 rd1 =
+              reinterpret_cast<const float4*>(sh_red)[rd_slot + lane_grp];
+          p0.x += rd0.x;
+          p0.y += rd0.y;
+          p0.z += rd0.z;
+          p0.w += rd0.w;
+          p1.x += rd1.x;
+          p1.y += rd1.y;
+          p1.z += rd1.z;
+          p1.w += rd1.w;
+        }
+        __syncthreads();
+      }
+      return;
+    }
     constexpr int red_off = threads / b_sh_stride_threads / 2;
     if (red_off >= 1) {
       auto red_idx = threadIdx.x / b_sh_stride_threads;
@@ -1909,7 +2028,43 @@ __global__ void Marlin(
 
   // Globally reduce over threadblocks that compute the same column block.
   // We use a tmp C buffer to reduce in full fp32 precision.
-  auto global_reduce_fp32 = [&](bool first = false, bool last = false) {
+  auto global_reduce_fp32 = [&](bool first = false, bool last = false,
+                                bool ctmp_prefetched = false) {
+    if constexpr (scale6 && m_block_size_8) {
+      if (!first && ctmp_prefetched) {
+        cp_async_wait<0>();
+      }
+      if (threadIdx.x < red_active_threads && (threadIdx.x & 3) == 0) {
+        const int red_tid = threadIdx.x >> 2;
+        const int c_cur_offset = locks_off * red_m1_c_size;
+        float4& p0 = reinterpret_cast<float4*>(frag_c)[0];
+        float4& p1 = reinterpret_cast<float4*>(frag_c)[1];
+        if (!first) {
+          float4 rd0, rd1;
+          if (ctmp_prefetched) {
+            const int4* sh_ctmp = get_sh_ctmp();
+            rd0 = reinterpret_cast<const float4*>(sh_ctmp)[red_tid * 2 + 0];
+            rd1 = reinterpret_cast<const float4*>(sh_ctmp)[red_tid * 2 + 1];
+          } else {
+            rd0 = reinterpret_cast<const float4*>(C_tmp)[c_cur_offset + red_tid * 2 + 0];
+            rd1 = reinterpret_cast<const float4*>(C_tmp)[c_cur_offset + red_tid * 2 + 1];
+          }
+          p0.x += rd0.x;
+          p0.y += rd0.y;
+          p0.z += rd0.z;
+          p0.w += rd0.w;
+          p1.x += rd1.x;
+          p1.y += rd1.y;
+          p1.z += rd1.z;
+          p1.w += rd1.w;
+        }
+        if (!last) {
+          reinterpret_cast<float4*>(C_tmp)[c_cur_offset + red_tid * 2 + 0] = p0;
+          reinterpret_cast<float4*>(C_tmp)[c_cur_offset + red_tid * 2 + 1] = p1;
+        }
+      }
+      return;
+    }
     constexpr int tb_m = thread_m_blocks * 16;
     constexpr int tb_n = thread_n_blocks * 16;
 
@@ -1955,6 +2110,32 @@ __global__ void Marlin(
   // reshuffle matrix fragments in this step, the reduction above is performed
   // in fragment layout.
   auto write_result = [&](bool last) {
+    if constexpr (scale6 && m_block_size_8) {
+      if (threadIdx.x < red_active_threads && (threadIdx.x & 3) == 0) {
+        const float4& p0 = reinterpret_cast<const float4*>(frag_c)[0];
+        const float4& p1 = reinterpret_cast<const float4*>(frag_c)[1];
+        const int c_sh_wr =
+            (threadIdx.x % 32) / 4 + 64 * (threadIdx.x / 32);
+        c_scalar_t* sh_red_s = reinterpret_cast<c_scalar_t*>(sh_red);
+        sh_red_s[c_sh_wr + 0] = Cdtype::float2num(p0.x * global_scale_f32);
+        sh_red_s[c_sh_wr + 8] = Cdtype::float2num(p0.y * global_scale_f32);
+        sh_red_s[c_sh_wr + 16] = Cdtype::float2num(p0.z * global_scale_f32);
+        sh_red_s[c_sh_wr + 24] = Cdtype::float2num(p0.w * global_scale_f32);
+        sh_red_s[c_sh_wr + 32] = Cdtype::float2num(p1.x * global_scale_f32);
+        sh_red_s[c_sh_wr + 40] = Cdtype::float2num(p1.y * global_scale_f32);
+        sh_red_s[c_sh_wr + 48] = Cdtype::float2num(p1.z * global_scale_f32);
+        sh_red_s[c_sh_wr + 56] = Cdtype::float2num(p1.w * global_scale_f32);
+      }
+      __syncthreads();
+      if (threadIdx.x < 2 * thread_n_blocks) {
+        const int c_gl_wr = (2 * thread_n_blocks) * slice_col + threadIdx.x;
+        C[c_gl_wr] = sh_red[threadIdx.x];
+      }
+      if constexpr (!gate_up_grid) {
+        __syncthreads();
+      }
+      return;
+    }
     int c_gl_stride = prob_n / 8;
     constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
     int c_gl_wr_delta = c_gl_stride * (threads / (2 * thread_n_blocks));
@@ -2136,8 +2317,17 @@ __global__ void Marlin(
       }
     }
 
+    if constexpr (scale6 && m_block_size_8) {
+      if (threadIdx.x == 0) {
+        get_sh_ctmp_ready()[0] = 0;
+      }
+    }
+
     zero_accums();
     wait_for_stage();
+#if !defined(MUSE_SCALE_RANS) && !defined(MUSE_SCALE_TMA4)
+    preconvert_scales6(0);
+#endif
 #ifdef MUSE_SCALE_TMA4
     if (!tma_started) {
       tma_started = true;
@@ -2207,7 +2397,39 @@ __global__ void Marlin(
           fetch_to_shared((pipe + stages - 1) % stages, pipe,
                           slice_iters >= stages);
           pipe++;
+          if constexpr (scale6 && m_block_size_8) {
+            if (slice_iters == 1 && slice_count > 1 && slice_idx != 0 &&
+                threadIdx.x == 0) {
+              int state = -1;
+              asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
+                           : "=r"(state)
+                           : "l"(&locks[locks_off]));
+              get_sh_ctmp_ready()[0] = (state == slice_idx) ? 1 : 0;
+            }
+          }
           wait_for_stage();
+          if constexpr (scale6 && m_block_size_8) {
+            if (slice_iters == 1 && slice_count > 1 && slice_idx != 0) {
+              if (get_sh_ctmp_ready()[0] != 0) {
+                if (threadIdx.x < red_active_threads &&
+                    (threadIdx.x & 3) == 0) {
+                  const int red_tid = threadIdx.x >> 2;
+                  const int c_cur_offset = locks_off * red_m1_c_size;
+                  int4* sh_ctmp = get_sh_ctmp();
+                  cp_async4(&sh_ctmp[red_tid * 2 + 0],
+                            &C_tmp[c_cur_offset + red_tid * 2 + 0]);
+                  cp_async4(&sh_ctmp[red_tid * 2 + 1],
+                            &C_tmp[c_cur_offset + red_tid * 2 + 1]);
+                }
+                cp_async_fence();
+              }
+            }
+          }
+#if !defined(MUSE_SCALE_RANS) && !defined(MUSE_SCALE_TMA4)
+          if (slice_iters > 1) {
+            preconvert_scales6(pipe % stages);
+          }
+#endif
 #ifdef MUSE_SCALE_TMA4
           tma_q++;
           if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
@@ -2313,7 +2535,28 @@ __global__ void Marlin(
         }
       }
 
-      cp_async_wait<0>();
+      const bool ctmp_prefetched =
+          (scale6 && m_block_size_8) &&
+          (slice_count > 1 && slice_idx != 0 && get_sh_ctmp_ready()[0] != 0);
+      if constexpr (scale6 && m_block_size_8) {
+        if ((threadIdx.x & 3) == 0) {
+          const float4 p0 =
+              make_float4(frag_c[0][0][0][0], frag_c[0][0][0][2],
+                          frag_c[0][1][0][0], frag_c[0][1][0][2]);
+          const float4 p1 =
+              make_float4(frag_c[0][2][0][0], frag_c[0][2][0][2],
+                          frag_c[0][3][0][0], frag_c[0][3][0][2]);
+          reinterpret_cast<float4*>(frag_c)[0] = p0;
+          reinterpret_cast<float4*>(frag_c)[1] = p1;
+        }
+        if (ctmp_prefetched) {
+          cp_async_wait<1>();
+        } else {
+          cp_async_wait<0>();
+        }
+      } else {
+        cp_async_wait<0>();
+      }
       bool last = slice_idx == slice_count - 1;
       // For per-column scales, we only fetch them here in the final step before
       // write-out
@@ -2419,9 +2662,11 @@ __global__ void Marlin(
 
       if (slice_count > 1 && !use_atomic_add) {
         // only globally reduce if there is more than one block in a slice
-        barrier_acquire(&locks[locks_off], slice_idx);
+        if (!(scale6 && m_block_size_8 && ctmp_prefetched)) {
+          barrier_acquire(&locks[locks_off], slice_idx);
+        }
         if (use_fp32_reduce) {
-          global_reduce_fp32(slice_idx == 0, last);
+          global_reduce_fp32(slice_idx == 0, last, ctmp_prefetched);
         } else {
           global_reduce_fp16(slice_idx == 0, last);
         }

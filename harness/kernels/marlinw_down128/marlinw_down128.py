@@ -110,7 +110,7 @@ def work_lists_shape(n: int, k: int, shared_bytes: int):
         cut[key] = (c1, c2)
     default_tail = _DEFAULT_TAIL[(n, k)]
     tail_tiles = int(os.environ.get("D128_TAIL", str(default_tail))) if (n, k) == (COLUMNS, INNER) else default_tail
-    pg = int(os.environ.get("D128_PG", "4"))
+    pg = int(os.environ.get("D128_PG", "2"))
     n_col = n // 128
     order = [(col, pair) for g in range(0, 4, pg) for col in range(n_col) for pair in range(g, g + pg)]
     items = []  # (row0, col128, mb, ca, cb, ca2, cb2)
@@ -177,7 +177,7 @@ def tma_work_lists_shape(n: int, k: int, shared_bytes: int):
     cut = _shape_cuts(n, k, shared_bytes)
     k_tiles = k // 64
     n_col = n // 128
-    tma_pg = int(os.environ.get("D128_TMA_PG", "4"))
+    tma_pg = int(os.environ.get("D128_TMA_PG", "2"))
     order = [(col, pair) for g in range(0, 4, tma_pg) for col in range(n_col) for pair in range(g, g + tma_pg)]
     slots = 0
     slot_of = {}
@@ -254,7 +254,7 @@ def tma_work_lists(shared_bytes: int, sizes=PIECES):
     n_col = COLUMNS // 128
     assert sum(sizes) == k_tiles and all(v % 8 == 0 for v in starts) and starts[2] < 1024
     assert n_col * 4 == 4 * SMS + SPLIT
-    tma_pg = int(os.environ.get("D128_TMA_PG", "4"))
+    tma_pg = int(os.environ.get("D128_TMA_PG", "2"))
     order = [(col, pair) for g in range(0, 4, tma_pg) for col in range(n_col) for pair in range(g, g + tma_pg)]
     whole, split = order[:-SPLIT], order[-SPLIT:]
     slots = SPLIT  # scratch: SPLIT hand-over states, then one slot per tile with a stock cut
