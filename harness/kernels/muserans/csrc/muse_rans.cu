@@ -255,8 +255,11 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   const int xbytes = (K + 15) & ~15;
   const uint32_t sbase0 = (uint32_t)__cvta_generic_to_shared(smem) + (uint32_t)xbytes;
   const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + (uint32_t)wib * RB;
-  const int w = blockIdx.x * wpb + wib;
-  const bool active = w < pb.tw;
+  const int q_w = pb.tw / gridDim.x;
+  const int rem_w = pb.tw % gridDim.x;
+  const int w_cnt = q_w + (blockIdx.x < rem_w ? 1 : 0);
+  const int w = blockIdx.x * q_w + (blockIdx.x < rem_w ? blockIdx.x : rem_w) + wib;
+  const bool active = wib < w_cnt && w < pb.tw;
   const uint8_t* ws = pb.stream;
   uint32_t wbytes = 0;
   int gmin = 0, toffw = 0, issued = 0;
@@ -369,6 +372,9 @@ static inline size_t rans_dsmem(int K, int wpb, int gbs, int rg) { size_t rb = (
 static inline bool rans_fits(int K, int wpb, int gbs, int rg) { return rans_dsmem(K, wpb, gbs, rg) + RANS_LUT_BYTES + 1024 <= (size_t)RANS_MAX_SMEM; }
 
 static RansCfg rans_pick_cfg(int N, int K) {
+  if (N == 39936 && K == 6656 && rans_fits(K, 8, 9, 4)) {
+    return RansCfg{384, 8, 4, 4, 9};
+  }
   const int NB = N / 8;
   // Attention output_gate (4096x6656, 28 layers) runs concurrently with split-KV flash attention on a side stream:
   // launching 32 blocks of 16 warps (512 warps total) leaves 16 free SMs for flash attention (idea: ArthurOstapenko a9002906).
@@ -536,7 +542,8 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   pb.stream_bytes = (blob_bytes > soff + 64u) ? (blob_bytes - soff - 64u) : 0u;
   pb.tpf_stride = rans_tpf_stride();
   TORCH_CHECK(tw >= 1 && tw <= N / 8 && wpb >= 1 && wpb <= 32 && (ns == 1 || ns == 2 || ns == 4) && (rg == 4 || rg == 8) && (ilv == 0 || ilv == 9), "bad launch config");
-  const int blocks = (tw + wpb - 1) / wpb;
+  const int raw_blocks = (tw + wpb - 1) / wpb;
+  const int blocks = (raw_blocks == 47 && tw >= 48) ? 48 : raw_blocks;
   const size_t dsmem = rans_dsmem(K, wpb, 9, rg);
   TORCH_CHECK(rans_fits(K, wpb, 9, rg), "rans smem too large (K too large for smem staging of x): ", dsmem);
   rans_set_attrs_once();

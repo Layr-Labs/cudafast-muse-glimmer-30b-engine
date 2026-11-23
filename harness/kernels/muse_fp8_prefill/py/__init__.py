@@ -22,7 +22,7 @@ ENABLED = os.environ.get("MUSE_FP8_PREFILL", "1") != "0"
 _CFG: dict[tuple[int, int], int] = {
     (6656, 19968): 2,  # down: 128x192x128
     (6656, 4096): 3,   # o_proj: 128x96x128
-    (4608, 6656): 3,   # qkv: 128x96x128 (exact 4 waves on 48 SMs)
+    (4608, 6656): 2,   # qkv: 128x192x128 (exact 2.00 waves on 48 SMs; faster cold-L2 than 128x96x128)
 }
 if os.environ.get("MUSE_FP8_PREFILL_QKV", "1") == "0":
     _CFG.pop((4608, 6656), None)
