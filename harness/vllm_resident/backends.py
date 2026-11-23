@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 # process inherits them.
 os.environ.setdefault("VLLM_HUMMING_BATCH_INVARIANT", "1")
 os.environ.setdefault("VLLM_DISABLED_KERNELS", "FlashInferFP8ScaledMMLinearKernel")
+# v10: enable GQA-16 Tensor-Core M=1 decode attention (0-ULP fa2_exact mode is default and self-checked).
+os.environ.setdefault("MUSE_GQA16_DECODE", "1")
 from typing import Protocol
 
 TOP_K = 8

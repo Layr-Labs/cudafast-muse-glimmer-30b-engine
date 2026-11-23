@@ -312,6 +312,27 @@ __device__ __forceinline__ float triton_sigmoid(float g) {
   return sig;
 }
 
+__device__ __forceinline__ float triton_silu(float gate) {
+  float result;
+  asm("{\n\t"
+      ".reg .f32 x, a, b, c, d, e, f, g, h;\n\t"
+      ".reg .b32 exp2_scale;\n\t"
+      "sub.f32 x, 0f00000000, %1;\n\t"
+      "fma.rn.ftz.f32 a, x, 0f3BBB989D, 0f3F000000;\n\t"
+      "cvt.ftz.sat.f32.f32 b, a;\n\t"
+      "fma.rm.ftz.f32 c, b, 0f437C0000, 0f4B400001;\n\t"
+      "add.f32 d, c, 0fCB40007F;\n\t"
+      "neg.f32 d, d;\n\t"
+      "fma.rn.ftz.f32 e, x, 0f3FB8AA3B, d;\n\t"
+      "fma.rn.ftz.f32 f, x, 0f32A57060, e;\n\t"
+      "shl.b32 exp2_scale, c, 23;\n\t"
+      "ex2.approx.ftz.f32 g, f;\n\t"
+      "fma.rn.f32 h, g, exp2_scale, 0f3F800000;\n\t"
+      "div.full.f32 %0, %1, h;\n\t"
+      "}" : "=f"(result) : "f"(gate));
+  return result;
+}
+
 __global__ void __launch_bounds__(256) mul_sigmoid_bf16_kernel(
     const uint4* __restrict__ gate, const uint4* __restrict__ attn, uint4* __restrict__ out, int vec8) {
   const int idx = blockIdx.x * 256 + threadIdx.x;
@@ -326,6 +347,108 @@ __global__ void __launch_bounds__(256) mul_sigmoid_bf16_kernel(
     ow[i] = pack_bf16x2(__fmul_rn(triton_sigmoid(gl), al), __fmul_rn(triton_sigmoid(gh), ah));
   }
   out[idx] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
+}
+
+constexpr int kInterVec8 = 19968 / 8;  // 2496 uint4s per 19968-element BF16 half-row
+
+__global__ void __launch_bounds__(128) mul_silu_slice_bf16_kernel(
+    const uint4* __restrict__ gu_all, uint4* __restrict__ out_all) {
+  const int col = blockIdx.x * 128 + threadIdx.x;
+  if (col >= kInterVec8) return;
+  const size_t row = blockIdx.y;
+  const uint4* gu = gu_all + row * (2 * kInterVec8);
+  const uint4 g = gu[col];
+  const uint4 u = gu[col + kInterVec8];
+  const uint32_t gw[4] = {g.x, g.y, g.z, g.w}, uw[4] = {u.x, u.y, u.z, u.w};
+  uint32_t ow[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float gl = bf_lo(gw[i]), gh = bf_hi(gw[i]);
+    const float ul = bf_lo(uw[i]), uh = bf_hi(uw[i]);
+    ow[i] = pack_bf16x2(__fmul_rn(triton_silu(gl), ul), __fmul_rn(triton_silu(gh), uh));
+  }
+  out_all[row * kInterVec8 + col] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
+}
+
+// Layer-51 final post-FF norm + residual + model.norm (compiled bf5b0726...):
+//   tensors: (d, res, x, sumsq_x, w_post, w_ff, w_in, out_h2_fp32, out_bf16)
+//   h1 = res + (a * x) * (w_post + 1)             (FMUL, FADD, FMUL, FADD)
+//   h2 = h1  + (cd * d) * (w_ff + 1)              (FMUL, FADD, FMUL, FADD)
+//   out_h2_fp32 <- h2;  s_h = sum h2^2;  e_r = inv_rms(s_h, 1e-5)
+//   y  = (e_r * h2) * (w_in + 0.0f);  out_bf16 <- bf16(y)
+__global__ void __launch_bounds__(kThreads) post_ff_final_norm(
+    const __nv_bfloat16* d_all, const __nv_bfloat16* res_all,
+    const __nv_bfloat16* x_all, const float* sumsq_x,
+    const __nv_bfloat16* __restrict__ w_post, const __nv_bfloat16* __restrict__ w_ff,
+    const __nv_bfloat16* __restrict__ w_in,
+    float* out_h2_all, __nv_bfloat16* out_bf16_all) {
+  __shared__ float red[2][8];
+  const size_t row = blockIdx.x;
+  const __nv_bfloat16* d = d_all + row * kHidden;
+  const __nv_bfloat16* res = res_all + row * kHidden;
+  const __nv_bfloat16* x = x_all + row * kHidden;
+  uint2 ud[kChunks], ur[kChunks], ux[kChunks], uw[kChunks], uf[kChunks], ui[kChunks];
+#pragma unroll
+  for (int c = 0; c < kChunks; ++c) {
+    if (chunk_valid(c)) {
+      ud[c] = ld8(d, c);
+      ur[c] = ld8(res, c);
+      ux[c] = ld8(x, c);
+      uw[c] = ld8(w_post, c);
+      uf[c] = ld8(w_ff, c);
+      ui[c] = ld8(w_in, c);
+    }
+  }
+  const float s_x = sumsq_x[row];
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int c = 0; c < kChunks; ++c) {
+    if (chunk_valid(c)) {
+      Row4 v = unpack(ud[c]);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) acc[e] = __fmaf_rn(v.v[e], v.v[e], acc[e]);
+    }
+  }
+  const float s_d = row_sum(acc, red[0]);
+  const float a = inv_rms(s_x, 1e-08f);
+  const float cd = inv_rms(s_d, 1e-08f);
+  float h2[kChunks][4];
+  float acc2[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int c = 0; c < kChunks; ++c) {
+    if (chunk_valid(c)) {
+      Row4 xv = unpack(ux[c]), dv = unpack(ud[c]), rv = unpack(ur[c]), wv = unpack(uw[c]), fv = unpack(uf[c]);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const float t1 = __fmul_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f));
+        const float h1 = __fadd_rn(rv.v[e], t1);
+        const float t2 = __fmul_rn(__fmul_rn(cd, dv.v[e]), __fadd_rn(fv.v[e], 1.0f));
+        h2[c][e] = __fadd_rn(h1, t2);
+        acc2[e] = __fmaf_rn(h2[c][e], h2[c][e], acc2[e]);
+      }
+      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
+      *reinterpret_cast<float4*>(out_h2_all + off) =
+          make_float4(h2[c][0], h2[c][1], h2[c][2], h2[c][3]);
+    }
+  }
+  const float s_h = row_sum(acc2, red[1]);
+  const float e_r = inv_rms(s_h, 1e-05f);
+#pragma unroll
+  for (int c = 0; c < kChunks; ++c) {
+    if (chunk_valid(c)) {
+      Row4 iv = unpack(ui[c]);
+      float y[4];
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        y[e] = __fmul_rn(__fmul_rn(e_r, h2[c][e]), __fadd_rn(iv.v[e], 0.0f));
+      }
+      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
+      uint2 o;
+      o.x = pack_bf16x2(y[0], y[1]);
+      o.y = pack_bf16x2(y[2], y[3]);
+      *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
+    }
+  }
 }
 
 }  // namespace
@@ -377,6 +500,19 @@ int muse_norm_glue_post_ff(int kind, int rows, void* x, const void* d, const voi
   return static_cast<int>(cudaGetLastError());
 }
 
+int muse_norm_glue_post_ff_final(int rows, const void* d, const void* res, const void* x, const void* sumsq_x,
+                                 const void* w_post, const void* w_ff, const void* w_in,
+                                 void* out_h2, void* out_bf16, cudaStream_t stream) {
+  if (rows <= 0) return 0;
+  post_ff_final_norm<<<rows, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(d), static_cast<const __nv_bfloat16*>(res),
+      static_cast<const __nv_bfloat16*>(x), static_cast<const float*>(sumsq_x),
+      static_cast<const __nv_bfloat16*>(w_post), static_cast<const __nv_bfloat16*>(w_ff),
+      static_cast<const __nv_bfloat16*>(w_in),
+      static_cast<float*>(out_h2), static_cast<__nv_bfloat16*>(out_bf16));
+  return static_cast<int>(cudaGetLastError());
+}
+
 int muse_norm_glue_post_ff_gate(int rows, void* x, const void* d, const void* res, const void* sumsq_x,
                                 const void* w_post, const void* w_ff, const void* w_in, const void* scale,
                                 void* out_bf16, void* out_fp8, const void* gate_scale, void* out_gate,
@@ -418,6 +554,14 @@ int muse_norm_glue_mul_sigmoid_bf16(const void* gate, const void* attn, void* ou
   mul_sigmoid_bf16_kernel<<<(vec8 + 255) / 256, 256, 0, stream>>>(
       static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
       static_cast<uint4*>(out), vec8);
+  return static_cast<int>(cudaGetLastError());
+}
+
+int muse_norm_glue_mul_silu_slice_bf16(const void* gu, void* out, int rows, cudaStream_t stream) {
+  if (rows <= 0) return -1;
+  const dim3 grid((kInterVec8 + 127) / 128, static_cast<unsigned>(rows));
+  mul_silu_slice_bf16_kernel<<<grid, 128, 0, stream>>>(
+      static_cast<const uint4*>(gu), static_cast<uint4*>(out));
   return static_cast<int>(cudaGetLastError());
 }
 

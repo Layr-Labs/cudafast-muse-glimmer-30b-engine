@@ -49,11 +49,13 @@ _DECODE_GATE_FOLD = os.environ.get("VLLM_MUSE_GLIMMER_DECODE_GATE_FOLD", "1") ==
 _DROP_BF16 = os.environ.get("VLLM_MUSE_GLIMMER_DECODE_DROP_BF16", "1") == "1"
 _RANS_PROLOGUE = os.environ.get("MUSE_RANS_PROLOGUE_FUSE", "1") != "0"
 _MUL_SIGMOID_GLUE = os.environ.get("MUSE_MUL_SIGMOID_GLUE", "1") != "0"
+_MUL_SILU_SLICE_GLUE = os.environ.get("MUSE_MUL_SILU_SLICE_GLUE", "1") != "0"
 _REQUANT = "triton_poi_fused__to_copy_clamp_mul_reciprocal_0"
 _REQUANT_BODY = "f7a07e4acde4818e0fe4bcb2f62a211fa163724414f5efcce3d93ee433b8300f"
 _SIGMOID_FP8_HASH = "68ddaaf112b7f2fbd8d452b5eb8b93c39567cfe29e167a625d3194458669ad01"
 _SILU_FP8_HASH = "19d65ce965db0a8c0bb1cfcaca79c3ac3de250ee8ed0a3aa1983d8c3612df9dc"
 _MUL_SIGMOID_BF16_HASH = "d7dbdd6fbb45cd65ebdcb6c1fde8d461e74484b611165ad886a6d2e589ff6573"
+_MUL_SILU_SLICE_BF16_HASH = "bf9bb13afc727a2d983f0324b4af948f9a8c926ab016caad6288cd160e3c49c7"
 _stats = dict(routed=0, routed_captured=0, captured_unchecked=0, compiled_ineligible=0, audit_ok=0,
               audit_mismatch=0, audit_error=0)
 
@@ -76,6 +78,26 @@ _gate_counts = Counter()
 _prologue_state: dict[int, str] = {}  # scale_ptr -> "admitted" | "rejected"
 _pending_rans_prologue = None  # (out_fp8_ptr, act_mode, x0, x1, scale_ptr, skipped)
 _prologue_counts = Counter()
+_pending_gate_up_swiglu = None  # (out_ptr, sw_entry, fused_launched, check_args)
+_expect_down_swiglu = None      # (triton_out_ptr, swiglu_view, down_gs_ptr)
+_swiglu_gu_counts = Counter()
+
+
+def notify_gate_up_swiglu(out_ptr: int, sw_entry: dict, fused_launched: bool, check_args) -> None:
+    global _pending_gate_up_swiglu
+    _pending_gate_up_swiglu = (out_ptr, sw_entry, fused_launched, check_args)
+
+
+def consume_down_swiglu(x: torch.Tensor, down_gs_ptr: int) -> torch.Tensor | None:
+    global _expect_down_swiglu
+    if _expect_down_swiglu is None:
+        return None
+    exp_ptr, sw_view, exp_gs = _expect_down_swiglu
+    _expect_down_swiglu = None
+    if x.data_ptr() != exp_ptr or down_gs_ptr != exp_gs:
+        raise RuntimeError("muse_glimmer_norm_glue: skipped silu_slice did not reach expected down_proj")
+    _swiglu_gu_counts["down_redirected"] += 1
+    return sw_view
 
 
 def consume_rans_prologue(
@@ -184,6 +206,128 @@ class _MulSigmoidSwap:
             logger.info("Decode mul_sigmoid glue: %s", self.state)
             return None
         G.mul_sigmoid_bf16(gate, attn, out, 4096, stream)
+        return None
+
+
+class _MulSiluSliceSwap:
+    def __init__(self) -> None:
+        self.state = "unchecked"
+
+    def run(self, kernel, orig_run, args, kwargs):
+        global _pending_gate_up_swiglu, _expect_down_swiglu
+        if kwargs.get("benchmark_run", False):
+            return orig_run(kernel, *args, **kwargs)
+        if _pending_gate_up_swiglu is not None:
+            gu_ptr, sw_entry, fused_launched, check_args = _pending_gate_up_swiglu
+            _pending_gate_up_swiglu = None
+            if len(args) == 3 and isinstance(args[0], torch.Tensor) and isinstance(args[1], torch.Tensor):
+                gu_t, out_t, numel_t = args
+                try:
+                    n_sw = int(numel_t)
+                except Exception:
+                    n_sw = -1
+                if n_sw == 19968 and gu_t.data_ptr() == gu_ptr:
+                    if fused_launched:
+                        _expect_down_swiglu = (
+                            out_t.data_ptr(),
+                            sw_entry["swiglu_out"][:, :19968],
+                            sw_entry["down_gs_ptr"],
+                        )
+                        _swiglu_gu_counts["skipped"] += 1
+                        return None
+                    if sw_entry["state"] == "prechecked" and not torch.cuda.is_current_stream_capturing() and check_args is not None:
+                        orig_run(kernel, *args, **kwargs)
+                        try:
+                            import muse_marlin6_gemv as _m6
+                            x_c, w_c, s6_c, pal_c, gs_c, ws_c, part_c = check_args
+                            sw_out = sw_entry["swiglu_out"]
+                            pl = sw_entry["pair_locks"]
+                            with torch.cuda.device(out_t.device):
+                                rc = _m6._gate_up_tma4_swiglu(
+                                    x_c.data_ptr(), w_c.data_ptr(), sw_out.data_ptr(), part_c.data_ptr(),
+                                    s6_c.data_ptr(), pal_c.data_ptr(), gs_c.data_ptr(), ws_c.data_ptr(),
+                                    pl.data_ptr(), 39936, 6656, 48,
+                                    out_t.device.index, torch.cuda.current_stream().cuda_stream,
+                                )
+                            torch.cuda.synchronize(out_t.device)
+                            if (
+                                rc == 0
+                                and int(torch.count_nonzero(pl).item()) == 0
+                                and int(torch.count_nonzero(ws_c).item()) == 0
+                                and torch.equal(sw_out[:, :19968].view(torch.int16), out_t.view(torch.int16))
+                            ):
+                                sw_entry["state"] = "admitted"
+                                _swiglu_gu_counts["admitted"] += 1
+                                if _swiglu_gu_counts["admitted"] in (1, 40):
+                                    logger.info("Decode6 gate_up SwiGLU epilogue: %d layers admitted bitwise", _swiglu_gu_counts["admitted"])
+                            else:
+                                sw_entry["state"] = "rejected"
+                                _swiglu_gu_counts["rejected"] += 1
+                        except Exception:
+                            sw_entry["state"] = "rejected"
+                            _swiglu_gu_counts["rejected"] += 1
+                        return None
+                elif fused_launched:
+                    raise RuntimeError("muse_glimmer_norm_glue: fused gate_up SwiGLU output did not reach expected silu_slice")
+            elif fused_launched:
+                raise RuntimeError("muse_glimmer_norm_glue: unexpected kernel after fused gate_up SwiGLU")
+        if self.state == "rejected" or len(args) != 3:
+            return orig_run(kernel, *args, **kwargs)
+        gu, out, numel = args
+        try:
+            n_el = int(numel)
+        except Exception:
+            return orig_run(kernel, *args, **kwargs)
+        stream = kwargs.get("stream")
+        if stream is None or n_el <= 0 or n_el % 19968 != 0:
+            return orig_run(kernel, *args, **kwargs)
+        rows = n_el // 19968
+        if (
+            rows > _MAX_ROWS
+            or not all(
+                isinstance(t, torch.Tensor)
+                and t.is_cuda
+                and t.dtype == torch.bfloat16
+                and t.is_contiguous()
+                and (t.data_ptr() & 15) == 0
+                for t in (gu, out)
+            )
+            or gu.numel() != rows * 39936
+            or out.numel() != rows * 19968
+            or (gu.data_ptr() < out.data_ptr() + out.numel() * 2 and out.data_ptr() < gu.data_ptr() + gu.numel() * 2)
+        ):
+            return orig_run(kernel, *args, **kwargs)
+        import muse_norm_glue as G
+
+        if self.state == "unchecked":
+            if torch.cuda.is_current_stream_capturing():
+                return orig_run(kernel, *args, **kwargs)
+            ok = False
+            try:
+                gu_c = gu.clone()
+                mine = torch.empty_like(out)
+                orig_run(kernel, *args, **kwargs)
+                G.mul_silu_slice_bf16(gu_c, mine, rows, stream)
+                torch.cuda.synchronize()
+                ok = torch.equal(out.view(torch.int16), mine.view(torch.int16))
+                if ok:
+                    gen = torch.Generator(device=out.device).manual_seed(20261124)
+                    for sig in (0.1, 1.0, 5.0, 20.0):
+                        rgu = (torch.randn((1, 39936), generator=gen, device=out.device) * sig).to(torch.bfloat16)
+                        ro = torch.empty((1, 19968), dtype=torch.bfloat16, device=out.device)
+                        mo = torch.empty_like(ro)
+                        orig_run(kernel, rgu, ro, 19968, **kwargs)
+                        G.mul_silu_slice_bf16(rgu, mo, 1, stream)
+                        torch.cuda.synchronize()
+                        if not torch.equal(ro.view(torch.int16), mo.view(torch.int16)):
+                            ok = False
+                            break
+            except Exception:
+                ok = False
+            self.state = "admitted" if ok else "rejected"
+            logger.info("Decode mul_silu_slice glue: %s", self.state)
+            return None
+        G.mul_silu_slice_bf16(gu, out, rows, stream)
         return None
 
 
@@ -334,9 +478,11 @@ _KNOWN = {
     "03e23ece0b7f19c9179e5134efd5bf3827487d160ecf62c3e25b2adb601aa9aa": ("post_attn", 1),  # ..._clamp_..._rsqrt_1
     "8df62488ea9e57d544ca01c77b0357adb35719e24003236406992576cc6a6d0f": ("post_ff", 0),    # ..._rsqrt_3
     "4af27bfe882e44d5385544eece542f1d53d64ed263e26dbefeb3f356a2576340": ("post_ff", 1),    # ..._clamp_..._rsqrt_3
+    "bf5b07265dd104f20e1d453c270c2c8c59aa7d22d7fe1bf6b70da6e71ef1dc03": ("post_ff", 2),    # Layer-51 final norm
+    "89c74b3ff8b8fca54204a32d25cc75b669560debd4bb866a354d7815eeda115b": ("post_ff", 2),    # Layer-51 final norm (canonical)
 }
 # Number of tensor arguments (then xnumel, r0_numel) per kind.
-_NARGS = {("post_attn", 0): 6, ("post_attn", 1): 7, ("post_ff", 0): 8, ("post_ff", 1): 10}
+_NARGS = {("post_attn", 0): 6, ("post_attn", 1): 7, ("post_ff", 0): 8, ("post_ff", 1): 10, ("post_ff", 2): 9}
 
 
 def _canonical_hash(src: str) -> str:
@@ -403,6 +549,14 @@ class _NormSwap:
                 return ok and s.dtype == f32 and s.numel() >= rows and row(o, bf)
             sc, s, q = tensors[4:7]
             return ok and sc.dtype == f32 and sc.numel() == 1 and s.dtype == f32 and s.numel() >= rows and row(q, f8)
+        if self.kind == 2:
+            d, res, x, sx, wp, wf, wi, h2, o = tensors
+            return (
+                row(d, bf) and row(res, bf) and row(x, bf)
+                and sx.dtype == f32 and sx.numel() >= rows
+                and vec(wp) and vec(wf) and vec(wi)
+                and row(h2, f32) and row(o, bf)
+            )
         x, d, res, sx, wp, wf, wi = tensors[:7]
         ok = row(x, bf) and row(d, bf) and row(res, bf) and sx.dtype == f32 and sx.numel() >= rows
         ok = ok and vec(wp) and vec(wf) and vec(wi)
@@ -423,6 +577,9 @@ class _NormSwap:
             else:
                 sc, s, q = tensors[4:7]
                 G.post_attn(1, rows, x, res, wp, wq, sc, s, None, q, stream)
+        elif self.kind == 2:
+            d, res, x, sx, wp, wf, wi, h2, o = tensors
+            G.post_ff_final(rows, d, res, x, sx, wp, wf, wi, h2, o, stream)
         else:
             x, d, res, sx, wp, wf, wi = tensors[:7]
             if self.kind == 0:
@@ -435,6 +592,8 @@ class _NormSwap:
         """Indices of the tensors a launch writes (the in/out activation first for post_ff)."""
         if self.op == "post_attn":
             return (4, 5) if self.kind == 0 else (5, 6)
+        if self.kind == 2:
+            return (7, 8)
         return (0, 7) if self.kind == 0 else (0, 8, 9)
 
     def _compare(self, kernel, orig_run, tensors, rows, kwargs, stream) -> bool:
@@ -646,6 +805,8 @@ def _classify(kernel):
             return _RansPrologueHook(2)
         if _MUL_SIGMOID_GLUE and h == _MUL_SIGMOID_BF16_HASH:
             return _MulSigmoidSwap()
+        if _MUL_SILU_SLICE_GLUE and h == _MUL_SILU_SLICE_BF16_HASH:
+            return _MulSiluSliceSwap()
     return None
 
 
@@ -748,6 +909,12 @@ def install_norm_glue() -> None:
     try:
         from vllm.model_executor.layers.quantization.utils import glimmer_fp8 as _glimmer_fp8
         _glimmer_fp8._decode_gemm_operand = decode_gemm_operand
+    except Exception:
+        pass
+    try:
+        import muse_marlin6_gemv as _m6
+        _m6._notify_gate_up_swiglu = notify_gate_up_swiglu
+        _m6._consume_down_swiglu = consume_down_swiglu
     except Exception:
         pass
     _installed = True
