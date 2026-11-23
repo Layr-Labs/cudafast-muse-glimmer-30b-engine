@@ -87,8 +87,6 @@ int l2pf_prefetch_desc(const void* desc, int ndesc, int blocks, int threads, voi
 #ifdef __linux__
 static std::atomic<bool> g_tickle_started{false};
 
-// Micro-attribution: The pure-C SCHED_IDLE 1 ms nanosleep tickler to prevent ARM LPI-3 deep-idle
-// entry on pinned high-capacity cores is inspired by @zereraz (Yukon submission 77795739).
 static void* l2pf_tickle_worker(void* arg) {
   int cpu = static_cast<int>(reinterpret_cast<intptr_t>(arg));
   if (cpu >= 0 && cpu < CPU_SETSIZE) {

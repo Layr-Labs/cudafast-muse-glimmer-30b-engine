@@ -10,9 +10,9 @@ so later groups do not recycle slow pages, and exchange slow homes with faster
 spares after a bitwise equality check.
 
   MUSE_DECODE_PLACEMENT=0             no decode placement step
-  MUSE_DECODE_PLACEMENT_SURPLUS=<r>   spare buffers per decode weight (default 3.5)
+  MUSE_DECODE_PLACEMENT_SURPLUS=<r>   spare buffers per decode weight (default 2.0)
   MUSE_PREFILL_PLACEMENT=0            no prefill placement step
-  MUSE_PREFILL_PLACEMENT_SURPLUS=<r>  spare buffers per prefill weight (default 2.0)
+  MUSE_PREFILL_PLACEMENT_SURPLUS=<r>  spare buffers per prefill weight (default 1.5)
 """
 
 from __future__ import annotations
@@ -42,6 +42,9 @@ _NAME = "_marlin_decode_weight"
 _L2_FLUSH_INTS = 16 << 20  # 64 MiB (> 2.5x GB10's 24 MiB L2)
 # Quarantine below-median (slow) buffers from place_decode_weights through place_prefill_weights.
 _SLOW_HOLD: list[torch.Tensor] = []
+PLACE_ATTN = os.environ.get("MUSE_PLACE_ATTN", "1").strip() not in ("0", "", "false", "no")
+ATTN_MIN_BYTES = 10 << 20
+ATTN_SURPLUS = float(os.environ.get("MUSE_ATTN_PLACEMENT_SURPLUS", "2.5"))
 
 
 def _drop_model_page_cache() -> None:
@@ -93,14 +96,19 @@ def _spares_allowed(wanted: int, payload_bytes: int) -> int:
     return max(0, min(wanted, (available - HOST_HEADROOM_BYTES) // payload_bytes))
 
 
-def _ensure_spares_room(wanted: int, payload_bytes: int, hold_list: list) -> int:
-    """Release oldest quarantined slow buffers only if needed for headroom."""
+def _ensure_spares_room(wanted: int, payload_bytes: int, hold_list: list, allow_slow_trim: bool = True) -> int:
+    """Release oldest quarantined buffers incrementally (25% at a time) only when headroom is tight."""
     spares_count = _spares_allowed(wanted, payload_bytes)
-    if spares_count >= wanted or not hold_list:
+    if spares_count >= wanted:
         return spares_count
     while hold_list and _spares_allowed(wanted, payload_bytes) < wanted:
         del hold_list[: max(1, len(hold_list) // 4)]
         torch.cuda.empty_cache()
+    spares_count = _spares_allowed(wanted, payload_bytes)
+    if allow_slow_trim and spares_count < wanted and _SLOW_HOLD:
+        while _SLOW_HOLD and _spares_allowed(wanted, payload_bytes) < wanted:
+            del _SLOW_HOLD[: max(1, len(_SLOW_HOLD) // 4)]
+            torch.cuda.empty_cache()
     return _spares_allowed(wanted, payload_bytes)
 
 
@@ -109,10 +117,27 @@ def _time_candidates(decode_linear, layer, candidates, n: int, k: int, rounds: i
     device = candidates[0].device
     # A fixed finite row; the kernel's timing does not depend on values.
     x = ((torch.arange(k, device=device) % 7).float() - 3.0).to(torch.bfloat16).reshape(1, k)
-    scales, global_scale, workspace = layer._marlin_decode_scales, layer.weight_global_scale, layer.workspace
+    global_scale, workspace = layer.weight_global_scale, layer.workspace
+    palette = getattr(layer, "_marlin_decode_palette", None)
+    scales6 = getattr(layer, "_marlin_decode_scales6", None)
+    fixed_grid = bool(getattr(layer, "marlin_decode6_fixed_grid", False))
+    use_6 = False
+    if palette is not None and scales6 is not None:
+        try:
+            from muse_marlin6_gemv import decode_linear6
+            use_6 = True
+        except (ImportError, OSError):
+            use_6 = False
+    if use_6:
+        def run_one(buf):
+            decode_linear6(x, buf, scales6, palette, global_scale, workspace, n, k, fixed_grid)
+    else:
+        scales = layer._marlin_decode_scales
+        def run_one(buf):
+            decode_linear(x, buf, scales, global_scale, workspace, n, k)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    decode_linear(x, candidates[0], scales, global_scale, workspace, n, k)
+    run_one(candidates[0])
     _flush_l2(evict_buf)
     torch.cuda.synchronize(device)
     samples: list[list[float]] = [[] for _ in candidates]
@@ -122,7 +147,7 @@ def _time_candidates(decode_linear, layer, candidates, n: int, k: int, rounds: i
         shuffler.shuffle(order)
         for index in order:
             start.record()
-            decode_linear(x, candidates[index], scales, global_scale, workspace, n, k)
+            run_one(candidates[index])
             end.record()
             end.synchronize()
             samples[index].append(start.elapsed_time(end))
@@ -133,9 +158,11 @@ def _place_group(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor,
     homes = [layer._buffers[_NAME] for layer in layers]
     count = len(homes)
     payload_bytes = homes[0].numel() * homes[0].element_size()
-    wanted = max(LM_HEAD_SPARES if count == 1 else 1, math.ceil(count * SURPLUS)) if SURPLUS > 0 else 0
-    spares_count = _spares_allowed(wanted, payload_bytes)
-    if spares_count <= 0:
+    is_small = payload_bytes < MIN_PAYLOAD_BYTES
+    surplus = ATTN_SURPLUS if is_small else SURPLUS
+    wanted = max(LM_HEAD_SPARES if count == 1 else 1, math.ceil(count * surplus)) if surplus > 0 else 0
+    spares_count = _ensure_spares_room(wanted, payload_bytes, rejected_hold, allow_slow_trim=not is_small)
+    if spares_count <= 0 or (is_small and spares_count < count):
         return None
     spares = []
     try:
@@ -150,13 +177,13 @@ def _place_group(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor,
     candidates = homes + spares
     times = _time_candidates(decode_linear, layers[0], candidates, n, k, ROUNDS, evict_buf)
     ranked = sorted(range(len(candidates)), key=times.__getitem__)
-    slow_cut = median(times)
     kept = set(ranked[:count])
     free_fast = [index for index in ranked[:count] if index >= count]
     movers = sorted((index for index in range(count) if index not in kept), key=times.__getitem__, reverse=True)
     moved = 0
     after = list(times[:count])
     used_targets = set()
+    slow_cut = median(times)
     for home_index, target_index in zip(movers, free_fast):
         target, source = candidates[target_index], homes[home_index]
         target.copy_(source)
@@ -188,24 +215,30 @@ def _place_muserans_group(rans_ext, layers, n: int, k: int, evict_buf: torch.Ten
     homes = [layer._buffers["muse_fp8_packed"] for layer in layers]
     count = len(homes)
     max_bytes = max(h.numel() for h in homes)
-    wanted = max(1, math.ceil(count * SURPLUS)) if SURPLUS > 0 else 0
-    spares_count = _spares_allowed(wanted, max_bytes)
-    if spares_count <= 0:
+    is_small = max_bytes < MIN_PAYLOAD_BYTES
+    surplus = ATTN_SURPLUS if is_small else SURPLUS
+    wanted = max(1, math.ceil(count * surplus)) if surplus > 0 else 0
+    spares_count = _ensure_spares_room(wanted, max_bytes, rejected_hold, allow_slow_trim=not is_small)
+    if spares_count <= 0 or (is_small and spares_count < count):
         return None
-    ref_len = homes[0].numel()
-    # Micro-attribution: Storage-swapping source.data in _place_muserans_group is inspired by @kaankolcu
-    # (Yukon submission 9daf69d2); cross-phase _SLOW_HOLD quarantine and total-bytes group sorting are
-    # inspired by @zereraz (Yukon submission 63ea2ee2).
+    # Time every home and spare with the EXACT same smallest blob so per-layer compression ratio
+    # differences do not confound physical-page speed measurements. Back up real blobs to host first.
+    min_idx = min(range(count), key=lambda i: homes[i].numel())
+    ref_blob = homes[min_idx].clone()
+    ref_len = ref_blob.numel()
+    saved_host = [h.detach().cpu() for h in homes]
     spares = []
     try:
         for _ in range(spares_count):
             spare = torch.empty((max_bytes,), dtype=torch.uint8, device=homes[0].device)
-            spare[:ref_len].copy_(homes[0])
+            spare[:ref_len].copy_(ref_blob)
             spares.append(spare)
     except RuntimeError:
         pass
     if not spares:
         return None
+    for h in homes:
+        h[:ref_len].copy_(ref_blob)
     ref = layers[0]
     device = homes[0].device
     xq = torch.zeros((k,), dtype=torch.float8_e4m3fn, device=device)
@@ -216,26 +249,131 @@ def _place_muserans_group(rans_ext, layers, n: int, k: int, evict_buf: torch.Ten
     def run_cand(buf):
         rans_ext.rans_gemv_auto(buf, xq, ws, xs, out, n, k)
 
-    cand_views = list(homes) + [s[:ref_len] for s in spares]
-    times = _time_calls(run_cand, cand_views, ROUNDS, evict_buf)
+    cand_views = [h[:ref_len] for h in homes] + [s[:ref_len] for s in spares]
+    try:
+        times = _time_calls(run_cand, cand_views, ROUNDS, evict_buf)
+    except Exception:
+        for h, sh in zip(homes, saved_host):
+            h.copy_(sh, non_blocking=False)
+        raise
     ranked = sorted(range(len(cand_views)), key=times.__getitem__)
-    slow_cut = median(times)
     kept = set(ranked[:count])
     free_fast = [index for index in ranked[:count] if index >= count]
     movers = sorted((index for index in range(count) if index not in kept), key=times.__getitem__, reverse=True)
+    # Restore every kept home's real bytes first.
+    for idx in kept:
+        if idx < count:
+            homes[idx].copy_(saved_host[idx], non_blocking=False)
     moved = 0
     after = list(times[:count])
     used_targets = set()
+    slow_cut = median(times)
     for home_index, target_index in zip(movers, free_fast):
         source = homes[home_index]
-        target = spares[target_index - count][: source.numel()]
-        target.copy_(source)
-        if not torch.equal(target, source):
+        real_dev = saved_host[home_index].to(device=device)
+        target_full = spares[target_index - count]
+        target = target_full[: source.numel()]
+        target.copy_(real_dev)
+        if not torch.equal(target, real_dev):
+            source.copy_(real_dev)
+            continue
+        # integration3: swap the storage of the home tensor object itself. The FP8 linear kernel keeps its own
+        # reference to this object (cutlass.py self.muse_packed), so replacing only the layer buffer entry
+        # would leave the kernel reading the old blob and the move would have no effect.
+        old = source.data
+        source.data = target
+        if source.data_ptr() != target.data_ptr():
+            source.data = old
+            source.copy_(real_dev)
+            continue
+        used_targets.add(target_index)
+        rejected_hold.append(old)
+        if times[home_index] > slow_cut:
+            _SLOW_HOLD.append(old)
+        after[home_index] = times[target_index]
+        moved += 1
+    for i, spare in enumerate(spares):
+        idx = count + i
+        if idx not in used_targets:
+            rejected_hold.append(spare)
+            if times[idx] > slow_cut:
+                _SLOW_HOLD.append(spare)
+    before = sorted(times[:count])
+    after.sort()
+    return {
+        "count": count, "spares": len(spares), "moved": moved, "payload_bytes": max_bytes,
+        "before": (before[0], median(before), before[-1], sum(before)),
+        "after": (after[0], median(after), after[-1], sum(after)),
+    }
+
+
+def _place_bf16_rans_group(bf16_lib, layers, n: int, k: int, evict_buf: torch.Tensor, rejected_hold: list) -> dict | None:
+    homes = [layer._buffers["muse_bf16_lane_weight"] for layer in layers]
+    count = len(homes)
+    max_bytes = max(h.numel() for h in homes)
+    wanted = max(1, math.ceil(count * ATTN_SURPLUS)) if ATTN_SURPLUS > 0 else 0
+    spares_count = _ensure_spares_room(wanted, max_bytes, rejected_hold, allow_slow_trim=False)
+    if spares_count < count:
+        return None
+    min_idx = min(range(count), key=lambda i: homes[i].numel())
+    ref_blob = homes[min_idx].clone()
+    ref_len = ref_blob.numel()
+    saved_host = [h.detach().cpu() for h in homes]
+    spares = []
+    try:
+        for _ in range(spares_count):
+            spare = torch.empty((max_bytes,), dtype=torch.uint8, device=homes[0].device)
+            spare[:ref_len].copy_(ref_blob)
+            spares.append(spare)
+    except RuntimeError:
+        pass
+    if not spares:
+        return None
+    for h in homes:
+        h[:ref_len].copy_(ref_blob)
+    device = homes[0].device
+    x = torch.zeros((1, k), dtype=torch.bfloat16, device=device)
+    out = torch.empty((1, n), dtype=torch.bfloat16, device=device)
+
+    def run_cand(buf):
+        stream = torch.cuda.current_stream(device).cuda_stream
+        rc = bf16_lib.muse_bf16_rans_gemv(n, ref_len, x.data_ptr(), buf.data_ptr(), out.data_ptr(), stream)
+        if rc:
+            raise RuntimeError(f"muse_bf16_rans_gemv returned {rc}")
+
+    cand_views = [h[:ref_len] for h in homes] + [s[:ref_len] for s in spares]
+    try:
+        with torch.cuda.device(device):
+            times = _time_calls(run_cand, cand_views, ROUNDS, evict_buf)
+    except Exception:
+        for h, sh in zip(homes, saved_host):
+            h.copy_(sh, non_blocking=False)
+        raise
+    ranked = sorted(range(len(cand_views)), key=times.__getitem__)
+    kept = set(ranked[:count])
+    free_fast = [index for index in ranked[:count] if index >= count]
+    movers = sorted((index for index in range(count) if index not in kept), key=times.__getitem__, reverse=True)
+    for idx in kept:
+        if idx < count:
+            homes[idx].copy_(saved_host[idx], non_blocking=False)
+    moved = 0
+    after = list(times[:count])
+    used_targets = set()
+    slow_cut = median(times)
+    for home_index, target_index in zip(movers, free_fast):
+        source = homes[home_index]
+        real_dev = saved_host[home_index].to(device=device)
+        target_full = spares[target_index - count]
+        target = target_full[: source.numel()]
+        target.copy_(real_dev)
+        if not torch.equal(target, real_dev):
+            source.copy_(real_dev)
             continue
         old = source.data
         source.data = target
         if source.data_ptr() != target.data_ptr():
             source.data = old
+            source.copy_(real_dev)
             continue
         used_targets.add(target_index)
         rejected_hold.append(old)
@@ -289,14 +427,15 @@ def _time_calls(run, candidates, rounds: int, evict_buf: torch.Tensor | None = N
     return [median(values) for values in samples]
 
 
-def _place_prefill_group(
-    layers, run, on_move=None, evict_buf=None, rejected_hold=None, buf_name: str | None = None
-) -> dict | None:
+def _place_prefill_group(layers, run, on_move=None, evict_buf=None, rejected_hold=None,
+                         buf_name: str | None = None) -> dict | None:
     homes = [layer._buffers[buf_name] if buf_name else layer.weight.data for layer in layers]
     count = len(homes)
     payload_bytes = homes[0].numel() * homes[0].element_size()
     wanted = math.ceil(count * PREFILL_SURPLUS) if PREFILL_SURPLUS > 0 else 0
-    spares_count = _ensure_spares_room(wanted, payload_bytes, _SLOW_HOLD)
+    spares_count = _ensure_spares_room(
+        wanted, payload_bytes, rejected_hold if rejected_hold is not None else [], allow_slow_trim=True
+    )
     col_major = homes[0].dim() == 2 and homes[0].stride() == (1, homes[0].shape[0])
     spares = []
     try:
@@ -358,9 +497,6 @@ def _place_prefill_group(
 def place_prefill_weights(model: torch.nn.Module) -> None:
     """Move 512-row NVFP4 & FP8 MLP weights that landed on slow device memory; never raises."""
     if not PREFILL_ENABLED or not torch.cuda.is_available():
-        _SLOW_HOLD.clear()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         return
     began = time.perf_counter()
     rejected_hold: list[torch.Tensor] = []
@@ -449,7 +585,7 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
                 def run_gate(weight, ref=ref, x=x):
                     _swiglu.gemm(x, weight, ref.weight_scale, ref.weight_global_scale)
 
-            groups.append(("39936x6656", gate_layers, run_gate, getattr(_swiglu, "moved", None), fast, None))
+            groups.append(("39936x6656", gate_layers, run_gate, getattr(_swiglu, "moved", None), fast))
         if len(down_layers) > 1:
             ref = down_layers[0]
             plan = ref.marlin_prompt_path[2]
@@ -467,7 +603,7 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
                         raise RuntimeError("down kernel refused the probe input")
 
             groups.append((f"{_down.COLUMNS}x{_down.INNER}", down_layers, run_down,
-                           _route.down128_moved if _route is not None else None, fast, None))
+                           _route.down128_moved if _route is not None else None, fast))
         if len(fp8_down_layers) > 1:
             ref = fp8_down_layers[0]
             dev = ref.weight.device
@@ -479,22 +615,22 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             def run_fp8_down(weight, x=x, sa=sa, sb=sb, cfg_dn=cfg_dn):
                 _fp8pf.gemm(x, weight, sa, sb, cfg_dn)
 
-            groups.append(("fp8_6656x19968", fp8_down_layers, run_fp8_down, _gfp8.prefill_moved, False, None))
+            groups.append(("fp8_6656x19968", fp8_down_layers, run_fp8_down, _gfp8.prefill_moved, False))
         if len(fp8_swiglu_layers) > 1:
             ref = fp8_swiglu_layers[0]
             dev = ref._buffers["paired_fp8_swiglu_weight"].device
             x = torch.zeros((512, 6656), dtype=torch.float8_e4m3fn, device=dev)
             sa = ref.input_scale if getattr(ref, "input_scale", None) is not None else torch.ones((1,), dtype=torch.float32, device=dev)
-            sb = ref.weight_scale.reshape(1)
+            sb = ref.weight_scale
             ds = torch.ones((1,), dtype=torch.float32, device=dev)
 
             def run_fp8_sw(weight, x=x, sa=sa, sb=sb, ds=ds):
                 _fp8sw.apply(x, weight, sa, sb, ds)
 
-            groups.append(("fp8_swiglu_39936x6656", fp8_swiglu_layers, run_fp8_sw,
-                           None, False, "paired_fp8_swiglu_weight"))
-        for name, layers, run, on_move, fast, buf_name in groups:
+            groups.append(("fp8_swiglu_39936x6656", fp8_swiglu_layers, run_fp8_sw, None, False))
+        for name, layers, run, on_move, fast in groups:
             try:
+                buf_name = "paired_fp8_swiglu_weight" if name == "fp8_swiglu_39936x6656" else None
                 stats = _place_prefill_group(layers, run, on_move, evict_buf, rejected_hold, buf_name=buf_name)
             except Exception as err:  # noqa: BLE001 - this group stays where it was
                 logger.warning("Prefill weight placement skipped for %s: %s", name, err)
@@ -538,6 +674,9 @@ def place_decode_weights(model: torch.nn.Module) -> None:
         evict_buf = torch.empty((_L2_FLUSH_INTS,), dtype=torch.int32, device="cuda")
         groups: dict[tuple, list] = {}
         rans_groups: dict[tuple[int, int], list] = {}
+        attn_nvfp4_groups: dict[tuple, list] = {}
+        attn_rans_groups: dict[tuple[int, int], list] = {}
+        attn_bf16_groups: dict[tuple[int, int], list] = {}
         for layer in model.modules():
             bufs = getattr(layer, "_buffers", {})
             weight = bufs.get(_NAME)
@@ -545,13 +684,17 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                 weight is not None
                 and weight.is_cuda
                 and weight.is_contiguous()
-                and weight.numel() * weight.element_size() >= MIN_PAYLOAD_BYTES
                 and getattr(layer, "_marlin_decode_scales", None) is not None
                 and getattr(layer, "weight_global_scale", None) is not None
                 and getattr(layer, "workspace", None) is not None
             ):
+                nbytes = weight.numel() * weight.element_size()
                 n, k = layer.output_size_per_partition, layer.input_size_per_partition
-                groups.setdefault((n, k, tuple(weight.shape), weight.dtype, weight.device), []).append(layer)
+                key = (n, k, tuple(weight.shape), weight.dtype, weight.device)
+                if nbytes >= MIN_PAYLOAD_BYTES:
+                    groups.setdefault(key, []).append(layer)
+                elif PLACE_ATTN and nbytes >= ATTN_MIN_BYTES:
+                    attn_nvfp4_groups.setdefault(key, []).append(layer)
             rblob = bufs.get("muse_fp8_packed")
             if (
                 rblob is not None
@@ -559,13 +702,32 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                 and rblob.dtype == torch.uint8
                 and rblob.dim() == 1
                 and rblob.is_contiguous()
-                and rblob.numel() >= MIN_PAYLOAD_BYTES
                 and getattr(layer, "weight_scale", None) is not None
             ):
                 n = getattr(layer, "output_size_per_partition", 0)
                 k = getattr(layer, "input_size_per_partition", 0)
                 if n > 0 and k > 0:
-                    rans_groups.setdefault((n, k), []).append(layer)
+                    if rblob.numel() >= MIN_PAYLOAD_BYTES:
+                        rans_groups.setdefault((n, k), []).append(layer)
+                    elif PLACE_ATTN and rblob.numel() >= ATTN_MIN_BYTES:
+                        attn_rans_groups.setdefault((n, k), []).append(layer)
+            bblob = bufs.get("muse_bf16_lane_weight")
+            bidx = bufs.get("muse_bf16_lane_index")
+            if (
+                PLACE_ATTN
+                and bblob is not None
+                and bidx is not None
+                and bidx.numel() == 1
+                and bblob.is_cuda
+                and bblob.dtype == torch.uint8
+                and bblob.dim() == 1
+                and bblob.is_contiguous()
+                and bblob.numel() >= ATTN_MIN_BYTES
+            ):
+                n = getattr(layer, "output_size_per_partition", 0)
+                k = getattr(layer, "input_size_per_partition", 0)
+                if n > 0 and k > 0:
+                    attn_bf16_groups.setdefault((n, k), []).append(layer)
         saved_ms = 0.0
         n_groups = 0
         # Place largest total-payload groups first (gate_up -> down -> lm_head) while holding rejected slow buffers.
@@ -601,7 +763,7 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             if _rans_ext is not None:
                 ordered_rans = sorted(
                     rans_groups.items(),
-                    key=lambda kv: -(len(kv[1]) * max(layer._buffers["muse_fp8_packed"].numel() for layer in kv[1])),
+                    key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_fp8_packed"].numel() for l in kv[1])),
                 )
                 for (n, k), layers in ordered_rans:
                     try:
@@ -620,6 +782,80 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                         n, k, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
                         b[0], b[1], b[2], a[0], a[1], a[2], b[3], a[3],
                     )
+        if PLACE_ATTN and attn_bf16_groups:
+            try:
+                import muse_bf16_lane as _bf16_mod
+                _bf16_lib = _bf16_mod._lib()
+            except (ImportError, OSError, AttributeError):
+                _bf16_lib = None
+            if _bf16_lib is not None and hasattr(_bf16_lib, "muse_bf16_rans_gemv"):
+                for (n, k), layers in sorted(
+                    attn_bf16_groups.items(),
+                    key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_bf16_lane_weight"].numel() for l in kv[1])),
+                ):
+                    try:
+                        stats = _place_bf16_rans_group(_bf16_lib, layers, n, k, evict_buf, rejected_hold)
+                    except Exception as err:  # noqa: BLE001
+                        logger.warning("Decode BF16 rANS attn placement skipped for %dx%d: %s", n, k, err)
+                        continue
+                    if stats is None:
+                        continue
+                    n_groups += 1
+                    b, a = stats["before"], stats["after"]
+                    saved_ms += b[3] - a[3]
+                    logger.info(
+                        "Decode BF16 rANS attn placement %dx%d: %d weights of ~%.0f MiB, %d spare buffers, %d moved; "
+                        "GEMV ms min/median/max %.4f/%.4f/%.4f -> %.4f/%.4f/%.4f, sum %.3f -> %.3f ms",
+                        n, k, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
+                        b[0], b[1], b[2], a[0], a[1], a[2], b[3], a[3],
+                    )
+        if PLACE_ATTN and attn_rans_groups:
+            try:
+                import muse_rans_ext as _rans_ext
+            except (ImportError, OSError):
+                _rans_ext = None
+            if _rans_ext is not None:
+                for (n, k), layers in sorted(
+                    attn_rans_groups.items(),
+                    key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_fp8_packed"].numel() for l in kv[1])),
+                ):
+                    try:
+                        stats = _place_muserans_group(_rans_ext, layers, n, k, evict_buf, rejected_hold)
+                    except Exception as err:  # noqa: BLE001
+                        logger.warning("Decode rANS attn placement skipped for %dx%d: %s", n, k, err)
+                        continue
+                    if stats is None:
+                        continue
+                    n_groups += 1
+                    b, a = stats["before"], stats["after"]
+                    saved_ms += b[3] - a[3]
+                    logger.info(
+                        "Decode rANS attn placement %dx%d: %d weights of ~%.0f MiB, %d spare buffers, %d moved; "
+                        "GEMV ms min/median/max %.4f/%.4f/%.4f -> %.4f/%.4f/%.4f, sum %.3f -> %.3f ms",
+                        n, k, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
+                        b[0], b[1], b[2], a[0], a[1], a[2], b[3], a[3],
+                    )
+        if PLACE_ATTN and attn_nvfp4_groups:
+            for (n, k, *_), layers in sorted(
+                attn_nvfp4_groups.items(),
+                key=lambda kv: -(len(kv[1]) * kv[1][0]._buffers[_NAME].numel()),
+            ):
+                try:
+                    stats = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
+                except Exception as err:  # noqa: BLE001
+                    logger.warning("Decode NVFP4 attn placement skipped for %dx%d: %s", n, k, err)
+                    continue
+                if stats is None:
+                    continue
+                n_groups += 1
+                b, a = stats["before"], stats["after"]
+                saved_ms += b[3] - a[3]
+                logger.info(
+                    "Decode NVFP4 attn placement %dx%d: %d weights of %.0f MiB, %d spare buffers, %d moved; "
+                    "GEMV ms min/median/max %.4f/%.4f/%.4f -> %.4f/%.4f/%.4f, sum %.3f -> %.3f ms",
+                    n, k, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
+                    b[0], b[1], b[2], a[0], a[1], a[2], b[3], a[3],
+                )
         logger.info(
             "Decode weight placement: %d groups, timed GEMV sum reduced by %.3f ms per token, %.2f s",
             n_groups, saved_ms, time.perf_counter() - began,

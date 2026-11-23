@@ -305,6 +305,7 @@ __device__ __forceinline__ void down_tile(
   // Runs before k-tile t; returns the k-tile before which it has to run again (the next cut, or the end).
   auto cuts = [&](const int t) {
     if (t == cut_a || t == cut_b) {
+      __syncthreads();
 #pragma unroll
       for (int i = 0; i < MB; i++) {
         const int ci = i < n_first ? cut_a : cut_b;
@@ -315,6 +316,7 @@ __device__ __forceinline__ void down_tile(
           for (int e = 0; e < 16; e++) reinterpret_cast<float*>(acc[i])[e] = 0.0f;
         }
       }
+      __syncthreads();
     }
     int stop = k1;
     if (cut_a > t && cut_a < stop) stop = cut_a;

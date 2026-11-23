@@ -42,7 +42,7 @@ def _lib():
         native.muse_bf16_rans_pass1.restype = ctypes.c_int
         native.muse_bf16_rans_pass2.argtypes = [ptr, ctypes.c_int, ctypes.c_int, ctypes.c_int, ptr, ptr, ptr, ptr, ptr]
         native.muse_bf16_rans_pass2.restype = ctypes.c_int
-        native.muse_bf16_rans_gemv.argtypes = [ctypes.c_int, ptr, ptr, ptr, ptr]
+        native.muse_bf16_rans_gemv.argtypes = [ctypes.c_int, ctypes.c_size_t, ptr, ptr, ptr, ptr]
         native.muse_bf16_rans_gemv.restype = ctypes.c_int
     return native
 
@@ -53,7 +53,7 @@ def _launch(x, payload, index, n):
         stream = torch.cuda.current_stream(x.device)
         if index.numel() == 1:
             error = _lib().muse_bf16_rans_gemv(
-                n, x.data_ptr(), payload.data_ptr(), out.data_ptr(), stream.cuda_stream,
+                n, payload.numel(), x.data_ptr(), payload.data_ptr(), out.data_ptr(), stream.cuda_stream,
             )
         else:
             error = _lib().muse_bf16_lane_gemv(
@@ -193,8 +193,11 @@ def _decode(x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor,
         return F.linear(x, weight)
     if not _stats["logged"]:
         _stats["logged"] = True
-        logger.info("muse_bf16_lane decode GEMV: %d admitted (%d rANS), %d rejected, %d packed bytes",
-                    _stats["admitted"], _stats["rans"], _stats["rejected"], _stats["bytes"])
+        tpf_kb = os.environ.get("MUSE_BF16_TLB_PREFETCH", "2048")
+        gate_blks = 32 if os.environ.get("MUSE_BF16_GATE_32_BLOCKS", "1") != "0" else 48
+        logger.info("muse_bf16_lane decode GEMV: %d admitted (%d rANS), %d rejected, %d packed bytes "
+                    "(translation prefetch %s KiB, gate %d blocks)",
+                    _stats["admitted"], _stats["rans"], _stats["rejected"], _stats["bytes"], tpf_kb, gate_blks)
     return _launch(x, packed, index, n)
 
 

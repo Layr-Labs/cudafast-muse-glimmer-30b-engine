@@ -59,6 +59,11 @@ BLOCKS = int(os.environ.get("L2PF_BLOCKS", "1"))
 MLP = os.environ.get("L2PF_MLP", "1") != "0"
 BYTES_MLP_NORM = _env_bytes("L2PF_MB_MLP_NORM", (9 << 20) // 4)
 BYTES_MLP_ACT = _env_bytes("L2PF_MB_MLP_ACT", 1 << 19)
+TLB_PREFETCH = os.environ.get("L2PF_TLB", "1") != "0"
+TLB_RANS_HEAD = int(os.environ.get("L2PF_TLB_RANS_HEAD_KB", "32")) << 10
+TLB_STRIDE = int(os.environ.get("L2PF_TLB_STRIDE_KB", "2048")) << 10
+TLB_ALL = os.environ.get("L2PF_TLB_ALL", "1") != "0"
+TLB_UNASSISTED = os.environ.get("L2PF_TLB_UNASSISTED", "0") != "0"
 
 # Compressed one-row projections measured with the same captured stream edges.
 _RANS_SKIP_PREFETCH = {
@@ -102,6 +107,21 @@ def head_descs(t: torch.Tensor, nbytes: int) -> list[tuple[int, int, int, int]]:
     if rem:
         out.append((base + full * CHUNK, 0, rem, 1))
     return out
+
+
+def tlb_descs(t: torch.Tensor, start_bytes: int = 0, stride: int = TLB_STRIDE,
+              seg: int = 128) -> list[tuple[int, int, int, int]]:
+    """One small bulk prefetch per stride across t to warm GMMU page-table entries on the side stream."""
+    if stride <= 0 or seg <= 0 or seg % 16:
+        return []
+    base, span = _dense_span(t)
+    if base % 16 or span <= stride:
+        return []
+    first = ((max(int(start_bytes), stride) + stride - 1) // stride) * stride
+    if first + seg > span:
+        return []
+    cnt = (span - seg - first) // stride + 1
+    return [(base + first, stride, seg, cnt)]
 
 
 def marlin_stripe_starts(n: int, k: int, sms: int, thread_k: int = 128,
@@ -432,7 +452,10 @@ class Session:
             if wbytes > MAX_WEIGHT:
                 self._prev_big = True
                 site.mlp = "act" if prev_big else "norm"
-                site.descs = weight_descs(ws, mlp_budget(len(ws), prev_big))
+                mb_b = mlp_budget(len(ws), prev_big)
+                site.descs = weight_descs(ws, mb_b)
+                if TLB_PREFETCH and (kind == "musefp8" or TLB_ALL):
+                    site.descs += tlb_descs(ws[0], mb_b, TLB_STRIDE)
             else:
                 nbytes = budget(wbytes, site.after_attn)
                 if kind == "musefp8":
@@ -451,7 +474,12 @@ class Session:
                             and a.is_contiguous() and index.numel() == 1):
                         nbytes = 0
                         site.unassisted = True
-                site.descs = weight_descs(ws, nbytes)
+                if site.unassisted and TLB_PREFETCH and TLB_UNASSISTED:
+                    site.descs = head_descs(ws[0], TLB_RANS_HEAD) + tlb_descs(ws[0], TLB_RANS_HEAD, TLB_STRIDE)
+                else:
+                    site.descs = weight_descs(ws, nbytes)
+                    if not site.unassisted and TLB_PREFETCH and (kind in ("musefp8", "muse_bf16_lane") or TLB_ALL):
+                        site.descs += tlb_descs(ws[0], nbytes, TLB_STRIDE)
             if self.ranges is not None and not _inside(site.descs, self.ranges):
                 site.descs = []
         except Exception:  # noqa: BLE001 - a site without ranges is still a site

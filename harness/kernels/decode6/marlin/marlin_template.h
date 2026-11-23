@@ -243,7 +243,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           // into a 64-entry per-layer palette (3/4 of the bytes); only the
           // M = 1 NVFP4 decode configuration supports it.
           const bool scale6 = false,
-          const bool gate_up_grid = false>
+          const bool gate_up_grid = false,
+          const bool down_ilv = false>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -273,10 +274,9 @@ __global__ void Marlin(
     bool use_fp32_reduce,  // whether to use fp32 global reduce
     int max_shared_mem,
     // scale6 only: 64 palette bytes (16-byte aligned) of this layer's codes
-    const int4* __restrict__ scale6_palette) {
+    const int4* __restrict__ scale6_palette,
+    size_t tpf_stride = 0) {
   if constexpr (scale6) {
-    // Every decode6 kernel runs for M = 1 without bias or atomic add; propagating these as
-    // compile-time constants avoids spilling frag_bias to local memory on non-gate_up layers.
     prob_m = 1;
     lda = prob_k;
     num_groups = prob_k >> 4;
@@ -667,8 +667,15 @@ __global__ void Marlin(
     b_gl_rd += b_gl_rd_delta_o * slice_row;
   }
 #else
-  b_gl_rd += b_sh_stride * tile_column_stride * slice_col;
-  b_gl_rd += b_gl_rd_delta_o * slice_row;
+  if constexpr (down_ilv) {
+    // Stage-interleaved 48-CTA stream-K down layout: flat stage 169*b + s lives at chunk 48*s + b,
+    // so at every stage all 48 SMs read 384 KiB of contiguous DRAM and l2pf's 512 KiB head warms all 48 SMs.
+    b_gl_rd += b_gl_rd_delta_o * blockIdx.x;
+    b_gl_rd_delta_o *= 48;
+  } else {
+    b_gl_rd += b_sh_stride * tile_column_stride * slice_col;
+    b_gl_rd += b_gl_rd_delta_o * slice_row;
+  }
 #endif
   auto b_sh_rd = threadIdx.x * b_thread_vecs;
   b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_wr_iters - 1));
@@ -847,21 +854,135 @@ __global__ void Marlin(
     if (threadIdx.x < 4)
       reinterpret_cast<int4*>(sh_pal)[threadIdx.x] = scale6_palette[threadIdx.x];
   }
+#ifdef MUSE_SCALE_TMA4
+  // 4-stage TMA super-block rANS block scales (gemv6_tma4.cu): hardware cp.async.bulk with 2 alternating
+  // super-block slots, 4x fewer TMA/mbarrier ops, zero block0/1 header bloat, global L1-cached off16[].
+  // Supports gate_up (336x256T), down (48x256T), and lm_head (48x128T).
+  static_assert(scale6 && (threads == 256 || threads == 128),
+                "TMA4 rANS scales require M = 1 decode config (128 or 256 threads)");
+  constexpr int kTmaWarps = threads / 32;
+  constexpr int RANS_CAP = (threads == 256) ? 3072 : 2048;
+  uint32_t* sh_states = reinterpret_cast<uint32_t*>(sh_pal + 64);
+  unsigned char* sh_rslot = reinterpret_cast<unsigned char*>(sh_states + threads);
+  uint32_t* sh_rlut = reinterpret_cast<uint32_t*>(sh_rslot + 2 * RANS_CAP);
+  uint64_t* sh_rbar = reinterpret_cast<uint64_t*>(sh_rlut + 1024);
+  const uint32_t* tma_u32 = reinterpret_cast<const uint32_t*>(g_idx);
+  const uint32_t* tma_blk_sb = tma_u32 + 1024;
+  const uint32_t* tma_blk_it = tma_blk_sb + (gridDim.x + 1);
+  const size_t tma_meta_u32 = ((static_cast<size_t>(2 * gridDim.x + 1) + 3) / 4) * 4;
+  const uint32_t* tma_off16 = tma_u32 + 1024 + tma_meta_u32;
+  const uint32_t tma_sb_base = tma_blk_sb[blockIdx.x];
+  const int tma_num_sbs = static_cast<int>(tma_blk_sb[blockIdx.x + 1] - tma_sb_base);
+  const int tma_iters = static_cast<int>(tma_blk_it[blockIdx.x]);
+  const unsigned char* tma_var_g = reinterpret_cast<const unsigned char*>(zp_ptr);
+  int tma_slice_base = 0, tma_done = 0, tma_q = 0;
+  bool tma_started = false;
+  uint32_t tma_x = 0;
+  const uint16_t* tma_wp = nullptr;
+  auto tma_bar = [&](int i) { return static_cast<uint32_t>(__cvta_generic_to_shared(sh_rbar + i)); };
+  auto tma_bulk = [&](void* dst, const void* src, int bytes, int bar) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(tma_bar(bar)), "r"(bytes) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                     static_cast<uint32_t>(__cvta_generic_to_shared(dst))),
+                 "l"(src), "r"(bytes), "r"(tma_bar(bar))
+                 : "memory");
+  };
+  auto tma_wait = [&](int bar, uint32_t parity) {
+    asm volatile(
+        "{\n\t.reg .pred P1;\n\tTMA4_WAIT_%=:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n\t"
+        "@!P1 bra TMA4_WAIT_%=;\n\t}" ::"r"(tma_bar(bar)), "r"(parity) : "memory");
+  };
+  auto tma_issue = [&](int sb) {
+    const uint32_t gsb = tma_sb_base + sb;
+    const uint32_t o0 = __ldg(tma_off16 + gsb);
+    const uint32_t o1 = __ldg(tma_off16 + gsb + 1);
+    const int bytes = static_cast<int>(o1 - o0) * 16;
+    const int slot = sb & 1;
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    tma_bulk(sh_rslot + slot * RANS_CAP, tma_var_g + static_cast<size_t>(o0) * 16, bytes, 1 + slot);
+  };
+  if (threadIdx.x == 0) {
+  #pragma unroll
+    for (int i = 0; i < 3; i++)
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(tma_bar(i)) : "memory");
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(tma_bar(0)),
+                 "r"(4096 + threads * 4) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                     static_cast<uint32_t>(__cvta_generic_to_shared(sh_rlut))),
+                 "l"(g_idx), "r"(4096), "r"(tma_bar(0)) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                     static_cast<uint32_t>(__cvta_generic_to_shared(sh_states))),
+                 "l"(reinterpret_cast<const unsigned char*>(scales_ptr) +
+                     static_cast<size_t>(blockIdx.x) * threads * 4),
+                 "r"(threads * 4), "r"(tma_bar(0)) : "memory");
+    if (tma_num_sbs > 0) tma_issue(0);
+    if (tma_num_sbs > 1) tma_issue(1);
+  }
+  auto tma_decode = [&](int X) {
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if ((X & 3) == 0) {
+      const int sb = X >> 2;
+      const int slot = sb & 1;
+      if (sb > 0 && threadIdx.x == 0 && sb + 1 < tma_num_sbs) tma_issue(sb + 1);
+      tma_wait(1 + slot, static_cast<uint32_t>((sb >> 1) & 1));
+      const unsigned char* blk = sh_rslot + slot * RANS_CAP;
+      const uint16_t* cw = reinterpret_cast<const uint16_t*>(blk);
+      int start = kTmaWarps;
+  #pragma unroll
+      for (int i = 0; i < kTmaWarps - 1; i++) start += i < w ? cw[i] : 0;
+      tma_wp = reinterpret_cast<const uint16_t*>(blk) + start;
+    }
+    uint8_t* dst = reinterpret_cast<uint8_t*>(sh_s + s_sh_stage * (X & (stages - 1))) + 128 * w + lane;
+    const uint32_t lt = (1u << lane) - 1u;
+  #pragma unroll
+    for (int m = 0; m < 4; m++) {
+      const uint32_t e = sh_rlut[tma_x & 1023u];
+      tma_x = ((e >> 6) & 2047u) * (tma_x >> 10) + (e >> 17);
+      dst[32 * m] = sh_pal[e & 63u];
+      const bool need = tma_x < 65536u;
+      const uint32_t msk = __ballot_sync(0xffffffffu, need);
+      if (need) tma_x = (tma_x << 16) | tma_wp[__popc(msk & lt)];
+      tma_wp += __popc(msk);
+    }
+  };
+#endif
 #ifdef MUSE_SCALE_RANS
-  // rANS-coded block scales for M = 1 NVFP4 MLP projections (336-CTA gate/up and 48-CTA stream-K down_proj).
-  // Per-CTA header in scales_ptr (RANS_HDR bytes): u32 states[256], u32 off16[64 or 176], block 0, block 1 (each RANS_CAP bytes).
-  // zp_ptr: variable region (blocks X >= 2); g_idx: u32[1024] decode table (symbol | freq << 6 | (slot - cum) << 17).
-  static_assert(scale6 && threads == 256, "rANS scales require 256-thread TileN=128 M = 1 decode config");
-  constexpr int RANS_CAP = 704;
-  constexpr int RANS_B0_OFF = gate_up_grid ? 1280 : 1728;
-  constexpr int RANS_HDR = RANS_B0_OFF + 2 * RANS_CAP;
+  // rANS-coded block scales (fixed gate/up grid only; muse_marlin6_gemv.encode_gate_up_scales, gemv6_srans.cu).
+  // Global operands, carried in pointer arguments this configuration does not otherwise use:
+  //   scales_ptr: per-CTA headers, RANS_HDR bytes each: u32 states[256] (warp-major), u32 off16[64]
+  //               (block X >= 2 starts at var + 16 off16[X]; off16[iters] ends the last), block 0, block 1
+  //   zp_ptr:     the variable region (blocks X >= 2 of every CTA)
+  //   g_idx:      the layer's decode table, u32[1024]: symbol | freq << 6 | (slot - cum) << 17
+  // A block (one k-stage of the CTA's slice): u8 count[8] (16-bit words per warp), then the words of warp 0..7.
+  // Warp w decodes bytes 128 w + lane + 32 m (m = 0..3) of the stage's 1 KB raw scale block into the 8-bit
+  // scale slot of that stage; consumers then read raw scale bytes exactly as the uncompressed kernel does.
+#ifdef MUSE_SCALE_RANS_SK
+  // stream-K variant (one-row down projection, 48 CTAs): a CTA's stages run across up to two column slices; its
+  // rANS lanes, block stream and scale-slot ring continue across the slice boundary (global stage index X), the
+  // header holds 192 block offsets, and the consumers address the slot of global stage X.
+  static_assert(!gate_up_grid && scale6 && threads == 256 && thread_n_blocks == 8,
+                "stream-K rANS scales are built for the one-row 128-column decode configuration");
+  constexpr int RANS_HDR = 3840, RANS_CAP = 1024, RANS_BLK0 = 1792;
+#else
+  static_assert(gate_up_grid && scale6, "rANS scales are built for the fixed gate/up grid only");
+  constexpr int RANS_HDR = 3328, RANS_CAP = 1024;
+#endif
   unsigned char* sh_rhdr = sh_pal + 64;
   unsigned char* sh_rslot = sh_rhdr + RANS_HDR;
   uint32_t* sh_rlut = reinterpret_cast<uint32_t*>(sh_rslot + stages * RANS_CAP);
   uint64_t* sh_rbar = reinterpret_cast<uint64_t*>(sh_rlut + 1024);
   const unsigned char* rans_var_g = reinterpret_cast<const unsigned char*>(zp_ptr);
+#ifdef MUSE_SCALE_RANS_SK
+  const int rans_iters = min(iters, k_tiles * part2_mn_tiles - static_cast<int>(blockIdx.x) * iters);
+  int rans_slice_base = 0, rans_done = 0;
+  bool rans_started = false;
+#else
+  const int rans_iters = slice_iters;
+#endif
   uint32_t rans_x = 0;
-  int rans_gx = 0, rans_sbase = 0, rans_siters = 0, rans_lq = 0;
+  int rans_q = 0;
   auto rans_bar = [&](int i) { return static_cast<uint32_t>(__cvta_generic_to_shared(sh_rbar + i)); };
   auto rans_bulk = [&](void* dst, const void* src, int bytes, int bar) {
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(rans_bar(bar)), "r"(bytes) : "memory");
@@ -876,12 +997,13 @@ __global__ void Marlin(
         "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n\t"
         "@!P1 bra RANS_WAIT_%=;\n\t}" ::"r"(rans_bar(bar)), "r"(parity) : "memory");
   };
+  // block X >= 2 into slot X % stages; the slot's previous block was decoded two barriers earlier
   auto rans_issue = [&](int X) {
     const uint32_t* off = reinterpret_cast<const uint32_t*>(sh_rhdr + 1024);
     const int bytes = static_cast<int>(off[X + 1] - off[X]) * 16;
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    rans_bulk(sh_rslot + (X & 3) * RANS_CAP, rans_var_g + static_cast<size_t>(off[X]) * 16, bytes,
-              1 + (X & 3));
+    rans_bulk(sh_rslot + (X % stages) * RANS_CAP, rans_var_g + static_cast<size_t>(off[X]) * 16, bytes,
+              1 + X % stages);
   };
   if (threadIdx.x == 0) {
   #pragma unroll
@@ -900,14 +1022,18 @@ __global__ void Marlin(
                  "l"(g_idx), "r"(4096), "r"(rans_bar(0))
                  : "memory");
   }
-  auto rans_decode = [&](int X, int dst_slot) {
-    const unsigned char* blk = X < 2 ? sh_rhdr + RANS_B0_OFF + X * RANS_CAP : sh_rslot + (X & 3) * RANS_CAP;
+  auto rans_decode = [&](int X) {
+#ifdef MUSE_SCALE_RANS_SK
+    const unsigned char* blk = X < 2 ? sh_rhdr + RANS_BLK0 + X * RANS_CAP : sh_rslot + (X % stages) * RANS_CAP;
+#else
+    const unsigned char* blk = X < 2 ? sh_rhdr + 1280 + X * RANS_CAP : sh_rslot + (X % stages) * RANS_CAP;
+#endif
     const int w = threadIdx.x / 32, lane = threadIdx.x % 32;
     int start = 4;
   #pragma unroll
     for (int i = 0; i < 7; i++) start += i < w ? blk[i] : 0;
     const uint16_t* words = reinterpret_cast<const uint16_t*>(blk) + start;
-    uint8_t* dst = reinterpret_cast<uint8_t*>(sh_s + s_sh_stage * dst_slot) + 128 * w + lane;
+    uint8_t* dst = reinterpret_cast<uint8_t*>(sh_s + s_sh_stage * (X % stages)) + 128 * w + lane;
     const uint32_t lt = (1u << lane) - 1u;
     int pos = 0;
   #pragma unroll
@@ -1051,11 +1177,10 @@ __global__ void Marlin(
         }
       } else {
         if constexpr (group_blocks != -1) {
-          int4* sh_s_stage = sh_s + s_sh_stage * pipe;
-
           // Only fetch scales if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
-#ifndef MUSE_SCALE_RANS
+#if !defined(MUSE_SCALE_RANS) && !defined(MUSE_SCALE_TMA4)
+            int4* sh_s_stage = sh_s + s_sh_stage * pipe;
             if (s_sh_wr_pred) {
               cp_async4_stream(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
             }
@@ -1173,13 +1298,19 @@ __global__ void Marlin(
           int k_blocks = b_sh_wr_iters * warp_row + k % b_sh_wr_iters;
           int cur_group_id = k_blocks / group_blocks2;
 
+#ifdef MUSE_SCALE_RANS_SK
+          int4* sh_s_stage = sh_s + s_sh_stage * ((rans_slice_base + pipe) & (stages - 1));
+#elif defined(MUSE_SCALE_TMA4)
+          int4* sh_s_stage = sh_s + s_sh_stage * ((tma_slice_base + pipe) & (stages - 1));
+#else
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
+#endif
 
           if constexpr (!is_8bit_scale) {
             reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
                 sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
           } else if constexpr (scale6) {
-#ifdef MUSE_SCALE_RANS
+#if defined(MUSE_SCALE_RANS) || defined(MUSE_SCALE_TMA4)
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] = reinterpret_cast<int2*>(
                 sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
 #else
@@ -1945,17 +2076,15 @@ __global__ void Marlin(
   };
 
   // Start global fetch and register load pipelines.
+  [[maybe_unused]] bool tlb_done = false;
   auto start_pipes = [&]() {
-#ifdef MUSE_SCALE_RANS
-    if constexpr (!gate_up_grid) {
-      if (rans_gx > 0) {
-        __syncthreads();
-        if (threadIdx.x == 0) {
-          rans_issue(rans_gx);
-          if (slice_iters > 1) rans_issue(rans_gx + 1);
-        }
-      }
-    }
+#ifdef MUSE_SCALE_RANS_SK
+    rans_slice_base = rans_done;
+    rans_done += slice_iters;
+#endif
+#ifdef MUSE_SCALE_TMA4
+    tma_slice_base = tma_done;
+    tma_done += slice_iters;
 #endif
 
   #pragma unroll
@@ -1980,32 +2109,72 @@ __global__ void Marlin(
       fetch_to_shared(i, i, i < slice_iters);
     }
 
-    zero_accums();
-    wait_for_stage();
-#ifdef MUSE_SCALE_RANS
-    rans_sbase = rans_gx;
-    rans_siters = slice_iters;
-    rans_lq = 0;
-    if (rans_gx == 0) {
-      rans_wait(0, 0);
-      rans_x = reinterpret_cast<const uint32_t*>(sh_rhdr)[threadIdx.x];
-      rans_decode(0, 0);
-      if (rans_siters > 1) rans_decode(1, 1);
-    } else {
-      rans_wait(1 + (rans_gx & 3), static_cast<uint32_t>(((rans_gx - 2) >> 2) & 1));
-      rans_decode(rans_gx, 0);
-      if (rans_siters > 1) {
-        const int X1 = rans_gx + 1;
-        rans_wait(1 + (X1 & 3), static_cast<uint32_t>(((X1 - 2) >> 2) & 1));
-        rans_decode(X1, 1);
+    if constexpr (scale6) {
+      if (blockIdx.x == 0 && !tlb_done && tpf_stride > 0) {
+        tlb_done = true;
+        const uint8_t* b_base = reinterpret_cast<const uint8_t*>(B);
+        const size_t b_bytes = (static_cast<size_t>(prob_n) * static_cast<size_t>(prob_k)) >> 1;
+        for (size_t off = static_cast<size_t>(threadIdx.x) * tpf_stride; off < b_bytes;
+             off += static_cast<size_t>(threads) * tpf_stride) {
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(b_base + off));
+        }
+#ifdef MUSE_SCALE_TMA4
+        const uint32_t tot_sbs = tma_blk_sb[gridDim.x];
+        const size_t s_bytes = static_cast<size_t>(tma_off16[tot_sbs]) * 16u;
+        for (size_t off = static_cast<size_t>(threadIdx.x) * tpf_stride; off < s_bytes;
+             off += static_cast<size_t>(threads) * tpf_stride) {
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(tma_var_g + off));
+        }
+#elif !defined(MUSE_SCALE_RANS)
+        const uint8_t* s_base = reinterpret_cast<const uint8_t*>(scales_ptr);
+        const size_t s_bytes = ((static_cast<size_t>(prob_n) * static_cast<size_t>(prob_k)) >> 4) * 3u / 4u;
+        for (size_t off = static_cast<size_t>(threadIdx.x) * tpf_stride; off < s_bytes;
+             off += static_cast<size_t>(threads) * tpf_stride) {
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(s_base + off));
+        }
+#endif
       }
     }
-    if (threadIdx.x == 0) {
-      if (rans_siters > 2) rans_issue(rans_gx + 2);
-      if (rans_siters > 3) rans_issue(rans_gx + 3);
+
+    zero_accums();
+    wait_for_stage();
+#ifdef MUSE_SCALE_TMA4
+    if (!tma_started) {
+      tma_started = true;
+      tma_wait(0, 0);
+      tma_x = sh_states[threadIdx.x];
+      if (tma_iters > 0) tma_decode(0);
+      if (tma_iters > 1) tma_decode(1);
+      __syncthreads();
     }
-    rans_gx += rans_siters;
+#endif
+#ifdef MUSE_SCALE_RANS
+  #ifdef MUSE_SCALE_RANS_SK
+    if (rans_started) {
+      // a later slice: entering its first stage is one more stage boundary of the CTA's stream
+      rans_q++;
+      if (rans_q + 1 < rans_iters) {
+        const int X = rans_q + 1;
+        if (X >= 2) rans_wait(1 + X % stages, static_cast<uint32_t>(((X - 2) / 4) & 1));
+        rans_decode(X);
+      }
+      if (threadIdx.x == 0 && rans_q + 3 < rans_iters) rans_issue(rans_q + 3);
+      __syncthreads();
+    } else {
+      rans_started = true;
+  #endif
+    rans_wait(0, 0);
+    rans_x = reinterpret_cast<const uint32_t*>(sh_rhdr)[threadIdx.x];
+    rans_decode(0);
+    if (rans_iters > 1) rans_decode(1);
+    if (threadIdx.x == 0) {
+      if (rans_iters > 2) rans_issue(2);
+      if (rans_iters > 3) rans_issue(3);
+    }
     __syncthreads();
+  #ifdef MUSE_SCALE_RANS_SK
+    }
+  #endif
 #endif
     init_same_group(0);
     fetch_to_registers(0, 0);
@@ -2039,14 +2208,20 @@ __global__ void Marlin(
                           slice_iters >= stages);
           pipe++;
           wait_for_stage();
+#ifdef MUSE_SCALE_TMA4
+          tma_q++;
+          if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
+#endif
 #ifdef MUSE_SCALE_RANS
-          rans_lq++;
-          if (rans_lq + 1 < rans_siters) {
-            const int X = rans_sbase + rans_lq + 1;
-            if (X >= 2) rans_wait(1 + (X & 3), static_cast<uint32_t>(((X - 2) >> 2) & 1));
-            rans_decode(X, (rans_lq + 1) & 3);
+          // entering stage rans_q: decode stage rans_q + 1 (its block was issued two stages ago),
+          // then issue block rans_q + 3 into the slot of the block decoded two barriers ago
+          rans_q++;
+          if (rans_q + 1 < rans_iters) {
+            const int X = rans_q + 1;
+            if (X >= 2) rans_wait(1 + X % stages, static_cast<uint32_t>(((X - 2) / 4) & 1));
+            rans_decode(X);
           }
-          if (threadIdx.x == 0 && rans_lq + 3 < rans_siters) rans_issue(rans_sbase + rans_lq + 3);
+          if (threadIdx.x == 0 && rans_q + 3 < rans_iters) rans_issue(rans_q + 3);
 #endif
           init_same_group(pipe % stages);
         }
@@ -2282,9 +2457,11 @@ __global__ void Marlin(
         a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) +
                   (threadIdx.x % a_gl_rd_delta_o);
         a_gl_rd += a_gl_rd_delta_o * slice_row;
-        b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride) +
-                  (threadIdx.x % b_sh_stride);
-        b_gl_rd += b_sh_stride * tile_column_stride * slice_col + b_gl_rd_delta_o * slice_row;
+        if constexpr (!down_ilv) {
+          b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride) +
+                    (threadIdx.x % b_sh_stride);
+          b_gl_rd += b_sh_stride * tile_column_stride * slice_col + b_gl_rd_delta_o * slice_row;
+        }
 
         bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;
         // Update slice k/n for scales loading

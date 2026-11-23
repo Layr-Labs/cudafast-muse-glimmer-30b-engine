@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
@@ -269,11 +270,23 @@ __global__ void bf16_enc_pass2_kernel(const uint16_t* __restrict__ W, int rows, 
   }
 }
 
+static size_t bf16_tpf_stride() {
+  static size_t stride = []() -> size_t {
+    const char* env = std::getenv("MUSE_BF16_TLB_PREFETCH");
+    if (!env || !*env) return 2048u << 10;
+    long kb = std::strtol(env, nullptr, 10);
+    return kb > 0 ? (static_cast<size_t>(kb) << 10) : 0u;
+  }();
+  return stride;
+}
+
 __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
     const uint16_t* __restrict__ x_in,
     const uint8_t* __restrict__ blob,
     uint16_t* __restrict__ out,
-    int rows) {
+    int rows,
+    size_t blob_bytes,
+    size_t tpf_stride) {
   // Blob layout (self-describing, no host sync needed on launch):
   //   [0..4096):    u32 lut[1024] = hi_byte | (freq << 8) | ((slot - cum) << 19)
   //   [4096..4112): u32 meta[4]   = {rows, tw, gmin, soff}
@@ -286,7 +299,7 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
   __shared__ __align__(16) uint16_t sh_x[kWidth];
   extern __shared__ __align__(16) unsigned char smem[];
 
-  const int tid = threadIdx.x, lane = tid & 31, wib = tid >> 5, wpb = blockDim.x >> 5;
+  const int tid = threadIdx.x, lane = tid & 31, wib = tid >> 5;
   const uint32_t* meta = reinterpret_cast<const uint32_t*>(blob + 4096);
   const int tw = static_cast<int>(__ldg(&meta[1]));
   const int gmin = static_cast<int>(__ldg(&meta[2]));
@@ -294,8 +307,12 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
 
   const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
   const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + static_cast<uint32_t>(wib) * RB;
-  const int w = blockIdx.x * wpb + wib;
-  const bool active = w < tw;
+  // Even 48-SM virtual warp distribution (avoids leaving SM 47 idle on rows=4096, tw=512).
+  const int q_w = tw / gridDim.x;
+  const int rem_w = tw % gridDim.x;
+  const int w_cnt = q_w + (blockIdx.x < rem_w ? 1 : 0);
+  const int w = blockIdx.x * q_w + (blockIdx.x < rem_w ? blockIdx.x : rem_w) + wib;
+  const bool active = wib < w_cnt && w < tw;
 
   const int* woff16 = reinterpret_cast<const int*>(blob + 4112);
   const uint8_t* stream = blob + soff;
@@ -318,6 +335,13 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
     toffw = woff16[tw + 1 + w];
 #pragma unroll
     for (int i = 0; i < static_cast<int>(RG) - 1; ++i) BF_ISSUE();
+  }
+  if (blockIdx.x == 0 && tpf_stride > 0 && blob_bytes > static_cast<size_t>(soff) + 64u) {
+    const size_t sbytes = blob_bytes - static_cast<size_t>(soff) - 64u;
+    for (size_t off = static_cast<size_t>(tid) * tpf_stride; off < sbytes;
+         off += static_cast<size_t>(blockDim.x) * tpf_stride) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(stream + off));
+    }
   }
   for (int i = tid; i < 256; i += blockDim.x) {
     reinterpret_cast<uint4*>(sh_lut)[i] = reinterpret_cast<const uint4*>(blob)[i];
@@ -508,12 +532,18 @@ extern "C" int muse_bf16_rans_pass2(const uint16_t* W, int rows, int tw, int gmi
   return cudaGetLastError();
 }
 
-extern "C" int muse_bf16_rans_gemv(int rows, const void* input, const void* blob, void* output, cudaStream_t stream) {
+extern "C" int muse_bf16_rans_gemv(int rows, size_t blob_bytes, const void* input, const void* blob, void* output, cudaStream_t stream) {
   if (!valid_rows(rows)) return cudaErrorInvalidValue;
   const int tw = (rows == 4608) ? 576 : ((rows == 4096) ? 512 : (rows / 8));
   if (tw <= 0) return cudaErrorInvalidValue;
-  const int wpb = (tw + 47) / 48;
-  const int blocks = (tw + wpb - 1) / wpb;
+  // For BF16 output_gate (rows == 4096, tw == 512), launch 32 blocks of 16 warps so 16 SMs stay free
+  // for side-stream split-KV flash attention during M == 1 decode overlap.
+  static const bool bf16_gate32 = []() {
+    const char* env = std::getenv("MUSE_BF16_GATE_32_BLOCKS");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  const int blocks = (bf16_gate32 && rows == 4096 && tw == 512) ? 32 : ((tw < 48) ? tw : 48);
+  const int wpb = (tw + blocks - 1) / blocks;
   const size_t rb = 4u * 512u;
   const size_t dsmem = rb + static_cast<size_t>(wpb) * rb;
   static bool init = false;
@@ -526,6 +556,6 @@ extern "C" int muse_bf16_rans_gemv(int rows, const void* input, const void* blob
   }
   bf16_rans_gemv_kernel<<<blocks, wpb * 32, dsmem, stream>>>(
       static_cast<const uint16_t*>(input), static_cast<const uint8_t*>(blob),
-      static_cast<uint16_t*>(output), rows);
+      static_cast<uint16_t*>(output), rows, blob_bytes, bf16_tpf_stride());
   return cudaGetLastError();
 }
