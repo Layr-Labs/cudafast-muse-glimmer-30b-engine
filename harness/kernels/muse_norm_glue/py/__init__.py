@@ -17,6 +17,10 @@ def lib():
     native.muse_norm_glue_post_attn.restype = ctypes.c_int
     native.muse_norm_glue_post_ff.argtypes = [ctypes.c_int, ctypes.c_int] + [p] * 10 + [p]
     native.muse_norm_glue_post_ff.restype = ctypes.c_int
+    ff_fin = getattr(native, "muse_norm_glue_post_ff_final", None)
+    if ff_fin is not None:
+        ff_fin.argtypes = [ctypes.c_int] + [p] * 9 + [p]
+        ff_fin.restype = ctypes.c_int
     fg = getattr(native, "muse_norm_glue_post_ff_gate", None)
     if fg is not None:
         fg.argtypes = [ctypes.c_int] + [p] * 12 + [ctypes.c_int, p]
@@ -29,6 +33,10 @@ def lib():
     if ms is not None:
         ms.argtypes = [p, p, p, ctypes.c_int, p]
         ms.restype = ctypes.c_int
+    ss = getattr(native, "muse_norm_glue_mul_silu_slice_bf16", None)
+    if ss is not None:
+        ss.argtypes = [p, p, ctypes.c_int, p]
+        ss.restype = ctypes.c_int
     return native
 
 
@@ -52,6 +60,16 @@ def post_ff(kind, rows, x, d, res, sumsq_x, w_post, w_ff, w_in, scale, out_bf16,
         _ptr(scale), _ptr(out_bf16), _ptr(out_fp8), stream)
     if err:
         raise RuntimeError(f"muse_norm_glue post_ff launch returned CUDA status {err}")
+
+
+def post_ff_final(rows, d, res, x, sumsq_x, w_post, w_ff, w_in, out_h2, out_bf16, stream):
+    fn = getattr(lib(), "muse_norm_glue_post_ff_final", None)
+    if fn is None:
+        raise RuntimeError("muse_norm_glue_post_ff_final unavailable")
+    err = fn(rows, _ptr(d), _ptr(res), _ptr(x), _ptr(sumsq_x), _ptr(w_post), _ptr(w_ff), _ptr(w_in),
+             _ptr(out_h2), _ptr(out_bf16), stream)
+    if err:
+        raise RuntimeError(f"muse_norm_glue post_ff_final launch returned CUDA status {err}")
 
 
 def post_ff_gate(rows, x, d, res, sumsq_x, w_post, w_ff, w_in, scale, out_bf16, out_fp8,
@@ -82,3 +100,12 @@ def mul_sigmoid_bf16(gate, attn, out, n, stream):
     err = fn(_ptr(gate), _ptr(attn), _ptr(out), int(n), stream)
     if err:
         raise RuntimeError(f"muse_norm_glue mul_sigmoid_bf16 launch returned CUDA status {err}")
+
+
+def mul_silu_slice_bf16(gu, out, rows, stream):
+    fn = getattr(lib(), "muse_norm_glue_mul_silu_slice_bf16", None)
+    if fn is None:
+        raise RuntimeError("muse_norm_glue_mul_silu_slice_bf16 unavailable")
+    err = fn(_ptr(gu), _ptr(out), int(rows), stream)
+    if err:
+        raise RuntimeError(f"muse_norm_glue mul_silu_slice_bf16 launch returned CUDA status {err}")
