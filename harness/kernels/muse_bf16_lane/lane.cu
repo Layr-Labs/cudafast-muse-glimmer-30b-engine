@@ -155,7 +155,7 @@ __global__ void bf16_hist_kernel(const uint16_t* __restrict__ W, size_t n, unsig
   __syncthreads();
   for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n;
        i += static_cast<size_t>(gridDim.x) * blockDim.x) {
-    atomicAdd(&h[W[i] >> 8], 1u);
+    atomicAdd(&h[(W[i] >> 7) & 255u], 1u);
   }
   __syncthreads();
   for (int i = threadIdx.x; i < 256; i += blockDim.x) atomicAdd(&counts[i], static_cast<unsigned long long>(h[i]));
@@ -184,7 +184,7 @@ __global__ void bf16_enc_pass1_kernel(const uint16_t* __restrict__ W, int rows, 
 #pragma unroll
       for (int step = kSteps - 1; step >= 0; --step) {
         uint32_t& x = st[step & 3];
-        const uint32_t sy = tsrc[step * kLanes] >> 8;
+        const uint32_t sy = (tsrc[step * kLanes] >> 7) & 255u;
         const uint32_t fs = sf[sy], cs = sc[sy];
         const bool emit = static_cast<uint64_t>(x) >= (static_cast<uint64_t>(fs) << 22);
         ws += __popc(__ballot_sync(0xffffffffu, emit));
@@ -221,7 +221,7 @@ __global__ void bf16_enc_pass2_kernel(const uint16_t* __restrict__ W, int rows, 
 #pragma unroll
       for (int step = kSteps - 1; step >= 0; --step) {
         uint32_t& x = st[step & 3];
-        const uint32_t sy = tsrc[step * kLanes] >> 8;
+        const uint32_t sy = (tsrc[step * kLanes] >> 7) & 255u;
         const uint32_t fs = sf[sy], cs = sc[sy];
         const bool emit = static_cast<uint64_t>(x) >= (static_cast<uint64_t>(fs) << 22);
         ws += __popc(__ballot_sync(0xffffffffu, emit));
@@ -243,9 +243,10 @@ __global__ void bf16_enc_pass2_kernel(const uint16_t* __restrict__ W, int rows, 
 #pragma unroll
       for (int step = kSteps - 1; step >= 0; --step) {
         const uint16_t word = tsrc[step * kLanes];
-        lo_u16[step >> 1] |= static_cast<uint16_t>((word & 255u) << (8 * (step & 1)));
+        const uint32_t sm = ((word >> 8) & 128u) | (word & 127u);
+        lo_u16[step >> 1] |= static_cast<uint16_t>(sm << (8 * (step & 1)));
         uint32_t& x = st[step & 3];
-        const uint32_t sy = word >> 8;
+        const uint32_t sy = (word >> 7) & 255u;
         const uint32_t fs = sf[sy], cs = sc[sy];
         const bool emit = static_cast<uint64_t>(x) >= (static_cast<uint64_t>(fs) << 22);
         const uint32_t msk = __ballot_sync(0xffffffffu, emit);
@@ -301,9 +302,9 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
 
   const int tid = threadIdx.x, lane = tid & 31, wib = tid >> 5;
   const uint32_t* meta = reinterpret_cast<const uint32_t*>(blob + 4096);
-  const int tw = static_cast<int>(__ldg(&meta[1]));
-  const int gmin = static_cast<int>(__ldg(&meta[2]));
-  const int soff = static_cast<int>(__ldg(&meta[3]));
+  const bool fast_shape = (rows == 4096 || rows == 4608);
+  const int tw = fast_shape ? ((rows == 4096) ? 512 : 576) : static_cast<int>(__ldg(&meta[1]));
+  const int soff = fast_shape ? ((rows == 4096) ? 8704 : 9216) : static_cast<int>(__ldg(&meta[3]));
 
   const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
   const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + static_cast<uint32_t>(wib) * RB;
@@ -317,7 +318,7 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
   const int* woff16 = reinterpret_cast<const int*>(blob + 4112);
   const uint8_t* stream = blob + soff;
   uint32_t wbytes = 0;
-  int toffw = 0, issued = 0;
+  int gmin = 0, toffw = 0, issued = 0;
   const uint64_t pol = pol_ef();
 
 #define BF_ISSUE() { \
@@ -331,10 +332,24 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
   }
 
   if (active) {
-    wbytes = static_cast<uint32_t>(woff16[w + 1] - woff16[w]) * 16u;
-    toffw = woff16[tw + 1 + w];
+    if (fast_shape) {
 #pragma unroll
-    for (int i = 0; i < static_cast<int>(RG) - 1; ++i) BF_ISSUE();
+      for (int i = 0; i < static_cast<int>(RG) - 1; ++i) {
+        const uint32_t boff = static_cast<uint32_t>(i) * 512u + static_cast<uint32_t>(lane) * 16u;
+        cp_async16_ef(
+            ring_s + (boff & (RB - 1u)),
+            stream + (((static_cast<size_t>(i) * tw + w) << 9) + static_cast<uint32_t>(lane) * 16u),
+            pol);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+      }
+      issued = static_cast<int>(RG) - 1;
+    } else {
+      gmin = static_cast<int>(__ldg(&meta[2]));
+      wbytes = static_cast<uint32_t>(woff16[w + 1] - woff16[w]) * 16u;
+      toffw = woff16[tw + 1 + w];
+#pragma unroll
+      for (int i = 0; i < static_cast<int>(RG) - 1; ++i) BF_ISSUE();
+    }
   }
   if (blockIdx.x == 0 && tpf_stride > 0 && blob_bytes > static_cast<size_t>(soff) + 64u) {
     const size_t sbytes = blob_bytes - static_cast<size_t>(soff) - 64u;
@@ -346,8 +361,17 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
   for (int i = tid; i < 256; i += blockDim.x) {
     reinterpret_cast<uint4*>(sh_lut)[i] = reinterpret_cast<const uint4*>(blob)[i];
   }
-  for (int i = tid; i < kWidth / 8; i += blockDim.x) {
-    reinterpret_cast<uint4*>(sh_x)[i] = reinterpret_cast<const uint4*>(x_in)[i];
+  for (int i = tid; i < kWidth; i += blockDim.x) {
+    const int tile = i / kValues;
+    const int rem = i - tile * kValues;
+    const int step = rem >> 5;
+    const int ln = rem & 31;
+    sh_x[tile * kValues + ln * kSteps + step] = x_in[i];
+  }
+  if (active && fast_shape) {
+    gmin = static_cast<int>(__ldg(&meta[2]));
+    wbytes = static_cast<uint32_t>(woff16[w + 1] - woff16[w]) * 16u;
+    toffw = woff16[tw + 1 + w];
   }
   __syncthreads();
   if (!active) return;
@@ -380,20 +404,22 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
         lo1 = lds16(ring_s + ((a0 + 4u) & (RB - 1u))) | (lds16(ring_s + ((a0 + 6u) & (RB - 1u))) << 16);
       }
       pwb += 256u;
-      const uint16_t* xtile = sh_x + tile * kValues + lane;
+      const uint4 x4 = reinterpret_cast<const uint4*>(sh_x + tile * kValues + lane * kSteps)[0];
+      const uint32_t xw[4] = {x4.x, x4.y, x4.z, x4.w};
 #pragma unroll
       for (int step = 0; step < kSteps; ++step) {
         uint32_t& rx = st[step & 3];
         const uint32_t e = sh_lut[rx & 1023u];
         rx = ((e >> 8) & 2047u) * (rx >> 10) + (e >> 19);
-        const uint32_t hi = e & 255u;
-        const uint32_t lo = ((step < 4 ? lo0 : lo1) >> (8 * (step & 3))) & 255u;
+        const uint32_t exp_bits = (e & 255u) << 23;
+        const uint32_t sm_dup = __byte_perm(lo0, lo1, (step << 12) | (step << 8));
         const bool need = rx < kRansL;
         const uint32_t msk = __ballot_sync(0xffffffffu, need);
         if (need) rx = (rx << 16) | lds16(ring_s + ((pwb + (__popc(msk & lt) << 1)) & (RB - 1u)));
         pwb += __popc(msk) << 1;
-        const float wv = __uint_as_float((hi << 24) | (lo << 16));
-        const float xv = __uint_as_float(static_cast<uint32_t>(xtile[kLanes * step]) << 16);
+        const float wv = __uint_as_float((sm_dup & 0x807F0000u) | exp_bits);
+        const uint32_t xpair = xw[step >> 1];
+        const float xv = __uint_as_float((step & 1) ? (xpair & 0xFFFF0000u) : (xpair << 16));
         accum = __fmaf_rn(xv, wv, accum);
       }
     }
