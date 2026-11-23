@@ -31,18 +31,21 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 ENABLED = os.environ.get("MUSE_DECODE_PLACEMENT", "1").strip() not in ("0", "", "false", "no")
-SURPLUS = float(os.environ.get("MUSE_DECODE_PLACEMENT_SURPLUS", "3.5"))
+FULL_RAM_SCAN = os.environ.get("MUSE_FULL_RAM_SCAN", "1").strip() not in ("0", "", "false", "no")
+PLACE_SCALES6 = os.environ.get("MUSE_PLACE_SCALES6", "1").strip() not in ("0", "", "false", "no")
+SURPLUS = float(os.environ.get("MUSE_DECODE_PLACEMENT_SURPLUS", "3.0"))
 LM_HEAD_SPARES = int(os.environ.get("MUSE_LM_HEAD_SPARES", "16"))
 ROUNDS = 5
 # Weights that fit in L2 several times over are not bandwidth-bound per call.
 MIN_PAYLOAD_BYTES = 48 << 20
 # Host memory that must stay available while the spares exist.
-HOST_HEADROOM_BYTES = 16 << 30
+HOST_HEADROOM_BYTES = 20 << 30
 _NAME = "_marlin_decode_weight"
 _L2_FLUSH_INTS = 16 << 20  # 64 MiB (> 2.5x GB10's 24 MiB L2)
 # Quarantine below-median (slow) buffers from place_decode_weights through place_prefill_weights.
 _SLOW_HOLD: list[torch.Tensor] = []
 PLACE_ATTN = os.environ.get("MUSE_PLACE_ATTN", "1").strip() not in ("0", "", "false", "no")
+PREFILL_PLACE_ATTN = os.environ.get("MUSE_PREFILL_PLACE_ATTN", "1").strip() not in ("0", "", "false", "no")
 ATTN_MIN_BYTES = 10 << 20
 ATTN_SURPLUS = float(os.environ.get("MUSE_ATTN_PLACEMENT_SURPLUS", "2.5"))
 
@@ -89,22 +92,33 @@ def _mem_available() -> int | None:
 
 
 def _spares_allowed(wanted: int, payload_bytes: int) -> int:
-    """Spare buffers the host can carry right now, at most ``wanted``."""
+    """Spare buffers the host can carry right now, at most ``wanted``.
+    Only count PyTorch's cached-free 127 MiB fast pool for allocations <= 128 MiB that can actually reuse it."""
     available = _mem_available()
     if available is None:
         return 0
-    return max(0, min(wanted, (available - HOST_HEADROOM_BYTES) // payload_bytes))
+    if payload_bytes <= (128 << 20):
+        cached_free = max(0, torch.cuda.memory_reserved() - torch.cuda.memory_allocated())
+        effective = available + cached_free
+    else:
+        effective = available
+    return max(0, min(wanted, (effective - HOST_HEADROOM_BYTES) // payload_bytes))
 
 
 def _ensure_spares_room(wanted: int, payload_bytes: int, hold_list: list, allow_slow_trim: bool = True) -> int:
-    """Release oldest quarantined buffers incrementally (25% at a time) only when headroom is tight."""
+    """Release oldest fast spares back to PyTorch's cache first; only trim _SLOW_HOLD + empty_cache if still short."""
     spares_count = _spares_allowed(wanted, payload_bytes)
     if spares_count >= wanted:
         return spares_count
+    need_flush = payload_bytes > (128 << 20)
     while hold_list and _spares_allowed(wanted, payload_bytes) < wanted:
         del hold_list[: max(1, len(hold_list) // 4)]
-        torch.cuda.empty_cache()
+        if need_flush:
+            torch.cuda.empty_cache()
     spares_count = _spares_allowed(wanted, payload_bytes)
+    if need_flush and spares_count < wanted:
+        torch.cuda.empty_cache()
+        spares_count = _spares_allowed(wanted, payload_bytes)
     if allow_slow_trim and spares_count < wanted and _SLOW_HOLD:
         while _SLOW_HOLD and _spares_allowed(wanted, payload_bytes) < wanted:
             del _SLOW_HOLD[: max(1, len(_SLOW_HOLD) // 4)]
@@ -154,6 +168,70 @@ def _time_candidates(decode_linear, layer, candidates, n: int, k: int, rounds: i
     return [median(values) for values in samples]
 
 
+def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor) -> dict | None:
+    """Scan available host RAM in 127 MiB blocks (~4s), place gate_up into the fastest 45,
+    seed PyTorch's caching allocator with the next ~24 GiB of fastest blocks, and quarantine
+    the slowest ~44 GiB in _SLOW_HOLD so all subsequent decode & prefill groups draw only
+    from the fast physical DRAM band."""
+    homes = [layer._buffers[_NAME] for layer in layers]
+    count = len(homes)
+    payload_bytes = homes[0].numel() * homes[0].element_size()
+    spares_count = _spares_allowed(600, payload_bytes)
+    if spares_count < count * 4:
+        return None
+    spares = []
+    try:
+        for _ in range(spares_count):
+            spare = torch.empty_like(homes[0])
+            spare.copy_(homes[0])
+            spares.append(spare)
+    except RuntimeError:
+        pass
+    if len(spares) < count * 4:
+        spares.clear()
+        return None
+    candidates = homes + spares
+    times = _time_candidates(decode_linear, layers[0], candidates, n, k, 3, evict_buf)
+    ranked = sorted(range(len(candidates)), key=times.__getitem__)
+    kept = set(ranked[:count])
+    free_fast = [index for index in ranked[:count] if index >= count]
+    movers = sorted((index for index in range(count) if index not in kept), key=times.__getitem__, reverse=True)
+    moved = 0
+    after = list(times[:count])
+    used_targets = set()
+    displaced_homes = []
+    for home_index, target_index in zip(movers, free_fast):
+        target, source = candidates[target_index], homes[home_index]
+        target.copy_(source)
+        if not torch.equal(target, source):
+            continue
+        layers[home_index]._buffers[_NAME] = target
+        used_targets.add(target_index)
+        displaced_homes.append((times[home_index], source))
+        after[home_index] = times[target_index]
+        moved += 1
+    # Partition all unused candidates (spares + displaced homes) by measured speed:
+    # release the fastest ~24 GiB (190 blocks) to PyTorch's caching allocator (no empty_cache),
+    # quarantine up to ~22 GiB (175 slowest blocks) in _SLOW_HOLD, and release any middle overflow.
+    unused = [(times[count + i], spare) for i, spare in enumerate(spares) if (count + i) not in used_targets]
+    unused.extend(displaced_homes)
+    unused.sort(key=lambda pair: pair[0])
+    fast_keep = min(len(unused), max(180, int(len(unused) * 0.42)))
+    slow_tail = unused[fast_keep:]
+    if len(slow_tail) > 175:
+        slow_tail = slow_tail[-175:]
+    for _, slow_buf in slow_tail:
+        _SLOW_HOLD.append(slow_buf)
+    del unused, slow_tail
+    before = sorted(times[:count])
+    after.sort()
+    return {
+        "count": count, "spares": len(spares), "moved": moved, "payload_bytes": payload_bytes,
+        "before": (before[0], median(before), before[-1], sum(before)),
+        "after": (after[0], median(after), after[-1], sum(after)),
+    }
+
+
 def _place_group(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor, rejected_hold: list) -> dict | None:
     homes = [layer._buffers[_NAME] for layer in layers]
     count = len(homes)
@@ -200,7 +278,7 @@ def _place_group(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor,
         idx = count + i
         if idx not in used_targets:
             rejected_hold.append(spare)
-            if times[idx] > slow_cut:
+            if times[idx] > slow_cut and len(_SLOW_HOLD) < 100:
                 _SLOW_HOLD.append(spare)
     before = sorted(times[:count])
     after.sort()
@@ -296,7 +374,7 @@ def _place_muserans_group(rans_ext, layers, n: int, k: int, evict_buf: torch.Ten
         idx = count + i
         if idx not in used_targets:
             rejected_hold.append(spare)
-            if times[idx] > slow_cut:
+            if times[idx] > slow_cut and len(_SLOW_HOLD) < 100:
                 _SLOW_HOLD.append(spare)
     before = sorted(times[:count])
     after.sort()
@@ -385,7 +463,7 @@ def _place_bf16_rans_group(bf16_lib, layers, n: int, k: int, evict_buf: torch.Te
         idx = count + i
         if idx not in used_targets:
             rejected_hold.append(spare)
-            if times[idx] > slow_cut:
+            if times[idx] > slow_cut and len(_SLOW_HOLD) < 100:
                 _SLOW_HOLD.append(spare)
     before = sorted(times[:count])
     after.sort()
@@ -523,9 +601,28 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             import muse_fp8_swiglu as _fp8sw
         except (ImportError, OSError):
             _fp8sw = None
-        gate_layers, down_layers, fp8_down_layers, fp8_swiglu_layers = [], [], [], []
+        try:
+            import fp8ws as _fp8ws
+        except (ImportError, OSError):
+            _fp8ws = None
+        try:
+            import marlinw_attn as _marlin_attn
+        except (ImportError, OSError):
+            _marlin_attn = None
+        gate_layers, down_layers, fp8_down_layers, fp8_swiglu_layers, bf16_attn_layers = [], [], [], [], []
+        fp8_attn_o, fp8_attn_qkv, fp8_attn_gate = [], [], []
+        nvfp4_attn_qkv, nvfp4_attn_gate, nvfp4_attn_o = [], [], []
         for layer in model.modules():
             bufs = getattr(layer, "_buffers", {})
+            bf16_cat = bufs.get("_bf16_qkv_gate_w")
+            if (
+                bf16_cat is not None
+                and bf16_cat.is_cuda
+                and bf16_cat.dtype == torch.bfloat16
+                and tuple(bf16_cat.shape) == (8704, 6656)
+                and bf16_cat.numel() * bf16_cat.element_size() >= MIN_PAYLOAD_BYTES
+            ):
+                bf16_attn_layers.append(layer)
             pw = bufs.get("paired_fp8_swiglu_weight")
             if (
                 _fp8sw is not None
@@ -543,16 +640,25 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
                 _gfp8 is not None
                 and _fp8pf is not None
                 and weight.dtype == torch.float8_e4m3fn
-                and _gfp8.prefill_admitted(weight)
-                and weight.numel() >= MIN_PAYLOAD_BYTES
-                and tuple(weight.shape) == (19968, 6656)
+                and getattr(layer, "weight_scale", None) is not None
             ):
-                fp8_down_layers.append(layer)
-                continue
+                wshape = tuple(weight.shape)
+                if _gfp8.prefill_admitted(weight) and wshape == (19968, 6656):
+                    fp8_down_layers.append(layer)
+                    continue
+                if PREFILL_PLACE_ATTN:
+                    if _gfp8.prefill_admitted(weight) and wshape == (4096, 6656):
+                        fp8_attn_o.append(layer)
+                        continue
+                    if _fp8ws is not None and wshape == (6656, 4608) and weight.stride() == (1, 6656):
+                        fp8_attn_qkv.append(layer)
+                        continue
+                    if _fp8ws is not None and wshape == (6656, 4096) and weight.stride() == (1, 6656):
+                        fp8_attn_gate.append(layer)
+                        continue
             if (
                 weight.dtype != torch.int32
                 or not weight.is_contiguous()
-                or weight.numel() * 4 < MIN_PAYLOAD_BYTES
                 or getattr(layer, "weight_scale", None) is None
                 or getattr(layer, "weight_global_scale", None) is None
             ):
@@ -562,13 +668,21 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             if tuple(weight.shape) != (k // 16, 2 * n):
                 continue
             path = getattr(layer, "marlin_prompt_path", None)
-            if _swiglu is not None and getattr(layer, "marlin_swiglu_ready", False) and (n, k) == (39936, 6656):
-                gate_layers.append(layer)
-            elif (
-                _down is not None and path is not None and path[0] == "wide" and path[2][0] is not None
-                and (n, k) == (_down.COLUMNS, _down.INNER)
-            ):
-                down_layers.append(layer)
+            if weight.numel() * 4 >= MIN_PAYLOAD_BYTES:
+                if _swiglu is not None and getattr(layer, "marlin_swiglu_ready", False) and (n, k) == (39936, 6656):
+                    gate_layers.append(layer)
+                elif (
+                    _down is not None and path is not None and path[0] == "wide" and path[2][0] is not None
+                    and (n, k) == (_down.COLUMNS, _down.INNER)
+                ):
+                    down_layers.append(layer)
+            elif PREFILL_PLACE_ATTN and _marlin_attn is not None and path is not None and path[0] == "narrow_attn":
+                if (n, k) == (4608, 6656):
+                    nvfp4_attn_qkv.append(layer)
+                elif (n, k) == (4096, 6656):
+                    nvfp4_attn_gate.append(layer)
+                elif (n, k) == (6656, 4096):
+                    nvfp4_attn_o.append(layer)
         evict_buf = torch.empty((_L2_FLUSH_INTS,), dtype=torch.int32, device="cuda")
         saved_ms = 0.0
         groups = []
@@ -578,6 +692,20 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             x = x.to(torch.bfloat16).reshape(512, 6656).contiguous()
 
             fast = hasattr(_swiglu, "uses_128") and all(_swiglu.uses_128(layer.weight) for layer in gate_layers)
+            if fast and hasattr(_swiglu, "choose_feed") and os.environ.get("MUSE_PREFILL_FEED_CHOICE", "1") != "0":
+                try:
+                    choice = _swiglu.choose_feed(
+                        gate_layers, x, lambda run, ws: _time_calls(run, ws, PREFILL_ROUNDS, evict_buf)
+                    )
+                except Exception as err:  # noqa: BLE001 - keep the admitted kernels as they are
+                    choice = None
+                    logger.warning("512-row gate/up feed choice skipped: %s", err)
+                if choice is not None:
+                    logger.info(
+                        "512-row gate/up feed choice over %d layers: cp.async-fed %.2f ms, TMA-fed %.2f ms per "
+                        "prefill -> %s", len(gate_layers), choice[0], choice[1],
+                        "TMA-fed kept" if choice[2] else "cp.async-fed on every layer",
+                    )
             if hasattr(_swiglu, "gemm_with"):
                 def run_gate(weight, ref=ref, x=x, fast=fast):
                     _swiglu.gemm_with(x, weight, ref.weight_scale, ref.weight_global_scale, fast)
@@ -628,9 +756,84 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
                 _fp8sw.apply(x, weight, sa, sb, ds)
 
             groups.append(("fp8_swiglu_39936x6656", fp8_swiglu_layers, run_fp8_sw, None, False))
+        if len(bf16_attn_layers) > 1:
+            dev = bf16_attn_layers[0]._buffers["_bf16_qkv_gate_w"].device
+            x = torch.zeros((512, 6656), dtype=torch.bfloat16, device=dev)
+
+            def run_bf16_attn(weight, x=x):
+                torch.mm(x, weight.t())
+
+            def on_bf16_attn_move(old_ptr, new_ptr, layers=bf16_attn_layers):
+                for attn_mod in layers:
+                    w_cat = attn_mod._buffers["_bf16_qkv_gate_w"]
+                    if w_cat.data_ptr() == new_ptr:
+                        attn_mod.qkv_proj.weight.data = w_cat[:4608]
+                        attn_mod.output_gate_proj.weight.data = w_cat[4608:]
+                        break
+
+            groups.append(("bf16_attn_8704x6656", bf16_attn_layers, run_bf16_attn, on_bf16_attn_move, False))
+        if PREFILL_PLACE_ATTN and len(fp8_attn_o) > 1:
+            ref = fp8_attn_o[0]
+            dev = ref.weight.device
+            x = torch.zeros((512, 4096), dtype=torch.float8_e4m3fn, device=dev)
+            sa = ref.input_scale if getattr(ref, "input_scale", None) is not None else torch.ones((1,), dtype=torch.float32, device=dev)
+            sb = ref.weight_scale
+            cfg_o = _fp8pf.config(6656, 4096) or 3
+
+            def run_fp8_o(weight, x=x, sa=sa, sb=sb, cfg_o=cfg_o):
+                _fp8pf.gemm(x, weight, sa, sb, cfg_o)
+
+            groups.append(("fp8_attn_6656x4096", fp8_attn_o, run_fp8_o, _gfp8.prefill_moved, False))
+        if PREFILL_PLACE_ATTN and _fp8ws is not None and _fp8ws.ready(torch.device("cuda")):
+            for gname, glayers, gk in (
+                ("fp8_attn_4608x6656", fp8_attn_qkv, 6656),
+                ("fp8_attn_4096x6656", fp8_attn_gate, 6656),
+            ):
+                if len(glayers) > 1:
+                    ref = glayers[0]
+                    dev = ref.weight.device
+                    x = torch.zeros((512, gk), dtype=torch.float8_e4m3fn, device=dev)
+                    sa = ref.input_scale if getattr(ref, "input_scale", None) is not None else torch.ones((1,), dtype=torch.float32, device=dev)
+                    sb = ref.weight_scale
+
+                    def run_fp8_ws(weight, x=x, sa=sa, sb=sb):
+                        _fp8ws.gemm(x, weight, sa, sb)
+
+                    groups.append((gname, glayers, run_fp8_ws, _gfp8.prefill_moved, False))
+        if PREFILL_PLACE_ATTN and _marlin_attn is not None:
+            for gname, glayers, gn, gk in (
+                ("nvfp4_attn_4608x6656", nvfp4_attn_qkv, 4608, 6656),
+                ("nvfp4_attn_4096x6656", nvfp4_attn_gate, 4096, 6656),
+                ("nvfp4_attn_6656x4096", nvfp4_attn_o, 6656, 4096),
+            ):
+                if len(glayers) > 1:
+                    ref = glayers[0]
+                    dev = ref.weight.device
+                    x = ((torch.arange(512 * gk, device=dev) % 11).float() - 5.0).mul(0.07).to(torch.bfloat16).reshape(512, gk).contiguous()
+                    if (
+                        gn == 4608
+                        and gk == 6656
+                        and _route is not None
+                        and _route.marlinw_down128 is not None
+                        and all(l.weight.data_ptr() in _route._attn128_weights for l in glayers)
+                    ):
+                        def run_nv_attn(weight, ref=ref, x=x, gn=gn, gk=gk):
+                            _route.marlinw_down128.gemm_shape(x, weight, ref.weight_scale, ref.weight_global_scale, gn, gk)
+                        on_mv = _route.down128_moved
+                    else:
+                        plan = ref.marlin_prompt_path[1:]
+                        def run_nv_attn(weight, ref=ref, x=x, plan=plan):
+                            _marlin_attn.gemm(x, weight, ref.weight_scale, ref.weight_global_scale, *plan)
+                        on_mv = _route.down128_moved if _route is not None else None
+                    groups.append((gname, glayers, run_nv_attn, on_mv, False))
         for name, layers, run, on_move, fast in groups:
             try:
-                buf_name = "paired_fp8_swiglu_weight" if name == "fp8_swiglu_39936x6656" else None
+                if name == "fp8_swiglu_39936x6656":
+                    buf_name = "paired_fp8_swiglu_weight"
+                elif name == "bf16_attn_8704x6656":
+                    buf_name = "_bf16_qkv_gate_w"
+                else:
+                    buf_name = None
                 stats = _place_prefill_group(layers, run, on_move, evict_buf, rejected_hold, buf_name=buf_name)
             except Exception as err:  # noqa: BLE001 - this group stays where it was
                 logger.warning("Prefill weight placement skipped for %s: %s", name, err)
@@ -730,14 +933,50 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                     attn_bf16_groups.setdefault((n, k), []).append(layer)
         saved_ms = 0.0
         n_groups = 0
-        # Place largest total-payload groups first (gate_up -> down -> lm_head) while holding rejected slow buffers.
+        # Place 39936x6656 first (full-RAM scan seeds PyTorch's fast cache and quarantines slow pages in _SLOW_HOLD),
+        # then 6656x19968 down, then FP8 rANS MLPs, and defer 641 MiB lm_head until after rANS MLPs so its spares
+        # never crowd the fast pool.
         ordered_groups = sorted(
             groups.items(),
-            key=lambda kv: -(len(kv[1]) * kv[1][0]._buffers[_NAME].numel()),
+            key=lambda kv: (1 if len(kv[1]) == 1 else 0, -(len(kv[1]) * kv[1][0]._buffers[_NAME].numel())),
         )
-        for (n, k, *_), layers in ordered_groups:
+        deferred_single = [(k, v) for k, v in ordered_groups if len(v) == 1]
+        multi_nvfp4 = [(k, v) for k, v in ordered_groups if len(v) > 1]
+        for (n, k, *_), layers in multi_nvfp4:
             try:
-                stats = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
+                stats = None
+                if FULL_RAM_SCAN and (n, k) == (39936, 6656) and len(layers) >= 32:
+                    stats = _place_group_full_ram_scan(decode_linear, layers, n, k, evict_buf)
+                    if stats is not None and PLACE_SCALES6:
+                        try:
+                            import muse_marlin6_gemv as _m6
+                            ilv_set = getattr(_m6, "_DOWN_ILV_SCALES", None)
+                        except (ImportError, OSError):
+                            ilv_set = None
+                        moved_s6, bytes_s6 = 0, 0
+                        for m in model.modules():
+                            s6 = m._buffers.get("_marlin_decode_scales6")
+                            if s6 is not None and s6.is_cuda and s6.numel() * s6.element_size() >= (1 << 20):
+                                try:
+                                    old_ptr = s6.data_ptr()
+                                    dst = torch.empty_like(s6)
+                                    dst.copy_(s6)
+                                    if torch.equal(dst, s6):
+                                        m._buffers["_marlin_decode_scales6"] = dst
+                                        if ilv_set is not None and old_ptr in ilv_set:
+                                            ilv_set.discard(old_ptr)
+                                            ilv_set.add(dst.data_ptr())
+                                        moved_s6 += 1
+                                        bytes_s6 += dst.numel() * dst.element_size()
+                                except RuntimeError:
+                                    break
+                        if moved_s6:
+                            logger.info(
+                                "Decode scales6 fast-pool relocation: %d buffers (%.1f MiB) moved into fast pool",
+                                moved_s6, bytes_s6 / (1 << 20),
+                            )
+                if stats is None:
+                    stats = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
             except Exception as err:  # noqa: BLE001 - this group stays where it was
                 logger.warning("Decode weight placement skipped for %dx%d: %s", n, k, err)
                 continue
@@ -782,6 +1021,26 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                         n, k, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
                         b[0], b[1], b[2], a[0], a[1], a[2], b[3], a[3],
                     )
+        for (n, k, *_), layers in deferred_single:
+            try:
+                stats = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
+            except Exception as err:  # noqa: BLE001
+                logger.warning("Decode weight placement skipped for %dx%d: %s", n, k, err)
+                continue
+            if stats is None:
+                continue
+            n_groups += 1
+            b, a = stats["before"], stats["after"]
+            saved_ms += b[3] - a[3]
+            gbps = stats["payload_bytes"] / 1e6
+            logger.info(
+                "Decode weight placement %dx%d: %d weights of %.0f MiB, %d spare buffers, %d moved; "
+                "GEMV ms min/median/max %.4f/%.4f/%.4f -> %.4f/%.4f/%.4f "
+                "(weight-only %.0f/%.0f/%.0f -> %.0f/%.0f/%.0f GB/s), sum %.3f -> %.3f ms",
+                n, k, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
+                b[0], b[1], b[2], a[0], a[1], a[2],
+                gbps / b[0], gbps / b[1], gbps / b[2], gbps / a[0], gbps / a[1], gbps / a[2], b[3], a[3],
+            )
         if PLACE_ATTN and attn_bf16_groups:
             try:
                 import muse_bf16_lane as _bf16_mod
@@ -866,4 +1125,4 @@ def place_decode_weights(model: torch.nn.Module) -> None:
         rejected_hold.clear()
         if not PREFILL_ENABLED:
             _SLOW_HOLD.clear()
-        torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
