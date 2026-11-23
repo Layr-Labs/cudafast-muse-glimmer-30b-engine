@@ -114,6 +114,41 @@ def counts() -> tuple[int, int]:
     return len(_fast), len(_fast3)
 
 
+def choose_feed(layers, x, timer, margin=0.997):
+    """Keep the TMA-fed 128-row kernel only if it is not slower than the cp.async-fed one (Muse Glimmer).
+
+    Both 128-row kernels passed the bitwise comparison with the 64-row reference on every layer of
+    ``layers`` (prepare), so the choice cannot change any output. In the engine the TMA-fed gate/up
+    kernel has timed about 25 us per call slower than the cp.async-fed one on some boots, so this
+    times both on every layer's own buffers with ``timer`` (the prefill placement's median-of-rounds
+    timer), in the order cp.async, TMA, TMA, cp.async to cancel drift, and drops the TMA-fed kernel
+    for all layers unless its summed time is within ``margin`` of the cp.async one. Called before the
+    placement times the gate/up buffers, so placement then times the kernel every layer will run.
+    Returns (cp.async sum, TMA sum, kept TMA) in ms per prefill, or None if there was no choice.
+    """
+    if _lib2 is None or _lib3 is None or not _fast3 or _fast3 != _fast:
+        return None
+    if any(layer.weight.data_ptr() not in _fast3 for layer in layers):
+        return None
+    own = {layer.weight.data_ptr(): layer for layer in layers}
+
+    def runner(lib):
+        def run(weight):
+            layer = own[weight.data_ptr()]
+            _run(lib, x, weight, layer.weight_scale, layer.weight_global_scale)
+        return run
+
+    weights = [layer.weight for layer in layers]
+    sums = {2: 0.0, 3: 0.0}
+    for which in (2, 3, 3, 2):
+        sums[which] += sum(timer(runner(_lib2 if which == 2 else _lib3), weights))
+    async_ms, tma_ms = sums[2] / 2, sums[3] / 2
+    keep = tma_ms <= async_ms / margin
+    if not keep:
+        _fast3.clear()
+    return async_ms, tma_ms, keep
+
+
 def gemm_with(x, weight, scales, global_scale, fast: bool):
     """Load-time prefill weight placement: time the kernel the group's layers will run (Muse Glimmer)."""
     if x.device not in _ready:
