@@ -351,6 +351,7 @@ static inline size_t rans_dsmem(int K, int wpb, int gbs, int rg) { size_t rb = (
 static inline bool rans_fits(int K, int wpb, int gbs, int rg) { return rans_dsmem(K, wpb, gbs, rg) + RANS_LUT_BYTES + 1024 <= (size_t)RANS_MAX_SMEM; }
 
 static RansCfg rans_pick_cfg(int N, int K) {
+  if (N == 39936 && K == 6656 && rans_fits(K, 8, 9, 4)) return RansCfg{384, 8, 4, 4, 9};
   const int NB = N / 8;
   for (int wcap = 18; wcap >= 1; wcap--) {
     const int R = (NB + 48 * wcap - 1) / (48 * wcap);

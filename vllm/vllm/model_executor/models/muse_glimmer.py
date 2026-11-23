@@ -1970,7 +1970,7 @@ class MuseGlimmerForCausalLM(
             import muse_final_slab
         except (ImportError, OSError):
             return None
-        return muse_final_slab.prepare(self.model.layers[self.model.end_layer - 1].mlp)
+        return muse_final_slab.prepare(self.model.layers[self.model.end_layer - 1])
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

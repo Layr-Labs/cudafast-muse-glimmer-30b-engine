@@ -23,7 +23,6 @@ logger = init_logger(__name__)
 
 ENABLED = os.environ.get("FP8WS", "1") != "0"
 SHAPES = frozenset({
-    (4608, 6656),
     (4096, 6656),
 })
 _admitted: dict[tuple[int, int, int], bool] = {}
