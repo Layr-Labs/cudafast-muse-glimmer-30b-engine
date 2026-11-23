@@ -5,6 +5,7 @@
 // (336 CTAs x 256T), down (48 CTAs x 256T), and lm_head (48 CTAs x 128T) with zero cp.async contention.
 #define MARLIN_NAMESPACE_NAME muse_marlin6_tma4
 #define MUSE_SCALE_TMA4
+#define MUSE_B_EVICT_FIRST
 #include <cstdlib>
 #include "marlin/marlin_template.h"
 
@@ -134,29 +135,45 @@ template <int TileN, int Threads, bool GateUpGrid, bool DownIlv = false>
 int launch_tma4(const int4* input, const int4* weight, int4* output, int4* partials,
                 const int4* coded, const int4* palette, const float* global_scale,
                 int* locks, int n, int k, int grid, int device, cudaStream_t stream) {
-  int shared = 0;
-  auto status = cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-  if (status != cudaSuccess) return status;
+  auto kernel = muse_marlin6_tma4::Marlin<
+      vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
+      vllm::kFE4M3fn.id(), Threads, 1, TileN / 16, 8, true, 4, 1, false, true, GateUpGrid, DownIlv>;
+  static int cached_shared[16] = {0};
+  int shared = (device >= 0 && device < 16) ? cached_shared[device] : 0;
+  if (shared == 0) {
+    auto status = cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status != cudaSuccess) return status;
+    status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
+    if (status != cudaSuccess) return status;
+    if (device >= 0 && device < 16) cached_shared[device] = shared;
+  }
   size_t total_sbs = 0;
   if constexpr (GateUpGrid) {
     total_sbs = 288 * 13 + 48 * 7;  // 4080
   } else {
-    const int n_tiles = n / TileN;
-    const int k_tiles = k / 128;
-    int part2_mn_tiles = n_tiles;
-    int part1_mn_iters = 0;
-    if (n_tiles > grid) {
-      part2_mn_tiles = n_tiles % grid;
-      if (part2_mn_tiles * 3 <= grid) part2_mn_tiles += grid;
-      part1_mn_iters = (n_tiles - part2_mn_tiles) / grid;
-    }
-    const int p2_iters = (k_tiles * part2_mn_tiles + grid - 1) / grid;
-    const int total_p2 = k_tiles * part2_mn_tiles;
-    for (int b = 0; b < grid; ++b) {
-      const int rem = total_p2 - p2_iters * b;
-      const int p2 = rem > 0 ? (rem < p2_iters ? rem : p2_iters) : 0;
-      const int it = part1_mn_iters * k_tiles + p2;
-      total_sbs += static_cast<size_t>((it + 3) / 4);
+    static int last_n = -1, last_k = -1, last_grid = -1;
+    static size_t last_total_sbs = 0;
+    if (n == last_n && k == last_k && grid == last_grid) {
+      total_sbs = last_total_sbs;
+    } else {
+      const int n_tiles = n / TileN;
+      const int k_tiles = k / 128;
+      int part2_mn_tiles = n_tiles;
+      int part1_mn_iters = 0;
+      if (n_tiles > grid) {
+        part2_mn_tiles = n_tiles % grid;
+        if (part2_mn_tiles * 3 <= grid) part2_mn_tiles += grid;
+        part1_mn_iters = (n_tiles - part2_mn_tiles) / grid;
+      }
+      const int p2_iters = (k_tiles * part2_mn_tiles + grid - 1) / grid;
+      const int total_p2 = k_tiles * part2_mn_tiles;
+      for (int b = 0; b < grid; ++b) {
+        const int rem = total_p2 - p2_iters * b;
+        const int p2 = rem > 0 ? (rem < p2_iters ? rem : p2_iters) : 0;
+        const int it = part1_mn_iters * k_tiles + p2;
+        total_sbs += static_cast<size_t>((it + 3) / 4);
+      }
+      last_n = n; last_k = k; last_grid = grid; last_total_sbs = total_sbs;
     }
   }
   const size_t meta_bytes = ((static_cast<size_t>(2 * grid + 1) * 4 + 15) / 16) * 16;
@@ -167,11 +184,6 @@ int launch_tma4(const int4* input, const int4* weight, int4* output, int4* parti
   const auto* lut_and_meta = reinterpret_cast<const int*>(base);
   const auto* states = reinterpret_cast<const int4*>(base + states_off);
   const auto* var = reinterpret_cast<const int4*>(base + var_off);
-  auto kernel = muse_marlin6_tma4::Marlin<
-      vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
-      vllm::kFE4M3fn.id(), Threads, 1, TileN / 16, 8, true, 4, 1, false, true, GateUpGrid, DownIlv>;
-  status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
-  if (status != cudaSuccess) return status;
   kernel<<<grid, Threads, shared, stream>>>(
       input, weight, output, partials, nullptr, nullptr, states, global_scale,
       var, lut_and_meta, k / 16, 1, n, k, k, locks, false, false, true, shared, palette,
