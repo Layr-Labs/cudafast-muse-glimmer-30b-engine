@@ -36,7 +36,22 @@ fn cuda_device() -> String {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn disable_coredump() {
+    extern "C" {
+        fn prctl(option: i32, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> i32;
+    }
+    // PR_SET_DUMPABLE = 4 -> 0 so SIGKILL/abort never invokes host apport (/var/crash).
+    unsafe {
+        let _ = prctl(4, 0, 0, 0, 0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn disable_coredump() {}
+
 fn main() -> ExitCode {
+    disable_coredump();
     let stdin = io::stdin();
     let stdout = io::stdout();
     let out = BufWriter::new(stdout.lock());

@@ -66,13 +66,31 @@ about 100 s on GB10) and kept the GPU busy through benchd's quiescence gate.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
+import resource
 import signal
 import socket
 import sys
 import time
 from collections import deque
+
+
+def _harden_no_coredump() -> None:
+    """Ensure neither this process nor any child can ever trigger host apport (/var/crash)."""
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except Exception:
+        pass
+    if sys.platform == "linux":
+        try:
+            ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE = 0
+        except Exception:
+            pass
+
+
+_harden_no_coredump()
 
 try:
     from .backends import Backend, Emit, FakeBackend, VllmBackend, VllmConfig
@@ -414,6 +432,10 @@ def main() -> int:
     stop = {"flag": False}
 
     def on_signal(_sig, _frame):
+        try:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        except Exception:
+            pass
         stop["flag"] = True
         raise KeyboardInterrupt
 
@@ -457,11 +479,44 @@ def main() -> int:
         pass
     finally:
         log(f"shutting down after {phase} phase(s) on one load")
-        listener.close()
-        if os.path.exists(socket_path):
-            os.unlink(socket_path)
-        if ready_file and os.path.exists(ready_file):
-            os.unlink(ready_file)
+        try:
+            listener.close()
+        except BaseException:
+            pass
+        try:
+            if os.path.exists(socket_path):
+                os.unlink(socket_path)
+        except BaseException:
+            pass
+        try:
+            if ready_file and os.path.exists(ready_file):
+                os.unlink(ready_file)
+        except BaseException:
+            pass
+        if isinstance(backend, VllmBackend):
+            try:
+                if not stop["flag"]:
+                    backend.close()
+            except BaseException:
+                pass
+            try:
+                import multiprocessing
+                import torch
+                for child in multiprocessing.active_children():
+                    try:
+                        child.terminate()
+                    except BaseException:
+                        pass
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except BaseException:
+                pass
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except BaseException:
+                pass
+            os._exit(0)
         backend.close()
     return 0
 

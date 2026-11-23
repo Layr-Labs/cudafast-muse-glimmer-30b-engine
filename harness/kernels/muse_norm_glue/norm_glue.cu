@@ -40,6 +40,12 @@ __device__ __forceinline__ float rcp_approx_ftz(float v) {
   return r;
 }
 
+__device__ __forceinline__ float full_divide(float num, float denom) {
+  float r;
+  asm("div.full.f32 %0, %1, %2;" : "=f"(r) : "f"(num), "f"(denom));
+  return r;
+}
+
 // rsqrt(s / 6656 + eps) exactly as the compiled SASS evaluates it.
 __device__ __forceinline__ float inv_rms(float s, float eps) {
   return rsqrt_approx_ftz(__fmaf_rn(s, __int_as_float(0x391d89d9), eps));
@@ -193,13 +199,14 @@ __global__ void __launch_bounds__(kThreads) post_attn_norm(
 //   h2  = fma(c * d, w_ff + 1, h1)               (FMUL, FADD, FFMA)
 //   x  <- bf16(h2) (in place);  s_h = sum h2^2 (unrounded h2);  e = inv_rms(s_h, 1e-5)
 //   y   = (e * bf16(h2)) * (w_in + 1);  out_bf16 = bf16(y);  out_fp8 = e4m3(clamp(rcp(scale) * y))
-template <bool kFp8Out>
+template <bool kFp8Out, bool kGateOut = false, bool kWriteBf16 = true>
 __global__ void __launch_bounds__(kThreads) post_ff_norm(
     __nv_bfloat16* x_all, const __nv_bfloat16* d_all,
     const __nv_bfloat16* res_all, const float* sumsq_x,
     const __nv_bfloat16* __restrict__ w_post, const __nv_bfloat16* __restrict__ w_ff,
     const __nv_bfloat16* w_in, const float* scale,
-    __nv_bfloat16* out_bf16_all, uint8_t* out_fp8_all) {
+    __nv_bfloat16* out_bf16_all, uint8_t* out_fp8_all,
+    const float* gate_scale = nullptr, uint8_t* out_gate_all = nullptr) {
   __shared__ float red[2][8];
   const size_t row = blockIdx.x;
   __nv_bfloat16* x = x_all + row * kHidden;
@@ -252,7 +259,9 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm(
   const float s_h = row_sum(acc2, red[1]);
   const float e_r = inv_rms(s_h, 1e-05f);
   float inv_scale = 0.f;
+  float gate_inv = 0.f;
   if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(*scale);
+  if constexpr (kGateOut) gate_inv = full_divide(1.0f, *gate_scale);
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
@@ -264,14 +273,30 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm(
       uint2 o;
       o.x = pack_bf16x2(y[0], y[1]);
       o.y = pack_bf16x2(y[2], y[3]);
-      *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
+      if constexpr (kWriteBf16) {
+        *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
+      }
       if constexpr (kFp8Out) {
         uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
                      (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
         *reinterpret_cast<uint32_t*>(out_fp8_all + off) = q;
       }
+      if constexpr (kGateOut) {
+        const float g0 = bf_lo(o.x), g1 = bf_hi(o.x), g2 = bf_lo(o.y), g3 = bf_hi(o.y);
+        uint32_t gq = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g0)), clamp448(__fmul_rn(gate_inv, g1)))) |
+                      (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g2)), clamp448(__fmul_rn(gate_inv, g3)))) << 16);
+        *reinterpret_cast<uint32_t*>(out_gate_all + off) = gq;
+      }
     }
   }
+}
+
+__global__ void gate_formula_kernel(const uint16_t* bits, const float* gate_scale, uint8_t* out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float gate_inv = full_divide(1.0f, *gate_scale);
+  const float v = __uint_as_float(static_cast<uint32_t>(bits[i]) << 16);
+  out[i] = static_cast<uint8_t>(fp8x2(clamp448(__fmul_rn(gate_inv, v)), 0.0f) & 0xff);
 }
 
 }  // namespace
@@ -320,6 +345,40 @@ int muse_norm_glue_post_ff(int kind, int rows, void* x, const void* d, const voi
   } else {
     return -1;
   }
+  return static_cast<int>(cudaGetLastError());
+}
+
+int muse_norm_glue_post_ff_gate(int rows, void* x, const void* d, const void* res, const void* sumsq_x,
+                                const void* w_post, const void* w_ff, const void* w_in, const void* scale,
+                                void* out_bf16, void* out_fp8, const void* gate_scale, void* out_gate,
+                                int write_bf16, cudaStream_t stream) {
+  if (rows <= 0) return 0;
+  auto* X = static_cast<__nv_bfloat16*>(x);
+  const auto* D = static_cast<const __nv_bfloat16*>(d);
+  const auto* Rs = static_cast<const __nv_bfloat16*>(res);
+  const auto* S = static_cast<const float*>(sumsq_x);
+  const auto* Wp = static_cast<const __nv_bfloat16*>(w_post);
+  const auto* Wf = static_cast<const __nv_bfloat16*>(w_ff);
+  const auto* Wi = static_cast<const __nv_bfloat16*>(w_in);
+  const auto* Sc = static_cast<const float*>(scale);
+  const auto* Gs = static_cast<const float*>(gate_scale);
+  auto* Ob = static_cast<__nv_bfloat16*>(out_bf16);
+  auto* Of = static_cast<uint8_t*>(out_fp8);
+  auto* Og = static_cast<uint8_t*>(out_gate);
+  if (write_bf16) {
+    post_ff_norm<true, true, true><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, Sc, Ob, Of, Gs, Og);
+  } else {
+    post_ff_norm<true, true, false><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, Sc, Ob, Of, Gs, Og);
+  }
+  return static_cast<int>(cudaGetLastError());
+}
+
+int muse_norm_glue_gate_formula(const void* bits, const void* gate_scale, void* out, int n,
+                                cudaStream_t stream) {
+  if (n <= 0) return 0;
+  gate_formula_kernel<<<(n + 255) / 256, 256, 0, stream>>>(
+      static_cast<const uint16_t*>(bits), static_cast<const float*>(gate_scale),
+      static_cast<uint8_t*>(out), n);
   return static_cast<int>(cudaGetLastError());
 }
 
