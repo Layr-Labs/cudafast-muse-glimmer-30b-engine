@@ -65,6 +65,10 @@ extern "C" int muse_marlin6_set_gate_blocks(int blocks) {
     return cudaErrorInvalidValue;
 }
 
+extern "C" int muse_marlin6_get_gate_blocks() {
+    return decode6_gate_blocks();
+}
+
 extern "C" int muse_marlin6_gemv(const int4* input, const int4* weight, int4* output,
                                  int4* partials, const int4* scales6, const int4* palette,
                                  const float* global_scale, int* locks, int n, int k, int blocks,

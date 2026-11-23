@@ -63,11 +63,16 @@ BYTES_MLP_NORM = _env_bytes("L2PF_MB_MLP_NORM", (9 << 20) // 4)
 BYTES_MLP_ACT = _env_bytes("L2PF_MB_MLP_ACT", 1 << 19)
 BYTES_RANS_AFTER_ATTN = _env_bytes("L2PF_MB_RANS_ATTN", 0)
 BYTES_RANS_QKV = _env_bytes("L2PF_MB_RANS_QKV", 0)
+BYTES_NV_GATE = _env_bytes("L2PF_MB_NV_GATE", BYTES_OTHER)
 TLB_PREFETCH = os.environ.get("L2PF_TLB", "1") != "0"
 TLB_RANS_HEAD = int(os.environ.get("L2PF_TLB_RANS_HEAD_KB", "64")) << 10
 TLB_STRIDE = int(os.environ.get("L2PF_TLB_STRIDE_KB", "2048")) << 10
 TLB_ALL = os.environ.get("L2PF_TLB_ALL", "1") != "0"
 TLB_UNASSISTED = os.environ.get("L2PF_TLB_UNASSISTED", "1") != "0"
+# Per-layer (address, bytes) of the contiguous RMSNorm weight arena (set by the model); NORM_PREWARM=0 disables.
+NORM_HINT: list | None = None
+NORM_PREWARM = os.environ.get("L2PF_NORM_PREWARM", "1") != "0"
+SITES_PER_LAYER = 5
 
 # Compressed one-row projections measured with the same captured stream edges.
 _RANS_SKIP_PREFETCH = {
@@ -213,14 +218,81 @@ def mlp_budget(n_tensors: int, after_act: bool) -> int:
     return nbytes * 8 // 9 if n_tensors > 1 else nbytes
 
 
+def _range_descs(base: int, span: int, off: int, length: int) -> list[tuple[int, int, int, int]]:
+    off = off & ~15
+    end = min(off + ((int(length) + 15) & ~15), span) & ~15
+    n = end - off
+    if base % 16 or off < 0 or n <= 0:
+        return []
+    p = base + off
+    full, rem = divmod(n, CHUNK)
+    out = []
+    if full:
+        out.append((p, CHUNK, CHUNK, full))
+    if rem:
+        out.append((p + full * CHUNK, 0, rem, 1))
+    return out
+
+
+def _tma4_scale_descs(w: torch.Tensor) -> list[tuple[int, int, int, int]]:
+    """Exact Wave-0 L2 head for TMA4 scales (shape [rows, 32] uint8):
+    lut + meta + Wave-0 off16 + Wave-0 states + Wave-0 super-blocks sb 0 and sb 1."""
+    base, span = _dense_span(w)
+    if base % 16 or span < 4096 + 16:
+        return []
+    prefix = min(span, 32768)
+    u32 = w.reshape(-1)[:prefix].cpu().view(torch.int32)
+    total_sbs = int(u32[1024].item())
+    num_blks = int(u32[1025].item())
+    max_sbs = int(u32[1026].item())
+    threads = int(u32[1027].item())
+    if total_sbs <= 0 or num_blks <= 0 or threads not in (128, 256):
+        return head_descs(w, min(span, 256 << 10))
+    meta_u32 = ((4 + num_blks + max_sbs + 3) // 4) * 4
+    meta_bytes = meta_u32 * 4
+    off16_bytes = ((total_sbs + 1) * 4 + 15) // 16 * 16
+    states_off = 4096 + meta_bytes + off16_bytes
+    var_off = states_off + num_blks * threads * 4
+    wave_blks = min(num_blks, 48)
+    gsb_sb1_end = min(total_sbs, 2 * wave_blks)
+    need_u32 = 1024 + meta_u32 + gsb_sb1_end + 1
+    if need_u32 * 4 > prefix:
+        if need_u32 * 4 > span:
+            return head_descs(w, min(span, 256 << 10))
+        u32 = w.reshape(-1)[: need_u32 * 4].cpu().view(torch.int32)
+    sb01_bytes = int(u32[1024 + meta_u32 + gsb_sb1_end].item()) * 16
+    wave_states_bytes = wave_blks * threads * 4
+    wave_off16_end = 4096 + meta_bytes + ((gsb_sb1_end + 1) * 4 + 15) // 16 * 16
+    if (states_off - wave_off16_end) + (var_off - (states_off + wave_states_bytes)) <= (16 << 10):
+        return _range_descs(base, span, 0, var_off + sb01_bytes)
+    out = []
+    if states_off - wave_off16_end <= (16 << 10):
+        out += _range_descs(base, span, 0, states_off + wave_states_bytes)
+        out += _range_descs(base, span, var_off, sb01_bytes)
+    else:
+        out += _range_descs(base, span, 0, wave_off16_end)
+        out += _range_descs(base, span, states_off, wave_states_bytes + sb01_bytes)
+    return out
+
+
 def weight_descs(ws: tuple[torch.Tensor, ...], nbytes: int) -> list[tuple[int, int, int, int]]:
-    """The first nbytes of the weight (ws[0]) and the same share of its block
-    scales (ws[1], one byte per 16 four-bit codes: an eighth of the bytes)."""
+    """The first nbytes of the weight (ws[0]) and exact TMA4 Wave-0 head (or 1/8 share) of ws[1:]."""
     if nbytes <= 0:
         return []
-    out = head_descs(ws[0], nbytes)
+    w0 = ws[0]
+    if w0.ndim == 3 and w0.shape[1:] == (416, 128) and w0.shape[0] >= 48 and w0.dtype == torch.int32:
+        base, span = _dense_span(w0)
+        if base % 16 == 0 and 47 * 212992 + 16384 <= span:
+            out = [(base, 212992, 16384, 48)]
+        else:
+            out = head_descs(w0, nbytes)
+    else:
+        out = head_descs(w0, nbytes)
     for w in ws[1:]:
-        out += head_descs(w, nbytes // 8)
+        if w.ndim == 2 and w.shape[1] == 32 and w.dtype == torch.uint8:
+            out += _tma4_scale_descs(w)
+        else:
+            out += head_descs(w, nbytes // 8)
     return out
 
 
@@ -379,6 +451,7 @@ class Session:
         self._pending = False
         self._attn = False
         self._prev_big = False
+        self.norm_sites = 0
 
     # -- patching
     @contextlib.contextmanager
@@ -468,6 +541,8 @@ class Session:
                 site.descs = weight_descs(ws, mb_b)
                 if TLB_PREFETCH and (kind == "musefp8" or TLB_ALL):
                     site.descs += tlb_descs(ws[0], mb_b, TLB_STRIDE)
+                    for w_extra in ws[1:]:
+                        site.descs += tlb_descs(w_extra, 0, TLB_STRIDE)
             else:
                 nbytes = budget(wbytes, site.after_attn)
                 if kind == "musefp8":
@@ -488,6 +563,19 @@ class Session:
                         nbytes = BYTES_RANS_AFTER_ATTN if site.after_attn else BYTES_RANS_QKV
                         if nbytes == 0:
                             site.unassisted = True
+                elif kind == "muse_bf16_gate":
+                    _, a, weight, packed, index = args
+                    n, k = weight.shape
+                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
+                            and a.is_contiguous() and index.numel() == 1):
+                        nbytes = BYTES_RANS_QKV
+                        if nbytes == 0:
+                            site.unassisted = True
+                elif kind == "marlin_tiled" and not site.after_attn and len(args) >= 8:
+                    if (int(args[6]), int(args[7])) == (4096, 6656):
+                        nbytes = BYTES_NV_GATE
+                        if nbytes == 0:
+                            site.unassisted = True
                 if site.unassisted and TLB_PREFETCH and TLB_UNASSISTED:
                     site.descs = head_descs(ws[0], TLB_RANS_HEAD) + tlb_descs(ws[0], TLB_RANS_HEAD, TLB_STRIDE)
                 else:
@@ -501,7 +589,36 @@ class Session:
             site.descs = []
         self.sites.append(site)
 
+    def _norm_prewarm(self) -> int:
+        """Append each layer's norm-weight slice to its first (qkv), gate_up and down sites, so the norm kernels that
+        follow find their weights in L2 instead of queueing behind the bulk weight prefetch."""
+        hint = NORM_HINT
+        if not NORM_PREWARM or not hint or len(self.sites) != SITES_PER_LAYER * len(hint):
+            return 0
+        added = 0
+        for lyr, span in enumerate(hint):
+            if span is None:
+                continue
+            base, nbytes = span
+            nbytes &= ~15
+            if base % 16 or nbytes <= 0:
+                continue
+            full, rem = divmod(nbytes, CHUNK)
+            descs = []
+            if full:
+                descs.append((base, CHUNK, CHUNK, full))
+            if rem:
+                descs.append((base + full * CHUNK, 0, rem, 1))
+            if self.ranges is not None and not _inside(descs, self.ranges):
+                continue
+            for k in (0, 3, 4):
+                site = self.sites[SITES_PER_LAYER * lyr + k]
+                site.descs = list(site.descs) + descs
+                added += 1
+        return added
+
     def _build(self, dev):
+        self.norm_sites = self._norm_prewarm()
         flat = []
         for s in self.sites:
             s.off = len(flat) // 3
@@ -582,4 +699,4 @@ class Session:
                 f"{nb} others at {BYTES_OTHER / (1 << 20):.1f} MiB, "
                 f"weights above {MAX_WEIGHT / (1 << 20):.0f} MiB: {big}; "
                 f"{mb:.0f} MiB per step; compressed FP8 sites left without prefetch: "
-                f"{ua} output after attention, {ub} QKV")
+                f"{ua} output after attention, {ub} QKV; norm-weight pre-warm on {self.norm_sites} sites")

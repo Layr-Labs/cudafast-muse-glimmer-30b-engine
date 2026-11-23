@@ -33,6 +33,7 @@ adapter/projection stack.
 
 import math
 import os
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 from typing import Annotated, Literal
@@ -1394,6 +1395,9 @@ def _init_qk_fused() -> bool:
         return False
 
 
+_BF16_DUAL_WS_ADMITTED: set[int] = set()
+
+
 def _muse_bf16_qkv_or_stacked_impl(
     x: torch.Tensor,
     w_cat: torch.Tensor,
@@ -1402,6 +1406,11 @@ def _muse_bf16_qkv_or_stacked_impl(
     idx_qkv: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.ndim == 2 and x.shape == (512, 6656) and x.is_contiguous():
+        if w_cat.data_ptr() in _BF16_DUAL_WS_ADMITTED:
+            import fp8ws as _fp8ws
+            dual = _fp8ws.bf16_gemm_dual_stacked(x, w_cat)
+            if dual is not None:
+                return dual
         out = torch.mm(x, w_cat.t())
         return out[:, :4608].contiguous(), out[:, 4608:].contiguous()
     qkv = torch.ops.vllm.muse_bf16_lane_linear.default(x, w_qkv, packed_qkv, idx_qkv)
@@ -2186,6 +2195,7 @@ class MuseGlimmerForCausalLM(
         # compute_logits chain (x * output_multiplier, then cap * tanh(x / cap)) evaluated by the same torch ops on
         # every BF16 value; ties go to the lowest index, as the stock greedy sampler's block argmax + argmax.
         self._lmpost_softcap_argmax = None
+        self._pack_persisting_norm_arena()
         # Gate-quant fold (harness/kernels/sandwich/muse_sandwich.py): register every FP8-attention layer's
         # qkv and output-gate input scales; the 512-row native sandwich of such a layer then also writes the
         # gate's FP8 operand once admitted (decode untouched).
@@ -2193,8 +2203,14 @@ class MuseGlimmerForCausalLM(
             import muse_sandwich
         except (ImportError, OSError):
             muse_sandwich = None
-        if muse_sandwich is not None and hasattr(muse_sandwich, "register_gate"):
+        try:
+            from .muse_glimmer_norm_glue import register_gate as register_decode_gate
+        except ImportError:
+            register_decode_gate = None
+        has_sandwich_gate = muse_sandwich is not None and hasattr(muse_sandwich, "register_gate")
+        if has_sandwich_gate or register_decode_gate is not None:
             registered = 0
+            decode_registered = 0
             for layer in islice(self.model.layers, self.model.start_layer, self.model.end_layer):
                 attn = layer.self_attn
                 gate = getattr(attn, "output_gate_proj", None)
@@ -2205,8 +2221,14 @@ class MuseGlimmerForCausalLM(
                     for m in (attn.qkv_proj, gate)
                 )
                 if fp8 and qkv_scale is not None and gate_scale is not None:
-                    registered += bool(muse_sandwich.register_gate(qkv_scale, gate_scale))
-            logger.info("Gate-quant fold: %d FP8-attention layers registered with the native sandwich", registered)
+                    if has_sandwich_gate:
+                        registered += bool(muse_sandwich.register_gate(qkv_scale, gate_scale))
+                    if register_decode_gate is not None:
+                        decode_registered += bool(register_decode_gate(qkv_scale, gate_scale))
+            if has_sandwich_gate:
+                logger.info("Gate-quant fold: %d FP8-attention layers registered with the native sandwich", registered)
+            if register_decode_gate is not None:
+                logger.info("Decode gate-quant fold: %d FP8-attention layers registered with norm glue", decode_registered)
         try:
             import lmpost
             lm_head = getattr(self, "lm_head", None)
@@ -2223,6 +2245,77 @@ class MuseGlimmerForCausalLM(
         # qkv_proj + output_gate_proj into a single contiguous [8704, 6656] weight (zero extra VRAM via views)
         # for M=512 prefill after bitwise verification.
         self._prepare_attn_dual_prefill()
+
+    def _pack_persisting_norm_arena(self) -> None:
+        self._persisting_norm_arena = None
+        self._norm_arena_buf = None
+        persist = os.environ.get("MUSE_PERSIST_NORMS", "0") != "0"
+        prewarm = os.environ.get("MUSE_NORM_PREWARM", "1") != "0"
+        if not persist and not prewarm:
+            return
+        try:
+            params: list[torch.nn.Parameter] = []
+            param_layer: list[int] = []
+            total_bytes = 0
+            dev = None
+            for name, mod in self.model.named_modules():
+                if "norm" not in name.lower():
+                    continue
+                w = getattr(mod, "weight", None)
+                if (
+                    isinstance(w, torch.nn.Parameter)
+                    and w.is_cuda
+                    and w.dtype == torch.bfloat16
+                    and w.dim() == 1
+                    and w.is_contiguous()
+                    and 0 < w.numel() <= 16384
+                ):
+                    dev = w.device
+                    params.append(w)
+                    m_layer = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+                    param_layer.append(int(m_layer.group(1)) if m_layer else -1)
+                    total_bytes += ((w.numel() * 2 + 255) // 256) * 256
+            if not params or dev is None or total_bytes > (4 << 20):
+                return
+            arena = torch.zeros((total_bytes,), dtype=torch.uint8, device=dev)
+            off = 0
+            moved = 0
+            layer_span: dict[int, list[int]] = {}
+            for w, lyr in zip(params, param_layer):
+                nb = w.numel() * 2
+                view = arena[off : off + nb].view(torch.bfloat16)
+                view.copy_(w.data)
+                if torch.equal(view.view(torch.int16), w.data.view(torch.int16)):
+                    w.data = view
+                    moved += 1
+                    if lyr >= 0:
+                        lo_hi = layer_span.setdefault(lyr, [off, off])
+                        lo_hi[0] = min(lo_hi[0], off)
+                        lo_hi[1] = max(lo_hi[1], off + ((nb + 255) // 256) * 256)
+                off += ((nb + 255) // 256) * 256
+            if moved:
+                self._norm_arena_buf = arena
+                if persist:
+                    self._persisting_norm_arena = arena
+                if prewarm and layer_span:
+                    try:
+                        from l2pf import sites as _l2pf_sites
+
+                        base = arena.data_ptr()
+                        n_layers = max(layer_span) + 1
+                        _l2pf_sites.NORM_HINT = [
+                            (base + layer_span[i][0], layer_span[i][1] - layer_span[i][0])
+                            if i in layer_span else None
+                            for i in range(n_layers)
+                        ]
+                    except Exception:  # noqa: BLE001
+                        pass
+                logger.info(
+                    "Packed %d RMSNorm weights into %.2f MiB contiguous L2-persisting arena",
+                    moved, total_bytes / (1 << 20),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Persisting norm arena skipped: %s", exc)
 
     def _prepare_attn_dual_prefill(self) -> None:
         if get_tensor_model_parallel_world_size() != 1:
@@ -2273,6 +2366,18 @@ class MuseGlimmerForCausalLM(
                         attn.register_buffer("_bf16_qkv_gate_w", w_cat, persistent=False)
                         attn._bf16_dual_prefill = True
                         bf16_stack_cnt += 1
+                        try:
+                            import fp8ws as _fp8ws
+                            if _fp8ws.ready(w_cat.device):
+                                dpair = _fp8ws.bf16_gemm_dual_stacked(probe, w_cat)
+                                if (
+                                    dpair is not None
+                                    and torch.equal(r0.view(torch.int16), dpair[0].view(torch.int16))
+                                    and torch.equal(r1.view(torch.int16), dpair[1].view(torch.int16))
+                                ):
+                                    _BF16_DUAL_WS_ADMITTED.add(w_cat.data_ptr())
+                        except Exception:
+                            pass
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("BF16 stacked qkv+gate prefill skipped on layer %d: %s", attn.layer_idx, exc)
         if bf16_stack_cnt:

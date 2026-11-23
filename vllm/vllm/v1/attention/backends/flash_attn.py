@@ -66,6 +66,16 @@ from vllm.v1.worker.cp_utils import (
     split_dcp_context_queries,
 )
 
+try:
+    import muse_final_slab
+except (ImportError, OSError):
+    muse_final_slab = None
+
+try:
+    import muse_gqa16_attn
+except (ImportError, OSError):
+    muse_gqa16_attn = None
+
 logger = init_logger(__name__)
 
 
@@ -835,6 +845,19 @@ class FlashAttentionImpl(AttentionImpl):
                 vllm_config.scheduler_config.max_num_batched_tokens
             )
 
+        self._gqa16_decode_eligible = (
+            muse_gqa16_attn is not None
+            and self.attn_type == AttentionType.DECODER
+            and self.num_heads == 32
+            and self.num_kv_heads == 2
+            and self.head_size == 128
+            and not is_quantized_kv_cache(self.kv_cache_dtype)
+            and self.alibi_slopes is None
+            and self.logits_soft_cap == 0
+            and self.sinks is None
+            and self.dcp_world_size == 1
+        )
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -900,6 +923,32 @@ class FlashAttentionImpl(AttentionImpl):
                 attn_metadata,
                 layer,
             )
+
+        if (
+            self._gqa16_decode_eligible
+            and num_actual_tokens == 1
+            and attn_metadata.max_query_len == 1
+            and not attn_metadata.use_cascade
+            and attn_metadata.causal is True
+            and attn_metadata.mm_prefix_range_tensor is None
+            and attn_metadata.rswa_prefix_lens is None
+        ):
+            window = (
+                attn_metadata.sliding_window
+                if attn_metadata.sliding_window is not None
+                else self.sliding_window
+            )
+            if muse_gqa16_attn.try_decode_gqa16(
+                query=query,
+                kv_cache=kv_cache,
+                output=output,
+                seqused_k=attn_metadata.seq_lens,
+                block_table=attn_metadata.block_table,
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                softmax_scale=self.scale,
+                window=window,
+            ):
+                return output
 
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
@@ -1038,11 +1087,37 @@ class FlashAttentionImpl(AttentionImpl):
                     )
                     causal = not has_window
 
+                q_arg = query[:num_actual_tokens]
+                out_arg = output[:num_actual_tokens]
+                if (
+                    muse_final_slab is not None
+                    and mm_mask_mod is None
+                    and rswa_mask_mod_fn is None
+                    and q_descale is None
+                ):
+                    tail = muse_final_slab.flash_tail_if_active(
+                        layer,
+                        num_actual_tokens,
+                        cu_seqlens_q,
+                        max_seqlen_q,
+                        seqused_k,
+                        causal,
+                        sliding_window_size,
+                        scheduler_metadata,
+                        self.vllm_flash_attn_version,
+                    )
+                    if tail is not None:
+                        tail_rows, tail_cu_q = tail
+                        q_arg = query[num_actual_tokens - tail_rows : num_actual_tokens]
+                        out_arg = output[num_actual_tokens - tail_rows : num_actual_tokens]
+                        cu_seqlens_q = tail_cu_q
+                        max_seqlen_q = tail_rows
+
                 flash_attn_varlen_func(
-                    q=query[:num_actual_tokens],
+                    q=q_arg,
                     k=key_cache,
                     v=value_cache,
-                    out=output[:num_actual_tokens],
+                    out=out_arg,
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
                     seqused_k=seqused_k,

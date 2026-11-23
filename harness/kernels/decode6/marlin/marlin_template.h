@@ -413,6 +413,7 @@ __global__ void Marlin(
     if (part2_mn_tiles * 3 <= vgrid) part2_mn_tiles += vgrid;
     part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / vgrid;
   }
+  const int orig_p1_iters = part1_mn_iters;
 
   int iters = div_ceil(k_tiles * part2_mn_tiles, vgrid);
 
@@ -634,9 +635,9 @@ __global__ void Marlin(
   int zp_gl_rd_delta = zp_gl_stride;
 
   // Global A read index of current thread.
-  int a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) +
-                (threadIdx.x % a_gl_rd_delta_o);
-  a_gl_rd += a_gl_rd_delta_o * slice_row;
+  const int a_gl_rd_base = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) +
+                           (threadIdx.x % a_gl_rd_delta_o);
+  int a_gl_rd = a_gl_rd_base + a_gl_rd_delta_o * slice_row;
   // Shared write index of current thread.
   int a_sh_wr = a_sh_stride * (threadIdx.x / a_gl_rd_delta_o) +
                 (threadIdx.x % a_gl_rd_delta_o);
@@ -654,11 +655,14 @@ __global__ void Marlin(
         b_gl_stride * (threadIdx.x / b_sh_stride) + (threadIdx.x % b_sh_stride);
   }
 
+  [[maybe_unused]] int ilv_a_kt = slice_row;
+  [[maybe_unused]] int ilv_f = 0;
+  [[maybe_unused]] int ilv_jump_f = 0;
+  [[maybe_unused]] int ilv_jump_kt = 0;
+  [[maybe_unused]] int ilv_step_switch = 0;
+  [[maybe_unused]] int ilv_delta_hi = 0;
+  [[maybe_unused]] int ilv_delta_lo = 0;
 #ifdef MUSE_GATE_UP_ILV
-  // Schedule-ordered gate/up layout (muse_marlin6_gemv.to_gate_up_ilv): the k-stage s of this CTA's slice
-  // is chunk ilv_base + 48 * s, so at every stage the 48 co-resident CTAs of a wave read 48 adjacent
-  // chunks; a chunk holds one stage (512 int4 of codes, 48 int4 of 6-bit scale codes). Every thread
-  // fetches the same bytes into the same shared slots at the same stage as with the tiled layout.
   [[maybe_unused]] int ilv_base = 0;
   if constexpr (gate_up_grid) {
     ilv_base = blockIdx.x < 288 ? (blockIdx.x / 48) * 2496 + blockIdx.x % 48
@@ -671,10 +675,25 @@ __global__ void Marlin(
   }
 #else
   if constexpr (down_ilv) {
-    // Stage-interleaved 48-CTA stream-K down layout: flat stage 169*b + s lives at chunk 48*s + b,
-    // so at every stage all 48 SMs read 384 KiB of contiguous DRAM and l2pf's 512 KiB head warms all 48 SMs.
+    static_assert(scale6 && threads == 256 && thread_n_blocks == 8 && !gate_up_grid,
+                  "down_ilv requires M=1 256T 128-col decode config");
     b_gl_rd += b_gl_rd_delta_o * blockIdx.x;
-    b_gl_rd_delta_o *= 48;
+    const int total_p2 = k_tiles * part2_mn_tiles;
+    if constexpr (gate_v48) {
+      ilv_jump_f = min(iters, max(0, total_p2 - vblk * iters));
+      ilv_jump_kt = (vblk >= static_cast<int>(gridDim.x))
+                        ? ((iters * (vblk - static_cast<int>(gridDim.x))) % k_tiles)
+                        : 0;
+      ilv_step_switch = 53;
+      ilv_delta_hi = 24 * b_gl_rd_delta_o;
+      ilv_delta_lo = 23 * b_gl_rd_delta_o;
+    } else {
+      ilv_jump_f = orig_p1_iters * k_tiles;
+      ilv_jump_kt = (iters * vblk) % k_tiles;
+      ilv_step_switch = ilv_jump_f + max(0, total_p2 - 47 * iters);
+      ilv_delta_hi = 48 * b_gl_rd_delta_o;
+      ilv_delta_lo = 47 * b_gl_rd_delta_o;
+    }
   } else {
     b_gl_rd += b_sh_stride * tile_column_stride * slice_col;
     b_gl_rd += b_gl_rd_delta_o * slice_row;
@@ -858,25 +877,24 @@ __global__ void Marlin(
       reinterpret_cast<int4*>(sh_pal)[threadIdx.x] = scale6_palette[threadIdx.x];
   }
 #ifdef MUSE_SCALE_TMA4
-  // 4-stage TMA super-block rANS block scales (gemv6_tma4.cu): hardware cp.async.bulk with 2 alternating
-  // super-block slots, 4x fewer TMA/mbarrier ops, zero block0/1 header bloat, global L1-cached off16[].
-  // Supports gate_up (336x256T), down (48x256T), and lm_head (48x128T).
   static_assert(scale6 && (threads == 256 || threads == 128),
                 "TMA4 rANS scales require M = 1 decode config (128 or 256 threads)");
   constexpr int kTmaWarps = threads / 32;
-  constexpr int RANS_CAP = (threads == 256) ? 3072 : 2048;
+  constexpr int RANS_CAP = (threads == 256) ? 3200 : 2048;
   uint32_t* sh_states = reinterpret_cast<uint32_t*>(sh_pal + 64);
   unsigned char* sh_rslot = reinterpret_cast<unsigned char*>(sh_states + threads);
   uint32_t* sh_rlut = reinterpret_cast<uint32_t*>(sh_rslot + 2 * RANS_CAP);
   uint64_t* sh_rbar = reinterpret_cast<uint64_t*>(sh_rlut + 1024);
+  sh_red = reinterpret_cast<int4*>(sh_rbar + 4);
   const uint32_t* tma_u32 = reinterpret_cast<const uint32_t*>(g_idx);
-  const uint32_t* tma_blk_sb = tma_u32 + 1024;
-  const uint32_t* tma_blk_it = tma_blk_sb + (gridDim.x + 1);
-  const size_t tma_meta_u32 = ((static_cast<size_t>(2 * gridDim.x + 1) + 3) / 4) * 4;
+  const uint32_t tma_tot_sbs = tma_u32[1024];
+  const uint32_t tma_max_sbs = tma_u32[1026];
+  const uint32_t* tma_blk_it = tma_u32 + 1028;
+  const uint32_t* tma_sb_row = tma_blk_it + gridDim.x;
+  const size_t tma_meta_u32 = ((static_cast<size_t>(4 + gridDim.x + tma_max_sbs) + 3) / 4) * 4;
   const uint32_t* tma_off16 = tma_u32 + 1024 + tma_meta_u32;
-  const uint32_t tma_sb_base = tma_blk_sb[blockIdx.x];
-  const int tma_num_sbs = static_cast<int>(tma_blk_sb[blockIdx.x + 1] - tma_sb_base);
   const int tma_iters = static_cast<int>(tma_blk_it[blockIdx.x]);
+  const int tma_num_sbs = (tma_iters + 3) >> 2;
   const unsigned char* tma_var_g = reinterpret_cast<const unsigned char*>(zp_ptr);
   int tma_slice_base = 0, tma_done = 0, tma_q = 0;
   bool tma_started = false;
@@ -897,7 +915,12 @@ __global__ void Marlin(
         "@!P1 bra TMA4_WAIT_%=;\n\t}" ::"r"(tma_bar(bar)), "r"(parity) : "memory");
   };
   auto tma_issue = [&](int sb) {
-    const uint32_t gsb = tma_sb_base + sb;
+    uint32_t gsb;
+    if constexpr (gate_up_grid) {
+      gsb = static_cast<uint32_t>(((blockIdx.x / 48) * 13 + sb) * 48 + (blockIdx.x % 48));
+    } else {
+      gsb = __ldg(tma_sb_row + sb) + blockIdx.x;
+    }
     const uint32_t o0 = __ldg(tma_off16 + gsb);
     const uint32_t o1 = __ldg(tma_off16 + gsb + 1);
     const int bytes = static_cast<int>(o1 - o0) * 16;
@@ -1144,11 +1167,13 @@ __global__ void Marlin(
   auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true) {
     if (pred) {
       int4* sh_a_stage = sh_a + a_sh_stage * pipe;
+      const int cur_a_off = down_ilv ? (a_gl_rd_base + a_gl_rd_delta_o * ilv_a_kt)
+                                     : (a_gl_rd + a_gl_rd_delta_o * a_off);
   #pragma unroll
       for (int i = 0; i < a_sh_wr_iters; i++) {
         cp_async4_pred(
             &sh_a_stage[a_sh_wr_trans[i]],
-            &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
+            &A[a_gl_rd_delta_i * i + cur_a_off],
             a_sh_wr_pred[i]);
       }
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
@@ -1162,7 +1187,17 @@ __global__ void Marlin(
         cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
       }
 
-      b_gl_rd += b_gl_rd_delta_o;
+      if constexpr (down_ilv) {
+        b_gl_rd += (ilv_f < ilv_step_switch) ? ilv_delta_hi : ilv_delta_lo;
+        ilv_f++;
+        if (ilv_f == ilv_jump_f) {
+          ilv_a_kt = ilv_jump_kt;
+        } else if (++ilv_a_kt == k_tiles) {
+          ilv_a_kt = 0;
+        }
+      } else {
+        b_gl_rd += b_gl_rd_delta_o;
+      }
 
       if constexpr (has_act_order) {
         // Fetch g_idx thread-block portion
@@ -1305,7 +1340,7 @@ __global__ void Marlin(
 #ifdef MUSE_SCALE_RANS_SK
           int4* sh_s_stage = sh_s + s_sh_stage * ((rans_slice_base + pipe) & (stages - 1));
 #elif defined(MUSE_SCALE_TMA4)
-          int4* sh_s_stage = sh_s + s_sh_stage * ((tma_slice_base + pipe) & (stages - 1));
+          int4* sh_s_stage = sh_s + s_sh_stage * (((down_ilv ? 0 : tma_slice_base) + pipe) & (stages - 1));
 #else
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 #endif
@@ -2079,6 +2114,15 @@ __global__ void Marlin(
     __syncthreads();
   };
 
+#ifdef MUSE_SCALE_TMA4
+  constexpr bool cont_pipe = down_ilv;
+  [[maybe_unused]] int total_rem = cont_pipe ? tma_iters : 0;
+#else
+  constexpr bool cont_pipe = false;
+  [[maybe_unused]] int total_rem = 0;
+#endif
+  [[maybe_unused]] int pipe_start = 0;
+
   // Start global fetch and register load pipelines.
   [[maybe_unused]] bool tlb_done = false;
   auto start_pipes = [&]() {
@@ -2110,7 +2154,7 @@ __global__ void Marlin(
           }
         }
       }
-      fetch_to_shared(i, i, i < slice_iters);
+      fetch_to_shared(i, i, cont_pipe ? (i < total_rem) : (i < slice_iters));
     }
 
     if constexpr (scale6) {
@@ -2123,8 +2167,7 @@ __global__ void Marlin(
           asm volatile("prefetch.global.L2 [%0];" ::"l"(b_base + off));
         }
 #ifdef MUSE_SCALE_TMA4
-        const uint32_t tot_sbs = tma_blk_sb[gridDim.x];
-        const size_t s_bytes = static_cast<size_t>(tma_off16[tot_sbs]) * 16u;
+        const size_t s_bytes = static_cast<size_t>(tma_off16[tma_tot_sbs]) * 16u;
         for (size_t off = static_cast<size_t>(threadIdx.x) * tpf_stride; off < s_bytes;
              off += static_cast<size_t>(threads) * tpf_stride) {
           asm volatile("prefetch.global.L2 [%0];" ::"l"(tma_var_g + off));
@@ -2195,55 +2238,83 @@ __global__ void Marlin(
 
   // Main loop.
   while (slice_iters) {
-    // We unroll over both the global fetch and the register load pipeline to
-    // ensure all shared memory accesses are static. Note that both pipelines
-    // have even length meaning that the next iteration will always start at
-    // index 0.
-
+    if constexpr (cont_pipe) {
   #pragma unroll
-    for (int pipe = 0; pipe < stages;) {
+      for (int p = 0; p < stages; p++) {
+        if (p < pipe_start) continue;
+        int pipe = p;
   #pragma unroll
-      for (int k = 0; k < b_sh_wr_iters; k++) {
-        fetch_to_registers(k + 1, pipe % stages);
-        fetch_scales_to_registers(k + 1, pipe);
-        fetch_zp_to_registers(k + 1, pipe);
-        if (k == b_sh_wr_iters - 2) {
-          fetch_to_shared((pipe + stages - 1) % stages, pipe,
-                          slice_iters >= stages);
-          pipe++;
-          wait_for_stage();
+        for (int k = 0; k < b_sh_wr_iters; k++) {
+          fetch_to_registers(k + 1, pipe % stages);
+          fetch_scales_to_registers(k + 1, pipe);
+          fetch_zp_to_registers(k + 1, pipe);
+          if (k == b_sh_wr_iters - 2) {
+            fetch_to_shared((pipe + stages - 1) % stages, pipe,
+                            total_rem >= stages);
+            pipe++;
+            wait_for_stage();
 #ifdef MUSE_SCALE_TMA4
-          tma_q++;
-          if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
+            tma_q++;
+            if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
+#endif
+            init_same_group(pipe % stages);
+          }
+          matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
+        }
+        total_rem--;
+        slice_iters--;
+        if (slice_iters == 0) {
+          pipe_start = (p + 1) & (stages - 1);
+          break;
+        }
+      }
+      if (slice_iters != 0) {
+        pipe_start = 0;
+      }
+    } else {
+  #pragma unroll
+      for (int pipe = 0; pipe < stages;) {
+  #pragma unroll
+        for (int k = 0; k < b_sh_wr_iters; k++) {
+          fetch_to_registers(k + 1, pipe % stages);
+          fetch_scales_to_registers(k + 1, pipe);
+          fetch_zp_to_registers(k + 1, pipe);
+          if (k == b_sh_wr_iters - 2) {
+            fetch_to_shared((pipe + stages - 1) % stages, pipe,
+                            slice_iters >= stages);
+            pipe++;
+            wait_for_stage();
+#ifdef MUSE_SCALE_TMA4
+            tma_q++;
+            if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
 #endif
 #ifdef MUSE_SCALE_RANS
-          // entering stage rans_q: decode stage rans_q + 1 (its block was issued two stages ago),
-          // then issue block rans_q + 3 into the slot of the block decoded two barriers ago
-          rans_q++;
-          if (rans_q + 1 < rans_iters) {
-            const int X = rans_q + 1;
-            if (X >= 2) rans_wait(1 + X % stages, static_cast<uint32_t>(((X - 2) / 4) & 1));
-            rans_decode(X);
-          }
-          if (threadIdx.x == 0 && rans_q + 3 < rans_iters) rans_issue(rans_q + 3);
+            rans_q++;
+            if (rans_q + 1 < rans_iters) {
+              const int X = rans_q + 1;
+              if (X >= 2) rans_wait(1 + X % stages, static_cast<uint32_t>(((X - 2) / 4) & 1));
+              rans_decode(X);
+            }
+            if (threadIdx.x == 0 && rans_q + 3 < rans_iters) rans_issue(rans_q + 3);
 #endif
-          init_same_group(pipe % stages);
-        }
+            init_same_group(pipe % stages);
+          }
 
-        if constexpr (!is_a_8bit) {
-          matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
-        } else {
-          static_assert(group_blocks != 0 && group_blocks != 1);
-          matmul_a8(k);
+          if constexpr (!is_a_8bit) {
+            matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
+          } else {
+            static_assert(group_blocks != 0 && group_blocks != 1);
+            matmul_a8(k);
+          }
+        }
+        slice_iters--;
+        if (slice_iters == 0) {
+          break;
         }
       }
-      slice_iters--;
-      if (slice_iters == 0) {
-        break;
-      }
+
+      a_gl_rd += a_gl_rd_delta_o * stages;
     }
-
-    a_gl_rd += a_gl_rd_delta_o * stages;
 
     if constexpr (has_act_order) {
       slice_k_start += tb_k * stages;
@@ -2317,7 +2388,11 @@ __global__ void Marlin(
         }
       }
 
-      cp_async_wait<0>();
+      if constexpr (!cont_pipe) {
+        cp_async_wait<0>();
+      } else if (total_rem == 0) {
+        cp_async_wait<0>();
+      }
       bool last = slice_idx == slice_count - 1;
       // For per-column scales, we only fetch them here in the final step before
       // write-out
@@ -2470,50 +2545,52 @@ __global__ void Marlin(
       }
 
       if (slice_iters) {
-        a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) +
-                  (threadIdx.x % a_gl_rd_delta_o);
-        a_gl_rd += a_gl_rd_delta_o * slice_row;
-        if constexpr (!down_ilv) {
-          b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride) +
-                    (threadIdx.x % b_sh_stride);
-          b_gl_rd += b_sh_stride * tile_column_stride * slice_col + b_gl_rd_delta_o * slice_row;
-        }
-
-        bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;
-        // Update slice k/n for scales loading
-        if constexpr (has_act_order) {
-          slice_k_start = tb_k * slice_row;
-          slice_k_finish = slice_k_start + tb_k * slice_iters;
-          slice_k_start_shared_fetch = slice_k_start;
-          slice_n_offset = act_s_col_tb_stride * slice_col;
+        if constexpr (cont_pipe) {
+          zero_accums();
         } else {
-          if constexpr (group_blocks == -1) {
-            s_gl_rd = s_sh_stride * tile_column_stride * slice_col + threadIdx.x;
-            zp_gl_rd = zp_sh_stride * slice_col + threadIdx.x;
-          } else if constexpr (group_blocks >= thread_k_blocks) {
-            s_gl_rd =
-                s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
-                s_sh_stride * tile_column_stride * slice_col + threadIdx.x;
-            zp_gl_rd =
-                zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
-                zp_sh_stride * slice_col + threadIdx.x;
-          } else {
-            if constexpr (scale6) {
-              s_gl_rd = (3 * s_sh_stride * tile_column_stride / 4) * slice_col +
-                        (3 * s_sh_stage / 4) * slice_row + threadIdx.x;
-            } else {
-              s_gl_rd =
-                  s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
-                                 threadIdx.x / s_sh_stride) +
-                  s_sh_stride * tile_column_stride * slice_col + threadIdx.x % s_sh_stride;
-            }
-            zp_gl_rd =
-                zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
-                                threadIdx.x / zp_sh_stride) +
-                zp_sh_stride * slice_col + threadIdx.x % zp_sh_stride;
+          a_gl_rd = a_gl_rd_base + a_gl_rd_delta_o * slice_row;
+          if constexpr (!down_ilv) {
+            b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride) +
+                      (threadIdx.x % b_sh_stride);
+            b_gl_rd += b_sh_stride * tile_column_stride * slice_col + b_gl_rd_delta_o * slice_row;
           }
+
+          bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;
+          // Update slice k/n for scales loading
+          if constexpr (has_act_order) {
+            slice_k_start = tb_k * slice_row;
+            slice_k_finish = slice_k_start + tb_k * slice_iters;
+            slice_k_start_shared_fetch = slice_k_start;
+            slice_n_offset = act_s_col_tb_stride * slice_col;
+          } else {
+            if constexpr (group_blocks == -1) {
+              s_gl_rd = s_sh_stride * tile_column_stride * slice_col + threadIdx.x;
+              zp_gl_rd = zp_sh_stride * slice_col + threadIdx.x;
+            } else if constexpr (group_blocks >= thread_k_blocks) {
+              s_gl_rd =
+                  s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
+                  s_sh_stride * tile_column_stride * slice_col + threadIdx.x;
+              zp_gl_rd =
+                  zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
+                  zp_sh_stride * slice_col + threadIdx.x;
+            } else {
+              if constexpr (scale6) {
+                s_gl_rd = (3 * s_sh_stride * tile_column_stride / 4) * slice_col +
+                          (3 * s_sh_stage / 4) * slice_row + threadIdx.x;
+              } else {
+                s_gl_rd =
+                    s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
+                                   threadIdx.x / s_sh_stride) +
+                    s_sh_stride * tile_column_stride * slice_col + threadIdx.x % s_sh_stride;
+              }
+              zp_gl_rd =
+                  zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
+                                  threadIdx.x / zp_sh_stride) +
+                  zp_sh_stride * slice_col + threadIdx.x % zp_sh_stride;
+            }
+          }
+          start_pipes();
         }
-        start_pipes();
       }
     }
   }

@@ -47,6 +47,9 @@ class SampleTile:
     post_attn_norm_address: int = 0
     final_norm_address: int = 0
     qkv_plan: object = None  # (weight data_ptr, work list, grid) of the final layer's restricted qkv tiles
+    attn_address: int = 0
+    attn_tail_rows: int = 0
+    attn_cu_q: torch.Tensor | None = None
 
     @contextmanager
     def capture(self):
@@ -174,6 +177,7 @@ def prepare(layer_or_mlp, final_norm=None):
                 aplan = None
             if aplan is not None:
                 attn_plans[proj.weight.data_ptr()] = aplan
+    attn_addr, attn_tail_rows, attn_cu_q = _prepare_attn_tail(self_attn, attn_plans, device)
     admitted_weight = getattr(gate, "swiglu_paired_weight", gate.weight)
     return SampleTile(
         admitted_weight.data_ptr(), gate.weight, gate.weight_scale, gate.weight_global_scale,
@@ -181,6 +185,7 @@ def prepare(layer_or_mlp, final_norm=None):
         torch.tensor(pointers, device=device, dtype=torch.int32), slots, attn_plans,
         *_restriction_addresses(layer_or_mlp, final_norm),
         _prepare_qkv(getattr(self_attn, "qkv_proj", None)),
+        attn_addr, attn_tail_rows, attn_cu_q,
     )
 
 
@@ -263,7 +268,7 @@ import os as _os
 
 RESTRICT = _os.environ.get("MUSE_FINAL_ROWS_ONLY", "1") == "1"
 _restricted_inputs = set()
-restrict_stats = {"qkv": 0, "post_attn": 0, "sigmoid": 0, "final_norm": 0}
+restrict_stats = {"qkv": 0, "attn": 0, "post_attn": 0, "sigmoid": 0, "final_norm": 0}
 _POST_ATTN = ("triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_1", "triton_red_fused__to_copy_add_clamp_mean_mul_pow_reciprocal_rsqrt_1")
 _FINAL = "triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_3"
 _SIGMOID = "triton_poi_fused_mul_sigmoid_0"
@@ -389,3 +394,97 @@ def _run_qkv(x, weight, scales, global_scale, qplan):
     if status:
         return None
     return out
+
+
+def _prepare_attn_tail(self_attn, attn_plans: dict[int, AttnSlabPlan], device: torch.device):
+    """Bitwise-checked Q[-64:] (fallback Q[-128:]) FlashAttention pruning for Layer 51."""
+    if not RESTRICT or self_attn is None or len(attn_plans) != 2:
+        return 0, 0, None
+    attn = getattr(self_attn, "attn", None)
+    impl = getattr(attn, "impl", None) if attn is not None else None
+    if (
+        attn is None
+        or impl is None
+        or getattr(impl, "vllm_flash_attn_version", None) != 2
+        or getattr(impl, "sliding_window", None) is not None
+        or getattr(impl, "supports_quant_query_input", False)
+        or getattr(self_attn, "num_heads", 0) != 32
+        or getattr(self_attn, "num_kv_heads", 0) != 2
+        or getattr(self_attn, "head_dim", 0) != 128
+    ):
+        return 0, 0, None
+    try:
+        from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+        gen = torch.Generator(device=device).manual_seed(51 * 4096 + 64)
+        scale = float(getattr(impl, "scale", 128.0 ** -0.5))
+        q = (torch.randn((ROWS, 32, 128), generator=gen, device=device) * 1.5).to(torch.bfloat16)
+        k_cache = (torch.randn((40, 16, 2, 128), generator=gen, device=device) * 0.5).to(torch.bfloat16)
+        v_cache = (torch.randn((40, 16, 2, 128), generator=gen, device=device) * 0.5).to(torch.bfloat16)
+        bt = torch.arange(40, dtype=torch.int32, device=device).unsqueeze(0)
+        cu_512 = torch.tensor([0, ROWS], dtype=torch.int32, device=device)
+        for tail_rows in (TILE_ROWS, 2 * TILE_ROWS):
+            cu_tail = torch.tensor([0, tail_rows], dtype=torch.int32, device=device)
+            ok = True
+            for seq_k in (ROWS, 640):
+                sk = torch.tensor([seq_k], dtype=torch.int32, device=device)
+                ref = torch.empty((ROWS, 32, 128), dtype=torch.bfloat16, device=device)
+                got = torch.empty((tail_rows, 32, 128), dtype=torch.bfloat16, device=device)
+                flash_attn_varlen_func(
+                    q=q, k=k_cache, v=v_cache, out=ref, cu_seqlens_q=cu_512, max_seqlen_q=ROWS,
+                    seqused_k=sk, max_seqlen_k=seq_k, softmax_scale=scale, causal=True,
+                    window_size=(-1, -1), block_table=bt, fa_version=2, num_splits=0,
+                )
+                flash_attn_varlen_func(
+                    q=q[ROWS - tail_rows :], k=k_cache, v=v_cache, out=got, cu_seqlens_q=cu_tail,
+                    max_seqlen_q=tail_rows, seqused_k=sk, max_seqlen_k=seq_k, softmax_scale=scale,
+                    causal=True, window_size=(-1, -1), block_table=bt, fa_version=2, num_splits=0,
+                )
+                torch.cuda.synchronize()
+                if not torch.equal(ref[ROWS - tail_rows :].view(torch.int16), got.view(torch.int16)):
+                    ok = False
+                    break
+            if ok:
+                return id(attn), tail_rows, cu_tail
+    except Exception:
+        return 0, 0, None
+    return 0, 0, None
+
+
+def flash_tail_if_active(
+    layer,
+    num_actual_tokens: int,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    seqused_k: torch.Tensor | None,
+    causal,
+    sliding_window_size,
+    scheduler_metadata,
+    fa_version: int,
+):
+    if not RESTRICT:
+        return None
+    active = _active.get()
+    if active is None:
+        return None
+    tile = active[0]
+    if id(layer) != tile.attn_address or tile.attn_cu_q is None:
+        return None
+    if (
+        num_actual_tokens != ROWS
+        or max_seqlen_q != ROWS
+        or causal is not True
+        or fa_version != 2
+        or scheduler_metadata is not None
+        or cu_seqlens_q.ndim != 1
+        or cu_seqlens_q.shape[0] != 2
+        or seqused_k is None
+        or seqused_k.ndim != 1
+        or seqused_k.shape[0] != 1
+    ):
+        return None
+    if sliding_window_size is not None and not (
+        len(sliding_window_size) == 2 and sliding_window_size[0] < 0 and sliding_window_size[1] < 0
+    ):
+        return None
+    restrict_stats["attn"] += 1
+    return tile.attn_tail_rows, tile.attn_cu_q
