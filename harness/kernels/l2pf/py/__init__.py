@@ -52,8 +52,21 @@ def lib():
     if hasattr(h, "l2pf_prefetch_desc_spread"):
         h.l2pf_prefetch_desc_spread.argtypes = h.l2pf_prefetch_desc.argtypes
         h.l2pf_prefetch_desc_spread.restype = ctypes.c_int
+    if hasattr(h, "l2pf_set_persisting_window"):
+        h.l2pf_set_persisting_window.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p,
+        ]
+        h.l2pf_set_persisting_window.restype = ctypes.c_int
     _lib = h
     return h
+
+
+def set_persisting_window(base_ptr: int, num_bytes: int, limit_bytes: int, stream: torch.cuda.Stream) -> bool:
+    h = lib()
+    if h is None or not hasattr(h, "l2pf_set_persisting_window"):
+        return False
+    rc = h.l2pf_set_persisting_window(base_ptr, int(num_bytes), int(limit_bytes), stream.cuda_stream)
+    return rc == 0
 
 
 def prefetch(t: torch.Tensor, nbytes: int, stream: torch.cuda.Stream,

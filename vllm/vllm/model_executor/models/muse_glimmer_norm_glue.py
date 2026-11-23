@@ -26,6 +26,9 @@ real weights. Prompt-sized launches always run the compiled kernel.
 
 from __future__ import annotations
 
+import ast
+from collections import Counter
+from functools import cache
 import hashlib
 import os
 import re
@@ -42,8 +45,287 @@ _MAX_POST_ATTN_ROWS = 4096
 # Diagnostics only: compare both kernels on every eligible launch made outside graph capture (real
 # activations of short prompts, which run without graphs). Off by default.
 _AUDIT = os.environ.get("VLLM_MUSE_GLIMMER_NORM_GLUE_AUDIT", "0") == "1"
+_DECODE_GATE_FOLD = os.environ.get("VLLM_MUSE_GLIMMER_DECODE_GATE_FOLD", "1") == "1"
+_DROP_BF16 = os.environ.get("VLLM_MUSE_GLIMMER_DECODE_DROP_BF16", "1") == "1"
+_RANS_PROLOGUE = os.environ.get("MUSE_RANS_PROLOGUE_FUSE", "1") != "0"
+_MUL_SIGMOID_GLUE = os.environ.get("MUSE_MUL_SIGMOID_GLUE", "1") != "0"
+_REQUANT = "triton_poi_fused__to_copy_clamp_mul_reciprocal_0"
+_REQUANT_BODY = "f7a07e4acde4818e0fe4bcb2f62a211fa163724414f5efcce3d93ee433b8300f"
+_SIGMOID_FP8_HASH = "68ddaaf112b7f2fbd8d452b5eb8b93c39567cfe29e167a625d3194458669ad01"
+_SILU_FP8_HASH = "19d65ce965db0a8c0bb1cfcaca79c3ac3de250ee8ed0a3aa1983d8c3612df9dc"
+_MUL_SIGMOID_BF16_HASH = "d7dbdd6fbb45cd65ebdcb6c1fde8d461e74484b611165ad886a6d2e589ff6573"
 _stats = dict(routed=0, routed_captured=0, captured_unchecked=0, compiled_ineligible=0, audit_ok=0,
               audit_mismatch=0, audit_error=0)
+
+
+class _GateLayer:
+    __slots__ = ("qkv_scale", "gate_scale", "buffer", "state", "formula")
+
+    def __init__(self, qkv_scale: torch.Tensor, gate_scale: torch.Tensor, buffer: torch.Tensor):
+        self.qkv_scale = qkv_scale
+        self.gate_scale = gate_scale
+        self.buffer = buffer
+        self.state = "unchecked"  # -> "norm_ok" -> "requant_ok" -> "admitted" | "rejected"
+        self.formula: bool | None = None
+
+
+_gate_layers: dict[int, _GateLayer] = {}
+_pending_decode = None  # (out_bf16_ptr, _GateLayer, rows, folded)
+_expect_decode = None   # (requant_out_ptr, _GateLayer, rows, folded)
+_gate_counts = Counter()
+_prologue_state: dict[int, str] = {}  # scale_ptr -> "admitted" | "rejected"
+_pending_rans_prologue = None  # (out_fp8_ptr, act_mode, x0, x1, scale_ptr, skipped)
+_prologue_counts = Counter()
+
+
+def consume_rans_prologue(
+    A: torch.Tensor, As: torch.Tensor, packed: torch.Tensor, n: int, k: int, Bs: torch.Tensor
+) -> torch.Tensor | None:
+    """Consume a pending M=1 fused activation+FP8 prologue inside muse_fp8_scaled_mm."""
+    global _pending_rans_prologue
+    if _pending_rans_prologue is None:
+        return None
+    ptr, act_mode, x0, x1, scale_ptr, skipped = _pending_rans_prologue
+    _pending_rans_prologue = None
+    if A.data_ptr() != ptr or As.data_ptr() != scale_ptr:
+        if skipped:
+            raise RuntimeError("muse_glimmer_norm_glue: skipped prologue did not reach expected FP8 GEMM")
+        _prologue_state[scale_ptr] = "rejected"
+        return None
+    import muse_rans_ext as _rans
+
+    aux = x1 if x1 is not None else x0
+    if not skipped:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        ref = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
+        got = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
+        _rans.rans_gemv_auto(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), ref, n, k)
+        _rans.rans_gemv_fused_auto(
+            packed, x0.view(-1), aux.view(-1), Bs.reshape(-1), As.reshape(-1), got, n, k, act_mode
+        )
+        torch.cuda.synchronize()
+        if torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+            _prologue_state[scale_ptr] = "admitted"
+            _prologue_counts["admitted"] += 1
+            if _prologue_counts["admitted"] in (1, 42, 54):
+                logger.info("Decode rANS prologue fusion: %d FP8 layers admitted", _prologue_counts["admitted"])
+        else:
+            _prologue_state[scale_ptr] = "rejected"
+            _prologue_counts["rejected"] += 1
+        del x0, x1, aux
+        return ref
+    # Hold x0/x1 alive across output allocation so caching allocator cannot alias them.
+    out = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
+    _rans.rans_gemv_fused_auto(
+        packed, x0.view(-1), aux.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k, act_mode
+    )
+    _prologue_counts["fused_launches"] += 1
+    del x0, x1, aux
+    return out
+
+
+class _MulSigmoidSwap:
+    def __init__(self) -> None:
+        self.state = "unchecked"
+
+    def run(self, kernel, orig_run, args, kwargs):
+        if kwargs.get("benchmark_run", False) or self.state == "rejected" or len(args) != 4:
+            return orig_run(kernel, *args, **kwargs)
+        gate, attn, out, numel = args
+        try:
+            n_el = int(numel)
+        except Exception:
+            return orig_run(kernel, *args, **kwargs)
+        stream = kwargs.get("stream")
+        if (
+            stream is None
+            or n_el != 4096
+            or not all(
+                isinstance(t, torch.Tensor)
+                and t.is_cuda
+                and t.dtype == torch.bfloat16
+                and t.is_contiguous()
+                and t.numel() == 4096
+                and (t.data_ptr() & 15) == 0
+                for t in (gate, attn, out)
+            )
+        ):
+            return orig_run(kernel, *args, **kwargs)
+        import muse_norm_glue as G
+
+        if self.state == "unchecked":
+            if torch.cuda.is_current_stream_capturing():
+                return orig_run(kernel, *args, **kwargs)
+            ok = False
+            try:
+                g_c, a_c = gate.clone(), attn.clone()
+                mine = torch.empty_like(out)
+                orig_run(kernel, *args, **kwargs)
+                G.mul_sigmoid_bf16(g_c, a_c, mine, 4096, stream)
+                torch.cuda.synchronize()
+                ok = torch.equal(out.view(torch.int16), mine.view(torch.int16))
+                if ok:
+                    gen = torch.Generator(device=out.device).manual_seed(20261123)
+                    for sig in (0.1, 1.0, 5.0, 20.0):
+                        rg = (torch.randn((1, 4096), generator=gen, device=out.device) * sig).to(torch.bfloat16)
+                        ra = (torch.randn((1, 4096), generator=gen, device=out.device) * sig).to(torch.bfloat16)
+                        ro = torch.empty_like(rg)
+                        mo = torch.empty_like(rg)
+                        orig_run(kernel, rg, ra, ro, 4096, **kwargs)
+                        G.mul_sigmoid_bf16(rg, ra, mo, 4096, stream)
+                        torch.cuda.synchronize()
+                        if not torch.equal(ro.view(torch.int16), mo.view(torch.int16)):
+                            ok = False
+                            break
+            except Exception:
+                ok = False
+            self.state = "admitted" if ok else "rejected"
+            logger.info("Decode mul_sigmoid glue: %s", self.state)
+            return None
+        G.mul_sigmoid_bf16(gate, attn, out, 4096, stream)
+        return None
+
+
+class _RansPrologueHook:
+    def __init__(self, act_mode: int) -> None:
+        self.act_mode = act_mode
+
+    def run(self, kernel, orig_run, args, kwargs):
+        global _pending_rans_prologue
+        if kwargs.get("benchmark_run", False) or _pending_rans_prologue is not None:
+            return orig_run(kernel, *args, **kwargs)
+        try:
+            import muse_rans_ext as _rans
+            if not hasattr(_rans, "rans_gemv_fused_auto"):
+                return orig_run(kernel, *args, **kwargs)
+        except Exception:
+            return orig_run(kernel, *args, **kwargs)
+        if self.act_mode == 1:
+            if len(args) != 5:
+                return orig_run(kernel, *args, **kwargs)
+            gate, attn, scale, out, numel = args
+            try:
+                n_el = int(numel)
+            except Exception:
+                return orig_run(kernel, *args, **kwargs)
+            if (
+                n_el != 4096
+                or not all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gate, attn, scale, out))
+                or gate.dtype != torch.bfloat16 or attn.dtype != torch.bfloat16
+                or gate.numel() != 4096 or attn.numel() != 4096
+                or ((gate.data_ptr() | attn.data_ptr()) & 7) != 0
+                or scale.dtype != torch.float32 or scale.numel() != 1
+                or out.dtype != torch.float8_e4m3fn or out.numel() != 4096
+            ):
+                return orig_run(kernel, *args, **kwargs)
+            x0, x1 = gate, attn
+        else:
+            if len(args) != 4:
+                return orig_run(kernel, *args, **kwargs)
+            gu, scale, out, numel = args
+            try:
+                n_el = int(numel)
+            except Exception:
+                return orig_run(kernel, *args, **kwargs)
+            if (
+                n_el != 19968
+                or not all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gu, scale, out))
+                or gu.dtype != torch.bfloat16 or gu.numel() != 39936
+                or (gu.data_ptr() & 7) != 0
+                or scale.dtype != torch.float32 or scale.numel() != 1
+                or out.dtype != torch.float8_e4m3fn or out.numel() != 19968
+            ):
+                return orig_run(kernel, *args, **kwargs)
+            x0, x1 = gu, None
+        s_ptr = scale.data_ptr()
+        st = _prologue_state.get(s_ptr, "unchecked")
+        if st == "rejected":
+            return orig_run(kernel, *args, **kwargs)
+        if st == "admitted":
+            _pending_rans_prologue = (out.data_ptr(), self.act_mode, x0, x1, s_ptr, True)
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            return orig_run(kernel, *args, **kwargs)
+        orig_run(kernel, *args, **kwargs)
+        _pending_rans_prologue = (out.data_ptr(), self.act_mode, x0, x1, s_ptr, False)
+        return None
+
+
+def register_gate(qkv_scale: torch.Tensor, gate_scale: torch.Tensor) -> bool:
+    """Register an FP8-attention layer (qkv_scale -> gate_scale) for M<=16 decode gate-quant fold."""
+    if not _DECODE_GATE_FOLD:
+        return False
+    for t in (qkv_scale, gate_scale):
+        if not (isinstance(t, torch.Tensor) and t.is_cuda and t.dtype == torch.float32 and t.numel() == 1):
+            return False
+    key = qkv_scale.data_ptr()
+    if key not in _gate_layers:
+        buf = torch.empty((_MAX_ROWS, _H), dtype=torch.float8_e4m3fn, device=qkv_scale.device)
+        _gate_layers[key] = _GateLayer(qkv_scale, gate_scale, buf)
+    return True
+
+
+def _gate_native_ok() -> bool:
+    try:
+        import muse_norm_glue as G
+        return G.lib() is not None and hasattr(G.lib(), "muse_norm_glue_post_ff_gate") and hasattr(G.lib(), "muse_norm_glue_gate_formula")
+    except Exception:
+        return False
+
+
+@cache
+def _body_hash(source: str) -> str | None:
+    definitions = ast.parse(source).body
+    if len(definitions) != 1 or not isinstance(definitions[0], ast.FunctionDef):
+        return None
+    fn = definitions[0]
+    fn.name = "requant"
+    fn.decorator_list = []
+    return hashlib.sha256(ast.dump(fn, include_attributes=False).encode()).hexdigest()
+
+
+def _formula_ok(kernel, orig_run, layer: _GateLayer, stream) -> bool:
+    import muse_norm_glue as G
+
+    dev = layer.gate_scale.device
+    bits = torch.arange(65536, dtype=torch.int32, device=dev).to(torch.int16)
+    theirs = torch.empty(65536, dtype=torch.float8_e4m3fn, device=dev)
+    mine = torch.empty(65536, dtype=torch.uint8, device=dev)
+    orig_run(kernel, bits.view(torch.bfloat16), layer.gate_scale, theirs, 65536, stream=stream)
+    G.gate_formula(bits, layer.gate_scale, mine, 65536, stream)
+    torch.cuda.synchronize()
+    return torch.equal(theirs.view(torch.uint8), mine)
+
+
+def decode_gemm_operand(a: torch.Tensor) -> torch.Tensor:
+    """Redirect M<=16 gate FP8 GEMM operand to the folded buffer when requant was skipped."""
+    global _expect_decode
+    if _expect_decode is None:
+        return a
+    ptr, layer, rows, folded = _expect_decode
+    _expect_decode = None
+    if a.data_ptr() != ptr:
+        if folded:
+            raise RuntimeError("muse_glimmer_norm_glue: skipped requant output did not reach decode gate GEMM")
+        layer.state = "rejected"
+        _gate_counts["rejected_order"] += 1
+        return a
+    if not folded:
+        if layer.state == "requant_ok" and not torch.cuda.is_current_stream_capturing():
+            layer.state = "admitted"
+            _gate_counts["admitted"] += 1
+            if _gate_counts["admitted"] in (1, 27, 28):
+                logger.info("Decode gate-quant fold: %d layers admitted (requant skipped: %d)",
+                            _gate_counts["admitted"], _gate_counts["requant_skipped"])
+        else:
+            layer.state = "rejected"
+            _gate_counts["rejected_order"] += 1
+        return a
+    if a.shape != (rows, _H) or a.dtype != torch.float8_e4m3fn or not a.is_contiguous():
+        raise RuntimeError(f"muse_glimmer_norm_glue: decode GEMM operand shape changed: {tuple(a.shape)}")
+    _gate_counts["gemm_redirected"] += 1
+    return layer.buffer[:rows]
 
 # sha256 of the kernel function source with its name replaced by KERNEL and
 # trailing whitespace removed (see _canonical_hash).
@@ -174,7 +456,7 @@ class _NormSwap:
                 return False
         return True
 
-    def _check(self, kernel, orig_run, args, kwargs, tensors, rows, stream) -> bool:
+    def _check(self, kernel, orig_run, args, kwargs, tensors, rows, stream, out_snapshot=None) -> bool:
         if self.kind == 1:
             sc = float(tensors[4 if self.op == "post_attn" else 7].reshape(()).item())
             if not 1.2e-38 < abs(sc) < 8.5e37:
@@ -182,6 +464,8 @@ class _NormSwap:
         # 1) the real launch: the compiled kernel writes the real outputs, the replacement writes copies
         outs = self._outputs(tensors)
         snapshot = [t.clone() for t in tensors]
+        if out_snapshot is not None:
+            out_snapshot[:] = snapshot
         orig_run(kernel, *args, **kwargs)
         mine = [t.clone() for t in snapshot]
         self._launch(mine, rows, stream)
@@ -234,7 +518,40 @@ class _NormSwap:
                     return False
         return True
 
+    def _gate_check_real(self, glayer: _GateLayer, snapshot, tensors, rows, stream) -> None:
+        global _pending_decode
+        import muse_norm_glue as G
+
+        try:
+            gsc = float(glayer.gate_scale.reshape(()).item())
+            if not 1.2e-38 < abs(gsc) < 8.5e37:
+                glayer.state = "rejected"
+                _gate_counts["rejected_scale"] += 1
+                return
+            copy = [t.clone() for t in snapshot]
+            x, d, res, sx, wp, wf, wi, sc, o, q = copy
+            G.post_ff_gate(rows, x, d, res, sx, wp, wf, wi, sc, o, q, glayer.gate_scale, glayer.buffer, 1, stream)
+            torch.cuda.synchronize()
+            if all(torch.equal(tensors[i].reshape(-1).view(torch.uint8), copy[i].reshape(-1).view(torch.uint8)) for i in (0, 8, 9)):
+                glayer.state = "norm_ok"
+                _pending_decode = (tensors[8].data_ptr(), glayer, rows, False)
+            else:
+                glayer.state = "rejected"
+                _gate_counts["rejected_norm"] += 1
+        except Exception:
+            glayer.state = "rejected"
+            _gate_counts["rejected_norm"] += 1
+
     def run(self, kernel, orig_run, args, kwargs):
+        global _pending_decode
+        if kwargs.get("benchmark_run", False):
+            return orig_run(kernel, *args, **kwargs)
+        if self.op == "post_ff" and _pending_decode is not None:
+            if _pending_decode[3]:
+                raise RuntimeError("muse_glimmer_norm_glue: folded gate operand was never consumed by requant")
+            _pending_decode[1].state = "rejected"
+            _gate_counts["rejected_order"] += 1
+            _pending_decode = None
         if self.state == "rejected":
             return orig_run(kernel, *args, **kwargs)
         split = self._split(args)
@@ -259,7 +576,6 @@ class _NormSwap:
                         "%d not run", self.op, self.kind, rows,
                         {True: "identical", False: "DIFFERENT", None: "NOT RUN"}[ok],
                         _stats["audit_ok"], _stats["audit_mismatch"], _stats["audit_error"])
-            # _compare ran the compiled kernel on the real tensors; its outputs stand.
             return None
         if self.state == "unchecked":
             if capturing:
@@ -269,9 +585,10 @@ class _NormSwap:
                                    "capture; it keeps the compiled kernel")
                 return orig_run(kernel, *args, **kwargs)
             ok = False
+            snapshot: list[torch.Tensor] = []
             try:
                 # The check's first step is the real compiled launch, so the launcher is built after it.
-                ok = self._check(kernel, orig_run, args, kwargs, tensors, rows, stream) and _config_ok(kernel)
+                ok = self._check(kernel, orig_run, args, kwargs, tensors, rows, stream, snapshot) and _config_ok(kernel)
             except Exception:
                 logger.warning("Decode norm glue check failed to run", exc_info=True)
             self.state = "admitted" if ok else "rejected"
@@ -281,9 +598,25 @@ class _NormSwap:
                 _NormSwap.rejected += 1
             logger.info("Exact decode norm kernels: %d compiled kernels admitted, %d rejected",
                         _NormSwap.admitted, _NormSwap.rejected)
-            # The compiled kernel already wrote this launch's outputs.
+            if ok and self.op == "post_ff" and self.kind == 1 and _DECODE_GATE_FOLD and not _AUDIT and _gate_native_ok():
+                glayer = _gate_layers.get(tensors[7].data_ptr())
+                if glayer is not None and glayer.state == "unchecked":
+                    self._gate_check_real(glayer, snapshot, tensors, rows, stream)
             return None
-        self._launch(tensors, rows, stream)
+        glayer = _gate_layers.get(tensors[7].data_ptr()) if (self.op == "post_ff" and self.kind == 1 and _DECODE_GATE_FOLD and not _AUDIT and _gate_native_ok()) else None
+        if glayer is not None and glayer.state == "admitted":
+            import muse_norm_glue as G
+
+            x, d, res, sx, wp, wf, wi, sc, o, q = tensors
+            G.post_ff_gate(rows, x, d, res, sx, wp, wf, wi, sc, o, q, glayer.gate_scale, glayer.buffer, int(not _DROP_BF16), stream)
+            _pending_decode = (o.data_ptr(), glayer, rows, True)
+            _gate_counts["folded_launches"] += 1
+        elif glayer is not None and glayer.state == "unchecked" and not capturing:
+            snapshot = [t.clone() for t in tensors]
+            self._launch(tensors, rows, stream)
+            self._gate_check_real(glayer, snapshot, tensors, rows, stream)
+        else:
+            self._launch(tensors, rows, stream)
         _stats["routed"] += 1
         if _stats["routed"] in (1, 64, 128, 256, 512):
             logger.info("Exact decode norm kernels: %d launches routed (%d under capture), %d left compiled while "
@@ -294,18 +627,26 @@ class _NormSwap:
         return None
 
 
-def _classify(kernel) -> _NormSwap | None:
+def _classify(kernel):
     meta = getattr(kernel, "inductor_meta", None) or {}
     name = meta.get("kernel_name", "")
-    if not name.startswith("triton_red_fused__to_copy_add_"):
-        return None
     src = getattr(getattr(kernel, "fn", None), "src", None)
     if not isinstance(src, str):
         return None
-    known = _KNOWN.get(_canonical_hash(src))
-    if known is None:
-        return None
-    return _NormSwap(*known)
+    if name.startswith("triton_red_fused__to_copy_add_"):
+        known = _KNOWN.get(_canonical_hash(src))
+        if known is None:
+            return None
+        return _NormSwap(*known)
+    if name.startswith("triton_poi_fused_"):
+        h = _canonical_hash(src)
+        if _RANS_PROLOGUE and h == _SIGMOID_FP8_HASH:
+            return _RansPrologueHook(1)
+        if _RANS_PROLOGUE and h == _SILU_FP8_HASH:
+            return _RansPrologueHook(2)
+        if _MUL_SIGMOID_GLUE and h == _MUL_SIGMOID_BF16_HASH:
+            return _MulSigmoidSwap()
+    return None
 
 
 _installed = False
@@ -326,9 +667,66 @@ def install_norm_glue() -> None:
     except Exception:
         logger.info("muse_norm_glue or the Inductor launcher not available; decode norm glue disabled")
         return
+
+    def _fold_requant(autotuner, orig_run, args, kwargs) -> bool:
+        global _pending_decode, _expect_decode
+        if _pending_decode is None or len(args) != 4 or not all(isinstance(t, torch.Tensor) for t in args[:3]):
+            return False
+        ptr, layer, rows, folded = _pending_decode
+        hidden, scale, out, numel = args
+        try:
+            n_el = int(numel)
+        except Exception:
+            return False
+        if hidden.data_ptr() != ptr or scale.data_ptr() != layer.gate_scale.data_ptr():
+            if folded:
+                raise RuntimeError("muse_glimmer_norm_glue: requant mismatch after folded post_ff")
+            return False
+        _pending_decode = None
+        stream = kwargs.get("stream")
+        if (
+            stream is None
+            or n_el != rows * _H
+            or out.numel() != n_el
+            or out.dtype != torch.float8_e4m3fn
+            or not out.is_cuda
+            or not out.is_contiguous()
+        ):
+            if folded:
+                raise RuntimeError("muse_glimmer_norm_glue: folded layer requant changed shape")
+            layer.state = "rejected"
+            _gate_counts["rejected_requant_args"] += 1
+            return False
+        if folded:
+            _expect_decode = (out.data_ptr(), layer, rows, True)
+            _gate_counts["requant_skipped"] += 1
+            return True
+        if layer.state != "norm_ok" or torch.cuda.is_current_stream_capturing():
+            return False
+        fn = getattr(autotuner, "fn", None)
+        if fn is None or _body_hash(fn.src) != _REQUANT_BODY:
+            layer.state = "rejected"
+            _gate_counts["rejected_requant_src"] += 1
+            return False
+        orig_run(autotuner, *args, **kwargs)
+        torch.cuda.synchronize()
+        if layer.formula is None:
+            layer.formula = _formula_ok(autotuner, orig_run, layer, stream)
+        if layer.formula and torch.equal(out.reshape(-1).view(torch.uint8), layer.buffer[:rows].reshape(-1).view(torch.uint8)):
+            layer.state = "requant_ok"
+            _expect_decode = (out.data_ptr(), layer, rows, False)
+        else:
+            layer.state = "rejected"
+            _gate_counts["rejected_requant_bytes"] += 1
+        return True
+
     prev_run = CachingAutotuner.run
 
     def run(self, *args, **kwargs):
+        if _pending_decode is not None and not kwargs.get("benchmark_run", False):
+            if getattr(getattr(self, "fn", None), "__name__", None) == _REQUANT:
+                if _fold_requant(self, prev_run, args, kwargs):
+                    return None
         swap = self.__dict__.get("_norm_glue_swap", 0)
         if swap == 0:
             try:
@@ -341,4 +739,15 @@ def install_norm_glue() -> None:
         return swap.run(self, prev_run, args, kwargs)
 
     CachingAutotuner.run = run
+    try:
+        from vllm.model_executor.kernels.linear.scaled_mm import muse_fp8 as _muse_fp8
+        _muse_fp8._decode_gemm_operand = decode_gemm_operand
+        _muse_fp8._consume_rans_prologue = consume_rans_prologue
+    except Exception:
+        pass
+    try:
+        from vllm.model_executor.layers.quantization.utils import glimmer_fp8 as _glimmer_fp8
+        _glimmer_fp8._decode_gemm_operand = decode_gemm_operand
+    except Exception:
+        pass
     _installed = True

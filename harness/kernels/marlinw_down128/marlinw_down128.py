@@ -23,7 +23,7 @@ SMS = 48
 ENABLED = os.environ.get("MARLIN_DOWN128", "1") == "1"
 ATTN_ENABLED = os.environ.get("MARLIN_ATTN128", "1") == "1"
 _ALL_ATTN_SHAPES = {(4608, 6656): "qkv", (6656, 4096): "o_proj", (4096, 6656): "gate"}
-_enabled_attn = set(os.environ.get("MARLIN_ATTN128_SHAPES", "qkv").split(","))
+_enabled_attn = set(os.environ.get("MARLIN_ATTN128_SHAPES", "qkv,o_proj").split(","))
 ATTN_SHAPES = {k: v for k, v in _ALL_ATTN_SHAPES.items() if v in _enabled_attn}
 ATTN_TMA_ENABLED = ATTN_ENABLED and os.environ.get("MARLIN_ATTN_TMA", "1") == "1"
 _DEFAULT_TAIL = {(6656, 19968): 16, (4608, 6656): 0, (4096, 6656): 8, (6656, 4096): 16}
@@ -177,7 +177,7 @@ def tma_work_lists_shape(n: int, k: int, shared_bytes: int):
     cut = _shape_cuts(n, k, shared_bytes)
     k_tiles = k // 64
     n_col = n // 128
-    tma_pg = int(os.environ.get("D128_TMA_PG", "2"))
+    tma_pg = int(os.environ.get("D128_TMA_PG", "4"))
     order = [(col, pair) for g in range(0, 4, tma_pg) for col in range(n_col) for pair in range(g, g + tma_pg)]
     slots = 0
     slot_of = {}
@@ -254,7 +254,7 @@ def tma_work_lists(shared_bytes: int, sizes=PIECES):
     n_col = COLUMNS // 128
     assert sum(sizes) == k_tiles and all(v % 8 == 0 for v in starts) and starts[2] < 1024
     assert n_col * 4 == 4 * SMS + SPLIT
-    tma_pg = int(os.environ.get("D128_TMA_PG", "2"))
+    tma_pg = int(os.environ.get("D128_TMA_PG", "4"))
     order = [(col, pair) for g in range(0, 4, tma_pg) for col in range(n_col) for pair in range(g, g + tma_pg)]
     whole, split = order[:-SPLIT], order[-SPLIT:]
     slots = SPLIT  # scratch: SPLIT hand-over states, then one slot per tile with a stock cut

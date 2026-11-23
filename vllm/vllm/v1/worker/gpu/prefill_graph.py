@@ -253,6 +253,10 @@ class PrefillGraph:
         self.replays = 0
         self._fast_replays = 0
         self._fast_verified = False
+        self._zp_enabled = os.environ.get("VLLM_PREFILL_GRAPH_ZERO_PREP", "1") != "0"
+        self._zp_verified = False
+        self._zp_failed = False
+        self._zp_replays = 0
         self._logged_refusal = False
 
         model_state = runner.model_state
@@ -338,6 +342,34 @@ class PrefillGraph:
         if _muse_embed is not None:
             logger.info("Prefill graph embedding: fused muse_embed %s (%d fused calls)",
                         _muse_embed.state["reason"] or "not used", _muse_embed.state["fused_calls"])
+        self._init_zero_prep(runner)
+
+    def _init_zero_prep(self, runner) -> None:
+        try:
+            n = self.num_tokens
+            dev = runner.device
+            ib = runner.input_buffers
+            bt = runner.block_tables
+            self._zp_positions_gpu = torch.arange(n, dtype=torch.int64, device=dev)
+            self._zp_seq_lens_gpu = torch.zeros_like(ib.seq_lens)
+            self._zp_seq_lens_gpu[0] = n
+            self._zp_qsl_gpu = torch.full_like(ib.query_start_loc, n)
+            self._zp_qsl_gpu[0] = 0
+            self._zp_logits_indices_gpu = torch.tensor([n - 1], dtype=torch.int32, device=dev)
+            self._zp_pin_ids = torch.empty((n,), dtype=torch.int32, pin_memory=True)
+            self._zp_pin_ids_np = self._zp_pin_ids.numpy()
+            num_g = bt.num_kv_cache_groups
+            self._zp_pin_slots = torch.empty((num_g, n), dtype=torch.int64, pin_memory=True)
+            self._zp_pin_slots_np = self._zp_pin_slots.numpy()
+            self._zp_pin_bt = [
+                torch.zeros((bt.input_block_tables[g].shape[1],), dtype=torch.int32, pin_memory=True)
+                for g in range(num_g)
+            ]
+            self._zp_pin_bt_np = [t.numpy() for t in self._zp_pin_bt]
+            self._zp_bs_offsets = [np.arange(bs, dtype=np.int64) for bs in bt.block_sizes]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Prefill graph zero-prep init skipped: %s", exc)
+            self._zp_failed = True
 
     def _forward(self):
         with set_forward_context(
@@ -471,3 +503,58 @@ class PrefillGraph:
         if self._fast_replays == 1:
             logger.info("Prefill graph: fast replay active (skipping 52-layer metadata and _plan)")
         return self.hidden_states
+
+    def stage_zero_prep(
+        self,
+        input_buffers,
+        block_tables,
+        prefill_token_ids: list[int],
+        block_ids: tuple[list[int], ...],
+        pad_id: int,
+        skip_padding: bool,
+    ) -> bool:
+        if not self._fast_verified or not self._zp_enabled or self._zp_failed or self.embed_input_ids is None:
+            return False
+        n = self.num_tokens
+        pos = self.model_inputs.get("positions")
+        if pos is None or len(prefill_token_ids) != n or len(block_ids) != block_tables.num_kv_cache_groups:
+            return False
+        raw_ids = input_buffers.input_ids[:n]
+        raw_pos = input_buffers.positions[:n]
+        raw_pad = input_buffers.is_padding[:n]
+        raw_slots = block_tables.slot_mappings[:, :n]
+        if (
+            raw_ids.data_ptr() != self.embed_input_ids.data_ptr()
+            or raw_pos.data_ptr() != pos.data_ptr()
+            or raw_pad.data_ptr() != self.is_padding.data_ptr()
+            or raw_slots.data_ptr() != self._raw_slot_sig[0]
+            or len(block_tables.input_block_tables) != len(self._raw_bt_sig)
+        ):
+            return False
+        for g, sig in enumerate(self._raw_bt_sig):
+            bt_view = block_tables.input_block_tables[g][:1]
+            if (bt_view.data_ptr(), tuple(bt_view.shape), tuple(bt_view.stride())) != sig:
+                return False
+        for g in range(block_tables.num_kv_cache_groups):
+            bs = block_tables.block_sizes[g]
+            bids = block_ids[g]
+            nb = len(bids)
+            if nb * bs < n or nb > self._zp_pin_bt_np[g].shape[0]:
+                return False
+            bids_arr = np.asarray(bids, dtype=np.int64)
+            slots_full = (bids_arr[:, None] * bs + self._zp_bs_offsets[g][None, :]).reshape(-1)
+            self._zp_pin_slots_np[g, :] = slots_full[:n]
+            bt_np = self._zp_pin_bt_np[g]
+            bt_np[:nb] = bids_arr
+        self._zp_pin_ids_np[:] = prefill_token_ids
+        if skip_padding:
+            raw_pad.fill_(False)
+        raw_ids.copy_(self._zp_pin_ids, non_blocking=True)
+        raw_pos.copy_(self._zp_positions_gpu, non_blocking=True)
+        input_buffers.seq_lens[:1].copy_(self._zp_seq_lens_gpu[:1], non_blocking=True)
+        input_buffers.query_start_loc[:2].copy_(self._zp_qsl_gpu[:2], non_blocking=True)
+        for g in range(block_tables.num_kv_cache_groups):
+            nb = len(block_ids[g])
+            block_tables.input_block_tables[g][0, :nb].copy_(self._zp_pin_bt[g][:nb], non_blocking=True)
+        raw_slots.copy_(self._zp_pin_slots, non_blocking=True)
+        return True

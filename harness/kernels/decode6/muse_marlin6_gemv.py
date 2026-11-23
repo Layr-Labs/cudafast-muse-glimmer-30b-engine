@@ -48,12 +48,16 @@ _sk_tma4_ilv = getattr(_lib, "muse_marlin6_sk_tma4_ilv", None)
 if _sk_tma4_ilv is not None:
     _sk_tma4_ilv.argtypes = _gemv6.argtypes
     _sk_tma4_ilv.restype = ctypes.c_int
+_get_gate_blocks = getattr(_lib, "muse_marlin6_get_gate_blocks", None)
+if _get_gate_blocks is not None:
+    _get_gate_blocks.argtypes = []
+    _get_gate_blocks.restype = ctypes.c_int
 _tma4_p1 = getattr(_lib, "muse_tma4_pass1", None)
 if _tma4_p1 is not None:
     _tma4_p1.argtypes = [
         ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
     ]
     _tma4_p1.restype = ctypes.c_int
 _tma4_p2 = getattr(_lib, "muse_tma4_pass2", None)
@@ -61,7 +65,7 @@ if _tma4_p2 is not None:
     _tma4_p2.argtypes = [
         ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
     ]
     _tma4_p2.restype = ctypes.c_int
@@ -70,8 +74,22 @@ if _tma4_p2 is not None:
 GATE_UP_N, GATE_UP_K = 39936, 6656
 DOWN_N, DOWN_K = 6656, 19968
 LM_HEAD_N, LM_HEAD_K = 202048, 6656
-_TMA4_SCHED_CACHE: dict[tuple[int, int, bool, torch.device], tuple] = {}
+ATTN_ILV_SHAPES = {(4608, 6656), (6656, 4096), (4096, 6656)}
+_TMA4_SCHED_CACHE: dict[tuple[int, int, bool, bool, int, torch.device], tuple] = {}
 _DOWN_ILV_SCALES: set[int] = set()
+
+
+def _nv6_gate_blocks() -> int:
+    if _get_gate_blocks is not None:
+        return int(_get_gate_blocks())
+    env = os.environ.get("MUSE_NV6_GATE_BLOCKS", "")
+    if not env:
+        return 24
+    try:
+        v = int(env)
+    except ValueError:
+        return 24
+    return v if v in (24, 32, 48) else 24
 
 # ---------------------------------------------------------------- rANS-coded gate/up block scales
 # Symbols: the layer's palette indices of the tiled one-byte scales. One table per layer (10-bit probabilities),
@@ -132,8 +150,16 @@ def is_tma4_ilv(scales: torch.Tensor) -> bool:
     return is_tma4(scales) and scales.data_ptr() in _DOWN_ILV_SCALES
 
 
-def _get_tma4_sched(n: int, k: int, fixed_grid: bool, device: torch.device):
-    key = (n, k, fixed_grid, device)
+def _get_tma4_sched(
+    n: int,
+    k: int,
+    fixed_grid: bool,
+    device: torch.device,
+    *,
+    gate_v48: bool = False,
+    gate_blocks: int = 48,
+):
+    key = (n, k, fixed_grid, gate_v48, gate_blocks, device)
     cached = _TMA4_SCHED_CACHE.get(key)
     if cached is not None:
         return cached
@@ -165,6 +191,24 @@ def _get_tma4_sched(n: int, k: int, fixed_grid: bool, device: torch.device):
             blk_off.append(len(stages))
             blk_iters.append(26)
             blk_sb_off.append(blk_sb_off[-1] + (26 + 3) // 4)
+    elif gate_v48:
+        num_blks = gate_blocks
+        vgrid = 48
+        iters = (k_tiles * n_tiles + vgrid - 1) // vgrid
+        total_p2 = n_tiles * k_tiles
+        for b in range(num_blks):
+            s_start = len(stages)
+            v1 = 47 - b
+            for pos in range(iters * v1, min(iters * (v1 + 1), total_p2)):
+                stages.append((pos // k_tiles, pos % k_tiles))
+            if v1 >= num_blks:
+                v2 = v1 - num_blks
+                for pos in range(iters * v2, min(iters * (v2 + 1), total_p2)):
+                    stages.append((pos // k_tiles, pos % k_tiles))
+            blk_off.append(len(stages))
+            it = len(stages) - s_start
+            blk_iters.append(it)
+            blk_sb_off.append(blk_sb_off[-1] + (it + 3) // 4)
     else:
         num_blks = 48
         part2_mn_tiles = n_tiles
@@ -191,21 +235,79 @@ def _get_tma4_sched(n: int, k: int, fixed_grid: bool, device: torch.device):
             it = len(stages) - s_start
             blk_iters.append(it)
             blk_sb_off.append(blk_sb_off[-1] + (it + 3) // 4)
+
+    total_sbs = blk_sb_off[-1]
+    blk_num_sbs = [(it + 3) // 4 for it in blk_iters]
+    sb_gsb_map = [0] * total_sbs
+    if fixed_grid:
+        max_sbs = 0
+        sb_row_off: list[int] = []
+        for b in range(num_blks):
+            w_idx, lane_b = divmod(b, 48)
+            base = blk_sb_off[b]
+            for sb in range(blk_num_sbs[b]):
+                sb_gsb_map[base + sb] = (w_idx * 13 + sb) * 48 + lane_b
+    else:
+        max_sbs = max(blk_num_sbs)
+        sb_row_off = []
+        gsb_cursor = 0
+        for sb in range(max_sbs):
+            active = [b for b in range(num_blks) if sb < blk_num_sbs[b]]
+            assert active == list(range(active[0], active[0] + len(active)))
+            assert gsb_cursor >= active[0]
+            sb_row_off.append(gsb_cursor - active[0])
+            for rank, b in enumerate(active):
+                sb_gsb_map[blk_sb_off[b] + sb] = gsb_cursor + rank
+            gsb_cursor += len(active)
+        assert gsb_cursor == total_sbs
+
     res = (
         torch.tensor(stages, dtype=torch.int32, device=device).reshape(-1),
         torch.tensor(blk_off, dtype=torch.int32, device=device),
         torch.tensor(blk_sb_off, dtype=torch.int32, device=device),
+        torch.tensor(sb_gsb_map, dtype=torch.int32, device=device),
         torch.tensor(blk_iters, dtype=torch.int32, device=device),
+        torch.tensor(sb_row_off, dtype=torch.int32, device=device),
         num_blks,
         threads,
-        blk_sb_off[-1],
+        total_sbs,
+        max_sbs,
+        stages,
+        blk_off,
+        blk_iters,
     )
     _TMA4_SCHED_CACHE[key] = res
     return res
 
 
-def encode_tma4_scales(tiled_scales: torch.Tensor, palette: torch.Tensor, n: int, k: int, fixed_grid: bool) -> torch.Tensor:
-    """Encode tiled one-byte scales into 4-stage TMA super-block rANS streams (shape (rows, 32) uint8)."""
+def _build_ilv_weight(w: torch.Tensor, n: int, k: int, gate_v48: bool, gate_blocks: int) -> torch.Tensor:
+    k_tiles = k // 128
+    *_, num_blks, _, _, _, stages, blk_off, blk_iters = _get_tma4_sched(
+        n, k, False, w.device, gate_v48=gate_v48, gate_blocks=gate_blocks
+    )
+    max_it = max(blk_iters)
+    perm = []
+    for s in range(max_it):
+        for b in range(num_blks):
+            if s < blk_iters[b]:
+                col, kt = stages[blk_off[b] + s]
+                perm.append(col * k_tiles + kt)
+    assert len(perm) == (n // 128) * k_tiles
+    idx_t = torch.tensor(perm, dtype=torch.long, device=w.device)
+    return w.reshape(len(perm), -1).index_select(0, idx_t).contiguous().view_as(w)
+
+
+def encode_tma4_scales(
+    tiled_scales: torch.Tensor,
+    palette: torch.Tensor,
+    n: int,
+    k: int,
+    fixed_grid: bool,
+    *,
+    gate_v48: bool = False,
+    gate_blocks: int = 48,
+) -> torch.Tensor:
+    """Encode tiled one-byte scales into wave/stage-interleaved 4-stage TMA super-block rANS streams (shape (rows, 32) uint8)."""
     if _tma4_p1 is None or _tma4_p2 is None:
         raise RuntimeError("GPU TMA4 rANS encoder unavailable")
     dev = tiled_scales.device
@@ -225,25 +327,26 @@ def encode_tma4_scales(tiled_scales: torch.Tensor, palette: torch.Tensor, n: int
     enc_f = f.to(dtype=torch.int32, device=dev)
     enc_c = cum.to(dtype=torch.int32, device=dev)
 
-    stage_col_k, blk_stage_off, blk_sb_off, blk_iters, num_blks, threads, total_sbs = _get_tma4_sched(
-        n, k, fixed_grid, dev
-    )
+    (
+        stage_col_k, blk_stage_off, blk_sb_off, sb_gsb_map,
+        blk_iters, sb_row_off, num_blks, threads, total_sbs, max_sbs, *_
+    ) = _get_tma4_sched(n, k, fixed_grid, dev, gate_v48=gate_v48, gate_blocks=gate_blocks)
     warps = threads // 32
-    rans_cap = 3072 if threads == 256 else 2048
+    rans_cap = 3200 if threads == 256 else 2048
     sb_wc = torch.empty(total_sbs * warps, dtype=torch.int32, device=dev)
     with torch.cuda.device(dev):
         stream = torch.cuda.current_stream().cuda_stream
         st = _tma4_p1(
             sym.data_ptr(), k_tiles, stage_col_k.data_ptr(), blk_stage_off.data_ptr(),
-            blk_sb_off.data_ptr(), enc_f.data_ptr(), enc_c.data_ptr(), sb_wc.data_ptr(),
-            num_blks, threads, stream,
+            blk_sb_off.data_ptr(), sb_gsb_map.data_ptr(), enc_f.data_ptr(), enc_c.data_ptr(),
+            sb_wc.data_ptr(), num_blks, threads, stream,
         )
         if st:
             raise RuntimeError(f"muse_tma4_pass1 failed with CUDA error {st}")
 
     wc2 = sb_wc.view(total_sbs, warps).long()
-    sb_words = warps + wc2.sum(dim=1)  # uint16 words: cw[warps] + warp words
-    sb_16b = (sb_words + 7) // 8       # 16-byte rows per super-block
+    sb_words = warps + wc2.sum(dim=1)
+    sb_16b = (sb_words + 7) // 8
     if int(sb_16b.max().item()) * 16 > rans_cap:
         raise ValueError(f"TMA4 super-block exceeds RANS_CAP ({int(sb_16b.max().item()) * 16} > {rans_cap})")
     off16_long = torch.zeros(total_sbs + 1, dtype=torch.long, device=dev)
@@ -251,7 +354,8 @@ def encode_tma4_scales(tiled_scales: torch.Tensor, palette: torch.Tensor, n: int
     total_var_bytes = int(off16_long[-1].item()) * 16
     off16 = off16_long.to(dtype=torch.int32)
 
-    meta_bytes = ((2 * num_blks + 1) * 4 + 15) // 16 * 16
+    meta_u32 = ((4 + num_blks + max_sbs + 3) // 4) * 4
+    meta_bytes = meta_u32 * 4
     off16_bytes = ((total_sbs + 1) * 4 + 15) // 16 * 16
     states_off = 4096 + meta_bytes + off16_bytes
     var_off = states_off + num_blks * threads * 4
@@ -259,18 +363,23 @@ def encode_tma4_scales(tiled_scales: torch.Tensor, palette: torch.Tensor, n: int
 
     coded = torch.zeros(total_bytes, dtype=torch.uint8, device=dev)
     coded[:4096].copy_(lut.to(dtype=torch.int32, device=dev).view(torch.uint8))
+    hdr_meta = torch.tensor([total_sbs, num_blks, max_sbs, threads], dtype=torch.int32, device=dev)
     p = 4096
-    b_sb = (num_blks + 1) * 4
-    coded[p : p + b_sb].copy_(blk_sb_off.view(torch.uint8))
-    coded[p + b_sb : p + b_sb + num_blks * 4].copy_(blk_iters.view(torch.uint8))
+    coded[p : p + 16].copy_(hdr_meta.view(torch.uint8))
+    p += 16
+    coded[p : p + num_blks * 4].copy_(blk_iters.view(torch.uint8))
+    p += num_blks * 4
+    if max_sbs > 0:
+        coded[p : p + max_sbs * 4].copy_(sb_row_off.view(torch.uint8))
     coded[4096 + meta_bytes : 4096 + meta_bytes + (total_sbs + 1) * 4].copy_(off16.view(torch.uint8))
     with torch.cuda.device(dev):
         stream = torch.cuda.current_stream().cuda_stream
         bp = coded.data_ptr()
         st = _tma4_p2(
             sym.data_ptr(), k_tiles, stage_col_k.data_ptr(), blk_stage_off.data_ptr(),
-            blk_sb_off.data_ptr(), enc_f.data_ptr(), enc_c.data_ptr(), sb_wc.data_ptr(),
-            off16.data_ptr(), bp + states_off, bp + var_off, num_blks, threads, stream,
+            blk_sb_off.data_ptr(), sb_gsb_map.data_ptr(), enc_f.data_ptr(), enc_c.data_ptr(),
+            sb_wc.data_ptr(), off16.data_ptr(), bp + states_off, bp + var_off,
+            num_blks, threads, stream,
         )
         if st:
             raise RuntimeError(f"muse_tma4_pass2 failed with CUDA error {st}")
@@ -483,7 +592,7 @@ def decode_linear6(
         use_grid = fixed_grid and _gate_up is not None and x.numel() == k and (n, k) == (39936, 6656)
         kernel = _gate_up if use_grid else _gemv6
         if is_tma4_ilv(scales6):
-            if not fixed_grid and x.numel() == k and (n, k) == (DOWN_N, DOWN_K) and _sk_tma4_ilv is not None:
+            if x.numel() == k and _sk_tma4_ilv is not None:
                 kernel = _sk_tma4_ilv
             else:
                 raise RuntimeError(f"TMA4-ILV rANS scales unsupported for shape ({n}, {k}, fixed={fixed_grid})")
@@ -761,18 +870,34 @@ def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
     gs = layer.weight_global_scale
     ws = layer.workspace
     expected = [decode_linear6(x, w, c, pal, gs, ws, n, k, fixed_grid) for x in probes]
-    coded = encode_tma4_scales(layer._marlin_decode_scales, pal, n, k, fixed_grid)
+    want_gu_ilv = (
+        fixed_grid
+        and (n, k) == (GATE_UP_N, GATE_UP_K)
+        and _sk_tma4_ilv is not None
+        and os.environ.get("MUSE_GATE_UP_ILV", "0") != "0"
+    )
+    gb = _nv6_gate_blocks() if (not fixed_grid and (n, k) == (4096, 6656)) else 48
+    is_gate_v48 = (not fixed_grid and (n, k) == (4096, 6656) and gb != 48)
+    coded = encode_tma4_scales(
+        layer._marlin_decode_scales, pal, n, k,
+        False if want_gu_ilv else fixed_grid,
+        gate_v48=is_gate_v48, gate_blocks=gb,
+    )
     if coded.numel() > c.numel():
         logger.warning("TMA4 (%dx%d) rejected: coded %d > c %d", n, k, coded.numel(), c.numel())
         return False
-    want_ilv = (
-        not fixed_grid
-        and (n, k) == (DOWN_N, DOWN_K)
-        and _sk_tma4_ilv is not None
-        and os.environ.get("MUSE_DOWN_ILV", "1") != "0"
+    want_ilv = _sk_tma4_ilv is not None and (
+        want_gu_ilv
+        or (
+            not fixed_grid
+            and (
+                ((n, k) == (DOWN_N, DOWN_K) and os.environ.get("MUSE_DOWN_ILV", "1") != "0")
+                or ((n, k) in ATTN_ILV_SHAPES and gb in (24, 48) and os.environ.get("MUSE_ATTN_ILV", "1") != "0")
+            )
+        )
     )
     if want_ilv:
-        w_ilv = w.view(48, 169, -1).transpose(0, 1).contiguous().view_as(w)
+        w_ilv = _build_ilv_weight(w, n, k, is_gate_v48, gb)
         _DOWN_ILV_SCALES.add(coded.data_ptr())
         try:
             got_ilv = [decode_linear6(x, w_ilv, coded, pal, gs, ws, n, k, False) for x in probes]
@@ -791,9 +916,15 @@ def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
             if _same_bits(expected, got2) and int(torch.count_nonzero(ws)) == 0:
                 del w_backup
                 layer.register_buffer("_marlin_decode_scales6", view, persistent=False)
-                layer.marlin_decode6_down_srans = True
-                STATS["down_srans_scales"] += layer._marlin_decode_scales.numel()
-                STATS["down_srans_bytes"] += nbytes
+                if want_gu_ilv:
+                    layer.marlin_decode6_fixed_grid = False
+                    layer.marlin_decode6_gate_up_srans = True
+                    STATS["srans_scales"] += layer._marlin_decode_scales.numel()
+                    STATS["srans_bytes"] += nbytes
+                else:
+                    layer.marlin_decode6_down_srans = True
+                    STATS["down_srans_scales"] += layer._marlin_decode_scales.numel()
+                    STATS["down_srans_bytes"] += nbytes
                 return True
             _DOWN_ILV_SCALES.discard(view.data_ptr())
             w.copy_(w_backup)
@@ -801,6 +932,10 @@ def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
             c.copy_(_six_bit_codes(layer))
             return False
         del w_ilv
+        if want_gu_ilv:
+            coded = encode_tma4_scales(layer._marlin_decode_scales, pal, n, k, True)
+            if coded.numel() > c.numel():
+                return False
     got = [decode_linear6(x, w, coded, pal, gs, ws, n, k, fixed_grid) for x in probes]
     if not _same_bits(expected, got) or int(torch.count_nonzero(ws)) != 0:
         logger.warning("TMA4 (%dx%d) rejected: bitwise=%s ws_nz=%d", n, k, _same_bits(expected, got), int(torch.count_nonzero(ws)))
@@ -867,7 +1002,7 @@ def prepare_decode_layout6(layer: torch.nn.Module, reference) -> bool:
                 STATS["gate_up_srans" if coded_ok else "gate_up_srans_rejected"] += 1
     elif (
         (n, k) in ((DOWN_N, DOWN_K), (LM_HEAD_N, LM_HEAD_K))
-        or (use_tma4 and os.environ.get("MUSE_TMA4_ATTN", "0") != "0" and n % 128 == 0 and k % 128 == 0)
+        or (use_tma4 and os.environ.get("MUSE_TMA4_ATTN", "1") != "0" and n % 128 == 0 and k % 128 == 0)
     ) and os.environ.get("MUSE_DOWN_SRANS", "1") != "0":
         if use_tma4:
             try:

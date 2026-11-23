@@ -57,6 +57,8 @@ try:
 except Exception:  # noqa: BLE001 - package absent or older build: no fold
     _sandwich_gemm_hook = None
 
+_decode_gemm_operand = None
+
 # Weights (data_ptr of the finished [K, N] column-major e4m3 tensor) admitted at load by a bitwise comparison with
 # ops.cutlass_scaled_mm on the layer's own weight; any other weight keeps the stock op.
 _prefill_admitted: set[int] = set()
@@ -148,6 +150,8 @@ def fp8_scaled_mm(a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale
         return _sandwich_gemm_hook(a, b, scale_a, scale_b, lambda x: _prompt_route(x, b, scale_a, scale_b))
     if a.size(0) > 16:
         return _prompt_route(a, b, scale_a, scale_b)
+    if _decode_gemm_operand is not None:
+        a = _decode_gemm_operand(a)
     if (_ext is not None and 0 < a.size(0) <= 16
             and a.is_cuda and a.device == b.device == scale_a.device == scale_b.device
             and scale_a.numel() == scale_b.numel() == 1

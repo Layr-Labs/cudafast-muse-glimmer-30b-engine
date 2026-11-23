@@ -759,11 +759,23 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
         if len(bf16_attn_layers) > 1:
             dev = bf16_attn_layers[0]._buffers["_bf16_qkv_gate_w"].device
             x = torch.zeros((512, 6656), dtype=torch.bfloat16, device=dev)
+            use_bf16_ws = _fp8ws is not None and _fp8ws.ready(dev) and hasattr(_fp8ws, "bf16_gemm_dual_stacked")
 
-            def run_bf16_attn(weight, x=x):
+            def run_bf16_attn(weight, x=x, use_bf16_ws=use_bf16_ws):
+                if use_bf16_ws:
+                    res = _fp8ws.bf16_gemm_dual_stacked(x, weight)
+                    if res is not None:
+                        return
                 torch.mm(x, weight.t())
 
             def on_bf16_attn_move(old_ptr, new_ptr, layers=bf16_attn_layers):
+                try:
+                    from vllm.model_executor.models.muse_glimmer import _BF16_DUAL_WS_ADMITTED
+                    if old_ptr in _BF16_DUAL_WS_ADMITTED:
+                        _BF16_DUAL_WS_ADMITTED.discard(old_ptr)
+                        _BF16_DUAL_WS_ADMITTED.add(new_ptr)
+                except Exception:
+                    pass
                 for attn_mod in layers:
                     w_cat = attn_mod._buffers["_bf16_qkv_gate_w"]
                     if w_cat.data_ptr() == new_ptr:
@@ -811,8 +823,7 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
                     dev = ref.weight.device
                     x = ((torch.arange(512 * gk, device=dev) % 11).float() - 5.0).mul(0.07).to(torch.bfloat16).reshape(512, gk).contiguous()
                     if (
-                        gn == 4608
-                        and gk == 6656
+                        (gn, gk) in ((4608, 6656), (6656, 4096))
                         and _route is not None
                         and _route.marlinw_down128 is not None
                         and all(l.weight.data_ptr() in _route._attn128_weights for l in glayers)
