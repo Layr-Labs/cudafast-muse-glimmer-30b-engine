@@ -267,9 +267,15 @@ __global__ void Marlin(
     int prob_k,      // reduction dimension k
     int lda,         // A.stride(0), equal to prob_k is A is contiguous
     int* locks,      // extra global storage for barrier synchronization
+#ifdef MARLINW_ONE_SLICE
+    bool has_bias_arg,
+    bool use_atomic_add_arg,
+    bool use_fp32_reduce_arg,
+#else
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
+#endif
     int max_shared_mem,
     // Work list: block b runs items work_ptr[b] .. work_ptr[b + 1] - 1 in
     // order. Item i is work[2 * i] = {par_id, slice_col, slice_row,
@@ -314,6 +320,11 @@ __global__ void Marlin(
   #else
   constexpr bool use_fp16_accum = false;
   #endif
+#ifdef MARLINW_ONE_SLICE
+  constexpr bool has_bias = false;
+  constexpr bool use_atomic_add = false;
+  constexpr bool use_fp32_reduce = true;
+#endif
   using Adtype = MarlinScalarType<a_type_id>;
   using Cdtype = MarlinScalarType<c_type_id>;
   const int4* A = A0;
@@ -416,6 +427,11 @@ __global__ void Marlin(
   int par_id = 0;
   int locks_off = 0;
 
+#ifdef MARLINW_ONE_SLICE
+  auto init_slice = [&]() {
+    int4 w0 = work[2 * blockIdx.x];
+    int4 w1 = work[2 * blockIdx.x + 1];
+#else
   int work_cur = work_ptr[blockIdx.x];
   const int work_end = work_ptr[blockIdx.x + 1];
 
@@ -427,6 +443,7 @@ __global__ void Marlin(
     int4 w0 = work[2 * work_cur];
     int4 w1 = work[2 * work_cur + 1];
     work_cur++;
+#endif
     par_id = w0.x;
     slice_col = w0.y;
     slice_row = w0.z;
@@ -1994,9 +2011,13 @@ __global__ void Marlin(
         // only the last block in a slice actually writes the result
         write_result(last);
       is_first_matmul_in_slice = true;
+#ifdef MARLINW_ONE_SLICE
+      if (false) {
+#else
       init_slice();
 
       if (slice_iters) {
+#endif
         a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) +
                   (threadIdx.x % a_gl_rd_delta_o);
         a_gl_rd += a_gl_rd_delta_o * slice_row;

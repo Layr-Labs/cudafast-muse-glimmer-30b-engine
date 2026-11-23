@@ -11,6 +11,7 @@ _INNER = 19968
 _ROWS = 512
 _library = None
 _sms = {}
+_scratch_buf: dict[int, torch.Tensor] = {}
 _lock = threading.Lock()
 
 
@@ -66,8 +67,13 @@ def apply(a, b, scale_a, scale_b, down_scale):
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)
         out = a.new_empty((_ROWS, _INNER))
-        # A separate allocation per call follows the caller's capture/stream.
-        scratch = torch.empty(1 << 20, dtype=torch.uint8, device=a.device)
+        if torch.cuda.is_current_stream_capturing():
+            scratch = torch.empty(1 << 20, dtype=torch.uint8, device=a.device)
+        else:
+            scratch = _scratch_buf.get(device)
+            if scratch is None:
+                scratch = torch.empty(1 << 20, dtype=torch.uint8, device=a.device)
+                _scratch_buf[device] = scratch
         status = _library.prefill(
             _ROWS, 2 * _INNER, _HIDDEN, a.data_ptr(), b.data_ptr(), scale_a.data_ptr(),
             scale_b.data_ptr(), down_scale.data_ptr(), out.data_ptr(), scratch.data_ptr(),

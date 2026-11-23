@@ -97,7 +97,7 @@ def gate_if_active(x, weight):
     if x.shape != (ROWS, marlinw_down.COLUMNS) or not x.is_contiguous() or x.dtype != torch.bfloat16:
         raise ValueError("Final gate capture requires contiguous BF16 prefill input")
     out = x.new_empty((ROWS, marlinw_down.INNER))
-    out[:-TILE_ROWS].zero_()
+    # Skip zeroing rows 0..447 on the intermediate gate_up buffer: down_if_active only reads out[-64:].
     tile = x[-TILE_ROWS:]
     dest = out[-TILE_ROWS:]
     g, _ = _native[x.device]
@@ -122,8 +122,7 @@ def down_if_active(x, weight, scales, global_scale):
     out[:-TILE_ROWS].zero_()
     tile = x[-TILE_ROWS:]
     dest = out[-TILE_ROWS:]
-    partial = x.new_empty((plan.slots, TILE_ROWS, 128), dtype=torch.float32)
-    locks = x.new_zeros((plan.slots,), dtype=torch.int32)
+    partial, locks = marlinw_down._get_scratch(x.device, plan.slots)
     _, d = _native[x.device]
     with torch.cuda.device(x.device):
         stream = torch.cuda.current_stream(x.device).cuda_stream

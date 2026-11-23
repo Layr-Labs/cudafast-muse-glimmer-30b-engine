@@ -199,7 +199,8 @@ class Session:
         tokens = []
         try:
             for _ in range(count):
-                token = self.eval(token)
+                self._feed(token)
+                token = self.frontier.token  # type: ignore[union-attr]
                 tokens.append(token)
         except (RefusedError, ValueError, RuntimeError):
             # A failed request can have consumed part of the continuation.

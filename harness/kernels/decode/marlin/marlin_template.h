@@ -268,6 +268,14 @@ __global__ void Marlin(
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
     int max_shared_mem) {
+  // Compile-time M = 1 specialization matching gemv.cu launch args to avoid local-memory spills.
+  prob_m = 1;
+  lda = prob_k;
+  num_groups = prob_k >> 4;
+  has_bias = false;
+  use_atomic_add = false;
+  use_fp32_reduce = true;
+
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM

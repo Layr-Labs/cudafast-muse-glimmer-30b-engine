@@ -19,19 +19,35 @@ torch_inc=$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(tor
 "$nvcc" --version | tail -n 2
 # Same numerics as the stock Marlin build: no --use_fast_math (IEEE fp32 adds
 # and multiplies, no flush to zero), default contraction.
-build_library() {
-  local name=$1
+build_library() {  # build_library <library name> [<source name> [<extra flags>...]]
+  local name=$1 source=${2:-$1}
+  shift; shift || true
   "$nvcc" -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
-  --expt-relaxed-constexpr -DENABLE_FP8 \
+  --expt-relaxed-constexpr -DENABLE_FP8 "$@" \
   -gencode "arch=compute_${sm},code=sm_${sm}" \
   -I "$here/csrc" -I "$torch_inc" \
   -Xptxas -v \
-  -o "$out/lib${name}.so" "$here/csrc/${name}.cu"
+  -o "$out/lib${name}.so" "$here/csrc/${source}.cu"
 }
-build_library marlinw
-build_library marlinw_swiglu
-build_library marlinw_swiglu2
-build_library marlinw_swiglu_fp8
-test -f "$out/libmarlinw.so" || { echo "marlinw: build failed" >&2; exit 1; }
+pids=()
+libs=(marlinw marlinw_swiglu marlinw_swiglu2 marlinw_swiglu3 marlinw_swiglu3_fp8 marlinw_swiglu_fp8)
+build_library marlinw & pids+=("$!")
+build_library marlinw_swiglu & pids+=("$!")
+build_library marlinw_swiglu2 & pids+=("$!")
+# The 128-row gate/up + SwiGLU tiles fed by TMA; marlinw_down128 builds the down projection from the same source.
+build_library marlinw_swiglu3 marlinw_tma -DMARLINW_TMA_GATEUP & pids+=("$!")
+build_library marlinw_swiglu3_fp8 marlinw_tma -DMARLINW_TMA_GATEUP -DMARLINW_TMA_FP8 & pids+=("$!")
+build_library marlinw_swiglu_fp8 & pids+=("$!")
+fail=0
+for i in "${!pids[@]}"; do
+  if ! wait "${pids[$i]}"; then
+    echo "marlinw: FAILED lib${libs[$i]}.so" >&2
+    fail=1
+  fi
+done
+test "$fail" -eq 0
+for lib in "${libs[@]}"; do
+  test -s "$out/lib${lib}.so" || { echo "marlinw: missing $out/lib${lib}.so" >&2; exit 1; }
+done
 cp "$here/py/__init__.py" "$here/py/swiglu.py" "$here/py/swiglu_fp8.py" "$out/"
 echo "marlinw: built $out/libmarlinw.so for sm_${sm}"
