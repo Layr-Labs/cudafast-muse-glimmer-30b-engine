@@ -25,8 +25,10 @@ namespace l2pf {
 constexpr uint32_t kMaxPiece = 1u << 16;
 
 __device__ __forceinline__ void bulk_prefetch(const uint8_t* p, uint32_t n) {
-  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(p), "r"(n)
-               : "memory");
+  uint64_t pol;
+  asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
+  asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;\n"
+               ::"l"(p), "r"(n), "l"(pol) : "memory");
 }
 
 __global__ void prefetch_kernel(const uint8_t* __restrict__ p, size_t bytes, uint32_t chunk) {
@@ -58,6 +60,24 @@ __global__ void prefetch_desc_kernel(const unsigned long long* __restrict__ d, i
   }
 }
 
+// CTA-first spread variant: segment r goes to CTA r % gridDim.x so bulk prefetches
+// spread across SMs instead of concentrating on CTA 0.
+__global__ void prefetch_desc_spread_kernel(const unsigned long long* __restrict__ d, int nd) {
+  const uint32_t nthr = gridDim.x * blockDim.x;
+  const uint32_t tid = threadIdx.x * gridDim.x + blockIdx.x;
+  uint32_t first = 0;
+  for (int j = 0; j < nd; ++j) {
+    const unsigned long long base = d[3 * j];
+    const unsigned long long pitch = d[3 * j + 1];
+    const unsigned long long sc = d[3 * j + 2];
+    const uint32_t seg = (uint32_t)(sc >> 32);
+    const uint32_t cnt = (uint32_t)(sc & 0xffffffffull);
+    uint32_t r = (tid + nthr - first) % nthr;
+    for (; r < cnt; r += nthr) bulk_prefetch((const uint8_t*)(base + r * pitch), seg);
+    first = (first + cnt) % nthr;
+  }
+}
+
 }  // namespace l2pf
 
 extern "C" {
@@ -75,6 +95,15 @@ int l2pf_prefetch(const void* p, size_t bytes, int chunk, int blocks, void* stre
 // The descriptors are checked on the host when the table is built (alignment,
 // segment size <= 64 KB, every segment inside one weight tensor); here only the
 // launch arguments are.
+int l2pf_prefetch_desc_spread(const void* desc, int ndesc, int blocks, int threads, void* stream) {
+  if (!desc || ndesc < 1 || blocks < 1 || threads < 32 || threads > 1024 ||
+      reinterpret_cast<uintptr_t>(desc) % 8)
+    return -1;
+  l2pf::prefetch_desc_spread_kernel<<<blocks, threads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      (const unsigned long long*)desc, ndesc);
+  return (int)cudaGetLastError();
+}
+
 int l2pf_prefetch_desc(const void* desc, int ndesc, int blocks, int threads, void* stream) {
   if (!desc || ndesc < 1 || blocks < 1 || threads < 32 || threads > 1024 ||
       reinterpret_cast<uintptr_t>(desc) % 8)

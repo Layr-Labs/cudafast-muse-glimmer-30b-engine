@@ -52,6 +52,11 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 
 logger = init_logger(__name__)
 
+try:
+    import muse_embed as _muse_embed  # prefill3, harness/kernels/muse_embed
+except (ImportError, OSError):
+    _muse_embed = None
+
 _SCALARS = (
     int,
     float,
@@ -246,6 +251,8 @@ class PrefillGraph:
         self.sample_tile = sample_tile
         self.final_sample_tile = sample_tile is not None
         self.replays = 0
+        self._fast_replays = 0
+        self._fast_verified = False
         self._logged_refusal = False
 
         model_state = runner.model_state
@@ -258,6 +265,10 @@ class PrefillGraph:
         block_tables = runner.block_tables.get_dummy_block_tables(1)
         # PAD slots: the warm-up runs and the capture write no KV.
         slot_mappings = runner.block_tables.get_dummy_slot_mappings(n)
+        self._raw_slot_sig = (slot_mappings.data_ptr(), tuple(slot_mappings.shape), tuple(slot_mappings.stride()))
+        self._raw_bt_sig = tuple(
+            (t.data_ptr(), tuple(t.shape), tuple(t.stride())) for t in block_tables
+        )
         self.slot_mappings = build_slot_mappings_by_layer(
             slot_mappings, runner.kv_cache_config
         )
@@ -309,6 +320,24 @@ class PrefillGraph:
             raise TypeError(f"model returned {type(self.hidden_states).__name__}")
         if self.final_sample_tile:
             logger.info("Prefill graph captured both final FFN tiles on the compiled backbone")
+            plans = getattr(self.sample_tile, "attn_plans", None)
+            if plans is not None:
+                try:
+                    import muse_final_slab
+                    calls = muse_final_slab.attn_stats["calls"]
+                except (ImportError, OSError, AttributeError):
+                    calls = -1
+                logger.info("Prefill graph final-layer attention slab: %d of 2 projections admitted on the last "
+                            "64 rows (%d slab launches so far)", len(plans), calls)
+                try:
+                    import muse_final_slab
+                    logger.info("Prefill graph final rows only: %s launches narrowed to rows 448..511 so far",
+                                muse_final_slab.restrict_stats)
+                except (ImportError, OSError, AttributeError):
+                    pass
+        if _muse_embed is not None:
+            logger.info("Prefill graph embedding: fused muse_embed %s (%d fused calls)",
+                        _muse_embed.state["reason"] or "not used", _muse_embed.state["fused_calls"])
 
     def _forward(self):
         with set_forward_context(
@@ -330,9 +359,14 @@ class PrefillGraph:
                     if hasattr(self.model, "get_language_model")
                     else self.model
                 )
-                self.model_inputs["inputs_embeds"].copy_(
-                    lm.embed_input_ids(self.embed_input_ids)
-                )
+                # prefill3: the same embedding + weightless embedding norm in three kernels written straight into
+                # inputs_embeds (harness/kernels/muse_embed; admitted by bitwise checks on its first eager call).
+                if _muse_embed is None or not _muse_embed.embed_into(
+                    lm, self.embed_input_ids, self.model_inputs["inputs_embeds"]
+                ):
+                    self.model_inputs["inputs_embeds"].copy_(
+                        lm.embed_input_ids(self.embed_input_ids)
+                    )
             if self.sample_tile is None:
                 return self.model(**self.model_inputs)
             with self.sample_tile.capture():
@@ -384,5 +418,56 @@ class PrefillGraph:
         self.graph.replay()
         if self.replays == 0:
             logger.info("Prefill graph: first %d-token replay", self.num_tokens)
+            if not pairs and self.embed_input_ids is not None and os.environ.get("VLLM_PREFILL_GRAPH_FAST", "1") != "0":
+                self._fast_verified = True
         self.replays += 1
+        return self.hidden_states
+
+    def can_fast_replay(
+        self,
+        input_batch: InputBatch,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        raw_input_ids: torch.Tensor | None,
+    ) -> bool:
+        """True when all persistent GPU buffers match the first verified zero-copy replay."""
+        if not self._fast_verified or raw_input_ids is None or self.embed_input_ids is None:
+            return False
+        pos = self.model_inputs.get("positions")
+        if pos is None:
+            return False
+        if (
+            raw_input_ids.data_ptr() != self.embed_input_ids.data_ptr()
+            or raw_input_ids.shape != self.embed_input_ids.shape
+            or raw_input_ids.stride() != self.embed_input_ids.stride()
+            or input_batch.positions.data_ptr() != pos.data_ptr()
+            or input_batch.positions.shape != pos.shape
+            or input_batch.positions.stride() != pos.stride()
+            or input_batch.is_padding.data_ptr() != self.is_padding.data_ptr()
+            or input_batch.is_padding.shape != self.is_padding.shape
+            or slot_mappings.data_ptr() != self._raw_slot_sig[0]
+            or tuple(slot_mappings.shape) != self._raw_slot_sig[1]
+            or tuple(slot_mappings.stride()) != self._raw_slot_sig[2]
+            or len(block_tables) != len(self._raw_bt_sig)
+        ):
+            return False
+        for t, sig in zip(block_tables, self._raw_bt_sig):
+            if (t.data_ptr(), tuple(t.shape), tuple(t.stride())) != sig:
+                return False
+        if (
+            input_batch.prefill_len_np is None
+            or input_batch.is_prefilling_np is None
+            or int(input_batch.prefill_len_np[0]) != self.num_tokens
+            or not bool(input_batch.is_prefilling_np[0])
+        ):
+            return False
+        return True
+
+    def fast_replay(self) -> torch.Tensor:
+        get_offloader().sync_prev_onload()
+        self.graph.replay()
+        self.replays += 1
+        self._fast_replays += 1
+        if self._fast_replays == 1:
+            logger.info("Prefill graph: fast replay active (skipping 52-layer metadata and _plan)")
         return self.hidden_states

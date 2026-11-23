@@ -275,6 +275,8 @@ class VllmBackend:
         self._warm_up()
         if muse_sandwich is not None and (summary := muse_sandwich.launch_summary()):
             _log(f"native sandwich dispatch during initialization: {summary}")
+        if muse_sandwich is not None and hasattr(muse_sandwich, "fold_summary"):
+            _log(f"gate-quant fold: {muse_sandwich.fold_summary()}")
 
     # BOOT WARM-UP. The first prefill and the first decode steps after the
     # engine is built run cold (lazy kernel JIT, autotune, allocator growth):

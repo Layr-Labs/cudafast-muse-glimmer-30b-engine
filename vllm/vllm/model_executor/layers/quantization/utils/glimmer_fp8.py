@@ -49,6 +49,16 @@ try:
 except Exception:  # noqa: BLE001 - package absent: stock cutlass for every prompt-sized FP8 GEMM
     _prefill = None
 
+try:
+    # 512-row attention output-gate GEMM of a folded FP8-attention layer reads the FP8 operand the native
+    # sandwich wrote (harness/kernels/sandwich/muse_sandwich.py, gate-quant fold) and optionally fuses qkv+gate
+    # into one persistent fp8ws dual-activation launch.
+    from muse_sandwich import gemm_hook as _sandwich_gemm_hook
+except Exception:  # noqa: BLE001 - package absent or older build: no fold
+    _sandwich_gemm_hook = None
+
+_decode_gemm_operand = None
+
 # Weights (data_ptr of the finished [K, N] column-major e4m3 tensor) admitted at load by a bitwise comparison with
 # ops.cutlass_scaled_mm on the layer's own weight; any other weight keeps the stock op.
 _prefill_admitted: set[int] = set()
@@ -124,16 +134,24 @@ def _prefill_gemm(a, b, scale_a, scale_b):
     return out
 
 
+def _prompt_route(a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor) -> torch.Tensor:
+    if _prefill is not None and b.data_ptr() in _prefill_admitted and _prefill.supported(a, b, scale_a, scale_b):
+        return _prefill_gemm(a, b, scale_a, scale_b)
+    if a.size(0) == 512 and _fp8ws_maybe_gemm is not None:
+        out = _fp8ws_maybe_gemm(a, b, scale_a, scale_b)
+        if out is not None:
+            return out
+    return _prefill_gemm(a, b, scale_a, scale_b)
+
+
 @torch.library.custom_op("glimmer::fp8_scaled_mm", mutates_args=())
 def fp8_scaled_mm(a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor) -> torch.Tensor:
+    if a.size(0) == 512 and _sandwich_gemm_hook is not None:
+        return _sandwich_gemm_hook(a, b, scale_a, scale_b, lambda x: _prompt_route(x, b, scale_a, scale_b))
     if a.size(0) > 16:
-        if _prefill is not None and b.data_ptr() in _prefill_admitted and _prefill.supported(a, b, scale_a, scale_b):
-            return _prefill_gemm(a, b, scale_a, scale_b)
-        if a.size(0) == 512 and _fp8ws_maybe_gemm is not None:
-            out = _fp8ws_maybe_gemm(a, b, scale_a, scale_b)
-            if out is not None:
-                return out
-        return _prefill_gemm(a, b, scale_a, scale_b)
+        return _prompt_route(a, b, scale_a, scale_b)
+    if _decode_gemm_operand is not None:
+        a = _decode_gemm_operand(a)
     if (_ext is not None and 0 < a.size(0) <= 16
             and a.is_cuda and a.device == b.device == scale_a.device == scale_b.device
             and scale_a.numel() == scale_b.numel() == 1

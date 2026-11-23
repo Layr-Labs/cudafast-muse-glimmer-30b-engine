@@ -66,6 +66,11 @@ from vllm.v1.worker.cp_utils import (
     split_dcp_context_queries,
 )
 
+try:
+    import muse_final_slab
+except (ImportError, OSError):
+    muse_final_slab = None
+
 logger = init_logger(__name__)
 
 
@@ -1038,11 +1043,37 @@ class FlashAttentionImpl(AttentionImpl):
                     )
                     causal = not has_window
 
+                q_arg = query[:num_actual_tokens]
+                out_arg = output[:num_actual_tokens]
+                if (
+                    muse_final_slab is not None
+                    and mm_mask_mod is None
+                    and rswa_mask_mod_fn is None
+                    and q_descale is None
+                ):
+                    tail = muse_final_slab.flash_tail_if_active(
+                        layer,
+                        num_actual_tokens,
+                        cu_seqlens_q,
+                        max_seqlen_q,
+                        seqused_k,
+                        causal,
+                        sliding_window_size,
+                        scheduler_metadata,
+                        self.vllm_flash_attn_version,
+                    )
+                    if tail is not None:
+                        tail_rows, tail_cu_q = tail
+                        q_arg = query[num_actual_tokens - tail_rows : num_actual_tokens]
+                        out_arg = output[num_actual_tokens - tail_rows : num_actual_tokens]
+                        cu_seqlens_q = tail_cu_q
+                        max_seqlen_q = tail_rows
+
                 flash_attn_varlen_func(
-                    q=query[:num_actual_tokens],
+                    q=q_arg,
                     k=key_cache,
                     v=value_cache,
-                    out=output[:num_actual_tokens],
+                    out=out_arg,
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
                     seqused_k=seqused_k,

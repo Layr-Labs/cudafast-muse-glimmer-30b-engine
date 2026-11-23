@@ -463,6 +463,19 @@ def main() -> int:
         if ready_file and os.path.exists(ready_file):
             os.unlink(ready_file)
         backend.close()
+        if isinstance(backend, VllmBackend):
+            try:
+                import multiprocessing
+                import torch
+                for child in multiprocessing.active_children():
+                    child.terminate()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
     return 0
 
 

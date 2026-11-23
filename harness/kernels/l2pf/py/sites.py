@@ -52,13 +52,17 @@ def _env_bytes(name: str, default: int) -> int:
 # whose weights exceed MAX_WEIGHT get the MLP budgets below instead: a head
 # that fits the window ahead of them (the norm before gate_up, the activation
 # before down).
-BYTES_AFTER_ATTN = _env_bytes("L2PF_MB_ATTN", 8 << 20)
+BYTES_AFTER_ATTN = _env_bytes("L2PF_MB_ATTN", (9 << 20) // 8)
 BYTES_OTHER = _env_bytes("L2PF_MB_OTHER", 2 << 20)
 MAX_WEIGHT = _env_bytes("L2PF_MAX_WEIGHT_MB", 64 << 20)
-BLOCKS = int(os.environ.get("L2PF_BLOCKS", "1"))
+BLOCKS = int(os.environ.get("L2PF_BLOCKS", "8"))
+THREADS = int(os.environ.get("L2PF_THREADS", "32"))
+SPREAD = os.environ.get("L2PF_SPREAD", "1") != "0"
 MLP = os.environ.get("L2PF_MLP", "1") != "0"
 BYTES_MLP_NORM = _env_bytes("L2PF_MB_MLP_NORM", (9 << 20) // 4)
 BYTES_MLP_ACT = _env_bytes("L2PF_MB_MLP_ACT", 1 << 19)
+BYTES_RANS_AFTER_ATTN = _env_bytes("L2PF_MB_RANS_ATTN", 0)
+BYTES_RANS_QKV = _env_bytes("L2PF_MB_RANS_QKV", 0)
 TLB_PREFETCH = os.environ.get("L2PF_TLB", "1") != "0"
 TLB_RANS_HEAD = int(os.environ.get("L2PF_TLB_RANS_HEAD_KB", "32")) << 10
 TLB_STRIDE = int(os.environ.get("L2PF_TLB_STRIDE_KB", "2048")) << 10
@@ -209,14 +213,73 @@ def mlp_budget(n_tensors: int, after_act: bool) -> int:
     return nbytes * 8 // 9 if n_tensors > 1 else nbytes
 
 
+def _range_descs(base: int, span: int, off: int, length: int) -> list[tuple[int, int, int, int]]:
+    off = off & ~15
+    end = min(off + ((int(length) + 15) & ~15), span) & ~15
+    n = end - off
+    if base % 16 or off < 0 or n <= 0:
+        return []
+    p = base + off
+    full, rem = divmod(n, CHUNK)
+    out = []
+    if full:
+        out.append((p, CHUNK, CHUNK, full))
+    if rem:
+        out.append((p + full * CHUNK, 0, rem, 1))
+    return out
+
+
+def _tma4_scale_descs(w: torch.Tensor) -> list[tuple[int, int, int, int]]:
+    """Exact Wave-0 L2 head for TMA4 scales (shape [rows, 32] uint8):
+    lut + meta + Wave-0 off16 + Wave-0 states + Wave-0 super-blocks sb 0 and sb 1."""
+    base, span = _dense_span(w)
+    if base % 16 or span < 4096 + 16:
+        return []
+    prefix = min(span, 32768)
+    u32 = w.reshape(-1)[:prefix].cpu().view(torch.int32)
+    total_sbs = int(u32[1024].item())
+    num_blks = int(u32[1025].item())
+    max_sbs = int(u32[1026].item())
+    threads = int(u32[1027].item())
+    if total_sbs <= 0 or num_blks <= 0 or threads not in (128, 256):
+        return head_descs(w, min(span, 256 << 10))
+    meta_u32 = ((4 + num_blks + max_sbs + 3) // 4) * 4
+    meta_bytes = meta_u32 * 4
+    off16_bytes = ((total_sbs + 1) * 4 + 15) // 16 * 16
+    states_off = 4096 + meta_bytes + off16_bytes
+    var_off = states_off + num_blks * threads * 4
+    wave_blks = min(num_blks, 48)
+    gsb_sb1_end = min(total_sbs, 2 * wave_blks)
+    need_u32 = 1024 + meta_u32 + gsb_sb1_end + 1
+    if need_u32 * 4 > prefix:
+        if need_u32 * 4 > span:
+            return head_descs(w, min(span, 256 << 10))
+        u32 = w.reshape(-1)[: need_u32 * 4].cpu().view(torch.int32)
+    sb01_bytes = int(u32[1024 + meta_u32 + gsb_sb1_end].item()) * 16
+    wave_states_bytes = wave_blks * threads * 4
+    wave_off16_end = 4096 + meta_bytes + ((gsb_sb1_end + 1) * 4 + 15) // 16 * 16
+    if (states_off - wave_off16_end) + (var_off - (states_off + wave_states_bytes)) <= (16 << 10):
+        return _range_descs(base, span, 0, var_off + sb01_bytes)
+    out = []
+    if states_off - wave_off16_end <= (16 << 10):
+        out += _range_descs(base, span, 0, states_off + wave_states_bytes)
+        out += _range_descs(base, span, var_off, sb01_bytes)
+    else:
+        out += _range_descs(base, span, 0, wave_off16_end)
+        out += _range_descs(base, span, states_off, wave_states_bytes + sb01_bytes)
+    return out
+
+
 def weight_descs(ws: tuple[torch.Tensor, ...], nbytes: int) -> list[tuple[int, int, int, int]]:
-    """The first nbytes of the weight (ws[0]) and the same share of its block
-    scales (ws[1], one byte per 16 four-bit codes: an eighth of the bytes)."""
+    """The first nbytes of the weight (ws[0]) and exact TMA4 Wave-0 head (or 1/8 share) of ws[1:]."""
     if nbytes <= 0:
         return []
     out = head_descs(ws[0], nbytes)
     for w in ws[1:]:
-        out += head_descs(w, nbytes // 8)
+        if w.ndim == 2 and w.shape[1] == 32 and w.dtype == torch.uint8:
+            out += _tma4_scale_descs(w)
+        else:
+            out += head_descs(w, nbytes // 8)
     return out
 
 
@@ -293,6 +356,12 @@ def _targets():
         lane_bf16 = torch.ops.vllm.muse_bf16_lane_linear
         lane_bf16.default  # noqa: B018
         out.append((lane_bf16, "default", "muse_bf16_lane", False))
+        try:
+            bgpkt = torch.ops.vllm.muse_bf16_gate_fill
+            bgpkt.default  # noqa: B018
+            out.append((bgpkt, "default", "muse_bf16_gate", False))
+        except (AttributeError, RuntimeError):
+            pass
     except (AttributeError, RuntimeError):
         pass
     try:
@@ -332,6 +401,8 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[1],)
         if kind == "muse_bf16_lane" and args[0].shape[0] == 1 and args[0].is_contiguous():
             return (args[2],)
+        if kind == "muse_bf16_gate" and args[1].shape[0] == 1 and args[1].is_contiguous():
+            return (args[3],)
         if kind == "marlin_tiled":
             return (args[1], args[2])
     except IndexError:
@@ -456,6 +527,8 @@ class Session:
                 site.descs = weight_descs(ws, mb_b)
                 if TLB_PREFETCH and (kind == "musefp8" or TLB_ALL):
                     site.descs += tlb_descs(ws[0], mb_b, TLB_STRIDE)
+                    for w_extra in ws[1:]:
+                        site.descs += tlb_descs(w_extra, 0, TLB_STRIDE)
             else:
                 nbytes = budget(wbytes, site.after_attn)
                 if kind == "musefp8":
@@ -465,20 +538,23 @@ class Session:
                             and a.is_contiguous() and 0 < packed.numel() != n * k):
                         from vllm.model_executor.kernels.linear.scaled_mm.muse_fp8 import _scales_ok
                         if _scales_ok(sa, sb, n):
-                            nbytes = 0
-                            site.unassisted = True
+                            nbytes = BYTES_RANS_AFTER_ATTN if site.after_attn else BYTES_RANS_QKV
+                            if nbytes == 0:
+                                site.unassisted = True
                 elif kind == "muse_bf16_lane":
                     a, weight, packed, index = args
                     n, k = weight.shape
                     if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
                             and a.is_contiguous() and index.numel() == 1):
-                        nbytes = 0
-                        site.unassisted = True
+                        nbytes = BYTES_RANS_AFTER_ATTN if site.after_attn else BYTES_RANS_QKV
+                        if nbytes == 0:
+                            site.unassisted = True
                 if site.unassisted and TLB_PREFETCH and TLB_UNASSISTED:
                     site.descs = head_descs(ws[0], TLB_RANS_HEAD) + tlb_descs(ws[0], TLB_RANS_HEAD, TLB_STRIDE)
                 else:
                     site.descs = weight_descs(ws, nbytes)
-                    if not site.unassisted and TLB_PREFETCH and (kind in ("musefp8", "muse_bf16_lane") or TLB_ALL):
+                    if not site.unassisted and TLB_PREFETCH and (
+                            kind in ("musefp8", "musefp8_gate", "muse_bf16_lane", "muse_bf16_gate") or TLB_ALL):
                         site.descs += tlb_descs(ws[0], nbytes, TLB_STRIDE)
             if self.ranges is not None and not _inside(site.descs, self.ranges):
                 site.descs = []
@@ -522,7 +598,7 @@ class Session:
         s = self.sites[i]
         self.side.wait_stream(main)
         prefetch_desc(self.table.data_ptr() + 24 * s.off, len(s.descs), self.side,
-                      blocks=BLOCKS)
+                      blocks=BLOCKS, threads=THREADS, spread=SPREAD)
         self._pending = True
         self.prefetched += 1
 
