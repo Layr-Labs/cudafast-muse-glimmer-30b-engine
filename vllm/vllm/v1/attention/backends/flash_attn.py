@@ -3,6 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -10,6 +11,7 @@ import numpy as np
 import torch
 
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
@@ -75,6 +77,23 @@ try:
     import muse_gqa16_attn
 except (ImportError, OSError):
     muse_gqa16_attn = None
+
+# Opt-in: warm the paged KV window of a single-token decode into L2 with a wide grid right
+# before FlashAttention reads it. FA2 packs GQA into 2 CTAs, so its own first touch of the
+# window dribbles in while the output_gate stream saturates DRAM; a many-CTA read of the same
+# bytes leaves the window in the 24 MiB L2, which is where FA2's per-q-head re-reads then hit.
+# `kv_prefetch` is read-only and validates the layout itself; it returns without doing
+# anything when the cache is not the plain paged bf16 layout. The env test is repeated here so
+# that with the feature off there is no call at all -- an argument expression that raised (or
+# just cost a ctypes round trip per layer per step) would tax every run that does not use it.
+_KV_PREFETCH = os.environ.get("MUSE_KV_PREFETCH", "1").strip() not in ("", "0")
+_KV_PREFETCH_NEXT = os.environ.get("MUSE_KV_PREFETCH_NEXT", "0").strip() not in ("", "0")
+try:
+    from muse_qk_glue import kv_prefetch as _muse_kv_prefetch
+except Exception:  # noqa: BLE001 - extension absent: no prefetch
+    _muse_kv_prefetch = None
+if not (_KV_PREFETCH or _KV_PREFETCH_NEXT):
+    _muse_kv_prefetch = None
 
 logger = init_logger(__name__)
 
@@ -947,6 +966,8 @@ class FlashAttentionImpl(AttentionImpl):
                 cu_seqlens_q=attn_metadata.query_start_loc,
                 softmax_scale=self.scale,
                 window=window,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                scheduler_metadata=attn_metadata.scheduler_metadata,
             ):
                 return output
 
@@ -1112,6 +1133,42 @@ class FlashAttentionImpl(AttentionImpl):
                         out_arg = output[num_actual_tokens - tail_rows : num_actual_tokens]
                         cu_seqlens_q = tail_cu_q
                         max_seqlen_q = tail_rows
+
+                if _muse_kv_prefetch is not None and num_actual_tokens == 1:
+                    # Read-only L2 warm of a paged KV window, on the same stream so it is
+                    # ordered before the attention kernel. Single-token decode only: a
+                    # prefill already reads the window with enough CTAs to saturate DRAM on
+                    # its own. MUSE_KV_PREFETCH warms this layer's window; MUSE_KV_PREFETCH_NEXT
+                    # warms the next layer's, so the read overlaps this layer's attention
+                    # instead of serialising in front of it. Its own gate lives in
+                    # muse_qk_glue, which also validates the layout and no-ops otherwise.
+                    if _KV_PREFETCH:
+                        _muse_kv_prefetch(
+                            key_cache,
+                            value_cache,
+                            block_table,
+                            seqused_k,
+                            key_cache.shape[-3],
+                            max_seqlen_k,
+                        )
+                    if _KV_PREFETCH_NEXT:
+                        nxt = getattr(layer, "_next_attn", None)
+                        if nxt is not None:
+                            nxt_meta, _, nxt_cache, _ = get_attention_context(
+                                nxt.layer_name
+                            )
+                            if nxt_meta is not None and nxt_cache.numel():
+                                nxt_k, nxt_v = nxt_cache.transpose(1, 2).split(
+                                    self.head_size, dim=-1
+                                )
+                                _muse_kv_prefetch(
+                                    nxt_k,
+                                    nxt_v,
+                                    nxt_meta.block_table,
+                                    nxt_meta.seq_lens,
+                                    nxt_k.shape[-3],
+                                    nxt_meta.max_seq_len,
+                                )
 
                 flash_attn_varlen_func(
                     q=q_arg,

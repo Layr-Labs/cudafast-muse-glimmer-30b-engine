@@ -23,6 +23,8 @@
   #define MARLIN_NAMESPACE_NAME marlin
 #endif
 
+#include <cstdint>
+
 #include "marlin.cuh"
 #include "marlin_dtypes.cuh"
 #include "dequant.h"
@@ -276,7 +278,17 @@ __global__ void Marlin(
     int max_shared_mem,
     // scale6 only: 64 palette bytes (16-byte aligned) of this layer's codes
     const int4* __restrict__ scale6_palette,
-    size_t tpf_stride = 0) {
+    size_t tpf_stride = 0,
+    // scale6 only: row-chunked weight placement. `wptrs` holds the chunk base addresses and `wtiles` the cumulative
+    // tile offsets ([0, 527, 1053, ...]). nullptr means the weight is contiguous and B0 + tile_column_stride *
+    // slice_col addresses tile slice_col. Only the weight base moves: the tile index, the k-chain, the grid, the
+    // schedule, the output, partials, locks and the scale addresses all stay on the global index.
+    // NOTE: these defaults do NOT apply at the launch site. `auto kernel = Marlin<...>` deduces a function pointer,
+    // and default arguments are not part of a function's type, so every `kernel<<<...>>>(...)` must pass all three
+    // explicitly (nullptr, nullptr, 0 for the contiguous path).
+    const int64_t* __restrict__ wptrs = nullptr,
+    const int* __restrict__ wtiles = nullptr,
+    int wchunks = 0) {
   if constexpr (scale6) {
     prob_m = 1;
     lda = prob_k;
@@ -329,6 +341,21 @@ __global__ void Marlin(
   using Cdtype = MarlinScalarType<c_type_id>;
   const int4* A = A0;
   int4* C = C0;
+  // scale6 chunked placement: B reads go through the chunk base pointer when wptrs is supplied.
+  const int4* Bslice = B;
+  // Returns the column index to use for the weight address (chunk-local when chunked, global otherwise) and selects
+  // the chunk's buffer base. Every other use of slice_col -- output, partials, locks, scales, coded, bias -- stays on
+  // the global index, so the schedule and the reduction tree are untouched.
+  auto b_chunk_col = [&](int col) -> int {
+    if (wptrs == nullptr) {
+      Bslice = B;
+      return col;
+    }
+    int c = 0;
+    while (c + 1 < wchunks && col >= wtiles[c + 1]) ++c;
+    Bslice = reinterpret_cast<const int4*>(static_cast<uintptr_t>(wptrs[c]));
+    return col - wtiles[c];
+  };
 
   using scalar_t = typename MarlinScalarType<a_type_id>::scalar_t;
   using scalar_t2 = typename MarlinScalarType<a_type_id>::scalar_t2;
@@ -695,7 +722,7 @@ __global__ void Marlin(
       ilv_delta_lo = 47 * b_gl_rd_delta_o;
     }
   } else {
-    b_gl_rd += b_sh_stride * tile_column_stride * slice_col;
+    b_gl_rd += b_sh_stride * tile_column_stride * b_chunk_col(slice_col);
     b_gl_rd += b_gl_rd_delta_o * slice_row;
   }
 #endif
@@ -880,7 +907,14 @@ __global__ void Marlin(
   static_assert(scale6 && (threads == 256 || threads == 128),
                 "TMA4 rANS scales require M = 1 decode config (128 or 256 threads)");
   constexpr int kTmaWarps = threads / 32;
-  constexpr int RANS_CAP = (threads == 256) ? 3200 : 2048;
+  // The super-block byte budget is a property of the tile geometry, not of the thread count: a 64-column tile's
+  // 4-stage super-block is 4 x 512 = 2048 raw scale bytes, a 128-column one is 4 x 1024 = 4096.
+  constexpr int RANS_CAP = (thread_n_blocks == 8) ? 3200 : 2048;
+  // Each warp decodes a contiguous run of the stage's tile_n * 8 scale bytes; 8 warps on a 64-column tile cover 64 B
+  // each instead of 4 warps covering 128 B each. The warps still cover the stage in ascending byte order, so the
+  // concatenated symbol stream is identical and the decoded scale bytes are unchanged.
+  constexpr int kTmaPerWarp = (16 * thread_n_blocks * 8) / kTmaWarps;
+  constexpr int kTmaM = kTmaPerWarp / 32;
   uint32_t* sh_states = reinterpret_cast<uint32_t*>(sh_pal + 64);
   unsigned char* sh_rslot = reinterpret_cast<unsigned char*>(sh_states + threads);
   uint32_t* sh_rlut = reinterpret_cast<uint32_t*>(sh_rslot + 2 * RANS_CAP);
@@ -960,13 +994,13 @@ __global__ void Marlin(
       for (int i = 0; i < kTmaWarps - 1; i++) start += i < w ? cw[i] : 0;
       tma_wp = reinterpret_cast<const uint16_t*>(blk) + start;
     }
-    uint8_t* dst = reinterpret_cast<uint8_t*>(sh_s + s_sh_stage * (X & (stages - 1))) + 128 * w + lane;
+    uint8_t* dst = reinterpret_cast<uint8_t*>(sh_s + s_sh_stage * (X & (stages - 1))) + kTmaPerWarp * w + lane;
     const uint32_t lt = (1u << lane) - 1u;
   #pragma unroll
-    for (int m = 0; m < 4; m++) {
+    for (int m = 0; m < kTmaM; m++) {
       const uint32_t e = sh_rlut[tma_x & 1023u];
-      tma_x = ((e >> 6) & 2047u) * (tma_x >> 10) + (e >> 17);
-      dst[32 * m] = sh_pal[e & 63u];
+      tma_x = ((e >> 8) & 2047u) * (tma_x >> 10) + (e >> 19);
+      dst[32 * m] = static_cast<uint8_t>(e);
       const bool need = tma_x < 65536u;
       const uint32_t msk = __ballot_sync(0xffffffffu, need);
       if (need) tma_x = (tma_x << 16) | tma_wp[__popc(msk & lt)];
@@ -1184,7 +1218,7 @@ __global__ void Marlin(
             b_gl_rd + (i % count) * threads +
             b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
 
-        cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
+        cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &Bslice[b_gl_idx]);
       }
 
       if constexpr (down_ilv) {
@@ -2189,6 +2223,11 @@ __global__ void Marlin(
     if (!tma_started) {
       tma_started = true;
       tma_wait(0, 0);
+      for (int i = threadIdx.x; i < 1024; i += threads) {
+        const uint32_t e = sh_rlut[i];
+        sh_rlut[i] = ((e & ~63u) << 2) | static_cast<uint32_t>(sh_pal[e & 63u]);
+      }
+      __syncthreads();
       tma_x = sh_states[threadIdx.x];
       if (tma_iters > 0) tma_decode(0);
       if (tma_iters > 1) tma_decode(1);
@@ -2252,11 +2291,11 @@ __global__ void Marlin(
             fetch_to_shared((pipe + stages - 1) % stages, pipe,
                             total_rem >= stages);
             pipe++;
-            wait_for_stage();
 #ifdef MUSE_SCALE_TMA4
             tma_q++;
             if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
 #endif
+            wait_for_stage();
             init_same_group(pipe % stages);
           }
           matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
@@ -2283,11 +2322,11 @@ __global__ void Marlin(
             fetch_to_shared((pipe + stages - 1) % stages, pipe,
                             slice_iters >= stages);
             pipe++;
-            wait_for_stage();
 #ifdef MUSE_SCALE_TMA4
             tma_q++;
             if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
 #endif
+            wait_for_stage();
 #ifdef MUSE_SCALE_RANS
             rans_q++;
             if (rans_q + 1 < rans_iters) {
@@ -2552,7 +2591,7 @@ __global__ void Marlin(
           if constexpr (!down_ilv) {
             b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride) +
                       (threadIdx.x % b_sh_stride);
-            b_gl_rd += b_sh_stride * tile_column_stride * slice_col + b_gl_rd_delta_o * slice_row;
+            b_gl_rd += b_sh_stride * tile_column_stride * b_chunk_col(slice_col) + b_gl_rd_delta_o * slice_row;
           }
 
           bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;

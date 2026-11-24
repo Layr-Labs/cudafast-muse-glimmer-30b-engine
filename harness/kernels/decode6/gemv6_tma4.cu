@@ -23,7 +23,11 @@ static size_t decode6_tpf_stride() {
   return stride;
 }
 
-template <int Threads>
+// A stage holds tile_n * 8 scale bytes (8 group-16 codes per column of a 128-k tile), which is independent of the
+// thread count: StageBytes is passed explicitly so a 64-column tile can run 8 warps (64 B each) instead of 4 (128 B
+// each). The warps still cover the stage's bytes in ascending order, so the concatenated symbol stream -- and hence
+// every decoded scale byte -- is unchanged.
+template <int Threads, int StageBytes>
 __global__ void tma4_pass1_kernel(
     const uint8_t* __restrict__ sym_tiled, int k_tiles,
     const int* __restrict__ stage_col_k, const int* __restrict__ blk_stage_off,
@@ -31,7 +35,8 @@ __global__ void tma4_pass1_kernel(
     const uint32_t* __restrict__ enc_f, const uint32_t* __restrict__ enc_c,
     uint32_t* __restrict__ sb_wc) {
   constexpr int kWarps = Threads / 32;
-  constexpr int kStageBytes = Threads * 4;
+  constexpr int kPerWarp = StageBytes / kWarps;
+  constexpr int kM = kPerWarp / 32;
   __shared__ uint32_t sf[64], sc[64];
   if (threadIdx.x < 64) {
     sf[threadIdx.x] = enc_f[threadIdx.x];
@@ -55,9 +60,9 @@ __global__ void tma4_pass1_kernel(
     for (int s = st_hi - 1; s >= st_lo; --s) {
       const int col = stage_col_k[2 * s];
       const int kt = stage_col_k[2 * s + 1];
-      const uint8_t* raw = sym_tiled + (static_cast<size_t>(col) * k_tiles + kt) * kStageBytes + 128 * w + lane;
+      const uint8_t* raw = sym_tiled + (static_cast<size_t>(col) * k_tiles + kt) * StageBytes + kPerWarp * w + lane;
 #pragma unroll
-      for (int m = 3; m >= 0; --m) {
+      for (int m = kM - 1; m >= 0; --m) {
         const uint32_t sy = raw[32 * m];
         const uint32_t fs = sf[sy], cs = sc[sy];
         const bool emit = static_cast<uint64_t>(x) >= (static_cast<uint64_t>(fs) << 22);
@@ -70,7 +75,7 @@ __global__ void tma4_pass1_kernel(
   }
 }
 
-template <int Threads>
+template <int Threads, int StageBytes>
 __global__ void tma4_pass2_kernel(
     const uint8_t* __restrict__ sym_tiled, int k_tiles,
     const int* __restrict__ stage_col_k, const int* __restrict__ blk_stage_off,
@@ -79,7 +84,8 @@ __global__ void tma4_pass2_kernel(
     const uint32_t* __restrict__ sb_wc, const uint32_t* __restrict__ off16,
     uint32_t* __restrict__ states_out, unsigned char* __restrict__ var_out) {
   constexpr int kWarps = Threads / 32;
-  constexpr int kStageBytes = Threads * 4;
+  constexpr int kPerWarp = StageBytes / kWarps;
+  constexpr int kM = kPerWarp / 32;
   __shared__ uint32_t sf[64], sc[64];
   if (threadIdx.x < 64) {
     sf[threadIdx.x] = enc_f[threadIdx.x];
@@ -114,9 +120,9 @@ __global__ void tma4_pass2_kernel(
     for (int s = st_hi - 1; s >= st_lo; --s) {
       const int col = stage_col_k[2 * s];
       const int kt = stage_col_k[2 * s + 1];
-      const uint8_t* raw = sym_tiled + (static_cast<size_t>(col) * k_tiles + kt) * kStageBytes + 128 * w + lane;
+      const uint8_t* raw = sym_tiled + (static_cast<size_t>(col) * k_tiles + kt) * StageBytes + kPerWarp * w + lane;
 #pragma unroll
-      for (int m = 3; m >= 0; --m) {
+      for (int m = kM - 1; m >= 0; --m) {
         const uint32_t sy = raw[32 * m];
         const uint32_t fs = sf[sy], cs = sc[sy];
         const bool emit = static_cast<uint64_t>(x) >= (static_cast<uint64_t>(fs) << 22);
@@ -136,16 +142,28 @@ __global__ void tma4_pass2_kernel(
 template <int TileN, int Threads, bool GateUpGrid, bool DownIlv = false, bool GateV48 = false>
 int launch_tma4(const int4* input, const int4* weight, int4* output, int4* partials,
                 const int4* coded, const int4* palette, const float* global_scale,
-                int* locks, int n, int k, int grid, int device, cudaStream_t stream) {
+                int* locks, int n, int k, int grid, int device, cudaStream_t stream,
+                const int64_t* wptrs = nullptr, const int* wtiles = nullptr, int wchunks = 0) {
   auto kernel = muse_marlin6_tma4::Marlin<
       vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
       vllm::kFE4M3fn.id(), Threads, 1, TileN / 16, 8, true, 4, 1, false, true, GateUpGrid, DownIlv, GateV48>;
   static int cached_shared[16] = {0};
   int shared = (device >= 0 && device < 16) ? cached_shared[device] : 0;
   if (shared == 0) {
-    auto status = cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status != cudaSuccess) return status;
-    status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
+    if constexpr (TileN == 64 && Threads == 128) {
+      // Actual usage is 45,904 B (16 KiB B + 2 KiB S + 16 KiB A + 11.1 KiB TMA4/red); 48 KiB fits 2 CTAs/SM.
+      // NOTE: the 256-thread instantiation must NOT take this branch. The cross-warp reduction region is
+      // red_sh_stride * (Threads/32) = 256 * 8 = 2048 int4 = 32 KiB at 8 warps; at 4 warps it is 1024 int4 = 16 KiB,
+      // which happens to fit inside the B-stage overlay that this 48 KiB figure was measured against. At 256 threads
+      // the real footprint is 57,472 B, so requesting 48 KiB is an out-of-bounds dynamic shared memory request and
+      // faults with an illegal memory access. 256 threads therefore takes the opt-in-maximum branch below; lm_head
+      // runs 48 CTAs on 48 SMs, so 1 CTA/SM is what it gets either way and the larger request costs nothing.
+      shared = 48 * 1024;
+    } else {
+      auto status = cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+      if (status != cudaSuccess) return status;
+    }
+    auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
     if (status != cudaSuccess) return status;
     if (device >= 0 && device < 16) cached_shared[device] = shared;
   }
@@ -220,7 +238,7 @@ int launch_tma4(const int4* input, const int4* weight, int4* output, int4* parti
   kernel<<<grid, Threads, shared, stream>>>(
       input, weight, output, partials, nullptr, nullptr, states, global_scale,
       var, lut_and_meta, k / 16, 1, n, k, k, locks, false, false, true, shared, palette,
-      decode6_tpf_stride());
+      decode6_tpf_stride(), wptrs, wtiles, wchunks);
   return cudaGetLastError();
 }
 
@@ -239,28 +257,66 @@ extern "C" int muse_marlin6_sk_tma4(const int4* input, const int4* weight, int4*
                                     int4* partials, const int4* coded, const int4* palette,
                                     const float* global_scale, int* locks, int n, int k, int blocks,
                                     int device, cudaStream_t stream) {
-  if (k % 128 != 0 || blocks != 48) return cudaErrorInvalidValue;
+  if (k % 128 != 0 || blocks < 48 || blocks > 1024) return cudaErrorInvalidValue;
   if (n == 4096 && k == 6656) {
     const int gb = muse_marlin6_get_gate_blocks();
-    if (gb != 48) {
+    if (gb == 24) {
       return launch_tma4<128, 256, false, false, true>(input, weight, output, partials, coded, palette,
                                                        global_scale, locks, n, k, gb, device, stream);
     }
+    return launch_tma4<128, 256, false, false, false>(input, weight, output, partials, coded, palette,
+                                                      global_scale, locks, n, k, gb, device, stream);
   }
   if (n % 128 == 0)
     return launch_tma4<128, 256, false, false, false>(input, weight, output, partials, coded, palette,
                                                       global_scale, locks, n, k, 48, device, stream);
   if (n % 64 == 0)
+    // 64-column tiles run 128 threads (4 warps), so lm_head takes the caller's wider grid: 336 CTAs give 2 CTAs
+    // (8 warps) per SM and drop the 48-CTA wave tail, with each output column still reduced in ascending k order
+    // inside a single CTA.
     return launch_tma4<64, 128, false, false, false>(input, weight, output, partials, coded, palette,
-                                                     global_scale, locks, n, k, 48, device, stream);
+                                                     global_scale, locks, n, k, blocks, device, stream);
   return cudaErrorInvalidValue;
+}
+
+// 64-column tiles at 256 threads: identical grid, identical schedule, identical reduction tree, 8 warps/SM instead of
+// 4. The rANS warp mapping is generalized (64 B per warp instead of 128 B) on both the encode and decode sides, so the
+// decoded scale bytes are unchanged and the GEMV is bit-exact against the 128-thread instantiation by construction.
+extern "C" int muse_marlin6_sk_tma4_t256(const int4* input, const int4* weight, int4* output,
+                                         int4* partials, const int4* coded, const int4* palette,
+                                         const float* global_scale, int* locks, int n, int k, int blocks,
+                                         int device, cudaStream_t stream) {
+  if (k % 128 != 0 || n % 64 != 0 || n % 128 == 0 || blocks < 48 || blocks > 1024)
+    return cudaErrorInvalidValue;
+  return launch_tma4<64, 256, false, false, false>(input, weight, output, partials, coded, palette,
+                                                   global_scale, locks, n, k, blocks, device, stream);
+}
+
+// Same kernels with a row-chunked weight placement: the caller may split the 3157 output-column tiles across several
+// separately allocated buffers (each small enough to land in the fast band) and pass the chunk bases plus the
+// cumulative tile offsets. Only the weight base moves -- the tile index, the k-chain, the grid and the schedule are
+// unchanged -- so the result is bit-exact. wptrs == nullptr is the contiguous path we ship today.
+extern "C" int muse_marlin6_sk_tma4_chunked(const int4* input, const int4* weight, int4* output,
+                                            int4* partials, const int4* coded, const int4* palette,
+                                            const float* global_scale, int* locks, int n, int k, int blocks,
+                                            int device, cudaStream_t stream,
+                                            const int64_t* wptrs, const int* wtiles, int wchunks) {
+  if (k % 128 != 0 || n % 64 != 0 || blocks < 48 || blocks > 1024 || wchunks < 1)
+    return cudaErrorInvalidValue;
+  if (n % 128 == 0)
+    return launch_tma4<128, 256, false, false, false>(input, weight, output, partials, coded, palette,
+                                                      global_scale, locks, n, k, 48, device, stream,
+                                                      wptrs, wtiles, wchunks);
+  return launch_tma4<64, 128, false, false, false>(input, weight, output, partials, coded, palette,
+                                                   global_scale, locks, n, k, blocks, device, stream,
+                                                   wptrs, wtiles, wchunks);
 }
 
 extern "C" int muse_marlin6_sk_tma4_ilv(const int4* input, const int4* weight, int4* output,
                                         int4* partials, const int4* coded, const int4* palette,
                                         const float* global_scale, int* locks, int n, int k, int blocks,
                                         int device, cudaStream_t stream) {
-  if (k % 128 != 0 || n % 128 != 0 || blocks != 48) return cudaErrorInvalidValue;
+  if (k % 128 != 0 || n % 128 != 0 || blocks < 48 || blocks > 1024) return cudaErrorInvalidValue;
   if (n == 4096 && k == 6656) {
     const int gb = muse_marlin6_get_gate_blocks();
     if (gb == 24) {
@@ -268,8 +324,14 @@ extern "C" int muse_marlin6_sk_tma4_ilv(const int4* input, const int4* weight, i
                                                       global_scale, locks, n, k, 24, device, stream);
     }
     if (gb != 48) return cudaErrorInvalidValue;
-  } else if (!((n == 39936 && k == 6656) || (n == 6656 && k == 19968) ||
-               (n == 4608 && k == 6656) || (n == 6656 && k == 4096))) {
+    return launch_tma4<128, 256, false, true, false>(input, weight, output, partials, coded, palette,
+                                                     global_scale, locks, n, k, 48, device, stream);
+  } else if (n == 6656 && k == 19968) {
+    // The down projection is the only 48-CTA stream-K ILV shape that is re-launched on the caller's wider grid;
+    // its weight permutation is rebuilt from the same schedule, so the admitted bytes are unchanged.
+    return launch_tma4<128, 256, false, true, false>(input, weight, output, partials, coded, palette,
+                                                     global_scale, locks, n, k, blocks, device, stream);
+  } else if (!((n == 39936 && k == 6656) || (n == 4608 && k == 6656) || (n == 6656 && k == 4096))) {
     return cudaErrorInvalidValue;
   }
   return launch_tma4<128, 256, false, true, false>(input, weight, output, partials, coded, palette,
@@ -280,13 +342,16 @@ extern "C" int muse_tma4_pass1(const uint8_t* sym_tiled, int k_tiles,
                                const int* stage_col_k, const int* blk_stage_off,
                                const uint32_t* blk_sb_off, const uint32_t* sb_gsb_map,
                                const uint32_t* enc_f, const uint32_t* enc_c,
-                               uint32_t* sb_wc, int num_blks, int threads,
+                               uint32_t* sb_wc, int num_blks, int threads, int stage_bytes,
                                cudaStream_t stream) {
-  if (threads == 256)
-    tma4_pass1_kernel<256><<<num_blks, 256, 0, stream>>>(
+  if (threads == 256 && stage_bytes == 1024)
+    tma4_pass1_kernel<256, 1024><<<num_blks, 256, 0, stream>>>(
         sym_tiled, k_tiles, stage_col_k, blk_stage_off, blk_sb_off, sb_gsb_map, enc_f, enc_c, sb_wc);
-  else if (threads == 128)
-    tma4_pass1_kernel<128><<<num_blks, 128, 0, stream>>>(
+  else if (threads == 256 && stage_bytes == 512)
+    tma4_pass1_kernel<256, 512><<<num_blks, 256, 0, stream>>>(
+        sym_tiled, k_tiles, stage_col_k, blk_stage_off, blk_sb_off, sb_gsb_map, enc_f, enc_c, sb_wc);
+  else if (threads == 128 && stage_bytes == 512)
+    tma4_pass1_kernel<128, 512><<<num_blks, 128, 0, stream>>>(
         sym_tiled, k_tiles, stage_col_k, blk_stage_off, blk_sb_off, sb_gsb_map, enc_f, enc_c, sb_wc);
   else
     return cudaErrorInvalidValue;
@@ -299,13 +364,18 @@ extern "C" int muse_tma4_pass2(const uint8_t* sym_tiled, int k_tiles,
                                const uint32_t* enc_f, const uint32_t* enc_c,
                                const uint32_t* sb_wc, const uint32_t* off16,
                                uint32_t* states_out, unsigned char* var_out,
-                               int num_blks, int threads, cudaStream_t stream) {
-  if (threads == 256)
-    tma4_pass2_kernel<256><<<num_blks, 256, 0, stream>>>(
+                               int num_blks, int threads, int stage_bytes,
+                               cudaStream_t stream) {
+  if (threads == 256 && stage_bytes == 1024)
+    tma4_pass2_kernel<256, 1024><<<num_blks, 256, 0, stream>>>(
         sym_tiled, k_tiles, stage_col_k, blk_stage_off, blk_sb_off, sb_gsb_map, enc_f, enc_c,
         sb_wc, off16, states_out, var_out);
-  else if (threads == 128)
-    tma4_pass2_kernel<128><<<num_blks, 128, 0, stream>>>(
+  else if (threads == 256 && stage_bytes == 512)
+    tma4_pass2_kernel<256, 512><<<num_blks, 256, 0, stream>>>(
+        sym_tiled, k_tiles, stage_col_k, blk_stage_off, blk_sb_off, sb_gsb_map, enc_f, enc_c,
+        sb_wc, off16, states_out, var_out);
+  else if (threads == 128 && stage_bytes == 512)
+    tma4_pass2_kernel<128, 512><<<num_blks, 128, 0, stream>>>(
         sym_tiled, k_tiles, stage_col_k, blk_stage_off, blk_sb_off, sb_gsb_map, enc_f, enc_c,
         sb_wc, off16, states_out, var_out);
   else

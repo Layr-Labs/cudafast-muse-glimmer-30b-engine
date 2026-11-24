@@ -69,6 +69,12 @@ TLB_RANS_HEAD = int(os.environ.get("L2PF_TLB_RANS_HEAD_KB", "64")) << 10
 TLB_STRIDE = int(os.environ.get("L2PF_TLB_STRIDE_KB", "2048")) << 10
 TLB_ALL = os.environ.get("L2PF_TLB_ALL", "1") != "0"
 TLB_UNASSISTED = os.environ.get("L2PF_TLB_UNASSISTED", "1") != "0"
+# L2PF_JOIN=0 leaves the prefetch on its side stream instead of making the main
+# stream wait for it before the GEMM it warms. The prefetch then overlaps the
+# GEMM's own first microseconds rather than the (much shorter) gap ahead of it,
+# which removes the prefetch kernel from the serialized path. Prefetches write
+# nothing, so this can only change timing, never a value.
+JOIN = os.environ.get("L2PF_JOIN", "0") != "0"
 # Per-layer (address, bytes) of the contiguous RMSNorm weight arena (set by the model); NORM_PREWARM=0 disables.
 NORM_HINT: list | None = None
 NORM_PREWARM = os.environ.get("L2PF_NORM_PREWARM", "1") != "0"
@@ -646,7 +652,7 @@ class Session:
             with self._patched(self._on_apply, False):
                 yield
         finally:
-            self._join(torch.cuda.current_stream())
+            self._join(torch.cuda.current_stream(), force=True)
 
     def _fork(self, main, i):
         if i >= len(self.sites) or not self.sites[i].descs:
@@ -658,8 +664,8 @@ class Session:
         self._pending = True
         self.prefetched += 1
 
-    def _join(self, main):
-        if self._pending:
+    def _join(self, main, force=False):
+        if self._pending and (JOIN or force):
             main.wait_stream(self.side)
             self._pending = False
 
@@ -674,7 +680,7 @@ class Session:
         self._i += 1
         if i >= len(self.sites) or key != self.sites[i].ptr or kind != self.sites[i].kind:
             self.stopped = True
-            self._join(main)
+            self._join(main, force=True)
             return
         self._join(main)
         self._fork(main, i + 1)
@@ -695,6 +701,7 @@ class Session:
             big = "skipped"
         return (f"{self.prefetched} of {len(self.sites)} GEMM sites"
                 f"{' (stopped at a mismatch)' if self.stopped else ''}; "
+                f"join={'on' if JOIN else 'off (overlapped)'}; "
                 f"{na} after attention at {BYTES_AFTER_ATTN / (1 << 20):.1f} MiB, "
                 f"{nb} others at {BYTES_OTHER / (1 << 20):.1f} MiB, "
                 f"weights above {MAX_WEIGHT / (1 << 20):.0f} MiB: {big}; "

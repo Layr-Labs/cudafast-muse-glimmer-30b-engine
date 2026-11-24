@@ -27,6 +27,7 @@ extern "C" int muse_marlin6_gate_up_srans(const int4* input, const int4* weight,
   status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
   if (status != cudaSuccess) return status;
   kernel<<<336, 256, shared, stream>>>(input, weight, output, partials, nullptr, nullptr, headers, global_scale,
-                                       var, lut, k / 16, 1, n, k, k, locks, false, false, true, shared, palette, 0);
+                                       var, lut, k / 16, 1, n, k, k, locks, false, false, true, shared, palette, 0,
+                                       nullptr, nullptr, 0);
   return cudaGetLastError();
 }

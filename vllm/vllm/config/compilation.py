@@ -1191,6 +1191,7 @@ class CompilationConfig:
                         self.pass_config.fuse_qk_norm_rope_kvcache = False
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
+                    self.splitting_ops.append("vllm::muse_glimmer_qk_norm_rope_cache")
                     self.splitting_ops.extend(self._side_stream_ops)
 
             elif len(self.splitting_ops) == 0:

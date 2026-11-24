@@ -34,7 +34,44 @@ ENABLED = os.environ.get("MUSE_DECODE_PLACEMENT", "1").strip() not in ("0", "", 
 FULL_RAM_SCAN = os.environ.get("MUSE_FULL_RAM_SCAN", "1").strip() not in ("0", "", "false", "no")
 PLACE_SCALES6 = os.environ.get("MUSE_PLACE_SCALES6", "1").strip() not in ("0", "", "false", "no")
 SURPLUS = float(os.environ.get("MUSE_DECODE_PLACEMENT_SURPLUS", "3.0"))
+# lm_head is a single 641 MiB tensor: the largest weight in the model and the only GEMV that
+# sits below 230 GB/s. 24 is the measured default and it is already saturated -- see the
+# LM_HEAD_SCAN note below; more spares buy nothing.
 LM_HEAD_SPARES = int(os.environ.get("MUSE_LM_HEAD_SPARES", "24"))
+# Place the single-layer groups (lm_head) right after the full-RAM scan has seeded the fast
+# pool, instead of last. Default OFF: the measured 1.35307 tree places it last, and the log
+# shows placement is saturated at this size either way, so reordering is pure risk. Turn on
+# only to test whether lm_head's candidates are better before the rANS groups take the pool.
+LM_HEAD_FIRST = os.environ.get("MUSE_LM_HEAD_FIRST", "0").strip() not in ("0", "", "false", "no")
+# Candidates for lm_head's own fast-band scan, at its own 641 MiB size. 0 disables the scan and
+# leaves the small spare pick. The default equals the spare count the measured tree already
+# allocates (25 candidates, ~15 GiB), so this adds the distribution line at no extra memory
+# cost: if the fastest of 25 candidates at 641 MiB is still ~228 GB/s then placement is
+# exhausted and no spare count or ordering recovers the gap to gate_up's 256 GB/s.
+LM_HEAD_SCAN = int(os.environ.get("MUSE_LM_HEAD_SCAN", "24"))
+# Split lm_head's packed weight into tile-aligned chunks at or below this many MiB and probe each
+# chunk's band. The packed layout is tile-major, so a chunk is a plain contiguous slice and the
+# kernel can address it with a per-chunk base plus a local tile index -- n_tiles and the grid stay
+# fixed, so the per-column k-chain is untouched. 0 disables the probe. This is measurement only:
+# nothing reads the chunks yet, so the tree behaves exactly as before.
+LM_HEAD_CHUNKS = int(os.environ.get("MUSE_LM_HEAD_CHUNKS", "6"))
+LM_HEAD_CHUNK_SPARES = int(os.environ.get("MUSE_LM_HEAD_CHUNK_SPARES", "3"))
+LM_HEAD_CHUNK_CAP_BYTES = int(os.environ.get("MUSE_LM_HEAD_CHUNK_MIB", "128")) << 20
+# Register the chunked placement with the kernel (muse_marlin6_gemv.set_btab). OFF, and the reason is
+# measured rather than cautious: the split was built on the premise that lm_head's 226 GB/s is a
+# placement/granule artifact that a 641 MiB allocation cannot escape, and that splitting it into
+# 6x107 MiB pieces would let it reach the 245-256 that gate_up's 127 MiB layers achieve. The
+# fast-band scan refutes the premise -- six independent 641 MiB draws span 226/226/225/224/221 GB/s,
+# a 2.2% spread, and moving to the best of four gains 0.004 ms -- so the allocation was already in
+# the fast band and re-cutting it cannot recover a gap that does not exist. Measured with the table
+# verified live: 67.992/67.966 against 67.787/67.898 for the contiguous path, +0.136 ms/tok = -15
+# bips, which is inside the null spread but is not a gain. The 226 is a property of the
+# 202048x6656 shape and its tile_n=64 instantiation, not of the allocation size.
+# MUSE_LM_HEAD_CHUNKS_APPLY=1 restores it for an A/B on the same binary; the probe still runs and
+# still prints, so the fast-band distribution stays in the log either way.
+LM_HEAD_CHUNKS_APPLY = os.environ.get("MUSE_LM_HEAD_CHUNKS_APPLY", "0").strip() not in ("0", "", "false", "no")
+# Only the largest single weight is worth chunking; everything else already fits the granule.
+LM_HEAD_CHUNK_MIN_BYTES = 256 << 20
 ROUNDS = 5
 # Weights that fit in L2 several times over are not bandwidth-bound per call.
 MIN_PAYLOAD_BYTES = 48 << 20
@@ -48,6 +85,14 @@ PLACE_ATTN = os.environ.get("MUSE_PLACE_ATTN", "1").strip() not in ("0", "", "fa
 PREFILL_PLACE_ATTN = os.environ.get("MUSE_PREFILL_PLACE_ATTN", "1").strip() not in ("0", "", "false", "no")
 ATTN_MIN_BYTES = 10 << 20
 ATTN_SURPLUS = float(os.environ.get("MUSE_ATTN_PLACEMENT_SURPLUS", "2.5"))
+# Belt to muse_fp8.prepare's brace. That function registers the uncompressed pack under
+# `muse_fp8_plain` and the rANS stream under `muse_fp8_packed`, so the buffer name alone already
+# separates the two cases. This gate is the second lock: the rANS decoder must never be handed a
+# pack that rans_pack did not produce, and reading MUSERANS here fails closed if some other module
+# ever registers `muse_fp8_packed` while compression is off. Handing the decoder an uncompressed
+# pack is not a rejection -- it reads its state table out of weight bytes and walks off the end of
+# the allocation, which surfaces as a sticky illegal memory access at load.
+_RANS_ON = os.environ.get("MUSERANS", "1").strip() != "0"
 
 
 def _drop_model_page_cache() -> None:
@@ -232,14 +277,263 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
     }
 
 
-def _place_group(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor, rejected_hold: list) -> dict | None:
+def _place_lm_head_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor,
+                                 rejected_hold: list) -> dict | None:
+    """Scan the fast band at lm_head's own 641 MiB granularity and keep the fastest home.
+
+    The gate_up scan seeds PyTorch's cache with 127 MiB blocks, but a 641 MiB allocation cannot
+    be served from those blocks -- the caching allocator will not merge separate segments, so it
+    cudaMallocs a fresh one wherever the driver likes.
+
+    What the existing log already shows, over six independent runs: the fastest of 25 candidates
+    at 641 MiB is 222-228 GB/s (moved=1 every time, gain 2-4%), while the same runs place 127 MiB
+    gate_up layers at 256 GB/s and 63 MiB down layers at 244 GB/s. So the fast band is a ~127 MiB
+    granule that a 641 MiB allocation cannot occupy, and 24 spares (15 GiB sampled) never find a
+    better one. The scan's job is therefore diagnostic, not corrective: it prints the distribution
+    over candidates so that "no 641 MiB hole exists" is measured rather than inferred.
+    """
+    homes = [layer._buffers[_NAME] for layer in layers]
+    count = len(homes)
+    payload_bytes = homes[0].numel() * homes[0].element_size()
+    wanted = max(LM_HEAD_SCAN, count + 1)
+    if LM_HEAD_SCAN <= 0:
+        return None
+    # Ask for the candidates without the destructive trim: at this point nothing has been placed
+    # yet, so the allocator has the whole machine to hand out and empty_cache() would only cost.
+    spares_count = _spares_allowed(wanted, payload_bytes)
+    if spares_count <= count:
+        return None
+    spares = []
+    try:
+        for _ in range(spares_count):
+            spare = torch.empty_like(homes[0])
+            spare.copy_(homes[0])  # every page written once before it is timed
+            spares.append(spare)
+    except RuntimeError:  # out of device memory: time what exists
+        pass
+    if len(spares) <= count:
+        spares.clear()
+        return None
+    candidates = homes + spares
+    times = _time_candidates(decode_linear, layers[0], candidates, n, k, 3, evict_buf)
+    ranked = sorted(range(len(candidates)), key=times.__getitem__)
+    kept = set(ranked[:count])
+    free_fast = [index for index in ranked[:count] if index >= count]
+    movers = sorted((index for index in range(count) if index not in kept),
+                    key=times.__getitem__, reverse=True)
+    moved = 0
+    after = list(times[:count])
+    used_targets = set()
+    displaced = []
+    for home_index, target_index in zip(movers, free_fast):
+        target, source = candidates[target_index], homes[home_index]
+        target.copy_(source)
+        if not torch.equal(target, source):
+            continue
+        layers[home_index]._buffers[_NAME] = target
+        used_targets.add(target_index)
+        displaced.append((times[home_index], source))
+        after[home_index] = times[target_index]
+        moved += 1
+    # Everything not kept: the slowest stay quarantined so later groups do not recycle them.
+    unused = [(times[count + i], spare) for i, spare in enumerate(spares) if (count + i) not in used_targets]
+    unused.extend(displaced)
+    unused.sort(key=lambda pair: pair[0])
+    for _, slow_buf in unused[len(unused) // 2:]:
+        _SLOW_HOLD.append(slow_buf)
+    before = sorted(times[:count])
+    after.sort()
+    spread = sorted(times)
+    return {
+        "count": count, "spares": len(spares), "moved": moved, "payload_bytes": payload_bytes,
+        "before": (before[0], median(before), before[-1], sum(before)),
+        "after": (after[0], median(after), after[-1], sum(after)),
+        "scan": (spread[0], median(spread), spread[-1], spread[len(spread) // 4],
+                 spread[(3 * len(spread)) // 4]),
+    }
+
+
+def _probe_stream_seconds(bufs: list, evict_buf: torch.Tensor, rounds: int = 3) -> float:
+    """Best-of-``rounds`` streaming-read time, in seconds, for the whole set at once.
+
+    The set is timed as one pass rather than buffer by buffer, and that is the whole point: a
+    single chunk is ~107 MiB and this part's L2 is the same order of magnitude, so a per-chunk
+    read can be served largely from cache and report a band the DRAM never delivered. The whole
+    set is ~640 MiB, several times L2, so its rate is a DRAM rate -- and because it is the same
+    total bytes as the single 641 MiB buffer, it is directly comparable with that buffer's
+    ceiling, which is exactly the question this probe exists to answer.
+
+    ``.item()`` is what makes the timing real. It copies the reduction result to the host, so the
+    reads have completed before the clock is read; without it the timer can close on the launch
+    and report a rate hundreds of times the hardware's.
+    """
+    best = float("inf")
+    for _ in range(rounds):
+        _flush_l2(evict_buf)
+        torch.cuda.synchronize()
+        began = time.perf_counter()
+        acc = 0
+        for buf in bufs:
+            acc = acc + buf.sum()
+        float(acc.item())
+        best = min(best, time.perf_counter() - began)
+    return best
+
+
+def _diagnose_lm_head_chunks(layer, n: int, k: int, evict_buf: torch.Tensor,
+                             baseline_gbps: float) -> None:
+    """Split lm_head's packed weight into tile-aligned chunks and probe each chunk's band.
+
+    ``prepare_decode_layout`` writes the packed weight tile-major as ``[n//tile_n][k//16][2*tile_n]``,
+    so a tile-aligned chunk is a plain contiguous slice: no repacking, and the kernel can address it
+    with a per-chunk base plus a local tile index while ``n_tiles`` and the grid stay fixed. That is
+    what keeps this bit-exact -- the per-column k-chain never changes, only where the bytes live.
+
+    Measurement only. The chunks are probed and released; nothing reads them yet, so the engine
+    behaves exactly as before. The number to read is the aggregate GB/s: if chunking reaches the
+    ~256 GB/s that gate_up's 127 MiB layers prove is available, the kernel indirection is worth
+    building, and if it stays at the single-buffer ceiling the granule model is wrong.
+    """
+    if LM_HEAD_CHUNKS < 2:
+        return
+    w = layer._buffers.get(_NAME)
+    if w is None or w.dim() != 3 or not w.is_cuda:
+        return
+    n_tiles, k16, width = w.shape
+    tile_n = width // 2
+    if tile_n <= 0 or tile_n * n_tiles != n or k16 * 16 != k:
+        return
+    total_bytes = w.numel() * w.element_size()
+    if total_bytes < LM_HEAD_CHUNK_MIN_BYTES:
+        return
+    chunks_wanted = max(2, math.ceil(total_bytes / max(1, LM_HEAD_CHUNK_CAP_BYTES)))
+    base, rem = divmod(n_tiles, chunks_wanted)
+    if base <= 0:
+        return
+    counts = [base + (1 if i < rem else 0) for i in range(chunks_wanted)]
+    # Candidate j is the j-th allocation of the *whole* set, so what gets timed and what the
+    # kernel would read are the same object: six chunks placed together, not six independent
+    # draws whose bands are then averaged.
+    sets: list[list] = []
+    for _ in range(1 + LM_HEAD_CHUNK_SPARES):
+        try:
+            bufs, start = [], 0
+            for count in counts:
+                buf = torch.empty((count, k16, width), dtype=w.dtype, device=w.device)
+                buf.copy_(w[start:start + count])  # materialise every page, carry the real bytes
+                bufs.append(buf)
+                start += count
+            sets.append(bufs)
+        except RuntimeError:  # out of device memory: keep the sets that exist
+            break
+    if not sets:
+        return
+    times = [_probe_stream_seconds(bufs, evict_buf) for bufs in sets]
+    best = min(range(len(sets)), key=times.__getitem__)
+    kept = sets[best]
+    start = 0
+    for count, buf in zip(counts, kept):
+        if not torch.equal(buf, w[start:start + count]):
+            return  # never report a band we did not actually copy into
+        start += count
+    total = sum(counts) * k16 * width * w.element_size()
+    gbps = total / 1e9 / times[best]
+    # A rate above twice the single-buffer ceiling is not a band, it is an instrument fault;
+    # say so in the line rather than letting it be read as evidence.
+    plausible = gbps <= 2.0 * max(baseline_gbps, 1.0)
+    logger.info(
+        "lm_head chunk probe: %d chunks of %s tiles (%.0f MiB each, cap %d MiB), "
+        "set of %.0f MiB streamed in %.3f ms = %.0f GB/s vs single-buffer ceiling %.0f GB/s%s",
+        len(counts), "/".join(str(c) for c in counts), total / len(counts) / (1 << 20),
+        LM_HEAD_CHUNK_CAP_BYTES >> 20, total / (1 << 20), times[best] * 1e3, gbps,
+        baseline_gbps,
+        "" if plausible else " (IMPLAUSIBLE: above 2x the ceiling, treat as unmeasured)",
+    )
+    if not LM_HEAD_CHUNKS_APPLY:
+        return  # probe only: the kernel keeps reading the single buffer
+    # Hand the chunks to the kernel. set_btab keys its table by the weight's data_ptr(), and the
+    # single-buffer placement above may already have moved that buffer, so this must run after it
+    # and against the buffer the layer now holds -- which is exactly what `w` is.
+    try:
+        import muse_marlin6_gemv as _m6
+        if getattr(_m6, "_sk_tma4_chunked", None) is None:
+            # Without the symbol decode_linear6 silently takes the contiguous path, so a
+            # "verified bitwise" line would be comparing the contiguous path with itself and the
+            # run would measure nothing. Refuse to register rather than report a false pass.
+            logger.warning(
+                "lm_head chunk table not registered for %dx%d: libmuse_marlin6.so has no "
+                "muse_marlin6_sk_tma4_chunked symbol (check `nm -D`)", n, k,
+            )
+            return
+        entry = _m6.set_btab(w, n, k, kept)
+    except (ImportError, OSError, ValueError) as err:
+        logger.warning("lm_head chunk table not registered for %dx%d: %s", n, k, err)
+        return
+    # Keep the buffers alive for the life of the module; set_btab only stored their addresses.
+    layer._marlin_decode_wchunks = kept
+    # Prove the split before any token is generated. The kernel's own admission check runs in
+    # prepare_decode_layout6, which is BEFORE this function, so it never sees this table -- the
+    # equality has to be established here or not at all. Compare the contiguous path against the
+    # registered placement on the layer's real scale codes, bit for bit.
+    scales6 = getattr(layer, "_marlin_decode_scales6", None)
+    palette = getattr(layer, "_marlin_decode_palette", None)
+    if scales6 is None or palette is None:
+        _m6._BTAB.pop(w.data_ptr(), None)
+        logger.warning("lm_head chunk table dropped for %dx%d: no 6-bit scale codes to verify against", n, k)
+        return
+    fixed_grid = bool(getattr(layer, "marlin_decode6_fixed_grid", False))
+    xv = ((torch.arange(k, device=w.device) % 7).float() - 3.0).to(torch.bfloat16).reshape(1, k)
+    args = (scales6, palette, layer.weight_global_scale, layer.workspace, n, k, fixed_grid)
+    # Pin both probes to the 48-CTA partition so the equality covers the grid we actually ship
+    # rather than whatever _SK_BLOCKS currently defaults to. The address indirection is the same
+    # code at any width, but a check that silently ran at a different width is not evidence.
+    pinned = {**getattr(_m6, "_SK_BLOCK_OVERRIDE", {})}
+    try:
+        _m6._SK_BLOCK_OVERRIDE[(n, k)] = 48
+        _m6._BTAB.pop(w.data_ptr(), None)
+        contig = _m6.decode_linear6(xv, w, *args)
+        _m6.set_btab(w, n, k, kept)
+        placed = _m6.decode_linear6(xv, w, *args)
+        same = bool((contig.view(torch.int16) == placed.view(torch.int16)).all())
+    except (RuntimeError, ValueError) as err:
+        _m6._BTAB.pop(w.data_ptr(), None)
+        logger.warning("lm_head chunk table dropped for %dx%d: verification failed: %s", n, k, err)
+        return
+    finally:
+        _m6._SK_BLOCK_OVERRIDE.clear()
+        _m6._SK_BLOCK_OVERRIDE.update(pinned)
+    if not same:
+        _m6._BTAB.pop(w.data_ptr(), None)
+        logger.warning(
+            "lm_head chunk table dropped for %dx%d: %d-chunk placement is not bitwise identical "
+            "to the contiguous weight (chunk split %s)", n, k, len(kept), counts,
+        )
+        return
+    layer._marlin_decode_wtiles = [int(v) for v in entry[1].tolist()]
+    logger.info(
+        "lm_head chunk table verified bitwise for %dx%d: %d chunks, cumulative tiles %s "
+        "(kernel reads tile col at wptrs[chunk] + col - wtiles[chunk]; n_tiles and grid unchanged)",
+        n, k, len(kept), layer._marlin_decode_wtiles,
+    )
+
+
+def _place_group(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor, rejected_hold: list,
+                 prefer_pool: bool = False) -> dict | None:
     homes = [layer._buffers[_NAME] for layer in layers]
     count = len(homes)
     payload_bytes = homes[0].numel() * homes[0].element_size()
     is_small = payload_bytes < MIN_PAYLOAD_BYTES
     surplus = ATTN_SURPLUS if is_small else SURPLUS
     wanted = max(LM_HEAD_SPARES if count == 1 else 1, math.ceil(count * surplus)) if surplus > 0 else 0
-    spares_count = _ensure_spares_room(wanted, payload_bytes, rejected_hold, allow_slow_trim=not is_small)
+    # prefer_pool: take the candidates from the fast pool the full-RAM scan seeded, and only
+    # fall back to the destructive trim below if the allocator cannot serve them. For a payload
+    # above 128 MiB that trim calls empty_cache(), which returns the seeded fast blocks to the
+    # driver -- exactly the pages we want to sample.
+    spares_count = 0
+    if prefer_pool:
+        spares_count = _spares_allowed(wanted, payload_bytes)
+    if spares_count <= 0 or (is_small and spares_count < count):
+        spares_count = _ensure_spares_room(wanted, payload_bytes, rejected_hold, allow_slow_trim=not is_small)
     if spares_count <= 0 or (is_small and spares_count < count):
         return None
     spares = []
@@ -909,7 +1203,7 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                     groups.setdefault(key, []).append(layer)
                 elif PLACE_ATTN and nbytes >= ATTN_MIN_BYTES:
                     attn_nvfp4_groups.setdefault(key, []).append(layer)
-            rblob = bufs.get("muse_fp8_packed")
+            rblob = bufs.get("muse_fp8_packed") if _RANS_ON else None
             if (
                 rblob is not None
                 and rblob.is_cuda
@@ -953,6 +1247,56 @@ def place_decode_weights(model: torch.nn.Module) -> None:
         )
         deferred_single = [(k, v) for k, v in ordered_groups if len(v) == 1]
         multi_nvfp4 = [(k, v) for k, v in ordered_groups if len(v) > 1]
+
+        def _place_single_groups() -> None:
+            """Place the single-layer groups (lm_head). Returns nothing; updates the counters."""
+            nonlocal n_groups, saved_ms
+            for (n, k, *_), layers in deferred_single:
+                try:
+                    stats = _place_lm_head_full_ram_scan(decode_linear, layers, n, k, evict_buf,
+                                                         rejected_hold)
+                except Exception as err:  # noqa: BLE001
+                    logger.warning("lm_head fast-band scan skipped for %dx%d: %s", n, k, err)
+                    stats = None
+                if stats is None:
+                    try:
+                        stats = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold,
+                                             prefer_pool=True)
+                    except Exception as err:  # noqa: BLE001
+                        logger.warning("Decode weight placement skipped for %dx%d: %s", n, k, err)
+                        continue
+                if stats is None:
+                    continue
+                n_groups += 1
+                b, a = stats["before"], stats["after"]
+                saved_ms += b[3] - a[3]
+                gbps = stats["payload_bytes"] / 1e6
+                logger.info(
+                    "Decode weight placement %dx%d: %d weights of %.0f MiB, %d spare buffers, %d moved; "
+                    "GEMV ms min/median/max %.4f/%.4f/%.4f -> %.4f/%.4f/%.4f "
+                    "(weight-only %.0f/%.0f/%.0f -> %.0f/%.0f/%.0f GB/s), sum %.3f -> %.3f ms",
+                    n, k, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
+                    b[0], b[1], b[2], a[0], a[1], a[2],
+                    gbps / b[0], gbps / b[1], gbps / b[2], gbps / a[0], gbps / a[1], gbps / a[2], b[3], a[3],
+                )
+                scan = stats.get("scan")
+                if scan is not None:
+                    # The distribution over every candidate at lm_head's own size: if the fastest
+                    # candidate is no faster than the home, this tensor is not placement-limited
+                    # and no grid change will recover the gap.
+                    logger.info(
+                        "lm_head fast-band scan: %d candidates of %.0f MiB; GEMV ms "
+                        "fastest/p25/median/p75/slowest %.4f/%.4f/%.4f/%.4f/%.4f "
+                        "(weight-only %.0f/%.0f/%.0f/%.0f/%.0f GB/s)",
+                        stats["spares"], stats["payload_bytes"] / (1 << 20),
+                        scan[0], scan[3], scan[1], scan[4], scan[2],
+                        gbps / scan[0], gbps / scan[3], gbps / scan[1], gbps / scan[4], gbps / scan[2],
+                    )
+                try:
+                    _diagnose_lm_head_chunks(layers[0], n, k, evict_buf, gbps / a[0])
+                except Exception as err:  # noqa: BLE001 - diagnostics must never fail a load
+                    logger.warning("lm_head chunk probe skipped for %dx%d: %s", n, k, err)
+
         for (n, k, *_), layers in multi_nvfp4:
             try:
                 stats = None
@@ -1005,6 +1349,10 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                 b[0], b[1], b[2], a[0], a[1], a[2],
                 gbps / b[0], gbps / b[1], gbps / b[2], gbps / a[0], gbps / a[1], gbps / a[2], b[3], a[3],
             )
+        # lm_head straight after the scan that seeded the fast pool: its candidates are then the
+        # pool's own pages, and the pool still has room for the groups below.
+        if LM_HEAD_FIRST:
+            _place_single_groups()
         deferred_large_rans: list[tuple[tuple[int, int], list]] = []
         _rans_ext = None
         if rans_groups or (PLACE_ATTN and attn_rans_groups):
@@ -1125,26 +1473,8 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                     n, k, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
                     b[0], b[1], b[2], a[0], a[1], a[2], b[3], a[3],
                 )
-        for (n, k, *_), layers in deferred_single:
-            try:
-                stats = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
-            except Exception as err:  # noqa: BLE001
-                logger.warning("Decode weight placement skipped for %dx%d: %s", n, k, err)
-                continue
-            if stats is None:
-                continue
-            n_groups += 1
-            b, a = stats["before"], stats["after"]
-            saved_ms += b[3] - a[3]
-            gbps = stats["payload_bytes"] / 1e6
-            logger.info(
-                "Decode weight placement %dx%d: %d weights of %.0f MiB, %d spare buffers, %d moved; "
-                "GEMV ms min/median/max %.4f/%.4f/%.4f -> %.4f/%.4f/%.4f "
-                "(weight-only %.0f/%.0f/%.0f -> %.0f/%.0f/%.0f GB/s), sum %.3f -> %.3f ms",
-                n, k, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
-                b[0], b[1], b[2], a[0], a[1], a[2],
-                gbps / b[0], gbps / b[1], gbps / b[2], gbps / a[0], gbps / a[1], gbps / a[2], b[3], a[3],
-            )
+        if not LM_HEAD_FIRST:
+            _place_single_groups()
         logger.info(
             "Decode weight placement: %d groups, timed GEMV sum reduced by %.3f ms per token, %.2f s",
             n_groups, saved_ms, time.perf_counter() - began,

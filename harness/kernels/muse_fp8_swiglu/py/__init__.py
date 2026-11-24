@@ -26,6 +26,12 @@ def _load():
             ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ptr,
         ]
         lib.prefill.restype = ctypes.c_int
+        cfg = getattr(lib, "prefill_cfg", None)
+        if cfg is not None:
+            cfg.argtypes = [ctypes.c_int] + lib.prefill.argtypes
+            cfg.restype = ctypes.c_int
+            lib.shared_bytes_cfg.argtypes = [ctypes.c_int]
+            lib.shared_bytes_cfg.restype = ctypes.c_size_t
         _library = lib
     return _library
 
@@ -82,3 +88,61 @@ def apply(a, b, scale_a, scale_b, down_scale):
         if status:
             raise RuntimeError(f"GB10 FP8 gate/up CUTLASS status {status}")
         return out
+
+
+def _run_cfg(cfg, a, b, scale_a, scale_b, down_scale, out, scratch, device, stream):
+    status = _library.prefill_cfg(
+        cfg, _ROWS, 2 * _INNER, _HIDDEN, a.data_ptr(), b.data_ptr(), scale_a.data_ptr(), scale_b.data_ptr(),
+        down_scale.data_ptr(), out.data_ptr(), scratch.data_ptr(), scratch.numel(), device, _sms[device],
+        stream.cuda_stream,
+    )
+    if status:
+        raise RuntimeError(f"GB10 FP8 gate/up CUTLASS status {status} (cfg {cfg})")
+    return out
+
+
+def shared_bytes_cfg(cfg: int) -> int:
+    """Shared-memory footprint of a sweep config (0 if this build predates the config table)."""
+    lib = _load()
+    fn = getattr(lib, "shared_bytes_cfg", None)
+    return int(fn(cfg)) if fn is not None else 0
+
+
+def bench_cfg(a, b, scale_a, scale_b, down_scale, cfgs, iters: int = 20) -> dict:
+    """Median ms per call for each sweep config on fixed operands, plus whether the output matches config 0 bit for
+    bit. Config 0 is the shipping kernel, so a config that reproduces it exactly is admissible by construction.
+    Only for sweeps outside graph capture."""
+    import statistics
+
+    device = a.device.index
+    with torch.cuda.device(device):
+        _load()
+        stream = torch.cuda.current_stream(device)
+        out = a.new_empty((_ROWS, _INNER))
+        scratch = torch.empty(1 << 20, dtype=torch.uint8, device=a.device)
+        res = {}
+        ref = None
+        for cfg in cfgs:
+            try:
+                _run_cfg(cfg, a, b, scale_a, scale_b, down_scale, out, scratch, device, stream)
+                torch.cuda.synchronize()
+            except Exception as e:  # noqa: BLE001
+                res[cfg] = {"error": str(e)}
+                continue
+            bits = out.view(torch.int16).clone()
+            if cfg == cfgs[0]:
+                ref = bits
+            for _ in range(3):
+                _run_cfg(cfg, a, b, scale_a, scale_b, down_scale, out, scratch, device, stream)
+            torch.cuda.synchronize()
+            ts = []
+            for _ in range(iters):
+                s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+                s.record()
+                _run_cfg(cfg, a, b, scale_a, scale_b, down_scale, out, scratch, device, stream)
+                e.record()
+                e.synchronize()
+                ts.append(s.elapsed_time(e))
+            res[cfg] = {"ms": round(statistics.median(ts), 4),
+                        "same_bits": bool(torch.equal(bits, ref)) if ref is not None else None}
+        return res
