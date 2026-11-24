@@ -135,12 +135,12 @@ def _prefill_gemm(a, b, scale_a, scale_b):
 
 
 def _prompt_route(a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor) -> torch.Tensor:
-    if _prefill is not None and b.data_ptr() in _prefill_admitted and _prefill.supported(a, b, scale_a, scale_b):
-        return _prefill_gemm(a, b, scale_a, scale_b)
     if a.size(0) == 512 and _fp8ws_maybe_gemm is not None:
         out = _fp8ws_maybe_gemm(a, b, scale_a, scale_b)
         if out is not None:
             return out
+    if _prefill is not None and b.data_ptr() in _prefill_admitted and _prefill.supported(a, b, scale_a, scale_b):
+        return _prefill_gemm(a, b, scale_a, scale_b)
     return _prefill_gemm(a, b, scale_a, scale_b)
 
 
