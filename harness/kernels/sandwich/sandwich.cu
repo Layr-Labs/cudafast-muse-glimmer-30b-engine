@@ -6,6 +6,8 @@ constexpr int Threads = 256;
 constexpr int Vectors = Columns / 4;
 constexpr int Tiles = (Vectors + Threads - 1) / Threads;
 
+static bool g_prefill_cs = true;
+
 __device__ float bf16(uint2 packed, int channel) {
     const unsigned bits = channel < 2 ? packed.x : packed.y;
     return __uint_as_float((channel & 1) ? bits & 0xffff0000 : bits << 16);
@@ -76,6 +78,12 @@ __device__ unsigned pack_fp8(const float (&values)[4], float scale_inv) {
     return static_cast<unsigned>(low) | (static_cast<unsigned>(high) << 16);
 }
 
+__device__ __forceinline__ uint2 load2_cs(const uint2* address) {
+    uint2 r;
+    asm("ld.global.cs.v2.u32 {%0, %1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(address));
+    return r;
+}
+
 // Gate (prefill3): also emit the FP8 input of the attention output-gate projection, i.e. what the compiled
 // requant kernel (triton_poi_fused__to_copy_clamp_mul_reciprocal_0) computes from `hidden`: the bf16-rounded
 // value times div.full(1, gate_scale), clamped to +-448, cvt.rn.satfinite.e4m3. With WriteHidden false the bf16
@@ -96,13 +104,14 @@ __device__ __forceinline__ void store2_evict_last(uint2* address, uint2 value) {
 }
 
 template <bool Quantize, bool Shared, bool Gate = false, bool WriteHidden = true, bool GateEvictLast = false,
-          bool ResidualEvictLast = false>
+          bool ResidualEvictLast = false, bool CsLoads = false>
 __global__ __launch_bounds__(Threads) void sandwich(
     uint2* post_attn, const uint2* down, const uint2* residual,
     const float* previous_sum, const uint2* post_attn_weight,
     const uint2* post_ff_weight, const uint2* next_pre_attn_weight,
     const float* scale, uint2* hidden, unsigned* quantized,
     const float* gate_scale = nullptr, unsigned* gate_quantized = nullptr) {
+    constexpr bool UseCs = Shared && CsLoads;
     __shared__ float warp_totals[8];
     extern __shared__ uint2 shared_row[];
     uint2 saved[Tiles];
@@ -113,7 +122,12 @@ __global__ __launch_bounds__(Threads) void sandwich(
     for (int tile = 0; tile < Tiles; ++tile) {
         const unsigned offset = tile * Threads + thread;
         if (offset < Vectors) {
-            const uint2 values = down[base + offset];
+            uint2 values;
+            if constexpr (UseCs) {
+                values = load2_cs(down + base + offset);
+            } else {
+                values = down[base + offset];
+            }
             if constexpr (Shared) {
                 shared_row[offset] = values;
             } else {
@@ -127,7 +141,8 @@ __global__ __launch_bounds__(Threads) void sandwich(
         }
     }
     const float down_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-8f);
-    const float attn_inverse = inverse_rms(previous_sum[blockIdx.x], 1.e-8f);
+    const float prev_s = UseCs ? __ldg(previous_sum + blockIdx.x) : previous_sum[blockIdx.x];
+    const float attn_inverse = inverse_rms(prev_s, 1.e-8f);
     #pragma unroll
     for (int channel = 0; channel < 4; ++channel) partial[channel] = 0.f;
     #pragma unroll
@@ -141,9 +156,16 @@ __global__ __launch_bounds__(Threads) void sandwich(
                 d = saved[tile];
             }
             const uint2 a = post_attn[base + offset];
-            const uint2 r = residual[base + offset];
-            const uint2 wa = post_attn_weight[offset];
-            const uint2 wd = post_ff_weight[offset];
+            uint2 r, wa, wd;
+            if constexpr (UseCs) {
+                r = load2_cs(residual + base + offset);
+                wa = __ldg(post_attn_weight + offset);
+                wd = __ldg(post_ff_weight + offset);
+            } else {
+                r = residual[base + offset];
+                wa = post_attn_weight[offset];
+                wd = post_ff_weight[offset];
+            }
             float values[4];
             #pragma unroll
             for (int channel = 0; channel < 4; ++channel) {
@@ -169,8 +191,8 @@ __global__ __launch_bounds__(Threads) void sandwich(
         }
     }
     const float input_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-5f);
-    const float scale_inv = Quantize ? full_divide(1.f, *scale) : 1.f;
-    const float gate_inv = Gate ? full_divide(1.f, *gate_scale) : 1.f;
+    const float scale_inv = Quantize ? full_divide(1.f, UseCs ? __ldg(scale) : *scale) : 1.f;
+    const float gate_inv = Gate ? full_divide(1.f, UseCs ? __ldg(gate_scale) : *gate_scale) : 1.f;
     #pragma unroll
     for (int tile = 0; tile < Tiles; ++tile) {
         const unsigned offset = tile * Threads + thread;
@@ -181,7 +203,7 @@ __global__ __launch_bounds__(Threads) void sandwich(
             } else {
                 r = saved[tile];
             }
-            const uint2 w = next_pre_attn_weight[offset];
+            const uint2 w = UseCs ? __ldg(next_pre_attn_weight + offset) : next_pre_attn_weight[offset];
             float values[4];
             #pragma unroll
             for (int channel = 0; channel < 4; ++channel) {
@@ -211,9 +233,9 @@ __global__ __launch_bounds__(Threads) void sandwich(
     }
 }
 
-template <bool Quantize, bool Shared>
+template <bool Quantize, bool Shared, bool CsLoads = false>
 void launch(const void* const* args, int rows, cudaStream_t stream) {
-    sandwich<Quantize, Shared><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
+    sandwich<Quantize, Shared, false, true, false, false, CsLoads><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
         static_cast<uint2*>(const_cast<void*>(args[0])), static_cast<const uint2*>(args[1]),
         static_cast<const uint2*>(args[2]), static_cast<const float*>(args[3]),
         static_cast<const uint2*>(args[4]), static_cast<const uint2*>(args[5]),
@@ -223,9 +245,13 @@ void launch(const void* const* args, int rows, cudaStream_t stream) {
 }
 }
 
-template <bool Shared, bool WriteHidden, bool EvictLast = false>
+extern "C" void muse_sandwich_set_prefill_cs(int enable) {
+    g_prefill_cs = (enable != 0);
+}
+
+template <bool Shared, bool WriteHidden, bool EvictLast = false, bool CsLoads = false>
 void launch_gate(const void* const* args, int rows, cudaStream_t stream) {
-    sandwich<true, Shared, true, WriteHidden, EvictLast><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
+    sandwich<true, Shared, true, WriteHidden, EvictLast, false, CsLoads><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
         static_cast<uint2*>(const_cast<void*>(args[0])), static_cast<const uint2*>(args[1]),
         static_cast<const uint2*>(args[2]), static_cast<const float*>(args[3]),
         static_cast<const uint2*>(args[4]), static_cast<const uint2*>(args[5]),
@@ -248,8 +274,13 @@ __global__ void gate_formula(const unsigned short* bits, const float* gate_scale
 extern "C" int muse_sandwich_gate(const void* const* args, int rows, bool shared, bool write_hidden,
                                    cudaStream_t stream) {
     if (shared) {
-        if (write_hidden) launch_gate<true, true>(args, rows, stream);
-        else launch_gate<true, false>(args, rows, stream);
+        if (g_prefill_cs) {
+            if (write_hidden) launch_gate<true, true, false, true>(args, rows, stream);
+            else launch_gate<true, false, false, true>(args, rows, stream);
+        } else {
+            if (write_hidden) launch_gate<true, true, false, false>(args, rows, stream);
+            else launch_gate<true, false, false, false>(args, rows, stream);
+        }
     } else {
         if (write_hidden) launch_gate<false, true>(args, rows, stream);
         else launch_gate<false, false>(args, rows, stream);
@@ -259,24 +290,25 @@ extern "C" int muse_sandwich_gate(const void* const* args, int rows, bool shared
 
 // The same with the gate operand stored at L2 evict_last priority (shared-row staging, bf16 row not stored).
 extern "C" int muse_sandwich_gate_evict_last(const void* const* args, int rows, cudaStream_t stream) {
-    launch_gate<true, false, true>(args, rows, stream);
+    if (g_prefill_cs) launch_gate<true, false, true, true>(args, rows, stream);
+    else launch_gate<true, false, true, false>(args, rows, stream);
     return cudaGetLastError();
 }
 
 // Cache-hint variants for the 512-row prefill (values identical to the plain kernels; only L2 eviction priority of
 // the stores changes). mode 0: non-quantizing sandwich (args as muse_sandwich, quantize false); mode 1: folding
 // sandwich without the bf16 row (args as muse_sandwich_gate). gate_el / residual_el: store at evict_last priority.
-template <bool GateEL, bool ResEL>
+template <bool GateEL, bool ResEL, bool CsLoads>
 int launch_hint(const void* const* args, int rows, int mode, cudaStream_t stream) {
     const size_t smem = Vectors * sizeof(uint2);
     if (mode == 0) {
-        sandwich<false, true, false, true, false, ResEL><<<rows, Threads, smem, stream>>>(
+        sandwich<false, true, false, true, false, ResEL, CsLoads><<<rows, Threads, smem, stream>>>(
             static_cast<uint2*>(const_cast<void*>(args[0])), static_cast<const uint2*>(args[1]),
             static_cast<const uint2*>(args[2]), static_cast<const float*>(args[3]),
             static_cast<const uint2*>(args[4]), static_cast<const uint2*>(args[5]),
             static_cast<const uint2*>(args[6]), nullptr, static_cast<uint2*>(const_cast<void*>(args[7])), nullptr);
     } else {
-        sandwich<true, true, true, false, GateEL, ResEL><<<rows, Threads, smem, stream>>>(
+        sandwich<true, true, true, false, GateEL, ResEL, CsLoads><<<rows, Threads, smem, stream>>>(
             static_cast<uint2*>(const_cast<void*>(args[0])), static_cast<const uint2*>(args[1]),
             static_cast<const uint2*>(args[2]), static_cast<const float*>(args[3]),
             static_cast<const uint2*>(args[4]), static_cast<const uint2*>(args[5]),
@@ -290,15 +322,27 @@ int launch_hint(const void* const* args, int rows, int mode, cudaStream_t stream
 extern "C" int muse_sandwich_hint(const void* const* args, int rows, int mode, int gate_el, int residual_el,
                                   cudaStream_t stream) {
     if (mode == 0) {
-        return residual_el ? launch_hint<false, true>(args, rows, 0, stream)
-                           : launch_hint<false, false>(args, rows, 0, stream);
+        if (g_prefill_cs) {
+            return residual_el ? launch_hint<false, true, true>(args, rows, 0, stream)
+                               : launch_hint<false, false, true>(args, rows, 0, stream);
+        }
+        return residual_el ? launch_hint<false, true, false>(args, rows, 0, stream)
+                           : launch_hint<false, false, false>(args, rows, 0, stream);
+    }
+    if (g_prefill_cs) {
+        if (gate_el) {
+            return residual_el ? launch_hint<true, true, true>(args, rows, 1, stream)
+                               : launch_hint<true, false, true>(args, rows, 1, stream);
+        }
+        return residual_el ? launch_hint<false, true, true>(args, rows, 1, stream)
+                           : launch_hint<false, false, true>(args, rows, 1, stream);
     }
     if (gate_el) {
-        return residual_el ? launch_hint<true, true>(args, rows, 1, stream)
-                           : launch_hint<true, false>(args, rows, 1, stream);
+        return residual_el ? launch_hint<true, true, false>(args, rows, 1, stream)
+                           : launch_hint<true, false, false>(args, rows, 1, stream);
     }
-    return residual_el ? launch_hint<false, true>(args, rows, 1, stream)
-                       : launch_hint<false, false>(args, rows, 1, stream);
+    return residual_el ? launch_hint<false, true, false>(args, rows, 1, stream)
+                       : launch_hint<false, false, false>(args, rows, 1, stream);
 }
 
 extern "C" int muse_sandwich_gate_formula(const void* bits, const void* gate_scale, void* out, int n,
@@ -312,11 +356,19 @@ extern "C" int muse_sandwich_gate_formula(const void* bits, const void* gate_sca
 extern "C" int muse_sandwich(const void* const* args, int rows, bool quantize, bool shared,
                               cudaStream_t stream) {
     if (quantize) {
-        if (shared) launch<true, true>(args, rows, stream);
-        else launch<true, false>(args, rows, stream);
+        if (shared) {
+            if (g_prefill_cs) launch<true, true, true>(args, rows, stream);
+            else launch<true, true, false>(args, rows, stream);
+        } else {
+            launch<true, false>(args, rows, stream);
+        }
     } else {
-        if (shared) launch<false, true>(args, rows, stream);
-        else launch<false, false>(args, rows, stream);
+        if (shared) {
+            if (g_prefill_cs) launch<false, true, true>(args, rows, stream);
+            else launch<false, true, false>(args, rows, stream);
+        } else {
+            launch<false, false>(args, rows, stream);
+        }
     }
     return cudaGetLastError();
 }

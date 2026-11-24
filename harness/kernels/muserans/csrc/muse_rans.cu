@@ -279,7 +279,7 @@ struct RansProb {
   const uint8_t* hdr; const uint8_t* stream; const int* woff16; const uint32_t* lut;
   const uint8_t* x; const uint16_t* x_aux; int act_mode;
   const float* sb; int sb_scalar; const float* sa;
-  __nv_bfloat16* out; int N; int K; int tw; int ilv; size_t stream_bytes; size_t tpf_stride;
+  __nv_bfloat16* out; int N; int K; int tw; int ilv; int strided_w; size_t stream_bytes; size_t tpf_stride;
 };
 
 static size_t rans_tpf_stride() {
@@ -304,7 +304,7 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   const int xbytes = (K + 15) & ~15;
   const uint32_t sbase0 = (uint32_t)__cvta_generic_to_shared(smem) + (uint32_t)xbytes;
   const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + (uint32_t)wib * RB;
-  const int w = blockIdx.x * wpb + wib;
+  const int w = pb.strided_w ? (wib * gridDim.x + blockIdx.x) : (blockIdx.x * wpb + wib);
   const bool active = w < pb.tw;
   const uint8_t* ws = pb.stream;
   uint32_t wbytes = 0;
@@ -665,8 +665,18 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   pb.tpf_stride = rans_tpf_stride();
   TORCH_CHECK(tw >= 1 && tw <= N / 8 && wpb >= 1 && wpb <= 32 && (ns == 1 || ns == 2 || ns == 4) && (rg == 4 || rg == 8) && (ilv == 0 || ilv == 9), "bad launch config");
   const int blocks = (tw + wpb - 1) / wpb;
-  const size_t dsmem = rans_dsmem(K, wpb, 9, rg);
+  static const bool strided_gu = []() {
+    const char* env = std::getenv("MUSERANS_STRIDED_GATE_UP");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  pb.strided_w = (strided_gu && N == 39936 && K == 6656 && tw == blocks * wpb) ? 1 : 0;
+  size_t dsmem = rans_dsmem(K, wpb, 9, rg);
   TORCH_CHECK(rans_fits(K, wpb, 9, rg), "rans smem too large (K too large for smem staging of x): ", dsmem);
+  static const bool lock48 = []() {
+    const char* env = std::getenv("MUSERANS_SMEM_LOCK48");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  if (lock48 && blocks == 48 && dsmem < 40960) dsmem = 40960;
   rans_set_attrs_once();
 #define RANS_L2(NSV, RGV) \
   if (ns == NSV && rg == RGV) rans_gemv_kernel<NSV, 9, RGV><<<blocks, wpb * 32, dsmem, st>>>(pb);

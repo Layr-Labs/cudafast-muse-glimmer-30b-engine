@@ -4,18 +4,19 @@
 From SP5D's Yukon submission 98c1361e-289f-45a3-8471-5df0259bd3b2 (harness/kernels/fp8ws), unchanged apart from SHAPES."""
 
 import ctypes
+import os
 from pathlib import Path
 
 import torch
 
 M = 512
-# Muse Glimmer routing (integration3): only the attention qkv and output-gate projections, where this kernel beat
-# stock CUTLASS in sustained capped timing on GB10 (opus-prefill2 ws-w1). o_proj (6656, 4096) was slower, down
-# (6656, 19968) runs on muse_fp8_prefill's 128x192 tile and FP8 gate/up (39936, 6656) on muse_fp8_swiglu.
-SHAPES = frozenset({
-    (4608, 6656),
-    (4096, 6656),
-})
+SHAPES = frozenset(
+    {(4608, 6656), (4096, 6656)}
+    | ({(6656, 4096), (6656, 19968)} if os.environ.get("FP8WS_6656", "1") != "0" else set())
+)
+NSPLIT_6656 = os.environ.get("FP8WS_6656_NSPLIT", "1") != "0"
+DUAL_SEAMLESS = os.environ.get("FP8WS_DUAL_SEAMLESS", "1") != "0"
+BF16_SEAMLESS = os.environ.get("BF16WS_DUAL_SEAMLESS", "1") != "0"
 _lib = None
 _load_failed = False
 _ready_devices: set[int] = set()
@@ -39,6 +40,10 @@ def _load():
         if hasattr(lib, "bf16ws_run_dual_stacked"):
             lib.bf16ws_run_dual_stacked.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
             lib.bf16ws_run_dual_stacked.restype = ctypes.c_int
+        if hasattr(lib, "fp8ws_set_flags"):
+            lib.fp8ws_set_flags.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            lib.fp8ws_set_flags.restype = None
+            lib.fp8ws_set_flags(int(NSPLIT_6656), int(DUAL_SEAMLESS), int(BF16_SEAMLESS))
         _lib = lib
     except OSError:
         _load_failed = True
