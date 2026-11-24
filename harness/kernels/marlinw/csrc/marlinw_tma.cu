@@ -285,7 +285,18 @@ __device__ __forceinline__ void k_loop(
 constexpr int kColumns = 6656;
 constexpr int kInner = 19968;
 
-template <int MB, bool kLater, int kCols>  // kLater: the copy for the pieces that take over a state
+__device__ __forceinline__ uint32_t selp_u32(uint32_t a, uint32_t b, bool c) {
+  uint32_t r;
+  asm("{\n .reg .pred p;\n setp.ne.b32 p, %3, 0;\n selp.b32 %0, %1, %2, p;\n}"
+      : "=r"(r) : "r"(a), "r"(b), "r"((uint32_t)c));
+  return r;
+}
+__device__ __forceinline__ uint32_t sel4_u32(uint32_t v0, uint32_t v1, uint32_t v2, uint32_t v3, int i) {
+  const uint32_t lo = selp_u32(v1, v0, i & 1), hi = selp_u32(v3, v2, i & 1);
+  return selp_u32(hi, lo, i & 2);
+}
+
+template <int MB, bool kLater, int kCols, bool kShflEpi = true>  // kLater: the copy for the pieces that take over a state
 __device__ __forceinline__ void down_tile(
     const CUtensorMap* tmA, const CUtensorMap* tmB, const CUtensorMap* tmS, int4* __restrict__ C0,
     float4* __restrict__ scratch, const float gs, const int row0, const int col, const int slot, const int cut_a,
@@ -401,26 +412,59 @@ __device__ __forceinline__ void down_tile(
       }
     }
     __nv_bfloat16* C = reinterpret_cast<__nv_bfloat16*>(C0);
-    const int r0 = row0 + (lane >> 2);
-    const int col0 = 128 * col + 64 * nb + 32 * sh2 + 2 * (lane & 3);
+    if constexpr (kShflEpi) {
+      const int q = lane & 3;
+      const int r0 = row0 + (lane >> 2);
+      const int base_col0 = 128 * col + 64 * nb + 32 * sh2;
 #pragma unroll
-    for (int i = 0; i < MB; i++)
+      for (int i = 0; i < MB; i++) {
 #pragma unroll
-      for (int jj = 0; jj < 2; jj++)
-#pragma unroll
-        for (int h = 0; h < 2; h++) {
-          const float* c = acc[i][jj][h];
-          const nv_bfloat162 lo = __halves2bfloat162(__float2bfloat16(c[0] * gs), __float2bfloat16(c[1] * gs));
-          const nv_bfloat162 hi = __halves2bfloat162(__float2bfloat16(c[2] * gs), __float2bfloat16(c[3] * gs));
-          const int cc = col0 + 16 * jj + 8 * h;
-          *reinterpret_cast<nv_bfloat162*>(&C[(size_t)(r0 + 16 * i) * kCols + cc]) = lo;
-          *reinterpret_cast<nv_bfloat162*>(&C[(size_t)(r0 + 16 * i + 8) * kCols + cc]) = hi;
+        for (int jj = 0; jj < 2; jj++) {
+          const float* c = &acc[i][jj][0][0];
+          const nv_bfloat162 lo0 = __halves2bfloat162(__float2bfloat16(c[0] * gs), __float2bfloat16(c[1] * gs));
+          const nv_bfloat162 hi0 = __halves2bfloat162(__float2bfloat16(c[2] * gs), __float2bfloat16(c[3] * gs));
+          const nv_bfloat162 lo1 = __halves2bfloat162(__float2bfloat16(c[4] * gs), __float2bfloat16(c[5] * gs));
+          const nv_bfloat162 hi1 = __halves2bfloat162(__float2bfloat16(c[6] * gs), __float2bfloat16(c[7] * gs));
+          const uint32_t v0 = *reinterpret_cast<const uint32_t*>(&lo0);
+          const uint32_t v1 = *reinterpret_cast<const uint32_t*>(&hi0);
+          const uint32_t v2 = *reinterpret_cast<const uint32_t*>(&lo1);
+          const uint32_t v3 = *reinterpret_cast<const uint32_t*>(&hi1);
+          const uint32_t r1 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 1), 1);
+          const uint32_t r2 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 2), 2);
+          const uint32_t r3 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 3), 3);
+          const uint32_t own = sel4_u32(v0, v1, v2, v3, q);
+          uint4 w;
+          w.x = sel4_u32(own, r1, r2, r3, 0 ^ q);
+          w.y = sel4_u32(own, r1, r2, r3, 1 ^ q);
+          w.z = sel4_u32(own, r1, r2, r3, 2 ^ q);
+          w.w = sel4_u32(own, r1, r2, r3, 3 ^ q);
+          const int r_out = r0 + 16 * i + (q & 1) * 8;
+          const int c_out = base_col0 + 16 * jj + (q >> 1) * 8;
+          *reinterpret_cast<uint4*>(&C[(size_t)r_out * kCols + c_out]) = w;
         }
+      }
+    } else {
+      const int r0 = row0 + (lane >> 2);
+      const int col0 = 128 * col + 64 * nb + 32 * sh2 + 2 * (lane & 3);
+#pragma unroll
+      for (int i = 0; i < MB; i++)
+#pragma unroll
+        for (int jj = 0; jj < 2; jj++)
+#pragma unroll
+          for (int h = 0; h < 2; h++) {
+            const float* c = acc[i][jj][h];
+            const nv_bfloat162 lo = __halves2bfloat162(__float2bfloat16(c[0] * gs), __float2bfloat16(c[1] * gs));
+            const nv_bfloat162 hi = __halves2bfloat162(__float2bfloat16(c[2] * gs), __float2bfloat16(c[3] * gs));
+            const int cc = col0 + 16 * jj + 8 * h;
+            *reinterpret_cast<nv_bfloat162*>(&C[(size_t)(r0 + 16 * i) * kCols + cc]) = lo;
+            *reinterpret_cast<nv_bfloat162*>(&C[(size_t)(r0 + 16 * i + 8) * kCols + cc]) = hi;
+          }
+    }
   }
 }
 
 
-template <int kCols>
+template <int kCols, bool kShflEpi = true>
 __global__ void __launch_bounds__(kThreads, 1) down(
     const __grid_constant__ CUtensorMap tmA8, const __grid_constant__ CUtensorMap tmB,
     const __grid_constant__ CUtensorMap tmS, int4* __restrict__ C0, float4* __restrict__ scratch,
@@ -435,10 +479,10 @@ __global__ void __launch_bounds__(kThreads, 1) down(
   const int4 w1 = work[2 * blockIdx.x + 1];
   const float gs = gs_ptr[0];
   if (w1.w & 2048)
-    down_tile<8, true, kCols>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
+    down_tile<8, true, kCols, kShflEpi>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
                        reinterpret_cast<volatile int*>(work + 2 * gridDim.x));
   else
-    down_tile<8, false, kCols>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
+    down_tile<8, false, kCols, kShflEpi>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
                         reinterpret_cast<volatile int*>(work + 2 * gridDim.x));
 }
 #else
@@ -651,14 +695,28 @@ static bool map2d(CUtensorMap* tm, const void* ptr, int esize, uint64_t width, u
 
 #ifndef MARLINW_TMA_GATEUP
 // Same C ABI as libmarlinw_down128.so, plus multi-shape TMA entrypoints (qkv 4608x6656, o_proj 6656x4096, gate 4096x6656).
+static bool g_shfl_epi = true;
+
+extern "C" void marlinw_down128_set_shfl_epi(int enable) {
+  g_shfl_epi = (enable != 0);
+}
+
 template <int kCols>
 static int init_down_shape(int* active_blocks) {
   using namespace MARLIN_NAMESPACE_NAME;
   auto status = find_encode();
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(down<kCols>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  status = cudaFuncSetAttribute(down<kCols, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
   if (status != cudaSuccess) return status;
-  return cudaOccupancyMaxActiveBlocksPerMultiprocessor(active_blocks, down<kCols>, kThreads, kShared);
+  status = cudaFuncSetAttribute(down<kCols, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  if (status != cudaSuccess) return status;
+  int occ_shfl = 0, occ_stock = 0;
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_shfl, down<kCols, true>, kThreads, kShared);
+  if (status != cudaSuccess) return status;
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_stock, down<kCols, false>, kThreads, kShared);
+  if (status != cudaSuccess) return status;
+  *active_blocks = occ_shfl < occ_stock ? occ_shfl : occ_stock;
+  return cudaSuccess;
 }
 
 template <int kCols>
@@ -673,8 +731,9 @@ static int launch_down_shape(
       !map2d(&tmB, weight, 4, 2 * (uint64_t)kCols, (uint64_t)k / 16, 8 * (uint64_t)kCols, 256, 4, false) ||
       !map2d(&tmS, scales, 1, (uint64_t)kCols, (uint64_t)k / 16, (uint64_t)kCols, 128, 4, false))
     return cudaErrorInvalidValue;
-  down<kCols><<<grid, kThreads, kShared, stream>>>(tmA8, tmB, tmS, output, scratch, global_scale,
-                                                   const_cast<int4*>(work));
+  auto kernel = g_shfl_epi ? down<kCols, true> : down<kCols, false>;
+  kernel<<<grid, kThreads, kShared, stream>>>(tmA8, tmB, tmS, output, scratch, global_scale,
+                                              const_cast<int4*>(work));
   return cudaGetLastError();
 }
 

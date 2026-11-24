@@ -63,6 +63,8 @@ BYTES_MLP_NORM = _env_bytes("L2PF_MB_MLP_NORM", (9 << 20) // 4)
 BYTES_MLP_ACT = _env_bytes("L2PF_MB_MLP_ACT", 1 << 19)
 BYTES_RANS_AFTER_ATTN = _env_bytes("L2PF_MB_RANS_ATTN", 0)
 BYTES_RANS_QKV = _env_bytes("L2PF_MB_RANS_QKV", 0)
+BYTES_RANS_GATE = _env_bytes("L2PF_MB_RANS_GATE", 0)
+BF16_GATE_NONE = os.environ.get("L2PF_BF16_GATE_NONE", "1") != "0"
 BYTES_NV_GATE = _env_bytes("L2PF_MB_NV_GATE", BYTES_OTHER)
 TLB_PREFETCH = os.environ.get("L2PF_TLB", "1") != "0"
 TLB_RANS_HEAD = int(os.environ.get("L2PF_TLB_RANS_HEAD_KB", "64")) << 10
@@ -73,11 +75,18 @@ TLB_UNASSISTED = os.environ.get("L2PF_TLB_UNASSISTED", "1") != "0"
 NORM_HINT: list | None = None
 NORM_PREWARM = os.environ.get("L2PF_NORM_PREWARM", "1") != "0"
 SITES_PER_LAYER = 5
+TAIL_DESCS: list[tuple[int, int, int, int]] = []
+LM_HEAD_TAIL = os.environ.get("L2PF_LM_HEAD_TAIL", "1") != "0"
+LM_HEAD_WAVES = max(1, min(4, int(os.environ.get("L2PF_LM_HEAD_WAVES", "2"))))
+LM_ILV_PF = os.environ.get("L2PF_LM_ILV", "1") != "0"
+TMA4_FULL_NORM = os.environ.get("L2PF_TMA4_FULL_NORM", "1") != "0"
+SKIP_SWIGLU_ACT = os.environ.get("L2PF_SKIP_SWIGLU_ACT", "0") != "0"
 
 # Compressed one-row projections measured with the same captured stream edges.
 _RANS_SKIP_PREFETCH = {
     (6656, 4096, True),
     (4608, 6656, False),
+    (4096, 6656, False),
 }
 
 
@@ -209,13 +218,26 @@ def budget(weight_bytes: int, after_attn: bool) -> int:
     return BYTES_AFTER_ATTN if after_attn else BYTES_OTHER
 
 
-def mlp_budget(n_tensors: int, after_act: bool) -> int:
+def mlp_budget(n_tensors: int, after_act: bool, tma4_scales: bool = False) -> int:
     """Bytes of the weight head ahead of a GEMM above MAX_WEIGHT; with block
     scales (an eighth of the code bytes) the two together take the budget."""
     if not MLP:
         return 0
     nbytes = BYTES_MLP_ACT if after_act else BYTES_MLP_NORM
+    if tma4_scales and not after_act and TMA4_FULL_NORM:
+        return nbytes
     return nbytes * 8 // 9 if n_tensors > 1 else nbytes
+
+
+def _is_tma4_ilv_scale(w: torch.Tensor) -> bool:
+    if not (w.ndim == 2 and w.shape[1] == 32 and w.dtype == torch.uint8):
+        return False
+    try:
+        import muse_marlin6_gemv as _m6
+
+        return bool(_m6.is_tma4_ilv(w))
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def _range_descs(base: int, span: int, off: int, length: int) -> list[tuple[int, int, int, int]]:
@@ -253,7 +275,7 @@ def _tma4_scale_descs(w: torch.Tensor) -> list[tuple[int, int, int, int]]:
     off16_bytes = ((total_sbs + 1) * 4 + 15) // 16 * 16
     states_off = 4096 + meta_bytes + off16_bytes
     var_off = states_off + num_blks * threads * 4
-    wave_blks = min(num_blks, 48)
+    wave_blks = 96 if (LM_ILV_PF and num_blks == 96 and threads == 128) else min(num_blks, 48)
     gsb_sb1_end = min(total_sbs, 2 * wave_blks)
     need_u32 = 1024 + meta_u32 + gsb_sb1_end + 1
     if need_u32 * 4 > prefix:
@@ -280,10 +302,15 @@ def weight_descs(ws: tuple[torch.Tensor, ...], nbytes: int) -> list[tuple[int, i
     if nbytes <= 0:
         return []
     w0 = ws[0]
-    if w0.ndim == 3 and w0.shape[1:] == (416, 128) and w0.shape[0] >= 48 and w0.dtype == torch.int32:
+    is_ilv = LM_ILV_PF and len(ws) > 1 and _is_tma4_ilv_scale(ws[1])
+    if (
+        not is_ilv
+        and w0.ndim == 3 and w0.shape[1:] == (416, 128) and w0.shape[0] >= 48 and w0.dtype == torch.int32
+    ):
         base, span = _dense_span(w0)
-        if base % 16 == 0 and 47 * 212992 + 16384 <= span:
-            out = [(base, 212992, 16384, 48)]
+        seg = LM_HEAD_WAVES * 16384
+        if base % 16 == 0 and seg <= CHUNK and 47 * 212992 + seg <= span:
+            out = [(base, 212992, seg, 48)]
         else:
             out = head_descs(w0, nbytes)
     else:
@@ -305,12 +332,36 @@ def _inside(descs, ranges) -> bool:
 
 
 def weight_ranges(module: torch.nn.Module) -> list[tuple[int, int]]:
-    """Memory ranges of every parameter and buffer of module."""
+    """Memory ranges of every parameter and buffer of module (plus post-backbone tail descriptors)."""
+    global TAIL_DESCS
     out = []
     for t in list(module.parameters()) + list(module.buffers()):
         if t.is_cuda and t.numel():
             st = t.untyped_storage()
             out.append((st.data_ptr(), st.data_ptr() + st.nbytes()))
+    TAIL_DESCS = []
+    if LM_HEAD_TAIL:
+        try:
+            td: list[tuple[int, int, int, int]] = []
+            inner = getattr(module, "model", None)
+            fnorm = getattr(inner, "norm", None) if inner is not None else None
+            nw = getattr(fnorm, "weight", None)
+            if isinstance(nw, torch.Tensor) and nw.is_cuda and nw.numel():
+                td += head_descs(nw, 16384)
+            lm = getattr(module, "lm_head", None)
+            lm_w = getattr(lm, "_marlin_decode_weight", None)
+            lm_s = getattr(lm, "_marlin_decode_scales6", None)
+            if isinstance(lm_w, torch.Tensor) and lm_w.is_cuda:
+                ws = (lm_w, lm_s) if (isinstance(lm_s, torch.Tensor) and lm_s.is_cuda) else (lm_w,)
+                td += weight_descs(ws, BYTES_MLP_NORM)
+                if TLB_PREFETCH:
+                    td += tlb_descs(lm_w, 0, TLB_STRIDE)
+                    for w_ex in ws[1:]:
+                        td += tlb_descs(w_ex, 0, TLB_STRIDE)
+            if td and _inside(td, out):
+                TAIL_DESCS = td
+        except Exception:  # noqa: BLE001
+            TAIL_DESCS = []
     return out
 
 
@@ -432,6 +483,22 @@ class _Site:
     off: int = 0
     unassisted: bool = False
     mlp: str = ""  # "norm" / "act": a GEMM above MAX_WEIGHT after a norm / an activation
+    skip_act: bool = False
+
+
+def _is_admitted_swiglu_down(down_gs_ptr: int) -> bool:
+    try:
+        import muse_marlin6_gemv as _m6
+
+        sw_map = getattr(_m6, "_SWIGLU_GATE_UP", None)
+        if not sw_map:
+            return False
+        return any(
+            v.get("state") == "admitted" and v.get("down_gs_ptr") == down_gs_ptr
+            for v in sw_map.values()
+        )
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class Session:
@@ -452,6 +519,8 @@ class Session:
         self._attn = False
         self._prev_big = False
         self.norm_sites = 0
+        self.tail_descs: list[tuple[int, int, int, int]] = []
+        self.tail_off = -1
 
     # -- patching
     @contextlib.contextmanager
@@ -537,14 +606,27 @@ class Session:
             if wbytes > MAX_WEIGHT:
                 self._prev_big = True
                 site.mlp = "act" if prev_big else "norm"
-                mb_b = mlp_budget(len(ws), prev_big)
-                site.descs = weight_descs(ws, mb_b)
-                if TLB_PREFETCH and (kind == "musefp8" or TLB_ALL):
-                    site.descs += tlb_descs(ws[0], mb_b, TLB_STRIDE)
-                    for w_extra in ws[1:]:
-                        site.descs += tlb_descs(w_extra, 0, TLB_STRIDE)
+                if (
+                    prev_big
+                    and SKIP_SWIGLU_ACT
+                    and kind == "marlin_tiled"
+                    and len(args) >= 5
+                    and isinstance(args[4], torch.Tensor)
+                    and _is_admitted_swiglu_down(args[4].data_ptr())
+                ):
+                    site.skip_act = True
+                    site.descs = []
+                else:
+                    has_tma4 = len(ws) > 1 and ws[1].ndim == 2 and ws[1].shape[1] == 32 and ws[1].dtype == torch.uint8
+                    mb_b = mlp_budget(len(ws), prev_big, has_tma4)
+                    site.descs = weight_descs(ws, mb_b)
+                    if TLB_PREFETCH and (kind == "musefp8" or TLB_ALL):
+                        site.descs += tlb_descs(ws[0], mb_b, TLB_STRIDE)
+                        for w_extra in ws[1:]:
+                            site.descs += tlb_descs(w_extra, 0, TLB_STRIDE)
             else:
                 nbytes = budget(wbytes, site.after_attn)
+                skip_all = False
                 if kind == "musefp8":
                     a, weight, packed, sa, sb = args
                     k, n = weight.shape
@@ -552,7 +634,11 @@ class Session:
                             and a.is_contiguous() and 0 < packed.numel() != n * k):
                         from vllm.model_executor.kernels.linear.scaled_mm.muse_fp8 import _scales_ok
                         if _scales_ok(sa, sb, n):
-                            nbytes = BYTES_RANS_AFTER_ATTN if site.after_attn else BYTES_RANS_QKV
+                            nbytes = (
+                                BYTES_RANS_AFTER_ATTN
+                                if site.after_attn
+                                else (BYTES_RANS_GATE if (n, k) == (4096, 6656) else BYTES_RANS_QKV)
+                            )
                             if nbytes == 0:
                                 site.unassisted = True
                 elif kind == "muse_bf16_lane":
@@ -560,23 +646,33 @@ class Session:
                     n, k = weight.shape
                     if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
                             and a.is_contiguous() and index.numel() == 1):
-                        nbytes = BYTES_RANS_AFTER_ATTN if site.after_attn else BYTES_RANS_QKV
+                        nbytes = (
+                            BYTES_RANS_AFTER_ATTN
+                            if site.after_attn
+                            else (BYTES_RANS_GATE if (n, k) == (4096, 6656) else BYTES_RANS_QKV)
+                        )
                         if nbytes == 0:
                             site.unassisted = True
+                            if (n, k) == (4096, 6656) and BF16_GATE_NONE:
+                                skip_all = True
                 elif kind == "muse_bf16_gate":
                     _, a, weight, packed, index = args
                     n, k = weight.shape
                     if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
                             and a.is_contiguous() and index.numel() == 1):
-                        nbytes = BYTES_RANS_QKV
+                        nbytes = BYTES_RANS_GATE
                         if nbytes == 0:
                             site.unassisted = True
+                            if BF16_GATE_NONE:
+                                skip_all = True
                 elif kind == "marlin_tiled" and not site.after_attn and len(args) >= 8:
                     if (int(args[6]), int(args[7])) == (4096, 6656):
                         nbytes = BYTES_NV_GATE
                         if nbytes == 0:
                             site.unassisted = True
-                if site.unassisted and TLB_PREFETCH and TLB_UNASSISTED:
+                if skip_all:
+                    site.descs = []
+                elif site.unassisted and TLB_PREFETCH and TLB_UNASSISTED:
                     site.descs = head_descs(ws[0], TLB_RANS_HEAD) + tlb_descs(ws[0], TLB_RANS_HEAD, TLB_STRIDE)
                 else:
                     site.descs = weight_descs(ws, nbytes)
@@ -613,6 +709,8 @@ class Session:
                 continue
             for k in (0, 3, 4):
                 site = self.sites[SITES_PER_LAYER * lyr + k]
+                if site.skip_act:
+                    continue
                 site.descs = list(site.descs) + descs
                 added += 1
         return added
@@ -624,6 +722,14 @@ class Session:
             s.off = len(flat) // 3
             for base, pitch, seg, cnt in s.descs:
                 flat += [base, pitch, (seg << 32) | cnt]
+        self.tail_descs = []
+        self.tail_off = -1
+        if TAIL_DESCS and len(self.sites) == SITES_PER_LAYER * 52:
+            if self.ranges is None or _inside(TAIL_DESCS, self.ranges):
+                self.tail_off = len(flat) // 3
+                self.tail_descs = list(TAIL_DESCS)
+                for base, pitch, seg, cnt in self.tail_descs:
+                    flat += [base, pitch, (seg << 32) | cnt]
         self.used = sum(1 for s in self.sites if s.descs)
         if flat:
             self.table = torch.tensor(flat, dtype=torch.int64).to(dev)
@@ -677,7 +783,14 @@ class Session:
             self._join(main)
             return
         self._join(main)
-        self._fork(main, i + 1)
+        if i + 1 < len(self.sites):
+            self._fork(main, i + 1)
+        elif self.tail_off >= 0 and self.tail_descs:
+            self.side.wait_stream(main)
+            prefetch_desc(self.table.data_ptr() + 24 * self.tail_off, len(self.tail_descs), self.side,
+                          blocks=BLOCKS, threads=THREADS, spread=SPREAD)
+            self._pending = True
+            self.prefetched += 1
 
     def summary(self) -> str:
         na = sum(1 for s in self.sites if s.descs and not s.mlp and s.after_attn)
@@ -699,4 +812,5 @@ class Session:
                 f"{nb} others at {BYTES_OTHER / (1 << 20):.1f} MiB, "
                 f"weights above {MAX_WEIGHT / (1 << 20):.0f} MiB: {big}; "
                 f"{mb:.0f} MiB per step; compressed FP8 sites left without prefetch: "
-                f"{ua} output after attention, {ub} QKV; norm-weight pre-warm on {self.norm_sites} sites")
+                f"{ua} output after attention, {ub} QKV; norm-weight pre-warm on {self.norm_sites} sites"
+                + (f"; lm_head tail {len(self.tail_descs)} descs" if self.tail_descs else ""))

@@ -222,6 +222,55 @@ __device__ inline void wait_negative_and_add(int* lock) {
   __syncthreads();
 }
 
+__device__ __forceinline__ float marlin_swiglu_silu(float gate) {
+  float result;
+  asm("{\n\t"
+      ".reg .f32 x, a, b, c, d, e, f, g, h;\n\t"
+      ".reg .b32 exp2_scale;\n\t"
+      "sub.f32 x, 0f00000000, %1;\n\t"
+      "fma.rn.ftz.f32 a, x, 0f3BBB989D, 0f3F000000;\n\t"
+      "cvt.ftz.sat.f32.f32 b, a;\n\t"
+      "fma.rm.ftz.f32 c, b, 0f437C0000, 0f4B400001;\n\t"
+      "add.f32 d, c, 0fCB40007F;\n\t"
+      "neg.f32 d, d;\n\t"
+      "fma.rn.ftz.f32 e, x, 0f3FB8AA3B, d;\n\t"
+      "fma.rn.ftz.f32 f, x, 0f32A57060, e;\n\t"
+      "shl.b32 exp2_scale, c, 23;\n\t"
+      "ex2.approx.ftz.f32 g, f;\n\t"
+      "fma.rn.f32 h, g, exp2_scale, 0f3F800000;\n\t"
+      "div.full.f32 %0, %1, h;\n\t"
+      "}" : "=f"(result) : "f"(gate));
+  return result;
+}
+
+__device__ __forceinline__ float marlin_full_rcp(float s) {
+  float r;
+  asm("div.full.f32 %0, 0f3F800000, %1;" : "=f"(r) : "f"(s));
+  return r;
+}
+
+__device__ __forceinline__ uint16_t marlin_pack_fp8x2(float v0, float v1) {
+  auto cl = [](float v) {
+    return (v != v) ? 448.0f : (v < -448.0f ? -448.0f : (v > 448.0f ? 448.0f : v));
+  };
+  uint16_t lo;
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(cl(v1)), "f"(cl(v0)));
+  return lo;
+}
+
+__device__ __forceinline__ float marlin_triton_sigmoid(float g) {
+  float sig;
+  asm("{\n\t"
+      ".reg .f32 ng, t, e, d;\n\t"
+      "sub.f32 ng, 0f00000000, %1;\n\t"
+      "mul.f32 t, ng, 0f3FB8AA3B;\n\t"
+      "ex2.approx.f32 e, t;\n\t"
+      "add.f32 d, e, 0f3F800000;\n\t"
+      "div.full.f32 %0, 0f3F800000, d;\n\t"
+      "}" : "=f"(sig) : "f"(g));
+  return sig;
+}
+
 template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const vllm::ScalarTypeId b_type_id,  // B ScalarType id
           const vllm::ScalarTypeId c_type_id,  // C ScalarType id
@@ -245,7 +294,16 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool scale6 = false,
           const bool gate_up_grid = false,
           const bool down_ilv = false,
-          const bool gate_v48 = false>
+          const bool gate_v48 = false,
+          const bool gate_up_swiglu = false,
+          const bool fuse_lmpost = false,
+          const bool fuse_mul_sigmoid = false,
+          const bool split2 = false,
+          const int fixed_shape = 0,
+          const bool gate_up_swiglu_fp8 = false,
+          const bool tma_ovlp = false,
+          const bool half_split = false,
+          const bool fast_pal16 = false>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -276,7 +334,12 @@ __global__ void Marlin(
     int max_shared_mem,
     // scale6 only: 64 palette bytes (16-byte aligned) of this layer's codes
     const int4* __restrict__ scale6_palette,
-    size_t tpf_stride = 0) {
+    size_t tpf_stride = 0,
+    int* pair_locks = nullptr,
+    const uint16_t* __restrict__ lmpost_lut = nullptr,
+    int64_t* __restrict__ lmpost_out = nullptr,
+    int org_vocab_size = 0,
+    const int4* __restrict__ A_aux = nullptr) {
   if constexpr (scale6) {
     prob_m = 1;
     lda = prob_k;
@@ -291,6 +354,48 @@ __global__ void Marlin(
     prob_k = lda = 6656;
     num_groups = 416;
   }
+  if constexpr (gate_up_swiglu) {
+    static_assert(scale6 && threads == 256 && thread_n_blocks == 8 && thread_k_blocks == 8 &&
+                  (gate_up_grid || down_ilv) && !gate_v48 && !half_split && !fuse_lmpost && !fuse_mul_sigmoid);
+    prob_n = 39936;
+    prob_k = lda = 6656;
+    num_groups = 416;
+  }
+  if constexpr (fuse_lmpost) {
+    static_assert(scale6 && m_block_size_8 && !gate_up_grid && !gate_v48 && !half_split &&
+                  thread_n_blocks == 4 && threads == 128 && c_type_id == vllm::kBFloat16.id());
+  }
+  if constexpr (fuse_mul_sigmoid) {
+    static_assert(scale6 &&
+                  ((threads == 256 && thread_n_blocks == 8) ||
+                   (threads == 128 && thread_n_blocks == 4 && half_split)) &&
+                  thread_k_blocks == 8 &&
+                  !gate_up_grid && !gate_v48 && !gate_up_swiglu && !fuse_lmpost);
+    prob_n = 6656;
+    prob_k = lda = 4096;
+    num_groups = 256;
+  }
+  if constexpr (half_split) {
+    static_assert(scale6 && threads == 128 && thread_n_blocks == 4 && thread_k_blocks == 8 &&
+                  down_ilv && !gate_up_grid && !gate_v48 && !split2 && !gate_up_swiglu && !fuse_lmpost);
+  }
+  if constexpr (fixed_shape == 1) {
+    prob_n = 6656;
+    prob_k = lda = 19968;
+    num_groups = 1248;
+  } else if constexpr (fixed_shape == 2) {
+    prob_n = 202048;
+    prob_k = lda = 6656;
+    num_groups = 416;
+  }
+  [[maybe_unused]] float inv_fp8_scale = 1.0f;
+  [[maybe_unused]] uint8_t* const fp8_out_ptr = reinterpret_cast<uint8_t*>(lmpost_out);
+  if constexpr (gate_up_swiglu_fp8) {
+    static_assert(gate_up_swiglu && !fuse_lmpost);
+    inv_fp8_scale = marlin_full_rcp(__ldg(a_scales_ptr));
+  }
+  [[maybe_unused]] float lm_bv = -__int_as_float(0x7f800000);
+  [[maybe_unused]] int lm_bi = 0x7fffffff;
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -400,10 +505,21 @@ __global__ void Marlin(
 
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
+  const int sched_n_tiles = half_split ? (n_tiles >> 1) : n_tiles;
 
-  int global_mn_tiles = parallel * n_tiles;
-  const int vgrid = gate_v48 ? 48 : gridDim.x;
-  int vblk = gate_v48 ? (47 - static_cast<int>(blockIdx.x)) : static_cast<int>(blockIdx.x);
+  int global_mn_tiles = parallel * sched_n_tiles;
+  const int vgrid = (gate_v48 || split2 || half_split) ? 48 : gridDim.x;
+  int half_id = (half_split && static_cast<int>(gridDim.x) == 96)
+                    ? (static_cast<int>(blockIdx.x) & 1)
+                    : 0;
+  int vblk = gate_v48
+                 ? (47 - static_cast<int>(blockIdx.x))
+                 : (split2 ? (static_cast<int>(blockIdx.x) >= 48
+                                  ? static_cast<int>(blockIdx.x) - 48
+                                  : static_cast<int>(blockIdx.x))
+                           : ((half_split && static_cast<int>(gridDim.x) == 96)
+                                  ? (static_cast<int>(blockIdx.x) >> 1)
+                                  : static_cast<int>(blockIdx.x)));
   int part2_mn_tiles = global_mn_tiles;
   int part1_mn_iters = 0;
   bool in_part2 = false;
@@ -414,6 +530,11 @@ __global__ void Marlin(
     part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / vgrid;
   }
   const int orig_p1_iters = part1_mn_iters;
+  [[maybe_unused]] const int split2_lo_p1 = (orig_p1_iters + 1) / 2;
+  [[maybe_unused]] const int split2_hi_p1 = orig_p1_iters - split2_lo_p1;
+  if constexpr (split2) {
+    part1_mn_iters = (static_cast<int>(blockIdx.x) < 48) ? split2_lo_p1 : split2_hi_p1;
+  }
 
   int iters = div_ceil(k_tiles * part2_mn_tiles, vgrid);
 
@@ -428,7 +549,9 @@ __global__ void Marlin(
   }
 
   int slice_row = 0;
-  int slice_col_par = vblk;
+  int slice_col_par = (split2 && static_cast<int>(blockIdx.x) >= 48)
+                          ? (vblk + split2_lo_p1 * vgrid)
+                          : vblk;
   int slice_col;
   int slice_iters =
       k_tiles;  // number of threadblock tiles in the current slice
@@ -518,8 +641,9 @@ __global__ void Marlin(
   auto init_part1_slice = [&]() {
     if (part1_mn_iters) {
       part1_mn_iters--;
-      par_id = slice_col_par / n_tiles;
-      slice_col = slice_col_par % n_tiles;
+      par_id = slice_col_par / sched_n_tiles;
+      const int base_sc = slice_col_par % sched_n_tiles;
+      slice_col = half_split ? (2 * base_sc + half_id) : base_sc;
       slice_iters = k_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
       C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
@@ -534,11 +658,18 @@ __global__ void Marlin(
 
   auto init_slice = [&]() {
     if (!in_part2 && !part1_mn_iters) {
+      if constexpr (split2) {
+        if (static_cast<int>(blockIdx.x) < 48) {
+          slice_iters = 0;
+          return;
+        }
+      }
       in_part2 = true;
       slice_col_par = (iters * vblk) / k_tiles;
       slice_row = (iters * vblk) % k_tiles;
-      slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % n_tiles;
-      par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
+      const int base_sc = (slice_col_par + global_mn_tiles - part2_mn_tiles) % sched_n_tiles;
+      slice_col = half_split ? (2 * base_sc + half_id) : base_sc;
+      par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / sched_n_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
       C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
     }
@@ -584,6 +715,10 @@ __global__ void Marlin(
   constexpr int a_sh_rd_delta_i = a_sh_stride * 16;
   // overall size of a tile
   constexpr int a_sh_stage = a_sh_stride * m_block_size;
+  constexpr int a_sh_stage_step =
+      (scale6 && m_block_size_8 && (tma_ovlp || stages != 4 || half_split || fast_pal16))
+          ? a_sh_stride
+          : a_sh_stage;
   // number of shared write iterations for a tile
   constexpr int a_sh_wr_iters = div_ceil(a_sh_stage, a_sh_wr_delta);
 
@@ -605,7 +740,11 @@ __global__ void Marlin(
 
   // Scale sizes/strides without act_order
   constexpr int s_gl_stride = (16 * thread_n_blocks) / (is_8bit_scale ? 16 : 8);
+#ifdef MUSE_SCALE_TMA4
+  constexpr int s_sh_stride = 16 * thread_n_blocks / ((is_8bit_scale && !fast_pal16) ? 16 : 8);
+#else
   constexpr int s_sh_stride = 16 * thread_n_blocks / (is_8bit_scale ? 16 : 8);
+#endif
   constexpr int s_tb_groups =
       !has_act_order && group_blocks != -1 && group_blocks < thread_k_blocks
           ? thread_k_blocks / group_blocks
@@ -659,9 +798,13 @@ __global__ void Marlin(
   [[maybe_unused]] int ilv_f = 0;
   [[maybe_unused]] int ilv_jump_f = 0;
   [[maybe_unused]] int ilv_jump_kt = 0;
+  [[maybe_unused]] int ilv_step_p1end = 0;
   [[maybe_unused]] int ilv_step_switch = 0;
+  [[maybe_unused]] int ilv_step_p2end = 0;
+  [[maybe_unused]] int ilv_delta_p1 = 0;
   [[maybe_unused]] int ilv_delta_hi = 0;
   [[maybe_unused]] int ilv_delta_lo = 0;
+  [[maybe_unused]] int ilv_delta_tail = 0;
 #ifdef MUSE_GATE_UP_ILV
   [[maybe_unused]] int ilv_base = 0;
   if constexpr (gate_up_grid) {
@@ -675,8 +818,9 @@ __global__ void Marlin(
   }
 #else
   if constexpr (down_ilv) {
-    static_assert(scale6 && threads == 256 && thread_n_blocks == 8 && !gate_up_grid,
-                  "down_ilv requires M=1 256T 128-col decode config");
+    static_assert(scale6 && ((threads == 256 && thread_n_blocks == 8) ||
+                             (threads == 128 && thread_n_blocks == 4)) && !gate_up_grid,
+                  "down_ilv requires M=1 256T/128-col or 128T/64-col decode config");
     b_gl_rd += b_gl_rd_delta_o * blockIdx.x;
     const int total_p2 = k_tiles * part2_mn_tiles;
     if constexpr (gate_v48) {
@@ -687,12 +831,62 @@ __global__ void Marlin(
       ilv_step_switch = 53;
       ilv_delta_hi = 24 * b_gl_rd_delta_o;
       ilv_delta_lo = 23 * b_gl_rd_delta_o;
+    } else if constexpr (split2) {
+      const int hi_base = split2_hi_p1 * k_tiles;
+      const int lo_active = (split2_lo_p1 > split2_hi_p1) ? 48 : 0;
+      const int ilv_full_b = total_p2 / iters;
+      const int ilv_rem_s = total_p2 - ilv_full_b * iters;
+      ilv_jump_f = (static_cast<int>(blockIdx.x) < 48) ? (split2_lo_p1 * k_tiles) : hi_base;
+      ilv_jump_kt = (static_cast<int>(blockIdx.x) < 48) ? 0 : ((iters * vblk) % k_tiles);
+      ilv_step_p1end = lo_active ? hi_base : (hi_base - 1);
+      ilv_step_switch = lo_active ? (hi_base + ilv_rem_s) : (hi_base + (ilv_rem_s > 0 ? ilv_rem_s : -1));
+      ilv_step_p2end = hi_base + iters;
+      ilv_delta_p1 = 96 * b_gl_rd_delta_o;
+      ilv_delta_hi = (lo_active + ilv_full_b + 1) * b_gl_rd_delta_o;
+      ilv_delta_lo = (lo_active + ilv_full_b) * b_gl_rd_delta_o;
+      ilv_delta_tail = 48 * b_gl_rd_delta_o;
+    } else if constexpr (half_split) {
+      const int ilv_full_b48 = total_p2 / iters;
+      const int ilv_rem_s = total_p2 - ilv_full_b48 * iters;
+      if (gridDim.x == 96) {
+        ilv_jump_f = orig_p1_iters * k_tiles;
+        ilv_jump_kt = (iters * vblk) % k_tiles;
+        ilv_step_p1end = ilv_jump_f;
+        ilv_step_switch = ilv_jump_f + ilv_rem_s;
+        ilv_delta_p1 = 96 * b_gl_rd_delta_o;
+        ilv_delta_hi = 2 * (ilv_full_b48 + 1) * b_gl_rd_delta_o;
+        ilv_delta_lo = 2 * ilv_full_b48 * b_gl_rd_delta_o;
+      } else {
+        const int p2_len = min(iters, max(0, total_p2 - vblk * iters));
+        ilv_jump_f = p2_len;
+        ilv_jump_kt = (iters * vblk) % k_tiles;
+        ilv_step_p1end = 0;
+        ilv_step_switch = 2 * ilv_rem_s;
+        ilv_delta_p1 = 48 * b_gl_rd_delta_o;
+        ilv_delta_hi = (ilv_full_b48 + 1) * b_gl_rd_delta_o;
+        ilv_delta_lo = ilv_full_b48 * b_gl_rd_delta_o;
+      }
+    } else if constexpr (!gate_up_swiglu && fixed_shape == 1) {
+      ilv_jump_f = orig_p1_iters * k_tiles;
+      ilv_jump_kt = (iters * vblk) % k_tiles;
+    } else if constexpr (!gate_up_swiglu && thread_n_blocks == 8) {
+      ilv_jump_f = orig_p1_iters * k_tiles;
+      ilv_jump_kt = (iters * vblk) % k_tiles;
+      const int ilv_full_b = total_p2 / iters;
+      const int ilv_rem_s = total_p2 - ilv_full_b * iters;
+      ilv_step_switch = (orig_p1_iters == 0) ? ilv_rem_s : 0;
+      ilv_delta_hi = (ilv_full_b + 1) * b_gl_rd_delta_o;
+      ilv_delta_lo = ilv_full_b * b_gl_rd_delta_o;
     } else {
       ilv_jump_f = orig_p1_iters * k_tiles;
       ilv_jump_kt = (iters * vblk) % k_tiles;
-      ilv_step_switch = ilv_jump_f + max(0, total_p2 - 47 * iters);
-      ilv_delta_hi = 48 * b_gl_rd_delta_o;
-      ilv_delta_lo = 47 * b_gl_rd_delta_o;
+      const int ilv_full_b = total_p2 / iters;
+      const int ilv_rem_s = total_p2 - ilv_full_b * iters;
+      ilv_step_p1end = ilv_jump_f;
+      ilv_step_switch = ilv_jump_f + ilv_rem_s;
+      ilv_delta_p1 = 48 * b_gl_rd_delta_o;
+      ilv_delta_hi = (ilv_full_b + 1) * b_gl_rd_delta_o;
+      ilv_delta_lo = ilv_full_b * b_gl_rd_delta_o;
     }
   } else {
     b_gl_rd += b_sh_stride * tile_column_stride * slice_col;
@@ -860,28 +1054,42 @@ __global__ void Marlin(
   int4* sh_bias = sh_new + sh_size_b_red_min;
   int4* sh_g_idx = sh_new + sh_b_red_bias_size;
   int4* sh_zp = sh_g_idx + (stages * g_idx_stage);
+#ifdef MUSE_SCALE_TMA4
+  constexpr int sh_s_stages = 4;
+#else
+  constexpr int sh_s_stages = stages;
+#endif
   constexpr int sh_s_size = has_act_order ? (act_s_max_num_groups * s_sh_stride)
-                                          : (stages * s_sh_stage);
+                                          : (sh_s_stages * s_sh_stage);
   int4* sh_s = sh_zp + (stages * zp_sh_stage);
   int4* sh_a = sh_s + sh_s_size;
-  // scale6: the 64-byte palette lives after the A stages (the launch reserves
-  // the device's opt-in shared memory, far more than the stages use).
+  // scale6: the 64-byte palette (or 128-byte BF16 palette when fast_pal16) lives after the A stages.
   [[maybe_unused]] uint8_t* sh_pal =
-      reinterpret_cast<uint8_t*>(sh_a + stages * a_sh_stage);
+      reinterpret_cast<uint8_t*>(sh_a + (stages - 1) * a_sh_stage_step + a_sh_stage);
+  [[maybe_unused]] uint16_t* sh_pal16 = reinterpret_cast<uint16_t*>(sh_pal);
   if constexpr (scale6) {
     static_assert(group_blocks == 1 && is_8bit_scale && !has_act_order &&
                       !has_zp && !is_a_8bit && thread_k_blocks == 8,
                   "scale6 is only built for the M = 1 NVFP4 decode config");
-    // visible to all threads at the __syncthreads of the first wait_for_stage
-    if (threadIdx.x < 4)
-      reinterpret_cast<int4*>(sh_pal)[threadIdx.x] = scale6_palette[threadIdx.x];
+    if constexpr (fast_pal16) {
+      if (threadIdx.x < 64) {
+        const uint8_t b = reinterpret_cast<const uint8_t*>(scale6_palette)[threadIdx.x];
+        sh_pal16[threadIdx.x] = static_cast<uint16_t>(((b & 0x80u) << 7) | ((b & 0x7Fu) << 4));
+      }
+    } else {
+      // visible to all threads at the __syncthreads of the first wait_for_stage
+      if (threadIdx.x < 4)
+        reinterpret_cast<int4*>(sh_pal)[threadIdx.x] = scale6_palette[threadIdx.x];
+    }
   }
+  constexpr bool fast_m1_red =
+      scale6 && m_block_size_8 && (tma_ovlp || fast_pal16 || stages == 3 || half_split);
 #ifdef MUSE_SCALE_TMA4
   static_assert(scale6 && (threads == 256 || threads == 128),
                 "TMA4 rANS scales require M = 1 decode config (128 or 256 threads)");
   constexpr int kTmaWarps = threads / 32;
   constexpr int RANS_CAP = (threads == 256) ? 3200 : 2048;
-  uint32_t* sh_states = reinterpret_cast<uint32_t*>(sh_pal + 64);
+  uint32_t* sh_states = reinterpret_cast<uint32_t*>(sh_pal + (fast_pal16 ? 128 : 64));
   unsigned char* sh_rslot = reinterpret_cast<unsigned char*>(sh_states + threads);
   uint32_t* sh_rlut = reinterpret_cast<uint32_t*>(sh_rslot + 2 * RANS_CAP);
   uint64_t* sh_rbar = reinterpret_cast<uint64_t*>(sh_rlut + 1024);
@@ -960,17 +1168,32 @@ __global__ void Marlin(
       for (int i = 0; i < kTmaWarps - 1; i++) start += i < w ? cw[i] : 0;
       tma_wp = reinterpret_cast<const uint16_t*>(blk) + start;
     }
-    uint8_t* dst = reinterpret_cast<uint8_t*>(sh_s + s_sh_stage * (X & (stages - 1))) + 128 * w + lane;
     const uint32_t lt = (1u << lane) - 1u;
+    if constexpr (fast_pal16) {
+      const int pl = (lane & ~3) | ((lane & 1) << 1) | ((lane >> 1) & 1);
+      uint16_t* dst16 = reinterpret_cast<uint16_t*>(sh_s + s_sh_stage * (X & 3)) + 128 * w + pl;
   #pragma unroll
-    for (int m = 0; m < 4; m++) {
-      const uint32_t e = sh_rlut[tma_x & 1023u];
-      tma_x = ((e >> 6) & 2047u) * (tma_x >> 10) + (e >> 17);
-      dst[32 * m] = sh_pal[e & 63u];
-      const bool need = tma_x < 65536u;
-      const uint32_t msk = __ballot_sync(0xffffffffu, need);
-      if (need) tma_x = (tma_x << 16) | tma_wp[__popc(msk & lt)];
-      tma_wp += __popc(msk);
+      for (int m = 0; m < 4; m++) {
+        const uint32_t e = sh_rlut[tma_x & 1023u];
+        tma_x = ((e >> 6) & 2047u) * (tma_x >> 10) + (e >> 17);
+        dst16[32 * m] = sh_pal16[e & 63u];
+        const bool need = tma_x < 65536u;
+        const uint32_t msk = __ballot_sync(0xffffffffu, need);
+        if (need) tma_x = (tma_x << 16) | tma_wp[__popc(msk & lt)];
+        tma_wp += __popc(msk);
+      }
+    } else {
+      uint8_t* dst = reinterpret_cast<uint8_t*>(sh_s + s_sh_stage * (X & 3)) + 128 * w + lane;
+  #pragma unroll
+      for (int m = 0; m < 4; m++) {
+        const uint32_t e = sh_rlut[tma_x & 1023u];
+        tma_x = ((e >> 6) & 2047u) * (tma_x >> 10) + (e >> 17);
+        dst[32 * m] = sh_pal[e & 63u];
+        const bool need = tma_x < 65536u;
+        const uint32_t msk = __ballot_sync(0xffffffffu, need);
+        if (need) tma_x = (tma_x << 16) | tma_wp[__popc(msk & lt)];
+        tma_wp += __popc(msk);
+      }
     }
   };
 #endif
@@ -1075,6 +1298,41 @@ __global__ void Marlin(
   };
 #endif
 
+  [[maybe_unused]] int4* sh_a_gated = nullptr;
+  if constexpr (fuse_mul_sigmoid) {
+#ifdef MUSE_SCALE_TMA4
+    constexpr int sh_red_tma_max = fast_m1_red ? ((threads == 256) ? 128 : 64)
+                                               : ((threads == 256) ? 512 : 256);
+    sh_a_gated = sh_red + sh_red_tma_max;
+#else
+    sh_a_gated = reinterpret_cast<int4*>((reinterpret_cast<uintptr_t>(sh_pal + 64) + 15u) & ~uintptr_t(15u)) + 1024;
+#endif
+    const uint4* g_ptr = reinterpret_cast<const uint4*>(A0);
+    const uint4* a_ptr = reinterpret_cast<const uint4*>(A_aux);
+    uint4* dst_ptr = reinterpret_cast<uint4*>(sh_a_gated);
+  #pragma unroll
+    for (int idx = threadIdx.x; idx < 512; idx += threads) {
+      const uint4 g = g_ptr[idx];
+      const uint4 av = a_ptr[idx];
+      const uint32_t gw[4] = {g.x, g.y, g.z, g.w};
+      const uint32_t aw[4] = {av.x, av.y, av.z, av.w};
+      uint32_t ow[4];
+  #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float gl = __uint_as_float(gw[j] << 16);
+        const float gh = __uint_as_float(gw[j] & 0xffff0000u);
+        const float al = __uint_as_float(aw[j] << 16);
+        const float ah = __uint_as_float(aw[j] & 0xffff0000u);
+        __nv_bfloat162 p = __floats2bfloat162_rn(
+            __fmul_rn(marlin_triton_sigmoid(gl), al),
+            __fmul_rn(marlin_triton_sigmoid(gh), ah));
+        ow[j] = *reinterpret_cast<uint32_t*>(&p);
+      }
+      dst_ptr[idx] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
+    }
+    __syncthreads();
+  }
+
   // Register storage for double buffer of shared memory reads.
   FragA frag_a[2][thread_m_blocks];
   I4 frag_b_quant[2][b_thread_vecs];
@@ -1154,10 +1412,14 @@ __global__ void Marlin(
   // locally per copy to avoid ptxas odd-UR descriptor allocation on sm_121a.
   auto cp_async4_stream = [&](void* smem_ptr, const void* glob_ptr) {
     const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    uint64_t stream_policy;
-    asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(stream_policy));
-    asm volatile("cp.async.cg.shared.global.L2::256B.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(smem), "l"(glob_ptr),
-                 "l"(stream_policy));
+    if constexpr (fuse_lmpost && down_ilv) {
+      asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;\n" ::"r"(smem), "l"(glob_ptr));
+    } else {
+      uint64_t stream_policy;
+      asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(stream_policy));
+      asm volatile("cp.async.cg.shared.global.L2::256B.L2::cache_hint [%0], [%1], 16, %2;\n" ::"r"(smem), "l"(glob_ptr),
+                   "l"(stream_policy));
+    }
   };
 #else
   auto cp_async4_stream = [&](void* smem_ptr, const void* glob_ptr) { cp_async4(smem_ptr, glob_ptr); };
@@ -1166,15 +1428,24 @@ __global__ void Marlin(
   // shared memory pipeline location.
   auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true) {
     if (pred) {
-      int4* sh_a_stage = sh_a + a_sh_stage * pipe;
+      int4* sh_a_stage = sh_a + a_sh_stage_step * pipe;
       const int cur_a_off = down_ilv ? (a_gl_rd_base + a_gl_rd_delta_o * ilv_a_kt)
                                      : (a_gl_rd + a_gl_rd_delta_o * a_off);
+      if constexpr (fuse_mul_sigmoid) {
   #pragma unroll
-      for (int i = 0; i < a_sh_wr_iters; i++) {
-        cp_async4_pred(
-            &sh_a_stage[a_sh_wr_trans[i]],
-            &A[a_gl_rd_delta_i * i + cur_a_off],
-            a_sh_wr_pred[i]);
+        for (int i = 0; i < a_sh_wr_iters; i++) {
+          if (a_sh_wr_pred[i]) {
+            sh_a_stage[a_sh_wr_trans[i]] = sh_a_gated[(a_gl_rd_delta_i * i + cur_a_off) & 511];
+          }
+        }
+      } else {
+  #pragma unroll
+        for (int i = 0; i < a_sh_wr_iters; i++) {
+          cp_async4_pred(
+              &sh_a_stage[a_sh_wr_trans[i]],
+              &A[a_gl_rd_delta_i * i + cur_a_off],
+              a_sh_wr_pred[i]);
+        }
       }
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
   #pragma unroll
@@ -1188,7 +1459,23 @@ __global__ void Marlin(
       }
 
       if constexpr (down_ilv) {
-        b_gl_rd += (ilv_f < ilv_step_switch) ? ilv_delta_hi : ilv_delta_lo;
+        if constexpr (gate_v48) {
+          b_gl_rd += (ilv_f < ilv_step_switch) ? ilv_delta_hi : ilv_delta_lo;
+        } else if constexpr (split2) {
+          b_gl_rd += (ilv_f < ilv_step_p1end)
+                         ? ilv_delta_p1
+                         : ((ilv_f < ilv_step_switch)
+                                ? ilv_delta_hi
+                                : ((ilv_f < ilv_step_p2end) ? ilv_delta_lo : ilv_delta_tail));
+        } else if constexpr (!half_split && !gate_up_swiglu && fixed_shape == 1) {
+          b_gl_rd += 48 * b_gl_rd_delta_o;
+        } else if constexpr (!half_split && !gate_up_swiglu && thread_n_blocks == 8) {
+          b_gl_rd += (ilv_f < ilv_step_switch) ? ilv_delta_hi : ilv_delta_lo;
+        } else {
+          b_gl_rd += (ilv_f < ilv_step_p1end)
+                         ? ilv_delta_p1
+                         : ((ilv_f < ilv_step_switch) ? ilv_delta_hi : ilv_delta_lo);
+        }
         ilv_f++;
         if (ilv_f == ilv_jump_f) {
           ilv_a_kt = ilv_jump_kt;
@@ -1272,7 +1559,7 @@ __global__ void Marlin(
   // Load the next sub-tile from the current location in the shared memory pipe
   // into the current register buffer.
   auto fetch_to_registers = [&](int k, int pipe) {
-    int4* sh_a_stage = sh_a + a_sh_stage * pipe;
+    int4* sh_a_stage = sh_a + a_sh_stage_step * pipe;
   #pragma unroll
     for (int i = 0; i < thread_m_blocks; i++)
       ldsm<m_block_size_8 ? 2 : 4, a_type_id>(
@@ -1340,7 +1627,7 @@ __global__ void Marlin(
 #ifdef MUSE_SCALE_RANS_SK
           int4* sh_s_stage = sh_s + s_sh_stage * ((rans_slice_base + pipe) & (stages - 1));
 #elif defined(MUSE_SCALE_TMA4)
-          int4* sh_s_stage = sh_s + s_sh_stage * (((down_ilv ? 0 : tma_slice_base) + pipe) & (stages - 1));
+          int4* sh_s_stage = sh_s + s_sh_stage * (tma_q & 3);
 #else
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 #endif
@@ -1349,7 +1636,15 @@ __global__ void Marlin(
             reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
                 sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
           } else if constexpr (scale6) {
-#if defined(MUSE_SCALE_RANS) || defined(MUSE_SCALE_TMA4)
+#ifdef MUSE_SCALE_TMA4
+            if constexpr (fast_pal16) {
+              reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
+                  sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
+            } else {
+              reinterpret_cast<int2*>(&frag_s[k % 2])[0] = reinterpret_cast<int2*>(
+                  sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
+            }
+#elif defined(MUSE_SCALE_RANS)
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] = reinterpret_cast<int2*>(
                 sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
 #else
@@ -1579,7 +1874,7 @@ __global__ void Marlin(
       }
     }
 
-    if constexpr (s_type == vllm::kFE4M3fn || s_type == vllm::kFE8M0fnu) {
+    if constexpr (!fast_pal16 && (s_type == vllm::kFE4M3fn || s_type == vllm::kFE8M0fnu)) {
       int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
       int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
 
@@ -1773,11 +2068,62 @@ __global__ void Marlin(
   // multiple warps that accumulate their partial sums of the same output
   // location; which we have to reduce over in the end. We do in shared memory.
   auto thread_block_reduce = [&]() {
+    if constexpr (fast_m1_red) {
+      constexpr int red_off = threads / b_sh_stride_threads / 2;
+      if constexpr (red_off >= 1) {
+        const int red_idx = threadIdx.x / b_sh_stride_threads;
+        constexpr int lane_grp = b_sh_stride_threads >> 2;
+        const int tid_grp = (threadIdx.x % b_sh_stride_threads) >> 2;
+        const bool is_row0 = (threadIdx.x & 3) == 0;
+  #pragma unroll
+        for (int i = red_off; i > 0; i /= 2) {
+          if (is_row0 && i <= red_idx && red_idx < 2 * i) {
+            const int wr_slot = (red_idx - i) * 2 * lane_grp + tid_grp;
+            if (i < red_off) {
+              const int rd_slot = red_idx * 2 * lane_grp + tid_grp;
+              const float4 rd0 = reinterpret_cast<const float4*>(sh_red)[rd_slot];
+              const float4 rd1 = reinterpret_cast<const float4*>(sh_red)[rd_slot + lane_grp];
+              const float4 wr0 = reinterpret_cast<const float4*>(sh_red)[wr_slot];
+              const float4 wr1 = reinterpret_cast<const float4*>(sh_red)[wr_slot + lane_grp];
+              frag_c[0][0][0][0] += rd0.x + wr0.x;
+              frag_c[0][0][0][2] += rd0.y + wr0.y;
+              frag_c[0][1][0][0] += rd0.z + wr0.z;
+              frag_c[0][1][0][2] += rd0.w + wr0.w;
+              frag_c[0][2][0][0] += rd1.x + wr1.x;
+              frag_c[0][2][0][2] += rd1.y + wr1.y;
+              frag_c[0][3][0][0] += rd1.z + wr1.z;
+              frag_c[0][3][0][2] += rd1.w + wr1.w;
+            }
+            reinterpret_cast<float4*>(sh_red)[wr_slot] = make_float4(
+                frag_c[0][0][0][0], frag_c[0][0][0][2], frag_c[0][1][0][0], frag_c[0][1][0][2]);
+            reinterpret_cast<float4*>(sh_red)[wr_slot + lane_grp] = make_float4(
+                frag_c[0][2][0][0], frag_c[0][2][0][2], frag_c[0][3][0][0], frag_c[0][3][0][2]);
+          }
+          __syncthreads();
+        }
+        if (is_row0 && red_idx == 0) {
+          const int rd_slot = tid_grp;
+          const float4 rd0 = reinterpret_cast<const float4*>(sh_red)[rd_slot];
+          const float4 rd1 = reinterpret_cast<const float4*>(sh_red)[rd_slot + lane_grp];
+          frag_c[0][0][0][0] += rd0.x;
+          frag_c[0][0][0][2] += rd0.y;
+          frag_c[0][1][0][0] += rd0.z;
+          frag_c[0][1][0][2] += rd0.w;
+          frag_c[0][2][0][0] += rd1.x;
+          frag_c[0][2][0][2] += rd1.y;
+          frag_c[0][3][0][0] += rd1.z;
+          frag_c[0][3][0][2] += rd1.w;
+        }
+        __syncthreads();
+      }
+      return;
+    }
     constexpr int red_off = threads / b_sh_stride_threads / 2;
     if (red_off >= 1) {
       auto red_idx = threadIdx.x / b_sh_stride_threads;
+      constexpr int red_j_shift = m_block_size_8 ? 1 : 0;
       constexpr int red_sh_stride =
-          b_sh_stride_threads * (is_a_8bit ? 2 : 4) * 2;
+          b_sh_stride_threads * ((is_a_8bit ? 2 : 4) * 2 >> red_j_shift);
       constexpr int red_sh_delta = b_sh_stride_threads;
       int red_sh_rd = red_sh_stride * (threadIdx.x / b_sh_stride_threads) +
                       (threadIdx.x % b_sh_stride_threads);
@@ -1794,11 +2140,12 @@ __global__ void Marlin(
   #pragma unroll
             for (int j = 0; j < (is_a_8bit ? 2 : 4) * 2;
                  j += (m_block_size_8 ? 2 : 1)) {
+              const int jj = j >> red_j_shift;
               int red_sh_wr =
-                  red_sh_delta * j + (red_sh_rd - red_sh_stride * i);
+                  red_sh_delta * jj + (red_sh_rd - red_sh_stride * i);
               if (i < red_off) {
                 float* c_rd = reinterpret_cast<float*>(
-                    &sh_red[red_sh_delta * j + red_sh_rd]);
+                    &sh_red[red_sh_delta * jj + red_sh_rd]);
                 float* c_wr = reinterpret_cast<float*>(&sh_red[red_sh_wr]);
   #pragma unroll
                 for (int k = 0; k < 4; k++)
@@ -1817,7 +2164,7 @@ __global__ void Marlin(
           for (int i = 0; i < (is_a_8bit ? 2 : 4) * 2;
                i += (m_block_size_8 ? 2 : 1)) {
             float* c_rd =
-                reinterpret_cast<float*>(&sh_red[red_sh_delta * i + red_sh_rd]);
+                reinterpret_cast<float*>(&sh_red[red_sh_delta * (i >> red_j_shift) + red_sh_rd]);
   #pragma unroll
             for (int j = 0; j < 4; j++)
               reinterpret_cast<FragC*>(
@@ -1949,6 +2296,34 @@ __global__ void Marlin(
   // Globally reduce over threadblocks that compute the same column block.
   // We use a tmp C buffer to reduce in full fp32 precision.
   auto global_reduce_fp32 = [&](bool first = false, bool last = false) {
+    const int eff_lock = half_split ? (2 * locks_off + half_id) : locks_off;
+    if constexpr (fast_m1_red) {
+      constexpr int active_threads = 32 * tb_n_warps;
+      constexpr int red_m1_c_size = (active_threads >> 2) * 2;
+      if (threadIdx.x < active_threads && (threadIdx.x & 3) == 0) {
+        const int red_tid = threadIdx.x >> 2;
+        const int c_cur_offset = eff_lock * red_m1_c_size;
+        if (!first) {
+          const float4 rd0 = reinterpret_cast<const float4*>(C_tmp)[c_cur_offset + red_tid * 2 + 0];
+          const float4 rd1 = reinterpret_cast<const float4*>(C_tmp)[c_cur_offset + red_tid * 2 + 1];
+          frag_c[0][0][0][0] += rd0.x;
+          frag_c[0][0][0][2] += rd0.y;
+          frag_c[0][1][0][0] += rd0.z;
+          frag_c[0][1][0][2] += rd0.w;
+          frag_c[0][2][0][0] += rd1.x;
+          frag_c[0][2][0][2] += rd1.y;
+          frag_c[0][3][0][0] += rd1.z;
+          frag_c[0][3][0][2] += rd1.w;
+        }
+        if (!last) {
+          reinterpret_cast<float4*>(C_tmp)[c_cur_offset + red_tid * 2 + 0] = make_float4(
+              frag_c[0][0][0][0], frag_c[0][0][0][2], frag_c[0][1][0][0], frag_c[0][1][0][2]);
+          reinterpret_cast<float4*>(C_tmp)[c_cur_offset + red_tid * 2 + 1] = make_float4(
+              frag_c[0][2][0][0], frag_c[0][2][0][2], frag_c[0][3][0][0], frag_c[0][3][0][2]);
+        }
+      }
+      return;
+    }
     constexpr int tb_m = thread_m_blocks * 16;
     constexpr int tb_n = thread_n_blocks * 16;
 
@@ -1960,7 +2335,7 @@ __global__ void Marlin(
     constexpr int num_floats = thread_m_blocks * (is_a_8bit ? 2 : 4) * 2 * 4;
     constexpr int th_size = num_floats * sizeof(float) / 16;
 
-    int c_cur_offset = locks_off * c_size;
+    int c_cur_offset = eff_lock * c_size;
 
     if (!is_th_active) {
       return;
@@ -2057,7 +2432,17 @@ __global__ void Marlin(
       }
     };
 
-    if (threadIdx.x / 32 < tb_n_warps) {
+    if constexpr (fast_m1_red) {
+      if (threadIdx.x < 32 * tb_n_warps && (threadIdx.x & 3) == 0) {
+        const int wr_base = (threadIdx.x % 32) / 4 + 64 * (threadIdx.x / 32);
+        c_scalar_t* sh_red_s = reinterpret_cast<c_scalar_t*>(sh_red);
+  #pragma unroll
+        for (int j = 0; j < 4; j++) {
+          sh_red_s[wr_base + 16 * j + 0] = Cdtype::float2num(frag_c[0][j][0][0] * global_scale_f32);
+          sh_red_s[wr_base + 16 * j + 8] = Cdtype::float2num(frag_c[0][j][0][2] * global_scale_f32);
+        }
+      }
+    } else if (threadIdx.x / 32 < tb_n_warps) {
   #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
   #pragma unroll
@@ -2091,24 +2476,100 @@ __global__ void Marlin(
     }
     __syncthreads();
 
-  #pragma unroll
-    for (int i = 0;
-         i < div_ceil(16 * thread_m_blocks, threads / (2 * thread_n_blocks));
-         i++) {
-      if (c_gl_wr < c_gl_wr_end) {
-        if (use_atomic_add && slice_count > 1) {
-          c_scalar_t2* C_half2 = reinterpret_cast<c_scalar_t2*>(&C[c_gl_wr]);
-          c_scalar_t2* sh_red_half2 =
-              reinterpret_cast<c_scalar_t2*>(&sh_red[c_sh_rd]);
-  #pragma unroll
-          for (int a = 0; a < 4; a++) {
-            atomicAdd(&C_half2[a], sh_red_half2[a]);
+    if constexpr (gate_up_swiglu) {
+      if (slice_col < 264) {
+        if (threadIdx.x < 32) {
+          const uint32_t gw = reinterpret_cast<const uint32_t*>(sh_red)[threadIdx.x];
+          const uint32_t uw = reinterpret_cast<const uint32_t*>(sh_red)[threadIdx.x + 32];
+          const float g0 = __uint_as_float(gw << 16);
+          const float g1 = __uint_as_float(gw & 0xffff0000u);
+          const float u0 = __uint_as_float(uw << 16);
+          const float u1 = __uint_as_float(uw & 0xffff0000u);
+          if constexpr (gate_up_swiglu_fp8) {
+            reinterpret_cast<uint16_t*>(fp8_out_ptr + slice_col * 64)[threadIdx.x] =
+                marlin_pack_fp8x2(
+                    __fmul_rn(__fmul_rn(marlin_swiglu_silu(g0), u0), inv_fp8_scale),
+                    __fmul_rn(__fmul_rn(marlin_swiglu_silu(g1), u1), inv_fp8_scale));
+          } else {
+            __nv_bfloat162 r = __floats2bfloat162_rn(
+                __fmul_rn(marlin_swiglu_silu(g0), u0),
+                __fmul_rn(marlin_swiglu_silu(g1), u1));
+            reinterpret_cast<uint32_t*>(C0 + slice_col * 8)[threadIdx.x] =
+                *reinterpret_cast<uint32_t*>(&r);
           }
-        } else {
-          C[c_gl_wr] = sh_red[c_sh_rd];
         }
-        c_gl_wr += c_gl_wr_delta;
-        c_sh_rd += c_sh_rd_delta;
+      } else {
+        const bool is_up = (slice_col >= 288);
+        const int m = is_up ? (slice_col - 288) : (slice_col - 264);
+        int4* const my_slot = C0 + 2496 + m * 32 + (is_up ? 16 : 0);
+        const int4* const other_slot = C0 + 2496 + m * 32 + (is_up ? 0 : 16);
+        int* const plock = (pair_locks != nullptr ? pair_locks : (locks + 24)) + m;
+        if (threadIdx.x < 16) {
+          const int4 v = sh_red[threadIdx.x];
+          asm volatile("st.global.wb.v4.b32 [%0], {%1, %2, %3, %4};\n"
+                       :
+                       : "l"(my_slot + threadIdx.x), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                       : "memory");
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          int old = 0;
+          asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;\n"
+                       : "=r"(old)
+                       : "l"(plock)
+                       : "memory");
+          if (old == 1) {
+            asm volatile("st.global.wb.b32 [%0], 0;\n" ::"l"(plock) : "memory");
+          }
+          sh_red[16].x = old;
+        }
+        __syncthreads();
+        if (sh_red[16].x == 1 && threadIdx.x < 64) {
+          const uint32_t own_w = reinterpret_cast<const uint32_t*>(sh_red)[threadIdx.x];
+          uint32_t oth_w;
+          asm volatile("ld.global.ca.b32 %0, [%1];\n"
+                       : "=r"(oth_w)
+                       : "l"(reinterpret_cast<const uint32_t*>(other_slot) + threadIdx.x));
+          const uint32_t gw = is_up ? oth_w : own_w;
+          const uint32_t uw = is_up ? own_w : oth_w;
+          const float g0 = __uint_as_float(gw << 16);
+          const float g1 = __uint_as_float(gw & 0xffff0000u);
+          const float u0 = __uint_as_float(uw << 16);
+          const float u1 = __uint_as_float(uw & 0xffff0000u);
+          if constexpr (gate_up_swiglu_fp8) {
+            reinterpret_cast<uint16_t*>(fp8_out_ptr + 16896 + m * 128)[threadIdx.x] =
+                marlin_pack_fp8x2(
+                    __fmul_rn(__fmul_rn(marlin_swiglu_silu(g0), u0), inv_fp8_scale),
+                    __fmul_rn(__fmul_rn(marlin_swiglu_silu(g1), u1), inv_fp8_scale));
+          } else {
+            __nv_bfloat162 r = __floats2bfloat162_rn(
+                __fmul_rn(marlin_swiglu_silu(g0), u0),
+                __fmul_rn(marlin_swiglu_silu(g1), u1));
+            reinterpret_cast<uint32_t*>(C0 + 2112 + m * 16)[threadIdx.x] =
+                *reinterpret_cast<uint32_t*>(&r);
+          }
+        }
+      }
+    } else {
+  #pragma unroll
+      for (int i = 0;
+           i < div_ceil(16 * thread_m_blocks, threads / (2 * thread_n_blocks));
+           i++) {
+        if (c_gl_wr < c_gl_wr_end) {
+          if (use_atomic_add && slice_count > 1) {
+            c_scalar_t2* C_half2 = reinterpret_cast<c_scalar_t2*>(&C[c_gl_wr]);
+            c_scalar_t2* sh_red_half2 =
+                reinterpret_cast<c_scalar_t2*>(&sh_red[c_sh_rd]);
+  #pragma unroll
+            for (int a = 0; a < 4; a++) {
+              atomicAdd(&C_half2[a], sh_red_half2[a]);
+            }
+          } else {
+            C[c_gl_wr] = sh_red[c_sh_rd];
+          }
+          c_gl_wr += c_gl_wr_delta;
+          c_sh_rd += c_sh_rd_delta;
+        }
       }
     }
     __syncthreads();
@@ -2184,15 +2645,29 @@ __global__ void Marlin(
     }
 
     zero_accums();
+#ifdef MUSE_SCALE_TMA4
+    if constexpr (tma_ovlp) {
+      if (!tma_started) {
+        tma_started = true;
+        __syncthreads();
+        tma_wait(0, 0);
+        tma_x = sh_states[threadIdx.x];
+        if (tma_iters > 0) tma_decode(0);
+        if (tma_iters > 1) tma_decode(1);
+      }
+    }
+#endif
     wait_for_stage();
 #ifdef MUSE_SCALE_TMA4
-    if (!tma_started) {
-      tma_started = true;
-      tma_wait(0, 0);
-      tma_x = sh_states[threadIdx.x];
-      if (tma_iters > 0) tma_decode(0);
-      if (tma_iters > 1) tma_decode(1);
-      __syncthreads();
+    if constexpr (!tma_ovlp) {
+      if (!tma_started) {
+        tma_started = true;
+        tma_wait(0, 0);
+        tma_x = sh_states[threadIdx.x];
+        if (tma_iters > 0) tma_decode(0);
+        if (tma_iters > 1) tma_decode(1);
+        __syncthreads();
+      }
     }
 #endif
 #ifdef MUSE_SCALE_RANS
@@ -2264,7 +2739,7 @@ __global__ void Marlin(
         total_rem--;
         slice_iters--;
         if (slice_iters == 0) {
-          pipe_start = (p + 1) & (stages - 1);
+          pipe_start = (p + 1 == stages) ? 0 : (p + 1);
           break;
         }
       }
@@ -2496,15 +2971,16 @@ __global__ void Marlin(
         }
       }
 
+      const int eff_lock = half_split ? (2 * locks_off + half_id) : locks_off;
       if (slice_count > 1 && !use_atomic_add) {
         // only globally reduce if there is more than one block in a slice
-        barrier_acquire(&locks[locks_off], slice_idx);
+        barrier_acquire(&locks[eff_lock], slice_idx);
         if (use_fp32_reduce) {
           global_reduce_fp32(slice_idx == 0, last);
         } else {
           global_reduce_fp16(slice_idx == 0, last);
         }
-        barrier_release(&locks[locks_off], last);
+        barrier_release(&locks[eff_lock], last);
       }
 
       if (has_bias && last) {
@@ -2517,17 +2993,47 @@ __global__ void Marlin(
       }
 
       if (use_atomic_add && slice_count > 1 && slice_idx != 0)
-        wait_negative_and_add(&locks[locks_off]);
-      if (last || use_atomic_add)
-        // only the last block in a slice actually writes the result
-        write_result(last);
+        wait_negative_and_add(&locks[eff_lock]);
+      if constexpr (fuse_lmpost) {
+        if (last && threadIdx.x < 32 && (threadIdx.x & 3) == 0) {
+          const int base_col = slice_col * (thread_n_blocks * 16);
+          const int g = threadIdx.x >> 2;
+  #pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const int col0 = base_col + 16 * j + g;
+            const int col2 = col0 + 8;
+            if (col0 < org_vocab_size) {
+              const __nv_bfloat16 b0 = Cdtype::float2num(frag_c[0][j][0][0] * global_scale_f32);
+              const uint16_t m0 = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&b0));
+              const float v0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m0));
+              if ((v0 > lm_bv) || (v0 == lm_bv && col0 < lm_bi)) {
+                lm_bv = v0;
+                lm_bi = col0;
+              }
+            }
+            if (col2 < org_vocab_size) {
+              const __nv_bfloat16 b2 = Cdtype::float2num(frag_c[0][j][0][2] * global_scale_f32);
+              const uint16_t m2 = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&b2));
+              const float v2 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m2));
+              if ((v2 > lm_bv) || (v2 == lm_bv && col2 < lm_bi)) {
+                lm_bv = v2;
+                lm_bi = col2;
+              }
+            }
+          }
+        }
+      } else {
+        if (last || use_atomic_add)
+          // only the last block in a slice actually writes the result
+          write_result(last);
+      }
       if constexpr (gate_up_grid) return;
       slice_row = 0;
       if (!in_part2) {
-        slice_col_par += gridDim.x;
+        slice_col_par += ((split2 || half_split) ? vgrid : gridDim.x);
       } else {
         slice_col_par++;
-        slice_col++;
+        slice_col += (half_split ? 2 : 1);
       }
       is_first_matmul_in_slice = true;
       init_slice();
@@ -2540,6 +3046,18 @@ __global__ void Marlin(
           slice_row = 0;
           slice_col_par = vblk;
           locks_off = (iters * vblk) / k_tiles - 1;
+          init_slice();
+        }
+      }
+      if constexpr (half_split) {
+        if (slice_iters == 0 && static_cast<int>(gridDim.x) == 48 && half_id == 0) {
+          __syncthreads();
+          half_id = 1;
+          in_part2 = false;
+          first_init = true;
+          slice_row = 0;
+          slice_col_par = vblk;
+          locks_off = (part2_mn_tiles >= vgrid) ? vblk : ((iters * vblk) / k_tiles - 1);
           init_slice();
         }
       }
@@ -2590,6 +3108,82 @@ __global__ void Marlin(
             }
           }
           start_pipes();
+        }
+      }
+    }
+  }
+  if constexpr (fuse_lmpost) {
+    __syncthreads();
+    float* const sh_bv = reinterpret_cast<float*>(sh);
+    int* const sh_bi = reinterpret_cast<int*>(sh_bv + 128);
+    int* const sh_last = sh_bi + 128;
+
+    if (threadIdx.x < 32) {
+      if ((threadIdx.x & 3) != 0) {
+        lm_bv = -__int_as_float(0x7f800000);
+        lm_bi = 0x7fffffff;
+      }
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, lm_bv, off);
+        const int oi = __shfl_xor_sync(0xffffffffu, lm_bi, off);
+        if ((ov > lm_bv) || (ov == lm_bv && oi < lm_bi)) {
+          lm_bv = ov;
+          lm_bi = oi;
+        }
+      }
+    }
+
+    float* const g_bv = reinterpret_cast<float*>(C0);
+    int* const g_bi = reinterpret_cast<int*>(g_bv + 128);
+    int* const g_done = g_bi + 128;
+
+    if (threadIdx.x == 0) {
+      g_bv[blockIdx.x] = lm_bv;
+      g_bi[blockIdx.x] = lm_bi;
+      __threadfence();
+      *sh_last = (atomicAdd(g_done, 1) == static_cast<int>(gridDim.x) - 1) ? 1 : 0;
+    }
+    __syncthreads();
+
+    if (*sh_last) {
+      float fv = (static_cast<int>(threadIdx.x) < static_cast<int>(gridDim.x))
+                     ? const_cast<const volatile float*>(g_bv)[threadIdx.x]
+                     : -__int_as_float(0x7f800000);
+      int fi = (static_cast<int>(threadIdx.x) < static_cast<int>(gridDim.x))
+                   ? const_cast<const volatile int*>(g_bi)[threadIdx.x]
+                   : 0x7fffffff;
+#pragma unroll
+      for (int off = 16; off >= 1; off >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, fv, off);
+        const int oi = __shfl_down_sync(0xffffffffu, fi, off);
+        if ((ov > fv) || (ov == fv && oi < fi)) {
+          fv = ov;
+          fi = oi;
+        }
+      }
+      const int warp = threadIdx.x >> 5;
+      const int lane = threadIdx.x & 31;
+      if (lane == 0) {
+        sh_bv[warp] = fv;
+        sh_bi[warp] = fi;
+      }
+      __syncthreads();
+      if (warp == 0) {
+        fv = (lane < (threads >> 5)) ? sh_bv[lane] : -__int_as_float(0x7f800000);
+        fi = (lane < (threads >> 5)) ? sh_bi[lane] : 0x7fffffff;
+#pragma unroll
+        for (int off = 2; off >= 1; off >>= 1) {
+          const float ov = __shfl_down_sync(0xffffffffu, fv, off);
+          const int oi = __shfl_down_sync(0xffffffffu, fi, off);
+          if ((ov > fv) || (ov == fv && oi < fi)) {
+            fv = ov;
+            fi = oi;
+          }
+        }
+        if (lane == 0) {
+          *g_done = 0;
+          *lmpost_out = static_cast<int64_t>(fi);
         }
       }
     }

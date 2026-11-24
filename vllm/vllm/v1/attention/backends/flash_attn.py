@@ -947,6 +947,8 @@ class FlashAttentionImpl(AttentionImpl):
                 cu_seqlens_q=attn_metadata.query_start_loc,
                 softmax_scale=self.scale,
                 window=window,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                max_num_splits=attn_metadata.max_num_splits,
             ):
                 return output
 
@@ -1093,7 +1095,8 @@ class FlashAttentionImpl(AttentionImpl):
                     muse_final_slab is not None
                     and mm_mask_mod is None
                     and rswa_mask_mod_fn is None
-                    and q_descale is None
+                    and query.dtype in (torch.float16, torch.bfloat16)
+                    and not is_quantized_kv_cache(self.kv_cache_dtype)
                 ):
                     tail = muse_final_slab.flash_tail_if_active(
                         layer,
@@ -1112,6 +1115,28 @@ class FlashAttentionImpl(AttentionImpl):
                         out_arg = output[num_actual_tokens - tail_rows : num_actual_tokens]
                         cu_seqlens_q = tail_cu_q
                         max_seqlen_q = tail_rows
+
+                if (
+                    self._gqa16_decode_eligible
+                    and max_seqlen_q >= 64
+                    and causal is True
+                    and dynamic_causal is None
+                    and mm_mask_mod is None
+                    and rswa_mask_mod_fn is None
+                    and q_arg.shape[0] == max_seqlen_q
+                    and muse_gqa16_attn.try_prefill_gqa16(
+                        layer=layer,
+                        query=q_arg,
+                        kv_cache=kv_cache,
+                        output=out_arg,
+                        seqused_k=seqused_k,
+                        block_table=block_table,
+                        cu_seqlens_q=cu_seqlens_q,
+                        softmax_scale=self.scale,
+                        window=window,
+                    )
+                ):
+                    return output
 
                 flash_attn_varlen_func(
                     q=q_arg,
@@ -1178,6 +1203,10 @@ class FlashAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
+        if getattr(layer, "_qk_kv_cache_written", False):
+            layer._qk_kv_cache_written = False
+            if key.shape[0] == 1:
+                return
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
