@@ -46,7 +46,10 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if hasattr(target_model, "get_language_model")
         else target_model
     )
-    target_inner = target_language_model.model
+    # A target whose get_language_model() is already the decoder (Muse Glimmer
+    # marks its MuseGlimmerModel, which has embed_tokens but no .model) shares
+    # from that module itself.
+    target_inner = getattr(target_language_model, "model", target_language_model)
     draft_inner = dflash_model.model
 
     # Skip embedding sharing under PP — each rank owns its own embedding.

@@ -102,12 +102,15 @@ verifies it.
 ./tools/local-baseline.sh
 ```
 
-This command boots a serial resident and runs benchd's local-iterate leg over
-the public golden `correctness_prompts/public-longcopy-gate-english-512.golden.json`.
+With no explicit golden, this command boots a serial resident and runs benchd's
+local-iterate leg over the public golden
+`correctness_prompts/public-longcopy-gate-english-512.golden.json`.
 The organizer recorded that golden on a Spark with `tools/record-goldens.sh`,
 and this tree ships it. `tools/local-baseline.sh` checks its sha256 and byte
-count before any run work. The track is serial only, so one golden covers
-every local run. A local run seals
+count before any run work. When the tree declares the drafter on (as main does
+once the organizer's first entry is promoted), a free local run measures serial
+unless you set `MLXFAST_CORRECTNESS_GOLDEN_PATH` to a golden for the declared
+depth; a caller-set `SPEC_DECLARATION_MANIFEST` is not overridden. A local run seals
 `score: null`: only the paired ranked path produces a score.
 
 ```bash
@@ -143,9 +146,9 @@ tools/three-flows-dry-run.sh
 
 This command runs the real benchd binaries (the pinned `main` channel) over the
 same fake resident. It covers golden authoring, a local serial leg and the
-paired lifecycle. An MTP leg is a positive case only when the fixture's
-`allowed_modes` names mtp; on this serial-only track the script checks that an
-MTP declaration is refused. Its `B4` check (the sealed vllm-resident identity)
+paired lifecycle. A speculative leg is a positive case only when the
+fixture's `allowed_modes` names a decoder and pins a drafter; on this track it
+names `dflash`. Its `B4` check (the sealed vllm-resident identity)
 fails against the pinned benchd, which seals `engine-text-withheld` in that
 field.
 
@@ -157,7 +160,7 @@ field.
 | `harness/protocol-adapter/` | editable | Engine Protocol v1 adapter (Rust) |
 | `harness/vllm_resident/` | editable | the resident: `resident.py` (wire, bookkeeping), `backends.py` (vLLM + fake) |
 | `harness/kernels/` | editable, optional | custom CUDA/C++ kernels built by `harness/kernels/build.sh` |
-| `mtp-head.manifest.json` | editable | the speculation declaration; on this serial-only track it must stay `"source": "none"` |
+| `mtp-head.manifest.json` | editable | the speculation declaration: switch the pinned DFlash drafter on and pick a depth (1..6); it cannot name weights of its own |
 | `fixtures/muse_glimmer_30b_cuda_v1_track.json` | trusted | the track contract: pins, engine configuration, serve depths, scoring semantics |
 | `benchmark.json` | trusted | editable paths, commands, byte budget, scoring constants |
 | `setup.sh`, `benchmark.sh`, `tools/` | trusted | build, serve, preflight, measure, calibrate, stage, organizer tools |
@@ -245,7 +248,7 @@ run blocks the upload. Run `yukon run` yourself before you submit.
 | Artifact | Pin |
 |---|---|
 | Target | `nvidia/Muse-Glimmer-30B-NVFP4` @ `47818374517751c48c55cde2621594926b1888b6`, 14 files by bytes + sha256 (24.7 GB) |
-| Speculation | none: the checkpoint ships no draft tensors and the fixture's `allowed_modes` is `[serial]` |
+| Speculation | the pinned DFlash drafter `meta-models/Muse-Glimmer-30B-assistant` @ `c676cce91658f9568aaf264a416211e2782735b7` (2 files by bytes + sha256, mounted read-only); `allowed_modes` `[serial, mtp]` (wire modes; decoder `dflash`), depths 1..6; no own weights, no network |
 | Engine source | vLLM `v0.27.1` @ `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` |
 | Engine image | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` (arm64) |
 | benchd | `Layr-Labs/benchd` dist `8ce0ca7821e9c882f2ff1e1cbd1e2ce561040729`, built from source `3101418f95eb074cc9c100f8dc61cc85cc924155` (`PINNED_COMMIT` and `PINNED_SOURCE_COMMIT` in `tools/fetch-benchd.sh`); the dist's `dist/linux-aarch64/benchd.manifest.json` pins each binary's sha256 and bytes |

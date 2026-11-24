@@ -15,9 +15,12 @@ this tree was cloned from.
   (`docker.io/vllm/vllm-openai:v0.27.1`, arm64 digest
   `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c`).
   `vllm/VENDOR.json` records the base and every local patch.
-- **Track.** `muse-glimmer-30b-cuda-v1`, SERIAL ONLY: `allowed_modes` is
-  `[serial]`, the fixture declares one serve depth (`serial`), and the
-  checkpoint ships no MTP or draft tensors.
+- **Track.** `muse-glimmer-30b-cuda-v1`, drafter track (runner label
+  `muse-glimmer-30b-cuda-drafter-v1`): `allowed_modes` is `[serial, mtp]` (benchd's wire modes: a speculative leg is mode `mtp` at depth N; the pinned DFlash drafter serves it, fixture `mtp_head.decoder` `dflash`),
+  the fixture declares `serial` and `mtp1`..`mtp6`, and the checkpoint ships no
+  MTP or draft tensors; the pinned DFlash drafter is
+  `meta-models/Muse-Glimmer-30B-assistant` @ `c676cce91658f9568aaf264a416211e2782735b7`
+  (fixture `mtp_head`).
 - **Box class.** NVIDIA DGX Spark (GB10, `sm_121`, aarch64), driver floor
   `580.159.03`.
 

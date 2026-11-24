@@ -11,8 +11,8 @@ Every point links to the document that has the detail.
   computes: the timed window must match the serial tape token for token.
 - **Track.** `muse-glimmer-30b-cuda-v1`, on a pool of DGX Spark ranked boxes.
 - **What a team may edit.** Only `vllm/`, `harness/` and
-  `mtp-head.manifest.json` (a declaration that must stay `none`: the track is
-  serial only). Everything else is trusted and is replaced by the organizer's
+  `mtp-head.manifest.json` (a declaration that may switch the pinned DFlash
+  drafter on and pick a depth 1..6; it cannot bring weights of its own). Everything else is trusted and is replaced by the organizer's
   copy.
 - **What a team may not change.** The numerical formats
   ([contract §3.4](docs/participant-contract.md)).

@@ -23,9 +23,11 @@
 #   4. a caller pre-sets a DIFFERENT MLXFAST_QWEN_MTP_TRACK_ID: refused, never
 #      overridden, benchd never spawned.
 #   5. a caller pre-sets the SAME value: accepted.
-#   6. an mtp1 declaration: the argv carries --mtp-depth 1.
-#   7. an mtp1 declaration against a benchd whose help does not list
-#      --mtp-depth: refused, and benchd is never spawned for the run.
+#   6. an mtp1 declaration (the pinned drafter at depth 1): the argv carries
+#      --mtp-depth 1; a depth outside permitted_draft_depths is refused and
+#      benchd is never spawned.
+#   7. a "pinned" declaration with a revision other than the contract's:
+#      refused, and benchd is never spawned for the run.
 #   8. the run is dispatched THROUGH tools/serve-up.sh, so a missing target
 #      snapshot refuses in serve-up's own words and benchd is never spawned.
 #
@@ -79,9 +81,20 @@ chmod 755 "${STUB}"
 
 # The declaration the facade derives the spec from. spec-declaration.sh reads
 # SPEC_DECLARATION_MANIFEST, so a case can declare mtp1 without touching the
-# repository's own mtp-head.manifest.json.
+# repository's own mtp-head.manifest.json. Every case runs SERIAL unless it
+# names another declaration: the shipped file is the base's, which may switch
+# the drafter on (tools/testlib/serial-declaration.jq).
+SERIAL_MANIFEST="${WORK}/serial.manifest.json"
+jq -f "${REPO_ROOT}/tools/testlib/serial-declaration.jq" "${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" > "${SERIAL_MANIFEST}"
 MTP1_MANIFEST="${WORK}/mtp1.manifest.json"
 echo '{"spec":{"enabled":true,"num_speculative_tokens":1}}' > "${MTP1_MANIFEST}"
+MTP7_MANIFEST="${WORK}/mtp7.manifest.json"
+echo '{"spec":{"enabled":true,"num_speculative_tokens":7}}' > "${MTP7_MANIFEST}"
+# The pinned drafter a speculative leg mounts, outside the checkout as on a box.
+DRAFTER="${WORK}/drafter"
+mkdir -p "${DRAFTER}"
+while IFS= read -r f; do printf '{}' > "${DRAFTER}/${f}"; done \
+  < <(jq -r '.mtp_head.files[].path' "${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json")
 
 GOLDEN="${WORK}/golden.json"
 echo '{}' > "${GOLDEN}"
@@ -102,6 +115,7 @@ run_facade() {
     MLXFAST_CORRECTNESS_GOLDEN_PATH="${GOLDEN}" \
     MLXFAST_SCORE_PATH="${WORK}/${case_name}.score.json" \
     MLXFAST_INTEGRITY_PATH="${WORK}/${case_name}.integrity.json" \
+    SPEC_DECLARATION_MANIFEST="${SERIAL_MANIFEST}" \
     "${EXTRA_ENV[@]}" \
     "${facade}" "$@" > "${WORK}/${case_name}.out" 2>&1
   rc=$?
@@ -183,32 +197,41 @@ if [[ ! -f "${WORK}/case5.env" ]] || [[ "$(cat "${WORK}/case5.env")" != "${EXPEC
   fail "case 5: benchd did not see the expected track id"
 fi
 
-# Case 6: an armed declaration never reaches benchd. This track is serial
-# only (permitted_draft_depths is empty), so the facade's own spec derivation
-# refuses the depth by name and no leg is measured under it.
-EXTRA_ENV=(MLXFAST_NO_SANDBOX=1 "SPEC_DECLARATION_MANIFEST=${MTP1_MANIFEST}")
+# Case 6: an armed declaration at a permitted depth reaches benchd as
+# --mtp-depth N, and the window's resident boots the pinned drafter. A depth
+# outside permitted_draft_depths never reaches benchd: the facade's own spec
+# derivation refuses it by name.
+EXTRA_ENV=(MLXFAST_NO_SANDBOX=1 "SPEC_DECLARATION_MANIFEST=${MTP1_MANIFEST}" "SERVE_UP_DRAFTER_DIR=${DRAFTER}")
 run_facade case6 "${FACADE}" --local-iterate
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 6: facade refused a permitted mtp1 declaration; output: $(cat "${WORK}/case6.out")"
+fi
+if [[ ! -f "${WORK}/case6.argv" ]] || ! grep -A1 -x -- '--mtp-depth' "${WORK}/case6.argv" | grep -qx 1; then
+  fail "case 6: the argv does not carry --mtp-depth 1: $(tr '\n' ' ' < "${WORK}/case6.argv" 2>/dev/null)"
+fi
+EXTRA_ENV=(MLXFAST_NO_SANDBOX=1 "SPEC_DECLARATION_MANIFEST=${MTP7_MANIFEST}" "SERVE_UP_DRAFTER_DIR=${DRAFTER}")
+run_facade case6b "${FACADE}" --local-iterate
 if [[ "${rc}" -eq 0 ]]; then
-  fail "case 6: facade ran an armed declaration on a serial-only track"
+  fail "case 6b: facade ran a depth outside permitted_draft_depths"
 fi
-if ! grep -q 'not a contract-permitted draft depth' "${WORK}/case6.out"; then
-  fail "case 6: refusal does not name the draft depth; got: $(cat "${WORK}/case6.out")"
+if ! grep -q 'not a contract-permitted draft depth' "${WORK}/case6b.out"; then
+  fail "case 6b: refusal does not name the draft depth; got: $(cat "${WORK}/case6b.out")"
 fi
-if [[ -f "${WORK}/case6.argv" ]]; then
-  fail "case 6: benchd was spawned under an armed declaration"
+if [[ -f "${WORK}/case6b.argv" ]]; then
+  fail "case 6b: benchd was spawned under an unpermitted depth"
 fi
 
-# Case 7: the declaration's SOURCE is the contract's own. This checkpoint ships
-# no head, so `pinned` is refused the same way an armed depth is.
+# Case 7: the declaration's pin is the contract's own. A "pinned" source with
+# any other revision is refused before any leg.
 PINNED_MANIFEST="${WORK}/pinned.manifest.json"
-echo '{"version":1,"source":"pinned","spec":{"enabled":false,"num_speculative_tokens":0}}' > "${PINNED_MANIFEST}"
+jq -c '.upstream_revision = "c676cce9"' "${SERIAL_MANIFEST}" > "${PINNED_MANIFEST}"
 EXTRA_ENV=(MLXFAST_NO_SANDBOX=1 "SPEC_DECLARATION_MANIFEST=${PINNED_MANIFEST}")
 run_facade case7 "${FACADE}" --local-iterate
 if [[ "${rc}" -eq 0 ]]; then
-  fail "case 7: facade ran a \"pinned\" declaration on a track whose contract source is \"none\""
+  fail "case 7: facade ran a \"pinned\" declaration with a revision other than the contract's"
 fi
-if ! grep -q 'is not accepted' "${WORK}/case7.out"; then
-  fail "case 7: refusal does not name the source; got: $(cat "${WORK}/case7.out")"
+if ! grep -q 'accepts no other' "${WORK}/case7.out"; then
+  fail "case 7: refusal does not name the pin; got: $(cat "${WORK}/case7.out")"
 fi
 if [[ -f "${WORK}/case7.argv" ]]; then
   fail "case 7: benchd was spawned under a refused declaration"

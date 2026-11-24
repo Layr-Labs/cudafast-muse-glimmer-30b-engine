@@ -71,7 +71,8 @@ def default_repo() -> str:
     return subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
                           cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
 FIXTURE_REL = "fixtures/muse_glimmer_30b_cuda_v1_track.json"
-TRACK_LABEL = "muse-glimmer-30b-cuda-v1"
+# The runner label of the drafter track (.github/workflows/benchmark.yml runs-on).
+RUNNER_LABEL = "muse-glimmer-30b-cuda-drafter-v1"
 WATCHDOG_SECONDS = 90 * 60
 POLL_SECONDS = 60
 
@@ -263,7 +264,7 @@ class Router:
     def online_runners(self) -> int:
         data = self.gh_json(["api", f"repos/{self.repo}/actions/runners?per_page=100"])
         return sum(1 for r in data.get("runners", [])
-                   if r.get("status") == "online" and any(l.get("name") == TRACK_LABEL for l in r.get("labels", [])))
+                   if r.get("status") == "online" and any(l.get("name") == RUNNER_LABEL for l in r.get("labels", [])))
 
     def find_run(self, branch: str, polls: int):
         for _ in range(polls):  # the run appears a few seconds after the dispatch

@@ -8,8 +8,15 @@ it pinned three draft depths while permitting six. This check is the tripwire
 for that class of drift. It reads the values from benchmark.json and the track
 fixture and requires every participant-facing document to state them.
 
-This track is SERIAL ONLY, so the check pins the serial shape: one serve depth,
-no speculative arm, one 512-token seed, every live golden measured. It also
+This track pins ONE DFlash drafter, so the check pins that shape: the
+contract's mtp_head is source "pinned" with a repository, a full revision and
+every file by bytes and sha256; allowed_modes is the wire modes serial and mtp
+(mtp_head.decoder names the decoder that serves an mtp leg); serve_configuration.depths is serial plus one mtpN per permitted
+depth; the shipped declaration restates the pin exactly, either with
+speculation off or switched on at a permitted depth whose timed oracle every
+live golden pins (the drafter track's base ships depth 4);
+and the participant documents name the drafter, its revision and the permitted
+depths. One 512-token seed, every live golden measured. It also
 refuses another track's vocabulary anywhere outside the vendor tree.
 A calibration CV limit quoted next to its field name anywhere outside the
 vendor tree must equal the fixture's calibration_max_cv_percent. CI runs every
@@ -64,33 +71,78 @@ def main() -> int:
             need(n in (str(len(editable)), words.get(len(editable), "")),
                  f"{name}: says '{m.group(0)}' but editablePaths has {len(editable)}")
 
-    # 2. The serial envelope. One serve depth, no speculative arm anywhere.
-    need(sorted(fixture["allowed_modes"]) == ["serial"],
-         f"fixture: allowed_modes is {fixture['allowed_modes']}, expected ['serial']")
-    serve_depths = sorted(fixture["serve_configuration"]["depths"])
-    need(serve_depths == ["serial"],
-         f"fixture: serve_configuration.depths {serve_depths} must be exactly ['serial']")
-    need(fixture["mtp_head"].get("permitted_draft_depths") == [],
-         "fixture: mtp_head.permitted_draft_depths must be empty (serial only)")
-    need(not fixture.get("speculative_oracles"),
-         "fixture: speculative_oracles must be empty (serial only)")
+    # 2. The pinned-drafter envelope. One drafter, pinned by repository, full
+    #    revision and every file; serial plus one serve depth per permitted
+    #    draft depth; the docs say what is allowed and what is not.
+    head = fixture["mtp_head"]
+    decoder = head.get("decoder")
+    depths = head.get("permitted_draft_depths") or []
+    need(head.get("source") == "pinned", f"fixture: mtp_head.source is {head.get('source')!r}, expected 'pinned'")
+    # allowed_modes names benchd's WIRE modes: a speculative CUDA leg is mode mtp
+    # at depth N; the decoder that serves it is mtp_head.decoder.
+    need(sorted(fixture["allowed_modes"]) == ["mtp", "serial"],
+         f"fixture: allowed_modes is {fixture['allowed_modes']}, expected ['serial', 'mtp'] (the wire modes)")
+    need(isinstance(decoder, str) and bool(decoder), "fixture: mtp_head.decoder is missing")
+    need(bool(head.get("upstream_model_id")), "fixture: mtp_head.upstream_model_id is missing")
+    need(re.fullmatch(r"[0-9a-f]{40}", str(head.get("upstream_revision", ""))) is not None,
+         f"fixture: mtp_head.upstream_revision {head.get('upstream_revision')!r} is not a full 40-hex revision")
+    files = head.get("files") or []
+    need(bool(files) and all(
+        isinstance(f, dict) and isinstance(f.get("path"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", str(f.get("sha256", ""))) is not None
+        and isinstance(f.get("bytes"), int) and f["bytes"] > 0 for f in files),
+        "fixture: mtp_head.files must pin every drafter file by path, bytes and a 64-hex sha256")
+    need(bool(depths) and all(isinstance(d, int) and 1 <= d <= 8 for d in depths),
+         f"fixture: mtp_head.permitted_draft_depths {depths} must be a non-empty list of depths 1..8")
+    serve_depths = list(fixture["serve_configuration"]["depths"])
+    want_depths = ["serial"] + [f"mtp{d}" for d in depths]
+    need(serve_depths == want_depths,
+         f"fixture: serve_configuration.depths {serve_depths} must be exactly {want_depths}")
+    for d in depths:
+        entry = fixture["serve_configuration"]["depths"].get(f"mtp{d}", {})
+        need(entry.get("method") == decoder and entry.get("num_speculative_tokens") == d,
+             f"fixture: serve_configuration.depths.mtp{d} must run method {decoder!r} at {d} tokens")
+    depth_text = "[" + ", ".join(str(d) for d in depths) + "]"
     for name in ("TASK.md", "docs/participant-contract.md"):
-        need("serial only" in docs[name] or "SERIAL ONLY" in docs[name],
-             f"{name}: does not say the track is serial only")
+        text = docs[name]
+        need(str(head.get("upstream_model_id")) in text and str(head.get("upstream_revision")) in text,
+             f"{name}: does not name the pinned drafter {head.get('upstream_model_id')} @ {head.get('upstream_revision')}")
+        need(depth_text in text, f"{name}: does not state the permitted draft depths {depth_text}")
+        need("own drafter" in text, f"{name}: does not say a submission may not bring its own drafter")
+        need("network" in text, f"{name}: does not say the resident has no network")
 
-    # 2b. The declaration matches the contract's own source, disabled. The file
-    # is an OPTIONAL editable path: the scoring reader (tools/spec-declaration.sh)
-    # reads an absent file, an absent source and an absent spec block as the
-    # defaults (serial), so this check does too.
+    # 2b. The shipped declaration restates the contract's pin exactly. Its spec
+    # is either off (serial) or on at a permitted depth whose timed oracle
+    # every live golden pins (the drafter track's base ships mtp4); any other
+    # spec (unknown depth, unpinned oracle, another decoder) fails.
+    # The file is an OPTIONAL editable path: the scoring reader
+    # (tools/spec-declaration.sh) reads an absent file, an absent source and an
+    # absent spec block as the defaults (serial), so this check does too.
     decl_path = ROOT / "mtp-head.manifest.json"
     decl = json.loads(decl_path.read_text()) if decl_path.is_file() else {}
     if "source" in decl:
-        need(decl["source"] == fixture["mtp_head"].get("source"),
+        need(decl["source"] == head.get("source"),
              f"mtp-head.manifest.json: source {decl['source']!r} disagrees with the fixture's "
-             f"mtp_head.source {fixture['mtp_head'].get('source')!r}")
+             f"mtp_head.source {head.get('source')!r}")
+        need(decl.get("upstream_model_id") == head.get("upstream_model_id")
+             and decl.get("upstream_revision") == head.get("upstream_revision")
+             and decl.get("sha256") == {f.get("path"): f.get("sha256") for f in files},
+             "mtp-head.manifest.json: the pin (upstream_model_id, upstream_revision, sha256) is not the fixture's mtp_head")
     spec = decl.get("spec") or {}
-    need(spec.get("enabled", False) is False and int(spec.get("num_speculative_tokens", 0)) == 0,
-         "mtp-head.manifest.json: the declaration must be disabled (serial only)")
+    enabled, n = spec.get("enabled", False), spec.get("num_speculative_tokens", 0)
+    need(spec.get("decoder", decoder) == decoder,
+         f"mtp-head.manifest.json: spec.decoder {spec.get('decoder')!r} is not the fixture's mtp_head.decoder {decoder!r}")
+    if not (enabled is False and n == 0):
+        need(enabled is True and isinstance(n, int) and not isinstance(n, bool) and n in depths,
+             f"mtp-head.manifest.json: the shipped declaration must be disabled, or enabled at a "
+             f"permitted draft depth {depth_text} (got enabled {enabled!r}, num_speculative_tokens {n!r})")
+        for name in fixture.get("live_goldens") or []:
+            pin = (fixture.get("speculative_oracles") or {}).get(name, {}).get(f"mtp{n}") or {}
+            need(str(pin.get("r2_path", "")).endswith(f"/{name}.mtp{n}.golden.json")
+                 and re.fullmatch(r"[0-9a-f]{64}", str(pin.get("sha256", ""))) is not None
+                 and isinstance(pin.get("bytes"), int) and pin["bytes"] > 0,
+                 f"mtp-head.manifest.json: the shipped declaration enables mtp{n}, but the fixture pins no "
+                 f"speculative_oracles.{name}.mtp{n} (r2_path, sha256, bytes)")
 
     # 2c. Every job measures every live golden; the seed length is the fixture's.
     live = fixture.get("live_goldens") or []

@@ -60,9 +60,17 @@ WEIGHTS="${WORK}/weights"
 synthetic_window_weights "${WEIGHTS}" || { echo "cannot write the synthetic window" >&2; exit 1; }
 synthetic_window_meminfo "${WORK}/meminfo"
 LOGDIR="${WORK}/logs"
+# The pinned drafter a dflash leg mounts: every file the fixture pins, by name
+# (setup.sh verifies bytes and sha256; serve-up checks that the directory holds
+# exactly those files). Outside the checkout, as on a box.
+DRAFTER="${WORK}/drafter"
+mkdir -p "${DRAFTER}"
+while IFS= read -r f; do printf '{}' > "${DRAFTER}/${f}"; done \
+  < <(jq -r '.mtp_head.files[].path' "${ROOT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json")
 
 serve() {
   env SERVE_UP_WEIGHTS_DIR="${WEIGHTS}" \
+      SERVE_UP_DRAFTER_DIR="${DRAFTER}" \
       SERVE_UP_LOG_DIR="${LOGDIR}" \
       SERVE_UP_SOCKET_DIR="${SOCKDIR}" \
       SERVE_UP_HEALTH_TIMEOUT_S=60 \
@@ -124,6 +132,10 @@ if [[ -f "${LOGDIR}/serve-identity.json" ]]; then
   [[ "${spec}" == "serial" && "${armed}" == "false" && "${drafts}" == "1" ]] \
     && ok "case 1: --spec serial armed no drafter (spec_config=serial, mtp_armed=false, draft_tokens=1)" \
     || fail "case 1: --spec serial booted spec_config=${spec} mtp_armed=${armed} draft_tokens=${drafts}"
+  # SERVE_UP_DRAFTER_DIR is set for every boot here; a serial leg ignores it.
+  [[ "$(jq -r '.spec_method + " " + .drafter_dir + "|" + .hello.mtp_head_path' "${LOGDIR}/serve-identity.json")" == "none |" ]] \
+    && ok "case 1: the serial leg loads no drafter even with SERVE_UP_DRAFTER_DIR set" \
+    || fail "case 1: the serial leg named a decoder or a drafter: $(jq -c '{spec_method, drafter_dir, p: .hello.mtp_head_path}' "${LOGDIR}/serve-identity.json")"
 else
   fail "case 1: no serve-identity.json was written"
 fi
@@ -182,6 +194,15 @@ if [[ -f "${LOGDIR}/serve-identity.json" ]]; then
   [[ "${spec}" == "mtp2" && "${drafts}" == "3" && "${head}" == "true" ]] \
     && ok "case 4: --spec mtp --draft-len 2 armed the drafter (spec_config=mtp2, draft_tokens=3)" \
     || fail "case 4: booted spec_config=${spec} draft_tokens=${drafts} mtp_armed='${head}'"
+  # The decoder is the declaration's (dflash on this track), and the drafter the
+  # resident loaded is the pinned one at SERVE_UP_DRAFTER_DIR.
+  method="$(jq -r '.spec_method' "${LOGDIR}/serve-identity.json")"
+  ddir="$(jq -r '.drafter_dir' "${LOGDIR}/serve-identity.json")"
+  dpath="$(jq -r '.hello.mtp_head_path' "${LOGDIR}/serve-identity.json")"
+  want_ddir="$(cd "${DRAFTER}" && pwd -P)"
+  [[ "${method}" == "dflash" && "${ddir}" == "${want_ddir}" && "${dpath}" == "${want_ddir}" ]] \
+    && ok "case 4: the speculative leg runs the declared decoder dflash on the pinned drafter (${want_ddir})" \
+    || fail "case 4: spec_method=${method} drafter_dir=${ddir} hello.mtp_head_path=${dpath}, want dflash and ${want_ddir}"
 else
   fail "case 4: no serve-identity.json was written for the mtp boot"
 fi
@@ -208,6 +229,35 @@ refuse "serial with a draft length" "the serial control leg arms no drafter" \
 refuse "mtp with no draft length" "requires --draft-len N with N >= 1" \
   env SERVE_UP_WEIGHTS_DIR="${WEIGHTS}" SERVE_UP_SOCKET_DIR="${SOCKDIR}" \
       "${SERVE_UP}" --boot --spec mtp --socket-out "${WORK}/x.txt"
+# THE PINNED DRAFTER, OR NO DFLASH LEG. A dflash leg with no drafter directory,
+# with one that lacks a pinned file, or with one inside the checkout (where a
+# submission could stand in its own weights) is refused before any load.
+refuse "dflash leg without a drafter dir" "a dflash leg needs the pinned drafter" \
+  serve SERVE_UP_DRAFTER_DIR= MLXFAST_DRAFTER_DIR= \
+      "${SERVE_UP}" --boot --spec mtp --draft-len 2 --socket-out "${WORK}/x.txt"
+mkdir -p "${WORK}/drafter-partial" && printf '{}' > "${WORK}/drafter-partial/config.json"
+refuse "drafter dir missing a pinned file" "the drafter directory has no model.safetensors" \
+  serve SERVE_UP_DRAFTER_DIR="${WORK}/drafter-partial" \
+      "${SERVE_UP}" --boot --spec mtp --draft-len 2 --socket-out "${WORK}/x.txt"
+refuse "drafter dir inside the checkout" "is inside the checkout" \
+  serve SERVE_UP_DRAFTER_DIR="${ROOT_DIR}/harness" \
+      "${SERVE_UP}" --boot --spec mtp --draft-len 2 --socket-out "${WORK}/x.txt"
+# THE EXACT PINNED SET. A drafter directory that holds anything the contract
+# does not pin -- an extra weights file, a nested directory, a symlink in place
+# of a pinned file -- is refused before any load (tools/drafter-dir-check.sh).
+cp -R "${DRAFTER}" "${WORK}/drafter-extra" && printf 'x' > "${WORK}/drafter-extra/own.safetensors"
+refuse "drafter dir with an unlisted weights file" "1 entr(ies) the contract does not pin: own.safetensors" \
+  serve SERVE_UP_DRAFTER_DIR="${WORK}/drafter-extra" \
+      "${SERVE_UP}" --boot --spec mtp --draft-len 2 --socket-out "${WORK}/x.txt"
+cp -R "${DRAFTER}" "${WORK}/drafter-nested" && mkdir -p "${WORK}/drafter-nested/sub" && printf '{}' > "${WORK}/drafter-nested/sub/config.json"
+refuse "drafter dir with an unlisted directory" "the contract does not pin: sub" \
+  serve SERVE_UP_DRAFTER_DIR="${WORK}/drafter-nested" \
+      "${SERVE_UP}" --boot --spec mtp --draft-len 2 --socket-out "${WORK}/x.txt"
+mkdir -p "${WORK}/drafter-link" && cp "${DRAFTER}/model.safetensors" "${WORK}/drafter-link/" \
+  && ln -s "${DRAFTER}/config.json" "${WORK}/drafter-link/config.json"
+refuse "drafter dir with a symlinked pinned file" "the pinned drafter file config.json is a symlink" \
+  serve SERVE_UP_DRAFTER_DIR="${WORK}/drafter-link" \
+      "${SERVE_UP}" --boot --spec mtp --draft-len 2 --socket-out "${WORK}/x.txt"
 refuse "no spec" "--boot requires --spec serial|mtp" \
   env SERVE_UP_WEIGHTS_DIR="${WEIGHTS}" SERVE_UP_SOCKET_DIR="${SOCKDIR}" \
       "${SERVE_UP}" --boot --socket-out "${WORK}/x.txt"
@@ -298,7 +348,8 @@ done
 # staged overlay, so the cases run a copy of the tree.
 TREE="${WORK}/tree"
 mkdir -p "${TREE}/tools" "${TREE}/fixtures" "${TREE}/harness" "${TREE}/.build/vllm-overlay/vllm" "${TREE}/.build/kernels"
-cp "${SERVE_UP}" "${TREE}/tools/"
+cp "${SERVE_UP}" "${ROOT_DIR}/tools/spec-declaration.sh" "${ROOT_DIR}/tools/drafter-dir-check.sh" "${TREE}/tools/"
+cp "${ROOT_DIR}/mtp-head.manifest.json" "${TREE}/"
 cp "${ROOT_DIR}/tools/sandbox-wipe.sh" "${ROOT_DIR}/tools/sandbox-kill.sh" "${ROOT_DIR}/tools/sandbox-clear-dirs.sh" "${ROOT_DIR}/tools/sandbox-access.sh" \
   "${ROOT_DIR}/tools/wait-for-memory.sh" "${TREE}/tools/"
 cp "${ROOT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json" "${TREE}/fixtures/"
@@ -384,7 +435,7 @@ chmod +x "${STUB}/bin/"*
 
 dserve() { # dserve [VAR=VALUE...] ARGS... -- serve-up from the copied tree via the stub docker
   env PATH="${STUB}/bin:${PATH}" SERVE_UP_LAUNCHER=docker \
-      SERVE_UP_WEIGHTS_DIR="${WEIGHTS}" SERVE_UP_LOG_DIR="${WORK}/dlogs" \
+      SERVE_UP_WEIGHTS_DIR="${WEIGHTS}" SERVE_UP_DRAFTER_DIR="${DRAFTER}" SERVE_UP_LOG_DIR="${WORK}/dlogs" \
       SERVE_UP_SOCKET_DIR="${SOCKDIR}" SERVE_UP_HEALTH_TIMEOUT_S=60 \
       SERVE_UP_MEMINFO="${WORK}/meminfo" "$@"
 }
@@ -392,6 +443,7 @@ run_arg_after() { # run_arg_after FLAG -- every value that follows FLAG in the l
   awk -v flag="$1" 'prev == flag { print } { prev = $0 }' "${STUB}/docker-run.argv"
 }
 
+DRAFTER_REAL="$(cd "${DRAFTER}" && pwd -P)"
 # --- case 7: unsandboxed, the docker path is exactly today's -----------------
 dserve "${TREE}/tools/serve-up.sh" --boot --spec serial --draft-len 0 \
   --socket-out "${WORK}/leg7/socket.txt" > "${WORK}/boot7.out" 2>&1 \
@@ -411,6 +463,9 @@ SOCKET7="$(head -1 "${WORK}/leg7/socket.txt" 2>/dev/null)"
   && run_arg_after --mount | grep -qxF "type=bind,src=${WORK}/dlogs,dst=${WORK}/dlogs" \
   && ok "case 7: the writable mounts are the socket dir and the log dir, as today" \
   || fail "case 7: the writable mounts changed: $(run_arg_after --mount | tr '\n' ' ')"
+! run_arg_after --mount | grep -qF "${DRAFTER_REAL}" && ! run_arg_after --env | grep -qE '^RESIDENT_(DRAFT_MODEL_DIR|SPEC_METHOD)=' \
+  && ok "case 7: a serial leg mounts no drafter and names no decoder" \
+  || fail "case 7: a serial leg got a drafter mount or a decoder: $(run_arg_after --mount | tr '\n' ' ')"
 [[ "$(sed -n 3p "${SOCKET7}.pid" 2>/dev/null)" == serve-up-* ]] \
   && ok "case 7: the pid sidecar beside the socket names the container" \
   || fail "case 7: no sidecar with the container name beside the socket"
@@ -453,6 +508,16 @@ run_arg_after --security-opt | grep -qxF no-new-privileges && run_arg_after --ca
 [[ "$(run_arg_after --mount | grep -v ',readonly$')" == "type=bind,src=${LEGDIR8},dst=${LEGDIR8}" ]] \
   && ok "case 8: the per-leg dir is the container's only writable mount" \
   || fail "case 8: the writable mounts are: $(run_arg_after --mount | grep -v ',readonly$' | tr '\n' ' ')"
+# The drafter is mounted as an EXACT staging of the pinned files: one
+# read-only bind per pinned file, and no bind of the directory itself.
+want_dmounts="$(jq -r --arg d "${DRAFTER_REAL}" '.mtp_head.files[].path | "type=bind,src=\($d)/\(.),dst=\($d)/\(.),readonly"' \
+  "${ROOT_DIR}/fixtures/muse_glimmer_30b_cuda_v1_track.json" | LC_ALL=C sort)"
+got_dmounts="$(run_arg_after --mount | grep -F "${DRAFTER_REAL}" | LC_ALL=C sort)"
+[[ -n "${want_dmounts}" && "${got_dmounts}" == "${want_dmounts}" ]] \
+  && run_arg_after --env | grep -qxF "RESIDENT_DRAFT_MODEL_DIR=${DRAFTER_REAL}" \
+  && run_arg_after --env | grep -qxF "RESIDENT_SPEC_METHOD=dflash" \
+  && ok "case 8: the dflash leg mounts each pinned drafter file READ-ONLY (no directory bind) and names the drafter to the resident" \
+  || fail "case 8: drafter mount/env wrong: $(tr '\n' ' ' <<<"${got_dmounts}") (want $(tr '\n' ' ' <<<"${want_dmounts}")) / $(run_arg_after --env | grep -E '^RESIDENT_(DRAFT|SPEC_METHOD)' | tr '\n' ' ')"
 run_arg_after --env | grep -qxF "HOME=${LEGDIR8}/run/home" \
   && run_arg_after --env | grep -qxF "RESIDENT_READY_FILE=" \
   && ok "case 8: HOME is in the per-leg dir and no ready file is asked for" \

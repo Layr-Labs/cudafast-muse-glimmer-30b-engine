@@ -82,6 +82,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 
 # --- per-track scoring-constant registry ------------------------------------
@@ -238,6 +239,7 @@ class Linter:
         self.failures: list[str] = []
         self.unverified: list[str] = []
         self.checks = 0
+        self.contract_path = ""
 
     def fail(self, msg: str) -> None:
         self.failures.append(msg)
@@ -709,6 +711,7 @@ class Linter:
             self.fail(f"contractPath: {rel} does not parse as JSON: {exc}")
             return {}
         self.ok(f"contractPath: {rel} exists and parses ({len(contract)} top-level keys)")
+        self.contract_path = path
 
         if contract.get("track_id") != m.get("trackId"):
             self.fail(
@@ -795,15 +798,60 @@ class Linter:
         )
 
     # -- 5a ----------------------------------------------------------------
+    def declared_oracle_depths(self, label: str) -> list[int] | None:
+        """The draft depths whose per-depth oracle this tree needs.
+
+        ONLY THE DECLARED DEPTH NEEDS AN ORACLE. A ranked job scores the serial
+        control leg and ONE candidate leg, at the depth the tree's declaration
+        (mtp-head.manifest.json) enables. A serial declaration (absent, disabled
+        or depth 0) scores no speculative leg, so it needs no per-depth oracle at
+        all, whatever permitted_draft_depths permits; an enabled depth N needs
+        speculative_oracles.<prompt>.mtp<N> for every prompt a job can measure,
+        and a depth with no pinned oracle is refused fail-closed by name.
+
+        The derivation is tools/spec-declaration.sh, the single trusted source
+        the preflight, the serve script and the workflow also read, run on this
+        tree's declaration against this tree's contract. An invalid declaration
+        is a failure here, not a serial default. Returns None on a failure.
+        """
+        helper = self.abspath(os.path.join("tools", "spec-declaration.sh"))
+        if not os.path.isfile(helper):
+            self.fail(f"{label}: tools/spec-declaration.sh is missing; the declared depth cannot be derived")
+            return None
+        env = dict(os.environ)
+        env["SPEC_DECLARATION_MANIFEST"] = self.abspath("mtp-head.manifest.json")
+        if self.contract_path:
+            env["SPEC_DECLARATION_CONTRACT"] = self.contract_path
+        try:
+            proc = subprocess.run(
+                ["bash", helper, "describe"], env=env, capture_output=True, text=True, timeout=60
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.fail(f"{label}: tools/spec-declaration.sh describe did not run: {exc}")
+            return None
+        desc = proc.stdout.strip()
+        if proc.returncode != 0:
+            why = proc.stderr.strip().splitlines()[-1:] or [f"exit {proc.returncode}"]
+            self.fail(f"{label}: the speculative-decode declaration is invalid: {why[0]}")
+            return None
+        if desc == "serial":
+            return []
+        found = re.fullmatch(r"mtp([1-9][0-9]*)", desc)
+        if not found:
+            self.fail(f"{label}: tools/spec-declaration.sh describe printed {desc!r}, not serial or mtp<N>")
+            return None
+        return [int(found.group(1))]
+
     def check_live_golden_rotation(self, contract: dict) -> None:
         """Every prompt the ranked workflow can draw is fully pinned.
 
         The scored prompt is drawn per job from live_golden_rotation.pool
         (tools/draw-live-golden.sh). A pool name must be a timed_prompt_pool
-        entry (its serial golden) and carry one pinned oracle per permitted
-        draft depth in speculative_oracles.<name>, each at
-        <name>.mtp<d>.golden.json. benchd and the ranked preflight refuse the
-        same gaps; this says so at rest, where they can be fixed.
+        entry (its serial golden) and, when the tree's declaration enables
+        depth d, carry a pinned oracle speculative_oracles.<name>.mtp<d> at
+        <name>.mtp<d>.golden.json (declared_oracle_depths). The ranked
+        preflight refuses the same gaps; this says so at rest, where they can
+        be fixed.
         """
         rotation = contract.get("live_golden_rotation")
         live = contract.get("live_golden")
@@ -836,7 +884,9 @@ class Linter:
                 self.fail(f"rotation: {label} '{name}' names no timed_prompt_pool entry")
         if live not in pool:
             self.fail(f"rotation: live_golden '{live}' (the default) is not in live_golden_rotation.pool")
-        depths = contract.get("mtp_head", {}).get("permitted_draft_depths", [])
+        depths = self.declared_oracle_depths("rotation")
+        if depths is None:
+            return
         oracles = contract.get("speculative_oracles", {})
 
         def pinned(e: object) -> bool:
@@ -863,13 +913,15 @@ class Linter:
                 if not pinned(e) or not str(e.get("r2_path", "")).endswith(f"/{name}.mtp{d}.golden.json"):
                     self.fail(
                         f"rotation: pool prompt '{name}' has no pinned oracle "
-                        f"speculative_oracles.{name}.mtp{d} at {name}.mtp{d}.golden.json"
+                        f"speculative_oracles.{name}.mtp{d} at {name}.mtp{d}.golden.json; "
+                        f"the declaration enables mtp{d}, and a declared depth with no pinned "
+                        "oracle cannot be scored (record it on a box with tools/record-goldens.sh)"
                     )
                     bad += 1
         if not bad:
             self.ok(
                 f"rotation: {len(pool)} pool prompt(s) {pool}, each with a pinned serial golden "
-                f"and {len(depths)} pinned per-depth oracle(s)"
+                f"and {oracle_note(depths)}"
             )
 
     def check_live_goldens(self, contract: dict) -> None:
@@ -878,9 +930,10 @@ class Linter:
         Every ranked job measures every name in live_goldens: pair k measures
         live_goldens[(k - 1) mod N] (tools/muse-glimmer-measure-and-score.sh), so
         official_pairs must be a multiple of N. Each name needs a pinned serial
-        golden in timed_prompt_pool and one pinned oracle per permitted draft
-        depth in speculative_oracles.<name>. A job draws nothing, so the rotation
-        keys must be absent.
+        golden in timed_prompt_pool and, when the tree's declaration enables
+        depth d, a pinned oracle speculative_oracles.<name>.mtp<d>
+        (declared_oracle_depths). A job draws nothing, so the rotation keys
+        must be absent.
         """
         names = contract.get("live_goldens")
         if not isinstance(names, list) or not names or not all(isinstance(n, str) for n in names):
@@ -899,7 +952,9 @@ class Linter:
             for e in contract.get("timed_prompt_pool", [])
             if isinstance(e, dict) and isinstance(e.get("r2_path"), str)
         }
-        depths = contract.get("mtp_head", {}).get("permitted_draft_depths", [])
+        depths = self.declared_oracle_depths("live_goldens")
+        if depths is None:
+            return
         oracles = contract.get("speculative_oracles", {})
 
         def pinned(e: object) -> bool:
@@ -926,13 +981,15 @@ class Linter:
                 if not pinned(e) or not str(e.get("r2_path", "")).endswith(f"/{name}.mtp{d}.golden.json"):
                     self.fail(
                         f"live_goldens: '{name}' has no pinned oracle "
-                        f"speculative_oracles.{name}.mtp{d} at {name}.mtp{d}.golden.json"
+                        f"speculative_oracles.{name}.mtp{d} at {name}.mtp{d}.golden.json; "
+                        f"the declaration enables mtp{d}, and a declared depth with no pinned "
+                        "oracle cannot be scored (record it on a box with tools/record-goldens.sh)"
                     )
                     bad += 1
         if not bad:
             self.ok(
                 f"live_goldens: {len(names)} prompt(s) {names}, each with a pinned serial golden "
-                f"and {len(depths)} pinned per-depth oracle(s); {pairs} pairs"
+                f"and {oracle_note(depths)}; {pairs} pairs"
             )
 
     # -- 5b ----------------------------------------------------------------
@@ -1289,6 +1346,13 @@ class Linter:
             + (f", {len(self.unverified)} unverified" if self.unverified else "")
         )
         return 0
+
+
+def oracle_note(depths: list[int]) -> str:
+    """The ok-line wording for the oracles the declared depth needs."""
+    if not depths:
+        return "no per-depth oracle needed (the declaration is serial)"
+    return "a pinned per-depth oracle for the declared " + ", ".join(f"mtp{d}" for d in depths)
 
 
 def speculative_oracle_paths(contract: dict) -> set[str]:

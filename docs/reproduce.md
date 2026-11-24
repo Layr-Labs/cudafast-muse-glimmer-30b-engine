@@ -60,8 +60,9 @@ whenever the pin moves.
 
 The live pool is `pool-9`, `pool-10` and `pool-11`: three coding prompts in
 the raw-continuation form: the first 512 ids of each text with the pinned
-tokenizer, no chat template and no special ids. This track is serial only,
-so each prompt has ONE serial golden — there are no per-depth oracles. The
+tokenizer, no chat template and no special ids. Each prompt has ONE serial
+golden and, for each permitted draft depth N, one per-depth oracle
+(`speculative_oracles.<prompt>.mtpN`) recorded with the pinned drafter. The
 fixture pins every file by sha256 and bytes: `timed_prompt_pool[]` pins the
 three serial goldens and the hidden correctness pin repeats the default live
 golden's serial tape.

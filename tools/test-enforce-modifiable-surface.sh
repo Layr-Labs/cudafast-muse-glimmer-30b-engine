@@ -14,7 +14,7 @@
 #   6. a hard link inside editablePaths to the box's benchd.pin file fails
 #      (device:inode arm: same inode, other spelling);
 #   7. a base contract with no editablePaths fails closed;
-#   8. an empty diff (a commit on the default branch) passes;
+#   8. an empty diff (a commit on the protected branch) passes;
 #   9. benchmark.yml's surface-check job fetches full history and runs the
 #      gate and its git wrapper as the merge base holds them, before the lint;
 #  10. a protected file RENAMED into editablePaths fails and names the removed

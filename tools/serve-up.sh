@@ -32,8 +32,19 @@
 # WEIGHTS LOAD ONCE PER LEG. benchd spawns one `cuda-engine` per leg for its
 # phases (a second one on the last pair, for the pinned correctness golden);
 # each connects to this resident (harness/vllm_resident/resident.py) and loads
-# nothing. The native MTP layer is part of the same checkpoint, so the
-# speculative leg loads no second file.
+# nothing.
+#
+# THE SPECULATIVE LEG'S DECODER COMES FROM THIS TREE'S DECLARATION. `--spec mtp`
+# is benchd's word for "a speculative leg at --draft-len N"; WHICH decoder runs
+# it is tools/spec-declaration.sh `decoder`, read from this tree. On this track
+# that is "dflash": the contract's pinned DFlash drafter (fixture mtp_head),
+# which the box stages at SERVE_UP_DRAFTER_DIR / MLXFAST_DRAFTER_DIR and
+# setup.sh verifies by bytes and sha256. Its pinned files are mounted
+# READ-ONLY beside the target snapshot, one bind per pinned file, and only into
+# a speculative leg: a serial leg (the control leg always) mounts no drafter. A
+# drafter directory inside the checkout, or holding any entry the contract does
+# not pin (tools/drafter-dir-check.sh), is refused, so a submission can never
+# stand in its own weights.
 #
 # THE RESIDENT RUNS IN THE PINNED CONTAINER (fixture
 # serve_configuration.container_image @ container_digest) with NO NETWORK
@@ -56,6 +67,10 @@
 #                             from mtp-head.manifest.json via tools/spec-declaration.sh.
 #                             Default 0 -- the stock serial launch reference.
 #   SERVE_UP_SPEC_DRAFT_LEN   declared num_speculative_tokens (default 1 when SPECULATIVE=1)
+#   SERVE_UP_DRAFTER_DIR      the pinned drafter directory a dflash leg mounts
+#                             read-only (MLXFAST_DRAFTER_DIR is honoured as a
+#                             fallback; the fixture's mtp_head.box_dir_env names
+#                             it). Required for a dflash leg, unused otherwise.
 #   SERVE_UP_LOG_DIR          where the run's identity, ready file and resident
 #                             log are kept (default <repo>/.build/resident)
 #   SERVE_UP_SOCKET_DIR       where the resident's Unix socket is bound (default
@@ -349,6 +364,27 @@ else
   SPEC_LABEL="serial"
 fi
 
+# --- the speculative leg's decoder and its pinned drafter --------------------
+# The decoder is this tree's declaration's (tools/spec-declaration.sh decoder,
+# which validates the whole declaration fail-closed first). A dflash leg needs
+# the organizer-staged drafter; nothing else ever names a drafter directory.
+SPEC_METHOD="none"
+DRAFTER_DIR=""
+if [[ "${SERVE_UP_SPECULATIVE}" == "1" ]]; then
+  SPEC_METHOD="$("${SCRIPT_DIR}/tools/spec-declaration.sh" decoder)" \
+    || die "the speculative-decode declaration (mtp-head.manifest.json) is invalid; tools/spec-declaration.sh names why"
+  case "${SPEC_METHOD}" in mtp|dflash) ;; *) die "the declared decoder '${SPEC_METHOD}' has no serve path (mtp or dflash)" ;; esac
+fi
+if [[ "${SPEC_METHOD}" == "dflash" ]]; then
+  DRAFTER_DIR="${SERVE_UP_DRAFTER_DIR:-${MLXFAST_DRAFTER_DIR:-}}"
+  [[ -n "${DRAFTER_DIR}" ]] \
+    || die "a dflash leg needs the pinned drafter: set SERVE_UP_DRAFTER_DIR (or MLXFAST_DRAFTER_DIR) to the directory setup.sh verified"
+  [[ -d "${DRAFTER_DIR}" ]] || die "the drafter directory is missing: '${DRAFTER_DIR}'"
+  DRAFTER_DIR="$(cd -- "${DRAFTER_DIR}" && pwd -P)"
+  [[ "${DRAFTER_DIR}/" != "${SCRIPT_DIR}/"* ]] \
+    || die "REFUSING: the drafter directory ${DRAFTER_DIR} is inside the checkout ${SCRIPT_DIR}; the drafter is organizer-staged, never part of a tree"
+fi
+
 # A SANDBOXED leg's log dir is never defaulted: the default is under the
 # checkout, whose default ACL gives the sandbox user read on every new file
 # (umask does not apply under a default ACL). The ranked box names its private
@@ -401,6 +437,16 @@ engine_env_value() { # engine_env_value KEY
   die "the fixture's engine_env has no $1"
 }
 GPU_MEM_UTIL="$(engine_env_value RESIDENT_GPU_MEMORY_UTILIZATION)"
+# The drafter directory holds EXACTLY the pinned files (setup.sh checked their
+# bytes and sha256; tools/drafter-dir-check.sh refuses any unlisted entry), and
+# only those files are mounted, one read-only bind each (below).
+DRAFTER_FILES=()
+if [[ -n "${DRAFTER_DIR}" ]]; then
+  "${SCRIPT_DIR}/tools/drafter-dir-check.sh" "${DRAFTER_DIR}" >/dev/null \
+    || die "REFUSING: the drafter directory ${DRAFTER_DIR} is not exactly the pinned drafter (above)"
+  mapfile -t DRAFTER_FILES < <(jq -r '.mtp_head.files[]?.path' "${TRACK_FIXTURE}")
+  [[ ${#DRAFTER_FILES[@]} -gt 0 ]] || die "the fixture pins no drafter files (mtp_head.files) for a dflash leg"
+fi
 CTX_SIZE="$(engine_env_value RESIDENT_CTX_SIZE)"
 
 OVERLAY_DIR="${SCRIPT_DIR}/.build/vllm-overlay"
@@ -418,6 +464,10 @@ if [[ -n "${SANDBOX_USER_ID}" ]]; then
   [[ -d "${KERNELS_DIR}" && ! -L "${KERNELS_DIR}" ]] || die "no staged kernels directory ${KERNELS_DIR} (tools/engine/build.sh creates it)"
   "${SCRIPT_DIR}/tools/sandbox-access.sh" no-write "${SERVE_UP_CONTAINER_USER}" "${KERNELS_DIR}" \
     || die "REFUSING: ${SERVE_UP_CONTAINER_USER} can write the staged kernels ${KERNELS_DIR}, or that could not be checked (above)"
+  # The same for the drafter: a drafter an earlier leg could rewrite would be
+  # loaded by this one.
+  [[ -z "${DRAFTER_DIR}" ]] || "${SCRIPT_DIR}/tools/sandbox-access.sh" no-write "${SERVE_UP_CONTAINER_USER}" "${DRAFTER_DIR}" \
+    || die "REFUSING: ${SERVE_UP_CONTAINER_USER} can write the pinned drafter ${DRAFTER_DIR}, or that could not be checked (above)"
 fi
 
 RUN_TAG="$$-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -450,6 +500,7 @@ fi
 
 driver_ver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
 ENGINE_IDENT="vllm@${ENGINE_PIN:0:12} image=${DIGEST:7:12} driver=${driver_ver:-unknown} ${SPEC_LABEL}"
+[[ "${SPEC_METHOD}" == "none" ]] || ENGINE_IDENT="${ENGINE_IDENT} decoder=${SPEC_METHOD}"
 
 # --- the health probe: a real hello over the real socket ---------------------
 # A sandboxed resident's socket is 0600 and owned by the sandbox user, so only
@@ -483,7 +534,7 @@ if reply.get("ok") is not True:
     print(f"probe refused: {reply}", file=sys.stderr)
     sys.exit(1)
 print(json.dumps({k: reply.get(k) for k in
-                  ("vocab_size", "eos_token", "mtp_armed", "draft_tokens", "ctx_size",
+                  ("vocab_size", "eos_token", "mtp_armed", "draft_tokens", "ctx_size", "mtp_head_path",
                    "load_epoch", "ident")}))
 PY
 }
@@ -502,6 +553,11 @@ plan_memory() {
   local body_bytes total_kb avail_kb total_bytes avail_bytes reserve_bytes want_bytes
   body_bytes="$(find "${SERVE_UP_WEIGHTS_DIR}" -maxdepth 1 -name '*.safetensors' -printf '%s\n' | awk '{s+=$1} END{print s+0}')"
   (( body_bytes > 0 )) || die "memory plan REFUSES the load: no *.safetensors in ${SERVE_UP_WEIGHTS_DIR}"
+  # A dflash leg loads the drafter into the same reservation.
+  if [[ -n "${DRAFTER_DIR}" ]]; then
+    drafter_bytes="$(find "${DRAFTER_DIR}" -maxdepth 1 -name '*.safetensors' -printf '%s\n' | awk '{s+=$1} END{print s+0}')"
+    body_bytes=$(( body_bytes + drafter_bytes ))
+  fi
   [[ -r "${SERVE_UP_MEMINFO}" ]] || die "cannot read ${SERVE_UP_MEMINFO}; refusing to start a load blind"
   total_kb="$(awk '/^MemTotal:/ {print $2; exit}' "${SERVE_UP_MEMINFO}")"
   avail_kb="$(awk '/^MemAvailable:/ {print $2; exit}' "${SERVE_UP_MEMINFO}")"
@@ -511,7 +567,7 @@ plan_memory() {
   want_bytes=$(( reserve_bytes + HOST_OVERHEAD_GIB * 1073741824 ))
   {
     printf 'serve-up.sh: memory plan for this leg (GiB)\n'
-    printf '  %-26s %9s\n' "weights (safetensors)" "$(gib "${body_bytes}")"
+    printf '  %-26s %9s%s\n' "weights (safetensors)" "$(gib "${body_bytes}")" "${DRAFTER_DIR:+   target + pinned drafter}"
     printf '  %-26s %9s   %s\n' "engine reservation" "$(gib "${reserve_bytes}")" "${GPU_MEM_UTIL} x MemTotal (fixture engine_env)"
     printf '  %-26s %9s\n' "host process overhead" "${HOST_OVERHEAD_GIB}.00"
     printf '  %-26s %9s\n' "required free" "$(gib "${want_bytes}")"
@@ -580,7 +636,10 @@ RESIDENT_ENV=(
   "PYTHONPATH=${OVERLAY_DIR}:${KERNELS_DIR}"
   "${ENGINE_ENV[@]}"
 )
-log "booting the resident: ${SERVE_UP_WEIGHTS_DIR} (${SPEC_LABEL}) via ${SERVE_UP_LAUNCHER}; ONE load for the whole leg"
+# A speculative leg names its decoder; a dflash leg also names the drafter.
+[[ "${SPEC_METHOD}" == "none" ]] || RESIDENT_ENV+=("RESIDENT_SPEC_METHOD=${SPEC_METHOD}")
+[[ -z "${DRAFTER_DIR}" ]] || RESIDENT_ENV+=("RESIDENT_DRAFT_MODEL_DIR=${DRAFTER_DIR}")
+log "booting the resident: ${SERVE_UP_WEIGHTS_DIR}${DRAFTER_DIR:+ + drafter ${DRAFTER_DIR}} (${SPEC_LABEL}) via ${SERVE_UP_LAUNCHER}; ONE load for the whole leg"
 if [[ "${SERVE_UP_LAUNCHER}" == "docker" ]]; then
   docker_env=()
   for kv in "${RESIDENT_ENV[@]}"; do docker_env+=(--env "${kv}"); done
@@ -588,6 +647,14 @@ if [[ "${SERVE_UP_LAUNCHER}" == "docker" ]]; then
   rw_mounts=(--mount "type=bind,src=${SERVE_UP_SOCKET_DIR},dst=${SERVE_UP_SOCKET_DIR}"
              --mount "type=bind,src=${SERVE_UP_LOG_DIR},dst=${SERVE_UP_LOG_DIR}")
   hardening=()
+  # The pinned drafter rides beside the target snapshot, read-only, on a dflash
+  # leg only. Each PINNED FILE is its own read-only bind at the same path, so
+  # the container's drafter directory is an exact staging of the pinned files:
+  # nothing else in the host directory is visible to the resident.
+  drafter_mount=()
+  for f in ${DRAFTER_FILES[@]+"${DRAFTER_FILES[@]}"}; do
+    drafter_mount+=(--mount "type=bind,src=${DRAFTER_DIR}/${f},dst=${DRAFTER_DIR}/${f},readonly")
+  done
   if [[ -n "${SANDBOX_USER_ID}" ]]; then
     container_user="${SANDBOX_USER_ID}"
     rw_mounts=(--mount "type=bind,src=${SOCKET_LEG_DIR},dst=${SOCKET_LEG_DIR}")
@@ -613,6 +680,7 @@ if [[ "${SERVE_UP_LAUNCHER}" == "docker" ]]; then
     --read-only --tmpfs /tmp:rw,exec,size=8g \
     --mount "type=bind,src=${SCRIPT_DIR},dst=${SCRIPT_DIR},readonly" \
     --mount "type=bind,src=${SERVE_UP_WEIGHTS_DIR},dst=${SERVE_UP_WEIGHTS_DIR},readonly" \
+    "${drafter_mount[@]}" \
     "${rw_mounts[@]}" \
     "${docker_env[@]}" \
     --entrypoint python3 "${IMAGE_REF}" \
@@ -658,11 +726,13 @@ jq -n \
   --arg launcher "${SERVE_UP_LAUNCHER}" --arg image "${IMAGE_REF}" --arg pin "${ENGINE_PIN}" \
   --arg driver "${driver_ver:-unknown}" --arg ident "${ENGINE_IDENT}" \
   --arg weights "${SERVE_UP_WEIGHTS_DIR}" --arg spec "${SPEC_LABEL}" \
+  --arg method "${SPEC_METHOD}" --arg drafter "${DRAFTER_DIR}" \
   --argjson depth "${SPEC_DEPTH}" --argjson hello "${HELLO_JSON}" \
   --arg started "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   '{engine:"vllm", weight_owner:"vllm-resident", resident_socket:$socket, resident_pid:$pid,
     container:$container, launcher:$launcher, image:$image, engine_pin:$pin, driver_version:$driver,
-    engine_ident:$ident, weights_dir:$weights, spec_config:$spec, declared_draft_len:$depth,
+    engine_ident:$ident, weights_dir:$weights, spec_config:$spec, spec_method:$method,
+    drafter_dir:$drafter, declared_draft_len:$depth,
     hello:$hello, started:$started}' > "${IDENTITY_FILE}"
 
 export SERVE_IDENTITY_FILE="${IDENTITY_FILE}"

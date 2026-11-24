@@ -40,16 +40,31 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "${REPO_ROOT}"
 
 export MLXFAST_ENGINE_BIN="${MLXFAST_ENGINE_BIN:-.build/release/mlxfast-runtime-worker}"
-# The free run must match its golden exactly. This track is serial only, so
-# one public golden (recorded on a Spark by tools/record-goldens.sh and
-# committed under correctness_prompts/) covers every local leg; the
-# declaration must derive serial, or nothing runs.
+serial_manifest=""
+# The free run must match its golden exactly. The one public golden (recorded
+# on a Spark by tools/record-goldens.sh and committed under
+# correctness_prompts/) is a SERIAL tape. When the shipped declaration enables
+# the drafter, this local-only path uses a temporary serial declaration. A
+# caller's own declaration is never overridden. A speculative leg (the pinned
+# drafter at depth N) needs that depth's own golden: name it with
+# MLXFAST_CORRECTNESS_GOLDEN_PATH.
 if [[ -z "${MLXFAST_CORRECTNESS_GOLDEN_PATH:-}" ]]; then
   spec="$("${REPO_ROOT}/tools/spec-declaration.sh" describe)" || exit 1
-  [[ "${spec}" == serial ]] || {
-    echo "local-baseline.sh: the declaration derives ${spec}; this track is serial only" >&2
-    exit 1
-  }
+  if [[ "${spec}" != serial ]]; then
+    if [[ "${SPEC_DECLARATION_MANIFEST+x}" == x ]]; then
+      echo "local-baseline.sh: the caller's SPEC_DECLARATION_MANIFEST derives ${spec}, but the public golden is a serial tape; set MLXFAST_CORRECTNESS_GOLDEN_PATH to a ${spec} golden" >&2
+      exit 1
+    fi
+    serial_manifest="$(mktemp "${TMPDIR:-/tmp}/muse-glimmer-serial-declaration.XXXXXX")"
+    trap 'rm -f -- "${serial_manifest}"' EXIT
+    if ! jq -c -f "${REPO_ROOT}/tools/testlib/serial-declaration.jq" \
+      "${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" > "${serial_manifest}"; then
+      echo "local-baseline.sh: failed to build the temporary serial declaration" >&2
+      exit 1
+    fi
+    export SPEC_DECLARATION_MANIFEST="${serial_manifest}"
+    echo "local-baseline.sh: the shipped declaration derives ${spec}; this local run measures SERIAL against the public serial golden (no public ${spec} golden). Set MLXFAST_CORRECTNESS_GOLDEN_PATH to a ${spec} golden to run the drafter." >&2
+  fi
   MLXFAST_CORRECTNESS_GOLDEN_PATH="correctness_prompts/public-longcopy-gate-english-512.golden.json"
   # The committed public golden is pinned: benchmark.sh refuses a copy that is
   # not these bytes before any run work. A caller's own pin still wins.
@@ -78,4 +93,21 @@ fi
   echo "local-baseline.sh: result=${MLXFAST_SCORE_PATH}; score=null is expected without ranked paired scoring"
 } >&2
 
-exec "${REPO_ROOT}/benchmark.sh" --local-iterate
+if [[ -z "${serial_manifest}" ]]; then
+  exec "${REPO_ROOT}/benchmark.sh" --local-iterate
+fi
+
+"${REPO_ROOT}/benchmark.sh" --local-iterate &
+pid=$!
+trap 'kill -TERM "${pid}" 2>/dev/null || true' INT TERM
+
+rc=0
+wait "${pid}" || rc=$?
+while kill -0 "${pid}" 2>/dev/null; do
+  wait "${pid}" || rc=$?
+done
+
+trap - INT TERM
+rm -f -- "${serial_manifest}"
+trap - EXIT
+exit "${rc}"

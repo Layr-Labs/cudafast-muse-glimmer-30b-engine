@@ -10,9 +10,12 @@
 #
 #   sandbox-access.sh no-write USER PATH...
 #       exit 0 when USER can write no PATH and, for a directory, nothing under
-#       it (find -writable, which asks access(2) as USER). Every PATH must be
-#       reachable by USER: a find error means the tree was not fully checked,
-#       and that is exit 2, not a pass.
+#       it (find -writable, which asks access(2) as USER). A PATH USER cannot
+#       reach at all (a directory above it USER may not search, so USER cannot
+#       even stat it) passes: USER cannot write what it cannot name. Every
+#       PATH must exist for the caller (a missing one is exit 2), and below a
+#       PATH USER can reach, a find error means the tree was not fully
+#       checked, and that is exit 2, not a pass.
 #   sandbox-access.sh no-read USER PATH...
 #       exit 0 when USER can read none of the PATHs and enter none that is a
 #       directory (a directory USER can enter but not list still opens every
@@ -53,16 +56,57 @@ echo "probed $n"' sh "${want}" "$@" 2>/dev/null)"
   printf '%s\n' "${n}"
 }
 
+# writable_count PATH... -- how many entries USER can write in the PATHs and
+# under them (find -writable asks access(2) as USER). Fails when the walk does
+# not finish (a directory USER cannot list or reach).
+# -P: a symlink is never followed (its target is checked where it lives).
+# -xdev: a mount below PATH is not this tree's.
+writable_count() {
+  sudo -n -u "${user}" -- find -P "$@" -xdev -writable -printf . 2>/dev/null | wc -c
+}
+
+# reachable PATH... -- set WALK to the PATHs USER can reach at all (an lstat as
+# USER succeeds; it fails when a directory above the PATH is closed to USER).
+# One shell as USER answers for every PATH in order; its last line proves it
+# finished, so a failed probe is never "nothing reachable".
+reachable() {
+  local out i
+  local -a ans
+  # shellcheck disable=SC2016  # expands in the inner shell
+  out="$(sudo -n -u "${user}" -- sh -c 'for p do
+  if [ -e "$p" ] || [ -L "$p" ]; then echo y; else echo n; fi
+done
+echo reached' sh "$@" 2>/dev/null)"
+  mapfile -t ans <<<"${out}"
+  [[ ${#ans[@]} -eq $(( $# + 1 )) && "${ans[$#]}" == reached ]] || return 1
+  WALK=()
+  for (( i = 0; i < $#; i++ )); do
+    [[ "${ans[i]}" == y ]] && WALK+=("${@:i+1:1}")
+  done
+  return 0
+}
+
 sudo -n -u "${user}" -- true >/dev/null 2>&1 \
   || { say "'sudo -n -u ${user}' fails; cannot check what ${user} can reach"; exit 2; }
 
 case "${mode}" in
   no-write)
-    # -P: a symlink is never followed (its target is checked where it lives).
-    # -xdev: a mount below PATH is not this tree's.
-    if ! n="$(sudo -n -u "${user}" -- find -P "$@" -xdev -writable -printf . 2>/dev/null | wc -c)"; then
-      say "${user} cannot walk every path given (a directory it cannot list); nothing is proven"
-      exit 2
+    for p in "$@"; do
+      [[ -e "${p}" || -L "${p}" ]] || { say "a path given does not exist; nothing is proven"; exit 2; }
+    done
+    if ! n="$(writable_count "$@")"; then
+      # The walk failed somewhere. A PATH USER cannot reach at all passes;
+      # the PATHs it can reach are walked again, and must walk clean.
+      reachable "$@" || { say "the probe as ${user} did not finish; nothing is proven"; exit 2; }
+      if (( ${#WALK[@]} == $# )); then
+        say "${user} cannot walk every path given (a directory it cannot list); nothing is proven"
+        exit 2
+      fi
+      n=0
+      if (( ${#WALK[@]} > 0 )) && ! n="$(writable_count "${WALK[@]}")"; then
+        say "${user} cannot walk every path given (a directory it cannot list); nothing is proven"
+        exit 2
+      fi
     fi
     if (( n != 0 )); then
       say "${user} can write ${n} file(s) or directory(ies) under the $# path(s) given"

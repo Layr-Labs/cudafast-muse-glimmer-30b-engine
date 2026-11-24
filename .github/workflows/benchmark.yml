@@ -56,9 +56,12 @@
 # a box that is missing either variable is refused before any work rather than
 # scored against a number from somewhere else.
 #
-# THE RUNNER LABEL IS THE TRACK ID. `runs-on: [self-hosted, Linux, ARM64,
-# muse-glimmer-30b-cuda-v1]` -- the fourth label is branch = track = R2 key
-# prefix (the canonical decoder-neutral naming construction). Linux and ARM64
+# THE RUNNER LABEL NAMES THE DRAFTER TRACK. `runs-on: [self-hosted, Linux, ARM64,
+# muse-glimmer-30b-cuda-drafter-v1]` -- the fourth label is this track's own, NOT the track id
+# muse-glimmer-30b-cuda-v1 that the live and DEV rows' boxes carry, so a box
+# set up for the pinned-drafter track never takes a live or DEV job and the
+# reverse. The track id (fixture track_id, the R2 key prefix of the goldens) is
+# unchanged: the serial goldens are the same. Linux and ARM64
 # name the GB10 box's operating system and architecture; the same pair the
 # aarch64-unknown-linux-gnu benchd dist is published for. tools/box-runner/
 # RUNNER_LABELS must advertise the same set: that value is the entire coupling
@@ -173,16 +176,20 @@ jobs:
   # before the dispatch to the ranked box.
   surface-check:
     name: editable-surface + static review (box runner, no GPU, no credential)
-    runs-on: [self-hosted, Linux, ARM64, muse-glimmer-30b-cuda-v1]
+    runs-on: [self-hosted, Linux, ARM64, muse-glimmer-30b-cuda-drafter-v1]
     timeout-minutes: 10
+    env:
+      # This repository serves only this track, so the protected base is main.
+      TRACK_PROTECTED_BRANCH: main
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.sha }}
           submodules: false
           persist-credentials: false
-          # Full history, so the protected default branch is present as
-          # origin/<default branch> for the surface check below.
+          # Full history of every branch, so the track's protected branch is
+          # present as origin/${TRACK_PROTECTED_BRANCH} for the surface check
+          # below (fetch-depth 0 fetches +refs/heads/*:refs/remotes/origin/*).
           fetch-depth: 0
 
       - name: Candidate diff stays inside the protected base's editable surface
@@ -191,27 +198,25 @@ jobs:
         # benchmark.json editablePaths, so an edit outside them never reaches
         # the dispatched commit. This step checks the dispatched commit again.
         # The allowlist is read from a protected base: the merge base of the
-        # dispatched commit and the default branch, a commit the protected
-        # branch already holds. The gate and its git wrapper are taken from
-        # that base too, so a candidate that edits them does not change what
-        # checks it. A file outside the base's editablePaths -- benchmark.json
+        # dispatched commit and the track's protected branch
+        # (TRACK_PROTECTED_BRANCH, job env), a commit that branch already
+        # holds. The gate and its git wrapper are taken from that base too, so
+        # a candidate that edits them does not change what checks it. A file outside the base's editablePaths -- benchmark.json
         # itself included -- fails the job before the ranked job sees the
         # commit. Limit: this workflow file is read from the dispatched commit,
         # so a dispatched commit that changes it can remove this step.
-        # An organizer baseline dispatch is a commit on the default branch:
-        # the merge base is the commit itself, the diff is empty, and the step
-        # passes.
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        # An organizer baseline dispatch is a commit on the protected branch
+        # (its tip, or a yukon/baseline/<sha> ref at it): the merge base is the
+        # commit itself, the diff is empty, and the step passes.
         run: |
           set -euo pipefail
-          base_ref="refs/remotes/origin/${DEFAULT_BRANCH}"
+          base_ref="refs/remotes/origin/${TRACK_PROTECTED_BRANCH}"
           if ! git rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null; then
-            echo "::error::the protected default branch ${DEFAULT_BRANCH} is not in the checkout (${base_ref}); refusing to judge the candidate against its own benchmark.json" >&2
+            echo "::error::the track's protected branch ${TRACK_PROTECTED_BRANCH} is not in the checkout (${base_ref}); refusing to judge the candidate against its own benchmark.json" >&2
             exit 1
           fi
           base_sha="$(git merge-base "${base_ref}" "${GITHUB_SHA}")" || {
-            echo "::error::the dispatched commit ${GITHUB_SHA} shares no history with ${DEFAULT_BRANCH}" >&2
+            echo "::error::the dispatched commit ${GITHUB_SHA} shares no history with ${TRACK_PROTECTED_BRANCH}" >&2
             exit 1
           }
           trusted="${RUNNER_TEMP}/trusted-surface-gate"
@@ -220,9 +225,29 @@ jobs:
             git show "${base_sha}:.github/scripts/${script}" > "${trusted}/${script}"
             chmod 755 "${trusted}/${script}"
           done
-          echo "protected base ${base_sha} (merge base with ${DEFAULT_BRANCH}); candidate ${GITHUB_SHA}"
+          echo "protected base ${base_sha} (merge base with ${TRACK_PROTECTED_BRANCH}); candidate ${GITHUB_SHA}"
           BASE_SHA="${base_sha}" HEAD_SHA="${GITHUB_SHA}" CONTRACT_PATH=benchmark.json \
             "${trusted}/enforce-modifiable-surface.sh"
+
+      - name: Entry diff carries no weights and names no other loader
+        # The pinned drafter is the only drafter a leg runs, but the leg also
+        # mounts the entry's editable tree. .github/scripts/entry-weight-check.py
+        # refuses, fail-closed, an entry diff that adds weight-like payloads
+        # (weight files, container signatures, non-text data over 1 MiB,
+        # base64/hex blobs, weight tables) or editable code that names a
+        # weights directory or a model loading path other than the unchanged
+        # trusted resident call. Its header lists what it cannot catch. It runs
+        # from this checkout: the step above already refused any change to
+        # .github/, so this copy is the protected one. The base is the same
+        # protected merge base (TRACK_PROTECTED_BRANCH, job env).
+        run: |
+          set -euo pipefail
+          base_sha="$(git merge-base "refs/remotes/origin/${TRACK_PROTECTED_BRANCH}" "${GITHUB_SHA}")" || {
+            echo "::error::the dispatched commit ${GITHUB_SHA} shares no history with ${TRACK_PROTECTED_BRANCH}" >&2
+            exit 1
+          }
+          BASE_SHA="${base_sha}" HEAD_SHA="${GITHUB_SHA}" CONTRACT_PATH=benchmark.json \
+            .github/scripts/entry-weight-check.py
 
       - name: Benchmark manifest lint
         run: |
@@ -250,12 +275,12 @@ jobs:
   # The ranked measurement. `needs: surface-check` so a submission that fails
   # the static review never reaches the box at all.
   ranked:
-    name: ranked measurement (self-hosted, muse-glimmer-30b-cuda-v1 GB10 box)
+    name: ranked measurement (self-hosted, muse-glimmer-30b-cuda-drafter-v1 GB10 box)
     needs: surface-check
-    # The fourth label IS the track id (= the branch name = the R2 key prefix).
+    # The fourth label is the drafter track's own runner label (see the header).
     # Linux + ARM64 name the GB10 box. tools/box-runner RUNNER_LABELS must
     # advertise the set.
-    runs-on: [self-hosted, Linux, ARM64, muse-glimmer-30b-cuda-v1]
+    runs-on: [self-hosted, Linux, ARM64, muse-glimmer-30b-cuda-drafter-v1]
     # A cold run fetches the pinned checkpoint before it measures anything, and
     # then every timed phase waits behind benchd's per-phase cool-down that can
     # legitimately spend up to 900 s. THE COUNT IS DERIVED FROM THE RULED PAIR
@@ -294,6 +319,9 @@ jobs:
     #                                 here to point at.
     #   MLXFAST_BASELINE_WORKSPACE    the built reference tree
     #   MLXFAST_BASELINE_CALIBRATION  this box's calibration file
+    #   MLXFAST_DRAFTER_DIR           the pinned DFlash drafter (fixture mtp_head),
+    #                                 verified by setup.sh and mounted read-only
+    #                                 into a speculative candidate leg only
     #
     # Every box in the fleet stages them where its converge units put them, so no
     # literal home path lives in this workflow: a box that does not export them
@@ -355,7 +383,17 @@ jobs:
           # organizer material published in R2 and staged on the box out of
           # band; they are never in the checkout, so an unset variable here has
           # no in-repo copy to fall back on and is refused.
-          for var in MLXFAST_TARGET_SNAPSHOT_DIR BENCHD_BIN_DIR MLXFAST_BASELINE_WORKSPACE MLXFAST_MUSE_GLIMMER_GOLDEN_DIR; do
+          # MLXFAST_DRAFTER_DIR is the pinned drafter. It is required ONLY when
+          # the contract pins one (mtp_head.source "pinned") AND the entry's
+          # declaration switches speculation on (tools/spec-declaration.sh
+          # speculative = 1, which refuses an invalid declaration); setup.sh
+          # then verifies it. A serial entry needs no drafter on the box.
+          box_dirs=(MLXFAST_TARGET_SNAPSHOT_DIR BENCHD_BIN_DIR MLXFAST_BASELINE_WORKSPACE MLXFAST_MUSE_GLIMMER_GOLDEN_DIR)
+          if [[ "$(jq -r '.mtp_head.source // empty' fixtures/muse_glimmer_30b_cuda_v1_track.json)" == "pinned" ]]; then
+            drafter_spec="$(./tools/spec-declaration.sh speculative)"
+            [[ "${drafter_spec}" != "1" ]] || box_dirs+=(MLXFAST_DRAFTER_DIR)
+          fi
+          for var in "${box_dirs[@]}"; do
             eval "value=\${${var}:-}"
             if [[ -z "${value}" ]]; then
               echo "::error::${var} is not exported by the runner service environment (fleet-bootstrap stages the asset and exports its path)" >&2
@@ -379,7 +417,7 @@ jobs:
             command -v "${tool}" >/dev/null 2>&1 || { echo "::error::${tool} is not on the runner service PATH (fleet-bootstrap owns the unit's PATH)" >&2; fail=1; }
           done
           [[ "${fail}" == "0" ]] || exit 1
-          echo "runner environment ok: snapshot=${MLXFAST_TARGET_SNAPSHOT_DIR} benchd=${BENCHD_BIN_DIR} reference=${MLXFAST_BASELINE_WORKSPACE} calibration=${MLXFAST_BASELINE_CALIBRATION} goldens=${MLXFAST_MUSE_GLIMMER_GOLDEN_DIR} docker=$(command -v docker) cargo=$(command -v cargo)"
+          echo "runner environment ok: snapshot=${MLXFAST_TARGET_SNAPSHOT_DIR} drafter=${MLXFAST_DRAFTER_DIR:-none} benchd=${BENCHD_BIN_DIR} reference=${MLXFAST_BASELINE_WORKSPACE} calibration=${MLXFAST_BASELINE_CALIBRATION} goldens=${MLXFAST_MUSE_GLIMMER_GOLDEN_DIR} docker=$(command -v docker) cargo=$(command -v cargo)"
 
       - name: Reference workspace is the pinned baseline, and it is built
         # THE SERIAL CONTROL LEG RUNS ON THIS TREE. Under the paired model the

@@ -50,7 +50,7 @@ text track does not exercise.
 | Vision tower | 50 layers, hidden 1536, patch 14 (not scored by this track) |
 | Vocabulary | 202048, untied embeddings |
 | Tokens | BOS 200000; EOS 200001 and 200008; PAD 200018 |
-| Speculation | none: the checkpoint ships no MTP or draft tensors |
+| Speculation | the checkpoint ships no MTP or draft tensors; the track pins a separate DFlash drafter, `meta-models/Muse-Glimmer-30B-assistant` @ `c676cce91658f9568aaf264a416211e2782735b7` (section 4) |
 
 The checkpoint's `config.json` `quantization_config` is the authority on
 formats:
@@ -62,9 +62,12 @@ formats:
 | Vision tower, embeddings | BF16 |
 | KV cache | the fixture's `kv_cache_dtype` (`auto`: the checkpoint's own dtype) |
 
-The engine is vLLM `v0.27.1`. The track is SERIAL ONLY: the fixture's
-`allowed_modes` is `[serial]` and `serve_configuration.depths` declares
-`serial` alone (section 4). The KV backend is `vllm-paged`, pinned in the
+The engine is vLLM `v0.27.1`. The fixture's `allowed_modes` is
+`[serial, mtp]`, benchd's wire modes (a speculative leg is mode `mtp` at
+depth N; the pinned DFlash drafter serves it, `mtp_head.decoder` `dflash`):
+the serial-control leg is always serial, and the candidate
+leg runs serial or the PINNED DFlash drafter at a declared depth
+(`serve_configuration.depths`: `serial`, `mtp1`..`mtp6`; section 4). The KV backend is `vllm-paged`, pinned in the
 fixture and in `benchmark.json`.
 
 ## 3. What you may edit
@@ -77,11 +80,11 @@ paths.
 |---|---|
 | `vllm/` | vLLM v0.27.1's Python package (`vllm/vllm/`), `vllm/VENDOR.json`, `vllm/LICENSE` |
 | `harness/` | `protocol-adapter/` (Rust), `vllm_resident/` (Python), optional `kernels/` |
-| `mtp-head.manifest.json` | the speculation declaration (section 4): on this track it declares `"source": "none"` |
+| `mtp-head.manifest.json` | the speculation declaration (section 4): it may switch the pinned drafter on and pick a depth |
 
 ### 3.1 Optional paths
 
-`mtp-head.manifest.json` is optional. The shipped declaration is `"source": "none"` with speculation disabled, and every leg of this track runs serial (section 4).
+`mtp-head.manifest.json` is optional. The shipped declaration restates the drafter pin with the drafter off in the track's base; the organizer's first entry switches it on at a permitted depth whose timed oracles are pinned. An entry may pick another permitted depth or switch it off; an absent or disabled declaration runs serial (section 4).
 
 ### 3.2 The byte budget
 
@@ -190,47 +193,79 @@ box.
 
 ## 4. The speculation declaration
 
-This track has no speculative arm. The checkpoint ships no MTP or draft
-tensors, the fixture's `mtp_head` block records `"source": "none"` with an
-empty `permitted_draft_depths`, and `serve_configuration.depths` declares
-`serial` alone. `mtp-head.manifest.json` stays an editable path only because a
-submission archive replaces whole paths; its one accepted value is the
-disabled one.
+The checkpoint ships no MTP or draft tensors. The track pins ONE drafter in the
+fixture's `mtp_head`: the DFlash drafter `meta-models/Muse-Glimmer-30B-assistant` @ `c676cce91658f9568aaf264a416211e2782735b7` (BF16, Apache-2.0,
+5,111,976,608 bytes of weights), `"source": "pinned"`, with the bytes and the
+sha256 of each file (`mtp_head.files`). The organizer stages it on the box;
+`setup.sh` verifies every file on every run, and `tools/serve-up.sh` mounts it
+READ-ONLY beside the target snapshot into a speculative candidate leg only. A
+submission may switch it on and pick a depth. That is all.
 
 ### 4.1 What you may declare
 
 ```json
 {
   "version": 1,
-  "source": "none",
-  "spec": { "enabled": false, "num_speculative_tokens": 0 }
+  "source": "pinned",
+  "upstream_model_id": "meta-models/Muse-Glimmer-30B-assistant",
+  "upstream_revision": "c676cce91658f9568aaf264a416211e2782735b7",
+  "sha256": {
+    "config.json": "38915167b64b1e6405492aacae5b1b4511b6431163d2960b9bd25821df6fa30a",
+    "model.safetensors": "fd88d337eb84f8d0e6ba33a7684d7efa6722d4460ba4d6badca9699418392a84"
+  },
+  "spec": { "decoder": "dflash", "enabled": true, "num_speculative_tokens": 3 }
 }
 ```
 
 `tools/spec-declaration.sh` is the one trusted reader of the declaration.
 
-- **Allowed keys.** It accepts `version`, `source`, `max_bytes`, `bytes`,
-  `sha256` and `spec`, and refuses any other key.
+- **Allowed keys.** It accepts `version`, `source`, `upstream_model_id`,
+  `upstream_revision`, `sha256`, `max_bytes`, `bytes` and `spec` (with
+  `decoder`, `enabled`, `num_speculative_tokens`), and refuses any other key.
 - **Source.** The accepted `source` is the contract's own `mtp_head.source`,
-  which is `"none"` on this track. `"pinned"`, `"remote"` and `"in_branch"` are
-  refused.
+  `"pinned"`. With it, `upstream_model_id`, the full 40-hex
+  `upstream_revision` and the `sha256` map must equal the contract's pin
+  exactly: a different repository, a short or different revision, a different
+  digest, or an added or dropped file is refused. `"none"`, `"remote"` and
+  `"in_branch"` are refused. The source and the pin may also be left out; the
+  contract's pin applies.
+- **Decoder.** `dflash`, the contract's `mtp_head.decoder` and the only one
+  accepted. On the wire the leg is mode `mtp` at depth N (`allowed_modes`
+  `[serial, mtp]`).
 - **Depth.** An enabled depth must be in `mtp_head.permitted_draft_depths`,
-  which is empty here, so any enabled depth is refused, never clamped.
+  `[1, 2, 3, 4, 5, 6]`; any other depth is refused, never clamped. (The MLX
+  track permits 1..7 for the same drafter; this track stops at 6, the depth
+  envelope of the CUDA protocol adapter and the resident.)
 - **Serial.** A declaration that is absent, disabled, or has 0 tokens derives
-  serial, which is what every leg of this track runs.
+  serial.
 
 ### 4.2 What you may not do
 
-- Load a drafter of any kind (MTP, DSpark, DFlash, Eagle, n-gram).
-- Declare head weights as your own (`bytes`/`sha256` are recorded, not read, and
-  nothing loads from a declaration).
-- Fetch anything at run time; the resident has no network.
+- Bring your own drafter or any other weights, by any key, path, repository,
+  revision or digest. Nothing loads from a declaration; the only drafter a leg
+  can load is the organizer-staged, read-only pinned one.
+- Load a drafter of another kind (MTP, DSpark, Eagle, n-gram).
+- Fetch anything at run time; the resident has no network and runs with
+  Hugging Face offline.
+- Grow the editable surface past the 40 MiB cap (section 3.2), which is
+  unchanged.
+- Add weights or a loader in editable code. `.github/scripts/entry-weight-check.py`
+  reads only what your entry changed and refuses weight files and container
+  signatures, non-text data over 1 MiB, base64/hex blobs, weight tables, and
+  added lines that name a weights directory or a model loading, download or
+  unpacking path. Its header lists the limits; the rule above still holds
+  where the filter cannot see.
 
-### 4.3 What the head does in a run
+### 4.3 What the drafter does in a run
 
-Nothing: no leg boots a speculative config. Every phase — warm-up, timed
-prefill, timed decode, correctness — runs the serial path, and benchd seals
-`effective_spec_mode` as `serial` with depth 0.
+The serial-control leg never loads it. A candidate leg that declares depth N
+boots its resident with vLLM's `dflash` method at N speculative tokens on the
+pinned drafter, and benchd scores it against that depth's own timed oracle
+(`speculative_oracles.<prompt>.mtpN`; section 11.4). Only the declared
+depth needs its oracle; a declared depth with no pinned oracle is refused
+before the run (the manifest lint and the ranked preflight). An absent or disabled
+declaration runs the serial path, and benchd seals `effective_spec_mode` as
+`serial` with depth 0.
 
 ## 5. Scoring
 
@@ -613,7 +648,7 @@ The rest of the command surface:
 | Artifact | Identity |
 |---|---|
 | Target | 14 files at the pinned revision, each by bytes and sha256 (`target.files`), 24.7 GB |
-| Speculation | none: `allowed_modes` is `[serial]` and the checkpoint ships no draft tensors |
+| Speculation | `allowed_modes` `[serial, mtp]` (wire modes; decoder `dflash`); the DFlash drafter `meta-models/Muse-Glimmer-30B-assistant` @ `c676cce91658f9568aaf264a416211e2782735b7`, 2 files by bytes and sha256 (`mtp_head.files`), depths 1..6 |
 | Engine source | vLLM `v0.27.1` @ `6e448d0ea9bf3d88d898b65449ca6dc2aec170ac` (`vllm/VENDOR.json`) |
 | Engine image | `docker.io/vllm/vllm-openai:v0.27.1` @ `sha256:1c8e60a0841b333c700488cb029d3664807249da0c071e862191b00fe34b228c` |
 | Driver floor | `580.159.03` |
@@ -684,8 +719,10 @@ exact match — fails the run.
 
 (a) the serial tape is the fidelity oracle for every leg (section 5.4);
 
-(b) there is no per-depth oracle and no speculative verify to price, because
-this track declares no other mode;
+(b) each permitted draft depth N has its own pinned timed oracle per live
+golden (`speculative_oracles.<prompt>.mtpN`), recorded with the pinned drafter
+at depth N, because a speculative free run can fork from the serial one at a
+near-tie; token fidelity is still measured against the serial tape;
 
 (c) your engine can fork from the reference's trajectory at a near-tie, and the
 timed window then fails, because it requires an exact match (section 5.4.1).

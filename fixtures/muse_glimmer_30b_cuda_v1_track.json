@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "track_id": "muse-glimmer-30b-cuda-v1",
-  "track_name": "Muse Glimmer 30B NVFP4 CUDA -- serial paired speedup",
+  "track_name": "Muse Glimmer 30B NVFP4 CUDA -- paired speedup with the pinned DFlash drafter",
   "official_scoring_enabled": true,
   "official_pairs": 3,
   "official_pair_combine": "mean",
@@ -11,7 +11,8 @@
     "maxConcurrentWorkflows": 1
   },
   "allowed_modes": [
-    "serial"
+    "serial",
+    "mtp"
   ],
   "benchmark_name": "cudafast-muse-glimmer-30b",
   "kv_backend": "vllm-paged",
@@ -77,7 +78,104 @@
       "sha256": "2c5593f6d7dc0e3afc2c970138072c111dcda7fe0eff09e3d2476d67bc5ad0ce"
     }
   ],
-  "speculative_oracles": {},
+  "speculative_oracles": {
+    "pool-10": {
+      "mtp1": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-10.mtp1.golden.json",
+        "sha256": "83713c13d69ba9a6dca12cad7fd42756ce0a2162928d29984465fbfc25435e1e",
+        "bytes": 35284
+      },
+      "mtp2": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-10.mtp2.golden.json",
+        "sha256": "83713c13d69ba9a6dca12cad7fd42756ce0a2162928d29984465fbfc25435e1e",
+        "bytes": 35284
+      },
+      "mtp3": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-10.mtp3.golden.json",
+        "sha256": "83713c13d69ba9a6dca12cad7fd42756ce0a2162928d29984465fbfc25435e1e",
+        "bytes": 35284
+      },
+      "mtp4": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-10.mtp4.golden.json",
+        "sha256": "83713c13d69ba9a6dca12cad7fd42756ce0a2162928d29984465fbfc25435e1e",
+        "bytes": 35284
+      },
+      "mtp5": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-10.mtp5.golden.json",
+        "sha256": "83713c13d69ba9a6dca12cad7fd42756ce0a2162928d29984465fbfc25435e1e",
+        "bytes": 35284
+      },
+      "mtp6": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-10.mtp6.golden.json",
+        "sha256": "83713c13d69ba9a6dca12cad7fd42756ce0a2162928d29984465fbfc25435e1e",
+        "bytes": 35284
+      }
+    },
+    "pool-11": {
+      "mtp1": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-11.mtp1.golden.json",
+        "sha256": "8f72af875be58dc6ebe3239ba6785e03b9a574cad93fc3f1a134435820ef70fb",
+        "bytes": 35313
+      },
+      "mtp2": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-11.mtp2.golden.json",
+        "sha256": "8f72af875be58dc6ebe3239ba6785e03b9a574cad93fc3f1a134435820ef70fb",
+        "bytes": 35313
+      },
+      "mtp3": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-11.mtp3.golden.json",
+        "sha256": "8f72af875be58dc6ebe3239ba6785e03b9a574cad93fc3f1a134435820ef70fb",
+        "bytes": 35313
+      },
+      "mtp4": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-11.mtp4.golden.json",
+        "sha256": "8f72af875be58dc6ebe3239ba6785e03b9a574cad93fc3f1a134435820ef70fb",
+        "bytes": 35313
+      },
+      "mtp5": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-11.mtp5.golden.json",
+        "sha256": "8f72af875be58dc6ebe3239ba6785e03b9a574cad93fc3f1a134435820ef70fb",
+        "bytes": 35313
+      },
+      "mtp6": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-11.mtp6.golden.json",
+        "sha256": "8f72af875be58dc6ebe3239ba6785e03b9a574cad93fc3f1a134435820ef70fb",
+        "bytes": 35313
+      }
+    },
+    "pool-9": {
+      "mtp1": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-9.mtp1.golden.json",
+        "sha256": "46613eb5049d567630695ccde3190c12591b95fdb40e2c13e2ef10dd47b05cda",
+        "bytes": 28297
+      },
+      "mtp2": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-9.mtp2.golden.json",
+        "sha256": "46613eb5049d567630695ccde3190c12591b95fdb40e2c13e2ef10dd47b05cda",
+        "bytes": 28297
+      },
+      "mtp3": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-9.mtp3.golden.json",
+        "sha256": "46613eb5049d567630695ccde3190c12591b95fdb40e2c13e2ef10dd47b05cda",
+        "bytes": 28297
+      },
+      "mtp4": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-9.mtp4.golden.json",
+        "sha256": "46613eb5049d567630695ccde3190c12591b95fdb40e2c13e2ef10dd47b05cda",
+        "bytes": 28297
+      },
+      "mtp5": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-9.mtp5.golden.json",
+        "sha256": "46613eb5049d567630695ccde3190c12591b95fdb40e2c13e2ef10dd47b05cda",
+        "bytes": 28297
+      },
+      "mtp6": {
+        "r2_path": "correctness_prompts/muse-glimmer-30b-cuda-v1/pool-9.mtp6.golden.json",
+        "sha256": "46613eb5049d567630695ccde3190c12591b95fdb40e2c13e2ef10dd47b05cda",
+        "bytes": 28297
+      }
+    }
+  },
   "serve_configuration": {
     "engine": "vllm",
     "engine_pin": "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac",
@@ -116,6 +214,42 @@
         "num_speculative_tokens": 0,
         "resident_spec_depth": 0,
         "timed_oracle": "timed_prompt_pool[<live prompt>]"
+      },
+      "mtp1": {
+        "method": "dflash",
+        "num_speculative_tokens": 1,
+        "resident_spec_depth": 1,
+        "timed_oracle": "speculative_oracles[<live prompt>].mtp1"
+      },
+      "mtp2": {
+        "method": "dflash",
+        "num_speculative_tokens": 2,
+        "resident_spec_depth": 2,
+        "timed_oracle": "speculative_oracles[<live prompt>].mtp2"
+      },
+      "mtp3": {
+        "method": "dflash",
+        "num_speculative_tokens": 3,
+        "resident_spec_depth": 3,
+        "timed_oracle": "speculative_oracles[<live prompt>].mtp3"
+      },
+      "mtp4": {
+        "method": "dflash",
+        "num_speculative_tokens": 4,
+        "resident_spec_depth": 4,
+        "timed_oracle": "speculative_oracles[<live prompt>].mtp4"
+      },
+      "mtp5": {
+        "method": "dflash",
+        "num_speculative_tokens": 5,
+        "resident_spec_depth": 5,
+        "timed_oracle": "speculative_oracles[<live prompt>].mtp5"
+      },
+      "mtp6": {
+        "method": "dflash",
+        "num_speculative_tokens": 6,
+        "resident_spec_depth": 6,
+        "timed_oracle": "speculative_oracles[<live prompt>].mtp6"
       }
     }
   },
@@ -309,13 +443,43 @@
     ]
   },
   "mtp_head": {
-    "role": "spec_decode_mtp_head",
-    "source": "none",
-    "note": "serial-only track (contract supported_optimization_modes [serial]): the checkpoint ships no MTP tensors (model.safetensors.index.json has none) and no speculative depth is permitted",
-    "permitted_draft_depths": []
+    "role": "spec_decode_dflash_drafter",
+    "source": "pinned",
+    "decoder": "dflash",
+    "note": "the key keeps its name because mtp-head.manifest.json is the declaration slot the trusted readers use. The target checkpoint ships no MTP tensors; the drafter is the published BF16 DFlash drafter below, pinned by repository, revision and the sha256 of every file. The organizer stages it on the box (setup.sh verifies it, the box exports its directory as box_dir_env) and tools/serve-up.sh mounts it READ-ONLY into the candidate resident, with no network and Hugging Face offline. A submission may only switch it on and pick a depth from permitted_draft_depths; it can never name, ship or load drafter weights of its own.",
+    "upstream_model_id": "meta-models/Muse-Glimmer-30B-assistant",
+    "upstream_revision": "c676cce91658f9568aaf264a416211e2782735b7",
+    "license": "apache-2.0",
+    "format": "safetensors",
+    "dtype": "bfloat16",
+    "architecture": "MuseGlimmerAssistantModel",
+    "model_type": "muse_glimmer_assistant",
+    "box_dir_env": "MLXFAST_DRAFTER_DIR",
+    "files": [
+      {
+        "path": "config.json",
+        "bytes": 883,
+        "sha256": "38915167b64b1e6405492aacae5b1b4511b6431163d2960b9bd25821df6fa30a"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 5111976608,
+        "sha256": "fd88d337eb84f8d0e6ba33a7684d7efa6722d4460ba4d6badca9699418392a84"
+      }
+    ],
+    "permitted_draft_depths": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "permitted_draft_depths_note": "the MLX track permits 1..7 for the same drafter; this track permits 1..6, the depth envelope the CUDA protocol adapter (harness/protocol-adapter/src/session_backend.rs MTP_MAX_DEPTH), the resident (IMPLEMENTED_DEPTH) and the benchd wire already carry. Every permitted depth needs its own pinned timed oracle in speculative_oracles before it can be scored.",
+    "decoder_note": "allowed_modes names benchd wire modes. On the CUDA Engine Protocol wire a speculative candidate leg is mode \"mtp\" at depth N (benchd --mtp-depth N, the adapter effective_spec, the serve label mtpN and speculative_oracles.<prompt>.mtpN); benchd native \"dflash\" mode is the MLX engine path and is not used here. The decoder that serves an mtp leg on this track is this block decoder: the pinned DFlash drafter, loaded by vLLM method dflash (harness/vllm_resident/backends.py)."
   },
   "scoring_semantics": {
-    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = control / candidate per-token time (serial-anchored -- a faster candidate scores > 1). Decode per-token time is the decode window: decode-run time / N, with no seed prefill in it. The run is PAIRED on the box: official_pairs pairs, each one serial-control leg on the organizer-staged reference tree and one candidate leg, single-stream (serial only -- this track declares no speculative arm). Pair k measures live_goldens[(k - 1) mod N], so each live golden gets the same number of pairs. The score is the mean of the per-pair composites (official_pair_combine: mean). Floors and the ceilings apply to every pair."
+    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75. Per component: gain = control / candidate per-token time (serial-anchored -- a faster candidate scores > 1). Decode per-token time is the decode window: decode-run time / N, with no seed prefill in it. The run is PAIRED on the box: official_pairs pairs, each one serial-control leg on the organizer-staged reference tree and one candidate leg, single-stream (the serial-control leg is always serial; the candidate leg runs serial or the pinned DFlash drafter at its declared depth). Pair k measures live_goldens[(k - 1) mod N], so each live golden gets the same number of pairs. The score is the mean of the per-pair composites (official_pair_combine: mean). Floors and the ceilings apply to every pair."
   },
   "hidden_correctness_golden": {
     "bytes": 28297,
