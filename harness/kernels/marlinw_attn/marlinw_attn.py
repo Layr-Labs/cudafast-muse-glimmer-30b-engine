@@ -36,8 +36,14 @@ SMS = 48
 CONFIG = (64, 256, 256)
 SHAPES = {(4608, 6656): "qkv", (4096, 6656): "gate", (6656, 4096): "o"}
 ENABLED = os.environ.get("MARLIN_NARROW_ATTN", "1") == "1"
+FAST_ENABLED = os.environ.get("MARLIN_ATTN_FAST", "1") != "0"
 
 _library = ctypes.CDLL(str(Path(__file__).with_name("libmarlinw_attn.so")))
+_set_fast = getattr(_library, "marlinw_attn_set_fast", None)
+if _set_fast is not None:
+    _set_fast.argtypes = [ctypes.c_int]
+    _set_fast.restype = None
+    _set_fast(1 if FAST_ENABLED else 0)
 _init = _library.marlinw_attn_init
 _init.argtypes = [ctypes.POINTER(ctypes.c_int)]
 _init.restype = ctypes.c_int

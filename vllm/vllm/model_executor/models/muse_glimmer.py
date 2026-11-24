@@ -1207,7 +1207,7 @@ class _GateSideStream:
         self.unavailable = False
         self.last_layer = -1
         self.forks = 0
-        self.reported = False
+        self.reported_forks = 0
         # Layers whose output_gate_proj uses a deterministic custom M=1 kernel (muse_bf16_lane)
         # while M>1 falls back to cuBLAS: restrict side-stream fork strictly to M=1 and require
         # muse_bf16_lane_weight to be admitted.
@@ -1232,13 +1232,13 @@ class _GateSideStream:
 
     def _count(self, layer_idx: int) -> None:
         if layer_idx <= self.last_layer:
-            if not self.reported:
+            if self.forks > self.reported_forks:
                 logger.info(
                     "Attention output gate projection overlapped attention "
                     "in %d layers",
                     self.forks,
                 )
-                self.reported = True
+                self.reported_forks = self.forks
             self.forks = 0
         self.forks += 1
         self.last_layer = layer_idx
@@ -1349,15 +1349,107 @@ direct_register_custom_op(
 )
 
 
+_QK_ATTN_REFS: list = []
+_QK_ATTN_BY_TAG_PTR: dict[int, nn.Module] = {}
+
+
+def _register_qk_attn_layer(attn: nn.Module) -> None:
+    import weakref
+
+    _QK_ATTN_REFS.append(weakref.ref(attn))
+    _QK_ATTN_BY_TAG_PTR.clear()
+
+
+def _resolve_qk_attn_layer(tag_ptr: int) -> nn.Module | None:
+    layer = _QK_ATTN_BY_TAG_PTR.get(tag_ptr)
+    if layer is not None:
+        return layer
+    alive = []
+    for ref in _QK_ATTN_REFS:
+        mod = ref()
+        if mod is not None:
+            alive.append(ref)
+            k_scale = getattr(mod, "_k_scale", None)
+            if isinstance(k_scale, torch.Tensor) and k_scale.is_cuda:
+                _QK_ATTN_BY_TAG_PTR[k_scale.data_ptr()] = mod
+    _QK_ATTN_REFS[:] = alive
+    return _QK_ATTN_BY_TAG_PTR.get(tag_ptr)
+
+
 def _muse_qk_norm_rope_impl(
     qkv: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
+    layer_tag: torch.Tensor,
     eps: float,
     qscale: float,
     use_rope: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import muse_qk_glue
+
+    attn_layer = _resolve_qk_attn_layer(layer_tag.data_ptr())
+    if attn_layer is not None:
+        attn_layer._qk_kv_cache_written = False
+        attn_layer._qk_kv_cache_written_rows = 0
+        if (
+            muse_qk_glue.FUSE_KVCACHE
+            and is_forward_context_available()
+            and not attn_layer.calculate_kv_scales
+            and attn_layer.kv_sharing_target_layer_name is None
+            and not attn_layer.attn_backend.forward_includes_kv_cache_update
+            and attn_layer.kv_cache_dtype in ("auto", "bfloat16")
+            and getattr(attn_layer.impl, "dcp_world_size", 1) == 1
+        ):
+            fwd_ctx = get_forward_context()
+            slot_map_dict = (
+                fwd_ctx.slot_mapping
+                if fwd_ctx.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
+                else None
+            )
+            layer_slot = (
+                slot_map_dict.get(attn_layer.layer_name)
+                if isinstance(slot_map_dict, dict)
+                else None
+            )
+            kv_cache = attn_layer.kv_cache
+            if layer_slot is not None and isinstance(kv_cache, torch.Tensor) and kv_cache.numel() > 0:
+                if qkv.shape[0] == 1:
+                    q_out, k_out, wrote = muse_qk_glue.run_qk_norm_rope_kvcache_m1(
+                        qkv,
+                        positions,
+                        cos_sin_cache,
+                        eps,
+                        qscale,
+                        use_rope,
+                        kv_cache,
+                        layer_slot,
+                    )
+                    if wrote:
+                        attn_layer._qk_kv_cache_written = True
+                        attn_layer._qk_kv_cache_written_rows = 1
+                    return q_out, k_out
+                if qkv.shape[0] > 1 and muse_qk_glue.FUSE_KVCACHE_PREFILL:
+                    q_first_row = 0
+                    if qkv.shape[0] == 512:
+                        try:
+                            import muse_final_slab as _mfs
+                            q_first_row = _mfs.q_first_row_if_active(attn_layer)
+                        except (ImportError, OSError, AttributeError):
+                            q_first_row = 0
+                    q_out, k_out, wrote = muse_qk_glue.run_qk_norm_rope_kvcache_prefill(
+                        qkv,
+                        positions,
+                        cos_sin_cache,
+                        eps,
+                        qscale,
+                        use_rope,
+                        kv_cache,
+                        layer_slot,
+                        q_first_row=q_first_row,
+                    )
+                    if wrote:
+                        attn_layer._qk_kv_cache_written_rows = int(qkv.shape[0])
+                    return q_out, k_out
 
     return muse_qk_glue.run_qk_norm_rope(
         qkv, positions, cos_sin_cache, eps, qscale, use_rope
@@ -1368,6 +1460,7 @@ def _muse_qk_norm_rope_fake(
     qkv: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
+    layer_tag: torch.Tensor,
     eps: float,
     qscale: float,
     use_rope: bool,
@@ -1651,6 +1744,8 @@ class MuseGlimmerAttention(nn.Module):
             per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
         )
+        if self._use_qk_fused:
+            _register_qk_attn_layer(self.attn)
         self._fp8_shared_input_scale = False
         self._fp8_dual_prefill = False
         self._bf16_dual_prefill = False
@@ -1708,6 +1803,7 @@ class MuseGlimmerAttention(nn.Module):
                 qkv,
                 positions,
                 cache,
+                self.attn._k_scale,
                 float(self.qk_norm.eps),
                 float(self.scale_query_by),
                 self.rotary_emb is not None,
@@ -2195,6 +2291,7 @@ class MuseGlimmerForCausalLM(
         # compute_logits chain (x * output_multiplier, then cap * tanh(x / cap)) evaluated by the same torch ops on
         # every BF16 value; ties go to the lowest index, as the stock greedy sampler's block argmax + argmax.
         self._lmpost_softcap_argmax = None
+        self._lmpost_softcap_argmax_into = None
         self._pack_persisting_norm_arena()
         # Gate-quant fold (harness/kernels/sandwich/muse_sandwich.py): register every FP8-attention layer's
         # qkv and output-gate input scales; the 512-row native sandwich of such a layer then also writes the
@@ -2211,6 +2308,7 @@ class MuseGlimmerForCausalLM(
         if has_sandwich_gate or register_decode_gate is not None:
             registered = 0
             decode_registered = 0
+            layer0_qkv_scale = None
             for layer in islice(self.model.layers, self.model.start_layer, self.model.end_layer):
                 attn = layer.self_attn
                 gate = getattr(attn, "output_gate_proj", None)
@@ -2222,10 +2320,15 @@ class MuseGlimmerForCausalLM(
                 )
                 if fp8 and qkv_scale is not None and gate_scale is not None:
                     if has_sandwich_gate:
-                        registered += bool(muse_sandwich.register_gate(qkv_scale, gate_scale))
+                        if muse_sandwich.register_gate(qkv_scale, gate_scale):
+                            registered += 1
+                            if getattr(attn, "layer_idx", -1) == 0:
+                                layer0_qkv_scale = qkv_scale
                     if register_decode_gate is not None:
                         decode_registered += bool(register_decode_gate(qkv_scale, gate_scale))
             if has_sandwich_gate:
+                if layer0_qkv_scale is not None:
+                    _install_layer0_sandwich_fold(layer0_qkv_scale)
                 logger.info("Gate-quant fold: %d FP8-attention layers registered with the native sandwich", registered)
             if register_decode_gate is not None:
                 logger.info("Decode gate-quant fold: %d FP8-attention layers registered with norm glue", decode_registered)
@@ -2237,6 +2340,7 @@ class MuseGlimmerForCausalLM(
                 lmpost._get_lut(dev, self.output_multiplier, self.final_logit_softcapping)
                 lmpost._get_scratch(dev)
                 self._lmpost_softcap_argmax = lmpost.softcap_argmax
+                self._lmpost_softcap_argmax_into = getattr(lmpost, "softcap_argmax_into", None)
         except ImportError:
             pass
 
@@ -2382,3 +2486,167 @@ class MuseGlimmerForCausalLM(
                     logger.warning("BF16 stacked qkv+gate prefill skipped on layer %d: %s", attn.layer_idx, exc)
         if bf16_stack_cnt:
             logger.info("Attention dual prefill: %d BF16 stacked qkv+gate", bf16_stack_cnt)
+
+
+_LAYER0_INPUT_NORM_HASH = "205ac75eb1f7a0ece86a243e894446a5b327438374179ec02f0225baedfaaf84"
+_layer0_fold_scales: dict[int, list[int]] = {}
+_layer0_fold_installed = False
+
+
+def _layer0_canonical_hash(src: str) -> str:
+    import hashlib
+    import re
+
+    m = re.search(r"^def\s+\w+\s*\(", src, re.MULTILINE)
+    if m is None:
+        return ""
+    body = re.sub(r"^def\s+\w+\s*\(", "def KERNEL(", src[m.start() :]).rstrip()
+    body = "\n".join(line.rstrip() for line in body.splitlines())
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _install_layer0_sandwich_fold(qkv_scale: torch.Tensor) -> None:
+    """Fold Layer-0's 512-row standalone input_layernorm + gate FP8 quant into muse_sandwich."""
+    global _layer0_fold_installed
+    if os.environ.get("MUSE_LAYER0_SANDWICH_FOLD", "1") == "0":
+        return
+    try:
+        import muse_norm_glue as _ng
+        import muse_sandwich as _ms
+        from torch._inductor.runtime.triton_heuristics import CachingAutotuner, get_active_debug_mode
+    except Exception:
+        return
+    if _ng.lib() is None or qkv_scale.data_ptr() not in getattr(_ms, "_layers", {}):
+        return
+    _layer0_fold_scales.setdefault(qkv_scale.data_ptr(), [0])
+    if _layer0_fold_installed:
+        return
+
+    prev_run = CachingAutotuner.run
+
+    def _try_fold(autotuner, args, kwargs) -> bool:
+        stream = kwargs.get("stream")
+        if (
+            stream is None
+            or any(k not in ("stream", "benchmark_run") for k in kwargs)
+            or getattr(autotuner, "triton_interpret", False)
+            or get_active_debug_mode()
+            or not getattr(_ms, "active", False)
+        ):
+            return False
+        src_ok = autotuner.__dict__.get("_l0_inorm_ok")
+        if src_ok is None:
+            fn = getattr(autotuner, "fn", None)
+            src_ok = fn is not None and _layer0_canonical_hash(getattr(fn, "src", "")) == _LAYER0_INPUT_NORM_HASH
+            autotuner.__dict__["_l0_inorm_ok"] = src_ok
+        if not src_ok:
+            return False
+        x, wi, sc, o, q = args[:5]
+        if (
+            not all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (x, wi, sc, o, q))
+            or x.dtype != torch.bfloat16
+            or x.numel() != 512 * 6656
+            or wi.dtype != torch.bfloat16
+            or wi.numel() != 6656
+            or sc.dtype != torch.float32
+            or sc.numel() != 1
+            or o.dtype != torch.bfloat16
+            or o.numel() != 512 * 6656
+            or q.dtype != torch.float8_e4m3fn
+            or q.numel() != 512 * 6656
+            or ((x.data_ptr() | wi.data_ptr() | o.data_ptr() | q.data_ptr()) & 15) != 0
+        ):
+            return False
+        sc_ptr = sc.data_ptr()
+        s_layer = _ms._layers.get(sc_ptr)
+        slot = _layer0_fold_scales.get(sc_ptr)
+        _ms._pending = None
+        if s_layer is None or slot is None or s_layer.state == "rejected":
+            return False
+        if _ms._expect is not None:
+            if _ms._expect[2]:
+                raise RuntimeError("muse_sandwich gate fold: a folded requant output was never consumed by its GEMM")
+            _ms._expect[1].state = "rejected"
+            _ms._fold_counts["rejected_order"] += 1
+            _ms._expect = None
+        if s_layer.state == "admitted" and slot[0] in (8, 16):
+            _ng.input_fp8_gate(
+                slot[0], 512, x, wi, sc, o, q, s_layer.gate_scale, s_layer.buffer, not _ms.DROP_HIDDEN, stream
+            )
+            _ms._pending = (o.data_ptr(), s_layer, q.data_ptr())
+            _ms._launch_counts[512, True] += 1
+            _ms._fold_counts["sandwich_folded"] += 1
+            return True
+        if torch.cuda.is_current_stream_capturing() or s_layer.state != "unchecked":
+            return False
+        sc_val = float(sc.reshape(()).item())
+        gs_val = float(s_layer.gate_scale.reshape(()).item())
+        if not (1.2e-38 < abs(sc_val) < 8.5e37 and 1.2e-38 < abs(gs_val) < 8.5e37):
+            s_layer.state = "rejected"
+            _ms._fold_counts["rejected_sandwich"] += 1
+            return False
+        x_s, wi_s, sc_s = x.clone(), wi.clone(), sc.clone()
+        prev_run(autotuner, *args, **kwargs)
+        matched_w = 0
+        try:
+            o_c = torch.empty_like(o)
+            q_c = torch.empty_like(q)
+            for cand_w in (8, 16):
+                _ng.input_fp8_gate(
+                    cand_w, 512, x_s, wi_s, sc_s, o_c, q_c, s_layer.gate_scale, s_layer.buffer, True, stream
+                )
+                torch.cuda.synchronize(x.device)
+                if torch.equal(o_c.view(torch.uint16), o.view(torch.uint16)) and torch.equal(
+                    q_c.view(torch.uint8), q.view(torch.uint8)
+                ):
+                    gen = torch.Generator(device=x.device).manual_seed(20261128)
+                    probes_ok = True
+                    for sig in (0.05, 1.0, 8.0, 32.0):
+                        xr = (torch.randn((512, 6656), generator=gen, device=x.device) * sig).to(torch.bfloat16)
+                        or_ref = torch.empty_like(o)
+                        qr_ref = torch.empty_like(q)
+                        prev_run(autotuner, xr, wi_s, sc_s, or_ref, qr_ref, 512, 6656, **kwargs)
+                        _ng.input_fp8_gate(
+                            cand_w, 512, xr, wi_s, sc_s, o_c, q_c, s_layer.gate_scale, s_layer.buffer, True, stream
+                        )
+                        torch.cuda.synchronize(x.device)
+                        if not (
+                            torch.equal(o_c.view(torch.uint16), or_ref.view(torch.uint16))
+                            and torch.equal(q_c.view(torch.uint8), qr_ref.view(torch.uint8))
+                        ):
+                            probes_ok = False
+                            break
+                    if probes_ok:
+                        _ng.input_fp8_gate(
+                            cand_w, 512, x_s, wi_s, sc_s, o_c, q_c, s_layer.gate_scale, s_layer.buffer, True, stream
+                        )
+                        torch.cuda.synchronize(x.device)
+                        matched_w = cand_w
+                        break
+        except Exception:
+            matched_w = 0
+        if matched_w in (8, 16):
+            slot[0] = matched_w
+            s_layer.state = "sandwich_ok"
+            s_layer.checked_hidden = o.data_ptr()
+            _ms._pending = (o.data_ptr(), s_layer, q.data_ptr())
+        else:
+            s_layer.state = "rejected"
+            _ms._fold_counts["rejected_sandwich"] += 1
+        return True
+
+    def run(self, *args, **kwargs):
+        if (
+            len(args) == 7
+            and args[5] == 512
+            and args[6] == 6656
+            and not kwargs.get("benchmark_run", False)
+            and isinstance(args[2], torch.Tensor)
+            and args[2].data_ptr() in _layer0_fold_scales
+        ):
+            if _try_fold(self, args, kwargs):
+                return None
+        return prev_run(self, *args, **kwargs)
+
+    CachingAutotuner.run = run
+    _layer0_fold_installed = True
