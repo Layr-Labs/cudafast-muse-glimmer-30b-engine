@@ -345,6 +345,20 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
     issued++; \
   }
 
+  const uint32_t lut_sa = static_cast<uint32_t>(__cvta_generic_to_shared(sh_lut));
+  for (int i = tid; i < 256; i += blockDim.x) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                 ::"r"(lut_sa + 16u * static_cast<uint32_t>(i)),
+                   "l"(reinterpret_cast<const uint4*>(blob) + i));
+  }
+  asm volatile("cp.async.commit_group;" ::: "memory");
+  int pre_gmin = 0, pre_wo0 = 0, pre_wo1 = 0, pre_tof = 0;
+  if (active && fast_shape) {
+    pre_gmin = static_cast<int>(__ldg(&meta[2]));
+    pre_wo0 = __ldg(woff16 + w);
+    pre_wo1 = __ldg(woff16 + w + 1);
+    pre_tof = __ldg(woff16 + tw + 1 + w);
+  }
   if (active) {
     if (fast_shape) {
 #pragma unroll
@@ -372,13 +386,10 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
       asm volatile("prefetch.global.L2 [%0];" ::"l"(stream + off));
     }
   }
-  for (int i = tid; i < 256; i += blockDim.x) {
-    reinterpret_cast<uint4*>(sh_lut)[i] = reinterpret_cast<const uint4*>(blob)[i];
-  }
   if (active && fast_shape) {
-    gmin = static_cast<int>(__ldg(&meta[2]));
-    wbytes = static_cast<uint32_t>(woff16[w + 1] - woff16[w]) * 16u;
-    toffw = woff16[tw + 1 + w];
+    gmin = pre_gmin;
+    wbytes = static_cast<uint32_t>(pre_wo1 - pre_wo0) * 16u;
+    toffw = pre_tof;
   }
   if (pdl_mode & 1) {
     // SM121 PDL consumer barrier: weight ring groups, TLB prefetches, sh_lut, and offsets
@@ -391,6 +402,11 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
     const int step = rem >> 5;
     const int ln = rem & 31;
     sh_x[tile * kValues + ln * kSteps + step] = x_in[i];
+  }
+  if (active) {
+    asm volatile("cp.async.wait_group %0;" ::"n"(RG - 1) : "memory");
+  } else {
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
   }
   __syncthreads();
   if (!active) return;
