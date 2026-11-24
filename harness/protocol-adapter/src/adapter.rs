@@ -107,6 +107,8 @@ pub struct Adapter<F: EngineFactory> {
     spec_modes: Vec<Route>,
     /// Monotonic count of timed steps completed in the current phase.
     completed_work: i64,
+    /// Reusable response buffer to avoid per-request allocations on timed verbs.
+    out_buf: Vec<u8>,
 }
 
 impl<F: EngineFactory> Adapter<F> {
@@ -141,6 +143,7 @@ impl<F: EngineFactory> Adapter<F> {
             phase: None,
             spec_modes: vec![Route::Serial, Route::Mtp],
             completed_work: 0,
+            out_buf: Vec::with_capacity(16 * 1024),
         }
     }
 
@@ -155,7 +158,11 @@ impl<F: EngineFactory> Adapter<F> {
     /// protocol/engine errors are reported inline (`ok:false`) and the loop
     /// continues after discarding the phase session. On EOF any in-flight
     /// session is discarded fail-closed.
-    pub fn run<R: BufRead, W: Write>(&mut self, input: R, mut output: W) -> std::io::Result<()> {
+    pub fn run<R: BufRead, W: Write>(
+        &mut self,
+        mut input: R,
+        mut output: W,
+    ) -> std::io::Result<()> {
         // Unsolicited startup hello (id = 0): announces protocol version +
         // backend/device, ADVERTISES the runnable spec modes and the optional
         // surfaces, and establishes the session nonce.
@@ -192,12 +199,17 @@ impl<F: EngineFactory> Adapter<F> {
         };
         self.emit(&mut output, &hello)?;
 
-        for line in input.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
+        let mut line = String::with_capacity(16 * 1024);
+        loop {
+            line.clear();
+            if input.read_line(&mut line)? == 0 {
+                break;
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.trim().is_empty() {
                 continue;
             }
-            let response = self.service(&line);
+            let response = self.service(trimmed);
             self.emit(&mut output, &response)?;
         }
 
@@ -685,10 +697,11 @@ impl<F: EngineFactory> Adapter<F> {
     }
 
     /// Serialize one response as a single NDJSON line (object + '\n') and flush.
-    fn emit<W: Write>(&self, output: &mut W, response: &WorkerResponse) -> std::io::Result<()> {
-        let mut line = serde_json::to_vec(response).expect("WorkerResponse serializes");
-        line.push(b'\n');
-        output.write_all(&line)?;
+    fn emit<W: Write>(&mut self, output: &mut W, response: &WorkerResponse) -> std::io::Result<()> {
+        self.out_buf.clear();
+        serde_json::to_writer(&mut self.out_buf, response).expect("WorkerResponse serializes");
+        self.out_buf.push(b'\n');
+        output.write_all(&self.out_buf)?;
         output.flush()
     }
 }

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import sys
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -28,6 +30,11 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# LOCAL PATCH (cudafast-nemotron35): blocks BlockPool._canonical_head restores.
+_CANONICAL_HEAD = (
+    64 if os.environ.get("VLLM_CANONICAL_BLOCK_HEAD", "1") != "0" else 0
+)
 
 
 class BlockHashToBlockMap:
@@ -177,8 +184,27 @@ class BlockPool:
         ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        # enabled). Keep block 0 first as the null block, and order remaining
+        # free blocks from fastest to slowest DRAM pages when KV probes exist.
+        ordered_blocks = self.blocks
+        dp_mod = sys.modules.get(
+            "vllm.model_executor.kernels.linear.nvfp4.decode_placement"
+        )
+        if dp_mod is not None and num_gpu_blocks > 2:
+            get_ranks = getattr(dp_mod, "get_kv_block_ranks", None)
+            ranks = get_ranks(num_gpu_blocks) if callable(get_ranks) else None
+            if ranks is not None and len(ranks) == num_gpu_blocks:
+                rest = sorted(self.blocks[1:], key=lambda b: ranks[b.block_id])
+                ordered_blocks = [self.blocks[0]] + rest
+        self.free_block_queue = FreeKVCacheBlockQueue(ordered_blocks)
+        k_canon = (
+            min(_CANONICAL_HEAD, self.num_gpu_blocks - 1)
+            if _CANONICAL_HEAD > 0
+            else 0
+        )
+        self._canonical_blocks: list[KVCacheBlock] = (
+            list(ordered_blocks[1 : k_canon + 1]) if k_canon > 0 else []
+        )
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -189,6 +215,8 @@ class BlockPool:
         # avoid freeing it.
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
+        if _CANONICAL_HEAD and not self.enable_caching:
+            self._canonical_head()
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
@@ -740,6 +768,40 @@ class BlockPool:
         # Blocks without hash get evicted first - prepend them last to the tail
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
+        if (
+            _CANONICAL_HEAD
+            and not self.enable_caching
+            and self.free_block_queue.num_free_blocks == self.num_gpu_blocks - 1
+        ):
+            self._canonical_head()
+
+    def _canonical_head(self) -> None:
+        """LOCAL PATCH (cudafast-nemotron35): with caching disabled a freed block
+        keeps no content anyone may read again, only its address. When every
+        block is free again (the last request is gone), put blocks 1..K back
+        at the head of the free queue in id order, so the next request gets
+        the block ids the first request after boot got, whatever ran before.
+        Which physical blocks hold a request's KV and Mamba state changes no
+        value; it lets the fresh-prefill graph (prefill_graph.py) find its
+        block-derived metadata already in place. VLLM_CANONICAL_BLOCK_HEAD=0
+        disables."""
+        queue = self.free_block_queue
+        head = getattr(self, "_canonical_blocks", None)
+        if not head:
+            k = min(_CANONICAL_HEAD, self.num_gpu_blocks - 1)
+            head = self.blocks[1 : k + 1]
+        block = queue.fake_free_list_head.next_free_block
+        matched = True
+        for target_blk in head:
+            if block is None or block.block_id != target_blk.block_id:
+                matched = False
+                break
+            block = block.next_free_block
+        if matched:
+            return
+        for block in head:
+            queue.remove(block)
+        queue.prepend_n(head)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

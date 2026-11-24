@@ -12,6 +12,7 @@
 // multiple of 16.
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdlib>
 #ifdef __linux__
 #include <pthread.h>
 #include <sched.h>
@@ -24,11 +25,16 @@ namespace l2pf {
 
 constexpr uint32_t kMaxPiece = 1u << 16;
 
-__device__ __forceinline__ void bulk_prefetch(const uint8_t* p, uint32_t n) {
+__device__ __forceinline__ void bulk_prefetch_normal(const uint8_t* p, uint32_t n) {
+  asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n"
+               :: "l"(p), "r"(n) : "memory");
+}
+
+__device__ __forceinline__ void bulk_prefetch_evict_last(const uint8_t* p, uint32_t n) {
   uint64_t pol;
   asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
   asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;\n"
-               ::"l"(p), "r"(n), "l"(pol) : "memory");
+               :: "l"(p), "r"(n), "l"(pol) : "memory");
 }
 
 __global__ void prefetch_kernel(const uint8_t* __restrict__ p, size_t bytes, uint32_t chunk) {
@@ -37,13 +43,13 @@ __global__ void prefetch_kernel(const uint8_t* __restrict__ p, size_t bytes, uin
   for (size_t off = tid * chunk; off < bytes; off += nthr * chunk) {
     const size_t n = bytes - off < chunk ? bytes - off : chunk;
     const uint32_t m = (uint32_t)(n & ~(size_t)15);
-    if (m) bulk_prefetch(p + off, m);
+    if (m) bulk_prefetch_normal(p + off, m);
   }
 }
 
 // Descriptor j is three 64-bit words: base address, pitch in bytes, and
-// (segment bytes << 32 | segment count). It names `count` segments of `seg`
-// bytes at base + r * pitch. Segments are dealt round-robin over all threads.
+// (raw_seg << 32 | segment count), where bit 31 of raw_seg requests L2::evict_last
+// and bits 0..30 hold segment bytes. Segments are dealt round-robin over all threads.
 __global__ void prefetch_desc_kernel(const unsigned long long* __restrict__ d, int nd) {
   const uint32_t nthr = gridDim.x * blockDim.x;
   const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -52,10 +58,16 @@ __global__ void prefetch_desc_kernel(const unsigned long long* __restrict__ d, i
     const unsigned long long base = d[3 * j];
     const unsigned long long pitch = d[3 * j + 1];
     const unsigned long long sc = d[3 * j + 2];
-    const uint32_t seg = (uint32_t)(sc >> 32);
+    const uint32_t raw_seg = (uint32_t)(sc >> 32);
+    const uint32_t seg = raw_seg & 0x7fffffffu;
+    const bool evict_last = (raw_seg >> 31) != 0;
     const uint32_t cnt = (uint32_t)(sc & 0xffffffffull);
     uint32_t r = (tid + nthr - first) % nthr;
-    for (; r < cnt; r += nthr) bulk_prefetch((const uint8_t*)(base + r * pitch), seg);
+    if (evict_last) {
+      for (; r < cnt; r += nthr) bulk_prefetch_evict_last((const uint8_t*)(base + r * pitch), seg);
+    } else {
+      for (; r < cnt; r += nthr) bulk_prefetch_normal((const uint8_t*)(base + r * pitch), seg);
+    }
     first = (first + cnt) % nthr;
   }
 }
@@ -70,10 +82,16 @@ __global__ void prefetch_desc_spread_kernel(const unsigned long long* __restrict
     const unsigned long long base = d[3 * j];
     const unsigned long long pitch = d[3 * j + 1];
     const unsigned long long sc = d[3 * j + 2];
-    const uint32_t seg = (uint32_t)(sc >> 32);
+    const uint32_t raw_seg = (uint32_t)(sc >> 32);
+    const uint32_t seg = raw_seg & 0x7fffffffu;
+    const bool evict_last = (raw_seg >> 31) != 0;
     const uint32_t cnt = (uint32_t)(sc & 0xffffffffull);
     uint32_t r = (tid + nthr - first) % nthr;
-    for (; r < cnt; r += nthr) bulk_prefetch((const uint8_t*)(base + r * pitch), seg);
+    if (evict_last) {
+      for (; r < cnt; r += nthr) bulk_prefetch_evict_last((const uint8_t*)(base + r * pitch), seg);
+    } else {
+      for (; r < cnt; r += nthr) bulk_prefetch_normal((const uint8_t*)(base + r * pitch), seg);
+    }
     first = (first + cnt) % nthr;
   }
 }
@@ -113,27 +131,148 @@ int l2pf_prefetch_desc(const void* desc, int ndesc, int blocks, int threads, voi
   return (int)cudaGetLastError();
 }
 
+static bool l2pf_stream_capturing(cudaStream_t st) {
+  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(st, &status) != cudaSuccess) return false;
+  return status != cudaStreamCaptureStatusNone;
+}
+
+static void l2pf_clamp_window(size_t* num_bytes, size_t* limit_bytes) {
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return;
+  static int cached_max_persist[16] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+  static int cached_max_win[16] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+  int max_persist = -1;
+  int max_win = -1;
+  if (dev >= 0 && dev < 16 && cached_max_persist[dev] >= 0 && cached_max_win[dev] >= 0) {
+    max_persist = cached_max_persist[dev];
+    max_win = cached_max_win[dev];
+  } else {
+    cudaStreamCaptureMode prev = cudaStreamCaptureModeRelaxed;
+    const bool exchanged = (cudaThreadExchangeStreamCaptureMode(&prev) == cudaSuccess);
+    if (cudaDeviceGetAttribute(&max_persist, cudaDevAttrMaxPersistingL2CacheSize, dev) != cudaSuccess) {
+      max_persist = -1;
+    }
+    if (cudaDeviceGetAttribute(&max_win, cudaDevAttrMaxAccessPolicyWindowSize, dev) != cudaSuccess) {
+      max_win = -1;
+    }
+    if (exchanged) {
+      cudaStreamCaptureMode tmp = prev;
+      (void)cudaThreadExchangeStreamCaptureMode(&tmp);
+    }
+    if (dev >= 0 && dev < 16 && max_persist >= 0 && max_win >= 0) {
+      cached_max_persist[dev] = max_persist;
+      cached_max_win[dev] = max_win;
+    }
+  }
+  if (limit_bytes && max_persist >= 0) {
+    if (max_persist == 0) {
+      *limit_bytes = 0;
+      if (num_bytes) *num_bytes = 0;
+    } else if (*limit_bytes > static_cast<size_t>(max_persist)) {
+      *limit_bytes = static_cast<size_t>(max_persist);
+    }
+  }
+  if (num_bytes && max_win >= 0) {
+    if (max_win == 0) {
+      *num_bytes = 0;
+    } else if (*num_bytes > static_cast<size_t>(max_win)) {
+      *num_bytes = static_cast<size_t>(max_win);
+    }
+  }
+}
+
 int l2pf_set_persisting_window(const void* base_ptr, size_t num_bytes, size_t limit_bytes, void* stream) {
-  if (limit_bytes > 0) {
+  cudaStream_t cu_stream = reinterpret_cast<cudaStream_t>(stream);
+  const bool capturing = l2pf_stream_capturing(cu_stream);
+  l2pf_clamp_window(&num_bytes, &limit_bytes);
+  if (!capturing && limit_bytes > 0) {
     cudaError_t e = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, limit_bytes);
     if (e != cudaSuccess) return (int)e;
   }
   cudaStreamAttrValue attr{};
-  attr.accessPolicyWindow.base_ptr = const_cast<void*>(base_ptr);
+  attr.accessPolicyWindow.base_ptr = (num_bytes > 0) ? const_cast<void*>(base_ptr) : nullptr;
   attr.accessPolicyWindow.num_bytes = num_bytes;
   attr.accessPolicyWindow.hitRatio = (num_bytes > 0) ? 1.0f : 0.0f;
   attr.accessPolicyWindow.hitProp = (num_bytes > 0) ? cudaAccessPropertyPersisting : cudaAccessPropertyNormal;
-  attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-  cudaError_t se = cudaStreamSetAttribute(reinterpret_cast<cudaStream_t>(stream),
-                                          cudaStreamAttributeAccessPolicyWindow, &attr);
-  if (limit_bytes == 0) {
+  attr.accessPolicyWindow.missProp = (num_bytes > 0) ? cudaAccessPropertyStreaming : cudaAccessPropertyNormal;
+  cudaError_t se = cudaStreamSetAttribute(cu_stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+  if (!capturing && limit_bytes == 0) {
     (void)cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0);
   }
   return (int)se;
 }
 
+int l2pf_clear_stream_persisting_window(void* stream) {
+  cudaStreamAttrValue attr{};
+  attr.accessPolicyWindow.base_ptr = nullptr;
+  attr.accessPolicyWindow.num_bytes = 0;
+  attr.accessPolicyWindow.hitRatio = 0.0f;
+  attr.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+  attr.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+  cudaError_t se = cudaStreamSetAttribute(reinterpret_cast<cudaStream_t>(stream),
+                                          cudaStreamAttributeAccessPolicyWindow, &attr);
+  return (int)se;
+}
+
+int l2pf_set_persisting_window_ex(const void* base_ptr, size_t num_bytes, size_t limit_bytes,
+                                  int miss_streaming, void* stream) {
+  cudaStream_t cu_stream = reinterpret_cast<cudaStream_t>(stream);
+  const bool capturing = l2pf_stream_capturing(cu_stream);
+  l2pf_clamp_window(&num_bytes, &limit_bytes);
+  if (!capturing && limit_bytes > 0) {
+    cudaError_t e = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, limit_bytes);
+    if (e != cudaSuccess) return (int)e;
+  }
+  cudaStreamAttrValue attr{};
+  attr.accessPolicyWindow.base_ptr = (num_bytes > 0) ? const_cast<void*>(base_ptr) : nullptr;
+  attr.accessPolicyWindow.num_bytes = num_bytes;
+  attr.accessPolicyWindow.hitRatio = (num_bytes > 0) ? 1.0f : 0.0f;
+  attr.accessPolicyWindow.hitProp = (num_bytes > 0) ? cudaAccessPropertyPersisting : cudaAccessPropertyNormal;
+  attr.accessPolicyWindow.missProp =
+      (num_bytes > 0 && miss_streaming) ? cudaAccessPropertyStreaming : cudaAccessPropertyNormal;
+  cudaError_t se = cudaStreamSetAttribute(cu_stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+  return (int)se;
+}
+
+int l2pf_set_max_l2_fetch_granularity(int bytes) {
+  if (bytes != 32 && bytes != 64 && bytes != 128) return -1;
+  if (l2pf_stream_capturing(nullptr)) return 0;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+  cudaError_t e = cudaDeviceSetLimit(cudaLimitMaxL2FetchGranularity, static_cast<size_t>(bytes));
+  return (int)e;
+#else
+  return -1;
+#endif
+}
+
 #ifdef __linux__
 static std::atomic<bool> g_tickle_started{false};
+static std::atomic<long> g_tickle_ns{1000000L};
+static std::atomic<long> g_prefill_tickle_ns{-1L};
+
+static long resolve_prefill_tickle_ns() {
+  long v = g_prefill_tickle_ns.load(std::memory_order_relaxed);
+  if (v > 0L) return v;
+  long ns = 1000000L;  // 1 ms default in both prefill and decode to prevent ARM LPI-3 entry
+  const char* env = std::getenv("L2PF_PREFILL_TICKLE_MS");
+  if (env && *env) {
+    char* end = nullptr;
+    long ms = std::strtol(env, &end, 10);
+    if (end != env && ms >= 1L) {
+      if (ms > 999L) ms = 999L;
+      ns = ms * 1000000L;
+    }
+  }
+  g_prefill_tickle_ns.store(ns, std::memory_order_relaxed);
+  return ns;
+}
+
+int l2pf_set_tickle_phase(int is_decode) {
+  const long ns = is_decode ? 1000000L : resolve_prefill_tickle_ns();
+  g_tickle_ns.store(ns, std::memory_order_relaxed);
+  return 0;
+}
 
 static void* l2pf_tickle_worker(void* arg) {
   int cpu = static_cast<int>(reinterpret_cast<intptr_t>(arg));
@@ -147,10 +286,10 @@ static void* l2pf_tickle_worker(void* arg) {
   struct sched_param sp{};
   sp.sched_priority = 0;
   (void)sched_setscheduler(0, SCHED_IDLE, &sp);
-  struct timespec req{};
-  req.tv_sec = 0;
-  req.tv_nsec = 1000000L;  // 1 ms
   for (;;) {
+    struct timespec req{};
+    req.tv_sec = 0;
+    req.tv_nsec = g_tickle_ns.load(std::memory_order_relaxed);
     (void)nanosleep(&req, nullptr);
   }
   return nullptr;
@@ -172,6 +311,7 @@ int l2pf_start_idle_tickle(const int* cpus, int count) {
   return started;
 }
 #else
+int l2pf_set_tickle_phase(int) { return 0; }
 int l2pf_start_idle_tickle(const int*, int) { return 0; }
 #endif
 

@@ -130,6 +130,9 @@ __device__ __forceinline__ uint64_t pol_ef() {
 __device__ __forceinline__ void cp_async16_ef(uint32_t sd, const void* gs, uint64_t pol) {
   asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(sd), "l"(gs), "l"(pol));
 }
+__device__ __forceinline__ void cp_async16_ca(uint32_t sd, const void* gs) {
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(sd), "l"(gs));
+}
 __device__ __forceinline__ uint32_t lds32(uint32_t a) {
   uint32_t v;
   asm volatile("ld.shared.u32 %0, [%1];" : "=r"(v) : "r"(a));
@@ -281,7 +284,31 @@ static size_t bf16_tpf_stride() {
   return stride;
 }
 
-__global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
+static int g_bf16_pdl = -1;
+static int g_bf16_gate_blocks = -1;
+
+static bool bf16_pdl_enabled() {
+  static const bool env_off = []() {
+    const char* off = std::getenv("MUSE_PDL_OFF");
+    return off && *off && std::strtol(off, nullptr, 10) != 0;
+  }();
+  static const bool env_pdl = []() {
+    const char* env = std::getenv("MUSE_BF16_PDL");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  if (env_off) return false;
+  return (g_bf16_pdl >= 0) ? (g_bf16_pdl != 0) : env_pdl;
+}
+
+static int bf16_gate_blocks() {
+  static const int env_blks = []() {
+    const char* env = std::getenv("MUSE_BF16_GATE_32_BLOCKS");
+    return (env && *env && std::strtol(env, nullptr, 10) != 0) ? 32 : 48;
+  }();
+  return (g_bf16_gate_blocks == 32 || g_bf16_gate_blocks == 48) ? g_bf16_gate_blocks : env_blks;
+}
+
+__global__ void __launch_bounds__(576, 1) bf16_rans_gemv_kernel(
     const uint16_t* __restrict__ x_in,
     const uint8_t* __restrict__ blob,
     uint16_t* __restrict__ out,
@@ -307,7 +334,7 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
   const int soff = fast_shape ? ((rows == 4096) ? 8704 : 9216) : static_cast<int>(__ldg(&meta[3]));
 
   const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
-  const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + static_cast<uint32_t>(wib) * RB;
+  const uint32_t ring_s = sbase0 + static_cast<uint32_t>(wib) * RB;
   // Even 48-SM virtual warp distribution (avoids leaving SM 47 idle on rows=4096, tw=512).
   const int q_w = tw / gridDim.x;
   const int rem_w = tw % gridDim.x;
@@ -330,6 +357,13 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
     asm volatile("cp.async.commit_group;" ::: "memory"); \
     issued++; \
   }
+
+  // Async sh_lut (4 KiB) load BEFORE weight pre-issue & PDL wait so it overlaps sh_x staging.
+  const uint32_t sh_lut_base = static_cast<uint32_t>(__cvta_generic_to_shared(sh_lut));
+  for (int i = tid; i < 256; i += blockDim.x) {
+    cp_async16_ca(sh_lut_base + static_cast<uint32_t>(i * 16), reinterpret_cast<const uint4*>(blob) + i);
+  }
+  asm volatile("cp.async.commit_group;" ::: "memory");
 
   if (active) {
     if (fast_shape) {
@@ -358,24 +392,47 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
       asm volatile("prefetch.global.L2 [%0];" ::"l"(stream + off));
     }
   }
-  for (int i = tid; i < 256; i += blockDim.x) {
-    reinterpret_cast<uint4*>(sh_lut)[i] = reinterpret_cast<const uint4*>(blob)[i];
-  }
-  for (int i = tid; i < kWidth; i += blockDim.x) {
-    const int tile = i / kValues;
-    const int rem = i - tile * kValues;
-    const int step = rem >> 5;
-    const int ln = rem & 31;
-    sh_x[tile * kValues + ln * kSteps + step] = x_in[i];
-  }
   if (active && fast_shape) {
     gmin = static_cast<int>(__ldg(&meta[2]));
     wbytes = static_cast<uint32_t>(woff16[w + 1] - woff16[w]) * 16u;
     toffw = woff16[tw + 1 + w];
   }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+  if ((reinterpret_cast<uintptr_t>(x_in) & 15u) == 0u) {
+    const uint4* __restrict__ x4_in = reinterpret_cast<const uint4*>(x_in);
+    for (int j = tid; j < kWidth / 8; j += blockDim.x) {
+      const uint4 xv = __ldg(&x4_in[j]);
+      const int tile = j >> 5;
+      const int step = (j >> 2) & 7;
+      const int ln0 = (j & 3) << 3;
+      uint16_t* dst = sh_x + tile * kValues + ln0 * kSteps + step;
+      dst[0 * kSteps] = static_cast<uint16_t>(xv.x & 0xFFFFu);
+      dst[1 * kSteps] = static_cast<uint16_t>(xv.x >> 16);
+      dst[2 * kSteps] = static_cast<uint16_t>(xv.y & 0xFFFFu);
+      dst[3 * kSteps] = static_cast<uint16_t>(xv.y >> 16);
+      dst[4 * kSteps] = static_cast<uint16_t>(xv.z & 0xFFFFu);
+      dst[5 * kSteps] = static_cast<uint16_t>(xv.z >> 16);
+      dst[6 * kSteps] = static_cast<uint16_t>(xv.w & 0xFFFFu);
+      dst[7 * kSteps] = static_cast<uint16_t>(xv.w >> 16);
+    }
+  } else {
+    for (int i = tid; i < kWidth; i += blockDim.x) {
+      const int tile = i / kValues;
+      const int rem = i - tile * kValues;
+      const int step = rem >> 5;
+      const int ln = rem & 31;
+      sh_x[tile * kValues + ln * kSteps + step] = __ldg(&x_in[i]);
+    }
+  }
+  if (active) {
+    asm volatile("cp.async.wait_group %0;" ::"n"(RG - 1) : "memory");
+  } else {
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+  }
   __syncthreads();
   if (!active) return;
-
   const uint32_t lt = (1u << lane) - 1u;
   asm volatile("cp.async.wait_group %0;" ::"n"(RG - 2) : "memory");
   __syncwarp();
@@ -389,11 +446,18 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
   for (int row = w; row < rows; row += tw) {
     float accum = 0.0f;
     for (int tile = 0; tile < kTiles; ++tile) {
-      __syncwarp();
+      // Issue the first 4 independent sh_lut lookups before any cp.async wait so SMEM latency overlaps with DRAM waits.
+      const uint32_t he0 = sh_lut[st[0] & 1023u];
+      const uint32_t he1 = sh_lut[st[1] & 1023u];
+      const uint32_t he2 = sh_lut[st[2] & 1023u];
+      const uint32_t he3 = sh_lut[st[3] & 1023u];
       const int curg = static_cast<int>(pwb >> 9);
-      while (issued <= curg + static_cast<int>(RG) - 1) BF_ISSUE();
-      asm volatile("cp.async.wait_group %0;" ::"n"(RG - 2) : "memory");
-      __syncwarp();
+      if (issued <= curg + static_cast<int>(RG) - 1) {
+        __syncwarp();
+        do { BF_ISSUE(); } while (issued <= curg + static_cast<int>(RG) - 1);
+        asm volatile("cp.async.wait_group %0;" ::"n"(RG - 2) : "memory");
+        __syncwarp();
+      }
       uint32_t lo0, lo1;
       const uint32_t a0 = pwb + 8u * static_cast<uint32_t>(lane);
       if ((pwb & 2u) == 0u) {
@@ -407,20 +471,59 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
       const uint4 x4 = reinterpret_cast<const uint4*>(sh_x + tile * kValues + lane * kSteps)[0];
       const uint32_t xw[4] = {x4.x, x4.y, x4.z, x4.w};
 #pragma unroll
-      for (int step = 0; step < kSteps; ++step) {
-        uint32_t& rx = st[step & 3];
-        const uint32_t e = sh_lut[rx & 1023u];
-        rx = ((e >> 8) & 2047u) * (rx >> 10) + (e >> 19);
-        const uint32_t exp_bits = (e & 255u) << 23;
-        const uint32_t sm_dup = __byte_perm(lo0, lo1, (step << 12) | (step << 8));
-        const bool need = rx < kRansL;
-        const uint32_t msk = __ballot_sync(0xffffffffu, need);
-        if (need) rx = (rx << 16) | lds16(ring_s + ((pwb + (__popc(msk & lt) << 1)) & (RB - 1u)));
-        pwb += __popc(msk) << 1;
-        const float wv = __uint_as_float((sm_dup & 0x807F0000u) | exp_bits);
-        const uint32_t xpair = xw[step >> 1];
-        const float xv = __uint_as_float((step & 1) ? (xpair & 0xFFFF0000u) : (xpair << 16));
-        accum = __fmaf_rn(xv, wv, accum);
+      for (int half = 0; half < 2; ++half) {
+        const int base = half * 4;
+        uint32_t e0, e1, e2, e3;
+        if (half == 0) {
+          e0 = he0;
+          e1 = he1;
+          e2 = he2;
+          e3 = he3;
+        } else {
+          e0 = sh_lut[st[0] & 1023u];
+          e1 = sh_lut[st[1] & 1023u];
+          e2 = sh_lut[st[2] & 1023u];
+          e3 = sh_lut[st[3] & 1023u];
+          if (issued <= static_cast<int>(pwb >> 9) + 3) {
+            __syncwarp();
+            do { BF_ISSUE(); } while (issued <= static_cast<int>(pwb >> 9) + 3);
+            asm volatile("cp.async.wait_group %0;" ::"n"(RG - 2) : "memory");
+            __syncwarp();
+          }
+        }
+        uint32_t rx0 = ((e0 >> 8) & 2047u) * (st[0] >> 10) + (e0 >> 19);
+        uint32_t rx1 = ((e1 >> 8) & 2047u) * (st[1] >> 10) + (e1 >> 19);
+        uint32_t rx2 = ((e2 >> 8) & 2047u) * (st[2] >> 10) + (e2 >> 19);
+        uint32_t rx3 = ((e3 >> 8) & 2047u) * (st[3] >> 10) + (e3 >> 19);
+        const bool n0 = rx0 < kRansL, n1 = rx1 < kRansL, n2 = rx2 < kRansL, n3 = rx3 < kRansL;
+        const uint32_t m0 = __ballot_sync(0xffffffffu, n0);
+        const uint32_t m1 = __ballot_sync(0xffffffffu, n1);
+        const uint32_t m2 = __ballot_sync(0xffffffffu, n2);
+        const uint32_t m3 = __ballot_sync(0xffffffffu, n3);
+        const uint32_t p0 = pwb;
+        const uint32_t p1 = p0 + (__popc(m0) << 1);
+        const uint32_t p2 = p1 + (__popc(m1) << 1);
+        const uint32_t p3 = p2 + (__popc(m2) << 1);
+        pwb = p3 + (__popc(m3) << 1);
+        if (n0) rx0 = (rx0 << 16) | lds16(ring_s + ((p0 + (__popc(m0 & lt) << 1)) & (RB - 1u)));
+        if (n1) rx1 = (rx1 << 16) | lds16(ring_s + ((p1 + (__popc(m1 & lt) << 1)) & (RB - 1u)));
+        if (n2) rx2 = (rx2 << 16) | lds16(ring_s + ((p2 + (__popc(m2 & lt) << 1)) & (RB - 1u)));
+        if (n3) rx3 = (rx3 << 16) | lds16(ring_s + ((p3 + (__popc(m3 & lt) << 1)) & (RB - 1u)));
+        st[0] = rx0;
+        st[1] = rx1;
+        st[2] = rx2;
+        st[3] = rx3;
+        const uint32_t es[4] = {e0, e1, e2, e3};
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const int step = base + q;
+          const uint32_t exp_bits = (es[q] & 255u) << 23;
+          const uint32_t sm_dup = __byte_perm(lo0, lo1, (step << 12) | (step << 8));
+          const float wv = __uint_as_float((sm_dup & 0x807F0000u) | exp_bits);
+          const uint32_t xpair = xw[step >> 1];
+          const float xv = __uint_as_float((step & 1) ? (xpair & 0xFFFF0000u) : (xpair << 16));
+          accum = __fmaf_rn(xv, wv, accum);
+        }
       }
     }
 #pragma unroll
@@ -431,7 +534,11 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
       asm volatile("cvt.rn.bf16.f32 %0, %1;" : "=h"(out[row]) : "f"(accum));
     }
   }
+  __syncwarp();
   asm volatile("cp.async.wait_group 0;" ::: "memory");
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
 #undef BF_ISSUE
 }
 
@@ -558,20 +665,34 @@ extern "C" int muse_bf16_rans_pass2(const uint16_t* W, int rows, int tw, int gmi
   return cudaGetLastError();
 }
 
+extern "C" void muse_bf16_set_runtime_pdl(int enabled) {
+  g_bf16_pdl = (enabled < 0) ? -1 : (enabled ? 1 : 0);
+}
+
+extern "C" int muse_bf16_get_runtime_pdl() {
+  return bf16_pdl_enabled() ? 1 : 0;
+}
+
+extern "C" void muse_bf16_set_runtime_gate_blocks(int blocks) {
+  g_bf16_gate_blocks = (blocks == 32 || blocks == 48) ? blocks : -1;
+}
+
+extern "C" int muse_bf16_get_runtime_gate_blocks() {
+  return bf16_gate_blocks();
+}
+
 extern "C" int muse_bf16_rans_gemv(int rows, size_t blob_bytes, const void* input, const void* blob, void* output, cudaStream_t stream) {
   if (!valid_rows(rows)) return cudaErrorInvalidValue;
   const int tw = (rows == 4608) ? 576 : ((rows == 4096) ? 512 : (rows / 8));
   if (tw <= 0) return cudaErrorInvalidValue;
-  // For BF16 output_gate (rows == 4096, tw == 512), launch 32 blocks of 16 warps so 16 SMs stay free
-  // for side-stream split-KV flash attention during M == 1 decode overlap.
-  static const bool bf16_gate32 = []() {
-    const char* env = std::getenv("MUSE_BF16_GATE_32_BLOCKS");
-    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
-  }();
-  const int blocks = (bf16_gate32 && rows == 4096 && tw == 512) ? 32 : ((tw < 48) ? tw : 48);
+  // For BF16 output_gate (rows == 4096, tw == 512), 48 blocks (32x11 + 16x10 warps,
+  // ~39 KiB SMEM) co-resides on the same SMs with gqa16_1pass_dsplit;
+  // 32 blocks of 16 warps leaves 16 free SMs when stock FA2 (~80 KiB SMEM) is active.
+  const int blocks = (rows == 4096 && tw == 512) ? bf16_gate_blocks() : ((tw < 48) ? tw : 48);
   const int wpb = (tw + blocks - 1) / blocks;
   const size_t rb = 4u * 512u;
-  const size_t dsmem = rb + static_cast<size_t>(wpb) * rb;
+  size_t dsmem = static_cast<size_t>(wpb) * rb;
+  if (blocks == 48 && rows != 4096 && dsmem < 40960) dsmem = 40960;
   static bool init = false;
   if (!init) {
     cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
@@ -580,8 +701,18 @@ extern "C" int muse_bf16_rans_gemv(int rows, size_t blob_bytes, const void* inpu
     cudaThreadExchangeStreamCaptureMode(&mode);
     init = true;
   }
-  bf16_rans_gemv_kernel<<<blocks, wpb * 32, dsmem, stream>>>(
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(blocks);
+  cfg.blockDim = dim3(wpb * 32);
+  cfg.dynamicSmemBytes = dsmem;
+  cfg.stream = stream;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = bf16_pdl_enabled() ? 1 : 0;
+  return cudaLaunchKernelEx(
+      &cfg, bf16_rans_gemv_kernel,
       static_cast<const uint16_t*>(input), static_cast<const uint8_t*>(blob),
       static_cast<uint16_t*>(output), rows, blob_bytes, bf16_tpf_stride());
-  return cudaGetLastError();
 }

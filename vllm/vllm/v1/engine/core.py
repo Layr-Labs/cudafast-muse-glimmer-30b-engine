@@ -210,6 +210,14 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
+        try:
+            dw = getattr(self.model_executor, "driver_worker", None)
+            runner = getattr(getattr(dw, "worker", dw), "model_runner", None)
+            if runner is not None:
+                runner._engine_core = self
+                runner._scheduler = self.scheduler
+        except Exception:
+            pass
 
         self.is_ec_consumer = (
             vllm_config.ec_transfer_config is None
@@ -613,6 +621,8 @@ class EngineCore:
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
+    _pause_batch_queue: bool = False
+
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
@@ -621,6 +631,25 @@ class EngineCore:
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
+
+    def _can_schedule_more(self) -> bool:
+        sched = self.scheduler
+        if not sched.has_requests():
+            return False
+        if getattr(sched, "waiting", None) or getattr(sched, "finished_req_ids", None):
+            return True
+        running = getattr(sched, "running", None)
+        if running is None:
+            return True
+        for r in running:
+            if not (
+                r.num_output_placeholders > 0
+                and r.max_tokens is not None
+                and r.num_computed_tokens + 2 - r.num_output_placeholders
+                >= r.num_prompt_tokens + r.max_tokens
+            ):
+                return True
+        return False
 
     def step_with_batch_queue(
         self,
@@ -649,7 +678,11 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        if (
+            not self._pause_batch_queue
+            and self.scheduler.has_requests()
+            and (not batch_queue or self._can_schedule_more())
+        ):
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
@@ -679,8 +712,10 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
-                if len(batch_queue) < self.batch_queue_size and (
-                    model_executed or self.scheduler.has_requests()
+                if (
+                    len(batch_queue) < self.batch_queue_size
+                    and not self._pause_batch_queue
+                    and self._can_schedule_more()
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.

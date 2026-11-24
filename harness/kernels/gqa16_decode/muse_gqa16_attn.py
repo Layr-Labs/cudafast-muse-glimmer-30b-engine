@@ -1,16 +1,18 @@
-"""16-CTA GQA-16 Tensor-Core M=1 decode attention for MuseGlimmer (32Q / 2KV / D=128).
+"""Strict 0-ULP FA2-exact GQA-16 Tensor-Core M=1 decode attention for MuseGlimmer (32Q / 2KV / D=128).
 
 Controls (no VLLM_* env vars required):
-  MUSE_GQA16_DECODE=1          opt-in (off by default: not bit-identical to FlashAttention-2 in every case).
-  MUSE_GQA16_MODE=fa2_8sp      default: 16 CTAs (kBlockN=128, 8 splits on SW, 32 splits on Full; 8.95-11.15 us).
-  MUSE_GQA16_MODE=fa2_exact    0-ULP FA2-matched kBlockN=128 mode (2 CTAs on SW, 16 CTAs on Full).
-  MUSE_GQA16_MODE=split8       16 CTAs (8 splits x 2 KV heads, B_N=32) on all 52 layers.
-  MUSE_GQA16_SPLITS=8          KV split worker count per KV head (default 8 -> 16 CTAs).
+  MUSE_GQA16_DECODE=1          enable 0-ULP GQA-16 M=1 decode kernel (admitted only after strict 0-ULP self-check).
+  MUSE_GQA16_SPLITS=8          worker CTA count per KV head for multi-split full attention (default 8 -> 16 CTAs).
+  MUSE_GQA16_1PASS=1           enable single-pass 0-ULP D-split kernel on sliding-window / short layers (default 1).
+  MUSE_GQA16_1PASS_SPLITS=4    D-split CTA count per KV head for 1-pass kernel: 4, 8, or 16 (default 4 -> 8 CTAs).
+  MUSE_GQA16_RING3=1           use WAR-safe 3-buffer KV ring in 0-ULP full-attention block128 kernel (default 1).
+  MUSE_GQA16_PDL=1             enable Programmatic Dependent Launch (griddepcontrol) on decode kernels (default 1).
 """
 from __future__ import annotations
 
 import ctypes
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -23,10 +25,29 @@ except Exception:  # noqa: BLE001
     logger = logging.getLogger("vllm.muse_gqa16_attn")
 
 MAX_SPLITS = 64
-ENABLED = os.environ.get("MUSE_GQA16_DECODE", "0").strip() not in ("0", "", "false", "no")
-MODE_NAME = os.environ.get("MUSE_GQA16_MODE", "fa2_exact").strip().lower()
+MAX_NBLOCKS64 = 256
+ENABLED = os.environ.get("MUSE_GQA16_DECODE", "1").strip() not in ("0", "", "false", "no")
 NUM_SPLITS = max(1, min(MAX_SPLITS, int(os.environ.get("MUSE_GQA16_SPLITS", "8"))))
-FA2_FULL_SPLITS = int(os.environ.get("MUSE_GQA16_FA2_FULL_SPLITS", "32"))
+_ENV_ONE_PASS = os.environ.get("MUSE_GQA16_1PASS", "1").strip() not in ("0", "", "false", "no")
+ONE_PASS = _ENV_ONE_PASS
+_RAW_1PASS_SPLITS = int(os.environ.get("MUSE_GQA16_1PASS_SPLITS", "4"))
+ONE_PASS_SPLITS = _RAW_1PASS_SPLITS if _RAW_1PASS_SPLITS in (4, 8, 16) else 4
+ONE_PASS_MAX_TOKENS = int(os.environ.get("MUSE_GQA16_1PASS_MAX_TOKENS", "2176"))
+RING3 = os.environ.get("MUSE_GQA16_RING3", "1").strip() not in ("0", "", "false", "no")
+_ENV_PDL = os.environ.get("MUSE_GQA16_PDL", "1").strip() not in ("0", "", "false", "no")
+PDL = _ENV_PDL
+
+
+def set_runtime_one_pass(enabled: bool | None) -> None:
+    """Override 1-pass vs 2-pass decode dispatch at runtime (None restores env default)."""
+    global ONE_PASS
+    ONE_PASS = _ENV_ONE_PASS if enabled is None else bool(enabled)
+
+
+def set_runtime_pdl(enabled: bool | None) -> None:
+    """Override Programmatic Dependent Launch (PDL) at runtime (None restores env default)."""
+    global PDL
+    PDL = _ENV_PDL if enabled is None else bool(enabled)
 
 _lib = None
 try:
@@ -45,7 +66,32 @@ except OSError:
     _lib = None
 
 _scratch: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-_state: dict[int, tuple[bool, int]] = {}  # dev_idx -> (admitted, fa2_exact_submode)
+_state: dict[int, tuple[bool, int, int]] = {}  # dev_idx -> (admitted, scale_mode, num_sms)
+
+
+def is_admitted(device: torch.device | int | None = None) -> bool | None:
+    """Return True if admitted on device, False if disabled/rejected, or None if self_check has not run yet."""
+    if not ENABLED or _lib is None:
+        return False
+    if isinstance(device, int):
+        idx = device
+    elif isinstance(device, torch.device):
+        if device.type != "cuda":
+            return False
+        if device.index is not None:
+            idx = int(device.index)
+        elif torch.cuda.is_available():
+            idx = int(torch.cuda.current_device())
+        else:
+            return None
+    else:
+        if not torch.cuda.is_available():
+            return None
+        idx = int(torch.cuda.current_device())
+    st = _state.get(idx)
+    if st is None:
+        return None
+    return bool(st[0])
 
 
 def _get_scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
@@ -55,25 +101,86 @@ def _get_scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torc
         return bufs
     if torch.cuda.is_current_stream_capturing():
         return None
-    o_part = torch.zeros((2, MAX_SPLITS, 16, 128), dtype=torch.float32, device=device)
-    lse_part = torch.full((2, MAX_SPLITS, 16), float("-inf"), dtype=torch.float32, device=device)
+    # Sized to hold both 2-pass kBlockN=64 scratch (2 x 256 x 1024 f32 = 2 MiB)
+    # and multi-split kBlockN=128 O/LSE accumulators (2 x 64 x 16 x 128 f32 = 1 MiB).
+    o_part = torch.zeros((2, MAX_NBLOCKS64, 1024), dtype=torch.float32, device=device)
+    lse_part = torch.full((2, MAX_NBLOCKS64, 16), float("-inf"), dtype=torch.float32, device=device)
     cnt = torch.zeros((2,), dtype=torch.int32, device=device)
     bufs = (o_part, lse_part, cnt)
     _scratch[idx] = bufs
     return bufs
 
 
-def _mode_params(w_left: int, exact_submode: int) -> tuple[int, int, int]:
-    if MODE_NAME == "fa2_exact":
-        g_splits = 1 if w_left >= 0 else NUM_SPLITS
-        f_splits = 1 if w_left >= 0 else FA2_FULL_SPLITS
-        return g_splits, f_splits, exact_submode
-    if MODE_NAME == "split8":
-        return NUM_SPLITS, NUM_SPLITS, 0
-    # Default "fa2_8sp": kBlockN=128 online softmax across 8 worker splits (16 CTAs) on SW
-    # and FA2_FULL_SPLITS across 8 worker splits (16 CTAs, 0-ULP vs FA2) on Full-Attention.
-    f_splits = NUM_SPLITS if w_left >= 0 else FA2_FULL_SPLITS
-    return NUM_SPLITS, f_splits, exact_submode
+def fa2_num_splits_heuristic(max_seqlen_k: int, num_sms: int, batch_nheads_mblocks: int = 2) -> int:
+    """Exact replica of FlashAttention-2's host num_splits_heuristic for kBlockN=128."""
+    if batch_nheads_mblocks >= 0.8 * num_sms:
+        return 1
+    num_n_blocks = (max_seqlen_k + 127) // 128
+    if num_n_blocks <= 1:
+        return 1
+    max_splits = min(128, num_sms, num_n_blocks)
+    if max_splits > MAX_SPLITS:
+        max_splits = MAX_SPLITS
+
+    def ceildiv(a: int, b: int) -> int:
+        return (a + b - 1) // b
+
+    def eligible(s: int) -> bool:
+        return s == 1 or ceildiv(num_n_blocks, s) != ceildiv(num_n_blocks, s - 1)
+
+    max_eff = 0.0
+    effs: list[float] = []
+    for s in range(1, max_splits + 1):
+        if not eligible(s):
+            effs.append(0.0)
+        else:
+            n_waves = float(batch_nheads_mblocks * s) / float(num_sms)
+            eff = n_waves / math.ceil(n_waves)
+            if eff > max_eff:
+                max_eff = eff
+            effs.append(eff)
+    for s in range(1, max_splits + 1):
+        if eligible(s) and effs[s - 1] >= 0.85 * max_eff:
+            return s
+    return 1
+
+
+def _resolve_splits(
+    w_left: int,
+    max_seqlen_k: int,
+    max_num_splits: int,
+    num_sms: int,
+    base_scale_mode: int = 1,
+    one_pass: bool | None = None,
+    pdl: bool | None = None,
+) -> tuple[int, int, int]:
+    """Return (grid_splits, fa2_splits, mode) matching _vllm_fa2_C::varlen_fwd."""
+    use_one_pass = ONE_PASS if one_pass is None else one_pass
+    use_pdl = PDL if pdl is None else pdl
+    ring3_bit = 16 if RING3 else 0
+    pdl_bit = 32 if use_pdl else 0
+    if max_num_splits == 1:
+        max_active = (w_left + 65) if w_left >= 0 else max_seqlen_k
+        if use_one_pass and max_active <= ONE_PASS_MAX_TOKENS:
+            return ONE_PASS_SPLITS, 1, (base_scale_mode | 8 | pdl_bit)
+        g_splits = 8 if (NUM_SPLITS >= 8 and max_active <= MAX_NBLOCKS64 * 64) else 1
+        return g_splits, 1, (base_scale_mode | pdl_bit)
+    if w_left >= 0:
+        # With num_splits=0 and sliding window on paged KV, FA2 dispatches to non-splitkv kBlockN=128.
+        max_active = w_left + 129
+        if use_one_pass and max_active <= ONE_PASS_MAX_TOKENS:
+            return ONE_PASS_SPLITS, 1, (base_scale_mode | 4 | 8 | pdl_bit)
+        g_splits = 8 if (NUM_SPLITS >= 8 and max_active <= 128 * 128) else 1
+        return g_splits, 1, (base_scale_mode | 4 | pdl_bit)
+    if max_num_splits > 1:
+        return NUM_SPLITS, min(MAX_SPLITS, max_num_splits), (base_scale_mode | ring3_bit | pdl_bit)
+    f_splits = fa2_num_splits_heuristic(max_seqlen_k, num_sms)
+    if f_splits == 1:
+        if use_one_pass and max_seqlen_k <= ONE_PASS_MAX_TOKENS:
+            return ONE_PASS_SPLITS, 1, (base_scale_mode | 4 | 8 | pdl_bit)
+        g_splits = 8 if (NUM_SPLITS >= 8 and max_seqlen_k <= 128 * 128) else 1
+        return g_splits, 1, (base_scale_mode | 4 | pdl_bit)
+    return NUM_SPLITS, f_splits, (base_scale_mode | ring3_bit | pdl_bit)
 
 
 def self_check(device: torch.device) -> bool:
@@ -87,7 +194,8 @@ def self_check(device: torch.device) -> bool:
         return False
 
     ok = False
-    exact_submode = 1
+    scale_mode = 1
+    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     try:
         from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 
@@ -108,10 +216,12 @@ def self_check(device: torch.device) -> bool:
         cu_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
         stream = torch.cuda.current_stream(device).cuda_stream
 
-        for sub in (1, 2):
-            sub_mismatches = 0
-            for seq_k in (1, 16, 64, 129, 577, 2048):
-                for win in ((-1, -1), (2047, 0)):
+        # 1. Pick scale_mode (1 = double(scale)*M_LOG2E, 3 = float(scale)*float(M_LOG2E)) with 0 mismatches.
+        found_mode = False
+        for cand_mode in (1, 3):
+            mismatches = 0
+            for seq_k in (1, 17, 64, 128, 255, 512, 576, 1024):
+                for win in ((-1, -1), (511, 0)):
                     q = (torch.randn((1, 32, 128), generator=gen, device=device) * 1.5).to(torch.bfloat16).contiguous()
                     sk = torch.tensor([seq_k], dtype=torch.int32, device=device)
                     ref = torch.empty_like(q)
@@ -128,83 +238,122 @@ def self_check(device: torch.device) -> bool:
                         q.data_ptr(), kv_cache.data_ptr(), got.data_ptr(),
                         o_part.data_ptr(), lse_part.data_ptr(), cnt.data_ptr(),
                         sk.data_ptr(), bt.data_ptr(),
-                        block_size, win[0], 1, 1, sub, scale,
+                        block_size, win[0], NUM_SPLITS, 1, cand_mode, scale,
                         q.stride(1), got.stride(1),
                         kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
                         stream,
                     )
                     torch.cuda.synchronize(device)
                     if st != 0 or not torch.isfinite(got).all():
-                        sub_mismatches += 100000
+                        mismatches += 100000
                         break
-                    sub_mismatches += int((ref.view(torch.int16) != got.view(torch.int16)).sum().item())
-            if sub_mismatches == 0:
-                exact_submode = sub
+                    mismatches += int((ref.view(torch.int16) != got.view(torch.int16)).sum().item())
+                if mismatches > 0:
+                    break
+            if mismatches == 0:
+                scale_mode = cand_mode
+                found_mode = True
                 break
 
-        ok = True
-        for seq_k in (1, 16, 17, 32, 33, 64, 128, 513, 576, 640, 2048, 2500):
-            for win in ((-1, -1), (2047, 0)):
-                bt_cur = bt.clone()
-                if win[0] >= 0 and seq_k > 2048:
-                    expired_pages = (seq_k - 2048) // block_size
-                    if expired_pages > 0:
-                        bt_cur[0, :expired_pages] = 0
-                q = (torch.randn((1, 32, 128), generator=gen, device=device) * 1.5).to(torch.bfloat16).contiguous()
-                sk = torch.tensor([seq_k], dtype=torch.int32, device=device)
-                ref = torch.empty_like(q)
-                got = torch.empty_like(q)
+        if found_mode:
+            ok = True
+            # 2. Verify strict 0-ULP against BOTH num_splits=1 AND production (max_seqlen_k=8192, num_splits=0)
+            for seq_k in (1, 17, 64, 128, 255, 511, 512, 513, 576, 639, 640, 1024, 1152, 2048, 2500, 3056):
+                for win in ((-1, -1), (511, 0), (2047, 0)):
+                    bt_cur = bt.clone()
+                    if win[0] >= 0 and seq_k > win[0] + 1:
+                        expired_pages = (seq_k - (win[0] + 1)) // block_size
+                        if expired_pages > 0:
+                            bt_cur[0, :expired_pages] = 0
+                    for max_sk, ns in ((seq_k, 1), (8192, 0)):
+                        q = (torch.randn((1, 32, 128), generator=gen, device=device) * 1.5).to(torch.bfloat16).contiguous()
+                        sk = torch.tensor([seq_k], dtype=torch.int32, device=device)
+                        ref = torch.empty_like(q)
+                        got = torch.empty_like(q)
+                        flash_attn_varlen_func(
+                            q=q, k=k_cache, v=v_cache, out=ref,
+                            cu_seqlens_q=cu_q, max_seqlen_q=1,
+                            seqused_k=sk, max_seqlen_k=max_sk,
+                            softmax_scale=scale, causal=True,
+                            window_size=list(win), block_table=bt_cur,
+                            fa_version=2, num_splits=ns,
+                        )
+                        for one_pass_opt, pdl_opt in ((True, True), (False, True), (True, False)):
+                            got.fill_(float("nan"))
+                            g_splits, f_splits, run_mode = _resolve_splits(
+                                win[0], max_sk, ns, num_sms, scale_mode, one_pass=one_pass_opt, pdl=pdl_opt
+                            )
+                            st = _lib.muse_gqa16_decode(
+                                q.data_ptr(), kv_cache.data_ptr(), got.data_ptr(),
+                                o_part.data_ptr(), lse_part.data_ptr(), cnt.data_ptr(),
+                                sk.data_ptr(), bt_cur.data_ptr(),
+                                block_size, win[0], g_splits, f_splits, run_mode, scale,
+                                q.stride(1), got.stride(1),
+                                kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
+                                stream,
+                            )
+                            torch.cuda.synchronize(device)
+                            if (
+                                st != 0
+                                or not torch.isfinite(got).all()
+                                or int(cnt.abs().max().item()) != 0
+                                or not torch.equal(ref.view(torch.int16), got.view(torch.int16))
+                            ):
+                                ok = False
+                                break
+                        if not ok:
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    break
+            # 3. Verify -0.0f / all-zero V canonicalization with empty trailing splits (seq_k=512, max_sk=8192)
+            if ok:
+                raw_kv_neg0 = torch.full_like(raw_kv, -0.0)
+                kv_neg0 = raw_kv_neg0.permute(0, 2, 1, 3)
+                k_neg0, v_neg0 = kv_neg0.transpose(1, 2).split(128, dim=-1)
+                q_z = torch.randn((1, 32, 128), generator=gen, device=device).to(torch.bfloat16).contiguous()
+                sk_z = torch.tensor([512], dtype=torch.int32, device=device)
+                ref_z = torch.empty_like(q_z)
+                got_z = torch.empty_like(q_z)
                 flash_attn_varlen_func(
-                    q=q, k=k_cache, v=v_cache, out=ref,
+                    q=q_z, k=k_neg0, v=v_neg0, out=ref_z,
                     cu_seqlens_q=cu_q, max_seqlen_q=1,
-                    seqused_k=sk, max_seqlen_k=8192,
+                    seqused_k=sk_z, max_seqlen_k=8192,
                     softmax_scale=scale, causal=True,
-                    window_size=list(win), block_table=bt_cur,
+                    window_size=[-1, -1], block_table=bt,
                     fa_version=2, num_splits=0,
                 )
-                g_splits, f_splits, k_mode = _mode_params(win[0], exact_submode)
-                st = _lib.muse_gqa16_decode(
-                    q.data_ptr(), kv_cache.data_ptr(), got.data_ptr(),
+                g_splits, f_splits, run_mode = _resolve_splits(-1, 8192, 0, num_sms, scale_mode, True, True)
+                st_z = _lib.muse_gqa16_decode(
+                    q_z.data_ptr(), kv_neg0.data_ptr(), got_z.data_ptr(),
                     o_part.data_ptr(), lse_part.data_ptr(), cnt.data_ptr(),
-                    sk.data_ptr(), bt_cur.data_ptr(),
-                    block_size, win[0], g_splits, f_splits, k_mode, scale,
-                    q.stride(1), got.stride(1),
-                    kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
+                    sk_z.data_ptr(), bt.data_ptr(),
+                    block_size, -1, g_splits, f_splits, run_mode, scale,
+                    q_z.stride(1), got_z.stride(1),
+                    kv_neg0.stride(0), kv_neg0.stride(2), kv_neg0.stride(1),
                     stream,
                 )
                 torch.cuda.synchronize(device)
-                if st != 0 or not torch.isfinite(got).all() or int(cnt.abs().max().item()) != 0:
+                if (
+                    st_z != 0
+                    or int(cnt.abs().max().item()) != 0
+                    or not torch.equal(ref_z.view(torch.int16), got_z.view(torch.int16))
+                ):
                     ok = False
-                    break
-                max_err = float((ref.float() - got.float()).abs().max().item())
-                mismatch = int((ref.view(torch.int16) != got.view(torch.int16)).sum().item())
-                if MODE_NAME == "fa2_exact":
-                    if mismatch > 0:
-                        ok = False
-                        break
-                elif MODE_NAME == "fa2_8sp":
-                    # Full-attention (-1) must be near 0-ULP; SW (2047) 8-split LSE combine <= 1 ULP.
-                    if (win[0] < 0 and mismatch > 4) or max_err > 4e-3:
-                        ok = False
-                        break
-                else:
-                    if max_err > 1e-2:
-                        ok = False
-                        break
-            if not ok:
-                break
     except Exception:  # noqa: BLE001
         logger.warning("muse_gqa16_attn: self-check raised on cuda:%d", idx, exc_info=True)
         ok = False
 
-    _state[idx] = (ok, exact_submode)
+    _state[idx] = (ok, scale_mode, num_sms)
     if ok:
         logger.info(
-            "muse_gqa16_attn: admitted on cuda:%d (mode=%s, splits=%d -> %d CTAs, exact_submode=%d)",
-            idx, MODE_NAME, NUM_SPLITS, NUM_SPLITS * 2, exact_submode,
+            "muse_gqa16_attn: strict 0-ULP admitted on cuda:%d (splits=%d -> %d CTAs, 1pass_sw=%d (1pass_splits=%d -> %d CTAs), ring3=%d, pdl=%d, scale_mode=%d, full_splits_8k=%d)",
+            idx, NUM_SPLITS, NUM_SPLITS * 2, int(ONE_PASS), ONE_PASS_SPLITS, ONE_PASS_SPLITS * 2,
+            int(RING3), int(PDL), scale_mode, fa2_num_splits_heuristic(8192, num_sms),
         )
     else:
-        logger.warning("muse_gqa16_attn: self-check failed on cuda:%d; keeping stock FlashAttention-2", idx)
+        logger.warning("muse_gqa16_attn: strict 0-ULP self-check failed on cuda:%d; keeping stock FlashAttention-2", idx)
     return ok
 
 
@@ -217,6 +366,8 @@ def try_decode_gqa16(
     cu_seqlens_q: torch.Tensor,
     softmax_scale: float,
     window: tuple[int, int] | None,
+    max_seqlen_k: int = 8192,
+    max_num_splits: int = 0,
 ) -> bool:
     if not ENABLED or _lib is None:
         return False
@@ -268,7 +419,11 @@ def try_decode_gqa16(
         return False
     o_part, lse_part, cnt = bufs
 
-    g_splits, f_splits, k_mode = _mode_params(w_left, st[1])
+    g_splits, f_splits, run_mode = _resolve_splits(
+        w_left, int(max_seqlen_k), int(max_num_splits), st[2], st[1]
+    )
+    if f_splits > MAX_SPLITS:
+        return False
     stream = torch.cuda.current_stream(device).cuda_stream
     rc = _lib.muse_gqa16_decode(
         query.data_ptr(),
@@ -283,7 +438,7 @@ def try_decode_gqa16(
         w_left,
         g_splits,
         f_splits,
-        k_mode,
+        run_mode,
         softmax_scale,
         query.stride(1),
         output.stride(1),

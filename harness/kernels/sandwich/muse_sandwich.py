@@ -114,9 +114,16 @@ _inputs = ("*bf16", "*bf16", "*bf16", "*fp32", "*bf16", "*bf16", "*bf16")
 _dimensions = ("i32", "i32", "constexpr", "constexpr")
 
 
+def _strip_pdl_lines(source: str) -> str:
+    return "\n".join(
+        ln for ln in source.splitlines()
+        if "gdc_wait" not in ln and "gdc_launch_dependents" not in ln
+    )
+
+
 @cache
 def _mode(source):
-    definitions = ast.parse(source).body
+    definitions = ast.parse(_strip_pdl_lines(source)).body
     if len(definitions) != 1 or not isinstance(definitions[0], ast.FunctionDef):
         return None
     kernel = definitions[0]
@@ -298,7 +305,7 @@ def _fold_requant(autotuner, original, args, stream) -> bool:
 
 @cache
 def _body_hash(source):
-    definitions = ast.parse(source).body
+    definitions = ast.parse(_strip_pdl_lines(source)).body
     if len(definitions) != 1 or not isinstance(definitions[0], ast.FunctionDef):
         return None
     kernel = definitions[0]

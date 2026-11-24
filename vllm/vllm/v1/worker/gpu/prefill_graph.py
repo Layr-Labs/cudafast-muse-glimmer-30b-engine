@@ -47,7 +47,9 @@ from vllm.distributed.parallel_state import graph_capture
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+from vllm.v1.worker.gpu.cudagraph_utils import upload_cudagraph
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 logger = init_logger(__name__)
@@ -319,6 +321,7 @@ class PrefillGraph:
         with torch.cuda.graph(self.graph, self.pool):
             self.hidden_states = self._forward()
             get_offloader().join_after_forward()
+        upload_cudagraph(self.graph)
         torch.accelerator.synchronize()
         if not isinstance(self.hidden_states, torch.Tensor):
             raise TypeError(f"model returned {type(self.hidden_states).__name__}")
@@ -356,10 +359,10 @@ class PrefillGraph:
             self._zp_qsl_gpu = torch.full_like(ib.query_start_loc, n)
             self._zp_qsl_gpu[0] = 0
             self._zp_logits_indices_gpu = torch.tensor([n - 1], dtype=torch.int32, device=dev)
-            self._zp_pin_ids = torch.empty((n,), dtype=torch.int32, pin_memory=True)
+            self._zp_pin_ids = torch.zeros((n,), dtype=torch.int32, pin_memory=True)
             self._zp_pin_ids_np = self._zp_pin_ids.numpy()
             num_g = bt.num_kv_cache_groups
-            self._zp_pin_slots = torch.empty((num_g, n), dtype=torch.int64, pin_memory=True)
+            self._zp_pin_slots = torch.zeros((num_g, n), dtype=torch.int64, pin_memory=True)
             self._zp_pin_slots_np = self._zp_pin_slots.numpy()
             self._zp_pin_bt = [
                 torch.zeros((bt.input_block_tables[g].shape[1],), dtype=torch.int32, pin_memory=True)
@@ -367,6 +370,73 @@ class PrefillGraph:
             ]
             self._zp_pin_bt_np = [t.numpy() for t in self._zp_pin_bt]
             self._zp_bs_offsets = [np.arange(bs, dtype=np.int64) for bs in bt.block_sizes]
+            self._zp_nb_per_group = [(n + bs - 1) // bs for bs in bt.block_sizes]
+            self._zp_cached_bids: list[list[int] | None] = [None] * num_g
+            for g in range(num_g):
+                nb_g = self._zp_nb_per_group[g]
+                bs = bt.block_sizes[g]
+                if nb_g <= self._zp_pin_bt_np[g].shape[0]:
+                    canon = list(range(1, nb_g + 1))
+                    bids_arr = np.asarray(canon, dtype=np.int64)
+                    slots_full = (
+                        bids_arr[:, None] * bs + self._zp_bs_offsets[g][None, :]
+                    ).reshape(-1)
+                    self._zp_pin_slots_np[g, :] = slots_full[:n]
+                    self._zp_pin_bt_np[g][:nb_g] = bids_arr
+                    self._zp_cached_bids[g] = canon
+            self._zp_num_sched_np = np.array([n], dtype=np.int32)
+            self._zp_qsl_np = np.array([0, n], dtype=np.int32)
+            self._zp_prefill_len_np = np.array([n], dtype=np.int32)
+            self._zp_zero_1_np = np.zeros(1, dtype=np.int32)
+            self._zp_is_pref_np = np.array([True], dtype=np.bool_)
+            self._zp_seq_ub = torch.from_numpy(self._zp_num_sched_np.copy())
+            self._zp_const_graph: torch.cuda.CUDAGraph | None = None
+            self._zp_const_skip_pad = False
+            try:
+                from vllm import envs
+                skip_pad = bool(envs.VLLM_MOE_SKIP_PADDING)
+                raw_ids = ib.input_ids[:n]
+                raw_pos = ib.positions[:n]
+                raw_pad = ib.is_padding[:n]
+                raw_slots = bt.slot_mappings[:, :n]
+                if any(
+                    self._zp_nb_per_group[g] > self._zp_pin_bt_np[g].shape[0]
+                    for g in range(num_g)
+                ):
+                    raise RuntimeError("prefill blocks exceed block_table width")
+
+                def _stage_ops() -> None:
+                    if skip_pad:
+                        raw_pad.fill_(False)
+                    raw_pos.copy_(self._zp_positions_gpu, non_blocking=True)
+                    ib.seq_lens.copy_(self._zp_seq_lens_gpu, non_blocking=True)
+                    ib.query_start_loc.copy_(self._zp_qsl_gpu, non_blocking=True)
+                    raw_ids.copy_(self._zp_pin_ids, non_blocking=True)
+                    for g in range(num_g):
+                        nb_g = self._zp_nb_per_group[g]
+                        bt.input_block_tables[g][0, :nb_g].copy_(
+                            self._zp_pin_bt[g][:nb_g], non_blocking=True
+                        )
+                    raw_slots.copy_(self._zp_pin_slots, non_blocking=True)
+
+                # Warmup before capture, then capture all const + 4 pinned H2D copies into one graph.
+                _stage_ops()
+                torch.cuda.synchronize(dev)
+                cg = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(cg):
+                    _stage_ops()
+                upload_cudagraph(cg)
+                # Leave persistent dummy buffers clean for initial warmup passes.
+                raw_ids.zero_()
+                for g in range(num_g):
+                    bt.input_block_tables[g].zero_()
+                bt.slot_mappings.fill_(PAD_SLOT_ID)
+                ib.is_padding.fill_(True)
+                torch.cuda.synchronize(dev)
+                self._zp_const_graph = cg
+                self._zp_const_skip_pad = skip_pad
+            except Exception:  # noqa: BLE001
+                self._zp_const_graph = None
         except Exception as exc:  # noqa: BLE001
             logger.warning("Prefill graph zero-prep init skipped: %s", exc)
             self._zp_failed = True
@@ -535,26 +605,40 @@ class PrefillGraph:
             bt_view = block_tables.input_block_tables[g][:1]
             if (bt_view.data_ptr(), tuple(bt_view.shape), tuple(bt_view.stride())) != sig:
                 return False
+        can_use_const_graph = (
+            self._zp_const_graph is not None
+            and skip_padding == self._zp_const_skip_pad
+        )
         for g in range(block_tables.num_kv_cache_groups):
             bs = block_tables.block_sizes[g]
             bids = block_ids[g]
             nb = len(bids)
             if nb * bs < n or nb > self._zp_pin_bt_np[g].shape[0]:
                 return False
-            bids_arr = np.asarray(bids, dtype=np.int64)
-            slots_full = (bids_arr[:, None] * bs + self._zp_bs_offsets[g][None, :]).reshape(-1)
-            self._zp_pin_slots_np[g, :] = slots_full[:n]
-            bt_np = self._zp_pin_bt_np[g]
-            bt_np[:nb] = bids_arr
+            if nb != self._zp_nb_per_group[g]:
+                can_use_const_graph = False
+            if bids != self._zp_cached_bids[g]:
+                bids_arr = np.asarray(bids, dtype=np.int64)
+                slots_full = (
+                    bids_arr[:, None] * bs + self._zp_bs_offsets[g][None, :]
+                ).reshape(-1)
+                self._zp_pin_slots_np[g, :] = slots_full[:n]
+                self._zp_pin_bt_np[g][:nb] = bids_arr
+                self._zp_cached_bids[g] = list(bids)
         self._zp_pin_ids_np[:] = prefill_token_ids
-        if skip_padding:
-            raw_pad.fill_(False)
-        raw_ids.copy_(self._zp_pin_ids, non_blocking=True)
-        raw_pos.copy_(self._zp_positions_gpu, non_blocking=True)
-        input_buffers.seq_lens[:1].copy_(self._zp_seq_lens_gpu[:1], non_blocking=True)
-        input_buffers.query_start_loc[:2].copy_(self._zp_qsl_gpu[:2], non_blocking=True)
-        for g in range(block_tables.num_kv_cache_groups):
-            nb = len(block_ids[g])
-            block_tables.input_block_tables[g][0, :nb].copy_(self._zp_pin_bt[g][:nb], non_blocking=True)
-        raw_slots.copy_(self._zp_pin_slots, non_blocking=True)
+        if can_use_const_graph:
+            self._zp_const_graph.replay()
+        else:
+            if skip_padding:
+                raw_pad.fill_(False)
+            raw_pos.copy_(self._zp_positions_gpu, non_blocking=True)
+            input_buffers.seq_lens.copy_(self._zp_seq_lens_gpu, non_blocking=True)
+            input_buffers.query_start_loc.copy_(self._zp_qsl_gpu, non_blocking=True)
+            raw_ids.copy_(self._zp_pin_ids, non_blocking=True)
+            for g in range(block_tables.num_kv_cache_groups):
+                nb = len(block_ids[g])
+                block_tables.input_block_tables[g][0, :nb].copy_(
+                    self._zp_pin_bt[g][:nb], non_blocking=True
+                )
+            raw_slots.copy_(self._zp_pin_slots, non_blocking=True)
         return True
