@@ -26,7 +26,18 @@ def _load(name):
     lib.swiglu_fp8_prepare.restype = ctypes.c_int
     lib.swiglu_fp8_gemm.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int, ctypes.c_void_p]
     lib.swiglu_fp8_gemm.restype = ctypes.c_int
+    sp = getattr(lib, "marlinw_tma_set_pdl", None)
+    if sp is not None:
+        sp.argtypes = [ctypes.c_int]
+        sp.restype = ctypes.c_int
     return lib
+
+
+def set_tma_pdl(mode: int) -> int | None:
+    fn = getattr(_lib3, "marlinw_tma_set_pdl", None) if _lib3 is not None else None
+    if fn is None:
+        return None
+    return int(fn(int(mode)))
 
 
 def _run(lib, x, weight, scales, global_scale, down_scale):

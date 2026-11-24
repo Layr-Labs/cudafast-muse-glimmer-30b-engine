@@ -17,6 +17,7 @@
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cstdlib>
 #include <stdint.h>
 #include "swiglu.cuh"
 template<class Fragment> struct PairSwiGLU {
@@ -127,6 +128,11 @@ __device__ __forceinline__ void mbar_init(uint32_t a, int n) {
 __device__ __forceinline__ void mbar_expect_tx(uint32_t a, int tx) {
   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(a), "r"(tx) : "memory");
 }
+__device__ __forceinline__ void mbar_expect_tx_only(uint32_t a, int tx) {
+  asm volatile("mbarrier.expect_tx.shared::cta.b64 [%0], %1;" ::"r"(a), "r"(tx) : "memory");
+}
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void pdl_launch_dependents() { asm volatile("griddepcontrol.launch_dependents;"); }
 __device__ __forceinline__ void mbar_arrive(uint32_t a) {
   asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(a) : "memory");
 }
@@ -212,6 +218,7 @@ __device__ __forceinline__ void epilogue_swiglu_fp8(const float (&acc)[NW][4], u
   }
 }
 
+template <bool kPdl = false>
 __global__ void __launch_bounds__(NT, 1)
 swiglu_ws_256_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
                      const float* sa_p, const float* sb_p, const float* down_p, uint8_t* out) {
@@ -219,6 +226,7 @@ swiglu_ws_256_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_const
   constexpr int NTN = N_DIM / BN, NTILES = NB * NTN, NKT = K_DIM / KT;
   static_assert(NTILES == 13 * 48, "13 exact waves on 48 SMs");
   constexpr int total = 13 * NKT;
+  constexpr int kPdlTrig = total - 12;
   extern __shared__ uint8_t sm_raw[];
   __shared__ __align__(8) unsigned long long bars[2 * ST_T];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
@@ -236,24 +244,49 @@ swiglu_ws_256_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_const
     const int ti = gl / NKT, kt = gl - ti * NKT;
     const int t = b + ti * 48, nt = t >> 1, band = t & 1;
     const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB;
+    if constexpr (kPdl) {
+      if (gl == 1) {
+        mbar_expect_tx(bar, ASZ);
+        tma2d_hint(dst, &tmA, kt * KT, band * BM_T, bar, tma_pol_el());
+        return;
+      }
+    }
     mbar_expect_tx(bar, STB);
     tma2d_hint(dst, &tmA, kt * KT, band * BM_T, bar, tma_pol_el());
     tma2d_hint(dst + ASZ, &tmB, kt * KT, nt * BN, bar, tma_pol_ef());
   };
-  if (tid == 0) {
+  const float sa = __ldg(sa_p), sb = __ldg(sb_p);
+  float inv_down;
+  asm("div.full.f32 %0, 0f3F800000, %1;" : "=f"(inv_down) : "f"(__ldg(down_p)));
+  if constexpr (kPdl) {
+    const int nt0 = b >> 1, band0 = b & 1;
+    if (tid == 0) {
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
+      mbar_expect_tx_only(full0, WSZ);
+      tma2d_hint(sbase + ASZ, &tmB, 0, nt0 * BN, full0, tma_pol_ef());
+      mbar_expect_tx_only(full0 + 8, WSZ);
+      tma2d_hint(sbase + STB + ASZ, &tmB, KT, nt0 * BN, full0 + 8, tma_pol_ef());
+    }
+    pdl_wait();
+    if (tid == 0) {
+      mbar_expect_tx(full0, ASZ);
+      tma2d_hint(sbase, &tmA, 0, band0 * BM_T, full0, tma_pol_el());
+    }
+  } else if (tid == 0) {
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
     produce(0);
   }
   const int wm = warp % WM, wn = warp / WM;
-  const float sa = __ldg(sa_p), sb = __ldg(sb_p);
-  float inv_down;
-  asm("div.full.f32 %0, 0f3F800000, %1;" : "=f"(inv_down) : "f"(__ldg(down_p)));
   float acc[MW][NW][4] = {};
   const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ach = lane >> 4;
   const int br = (lane & 7) + (lane >> 4) * 8, bch = (lane >> 3) & 1;
   int kt = 0, ti = 0;
   for (int g = 0; g < total; ++g) {
+    if constexpr (kPdl) {
+      if (g == kPdlTrig) pdl_launch_dependents();
+    }
     const int s = g & 1, n = g >> 1;
     const int t = b + ti * 48, nt = t >> 1, band = t & 1;
     const int rb0 = band * BM_T + wm * MW * 16;
@@ -298,6 +331,16 @@ swiglu_ws_256_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_const
   }
 }
 
+static int g_ws_pdl_override = -1;
+static bool ws_pdl_enabled() {
+  if (g_ws_pdl_override >= 0) return g_ws_pdl_override != 0;
+  static const bool env_on = []() {
+    const char* env = std::getenv("MUSE_FP8_SWIGLU_PDL");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  return env_on;
+}
+
 typedef CUresult (*EncodeFn)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
                              const cuuint64_t*, const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave,
                              CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
@@ -314,6 +357,12 @@ static bool encode_tma2d(CUtensorMap* tm, const void* ptr, int k, int rows, int 
 }
 }  // namespace swiglu_ws
 
+extern "C" int swiglu_ws_set_pdl(int on) {
+  const int old = swiglu_ws::ws_pdl_enabled() ? 1 : 0;
+  swiglu_ws::g_ws_pdl_override = (on < 0) ? -1 : (on != 0 ? 1 : 0);
+  return old;
+}
+
 extern "C" int swiglu_ws_init(cudaStream_t stream) {
   using namespace swiglu_ws;
   if (!encode) {
@@ -323,7 +372,10 @@ extern "C" int swiglu_ws_init(cudaStream_t stream) {
     encode = (EncodeFn)fn;
   }
   cudaError_t e = cudaFuncSetAttribute(
-      swiglu_ws_256_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+      swiglu_ws_256_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  if (e != cudaSuccess) return int(e);
+  e = cudaFuncSetAttribute(
+      swiglu_ws_256_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   if (e != cudaSuccess) return int(e);
   int diffs = 0;
   e = cudaMemcpyToSymbolAsync(ws_silu_diffs, &diffs, sizeof(int), 0, cudaMemcpyHostToDevice, stream);
@@ -342,6 +394,19 @@ extern "C" int swiglu_ws_run(const void* a, const void* b, const float* sa, cons
   if (!encode || (((uintptr_t)a | (uintptr_t)b | (uintptr_t)d) & 15)) return -1;
   CUtensorMap tmA, tmB;
   if (!encode_tma2d(&tmA, a, K_DIM, M_DIM, 256) || !encode_tma2d(&tmB, b, K_DIM, N_DIM, BN)) return -3;
-  swiglu_ws_256_kernel<<<48, NT, SMEM_MAX, stream>>>(tmA, tmB, sa, sb, down, static_cast<uint8_t*>(d));
+  if (ws_pdl_enabled()) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(48, 1, 1);
+    cfg.blockDim = dim3(NT, 1, 1);
+    cfg.dynamicSmemBytes = SMEM_MAX;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    return int(cudaLaunchKernelEx(&cfg, swiglu_ws_256_kernel<true>, tmA, tmB, sa, sb, down, static_cast<uint8_t*>(d)));
+  }
+  swiglu_ws_256_kernel<false><<<48, NT, SMEM_MAX, stream>>>(tmA, tmB, sa, sb, down, static_cast<uint8_t*>(d));
   return int(cudaGetLastError());
 }

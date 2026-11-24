@@ -56,11 +56,22 @@ try:
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
         ]
         _kv_prefill.restype = ctypes.c_int
+    _set_pdl_fn = getattr(_lib, "muse_qk_glue_set_pdl", None)
+    if _set_pdl_fn is not None:
+        _set_pdl_fn.argtypes = [ctypes.c_int]
+        _set_pdl_fn.restype = ctypes.c_int
 except OSError:
     _lib = None
     _multi = None
     _kv_m1 = None
     _kv_prefill = None
+    _set_pdl_fn = None
+
+
+def set_pdl(on: bool) -> bool | None:
+    if _set_pdl_fn is None:
+        return None
+    return bool(_set_pdl_fn(1 if on else 0))
 
 MULTI_HPW = int(os.environ.get("MUSE_QK_MULTI_HPW", "9"))
 MULTI_MIN_TOKENS = 64

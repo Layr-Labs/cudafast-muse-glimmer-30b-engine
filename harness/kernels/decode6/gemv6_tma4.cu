@@ -156,12 +156,44 @@ static bool decode6_tma4_pal16() {
   return pal16;
 }
 
-static bool decode6_tma4_pal16_lm() {
+static bool decode6_tma4_pal16_lm(bool is_pad128) {
+  if (is_pad128) {
+    static const bool pal16_lm128 = []() {
+      const char* env = std::getenv("MUSE_TMA4_PAL16_LM");
+      return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+    }();
+    return pal16_lm128;
+  }
   static const bool pal16_lm = []() {
     const char* env = std::getenv("MUSE_TMA4_PAL16_LM");
     return env && *env && std::strtol(env, nullptr, 10) != 0;
   }();
   return pal16_lm;
+}
+
+static int decode6_lm128_stages(int blocks) {
+  static const int env_st = []() -> int {
+    const char* env = std::getenv("MUSE_LM128_STAGES");
+    if (env && *env) {
+      long v = std::strtol(env, nullptr, 10);
+      if (v == 3 || v == 4) return static_cast<int>(v);
+    }
+    return 3;
+  }();
+  return (blocks == 96) ? 3 : env_st;
+}
+
+static int g_tma4_pdl_override = -1;
+
+static int decode6_tma4_pdl() {
+  if (g_tma4_pdl_override >= 0) return g_tma4_pdl_override;
+  static const int mode = []() -> int {
+    const char* env = std::getenv("MUSE_TMA4_PDL");
+    if (!env || !*env) return 2;  // default ON: full dual-sided SM121 PDL (all edges; 0=off, 1=role-smart)
+    long v = std::strtol(env, nullptr, 10);
+    return (v == 0 || v == 1 || v == 2) ? static_cast<int>(v) : 2;
+  }();
+  return mode;
 }
 
 template <int TileN, int Threads, bool GateUpGrid, bool DownIlv, bool GateV48,
@@ -188,11 +220,13 @@ int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* 
       auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
       if (status != cudaSuccess) return status;
     } else if constexpr (Stages == 3 && TileN == 128 && Threads == 256) {
-      shared = FastPal16 ? (48 * 1024) : (45 * 1024);
+      shared = (FixedShape == 3) ? (FastPal16 ? (49 * 1024) : (45 * 1024))
+                                 : (FastPal16 ? (48 * 1024) : (45 * 1024));
       auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
       if (status != cudaSuccess) return status;
     } else if constexpr (Stages == 4 && TileN == 128 && Threads == 256 && DownIlv && !FuseMulSigmoid && (FastPal16 || TmaOvlp)) {
-      shared = FastPal16 ? (57 * 1024) : 53504;
+      shared = (FixedShape == 3) ? (FastPal16 ? (58 * 1024) : (55 * 1024))
+                                 : (FastPal16 ? (57 * 1024) : 53504);
       auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
       if (status != cudaSuccess) return status;
     } else if constexpr (Split2 && TileN == 64 && Threads == 128) {
@@ -229,61 +263,74 @@ int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* 
       }
     }
     if (!hit) {
-      const int vgrid = (GateV48 || Split2 || HalfSplit) ? 48 : grid;
-      const int n_tiles = HalfSplit ? (n / 128) : (n / TileN);
-      const int k_tiles = k / 128;
-      int part2_mn_tiles = n_tiles;
-      int part1_mn_iters = 0;
-      if (n_tiles > vgrid) {
-        part2_mn_tiles = n_tiles % vgrid;
-        if (part2_mn_tiles * 3 <= vgrid) part2_mn_tiles += vgrid;
-        part1_mn_iters = (n_tiles - part2_mn_tiles) / vgrid;
-      }
-      const int p2_iters = (k_tiles * part2_mn_tiles + vgrid - 1) / vgrid;
-      const int total_p2 = k_tiles * part2_mn_tiles;
-      const int lo_p1 = (part1_mn_iters + 1) / 2;
-      const int hi_p1 = part1_mn_iters - lo_p1;
-      for (int b = 0; b < grid; ++b) {
-        int it = 0;
-        if constexpr (GateV48) {
-          const int v1 = 47 - b;
-          const int rem1 = total_p2 - p2_iters * v1;
-          const int p2_1 = rem1 > 0 ? (rem1 < p2_iters ? rem1 : p2_iters) : 0;
-          int p2_2 = 0;
-          if (v1 >= grid) {
-            const int v2 = v1 - grid;
-            const int rem2 = total_p2 - p2_iters * v2;
-            p2_2 = rem2 > 0 ? (rem2 < p2_iters ? rem2 : p2_iters) : 0;
-          }
-          it = p2_1 + p2_2;
-        } else if constexpr (Split2) {
-          if (b < 48) {
-            it = lo_p1 * k_tiles;
-          } else {
-            const int vb = b - 48;
-            const int rem = total_p2 - p2_iters * vb;
-            const int p2 = rem > 0 ? (rem < p2_iters ? rem : p2_iters) : 0;
-            it = hi_p1 * k_tiles + p2;
-          }
-        } else if constexpr (HalfSplit) {
-          if (grid == 96) {
-            const int vb = b >> 1;
-            const int rem = total_p2 - p2_iters * vb;
-            const int p2 = rem > 0 ? (rem < p2_iters ? rem : p2_iters) : 0;
-            it = part1_mn_iters * k_tiles + p2;
+      if constexpr (FixedShape == 3) {
+        const int n_tiles = 1579;
+        const int k_tiles = 52;
+        const int full_p = n_tiles / grid;
+        const int rem_c = n_tiles - full_p * grid;
+        for (int b = 0; b < grid; ++b) {
+          const int it = (full_p + (b < rem_c ? 1 : 0)) * k_tiles;
+          const size_t sbs = static_cast<size_t>((it + 3) / 4);
+          total_sbs += sbs;
+          if (sbs > max_sbs) max_sbs = sbs;
+        }
+      } else {
+        const int vgrid = (GateV48 || Split2 || HalfSplit) ? 48 : grid;
+        const int n_tiles = HalfSplit ? (n / 128) : (n / TileN);
+        const int k_tiles = k / 128;
+        int part2_mn_tiles = n_tiles;
+        int part1_mn_iters = 0;
+        if (n_tiles > vgrid) {
+          part2_mn_tiles = n_tiles % vgrid;
+          if (part2_mn_tiles * 3 <= vgrid) part2_mn_tiles += vgrid;
+          part1_mn_iters = (n_tiles - part2_mn_tiles) / vgrid;
+        }
+        const int p2_iters = (k_tiles * part2_mn_tiles + vgrid - 1) / vgrid;
+        const int total_p2 = k_tiles * part2_mn_tiles;
+        const int lo_p1 = (part1_mn_iters + 1) / 2;
+        const int hi_p1 = part1_mn_iters - lo_p1;
+        for (int b = 0; b < grid; ++b) {
+          int it = 0;
+          if constexpr (GateV48) {
+            const int v1 = 47 - b;
+            const int rem1 = total_p2 - p2_iters * v1;
+            const int p2_1 = rem1 > 0 ? (rem1 < p2_iters ? rem1 : p2_iters) : 0;
+            int p2_2 = 0;
+            if (v1 >= grid) {
+              const int v2 = v1 - grid;
+              const int rem2 = total_p2 - p2_iters * v2;
+              p2_2 = rem2 > 0 ? (rem2 < p2_iters ? rem2 : p2_iters) : 0;
+            }
+            it = p2_1 + p2_2;
+          } else if constexpr (Split2) {
+            if (b < 48) {
+              it = lo_p1 * k_tiles;
+            } else {
+              const int vb = b - 48;
+              const int rem = total_p2 - p2_iters * vb;
+              const int p2 = rem > 0 ? (rem < p2_iters ? rem : p2_iters) : 0;
+              it = hi_p1 * k_tiles + p2;
+            }
+          } else if constexpr (HalfSplit) {
+            if (grid == 96) {
+              const int vb = b >> 1;
+              const int rem = total_p2 - p2_iters * vb;
+              const int p2 = rem > 0 ? (rem < p2_iters ? rem : p2_iters) : 0;
+              it = part1_mn_iters * k_tiles + p2;
+            } else {
+              const int rem = total_p2 - p2_iters * b;
+              const int p2 = rem > 0 ? (rem < p2_iters ? rem : p2_iters) : 0;
+              it = 2 * (part1_mn_iters * k_tiles + p2);
+            }
           } else {
             const int rem = total_p2 - p2_iters * b;
             const int p2 = rem > 0 ? (rem < p2_iters ? rem : p2_iters) : 0;
-            it = 2 * (part1_mn_iters * k_tiles + p2);
+            it = part1_mn_iters * k_tiles + p2;
           }
-        } else {
-          const int rem = total_p2 - p2_iters * b;
-          const int p2 = rem > 0 ? (rem < p2_iters ? rem : p2_iters) : 0;
-          it = part1_mn_iters * k_tiles + p2;
+          const size_t sbs = static_cast<size_t>((it + 3) / 4);
+          total_sbs += sbs;
+          if (sbs > max_sbs) max_sbs = sbs;
         }
-        const size_t sbs = static_cast<size_t>((it + 3) / 4);
-        total_sbs += sbs;
-        if (sbs > max_sbs) max_sbs = sbs;
       }
       cache[next_slot] = {n, k, grid, total_sbs, max_sbs};
       next_slot = (next_slot + 1) & 7;
@@ -299,10 +346,56 @@ int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* 
   const auto* var = reinterpret_cast<const int4*>(base + var_off);
   const float* a_sc_arg = GateUpSwigluFp8 ? fp8_scale : nullptr;
   int64_t* lm_out_arg = GateUpSwigluFp8 ? reinterpret_cast<int64_t*>(fp8_out) : lmpost_out;
+  const int pdl_cfg = decode6_tma4_pdl();
+  int pdl_mode = 0;
+  if (pdl_cfg == 1) {
+    // Role-smart SM121 PDL: o_proj / down_proj trigger the following 1-CTA norm during their tail;
+    // gate_up / qkv consume the preceding 1-CTA norm via PDL (preload LUT/states/sb0/B before wait).
+    if constexpr (FuseMulSigmoid) {
+      pdl_mode = 2;
+    } else if (n == 6656 && k == 19968) {
+      pdl_mode = 2;
+    } else if constexpr (DownIlv && !FuseLmPost) {
+      if ((n == 39936 && k == 6656) || (n == 4608 && k == 6656)) {
+        pdl_mode = 1;
+      }
+    }
+  } else if (pdl_cfg == 2) {
+    if constexpr (FuseMulSigmoid) {
+      pdl_mode = 2;
+    } else if constexpr (DownIlv && !FuseLmPost) {
+      pdl_mode = 3;
+    } else if constexpr (DownIlv && FuseLmPost) {
+      static const int lm_pdl = []() -> int {
+        const char* env = std::getenv("MUSE_LM_HEAD_PDL");
+        if (!env || !*env) return 3;
+        long v = std::strtol(env, nullptr, 10);
+        return (v >= 0 && v <= 3) ? static_cast<int>(v) : 3;
+      }();
+      pdl_mode = lm_pdl;
+    }
+  }
+  if ((pdl_mode & 1) != 0) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(grid, 1, 1);
+    cfg.blockDim = dim3(Threads, 1, 1);
+    cfg.dynamicSmemBytes = static_cast<size_t>(shared);
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    return static_cast<int>(cudaLaunchKernelEx(
+        &cfg, kernel,
+        input, weight, output, partials, static_cast<const int4*>(nullptr), a_sc_arg, states, global_scale,
+        var, lut_and_meta, k / 16, 1, n, k, k, locks, false, false, true, shared, palette,
+        decode6_tpf_stride(), pair_locks, lmpost_lut, lm_out_arg, org_vocab_size, input_aux, pdl_mode));
+  }
   kernel<<<grid, Threads, shared, stream>>>(
       input, weight, output, partials, nullptr, a_sc_arg, states, global_scale,
       var, lut_and_meta, k / 16, 1, n, k, k, locks, false, false, true, shared, palette,
-      decode6_tpf_stride(), pair_locks, lmpost_lut, lm_out_arg, org_vocab_size, input_aux);
+      decode6_tpf_stride(), pair_locks, lmpost_lut, lm_out_arg, org_vocab_size, input_aux, pdl_mode);
   return cudaGetLastError();
 }
 
@@ -318,7 +411,7 @@ int launch_tma4(const int4* input, const int4* weight, int4* output, int4* parti
                 const int4* input_aux = nullptr, const float* fp8_scale = nullptr,
                 uint8_t* fp8_out = nullptr) {
   const bool ovlp = decode6_tma4_ovlp();
-  const bool pal16 = !GateUpGrid && (FuseLmPost ? decode6_tma4_pal16_lm() : decode6_tma4_pal16());
+  const bool pal16 = !GateUpGrid && (FuseLmPost ? decode6_tma4_pal16_lm(FixedShape == 3) : decode6_tma4_pal16());
   if (ovlp) {
     if constexpr (!GateUpGrid) {
       if (pal16) {
@@ -356,6 +449,12 @@ int launch_tma4(const int4* input, const int4* weight, int4* output, int4* parti
 }
 
 }  // namespace
+
+extern "C" int muse_marlin6_set_pdl(int mode) {
+  const int prev = decode6_tma4_pdl();
+  g_tma4_pdl_override = (mode == 0 || mode == 1 || mode == 2) ? mode : -1;
+  return prev;
+}
 
 extern "C" int muse_marlin6_gate_up_tma4(const int4* input, const int4* weight, int4* output,
                                          int4* partials, const int4* coded, const int4* palette,
@@ -450,10 +549,21 @@ extern "C" int muse_marlin6_sk_tma4_ilv_lmpost(
     const int4* coded, const int4* palette, const float* global_scale, int* locks,
     const uint16_t* lmpost_lut, int64_t* lmpost_out, int org_vocab_size,
     int n, int k, int blocks, int device, cudaStream_t stream) {
-  if (n != 202048 || k != 6656 || (blocks != 48 && blocks != 96) ||
+  if ((n != 202048 && n != 202112) || k != 6656 || (blocks != 48 && blocks != 96) ||
       org_vocab_size <= 0 || org_vocab_size > n ||
       lmpost_lut == nullptr || lmpost_out == nullptr) {
     return cudaErrorInvalidValue;
+  }
+  if (n == 202112) {
+    const int st = decode6_lm128_stages(blocks);
+    if (st == 3) {
+      return launch_tma4<128, 256, false, true, false, false, true, false, 3, false, 3>(
+          input, weight, scratch, partials, coded, palette, global_scale, locks,
+          n, k, blocks, device, stream, nullptr, lmpost_lut, lmpost_out, org_vocab_size);
+    }
+    return launch_tma4<128, 256, false, true, false, false, true, false, 4, false, 3>(
+        input, weight, scratch, partials, coded, palette, global_scale, locks,
+        n, k, blocks, device, stream, nullptr, lmpost_lut, lmpost_out, org_vocab_size);
   }
   if (blocks == 96) {
     return launch_tma4<64, 128, false, true, false, false, true, false, 4, true, 2>(
@@ -490,6 +600,15 @@ extern "C" int muse_marlin6_sk_tma4_ilv(const int4* input, const int4* weight, i
                                         int4* partials, const int4* coded, const int4* palette,
                                         const float* global_scale, int* locks, int n, int k, int blocks,
                                         int device, cudaStream_t stream) {
+  if (n == 202112 && k == 6656 && (blocks == 48 || blocks == 96)) {
+    const int st = decode6_lm128_stages(blocks);
+    if (st == 3) {
+      return launch_tma4<128, 256, false, true, false, false, false, false, 3, false, 3>(
+          input, weight, output, partials, coded, palette, global_scale, locks, n, k, blocks, device, stream);
+    }
+    return launch_tma4<128, 256, false, true, false, false, false, false, 4, false, 3>(
+        input, weight, output, partials, coded, palette, global_scale, locks, n, k, blocks, device, stream);
+  }
   if (n == 202048 && k == 6656 && (blocks == 48 || blocks == 96)) {
     if (blocks == 96) {
       return launch_tma4<64, 128, false, true, false, false, false, false, 4, true>(

@@ -52,15 +52,18 @@ def _env_bytes(name: str, default: int) -> int:
 # whose weights exceed MAX_WEIGHT get the MLP budgets below instead: a head
 # that fits the window ahead of them (the norm before gate_up, the activation
 # before down).
-BYTES_AFTER_ATTN = _env_bytes("L2PF_MB_ATTN", 8 << 20)
-BYTES_OTHER = _env_bytes("L2PF_MB_OTHER", 2 << 20)
+# Under dual-sided SM121 PDL, bulk weight-head prefetches contend with early-launched
+# GEMVs; zeroing the weight-head MB budgets with BLOCKS=2 keeps lightweight norm-weight
+# pre-warm and 2 MiB TLB page walks while eliminating bandwidth contention (Wave 35).
+BYTES_AFTER_ATTN = _env_bytes("L2PF_MB_ATTN", 0)
+BYTES_OTHER = _env_bytes("L2PF_MB_OTHER", 0)
 MAX_WEIGHT = _env_bytes("L2PF_MAX_WEIGHT_MB", 64 << 20)
-BLOCKS = int(os.environ.get("L2PF_BLOCKS", "8"))
+BLOCKS = int(os.environ.get("L2PF_BLOCKS", "2"))
 THREADS = int(os.environ.get("L2PF_THREADS", "32"))
 SPREAD = os.environ.get("L2PF_SPREAD", "1") != "0"
 MLP = os.environ.get("L2PF_MLP", "1") != "0"
-BYTES_MLP_NORM = _env_bytes("L2PF_MB_MLP_NORM", (9 << 20) // 4)
-BYTES_MLP_ACT = _env_bytes("L2PF_MB_MLP_ACT", 1 << 19)
+BYTES_MLP_NORM = _env_bytes("L2PF_MB_MLP_NORM", 0)
+BYTES_MLP_ACT = _env_bytes("L2PF_MB_MLP_ACT", 0)
 BYTES_RANS_AFTER_ATTN = _env_bytes("L2PF_MB_RANS_ATTN", 0)
 BYTES_RANS_QKV = _env_bytes("L2PF_MB_RANS_QKV", 0)
 BYTES_RANS_GATE = _env_bytes("L2PF_MB_RANS_GATE", 0)

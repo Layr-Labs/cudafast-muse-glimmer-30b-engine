@@ -17,6 +17,9 @@ SHAPES = frozenset(
 NSPLIT_6656 = os.environ.get("FP8WS_6656_NSPLIT", "1") != "0"
 DUAL_SEAMLESS = os.environ.get("FP8WS_DUAL_SEAMLESS", "1") != "0"
 BF16_SEAMLESS = os.environ.get("BF16WS_DUAL_SEAMLESS", "1") != "0"
+_ST3_ON = os.environ.get("FP8WS_ST3", "1") != "0"
+ST3_OPROJ = _ST3_ON and os.environ.get("FP8WS_ST3_OPROJ", "1") != "0"
+ST3_DUAL = _ST3_ON and os.environ.get("FP8WS_ST3_DUAL", "1") != "0"
 _lib = None
 _load_failed = False
 _ready_devices: set[int] = set()
@@ -44,10 +47,25 @@ def _load():
             lib.fp8ws_set_flags.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
             lib.fp8ws_set_flags.restype = None
             lib.fp8ws_set_flags(int(NSPLIT_6656), int(DUAL_SEAMLESS), int(BF16_SEAMLESS))
+        if hasattr(lib, "fp8ws_set_st3"):
+            lib.fp8ws_set_st3.argtypes = [ctypes.c_int, ctypes.c_int]
+            lib.fp8ws_set_st3.restype = None
+            lib.fp8ws_set_st3(int(ST3_OPROJ), int(ST3_DUAL))
+        if hasattr(lib, "fp8ws_set_pdl"):
+            lib.fp8ws_set_pdl.argtypes = [ctypes.c_int]
+            lib.fp8ws_set_pdl.restype = ctypes.c_int
         _lib = lib
     except OSError:
         _load_failed = True
     return _lib
+
+
+def set_pdl(on: bool) -> bool | None:
+    lib = _load()
+    fn = getattr(lib, "fp8ws_set_pdl", None) if lib is not None else None
+    if fn is None:
+        return None
+    return bool(fn(1 if on else 0))
 
 
 def ready(device: torch.device) -> bool:

@@ -279,8 +279,27 @@ struct RansProb {
   const uint8_t* hdr; const uint8_t* stream; const int* woff16; const uint32_t* lut;
   const uint8_t* x; const uint16_t* x_aux; int act_mode;
   const float* sb; int sb_scalar; const float* sa;
-  __nv_bfloat16* out; int N; int K; int tw; int ilv; int strided_w; int lut_first; size_t stream_bytes; size_t tpf_stride;
+  __nv_bfloat16* out; int N; int K; int tw; int ilv; int strided_w; int lut_first; int pdl_mode; size_t stream_bytes; size_t tpf_stride;
 };
+
+static int g_rans_pdl_override = -1;
+
+static int rans_pdl_cfg() {
+  if (g_rans_pdl_override >= 0) return g_rans_pdl_override;
+  static const int mode = []() -> int {
+    const char* env = std::getenv("MUSERANS_PDL");
+    if (!env || !*env) return 2;  // default ON: full dual-sided SM121 PDL (consumer + producer on all edges)
+    long v = std::strtol(env, nullptr, 10);
+    return (v == 0 || v == 1 || v == 2) ? static_cast<int>(v) : 2;
+  }();
+  return mode;
+}
+
+int64_t rans_set_pdl(int64_t mode) {
+  const int prev = rans_pdl_cfg();
+  g_rans_pdl_override = (mode == 0 || mode == 1 || mode == 2) ? static_cast<int>(mode) : -1;
+  return static_cast<int64_t>(prev);
+}
 
 static size_t rans_tpf_stride() {
   static size_t stride = []() -> size_t {
@@ -379,6 +398,12 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   }
   if (!lut_first)
     for (int i = tid; i < RANS_LUT_BYTES / 16; i += blockDim.x) ((uint4*)lut_s)[i] = ((const uint4*)pb.lut)[i];
+  if (pb.pdl_mode & 1) {
+    // SM121 PDL consumer barrier: LUT, stream offsets, RG-1 weight ring groups, and TLB prefetches
+    // are already in flight from immutable weight buffers; wait for predecessor (e.g. muse_norm_glue)
+    // before reading pb.x / pb.x_aux in any act_mode (0, 1, or 2).
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
   if (pb.act_mode == 0) {
     for (int i = tid; i < S * 4; i += blockDim.x) {
       int s = i >> 2, tt = i & 3;
@@ -464,7 +489,13 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
 
   for (int nb = w; nb < NB; nb += pb.tw) {
     float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+    // SM121 PDL producer trigger: emit launch_dependents ~12.5 us (16 k-steps) before the final chunk
+    // completes so the following 1-CTA norm can preload its 66 KB cold weights on the idle SM.
+    const int trig_s = ((pb.pdl_mode & 2) && (nb + pb.tw >= NB)) ? ((S > 16) ? (S - 16) : 0) : -1;
     for (int s = 0; s < S; s++) {
+      if (s == trig_s) {
+        asm volatile("griddepcontrol.launch_dependents;");
+      }
       __syncwarp();
       const int curg = (int)(pwb >> GBS);
       while (issued <= curg + (RG - 1)) RANS_ISSUE();
@@ -687,6 +718,27 @@ static void rans_check_io(const torch::Tensor& blob, const torch::Tensor& x, con
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == N, "out must be a contiguous bfloat16 cuda tensor with N elements");
 }
 
+template <int NSV, int RGV>
+static inline void rans_launch_k(int blocks, int threads, size_t dsmem, cudaStream_t st, RansProb pb) {
+  if ((pb.pdl_mode & 1) != 0) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(blocks, 1, 1);
+    cfg.blockDim = dim3(threads, 1, 1);
+    cfg.dynamicSmemBytes = dsmem;
+    cfg.stream = st;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    cudaError_t err = cudaLaunchKernelEx(&cfg, rans_gemv_kernel<NSV, 9, RGV>, pb);
+    TORCH_CHECK(err == cudaSuccess, "rans_gemv_kernel PDL launch failed: ", cudaGetErrorString(err));
+  } else {
+    rans_gemv_kernel<NSV, 9, RGV><<<blocks, threads, dsmem, st>>>(pb);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
 static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, int wpb, int rg, int ilv, const uint8_t* x, const uint16_t* x_aux, int act_mode, const float* sb, int sb_scalar, const float* sa, __nv_bfloat16* out, int N, int K, cudaStream_t st) {
   const size_t soff = rans_stream_off(tw);
   RansProb pb;
@@ -707,6 +759,21 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
   pb.lut_first = lut_first ? 1 : 0;
+  const int pdl_cfg = rans_pdl_cfg();
+  int pdl_mode = 0;
+  if (pdl_cfg == 1) {
+    // Role-smart SM121 PDL:
+    // - Consumer (bit 0): qkv (4608x6656), gate (4096x6656), gate_up (39936x6656) preload LUT/offsets/weights before wait.
+    // - Producer (bit 1): o_proj (6656x4096), down_proj (6656x19968) trigger the following 1-CTA norm during their tail.
+    if (K == 6656 && (N == 4608 || N == 4096 || N == 39936)) {
+      pdl_mode = 1;
+    } else if (N == 6656 && (K == 4096 || K == 19968)) {
+      pdl_mode = 2;
+    }
+  } else if (pdl_cfg == 2) {
+    pdl_mode = 3;
+  }
+  pb.pdl_mode = pdl_mode;
   size_t dsmem = rans_dsmem(K, wpb, 9, rg);
   TORCH_CHECK(rans_fits(K, wpb, 9, rg), "rans smem too large (K too large for smem staging of x): ", dsmem);
   static const bool lock48 = []() {
@@ -716,10 +783,9 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   if (lock48 && blocks == 48 && dsmem < 40960) dsmem = 40960;
   rans_set_attrs_once();
 #define RANS_L2(NSV, RGV) \
-  if (ns == NSV && rg == RGV) rans_gemv_kernel<NSV, 9, RGV><<<blocks, wpb * 32, dsmem, st>>>(pb);
+  if (ns == NSV && rg == RGV) rans_launch_k<NSV, RGV>(blocks, wpb * 32, dsmem, st, pb);
   RANS_L2(1, 4) RANS_L2(1, 8) RANS_L2(2, 4) RANS_L2(2, 8) RANS_L2(4, 4) RANS_L2(4, 8)
 #undef RANS_L2
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void rans_gemv_cfg(torch::Tensor blob, torch::Tensor x, torch::Tensor sb, torch::Tensor sa, torch::Tensor out, int64_t N, int64_t K, int64_t tw, int64_t ns, int64_t wpb, int64_t rg, int64_t ilv) {
@@ -787,5 +853,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_blob_cfg", &rans_blob_cfg);
   m.def("rans_prepare", &rans_prepare);
   m.def("rans_tpf_kb", &rans_tpf_kb);
+  m.def("rans_set_pdl", &rans_set_pdl);
 }
 #endif

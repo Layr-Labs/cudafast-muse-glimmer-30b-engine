@@ -44,6 +44,16 @@ if _set_prefill_cs is not None:
     _set_prefill_cs.argtypes = [ctypes.c_int]
     _set_prefill_cs.restype = None
     _set_prefill_cs(1 if PREFILL_CS else 0)
+_set_pdl = getattr(_library, "muse_sandwich_set_pdl", None)
+if _set_pdl is not None:
+    _set_pdl.argtypes = [ctypes.c_int]
+    _set_pdl.restype = ctypes.c_int
+
+
+def set_pdl(on: bool) -> bool | None:
+    if _set_pdl is None:
+        return None
+    return bool(_set_pdl(1 if on else 0))
 FOLD = os.environ.get("MUSE_SANDWICH_GATE_FOLD", "1") == "1" and _gate_launch is not None
 # 512-row prefill only, cache hints only (no value changes): store the folded gate operand / the new residual row at
 # L2 evict_last priority, so that they are still in L2 when the gate GEMM / the post-attention norm read them after

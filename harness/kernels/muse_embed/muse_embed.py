@@ -19,7 +19,10 @@ import torch
 
 ENABLED = os.environ.get("MUSE_EMBED_FUSED", "1") == "1"
 ENABLED_M1 = os.environ.get("MUSE_EMBED_FUSED_M1", "1") != "0"
+ENABLED_TAIL = os.environ.get("MUSE_FAST_DECODE_TAIL", "1") != "0"
 _lib = None
+_post_update_m1_fn = None
+_single_decode_prep_fn = None
 try:
     _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_embed.so")))
     _p = ctypes.c_void_p
@@ -31,8 +34,129 @@ try:
     if _m1 is not None:
         _m1.argtypes = [_p, ctypes.c_int, _p, ctypes.c_float, _p, ctypes.c_int, _p]
         _m1.restype = ctypes.c_int
+    _pu = getattr(_lib, "muse_post_update_m1", None)
+    if _pu is not None:
+        _pu.argtypes = [
+            _p, _p, _p, _p, ctypes.c_int64, _p, _p, _p, _p, _p, ctypes.c_int64, _p, _p,
+        ]
+        _pu.restype = ctypes.c_int
+        _post_update_m1_fn = _pu
+    _dp = getattr(_lib, "muse_single_decode_prep", None)
+    if _dp is not None:
+        _dp.argtypes = [
+            ctypes.c_int, _p, _p, _p, _p, _p, _p, _p, _p, _p, _p, ctypes.c_int64, _p, _p, ctypes.c_int64, _p,
+        ]
+        _dp.restype = ctypes.c_int
+        _single_decode_prep_fn = _dp
 except OSError:
     _lib = None
+
+
+def fast_post_update_m1(
+    idx_mapping: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    last_sampled_tokens: torch.Tensor,
+    output_bin_counts: torch.Tensor | None,
+    sampled_tokens: torch.Tensor,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    query_start_loc: torch.Tensor | None,
+    all_token_ids: torch.Tensor,
+    total_len: torch.Tensor,
+) -> bool:
+    if (
+        not ENABLED_TAIL
+        or _post_update_m1_fn is None
+        or idx_mapping.shape[0] != 1
+        or idx_mapping.dtype != torch.int32
+        or num_computed_tokens.dtype != torch.int32
+        or last_sampled_tokens.dtype != torch.int64
+        or not last_sampled_tokens.is_contiguous()
+        or sampled_tokens.dtype != torch.int64
+        or not sampled_tokens.is_contiguous()
+        or num_sampled.dtype != torch.int32
+        or num_rejected.dtype != torch.int32
+        or all_token_ids.dtype != torch.int32
+        or total_len.dtype != torch.int32
+        or (query_start_loc is not None and query_start_loc.dtype != torch.int32)
+        or (output_bin_counts is not None and output_bin_counts.dtype != torch.int32)
+    ):
+        return False
+    rc = _post_update_m1_fn(
+        idx_mapping.data_ptr(),
+        num_computed_tokens.data_ptr(),
+        last_sampled_tokens.data_ptr(),
+        output_bin_counts.data_ptr() if output_bin_counts is not None else 0,
+        output_bin_counts.stride(0) if output_bin_counts is not None else 0,
+        sampled_tokens.data_ptr(),
+        num_sampled.data_ptr(),
+        num_rejected.data_ptr(),
+        query_start_loc.data_ptr() if query_start_loc is not None else 0,
+        all_token_ids.data_ptr(),
+        all_token_ids.stride(0),
+        total_len.data_ptr(),
+        torch.cuda.current_stream(idx_mapping.device).cuda_stream,
+    )
+    if rc:
+        raise RuntimeError(f"muse_post_update_m1 failed with CUDA error {rc}")
+    return True
+
+
+def fast_single_decode_prep(
+    num_groups: int,
+    idx_mapping: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    last_sampled_tokens: torch.Tensor,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    seq_lens: torch.Tensor,
+    src_bt_ptrs: torch.Tensor,
+    dst_bt_ptrs: torch.Tensor,
+    bt_strides: torch.Tensor,
+    num_blocks: torch.Tensor,
+    block_sizes: torch.Tensor,
+    slot_mappings: torch.Tensor,
+) -> bool:
+    if (
+        not ENABLED_TAIL
+        or _single_decode_prep_fn is None
+        or num_groups <= 0
+        or idx_mapping.dtype != torch.int32
+        or num_computed_tokens.dtype != torch.int32
+        or last_sampled_tokens.dtype != torch.int64
+        or not last_sampled_tokens.is_contiguous()
+        or input_ids.dtype != torch.int32
+        or positions.dtype != torch.int64
+        or seq_lens.dtype != torch.int32
+        or src_bt_ptrs.dtype != torch.uint64
+        or dst_bt_ptrs.dtype != torch.uint64
+        or bt_strides.dtype != torch.int64
+        or num_blocks.dtype != torch.int32
+        or block_sizes.dtype != torch.int32
+        or slot_mappings.dtype != torch.int64
+    ):
+        return False
+    rc = _single_decode_prep_fn(
+        int(num_groups),
+        idx_mapping.data_ptr(),
+        num_computed_tokens.data_ptr(),
+        last_sampled_tokens.data_ptr(),
+        input_ids.data_ptr(),
+        positions.data_ptr(),
+        seq_lens.data_ptr(),
+        src_bt_ptrs.data_ptr(),
+        dst_bt_ptrs.data_ptr(),
+        bt_strides.data_ptr(),
+        num_blocks.data_ptr(),
+        num_blocks.stride(0),
+        block_sizes.data_ptr(),
+        slot_mappings.data_ptr(),
+        slot_mappings.stride(0),
+        torch.cuda.current_stream(idx_mapping.device).cuda_stream,
+    )
+    if rc:
+        raise RuntimeError(f"muse_single_decode_prep failed with CUDA error {rc}")
+    return True
 
 state = {"admitted": None, "admitted_m1": None, "fused_calls": 0, "m1_calls": 0, "reason": ""}
 

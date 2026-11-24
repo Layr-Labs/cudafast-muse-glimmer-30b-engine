@@ -49,7 +49,19 @@ def lib():
     if ss is not None:
         ss.argtypes = [p, p, ctypes.c_int, p]
         ss.restype = ctypes.c_int
+    pdl = getattr(native, "muse_norm_glue_set_pdl", None)
+    if pdl is not None:
+        pdl.argtypes = [ctypes.c_int]
+        pdl.restype = ctypes.c_int
     return native
+
+
+def set_pdl(on: bool) -> bool | None:
+    """Enable or disable SM121 PDL for decode (rows <= 16) norm glue launches."""
+    fn = getattr(lib(), "muse_norm_glue_set_pdl", None)
+    if fn is None:
+        return None
+    return bool(fn(1 if on else 0))
 
 
 def _ptr(t):

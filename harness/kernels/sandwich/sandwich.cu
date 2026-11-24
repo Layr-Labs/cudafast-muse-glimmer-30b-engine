@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cstdlib>
 
 namespace {
 constexpr int Columns = 6656;
@@ -7,6 +8,35 @@ constexpr int Vectors = Columns / 4;
 constexpr int Tiles = (Vectors + Threads - 1) / Threads;
 
 static bool g_prefill_cs = true;
+static int g_sandwich_pdl_override = -1;
+
+static bool sandwich_pdl_enabled() {
+    if (g_sandwich_pdl_override >= 0) return g_sandwich_pdl_override != 0;
+    static const bool env_on = []() {
+        const char* env = std::getenv("MUSE_SANDWICH_PDL");
+        return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+    }();
+    return env_on;
+}
+
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void pdl_launch_dependents() { asm volatile("griddepcontrol.launch_dependents;"); }
+
+template <typename... KArgs, typename... Args>
+static cudaError_t launch_ex_pdl(void (*kernel)(KArgs...), int rows, int threads, size_t smem, cudaStream_t stream,
+                                 Args... args) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(rows, 1, 1);
+    cfg.blockDim = dim3(threads, 1, 1);
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+}
 
 __device__ float bf16(uint2 packed, int channel) {
     const unsigned bits = channel < 2 ? packed.x : packed.y;
@@ -104,7 +134,7 @@ __device__ __forceinline__ void store2_evict_last(uint2* address, uint2 value) {
 }
 
 template <bool Quantize, bool Shared, bool Gate = false, bool WriteHidden = true, bool GateEvictLast = false,
-          bool ResidualEvictLast = false, bool CsLoads = false>
+          bool ResidualEvictLast = false, bool CsLoads = false, bool Pdl = false>
 __global__ __launch_bounds__(Threads) void sandwich(
     uint2* post_attn, const uint2* down, const uint2* residual,
     const float* previous_sum, const uint2* post_attn_weight,
@@ -112,11 +142,45 @@ __global__ __launch_bounds__(Threads) void sandwich(
     const float* scale, uint2* hidden, unsigned* quantized,
     const float* gate_scale = nullptr, unsigned* gate_quantized = nullptr) {
     constexpr bool UseCs = Shared && CsLoads;
+    constexpr bool UsePdl = Shared && Pdl;
     __shared__ float warp_totals[8];
     extern __shared__ uint2 shared_row[];
     uint2 saved[Tiles];
     const unsigned thread = threadIdx.x;
     const size_t base = blockIdx.x * Vectors;
+    float h1_pre[Tiles][4];
+    float scale_inv_pre = 1.f;
+    float gate_inv_pre = 1.f;
+    if constexpr (UsePdl) {
+        // Preload predecessor-independent inputs (post_attn, residual, weights, scales) and precompute
+        // attention_sum BEFORE waiting for down_proj completion; exact same FP32 ops & rounding order.
+        const float prev_s_pre = UseCs ? __ldg(previous_sum + blockIdx.x) : previous_sum[blockIdx.x];
+        const float attn_inv_pre = inverse_rms(prev_s_pre, 1.e-8f);
+        if constexpr (Quantize) scale_inv_pre = full_divide(1.f, UseCs ? __ldg(scale) : *scale);
+        if constexpr (Gate) gate_inv_pre = full_divide(1.f, UseCs ? __ldg(gate_scale) : *gate_scale);
+        #pragma unroll
+        for (int tile = 0; tile < Tiles; ++tile) {
+            const unsigned offset = tile * Threads + thread;
+            if (offset < Vectors) {
+                const uint2 a = UseCs ? load2_cs(post_attn + base + offset) : post_attn[base + offset];
+                uint2 r, wa;
+                if constexpr (UseCs) {
+                    r = load2_cs(residual + base + offset);
+                    wa = __ldg(post_attn_weight + offset);
+                } else {
+                    r = residual[base + offset];
+                    wa = post_attn_weight[offset];
+                }
+                #pragma unroll
+                for (int channel = 0; channel < 4; ++channel) {
+                    const float attention = apply_norm(bf16(a, channel), attn_inv_pre, bf16(wa, channel));
+                    h1_pre[tile][channel] = __fadd_rn(bf16(r, channel), attention);
+                }
+            }
+        }
+        pdl_wait();
+        pdl_launch_dependents();
+    }
     float partial[4] = {};
     #pragma unroll
     for (int tile = 0; tile < Tiles; ++tile) {
@@ -141,8 +205,11 @@ __global__ __launch_bounds__(Threads) void sandwich(
         }
     }
     const float down_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-8f);
-    const float prev_s = UseCs ? __ldg(previous_sum + blockIdx.x) : previous_sum[blockIdx.x];
-    const float attn_inverse = inverse_rms(prev_s, 1.e-8f);
+    float attn_inverse = 0.f;
+    if constexpr (!UsePdl) {
+        const float prev_s = UseCs ? __ldg(previous_sum + blockIdx.x) : previous_sum[blockIdx.x];
+        attn_inverse = inverse_rms(prev_s, 1.e-8f);
+    }
     #pragma unroll
     for (int channel = 0; channel < 4; ++channel) partial[channel] = 0.f;
     #pragma unroll
@@ -155,26 +222,37 @@ __global__ __launch_bounds__(Threads) void sandwich(
             } else {
                 d = saved[tile];
             }
-            const uint2 a = post_attn[base + offset];
-            uint2 r, wa, wd;
-            if constexpr (UseCs) {
-                r = load2_cs(residual + base + offset);
-                wa = __ldg(post_attn_weight + offset);
-                wd = __ldg(post_ff_weight + offset);
-            } else {
-                r = residual[base + offset];
-                wa = post_attn_weight[offset];
-                wd = post_ff_weight[offset];
-            }
             float values[4];
-            #pragma unroll
-            for (int channel = 0; channel < 4; ++channel) {
-                const float attention = apply_norm(bf16(a, channel), attn_inverse, bf16(wa, channel));
-                const float feed_forward = __fmul_rn(bf16(d, channel), down_inverse);
-                const float attention_sum = __fadd_rn(bf16(r, channel), attention);
-                const float value = __fmaf_rn(feed_forward, __fadd_rn(bf16(wd, channel), 1.f), attention_sum);
-                values[channel] = value;
-                partial[channel] = __fmaf_rn(value, value, partial[channel]);
+            if constexpr (UsePdl) {
+                const uint2 wd = UseCs ? __ldg(post_ff_weight + offset) : post_ff_weight[offset];
+                #pragma unroll
+                for (int channel = 0; channel < 4; ++channel) {
+                    const float feed_forward = __fmul_rn(bf16(d, channel), down_inverse);
+                    const float value = __fmaf_rn(feed_forward, __fadd_rn(bf16(wd, channel), 1.f), h1_pre[tile][channel]);
+                    values[channel] = value;
+                    partial[channel] = __fmaf_rn(value, value, partial[channel]);
+                }
+            } else {
+                const uint2 a = post_attn[base + offset];
+                uint2 r, wa, wd;
+                if constexpr (UseCs) {
+                    r = load2_cs(residual + base + offset);
+                    wa = __ldg(post_attn_weight + offset);
+                    wd = __ldg(post_ff_weight + offset);
+                } else {
+                    r = residual[base + offset];
+                    wa = post_attn_weight[offset];
+                    wd = post_ff_weight[offset];
+                }
+                #pragma unroll
+                for (int channel = 0; channel < 4; ++channel) {
+                    const float attention = apply_norm(bf16(a, channel), attn_inverse, bf16(wa, channel));
+                    const float feed_forward = __fmul_rn(bf16(d, channel), down_inverse);
+                    const float attention_sum = __fadd_rn(bf16(r, channel), attention);
+                    const float value = __fmaf_rn(feed_forward, __fadd_rn(bf16(wd, channel), 1.f), attention_sum);
+                    values[channel] = value;
+                    partial[channel] = __fmaf_rn(value, value, partial[channel]);
+                }
             }
             const uint2 rounded = make_uint2(pack_bf16(values[0], values[1]),
                                              pack_bf16(values[2], values[3]));
@@ -191,8 +269,10 @@ __global__ __launch_bounds__(Threads) void sandwich(
         }
     }
     const float input_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-5f);
-    const float scale_inv = Quantize ? full_divide(1.f, UseCs ? __ldg(scale) : *scale) : 1.f;
-    const float gate_inv = Gate ? full_divide(1.f, UseCs ? __ldg(gate_scale) : *gate_scale) : 1.f;
+    const float scale_inv = UsePdl ? scale_inv_pre
+                                   : (Quantize ? full_divide(1.f, UseCs ? __ldg(scale) : *scale) : 1.f);
+    const float gate_inv = UsePdl ? gate_inv_pre
+                                  : (Gate ? full_divide(1.f, UseCs ? __ldg(gate_scale) : *gate_scale) : 1.f);
     #pragma unroll
     for (int tile = 0; tile < Tiles; ++tile) {
         const unsigned offset = tile * Threads + thread;
@@ -235,13 +315,26 @@ __global__ __launch_bounds__(Threads) void sandwich(
 
 template <bool Quantize, bool Shared, bool CsLoads = false>
 void launch(const void* const* args, int rows, cudaStream_t stream) {
-    sandwich<Quantize, Shared, false, true, false, false, CsLoads><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
-        static_cast<uint2*>(const_cast<void*>(args[0])), static_cast<const uint2*>(args[1]),
-        static_cast<const uint2*>(args[2]), static_cast<const float*>(args[3]),
-        static_cast<const uint2*>(args[4]), static_cast<const uint2*>(args[5]),
-        static_cast<const uint2*>(args[6]), Quantize ? static_cast<const float*>(args[7]) : nullptr,
-        static_cast<uint2*>(const_cast<void*>(args[Quantize ? 8 : 7])),
-        Quantize ? static_cast<unsigned*>(const_cast<void*>(args[9])) : nullptr);
+    auto* a0 = static_cast<uint2*>(const_cast<void*>(args[0]));
+    const auto* a1 = static_cast<const uint2*>(args[1]);
+    const auto* a2 = static_cast<const uint2*>(args[2]);
+    const auto* a3 = static_cast<const float*>(args[3]);
+    const auto* a4 = static_cast<const uint2*>(args[4]);
+    const auto* a5 = static_cast<const uint2*>(args[5]);
+    const auto* a6 = static_cast<const uint2*>(args[6]);
+    const auto* a7 = Quantize ? static_cast<const float*>(args[7]) : nullptr;
+    auto* a8 = static_cast<uint2*>(const_cast<void*>(args[Quantize ? 8 : 7]));
+    auto* a9 = Quantize ? static_cast<unsigned*>(const_cast<void*>(args[9])) : nullptr;
+    if constexpr (Shared) {
+        if (sandwich_pdl_enabled()) {
+            launch_ex_pdl(sandwich<Quantize, true, false, true, false, false, CsLoads, true>, rows, Threads,
+                          Vectors * sizeof(uint2), stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9,
+                          static_cast<const float*>(nullptr), static_cast<unsigned*>(nullptr));
+            return;
+        }
+    }
+    sandwich<Quantize, Shared, false, true, false, false, CsLoads, false><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
+        a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
 }
 }
 
@@ -249,15 +342,35 @@ extern "C" void muse_sandwich_set_prefill_cs(int enable) {
     g_prefill_cs = (enable != 0);
 }
 
+extern "C" int muse_sandwich_set_pdl(int enable) {
+    const int old = sandwich_pdl_enabled() ? 1 : 0;
+    g_sandwich_pdl_override = (enable < 0) ? -1 : (enable != 0 ? 1 : 0);
+    return old;
+}
+
 template <bool Shared, bool WriteHidden, bool EvictLast = false, bool CsLoads = false>
 void launch_gate(const void* const* args, int rows, cudaStream_t stream) {
-    sandwich<true, Shared, true, WriteHidden, EvictLast, false, CsLoads><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
-        static_cast<uint2*>(const_cast<void*>(args[0])), static_cast<const uint2*>(args[1]),
-        static_cast<const uint2*>(args[2]), static_cast<const float*>(args[3]),
-        static_cast<const uint2*>(args[4]), static_cast<const uint2*>(args[5]),
-        static_cast<const uint2*>(args[6]), static_cast<const float*>(args[7]),
-        static_cast<uint2*>(const_cast<void*>(args[8])), static_cast<unsigned*>(const_cast<void*>(args[9])),
-        static_cast<const float*>(args[10]), static_cast<unsigned*>(const_cast<void*>(args[11])));
+    auto* a0 = static_cast<uint2*>(const_cast<void*>(args[0]));
+    const auto* a1 = static_cast<const uint2*>(args[1]);
+    const auto* a2 = static_cast<const uint2*>(args[2]);
+    const auto* a3 = static_cast<const float*>(args[3]);
+    const auto* a4 = static_cast<const uint2*>(args[4]);
+    const auto* a5 = static_cast<const uint2*>(args[5]);
+    const auto* a6 = static_cast<const uint2*>(args[6]);
+    const auto* a7 = static_cast<const float*>(args[7]);
+    auto* a8 = static_cast<uint2*>(const_cast<void*>(args[8]));
+    auto* a9 = static_cast<unsigned*>(const_cast<void*>(args[9]));
+    const auto* a10 = static_cast<const float*>(args[10]);
+    auto* a11 = static_cast<unsigned*>(const_cast<void*>(args[11]));
+    if constexpr (Shared) {
+        if (sandwich_pdl_enabled()) {
+            launch_ex_pdl(sandwich<true, true, true, WriteHidden, EvictLast, false, CsLoads, true>, rows, Threads,
+                          Vectors * sizeof(uint2), stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+            return;
+        }
+    }
+    sandwich<true, Shared, true, WriteHidden, EvictLast, false, CsLoads, false><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
+        a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
 }
 
 // The gate quantization formula alone on n bf16 bit patterns (the admission check runs it on all 65,536 and
@@ -301,20 +414,44 @@ extern "C" int muse_sandwich_gate_evict_last(const void* const* args, int rows, 
 template <bool GateEL, bool ResEL, bool CsLoads>
 int launch_hint(const void* const* args, int rows, int mode, cudaStream_t stream) {
     const size_t smem = Vectors * sizeof(uint2);
+    const bool use_pdl = sandwich_pdl_enabled();
     if (mode == 0) {
-        sandwich<false, true, false, true, false, ResEL, CsLoads><<<rows, Threads, smem, stream>>>(
-            static_cast<uint2*>(const_cast<void*>(args[0])), static_cast<const uint2*>(args[1]),
-            static_cast<const uint2*>(args[2]), static_cast<const float*>(args[3]),
-            static_cast<const uint2*>(args[4]), static_cast<const uint2*>(args[5]),
-            static_cast<const uint2*>(args[6]), nullptr, static_cast<uint2*>(const_cast<void*>(args[7])), nullptr);
+        auto* a0 = static_cast<uint2*>(const_cast<void*>(args[0]));
+        const auto* a1 = static_cast<const uint2*>(args[1]);
+        const auto* a2 = static_cast<const uint2*>(args[2]);
+        const auto* a3 = static_cast<const float*>(args[3]);
+        const auto* a4 = static_cast<const uint2*>(args[4]);
+        const auto* a5 = static_cast<const uint2*>(args[5]);
+        const auto* a6 = static_cast<const uint2*>(args[6]);
+        auto* a7 = static_cast<uint2*>(const_cast<void*>(args[7]));
+        if (use_pdl) {
+            return static_cast<int>(launch_ex_pdl(
+                sandwich<false, true, false, true, false, ResEL, CsLoads, true>, rows, Threads, smem, stream,
+                a0, a1, a2, a3, a4, a5, a6, static_cast<const float*>(nullptr), a7,
+                static_cast<unsigned*>(nullptr), static_cast<const float*>(nullptr), static_cast<unsigned*>(nullptr)));
+        }
+        sandwich<false, true, false, true, false, ResEL, CsLoads, false><<<rows, Threads, smem, stream>>>(
+            a0, a1, a2, a3, a4, a5, a6, nullptr, a7, nullptr);
     } else {
-        sandwich<true, true, true, false, GateEL, ResEL, CsLoads><<<rows, Threads, smem, stream>>>(
-            static_cast<uint2*>(const_cast<void*>(args[0])), static_cast<const uint2*>(args[1]),
-            static_cast<const uint2*>(args[2]), static_cast<const float*>(args[3]),
-            static_cast<const uint2*>(args[4]), static_cast<const uint2*>(args[5]),
-            static_cast<const uint2*>(args[6]), static_cast<const float*>(args[7]),
-            static_cast<uint2*>(const_cast<void*>(args[8])), static_cast<unsigned*>(const_cast<void*>(args[9])),
-            static_cast<const float*>(args[10]), static_cast<unsigned*>(const_cast<void*>(args[11])));
+        auto* a0 = static_cast<uint2*>(const_cast<void*>(args[0]));
+        const auto* a1 = static_cast<const uint2*>(args[1]);
+        const auto* a2 = static_cast<const uint2*>(args[2]);
+        const auto* a3 = static_cast<const float*>(args[3]);
+        const auto* a4 = static_cast<const uint2*>(args[4]);
+        const auto* a5 = static_cast<const uint2*>(args[5]);
+        const auto* a6 = static_cast<const uint2*>(args[6]);
+        const auto* a7 = static_cast<const float*>(args[7]);
+        auto* a8 = static_cast<uint2*>(const_cast<void*>(args[8]));
+        auto* a9 = static_cast<unsigned*>(const_cast<void*>(args[9]));
+        const auto* a10 = static_cast<const float*>(args[10]);
+        auto* a11 = static_cast<unsigned*>(const_cast<void*>(args[11]));
+        if (use_pdl) {
+            return static_cast<int>(launch_ex_pdl(
+                sandwich<true, true, true, false, GateEL, ResEL, CsLoads, true>, rows, Threads, smem, stream,
+                a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11));
+        }
+        sandwich<true, true, true, false, GateEL, ResEL, CsLoads, false><<<rows, Threads, smem, stream>>>(
+            a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
     }
     return cudaGetLastError();
 }

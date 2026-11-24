@@ -169,21 +169,24 @@ def _time_candidates(decode_linear, layer, candidates, n: int, k: int, rounds: i
         except (ImportError, OSError):
             use_6 = False
     if use_6:
-        # Pre-warm Split2 scale header check and use fused 96-CTA Split2 lm_head+lmpost kernel when active on lm_head.
+        # Pre-warm Split2/Pad128 scale header checks and use fused lm_head+lmpost kernel when active on lm_head.
+        _is_pad128 = hasattr(_m6_mod, "is_lm_pad128") and _m6_mod.is_lm_pad128(scales6)
+        _is_split2 = hasattr(_m6_mod, "is_lm_split2") and _m6_mod.is_lm_split2(scales6)
         use_lm_lmpost = (
             (n, k) == (202048, 6656)
             and os.environ.get("MUSE_PLACE_LMHEAD_SPLIT2", "1") != "0"
             and hasattr(_m6_mod, "is_tma4_ilv")
-            and hasattr(_m6_mod, "is_lm_split2")
             and getattr(_m6_mod, "_sk_tma4_ilv_lmpost", None) is not None
             and _m6_mod.is_tma4_ilv(scales6)
-            and _m6_mod.is_lm_split2(scales6)
+            and (_is_split2 or _is_pad128)
         )
         if use_lm_lmpost:
             scratch, partials = _m6_mod._get_lmpost_bufs(device)
             dummy_lut = torch.zeros(65536, dtype=torch.bfloat16, device=device)
             dummy_tok = torch.zeros((1, 1), dtype=torch.int64, device=device)
             org_vocab = int(getattr(layer, "org_vocab_size", n))
+            eff_n = 202112 if _is_pad128 else n
+            lm_blocks = 96 if _is_split2 else 48
             dev_idx = device.index if device.index is not None else torch.cuda.current_device()
             lmpost_fn = _m6_mod._sk_tma4_ilv_lmpost
 
@@ -191,11 +194,11 @@ def _time_candidates(decode_linear, layer, candidates, n: int, k: int, rounds: i
                 rc = lmpost_fn(
                     x.data_ptr(), buf.data_ptr(), scratch.data_ptr(), partials.data_ptr(),
                     scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
-                    dummy_lut.data_ptr(), dummy_tok.data_ptr(), org_vocab, n, k, 96, dev_idx,
+                    dummy_lut.data_ptr(), dummy_tok.data_ptr(), org_vocab, eff_n, k, lm_blocks, dev_idx,
                     torch.cuda.current_stream(device).cuda_stream,
                 )
                 if rc:
-                    raise RuntimeError(f"lm_head Split2 placement probe returned {rc}")
+                    raise RuntimeError(f"lm_head placement probe returned {rc}")
         else:
             def run_one(buf):
                 decode_linear6(x, buf, scales6, palette, global_scale, workspace, n, k, fixed_grid)
@@ -1042,10 +1045,14 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                             ilv_set = getattr(_m6, "_DOWN_ILV_SCALES", None)
                             lm_split2_set = getattr(_m6, "_LM_SPLIT2_SCALES", None)
                             lm_split2_cache = getattr(_m6, "_LM_SPLIT2_CACHE", None)
+                            lm_pad128_set = getattr(_m6, "_LM_PAD128_SCALES", None)
+                            lm_pad128_cache = getattr(_m6, "_LM_PAD128_CACHE", None)
                         except (ImportError, OSError):
                             ilv_set = None
                             lm_split2_set = None
                             lm_split2_cache = None
+                            lm_pad128_set = None
+                            lm_pad128_cache = None
                         moved_s6, bytes_s6 = 0, 0
                         for m in model.modules():
                             s6 = m._buffers.get("_marlin_decode_scales6")
@@ -1068,6 +1075,11 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                                             lm_split2_set.add(dst.data_ptr())
                                         if lm_split2_cache is not None and old_ptr in lm_split2_cache:
                                             lm_split2_cache[dst.data_ptr()] = lm_split2_cache.pop(old_ptr)
+                                        if lm_pad128_set is not None and old_ptr in lm_pad128_set:
+                                            lm_pad128_set.discard(old_ptr)
+                                            lm_pad128_set.add(dst.data_ptr())
+                                        if lm_pad128_cache is not None and old_ptr in lm_pad128_cache:
+                                            lm_pad128_cache[dst.data_ptr()] = lm_pad128_cache.pop(old_ptr)
                                         moved_s6 += 1
                                         bytes_s6 += dst.numel() * dst.element_size()
                                 except RuntimeError:

@@ -281,13 +281,27 @@ static size_t bf16_tpf_stride() {
   return stride;
 }
 
+static int g_bf16_pdl_override = -1;
+
+static int bf16_pdl_cfg() {
+  if (g_bf16_pdl_override >= 0) return g_bf16_pdl_override;
+  static const int mode = []() -> int {
+    const char* env = std::getenv("MUSE_BF16_PDL");
+    if (!env || !*env) return 2;  // default ON: full dual-sided SM121 PDL (0=off, 1=consumer, 2=all)
+    long v = std::strtol(env, nullptr, 10);
+    return (v == 0 || v == 1 || v == 2) ? static_cast<int>(v) : 2;
+  }();
+  return mode;
+}
+
 __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
     const uint16_t* __restrict__ x_in,
     const uint8_t* __restrict__ blob,
     uint16_t* __restrict__ out,
     int rows,
     size_t blob_bytes,
-    size_t tpf_stride) {
+    size_t tpf_stride,
+    int pdl_mode) {
   // Blob layout (self-describing, no host sync needed on launch):
   //   [0..4096):    u32 lut[1024] = hi_byte | (freq << 8) | ((slot - cum) << 19)
   //   [4096..4112): u32 meta[4]   = {rows, tw, gmin, soff}
@@ -361,17 +375,22 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
   for (int i = tid; i < 256; i += blockDim.x) {
     reinterpret_cast<uint4*>(sh_lut)[i] = reinterpret_cast<const uint4*>(blob)[i];
   }
+  if (active && fast_shape) {
+    gmin = static_cast<int>(__ldg(&meta[2]));
+    wbytes = static_cast<uint32_t>(woff16[w + 1] - woff16[w]) * 16u;
+    toffw = woff16[tw + 1 + w];
+  }
+  if (pdl_mode & 1) {
+    // SM121 PDL consumer barrier: weight ring groups, TLB prefetches, sh_lut, and offsets
+    // are preloaded from immutable blob; wait for predecessor before reading x_in.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
   for (int i = tid; i < kWidth; i += blockDim.x) {
     const int tile = i / kValues;
     const int rem = i - tile * kValues;
     const int step = rem >> 5;
     const int ln = rem & 31;
     sh_x[tile * kValues + ln * kSteps + step] = x_in[i];
-  }
-  if (active && fast_shape) {
-    gmin = static_cast<int>(__ldg(&meta[2]));
-    wbytes = static_cast<uint32_t>(woff16[w + 1] - woff16[w]) * 16u;
-    toffw = woff16[tw + 1 + w];
   }
   __syncthreads();
   if (!active) return;
@@ -388,7 +407,12 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
 
   for (int row = w; row < rows; row += tw) {
     float accum = 0.0f;
+    // SM121 PDL producer trigger: ~10 us (12 tiles) before final row completes.
+    const int trig_tile = ((pdl_mode & 2) && (row + tw >= rows)) ? (kTiles - 12) : -1;
     for (int tile = 0; tile < kTiles; ++tile) {
+      if (tile == trig_tile) {
+        asm volatile("griddepcontrol.launch_dependents;");
+      }
       __syncwarp();
       const int curg = static_cast<int>(pwb >> 9);
       while (issued <= curg + static_cast<int>(RG) - 1) BF_ISSUE();
@@ -558,6 +582,12 @@ extern "C" int muse_bf16_rans_pass2(const uint16_t* W, int rows, int tw, int gmi
   return cudaGetLastError();
 }
 
+extern "C" int muse_bf16_lane_set_pdl(int mode) {
+  const int prev = bf16_pdl_cfg();
+  g_bf16_pdl_override = (mode == 0 || mode == 1 || mode == 2) ? mode : -1;
+  return prev;
+}
+
 extern "C" int muse_bf16_rans_gemv(int rows, size_t blob_bytes, const void* input, const void* blob, void* output, cudaStream_t stream) {
   if (!valid_rows(rows)) return cudaErrorInvalidValue;
   const int tw = (rows == 4608) ? 576 : ((rows == 4096) ? 512 : (rows / 8));
@@ -585,8 +615,27 @@ extern "C" int muse_bf16_rans_gemv(int rows, size_t blob_bytes, const void* inpu
     cudaThreadExchangeStreamCaptureMode(&mode);
     init = true;
   }
+  const int pdl_cfg = bf16_pdl_cfg();
+  const int pdl_mode = (pdl_cfg == 2) ? 3 : ((pdl_cfg == 1) ? 1 : 0);
+  const auto* x_arg = static_cast<const uint16_t*>(input);
+  const auto* b_arg = static_cast<const uint8_t*>(blob);
+  auto* o_arg = static_cast<uint16_t*>(output);
+  const size_t tpf_arg = bf16_tpf_stride();
+  if ((pdl_mode & 1) != 0) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(blocks, 1, 1);
+    cfg.blockDim = dim3(wpb * 32, 1, 1);
+    cfg.dynamicSmemBytes = dsmem;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    return static_cast<int>(cudaLaunchKernelEx(
+        &cfg, bf16_rans_gemv_kernel, x_arg, b_arg, o_arg, rows, blob_bytes, tpf_arg, pdl_mode));
+  }
   bf16_rans_gemv_kernel<<<blocks, wpb * 32, dsmem, stream>>>(
-      static_cast<const uint16_t*>(input), static_cast<const uint8_t*>(blob),
-      static_cast<uint16_t*>(output), rows, blob_bytes, bf16_tpf_stride());
+      x_arg, b_arg, o_arg, rows, blob_bytes, tpf_arg, pdl_mode);
   return cudaGetLastError();
 }

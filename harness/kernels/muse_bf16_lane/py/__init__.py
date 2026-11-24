@@ -44,7 +44,19 @@ def _lib():
         native.muse_bf16_rans_pass2.restype = ctypes.c_int
         native.muse_bf16_rans_gemv.argtypes = [ctypes.c_int, ctypes.c_size_t, ptr, ptr, ptr, ptr]
         native.muse_bf16_rans_gemv.restype = ctypes.c_int
+    if hasattr(native, "muse_bf16_lane_set_pdl"):
+        native.muse_bf16_lane_set_pdl.argtypes = [ctypes.c_int]
+        native.muse_bf16_lane_set_pdl.restype = ctypes.c_int
     return native
+
+
+def set_pdl(mode: int) -> int | None:
+    """Set SM121 PDL mode for BF16 rANS decode launches (0=off, 1=consumer, 2=all, <0=env default)."""
+    native = _lib()
+    fn = getattr(native, "muse_bf16_lane_set_pdl", None) if native is not None else None
+    if fn is None:
+        return None
+    return int(fn(int(mode)))
 
 
 def _launch(x, payload, index, n):

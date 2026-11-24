@@ -74,6 +74,17 @@ if TMA_ENABLED or ATTN_TMA_ENABLED:
             _tma_set_shfl_epi.argtypes = [ctypes.c_int]
             _tma_set_shfl_epi.restype = None
             _tma_set_shfl_epi(1 if TMA_SHFL_EPI else 0)
+        _tma_set_pdl = getattr(_tma_library, "marlinw_tma_set_pdl", None)
+        if _tma_set_pdl is not None:
+            _tma_set_pdl.argtypes = [ctypes.c_int]
+            _tma_set_pdl.restype = ctypes.c_int
+
+
+def set_tma_pdl(mode: int) -> int | None:
+    fn = globals().get("_tma_set_pdl")
+    if fn is None:
+        return None
+    return int(fn(int(mode)))
 _tma_ready = set()  # devices on which the TMA-fed kernel initialized
 _tma_weights = set()  # weight data pointers whose layer passed the comparison with the TMA-fed kernel
 _admitted = 0  # layers offered to admit_tma (those on the 128x128 tile)

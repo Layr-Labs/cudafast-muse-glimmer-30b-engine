@@ -538,6 +538,12 @@ def _post_update_kernel(
         tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + computed_delta)
 
 
+try:
+    from muse_embed import fast_post_update_m1 as _fast_post_update_m1
+except (ImportError, OSError):
+    _fast_post_update_m1 = None
+
+
 def post_update(
     # [num_reqs] batch_idx -> req_state_idx; negative index means skip.
     idx_mapping: torch.Tensor,
@@ -561,6 +567,23 @@ def post_update(
     total_len: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if (
+        num_reqs == 1
+        and _fast_post_update_m1 is not None
+        and _fast_post_update_m1(
+            idx_mapping,
+            num_computed_tokens,
+            last_sampled_tokens,
+            output_bin_counts,
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            query_start_loc,
+            all_token_ids,
+            total_len,
+        )
+    ):
+        return
     _post_update_kernel[(num_reqs,)](
         idx_mapping,
         num_computed_tokens,

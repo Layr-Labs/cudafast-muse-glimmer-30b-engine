@@ -34,8 +34,19 @@ def _load():
             lib.swiglu_ws_init.restype = ctypes.c_int
             lib.swiglu_ws_run.argtypes = [ptr] * 7
             lib.swiglu_ws_run.restype = ctypes.c_int
+        if hasattr(lib, "swiglu_ws_set_pdl"):
+            lib.swiglu_ws_set_pdl.argtypes = [ctypes.c_int]
+            lib.swiglu_ws_set_pdl.restype = ctypes.c_int
         _library = lib
     return _library
+
+
+def set_pdl(on: bool) -> bool | None:
+    lib = _load()
+    fn = getattr(lib, "swiglu_ws_set_pdl", None)
+    if fn is None:
+        return None
+    return bool(fn(1 if on else 0))
 
 
 def _admit_ws(device: int, packed: torch.Tensor) -> bool:

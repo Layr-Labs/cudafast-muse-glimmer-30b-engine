@@ -13,6 +13,11 @@ from vllm.v1.worker.gpu.buffer_utils import (
     _load_ptr,
 )
 
+try:
+    from muse_embed import fast_single_decode_prep as _fast_single_decode_prep
+except (ImportError, OSError):
+    _fast_single_decode_prep = None
+
 
 class BlockTables:
     def __init__(
@@ -220,6 +225,25 @@ class BlockTables:
         positions: torch.Tensor,
         seq_lens: torch.Tensor,
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        if _fast_single_decode_prep is not None and _fast_single_decode_prep(
+            self.num_kv_cache_groups,
+            idx_mapping,
+            num_computed_tokens,
+            last_sampled_tokens,
+            input_ids,
+            positions,
+            seq_lens,
+            self.block_table_ptrs,
+            self.input_block_table_ptrs,
+            self.block_table_strides,
+            self.num_blocks.gpu,
+            self.block_sizes_tensor,
+            self.slot_mappings,
+        ):
+            return (
+                tuple(bt[:1] for bt in self.input_block_tables),
+                self.slot_mappings[:, :1],
+            )
         _fused_single_decode_prep_kernel[(self.num_kv_cache_groups,)](
             idx_mapping,
             num_computed_tokens,
