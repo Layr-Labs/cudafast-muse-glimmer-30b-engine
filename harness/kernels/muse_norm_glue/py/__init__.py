@@ -29,6 +29,10 @@ def lib():
     if ms is not None:
         ms.argtypes = [p, p, p, ctypes.c_int, p]
         ms.restype = ctypes.c_int
+    ms8 = getattr(native, "muse_norm_glue_mul_sigmoid_fp8", None)
+    if ms8 is not None:
+        ms8.argtypes = [p, p, p, p, ctypes.c_int, p]
+        ms8.restype = ctypes.c_int
     return native
 
 
@@ -82,3 +86,12 @@ def mul_sigmoid_bf16(gate, attn, out, n, stream):
     err = fn(_ptr(gate), _ptr(attn), _ptr(out), int(n), stream)
     if err:
         raise RuntimeError(f"muse_norm_glue mul_sigmoid_bf16 launch returned CUDA status {err}")
+
+
+def mul_sigmoid_fp8(gate, attn, scale, out, n, stream):
+    fn = getattr(lib(), "muse_norm_glue_mul_sigmoid_fp8", None)
+    if fn is None:
+        raise RuntimeError("muse_norm_glue_mul_sigmoid_fp8 unavailable")
+    err = fn(_ptr(gate), _ptr(attn), _ptr(scale), _ptr(out), int(n), stream)
+    if err:
+        raise RuntimeError(f"muse_norm_glue mul_sigmoid_fp8 launch returned CUDA status {err}")

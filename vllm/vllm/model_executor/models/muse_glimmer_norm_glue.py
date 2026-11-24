@@ -140,13 +140,15 @@ class _MulSigmoidSwap:
         stream = kwargs.get("stream")
         if (
             stream is None
-            or n_el != 4096
+            or n_el <= 0
+            or (n_el & 4095) != 0
+            or n_el > 4096 * 4096
             or not all(
                 isinstance(t, torch.Tensor)
                 and t.is_cuda
                 and t.dtype == torch.bfloat16
                 and t.is_contiguous()
-                and t.numel() == 4096
+                and t.numel() == n_el
                 and (t.data_ptr() & 15) == 0
                 for t in (gate, attn, out)
             )
@@ -162,7 +164,7 @@ class _MulSigmoidSwap:
                 g_c, a_c = gate.clone(), attn.clone()
                 mine = torch.empty_like(out)
                 orig_run(kernel, *args, **kwargs)
-                G.mul_sigmoid_bf16(g_c, a_c, mine, 4096, stream)
+                G.mul_sigmoid_bf16(g_c, a_c, mine, n_el, stream)
                 torch.cuda.synchronize()
                 ok = torch.equal(out.view(torch.int16), mine.view(torch.int16))
                 if ok:
@@ -181,19 +183,81 @@ class _MulSigmoidSwap:
             except Exception:
                 ok = False
             self.state = "admitted" if ok else "rejected"
-            logger.info("Decode mul_sigmoid glue: %s", self.state)
+            logger.info("Decode/prefill mul_sigmoid glue: %s", self.state)
             return None
-        G.mul_sigmoid_bf16(gate, attn, out, 4096, stream)
+        G.mul_sigmoid_bf16(gate, attn, out, n_el, stream)
         return None
 
 
 class _RansPrologueHook:
     def __init__(self, act_mode: int) -> None:
         self.act_mode = act_mode
+        self.fp8_glue_state = "unchecked"
+
+    def _try_prefill_sigmoid_fp8(self, kernel, orig_run, args, kwargs) -> bool:
+        if not _MUL_SIGMOID_GLUE or self.fp8_glue_state == "rejected" or len(args) != 5:
+            return False
+        gate, attn, scale, out, numel = args
+        try:
+            n_el = int(numel)
+        except Exception:
+            return False
+        stream = kwargs.get("stream")
+        if (
+            stream is None
+            or n_el <= 4096
+            or (n_el & 4095) != 0
+            or n_el > 4096 * 4096
+            or not all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gate, attn, scale, out))
+            or gate.dtype != torch.bfloat16 or attn.dtype != torch.bfloat16
+            or gate.numel() != n_el or attn.numel() != n_el
+            or ((gate.data_ptr() | attn.data_ptr()) & 15) != 0
+            or scale.dtype != torch.float32 or scale.numel() != 1
+            or out.dtype != torch.float8_e4m3fn or out.numel() != n_el
+            or (out.data_ptr() & 7) != 0
+        ):
+            return False
+        import muse_norm_glue as G
+
+        if self.fp8_glue_state == "unchecked":
+            if torch.cuda.is_current_stream_capturing():
+                return False
+            ok = False
+            try:
+                g_c, a_c, s_c = gate.clone(), attn.clone(), scale.clone()
+                mine = torch.empty_like(out)
+                orig_run(kernel, *args, **kwargs)
+                G.mul_sigmoid_fp8(g_c, a_c, s_c, mine, n_el, stream)
+                torch.cuda.synchronize()
+                ok = torch.equal(out.view(torch.uint8), mine.view(torch.uint8))
+                if ok:
+                    gen = torch.Generator(device=out.device).manual_seed(20261124)
+                    for sig in (0.1, 1.0, 5.0, 20.0):
+                        rg = (torch.randn((1, 4096), generator=gen, device=out.device) * sig).to(torch.bfloat16)
+                        ra = (torch.randn((1, 4096), generator=gen, device=out.device) * sig).to(torch.bfloat16)
+                        ro = torch.empty((1, 4096), dtype=torch.float8_e4m3fn, device=out.device)
+                        mo = torch.empty_like(ro)
+                        orig_run(kernel, rg, ra, s_c, ro, 4096, **kwargs)
+                        G.mul_sigmoid_fp8(rg, ra, s_c, mo, 4096, stream)
+                        torch.cuda.synchronize()
+                        if not torch.equal(ro.view(torch.uint8), mo.view(torch.uint8)):
+                            ok = False
+                            break
+            except Exception:
+                ok = False
+            self.fp8_glue_state = "admitted" if ok else "rejected"
+            logger.info("Prefill mul_sigmoid_fp8 glue: %s", self.fp8_glue_state)
+            return True
+        G.mul_sigmoid_fp8(gate, attn, scale, out, n_el, stream)
+        return True
 
     def run(self, kernel, orig_run, args, kwargs):
         global _pending_rans_prologue
-        if kwargs.get("benchmark_run", False) or _pending_rans_prologue is not None:
+        if kwargs.get("benchmark_run", False):
+            return orig_run(kernel, *args, **kwargs)
+        if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
+            return None
+        if _pending_rans_prologue is not None:
             return orig_run(kernel, *args, **kwargs)
         try:
             import muse_rans_ext as _rans

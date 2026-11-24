@@ -19,6 +19,7 @@ except Exception:  # noqa: BLE001
 
 _lib = None
 _multi = None
+_cache_multi = None
 try:
     _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_qk_glue.so")))
     _lib.muse_qk_norm_rope.argtypes = [
@@ -32,9 +33,22 @@ try:
     if _multi is not None:
         _multi.argtypes = list(_lib.muse_qk_norm_rope.argtypes[:-1]) + [ctypes.c_int, ctypes.c_void_p]
         _multi.restype = ctypes.c_int
+    _cache_multi = getattr(_lib, "muse_qk_norm_rope_cache_multi", None)
+    if _cache_multi is not None:
+        _cache_multi.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ]
+        _cache_multi.restype = ctypes.c_int
 except OSError:
     _lib = None
     _multi = None
+    _cache_multi = None
 
 MULTI_HPW = int(os.environ.get("MUSE_QK_MULTI_HPW", "9"))
 MULTI_MIN_TOKENS = 64
@@ -43,6 +57,7 @@ _multi_state: dict[str, bool | None] = {"admitted": None}
 _decode_state: dict[str, bool | None] = {"admitted": None}
 
 ENABLED = os.environ.get("VLLM_MUSE_GLIMMER_QK_FUSED", "1").strip() not in ("0", "", "false", "no")
+CACHE_FUSED_ENABLED = ENABLED and os.environ.get("VLLM_MUSE_GLIMMER_QK_CACHE_FUSED", "1").strip() not in ("0", "", "false", "no")
 _checked: dict[int, bool] = {}
 
 
@@ -115,6 +130,30 @@ def self_check(device: torch.device) -> bool:
                 if q_mismatch > max(4, oq.numel() // 1000) or k_mismatch > max(2, ok_t.numel() // 1000):
                     ok = False
                     break
+                if _cache_multi is not None:
+                    block_size = 16
+                    num_blocks = 4
+                    kv_cache = torch.zeros((num_blocks, 2, block_size, 256), dtype=torch.bfloat16, device=device)
+                    ref_kv = kv_cache.clone()
+                    kc, vc = kv_cache.transpose(1, 2).split(128, dim=-1)
+                    rkc, rvc = ref_kv.transpose(1, 2).split(128, dim=-1)
+                    slots = torch.arange(m, dtype=torch.int64, device=device) * 3 + 1
+                    if m > 1:
+                        slots[-1] = -1
+                    oq2 = run_qk_norm_rope_cache(qkv, pos, cache, eps, qscale, use_rope, kc, vc, slots)
+                    if not torch.equal(oq.view(torch.int16), oq2.view(torch.int16)):
+                        ok = False
+                        break
+                    v_ref = qkv[:, 4352:].view(m, 2, 128)
+                    k_ref = ok_t.view(m, 2, 128)
+                    for ti in range(m):
+                        sl = int(slots[ti].item())
+                        if sl >= 0:
+                            rkc[sl // block_size, sl % block_size].copy_(k_ref[ti])
+                            rvc[sl // block_size, sl % block_size].copy_(v_ref[ti])
+                    if not torch.equal(kv_cache.view(torch.int16), ref_kv.view(torch.int16)):
+                        ok = False
+                        break
             if not ok:
                 break
         if ok and _multi is not None and DECODE_HPW > 0 and _decode_state["admitted"] is None:
@@ -161,6 +200,73 @@ def available(device: torch.device | None = None) -> bool:
     if device is None:
         return True
     return self_check(device)
+
+
+def cache_fused_available(device: torch.device | None = None) -> bool:
+    if not CACHE_FUSED_ENABLED or _cache_multi is None:
+        return False
+    if device is None:
+        return True
+    return self_check(device)
+
+
+def run_qk_norm_rope_cache(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    eps: float,
+    qscale: float,
+    use_rope: bool,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> torch.Tensor:
+    if _cache_multi is None:
+        raise RuntimeError("muse_qk_norm_rope_cache_multi unavailable")
+    if not qkv.is_contiguous():
+        qkv = qkv.contiguous()
+    num_tokens = int(qkv.shape[0])
+    q_out = qkv.new_empty((num_tokens, 4096))
+    if num_tokens == 0:
+        return q_out
+    if use_rope:
+        assert cos_sin_cache is not None
+        if positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+        if not positions.is_contiguous():
+            positions = positions.contiguous()
+        pos_ptr = positions.data_ptr()
+        cache_ptr = cos_sin_cache.data_ptr()
+        cache_rows = int(cos_sin_cache.shape[0])
+        cache_fp32 = int(cos_sin_cache.dtype == torch.float32)
+    else:
+        pos_ptr = 0
+        cache_ptr = 0
+        cache_rows = 0
+        cache_fp32 = 1
+    if slot_mapping.dtype != torch.int64:
+        slot_mapping = slot_mapping.to(torch.int64)
+    if not slot_mapping.is_contiguous():
+        slot_mapping = slot_mapping.contiguous()
+    num_slots = int(slot_mapping.numel())
+    block_size = int(key_cache.shape[1])
+    k_s0, k_s1, k_s2, k_s3 = key_cache.stride()
+    v_s0, v_s1, v_s2, v_s3 = value_cache.stride()
+    if k_s3 != 1 or v_s3 != 1:
+        raise RuntimeError(f"non-unit head_dim stride in KV cache: k={k_s3}, v={v_s3}")
+    hpw = 9 if num_tokens > MULTI_MIN_TOKENS else 2
+    with torch.cuda.device(qkv.device):
+        stream = torch.cuda.current_stream(qkv.device).cuda_stream
+        st = _cache_multi(
+            qkv.data_ptr(), pos_ptr, cache_ptr, q_out.data_ptr(),
+            key_cache.data_ptr(), value_cache.data_ptr(), slot_mapping.data_ptr(),
+            num_tokens, num_slots, cache_rows, block_size,
+            k_s0, k_s1, k_s2, v_s0, v_s1, v_s2,
+            float(eps), float(qscale), int(use_rope), cache_fp32, hpw, stream,
+        )
+    if st:
+        raise RuntimeError(f"muse_qk_norm_rope_cache_multi failed with CUDA error {st}")
+    return q_out
 
 
 def run_qk_norm_rope(

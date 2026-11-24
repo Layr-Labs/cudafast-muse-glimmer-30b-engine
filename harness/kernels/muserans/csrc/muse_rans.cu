@@ -500,11 +500,20 @@ static RansCfg rans_pick_cfg(int N, int K) {
     const char* env = std::getenv("MUSERANS_GATE_UP_EVEN48");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
+  static const bool gate_up_8w = []() {
+    const char* env = std::getenv("MUSERANS_GATE_UP_8W");
+    return env && *env && std::strtol(env, nullptr, 10) != 0;
+  }();
   if (gate32 && N == 4096 && K == 6656 && NB == 512 && rans_fits(K, 16, 9, 4)) {
     return RansCfg{512, 16, 4, 4, 9};
   }
-  if (gate_up_even && N == 39936 && K == 6656 && NB == 4992 && rans_fits(K, 16, 9, 4)) {
-    return RansCfg{768, 16, 4, 4, 9};
+  if (gate_up_even && N == 39936 && K == 6656 && NB == 4992) {
+    if (gate_up_8w && rans_fits(K, 8, 9, 4)) {
+      return RansCfg{384, 8, 2, 4, 9};
+    }
+    if (rans_fits(K, 16, 9, 4)) {
+      return RansCfg{768, 16, 4, 4, 9};
+    }
   }
   for (int wcap = 18; wcap >= 1; wcap--) {
     const int R = (NB + 48 * wcap - 1) / (48 * wcap);
@@ -665,8 +674,14 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   pb.tpf_stride = rans_tpf_stride();
   TORCH_CHECK(tw >= 1 && tw <= N / 8 && wpb >= 1 && wpb <= 32 && (ns == 1 || ns == 2 || ns == 4) && (rg == 4 || rg == 8) && (ilv == 0 || ilv == 9), "bad launch config");
   const int blocks = (tw + wpb - 1) / wpb;
-  const size_t dsmem = rans_dsmem(K, wpb, 9, rg);
+  size_t dsmem = rans_dsmem(K, wpb, 9, rg);
   TORCH_CHECK(rans_fits(K, wpb, 9, rg), "rans smem too large (K too large for smem staging of x): ", dsmem);
+  // Enforce max 1 CTA/SM on 48-CTA launches (e.g. 7L FP8 gate_up 48b x 8w at 41.5 KiB and 28L qkv
+  // 48b x 12w at 49.7 KiB): without padding, <= 50.5 KiB total SMEM allows 2 CTAs/SM, so when
+  // concurrent l2pf or a preceding tail holds SMs, the block scheduler double-packs 2 CTAs onto busy
+  // SMs (+300 us/layer on gate_up). Padding dynamic SMEM to 40 KiB (+16 KiB LUT = 56 KiB > 50.5 KiB)
+  // guarantees 1 CTA per SM across all 48 SMs.
+  if (blocks == 48 && dsmem < 40960) dsmem = 40960;
   rans_set_attrs_once();
 #define RANS_L2(NSV, RGV) \
   if (ns == NSV && rg == RGV) rans_gemv_kernel<NSV, 9, RGV><<<blocks, wpb * 32, dsmem, st>>>(pb);

@@ -97,7 +97,12 @@ from vllm.renderers import TokenizeParams
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processors.muse_glimmer import MuseGlimmerProcessor
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 
 from .interfaces import (
     EagleModelMixin,
@@ -1212,6 +1217,13 @@ class _GateSideStream:
         # while M>1 falls back to cuBLAS: restrict side-stream fork strictly to M=1 and require
         # muse_bf16_lane_weight to be admitted.
         self.bf16_gate_by_layer: dict[int, nn.Module] = {}
+        # Deterministic NVFP4 output_gate_proj layers (18 layers) can also overlap FA2 during prefill.
+        self.nvfp4_gate_layers: set[int] = set()
+        self.prefill_nvfp4_max_tokens = (
+            int(os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_PREFILL_MAX_TOKENS", "512"))
+            if os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_PREFILL", "1") != "0"
+            else 0
+        )
 
     def _ensure_stream(self) -> bool:
         if self.stream is None and not self.unavailable:
@@ -1249,8 +1261,14 @@ class _GateSideStream:
         if bf16_gate is not None:
             if not x.is_cuda or x.shape[0] != 1 or getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
                 return
-        elif not x.is_cuda or x.shape[0] > self.max_tokens:
+        elif not x.is_cuda:
             return
+        elif x.shape[0] > self.max_tokens:
+            if not (
+                layer_idx in self.nvfp4_gate_layers
+                and x.shape[0] <= self.prefill_nvfp4_max_tokens
+            ):
+                return
         if (
             is_forward_context_available()
             and get_forward_context().cudagraph_runtime_mode
@@ -1384,6 +1402,71 @@ direct_register_custom_op(
 )
 
 
+def _muse_qk_norm_rope_cache_impl(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    qscale: float,
+    use_rope: bool,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    import muse_qk_glue
+    from vllm.model_executor.layers.attention.attention import get_attention_context
+
+    name = _resolve_layer_name(layer_name)
+    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(name)
+    if (
+        layer_slot_mapping is not None
+        and kv_cache is not None
+        and kv_cache.ndim == 4
+        and kv_cache.shape[1] == 2
+        and kv_cache.shape[3] == 256
+    ):
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(128, dim=-1)
+        if key_cache.stride(-1) == 1 and value_cache.stride(-1) == 1:
+            return muse_qk_glue.run_qk_norm_rope_cache(
+                qkv,
+                positions,
+                cos_sin_cache,
+                eps,
+                qscale,
+                use_rope,
+                key_cache,
+                value_cache,
+                layer_slot_mapping,
+            )
+    q, k = muse_qk_glue.run_qk_norm_rope(
+        qkv, positions, cos_sin_cache, eps, qscale, use_rope
+    )
+    if layer_slot_mapping is not None:
+        v = qkv[:, 4352:].reshape(-1, 2, 128)
+        attn_layer.impl.do_kv_cache_update(
+            attn_layer, k.reshape(-1, 2, 128), v, kv_cache, layer_slot_mapping
+        )
+    return q
+
+
+def _muse_qk_norm_rope_cache_fake(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    eps: float,
+    qscale: float,
+    use_rope: bool,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return qkv.new_empty((qkv.shape[0], 4096))
+
+
+direct_register_custom_op(
+    op_name="muse_glimmer_qk_norm_rope_cache",
+    op_func=_muse_qk_norm_rope_cache_impl,
+    fake_impl=_muse_qk_norm_rope_cache_fake,
+    mutates_args=[],
+)
+
+
 def _init_qk_fused() -> bool:
     if not current_platform.is_cuda():
         return False
@@ -1391,6 +1474,17 @@ def _init_qk_fused() -> bool:
         import muse_qk_glue
 
         return muse_qk_glue.available(torch.device("cuda"))
+    except (ImportError, OSError, RuntimeError):
+        return False
+
+
+def _init_qk_cache_fused() -> bool:
+    if not current_platform.is_cuda():
+        return False
+    try:
+        import muse_qk_glue
+
+        return muse_qk_glue.cache_fused_available(torch.device("cuda"))
     except (ImportError, OSError, RuntimeError):
         return False
 
@@ -1511,6 +1605,7 @@ def _gate_side_stream_fork_point(gate_proj: nn.Module, layer_idx: int = -1) -> s
             bf16_lane_only = True
         else:
             return None
+    is_nvfp4_gate = qm is not None and type(qm).__name__ == "ModelOptNvFp4LinearMethod"
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
         return None
@@ -1518,6 +1613,8 @@ def _gate_side_stream_fork_point(gate_proj: nn.Module, layer_idx: int = -1) -> s
     if compilation_config.mode == CompilationMode.NONE:
         if bf16_lane_only and layer_idx >= 0:
             _gate_side_stream.bf16_gate_by_layer[layer_idx] = gate_proj
+        elif is_nvfp4_gate and layer_idx >= 0:
+            _gate_side_stream.nvfp4_gate_layers.add(layer_idx)
         return mode
     if (
         compilation_config.mode != CompilationMode.VLLM_COMPILE
@@ -1530,6 +1627,8 @@ def _gate_side_stream_fork_point(gate_proj: nn.Module, layer_idx: int = -1) -> s
         return None
     if bf16_lane_only and layer_idx >= 0:
         _gate_side_stream.bf16_gate_by_layer[layer_idx] = gate_proj
+    elif is_nvfp4_gate and layer_idx >= 0:
+        _gate_side_stream.nvfp4_gate_layers.add(layer_idx)
     return mode
 
 
@@ -1624,6 +1723,7 @@ class MuseGlimmerAttention(nn.Module):
             and self.head_dim == 128
             and _init_qk_fused()
         )
+        self._use_qk_cache_fused = self._use_qk_fused and _init_qk_cache_fused()
 
         self.rotary_emb = (
             get_rope(
@@ -1697,7 +1797,34 @@ class MuseGlimmerAttention(nn.Module):
             qkv, _ = self.qkv_proj(hidden_states)
             if self.gate_fork_point == "qkv":
                 gate, gate_dep = self._output_gate_before_attention(hidden_states, [qkv])
-        if self._use_qk_fused and qkv.is_cuda and qkv.dtype == torch.bfloat16:
+        skip_kv_update = False
+        if (
+            self._use_qk_cache_fused
+            and qkv.is_cuda
+            and qkv.dtype == torch.bfloat16
+            and self.attn.kv_cache_dtype == "auto"
+            and not self.attn.calculate_kv_scales
+            and self.attn.kv_sharing_target_layer_name is None
+            and not self.attn.attn_backend.forward_includes_kv_cache_update
+        ):
+            k = qkv[:, self.q_size : self.q_size + self.kv_size]
+            v = qkv[:, self.q_size + self.kv_size :]
+            cache = (
+                self.rotary_emb.cos_sin_cache
+                if self.rotary_emb is not None
+                else positions
+            )
+            q = torch.ops.vllm.muse_glimmer_qk_norm_rope_cache(
+                qkv,
+                positions,
+                cache,
+                float(self.qk_norm.eps),
+                float(self.scale_query_by),
+                self.rotary_emb is not None,
+                _encode_layer_name(self.attn.layer_name),
+            )
+            skip_kv_update = True
+        elif self._use_qk_fused and qkv.is_cuda and qkv.dtype == torch.bfloat16:
             v = qkv[:, self.q_size + self.kv_size :]
             cache = (
                 self.rotary_emb.cos_sin_cache
@@ -1732,7 +1859,7 @@ class MuseGlimmerAttention(nn.Module):
                 hidden_states, [q, k, v]
             )
 
-        attn_output = self.attn(q, k, v)
+        attn_output = self.attn(q, k, v, skip_kv_cache_update=skip_kv_update)
 
         if self.use_output_gate:
             if gate is None:

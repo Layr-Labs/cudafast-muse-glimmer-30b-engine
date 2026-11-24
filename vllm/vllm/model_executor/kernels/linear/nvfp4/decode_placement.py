@@ -479,7 +479,9 @@ def _place_bf16_rans_group(bf16_lib, layers, n: int, k: int, evict_buf: torch.Te
 # --------------------------------------------------------------------------- #
 PREFILL_ENABLED = os.environ.get("MUSE_PREFILL_PLACEMENT", "1").strip() not in ("0", "", "false", "no")
 PREFILL_SURPLUS = float(os.environ.get("MUSE_PREFILL_PLACEMENT_SURPLUS", "2.0"))
-PREFILL_ROUNDS = 4
+PREFILL_ROUNDS = 5
+PREFILL_PASSES = int(os.environ.get("MUSE_PREFILL_PLACEMENT_PASSES", "1"))
+DECODE_DOWN_PASSES = int(os.environ.get("MUSE_DECODE_DOWN_PASSES", "1"))
 
 
 def _time_calls(run, candidates, rounds: int, evict_buf: torch.Tensor | None = None) -> list[float]:
@@ -846,6 +848,21 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
                 else:
                     buf_name = None
                 stats = _place_prefill_group(layers, run, on_move, evict_buf, rejected_hold, buf_name=buf_name)
+                if (
+                    stats is not None
+                    and PREFILL_PASSES >= 2
+                    and name in ("39936x6656", "6656x19968", "fp8_6656x19968")
+                    and (stats["before"][3] - stats["after"][3]) >= 0.05
+                ):
+                    for _pass in range(1, PREFILL_PASSES):
+                        stats2 = _place_prefill_group(layers, run, on_move, evict_buf, rejected_hold, buf_name=buf_name)
+                        if stats2 is None:
+                            break
+                        gain2 = stats2["before"][3] - stats2["after"][3]
+                        stats["moved"] += stats2["moved"]
+                        stats["after"] = stats2["after"]
+                        if gain2 < 0.05:
+                            break
             except Exception as err:  # noqa: BLE001 - this group stays where it was
                 logger.warning("Prefill weight placement skipped for %s: %s", name, err)
                 continue
@@ -988,6 +1005,21 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                             )
                 if stats is None:
                     stats = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
+                    if (
+                        stats is not None
+                        and DECODE_DOWN_PASSES >= 2
+                        and (n, k) == (6656, 19968)
+                        and (stats["before"][3] - stats["after"][3]) >= 0.05
+                    ):
+                        for _pass in range(1, DECODE_DOWN_PASSES):
+                            stats2 = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
+                            if stats2 is None:
+                                break
+                            gain2 = stats2["before"][3] - stats2["after"][3]
+                            stats["moved"] += stats2["moved"]
+                            stats["after"] = stats2["after"]
+                            if gain2 < 0.03:
+                                break
             except Exception as err:  # noqa: BLE001 - this group stays where it was
                 logger.warning("Decode weight placement skipped for %dx%d: %s", n, k, err)
                 continue

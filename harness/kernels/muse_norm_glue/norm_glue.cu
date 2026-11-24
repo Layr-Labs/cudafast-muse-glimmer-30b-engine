@@ -111,6 +111,10 @@ __device__ __forceinline__ uint2 ld8(const __nv_bfloat16* base, int c) {
   return *reinterpret_cast<const uint2*>(base + c * 1024 + threadIdx.x * 4);
 }
 
+__device__ __forceinline__ uint2 ldg8(const __nv_bfloat16* base, int c) {
+  return __ldg(reinterpret_cast<const uint2*>(base + c * 1024 + threadIdx.x * 4));
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Post-attention norm + residual + pre-feedforward norm (compiled ..._mean_mul_pow_rsqrt_1 and the FP8 variant
 // ..._clamp_..._reciprocal_rsqrt_1):
@@ -120,7 +124,7 @@ __device__ __forceinline__ uint2 ld8(const __nv_bfloat16* base, int c) {
 //   y   = (b * h) * (w_pre + 1)                 (FMUL, FADD, FMUL)
 //   out_bf16 = bf16(y);  out_fp8 = e4m3(clamp(rcp(scale) * y))
 template <bool kBf16Out, bool kFp8Out>
-__global__ void __launch_bounds__(kThreads) post_attn_norm(
+__global__ void __launch_bounds__(kThreads) post_attn_norm_decode(
     const __nv_bfloat16* x_all, const __nv_bfloat16* res_all,
     const __nv_bfloat16* __restrict__ w_post, const __nv_bfloat16* __restrict__ w_pre,
     const float* scale, float* sumsq_out,
@@ -172,6 +176,70 @@ __global__ void __launch_bounds__(kThreads) post_attn_norm(
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
       Row4 pv = unpack(up[c]);
+      float y[4];
+#pragma unroll
+      for (int e = 0; e < 4; ++e) y[e] = __fmul_rn(__fmul_rn(b, h[c][e]), __fadd_rn(pv.v[e], 1.0f));
+      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
+      if constexpr (kBf16Out) {
+        uint2 o;
+        o.x = pack_bf16x2(y[0], y[1]);
+        o.y = pack_bf16x2(y[2], y[3]);
+        *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
+      }
+      if constexpr (kFp8Out) {
+        uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
+                     (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
+        *reinterpret_cast<uint32_t*>(out_fp8_all + off) = q;
+      }
+    }
+  }
+}
+
+template <bool kBf16Out, bool kFp8Out>
+__global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
+    const __nv_bfloat16* __restrict__ x_all, const __nv_bfloat16* __restrict__ res_all,
+    const __nv_bfloat16* __restrict__ w_post, const __nv_bfloat16* __restrict__ w_pre,
+    const float* __restrict__ scale, float* __restrict__ sumsq_out,
+    __nv_bfloat16* __restrict__ out_bf16_all, uint8_t* __restrict__ out_fp8_all) {
+  __shared__ float red[2][8];
+  const size_t row = blockIdx.x;
+  const __nv_bfloat16* x = x_all + row * kHidden;
+  const __nv_bfloat16* res = res_all + row * kHidden;
+  uint2 ux[kChunks];
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int c = 0; c < kChunks; ++c) {
+    if (chunk_valid(c)) {
+      ux[c] = ld8(x, c);
+      Row4 v = unpack(ux[c]);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) acc[e] = __fmaf_rn(v.v[e], v.v[e], acc[e]);
+    }
+  }
+  const float s_x = row_sum(acc, red[0]);
+  if (threadIdx.x == 0) sumsq_out[row] = s_x;
+  const float a = inv_rms(s_x, 1e-08f);
+  float h[kChunks][4];
+  float acc2[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int c = 0; c < kChunks; ++c) {
+    if (chunk_valid(c)) {
+      Row4 xv = unpack(ux[c]), rv = unpack(ld8(res, c)), wv = unpack(ldg8(w_post, c));
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        h[c][e] = __fmaf_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f), rv.v[e]);
+        acc2[e] = __fmaf_rn(h[c][e], h[c][e], acc2[e]);
+      }
+    }
+  }
+  const float s_h = row_sum(acc2, red[1]);
+  const float b = inv_rms(s_h, 1e-05f);
+  float inv_scale = 0.f;
+  if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(*scale);
+#pragma unroll
+  for (int c = 0; c < kChunks; ++c) {
+    if (chunk_valid(c)) {
+      Row4 pv = unpack(ldg8(w_pre, c));
       float y[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) y[e] = __fmul_rn(__fmul_rn(b, h[c][e]), __fadd_rn(pv.v[e], 1.0f));
@@ -328,6 +396,28 @@ __global__ void __launch_bounds__(256) mul_sigmoid_bf16_kernel(
   out[idx] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
 }
 
+__global__ void __launch_bounds__(256) mul_sigmoid_fp8_kernel(
+    const uint4* __restrict__ gate, const uint4* __restrict__ attn,
+    const float* __restrict__ scale, uint2* __restrict__ out, int vec8) {
+  const int idx = blockIdx.x * 256 + threadIdx.x;
+  if (idx >= vec8) return;
+  const float inv_s = full_divide(1.0f, __ldg(scale));
+  const uint4 g = gate[idx], a = attn[idx];
+  const uint32_t gw[4] = {g.x, g.y, g.z, g.w}, aw[4] = {a.x, a.y, a.z, a.w};
+  uint16_t ow[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float gl = bf_lo(gw[i]), gh = bf_hi(gw[i]);
+    const float al = bf_lo(aw[i]), ah = bf_hi(aw[i]);
+    const float ql = clamp448(__fmul_rn(__fmul_rn(triton_sigmoid(gl), al), inv_s));
+    const float qh = clamp448(__fmul_rn(__fmul_rn(triton_sigmoid(gh), ah), inv_s));
+    ow[i] = fp8x2(ql, qh);
+  }
+  const uint32_t lo = static_cast<uint32_t>(ow[0]) | (static_cast<uint32_t>(ow[1]) << 16);
+  const uint32_t hi = static_cast<uint32_t>(ow[2]) | (static_cast<uint32_t>(ow[3]) << 16);
+  out[idx] = make_uint2(lo, hi);
+}
+
 }  // namespace
 
 extern "C" {
@@ -342,11 +432,21 @@ int muse_norm_glue_post_attn(int kind, int rows, const void* x, const void* res,
   const auto* Wp = static_cast<const __nv_bfloat16*>(w_post);
   const auto* Wq = static_cast<const __nv_bfloat16*>(w_pre);
   if (kind == 0) {
-    post_attn_norm<true, false><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, nullptr,
-        static_cast<float*>(sumsq_out), static_cast<__nv_bfloat16*>(out_bf16), nullptr);
+    if (rows <= 16) {
+      post_attn_norm_decode<true, false><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, nullptr,
+          static_cast<float*>(sumsq_out), static_cast<__nv_bfloat16*>(out_bf16), nullptr);
+    } else {
+      post_attn_norm<true, false><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, nullptr,
+          static_cast<float*>(sumsq_out), static_cast<__nv_bfloat16*>(out_bf16), nullptr);
+    }
   } else if (kind == 1) {
-    post_attn_norm<false, true><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, static_cast<const float*>(scale),
-        static_cast<float*>(sumsq_out), nullptr, static_cast<uint8_t*>(out_fp8));
+    if (rows <= 16) {
+      post_attn_norm_decode<false, true><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, static_cast<const float*>(scale),
+          static_cast<float*>(sumsq_out), nullptr, static_cast<uint8_t*>(out_fp8));
+    } else {
+      post_attn_norm<false, true><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, static_cast<const float*>(scale),
+          static_cast<float*>(sumsq_out), nullptr, static_cast<uint8_t*>(out_fp8));
+    }
   } else {
     return -1;
   }
@@ -418,6 +518,16 @@ int muse_norm_glue_mul_sigmoid_bf16(const void* gate, const void* attn, void* ou
   mul_sigmoid_bf16_kernel<<<(vec8 + 255) / 256, 256, 0, stream>>>(
       static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
       static_cast<uint4*>(out), vec8);
+  return static_cast<int>(cudaGetLastError());
+}
+
+int muse_norm_glue_mul_sigmoid_fp8(const void* gate, const void* attn, const void* scale, void* out, int n,
+                                   cudaStream_t stream) {
+  if (n <= 0 || (n & 7) != 0) return -1;
+  const int vec8 = n >> 3;
+  mul_sigmoid_fp8_kernel<<<(vec8 + 255) / 256, 256, 0, stream>>>(
+      static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
+      static_cast<const float*>(scale), static_cast<uint2*>(out), vec8);
   return static_cast<int>(cudaGetLastError());
 }
 

@@ -133,20 +133,41 @@ __global__ void tma4_pass2_kernel(
   states_out[static_cast<size_t>(b) * Threads + threadIdx.x] = x;
 }
 
-template <int TileN, int Threads, bool GateUpGrid, bool DownIlv = false, bool GateV48 = false>
+static int decode6_tma4_stages(const char* env_name, int def_val) {
+  const char* env = std::getenv(env_name);
+  if (!env || !*env) return def_val;
+  long v = std::strtol(env, nullptr, 10);
+  return (v == 4 || v == 8) ? static_cast<int>(v) : def_val;
+}
+
+template <int TileN, int Threads, bool GateUpGrid, bool DownIlv = false, bool GateV48 = false, int Stages = 4, int SplitK = 1>
 int launch_tma4(const int4* input, const int4* weight, int4* output, int4* partials,
                 const int4* coded, const int4* palette, const float* global_scale,
                 int* locks, int n, int k, int grid, int device, cudaStream_t stream) {
   auto kernel = muse_marlin6_tma4::Marlin<
       vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
-      vllm::kFE4M3fn.id(), Threads, 1, TileN / 16, 8, true, 4, 1, false, true, GateUpGrid, DownIlv, GateV48>;
+      vllm::kFE4M3fn.id(), Threads, 1, TileN / 16, 8, true, Stages, 1, false, true, GateUpGrid, DownIlv, GateV48, SplitK>;
   static int cached_shared[16] = {0};
   int shared = (device >= 0 && device < 16) ? cached_shared[device] : 0;
   if (shared == 0) {
-    auto status = cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-    if (status != cudaSuccess) return status;
-    status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
-    if (status != cudaSuccess) return status;
+    if constexpr (SplitK == 2) {
+      // 128T / TileN=64 / 4 stages needs 38.6 KiB dynamic SMEM; capping at 42 KiB
+      // allows 2 CTAs/SM (8 warps/SM) to co-reside within GB10's 99 KiB opt-in SMEM.
+      shared = 42 * 1024;
+      auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
+      if (status != cudaSuccess) return status;
+    } else if constexpr (SplitK == 3) {
+      // 128T / TileN=64 / 3 stages with compact M=1 sh_a needs ~29.2 KiB dynamic SMEM;
+      // capping at 31 KiB allows 3 CTAs/SM (12 warps/SM) within GB10's 99 KiB opt-in SMEM.
+      shared = (Stages == 3) ? (31 * 1024) : (36 * 1024);
+      auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
+      if (status != cudaSuccess) return status;
+    } else {
+      auto status = cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+      if (status != cudaSuccess) return status;
+      status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
+      if (status != cudaSuccess) return status;
+    }
     if (device >= 0 && device < 16) cached_shared[device] = shared;
   }
   size_t total_sbs = 0;
@@ -171,7 +192,7 @@ int launch_tma4(const int4* input, const int4* weight, int4* output, int4* parti
       }
     }
     if (!hit) {
-      const int vgrid = GateV48 ? 48 : grid;
+      const int vgrid = (GateV48 || SplitK > 1) ? 48 : grid;
       const int n_tiles = n / TileN;
       const int k_tiles = k / 128;
       int part2_mn_tiles = n_tiles;
@@ -196,6 +217,19 @@ int launch_tma4(const int4* input, const int4* weight, int4* output, int4* parti
             p2_2 = rem2 > 0 ? (rem2 < p2_iters ? rem2 : p2_iters) : 0;
           }
           it = p2_1 + p2_2;
+        } else if constexpr (SplitK > 1) {
+          const int g = b / 48;
+          const int vb = b - g * 48;
+          const int sq = part1_mn_iters / SplitK;
+          const int sr = part1_mn_iters % SplitK;
+          const int gp1 = sq + (g < sr ? 1 : 0);
+          if (g < SplitK - 1) {
+            it = gp1 * k_tiles;
+          } else {
+            const int rem = total_p2 - p2_iters * vb;
+            const int p2 = rem > 0 ? (rem < p2_iters ? rem : p2_iters) : 0;
+            it = gp1 * k_tiles + p2;
+          }
         } else {
           const int rem = total_p2 - p2_iters * b;
           const int p2 = rem > 0 ? (rem < p2_iters ? rem : p2_iters) : 0;
@@ -260,20 +294,49 @@ extern "C" int muse_marlin6_sk_tma4_ilv(const int4* input, const int4* weight, i
                                         int4* partials, const int4* coded, const int4* palette,
                                         const float* global_scale, int* locks, int n, int k, int blocks,
                                         int device, cudaStream_t stream) {
-  if (k % 128 != 0 || n % 128 != 0 || blocks != 48) return cudaErrorInvalidValue;
+  if (k % 128 != 0 || n % 64 != 0 || blocks != 48) return cudaErrorInvalidValue;
+  if (n == 202048 && k == 6656) {
+    static const int lm_split = []() {
+      const char* env = std::getenv("MUSE_LM_HEAD_SPLIT");
+      if (env && *env) return static_cast<int>(std::strtol(env, nullptr, 10));
+      const char* s2 = std::getenv("MUSE_LM_HEAD_SPLIT2");
+      if (s2 && *s2) return std::strtol(s2, nullptr, 10) != 0 ? 2 : 1;
+      return 2;
+    }();
+    if (lm_split == 3)
+      return launch_tma4<64, 128, false, true, false, 3, 3>(input, weight, output, partials, coded, palette,
+                                                            global_scale, locks, n, k, 144, device, stream);
+    if (lm_split == 2)
+      return launch_tma4<64, 128, false, true, false, 4, 2>(input, weight, output, partials, coded, palette,
+                                                            global_scale, locks, n, k, 96, device, stream);
+    static const int lm_st = decode6_tma4_stages("MUSE_LM_HEAD_STAGES", 4);
+    if (lm_st == 8)
+      return launch_tma4<64, 128, false, true, false, 8, 1>(input, weight, output, partials, coded, palette,
+                                                            global_scale, locks, n, k, 48, device, stream);
+    return launch_tma4<64, 128, false, true, false, 4, 1>(input, weight, output, partials, coded, palette,
+                                                          global_scale, locks, n, k, 48, device, stream);
+  }
+  if (n % 128 != 0) return cudaErrorInvalidValue;
+  static const int ilv_st = decode6_tma4_stages("MUSE_TMA4_STAGES", 4);
   if (n == 4096 && k == 6656) {
     const int gb = muse_marlin6_get_gate_blocks();
     if (gb == 24) {
-      return launch_tma4<128, 256, false, true, true>(input, weight, output, partials, coded, palette,
-                                                      global_scale, locks, n, k, 24, device, stream);
+      if (ilv_st == 8)
+        return launch_tma4<128, 256, false, true, true, 8>(input, weight, output, partials, coded, palette,
+                                                           global_scale, locks, n, k, 24, device, stream);
+      return launch_tma4<128, 256, false, true, true, 4>(input, weight, output, partials, coded, palette,
+                                                         global_scale, locks, n, k, 24, device, stream);
     }
     if (gb != 48) return cudaErrorInvalidValue;
   } else if (!((n == 39936 && k == 6656) || (n == 6656 && k == 19968) ||
                (n == 4608 && k == 6656) || (n == 6656 && k == 4096))) {
     return cudaErrorInvalidValue;
   }
-  return launch_tma4<128, 256, false, true, false>(input, weight, output, partials, coded, palette,
-                                                   global_scale, locks, n, k, 48, device, stream);
+  if (ilv_st == 8)
+    return launch_tma4<128, 256, false, true, false, 8>(input, weight, output, partials, coded, palette,
+                                                        global_scale, locks, n, k, 48, device, stream);
+  return launch_tma4<128, 256, false, true, false, 4>(input, weight, output, partials, coded, palette,
+                                                      global_scale, locks, n, k, 48, device, stream);
 }
 
 extern "C" int muse_tma4_pass1(const uint8_t* sym_tiled, int k_tiles,
