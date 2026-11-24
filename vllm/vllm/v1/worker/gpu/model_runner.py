@@ -60,7 +60,12 @@ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
-from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
+from vllm.v1.worker.gpu.async_utils import (
+    AsyncOutput,
+    AsyncPoolingOutput,
+    acquire_blocking_event,
+    release_blocking_event,
+)
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
     get_kv_cache_spec,
@@ -77,6 +82,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
     get_uniform_token_count,
+    upload_cudagraph,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -85,6 +91,7 @@ from vllm.v1.worker.gpu.input_batch import (
     InputBuffers,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
+    finish_serial_decode_post_update,
     post_update,
     post_update_num_computed_tokens,
     prepare_pos_seq_lens,
@@ -104,6 +111,7 @@ from vllm.v1.worker.gpu.lora_utils import (
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
+from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.prefill_graph import PrefillGraph, capture_prefill_graph
@@ -297,6 +305,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self._ones_1_i32 = torch.ones(1, dtype=torch.int32, device=self.device)
         self._zeros_1_i32 = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self._req_idx_gpu = torch.arange(
+            max(2, self.max_num_reqs), dtype=torch.int32, device=self.device
+        )
+        self._req_idx_views: list[torch.Tensor] = [
+            self._zeros_1_i32,
+            self._ones_1_i32,
+            *[
+                self._req_idx_gpu[i : i + 1]
+                for i in range(2, max(2, self.max_num_reqs))
+            ],
+        ]
+        self._zp_cg_ok: bool | None = None
+        self._logits_indices_0_gpu = torch.zeros(1, dtype=torch.int64, device=self.device)
+        self._ones_1_np = np.ones(1, dtype=np.int32)
+        self._false_1_np = np.zeros(1, dtype=np.bool_)
+        self._single_decode_prep_enabled = (
+            envs.os.environ.get("VLLM_FUSED_DECODE_PREP", "1") != "0"
+        )
+        self._single_decode_prep_armed = False
+        self._single_decode_prep_verified = False
+        self._single_decode_prep_failed = False
+        self._pending_zp_flush: tuple[InputBatch, bool] | None = None
+        self._engine_core: Any = None
+        self._scheduler: Any = None
+        self._sd_ready = False
+        self._sd_failed = False
         self._qsl_const_gpu: dict[int, torch.Tensor] = {}
         for _nt in (1, 2, 512):
             _qsl = [0] + [_nt] * self.max_num_reqs
@@ -820,6 +854,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculator is not None:
                 self.speculator.capture()
 
+        # Proposal 09: whole-graph decode boot autotuner (default ON on 48-SM GB10).
+        self.cudagraph_manager.maybe_autotune_decode_graph(self)
+
         # LOCAL PATCH (prefill graph): captured apart from the dispatcher's
         # graphs, so decode dispatch and compile ranges stay unchanged.
         self.prefill_graph = capture_prefill_graph(self)
@@ -878,7 +915,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if outputs is not None:
                 self.postprocess_sampled(**outputs)
 
-    def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+    def add_requests(
+        self, scheduler_output: SchedulerOutput, *, apply_gpu_writes: bool = True
+    ) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.prompt_token_ids is not None
             assert new_req_data.prefill_token_ids is not None
@@ -928,11 +967,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     req_id, req_index, new_req_data.sampling_params
                 )
 
-        if scheduler_output.scheduled_new_reqs:
+        if apply_gpu_writes:
+            if scheduler_output.scheduled_new_reqs:
+                self.req_states.apply_staged_writes()
+                self.model_state.apply_staged_writes()
+            if self.sampler is not None:
+                self.sampler.apply_staged_writes()
+
+    def _flush_pending_zp(self) -> None:
+        pending = self._pending_zp_flush
+        if pending is None:
+            return
+        self._pending_zp_flush = None
+        zp_batch, has_new_reqs = pending
+        if has_new_reqs:
             self.req_states.apply_staged_writes()
             self.model_state.apply_staged_writes()
         if self.sampler is not None:
             self.sampler.apply_staged_writes()
+        self.block_tables.apply_staged_writes()
+        self.model_state.preprocess_state(
+            zp_batch,
+            tuple(bt[:1] for bt in self.block_tables.input_block_tables),
+            self.kv_cache_config,
+            self.req_states.num_computed_tokens.gpu,
+        )
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
@@ -980,9 +1039,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Mark trailing cudagraph-padding rows so kernels can skip work for
             # them when supported.
             self.input_buffers.is_padding[:num_tokens].fill_(False)
-            self.input_buffers.is_padding[num_tokens:num_tokens_after_padding].fill_(
-                True
-            )
+            if num_tokens < num_tokens_after_padding:
+                self.input_buffers.is_padding[num_tokens:num_tokens_after_padding].fill_(
+                    True
+                )
         num_tokens_per_req = scheduler_output.num_scheduled_tokens
         num_reqs = len(num_tokens_per_req)
 
@@ -993,10 +1053,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
         idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int32, count=num_reqs)
-        if num_reqs == 1 and int(idx_mapping_np[0]) == 0:
-            idx_mapping = self._zeros_1_i32
-        elif num_reqs == 1 and int(idx_mapping_np[0]) == 1:
-            idx_mapping = self._ones_1_i32
+        if num_reqs == 1 and 0 <= int(idx_mapping_np[0]) < len(self._req_idx_views):
+            idx_mapping = self._req_idx_views[int(idx_mapping_np[0])]
         else:
             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
@@ -1196,6 +1254,242 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _try_lmhead_argmax_graph(
+        self,
+        sample_hidden_states: torch.Tensor,
+        lmpost_argmax: Any,
+        lmpost_into: Any,
+    ) -> torch.Tensor | None:
+        if (
+            lmpost_into is None
+            or envs.os.environ.get("VLLM_LMHEAD_GRAPH", "1") == "0"
+            or self.cudagraph_manager is None
+            or not self.cudagraph_manager._graphs_captured
+            or sample_hidden_states.ndim != 2
+            or sample_hidden_states.shape[0] != 1
+            or not sample_hidden_states.is_contiguous()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        # Capture ONLY persistent graph output slices (FULL decode graph or PrefillGraph),
+        # never ephemeral 4096-token warmup tensors.
+        ptr = sample_hidden_states.data_ptr()
+        nbytes = sample_hidden_states.numel() * sample_hidden_states.element_size()
+        is_persistent = False
+        cg_hs = self.cudagraph_manager.hidden_states
+        if cg_hs is not None:
+            lo = cg_hs.data_ptr()
+            hi = lo + cg_hs.numel() * cg_hs.element_size()
+            if lo <= ptr and ptr + nbytes <= hi:
+                is_persistent = True
+        if not is_persistent and self.prefill_graph is not None:
+            pg_hs = getattr(self.prefill_graph, "hidden_states", None)
+            if pg_hs is not None:
+                lo = pg_hs.data_ptr()
+                hi = lo + pg_hs.numel() * pg_hs.element_size()
+                if lo <= ptr and ptr + nbytes <= hi:
+                    is_persistent = True
+        if not is_persistent:
+            return None
+
+        entries = getattr(self, "_lmhead_cg_entries", None)
+        if entries is None:
+            entries = {}
+            self._lmhead_cg_entries = entries
+            self._lmhead_cg_rejected: set[tuple] = set()
+            self._lmhead_cg_pool = torch.cuda.graph_pool_handle()
+            self._lmhead_cg_cap_stream = torch.cuda.Stream(device=self.device)
+        sig = (
+            ptr,
+            tuple(sample_hidden_states.shape),
+            tuple(sample_hidden_states.stride()),
+        )
+        entry = entries.get(sig)
+        if entry is not None:
+            graphs, outs, step_cnt, _fused = entry
+            slot = step_cnt & 3
+            entry[2] = step_cnt + 1
+            graphs[slot].replay()
+            return outs[slot]
+        if sig in self._lmhead_cg_rejected or len(entries) >= 4:
+            return None
+
+        mult = self.model.output_multiplier
+        cap = self.model.final_logit_softcapping
+        raw_ref = self.model.logits_processor(self.model.lm_head, sample_hidden_states)
+        if raw_ref is None:
+            self._lmhead_cg_rejected.add(sig)
+            return None
+        ref_tok = lmpost_argmax(raw_ref, mult, cap)
+        if ref_tok is None:
+            self._lmhead_cg_rejected.add(sig)
+            return None
+        del raw_ref
+        fused_launch = None
+        try:
+            import lmpost as _lmp
+            import muse_marlin6_gemv as _m6
+            lm_head = self.model.lm_head
+            lp = self.model.logits_processor
+            org_vocab = int(getattr(lp, "org_vocab_size", getattr(lm_head, "org_vocab_size", 0)))
+            if (
+                getattr(lm_head, "tp_size", 1) == 1
+                and getattr(lm_head, "bias", None) is None
+                and not getattr(lp, "logits_as_input", False)
+                and getattr(lp, "soft_cap", None) is None
+                and float(getattr(lp, "scale", 1.0)) == 1.0
+                and sample_hidden_states.dtype == torch.bfloat16
+                and (sample_hidden_states.data_ptr() & 15) == 0
+            ):
+                lut = _lmp._get_lut(self.device, mult, cap)
+                if getattr(lm_head, "marlin_decode6_lmpost_admitted", None) is None:
+                    lm_head.marlin_decode6_lmpost_admitted = _m6.admit_tma4_lmpost(
+                        lm_head, lut, org_vocab, lmpost_argmax, mult, cap
+                    )
+                if lm_head.marlin_decode6_lmpost_admitted:
+                    fused_launch = (lm_head, lut, org_vocab, _m6.launch_lmhead_lmpost6)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Fused lm_head+lmpost setup skipped (%s); using 2-node graph", exc)
+            fused_launch = None
+        try:
+            outs = [torch.empty((1, 1), dtype=torch.int64, device=self.device) for _ in range(4)]
+            graphs: list[torch.cuda.CUDAGraph] = []
+            main_st = torch.cuda.current_stream(self.device)
+            cap_st = self._lmhead_cg_cap_stream
+            cap_st.wait_stream(main_st)
+            with torch.cuda.stream(cap_st):
+                for slot in range(4):
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, pool=self._lmhead_cg_pool, stream=cap_st):
+                        if fused_launch is not None:
+                            lm_h, lut_t, ov, fn_f = fused_launch
+                            if not fn_f(sample_hidden_states, lm_h, lut_t, outs[slot], ov):
+                                raise RuntimeError("fused lm_head+lmpost refused during capture")
+                        else:
+                            raw_g = self.model.logits_processor(self.model.lm_head, sample_hidden_states)
+                            if raw_g is None or not lmpost_into(raw_g, mult, cap, outs[slot]):
+                                raise RuntimeError("lmpost_into refused during capture")
+                    upload_cudagraph(g, cap_st)
+                    graphs.append(g)
+            main_st.wait_stream(cap_st)
+            outs[0].fill_(-1)
+            graphs[0].replay()
+            if not torch.equal(outs[0], ref_tok):
+                for g in graphs:
+                    g.reset()
+                self._lmhead_cg_rejected.add(sig)
+                logger.warning("lm_head+lmpost graph mismatch vs eager; keeping eager path")
+                return ref_tok
+            entries[sig] = [graphs, outs, 1, fused_launch]
+            logger.info(
+                "Captured %s lm_head+lmpost_argmax CUDA graph (4-slot ring, shape=%s)",
+                "1-node fused" if fused_launch is not None else "2-node",
+                tuple(sample_hidden_states.shape),
+            )
+            return outs[0]
+        except Exception as exc:  # noqa: BLE001
+            self._lmhead_cg_rejected.add(sig)
+            logger.warning("lm_head+lmpost graph capture skipped (%s); keeping eager path", exc)
+            return ref_tok
+
+    def _try_decode_embed_graph(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        input_batch: InputBatch,
+    ) -> torch.Tensor | None:
+        enc_runner = getattr(self.model_state, "encoder_runner", None)
+        if (
+            enc_runner is None
+            or enc_runner.is_realtime
+            or getattr(self.model_state, "mm_pruner", None) is not None
+            or scheduled_encoder_inputs
+            or self.lora_config is not None
+            or envs.os.environ.get("VLLM_DECODE_EMBED_GRAPH", "1") == "0"
+            or self.cudagraph_manager is None
+            or not self.cudagraph_manager._graphs_captured
+            or torch.cuda.is_current_stream_capturing()
+            or input_batch.num_reqs != 1
+            or input_batch.num_tokens != 1
+            or input_batch.num_tokens_after_padding != 1
+            or int(input_batch.num_computed_tokens_np[0]) < int(input_batch.prefill_len_np[0])
+        ):
+            return None
+        ids_1 = input_batch.input_ids[:1]
+        dst_1 = enc_runner.inputs_embeds[:1]
+        if not ids_1.is_contiguous() or not dst_1.is_contiguous():
+            return None
+        entries = getattr(self, "_decode_embed_cg_entries", None)
+        if entries is None:
+            entries = {}
+            self._decode_embed_cg_entries = entries
+            self._decode_embed_cg_rejected: set[tuple] = set()
+            self._decode_embed_cg_pool = torch.cuda.graph_pool_handle()
+            self._decode_embed_cg_cap_stream = torch.cuda.Stream(device=self.device)
+        sig = (ids_1.data_ptr(), ids_1.dtype, dst_1.data_ptr(), tuple(dst_1.shape))
+        entry = entries.get(sig)
+        if entry is not None:
+            g, out_view = entry
+            g.replay()
+            return out_view
+        if sig in self._decode_embed_cg_rejected or len(entries) >= 4:
+            return None
+
+        ref_out = self.model_state.get_mm_embeddings(
+            scheduled_encoder_inputs, input_batch, self.req_states
+        )
+        if ref_out is None or ref_out.data_ptr() != dst_1.data_ptr() or ref_out.shape != dst_1.shape:
+            self._decode_embed_cg_rejected.add(sig)
+            return ref_out
+        ref_copy = ref_out.clone()
+        try:
+            import muse_embed as _me
+
+            lm = (
+                self.model.get_language_model()
+                if hasattr(self.model, "get_language_model")
+                else getattr(self.model, "model", self.model)
+            )
+            if not (hasattr(lm, "embed_tokens") and hasattr(lm, "embed_norm")):
+                lm = getattr(self.model, "model", lm)
+            if not _me.embed_into(lm, ids_1, dst_1):
+                dst_1.copy_(ref_copy)
+                self._decode_embed_cg_rejected.add(sig)
+                return dst_1
+            if not torch.equal(dst_1.view(torch.int16), ref_copy.view(torch.int16)):
+                dst_1.copy_(ref_copy)
+                self._decode_embed_cg_rejected.add(sig)
+                logger.warning("decode muse_embed eager mismatch; keeping eager get_mm_embeddings")
+                return dst_1
+            main_st = torch.cuda.current_stream(self.device)
+            cap_st = self._decode_embed_cg_cap_stream
+            cap_st.wait_stream(main_st)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.stream(cap_st):
+                with torch.cuda.graph(g, pool=self._decode_embed_cg_pool, stream=cap_st):
+                    if not _me.embed_into(lm, ids_1, dst_1):
+                        raise RuntimeError("muse_embed.embed_into refused during decode graph capture")
+                upload_cudagraph(g, cap_st)
+            main_st.wait_stream(cap_st)
+            dst_1.zero_()
+            g.replay()
+            if not torch.equal(dst_1.view(torch.int16), ref_copy.view(torch.int16)):
+                g.reset()
+                dst_1.copy_(ref_copy)
+                self._decode_embed_cg_rejected.add(sig)
+                logger.warning("decode muse_embed graph mismatch vs eager; keeping eager path")
+                return dst_1
+            entries[sig] = (g, dst_1)
+            logger.info(
+                "Captured M=1 decode muse_embed CUDA graph (shape=%s)",
+                tuple(dst_1.shape),
+            )
+            return dst_1
+        except Exception as exc:  # noqa: BLE001
+            dst_1.copy_(ref_copy)
+            self._decode_embed_cg_rejected.add(sig)
+            logger.warning("decode muse_embed graph capture skipped (%s); keeping eager path", exc)
+            return dst_1
+
     def sample(
         self,
         hidden_states: torch.Tensor,
@@ -1236,26 +1530,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 and self.sampler.logprob_token_ids_state.max_num_token_ids(idx_mapping_np) == 0
                 and not self.sampler._requires_logits_processing(idx_mapping_np)
             ):
-                raw_logits = self.model.logits_processor(self.model.lm_head, sample_hidden_states)
-                if raw_logits is not None:
-                    sampled_token_ids = lmpost_argmax(
-                        raw_logits, self.model.output_multiplier, self.model.final_logit_softcapping
-                    )
-                    if sampled_token_ids is not None:
-                        if not getattr(self, "_lmpost_logged", False):
-                            self._lmpost_logged = True
-                            logger.info("lmpost fused softcap + argmax in use (one-row greedy decode)")
-                        return (
-                            SamplerOutput(
-                                sampled_token_ids=sampled_token_ids,
-                                logprobs_tensors=None,
-                                num_nans=None,
-                                num_sampled=self._ones_1_i32,
-                                num_rejected=self._zeros_1_i32,
-                            ),
-                            self._ones_1_i32,
-                            self._zeros_1_i32,
+                lmpost_into = getattr(self.model, "_lmpost_softcap_argmax_into", None)
+                sampled_token_ids = self._try_lmhead_argmax_graph(
+                    sample_hidden_states, lmpost_argmax, lmpost_into
+                )
+                if sampled_token_ids is None:
+                    raw_logits = self.model.logits_processor(self.model.lm_head, sample_hidden_states)
+                    if raw_logits is not None:
+                        sampled_token_ids = lmpost_argmax(
+                            raw_logits, self.model.output_multiplier, self.model.final_logit_softcapping
                         )
+                if sampled_token_ids is not None:
+                    if not getattr(self, "_lmpost_logged", False):
+                        self._lmpost_logged = True
+                        logger.info("lmpost fused softcap + argmax in use (one-row greedy decode)")
+                    return (
+                        SamplerOutput(
+                            sampled_token_ids=sampled_token_ids,
+                            logprobs_tensors=None,
+                            num_nans=None,
+                            num_sampled=self._ones_1_i32,
+                            num_rejected=self._zeros_1_i32,
+                        ),
+                        self._ones_1_i32,
+                        self._zeros_1_i32,
+                    )
+        if self._pending_zp_flush is not None:
+            self._flush_pending_zp()
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
@@ -1294,7 +1595,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Update the number of computed tokens.
         if self.is_last_pp_rank:
             assert self.sampler is not None
-            output_bin_counts = self.sampler.penalties_state.output_bin_counts
+            penalties = self.sampler.penalties_state
+            use_pen = (
+                bool(penalties.use_penalty[0])
+                if penalties.use_penalty.shape[0] == 1
+                else bool(np.any(penalties.use_penalty))
+            )
+            output_bin_counts = penalties.output_bin_counts if use_pen else None
         else:
             output_bin_counts = None
         post_update(
@@ -1362,11 +1669,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             return False
         if self.cudagraph_manager is not None:
-            bd, _ = dispatch_cg_and_sync_dp(
-                self.cudagraph_manager, 1, pg.num_tokens, pg.num_tokens, 1, 0,
-                need_eager=False, num_active_loras=0,
-            )
-            if bd.cg_mode != CUDAGraphMode.NONE or bd.num_tokens != pg.num_tokens:
+            if self._zp_cg_ok is None:
+                bd, _ = dispatch_cg_and_sync_dp(
+                    self.cudagraph_manager, 1, pg.num_tokens, pg.num_tokens, 1, 0,
+                    need_eager=False, num_active_loras=0,
+                )
+                self._zp_cg_ok = (bd.cg_mode == CUDAGraphMode.NONE and bd.num_tokens == pg.num_tokens)
+            if not self._zp_cg_ok:
                 return False
         return True
 
@@ -1375,18 +1684,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert pg is not None
         req_idx = self.req_states.req_id_to_index[req_id]
         idx_mapping_np = np.array([req_idx], dtype=np.int32)
-        if req_idx == 0:
-            idx_mapping = self._zeros_1_i32
-        elif req_idx == 1:
-            idx_mapping = self._ones_1_i32
+        if 0 <= req_idx < len(self._req_idx_views):
+            idx_mapping = self._req_idx_views[req_idx]
         else:
             idx_mapping = torch.tensor([req_idx], dtype=torch.int32, device=self.device)
-        num_sched = np.array([n], dtype=np.int32)
-        qsl_np = np.array([0, n], dtype=np.int32)
-        prefill_len_np = np.array([n], dtype=np.int32)
-        zero_1_np = np.zeros(1, dtype=np.int32)
-        is_pref_np = np.array([True], dtype=np.bool_)
-        seq_ub = torch.from_numpy(num_sched.copy())
         return InputBatch(
             req_ids=[req_id],
             num_reqs=1,
@@ -1395,20 +1696,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping_np=idx_mapping_np,
             expanded_idx_mapping=idx_mapping,
             expanded_local_pos=self._expanded_local_pos_1_gpu,
-            num_scheduled_tokens=num_sched,
+            num_scheduled_tokens=pg._zp_num_sched_np,
             num_tokens=n,
             num_tokens_after_padding=n,
             num_draft_tokens=0,
             num_draft_tokens_per_req=None,
             query_start_loc=self.input_buffers.query_start_loc[:2],
-            query_start_loc_np=qsl_np,
+            query_start_loc_np=pg._zp_qsl_np,
             seq_lens=self.input_buffers.seq_lens[:1],
-            seq_lens_cpu_upper_bound=seq_ub,
+            seq_lens_cpu_upper_bound=pg._zp_seq_ub,
             dcp_local_seq_lens=None,
-            num_computed_tokens_np=zero_1_np,
-            prefill_len_np=prefill_len_np,
-            num_computed_prefill_tokens_np=zero_1_np,
-            is_prefilling_np=is_pref_np,
+            num_computed_tokens_np=pg._zp_zero_1_np,
+            prefill_len_np=pg._zp_prefill_len_np,
+            num_computed_prefill_tokens_np=pg._zp_zero_1_np,
+            is_prefilling_np=pg._zp_is_pref_np,
             max_seq_len_np=None,
             input_ids=self.input_buffers.input_ids[:n],
             positions=self.input_buffers.positions[:n],
@@ -1420,6 +1721,139 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_lens=None,
         )
 
+    def _is_single_full_decode(
+        self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
+    ) -> tuple[str, int, int, int, int] | None:
+        if (
+            not self._single_decode_prep_enabled
+            or self._single_decode_prep_failed
+            or batch_desc.cg_mode != CUDAGraphMode.FULL
+            or batch_desc.num_tokens != 1
+            or batch_desc.num_reqs != 1
+            or self.cudagraph_manager is None
+            or batch_desc not in self.cudagraph_manager.graphs
+            or scheduler_output.total_num_scheduled_tokens != 1
+            or len(scheduler_output.num_scheduled_tokens) != 1
+            or scheduler_output.scheduled_spec_decode_tokens
+            or self.use_dcp
+            or self.pcp_manager is not None
+            or self.block_tables.cp_size != 1
+            or self.model_state.num_new_sampled_tokens_per_step != 1
+        ):
+            return None
+        req_id = next(iter(scheduler_output.num_scheduled_tokens))
+        req_idx = self.req_states.req_id_to_index.get(req_id)
+        if req_idx is None:
+            return None
+        num_comp = int(self.req_states.num_computed_tokens_np[req_idx])
+        pref_len = int(self.req_states.prefill_len.np[req_idx])
+        num_comp_pref = int(self.req_states.num_computed_prefill_tokens[req_idx])
+        if num_comp_pref < pref_len or num_comp < pref_len:
+            return None
+        return req_id, req_idx, num_comp, pref_len, num_comp_pref
+
+    def _try_prepare_single_decode(
+        self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
+    ) -> tuple[InputBatch, tuple[torch.Tensor, ...], torch.Tensor] | None:
+        if not self._single_decode_prep_armed:
+            return None
+        if not self._single_decode_prep_verified and torch.cuda.is_current_stream_capturing():
+            return None
+        info = self._is_single_full_decode(scheduler_output, batch_desc)
+        if info is None:
+            return None
+        req_id, req_idx, num_comp, pref_len, num_comp_pref = info
+        idx_mapping_np = np.array([req_idx], dtype=np.int32)
+        if req_idx == 0:
+            idx_mapping = self._zeros_1_i32
+        elif req_idx == 1:
+            idx_mapping = self._ones_1_i32
+        else:
+            idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        block_tables, slot_mappings = self.block_tables.prepare_single_decode_step(
+            idx_mapping,
+            self.req_states.num_computed_tokens.gpu,
+            self.req_states.last_sampled_tokens,
+            self.input_buffers.input_ids,
+            self.input_buffers.positions,
+            self.input_buffers.seq_lens,
+            self.input_buffers.query_start_loc,
+            self.input_buffers.is_padding if envs.VLLM_MOE_SKIP_PADDING else None,
+        )
+        if not self._single_decode_prep_verified:
+            got_ids = self.input_buffers.input_ids[:1].clone()
+            got_pos = self.input_buffers.positions[:1].clone()
+            got_sl = self.input_buffers.seq_lens.clone()
+            got_qsl = self.input_buffers.query_start_loc.clone()
+            got_pad = self.input_buffers.is_padding[:1].clone()
+            got_slots = self.block_tables.slot_mappings[:, :1].clone()
+            got_bts = [bt.clone() for bt in self.block_tables.input_block_tables]
+            ref_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            ref_bts, ref_slots = self.prepare_attn(ref_batch)
+            ok = (
+                torch.equal(got_ids, self.input_buffers.input_ids[:1])
+                and torch.equal(got_pos, self.input_buffers.positions[:1])
+                and torch.equal(got_sl, self.input_buffers.seq_lens)
+                and torch.equal(got_qsl, self.input_buffers.query_start_loc)
+                and torch.equal(got_pad, self.input_buffers.is_padding[:1])
+                and torch.equal(got_slots, self.block_tables.slot_mappings[:, :1])
+                and torch.equal(self._logits_indices_0_gpu, ref_batch.logits_indices)
+                and all(
+                    torch.equal(g_bt, r_bt)
+                    for g_bt, r_bt in zip(got_bts, self.block_tables.input_block_tables)
+                )
+            )
+            if ok:
+                self._single_decode_prep_verified = True
+                logger.info("Single-token FULL decode fused prep verified bitwise and active")
+            else:
+                self._single_decode_prep_failed = True
+                self._single_decode_prep_armed = False
+                logger.warning("Single-token FULL decode fused prep mismatch; keeping stock prep")
+            return ref_batch, ref_bts, ref_slots
+        seq_ub = torch.from_numpy(np.array([num_comp + 1], dtype=np.int32))
+        max_seq_len_np = (
+            self.req_states.max_seq_len[idx_mapping_np] if self.use_pp else None
+        )
+        prompt_lens = (
+            self.req_states.prompt_len.gpu[idx_mapping]
+            if self.model_config.rswa_window is not None
+            else None
+        )
+        input_batch = InputBatch(
+            req_ids=[req_id],
+            num_reqs=1,
+            num_reqs_after_padding=1,
+            idx_mapping=idx_mapping,
+            idx_mapping_np=idx_mapping_np,
+            expanded_idx_mapping=idx_mapping,
+            expanded_local_pos=self._expanded_local_pos_1_gpu,
+            num_scheduled_tokens=self._ones_1_np,
+            num_tokens=1,
+            num_tokens_after_padding=1,
+            num_draft_tokens=0,
+            num_draft_tokens_per_req=None,
+            query_start_loc=self.input_buffers.query_start_loc[:2],
+            query_start_loc_np=self._cu_num_logits_1_np,
+            seq_lens=self.input_buffers.seq_lens[:1],
+            seq_lens_cpu_upper_bound=seq_ub,
+            dcp_local_seq_lens=None,
+            num_computed_tokens_np=np.array([num_comp], dtype=np.int32),
+            prefill_len_np=np.array([pref_len], dtype=np.int32),
+            num_computed_prefill_tokens_np=np.array([num_comp_pref], dtype=np.int32),
+            is_prefilling_np=self._false_1_np,
+            max_seq_len_np=max_seq_len_np,
+            input_ids=self.input_buffers.input_ids[:1],
+            positions=self.input_buffers.positions[:1],
+            is_padding=self.input_buffers.is_padding[:1],
+            logits_indices=self._logits_indices_0_gpu,
+            cu_num_logits=self._cu_num_logits_1_gpu,
+            cu_num_logits_np=self._cu_num_logits_1_np,
+            has_structured_output_reqs=scheduler_output.has_structured_output_requests,
+            prompt_lens=prompt_lens,
+        )
+        return input_batch, block_tables, slot_mappings
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1429,6 +1863,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if self._pending_zp_flush is not None:
+            self._flush_pending_zp()
         if (
             not dummy_run
             and not is_profile
@@ -1454,16 +1890,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 pg._zp_replays += 1
                 if pg._zp_replays == 1:
                     logger.info("Prefill graph: zero-prep launch active (host prep overlapped behind graph)")
-                # Overlap CPU request/sampler/block-table bookkeeping behind the running 246 ms GPU graph!
-                self.add_requests(scheduler_output)
+                # Stage CPU request/sampler/block-table state behind the running GPU prefill graph,
+                # deferring GPU staged writes until AFTER forward_done.record(), sample(), and D2H!
+                self.add_requests(scheduler_output, apply_gpu_writes=False)
                 self.update_requests(scheduler_output)
-                self.block_tables.apply_staged_writes()
                 input_batch = self._build_zero_prep_batch(nr.req_id, pg.num_tokens)
-                self.model_state.preprocess_state(
+                self._pending_zp_flush = (
                     input_batch,
-                    tuple(bt[:1] for bt in self.block_tables.input_block_tables),
-                    self.kv_cache_config,
-                    self.req_states.num_computed_tokens.gpu,
+                    bool(scheduler_output.scheduled_new_reqs),
+                )
+                self._single_decode_prep_armed = (
+                    self._single_decode_prep_enabled
+                    and not self._single_decode_prep_failed
                 )
                 self.execute_model_state = ExecuteModelState(
                     input_batch=input_batch,
@@ -1528,8 +1966,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
-            input_batch = self.prepare_inputs(scheduler_output, batch_desc)
-            block_tables, slot_mappings = self.prepare_attn(input_batch)
+            fast_dec = self._try_prepare_single_decode(scheduler_output, batch_desc)
+            if fast_dec is not None:
+                input_batch, block_tables, slot_mappings = fast_dec
+            else:
+                self._single_decode_prep_armed = False
+                input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+                block_tables, slot_mappings = self.prepare_attn(input_batch)
+                if (
+                    self._is_single_full_decode(scheduler_output, batch_desc) is not None
+                    or (
+                        self._single_decode_prep_enabled
+                        and not self._single_decode_prep_failed
+                        and input_batch.num_reqs == 1
+                        and int(input_batch.num_computed_tokens_np[0])
+                        + int(input_batch.num_scheduled_tokens[0])
+                        >= int(input_batch.prefill_len_np[0])
+                    )
+                ):
+                    self._single_decode_prep_armed = True
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -1550,6 +2005,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 self._set_active_loras(*lora_inputs)
         else:
+            self._single_decode_prep_armed = False
             # No actual tokens to run. A dummy run for DP or memory profiling.
             input_batch = InputBatch.make_dummy(
                 batch_desc.num_reqs or num_reqs,
@@ -1693,9 +2149,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             lora_state=self.lora_state,
                             scheduled_encoder_inputs=scheduled_encoder_inputs,
                         )
-                    inputs_embeds = self.model_state.get_mm_embeddings(
-                        scheduled_encoder_inputs, input_batch, self.req_states
-                    )
+                    inputs_embeds = None
+                    if self.lora_config is None:
+                        inputs_embeds = self._try_decode_embed_graph(
+                            scheduled_encoder_inputs, input_batch
+                        )
+                    if inputs_embeds is None:
+                        inputs_embeds = self.model_state.get_mm_embeddings(
+                            scheduled_encoder_inputs, input_batch, self.req_states
+                        )
                 if inputs_embeds is not None and not self.model.requires_raw_input_tokens:
                     input_ids = None
 
@@ -1959,7 +2421,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # host waits for it with the next step already queued.
         forward_done = None
         if input_batch.num_reqs == 1 and input_batch.num_tokens > 1:
-            forward_done = torch.cuda.Event(blocking=True)
+            forward_done = acquire_blocking_event()
             forward_done.record(self.main_stream)
 
         sampler_output, num_sampled, num_rejected = self.sample(
@@ -1976,6 +2438,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         assert self.prompt_logprobs_worker is not None
+        if (
+            self._pending_zp_flush is not None
+            and np.any(
+                self.prompt_logprobs_worker.uses_prompt_logprobs[
+                    input_batch.idx_mapping_np
+                ]
+            )
+        ):
+            self._flush_pending_zp()
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
             self.model.compute_logits,
             hidden_states,
@@ -1996,9 +2467,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         known_single_token = (
             input_batch.num_reqs == 1
-            and self.num_speculative_steps == 0
-            and not bool(input_batch.is_prefilling_np[0])
             and sampler_output.sampled_token_ids.shape == (1, 1)
+            and (
+                num_sampled is self._ones_1_i32
+                or (
+                    self.num_speculative_steps == 0
+                    and (
+                        not bool(input_batch.is_prefilling_np[0])
+                        or int(input_batch.num_computed_tokens_np[0])
+                        + int(input_batch.num_scheduled_tokens[0])
+                        >= int(input_batch.prefill_len_np[0])
+                    )
+                )
+            )
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
@@ -2011,6 +2492,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             known_single_token=known_single_token,
             forward_done=forward_done,
         )
+
+        if self._pending_zp_flush is not None:
+            self._flush_pending_zp()
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         if self.speculator is not None and self.speculator.supports_mm_inputs:
@@ -2036,6 +2520,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_rejected,
             input_batch.query_start_loc,
         )
+
+        if (
+            not self._sd_ready
+            and not self._sd_failed
+            and self._single_decode_prep_verified
+            and input_batch.num_reqs == 1
+            and input_batch.num_tokens == 1
+            and self.num_speculative_steps == 0
+        ):
+            self._maybe_init_serial_decode_fast()
 
         if self.speculator is not None:
             assert self.sampler is not None
@@ -2079,6 +2573,549 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()
+
+    @torch.inference_mode()
+    def _maybe_init_serial_decode_fast(self) -> bool:
+        if self._sd_ready:
+            return True
+        if (
+            self._sd_failed
+            or envs.os.environ.get("VLLM_SERIAL_DECODE_FAST", "1") == "0"
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        if (
+            not self._single_decode_prep_verified
+            or self.num_speculative_steps != 0
+            or self.speculator is not None
+            or self.use_pp
+            or self.dp_size != 1
+            or self.use_dcp
+            or self.pcp_manager is not None
+            or self.lora_config is not None
+            or self.block_tables.cp_size != 1
+            or self.use_aux_hidden_state_outputs
+            or self.model_config.rswa_window is not None
+            or not self.is_first_pp_rank
+            or not self.is_last_pp_rank
+            or self.kv_connector is not NO_OP_KV_CONNECTOR
+            or getattr(self.model_state, "rope_state", None) is not None
+            or getattr(self.model_state, "mm_pruner", None) is not None
+            or self.model_state.preprocess_state.__func__ is not ModelState.preprocess_state
+            or self.model_state.postprocess_state.__func__ is not ModelState.postprocess_state
+        ):
+            return False
+        if (
+            self.cudagraph_manager is None
+            or not self.cudagraph_manager._graphs_captured
+            or self.cudagraph_manager.hidden_states is None
+        ):
+            return False
+        batch_desc = self.cudagraph_manager.dispatch(1, 1, 1, 0)
+        if (
+            batch_desc.cg_mode != CUDAGraphMode.FULL
+            or batch_desc.num_tokens != 1
+            or batch_desc not in self.cudagraph_manager.graphs
+        ):
+            return False
+        full_graph = self.cudagraph_manager.graphs[batch_desc]
+        hidden_1 = self.cudagraph_manager.hidden_states[:1]
+
+        lm_sig = (
+            hidden_1.data_ptr(),
+            tuple(hidden_1.shape),
+            tuple(hidden_1.stride()),
+        )
+        lm_entry = getattr(self, "_lmhead_cg_entries", {}).get(lm_sig)
+        if lm_entry is None:
+            return False
+        lmhead_graph_0 = lm_entry[0][0]
+        lmhead_out_0 = lm_entry[1][0]
+        fused_launch = lm_entry[3]
+        lmpost_into = getattr(self.model, "_lmpost_softcap_argmax_into", None)
+        if fused_launch is None and lmpost_into is None:
+            return False
+
+        embed_graph = None
+        dst_1 = None
+        lm_inner = None
+        me_mod = None
+        ids_1 = self.input_buffers.input_ids[:1]
+        if self.supports_mm_inputs:
+            enc_runner = getattr(self.model_state, "encoder_runner", None)
+            if enc_runner is None or self.model.requires_raw_input_tokens:
+                return False
+            dst_1 = enc_runner.inputs_embeds[:1]
+            emb_sig = (
+                ids_1.data_ptr(),
+                ids_1.dtype,
+                dst_1.data_ptr(),
+                tuple(dst_1.shape),
+            )
+            emb_entry = getattr(self, "_decode_embed_cg_entries", {}).get(emb_sig)
+            if emb_entry is None:
+                return False
+            embed_graph = emb_entry[0]
+            try:
+                import muse_embed as _me
+
+                me_mod = _me
+            except (ImportError, OSError):
+                return False
+            lm_inner = (
+                self.model.get_language_model()
+                if hasattr(self.model, "get_language_model")
+                else getattr(self.model, "model", self.model)
+            )
+            if not (hasattr(lm_inner, "embed_tokens") and hasattr(lm_inner, "embed_norm")):
+                lm_inner = getattr(self.model, "model", lm_inner)
+
+        from vllm.v1.kv_cache_interface import AttentionSpec
+
+        bt = self.block_tables
+        ib = self.input_buffers
+        if not bt.block_sizes or len(set(bt.block_sizes)) != 1:
+            return False
+        bs0 = bt.block_sizes[0]
+        if any(kbs != bs0 for kbs in bt.kernel_block_sizes):
+            return False
+
+        used_blks: set[int] = {0}
+        for g in range(bt.num_kv_cache_groups):
+            for r in range(bt.max_num_reqs):
+                nb_r = int(bt.num_blocks.np[g, r])
+                if nb_r > 0:
+                    used_blks.update(int(x) for x in bt.block_tables[g].np[r, :nb_r])
+        free_pair: list[int] = []
+        for cand_b in range(1, self.kv_cache_config.num_blocks):
+            if cand_b not in used_blks:
+                free_pair.append(cand_b)
+                if len(free_pair) == 2:
+                    break
+        if len(free_pair) < 2:
+            return False
+
+        kv_views: list[tuple[torch.Tensor, int]] = []
+        seen_kv_ptrs: set[int] = set()
+        fwd_ctx = self.compilation_config.static_forward_context
+        for groups in self.attn_groups:
+            for group in groups:
+                spec = group.kv_cache_spec
+                if not isinstance(spec, AttentionSpec):
+                    return False
+                if group.kv_cache_group_id >= len(self.kernel_block_sizes):
+                    continue
+                kbs = self.kernel_block_sizes[group.kv_cache_group_id]
+                bdim = group.backend.get_kv_cache_block_dim(
+                    kbs,
+                    spec.num_kv_heads,
+                    spec.head_size,
+                    cache_dtype_str=self.cache_config.cache_dtype,
+                )
+                for lname in group.layer_names:
+                    attn_mod = fwd_ctx.get(lname)
+                    kv = getattr(attn_mod, "kv_cache", None)
+                    if isinstance(kv, (list, tuple)) and len(kv) == 1:
+                        kv = kv[0]
+                    if not isinstance(kv, torch.Tensor):
+                        return False
+                    if kv.data_ptr() not in seen_kv_ptrs:
+                        seen_kv_ptrs.add(kv.data_ptr())
+                        kv_views.append((kv, bdim))
+        if not kv_views:
+            return False
+
+        sw_limit = self.max_model_len
+        for kv_group in self.kv_cache_config.kv_cache_groups:
+            sw = getattr(kv_group.kv_cache_spec, "sliding_window", None)
+            if sw is not None:
+                sw_limit = min(sw_limit, int(sw))
+
+        saved_ids = ib.input_ids[:1].clone()
+        saved_pos = ib.positions[:1].clone()
+        saved_sl = ib.seq_lens.clone()
+        saved_qsl = ib.query_start_loc.clone()
+        saved_pad = ib.is_padding[:1].clone()
+        saved_slots = bt.slot_mappings[:, :1].clone()
+        saved_hs = hidden_1.clone()
+        saved_emb = dst_1.clone() if dst_1 is not None else None
+        saved_in_bt2 = [t[0, :2].clone() for t in bt.input_block_tables]
+        saved_src_bt2 = [b.gpu[0, :2].clone() for b in bt.block_tables]
+        saved_nblk = bt.num_blocks.gpu[:, :1].clone()
+        bridge_graph: torch.cuda.CUDAGraph | None = None
+
+        try:
+            max_steps = 4096
+            out_tokens_gpu = torch.zeros(max_steps, dtype=torch.int32, device=self.device)
+            out_tokens_pin = torch.zeros(max_steps, dtype=torch.int32, pin_memory=True)
+            step_idx = torch.zeros(1, dtype=torch.int32, device=self.device)
+            step_limit = torch.ones(1, dtype=torch.int32, device=self.device)
+            tok_scratch = torch.zeros((1, 1), dtype=torch.int64, device=self.device)
+            sd_pool = torch.cuda.graph_pool_handle()
+            cap_st = getattr(self, "_sd_cap_stream", None)
+            if cap_st is None:
+                cap_st = torch.cuda.Stream(device=self.device)
+                self._sd_cap_stream = cap_st
+
+            mult = self.model.output_multiplier
+            cap = self.model.final_logit_softcapping
+            skip_pad = bool(envs.VLLM_MOE_SKIP_PADDING)
+
+            pair_t = torch.tensor(free_pair, dtype=torch.int32, device=self.device)
+            for g in range(bt.num_kv_cache_groups):
+                bt.block_tables[g].gpu[0, :2].copy_(pair_t)
+                bt.input_block_tables[g][0, :2].copy_(pair_t)
+                bt.num_blocks.gpu[g, 0] = max(2, int(saved_nblk[g, 0].item()))
+
+            # Warm Triton JITs outside graph capture.
+            bt.init_serial_decode_loop(
+                self._zeros_1_i32,
+                1000,
+                bs0 - 1,
+                1,
+                step_idx,
+                step_limit,
+                ib.input_ids,
+                ib.positions,
+                ib.seq_lens,
+                ib.query_start_loc,
+                ib.is_padding if skip_pad else None,
+            )
+
+            def _bridge_ops() -> None:
+                if fused_launch is not None:
+                    lm_h, lut_t, ov, fn_f = fused_launch
+                    if not fn_f(hidden_1, lm_h, lut_t, tok_scratch, ov):
+                        raise RuntimeError("fused lm_head+lmpost refused in serial bridge")
+                else:
+                    raw_g = self.model.logits_processor(self.model.lm_head, hidden_1)
+                    if raw_g is None or not lmpost_into(raw_g, mult, cap, tok_scratch):
+                        raise RuntimeError("lmpost_into refused in serial bridge")
+                bt.advance_serial_decode_step(
+                    tok_scratch,
+                    out_tokens_gpu,
+                    step_idx,
+                    step_limit,
+                    ib.input_ids,
+                    ib.positions,
+                    ib.seq_lens,
+                )
+                if me_mod is not None and lm_inner is not None and dst_1 is not None:
+                    if not me_mod.embed_into(lm_inner, ids_1, dst_1):
+                        raise RuntimeError("muse_embed refused in serial bridge")
+
+            _bridge_ops()
+            main_st = torch.cuda.current_stream(self.device)
+            cap_st.wait_stream(main_st)
+            bridge_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.stream(cap_st):
+                with torch.cuda.graph(bridge_graph, pool=sd_pool, stream=cap_st):
+                    _bridge_ops()
+                upload_cudagraph(bridge_graph, cap_st)
+            main_st.wait_stream(cap_st)
+
+            def _reset_synth_kv() -> None:
+                for kv, bdim in kv_views:
+                    b0_view = kv.narrow(bdim, free_pair[0], 1)
+                    b1_view = kv.narrow(bdim, free_pair[1], 1)
+                    b1_view.zero_()
+                    if b0_view.dtype in (torch.bfloat16, torch.float16, torch.float32):
+                        n_el = b0_view.numel()
+                        pat = (
+                            ((torch.arange(n_el, device=self.device) % 11).float() - 5.0)
+                            .mul(0.03125)
+                            .to(b0_view.dtype)
+                            .reshape(b0_view.shape)
+                        )
+                        b0_view.copy_(pat)
+                    else:
+                        b0_view.zero_()
+
+            # Reference 3 single-steps crossing block boundary (bs0 - 1 -> bs0 -> bs0 + 1).
+            _reset_synth_kv()
+            tmp_comp = torch.tensor([bs0 - 1], dtype=torch.int32, device=self.device)
+            tmp_last = torch.tensor([[1234]], dtype=torch.int64, device=self.device)
+            ref_toks: list[int] = []
+            for _ in range(3):
+                bt.prepare_single_decode_step(
+                    self._zeros_1_i32,
+                    tmp_comp,
+                    tmp_last,
+                    ib.input_ids,
+                    ib.positions,
+                    ib.seq_lens,
+                    ib.query_start_loc,
+                    ib.is_padding if skip_pad else None,
+                )
+                if embed_graph is not None:
+                    embed_graph.replay()
+                full_graph.replay()
+                lmhead_graph_0.replay()
+                tok_val = int(lmhead_out_0.item())
+                ref_toks.append(tok_val)
+                tmp_last[0, 0] = tok_val
+                tmp_comp[0] += 1
+            ref_hs = hidden_1.clone()
+
+            # Multi-step 3-step replay across identical initial KV state.
+            _reset_synth_kv()
+            out_tokens_gpu[:4].fill_(-1)
+            bt.init_serial_decode_loop(
+                self._zeros_1_i32,
+                1234,
+                bs0 - 1,
+                3,
+                step_idx,
+                step_limit,
+                ib.input_ids,
+                ib.positions,
+                ib.seq_lens,
+                ib.query_start_loc,
+                ib.is_padding if skip_pad else None,
+            )
+            if embed_graph is not None:
+                embed_graph.replay()
+            for _ in range(3):
+                full_graph.replay()
+                bridge_graph.replay()
+            got_toks = [int(t) for t in out_tokens_gpu[:3].tolist()]
+
+            # Also warm & verify finish_serial_decode_post_update on scratch tensors.
+            chk_comp = torch.tensor([bs0 - 1], dtype=torch.int32, device=self.device)
+            chk_last = torch.zeros((1, 1), dtype=torch.int64, device=self.device)
+            chk_all = torch.zeros((1, 16), dtype=torch.int32, device=self.device)
+            chk_tot = torch.tensor([5], dtype=torch.int32, device=self.device)
+            finish_serial_decode_post_update(
+                0, 3, bs0 + 2, out_tokens_gpu, chk_comp, chk_last, chk_all, chk_tot
+            )
+            post_ok = (
+                int(chk_comp[0].item()) == bs0 + 2
+                and int(chk_last[0, 0].item()) == ref_toks[-1]
+                and int(chk_tot[0].item()) == 8
+                and [int(t) for t in chk_all[0, 5:8].tolist()] == ref_toks
+            )
+
+            if (
+                got_toks != ref_toks
+                or not torch.equal(hidden_1.view(torch.int16), ref_hs.view(torch.int16))
+                or not post_ok
+            ):
+                bridge_graph.reset()
+                self._sd_failed = True
+                logger.warning(
+                    "Zero-sync multi-step serial decode 0-ULP self-check failed (got=%s vs ref=%s); disabled",
+                    got_toks,
+                    ref_toks,
+                )
+                return False
+
+            self._sd_max_steps = max_steps
+            self._sd_sw_limit = sw_limit
+            self._sd_out_tokens_gpu = out_tokens_gpu
+            self._sd_out_tokens_pin = out_tokens_pin
+            self._sd_out_tokens_pin_np = out_tokens_pin.numpy()
+            self._sd_step_idx = step_idx
+            self._sd_step_limit = step_limit
+            self._sd_tok_scratch = tok_scratch
+            self._sd_pool = sd_pool
+            self._sd_full_graph = full_graph
+            self._sd_embed_graph = embed_graph
+            self._sd_bridge_graph = bridge_graph
+            self._sd_ready = True
+            logger.info(
+                "Zero-sync multi-step serial decode verified 0-ULP and armed (window_limit=%d)",
+                sw_limit,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            if bridge_graph is not None:
+                try:
+                    bridge_graph.reset()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._sd_failed = True
+            logger.warning("Zero-sync multi-step serial decode init skipped: %s", exc)
+            return False
+        finally:
+            try:
+                for kv, bdim in kv_views:
+                    kv.narrow(bdim, free_pair[0], 1).zero_()
+                    kv.narrow(bdim, free_pair[1], 1).zero_()
+                for g in range(bt.num_kv_cache_groups):
+                    bt.block_tables[g].gpu[0, :2].copy_(saved_src_bt2[g])
+                    bt.input_block_tables[g][0, :2].copy_(saved_in_bt2[g])
+                bt.num_blocks.gpu[:, :1].copy_(saved_nblk)
+                ib.input_ids[:1].copy_(saved_ids)
+                ib.positions[:1].copy_(saved_pos)
+                ib.seq_lens.copy_(saved_sl)
+                ib.query_start_loc.copy_(saved_qsl)
+                ib.is_padding[:1].copy_(saved_pad)
+                bt.slot_mappings[:, :1].copy_(saved_slots)
+                hidden_1.copy_(saved_hs)
+                if dst_1 is not None and saved_emb is not None:
+                    dst_1.copy_(saved_emb)
+                torch.cuda.synchronize(self.device)
+            except Exception:  # noqa: BLE001
+                pass
+
+    @torch.inference_mode()
+    def run_serial_decode_steps(
+        self, first_token_id: int, count: int
+    ) -> list[int] | None:
+        """Zero-sync in-GPU multi-step serial greedy decode loop.
+
+        Replays ``count`` M=1 decode steps on the GPU with zero mid-run host
+        synchronization and zero scheduler/runner Python hops, copying
+        ``out_tokens[:count]`` back once via a sleeping event wait and leaving
+        both scheduler and runner CPU/GPU states cleanly synchronized.
+        """
+        if count == 0:
+            return []
+        if count < 1:
+            return None
+        if self._pending_zp_flush is not None:
+            self._flush_pending_zp()
+        if not self._sd_ready:
+            if self._sd_failed or not self._maybe_init_serial_decode_fast():
+                return None
+        if count > self._sd_max_steps:
+            return None
+        if (
+            self.cudagraph_manager is None
+            or self._sd_full_graph
+            is not self.cudagraph_manager.graphs.get(
+                self.cudagraph_manager.dispatch(1, 1, 1, 0)
+            )
+        ):
+            return None
+
+        core = self._engine_core
+        scheduler = self._scheduler or getattr(core, "scheduler", None)
+        if scheduler is None:
+            return None
+        if core is not None and getattr(core, "batch_queue", None):
+            return None
+        if len(scheduler.running) != 1 or bool(getattr(scheduler, "waiting", None)):
+            return None
+
+        req = scheduler.running[0]
+        if req.is_finished() or getattr(req, "num_output_placeholders", 0) != 0:
+            return None
+        if getattr(req, "structured_output_request", None) is not None:
+            return None
+        sp = req.sampling_params
+        if (
+            sp is None
+            or sp.temperature != 0.0
+            or sp.logprobs is not None
+            or sp.prompt_logprobs is not None
+            or not sp.ignore_eos
+        ):
+            return None
+
+        req_idx = self.req_states.req_id_to_index.get(req.request_id)
+        if req_idx is None or self.sampler is None or self.sampler.compute_nans:
+            return None
+        idx_arr = np.array([req_idx], dtype=np.int32)
+        states = self.sampler.sampling_states
+        if (
+            states.temperature.np[req_idx] != 0.0
+            or states.max_num_logprobs(idx_arr) != NO_LOGPROBS
+            or self.sampler.logprob_token_ids_state.max_num_token_ids(idx_arr) != 0
+            or self.sampler._requires_logits_processing(idx_arr)
+            or bool(self.sampler.penalties_state.use_penalty[req_idx])
+        ):
+            return None
+
+        start_pos = int(req.num_computed_tokens)
+        pref_len = int(self.req_states.prefill_len.np[req_idx])
+        if (
+            start_pos < pref_len
+            or int(self.req_states.num_computed_tokens_np[req_idx]) != start_pos
+            or start_pos + count + 1 >= min(self.max_model_len, self._sd_sw_limit)
+            or (req.max_tokens is not None and req.num_output_tokens + count >= req.max_tokens)
+            or not (0 <= int(first_token_id) < self.vocab_size)
+        ):
+            return None
+
+        # Pre-allocate KV cache blocks for all `count` positions in one call.
+        new_blocks = scheduler.kv_cache_manager.allocate_slots(req, count)
+        if new_blocks is None:
+            return None
+        new_block_ids = new_blocks.get_block_ids()
+        if any(new_block_ids):
+            if (
+                self.kv_cache_config.needs_kv_cache_zeroing
+                and self.kv_block_zeroer is not None
+            ):
+                flat_bids = [bid for grp in new_block_ids for bid in grp]
+                if flat_bids:
+                    self.kv_block_zeroer.zero_block_ids(flat_bids)
+            self.block_tables.append_block_ids(req_idx, new_block_ids, overwrite=False)
+            self.block_tables.apply_staged_writes()
+
+        idx_t = (
+            self._req_idx_views[req_idx]
+            if 0 <= req_idx < len(self._req_idx_views)
+            else torch.tensor([req_idx], dtype=torch.int32, device=self.device)
+        )
+        skip_pad = bool(envs.VLLM_MOE_SKIP_PADDING)
+        self.block_tables.init_serial_decode_loop(
+            idx_t,
+            int(first_token_id),
+            start_pos,
+            count,
+            self._sd_step_idx,
+            self._sd_step_limit,
+            self.input_buffers.input_ids,
+            self.input_buffers.positions,
+            self.input_buffers.seq_lens,
+            self.input_buffers.query_start_loc,
+            self.input_buffers.is_padding if skip_pad else None,
+        )
+        if self._sd_embed_graph is not None:
+            self._sd_embed_graph.replay()
+
+        full_g = self._sd_full_graph
+        bridge_g = self._sd_bridge_graph
+        for _ in range(count):
+            full_g.replay()
+            bridge_g.replay()
+
+        new_computed = start_pos + count
+        finish_serial_decode_post_update(
+            req_idx,
+            count,
+            new_computed,
+            self._sd_out_tokens_gpu,
+            self.req_states.num_computed_tokens.gpu,
+            self.req_states.last_sampled_tokens,
+            self.req_states.all_token_ids.gpu,
+            self.req_states.total_len.gpu,
+        )
+        self._sd_out_tokens_pin[:count].copy_(
+            self._sd_out_tokens_gpu[:count], non_blocking=True
+        )
+        done_ev = acquire_blocking_event()
+        done_ev.record(self.main_stream)
+
+        # Overlap CPU bookkeeping behind the running multi-step GPU stream, then sleep-wait once.
+        req.num_computed_tokens = new_computed
+        self.req_states.num_computed_tokens_np[req_idx] = new_computed
+        self.req_states.num_computed_prefill_tokens[req_idx] = min(
+            new_computed, pref_len
+        )
+        if self._single_decode_prep_enabled and not self._single_decode_prep_failed:
+            self._single_decode_prep_armed = True
+
+        try:
+            done_ev.synchronize()
+        finally:
+            release_blocking_event(done_ev)
+
+        tokens: list[int] = self._sd_out_tokens_pin_np[:count].tolist()
+        req.append_output_token_ids(tokens)
+        return tokens
 
     @torch.inference_mode()
     @step_eplb_after()

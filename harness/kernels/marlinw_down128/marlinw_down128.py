@@ -71,7 +71,7 @@ _tma_ready = set()  # devices on which the TMA-fed kernel initialized
 _tma_weights = set()  # weight data pointers whose layer passed the comparison with the TMA-fed kernel
 _admitted = 0  # layers offered to admit_tma (those on the 128x128 tile)
 SPLIT = 16  # tiles the TMA-fed kernel runs as three K pieces (= hand-over states = flag words)
-PIECES = (120, 96, 96)  # k-tiles of the first / middle / last piece (the later two run a slower loop copy)
+PIECES = (104, 104, 104)  # k-tiles of the first / middle / last piece (exact 1/3 split; resume hoisted outside k_loop)
 
 
 def _get_scratch(device: torch.device, slots: int) -> torch.Tensor:
@@ -319,13 +319,17 @@ def prepare_shape(device: torch.device, n: int, k: int) -> Prepared:
             plan = Prepared(plan.work, plan.grid, plan.slots, plan.active_blocks_per_sm, n, k,
                             torch.tensor(work, dtype=torch.int32, device=device), grid, slots)
             _tma_ready.add(device)
-    elif ATTN_TMA_ENABLED and _tma_shape_init is not None and (n, k) in _ALL_ATTN_SHAPES:
+    elif ATTN_TMA_ENABLED and _tma_shape_init is not None and (n, k) in _ALL_ATTN_SHAPES and (n, k) != (4096, 6656):
         with torch.cuda.device(device):
             status = _tma_shape_init(n, k, ctypes.byref(active))
         if status == 0 and active.value == 1:
-            work, grid, slots = tma_work_lists_shape(n, k, props.shared_memory_per_block_optin)
-            plan = Prepared(plan.work, plan.grid, plan.slots, plan.active_blocks_per_sm, n, k,
-                            torch.tensor(work, dtype=torch.int32, device=device), grid, slots)
+            try:
+                work, grid, slots = tma_work_lists_shape(n, k, props.shared_memory_per_block_optin)
+            except ValueError:
+                pass
+            else:
+                plan = Prepared(plan.work, plan.grid, plan.slots, plan.active_blocks_per_sm, n, k,
+                                torch.tensor(work, dtype=torch.int32, device=device), grid, slots)
     return plan
 
 

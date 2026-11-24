@@ -23,10 +23,10 @@ static int decode6_gate_blocks() {
   if (g_gate_blocks < 0) {
     const char* env = std::getenv("MUSE_NV6_GATE_BLOCKS");
     if (!env || !*env) {
-      g_gate_blocks = 24;
+      g_gate_blocks = 48;
     } else {
       int v = static_cast<int>(std::strtol(env, nullptr, 10));
-      g_gate_blocks = (v == 24 || v == 32 || v == 48) ? v : 24;
+      g_gate_blocks = (v == 24 || v == 32 || v == 48) ? v : 48;
     }
   }
   return g_gate_blocks;
@@ -39,20 +39,26 @@ cudaError_t launch(const int4* input, const int4* weight, int4* output,
     auto kernel = muse_marlin6::Marlin<
         vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
         vllm::kFE4M3fn.id(), Threads, 1, TileN / 16, 8, true, 4, 1, false, true, GateUpGrid, false, GateV48>;
-    static int cached_shared[16] = {0};
-    int shared = (device >= 0 && device < 16) ? cached_shared[device] : 0;
-    if (shared == 0) {
-        auto status = cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
-        if (status != cudaSuccess) return status;
-        status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
-        if (status != cudaSuccess) return status;
-        if (device >= 0 && device < 16) cached_shared[device] = shared;
+    constexpr int target_smem = (TileN == 128) ? (52 * 1024) : 18560;
+    int shared = target_smem;
+    if constexpr (target_smem > 48 * 1024) {
+        static int cached_shared[16] = {0};
+        shared = (device >= 0 && device < 16) ? cached_shared[device] : 0;
+        if (shared == 0) {
+            int max_optin = 0;
+            auto status = cudaDeviceGetAttribute(&max_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+            if (status != cudaSuccess) return status;
+            shared = (target_smem <= max_optin) ? target_smem : max_optin;
+            status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
+            if (status != cudaSuccess) return status;
+            if (device >= 0 && device < 16) cached_shared[device] = shared;
+        }
     }
     const int grid = GateUpGrid ? 336 : blocks;
     kernel<<<grid, Threads, shared, stream>>>(
         input, weight, output, partials, nullptr, nullptr, scales6, global_scale,
         nullptr, nullptr, k / 16, 1, n, k, k, locks, false, false, true, shared, palette,
-        decode6_attn_tpf_stride());
+        decode6_attn_tpf_stride(), nullptr, nullptr, nullptr, 0, nullptr);
     return cudaGetLastError();
 }
 }  // namespace

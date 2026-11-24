@@ -20,6 +20,15 @@ _WIDTH = 6656
 _ROWS = (4096, 4608)
 _INDEX_BYTES = 36
 _stats = dict(admitted=0, rejected=0, bytes=0, rans=0, logged=False)
+_gate_blocks_override: int | None = None
+_last_auto_gate_blocks: int | None = None
+
+
+def _env_truthy(name: str, default: str = "0") -> bool:
+    val = os.environ.get(name)
+    if val is None or val == "":
+        val = default
+    return val.strip().lower() not in ("0", "", "false", "no")
 
 
 @cache
@@ -44,7 +53,91 @@ def _lib():
         native.muse_bf16_rans_pass2.restype = ctypes.c_int
         native.muse_bf16_rans_gemv.argtypes = [ctypes.c_int, ctypes.c_size_t, ptr, ptr, ptr, ptr]
         native.muse_bf16_rans_gemv.restype = ctypes.c_int
+    if hasattr(native, "muse_bf16_set_runtime_pdl"):
+        native.muse_bf16_set_runtime_pdl.argtypes = [ctypes.c_int]
+        native.muse_bf16_set_runtime_pdl.restype = None
+        native.muse_bf16_get_runtime_pdl.argtypes = []
+        native.muse_bf16_get_runtime_pdl.restype = ctypes.c_int
+    if hasattr(native, "muse_bf16_set_runtime_gate_blocks"):
+        native.muse_bf16_set_runtime_gate_blocks.argtypes = [ctypes.c_int]
+        native.muse_bf16_set_runtime_gate_blocks.restype = None
+        native.muse_bf16_get_runtime_gate_blocks.argtypes = []
+        native.muse_bf16_get_runtime_gate_blocks.restype = ctypes.c_int
     return native
+
+
+def set_runtime_pdl(enabled: bool | None = None) -> None:
+    native = _lib()
+    if native is not None and hasattr(native, "muse_bf16_set_runtime_pdl"):
+        native.muse_bf16_set_runtime_pdl(-1 if enabled is None else (1 if enabled else 0))
+
+
+def get_runtime_pdl() -> bool:
+    native = _lib()
+    if native is not None and hasattr(native, "muse_bf16_get_runtime_pdl"):
+        return bool(native.muse_bf16_get_runtime_pdl())
+    return False
+
+
+def set_runtime_gate_blocks(blocks: int | None = None) -> None:
+    global _gate_blocks_override, _last_auto_gate_blocks
+    if blocks is None or int(blocks) <= 0:
+        _gate_blocks_override = None
+    else:
+        b = int(blocks)
+        if b not in (32, 48):
+            raise ValueError(f"gate blocks must be 32 or 48, got {blocks}")
+        _gate_blocks_override = b
+    _last_auto_gate_blocks = None
+    native = _lib()
+    if native is not None and hasattr(native, "muse_bf16_set_runtime_gate_blocks"):
+        native.muse_bf16_set_runtime_gate_blocks(-1 if _gate_blocks_override is None else _gate_blocks_override)
+
+
+def get_runtime_gate_blocks() -> int:
+    native = _lib()
+    if native is not None and hasattr(native, "muse_bf16_get_runtime_gate_blocks"):
+        return int(native.muse_bf16_get_runtime_gate_blocks())
+    if _gate_blocks_override is not None:
+        return _gate_blocks_override
+    return 32 if _env_truthy("MUSE_BF16_GATE_32_BLOCKS", "0") else 48
+
+
+def _is_gqa16_admitted(device: torch.device) -> bool:
+    try:
+        import muse_gqa16_attn as _gqa
+    except Exception:  # noqa: BLE001
+        return False
+    if not getattr(_gqa, "ENABLED", False) or getattr(_gqa, "_lib", None) is None:
+        return False
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    state_map = getattr(_gqa, "_state", None)
+    if isinstance(state_map, dict):
+        st = state_map.get(idx)
+        if st is not None:
+            return bool(st[0])
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    self_check = getattr(_gqa, "self_check", None)
+    if callable(self_check):
+        try:
+            return bool(self_check(device))
+        except Exception:  # noqa: BLE001
+            return False
+    return False
+
+
+def _sync_gate_blocks(device: torch.device) -> int:
+    global _last_auto_gate_blocks
+    if _gate_blocks_override is not None:
+        return _gate_blocks_override
+    target = 32 if (_env_truthy("MUSE_BF16_GATE_32_BLOCKS", "0") or not _is_gqa16_admitted(device)) else 48
+    if target != _last_auto_gate_blocks:
+        native = _lib()
+        if native is not None and hasattr(native, "muse_bf16_set_runtime_gate_blocks"):
+            native.muse_bf16_set_runtime_gate_blocks(target)
+            _last_auto_gate_blocks = target
+    return target
 
 
 def _launch(x, payload, index, n):
@@ -191,13 +284,14 @@ def _decode(x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor,
             or index.dtype != torch.uint8 or not index.is_contiguous()
             or packed.dtype != torch.uint8 or not packed.is_contiguous() or _lib() is None):
         return F.linear(x, weight)
+    gate_blks = _sync_gate_blocks(x.device)
     if not _stats["logged"]:
         _stats["logged"] = True
         tpf_kb = os.environ.get("MUSE_BF16_TLB_PREFETCH", "2048")
-        gate_blks = 32 if os.environ.get("MUSE_BF16_GATE_32_BLOCKS", "1") != "0" else 48
+        pdl_on = int(get_runtime_pdl())
         logger.info("muse_bf16_lane decode GEMV: %d admitted (%d rANS), %d rejected, %d packed bytes "
-                    "(translation prefetch %s KiB, gate %d blocks)",
-                    _stats["admitted"], _stats["rans"], _stats["rejected"], _stats["bytes"], tpf_kb, gate_blks)
+                    "(translation prefetch %s KiB, gate %d blocks, pdl=%d)",
+                    _stats["admitted"], _stats["rans"], _stats["rejected"], _stats["bytes"], tpf_kb, gate_blks, pdl_on)
     return _launch(x, packed, index, n)
 
 

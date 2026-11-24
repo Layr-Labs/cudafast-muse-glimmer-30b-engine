@@ -25,6 +25,7 @@ resident's wire and bookkeeping are tested with no GPU and no vLLM install.
 
 from __future__ import annotations
 
+import gc
 import os
 import sys
 from dataclasses import dataclass, field
@@ -43,6 +44,56 @@ os.environ.setdefault("VLLM_DISABLED_KERNELS", "FlashInferFP8ScaledMMLinearKerne
 from typing import Protocol
 
 TOP_K = 8
+_pdl_installed = False
+
+
+def _enable_inductor_pdl() -> None:
+    """Launch inductor's fused Triton kernels with programmatic dependent launch.
+
+    Every generated kernel executes griddepcontrol.wait before its first
+    instruction (so no data produced by an earlier kernel is read early) and
+    griddepcontrol.launch_dependents right after, letting the next kernel's
+    CTAs start prefetching weights while this short latency-bound kernel runs.
+    Arithmetic is untouched."""
+    global _pdl_installed
+    if _pdl_installed:
+        return
+    if os.environ.get("MUSE_PDL_OFF", "").strip() not in ("", "0", "false", "no"):
+        return
+    try:
+        import torch._inductor.config as _ic
+        from torch._inductor.codegen.triton import TritonKernel
+    except Exception:
+        return
+    triton_cfg = getattr(_ic, "triton", None)
+    if (
+        triton_cfg is None
+        or not hasattr(triton_cfg, "enable_pdl")
+        or not hasattr(TritonKernel, "GDC_WAIT")
+        or not hasattr(TritonKernel, "GDC_LAUNCH")
+        or not hasattr(TritonKernel, "_filter_pdl")
+    ):
+        return
+    triton_cfg.enable_pdl = True
+    if hasattr(TritonKernel, "_handle_pdl_before_access"):
+        TritonKernel._handle_pdl_before_access = lambda self, *a, **k: None
+    if hasattr(TritonKernel, "_handle_pdl_after_load"):
+        TritonKernel._handle_pdl_after_load = lambda self, *a, **k: None
+
+    def _filter(self, code):
+        lines = getattr(code, "_lines", None)
+        if not isinstance(lines, list):
+            return
+        for ln in lines:
+            if type(ln) is str and ln.strip():
+                indent = ln[: len(ln) - len(ln.lstrip())]
+                break
+        else:
+            indent = "    "
+        lines[0:0] = [indent + self.GDC_WAIT, indent + self.GDC_LAUNCH]
+
+    TritonKernel._filter_pdl = _filter
+    _pdl_installed = True
 
 
 def _log(msg: str) -> None:
@@ -169,6 +220,7 @@ class VllmBackend:
     """
 
     def __init__(self, cfg: VllmConfig):
+        _enable_inductor_pdl()
         from vllm import EngineArgs, LLMEngine, SamplingParams
         from vllm.sampling_params import RequestOutputKind
         from vllm.usage.usage_lib import UsageContext
@@ -242,16 +294,22 @@ class VllmBackend:
             )
         from vllm.v1.worker import hostfast
 
+        self._hostfast = hostfast
         pinned = hostfast.pin_to_fast_cpus()
+        main_core = hostfast.pin_main_thread(pinned) if pinned else None
         _log(
             f"process pinned to CPUs {hostfast.format_cpus(pinned)}"
+            + (f" (main thread on CPU {main_core})" if main_core is not None else "")
             if pinned
             else "CPU affinity unchanged"
         )
         if pinned:
-            tickled = hostfast.start_idle_tickle(pinned)
+            tickled = hostfast.start_idle_tickle(pinned, core=main_core)
             if tickled:
-                _log(f"started {tickled} SCHED_IDLE deep-idle tickler threads")
+                _log(
+                    f"started {tickled} SCHED_IDLE deep-idle tickler thread(s)"
+                    + (f" on CPU {main_core}" if main_core is not None else "")
+                )
         # REPLY FIRST, THEN CLEAN UP. When a bounded request (a timed prefill)
         # has emitted its last token, the engine core still owns the request's
         # cleanup and a queued empty batch. The stock engine's core loop does
@@ -262,6 +320,15 @@ class VllmBackend:
         # `abort`, so every `start`, runs first in any case). The same work
         # runs, in the stock order. VLLM_RESIDENT_DEFER_SETTLE=0 keeps it inline.
         client = self._engine.engine_core
+        self._core = getattr(client, "engine_core", None)
+        dw = getattr(getattr(self._core, "model_executor", None), "driver_worker", None)
+        self._runner = getattr(getattr(dw, "worker", dw), "model_runner", None)
+        if self._runner is not None and self._core is not None:
+            try:
+                self._runner._engine_core = self._core
+                self._runner._scheduler = self._core.scheduler
+            except Exception:
+                pass
         self._settle_core = None
         if os.environ.get("VLLM_RESIDENT_DEFER_SETTLE", "1") != "0" and callable(
             getattr(client, "settle", None)
@@ -272,6 +339,7 @@ class VllmBackend:
         self._argmax_only = os.environ.get("VLLM_RESIDENT_ARGMAX_ONLY", "1") != "0"
         self._SamplingParams = SamplingParams
         self._delta = RequestOutputKind.DELTA
+        self._params_cache: dict[tuple[int, bool], object] = {}
         hf = self._engine.model_config.hf_config
         # PORT DRIFT (Muse Glimmer 30B): a composite config keeps vocab_size and
         # eos_token_id in its text sub-config, not at the top level. Read the
@@ -289,6 +357,7 @@ class VllmBackend:
         self.model_path = cfg.model_dir
         self._rid = 0
         self._live: str | None = None
+        self._settled = False
         self._warm_up()
         _shutdown_inductor_workers()
         if muse_sandwich is not None and (summary := muse_sandwich.launch_summary()):
@@ -310,6 +379,7 @@ class VllmBackend:
     WARMUP_ROUNDS = 3
     WARMUP_SEED_TOKENS = 512
     WARMUP_SEED_DECODE_STEPS = 4
+    _settled: bool = False
 
     def _warm_up(self) -> None:
         prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_PROMPT_TOKENS)]
@@ -321,23 +391,50 @@ class VllmBackend:
             for _ in range(self.WARMUP_DECODE_STEPS):
                 self.step()
             self.abort()
-        self.start(prompt[: self.WARMUP_SEED_TOKENS], top_logits=False)
-        for _ in range(self.WARMUP_SEED_DECODE_STEPS):
-            self.step()
-        self.abort()
+        for i in range(4):
+            emitted = self.start(prompt[: self.WARMUP_SEED_TOKENS], top_logits=False)
+            if i == 0:
+                for _ in range(self.WARMUP_SEED_DECODE_STEPS):
+                    emitted = self.step()
+                if self.depth == 0 and emitted:
+                    try:
+                        self.serial_run_fast(
+                            emitted[-1].token, self.WARMUP_SEED_DECODE_STEPS
+                        )
+                    except Exception:
+                        pass
+            self.abort()
+        # Warm the exact timed prefill shape (`max_tokens=1, argmax_only=True`)
+        # and post-reply `settle()` before reporting ready.
+        self.start(prompt[: self.WARMUP_SEED_TOKENS], max_tokens=1, top_logits=False)
+        self.settle()
+        if self._live is not None:
+            self.abort()
 
     def _params(self, prompt_len: int, max_tokens: int | None = None, top_logits: bool = True):
         room = max(1, self.ctx_size - prompt_len - self.depth - 1)
-        return self._SamplingParams(
+        eff_max = room if max_tokens is None else min(room, max_tokens)
+        want_top = bool(top_logits)
+        key = (eff_max, want_top)
+        cache = getattr(self, "_params_cache", None)
+        if cache is not None:
+            cached = cache.get(key)
+            if cached is not None:
+                return cached
+        sp = self._SamplingParams(
             temperature=0.0,
-            max_tokens=room if max_tokens is None else min(room, max_tokens),
+            max_tokens=eff_max,
             ignore_eos=True,
             # None, not 0: 0 still runs the logprobs path for the sampled
             # token. None leaves the sampler on its greedy path alone.
-            logprobs=TOP_K if top_logits else None,
+            logprobs=TOP_K if want_top else None,
             detokenize=False,
             output_kind=self._delta,
+            skip_clone=True,
         )
+        if cache is not None and len(cache) < 256:
+            cache[key] = sp
+        return sp
 
     def _collect(self) -> list[Emit]:
         emitted: list[Emit] = []
@@ -359,14 +456,33 @@ class VllmBackend:
     def start(
         self, tokens: list[int], max_tokens: int | None = None, top_logits: bool = True
     ) -> list[Emit]:
-        self.abort()
+        hf = getattr(self, "_hostfast", None)
+        if hf is not None:
+            try:
+                hf.gc_busy()
+                hf.set_tickle_phase(False)
+            except Exception:
+                pass
+        if self._live is not None or not self._settled:
+            self.abort()
+        if hf is not None:
+            try:
+                hf.gc_busy()
+            except Exception:
+                pass
         if len(tokens) + self.depth + 2 > self.ctx_size:
+            if hf is not None:
+                try:
+                    hf.gc_idle()
+                except Exception:
+                    pass
             raise RuntimeError(f"{len(tokens)} tokens do not fit the {self.ctx_size}-token context")
         self._rid += 1
         self._live = f"r{self._rid}"
+        self._settled = False
         self._engine.add_request(
             self._live,
-            {"prompt_token_ids": list(tokens)},
+            {"type": "token", "prompt_token_ids": tokens},
             self._params(len(tokens), max_tokens, top_logits or not self._argmax_only),
         )
         emitted: list[Emit] = []
@@ -379,12 +495,106 @@ class VllmBackend:
     def step(self) -> list[Emit]:
         if self._live is None:
             raise RuntimeError("step with no live request")
+        hf = getattr(self, "_hostfast", None)
+        if hf is not None:
+            try:
+                hf.set_tickle_phase(True)
+            except Exception:
+                pass
+        self._settled = False
         emitted: list[Emit] = []
         while not emitted:
             if not self._engine.has_unfinished_requests():
                 raise RuntimeError("the request reached the context limit")
             emitted = self._collect()
         return emitted
+
+    def _sync_live_after_fast(self, core) -> None:
+        try:
+            if self._live is not None and not core.scheduler.has_unfinished_requests():
+                op = getattr(self._engine, "output_processor", None)
+                if op is not None and hasattr(op, "abort_requests"):
+                    op.abort_requests([self._live], False)
+                self._live = None
+        except Exception:
+            pass
+
+    def serial_run_fast(self, token: int, count: int) -> list[int] | None:
+        if getattr(self, "depth", 0) != 0 or self._live is None or count < 1:
+            return None
+        runner = getattr(self, "_runner", None)
+        fn = getattr(runner, "run_serial_decode_steps", None)
+        if not callable(fn):
+            return None
+        core = getattr(self, "_core", None)
+        if core is None:
+            return None
+        hf = getattr(self, "_hostfast", None)
+        if hf is not None:
+            try:
+                hf.set_tickle_phase(True)
+            except Exception:
+                pass
+        try:
+            sched = core.scheduler
+            running = getattr(sched, "running", None)
+            if running is None or len(running) != 1 or getattr(sched, "waiting", None):
+                return None
+            req = running[0]
+            if req.request_id != self._live or req.is_finished():
+                return None
+            sp = req.sampling_params
+            if sp is None or sp.temperature != 0.0 or sp.logprobs is not None:
+                return None
+        except Exception:
+            return None
+
+        prefix: list[int] = []
+        bq = getattr(core, "batch_queue", None)
+        if bq:
+            core._pause_batch_queue = True
+            try:
+                while bq and len(prefix) < count:
+                    for e in self._collect():
+                        prefix.append(e.token)
+            except Exception:
+                if not prefix:
+                    return None
+                raise
+            finally:
+                core._pause_batch_queue = False
+            if bq:
+                return None
+            if prefix:
+                self._settled = False
+                token = prefix[-1]
+
+        rem = count - len(prefix)
+        if rem <= 0:
+            self._sync_live_after_fast(core)
+            return prefix[:count]
+
+        try:
+            fast_tokens = fn(int(token), int(rem))
+        except Exception as err:
+            _log(f"serial_run_fast fallback after runner error: {err}")
+            fast_tokens = None
+
+        if fast_tokens is not None:
+            if len(fast_tokens) != rem:
+                raise RuntimeError(
+                    f"run_serial_decode_steps returned {len(fast_tokens)} of {rem} tokens"
+                )
+            self._settled = False
+            self._sync_live_after_fast(core)
+            return (prefix + fast_tokens) if prefix else fast_tokens
+
+        if prefix:
+            for _ in range(rem):
+                for e in self.step():
+                    prefix.append(e.token)
+            return prefix
+        return None
 
     def abort(self) -> bool:
         running = False
@@ -398,16 +608,35 @@ class VllmBackend:
         if self._settle_core is not None:
             # Nothing is live now: the core may still own a deferred cleanup.
             self._settle_core()
+        hf = getattr(self, "_hostfast", None)
+        if hf is not None:
+            try:
+                hf.gc_idle()
+            except Exception:
+                pass
+        self._settled = True
         return running
 
     def settle(self) -> None:
         if self._settle_core is None:
             return
         self._settle_core()
-        if self._live is not None and not self._engine.has_unfinished_requests():
-            # The request completed on its own: do now, after the reply, what
-            # the next `start` would otherwise do first inside its window.
-            self.abort()
+        if self._live is not None:
+            if not self._engine.has_unfinished_requests():
+                # The request completed on its own: do now, after the reply, what
+                # the next `start` would otherwise do first inside its window.
+                self.abort()
+            else:
+                self._settled = False
+        if self._live is None:
+            self._settled = True
+            hf = getattr(self, "_hostfast", None)
+            if hf is not None:
+                try:
+                    gc.collect(1)
+                    hf.gc_idle()
+                except Exception:
+                    pass
 
     def close(self) -> None:
         self.abort()

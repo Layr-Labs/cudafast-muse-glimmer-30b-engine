@@ -32,45 +32,78 @@ logger = init_logger(__name__)
 
 ENABLED = os.environ.get("MUSE_DECODE_PLACEMENT", "1").strip() not in ("0", "", "false", "no")
 FULL_RAM_SCAN = os.environ.get("MUSE_FULL_RAM_SCAN", "1").strip() not in ("0", "", "false", "no")
+DIRECT_FAST_PACK = os.environ.get("MUSE_DIRECT_FAST_PACK", "1").strip() not in ("0", "", "false", "no")
 PLACE_SCALES6 = os.environ.get("MUSE_PLACE_SCALES6", "1").strip() not in ("0", "", "false", "no")
 SURPLUS = float(os.environ.get("MUSE_DECODE_PLACEMENT_SURPLUS", "3.0"))
-LM_HEAD_SPARES = int(os.environ.get("MUSE_LM_HEAD_SPARES", "24"))
-ROUNDS = 5
+LARGE_RANS_SURPLUS = float(os.environ.get("MUSE_LARGE_RANS_SURPLUS", "5.0"))
+LM_HEAD_SPARES = int(os.environ.get("MUSE_LM_HEAD_SPARES", "32"))
+ROUNDS = 6
+SCREEN_ROUNDS = max(1, int(os.environ.get("MUSE_PLACEMENT_SCREEN_ROUNDS", "2")))
+REFINE_ROUNDS = max(0, int(os.environ.get("MUSE_PLACEMENT_REFINE_ROUNDS", "4")))
+FULL_SCAN_SCREEN_ROUNDS = max(1, int(os.environ.get("MUSE_FULL_SCAN_SCREEN_ROUNDS", "2")))
+FULL_SCAN_REFINE_ROUNDS = max(0, int(os.environ.get("MUSE_FULL_SCAN_REFINE_ROUNDS", "4")))
 # Weights that fit in L2 several times over are not bandwidth-bound per call.
 MIN_PAYLOAD_BYTES = 48 << 20
 # Host memory that must stay available while the spares exist.
 HOST_HEADROOM_BYTES = 20 << 30
+KV_HEADROOM_BYTES = 16 << 30
 _NAME = "_marlin_decode_weight"
 _L2_FLUSH_INTS = 16 << 20  # 64 MiB (> 2.5x GB10's 24 MiB L2)
-# Quarantine below-median (slow) buffers from place_decode_weights through place_prefill_weights.
+# Quarantine below-median (slow) buffers from place_decode_weights through initialize_kv_cache.
 _SLOW_HOLD: list[torch.Tensor] = []
 PLACE_ATTN = os.environ.get("MUSE_PLACE_ATTN", "1").strip() not in ("0", "", "false", "no")
 PREFILL_PLACE_ATTN = os.environ.get("MUSE_PREFILL_PLACE_ATTN", "1").strip() not in ("0", "", "false", "no")
 ATTN_MIN_BYTES = 10 << 20
 ATTN_SURPLUS = float(os.environ.get("MUSE_ATTN_PLACEMENT_SURPLUS", "2.5"))
 
+KV_ENABLED = os.environ.get("MUSE_KV_PLACEMENT", "1").strip() not in ("0", "", "false", "no")
+KV_BLOCK_SORT_ENABLED = os.environ.get("MUSE_KV_BLOCK_SORT", "1").strip() not in ("0", "", "false", "no")
+KV_SURPLUS = float(os.environ.get("MUSE_KV_PLACEMENT_SURPLUS", "2.0"))
+KV_ROUNDS = 3
+KV_WINDOW_BYTES = 32 << 20
+_KV_BLOCK_RANKS: list[float] | None = None
 
-def _drop_model_page_cache() -> None:
-    """Release clean checkpoint file pages back to Linux free memory on unified-RAM hosts."""
+
+def drop_safetensors_shard(path: str | Path) -> bool:
+    """Drop clean Linux page cache for a single .safetensors file via posix_fadvise(DONTNEED)."""
     if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
-        return
-    model_dir = os.environ.get("RESIDENT_MODEL_DIR", "")
-    if not model_dir:
-        return
-    root = Path(model_dir)
-    if not root.is_dir():
+        return False
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            return True
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
+def _resolve_model_dir(model_dir: str | None = None) -> Path | None:
+    cand = model_dir or os.environ.get("RESIDENT_MODEL_DIR", "")
+    if not cand:
+        try:
+            from vllm.config import get_current_vllm_config
+
+            cfg = get_current_vllm_config()
+            cand = getattr(getattr(cfg, "model_config", None), "model", "") or ""
+        except Exception:
+            cand = ""
+    if not cand:
+        return None
+    root = Path(cand)
+    return root if root.is_dir() else None
+
+
+def _drop_model_page_cache(model_dir: str | None = None) -> None:
+    """Release clean checkpoint file pages back to Linux free memory on unified-RAM hosts."""
+    root = _resolve_model_dir(model_dir)
+    if root is None:
         return
     dropped = 0
     for path in root.glob("*.safetensors"):
-        try:
-            fd = os.open(str(path), os.O_RDONLY)
-            try:
-                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-                dropped += 1
-            finally:
-                os.close(fd)
-        except OSError:
-            pass
+        if drop_safetensors_shard(path):
+            dropped += 1
     if dropped:
         logger.info("Released page cache for %d safetensors shards via posix_fadvise(DONTNEED)", dropped)
 
@@ -126,7 +159,69 @@ def _ensure_spares_room(wanted: int, payload_bytes: int, hold_list: list, allow_
     return _spares_allowed(wanted, payload_bytes)
 
 
-def _time_candidates(decode_linear, layer, candidates, n: int, k: int, rounds: int, evict_buf: torch.Tensor) -> list[float]:
+def ensure_kv_cache_room(required_bytes: int) -> None:
+    """Release oldest quarantined slow buffers only if host RAM lacks room for KV cache."""
+    if not _SLOW_HOLD or required_bytes <= 0:
+        return
+    needed = max(1, required_bytes)
+    while _SLOW_HOLD:
+        available = _mem_available()
+        if available is None or available - KV_HEADROOM_BYTES >= needed:
+            break
+        del _SLOW_HOLD[: max(1, len(_SLOW_HOLD) // 4)]
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def release_slow_hold() -> None:
+    """Release quarantined slow buffers once KV cache allocation has finished."""
+    if not _SLOW_HOLD:
+        return
+    _SLOW_HOLD.clear()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def get_kv_block_ranks(num_blocks: int | None = None) -> list[float] | None:
+    """Return per-block read-latency ranks measured during KV cache allocation."""
+    ranks = _KV_BLOCK_RANKS
+    if ranks is None:
+        return None
+    if num_blocks is not None and len(ranks) != num_blocks:
+        return None
+    return ranks
+
+
+def _halving_keep_count(total: int, num_homes: int | None) -> int:
+    count = max(1, num_homes) if num_homes is not None else 1
+    spares = max(0, total - count)
+    min_keep = count + min(spares, max(1, min(count, spares // 2)))
+    return min(total, max(min_keep, math.ceil(0.35 * total)))
+
+
+def _partition_candidates(times: list[float], count: int) -> tuple[float, list[int], list[int]]:
+    """Split candidates into slow threshold, above-count fast spares, and below-count movers."""
+    slow_cut = median(times)
+    ranked = sorted(range(len(times)), key=times.__getitem__)
+    kept = set(ranked[:count])
+    free_fast = [index for index in ranked[:count] if index >= count]
+    movers = sorted((index for index in range(count) if index not in kept), key=times.__getitem__, reverse=True)
+    return slow_cut, free_fast, movers
+
+
+def _time_candidates(
+    decode_linear,
+    layer,
+    candidates,
+    n: int,
+    k: int,
+    rounds: int,
+    evict_buf: torch.Tensor,
+    *,
+    num_homes: int | None = None,
+    screen_rounds: int | None = None,
+    refine_rounds: int | None = None,
+) -> list[float]:
     """Median GEMV time (ms) of the tiled decode kernel on each candidate buffer."""
     device = candidates[0].device
     # A fixed finite row; the kernel's timing does not depend on values.
@@ -149,35 +244,89 @@ def _time_candidates(decode_linear, layer, candidates, n: int, k: int, rounds: i
         scales = layer._marlin_decode_scales
         def run_one(buf):
             decode_linear(x, buf, scales, global_scale, workspace, n, k)
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    run_one(candidates[0])
-    _flush_l2(evict_buf)
-    torch.cuda.synchronize(device)
-    samples: list[list[float]] = [[] for _ in candidates]
-    order = list(range(len(candidates)))
-    shuffler = random.Random(20261122)
-    for _ in range(rounds):
-        shuffler.shuffle(order)
-        for index in order:
-            start.record()
-            run_one(candidates[index])
-            end.record()
-            end.synchronize()
-            samples[index].append(start.elapsed_time(end))
-    return [median(values) for values in samples]
+    return _time_calls(
+        run_one,
+        candidates,
+        rounds,
+        evict_buf,
+        num_homes=num_homes,
+        screen_rounds=screen_rounds,
+        refine_rounds=refine_rounds,
+    )
+
+
+class _FastSlabPacker:
+    """Bump-allocates 4 KiB-aligned contiguous slices from ranked 127 MiB fast DRAM slabs, fastest first."""
+
+    def __init__(self, slabs: list[torch.Tensor]) -> None:
+        self._slabs = [s.reshape(-1).view(torch.uint8) for s in slabs]
+        self._idx = 0
+        self._off = 0
+        self.used_slabs = 0
+
+    def alloc_u8(
+        self, nbytes: int, align: int = 4096, *, cap_bytes: int | None = None
+    ) -> torch.Tensor | None:
+        if nbytes <= 0:
+            return None
+        cap = nbytes if cap_bytes is None else max(nbytes, cap_bytes)
+        while self._idx < len(self._slabs):
+            slab = self._slabs[self._idx]
+            pad = (-(slab.data_ptr() + self._off)) & (align - 1) if align > 1 else 0
+            off = self._off + pad
+            if off + cap <= slab.numel():
+                self._off = off + cap
+                self.used_slabs = self._idx + 1
+                sub = torch.empty((0,), dtype=torch.uint8, device=slab.device).set_(
+                    slab.untyped_storage(), slab.storage_offset() + off, (cap,), (1,)
+                )
+                return sub if cap == nbytes else sub[:nbytes]
+            self._idx += 1
+            self._off = 0
+        return None
+
+    def alloc_like(
+        self, src: torch.Tensor, align: int = 4096, *, cap_bytes: int | None = None
+    ) -> torch.Tensor | None:
+        nbytes = src.numel() * src.element_size()
+        raw = self.alloc_u8(nbytes, align=align, cap_bytes=cap_bytes)
+        if raw is None:
+            return None
+        if src.dtype == torch.uint8:
+            return raw.view(src.shape)
+        return raw.view(src.dtype).view(src.shape)
+
+    def release_unused(self) -> None:
+        if self.used_slabs < len(self._slabs):
+            del self._slabs[self.used_slabs :]
+
+
+def _relocate_scales6_ptr(m6_mod, old_ptr: int, new_ptr: int) -> None:
+    if m6_mod is None or old_ptr == new_ptr:
+        return
+    if hasattr(m6_mod, "relocate_scale_ptr"):
+        m6_mod.relocate_scale_ptr(old_ptr, new_ptr)
+    for attr in (
+        "_DOWN_ILV_SCALES",
+        "_LM_SPLIT2_SCALES",
+        "_GATE_UP_SPLIT2_SCALES",
+        "_DOWN_SPLIT2_SCALES",
+    ):
+        pset = getattr(m6_mod, attr, None)
+        if pset is not None and old_ptr in pset:
+            pset.discard(old_ptr)
+            pset.add(new_ptr)
 
 
 def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor) -> dict | None:
     """Scan available host RAM in 127 MiB blocks (~4s), place gate_up into the fastest 45,
-    seed PyTorch's caching allocator with the next ~24 GiB of fastest blocks, and quarantine
-    the slowest ~44 GiB in _SLOW_HOLD so all subsequent decode & prefill groups draw only
-    from the fast physical DRAM band."""
+    return the next fastest ranked slabs in exact speed order for direct fast-slab packing,
+    and quarantine the slowest slabs in _SLOW_HOLD."""
     homes = [layer._buffers[_NAME] for layer in layers]
     count = len(homes)
     payload_bytes = homes[0].numel() * homes[0].element_size()
     spares_count = _spares_allowed(600, payload_bytes)
-    if spares_count < count * 4:
+    if spares_count < count * 3:
         return None
     spares = []
     try:
@@ -187,11 +336,23 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
             spares.append(spare)
     except RuntimeError:
         pass
-    if len(spares) < count * 4:
+    num_spares = len(spares)
+    if num_spares < count * 3:
         spares.clear()
         return None
     candidates = homes + spares
-    times = _time_candidates(decode_linear, layers[0], candidates, n, k, 3, evict_buf)
+    times = _time_candidates(
+        decode_linear,
+        layers[0],
+        candidates,
+        n,
+        k,
+        FULL_SCAN_SCREEN_ROUNDS + FULL_SCAN_REFINE_ROUNDS,
+        evict_buf,
+        num_homes=count,
+        screen_rounds=FULL_SCAN_SCREEN_ROUNDS,
+        refine_rounds=FULL_SCAN_REFINE_ROUNDS,
+    )
     ranked = sorted(range(len(candidates)), key=times.__getitem__)
     kept = set(ranked[:count])
     free_fast = [index for index in ranked[:count] if index >= count]
@@ -210,25 +371,33 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
         displaced_homes.append((times[home_index], source))
         after[home_index] = times[target_index]
         moved += 1
-    # Partition all unused candidates (spares + displaced homes) by measured speed:
-    # release the fastest ~24 GiB (190 blocks) to PyTorch's caching allocator (no empty_cache),
-    # quarantine up to ~22 GiB (175 slowest blocks) in _SLOW_HOLD, and release any middle overflow.
     unused = [(times[count + i], spare) for i, spare in enumerate(spares) if (count + i) not in used_targets]
     unused.extend(displaced_homes)
+    spares.clear()
+    candidates.clear()
+    homes.clear()
+    displaced_homes.clear()
+    spare = target = source = None
     unused.sort(key=lambda pair: pair[0])
-    fast_keep = min(len(unused), max(180, int(len(unused) * 0.42)))
-    slow_tail = unused[fast_keep:]
-    if len(slow_tail) > 175:
-        slow_tail = slow_tail[-175:]
-    for _, slow_buf in slow_tail:
-        _SLOW_HOLD.append(slow_buf)
-    del unused, slow_tail
+    fast_keep = min(len(unused), max(140 if DIRECT_FAST_PACK else 180, int(len(unused) * 0.42)))
+    fast_hold = [buf for _, buf in unused[:fast_keep]]
+    mid_and_slow = unused[fast_keep:]
+    slow_tail = mid_and_slow[-140:] if len(mid_and_slow) > 140 else mid_and_slow
+    _SLOW_HOLD.extend(slow_buf for _, slow_buf in slow_tail)
+    del unused, mid_and_slow, slow_tail
+    if DIRECT_FAST_PACK:
+        fast_slabs = fast_hold
+    else:
+        torch.cuda.empty_cache()
+        del fast_hold
+        fast_slabs = []
     before = sorted(times[:count])
     after.sort()
     return {
-        "count": count, "spares": len(spares), "moved": moved, "payload_bytes": payload_bytes,
+        "count": count, "spares": num_spares, "moved": moved, "payload_bytes": payload_bytes,
         "before": (before[0], median(before), before[-1], sum(before)),
         "after": (after[0], median(after), after[-1], sum(after)),
+        "fast_slabs": fast_slabs,
     }
 
 
@@ -253,15 +422,22 @@ def _place_group(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor,
     if not spares:
         return None
     candidates = homes + spares
-    times = _time_candidates(decode_linear, layers[0], candidates, n, k, ROUNDS, evict_buf)
-    ranked = sorted(range(len(candidates)), key=times.__getitem__)
-    kept = set(ranked[:count])
-    free_fast = [index for index in ranked[:count] if index >= count]
-    movers = sorted((index for index in range(count) if index not in kept), key=times.__getitem__, reverse=True)
+    times = _time_candidates(
+        decode_linear,
+        layers[0],
+        candidates,
+        n,
+        k,
+        ROUNDS,
+        evict_buf,
+        num_homes=count,
+        screen_rounds=SCREEN_ROUNDS,
+        refine_rounds=REFINE_ROUNDS,
+    )
+    slow_cut, free_fast, movers = _partition_candidates(times, count)
     moved = 0
     after = list(times[:count])
     used_targets = set()
-    slow_cut = median(times)
     for home_index, target_index in zip(movers, free_fast):
         target, source = candidates[target_index], homes[home_index]
         target.copy_(source)
@@ -289,12 +465,20 @@ def _place_group(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor,
     }
 
 
-def _place_muserans_group(rans_ext, layers, n: int, k: int, evict_buf: torch.Tensor, rejected_hold: list) -> dict | None:
+def _place_muserans_group(
+    rans_ext,
+    layers,
+    n: int,
+    k: int,
+    evict_buf: torch.Tensor,
+    rejected_hold: list,
+    surplus_override: float | None = None,
+) -> dict | None:
     homes = [layer._buffers["muse_fp8_packed"] for layer in layers]
     count = len(homes)
     max_bytes = max(h.numel() for h in homes)
     is_small = max_bytes < MIN_PAYLOAD_BYTES
-    surplus = ATTN_SURPLUS if is_small else SURPLUS
+    surplus = surplus_override if surplus_override is not None else (ATTN_SURPLUS if is_small else SURPLUS)
     wanted = max(1, math.ceil(count * surplus)) if surplus > 0 else 0
     spares_count = _ensure_spares_room(wanted, max_bytes, rejected_hold, allow_slow_trim=not is_small)
     if spares_count <= 0 or (is_small and spares_count < count):
@@ -329,7 +513,15 @@ def _place_muserans_group(rans_ext, layers, n: int, k: int, evict_buf: torch.Ten
 
     cand_views = [h[:ref_len] for h in homes] + [s[:ref_len] for s in spares]
     try:
-        times = _time_calls(run_cand, cand_views, ROUNDS, evict_buf)
+        times = _time_calls(
+            run_cand,
+            cand_views,
+            ROUNDS,
+            evict_buf,
+            num_homes=count,
+            screen_rounds=SCREEN_ROUNDS,
+            refine_rounds=REFINE_ROUNDS,
+        )
     except Exception:
         for h, sh in zip(homes, saved_host):
             h.copy_(sh, non_blocking=False)
@@ -422,7 +614,15 @@ def _place_bf16_rans_group(bf16_lib, layers, n: int, k: int, evict_buf: torch.Te
     cand_views = [h[:ref_len] for h in homes] + [s[:ref_len] for s in spares]
     try:
         with torch.cuda.device(device):
-            times = _time_calls(run_cand, cand_views, ROUNDS, evict_buf)
+            times = _time_calls(
+                run_cand,
+                cand_views,
+                ROUNDS,
+                evict_buf,
+                num_homes=count,
+                screen_rounds=SCREEN_ROUNDS,
+                refine_rounds=REFINE_ROUNDS,
+            )
     except Exception:
         for h, sh in zip(homes, saved_host):
             h.copy_(sh, non_blocking=False)
@@ -475,33 +675,270 @@ def _place_bf16_rans_group(bf16_lib, layers, n: int, k: int, evict_buf: torch.Te
 
 
 # --------------------------------------------------------------------------- #
+# KV cache placement & block_id latency ranking
+# --------------------------------------------------------------------------- #
+def _stream_read_sum(buf: torch.Tensor) -> torch.Tensor:
+    if buf.is_contiguous() and buf.data_ptr() % 8 == 0 and (buf.numel() * buf.element_size()) % 8 == 0:
+        return buf.view(torch.int64).sum()
+    return buf.sum()
+
+
+def _probe_kv_block_ranks(
+    unique_tensors: list[torch.Tensor],
+    num_blocks: int,
+    evict_buf: torch.Tensor,
+) -> list[float] | None:
+    """Measure read latency across ~32 MiB block_id windows spanning all KV tensors."""
+    if not KV_BLOCK_SORT_ENABLED or num_blocks <= 2 or not unique_tensors:
+        return None
+    if not all(
+        t.is_cuda
+        and t.dim() == 1
+        and t.is_contiguous()
+        and t.numel() >= num_blocks
+        and t.numel() % num_blocks == 0
+        for t in unique_tensors
+    ):
+        return None
+    tensor_strides = [(t, t.numel() // num_blocks) for t in unique_tensors]
+    sum_stride = sum(st for _, st in tensor_strides)
+    if sum_stride <= 0:
+        return None
+    win_blocks = max(1, min(num_blocks - 1, round(KV_WINDOW_BYTES / sum_stride)))
+    windows = [
+        (b0, min(b0 + win_blocks, num_blocks))
+        for b0 in range(1, num_blocks, win_blocks)
+    ]
+    if len(windows) <= 1:
+        return None
+
+    device = unique_tensors[0].device
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    w0_b0, w0_b1 = windows[0]
+    for t, st in tensor_strides:
+        _stream_read_sum(t[w0_b0 * st : w0_b1 * st])
+    _flush_l2(evict_buf)
+    torch.cuda.synchronize(device)
+
+    samples: list[list[float]] = [[] for _ in windows]
+    order = list(range(len(windows)))
+    shuffler = random.Random(20261122)
+    for _ in range(KV_ROUNDS):
+        shuffler.shuffle(order)
+        for w_idx in order:
+            b0, b1 = windows[w_idx]
+            start.record()
+            for t, st in tensor_strides:
+                _stream_read_sum(t[b0 * st : b1 * st])
+            end.record()
+            end.synchronize()
+            samples[w_idx].append(start.elapsed_time(end))
+
+    ranks = [0.0] * num_blocks
+    per_block_rates: list[float] = []
+    for (b0, b1), vals in zip(windows, samples):
+        rate = median(vals) / (b1 - b0)
+        per_block_rates.append(rate)
+        for blk in range(b0, b1):
+            ranks[blk] = rate
+    per_block_rates.sort()
+    logger.info(
+        "KV block probe: %d blocks in %d windows (%d blocks/win, %.1f MiB/win); "
+        "ms/block min/median/max %.5f/%.5f/%.5f",
+        num_blocks,
+        len(windows),
+        win_blocks,
+        win_blocks * sum_stride / (1 << 20),
+        per_block_rates[0],
+        median(per_block_rates),
+        per_block_rates[-1],
+    )
+    return ranks
+
+
+def place_kv_cache_tensors(
+    raw_tensors: dict[str, torch.Tensor],
+    num_blocks: int,
+) -> dict[str, torch.Tensor]:
+    """Swap slow KV backing buffers with faster zeroed spares and rank block_ids; never raises."""
+    global _KV_BLOCK_RANKS
+    _KV_BLOCK_RANKS = None
+    if (not KV_ENABLED and not KV_BLOCK_SORT_ENABLED) or not torch.cuda.is_available() or not raw_tensors:
+        return raw_tensors
+
+    began = time.perf_counter()
+    try:
+        unique_by_ptr: dict[int, torch.Tensor] = {}
+        for t in raw_tensors.values():
+            if t.is_cuda:
+                unique_by_ptr.setdefault(t.data_ptr(), t)
+        unique_tensors = list(unique_by_ptr.values())
+        if not unique_tensors:
+            return raw_tensors
+        total_bytes = sum(t.numel() * t.element_size() for t in unique_tensors)
+        if total_bytes < MIN_PAYLOAD_BYTES:
+            return raw_tensors
+
+        evict_buf = torch.empty(
+            (_L2_FLUSH_INTS,), dtype=torch.int32, device=unique_tensors[0].device
+        )
+        replacements: dict[int, torch.Tensor] = {}
+        moved_total = 0
+
+        if KV_ENABLED and KV_SURPLUS > 0:
+            groups: dict[tuple, list[torch.Tensor]] = {}
+            for t in unique_tensors:
+                groups.setdefault((t.numel(), t.dtype, t.device), []).append(t)
+
+            for (numel, dtype, device), homes in groups.items():
+                payload_bytes = numel * homes[0].element_size()
+                batch_sz = min(len(homes), 13)
+                for offset in range(0, len(homes), batch_sz):
+                    batch = homes[offset : offset + batch_sz]
+                    wanted = (
+                        max(2, math.ceil(KV_SURPLUS))
+                        if len(batch) == 1
+                        else math.ceil(len(batch) * KV_SURPLUS)
+                    )
+                    spares_count = _spares_allowed(wanted, payload_bytes)
+                    if spares_count <= 0:
+                        continue
+                    spares: list[torch.Tensor] = []
+                    try:
+                        for _ in range(spares_count):
+                            spares.append(torch.zeros_like(batch[0]))
+                    except RuntimeError:
+                        pass
+                    if not spares:
+                        continue
+                    candidates = batch + spares
+                    times = _time_calls(
+                        _stream_read_sum,
+                        candidates,
+                        KV_ROUNDS,
+                        evict_buf,
+                        num_homes=len(batch),
+                        screen_rounds=KV_ROUNDS,
+                        refine_rounds=0,
+                    )
+                    slow_cut, free_fast, movers = _partition_candidates(times, len(batch))
+                    used_targets = set()
+                    for home_idx, target_idx in zip(movers, free_fast):
+                        source = batch[home_idx]
+                        target = candidates[target_idx]
+                        if target.shape != source.shape or target.dtype != source.dtype:
+                            continue
+                        replacements[id(source)] = target
+                        used_targets.add(target_idx)
+                        if times[home_idx] > slow_cut and _spares_allowed(1, payload_bytes) > 0:
+                            _SLOW_HOLD.append(source)
+                        moved_total += 1
+                    for i, spare in enumerate(spares):
+                        idx = len(batch) + i
+                        if idx not in used_targets and times[idx] > slow_cut and _spares_allowed(1, payload_bytes) > 0:
+                            _SLOW_HOLD.append(spare)
+                    del spares
+                    torch.cuda.empty_cache()
+
+        if replacements:
+            raw_tensors = {
+                ln: replacements.get(id(t), t) for ln, t in raw_tensors.items()
+            }
+
+        final_by_ptr: dict[int, torch.Tensor] = {}
+        for t in raw_tensors.values():
+            if t.is_cuda:
+                final_by_ptr.setdefault(t.data_ptr(), t)
+        final_tensors = list(final_by_ptr.values())
+
+        _KV_BLOCK_RANKS = _probe_kv_block_ranks(final_tensors, num_blocks, evict_buf)
+        logger.info(
+            "KV cache placement: %d tensors (%.0f MiB), %d swapped, sorted=%s, %.2f s",
+            len(final_tensors),
+            total_bytes / (1 << 20),
+            moved_total,
+            _KV_BLOCK_RANKS is not None,
+            time.perf_counter() - began,
+        )
+    except Exception as err:  # noqa: BLE001 - placement never blocks KV init
+        logger.warning("KV cache placement skipped: %s", err)
+    return raw_tensors
+
+
+# --------------------------------------------------------------------------- #
 # Prompt-sized (prefill) weights
 # --------------------------------------------------------------------------- #
 PREFILL_ENABLED = os.environ.get("MUSE_PREFILL_PLACEMENT", "1").strip() not in ("0", "", "false", "no")
 PREFILL_SURPLUS = float(os.environ.get("MUSE_PREFILL_PLACEMENT_SURPLUS", "2.0"))
-PREFILL_ROUNDS = 4
+PREFILL_ROUNDS = 5
+PREFILL_PASSES = int(os.environ.get("MUSE_PREFILL_PLACEMENT_PASSES", "1"))
+DECODE_DOWN_PASSES = int(os.environ.get("MUSE_DECODE_DOWN_PASSES", "2"))
 
 
-def _time_calls(run, candidates, rounds: int, evict_buf: torch.Tensor | None = None) -> list[float]:
-    """Median time (ms) of run(candidate) per candidate, in shuffled rounds."""
+def _time_calls(
+    run,
+    candidates,
+    rounds: int,
+    evict_buf: torch.Tensor | None = None,
+    *,
+    num_homes: int | None = None,
+    screen_rounds: int | None = None,
+    refine_rounds: int | None = None,
+) -> list[float]:
+    """Median time (ms) of run(candidate) per candidate, with optional two-stage successive halving."""
+    total = len(candidates)
+    if total == 0:
+        return []
     device = candidates[0].device
+    payload_bytes = candidates[0].numel() * candidates[0].element_size()
+    total_bytes = sum(c.numel() * c.element_size() for c in candidates)
+    flush_per_cand = evict_buf is not None and payload_bytes < (32 << 20) and total_bytes < (48 << 20)
+    flush_per_round = evict_buf is not None and payload_bytes < (32 << 20) and not flush_per_cand
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     run(candidates[0])
     if evict_buf is not None:
         _flush_l2(evict_buf)
     torch.cuda.synchronize(device)
-    samples: list[list[float]] = [[] for _ in candidates]
-    order = list(range(len(candidates)))
+
+    samples: list[list[float]] = [[] for _ in range(total)]
     shuffler = random.Random(20261122)
-    for _ in range(rounds):
-        shuffler.shuffle(order)
-        for index in order:
-            start.record()
-            run(candidates[index])
-            end.record()
-            end.synchronize()
-            samples[index].append(start.elapsed_time(end))
+
+    if screen_rounds is not None and refine_rounds is not None and refine_rounds > 0:
+        scr = max(1, screen_rounds)
+        ref = max(0, refine_rounds)
+    else:
+        scr = max(1, rounds)
+        ref = 0
+
+    def _run_stage(indices: list[int], n_rounds: int, first_stage: bool) -> None:
+        order = list(indices)
+        stage_bytes = payload_bytes * len(order)
+        stage_flush_cand = evict_buf is not None and payload_bytes < (32 << 20) and stage_bytes < (48 << 20)
+        stage_flush_round = evict_buf is not None and payload_bytes < (32 << 20) and not stage_flush_cand
+        for r_idx in range(n_rounds):
+            if (not first_stage or r_idx > 0) and (flush_per_round or stage_flush_round):
+                _flush_l2(evict_buf)
+            shuffler.shuffle(order)
+            for step_idx, index in enumerate(order):
+                if (flush_per_cand or stage_flush_cand) and (not first_stage or r_idx > 0 or step_idx > 0):
+                    _flush_l2(evict_buf)
+                start.record()
+                run(candidates[index])
+                end.record()
+                end.synchronize()
+                samples[index].append(start.elapsed_time(end))
+
+    _run_stage(list(range(total)), scr, True)
+    if ref > 0:
+        keep = _halving_keep_count(total, num_homes)
+        if keep < total:
+            stage1 = [median(values) for values in samples]
+            finalists = sorted(range(total), key=stage1.__getitem__)[:keep]
+        else:
+            finalists = list(range(total))
+        _run_stage(finalists, ref, False)
     return [median(values) for values in samples]
 
 
@@ -739,9 +1176,18 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             sa = ref.input_scale if getattr(ref, "input_scale", None) is not None else torch.ones((1,), dtype=torch.float32, device=dev)
             sb = ref.weight_scale
             cfg_dn = _fp8pf.config(6656, 19968) or 1
+            use_ws_dn = (
+                _fp8ws is not None
+                and _fp8ws.ready(dev)
+                and os.environ.get("FP8WS", "1") != "0"
+                and (6656, 19968) in getattr(_fp8ws, "SHAPES", ())
+            )
 
-            def run_fp8_down(weight, x=x, sa=sa, sb=sb, cfg_dn=cfg_dn):
-                _fp8pf.gemm(x, weight, sa, sb, cfg_dn)
+            def run_fp8_down(weight, x=x, sa=sa, sb=sb, cfg_dn=cfg_dn, use_ws_dn=use_ws_dn):
+                if use_ws_dn:
+                    _fp8ws.gemm(x, weight, sa, sb)
+                else:
+                    _fp8pf.gemm(x, weight, sa, sb, cfg_dn)
 
             groups.append(("fp8_6656x19968", fp8_down_layers, run_fp8_down, _gfp8.prefill_moved, False))
         if len(fp8_swiglu_layers) > 1:
@@ -791,9 +1237,18 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             sa = ref.input_scale if getattr(ref, "input_scale", None) is not None else torch.ones((1,), dtype=torch.float32, device=dev)
             sb = ref.weight_scale
             cfg_o = _fp8pf.config(6656, 4096) or 3
+            use_ws_o = (
+                _fp8ws is not None
+                and _fp8ws.ready(dev)
+                and os.environ.get("FP8WS", "1") != "0"
+                and (6656, 4096) in getattr(_fp8ws, "SHAPES", ())
+            )
 
-            def run_fp8_o(weight, x=x, sa=sa, sb=sb, cfg_o=cfg_o):
-                _fp8pf.gemm(x, weight, sa, sb, cfg_o)
+            def run_fp8_o(weight, x=x, sa=sa, sb=sb, cfg_o=cfg_o, use_ws_o=use_ws_o):
+                if use_ws_o:
+                    _fp8ws.gemm(x, weight, sa, sb)
+                else:
+                    _fp8pf.gemm(x, weight, sa, sb, cfg_o)
 
             groups.append(("fp8_attn_6656x4096", fp8_attn_o, run_fp8_o, _gfp8.prefill_moved, False))
         if PREFILL_PLACE_ATTN and _fp8ws is not None and _fp8ws.ready(torch.device("cuda")):
@@ -823,7 +1278,7 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
                     dev = ref.weight.device
                     x = ((torch.arange(512 * gk, device=dev) % 11).float() - 5.0).mul(0.07).to(torch.bfloat16).reshape(512, gk).contiguous()
                     if (
-                        (gn, gk) in ((4608, 6656), (6656, 4096))
+                        (gn, gk) in ((4608, 6656), (4096, 6656), (6656, 4096))
                         and _route is not None
                         and _route.marlinw_down128 is not None
                         and all(l.weight.data_ptr() in _route._attn128_weights for l in glayers)
@@ -846,6 +1301,21 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
                 else:
                     buf_name = None
                 stats = _place_prefill_group(layers, run, on_move, evict_buf, rejected_hold, buf_name=buf_name)
+                if (
+                    stats is not None
+                    and PREFILL_PASSES >= 2
+                    and name in ("39936x6656", "6656x19968", "fp8_6656x19968")
+                    and (stats["before"][3] - stats["after"][3]) >= 0.05
+                ):
+                    for _pass in range(1, PREFILL_PASSES):
+                        stats2 = _place_prefill_group(layers, run, on_move, evict_buf, rejected_hold, buf_name=buf_name)
+                        if stats2 is None:
+                            break
+                        gain2 = stats2["before"][3] - stats2["after"][3]
+                        stats["moved"] += stats2["moved"]
+                        stats["after"] = stats2["after"]
+                        if gain2 < 0.05:
+                            break
             except Exception as err:  # noqa: BLE001 - this group stays where it was
                 logger.warning("Prefill weight placement skipped for %s: %s", name, err)
                 continue
@@ -867,13 +1337,13 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
     except Exception as err:  # noqa: BLE001 - the load must go on
         logger.warning("Prefill weight placement failed and was skipped: %s", err)
     finally:
+        # Keep _SLOW_HOLD quarantined until gpu_worker calls release_slow_hold() after initialize_kv_cache().
         rejected_hold.clear()
-        _SLOW_HOLD.clear()
-        torch.cuda.empty_cache()
 
 
 def place_decode_weights(model: torch.nn.Module) -> None:
     """Move decode weights that landed on slow device memory; never raises."""
+    global _KV_BLOCK_RANKS
     if not ENABLED or not torch.cuda.is_available():
         return
     try:
@@ -882,6 +1352,7 @@ def place_decode_weights(model: torch.nn.Module) -> None:
         return
     began = time.perf_counter()
     _SLOW_HOLD.clear()
+    _KV_BLOCK_RANKS = None
     rejected_hold: list[torch.Tensor] = []
     try:
         _drop_model_page_cache()
@@ -953,41 +1424,266 @@ def place_decode_weights(model: torch.nn.Module) -> None:
         )
         deferred_single = [(k, v) for k, v in ordered_groups if len(v) == 1]
         multi_nvfp4 = [(k, v) for k, v in ordered_groups if len(v) > 1]
+        packer: _FastSlabPacker | None = None
+        packed_groups: set[tuple[str, int, int]] = set()
         for (n, k, *_), layers in multi_nvfp4:
+            if ("nvfp4", n, k) in packed_groups:
+                continue
             try:
                 stats = None
                 if FULL_RAM_SCAN and (n, k) == (39936, 6656) and len(layers) >= 32:
                     stats = _place_group_full_ram_scan(decode_linear, layers, n, k, evict_buf)
-                    if stats is not None and PLACE_SCALES6:
-                        try:
-                            import muse_marlin6_gemv as _m6
-                            ilv_set = getattr(_m6, "_DOWN_ILV_SCALES", None)
-                        except (ImportError, OSError):
-                            ilv_set = None
-                        moved_s6, bytes_s6 = 0, 0
-                        for m in model.modules():
-                            s6 = m._buffers.get("_marlin_decode_scales6")
-                            if s6 is not None and s6.is_cuda and s6.numel() * s6.element_size() >= (64 << 10):
+                    if stats is not None:
+                        fast_slabs = stats.pop("fast_slabs", [])
+                        if fast_slabs:
+                            packer = _FastSlabPacker(fast_slabs)
+                            # Pack all remaining <= 127 MiB decode weights directly into the top ranked
+                            # fast slabs in descending decode-impact order, before releasing unused slabs.
+                            p_moved, p_bytes = 0, 0
+                            # 1) NVFP4 multi-layer groups (e.g. 6656x19968 down: 40 x 63 MiB -> 20 slabs)
+                            for (gn, gk, *_), glayers in multi_nvfp4:
+                                if (gn, gk) == (39936, 6656):
+                                    continue
+                                ok_all = True
+                                for gl in glayers:
+                                    src = gl._buffers[_NAME]
+                                    dst = packer.alloc_like(src)
+                                    if dst is None:
+                                        ok_all = False
+                                        break
+                                    dst.copy_(src)
+                                    if torch.equal(dst, src):
+                                        gl._buffers[_NAME] = dst
+                                        p_moved += 1
+                                        p_bytes += dst.numel() * dst.element_size()
+                                    else:
+                                        ok_all = False
+                                if ok_all:
+                                    packed_groups.add(("nvfp4", gn, gk))
+                            # 2) FP8 rANS <= 127 MiB (6656x19968 down: 12 x ~105 MiB -> 12 slabs)
+                            for (gn, gk), glayers in sorted(
+                                rans_groups.items(),
+                                key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_fp8_packed"].numel() for l in kv[1])),
+                            ):
+                                max_b = max(l._buffers["muse_fp8_packed"].numel() for l in glayers)
+                                if max_b > (128 << 20):
+                                    continue
+                                ok_all = True
+                                for gl in glayers:
+                                    src = gl._buffers["muse_fp8_packed"]
+                                    dst = packer.alloc_u8(src.numel())
+                                    if dst is None:
+                                        ok_all = False
+                                        break
+                                    dst.copy_(src)
+                                    if torch.equal(dst, src):
+                                        old = src.data
+                                        src.data = dst
+                                        if src.data_ptr() != dst.data_ptr():
+                                            src.data = old
+                                            ok_all = False
+                                        else:
+                                            p_moved += 1
+                                            p_bytes += dst.numel()
+                                    else:
+                                        ok_all = False
+                                if ok_all:
+                                    packed_groups.add(("rans", gn, gk))
+                            # 3) FP8 rANS attention (98 x ~23 MiB -> 19 slabs)
+                            if PLACE_ATTN:
+                                for (gn, gk), glayers in sorted(
+                                    attn_rans_groups.items(),
+                                    key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_fp8_packed"].numel() for l in kv[1])),
+                                ):
+                                    ok_all = True
+                                    for gl in glayers:
+                                        src = gl._buffers["muse_fp8_packed"]
+                                        dst = packer.alloc_u8(src.numel())
+                                        if dst is None:
+                                            ok_all = False
+                                            break
+                                        dst.copy_(src)
+                                        if torch.equal(dst, src):
+                                            old = src.data
+                                            src.data = dst
+                                            if src.data_ptr() != dst.data_ptr():
+                                                src.data = old
+                                                ok_all = False
+                                            else:
+                                                p_moved += 1
+                                                p_bytes += dst.numel()
+                                        else:
+                                            ok_all = False
+                                    if ok_all:
+                                        packed_groups.add(("attn_rans", gn, gk))
+                                # 4) BF16 rANS attention (12 x ~37 MiB -> 4 slabs)
+                                for (gn, gk), glayers in sorted(
+                                    attn_bf16_groups.items(),
+                                    key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_bf16_lane_weight"].numel() for l in kv[1])),
+                                ):
+                                    ok_all = True
+                                    for gl in glayers:
+                                        src = gl._buffers["muse_bf16_lane_weight"]
+                                        dst = packer.alloc_u8(src.numel())
+                                        if dst is None:
+                                            ok_all = False
+                                            break
+                                        dst.copy_(src)
+                                        if torch.equal(dst, src):
+                                            old = src.data
+                                            src.data = dst
+                                            if src.data_ptr() != dst.data_ptr():
+                                                src.data = old
+                                                ok_all = False
+                                            else:
+                                                p_moved += 1
+                                                p_bytes += dst.numel()
+                                        else:
+                                            ok_all = False
+                                    if ok_all:
+                                        packed_groups.add(("attn_bf16", gn, gk))
+                                # 5) NVFP4 attention (46 x ~14 MiB -> 6 slabs)
+                                for (gn, gk, *_), glayers in sorted(
+                                    attn_nvfp4_groups.items(),
+                                    key=lambda kv: -(len(kv[1]) * kv[1][0]._buffers[_NAME].numel()),
+                                ):
+                                    ok_all = True
+                                    for gl in glayers:
+                                        src = gl._buffers[_NAME]
+                                        dst = packer.alloc_like(src)
+                                        if dst is None:
+                                            ok_all = False
+                                            break
+                                        dst.copy_(src)
+                                        if torch.equal(dst, src):
+                                            gl._buffers[_NAME] = dst
+                                            p_moved += 1
+                                            p_bytes += dst.numel() * dst.element_size()
+                                        else:
+                                            ok_all = False
+                                    if ok_all:
+                                        packed_groups.add(("attn_nvfp4", gn, gk))
+                            # 6) scales6 / TMA4 scale + palette buffers (all NVFP4 layers incl. gate_up & lm_head)
+                            if PLACE_SCALES6:
                                 try:
-                                    old_ptr = s6.data_ptr()
-                                    dst = torch.empty_like(s6)
-                                    dst.copy_(s6)
-                                    if torch.equal(dst, s6):
-                                        m._buffers["_marlin_decode_scales6"] = dst
-                                        if ilv_set is not None and old_ptr in ilv_set:
-                                            ilv_set.discard(old_ptr)
-                                            ilv_set.add(dst.data_ptr())
-                                        moved_s6 += 1
-                                        bytes_s6 += dst.numel() * dst.element_size()
-                                except RuntimeError:
-                                    break
-                        if moved_s6:
+                                    import muse_marlin6_gemv as _m6
+                                except (ImportError, OSError):
+                                    _m6 = None
+                                moved_s6, bytes_s6 = 0, 0
+                                for m in model.modules():
+                                    s6 = m._buffers.get("_marlin_decode_scales6")
+                                    if s6 is not None and s6.is_cuda and s6.numel() * s6.element_size() >= (64 << 10):
+                                        old_ptr = s6.data_ptr()
+                                        s6_nbytes = s6.numel() * s6.element_size()
+                                        cap_b = None
+                                        if (
+                                            s6.dtype == torch.uint8
+                                            and (
+                                                getattr(m, "output_size_per_partition", 0),
+                                                getattr(m, "input_size_per_partition", 0),
+                                            )
+                                            == (39936, 6656)
+                                        ):
+                                            base_cap = (
+                                                s6._base.numel() * s6._base.element_size()
+                                                if s6._base is not None
+                                                else 12_459_648
+                                            )
+                                            cap_b = min(
+                                                max(s6_nbytes, base_cap),
+                                                max(s6_nbytes + (256 << 10), ((int(s6_nbytes * 1.05) + 31) & ~31)),
+                                            )
+                                        dst = packer.alloc_like(s6, cap_bytes=cap_b)
+                                        if dst is None:
+                                            break
+                                        dst.copy_(s6)
+                                        if torch.equal(dst, s6):
+                                            m._buffers["_marlin_decode_scales6"] = dst
+                                            _relocate_scales6_ptr(_m6, old_ptr, dst.data_ptr())
+                                            moved_s6 += 1
+                                            bytes_s6 += s6_nbytes
+                                            p_moved += 1
+                                            p_bytes += s6_nbytes
+                                    elif s6 is None:
+                                        s_raw = m._buffers.get("_marlin_decode_scales")
+                                        if (
+                                            s_raw is not None
+                                            and s_raw.is_cuda
+                                            and (64 << 10) <= s_raw.numel() * s_raw.element_size() <= (126 << 20)
+                                        ):
+                                            dst_raw = packer.alloc_like(s_raw)
+                                            if dst_raw is not None:
+                                                dst_raw.copy_(s_raw)
+                                                if torch.equal(dst_raw, s_raw):
+                                                    m._buffers["_marlin_decode_scales"] = dst_raw
+                                                    p_moved += 1
+                                                    p_bytes += dst_raw.numel() * dst_raw.element_size()
+                                    pal = m._buffers.get("_marlin_decode_palette")
+                                    if pal is not None and pal.is_cuda and pal.dtype == torch.uint8 and 0 < pal.numel() <= 256:
+                                        dst_pal = packer.alloc_u8(pal.numel(), align=64)
+                                        if dst_pal is not None:
+                                            dst_pal.copy_(pal)
+                                            if torch.equal(dst_pal, pal):
+                                                old_pal = pal.data
+                                                pal.data = dst_pal
+                                                if pal.data_ptr() != dst_pal.data_ptr():
+                                                    pal.data = old_pal
+                                if moved_s6:
+                                    logger.info(
+                                        "Decode scales6 direct fast-slab packing: %d buffers (%.1f MiB)",
+                                        moved_s6, bytes_s6 / (1 << 20),
+                                    )
+                            used_slabs = packer.used_slabs
+                            packer.release_unused()
+                            del packer, fast_slabs
+                            packer = None
                             logger.info(
-                                "Decode scales6 fast-pool relocation: %d buffers (%.1f MiB) moved into fast pool",
-                                moved_s6, bytes_s6 / (1 << 20),
+                                "Decode direct fast-slab packing: %d tensors (%.1f MiB) packed into top %d fast slabs",
+                                p_moved, p_bytes / (1 << 20), used_slabs,
                             )
+                        elif PLACE_SCALES6:
+                            try:
+                                import muse_marlin6_gemv as _m6
+                            except (ImportError, OSError):
+                                _m6 = None
+                            moved_s6, bytes_s6 = 0, 0
+                            for m in model.modules():
+                                s6 = m._buffers.get("_marlin_decode_scales6")
+                                if s6 is not None and s6.is_cuda and s6.numel() * s6.element_size() >= (64 << 10):
+                                    try:
+                                        old_ptr = s6.data_ptr()
+                                        dst = torch.empty_like(s6)
+                                        dst.copy_(s6)
+                                        if torch.equal(dst, s6):
+                                            m._buffers["_marlin_decode_scales6"] = dst
+                                            rejected_hold.append(s6)
+                                            _relocate_scales6_ptr(_m6, old_ptr, dst.data_ptr())
+                                            moved_s6 += 1
+                                            bytes_s6 += dst.numel() * dst.element_size()
+                                    except RuntimeError:
+                                        break
+                            if moved_s6:
+                                logger.info(
+                                    "Decode scales6 fast-pool relocation: %d buffers (%.1f MiB) moved into fast pool",
+                                    moved_s6, bytes_s6 / (1 << 20),
+                                )
                 if stats is None:
                     stats = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
+                    if (
+                        stats is not None
+                        and DECODE_DOWN_PASSES >= 2
+                        and (n, k) == (6656, 19968)
+                        and (stats["before"][3] - stats["after"][3]) >= 0.05
+                    ):
+                        for _pass in range(1, DECODE_DOWN_PASSES):
+                            stats2 = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
+                            if stats2 is None:
+                                break
+                            gain2 = stats2["before"][3] - stats2["after"][3]
+                            stats["moved"] += stats2["moved"]
+                            stats["after"] = stats2["after"]
+                            if gain2 < 0.03:
+                                break
             except Exception as err:  # noqa: BLE001 - this group stays where it was
                 logger.warning("Decode weight placement skipped for %dx%d: %s", n, k, err)
                 continue
@@ -1022,6 +1718,8 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                 if max_b > (128 << 20):
                     deferred_large_rans.append(((n, k), layers))
                     continue
+                if ("rans", n, k) in packed_groups:
+                    continue
                 try:
                     stats = _place_muserans_group(_rans_ext, layers, n, k, evict_buf, rejected_hold)
                 except Exception as err:  # noqa: BLE001
@@ -1049,6 +1747,8 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                     attn_bf16_groups.items(),
                     key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_bf16_lane_weight"].numel() for l in kv[1])),
                 ):
+                    if ("attn_bf16", n, k) in packed_groups:
+                        continue
                     try:
                         stats = _place_bf16_rans_group(_bf16_lib, layers, n, k, evict_buf, rejected_hold)
                     except Exception as err:  # noqa: BLE001
@@ -1070,6 +1770,8 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                 attn_rans_groups.items(),
                 key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_fp8_packed"].numel() for l in kv[1])),
             ):
+                if ("attn_rans", n, k) in packed_groups:
+                    continue
                 try:
                     stats = _place_muserans_group(_rans_ext, layers, n, k, evict_buf, rejected_hold)
                 except Exception as err:  # noqa: BLE001
@@ -1091,6 +1793,8 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                 attn_nvfp4_groups.items(),
                 key=lambda kv: -(len(kv[1]) * kv[1][0]._buffers[_NAME].numel()),
             ):
+                if ("attn_nvfp4", n, k) in packed_groups:
+                    continue
                 try:
                     stats = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
                 except Exception as err:  # noqa: BLE001
@@ -1110,7 +1814,9 @@ def place_decode_weights(model: torch.nn.Module) -> None:
         if deferred_large_rans and _rans_ext is not None:
             for (n, k), layers in deferred_large_rans:
                 try:
-                    stats = _place_muserans_group(_rans_ext, layers, n, k, evict_buf, rejected_hold)
+                    stats = _place_muserans_group(
+                        _rans_ext, layers, n, k, evict_buf, rejected_hold, surplus_override=LARGE_RANS_SURPLUS
+                    )
                 except Exception as err:  # noqa: BLE001
                     logger.warning("Decode rANS placement skipped for %dx%d: %s", n, k, err)
                     continue
@@ -1152,7 +1858,15 @@ def place_decode_weights(model: torch.nn.Module) -> None:
     except Exception as err:  # noqa: BLE001 - the load must go on
         logger.warning("Decode weight placement failed and was skipped: %s", err)
     finally:
+        # Keep _SLOW_HOLD quarantined until gpu_worker calls release_slow_hold() after initialize_kv_cache().
         rejected_hold.clear()
-        if not PREFILL_ENABLED:
-            _SLOW_HOLD.clear()
-            torch.cuda.empty_cache()
+    try:
+        import muse_marlin6_gemv as _m6
+        if hasattr(_m6, "register_all_gate_up_swiglu"):
+            _m6.register_all_gate_up_swiglu(model)
+        if hasattr(_m6, "register_all_oproj_sigmoid"):
+            _m6.register_all_oproj_sigmoid(model)
+        if hasattr(_m6, "register_all_down_swiglu"):
+            _m6.register_all_down_swiglu(model)
+    except Exception as err:  # noqa: BLE001
+        logger.warning("Decode6 post-placement registration skipped: %s", err)

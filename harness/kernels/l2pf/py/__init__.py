@@ -21,6 +21,11 @@ __all__ = [
     "lib",
     "prefetch",
     "prefetch_desc",
+    "set_persisting_window",
+    "set_persisting_window_ex",
+    "clear_stream_persisting_window",
+    "set_max_l2_fetch_granularity",
+    "set_tickle_phase",
     "self_check",
 ]
 
@@ -30,6 +35,14 @@ ENABLED = os.environ.get("L2PF", "1") != "0"
 CHUNK = 1 << 16
 
 _lib = None
+
+
+def _stream_ptr(stream) -> int:
+    if stream is None:
+        return int(torch.cuda.current_stream().cuda_stream)
+    if isinstance(stream, int):
+        return stream
+    return int(stream.cuda_stream)
 
 
 def lib():
@@ -57,16 +70,79 @@ def lib():
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p,
         ]
         h.l2pf_set_persisting_window.restype = ctypes.c_int
+    if hasattr(h, "l2pf_clear_stream_persisting_window"):
+        h.l2pf_clear_stream_persisting_window.argtypes = [ctypes.c_void_p]
+        h.l2pf_clear_stream_persisting_window.restype = ctypes.c_int
+    if hasattr(h, "l2pf_set_persisting_window_ex"):
+        h.l2pf_set_persisting_window_ex.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
+        ]
+        h.l2pf_set_persisting_window_ex.restype = ctypes.c_int
+    if hasattr(h, "l2pf_set_max_l2_fetch_granularity"):
+        h.l2pf_set_max_l2_fetch_granularity.argtypes = [ctypes.c_int]
+        h.l2pf_set_max_l2_fetch_granularity.restype = ctypes.c_int
+    if hasattr(h, "l2pf_set_tickle_phase"):
+        h.l2pf_set_tickle_phase.argtypes = [ctypes.c_int]
+        h.l2pf_set_tickle_phase.restype = ctypes.c_int
     _lib = h
     return h
 
 
-def set_persisting_window(base_ptr: int, num_bytes: int, limit_bytes: int, stream: torch.cuda.Stream) -> bool:
+def set_persisting_window(base_ptr: int, num_bytes: int, limit_bytes: int, stream) -> bool:
     h = lib()
     if h is None or not hasattr(h, "l2pf_set_persisting_window"):
         return False
-    rc = h.l2pf_set_persisting_window(base_ptr, int(num_bytes), int(limit_bytes), stream.cuda_stream)
+    rc = h.l2pf_set_persisting_window(base_ptr, int(num_bytes), int(limit_bytes), _stream_ptr(stream))
     return rc == 0
+
+
+def clear_stream_persisting_window(stream) -> bool:
+    h = lib()
+    if h is None or not hasattr(h, "l2pf_clear_stream_persisting_window"):
+        return False
+    rc = h.l2pf_clear_stream_persisting_window(_stream_ptr(stream))
+    return rc == 0
+
+
+def set_persisting_window_ex(
+    base_ptr: int,
+    num_bytes: int,
+    limit_bytes: int,
+    miss_streaming: bool | int,
+    stream,
+) -> bool:
+    h = lib()
+    if h is None or not hasattr(h, "l2pf_set_persisting_window_ex"):
+        return False
+    rc = h.l2pf_set_persisting_window_ex(
+        base_ptr, int(num_bytes), int(limit_bytes), int(bool(miss_streaming)), _stream_ptr(stream)
+    )
+    return rc == 0
+
+
+def set_max_l2_fetch_granularity(nbytes: int) -> bool:
+    h = lib()
+    if h is None or not hasattr(h, "l2pf_set_max_l2_fetch_granularity"):
+        return False
+    return h.l2pf_set_max_l2_fetch_granularity(int(nbytes)) == 0
+
+
+def set_tickle_phase(is_decode: bool | int) -> bool:
+    h = lib()
+    if h is None:
+        try:
+            h_raw = ctypes.CDLL(LIB_PATH)
+        except OSError:
+            return False
+        fn = getattr(h_raw, "l2pf_set_tickle_phase", None)
+        if fn is None:
+            return False
+        fn.argtypes = [ctypes.c_int]
+        fn.restype = ctypes.c_int
+        return fn(int(bool(is_decode))) == 0
+    if not hasattr(h, "l2pf_set_tickle_phase"):
+        return False
+    return h.l2pf_set_tickle_phase(int(bool(is_decode))) == 0
 
 
 def prefetch(t: torch.Tensor, nbytes: int, stream: torch.cuda.Stream,
@@ -107,8 +183,9 @@ def self_check(device: torch.device | int | None = None) -> bool:
     buf = torch.randint(0, 256, (3 << 20,), generator=g, device=dev, dtype=torch.uint8)
     ref = buf.clone()
     base = buf.data_ptr() + (1 << 20)
+    ev_sc = (((1024 | (1 << 31)) << 32) | 64) - (1 << 64)
     desc = torch.tensor(
-        [base, 4096, (1024 << 32) | 64, base + 512 * 1024, 0, (CHUNK << 32) | 4],
+        [base, 4096, ev_sc, base + 512 * 1024, 0, (CHUNK << 32) | 4],
         dtype=torch.int64).to(dev)
     dref = desc.clone()
     s = torch.cuda.Stream(device=dev)

@@ -18,7 +18,9 @@ from pathlib import Path
 import torch
 
 ENABLED = os.environ.get("MUSE_EMBED_FUSED", "1") == "1"
+FAST_INDEXED = os.environ.get("MUSE_EMBED_INDEXED", "1") != "0"
 _lib = None
+_scale_indexed = None
 try:
     _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_embed.so")))
     _p = ctypes.c_void_p
@@ -26,13 +28,19 @@ try:
     _lib.muse_embed_square.restype = ctypes.c_int
     _lib.muse_embed_scale.argtypes = [_p, ctypes.c_int, _p, _p, _p, ctypes.c_int, ctypes.c_int, _p]
     _lib.muse_embed_scale.restype = ctypes.c_int
+    _scale_indexed = getattr(_lib, "muse_embed_scale_indexed", None)
+    if _scale_indexed is not None:
+        _scale_indexed.argtypes = [_p, ctypes.c_int, _p, _p, _p, ctypes.c_int, ctypes.c_int, _p]
+        _scale_indexed.restype = ctypes.c_int
 except OSError:
     _lib = None
+    _scale_indexed = None
 
-state = {"admitted": None, "fused_calls": 0, "reason": ""}
+state = {"admitted": None, "fused_calls": 0, "indexed_calls": 0, "indexed_admitted": False, "reason": ""}
+_inv_rms_cache: dict[tuple[int, int, int, float, int], torch.Tensor] = {}
 
 
-def _fused(ids, table, eps, out):
+def _fused_5kernel(ids, table, eps, out):
     rows, width = out.shape
     stream = torch.cuda.current_stream(out.device).cuda_stream
     x2 = torch.empty((rows, width), dtype=torch.float32, device=out.device)
@@ -45,6 +53,85 @@ def _fused(ids, table, eps, out):
                                    out.data_ptr(), rows, width, stream)
     if status:
         raise RuntimeError(f"muse_embed scale launch returned CUDA error {status}")
+
+
+def _fused_indexed(ids, table, inv_table, out):
+    rows, width = out.shape
+    stream = torch.cuda.current_stream(out.device).cuda_stream
+    status = _scale_indexed(
+        ids.data_ptr(),
+        int(ids.dtype == torch.int64),
+        table.data_ptr(),
+        inv_table.data_ptr(),
+        out.data_ptr(),
+        rows,
+        width,
+        stream,
+    )
+    if status:
+        raise RuntimeError(f"muse_embed scale_indexed launch returned CUDA error {status}")
+
+
+def _build_inv_rms_table(table: torch.Tensor, eps: float) -> torch.Tensor:
+    dev = table.device
+    dev_idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    key = (table.data_ptr(), int(table.shape[0]), int(table.shape[1]), float(eps), int(dev_idx))
+    cached = _inv_rms_cache.get(key)
+    if cached is not None:
+        return cached
+    vocab, width = int(table.shape[0]), int(table.shape[1])
+    inv_rms = torch.empty((vocab,), dtype=torch.float32, device=dev)
+    chunk = 512
+    x2_buf = torch.empty((chunk, width), dtype=torch.float32, device=dev)
+    with torch.no_grad():
+        for start in range(0, vocab, chunk):
+            end = min(start + chunk, vocab)
+            n = end - start
+            if n == chunk:
+                x2_buf.copy_(table[start:end]).pow_(2)
+                inv_chunk = torch.rsqrt(x2_buf.mean(-1, keepdim=True) + eps).squeeze(-1)
+                inv_rms[start:end].copy_(inv_chunk)
+            else:
+                x2_buf[:n].copy_(table[start:end])
+                x2_buf[n:].copy_(table[0:1].expand(chunk - n, width))
+                x2_buf.pow_(2)
+                inv_chunk = torch.rsqrt(x2_buf.mean(-1, keepdim=True) + eps).squeeze(-1)
+                inv_rms[start:end].copy_(inv_chunk[:n])
+    del x2_buf
+    _inv_rms_cache[key] = inv_rms
+    return inv_rms
+
+
+def precompute_inv_rms(model) -> torch.Tensor | None:
+    """Precompute and cache embed_inv_rms[vocab] FP32 without touching embed_tokens.weight."""
+    if not ENABLED or not FAST_INDEXED or _lib is None or _scale_indexed is None:
+        return None
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    emb = getattr(model, "embed_tokens", None)
+    norm = getattr(model, "embed_norm", None)
+    table = getattr(emb, "weight", None)
+    if (
+        table is None or norm is None or getattr(emb, "tp_size", 1) != 1
+        or type(emb.quant_method).__name__ != "UnquantizedEmbeddingMethod"
+        or norm.with_scale or table.dtype != torch.bfloat16
+        or not table.is_cuda or not table.is_contiguous() or table.dim() != 2
+    ):
+        return None
+    return _build_inv_rms_table(table, float(norm.eps))
+
+
+def _fused(ids, table, eps, out):
+    if state["indexed_admitted"] and _scale_indexed is not None:
+        dev = table.device
+        dev_idx = dev.index if dev.index is not None else torch.cuda.current_device()
+        key = (table.data_ptr(), int(table.shape[0]), int(table.shape[1]), float(eps), int(dev_idx))
+        inv_table = _inv_rms_cache.get(key)
+        if inv_table is not None:
+            _fused_indexed(ids, table, inv_table, out)
+            state["indexed_calls"] += 1
+            return
+    _fused_5kernel(ids, table, eps, out)
 
 
 def _eligible(model, ids, out):
@@ -90,11 +177,42 @@ def _admit(model, ids, out, table) -> str:
         cases.append(torch.randint(0, table.shape[0], ids.shape, generator=gen, device=dev, dtype=ids.dtype))
     for case in cases:
         mine = torch.empty_like(out)
-        _fused(case, table, eps, mine)
+        _fused_5kernel(case, table, eps, mine)
         theirs = model.embed_norm(model.embed_tokens(case))
         torch.cuda.synchronize()
         if not torch.equal(mine.view(torch.int16), theirs.view(torch.int16)):
             return "fused path differs from eager"
+    # (3) Precompute embed_inv_rms[vocab] FP32 via exact ATen mean/add/rsqrt and verify 1-kernel
+    #     muse_embed_scale_indexed bitwise against BOTH the 5-kernel path and eager on M=1 and M=512.
+    state["indexed_admitted"] = False
+    if FAST_INDEXED and _scale_indexed is not None:
+        try:
+            inv_table = _build_inv_rms_table(table, float(eps))
+            idx_ok = bool(torch.isfinite(inv_table).all())
+            if idx_ok:
+                idx_cases = list(cases)
+                for m_probe in (1, 512):
+                    for dt in (torch.int32, torch.int64):
+                        for _ in range(4):
+                            idx_cases.append(
+                                torch.randint(0, table.shape[0], (m_probe,), generator=gen, device=dev, dtype=dt)
+                            )
+                for c_ids in idx_cases:
+                    ref_5k = torch.empty((c_ids.shape[0], width), dtype=torch.bfloat16, device=dev)
+                    got_1k = torch.empty_like(ref_5k)
+                    _fused_5kernel(c_ids, table, eps, ref_5k)
+                    _fused_indexed(c_ids, table, inv_table, got_1k)
+                    theirs_c = model.embed_norm(model.embed_tokens(c_ids))
+                    torch.cuda.synchronize()
+                    if (
+                        not torch.equal(got_1k.view(torch.int16), ref_5k.view(torch.int16))
+                        or not torch.equal(got_1k.view(torch.int16), theirs_c.view(torch.int16))
+                    ):
+                        idx_ok = False
+                        break
+            state["indexed_admitted"] = idx_ok
+        except Exception:  # noqa: BLE001
+            state["indexed_admitted"] = False
     return ""
 
 

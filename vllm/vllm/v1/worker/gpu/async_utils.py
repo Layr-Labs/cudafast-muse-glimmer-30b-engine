@@ -22,6 +22,36 @@ _TWO_STAGE_WAIT = os.environ.get("VLLM_TWO_STAGE_WAIT", "1") != "0"
 # The longest the tail of a step is polled before the wait blocks again.
 _TAIL_POLL_NS = 20_000_000
 
+_BLOCKING_EVENT_POOL: list[torch.cuda.Event] = []
+_SINGLE_TOK_RINGS: dict[torch.dtype, list[tuple[torch.Tensor, np.ndarray]]] = {}
+_SINGLE_TOK_RING_STEPS: dict[torch.dtype, int] = {}
+
+
+def acquire_blocking_event() -> torch.cuda.Event:
+    if _BLOCKING_EVENT_POOL:
+        return _BLOCKING_EVENT_POOL.pop()
+    return torch.cuda.Event(blocking=True)
+
+
+def release_blocking_event(ev: torch.cuda.Event | None) -> None:
+    if ev is not None and len(_BLOCKING_EVENT_POOL) < 16:
+        _BLOCKING_EVENT_POOL.append(ev)
+
+
+def _acquire_single_token_slot(dtype: torch.dtype) -> tuple[torch.Tensor, np.ndarray]:
+    ring = _SINGLE_TOK_RINGS.get(dtype)
+    if ring is None:
+        ring = []
+        for _ in range(4):
+            t = torch.empty((1, 1), dtype=dtype, pin_memory=True)
+            ring.append((t, t.numpy()))
+        _SINGLE_TOK_RINGS[dtype] = ring
+        _SINGLE_TOK_RING_STEPS[dtype] = 0
+    step = _SINGLE_TOK_RING_STEPS[dtype]
+    slot = ring[step & 3]
+    _SINGLE_TOK_RING_STEPS[dtype] = step + 1
+    return slot
+
 
 def wait_for_output(copy_event, forward_done=None, clock=time.perf_counter_ns) -> None:
     """Return once `copy_event` has completed.
@@ -74,16 +104,30 @@ class AsyncOutput(AsyncModelRunnerOutput):
         # decode step: exactly one sampled token, so num_sampled_tokens is not copied back and the output is
         # [[sampled_token_ids[0, 0]]], what the general path below produces from a count of 1.
         self.known_single_token = known_single_token
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.cuda.Event(blocking=True)
+        # Reusable blocking (sleep) event to avoid per-step cudaEventCreate & busy-polling.
+        self.copy_event: torch.cuda.Event | None = acquire_blocking_event()
         # See wait_for_output: set by the runner for a prefill step only.
-        self.forward_done = forward_done if _TWO_STAGE_WAIT else None
+        if _TWO_STAGE_WAIT:
+            self.forward_done = forward_done
+        else:
+            release_blocking_event(forward_done)
+            self.forward_done = None
         self._has_fault: torch.Tensor | None = None
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
 
-            self.sampled_token_ids = async_copy_to_np(sampler_output.sampled_token_ids)
+            st_ids = sampler_output.sampled_token_ids
+            if (
+                known_single_token
+                and st_ids.shape == (1, 1)
+                and st_ids.dtype in (torch.int64, torch.int32)
+            ):
+                pin_t, pin_np = _acquire_single_token_slot(st_ids.dtype)
+                pin_t.copy_(st_ids, non_blocking=True)
+                self.sampled_token_ids = pin_np
+            else:
+                self.sampled_token_ids = async_copy_to_np(st_ids)
             self.logprobs_tensors: LogprobsTensors | None = None
             if sampler_output.logprobs_tensors is not None:
                 self.logprobs_tensors = (
@@ -105,7 +149,12 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
-        wait_for_output(self.copy_event, self.forward_done)
+        if self.copy_event is not None:
+            wait_for_output(self.copy_event, self.forward_done)
+            release_blocking_event(self.copy_event)
+            release_blocking_event(self.forward_done)
+            self.copy_event = None
+            self.forward_done = None
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.
@@ -153,8 +202,8 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
     ):
         self.model_runner_output = model_runner_output
         self.pooler_output = pooler_output
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.cuda.Event(blocking=True)
+        # Reusable blocking (sleep) event to avoid busy-polling the CUDA driver lock.
+        self.copy_event: torch.cuda.Event | None = acquire_blocking_event()
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -181,7 +230,10 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
             pooler_output = list(self.pooler_output_cpu.unbind(dim=0))
         else:
             pooler_output = self.pooler_output_cpu
-        self.copy_event.synchronize()
+        if self.copy_event is not None:
+            self.copy_event.synchronize()
+            release_blocking_event(self.copy_event)
+            self.copy_event = None
         self.model_runner_output.pooler_output = pooler_output
         return self.model_runner_output
 
