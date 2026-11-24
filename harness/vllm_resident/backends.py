@@ -321,10 +321,12 @@ class VllmBackend:
             for _ in range(self.WARMUP_DECODE_STEPS):
                 self.step()
             self.abort()
-        self.start(prompt[: self.WARMUP_SEED_TOKENS], top_logits=False)
-        for _ in range(self.WARMUP_SEED_DECODE_STEPS):
-            self.step()
-        self.abort()
+        for i in range(3):
+            self.start(prompt[: self.WARMUP_SEED_TOKENS], top_logits=False)
+            if i == 0:
+                for _ in range(self.WARMUP_SEED_DECODE_STEPS):
+                    self.step()
+            self.abort()
 
     def _params(self, prompt_len: int, max_tokens: int | None = None, top_logits: bool = True):
         room = max(1, self.ctx_size - prompt_len - self.depth - 1)
