@@ -64,7 +64,7 @@ def _get_scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torc
 
 
 def _mode_params(w_left: int, exact_submode: int) -> tuple[int, int, int]:
-    if MODE_NAME == "fa2_exact":
+    if MODE_NAME in ("fa2_exact", "fa2_exact_swa", "fa2_exact_full"):
         g_splits = 1 if w_left >= 0 else NUM_SPLITS
         f_splits = 1 if w_left >= 0 else FA2_FULL_SPLITS
         return g_splits, f_splits, exact_submode
@@ -143,8 +143,14 @@ def self_check(device: torch.device) -> bool:
                 break
 
         ok = True
+        if MODE_NAME == "fa2_exact_swa":
+            check_wins = ((2047, 0),)
+        elif MODE_NAME == "fa2_exact_full":
+            check_wins = ((-1, -1),)
+        else:
+            check_wins = ((-1, -1), (2047, 0))
         for seq_k in (1, 16, 17, 32, 33, 64, 128, 513, 576, 640, 2048, 2500):
-            for win in ((-1, -1), (2047, 0)):
+            for win in check_wins:
                 bt_cur = bt.clone()
                 if win[0] >= 0 and seq_k > 2048:
                     expired_pages = (seq_k - 2048) // block_size
@@ -178,7 +184,7 @@ def self_check(device: torch.device) -> bool:
                     break
                 max_err = float((ref.float() - got.float()).abs().max().item())
                 mismatch = int((ref.view(torch.int16) != got.view(torch.int16)).sum().item())
-                if MODE_NAME == "fa2_exact":
+                if MODE_NAME in ("fa2_exact", "fa2_exact_swa", "fa2_exact_full"):
                     if mismatch > 0:
                         ok = False
                         break
@@ -262,6 +268,10 @@ def try_decode_gqa16(
         if window[1] > 0:
             return False
         w_left = int(window[0])
+    if MODE_NAME == "fa2_exact_swa" and w_left < 0:
+        return False
+    if MODE_NAME == "fa2_exact_full" and w_left >= 0:
+        return False
 
     bufs = _get_scratch(device)
     if bufs is None:

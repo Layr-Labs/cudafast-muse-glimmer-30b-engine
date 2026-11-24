@@ -328,6 +328,28 @@ __global__ void __launch_bounds__(256) mul_sigmoid_bf16_kernel(
   out[idx] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
 }
 
+__global__ void __launch_bounds__(256) mul_sigmoid_fp8_kernel(
+    const uint4* __restrict__ gate, const uint4* __restrict__ attn,
+    const float* __restrict__ scale, uint2* __restrict__ out, int vec8) {
+  const int idx = blockIdx.x * 256 + threadIdx.x;
+  if (idx >= vec8) return;
+  const float inv_s = full_divide(1.0f, *scale);
+  const uint4 g = gate[idx], a = attn[idx];
+  const uint32_t gw[4] = {g.x, g.y, g.z, g.w}, aw[4] = {a.x, a.y, a.z, a.w};
+  uint16_t ow[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float gl = bf_lo(gw[i]), gh = bf_hi(gw[i]);
+    const float al = bf_lo(aw[i]), ah = bf_hi(aw[i]);
+    const float yl = clamp448(__fmul_rn(__fmul_rn(triton_sigmoid(gl), al), inv_s));
+    const float yh = clamp448(__fmul_rn(__fmul_rn(triton_sigmoid(gh), ah), inv_s));
+    ow[i] = fp8x2(yl, yh);
+  }
+  const uint32_t lo = static_cast<uint32_t>(ow[0]) | (static_cast<uint32_t>(ow[1]) << 16);
+  const uint32_t hi = static_cast<uint32_t>(ow[2]) | (static_cast<uint32_t>(ow[3]) << 16);
+  out[idx] = make_uint2(lo, hi);
+}
+
 }  // namespace
 
 extern "C" {
@@ -418,6 +440,16 @@ int muse_norm_glue_mul_sigmoid_bf16(const void* gate, const void* attn, void* ou
   mul_sigmoid_bf16_kernel<<<(vec8 + 255) / 256, 256, 0, stream>>>(
       static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
       static_cast<uint4*>(out), vec8);
+  return static_cast<int>(cudaGetLastError());
+}
+
+int muse_norm_glue_mul_sigmoid_fp8(const void* gate, const void* attn, const void* scale,
+                                   void* out, int n, cudaStream_t stream) {
+  if (n <= 0 || (n & 7) != 0) return -1;
+  const int vec8 = n >> 3;
+  mul_sigmoid_fp8_kernel<<<(vec8 + 255) / 256, 256, 0, stream>>>(
+      static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
+      static_cast<const float*>(scale), static_cast<uint2*>(out), vec8);
   return static_cast<int>(cudaGetLastError());
 }
 

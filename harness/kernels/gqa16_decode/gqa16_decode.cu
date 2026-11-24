@@ -738,21 +738,34 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_kernel(
 
       const float max_sc0 = (row_max0 == -INFINITY) ? 0.0f : (row_max0 * scale_log2);
       const float max_sc1 = (row_max1 == -INFINITY) ? 0.0f : (row_max1 * scale_log2);
+      // Reuse unused smem.kv[2] (8 KiB) to stage FP32 p[16][16][4][2] for exact FA2 1-warp sum order
+      float (*p_f32)[16][4][2] = reinterpret_cast<float (*)[16][4][2]>(smem.kv[2]);
       #pragma unroll
       for (int ch = 0; ch < 4; ++ch) {
         const float p0 = (s_frag[ch][0] == -INFINITY) ? 0.0f : fast_exp2f(__fmaf_rn(s_frag[ch][0], scale_log2, -max_sc0));
         const float p1 = (s_frag[ch][1] == -INFINITY) ? 0.0f : fast_exp2f(__fmaf_rn(s_frag[ch][1], scale_log2, -max_sc0));
         const float p2 = (s_frag[ch][2] == -INFINITY) ? 0.0f : fast_exp2f(__fmaf_rn(s_frag[ch][2], scale_log2, -max_sc1));
         const float p3 = (s_frag[ch][3] == -INFINITY) ? 0.0f : fast_exp2f(__fmaf_rn(s_frag[ch][3], scale_log2, -max_sc1));
-        row_sum0 = (row_sum0 + p0) + p1;
-        row_sum1 = (row_sum1 + p2) + p3;
+        const int j = (ch << 2) + warp_id;
+        p_f32[group_id][j][tid_in_grp][0] = p0;
+        p_f32[group_id][j][tid_in_grp][1] = p1;
+        p_f32[group_id + 8][j][tid_in_grp][0] = p2;
+        p_f32[group_id + 8][j][tid_in_grp][1] = p3;
         const __nv_bfloat162 pb0 = __floats2bfloat162_rn(p0, p1);
         const __nv_bfloat162 pb1 = __floats2bfloat162_rn(p2, p3);
-        const int c_phys_p = ((ch << 2) + warp_id) ^ group_id;
+        const int c_phys_p = j ^ group_id;
         reinterpret_cast<uint32_t*>(&smem.p[group_id][c_phys_p])[tid_in_grp] =
             *reinterpret_cast<const uint32_t*>(&pb0);
         reinterpret_cast<uint32_t*>(&smem.p[group_id + 8][c_phys_p])[tid_in_grp] =
             *reinterpret_cast<const uint32_t*>(&pb1);
+      }
+      __syncthreads();
+      if (warp_id == 0) {
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          row_sum0 = (row_sum0 + p_f32[group_id][j][tid_in_grp][0]) + p_f32[group_id][j][tid_in_grp][1];
+          row_sum1 = (row_sum1 + p_f32[group_id + 8][j][tid_in_grp][0]) + p_f32[group_id + 8][j][tid_in_grp][1];
+        }
       }
 
       #pragma unroll
@@ -782,20 +795,20 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_kernel(
       }
     }
 
-    row_sum0 += __shfl_xor_sync(0xffffffffu, row_sum0, 2);
-    row_sum0 += __shfl_xor_sync(0xffffffffu, row_sum0, 1);
-    row_sum1 += __shfl_xor_sync(0xffffffffu, row_sum1, 2);
-    row_sum1 += __shfl_xor_sync(0xffffffffu, row_sum1, 1);
-    if (tid_in_grp == 0) {
-      smem.warp_sum[warp_id][group_id]     = row_sum0;
-      smem.warp_sum[warp_id][group_id + 8] = row_sum1;
+    if (warp_id == 0) {
+      row_sum0 += __shfl_xor_sync(0xffffffffu, row_sum0, 2);
+      row_sum0 += __shfl_xor_sync(0xffffffffu, row_sum0, 1);
+      row_sum1 += __shfl_xor_sync(0xffffffffu, row_sum1, 2);
+      row_sum1 += __shfl_xor_sync(0xffffffffu, row_sum1, 1);
+      if (tid_in_grp == 0) {
+        smem.warp_sum[0][group_id]     = row_sum0;
+        smem.warp_sum[0][group_id + 8] = row_sum1;
+      }
     }
     __syncthreads();
 
-    const float tot0 = (smem.warp_sum[0][group_id] + smem.warp_sum[1][group_id]) +
-                       (smem.warp_sum[2][group_id] + smem.warp_sum[3][group_id]);
-    const float tot1 = (smem.warp_sum[0][group_id + 8] + smem.warp_sum[1][group_id + 8]) +
-                       (smem.warp_sum[2][group_id + 8] + smem.warp_sum[3][group_id + 8]);
+    const float tot0 = smem.warp_sum[0][group_id];
+    const float tot1 = smem.warp_sum[0][group_id + 8];
     const bool empty0 = (tot0 == 0.0f || tot0 != tot0 || row_max0 == -INFINITY);
     const bool empty1 = (tot1 == 0.0f || tot1 != tot1 || row_max1 == -INFINITY);
     const float inv0 = empty0 ? 0.0f : (UseFastRcp ? fast_rcpf(tot0) : (1.0f / tot0));

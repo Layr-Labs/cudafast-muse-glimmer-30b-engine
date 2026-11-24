@@ -503,8 +503,8 @@ static RansCfg rans_pick_cfg(int N, int K) {
   if (gate32 && N == 4096 && K == 6656 && NB == 512 && rans_fits(K, 16, 9, 4)) {
     return RansCfg{512, 16, 4, 4, 9};
   }
-  if (gate_up_even && N == 39936 && K == 6656 && NB == 4992 && rans_fits(K, 16, 9, 4)) {
-    return RansCfg{768, 16, 4, 4, 9};
+  if (gate_up_even && N == 39936 && K == 6656 && NB == 4992 && rans_fits(K, 8, 9, 8)) {
+    return RansCfg{384, 8, 4, 8, 9};
   }
   for (int wcap = 18; wcap >= 1; wcap--) {
     const int R = (NB + 48 * wcap - 1) / (48 * wcap);

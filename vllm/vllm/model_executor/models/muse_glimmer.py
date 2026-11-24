@@ -1356,8 +1356,44 @@ def _muse_qk_norm_rope_impl(
     eps: float,
     qscale: float,
     use_rope: bool,
+    layer_name: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import muse_qk_glue
+
+    if layer_name:
+        try:
+            from vllm.model_executor.layers.attention.attention import (
+                get_attention_context,
+            )
+            from vllm.utils.torch_utils import is_quantized_kv_cache
+            from vllm.v1.attention.backend import AttentionType
+
+            _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+                layer_name
+            )
+            impl = attn_layer.impl
+            if (
+                layer_slot_mapping is not None
+                and kv_cache is not None
+                and getattr(impl, "attn_type", None)
+                not in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER)
+                and not is_quantized_kv_cache(getattr(impl, "kv_cache_dtype", "auto"))
+            ):
+                q_out, k_out, kv_written = muse_qk_glue.run_qk_norm_rope_kv(
+                    qkv,
+                    positions,
+                    cos_sin_cache,
+                    eps,
+                    qscale,
+                    use_rope,
+                    kv_cache,
+                    layer_slot_mapping,
+                )
+                if kv_written:
+                    attn_layer._muse_kv_fused_done = True
+                return q_out, k_out
+        except Exception:
+            pass
 
     return muse_qk_glue.run_qk_norm_rope(
         qkv, positions, cos_sin_cache, eps, qscale, use_rope
@@ -1371,6 +1407,7 @@ def _muse_qk_norm_rope_fake(
     eps: float,
     qscale: float,
     use_rope: bool,
+    layer_name: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     n = qkv.shape[0]
     return qkv.new_empty((n, 4096)), qkv.new_empty((n, 256))
@@ -1711,6 +1748,7 @@ class MuseGlimmerAttention(nn.Module):
                 float(self.qk_norm.eps),
                 float(self.scale_query_by),
                 self.rotary_emb is not None,
+                self.attn.layer_name,
             )
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
