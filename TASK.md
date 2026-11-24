@@ -8,7 +8,8 @@ mixed-precision checkpoint of a 52-layer text decoder: 39 sliding-attention
 layers (window 2048) and 13 full-attention layers, a dense MLP (intermediate
 19968, hidden 6656, 32 heads, 2 KV heads, vocab 202048), plus a BF16 vision
 tower that the scored text track does not exercise. The checkpoint ships no
-speculative tensors.
+speculative tensors; this track pins a separate DFlash drafter for it
+(below).
 
 The engine is vLLM v0.27.1. Its Python source is vendored at `vllm/vllm/`, and
 it runs on top of the compiled extensions in the pinned engine container. The
@@ -30,7 +31,7 @@ those paths and nothing else.
 |---|---|
 | `vllm/` | The vendored vLLM Python and Triton source: model code (`muse_glimmer.py`), attention backends, the scheduler, the KV cache. |
 | `harness/` | The Rust protocol adapter, the Python resident, and optional custom CUDA/C++ kernels under `harness/kernels/`. A `harness/kernels/build.sh` runs in the pinned container at setup, and its output goes on the resident's `PYTHONPATH`. |
-| `mtp-head.manifest.json` | The speculative-decoding declaration: `spec.enabled` and `spec.num_speculative_tokens`. |
+| `mtp-head.manifest.json` | The speculative-decoding declaration: switch the pinned DFlash drafter on (`spec.enabled`) and pick its depth (`spec.num_speculative_tokens`). |
 
 The rule behind the list is simple. Code that **proposes** tokens or
 **computes** the forward pass is editable. Code that **verifies**, **measures**
@@ -54,15 +55,30 @@ benchd.
 > faster kernels that compute the same formats: fused dequant-GEMM, a better
 > attention kernel, CUDA graphs, fusion, scheduling.
 
-> **WARNING — this track is serial only: it has no speculative arm.**
-> The checkpoint ships no MTP or draft tensors, and the fixture's
-> `allowed_modes` is `[serial]`. `mtp-head.manifest.json` must declare
-> `"source": "none"`; a declaration that arms speculation is refused. DSpark,
-> DFlash and Eagle drafters are not part of this track.
+> **The pinned DFlash drafter: you may switch it on and pick a depth. Nothing
+> more.** The fixture's `allowed_modes` is `[serial, mtp]` (benchd's wire modes: a speculative leg is mode `mtp` at depth N; the pinned DFlash drafter serves it, fixture `mtp_head.decoder` `dflash`). The drafter is
+> `meta-models/Muse-Glimmer-30B-assistant` at revision
+> `c676cce91658f9568aaf264a416211e2782735b7` (BF16, Apache-2.0), pinned in the
+> fixture's `mtp_head` by the sha256 of each file. The organizer stages it on
+> the box and mounts it read-only into the candidate resident.
+>
+> - **Allowed:** `spec.enabled: true` with `spec.num_speculative_tokens` in
+>   `permitted_draft_depths` `[1, 2, 3, 4, 5, 6]`, and your own engine code in
+>   `vllm/` and `harness/` that uses the drafter.
+> - **Still banned:** your own drafter or any other weights, a path, a
+>   repository, a revision or a digest other than the pinned ones (refused by
+>   `tools/spec-declaration.sh`), and any network access (the resident runs with
+>   no network and Hugging Face offline). The 40 MiB editable-surface cap is
+>   unchanged.
+> - **The serial-control leg is always serial.** Only the candidate leg runs
+>   the drafter.
 
 - **The scored batch size is 1.** It is not a tunable.
-- **Every leg runs serial.** `serve_configuration.depths` declares `serial`
-  only, and each run seals `effective_spec_mode = serial`.
+- **The control leg runs serial; the candidate leg runs what it declares.**
+  `serve_configuration.depths` declares `serial` and `mtp1`..`mtp6` (the
+  speculative-depth label benchd and the oracles use; the decoder that runs
+  it is the pinned DFlash drafter). Each depth is scored against its own
+  pinned timed oracle (`speculative_oracles`).
 - **The engine configuration comes from the fixture:**
   `serve_configuration.engine_env` sets the context of 8192 tokens, the
   batched-token budget and the memory fraction. The resident's own code decides

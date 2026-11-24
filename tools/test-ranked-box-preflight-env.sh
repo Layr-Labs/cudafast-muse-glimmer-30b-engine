@@ -223,10 +223,16 @@ EOF
   mkdir -m 0750 "${WORK}/serve-log"
   for entry in "${REPO_ROOT}"/*; do
     case "$(basename "${entry}")" in
-      tools|fixtures|correctness_prompts) continue ;;
+      tools|fixtures|correctness_prompts|mtp-head.manifest.json) continue ;;
     esac
     ln -s "${entry}" "${ROOT}/$(basename "${entry}")"
   done
+  # The scaffold declares SERIAL unless a case says otherwise: the contract's
+  # pin, drafter off. Not the shipped file: that is the base's, which may
+  # switch the drafter on (tools/testlib/serial-declaration.jq).
+  SERIAL_DECL="${WORK}/serial.manifest.json"
+  jq -f "${REPO_ROOT}/tools/testlib/serial-declaration.jq" "${REPO_ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json" > "${SERIAL_DECL}"
+  ln -s "${SERIAL_DECL}" "${ROOT}/mtp-head.manifest.json"
   PREFLIGHT8="${ROOT}/tools/ranked-box-preflight.sh"
 
   # The staged pool, and the contract re-pinned to it. Only sha256 and bytes
@@ -253,6 +259,16 @@ def stage(r2_path):
 
 for entry in contract.get("timed_prompt_pool", []):
     entry["sha256"], entry["bytes"] = stage(entry["r2_path"])
+# Every permitted draft depth needs a per-depth oracle per live golden. The
+# shipped fixture carries none until a box records them with the pinned
+# drafter, so the scaffold stands in a synthetic one for each missing pin, as it
+# does for every serial golden above.
+prefix = contract["timed_prompt_pool"][0]["r2_path"].rsplit("/", 1)[0]
+oracles_all = contract.setdefault("speculative_oracles", {})
+for name in contract["live_goldens"]:
+    per = oracles_all.setdefault(name, {})
+    for d in contract["mtp_head"].get("permitted_draft_depths", []):
+        per.setdefault(f"mtp{d}", {"r2_path": f"{prefix}/{name}.mtp{d}.golden.json"})
 for oracles in (contract.get("speculative_oracles") or {}).values():
     for entry in oracles.values():
         entry["sha256"], entry["bytes"] = stage(entry["r2_path"])
@@ -409,6 +425,36 @@ EOF
     fail "section 8 / control: a correctly staged box did not pass; got: $(tail -3 <<<"${control8}")"
   fi
 
+  # THE PINNED DRAFTER (section 7). A declaration that switches the DFlash
+  # drafter on needs the organizer-staged drafter directory on the box, outside
+  # every checkout; the same declaration on a box that has it passes.
+  DECL_LINK="${ROOT}/mtp-head.manifest.json"
+  rm -f "${DECL_LINK}"
+  jq '.spec.enabled = true | .spec.num_speculative_tokens = 3' "${SERIAL_DECL}" > "${DECL_LINK}"
+  mkdir -p "${WORK}/drafter"
+  expect_refusal "dflash declared, no drafter dir" "MLXFAST_DRAFTER_DIR ('') is not a directory on this box" MLXFAST_DRAFTER_DIR=
+  expect_refusal "dflash declared, drafter dir inside the checkout" "is inside the checkout" "MLXFAST_DRAFTER_DIR=${ROOT}/fixtures"
+  control_drafter="$(run_preflight "MLXFAST_DRAFTER_DIR=${WORK}/drafter")"
+  if grep -q 'ranked-box-preflight: all checks passed' <<<"${control_drafter}" \
+    && grep -q 'serve spec is the declared dflash config (num_speculative_tokens=3)' <<<"${control_drafter}"; then
+    echo "ok    section 7 / control: a dflash depth-3 declaration on a box with the pinned drafter passes"
+  else
+    fail "section 7 / control: a dflash declaration with the drafter staged did not pass; got: $(tail -3 <<<"${control_drafter}")"
+  fi
+  rm -f "${DECL_LINK}"
+  ln -s "${SERIAL_DECL}" "${DECL_LINK}"
+  # declare_depth N / declare_serial: the scaffold's declaration switched on at
+  # depth N (the per-depth oracle cases below need one: ONLY the declared depth
+  # needs an oracle), and back to the serial declaration.
+  declare_depth() {
+    rm -f "${DECL_LINK}"
+    jq --argjson n "$1" '.spec.enabled = true | .spec.num_speculative_tokens = $n' "${SERIAL_DECL}" > "${DECL_LINK}"
+  }
+  declare_serial() {
+    rm -f "${DECL_LINK}"
+    ln -s "${SERIAL_DECL}" "${DECL_LINK}"
+  }
+
   expect_refusal "workspace unset" \
     "MLXFAST_BASELINE_WORKSPACE is not set" MLXFAST_BASELINE_WORKSPACE=
   expect_refusal "calibration unset" \
@@ -555,10 +601,12 @@ EOF
   if [[ "${mtp_depths}" == "[]" ]]; then
     echo "ok    section 4b / rotation prompt without per-depth oracles: not applicable (serial-only track, no permitted draft depth)"
   else
-    rotation_case "rotation prompt without per-depth oracles" \
+    declare_depth 1
+    rotation_case "rotation prompt without per-depth oracles (mtp1 declared)" \
       "${SECOND_IN_POOL} | del(.speculative_oracles[\"${SECOND}\"])" \
-      "has no pinned per-depth oracle speculative_oracles[${SECOND}][mtp1]" \
-      "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
+      "has no pinned per-depth oracle speculative_oracles[${SECOND}][mtp1]; the declaration enables mtp1, and a declared depth with no pinned oracle cannot be scored" \
+      "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}" "MLXFAST_DRAFTER_DIR=${WORK}/drafter"
+    declare_serial
   fi
   rotation_case "rotation prompt outside timed_prompt_pool" \
     '.live_golden_rotation.pool += ["nosuch"]' \
@@ -566,10 +614,12 @@ EOF
   if [[ "${mtp_depths}" == "[]" ]]; then
     echo "ok    section 4b / rotation prompt borrowing another prompt's oracles: not applicable (serial-only track, no permitted draft depth)"
   else
-    rotation_case "rotation prompt borrowing another prompt's oracles" \
+    declare_depth 1
+    rotation_case "rotation prompt borrowing another prompt's oracles (mtp1 declared)" \
       "${SECOND_IN_POOL} | .speculative_oracles[\"${SECOND}\"] = (.speculative_oracles[\"${LIVE_GOLDEN}\"] | del(.mtp6))" \
       "speculative_oracles[${SECOND}][mtp1] points at ${LIVE_GOLDEN}.mtp1.golden.json" \
-      "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}"
+      "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR_NO_SECOND}" "MLXFAST_DRAFTER_DIR=${WORK}/drafter"
+    declare_serial
   fi
   rotation_case "rotation pool empty" '.live_golden_rotation.pool = []' \
     "live_golden_rotation.pool is empty"
@@ -605,8 +655,10 @@ ROTEOF
     echo "ok    section 4b / rotation oracle not staged: not applicable (serial-only track, no per-depth oracle exists)"
   else
     rm "${GOLDEN_DIR2}/${SECOND}.mtp4.golden.json"
-    expect_refusal "rotation oracle not staged" "${SECOND}.mtp4.golden.json" \
-      "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR2}"
+    declare_depth 4
+    expect_refusal "rotation oracle not staged (mtp4 declared)" "${SECOND}.mtp4.golden.json" \
+      "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR2}" "MLXFAST_DRAFTER_DIR=${WORK}/drafter"
+    declare_serial
   fi
   cp "${WORK}/contract.orig.json" "${SCAFFOLD_CONTRACT}"
 
@@ -647,6 +699,26 @@ ROTEOF
     "${SCAFFOLD_CONTRACT}.live-goldens" > "${SCAFFOLD_CONTRACT}"
   expect_refusal "live_goldens with a rotation block" \
     "declares both live_goldens and live_golden_rotation" "MLXFAST_BASELINE_CALIBRATION=${CAL_ALL}"
+  # THE SHIPPED SERIAL RUN (section 4b): the fixture pins no per-depth oracle
+  # yet (speculative_oracles {}), and a serial declaration needs none, so a box
+  # with only the serial goldens staged passes. A declared depth with no pinned
+  # oracle is refused fail-closed by name.
+  GOLDEN_DIR_SERIAL="${WORK}/goldens-serial-only"
+  mkdir -p "${GOLDEN_DIR_SERIAL}"
+  find "${GOLDEN_DIR}" -maxdepth 1 -name '*.json' ! -name '*.mtp*.golden.json' -exec cp {} "${GOLDEN_DIR_SERIAL}/" \;
+  jq '.speculative_oracles = {}' "${SCAFFOLD_CONTRACT}.live-goldens" > "${SCAFFOLD_CONTRACT}"
+  control_serial="$(run_preflight "MLXFAST_BASELINE_CALIBRATION=${CAL_ALL}" "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR_SERIAL}" MLXFAST_DRAFTER_DIR=)"
+  if grep -q 'ranked-box-preflight: all checks passed' <<<"${control_serial}" \
+    && grep -q "the declaration is serial, so no per-depth oracle is needed" <<<"${control_serial}"; then
+    echo "ok    section 4b / serial: no per-depth oracle pinned or staged, no drafter dir, a serial declaration passes"
+  else
+    fail "section 4b / serial: a serial run with no per-depth oracle did not pass; got: $(tail -3 <<<"${control_serial}")"
+  fi
+  declare_depth 3
+  expect_refusal "declared mtp3 with no pinned oracle" \
+    "has no pinned per-depth oracle speculative_oracles[${LIVE_NAMES[0]}][mtp3]; the declaration enables mtp3, and a declared depth with no pinned oracle cannot be scored" \
+    "MLXFAST_BASELINE_CALIBRATION=${CAL_ALL}" "MLXFAST_MUSE_GLIMMER_GOLDEN_DIR=${GOLDEN_DIR_SERIAL}" "MLXFAST_DRAFTER_DIR=${WORK}/drafter"
+  declare_serial
   cp "${WORK}/contract.orig.json" "${SCAFFOLD_CONTRACT}"
 
   # Section 9, first: each runner on the box has its own sandbox names

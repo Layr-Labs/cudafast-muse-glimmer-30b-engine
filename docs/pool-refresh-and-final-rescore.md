@@ -62,8 +62,8 @@ Idempotent steps, each refusing on any mismatch:
 1. **Author**: N prompts for the next generation (above). N is `--count`,
    by default the number of `live_goldens` in the fixture (3 now); use
    `--texts DIR` for chat prompts.
-2. **Record**: one serial golden for every prompt (N goldens, 3 for 3
-   prompts; this track is serial only, so there are no per-depth oracles),
+2. **Record**: one serial golden for every prompt, plus one per-depth oracle
+   for each permitted draft depth (N x 7 goldens: serial + mtp1..mtp6),
    spread across the fleet with `tools/record-goldens.sh`, each one on **two**
    boxes and required to be byte-identical (the engine is deterministic; a
    mismatch means a broken box or engine).

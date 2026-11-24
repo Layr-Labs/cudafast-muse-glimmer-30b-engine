@@ -147,12 +147,15 @@ boot() { # boot SPEC DEPTH
   "${ROOT}/tools/serve-up.sh" --boot --spec "$1" --draft-len "$2" --socket-out "${OUT}/.socket" >&2
   SOCKET="$(head -1 "${OUT}/.socket")"
 }
-record() { # record NAME OUTFILE
+record() { # record NAME OUTFILE [SPEC]
+  # SPEC (serial | mtp:<D>) is the spec the free-run block is recorded under. A
+  # per-depth oracle MUST carry it: with no spec the recorder sends none, and the
+  # adapter serves that free run SERIAL even on a resident booted with a drafter.
   (cd "${ROOT}" && BENCH_WORKER_RESIDENT_SOCKET="${SOCKET}" "${RECORDER}" \
      --worker-bin "${ENGINE_REL}" --weights "${SNAP}" \
      --prompt-tokens "${PROMPTS}/$1.tokens.json" --case-name "$1" \
      --steps "${ANSWER_MAX_TOKENS}" "${STOP_ARGS[@]}" \
-     --benchmark-free-run --track "${TRACK}" --contract "${FIXTURE}" \
+     --benchmark-free-run --benchmark-spec "${3:-serial}" --track "${TRACK}" --contract "${FIXTURE}" \
      --model-provenance-repo "${REPO}" --model-provenance-rev "${REV}" --out "$2") >&2
 }
 validate() { "${BENCHD}" validate-golden --golden "$1" --track "${TRACK}" --contract "${FIXTURE}" >&2; }
@@ -178,7 +181,7 @@ for d in ${DEPTHS[@]+"${DEPTHS[@]}"}; do
   log "mtp${d} resident: ${ORACLE_NAMES[*]}"
   boot mtp "${d}"
   for n in "${ORACLE_NAMES[@]}"; do
-    record "${n}" "${OUT}/${n}.mtp${d}.raw.json"
+    record "${n}" "${OUT}/${n}.mtp${d}.raw.json" "mtp:${d}"
     jq --slurpfile serial "${OUT}/${n}.golden.json" '.cases = $serial[0].cases' \
       "${OUT}/${n}.mtp${d}.raw.json" > "${OUT}/${n}.mtp${d}.golden.json"
     rm -f "${OUT}/${n}.mtp${d}.raw.json"

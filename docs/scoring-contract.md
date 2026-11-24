@@ -32,7 +32,7 @@ benchd writes that string into every `score.json`, and
 `tools/lint-benchmark-manifest.py` requires the manifest to state the same
 string, so readers can match the two. The name comes from the track family
 that first ruled this paired regime. It does not describe this track's
-model or modes: this track is serial only. The label changes only when
+model or modes: this track runs serial plus the pinned DFlash drafter. The label changes only when
 benchd, `benchmark.json` and every reader of `score.json` adopt a new name
 together.
 

@@ -25,8 +25,11 @@ fail() { echo "FAIL: $*" >&2; failures=$((failures + 1)); }
 ok()   { echo "ok: $*"; }
 
 # lint_with JQ -- lint benchmark.json against the fixture edited by JQ.
+# The fixture copy carries a stand-in pin for each per-depth oracle the box has
+# not recorded yet (tools/testlib/standin-oracles.jq): this suite is about the
+# scoring limits, and the lint run on the committed tree reports that gap.
 lint_with() {
-  jq "$1" "${ROOT_DIR}/${FIXTURE_REL}" > "${WORK}/fixture.json"
+  jq -f "${ROOT_DIR}/tools/testlib/standin-oracles.jq" "${ROOT_DIR}/${FIXTURE_REL}" | jq "$1" > "${WORK}/fixture.json"
   jq --arg c "${WORK}/fixture.json" '.contractPath = $c' "${ROOT_DIR}/benchmark.json" > "${WORK}/benchmark.json"
   python3 "${ROOT_DIR}/tools/lint-benchmark-manifest.py" --manifest "${WORK}/benchmark.json" 2>&1
 }
@@ -35,7 +38,7 @@ out="$(lint_with '.')"; rc=$?
 [[ "${rc}" -eq 0 ]] && grep -q "states the fixture's decode_speedup_ceiling = ${CEILING}" <<<"${out}" \
   && grep -q "states the fixture's prefill_speedup_ceiling = ${PREFILL_CEILING}" <<<"${out}" \
   && grep -q "the early-decode limit is ${SEED_RATIO}" <<<"${out}" \
-  && ok "case 1: the committed files pass and state the same ceilings" \
+  && ok "case 1: the committed files (stand-in oracle pins) pass and state the same ceilings" \
   || fail "case 1: rc=${rc}: $(grep -E '^FAIL' <<<"${out}" | head -3)"
 
 out="$(lint_with 'del(.decode_speedup_ceiling)')"; rc=$?

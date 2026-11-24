@@ -622,8 +622,16 @@ _SPECULATIVE_DECODING_MODELS = {
     # the registry is asked for is DFlashMuseGlimmerAssistantModel -- same
     # convention as DFlashLagunaForCausalLM. The bare name is kept as a
     # defensive alias (both lines carried from the vendor tree, PR #51655).
-    "MuseGlimmerAssistantModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
-    "DFlashMuseGlimmerAssistantModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
+    # The head's checkpoint names its context projection encoder.fc /
+    # encoder.output_norm_enc; DFlashMuseGlimmerAssistantForCausalLM maps them.
+    "MuseGlimmerAssistantModel": (
+        "qwen3_dflash",
+        "DFlashMuseGlimmerAssistantForCausalLM",
+    ),
+    "DFlashMuseGlimmerAssistantModel": (
+        "qwen3_dflash",
+        "DFlashMuseGlimmerAssistantForCausalLM",
+    ),
     "DSparkDraftModel": ("vllm.models.deepseek_v4", "DSparkDeepseekV4ForCausalLM"),
     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "K3DSparkModel": (

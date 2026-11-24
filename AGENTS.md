@@ -33,9 +33,14 @@ changing what it computes: the output must match the golden token for token
 | Dense MLP (NVFP4 W4A16) | `vllm/vllm/model_executor/layers/linear.py`, `.../quantization/` |
 | New CUDA kernels | `harness/kernels/` + `harness/kernels/build.sh` |
 
-This track is serial only: `allowed_modes` is `[serial]` and there is no
-speculative lever. `mtp-head.manifest.json` is still an editable path, but it
-must declare `"source": "none"`.
+This track pins one DFlash drafter, `meta-models/Muse-Glimmer-30B-assistant`
+@ `c676cce91658f9568aaf264a416211e2782735b7` (fixture `mtp_head`, every file by
+sha256), staged by the organizer and mounted read-only. `allowed_modes` is
+`[serial, mtp]`: a speculative leg is wire mode `mtp` at depth N, served by
+the pinned drafter (`mtp_head.decoder` `dflash`). In `mtp-head.manifest.json` you may switch it on
+(`spec.enabled`) and pick a depth from `permitted_draft_depths` `[1..6]`. You
+may NOT bring your own drafter or any other weights, name a path, or use the
+network; the 40 MiB editable-surface cap is unchanged.
 
 ## Rules
 
@@ -58,8 +63,8 @@ must declare `"source": "none"`.
   the golden at any token, even at a logit tie, the run fails (contract
   section 5.4.1). The ranked run and the local modes apply the same rule.
 - **Keep the engine reproducible.** Run `tools/determinism-probe.py` against a
-  booted resident; it must report one stream at serial; this track has no other
-  mode. It runs the engine this checkout staged
+  booted resident; it must report one stream at serial and one stream at each
+  drafter depth you declare. It runs the engine this checkout staged
   (`.build/release/mlxfast-runtime-worker`, or `MLXFAST_ENGINE_BIN`). The
   fixture disables
   `FlashInferFP8ScaledMMLinearKernel` because this checkpoint quantizes its

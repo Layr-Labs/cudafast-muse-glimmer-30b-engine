@@ -54,7 +54,7 @@ The transport is NDJSON over `AF_UNIX`/`SOCK_STREAM`:
 
 | Verb | Request | Response |
 | --- | --- | --- |
-| `hello` | — | `vocab_size`, `eos_token`, `mtp_armed`, `draft_tokens` (depth + 1), `ctx_size`, `load_epoch` (ms timestamp of the load), `spec_run`, `ident`, `model_path`, `mtp_head_path` |
+| `hello` | — | `vocab_size`, `eos_token`, `mtp_armed`, `draft_tokens` (depth + 1), `ctx_size`, `load_epoch` (ms timestamp of the load), `spec_run`, `ident`, `model_path`, `mtp_head_path` (the pinned drafter's directory on a dflash leg, `<model>#mtp.*` on an mtp leg, empty on a serial leg) |
 | `invalidate` | — | — |
 | `sync` | `tokens`, optional `max_tokens` | `token` (the frontier argmax) |
 | `eval` | `token` | `token` |

@@ -387,11 +387,16 @@ fi
 # Otherwise the ranked run scores ONE prompt per job: the one the workflow
 # draws from live_golden_rotation.pool (tools/draw-live-golden.sh), or the
 # fixture's live_golden when it declares no rotation. Every prompt a job can
-# measure must carry its serial golden (a timed_prompt_pool entry) and one
-# per-depth oracle for every permitted draft depth, all pinned and staged. The
-# loops above already pin-verified what is pinned; this refuses, by name, a
-# prompt with any of the seven missing, pre-GPU rather than in the one job
-# that happens to measure it.
+# measure must carry its serial golden (a timed_prompt_pool entry), pinned and
+# staged. ONLY THE DECLARED DEPTH NEEDS AN ORACLE: the job scores the serial
+# control leg and one candidate leg at the depth the declaration enables
+# (tools/spec-declaration.sh, the single trusted source section 7 reads too).
+# A serial declaration needs no per-depth oracle at all; an enabled depth N
+# needs speculative_oracles.<prompt>.mtp<N> for every prompt, pinned and
+# staged, and a declared depth with no pinned oracle is refused fail-closed.
+# The loops above already pin-verified what is pinned; this refuses, by name,
+# a prompt with any of them missing, pre-GPU rather than in the one job that
+# happens to measure it.
 if [[ "$(jq -r 'has("live_goldens")' "${CONTRACT}")" == "true" ]]; then
   [[ "$(jq -r 'has("live_golden_rotation")' "${CONTRACT}")" != "true" ]] \
     || fail "the fixture declares both live_goldens and live_golden_rotation; a job either measures every live golden or draws one prompt"
@@ -409,7 +414,15 @@ elif [[ "$(jq -r 'has("live_golden_rotation")' "${CONTRACT}")" == "true" ]]; the
 else
   ROTATION_POOL=("${LIVE_GOLDEN_NAME}")
 fi
-mapfile -t PERMITTED_DEPTHS < <(jq -r '.mtp_head.permitted_draft_depths // [] | .[]' "${CONTRACT}")
+if ! oracle_decl="$("${REPO_ROOT}/tools/spec-declaration.sh" describe)"; then
+  fail "the speculative-decode declaration (mtp-head.manifest.json) is invalid; tools/spec-declaration.sh names why above. An undeclared or disabled declaration is valid and derives serial"
+fi
+DECLARED_DEPTHS=()
+case "${oracle_decl}" in
+  serial) ;;
+  mtp[1-9]*) DECLARED_DEPTHS=("${oracle_decl#mtp}") ;;
+  *) fail "tools/spec-declaration.sh describe printed '${oracle_decl}', not serial or mtp<N>" ;;
+esac
 for prompt in "${ROTATION_POOL[@]}"; do
   [[ "${prompt}" =~ ^[a-z0-9_-]+$ ]] || fail "rotation pool name '${prompt}' is not [a-z0-9_-]+"
   base="${prompt}.golden.json"
@@ -417,17 +430,21 @@ for prompt in "${ROTATION_POOL[@]}"; do
     || fail "rotation pool prompt '${prompt}' names no timed_prompt_pool entry (looked for ${base}); its serial golden carries no pin"
   [[ -f "${GOLDEN_DIR}/${base}" ]] \
     || fail "rotation pool prompt '${prompt}': its serial golden ${base} is not staged in ${GOLDEN_DIR}"
-  for d in "${PERMITTED_DEPTHS[@]}"; do
+  for d in ${DECLARED_DEPTHS[@]+"${DECLARED_DEPTHS[@]}"}; do
     oracle="$(jq -r --arg p "${prompt}" --arg k "mtp${d}" '.speculative_oracles[$p][$k].r2_path // ""' "${CONTRACT}")"
     [[ -n "${oracle}" ]] \
-      || fail "rotation pool prompt '${prompt}' has no pinned per-depth oracle speculative_oracles[${prompt}][mtp${d}]; record it with tools/record-goldens.sh --oracles-for ${prompt}"
+      || fail "rotation pool prompt '${prompt}' has no pinned per-depth oracle speculative_oracles[${prompt}][mtp${d}]; the declaration enables mtp${d}, and a declared depth with no pinned oracle cannot be scored. Record it with tools/record-goldens.sh --oracles-for ${prompt}"
     [[ "${oracle##*/}" == "${prompt}.mtp${d}.golden.json" ]] \
       || fail "speculative_oracles[${prompt}][mtp${d}] points at ${oracle##*/}, not ${prompt}.mtp${d}.golden.json"
     [[ -f "${GOLDEN_DIR}/${oracle##*/}" ]] \
       || fail "rotation pool prompt '${prompt}': its per-depth oracle ${oracle##*/} is not staged in ${GOLDEN_DIR}"
   done
 done
-ok "every rotation pool prompt (${ROTATION_POOL[*]}) has its serial golden and ${#PERMITTED_DEPTHS[@]} per-depth oracle(s) pinned and staged"
+if [[ ${#DECLARED_DEPTHS[@]} -eq 0 ]]; then
+  ok "every rotation pool prompt (${ROTATION_POOL[*]}) has its serial golden pinned and staged; the declaration is serial, so no per-depth oracle is needed"
+else
+  ok "every rotation pool prompt (${ROTATION_POOL[*]}) has its serial golden and the declared mtp${DECLARED_DEPTHS[0]} oracle pinned and staged"
+fi
 
 # --- 5. the fixture is armed for official scoring ---------------------------
 # benchd refuses, pre-GPU, to seal an official artifact unless the fixture
@@ -503,10 +520,21 @@ decl_draft="$("${REPO_ROOT}/tools/spec-declaration.sh" draft-len)"
 [[ -z "${SERVE_UP_SPECULATIVE:-}" ]] \
   || fail "a box pre-set SERVE_UP_SPECULATIVE=${SERVE_UP_SPECULATIVE}; on the paired path that value reaches BOTH legs' serve scripts and the serial-control leg must be serial whatever the candidate declares. The serve spec comes from the declaration only"
 if [[ "${decl_spec}" == "1" ]]; then
+  decl_decoder="$("${REPO_ROOT}/tools/spec-declaration.sh" decoder)"
   armed="$(jq -r '.official_scoring_enabled // false' "${CONTRACT}")"
   [[ "${armed}" == "true" ]] \
-    || fail "the declaration enables MTP speculation (num_speculative_tokens=${decl_draft}) but fixtures/muse_glimmer_30b_cuda_v1_track.json is not armed (official_scoring_enabled != true); the arm gate opens only for a valid declaration on an armed fixture"
-  ok "serve spec is the declared MTP config (num_speculative_tokens=${decl_draft}) and the fixture is armed"
+    || fail "the declaration enables ${decl_decoder} speculation (num_speculative_tokens=${decl_draft}) but fixtures/muse_glimmer_30b_cuda_v1_track.json is not armed (official_scoring_enabled != true); the arm gate opens only for a valid declaration on an armed fixture"
+  # A dflash leg loads the contract's pinned drafter, which the box stages
+  # outside every checkout (setup.sh verified its bytes and sha256 above).
+  if [[ "${decl_decoder}" == "dflash" ]]; then
+    drafter_dir="${MLXFAST_DRAFTER_DIR:-}"
+    [[ -n "${drafter_dir}" && -d "${drafter_dir}" ]] \
+      || fail "the declaration enables the pinned DFlash drafter but MLXFAST_DRAFTER_DIR ('${drafter_dir}') is not a directory on this box; the organizer stages it (setup.sh verifies it)"
+    drafter_dir="$(cd -- "${drafter_dir}" && pwd -P)"
+    [[ "${drafter_dir}/" != "${REPO_ROOT}/"* ]] \
+      || fail "MLXFAST_DRAFTER_DIR=${drafter_dir} is inside the checkout ${REPO_ROOT}; the pinned drafter is organizer-staged, never part of a tree"
+  fi
+  ok "serve spec is the declared ${decl_decoder} config (num_speculative_tokens=${decl_draft}) and the fixture is armed"
 else
   ok "serve spec is the serial launch reference (SERVE_UP_SPECULATIVE=0; declaration absent or disabled)"
 fi

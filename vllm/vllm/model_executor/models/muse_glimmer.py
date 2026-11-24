@@ -2252,6 +2252,18 @@ class MuseGlimmerForCausalLM(
                 embeddings.extend(self._process_video_input(video_input))
         return embeddings
 
+    # The SupportsEagle3 defaults reach the decoder through
+    # get_language_model().model, but here get_language_model() IS the decoder
+    # (self.model, marked by _mark_language_model), which has no .model. A
+    # DFlash/EAGLE-3 drafter therefore sets and reads the auxiliary layers on
+    # self.model directly.
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model._set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,

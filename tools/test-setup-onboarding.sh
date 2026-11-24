@@ -16,6 +16,8 @@ sha256_of() {
 ROOT="${WORK}/checkout with spaces"
 mkdir -p "${ROOT}/fixtures" "${ROOT}/tools" "${ROOT}/.build/release" "${ROOT}/.build/vllm-overlay/vllm"
 cp "${REPO_ROOT}/setup.sh" "${ROOT}/"
+# The trusted helpers step 2 calls for a contract that pins a drafter (case 11+).
+cp "${REPO_ROOT}/tools/spec-declaration.sh" "${REPO_ROOT}/tools/drafter-dir-check.sh" "${ROOT}/tools/"
 printf '#!/usr/bin/env bash\nexit 0\n' > "${ROOT}/.build/release/mlxfast-runtime-worker"
 touch "${ROOT}/.build/vllm-overlay/vllm/__init__.py"
 chmod +x "${ROOT}/.build/release/mlxfast-runtime-worker"
@@ -164,4 +166,76 @@ run_setup skipped MLXFAST_SKIP_WEIGHTS_DOWNLOAD=1
 [[ "$(downloads skipped)" == 0 && ! -d "${DEFAULT_DIR}" ]]
 grep -q 'not verifying the checkpoint' "${WORK}/skipped.log"
 
-echo 'test-setup-onboarding.sh: all 10 cases passed'
+# 11. A contract that pins a drafter (mtp_head.source "pinned"): step 2 also
+#     fills and verifies it from its own pinned repository, under the same
+#     rules; a staged MLXFAST_DRAFTER_DIR with a wrong digest refuses.
+DSOURCE="${WORK}/drafter-source"
+mkdir -p "${DSOURCE}"
+dpins='[]'
+for f in config.json model.safetensors; do
+  head -c $((RANDOM + 500)) /dev/urandom > "${DSOURCE}/${f}"
+  dpins="$(jq -c --arg p "${f}" --argjson b "$(wc -c < "${DSOURCE}/${f}" | tr -d ' ')" \
+    --arg s "$(sha256_of "${DSOURCE}/${f}")" '. + [{path:$p, bytes:$b, sha256:$s}]' <<<"${dpins}")"
+done
+jq -n --argjson files "${pins}" --argjson dfiles "${dpins}" \
+  '{target:{upstream_model_id:"example/model", upstream_revision:"0000000", files:$files},
+    allowed_modes:["serial","mtp"],
+    mtp_head:{source:"pinned", decoder:"dflash", upstream_model_id:"example/drafter", upstream_revision:"1111111",
+              files:$dfiles, permitted_draft_depths:[1,2,3]}}' \
+  > "${ROOT}/fixtures/muse_glimmer_30b_cuda_v1_track.json"
+DDEFAULT="${ROOT}/reference_weights/Muse-Glimmer-30B-assistant"
+# 12. A SERIAL declaration (none, or spec disabled) needs no drafter: nothing is
+#     required, hashed or fetched for it, even with no MLXFAST_DRAFTER_DIR and
+#     an unreachable drafter source.
+for decl in none disabled; do
+  if [[ "${decl}" == disabled ]]; then
+    printf '{"version":1,"spec":{"decoder":"dflash","enabled":false,"num_speculative_tokens":0}}\n' > "${ROOT}/mtp-head.manifest.json"
+  fi
+  run_setup "serial_${decl}" MLXFAST_DRAFTER_BASE_URL="file://${WORK}/nowhere"
+  [[ "${rc}" == 0 ]] || { cat "${WORK}/serial_${decl}.log"; exit 1; }
+  grep -q 'the declaration is serial: the pinned drafter is not needed, verified or fetched' "${WORK}/serial_${decl}.log"
+  if grep -qE 'pinned drafter verified|verifying the pinned pinned drafter|MLXFAST_DRAFTER_DIR is unset' "${WORK}/serial_${decl}.log"; then
+    cat "${WORK}/serial_${decl}.log"; exit 1
+  fi
+  [[ ! -e "${DDEFAULT}" ]]
+done
+# ...and a staged box that exports no drafter directory at all passes too.
+cp "${SOURCE}/$(source_path "${FILES[4]}")" "${BOX}/${FILES[4]}"   # case 8 shortened it
+run_setup serial_box MLXFAST_TARGET_SNAPSHOT_DIR="${BOX}" MLXFAST_DRAFTER_DIR="${WORK}/no-such-drafter"
+[[ "${rc}" == 0 && "$(downloads serial_box)" == 0 ]] || { cat "${WORK}/serial_box.log"; exit 1; }
+# An invalid declaration is refused, never read as serial.
+printf '{"version":1,"spec":{"enabled":true,"num_speculative_tokens":7}}\n' > "${ROOT}/mtp-head.manifest.json"
+run_setup bad_decl
+[[ "${rc}" == 1 ]]
+grep -q 'not a contract-permitted draft depth' "${WORK}/bad_decl.log"
+# 11. The declaration switches speculation on: the drafter is required.
+printf '{"version":1,"spec":{"decoder":"dflash","enabled":true,"num_speculative_tokens":2}}\n' > "${ROOT}/mtp-head.manifest.json"
+run_setup drafter MLXFAST_DRAFTER_BASE_URL="file://${DSOURCE}"
+[[ "${rc}" == 0 ]] || { cat "${WORK}/drafter.log"; exit 1; }
+cmp -s "${DSOURCE}/model.safetensors" "${DDEFAULT}/model.safetensors"
+grep -q 'MLXFAST_DRAFTER_DIR is unset; using' "${WORK}/drafter.log"
+grep -q 'pinned drafter verified: 2 files by byte count and sha256' "${WORK}/drafter.log"
+DBOX="${WORK}/box drafter"
+mkdir -p "${DBOX}"
+cp "${DSOURCE}/config.json" "${DBOX}/"
+head -c "$(wc -c < "${DSOURCE}/model.safetensors" | tr -d ' ')" /dev/zero > "${DBOX}/model.safetensors"
+cp "${SOURCE}/$(source_path "${FILES[4]}")" "${BOX}/${FILES[4]}"   # case 8 shortened it
+run_setup drafter_box MLXFAST_TARGET_SNAPSHOT_DIR="${BOX}" MLXFAST_DRAFTER_DIR="${DBOX}"
+[[ "${rc}" == 1 && "$(downloads drafter_box)" == 0 ]]
+grep -q 'sha256 mismatch for model.safetensors' "${WORK}/drafter_box.log"
+# 13. A staged drafter directory holds EXACTLY the pinned files: the right
+#     bytes pass, and the same directory with one unlisted file is refused.
+DBOX2="${WORK}/box drafter exact"
+mkdir -p "${DBOX2}"
+cp "${DSOURCE}/config.json" "${DSOURCE}/model.safetensors" "${DBOX2}/"
+run_setup drafter_exact MLXFAST_TARGET_SNAPSHOT_DIR="${BOX}" MLXFAST_DRAFTER_DIR="${DBOX2}"
+[[ "${rc}" == 0 && "$(downloads drafter_exact)" == 0 ]] || { cat "${WORK}/drafter_exact.log"; exit 1; }
+grep -q 'holds exactly the 2 pinned drafter file(s)' "${WORK}/drafter_exact.log"
+printf 'x' > "${DBOX2}/extra.safetensors"
+run_setup drafter_extra MLXFAST_TARGET_SNAPSHOT_DIR="${BOX}" MLXFAST_DRAFTER_DIR="${DBOX2}"
+[[ "${rc}" == 1 ]] || { cat "${WORK}/drafter_extra.log"; exit 1; }
+grep -q 'the contract does not pin: extra.safetensors' "${WORK}/drafter_extra.log"
+write_fixture "${pins}"
+printf '{"version":1}\n' > "${ROOT}/mtp-head.manifest.json"
+
+echo 'test-setup-onboarding.sh: all 13 cases passed'

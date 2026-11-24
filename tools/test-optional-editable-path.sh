@@ -28,6 +28,11 @@ mkdir -p "${T}"
 (cd "${ROOT_DIR}" && git ls-files -z | tar --null -T - -cf -) | tar -xf - -C "${T}" \
   || { echo "FAIL: cannot copy the tree" >&2; exit 1; }
 rm -f "${T}/mtp-head.manifest.json"
+# A stand-in pin for each per-depth oracle the box has not recorded yet
+# (tools/testlib/standin-oracles.jq): this suite is about the optional path;
+# the lint run on the committed tree reports that gap.
+FIX="${T}/$(jq -r .contractPath "${T}/benchmark.json")"
+jq -f "${ROOT_DIR}/tools/testlib/standin-oracles.jq" "${FIX}" > "${WORK}/fixture.json" && cat "${WORK}/fixture.json" > "${FIX}"
 
 lint() { python3 "${T}/tools/lint-benchmark-manifest.py" --repo-root "${T}" --gitlink-targets report > "${WORK}/lint.out" 2>&1; }
 review() {
