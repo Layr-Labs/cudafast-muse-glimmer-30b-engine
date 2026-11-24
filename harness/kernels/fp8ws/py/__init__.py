@@ -4,18 +4,16 @@
 From SP5D's Yukon submission 98c1361e-289f-45a3-8471-5df0259bd3b2 (harness/kernels/fp8ws), unchanged apart from SHAPES."""
 
 import ctypes
+import os
 from pathlib import Path
 
 import torch
 
 M = 512
-# Muse Glimmer routing (integration3): only the attention qkv and output-gate projections, where this kernel beat
-# stock CUTLASS in sustained capped timing on GB10 (opus-prefill2 ws-w1). o_proj (6656, 4096) was slower, down
-# (6656, 19968) runs on muse_fp8_prefill's 128x192 tile and FP8 gate/up (39936, 6656) on muse_fp8_swiglu.
-SHAPES = frozenset({
-    (4608, 6656),
-    (4096, 6656),
-})
+SHAPES = frozenset(
+    {(4608, 6656), (4096, 6656)}
+    | ({(6656, 4096), (6656, 19968)} if os.environ.get("FP8WS_6656", "1") != "0" else set())
+)
 _lib = None
 _load_failed = False
 _ready_devices: set[int] = set()
