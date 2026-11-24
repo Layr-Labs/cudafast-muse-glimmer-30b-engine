@@ -59,7 +59,95 @@ __global__ void __launch_bounds__(kThreads) embed_scale(const Id* __restrict__ i
   }
   out[static_cast<size_t>(row) * vec_per_row + v] = make_uint4(o[0], o[1], o[2], o[3]);
 }
+
+// Single-CTA exact M=1 decode embedding + weightless RMSNorm (width <= 8192, width % 8 == 0).
+// Matches ATen's gpu_reduce_kernel<float, MeanOps, vt0=4, input_vec_size=4> for rows == 1:
+// block_width = 512, step_input = 512, 4 vectorized accumulators per thread combined in order
+// (((a0 + a1) + a2) + a3), shared tree reduction offset 256 -> 32, warp shfl_down 16 -> 1,
+// mean = sum * float(1.0 / width), inv = rsqrtf(mean + eps), then bf16_rne(x * inv).
+template <typename Id>
+__global__ void __launch_bounds__(512) embed_norm_m1(
+    const Id* __restrict__ ids, const uint2* __restrict__ table, float eps,
+    uint2* __restrict__ out, int width) {
+  asm volatile("griddepcontrol.launch_dependents;");
+  __shared__ float smem[512];
+  const int t = threadIdx.x;
+  const int vec4 = width >> 2;
+  const long long id = static_cast<long long>(ids[0]);
+  const uint2* row_ptr = table + id * static_cast<size_t>(vec4);
+
+  float f[4][4];
+  float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+#pragma unroll
+  for (int it = 0; it < 4; ++it) {
+    const int idx = t + it * 512;
+    if (idx < vec4) {
+      const uint2 raw = row_ptr[idx];
+      const float x0 = __uint_as_float(raw.x << 16);
+      const float x1 = __uint_as_float(raw.x & 0xffff0000u);
+      const float x2 = __uint_as_float(raw.y << 16);
+      const float x3 = __uint_as_float(raw.y & 0xffff0000u);
+      f[it][0] = x0;
+      f[it][1] = x1;
+      f[it][2] = x2;
+      f[it][3] = x3;
+      acc0 = __fadd_rn(acc0, __fmul_rn(x0, x0));
+      acc1 = __fadd_rn(acc1, __fmul_rn(x1, x1));
+      acc2 = __fadd_rn(acc2, __fmul_rn(x2, x2));
+      acc3 = __fadd_rn(acc3, __fmul_rn(x3, x3));
+    }
+  }
+  float v = __fadd_rn(__fadd_rn(__fadd_rn(acc0, acc1), acc2), acc3);
+  smem[t] = v;
+#pragma unroll
+  for (int offset = 256; offset >= 32; offset >>= 1) {
+    __syncthreads();
+    if (t < offset) {
+      v = __fadd_rn(v, smem[t + offset]);
+      smem[t] = v;
+    }
+  }
+  __syncthreads();
+  if (t < 32) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, offset));
+    }
+    if (t == 0) {
+      const float factor = static_cast<float>(1.0 / static_cast<double>(width));
+      const float mean = __fmul_rn(v, factor);
+      smem[0] = rsqrtf(__fadd_rn(mean, eps));
+    }
+  }
+  __syncthreads();
+  const float r = smem[0];
+#pragma unroll
+  for (int it = 0; it < 4; ++it) {
+    const int idx = t + it * 512;
+    if (idx < vec4) {
+      const unsigned lo0 = bf16_rne(__fmul_rn(f[it][0], r));
+      const unsigned hi0 = bf16_rne(__fmul_rn(f[it][1], r));
+      const unsigned lo1 = bf16_rne(__fmul_rn(f[it][2], r));
+      const unsigned hi1 = bf16_rne(__fmul_rn(f[it][3], r));
+      out[idx] = make_uint2(lo0 | (hi0 << 16), lo1 | (hi1 << 16));
+    }
+  }
+}
 }  // namespace
+
+extern "C" int muse_embed_norm_m1(const void* ids, int ids_64, const void* table, float eps,
+                                  void* out, int width, cudaStream_t stream) {
+  if (width <= 0 || (width & 7) != 0 || width > 8192) return cudaErrorInvalidValue;
+  if (ids_64)
+    embed_norm_m1<long long><<<1, 512, 0, stream>>>(
+        static_cast<const long long*>(ids), static_cast<const uint2*>(table), eps,
+        static_cast<uint2*>(out), width);
+  else
+    embed_norm_m1<int><<<1, 512, 0, stream>>>(
+        static_cast<const int*>(ids), static_cast<const uint2*>(table), eps,
+        static_cast<uint2*>(out), width);
+  return static_cast<int>(cudaGetLastError());
+}
 
 extern "C" int muse_embed_square(const void* ids, int ids_64, const void* table, void* x2, int rows, int width,
                                  cudaStream_t stream) {

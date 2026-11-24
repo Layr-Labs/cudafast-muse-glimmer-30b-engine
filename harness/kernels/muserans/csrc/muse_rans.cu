@@ -279,7 +279,7 @@ struct RansProb {
   const uint8_t* hdr; const uint8_t* stream; const int* woff16; const uint32_t* lut;
   const uint8_t* x; const uint16_t* x_aux; int act_mode;
   const float* sb; int sb_scalar; const float* sa;
-  __nv_bfloat16* out; int N; int K; int tw; int ilv; size_t stream_bytes; size_t tpf_stride;
+  __nv_bfloat16* out; int N; int K; int tw; int ilv; int strided_w; int lut_first; size_t stream_bytes; size_t tpf_stride;
 };
 
 static size_t rans_tpf_stride() {
@@ -304,7 +304,7 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   const int xbytes = (K + 15) & ~15;
   const uint32_t sbase0 = (uint32_t)__cvta_generic_to_shared(smem) + (uint32_t)xbytes;
   const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + (uint32_t)wib * RB;
-  const int w = blockIdx.x * wpb + wib;
+  const int w = pb.strided_w ? (wib * gridDim.x + blockIdx.x) : (blockIdx.x * wpb + wib);
   const bool active = w < pb.tw;
   const uint8_t* ws = pb.stream;
   uint32_t wbytes = 0;
@@ -322,6 +322,26 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
 #if RANS_PREISSUE
   const bool fast_preissue = (pb.ilv != 0 && pb.K >= 2048 && RG <= 8);
 #endif
+  // lut_first (MUSERANS_LUT_FIRST, default on): the 16 KB decode table goes out as cp.async BEFORE the weight
+  // pre-issue and the per-warp stream offsets are loaded next to it, so neither queues in DRAM behind the
+  // pre-issued groups; the prologue (x staging) then overlaps them and the main loop starts ~2-3 us earlier.
+  // Same table, same offsets, same stream: bit-identical output.
+  const bool lut_first = pb.lut_first != 0;
+  int pre_wo0 = 0, pre_wo1 = 0, pre_tof = 0, pre_gmin = 0;
+  if (lut_first) {
+    const uint32_t lut_sa = (uint32_t)__cvta_generic_to_shared(lut_s);
+    for (int i = tid; i < RANS_LUT_BYTES / 16; i += blockDim.x)
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(lut_sa + 16u * (uint32_t)i), "l"(((const uint4*)pb.lut) + i));
+    rans_cp_commit();
+#if RANS_PREISSUE
+    if (active && fast_preissue) {
+      pre_wo0 = __ldg(pb.woff16 + w);
+      pre_wo1 = __ldg(pb.woff16 + w + 1);
+      pre_tof = __ldg(pb.woff16 + pb.tw + 1 + w);
+      pre_gmin = (int)__ldg((const uint32_t*)pb.hdr + 14);
+    }
+#endif
+  }
   if (active) {
 #if RANS_PREISSUE
     if (fast_preissue) {
@@ -357,7 +377,8 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
       asm volatile("prefetch.global.L2 [%0];" ::"l"(pb.stream + off));
     }
   }
-  for (int i = tid; i < RANS_LUT_BYTES / 16; i += blockDim.x) ((uint4*)lut_s)[i] = ((const uint4*)pb.lut)[i];
+  if (!lut_first)
+    for (int i = tid; i < RANS_LUT_BYTES / 16; i += blockDim.x) ((uint4*)lut_s)[i] = ((const uint4*)pb.lut)[i];
   if (pb.act_mode == 0) {
     for (int i = tid; i < S * 4; i += blockDim.x) {
       int s = i >> 2, tt = i & 3;
@@ -409,10 +430,21 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   }
 #if RANS_PREISSUE
   if (active && fast_preissue) {
-    wbytes = (uint32_t)(pb.woff16[w + 1] - pb.woff16[w]) * 16u;
-    gmin = (int)((const uint32_t*)pb.hdr)[14];
-    toffw = pb.woff16[pb.tw + 1 + w];
+    if (lut_first) {
+      wbytes = (uint32_t)(pre_wo1 - pre_wo0) * 16u;
+      gmin = pre_gmin;
+      toffw = pre_tof;
+    } else {
+      wbytes = (uint32_t)(pb.woff16[w + 1] - pb.woff16[w]) * 16u;
+      gmin = (int)((const uint32_t*)pb.hdr)[14];
+      toffw = pb.woff16[pb.tw + 1 + w];
+    }
   }
+  if (lut_first) {  // the table's group is older than the RG - 1 pre-issued weight groups of an active warp
+    if (active) rans_cp_wait<RG - 1>(); else rans_cp_wait<0>();
+  }
+#else
+  if (lut_first) rans_cp_wait<0>();
 #endif
   __syncthreads();
   if (!active) return;
@@ -665,8 +697,23 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   pb.tpf_stride = rans_tpf_stride();
   TORCH_CHECK(tw >= 1 && tw <= N / 8 && wpb >= 1 && wpb <= 32 && (ns == 1 || ns == 2 || ns == 4) && (rg == 4 || rg == 8) && (ilv == 0 || ilv == 9), "bad launch config");
   const int blocks = (tw + wpb - 1) / wpb;
-  const size_t dsmem = rans_dsmem(K, wpb, 9, rg);
+  static const bool strided_gu = []() {
+    const char* env = std::getenv("MUSERANS_STRIDED_GATE_UP");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  pb.strided_w = (strided_gu && N == 39936 && K == 6656 && tw == blocks * wpb) ? 1 : 0;
+  static const bool lut_first = []() {
+    const char* env = std::getenv("MUSERANS_LUT_FIRST");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  pb.lut_first = lut_first ? 1 : 0;
+  size_t dsmem = rans_dsmem(K, wpb, 9, rg);
   TORCH_CHECK(rans_fits(K, wpb, 9, rg), "rans smem too large (K too large for smem staging of x): ", dsmem);
+  static const bool lock48 = []() {
+    const char* env = std::getenv("MUSERANS_SMEM_LOCK48");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  if (lock48 && blocks == 48 && dsmem < 40960) dsmem = 40960;
   rans_set_attrs_once();
 #define RANS_L2(NSV, RGV) \
   if (ns == NSV && rg == RGV) rans_gemv_kernel<NSV, 9, RGV><<<blocks, wpb * 32, dsmem, st>>>(pb);

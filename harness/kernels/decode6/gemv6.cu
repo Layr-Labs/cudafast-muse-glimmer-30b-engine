@@ -23,10 +23,10 @@ static int decode6_gate_blocks() {
   if (g_gate_blocks < 0) {
     const char* env = std::getenv("MUSE_NV6_GATE_BLOCKS");
     if (!env || !*env) {
-      g_gate_blocks = 24;
+      g_gate_blocks = 48;
     } else {
       int v = static_cast<int>(std::strtol(env, nullptr, 10));
-      g_gate_blocks = (v == 24 || v == 32 || v == 48) ? v : 24;
+      g_gate_blocks = (v == 0 || v == 24) ? 24 : ((v == 32 || v == 48) ? v : 48);
     }
   }
   return g_gate_blocks;
@@ -52,7 +52,7 @@ cudaError_t launch(const int4* input, const int4* weight, int4* output,
     kernel<<<grid, Threads, shared, stream>>>(
         input, weight, output, partials, nullptr, nullptr, scales6, global_scale,
         nullptr, nullptr, k / 16, 1, n, k, k, locks, false, false, true, shared, palette,
-        decode6_attn_tpf_stride());
+        decode6_attn_tpf_stride(), nullptr, nullptr, nullptr, 0, nullptr);
     return cudaGetLastError();
 }
 }  // namespace

@@ -34,6 +34,7 @@ ENABLED = os.environ.get("MUSE_DECODE_PLACEMENT", "1").strip() not in ("0", "", 
 FULL_RAM_SCAN = os.environ.get("MUSE_FULL_RAM_SCAN", "1").strip() not in ("0", "", "false", "no")
 PLACE_SCALES6 = os.environ.get("MUSE_PLACE_SCALES6", "1").strip() not in ("0", "", "false", "no")
 SURPLUS = float(os.environ.get("MUSE_DECODE_PLACEMENT_SURPLUS", "3.0"))
+LARGE_RANS_SURPLUS = float(os.environ.get("MUSE_LARGE_RANS_SURPLUS", "6.0"))
 LM_HEAD_SPARES = int(os.environ.get("MUSE_LM_HEAD_SPARES", "24"))
 ROUNDS = 5
 # Weights that fit in L2 several times over are not bandwidth-bound per call.
@@ -42,8 +43,31 @@ MIN_PAYLOAD_BYTES = 48 << 20
 HOST_HEADROOM_BYTES = 20 << 30
 _NAME = "_marlin_decode_weight"
 _L2_FLUSH_INTS = 16 << 20  # 64 MiB (> 2.5x GB10's 24 MiB L2)
-# Quarantine below-median (slow) buffers from place_decode_weights through place_prefill_weights.
+# Quarantine below-median (slow) buffers from place_decode_weights through place_prefill_weights (and KV-cache init).
 _SLOW_HOLD: list[torch.Tensor] = []
+HOLD_SLOW_FOR_KV = os.environ.get("MUSE_HOLD_SLOW_FOR_KV", "1").strip() not in ("0", "", "false", "no")
+
+
+def ensure_slow_hold_headroom(min_free_bytes: int) -> None:
+    """Trim oldest _SLOW_HOLD slabs only if available host memory is below min_free_bytes."""
+    if not _SLOW_HOLD or not torch.cuda.is_available():
+        return
+    while _SLOW_HOLD:
+        avail = _mem_available()
+        if avail is None or avail >= min_free_bytes:
+            break
+        del _SLOW_HOLD[: max(1, len(_SLOW_HOLD) // 4)]
+        torch.cuda.empty_cache()
+
+
+def release_slow_hold() -> None:
+    """Release quarantined slow DRAM slabs after KV-cache allocation completes."""
+    if _SLOW_HOLD:
+        n = len(_SLOW_HOLD)
+        _SLOW_HOLD.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("Released %d quarantined slow-DRAM slabs after KV-cache allocation", n)
 PLACE_ATTN = os.environ.get("MUSE_PLACE_ATTN", "1").strip() not in ("0", "", "false", "no")
 PREFILL_PLACE_ATTN = os.environ.get("MUSE_PREFILL_PLACE_ATTN", "1").strip() not in ("0", "", "false", "no")
 ATTN_MIN_BYTES = 10 << 20
@@ -136,15 +160,45 @@ def _time_candidates(decode_linear, layer, candidates, n: int, k: int, rounds: i
     scales6 = getattr(layer, "_marlin_decode_scales6", None)
     fixed_grid = bool(getattr(layer, "marlin_decode6_fixed_grid", False))
     use_6 = False
+    _m6_mod = None
     if palette is not None and scales6 is not None:
         try:
-            from muse_marlin6_gemv import decode_linear6
+            import muse_marlin6_gemv as _m6_mod
+            decode_linear6 = _m6_mod.decode_linear6
             use_6 = True
         except (ImportError, OSError):
             use_6 = False
     if use_6:
-        def run_one(buf):
-            decode_linear6(x, buf, scales6, palette, global_scale, workspace, n, k, fixed_grid)
+        # Pre-warm Split2 scale header check and use fused 96-CTA Split2 lm_head+lmpost kernel when active on lm_head.
+        use_lm_lmpost = (
+            (n, k) == (202048, 6656)
+            and os.environ.get("MUSE_PLACE_LMHEAD_SPLIT2", "1") != "0"
+            and hasattr(_m6_mod, "is_tma4_ilv")
+            and hasattr(_m6_mod, "is_lm_split2")
+            and getattr(_m6_mod, "_sk_tma4_ilv_lmpost", None) is not None
+            and _m6_mod.is_tma4_ilv(scales6)
+            and _m6_mod.is_lm_split2(scales6)
+        )
+        if use_lm_lmpost:
+            scratch, partials = _m6_mod._get_lmpost_bufs(device)
+            dummy_lut = torch.zeros(65536, dtype=torch.bfloat16, device=device)
+            dummy_tok = torch.zeros((1, 1), dtype=torch.int64, device=device)
+            org_vocab = int(getattr(layer, "org_vocab_size", n))
+            dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+            lmpost_fn = _m6_mod._sk_tma4_ilv_lmpost
+
+            def run_one(buf):
+                rc = lmpost_fn(
+                    x.data_ptr(), buf.data_ptr(), scratch.data_ptr(), partials.data_ptr(),
+                    scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
+                    dummy_lut.data_ptr(), dummy_tok.data_ptr(), org_vocab, n, k, 96, dev_idx,
+                    torch.cuda.current_stream(device).cuda_stream,
+                )
+                if rc:
+                    raise RuntimeError(f"lm_head Split2 placement probe returned {rc}")
+        else:
+            def run_one(buf):
+                decode_linear6(x, buf, scales6, palette, global_scale, workspace, n, k, fixed_grid)
     else:
         scales = layer._marlin_decode_scales
         def run_one(buf):
@@ -191,7 +245,7 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
         spares.clear()
         return None
     candidates = homes + spares
-    times = _time_candidates(decode_linear, layers[0], candidates, n, k, 3, evict_buf)
+    times = _time_candidates(decode_linear, layers[0], candidates, n, k, 5, evict_buf)
     ranked = sorted(range(len(candidates)), key=times.__getitem__)
     kept = set(ranked[:count])
     free_fast = [index for index in ranked[:count] if index >= count]
@@ -297,6 +351,8 @@ def _place_muserans_group(rans_ext, layers, n: int, k: int, evict_buf: torch.Ten
     surplus = ATTN_SURPLUS if is_small else SURPLUS
     wanted = max(1, math.ceil(count * surplus)) if surplus > 0 else 0
     spares_count = _ensure_spares_room(wanted, max_bytes, rejected_hold, allow_slow_trim=not is_small)
+    if not is_small and max_bytes > (128 << 20) and LARGE_RANS_SURPLUS > surplus:
+        spares_count = max(spares_count, _spares_allowed(math.ceil(count * LARGE_RANS_SURPLUS), max_bytes))
     if spares_count <= 0 or (is_small and spares_count < count):
         return None
     # Time every home and spare with the EXACT same smallest blob so per-layer compression ratio
@@ -479,7 +535,7 @@ def _place_bf16_rans_group(bf16_lib, layers, n: int, k: int, evict_buf: torch.Te
 # --------------------------------------------------------------------------- #
 PREFILL_ENABLED = os.environ.get("MUSE_PREFILL_PLACEMENT", "1").strip() not in ("0", "", "false", "no")
 PREFILL_SURPLUS = float(os.environ.get("MUSE_PREFILL_PLACEMENT_SURPLUS", "2.0"))
-PREFILL_ROUNDS = 4
+PREFILL_ROUNDS = 5
 
 
 def _time_calls(run, candidates, rounds: int, evict_buf: torch.Tensor | None = None) -> list[float]:
@@ -739,9 +795,18 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             sa = ref.input_scale if getattr(ref, "input_scale", None) is not None else torch.ones((1,), dtype=torch.float32, device=dev)
             sb = ref.weight_scale
             cfg_dn = _fp8pf.config(6656, 19968) or 1
+            use_ws_dn = (
+                _fp8ws is not None
+                and _fp8ws.ready(dev)
+                and os.environ.get("FP8WS", "1") != "0"
+                and (6656, 19968) in getattr(_fp8ws, "SHAPES", ())
+            )
 
-            def run_fp8_down(weight, x=x, sa=sa, sb=sb, cfg_dn=cfg_dn):
-                _fp8pf.gemm(x, weight, sa, sb, cfg_dn)
+            def run_fp8_down(weight, x=x, sa=sa, sb=sb, cfg_dn=cfg_dn, use_ws_dn=use_ws_dn):
+                if use_ws_dn:
+                    _fp8ws.gemm(x, weight, sa, sb)
+                else:
+                    _fp8pf.gemm(x, weight, sa, sb, cfg_dn)
 
             groups.append(("fp8_6656x19968", fp8_down_layers, run_fp8_down, _gfp8.prefill_moved, False))
         if len(fp8_swiglu_layers) > 1:
@@ -791,9 +856,18 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             sa = ref.input_scale if getattr(ref, "input_scale", None) is not None else torch.ones((1,), dtype=torch.float32, device=dev)
             sb = ref.weight_scale
             cfg_o = _fp8pf.config(6656, 4096) or 3
+            use_ws_o = (
+                _fp8ws is not None
+                and _fp8ws.ready(dev)
+                and os.environ.get("FP8WS", "1") != "0"
+                and (6656, 4096) in getattr(_fp8ws, "SHAPES", ())
+            )
 
-            def run_fp8_o(weight, x=x, sa=sa, sb=sb, cfg_o=cfg_o):
-                _fp8pf.gemm(x, weight, sa, sb, cfg_o)
+            def run_fp8_o(weight, x=x, sa=sa, sb=sb, cfg_o=cfg_o, use_ws_o=use_ws_o):
+                if use_ws_o:
+                    _fp8ws.gemm(x, weight, sa, sb)
+                else:
+                    _fp8pf.gemm(x, weight, sa, sb, cfg_o)
 
             groups.append(("fp8_attn_6656x4096", fp8_attn_o, run_fp8_o, _gfp8.prefill_moved, False))
         if PREFILL_PLACE_ATTN and _fp8ws is not None and _fp8ws.ready(torch.device("cuda")):
@@ -868,8 +942,11 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
         logger.warning("Prefill weight placement failed and was skipped: %s", err)
     finally:
         rejected_hold.clear()
-        _SLOW_HOLD.clear()
-        torch.cuda.empty_cache()
+        if HOLD_SLOW_FOR_KV and _SLOW_HOLD:
+            ensure_slow_hold_headroom(HOST_HEADROOM_BYTES)
+        else:
+            _SLOW_HOLD.clear()
+            torch.cuda.empty_cache()
 
 
 def place_decode_weights(model: torch.nn.Module) -> None:
@@ -883,6 +960,7 @@ def place_decode_weights(model: torch.nn.Module) -> None:
     began = time.perf_counter()
     _SLOW_HOLD.clear()
     rejected_hold: list[torch.Tensor] = []
+    _post_reg_done = False
     try:
         _drop_model_page_cache()
         evict_buf = torch.empty((_L2_FLUSH_INTS,), dtype=torch.int32, device="cuda")
@@ -962,21 +1040,34 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                         try:
                             import muse_marlin6_gemv as _m6
                             ilv_set = getattr(_m6, "_DOWN_ILV_SCALES", None)
+                            lm_split2_set = getattr(_m6, "_LM_SPLIT2_SCALES", None)
+                            lm_split2_cache = getattr(_m6, "_LM_SPLIT2_CACHE", None)
                         except (ImportError, OSError):
                             ilv_set = None
+                            lm_split2_set = None
+                            lm_split2_cache = None
                         moved_s6, bytes_s6 = 0, 0
                         for m in model.modules():
                             s6 = m._buffers.get("_marlin_decode_scales6")
                             if s6 is not None and s6.is_cuda and s6.numel() * s6.element_size() >= (64 << 10):
                                 try:
                                     old_ptr = s6.data_ptr()
-                                    dst = torch.empty_like(s6)
+                                    if s6.dim() == 2 and s6.shape[1] == 32 and (s6.shape[0] + 64) * 32 < (1 << 20):
+                                        dst_base = torch.empty((s6.shape[0] + 64, 32), dtype=s6.dtype, device=s6.device)
+                                        dst = dst_base[: s6.shape[0]]
+                                    else:
+                                        dst = torch.empty_like(s6)
                                     dst.copy_(s6)
                                     if torch.equal(dst, s6):
                                         m._buffers["_marlin_decode_scales6"] = dst
                                         if ilv_set is not None and old_ptr in ilv_set:
                                             ilv_set.discard(old_ptr)
                                             ilv_set.add(dst.data_ptr())
+                                        if lm_split2_set is not None and old_ptr in lm_split2_set:
+                                            lm_split2_set.discard(old_ptr)
+                                            lm_split2_set.add(dst.data_ptr())
+                                        if lm_split2_cache is not None and old_ptr in lm_split2_cache:
+                                            lm_split2_cache[dst.data_ptr()] = lm_split2_cache.pop(old_ptr)
                                         moved_s6 += 1
                                         bytes_s6 += dst.numel() * dst.element_size()
                                 except RuntimeError:
@@ -1149,6 +1240,15 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             "Decode weight placement: %d groups, timed GEMV sum reduced by %.3f ms per token, %.2f s",
             n_groups, saved_ms, time.perf_counter() - began,
         )
+        try:
+            import muse_marlin6_gemv as _m6
+            if hasattr(_m6, "register_all_gate_up_swiglu"):
+                _m6.register_all_gate_up_swiglu(model)
+            if hasattr(_m6, "register_all_oproj_sigmoid"):
+                _m6.register_all_oproj_sigmoid(model)
+        except Exception as err:  # noqa: BLE001
+            logger.warning("Decode6 post-placement registration skipped: %s", err)
+        _post_reg_done = True
     except Exception as err:  # noqa: BLE001 - the load must go on
         logger.warning("Decode weight placement failed and was skipped: %s", err)
     finally:
@@ -1156,3 +1256,12 @@ def place_decode_weights(model: torch.nn.Module) -> None:
         if not PREFILL_ENABLED:
             _SLOW_HOLD.clear()
             torch.cuda.empty_cache()
+    if not _post_reg_done:
+        try:
+            import muse_marlin6_gemv as _m6
+            if hasattr(_m6, "register_all_gate_up_swiglu"):
+                _m6.register_all_gate_up_swiglu(model)
+            if hasattr(_m6, "register_all_oproj_sigmoid"):
+                _m6.register_all_oproj_sigmoid(model)
+        except Exception as err:  # noqa: BLE001
+            logger.warning("Decode6 post-placement registration skipped: %s", err)
