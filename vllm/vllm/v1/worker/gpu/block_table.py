@@ -211,6 +211,38 @@ class BlockTables:
         # rather than allocating a new tensor.
         return self.slot_mappings[:, :num_tokens]
 
+    def prepare_single_decode_step(
+        self,
+        idx_mapping: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        last_sampled_tokens: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        _fused_single_decode_prep_kernel[(self.num_kv_cache_groups,)](
+            idx_mapping,
+            num_computed_tokens,
+            last_sampled_tokens,
+            input_ids,
+            positions,
+            seq_lens,
+            self.block_table_ptrs,
+            self.input_block_table_ptrs,
+            self.block_table_strides,
+            self.num_blocks.gpu,
+            self.num_blocks.gpu.stride(0),
+            self.block_sizes_tensor,
+            self.slot_mappings,
+            self.slot_mappings.stride(0),
+            BLOCK_SIZE=1024,  # type: ignore
+            num_warps=4,  # type: ignore
+        )
+        return (
+            tuple(bt[:1] for bt in self.input_block_tables),
+            self.slot_mappings[:, :1],
+        )
+
 
 @triton.jit(do_not_specialize=["num_reqs"])
 def _gather_block_tables_kernel(
@@ -315,3 +347,48 @@ def _compute_slot_mappings_kernel(
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
+
+
+@triton.jit
+def _fused_single_decode_prep_kernel(
+    idx_mapping_ptr,
+    num_computed_tokens_ptr,
+    last_sampled_tokens_ptr,
+    input_ids_ptr,
+    pos_ptr,
+    seq_lens_ptr,
+    src_bt_ptrs,
+    dst_bt_ptrs,
+    bt_strides,
+    num_blocks_ptr,
+    num_blocks_stride,
+    block_sizes_ptr,
+    slot_mappings_ptr,
+    slot_mappings_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    gid = tl.program_id(0)
+    req_idx = tl.load(idx_mapping_ptr)
+    num_comp = tl.load(num_computed_tokens_ptr + req_idx)
+    if gid == 0:
+        tok = tl.load(last_sampled_tokens_ptr + req_idx)
+        tl.store(input_ids_ptr, tok.to(tl.int32))
+        tl.store(pos_ptr, num_comp.to(tl.int64))
+        tl.store(seq_lens_ptr, num_comp + 1)
+
+    stride = tl.load(bt_strides + gid)
+    nblk = tl.load(num_blocks_ptr + gid * num_blocks_stride + req_idx)
+    src_ptr = _load_ptr(src_bt_ptrs + gid, tl.int32) + req_idx * stride
+    dst_ptr = _load_ptr(dst_bt_ptrs + gid, tl.int32)
+    for i in tl.range(0, nblk, BLOCK_SIZE):
+        off = i + tl.arange(0, BLOCK_SIZE)
+        m = off < nblk
+        b = tl.load(src_ptr + off, mask=m)
+        tl.store(dst_ptr + off, b, mask=m)
+
+    bs = tl.load(block_sizes_ptr + gid)
+    b_idx = num_comp // bs
+    b_off = num_comp % bs
+    b_num = tl.load(src_ptr + b_idx)
+    slot = b_num.to(tl.int64) * bs.to(tl.int64) + b_off.to(tl.int64)
+    tl.store(slot_mappings_ptr + gid * slot_mappings_stride, slot)
