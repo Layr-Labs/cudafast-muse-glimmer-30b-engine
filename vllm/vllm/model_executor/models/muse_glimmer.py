@@ -1207,11 +1207,18 @@ class _GateSideStream:
         self.unavailable = False
         self.last_layer = -1
         self.forks = 0
-        self.reported = False
+        self.reported_forks = 0
         # Layers whose output_gate_proj uses a deterministic custom M=1 kernel (muse_bf16_lane)
         # while M>1 falls back to cuBLAS: restrict side-stream fork strictly to M=1 and require
         # muse_bf16_lane_weight to be admitted.
         self.bf16_gate_by_layer: dict[int, nn.Module] = {}
+        # Deterministic NVFP4 output_gate_proj layers (18 layers) can also overlap FA2 during prefill.
+        self.nvfp4_gate_layers: set[int] = set()
+        self.prefill_nvfp4_max_tokens = (
+            int(os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_PREFILL_MAX_TOKENS", "512"))
+            if os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_PREFILL", "1") != "0"
+            else 0
+        )
 
     def _ensure_stream(self) -> bool:
         if self.stream is None and not self.unavailable:
@@ -1232,13 +1239,13 @@ class _GateSideStream:
 
     def _count(self, layer_idx: int) -> None:
         if layer_idx <= self.last_layer:
-            if not self.reported:
+            if self.forks > self.reported_forks:
                 logger.info(
                     "Attention output gate projection overlapped attention "
                     "in %d layers",
                     self.forks,
                 )
-                self.reported = True
+                self.reported_forks = self.forks
             self.forks = 0
         self.forks += 1
         self.last_layer = layer_idx
@@ -1249,8 +1256,14 @@ class _GateSideStream:
         if bf16_gate is not None:
             if not x.is_cuda or x.shape[0] != 1 or getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
                 return
-        elif not x.is_cuda or x.shape[0] > self.max_tokens:
+        elif not x.is_cuda:
             return
+        elif x.shape[0] > self.max_tokens:
+            if not (
+                layer_idx in self.nvfp4_gate_layers
+                and x.shape[0] <= self.prefill_nvfp4_max_tokens
+            ):
+                return
         if (
             is_forward_context_available()
             and get_forward_context().cudagraph_runtime_mode
@@ -1349,15 +1362,100 @@ direct_register_custom_op(
 )
 
 
+_QK_ATTN_REFS: list = []
+_QK_ATTN_BY_TAG_PTR: dict[int, nn.Module] = {}
+
+
+def _register_qk_attn_layer(attn: nn.Module) -> None:
+    import weakref
+
+    _QK_ATTN_REFS.append(weakref.ref(attn))
+    _QK_ATTN_BY_TAG_PTR.clear()
+
+
+def _resolve_qk_attn_layer(tag_ptr: int) -> nn.Module | None:
+    layer = _QK_ATTN_BY_TAG_PTR.get(tag_ptr)
+    if layer is not None:
+        return layer
+    alive = []
+    for ref in _QK_ATTN_REFS:
+        mod = ref()
+        if mod is not None:
+            alive.append(ref)
+            k_scale = getattr(mod, "_k_scale", None)
+            if isinstance(k_scale, torch.Tensor) and k_scale.is_cuda:
+                _QK_ATTN_BY_TAG_PTR[k_scale.data_ptr()] = mod
+    _QK_ATTN_REFS[:] = alive
+    return _QK_ATTN_BY_TAG_PTR.get(tag_ptr)
+
+
 def _muse_qk_norm_rope_impl(
     qkv: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
+    layer_tag: torch.Tensor,
     eps: float,
     qscale: float,
     use_rope: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import muse_qk_glue
+
+    attn_layer = _resolve_qk_attn_layer(layer_tag.data_ptr())
+    if attn_layer is not None:
+        attn_layer._qk_kv_cache_written = False
+        attn_layer._qk_kv_cache_written_rows = 0
+        if (
+            muse_qk_glue.FUSE_KVCACHE
+            and is_forward_context_available()
+            and not attn_layer.calculate_kv_scales
+            and attn_layer.kv_sharing_target_layer_name is None
+            and not attn_layer.attn_backend.forward_includes_kv_cache_update
+            and attn_layer.kv_cache_dtype in ("auto", "bfloat16")
+            and getattr(attn_layer.impl, "dcp_world_size", 1) == 1
+        ):
+            fwd_ctx = get_forward_context()
+            slot_map_dict = (
+                fwd_ctx.slot_mapping
+                if fwd_ctx.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
+                else None
+            )
+            layer_slot = (
+                slot_map_dict.get(attn_layer.layer_name)
+                if isinstance(slot_map_dict, dict)
+                else None
+            )
+            kv_cache = attn_layer.kv_cache
+            if layer_slot is not None and isinstance(kv_cache, torch.Tensor) and kv_cache.numel() > 0:
+                if qkv.shape[0] == 1:
+                    q_out, k_out, wrote = muse_qk_glue.run_qk_norm_rope_kvcache_m1(
+                        qkv,
+                        positions,
+                        cos_sin_cache,
+                        eps,
+                        qscale,
+                        use_rope,
+                        kv_cache,
+                        layer_slot,
+                    )
+                    if wrote:
+                        attn_layer._qk_kv_cache_written = True
+                        attn_layer._qk_kv_cache_written_rows = 1
+                    return q_out, k_out
+                if qkv.shape[0] > 1 and muse_qk_glue.FUSE_KVCACHE_PREFILL:
+                    q_out, k_out, wrote = muse_qk_glue.run_qk_norm_rope_kvcache_prefill(
+                        qkv,
+                        positions,
+                        cos_sin_cache,
+                        eps,
+                        qscale,
+                        use_rope,
+                        kv_cache,
+                        layer_slot,
+                        q_first_row=0,
+                    )
+                    if wrote:
+                        attn_layer._qk_kv_cache_written_rows = int(qkv.shape[0])
+                    return q_out, k_out
 
     return muse_qk_glue.run_qk_norm_rope(
         qkv, positions, cos_sin_cache, eps, qscale, use_rope
@@ -1368,6 +1466,7 @@ def _muse_qk_norm_rope_fake(
     qkv: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
+    layer_tag: torch.Tensor,
     eps: float,
     qscale: float,
     use_rope: bool,
@@ -1511,6 +1610,7 @@ def _gate_side_stream_fork_point(gate_proj: nn.Module, layer_idx: int = -1) -> s
             bf16_lane_only = True
         else:
             return None
+    is_nvfp4_gate = qm is not None and type(qm).__name__ == "ModelOptNvFp4LinearMethod"
     vllm_config = get_current_vllm_config_or_none()
     if vllm_config is None:
         return None
@@ -1518,6 +1618,10 @@ def _gate_side_stream_fork_point(gate_proj: nn.Module, layer_idx: int = -1) -> s
     if compilation_config.mode == CompilationMode.NONE:
         if bf16_lane_only and layer_idx >= 0:
             _gate_side_stream.bf16_gate_by_layer[layer_idx] = gate_proj
+            _gate_side_stream.nvfp4_gate_layers.discard(layer_idx)
+        elif is_nvfp4_gate and layer_idx >= 0:
+            _gate_side_stream.nvfp4_gate_layers.add(layer_idx)
+            _gate_side_stream.bf16_gate_by_layer.pop(layer_idx, None)
         return mode
     if (
         compilation_config.mode != CompilationMode.VLLM_COMPILE
@@ -1530,6 +1634,10 @@ def _gate_side_stream_fork_point(gate_proj: nn.Module, layer_idx: int = -1) -> s
         return None
     if bf16_lane_only and layer_idx >= 0:
         _gate_side_stream.bf16_gate_by_layer[layer_idx] = gate_proj
+        _gate_side_stream.nvfp4_gate_layers.discard(layer_idx)
+    elif is_nvfp4_gate and layer_idx >= 0:
+        _gate_side_stream.nvfp4_gate_layers.add(layer_idx)
+        _gate_side_stream.bf16_gate_by_layer.pop(layer_idx, None)
     return mode
 
 
@@ -1651,6 +1759,8 @@ class MuseGlimmerAttention(nn.Module):
             per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
         )
+        if self._use_qk_fused:
+            _register_qk_attn_layer(self.attn)
         self._fp8_shared_input_scale = False
         self._fp8_dual_prefill = False
         self._bf16_dual_prefill = False
@@ -1708,6 +1818,7 @@ class MuseGlimmerAttention(nn.Module):
                 qkv,
                 positions,
                 cache,
+                self.attn._k_scale,
                 float(self.qk_norm.eps),
                 float(self.scale_query_by),
                 self.rotary_emb is not None,
@@ -2195,6 +2306,7 @@ class MuseGlimmerForCausalLM(
         # compute_logits chain (x * output_multiplier, then cap * tanh(x / cap)) evaluated by the same torch ops on
         # every BF16 value; ties go to the lowest index, as the stock greedy sampler's block argmax + argmax.
         self._lmpost_softcap_argmax = None
+        self._lmpost_softcap_argmax_into = None
         self._pack_persisting_norm_arena()
         # Gate-quant fold (harness/kernels/sandwich/muse_sandwich.py): register every FP8-attention layer's
         # qkv and output-gate input scales; the 512-row native sandwich of such a layer then also writes the
@@ -2237,6 +2349,7 @@ class MuseGlimmerForCausalLM(
                 lmpost._get_lut(dev, self.output_multiplier, self.final_logit_softcapping)
                 lmpost._get_scratch(dev)
                 self._lmpost_softcap_argmax = lmpost.softcap_argmax
+                self._lmpost_softcap_argmax_into = getattr(lmpost, "softcap_argmax_into", None)
         except ImportError:
             pass
 

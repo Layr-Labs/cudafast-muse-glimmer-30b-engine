@@ -479,7 +479,7 @@ def _place_bf16_rans_group(bf16_lib, layers, n: int, k: int, evict_buf: torch.Te
 # --------------------------------------------------------------------------- #
 PREFILL_ENABLED = os.environ.get("MUSE_PREFILL_PLACEMENT", "1").strip() not in ("0", "", "false", "no")
 PREFILL_SURPLUS = float(os.environ.get("MUSE_PREFILL_PLACEMENT_SURPLUS", "2.0"))
-PREFILL_ROUNDS = 4
+PREFILL_ROUNDS = 5
 
 
 def _time_calls(run, candidates, rounds: int, evict_buf: torch.Tensor | None = None) -> list[float]:
@@ -739,9 +739,18 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             sa = ref.input_scale if getattr(ref, "input_scale", None) is not None else torch.ones((1,), dtype=torch.float32, device=dev)
             sb = ref.weight_scale
             cfg_dn = _fp8pf.config(6656, 19968) or 1
+            use_ws_dn = (
+                _fp8ws is not None
+                and _fp8ws.ready(dev)
+                and os.environ.get("FP8WS", "1") != "0"
+                and (6656, 19968) in getattr(_fp8ws, "SHAPES", ())
+            )
 
-            def run_fp8_down(weight, x=x, sa=sa, sb=sb, cfg_dn=cfg_dn):
-                _fp8pf.gemm(x, weight, sa, sb, cfg_dn)
+            def run_fp8_down(weight, x=x, sa=sa, sb=sb, cfg_dn=cfg_dn, use_ws_dn=use_ws_dn):
+                if use_ws_dn:
+                    _fp8ws.gemm(x, weight, sa, sb)
+                else:
+                    _fp8pf.gemm(x, weight, sa, sb, cfg_dn)
 
             groups.append(("fp8_6656x19968", fp8_down_layers, run_fp8_down, _gfp8.prefill_moved, False))
         if len(fp8_swiglu_layers) > 1:
@@ -791,9 +800,18 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             sa = ref.input_scale if getattr(ref, "input_scale", None) is not None else torch.ones((1,), dtype=torch.float32, device=dev)
             sb = ref.weight_scale
             cfg_o = _fp8pf.config(6656, 4096) or 3
+            use_ws_o = (
+                _fp8ws is not None
+                and _fp8ws.ready(dev)
+                and os.environ.get("FP8WS", "1") != "0"
+                and (6656, 4096) in getattr(_fp8ws, "SHAPES", ())
+            )
 
-            def run_fp8_o(weight, x=x, sa=sa, sb=sb, cfg_o=cfg_o):
-                _fp8pf.gemm(x, weight, sa, sb, cfg_o)
+            def run_fp8_o(weight, x=x, sa=sa, sb=sb, cfg_o=cfg_o, use_ws_o=use_ws_o):
+                if use_ws_o:
+                    _fp8ws.gemm(x, weight, sa, sb)
+                else:
+                    _fp8pf.gemm(x, weight, sa, sb, cfg_o)
 
             groups.append(("fp8_attn_6656x4096", fp8_attn_o, run_fp8_o, _gfp8.prefill_moved, False))
         if PREFILL_PLACE_ATTN and _fp8ws is not None and _fp8ws.ready(torch.device("cuda")):
@@ -962,8 +980,10 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                         try:
                             import muse_marlin6_gemv as _m6
                             ilv_set = getattr(_m6, "_DOWN_ILV_SCALES", None)
+                            lm_split2_set = getattr(_m6, "_LM_SPLIT2_SCALES", None)
                         except (ImportError, OSError):
                             ilv_set = None
+                            lm_split2_set = None
                         moved_s6, bytes_s6 = 0, 0
                         for m in model.modules():
                             s6 = m._buffers.get("_marlin_decode_scales6")
@@ -977,6 +997,9 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                                         if ilv_set is not None and old_ptr in ilv_set:
                                             ilv_set.discard(old_ptr)
                                             ilv_set.add(dst.data_ptr())
+                                        if lm_split2_set is not None and old_ptr in lm_split2_set:
+                                            lm_split2_set.discard(old_ptr)
+                                            lm_split2_set.add(dst.data_ptr())
                                         moved_s6 += 1
                                         bytes_s6 += dst.numel() * dst.element_size()
                                 except RuntimeError:
@@ -1156,3 +1179,11 @@ def place_decode_weights(model: torch.nn.Module) -> None:
         if not PREFILL_ENABLED:
             _SLOW_HOLD.clear()
             torch.cuda.empty_cache()
+    try:
+        import muse_marlin6_gemv as _m6
+        if hasattr(_m6, "register_all_gate_up_swiglu"):
+            _m6.register_all_gate_up_swiglu(model)
+        if hasattr(_m6, "register_all_oproj_sigmoid"):
+            _m6.register_all_oproj_sigmoid(model)
+    except Exception as err:  # noqa: BLE001
+        logger.warning("Decode6 post-placement registration skipped: %s", err)

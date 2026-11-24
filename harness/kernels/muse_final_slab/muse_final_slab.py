@@ -402,12 +402,14 @@ def _prepare_attn_tail(self_attn, attn_plans: dict[int, AttnSlabPlan], device: t
         return 0, 0, None
     attn = getattr(self_attn, "attn", None)
     impl = getattr(attn, "impl", None) if attn is not None else None
+    sw = getattr(impl, "sliding_window", None) if impl is not None else None
     if (
         attn is None
         or impl is None
         or getattr(impl, "vllm_flash_attn_version", None) != 2
-        or getattr(impl, "sliding_window", None) is not None
-        or getattr(impl, "supports_quant_query_input", False)
+        or (sw is not None and not (len(sw) == 2 and sw[0] < 0 and sw[1] < 0))
+        or getattr(attn, "query_quant", None) is not None
+        or getattr(attn, "kv_cache_dtype", "auto") not in ("auto", "bfloat16", "float16")
         or getattr(self_attn, "num_heads", 0) != 32
         or getattr(self_attn, "num_kv_heads", 0) != 2
         or getattr(self_attn, "head_dim", 0) != 128
