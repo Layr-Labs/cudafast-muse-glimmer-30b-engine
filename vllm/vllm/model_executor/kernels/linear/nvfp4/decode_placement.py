@@ -216,13 +216,19 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
     unused = [(times[count + i], spare) for i, spare in enumerate(spares) if (count + i) not in used_targets]
     unused.extend(displaced_homes)
     unused.sort(key=lambda pair: pair[0])
-    fast_keep = min(len(unused), max(180, int(len(unused) * 0.42)))
+    fast_keep = min(len(unused), max(150, int(len(unused) * 0.34)))
     slow_tail = unused[fast_keep:]
     if len(slow_tail) > 175:
         slow_tail = slow_tail[-175:]
+    fast_pool = unused[:fast_keep]
+    mid_drop = unused[fast_keep : len(unused) - len(slow_tail)]
     for _, slow_buf in slow_tail:
         _SLOW_HOLD.append(slow_buf)
     del unused, slow_tail
+    if mid_drop:
+        del mid_drop
+        torch.cuda.empty_cache()
+    del fast_pool
     before = sorted(times[:count])
     after.sort()
     return {

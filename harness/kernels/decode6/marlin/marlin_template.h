@@ -245,7 +245,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool scale6 = false,
           const bool gate_up_grid = false,
           const bool down_ilv = false,
-          const bool gate_v48 = false>
+          const bool gate_v48 = false,
+          const bool gate_up_ilv = false>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -402,8 +403,13 @@ __global__ void Marlin(
   int n_tiles = prob_n / 16 / thread_n_blocks;
 
   int global_mn_tiles = parallel * n_tiles;
-  const int vgrid = gate_v48 ? 48 : gridDim.x;
-  int vblk = gate_v48 ? (47 - static_cast<int>(blockIdx.x)) : static_cast<int>(blockIdx.x);
+  constexpr bool lm_head_g96 = down_ilv && threads == 128 && thread_n_blocks == 4;
+  const int vgrid = (gate_v48 || lm_head_g96) ? 48 : gridDim.x;
+  int vblk = gate_v48
+                 ? (47 - static_cast<int>(blockIdx.x))
+                 : (lm_head_g96
+                        ? (blockIdx.x < 48 ? 48 : static_cast<int>(blockIdx.x) - 48)
+                        : static_cast<int>(blockIdx.x));
   int part2_mn_tiles = global_mn_tiles;
   int part1_mn_iters = 0;
   bool in_part2 = false;
@@ -414,6 +420,9 @@ __global__ void Marlin(
     part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / vgrid;
   }
   const int orig_p1_iters = part1_mn_iters;
+  if constexpr (lm_head_g96) {
+    part1_mn_iters = (blockIdx.x < 48) ? ((orig_p1_iters + 1) / 2) : (orig_p1_iters / 2);
+  }
 
   int iters = div_ceil(k_tiles * part2_mn_tiles, vgrid);
 
@@ -428,7 +437,7 @@ __global__ void Marlin(
   }
 
   int slice_row = 0;
-  int slice_col_par = vblk;
+  int slice_col_par = lm_head_g96 ? static_cast<int>(blockIdx.x) : vblk;
   int slice_col;
   int slice_iters =
       k_tiles;  // number of threadblock tiles in the current slice
@@ -659,9 +668,13 @@ __global__ void Marlin(
   [[maybe_unused]] int ilv_f = 0;
   [[maybe_unused]] int ilv_jump_f = 0;
   [[maybe_unused]] int ilv_jump_kt = 0;
+  [[maybe_unused]] int ilv_step_p1 = 0;
   [[maybe_unused]] int ilv_step_switch = 0;
+  [[maybe_unused]] int ilv_step_tail = 0;
+  [[maybe_unused]] int ilv_delta_p1 = 0;
   [[maybe_unused]] int ilv_delta_hi = 0;
   [[maybe_unused]] int ilv_delta_lo = 0;
+  [[maybe_unused]] int ilv_delta_tail = 0;
 #ifdef MUSE_GATE_UP_ILV
   [[maybe_unused]] int ilv_base = 0;
   if constexpr (gate_up_grid) {
@@ -674,9 +687,16 @@ __global__ void Marlin(
     b_gl_rd += b_gl_rd_delta_o * slice_row;
   }
 #else
-  if constexpr (down_ilv) {
-    static_assert(scale6 && threads == 256 && thread_n_blocks == 8 && !gate_up_grid,
-                  "down_ilv requires M=1 256T 128-col decode config");
+  if constexpr (gate_up_grid && gate_up_ilv) {
+    const int ilv_base = blockIdx.x < 288 ? (blockIdx.x / 48) * 2496 + blockIdx.x % 48
+                                          : 14976 + (blockIdx.x - 288);
+    b_gl_rd += b_gl_rd_delta_o * ilv_base;
+    b_gl_rd_delta_o *= 48;
+  } else if constexpr (down_ilv) {
+    static_assert(scale6 && !gate_up_grid &&
+                      ((threads == 256 && thread_n_blocks == 8) ||
+                       (threads == 128 && thread_n_blocks == 4)),
+                  "down_ilv requires M=1 256T/128-col or 128T/64-col decode config");
     b_gl_rd += b_gl_rd_delta_o * blockIdx.x;
     const int total_p2 = k_tiles * part2_mn_tiles;
     if constexpr (gate_v48) {
@@ -684,15 +704,39 @@ __global__ void Marlin(
       ilv_jump_kt = (vblk >= static_cast<int>(gridDim.x))
                         ? ((iters * (vblk - static_cast<int>(gridDim.x))) % k_tiles)
                         : 0;
+      ilv_step_p1 = ilv_jump_f;
       ilv_step_switch = 53;
+      ilv_step_tail = 1 << 20;
+      ilv_delta_p1 = 24 * b_gl_rd_delta_o;
       ilv_delta_hi = 24 * b_gl_rd_delta_o;
       ilv_delta_lo = 23 * b_gl_rd_delta_o;
+      ilv_delta_tail = 23 * b_gl_rd_delta_o;
+    } else if constexpr (lm_head_g96) {
+      const int p1_lo = (orig_p1_iters / 2) * k_tiles;
+      const int p1_hi = ((orig_p1_iters + 1) / 2) * k_tiles;
+      const int full_blks = iters > 0 ? (total_p2 / iters) : 48;
+      const int rem_p2 = iters > 0 ? (total_p2 % iters) : 0;
+      ilv_jump_f = (blockIdx.x < 48) ? p1_hi : p1_lo;
+      ilv_jump_kt = (blockIdx.x < 48) ? 0 : ((iters * vblk) % k_tiles);
+      ilv_step_p1 = p1_lo;
+      ilv_step_switch = p1_lo + rem_p2;
+      ilv_step_tail = p1_lo + iters;
+      ilv_delta_p1 = 96 * b_gl_rd_delta_o;
+      ilv_delta_hi = (48 + full_blks + 1) * b_gl_rd_delta_o;
+      ilv_delta_lo = (48 + full_blks) * b_gl_rd_delta_o;
+      ilv_delta_tail = 48 * b_gl_rd_delta_o;
     } else {
       ilv_jump_f = orig_p1_iters * k_tiles;
       ilv_jump_kt = (iters * vblk) % k_tiles;
-      ilv_step_switch = ilv_jump_f + max(0, total_p2 - 47 * iters);
-      ilv_delta_hi = 48 * b_gl_rd_delta_o;
-      ilv_delta_lo = 47 * b_gl_rd_delta_o;
+      const int full_blks = iters > 0 ? (total_p2 / iters) : 48;
+      const int rem_p2 = iters > 0 ? (total_p2 % iters) : 0;
+      ilv_step_p1 = ilv_jump_f;
+      ilv_step_switch = ilv_jump_f + rem_p2;
+      ilv_step_tail = 1 << 20;
+      ilv_delta_p1 = 48 * b_gl_rd_delta_o;
+      ilv_delta_hi = (full_blks + 1) * b_gl_rd_delta_o;
+      ilv_delta_lo = full_blks * b_gl_rd_delta_o;
+      ilv_delta_tail = full_blks * b_gl_rd_delta_o;
     }
   } else {
     b_gl_rd += b_sh_stride * tile_column_stride * slice_col;
@@ -1188,7 +1232,11 @@ __global__ void Marlin(
       }
 
       if constexpr (down_ilv) {
-        b_gl_rd += (ilv_f < ilv_step_switch) ? ilv_delta_hi : ilv_delta_lo;
+        b_gl_rd += (ilv_f < ilv_step_p1)
+                       ? ilv_delta_p1
+                       : ((ilv_f < ilv_step_switch)
+                              ? ilv_delta_hi
+                              : ((ilv_f < ilv_step_tail) ? ilv_delta_lo : ilv_delta_tail));
         ilv_f++;
         if (ilv_f == ilv_jump_f) {
           ilv_a_kt = ilv_jump_kt;

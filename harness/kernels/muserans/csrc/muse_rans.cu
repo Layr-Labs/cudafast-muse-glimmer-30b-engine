@@ -304,8 +304,12 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   const int xbytes = (K + 15) & ~15;
   const uint32_t sbase0 = (uint32_t)__cvta_generic_to_shared(smem) + (uint32_t)xbytes;
   const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + (uint32_t)wib * RB;
-  const int w = blockIdx.x * wpb + wib;
-  const bool active = w < pb.tw;
+  const int q = pb.tw / gridDim.x;
+  const int r = pb.tw % gridDim.x;
+  const int w_start = blockIdx.x * q + (blockIdx.x < r ? blockIdx.x : r);
+  const int w_cnt = q + (blockIdx.x < r ? 1 : 0);
+  const bool active = wib < w_cnt;
+  const int w = w_start + wib;
   const uint8_t* ws = pb.stream;
   uint32_t wbytes = 0;
   int gmin = 0, toffw = 0, issued = 0;
@@ -500,8 +504,9 @@ static RansCfg rans_pick_cfg(int N, int K) {
     const char* env = std::getenv("MUSERANS_GATE_UP_EVEN48");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
-  if (gate32 && N == 4096 && K == 6656 && NB == 512 && rans_fits(K, 16, 9, 4)) {
-    return RansCfg{512, 16, 4, 4, 9};
+  if (gate32 && N == 4096 && K == 6656 && NB == 512) {
+    if (rans_fits(K, 16, 9, 8)) return RansCfg{512, 16, 4, 8, 9};
+    if (rans_fits(K, 16, 9, 4)) return RansCfg{512, 16, 4, 4, 9};
   }
   if (gate_up_even && N == 39936 && K == 6656 && NB == 4992 && rans_fits(K, 16, 9, 4)) {
     return RansCfg{768, 16, 4, 4, 9};
@@ -510,8 +515,9 @@ static RansCfg rans_pick_cfg(int N, int K) {
     const int R = (NB + 48 * wcap - 1) / (48 * wcap);
     const int tw = (NB + R - 1) / R, wpb = (tw + 47) / 48;
     if (rans_fits(K, wpb, 9, 4)) {
-      const int states = ((N == 6656) || (N == 4608 && K == 6656)) ? 4 : 2;
-      return RansCfg{tw, wpb, states, 4, 9};
+      const int states = ((N == 6656 && K == 4096) || ((N == 4608 || N == 4096) && K == 6656)) ? 4 : 2;
+      const int rg = (((N == 4608 || N == 4096) && K == 6656) && rans_fits(K, wpb, 9, 8)) ? 8 : 4;
+      return RansCfg{tw, wpb, states, rg, 9};
     }
   }
   return RansCfg{NB, 1, 2, 4, 9};
@@ -664,7 +670,8 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   pb.stream_bytes = (blob_bytes > soff + 64u) ? (blob_bytes - soff - 64u) : 0u;
   pb.tpf_stride = rans_tpf_stride();
   TORCH_CHECK(tw >= 1 && tw <= N / 8 && wpb >= 1 && wpb <= 32 && (ns == 1 || ns == 2 || ns == 4) && (rg == 4 || rg == 8) && (ilv == 0 || ilv == 9), "bad launch config");
-  const int blocks = (tw + wpb - 1) / wpb;
+  int blocks = (tw + wpb - 1) / wpb;
+  if (blocks == 47 && tw >= 48) blocks = 48;
   const size_t dsmem = rans_dsmem(K, wpb, 9, rg);
   TORCH_CHECK(rans_fits(K, wpb, 9, rg), "rans smem too large (K too large for smem staging of x): ", dsmem);
   rans_set_attrs_once();

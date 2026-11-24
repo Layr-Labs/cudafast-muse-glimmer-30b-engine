@@ -140,13 +140,14 @@ class _MulSigmoidSwap:
         stream = kwargs.get("stream")
         if (
             stream is None
-            or n_el != 4096
+            or n_el <= 0
+            or (n_el & 7) != 0
             or not all(
                 isinstance(t, torch.Tensor)
                 and t.is_cuda
                 and t.dtype == torch.bfloat16
                 and t.is_contiguous()
-                and t.numel() == 4096
+                and t.numel() == n_el
                 and (t.data_ptr() & 15) == 0
                 for t in (gate, attn, out)
             )
@@ -162,7 +163,7 @@ class _MulSigmoidSwap:
                 g_c, a_c = gate.clone(), attn.clone()
                 mine = torch.empty_like(out)
                 orig_run(kernel, *args, **kwargs)
-                G.mul_sigmoid_bf16(g_c, a_c, mine, 4096, stream)
+                G.mul_sigmoid_bf16(g_c, a_c, mine, n_el, stream)
                 torch.cuda.synchronize()
                 ok = torch.equal(out.view(torch.int16), mine.view(torch.int16))
                 if ok:
@@ -181,20 +182,60 @@ class _MulSigmoidSwap:
             except Exception:
                 ok = False
             self.state = "admitted" if ok else "rejected"
-            logger.info("Decode mul_sigmoid glue: %s", self.state)
+            logger.info("mul_sigmoid_bf16 glue (n_el=%d): %s", n_el, self.state)
             return None
-        G.mul_sigmoid_bf16(gate, attn, out, 4096, stream)
+        G.mul_sigmoid_bf16(gate, attn, out, n_el, stream)
         return None
 
 
 class _RansPrologueHook:
     def __init__(self, act_mode: int) -> None:
         self.act_mode = act_mode
+        self.fp8_ms_state = "unchecked"
 
     def run(self, kernel, orig_run, args, kwargs):
         global _pending_rans_prologue
         if kwargs.get("benchmark_run", False) or _pending_rans_prologue is not None:
             return orig_run(kernel, *args, **kwargs)
+        if self.act_mode == 1 and len(args) == 5:
+            gate, attn, scale, out, numel = args
+            try:
+                n_el = int(numel)
+            except Exception:
+                n_el = -1
+            if (
+                n_el > 4096
+                and (n_el & 7) == 0
+                and self.fp8_ms_state != "rejected"
+                and kwargs.get("stream") is not None
+                and all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gate, attn, scale, out))
+                and gate.dtype == torch.bfloat16 and attn.dtype == torch.bfloat16
+                and gate.numel() == n_el and attn.numel() == n_el
+                and ((gate.data_ptr() | attn.data_ptr()) & 15) == 0
+                and scale.dtype == torch.float32 and scale.numel() == 1
+                and out.dtype == torch.float8_e4m3fn and out.numel() == n_el
+                and (out.data_ptr() & 7) == 0
+            ):
+                import muse_norm_glue as G
+                stream = kwargs["stream"]
+                if self.fp8_ms_state == "unchecked":
+                    if not torch.cuda.is_current_stream_capturing():
+                        ok = False
+                        try:
+                            g_c, a_c = gate.clone(), attn.clone()
+                            mine = torch.empty_like(out)
+                            orig_run(kernel, *args, **kwargs)
+                            G.mul_sigmoid_fp8(g_c, a_c, scale, mine, n_el, stream)
+                            torch.cuda.synchronize()
+                            ok = torch.equal(out.view(torch.uint8), mine.view(torch.uint8))
+                        except Exception:
+                            ok = False
+                        self.fp8_ms_state = "admitted" if ok else "rejected"
+                        logger.info("mul_sigmoid_fp8 glue (n_el=%d): %s", n_el, self.fp8_ms_state)
+                        return None
+                elif self.fp8_ms_state == "admitted":
+                    G.mul_sigmoid_fp8(gate, attn, scale, out, n_el, stream)
+                    return None
         try:
             import muse_rans_ext as _rans
             if not hasattr(_rans, "rans_gemv_fused_auto"):
