@@ -135,3 +135,38 @@ def softcap_argmax(logits: torch.Tensor, mult: float, cap: float | None) -> torc
     if rc:
         raise RuntimeError(f"lmpost_softcap_argmax failed: {rc}")
     return out
+
+
+def softcap_argmax_into(
+    logits: torch.Tensor, mult: float, cap: float | None, out: torch.Tensor
+) -> bool:
+    """Write [1, 1] int64 argmax directly into caller-owned persistent `out` (CUDA-graph safe)."""
+    if (
+        logits.ndim != 2
+        or logits.shape[0] != 1
+        or logits.shape[1] == 0
+        or logits.dtype != torch.bfloat16
+        or not logits.is_contiguous()
+        or out.shape != (1, 1)
+        or out.dtype != torch.int64
+        or not out.is_contiguous()
+        or out.device != logits.device
+        or not available(logits.device)
+    ):
+        return False
+    dev = logits.device
+    lut = _get_lut(dev, mult, cap)
+    sv, si, dc, _, _ = _get_scratch(dev)
+    rc = _lib.lmpost_softcap_argmax(
+        logits.data_ptr(),
+        lut.data_ptr(),
+        out.data_ptr(),
+        sv.data_ptr(),
+        si.data_ptr(),
+        dc.data_ptr(),
+        logits.shape[1],
+        torch.cuda.current_stream(dev).cuda_stream,
+    )
+    if rc:
+        raise RuntimeError(f"lmpost_softcap_argmax failed: {rc}")
+    return True
