@@ -59,7 +59,14 @@ constexpr int kBBytes = 4096;       // 4 k16 rows x 128 columns of fe2m1 codes
 constexpr int kSBytes = 512;        // 4 k16 rows x 128 fe4m3 scales
 constexpr int kStageBytes = 21 * 1024;
 // The epilogues stage their reduction in the same window: 64 KiB (down) / 34 KiB (gate/up) from its start.
-constexpr int kTilesPerCta = 1;  // column tiles per CTA (gate/up)
+#ifndef MARLINW_TMA_KTILES_PER_CTA
+#ifdef MARLINW_TMA_GATEUP
+#define MARLINW_TMA_KTILES_PER_CTA 26
+#else
+#define MARLINW_TMA_KTILES_PER_CTA 1
+#endif
+#endif
+constexpr int kTilesPerCta = MARLINW_TMA_KTILES_PER_CTA;  // column tiles per CTA (gate/up)
 // With several tiles per CTA the epilogue must not touch the stages that already hold the next tile: it stages in
 // the last stage (free at a tile boundary) plus kEpiExtra bytes after it.
 constexpr int kEpiBytes = 128 * 68 * 4;
@@ -89,6 +96,9 @@ __device__ __forceinline__ void ldsm4(FragA& a, uint32_t smem) {
 }
 __device__ __forceinline__ void mbar_init(uint32_t a, int count) {
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(a), "r"(count) : "memory");
+}
+__device__ __forceinline__ void mbar_inval(uint32_t a) {
+  asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"r"(a) : "memory");
 }
 __device__ __forceinline__ void mbar_arrive(uint32_t a) {
   asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(a) : "memory");
@@ -134,11 +144,19 @@ __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* map, int 
 // int4 / int offsets of its codes and scales inside a stage, to which 4 b_row / s_row per k16 row are added.
 // A CTA may run several tiles back to back (kTilesPerCta): q0 is the position of this tile's first k-tile in the CTA's
 // k-tile stream of length `total`, and the copies keep running across the tile boundary.
+#ifndef MARLINW_TMA_SWAIT10
+#ifdef MARLINW_TMA_GATEUP
+#define MARLINW_TMA_SWAIT10 1
+#else
+#define MARLINW_TMA_SWAIT10 0
+#endif
+#endif
+
 template <int MB, bool kPdl = false, class Produce, class OnTile>
 __device__ __forceinline__ void k_loop(
     float (&acc)[MB][2][2][4], const int iters, const int b_rd, const int b_row, const int s_rd, const int s_row,
     Produce&& produce, OnTile&& on_tile, const int q0 = 0, const int total_or_0 = 0,
-    const float4* const resume = nullptr, const int t0 = 0) {
+    const int t0 = 0, const bool zero_acc = true) {
   const int total = total_or_0 ? total_or_0 : iters;
   extern __shared__ int4 sh[];
   const int tid = threadIdx.x;
@@ -237,10 +255,7 @@ __device__ __forceinline__ void k_loop(
     }
   };
 
-  if (resume) {  // a later K piece of a tile: both chains continue from the state the previous piece left
-#pragma unroll
-    for (int e = 0; e < MB * 4; e++) reinterpret_cast<float4*>(acc)[e] = resume[e * kThreads + tid];
-  } else {
+  if (zero_acc) {
 #pragma unroll
     for (int i = 0; i < MB * 16; i++) reinterpret_cast<float*>(acc)[i] = 0.0f;
   }
@@ -250,13 +265,7 @@ __device__ __forceinline__ void k_loop(
   load_bs(0, q0 & (kStages - 1));
   dequant_to(0);
 
-  // on_tile(t) returns the k-tile before which it wants to run next: the loop over the k-tiles in between carries
-  // none of its code (compiled into the loop it becomes predicated instructions that every k-tile pays for).
-#pragma unroll 1
-  for (int t = t0; t < iters;) {
-  const int stop = on_tile(t);
-#pragma unroll 1
-  for (; t < stop; t++) {
+  auto step_body = [&](const int t, const bool load_next) {
     const int q = q0 + t;
     const int s = q & (kStages - 1);
     const int ns = (q + 1) & (kStages - 1);
@@ -280,27 +289,73 @@ __device__ __forceinline__ void k_loop(
       mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
       mma16(fa[0][i], bb[0][1][1], acc[i][1][1]);
     }
-    // k-half 1 of k-tile t; meanwhile k-half 0 of k-tile t + 1 is loaded.
-    if (t + 1 < iters) mbar_wait(full_bar + 8 * ns, ((q + 1) / kStages) & 1);
-    load_bs(0, ns);
-    dequant_to(0);
-    {
-      const uint32_t sa = sbase + kStageBytes * ns + a_rd0;
+    if constexpr (MARLINW_TMA_SWAIT10) {
 #pragma unroll
       for (int i = 0; i < MB; i++) {
         mma16(fa[1][i], bb[1][0][0], acc[i][0][0]);
         mma16(fa[1][i], bb[1][0][1], acc[i][0][1]);
-        ldsm4(fa[0][i], sa + 2048 * i);
+      }
+      if (load_next) {
+        mbar_wait(full_bar + 8 * ns, ((q + 1) / kStages) & 1);
+        load_bs(0, ns);
+        const uint32_t sa = sbase + kStageBytes * ns + a_rd0;
+#pragma unroll
+        for (int i = 0; i < MB; i++) ldsm4(fa[0][i], sa + 2048 * i);
+        dequant_to(0);
+      }
+#pragma unroll
+      for (int i = 0; i < MB; i++) {
+        mma16(fa[1][i], bb[1][1][0], acc[i][1][0]);
+        mma16(fa[1][i], bb[1][1][1], acc[i][1][1]);
+      }
+    } else {
+      if (load_next) {
+        mbar_wait(full_bar + 8 * ns, ((q + 1) / kStages) & 1);
+        load_bs(0, ns);
+        dequant_to(0);
+        const uint32_t sa = sbase + kStageBytes * ns + a_rd0;
+#pragma unroll
+        for (int i = 0; i < MB; i++) {
+          mma16(fa[1][i], bb[1][0][0], acc[i][0][0]);
+          mma16(fa[1][i], bb[1][0][1], acc[i][0][1]);
+          ldsm4(fa[0][i], sa + 2048 * i);
+        }
+      } else {
+#pragma unroll
+        for (int i = 0; i < MB; i++) {
+          mma16(fa[1][i], bb[1][0][0], acc[i][0][0]);
+          mma16(fa[1][i], bb[1][0][1], acc[i][0][1]);
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < MB; i++) {
+        mma16(fa[1][i], bb[1][1][0], acc[i][1][0]);
+        mma16(fa[1][i], bb[1][1][1], acc[i][1][1]);
       }
     }
-#pragma unroll
-    for (int i = 0; i < MB; i++) {
-      mma16(fa[1][i], bb[1][1][0], acc[i][1][0]);
-      mma16(fa[1][i], bb[1][1][1], acc[i][1][1]);
+  };
+
+  // on_tile(t) returns the k-tile before which it wants to run next: the loop over the k-tiles in between carries
+  // none of its code (compiled into the loop it becomes predicated instructions that every k-tile pays for).
+#pragma unroll 1
+  for (int t = t0; t < iters;) {
+    const int stop = on_tile(t);
+    const int steady = (stop < iters) ? stop : (iters - 1);
+#pragma unroll 1
+    for (; t < steady; t++) step_body(t, true);
+    if (t < stop) {
+      step_body(t, false);
+      t++;
     }
   }
-  }
 }
+
+#ifndef MARLINW_DOWN_SHARED_B
+#define MARLINW_DOWN_SHARED_B 0
+#endif
+#ifndef MARLINW_TMA_COL_STRIDED
+#define MARLINW_TMA_COL_STRIDED 0
+#endif
 
 #ifndef MARLINW_TMA_GATEUP
 // ---------------------------------------------------------------------------------------------------------------
@@ -321,13 +376,11 @@ __device__ __forceinline__ uint32_t sel4_u32(uint32_t v0, uint32_t v1, uint32_t 
   return selp_u32(hi, lo, i & 2);
 }
 
-template <int MB, bool kLater, int kCols, bool kShflEpi = true, int kPdlMode = 0>  // kPdlMode: 0=off, 1=prod-only, 2=dual
+template <int MB, int kCols, bool kShflEpi = true, int kPdlMode = 0>  // kPdlMode: 0=off, 1=prod-only, 2=dual
 __device__ __forceinline__ void down_tile(
     const CUtensorMap* tmA, const CUtensorMap* tmB, const CUtensorMap* tmS, int4* __restrict__ C0,
-    float4* __restrict__ scratch, const float gs, const int row0, const int col, const int slot, const int cut_a,
-    const int cut_b, const int k_tiles
-    , const int piece, volatile int* const flags
-    ) {
+    float4* __restrict__ scratch, const float gs, const int row0, const int col, const int slot, const int cut_ax,
+    const int cut_by, const int k_tiles, const int piece, volatile int* const flags, const bool last_item = true) {
   extern __shared__ int4 sh[];
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -336,9 +389,15 @@ __device__ __forceinline__ void down_tile(
   const int nb = (warp >> 1) & 1;  // 64-column half of the tile
   const int sh2 = warp & 1;        // 32-column half of that
 
+  const int cut_a = static_cast<int16_t>(static_cast<uint32_t>(cut_ax) & 0xFFFFu);
+  const int cut_a2 = static_cast<int16_t>(static_cast<uint32_t>(cut_ax) >> 16);
+  const int cut_b = static_cast<int16_t>(static_cast<uint32_t>(cut_by) & 0xFFFFu);
+  const int cut_b2 = static_cast<int16_t>(static_cast<uint32_t>(cut_by) >> 16);
+
   float acc[MB][2][2][4];
   const int n_first = 4 - ((row0 >> 4) & 3);  // m-blocks in the chunk containing row0
-  float4* my_scratch = scratch + ((size_t)slot * 256 + tid) * 32;
+  float4* const my_scratch = scratch + ((size_t)slot * 256 + tid) * 32;
+  float4* const my_scratch2 = scratch + ((size_t)(slot + 1) * 256 + tid) * 32;
   // K pieces. piece = k0 | role << 10 | index << 12: this CTA runs k-tiles [k0, k0 + k_tiles) of its tile (k0 a
   // multiple of 8). role 0: the whole tile. 1: first piece (chains from +0, state stored at the end). 2: middle piece
   // (state loaded, state stored). 3: last piece (state loaded, epilogue). The state is every thread's accumulator
@@ -347,24 +406,35 @@ __device__ __forceinline__ void down_tile(
   // done) -> 2 (middle piece done) -> 0 (taken by the last piece).
   const int k0 = piece & 1023;
   const int k1 = k0 + k_tiles;
-  if (tid == 0 && (piece & 2048)) {
-    volatile int* const flag = flags + (piece >> 12);
-    const int before = ((piece >> 10) & 3) - 1;
-    while (*flag != before) {
+  if (piece & 2048) {
+    if (tid == 0) {
+      volatile int* const flag = flags + (piece >> 12);
+      const int before = ((piece >> 10) & 3) - 1;
+      while (*flag != before) {
+      }
+      __threadfence();  // acquire: the predecessor's state (stored before its release fence + flag) is visible
+      if (before == 2) *flag = 0;
     }
-    __threadfence();  // acquire: the predecessor's state (stored before its release fence + flag) is visible
-    if (before == 2) *flag = 0;
+    __syncthreads();
+    const float4* const hand = scratch + (size_t)(piece >> 12) * (kThreads * 32);
+#pragma unroll
+    for (int e = 0; e < MB * 4; e++) reinterpret_cast<float4*>(acc)[e] = hand[e * kThreads + tid];
+  } else {
+#pragma unroll
+    for (int i = 0; i < MB * 16; i++) reinterpret_cast<float*>(acc)[i] = 0.0f;
   }
   // Runs before k-tile t; returns the k-tile before which it has to run again (the next cut, or the end).
   auto cuts = [&](const int t) {
-    if (t == cut_a || t == cut_b) {
+    if (t == cut_a || t == cut_b || t == cut_a2 || t == cut_b2) {
       __syncthreads();
 #pragma unroll
       for (int i = 0; i < MB; i++) {
-        const int ci = i < n_first ? cut_a : cut_b;
-        if (ci == t) {
+        const int c1 = i < n_first ? cut_a : cut_b;
+        const int c2 = i < n_first ? cut_a2 : cut_b2;
+        if (c1 == t || c2 == t) {
+          float4* const dst_s = (c2 == t) ? my_scratch2 : my_scratch;
 #pragma unroll
-          for (int e = 0; e < 4; e++) my_scratch[i * 4 + e] = reinterpret_cast<float4*>(acc[i])[e];
+          for (int e = 0; e < 4; e++) dst_s[i * 4 + e] = reinterpret_cast<float4*>(acc[i])[e];
 #pragma unroll
           for (int e = 0; e < 16; e++) reinterpret_cast<float*>(acc[i])[e] = 0.0f;
         }
@@ -374,18 +444,30 @@ __device__ __forceinline__ void down_tile(
     int stop = k1;
     if (cut_a > t && cut_a < stop) stop = cut_a;
     if (cut_b > t && cut_b < stop) stop = cut_b;
+    if (cut_a2 > t && cut_a2 < stop) stop = cut_a2;
+    if (cut_b2 > t && cut_b2 < stop) stop = cut_b2;
     return stop;
   };
   auto produce = [&](const int g, const uint32_t dst, const uint32_t bar, const int mode) {
     if (mode == 0) {
       mbar_expect_tx(bar, MB * 16 * 128 + kBBytes + kSBytes);
       tma2d_hint(dst, tmA, 128 * g, row0, bar, tma_pol_el());                         // bytes, rows
-      tma2d_hint(dst + kABytes, tmB, 256 * col, 4 * g, bar, tma_pol_ef());            // uint32, k16 rows
-      tma2d_hint(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar, tma_pol_ef());  // bytes, k16 rows
+      if constexpr (kCols != 6656 || MARLINW_DOWN_SHARED_B) {
+        tma2d(dst + kABytes, tmB, 256 * col, 4 * g, bar);                              // uint32, k16 rows
+        tma2d(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar);                    // bytes, k16 rows
+      } else {
+        tma2d_hint(dst + kABytes, tmB, 256 * col, 4 * g, bar, tma_pol_ef());            // uint32, k16 rows
+        tma2d_hint(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar, tma_pol_ef());  // bytes, k16 rows
+      }
     } else if (mode == 1) {
       mbar_expect_tx_only(bar, kBBytes + kSBytes);
-      tma2d_hint(dst + kABytes, tmB, 256 * col, 4 * g, bar, tma_pol_ef());
-      tma2d_hint(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar, tma_pol_ef());
+      if constexpr (kCols != 6656 || MARLINW_DOWN_SHARED_B) {
+        tma2d(dst + kABytes, tmB, 256 * col, 4 * g, bar);
+        tma2d(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar);
+      } else {
+        tma2d_hint(dst + kABytes, tmB, 256 * col, 4 * g, bar, tma_pol_ef());
+        tma2d_hint(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar, tma_pol_ef());
+      }
     } else {
       mbar_expect_tx(bar, MB * 16 * 128);
       tma2d_hint(dst, tmA, 128 * g, row0, bar, tma_pol_el());
@@ -394,8 +476,10 @@ __device__ __forceinline__ void down_tile(
   // codes: int4 (64 g + 32 nb + lane), int2 sh2 of it; scales: int 32 g + 2 (8 nb + lane / 4) + sh2
   k_loop<MB, (kPdlMode == 2)>(acc, k1, kABytes / 4 + 4 * (32 * nb + lane) + 2 * sh2, 256,
                               (kABytes + kBBytes) / 4 + 2 * (8 * nb + (lane >> 2)) + sh2, 32, produce, cuts, 0, 0,
-                              kLater ? scratch + (size_t)(piece >> 12) * (kThreads * 32) : nullptr, k0);
-  if constexpr (kPdlMode != 0) pdl_launch_dependents();
+                              k0, false);
+  if constexpr (kPdlMode != 0) {
+    if (last_item) pdl_launch_dependents();
+  }
   __syncthreads();
   {
     const int role = (piece >> 10) & 3;
@@ -427,13 +511,29 @@ __device__ __forceinline__ void down_tile(
       float* c = reinterpret_cast<float*>(acc) + 4 * k;
       c[0] += r.x; c[1] += r.y; c[2] += r.z; c[3] += r.w;
     }
-    if (cut_a >= 0 || cut_b >= 0) {
+    if (cut_a >= 0 || cut_b >= 0 || cut_a2 >= 0 || cut_b2 >= 0) {
       const float4* s0 = scratch + ((size_t)slot * 256 + tid) * 32;
       const float4* s1 = scratch + ((size_t)slot * 256 + tid + 128) * 32;
+      const bool has_2 = (cut_a2 >= 0 || cut_b2 >= 0);
+      const float4* s0_2 = scratch + ((size_t)(slot + 1) * 256 + tid) * 32;
+      const float4* s1_2 = scratch + ((size_t)(slot + 1) * 256 + tid + 128) * 32;
 #pragma unroll
       for (int i = 0; i < MB; i++) {
-        const int ci = i < n_first ? cut_a : cut_b;
-        if (ci >= 0) {
+        const int c1 = i < n_first ? cut_a : cut_b;
+        const int c2 = i < n_first ? cut_a2 : cut_b2;
+        if (has_2 && c2 >= 0) {
+#pragma unroll
+          for (int e = 0; e < 4; e++) {
+            const float4 x0 = s0[i * 4 + e], y0 = s1[i * 4 + e];
+            const float4 x1 = s0_2[i * 4 + e], y1 = s1_2[i * 4 + e];
+            float* c = reinterpret_cast<float*>(acc[i]) + 4 * e;
+            // Exact stock 3-slice fold: slice_idx=2 (low) + (slice_idx=1 (mid) + slice_idx=0 (high))
+            c[0] = (x0.x + y0.x) + ((x1.x + y1.x) + c[0]);
+            c[1] = (x0.y + y0.y) + ((x1.y + y1.y) + c[1]);
+            c[2] = (x0.z + y0.z) + ((x1.z + y1.z) + c[2]);
+            c[3] = (x0.w + y0.w) + ((x1.w + y1.w) + c[3]);
+          }
+        } else if (c1 >= 0) {
 #pragma unroll
           for (int e = 0; e < 4; e++) {
             const float4 x = s0[i * 4 + e], y = s1[i * 4 + e];
@@ -503,22 +603,35 @@ template <int kCols, bool kShflEpi = true, int kPdlMode = 0>
 __global__ void __launch_bounds__(kThreads, 1) down(
     const __grid_constant__ CUtensorMap tmA8, const __grid_constant__ CUtensorMap tmB,
     const __grid_constant__ CUtensorMap tmS, int4* __restrict__ C0, float4* __restrict__ scratch,
-    const float* __restrict__ gs_ptr, int4* __restrict__ work
-    ) {
+    const float* __restrict__ gs_ptr, int4* __restrict__ work, const int total_items) {
+  extern __shared__ int4 sh[];
   if (threadIdx.x == 0) {
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA8) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmS) : "memory");
   }
-  const int4 w0 = work[2 * blockIdx.x];
-  const int4 w1 = work[2 * blockIdx.x + 1];
   const float gs = gs_ptr[0];
-  if (w1.w & 2048)
-    down_tile<8, true, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
-                       reinterpret_cast<volatile int*>(work + 2 * gridDim.x));
-  else
-    down_tile<8, false, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
-                        reinterpret_cast<volatile int*>(work + 2 * gridDim.x));
+  volatile int* const flags = reinterpret_cast<volatile int*>(work + 2 * total_items);
+  for (int b = blockIdx.x; b < total_items; b += gridDim.x) {
+    if (b >= gridDim.x) {
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        const uint32_t sbase = (static_cast<uint32_t>(__cvta_generic_to_shared(sh)) + 1023u) & ~1023u;
+        const uint32_t full_bar = sbase + kStages * kStageBytes + kEpiExtra;
+        const uint32_t empty_bar = full_bar + 8 * kStages;
+#pragma unroll
+        for (int i = 0; i < kStages; i++) {
+          mbar_inval(full_bar + 8 * i);
+          mbar_inval(empty_bar + 8 * i);
+        }
+      }
+      __syncthreads();
+    }
+    const int4 w0 = work[2 * b];
+    const int4 w1 = work[2 * b + 1];
+    down_tile<8, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
+                                          flags, b + gridDim.x >= total_items);
+  }
 }
 #else
 // ---------------------------------------------------------------------------------------------------------------
@@ -550,7 +663,11 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
   extern __shared__ int4 sh[];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int kw = warp >> 2, cw = (warp >> 1) & 1, jh = warp & 1;
-  const int chunk = blockIdx.x & 3, col0 = (blockIdx.x >> 2) * kTilesPerCta;
+  const int chunk = blockIdx.x & 3;
+  constexpr int kColsPerWave = (kFused / 128) / kTilesPerCta;
+  auto slice_col_of = [&](int ti) {
+    return MARLINW_TMA_COL_STRIDED ? ((blockIdx.x >> 2) + kColsPerWave * ti) : ((blockIdx.x >> 2) * kTilesPerCta + ti);
+  };
   if (tid == 0) {
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
@@ -563,20 +680,20 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
   auto produce = [&](const int q, const uint32_t dst, const uint32_t bar, const int mode) {
     const int ti = q / kTiles;
     const int g = q - ti * kTiles;
-    const int slice_col = col0 + ti;
+    const int slice_col = slice_col_of(ti);
     if (mode == 0) {
       mbar_expect_tx(bar, kABytes + kBBytes + kSBytes);
-      tma2d_hint(dst, &tmA, 128 * g, 128 * chunk, bar, tma_pol_el());                                               // bytes, rows
-      tma2d_hint(dst + kABytes, &tmB, 128 * slice_col, 4 * g, bar, tma_pol_ef());                                   // uint32, k16 rows
-      tma2d_hint(dst + kABytes + kBBytes / 2, &tmB, 128 * slice_col + kFused, 4 * g, bar, tma_pol_ef());
-      tma2d_hint(dst + kABytes + kBBytes, &tmS, 64 * slice_col, 4 * g, bar, tma_pol_ef());                          // bytes, k16 rows
-      tma2d_hint(dst + kABytes + kBBytes + kSBytes / 2, &tmS, 64 * slice_col + kFused / 2, 4 * g, bar, tma_pol_ef());
+      tma2d_hint(dst, &tmA, 128 * g, 128 * chunk, bar, tma_pol_el());  // bytes, rows
+      tma2d(dst + kABytes, &tmB, 128 * slice_col, 4 * g, bar);         // uint32, k16 rows
+      tma2d(dst + kABytes + kBBytes / 2, &tmB, 128 * slice_col + kFused, 4 * g, bar);
+      tma2d(dst + kABytes + kBBytes, &tmS, 64 * slice_col, 4 * g, bar);  // bytes, k16 rows
+      tma2d(dst + kABytes + kBBytes + kSBytes / 2, &tmS, 64 * slice_col + kFused / 2, 4 * g, bar);
     } else if (mode == 1) {
       mbar_expect_tx_only(bar, kBBytes + kSBytes);
-      tma2d_hint(dst + kABytes, &tmB, 128 * slice_col, 4 * g, bar, tma_pol_ef());
-      tma2d_hint(dst + kABytes + kBBytes / 2, &tmB, 128 * slice_col + kFused, 4 * g, bar, tma_pol_ef());
-      tma2d_hint(dst + kABytes + kBBytes, &tmS, 64 * slice_col, 4 * g, bar, tma_pol_ef());
-      tma2d_hint(dst + kABytes + kBBytes + kSBytes / 2, &tmS, 64 * slice_col + kFused / 2, 4 * g, bar, tma_pol_ef());
+      tma2d(dst + kABytes, &tmB, 128 * slice_col, 4 * g, bar);
+      tma2d(dst + kABytes + kBBytes / 2, &tmB, 128 * slice_col + kFused, 4 * g, bar);
+      tma2d(dst + kABytes + kBBytes, &tmS, 64 * slice_col, 4 * g, bar);
+      tma2d(dst + kABytes + kBBytes + kSBytes / 2, &tmS, 64 * slice_col + kFused / 2, 4 * g, bar);
     } else {
       mbar_expect_tx(bar, kABytes);
       tma2d_hint(dst, &tmA, 128 * g, 128 * chunk, bar, tma_pol_el());
@@ -589,7 +706,7 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
                                      static_cast<uint32_t>(__cvta_generic_to_shared(sh))) + (kStages - 1) * kStageBytes);
 #pragma unroll 1
   for (int ti = 0; ti < kTilesPerCta; ti++) {
-  const int slice_col = col0 + ti;
+  const int slice_col = slice_col_of(ti);
   k_loop<8, (kPdlMode == 2)>(c, kTiles, kABytes / 4 + 4 * (128 * cw + lane) + 2 * jh, 128,
                   (kABytes + kBBytes) / 4 + 64 * cw + 2 * (lane >> 2) + jh, 16, produce, [](int) { return kTiles; }, ti * kTiles,
                   kTilesPerCta * kTiles);
@@ -706,6 +823,12 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
     }
 #endif
   }
+  if constexpr (kTilesPerCta > 1) {
+    if (ti + 1 < kTilesPerCta) {
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      __syncthreads();
+    }
+  }
   }  // tiles of this CTA
 }
 #endif
@@ -776,12 +899,24 @@ extern "C" int marlinw_tma_set_pdl(int mode) {
   return old;
 }
 
+#ifndef MARLINW_DOWN_SHARED_B
+#define MARLINW_DOWN_SHARED_B 0
+#endif
+#ifndef MARLINW_TMA_COL_STRIDED
+#define MARLINW_TMA_COL_STRIDED 0
+#endif
+
 #ifndef MARLINW_TMA_GATEUP
 // Same C ABI as libmarlinw_down128.so, plus multi-shape TMA entrypoints (qkv 4608x6656, o_proj 6656x4096, gate 4096x6656).
 static bool g_shfl_epi = true;
+static bool g_down_persist = false;
 
 extern "C" void marlinw_down128_set_shfl_epi(int enable) {
   g_shfl_epi = (enable != 0);
+}
+
+extern "C" void marlinw_down128_set_persist(int enable) {
+  g_down_persist = (enable != 0);
 }
 
 template <int kCols>
@@ -822,16 +957,17 @@ static int launch_down_shape(
       !map2d(&tmB, weight, 4, 2 * (uint64_t)kCols, (uint64_t)k / 16, 8 * (uint64_t)kCols, 256, 4, false) ||
       !map2d(&tmS, scales, 1, (uint64_t)kCols, (uint64_t)k / 16, (uint64_t)kCols, 128, 4, false))
     return cudaErrorInvalidValue;
+  const int launch_grid = (g_down_persist && grid > 48 && grid % 48 == 0) ? 48 : grid;
   const int pm = tma_pdl_mode();
   if (pm == 2) {
     auto kernel = g_shfl_epi ? down<kCols, true, 2> : down<kCols, false, 2>;
-    return launch_ex_pdl(kernel, grid, kThreads, kShared, stream, tmA8, tmB, tmS, output, scratch, global_scale,
-                         const_cast<int4*>(work));
+    return launch_ex_pdl(kernel, launch_grid, kThreads, kShared, stream, tmA8, tmB, tmS, output, scratch, global_scale,
+                         const_cast<int4*>(work), grid);
   }
   auto kernel = (pm == 1) ? (g_shfl_epi ? down<kCols, true, 1> : down<kCols, false, 1>)
                           : (g_shfl_epi ? down<kCols, true, 0> : down<kCols, false, 0>);
-  kernel<<<grid, kThreads, kShared, stream>>>(tmA8, tmB, tmS, output, scratch, global_scale,
-                                              const_cast<int4*>(work));
+  kernel<<<launch_grid, kThreads, kShared, stream>>>(tmA8, tmB, tmS, output, scratch, global_scale,
+                                                     const_cast<int4*>(work), grid);
   return cudaGetLastError();
 }
 

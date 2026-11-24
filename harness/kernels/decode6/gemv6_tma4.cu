@@ -157,18 +157,20 @@ static bool decode6_tma4_pal16() {
 }
 
 static bool decode6_tma4_pal16_lm(bool is_pad128) {
-  if (is_pad128) {
-    static const bool pal16_lm128 = []() {
-      const char* env = std::getenv("MUSE_TMA4_PAL16_LM");
-      return !env || !*env || std::strtol(env, nullptr, 10) != 0;
-    }();
-    return pal16_lm128;
-  }
+  (void)is_pad128;
   static const bool pal16_lm = []() {
     const char* env = std::getenv("MUSE_TMA4_PAL16_LM");
-    return env && *env && std::strtol(env, nullptr, 10) != 0;
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
   return pal16_lm;
+}
+
+static bool decode6_waitfree_sk_red() {
+  static const bool wf = []() {
+    const char* env = std::getenv("MUSE_WAITFREE_SK_RED");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  return wf;
 }
 
 static int decode6_lm128_stages(int blocks) {
@@ -349,16 +351,19 @@ int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* 
   const int pdl_cfg = decode6_tma4_pdl();
   int pdl_mode = 0;
   if (pdl_cfg == 1) {
-    // Role-smart SM121 PDL: o_proj / down_proj trigger the following 1-CTA norm during their tail;
-    // gate_up / qkv consume the preceding 1-CTA norm via PDL (preload LUT/states/sb0/B before wait).
+    // Role-smart SM121 PDL: o_proj / down_proj / gate trigger dependents; qkv / gate / o_proj / gate_up consume.
     if constexpr (FuseMulSigmoid) {
-      pdl_mode = 2;
+      pdl_mode = 3;
     } else if (n == 6656 && k == 19968) {
-      pdl_mode = 2;
+      pdl_mode = 3;
     } else if constexpr (DownIlv && !FuseLmPost) {
-      if ((n == 39936 && k == 6656) || (n == 4608 && k == 6656)) {
+      if (n == 39936 && k == 6656) {
         pdl_mode = 1;
+      } else if ((n == 4608 && k == 6656) || (n == 4096 && k == 6656)) {
+        pdl_mode = 3;
       }
+    } else if constexpr (GateV48) {
+      pdl_mode = 3;
     }
   } else if (pdl_cfg == 2) {
     if constexpr (FuseMulSigmoid) {
@@ -390,12 +395,14 @@ int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* 
         &cfg, kernel,
         input, weight, output, partials, static_cast<const int4*>(nullptr), a_sc_arg, states, global_scale,
         var, lut_and_meta, k / 16, 1, n, k, k, locks, false, false, true, shared, palette,
-        decode6_tpf_stride(), pair_locks, lmpost_lut, lm_out_arg, org_vocab_size, input_aux, pdl_mode));
+        decode6_tpf_stride(), pair_locks, lmpost_lut, lm_out_arg, org_vocab_size, input_aux, pdl_mode,
+        decode6_waitfree_sk_red()));
   }
   kernel<<<grid, Threads, shared, stream>>>(
       input, weight, output, partials, nullptr, a_sc_arg, states, global_scale,
       var, lut_and_meta, k / 16, 1, n, k, k, locks, false, false, true, shared, palette,
-      decode6_tpf_stride(), pair_locks, lmpost_lut, lm_out_arg, org_vocab_size, input_aux, pdl_mode);
+      decode6_tpf_stride(), pair_locks, lmpost_lut, lm_out_arg, org_vocab_size, input_aux, pdl_mode,
+      decode6_waitfree_sk_red());
   return cudaGetLastError();
 }
 

@@ -1060,7 +1060,7 @@ def _pair_gate_up_tensors(w_raw: torch.Tensor, s_raw: torch.Tensor) -> tuple[tor
 def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
     if os.environ.get("MUSE_GATE_UP_SWIGLU", "1") == "0":
         return 0
-    want_fp8 = os.environ.get("MUSE_GATE_UP_SWIGLU_FP8", "0") != "0"
+    want_fp8 = os.environ.get("MUSE_GATE_UP_SWIGLU_FP8", "1") != "0"
     try:
         import muse_norm_glue as _ng
         if _ng.lib() is None or not hasattr(_ng, "mul_silu_slice_bf16"):

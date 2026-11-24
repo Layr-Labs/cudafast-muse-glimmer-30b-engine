@@ -93,10 +93,10 @@ def _harden_no_coredump() -> None:
 _harden_no_coredump()
 
 try:
-    from .backends import Backend, Emit, FakeBackend, VllmBackend, VllmConfig, check_spec_method
+    from .backends import Backend, Emit, FakeBackend, VllmBackend, VllmConfig
     from .settle import settle_and_log
 except ImportError:  # run as a script
-    from backends import Backend, Emit, FakeBackend, VllmBackend, VllmConfig, check_spec_method  # type: ignore
+    from backends import Backend, Emit, FakeBackend, VllmBackend, VllmConfig  # type: ignore
     from settle import settle_and_log  # type: ignore
 
 # The depth the resident implements. MUST equal ENGINE_IMPLEMENTED_DEPTH in
@@ -301,10 +301,8 @@ class Session:
             "spec_run": self.spec_run_offered,
             "ident": self.b.ident,
             "model_path": self.b.model_path,
-            # The drafter this leg loaded: the separate DFlash drafter's
-            # directory, or the MTP layer embedded in the checkpoint.
-            "mtp_head_path": self.b.draft_model_path
-            or (f"{self.b.model_path}#mtp.*" if self.b.depth > 0 else ""),
+            # The native MTP layer is embedded in the pinned checkpoint.
+            "mtp_head_path": f"{self.b.model_path}#mtp.*" if self.b.depth > 0 else "",
         }
 
     def handle(self, req: dict) -> tuple[dict, bool]:
@@ -418,11 +416,7 @@ def make_backend() -> Backend:
     if kind == "vllm":
         return VllmBackend(VllmConfig.from_env())
     if kind == "fake":
-        depth = int(os.environ.get("RESIDENT_SPEC_DEPTH", "0"))
-        method = os.environ.get("RESIDENT_SPEC_METHOD", "mtp")
-        draft_dir = os.environ.get("RESIDENT_DRAFT_MODEL_DIR", "")
-        check_spec_method(method, depth, draft_dir)
-        return FakeBackend(depth=depth, draft_model_path=draft_dir)
+        return FakeBackend(depth=int(os.environ.get("RESIDENT_SPEC_DEPTH", "0")))
     raise RuntimeError(f"RESIDENT_BACKEND={kind!r} is neither vllm nor fake")
 
 

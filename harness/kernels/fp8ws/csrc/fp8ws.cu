@@ -41,6 +41,9 @@ __host__ __device__ constexpr int swz(int r, int c) { return c ^ (r & 7); }
 __device__ __forceinline__ void mbar_init(uint32_t a, int n) {
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(a), "r"(n) : "memory");
 }
+__device__ __forceinline__ void mbar_inval(uint32_t a) {
+  asm volatile("mbarrier.inval.shared::cta.b64 [%0];" ::"r"(a) : "memory");
+}
 __device__ __forceinline__ void mbar_expect_tx(uint32_t a, int tx) {
   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(a), "r"(tx) : "memory");
 }
@@ -458,6 +461,7 @@ gemm_hybrid_6656(const __grid_constant__ CUtensorMap tmA256, const __grid_consta
     constexpr int ST2 = 4, BM2 = 64, ASZ2 = BM2 * KT, STB2 = ASZ2 + WSZ;
     const int nt = 48 + (b >> 3), band = b & 7;
     if (tid == 0) {
+      for (int s = 0; s < 2; ++s) { mbar_inval(full0 + 8 * s); mbar_inval(empty0 + 8 * s); }
       for (int s = 0; s < ST2; ++s) { mbar_init(full0 + 8 * s, 1); mbar_init(empty0 + 8 * s, NWARP); }
       asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -594,6 +598,7 @@ gemm_hybrid_6656_nsplit128(const __grid_constant__ CUtensorMap tmA256,
     const int col0 = is48 ? (6144 + c * 48) : (6144 + 384 + (c - 8) * 32);
     const int tx_bytes = ASZ2 + (is48 ? (48 * KT) : (32 * KT));
     if (tid == 0) {
+      for (int s = 0; s < 2; ++s) { mbar_inval(full0 + 8 * s); mbar_inval(empty0 + 8 * s); }
       for (int s = 0; s < ST2; ++s) { mbar_init(full0 + 8 * s, 1); mbar_init(empty0 + 8 * s, NWARP); }
       asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");

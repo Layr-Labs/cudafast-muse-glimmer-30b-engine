@@ -9,6 +9,7 @@
 // reduction order and the same BF16 epilogue as the stock call.
 #define MARLIN_NAMESPACE_NAME marlinw_down
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include "marlinw_template.h"
 
 namespace {
@@ -17,16 +18,40 @@ constexpr int kShared = 45056;
 constexpr auto kKernelStock =
     marlinw_down::Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
                         vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
-                        kThreads, 4, 8, 4, false, 3, 1, false, false>;
+                        kThreads, 4, 8, 4, false, 3, 1, false, false, false>;
 constexpr auto kKernelFast =
     marlinw_down::Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
                         vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
-                        kThreads, 4, 8, 4, false, 3, 1, false, true>;
+                        kThreads, 4, 8, 4, false, 3, 1, false, true, false>;
+constexpr auto kKernelStockPdl =
+    marlinw_down::Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                        vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
+                        kThreads, 4, 8, 4, false, 3, 1, false, false, true>;
+constexpr auto kKernelFastPdl =
+    marlinw_down::Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
+                        vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
+                        kThreads, 4, 8, 4, false, 3, 1, false, true, true>;
 static bool g_use_fast = true;
+static int g_attn_pdl_override = -1;
+
+static bool attn_pdl_enabled() {
+  if (g_attn_pdl_override >= 0) return g_attn_pdl_override != 0;
+  static const bool env_pdl = []() {
+    const char* env = std::getenv("MUSE_ATTN_PDL");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  return env_pdl;
+}
 }  // namespace
 
 extern "C" void marlinw_attn_set_fast(int enable) {
   g_use_fast = (enable != 0);
+}
+
+extern "C" int marlinw_attn_set_pdl(int enable) {
+  const int prev = attn_pdl_enabled() ? 1 : 0;
+  g_attn_pdl_override = (enable < 0) ? -1 : (enable != 0 ? 1 : 0);
+  return prev;
 }
 
 extern "C" int marlinw_attn_init(int* active_blocks) {
@@ -36,14 +61,29 @@ extern "C" int marlinw_attn_init(int* active_blocks) {
   status = cudaFuncSetAttribute(
       kKernelFast, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
   if (status != cudaSuccess) return status;
-  int occ_stock = 0, occ_fast = 0;
+  status = cudaFuncSetAttribute(
+      kKernelStockPdl, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  if (status != cudaSuccess) return status;
+  status = cudaFuncSetAttribute(
+      kKernelFastPdl, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  if (status != cudaSuccess) return status;
+  int occ_stock = 0, occ_fast = 0, occ_stock_pdl = 0, occ_fast_pdl = 0;
   status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &occ_stock, kKernelStock, kThreads, kShared);
   if (status != cudaSuccess) return status;
   status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &occ_fast, kKernelFast, kThreads, kShared);
   if (status != cudaSuccess) return status;
-  *active_blocks = occ_fast < occ_stock ? occ_fast : occ_stock;
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &occ_stock_pdl, kKernelStockPdl, kThreads, kShared);
+  if (status != cudaSuccess) return status;
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &occ_fast_pdl, kKernelFastPdl, kThreads, kShared);
+  if (status != cudaSuccess) return status;
+  int m = occ_fast < occ_stock ? occ_fast : occ_stock;
+  if (occ_stock_pdl < m) m = occ_stock_pdl;
+  if (occ_fast_pdl < m) m = occ_fast_pdl;
+  *active_blocks = m;
   return cudaSuccess;
 }
 
@@ -55,7 +95,9 @@ extern "C" int marlinw_attn_gemm(
   if (grid <= 0 || (rows != 512 && rows != 64) || columns % 128 || inner % 64 ||
       row_stride < inner || row_stride % 8)
     return cudaErrorInvalidValue;
-  auto kernel = g_use_fast ? kKernelFast : kKernelStock;
+  const bool pdl = attn_pdl_enabled();
+  auto kernel = pdl ? (g_use_fast ? kKernelFastPdl : kKernelStockPdl)
+                    : (g_use_fast ? kKernelFast : kKernelStock);
   kernel<<<grid, kThreads, kShared, stream>>>(
       input, weight, output, partial, nullptr, nullptr, scales, global_scale,
       nullptr, nullptr, inner / 16, rows, columns, inner, row_stride, locks,

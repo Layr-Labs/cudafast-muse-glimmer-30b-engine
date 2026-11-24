@@ -486,6 +486,8 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
     states[state] = rans_lds32(ring_s | ((128u * state + 4u * lane) & (RB - 1u)));
   }
   uint32_t pwb = 128u * NS;
+  const float sa_v = __ldg(pb.sa);
+  const float sb0 = pb.sb_scalar ? __ldg(pb.sb) : 0.f;
 
   for (int nb = w; nb < NB; nb += pb.tw) {
     float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
@@ -532,9 +534,8 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
       rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
     }
     if (lane < 4) {
-      const float sa_v = __ldg(pb.sa);
       int n = nb * 8 + 2 * t;
-      float s0 = pb.sb_scalar ? pb.sb[0] : pb.sb[n], s1 = pb.sb_scalar ? pb.sb[0] : pb.sb[n + 1];
+      float s0 = pb.sb_scalar ? sb0 : __ldg(pb.sb + n), s1 = pb.sb_scalar ? sb0 : __ldg(pb.sb + n + 1);
       __nv_bfloat162 r; r.x = __float2bfloat16_rn(sa_v * (s0 * c0)); r.y = __float2bfloat16_rn(sa_v * (s1 * c1));
       *(__nv_bfloat162*)(pb.out + n) = r;
     }
@@ -563,8 +564,15 @@ static RansCfg rans_pick_cfg(int N, int K) {
     const char* env = std::getenv("MUSERANS_GATE_UP_EVEN48");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
+  static const bool gu_tw384 = []() {
+    const char* env = std::getenv("MUSERANS_GATE_UP_TW384");
+    return env && *env && std::strtol(env, nullptr, 10) != 0;
+  }();
   if (gate32 && N == 4096 && K == 6656 && NB == 512 && rans_fits(K, 16, 9, 4)) {
     return RansCfg{512, 16, 4, 4, 9};
+  }
+  if (gu_tw384 && N == 39936 && K == 6656 && NB == 4992 && rans_fits(K, 8, 9, 8)) {
+    return RansCfg{384, 8, 4, 8, 9};
   }
   if (gate_up_even && N == 39936 && K == 6656 && NB == 4992 && rans_fits(K, 16, 9, 4)) {
     return RansCfg{768, 16, 4, 4, 9};
@@ -582,20 +590,45 @@ static RansCfg rans_pick_cfg(int N, int K) {
 
 static void rans_normalize(const int64_t* counts, int32_t* f) {
   int64_t total = 0;
-  for (int i = 0; i < 256; i++) total += counts[i];
-  TORCH_CHECK(total > 0);
+  int active = 0;
+  for (int i = 0; i < 256; i++) {
+    total += counts[i];
+    if (counts[i] > 0) ++active;
+  }
+  TORCH_CHECK(total > 0 && active <= 4096);
   int sum = 0;
   for (int i = 0; i < 256; i++) {
-    if (counts[i] > 0) { long v = std::lround((double)counts[i] * 4096.0 / (double)total); f[i] = (int)std::max(1L, v); } else f[i] = 0;
+    if (counts[i] > 0) {
+      long v = std::floor((double)counts[i] * 4096.0 / (double)total);
+      f[i] = (int)std::max(1L, v);
+    } else {
+      f[i] = 0;
+    }
     sum += f[i];
   }
-  int diff = 4096 - sum;
-  while (diff != 0) {
-    int k = 0;
-    for (int i = 1; i < 256; i++) if (f[i] > f[k]) k = i;
-    int step = diff > 0 ? diff : std::max(diff, -(f[k] - 1));
-    TORCH_CHECK(step != 0, "cannot normalize frequencies");
-    f[k] += step; diff -= step;
+  while (sum < 4096) {
+    int best = -1;
+    double best_gain = -1.0;
+    for (int i = 0; i < 256; i++) {
+      if (f[i] <= 0) continue;
+      double gain = (double)counts[i] * std::log(((double)f[i] + 1.0) / (double)f[i]);
+      if (gain > best_gain) { best_gain = gain; best = i; }
+    }
+    TORCH_CHECK(best >= 0, "cannot normalize frequencies (+)");
+    f[best]++;
+    sum++;
+  }
+  while (sum > 4096) {
+    int best = -1;
+    double best_loss = 1e300;
+    for (int i = 0; i < 256; i++) {
+      if (f[i] <= 1) continue;
+      double loss = (double)counts[i] * std::log((double)f[i] / ((double)f[i] - 1.0));
+      if (loss < best_loss) { best_loss = loss; best = i; }
+    }
+    TORCH_CHECK(best >= 0, "cannot normalize frequencies (-)");
+    f[best]--;
+    sum--;
   }
 }
 

@@ -385,12 +385,30 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
     // are preloaded from immutable blob; wait for predecessor before reading x_in.
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
-  for (int i = tid; i < kWidth; i += blockDim.x) {
-    const int tile = i / kValues;
-    const int rem = i - tile * kValues;
-    const int step = rem >> 5;
-    const int ln = rem & 31;
-    sh_x[tile * kValues + ln * kSteps + step] = x_in[i];
+  if ((reinterpret_cast<uintptr_t>(x_in) & 15u) == 0u) {
+    for (int v = tid; v < (kWidth >> 3); v += blockDim.x) {
+      const int tile = v >> 5;
+      const int step = (v >> 2) & 7;
+      const int ln0 = (v & 3) << 3;
+      const uint4 x4 = reinterpret_cast<const uint4*>(x_in)[v];
+      uint16_t* dst = sh_x + tile * kValues + ln0 * kSteps + step;
+      dst[0 * kSteps] = static_cast<uint16_t>(x4.x);
+      dst[1 * kSteps] = static_cast<uint16_t>(x4.x >> 16);
+      dst[2 * kSteps] = static_cast<uint16_t>(x4.y);
+      dst[3 * kSteps] = static_cast<uint16_t>(x4.y >> 16);
+      dst[4 * kSteps] = static_cast<uint16_t>(x4.z);
+      dst[5 * kSteps] = static_cast<uint16_t>(x4.z >> 16);
+      dst[6 * kSteps] = static_cast<uint16_t>(x4.w);
+      dst[7 * kSteps] = static_cast<uint16_t>(x4.w >> 16);
+    }
+  } else {
+    for (int i = tid; i < kWidth; i += blockDim.x) {
+      const int tile = i >> 8;
+      const int rem = i & 255;
+      const int step = rem >> 5;
+      const int ln = rem & 31;
+      sh_x[tile * kValues + ln * kSteps + step] = x_in[i];
+    }
   }
   __syncthreads();
   if (!active) return;
@@ -431,20 +449,29 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
       const uint4 x4 = reinterpret_cast<const uint4*>(sh_x + tile * kValues + lane * kSteps)[0];
       const uint32_t xw[4] = {x4.x, x4.y, x4.z, x4.w};
 #pragma unroll
-      for (int step = 0; step < kSteps; ++step) {
-        uint32_t& rx = st[step & 3];
-        const uint32_t e = sh_lut[rx & 1023u];
-        rx = ((e >> 8) & 2047u) * (rx >> 10) + (e >> 19);
-        const uint32_t exp_bits = (e & 255u) << 23;
-        const uint32_t sm_dup = __byte_perm(lo0, lo1, (step << 12) | (step << 8));
-        const bool need = rx < kRansL;
-        const uint32_t msk = __ballot_sync(0xffffffffu, need);
-        if (need) rx = (rx << 16) | lds16(ring_s + ((pwb + (__popc(msk & lt) << 1)) & (RB - 1u)));
-        pwb += __popc(msk) << 1;
-        const float wv = __uint_as_float((sm_dup & 0x807F0000u) | exp_bits);
-        const uint32_t xpair = xw[step >> 1];
-        const float xv = __uint_as_float((step & 1) ? (xpair & 0xFFFF0000u) : (xpair << 16));
-        accum = __fmaf_rn(xv, wv, accum);
+      for (int half = 0; half < 2; ++half) {
+        const uint32_t e0 = sh_lut[st[0] & 1023u];
+        const uint32_t e1 = sh_lut[st[1] & 1023u];
+        const uint32_t e2 = sh_lut[st[2] & 1023u];
+        const uint32_t e3 = sh_lut[st[3] & 1023u];
+        const uint32_t es[4] = {e0, e1, e2, e3};
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const int step = half * 4 + q;
+          const uint32_t e = es[q];
+          uint32_t& rx = st[q];
+          rx = ((e >> 8) & 2047u) * (rx >> 10) + (e >> 19);
+          const uint32_t exp_bits = (e & 255u) << 23;
+          const uint32_t sm_dup = __byte_perm(lo0, lo1, (step << 12) | (step << 8));
+          const bool need = rx < kRansL;
+          const uint32_t msk = __ballot_sync(0xffffffffu, need);
+          if (need) rx = (rx << 16) | lds16(ring_s + ((pwb + (__popc(msk & lt) << 1)) & (RB - 1u)));
+          pwb += __popc(msk) << 1;
+          const float wv = __uint_as_float((sm_dup & 0x807F0000u) | exp_bits);
+          const uint32_t xpair = xw[step >> 1];
+          const float xv = __uint_as_float((step & 1) ? (xpair & 0xFFFF0000u) : (xpair << 16));
+          accum = __fmaf_rn(xv, wv, accum);
+        }
       }
     }
 #pragma unroll

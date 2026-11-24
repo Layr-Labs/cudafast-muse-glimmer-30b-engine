@@ -30,6 +30,13 @@ FULL_SPLITS = max(1, min(MAX_SPLITS, int(os.environ.get("MUSE_GQA16_FULL_SPLITS"
 FULL_PIPE = os.environ.get("MUSE_GQA16_FULL_PIPE", "1").strip() not in ("0", "", "false", "no")
 ONE_PASS = os.environ.get("MUSE_GQA16_1PASS", "1").strip() not in ("0", "", "false", "no")
 ONE_PASS_MAX_TOKENS = int(os.environ.get("MUSE_GQA16_1PASS_MAX_TOKENS", "2176"))
+KV_PREFETCH = os.environ.get("MUSE_KV_PREFETCH", "0").strip() not in ("0", "", "false", "no")
+_l2pf = None
+if KV_PREFETCH:
+    try:
+        import l2pf as _l2pf
+    except Exception:
+        _l2pf = None
 
 _lib = None
 try:
@@ -332,6 +339,8 @@ def try_decode_gqa16(
     if f_splits > MAX_SPLITS:
         return False
     stream = torch.cuda.current_stream(device).cuda_stream
+    if KV_PREFETCH and _l2pf is not None and hasattr(_l2pf, "prefetch_kv_window"):
+        _l2pf.prefetch_kv_window(kv_cache, block_table, seqused_k, block_size, w_left, stream)
     rc = _lib.muse_gqa16_decode(
         query.data_ptr(),
         kv_cache.data_ptr(),

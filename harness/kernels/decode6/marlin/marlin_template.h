@@ -342,7 +342,8 @@ __global__ void Marlin(
     const int4* __restrict__ A_aux = nullptr
 #ifdef MUSE_SCALE_TMA4
     ,
-    int tma_pdl_mode = 0
+    int tma_pdl_mode = 0,
+    bool waitfree_sk_red = false
 #endif
 ) {
   if constexpr (scale6) {
@@ -1195,8 +1196,8 @@ __global__ void Marlin(
   #pragma unroll
       for (int m = 0; m < 4; m++) {
         const uint32_t e = sh_rlut[tma_x & 1023u];
-        tma_x = ((e >> 6) & 2047u) * (tma_x >> 10) + (e >> 17);
-        dst16[32 * m] = sh_pal16[e & 63u];
+        tma_x = ((e >> 11) & 2047u) * (tma_x >> 10) + (e >> 22);
+        dst16[32 * m] = static_cast<uint16_t>((e & 2047u) << 4);
         const bool need = tma_x < 65536u;
         const uint32_t msk = __ballot_sync(0xffffffffu, need);
         if (need) tma_x = (tma_x << 16) | tma_wp[__popc(msk & lt)];
@@ -1327,30 +1328,43 @@ __global__ void Marlin(
 #else
     sh_a_gated = reinterpret_cast<int4*>((reinterpret_cast<uintptr_t>(sh_pal + 64) + 15u) & ~uintptr_t(15u)) + 1024;
 #endif
-    const uint4* g_ptr = reinterpret_cast<const uint4*>(A0);
-    const uint4* a_ptr = reinterpret_cast<const uint4*>(A_aux);
-    uint4* dst_ptr = reinterpret_cast<uint4*>(sh_a_gated);
+  }
+  auto compute_a_gated = [&]() {
+    if constexpr (fuse_mul_sigmoid) {
+      const uint4* g_ptr = reinterpret_cast<const uint4*>(A0);
+      const uint4* a_ptr = reinterpret_cast<const uint4*>(A_aux);
+      uint4* dst_ptr = reinterpret_cast<uint4*>(sh_a_gated);
   #pragma unroll
-    for (int idx = threadIdx.x; idx < 512; idx += threads) {
-      const uint4 g = g_ptr[idx];
-      const uint4 av = a_ptr[idx];
-      const uint32_t gw[4] = {g.x, g.y, g.z, g.w};
-      const uint32_t aw[4] = {av.x, av.y, av.z, av.w};
-      uint32_t ow[4];
+      for (int idx = threadIdx.x; idx < 512; idx += threads) {
+        const uint4 g = g_ptr[idx];
+        const uint4 av = a_ptr[idx];
+        const uint32_t gw[4] = {g.x, g.y, g.z, g.w};
+        const uint32_t aw[4] = {av.x, av.y, av.z, av.w};
+        uint32_t ow[4];
   #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const float gl = __uint_as_float(gw[j] << 16);
-        const float gh = __uint_as_float(gw[j] & 0xffff0000u);
-        const float al = __uint_as_float(aw[j] << 16);
-        const float ah = __uint_as_float(aw[j] & 0xffff0000u);
-        __nv_bfloat162 p = __floats2bfloat162_rn(
-            __fmul_rn(marlin_triton_sigmoid(gl), al),
-            __fmul_rn(marlin_triton_sigmoid(gh), ah));
-        ow[j] = *reinterpret_cast<uint32_t*>(&p);
+        for (int j = 0; j < 4; ++j) {
+          const float gl = __uint_as_float(gw[j] << 16);
+          const float gh = __uint_as_float(gw[j] & 0xffff0000u);
+          const float al = __uint_as_float(aw[j] << 16);
+          const float ah = __uint_as_float(aw[j] & 0xffff0000u);
+          __nv_bfloat162 p = __floats2bfloat162_rn(
+              __fmul_rn(marlin_triton_sigmoid(gl), al),
+              __fmul_rn(marlin_triton_sigmoid(gh), ah));
+          ow[j] = *reinterpret_cast<uint32_t*>(&p);
+        }
+        dst_ptr[idx] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
       }
-      dst_ptr[idx] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
+      __syncthreads();
     }
-    __syncthreads();
+  };
+  if constexpr (fuse_mul_sigmoid) {
+#ifdef MUSE_SCALE_TMA4
+    if (!(down_ilv && ((tma_pdl_mode & 1) != 0))) {
+      compute_a_gated();
+    }
+#else
+    compute_a_gated();
+#endif
   }
 
   // Register storage for double buffer of shared memory reads.
@@ -2651,7 +2665,7 @@ __global__ void Marlin(
     tma_slice_base = tma_done;
     tma_done += slice_iters;
     const bool pdl_cons = ((tma_pdl_mode & 1) != 0) && !tma_started && cont_pipe &&
-                          !fuse_mul_sigmoid && !has_act_order && !has_zp && !is_a_8bit;
+                          !has_act_order && !has_zp && !is_a_8bit;
     int pre_a_off[stages - 1];
     bool pre_a_pred[stages - 1];
     if (pdl_cons) {
@@ -2721,6 +2735,15 @@ __global__ void Marlin(
         tma_started = true;
         __syncthreads();
         tma_wait(0, 0);
+        if constexpr (fast_pal16) {
+  #pragma unroll
+          for (int i = threadIdx.x; i < 1024; i += threads) {
+            const uint32_t e = sh_rlut[i];
+            const uint32_t p11 = static_cast<uint32_t>(sh_pal16[e & 63u]) >> 4;
+            sh_rlut[i] = p11 | (((e >> 6) & 2047u) << 11) | ((e >> 17) << 22);
+          }
+          __syncthreads();
+        }
         tma_x = sh_states[threadIdx.x];
         if (tma_iters > 0) tma_decode(0);
         if (tma_iters > 1) tma_decode(1);
@@ -2728,14 +2751,30 @@ __global__ void Marlin(
     }
     if (pdl_cons) {
       asm volatile("griddepcontrol.wait;" ::: "memory");
+      if constexpr (fuse_mul_sigmoid) {
+        compute_a_gated();
   #pragma unroll
-      for (int i = 0; i < stages - 1; i++) {
-        if (pre_a_pred[i]) {
-          int4* sh_a_stage = sh_a + a_sh_stage_step * i;
+        for (int i = 0; i < stages - 1; i++) {
+          if (pre_a_pred[i]) {
+            int4* sh_a_stage = sh_a + a_sh_stage_step * i;
   #pragma unroll
-          for (int j = 0; j < a_sh_wr_iters; j++) {
-            if (a_sh_wr_pred[j]) {
-              sh_a_stage[a_sh_wr_trans[j]] = A[a_gl_rd_delta_i * j + pre_a_off[i]];
+            for (int j = 0; j < a_sh_wr_iters; j++) {
+              if (a_sh_wr_pred[j]) {
+                sh_a_stage[a_sh_wr_trans[j]] = sh_a_gated[(a_gl_rd_delta_i * j + pre_a_off[i]) & 511];
+              }
+            }
+          }
+        }
+      } else {
+  #pragma unroll
+        for (int i = 0; i < stages - 1; i++) {
+          if (pre_a_pred[i]) {
+            int4* sh_a_stage = sh_a + a_sh_stage_step * i;
+  #pragma unroll
+            for (int j = 0; j < a_sh_wr_iters; j++) {
+              if (a_sh_wr_pred[j]) {
+                sh_a_stage[a_sh_wr_trans[j]] = A[a_gl_rd_delta_i * j + pre_a_off[i]];
+              }
             }
           }
         }
@@ -2748,6 +2787,15 @@ __global__ void Marlin(
       if (!tma_started) {
         tma_started = true;
         tma_wait(0, 0);
+        if constexpr (fast_pal16) {
+  #pragma unroll
+          for (int i = threadIdx.x; i < 1024; i += threads) {
+            const uint32_t e = sh_rlut[i];
+            const uint32_t p11 = static_cast<uint32_t>(sh_pal16[e & 63u]) >> 4;
+            sh_rlut[i] = p11 | (((e >> 6) & 2047u) << 11) | ((e >> 17) << 22);
+          }
+          __syncthreads();
+        }
         tma_x = sh_states[threadIdx.x];
         if (tma_iters > 0) tma_decode(0);
         if (tma_iters > 1) tma_decode(1);
@@ -2823,10 +2871,18 @@ __global__ void Marlin(
             fetch_to_shared((pipe + stages - 1) % stages, pipe,
                             total_rem >= stages);
             pipe++;
+#ifdef MUSE_SCALE_TMA4
+            if constexpr (tma_ovlp) {
+              tma_q++;
+              if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
+            }
+#endif
             wait_for_stage();
 #ifdef MUSE_SCALE_TMA4
-            tma_q++;
-            if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
+            if constexpr (!tma_ovlp) {
+              tma_q++;
+              if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
+            }
 #endif
             init_same_group(pipe % stages);
           }
@@ -2929,10 +2985,18 @@ __global__ void Marlin(
             fetch_to_shared((pipe + stages - 1) % stages, pipe,
                             slice_iters >= stages);
             pipe++;
+#ifdef MUSE_SCALE_TMA4
+            if constexpr (tma_ovlp) {
+              tma_q++;
+              if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
+            }
+#endif
             wait_for_stage();
 #ifdef MUSE_SCALE_TMA4
-            tma_q++;
-            if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
+            if constexpr (!tma_ovlp) {
+              tma_q++;
+              if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
+            }
 #endif
 #ifdef MUSE_SCALE_RANS
             rans_q++;
@@ -3249,6 +3313,76 @@ __global__ void Marlin(
 
       const int eff_lock = half_split ? (2 * locks_off + half_id) : locks_off;
       if (slice_count > 1 && !use_atomic_add) {
+#ifdef MUSE_SCALE_TMA4
+        constexpr int wf_stride = 3;
+        const int wf_base = 2 * static_cast<int>(gridDim.x);
+        if constexpr (fast_m1_red) {
+          if (waitfree_sk_red && use_fp32_reduce && slice_count <= (wf_stride + 1) &&
+              wf_base + (eff_lock + 1) * wf_stride <= 16 * static_cast<int>(gridDim.x)) {
+            constexpr int active_threads = 32 * tb_n_warps;
+            constexpr int red_m1_c_size = (active_threads >> 2) * 2;
+            if (!last) {
+              if (threadIdx.x < active_threads && (threadIdx.x & 3) == 0) {
+                const int red_tid = threadIdx.x >> 2;
+                const int slot_off = (wf_base + eff_lock * wf_stride + slice_idx) * red_m1_c_size;
+                reinterpret_cast<float4*>(C_tmp)[slot_off + red_tid * 2 + 0] = make_float4(
+                    frag_c[0][0][0][0], frag_c[0][0][0][2], frag_c[0][1][0][0], frag_c[0][1][0][2]);
+                reinterpret_cast<float4*>(C_tmp)[slot_off + red_tid * 2 + 1] = make_float4(
+                    frag_c[0][2][0][0], frag_c[0][2][0][2], frag_c[0][3][0][0], frag_c[0][3][0][2]);
+              }
+              barrier_release(&locks[eff_lock], false);
+            } else {
+              barrier_acquire(&locks[eff_lock], slice_count - 1);
+              if (threadIdx.x < active_threads && (threadIdx.x & 3) == 0) {
+                const int red_tid = threadIdx.x >> 2;
+                const int base_off = (wf_base + eff_lock * wf_stride) * red_m1_c_size + red_tid * 2;
+                float4 acc0 = reinterpret_cast<const float4*>(C_tmp)[base_off + 0];
+                float4 acc1 = reinterpret_cast<const float4*>(C_tmp)[base_off + 1];
+                for (int s = 1; s < slice_count - 1; ++s) {
+                  const int s_off = base_off + s * red_m1_c_size;
+                  const float4 t0 = reinterpret_cast<const float4*>(C_tmp)[s_off + 0];
+                  const float4 t1 = reinterpret_cast<const float4*>(C_tmp)[s_off + 1];
+                  acc0.x = t0.x + acc0.x;
+                  acc0.y = t0.y + acc0.y;
+                  acc0.z = t0.z + acc0.z;
+                  acc0.w = t0.w + acc0.w;
+                  acc1.x = t1.x + acc1.x;
+                  acc1.y = t1.y + acc1.y;
+                  acc1.z = t1.z + acc1.z;
+                  acc1.w = t1.w + acc1.w;
+                }
+                frag_c[0][0][0][0] += acc0.x;
+                frag_c[0][0][0][2] += acc0.y;
+                frag_c[0][1][0][0] += acc0.z;
+                frag_c[0][1][0][2] += acc0.w;
+                frag_c[0][2][0][0] += acc1.x;
+                frag_c[0][2][0][2] += acc1.y;
+                frag_c[0][3][0][0] += acc1.z;
+                frag_c[0][3][0][2] += acc1.w;
+              }
+              barrier_release(&locks[eff_lock], true);
+            }
+          } else {
+            // only globally reduce if there is more than one block in a slice
+            barrier_acquire(&locks[eff_lock], slice_idx);
+            if (use_fp32_reduce) {
+              global_reduce_fp32(slice_idx == 0, last);
+            } else {
+              global_reduce_fp16(slice_idx == 0, last);
+            }
+            barrier_release(&locks[eff_lock], last);
+          }
+        } else {
+          // only globally reduce if there is more than one block in a slice
+          barrier_acquire(&locks[eff_lock], slice_idx);
+          if (use_fp32_reduce) {
+            global_reduce_fp32(slice_idx == 0, last);
+          } else {
+            global_reduce_fp16(slice_idx == 0, last);
+          }
+          barrier_release(&locks[eff_lock], last);
+        }
+#else
         // only globally reduce if there is more than one block in a slice
         barrier_acquire(&locks[eff_lock], slice_idx);
         if (use_fp32_reduce) {
@@ -3257,6 +3391,7 @@ __global__ void Marlin(
           global_reduce_fp16(slice_idx == 0, last);
         }
         barrier_release(&locks[eff_lock], last);
+#endif
       }
 
       if (has_bias && last) {

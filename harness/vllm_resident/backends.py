@@ -81,7 +81,6 @@ class Backend(Protocol):
     ctx_size: int
     ident: str
     model_path: str
-    draft_model_path: str  # the separate drafter's directory; "" when none is loaded
 
     def start(
         self, tokens: list[int], max_tokens: int | None = None, top_logits: bool = True
@@ -118,12 +117,6 @@ class VllmConfig:
     max_num_batched_tokens: int
     kv_cache_memory_bytes: int
     ident: str
-    # The speculative decoder at depth > 0 (SPEC_METHODS). "mtp" reads an MTP
-    # layer inside the target checkpoint; "dflash" loads the separate drafter at
-    # `draft_model_dir`, the contract's pinned drafter that tools/serve-up.sh
-    # mounts read-only. Both come from serve-up.sh, never from the submission.
-    spec_method: str = "mtp"
-    draft_model_dir: str = ""
     extra: dict = field(default_factory=dict)
 
     @classmethod
@@ -137,9 +130,6 @@ class VllmConfig:
         depth = int(need("RESIDENT_SPEC_DEPTH"))
         if not 0 <= depth <= 6:
             raise RuntimeError(f"RESIDENT_SPEC_DEPTH={depth} is outside 0..6")
-        method = os.environ.get("RESIDENT_SPEC_METHOD", "mtp")
-        draft_dir = os.environ.get("RESIDENT_DRAFT_MODEL_DIR", "")
-        check_spec_method(method, depth, draft_dir)
         return cls(
             model_dir=need("RESIDENT_MODEL_DIR"),
             depth=depth,
@@ -148,43 +138,7 @@ class VllmConfig:
             max_num_batched_tokens=int(need("RESIDENT_MAX_NUM_BATCHED_TOKENS")),
             kv_cache_memory_bytes=int(need("RESIDENT_KV_CACHE_MEMORY_BYTES")),
             ident=os.environ.get("RESIDENT_IDENT", "vllm"),
-            spec_method=method,
-            draft_model_dir=draft_dir,
         )
-
-
-# The decoders the resident can build. "mtp" is the in-checkpoint MTP layer
-# (unchanged); "dflash" is a separate DFlash drafter loaded from its own
-# directory.
-SPEC_METHODS = ("mtp", "dflash")
-
-
-def check_spec_method(method: str, depth: int, draft_dir: str) -> None:
-    """Refuse a decoder the resident cannot build, or a drafter it cannot find.
-
-    A dflash leg needs the drafter directory (with its config.json); an mtp or
-    serial leg must not name one, so a stray path can never reach the engine.
-    """
-    if method not in SPEC_METHODS:
-        raise RuntimeError(f"RESIDENT_SPEC_METHOD={method!r} is not one of {', '.join(SPEC_METHODS)}")
-    if method == "dflash" and depth > 0:
-        if not draft_dir:
-            raise RuntimeError("RESIDENT_SPEC_METHOD=dflash needs RESIDENT_DRAFT_MODEL_DIR; tools/serve-up.sh exports it")
-        if not os.path.isfile(os.path.join(draft_dir, "config.json")):
-            raise RuntimeError(f"RESIDENT_DRAFT_MODEL_DIR={draft_dir} holds no config.json")
-    elif draft_dir:
-        raise RuntimeError(
-            f"RESIDENT_DRAFT_MODEL_DIR is set for a {'serial' if depth == 0 else method} leg; only a dflash leg loads a drafter"
-        )
-
-
-def speculative_config(cfg: VllmConfig) -> dict | None:
-    """vLLM's `speculative_config` for this leg; None for a serial leg."""
-    if cfg.depth == 0:
-        return None
-    if cfg.spec_method == "dflash":
-        return {"method": "dflash", "model": cfg.draft_model_dir, "num_speculative_tokens": cfg.depth}
-    return {"method": "mtp", "num_speculative_tokens": cfg.depth}
 
 
 def _checkpoint_is_multimodal(model_dir: str) -> bool:
@@ -227,7 +181,9 @@ class VllmBackend:
         if muse_sandwich is not None:
             muse_sandwich.install()
 
-        spec = speculative_config(cfg)
+        spec = None
+        if cfg.depth > 0:
+            spec = {"method": "mtp", "num_speculative_tokens": cfg.depth}
         # PORT DRIFT (vLLM 0.27.1, Muse Glimmer 30B): a multimodal checkpoint
         # needs a tokenizer even when the caller only sends token IDs, because
         # the renderer builds the model's multimodal processor at engine start
@@ -331,7 +287,6 @@ class VllmBackend:
         self.ctx_size = cfg.ctx_size
         self.ident = cfg.ident
         self.model_path = cfg.model_dir
-        self.draft_model_path = cfg.draft_model_dir if cfg.depth > 0 and cfg.spec_method == "dflash" else ""
         self._rid = 0
         self._live: str | None = None
         self._warm_up()
@@ -471,16 +426,13 @@ class FakeBackend:
     (1..depth+1), every one of them the same greedy continuation, which is the
     contract a correct speculative engine keeps."""
 
-    def __init__(
-        self, depth: int = 0, vocab_size: int = 131072, ctx_size: int = 8192, draft_model_path: str = ""
-    ):
+    def __init__(self, depth: int = 0, vocab_size: int = 131072, ctx_size: int = 8192):
         self.vocab_size = vocab_size
         self.eos_token = 2
         self.depth = depth
         self.ctx_size = ctx_size
         self.ident = f"fake depth={depth}"
         self.model_path = "/fake/model"
-        self.draft_model_path = draft_model_path
         self._ctx: list[int] | None = None
         self._cycle = 0
         self._left: int | None = None

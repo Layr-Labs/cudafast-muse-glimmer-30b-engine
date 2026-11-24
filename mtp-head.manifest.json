@@ -1,14 +1,7 @@
 {
   "version": 1,
-  "source": "pinned",
-  "upstream_model_id": "meta-models/Muse-Glimmer-30B-assistant",
-  "upstream_revision": "c676cce91658f9568aaf264a416211e2782735b7",
-  "sha256": {
-    "config.json": "38915167b64b1e6405492aacae5b1b4511b6431163d2960b9bd25821df6fa30a",
-    "model.safetensors": "fd88d337eb84f8d0e6ba33a7684d7efa6722d4460ba4d6badca9699418392a84"
-  },
+  "source": "none",
   "spec": {
-    "decoder": "dflash",
     "enabled": false,
     "num_speculative_tokens": 0
   }
