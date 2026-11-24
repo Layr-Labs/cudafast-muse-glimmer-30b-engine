@@ -18,6 +18,7 @@ from pathlib import Path
 import torch
 
 ENABLED = os.environ.get("MUSE_EMBED_FUSED", "1") == "1"
+ENABLED_M1 = os.environ.get("MUSE_EMBED_FUSED_M1", "1") != "0"
 _lib = None
 try:
     _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_embed.so")))
@@ -26,10 +27,51 @@ try:
     _lib.muse_embed_square.restype = ctypes.c_int
     _lib.muse_embed_scale.argtypes = [_p, ctypes.c_int, _p, _p, _p, ctypes.c_int, ctypes.c_int, _p]
     _lib.muse_embed_scale.restype = ctypes.c_int
+    _m1 = getattr(_lib, "muse_embed_norm_m1", None)
+    if _m1 is not None:
+        _m1.argtypes = [_p, ctypes.c_int, _p, ctypes.c_float, _p, ctypes.c_int, _p]
+        _m1.restype = ctypes.c_int
 except OSError:
     _lib = None
 
-state = {"admitted": None, "fused_calls": 0, "reason": ""}
+state = {"admitted": None, "admitted_m1": None, "fused_calls": 0, "m1_calls": 0, "reason": ""}
+
+
+def _fused_m1(ids, table, eps, out):
+    _, width = out.shape
+    stream = torch.cuda.current_stream(out.device).cuda_stream
+    status = _lib.muse_embed_norm_m1(
+        ids.data_ptr(), int(ids.dtype == torch.int64), table.data_ptr(), float(eps), out.data_ptr(), width, stream
+    )
+    if status:
+        raise RuntimeError(f"muse_embed norm_m1 launch returned CUDA error {status}")
+
+
+def _admit_m1(model, ids, out, table) -> bool:
+    if not ENABLED_M1 or _lib is None or getattr(_lib, "muse_embed_norm_m1", None) is None:
+        return False
+    width = table.shape[1]
+    if width <= 0 or (width & 7) != 0 or width > 8192:
+        return False
+    dev = out.device
+    eps = model.embed_norm.eps
+    gen = torch.Generator(device=dev)
+    gen.manual_seed(20261124)
+    cases = [ids[:1].clone()]
+    for _ in range(8):
+        cases.append(torch.randint(0, table.shape[0], (1,), generator=gen, device=dev, dtype=ids.dtype))
+    for case in cases:
+        mine = torch.empty((1, width), dtype=torch.bfloat16, device=dev)
+        _fused_m1(case, table, eps, mine)
+        theirs = model.embed_norm(model.embed_tokens(case))
+        torch.cuda.synchronize()
+        if not torch.equal(mine.view(torch.int16), theirs.view(torch.int16)):
+            return False
+    return True
+
+
+def is_single_kernel_m1() -> bool:
+    return bool(ENABLED and ENABLED_M1 and state["admitted_m1"] is True)
 
 
 def _fused(ids, table, eps, out):
@@ -113,6 +155,14 @@ def embed_into(model, ids, out) -> bool:
         state["reason"] = reason or "admitted"
         if reason:
             return False
+    if out.shape[0] == 1 and ENABLED_M1:
+        if state["admitted_m1"] is None and not torch.cuda.is_current_stream_capturing():
+            state["admitted_m1"] = _admit_m1(model, ids, out, table)
+        if state["admitted_m1"] is True:
+            _fused_m1(ids, table, model.embed_norm.eps, out)
+            state["fused_calls"] += 1
+            state["m1_calls"] += 1
+            return True
     _fused(ids, table, model.embed_norm.eps, out)
     state["fused_calls"] += 1
     return True

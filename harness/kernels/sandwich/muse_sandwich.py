@@ -38,11 +38,17 @@ _hint_launch = getattr(_library, "muse_sandwich_hint", None)
 if _hint_launch is not None:
     _hint_launch.argtypes = [ctypes.POINTER(_pointer), ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, _pointer]
     _hint_launch.restype = ctypes.c_int
+PREFILL_CS = os.environ.get("MUSE_SANDWICH_PREFILL_CS", "1") != "0"
+_set_prefill_cs = getattr(_library, "muse_sandwich_set_prefill_cs", None)
+if _set_prefill_cs is not None:
+    _set_prefill_cs.argtypes = [ctypes.c_int]
+    _set_prefill_cs.restype = None
+    _set_prefill_cs(1 if PREFILL_CS else 0)
 FOLD = os.environ.get("MUSE_SANDWICH_GATE_FOLD", "1") == "1" and _gate_launch is not None
 # 512-row prefill only, cache hints only (no value changes): store the folded gate operand / the new residual row at
 # L2 evict_last priority, so that they are still in L2 when the gate GEMM / the post-attention norm read them after
-# the qkv (and attention) weight streams. Off until measured in the engine.
-EVICT_LAST = os.environ.get("MUSE_SANDWICH_GATE_EVICT_LAST", "0") == "1"
+# the qkv (and attention) weight streams. Paired with MUSE_SANDWICH_PREFILL_CS ld.global.cs streaming on dead down/res.
+EVICT_LAST = os.environ.get("MUSE_SANDWICH_GATE_EVICT_LAST", "1") != "0"
 RESIDUAL_EVICT_LAST = os.environ.get("MUSE_SANDWICH_RESIDUAL_EVICT_LAST", "0") == "1"
 # Not storing `hidden` in folded layers: its only reader there is the skipped requant (in-boot A/B ab-p3c-1: logits
 # and final hidden rows bitwise equal with it dropped; writing it costs the folding sandwich ~27 us per layer).
