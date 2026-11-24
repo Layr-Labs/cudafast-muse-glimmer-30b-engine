@@ -22,10 +22,10 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 ENABLED = os.environ.get("FP8WS", "1") != "0"
-SHAPES = frozenset({
-    (4608, 6656),
-    (4096, 6656),
-})
+SHAPES = frozenset(
+    {(4608, 6656), (4096, 6656)}
+    | ({(6656, 4096), (6656, 19968)} if os.environ.get("FP8WS_6656", "1") != "0" else set())
+)
 _admitted: dict[tuple[int, int, int], bool] = {}
 
 try:
