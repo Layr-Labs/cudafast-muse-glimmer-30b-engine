@@ -571,7 +571,12 @@ extern "C" int muse_bf16_rans_gemv(int rows, size_t blob_bytes, const void* inpu
   const int blocks = (bf16_gate32 && rows == 4096 && tw == 512) ? 32 : ((tw < 48) ? tw : 48);
   const int wpb = (tw + blocks - 1) / blocks;
   const size_t rb = 4u * 512u;
-  const size_t dsmem = rb + static_cast<size_t>(wpb) * rb;
+  size_t dsmem = rb + static_cast<size_t>(wpb) * rb;
+  static const bool bf16_lock48 = []() {
+    const char* env = std::getenv("MUSE_BF16_SMEM_LOCK48");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  if (bf16_lock48 && blocks == 48 && dsmem < 40960) dsmem = 40960;
   static bool init = false;
   if (!init) {
     cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
