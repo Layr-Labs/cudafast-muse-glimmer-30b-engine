@@ -19,6 +19,7 @@ except Exception:  # noqa: BLE001
 
 _lib = None
 _multi = None
+_multi_kv = None
 try:
     _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_qk_glue.so")))
     _lib.muse_qk_norm_rope.argtypes = [
@@ -32,9 +33,22 @@ try:
     if _multi is not None:
         _multi.argtypes = list(_lib.muse_qk_norm_rope.argtypes[:-1]) + [ctypes.c_int, ctypes.c_void_p]
         _multi.restype = ctypes.c_int
+    _multi_kv = getattr(_lib, "muse_qk_norm_rope_multi_kv", None)
+    if _multi_kv is not None:
+        _multi_kv.argtypes = (
+            list(_lib.muse_qk_norm_rope.argtypes[:-1])
+            + [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+            + [ctypes.c_int64] * 3
+            + [ctypes.c_void_p]
+        )
+        _multi_kv.restype = ctypes.c_int
 except OSError:
     _lib = None
     _multi = None
+    _multi_kv = None
+
+KV_FUSE_ENABLED = os.environ.get("MUSE_QK_KV_FUSE", "1").strip() not in ("0", "", "false", "no")
+_kv_fuse_logged: set[int] = set()
 
 MULTI_HPW = int(os.environ.get("MUSE_QK_MULTI_HPW", "9"))
 MULTI_MIN_TOKENS = 64
@@ -171,6 +185,22 @@ def run_qk_norm_rope(
     qscale: float,
     use_rope: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    q_out, k_out, _ = run_qk_norm_rope_kv(
+        qkv, positions, cos_sin_cache, eps, qscale, use_rope, None, None
+    )
+    return q_out, k_out
+
+
+def run_qk_norm_rope_kv(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    eps: float,
+    qscale: float,
+    use_rope: bool,
+    kv_cache: torch.Tensor | None,
+    slot_mapping: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
     if _lib is None:
         raise RuntimeError("libmuse_qk_glue.so unavailable")
     if not qkv.is_contiguous():
@@ -179,7 +209,7 @@ def run_qk_norm_rope(
     q_out = qkv.new_empty((num_tokens, 4096))
     k_out = qkv.new_empty((num_tokens, 256))
     if num_tokens == 0:
-        return q_out, k_out
+        return q_out, k_out, False
     if use_rope:
         assert cos_sin_cache is not None
         if positions.dtype != torch.int64:
@@ -195,6 +225,22 @@ def run_qk_norm_rope(
         cache_ptr = 0
         cache_rows = 0
         cache_fp32 = 1
+    can_kv = (
+        KV_FUSE_ENABLED
+        and _multi_kv is not None
+        and kv_cache is not None
+        and slot_mapping is not None
+        and kv_cache.ndim == 4
+        and kv_cache.dtype == torch.bfloat16
+        and kv_cache.shape[1] == 2
+        and kv_cache.shape[3] == 256
+        and kv_cache.stride(3) == 1
+        and slot_mapping.ndim == 1
+        and slot_mapping.dtype == torch.int64
+        and slot_mapping.is_contiguous()
+        and slot_mapping.shape[0] == num_tokens
+    )
+    kv_written = False
     with torch.cuda.device(qkv.device):
         stream = torch.cuda.current_stream(qkv.device).cuda_stream
         args = (
@@ -202,19 +248,38 @@ def run_qk_norm_rope(
             num_tokens, cache_rows, float(eps), float(qscale), int(use_rope), cache_fp32,
         )
         if num_tokens == 1 and DECODE_HPW > 0 and _multi is not None and _decode_state["admitted"]:
-            st = _multi(*args, DECODE_HPW, stream)
+            if can_kv and DECODE_HPW in (2, 9):
+                st = _multi_kv(
+                    *args, DECODE_HPW, kv_cache.data_ptr(), slot_mapping.data_ptr(),
+                    int(kv_cache.shape[2]), int(kv_cache.stride(0)),
+                    int(kv_cache.stride(1)), int(kv_cache.stride(2)), stream,
+                )
+                kv_written = (st == 0)
+            else:
+                st = _multi(*args, DECODE_HPW, stream)
         elif (
             num_tokens > MULTI_MIN_TOKENS
             and MULTI_HPW > 0
             and _multi is not None
             and _multi_ok(args, qkv, positions, cos_sin_cache, stream)
         ):
-            st = _multi(*args, MULTI_HPW, stream)
+            if can_kv and MULTI_HPW in (2, 9):
+                st = _multi_kv(
+                    *args, MULTI_HPW, kv_cache.data_ptr(), slot_mapping.data_ptr(),
+                    int(kv_cache.shape[2]), int(kv_cache.stride(0)),
+                    int(kv_cache.stride(1)), int(kv_cache.stride(2)), stream,
+                )
+                kv_written = (st == 0)
+            else:
+                st = _multi(*args, MULTI_HPW, stream)
         else:
             st = _lib.muse_qk_norm_rope(*args, stream)
     if st:
         raise RuntimeError(f"muse_qk_norm_rope failed with CUDA error {st}")
-    return q_out, k_out
+    if kv_written and num_tokens not in _kv_fuse_logged:
+        _kv_fuse_logged.add(num_tokens)
+        logger.info("muse_qk_glue: fused Q/K RMSNorm+RoPE+KV-cache scatter active (M=%d)", num_tokens)
+    return q_out, k_out, kv_written
 
 
 def _multi_ok(args, qkv, positions, cos_sin_cache, stream) -> bool:

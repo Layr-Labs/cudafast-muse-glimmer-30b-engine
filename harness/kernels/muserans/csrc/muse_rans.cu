@@ -510,8 +510,9 @@ static RansCfg rans_pick_cfg(int N, int K) {
     const int R = (NB + 48 * wcap - 1) / (48 * wcap);
     const int tw = (NB + R - 1) / R, wpb = (tw + 47) / 48;
     if (rans_fits(K, wpb, 9, 4)) {
-      const int states = ((N == 6656) || (N == 4608 && K == 6656)) ? 4 : 2;
-      return RansCfg{tw, wpb, states, 4, 9};
+      const int states = ((N == 6656 && K == 4096) || (N == 4608 && K == 6656)) ? 4 : 2;
+      const int rg = ((N == 4608 && K == 6656) && rans_fits(K, wpb, 9, 8)) ? 8 : 4;
+      return RansCfg{tw, wpb, states, rg, 9};
     }
   }
   return RansCfg{NB, 1, 2, 4, 9};

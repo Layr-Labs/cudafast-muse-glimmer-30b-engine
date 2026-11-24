@@ -253,7 +253,7 @@ def _tma4_scale_descs(w: torch.Tensor) -> list[tuple[int, int, int, int]]:
     off16_bytes = ((total_sbs + 1) * 4 + 15) // 16 * 16
     states_off = 4096 + meta_bytes + off16_bytes
     var_off = states_off + num_blks * threads * 4
-    wave_blks = min(num_blks, 48)
+    wave_blks = 96 if (num_blks == 96 and threads == 128) else min(num_blks, 48)
     gsb_sb1_end = min(total_sbs, 2 * wave_blks)
     need_u32 = 1024 + meta_u32 + gsb_sb1_end + 1
     if need_u32 * 4 > prefix:
@@ -280,7 +280,14 @@ def weight_descs(ws: tuple[torch.Tensor, ...], nbytes: int) -> list[tuple[int, i
     if nbytes <= 0:
         return []
     w0 = ws[0]
-    if w0.ndim == 3 and w0.shape[1:] == (416, 128) and w0.shape[0] >= 48 and w0.dtype == torch.int32:
+    is_tma4_ilv = (
+        w0.ndim == 3 and w0.shape[1:] == (416, 128) and w0.shape[0] >= 48
+        and len(ws) > 1 and ws[1].ndim == 2 and ws[1].shape[1] == 32 and ws[1].dtype == torch.uint8
+    )
+    if (
+        not is_tma4_ilv
+        and w0.ndim == 3 and w0.shape[1:] == (416, 128) and w0.shape[0] >= 48 and w0.dtype == torch.int32
+    ):
         base, span = _dense_span(w0)
         if base % 16 == 0 and 47 * 212992 + 16384 <= span:
             out = [(base, 212992, 16384, 48)]

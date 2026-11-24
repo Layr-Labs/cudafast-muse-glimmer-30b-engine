@@ -119,7 +119,7 @@ __global__ void qk_norm_rope_kernel(
   }
 }
 
-template <bool UseRope, bool CacheFP32, int HPW>
+template <bool UseRope, bool CacheFP32, int HPW, bool FuseKV = false>
 __global__ void qk_norm_rope_multi_kernel(
     const __nv_bfloat16* __restrict__ qkv,
     const int64_t* __restrict__ positions,
@@ -129,7 +129,13 @@ __global__ void qk_norm_rope_multi_kernel(
     int num_tokens,
     int cache_rows,
     float eps,
-    float qscale) {
+    float qscale,
+    __nv_bfloat16* __restrict__ kv_cache = nullptr,
+    const int64_t* __restrict__ slot_mapping = nullptr,
+    int block_size = 16,
+    int64_t kv_stride_blk = 0,
+    int64_t kv_stride_h = 0,
+    int64_t kv_stride_tok = 0) {
   constexpr int kGroups = (34 + HPW - 1) / HPW;
   const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   if (warp_id >= num_tokens * kGroups) return;
@@ -225,13 +231,28 @@ __global__ void qk_norm_rope_multi_kernel(
       *reinterpret_cast<uint2*>(q_out + static_cast<size_t>(t) * 4096 + h * 128 + lane * 4) = out_v;
     } else {
       *reinterpret_cast<uint2*>(k_out + static_cast<size_t>(t) * 256 + (h - 32) * 128 + lane * 4) = out_v;
+      if constexpr (FuseKV) {
+        const int64_t slot = slot_mapping[t];
+        if (slot >= 0) {
+          const int64_t blk = slot / block_size;
+          const int64_t off = slot - blk * block_size;
+          const int kh = h - 32;
+          __nv_bfloat16* kv_dst = kv_cache + blk * kv_stride_blk + kh * kv_stride_h + off * kv_stride_tok;
+          *reinterpret_cast<uint2*>(kv_dst + lane * 4) = out_v;
+          const uint2 v_raw = *reinterpret_cast<const uint2*>(
+              qkv + static_cast<size_t>(t) * 4608 + (34 + kh) * 128 + lane * 4);
+          *reinterpret_cast<uint2*>(kv_dst + 128 + lane * 4) = v_raw;
+        }
+      }
     }
   }
 }
 
-template <int HPW>
+template <int HPW, bool FuseKV = false>
 int launch_multi(const void* qkv, const void* positions, const void* cos_sin_cache, void* q_out, void* k_out,
                  int num_tokens, int cache_rows, float eps, float qscale, int use_rope, int cache_fp32,
+                 void* kv_cache, const void* slot_mapping, int block_size,
+                 int64_t kv_stride_blk, int64_t kv_stride_h, int64_t kv_stride_tok,
                  cudaStream_t stream) {
   constexpr int kGroups = (34 + HPW - 1) / HPW;
   const int threads = (HPW == 2 && num_tokens == 1) ? 288 : 128;
@@ -241,16 +262,21 @@ int launch_multi(const void* qkv, const void* positions, const void* cos_sin_cac
   const auto* pos = static_cast<const int64_t*>(positions);
   auto* qo = static_cast<__nv_bfloat16*>(q_out);
   auto* ko = static_cast<__nv_bfloat16*>(k_out);
+  auto* kvc = static_cast<__nv_bfloat16*>(kv_cache);
+  const auto* smap = static_cast<const int64_t*>(slot_mapping);
   if (use_rope) {
     if (cache_fp32)
-      qk_norm_rope_multi_kernel<true, true, HPW><<<blocks, threads, 0, stream>>>(
-          q, pos, cos_sin_cache, qo, ko, num_tokens, cache_rows, eps, qscale);
+      qk_norm_rope_multi_kernel<true, true, HPW, FuseKV><<<blocks, threads, 0, stream>>>(
+          q, pos, cos_sin_cache, qo, ko, num_tokens, cache_rows, eps, qscale,
+          kvc, smap, block_size, kv_stride_blk, kv_stride_h, kv_stride_tok);
     else
-      qk_norm_rope_multi_kernel<true, false, HPW><<<blocks, threads, 0, stream>>>(
-          q, pos, cos_sin_cache, qo, ko, num_tokens, cache_rows, eps, qscale);
+      qk_norm_rope_multi_kernel<true, false, HPW, FuseKV><<<blocks, threads, 0, stream>>>(
+          q, pos, cos_sin_cache, qo, ko, num_tokens, cache_rows, eps, qscale,
+          kvc, smap, block_size, kv_stride_blk, kv_stride_h, kv_stride_tok);
   } else {
-    qk_norm_rope_multi_kernel<false, true, HPW><<<blocks, threads, 0, stream>>>(
-        q, pos, cos_sin_cache, qo, ko, num_tokens, cache_rows, eps, qscale);
+    qk_norm_rope_multi_kernel<false, true, HPW, FuseKV><<<blocks, threads, 0, stream>>>(
+        q, pos, cos_sin_cache, qo, ko, num_tokens, cache_rows, eps, qscale,
+        kvc, smap, block_size, kv_stride_blk, kv_stride_h, kv_stride_tok);
   }
   return static_cast<int>(cudaGetLastError());
 }
@@ -263,11 +289,25 @@ extern "C" int muse_qk_norm_rope_multi(
     cudaStream_t stream) {
   if (num_tokens <= 0) return 0;
   switch (hpw) {
-    case 2: return muse_qk_glue::launch_multi<2>(qkv, positions, cos_sin_cache, q_out, k_out, num_tokens, cache_rows, eps, qscale, use_rope, cache_fp32, stream);
-    case 6: return muse_qk_glue::launch_multi<6>(qkv, positions, cos_sin_cache, q_out, k_out, num_tokens, cache_rows, eps, qscale, use_rope, cache_fp32, stream);
-    case 9: return muse_qk_glue::launch_multi<9>(qkv, positions, cos_sin_cache, q_out, k_out, num_tokens, cache_rows, eps, qscale, use_rope, cache_fp32, stream);
-    case 17: return muse_qk_glue::launch_multi<17>(qkv, positions, cos_sin_cache, q_out, k_out, num_tokens, cache_rows, eps, qscale, use_rope, cache_fp32, stream);
-    case 34: return muse_qk_glue::launch_multi<34>(qkv, positions, cos_sin_cache, q_out, k_out, num_tokens, cache_rows, eps, qscale, use_rope, cache_fp32, stream);
+    case 2: return muse_qk_glue::launch_multi<2, false>(qkv, positions, cos_sin_cache, q_out, k_out, num_tokens, cache_rows, eps, qscale, use_rope, cache_fp32, nullptr, nullptr, 16, 0, 0, 0, stream);
+    case 6: return muse_qk_glue::launch_multi<6, false>(qkv, positions, cos_sin_cache, q_out, k_out, num_tokens, cache_rows, eps, qscale, use_rope, cache_fp32, nullptr, nullptr, 16, 0, 0, 0, stream);
+    case 9: return muse_qk_glue::launch_multi<9, false>(qkv, positions, cos_sin_cache, q_out, k_out, num_tokens, cache_rows, eps, qscale, use_rope, cache_fp32, nullptr, nullptr, 16, 0, 0, 0, stream);
+    case 17: return muse_qk_glue::launch_multi<17, false>(qkv, positions, cos_sin_cache, q_out, k_out, num_tokens, cache_rows, eps, qscale, use_rope, cache_fp32, nullptr, nullptr, 16, 0, 0, 0, stream);
+    case 34: return muse_qk_glue::launch_multi<34, false>(qkv, positions, cos_sin_cache, q_out, k_out, num_tokens, cache_rows, eps, qscale, use_rope, cache_fp32, nullptr, nullptr, 16, 0, 0, 0, stream);
+    default: return 1;
+  }
+}
+
+extern "C" int muse_qk_norm_rope_multi_kv(
+    const void* qkv, const void* positions, const void* cos_sin_cache, void* q_out, void* k_out,
+    int num_tokens, int cache_rows, float eps, float qscale, int use_rope, int cache_fp32, int hpw,
+    void* kv_cache, const void* slot_mapping, int block_size,
+    int64_t kv_stride_blk, int64_t kv_stride_h, int64_t kv_stride_tok,
+    cudaStream_t stream) {
+  if (num_tokens <= 0) return 0;
+  switch (hpw) {
+    case 2: return muse_qk_glue::launch_multi<2, true>(qkv, positions, cos_sin_cache, q_out, k_out, num_tokens, cache_rows, eps, qscale, use_rope, cache_fp32, kv_cache, slot_mapping, block_size, kv_stride_blk, kv_stride_h, kv_stride_tok, stream);
+    case 9: return muse_qk_glue::launch_multi<9, true>(qkv, positions, cos_sin_cache, q_out, k_out, num_tokens, cache_rows, eps, qscale, use_rope, cache_fp32, kv_cache, slot_mapping, block_size, kv_stride_blk, kv_stride_h, kv_stride_tok, stream);
     default: return 1;
   }
 }
