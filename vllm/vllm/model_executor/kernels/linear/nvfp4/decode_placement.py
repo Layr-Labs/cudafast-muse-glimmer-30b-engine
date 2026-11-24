@@ -32,9 +32,11 @@ logger = init_logger(__name__)
 
 ENABLED = os.environ.get("MUSE_DECODE_PLACEMENT", "1").strip() not in ("0", "", "false", "no")
 FULL_RAM_SCAN = os.environ.get("MUSE_FULL_RAM_SCAN", "1").strip() not in ("0", "", "false", "no")
+DIRECT_FAST_PACK = os.environ.get("MUSE_DIRECT_FAST_PACK", "1").strip() not in ("0", "", "false", "no")
 PLACE_SCALES6 = os.environ.get("MUSE_PLACE_SCALES6", "1").strip() not in ("0", "", "false", "no")
 SURPLUS = float(os.environ.get("MUSE_DECODE_PLACEMENT_SURPLUS", "3.0"))
-LM_HEAD_SPARES = int(os.environ.get("MUSE_LM_HEAD_SPARES", "24"))
+LARGE_RANS_SURPLUS = float(os.environ.get("MUSE_LARGE_RANS_SURPLUS", "5.0"))
+LM_HEAD_SPARES = int(os.environ.get("MUSE_LM_HEAD_SPARES", "32"))
 ROUNDS = 5
 # Weights that fit in L2 several times over are not bandwidth-bound per call.
 MIN_PAYLOAD_BYTES = 48 << 20
@@ -168,16 +170,47 @@ def _time_candidates(decode_linear, layer, candidates, n: int, k: int, rounds: i
     return [median(values) for values in samples]
 
 
+class _FastSlabPacker:
+    """Bump-allocates 4 KiB-aligned contiguous slices from ranked 127 MiB fast DRAM slabs, fastest first."""
+
+    def __init__(self, slabs: list[torch.Tensor]) -> None:
+        self._slabs = [s.reshape(-1).view(torch.uint8) for s in slabs]
+        self._idx = 0
+        self._off = 0
+        self.used_slabs = 0
+
+    def alloc_u8(self, nbytes: int, align: int = 4096) -> torch.Tensor | None:
+        while self._idx < len(self._slabs):
+            slab = self._slabs[self._idx]
+            off = (self._off + align - 1) & ~(align - 1)
+            if off + nbytes <= slab.numel():
+                self._off = off + nbytes
+                self.used_slabs = self._idx + 1
+                return slab[off : off + nbytes]
+            self._idx += 1
+            self._off = 0
+        return None
+
+    def alloc_like(self, src: torch.Tensor, align: int = 4096) -> torch.Tensor | None:
+        raw = self.alloc_u8(src.numel() * src.element_size(), align=align)
+        if raw is None:
+            return None
+        return raw.view(src.dtype).view(src.shape)
+
+    def release_unused(self) -> None:
+        if self.used_slabs < len(self._slabs):
+            del self._slabs[self.used_slabs :]
+
+
 def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor) -> dict | None:
     """Scan available host RAM in 127 MiB blocks (~4s), place gate_up into the fastest 45,
-    seed PyTorch's caching allocator with the next ~24 GiB of fastest blocks, and quarantine
-    the slowest ~44 GiB in _SLOW_HOLD so all subsequent decode & prefill groups draw only
-    from the fast physical DRAM band."""
+    return the next fastest ranked slabs in exact speed order for direct fast-slab packing,
+    and quarantine the slowest slabs in _SLOW_HOLD."""
     homes = [layer._buffers[_NAME] for layer in layers]
     count = len(homes)
     payload_bytes = homes[0].numel() * homes[0].element_size()
     spares_count = _spares_allowed(600, payload_bytes)
-    if spares_count < count * 4:
+    if spares_count < count * 3:
         return None
     spares = []
     try:
@@ -187,11 +220,11 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
             spares.append(spare)
     except RuntimeError:
         pass
-    if len(spares) < count * 4:
+    if len(spares) < count * 3:
         spares.clear()
         return None
     candidates = homes + spares
-    times = _time_candidates(decode_linear, layers[0], candidates, n, k, 3, evict_buf)
+    times = _time_candidates(decode_linear, layers[0], candidates, n, k, 5, evict_buf)
     ranked = sorted(range(len(candidates)), key=times.__getitem__)
     kept = set(ranked[:count])
     free_fast = [index for index in ranked[:count] if index >= count]
@@ -210,16 +243,14 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
         displaced_homes.append((times[home_index], source))
         after[home_index] = times[target_index]
         moved += 1
-    # Partition all unused candidates (spares + displaced homes) by measured speed:
-    # release the fastest ~24 GiB (190 blocks) to PyTorch's caching allocator (no empty_cache),
-    # quarantine up to ~22 GiB (175 slowest blocks) in _SLOW_HOLD, and release any middle overflow.
     unused = [(times[count + i], spare) for i, spare in enumerate(spares) if (count + i) not in used_targets]
     unused.extend(displaced_homes)
     unused.sort(key=lambda pair: pair[0])
-    fast_keep = min(len(unused), max(180, int(len(unused) * 0.42)))
+    fast_keep = min(len(unused), max(140, int(len(unused) * 0.42)))
+    fast_slabs = [buf for _, buf in unused[:fast_keep]] if DIRECT_FAST_PACK else []
     slow_tail = unused[fast_keep:]
-    if len(slow_tail) > 175:
-        slow_tail = slow_tail[-175:]
+    if len(slow_tail) > 140:
+        slow_tail = slow_tail[-140:]
     for _, slow_buf in slow_tail:
         _SLOW_HOLD.append(slow_buf)
     del unused, slow_tail
@@ -229,6 +260,7 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
         "count": count, "spares": len(spares), "moved": moved, "payload_bytes": payload_bytes,
         "before": (before[0], median(before), before[-1], sum(before)),
         "after": (after[0], median(after), after[-1], sum(after)),
+        "fast_slabs": fast_slabs,
     }
 
 
@@ -289,12 +321,13 @@ def _place_group(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor,
     }
 
 
-def _place_muserans_group(rans_ext, layers, n: int, k: int, evict_buf: torch.Tensor, rejected_hold: list) -> dict | None:
+def _place_muserans_group(rans_ext, layers, n: int, k: int, evict_buf: torch.Tensor, rejected_hold: list,
+                          surplus_override: float | None = None) -> dict | None:
     homes = [layer._buffers["muse_fp8_packed"] for layer in layers]
     count = len(homes)
     max_bytes = max(h.numel() for h in homes)
     is_small = max_bytes < MIN_PAYLOAD_BYTES
-    surplus = ATTN_SURPLUS if is_small else SURPLUS
+    surplus = surplus_override if surplus_override is not None else (ATTN_SURPLUS if is_small else SURPLUS)
     wanted = max(1, math.ceil(count * surplus)) if surplus > 0 else 0
     spares_count = _ensure_spares_room(wanted, max_bytes, rejected_hold, allow_slow_trim=not is_small)
     if spares_count <= 0 or (is_small and spares_count < count):
@@ -953,39 +986,209 @@ def place_decode_weights(model: torch.nn.Module) -> None:
         )
         deferred_single = [(k, v) for k, v in ordered_groups if len(v) == 1]
         multi_nvfp4 = [(k, v) for k, v in ordered_groups if len(v) > 1]
+        packer: _FastSlabPacker | None = None
+        packed_groups: set[tuple[str, int, int]] = set()
         for (n, k, *_), layers in multi_nvfp4:
+            if ("nvfp4", n, k) in packed_groups:
+                continue
             try:
                 stats = None
                 if FULL_RAM_SCAN and (n, k) == (39936, 6656) and len(layers) >= 32:
                     stats = _place_group_full_ram_scan(decode_linear, layers, n, k, evict_buf)
-                    if stats is not None and PLACE_SCALES6:
-                        try:
-                            import muse_marlin6_gemv as _m6
-                            ilv_set = getattr(_m6, "_DOWN_ILV_SCALES", None)
-                        except (ImportError, OSError):
-                            ilv_set = None
-                        moved_s6, bytes_s6 = 0, 0
-                        for m in model.modules():
-                            s6 = m._buffers.get("_marlin_decode_scales6")
-                            if s6 is not None and s6.is_cuda and s6.numel() * s6.element_size() >= (64 << 10):
+                    if stats is not None:
+                        fast_slabs = stats.pop("fast_slabs", [])
+                        if fast_slabs:
+                            packer = _FastSlabPacker(fast_slabs)
+                            # Pack all remaining <= 127 MiB decode weights directly into the top ranked
+                            # fast slabs in descending decode-impact order, before releasing unused slabs.
+                            p_moved, p_bytes = 0, 0
+                            # 1) NVFP4 multi-layer groups (e.g. 6656x19968 down: 40 x 63 MiB -> 20 slabs)
+                            for (gn, gk, *_), glayers in multi_nvfp4:
+                                if (gn, gk) == (39936, 6656):
+                                    continue
+                                ok_all = True
+                                for gl in glayers:
+                                    src = gl._buffers[_NAME]
+                                    dst = packer.alloc_like(src)
+                                    if dst is None:
+                                        ok_all = False
+                                        break
+                                    dst.copy_(src)
+                                    if torch.equal(dst, src):
+                                        gl._buffers[_NAME] = dst
+                                        p_moved += 1
+                                        p_bytes += dst.numel() * dst.element_size()
+                                    else:
+                                        ok_all = False
+                                if ok_all:
+                                    packed_groups.add(("nvfp4", gn, gk))
+                            # 2) FP8 rANS <= 127 MiB (6656x19968 down: 12 x 105 MiB -> 12 slabs)
+                            for (gn, gk), glayers in sorted(
+                                rans_groups.items(),
+                                key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_fp8_packed"].numel() for l in kv[1])),
+                            ):
+                                max_b = max(l._buffers["muse_fp8_packed"].numel() for l in glayers)
+                                if max_b > (128 << 20):
+                                    continue
+                                ok_all = True
+                                for gl in glayers:
+                                    src = gl._buffers["muse_fp8_packed"]
+                                    dst = packer.alloc_u8(src.numel())
+                                    if dst is None:
+                                        ok_all = False
+                                        break
+                                    dst.copy_(src)
+                                    if torch.equal(dst, src):
+                                        old = src.data
+                                        src.data = dst
+                                        if src.data_ptr() != dst.data_ptr():
+                                            src.data = old
+                                            ok_all = False
+                                        else:
+                                            p_moved += 1
+                                            p_bytes += dst.numel()
+                                    else:
+                                        ok_all = False
+                                if ok_all:
+                                    packed_groups.add(("rans", gn, gk))
+                            # 3) FP8 rANS attention (98 x ~23 MiB -> 19 slabs)
+                            if PLACE_ATTN:
+                                for (gn, gk), glayers in sorted(
+                                    attn_rans_groups.items(),
+                                    key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_fp8_packed"].numel() for l in kv[1])),
+                                ):
+                                    ok_all = True
+                                    for gl in glayers:
+                                        src = gl._buffers["muse_fp8_packed"]
+                                        dst = packer.alloc_u8(src.numel())
+                                        if dst is None:
+                                            ok_all = False
+                                            break
+                                        dst.copy_(src)
+                                        if torch.equal(dst, src):
+                                            old = src.data
+                                            src.data = dst
+                                            if src.data_ptr() != dst.data_ptr():
+                                                src.data = old
+                                                ok_all = False
+                                            else:
+                                                p_moved += 1
+                                                p_bytes += dst.numel()
+                                        else:
+                                            ok_all = False
+                                    if ok_all:
+                                        packed_groups.add(("attn_rans", gn, gk))
+                                # 4) BF16 rANS attention (12 x ~37 MiB -> 4 slabs)
+                                for (gn, gk), glayers in sorted(
+                                    attn_bf16_groups.items(),
+                                    key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_bf16_lane_weight"].numel() for l in kv[1])),
+                                ):
+                                    ok_all = True
+                                    for gl in glayers:
+                                        src = gl._buffers["muse_bf16_lane_weight"]
+                                        dst = packer.alloc_u8(src.numel())
+                                        if dst is None:
+                                            ok_all = False
+                                            break
+                                        dst.copy_(src)
+                                        if torch.equal(dst, src):
+                                            old = src.data
+                                            src.data = dst
+                                            if src.data_ptr() != dst.data_ptr():
+                                                src.data = old
+                                                ok_all = False
+                                            else:
+                                                p_moved += 1
+                                                p_bytes += dst.numel()
+                                        else:
+                                            ok_all = False
+                                    if ok_all:
+                                        packed_groups.add(("attn_bf16", gn, gk))
+                                # 5) NVFP4 attention (46 x ~14 MiB -> 6 slabs)
+                                for (gn, gk, *_), glayers in sorted(
+                                    attn_nvfp4_groups.items(),
+                                    key=lambda kv: -(len(kv[1]) * kv[1][0]._buffers[_NAME].numel()),
+                                ):
+                                    ok_all = True
+                                    for gl in glayers:
+                                        src = gl._buffers[_NAME]
+                                        dst = packer.alloc_like(src)
+                                        if dst is None:
+                                            ok_all = False
+                                            break
+                                        dst.copy_(src)
+                                        if torch.equal(dst, src):
+                                            gl._buffers[_NAME] = dst
+                                            p_moved += 1
+                                            p_bytes += dst.numel() * dst.element_size()
+                                        else:
+                                            ok_all = False
+                                    if ok_all:
+                                        packed_groups.add(("attn_nvfp4", gn, gk))
+                            # 6) scales6 (130 buffers, 593 MiB -> 5 slabs)
+                            if PLACE_SCALES6:
                                 try:
-                                    old_ptr = s6.data_ptr()
-                                    dst = torch.empty_like(s6)
-                                    dst.copy_(s6)
-                                    if torch.equal(dst, s6):
-                                        m._buffers["_marlin_decode_scales6"] = dst
-                                        if ilv_set is not None and old_ptr in ilv_set:
-                                            ilv_set.discard(old_ptr)
-                                            ilv_set.add(dst.data_ptr())
-                                        moved_s6 += 1
-                                        bytes_s6 += dst.numel() * dst.element_size()
-                                except RuntimeError:
-                                    break
-                        if moved_s6:
+                                    import muse_marlin6_gemv as _m6
+                                    ilv_set = getattr(_m6, "_DOWN_ILV_SCALES", None)
+                                except (ImportError, OSError):
+                                    ilv_set = None
+                                moved_s6, bytes_s6 = 0, 0
+                                for m in model.modules():
+                                    s6 = m._buffers.get("_marlin_decode_scales6")
+                                    if s6 is not None and s6.is_cuda and s6.numel() * s6.element_size() >= (64 << 10):
+                                        old_ptr = s6.data_ptr()
+                                        dst = packer.alloc_like(s6)
+                                        if dst is None:
+                                            break
+                                        dst.copy_(s6)
+                                        if torch.equal(dst, s6):
+                                            m._buffers["_marlin_decode_scales6"] = dst
+                                            if ilv_set is not None and old_ptr in ilv_set:
+                                                ilv_set.discard(old_ptr)
+                                                ilv_set.add(dst.data_ptr())
+                                            moved_s6 += 1
+                                            bytes_s6 += dst.numel() * dst.element_size()
+                                if moved_s6:
+                                    logger.info(
+                                        "Decode scales6 direct fast-slab packing: %d buffers (%.1f MiB)",
+                                        moved_s6, bytes_s6 / (1 << 20),
+                                    )
+                            used_slabs = packer.used_slabs
+                            packer.release_unused()
+                            del packer
+                            packer = None
                             logger.info(
-                                "Decode scales6 fast-pool relocation: %d buffers (%.1f MiB) moved into fast pool",
-                                moved_s6, bytes_s6 / (1 << 20),
+                                "Decode direct fast-slab packing: %d tensors (%.1f MiB) packed into top %d fast slabs",
+                                p_moved, p_bytes / (1 << 20), used_slabs,
                             )
+                        elif PLACE_SCALES6:
+                            try:
+                                import muse_marlin6_gemv as _m6
+                                ilv_set = getattr(_m6, "_DOWN_ILV_SCALES", None)
+                            except (ImportError, OSError):
+                                ilv_set = None
+                            moved_s6, bytes_s6 = 0, 0
+                            for m in model.modules():
+                                s6 = m._buffers.get("_marlin_decode_scales6")
+                                if s6 is not None and s6.is_cuda and s6.numel() * s6.element_size() >= (64 << 10):
+                                    try:
+                                        old_ptr = s6.data_ptr()
+                                        dst = torch.empty_like(s6)
+                                        dst.copy_(s6)
+                                        if torch.equal(dst, s6):
+                                            m._buffers["_marlin_decode_scales6"] = dst
+                                            if ilv_set is not None and old_ptr in ilv_set:
+                                                ilv_set.discard(old_ptr)
+                                                ilv_set.add(dst.data_ptr())
+                                            moved_s6 += 1
+                                            bytes_s6 += dst.numel() * dst.element_size()
+                                    except RuntimeError:
+                                        break
+                            if moved_s6:
+                                logger.info(
+                                    "Decode scales6 fast-pool relocation: %d buffers (%.1f MiB) moved into fast pool",
+                                    moved_s6, bytes_s6 / (1 << 20),
+                                )
                 if stats is None:
                     stats = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
             except Exception as err:  # noqa: BLE001 - this group stays where it was
@@ -1022,6 +1225,8 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                 if max_b > (128 << 20):
                     deferred_large_rans.append(((n, k), layers))
                     continue
+                if ("rans", n, k) in packed_groups:
+                    continue
                 try:
                     stats = _place_muserans_group(_rans_ext, layers, n, k, evict_buf, rejected_hold)
                 except Exception as err:  # noqa: BLE001
@@ -1049,6 +1254,8 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                     attn_bf16_groups.items(),
                     key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_bf16_lane_weight"].numel() for l in kv[1])),
                 ):
+                    if ("attn_bf16", n, k) in packed_groups:
+                        continue
                     try:
                         stats = _place_bf16_rans_group(_bf16_lib, layers, n, k, evict_buf, rejected_hold)
                     except Exception as err:  # noqa: BLE001
@@ -1070,6 +1277,8 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                 attn_rans_groups.items(),
                 key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_fp8_packed"].numel() for l in kv[1])),
             ):
+                if ("attn_rans", n, k) in packed_groups:
+                    continue
                 try:
                     stats = _place_muserans_group(_rans_ext, layers, n, k, evict_buf, rejected_hold)
                 except Exception as err:  # noqa: BLE001
@@ -1091,6 +1300,8 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                 attn_nvfp4_groups.items(),
                 key=lambda kv: -(len(kv[1]) * kv[1][0]._buffers[_NAME].numel()),
             ):
+                if ("attn_nvfp4", n, k) in packed_groups:
+                    continue
                 try:
                     stats = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
                 except Exception as err:  # noqa: BLE001
@@ -1110,7 +1321,8 @@ def place_decode_weights(model: torch.nn.Module) -> None:
         if deferred_large_rans and _rans_ext is not None:
             for (n, k), layers in deferred_large_rans:
                 try:
-                    stats = _place_muserans_group(_rans_ext, layers, n, k, evict_buf, rejected_hold)
+                    stats = _place_muserans_group(_rans_ext, layers, n, k, evict_buf, rejected_hold,
+                                                  surplus_override=LARGE_RANS_SURPLUS)
                 except Exception as err:  # noqa: BLE001
                     logger.warning("Decode rANS placement skipped for %dx%d: %s", n, k, err)
                     continue
