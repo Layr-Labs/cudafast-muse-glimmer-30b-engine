@@ -5,6 +5,8 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import product
+import math
+import os
 from typing import Any, NamedTuple, Protocol
 
 import torch
@@ -46,6 +48,177 @@ try:
     from l2pf import sites as l2_prefetch
 except ImportError:
     l2_prefetch = None
+
+_PERSIST_L2_LIMIT_BYTES = 4 << 20
+_cudart_upload_fn: Any = False
+
+
+def upload_cudagraph(
+    graph: torch.cuda.CUDAGraph, stream: Any = None
+) -> None:
+    """Eagerly upload an instantiated CUDA graph to the device; fail-soft."""
+    global _cudart_upload_fn
+    try:
+        if hasattr(graph, "upload"):
+            if stream is not None:
+                try:
+                    graph.upload(stream)
+                    return
+                except TypeError:
+                    pass
+            graph.upload()
+            return
+        if not hasattr(graph, "raw_cuda_graph_exec"):
+            return
+        if _cudart_upload_fn is False:
+            import ctypes
+
+            for libname in ("libcudart.so", "libcudart.so.13", "libcudart.so.12"):
+                try:
+                    lib = ctypes.CDLL(libname)
+                    fn = lib.cudaGraphUpload
+                    fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                    fn.restype = ctypes.c_int
+                    _cudart_upload_fn = fn
+                    break
+                except OSError:
+                    continue
+            else:
+                _cudart_upload_fn = None
+        if _cudart_upload_fn is not None:
+            import ctypes
+
+            exec_ptr = int(graph.raw_cuda_graph_exec())
+            if exec_ptr:
+                if stream is None:
+                    st_ptr = int(torch.cuda.current_stream().cuda_stream)
+                elif isinstance(stream, int):
+                    st_ptr = stream
+                else:
+                    st_ptr = int(getattr(stream, "cuda_stream", stream))
+                _cudart_upload_fn(ctypes.c_void_p(exec_ptr), ctypes.c_void_p(st_ptr))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _apply_persisting_window(
+    arena: torch.Tensor | None,
+    cap_stream: Any,
+    miss_streaming: bool = False,
+    persist_limit: int = _PERSIST_L2_LIMIT_BYTES,
+) -> bool:
+    if arena is None:
+        return False
+    try:
+        import l2pf as _l2pf_mod
+
+        if hasattr(_l2pf_mod, "set_persisting_window_ex"):
+            return bool(
+                _l2pf_mod.set_persisting_window_ex(
+                    arena.data_ptr(),
+                    arena.numel(),
+                    persist_limit,
+                    bool(miss_streaming),
+                    cap_stream,
+                )
+            )
+        if hasattr(_l2pf_mod, "set_persisting_window"):
+            return bool(
+                _l2pf_mod.set_persisting_window(
+                    arena.data_ptr(), arena.numel(), persist_limit, cap_stream
+                )
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _clear_persisting_window(
+    cap_stream: Any, persist_limit: int = _PERSIST_L2_LIMIT_BYTES
+) -> None:
+    """Clear stream accessPolicyWindow WITHOUT zeroing cudaLimitPersistingL2CacheSize."""
+    try:
+        import l2pf as _l2pf_mod
+
+        if hasattr(_l2pf_mod, "clear_stream_persisting_window"):
+            _l2pf_mod.clear_stream_persisting_window(cap_stream)
+        elif hasattr(_l2pf_mod, "set_persisting_window_ex"):
+            _l2pf_mod.set_persisting_window_ex(
+                0, 0, persist_limit, False, cap_stream
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _apply_l2_fetch_granularity() -> None:
+    """R3F-D: Set CUDA max L2 fetch granularity on boot before graph capture; fail-soft."""
+    gran = os.environ.get("MUSE_L2_FETCH_GRAN", "128").strip()
+    if gran in ("0", "", "false", "no"):
+        return
+    try:
+        import l2pf as _l2pf_mod
+
+        if hasattr(_l2pf_mod, "set_max_l2_fetch_granularity"):
+            if _l2pf_mod.set_max_l2_fetch_granularity(int(gran)):
+                logger.info("Set CUDA max L2 fetch granularity to %d B", int(gran))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _call_bool_setter(
+    mod: Any, fn_name: str, val: bool | None, default_bool: bool = True
+) -> None:
+    if mod is None:
+        return
+    fn = getattr(mod, fn_name, None)
+    if not callable(fn):
+        return
+    try:
+        if val is None:
+            try:
+                fn(None)
+            except TypeError:
+                fn(default_bool)
+        else:
+            fn(bool(val))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _set_decode_autotune_runtime(
+    stages: int | None, one_pass: bool | None, pdl: bool | None
+) -> None:
+    try:
+        import muse_marlin6_gemv as _m6
+
+        fn_st = getattr(_m6, "set_runtime_tma4_stages", None)
+        if callable(fn_st):
+            try:
+                fn_st(stages)
+            except TypeError:
+                if stages is not None:
+                    fn_st(int(stages))
+        _call_bool_setter(_m6, "set_runtime_pdl", pdl, True)
+    except Exception:  # noqa: BLE001
+        pass
+    for mod_name in (
+        "muse_rans_ext",
+        "vllm.model_executor.kernels.linear.scaled_mm.muse_fp8",
+        "muse_bf16_lane",
+        "vllm.model_executor.models.muse_glimmer_norm_glue",
+    ):
+        try:
+            mod = __import__(mod_name, fromlist=["set_runtime_pdl"])
+            _call_bool_setter(mod, "set_runtime_pdl", pdl, True)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        import muse_gqa16_attn as _gqa
+
+        _call_bool_setter(_gqa, "set_runtime_one_pass", one_pass, True)
+        _call_bool_setter(_gqa, "set_runtime_pdl", pdl, True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class AttentionState(NamedTuple):
@@ -157,11 +330,25 @@ class CudaGraphManager:
         # Memory ranges of the model's weights (set by the model capture) and
         # the L2 prefetch sessions of the captured FULL graphs.
         self.weight_ranges: list[tuple[int, int]] | None = None
+        self._live_weight_ranges_fn: Callable[[], list[tuple[int, int]]] | None = None
         self._l2_prefetch_sessions: list[Any] = []
 
         self._init_candidates()
 
-    def _l2_prefetch_session(self, desc: "BatchExecutionDescriptor") -> Any:
+    def _verify_l2_prefetch(self, l2pf: Any) -> None:
+        if l2pf is None or not hasattr(l2pf, "verify_live_ranges"):
+            return
+        live = (
+            self._live_weight_ranges_fn()
+            if self._live_weight_ranges_fn is not None
+            else self.weight_ranges
+        )
+        if live is not None:
+            l2pf.verify_live_ranges(live)
+
+    def _l2_prefetch_session(
+        self, desc: "BatchExecutionDescriptor", *, retain: bool = True
+    ) -> Any:
         if (
             l2_prefetch is None
             or desc.cg_mode != CUDAGraphMode.FULL
@@ -170,7 +357,8 @@ class CudaGraphManager:
         ):
             return None
         session = l2_prefetch.Session(self.weight_ranges)
-        self._l2_prefetch_sessions.append(session)
+        if retain:
+            self._l2_prefetch_sessions.append(session)
         return session
 
     def _build_lora_dispatch_map(self) -> tuple[dict[int, int], int]:
@@ -333,6 +521,7 @@ class CudaGraphManager:
                 metadata during warmup.
         """
         with graph_capture(device=self.device):
+            _apply_l2_fetch_granularity()
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -351,6 +540,7 @@ class CudaGraphManager:
                     l2pf = self._l2_prefetch_session(desc)
                     with l2pf.record() if l2pf is not None else nullcontext():
                         forward_fn(CUDAGraphMode.NONE)
+                    self._verify_l2_prefetch(l2pf)
 
                     # Capture
                     logger.debug(
@@ -378,22 +568,18 @@ class CudaGraphManager:
                             set_graph_pool_id(self.pool)
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
+                        self._verify_l2_prefetch(l2pf)
                         persist_set = False
                         cap_stream = current_platform.current_stream()
                         if desc.num_tokens == 1:
-                            try:
-                                import l2pf as _l2pf_mod
-                                arena = getattr(
-                                    getattr(self, "_capture_model", None),
-                                    "_persisting_norm_arena",
-                                    None,
-                                )
-                                if arena is not None and hasattr(_l2pf_mod, "set_persisting_window"):
-                                    persist_set = _l2pf_mod.set_persisting_window(
-                                        arena.data_ptr(), arena.numel(), 4 << 20, cap_stream
-                                    )
-                            except Exception:
-                                persist_set = False
+                            arena = getattr(
+                                getattr(self, "_capture_model", None),
+                                "_persisting_norm_arena",
+                                None,
+                            )
+                            persist_set = _apply_persisting_window(
+                                arena, cap_stream, False, _PERSIST_L2_LIMIT_BYTES
+                            )
                         try:
                             with (
                                 torch.cuda.graph(graph, self.pool),
@@ -407,11 +593,10 @@ class CudaGraphManager:
                                 get_offloader().join_after_forward()
                         finally:
                             if persist_set:
-                                try:
-                                    import l2pf as _l2pf_mod
-                                    _l2pf_mod.set_persisting_window(0, 0, 0, cap_stream)
-                                except Exception:
-                                    pass
+                                _clear_persisting_window(
+                                    cap_stream, _PERSIST_L2_LIMIT_BYTES
+                                )
+                        upload_cudagraph(graph, cap_stream)
                         if l2pf is not None:
                             logger.info(
                                 "L2 prefetch for num_tokens=%d: %s",
@@ -521,6 +706,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
         if l2_prefetch is not None:
             self.weight_ranges = l2_prefetch.weight_ranges(model)
+            self._live_weight_ranges_fn = lambda: l2_prefetch.weight_ranges(model)
         if self.use_breakable_cg:
             self.init_breakable_cg_runner(model)
 
@@ -626,7 +812,365 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             return forward_fn
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        self._last_create_forward_fn = create_forward_fn
+        try:
+            super().capture(create_forward_fn, progress_bar_desc)
+        finally:
+            self._live_weight_ranges_fn = None
+
+    @torch.inference_mode()
+    def maybe_autotune_decode_graph(self, runner: Any) -> None:
+        """Proposal 09: Whole-graph boot autotuner for M=1 FULL decode graph.
+
+        Captures 4 candidate decode graphs sharing weights & activation pool,
+        verifies 0-ULP (`torch.equal` on output logits across 6 synthetic steps
+        at pos=512..517), times 16 interleaved rounds (dropping round 0), picks
+        winner only if paired gain > 2*sigma and > 0.3%, resets losers, and
+        uploads winner. Fail-soft to default captured graph.
+        """
+        env_val = os.environ.get("MUSE_BOOT_AUTOTUNE")
+        if env_val is not None:
+            enabled = env_val.strip().lower() not in ("0", "", "false", "no")
+        else:
+            enabled = False
+        if not enabled:
+            return
+
+        create_fn = getattr(self, "_last_create_forward_fn", None)
+        if (
+            create_fn is None
+            or not self._graphs_captured
+            or not self.is_first_pp_rank
+            or not self.is_last_pp_rank
+            or self.dp_size != 1
+            or self.tp_size != 1
+            or self.use_aux_hidden_state_outputs
+            or self.hidden_states is None
+            or getattr(runner, "lora_config", None) is not None
+            or getattr(runner, "speculator", None) is not None
+        ):
+            return
+
+        target_desc = self.dispatch(1, 1, 1, 0)
+        if (
+            target_desc.cg_mode != CUDAGraphMode.FULL
+            or target_desc.num_tokens != 1
+            or target_desc.num_reqs not in (1, None)
+            or target_desc not in self.graphs
+        ):
+            return
+
+        from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+        from vllm.v1.kv_cache_interface import AttentionSpec
+
+        bt = runner.block_tables
+        ib = runner.input_buffers
+        if not bt.block_sizes or bt.cp_size != 1:
+            return
+        min_bs = min(bt.block_sizes)
+        need_blks = (518 + min_bs - 1) // min_bs
+        need_total_blks = need_blks * bt.num_kv_cache_groups
+        if runner.kv_cache_config.num_blocks <= need_total_blks + 2:
+            return
+
+        # Collect unique KV cache tensors and their block dimension for clean fill & zeroing.
+        kv_views: list[tuple[torch.Tensor, int]] = []
+        seen_kv_ptrs: set[int] = set()
+        fwd_ctx = runner.compilation_config.static_forward_context
+        for groups in runner.attn_groups:
+            for group in groups:
+                spec = group.kv_cache_spec
+                if not isinstance(spec, AttentionSpec):
+                    return
+                if group.kv_cache_group_id >= len(runner.kernel_block_sizes):
+                    continue
+                kbs = runner.kernel_block_sizes[group.kv_cache_group_id]
+                if kbs != spec.block_size:
+                    return
+                bdim = group.backend.get_kv_cache_block_dim(
+                    kbs,
+                    spec.num_kv_heads,
+                    spec.head_size,
+                    cache_dtype_str=runner.cache_config.cache_dtype,
+                )
+                for lname in group.layer_names:
+                    attn_mod = fwd_ctx.get(lname)
+                    kv = getattr(attn_mod, "kv_cache", None)
+                    if isinstance(kv, (list, tuple)) and len(kv) == 1:
+                        kv = kv[0]
+                    if not isinstance(kv, torch.Tensor):
+                        return
+                    if kv.data_ptr() not in seen_kv_ptrs:
+                        seen_kv_ptrs.add(kv.data_ptr())
+                        kv_views.append((kv, bdim))
+        if not kv_views:
+            return
+
+        orig_graph = self.graphs[target_desc]
+        cand_specs = [
+            ("C0(st8,1pass,pdl1,L2Norm)", 8, True, True, False),
+            ("C2(st8,2pass,pdl1,L2Norm)", 8, False, True, False),
+            ("C3(st8,2pass,pdl0,L2Norm)", 8, False, False, False),
+        ]
+        captured: list[tuple[str, tuple[int, bool, bool, bool], torch.cuda.CUDAGraph, Any]] = []
+        installed_winner = False
+        arena = getattr(runner.model, "_persisting_norm_arena", None)
+
+        try:
+            if l2_prefetch is not None:
+                self._live_weight_ranges_fn = lambda: l2_prefetch.weight_ranges(runner.model)
+            with graph_capture(device=self.device):
+                cap_stream = current_platform.current_stream()
+                for cname, st_val, op_val, pdl_val, miss_stream in cand_specs:
+                    try:
+                        _set_decode_autotune_runtime(st_val, op_val, pdl_val)
+                        fn_w = create_fn(target_desc, warmup=True)
+                        cand_l2pf = self._l2_prefetch_session(target_desc, retain=False)
+                        with cand_l2pf.record() if cand_l2pf is not None else nullcontext():
+                            fn_w(CUDAGraphMode.NONE)
+                        self._verify_l2_prefetch(cand_l2pf)
+
+                        fn_c = create_fn(target_desc, warmup=False)
+                        cg = torch.cuda.CUDAGraph()
+                        get_offloader().sync_prev_onload()
+                        if self.pool is not None:
+                            set_graph_pool_id(self.pool)
+                        else:
+                            set_graph_pool_id(current_platform.graph_pool_handle())
+                        self._verify_l2_prefetch(cand_l2pf)
+                        pset = _apply_persisting_window(
+                            arena, cap_stream, miss_stream, _PERSIST_L2_LIMIT_BYTES
+                        )
+                        try:
+                            with (
+                                torch.cuda.graph(cg, self.pool),
+                                cand_l2pf.apply() if cand_l2pf is not None else nullcontext(),
+                            ):
+                                fn_c(CUDAGraphMode.NONE)
+                                get_offloader().join_after_forward()
+                        finally:
+                            if pset:
+                                _clear_persisting_window(
+                                    cap_stream, _PERSIST_L2_LIMIT_BYTES
+                                )
+                        captured.append(
+                            (cname, (st_val, op_val, pdl_val, miss_stream), cg, cand_l2pf)
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Boot autotune candidate %s capture skipped: %s", cname, exc
+                        )
+                        if cname.startswith("C0"):
+                            return
+
+            if len(captured) < 2:
+                return
+
+            # Build eager reference forward with default runtime config BEFORE staging synthetic pos=512 state.
+            _set_decode_autotune_runtime(8, True, True)
+            eager_ref_fn = create_fn(target_desc, warmup=False)
+
+            # Populate blocks 1..need_total_blks cleanly (disjoint slice per group g).
+            for kv, bdim in kv_views:
+                span = kv.narrow(bdim, 1, need_total_blks)
+                if span.dtype in (torch.bfloat16, torch.float16, torch.float32):
+                    n_el = span.numel()
+                    pat = (
+                        ((torch.arange(n_el, device=self.device) % 13).float() - 6.0)
+                        .mul(0.03125)
+                        .to(span.dtype)
+                        .reshape(span.shape)
+                    )
+                    span.copy_(pat)
+                else:
+                    span.zero_()
+
+            for g in range(bt.num_kv_cache_groups):
+                base_g = 1 + g * need_blks
+                blk_seq_g = torch.arange(
+                    base_g, base_g + need_blks, dtype=torch.int32, device=self.device
+                )
+                bt.input_block_tables[g][0, :need_blks].copy_(blk_seq_g)
+
+            enc_runner = getattr(runner.model_state, "encoder_runner", None)
+            emb_dst = (
+                enc_runner.inputs_embeds[:1]
+                if (runner.supports_mm_inputs and enc_runner is not None)
+                else None
+            )
+
+            alive = list(captured)
+            for step_s in range(6):
+                pos_s = 512 + step_s
+                ib.input_ids[0] = 1000 + step_s * 37
+                ib.positions[0] = pos_s
+                ib.seq_lens[0] = pos_s + 1
+                if ib.seq_lens.numel() > 1:
+                    ib.seq_lens[1:].zero_()
+                ib.query_start_loc[0] = 0
+                ib.query_start_loc[1:] = 1
+                ib.is_padding[0] = False
+                for g in range(bt.num_kv_cache_groups):
+                    bs_g = bt.block_sizes[g]
+                    b_id = (1 + g * need_blks) + (pos_s // bs_g)
+                    bt.slot_mappings[g, 0] = b_id * bs_g + (pos_s % bs_g)
+                if emb_dst is not None:
+                    h_dim = emb_dst.shape[-1]
+                    emb_pat = (
+                        (
+                            (torch.arange(h_dim, device=self.device) + step_s * 97) % 19
+                            - 9.0
+                        )
+                        .mul(0.03125)
+                        .to(emb_dst.dtype)
+                        .reshape(emb_dst.shape)
+                    )
+                    emb_dst.copy_(emb_pat)
+
+                target_blks = {
+                    (1 + g * need_blks) + (pos_s // bt.block_sizes[g])
+                    for g in range(bt.num_kv_cache_groups)
+                }
+                for kv, bdim in kv_views:
+                    for tb in target_blks:
+                        kv.narrow(bdim, tb, 1).zero_()
+
+                self.hidden_states[:1].zero_()
+                _set_decode_autotune_runtime(8, True, True)
+                eager_ref_fn(CUDAGraphMode.NONE)
+                ref_logits = runner.model.compute_logits(self.hidden_states[:1]).clone()
+
+                next_alive = []
+                for item in alive:
+                    cname, cfg, cg, cl2pf = item
+                    for kv, bdim in kv_views:
+                        for tb in target_blks:
+                            kv.narrow(bdim, tb, 1).zero_()
+                    self.hidden_states[:1].zero_()
+                    cg.replay()
+                    cand_logits = runner.model.compute_logits(self.hidden_states[:1])
+                    if torch.equal(cand_logits, ref_logits):
+                        next_alive.append(item)
+                    else:
+                        logger.warning(
+                            "Boot autotune candidate %s failed 0-ULP check at pos=%d; disqualified",
+                            cname,
+                            pos_s,
+                        )
+                        cg.reset()
+                alive = next_alive
+                if not alive or not alive[0][0].startswith("C0"):
+                    logger.warning(
+                        "Boot autotune baseline C0 disqualified; keeping original graph"
+                    )
+                    return
+
+            if len(alive) < 2:
+                logger.info(
+                    "Boot autotune: only %s passed 0-ULP; keeping baseline",
+                    alive[0][0],
+                )
+                return
+
+            # Set clean pos=512 state for 16 interleaved timing rounds (drop round 0).
+            ib.positions[0] = 512
+            ib.seq_lens[0] = 513
+            for g in range(bt.num_kv_cache_groups):
+                bs_g = bt.block_sizes[g]
+                b_id = (1 + g * need_blks) + (512 // bs_g)
+                bt.slot_mappings[g, 0] = b_id * bs_g + (512 % bs_g)
+
+            n_cand = len(alive)
+            n_rounds = 16
+            samples: list[list[float]] = [[] for _ in range(n_cand)]
+            stream = torch.cuda.current_stream(self.device)
+            ev_pairs = [
+                (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                for _ in range(n_cand)
+            ]
+            torch.cuda.synchronize(self.device)
+            for r in range(n_rounds):
+                for step_k in range(n_cand):
+                    c_idx = (r + step_k) % n_cand
+                    s_ev, e_ev = ev_pairs[c_idx]
+                    s_ev.record(stream)
+                    alive[c_idx][2].replay()
+                    e_ev.record(stream)
+                torch.cuda.synchronize(self.device)
+                if r >= 1:
+                    for c_idx in range(n_cand):
+                        s_ev, e_ev = ev_pairs[c_idx]
+                        samples[c_idx].append(s_ev.elapsed_time(e_ev))
+
+            mean_c0 = sum(samples[0]) / len(samples[0])
+            win_idx = 0
+            best_gain = 0.0
+            summary_parts = [f"{alive[0][0]}={mean_c0:.3f}ms"]
+            for idx in range(1, n_cand):
+                mean_ci = sum(samples[idx]) / len(samples[idx])
+                diffs = [t0 - ti for t0, ti in zip(samples[0], samples[idx])]
+                m_gain = sum(diffs) / len(diffs)
+                var_d = sum((d - m_gain) ** 2 for d in diffs) / max(1, len(diffs) - 1)
+                se_d = math.sqrt(var_d / len(diffs))
+                rel_gain = m_gain / max(mean_c0, 1e-9)
+                summary_parts.append(
+                    f"{alive[idx][0]}={mean_ci:.3f}ms(gain={m_gain:+.3f}ms,2sig={2.0 * se_d:.3f}ms,{rel_gain * 100.0:+.2f}%)"
+                )
+                if m_gain > 2.0 * se_d and rel_gain > 0.003 and m_gain > best_gain:
+                    best_gain = m_gain
+                    win_idx = idx
+
+            win_name, win_cfg, win_graph, win_l2pf = alive[win_idx]
+            for idx, (_cn, _cfg, cg, _cl2) in enumerate(alive):
+                if idx != win_idx:
+                    cg.reset()
+            captured.clear()
+
+            self.graphs[target_desc] = win_graph
+            if win_l2pf is not None:
+                self._l2_prefetch_sessions.append(win_l2pf)
+            _set_decode_autotune_runtime(win_cfg[0], win_cfg[1], win_cfg[2])
+            upload_cudagraph(win_graph, stream)
+            installed_winner = True
+            orig_graph.reset()
+            logger.info(
+                "Proposal 09 boot autotuner selected %s: %s",
+                win_name,
+                ", ".join(summary_parts),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Proposal 09 boot autotuner skipped (%s); keeping default graph", exc)
+        finally:
+            self._live_weight_ranges_fn = None
+            self._last_create_forward_fn = None
+            if not installed_winner:
+                for _cn, _cfg, cg, _cl2 in captured:
+                    try:
+                        cg.reset()
+                    except Exception:  # noqa: BLE001
+                        pass
+                _set_decode_autotune_runtime(None, None, None)
+                self.graphs[target_desc] = orig_graph
+                upload_cudagraph(orig_graph, torch.cuda.current_stream(self.device))
+            try:
+                for kv, bdim in kv_views:
+                    kv.narrow(bdim, 1, need_total_blks).zero_()
+                for g in range(bt.num_kv_cache_groups):
+                    bt.input_block_tables[g].zero_()
+                bt.slot_mappings.fill_(PAD_SLOT_ID)
+                ib.input_ids[:1].zero_()
+                ib.positions[:1].zero_()
+                ib.seq_lens.zero_()
+                ib.query_start_loc.zero_()
+                ib.is_padding.fill_(True)
+                if self.hidden_states is not None:
+                    self.hidden_states[:1].zero_()
+                torch.cuda.synchronize(self.device)
+            except Exception:  # noqa: BLE001
+                pass
 
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor

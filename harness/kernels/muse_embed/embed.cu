@@ -59,6 +59,30 @@ __global__ void __launch_bounds__(kThreads) embed_scale(const Id* __restrict__ i
   }
   out[static_cast<size_t>(row) * vec_per_row + v] = make_uint4(o[0], o[1], o[2], o[3]);
 }
+
+template <typename Id>
+__global__ void __launch_bounds__(kThreads) embed_scale_indexed(
+    const Id* __restrict__ ids,
+    const uint4* __restrict__ table,
+    const float* __restrict__ inv_table,
+    uint4* __restrict__ out,
+    int vec_per_row) {
+  const int row = blockIdx.y;
+  const int v = blockIdx.x * kThreads + threadIdx.x;
+  if (v >= vec_per_row) return;
+  const long long id = static_cast<long long>(ids[row]);
+  const uint4 raw = table[id * vec_per_row + v];
+  const float r = __ldg(inv_table + id);
+  const unsigned w[4] = {raw.x, raw.y, raw.z, raw.w};
+  unsigned o[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const unsigned lo = bf16_rne(__fmul_rn(__uint_as_float(w[i] << 16), r));
+    const unsigned hi = bf16_rne(__fmul_rn(__uint_as_float(w[i] & 0xffff0000u), r));
+    o[i] = lo | (hi << 16);
+  }
+  out[static_cast<size_t>(row) * vec_per_row + v] = make_uint4(o[0], o[1], o[2], o[3]);
+}
 }  // namespace
 
 extern "C" int muse_embed_square(const void* ids, int ids_64, const void* table, void* x2, int rows, int width,
@@ -89,5 +113,27 @@ extern "C" int muse_embed_scale(const void* ids, int ids_64, const void* table, 
   else
     embed_scale<int><<<grid, kThreads, 0, stream>>>(static_cast<const int*>(ids), static_cast<const uint4*>(table),
                                                      static_cast<const float*>(inv), static_cast<uint4*>(out), vec);
+  return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int muse_embed_scale_indexed(const void* ids, int ids_64, const void* table, const void* inv_table,
+                                        void* out, int rows, int width, cudaStream_t stream) {
+  if (rows <= 0 || width % 8) return cudaErrorInvalidValue;
+  const int vec = width / 8;
+  dim3 grid((vec + kThreads - 1) / kThreads, rows);
+  if (ids_64)
+    embed_scale_indexed<long long><<<grid, kThreads, 0, stream>>>(
+        static_cast<const long long*>(ids),
+        static_cast<const uint4*>(table),
+        static_cast<const float*>(inv_table),
+        static_cast<uint4*>(out),
+        vec);
+  else
+    embed_scale_indexed<int><<<grid, kThreads, 0, stream>>>(
+        static_cast<const int*>(ids),
+        static_cast<const uint4*>(table),
+        static_cast<const float*>(inv_table),
+        static_cast<uint4*>(out),
+        vec);
   return static_cast<int>(cudaGetLastError());
 }

@@ -66,9 +66,16 @@ class BlockTables:
 
         # Block tables used for model's forward pass.
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
-        self.input_block_tables: list[torch.Tensor] = [
-            torch.zeros_like(b.gpu) for b in self.block_tables
-        ]
+        # When max_num_reqs == 1, req_idx is always 0, so input_block_tables[g]
+        # can alias block_tables[g].gpu directly and skip full-row copies per step.
+        if self.max_num_reqs == 1:
+            self.input_block_tables: list[torch.Tensor] = [
+                b.gpu for b in self.block_tables
+            ]
+        else:
+            self.input_block_tables = [
+                torch.zeros_like(b.gpu) for b in self.block_tables
+            ]
 
         self.slot_mappings = torch.zeros(
             self.num_kv_cache_groups,
@@ -91,6 +98,8 @@ class BlockTables:
         # are reallocated on wake; block_sizes_tensor needs re-populating
         # because its storage lives under the kv_cache pool tag and comes back
         # with undefined contents.
+        if self.max_num_reqs == 1:
+            self.input_block_tables = [b.gpu for b in self.block_tables]
         self.block_table_ptrs = self._make_ptr_tensor(
             [b.gpu for b in self.block_tables]
         )
@@ -138,13 +147,20 @@ class BlockTables:
         out: tuple[torch.Tensor, ...] | None = None,
         out_ptrs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
+        num_reqs = idx_mapping.shape[0]
+        if (
+            out is None
+            and self.max_num_reqs == 1
+            and num_reqs == 1
+            and num_reqs_padded == 1
+        ):
+            return tuple(bt[:1] for bt in self.input_block_tables)
         if out is None:
             out = tuple(self.input_block_tables)
             out_ptrs = self.input_block_table_ptrs
         else:
             assert out_ptrs is not None
             assert len(out) == self.num_kv_cache_groups
-        num_reqs = idx_mapping.shape[0]
         # Launch kernel with num_reqs_padded to fuse zeroing of padded rows.
         _gather_block_tables_kernel[(self.num_kv_cache_groups, num_reqs_padded)](
             idx_mapping,
@@ -210,6 +226,114 @@ class BlockTables:
         # with the same memory address as that used during the model's forward pass,
         # rather than allocating a new tensor.
         return self.slot_mappings[:, :num_tokens]
+
+    def prepare_single_decode_step(
+        self,
+        idx_mapping: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        last_sampled_tokens: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor | None = None,
+        is_padding: torch.Tensor | None = None,
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+        copy_bt = self.max_num_reqs > 1
+        _fused_single_decode_prep_kernel[(self.num_kv_cache_groups,)](
+            idx_mapping,
+            num_computed_tokens,
+            last_sampled_tokens,
+            input_ids,
+            positions,
+            seq_lens,
+            query_start_loc,
+            is_padding,
+            self.max_num_reqs,
+            self.block_table_ptrs,
+            self.input_block_table_ptrs,
+            self.block_table_strides,
+            self.num_blocks.gpu,
+            self.num_blocks.gpu.stride(0),
+            self.block_sizes_tensor,
+            self.slot_mappings,
+            self.slot_mappings.stride(0),
+            COPY_BT=copy_bt,  # type: ignore
+            SINGLE_REQ=(self.max_num_reqs == 1),  # type: ignore
+            BLOCK_SIZE=1024,  # type: ignore
+            num_warps=1 if not copy_bt else 4,  # type: ignore
+        )
+        return (
+            tuple(bt[:1] for bt in self.input_block_tables),
+            self.slot_mappings[:, :1],
+        )
+
+    def init_serial_decode_loop(
+        self,
+        idx_mapping: torch.Tensor,
+        first_token_id: int,
+        start_pos: int,
+        count: int,
+        step_idx: torch.Tensor,
+        step_limit: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        is_padding: torch.Tensor | None = None,
+    ) -> None:
+        copy_bt = self.max_num_reqs > 1
+        _serial_decode_init_kernel[(self.num_kv_cache_groups,)](
+            idx_mapping,
+            first_token_id,
+            start_pos,
+            count,
+            step_idx,
+            step_limit,
+            input_ids,
+            positions,
+            seq_lens,
+            query_start_loc,
+            is_padding,
+            self.max_num_reqs,
+            self.block_table_ptrs,
+            self.input_block_table_ptrs,
+            self.block_table_strides,
+            self.num_blocks.gpu,
+            self.num_blocks.gpu.stride(0),
+            self.block_sizes_tensor,
+            self.slot_mappings,
+            self.slot_mappings.stride(0),
+            COPY_BT=copy_bt,  # type: ignore
+            SINGLE_REQ=(self.max_num_reqs == 1),  # type: ignore
+            BLOCK_SIZE=1024,  # type: ignore
+            num_warps=1 if not copy_bt else 4,  # type: ignore
+        )
+
+    def advance_serial_decode_step(
+        self,
+        sampled_token_i64: torch.Tensor,
+        out_tokens: torch.Tensor,
+        step_idx: torch.Tensor,
+        step_limit: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        _serial_decode_advance_kernel[(1,)](
+            sampled_token_i64,
+            out_tokens,
+            step_idx,
+            step_limit,
+            input_ids,
+            positions,
+            seq_lens,
+            self.input_block_table_ptrs,
+            self.block_sizes_tensor,
+            self.slot_mappings,
+            self.slot_mappings.stride(0),
+            NUM_GROUPS=self.num_kv_cache_groups,  # type: ignore
+            num_warps=1,  # type: ignore
+        )
 
 
 @triton.jit(do_not_specialize=["num_reqs"])
@@ -315,3 +439,169 @@ def _compute_slot_mappings_kernel(
             slot_ids = tl.where(is_local, slot_ids, PAD_ID)
 
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
+
+
+@triton.jit(do_not_specialize=["max_reqs"])
+def _fused_single_decode_prep_kernel(
+    idx_mapping_ptr,
+    num_computed_tokens_ptr,
+    last_sampled_tokens_ptr,
+    input_ids_ptr,
+    pos_ptr,
+    seq_lens_ptr,
+    query_start_loc_ptr,
+    is_padding_ptr,
+    max_reqs,
+    src_bt_ptrs,
+    dst_bt_ptrs,
+    bt_strides,
+    num_blocks_ptr,
+    num_blocks_stride,
+    block_sizes_ptr,
+    slot_mappings_ptr,
+    slot_mappings_stride,
+    COPY_BT: tl.constexpr,
+    SINGLE_REQ: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    gid = tl.program_id(0)
+    req_idx = tl.load(idx_mapping_ptr)
+    num_comp = tl.load(num_computed_tokens_ptr + req_idx)
+    if gid == 0:
+        tok = tl.load(last_sampled_tokens_ptr + req_idx)
+        tl.store(input_ids_ptr, tok.to(tl.int32))
+        tl.store(pos_ptr, num_comp.to(tl.int64))
+        tl.store(seq_lens_ptr, num_comp + 1)
+        if not SINGLE_REQ:
+            for r in range(1, max_reqs):
+                tl.store(seq_lens_ptr + r, 0)
+        if query_start_loc_ptr is not None:
+            tl.store(query_start_loc_ptr, 0)
+            if SINGLE_REQ:
+                tl.store(query_start_loc_ptr + 1, 1)
+            else:
+                for r in range(1, max_reqs + 1):
+                    tl.store(query_start_loc_ptr + r, 1)
+        if is_padding_ptr is not None:
+            tl.store(is_padding_ptr, False)
+
+    stride = tl.load(bt_strides + gid)
+    src_ptr = _load_ptr(src_bt_ptrs + gid, tl.int32) + req_idx * stride
+    if COPY_BT:
+        nblk = tl.load(num_blocks_ptr + gid * num_blocks_stride + req_idx)
+        dst_ptr = _load_ptr(dst_bt_ptrs + gid, tl.int32)
+        for i in tl.range(0, nblk, BLOCK_SIZE):
+            off = i + tl.arange(0, BLOCK_SIZE)
+            m = off < nblk
+            b = tl.load(src_ptr + off, mask=m)
+            tl.store(dst_ptr + off, b, mask=m)
+
+    bs = tl.load(block_sizes_ptr + gid)
+    b_idx = num_comp // bs
+    b_off = num_comp % bs
+    b_num = tl.load(src_ptr + b_idx)
+    slot = b_num.to(tl.int64) * bs.to(tl.int64) + b_off.to(tl.int64)
+    tl.store(slot_mappings_ptr + gid * slot_mappings_stride, slot)
+
+
+@triton.jit(do_not_specialize=["first_tok", "start_pos", "count", "max_reqs"])
+def _serial_decode_init_kernel(
+    idx_mapping_ptr,
+    first_tok,
+    start_pos,
+    count,
+    step_idx_ptr,
+    step_limit_ptr,
+    input_ids_ptr,
+    pos_ptr,
+    seq_lens_ptr,
+    query_start_loc_ptr,
+    is_padding_ptr,
+    max_reqs,
+    src_bt_ptrs,
+    dst_bt_ptrs,
+    bt_strides,
+    num_blocks_ptr,
+    num_blocks_stride,
+    block_sizes_ptr,
+    slot_mappings_ptr,
+    slot_mappings_stride,
+    COPY_BT: tl.constexpr,
+    SINGLE_REQ: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    gid = tl.program_id(0)
+    req_idx = tl.load(idx_mapping_ptr)
+    if gid == 0:
+        tl.store(step_idx_ptr, 0)
+        tl.store(step_limit_ptr, count.to(tl.int32))
+        tl.store(input_ids_ptr, first_tok.to(tl.int32))
+        tl.store(pos_ptr, start_pos.to(tl.int64))
+        tl.store(seq_lens_ptr, (start_pos + 1).to(tl.int32))
+        if not SINGLE_REQ:
+            for r in range(1, max_reqs):
+                tl.store(seq_lens_ptr + r, 0)
+        tl.store(query_start_loc_ptr, 0)
+        if SINGLE_REQ:
+            tl.store(query_start_loc_ptr + 1, 1)
+        else:
+            for r in range(1, max_reqs + 1):
+                tl.store(query_start_loc_ptr + r, 1)
+        if is_padding_ptr is not None:
+            tl.store(is_padding_ptr, False)
+
+    stride = tl.load(bt_strides + gid)
+    src_ptr = _load_ptr(src_bt_ptrs + gid, tl.int32) + req_idx * stride
+    if COPY_BT:
+        nblk = tl.load(num_blocks_ptr + gid * num_blocks_stride + req_idx)
+        dst_ptr = _load_ptr(dst_bt_ptrs + gid, tl.int32)
+        for i in tl.range(0, nblk, BLOCK_SIZE):
+            off = i + tl.arange(0, BLOCK_SIZE)
+            m = off < nblk
+            b = tl.load(src_ptr + off, mask=m)
+            tl.store(dst_ptr + off, b, mask=m)
+
+    bs = tl.load(block_sizes_ptr + gid).to(tl.int64)
+    pos64 = start_pos.to(tl.int64)
+    b_idx = pos64 // bs
+    b_off = pos64 % bs
+    b_num = tl.load(src_ptr + b_idx).to(tl.int64)
+    slot = b_num * bs + b_off
+    tl.store(slot_mappings_ptr + gid * slot_mappings_stride, slot)
+
+
+@triton.jit
+def _serial_decode_advance_kernel(
+    sampled_token_i64_ptr,
+    out_tokens_ptr,
+    step_idx_ptr,
+    step_limit_ptr,
+    input_ids_ptr,
+    pos_ptr,
+    seq_lens_ptr,
+    dst_bt_ptrs,
+    block_sizes_ptr,
+    slot_mappings_ptr,
+    slot_mappings_stride,
+    NUM_GROUPS: tl.constexpr,
+):
+    k = tl.load(step_idx_ptr)
+    lim = tl.load(step_limit_ptr)
+    tok = tl.load(sampled_token_i64_ptr).to(tl.int32)
+    cur_pos = tl.load(pos_ptr)
+    if k < lim:
+        tl.store(out_tokens_ptr + k, tok)
+        tl.store(step_idx_ptr, k + 1)
+    if (k + 1) < lim:
+        next_pos = cur_pos + 1
+        tl.store(input_ids_ptr, tok)
+        tl.store(pos_ptr, next_pos)
+        tl.store(seq_lens_ptr, (next_pos + 1).to(tl.int32))
+        for gid in tl.static_range(0, NUM_GROUPS):
+            bs = tl.load(block_sizes_ptr + gid).to(tl.int64)
+            dst_ptr = _load_ptr(dst_bt_ptrs + gid, tl.int32)
+            b_idx = next_pos // bs
+            b_off = next_pos % bs
+            b_num = tl.load(dst_ptr + b_idx).to(tl.int64)
+            slot = b_num * bs + b_off
+            tl.store(slot_mappings_ptr + gid * slot_mappings_stride, slot)

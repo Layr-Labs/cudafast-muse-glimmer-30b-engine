@@ -835,6 +835,17 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+def _drop_shard_page_cache(st_file: str) -> None:
+    try:
+        from vllm.model_executor.kernels.linear.nvfp4.decode_placement import (
+            drop_safetensors_shard,
+        )
+
+        drop_safetensors_shard(st_file)
+    except Exception:
+        pass
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -930,9 +941,11 @@ def safetensors_weights_iterator(
         if safetensors_load_strategy == "eager":
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
+            _drop_shard_page_cache(st_file)
             for name, param in state_dict.items():
                 if not should_skip_weight(name, local_expert_ids):
                     yield name, param
+            del state_dict
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
             # instead we reconstruct the subclasses here before returning
@@ -970,6 +983,7 @@ def safetensors_weights_iterator(
                         continue
                     param = f.get_tensor(name)
                     yield name, param
+        _drop_shard_page_cache(st_file)
 
 
 def multi_thread_safetensors_weights_iterator(
@@ -981,6 +995,7 @@ def multi_thread_safetensors_weights_iterator(
 
     def _load_file(st_file: str):
         result = load_file(st_file, device="cpu")
+        _drop_shard_page_cache(st_file)
         return result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:

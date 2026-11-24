@@ -35,6 +35,7 @@
 //! read as a fast phase.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -69,6 +70,10 @@ pub const RESIDENT_BACKEND: &str = "vllm-resident";
 /// Generous: one `sync` of a long prompt is a real prefill on the box. The
 /// resident has its own, shorter, idle ceiling in the other direction.
 const VERB_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// How long a reply wait polls before it blocks ([`crate::hotwait`]): longer
+/// than any timed verb on this track.
+const REPLY_HOT_WAIT: Duration = Duration::from_secs(5);
 
 /// What the resident answered `hello` with: the identity of the process that
 /// actually holds the weights.
@@ -126,6 +131,13 @@ pub struct ResidentSession {
     /// The argmax of the current frontier, carried by the last state-advancing
     /// reply. `None` only before the first `sync`.
     frontier: Option<i64>,
+    /// Whether the resident's session is already in an invalidated state
+    /// (`true` right after `accept()`/`connect()` and after a successful
+    /// `invalidate`, `false` once any state-advancing verb is issued).
+    clean: bool,
+    /// Reusable request/reply scratch buffers to avoid heap churn on timed verbs.
+    req_buf: Vec<u8>,
+    reply_buf: String,
     /// The first failure seen by an infallible verb, returned by the next
     /// fallible one.
     poison: Option<String>,
@@ -165,6 +177,9 @@ impl ResidentSession {
                 spec_run: false,
             },
             frontier: None,
+            clean: true,
+            req_buf: Vec::with_capacity(16 * 1024),
+            reply_buf: String::with_capacity(16 * 1024),
             poison: None,
             connect: Duration::ZERO,
         };
@@ -217,24 +232,28 @@ impl ResidentSession {
     }
 
     fn call_inner(&mut self, request: Value) -> Result<Value, String> {
-        let mut line = serde_json::to_string(&request)
+        self.req_buf.clear();
+        serde_json::to_writer(&mut self.req_buf, &request)
             .map_err(|e| format!("cannot serialize a resident request: {e}"))?;
-        line.push('\n');
+        self.req_buf.push(b'\n');
         self.writer
-            .write_all(line.as_bytes())
+            .write_all(&self.req_buf)
             .and_then(|()| self.writer.flush())
             .map_err(|e| {
                 format!("the resident engine closed while a request was going out: {e}")
             })?;
-        let mut reply = String::new();
+        self.reply_buf.clear();
+        if self.reader.buffer().is_empty() {
+            crate::hotwait::wait_readable(self.reader.get_ref().as_raw_fd(), REPLY_HOT_WAIT);
+        }
         let read = self
             .reader
-            .read_line(&mut reply)
+            .read_line(&mut self.reply_buf)
             .map_err(|e| format!("cannot read the resident engine's reply: {e}"))?;
         if read == 0 {
             return Err("the resident engine closed the connection mid-phase".to_string());
         }
-        let value: Value = serde_json::from_str(reply.trim_end())
+        let value: Value = serde_json::from_str(self.reply_buf.trim_end())
             .map_err(|e| format!("the resident engine sent a line that is not JSON: {e}"))?;
         if value.get("ok").and_then(Value::as_bool) != Some(true) {
             let why = value
@@ -258,6 +277,7 @@ impl ResidentSession {
     }
 
     fn serial_run_call(&mut self, first_token: i64, count: i64) -> Result<Vec<i64>, String> {
+        self.clean = false;
         self.frontier = None;
         let mut reply =
             self.call(json!({"op": "serial_run", "first_token": first_token, "count": count}))?;
@@ -278,6 +298,7 @@ impl ResidentSession {
     /// cycle left. One request for the whole run instead of one per cycle: the
     /// GPU otherwise idles through a socket round trip after every cycle.
     fn spec_run_call(&mut self, first_token: i64, count: i64) -> Result<Vec<SpecRound>, String> {
+        self.clean = false;
         let reply =
             self.call(json!({"op": "spec_run", "first_token": first_token, "count": count}))?;
         self.take_frontier(&reply)?;
@@ -352,6 +373,7 @@ impl EngineSession for ResidentSession {
     }
 
     fn sync(&mut self, tokens: &[i64]) -> Result<(), String> {
+        self.clean = false;
         let reply = self.call(json!({"op": "sync", "tokens": tokens}))?;
         self.take_frontier(&reply)
     }
@@ -361,6 +383,7 @@ impl EngineSession for ResidentSession {
         // token, so the engine is idle when this reply arrives.
         // `argmax_only`: the frontier token is all a prefill reads, so the
         // engine computes no top-k logits for it.
+        self.clean = false;
         let reply = self
             .call(json!({"op": "sync", "tokens": tokens, "max_tokens": 1, "argmax_only": true}))?;
         self.take_frontier(&reply)
@@ -369,11 +392,13 @@ impl EngineSession for ResidentSession {
     fn sync_argmax_only(&mut self, tokens: &[i64]) -> Result<(), String> {
         // A resident that predates the flag ignores it and computes the top-k
         // anyway: slower, never wrong.
+        self.clean = false;
         let reply = self.call(json!({"op": "sync", "tokens": tokens, "argmax_only": true}))?;
         self.take_frontier(&reply)
     }
 
     fn eval(&mut self, token: i64) -> Result<(), String> {
+        self.clean = false;
         let reply = self.call(json!({"op": "eval", "token": token}))?;
         self.take_frontier(&reply)
     }
@@ -450,6 +475,7 @@ impl EngineSession for ResidentSession {
     }
 
     fn eval_speculative(&mut self, first_token: i64, budget: i64) -> Result<Vec<i64>, String> {
+        self.clean = false;
         let reply = self.call(
             json!({"op": "eval_speculative", "first_token": first_token, "budget": budget}),
         )?;
@@ -514,11 +540,16 @@ impl EngineSession for ResidentSession {
     }
 
     fn invalidate(&mut self) {
-        // The resident invalidates on accept too, so a phase is reset even if
-        // this never runs. This is the backend's own drain contract.
+        // The resident invalidates on accept too, so a freshly connected
+        // session (or one already invalidated at phase close) needs no socket
+        // round trip during the next phase's opener.
         self.frontier = None;
-        if let Err(err) = self.call(json!({"op": "invalidate"})) {
-            self.poison_with(err);
+        if self.clean {
+            return;
+        }
+        match self.call(json!({"op": "invalidate"})) {
+            Ok(_) => self.clean = true,
+            Err(err) => self.poison_with(err),
         }
     }
 }
@@ -528,5 +559,84 @@ impl Drop for ResidentSession {
         // Say goodbye so the resident logs a clean phase close and goes back
         // to accepting immediately, rather than waiting for the EOF.
         let _ = self.call_inner(json!({"op": "bye"}));
+    }
+}
+
+#[cfg(test)]
+mod clean_tests {
+    use super::*;
+    use crate::session_backend::SessionFactory;
+    use crate::Adapter;
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    #[test]
+    fn clean_session_skips_redundant_invalidate_on_phase_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "resident-clean-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let reader = BufReader::new(stream);
+            let mut ops = Vec::new();
+            for line in reader.lines() {
+                let line = line.unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let op = req["op"].as_str().unwrap().to_string();
+                ops.push(op.clone());
+                let reply = match op.as_str() {
+                    "hello" => json!({
+                        "ok": true, "vocab_size": 1024, "eos_token": 2, "mtp_armed": false,
+                        "draft_tokens": 1, "ctx_size": 8192, "load_epoch": 1,
+                        "serial_run": true, "spec_run": false,
+                        "ident": "vllm", "model_path": "/m", "mtp_head_path": ""
+                    }),
+                    "sync" => json!({"ok": true, "token": 42}),
+                    "serial_run" => json!({"ok": true, "tokens": [43, 44]}),
+                    _ => json!({"ok": true}),
+                };
+                writeln!(writer, "{reply}").unwrap();
+                writer.flush().unwrap();
+                if op == "bye" {
+                    break;
+                }
+            }
+            ops
+        });
+
+        let (factory, hello, _) = SessionFactory::from_resident(path.to_str().unwrap()).unwrap();
+        let mut adapter = Adapter::with_session(factory, hello.backend_string(), "cuda", "n");
+        let input = concat!(
+            "{\"id\":1,\"kind\":\"free_decode_begin\",\"seed_tokens\":[1,2,3]}\n",
+            "{\"id\":2,\"kind\":\"free_decode_run\",\"count\":2}\n",
+            "{\"id\":3,\"kind\":\"phase_diagnostics\"}\n",
+            "{\"id\":4,\"kind\":\"free_decode_begin\",\"seed_tokens\":[1,2,3]}\n",
+            "{\"id\":5,\"kind\":\"phase_diagnostics\"}\n",
+        );
+        let mut out = Vec::new();
+        adapter.run(input.as_bytes(), &mut out).unwrap();
+        drop(adapter);
+
+        let ops = server.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            ops,
+            vec![
+                "hello",
+                "sync",
+                "serial_run",
+                "invalidate",
+                "sync",
+                "invalidate",
+                "bye",
+            ]
+        );
     }
 }

@@ -19,6 +19,8 @@ except Exception:  # noqa: BLE001
 
 _lib = None
 _multi = None
+_kv_m1 = None
+_kv_prefill = None
 try:
     _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_qk_glue.so")))
     _lib.muse_qk_norm_rope.argtypes = [
@@ -32,15 +34,44 @@ try:
     if _multi is not None:
         _multi.argtypes = list(_lib.muse_qk_norm_rope.argtypes[:-1]) + [ctypes.c_int, ctypes.c_void_p]
         _multi.restype = ctypes.c_int
+    _kv_m1 = getattr(_lib, "muse_qk_norm_rope_kvcache_m1", None)
+    if _kv_m1 is not None:
+        _kv_m1.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ]
+        _kv_m1.restype = ctypes.c_int
+    _kv_prefill = getattr(_lib, "muse_qk_norm_rope_kvcache_prefill", None)
+    if _kv_prefill is not None:
+        _kv_prefill.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ]
+        _kv_prefill.restype = ctypes.c_int
 except OSError:
     _lib = None
     _multi = None
+    _kv_m1 = None
+    _kv_prefill = None
 
 MULTI_HPW = int(os.environ.get("MUSE_QK_MULTI_HPW", "9"))
 MULTI_MIN_TOKENS = 64
 DECODE_HPW = int(os.environ.get("MUSE_QK_DECODE_HPW", "2"))
+PREFILL_KV_HPW = int(os.environ.get("MUSE_QK_PREFILL_KV_HPW", "6"))
+FUSE_KVCACHE = os.environ.get("MUSE_QK_FUSE_KVCACHE", "1").strip() not in ("0", "", "false", "no")
+FUSE_KVCACHE_PREFILL = FUSE_KVCACHE and os.environ.get("MUSE_QK_FUSE_KVCACHE_PREFILL", "1").strip() not in ("0", "", "false", "no")
 _multi_state: dict[str, bool | None] = {"admitted": None}
 _decode_state: dict[str, bool | None] = {"admitted": None}
+_kv_m1_state: dict[str, bool | None] = {"admitted": None}
+_kv_prefill_state: dict[str, bool | None] = {"admitted": None}
 
 ENABLED = os.environ.get("VLLM_MUSE_GLIMMER_QK_FUSED", "1").strip() not in ("0", "", "false", "no")
 _checked: dict[int, bool] = {}
@@ -84,7 +115,7 @@ def self_check(device: torch.device) -> bool:
     ok = False
     try:
         gen = torch.Generator(device=device).manual_seed(20261123)
-        t_idx = torch.arange(128, device=device, dtype=torch.float32)
+        t_idx = torch.arange(512, device=device, dtype=torch.float32)
         inv_freq = 1.0 / (10000.0 ** (torch.arange(0, 128, 2, device=device, dtype=torch.float32) / 128.0))
         freqs = torch.einsum("i,j->ij", t_idx, inv_freq)
         cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(torch.bfloat16).contiguous()
@@ -144,6 +175,136 @@ def self_check(device: torch.device) -> bool:
                     break
             _decode_state["admitted"] = dok
             logger.info("muse_qk_glue: M=1 %d-heads-per-warp decode kernel %s", DECODE_HPW, "admitted (2 blocks)" if dok else "REJECTED")
+        if ok and _kv_m1 is not None and FUSE_KVCACHE and _kv_m1_state["admitted"] is None:
+            kvok = True
+            stream = torch.cuda.current_stream(device).cuda_stream
+            pos1 = torch.tensor([17], dtype=torch.int64, device=device)
+            for layout in ("NHD", "HND"):
+                for block_size in (16, 32):
+                    raw_shape = (6, block_size, 2, 256) if layout == "NHD" else (6, 2, block_size, 256)
+                    for use_rope in (True, False):
+                        for cache_t in ((cache, cache.float()) if use_rope else (cache,)):
+                            for slot_val in (-1, 0, block_size + 5, 5 * block_size + block_size - 1):
+                                x = (torch.randn((1, 4608), generator=gen, device=device) * 3.0).to(torch.bfloat16).contiguous()
+                                raw_ref = torch.randn(raw_shape, generator=gen, device=device, dtype=torch.bfloat16)
+                                raw_got = raw_ref.clone()
+                                kv_ref = raw_ref.permute(0, 2, 1, 3) if layout == "NHD" else raw_ref
+                                kv_got = raw_got.permute(0, 2, 1, 3) if layout == "NHD" else raw_got
+                                q0, k0 = torch.empty((1, 4096), dtype=x.dtype, device=device), torch.empty((1, 256), dtype=x.dtype, device=device)
+                                q1, k1 = torch.empty_like(q0), torch.empty_like(k0)
+                                slot_t = torch.tensor([slot_val], dtype=torch.int64, device=device)
+                                cf32 = int(cache_t.dtype == torch.float32)
+                                c_rows = int(cache_t.shape[0]) if use_rope else 0
+                                p_ptr = pos1.data_ptr() if use_rope else 0
+                                c_ptr = cache_t.data_ptr() if use_rope else 0
+                                st0 = _lib.muse_qk_norm_rope(x.data_ptr(), p_ptr, c_ptr, q0.data_ptr(), k0.data_ptr(), 1, c_rows, eps, qscale, int(use_rope), cf32, stream)
+                                if slot_val >= 0:
+                                    blk, off = slot_val // block_size, slot_val % block_size
+                                    kv_ref[blk, :, off, :128].copy_(k0.view(2, 128))
+                                    kv_ref[blk, :, off, 128:].copy_(x[0, 4352:].view(2, 128))
+                                st1 = _kv_m1(
+                                    x.data_ptr(), p_ptr, c_ptr, q1.data_ptr(), k1.data_ptr(),
+                                    kv_got.data_ptr(), slot_t.data_ptr(),
+                                    c_rows, block_size,
+                                    kv_got.stride(0), kv_got.stride(2), kv_got.stride(1),
+                                    eps, qscale, int(use_rope), cf32, stream,
+                                )
+                                q2 = torch.empty_like(q0)
+                                raw_got2 = raw_ref.clone()
+                                kv_got2 = raw_got2.permute(0, 2, 1, 3) if layout == "NHD" else raw_got2
+                                st2 = _kv_m1(
+                                    x.data_ptr(), p_ptr, c_ptr, q2.data_ptr(), 0,
+                                    kv_got2.data_ptr(), slot_t.data_ptr(),
+                                    c_rows, block_size,
+                                    kv_got2.stride(0), kv_got2.stride(2), kv_got2.stride(1),
+                                    eps, qscale, int(use_rope), cf32, stream,
+                                )
+                                torch.cuda.synchronize()
+                                if (
+                                    st0 or st1 or st2
+                                    or not torch.equal(q0.view(torch.int16), q1.view(torch.int16))
+                                    or not torch.equal(q0.view(torch.int16), q2.view(torch.int16))
+                                    or not torch.equal(k0.view(torch.int16), k1.view(torch.int16))
+                                    or not torch.equal(raw_ref.view(torch.int16), raw_got.view(torch.int16))
+                                    or not torch.equal(raw_ref.view(torch.int16), raw_got2.view(torch.int16))
+                                ):
+                                    kvok = False
+                                    break
+                            if not kvok:
+                                break
+                        if not kvok:
+                            break
+                    if not kvok:
+                        break
+                if not kvok:
+                    break
+            _kv_m1_state["admitted"] = kvok
+            logger.info("muse_qk_glue: M=1 fused QK-norm+RoPE+KV-cache kernel %s", "admitted" if kvok else "REJECTED")
+        if ok and _kv_prefill is not None and FUSE_KVCACHE_PREFILL and _kv_prefill_state["admitted"] is None:
+            pkvok = PREFILL_KV_HPW in (2, 4, 5, 6, 9)
+            stream = torch.cuda.current_stream(device).cuda_stream
+            if pkvok:
+                for m_p in (16, 512):
+                    pos_p = torch.arange(m_p, dtype=torch.int64, device=device) % int(cache.shape[0])
+                    for layout in ("NHD", "HND"):
+                        for block_size in (16, 32):
+                            n_blk = (m_p // block_size) + 4
+                            raw_shape = (n_blk, block_size, 2, 256) if layout == "NHD" else (n_blk, 2, block_size, 256)
+                            for use_rope in (True, False):
+                                for cache_t in ((cache, cache.float()) if use_rope else (cache,)):
+                                    for q_first in (0, m_p - 64 if m_p >= 128 else m_p - 4):
+                                        x = (torch.randn((m_p, 4608), generator=gen, device=device) * 3.0).to(torch.bfloat16).contiguous()
+                                        raw_ref = torch.randn(raw_shape, generator=gen, device=device, dtype=torch.bfloat16)
+                                        raw_got = raw_ref.clone()
+                                        kv_ref = raw_ref.permute(0, 2, 1, 3) if layout == "NHD" else raw_ref
+                                        kv_got = raw_got.permute(0, 2, 1, 3) if layout == "NHD" else raw_got
+                                        slots_p = torch.arange(m_p, dtype=torch.int64, device=device)
+                                        slots_p[m_p // 2] = -1
+                                        slots_p[-1] = (n_blk - 1) * block_size + (block_size - 1)
+                                        q0 = torch.empty((m_p, 4096), dtype=x.dtype, device=device)
+                                        k0 = torch.empty((m_p, 256), dtype=x.dtype, device=device)
+                                        q1 = torch.empty_like(q0)
+                                        cf32 = int(cache_t.dtype == torch.float32)
+                                        c_rows = int(cache_t.shape[0]) if use_rope else 0
+                                        p_ptr = pos_p.data_ptr() if use_rope else 0
+                                        c_ptr = cache_t.data_ptr() if use_rope else 0
+                                        st0 = _lib.muse_qk_norm_rope(
+                                            x.data_ptr(), p_ptr, c_ptr, q0.data_ptr(), k0.data_ptr(),
+                                            m_p, c_rows, eps, qscale, int(use_rope), cf32, stream,
+                                        )
+                                        valid_mask = slots_p >= 0
+                                        valid_slots = slots_p[valid_mask]
+                                        blks = valid_slots // block_size
+                                        offs = valid_slots % block_size
+                                        kv_ref[blks, :, offs, :128] = k0[valid_mask].view(-1, 2, 128)
+                                        kv_ref[blks, :, offs, 128:] = x[valid_mask, 4352:].view(-1, 2, 128)
+                                        st1 = _kv_prefill(
+                                            x.data_ptr(), p_ptr, c_ptr, q1.data_ptr(),
+                                            kv_got.data_ptr(), slots_p.data_ptr(),
+                                            m_p, q_first, c_rows, block_size,
+                                            kv_got.stride(0), kv_got.stride(2), kv_got.stride(1),
+                                            eps, qscale, int(use_rope), cf32, PREFILL_KV_HPW, stream,
+                                        )
+                                        torch.cuda.synchronize()
+                                        if (
+                                            st0 or st1
+                                            or not torch.equal(q0[q_first:].view(torch.int16), q1[q_first:].view(torch.int16))
+                                            or not torch.equal(raw_ref.view(torch.int16), raw_got.view(torch.int16))
+                                        ):
+                                            pkvok = False
+                                            break
+                                    if not pkvok:
+                                        break
+                                if not pkvok:
+                                    break
+                            if not pkvok:
+                                break
+                        if not pkvok:
+                            break
+                    if not pkvok:
+                        break
+            _kv_prefill_state["admitted"] = pkvok
+            logger.info("muse_qk_glue: M>1 (HPW=%d) fused QK-norm+RoPE+KV-cache prefill kernel %s", PREFILL_KV_HPW, "admitted" if pkvok else "REJECTED")
     except Exception:  # noqa: BLE001
         logger.warning("muse_qk_glue: self-check raised on cuda:%d", idx, exc_info=True)
         ok = False
@@ -215,6 +376,202 @@ def run_qk_norm_rope(
     if st:
         raise RuntimeError(f"muse_qk_norm_rope failed with CUDA error {st}")
     return q_out, k_out
+
+
+def run_qk_norm_rope_kvcache_m1(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    eps: float,
+    qscale: float,
+    use_rope: bool,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    if (
+        not FUSE_KVCACHE
+        or _kv_m1 is None
+        or not _kv_m1_state.get("admitted")
+        or qkv.shape != (1, 4608)
+        or qkv.dtype != torch.bfloat16
+        or kv_cache.dtype != torch.bfloat16
+        or kv_cache.ndim != 4
+        or kv_cache.shape[1] != 2
+        or kv_cache.shape[3] != 256
+        or kv_cache.stride(3) != 1
+        or slot_mapping.dtype != torch.int64
+        or slot_mapping.numel() != 1
+    ):
+        q_out, k_out = run_qk_norm_rope(qkv, positions, cos_sin_cache, eps, qscale, use_rope)
+        return q_out, k_out, False
+
+    if not qkv.is_contiguous():
+        qkv = qkv.contiguous()
+    s_blk = int(kv_cache.stride(0))
+    s_slot = int(kv_cache.stride(2))
+    s_head = int(kv_cache.stride(1))
+    block_size = int(kv_cache.shape[2])
+    if (
+        block_size <= 0
+        or ((qkv.data_ptr() | kv_cache.data_ptr()) & 7) != 0
+        or ((s_blk | s_slot | s_head) & 3) != 0
+    ):
+        q_out, k_out = run_qk_norm_rope(qkv, positions, cos_sin_cache, eps, qscale, use_rope)
+        return q_out, k_out, False
+
+    q_out = qkv.new_empty((1, 4096))
+    k_out = qkv.new_empty((1, 256))
+    if use_rope:
+        assert cos_sin_cache is not None
+        if positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+        if not positions.is_contiguous():
+            positions = positions.contiguous()
+        pos_ptr = positions.data_ptr()
+        cache_ptr = cos_sin_cache.data_ptr()
+        cache_rows = int(cos_sin_cache.shape[0])
+        cache_fp32 = int(cos_sin_cache.dtype == torch.float32)
+    else:
+        pos_ptr = 0
+        cache_ptr = 0
+        cache_rows = 0
+        cache_fp32 = 1
+
+    with torch.cuda.device(qkv.device):
+        stream = torch.cuda.current_stream(qkv.device).cuda_stream
+        st = _kv_m1(
+            qkv.data_ptr(),
+            pos_ptr,
+            cache_ptr,
+            q_out.data_ptr(),
+            k_out.data_ptr(),
+            kv_cache.data_ptr(),
+            slot_mapping.data_ptr(),
+            cache_rows,
+            block_size,
+            s_blk,
+            s_slot,
+            s_head,
+            float(eps),
+            float(qscale),
+            int(use_rope),
+            cache_fp32,
+            stream,
+        )
+    if st:
+        raise RuntimeError(f"muse_qk_norm_rope_kvcache_m1 failed with CUDA error {st}")
+    return q_out, k_out, True
+
+
+def run_qk_norm_rope_kvcache_prefill(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    eps: float,
+    qscale: float,
+    use_rope: bool,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    q_first_row: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    num_tokens = int(qkv.shape[0]) if qkv.ndim == 2 else -1
+    if (
+        not FUSE_KVCACHE_PREFILL
+        or _kv_prefill is None
+        or not _kv_prefill_state.get("admitted")
+        or PREFILL_KV_HPW not in (2, 4, 5, 6, 9)
+        or qkv.ndim != 2
+        or num_tokens <= 1
+        or qkv.shape[1] != 4608
+        or not qkv.is_cuda
+        or qkv.dtype != torch.bfloat16
+        or kv_cache.device != qkv.device
+        or kv_cache.dtype != torch.bfloat16
+        or kv_cache.ndim != 4
+        or kv_cache.shape[1] != 2
+        or kv_cache.shape[3] != 256
+        or kv_cache.stride(3) != 1
+        or slot_mapping.device != qkv.device
+        or slot_mapping.ndim != 1
+        or slot_mapping.dtype != torch.int64
+        or not slot_mapping.is_contiguous()
+        or slot_mapping.numel() < num_tokens
+    ):
+        q_out, k_out = run_qk_norm_rope(qkv, positions, cos_sin_cache, eps, qscale, use_rope)
+        return q_out, k_out, False
+
+    if not qkv.is_contiguous():
+        qkv = qkv.contiguous()
+    s_blk = int(kv_cache.stride(0))
+    s_slot = int(kv_cache.stride(2))
+    s_head = int(kv_cache.stride(1))
+    block_size = int(kv_cache.shape[2])
+    q_first = int(q_first_row) if 0 <= int(q_first_row) < num_tokens else 0
+    if (
+        block_size <= 0
+        or ((qkv.data_ptr() | kv_cache.data_ptr()) & 7) != 0
+        or ((s_blk | s_slot | s_head) & 3) != 0
+    ):
+        q_out, k_out = run_qk_norm_rope(qkv, positions, cos_sin_cache, eps, qscale, use_rope)
+        return q_out, k_out, False
+
+    if use_rope:
+        if (
+            cos_sin_cache is None
+            or cos_sin_cache.device != qkv.device
+            or cos_sin_cache.ndim != 2
+            or cos_sin_cache.shape[0] <= 0
+            or cos_sin_cache.shape[1] != 128
+            or cos_sin_cache.dtype not in (torch.bfloat16, torch.float32)
+            or positions.device != qkv.device
+            or positions.numel() < num_tokens
+        ):
+            q_out, k_out = run_qk_norm_rope(qkv, positions, cos_sin_cache, eps, qscale, use_rope)
+            return q_out, k_out, False
+        if positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+        if not positions.is_contiguous():
+            positions = positions.contiguous()
+        if not cos_sin_cache.is_contiguous():
+            cos_sin_cache = cos_sin_cache.contiguous()
+        pos_ptr = positions.data_ptr()
+        cache_ptr = cos_sin_cache.data_ptr()
+        cache_rows = int(cos_sin_cache.shape[0])
+        cache_fp32 = int(cos_sin_cache.dtype == torch.float32)
+    else:
+        pos_ptr = 0
+        cache_ptr = 0
+        cache_rows = 0
+        cache_fp32 = 1
+
+    q_out = qkv.new_empty((num_tokens, 4096))
+    k_out = qkv.new_empty((num_tokens, 256))
+    with torch.cuda.device(qkv.device):
+        stream = torch.cuda.current_stream(qkv.device).cuda_stream
+        st = _kv_prefill(
+            qkv.data_ptr(),
+            pos_ptr,
+            cache_ptr,
+            q_out.data_ptr(),
+            kv_cache.data_ptr(),
+            slot_mapping.data_ptr(),
+            num_tokens,
+            q_first,
+            cache_rows,
+            block_size,
+            s_blk,
+            s_slot,
+            s_head,
+            float(eps),
+            float(qscale),
+            int(use_rope),
+            cache_fp32,
+            PREFILL_KV_HPW,
+            stream,
+        )
+    if st:
+        raise RuntimeError(f"muse_qk_norm_rope_kvcache_prefill failed with CUDA error {st}")
+    return q_out, k_out, True
 
 
 def _multi_ok(args, qkv, positions, cos_sin_cache, stream) -> bool:

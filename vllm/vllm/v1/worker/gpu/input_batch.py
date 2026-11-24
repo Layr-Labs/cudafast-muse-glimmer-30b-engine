@@ -579,6 +579,57 @@ def post_update(
     )
 
 
+@triton.jit(do_not_specialize=["req_idx", "count", "new_computed"])
+def _serial_decode_finish_kernel(
+    req_idx,
+    count,
+    new_computed,
+    out_tokens_ptr,
+    num_computed_tokens_ptr,
+    last_sampled_tokens_ptr,
+    all_token_ids_ptr,
+    all_token_ids_stride,
+    total_len_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    old_total = tl.load(total_len_ptr + req_idx)
+    row_ptr = all_token_ids_ptr + req_idx.to(tl.int64) * all_token_ids_stride + old_total
+    for i in range(0, count, BLOCK_SIZE):
+        off = i + tl.arange(0, BLOCK_SIZE)
+        m = off < count
+        toks = tl.load(out_tokens_ptr + off, mask=m)
+        tl.store(row_ptr + off, toks, mask=m)
+    last_tok = tl.load(out_tokens_ptr + count - 1).to(tl.int64)
+    tl.store(last_sampled_tokens_ptr + req_idx, last_tok)
+    tl.store(total_len_ptr + req_idx, old_total + count)
+    tl.store(num_computed_tokens_ptr + req_idx, new_computed)
+
+
+def finish_serial_decode_post_update(
+    req_idx: int,
+    count: int,
+    new_computed: int,
+    out_tokens: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    last_sampled_tokens: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    total_len: torch.Tensor,
+) -> None:
+    _serial_decode_finish_kernel[(1,)](
+        req_idx,
+        count,
+        new_computed,
+        out_tokens,
+        num_computed_tokens,
+        last_sampled_tokens,
+        all_token_ids,
+        all_token_ids.stride(0),
+        total_len,
+        BLOCK_SIZE=256,
+        num_warps=1,
+    )
+
+
 @triton.jit
 def _post_update_num_computed_tokens_kernel(
     idx_mapping_ptr,

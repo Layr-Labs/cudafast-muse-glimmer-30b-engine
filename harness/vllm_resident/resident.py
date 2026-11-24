@@ -114,6 +114,15 @@ def log(msg: str) -> None:
     print(f"resident: {msg}", file=sys.stderr, flush=True)
 
 
+def _set_tickle_phase(is_decode: bool) -> None:
+    try:
+        hf = sys.modules.get("vllm.v1.worker.hostfast")
+        if hf is not None:
+            hf.set_tickle_phase(is_decode)
+    except Exception:
+        pass
+
+
 class RefusedError(Exception):
     """A request the resident refuses; becomes an ok:false reply."""
 
@@ -175,6 +184,7 @@ class Session:
         if max_tokens is not None and max_tokens < 1:
             raise RefusedError("sync max_tokens must be positive")
         self._check_ids(tokens)
+        _set_tickle_phase(False)
         emitted = self.b.start(tokens, max_tokens, top_logits=not argmax_only)
         self.argmax_only = argmax_only
         if emitted[0].top:
@@ -182,9 +192,11 @@ class Session:
         else:
             self.lean_syncs += 1
         self.left = None if max_tokens is None else max_tokens - len(emitted)
-        self.ctx = list(tokens)
         self.frontier = emitted[0]
         self.ahead = deque(emitted[1:])
+        # Skip `list(tokens)` when `max_tokens == 1` (`_spent()` is already
+        # true, so `self.ctx` will never be mutated in place).
+        self.ctx = tokens if max_tokens == 1 or self._spent() else list(tokens)
         return self.frontier.token
 
     def take_sync_counts(self) -> tuple[int, int]:
@@ -209,13 +221,36 @@ class Session:
 
     def eval(self, token: int) -> int:
         self._check_ids([token])
+        _set_tickle_phase(True)
         self._feed(token)
         return self.frontier.token  # type: ignore[union-attr]
 
     def serial_run(self, token: int, count: int) -> list[int]:
         self._check_ids([token])
-        tokens = []
+        _set_tickle_phase(True)
+        tokens: list[int] = []
         try:
+            frontier = self.frontier
+            if (
+                self.b.depth == 0
+                and self.left is None
+                and not self.ahead
+                and frontier is not None
+                and token == frontier.token
+            ):
+                fast_fn = getattr(self.b, "serial_run_fast", None)
+                if callable(fast_fn):
+                    fast_tokens = fast_fn(token, count)
+                    if fast_tokens is not None:
+                        if len(fast_tokens) != count:
+                            raise RuntimeError(
+                                f"serial_run_fast returned {len(fast_tokens)} of {count} tokens"
+                            )
+                        self.ctx.append(token)
+                        if count > 1:
+                            self.ctx.extend(fast_tokens[:-1])
+                        self.frontier = Emit(int(fast_tokens[-1]), ())
+                        return fast_tokens
             for _ in range(count):
                 self._feed(token)
                 token = self.frontier.token  # type: ignore[union-attr]
@@ -250,6 +285,7 @@ class Session:
         return committed
 
     def spec_run(self, first: int, count: int) -> tuple[list[list[int]], list[int]]:
+        _set_tickle_phase(True)
         rounds: list[list[int]] = []
         frontiers: list[int] = []
         pending, produced = first, 0
