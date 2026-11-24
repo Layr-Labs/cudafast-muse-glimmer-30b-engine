@@ -257,6 +257,10 @@ class PrefillGraph:
         self._zp_verified = False
         self._zp_failed = False
         self._zp_replays = 0
+        self._zp_stage_graph_enabled = os.environ.get("VLLM_PREFILL_GRAPH_STAGE_GRAPH", "1") != "0"
+        self._zp_stage_graph: torch.cuda.CUDAGraph | None = None
+        self._zp_stage_sig: tuple | None = None
+        self._zp_stage_graph_failed = False
         self._logged_refusal = False
 
         model_state = runner.model_state
@@ -367,6 +371,38 @@ class PrefillGraph:
             ]
             self._zp_pin_bt_np = [t.numpy() for t in self._zp_pin_bt]
             self._zp_bs_offsets = [np.arange(bs, dtype=np.int64) for bs in bt.block_sizes]
+            self._zp_num_sched_np = np.array([n], dtype=np.int32)
+            self._zp_qsl_np = np.array([0, n], dtype=np.int32)
+            self._zp_prefill_len_np = np.array([n], dtype=np.int32)
+            self._zp_zero_1_np = np.zeros(1, dtype=np.int32)
+            self._zp_is_pref_np = np.array([True], dtype=np.bool_)
+            self._zp_seq_ub = torch.from_numpy(self._zp_num_sched_np.copy())
+            self._zp_const_graph: torch.cuda.CUDAGraph | None = None
+            self._zp_const_skip_pad = False
+            try:
+                from vllm import envs
+                skip_pad = bool(envs.VLLM_MOE_SKIP_PADDING)
+                raw_pos = ib.positions[:n]
+                raw_pad = ib.is_padding[:n]
+                # Warmup before capture
+                if skip_pad:
+                    raw_pad.fill_(False)
+                raw_pos.copy_(self._zp_positions_gpu, non_blocking=True)
+                ib.seq_lens[:1].copy_(self._zp_seq_lens_gpu[:1], non_blocking=True)
+                ib.query_start_loc[:2].copy_(self._zp_qsl_gpu[:2], non_blocking=True)
+                torch.cuda.synchronize(dev)
+                cg = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(cg):
+                    if skip_pad:
+                        raw_pad.fill_(False)
+                    raw_pos.copy_(self._zp_positions_gpu, non_blocking=True)
+                    ib.seq_lens[:1].copy_(self._zp_seq_lens_gpu[:1], non_blocking=True)
+                    ib.query_start_loc[:2].copy_(self._zp_qsl_gpu[:2], non_blocking=True)
+                torch.cuda.synchronize(dev)
+                self._zp_const_graph = cg
+                self._zp_const_skip_pad = skip_pad
+            except Exception:  # noqa: BLE001
+                self._zp_const_graph = None
         except Exception as exc:  # noqa: BLE001
             logger.warning("Prefill graph zero-prep init skipped: %s", exc)
             self._zp_failed = True
@@ -535,26 +571,66 @@ class PrefillGraph:
             bt_view = block_tables.input_block_tables[g][:1]
             if (bt_view.data_ptr(), tuple(bt_view.shape), tuple(bt_view.stride())) != sig:
                 return False
+        nbs_list: list[int] = []
         for g in range(block_tables.num_kv_cache_groups):
             bs = block_tables.block_sizes[g]
             bids = block_ids[g]
             nb = len(bids)
             if nb * bs < n or nb > self._zp_pin_bt_np[g].shape[0]:
                 return False
+            nbs_list.append(nb)
             bids_arr = np.asarray(bids, dtype=np.int64)
             slots_full = (bids_arr[:, None] * bs + self._zp_bs_offsets[g][None, :]).reshape(-1)
             self._zp_pin_slots_np[g, :] = slots_full[:n]
             bt_np = self._zp_pin_bt_np[g]
             bt_np[:nb] = bids_arr
         self._zp_pin_ids_np[:] = prefill_token_ids
-        if skip_padding:
-            raw_pad.fill_(False)
-        raw_ids.copy_(self._zp_pin_ids, non_blocking=True)
-        raw_pos.copy_(self._zp_positions_gpu, non_blocking=True)
-        input_buffers.seq_lens[:1].copy_(self._zp_seq_lens_gpu[:1], non_blocking=True)
-        input_buffers.query_start_loc[:2].copy_(self._zp_qsl_gpu[:2], non_blocking=True)
-        for g in range(block_tables.num_kv_cache_groups):
-            nb = len(block_ids[g])
-            block_tables.input_block_tables[g][0, :nb].copy_(self._zp_pin_bt[g][:nb], non_blocking=True)
-        raw_slots.copy_(self._zp_pin_slots, non_blocking=True)
+        nbs = tuple(nbs_list)
+        sig = (
+            nbs,
+            bool(skip_padding),
+            input_buffers.seq_lens.data_ptr(),
+            input_buffers.query_start_loc.data_ptr(),
+        )
+        if self._zp_stage_graph is not None and self._zp_stage_sig == sig:
+            self._zp_stage_graph.replay()
+            return True
+
+        def _emit_copies() -> None:
+            if skip_padding:
+                raw_pad.fill_(False)
+            raw_ids.copy_(self._zp_pin_ids, non_blocking=True)
+            raw_pos.copy_(self._zp_positions_gpu, non_blocking=True)
+            input_buffers.seq_lens[:1].copy_(self._zp_seq_lens_gpu[:1], non_blocking=True)
+            input_buffers.query_start_loc[:2].copy_(self._zp_qsl_gpu[:2], non_blocking=True)
+            for g in range(block_tables.num_kv_cache_groups):
+                nb = nbs[g]
+                block_tables.input_block_tables[g][0, :nb].copy_(
+                    self._zp_pin_bt[g][:nb], non_blocking=True
+                )
+            for g in range(block_tables.num_kv_cache_groups):
+                block_tables.slot_mappings[g, :n].copy_(
+                    self._zp_pin_slots[g], non_blocking=True
+                )
+
+        if (
+            self._zp_stage_graph_enabled
+            and not self._zp_stage_graph_failed
+            and self._zp_stage_graph is None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            try:
+                sg = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(sg, pool=self.pool):
+                    _emit_copies()
+                self._zp_stage_graph = sg
+                self._zp_stage_sig = sig
+                self._zp_stage_graph.replay()
+                logger.info("Prefill graph: captured zero-prep staging CUDA graph (nbs=%s)", nbs)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                self._zp_stage_graph_failed = True
+                logger.warning("Prefill graph: zero-prep staging graph skipped (%s); using direct copies", exc)
+
+        _emit_copies()
         return True
