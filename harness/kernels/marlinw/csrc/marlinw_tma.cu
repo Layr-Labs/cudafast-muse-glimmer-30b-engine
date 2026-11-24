@@ -503,12 +503,20 @@ template <int kCols, bool kShflEpi = true, int kPdlMode = 0>
 __global__ void __launch_bounds__(kThreads, 1) down(
     const __grid_constant__ CUtensorMap tmA8, const __grid_constant__ CUtensorMap tmB,
     const __grid_constant__ CUtensorMap tmS, int4* __restrict__ C0, float4* __restrict__ scratch,
-    const float* __restrict__ gs_ptr, int4* __restrict__ work
+    const float* __restrict__ gs_ptr, int4* __restrict__ work,
+    const uint8_t* __restrict__ w_raw, size_t w_bytes
     ) {
   if (threadIdx.x == 0) {
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA8) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmS) : "memory");
+  }
+  if (blockIdx.x == 0 && w_raw != nullptr) {
+    constexpr size_t kTpf = 2048u << 10;
+    for (size_t off = static_cast<size_t>(threadIdx.x) * kTpf; off < w_bytes;
+         off += static_cast<size_t>(kThreads) * kTpf) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(w_raw + off));
+    }
   }
   const int4 w0 = work[2 * blockIdx.x];
   const int4 w1 = work[2 * blockIdx.x + 1];
@@ -542,7 +550,8 @@ template <int kPdlMode = 0>
 __global__ void __launch_bounds__(kThreads, 1) gateup(
     const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
     const __grid_constant__ CUtensorMap tmS, char* __restrict__ out,
-    const float* __restrict__ global_scale_ptr
+    const float* __restrict__ global_scale_ptr,
+    const uint8_t* __restrict__ w_raw
 #ifdef MARLINW_TMA_FP8
     , const float* __restrict__ down_input_scale
 #endif
@@ -555,6 +564,14 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmS) : "memory");
+  }
+  if (blockIdx.x == 0 && w_raw != nullptr) {
+    constexpr size_t kTpf = 2048u << 10;
+    constexpr size_t kWBytes = (static_cast<size_t>(kFused) * 6656u) >> 1;
+    for (size_t off = static_cast<size_t>(tid) * kTpf; off < kWBytes;
+         off += static_cast<size_t>(kThreads) * kTpf) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(w_raw + off));
+    }
   }
   const float gs = global_scale_ptr[0];
   float c[8][2][2][4];
@@ -823,15 +840,17 @@ static int launch_down_shape(
       !map2d(&tmS, scales, 1, (uint64_t)kCols, (uint64_t)k / 16, (uint64_t)kCols, 128, 4, false))
     return cudaErrorInvalidValue;
   const int pm = tma_pdl_mode();
+  const size_t w_bytes = (static_cast<size_t>(kCols) * static_cast<size_t>(k)) >> 1;
+  const uint8_t* w_raw = reinterpret_cast<const uint8_t*>(weight);
   if (pm == 2) {
     auto kernel = g_shfl_epi ? down<kCols, true, 2> : down<kCols, false, 2>;
     return launch_ex_pdl(kernel, grid, kThreads, kShared, stream, tmA8, tmB, tmS, output, scratch, global_scale,
-                         const_cast<int4*>(work));
+                         const_cast<int4*>(work), w_raw, w_bytes);
   }
   auto kernel = (pm == 1) ? (g_shfl_epi ? down<kCols, true, 1> : down<kCols, false, 1>)
                           : (g_shfl_epi ? down<kCols, true, 0> : down<kCols, false, 0>);
   kernel<<<grid, kThreads, kShared, stream>>>(tmA8, tmB, tmS, output, scratch, global_scale,
-                                              const_cast<int4*>(work));
+                                              const_cast<int4*>(work), w_raw, w_bytes);
   return cudaGetLastError();
 }
 
@@ -901,13 +920,14 @@ extern "C" int swiglu_fp8_gemm(const void* x, const void* w, const void* scales,
   static_assert((n / 128) % kTilesPerCta == 0, "tiles per CTA");
   constexpr int grid = (m / 128) * (n / 128) / kTilesPerCta;
   const int pm = tma_pdl_mode();
+  const uint8_t* w_raw = reinterpret_cast<const uint8_t*>(w);
   if (pm == 2) {
     return launch_ex_pdl(gateup<2>, grid, kThreads, kShared, stream, tmA, tmB, tmS, static_cast<char*>(out),
-                         static_cast<const float*>(global), down_input_scale);
+                         static_cast<const float*>(global), w_raw, down_input_scale);
   }
   auto kernel = (pm == 1) ? gateup<1> : gateup<0>;
   kernel<<<grid, kThreads, kShared, stream>>>(
-      tmA, tmB, tmS, static_cast<char*>(out), static_cast<const float*>(global), down_input_scale);
+      tmA, tmB, tmS, static_cast<char*>(out), static_cast<const float*>(global), w_raw, down_input_scale);
   return cudaGetLastError();
 }
 #else
@@ -946,13 +966,14 @@ extern "C" int swiglu_gemm(const void* x, const void* w, const void* scales, con
   static_assert((n / 128) % kTilesPerCta == 0, "tiles per CTA");
   constexpr int grid = (m / 128) * (n / 128) / kTilesPerCta;
   const int pm = tma_pdl_mode();
+  const uint8_t* w_raw = reinterpret_cast<const uint8_t*>(w);
   if (pm == 2) {
     return launch_ex_pdl(gateup<2>, grid, kThreads, kShared, stream, tmA, tmB, tmS, static_cast<char*>(out),
-                         static_cast<const float*>(global));
+                         static_cast<const float*>(global), w_raw);
   }
   auto kernel = (pm == 1) ? gateup<1> : gateup<0>;
   kernel<<<grid, kThreads, kShared, stream>>>(
-      tmA, tmB, tmS, static_cast<char*>(out), static_cast<const float*>(global));
+      tmA, tmB, tmS, static_cast<char*>(out), static_cast<const float*>(global), w_raw);
   return cudaGetLastError();
 }
 #endif

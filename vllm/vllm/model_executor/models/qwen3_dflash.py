@@ -853,32 +853,3 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             MASK_EMBEDDING_FILENAME,
         )
         return state.reshape(-1)
-
-
-class DFlashMuseGlimmerAssistantForCausalLM(DFlashQwen3ForCausalLM):
-    """Muse Glimmer's DFlash draft head (meta-models/Muse-Glimmer-30B-assistant).
-
-    The head is the generic DFlash Qwen3 draft, but its checkpoint keeps the
-    context projection and the norm after it in an ``encoder.`` block:
-    ``encoder.fc`` (the concatenated target-layer hidden states -> hidden size)
-    and ``encoder.output_norm_enc``. The generic module names those two ``fc``
-    and ``hidden_norm``; every other tensor already has the generic name. Only
-    the two names are rewritten, so a checkpoint that already uses the generic
-    names loads unchanged.
-    """
-
-    _CHECKPOINT_RENAMES = (
-        ("encoder.fc.", "fc."),
-        ("encoder.output_norm_enc.", "hidden_norm."),
-    )
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        def renamed() -> Iterable[tuple[str, torch.Tensor]]:
-            for name, loaded_weight in weights:
-                for old, new in self._CHECKPOINT_RENAMES:
-                    if name.startswith(old):
-                        name = new + name[len(old) :]
-                        break
-                yield name, loaded_weight
-
-        return super().load_weights(renamed())

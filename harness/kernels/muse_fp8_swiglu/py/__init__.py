@@ -10,7 +10,7 @@ import torch
 _HIDDEN = 6656
 _INNER = 19968
 _ROWS = 512
-_USE_WS = os.environ.get("MUSE_FP8_SWIGLU_WS", "1") != "0"
+_USE_WS = os.environ.get("MUSE_FP8_SWIGLU_WS", "0") != "0"
 _library = None
 _sms = {}
 _ws_admitted: dict[int, bool] = {}
