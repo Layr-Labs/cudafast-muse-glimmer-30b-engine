@@ -241,8 +241,7 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float,  // is zero point of float16 type?
-          const bool fast_fp4 = false
+          const bool is_zp_float   // is zero point of float16 type?
           >
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
@@ -794,16 +793,10 @@ __global__ void Marlin(
       int4* sh_a_stage = sh_a + a_sh_stage * pipe;
   #pragma unroll
       for (int i = 0; i < a_sh_wr_iters; i++) {
-        if constexpr (fast_fp4) {
-          cp_async4_l2_256b(
-              &sh_a_stage[a_sh_wr_trans[i]],
-              &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off]);
-        } else {
-          cp_async4_pred(
-              &sh_a_stage[a_sh_wr_trans[i]],
-              &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
-              a_sh_wr_pred[i]);
-        }
+        cp_async4_pred(
+            &sh_a_stage[a_sh_wr_trans[i]],
+            &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
+            a_sh_wr_pred[i]);
       }
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
   #pragma unroll
@@ -813,11 +806,7 @@ __global__ void Marlin(
             b_gl_rd + (i % count) * threads +
             b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
 
-        if constexpr (fast_fp4) {
-          cp_async4_l2_256b(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
-        } else {
-          cp_async4(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
-        }
+        cp_async4(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
       }
 
       b_gl_rd += b_gl_rd_delta_o;
@@ -844,11 +833,7 @@ __global__ void Marlin(
           // Only fetch scales if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
             if (s_sh_wr_pred) {
-              if constexpr (fast_fp4) {
-                cp_async4_l2_256b(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
-              } else {
-                cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
-              }
+              cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
             }
             s_gl_rd += s_gl_rd_delta * s_tb_groups;
           }
@@ -1192,34 +1177,21 @@ __global__ void Marlin(
       FragB frag_b1;
       int b_quant_0, b_quant_1;
 
-      if constexpr (fast_fp4 && b_type_id == vllm::kFE2M1f.id() &&
-                    a_type_id == vllm::kBFloat16.id() && !is_a_8bit) {
-        const unsigned u = static_cast<unsigned>(frag_b_quant[k2][0][j]);
-        reinterpret_cast<unsigned*>(&frag_b1)[1] =
-            (u & 0x80008000u) | ((u >> 6) & 0x01c001c0u);
-        reinterpret_cast<unsigned*>(&frag_b1)[0] =
-            (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
-        reinterpret_cast<unsigned*>(&frag_b0)[1] =
-            ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
-        reinterpret_cast<unsigned*>(&frag_b0)[0] =
-            ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
+      if constexpr (b_type_id == vllm::kFE2M1f.id()) {
+        b_quant_1 = frag_b_quant[k2][0][j];
+        b_quant_0 = b_quant_1 << 8;
+      } else if constexpr (b_type.size_bits() == 4) {
+        b_quant_0 = frag_b_quant[k2][0][j];
+        b_quant_1 = b_quant_0 >> 8;
       } else {
-        if constexpr (b_type_id == vllm::kFE2M1f.id()) {
-          b_quant_1 = frag_b_quant[k2][0][j];
-          b_quant_0 = b_quant_1 << 8;
-        } else if constexpr (b_type.size_bits() == 4) {
-          b_quant_0 = frag_b_quant[k2][0][j];
-          b_quant_1 = b_quant_0 >> 8;
-        } else {
-          static_assert(b_type.size_bits() == 8);
-          int* frag_b_quant_ptr = reinterpret_cast<int*>(frag_b_quant[k2]);
-          b_quant_0 = frag_b_quant_ptr[j * 2 + 0];
-          b_quant_1 = frag_b_quant_ptr[j * 2 + 1];
-        }
-
-        dequant_data(b_quant_0, reinterpret_cast<scalar_32bit_t*>(&frag_b0));
-        dequant_data(b_quant_1, reinterpret_cast<scalar_32bit_t*>(&frag_b1));
+        static_assert(b_type.size_bits() == 8);
+        int* frag_b_quant_ptr = reinterpret_cast<int*>(frag_b_quant[k2]);
+        b_quant_0 = frag_b_quant_ptr[j * 2 + 0];
+        b_quant_1 = frag_b_quant_ptr[j * 2 + 1];
       }
+
+      dequant_data(b_quant_0, reinterpret_cast<scalar_32bit_t*>(&frag_b0));
+      dequant_data(b_quant_1, reinterpret_cast<scalar_32bit_t*>(&frag_b1));
 
       if constexpr (dequant_skip_flop && has_zp && !is_zp_float && !is_a_8bit) {
         sub_zp<a_type_id>(frag_b0, frag_zp[j], 0);

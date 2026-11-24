@@ -19,7 +19,9 @@
 #include <cuda_bf16.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <utility>
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -279,7 +281,7 @@ struct RansProb {
   const uint8_t* hdr; const uint8_t* stream; const int* woff16; const uint32_t* lut;
   const uint8_t* x; const uint16_t* x_aux; int act_mode;
   const float* sb; int sb_scalar; const float* sa;
-  __nv_bfloat16* out; int N; int K; int tw; int ilv; int strided_w; int lut_first; size_t stream_bytes; size_t tpf_stride;
+  __nv_bfloat16* out; int N; int K; int tw; int ilv; size_t stream_bytes; size_t tpf_stride;
 };
 
 static size_t rans_tpf_stride() {
@@ -304,7 +306,7 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   const int xbytes = (K + 15) & ~15;
   const uint32_t sbase0 = (uint32_t)__cvta_generic_to_shared(smem) + (uint32_t)xbytes;
   const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + (uint32_t)wib * RB;
-  const int w = pb.strided_w ? (wib * gridDim.x + blockIdx.x) : (blockIdx.x * wpb + wib);
+  const int w = blockIdx.x * wpb + wib;
   const bool active = w < pb.tw;
   const uint8_t* ws = pb.stream;
   uint32_t wbytes = 0;
@@ -322,26 +324,6 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
 #if RANS_PREISSUE
   const bool fast_preissue = (pb.ilv != 0 && pb.K >= 2048 && RG <= 8);
 #endif
-  // lut_first (MUSERANS_LUT_FIRST, default on): the 16 KB decode table goes out as cp.async BEFORE the weight
-  // pre-issue and the per-warp stream offsets are loaded next to it, so neither queues in DRAM behind the
-  // pre-issued groups; the prologue (x staging) then overlaps them and the main loop starts ~2-3 us earlier.
-  // Same table, same offsets, same stream: bit-identical output.
-  const bool lut_first = pb.lut_first != 0;
-  int pre_wo0 = 0, pre_wo1 = 0, pre_tof = 0, pre_gmin = 0;
-  if (lut_first) {
-    const uint32_t lut_sa = (uint32_t)__cvta_generic_to_shared(lut_s);
-    for (int i = tid; i < RANS_LUT_BYTES / 16; i += blockDim.x)
-      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(lut_sa + 16u * (uint32_t)i), "l"(((const uint4*)pb.lut) + i));
-    rans_cp_commit();
-#if RANS_PREISSUE
-    if (active && fast_preissue) {
-      pre_wo0 = __ldg(pb.woff16 + w);
-      pre_wo1 = __ldg(pb.woff16 + w + 1);
-      pre_tof = __ldg(pb.woff16 + pb.tw + 1 + w);
-      pre_gmin = (int)__ldg((const uint32_t*)pb.hdr + 14);
-    }
-#endif
-  }
   if (active) {
 #if RANS_PREISSUE
     if (fast_preissue) {
@@ -377,8 +359,7 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
       asm volatile("prefetch.global.L2 [%0];" ::"l"(pb.stream + off));
     }
   }
-  if (!lut_first)
-    for (int i = tid; i < RANS_LUT_BYTES / 16; i += blockDim.x) ((uint4*)lut_s)[i] = ((const uint4*)pb.lut)[i];
+  for (int i = tid; i < RANS_LUT_BYTES / 16; i += blockDim.x) ((uint4*)lut_s)[i] = ((const uint4*)pb.lut)[i];
   if (pb.act_mode == 0) {
     for (int i = tid; i < S * 4; i += blockDim.x) {
       int s = i >> 2, tt = i & 3;
@@ -430,21 +411,10 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   }
 #if RANS_PREISSUE
   if (active && fast_preissue) {
-    if (lut_first) {
-      wbytes = (uint32_t)(pre_wo1 - pre_wo0) * 16u;
-      gmin = pre_gmin;
-      toffw = pre_tof;
-    } else {
-      wbytes = (uint32_t)(pb.woff16[w + 1] - pb.woff16[w]) * 16u;
-      gmin = (int)((const uint32_t*)pb.hdr)[14];
-      toffw = pb.woff16[pb.tw + 1 + w];
-    }
+    wbytes = (uint32_t)(pb.woff16[w + 1] - pb.woff16[w]) * 16u;
+    gmin = (int)((const uint32_t*)pb.hdr)[14];
+    toffw = pb.woff16[pb.tw + 1 + w];
   }
-  if (lut_first) {  // the table's group is older than the RG - 1 pre-issued weight groups of an active warp
-    if (active) rans_cp_wait<RG - 1>(); else rans_cp_wait<0>();
-  }
-#else
-  if (lut_first) rans_cp_wait<0>();
 #endif
   __syncthreads();
   if (!active) return;
@@ -465,11 +435,21 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   for (int nb = w; nb < NB; nb += pb.tw) {
     float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
     for (int s = 0; s < S; s++) {
-      __syncwarp();
+      uint32_t e0 = 0, e1 = 0, e2 = 0, e3 = 0;
+      if constexpr (NS == 4) {
+        // Issue all 4 independent lut_s lookups before any cp.async wait so SMEM latency overlaps with DRAM waits.
+        e0 = ((uint32_t*)lut_s)[states[0] & 4095u];
+        e1 = ((uint32_t*)lut_s)[states[1] & 4095u];
+        e2 = ((uint32_t*)lut_s)[states[2] & 4095u];
+        e3 = ((uint32_t*)lut_s)[states[3] & 4095u];
+      }
       const int curg = (int)(pwb >> GBS);
-      while (issued <= curg + (RG - 1)) RANS_ISSUE();
-      rans_cp_wait<RG - 2>();
-      __syncwarp();
+      if (issued <= curg + (RG - 1)) {
+        __syncwarp();
+        do { RANS_ISSUE(); } while (issued <= curg + (RG - 1));
+        rans_cp_wait<RG - 2>();
+        __syncwarp();
+      }
       const uint32_t na = pwb + 4u * (uint32_t)lane;
       uint32_t nw;
       if ((pwb & 2u) == 0u) {
@@ -479,25 +459,51 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
       }
       pwb += 128u;
       uint32_t Pw = 0;
+      if constexpr (NS == 4) {
+        uint32_t xh0 = states[0] >> 12, xh1 = states[1] >> 12, xh2 = states[2] >> 12, xh3 = states[3] >> 12;
+        uint32_t x0 = ((e0 >> 8) & 4095u) * xh0 + xh0 + (e0 >> 20);
+        uint32_t x1 = ((e1 >> 8) & 4095u) * xh1 + xh1 + (e1 >> 20);
+        uint32_t x2 = ((e2 >> 8) & 4095u) * xh2 + xh2 + (e2 >> 20);
+        uint32_t x3 = ((e3 >> 8) & 4095u) * xh3 + xh3 + (e3 >> 20);
+        Pw = __byte_perm(__byte_perm(e0, e1, 0x0040), __byte_perm(e2, e3, 0x0040), 0x5410);
+        const bool n0 = x0 < RANS_L, n1 = x1 < RANS_L, n2 = x2 < RANS_L, n3 = x3 < RANS_L;
+        const uint32_t m0 = __ballot_sync(0xffffffffu, n0);
+        const uint32_t m1 = __ballot_sync(0xffffffffu, n1);
+        const uint32_t m2 = __ballot_sync(0xffffffffu, n2);
+        const uint32_t m3 = __ballot_sync(0xffffffffu, n3);
+        const uint32_t p0 = pwb;
+        const uint32_t p1 = p0 + (__popc(m0) << 1);
+        const uint32_t p2 = p1 + (__popc(m1) << 1);
+        const uint32_t p3 = p2 + (__popc(m2) << 1);
+        pwb = p3 + (__popc(m3) << 1);
+        if (n0) x0 = (x0 << 16) | rans_lds16(ring_s | ((p0 + (__popc(m0 & lt) << 1)) & (RB - 1u)));
+        if (n1) x1 = (x1 << 16) | rans_lds16(ring_s | ((p1 + (__popc(m1 & lt) << 1)) & (RB - 1u)));
+        if (n2) x2 = (x2 << 16) | rans_lds16(ring_s | ((p2 + (__popc(m2 & lt) << 1)) & (RB - 1u)));
+        if (n3) x3 = (x3 << 16) | rans_lds16(ring_s | ((p3 + (__popc(m3 & lt) << 1)) & (RB - 1u)));
+        states[0] = x0;
+        states[1] = x1;
+        states[2] = x2;
+        states[3] = x3;
+      } else {
 #pragma unroll
-      for (int q = 0; q < 4; q++) {
-        uint32_t& x = states[q % NS];
-        uint32_t e = ((uint32_t*)lut_s)[x & 4095u];
-        uint32_t xh = x >> 12;
-        x = ((e >> 8) & 4095u) * xh + xh + (e >> 20);
-        Pw = __byte_perm(Pw, e, (q == 0) ? 0x3214 : (q == 1) ? 0x3240 : (q == 2) ? 0x3410 : 0x4210);
-        bool need = x < RANS_L;
-        uint32_t m = __ballot_sync(0xffffffffu, need);
-        if (need) x = (x << 16) | rans_lds16(ring_s | ((pwb + (__popc(m & lt) << 1)) & (RB - 1u)));
-        pwb += __popc(m) << 1;
+        for (int q = 0; q < 4; q++) {
+          uint32_t& x = states[q % NS];
+          uint32_t e = ((uint32_t*)lut_s)[x & 4095u];
+          uint32_t xh = x >> 12;
+          x = ((e >> 8) & 4095u) * xh + xh + (e >> 20);
+          Pw = __byte_perm(Pw, e, (q == 0) ? 0x3214 : (q == 1) ? 0x3240 : (q == 2) ? 0x3410 : 0x4210);
+          bool need = x < RANS_L;
+          uint32_t m = __ballot_sync(0xffffffffu, need);
+          if (need) x = (x << 16) | rans_lds16(ring_s | ((pwb + (__popc(m & lt) << 1)) & (RB - 1u)));
+          pwb += __popc(m) << 1;
+        }
       }
       const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
       const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
       const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
       const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
       const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
-      uint2 a = xs[s * 4 + t];
-      a.x = (g == 0) ? a.x : 0u; a.y = (g == 0) ? a.y : 0u;
+      uint2 a = (g == 0) ? xs[s * 4 + t] : make_uint2(0u, 0u);
       rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
     }
     if (lane < 4) {
@@ -520,33 +526,132 @@ static inline size_t rans_stream_off(int tw) { return (rans_woff_off() + (size_t
 static inline size_t rans_dsmem(int K, int wpb, int gbs, int rg) { size_t rb = (size_t)rg << gbs; return rans_round16((size_t)K) + rb + (size_t)wpb * rb; }
 static inline bool rans_fits(int K, int wpb, int gbs, int rg) { return rans_dsmem(K, wpb, gbs, rg) + RANS_LUT_BYTES + 1024 <= (size_t)RANS_MAX_SMEM; }
 
-static RansCfg rans_pick_cfg(int N, int K) {
+static RansCfg rans_pick_cfg_base(int N, int K) {
   const int NB = N / 8;
   // Attention output_gate (4096x6656, 28 layers) runs concurrently with split-KV flash attention on a side stream:
   // launching 32 blocks of 16 warps (512 warps total) leaves 16 free SMs for flash attention (idea: ArthurOstapenko a9002906).
-  static const bool gate32 = []() {
+  static const int gate_blocks = []() {
+    if (const char* b = std::getenv("MUSERANS_GATE_BLOCKS"); b && *b) {
+      int v = static_cast<int>(std::strtol(b, nullptr, 10));
+      if (v == 32 || v == 43 || v == 47) return v;
+    }
     const char* env = std::getenv("MUSERANS_GATE_32_BLOCKS");
-    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+    return (!env || !*env || std::strtol(env, nullptr, 10) != 0) ? 32 : 47;
   }();
   static const bool gate_up_even = []() {
     const char* env = std::getenv("MUSERANS_GATE_UP_EVEN48");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
-  if (gate32 && N == 4096 && K == 6656 && NB == 512 && rans_fits(K, 16, 9, 4)) {
-    return RansCfg{512, 16, 4, 4, 9};
+  if (N == 4096 && K == 6656 && NB == 512) {
+    if (gate_blocks == 32 && rans_fits(K, 16, 9, 4)) {
+      return RansCfg{512, 16, 4, 4, 9};
+    }
+    if (gate_blocks == 43 && rans_fits(K, 12, 9, 4)) {
+      return RansCfg{512, 12, 4, 4, 9};
+    }
   }
-  if (gate_up_even && N == 39936 && K == 6656 && NB == 4992 && rans_fits(K, 16, 9, 4)) {
-    return RansCfg{768, 16, 4, 4, 9};
+  // qkv (4608x6656, 28 layers) defaults to wpb=12, i.e. 48 CTAs x 12 warps = 12 warps/SM on all 48 SMs, which
+  // is what the wcap loop below already returns for NB=576 (wpb = ceil(576/48) = 12 is an arithmetic identity).
+  // The explicit branch exists only to carry the wpb=18 experiment: 32 CTAs x 18 warps, 16 SMs left empty.
+  //
+  // wpb=18 was measured in situ and is a null -- reverted on structural grounds, not on a probe. Same binary,
+  // same cache, adjacent alternating legs, both arms bit-exact (78aeca36/b49d2375, 129/129): wpb=18 67.798 ms
+  // vs wpb=12 67.757 ms = +0.041 ms/tok = -4.6 bips, inside the +/-0.15 ms drift band. The isolated placement
+  // probe predicted +1.082 ms from a 35% swing in its qkv after-sum (4.186 vs 3.104); the step moved 0.06%.
+  // A 26x attenuation, and it is the reason the per-group GB/s table this branch was built on is not evidence:
+  // 190.6 (qkv) / 227.6 (gate) / 238.4 (o_proj) "monotonic in warps/SM" was page draws, not a shape property.
+  // Do not re-open occupancy here: 12 -> 18 warps/SM is worth nothing, so there is no occupancy lever left in
+  // this kernel. MUSERANS_QKV_WPB=18 is kept as the opt-in so the experiment stays reproducible.
+  //
+  // Bit-exact, and this is checked rather than assumed: muse_rans.cu's GEMV maps w = blockIdx.x*wpb + wib over
+  // the GLOBAL warp index, so (48,12) and (32,18) both produce w in [0,576) with warp-private rings (wib*RB)
+  // and block-identical input staging; the only __syncthreads() is the prologue LUT barrier before the k-loop,
+  // and the only other blockIdx use is block 0's prefetch.global.L2. No reduction is regrouped.
+  if (N == 4608 && K == 6656 && NB == 576) {
+    static const int qkv_wpb = []() {
+      const char* env = std::getenv("MUSERANS_QKV_WPB");
+      if (!env || !*env) return 12;
+      const int v = static_cast<int>(std::strtol(env, nullptr, 10));
+      return (v == 6 || v == 12 || v == 18) ? v : 12;
+    }();
+    if (qkv_wpb == 18 && rans_fits(K, 18, 9, 4)) return RansCfg{576, 18, 4, 4, 9};
+    if (qkv_wpb == 6 && rans_fits(K, 6, 9, 4)) return RansCfg{576, 6, 4, 4, 9};
+    // qkv_wpb == 12 (or a failed rans_fits) falls through to the wcap loop, which yields the old 48x12.
+  }
+  if (gate_up_even && N == 39936 && K == 6656 && NB == 4992) {
+    static const int gu_tw = []() {
+      const char* env = std::getenv("MUSERANS_GATE_UP_TW");
+      if (!env || !*env) return 624;
+      int v = static_cast<int>(std::strtol(env, nullptr, 10));
+      return (v > 0 && v <= 864 && (v % 48 == 0)) ? v : 624;
+    }();
+    const int gu_wpb = gu_tw / 48;
+    if (rans_fits(K, gu_wpb, 9, 4)) {
+      return RansCfg{gu_tw, gu_wpb, 4, 4, 9};
+    }
   }
   for (int wcap = 18; wcap >= 1; wcap--) {
     const int R = (NB + 48 * wcap - 1) / (48 * wcap);
     const int tw = (NB + R - 1) / R, wpb = (tw + 47) / 48;
     if (rans_fits(K, wpb, 9, 4)) {
-      const int states = ((N == 6656) || (N == 4608 && K == 6656)) ? 4 : 2;
+      const int states = ((N == 6656) || (N == 4608 && K == 6656) || (N == 4096 && K == 6656)) ? 4 : 2;
       return RansCfg{tw, wpb, states, 4, 9};
     }
   }
   return RansCfg{NB, 1, 2, 4, 9};
+}
+
+// Ring depth is a pure prefetch-depth knob: RB = (1<<gbs)*rg is the per-warp cp.async ring and RANS_ISSUE preissues
+// rg-1 groups into it, with the consumer waiting at cp.async.wait_group RG-2. It changes how far ahead the stream is
+// read, never the decode order, the k-chain or the MMA chain, so any rg is bit-identical to any other -- and the packed
+// blob does not depend on rg at all (rans_pack_cfg takes tw/ns/ilv only, never rg). That is why an rg A/B needs no
+// repack and can run on the same cache dir.
+//
+// rg=8 was tried as a DEFAULT and it LOST: 68.560 / 68.739 ms/tok against rg=4's 67.886 / 67.887 / 67.816, i.e.
+// +0.79 ms/tok = -89 bips at 6 sigma, with the pack lines confirming the knob took. The mechanism inverts the reason
+// it was tried: bytes-in-flight was never the limiter (the kernel already runs at 234 GB/s), and the deeper ring costs
+// SMEM -- o_proj reaches 99,328 B of the 101,376 B ceiling -- which starves L1 for the decode state table on a kernel
+// whose limiter is the serial rANS chain, not latency hiding. So the default stays rg=4, and MUSERANS_RG=8 is the
+// opt-in. This is a MEASURED negative and it is recorded here so nobody re-tries it as a "free" prefetch knob.
+//
+// Returns 0 for "no override", so the tuned rans_pick_cfg_base value (rg=4) is used verbatim.
+static int rans_rg_override() {
+  static const int rg = []() -> int {
+    const char* env = std::getenv("MUSERANS_RG");
+    if (!env || !*env) return 0;
+    const long v = std::strtol(env, nullptr, 10);
+    return (v == 4 || v == 8) ? static_cast<int>(v) : 0;
+  }();
+  return rg;
+}
+
+static RansCfg rans_pick_cfg(int N, int K) {
+  // Sweep escape hatch only -- not a submission knob, because the scored run carries no MUSE_* env at all.
+  // MUSERANS_CFG="tw,ns,wpb,rg,ilv", applied only where the shape fits, so a bad sweep point falls back to the tuned
+  // config instead of failing to launch. rans_pack calls this same function, so tw/ns/ilv are applied consistently to
+  // the blob and to the launch -- the pack log line prints the config actually used, which is the check that the
+  // sweep point took.
+  static const RansCfg ov = []() -> RansCfg {
+    RansCfg c{0, 0, 0, 0, 0};
+    const char* env = std::getenv("MUSERANS_CFG");
+    if (!env || !*env) return c;
+    int v[5] = {0, 0, 0, 0, 0};
+    if (std::sscanf(env, "%d,%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3], &v[4]) != 5) return c;
+    if (v[0] < 1 || v[2] < 1 || v[2] > 32 || (v[1] != 1 && v[1] != 2 && v[1] != 4) ||
+        (v[3] != 4 && v[3] != 8) || (v[4] != 0 && v[4] != 9)) return c;
+    return RansCfg{v[0], v[2], v[1], v[3], v[4]};
+  }();
+  // tw is the virtual-warp count and the GEMV walks rows as `for (nb = w; nb < NB; nb += pb.tw)`, so any tw in
+  // [1, NB] covers every output row exactly once -- but tw > NB leaves warps permanently idle, and rans_fits checks
+  // SMEM only, so without this guard a sweep point like "576,4,18,4,9" would be applied to every shape that fits and
+  // run o_proj (NB=832) with 576 warps, i.e. 256 warps doing 256 chunks' worth of work in a 576-warp grid. Reject
+  // rather than clamp, so a bad sweep point falls back to the tuned config for that shape instead of being quietly
+  // applied to the wrong ones. Note that tw < NB is legitimate and used: gate_up runs tw=624 against NB=4992.
+  if (ov.tw > 0 && ov.tw <= N / 8 && rans_fits(K, ov.wpb, 9, ov.rg)) return ov;
+  RansCfg c = rans_pick_cfg_base(N, K);
+  const int want = rans_rg_override();
+  if (want != 0 && want != c.rg && rans_fits(K, c.wpb, 9, want)) c.rg = want;
+  return c;
 }
 
 static void rans_normalize(const int64_t* counts, int32_t* f) {
@@ -639,7 +744,22 @@ torch::Tensor rans_pack_cfg(torch::Tensor W, int64_t tw, int64_t ns, int64_t ilv
 torch::Tensor rans_pack(torch::Tensor W) {
   TORCH_CHECK(W.dim() == 2);
   RansCfg cfg = rans_pick_cfg((int)W.size(0), (int)W.size(1));
-  return rans_pack_cfg(W, cfg.tw, cfg.ns, cfg.ilv);
+  auto blob = rans_pack_cfg(W, cfg.tw, cfg.ns, cfg.ilv);
+  // One line per distinct shape at load time (never in the timed window): the launch config actually selected, and the
+  // compressed size, so the decode byte budget and the achieved GB/s can be computed from the log instead of inferred.
+  // rans_gemv_auto picks its config from the same rans_pick_cfg, so this is the config the GEMV will launch with.
+  {
+    static std::vector<std::pair<int, int>> seen;
+    const std::pair<int, int> key{(int)W.size(0), (int)W.size(1)};
+    if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
+      seen.push_back(key);
+      std::fprintf(stderr,
+                   "muserans: pack %dx%d -> tw=%d wpb=%d ns=%d rg=%d ilv=%d, blob %zu B (%.4f x N*K)\n",
+                   key.first, key.second, cfg.tw, cfg.wpb, cfg.ns, cfg.rg, cfg.ilv,
+                   (size_t)blob.numel(), (double)blob.numel() / ((double)key.first * (double)key.second));
+    }
+  }
+  return blob;
 }
 
 std::vector<int64_t> rans_blob_info(torch::Tensor blob) {
@@ -671,7 +791,10 @@ static void rans_set_attrs_once() {
   if (done) return;
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   cudaThreadExchangeStreamCaptureMode(&mode);
-#define RANS_PREP(NSV, RGV) cudaFuncSetAttribute(rans_gemv_kernel<NSV, 9, RGV>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+// Checked, because a silently failed cudaFuncSetAttribute is invisible: rg=4 launches request far less than the
+// ceiling and would still succeed, so the failure would only surface as an unexplained "rans smem too large" or a
+// launch error on the one shape that is close to the limit (o_proj 6656x4096 at rg=8 needs 81,920 of 84,992 B).
+#define RANS_PREP(NSV, RGV) C10_CUDA_CHECK(cudaFuncSetAttribute(rans_gemv_kernel<NSV, 9, RGV>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES)));
   RANS_PREP(1, 4) RANS_PREP(1, 8) RANS_PREP(2, 4) RANS_PREP(2, 8) RANS_PREP(4, 4) RANS_PREP(4, 8)
 #undef RANS_PREP
   cudaThreadExchangeStreamCaptureMode(&mode);
@@ -681,6 +804,26 @@ static void rans_set_attrs_once() {
 static void rans_check_io(const torch::Tensor& blob, const torch::Tensor& x, const torch::Tensor& sb, const torch::Tensor& sa, const torch::Tensor& out, int64_t N, int64_t K) {
   TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "blob must be a contiguous uint8 cuda tensor");
   TORCH_CHECK(N > 0 && K > 0 && N % 8 == 0 && K % 64 == 0, "need N%8==0 and K%64==0");
+  // Validate the magic once per blob pointer. An uncompressed musefp8 pack is also a contiguous uint8 cuda tensor of the
+  // right length, so nothing in the shape checks distinguishes it -- and handing one to this decoder reads the rANS
+  // state table out of weight bytes and walks off the allocation, which surfaces as a sticky CUDA error far from here.
+  // The check costs one device->host read, so it is cached per pointer: the first call pays it, every decode step after
+  // that is a hash lookup. This is deliberately a hard error rather than a silent fallback, because at this point the
+  // caller has already decided the blob is compressed and a fallback would hide the misclassification again.
+  {
+    static std::vector<const void*> verified;
+    const void* key = blob.data_ptr();
+    if (std::find(verified.begin(), verified.end(), key) == verified.end()) {
+      TORCH_CHECK(blob.numel() >= (int64_t)(RANS_HDR_BYTES + RANS_LUT_BYTES),
+                  "rANS blob too small (", blob.numel(), " B): not a rANS pack");
+      auto hdr = blob.narrow(0, 0, 4).cpu();
+      const uint32_t magic = *reinterpret_cast<const uint32_t*>(hdr.data_ptr());
+      TORCH_CHECK(magic == 0x534E5241u,
+                  "blob is not a rANS pack (magic ", magic, ", expected ", 0x534E5241u,
+                  "): an uncompressed musefp8 pack was routed to the rANS decoder");
+      verified.push_back(key);
+    }
+  }
   TORCH_CHECK(x.is_cuda() && x.element_size() == 1 && x.numel() == K && x.is_contiguous(), "x must be a contiguous 1-byte (FP8 e4m3) cuda tensor with K elements");
   TORCH_CHECK(sb.is_cuda() && sb.scalar_type() == torch::kFloat && sb.is_contiguous() && (sb.numel() == N || sb.numel() == 1), "sb must be a contiguous float32 cuda tensor with N (per-channel) or 1 (scalar) elements");
   TORCH_CHECK(sa.is_cuda() && sa.scalar_type() == torch::kFloat && sa.numel() == 1, "sa must be a float32 cuda tensor with 1 element");
@@ -697,23 +840,8 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   pb.tpf_stride = rans_tpf_stride();
   TORCH_CHECK(tw >= 1 && tw <= N / 8 && wpb >= 1 && wpb <= 32 && (ns == 1 || ns == 2 || ns == 4) && (rg == 4 || rg == 8) && (ilv == 0 || ilv == 9), "bad launch config");
   const int blocks = (tw + wpb - 1) / wpb;
-  static const bool strided_gu = []() {
-    const char* env = std::getenv("MUSERANS_STRIDED_GATE_UP");
-    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
-  }();
-  pb.strided_w = (strided_gu && N == 39936 && K == 6656 && tw == blocks * wpb) ? 1 : 0;
-  static const bool lut_first = []() {
-    const char* env = std::getenv("MUSERANS_LUT_FIRST");
-    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
-  }();
-  pb.lut_first = lut_first ? 1 : 0;
-  size_t dsmem = rans_dsmem(K, wpb, 9, rg);
+  const size_t dsmem = rans_dsmem(K, wpb, 9, rg);
   TORCH_CHECK(rans_fits(K, wpb, 9, rg), "rans smem too large (K too large for smem staging of x): ", dsmem);
-  static const bool lock48 = []() {
-    const char* env = std::getenv("MUSERANS_SMEM_LOCK48");
-    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
-  }();
-  if (lock48 && blocks == 48 && dsmem < 40960) dsmem = 40960;
   rans_set_attrs_once();
 #define RANS_L2(NSV, RGV) \
   if (ns == NSV && rg == RGV) rans_gemv_kernel<NSV, 9, RGV><<<blocks, wpb * 32, dsmem, st>>>(pb);

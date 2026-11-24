@@ -23,11 +23,9 @@ SMS = 48
 ENABLED = os.environ.get("MARLIN_DOWN128", "1") == "1"
 ATTN_ENABLED = os.environ.get("MARLIN_ATTN128", "1") == "1"
 _ALL_ATTN_SHAPES = {(4608, 6656): "qkv", (6656, 4096): "o_proj", (4096, 6656): "gate"}
-_raw_attn_shapes = os.environ.get("MARLIN_ATTN128_SHAPES", "qkv,o_proj")
-_enabled_attn = set() if _raw_attn_shapes in ("", "0") else set(_raw_attn_shapes.split(","))
+_enabled_attn = set(os.environ.get("MARLIN_ATTN128_SHAPES", "qkv,o_proj").split(","))
 ATTN_SHAPES = {k: v for k, v in _ALL_ATTN_SHAPES.items() if v in _enabled_attn}
 ATTN_TMA_ENABLED = ATTN_ENABLED and os.environ.get("MARLIN_ATTN_TMA", "1") == "1"
-TMA_SHFL_EPI = os.environ.get("MARLIN_TMA_SHFL_EPI", "0") != "0"
 _DEFAULT_TAIL = {(6656, 19968): 16, (4608, 6656): 0, (4096, 6656): 8, (6656, 4096): 16}
 _plans: dict = {}
 _scratch_cache: dict[tuple[int, int], torch.Tensor] = {}
@@ -69,11 +67,6 @@ if TMA_ENABLED or ATTN_TMA_ENABLED:
         if _tma_shape_main is not None:
             _tma_shape_main.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
             _tma_shape_main.restype = ctypes.c_int
-        _tma_set_shfl_epi = getattr(_tma_library, "marlinw_down128_set_shfl_epi", None)
-        if _tma_set_shfl_epi is not None:
-            _tma_set_shfl_epi.argtypes = [ctypes.c_int]
-            _tma_set_shfl_epi.restype = None
-            _tma_set_shfl_epi(1 if TMA_SHFL_EPI else 0)
 _tma_ready = set()  # devices on which the TMA-fed kernel initialized
 _tma_weights = set()  # weight data pointers whose layer passed the comparison with the TMA-fed kernel
 _admitted = 0  # layers offered to admit_tma (those on the 128x128 tile)

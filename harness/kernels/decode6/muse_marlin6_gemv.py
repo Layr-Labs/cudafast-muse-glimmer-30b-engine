@@ -4,7 +4,6 @@ layer's group-16 FP8 block scales as 6-bit codes into a 64-entry palette, 3/4 of
 the same bytes, in the same shared-memory fragment, so the kernel computes the same bits; every layer is admitted only
 after a bitwise comparison with the uncompressed tiled GEMV on its own weight."""
 import ctypes
-import math
 import os
 from pathlib import Path
 
@@ -13,10 +12,20 @@ import torch
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
-logger = init_logger(__name__)
+# Under the `vllm` logger, not this module's own name. DEFAULT_LOGGING_CONFIG attaches a handler
+# only to the `vllm` logger (propagate=False); a top-level logger such as `muse_marlin6_gemv`
+# inherits from root, which has no handler, so every logger.info in this file was dropped and only
+# warnings reached the last-resort handler. That is why "NVFP4 decode GEMV with 6-bit block scales"
+# greps to 0 in every leg: not only is decode_linear6 off the inference path, its line could not
+# print even when it ran. A tell that cannot print is not a tell.
+logger = init_logger("vllm.muse_marlin6_gemv")
 STATS = {"admitted": 0, "kept": 0, "fixed_grid": 0, "gate_up_srans": 0, "gate_up_srans_rejected": 0,
          "srans_scales": 0, "srans_bytes": 0, "down_srans": 0, "down_srans_rejected": 0, "down_srans_scales": 0,
-         "down_srans_bytes": 0, "logged": False}
+         "down_srans_bytes": 0, "logged": False,
+         # Block count -> layers that will launch with it, filled by _log_gate_launch6. The
+         # aggregate is printed by marlin.py's _log_prompt_stats, which is the only summary hook
+         # that actually runs at inference (decode_linear6 is reached only from the probes).
+         "gate_launch": {}, "gate_launch_mismatch": 0}
 
 _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_marlin6.so")))
 _gemv6 = _lib.muse_marlin6_gemv
@@ -41,46 +50,24 @@ _gate_up_tma4 = getattr(_lib, "muse_marlin6_gate_up_tma4", None)
 if _gate_up_tma4 is not None:
     _gate_up_tma4.argtypes = _gemv6.argtypes
     _gate_up_tma4.restype = ctypes.c_int
-_gate_up_tma4_swiglu = getattr(_lib, "muse_marlin6_gate_up_tma4_swiglu", None)
-if _gate_up_tma4_swiglu is not None:
-    _gate_up_tma4_swiglu.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
-    _gate_up_tma4_swiglu.restype = ctypes.c_int
-_gate_up_tma4_swiglu_fp8 = getattr(_lib, "muse_marlin6_gate_up_tma4_swiglu_fp8", None)
-if _gate_up_tma4_swiglu_fp8 is not None:
-    _gate_up_tma4_swiglu_fp8.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
-    _gate_up_tma4_swiglu_fp8.restype = ctypes.c_int
-_sk_tma4_ilv_swiglu = getattr(_lib, "muse_marlin6_sk_tma4_ilv_swiglu", None)
-if _sk_tma4_ilv_swiglu is not None:
-    _sk_tma4_ilv_swiglu.argtypes = _gemv6.argtypes
-    _sk_tma4_ilv_swiglu.restype = ctypes.c_int
-_sk_tma4_ilv_swiglu_fp8 = getattr(_lib, "muse_marlin6_sk_tma4_ilv_swiglu_fp8", None)
-if _sk_tma4_ilv_swiglu_fp8 is not None:
-    _sk_tma4_ilv_swiglu_fp8.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
-    _sk_tma4_ilv_swiglu_fp8.restype = ctypes.c_int
 _sk_tma4 = getattr(_lib, "muse_marlin6_sk_tma4", None)
 if _sk_tma4 is not None:
     _sk_tma4.argtypes = _gemv6.argtypes
     _sk_tma4.restype = ctypes.c_int
-_sk_tma4_lmpost = getattr(_lib, "muse_marlin6_sk_tma4_lmpost", None)
-if _sk_tma4_lmpost is not None:
-    _sk_tma4_lmpost.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
-    _sk_tma4_lmpost.restype = ctypes.c_int
-_sk_tma4_ilv_lmpost = getattr(_lib, "muse_marlin6_sk_tma4_ilv_lmpost", None)
-if _sk_tma4_ilv_lmpost is not None:
-    _sk_tma4_ilv_lmpost.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
-    _sk_tma4_ilv_lmpost.restype = ctypes.c_int
 _sk_tma4_ilv = getattr(_lib, "muse_marlin6_sk_tma4_ilv", None)
 if _sk_tma4_ilv is not None:
     _sk_tma4_ilv.argtypes = _gemv6.argtypes
     _sk_tma4_ilv.restype = ctypes.c_int
-_sk_tma4_gated = getattr(_lib, "muse_marlin6_sk_tma4_gated", None)
-if _sk_tma4_gated is not None:
-    _sk_tma4_gated.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
-    _sk_tma4_gated.restype = ctypes.c_int
-_sk_tma4_ilv_gated = getattr(_lib, "muse_marlin6_sk_tma4_ilv_gated", None)
-if _sk_tma4_ilv_gated is not None:
-    _sk_tma4_ilv_gated.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
-    _sk_tma4_ilv_gated.restype = ctypes.c_int
+# 64-column tiles at 256 threads: same grid and schedule, 8 warps/SM instead of 4 (MUSE_LMHEAD_T256).
+_sk_tma4_t256 = getattr(_lib, "muse_marlin6_sk_tma4_t256", None)
+if _sk_tma4_t256 is not None:
+    _sk_tma4_t256.argtypes = _gemv6.argtypes
+    _sk_tma4_t256.restype = ctypes.c_int
+# Same kernels reading the weight through a row-chunked placement (chunk bases + cumulative tile offsets).
+_sk_tma4_chunked = getattr(_lib, "muse_marlin6_sk_tma4_chunked", None)
+if _sk_tma4_chunked is not None:
+    _sk_tma4_chunked.argtypes = _gemv6.argtypes + [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+    _sk_tma4_chunked.restype = ctypes.c_int
 _get_gate_blocks = getattr(_lib, "muse_marlin6_get_gate_blocks", None)
 if _get_gate_blocks is not None:
     _get_gate_blocks.argtypes = []
@@ -90,7 +77,7 @@ if _tma4_p1 is not None:
     _tma4_p1.argtypes = [
         ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
     ]
     _tma4_p1.restype = ctypes.c_int
 _tma4_p2 = getattr(_lib, "muse_tma4_pass2", None)
@@ -99,40 +86,194 @@ if _tma4_p2 is not None:
         ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
     ]
     _tma4_p2.restype = ctypes.c_int
 
 
 GATE_UP_N, GATE_UP_K = 39936, 6656
 DOWN_N, DOWN_K = 6656, 19968
-OPROJ_N, OPROJ_K = 6656, 4096
 LM_HEAD_N, LM_HEAD_K = 202048, 6656
 ATTN_ILV_SHAPES = {(4608, 6656), (6656, 4096), (4096, 6656)}
-_TMA4_SCHED_CACHE: dict[tuple[int, int, bool, bool, int, bool, torch.device], tuple] = {}
+_TMA4_SCHED_CACHE: dict[tuple[int, int, bool, bool, int, torch.device], tuple] = {}
 _DOWN_ILV_SCALES: set[int] = set()
-_LM_SPLIT2_SCALES: set[int] = set()
-_LM_SPLIT2_CACHE: dict[int, bool] = {}
-_SWIGLU_GATE_UP: dict[int, dict] = {}
-_GATED_OPROJ: set[int] = set()
-_ALL_OPROJ_GATED_READY: bool = False
-_LMPOST_BUFS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-_consume_down_swiglu = None
-_notify_gate_up_swiglu = None
-_consume_oproj_sigmoid = None
+
+
+# Stream-K CTA counts wider than the admitted 48. EMPTY BY DEFAULT: the shipping tree stays bit-exact everywhere.
+# Opt in with MUSE_SK_WIDE_BLOCKS=<n>.
+#   lm_head 202048x6656 -> 3157 column tiles = 287 x 11, i.e. 11 whole columns per CTA with slice_count == 1 (no
+#   split-K, no locks). 48 CTAs is 1 CTA/SM at 4 warps (TileN=64/Threads=128) and reaches ~225 GB/s; 287 would be 5.98
+#   waves at 4 CTAs/SM. MEASURED 11/24: NULL, -0.057 ms/tok = +6.4 bips, opposite signs across two rounds.
+# The "wider grid changes the split-K reduction grouping" caveat that used to be here is wrong in the safe direction,
+# and the measurement proves it: at 48 CTAs each CTA takes 65 whole columns (part1_mn_iters=65, part2=37), so every
+# output column's 52 k-stages are already reduced inside ONE CTA in ascending k order; at 287 it is 11 whole columns
+# the same way. Neither grid splits a column's k-chain, so widening only reassigns columns to CTAs -- it does not
+# regroup a partial sum anywhere. That is why 287 flips 5 of 1,212,288 elements at max 1 ULP (the part2 tail
+# assignment) instead of the ~45 a genuine regrouping would give, and why MUSE_SK_STRICT can never fire on a real
+# regrouping. Do not expect a numerics story from any grid change on this kernel.
+# `down` (6656x19968) has only 52 column tiles, so 52 CTAs would be 1.08 waves and the 4-CTA second wave costs more
+# than the split-K it removes. MUSE_SK_DOWN_BLOCKS=52 opts in if that turns out to be wrong.
+_SK_BLOCKS: dict[tuple[int, int], int] = {}
+_SK_BLOCK_OVERRIDE: dict[tuple[int, int], int] = {}
+# Experiment hooks: a positive value forces that CTA count; 0 uses the table above.
+_SK_WIDE_BLOCKS = int(os.environ.get("MUSE_SK_WIDE_BLOCKS", "0") or 0)
+_SK_DOWN_BLOCKS = int(os.environ.get("MUSE_SK_DOWN_BLOCKS", "0") or 0)
+# Admission runs every reference comparison on the admitted 48-CTA partition, exactly as before this change, so the
+# per-layer bitwise gates keep their original meaning. The wider runtime grid consumes the same decoded scale bytes
+# through the same MMA chain, so coding correctness carries over, and the grid change itself is validated end to end by
+# the golden hashes. It is NOT a reduction-grouping change: each column's k-chain is reduced inside one CTA at both
+# grids (see the _SK_BLOCKS comment), which is why 287 measured 5 flips at max 1 ULP rather than a regrouping's ~45.
+_ADMITTING = False
+# MUSE_SK_STRICT=1 vetoes a wider runtime grid that is not bitwise-equal to the 48-CTA partition.
+_SK_STRICT = os.environ.get("MUSE_SK_STRICT", "0").strip() not in ("", "0")
+# 64-column tiles (only lm_head 202048x6656) run 4 warps/SM at 48 CTAs, half of what the 128-column shapes get. Running
+# them at 256 threads keeps the grid, the schedule and the reduction tree identical -- so the GEMV stays bit-exact --
+# and only doubles the resident warps. Off by default until it is measured.
+_LMHEAD_T256 = os.environ.get("MUSE_LMHEAD_T256", "0").strip() not in ("", "0")
+# Per-output-tile base-pointer tables: weight data_ptr -> int64 CUDA tensor of n_tiles device addresses. Lets the
+# allocator place a 641 MiB weight in several buffers small enough to land in the fast band without changing the tile
+# index, the grid or the schedule (see set_btab).
+_BTAB: dict[int, torch.Tensor] = {}
+
+
+def _sk_blocks(n: int, k: int) -> int:
+    """CTA count for the stream-K TMA4 shapes. 48 (the admitted, bit-exact partition) unless explicitly widened."""
+    if _ADMITTING:
+        return 48
+    # The shape gates come BEFORE the override consult. They used to come after, which made them dead code
+    # whenever _SK_BLOCK_OVERRIDE held an entry for the shape: admit_tma4 writes that dict, and an ungated
+    # MUSE_SK_WIDE_BLOCKS=287 entry for `down` (6656x19968, 52 column tiles) indexed past the tile range and
+    # died at load with "NVFP4 TMA4 (6656x19968) scale admission failed: CUDA error: unspecified launch
+    # failure". With the gates first, an override can only ever apply to the shape it was written for, and
+    # MUSE_SK_DOWN_BLOCKS cannot be silently shadowed by a dict entry.
+    if (n, k) == (DOWN_N, DOWN_K):
+        return _SK_DOWN_BLOCKS if _SK_DOWN_BLOCKS > 0 else 48
+    if (n, k) != (LM_HEAD_N, LM_HEAD_K):
+        return 48
+    override = _SK_BLOCK_OVERRIDE.get((n, k))
+    if override is not None:
+        return override
+    # lm_head is the only shape with a widening candidate: 3157 column tiles = 287 x 11.
+    if _SK_WIDE_BLOCKS > 0:
+        return _SK_WIDE_BLOCKS
+    return _SK_BLOCKS.get((n, k), 48)
+
+
+def _tma4_tile_bytes(n: int, k: int) -> int:
+    """Bytes of one output column tile in the tiled decode weight: the kernel addresses tile `col` at
+    b_sh_stride * (k / 16) int4s from the buffer base (see marlin_template.h b_gl_rd)."""
+    tile_n = 128 if n % 128 == 0 else 64
+    pack_factor = 8  # NVFP4
+    b_sh_stride = ((tile_n * 16) // pack_factor) // 4
+    return b_sh_stride * (k // 16) * 16
+
+
+def set_btab(tiled_weight: torch.Tensor, n: int, k: int, chunks: list[torch.Tensor]) -> tuple:
+    """Register a row-chunked placement for a decode weight; returns (wptrs, wtiles, wchunks) device tensors.
+
+    `chunks` are consecutive tile-aligned slices of the packed weight, in order, each its own allocation. The kernel
+    reads tile `col` from `wptrs[chunk]` at `col - wtiles[chunk]`, so the tile index, the k-chain, the grid and the
+    schedule are unchanged and the GEMV stays bit-exact. Passing `[tiled_weight]` registers the identity placement,
+    which is the zero-risk way to exercise the path.
+    """
+    tile_bytes = _tma4_tile_bytes(n, k)
+    total = tiled_weight.numel() * tiled_weight.element_size()
+    if total % tile_bytes:
+        raise ValueError(f"weight is {total} B, not a whole number of {tile_bytes} B tiles")
+    n_tiles = total // tile_bytes
+    ptrs: list[int] = []
+    wtiles: list[int] = [0]
+    for c in chunks:
+        if c.data_ptr() % 16:
+            raise ValueError("chunk buffers must be 16-byte aligned")
+        cnt = c.numel() * c.element_size() // tile_bytes
+        if cnt < 1:
+            raise ValueError("empty chunk")
+        ptrs.append(int(c.data_ptr()))
+        wtiles.append(wtiles[-1] + cnt)
+    if wtiles[-1] != n_tiles:
+        raise ValueError(f"chunks cover {wtiles[-1]} tiles, weight has {n_tiles}")
+    wptrs_t = torch.tensor(ptrs, dtype=torch.int64, device=tiled_weight.device)
+    wtiles_t = torch.tensor(wtiles, dtype=torch.int32, device=tiled_weight.device)
+    entry = (wptrs_t, wtiles_t, len(ptrs))
+    _BTAB[tiled_weight.data_ptr()] = entry
+    return entry
 
 
 def _nv6_gate_blocks() -> int:
     if _get_gate_blocks is not None:
         return int(_get_gate_blocks())
-    env = os.environ.get("MUSE_NV6_GATE_BLOCKS", "")
+    return _env_gate_blocks("MUSE_NV6_GATE_BLOCKS", 24)
+
+
+# --- per-layer output_gate launch configuration (opt-in) -------------------------------------
+# The attention output_gate GEMV (4096x6656) runs beside the attention kernel on a side
+# stream. RoPE sliding-window layers run a 2-CTA attention kernel and *could* afford a wider gate
+# grid; NoPE full-attention layers run 16-32 CTAs and need those SMs back. Both classes default to
+# 24 blocks because that is the only value any measured leg has run: the one dispatch arm that
+# widened 22 RoPE-SW layers to 43 measured +2.0 bips pooled (mixed signs, inside noise), so the
+# widening is available but unearned. The block count is baked into the packed scale codes at
+# admission time, so it is recorded per layer here and re-applied before that layer's gate launch.
+# NOTE: the interleaved scale layout (muse_marlin6_sk_tma4_ilv) is only admitted for gate
+# blocks 24 or 48; 32/44/46 fall back to the plain super-block layout for the gate layer.
+_GATE_SHAPE6 = (4096, 6656)
+# The only block counts the C++ accepts (gemv6.cu:29, :61). Anything else is rejected there and
+# must be rejected loudly here too rather than becoming the default.
+_GATE_BLOCK_SET = (24, 32, 44, 46, 48)
+_ENV_GATE_WARNED: set[str] = set()
+_GATE_BLOCKS_BY_SCALES: dict[int, int] = {}
+_set_gate_blocks = getattr(_lib, "muse_marlin6_set_gate_blocks", None)
+if _set_gate_blocks is not None:
+    _set_gate_blocks.argtypes = [ctypes.c_int]
+    _set_gate_blocks.restype = ctypes.c_int
+_gate_dispatch6: bool | None = None
+
+
+def _gate_dispatch6_enabled() -> bool:
+    global _gate_dispatch6
+    if _gate_dispatch6 is None:
+        _gate_dispatch6 = os.environ.get(
+            "MUSE_GATE_ROPE_SW_DISPATCH", "0"
+        ).strip() not in ("", "0")
+    return _gate_dispatch6
+
+
+def _env_gate_blocks(name: str, default: int) -> int:
+    env = os.environ.get(name, "")
     if not env:
-        return 48
+        return default
     try:
         v = int(env)
     except ValueError:
-        return 48
-    return 24 if v in (0, 24) else (v if v in (32, 48) else 48)
+        v = None
+    if v in _GATE_BLOCK_SET:
+        return v
+    # An out-of-set pin must be named, not silently replaced by the default: the rANS arm's 43
+    # is the number someone will reach for, and 43 -> 46 would be a different grid with no log
+    # line of its own. Warn once per variable so a 28-layer load prints one line, not 28.
+    if name not in _ENV_GATE_WARNED:
+        _ENV_GATE_WARNED.add(name)
+        logger.warning(
+            "%s=%r is not one of %s; the pin did NOT take and the default %d is used instead",
+            name, env, list(_GATE_BLOCK_SET), default,
+        )
+    return default
+
+
+def _layer_gate_blocks(layer: torch.nn.Module) -> int:
+    """Gate block count for this layer: per-layer dispatch when enabled, else the env default."""
+    if not _gate_dispatch6_enabled():
+        return _nv6_gate_blocks()
+    rope_sw = getattr(layer, "_muse_rope_sw", None)
+    if rope_sw is None:
+        return _nv6_gate_blocks()
+    if rope_sw:
+        # 24, not 46: the 46 default was never exercised in any measured leg (the one dispatch arm
+        # pinned 24 to hold the NVFP4 gate fixed, and that arm measured +2.0 bips = null). So 46
+        # was an unmeasured value waiting behind a flag -- flipping the flag for any other reason
+        # would have moved 22 layers 24 -> 46 with nothing behind it. 24 is the measured default.
+        return _env_gate_blocks("MUSE_NV6_GATE_ROPE_SW_BLOCKS", 24)
+    return _env_gate_blocks("MUSE_NV6_GATE_NOPE_BLOCKS", 24)
 
 # ---------------------------------------------------------------- rANS-coded gate/up block scales
 # Symbols: the layer's palette indices of the tiled one-byte scales. One table per layer (10-bit probabilities),
@@ -160,36 +301,18 @@ def _srans_table(counts: torch.Tensor):
     counts = counts.cpu().long()
     total = int(counts.sum())
     f = torch.zeros(64, dtype=torch.long)
-    if os.environ.get("MUSE_TMA4_KL_TABLE", "1") != "0":
-        nz = [s for s in range(64) if int(counts[s]) > 0]
-        if nz:
-            for s in nz:
-                f[s] = max(1, (int(counts[s]) * SRANS_M) // total)
-            diff = SRANS_M - int(f.sum())
-            while diff > 0:
-                best_s = max(nz, key=lambda s: int(counts[s]) * math.log((int(f[s]) + 1) / int(f[s])))
-                f[best_s] += 1
-                diff -= 1
-            while diff < 0:
-                cands = [s for s in nz if int(f[s]) > 1]
-                if not cands:
-                    raise ValueError("cannot normalise the scale frequencies")
-                best_s = min(cands, key=lambda s: int(counts[s]) * math.log(int(f[s]) / (int(f[s]) - 1)))
-                f[best_s] -= 1
-                diff += 1
-    else:
-        for s in range(64):
-            c = int(counts[s])
-            if c:
-                f[s] = max(1, round(c * SRANS_M / total))
-        diff = SRANS_M - int(f.sum())
-        while diff:
-            k = int(torch.argmax(f))
-            step = diff if diff > 0 else max(diff, -(int(f[k]) - 1))
-            if step == 0:
-                raise ValueError("cannot normalise the scale frequencies")
-            f[k] += step
-            diff -= step
+    for s in range(64):
+        c = int(counts[s])
+        if c:
+            f[s] = max(1, round(c * SRANS_M / total))
+    diff = SRANS_M - int(f.sum())
+    while diff:
+        k = int(torch.argmax(f))
+        step = diff if diff > 0 else max(diff, -(int(f[k]) - 1))
+        if step == 0:
+            raise ValueError("cannot normalise the scale frequencies")
+        f[k] += step
+        diff -= step
     cum = torch.cumsum(f, 0) - f
     lut = torch.zeros(SRANS_M, dtype=torch.long)
     for s in range(64):
@@ -211,22 +334,6 @@ def is_tma4_ilv(scales: torch.Tensor) -> bool:
     return is_tma4(scales) and scales.data_ptr() in _DOWN_ILV_SCALES
 
 
-def is_lm_split2(scales: torch.Tensor) -> bool:
-    ptr = scales.data_ptr()
-    if ptr in _LM_SPLIT2_SCALES:
-        return True
-    cached = _LM_SPLIT2_CACHE.get(ptr)
-    if cached is not None:
-        return cached
-    if not is_tma4_ilv(scales) or scales.numel() < 4112 or torch.cuda.is_current_stream_capturing():
-        return False
-    res = int(scales.reshape(-1)[4100:4104].view(torch.int32).item()) == 96
-    _LM_SPLIT2_CACHE[ptr] = res
-    if res:
-        _LM_SPLIT2_SCALES.add(ptr)
-    return res
-
-
 def _get_tma4_sched(
     n: int,
     k: int,
@@ -235,14 +342,25 @@ def _get_tma4_sched(
     *,
     gate_v48: bool = False,
     gate_blocks: int = 48,
-    split2: bool = False,
 ):
-    key = (n, k, fixed_grid, gate_v48, gate_blocks, split2, device)
+    tile_n = 128 if n % 128 == 0 else 64
+    # A 64-column tile is the only shape that runs at 128 threads today (lm_head 202048x6656, 4 warps/SM at 48 CTAs).
+    # MUSE_LMHEAD_T256 doubles the resident warps without touching the grid or the schedule.
+    threads = 256 if (tile_n == 128 or _LMHEAD_T256) else 128
+    # The block count has to be resolved BEFORE the cache key and carried in it. _sk_blocks depends on mutable
+    # state (_ADMITTING, _SK_BLOCK_OVERRIDE, _SK_WIDE_BLOCKS), so two calls with identical arguments can legitimately
+    # need different schedules: without this, re-encoding lm_head at the wide grid after admission hit the cached
+    # 48-block entry, unpacked num_blks=48 from it, and silently rebuilt the 48-block buffer.
+    if fixed_grid:
+        num_blks = 336
+    elif gate_v48:
+        num_blks = gate_blocks
+    else:
+        num_blks = gate_blocks if (n, k) == (4096, 6656) else _sk_blocks(n, k)
+    key = (n, k, fixed_grid, gate_v48, gate_blocks, num_blks, device)
     cached = _TMA4_SCHED_CACHE.get(key)
     if cached is not None:
         return cached
-    tile_n = 128 if n % 128 == 0 else 64
-    threads = 256 if tile_n == 128 else 128
     n_tiles = n // tile_n
     k_tiles = k // 128
     stages: list[tuple[int, int]] = []
@@ -250,7 +368,6 @@ def _get_tma4_sched(
     blk_sb_off = [0]
     blk_iters = []
     if fixed_grid:
-        num_blks = 336
         for col in range(288):
             for kt in range(52):
                 stages.append((col, kt))
@@ -270,7 +387,6 @@ def _get_tma4_sched(
             blk_iters.append(26)
             blk_sb_off.append(blk_sb_off[-1] + (26 + 3) // 4)
     elif gate_v48:
-        num_blks = gate_blocks
         vgrid = 48
         iters = (k_tiles * n_tiles + vgrid - 1) // vgrid
         total_p2 = n_tiles * k_tiles
@@ -287,46 +403,7 @@ def _get_tma4_sched(
             it = len(stages) - s_start
             blk_iters.append(it)
             blk_sb_off.append(blk_sb_off[-1] + (it + 3) // 4)
-    elif split2:
-        vgrid = 48
-        num_blks = 96
-        part2_mn_tiles = n_tiles
-        part1_mn_iters = 0
-        if n_tiles > vgrid:
-            part2_mn_tiles = n_tiles % vgrid
-            if part2_mn_tiles * 3 <= vgrid:
-                part2_mn_tiles += vgrid
-            part1_mn_iters = (n_tiles - part2_mn_tiles) // vgrid
-        lo_p1 = (part1_mn_iters + 1) // 2
-        iters = (k_tiles * part2_mn_tiles + vgrid - 1) // vgrid
-        base_col = n_tiles - part2_mn_tiles
-        total_p2 = part2_mn_tiles * k_tiles
-        for b in range(vgrid):
-            s_start = len(stages)
-            for p in range(lo_p1):
-                col = b + p * vgrid
-                for kt in range(k_tiles):
-                    stages.append((col, kt))
-            blk_off.append(len(stages))
-            it = len(stages) - s_start
-            blk_iters.append(it)
-            blk_sb_off.append(blk_sb_off[-1] + (it + 3) // 4)
-        for b in range(vgrid):
-            s_start = len(stages)
-            for p in range(lo_p1, part1_mn_iters):
-                col = b + p * vgrid
-                for kt in range(k_tiles):
-                    stages.append((col, kt))
-            p2_start = iters * b
-            p2_end = min(iters * (b + 1), total_p2)
-            for pos in range(p2_start, p2_end):
-                stages.append((base_col + pos // k_tiles, pos % k_tiles))
-            blk_off.append(len(stages))
-            it = len(stages) - s_start
-            blk_iters.append(it)
-            blk_sb_off.append(blk_sb_off[-1] + (it + 3) // 4)
     else:
-        num_blks = 48
         part2_mn_tiles = n_tiles
         part1_mn_iters = 0
         if n_tiles > num_blks:
@@ -396,13 +473,10 @@ def _get_tma4_sched(
     return res
 
 
-def _build_ilv_weight(
-    w: torch.Tensor, n: int, k: int, gate_v48: bool, gate_blocks: int, split2: bool = False
-) -> torch.Tensor:
-    tile_n = 128 if n % 128 == 0 else 64
+def _build_ilv_weight(w: torch.Tensor, n: int, k: int, gate_v48: bool, gate_blocks: int) -> torch.Tensor:
     k_tiles = k // 128
     *_, num_blks, _, _, _, stages, blk_off, blk_iters = _get_tma4_sched(
-        n, k, False, w.device, gate_v48=gate_v48, gate_blocks=gate_blocks, split2=split2
+        n, k, False, w.device, gate_v48=gate_v48, gate_blocks=gate_blocks
     )
     max_it = max(blk_iters)
     perm = []
@@ -411,32 +485,9 @@ def _build_ilv_weight(
             if s < blk_iters[b]:
                 col, kt = stages[blk_off[b] + s]
                 perm.append(col * k_tiles + kt)
-    assert len(perm) == (n // tile_n) * k_tiles
+    assert len(perm) == (n // 128) * k_tiles
     idx_t = torch.tensor(perm, dtype=torch.long, device=w.device)
     return w.reshape(len(perm), -1).index_select(0, idx_t).contiguous().view_as(w)
-
-
-def _unbuild_ilv_weight(
-    w_ilv: torch.Tensor, n: int, k: int, gate_v48: bool = False, gate_blocks: int = 48, split2: bool = False
-) -> torch.Tensor:
-    tile_n = 128 if n % 128 == 0 else 64
-    k_tiles = k // 128
-    *_, num_blks, _, _, _, stages, blk_off, blk_iters = _get_tma4_sched(
-        n, k, False, w_ilv.device, gate_v48=gate_v48, gate_blocks=gate_blocks, split2=split2
-    )
-    max_it = max(blk_iters)
-    perm = []
-    for s in range(max_it):
-        for b in range(num_blks):
-            if s < blk_iters[b]:
-                col, kt = stages[blk_off[b] + s]
-                perm.append(col * k_tiles + kt)
-    assert len(perm) == (n // tile_n) * k_tiles
-    inv = [0] * len(perm)
-    for dst_i, src_i in enumerate(perm):
-        inv[src_i] = dst_i
-    idx_t = torch.tensor(inv, dtype=torch.long, device=w_ilv.device)
-    return w_ilv.reshape(len(perm), -1).index_select(0, idx_t).contiguous().view_as(w_ilv)
 
 
 def encode_tma4_scales(
@@ -448,7 +499,6 @@ def encode_tma4_scales(
     *,
     gate_v48: bool = False,
     gate_blocks: int = 48,
-    split2: bool = False,
 ) -> torch.Tensor:
     """Encode tiled one-byte scales into wave/stage-interleaved 4-stage TMA super-block rANS streams (shape (rows, 32) uint8)."""
     if _tma4_p1 is None or _tma4_p2 is None:
@@ -473,16 +523,18 @@ def encode_tma4_scales(
     (
         stage_col_k, blk_stage_off, blk_sb_off, sb_gsb_map,
         blk_iters, sb_row_off, num_blks, threads, total_sbs, max_sbs, *_
-    ) = _get_tma4_sched(n, k, fixed_grid, dev, gate_v48=gate_v48, gate_blocks=gate_blocks, split2=split2)
+    ) = _get_tma4_sched(n, k, fixed_grid, dev, gate_v48=gate_v48, gate_blocks=gate_blocks)
     warps = threads // 32
-    rans_cap = 3200 if threads == 256 else 2048
+    # The super-block byte budget follows the tile geometry, not the thread count (a 64-column super-block is 4 x 512
+    # raw scale bytes, a 128-column one 4 x 1024), and marlin_template.h derives RANS_CAP the same way.
+    rans_cap = 3200 if tile_n == 128 else 2048
     sb_wc = torch.empty(total_sbs * warps, dtype=torch.int32, device=dev)
     with torch.cuda.device(dev):
         stream = torch.cuda.current_stream().cuda_stream
         st = _tma4_p1(
             sym.data_ptr(), k_tiles, stage_col_k.data_ptr(), blk_stage_off.data_ptr(),
             blk_sb_off.data_ptr(), sb_gsb_map.data_ptr(), enc_f.data_ptr(), enc_c.data_ptr(),
-            sb_wc.data_ptr(), num_blks, threads, stream,
+            sb_wc.data_ptr(), num_blks, threads, stage_bytes, stream,
         )
         if st:
             raise RuntimeError(f"muse_tma4_pass1 failed with CUDA error {st}")
@@ -522,7 +574,7 @@ def encode_tma4_scales(
             sym.data_ptr(), k_tiles, stage_col_k.data_ptr(), blk_stage_off.data_ptr(),
             blk_sb_off.data_ptr(), sb_gsb_map.data_ptr(), enc_f.data_ptr(), enc_c.data_ptr(),
             sb_wc.data_ptr(), off16.data_ptr(), bp + states_off, bp + var_off,
-            num_blks, threads, stream,
+            num_blks, threads, stage_bytes, stream,
         )
         if st:
             raise RuntimeError(f"muse_tma4_pass2 failed with CUDA error {st}")
@@ -723,73 +775,50 @@ def decode_linear6(
 ) -> torch.Tensor:
     if not STATS["logged"]:
         STATS["logged"] = True
-        logger.info("NVFP4 decode GEMV with 6-bit block scales: %d layers, %d kept uncompressed",
-                    STATS["admitted"], STATS["kept"])
-    if _consume_down_swiglu is not None and not fixed_grid and (n, k) == (DOWN_N, DOWN_K) and x.numel() == k:
-        x_sw = _consume_down_swiglu(x, global_scale.data_ptr())
-        if x_sw is not None:
-            x = x_sw
-    if (
-        _consume_oproj_sigmoid is not None
-        and not fixed_grid
-        and (n, k) == (OPROJ_N, OPROJ_K)
-        and x.numel() == k
-        and global_scale.data_ptr() in _GATED_OPROJ
-        and is_tma4(scales6)
-    ):
-        op_res = _consume_oproj_sigmoid(
-            x, global_scale.data_ptr(), tiled_weight, scales6, palette, global_scale, workspace
-        )
-        if op_res is not None:
-            return op_res
+        # Report the output_gate block count, because it is resolved in C++ from
+        # MUSE_NV6_GATE_BLOCKS (gemv6.cu:22) and appears nowhere else in either log. Without this,
+        # a leg cannot show that the knob took: the number is not in the pack lines (unlike the
+        # rANS gate, whose wpb is), and there is no other admission line for it.
+        _gb_note = ""
+        try:
+            if _gate_dispatch6_enabled():
+                # Both defaults are 24 and must be read from the same place _layer_gate_blocks
+                # reads them, or this line reports a grid the launch does not use.
+                _gb_note = ", output_gate on %d blocks (RoPE sliding-window) / %d blocks (NoPE full attention), per-layer dispatch" % (
+                    _env_gate_blocks("MUSE_NV6_GATE_ROPE_SW_BLOCKS", 24),
+                    _env_gate_blocks("MUSE_NV6_GATE_NOPE_BLOCKS", 24),
+                )
+            else:
+                _gb = _nv6_gate_blocks()
+                # The block count alone does not identify the instantiation: gemv6.cu:74-82 selects
+                # GateV48=true only for gb == 24, so "24 blocks with GateV48=false" is a third state
+                # that no env value can produce -- it is what a stale overlay or a changed guard
+                # would give you. Print the instantiation the kernel will actually take, derived by
+                # the same rule as is_gate_v48 at :1075, so the arm cannot be "verified" by the
+                # block count alone.
+                _gb_note = ", output_gate on %d blocks, GateV48=%s" % (
+                    _gb, "true" if _gb == 24 else "false"
+                )
+        except Exception:  # noqa: BLE001 - a log line must never fail the load
+            # NOT empty: an empty suffix makes the line indistinguishable from the pre-change
+            # format, so a stale overlay and a failed probe both read as "the knob did not take".
+            # A tell that can silently vanish is not a tell.
+            _gb_note = ", output_gate on ? blocks (probe failed)"
+        logger.info("NVFP4 decode GEMV with 6-bit block scales: %d layers, %d kept uncompressed%s",
+                    STATS["admitted"], STATS["kept"], _gb_note)
     if not x.is_contiguous() or x.data_ptr() % 16:
         x = x.clone(memory_format=torch.contiguous_format)
-    blocks = 96 if (n, k) == (LM_HEAD_N, LM_HEAD_K) and is_lm_split2(scales6) else 48
+    output = x.new_empty((*x.shape[:-1], n))
+    # One grid for every kernel that can serve this shape, so the per-layer bitwise admission compares the coded
+    # scales against the six-bit scales *under the same schedule* (see _sk_blocks). Shapes outside _SK_BLOCKS get
+    # their admitted 48 CTAs.
+    blocks = _sk_blocks(n, k)
     tile_n = 128 if n % 128 == 0 else 64
     partials = x.new_empty((blocks, 16, tile_n), dtype=torch.float32)
     with torch.cuda.device(x.device):
         use_grid = fixed_grid and _gate_up is not None and x.numel() == k and (n, k) == (39936, 6656)
-        sw_entry = (
-            _SWIGLU_GATE_UP.get(global_scale.data_ptr())
-            if (x.numel() == k and (n, k) == (39936, 6656) and _notify_gate_up_swiglu is not None and is_tma4(scales6))
-            else None
-        )
-        if sw_entry is not None and sw_entry["state"] == "admitted":
-            out_buf = sw_entry["swiglu_out"]
-            st_stream = torch.cuda.current_stream().cuda_stream
-            if sw_entry.get("is_fp8", False):
-                fp8_buf = sw_entry["swiglu_fp8_out"]
-                fp8_sc_ptr = sw_entry["fp8_scale_ptr"]
-                if sw_entry["is_ilv"]:
-                    status = _sk_tma4_ilv_swiglu_fp8(
-                        x.data_ptr(), tiled_weight.data_ptr(), out_buf.data_ptr(), partials.data_ptr(),
-                        scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
-                        fp8_sc_ptr, fp8_buf.data_ptr(), n, k, 48, x.device.index, st_stream,
-                    )
-                else:
-                    status = _gate_up_tma4_swiglu_fp8(
-                        x.data_ptr(), tiled_weight.data_ptr(), out_buf.data_ptr(), partials.data_ptr(),
-                        scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
-                        fp8_sc_ptr, fp8_buf.data_ptr(), n, k, 48, x.device.index, st_stream,
-                    )
-            elif sw_entry["is_ilv"]:
-                status = _sk_tma4_ilv_swiglu(
-                    x.data_ptr(), tiled_weight.data_ptr(), out_buf.data_ptr(), partials.data_ptr(),
-                    scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
-                    n, k, 48, x.device.index, st_stream,
-                )
-            else:
-                status = _gate_up_tma4_swiglu(
-                    x.data_ptr(), tiled_weight.data_ptr(), out_buf.data_ptr(), partials.data_ptr(),
-                    scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
-                    0, n, k, 48, x.device.index, st_stream,
-                )
-            if status:
-                raise RuntimeError(f"SM121 Marlin gate_up SwiGLU launch failed with CUDA error {status}")
-            _notify_gate_up_swiglu(out_buf.data_ptr(), sw_entry, True, None)
-            return out_buf
-        output = x.new_empty((*x.shape[:-1], n))
         kernel = _gate_up if use_grid else _gemv6
+        extra: tuple = ()
         if is_tma4_ilv(scales6):
             if x.numel() == k and _sk_tma4_ilv is not None:
                 kernel = _sk_tma4_ilv
@@ -798,8 +827,19 @@ def decode_linear6(
         elif is_tma4(scales6):
             if use_grid and _gate_up_tma4 is not None:
                 kernel = _gate_up_tma4
-            elif not fixed_grid and x.numel() == k and _sk_tma4 is not None:
-                kernel = _sk_tma4
+            elif not fixed_grid and x.numel() == k:
+                chunked = _BTAB.get(tiled_weight.data_ptr())
+                if chunked is not None and _sk_tma4_chunked is not None:
+                    # Row-chunked placement: the kernel reads each tile from its own buffer. Same tile index, same
+                    # k-chain, same grid -- bit-exact.
+                    kernel = _sk_tma4_chunked
+                    extra = (chunked[0].data_ptr(), chunked[1].data_ptr(), int(chunked[2]))
+                elif _LMHEAD_T256 and tile_n == 64 and _sk_tma4_t256 is not None:
+                    kernel = _sk_tma4_t256
+                elif _sk_tma4 is not None:
+                    kernel = _sk_tma4
+                else:
+                    raise RuntimeError(f"TMA4 rANS scales unsupported for shape ({n}, {k}, fixed={fixed_grid})")
             else:
                 raise RuntimeError(f"TMA4 rANS scales unsupported for shape ({n}, {k}, fixed={fixed_grid})")
         elif is_gate_up_srans(scales6) and (n, k) == (DOWN_N, DOWN_K):
@@ -812,513 +852,19 @@ def decode_linear6(
             if not use_grid or _gate_up_srans is None:
                 raise RuntimeError("rANS-coded gate/up scales outside the one-row fixed grid")
             kernel = _gate_up_srans
+        if _GATE_BLOCKS_BY_SCALES and (n, k) == _GATE_SHAPE6:
+            # Per-layer gate grid: the packed scale codes were built for this block count.
+            gb = _GATE_BLOCKS_BY_SCALES.get(scales6.data_ptr())
+            if gb is not None and _set_gate_blocks is not None:
+                _set_gate_blocks(gb)
         status = kernel(
             x.data_ptr(), tiled_weight.data_ptr(), output.data_ptr(), partials.data_ptr(),
             scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(), n, k, blocks,
-            x.device.index, torch.cuda.current_stream().cuda_stream,
+            x.device.index, torch.cuda.current_stream().cuda_stream, *extra,
         )
     if status:
         raise RuntimeError(f"SM121 Marlin GEMV (scale6) launch failed with CUDA error {status}")
-    if sw_entry is not None and sw_entry["state"] == "prechecked" and not torch.cuda.is_current_stream_capturing():
-        _notify_gate_up_swiglu(
-            output.data_ptr(),
-            sw_entry,
-            False,
-            (x, tiled_weight, scales6, palette, global_scale, workspace, partials),
-        )
     return output
-
-
-def _get_lmpost_bufs(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    idx = dev.index if dev.index is not None else torch.cuda.current_device()
-    bufs = _LMPOST_BUFS.get(idx)
-    if bufs is None:
-        bufs = (
-            torch.zeros(256, dtype=torch.int64, device=dev),
-            torch.empty((96, 16, 64), dtype=torch.float32, device=dev),
-        )
-        _LMPOST_BUFS[idx] = bufs
-    return bufs
-
-
-def launch_lmhead_lmpost6(
-    x: torch.Tensor,
-    layer: torch.nn.Module,
-    lut: torch.Tensor,
-    out_token: torch.Tensor,
-    org_vocab_size: int,
-) -> bool:
-    s6 = getattr(layer, "_marlin_decode_scales6", None)
-    if (
-        s6 is None
-        or not x.is_contiguous()
-        or x.data_ptr() % 16 != 0
-        or x.shape != (1, layer.input_size_per_partition)
-        or out_token.shape != (1, 1)
-        or out_token.dtype != torch.int64
-    ):
-        return False
-    is_ilv = is_tma4_ilv(s6)
-    fn = _sk_tma4_ilv_lmpost if is_ilv else _sk_tma4_lmpost
-    if fn is None:
-        return False
-    n, k = layer.output_size_per_partition, layer.input_size_per_partition
-    blocks = 96 if (is_ilv and is_lm_split2(s6)) else 48
-    scratch, partials = _get_lmpost_bufs(x.device)
-    with torch.cuda.device(x.device):
-        rc = fn(
-            x.data_ptr(),
-            layer._marlin_decode_weight.data_ptr(),
-            scratch.data_ptr(),
-            partials.data_ptr(),
-            s6.data_ptr(),
-            layer._marlin_decode_palette.data_ptr(),
-            layer.weight_global_scale.data_ptr(),
-            layer.workspace.data_ptr(),
-            lut.data_ptr(),
-            out_token.data_ptr(),
-            int(org_vocab_size),
-            n,
-            k,
-            blocks,
-            x.device.index,
-            torch.cuda.current_stream().cuda_stream,
-        )
-    if rc:
-        raise RuntimeError(f"muse_marlin6_sk_tma4_lmpost failed with CUDA error {rc}")
-    return True
-
-
-def admit_tma4_lmpost(
-    layer: torch.nn.Module,
-    lut: torch.Tensor,
-    org_vocab_size: int,
-    lmpost_argmax,
-    mult: float,
-    cap: float | None,
-) -> bool:
-    if os.environ.get("MUSE_FUSE_LMHEAD_LMPOST", "1") == "0":
-        return False
-    scales6 = getattr(layer, "_marlin_decode_scales6", None)
-    if (
-        scales6 is None
-        or getattr(layer, "_marlin_decode_weight", None) is None
-        or getattr(layer, "_marlin_decode_palette", None) is None
-        or getattr(layer, "marlin_decode6_fixed_grid", False)
-        or not is_tma4(scales6)
-    ):
-        return False
-    is_ilv = is_tma4_ilv(scales6)
-    if (is_ilv and _sk_tma4_ilv_lmpost is None) or (not is_ilv and _sk_tma4_lmpost is None):
-        return False
-    n, k = layer.output_size_per_partition, layer.input_size_per_partition
-    if k % 128 != 0 or n % 128 == 0 or n % 64 != 0 or not (0 < org_vocab_size <= n):
-        return False
-    dev = scales6.device
-    scratch, _ = _get_lmpost_bufs(dev)
-    gen = torch.Generator(device=dev).manual_seed(20261125)
-    out_tok = torch.empty((1, 1), dtype=torch.int64, device=dev)
-    for mag in (0.01, 0.5, 2.0, 32.0):
-        x = (torch.randn((1, k), generator=gen, device=dev) * mag).to(torch.bfloat16).contiguous()
-        raw = decode_linear6(
-            x, layer._marlin_decode_weight, scales6, layer._marlin_decode_palette,
-            layer.weight_global_scale, layer.workspace, n, k, False,
-        )
-        if org_vocab_size < n:
-            raw = raw[:, :org_vocab_size].contiguous()
-        ref = lmpost_argmax(raw, mult, cap)
-        out_tok.fill_(-1)
-        if not launch_lmhead_lmpost6(x, layer, lut, out_tok, org_vocab_size):
-            return False
-        torch.cuda.synchronize(dev)
-        if (
-            ref is None
-            or not torch.equal(out_tok, ref)
-            or int(torch.count_nonzero(layer.workspace).item()) != 0
-            or int(scratch.view(torch.int32)[256].item()) != 0
-        ):
-            logger.warning("Fused lm_head+lmpost self-check mismatch; keeping 2-kernel path")
-            return False
-    layer.marlin_decode6_lmpost_admitted = True
-    logger.info(
-        "Fused lm_head+lmpost decode6 kernel admitted bitwise (n=%d, vocab=%d, k=%d, ilv=%s, split2=%s)",
-        n, org_vocab_size, k, is_ilv, is_lm_split2(scales6),
-    )
-    return True
-
-
-def _pair_gate_up_tensors(w_raw: torch.Tensor, s_raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Repack [312, 416, 256] int32 weights and [312, 416, 128] uint8 scales so part-1 tiles 0..263
-    pair 64 gate + 64 up cols in shared memory, part-1 tiles 264..287 hold pure full-K gate cols
-    16896..19967, and part-2 tiles 288..311 hold pure split-K up cols 16896..19967."""
-    w_head = (
-        torch.stack((w_raw[:132], w_raw[156:288]), dim=0)
-        .view(2, 132, 416, 2, 128)
-        .permute(1, 3, 2, 0, 4)
-        .reshape(264, 416, 256)
-    )
-    s_head = (
-        torch.stack((s_raw[:132], s_raw[156:288]), dim=0)
-        .view(2, 132, 416, 2, 64)
-        .permute(1, 3, 2, 0, 4)
-        .reshape(264, 416, 128)
-    )
-    w_p = torch.cat((w_head, w_raw[132:156], w_raw[288:312]), dim=0).contiguous()
-    s_p = torch.cat((s_head, s_raw[132:156], s_raw[288:312]), dim=0).contiguous()
-    return w_p, s_p
-
-
-def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
-    if os.environ.get("MUSE_GATE_UP_SWIGLU", "1") == "0":
-        return 0
-    want_fp8 = os.environ.get("MUSE_GATE_UP_SWIGLU_FP8", "0") != "0"
-    try:
-        import muse_norm_glue as _ng
-        if _ng.lib() is None or not hasattr(_ng, "mul_silu_slice_bf16"):
-            return 0
-    except Exception:
-        return 0
-    try:
-        import muse_rans_ext as _rans
-        if not hasattr(_rans, "rans_gemv_auto") or not hasattr(_rans, "rans_gemv_fused_auto"):
-            _rans = None
-    except Exception:
-        _rans = None
-    inner = getattr(model, "model", None)
-    layers = getattr(inner, "layers", None)
-    if layers is None:
-        return 0
-    count_bf16 = 0
-    count_fp8 = 0
-    for lyr in layers:
-        mlp = getattr(lyr, "mlp", None)
-        gu = getattr(mlp, "gate_up_proj", None)
-        dn = getattr(mlp, "down_proj", None)
-        if gu is None or dn is None:
-            continue
-        s6 = getattr(gu, "_marlin_decode_scales6", None)
-        s_raw = getattr(gu, "_marlin_decode_scales", None)
-        w = getattr(gu, "_marlin_decode_weight", None)
-        pal = getattr(gu, "_marlin_decode_palette", None)
-        ws = getattr(gu, "workspace", None)
-        if (
-            s6 is None or s_raw is None or w is None or pal is None
-            or ws is None or ws.numel() < 48
-            or not is_tma4(s6)
-            or (gu.output_size_per_partition, gu.input_size_per_partition) != (GATE_UP_N, GATE_UP_K)
-            or (dn.output_size_per_partition, dn.input_size_per_partition) != (DOWN_N, DOWN_K)
-        ):
-            continue
-        dn_is_nvfp4 = getattr(dn, "_marlin_decode_scales6", None) is not None
-        dn_packed = getattr(dn, "muse_fp8_packed", None)
-        dn_in_sc = getattr(dn, "input_scale", None)
-        dn_w_sc = getattr(dn, "weight_scale", None)
-        is_fp8 = False
-        if not dn_is_nvfp4:
-            if (
-                not want_fp8
-                or _rans is None
-                or dn_packed is None or not dn_packed.is_cuda or dn_packed.dtype != torch.uint8
-                or dn_packed.numel() == 0 or dn_packed.numel() == DOWN_N * DOWN_K
-                or dn_in_sc is None or not dn_in_sc.is_cuda or dn_in_sc.dtype != torch.float32 or dn_in_sc.numel() != 1
-                or dn_w_sc is None or not dn_w_sc.is_cuda or dn_w_sc.dtype != torch.float32 or dn_w_sc.numel() not in (1, DOWN_N)
-            ):
-                continue
-            is_fp8 = True
-        is_ilv = is_tma4_ilv(s6)
-        is_fg = bool(getattr(gu, "marlin_decode6_fixed_grid", False))
-        if is_ilv:
-            if (is_fp8 and _sk_tma4_ilv_swiglu_fp8 is None) or (not is_fp8 and _sk_tma4_ilv_swiglu is None):
-                continue
-        elif is_fg:
-            if (is_fp8 and _gate_up_tma4_swiglu_fp8 is None) or (not is_fp8 and _gate_up_tma4_swiglu is None):
-                continue
-        else:
-            continue
-        gs_key = gu.weight_global_scale.data_ptr()
-        if gs_key in _SWIGLU_GATE_UP:
-            continue
-        dev = s6.device
-        gen = torch.Generator(device=dev).manual_seed(20261126 + count_bf16 + count_fp8)
-        probes = []
-        for mag, shift in ((0.05, 0.01), (0.8, -0.15), (3.0, 0.4), (16.0, 0.0)):
-            xp = torch.randn((1, GATE_UP_K), generator=gen, device=dev) * mag + shift
-            probes.append(xp.to(torch.bfloat16).contiguous())
-        xp_ht = torch.randn((1, GATE_UP_K), generator=gen, device=dev) * torch.exp(
-            torch.randn((1, GATE_UP_K), generator=gen, device=dev) * 0.75
-        )
-        probes.append(xp_ht.to(torch.bfloat16).contiguous())
-        xp_canc = torch.randn((1, GATE_UP_K), generator=gen, device=dev) * 2.0
-        xp_canc[:, 1::2] = -xp_canc[:, ::2]
-        probes.append(xp_canc.to(torch.bfloat16).contiguous())
-        # Compute exact 0-ULP reference outputs BEFORE modifying buffers
-        refs = []
-        with torch.cuda.device(dev):
-            stream = torch.cuda.current_stream().cuda_stream
-            for xp in probes:
-                gu_ref = decode_linear6(
-                    xp, w, s6, pal, gu.weight_global_scale, gu.workspace, GATE_UP_N, GATE_UP_K, is_fg
-                )
-                if is_fp8:
-                    dn_ref = torch.empty((1, DOWN_N), dtype=torch.bfloat16, device=dev)
-                    _rans.rans_gemv_fused_auto(
-                        dn_packed, gu_ref.view(-1), gu_ref.view(-1),
-                        dn_w_sc.reshape(-1), dn_in_sc.reshape(-1), dn_ref, DOWN_N, DOWN_K, 2,
-                    )
-                    refs.append(dn_ref)
-                else:
-                    sw_ref = torch.empty((1, DOWN_K), dtype=torch.bfloat16, device=dev)
-                    _ng.mul_silu_slice_bf16(gu_ref, sw_ref, 1, stream)
-                    refs.append(sw_ref)
-            torch.cuda.synchronize(dev)
-
-        w_unilv = _unbuild_ilv_weight(w, GATE_UP_N, GATE_UP_K) if is_ilv else w
-        w_p, s_p = _pair_gate_up_tensors(w_unilv, s_raw)
-        del w_unilv
-        try:
-            s6_p = encode_tma4_scales(s_p, pal, GATE_UP_N, GATE_UP_K, not is_ilv)
-        except Exception:
-            continue
-        if is_ilv:
-            w_p = _build_ilv_weight(w_p, GATE_UP_N, GATE_UP_K, False, 48)
-
-        swiglu_out = torch.empty((1, GATE_UP_N), dtype=torch.bfloat16, device=dev)
-        swiglu_fp8_out = torch.empty((1, DOWN_K), dtype=torch.float8_e4m3fn, device=dev) if is_fp8 else None
-        partials = torch.empty((48, 16, 128), dtype=torch.float32, device=dev)
-        ok = True
-        with torch.cuda.device(dev):
-            stream = torch.cuda.current_stream().cuda_stream
-            for xp, ref_t in zip(probes, refs):
-                swiglu_out.zero_()
-                if is_fp8:
-                    swiglu_fp8_out.zero_()
-                    fn_fp8 = _sk_tma4_ilv_swiglu_fp8 if is_ilv else _gate_up_tma4_swiglu_fp8
-                    rc = fn_fp8(
-                        xp.data_ptr(), w_p.data_ptr(), swiglu_out.data_ptr(), partials.data_ptr(),
-                        s6_p.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
-                        gu.workspace.data_ptr(), dn_in_sc.data_ptr(), swiglu_fp8_out.data_ptr(),
-                        GATE_UP_N, GATE_UP_K, 48, dev.index, stream,
-                    )
-                    dn_got = torch.empty((1, DOWN_N), dtype=torch.bfloat16, device=dev)
-                    _rans.rans_gemv_auto(
-                        dn_packed, swiglu_fp8_out.view(-1), dn_w_sc.reshape(-1), dn_in_sc.reshape(-1),
-                        dn_got, DOWN_N, DOWN_K,
-                    )
-                    torch.cuda.synchronize(dev)
-                    cmp_ok = torch.equal(dn_got.view(torch.int16), ref_t.view(torch.int16))
-                else:
-                    if is_ilv:
-                        rc = _sk_tma4_ilv_swiglu(
-                            xp.data_ptr(), w_p.data_ptr(), swiglu_out.data_ptr(), partials.data_ptr(),
-                            s6_p.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
-                            gu.workspace.data_ptr(), GATE_UP_N, GATE_UP_K, 48, dev.index, stream,
-                        )
-                    else:
-                        rc = _gate_up_tma4_swiglu(
-                            xp.data_ptr(), w_p.data_ptr(), swiglu_out.data_ptr(), partials.data_ptr(),
-                            s6_p.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
-                            gu.workspace.data_ptr(), 0, GATE_UP_N, GATE_UP_K, 48, dev.index, stream,
-                        )
-                    torch.cuda.synchronize(dev)
-                    cmp_ok = torch.equal(swiglu_out[:, :DOWN_K].view(torch.int16), ref_t.view(torch.int16))
-                if rc != 0 or int(torch.count_nonzero(gu.workspace).item()) != 0 or not cmp_ok:
-                    ok = False
-                    break
-        if not ok:
-            continue
-        # Commit paired weights IN-PLACE into placed fast DRAM buffer (keeps w.data_ptr()!)
-        w_backup = w.detach().clone()
-        s6_backup = s6.detach().clone()
-        w.copy_(w_p)
-        del w_p
-        s6_buf = s6._base if (s6._base is not None and s6._base.data_ptr() == s6.data_ptr()) else s6
-        if s6_buf.is_contiguous() and s6_buf.numel() >= s6_p.numel():
-            if is_ilv:
-                _DOWN_ILV_SCALES.discard(s6.data_ptr())
-            s6_flat = s6_buf.view(-1)
-            s6_flat[: s6_p.numel()].copy_(s6_p.view(-1))
-            s6_new = s6_flat[: s6_p.numel()].view(-1, 32)
-            reused_s6 = True
-        else:
-            if is_ilv:
-                _DOWN_ILV_SCALES.discard(s6.data_ptr())
-            s6_new = s6_p
-            reused_s6 = False
-        if is_ilv:
-            _DOWN_ILV_SCALES.add(s6_new.data_ptr())
-        gu.register_buffer("_marlin_decode_scales6", s6_new, persistent=False)
-        # Re-verify in-place buffer bitwise on probe 0!
-        swiglu_out.zero_()
-        with torch.cuda.device(dev):
-            stream = torch.cuda.current_stream().cuda_stream
-            if is_fp8:
-                swiglu_fp8_out.zero_()
-                fn_fp8 = _sk_tma4_ilv_swiglu_fp8 if is_ilv else _gate_up_tma4_swiglu_fp8
-                rc = fn_fp8(
-                    probes[0].data_ptr(), w.data_ptr(), swiglu_out.data_ptr(), partials.data_ptr(),
-                    s6_new.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
-                    gu.workspace.data_ptr(), dn_in_sc.data_ptr(), swiglu_fp8_out.data_ptr(),
-                    GATE_UP_N, GATE_UP_K, 48, dev.index, stream,
-                )
-                dn_got0 = torch.empty((1, DOWN_N), dtype=torch.bfloat16, device=dev)
-                _rans.rans_gemv_auto(
-                    dn_packed, swiglu_fp8_out.view(-1), dn_w_sc.reshape(-1), dn_in_sc.reshape(-1),
-                    dn_got0, DOWN_N, DOWN_K,
-                )
-                torch.cuda.synchronize(dev)
-                ok0 = rc == 0 and torch.equal(dn_got0.view(torch.int16), refs[0].view(torch.int16))
-            else:
-                if is_ilv:
-                    rc = _sk_tma4_ilv_swiglu(
-                        probes[0].data_ptr(), w.data_ptr(), swiglu_out.data_ptr(), partials.data_ptr(),
-                        s6_new.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
-                        gu.workspace.data_ptr(), GATE_UP_N, GATE_UP_K, 48, dev.index, stream,
-                    )
-                else:
-                    rc = _gate_up_tma4_swiglu(
-                        probes[0].data_ptr(), w.data_ptr(), swiglu_out.data_ptr(), partials.data_ptr(),
-                        s6_new.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
-                        gu.workspace.data_ptr(), 0, GATE_UP_N, GATE_UP_K, 48, dev.index, stream,
-                    )
-                torch.cuda.synchronize(dev)
-                ok0 = rc == 0 and torch.equal(swiglu_out[:, :DOWN_K].view(torch.int16), refs[0].view(torch.int16))
-        if not ok0:
-            w.copy_(w_backup)
-            if is_ilv:
-                _DOWN_ILV_SCALES.discard(s6_new.data_ptr())
-            if reused_s6:
-                s6_buf.view(-1)[: s6_backup.numel()].copy_(s6_backup.view(-1))
-                if is_ilv:
-                    _DOWN_ILV_SCALES.add(s6.data_ptr())
-                gu.register_buffer("_marlin_decode_scales6", s6, persistent=False)
-            else:
-                if is_ilv:
-                    _DOWN_ILV_SCALES.add(s6_backup.data_ptr())
-                gu.register_buffer("_marlin_decode_scales6", s6_backup, persistent=False)
-            continue
-        del w_backup, s6_backup
-        if is_fp8:
-            _SWIGLU_GATE_UP[gs_key] = {
-                "swiglu_out": swiglu_out,
-                "swiglu_fp8_out": swiglu_fp8_out,
-                "fp8_scale": dn_in_sc,
-                "fp8_scale_ptr": dn_in_sc.data_ptr(),
-                "is_fp8": True,
-                "is_ilv": is_ilv,
-                "state": "admitted",
-            }
-            count_fp8 += 1
-        else:
-            _SWIGLU_GATE_UP[gs_key] = {
-                "swiglu_out": swiglu_out,
-                "down_gs_ptr": dn.weight_global_scale.data_ptr(),
-                "is_fp8": False,
-                "is_ilv": is_ilv,
-                "state": "admitted",
-            }
-            count_bf16 += 1
-    total = count_bf16 + count_fp8
-    if total:
-        logger.info(
-            "Decode6 paired gate_up SwiGLU admitted bitwise on %d MLP layers (%d BF16->NVFP4, %d FP8->rANS)",
-            total, count_bf16, count_fp8,
-        )
-    return total
-
-
-def launch_oproj_gated6(
-    gate: torch.Tensor,
-    attn: torch.Tensor,
-    tiled_weight: torch.Tensor,
-    scales6: torch.Tensor,
-    palette: torch.Tensor,
-    global_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    out_shape: tuple[int, ...],
-) -> torch.Tensor:
-    g_kernel = _sk_tma4_ilv_gated if is_tma4_ilv(scales6) else _sk_tma4_gated
-    if g_kernel is None:
-        raise RuntimeError("SM121 Marlin o_proj gated kernel unavailable")
-    partials = gate.new_empty((48, 16, 128), dtype=torch.float32)
-    output = gate.new_empty(out_shape)
-    with torch.cuda.device(gate.device):
-        status = g_kernel(
-            gate.data_ptr(), attn.data_ptr(), tiled_weight.data_ptr(), output.data_ptr(),
-            partials.data_ptr(), scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(),
-            workspace.data_ptr(), OPROJ_N, OPROJ_K, 48,
-            gate.device.index, torch.cuda.current_stream().cuda_stream,
-        )
-    if status:
-        raise RuntimeError(f"SM121 Marlin o_proj gated launch failed with CUDA error {status}")
-    return output
-
-
-def register_all_oproj_sigmoid(model: torch.nn.Module) -> int:
-    global _ALL_OPROJ_GATED_READY
-    _ALL_OPROJ_GATED_READY = False
-    _GATED_OPROJ.clear()
-    if os.environ.get("MUSE_OPROJ_SIGMOID_FUSE", "1") == "0" or (_sk_tma4_ilv_gated is None and _sk_tma4_gated is None):
-        return 0
-    try:
-        import muse_norm_glue as _ng
-        if _ng.lib() is None or not hasattr(_ng, "mul_sigmoid_bf16"):
-            return 0
-    except Exception:
-        return 0
-    inner = getattr(model, "model", None)
-    layers = getattr(inner, "layers", None)
-    if layers is None:
-        return 0
-    non_fp8_total = 0
-    admitted = 0
-    for lyr in layers:
-        sa = getattr(lyr, "self_attn", None)
-        op = getattr(sa, "o_proj", None)
-        if op is None:
-            continue
-        w_raw = getattr(op, "weight", None)
-        if w_raw is not None and w_raw.dtype == torch.float8_e4m3fn:
-            continue
-        non_fp8_total += 1
-        s6 = getattr(op, "_marlin_decode_scales6", None)
-        w = getattr(op, "_marlin_decode_weight", None)
-        pal = getattr(op, "_marlin_decode_palette", None)
-        gs = getattr(op, "weight_global_scale", None)
-        ws = getattr(op, "workspace", None)
-        if (
-            s6 is None or w is None or pal is None or gs is None or ws is None
-            or getattr(op, "marlin_decode6_fixed_grid", False)
-            or not is_tma4(s6)
-            or (op.output_size_per_partition, op.input_size_per_partition) != (OPROJ_N, OPROJ_K)
-        ):
-            continue
-        g_kernel = _sk_tma4_ilv_gated if is_tma4_ilv(s6) else _sk_tma4_gated
-        if g_kernel is None:
-            continue
-        dev = s6.device
-        gen = torch.Generator(device=dev).manual_seed(20261127 + non_fp8_total)
-        tmp = torch.empty((1, OPROJ_K), dtype=torch.bfloat16, device=dev)
-        ok = True
-        with torch.cuda.device(dev):
-            stream = torch.cuda.current_stream().cuda_stream
-            for sig in (0.05, 1.0, 5.0, 24.0):
-                rg = (torch.randn((1, OPROJ_K), generator=gen, device=dev) * sig).to(torch.bfloat16).contiguous()
-                ra = (torch.randn((1, OPROJ_K), generator=gen, device=dev) * sig).to(torch.bfloat16).contiguous()
-                ra[:, 1::2] = -ra[:, ::2]
-                _ng.mul_sigmoid_bf16(rg, ra, tmp, OPROJ_K, stream)
-                ref = decode_linear6(tmp, w, s6, pal, gs, ws, OPROJ_N, OPROJ_K, False)
-                got = launch_oproj_gated6(rg, ra, w, s6, pal, gs, ws, (1, OPROJ_N))
-                torch.cuda.synchronize(dev)
-                if not torch.equal(got.view(torch.int16), ref.view(torch.int16)) or int(torch.count_nonzero(ws).item()) != 0:
-                    ok = False
-                    break
-        if ok:
-            _GATED_OPROJ.add(gs.data_ptr())
-            admitted += 1
-    if non_fp8_total > 0 and admitted == non_fp8_total:
-        _ALL_OPROJ_GATED_READY = True
-        logger.info("Decode6 o_proj fused mul_sigmoid prologue prechecked bitwise on %d/%d NVFP4 layers", admitted, non_fp8_total)
-    return admitted
 
 
 def _decode6_fake(x, tiled_weight, scales6, palette, global_scale, workspace, n, k, fixed_grid=False):
@@ -1330,22 +876,30 @@ direct_register_custom_op("marlin_tiled_decode6", decode_linear6, fake_impl=_dec
 
 def self_check6(layer: torch.nn.Module, reference, fixed_grid: bool = False) -> bool:
     """decode_linear6 == reference (the uncompressed tiled GEMV) bitwise on the layer's own weight, for activations with
-    large and cancelling entries at several magnitudes."""
+    large and cancelling entries at several magnitudes. Runs on the admitted 48-CTA partition (see _ADMITTING), which
+    is the partition the uncompressed reference uses."""
+    global _ADMITTING
     n, k = layer.output_size_per_partition, layer.input_size_per_partition
     dev = layer.weight.device
     gen = torch.Generator(device=dev)
     gen.manual_seed(n * 7 + k)
-    for mag in (0.01, 1.0, 64.0):
-        x = torch.randn(1, k, generator=gen, device=dev) * mag
-        x[:, ::3] *= 64
-        x[:, 1::2] = -x[:, ::2]
-        x = x.to(torch.bfloat16)
-        got = decode_linear6(x, layer._marlin_decode_weight, layer._marlin_decode_scales6, layer._marlin_decode_palette,
-                             layer.weight_global_scale, layer.workspace, n, k, fixed_grid)
-        ref = reference(x, layer._marlin_decode_weight, layer._marlin_decode_scales, layer.weight_global_scale,
-                        layer.workspace, n, k)
-        if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
-            return False
+    saved = _ADMITTING
+    _ADMITTING = True
+    try:
+        for mag in (0.01, 1.0, 64.0):
+            x = torch.randn(1, k, generator=gen, device=dev) * mag
+            x[:, ::3] *= 64
+            x[:, 1::2] = -x[:, ::2]
+            x = x.to(torch.bfloat16)
+            got = decode_linear6(x, layer._marlin_decode_weight, layer._marlin_decode_scales6,
+                                 layer._marlin_decode_palette, layer.weight_global_scale, layer.workspace,
+                                 n, k, fixed_grid)
+            ref = reference(x, layer._marlin_decode_weight, layer._marlin_decode_scales,
+                            layer.weight_global_scale, layer.workspace, n, k)
+            if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+                return False
+    finally:
+        _ADMITTING = saved
     return True
 
 
@@ -1548,7 +1102,7 @@ def admit_down_srans(layer: torch.nn.Module) -> bool:
     return True
 
 
-def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
+def _admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
     """Admit 4-stage TMA super-block rANS scales on gate_up, down, or lm_head after exact bitwise check."""
     c = layer._marlin_decode_scales6
     n, k = layer.output_size_per_partition, layer.input_size_per_partition
@@ -1572,28 +1126,20 @@ def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
         fixed_grid
         and (n, k) == (GATE_UP_N, GATE_UP_K)
         and _sk_tma4_ilv is not None
-        and os.environ.get("MUSE_GATE_UP_ILV", "1") != "0"
+        and os.environ.get("MUSE_GATE_UP_ILV", "0") != "0"
     )
-    gb = _nv6_gate_blocks() if (not fixed_grid and (n, k) == (4096, 6656)) else 48
-    is_gate_v48 = (not fixed_grid and (n, k) == (4096, 6656) and gb != 48)
-    want_lm_ilv = (
-        not fixed_grid
-        and (n, k) == (LM_HEAD_N, LM_HEAD_K)
-        and _sk_tma4_ilv is not None
-        and os.environ.get("MUSE_LM_HEAD_ILV", "1") != "0"
-    )
-    want_lm_split2 = want_lm_ilv and os.environ.get("MUSE_LM_HEAD_SPLIT2", "1") != "0"
+    gb = _layer_gate_blocks(layer) if (not fixed_grid and (n, k) == (4096, 6656)) else 48
+    is_gate_v48 = (not fixed_grid and (n, k) == (4096, 6656) and gb == 24)
     coded = encode_tma4_scales(
         layer._marlin_decode_scales, pal, n, k,
         False if want_gu_ilv else fixed_grid,
-        gate_v48=is_gate_v48, gate_blocks=gb, split2=want_lm_split2,
+        gate_v48=is_gate_v48, gate_blocks=gb,
     )
     if coded.numel() > c.numel():
         logger.warning("TMA4 (%dx%d) rejected: coded %d > c %d", n, k, coded.numel(), c.numel())
         return False
     want_ilv = _sk_tma4_ilv is not None and (
         want_gu_ilv
-        or want_lm_ilv
         or (
             not fixed_grid
             and (
@@ -1603,26 +1149,21 @@ def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
         )
     )
     if want_ilv:
-        w_ilv = _build_ilv_weight(w, n, k, is_gate_v48, gb, split2=want_lm_split2)
+        w_ilv = _build_ilv_weight(w, n, k, is_gate_v48, gb)
         _DOWN_ILV_SCALES.add(coded.data_ptr())
-        if want_lm_split2:
-            _LM_SPLIT2_SCALES.add(coded.data_ptr())
         try:
             got_ilv = [decode_linear6(x, w_ilv, coded, pal, gs, ws, n, k, False) for x in probes]
         finally:
             _DOWN_ILV_SCALES.discard(coded.data_ptr())
-            _LM_SPLIT2_SCALES.discard(coded.data_ptr())
         if _same_bits(expected, got_ilv) and int(torch.count_nonzero(ws)) == 0:
             nbytes = coded.numel()
-            w_backup = w.detach().clone() if w.nbytes <= (256 << 20) else None
+            w_backup = w.detach().clone()
             w.copy_(w_ilv)
             del w_ilv
             c[:nbytes].copy_(coded.view(-1))
             del coded
             view = c[:nbytes].view(-1, 32)
             _DOWN_ILV_SCALES.add(view.data_ptr())
-            if want_lm_split2:
-                _LM_SPLIT2_SCALES.add(view.data_ptr())
             got2 = [decode_linear6(x, w, view, pal, gs, ws, n, k, False) for x in probes]
             if _same_bits(expected, got2) and int(torch.count_nonzero(ws)) == 0:
                 del w_backup
@@ -1638,15 +1179,13 @@ def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
                     STATS["down_srans_bytes"] += nbytes
                 return True
             _DOWN_ILV_SCALES.discard(view.data_ptr())
-            _LM_SPLIT2_SCALES.discard(view.data_ptr())
-            if w_backup is not None:
-                w.copy_(w_backup)
-                del w_backup
+            w.copy_(w_backup)
+            del w_backup
             c.copy_(_six_bit_codes(layer))
             return False
         del w_ilv
-        if want_gu_ilv or want_lm_ilv:
-            coded = encode_tma4_scales(layer._marlin_decode_scales, pal, n, k, fixed_grid)
+        if want_gu_ilv:
+            coded = encode_tma4_scales(layer._marlin_decode_scales, pal, n, k, True)
             if coded.numel() > c.numel():
                 return False
     got = [decode_linear6(x, w, coded, pal, gs, ws, n, k, fixed_grid) for x in probes]
@@ -1662,6 +1201,31 @@ def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
         c.copy_(_six_bit_codes(layer))
         return False
     layer.register_buffer("_marlin_decode_scales6", view, persistent=False)
+    if (n, k) == (LM_HEAD_N, LM_HEAD_K):
+        # Placement check. If a row-chunked table is registered (set_btab) the chunked kernel must reproduce the
+        # contiguous weight bit for bit -- that equality is the entire safety argument for splitting the buffer, so
+        # prove it here rather than on the goldens. MUSE_LMHEAD_BTAB=1 additionally registers an identity table (one
+        # chunk spanning every tile) when none exists, which exercises the indirection at zero risk.
+        registered = _BTAB.get(w.data_ptr())
+        if registered is None and os.environ.get("MUSE_LMHEAD_BTAB", "0") != "0":
+            set_btab(w, n, k, [w])
+            registered = _BTAB.get(w.data_ptr())
+        if registered is not None:
+            _BTAB.pop(w.data_ptr(), None)
+            try:
+                contig = [decode_linear6(x, w, view, pal, gs, ws, n, k, fixed_grid) for x in probes]
+            finally:
+                _BTAB[w.data_ptr()] = registered
+            placed = [decode_linear6(x, w, view, pal, gs, ws, n, k, fixed_grid) for x in probes]
+            if not _same_bits(contig, placed) or int(torch.count_nonzero(ws)) != 0:
+                _BTAB.pop(w.data_ptr(), None)
+                logger.warning("TMA4 (%dx%d) rejected: %d-chunk placement is not bitwise identical to the "
+                               "contiguous weight", n, k, registered[2])
+                return False
+            logger.info("TMA4 (%dx%d): %d-chunk placement is bitwise identical to the contiguous weight "
+                        "(%d tiles of %d B, chunk split %s)", n, k, registered[2],
+                        int(registered[1][-1].item()), _tma4_tile_bytes(n, k),
+                        registered[1].tolist())
     if fixed_grid:
         layer.marlin_decode6_gate_up_srans = True
         STATS["srans_scales"] += layer._marlin_decode_scales.numel()
@@ -1673,6 +1237,136 @@ def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
     return True
 
 
+def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
+    """Admit TMA4 scales on the admitted 48-CTA partition (see _ADMITTING), then report how far the runtime grid is
+    from it. A wider grid is not bitwise-equal to the 48-CTA reference -- measured 5 of 1,212,288 elements at max
+    1 ULP on lm_head at 287 -- because the part2 tail columns are assigned differently; the k-chain of any single
+    column is never split across CTAs at either grid. The gate for it is the end-to-end golden hashes, and
+    MUSE_SK_STRICT=1 turns the report into a veto instead."""
+    global _ADMITTING
+    n, k = layer.output_size_per_partition, layer.input_size_per_partition
+    # MUSE_SK_WIDE_BLOCKS is lm_head-only, and the shape gate has to be applied HERE rather than left to
+    # _sk_blocks: this function writes _SK_BLOCK_OVERRIDE, and _sk_blocks consults that dict BEFORE its own
+    # shape gate, so an ungated value would be applied to every TMA4 shape. Measured 11/24: with
+    # MUSE_SK_WIDE_BLOCKS=287 ungated, gate_up (39936x6656) admitted at 287 CTAs and reported "bitwise
+    # identical", and down (6656x19968) -- 52 column tiles against 287 CTAs -- died at load with
+    # "NVFP4 TMA4 (6656x19968) scale admission failed: CUDA error: unspecified launch failure", voiding the
+    # leg (rc=1, no 'FP8 layers admitted'). lm_head is the only shape with 3157 tiles = 287 x 11.
+    wide = _SK_BLOCKS.get((n, k), 48)
+    if _SK_WIDE_BLOCKS > 0 and (n, k) == (LM_HEAD_N, LM_HEAD_K):
+        wide = _SK_WIDE_BLOCKS
+    _ADMITTING = True
+    try:
+        ok = _admit_tma4(layer, fixed_grid)
+    finally:
+        _ADMITTING = False
+    if not ok or wide == 48:
+        return ok
+    _SK_BLOCK_OVERRIDE[(n, k)] = wide
+    admitted_buf = layer._marlin_decode_scales6
+    try:
+        # The admitted buffer was encoded with _ADMITTING set, i.e. at 48 blocks, and gemv6_tma4.cu derives
+        # states_off/var_off from the grid it is launched with. Launching at `wide` against the 48-block buffer
+        # therefore reads past the end of the allocation -- and because that buffer is the one registered on the
+        # layer, inference would fault too, not just this probe. So: take the 48-block reference FIRST (while the
+        # admitted buffer is still registered), then re-encode at the wide grid, register that buffer, and probe
+        # the wide grid against it. The re-encoded buffer stays registered because the runtime launch resolves the
+        # same `wide` count from _sk_blocks.
+        narrow = _sk_probe_outputs(layer, n, k, admit=True)
+        wide_buf = encode_tma4_scales(
+            layer._marlin_decode_scales, layer._marlin_decode_palette, n, k, fixed_grid,
+        )
+        # Fresh allocation, never a copy into the admitted storage: the narrow reference above is a view of that
+        # storage and a copy would destroy it. lm_head has no data_ptr()-keyed side tables (it is not in
+        # ATTN_ILV_SHAPES and not the gate shape), so a new buffer needs no bookkeeping.
+        layer.register_buffer("_marlin_decode_scales6", wide_buf, persistent=False)
+        wide_out = _sk_probe_outputs(layer, n, k)
+    except Exception:
+        layer.register_buffer("_marlin_decode_scales6", admitted_buf, persistent=False)
+        raise
+    finally:
+        _SK_BLOCK_OVERRIDE.pop((n, k), None)
+    worst = 0
+    ulps = 0
+    for a, b in zip(narrow, wide_out):
+        d = (a.view(torch.int16).to(torch.int32) - b.view(torch.int16).to(torch.int32)).abs()
+        ulps += int((d != 0).sum())
+        worst = max(worst, int(d.max()))
+    if ulps == 0:
+        logger.info("TMA4 (%dx%d): %d-CTA runtime grid is bitwise identical to the 48-CTA partition; "
+                    "registered the %d-CTA scale buffer (%d B)", n, k, wide, wide, wide_buf.numel())
+        return True
+    if _SK_STRICT:
+        # Fall back to the 48-CTA partition, which means both the grid AND the buffer it was encoded for.
+        _SK_BLOCK_OVERRIDE[(n, k)] = 48
+        layer.register_buffer("_marlin_decode_scales6", admitted_buf, persistent=False)
+        logger.warning("TMA4 (%dx%d): %d-CTA runtime grid differs from 48 CTAs on %d elements (max %d ULP), "
+                       "falling back (MUSE_SK_STRICT=1); restored the 48-CTA scale buffer (%d B)",
+                       n, k, wide, ulps, worst, admitted_buf.numel())
+        return True
+    logger.info("TMA4 (%dx%d): %d-CTA runtime grid differs from the 48-CTA partition on %d of %d elements "
+                "(max %d ULP) -- reduction regrouping only; gated by the end-to-end golden hashes; "
+                "registered the %d-CTA scale buffer (%d B)",
+                n, k, wide, ulps, sum(a.numel() for a in narrow), worst, wide, wide_buf.numel())
+    return True
+
+
+def _sk_probe_outputs(layer: torch.nn.Module, n: int, k: int, admit: bool = False) -> list[torch.Tensor]:
+    """The layer's own outputs on the admission probes, on the current runtime grid (or the 48-CTA grid when
+    ``admit`` is set)."""
+    global _ADMITTING
+    saved = _ADMITTING
+    _ADMITTING = admit
+    try:
+        return [decode_linear6(x, layer._marlin_decode_weight, layer._marlin_decode_scales6,
+                               layer._marlin_decode_palette, layer.weight_global_scale, layer.workspace,
+                               n, k, False) for x in _down_probes(layer)]
+    finally:
+        _ADMITTING = saved
+
+
+def _set_gate_launch6(gate_blocks: int) -> tuple[int, str]:
+    """Set the output_gate grid; return (the block count the kernel will launch, a failure note).
+
+    The count is resolved in C++ (gemv6.cu:22) and appeared in no log at inference: decode_linear6
+    is reached only from the placement probes, so its summary line prints in no leg at all. The
+    tell therefore has to carry the *read-back* value, not a re-derivation from the environment: a
+    Python re-derivation still prints 48 when the staged .so carries an older guard, while a stale
+    overlay prints nothing at all. So absence and disagreement are both visible.
+    """
+    rc = None
+    if _set_gate_blocks is not None:
+        rc = int(_set_gate_blocks(int(gate_blocks)))
+    applied = int(_get_gate_blocks()) if _get_gate_blocks is not None else None
+    launched = gate_blocks if applied is None else applied
+    note = ""
+    if applied is None:
+        note = ", applied=unreadable (no muse_marlin6_get_gate_blocks)"
+    elif applied != gate_blocks:
+        note = ", requested %d, READ-BACK MISMATCH" % gate_blocks
+    if rc not in (None, 0):
+        note += ", set rejected rc=%d" % rc
+    return launched, note
+
+
+def _log_gate_launch6(layer: torch.nn.Module, gate_blocks: int, launched: int, note: str) -> None:
+    """Per-layer launch line, recorded only for a layer that is actually admitted on this path.
+
+    Called at the single success point of prepare_decode_layout6, so the aggregate count in
+    marlin.py's summary equals the number of gate layers that launch, not the number probed.
+    """
+    n, k = layer.output_size_per_partition, layer.input_size_per_partition
+    STATS["gate_launch"][launched] = STATS["gate_launch"].get(launched, 0) + 1
+    if launched != gate_blocks:
+        STATS["gate_launch_mismatch"] += 1
+    logger.info(
+        "NVFP4 gate launch: output_gate on %d blocks, GateV48=%s for layer %s "
+        "(shape %dx%d, dispatch=%s%s)",
+        launched, "true" if launched == 24 else "false", getattr(layer, "prefix", "?"),
+        n, k, "per-layer" if _gate_dispatch6_enabled() else "env", note,
+    )
+
+
 def prepare_decode_layout6(layer: torch.nn.Module, reference) -> bool:
     """After the board's prepare_decode_layout: add the 6-bit scale codes and palette, check, register. True if admitted."""
     layer.marlin_decode6_fixed_grid = False
@@ -1680,11 +1374,18 @@ def prepare_decode_layout6(layer: torch.nn.Module, reference) -> bool:
     if tiled is None or getattr(layer, "_marlin_decode_weight", None) is None:
         return False
     n, k = layer.output_size_per_partition, layer.input_size_per_partition
+    # Per-layer gate launch configuration: set it before any admission check so the variant
+    # that is checked is the variant that will be launched for this layer.
+    gate_blocks = _layer_gate_blocks(layer) if (n, k) == _GATE_SHAPE6 else None
+    launch = _set_gate_launch6(gate_blocks) if gate_blocks is not None else None
     packed = pack_scales6(tiled) if k % 128 == 0 else None
     if packed is None:
         STATS["kept"] += 1
         return False
     codes, palette = packed
+    # Drop any stale entry: the caching allocator can hand a freed scale buffer's address
+    # back to this layer, and the admission checks below must not read another layer's grid.
+    _GATE_BLOCKS_BY_SCALES.pop(codes.data_ptr(), None)
     layer.register_buffer("_marlin_decode_scales6", codes, persistent=False)
     layer.register_buffer("_marlin_decode_palette", palette, persistent=False)
     if not self_check6(layer, reference):
@@ -1731,5 +1432,10 @@ def prepare_decode_layout6(layer: torch.nn.Module, reference) -> bool:
                 logger.warning_once("NVFP4 rANS down scale admission failed on this layer: %s", exc)
                 coded_ok = False
             STATS["down_srans" if coded_ok else "down_srans_rejected"] += 1
+    if gate_blocks is not None:
+        codes = getattr(layer, "_marlin_decode_scales6", None)
+        if codes is not None:
+            _GATE_BLOCKS_BY_SCALES[codes.data_ptr()] = gate_blocks
+        _log_gate_launch6(layer, gate_blocks, launch[0], launch[1])
     STATS["admitted"] += 1
     return True

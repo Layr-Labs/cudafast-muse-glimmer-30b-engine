@@ -14,37 +14,18 @@
 namespace {
 constexpr int kThreads = 128;
 constexpr int kShared = 45056;
-constexpr auto kKernelStock =
+constexpr auto kKernel =
     marlinw_down::Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
                         vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
-                        kThreads, 4, 8, 4, false, 3, 1, false, false>;
-constexpr auto kKernelFast =
-    marlinw_down::Marlin<vllm::kBFloat16.id(), vllm::kFE2M1f.id(),
-                        vllm::kBFloat16.id(), vllm::kFE4M3fn.id(),
-                        kThreads, 4, 8, 4, false, 3, 1, false, true>;
-static bool g_use_fast = true;
+                        kThreads, 4, 8, 4, false, 3, 1, false>;
 }  // namespace
-
-extern "C" void marlinw_attn_set_fast(int enable) {
-  g_use_fast = (enable != 0);
-}
 
 extern "C" int marlinw_attn_init(int* active_blocks) {
   auto status = cudaFuncSetAttribute(
-      kKernelStock, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+      kKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(
-      kKernelFast, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
-  if (status != cudaSuccess) return status;
-  int occ_stock = 0, occ_fast = 0;
-  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &occ_stock, kKernelStock, kThreads, kShared);
-  if (status != cudaSuccess) return status;
-  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &occ_fast, kKernelFast, kThreads, kShared);
-  if (status != cudaSuccess) return status;
-  *active_blocks = occ_fast < occ_stock ? occ_fast : occ_stock;
-  return cudaSuccess;
+  return cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      active_blocks, kKernel, kThreads, kShared);
 }
 
 extern "C" int marlinw_attn_gemm(
@@ -55,8 +36,7 @@ extern "C" int marlinw_attn_gemm(
   if (grid <= 0 || (rows != 512 && rows != 64) || columns % 128 || inner % 64 ||
       row_stride < inner || row_stride % 8)
     return cudaErrorInvalidValue;
-  auto kernel = g_use_fast ? kKernelFast : kKernelStock;
-  kernel<<<grid, kThreads, kShared, stream>>>(
+  kKernel<<<grid, kThreads, kShared, stream>>>(
       input, weight, output, partial, nullptr, nullptr, scales, global_scale,
       nullptr, nullptr, inner / 16, rows, columns, inner, row_stride, locks,
       false, false, true, kShared, work, work_ptr);

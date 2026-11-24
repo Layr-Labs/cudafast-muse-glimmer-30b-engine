@@ -157,30 +157,6 @@ __device__ inline void cp_async4(void* smem_ptr, const void* glob_ptr) {
       "l"(glob_ptr), "n"(BYTES));
 }
 
-__device__ inline void cp_async4_l2_256b(void* smem_ptr, const void* glob_ptr) {
-  const int BYTES = 16;
-  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "{\n"
-      "   cp.async.cg.shared.global.L2::256B [%0], [%1], %2;\n"
-      "}\n" ::"r"(smem),
-      "l"(glob_ptr), "n"(BYTES));
-}
-
-__device__ inline void cp_async4_pred_l2_256b(void* smem_ptr,
-                                              const void* glob_ptr,
-                                              bool pred = true) {
-  const int BYTES = 16;
-  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "{\n"
-      "   .reg .pred p;\n"
-      "   setp.ne.b32 p, %0, 0;\n"
-      "   @p cp.async.cg.shared.global.L2::256B [%1], [%2], %3;\n"
-      "}\n" ::"r"((int)pred),
-      "r"(smem), "l"(glob_ptr), "n"(BYTES));
-}
-
 __device__ inline void cp_async_fence() {
   asm volatile("cp.async.commit_group;\n" ::);
 }

@@ -23,10 +23,10 @@ static int decode6_gate_blocks() {
   if (g_gate_blocks < 0) {
     const char* env = std::getenv("MUSE_NV6_GATE_BLOCKS");
     if (!env || !*env) {
-      g_gate_blocks = 48;
+      g_gate_blocks = 24;
     } else {
       int v = static_cast<int>(std::strtol(env, nullptr, 10));
-      g_gate_blocks = (v == 0 || v == 24) ? 24 : ((v == 32 || v == 48) ? v : 48);
+      g_gate_blocks = (v == 24 || v == 32 || v == 44 || v == 46 || v == 48) ? v : 24;
     }
   }
   return g_gate_blocks;
@@ -52,13 +52,13 @@ cudaError_t launch(const int4* input, const int4* weight, int4* output,
     kernel<<<grid, Threads, shared, stream>>>(
         input, weight, output, partials, nullptr, nullptr, scales6, global_scale,
         nullptr, nullptr, k / 16, 1, n, k, k, locks, false, false, true, shared, palette,
-        decode6_attn_tpf_stride(), nullptr, nullptr, nullptr, 0, nullptr);
+        decode6_attn_tpf_stride(), nullptr, nullptr, 0);
     return cudaGetLastError();
 }
 }  // namespace
 
 extern "C" int muse_marlin6_set_gate_blocks(int blocks) {
-    if (blocks == 24 || blocks == 32 || blocks == 48) {
+    if (blocks == 24 || blocks == 32 || blocks == 44 || blocks == 46 || blocks == 48) {
         g_gate_blocks = blocks;
         return 0;
     }
@@ -75,11 +75,14 @@ extern "C" int muse_marlin6_gemv(const int4* input, const int4* weight, int4* ou
                                  int device, cudaStream_t stream) {
     if (n == 4096 && k == 6656 && blocks == 48) {
         const int gb = decode6_gate_blocks();
-        if (gb != 48) {
+        if (gb == 24) {
             return launch<128, 256, false, true>(
                 input, weight, output, partials, scales6, palette, global_scale,
                 locks, n, k, gb, device, stream);
         }
+        return launch<128, 256, false, false>(
+            input, weight, output, partials, scales6, palette, global_scale,
+            locks, n, k, gb, device, stream);
     }
     if (n % 128 == 0)
         return launch<128, 256>(input, weight, output, partials, scales6, palette, global_scale,

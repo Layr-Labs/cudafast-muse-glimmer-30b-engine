@@ -488,13 +488,14 @@ class Attention(nn.Module, AttentionLayerBase):
     def forward(
         self,
         query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
         # For some alternate attention backends like MLA the attention output
         # shape does not match the query shape, so we optionally let the model
         # definition specify the output tensor shape.
         output_shape: torch.Size | None = None,
         output_dtype: torch.dtype | None = None,
+        kv_cache_dummy_dep: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         The KV cache is stored inside this class and is accessed via
@@ -539,11 +540,12 @@ class Attention(nn.Module, AttentionLayerBase):
             key = key.view(-1, self.num_kv_heads, self.head_size)
         if value is not None:
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
-        kv_cache_dummy_dep = None
+        skip_kv_cache_update = kv_cache_dummy_dep is not None
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
             if (
-                not self.attn_backend.forward_includes_kv_cache_update
+                not skip_kv_cache_update
+                and not self.attn_backend.forward_includes_kv_cache_update
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None
@@ -563,7 +565,8 @@ class Attention(nn.Module, AttentionLayerBase):
             # Skip this if sharing KV cache with an earlier attention layer.
             encoded = _encode_layer_name(self.layer_name)
             if (
-                not self.attn_backend.forward_includes_kv_cache_update
+                not skip_kv_cache_update
+                and not self.attn_backend.forward_includes_kv_cache_update
                 and self.kv_sharing_target_layer_name is None
                 and key is not None
                 and value is not None
@@ -783,16 +786,6 @@ def unified_kv_cache_update(
     """
     layer_name = _resolve_layer_name(layer_name)
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
-    written_rows = getattr(attn_layer, "_qk_kv_cache_written_rows", 0)
-    if written_rows:
-        attn_layer._qk_kv_cache_written_rows = 0
-        attn_layer._qk_kv_cache_written = False
-        if key.shape[0] == written_rows:
-            return key.new_empty(0)
-    if getattr(attn_layer, "_qk_kv_cache_written", False):
-        attn_layer._qk_kv_cache_written = False
-        if key.shape[0] == 1:
-            return key.new_empty(0)
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
@@ -828,8 +821,8 @@ direct_register_custom_op(
 @maybe_transfer_kv_layer
 def unified_attention_with_output(
     query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    key: torch.Tensor | None,
+    value: torch.Tensor | None,
     output: torch.Tensor,
     layer_name: LayerNameType,
     output_scale: torch.Tensor | None = None,
@@ -839,6 +832,8 @@ def unified_attention_with_output(
     # kv_cache_dummy_dep is not used but accepting it creates a data dependency
     # that ensures torch.compile preserves ordering between KV cache update and
     # attention forward.
+    # key/value may be None when the cache is already written by a fused op and
+    # the backend reads the cache only (see MuseGlimmerAttention.forward).
     del kv_cache_dummy_dep
     layer_name = _resolve_layer_name(layer_name)
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
@@ -858,8 +853,8 @@ def unified_attention_with_output(
 
 def unified_attention_with_output_fake(
     query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
+    key: torch.Tensor | None,
+    value: torch.Tensor | None,
     output: torch.Tensor,
     layer_name: LayerNameType,
     output_scale: torch.Tensor | None = None,

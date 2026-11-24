@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import types
 
 import torch
 
@@ -130,7 +131,7 @@ logger = init_logger(__name__)
 # ops.marlin_gemm call.
 _PROMPT_CHECK_M = (512, 4096)
 _prompt_stats = {
-    "wide": 0, "narrow": 0, "narrow_down": 0, "down128": 0, "down128_rejected": 0, "sliced": 0, "single": 0, "logged": False,
+    "wide": 0, "padded": 0, "narrow": 0, "narrow_down": 0, "down128": 0, "down128_rejected": 0, "sliced": 0, "single": 0, "logged": False,
     # Narrow 512-row NVFP4 attention projections: [admitted, rejected] per shape.
     "attn": {"qkv": [0, 0], "gate": [0, 0], "o": [0, 0]},
 }
@@ -165,6 +166,19 @@ def _log_prompt_stats() -> None:
             logger.info("NVFP4 decode palette admission: %d compressed, %d kept uncompressed",
                         _scale6_stats["admitted"], _scale6_stats["kept"])
             logger.info("NVFP4 fixed decode gate/up grid admitted on %d layers", _scale6_stats["fixed_grid"])
+            # The output_gate block count is resolved in C++ and, unlike the rANS gate's wpb, it is
+            # not in any pack line. This aggregate is the single line that says which grid the gate
+            # actually launches on: it is emitted here because this hook runs at inference, while
+            # decode_linear6 (which carries the per-layer line) is reached only from the probes.
+            launch = _scale6_stats.get("gate_launch") or {}
+            groups = ", ".join(
+                "%d on %d blocks (GateV48=%s)" % (count, blocks, "true" if blocks == 24 else "false")
+                for blocks, count in sorted(launch.items())
+            ) or "no gate layer admitted"
+            mismatch = _scale6_stats.get("gate_launch_mismatch", 0)
+            if mismatch:
+                groups += "; %d launched a block count other than the requested one" % mismatch
+            logger.info("NVFP4 gate grid: %d gate layers, %s", sum(launch.values()), groups)
             coded = _scale6_stats.get("srans_scales", 0)
             logger.info("NVFP4 rANS-coded gate/up block scales: %d layers admitted, %d rejected, %.3f bits per scale",
                         _scale6_stats.get("gate_up_srans", 0), _scale6_stats.get("gate_up_srans_rejected", 0),
@@ -180,6 +194,12 @@ def _log_prompt_stats() -> None:
             _prompt_stats["sliced"],
             _prompt_stats["single"],
         )
+        if _prompt_stats["padded"]:
+            logger.info(
+                "Marlin NVFP4 prompt GEMM: %d layers admitted on a zero-padded "
+                "column extension",
+                _prompt_stats["padded"],
+            )
         if _prompt_stats["narrow"]:
             logger.info(
                 "Narrow Marlin prefill passed bitwise validation on %d layers",
@@ -693,6 +713,233 @@ def _prompt_check(layer: torch.nn.Module, fn, ms) -> bool:
         return False
 
 
+# Zero-padded column extension of a prompt-sized NVFP4 weight.
+#
+# Every prompt schedule in this file needs n divisible by 256: marlinw's
+# prepare() requires it (harness/kernels/marlinw/py/__init__.py), the column
+# slices need it (_COL_TILE_N), and marlin_narrow is pinned to one shape. A
+# layer whose n is a multiple of 64 but of neither -- the vocabulary projection
+# of this model, 202048 = 64 * 3157 = 64 * 7 * 11 * 41 -- therefore stays on the
+# single ops.marlin_gemm call, which for n % 128 != 0 has to run Marlin's
+# 64-column tile instead of its 256-column one. That is a scheduling loss of
+# about 4x, and it is the whole of the prefill gap on that layer.
+#
+# Marlin's repacked layout is local to 64-column tiles, so extending n by whole
+# tiles is exactly the repacked form of a wider weight: the real columns keep
+# their offsets and the extension is a column-slice copy. The extension is
+# zeroed (quantized 0 decodes to 0.0, and a zero scale on a zero weight is 0),
+# so the padded outputs are inert and are sliced off before the logits leave
+# this file. Admission is a bitwise comparison of the *whole* path against the
+# unpadded single call on the real columns, so a padded plan is only ever taken
+# when it reproduces today's logits exactly.
+_PAD_TILE_N = 64
+_PAD_MAX_COLUMNS = 4096
+
+
+def _pad_prompt_width(
+    size_n: int, size_k: int, sms: int, smem: int
+) -> tuple[int, int] | None:
+    """(pad_n, k-split tiles) for the cheapest padded width marlinw can run at
+    every checked row count, or None if it has no plan at any width inside the
+    budget.
+
+    A width whose plan contains a k-split tile is only the fallback: those
+    tiles are reduced through the lock protocol, which is the one part of the
+    plan whose summation order can differ from the stock call. A width with no
+    split tile computes every output element in one CTA over the full K, in
+    ascending k-tile order -- the same order the stock call uses -- so it is
+    both the faster plan and the one that can be bitwise identical."""
+    probe = getattr(marlinw, "plan", None)
+    if probe is None:
+        return ((size_n // 256 + 1) * 256, -1)
+    cheapest = None
+    pad_n = (size_n // 256 + 1) * 256
+    while pad_n - size_n <= _PAD_MAX_COLUMNS:
+        splits, planned = 0, True
+        for m in _PROMPT_CHECK_M:
+            p = probe(m, pad_n, size_k, sms, smem)
+            if p is None or p.stock_rows:
+                planned = False
+                break
+            splits += sum(1 for item in p.items if item[5] != 1)
+        if planned:
+            if splits == 0:
+                return pad_n, 0
+            if cheapest is None:
+                cheapest = (pad_n, splits)
+        pad_n += 256
+    return cheapest
+
+
+def _pad_prompt_columns(
+    layer: torch.nn.Module, size_n: int, pad_n: int
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Fresh contiguous copies of the layer's repacked weight and scales,
+    extended to pad_n columns with the extension zeroed; the layer's own
+    tensors are untouched, so the decode layout built afterwards still sees
+    the real n."""
+    weight, weight_scale = layer.weight, layer.weight_scale
+    k_rows = weight.shape[0]
+    # Whole 64-column tiles only: the packed int32 layout holds 2 columns per
+    # n column, so a tile is 2 * 64 int32 columns and 64 scale columns.
+    if (
+        tuple(weight.shape) != (k_rows, 2 * size_n)
+        or tuple(weight_scale.shape) != (k_rows, size_n)
+        or size_n % _PAD_TILE_N
+        or pad_n % _PAD_TILE_N
+    ):
+        return None
+    w_pad = torch.zeros((k_rows, 2 * pad_n), dtype=weight.dtype, device=weight.device)
+    w_pad[:, : 2 * size_n].copy_(weight)
+    s_pad = torch.zeros(
+        (k_rows, pad_n), dtype=weight_scale.dtype, device=weight_scale.device
+    )
+    s_pad[:, :size_n].copy_(weight_scale)
+    return w_pad, s_pad
+
+
+def _pad_prompt_split(
+    x: torch.Tensor,
+    layer: torch.nn.Module,
+    pad_n: int,
+    w_pad: torch.Tensor,
+    s_pad: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    global_scale: torch.Tensor,
+) -> str:
+    """Which link of the padded path differs, for the admission log."""
+    workspace = layer.workspace
+    stock_pad = _marlin_fp4_single(
+        x, w_pad, s_pad, global_scale, workspace, pad_n, size_k
+    )
+    stock_real = _marlin_fp4_single(
+        x, layer.weight, layer.weight_scale, global_scale, workspace, size_n, size_k
+    )
+    wide_pad = _marlin_fp4_wide_gemm(
+        x, w_pad, s_pad, global_scale, workspace, pad_n, size_k
+    )
+    same_kernel = wide_pad is not None and torch.equal(
+        wide_pad.view(torch.int16), stock_pad.view(torch.int16)
+    )
+    inert_pad = torch.equal(
+        stock_pad[:, :size_n].contiguous().view(torch.int16), stock_real.view(torch.int16)
+    )
+    return (
+        f"marlinw vs stock at n={pad_n}: {'same' if same_kernel else 'DIFFERS'}; "
+        f"padding on the real columns: {'inert' if inert_pad else 'CHANGES THEM'}"
+    )
+
+
+def _pad_prompt_check(
+    layer: torch.nn.Module,
+    pad_n: int,
+    w_pad: torch.Tensor,
+    s_pad: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    global_scale: torch.Tensor,
+    ms,
+) -> tuple[bool, str]:
+    """(admitted, reason). Admitted only if the padded plan reproduces the
+    unpadded single call bitwise on the real columns at every checked row
+    count -- the same standard _prompt_check applies, but measured against the
+    call the layer runs today rather than against the padded one."""
+    gen = torch.Generator(device=layer.weight.device)
+    gen.manual_seed(pad_n * 31 + size_k)
+    try:
+        for m in ms:
+            x = _prompt_check_input(m, size_k, gen)
+            got = _marlin_fp4_wide_gemm(
+                x, w_pad, s_pad, global_scale, layer.workspace, pad_n, size_k
+            )
+            if got is None:
+                return False, "marlinw declined the padded plan"
+            ref = _marlin_fp4_single(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                global_scale,
+                layer.workspace,
+                size_n,
+                size_k,
+            )
+            if not torch.equal(
+                got[..., :size_n].contiguous().view(torch.int16), ref.view(torch.int16)
+            ):
+                return False, (
+                    f"differs from the unpadded call at M={m} ("
+                    + _pad_prompt_split(
+                        x, layer, pad_n, w_pad, s_pad, size_n, size_k, global_scale
+                    )
+                    + ")"
+                )
+        return True, "bitwise identical"
+    except Exception as e:  # noqa: BLE001
+        return False, f"self-check failed: {e}"
+
+
+def _try_padded_prompt(
+    layer: torch.nn.Module,
+    size_n: int,
+    size_k: int,
+    global_scale: torch.Tensor,
+    props,
+) -> bool:
+    """Admits a zero-padded column extension as the layer's prompt schedule."""
+    if os.environ.get("MUSE_PROMPT_PAD", "1") == "0":
+        return False
+    if marlinw is None or size_n % _PAD_TILE_N or size_n % 256 == 0:
+        return False
+    choice = _pad_prompt_width(
+        size_n, size_k, props.multi_processor_count,
+        int(props.shared_memory_per_block_optin),
+    )
+    if choice is None:
+        logger.info(
+            "NVFP4 prompt padding %dx%d: marlinw has no plan for any width up to "
+            "+%d columns", size_n, size_k, _PAD_MAX_COLUMNS,
+        )
+        return False
+    pad_n, splits = choice
+    padded = _pad_prompt_columns(layer, size_n, pad_n)
+    if padded is None:
+        return False
+    w_pad, s_pad = padded
+    # marlinw.prepare reads the layer's own attributes, so present the padded
+    # weight through a shim rather than touching the layer.
+    shim = types.SimpleNamespace(
+        output_size_per_partition=pad_n,
+        input_size_per_partition=size_k,
+        weight=w_pad,
+        weight_scale=s_pad,
+        weight_global_scale=global_scale,
+        bias=None,
+        workspace=layer.workspace,
+    )
+    if not marlinw.prepare(shim):
+        logger.info(
+            "NVFP4 prompt padding %dx%d -> n=%d: declined by marlinw.prepare",
+            size_n, size_k, pad_n,
+        )
+        return False
+    ok, reason = _pad_prompt_check(
+        layer, pad_n, w_pad, s_pad, size_n, size_k, global_scale, _PROMPT_CHECK_M
+    )
+    logger.info(
+        "NVFP4 prompt padding %dx%d -> n=%d (+%d columns, %.4f%% flops, %s k-split "
+        "tiles): marlinw on the zero-padded weight is %s against the stock call on "
+        "the unpadded weight at M=%s",
+        size_n, size_k, pad_n, pad_n - size_n,
+        100.0 * (pad_n - size_n) / size_n, splits, reason, list(_PROMPT_CHECK_M),
+    )
+    if not ok:
+        return False
+    layer.marlin_prompt_path = ("wide_pad", pad_n, w_pad, s_pad, marlinw.MIN_M)
+    _prompt_stats["padded"] += 1
+    return True
+
+
 def _prepare_narrow_attn(
     layer: torch.nn.Module, global_scale: torch.Tensor, size_n: int, size_k: int, sms: int
 ) -> None:
@@ -777,9 +1024,12 @@ def _prepare_prompt_gemm(layer: torch.nn.Module) -> None:
         return
     args = (weight, weight_scale, global_scale, layer.workspace, size_n, size_k)
 
+    wide_ready = marlinw is not None and marlinw.prepare(layer)
+    if not wide_ready and _try_padded_prompt(layer, size_n, size_k, global_scale, props):
+        return
+
     if (
-        marlinw is not None
-        and marlinw.prepare(layer)
+        wide_ready
         and _prompt_check(
             layer, lambda x: _marlin_fp4_wide_gemm(x, *args), _PROMPT_CHECK_M
         )
@@ -969,6 +1219,27 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
             decode = (decode_weight, scales)
             fixed_grid = palette is not None and getattr(layer, "marlin_decode6_fixed_grid", False)
             if path is None:
+                out = torch.ops.vllm.marlin_fp4_single_or_tiled(*args, *tail, *decode, palette, fixed_grid)
+            elif path[0] == "wide_pad":
+                # The padded columns exist only to make n divisible by 256; they
+                # are sliced off here, before the logits reach anything else.
+                # Below marlinw's minimum row count the padded plan cannot run,
+                # so those calls stay on the layer's own (unpadded) weight and
+                # its decode layout.
+                if args[0].shape[0] >= path[4]:
+                    out = torch.ops.vllm.marlin_fp4_wide(
+                        args[0], path[2], path[3], tail[0], tail[1], path[1], tail[3],
+                        None, None, False, None, None, 0, None, False,
+                    )
+                    out = out[..., :size_n]
+                    # A column slice of the padded output is already the right
+                    # shape for a 2-D call, and every consumer of these logits
+                    # (softmax, argmax, top-k, logprobs) takes a non-contiguous
+                    # tensor, so returning the view avoids a 207 MB copy at
+                    # M=512. Anything else goes through reshape, which copies.
+                    if out.shape == x.shape[:-1] + (size_n,):
+                        return out
+                    return out.reshape(x.shape[:-1] + (size_n,))
                 out = torch.ops.vllm.marlin_fp4_single_or_tiled(*args, *tail, *decode, palette, fixed_grid)
             elif path[0] == "wide":
                 out = torch.ops.vllm.marlin_fp4_wide(*args, *tail, *decode, path[1], *path[2], palette, fixed_grid)

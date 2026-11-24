@@ -47,12 +47,54 @@ def lib():
     vp = ctypes.c_void_p
     h.fp8_prefill_gemm.argtypes = [ctypes.c_int] * 4 + [vp] * 6 + [ctypes.c_size_t, ctypes.c_int, ctypes.c_int, vp]
     h.fp8_prefill_gemm.restype = ctypes.c_int
+    sb = getattr(h, "fp8_prefill_shared_bytes", None)
+    if sb is not None:
+        sb.argtypes = [ctypes.c_int]
+        sb.restype = ctypes.c_size_t
     _lib = h
     return _lib
 
 
+
 def config(n: int, k: int) -> int | None:
     return _CFG.get((n, k))
+
+
+def shared_bytes(cfg: int) -> int:
+    """Shared-memory footprint of a config (0 if unknown). Two CTAs per SM need <= 114 KiB each."""
+    h = lib()
+    fn = getattr(h, "fp8_prefill_shared_bytes", None) if h is not None else None
+    return int(fn(cfg)) if fn is not None else 0
+
+
+def bench(a: torch.Tensor, b: torch.Tensor, sa: torch.Tensor, sb: torch.Tensor, cfgs, iters: int = 20) -> dict:
+    """Median ms per call for each config id on fixed tensors (warm, 3 discarded warmups).
+
+    Only for sweeps outside graph capture; the numbers are for choosing a config, not for scoring.
+    """
+    import statistics
+
+    out = {}
+    for cfg in cfgs:
+        try:
+            gemm(a, b, sa, sb, cfg)  # also surfaces an unsupported config before timing it
+        except Exception as e:  # noqa: BLE001
+            out[cfg] = f"error: {e}"
+            continue
+        for _ in range(3):
+            gemm(a, b, sa, sb, cfg)
+        torch.cuda.synchronize()
+        times = []
+        for _ in range(iters):
+            start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+            start.record()
+            gemm(a, b, sa, sb, cfg)
+            end.record()
+            end.synchronize()
+            times.append(start.elapsed_time(end))
+        out[cfg] = round(statistics.median(times), 4)
+    return out
+
 
 
 def supported(a: torch.Tensor, b: torch.Tensor, sa: torch.Tensor, sb: torch.Tensor) -> bool:
