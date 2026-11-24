@@ -438,10 +438,10 @@ __device__ inline void dequant<nv_bfloat162, vllm::kFE2M1f.id(), true>(
   constexpr int RIGHT_SHIFT = BF16_EXPONENT - FP4_EXPONENT;
   constexpr int MASK = 0x70007000;
 
-  // Extract and shift FP4 values to FP16 format
-  int Out1 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
+  // Extract and shift FP4 values to BF16 format using 1-instruction LOP3
+  int Out1 = lop3<(0xf0 & 0xcc) | 0xaa>(q, 0x80008000, (q & MASK) >> RIGHT_SHIFT);
   q <<= 4;
-  int Out2 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
+  int Out2 = lop3<(0xf0 & 0xcc) | 0xaa>(q, 0x80008000, (q & MASK) >> RIGHT_SHIFT);
 
   // Note: reverse indexing is intentional because weights are permuted
   frag_b[1] = *reinterpret_cast<const nv_bfloat162*>(&Out1);

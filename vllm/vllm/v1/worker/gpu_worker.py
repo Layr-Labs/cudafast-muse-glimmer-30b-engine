@@ -512,6 +512,13 @@ class Worker(WorkerBase):
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
+        try:
+            from vllm.model_executor.kernels.linear.nvfp4.decode_placement import (
+                release_slow_hold,
+            )
+            release_slow_hold()
+        except Exception:  # noqa: BLE001
+            pass
         with memory_profiling(
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
@@ -676,19 +683,36 @@ class Worker(WorkerBase):
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
 
-        with self._maybe_get_memory_pool_context(tag="kv_cache"):
-            self.model_runner.initialize_kv_cache(kv_cache_config)
+        try:
+            from vllm.model_executor.kernels.linear.nvfp4.decode_placement import (
+                ensure_slow_hold_headroom,
+                release_slow_hold,
+            )
+            kv_req = int(getattr(self.cache_config, "kv_cache_memory_bytes", 0) or 0)
+            ensure_slow_hold_headroom(kv_req + (8 << 30))
+        except Exception:  # noqa: BLE001
+            release_slow_hold = None
 
-        if self.model_config.enable_return_routed_experts:
-            self.model_runner.init_routed_experts_capturer()
+        try:
+            with self._maybe_get_memory_pool_context(tag="kv_cache"):
+                self.model_runner.initialize_kv_cache(kv_cache_config)
 
-        # Build KV-zero metadata outside the CuMem pool so the bookkeeping
-        # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
-        # allocator and are not discarded during sleep/wake cycles.
-        if kv_cache_config.needs_kv_cache_zeroing and hasattr(
-            self.model_runner, "_init_kv_zero_meta"
-        ):
-            self.model_runner._init_kv_zero_meta()
+            if self.model_config.enable_return_routed_experts:
+                self.model_runner.init_routed_experts_capturer()
+
+            # Build KV-zero metadata outside the CuMem pool so the bookkeeping
+            # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
+            # allocator and are not discarded during sleep/wake cycles.
+            if kv_cache_config.needs_kv_cache_zeroing and hasattr(
+                self.model_runner, "_init_kv_zero_meta"
+            ):
+                self.model_runner._init_kv_zero_meta()
+        finally:
+            if release_slow_hold is not None:
+                try:
+                    release_slow_hold()
+                except Exception:  # noqa: BLE001
+                    pass
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
