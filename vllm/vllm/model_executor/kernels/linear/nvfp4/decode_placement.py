@@ -739,9 +739,18 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             sa = ref.input_scale if getattr(ref, "input_scale", None) is not None else torch.ones((1,), dtype=torch.float32, device=dev)
             sb = ref.weight_scale
             cfg_dn = _fp8pf.config(6656, 19968) or 1
+            use_ws_dn = (
+                _fp8ws is not None
+                and _fp8ws.ready(dev)
+                and os.environ.get("FP8WS", "1") != "0"
+                and (6656, 19968) in getattr(_fp8ws, "SHAPES", ())
+            )
 
-            def run_fp8_down(weight, x=x, sa=sa, sb=sb, cfg_dn=cfg_dn):
-                _fp8pf.gemm(x, weight, sa, sb, cfg_dn)
+            def run_fp8_down(weight, x=x, sa=sa, sb=sb, cfg_dn=cfg_dn, use_ws_dn=use_ws_dn):
+                if use_ws_dn:
+                    _fp8ws.gemm(x, weight, sa, sb)
+                else:
+                    _fp8pf.gemm(x, weight, sa, sb, cfg_dn)
 
             groups.append(("fp8_6656x19968", fp8_down_layers, run_fp8_down, _gfp8.prefill_moved, False))
         if len(fp8_swiglu_layers) > 1:
@@ -791,9 +800,18 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             sa = ref.input_scale if getattr(ref, "input_scale", None) is not None else torch.ones((1,), dtype=torch.float32, device=dev)
             sb = ref.weight_scale
             cfg_o = _fp8pf.config(6656, 4096) or 3
+            use_ws_o = (
+                _fp8ws is not None
+                and _fp8ws.ready(dev)
+                and os.environ.get("FP8WS", "1") != "0"
+                and (6656, 4096) in getattr(_fp8ws, "SHAPES", ())
+            )
 
-            def run_fp8_o(weight, x=x, sa=sa, sb=sb, cfg_o=cfg_o):
-                _fp8pf.gemm(x, weight, sa, sb, cfg_o)
+            def run_fp8_o(weight, x=x, sa=sa, sb=sb, cfg_o=cfg_o, use_ws_o=use_ws_o):
+                if use_ws_o:
+                    _fp8ws.gemm(x, weight, sa, sb)
+                else:
+                    _fp8pf.gemm(x, weight, sa, sb, cfg_o)
 
             groups.append(("fp8_attn_6656x4096", fp8_attn_o, run_fp8_o, _gfp8.prefill_moved, False))
         if PREFILL_PLACE_ATTN and _fp8ws is not None and _fp8ws.ready(torch.device("cuda")):
@@ -1156,3 +1174,11 @@ def place_decode_weights(model: torch.nn.Module) -> None:
         if not PREFILL_ENABLED:
             _SLOW_HOLD.clear()
             torch.cuda.empty_cache()
+    try:
+        import muse_marlin6_gemv as _m6
+        if hasattr(_m6, "register_all_gate_up_swiglu"):
+            _m6.register_all_gate_up_swiglu(model)
+        if hasattr(_m6, "register_all_oproj_sigmoid"):
+            _m6.register_all_oproj_sigmoid(model)
+    except Exception as err:  # noqa: BLE001
+        logger.warning("Decode6 post-placement registration skipped: %s", err)
