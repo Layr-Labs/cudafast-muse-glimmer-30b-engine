@@ -142,6 +142,8 @@ _GATE_UP_TILE_ORDER: dict[torch.device, torch.Tensor] = {}
 _GATED_OPROJ: set[int] = set()
 _ALL_OPROJ_GATED_READY: bool = False
 _LMPOST_BUFS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_LM_VERIFY_BUFS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_ALLOW_STRIDED_LM_OUT: bool = False
 _consume_down_swiglu = None
 _notify_gate_up_swiglu = None
 _consume_oproj_sigmoid = None
@@ -916,7 +918,22 @@ def decode_linear6(
                     raise RuntimeError(f"SM121 Marlin multi-M gate_up SwiGLU launch failed with CUDA error {status}")
                 _notify_gate_up_swiglu(out_buf_m.data_ptr(), sw_entry_m, True, None)
                 return out_buf_m
-            output = x.new_empty((m, eff_n))
+            if lm_pad128 and _ALLOW_STRIDED_LM_OUT:
+                dev_idx = x.device.index if x.device.index is not None else torch.cuda.current_device()
+                vbufs = _LM_VERIFY_BUFS.get(dev_idx)
+                if vbufs is None and not torch.cuda.is_current_stream_capturing():
+                    vbufs = (
+                        torch.empty((8, LM_HEAD_PAD128_N), dtype=x.dtype, device=x.device),
+                        torch.empty((96, 16, 128), dtype=torch.float32, device=x.device),
+                    )
+                    _LM_VERIFY_BUFS[dev_idx] = vbufs
+                if vbufs is not None:
+                    output = vbufs[0][:m]
+                    partials = vbufs[1][:blocks]
+                else:
+                    output = x.new_empty((m, eff_n))
+            else:
+                output = x.new_empty((m, eff_n))
             status = _sk_tma4_ilv_m(
                 x.data_ptr(), tiled_weight.data_ptr(), output.data_ptr(), partials.data_ptr(),
                 scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
@@ -925,6 +942,8 @@ def decode_linear6(
             if status:
                 raise RuntimeError(f"SM121 Marlin multi-M (scale6) launch failed with CUDA error {status}")
             if lm_pad128:
+                if _ALLOW_STRIDED_LM_OUT:
+                    return output[:, :n]
                 return output[:, :n].contiguous()
             if (n, k) == (GATE_UP_N, GATE_UP_K) and global_scale.data_ptr() in _SWIGLU_GATE_UP:
                 order = _GATE_UP_TILE_ORDER.get(output.device)

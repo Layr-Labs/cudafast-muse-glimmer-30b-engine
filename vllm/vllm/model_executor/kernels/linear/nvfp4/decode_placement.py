@@ -1314,13 +1314,25 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             n_groups, saved_ms, time.perf_counter() - began,
         )
         try:
+            if hasattr(model, "register_stacked_bf16_attn"):
+                model.register_stacked_bf16_attn()
+                torch.cuda.synchronize()
+        except Exception as err:  # noqa: BLE001
+            logger.warning("BF16 stacked attn registration skipped: %s", err)
+        try:
             import muse_marlin6_gemv as _m6
             if hasattr(_m6, "register_all_gate_up_swiglu"):
                 _m6.register_all_gate_up_swiglu(model)
+                torch.cuda.synchronize()
+        except Exception as err:  # noqa: BLE001
+            logger.warning("Decode6 gate_up SwiGLU registration skipped: %s", err)
+        try:
+            import muse_marlin6_gemv as _m6
             if hasattr(_m6, "register_all_oproj_sigmoid"):
                 _m6.register_all_oproj_sigmoid(model)
+                torch.cuda.synchronize()
         except Exception as err:  # noqa: BLE001
-            logger.warning("Decode6 post-placement registration skipped: %s", err)
+            logger.warning("Decode6 o_proj sigmoid registration skipped: %s", err)
         _post_reg_done = True
     except Exception as err:  # noqa: BLE001 - the load must go on
         logger.warning("Decode weight placement failed and was skipped: %s", err)
@@ -1331,10 +1343,22 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             torch.cuda.empty_cache()
     if not _post_reg_done:
         try:
+            if hasattr(model, "register_stacked_bf16_attn"):
+                model.register_stacked_bf16_attn()
+                torch.cuda.synchronize()
+        except Exception as err:  # noqa: BLE001
+            logger.warning("BF16 stacked attn registration skipped: %s", err)
+        try:
             import muse_marlin6_gemv as _m6
             if hasattr(_m6, "register_all_gate_up_swiglu"):
                 _m6.register_all_gate_up_swiglu(model)
+                torch.cuda.synchronize()
+        except Exception as err:  # noqa: BLE001
+            logger.warning("Decode6 gate_up SwiGLU registration skipped: %s", err)
+        try:
+            import muse_marlin6_gemv as _m6
             if hasattr(_m6, "register_all_oproj_sigmoid"):
                 _m6.register_all_oproj_sigmoid(model)
+                torch.cuda.synchronize()
         except Exception as err:  # noqa: BLE001
-            logger.warning("Decode6 post-placement registration skipped: %s", err)
+            logger.warning("Decode6 o_proj sigmoid registration skipped: %s", err)

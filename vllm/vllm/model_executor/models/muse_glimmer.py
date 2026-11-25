@@ -1245,6 +1245,8 @@ class _GateSideStream:
 
     def fork(self, x: torch.Tensor, layer_idx: int) -> None:
         self.active = False
+        if _STACKED_ATTN_GATE_READY:
+            return
         bf16_gate = self.bf16_gate_by_layer.get(layer_idx)
         if bf16_gate is not None:
             if not x.is_cuda:
@@ -1497,6 +1499,15 @@ def _init_qk_fused() -> bool:
 
 
 _BF16_DUAL_WS_ADMITTED: set[int] = set()
+_BF16_DUAL_DECODE: dict[int, tuple[torch.Tensor, int]] = {}
+_STACKED_ATTN_GATE_READY: bool = False
+_STACKED_BF16_ENABLED = os.environ.get("MUSE_STACKED_ATTN", "1") != "0" and os.environ.get("MUSE_STACKED_ATTN_BF16", "1") != "0"
+_STACKED_BF16_MIN_M = int(os.environ.get("MUSE_STACKED_ATTN_BF16_MIN_M", os.environ.get("MUSE_STACKED_ATTN_MIN_M", "2")))
+
+
+def _set_stacked_gate_ready(flag: bool) -> None:
+    global _STACKED_ATTN_GATE_READY
+    _STACKED_ATTN_GATE_READY = flag
 
 
 def _muse_bf16_qkv_or_stacked_impl(
@@ -1506,6 +1517,7 @@ def _muse_bf16_qkv_or_stacked_impl(
     packed_qkv: torch.Tensor,
     idx_qkv: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    global _STACKED_ATTN_GATE_READY
     if x.ndim == 2 and x.shape == (512, 6656) and x.is_contiguous():
         if w_cat.data_ptr() in _BF16_DUAL_WS_ADMITTED:
             import fp8ws as _fp8ws
@@ -1514,6 +1526,25 @@ def _muse_bf16_qkv_or_stacked_impl(
                 return dual
         out = torch.mm(x, w_cat.t())
         return out[:, :4608].contiguous(), out[:, 4608:].contiguous()
+    if (
+        _STACKED_BF16_ENABLED
+        and x.ndim == 2
+        and _STACKED_BF16_MIN_M <= x.shape[0] <= 8
+        and x.shape[1] == 6656
+        and x.dtype == torch.bfloat16
+        and x.is_cuda
+        and x.is_contiguous()
+    ):
+        d_entry = _BF16_DUAL_DECODE.get(w_cat.data_ptr())
+        if d_entry is not None:
+            import muse_bfx_ext as _bfx
+            blob_c, base_c = d_entry
+            m = int(x.shape[0])
+            qkv_o = x.new_empty((m, 4608))
+            gate_o = x.new_empty((m, 4096))
+            _bfx.rans_gemm_dual(x, blob_c, qkv_o, gate_o, 4608, 4096, 6656, base_c)
+            _STACKED_ATTN_GATE_READY = True
+            return qkv_o, gate_o
     qkv = torch.ops.vllm.muse_bf16_lane_linear.default(x, w_qkv, packed_qkv, idx_qkv)
     return qkv, x.new_empty((x.shape[0], 4096))
 
@@ -1535,6 +1566,10 @@ def _muse_bf16_gate_fill_impl(
     packed_gate: torch.Tensor,
     idx_gate: torch.Tensor,
 ) -> None:
+    global _STACKED_ATTN_GATE_READY
+    if _STACKED_ATTN_GATE_READY:
+        _STACKED_ATTN_GATE_READY = False
+        return
     if x.ndim == 2 and x.shape == (512, 6656) and x.is_contiguous():
         return
     if (
@@ -2304,6 +2339,14 @@ class MuseGlimmerForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is None:
             return None
+        softcap_inplace = getattr(self, "_lmpost_softcap_inplace", None)
+        if (
+            softcap_inplace is not None
+            and logits.dtype == torch.bfloat16
+            and (logits.is_contiguous() or (logits.ndim == 2 and logits.stride(1) == 1))
+            and softcap_inplace(logits, self.output_multiplier, self.final_logit_softcapping)
+        ):
+            return logits
         logits = logits * self.output_multiplier
         if self.final_logit_softcapping is not None:
             cap = self.final_logit_softcapping
@@ -2313,6 +2356,11 @@ class MuseGlimmerForCausalLM(
     def prepare_final_sample_tile(self, n: int):
         if n != 512 or not get_pp_group().is_last_rank or not get_pp_group().is_first_rank:
             return None
+        if self.model.aux_hidden_state_layers:
+            if os.environ.get("MUSE_FINAL_SLAB_DFLASH", "1") == "0":
+                return None
+            if any(lid >= self.model.end_layer for lid in self.model.aux_hidden_state_layers):
+                return None
         try:
             import muse_final_slab
         except (ImportError, OSError):
@@ -2330,6 +2378,9 @@ class MuseGlimmerForCausalLM(
         # every BF16 value; ties go to the lowest index, as the stock greedy sampler's block argmax + argmax.
         self._lmpost_softcap_argmax = None
         self._lmpost_softcap_argmax_into = None
+        self._lmpost_softcap_inplace = None
+        self._lmpost_greedy_verify_strided = None
+        self._lmpost_greedy_verify_strided_into = None
         self._pack_persisting_norm_arena()
         # Gate-quant fold (harness/kernels/sandwich/muse_sandwich.py): register every FP8-attention layer's
         # qkv and output-gate input scales; the 512-row native sandwich of such a layer then also writes the
@@ -2377,8 +2428,14 @@ class MuseGlimmerForCausalLM(
                 dev = lm_head.weight.device
                 lmpost._get_lut(dev, self.output_multiplier, self.final_logit_softcapping)
                 lmpost._get_scratch(dev)
+                if hasattr(lmpost, "_get_verify_scratch"):
+                    lmpost._get_verify_scratch(dev)
                 self._lmpost_softcap_argmax = lmpost.softcap_argmax
                 self._lmpost_softcap_argmax_into = getattr(lmpost, "softcap_argmax_into", None)
+                self._lmpost_greedy_verify_strided = getattr(lmpost, "greedy_verify_strided", None)
+                self._lmpost_greedy_verify_strided_into = getattr(lmpost, "greedy_verify_strided_into", None)
+                if os.environ.get("LMPOST_SOFTCAP_INPLACE", "1") != "0":
+                    self._lmpost_softcap_inplace = getattr(lmpost, "softcap_inplace", None)
         except ImportError:
             pass
 
@@ -2524,6 +2581,55 @@ class MuseGlimmerForCausalLM(
                     logger.warning("BF16 stacked qkv+gate prefill skipped on layer %d: %s", attn.layer_idx, exc)
         if bf16_stack_cnt:
             logger.info("Attention dual prefill: %d BF16 stacked qkv+gate", bf16_stack_cnt)
+
+    def register_stacked_bf16_attn(self) -> int:
+        _BF16_DUAL_DECODE.clear()
+        if not _STACKED_BF16_ENABLED:
+            return 0
+        try:
+            import muse_bfx_ext as _bfx
+            if not hasattr(_bfx, "rans_gemm_dual"):
+                return 0
+        except Exception:
+            return 0
+        admitted = 0
+        for layer in islice(self.model.layers, self.model.start_layer, self.model.end_layer):
+            attn = layer.self_attn
+            w_cat = getattr(attn, "_bf16_qkv_gate_w", None)
+            if not getattr(attn, "_bf16_dual_prefill", False) or w_cat is None or not w_cat.is_cuda:
+                continue
+            try:
+                blob_c = _bfx.rans_pack(w_cat)
+                unp = _bfx.rans_unpack(blob_c, 8704, 6656)
+                if not torch.equal(unp.view(torch.int16), w_cat.view(torch.int16)):
+                    del unp, blob_c
+                    continue
+                del unp
+                base_c = int(_bfx.rans_base(blob_c))
+                gen = torch.Generator(device=w_cat.device).manual_seed(20261131 + attn.layer_idx)
+                ok = True
+                for m_test in (2, 7):
+                    for sig in (0.05, 1.0, 12.0):
+                        x = (torch.randn((m_test, 6656), generator=gen, device=w_cat.device) * sig).to(torch.bfloat16)
+                        r0 = F.linear(x, attn.qkv_proj.weight)
+                        r1 = F.linear(x, attn.output_gate_proj.weight)
+                        g0 = torch.empty((m_test, 4608), dtype=torch.bfloat16, device=w_cat.device)
+                        g1 = torch.empty((m_test, 4096), dtype=torch.bfloat16, device=w_cat.device)
+                        _bfx.rans_gemm_dual(x, blob_c, g0, g1, 4608, 4096, 6656, base_c)
+                        if not (torch.equal(g0.view(torch.int16), r0.view(torch.int16)) and torch.equal(g1.view(torch.int16), r1.view(torch.int16))):
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if ok:
+                    attn.register_buffer("_bf16_qkv_gate_rans", blob_c, persistent=False)
+                    _BF16_DUAL_DECODE[w_cat.data_ptr()] = (blob_c, base_c)
+                    admitted += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Stacked BF16 qkv+gate decode skipped on layer %d: %s", attn.layer_idx, exc)
+        if admitted:
+            logger.info("Stacked BF16 qkv+output_gate rANS admitted bitwise (0-ULP) on %d layers (min_m=%d)", admitted, _STACKED_BF16_MIN_M)
+        return admitted
 
 
 _LAYER0_INPUT_NORM_HASH = "205ac75eb1f7a0ece86a243e894446a5b327438374179ec02f0225baedfaaf84"

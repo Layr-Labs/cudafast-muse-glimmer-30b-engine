@@ -2739,7 +2739,7 @@ __device__ __forceinline__ void ldsm4_v_pair64(
       : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]) : "r"(addr));
 }
 
-template <bool IsV>
+template <bool IsV, int BlockSize>
 __device__ __forceinline__ void issue_kv64_paged(
     uint4 smem_tile[64][16],
     const __nv_bfloat16* __restrict__ kv_ptr,
@@ -2754,18 +2754,42 @@ __device__ __forceinline__ void issue_kv64_paged(
   const int r_in_16 = tid >> 4;
   const int c = tid & 15;
   const int c_phys = c ^ (r_in_16 & 7);
-  const int lb_base = tok_base >> 4;
-  #pragma unroll
-  for (int u = 0; u < 4; ++u) {
-    const int phys_blk = __ldg(block_table + lb_base + u);
-    const int r = (u << 4) + r_in_16;
-    const int64_t row_off = static_cast<int64_t>(phys_blk) * stride_block
-                          + static_cast<int64_t>(r_in_16) * stride_slot + head_v_off;
-    cp_async_16(smem_u32(&smem_tile[r][c_phys]), kv_ptr + row_off + (c << 3));
+  if constexpr (BlockSize == 64) {
+    const int phys_blk = __ldg(block_table + (tok_base >> 6));
+    const int64_t base_off = static_cast<int64_t>(phys_blk) * stride_block
+                           + static_cast<int64_t>(r_in_16) * stride_slot + head_v_off + (c << 3);
+    const int64_t step16 = stride_slot << 4;
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int r = (u << 4) + r_in_16;
+      cp_async_16(smem_u32(&smem_tile[r][c_phys]), kv_ptr + base_off + static_cast<int64_t>(u) * step16);
+    }
+  } else if constexpr (BlockSize == 32) {
+    const int lb_base = tok_base >> 5;
+    const int64_t step16 = stride_slot << 4;
+    #pragma unroll
+    for (int b = 0; b < 2; ++b) {
+      const int phys_blk = __ldg(block_table + lb_base + b);
+      const int64_t base_off = static_cast<int64_t>(phys_blk) * stride_block
+                             + static_cast<int64_t>(r_in_16) * stride_slot + head_v_off + (c << 3);
+      const int r0 = (b << 5) + r_in_16;
+      cp_async_16(smem_u32(&smem_tile[r0][c_phys]), kv_ptr + base_off);
+      cp_async_16(smem_u32(&smem_tile[r0 + 16][c_phys]), kv_ptr + base_off + step16);
+    }
+  } else {
+    const int lb_base = tok_base >> 4;
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int phys_blk = __ldg(block_table + lb_base + u);
+      const int r = (u << 4) + r_in_16;
+      const int64_t row_off = static_cast<int64_t>(phys_blk) * stride_block
+                            + static_cast<int64_t>(r_in_16) * stride_slot + head_v_off;
+      cp_async_16(smem_u32(&smem_tile[r][c_phys]), kv_ptr + row_off + (c << 3));
+    }
   }
 }
 
-template <int Mode, bool kPdlProd>
+template <int Mode, bool kPdlProd, int BlockSize>
 __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
     const __nv_bfloat16* __restrict__ kv_ptr,
@@ -2831,8 +2855,8 @@ __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
   float row_max0 = -INFINITY, row_max1 = -INFINITY;
   float row_sum0 = 0.0f, row_sum1 = 0.0f;
 
-  issue_kv64_paged<false>(kv_smem[0], kv_ptr, block_table, (nb_max - 1) << 7,
-                          kv_head, stride_block, stride_slot, stride_kv_head, tid);
+  issue_kv64_paged<false, BlockSize>(kv_smem[0], kv_ptr, block_table, (nb_max - 1) << 7,
+                                     kv_head, stride_block, stride_slot, stride_kv_head, tid);
   cp_async_commit();
 
   for (int nb = nb_max - 1; nb >= 0; --nb) {
@@ -2843,8 +2867,8 @@ __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
       s_frag[ni][0] = 0.0f; s_frag[ni][1] = 0.0f; s_frag[ni][2] = 0.0f; s_frag[ni][3] = 0.0f;
     }
 
-    issue_kv64_paged<false>(kv_smem[1], kv_ptr, block_table, block_tok_base + 64,
-                            kv_head, stride_block, stride_slot, stride_kv_head, tid);
+    issue_kv64_paged<false, BlockSize>(kv_smem[1], kv_ptr, block_table, block_tok_base + 64,
+                                       kv_head, stride_block, stride_slot, stride_kv_head, tid);
     cp_async_commit();
     cp_async_wait<1>();
     __syncthreads();
@@ -2866,8 +2890,8 @@ __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
     }
     __syncthreads();
 
-    issue_kv64_paged<true>(kv_smem[0], kv_ptr, block_table, block_tok_base,
-                           kv_head, stride_block, stride_slot, stride_kv_head, tid);
+    issue_kv64_paged<true, BlockSize>(kv_smem[0], kv_ptr, block_table, block_tok_base,
+                                      kv_head, stride_block, stride_slot, stride_kv_head, tid);
     cp_async_commit();
     cp_async_wait<1>();
     __syncthreads();
@@ -2889,8 +2913,8 @@ __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
     }
     __syncthreads();
 
-    issue_kv64_paged<true>(kv_smem[1], kv_ptr, block_table, block_tok_base + 64,
-                           kv_head, stride_block, stride_slot, stride_kv_head, tid);
+    issue_kv64_paged<true, BlockSize>(kv_smem[1], kv_ptr, block_table, block_tok_base + 64,
+                                      kv_head, stride_block, stride_slot, stride_kv_head, tid);
     cp_async_commit();
 
     float m0 = -INFINITY, m1 = -INFINITY;
@@ -2983,8 +3007,8 @@ __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
     __syncthreads();
 
     if (nb > 0) {
-      issue_kv64_paged<false>(kv_smem[0], kv_ptr, block_table, (nb - 1) << 7,
-                              kv_head, stride_block, stride_slot, stride_kv_head, tid);
+      issue_kv64_paged<false, BlockSize>(kv_smem[0], kv_ptr, block_table, (nb - 1) << 7,
+                                         kv_head, stride_block, stride_slot, stride_kv_head, tid);
       cp_async_commit();
       cp_async_wait<1>();
     } else {
@@ -3086,8 +3110,8 @@ __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
   }
 }
 
-template <int Mode>
-static inline cudaError_t launch_prefill_mode(
+template <int Mode, int BlockSize>
+static inline cudaError_t launch_prefill_mode_bs(
     bool pdl_prod, dim3 grid, dim3 block, cudaStream_t st,
     const __nv_bfloat16* q, const __nv_bfloat16* kv, const __nv_bfloat16* gate,
     const float* fp8_scale, void* out, const int32_t* bt,
@@ -3106,14 +3130,40 @@ static inline cudaError_t launch_prefill_mode(
     cfg.attrs = attr;
     cfg.numAttrs = 1;
     return cudaLaunchKernelEx(
-        &cfg, gqa16_prefill_v3_kernel<Mode, true>,
+        &cfg, gqa16_prefill_v3_kernel<Mode, true, BlockSize>,
         q, kv, gate, fp8_scale, out, bt, seqlen_q, q_offset, scale_log2,
         q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
   }
-  gqa16_prefill_v3_kernel<Mode, false><<<grid, block, 0, st>>>(
+  gqa16_prefill_v3_kernel<Mode, false, BlockSize><<<grid, block, 0, st>>>(
       q, kv, gate, fp8_scale, out, bt, seqlen_q, q_offset, scale_log2,
       q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
   return cudaGetLastError();
+}
+
+template <int Mode>
+static inline cudaError_t launch_prefill_mode(
+    int block_size, bool pdl_prod, dim3 grid, dim3 block, cudaStream_t st,
+    const __nv_bfloat16* q, const __nv_bfloat16* kv, const __nv_bfloat16* gate,
+    const float* fp8_scale, void* out, const int32_t* bt,
+    int seqlen_q, int q_offset, float scale_log2,
+    int64_t q_tok_stride, int64_t q_head_stride, int64_t out_tok_stride,
+    int64_t stride_block, int64_t stride_slot, int64_t stride_kv_head) {
+  if (block_size == 64) {
+    return launch_prefill_mode_bs<Mode, 64>(
+        pdl_prod, grid, block, st, q, kv, gate, fp8_scale, out, bt,
+        seqlen_q, q_offset, scale_log2,
+        q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
+  }
+  if (block_size == 32) {
+    return launch_prefill_mode_bs<Mode, 32>(
+        pdl_prod, grid, block, st, q, kv, gate, fp8_scale, out, bt,
+        seqlen_q, q_offset, scale_log2,
+        q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
+  }
+  return launch_prefill_mode_bs<Mode, 16>(
+      pdl_prod, grid, block, st, q, kv, gate, fp8_scale, out, bt,
+      seqlen_q, q_offset, scale_log2,
+      q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
 }
 
 }  // namespace muse_gqa16_pf
@@ -3128,7 +3178,7 @@ extern "C" int muse_gqa16_prefill(
     void* cuda_stream) {
   if (!q_ptr || !kv_ptr || !out_ptr || !block_table_ptr ||
       seqlen_q <= 0 || (seqlen_q & 7) != 0 || q_offset < 0 || (q_offset & 7) != 0 ||
-      block_size != 16 || mode < 0 || mode > 2) {
+      (block_size != 16 && block_size != 32 && block_size != 64) || mode < 0 || mode > 2) {
     return 1;
   }
   const bool use_scale_mode3 = ((scale_mode & 3) == 3);
@@ -3147,17 +3197,17 @@ extern "C" int muse_gqa16_prefill(
   cudaError_t err;
   if (mode == 0) {
     err = muse_gqa16_pf::launch_prefill_mode<0>(
-        pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
+        block_size, pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
         seqlen_q, q_offset, scale_log2,
         q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
   } else if (mode == 1) {
     err = muse_gqa16_pf::launch_prefill_mode<1>(
-        pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
+        block_size, pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
         seqlen_q, q_offset, scale_log2,
         q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
   } else {
     err = muse_gqa16_pf::launch_prefill_mode<2>(
-        pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
+        block_size, pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
         seqlen_q, q_offset, scale_log2,
         q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
   }

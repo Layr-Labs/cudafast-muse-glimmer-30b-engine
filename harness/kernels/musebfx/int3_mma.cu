@@ -27,12 +27,13 @@ constexpr int kStages = 6;
 
 __device__ __forceinline__ void int3_mma_m16n8k16(
     float& d0, float& d1, float& d2, float& d3,
-    uint32_t a0, uint32_t a2, uint32_t b0, uint32_t b1) {
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
-      : "r"(a0), "r"(0u), "r"(a2), "r"(0u), "r"(b0), "r"(b1));
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
 __device__ __forceinline__ uint64_t int3_pol_ef() {
@@ -123,16 +124,28 @@ __global__ void int3_pack_kernel(
 
 struct alignas(16) Int3StageSmem {
   uint8_t w[kStages][kStepWBytes];     // 6 * 1792 = 10752 B
-  __nv_bfloat16 a[kStages][8][64];     // 6 * 1024 = 6144 B
-};                                     // Total = 16896 B (16.5 KiB)
+  __nv_bfloat16 a[kStages][16][72];    // 6 * 2304 = 13824 B (bank-conflict-free 144B row stride)
+};                                     // Total = 24576 B (24.0 KiB)
+
+struct Int3Aux5Ptrs {
+  const __nv_bfloat16* p0;
+  const __nv_bfloat16* p1;
+  const __nv_bfloat16* p2;
+  const __nv_bfloat16* p3;
+  const __nv_bfloat16* p4;
+  int kg_each;
+};
+
+__device__ __forceinline__ const __nv_bfloat16* int3_aux5_ptr(const Int3Aux5Ptrs& a, int ci) {
+  return (ci == 0) ? a.p0 : (ci == 1) ? a.p1 : (ci == 2) ? a.p2 : (ci == 3) ? a.p3 : a.p4;
+}
 
 // Persistent 48-CTA / 96-CTA or direct GEMM with optional split-K (for small N/64 like down/fc).
-// When kSplitK == 1, writes directly to BF16 C.
-// When kSplitK > 1, grid = (N/64, kSplitK), accumulates to FP32 partials, then final CTA reduces?
-// Even simpler: use 1-pass persistent 48-CTA or direct (N/64) for N>=10240, and 4-way split-K via atomicAdd to FP32 + tiny epilogue or persistent!
-template <bool kSplitK>
+// When kAux5 is true, reads 5 contiguous [M, K_each] BF16 activation slices directly without torch.cat.
+template <bool kSplitK, bool kAux5 = false>
 __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
     const __nv_bfloat16* __restrict__ A,
+    Int3Aux5Ptrs aux5,
     const uint8_t* __restrict__ W_packed,
     __nv_bfloat16* __restrict__ C,
     float* __restrict__ C_fp32,
@@ -171,12 +184,25 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
       int3_cp_async16_ef(sd, w_cta + static_cast<size_t>(kg) * kStepWBytes + tid * 16, pol);
     }
-    if (tid < 64) {
+    {
       const int row = tid >> 3;
       const int col8 = tid & 7;
       if (row < M) {
         const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][row][col8 * 8]));
-        int3_cp_async16_ca(sd, A + static_cast<size_t>(row) * K + kg * 64 + col8 * 8);
+        if constexpr (kAux5) {
+          // Fast exact branchless chunk lookup for 5 chunks (avoids 32-bit integer division in hot loop).
+          const int ke = aux5.kg_each;
+          int ci = 0;
+          int kg_loc = kg;
+          if (kg_loc >= ke) { kg_loc -= ke; ci = 1; }
+          if (kg_loc >= ke) { kg_loc -= ke; ci = 2; }
+          if (kg_loc >= ke) { kg_loc -= ke; ci = 3; }
+          if (kg_loc >= ke) { kg_loc -= ke; ci = 4; }
+          const int k_each = ke << 6;
+          int3_cp_async16_ca(sd, int3_aux5_ptr(aux5, ci) + static_cast<size_t>(row) * k_each + kg_loc * 64 + col8 * 8);
+        } else {
+          int3_cp_async16_ca(sd, A + static_cast<size_t>(row) * K + kg * 64 + col8 * 8);
+        }
       }
     }
     asm volatile("cp.async.commit_group;\n" ::: "memory");
@@ -211,12 +237,16 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
     __syncthreads();
 
     // Load A + both W tiles from stage `st`, then immediately issue stage `i + 5` into free slot!
-    const uint32_t* a_row_u32 = reinterpret_cast<const uint32_t*>(&smem.a[st][g][0]);
-    uint32_t a0_r[4], a2_r[4];
+    const int g1 = g + 8;
+    const uint32_t* a_row0_u32 = reinterpret_cast<const uint32_t*>(&smem.a[st][g][0]);
+    const uint32_t* a_row1_u32 = reinterpret_cast<const uint32_t*>(&smem.a[st][g1][0]);
+    uint32_t a0_r[4], a1_r[4], a2_r[4], a3_r[4];
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
-      a0_r[s] = (g < M) ? a_row_u32[s * 8 + t] : 0u;
-      a2_r[s] = (g < M) ? a_row_u32[s * 8 + 4 + t] : 0u;
+      a0_r[s] = (g < M) ? a_row0_u32[s * 8 + t] : 0u;
+      a2_r[s] = (g < M) ? a_row0_u32[s * 8 + 4 + t] : 0u;
+      a1_r[s] = (g1 < M) ? a_row1_u32[s * 8 + t] : 0u;
+      a3_r[s] = (g1 < M) ? a_row1_u32[s * 8 + 4 + t] : 0u;
     }
 
     const uint8_t* wt0 = &smem.w[st][(warp * 2 + 0) * kTileBytes];
@@ -234,8 +264,6 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
     const float zr1 = __bfloat162float(sz1.y);
 
     // Next write slot is (st + kPreload) % kStages = (st + 5) % 6 (last read 1 iter ago, before __syncthreads()!).
-    // Wait: to be 100% sure ALL warps finished reading (st + 5) % 6, notice we ALREADY loaded everything from `st`
-    // into registers above, AND the previous __syncthreads() guarantees all warps finished reading `st - 1 = (st + 5) % 6`!
     const int next_i = i + kPreload;
     if (next_i < my_kgs) {
       const int next_st = (st + kPreload >= kStages) ? (st + kPreload - kStages) : (st + kPreload);
@@ -254,7 +282,7 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
                                           __fmaf_rn(static_cast<float>(q1), sc0, zr0));
       const uint32_t b1 = int3_bf16x2_u32(__fmaf_rn(static_cast<float>(q2), sc0, zr0),
                                           __fmaf_rn(static_cast<float>(q3), sc0, zr0));
-      int3_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0_r[s], a2_r[s], b0, b1);
+      int3_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0_r[s], a1_r[s], a2_r[s], a3_r[s], b0, b1);
 
       const uint32_t p0 = (lo2_1 & 3u) | ((hi1_1 & 1u) << 2);
       const uint32_t p1 = ((lo2_1 >> 2) & 3u) | (((hi1_1 >> 1) & 1u) << 2);
@@ -266,15 +294,15 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
                                           __fmaf_rn(static_cast<float>(p1), sc1, zr1));
       const uint32_t c1 = int3_bf16x2_u32(__fmaf_rn(static_cast<float>(p2), sc1, zr1),
                                           __fmaf_rn(static_cast<float>(p3), sc1, zr1));
-      int3_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0_r[s], a2_r[s], c0, c1);
+      int3_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0_r[s], a1_r[s], a2_r[s], a3_r[s], c0, c1);
     }
 
     st = (st + 1 == kStages) ? 0 : (st + 1);
   }
 
+  const int col0 = cta_n * kRowsPerCTA + (warp * 2 + 0) * 8 + 2 * t;
+  const int col1 = cta_n * kRowsPerCTA + (warp * 2 + 1) * 8 + 2 * t;
   if (g < M) {
-    const int col0 = cta_n * kRowsPerCTA + (warp * 2 + 0) * 8 + 2 * t;
-    const int col1 = cta_n * kRowsPerCTA + (warp * 2 + 1) * 8 + 2 * t;
     if constexpr (!kSplitK) {
       *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col0) = int3_bf16x2_u32(d0_0, d1_0);
       *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col1) = int3_bf16x2_u32(d0_1, d1_1);
@@ -283,6 +311,18 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
       float* p1 = C_fp32 + (static_cast<size_t>(sk_idx) * M + g) * N + col1;
       p0[0] = d0_0; p0[1] = d1_0;
       p1[0] = d0_1; p1[1] = d1_1;
+    }
+  }
+  if (g + 8 < M) {
+    const int g1 = g + 8;
+    if constexpr (!kSplitK) {
+      *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g1) * N + col0) = int3_bf16x2_u32(d2_0, d3_0);
+      *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g1) * N + col1) = int3_bf16x2_u32(d2_1, d3_1);
+    } else {
+      float* p0 = C_fp32 + (static_cast<size_t>(sk_idx) * M + g1) * N + col0;
+      float* p1 = C_fp32 + (static_cast<size_t>(sk_idx) * M + g1) * N + col1;
+      p0[0] = d2_0; p0[1] = d3_0;
+      p1[0] = d2_1; p1[1] = d3_1;
     }
   }
 }
@@ -320,16 +360,16 @@ torch::Tensor int3_pack(torch::Tensor W) {
   return out;
 }
 
-torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K) {
-  TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous(),
-              "int3_gemm expects contiguous CUDA BF16 [M, K]");
-  const int M = static_cast<int>(A.size(0));
-  TORCH_CHECK(M >= 1 && M <= 8 && A.size(1) == K && N % kRowsPerCTA == 0 && K % 64 == 0,
-              "int3_gemm shape mismatch");
-  auto C = torch::empty({M, N}, A.options());
+static void int3_gemm_launch(
+    const __nv_bfloat16* a_ptr,
+    Int3Aux5Ptrs aux5,
+    bool is_aux5,
+    const uint8_t* w_ptr,
+    __nv_bfloat16* c_ptr,
+    const torch::TensorOptions& opts,
+    int M, int N, int K) {
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  const int n_blocks = static_cast<int>(N / kRowsPerCTA);
-  // Persistent scratch buffer for split-K reduction (avoids per-call caching-allocator churn).
+  const int n_blocks = N / kRowsPerCTA;
   static torch::Tensor g_partials;
   static int64_t g_partials_cap = 0;
   int split_k = 1;
@@ -337,28 +377,94 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
     split_k = (K >= 28672) ? 4 : 3;
   }
   if (split_k == 1) {
-    int3_mma_gemm_kernel<false><<<n_blocks, kThreads, 0, st>>>(
-        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
-        W_packed.data_ptr<uint8_t>(),
-        reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-        nullptr, M, static_cast<int>(N), static_cast<int>(K), 1);
+    if (is_aux5) {
+      int3_mma_gemm_kernel<false, true><<<n_blocks, kThreads, 0, st>>>(
+          nullptr, aux5, w_ptr, c_ptr, nullptr, M, N, K, 1);
+    } else {
+      int3_mma_gemm_kernel<false, false><<<n_blocks, kThreads, 0, st>>>(
+          a_ptr, aux5, w_ptr, c_ptr, nullptr, M, N, K, 1);
+    }
   } else {
     const int64_t need = static_cast<int64_t>(split_k) * M * N;
-    const int64_t alloc = (need > 4 * 8 * 6656) ? need : (4 * 8 * 6656);
-    if (!g_partials.defined() || g_partials.device() != A.device() || g_partials_cap < need) {
-      g_partials = torch::empty({alloc}, A.options().dtype(torch::kFloat32));
+    const int64_t alloc = (need > 4 * 16 * 6656) ? need : (4 * 16 * 6656);
+    if (!g_partials.defined() || g_partials.device() != opts.device() || g_partials_cap < need) {
+      g_partials = torch::empty({alloc}, opts.dtype(torch::kFloat32));
       g_partials_cap = alloc;
     }
-    int3_mma_gemm_kernel<true><<<dim3(n_blocks, split_k, 1), kThreads, 0, st>>>(
-        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
-        W_packed.data_ptr<uint8_t>(),
-        nullptr, g_partials.data_ptr<float>(),
-        M, static_cast<int>(N), static_cast<int>(K), split_k);
-    const int total = M * static_cast<int>(N);
+    if (is_aux5) {
+      int3_mma_gemm_kernel<true, true><<<dim3(n_blocks, split_k, 1), kThreads, 0, st>>>(
+          nullptr, aux5, w_ptr, nullptr, g_partials.data_ptr<float>(), M, N, K, split_k);
+    } else {
+      int3_mma_gemm_kernel<true, false><<<dim3(n_blocks, split_k, 1), kThreads, 0, st>>>(
+          a_ptr, aux5, w_ptr, nullptr, g_partials.data_ptr<float>(), M, N, K, split_k);
+    }
+    const int total = M * N;
     int3_reduce_splitk_kernel<<<(total + 255) / 256, 256, 0, st>>>(
-        g_partials.data_ptr<float>(),
-        reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-        M, static_cast<int>(N), split_k);
+        g_partials.data_ptr<float>(), c_ptr, M, N, split_k);
   }
+}
+
+torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K) {
+  TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous(),
+              "int3_gemm expects contiguous CUDA BF16 [M, K]");
+  const int M = static_cast<int>(A.size(0));
+  TORCH_CHECK(M >= 1 && M <= 16 && A.size(1) == K && N % kRowsPerCTA == 0 && K % 64 == 0,
+              "int3_gemm shape mismatch");
+  auto C = torch::empty({M, N}, A.options());
+  Int3Aux5Ptrs dummy = {};
+  int3_gemm_launch(
+      reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+      dummy, false,
+      W_packed.data_ptr<uint8_t>(),
+      reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+      A.options(), M, static_cast<int>(N), static_cast<int>(K));
   return C;
+}
+
+void int3_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K) {
+  TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous(),
+              "int3_gemm_out expects contiguous CUDA BF16 [M, K]");
+  const int M = static_cast<int>(A.size(0));
+  TORCH_CHECK(M >= 1 && M <= 16 && A.size(1) == K && N % kRowsPerCTA == 0 && K % 64 == 0,
+              "int3_gemm_out shape mismatch");
+  TORCH_CHECK(C.is_cuda() && C.scalar_type() == torch::kBFloat16 && C.is_contiguous() && C.numel() == M * N,
+              "int3_gemm_out bad C");
+  Int3Aux5Ptrs dummy = {};
+  int3_gemm_launch(
+      reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+      dummy, false,
+      W_packed.data_ptr<uint8_t>(),
+      reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+      A.options(), M, static_cast<int>(N), static_cast<int>(K));
+}
+
+void int3_gemm_aux5_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K_each) {
+  const int64_t K = K_each * 5;
+  TORCH_CHECK(N % kRowsPerCTA == 0 && K_each % 64 == 0, "int3_gemm_aux5_out requires N%64==0 and K_each%64==0");
+  const torch::Tensor* xs[5] = {&x0, &x1, &x2, &x3, &x4};
+  const int M = static_cast<int>(x0.size(0));
+  TORCH_CHECK(M >= 1 && M <= 16, "int3_gemm_aux5_out requires 1 <= M <= 16");
+  Int3Aux5Ptrs aux5 = {};
+  aux5.kg_each = static_cast<int>(K_each >> 6);
+  for (int i = 0; i < 5; ++i) {
+    TORCH_CHECK(xs[i]->is_cuda() && xs[i]->scalar_type() == torch::kBFloat16 && xs[i]->dim() == 2 &&
+                xs[i]->size(0) == M && xs[i]->size(1) == K_each && xs[i]->is_contiguous(),
+                "int3_gemm_aux5_out bad aux tensor");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(xs[i]->data_ptr()) & 15u) == 0u,
+                "int3_gemm_aux5_out requires 16B alignment");
+  }
+  aux5.p0 = reinterpret_cast<const __nv_bfloat16*>(x0.data_ptr());
+  aux5.p1 = reinterpret_cast<const __nv_bfloat16*>(x1.data_ptr());
+  aux5.p2 = reinterpret_cast<const __nv_bfloat16*>(x2.data_ptr());
+  aux5.p3 = reinterpret_cast<const __nv_bfloat16*>(x3.data_ptr());
+  aux5.p4 = reinterpret_cast<const __nv_bfloat16*>(x4.data_ptr());
+  TORCH_CHECK(C.is_cuda() && C.scalar_type() == torch::kBFloat16 && C.is_contiguous() && C.numel() == M * N,
+              "int3_gemm_aux5_out bad C");
+  int3_gemm_launch(
+      nullptr, aux5, true,
+      W_packed.data_ptr<uint8_t>(),
+      reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+      x0.options(), M, static_cast<int>(N), static_cast<int>(K));
 }

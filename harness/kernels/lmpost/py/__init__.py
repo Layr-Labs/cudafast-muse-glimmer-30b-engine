@@ -15,11 +15,13 @@ from pathlib import Path
 import torch
 
 ENABLED = os.environ.get("LMPOST", "1") != "0"
+MAX_VERIFY_ROWS = 16
 _lib = None
 _load_failed = False
 _ready_devices: set[int] = set()
 _luts: dict[tuple[int, float, float | None], torch.Tensor] = {}
 _scratch: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_verify_scratch: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _out_slot: dict[int, int] = {}
 
 
@@ -36,6 +38,17 @@ def _load():
         lib.lmpost_softcap_inplace.restype = ci
         lib.lmpost_softcap_argmax.argtypes = [vp, vp, vp, vp, vp, vp, ci, vp]
         lib.lmpost_softcap_argmax.restype = ci
+        if hasattr(lib, "lmpost_softcap_inplace_strided"):
+            lib.lmpost_softcap_inplace_strided.argtypes = [vp, vp, ci, ci, ci, vp]
+            lib.lmpost_softcap_inplace_strided.restype = ci
+        if hasattr(lib, "lmpost_argmax_rows_strided"):
+            lib.lmpost_argmax_rows_strided.argtypes = [vp, vp, vp, vp, vp, vp, ci, ci, ci, vp]
+            lib.lmpost_argmax_rows_strided.restype = ci
+        if hasattr(lib, "lmpost_greedy_verify_strided"):
+            lib.lmpost_greedy_verify_strided.argtypes = [
+                vp, vp, vp, ci, vp, vp, vp, vp, vp, vp, vp, ci, ci, ci, vp
+            ]
+            lib.lmpost_greedy_verify_strided.restype = ci
         _lib = lib
     except OSError:
         _load_failed = True
@@ -86,24 +99,213 @@ def _get_scratch(
     return bufs
 
 
+def _get_verify_scratch(
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    bufs = _verify_scratch.get(idx)
+    if bufs is None:
+        bufs = (
+            torch.empty((MAX_VERIFY_ROWS, 128), dtype=torch.float32, device=device),
+            torch.empty((MAX_VERIFY_ROWS, 128), dtype=torch.int32, device=device),
+            torch.zeros(MAX_VERIFY_ROWS + 4, dtype=torch.int32, device=device),
+            torch.empty(MAX_VERIFY_ROWS, dtype=torch.int32, device=device),
+        )
+        _verify_scratch[idx] = bufs
+    return bufs
+
+
 def softcap_inplace(logits: torch.Tensor, mult: float, cap: float | None) -> bool:
     """Apply ``logits = cap * tanh((logits * mult) / cap)`` in-place, bit-exact for BF16."""
-    if (
-        logits.dtype != torch.bfloat16
-        or not logits.is_contiguous()
-        or logits.numel() == 0
-        or not available(logits.device)
-    ):
+    if logits.dtype != torch.bfloat16 or logits.numel() == 0 or not available(logits.device):
         return False
     lut = _get_lut(logits.device, mult, cap)
-    rc = _lib.lmpost_softcap_inplace(
+    st = torch.cuda.current_stream(logits.device).cuda_stream
+    if logits.is_contiguous():
+        rc = _lib.lmpost_softcap_inplace(logits.data_ptr(), lut.data_ptr(), logits.numel(), st)
+        if rc:
+            raise RuntimeError(f"lmpost_softcap_inplace failed: {rc}")
+        return True
+    if (
+        logits.ndim == 2
+        and logits.stride(1) == 1
+        and logits.stride(0) >= logits.shape[1]
+        and hasattr(_lib, "lmpost_softcap_inplace_strided")
+    ):
+        rc = _lib.lmpost_softcap_inplace_strided(
+            logits.data_ptr(), lut.data_ptr(), int(logits.shape[0]), int(logits.shape[1]), int(logits.stride(0)), st
+        )
+        if rc:
+            raise RuntimeError(f"lmpost_softcap_inplace_strided failed: {rc}")
+        return True
+    return False
+
+
+def argmax_rows_strided(
+    logits: torch.Tensor,
+    mult: float,
+    cap: float | None,
+    out_argmax_i32: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Compute [rows] int32 argmax of ``cap * tanh((logits * mult) / cap)`` on strided 2D BF16 logits."""
+    if (
+        logits.ndim != 2
+        or not (1 <= logits.shape[0] <= MAX_VERIFY_ROWS)
+        or logits.shape[1] <= 0
+        or logits.dtype != torch.bfloat16
+        or logits.stride(1) != 1
+        or logits.stride(0) < logits.shape[1]
+        or not available(logits.device)
+        or not hasattr(_lib, "lmpost_argmax_rows_strided")
+    ):
+        return None
+    dev = logits.device
+    rows = int(logits.shape[0])
+    if out_argmax_i32 is None:
+        out_argmax_i32 = torch.empty((rows,), dtype=torch.int32, device=dev)
+    elif (
+        out_argmax_i32.shape != (rows,)
+        or out_argmax_i32.dtype != torch.int32
+        or not out_argmax_i32.is_contiguous()
+        or out_argmax_i32.device != dev
+    ):
+        return None
+    lut = _get_lut(dev, mult, cap)
+    sv, si, dc, _ = _get_verify_scratch(dev)
+    rc = _lib.lmpost_argmax_rows_strided(
         logits.data_ptr(),
         lut.data_ptr(),
-        logits.numel(),
-        torch.cuda.current_stream(logits.device).cuda_stream,
+        out_argmax_i32.data_ptr(),
+        sv.data_ptr(),
+        si.data_ptr(),
+        dc.data_ptr(),
+        rows,
+        int(logits.shape[1]),
+        int(logits.stride(0)),
+        torch.cuda.current_stream(dev).cuda_stream,
     )
     if rc:
-        raise RuntimeError(f"lmpost_softcap_inplace failed: {rc}")
+        raise RuntimeError(f"lmpost_argmax_rows_strided failed: {rc}")
+    return out_argmax_i32
+
+
+def greedy_verify_strided(
+    logits: torch.Tensor,
+    mult: float,
+    cap: float | None,
+    draft_ids: torch.Tensor,
+    max_spec_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """1-kernel strided BF16 LUT softcap + argmax + greedy rejection verify for 1-request M=2..16."""
+    if (
+        logits.ndim != 2
+        or not (2 <= logits.shape[0] <= MAX_VERIFY_ROWS)
+        or logits.shape[1] <= 0
+        or logits.dtype != torch.bfloat16
+        or logits.stride(1) != 1
+        or logits.stride(0) < logits.shape[1]
+        or draft_ids.ndim != 1
+        or draft_ids.shape[0] != logits.shape[0]
+        or not draft_ids.is_contiguous()
+        or draft_ids.dtype not in (torch.int32, torch.int64)
+        or draft_ids.device != logits.device
+        or max_spec_steps < logits.shape[0] - 1
+        or not available(logits.device)
+        or not hasattr(_lib, "lmpost_greedy_verify_strided")
+    ):
+        return None
+    dev = logits.device
+    rows = int(logits.shape[0])
+    lut = _get_lut(dev, mult, cap)
+    sv, si, dc, am = _get_verify_scratch(dev)
+    sampled = torch.empty((1, max_spec_steps + 1), dtype=torch.int64, device=dev)
+    num_sampled = torch.empty((1,), dtype=torch.int32, device=dev)
+    num_rejected = torch.empty((1,), dtype=torch.int32, device=dev)
+    rc = _lib.lmpost_greedy_verify_strided(
+        logits.data_ptr(),
+        lut.data_ptr(),
+        draft_ids.data_ptr(),
+        1 if draft_ids.dtype == torch.int64 else 0,
+        am.data_ptr(),
+        sampled.data_ptr(),
+        num_sampled.data_ptr(),
+        num_rejected.data_ptr(),
+        sv.data_ptr(),
+        si.data_ptr(),
+        dc.data_ptr(),
+        rows,
+        int(logits.shape[1]),
+        int(logits.stride(0)),
+        torch.cuda.current_stream(dev).cuda_stream,
+    )
+    if rc:
+        raise RuntimeError(f"lmpost_greedy_verify_strided failed: {rc}")
+    return sampled, num_sampled, num_rejected
+
+
+def greedy_verify_strided_into(
+    logits: torch.Tensor,
+    mult: float,
+    cap: float | None,
+    draft_ids: torch.Tensor,
+    max_spec_steps: int,
+    sampled: torch.Tensor,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+) -> bool:
+    """CUDA-graph-safe strided BF16 LUT softcap + argmax + greedy verify into caller-owned outputs."""
+    if (
+        logits.ndim != 2
+        or not (2 <= logits.shape[0] <= MAX_VERIFY_ROWS)
+        or logits.shape[1] <= 0
+        or logits.dtype != torch.bfloat16
+        or logits.stride(1) != 1
+        or logits.stride(0) < logits.shape[1]
+        or draft_ids.ndim != 1
+        or draft_ids.shape[0] != logits.shape[0]
+        or not draft_ids.is_contiguous()
+        or draft_ids.dtype not in (torch.int32, torch.int64)
+        or draft_ids.device != logits.device
+        or max_spec_steps < logits.shape[0] - 1
+        or sampled.shape != (1, max_spec_steps + 1)
+        or sampled.dtype != torch.int64
+        or not sampled.is_contiguous()
+        or sampled.device != logits.device
+        or num_sampled.shape != (1,)
+        or num_sampled.dtype != torch.int32
+        or not num_sampled.is_contiguous()
+        or num_sampled.device != logits.device
+        or num_rejected.shape != (1,)
+        or num_rejected.dtype != torch.int32
+        or not num_rejected.is_contiguous()
+        or num_rejected.device != logits.device
+        or not available(logits.device)
+        or not hasattr(_lib, "lmpost_greedy_verify_strided")
+    ):
+        return False
+    dev = logits.device
+    rows = int(logits.shape[0])
+    lut = _get_lut(dev, mult, cap)
+    sv, si, dc, am = _get_verify_scratch(dev)
+    rc = _lib.lmpost_greedy_verify_strided(
+        logits.data_ptr(),
+        lut.data_ptr(),
+        draft_ids.data_ptr(),
+        1 if draft_ids.dtype == torch.int64 else 0,
+        am.data_ptr(),
+        sampled.data_ptr(),
+        num_sampled.data_ptr(),
+        num_rejected.data_ptr(),
+        sv.data_ptr(),
+        si.data_ptr(),
+        dc.data_ptr(),
+        rows,
+        int(logits.shape[1]),
+        int(logits.stride(0)),
+        torch.cuda.current_stream(dev).cuda_stream,
+    )
+    if rc:
+        raise RuntimeError(f"lmpost_greedy_verify_strided failed: {rc}")
     return True
 
 

@@ -81,14 +81,14 @@ __global__ void __launch_bounds__(256) bfx_kernel(const __nv_bfloat16* __restric
 torch::Tensor bfx_gemm(torch::Tensor x, torch::Tensor lo, torch::Tensor nib, torch::Tensor base, torch::Tensor rowptr,
                        torch::Tensor ecol, torch::Tensor eval) {
   const int M = x.size(0), K = x.size(1), N = lo.size(0);
-  TORCH_CHECK(M >= 1 && M <= 8 && K % CH == 0 && lo.size(1) == K && x.is_contiguous() && x.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(M >= 1 && M <= 16 && K % CH == 0 && lo.size(1) == K && x.is_contiguous() && x.scalar_type() == torch::kBFloat16);
   auto out = torch::empty({M, N}, x.options());
   dim3 grid((N + WARPS * RPW - 1) / (WARPS * RPW));
   auto st = c10::cuda::getCurrentCUDAStream().stream();
 #define L_(MM) case MM: bfx_kernel<MM><<<grid, 256, 0, st>>>((const __nv_bfloat16*)x.data_ptr(), lo.data_ptr<uint8_t>(), \
     nib.data_ptr<uint8_t>(), base.data_ptr<int>(), rowptr.data_ptr<int>(), ecol.data_ptr<int>(), \
     (const __nv_bfloat16*)eval.data_ptr(), (__nv_bfloat16*)out.data_ptr(), N, K); break;
-  switch (M) { L_(1) L_(2) L_(3) L_(4) L_(5) L_(6) L_(7) L_(8) }
+  switch (M) { L_(1) L_(2) L_(3) L_(4) L_(5) L_(6) L_(7) L_(8) L_(9) L_(10) L_(11) L_(12) L_(13) L_(14) L_(15) L_(16) }
 #undef L_
   return out;
 }
@@ -97,9 +97,27 @@ torch::Tensor bf16_rans_pack(torch::Tensor W);
 torch::Tensor bf16_rans_unpack(torch::Tensor blob, int64_t N, int64_t K);
 torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int64_t K, int64_t base_exp);
 void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp);
+void bf16_rans_gemm_dual(torch::Tensor x, torch::Tensor blob, torch::Tensor out0, torch::Tensor out1, int64_t N0, int64_t N1, int64_t K, int64_t base_exp);
 int64_t bf16_rans_base(torch::Tensor blob);
 torch::Tensor int3_pack(torch::Tensor W);
 torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+void int3_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K);
+void int3_gemm_aux5_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K_each);
+torch::Tensor int4_pack(torch::Tensor W);
+torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+void int4_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K);
+void int4_gemm_aux5_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K_each);
+void dflash_kv_post(
+    torch::Tensor all_kv_flat, torch::Tensor k_norm_weights, torch::Tensor cos_sin_cache,
+    torch::Tensor positions, c10::optional<torch::Tensor> slot_mapping,
+    const std::vector<int64_t>& kv_ptrs, int64_t block_size,
+    int64_t stride_block, int64_t stride_kv_head, int64_t stride_slot, double eps);
+void dflash_argmax_bf16(torch::Tensor logits, torch::Tensor scratch_val, torch::Tensor scratch_idx,
+                        torch::Tensor out_tok, c10::optional<torch::Tensor> vocab_map = c10::nullopt);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm", &bfx_gemm);
@@ -107,7 +125,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_unpack", &bf16_rans_unpack);
   m.def("rans_gemm", &bf16_rans_gemm);
   m.def("rans_gemm_out", &bf16_rans_gemm_out);
+  m.def("rans_gemm_dual", &bf16_rans_gemm_dual);
   m.def("rans_base", &bf16_rans_base);
   m.def("int3_pack", &int3_pack);
   m.def("int3_gemm", &int3_gemm);
+  m.def("int3_gemm_out", &int3_gemm_out);
+  m.def("int3_gemm_aux5_out", &int3_gemm_aux5_out);
+  m.def("int4_pack", &int4_pack);
+  m.def("int4_gemm", &int4_gemm);
+  m.def("int4_gemm_out", &int4_gemm_out);
+  m.def("int4_gemm_aux5_out", &int4_gemm_aux5_out);
+  m.def("dflash_kv_post", &dflash_kv_post);
+  m.def("dflash_argmax_bf16", &dflash_argmax_bf16, pybind11::arg("logits"), pybind11::arg("scratch_val"),
+        pybind11::arg("scratch_idx"), pybind11::arg("out_tok"), pybind11::arg("vocab_map") = pybind11::none());
 }
