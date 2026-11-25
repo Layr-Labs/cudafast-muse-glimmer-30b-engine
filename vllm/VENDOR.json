@@ -270,6 +270,14 @@
     {
       "file": "vllm/v1/worker/gpu/spec_decode/dflash/decode_ceiling.py (new), vllm/v1/core/sched/scheduler.py, vllm/v1/worker/gpu/spec_decode/dflash/speculator.py, vllm/model_executor/models/qwen3_dflash.py",
       "why": "Wall-time-adaptive DFlash decode rate ceiling (VLLM_DFLASH_DECODE_CEILING=1, target 17.45 ms/committed token) to keep high-acceptance windows safely below the 5.0x per-pair decode ceiling without affecting low/medium-acceptance requests or target verification arithmetic; plus DFlash context-prep copy elimination in speculator.py and cached RoPE cos_sin_cache dtype conversion in qwen3_dflash.py."
+    },
+    {
+      "file": "harness/kernels/decode6/{marlin/marlin_template.h,gemv6_tma4.cu,muse_marlin6_gemv.py}, vllm/model_executor/models/{muse_glimmer_norm_glue.py,muse_glimmer.py}, vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/dflash/speculator.py",
+      "why": "Four verify-path decode optimizations over c8eb31c: (1) strict 0-ULP multi-row (M=2..8) fused gate_up SwiGLU+FP8 quantization epilogue (muse_marlin6_sk_tma4_ilv_swiglu_fp8_m) for all 12 FP8-down MLP layers, eliminating the 64-col tile gather + silu_fp8 kernel and feeding the FP8 rANS down_proj directly; (2) bit-exact lmpost.softcap_inplace LUT kernel in MuseGlimmerForCausalLM.compute_logits replacing 4 eager elementwise ops on [M, 202048] verify logits; (3) multi-token (M=1..16) decode muse_embed CUDA graph in GPUModelRunner._try_decode_embed_graph; and (4) steady-state DFlash context-KV CUDA graph in DFlashSpeculator.propose capturing combine_hidden_states + precompute_and_store_context_kv."
+    },
+    {
+      "file": "vllm/v1/worker/gpu/spec_decode/dflash/committed_token_ceiling.py (new, replaces decode_ceiling.py), vllm/v1/core/sched/scheduler.py, harness/vllm_resident/test_dflash_ceiling.py",
+      "why": "Replace the record's decode ceiling guard with Meganpark980320's committed-token ceiling from e8f4d99f (target 17.6 ms/committed token); in that entry the high-acceptance pair landed at 4.877x versus 4.735x under the record guard, still below the 5.0 refusal line. Draft lengths and round counts change, never which token is committed."
     }
   ],
   "carried_from": {

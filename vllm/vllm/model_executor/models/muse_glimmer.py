@@ -2304,6 +2304,14 @@ class MuseGlimmerForCausalLM(
         logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is None:
             return None
+        softcap_inplace = getattr(self, "_lmpost_softcap_inplace", None)
+        if (
+            softcap_inplace is not None
+            and logits.dtype == torch.bfloat16
+            and logits.is_contiguous()
+            and softcap_inplace(logits, self.output_multiplier, self.final_logit_softcapping)
+        ):
+            return logits
         logits = logits * self.output_multiplier
         if self.final_logit_softcapping is not None:
             cap = self.final_logit_softcapping
@@ -2330,6 +2338,7 @@ class MuseGlimmerForCausalLM(
         # every BF16 value; ties go to the lowest index, as the stock greedy sampler's block argmax + argmax.
         self._lmpost_softcap_argmax = None
         self._lmpost_softcap_argmax_into = None
+        self._lmpost_softcap_inplace = None
         self._pack_persisting_norm_arena()
         # Gate-quant fold (harness/kernels/sandwich/muse_sandwich.py): register every FP8-attention layer's
         # qkv and output-gate input scales; the 512-row native sandwich of such a layer then also writes the
@@ -2379,6 +2388,7 @@ class MuseGlimmerForCausalLM(
                 lmpost._get_scratch(dev)
                 self._lmpost_softcap_argmax = lmpost.softcap_argmax
                 self._lmpost_softcap_argmax_into = getattr(lmpost, "softcap_argmax_into", None)
+                self._lmpost_softcap_inplace = getattr(lmpost, "softcap_inplace", None)
         except ImportError:
             pass
 

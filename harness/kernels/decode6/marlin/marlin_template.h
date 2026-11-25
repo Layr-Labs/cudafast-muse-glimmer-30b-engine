@@ -2546,11 +2546,18 @@ __global__ void Marlin(
               const float g1 = __uint_as_float(gw & 0xffff0000u);
               const float u0 = __uint_as_float(uw << 16);
               const float u1 = __uint_as_float(uw & 0xffff0000u);
-              __nv_bfloat162 res = __floats2bfloat162_rn(
-                  __fmul_rn(marlin_swiglu_silu(g0), u0),
-                  __fmul_rn(marlin_swiglu_silu(g1), u1));
-              reinterpret_cast<uint32_t*>(C0 + r * 2496 + slice_col * 8)[threadIdx.x] =
-                  *reinterpret_cast<uint32_t*>(&res);
+              if constexpr (gate_up_swiglu_fp8) {
+                reinterpret_cast<uint16_t*>(fp8_out_ptr + r * 19968 + slice_col * 64)[threadIdx.x] =
+                    marlin_pack_fp8x2(
+                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g0), u0), inv_fp8_scale),
+                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g1), u1), inv_fp8_scale));
+              } else {
+                __nv_bfloat162 res = __floats2bfloat162_rn(
+                    __fmul_rn(marlin_swiglu_silu(g0), u0),
+                    __fmul_rn(marlin_swiglu_silu(g1), u1));
+                reinterpret_cast<uint32_t*>(C0 + r * 2496 + slice_col * 8)[threadIdx.x] =
+                    *reinterpret_cast<uint32_t*>(&res);
+              }
             }
           }
         } else {
@@ -2595,11 +2602,18 @@ __global__ void Marlin(
               const float g1 = __uint_as_float(gw & 0xffff0000u);
               const float u0 = __uint_as_float(uw << 16);
               const float u1 = __uint_as_float(uw & 0xffff0000u);
-              __nv_bfloat162 res = __floats2bfloat162_rn(
-                  __fmul_rn(marlin_swiglu_silu(g0), u0),
-                  __fmul_rn(marlin_swiglu_silu(g1), u1));
-              reinterpret_cast<uint32_t*>(C0 + r * 2496 + 2112 + m_pair * 16)[threadIdx.x] =
-                  *reinterpret_cast<uint32_t*>(&res);
+              if constexpr (gate_up_swiglu_fp8) {
+                reinterpret_cast<uint16_t*>(fp8_out_ptr + r * 19968 + 16896 + m_pair * 128)[threadIdx.x] =
+                    marlin_pack_fp8x2(
+                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g0), u0), inv_fp8_scale),
+                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g1), u1), inv_fp8_scale));
+              } else {
+                __nv_bfloat162 res = __floats2bfloat162_rn(
+                    __fmul_rn(marlin_swiglu_silu(g0), u0),
+                    __fmul_rn(marlin_swiglu_silu(g1), u1));
+                reinterpret_cast<uint32_t*>(C0 + r * 2496 + 2112 + m_pair * 16)[threadIdx.x] =
+                    *reinterpret_cast<uint32_t*>(&res);
+              }
             }
           }
         }
