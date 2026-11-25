@@ -61,6 +61,10 @@ _sk_tma4_ilv_swiglu_fp8 = getattr(_lib, "muse_marlin6_sk_tma4_ilv_swiglu_fp8", N
 if _sk_tma4_ilv_swiglu_fp8 is not None:
     _sk_tma4_ilv_swiglu_fp8.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
     _sk_tma4_ilv_swiglu_fp8.restype = ctypes.c_int
+_sk_tma4_ilv_swiglu_fp8_m = getattr(_lib, "muse_marlin6_sk_tma4_ilv_swiglu_fp8_m", None)
+if _sk_tma4_ilv_swiglu_fp8_m is not None:
+    _sk_tma4_ilv_swiglu_fp8_m.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
+    _sk_tma4_ilv_swiglu_fp8_m.restype = ctypes.c_int
 _sk_tma4 = getattr(_lib, "muse_marlin6_sk_tma4", None)
 if _sk_tma4 is not None:
     _sk_tma4.argtypes = _gemv6.argtypes
@@ -896,7 +900,7 @@ def decode_linear6(
                 _SWIGLU_GATE_UP.get(global_scale.data_ptr())
                 if (
                     (n, k) == (GATE_UP_N, GATE_UP_K)
-                    and _sk_tma4_ilv_swiglu_m is not None
+                    and (_sk_tma4_ilv_swiglu_m is not None or _sk_tma4_ilv_swiglu_fp8_m is not None)
                     and _notify_gate_up_swiglu is not None
                 )
                 else None
@@ -907,15 +911,30 @@ def decode_linear6(
                 and sw_entry_m.get("swiglu_out_m") is not None
             ):
                 out_buf_m = sw_entry_m["swiglu_out_m"][:m]
-                status = _sk_tma4_ilv_swiglu_m(
-                    x.data_ptr(), tiled_weight.data_ptr(), out_buf_m.data_ptr(), partials.data_ptr(),
-                    scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
-                    m, n, k, 48, x.device.index, torch.cuda.current_stream().cuda_stream,
-                )
-                if status:
-                    raise RuntimeError(f"SM121 Marlin multi-M gate_up SwiGLU launch failed with CUDA error {status}")
-                _notify_gate_up_swiglu(out_buf_m.data_ptr(), sw_entry_m, True, None)
-                return out_buf_m
+                st_stream = torch.cuda.current_stream().cuda_stream
+                if sw_entry_m.get("is_fp8", False):
+                    if _sk_tma4_ilv_swiglu_fp8_m is not None and sw_entry_m.get("swiglu_fp8_out_m") is not None:
+                        fp8_buf_m = sw_entry_m["swiglu_fp8_out_m"][:m]
+                        status = _sk_tma4_ilv_swiglu_fp8_m(
+                            x.data_ptr(), tiled_weight.data_ptr(), out_buf_m.data_ptr(), partials.data_ptr(),
+                            scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
+                            sw_entry_m["fp8_scale_ptr"], fp8_buf_m.data_ptr(),
+                            m, n, k, 48, x.device.index, st_stream,
+                        )
+                        if status:
+                            raise RuntimeError(f"SM121 Marlin multi-M gate_up SwiGLU FP8 launch failed with CUDA error {status}")
+                        _notify_gate_up_swiglu(out_buf_m.data_ptr(), sw_entry_m, True, None)
+                        return out_buf_m
+                elif _sk_tma4_ilv_swiglu_m is not None:
+                    status = _sk_tma4_ilv_swiglu_m(
+                        x.data_ptr(), tiled_weight.data_ptr(), out_buf_m.data_ptr(), partials.data_ptr(),
+                        scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
+                        m, n, k, 48, x.device.index, st_stream,
+                    )
+                    if status:
+                        raise RuntimeError(f"SM121 Marlin multi-M gate_up SwiGLU launch failed with CUDA error {status}")
+                    _notify_gate_up_swiglu(out_buf_m.data_ptr(), sw_entry_m, True, None)
+                    return out_buf_m
             output = x.new_empty((m, eff_n))
             status = _sk_tma4_ilv_m(
                 x.data_ptr(), tiled_weight.data_ptr(), output.data_ptr(), partials.data_ptr(),
@@ -1359,9 +1378,62 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
             tiles = [*range(0, 528, 2), *range(528, 576), *range(1, 528, 2), *range(576, 624)]
             _GATE_UP_TILE_ORDER[dev] = torch.tensor(tiles, dtype=torch.int64, device=dev)
         if is_fp8:
+            swiglu_out_m = None
+            swiglu_fp8_out_m = None
+            if (
+                is_ilv
+                and _sk_tma4_ilv_swiglu_fp8_m is not None
+                and _sk_tma4_ilv_m is not None
+                and hasattr(_rans, "rans_gemm_m_auto")
+                and os.environ.get("MUSE_GATE_UP_SWIGLU_M", "1") != "0"
+            ):
+                try:
+                    gen_m = torch.Generator(device=dev).manual_seed(20261128 + count_fp8)
+                    xm = (torch.randn((7, GATE_UP_K), generator=gen_m, device=dev) * 0.6).to(torch.bfloat16).contiguous()
+                    out_raw = torch.empty((7, GATE_UP_N), dtype=torch.bfloat16, device=dev)
+                    sw_buf_m = torch.empty((8, GATE_UP_N), dtype=torch.bfloat16, device=dev)
+                    fp8_buf_m = torch.empty((8, DOWN_K), dtype=torch.float8_e4m3fn, device=dev)
+                    ref_dn_m = torch.empty((7, DOWN_N), dtype=torch.bfloat16, device=dev)
+                    got_dn_m = torch.empty((7, DOWN_N), dtype=torch.bfloat16, device=dev)
+                    with torch.cuda.device(dev):
+                        st_m = torch.cuda.current_stream().cuda_stream
+                        rc_r = _sk_tma4_ilv_m(
+                            xm.data_ptr(), w.data_ptr(), out_raw.data_ptr(), partials.data_ptr(),
+                            s6_new.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
+                            gu.workspace.data_ptr(), 7, GATE_UP_N, GATE_UP_K, 48, dev.index, st_m,
+                        )
+                        unpaired = out_raw.view(7, 624, 64).index_select(1, _GATE_UP_TILE_ORDER[dev]).reshape(7, GATE_UP_N).contiguous()
+                        inv_s = 1.0 / dn_in_sc.float()
+                        g_f = unpaired[:, :DOWN_K].float()
+                        u_f = unpaired[:, DOWN_K:].float()
+                        ref_fp8 = ((torch.nn.functional.silu(g_f) * u_f) * inv_s).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+                        _rans.rans_gemm_m_auto(
+                            dn_packed, ref_fp8, dn_w_sc.reshape(-1), dn_in_sc.reshape(-1),
+                            ref_dn_m, DOWN_N, DOWN_K,
+                        )
+                        rc_f = _sk_tma4_ilv_swiglu_fp8_m(
+                            xm.data_ptr(), w.data_ptr(), sw_buf_m.data_ptr(), partials.data_ptr(),
+                            s6_new.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
+                            gu.workspace.data_ptr(), dn_in_sc.data_ptr(), fp8_buf_m.data_ptr(),
+                            7, GATE_UP_N, GATE_UP_K, 48, dev.index, st_m,
+                        )
+                        _rans.rans_gemm_m_auto(
+                            dn_packed, fp8_buf_m[:7], dn_w_sc.reshape(-1), dn_in_sc.reshape(-1),
+                            got_dn_m, DOWN_N, DOWN_K,
+                        )
+                    torch.cuda.synchronize(dev)
+                    if rc_r == 0 and rc_f == 0 and int(torch.count_nonzero(gu.workspace).item()) == 0 and torch.equal(got_dn_m.view(torch.int16), ref_dn_m.view(torch.int16)):
+                        swiglu_out_m = sw_buf_m
+                        swiglu_fp8_out_m = fp8_buf_m
+                    del xm, out_raw, unpaired, ref_fp8, ref_dn_m, got_dn_m, g_f, u_f, inv_s
+                except Exception:
+                    swiglu_out_m = None
+                    swiglu_fp8_out_m = None
             _SWIGLU_GATE_UP[gs_key] = {
                 "swiglu_out": swiglu_out,
                 "swiglu_fp8_out": swiglu_fp8_out,
+                "swiglu_out_m": swiglu_out_m,
+                "swiglu_fp8_out_m": swiglu_fp8_out_m,
                 "fp8_scale": dn_in_sc,
                 "fp8_scale_ptr": dn_in_sc.data_ptr(),
                 "is_fp8": True,

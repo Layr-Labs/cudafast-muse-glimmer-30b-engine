@@ -143,7 +143,7 @@ def notify_gate_up_swiglu(out_ptr: int, sw_entry: dict, fused_launched: bool, ch
     _pending_gate_up_swiglu = (out_ptr, sw_entry, fused_launched, check_args)
 
 
-def try_consume_gate_up_swiglu_fp8(gu_ptr: int, s_ptr: int, out_ptr: int) -> bool:
+def try_consume_gate_up_swiglu_fp8(gu_ptr: int, s_ptr: int, out_ptr: int, m_rows: int = 1) -> bool:
     global _pending_gate_up_swiglu, _pending_rans_prologue
     if _pending_gate_up_swiglu is None:
         return False
@@ -158,7 +158,8 @@ def try_consume_gate_up_swiglu_fp8(gu_ptr: int, s_ptr: int, out_ptr: int) -> boo
         return False
     if gu_ptr != exp_gu_ptr or s_ptr != sw_entry["fp8_scale_ptr"]:
         raise RuntimeError("muse_glimmer_norm_glue: fused FP8 gate_up SwiGLU output did not match silu_fp8 args")
-    _pending_rans_prologue = (out_ptr, 0, sw_entry["swiglu_fp8_out"], None, s_ptr, True)
+    fp8_src = sw_entry["swiglu_fp8_out"] if m_rows == 1 else sw_entry["swiglu_fp8_out_m"][:m_rows]
+    _pending_rans_prologue = (out_ptr, 0, fp8_src, None, s_ptr, True)
     _swiglu_gu_counts["fp8_skipped"] += 1
     return True
 
@@ -193,8 +194,11 @@ def consume_rans_prologue(
 
     m = int(A.shape[0]) if A.ndim == 2 else 1
     if act_mode == 0:
-        out = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
-        _rans.rans_gemv_auto(packed, x0.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
+        if m == 1:
+            _rans.rans_gemv_auto(packed, x0.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
+        else:
+            _rans.rans_gemm_m_auto(packed, x0, Bs.reshape(-1), As.reshape(-1), out, n, k)
         _swiglu_gu_counts["fp8_down_redirected"] += 1
         del x0, x1
         return out
@@ -589,17 +593,22 @@ class _RansPrologueHook:
             except Exception:
                 return orig_run(kernel, *args, **kwargs)
             if (
-                n_el != 19968
+                n_el <= 0
+                or n_el % 19968 != 0
+                or (n_el // 19968) > 8
                 or not all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gu, scale, out))
-                or gu.dtype != torch.bfloat16 or gu.numel() != 39936
+                or gu.dtype != torch.bfloat16 or gu.numel() != 2 * n_el
                 or (gu.data_ptr() & 7) != 0
                 or scale.dtype != torch.float32 or scale.numel() != 1
-                or out.dtype != torch.float8_e4m3fn or out.numel() != 19968
+                or out.dtype != torch.float8_e4m3fn or out.numel() != n_el
             ):
                 return orig_run(kernel, *args, **kwargs)
-            x0, x1 = gu, None
-            if try_consume_gate_up_swiglu_fp8(gu.data_ptr(), scale.data_ptr(), out.data_ptr()):
+            m_rows = n_el // 19968
+            if try_consume_gate_up_swiglu_fp8(gu.data_ptr(), scale.data_ptr(), out.data_ptr(), m_rows):
                 return None
+            if m_rows > 1:
+                return orig_run(kernel, *args, **kwargs)
+            x0, x1 = gu, None
         s_ptr = scale.data_ptr()
         st = _prologue_state.get(s_ptr, "unchecked")
         if st == "rejected":
