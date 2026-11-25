@@ -240,6 +240,10 @@
       "why": "bs=1 speculative-decode host cuts: one-request draft steps read query_start_loc, cu_num_logits, expanded_idx_mapping and expanded_local_pos from read-only tensors built once in load_model (same contents) instead of a pin + H2D copy and an expand kernel per step, and the per-step draft-token gather handed to DraftTokensHandler is skipped when no structured-output request needs its contents (only its shape is read); in RejectionSampler._verify_in_chunks the identity shift cu_num_logits - 0 is replaced by read-only slices when the chunk starts at logit 0."
     },
     {
+      "file": "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py; vllm/model_executor/models/qwen3_dflash.py",
+      "why": "Lossless DFlash context-prep trim from jungjipdo 5be7aa15: drop the out-of-graph copy of combined aux hidden states into a staging buffer in DFlashSpeculator.propose, and cache the dtype-cast RoPE cos_sin_cache in precompute_and_store_context_kv."
+    },
+    {
       "file": "vllm/config/vllm.py",
       "why": "Allow DFlash to use vLLM's existing V2 async scheduler, matching the already-supported EAGLE and DSpark speculative paths. This queues the next fixed single-request verify batch before the prior round's host output bookkeeping, while the V2 runner applies rejection corrections and draft-token updates on device."
     },
@@ -262,14 +266,6 @@
     {
       "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
       "why": "bs=1 speculative-decode host cuts (from i34-9, Yukon submissions 9ba5da7f-8db5-430c-a3f5-d3da1a13d186 / 1cf35c6e-2e8d-4cc8-a354-d2132af5831d): one-request draft steps read query_start_loc, cu_num_logits, expanded_idx_mapping and expanded_local_pos from read-only tensors built once in load_model (same contents) instead of a pin + H2D copy and an expand kernel per step; the per-step draft-token gather handed to DraftTokensHandler is skipped when no structured-output request needs its contents (only its shape is read); the rejection sampler skips the identity cu_num_logits shift when the chunk starts at 0."
-    },
-    {
-      "file": "harness/kernels/musebfx/{int3_mma.cu,bfx.cu,build.sh}, vllm/model_executor/layers/muse_draft_fp8.py, vllm/model_executor/models/qwen3_dflash.py; harness/kernels/gqa16_decode/{gqa16_decode.cu,muse_gqa16_attn.py}, vllm/v1/attention/backends/flash_attn.py; harness/kernels/decode6/{marlin/marlin_template.h,gemv6_tma4.cu,muse_marlin6_gemv.py}; harness/kernels/muserans/csrc/muse_rans.cu, vllm/model_executor/kernels/linear/scaled_mm/muse_fp8.py, vllm/model_executor/models/muse_glimmer_norm_glue.py",
-      "why": "Drafter and target verify optimizations over 91f2d987 (from bf3c4740-d2f3-44b4-988b-0bc55bcbca2d and 8d225ff1-d044-4c06-a1b6-3e12090b4149): (1) drafter-only 3-bit asymmetric group-64 W3A16 Tensor-Core GEMM (int3_mma.cu, 3.50 bits/weight) across all 22 pinned DFlash drafter linears (5.25 GB -> 1.15 GB/step, NVFP4-TMA4 & FP8-Marlin kept as fallbacks, BF16 kept for M>8, target untouched); (2) strict 0-ULP 1-pass M=2..8 verify attention gqa16_verify; (3) strict 0-ULP decode6 M=2..8 fused gate_up SwiGLU (muse_marlin6_sk_tma4_ilv_swiglu_m); and (4) strict 0-ULP muserans M=2..8 fused o_proj mul_sigmoid_fp8 (rans_gemm_m_fused_auto) plus M>1 SM121 PDL and strided_w."
-    },
-    {
-      "file": "vllm/v1/worker/gpu/spec_decode/dflash/decode_ceiling.py (new), vllm/v1/core/sched/scheduler.py, vllm/v1/worker/gpu/spec_decode/dflash/speculator.py, vllm/model_executor/models/qwen3_dflash.py",
-      "why": "Wall-time-adaptive DFlash decode rate ceiling (VLLM_DFLASH_DECODE_CEILING=1, target 17.45 ms/committed token) to keep high-acceptance windows safely below the 5.0x per-pair decode ceiling without affecting low/medium-acceptance requests or target verification arithmetic; plus DFlash context-prep copy elimination in speculator.py and cached RoPE cos_sin_cache dtype conversion in qwen3_dflash.py."
     }
   ],
   "carried_from": {

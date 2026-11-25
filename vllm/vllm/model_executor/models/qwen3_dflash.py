@@ -599,17 +599,17 @@ class DFlashQwen3Model(nn.Module):
         positions_repeated = context_positions.repeat(L)
         cos_sin_cache = self._rope_cos_sin_cache
         if cos_sin_cache.dtype != all_k_flat.dtype:
-            cached = getattr(self, "_rope_cos_sin_cache_cast", None)
+            cast_cache = getattr(self, "_rope_cos_sin_cache_cast", None)
             if (
-                cached is None
-                or cached.dtype != all_k_flat.dtype
-                or cached.device != all_k_flat.device
+                cast_cache is None
+                or cast_cache.dtype != all_k_flat.dtype
+                or cast_cache.device != all_k_flat.device
             ):
-                cached = cos_sin_cache.to(
+                cast_cache = cos_sin_cache.to(
                     device=all_k_flat.device, dtype=all_k_flat.dtype
                 )
-                self._rope_cos_sin_cache_cast = cached
-            cos_sin_cache = cached
+                self._rope_cos_sin_cache_cast = cast_cache
+            cos_sin_cache = cast_cache
         ops.rotary_embedding(
             positions_repeated,
             all_k_flat,

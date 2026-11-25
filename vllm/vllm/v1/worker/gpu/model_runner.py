@@ -2490,10 +2490,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # LOCAL PATCH (two-stage output wait, async_utils.wait_for_output): for
         # a one-request prefill step, mark in stream order where the forward
         # ends and the sampling tail begins. A decode step needs no mark: the
-        # host waits for it with the next step already queued.
+        # host waits for it with the next step already queued. A speculative
+        # verify step (num_tokens > 1 only because of its draft tokens) is such
+        # a decode step: no event, no tail spin-poll; the copy event alone.
         forward_done = None
-        # Speculative verify steps (num_draft_tokens > 0) are decode steps: no
-        # event and no tail spin-poll (from i34-9 e95c7eaa cut 5).
         if (
             input_batch.num_reqs == 1
             and input_batch.num_tokens > 1
