@@ -97,7 +97,8 @@ def _register(mod: torch.nn.Module, prefix: str, enc: dict) -> None:
 
 def attach_linear(layer: torch.nn.Module) -> bool:
     w = getattr(layer, "weight", None)
-    if w is None or getattr(layer, "bias", None) is not None or getattr(layer, "_bfx", False):
+    if w is None or getattr(layer, "bias", None) is not None or getattr(layer, "_bfx", False) \
+            or getattr(layer, "_mfp8", None) is not None:
         return False
     enc = _encode(w.data)
     if enc is None:
