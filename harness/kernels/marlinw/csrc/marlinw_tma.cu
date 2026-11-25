@@ -350,15 +350,17 @@ __device__ __forceinline__ void down_tile(
   // registers (scratch slot `index`), so the chains of a split tile are the chains of the whole tile, HMMA for HMMA.
   // A later piece waits until its predecessor has published the state: flags[index] goes 0 -> 1 (first piece
   // done) -> 2 (middle piece done) -> 0 (taken by the last piece).
-  const int k0 = piece & 1023;
+  const int k0 = (kCols == 6656 && kLater) ? (piece & 1023) : 0;
   const int k1 = k0 + k_tiles;
-  if (tid == 0 && (piece & 2048)) {
-    volatile int* const flag = flags + (piece >> 12);
-    const int before = ((piece >> 10) & 3) - 1;
-    while (*flag != before) {
+  if constexpr (kCols == 6656 && kLater) {
+    if (tid == 0 && (piece & 2048)) {
+      volatile int* const flag = flags + (piece >> 12);
+      const int before = ((piece >> 10) & 3) - 1;
+      while (*flag != before) {
+      }
+      __threadfence();  // acquire: the predecessor's state (stored before its release fence + flag) is visible
+      if (before == 2) *flag = 0;
     }
-    __threadfence();  // acquire: the predecessor's state (stored before its release fence + flag) is visible
-    if (before == 2) *flag = 0;
   }
   // Runs before k-tile t; returns the k-tile before which it has to run again (the next cut, or the end).
   auto cuts = [&](const int t) {
@@ -413,9 +415,9 @@ __device__ __forceinline__ void down_tile(
                               (kABytes + kBBytes) / 4 + 2 * (8 * nb + (lane >> 2)) + sh2, 32, produce, cuts, 0, 0,
                               kLater ? scratch + (size_t)(piece >> 12) * (kThreads * 32) : nullptr, k0);
   __syncthreads();
-  {
+  if constexpr (kCols == 6656) {
     const int role = (piece >> 10) & 3;
-    if (role == 1 || role == 2) {
+    if (kLater ? (role == 2) : (role == 1)) {
       float4* const hand = scratch + (size_t)(piece >> 12) * (kThreads * 32);
 #pragma unroll
       for (int e = 0; e < MB * 4; e++) hand[e * kThreads + tid] = reinterpret_cast<float4*>(acc)[e];
@@ -567,12 +569,17 @@ __global__ void __launch_bounds__(kThreads, 1) down(
   const float gs = gs_ptr[0];
   const int cut_a2 = (kCols == 4096) ? static_cast<int>(static_cast<int16_t>(w0.z & 0xFFFF)) : -1;
   const int cut_b2 = (kCols == 4096) ? static_cast<int>(static_cast<int16_t>((w0.z >> 16) & 0xFFFF)) : -1;
-  if (w1.w & 2048)
-    down_tile<8, true, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
-                       reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
-  else
+  if constexpr (kCols == 6656) {
+    if (w1.w & 2048)
+      down_tile<8, true, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
+                         reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
+    else
+      down_tile<8, false, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
+                          reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
+  } else {
     down_tile<8, false, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
                         reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
+  }
 }
 #else
 // ---------------------------------------------------------------------------------------------------------------
