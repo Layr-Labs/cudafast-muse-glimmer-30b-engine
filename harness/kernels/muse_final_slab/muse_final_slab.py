@@ -23,12 +23,25 @@ attn_stats = {"calls": 0}  # final-layer attention slab launches (for the prefil
 
 
 @dataclass(frozen=True)
+class Decode1Plan:
+    weight: torch.Tensor
+    scales6: torch.Tensor
+    palette: torch.Tensor
+    global_scale: torch.Tensor
+    workspace: torch.Tensor
+    n: int
+    k: int
+    fixed_grid: bool
+
+
+@dataclass(frozen=True)
 class AttnSlabPlan:
     n: int
     k: int
     work: torch.Tensor
     work_ptr: torch.Tensor
     slots: int
+    decode1: Decode1Plan | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +63,8 @@ class SampleTile:
     attn_address: int = 0
     attn_tail_rows: int = 0
     attn_cu_q: torch.Tensor | None = None
+    gate_decode1: Decode1Plan | None = None
+    down_decode1: Decode1Plan | None = None
 
     @contextmanager
     def capture(self):
@@ -62,6 +77,24 @@ class SampleTile:
                 raise RuntimeError(f"Expected one live gate and down tile, captured {calls}")
         finally:
             _active.reset(token)
+
+
+def _make_decode1(proj) -> Decode1Plan | None:
+    if _os.environ.get("MUSE_FINAL_ROW1_DECODE6", "1") == "0" or proj is None:
+        return None
+    w = getattr(proj, "_marlin_decode_weight", None)
+    s6 = getattr(proj, "_marlin_decode_scales6", None)
+    pal = getattr(proj, "_marlin_decode_palette", None)
+    gs = getattr(proj, "weight_global_scale", None)
+    ws = getattr(proj, "workspace", None)
+    if w is None or s6 is None or pal is None or gs is None or ws is None:
+        return None
+    return Decode1Plan(
+        w, s6, pal, gs, ws,
+        int(proj.output_size_per_partition),
+        int(proj.input_size_per_partition),
+        bool(getattr(proj, "marlin_decode6_fixed_grid", False)),
+    )
 
 
 def _prepare_attn_proj(proj) -> AttnSlabPlan | None:
@@ -83,13 +116,13 @@ def _prepare_attn_proj(proj) -> AttnSlabPlan | None:
         return None
     w7 = torch.tensor(c7, device=dev, dtype=torch.int32)
     p7 = torch.arange(len(c7) + 1, device=dev, dtype=torch.int32)
-    plan = AttnSlabPlan(n, k, w7, p7, slots)
+    plan = AttnSlabPlan(n, k, w7, p7, slots, _make_decode1(proj))
     # Bitwise check on Layer 51's actual weight against full 512-row marlinw_attn.gemm
     gen = torch.Generator(device=dev).manual_seed(n * 19 + k + 51)
     for mag in (0.05, 2.0, 32.0):
         x = (torch.randn((ROWS, k), generator=gen, device=dev) * mag).to(torch.bfloat16).contiguous()
         ref = marlinw_attn.gemm(x, w, ws, gs, src_work, _src_ptr, slots)
-        got = _run_attn_slab(x, w, ws, gs, plan)
+        got = _run_attn_slab(x, w, ws, gs, AttnSlabPlan(n, k, w7, p7, slots, None))
         if ref is None or got is None or not torch.equal(ref[-TILE_ROWS:].view(torch.int16), got[-TILE_ROWS:].view(torch.int16)):
             return None
     return plan
@@ -107,6 +140,14 @@ def _run_attn_slab(x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, 
     out = x.new_empty((ROWS, plan.n))
     if not RESTRICT:
         out[:-TILE_ROWS].zero_()
+    if RESTRICT and plan.decode1 is not None:
+        d1 = plan.decode1
+        y1 = torch.ops.vllm.marlin_tiled_decode6.default(
+            x[-1:], d1.weight, d1.scales6, d1.palette, d1.global_scale, d1.workspace,
+            d1.n, d1.k, d1.fixed_grid,
+        )
+        out[-1:].copy_(y1)
+        return out
     tile = x[-TILE_ROWS:]
     dest = out[-TILE_ROWS:]
     partial, locks = marlinw_attn._get_scratch(x.device, plan.slots)
@@ -186,6 +227,7 @@ def prepare(layer_or_mlp, final_norm=None):
         *_restriction_addresses(layer_or_mlp, final_norm),
         _prepare_qkv(getattr(self_attn, "qkv_proj", None)),
         attn_addr, attn_tail_rows, attn_cu_q,
+        _make_decode1(gate), _make_decode1(down),
     )
 
 
@@ -218,6 +260,25 @@ def gate_if_active(x, weight):
     if x.shape != (ROWS, marlinw_down.COLUMNS) or not x.is_contiguous() or x.dtype != torch.bfloat16:
         raise ValueError("Final gate capture requires contiguous BF16 prefill input")
     out = x.new_empty((ROWS, marlinw_down.INNER))
+    if RESTRICT and plan.gate_decode1 is not None:
+        d1 = plan.gate_decode1
+        import muse_marlin6_gemv as _m6
+        prev_notify = getattr(_m6, "_notify_gate_up_swiglu", None)
+        if prev_notify is not None:
+            _m6._notify_gate_up_swiglu = None
+        try:
+            gu = torch.ops.vllm.marlin_tiled_decode6.default(
+                x[-1:], d1.weight, d1.scales6, d1.palette, d1.global_scale, d1.workspace,
+                d1.n, d1.k, d1.fixed_grid,
+            )
+        finally:
+            if prev_notify is not None:
+                _m6._notify_gate_up_swiglu = prev_notify
+        g_f = gu[:, :marlinw_down.INNER].float()
+        u_f = gu[:, marlinw_down.INNER:].float()
+        out[-1:].copy_(((g_f / (1.0 + torch.exp(-g_f))) * u_f).to(torch.bfloat16))
+        calls[0] += 1
+        return out
     tile = x[-TILE_ROWS:]
     dest = out[-TILE_ROWS:]
     g, _ = _native[x.device]
@@ -241,6 +302,15 @@ def down_if_active(x, weight, scales, global_scale):
     out = x.new_empty((ROWS, marlinw_down.COLUMNS))
     if not RESTRICT:
         out[:-TILE_ROWS].zero_()
+    if RESTRICT and plan.down_decode1 is not None:
+        d1 = plan.down_decode1
+        y1 = torch.ops.vllm.marlin_tiled_decode6.default(
+            x[-1:], d1.weight, d1.scales6, d1.palette, d1.global_scale, d1.workspace,
+            d1.n, d1.k, d1.fixed_grid,
+        )
+        out[-1:].copy_(y1)
+        calls[1] += 1
+        return out
     tile = x[-TILE_ROWS:]
     dest = out[-TILE_ROWS:]
     partial, locks = marlinw_down._get_scratch(x.device, plan.slots)
