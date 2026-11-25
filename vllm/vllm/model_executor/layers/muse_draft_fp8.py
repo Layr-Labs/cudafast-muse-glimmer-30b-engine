@@ -36,6 +36,7 @@ MAX_M_NVFP4 = 8
 _NAMES = ("qkv_proj", "o_proj", "gate_up_proj", "down_proj", "fc")
 _MLP_FC_NAMES = ("gate_up_proj", "down_proj", "fc")
 _stats = {
+    "admitted_int3": 0,
     "admitted_nvfp4": 0,
     "admitted_fp8": 0,
     "rejected": 0,
@@ -51,7 +52,7 @@ def enabled() -> bool:
 
 
 def _quant_mode() -> str:
-    return os.environ.get("MUSE_DRAFT_QUANT", "nvfp4").strip().lower()
+    return os.environ.get("MUSE_DRAFT_QUANT", "int3").strip().lower()
 
 
 def _get_partials(device: torch.device) -> torch.Tensor:
@@ -393,16 +394,47 @@ def _try_nvfp4_tma4_buffers(w: torch.Tensor):
 
 
 # ---------------------------------------------------------------------------
+# INT3 W3A16 (asymmetric group-64 via muse_bfx_ext.int3_gemm)
+# ---------------------------------------------------------------------------
+
+def _try_int3_buffer(w: torch.Tensor) -> torch.Tensor | None:
+    import muse_bfx_ext as _bfx
+
+    if not hasattr(_bfx, "int3_pack") or not hasattr(_bfx, "int3_gemm"):
+        return None
+    n, k = w.shape
+    if n % 64 != 0 or k % 64 != 0:
+        return None
+    w_c = w.contiguous()
+    blob = _bfx.int3_pack(w_c)
+    gen = torch.Generator(device=w.device)
+    gen.manual_seed(3037 + n + 17 * k)
+    for m in (1, 7, 8):
+        x = (torch.randn((m, k), generator=gen, device=w.device) * 0.5).to(w.dtype)
+        got = _bfx.int3_gemm(x, blob, n, k)
+        if got.shape != (m, n) or not bool(torch.isfinite(got).all()):
+            return None
+        dense = F.linear(x, w_c).float()
+        cos = F.cosine_similarity(got.float().flatten(), dense.flatten(), dim=0).item()
+        if not cos >= 0.96:
+            logger.warning("muse_draft_int3: low cosine %.5f on (%d,%d) M=%d", cos, n, k, m)
+            return None
+    torch.cuda.synchronize(w.device)
+    return blob
+
+
+# ---------------------------------------------------------------------------
 # Attachment (modules + fused KV tensor) and custom ops
 # ---------------------------------------------------------------------------
 
-def attach_linear(layer: torch.nn.Module, prefer_nvfp4: bool = True) -> bool:
+def attach_linear(layer: torch.nn.Module, mode: str = "int3") -> bool:
     w = getattr(layer, "weight", None)
     if (
         w is None
         or getattr(layer, "bias", None) is not None
         or getattr(layer, "_mfp8", None) is not None
         or getattr(layer, "_mnv4", None) is not None
+        or getattr(layer, "_mi3", None) is not None
         or not isinstance(w, torch.Tensor)
         or w.dtype != torch.bfloat16
         or w.dim() != 2
@@ -413,7 +445,21 @@ def attach_linear(layer: torch.nn.Module, prefer_nvfp4: bool = True) -> bool:
     if n % 64 or k % 128:
         return False
 
-    if prefer_nvfp4:
+    if mode == "int3":
+        try:
+            blob = _try_int3_buffer(w.data)
+            if blob is not None:
+                layer.register_buffer("_mi3_blob", blob, persistent=False)
+                layer._mi3 = (n, k)
+                layer._mfp8 = (n, k)  # sentinel so muse_bfx skips this layer
+                _stats["admitted_int3"] += 1
+                _stats["bytes_bf16"] += n * k * 2
+                _stats["bytes_quant"] += blob.numel() * blob.element_size()
+                return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("muse_draft_int3: attach failed for %s (%s); trying NVFP4", tuple(w.shape), e)
+
+    if mode in ("int3", "nvfp4"):
         try:
             res = _try_nvfp4_tma4_buffers(w.data)
             if res is not None:
@@ -454,13 +500,26 @@ def attach_linear(layer: torch.nn.Module, prefer_nvfp4: bool = True) -> bool:
     return True
 
 
-def attach_tensor(mod: torch.nn.Module, prefix: str, w: torch.Tensor, prefer_nvfp4: bool = True) -> bool:
+def attach_tensor(mod: torch.nn.Module, prefix: str, w: torch.Tensor, mode: str = "int3") -> bool:
     if not enabled() or w is None or w.dtype != torch.bfloat16 or w.dim() != 2 or not w.is_cuda:
         return False
     n, k = w.shape
     if n % 64 or k % 128:
         return False
-    if prefer_nvfp4:
+    if mode == "int3":
+        try:
+            blob = _try_int3_buffer(w.data)
+            if blob is not None:
+                mod.register_buffer(f"_{prefix}_mi3_blob", blob, persistent=False)
+                setattr(mod, f"_{prefix}_mi3", (n, k))
+                _stats["admitted_int3"] += 1
+                _stats["bytes_bf16"] += n * k * 2
+                _stats["bytes_quant"] += blob.numel() * blob.element_size()
+                return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("muse_draft_int3: tensor %s attach failed (%s); trying NVFP4", prefix, e)
+
+    if mode in ("int3", "nvfp4"):
         try:
             res = _try_nvfp4_tma4_buffers(w.data)
             if res is not None:
@@ -498,6 +557,25 @@ def attach_tensor(mod: torch.nn.Module, prefix: str, w: torch.Tensor, prefer_nvf
     _stats["bytes_bf16"] += n * k * 2
     _stats["bytes_quant"] += qweight.numel() * qweight.element_size()
     return True
+
+
+@torch.library.custom_op("muse::draft_int3_linear", mutates_args=())
+def draft_int3_linear(x: torch.Tensor, w: torch.Tensor, blob: torch.Tensor) -> torch.Tensor:
+    shape = x.shape
+    x2 = x.reshape(-1, shape[-1])
+    n, k = w.shape
+    if 1 <= x2.size(0) <= MAX_M_NVFP4 and x2.dtype == torch.bfloat16:
+        import muse_bfx_ext as _bfx
+
+        out = _bfx.int3_gemm(x2.contiguous(), blob, n, k)
+    else:
+        out = F.linear(x2, w)
+    return out.reshape(*shape[:-1], n)
+
+
+@draft_int3_linear.register_fake
+def _(x, w, blob):
+    return x.new_empty((*x.shape[:-1], w.shape[0]))
 
 
 @torch.library.custom_op("muse::draft_fp8_linear", mutates_args=())
@@ -545,6 +623,8 @@ def _(x, w, w_ilv, coded, pal, mgs, ws):
 
 
 def layer_apply(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    if getattr(layer, "_mi3", None) is not None:
+        return torch.ops.muse.draft_int3_linear(x, layer.weight, layer._mi3_blob)
     if getattr(layer, "_mnv4", None) is not None:
         return torch.ops.muse.draft_nvfp4_linear(
             x,
@@ -561,6 +641,8 @@ def layer_apply(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 
 def tensor_apply(mod: torch.nn.Module, prefix: str, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor | None:
+    if getattr(mod, f"_{prefix}_mi3", None) is not None:
+        return torch.ops.muse.draft_int3_linear(x, w, getattr(mod, f"_{prefix}_mi3_blob"))
     if getattr(mod, f"_{prefix}_mnv4", None) is not None:
         return torch.ops.muse.draft_nvfp4_linear(
             x,
@@ -583,12 +665,15 @@ def tensor_apply(mod: torch.nn.Module, prefix: str, x: torch.Tensor, w: torch.Te
 
 
 def place_drafter_quant(model: torch.nn.Module) -> int:
-    """GB10 UMA DRAM placement for quantized drafter weights (NVFP4 w_ilv and FP8 qweight)."""
+    """GB10 UMA DRAM placement for quantized drafter weights (INT3, NVFP4 w_ilv, and FP8 qweight)."""
     if os.environ.get("MUSE_DRAFT_PLACEMENT", "1") == "0":
         return 0
     groups: dict[tuple[str, int, int], list[tuple[torch.nn.Module, str, tuple]]] = {}
     for _, mod in model.named_modules():
-        if getattr(mod, "_mnv4", None) is not None:
+        if getattr(mod, "_mi3", None) is not None:
+            n, k = mod._mi3
+            groups.setdefault(("int3", n, k), []).append((mod, "_mi3_blob", ()))
+        elif getattr(mod, "_mnv4", None) is not None:
             n, k = mod._mnv4
             groups.setdefault(("nvfp4", n, k), []).append(
                 (mod, "_mnv4_w_ilv", (mod._mnv4_coded, mod._mnv4_pal, mod._mnv4_gs, mod._mnv4_ws))
@@ -598,7 +683,10 @@ def place_drafter_quant(model: torch.nn.Module) -> int:
             groups.setdefault(("fp8", n, k), []).append(
                 (mod, "_mfp8_qweight", (mod._mfp8_scales, mod._mfp8_ws))
             )
-    if getattr(model, "_fkv_mnv4", None) is not None:
+    if getattr(model, "_fkv_mi3", None) is not None:
+        n, k = model._fkv_mi3
+        groups.setdefault(("int3", n, k), []).append((model, "_fkv_mi3_blob", ()))
+    elif getattr(model, "_fkv_mnv4", None) is not None:
         n, k = model._fkv_mnv4
         groups.setdefault(("nvfp4", n, k), []).append(
             (model, "_fkv_mnv4_w_ilv", (model._fkv_mnv4_coded, model._fkv_mnv4_pal, model._fkv_mnv4_gs, model._fkv_mnv4_ws))
@@ -631,7 +719,11 @@ def place_drafter_quant(model: torch.nn.Module) -> int:
             continue
 
         def _time_buf(buf: torch.Tensor, meta: tuple) -> float:
-            if kind == "nvfp4":
+            if kind == "int3":
+                import muse_bfx_ext as _bfx
+
+                run = lambda: _bfx.int3_gemm(x, buf, n, k)
+            elif kind == "nvfp4":
                 coded, pal, mgs, ws = meta
                 run = lambda: _run_nvfp4_tma4(x, buf, coded, pal, mgs, ws, n, k)
             else:
@@ -702,20 +794,23 @@ def attach_drafter(model: torch.nn.Module) -> int:
     for name, mod in model.named_modules():
         leaf = name.split(".")[-1]
         if leaf in _NAMES:
-            if mode == "nvfp4":
-                prefer_nvfp4 = True
+            if mode == "int3":
+                lm = "int3"
+            elif mode == "nvfp4":
+                lm = "nvfp4"
             elif mode == "hybrid":
-                prefer_nvfp4 = leaf in _MLP_FC_NAMES
+                lm = "nvfp4" if leaf in _MLP_FC_NAMES else "fp8"
             else:
-                prefer_nvfp4 = False
-            n += attach_linear(mod, prefer_nvfp4=prefer_nvfp4)
+                lm = "fp8"
+            n += attach_linear(mod, mode=lm)
     if getattr(model, "_fused_kv_weight", None) is not None and getattr(model, "_fused_kv_bias", None) is None:
-        prefer_fkv_nvfp4 = (mode == "nvfp4")
-        n += attach_tensor(model, "fkv", model._fused_kv_weight, prefer_nvfp4=prefer_fkv_nvfp4)
+        fkv_mode = "int3" if mode == "int3" else ("nvfp4" if mode == "nvfp4" else "fp8")
+        n += attach_tensor(model, "fkv", model._fused_kv_weight, mode=fkv_mode)
     place_drafter_quant(model)
     logger.info(
-        "muse_draft_quant (%s): %d NVFP4-TMA4 + %d FP8-Marlin drafter linears (%d rejected), %.2f GB -> %.2f GB per step",
+        "muse_draft_quant (%s): %d INT3-g64 + %d NVFP4-TMA4 + %d FP8-Marlin drafter linears (%d rejected), %.2f GB -> %.2f GB per step",
         mode,
+        _stats["admitted_int3"],
         _stats["admitted_nvfp4"],
         _stats["admitted_fp8"],
         _stats["rejected"],
