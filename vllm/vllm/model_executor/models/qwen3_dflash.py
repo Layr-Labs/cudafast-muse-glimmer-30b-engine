@@ -747,6 +747,13 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        from vllm.v1.worker.gpu.spec_decode.dflash import muse_leaf as _ml
+
+        if _ml.ENABLED and logits is not None and logits.dim() == 2 and logits.shape[0] >= 1:
+            if _ml.S.alt is None and not torch.cuda.is_current_stream_capturing():
+                _ml.S.alt = torch.zeros(4, dtype=torch.int64, device=logits.device)
+            if _ml.S.alt is not None:
+                _ml.S.alt.copy_(logits[0].topk(4).indices)
         if self.draft_id_to_target_id is None:
             return logits
 

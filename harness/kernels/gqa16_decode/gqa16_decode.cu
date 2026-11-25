@@ -2147,7 +2147,11 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
     int64_t stride_kv_head,
     const int32_t* __restrict__ cu_seqlens_q_ptr = nullptr,
     int64_t q_tok_stride = 0,
-    int64_t out_tok_stride = 0) {
+    int64_t out_tok_stride = 0,
+    const int32_t* __restrict__ leaf_bt = nullptr,
+    const int32_t* __restrict__ leaf_seq = nullptr,
+    const bool* __restrict__ leaf_mode = nullptr,
+    int leaf_row = -1) {
   __shared__ Pipe128Storage smem;
 
   const int worker_idx  = blockIdx.x;
@@ -2169,6 +2173,12 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
     out_ptr += static_cast<int64_t>(q0 + q_idx) * out_tok_stride;
     seqlen_k -= (actual_m - 1 - q_idx);
     if (seqlen_k < 0) seqlen_k = 0;
+    // one-leaf verify: in leaf mode the leaf row attends the context + its own key (scratch block), i.e. it is a
+    // one-row decode at position p+1 over the alternate block table; arithmetic identical to that row's chain twin
+    if (leaf_mode != nullptr && q_idx == leaf_row && leaf_mode[0]) {
+      seqlen_k = leaf_seq[0];
+      block_table = leaf_bt;
+    }
   }
   const int k_start = (window_left >= 0)
       ? ((seqlen_k - 1 - window_left > 0) ? (seqlen_k - 1 - window_left) : 0)
@@ -3249,5 +3259,33 @@ extern "C" int muse_gqa16_verify(
           cuq, q_tok_stride, out_tok_stride);
     }
   }
+  return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int muse_gqa16_verify_leaf(
+    const void* q_ptr, const void* kv_ptr, void* out_ptr, const void* seqused_k_ptr, const void* block_table_ptr,
+    const void* cu_seqlens_q_ptr, int max_q, int block_size, int window_left, int mode, float softmax_scale,
+    int64_t q_tok_stride, int64_t q_head_stride, int64_t out_tok_stride, int64_t out_head_stride,
+    int64_t stride_block, int64_t stride_slot, int64_t stride_kv_head,
+    const void* leaf_bt, const void* leaf_seq, const void* leaf_mode, int leaf_row, void* cuda_stream) {
+  if (!q_ptr || !kv_ptr || !out_ptr || !seqused_k_ptr || !block_table_ptr || !cu_seqlens_q_ptr ||
+      max_q < 1 || max_q > 16 || block_size < 16 || (block_size & 15) != 0) {
+    return 1;
+  }
+  const bool use_scale_mode3 = ((mode & 3) == 3);
+  const float scale_log2 =
+      use_scale_mode3
+          ? (softmax_scale * muse_gqa16::kLog2e)
+          : static_cast<float>(static_cast<double>(softmax_scale) * 1.44269504088896340736);
+  const cudaStream_t stream = static_cast<cudaStream_t>(cuda_stream);
+  const dim3 grid(1u, 2u, static_cast<unsigned>(max_q));
+  muse_gqa16::gqa16_fa2_block128_pipe_kernel<true><<<grid, dim3(128u, 1u, 1u), 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(q_ptr), static_cast<const __nv_bfloat16*>(kv_ptr),
+      static_cast<__nv_bfloat16*>(out_ptr), nullptr, nullptr, nullptr,
+      static_cast<const int32_t*>(seqused_k_ptr), static_cast<const int32_t*>(block_table_ptr), block_size,
+      window_left, 1, softmax_scale, scale_log2, q_head_stride, out_head_stride, stride_block, stride_slot,
+      stride_kv_head, static_cast<const int32_t*>(cu_seqlens_q_ptr), q_tok_stride, out_tok_stride,
+      static_cast<const int32_t*>(leaf_bt), static_cast<const int32_t*>(leaf_seq),
+      static_cast<const bool*>(leaf_mode), leaf_row);
   return static_cast<int>(cudaGetLastError());
 }

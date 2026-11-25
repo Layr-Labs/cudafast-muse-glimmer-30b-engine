@@ -117,6 +117,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+from vllm.v1.worker.gpu.spec_decode.dflash import muse_leaf as _muse_leaf
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
@@ -524,6 +525,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        _muse_leaf.S.layer_gid = {
+            _n: _gi for _gi, _g in enumerate(kv_cache_config.kv_cache_groups) for _n in _g.layer_names
+        }
 
         block_table_max_model_len = self.max_model_len
         if self.is_encoder_decoder:
@@ -1615,6 +1619,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self._zeros_1_i32,
                     )
         logits = self.model.compute_logits(sample_hidden_states)
+        if getattr(self, "_leaf_step", False) and logits is not None and logits.shape[0] == 7:
+            self._leaf_logits = logits[_muse_leaf.LEAF_ROW].argmax().view(1)
+            if _muse_leaf._SELFTEST:
+                _muse_leaf.selftest(logits)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
@@ -2035,6 +2043,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_tables, slot_mappings = self.prepare_attn(input_batch)
                 if self._is_single_full_decode(scheduler_output, batch_desc) is not None:
                     self._single_decode_prep_armed = True
+            self._leaf_step = False
+            if _muse_leaf._DBG.get("slog", 0) < 8 and input_batch.num_draft_tokens > 0:
+                _muse_leaf._DBG["slog"] = _muse_leaf._DBG.get("slog", 0) + 1
+                _muse_leaf._DBG.setdefault("sseen", []).append(
+                    (input_batch.num_reqs, input_batch.num_draft_tokens, input_batch.num_tokens,
+                     input_batch.num_tokens_after_padding, batch_desc.cg_mode.name))
+            if (
+                _muse_leaf.ENABLED
+                and input_batch.num_reqs == 1
+                and input_batch.num_draft_tokens == 6
+                and input_batch.num_tokens == 7
+            ):
+                if not hasattr(self, "_leaf_group_windows"):
+                    _gw = []
+                    for _g in self.kv_cache_config.kv_cache_groups:
+                        _sw = getattr(_g.kv_cache_spec, "sliding_window", None)
+                        _gw.append(int(_sw) - 1 if _sw else -1)
+                    self._leaf_group_windows = _gw
+                self._leaf_step = _muse_leaf.setup_step(
+                    self.input_buffers.input_ids, self.input_buffers.positions, block_tables, slot_mappings,
+                    self._leaf_group_windows,
+                )
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -2505,6 +2535,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output, compact_sample=compact_sample
         )
+        if getattr(self, "_leaf_step", False) and getattr(self, "_leaf_logits", None) is not None:
+            _muse_leaf.commit(sampler_output.sampled_token_ids, num_sampled, num_rejected, self._leaf_logits)
+            self._leaf_logits = None
+            self._leaf_committed = True
+        else:
+            self._leaf_committed = False
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2596,6 +2632,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if hasattr(self.model, "get_mtp_target_hidden_states"):
                     pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                     spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                if getattr(self, "_leaf_committed", False):
+                    _muse_leaf.fix_hidden(spec_hidden_states, aux_hidden_states)
                 draft_tokens = self.speculator.propose(
                     input_batch,
                     attn_metadata,

@@ -71,6 +71,14 @@ try:
             ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
             ctypes.c_void_p,
         ]
+        if hasattr(_lib, "muse_gqa16_verify_leaf"):
+            _lib.muse_gqa16_verify_leaf.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float,
+                ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
+            ]
         _lib.muse_gqa16_verify.restype = ctypes.c_int
 except OSError:
     _lib = None
@@ -415,6 +423,7 @@ def try_verify_gqa16(
     softmax_scale: float,
     window: tuple[int, int] | None,
     max_num_splits: int = 0,
+    leaf=None,
 ) -> bool:
     if not VERIFY_ENABLED or _lib is None or not hasattr(_lib, "muse_gqa16_verify"):
         return False
@@ -469,6 +478,16 @@ def try_verify_gqa16(
     g_splits = VERIFY_SPLITS if VERIFY_SPLITS in (1, 4, 8, 16) else 1
     pipe_bit = 16 if VERIFY_PIPE else 0
     stream = torch.cuda.current_stream(device).cuda_stream
+    if leaf is not None and g_splits == 1 and hasattr(_lib, "muse_gqa16_verify_leaf"):
+        leaf_bt, leaf_seq, leaf_mode, leaf_row = leaf
+        rc = _lib.muse_gqa16_verify_leaf(
+            query.data_ptr(), kv_cache.data_ptr(), output.data_ptr(), seqused_k.data_ptr(), block_table.data_ptr(),
+            cu_seqlens_q.data_ptr(), int(num_actual_tokens), block_size, w_left, vst[1] | pipe_bit, softmax_scale,
+            query.stride(0), query.stride(1), output.stride(0), output.stride(1),
+            kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
+            leaf_bt.data_ptr(), leaf_seq.data_ptr(), leaf_mode.data_ptr(), int(leaf_row), stream,
+        )
+        return rc == 0
     rc = _lib.muse_gqa16_verify(
         query.data_ptr(),
         kv_cache.data_ptr(),
