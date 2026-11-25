@@ -74,4 +74,15 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             del dflash_model.lm_head
         dflash_model.lm_head = target_lm_head
 
+    # LOCAL PATCH (drafter rows GEMM): the drafter's BF16 linear layers run 1 + depth rows per step; route them
+    # through harness/kernels/muse_draft_rows when built (proposals only: the target verifies every token).
+    try:
+        import muse_draft_rows
+
+        from vllm.logger import init_logger
+
+        muse_draft_rows.install(dflash_model, init_logger(__name__))
+    except Exception:  # noqa: BLE001 - optional: stock BF16 GEMMs
+        pass
+
     return dflash_model

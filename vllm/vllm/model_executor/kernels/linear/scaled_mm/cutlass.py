@@ -9,7 +9,7 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils import replace_parameter
-from vllm.model_executor.layers.quantization.utils.glimmer_fp8 import admit_prefill, fp8_scaled_mm
+from vllm.model_executor.layers.quantization.utils.glimmer_fp8 import admit_prefill, admit_rows512, fp8_scaled_mm
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
@@ -212,6 +212,8 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         # Muse Glimmer: prompt-sized (M > 16) GEMMs of this layer through muse_fp8_prefill when bitwise equal to
         # cutlass_scaled_mm on this weight (glimmer_fp8.admit_prefill); otherwise the stock op as before.
         admit_prefill(getattr(layer, w_name, None), getattr(layer, w_s_name, None), getattr(layer, i_s_name, None))
+        # Muse Glimmer: DFlash verify blocks (2..8 rows) on the one-row 16x32x512 tile when bitwise equal per shape.
+        admit_rows512(getattr(layer, w_name, None), getattr(layer, w_s_name, None), getattr(layer, i_s_name, None))
 
     def _process_weights_after_loading_cutlass(self, layer: torch.nn.Module) -> None:
         weight_name, weight_scale_name, _, _ = self.layer_param_names
