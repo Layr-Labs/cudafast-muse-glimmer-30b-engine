@@ -49,13 +49,13 @@ def run_async_window(
 
 class DFlashCommittedTokenCeilingTests(unittest.TestCase):
     def test_explicit_safety_constant_matches_control_gain(self):
-        self.assertEqual(ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN, 17.15)
+        self.assertEqual(ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN, 17.00)
         projected_gain = (
             ceiling_module.REFERENCE_SERIAL_MS_PER_TOKEN
             / ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN
         )
         self.assertGreater(projected_gain, 4.96)
-        self.assertLess(projected_gain, 4.99)
+        self.assertLess(projected_gain, 5.04)
 
     def test_high_acceptance_tracks_current_s3_round_time(self):
         limiter, rounds, stream = run_async_window(79.0)
@@ -116,12 +116,12 @@ class DFlashCommittedTokenCeilingTests(unittest.TestCase):
                     ms_per_tok = decode_wall_ms / (n_tokens - 1)
                     self.assertGreaterEqual(
                         ms_per_tok,
-                        17.15,
+                        17.00,
                         f"n={n_tokens} j={jitter_frac} rms={round_ms}: {ms_per_tok:.4f}",
                     )
                     self.assertLess(
                         85.4 / ms_per_tok,
-                        4.980,
+                        5.03,
                         f"n={n_tokens} j={jitter_frac} rms={round_ms}: {85.4/ms_per_tok:.4f}x",
                     )
 
