@@ -1247,7 +1247,15 @@ class _GateSideStream:
         self.active = False
         bf16_gate = self.bf16_gate_by_layer.get(layer_idx)
         if bf16_gate is not None:
-            if not x.is_cuda or x.shape[0] != 1 or getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
+            if not x.is_cuda:
+                return
+            if x.shape[0] == 1:
+                if getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
+                    return
+            elif 2 <= x.shape[0] <= 8:
+                if getattr(bf16_gate, "muse_bf16_rans_m", None) is None:
+                    return
+            else:
                 return
         elif not x.is_cuda or x.shape[0] > self.max_tokens:
             return
@@ -1553,6 +1561,24 @@ def _muse_bf16_gate_fill_impl(
                 )
             if rc == 0:
                 return
+    if (
+        2 <= x.shape[0] <= 8
+        and x.ndim == 2
+        and x.shape[1] == 6656
+        and x.dtype == torch.bfloat16
+        and x.is_cuda
+        and x.is_contiguous()
+        and gate.is_contiguous()
+    ):
+        import muse_bf16_lane as _bf16
+
+        entry = _bf16.get_m_rans(idx_gate) if hasattr(_bf16, "get_m_rans") else None
+        if entry is not None:
+            import muse_bfx_ext as _bfx
+
+            blob, bexp = entry
+            _bfx.rans_gemm_out(x, blob, gate, 4096, 6656, bexp)
+            return
     gate.copy_(
         torch.ops.vllm.muse_bf16_lane_linear.default(x, w_gate, packed_gate, idx_gate)
     )

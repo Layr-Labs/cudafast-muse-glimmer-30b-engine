@@ -244,8 +244,12 @@
       "why": "Route 2..8-row FP8 GEMMs (the speculative verify width) through the rANS-compressed decode stream (muserans rans_gemm_m_auto): A rows 0..M-1 of the same m16n8k32 MMA chain, so every row is bitwise the M == 1 GEMV."
     },
     {
-      "file": "vllm/model_executor/layers/muse_bfx.py",
-      "why": "DFlash drafter MLP weights (gate_up, down) held as 4-bit NF4 codes with a bf16 per-32 scale (fitted at load from the pinned BF16 weights; proposals only, the target verifies every committed token) read by harness/kernels/musebfx nf4 GEMM at <= 8 rows; drafter attention/fc keep the lossless 12-bit code (split-K for long K)."
+      "file": "vllm/model_executor/layers/muse_draft_fp8.py, vllm/model_executor/layers/linear.py, vllm/model_executor/models/qwen3_dflash.py, vllm/model_executor/layers/muse_bfx.py; harness/kernels/decode6/muse_marlin6_gemv.py",
+      "why": "Drafter-only weight-only quantization of the pinned DFlash drafter's 22 bias-free linears (20 layer projections + fc + fused context-KV fkv) at M <= 8 via group-16 NVFP4 (float4_e2m1f with <=64-entry E4M3 block-scale palette) packed into decode6's 4-stage TMA interleaved stream-K layout (muse_marlin6_sk_tma4_ilv_m) with GB10 UMA DRAM placement, falling back to FP8 e4m3 per-row Marlin W8A16 (extended from c1da71b1-2cc6-4188-9466-ca56ca37989a); BF16 weights kept unchanged for M > 8 (prompt prefill); every layer verified at load against ops.marlin_gemm and F.linear; target untouched. Multi-row paired gate_up output un-paired by one exact 64-column tile gather (newjordan 833fb6c4)."
+    },
+    {
+      "file": "vllm/model_executor/layers/muse_bfx.py, vllm/model_executor/models/qwen3_dflash.py, vllm/model_executor/models/muse_glimmer.py, vllm/model_executor/kernels/linear/nvfp4/decode_placement.py, vllm/v1/attention/backends/flash_attn.py",
+      "why": "Lossless 12-bit exponent-pair BF16 rANS + inline escape (~10.6 bits/weight, 100% bit-exact verified at load) with K32 2x mma.sync.m16n8k16 Tensor-Core GEMM, 48-CTA persistent cp.async (L2::evict_first), 2 MiB TLB prefetch, dual-sided SM121 PDL, and GB10 UMA DRAM placement across all 12 target BF16 attention projections at verify width M=2..8 (strict 0-ULP bitwise admitted vs F.linear, with 32-SM gate overlap on output_gate_proj); zero-bank-conflict M=2..8 activation layout in muserans; and strict 0-ULP 512-token prefill kernels (gqa16_prefill_v3, fp8ws PDL + 9-warp ST=3, muse_fp8_swiglu WS9 ST=3)."
     }
   ],
   "carried_from": {

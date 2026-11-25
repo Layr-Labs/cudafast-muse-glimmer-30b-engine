@@ -44,9 +44,6 @@ def _lib():
         native.muse_bf16_rans_pass2.restype = ctypes.c_int
         native.muse_bf16_rans_gemv.argtypes = [ctypes.c_int, ctypes.c_size_t, ptr, ptr, ptr, ptr]
         native.muse_bf16_rans_gemv.restype = ctypes.c_int
-    if hasattr(native, "muse_bf16_rans_gemm_m"):
-        native.muse_bf16_rans_gemm_m.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_size_t, ptr, ptr, ptr, ptr, ptr]
-        native.muse_bf16_rans_gemm_m.restype = ctypes.c_int
     if hasattr(native, "muse_bf16_lane_set_pdl"):
         native.muse_bf16_lane_set_pdl.argtypes = [ctypes.c_int]
         native.muse_bf16_lane_set_pdl.restype = ctypes.c_int
@@ -85,7 +82,7 @@ def _pack_rans(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None
     if native is None or not hasattr(native, "muse_bf16_rans_gemv"):
         return None
     rows, k = weight.shape
-    tw = 576 if rows == 4608 else (512 if rows == 4096 else min(rows // 8, 768))
+    tw = 576 if rows == 4608 else (512 if rows == 4096 else rows // 8)
     if tw <= 0:
         return None
     dev = weight.device
@@ -196,9 +193,67 @@ def _prepare(weight):
     return packed, device_index
 
 
+_M_RANS: dict[int, tuple[torch.Tensor, int]] = {}
+_M_RANS_STATS = {"admitted": 0, "rejected": 0, "logged": False}
+
+
+def _prepare_m_rans(weight: torch.Tensor) -> tuple[torch.Tensor, int] | None:
+    if os.environ.get("MUSE_BF16_RANS_M", "1") == "0":
+        return None
+    try:
+        import muse_bfx_ext as _bfx
+    except Exception:  # noqa: BLE001
+        return None
+    if not hasattr(_bfx, "rans_pack") or not hasattr(_bfx, "rans_gemm"):
+        return None
+    n, k = weight.shape
+    if n not in _ROWS or k != _WIDTH or not weight.is_cuda or weight.dtype != torch.bfloat16:
+        return None
+    wc = weight.detach().contiguous()
+    blob = _bfx.rans_pack(wc)
+    unp = _bfx.rans_unpack(blob, n, k)
+    if not torch.equal(unp.view(torch.int16), wc.view(torch.int16)):
+        del unp, blob
+        return None
+    del unp
+    bexp = int(_bfx.rans_base(blob))
+    gen = torch.Generator(device=weight.device)
+    gen.manual_seed(n * 193 + k + 17)
+    for scale in (0.05, 0.5, 2.0, 12.0):
+        x = (torch.randn((7, k), generator=gen, device=weight.device) * scale).to(torch.bfloat16)
+        ref = F.linear(x, wc)
+        got = _bfx.rans_gemm(x, blob, n, k, bexp)
+        if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+            del blob
+            return None
+    return blob, bexp
+
+
+def get_m_rans(index: torch.Tensor) -> tuple[torch.Tensor, int] | None:
+    return _M_RANS.get(index.data_ptr())
+
+
+def update_m_rans(index: torch.Tensor, blob: torch.Tensor) -> None:
+    entry = _M_RANS.get(index.data_ptr())
+    if entry is not None:
+        _M_RANS[index.data_ptr()] = (blob, entry[1])
+
+
 def _decode(x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor,
             index: torch.Tensor) -> torch.Tensor:
     n = weight.shape[0]
+    if (2 <= x.shape[0] <= 8 and x.ndim == 2 and x.shape[1] == _WIDTH
+            and x.dtype == torch.bfloat16 and x.is_cuda and x.is_contiguous()
+            and n in _ROWS):
+        entry = _M_RANS.get(index.data_ptr())
+        if entry is not None:
+            import muse_bfx_ext as _bfx
+            blob, bexp = entry
+            if not _M_RANS_STATS["logged"]:
+                _M_RANS_STATS["logged"] = True
+                logger.info("muse_bf16_lane multi-M rANS MMA: %d target BF16 layers admitted bitwise (0-ULP)",
+                            _M_RANS_STATS["admitted"])
+            return _bfx.rans_gemm(x, blob, n, _WIDTH, bexp)
     idx_ok = index.numel() == 1 or index.shape == (n, _INDEX_BYTES)
     if (x.shape != (1, _WIDTH) or x.dtype != torch.bfloat16
             or not x.is_cuda or not x.is_contiguous() or x.device != packed.device
@@ -254,6 +309,20 @@ class _MuseBF16Lane(UnquantizedLinearMethod):
         layer.muse_bf16_lane_weight, layer.muse_bf16_lane_index = buffers
         _stats["admitted"] += 1
         _stats["bytes"] += sum(t.nbytes for t in buffers)
+        layer.register_buffer("muse_bf16_rans_m", None, persistent=False)
+        try:
+            with torch.no_grad():
+                m_res = _prepare_m_rans(layer.weight)
+        except Exception as error:  # noqa: BLE001
+            logger.warning("muse_bf16_lane multi-M rANS admission failed for %s (%s)", layer.prefix, error)
+            m_res = None
+        if m_res is not None:
+            blob_m, bexp_m = m_res
+            layer.muse_bf16_rans_m = blob_m
+            _M_RANS[layer.muse_bf16_lane_index.data_ptr()] = (blob_m, bexp_m)
+            _M_RANS_STATS["admitted"] += 1
+        else:
+            _M_RANS_STATS["rejected"] += 1
 
     def apply(self, layer, x, bias=None):
         packed = getattr(layer, "muse_bf16_lane_weight", None)
@@ -262,8 +331,8 @@ class _MuseBF16Lane(UnquantizedLinearMethod):
             return super().apply(layer, x, bias)
         args = (x, layer.weight, packed, layer.muse_bf16_lane_index)
         if torch.compiler.is_compiling():
-            return torch.cond(x.shape[0] == 1, _packed_branch, _dense_branch, args)
-        if x.shape[0] == 1:
+            return torch.cond(x.shape[0] <= 8, _packed_branch, _dense_branch, args)
+        if 1 <= x.shape[0] <= 8:
             return _packed_branch(*args)
         return super().apply(layer, x, bias)
 

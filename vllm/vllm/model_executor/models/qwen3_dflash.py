@@ -519,8 +519,13 @@ class DFlashQwen3Model(nn.Module):
             self._rms_norm_eps,
         )
         if self._fused_kv_bias is None:
-            from vllm.model_executor.layers import muse_bfx
-            all_kv_flat = muse_bfx.tensor_apply(self, "fkv", normed_context_states, self._fused_kv_weight)
+            all_kv_flat = None
+            if getattr(self, "_fkv_mnv4", None) is not None or getattr(self, "_fkv_mfp8", None) is not None:
+                from vllm.model_executor.layers import muse_draft_fp8
+                all_kv_flat = muse_draft_fp8.tensor_apply(self, "fkv", normed_context_states, self._fused_kv_weight)
+            if all_kv_flat is None:
+                from vllm.model_executor.layers import muse_bfx
+                all_kv_flat = muse_bfx.tensor_apply(self, "fkv", normed_context_states, self._fused_kv_weight)
         else:
             all_kv_flat = F.linear(
                 normed_context_states, self._fused_kv_weight, self._fused_kv_bias
@@ -819,10 +824,25 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         loader.load_weights(model_weights.items())
         self.model._build_fused_kv_buffers()
         import os
+        try:
+            from vllm.model_executor.layers import muse_draft_fp8
+            muse_draft_fp8.attach_drafter(self.model)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("muse_draft_fp8: skipped (%s)", e)
         if os.environ.get("MUSE_BFX", "1") != "0":
             from vllm.model_executor.layers import muse_bfx
             n = muse_bfx.attach_drafter(self.model)
-            kv = muse_bfx.attach_tensor(self.model, "fkv", self.model._fused_kv_weight) if self.model._fused_kv_bias is None else False
+            has_q_fkv = (
+                getattr(self.model, "_fkv_mnv4", None) is not None
+                or getattr(self.model, "_fkv_mfp8", None) is not None
+            )
+            kv = (
+                muse_bfx.attach_tensor(self.model, "fkv", self.model._fused_kv_weight)
+                if (self.model._fused_kv_bias is None and not has_q_fkv)
+                else False
+            )
+            if n > 0 or kv:
+                muse_bfx.place_drafter_rans(self.model)
             logger.info("muse_bfx: coded %d drafter linears, fused kv %s", n, kv)
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
