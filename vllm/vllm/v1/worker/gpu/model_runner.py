@@ -106,7 +106,11 @@ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
-from vllm.v1.worker.gpu.prefill_graph import PrefillGraph, capture_prefill_graph
+from vllm.v1.worker.gpu.prefill_graph import (
+    PrefillGraph,
+    capture_prefill_graph,
+    dflash_final_slab_safe,
+)
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -116,6 +120,7 @@ from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
+from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _native_leaf
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
@@ -628,6 +633,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config,
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+        if self.speculator is not None and _native_leaf.ENABLED:
+            draft_layers = getattr(self.speculator, "draft_attn_layer_names", None)
+            _native_leaf.init_kv_table(
+                kv_caches_dict, self.kv_cache_config, draft_layers, self.device
+            )
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""
@@ -1433,13 +1443,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or not self.cudagraph_manager._graphs_captured
             or torch.cuda.is_current_stream_capturing()
             or input_batch.num_reqs != 1
-            or input_batch.num_tokens != 1
-            or input_batch.num_tokens_after_padding != 1
+            or not (1 <= input_batch.num_tokens <= 16)
+            or input_batch.num_tokens_after_padding != input_batch.num_tokens
             or int(input_batch.num_computed_tokens_np[0]) < int(input_batch.prefill_len_np[0])
         ):
             return None
-        ids_1 = input_batch.input_ids[:1]
-        dst_1 = enc_runner.inputs_embeds[:1]
+        n_tok = int(input_batch.num_tokens)
+        ids_1 = input_batch.input_ids[:n_tok]
+        dst_1 = enc_runner.inputs_embeds[:n_tok]
         if not ids_1.is_contiguous() or not dst_1.is_contiguous():
             return None
         entries = getattr(self, "_decode_embed_cg_entries", None)
@@ -1458,7 +1469,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 g_or_fn.replay()
             return out_view
-        if sig in self._decode_embed_cg_rejected or len(entries) >= 4:
+        if sig in self._decode_embed_cg_rejected or len(entries) >= 8:
             return None
 
         ref_out = self.model_state.get_mm_embeddings(
@@ -1488,7 +1499,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logger.warning("decode muse_embed eager mismatch; keeping eager get_mm_embeddings")
                 return dst_1
             if (
-                envs.os.environ.get("VLLM_DECODE_EMBED_DIRECT", "1") != "0"
+                n_tok == 1
+                and envs.os.environ.get("VLLM_DECODE_EMBED_DIRECT", "1") != "0"
                 and getattr(_me, "is_single_kernel_m1", lambda: False)()
             ):
                 table_ptr = lm.embed_tokens.weight.data_ptr()
@@ -1539,7 +1551,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 return dst_1
             entries[sig] = (g, dst_1)
             logger.info(
-                "Captured M=1 decode muse_embed CUDA graph (shape=%s)",
+                "Captured M=%d decode muse_embed CUDA graph (shape=%s)",
+                n_tok,
                 tuple(dst_1.shape),
             )
             return dst_1
@@ -1566,11 +1579,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             + int(input_batch.num_scheduled_tokens[0])
             >= int(input_batch.prefill_len_np[0])
         )
+        verify_m = int(input_batch.cu_num_logits_np[1]) if input_batch.num_reqs == 1 else 0
+        can_greedy_verify = (
+            not can_single_row
+            and not compact_sample
+            and input_batch.num_reqs == 1
+            and 1 <= input_batch.num_draft_tokens <= 7
+            and verify_m == input_batch.num_draft_tokens + 1
+            and int(input_batch.num_computed_tokens_np[0])
+            + int(input_batch.num_scheduled_tokens[0])
+            >= int(input_batch.prefill_len_np[0])
+            and self.rejection_sampler is not None
+            and self.rejection_sampler.synthetic_conditional_rates is None
+            and self.sampler is not None
+            and not self.sampler.compute_nans
+            and grammar_output is None
+            and input_batch.input_ids.dtype == torch.int32
+        )
+        can_verify_slice = (
+            can_greedy_verify
+            and int(input_batch.query_start_loc_np[1]) == verify_m
+        )
         if compact_sample:
             sample_hidden_states = hidden_states[-1:]
         elif can_single_row:
             logits_row = int(input_batch.query_start_loc_np[1]) - 1
             sample_hidden_states = hidden_states[logits_row : logits_row + 1]
+        elif can_verify_slice:
+            sample_hidden_states = hidden_states[:verify_m]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
         lmpost_argmax = getattr(self.model, "_lmpost_softcap_argmax", None)
@@ -1614,7 +1650,86 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self._ones_1_i32,
                         self._zeros_1_i32,
                     )
+        if can_greedy_verify and lmpost_argmax is not None:
+            idx_mapping_np = input_batch.idx_mapping_np
+            states = self.sampler.sampling_states
+            if (
+                states.temperature.np[idx_mapping_np[0]] == 0.0
+                and states.max_num_logprobs(idx_mapping_np) == NO_LOGPROBS
+                and self.sampler.logprob_token_ids_state.max_num_token_ids(idx_mapping_np) == 0
+                and not self.sampler._requires_logits_processing(idx_mapping_np)
+            ):
+                try:
+                    import lmpost as _lmp
+                    import muse_marlin6_gemv as _m6
+                    lm_head = self.model.lm_head
+                    lp = self.model.logits_processor
+                    org_vocab = int(getattr(lp, "org_vocab_size", getattr(lm_head, "org_vocab_size", 0)))
+                    if (
+                        getattr(lm_head, "tp_size", 1) == 1
+                        and getattr(lm_head, "bias", None) is None
+                        and not getattr(lp, "logits_as_input", False)
+                        and getattr(lp, "soft_cap", None) is None
+                        and float(getattr(lp, "scale", 1.0)) == 1.0
+                        and sample_hidden_states.dtype == torch.bfloat16
+                        and sample_hidden_states.is_contiguous()
+                        and (sample_hidden_states.data_ptr() & 15) == 0
+                    ):
+                        mult = float(self.model.output_multiplier)
+                        cap = self.model.final_logit_softcapping
+                        lut = _lmp._get_lut(self.device, mult, cap)
+                        if (
+                            getattr(lm_head, "marlin_decode6_lmpost_m_admitted", None) is None
+                            and not torch.cuda.is_current_stream_capturing()
+                        ):
+                            lm_head.marlin_decode6_lmpost_m_admitted = _m6.admit_tma4_lmpost_m(
+                                lm_head, lut, org_vocab, lmpost_argmax, mult, cap
+                            )
+                        if getattr(lm_head, "marlin_decode6_lmpost_m_admitted", False):
+                            sampled_v = torch.empty(
+                                (1, self.rejection_sampler.num_speculative_steps + 1),
+                                dtype=torch.int64,
+                                device=self.device,
+                            )
+                            num_sampled_v = torch.empty((1,), dtype=torch.int32, device=self.device)
+                            num_rejected_v = torch.empty((1,), dtype=torch.int32, device=self.device)
+                            if (
+                                _m6.launch_lmhead_lmpost6_m(
+                                    sample_hidden_states, lm_head, lut, sampled_v, org_vocab
+                                )
+                                and _lmp.greedy_verify(
+                                    sampled_v,
+                                    input_batch.input_ids,
+                                    None if can_verify_slice else input_batch.logits_indices,
+                                    num_sampled_v,
+                                    num_rejected_v,
+                                    verify_m,
+                                )
+                            ):
+                                if getattr(self, "_leaf_step", False) and verify_m == 7:
+                                    self._leaf_u_tok = sampled_v[0, 6:7]
+                                if not getattr(self, "_lmpost_verify_logged", False):
+                                    self._lmpost_verify_logged = True
+                                    logger.info(
+                                        "lmpost fused multi-M lm_head+argmax + greedy verify active (m=%d)",
+                                        verify_m,
+                                    )
+                                return (
+                                    SamplerOutput(
+                                        sampled_token_ids=sampled_v,
+                                        logprobs_tensors=None,
+                                        num_nans=None,
+                                        num_sampled=num_sampled_v,
+                                        num_rejected=num_rejected_v,
+                                    ),
+                                    num_sampled_v,
+                                    num_rejected_v,
+                                )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning_once("Fused multi-M lm_head+lmpost verify skipped (%s); using stock path", exc)
         logits = self.model.compute_logits(sample_hidden_states)
+        if getattr(self, "_leaf_step", False) and logits is not None and logits.shape[0] >= 7:
+            self._leaf_u_tok = logits[6].argmax().view(1)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
@@ -2035,6 +2150,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_tables, slot_mappings = self.prepare_attn(input_batch)
                 if self._is_single_full_decode(scheduler_output, batch_desc) is not None:
                     self._single_decode_prep_armed = True
+            self._leaf_step = False
+            self._leaf_u_tok = None
+            self._leaf_slot_mappings = None
+            if _native_leaf.ENABLED:
+                if (
+                    input_batch.num_reqs == 1
+                    and input_batch.num_draft_tokens == 6
+                    and input_batch.num_tokens == 7
+                    and slot_mappings is not None
+                ):
+                    self._leaf_step = _native_leaf.setup_step(
+                        input_batch.req_ids[0],
+                        input_batch.input_ids,
+                        input_batch.positions,
+                        slot_mappings,
+                    )
+                    if self._leaf_step:
+                        self._leaf_slot_mappings = slot_mappings
+                else:
+                    _native_leaf.on_non_leaf_step(
+                        input_batch.req_ids[0] if input_batch.req_ids else None,
+                        input_batch.num_draft_tokens,
+                    )
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -2056,6 +2194,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self._set_active_loras(*lora_inputs)
         else:
             self._single_decode_prep_armed = False
+            self._leaf_step = False
+            self._leaf_u_tok = None
+            self._leaf_slot_mappings = None
             # No actual tokens to run. A dummy run for DP or memory profiling.
             input_batch = InputBatch.make_dummy(
                 batch_desc.num_reqs or num_reqs,
@@ -2104,9 +2245,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.prompt_logprobs_worker is not None
                 and not self.prompt_logprobs_worker.uses_prompt_logprobs[input_batch.idx_mapping_np[0]]
                 and input_batch.cu_num_logits_np[-1] == 1
-                and self.speculator is None
                 and self.pcp_manager is None
-                and not self.use_aux_hidden_state_outputs
+                and (
+                    (self.speculator is None and not self.use_aux_hidden_state_outputs)
+                    or dflash_final_slab_safe(self)
+                )
             ))
             and block_tables is not None
             and slot_mappings is not None
@@ -2375,9 +2518,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             self.prompt_logprobs_worker is not None
                             and not self.prompt_logprobs_worker.uses_prompt_logprobs[input_batch.idx_mapping_np[0]]
                             and input_batch.cu_num_logits_np[-1] == 1
-                            and self.speculator is None
                             and self.pcp_manager is None
-                            and not self.use_aux_hidden_state_outputs
+                            and (
+                                (self.speculator is None and not self.use_aux_hidden_state_outputs)
+                                or dflash_final_slab_safe(self)
+                            )
                         ))
                     ):
                         model_output = prefill_graph.try_replay(
@@ -2490,10 +2635,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # LOCAL PATCH (two-stage output wait, async_utils.wait_for_output): for
         # a one-request prefill step, mark in stream order where the forward
         # ends and the sampling tail begins. A decode step needs no mark: the
-        # host waits for it with the next step already queued. A speculative
-        # verify step (num_tokens > 1 only because of its draft tokens) is such
-        # a decode step: no event, no tail spin-poll; the copy event alone.
+        # host waits for it with the next step already queued.
         forward_done = None
+        # Speculative verify steps (num_draft_tokens > 0) are decode steps: no
+        # event and no tail spin-poll (from i34-9 e95c7eaa cut 5).
         if (
             input_batch.num_reqs == 1
             and input_batch.num_tokens > 1
@@ -2505,6 +2650,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output, compact_sample=compact_sample
         )
+        if getattr(self, "_leaf_step", False):
+            leaf_u = getattr(self, "_leaf_u_tok", None)
+            leaf_slots = getattr(self, "_leaf_slot_mappings", None)
+            self._leaf_step = False
+            self._leaf_u_tok = None
+            self._leaf_slot_mappings = None
+            if leaf_u is not None:
+                extra_h = None
+                if hasattr(self.model, "get_mtp_target_hidden_states"):
+                    pre_hc = self.model.get_mtp_target_hidden_states()
+                    if pre_hc is not None and hidden_states is not None:
+                        extra_h = pre_hc[: hidden_states.shape[0]]
+                _native_leaf.commit_and_fix(
+                    sampler_output.sampled_token_ids,
+                    num_sampled,
+                    num_rejected,
+                    leaf_u,
+                    hidden_states,
+                    aux_hidden_states,
+                    leaf_slots,
+                    extra_hidden=extra_h,
+                )
+            else:
+                _native_leaf.on_non_leaf_step(None, 0)
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).

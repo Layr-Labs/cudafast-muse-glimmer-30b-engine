@@ -54,8 +54,18 @@ __device__ __forceinline__ uint32_t int3_bf16x2_u32(float f0, float f1) {
   return *reinterpret_cast<const uint32_t*>(&v);
 }
 
+__device__ __forceinline__ float int3_subwarp4_sum(float v) {
+  v += __shfl_xor_sync(0xffffffffu, v, 1);
+  v += __shfl_xor_sync(0xffffffffu, v, 2);
+  return v;
+}
+
 // GPU packer: BF16 [N, K] (N%64==0, K%64==0) -> uint8 [N/64, K/64, 8, 224]
 // Grid: (N/8, K/64), Block: 32 threads (1 warp per 8x64 tile).
+// When kMseOpt is true, optimizes per-group (scale, zero) via warp-parallel clipping search
+// (symmetric midpoint, mean+-std, and one-sided clips) + 5-iteration closed-form ALS
+// minimizing exact BF16-dequantized MSE (monotonically <= naive min-max on every group).
+template <bool kMseOpt>
 __global__ void int3_pack_kernel(
     const __nv_bfloat16* __restrict__ W,
     uint8_t* __restrict__ out,
@@ -90,9 +100,132 @@ __global__ void int3_pack_kernel(
   rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 1));
   rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 2));
 
-  float sc = (rmax - rmin) * (1.0f / 7.0f);
-  if (sc < 1e-30f) sc = 1e-30f;
-  const __nv_bfloat162 sz_bf = __floats2bfloat162_rn(sc, rmin);
+  float sc_mm = (rmax - rmin) * (1.0f / 7.0f);
+  if (sc_mm < 1e-30f) sc_mm = 1e-30f;
+  __nv_bfloat162 sz_bf = __floats2bfloat162_rn(sc_mm, rmin);
+
+  if constexpr (kMseOpt) {
+    float lsum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      lsum += vals[i];
+    }
+    const float sw = int3_subwarp4_sum(lsum);
+    const float mu = sw * (1.0f / 64.0f);
+
+    float lvar = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const float d = vals[i] - mu;
+      lvar = __fmaf_rn(d, d, lvar);
+    }
+    const float std_v = sqrtf(fmaxf(int3_subwarp4_sum(lvar) * (1.0f / 64.0f), 0.0f));
+
+    auto eval_cand = [&](float sc_in, float zr_in, __nv_bfloat162& out_sz, float& out_mse) {
+      if (!(sc_in > 1e-30f)) sc_in = 1e-30f;
+      out_sz = __floats2bfloat162_rn(sc_in, zr_in);
+      const float sc_q = __bfloat162float(out_sz.x);
+      const float zr_q = __bfloat162float(out_sz.y);
+      const float inv_sc = (sc_q > 1e-30f) ? (1.0f / sc_q) : 0.0f;
+      float err = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        int q = __float2int_rn((vals[i] - zr_q) * inv_sc);
+        if (q < 0) q = 0;
+        if (q > 7) q = 7;
+        const float w_hat = __bfloat162float(
+            __float2bfloat16_rn(__fmaf_rn(static_cast<float>(q), sc_q, zr_q)));
+        const float diff = vals[i] - w_hat;
+        err = __fmaf_rn(diff, diff, err);
+      }
+      out_mse = int3_subwarp4_sum(err);
+    };
+
+    __nv_bfloat162 best_sz = sz_bf;
+    float best_mse = 0.0f;
+    eval_cand(sc_mm, rmin, best_sz, best_mse);
+
+    __nv_bfloat162 try_sz;
+    float try_mse;
+    auto consider_interval = [&](float lo, float hi) {
+      eval_cand((hi - lo) * (1.0f / 7.0f), lo, try_sz, try_mse);
+      if (try_mse < best_mse) {
+        best_mse = try_mse;
+        best_sz = try_sz;
+      }
+    };
+
+    // 4 symmetric midpoint shrinks (1.00 already evaluated as baseline min-max).
+    const float mid = 0.5f * (rmin + rmax);
+    const float half = 0.5f * (rmax - rmin);
+    constexpr float kMidAlphas[4] = {0.92f, 0.84f, 0.76f, 0.68f};
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      const float h = half * kMidAlphas[c];
+      consider_interval(mid - h, mid + h);
+    }
+
+    // 5 mean +/- c*std clips (immune to heavy-tail outliers on either side).
+    constexpr float kStdCs[5] = {2.60f, 2.30f, 2.00f, 1.75f, 1.50f};
+#pragma unroll
+    for (int c = 0; c < 5; ++c) {
+      const float d = std_v * kStdCs[c];
+      consider_interval(fmaxf(rmin, mu - d), fminf(rmax, mu + d));
+    }
+
+    // 4 one-sided clips (for asymmetric single-sided outlier groups).
+    constexpr float kOneSideCs[2] = {2.20f, 1.80f};
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+      const float d = std_v * kOneSideCs[c];
+      consider_interval(rmin, fminf(rmax, mu + d));
+      consider_interval(fmaxf(rmin, mu - d), rmax);
+    }
+
+    // 5 iterations of exact closed-form ALS (1D linear regression on q -> (scale, zero)).
+    float cur_sc = __bfloat162float(best_sz.x);
+    float cur_zr = __bfloat162float(best_sz.y);
+#pragma unroll
+    for (int it = 0; it < 5; ++it) {
+      const float inv_cur = (cur_sc > 1e-30f) ? (1.0f / cur_sc) : 0.0f;
+      float lsq = 0.0f;
+      float lsqq = 0.0f;
+      float lsqw = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        int q = __float2int_rn((vals[i] - cur_zr) * inv_cur);
+        if (q < 0) q = 0;
+        if (q > 7) q = 7;
+        const float fq = static_cast<float>(q);
+        lsq += fq;
+        lsqq = __fmaf_rn(fq, fq, lsqq);
+        lsqw = __fmaf_rn(fq, vals[i], lsqw);
+      }
+      const float sq = int3_subwarp4_sum(lsq);
+      const float sqq = int3_subwarp4_sum(lsqq);
+      const float sqw = int3_subwarp4_sum(lsqw);
+      const float denom = 64.0f * sqq - sq * sq;
+      if (denom > 0.5f) {
+        const float cand_sc = (64.0f * sqw - sq * sw) / denom;
+        const float cand_zr = (sw - cand_sc * sq) * (1.0f / 64.0f);
+        if (cand_sc > 1e-30f && cand_sc < 1e30f && fabsf(cand_zr) < 1e30f) {
+          cur_sc = cand_sc;
+          cur_zr = cand_zr;
+        }
+      }
+      eval_cand(cur_sc, cur_zr, try_sz, try_mse);
+      if (try_mse < best_mse) {
+        best_mse = try_mse;
+        best_sz = try_sz;
+      }
+    }
+
+    // Broadcast winning sz_bf from lane t==0 so all 4 threads pack with bit-identical (scale, zero).
+    uint32_t sz_bits = *reinterpret_cast<const uint32_t*>(&best_sz);
+    sz_bits = __shfl_sync(0xffffffffu, sz_bits, r << 2);
+    sz_bf = *reinterpret_cast<const __nv_bfloat162*>(&sz_bits);
+  }
+
   const float sc_q = __bfloat162float(sz_bf.x);
   const float zr_q = __bfloat162float(sz_bf.y);
   const float inv_sc = (sc_q > 1e-30f) ? (1.0f / sc_q) : 0.0f;
@@ -303,7 +436,7 @@ __global__ void int3_reduce_splitk_kernel(
 
 }  // namespace
 
-torch::Tensor int3_pack(torch::Tensor W) {
+torch::Tensor int3_pack(torch::Tensor W, bool mse_opt = true) {
   TORCH_CHECK(W.is_cuda() && W.scalar_type() == torch::kBFloat16 && W.dim() == 2 && W.is_contiguous(),
               "int3_pack expects contiguous CUDA BF16 [N, K]");
   const int N = static_cast<int>(W.size(0));
@@ -313,10 +446,17 @@ torch::Tensor int3_pack(torch::Tensor W) {
   auto out = torch::empty({total_bytes}, W.options().dtype(torch::kUInt8));
   dim3 grid(N / 8, K / 64);
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  int3_pack_kernel<<<grid, 32, 0, st>>>(
-      reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
-      out.data_ptr<uint8_t>(),
-      N, K);
+  if (mse_opt) {
+    int3_pack_kernel<true><<<grid, 32, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
+        out.data_ptr<uint8_t>(),
+        N, K);
+  } else {
+    int3_pack_kernel<false><<<grid, 32, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
+        out.data_ptr<uint8_t>(),
+        N, K);
+  }
   return out;
 }
 

@@ -291,7 +291,18 @@ class DraftModelSpeculator(BaseSpeculator):
     def _greedy_sample_draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
+        if hasattr(self.model, "draft_argmax"):
+            fast = self.model.draft_argmax(hidden_states)
+            if fast is not None:
+                return fast
         logits = self.model.compute_logits(hidden_states)
+        if logits is not None and logits.dim() == 2 and logits.shape[0] >= 1:
+            from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _nl
+
+            if _nl.ENABLED:
+                alt_buf = _nl.get_alt_buf(logits.device)
+                if alt_buf is not None:
+                    alt_buf.copy_(logits[0].topk(2).indices)
         return logits.argmax(dim=-1)
 
     def sample_draft(

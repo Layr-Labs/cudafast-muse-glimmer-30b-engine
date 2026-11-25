@@ -36,6 +36,10 @@ def _load():
         lib.lmpost_softcap_inplace.restype = ci
         lib.lmpost_softcap_argmax.argtypes = [vp, vp, vp, vp, vp, vp, ci, vp]
         lib.lmpost_softcap_argmax.restype = ci
+        gv = getattr(lib, "lmpost_greedy_verify", None)
+        if gv is not None:
+            gv.argtypes = [vp, vp, vp, vp, vp, ci, vp]
+            gv.restype = ci
         _lib = lib
     except OSError:
         _load_failed = True
@@ -169,4 +173,48 @@ def softcap_argmax_into(
     )
     if rc:
         raise RuntimeError(f"lmpost_softcap_argmax failed: {rc}")
+    return True
+
+
+def greedy_verify(
+    target_argmax: torch.Tensor,
+    input_ids: torch.Tensor,
+    logits_indices: torch.Tensor | None,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    m: int,
+) -> bool:
+    """Compare target_argmax[0..m-2] with draft tokens input_ids[logits_indices[1..m-1]]
+    and write num_sampled = accepted + 1, num_rejected = m - num_sampled."""
+    if not available(target_argmax.device):
+        return False
+    fn = getattr(_lib, "lmpost_greedy_verify", None)
+    if (
+        fn is None
+        or not (2 <= m <= 8)
+        or target_argmax.dtype != torch.int64
+        or not target_argmax.is_contiguous()
+        or target_argmax.numel() < m
+        or input_ids.dtype != torch.int32
+        or not input_ids.is_contiguous()
+        or num_sampled.dtype != torch.int32
+        or num_rejected.dtype != torch.int32
+    ):
+        return False
+    idx_ptr = 0
+    if logits_indices is not None:
+        if logits_indices.dtype != torch.int64 or not logits_indices.is_contiguous() or logits_indices.numel() < m:
+            return False
+        idx_ptr = logits_indices.data_ptr()
+    rc = fn(
+        target_argmax.data_ptr(),
+        input_ids.data_ptr(),
+        idx_ptr,
+        num_sampled.data_ptr(),
+        num_rejected.data_ptr(),
+        int(m),
+        torch.cuda.current_stream(target_argmax.device).cuda_stream,
+    )
+    if rc:
+        raise RuntimeError(f"lmpost_greedy_verify failed: {rc}")
     return True

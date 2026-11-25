@@ -191,6 +191,27 @@ def prefill_graph_unsupported(runner, num_tokens: int) -> str | None:
     return None
 
 
+def dflash_final_slab_safe(runner) -> bool:
+    """True when DFlash aux hidden states are all tapped strictly before the final layer."""
+    if os.environ.get("MUSE_FINAL_SLAB_DFLASH", "1") == "0":
+        return False
+    if not getattr(runner, "use_aux_hidden_state_outputs", False):
+        return False
+    spec_cfg = getattr(runner, "speculative_config", None)
+    if spec_cfg is None or getattr(spec_cfg, "method", None) != "dflash":
+        return False
+    inner = getattr(getattr(runner, "model", None), "model", None)
+    aux_layers = getattr(inner, "aux_hidden_state_layers", ())
+    end_layer = int(getattr(inner, "end_layer", 0))
+    # MuseGlimmerModel appends aux hidden state (layer_idx + 1) after layer_idx, so
+    # indices < end_layer are all captured before the final layer (end_layer - 1) runs.
+    return (
+        bool(aux_layers)
+        and end_layer > 0
+        and all(0 <= int(idx) < end_layer for idx in aux_layers)
+    )
+
+
 def capture_prefill_graph(runner) -> PrefillGraph | None:
     """Capture the graph for the runner, or None (with a log line)."""
     num_tokens = int(os.environ.get("VLLM_PREFILL_GRAPH_TOKENS", "512"))
@@ -201,9 +222,9 @@ def capture_prefill_graph(runner) -> PrefillGraph | None:
     started = time.perf_counter()
     graph = None
     prepare_tile = (
-        None
-        if runner.use_aux_hidden_state_outputs
-        else getattr(runner.model, "prepare_final_sample_tile", None)
+        getattr(runner.model, "prepare_final_sample_tile", None)
+        if (not runner.use_aux_hidden_state_outputs or dflash_final_slab_safe(runner))
+        else None
     )
     if prepare_tile is not None:
         try:
@@ -449,8 +470,10 @@ class PrefillGraph:
             if self.sample_tile is None:
                 return self.model(**self.model_inputs)
             with self.sample_tile.capture():
-                hidden_states = self.model(**self.model_inputs)
-                return hidden_states[-64:]
+                out = self.model(**self.model_inputs)
+                if isinstance(out, tuple):
+                    return (out[0][-64:], out[1])
+                return out[-64:]
 
     def try_replay(
         self,

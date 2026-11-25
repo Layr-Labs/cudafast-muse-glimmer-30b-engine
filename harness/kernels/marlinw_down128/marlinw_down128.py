@@ -164,27 +164,33 @@ def work_lists(shared_bytes: int):
 
 
 def _shape_cuts(n: int, k: int, shared_bytes: int):
-    """(col256, 64-row chunk) -> k-tile at which the stock partition restarts chains, or -1."""
+    """(col256, 64-row chunk) -> (cut1, cut2) k-tiles at which stock restarts chains (-1 if none)."""
     launches = marlinw.stock_launches(ROWS, n, k, SMS, shared_bytes)
     if launches != [(0, ROWS, 4, False, (64, 256, 256))]:
         raise ValueError(f"projection {n}x{k} does not select the expected stock tile")
     k_tiles = k // 64
-    cut = {}
+    cuts_map: dict[tuple[int, int], list[int]] = {}
     for block in marlinw.stock_slices(ROWS, n, k, 4, False, (64, 256, 256), SMS):
         for chunk, col, k_start, k_count, index, count in block:
-            if count > 2:
-                raise ValueError("more than two K slices per unit")
+            if count > 3:
+                raise ValueError("more than three K slices per unit")
+            lst = cuts_map.setdefault((col, chunk), [])
             if count == 1:
                 assert k_start == 0 and k_count == k_tiles
-                cut[(col, chunk)] = -1
             elif k_start > 0:
-                cut[(col, chunk)] = k_start
-    assert len(cut) == (n // 256) * (ROWS // 64)
+                lst.append(k_start)
+    assert len(cuts_map) == (n // 256) * (ROWS // 64)
+    cut = {}
+    for key, lst in cuts_map.items():
+        lst.sort()
+        c1 = lst[0] if len(lst) >= 1 else -1
+        c2 = lst[1] if len(lst) >= 2 else -1
+        cut[key] = (c1, c2)
     return cut
 
 
 def _down_cuts(shared_bytes: int):
-    return _shape_cuts(COLUMNS, INNER, shared_bytes)
+    return {k: v[0] for k, v in _shape_cuts(COLUMNS, INNER, shared_bytes).items()}
 
 
 def tma_work_lists_shape(n: int, k: int, shared_bytes: int):
@@ -199,18 +205,29 @@ def tma_work_lists_shape(n: int, k: int, shared_bytes: int):
     order = [(col, pair) for g in range(0, 4, tma_pg) for col in range(n_col) for pair in range(g, g + tma_pg)]
     slots = 0
     slot_of = {}
+    two_cuts_shape = (n, k) == (4096, 6656)
 
     def block(tile, k0, count, role, index):
         nonlocal slots
         col, pair = tile
-        ca, cb = cut[(col // 2, 2 * pair)], cut[(col // 2, 2 * pair + 1)]
+        (ca, ca2), (cb, cb2) = cut[(col // 2, 2 * pair)], cut[(col // 2, 2 * pair + 1)]
+        if not two_cuts_shape and (ca2 >= 0 or cb2 >= 0):
+            raise ValueError(f"unexpected 2nd K-cut for shape {n}x{k}")
         slot = 0
-        if ca >= 0 or cb >= 0:
+        has1 = ca >= 0 or cb >= 0
+        has2 = ca2 >= 0 or cb2 >= 0
+        if has1:
             if tile not in slot_of:
                 slot_of[tile] = slots
-                slots += 1
+                slots += 2 if has2 else 1
             slot = slot_of[tile]
-        return [(128 * pair, col, 8, slot), (ca, cb, count, k0 | role << 10 | index << 12)]
+        if two_cuts_shape:
+            w0_z = (ca2 & 0xFFFF) | ((cb2 & 0xFFFF) << 16)
+            if w0_z >= 0x80000000:
+                w0_z -= 0x100000000
+        else:
+            w0_z = 8
+        return [(128 * pair, col, w0_z, slot), (ca, cb, count, k0 | role << 10 | index << 12)]
 
     if (n, k) == (4608, 6656):
         # 144 tiles = 3 exact waves of 48 SMs; zero split tiles, zero K-cuts.

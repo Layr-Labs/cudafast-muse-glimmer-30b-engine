@@ -1062,6 +1062,16 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                                     if s6.dim() == 2 and s6.shape[1] == 32 and (s6.shape[0] + 64) * 32 < (1 << 20):
                                         dst_base = torch.empty((s6.shape[0] + 64, 32), dtype=s6.dtype, device=s6.device)
                                         dst = dst_base[: s6.shape[0]]
+                                    elif (
+                                        s6.dim() == 2
+                                        and s6.shape[1] == 32
+                                        and getattr(m, "output_size_per_partition", None) == 39936
+                                        and getattr(m, "input_size_per_partition", None) == 6656
+                                    ):
+                                        # Reserve +128 KiB fast-pool headroom so register_all_gate_up_swiglu
+                                        # always updates paired scales6 in-place without spilling to slow DRAM.
+                                        dst_base = torch.empty((s6.shape[0] + 4096, 32), dtype=s6.dtype, device=s6.device)
+                                        dst = dst_base[: s6.shape[0]]
                                     else:
                                         dst = torch.empty_like(s6)
                                     dst.copy_(s6)
@@ -1320,7 +1330,8 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             if hasattr(_m6, "register_all_oproj_sigmoid"):
                 _m6.register_all_oproj_sigmoid(model)
         except Exception as err:  # noqa: BLE001
-            logger.warning("Decode6 post-placement registration skipped: %s", err)
+            import traceback
+            logger.warning("Decode6 post-placement registration skipped: %s\n%s", err, traceback.format_exc())
         _post_reg_done = True
     except Exception as err:  # noqa: BLE001 - the load must go on
         logger.warning("Decode weight placement failed and was skipped: %s", err)
@@ -1337,4 +1348,5 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             if hasattr(_m6, "register_all_oproj_sigmoid"):
                 _m6.register_all_oproj_sigmoid(model)
         except Exception as err:  # noqa: BLE001
-            logger.warning("Decode6 post-placement registration skipped: %s", err)
+            import traceback
+            logger.warning("Decode6 post-placement registration skipped: %s\n%s", err, traceback.format_exc())
