@@ -376,10 +376,12 @@ struct BrProb {
   const uint32_t* lut;
   const uint16_t* x;
   __nv_bfloat16* out;
+  __nv_bfloat16* out2;
   int M;
   int N;
   int K;
   int tw;
+  int nb_split;
   int pdl_mode;
   uint32_t base_m1;
   size_t stream_bytes;
@@ -623,7 +625,14 @@ __global__ void __launch_bounds__(1024, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       __nv_bfloat162 r;
       r.x = __float2bfloat16_rn(c0);
       r.y = __float2bfloat16_rn(c1);
-      *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * pb.N + nb * 8 + 2 * t) = r;
+      if (pb.out2 != nullptr) {
+        const bool in_g2 = (nb >= pb.nb_split);
+        const int n_loc = (in_g2 ? (nb - pb.nb_split) : nb) * 8 + 2 * t;
+        const int n_str = in_g2 ? (pb.N - pb.nb_split * 8) : (pb.nb_split * 8);
+        *reinterpret_cast<__nv_bfloat162*>((in_g2 ? pb.out2 : pb.out) + static_cast<size_t>(g) * n_str + n_loc) = r;
+      } else {
+        *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * pb.N + nb * 8 + 2 * t) = r;
+      }
     }
   }
   asm volatile("cp.async.wait_group 0;" ::: "memory");
@@ -882,10 +891,12 @@ static void bf16_rans_gemm_into(torch::Tensor x, torch::Tensor blob, torch::Tens
   pb.lut = reinterpret_cast<const uint32_t*>(b + kHdrBytes);
   pb.x = reinterpret_cast<const uint16_t*>(x.data_ptr());
   pb.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  pb.out2 = nullptr;
   pb.M = M;
   pb.N = static_cast<int>(N);
   pb.K = static_cast<int>(K);
   pb.tw = cfg.tw;
+  pb.nb_split = 0;
   const int pdl_cfg = br_pdl_cfg();
   pb.pdl_mode = (pdl_cfg == 2) ? 3 : ((pdl_cfg == 1) ? 1 : 0);
   pb.base_m1 = static_cast<uint32_t>(base_exp) - 1u;
@@ -924,6 +935,66 @@ torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int
 
 void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp) {
   bf16_rans_gemm_into(x, blob, out, N, K, base_exp);
+}
+
+void bf16_rans_gemm_dual(
+    torch::Tensor x, torch::Tensor blob, torch::Tensor out0, torch::Tensor out1,
+    int64_t N0, int64_t N1, int64_t K, int64_t base_exp) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(),
+              "x must be contiguous CUDA bf16 [M, K]");
+  const int M = static_cast<int>(x.size(0));
+  const int64_t N = N0 + N1;
+  TORCH_CHECK(M >= 1 && M <= 8 && x.size(1) == K && N0 % 8 == 0 && N1 % 8 == 0 && K % 32 == 0, "bad shape");
+  TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "bad blob");
+  TORCH_CHECK(out0.is_cuda() && out0.scalar_type() == torch::kBFloat16 && out0.is_contiguous() && out0.numel() == M * N0, "bad out0");
+  TORCH_CHECK(out1.is_cuda() && out1.scalar_type() == torch::kBFloat16 && out1.is_contiguous() && out1.numel() == M * N1, "bad out1");
+
+  const BrCfg cfg = br_pick_cfg(static_cast<int>(N), static_cast<int>(K));
+  const size_t soff = br_stream_off(cfg.tw);
+  const size_t blob_bytes = static_cast<size_t>(blob.numel());
+  const uint8_t* b = reinterpret_cast<const uint8_t*>(blob.data_ptr());
+
+  BrProb pb;
+  pb.hdr = b;
+  pb.stream = b + soff;
+  pb.woff16 = reinterpret_cast<const int*>(b + br_woff_off());
+  pb.lut = reinterpret_cast<const uint32_t*>(b + kHdrBytes);
+  pb.x = reinterpret_cast<const uint16_t*>(x.data_ptr());
+  pb.out = reinterpret_cast<__nv_bfloat16*>(out0.data_ptr());
+  pb.out2 = reinterpret_cast<__nv_bfloat16*>(out1.data_ptr());
+  pb.M = M;
+  pb.N = static_cast<int>(N);
+  pb.K = static_cast<int>(K);
+  pb.tw = cfg.tw;
+  pb.nb_split = static_cast<int>(N0 / 8);
+  const int pdl_cfg = br_pdl_cfg();
+  pb.pdl_mode = (pdl_cfg == 2) ? 3 : ((pdl_cfg == 1) ? 1 : 0);
+  pb.base_m1 = static_cast<uint32_t>(base_exp) - 1u;
+  pb.stream_bytes = (blob_bytes > soff + 64u) ? (blob_bytes - soff - 64u) : 0u;
+  pb.tpf_stride = br_tpf_stride();
+
+  size_t dsmem = kRB + static_cast<size_t>(cfg.wpb) * kRB;
+  if (cfg.blocks == 48 && dsmem < 40960u) dsmem = 40960u;
+  br_set_attrs_once();
+
+  auto st = c10::cuda::getCurrentCUDAStream().stream();
+  if ((pb.pdl_mode & 1) != 0) {
+    cudaLaunchConfig_t lcfg = {};
+    lcfg.gridDim = dim3(cfg.blocks, 1, 1);
+    lcfg.blockDim = dim3(cfg.wpb * 32, 1, 1);
+    lcfg.dynamicSmemBytes = dsmem;
+    lcfg.stream = st;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    lcfg.attrs = attr;
+    lcfg.numAttrs = 1;
+    cudaError_t err = cudaLaunchKernelEx(&lcfg, br_pair_mma_gemm_kernel, pb);
+    TORCH_CHECK(err == cudaSuccess, "br_pair_mma_gemm_kernel PDL launch failed: ", cudaGetErrorString(err));
+  } else {
+    br_pair_mma_gemm_kernel<<<cfg.blocks, cfg.wpb * 32, dsmem, st>>>(pb);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
 
 int64_t bf16_rans_base(torch::Tensor blob) {
