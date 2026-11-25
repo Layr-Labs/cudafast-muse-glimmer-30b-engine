@@ -1320,7 +1320,7 @@ __global__ void Marlin(
 #endif
 
   [[maybe_unused]] int4* sh_a_gated = nullptr;
-  if constexpr (fuse_mul_sigmoid) {
+  if constexpr (fuse_mul_sigmoid && !multi_m) {
 #ifdef MUSE_SCALE_TMA4
     constexpr int sh_red_tma_max = fast_m1_red ? ((threads == 256) ? 128 : 64)
                                                : ((threads == 256) ? 512 : 256);
@@ -1453,10 +1453,39 @@ __global__ void Marlin(
       const int cur_a_off = down_ilv ? (a_gl_rd_base + a_gl_rd_delta_o * ilv_a_kt)
                                      : (a_gl_rd + a_gl_rd_delta_o * a_off);
       if constexpr (fuse_mul_sigmoid) {
+        if constexpr (multi_m) {
+          const uint4* g_gl = reinterpret_cast<const uint4*>(A);
+          const uint4* a_gl = reinterpret_cast<const uint4*>(A_aux + (A - A0));
   #pragma unroll
-        for (int i = 0; i < a_sh_wr_iters; i++) {
-          if (a_sh_wr_pred[i]) {
-            sh_a_stage[a_sh_wr_trans[i]] = sh_a_gated[(a_gl_rd_delta_i * i + cur_a_off) & 511];
+          for (int i = 0; i < a_sh_wr_iters; i++) {
+            if (a_sh_wr_pred[i]) {
+              const int off = a_gl_rd_delta_i * i + cur_a_off;
+              const uint4 g = g_gl[off];
+              const uint4 av = a_gl[off];
+              const uint32_t gw[4] = {g.x, g.y, g.z, g.w};
+              const uint32_t aw[4] = {av.x, av.y, av.z, av.w};
+              uint32_t ow[4];
+  #pragma unroll
+              for (int j = 0; j < 4; ++j) {
+                const float gl = __uint_as_float(gw[j] << 16);
+                const float gh = __uint_as_float(gw[j] & 0xffff0000u);
+                const float al = __uint_as_float(aw[j] << 16);
+                const float ah = __uint_as_float(aw[j] & 0xffff0000u);
+                __nv_bfloat162 p = __floats2bfloat162_rn(
+                    __fmul_rn(marlin_triton_sigmoid(gl), al),
+                    __fmul_rn(marlin_triton_sigmoid(gh), ah));
+                ow[j] = *reinterpret_cast<uint32_t*>(&p);
+              }
+              reinterpret_cast<uint4*>(sh_a_stage)[a_sh_wr_trans[i]] =
+                  make_uint4(ow[0], ow[1], ow[2], ow[3]);
+            }
+          }
+        } else {
+  #pragma unroll
+          for (int i = 0; i < a_sh_wr_iters; i++) {
+            if (a_sh_wr_pred[i]) {
+              sh_a_stage[a_sh_wr_trans[i]] = sh_a_gated[(a_gl_rd_delta_i * i + cur_a_off) & 511];
+            }
           }
         }
       } else {
@@ -2546,11 +2575,18 @@ __global__ void Marlin(
               const float g1 = __uint_as_float(gw & 0xffff0000u);
               const float u0 = __uint_as_float(uw << 16);
               const float u1 = __uint_as_float(uw & 0xffff0000u);
-              __nv_bfloat162 res = __floats2bfloat162_rn(
-                  __fmul_rn(marlin_swiglu_silu(g0), u0),
-                  __fmul_rn(marlin_swiglu_silu(g1), u1));
-              reinterpret_cast<uint32_t*>(C0 + r * 2496 + slice_col * 8)[threadIdx.x] =
-                  *reinterpret_cast<uint32_t*>(&res);
+              if constexpr (gate_up_swiglu_fp8) {
+                reinterpret_cast<uint16_t*>(fp8_out_ptr + r * 19968 + slice_col * 64)[threadIdx.x] =
+                    marlin_pack_fp8x2(
+                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g0), u0), inv_fp8_scale),
+                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g1), u1), inv_fp8_scale));
+              } else {
+                __nv_bfloat162 res = __floats2bfloat162_rn(
+                    __fmul_rn(marlin_swiglu_silu(g0), u0),
+                    __fmul_rn(marlin_swiglu_silu(g1), u1));
+                reinterpret_cast<uint32_t*>(C0 + r * 2496 + slice_col * 8)[threadIdx.x] =
+                    *reinterpret_cast<uint32_t*>(&res);
+              }
             }
           }
         } else {
@@ -2595,11 +2631,18 @@ __global__ void Marlin(
               const float g1 = __uint_as_float(gw & 0xffff0000u);
               const float u0 = __uint_as_float(uw << 16);
               const float u1 = __uint_as_float(uw & 0xffff0000u);
-              __nv_bfloat162 res = __floats2bfloat162_rn(
-                  __fmul_rn(marlin_swiglu_silu(g0), u0),
-                  __fmul_rn(marlin_swiglu_silu(g1), u1));
-              reinterpret_cast<uint32_t*>(C0 + r * 2496 + 2112 + m_pair * 16)[threadIdx.x] =
-                  *reinterpret_cast<uint32_t*>(&res);
+              if constexpr (gate_up_swiglu_fp8) {
+                reinterpret_cast<uint16_t*>(fp8_out_ptr + r * 19968 + 16896 + m_pair * 128)[threadIdx.x] =
+                    marlin_pack_fp8x2(
+                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g0), u0), inv_fp8_scale),
+                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g1), u1), inv_fp8_scale));
+              } else {
+                __nv_bfloat162 res = __floats2bfloat162_rn(
+                    __fmul_rn(marlin_swiglu_silu(g0), u0),
+                    __fmul_rn(marlin_swiglu_silu(g1), u1));
+                reinterpret_cast<uint32_t*>(C0 + r * 2496 + 2112 + m_pair * 16)[threadIdx.x] =
+                    *reinterpret_cast<uint32_t*>(&res);
+              }
             }
           }
         }

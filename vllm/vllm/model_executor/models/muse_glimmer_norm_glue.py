@@ -82,8 +82,9 @@ _prologue_counts = Counter()
 _pending_gate_up_swiglu = None  # (out_ptr, sw_entry, fused_launched, check_args)
 _expect_down_swiglu = None      # (triton_out_ptr, swiglu_view, down_gs_ptr)
 _swiglu_gu_counts = Counter()
-_pending_oproj_sigmoid = None   # (out_ptr, gate, attn, skipped)
+_pending_oproj_sigmoid = None   # (out_ptr, gate, attn, skipped, m_rows)
 _oproj_fuse_state = "unchecked"  # "unchecked" -> "admitted" | "rejected"
+_oproj_fuse_m_state = "unchecked"  # "unchecked" -> "admitted" | "rejected"
 _oproj_sig_counts = Counter()
 
 
@@ -96,44 +97,63 @@ def consume_oproj_sigmoid(
     global_scale: torch.Tensor,
     workspace: torch.Tensor,
 ) -> torch.Tensor | None:
-    global _pending_oproj_sigmoid, _oproj_fuse_state
+    global _pending_oproj_sigmoid, _oproj_fuse_state, _oproj_fuse_m_state
     if _pending_oproj_sigmoid is None:
         return None
-    ptr, gate, attn, skipped = _pending_oproj_sigmoid
+    ptr, gate, attn, skipped, m_rows = _pending_oproj_sigmoid
     _pending_oproj_sigmoid = None
     import muse_marlin6_gemv as _m6
 
-    if x.data_ptr() != ptr or gs_ptr not in _m6._GATED_OPROJ:
+    is_m = m_rows > 1
+    allowed_set = _m6._GATED_OPROJ_M if is_m else _m6._GATED_OPROJ
+    if x.data_ptr() != ptr or gs_ptr not in allowed_set or x.numel() != m_rows * _m6.OPROJ_K:
         if skipped:
             raise RuntimeError("muse_glimmer_norm_glue: skipped mul_sigmoid did not reach expected NVFP4 o_proj")
-        _oproj_fuse_state = "rejected"
+        if is_m:
+            _oproj_fuse_m_state = "rejected"
+        else:
+            _oproj_fuse_state = "rejected"
         del gate, attn
         return None
     out_shape = (*x.shape[:-1], _m6.OPROJ_N)
+    launcher = _m6.launch_oproj_gated6_m if is_m else _m6.launch_oproj_gated6
     if not skipped:
         if torch.cuda.is_current_stream_capturing():
             del gate, attn
             return None
         try:
             ref = _m6.decode_linear6(x, tiled_weight, scales6, palette, global_scale, workspace, _m6.OPROJ_N, _m6.OPROJ_K, False)
-            got = _m6.launch_oproj_gated6(gate, attn, tiled_weight, scales6, palette, global_scale, workspace, out_shape)
+            got = launcher(gate, attn, tiled_weight, scales6, palette, global_scale, workspace, out_shape)
             torch.cuda.synchronize(x.device)
             if torch.equal(got.view(torch.int16), ref.view(torch.int16)) and int(torch.count_nonzero(workspace).item()) == 0:
-                _oproj_fuse_state = "admitted"
-                _oproj_sig_counts["admitted"] += 1
-                logger.info("Decode6 o_proj fused mul_sigmoid prologue: live forward admitted bitwise")
+                if is_m:
+                    _oproj_fuse_m_state = "admitted"
+                    _oproj_sig_counts["admitted_m"] += 1
+                    logger.info("Decode6 multi-M o_proj fused mul_sigmoid prologue: live forward admitted bitwise (m=%d)", m_rows)
+                else:
+                    _oproj_fuse_state = "admitted"
+                    _oproj_sig_counts["admitted"] += 1
+                    logger.info("Decode6 o_proj fused mul_sigmoid prologue: live forward admitted bitwise")
+            else:
+                if is_m:
+                    _oproj_fuse_m_state = "rejected"
+                    _oproj_sig_counts["rejected_m"] += 1
+                else:
+                    _oproj_fuse_state = "rejected"
+                    _oproj_sig_counts["rejected"] += 1
+            del gate, attn
+            return ref
+        except Exception:
+            if is_m:
+                _oproj_fuse_m_state = "rejected"
+                _oproj_sig_counts["rejected_m"] += 1
             else:
                 _oproj_fuse_state = "rejected"
                 _oproj_sig_counts["rejected"] += 1
             del gate, attn
-            return ref
-        except Exception:
-            _oproj_fuse_state = "rejected"
-            _oproj_sig_counts["rejected"] += 1
-            del gate, attn
             return None
-    out = _m6.launch_oproj_gated6(gate, attn, tiled_weight, scales6, palette, global_scale, workspace, out_shape)
-    _oproj_sig_counts["fused_launches"] += 1
+    out = launcher(gate, attn, tiled_weight, scales6, palette, global_scale, workspace, out_shape)
+    _oproj_sig_counts["fused_launches_m" if is_m else "fused_launches"] += 1
     del gate, attn
     return out
 
@@ -143,7 +163,7 @@ def notify_gate_up_swiglu(out_ptr: int, sw_entry: dict, fused_launched: bool, ch
     _pending_gate_up_swiglu = (out_ptr, sw_entry, fused_launched, check_args)
 
 
-def try_consume_gate_up_swiglu_fp8(gu_ptr: int, s_ptr: int, out_ptr: int) -> bool:
+def try_consume_gate_up_swiglu_fp8(gu_ptr: int, s_ptr: int, out_ptr: int, m_rows: int = 1) -> bool:
     global _pending_gate_up_swiglu, _pending_rans_prologue
     if _pending_gate_up_swiglu is None:
         return False
@@ -158,8 +178,9 @@ def try_consume_gate_up_swiglu_fp8(gu_ptr: int, s_ptr: int, out_ptr: int) -> boo
         return False
     if gu_ptr != exp_gu_ptr or s_ptr != sw_entry["fp8_scale_ptr"]:
         raise RuntimeError("muse_glimmer_norm_glue: fused FP8 gate_up SwiGLU output did not match silu_fp8 args")
-    _pending_rans_prologue = (out_ptr, 0, sw_entry["swiglu_fp8_out"], None, s_ptr, True)
-    _swiglu_gu_counts["fp8_skipped"] += 1
+    fp8_src = sw_entry["swiglu_fp8_out"] if m_rows == 1 else sw_entry["swiglu_fp8_out_m"][:m_rows]
+    _pending_rans_prologue = (out_ptr, 0, fp8_src, None, s_ptr, True)
+    _swiglu_gu_counts["fp8_skipped_m" if m_rows > 1 else "fp8_skipped"] += 1
     return True
 
 
@@ -193,6 +214,12 @@ def consume_rans_prologue(
 
     m = int(A.shape[0]) if A.ndim == 2 else 1
     if act_mode == 0:
+        if m > 1:
+            out = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
+            _rans.rans_gemm_m_auto(packed, x0, Bs.reshape(-1), As.reshape(-1), out, n, k)
+            _swiglu_gu_counts["fp8_down_redirected_m"] += 1
+            del x0, x1
+            return out
         out = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
         _rans.rans_gemv_auto(packed, x0.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
         _swiglu_gu_counts["fp8_down_redirected"] += 1
@@ -261,13 +288,16 @@ class _MulSigmoidSwap:
         self.state = "unchecked"
 
     def run(self, kernel, orig_run, args, kwargs):
-        global _pending_oproj_sigmoid, _oproj_fuse_state
+        global _pending_oproj_sigmoid, _oproj_fuse_state, _oproj_fuse_m_state
         if kwargs.get("benchmark_run", False):
             return orig_run(kernel, *args, **kwargs)
         if _pending_oproj_sigmoid is not None:
             if _pending_oproj_sigmoid[3]:
                 raise RuntimeError("muse_glimmer_norm_glue: skipped mul_sigmoid was never consumed by o_proj")
-            _oproj_fuse_state = "rejected"
+            if _pending_oproj_sigmoid[4] > 1:
+                _oproj_fuse_m_state = "rejected"
+            else:
+                _oproj_fuse_state = "rejected"
             _pending_oproj_sigmoid = None
         if self.state == "rejected" or len(args) != 4:
             return orig_run(kernel, *args, **kwargs)
@@ -323,28 +353,47 @@ class _MulSigmoidSwap:
                 ok = False
             self.state = "admitted" if ok else "rejected"
             logger.info("Decode/prefill mul_sigmoid glue: %s", self.state)
-            if ok and _OPROJ_SIGMOID_FUSE and _oproj_fuse_state == "unchecked" and n_el == 4096:
+            if ok and _OPROJ_SIGMOID_FUSE and (n_el & 4095) == 0 and 1 <= (n_el >> 12) <= 8:
+                m_rows = n_el >> 12
                 try:
                     import muse_marlin6_gemv as _m6
-                    if getattr(_m6, "_ALL_OPROJ_GATED_READY", False):
-                        _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, False)
+                    if m_rows == 1 and _oproj_fuse_state == "unchecked" and getattr(_m6, "_ALL_OPROJ_GATED_READY", False):
+                        _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, False, 1)
+                    elif m_rows > 1 and _oproj_fuse_m_state == "unchecked" and getattr(_m6, "_ALL_OPROJ_GATED_M_READY", False):
+                        _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, False, m_rows)
                 except Exception:
                     pass
             return None
-        if _OPROJ_SIGMOID_FUSE and _oproj_fuse_state != "rejected" and n_el == 4096:
-            try:
-                import muse_marlin6_gemv as _m6
-                if getattr(_m6, "_ALL_OPROJ_GATED_READY", False):
-                    if _oproj_fuse_state == "admitted":
-                        _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, True)
-                        _oproj_sig_counts["skipped"] += 1
-                        return None
-                    if _oproj_fuse_state == "unchecked" and not torch.cuda.is_current_stream_capturing():
-                        G.mul_sigmoid_bf16(gate, attn, out, 4096, stream)
-                        _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, False)
-                        return None
-            except Exception:
-                _oproj_fuse_state = "rejected"
+        if _OPROJ_SIGMOID_FUSE and (n_el & 4095) == 0 and 1 <= (n_el >> 12) <= 8:
+            m_rows = n_el >> 12
+            if m_rows == 1 and _oproj_fuse_state != "rejected":
+                try:
+                    import muse_marlin6_gemv as _m6
+                    if getattr(_m6, "_ALL_OPROJ_GATED_READY", False):
+                        if _oproj_fuse_state == "admitted":
+                            _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, True, 1)
+                            _oproj_sig_counts["skipped"] += 1
+                            return None
+                        if _oproj_fuse_state == "unchecked" and not torch.cuda.is_current_stream_capturing():
+                            G.mul_sigmoid_bf16(gate, attn, out, 4096, stream)
+                            _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, False, 1)
+                            return None
+                except Exception:
+                    _oproj_fuse_state = "rejected"
+            elif m_rows > 1 and _oproj_fuse_m_state != "rejected":
+                try:
+                    import muse_marlin6_gemv as _m6
+                    if getattr(_m6, "_ALL_OPROJ_GATED_M_READY", False):
+                        if _oproj_fuse_m_state == "admitted":
+                            _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, True, m_rows)
+                            _oproj_sig_counts["skipped_m"] += 1
+                            return None
+                        if _oproj_fuse_m_state == "unchecked" and not torch.cuda.is_current_stream_capturing():
+                            G.mul_sigmoid_bf16(gate, attn, out, n_el, stream)
+                            _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, False, m_rows)
+                            return None
+                except Exception:
+                    _oproj_fuse_m_state = "rejected"
         G.mul_sigmoid_bf16(gate, attn, out, n_el, stream)
         return None
 
@@ -589,17 +638,22 @@ class _RansPrologueHook:
             except Exception:
                 return orig_run(kernel, *args, **kwargs)
             if (
-                n_el != 19968
+                n_el <= 0
+                or n_el % 19968 != 0
+                or (n_el // 19968) > 8
                 or not all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gu, scale, out))
-                or gu.dtype != torch.bfloat16 or gu.numel() != 39936
+                or gu.dtype != torch.bfloat16 or gu.numel() != (n_el // 19968) * 39936
                 or (gu.data_ptr() & 7) != 0
                 or scale.dtype != torch.float32 or scale.numel() != 1
-                or out.dtype != torch.float8_e4m3fn or out.numel() != 19968
+                or out.dtype != torch.float8_e4m3fn or out.numel() != n_el
             ):
                 return orig_run(kernel, *args, **kwargs)
+            m_rows = n_el // 19968
             x0, x1 = gu, None
-            if try_consume_gate_up_swiglu_fp8(gu.data_ptr(), scale.data_ptr(), out.data_ptr()):
+            if try_consume_gate_up_swiglu_fp8(gu.data_ptr(), scale.data_ptr(), out.data_ptr(), m_rows):
                 return None
+            if m_rows > 1:
+                return orig_run(kernel, *args, **kwargs)
         s_ptr = scale.data_ptr()
         st = _prologue_state.get(s_ptr, "unchecked")
         if st == "rejected":

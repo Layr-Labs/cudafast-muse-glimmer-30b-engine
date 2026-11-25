@@ -11,9 +11,18 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cstdlib>
 #include <stdint.h>
 
 namespace {
+
+static bool int3_pdl_enabled() {
+  static const bool on = []() -> bool {
+    const char* env = std::getenv("MUSE_INT3_PDL");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  return on;
+}
 
 constexpr int kWarpsPerBlock = 4;
 constexpr int kThreads = kWarpsPerBlock * 32;    // 128
@@ -130,7 +139,7 @@ struct alignas(16) Int3StageSmem {
 // When kSplitK == 1, writes directly to BF16 C.
 // When kSplitK > 1, grid = (N/64, kSplitK), accumulates to FP32 partials, then final CTA reduces?
 // Even simpler: use 1-pass persistent 48-CTA or direct (N/64) for N>=10240, and 4-way split-K via atomicAdd to FP32 + tiny epilogue or persistent!
-template <bool kSplitK>
+template <bool kSplitK, bool kPdl>
 __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
     const __nv_bfloat16* __restrict__ A,
     const uint8_t* __restrict__ W_packed,
@@ -153,12 +162,18 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
   int kg_end = kSplitK ? (kg_start + kg_per_sk) : num_kg;
   if (kg_end > num_kg) kg_end = num_kg;
   const int my_kgs = kg_end - kg_start;
-  if (my_kgs <= 0) return;
+  if (my_kgs <= 0) {
+    if constexpr (kPdl) {
+      asm volatile("griddepcontrol.wait;\n" ::: "memory");
+      asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+    }
+    return;
+  }
 
   const size_t cta_stride_bytes = static_cast<size_t>(num_kg) * kStepWBytes;
   const uint8_t* w_cta = W_packed + static_cast<size_t>(cta_n) * cta_stride_bytes;
 
-  // Issue 2 MiB TLB prefetch from block (0, 0).
+  // Issue 2 MiB TLB prefetch from block (0, 0) before PDL wait (read-only weights).
   if (cta_n == 0 && sk_idx == 0) {
     const size_t total_bytes = static_cast<size_t>(N / kRowsPerCTA) * cta_stride_bytes;
     for (size_t off = static_cast<size_t>(tid) << 21; off < total_bytes; off += static_cast<size_t>(kThreads) << 21) {
@@ -166,11 +181,14 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
     }
   }
 
-  auto issue_stage = [&](int kg, int st) {
+  auto issue_w_only = [&](int kg, int st) {
     if (tid < kStepWU4) {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
       int3_cp_async16_ef(sd, w_cta + static_cast<size_t>(kg) * kStepWBytes + tid * 16, pol);
     }
+  };
+
+  auto issue_a_only = [&](int kg, int st) {
     if (tid < 64) {
       const int row = tid >> 3;
       const int col8 = tid & 7;
@@ -179,14 +197,32 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
         int3_cp_async16_ca(sd, A + static_cast<size_t>(row) * K + kg * 64 + col8 * 8);
       }
     }
+  };
+
+  auto issue_stage = [&](int kg, int st) {
+    issue_w_only(kg, st);
+    issue_a_only(kg, st);
     asm volatile("cp.async.commit_group;\n" ::: "memory");
   };
 
   // Fill up to kStages - 1 = 5 stages in flight.
+  // With SM121 PDL enabled, preload read-only W stages BEFORE griddepcontrol.wait so
+  // DRAM weight fetches overlap with the producer kernel's epilogue; A loads wait until
+  // after griddepcontrol.wait so no stale activation byte can ever be read.
   constexpr int kPreload = kStages - 1;  // 5
   const int preload = (my_kgs < kPreload) ? my_kgs : kPreload;
-  for (int i = 0; i < preload; ++i) {
-    issue_stage(kg_start + i, i);
+  if constexpr (kPdl) {
+    issue_w_only(kg_start, 0);
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+    issue_a_only(kg_start, 0);
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    for (int i = 1; i < preload; ++i) {
+      issue_stage(kg_start + i, i);
+    }
+  } else {
+    for (int i = 0; i < preload; ++i) {
+      issue_stage(kg_start + i, i);
+    }
   }
 
   float d0_0 = 0.0f, d1_0 = 0.0f, d2_0 = 0.0f, d3_0 = 0.0f;
@@ -285,20 +321,31 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
       p1[0] = d0_1; p1[1] = d1_1;
     }
   }
+  if constexpr (kPdl) {
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+  }
 }
 
+template <bool kPdl>
 __global__ void int3_reduce_splitk_kernel(
     const float* __restrict__ C_fp32,
     __nv_bfloat16* __restrict__ C,
     int M, int N, int split_k) {
+  if constexpr (kPdl) {
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
+  }
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = M * N;
-  if (idx >= total) return;
-  float sum = 0.0f;
-  for (int s = 0; s < split_k; ++s) {
-    sum += C_fp32[static_cast<size_t>(s) * total + idx];
+  if (idx < total) {
+    float sum = 0.0f;
+    for (int s = 0; s < split_k; ++s) {
+      sum += C_fp32[static_cast<size_t>(s) * total + idx];
+    }
+    C[idx] = __float2bfloat16_rn(sum);
   }
-  C[idx] = __float2bfloat16_rn(sum);
+  if constexpr (kPdl) {
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");
+  }
 }
 
 }  // namespace
@@ -336,12 +383,32 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
   if (n_blocks <= 128 && K >= 16384) {
     split_k = (K >= 28672) ? 4 : 3;
   }
+  const bool use_pdl = int3_pdl_enabled();
   if (split_k == 1) {
-    int3_mma_gemm_kernel<false><<<n_blocks, kThreads, 0, st>>>(
-        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
-        W_packed.data_ptr<uint8_t>(),
-        reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-        nullptr, M, static_cast<int>(N), static_cast<int>(K), 1);
+    if (use_pdl) {
+      cudaLaunchConfig_t cfg = {};
+      cfg.gridDim = dim3(static_cast<unsigned>(n_blocks), 1u, 1u);
+      cfg.blockDim = dim3(static_cast<unsigned>(kThreads), 1u, 1u);
+      cfg.dynamicSmemBytes = 0;
+      cfg.stream = st;
+      cudaLaunchAttribute attr[1];
+      attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr[0].val.programmaticStreamSerializationAllowed = 1;
+      cfg.attrs = attr;
+      cfg.numAttrs = 1;
+      cudaLaunchKernelEx(
+          &cfg, int3_mma_gemm_kernel<false, true>,
+          reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+          W_packed.data_ptr<uint8_t>(),
+          reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+          static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1);
+    } else {
+      int3_mma_gemm_kernel<false, false><<<n_blocks, kThreads, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+          W_packed.data_ptr<uint8_t>(),
+          reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+          nullptr, M, static_cast<int>(N), static_cast<int>(K), 1);
+    }
   } else {
     const int64_t need = static_cast<int64_t>(split_k) * M * N;
     const int64_t alloc = (need > 4 * 8 * 6656) ? need : (4 * 8 * 6656);
@@ -349,16 +416,47 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
       g_partials = torch::empty({alloc}, A.options().dtype(torch::kFloat32));
       g_partials_cap = alloc;
     }
-    int3_mma_gemm_kernel<true><<<dim3(n_blocks, split_k, 1), kThreads, 0, st>>>(
-        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
-        W_packed.data_ptr<uint8_t>(),
-        nullptr, g_partials.data_ptr<float>(),
-        M, static_cast<int>(N), static_cast<int>(K), split_k);
     const int total = M * static_cast<int>(N);
-    int3_reduce_splitk_kernel<<<(total + 255) / 256, 256, 0, st>>>(
-        g_partials.data_ptr<float>(),
-        reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-        M, static_cast<int>(N), split_k);
+    if (use_pdl) {
+      cudaLaunchConfig_t cfg = {};
+      cfg.gridDim = dim3(static_cast<unsigned>(n_blocks), static_cast<unsigned>(split_k), 1u);
+      cfg.blockDim = dim3(static_cast<unsigned>(kThreads), 1u, 1u);
+      cfg.dynamicSmemBytes = 0;
+      cfg.stream = st;
+      cudaLaunchAttribute attr[1];
+      attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr[0].val.programmaticStreamSerializationAllowed = 1;
+      cfg.attrs = attr;
+      cfg.numAttrs = 1;
+      cudaLaunchKernelEx(
+          &cfg, int3_mma_gemm_kernel<true, true>,
+          reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+          W_packed.data_ptr<uint8_t>(),
+          static_cast<__nv_bfloat16*>(nullptr), g_partials.data_ptr<float>(),
+          M, static_cast<int>(N), static_cast<int>(K), split_k);
+      cudaLaunchConfig_t rcfg = {};
+      rcfg.gridDim = dim3(static_cast<unsigned>((total + 255) / 256), 1u, 1u);
+      rcfg.blockDim = dim3(256u, 1u, 1u);
+      rcfg.dynamicSmemBytes = 0;
+      rcfg.stream = st;
+      rcfg.attrs = attr;
+      rcfg.numAttrs = 1;
+      cudaLaunchKernelEx(
+          &rcfg, int3_reduce_splitk_kernel<true>,
+          g_partials.data_ptr<float>(),
+          reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+          M, static_cast<int>(N), split_k);
+    } else {
+      int3_mma_gemm_kernel<true, false><<<dim3(n_blocks, split_k, 1), kThreads, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+          W_packed.data_ptr<uint8_t>(),
+          nullptr, g_partials.data_ptr<float>(),
+          M, static_cast<int>(N), static_cast<int>(K), split_k);
+      int3_reduce_splitk_kernel<false><<<(total + 255) / 256, 256, 0, st>>>(
+          g_partials.data_ptr<float>(),
+          reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+          M, static_cast<int>(N), split_k);
+    }
   }
   return C;
 }

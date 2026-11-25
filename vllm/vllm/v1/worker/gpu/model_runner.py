@@ -1433,13 +1433,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or not self.cudagraph_manager._graphs_captured
             or torch.cuda.is_current_stream_capturing()
             or input_batch.num_reqs != 1
-            or input_batch.num_tokens != 1
-            or input_batch.num_tokens_after_padding != 1
+            or not (1 <= input_batch.num_tokens <= 8)
+            or input_batch.num_tokens_after_padding != input_batch.num_tokens
             or int(input_batch.num_computed_tokens_np[0]) < int(input_batch.prefill_len_np[0])
         ):
             return None
-        ids_1 = input_batch.input_ids[:1]
-        dst_1 = enc_runner.inputs_embeds[:1]
+        n_tok = int(input_batch.num_tokens)
+        ids_1 = input_batch.input_ids[:n_tok]
+        dst_1 = enc_runner.inputs_embeds[:n_tok]
         if not ids_1.is_contiguous() or not dst_1.is_contiguous():
             return None
         entries = getattr(self, "_decode_embed_cg_entries", None)
@@ -1458,7 +1459,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 g_or_fn.replay()
             return out_view
-        if sig in self._decode_embed_cg_rejected or len(entries) >= 4:
+        if sig in self._decode_embed_cg_rejected or len(entries) >= 8:
             return None
 
         ref_out = self.model_state.get_mm_embeddings(
@@ -1488,7 +1489,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logger.warning("decode muse_embed eager mismatch; keeping eager get_mm_embeddings")
                 return dst_1
             if (
-                envs.os.environ.get("VLLM_DECODE_EMBED_DIRECT", "1") != "0"
+                n_tok == 1
+                and envs.os.environ.get("VLLM_DECODE_EMBED_DIRECT", "1") != "0"
                 and getattr(_me, "is_single_kernel_m1", lambda: False)()
             ):
                 table_ptr = lm.embed_tokens.weight.data_ptr()
@@ -1521,6 +1523,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     tuple(dst_1.shape),
                 )
                 return dst_1
+            if (
+                2 <= n_tok <= 8
+                and envs.os.environ.get("VLLM_DECODE_EMBED_DIRECT", "1") != "0"
+                and getattr(_me, "is_single_kernel_m", lambda: False)()
+            ):
+                table_ptr = lm.embed_tokens.weight.data_ptr()
+                ids_ptr = ids_1.data_ptr()
+                ids_64 = int(ids_1.dtype == torch.int64)
+                dst_ptr = dst_1.data_ptr()
+                eps_f = float(lm.embed_norm.eps)
+                width_i = int(dst_1.shape[1])
+                fn_m = _me._lib.muse_embed_norm_m
+                dev_m = self.device
+
+                def _run_direct_m():
+                    rc = fn_m(
+                        ids_ptr, ids_64, table_ptr, eps_f, dst_ptr, n_tok, width_i,
+                        torch.cuda.current_stream(dev_m).cuda_stream,
+                    )
+                    if rc:
+                        raise RuntimeError(f"muse_embed_norm_m failed with CUDA error {rc}")
+
+                dst_1.zero_()
+                _run_direct_m()
+                if not torch.equal(dst_1.view(torch.int16), ref_copy.view(torch.int16)):
+                    dst_1.copy_(ref_copy)
+                    self._decode_embed_cg_rejected.add(sig)
+                    logger.warning("decode muse_embed direct M=%d mismatch; keeping eager path", n_tok)
+                    return dst_1
+                entries[sig] = (_run_direct_m, dst_1)
+                logger.info(
+                    "Armed direct 1-kernel M=%d decode muse_embed_norm_m (shape=%s)",
+                    n_tok,
+                    tuple(dst_1.shape),
+                )
+                return dst_1
             main_st = torch.cuda.current_stream(self.device)
             cap_st = self._decode_embed_cg_cap_stream
             cap_st.wait_stream(main_st)
@@ -1539,7 +1577,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 return dst_1
             entries[sig] = (g, dst_1)
             logger.info(
-                "Captured M=1 decode muse_embed CUDA graph (shape=%s)",
+                "Captured M=%d decode muse_embed CUDA graph (shape=%s)",
+                n_tok,
                 tuple(dst_1.shape),
             )
             return dst_1

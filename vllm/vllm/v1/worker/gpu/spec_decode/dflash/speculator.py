@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -299,6 +300,135 @@ class DFlashSpeculator(DraftModelSpeculator):
             query_start_loc_np=query_start_loc_np,
         )
 
+    def _try_context_kv_graph(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        num_target_tokens: int,
+        context_slots: torch.Tensor | list[torch.Tensor | None],
+        compute_ctx_fn,
+    ) -> bool:
+        entries = getattr(self, "_ctx_cg_entries", None)
+        if entries is None:
+            entries = {}
+            self._ctx_cg_entries = entries
+            self._ctx_cg_rejected: set[tuple] = set()
+            self._ctx_cg_pool = torch.cuda.graph_pool_handle()
+            self._ctx_cg_cap_stream = torch.cuda.Stream(device=self.device)
+
+        sig = (
+            num_target_tokens,
+            tuple((h.data_ptr(), tuple(h.shape), tuple(h.stride())) for h in aux_hidden_states),
+            self.context_positions.data_ptr(),
+            self._context_slot_mappings.data_ptr(),
+        )
+        entry = entries.get(sig)
+        if entry is not None:
+            entry[0].replay()
+            return True
+        if sig in self._ctx_cg_rejected or len(entries) >= 8:
+            return False
+
+        ref_ctx = compute_ctx_fn()
+        ctx_pos_view = self.context_positions[:num_target_tokens]
+        self.model.precompute_and_store_context_kv(ref_ctx, ctx_pos_view, context_slots)
+        ref_ctx_copy = ref_ctx.clone()
+
+        kv_check = None
+        try:
+            inner = getattr(self.model, "model", self.model)
+            attn_layers = getattr(inner, "_attn_layers", None)
+            if attn_layers:
+                kv0 = getattr(attn_layers[0], "kv_cache", None)
+                s0 = context_slots[0] if isinstance(context_slots, (list, tuple)) else context_slots
+                if isinstance(kv0, torch.Tensor) and isinstance(s0, torch.Tensor):
+                    valid_slots = torch.unique(s0[s0 >= 0]).to(torch.long)
+                    if valid_slots.numel() > 0:
+                        if kv0.ndim == 5 and kv0.shape[0] == 2:
+                            k_flat = kv0[0].reshape(-1, kv0.shape[3], kv0.shape[4])
+                            v_flat = kv0[1].reshape(-1, kv0.shape[3], kv0.shape[4])
+                            kv_check = (
+                                k_flat,
+                                v_flat,
+                                valid_slots,
+                                k_flat[valid_slots].clone(),
+                                v_flat[valid_slots].clone(),
+                            )
+                        elif kv0.ndim == 4 and kv0.shape[1] == 2:
+                            k_flat = kv0[:, 0].reshape(-1, kv0.shape[3])
+                            v_flat = kv0[:, 1].reshape(-1, kv0.shape[3])
+                            kv_check = (
+                                k_flat,
+                                v_flat,
+                                valid_slots,
+                                k_flat[valid_slots].clone(),
+                                v_flat[valid_slots].clone(),
+                            )
+        except Exception:  # noqa: BLE001
+            kv_check = None
+
+        try:
+            main_st = torch.cuda.current_stream(self.device)
+            cap_st = self._ctx_cg_cap_stream
+            cap_st.wait_stream(main_st)
+            g = torch.cuda.CUDAGraph()
+            cap_ctx_holder: list[torch.Tensor] = []
+            with torch.cuda.stream(cap_st):
+                with torch.cuda.graph(g, pool=self._ctx_cg_pool, stream=cap_st):
+                    cap_ctx = compute_ctx_fn()
+                    self.model.precompute_and_store_context_kv(
+                        cap_ctx, ctx_pos_view, context_slots
+                    )
+                    cap_ctx_holder.append(cap_ctx)
+            main_st.wait_stream(cap_st)
+
+            cap_ctx_t = cap_ctx_holder[0]
+            cap_ctx_t.zero_()
+            if kv_check is not None:
+                k_flat, v_flat, valid_slots, k_ref, v_ref = kv_check
+                k_flat[valid_slots] = 0
+                v_flat[valid_slots] = 0
+            g.replay()
+            torch.cuda.synchronize(self.device)
+
+            ok = torch.equal(cap_ctx_t.view(torch.uint8), ref_ctx_copy.view(torch.uint8))
+            if ok and kv_check is not None:
+                k_flat, v_flat, valid_slots, k_ref, v_ref = kv_check
+                ok = torch.equal(
+                    k_flat[valid_slots].view(torch.uint8), k_ref.view(torch.uint8)
+                ) and torch.equal(
+                    v_flat[valid_slots].view(torch.uint8), v_ref.view(torch.uint8)
+                )
+            if not ok:
+                if kv_check is not None:
+                    k_flat, v_flat, valid_slots, k_ref, v_ref = kv_check
+                    k_flat[valid_slots] = k_ref
+                    v_flat[valid_slots] = v_ref
+                self._ctx_cg_rejected.add(sig)
+                logger.warning(
+                    "DFlash context-KV CUDA graph mismatch vs eager (m=%d); keeping eager path",
+                    num_target_tokens,
+                )
+                return True
+
+            entries[sig] = (g, cap_ctx_t)
+            logger.info(
+                "Captured DFlash context-KV CUDA graph (m=%d, kv_verified=%s)",
+                num_target_tokens,
+                kv_check is not None,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            if kv_check is not None:
+                k_flat, v_flat, valid_slots, k_ref, v_ref = kv_check
+                k_flat[valid_slots] = k_ref
+                v_flat[valid_slots] = v_ref
+            self._ctx_cg_rejected.add(sig)
+            logger.warning(
+                "DFlash context-KV CUDA graph capture skipped (%s); keeping eager path",
+                exc,
+            )
+            return True
+
     @torch.inference_mode()
     def propose(
         self,
@@ -339,25 +469,26 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if aux_hidden_states:
-            if aux_hidden_states[0].shape[0] > num_target_tokens:
-                aux_cat = torch.cat(
-                    [h[:num_target_tokens] for h in aux_hidden_states], dim=-1
-                )
+        def _compute_context_hidden() -> torch.Tensor:
+            if aux_hidden_states:
+                if aux_hidden_states[0].shape[0] > num_target_tokens:
+                    aux_cat = torch.cat(
+                        [h[:num_target_tokens] for h in aux_hidden_states], dim=-1
+                    )
+                else:
+                    aux_cat = torch.cat(aux_hidden_states, dim=-1)
+                ctx_h = self.model.combine_hidden_states(aux_cat)[:num_target_tokens]
             else:
-                aux_cat = torch.cat(aux_hidden_states, dim=-1)
-            context_hidden_states = self.model.combine_hidden_states(aux_cat)[
-                :num_target_tokens
-            ]
-        else:
-            context_hidden_states = last_hidden_states[:num_target_tokens]
-        if not context_hidden_states.is_contiguous():
-            context_hidden_states = context_hidden_states.contiguous()
+                ctx_h = last_hidden_states[:num_target_tokens]
+            if not ctx_h.is_contiguous():
+                ctx_h = ctx_h.contiguous()
+            return ctx_h
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
+            context_hidden_states = _compute_context_hidden()
             self.model.precompute_and_store_context_kv(
                 context_hidden_states,
                 self.context_positions[:num_target_tokens],
@@ -408,10 +539,10 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.sample_from_anchor,
             )
 
-        # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
-        # because the context shape varies per step. During dummy runs the block tables
-        # are placeholders, so we skip the cache write to avoid clobbering real entries.
-        # Each layer uses the context slots of its own kv-cache group.
+        # Pre-insert context K/V into the cache. Each layer uses the context slots
+        # of its own kv-cache group. During steady-state decode (1 req, 2..8 target
+        # tokens, fixed graph output pointers), capture combine_hidden_states +
+        # precompute_and_store_context_kv into a verified CUDA graph.
         if dummy_run:
             context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
         elif self._layer_group_idx is not None:
@@ -421,11 +552,31 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self.model.precompute_and_store_context_kv(
-            context_hidden_states,
-            self.context_positions[:num_target_tokens],
-            context_slots,
-        )
+
+        ctx_ran = False
+        if (
+            not dummy_run
+            and not is_profile
+            and num_reqs == 1
+            and 2 <= num_target_tokens <= 8
+            and aux_hidden_states
+            and context_slots is not None
+            and os.environ.get("VLLM_DFLASH_CTX_GRAPH", "1") != "0"
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            ctx_ran = self._try_context_kv_graph(
+                aux_hidden_states,
+                num_target_tokens,
+                context_slots,
+                _compute_context_hidden,
+            )
+        if not ctx_ran:
+            context_hidden_states = _compute_context_hidden()
+            self.model.precompute_and_store_context_kv(
+                context_hidden_states,
+                self.context_positions[:num_target_tokens],
+                context_slots,
+            )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
