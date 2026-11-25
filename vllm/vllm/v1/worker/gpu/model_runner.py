@@ -388,6 +388,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 place_prefill_weights(self.model)
             except Exception as err:  # noqa: BLE001 - never part of the load's success
                 logger.warning("Decode weight placement unavailable: %s", err)
+            if self.speculator is not None:
+                # LOCAL PATCH (DFlash verify rows, FP8): after every placement, admit the rANS FP8 layers whose
+                # (1 + depth)-row GEMM equals today's small-row FP8 op bit for bit.
+                try:
+                    from vllm.model_executor.kernels.linear.scaled_mm import muse_fp8 as _muse_fp8
+
+                    _muse_fp8.admit_verify_rows(
+                        self.model, 1 + int(self.speculative_config.num_speculative_tokens)
+                    )
+                except Exception as err:  # noqa: BLE001 - never part of the load's success
+                    logger.warning("FP8 verify-rows admission unavailable: %s", err)
         logger.info(
             "Model loading took %s GiB and %.6f seconds",
             format_gib(m.consumed_memory),
