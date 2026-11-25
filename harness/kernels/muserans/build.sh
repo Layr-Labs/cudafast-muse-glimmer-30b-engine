@@ -21,7 +21,7 @@ name = "muse_rans_ext"
 load(
     name=name,
     sources=[str(source / "csrc" / "muse_rans.cu")],
-    extra_cuda_cflags=["-O3", "-gencode=arch=compute_121a,code=sm_121a", "-DMUSE_RANS_STANDALONE_MODULE", "-lineinfo"],
+    extra_cuda_cflags=["-O3", "--threads=4", "-gencode=arch=compute_121a,code=sm_121a", "-DMUSE_RANS_STANDALONE_MODULE", "-lineinfo"],
     extra_cflags=["-O3"],
     build_directory=str(build),
     verbose=False,

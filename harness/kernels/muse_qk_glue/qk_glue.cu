@@ -577,7 +577,7 @@ int launch_kvcache_prefill(
     int64_t stride_block, int64_t stride_slot, int64_t stride_kv_head,
     float eps, float qscale, int use_rope, int cache_fp32, cudaStream_t stream) {
   constexpr int kGroups = (34 + HPW - 1) / HPW;
-  const int threads = 128;
+  const int threads = (HPW == 2 && num_tokens <= 16) ? 192 : 128;
   const int wpb = threads >> 5;
   const int blocks = (num_tokens * kGroups + wpb - 1) / wpb;
   const auto* q = static_cast<const __nv_bfloat16*>(qkv);
