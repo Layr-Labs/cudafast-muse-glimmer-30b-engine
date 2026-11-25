@@ -17,6 +17,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
+from vllm.transformers_utils.configs.muse_draft import is_muse_glimmer_assistant
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -56,10 +57,15 @@ _SLIDING_ATTENTION = "sliding_attention"
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
-    """``dflash_config.causal`` overrides all layers; else only SWA layers causal."""
+    """Resolve block causality independently of the context's sliding window."""
     override = (getattr(config, "dflash_config", None) or {}).get("causal")
     if override is not None:
         return override
+    if is_muse_glimmer_assistant(config):
+        # Muse denoises its mask-token block jointly. Sliding attention limits
+        # the context window; queries within the block see one another.
+        logger.info_once("Muse DFlash: bidirectional draft-block attention enabled")
+        return False
     layer_types = getattr(config, "layer_types", None)
     return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
 
