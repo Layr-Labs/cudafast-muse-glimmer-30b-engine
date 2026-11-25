@@ -73,6 +73,10 @@ _sk_tma4_ilv_lmpost = getattr(_lib, "muse_marlin6_sk_tma4_ilv_lmpost", None)
 if _sk_tma4_ilv_lmpost is not None:
     _sk_tma4_ilv_lmpost.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
     _sk_tma4_ilv_lmpost.restype = ctypes.c_int
+_sk_tma4_ilv_lmpost_m = getattr(_lib, "muse_marlin6_sk_tma4_ilv_lmpost_m", None)
+if _sk_tma4_ilv_lmpost_m is not None:
+    _sk_tma4_ilv_lmpost_m.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
+    _sk_tma4_ilv_lmpost_m.restype = ctypes.c_int
 _sk_tma4_ilv = getattr(_lib, "muse_marlin6_sk_tma4_ilv", None)
 if _sk_tma4_ilv is not None:
     _sk_tma4_ilv.argtypes = _gemv6.argtypes
@@ -142,6 +146,7 @@ _GATE_UP_TILE_ORDER: dict[torch.device, torch.Tensor] = {}
 _GATED_OPROJ: set[int] = set()
 _ALL_OPROJ_GATED_READY: bool = False
 _LMPOST_BUFS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_LMPOST_M_BUFS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 _consume_down_swiglu = None
 _notify_gate_up_swiglu = None
 _consume_oproj_sigmoid = None
@@ -1101,6 +1106,133 @@ def admit_tma4_lmpost(
     logger.info(
         "Fused lm_head+lmpost decode6 kernel admitted bitwise (n=%d, vocab=%d, k=%d, ilv=%s, split2=%s, pad128=%s)",
         n, org_vocab_size, k, is_ilv, is_lm_split2(scales6), pad128,
+    )
+    return True
+
+
+def _get_lmpost_m_bufs(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    bufs = _LMPOST_M_BUFS.get(idx)
+    if bufs is None:
+        bufs = (
+            torch.zeros(1088, dtype=torch.int64, device=dev),
+            torch.empty((96, 16, 128), dtype=torch.float32, device=dev),
+        )
+        _LMPOST_M_BUFS[idx] = bufs
+    return bufs
+
+
+def launch_lmhead_lmpost6_m(
+    x: torch.Tensor,
+    layer: torch.nn.Module,
+    lut: torch.Tensor | None,
+    out_tokens: torch.Tensor,
+    org_vocab_size: int,
+) -> bool:
+    if _sk_tma4_ilv_lmpost_m is None:
+        return False
+    s6 = getattr(layer, "_marlin_decode_scales6", None)
+    if (
+        s6 is None
+        or not is_tma4_ilv(s6)
+        or x.ndim != 2
+        or not (1 <= x.shape[0] <= 8)
+        or x.shape[1] != layer.input_size_per_partition
+        or x.dtype != torch.bfloat16
+        or not x.is_contiguous()
+        or x.data_ptr() % 16 != 0
+        or out_tokens.dtype != torch.int64
+        or not out_tokens.is_contiguous()
+        or out_tokens.numel() != x.shape[0]
+    ):
+        return False
+    m = int(x.shape[0])
+    n, k = layer.output_size_per_partition, layer.input_size_per_partition
+    lm_pad128 = (n, k) == (LM_HEAD_N, LM_HEAD_K) and is_lm_pad128(s6)
+    eff_n = LM_HEAD_PAD128_N if lm_pad128 else n
+    if (eff_n != LM_HEAD_N and eff_n != LM_HEAD_PAD128_N) or k != LM_HEAD_K:
+        return False
+    blocks = 96 if is_lm_split2(s6) else 48
+    scratch, partials = _get_lmpost_m_bufs(x.device)
+    lut_ptr = lut.data_ptr() if lut is not None else 0
+    with torch.cuda.device(x.device):
+        rc = _sk_tma4_ilv_lmpost_m(
+            x.data_ptr(),
+            layer._marlin_decode_weight.data_ptr(),
+            scratch.data_ptr(),
+            partials.data_ptr(),
+            s6.data_ptr(),
+            layer._marlin_decode_palette.data_ptr(),
+            layer.weight_global_scale.data_ptr(),
+            layer.workspace.data_ptr(),
+            lut_ptr,
+            out_tokens.data_ptr(),
+            m,
+            int(org_vocab_size),
+            eff_n,
+            k,
+            blocks,
+            x.device.index,
+            torch.cuda.current_stream().cuda_stream,
+        )
+    if rc:
+        raise RuntimeError(f"muse_marlin6_sk_tma4_ilv_lmpost_m failed with CUDA error {rc}")
+    return True
+
+
+def admit_tma4_lmpost_m(
+    layer: torch.nn.Module,
+    lut: torch.Tensor | None,
+    org_vocab_size: int,
+    ref_argmax_fn,
+    test_ms: tuple[int, ...] = (6, 7),
+) -> bool:
+    if os.environ.get("MUSE_FUSE_LMHEAD_LMPOST_M", "1") == "0":
+        return False
+    scales6 = getattr(layer, "_marlin_decode_scales6", None)
+    if (
+        _sk_tma4_ilv_lmpost_m is None
+        or scales6 is None
+        or getattr(layer, "_marlin_decode_weight", None) is None
+        or getattr(layer, "_marlin_decode_palette", None) is None
+        or getattr(layer, "marlin_decode6_fixed_grid", False)
+        or not is_tma4_ilv(scales6)
+    ):
+        return False
+    n, k = layer.output_size_per_partition, layer.input_size_per_partition
+    pad128 = (n, k) == (LM_HEAD_N, LM_HEAD_K) and is_lm_pad128(scales6)
+    eff_n = LM_HEAD_PAD128_N if pad128 else n
+    if (eff_n != LM_HEAD_N and eff_n != LM_HEAD_PAD128_N) or k != LM_HEAD_K or not (0 < org_vocab_size <= n):
+        return False
+    dev = scales6.device
+    scratch, _ = _get_lmpost_m_bufs(dev)
+    gen = torch.Generator(device=dev).manual_seed(20261126)
+    for m in test_ms:
+        out_tok = torch.empty((m,), dtype=torch.int64, device=dev)
+        for mag in (0.01, 0.5, 2.0, 32.0):
+            x = (torch.randn((m, k), generator=gen, device=dev) * mag).to(torch.bfloat16).contiguous()
+            ref = ref_argmax_fn(x)
+            if ref is None:
+                return False
+            ref_flat = ref.reshape(-1).to(torch.int64)
+            out_tok.fill_(-1)
+            if not launch_lmhead_lmpost6_m(x, layer, lut, out_tok, org_vocab_size):
+                return False
+            torch.cuda.synchronize(dev)
+            if (
+                ref_flat.shape != (m,)
+                or not torch.equal(out_tok, ref_flat)
+                or int(torch.count_nonzero(layer.workspace).item()) != 0
+                or int(scratch.view(torch.int32)[2048].item()) != 0
+            ):
+                logger.warning(
+                    "Fused multi-M lm_head+lmpost self-check mismatch (m=%d, lut=%s); keeping stock path",
+                    m, lut is not None,
+                )
+                return False
+    logger.info(
+        "Fused multi-M lm_head+lmpost decode6 kernel admitted bitwise (n=%d, vocab=%d, k=%d, lut=%s, split2=%s, pad128=%s)",
+        n, org_vocab_size, k, lut is not None, is_lm_split2(scales6), pad128,
     )
     return True
 

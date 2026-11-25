@@ -266,6 +266,10 @@
     {
       "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
       "why": "bs=1 speculative-decode host cuts (from i34-9, Yukon submissions 9ba5da7f-8db5-430c-a3f5-d3da1a13d186 / 1cf35c6e-2e8d-4cc8-a354-d2132af5831d): one-request draft steps read query_start_loc, cu_num_logits, expanded_idx_mapping and expanded_local_pos from read-only tensors built once in load_model (same contents) instead of a pin + H2D copy and an expand kernel per step; the per-step draft-token gather handed to DraftTokensHandler is skipped when no structured-output request needs its contents (only its shape is read); the rejection sampler skips the identity cu_num_logits shift when the chunk starts at 0."
+    },
+    {
+      "file": "harness/kernels/gqa16_decode/{gqa16_decode.cu,muse_gqa16_attn.py}; harness/kernels/decode6/{marlin/marlin_template.h,gemv6_tma4.cu,muse_marlin6_gemv.py}; harness/kernels/muse_embed/{embed.cu,muse_embed.py}; vllm/v1/worker/gpu/model_runner.py; vllm/v1/worker/gpu/spec_decode/{speculator.py,dflash/speculator.py}",
+      "why": "Shared-KV 2-query/CTA verify attention upgrade (gqa16_verify_pair_1pass_kernel, 8 CTAs for q_len=7/8, 2x fewer KV reads, automatic 0-ULP admission across m_tok in 2..8 with fallback to 1-query/CTA verify); fused multi-M (M=1..8) decode6 TMA4-ILV lm_head + LUT softcap/raw BF16 argmax (muse_marlin6_sk_tma4_ilv_lmpost_m) paired with single-CTA greedy rejection (muse_greedy_reject_m) in a 4-slot 2-node CUDA graph for target verify (dynamic num_logits == num_draft_tokens + 1 with per-M 0-ULP admission and full -1-padded output width) and inside DFlash query CUDA graph for draft token argmax; multi-row (M=2..8) muse_embed_norm_m direct/graph decode embedding; and verified DFlash context-KV precompute CUDA graph (combine_hidden_states + precompute_and_store_context_kv, 8-entry cache)."
     }
   ],
   "carried_from": {

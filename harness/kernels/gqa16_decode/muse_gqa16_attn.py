@@ -36,6 +36,7 @@ PREFILL_PDL_ENABLED = os.environ.get("MUSE_GQA16_PREFILL_PDL", "1").strip() not 
 VERIFY_ENABLED = os.environ.get("MUSE_GQA16_VERIFY", "1").strip() not in ("0", "", "false", "no")
 VERIFY_SPLITS = int(os.environ.get("MUSE_GQA16_VERIFY_SPLITS", "1"))
 VERIFY_PIPE = os.environ.get("MUSE_GQA16_VERIFY_PIPE", "1").strip() not in ("0", "", "false", "no")
+VERIFY_PAIR = os.environ.get("MUSE_GQA16_VERIFY_PAIR", "1").strip() not in ("0", "", "false", "no")
 
 _lib = None
 try:
@@ -78,7 +79,7 @@ except OSError:
 _scratch: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _state: dict[int, tuple[bool, int, int]] = {}  # dev_idx -> (admitted, scale_mode, num_sms)
 _prefill_state: dict[int, tuple[bool, int]] = {}  # dev_idx -> (admitted, scale_mode)
-_verify_state: dict[int, tuple[bool, int]] = {}  # dev_idx -> (admitted, scale_mode)
+_verify_state: dict[int, tuple[bool, int, int]] = {}  # dev_idx -> (admitted, scale_mode, extra_bits)
 _pending_prefill: tuple | None = None
 _pf_counts: dict[str, int] = {"defer": 0, "fused1": 0, "fused2": 0, "direct0": 0, "flush": 0, "miss": 0}
 
@@ -312,8 +313,10 @@ def self_check_verify(device: torch.device) -> bool:
 
     ok = False
     scale_mode = 1
+    chosen_extra = 0
     g_splits = VERIFY_SPLITS if VERIFY_SPLITS in (1, 4, 8, 16) else 1
     pipe_bit = 16 if VERIFY_PIPE else 0
+    cand_extras = ((pipe_bit | 32, pipe_bit) if (VERIFY_PAIR and g_splits == 1) else (pipe_bit,))
     try:
         from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
 
@@ -327,77 +330,82 @@ def self_check_verify(device: torch.device) -> bool:
         bt = perm.unsqueeze(0).contiguous()
         stream = torch.cuda.current_stream(device).cuda_stream
 
-        for cand_mode in (1, 3):
-            all_match = True
-            for m_tok in (2, 4, 7, 8):
-                q = (torch.randn((m_tok, 32, 128), generator=gen, device=device) * 1.1).to(torch.bfloat16).contiguous()
-                cu_q = torch.tensor([0, m_tok], dtype=torch.int32, device=device)
-                for seq_k in (518, 640):
-                    sk = torch.tensor([seq_k], dtype=torch.int32, device=device)
-                    for win in ((511, 0), (-1, -1)):
-                        ref = torch.empty_like(q)
-                        flash_attn_varlen_func(
-                            q=q, k=k_cache, v=v_cache, out=ref,
-                            cu_seqlens_q=cu_q, max_seqlen_q=m_tok,
-                            seqused_k=sk, max_seqlen_k=8192,
-                            softmax_scale=scale, causal=True,
-                            window_size=win, block_table=bt, fa_version=2,
-                        )
-                        got = torch.empty_like(q)
-                        rc = _lib.muse_gqa16_verify(
-                            q.data_ptr(), kv_cache.data_ptr(), got.data_ptr(),
-                            sk.data_ptr(), bt.data_ptr(), cu_q.data_ptr(),
-                            m_tok, block_size, win[0], g_splits, cand_mode | pipe_bit, scale,
-                            q.stride(0), q.stride(1), got.stride(0), got.stride(1),
-                            kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
-                            stream,
-                        )
-                        torch.cuda.synchronize(device)
-                        if rc != 0 or not torch.isfinite(got).all() or not torch.equal(ref.view(torch.int16), got.view(torch.int16)):
-                            all_match = False
-                            break
-                    if not all_match:
+        # Precompute stock FA2 reference outputs once across all test shapes.
+        cases = []
+        for m_tok in (2, 3, 4, 5, 7, 8):
+            q = (torch.randn((m_tok, 32, 128), generator=gen, device=device) * 1.1).to(torch.bfloat16).contiguous()
+            cu_q = torch.tensor([0, m_tok], dtype=torch.int32, device=device)
+            for seq_k in (518, 640):
+                sk = torch.tensor([seq_k], dtype=torch.int32, device=device)
+                for win in ((511, 0), (-1, -1)):
+                    ref = torch.empty_like(q)
+                    flash_attn_varlen_func(
+                        q=q, k=k_cache, v=v_cache, out=ref,
+                        cu_seqlens_q=cu_q, max_seqlen_q=m_tok,
+                        seqused_k=sk, max_seqlen_k=8192,
+                        softmax_scale=scale, causal=True,
+                        window_size=win, block_table=bt, fa_version=2,
+                    )
+                    cases.append((q, cu_q, sk, m_tok, win[0], ref))
+        q8 = (torch.randn((8, 32, 128), generator=gen, device=device) * 1.1).to(torch.bfloat16).contiguous()
+        cu_q7 = torch.tensor([0, 7], dtype=torch.int32, device=device)
+        sk640 = torch.tensor([640], dtype=torch.int32, device=device)
+        ref7 = torch.empty((7, 32, 128), dtype=torch.bfloat16, device=device)
+        flash_attn_varlen_func(
+            q=q8[:7], k=k_cache, v=v_cache, out=ref7,
+            cu_seqlens_q=cu_q7, max_seqlen_q=7,
+            seqused_k=sk640, max_seqlen_k=8192,
+            softmax_scale=scale, causal=True,
+            window_size=(511, 0), block_table=bt, fa_version=2,
+        )
+        torch.cuda.synchronize(device)
+
+        for extra_bits in cand_extras:
+            for cand_mode in (1, 3):
+                all_match = True
+                for q, cu_q, sk, m_tok, w_left, ref in cases:
+                    got = torch.empty_like(q)
+                    rc = _lib.muse_gqa16_verify(
+                        q.data_ptr(), kv_cache.data_ptr(), got.data_ptr(),
+                        sk.data_ptr(), bt.data_ptr(), cu_q.data_ptr(),
+                        m_tok, block_size, w_left, g_splits, cand_mode | extra_bits, scale,
+                        q.stride(0), q.stride(1), got.stride(0), got.stride(1),
+                        kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
+                        stream,
+                    )
+                    torch.cuda.synchronize(device)
+                    if rc != 0 or not torch.isfinite(got).all() or not torch.equal(ref.view(torch.int16), got.view(torch.int16)):
+                        all_match = False
                         break
-                if not all_match:
+                if all_match:
+                    got8 = torch.zeros_like(q8)
+                    rc = _lib.muse_gqa16_verify(
+                        q8.data_ptr(), kv_cache.data_ptr(), got8.data_ptr(),
+                        sk640.data_ptr(), bt.data_ptr(), cu_q7.data_ptr(),
+                        8, block_size, 511, g_splits, cand_mode | extra_bits, scale,
+                        q8.stride(0), q8.stride(1), got8.stride(0), got8.stride(1),
+                        kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
+                        stream,
+                    )
+                    torch.cuda.synchronize(device)
+                    if rc != 0 or not torch.equal(ref7.view(torch.int16), got8[:7].view(torch.int16)):
+                        all_match = False
+                if all_match:
+                    ok = True
+                    scale_mode = cand_mode
+                    chosen_extra = extra_bits
                     break
-            # Also verify padded CUDA-graph replay (grid max_q=8, runtime actual_m=7).
-            if all_match:
-                q8 = (torch.randn((8, 32, 128), generator=gen, device=device) * 1.1).to(torch.bfloat16).contiguous()
-                cu_q7 = torch.tensor([0, 7], dtype=torch.int32, device=device)
-                sk = torch.tensor([640], dtype=torch.int32, device=device)
-                ref7 = torch.empty((7, 32, 128), dtype=torch.bfloat16, device=device)
-                flash_attn_varlen_func(
-                    q=q8[:7], k=k_cache, v=v_cache, out=ref7,
-                    cu_seqlens_q=cu_q7, max_seqlen_q=7,
-                    seqused_k=sk, max_seqlen_k=8192,
-                    softmax_scale=scale, causal=True,
-                    window_size=(511, 0), block_table=bt, fa_version=2,
-                )
-                got8 = torch.zeros_like(q8)
-                rc = _lib.muse_gqa16_verify(
-                    q8.data_ptr(), kv_cache.data_ptr(), got8.data_ptr(),
-                    sk.data_ptr(), bt.data_ptr(), cu_q7.data_ptr(),
-                    8, block_size, 511, g_splits, cand_mode | pipe_bit, scale,
-                    q8.stride(0), q8.stride(1), got8.stride(0), got8.stride(1),
-                    kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
-                    stream,
-                )
-                torch.cuda.synchronize(device)
-                if rc != 0 or not torch.equal(ref7.view(torch.int16), got8[:7].view(torch.int16)):
-                    all_match = False
-            if all_match:
-                ok = True
-                scale_mode = cand_mode
+            if ok:
                 break
     except Exception:  # noqa: BLE001
         logger.warning("muse_gqa16_attn: verify self-check raised on cuda:%d", idx, exc_info=True)
         ok = False
 
-    _verify_state[idx] = (ok, scale_mode)
+    _verify_state[idx] = (ok, scale_mode, chosen_extra)
     if ok:
         logger.info(
-            "muse_gqa16_attn: strict 0-ULP verify (M=2..8) admitted on cuda:%d (grid_splits=%d, pipe=%d, scale_mode=%d)",
-            idx, g_splits, int(VERIFY_PIPE), scale_mode,
+            "muse_gqa16_attn: strict 0-ULP verify (M=2..8) admitted on cuda:%d (grid_splits=%d, pipe=%d, pair=%d, scale_mode=%d)",
+            idx, g_splits, int((chosen_extra & 16) != 0), int((chosen_extra & 32) != 0), scale_mode,
         )
     else:
         logger.warning("muse_gqa16_attn: strict 0-ULP verify self-check failed on cuda:%d; keeping stock FA2", idx)
@@ -467,7 +475,6 @@ def try_verify_gqa16(
         w_left = int(window[0])
 
     g_splits = VERIFY_SPLITS if VERIFY_SPLITS in (1, 4, 8, 16) else 1
-    pipe_bit = 16 if VERIFY_PIPE else 0
     stream = torch.cuda.current_stream(device).cuda_stream
     rc = _lib.muse_gqa16_verify(
         query.data_ptr(),
@@ -480,7 +487,7 @@ def try_verify_gqa16(
         block_size,
         w_left,
         g_splits,
-        vst[1] | pipe_bit,
+        vst[1] | vst[2],
         softmax_scale,
         query.stride(0),
         query.stride(1),

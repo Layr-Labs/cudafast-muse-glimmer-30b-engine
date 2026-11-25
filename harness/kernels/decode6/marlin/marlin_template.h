@@ -411,6 +411,8 @@ __global__ void Marlin(
   }
   [[maybe_unused]] float lm_bv = -__int_as_float(0x7f800000);
   [[maybe_unused]] int lm_bi = 0x7fffffff;
+  [[maybe_unused]] float lm_bv1 = -__int_as_float(0x7f800000);
+  [[maybe_unused]] int lm_bi1 = 0x7fffffff;
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -3342,7 +3344,44 @@ __global__ void Marlin(
         wait_negative_and_add(&locks[eff_lock]);
       if constexpr (fuse_lmpost) {
         constexpr int active_threads = 32 * tb_n_warps;
-        if (last && threadIdx.x < active_threads && (threadIdx.x & 3) == 0) {
+        if constexpr (multi_m) {
+          if (last && threadIdx.x < active_threads) {
+            const int lane = threadIdx.x & 31;
+            const int r0 = (lane & 3) << 1;
+            const int r1 = r0 + 1;
+            const bool a0 = (r0 < prob_m);
+            const bool a1 = (r1 < prob_m);
+            const int base_col = slice_col * (thread_n_blocks * 16) + 64 * (threadIdx.x >> 5);
+            const int g = lane >> 2;
+            auto upd = [&](float raw_f, int col, float& bv, int& bi) {
+              const __nv_bfloat16 b = Cdtype::float2num(raw_f * global_scale_f32);
+              float v;
+              if (lmpost_lut != nullptr) {
+                const uint16_t m = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&b));
+                v = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m));
+              } else {
+                v = __bfloat162float(b);
+              }
+              if ((v > bv) || (v == bv && col < bi)) {
+                bv = v;
+                bi = col;
+              }
+            };
+  #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+              const int col0 = base_col + 16 * j + g;
+              const int col2 = col0 + 8;
+              if (col0 < org_vocab_size) {
+                if (a0) upd(frag_c[0][j][0][0], col0, lm_bv, lm_bi);
+                if (a1) upd(frag_c[0][j][0][1], col0, lm_bv1, lm_bi1);
+              }
+              if (col2 < org_vocab_size) {
+                if (a0) upd(frag_c[0][j][0][2], col2, lm_bv, lm_bi);
+                if (a1) upd(frag_c[0][j][0][3], col2, lm_bv1, lm_bi1);
+              }
+            }
+          }
+        } else if (last && threadIdx.x < active_threads && (threadIdx.x & 3) == 0) {
           const int base_col = slice_col * (thread_n_blocks * 16) + 64 * (threadIdx.x >> 5);
           const int g = (threadIdx.x & 31) >> 2;
   #pragma unroll
@@ -3473,81 +3512,165 @@ __global__ void Marlin(
     int* const sh_last = sh_bi + 128;
 
     constexpr int active_threads = 32 * tb_n_warps;
-    if (threadIdx.x < active_threads) {
-      if ((threadIdx.x & 3) != 0) {
-        lm_bv = -__int_as_float(0x7f800000);
-        lm_bi = 0x7fffffff;
-      }
+    if constexpr (multi_m) {
+      if (threadIdx.x < active_threads) {
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
 #pragma unroll
-      for (int off = 16; off >= 1; off >>= 1) {
-        const float ov = __shfl_xor_sync(0xffffffffu, lm_bv, off);
-        const int oi = __shfl_xor_sync(0xffffffffu, lm_bi, off);
-        if ((ov > lm_bv) || (ov == lm_bv && oi < lm_bi)) {
-          lm_bv = ov;
-          lm_bi = oi;
+        for (int off = 16; off >= 4; off >>= 1) {
+          const float ov0 = __shfl_xor_sync(0xffffffffu, lm_bv, off);
+          const int oi0 = __shfl_xor_sync(0xffffffffu, lm_bi, off);
+          if ((ov0 > lm_bv) || (ov0 == lm_bv && oi0 < lm_bi)) {
+            lm_bv = ov0;
+            lm_bi = oi0;
+          }
+          const float ov1 = __shfl_xor_sync(0xffffffffu, lm_bv1, off);
+          const int oi1 = __shfl_xor_sync(0xffffffffu, lm_bi1, off);
+          if ((ov1 > lm_bv1) || (ov1 == lm_bv1 && oi1 < lm_bi1)) {
+            lm_bv1 = ov1;
+            lm_bi1 = oi1;
+          }
+        }
+        if (lane < 4) {
+          sh_bv[warp * 8 + (lane << 1)] = lm_bv;
+          sh_bi[warp * 8 + (lane << 1)] = lm_bi;
+          sh_bv[warp * 8 + (lane << 1) + 1] = lm_bv1;
+          sh_bi[warp * 8 + (lane << 1) + 1] = lm_bi1;
         }
       }
-      if constexpr (tb_n_warps > 1) {
-        if ((threadIdx.x & 31) == 0) {
-          sh_bv[threadIdx.x >> 5] = lm_bv;
-          sh_bi[threadIdx.x >> 5] = lm_bi;
+      __syncthreads();
+
+      float* const g_bv = reinterpret_cast<float*>(C0);
+      int* const g_bi = reinterpret_cast<int*>(g_bv + 1024);
+      int* const g_done = g_bi + 1024;
+
+      if (static_cast<int>(threadIdx.x) < prob_m) {
+        const int r = static_cast<int>(threadIdx.x);
+        float rbv = sh_bv[r];
+        int rbi = sh_bi[r];
+        if constexpr (tb_n_warps > 1) {
+          for (int w = 1; w < tb_n_warps; ++w) {
+            const float ov = sh_bv[w * 8 + r];
+            const int oi = sh_bi[w * 8 + r];
+            if ((ov > rbv) || (ov == rbv && oi < rbi)) {
+              rbv = ov;
+              rbi = oi;
+            }
+          }
         }
+        g_bv[r * 128 + static_cast<int>(blockIdx.x)] = rbv;
+        g_bi[r * 128 + static_cast<int>(blockIdx.x)] = rbi;
       }
-    }
-    if constexpr (tb_n_warps > 1) {
       __syncthreads();
       if (threadIdx.x == 0) {
-        for (int w = 1; w < tb_n_warps; ++w) {
-          const float ov = sh_bv[w];
-          const int oi = sh_bi[w];
+        __threadfence();
+        *sh_last = (atomicAdd(g_done, 1) == static_cast<int>(gridDim.x) - 1) ? 1 : 0;
+      }
+      __syncthreads();
+
+      if (*sh_last) {
+        const int warp = threadIdx.x >> 5;
+        const int lane = threadIdx.x & 31;
+        for (int r = 0; r < prob_m; ++r) {
+          float fv = (static_cast<int>(threadIdx.x) < static_cast<int>(gridDim.x))
+                         ? const_cast<const volatile float*>(g_bv + r * 128)[threadIdx.x]
+                         : -__int_as_float(0x7f800000);
+          int fi = (static_cast<int>(threadIdx.x) < static_cast<int>(gridDim.x))
+                       ? const_cast<const volatile int*>(g_bi + r * 128)[threadIdx.x]
+                       : 0x7fffffff;
+#pragma unroll
+          for (int off = 16; off >= 1; off >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffffu, fv, off);
+            const int oi = __shfl_down_sync(0xffffffffu, fi, off);
+            if ((ov > fv) || (ov == fv && oi < fi)) {
+              fv = ov;
+              fi = oi;
+            }
+          }
+          if (lane == 0) {
+            sh_bv[warp] = fv;
+            sh_bi[warp] = fi;
+          }
+          __syncthreads();
+          if (warp == 0) {
+            fv = (lane < (threads >> 5)) ? sh_bv[lane] : -__int_as_float(0x7f800000);
+            fi = (lane < (threads >> 5)) ? sh_bi[lane] : 0x7fffffff;
+#pragma unroll
+            for (int off = (threads >> 5) >> 1; off >= 1; off >>= 1) {
+              const float ov = __shfl_down_sync(0xffffffffu, fv, off);
+              const int oi = __shfl_down_sync(0xffffffffu, fi, off);
+              if ((ov > fv) || (ov == fv && oi < fi)) {
+                fv = ov;
+                fi = oi;
+              }
+            }
+            if (lane == 0) {
+              lmpost_out[r] = static_cast<int64_t>(fi);
+            }
+          }
+          __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+          *g_done = 0;
+        }
+      }
+    } else {
+      if (threadIdx.x < active_threads) {
+        if ((threadIdx.x & 3) != 0) {
+          lm_bv = -__int_as_float(0x7f800000);
+          lm_bi = 0x7fffffff;
+        }
+#pragma unroll
+        for (int off = 16; off >= 1; off >>= 1) {
+          const float ov = __shfl_xor_sync(0xffffffffu, lm_bv, off);
+          const int oi = __shfl_xor_sync(0xffffffffu, lm_bi, off);
           if ((ov > lm_bv) || (ov == lm_bv && oi < lm_bi)) {
             lm_bv = ov;
             lm_bi = oi;
           }
         }
-      }
-    }
-
-    float* const g_bv = reinterpret_cast<float*>(C0);
-    int* const g_bi = reinterpret_cast<int*>(g_bv + 128);
-    int* const g_done = g_bi + 128;
-
-    if (threadIdx.x == 0) {
-      g_bv[blockIdx.x] = lm_bv;
-      g_bi[blockIdx.x] = lm_bi;
-      __threadfence();
-      *sh_last = (atomicAdd(g_done, 1) == static_cast<int>(gridDim.x) - 1) ? 1 : 0;
-    }
-    __syncthreads();
-
-    if (*sh_last) {
-      float fv = (static_cast<int>(threadIdx.x) < static_cast<int>(gridDim.x))
-                     ? const_cast<const volatile float*>(g_bv)[threadIdx.x]
-                     : -__int_as_float(0x7f800000);
-      int fi = (static_cast<int>(threadIdx.x) < static_cast<int>(gridDim.x))
-                   ? const_cast<const volatile int*>(g_bi)[threadIdx.x]
-                   : 0x7fffffff;
-#pragma unroll
-      for (int off = 16; off >= 1; off >>= 1) {
-        const float ov = __shfl_down_sync(0xffffffffu, fv, off);
-        const int oi = __shfl_down_sync(0xffffffffu, fi, off);
-        if ((ov > fv) || (ov == fv && oi < fi)) {
-          fv = ov;
-          fi = oi;
+        if constexpr (tb_n_warps > 1) {
+          if ((threadIdx.x & 31) == 0) {
+            sh_bv[threadIdx.x >> 5] = lm_bv;
+            sh_bi[threadIdx.x >> 5] = lm_bi;
+          }
         }
       }
-      const int warp = threadIdx.x >> 5;
-      const int lane = threadIdx.x & 31;
-      if (lane == 0) {
-        sh_bv[warp] = fv;
-        sh_bi[warp] = fi;
+      if constexpr (tb_n_warps > 1) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          for (int w = 1; w < tb_n_warps; ++w) {
+            const float ov = sh_bv[w];
+            const int oi = sh_bi[w];
+            if ((ov > lm_bv) || (ov == lm_bv && oi < lm_bi)) {
+              lm_bv = ov;
+              lm_bi = oi;
+            }
+          }
+        }
+      }
+
+      float* const g_bv = reinterpret_cast<float*>(C0);
+      int* const g_bi = reinterpret_cast<int*>(g_bv + 128);
+      int* const g_done = g_bi + 128;
+
+      if (threadIdx.x == 0) {
+        g_bv[blockIdx.x] = lm_bv;
+        g_bi[blockIdx.x] = lm_bi;
+        __threadfence();
+        *sh_last = (atomicAdd(g_done, 1) == static_cast<int>(gridDim.x) - 1) ? 1 : 0;
       }
       __syncthreads();
-      if (warp == 0) {
-        fv = (lane < (threads >> 5)) ? sh_bv[lane] : -__int_as_float(0x7f800000);
-        fi = (lane < (threads >> 5)) ? sh_bi[lane] : 0x7fffffff;
+
+      if (*sh_last) {
+        float fv = (static_cast<int>(threadIdx.x) < static_cast<int>(gridDim.x))
+                       ? const_cast<const volatile float*>(g_bv)[threadIdx.x]
+                       : -__int_as_float(0x7f800000);
+        int fi = (static_cast<int>(threadIdx.x) < static_cast<int>(gridDim.x))
+                     ? const_cast<const volatile int*>(g_bi)[threadIdx.x]
+                     : 0x7fffffff;
 #pragma unroll
-        for (int off = (threads >> 5) >> 1; off >= 1; off >>= 1) {
+        for (int off = 16; off >= 1; off >>= 1) {
           const float ov = __shfl_down_sync(0xffffffffu, fv, off);
           const int oi = __shfl_down_sync(0xffffffffu, fi, off);
           if ((ov > fv) || (ov == fv && oi < fi)) {
@@ -3555,9 +3678,29 @@ __global__ void Marlin(
             fi = oi;
           }
         }
+        const int warp = threadIdx.x >> 5;
+        const int lane = threadIdx.x & 31;
         if (lane == 0) {
-          *g_done = 0;
-          *lmpost_out = static_cast<int64_t>(fi);
+          sh_bv[warp] = fv;
+          sh_bi[warp] = fi;
+        }
+        __syncthreads();
+        if (warp == 0) {
+          fv = (lane < (threads >> 5)) ? sh_bv[lane] : -__int_as_float(0x7f800000);
+          fi = (lane < (threads >> 5)) ? sh_bi[lane] : 0x7fffffff;
+#pragma unroll
+          for (int off = (threads >> 5) >> 1; off >= 1; off >>= 1) {
+            const float ov = __shfl_down_sync(0xffffffffu, fv, off);
+            const int oi = __shfl_down_sync(0xffffffffu, fi, off);
+            if ((ov > fv) || (ov == fv && oi < fi)) {
+              fv = ov;
+              fi = oi;
+            }
+          }
+          if (lane == 0) {
+            *g_done = 0;
+            *lmpost_out = static_cast<int64_t>(fi);
+          }
         }
       }
     }

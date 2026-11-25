@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from typing import Any
@@ -291,6 +292,56 @@ class DraftModelSpeculator(BaseSpeculator):
     def _greedy_sample_draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
+        if (
+            os.environ.get("MUSE_DRAFT_FUSE_LMHEAD", "1") != "0"
+            and hidden_states.ndim == 2
+            and 1 <= hidden_states.shape[0] <= 8
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and (hidden_states.data_ptr() & 15) == 0
+            and getattr(self.model, "draft_id_to_target_id", None) is None
+        ):
+            lm_head = getattr(self.model, "lm_head", None)
+            lp = getattr(self.model, "logits_processor", None)
+            if (
+                lm_head is not None
+                and lp is not None
+                and getattr(lm_head, "tp_size", 1) == 1
+                and getattr(lm_head, "bias", None) is None
+                and not getattr(lp, "logits_as_input", False)
+                and getattr(lp, "soft_cap", None) is None
+                and float(getattr(lp, "scale", 1.0)) == 1.0
+            ):
+                try:
+                    import muse_marlin6_gemv as _m6
+
+                    org_vocab = int(
+                        getattr(lp, "org_vocab_size", getattr(lm_head, "org_vocab_size", 0))
+                    )
+                    admitted = getattr(lm_head, "marlin_decode6_lmpost_raw_m_admitted", None)
+                    if (
+                        admitted is None
+                        and hasattr(_m6, "admit_tma4_lmpost_m")
+                        and not torch.cuda.is_current_stream_capturing()
+                    ):
+                        admitted = _m6.admit_tma4_lmpost_m(
+                            lm_head,
+                            None,
+                            org_vocab,
+                            lambda x: self.model.compute_logits(x).argmax(dim=-1),
+                            test_ms=(int(hidden_states.shape[0]),),
+                        )
+                        lm_head.marlin_decode6_lmpost_raw_m_admitted = admitted
+                    if admitted:
+                        out_tokens = hidden_states.new_empty(
+                            (hidden_states.shape[0],), dtype=torch.int64
+                        )
+                        if _m6.launch_lmhead_lmpost6_m(
+                            hidden_states, lm_head, None, out_tokens, org_vocab
+                        ):
+                            return out_tokens
+                except Exception:  # noqa: BLE001
+                    pass
         logits = self.model.compute_logits(hidden_states)
         return logits.argmax(dim=-1)
 

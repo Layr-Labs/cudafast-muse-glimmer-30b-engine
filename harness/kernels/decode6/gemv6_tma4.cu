@@ -597,6 +597,37 @@ extern "C" int muse_marlin6_sk_tma4_ilv_lmpost(
       n, k, 48, device, stream, nullptr, lmpost_lut, lmpost_out, org_vocab_size);
 }
 
+extern "C" int muse_marlin6_sk_tma4_ilv_lmpost_m(
+    const int4* input, const int4* weight, int4* scratch, int4* partials,
+    const int4* coded, const int4* palette, const float* global_scale, int* locks,
+    const uint16_t* lmpost_lut, int64_t* lmpost_out, int m, int org_vocab_size,
+    int n, int k, int blocks, int device, cudaStream_t stream) {
+  if (m < 1 || m > 8 || (n != 202048 && n != 202112) || k != 6656 ||
+      (blocks != 48 && blocks != 96) || org_vocab_size <= 0 || org_vocab_size > n ||
+      lmpost_out == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  if (n == 202112) {
+    const int st = decode6_lm128_stages(blocks);
+    if (st == 3) {
+      return launch_tma4_impl<128, 256, false, true, false, false, true, false, 3, false, 3, false, true, false, true, true>(
+          input, weight, scratch, partials, coded, palette, global_scale, locks, n, k, blocks, device, stream,
+          nullptr, lmpost_lut, lmpost_out, org_vocab_size, nullptr, nullptr, nullptr, m);
+    }
+    return launch_tma4_impl<128, 256, false, true, false, false, true, false, 4, false, 3, false, true, false, true, true>(
+        input, weight, scratch, partials, coded, palette, global_scale, locks, n, k, blocks, device, stream,
+        nullptr, lmpost_lut, lmpost_out, org_vocab_size, nullptr, nullptr, nullptr, m);
+  }
+  if (blocks == 96) {
+    return launch_tma4_impl<64, 128, false, true, false, false, true, false, 4, true, 0, false, true, false, true, true>(
+        input, weight, scratch, partials, coded, palette, global_scale, locks, n, k, 96, device, stream,
+        nullptr, lmpost_lut, lmpost_out, org_vocab_size, nullptr, nullptr, nullptr, m);
+  }
+  return launch_tma4_impl<64, 128, false, true, false, false, true, false, 4, false, 0, false, true, false, true, true>(
+      input, weight, scratch, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
+      nullptr, lmpost_lut, lmpost_out, org_vocab_size, nullptr, nullptr, nullptr, m);
+}
+
 extern "C" int muse_marlin6_sk_tma4(const int4* input, const int4* weight, int4* output,
                                     int4* partials, const int4* coded, const int4* palette,
                                     const float* global_scale, int* locks, int n, int k, int blocks,
