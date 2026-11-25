@@ -1314,6 +1314,11 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             n_groups, saved_ms, time.perf_counter() - began,
         )
         try:
+            if hasattr(model, "register_stacked_bf16_attn"):
+                model.register_stacked_bf16_attn()
+        except Exception as err:  # noqa: BLE001
+            logger.warning("BF16 stacked attn registration skipped: %s", err)
+        try:
             import muse_marlin6_gemv as _m6
             if hasattr(_m6, "register_all_gate_up_swiglu"):
                 _m6.register_all_gate_up_swiglu(model)
@@ -1330,6 +1335,11 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             _SLOW_HOLD.clear()
             torch.cuda.empty_cache()
     if not _post_reg_done:
+        try:
+            if hasattr(model, "register_stacked_bf16_attn"):
+                model.register_stacked_bf16_attn()
+        except Exception as err:  # noqa: BLE001
+            logger.warning("BF16 stacked attn registration skipped: %s", err)
         try:
             import muse_marlin6_gemv as _m6
             if hasattr(_m6, "register_all_gate_up_swiglu"):

@@ -256,6 +256,15 @@ def consume_rans_prologue(
     return out
 
 
+_gqa16_attn_mod = None
+
+
+def _flush_gqa16_prefill(stream=None) -> None:
+    mod = _gqa16_attn_mod
+    if mod is not None and mod._pending_prefill is not None:
+        mod.flush_pending_prefill(stream)
+
+
 class _MulSigmoidSwap:
     def __init__(self) -> None:
         self.state = "unchecked"
@@ -263,6 +272,7 @@ class _MulSigmoidSwap:
     def run(self, kernel, orig_run, args, kwargs):
         global _pending_oproj_sigmoid, _oproj_fuse_state
         if kwargs.get("benchmark_run", False):
+            _flush_gqa16_prefill(kwargs.get("stream"))
             return orig_run(kernel, *args, **kwargs)
         if _pending_oproj_sigmoid is not None:
             if _pending_oproj_sigmoid[3]:
@@ -270,11 +280,13 @@ class _MulSigmoidSwap:
             _oproj_fuse_state = "rejected"
             _pending_oproj_sigmoid = None
         if self.state == "rejected" or len(args) != 4:
+            _flush_gqa16_prefill(kwargs.get("stream"))
             return orig_run(kernel, *args, **kwargs)
         gate, attn, out, numel = args
         try:
             n_el = int(numel)
         except Exception:
+            _flush_gqa16_prefill(kwargs.get("stream"))
             return orig_run(kernel, *args, **kwargs)
         stream = kwargs.get("stream")
         if (
@@ -292,10 +304,12 @@ class _MulSigmoidSwap:
                 for t in (gate, attn, out)
             )
         ):
+            _flush_gqa16_prefill(stream)
             return orig_run(kernel, *args, **kwargs)
         import muse_norm_glue as G
 
         if self.state == "unchecked":
+            _flush_gqa16_prefill(stream)
             if torch.cuda.is_current_stream_capturing():
                 return orig_run(kernel, *args, **kwargs)
             ok = False
@@ -331,6 +345,10 @@ class _MulSigmoidSwap:
                 except Exception:
                     pass
             return None
+        if n_el > 4096 and _gqa16_attn_mod is not None and _gqa16_attn_mod._pending_prefill is not None:
+            if _gqa16_attn_mod.consume_prefill_mul_sigmoid(attn, gate, out, None, stream):
+                return None
+        _flush_gqa16_prefill(stream)
         if _OPROJ_SIGMOID_FUSE and _oproj_fuse_state != "rejected" and n_el == 4096:
             try:
                 import muse_marlin6_gemv as _m6
@@ -507,6 +525,7 @@ class _RansPrologueHook:
         import muse_norm_glue as G
 
         if self.fp8_glue_state == "unchecked":
+            _flush_gqa16_prefill(stream)
             if torch.cuda.is_current_stream_capturing():
                 return False
             ok = False
@@ -535,34 +554,46 @@ class _RansPrologueHook:
             self.fp8_glue_state = "admitted" if ok else "rejected"
             logger.info("Prefill mul_sigmoid_fp8 glue: %s", self.fp8_glue_state)
             return True
+        if _gqa16_attn_mod is not None and _gqa16_attn_mod._pending_prefill is not None:
+            if _gqa16_attn_mod.consume_prefill_mul_sigmoid(attn, gate, out, scale, stream):
+                return True
+        _flush_gqa16_prefill(stream)
         G.mul_sigmoid_fp8(gate, attn, scale, out, n_el, stream)
         return True
 
     def run(self, kernel, orig_run, args, kwargs):
         global _pending_rans_prologue
         if kwargs.get("benchmark_run", False):
+            _flush_gqa16_prefill(kwargs.get("stream"))
             return orig_run(kernel, *args, **kwargs)
+        if self.act_mode != 1:
+            _flush_gqa16_prefill(kwargs.get("stream"))
         if _pending_rans_prologue is not None:
             if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
                 return None
+            _flush_gqa16_prefill(kwargs.get("stream"))
             return orig_run(kernel, *args, **kwargs)
         try:
             import muse_rans_ext as _rans
             if not hasattr(_rans, "rans_gemv_fused_auto"):
                 if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
                     return None
+                _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
         except Exception:
             if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
                 return None
+            _flush_gqa16_prefill(kwargs.get("stream"))
             return orig_run(kernel, *args, **kwargs)
         if self.act_mode == 1:
             if len(args) != 5:
+                _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
             gate, attn, scale, out, numel = args
             try:
                 n_el = int(numel)
             except Exception:
+                _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
             max_m_fuse = 8 if hasattr(_rans, "rans_gemm_m_fused_auto") else 1
             if (
@@ -578,7 +609,9 @@ class _RansPrologueHook:
             ):
                 if self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
                     return None
+                _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
+            _flush_gqa16_prefill(kwargs.get("stream"))
             x0, x1 = gate, attn
         else:
             if len(args) != 4:
@@ -1184,10 +1217,21 @@ def install_norm_glue() -> None:
                 swap = None
             self.__dict__["_norm_glue_swap"] = swap
         if swap is None:
+            _flush_gqa16_prefill(kwargs.get("stream"))
             return prev_run(self, *args, **kwargs)
+        if not isinstance(swap, (_MulSigmoidSwap, _RansPrologueHook)):
+            _flush_gqa16_prefill(kwargs.get("stream"))
         return swap.run(self, prev_run, args, kwargs)
 
     CachingAutotuner.run = run
+    try:
+        global _gqa16_attn_mod
+        import muse_gqa16_attn as _gqa16
+        if hasattr(_gqa16, "consume_prefill_mul_sigmoid") and hasattr(_gqa16, "flush_pending_prefill"):
+            _gqa16_attn_mod = _gqa16
+            _gqa16._FUSE_CONSUMER_WIRED = True
+    except Exception:
+        pass
     try:
         from vllm.model_executor.kernels.linear.scaled_mm import muse_fp8 as _muse_fp8
         _muse_fp8._decode_gemm_operand = decode_gemm_operand
