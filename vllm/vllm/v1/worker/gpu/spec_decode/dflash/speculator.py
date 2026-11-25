@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -95,6 +96,8 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        self._fused_draft_lmhead = None
+        self._fused_draft_lmhead_checked = False
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -133,6 +136,57 @@ class DFlashSpeculator(DraftModelSpeculator):
             decode_query_len=self.num_query_per_req,
         )
 
+    def _try_admit_fused_draft_lmhead(self) -> None:
+        if (
+            self._fused_draft_lmhead is not None
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        self._fused_draft_lmhead_checked = True
+        if os.environ.get("VLLM_DFLASH_FUSED_LMHEAD", "1") == "0":
+            return
+        model = getattr(self, "model", None)
+        if (
+            self.draft_logits is not None
+            or self.use_local_argmax_reduction
+            or model is None
+            or getattr(model, "draft_id_to_target_id", None) is not None
+        ):
+            return
+        lm_head = getattr(model, "lm_head", None)
+        lp = getattr(model, "logits_processor", None)
+        if lm_head is None or lp is None:
+            return
+        if (
+            getattr(lm_head, "tp_size", 1) != 1
+            or getattr(lm_head, "bias", None) is not None
+            or getattr(lp, "logits_as_input", False)
+            or getattr(lp, "soft_cap", None) is not None
+            or float(getattr(lp, "scale", 1.0)) != 1.0
+            or getattr(lp, "head_dtype", None) not in (None, torch.bfloat16)
+        ):
+            return
+        org_vocab = int(
+            getattr(lp, "org_vocab_size", getattr(lm_head, "org_vocab_size", 0))
+        )
+        try:
+            import muse_marlin6_gemv as _m6
+
+            admit_raw = getattr(_m6, "admit_tma4_lmpost_raw", None)
+            launch_m = getattr(_m6, "launch_lmhead_lmpost6_m", None)
+            if (
+                callable(admit_raw)
+                and callable(launch_m)
+                and admit_raw(lm_head, org_vocab)
+            ):
+                self._fused_draft_lmhead = (lm_head, org_vocab, launch_m)
+                logger.info(
+                    "DFlash: fused draft lm_head + argmax admitted (k=%d)",
+                    self.num_speculative_steps,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
     def capture(self) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
         # Reset sampling indices to zero to prevent stale values from prior
@@ -140,6 +194,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_indices.zero_()
         self.sample_pos.zero_()
         self.sample_idx_mapping.zero_()
+        self._try_admit_fused_draft_lmhead()
         assert self.query_cudagraph_manager is not None
         self.query_cudagraph_manager.capture(
             self._generate_draft,
@@ -258,7 +313,27 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
         num_sample = num_reqs * self.num_speculative_steps
-        sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        if num_reqs == 1 and not self.sample_from_anchor:
+            sample_hidden_states = last_hidden_states[1 : 1 + num_sample]
+        else:
+            sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        if (
+            not self._fused_draft_lmhead_checked
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            self._try_admit_fused_draft_lmhead()
+        if (
+            self._fused_draft_lmhead is not None
+            and self.draft_logits is None
+            and 1 <= num_sample <= 8
+            and sample_hidden_states.dtype == torch.bfloat16
+            and sample_hidden_states.is_contiguous()
+            and (sample_hidden_states.data_ptr() & 15) == 0
+        ):
+            lm_h, org_vocab, launch_fn = self._fused_draft_lmhead
+            out_tok = self.draft_tokens[:num_reqs].view(-1)
+            if launch_fn(sample_hidden_states, lm_h, None, out_tok, org_vocab):
+                return
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
         draft_tokens = self.sample_draft(
@@ -340,26 +415,19 @@ class DFlashSpeculator(DraftModelSpeculator):
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
         if aux_hidden_states:
-            if aux_hidden_states[0].shape[0] > num_target_tokens:
-                aux_cat = torch.cat(
-                    [h[:num_target_tokens] for h in aux_hidden_states], dim=-1
-                )
-            else:
-                aux_cat = torch.cat(aux_hidden_states, dim=-1)
-            context_hidden_states = self.model.combine_hidden_states(aux_cat)[
-                :num_target_tokens
-            ]
+            hidden_states = self.model.combine_hidden_states(
+                torch.cat(aux_hidden_states, dim=-1)
+            )
         else:
-            context_hidden_states = last_hidden_states[:num_target_tokens]
-        if not context_hidden_states.is_contiguous():
-            context_hidden_states = context_hidden_states.contiguous()
+            hidden_states = last_hidden_states
+        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
             self.model.precompute_and_store_context_kv(
-                context_hidden_states,
+                self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
             )
             # DFlash processes all speculative tokens in one forward pass,
@@ -422,7 +490,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
         self.model.precompute_and_store_context_kv(
-            context_hidden_states,
+            self.hidden_states[:num_target_tokens],
             self.context_positions[:num_target_tokens],
             context_slots,
         )
@@ -469,6 +537,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
+
         return self.draft_tokens[:num_reqs]
 
 
@@ -507,7 +576,7 @@ def _prepare_dflash_inputs_kernel(
     num_query_per_req,
     num_speculative_steps,
     max_num_reqs,
-    max_num_tokens,
+    q_pad_end,
     max_model_len,
     SAMPLE_FROM_ANCHOR: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
@@ -626,9 +695,9 @@ def _prepare_dflash_inputs_kernel(
             # captured CG sees PAD slots (no K/V write) for replay sizes
             # larger than the current request count.
             q_pad_start = num_reqs * num_query_per_req
-            for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):
+            for i in range(q_pad_start, q_pad_end, BLOCK_SIZE):
                 block = i + tl.arange(0, BLOCK_SIZE)
-                mask = block < max_num_tokens
+                mask = block < q_pad_end
                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
 
 
@@ -674,6 +743,7 @@ def prepare_dflash_inputs(
     max_tokens_per_req = max_target_query_len + num_query_per_req
     BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
+    q_pad_end = min(max_num_tokens, max_num_reqs * num_query_per_req)
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
         input_buffers.input_ids,
         input_buffers.positions,
@@ -703,7 +773,7 @@ def prepare_dflash_inputs(
         num_query_per_req,
         num_speculative_steps,
         max_num_reqs,
-        max_num_tokens,
+        q_pad_end,
         max_model_len,
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
         PAD_SLOT_ID=PAD_SLOT_ID,

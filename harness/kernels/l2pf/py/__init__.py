@@ -21,6 +21,7 @@ __all__ = [
     "lib",
     "prefetch",
     "prefetch_desc",
+    "prefetch_kv_window",
     "self_check",
 ]
 
@@ -57,6 +58,14 @@ def lib():
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p,
         ]
         h.l2pf_set_persisting_window.restype = ctypes.c_int
+    if hasattr(h, "l2pf_prefetch_kv_window"):
+        h.l2pf_prefetch_kv_window.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+        ]
+        h.l2pf_prefetch_kv_window.restype = ctypes.c_int
     _lib = h
     return h
 
@@ -92,6 +101,37 @@ def prefetch_desc(desc_ptr: int, ndesc: int, stream: torch.cuda.Stream,
     rc = fn(desc_ptr, ndesc, blocks, threads, stream.cuda_stream)
     if rc != 0:
         raise RuntimeError(f"l2pf_prefetch_desc failed: {rc}")
+
+
+def prefetch_kv_window(
+    kv_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_size: int,
+    window_left: int,
+    stream: torch.cuda.Stream | int,
+    blocks: int = 8,
+    threads: int = 128,
+) -> bool:
+    h = lib()
+    fn = getattr(h, "l2pf_prefetch_kv_window", None) if h is not None else None
+    if fn is None:
+        return False
+    cs = stream if isinstance(stream, int) else stream.cuda_stream
+    rc = fn(
+        kv_cache.data_ptr(),
+        block_table_row.data_ptr(),
+        seqused_k.data_ptr(),
+        int(block_size),
+        int(window_left),
+        int(kv_cache.stride(0)),
+        int(kv_cache.stride(2)),
+        int(kv_cache.stride(1)),
+        int(blocks),
+        int(threads),
+        cs,
+    )
+    return rc == 0
 
 
 def self_check(device: torch.device | int | None = None) -> bool:

@@ -119,12 +119,19 @@ def _prepare_attn_proj(proj) -> AttnSlabPlan | None:
     plan = AttnSlabPlan(n, k, w7, p7, slots, _make_decode1(proj))
     # Bitwise check on Layer 51's actual weight against full 512-row marlinw_attn.gemm
     gen = torch.Generator(device=dev).manual_seed(n * 19 + k + 51)
+    decode1_ok = RESTRICT and DECODE1 and plan.decode1 is not None
     for mag in (0.05, 2.0, 32.0):
         x = (torch.randn((ROWS, k), generator=gen, device=dev) * mag).to(torch.bfloat16).contiguous()
         ref = marlinw_attn.gemm(x, w, ws, gs, src_work, _src_ptr, slots)
         got = _run_attn_slab(x, w, ws, gs, AttnSlabPlan(n, k, w7, p7, slots, None))
         if ref is None or got is None or not torch.equal(ref[-TILE_ROWS:].view(torch.int16), got[-TILE_ROWS:].view(torch.int16)):
             return None
+        if decode1_ok:
+            got1 = _run_attn_slab(x, w, ws, gs, plan)
+            if got1 is None or not torch.equal(ref[-1:].view(torch.int16), got1[-1:].view(torch.int16)):
+                decode1_ok = False
+    if not decode1_ok:
+        plan = AttnSlabPlan(n, k, w7, p7, slots, None)
     return plan
 
 
@@ -140,7 +147,7 @@ def _run_attn_slab(x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, 
     out = x.new_empty((ROWS, plan.n))
     if not RESTRICT:
         out[:-TILE_ROWS].zero_()
-    if RESTRICT and plan.decode1 is not None:
+    if RESTRICT and DECODE1 and plan.decode1 is not None:
         d1 = plan.decode1
         y1 = torch.ops.vllm.marlin_tiled_decode6.default(
             x[-1:], d1.weight, d1.scales6, d1.palette, d1.global_scale, d1.workspace,
@@ -260,25 +267,79 @@ def gate_if_active(x, weight):
     if x.shape != (ROWS, marlinw_down.COLUMNS) or not x.is_contiguous() or x.dtype != torch.bfloat16:
         raise ValueError("Final gate capture requires contiguous BF16 prefill input")
     out = x.new_empty((ROWS, marlinw_down.INNER))
-    if RESTRICT and plan.gate_decode1 is not None:
+    if RESTRICT and DECODE1 and plan.gate_decode1 is not None:
         d1 = plan.gate_decode1
         import muse_marlin6_gemv as _m6
-        prev_notify = getattr(_m6, "_notify_gate_up_swiglu", None)
-        if prev_notify is not None:
-            _m6._notify_gate_up_swiglu = None
-        try:
-            gu = torch.ops.vllm.marlin_tiled_decode6.default(
-                x[-1:], d1.weight, d1.scales6, d1.palette, d1.global_scale, d1.workspace,
-                d1.n, d1.k, d1.fixed_grid,
-            )
-        finally:
+        sw_map = getattr(_m6, "_SWIGLU_GATE_UP", None)
+        sw_entry = sw_map.get(d1.global_scale.data_ptr()) if sw_map is not None else None
+        if sw_entry is not None:
+            if (
+                sw_entry.get("state") == "admitted"
+                and not sw_entry.get("is_fp8", False)
+                and _m6.is_tma4(d1.scales6)
+            ):
+                fn = _m6._sk_tma4_ilv_swiglu_m if sw_entry.get("is_ilv") else _m6._gate_up_tma4_swiglu_m
+                if fn is not None:
+                    sw_out = sw_entry["swiglu_out"]
+                    partials = x.new_empty((48, 16, 128), dtype=torch.float32)
+                    x_last = x[-1:]
+                    with torch.cuda.device(x.device):
+                        st_stream = torch.cuda.current_stream(x.device).cuda_stream
+                        if sw_entry.get("is_ilv"):
+                            rc = fn(
+                                x_last.data_ptr(), d1.weight.data_ptr(), sw_out.data_ptr(), partials.data_ptr(),
+                                d1.scales6.data_ptr(), d1.palette.data_ptr(), d1.global_scale.data_ptr(),
+                                d1.workspace.data_ptr(), 1, d1.n, d1.k, 48, x.device.index, st_stream,
+                            )
+                        else:
+                            rc = fn(
+                                x_last.data_ptr(), d1.weight.data_ptr(), sw_out.data_ptr(), partials.data_ptr(),
+                                d1.scales6.data_ptr(), d1.palette.data_ptr(), d1.global_scale.data_ptr(),
+                                d1.workspace.data_ptr(), 0, 1, d1.n, d1.k, 48, x.device.index, st_stream,
+                            )
+                    if rc:
+                        raise RuntimeError(f"Final gate SwiGLU decode1 failed with status {rc}")
+                    out[-1:].copy_(sw_out.view(-1)[: marlinw_down.INNER].view(1, marlinw_down.INNER))
+                    calls[0] += 1
+                    return out
+        else:
+            try:
+                import muse_norm_glue as _ng_mod
+                if _ng_mod.lib() is not None and hasattr(_ng_mod, "mul_silu_slice_bf16"):
+                    prev_notify = getattr(_m6, "_notify_gate_up_swiglu", None)
+                    if prev_notify is not None:
+                        _m6._notify_gate_up_swiglu = None
+                    try:
+                        gu = torch.ops.vllm.marlin_tiled_decode6.default(
+                            x[-1:], d1.weight, d1.scales6, d1.palette, d1.global_scale, d1.workspace,
+                            d1.n, d1.k, d1.fixed_grid,
+                        )
+                    finally:
+                        if prev_notify is not None:
+                            _m6._notify_gate_up_swiglu = prev_notify
+                    with torch.cuda.device(x.device):
+                        st_stream = torch.cuda.current_stream(x.device).cuda_stream
+                        _ng_mod.mul_silu_slice_bf16(gu, out[-1:], 1, st_stream)
+                    calls[0] += 1
+                    return out
+            except Exception:
+                pass
+            prev_notify = getattr(_m6, "_notify_gate_up_swiglu", None)
             if prev_notify is not None:
-                _m6._notify_gate_up_swiglu = prev_notify
-        g_f = gu[:, :marlinw_down.INNER].float()
-        u_f = gu[:, marlinw_down.INNER:].float()
-        out[-1:].copy_(((g_f / (1.0 + torch.exp(-g_f))) * u_f).to(torch.bfloat16))
-        calls[0] += 1
-        return out
+                _m6._notify_gate_up_swiglu = None
+            try:
+                gu = torch.ops.vllm.marlin_tiled_decode6.default(
+                    x[-1:], d1.weight, d1.scales6, d1.palette, d1.global_scale, d1.workspace,
+                    d1.n, d1.k, d1.fixed_grid,
+                )
+            finally:
+                if prev_notify is not None:
+                    _m6._notify_gate_up_swiglu = prev_notify
+            g_f = gu[:, :marlinw_down.INNER].float()
+            u_f = gu[:, marlinw_down.INNER:].float()
+            out[-1:].copy_(((g_f / (1.0 + torch.exp(-g_f))) * u_f).to(torch.bfloat16))
+            calls[0] += 1
+            return out
     tile = x[-TILE_ROWS:]
     dest = out[-TILE_ROWS:]
     g, _ = _native[x.device]
@@ -302,7 +363,7 @@ def down_if_active(x, weight, scales, global_scale):
     out = x.new_empty((ROWS, marlinw_down.COLUMNS))
     if not RESTRICT:
         out[:-TILE_ROWS].zero_()
-    if RESTRICT and plan.down_decode1 is not None:
+    if RESTRICT and DECODE1 and plan.down_decode1 is not None:
         d1 = plan.down_decode1
         y1 = torch.ops.vllm.marlin_tiled_decode6.default(
             x[-1:], d1.weight, d1.scales6, d1.palette, d1.global_scale, d1.workspace,
@@ -337,6 +398,7 @@ def down_if_active(x, weight, scales, global_scale):
 import os as _os
 
 RESTRICT = _os.environ.get("MUSE_FINAL_ROWS_ONLY", "1") == "1"
+DECODE1 = _os.environ.get("MUSE_FINAL_SLAB_DECODE1", "1") != "0"
 _restricted_inputs = set()
 restrict_stats = {"qkv": 0, "attn": 0, "post_attn": 0, "sigmoid": 0, "final_norm": 0}
 _POST_ATTN = ("triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_1", "triton_red_fused__to_copy_add_clamp_mean_mul_pow_reciprocal_rsqrt_1")
