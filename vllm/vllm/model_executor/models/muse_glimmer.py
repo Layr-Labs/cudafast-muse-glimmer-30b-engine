@@ -1253,6 +1253,8 @@ class _GateSideStream:
                 if getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
                     return
             elif 2 <= x.shape[0] <= 16:
+                if layer_idx in _BF16_DUAL_RANS_M_LAYERS:
+                    return
                 if getattr(bf16_gate, "muse_bf16_rans_m", None) is None:
                     return
             else:
@@ -1497,6 +1499,15 @@ def _init_qk_fused() -> bool:
 
 
 _BF16_DUAL_WS_ADMITTED: set[int] = set()
+_BF16_DUAL_RANS_M: dict[int, tuple[torch.Tensor, int]] = {}
+_BF16_DUAL_RANS_M_GATE_PTRS: set[int] = set()
+_BF16_DUAL_RANS_M_LAYERS: set[int] = set()
+
+
+def update_bf16_dual_rans_m(idx_qkv: torch.Tensor, blob: torch.Tensor) -> None:
+    entry = _BF16_DUAL_RANS_M.get(idx_qkv.data_ptr())
+    if entry is not None:
+        _BF16_DUAL_RANS_M[idx_qkv.data_ptr()] = (blob, entry[1])
 
 
 def _muse_bf16_qkv_or_stacked_impl(
@@ -1514,6 +1525,20 @@ def _muse_bf16_qkv_or_stacked_impl(
                 return dual
         out = torch.mm(x, w_cat.t())
         return out[:, :4608].contiguous(), out[:, 4608:].contiguous()
+    if (
+        2 <= x.shape[0] <= 16
+        and x.ndim == 2
+        and x.shape[1] == 6656
+        and x.dtype == torch.bfloat16
+        and x.is_cuda
+        and x.is_contiguous()
+    ):
+        dual_entry = _BF16_DUAL_RANS_M.get(idx_qkv.data_ptr())
+        if dual_entry is not None:
+            import muse_bfx_ext as _bfx
+
+            blob_cat, bexp_cat = dual_entry
+            return _bfx.rans_gemm_dual(x, blob_cat, 4608, 4096, 6656, bexp_cat)
     qkv = torch.ops.vllm.muse_bf16_lane_linear.default(x, w_qkv, packed_qkv, idx_qkv)
     return qkv, x.new_empty((x.shape[0], 4096))
 
@@ -1570,6 +1595,8 @@ def _muse_bf16_gate_fill_impl(
         and x.is_contiguous()
         and gate.is_contiguous()
     ):
+        if idx_gate.data_ptr() in _BF16_DUAL_RANS_M_GATE_PTRS:
+            return
         import muse_bf16_lane as _bf16
 
         entry = _bf16.get_m_rans(idx_gate) if hasattr(_bf16, "get_m_rans") else None
@@ -2465,7 +2492,12 @@ class MuseGlimmerForCausalLM(
         want_bf16_stack = os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_PREFILL", "1") != "0"
         if not want_bf16_stack:
             return
+        want_bf16_stack_decode = (
+            os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_DECODE", "1") != "0"
+            and os.environ.get("MUSE_BF16_RANS_M", "1") != "0"
+        )
         bf16_stack_cnt = 0
+        bf16_dual_rans_cnt = 0
         for layer in islice(self.model.layers, self.model.start_layer, self.model.end_layer):
             attn = layer.self_attn
             if not attn.use_output_gate or attn.gate_fork_point != "qkv":
@@ -2520,10 +2552,105 @@ class MuseGlimmerForCausalLM(
                                     _BF16_DUAL_WS_ADMITTED.add(w_cat.data_ptr())
                         except Exception:
                             pass
+                        if want_bf16_stack_decode:
+                            try:
+                                import muse_bfx_ext as _bfx
+                                if (
+                                    hasattr(_bfx, "rans_pack")
+                                    and hasattr(_bfx, "rans_unpack")
+                                    and hasattr(_bfx, "rans_base")
+                                    and hasattr(_bfx, "rans_gemm_dual")
+                                ):
+                                    blob_cat = _bfx.rans_pack(w_cat)
+                                    unp_cat = _bfx.rans_unpack(blob_cat, 8704, 6656)
+                                    ok_dual = torch.equal(
+                                        unp_cat.view(torch.int16), w_cat.view(torch.int16)
+                                    )
+                                    del unp_cat
+                                    bexp_cat = int(_bfx.rans_base(blob_cat)) if ok_dual else 0
+                                    if ok_dual:
+                                        g2 = torch.Generator(device=qw.device).manual_seed(
+                                            20261125 + attn.layer_idx
+                                        )
+                                        for sc in (0.05, 0.5, 2.0, 12.0):
+                                            x7 = (
+                                                torch.randn((7, 6656), generator=g2, device=qw.device)
+                                                * sc
+                                            ).to(torch.bfloat16)
+                                            rq = torch.nn.functional.linear(x7, w_cat[:4608])
+                                            rg = torch.nn.functional.linear(x7, w_cat[4608:])
+                                            gq, gg = _bfx.rans_gemm_dual(
+                                                x7, blob_cat, 4608, 4096, 6656, bexp_cat
+                                            )
+                                            if not (
+                                                torch.equal(gq.view(torch.int16), rq.view(torch.int16))
+                                                and torch.equal(gg.view(torch.int16), rg.view(torch.int16))
+                                            ):
+                                                ok_dual = False
+                                                break
+                                    if ok_dual:
+                                        for cm in (12, 16):
+                                            xm = (
+                                                torch.randn((cm, 6656), generator=g2, device=qw.device)
+                                                * 1.5
+                                            ).to(torch.bfloat16)
+                                            gq, gg = _bfx.rans_gemm_dual(
+                                                xm, blob_cat, 4608, 4096, 6656, bexp_cat
+                                            )
+                                            rq0, rg0 = _bfx.rans_gemm_dual(
+                                                xm[:8].contiguous(),
+                                                blob_cat,
+                                                4608,
+                                                4096,
+                                                6656,
+                                                bexp_cat,
+                                            )
+                                            rq1, rg1 = _bfx.rans_gemm_dual(
+                                                xm[8:].contiguous(),
+                                                blob_cat,
+                                                4608,
+                                                4096,
+                                                6656,
+                                                bexp_cat,
+                                            )
+                                            if not (
+                                                torch.equal(gq[:8].view(torch.int16), rq0.view(torch.int16))
+                                                and torch.equal(gq[8:].view(torch.int16), rq1.view(torch.int16))
+                                                and torch.equal(gg[:8].view(torch.int16), rg0.view(torch.int16))
+                                                and torch.equal(gg[8:].view(torch.int16), rg1.view(torch.int16))
+                                            ):
+                                                ok_dual = False
+                                                break
+                                    if ok_dual:
+                                        attn.register_buffer(
+                                            "_bf16_qkv_gate_rans_m", blob_cat, persistent=False
+                                        )
+                                        _BF16_DUAL_RANS_M[qkv.muse_bf16_lane_index.data_ptr()] = (
+                                            blob_cat,
+                                            bexp_cat,
+                                        )
+                                        _BF16_DUAL_RANS_M_GATE_PTRS.add(
+                                            gate.muse_bf16_lane_index.data_ptr()
+                                        )
+                                        _BF16_DUAL_RANS_M_LAYERS.add(attn.layer_idx)
+                                        bf16_dual_rans_cnt += 1
+                                    else:
+                                        del blob_cat
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning(
+                                    "BF16 stacked qkv+gate decode rANS skipped on layer %d: %s",
+                                    attn.layer_idx,
+                                    exc,
+                                )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("BF16 stacked qkv+gate prefill skipped on layer %d: %s", attn.layer_idx, exc)
         if bf16_stack_cnt:
             logger.info("Attention dual prefill: %d BF16 stacked qkv+gate", bf16_stack_cnt)
+        if bf16_dual_rans_cnt:
+            logger.info(
+                "Attention dual decode rANS: %d BF16 stacked qkv+gate (8704x6656, 0-ULP)",
+                bf16_dual_rans_cnt,
+            )
 
 
 _LAYER0_INPUT_NORM_HASH = "205ac75eb1f7a0ece86a243e894446a5b327438374179ec02f0225baedfaaf84"

@@ -77,6 +77,31 @@ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
     )
 
 
+def dflash_query_len(config: Qwen3Config | None, num_spec_tokens: int) -> int:
+    """Resolve bidirectional DFlash query block length (VLLM_DFLASH_QUERY_LEN).
+
+    Default 16 runs one full m16n8k16 MMA tile (1 anchor + num_spec_tokens sampled
+    masks + trailing unsampled context masks matching DFlash's block-16 training
+    distribution). Set VLLM_DFLASH_QUERY_LEN=7 (or 0) to restore stock 1 + N.
+    """
+    base_q = 1 + max(0, int(num_spec_tokens))
+    if config is None or num_spec_tokens <= 0:
+        return base_q
+    raw = os.environ.get("VLLM_DFLASH_QUERY_LEN", "16").strip()
+    try:
+        wanted = int(raw)
+    except ValueError:
+        return base_q
+    if wanted <= base_q:
+        return base_q
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    if dflash_config.get("sample_from_anchor", False):
+        return base_q
+    if not dflash_has_any_non_causal(config):
+        return base_q
+    return min(wanted, 16)
+
+
 def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
     spec_config = vllm_config.speculative_config
     config = spec_config.draft_model_config.hf_config
@@ -522,7 +547,8 @@ class DFlashQwen3Model(nn.Module):
         if self._fused_kv_bias is None:
             all_kv_flat = None
             if (
-                getattr(self, "_fkv_mi3", None) is not None
+                getattr(self, "_fkv_mi4", None) is not None
+                or getattr(self, "_fkv_mi3", None) is not None
                 or getattr(self, "_fkv_mnv4", None) is not None
                 or getattr(self, "_fkv_mfp8", None) is not None
             ):
@@ -988,6 +1014,44 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             context_states, context_positions, context_slot_mapping
         )
 
+    def combine_hidden_states_aux5(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        num_tokens: int,
+    ) -> torch.Tensor | None:
+        """Zero-cat 5-aux-tensor INT4 fc projection for small M <= 16 (CUDA-graph safe)."""
+        if (
+            not self.model.use_aux_hidden_state
+            or len(aux_hidden_states) != 5
+            or not (1 <= num_tokens <= 16)
+        ):
+            return None
+        fc = self.model.fc
+        if not getattr(fc, "_mi4_aux5_ok", False):
+            return None
+        mi4 = getattr(fc, "_mi4", None)
+        if mi4 is None:
+            return None
+        n, k = mi4
+        k_sub = k // 5
+        hs: list[torch.Tensor] = []
+        for h in aux_hidden_states:
+            if (
+                not h.is_cuda
+                or h.dtype != torch.bfloat16
+                or h.dim() != 2
+                or h.shape[0] < num_tokens
+                or h.shape[1] != k_sub
+                or h.stride(1) != 1
+                or (h.stride(0) % 8 != 0)
+                or (h.data_ptr() % 16 != 0)
+            ):
+                return None
+            hs.append(h[:num_tokens] if h.shape[0] > num_tokens else h)
+        return torch.ops.muse.draft_int4_aux5_linear(
+            hs[0], hs[1], hs[2], hs[3], hs[4], fc._mi4_blob, n, k
+        )
+
     def combine_hidden_states(
         self,
         hidden_states: torch.Tensor,
@@ -1065,7 +1129,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             from vllm.model_executor.layers import muse_bfx
             n = muse_bfx.attach_drafter(self.model)
             has_q_fkv = (
-                getattr(self.model, "_fkv_mi3", None) is not None
+                getattr(self.model, "_fkv_mi4", None) is not None
+                or getattr(self.model, "_fkv_mi3", None) is not None
                 or getattr(self.model, "_fkv_mnv4", None) is not None
                 or getattr(self.model, "_fkv_mfp8", None) is not None
             )
