@@ -54,6 +54,7 @@ _RANS_PROLOGUE_M16 = os.environ.get("MUSE_RANS_PROLOGUE_M16", "0") != "0"
 _MUL_SIGMOID_GLUE = os.environ.get("MUSE_MUL_SIGMOID_GLUE", "1") != "0"
 _OPROJ_SIGMOID_FUSE = os.environ.get("MUSE_OPROJ_SIGMOID_FUSE", "1") != "0"
 _OPROJ_SIGMOID_FUSE_M = os.environ.get("MUSE_OPROJ_SIGMOID_FUSE_M", "1") != "0"
+_OPROJ_SIGMOID_FUSE_M16 = os.environ.get("MUSE_OPROJ_SIGMOID_FUSE_M16", "0") != "0"
 _MUL_SILU_SLICE_GLUE = os.environ.get("MUSE_MUL_SILU_SLICE_GLUE", "1") != "0"
 _REQUANT = "triton_poi_fused__to_copy_clamp_mul_reciprocal_0"
 _REQUANT_BODY = "f7a07e4acde4818e0fe4bcb2f62a211fa163724414f5efcce3d93ee433b8300f"
@@ -418,7 +419,11 @@ class _MulSigmoidSwap:
                         return None
             except Exception:
                 _oproj_fuse_state = "rejected"
-        elif _OPROJ_SIGMOID_FUSE_M and _oproj_fuse_m_state != "rejected" and 8192 <= n_el <= 16 * 4096:
+        elif (
+            _OPROJ_SIGMOID_FUSE_M
+            and _oproj_fuse_m_state != "rejected"
+            and 8192 <= n_el <= (16 * 4096 if _OPROJ_SIGMOID_FUSE_M16 else 8 * 4096)
+        ):
             try:
                 import muse_marlin6_gemv as _m6
                 if getattr(_m6, "_ALL_OPROJ_GATED_M_READY", False):

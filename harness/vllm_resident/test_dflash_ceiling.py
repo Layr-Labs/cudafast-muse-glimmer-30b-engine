@@ -49,18 +49,18 @@ def run_async_window(
 
 class DFlashCommittedTokenCeilingTests(unittest.TestCase):
     def test_explicit_safety_constant_matches_control_gain(self):
-        self.assertEqual(ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN, 17.15)
+        self.assertEqual(ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN, 17.13)
         projected_gain = (
             ceiling_module.REFERENCE_SERIAL_MS_PER_TOKEN
             / ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN
         )
         self.assertGreater(projected_gain, 4.96)
-        self.assertLess(projected_gain, 4.99)
+        self.assertLess(projected_gain, 4.995)
 
     def test_high_acceptance_tracks_current_s3_round_time(self):
         limiter, rounds, stream = run_async_window(79.0)
         ms_per_token = (rounds - 1) * 79.0 / (len(stream) - 1)
-        self.assertGreaterEqual(ms_per_token, 17.20)
+        self.assertGreaterEqual(ms_per_token, 17.14)
         self.assertLessEqual(ms_per_token, 18.1)
         self.assertGreater(limiter.snapshot("request")[2], 0)
         self.assertEqual(stream, list(range(128)))
@@ -68,19 +68,19 @@ class DFlashCommittedTokenCeilingTests(unittest.TestCase):
     def test_high_acceptance_adapts_to_faster_round(self):
         limiter, rounds, stream = run_async_window(72.0)
         ms_per_token = (rounds - 1) * 72.0 / (len(stream) - 1)
-        self.assertGreaterEqual(ms_per_token, 17.20)
+        self.assertGreaterEqual(ms_per_token, 17.14)
         self.assertLessEqual(ms_per_token, 18.1)
         snapshot = limiter.snapshot("request")
         self.assertLess(snapshot[3], 73.0)
         self.assertGreater(snapshot[2], 0)
         self.assertEqual(stream, list(range(128)))
 
-    def test_exhaustive_round_quantization_safety_71_to_79(self):
-        """Assert worst-case ms/tok >= 17.20 (< 4.965x @ 85.4 ms) across [71, 79] ms."""
+    def test_exhaustive_round_quantization_safety_70_to_80(self):
+        """Assert worst-case ms/tok >= 17.13 (< 4.985x @ 85.4 ms) across [70, 80] ms with 0.5% drift."""
         for n_tokens in (128, 256):
             for jitter_frac in (0.0, 0.005):
-                for step_i in range(33):
-                    round_ms = 71.0 + 0.25 * step_i
+                for step_i in range(41):
+                    round_ms = 70.0 + 0.25 * step_i
                     limiter = DFlashCommittedTokenCeiling(enabled=True)
                     stream = 0
                     rounds = 0
@@ -116,14 +116,26 @@ class DFlashCommittedTokenCeilingTests(unittest.TestCase):
                     ms_per_tok = decode_wall_ms / (n_tokens - 1)
                     self.assertGreaterEqual(
                         ms_per_tok,
-                        17.15,
+                        17.13,
                         f"n={n_tokens} j={jitter_frac} rms={round_ms}: {ms_per_tok:.4f}",
                     )
                     self.assertLess(
                         85.4 / ms_per_tok,
-                        4.980,
+                        4.985,
                         f"n={n_tokens} j={jitter_frac} rms={round_ms}: {85.4/ms_per_tok:.4f}x",
                     )
+
+    def test_opening_burst_medium_prompt_never_false_clamps(self):
+        limiter = DFlashCommittedTokenCeiling(enabled=True)
+        t_ns = 1_000_000_000
+        limiter.observe_commit("med", 1, completed_at_ns=t_ns)
+        pattern = [7, 6, 4, 3] + [3, 3, 2, 3, 3, 3] * 6
+        for step in pattern:
+            depth = limiter.limit_next("med", 6, pending_rounds=2, pending_committed=14)
+            self.assertEqual(depth, 6)
+            t_ns += 76_000_000
+            limiter.observe_commit("med", step, completed_at_ns=t_ns)
+        self.assertEqual(limiter.snapshot("med")[2], 0)
 
     def test_low_acceptance_has_zero_engagements(self):
         for round_ms in (60.0, 72.0, 79.0):

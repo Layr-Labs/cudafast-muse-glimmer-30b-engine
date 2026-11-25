@@ -275,41 +275,58 @@ __device__ __forceinline__ void issue_kv_tile_async(
     int leaf_remap_base = -1,
     int leaf_p_start = 0,
     uint32_t leaf_remap_packed = 0u) {
+  const bool is_bs64_aligned = (block_size == 64) && ((tok_base & 31) == 0);
   int phys_blk0 = 0, slot_base0 = 0;
   const bool half0_any = (tok_base < seqlen_k) && (tok_base + 16 > k_start);
   if (half0_any) {
-    const int lb0 = (block_size == 16) ? (tok_base >> 4) : (tok_base / block_size);
-    slot_base0 = (block_size == 16) ? 0 : (tok_base - lb0 * block_size);
+    const int lb0 = (block_size == 16) ? (tok_base >> 4)
+                  : ((block_size == 64) ? (tok_base >> 6) : (tok_base / block_size));
+    slot_base0 = (block_size == 16) ? 0
+               : ((block_size == 64) ? (tok_base & 63) : (tok_base - lb0 * block_size));
     phys_blk0 = __ldg(block_table + lb0);
   }
-  int phys_blk1 = 0, slot_base1 = 0;
+  int phys_blk1 = phys_blk0, slot_base1 = slot_base0 + 16;
   const int tok_hi = tok_base + 16;
   const bool half1_any = (tok_hi < seqlen_k) && (tok_hi + 16 > k_start);
-  if (half1_any) {
-    const int lb1 = (block_size == 16) ? (tok_hi >> 4) : (tok_hi / block_size);
-    slot_base1 = (block_size == 16) ? 0 : (tok_hi - lb1 * block_size);
+  if (half1_any && !is_bs64_aligned) {
+    const int lb1 = (block_size == 16) ? (tok_hi >> 4)
+                  : ((block_size == 64) ? (tok_hi >> 6) : (tok_hi / block_size));
+    slot_base1 = (block_size == 16) ? 0
+               : ((block_size == 64) ? (tok_hi & 63) : (tok_hi - lb1 * block_size));
     phys_blk1 = __ldg(block_table + lb1);
   }
 
   const int64_t head_v_off = static_cast<int64_t>(kv_head) * stride_kv_head + (IsV ? 128 : 0);
   const bool has_remap = (leaf_remap_base >= 0) && (tok_base + 32 > leaf_remap_base);
   const bool full_valid = !has_remap && (tok_base >= k_start) && (tok_base + 32 <= seqlen_k) &&
-                          ((block_size == 16) || (slot_base0 + 16 <= block_size && slot_base1 + 16 <= block_size));
+                          ((block_size == 16) || is_bs64_aligned ||
+                           (slot_base0 + 16 <= block_size && slot_base1 + 16 <= block_size));
 
   if (full_valid) {
     const int64_t base0 = static_cast<int64_t>(phys_blk0) * stride_block +
                           static_cast<int64_t>(slot_base0) * stride_slot + head_v_off;
-    const int64_t base1 = static_cast<int64_t>(phys_blk1) * stride_block +
-                          static_cast<int64_t>(slot_base1) * stride_slot + head_v_off;
-    #pragma unroll
-    for (int u = 0; u < 4; ++u) {
-      const int idx = (u << 7) + tid;
-      const int r = idx >> 4;
-      const int c = idx & 15;
-      const int64_t row_off = (u < 2)
-          ? (base0 + static_cast<int64_t>(r) * stride_slot)
-          : (base1 + static_cast<int64_t>(r - 16) * stride_slot);
-      cp_async_16(smem_u32(&smem_tile[r][c ^ (r & 7)]), kv_ptr + row_off + (c << 3));
+    if (is_bs64_aligned) {
+      #pragma unroll
+      for (int u = 0; u < 4; ++u) {
+        const int idx = (u << 7) + tid;
+        const int r = idx >> 4;
+        const int c = idx & 15;
+        const int64_t row_off = base0 + static_cast<int64_t>(r) * stride_slot;
+        cp_async_16(smem_u32(&smem_tile[r][c ^ (r & 7)]), kv_ptr + row_off + (c << 3));
+      }
+    } else {
+      const int64_t base1 = static_cast<int64_t>(phys_blk1) * stride_block +
+                            static_cast<int64_t>(slot_base1) * stride_slot + head_v_off;
+      #pragma unroll
+      for (int u = 0; u < 4; ++u) {
+        const int idx = (u << 7) + tid;
+        const int r = idx >> 4;
+        const int c = idx & 15;
+        const int64_t row_off = (u < 2)
+            ? (base0 + static_cast<int64_t>(r) * stride_slot)
+            : (base1 + static_cast<int64_t>(r - 16) * stride_slot);
+        cp_async_16(smem_u32(&smem_tile[r][c ^ (r & 7)]), kv_ptr + row_off + (c << 3));
+      }
     }
   } else {
     #pragma unroll
@@ -322,8 +339,10 @@ __device__ __forceinline__ void issue_kv_tile_async(
         const int tok_eff = (leaf_remap_base >= 0 && tok >= leaf_remap_base)
             ? (leaf_p_start + static_cast<int>((leaf_remap_packed >> ((tok - leaf_remap_base) << 2)) & 0xFu))
             : tok;
-        const int lb = (block_size == 16) ? (tok_eff >> 4) : (tok_eff / block_size);
-        const int slot = (block_size == 16) ? (tok_eff & 15) : (tok_eff - lb * block_size);
+        const int lb = (block_size == 16) ? (tok_eff >> 4)
+                     : ((block_size == 64) ? (tok_eff >> 6) : (tok_eff / block_size));
+        const int slot = (block_size == 16) ? (tok_eff & 15)
+                       : ((block_size == 64) ? (tok_eff & 63) : (tok_eff - lb * block_size));
         const int phys_blk = __ldg(block_table + lb);
         const int64_t row_off = static_cast<int64_t>(phys_blk) * stride_block +
                                 static_cast<int64_t>(slot) * stride_slot + head_v_off;
@@ -355,8 +374,10 @@ __device__ __forceinline__ void issue_v_col16_tile_async(
     const int r = (u << 6) + tid;
     const int tok = tok_base + r;
     if (tok >= k_start && tok < seqlen_k) {
-      const int lb = (block_size == 16) ? (tok >> 4) : (tok / block_size);
-      const int slot = (block_size == 16) ? (tok & 15) : (tok - lb * block_size);
+      const int lb = (block_size == 16) ? (tok >> 4)
+                   : ((block_size == 64) ? (tok >> 6) : (tok / block_size));
+      const int slot = (block_size == 16) ? (tok & 15)
+                     : ((block_size == 64) ? (tok & 63) : (tok - lb * block_size));
       const int phys_blk = __ldg(block_table + lb);
       const __nv_bfloat16* src =
           kv_ptr + static_cast<int64_t>(phys_blk) * stride_block +
@@ -965,8 +986,10 @@ __device__ __forceinline__ void issue_v_dsplit_async(
   if constexpr (kBlockN == 128) {
     const int tok = tok_base + tid;
     if (tok >= k_start && tok < seqlen_k) {
-      const int lb = (block_size == 16) ? (tok >> 4) : (tok / block_size);
-      const int slot = (block_size == 16) ? (tok & 15) : (tok - lb * block_size);
+      const int lb = (block_size == 16) ? (tok >> 4)
+                   : ((block_size == 64) ? (tok >> 6) : (tok / block_size));
+      const int slot = (block_size == 16) ? (tok & 15)
+                     : ((block_size == 64) ? (tok & 63) : (tok - lb * block_size));
       const int phys_blk = __ldg(block_table + lb);
       const __nv_bfloat16* src =
           kv_ptr + static_cast<int64_t>(phys_blk) * stride_block +

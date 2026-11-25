@@ -64,6 +64,9 @@ TREE_CONT_DECAY = float(os.environ.get("MUSE_TREE_CONT_DECAY", "0.88"))
 TREE_ADAPT_GAMMA = os.environ.get("MUSE_TREE_ADAPT_GAMMA", "1").strip() not in ("0", "", "false", "no")
 TREE_CALIB = os.environ.get("MUSE_TREE_CALIB", "1").strip() not in ("0", "", "false", "no")
 TREE_HIGH_ACC_CPC = float(os.environ.get("MUSE_TREE_HIGH_ACC_CPC", "0"))
+_TREE_K_RAW = int(os.environ.get("MUSE_TREE_K", "8"))
+TREE_K = 8 if _TREE_K_RAW >= 8 else 6
+TREE_BUF_ELEMS = 6 * TREE_K
 LEAF_STATS = os.environ.get("MUSE_LEAF_STATS", "0").strip() in ("1", "true", "yes")
 _ST_RAW = os.environ.get("MUSE_NATIVE_LEAF_SELFTEST", "0").strip().lower()
 SELFTEST = 1 if _ST_RAW in ("1", "true", "yes") else (2 if _ST_RAW == "2" else 0)
@@ -208,38 +211,38 @@ def get_margin_buf(device: torch.device) -> torch.Tensor | None:
 
 
 def get_tree_top_buf(device: torch.device) -> torch.Tensor | None:
-    """Return fixed-address int64[36] ([6, 6]) buffer for drafter rows 0..5 top-6 IDs (CUDA-graph safe)."""
+    """Return fixed-address int64[6*TREE_K] buffer for drafter rows 0..5 top-K IDs (CUDA-graph safe)."""
     if not ENABLED or TREE_M == 0 or device.type != "cuda":
         return None
     if (
         _S.tree_top is not None
         and _S.tree_top.device == device
-        and _S.tree_top.numel() >= 36
+        and _S.tree_top.numel() >= TREE_BUF_ELEMS
         and not _S.tree_top.is_inference()
     ):
         return _S.tree_top
     if torch.cuda.is_current_stream_capturing():
         return _S.tree_top if (_S.tree_top is not None and _S.tree_top.device == device) else None
     with torch.inference_mode(False):
-        _S.tree_top = torch.full((36,), -1, dtype=torch.int64, device=device)
+        _S.tree_top = torch.full((TREE_BUF_ELEMS,), -1, dtype=torch.int64, device=device)
     return _S.tree_top
 
 
 def get_tree_vals_buf(device: torch.device) -> torch.Tensor | None:
-    """Return fixed-address float32[36] ([6, 6]) buffer for drafter rows 0..5 top-6 logits (CUDA-graph safe)."""
+    """Return fixed-address float32[6*TREE_K] buffer for drafter rows 0..5 top-K logits (CUDA-graph safe)."""
     if not ENABLED or TREE_M == 0 or device.type != "cuda":
         return None
     if (
         _S.tree_vals is not None
         and _S.tree_vals.device == device
-        and _S.tree_vals.numel() >= 36
+        and _S.tree_vals.numel() >= TREE_BUF_ELEMS
         and not _S.tree_vals.is_inference()
     ):
         return _S.tree_vals
     if torch.cuda.is_current_stream_capturing():
         return _S.tree_vals if (_S.tree_vals is not None and _S.tree_vals.device == device) else None
     with torch.inference_mode(False):
-        _S.tree_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
+        _S.tree_vals = torch.full((TREE_BUF_ELEMS,), -1e30, dtype=torch.float32, device=device)
     return _S.tree_vals
 
 
@@ -344,19 +347,19 @@ def init_kv_table(
         if (
             _S.tree_top is None
             or _S.tree_top.device != device
-            or _S.tree_top.numel() < 36
+            or _S.tree_top.numel() < TREE_BUF_ELEMS
             or _S.tree_top.is_inference()
         ):
-            _S.tree_top = torch.full((36,), -1, dtype=torch.int64, device=device)
+            _S.tree_top = torch.full((TREE_BUF_ELEMS,), -1, dtype=torch.int64, device=device)
         else:
             _S.tree_top.fill_(-1)
         if (
             _S.tree_vals is None
             or _S.tree_vals.device != device
-            or _S.tree_vals.numel() < 36
+            or _S.tree_vals.numel() < TREE_BUF_ELEMS
             or _S.tree_vals.is_inference()
         ):
-            _S.tree_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
+            _S.tree_vals = torch.full((TREE_BUF_ELEMS,), -1e30, dtype=torch.float32, device=device)
         else:
             _S.tree_vals.fill_(-1e30)
         _S.req_acc_state = torch.zeros((3,), dtype=torch.int32, device=device)
@@ -391,8 +394,8 @@ def init_kv_table(
             _S._atexit_registered = True
             atexit.register(_dump_stats, "atexit")
     logger.info(
-        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, dynamic=%d [calib=%d,depth<=%d,T=%.2f,tail=%.1f,g=%.2f,adapt=%d,sub=%.2f,shf=%.2f,cont=%.2f,hi_cpc=%.1f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d, stats=%d)",
-        _S.num_layers, _S.tree_m_ready, int(TREE_DYNAMIC), int(TREE_CALIB), TREE_MAX_DEPTH, TREE_TEMP, TREE_TAIL, TREE_GAMMA,
+        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, k=%d, dynamic=%d [calib=%d,depth<=%d,T=%.2f,tail=%.1f,g=%.2f,adapt=%d,sub=%.2f,shf=%.2f,cont=%.2f,hi_cpc=%.1f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d, stats=%d)",
+        _S.num_layers, _S.tree_m_ready, TREE_K, int(TREE_DYNAMIC), int(TREE_CALIB), TREE_MAX_DEPTH, TREE_TEMP, TREE_TAIL, TREE_GAMMA,
         int(TREE_ADAPT_GAMMA), TREE_SUB_COEF, TREE_SHF_COEF, TREE_CONT_DECAY, TREE_HIGH_ACC_CPC,
         int(_S.m8_ready), _POLICY_RAW, MARGIN_ALPHA, LOW_THRESH, int(SELFTEST), int(NOHIT), int(LEAF_STATS),
     )
