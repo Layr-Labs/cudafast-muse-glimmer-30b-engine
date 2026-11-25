@@ -857,6 +857,10 @@ void rans_gemm_m_auto(torch::Tensor blob, torch::Tensor x, torch::Tensor sb, tor
   TORCH_CHECK(sa.is_cuda() && sa.scalar_type() == torch::kFloat && sa.numel() == 1, "bad sa");
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == x.size(0) * N, "bad out");
   RansCfg c = rans_pick_cfg((int)N, (int)K);
+  // Verify-width down projections cannot stage all M activation rows in shared memory. Grouping the 832 independent
+  // output warps into 44 CTAs x 19 warps cuts the launch tail from 14 to 4 inactive warp slots and removes three
+  // duplicated CTA LUT/prologue copies. The packed stream and every warp's k-ordered MMA chain are unchanged.
+  if (N == 6656 && K == 19968) c.wpb = 19;
   rans_launch((const uint8_t*)blob.data_ptr(), (size_t)blob.numel(), c.tw, c.ns, c.wpb, c.rg, c.ilv, (const uint8_t*)x.data_ptr(), nullptr, 0, (const float*)sb.data_ptr(), sb.numel() == 1, (const float*)sa.data_ptr(), (__nv_bfloat16*)out.data_ptr(),
               (int)N, (int)K, c10::cuda::getCurrentCUDAStream(), (int)x.size(0));
 }
