@@ -234,6 +234,14 @@
     {
       "file": "vllm/v1/worker/gpu/prefill_graph.py, vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/dflash/speculator.py",
       "why": "Enable the 512-token whole-forward prefill CUDA graph (including zero-prep replay) when DFlash auxiliary hidden states are enabled, skip the DFlash drafter on max_tokens == 1 batches in the V2 GPU model runner (matching V1's _drafts_can_be_verified), and skip redundant eager Python attention-metadata and slot-mapping construction on FULL CUDA graph replays for both the target verify step and DFlash draft step."
+    },
+    {
+      "file": "vllm/model_executor/layers/muse_bfx.py, vllm/model_executor/layers/linear.py, vllm/model_executor/models/qwen3_dflash.py",
+      "why": "Lossless 12-bit coded BF16 weights (sign+mantissa byte plus a 4-bit per-row exponent window, out-of-window values in an exact per-row escape list) for the DFlash drafter's linears, fc and fused context-KV projection at <= 8 rows (harness/kernels/musebfx); every weight is checked bit for bit at load; > 8 rows use the dense weight."
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/scaled_mm/muse_fp8.py",
+      "why": "Route 2..8-row FP8 GEMMs (the speculative verify width) through the rANS-compressed decode stream (muserans rans_gemm_m_auto): A rows 0..M-1 of the same m16n8k32 MMA chain, so every row is bitwise the M == 1 GEMV."
     }
   ],
   "carried_from": {
