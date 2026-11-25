@@ -29,3 +29,33 @@ load(
 shutil.copy2(build / f"{name}.so", out / f"{name}.so")
 print(f"muserans: built {out / name}.so for sm_121a")
 PY
+
+# muse_rans_rows_ext: the same source built with -DRANS_MR=7, the 7-row DFlash verify GEMM (rans_gemv_rows) over the
+# blobs packed above. Optional: if it does not build, every verify-block FP8 GEMM stays on the small-row CUTLASS op.
+rows_dir=$(mktemp -d "$KERNELS_OUT/.muserans_rows.XXXXXXXX")
+trap 'rm -rf -- "$build_dir" "$rows_dir"' EXIT
+if ! python3 - "$here" "$rows_dir" "$KERNELS_OUT" <<'PY'
+import pathlib
+import shutil
+import sys
+
+from torch.utils.cpp_extension import load
+
+source, build, out = map(pathlib.Path, sys.argv[1:])
+name = "muse_rans_rows_ext"
+load(
+    name=name,
+    sources=[str(source / "csrc" / "muse_rans.cu")],
+    extra_cuda_cflags=["-O3", "-gencode=arch=compute_121a,code=sm_121a", "-DMUSE_RANS_STANDALONE_MODULE", "-DRANS_MR=7",
+                       "-lineinfo"],
+    extra_cflags=["-O3"],
+    build_directory=str(build),
+    verbose=False,
+)
+shutil.copy2(build / f"{name}.so", out / f"{name}.so")
+print(f"muserans: built {out / name}.so (7 verify rows) for sm_121a")
+PY
+then
+  rm -f "$KERNELS_OUT/muse_rans_rows_ext.so"
+  echo "muserans: verify-rows extension not built; verify-block FP8 GEMMs stay on the small-row CUTLASS op" >&2
+fi
