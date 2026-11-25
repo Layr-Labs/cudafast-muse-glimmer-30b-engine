@@ -114,6 +114,12 @@ except (ImportError, OSError):
     prepare_decode_layout6 = None
     _scale6_stats = None
 
+try:
+    # DFlash verify block (1 + depth rows) on the TMA4-ILV decode buffers, admitted per layer bitwise against stock
+    from muse_marlin6_gemv import verify_rows_linear as _verify_rows_linear
+except (ImportError, OSError):
+    _verify_rows_linear = None
+
 logger = init_logger(__name__)
 
 # Prompt-sized calls of NVFP4 weights much larger than L2 (MLP gate_up and
@@ -233,6 +239,17 @@ def _marlin_fp4_single(
     decode_palette: torch.Tensor | None = None,
     decode_fixed_grid: bool = False,
 ) -> torch.Tensor:
+    if (
+        _verify_rows_linear is not None
+        and x.shape[0] > 1
+        and decode_palette is not None
+        and not decode_fixed_grid
+    ):
+        out = _verify_rows_linear(
+            x, decode_weight, decode_scales, decode_palette, weight_global_scale, workspace, size_n, size_k
+        )
+        if out is not None:
+            return out
     if (
         x.shape[0] == 1
         and x.dtype == torch.bfloat16

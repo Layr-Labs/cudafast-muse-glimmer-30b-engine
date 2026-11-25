@@ -199,7 +199,7 @@ static int decode6_tma4_pdl() {
 template <int TileN, int Threads, bool GateUpGrid, bool DownIlv, bool GateV48,
           bool GateUpSwiglu, bool FuseLmPost, bool FuseMulSigmoid,
           int Stages, bool Split2, int FixedShape,
-          bool GateUpSwigluFp8, bool TmaOvlp, bool HalfSplit, bool FastPal16>
+          bool GateUpSwigluFp8, bool TmaOvlp, bool HalfSplit, bool FastPal16, int MRows = 1>
 int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* partials,
                      const int4* coded, const int4* palette, const float* global_scale,
                      int* locks, int n, int k, int grid, int device, cudaStream_t stream,
@@ -211,7 +211,7 @@ int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* 
       vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
       vllm::kFE4M3fn.id(), Threads, 1, TileN / 16, 8, true, Stages, 1, false, true,
       GateUpGrid, DownIlv, GateV48, GateUpSwiglu, FuseLmPost, FuseMulSigmoid, Split2,
-      FixedShape, GateUpSwigluFp8, TmaOvlp, HalfSplit, FastPal16>;
+      FixedShape, GateUpSwigluFp8, TmaOvlp, HalfSplit, FastPal16, MRows>;
   static int cached_shared[16] = {0};
   int shared = (device >= 0 && device < 16) ? cached_shared[device] : 0;
   if (shared == 0) {
@@ -375,6 +375,9 @@ int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* 
       pdl_mode = lm_pdl;
     }
   }
+  // Verify-row launches neither wait on nor trigger a neighbouring 1-CTA norm: their neighbours are the
+  // stock multi-row kernels, which carry no programmatic dependency.
+  if constexpr (MRows != 1) pdl_mode = 0;
   if ((pdl_mode & 1) != 0) {
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(grid, 1, 1);
@@ -402,7 +405,7 @@ int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* 
 template <int TileN, int Threads, bool GateUpGrid, bool DownIlv = false, bool GateV48 = false,
           bool GateUpSwiglu = false, bool FuseLmPost = false, bool FuseMulSigmoid = false,
           int Stages = 4, bool Split2 = false, int FixedShape = 0,
-          bool GateUpSwigluFp8 = false, bool HalfSplit = false>
+          bool GateUpSwigluFp8 = false, bool HalfSplit = false, int MRows = 1>
 int launch_tma4(const int4* input, const int4* weight, int4* output, int4* partials,
                 const int4* coded, const int4* palette, const float* global_scale,
                 int* locks, int n, int k, int grid, int device, cudaStream_t stream,
@@ -417,7 +420,7 @@ int launch_tma4(const int4* input, const int4* weight, int4* output, int4* parti
       if (pal16) {
         return launch_tma4_impl<TileN, Threads, GateUpGrid, DownIlv, GateV48, GateUpSwiglu,
                                 FuseLmPost, FuseMulSigmoid, Stages, Split2, FixedShape,
-                                GateUpSwigluFp8, true, HalfSplit, true>(
+                                GateUpSwigluFp8, true, HalfSplit, true, MRows>(
             input, weight, output, partials, coded, palette, global_scale, locks,
             n, k, grid, device, stream, pair_locks, lmpost_lut, lmpost_out,
             org_vocab_size, input_aux, fp8_scale, fp8_out);
@@ -425,7 +428,7 @@ int launch_tma4(const int4* input, const int4* weight, int4* output, int4* parti
     }
     return launch_tma4_impl<TileN, Threads, GateUpGrid, DownIlv, GateV48, GateUpSwiglu,
                             FuseLmPost, FuseMulSigmoid, Stages, Split2, FixedShape,
-                            GateUpSwigluFp8, true, HalfSplit, false>(
+                            GateUpSwigluFp8, true, HalfSplit, false, MRows>(
         input, weight, output, partials, coded, palette, global_scale, locks,
         n, k, grid, device, stream, pair_locks, lmpost_lut, lmpost_out,
         org_vocab_size, input_aux, fp8_scale, fp8_out);
@@ -434,7 +437,7 @@ int launch_tma4(const int4* input, const int4* weight, int4* output, int4* parti
     if (pal16) {
       return launch_tma4_impl<TileN, Threads, GateUpGrid, DownIlv, GateV48, GateUpSwiglu,
                               FuseLmPost, FuseMulSigmoid, Stages, Split2, FixedShape,
-                              GateUpSwigluFp8, false, HalfSplit, true>(
+                              GateUpSwigluFp8, false, HalfSplit, true, MRows>(
           input, weight, output, partials, coded, palette, global_scale, locks,
           n, k, grid, device, stream, pair_locks, lmpost_lut, lmpost_out,
           org_vocab_size, input_aux, fp8_scale, fp8_out);
@@ -442,7 +445,7 @@ int launch_tma4(const int4* input, const int4* weight, int4* output, int4* parti
   }
   return launch_tma4_impl<TileN, Threads, GateUpGrid, DownIlv, GateV48, GateUpSwiglu,
                           FuseLmPost, FuseMulSigmoid, Stages, Split2, FixedShape,
-                          GateUpSwigluFp8, false, HalfSplit, false>(
+                          GateUpSwigluFp8, false, HalfSplit, false, MRows>(
       input, weight, output, partials, coded, palette, global_scale, locks,
       n, k, grid, device, stream, pair_locks, lmpost_lut, lmpost_out,
       org_vocab_size, input_aux, fp8_scale, fp8_out);
@@ -666,6 +669,30 @@ extern "C" int muse_marlin6_sk_tma4_ilv(const int4* input, const int4* weight, i
   return launch_tma4<128, 256, false, true, false, false, false, false, 4>(
       input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream);
 }
+
+#ifdef MUSE_VERIFY_ROWS
+// DFlash verify block (M = 1 + depth rows, m <= 8) on the same TMA4-ILV weight and rANS scales as the M = 1 GEMV:
+// the same 256-thread / 128-column / 8-k-block tile, the same 48-CTA stream-K partition and FP32 global reduce,
+// so each row's sum runs in the order stock ops.marlin_gemm uses at this M (m_block_size_8, thread_m_blocks 1).
+// Only the plain stream-K shapes: gate_up (39936 x 6656) and down (6656 x 19968). The Python side admits a layer
+// only after a bitwise comparison against stock ops.marlin_gemm at the same M.
+extern "C" int muse_marlin6_sk_tma4_ilv_rows(const int4* input, const int4* weight, int4* output,
+                                             int4* partials, const int4* coded, const int4* palette,
+                                             const float* global_scale, int* locks, int m, int n, int k,
+                                             int blocks, int device, cudaStream_t stream) {
+  if (blocks != 48 || !((n == 39936 && k == 6656) || (n == 6656 && k == 19968))) return cudaErrorInvalidValue;
+  switch (m) {
+    case 7:
+      // TmaOvlp, HalfSplit and FastPal16 off: the M = 1-only compact A stage and row-0 reduction stay out.
+      return launch_tma4_impl<128, 256, false, true, false, false, false, false, 4, false, 0, false,
+                              false, false, false, 7>(
+          input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
+          nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr);
+    default:
+      return cudaErrorInvalidValue;
+  }
+}
+#endif  // MUSE_VERIFY_ROWS
 
 extern "C" int muse_marlin6_sk_tma4_gated(
     const int4* gate, const int4* attn, const int4* weight, int4* output,

@@ -303,7 +303,11 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool gate_up_swiglu_fp8 = false,
           const bool tma_ovlp = false,
           const bool half_split = false,
-          const bool fast_pal16 = false>
+          const bool fast_pal16 = false,
+          // muse verify rows: activation rows of a DFlash verify block (1 + depth). The per-row work,
+          // the stream-K partition and the K reduction order do not depend on it (m_block_size_8 tile);
+          // 1 keeps the M = 1 decode specialization bit for bit.
+          const int m_rows = 1>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -345,8 +349,14 @@ __global__ void Marlin(
     int tma_pdl_mode = 0
 #endif
 ) {
+  static_assert(m_rows >= 1 && m_rows <= 8 && (m_rows == 1 || (m_block_size_8 && thread_m_blocks == 1)),
+                "verify rows need the 8-row m block");
+  static_assert(m_rows == 1 || (!gate_up_grid && !gate_up_swiglu && !fuse_lmpost && !fuse_mul_sigmoid &&
+                                !split2 && fixed_shape == 0 && !gate_up_swiglu_fp8 && !half_split && !gate_v48 &&
+                                !tma_ovlp && !fast_pal16 && stages == 4),
+                "verify rows run only the plain 4-stage stream-K tile kernel (full 8-row A stages, generic reduce)");
   if constexpr (scale6) {
-    prob_m = 1;
+    prob_m = m_rows;
     lda = prob_k;
     num_groups = prob_k >> 4;
     has_bias = false;
@@ -1103,7 +1113,7 @@ __global__ void Marlin(
     }
   }
   constexpr bool fast_m1_red =
-      scale6 && m_block_size_8 && (tma_ovlp || fast_pal16 || stages == 3 || half_split || fixed_shape == 3);
+      m_rows == 1 && scale6 && m_block_size_8 && (tma_ovlp || fast_pal16 || stages == 3 || half_split || fixed_shape == 3);
 #ifdef MUSE_SCALE_TMA4
   static_assert(scale6 && (threads == 256 || threads == 128),
                 "TMA4 rANS scales require M = 1 decode config (128 or 256 threads)");

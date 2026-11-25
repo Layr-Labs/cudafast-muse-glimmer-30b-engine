@@ -11,4 +11,13 @@ torch_include="$(python3 -c 'import importlib.util, pathlib; print(pathlib.Path(
 TMPDIR="$tmp" nvcc -O3 --expt-relaxed-constexpr -std=c++17 --shared --cudart shared \
     -Xcompiler=-fPIC -gencode arch=compute_121a,code=sm_121a -I"$torch_include" \
     "$src/gemv6.cu" "$src/gemv6_srans.cu" "$src/gemv6_srans_down.cu" "$src/gemv6_tma4.cu" -o "$KERNELS_OUT/libmuse_marlin6.so"
+# libmuse_marlin6_rows.so: the same sources with the DFlash verify-rows entry (muse_marlin6_sk_tma4_ilv_rows).
+# Optional: if it does not build, muse_marlin6_gemv keeps every verify block on stock ops.marlin_gemm.
+if ! TMPDIR="$tmp" nvcc -O3 --expt-relaxed-constexpr -std=c++17 --shared --cudart shared \
+    -Xcompiler=-fPIC -gencode arch=compute_121a,code=sm_121a -I"$torch_include" -DMUSE_VERIFY_ROWS \
+    "$src/gemv6.cu" "$src/gemv6_srans.cu" "$src/gemv6_srans_down.cu" "$src/gemv6_tma4.cu" \
+    -o "$KERNELS_OUT/libmuse_marlin6_rows.so"; then
+  rm -f "$KERNELS_OUT/libmuse_marlin6_rows.so"
+  echo "decode6: verify-rows library not built; DFlash verify GEMMs stay on stock" >&2
+fi
 install -m 0644 "$src/muse_marlin6_gemv.py" "$KERNELS_OUT/muse_marlin6_gemv.py"

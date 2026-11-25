@@ -73,6 +73,14 @@ _sk_tma4_ilv = getattr(_lib, "muse_marlin6_sk_tma4_ilv", None)
 if _sk_tma4_ilv is not None:
     _sk_tma4_ilv.argtypes = _gemv6.argtypes
     _sk_tma4_ilv.restype = ctypes.c_int
+try:
+    _rows_lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_marlin6_rows.so")))
+except OSError:
+    _rows_lib = None
+_sk_tma4_ilv_rows = getattr(_rows_lib, "muse_marlin6_sk_tma4_ilv_rows", None) if _rows_lib is not None else None
+if _sk_tma4_ilv_rows is not None:
+    _sk_tma4_ilv_rows.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
+    _sk_tma4_ilv_rows.restype = ctypes.c_int
 _sk_tma4_gated = getattr(_lib, "muse_marlin6_sk_tma4_gated", None)
 if _sk_tma4_gated is not None:
     _sk_tma4_gated.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
@@ -1875,3 +1883,119 @@ def prepare_decode_layout6(layer: torch.nn.Module, reference) -> bool:
             STATS["down_srans" if coded_ok else "down_srans_rejected"] += 1
     STATS["admitted"] += 1
     return True
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# DFlash verify rows. A speculative leg at depth N runs every target step as one (1 + N)-row block, so the M = 1
+# decode GEMVs above never run there: every NVFP4 MLP call falls back to stock ops.marlin_gemm on the stock layout.
+# muse_marlin6_sk_tma4_ilv_rows runs the same TMA4-ILV kernel (coded scales, interleaved tiles) with
+# prob_m = VERIFY_ROWS. Its tile config, 48-CTA stream-K partition and FP32 global reduce are the ones stock picks at
+# this M (m_block_size_8, thread_m_blocks 1), so each row sums in stock's order. A layer is admitted only after the
+# kernel reproduces stock apply_fp4_marlin_linear bit for bit on VERIFY_ROWS-row probes, on its final (placed,
+# possibly paired) buffers, with the lock workspace returned to zero. Anything else keeps the stock call.
+VERIFY_ROWS = 7
+_VERIFY_ROWS_ADMITTED: set[tuple[int, int, int]] = set()
+VERIFY_ROWS_STATS = {"admitted": 0, "rejected": 0}
+
+
+def _verify_rows_key(tiled_weight: torch.Tensor, scales6: torch.Tensor, global_scale: torch.Tensor):
+    return (tiled_weight.data_ptr(), scales6.data_ptr(), global_scale.data_ptr())
+
+
+def verify_rows_admitted(tiled_weight, scales6, global_scale) -> bool:
+    return (
+        tiled_weight is not None
+        and scales6 is not None
+        and _verify_rows_key(tiled_weight, scales6, global_scale) in _VERIFY_ROWS_ADMITTED
+        and is_tma4_ilv(scales6)
+    )
+
+
+def _verify_rows_launch(x, tiled_weight, scales6, palette, global_scale, workspace, n, k) -> torch.Tensor:
+    if not x.is_contiguous() or x.data_ptr() % 16:
+        x = x.clone(memory_format=torch.contiguous_format)
+    output = x.new_empty((x.shape[0], n))
+    partials = x.new_empty((48, 16, 128), dtype=torch.float32)
+    with torch.cuda.device(x.device):
+        status = _sk_tma4_ilv_rows(
+            x.data_ptr(), tiled_weight.data_ptr(), output.data_ptr(), partials.data_ptr(),
+            scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
+            int(x.shape[0]), n, k, 48, x.device.index, torch.cuda.current_stream().cuda_stream,
+        )
+    if status:
+        raise RuntimeError(f"SM121 Marlin verify-rows GEMM launch failed with CUDA error {status}")
+    return output
+
+
+def verify_rows_linear(x, tiled_weight, scales6, palette, global_scale, workspace, n, k):
+    """The admitted VERIFY_ROWS-row GEMM, or None (caller keeps the stock call)."""
+    if (
+        _sk_tma4_ilv_rows is None
+        or x.dim() != 2
+        or x.shape != (VERIFY_ROWS, k)
+        or x.dtype != torch.bfloat16
+        or palette is None
+        or not verify_rows_admitted(tiled_weight, scales6, global_scale)
+    ):
+        return None
+    return _verify_rows_launch(x, tiled_weight, scales6, palette, global_scale, workspace, n, k)
+
+
+def _admit_verify_rows_layer(layer: torch.nn.Module) -> bool:
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import apply_fp4_marlin_linear
+
+    w = getattr(layer, "_marlin_decode_weight", None)
+    s6 = getattr(layer, "_marlin_decode_scales6", None)
+    pal = getattr(layer, "_marlin_decode_palette", None)
+    if w is None or s6 is None or pal is None or getattr(layer, "marlin_decode6_fixed_grid", False):
+        return False
+    n, k = layer.output_size_per_partition, layer.input_size_per_partition
+    if (n, k) not in ((GATE_UP_N, GATE_UP_K), (DOWN_N, DOWN_K)) or not is_tma4_ilv(s6):
+        return False
+    if getattr(layer, "weight_global_scale", None) is None or getattr(layer, "workspace", None) is None:
+        return False
+    dev = layer.weight.device
+    gen = torch.Generator(device=dev)
+    gen.manual_seed(n * 13 + k + VERIFY_ROWS)
+    ws = layer.workspace
+    for mag in (0.01, 1.0, 64.0):
+        # Distinct rows with large, cancelling terms: a different summation order or a row mix-up shows.
+        x = torch.randn(VERIFY_ROWS, k, generator=gen, device=dev) * mag
+        x[:, ::3] *= 64
+        x[:, 1::2] = -x[:, ::2]
+        x[VERIFY_ROWS - 1].zero_()
+        x = x.to(torch.bfloat16)
+        ref = apply_fp4_marlin_linear(
+            input=x, weight=layer.weight, weight_scale=layer.weight_scale,
+            weight_global_scale=layer.weight_global_scale, workspace=ws, size_n=n, size_k=k,
+        )
+        for _ in range(2):
+            got = _verify_rows_launch(x, w, s6, pal, layer.weight_global_scale, ws, n, k)
+            torch.cuda.synchronize(dev)
+            if got.shape != ref.shape or not _same_bits([ref], [got]) or int(torch.count_nonzero(ws)) != 0:
+                return False
+    return True
+
+
+def admit_verify_rows(model: torch.nn.Module) -> int:
+    """After every load-time placement and pairing: admit layers whose verify-rows GEMM equals stock bit for bit."""
+    if _sk_tma4_ilv_rows is None or os.environ.get("MUSE_VERIFY_ROWS", "1") == "0":
+        return 0
+    _VERIFY_ROWS_ADMITTED.clear()
+    for module in model.modules():
+        if getattr(module, "_marlin_decode_scales6", None) is None:
+            continue
+        try:
+            ok = _admit_verify_rows_layer(module)
+        except (RuntimeError, ValueError) as exc:
+            logger.warning_once("NVFP4 verify-rows admission failed: %s", exc)
+            ok = False
+        if ok:
+            _VERIFY_ROWS_ADMITTED.add(_verify_rows_key(
+                module._marlin_decode_weight, module._marlin_decode_scales6, module.weight_global_scale))
+            VERIFY_ROWS_STATS["admitted"] += 1
+        elif getattr(module, "output_size_per_partition", None) is not None:
+            VERIFY_ROWS_STATS["rejected"] += 1
+    logger.info("NVFP4 %d-row verify GEMM on TMA4-ILV buffers: %d layers admitted bitwise, %d kept on stock",
+                VERIFY_ROWS, VERIFY_ROWS_STATS["admitted"], VERIFY_ROWS_STATS["rejected"])
+    return VERIFY_ROWS_STATS["admitted"]

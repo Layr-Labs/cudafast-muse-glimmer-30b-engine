@@ -388,6 +388,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 place_prefill_weights(self.model)
             except Exception as err:  # noqa: BLE001 - never part of the load's success
                 logger.warning("Decode weight placement unavailable: %s", err)
+            if self.speculator is not None:
+                # LOCAL PATCH (DFlash verify rows): after every placement and pairing, admit the NVFP4 layers whose
+                # (1 + depth)-row GEMM on the decode buffers equals stock ops.marlin_gemm bit for bit.
+                try:
+                    import muse_marlin6_gemv as _m6
+
+                    if hasattr(_m6, "admit_verify_rows"):
+                        _m6.VERIFY_ROWS = 1 + int(self.speculative_config.num_speculative_tokens)
+                        _m6.admit_verify_rows(self.model)
+                except Exception as err:  # noqa: BLE001 - never part of the load's success
+                    logger.warning("NVFP4 verify-rows admission unavailable: %s", err)
         logger.info(
             "Model loading took %s GiB and %.6f seconds",
             format_gib(m.consumed_memory),
