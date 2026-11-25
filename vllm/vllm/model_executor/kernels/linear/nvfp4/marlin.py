@@ -520,6 +520,26 @@ direct_register_custom_op(
 )
 
 
+def _marlin_paired_layout_swiglu(x: torch.Tensor) -> torch.Tensor:
+    import muse_marlin6_gemv as decode6
+
+    out = decode6.launch_paired_layout_swiglu(x)
+    if out is None:
+        raise RuntimeError(f"paired-layout SwiGLU declined input {tuple(x.shape)}")
+    return out
+
+
+def _marlin_paired_layout_swiglu_fake(x: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((x.shape[0], x.shape[1] // 2))
+
+
+direct_register_custom_op(
+    op_name="marlin_paired_layout_swiglu",
+    op_func=_marlin_paired_layout_swiglu,
+    fake_impl=_marlin_paired_layout_swiglu_fake,
+)
+
+
 def _marlin_fp4_swiglu_fp8(
     x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, global_scale: torch.Tensor,
     down_scale: torch.Tensor,

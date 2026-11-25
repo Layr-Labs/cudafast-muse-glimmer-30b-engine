@@ -454,7 +454,52 @@ int launch_tma4(const int4* input, const int4* weight, int4* output, int4* parti
       org_vocab_size, input_aux, fp8_scale, fp8_out);
 }
 
+// The paired gate/up weight layout makes the M=2..8 producer emit 264
+// interleaved gate/up tiles followed by 48 gate-tail and 48 up-tail tiles.
+// Consume that layout directly, avoiding the full-tensor gather before SwiGLU.
+__global__ void __launch_bounds__(128) paired_layout_swiglu_kernel(
+    const uint4* __restrict__ paired, uint4* __restrict__ output) {
+  constexpr int kOutVecs = 19968 / 8;
+  constexpr int kRawVecs = 39936 / 8;
+  const int col = blockIdx.x * 128 + threadIdx.x;
+  if (col >= kOutVecs) return;
+  const int row = blockIdx.y;
+  const int tile = col >> 3;
+  const int group = col & 7;
+  const int gate_tile = tile < 264 ? 2 * tile : 528 + (tile - 264);
+  const int up_tile = tile < 264 ? 2 * tile + 1 : 576 + (tile - 264);
+  const uint4 gv = paired[row * kRawVecs + gate_tile * 8 + group];
+  const uint4 uv = paired[row * kRawVecs + up_tile * 8 + group];
+  const uint32_t* gw = reinterpret_cast<const uint32_t*>(&gv);
+  const uint32_t* uw = reinterpret_cast<const uint32_t*>(&uv);
+  uint4 ov;
+  uint32_t* ow = reinterpret_cast<uint32_t*>(&ov);
+#pragma unroll
+  for (int p = 0; p < 4; ++p) {
+    const float g0 = __uint_as_float(gw[p] << 16);
+    const float g1 = __uint_as_float(gw[p] & 0xffff0000u);
+    const float u0 = __uint_as_float(uw[p] << 16);
+    const float u1 = __uint_as_float(uw[p] & 0xffff0000u);
+    const __nv_bfloat162 v = __floats2bfloat162_rn(
+        __fmul_rn(muse_marlin6_tma4::marlin_swiglu_silu(g0), u0),
+        __fmul_rn(muse_marlin6_tma4::marlin_swiglu_silu(g1), u1));
+    ow[p] = *reinterpret_cast<const uint32_t*>(&v);
+  }
+  output[row * kOutVecs + col] = ov;
+}
+
 }  // namespace
+
+extern "C" int muse_marlin6_paired_layout_swiglu(
+    const int4* paired, int4* output, int m, cudaStream_t stream) {
+  if (paired == nullptr || output == nullptr || m < 2 || m > 8)
+    return cudaErrorInvalidValue;
+  constexpr int kOutVecs = 19968 / 8;
+  const dim3 grid((kOutVecs + 127) / 128, static_cast<unsigned>(m));
+  paired_layout_swiglu_kernel<<<grid, 128, 0, stream>>>(
+      reinterpret_cast<const uint4*>(paired), reinterpret_cast<uint4*>(output));
+  return cudaGetLastError();
+}
 
 extern "C" int muse_marlin6_set_pdl(int mode) {
   const int prev = decode6_tma4_pdl();
@@ -512,6 +557,22 @@ extern "C" int muse_marlin6_sk_tma4_ilv_swiglu(
   return launch_tma4<128, 256, false, true, false, true, false, false, 4>(
       input, weight, output, partials, coded, palette, global_scale, locks,
       n, k, 48, device, stream);
+}
+
+extern "C" int muse_marlin6_sk_tma4_ilv_swiglu_m(
+    const int4* input, const int4* weight, int4* output, int4* partials,
+    const int4* coded, const int4* palette, const float* global_scale,
+    int* locks, int m, int n, int k, int blocks, int device, cudaStream_t stream) {
+  if (m < 1 || m > 8 || n != 39936 || k != 6656 || blocks != 48)
+    return cudaErrorInvalidValue;
+  static const int gu_st = decode6_tma4_stages("MUSE_TMA4_SWIGLU_M_STAGES", 3);  // S3 NVFP4TUNE: 3-stage multi-M gate_up
+  if (gu_st == 3)
+    return launch_tma4_impl<128, 256, false, true, false, true, false, false, 3, false, 0, false, true, false, true, true>(
+        input, weight, output, partials, coded, palette, global_scale, locks,
+        n, k, 48, device, stream, nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
+  return launch_tma4_impl<128, 256, false, true, false, true, false, false, 4, false, 0, false, true, false, true, true>(
+      input, weight, output, partials, coded, palette, global_scale, locks,
+      n, k, 48, device, stream, nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
 }
 
 extern "C" int muse_marlin6_sk_tma4_ilv_swiglu_fp8(
@@ -712,7 +773,12 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
         nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
   }
   if (n == 6656 && k == 19968) {
-    return launch_tma4_impl<128, 256, false, true, false, false, false, false, 4, false, 1, false, true, false, true, true>(
+    return launch_tma4_impl<128, 256, false, true, false, false, false, false, 3, false, 1, false, true, false, true, true>(
+        input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
+        nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
+  }
+  if (n == 39936 && k == 6656) {
+    return launch_tma4_impl<128, 256, false, true, false, false, false, false, 3, false, 0, false, true, false, true, true>(
         input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
         nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
   }

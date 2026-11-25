@@ -1110,6 +1110,18 @@ class MuseGlimmerMLP(nn.Module):
             x.contiguous(), proj.weight, proj.weight_scale, proj.weight_global_scale
         )
 
+    def _paired_layout_gate_up_activation(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        return torch.ops.vllm.marlin_paired_layout_swiglu(gate_up)
+
+    def _prefill_or_regular_gate_up_activation(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.cond(
+            x.shape[0] == 512,
+            self._paired_gate_up_activation,
+            self._gate_up_activation,
+            (x,),
+        )
+
     def _regular_swiglu_down(self, x: torch.Tensor) -> torch.Tensor:
         activation = self._gate_up_activation(x)
         return self.down_proj(activation)[0]
@@ -1143,6 +1155,17 @@ class MuseGlimmerMLP(nn.Module):
         return self.down_proj(self.act_fn(gate_up))[0]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rows_swiglu = bool(
+            getattr(self.gate_up_proj, "marlin_decode_swiglu_rows_ready", False)
+        )
+        if (
+            not torch.compiler.is_compiling()
+            and rows_swiglu
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and 2 <= x.shape[0] <= 8
+        ):
+            return self.down_proj(self._paired_layout_gate_up_activation(x))[0]
         if (torch.compiler.is_compiling() and x.ndim == 2 and x.dtype == torch.bfloat16
                 and hasattr(self.gate_up_proj, "paired_fp8_swiglu_weight")
                 and getattr(self.down_proj, "marlin_swiglu_fp8_input", False)):
@@ -1164,8 +1187,20 @@ class MuseGlimmerMLP(nn.Module):
                 and getattr(self.down_proj, "marlin_prompt_path", None) is not None):
             # The down projection consumes BF16 for these layers. Other quantizers
             # can fold their activation cast into SwiGLU with different boundaries.
-            x = torch.cond(x.shape[0] == 512, self._paired_gate_up_activation,
-                           self._gate_up_activation, (x,))
+            if rows_swiglu:
+                x = torch.cond(
+                    (x.shape[0] >= 2) & (x.shape[0] <= 8),
+                    self._paired_layout_gate_up_activation,
+                    self._prefill_or_regular_gate_up_activation,
+                    (x,),
+                )
+            else:
+                x = torch.cond(
+                    x.shape[0] == 512,
+                    self._paired_gate_up_activation,
+                    self._gate_up_activation,
+                    (x,),
+                )
         else:
             x = self._gate_up_activation(x)
         x, _ = self.down_proj(x)

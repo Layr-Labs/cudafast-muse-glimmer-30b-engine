@@ -253,12 +253,19 @@ class Session:
         rounds: list[list[int]] = []
         frontiers: list[int] = []
         pending, produced = first, 0
-        while produced < count:
-            committed = self.cycle(pending, count - produced)
-            rounds.append(committed)
-            pending = self.frontier.token  # type: ignore[union-attr]
-            frontiers.append(pending)
-            produced += len(committed)
+        self.b.begin_spec_run(count)
+        try:
+            while produced < count:
+                committed = self.cycle(pending, count - produced)
+                rounds.append(committed)
+                pending = self.frontier.token  # type: ignore[union-attr]
+                frontiers.append(pending)
+                produced += len(committed)
+        except BaseException:
+            # Leave the async queue armed until invalidate/abort drains it.
+            raise
+        else:
+            self.b.end_spec_run()
         return rounds, frontiers
 
     def top_logits(self, k: int) -> tuple[list[int], list[float]]:
