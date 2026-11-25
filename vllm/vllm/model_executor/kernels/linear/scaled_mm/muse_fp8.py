@@ -36,7 +36,22 @@ try:
 except Exception:  # noqa: BLE001
     _rans = None
 
+try:
+    # DFlash verify rows (harness/kernels/muserans, built with -DRANS_MR=7): the same rANS blobs, decoded once per
+    # 8-column chunk and multiplied with all 1 + depth activation rows in the same mma chain. Optional.
+    import muse_rans_rows_ext as _rans_rows
+
+    if _rans is None or os.environ.get("MUSERANS_ROWS", "1") == "0":
+        _rans_rows = None
+except Exception:  # noqa: BLE001
+    _rans_rows = None
+
 _stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False}
+# (blob data_ptr, weight data_ptr) of the layers whose verify-row GEMM equalled the small-row op bit for bit, after
+# every load-time placement (placement swaps blob storage, so the check runs on the final buffers).
+_ROWS_ADMITTED: set[tuple[int, int]] = set()
+_ROWS = 0
+_rows_stats = {"admitted": 0, "rejected": 0}
 _decode_gemm_operand = None
 _consume_rans_prologue = None
 
@@ -131,6 +146,18 @@ def _muse_fp8_scaled_mm(
     if A.shape[0] <= 16 and _decode_gemm_operand is not None:
         A = _decode_gemm_operand(A)
     k, n = B.shape
+    if (
+        _rans_rows is not None
+        and A.shape[0] == _ROWS
+        and A.dim() == 2
+        and A.is_contiguous()
+        and packed.numel() != n * k
+        and (packed.data_ptr(), B.data_ptr()) in _ROWS_ADMITTED
+        and _scales_ok(As, Bs, n)
+    ):
+        out = torch.empty((A.shape[0], n), dtype=torch.bfloat16, device=A.device)
+        _rans_rows.rans_gemv_rows(packed, A, Bs.reshape(-1), As.reshape(-1), out, n, k)
+        return out
     if A.shape[0] == 1 and packed.numel() > 0 and A.is_contiguous() and _scales_ok(As, Bs, n):
         if (
             packed.numel() != n * k
@@ -162,3 +189,56 @@ direct_register_custom_op(
     mutates_args=[],
     fake_impl=_muse_fp8_scaled_mm_fake,
 )
+
+
+def _rows_self_check(blob: torch.Tensor, w_kn: torch.Tensor, sb: torch.Tensor, sa: torch.Tensor, rows: int) -> bool:
+    """rans_gemv_rows vs the op this layer runs today for `rows` rows (glimmer_fp8.fp8_scaled_mm): distinct rows with
+    large and cancelling entries, bitwise, twice per probe."""
+    k, n = w_kn.shape
+    gen = torch.Generator(device=w_kn.device)
+    gen.manual_seed(n * 137 + k + rows)
+    for trial in range(4):
+        x = torch.randn(rows, k, generator=gen, device=w_kn.device) * (0.05, 1.0, 8.0, 40.0)[trial]
+        x[:, ::3] *= 16
+        x[:, 1::2] = -x[:, ::2]
+        x[rows - 1].zero_()
+        xq = (x / sa.float().reshape(1, 1)).clamp(-448, 448).to(torch.float8_e4m3fn).contiguous()
+        ref = _small_row_fp8(xq, w_kn, sa, sb)
+        for _ in range(2):
+            got = torch.empty(rows, n, dtype=torch.bfloat16, device=w_kn.device)
+            _rans_rows.rans_gemv_rows(blob, xq, sb.reshape(-1), sa.reshape(-1), got, n, k)
+            torch.cuda.synchronize(w_kn.device)
+            if got.shape != ref.shape or not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+                return False
+    return True
+
+
+def admit_verify_rows(model: torch.nn.Module, rows: int) -> int:
+    """After load-time placement: admit the rANS FP8 layers whose `rows`-row GEMM equals today's small-row op."""
+    global _ROWS
+    _ROWS_ADMITTED.clear()
+    _ROWS = 0
+    if _rans_rows is None or int(_rans_rows.rans_rows()) != rows:
+        return 0
+    for module in model.modules():
+        blob = getattr(module, "_buffers", {}).get("muse_fp8_packed")
+        w = getattr(module, "weight", None)
+        ws = getattr(module, "weight_scale", None)
+        xs = getattr(module, "input_scale", None)
+        if blob is None or w is None or w.dtype != torch.float8_e4m3fn or w.dim() != 2:
+            continue
+        k, n = w.shape
+        if blob.numel() == n * k or not w.t().is_contiguous() or not _scales_ok(xs, ws, n):
+            continue
+        try:
+            ok = _rows_self_check(blob, w, ws, xs, rows)
+        except Exception as e:  # noqa: BLE001 - e.g. K too large to stage `rows` rows in shared memory
+            logger.warning_once("muserans verify rows unavailable for some layers: %s", e)
+            ok = False
+        _rows_stats["admitted" if ok else "rejected"] += 1
+        if ok:
+            _ROWS_ADMITTED.add((blob.data_ptr(), w.data_ptr()))
+    _ROWS = rows
+    logger.info("muserans %d-row verify GEMM: %d FP8 layers admitted bitwise, %d kept on the small-row op",
+                rows, _rows_stats["admitted"], _rows_stats["rejected"])
+    return _rows_stats["admitted"]

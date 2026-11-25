@@ -35,6 +35,14 @@
 #ifndef RANS_PREISSUE
 #define RANS_PREISSUE 1
 #endif
+// DFlash verify rows. The default build (RANS_MR 1) is the one-token GEMV, unchanged. The optional rows build
+// (muse_rans_rows_ext, -DRANS_MR=7) stages RANS_MR activation rows and hands row g of the m16n8k32 A operand to the
+// lanes with g < RANS_MR: each row's accumulator sees the same mma chain over the same decoded weight fragments in the
+// same k order as the M = 1 kernel (and as the M <= 16 CUTLASS tiles), and rows never mix inside the MMA.
+#ifndef RANS_MR
+#define RANS_MR 1
+#endif
+static_assert(RANS_MR >= 1 && RANS_MR <= 8, "RANS_MR rows must fit the 8 non-padding rows of the m16 A operand");
 
 __device__ __forceinline__ void rans_mma_e4m3(float& d0, float& d1, float& d2, float& d3, uint32_t a0, uint32_t a2, uint32_t b0, uint32_t b1) {
 #if MUSE_MMA_KIND == 0
@@ -320,7 +328,11 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   const int tid = threadIdx.x, lane = tid & 31, wib = tid >> 5, wpb = blockDim.x >> 5;
   const int K = pb.K, S = K >> 5;
   uint2* xs = (uint2*)smem;
+#if RANS_MR == 1
   const int xbytes = (K + 15) & ~15;
+#else
+  const int xbytes = ((K + 15) & ~15) * RANS_MR;
+#endif
   const uint32_t sbase0 = (uint32_t)__cvta_generic_to_shared(smem) + (uint32_t)xbytes;
   const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + (uint32_t)wib * RB;
   const int w = pb.strided_w ? (wib * gridDim.x + blockIdx.x) : (blockIdx.x * wpb + wib);
@@ -405,10 +417,20 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
   if (pb.act_mode == 0) {
+#if RANS_MR == 1
     for (int i = tid; i < S * 4; i += blockDim.x) {
       int s = i >> 2, tt = i & 3;
       xs[i] = make_uint2(*(const uint32_t*)(pb.x + 32 * s + 4 * tt), *(const uint32_t*)(pb.x + 32 * s + 16 + 4 * tt));
     }
+#else
+    // Row r of x ([RANS_MR, K] e4m3, contiguous) goes to xs[r * S * 4 ...], in the one-row fragment order.
+    for (int i = tid; i < RANS_MR * S * 4; i += blockDim.x) {
+      const int r = i / (S * 4), j = i - r * (S * 4);
+      const int s = j >> 2, tt = j & 3;
+      const uint8_t* xr = pb.x + (size_t)r * K;
+      xs[i] = make_uint2(*(const uint32_t*)(xr + 32 * s + 4 * tt), *(const uint32_t*)(xr + 32 * s + 16 + 4 * tt));
+    }
+#endif
   } else if (pb.act_mode == 1) {
     const float inv_sa = rans_full_rcp(__ldg(pb.sa));
     const uint16_t* gate_u16 = (const uint16_t*)pb.x;
@@ -527,10 +549,15 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
       const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
       const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
       const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
+#if RANS_MR == 1
       uint2 a = xs[s * 4 + t];
       a.x = (g == 0) ? a.x : 0u; a.y = (g == 0) ? a.y : 0u;
+#else
+      const uint2 a = (g < RANS_MR) ? xs[g * (S * 4) + s * 4 + t] : make_uint2(0u, 0u);
+#endif
       rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
     }
+#if RANS_MR == 1
     if (lane < 4) {
       const float sa_v = __ldg(pb.sa);
       int n = nb * 8 + 2 * t;
@@ -538,6 +565,16 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
       __nv_bfloat162 r; r.x = __float2bfloat16_rn(sa_v * (s0 * c0)); r.y = __float2bfloat16_rn(sa_v * (s1 * c1));
       *(__nv_bfloat162*)(pb.out + n) = r;
     }
+#else
+    // c0, c1: row g, columns 2t and 2t + 1 of this 8-column chunk (the m16n8 accumulator layout); same epilogue.
+    if (g < RANS_MR) {
+      const float sa_v = __ldg(pb.sa);
+      int n = nb * 8 + 2 * t;
+      float s0 = pb.sb_scalar ? pb.sb[0] : pb.sb[n], s1 = pb.sb_scalar ? pb.sb[0] : pb.sb[n + 1];
+      __nv_bfloat162 r; r.x = __float2bfloat16_rn(sa_v * (s0 * c0)); r.y = __float2bfloat16_rn(sa_v * (s1 * c1));
+      *(__nv_bfloat162*)(pb.out + (size_t)g * pb.N + n) = r;
+    }
+#endif
   }
   rans_cp_wait<0>();
 #undef RANS_ISSUE
@@ -773,9 +810,18 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   } else if (pdl_cfg == 2) {
     pdl_mode = 3;
   }
+#if RANS_MR == 1
   pb.pdl_mode = pdl_mode;
   size_t dsmem = rans_dsmem(K, wpb, 9, rg);
   TORCH_CHECK(rans_fits(K, wpb, 9, rg), "rans smem too large (K too large for smem staging of x): ", dsmem);
+#else
+  // Verify rows: no programmatic dependency on the neighbouring (multi-row) kernels; RANS_MR staged rows of x.
+  (void)pdl_mode;
+  pb.pdl_mode = 0;
+  TORCH_CHECK(act_mode == 0, "rows build serves plain e4m3 activations only");
+  size_t dsmem = rans_dsmem(K, wpb, 9, rg) + rans_round16((size_t)K) * (RANS_MR - 1);
+  TORCH_CHECK(dsmem + RANS_LUT_BYTES + 1024 <= (size_t)RANS_MAX_SMEM, "rans rows smem too large: ", dsmem);
+#endif
   static const bool lock48 = []() {
     const char* env = std::getenv("MUSERANS_SMEM_LOCK48");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
@@ -840,6 +886,23 @@ std::vector<int64_t> rans_blob_cfg(torch::Tensor blob) {
 
 void rans_prepare() { rans_set_attrs_once(); }
 
+#if RANS_MR != 1
+// out [RANS_MR, N] = the RANS_MR-row FP8 GEMM on a blob made by the one-token build's rans_pack (same rans_pick_cfg).
+void rans_gemv_rows(torch::Tensor blob, torch::Tensor x, torch::Tensor sb, torch::Tensor sa, torch::Tensor out, int64_t N, int64_t K) {
+  TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "blob must be a contiguous uint8 cuda tensor");
+  TORCH_CHECK(N > 0 && K > 0 && N % 8 == 0 && K % 64 == 0, "need N%8==0 and K%64==0");
+  TORCH_CHECK(x.is_cuda() && x.element_size() == 1 && x.dim() == 2 && x.size(0) == RANS_MR && x.size(1) == K && x.is_contiguous(), "x must be a contiguous [RANS_MR, K] e4m3 cuda tensor");
+  TORCH_CHECK(sb.is_cuda() && sb.scalar_type() == torch::kFloat && sb.is_contiguous() && (sb.numel() == N || sb.numel() == 1), "bad sb");
+  TORCH_CHECK(sa.is_cuda() && sa.scalar_type() == torch::kFloat && sa.numel() == 1, "bad sa");
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.dim() == 2 && out.size(0) == RANS_MR && out.size(1) == N, "out must be a contiguous [RANS_MR, N] bf16 cuda tensor");
+  RansCfg c = rans_pick_cfg((int)N, (int)K);
+  rans_launch((const uint8_t*)blob.data_ptr(), (size_t)blob.numel(), c.tw, c.ns, c.wpb, c.rg, c.ilv, (const uint8_t*)x.data_ptr(), nullptr, 0, (const float*)sb.data_ptr(), sb.numel() == 1, (const float*)sa.data_ptr(), (__nv_bfloat16*)out.data_ptr(),
+              (int)N, (int)K, c10::cuda::getCurrentCUDAStream());
+}
+
+int64_t rans_rows() { return RANS_MR; }
+#endif
+
 #ifdef MUSE_RANS_STANDALONE_MODULE
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_pack", &rans_pack);
@@ -854,5 +917,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_prepare", &rans_prepare);
   m.def("rans_tpf_kb", &rans_tpf_kb);
   m.def("rans_set_pdl", &rans_set_pdl);
+#if RANS_MR != 1
+  m.def("rans_gemv_rows", &rans_gemv_rows);
+  m.def("rans_rows", &rans_rows);
+#endif
 }
 #endif
