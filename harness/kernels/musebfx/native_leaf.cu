@@ -36,15 +36,6 @@ __global__ void native_leaf_prepare_tree_kernel(
   seq_lens[0] = seq_lens[0] + (tree_m - 7);
 }
 
-
-// Calibrated path-probability scorer (fit on 12 logged prompts / 1587 steps, see /root/treesim/calib.json).
-// p(j,r) = exp(a_j + [post] a2_j + c_r + beta*(z_r - z_0)) / (1 + sum_{r<6} exp(...)), top-6 logits only.
-__constant__ float kCalA[6] = {2.424960f, 2.398534f, 2.506250f, 2.405109f, 1.847292f, 1.554834f};
-__constant__ float kCalA2[6] = {0.000000f, -1.911495f, -1.996907f, -1.750445f, -1.656647f, -1.742837f};
-__constant__ float kCalC[6] = {0.000000f, -0.562780f, -0.737762f, -0.996889f, -1.154073f, -1.388877f};
-#define CAL_BETA 0.714893f
-#define CAL_SHIFT 0.0650f
-
 // Arbitrary-depth (1..6-level) dynamic multi-leaf tree setup (rows 7..tree_m-1), launched as 1 warp (<<<1, 32>>>, <2 us):
 //   - Bit-packed remap inside int32[49] (1 + 16*3):
 //       leaf_flag[1 + 3*r + 0] = seq_sub  (seqlen_k_eff = seqlen_k - seq_sub)
@@ -177,8 +168,6 @@ __global__ void native_leaf_setup_tree_kernel(
   __shared__ float s_Z[6];
   __shared__ float s_A[6];
   __shared__ float s_p1[6];
-  __shared__ float s_p1post[6];
-  __shared__ float s_pr[6][6];
   __shared__ float s_z0[6];
   __shared__ int64_t s_dk[6];
   __shared__ uint8_t s_valid_row[6];
@@ -206,31 +195,25 @@ __global__ void native_leaf_setup_tree_kernel(
     s_valid_row[tid] = row_ok ? 1 : 0;
     s_z0[tid] = z0;
     if (row_ok) {
-      float e0[6], e1[6];
-      float den0 = 1.0f, den1 = 1.0f;
+      float sum_e = 1.0f;
+      float last_e = 0.0f;
 #pragma unroll
-      for (int rk = 0; rk < 6; ++rk) {
+      for (int rk = 1; rk < 6; ++rk) {
         const int64_t tok_r = tree_top[base + rk];
         const float zr = tree_vals[base + rk];
-        if (rk == 0 || (tok_r >= 0 && zr > -1e20f)) {
-          const float g = kCalC[rk] + CAL_BETA * (zr - z0);
-          e0[rk] = __expf(kCalA[tid] + g);
-          e1[rk] = __expf(kCalA[tid] + kCalA2[tid] + g);
-        } else {
-          e0[rk] = 0.0f; e1[rk] = 0.0f;
+        if (tok_r >= 0 && zr > -1e20f) {
+          const float er = __expf((zr - z0) * inv_temp);
+          sum_e += er;
+          last_e = er;
         }
-        den0 += e0[rk];
-        den1 += e1[rk];
       }
-#pragma unroll
-      for (int rk = 0; rk < 6; ++rk) s_pr[tid][rk] = e0[rk] / den0;
-      s_p1post[tid] = e1[0] / den1;
-      s_Z[tid] = den0;
-      s_p1[tid] = s_pr[tid][0];
+      const float z_tot = sum_e + tail_c * last_e;
+      s_Z[tid] = z_tot;
+      const float p1 = gamma / z_tot;
+      s_p1[tid] = (p1 < 1.0f) ? p1 : 1.0f;
     } else {
       s_Z[tid] = 1e30f;
       s_p1[tid] = 0.0f;
-      s_p1post[tid] = 0.0f;
     }
   }
   __syncwarp();
@@ -271,7 +254,7 @@ __global__ void native_leaf_setup_tree_kernel(
         }
       }
       if (ok) {
-        const float pr = s_pr[row_idx][rank];
+        const float pr = gamma * __expf((zr - s_z0[row_idx]) * inv_temp) / s_Z[row_idx];
         s_cand_score[tid] = s_A[row_idx] * pr;
         s_cand_tok[tid] = cand;
         s_cand_k[tid] = static_cast<int8_t>(row_idx + 1);
@@ -344,7 +327,8 @@ __global__ void native_leaf_setup_tree_kernel(
           int64_t sub_tok_spawned = -1;
           // 1) Aligned substitution continuation (`sub`, kind=1): d_{k_r+1}#1 = s_dk[k_r].
           if ((kind == 0 || kind == 1) && s_valid_row[k_r] && s_num_cands < 64) {
-            const float child_s = best_s * s_p1post[k_r];
+            const float c_mult = (kind == 0) ? sub_coef : cont_decay;
+            const float child_s = best_s * c_mult * s_p1[k_r];
             const int64_t sub_tok = s_dk[k_r];
             if (child_s > 0.0f && sub_tok >= 0) {
               const int slot = s_num_cands++;
@@ -362,8 +346,8 @@ __global__ void native_leaf_setup_tree_kernel(
             const int64_t shf_tok = s_dk[k_r - 1];
             if (shf_tok >= 0 && shf_tok != sub_tok_spawned) {
               const float child_s = (kind == 0)
-                  ? (best_s * CAL_SHIFT)
-                  : (best_s * s_p1post[k_r - 1]);
+                  ? (best_s * shf_coef)
+                  : (best_s * cont_decay * s_p1[k_r - 1]);
               if (child_s > 0.0f) {
                 const int slot = s_num_cands++;
                 s_cand_score[slot] = child_s;
