@@ -28,9 +28,19 @@ import time
 from dataclasses import dataclass
 
 
-REFERENCE_SERIAL_MS_PER_TOKEN = 85.5
-REFERENCE_MAX_DECODE_GAIN = 4.86
-TARGET_MS_PER_COMMITTED_TOKEN = 17.6
+REFERENCE_SERIAL_MS_PER_TOKEN = 85.2
+REFERENCE_MAX_DECODE_GAIN = 4.91
+TARGET_MS_PER_COMMITTED_TOKEN = float(
+    os.environ.get("MUSE_DFLASH_TARGET_MS_PER_TOKEN", "17.38")
+)
+
+# In-process zero-sync (rounds, committed_tokens) mirror for adaptive DFlash query width.
+_LAST_REQ_COMMIT_STATS: dict[str, tuple[int, int]] = {}
+
+
+def get_last_req_stats(req_id: str) -> tuple[int, int]:
+    """Return (rounds, committed_tokens) observed on the host for req_id."""
+    return _LAST_REQ_COMMIT_STATS.get(req_id, (0, 0))
 
 # The estimator starts at the measured S3 neighborhood and adapts downward
 # quickly.  Upward changes are intentionally slower: overestimating round time
@@ -110,6 +120,9 @@ class DFlashCommittedTokenCeiling:
         state = self._states.setdefault(req_id, _RequestCeilingState())
         state.rounds += 1
         state.committed_tokens += committed_tokens
+        if len(_LAST_REQ_COMMIT_STATS) > 64 and req_id not in _LAST_REQ_COMMIT_STATS:
+            _LAST_REQ_COMMIT_STATS.clear()
+        _LAST_REQ_COMMIT_STATS[req_id] = (state.rounds, state.committed_tokens)
         if (
             state.committed_tokens
             > HIGH_ACCEPTANCE_TRIGGER_TOKENS_PER_ROUND * state.rounds
@@ -210,6 +223,7 @@ class DFlashCommittedTokenCeiling:
     def reset(self, req_id: str) -> None:
         """Forget an earlier request that used the same external ID."""
         self._states.pop(req_id, None)
+        _LAST_REQ_COMMIT_STATS.pop(req_id, None)
 
     def snapshot(self, req_id: str) -> tuple[int, int, int, float, int]:
         """Return counters plus round estimate for tests and diagnostics."""

@@ -6,6 +6,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include <vector>
 
 constexpr int CH = 512;   // k chunk
 constexpr int RPW = 2;    // rows per warp
@@ -81,14 +82,14 @@ __global__ void __launch_bounds__(256) bfx_kernel(const __nv_bfloat16* __restric
 torch::Tensor bfx_gemm(torch::Tensor x, torch::Tensor lo, torch::Tensor nib, torch::Tensor base, torch::Tensor rowptr,
                        torch::Tensor ecol, torch::Tensor eval) {
   const int M = x.size(0), K = x.size(1), N = lo.size(0);
-  TORCH_CHECK(M >= 1 && M <= 8 && K % CH == 0 && lo.size(1) == K && x.is_contiguous() && x.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(M >= 1 && M <= 16 && K % CH == 0 && lo.size(1) == K && x.is_contiguous() && x.scalar_type() == torch::kBFloat16);
   auto out = torch::empty({M, N}, x.options());
   dim3 grid((N + WARPS * RPW - 1) / (WARPS * RPW));
   auto st = c10::cuda::getCurrentCUDAStream().stream();
 #define L_(MM) case MM: bfx_kernel<MM><<<grid, 256, 0, st>>>((const __nv_bfloat16*)x.data_ptr(), lo.data_ptr<uint8_t>(), \
     nib.data_ptr<uint8_t>(), base.data_ptr<int>(), rowptr.data_ptr<int>(), ecol.data_ptr<int>(), \
     (const __nv_bfloat16*)eval.data_ptr(), (__nv_bfloat16*)out.data_ptr(), N, K); break;
-  switch (M) { L_(1) L_(2) L_(3) L_(4) L_(5) L_(6) L_(7) L_(8) }
+  switch (M) { L_(1) L_(2) L_(3) L_(4) L_(5) L_(6) L_(7) L_(8) L_(9) L_(10) L_(11) L_(12) L_(13) L_(14) L_(15) L_(16) }
 #undef L_
   return out;
 }
@@ -97,9 +98,36 @@ torch::Tensor bf16_rans_pack(torch::Tensor W);
 torch::Tensor bf16_rans_unpack(torch::Tensor blob, int64_t N, int64_t K);
 torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int64_t K, int64_t base_exp);
 void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp);
+void bf16_rans_gemm_dual(
+    torch::Tensor x, torch::Tensor blob, torch::Tensor out0, torch::Tensor out1,
+    int64_t N0, int64_t N1, int64_t K, int64_t base_exp);
 int64_t bf16_rans_base(torch::Tensor blob);
 torch::Tensor int3_pack(torch::Tensor W, bool mse_opt = true);
+torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true);
 torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+void int3_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K);
+torch::Tensor int3_swiglu_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t H, int64_t K);
+void int3_swiglu_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t H, int64_t K);
+void int3_gemm_aux5_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K_each);
+torch::Tensor int4_pack(torch::Tensor W, bool mse_opt = true);
+torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+void int4_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K);
+void int4_gemm_aux5_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K_each);
+void dflash_kv_post(
+    torch::Tensor all_kv_flat, torch::Tensor k_norm_weights, torch::Tensor cos_sin_cache,
+    torch::Tensor positions, c10::optional<torch::Tensor> slot_mapping,
+    const std::vector<int64_t>& kv_ptrs, int64_t block_size,
+    int64_t stride_block, int64_t stride_kv_head, int64_t stride_slot, double eps);
+void dflash_qkv_norm_rope_cache(
+    torch::Tensor qkv, torch::Tensor q_norm_weight, torch::Tensor k_norm_weight,
+    torch::Tensor cos_sin_cache, torch::Tensor positions, torch::Tensor q_out,
+    c10::optional<torch::Tensor> k_out, c10::optional<torch::Tensor> slot_mapping,
+    int64_t kv_ptr, int64_t block_size, int64_t stride_block, int64_t stride_kv_head,
+    int64_t stride_slot, int64_t v_offset, double eps);
 void draft_vocab_update_tail(
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor in_static_vocab,
     torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor tail_seen);
@@ -128,7 +156,12 @@ void native_leaf_setup_tree(
     bool dynamic_mode = true,
     double temp = 1.35,
     double tail_c = 4.0,
-    double gamma = 0.92);
+    double gamma = 0.92,
+    c10::optional<torch::Tensor> saved_leaf_parent = c10::nullopt,
+    bool tree_l2_mode = false,
+    double l2_couple = 0.45,
+    bool always_active = false,
+    double shift_couple = 0.20);
 void native_leaf_commit_tree(
     torch::Tensor leaf_flag, torch::Tensor prev_ns,
     torch::Tensor hit_flag, torch::Tensor hit_src_row,
@@ -137,7 +170,8 @@ void native_leaf_commit_tree(
     torch::Tensor num_sampled, torch::Tensor num_rejected,
     int64_t tree_m = 12,
     c10::optional<torch::Tensor> stats = c10::nullopt, bool no_hit_mode = false,
-    c10::optional<torch::Tensor> req_acc_state = c10::nullopt);
+    c10::optional<torch::Tensor> req_acc_state = c10::nullopt,
+    c10::optional<torch::Tensor> saved_leaf_parent = c10::nullopt);
 void native_leaf_setup(
     torch::Tensor leaf_flag, torch::Tensor prev_ns, torch::Tensor alt_ids,
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor saved_alt_tok,
@@ -168,9 +202,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_unpack", &bf16_rans_unpack);
   m.def("rans_gemm", &bf16_rans_gemm);
   m.def("rans_gemm_out", &bf16_rans_gemm_out);
+  m.def("rans_gemm_dual", &bf16_rans_gemm_dual);
   m.def("rans_base", &bf16_rans_base);
   m.def("int3_pack", &int3_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
+  m.def("int3_pack_swiglu", &int3_pack_swiglu, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
   m.def("int3_gemm", &int3_gemm);
+  m.def("int3_gemm_out", &int3_gemm_out);
+  m.def("int3_swiglu_gemm", &int3_swiglu_gemm);
+  m.def("int3_swiglu_gemm_out", &int3_swiglu_gemm_out);
+  m.def("int3_gemm_aux5_out", &int3_gemm_aux5_out);
+  m.def("int4_pack", &int4_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
+  m.def("int4_gemm", &int4_gemm);
+  m.def("int4_gemm_out", &int4_gemm_out);
+  m.def("int4_gemm_aux5_out", &int4_gemm_aux5_out);
+  m.def("dflash_kv_post", &dflash_kv_post);
+  m.def("dflash_qkv_norm_rope_cache", &dflash_qkv_norm_rope_cache);
   m.def("draft_vocab_update_tail", &draft_vocab_update_tail);
   m.def("draft_vocab_tail_argmax", &draft_vocab_tail_argmax,
         pybind11::arg("A"), pybind11::arg("static_logits"), pybind11::arg("vocab_map"),
@@ -196,7 +242,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("dynamic_mode") = true,
         pybind11::arg("temp") = 1.35,
         pybind11::arg("tail_c") = 4.0,
-        pybind11::arg("gamma") = 0.92);
+        pybind11::arg("gamma") = 0.92,
+        pybind11::arg("saved_leaf_parent") = c10::nullopt,
+        pybind11::arg("tree_l2_mode") = false,
+        pybind11::arg("l2_couple") = 0.45,
+        pybind11::arg("always_active") = false,
+        pybind11::arg("shift_couple") = 0.20);
   m.def("native_leaf_commit_tree", &native_leaf_commit_tree,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"),
         pybind11::arg("hit_flag"), pybind11::arg("hit_src_row"),
@@ -205,7 +256,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("num_sampled"), pybind11::arg("num_rejected"),
         pybind11::arg("tree_m") = 12,
         pybind11::arg("stats") = c10::nullopt, pybind11::arg("no_hit_mode") = false,
-        pybind11::arg("req_acc_state") = c10::nullopt);
+        pybind11::arg("req_acc_state") = c10::nullopt,
+        pybind11::arg("saved_leaf_parent") = c10::nullopt);
   m.def("native_leaf_setup", &native_leaf_setup,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"), pybind11::arg("alt_ids"),
         pybind11::arg("input_ids"), pybind11::arg("positions"), pybind11::arg("saved_alt_tok"),

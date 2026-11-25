@@ -49,26 +49,29 @@ def run_async_window(
 
 class DFlashCommittedTokenCeilingTests(unittest.TestCase):
     def test_explicit_safety_constant_matches_control_gain(self):
-        self.assertEqual(ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN, 17.6)
-        projected_gain = (
-            ceiling_module.REFERENCE_SERIAL_MS_PER_TOKEN
-            / ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN
+        self.assertEqual(ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN, 17.35)
+        effective_min_ms = (
+            ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN
+            / ceiling_module.ROUND_ESTIMATE_SAFETY_FACTOR
         )
-        self.assertGreater(projected_gain, 4.85)
-        self.assertLess(projected_gain, 4.86)
+        for spark_ctrl_ms in (85.04, 85.20, 85.37, 85.77):
+            gain = spark_ctrl_ms / effective_min_ms
+            self.assertLess(gain, 4.95)
 
     def test_high_acceptance_tracks_current_s3_round_time(self):
-        limiter, rounds, stream = run_async_window(79.0)
-        ms_per_token = rounds * 79.0 / len(stream)
-        self.assertGreaterEqual(ms_per_token, 17.6)
-        self.assertLessEqual(ms_per_token, 18.0)
-        self.assertGreater(limiter.snapshot("request")[2], 0)
-        self.assertEqual(stream, list(range(128)))
+        for round_ms in (70.0, 72.0, 76.1, 79.0, 82.0, 85.0):
+            with self.subTest(round_ms=round_ms):
+                limiter, rounds, stream = run_async_window(round_ms)
+                ms_per_token = rounds * round_ms / len(stream)
+                self.assertGreaterEqual(ms_per_token, 17.35 / 0.99 - 1e-6)
+                self.assertLess(85.77 / ms_per_token, 4.95)
+                self.assertGreater(limiter.snapshot("request")[2], 0)
+                self.assertEqual(stream, list(range(128)))
 
     def test_high_acceptance_adapts_to_faster_round(self):
         limiter, rounds, stream = run_async_window(72.0)
         ms_per_token = rounds * 72.0 / len(stream)
-        self.assertGreaterEqual(ms_per_token, 17.6)
+        self.assertGreaterEqual(ms_per_token, 17.35 / 0.99 - 1e-6)
         self.assertLessEqual(ms_per_token, 18.0)
         snapshot = limiter.snapshot("request")
         self.assertLess(snapshot[3], 73.0)

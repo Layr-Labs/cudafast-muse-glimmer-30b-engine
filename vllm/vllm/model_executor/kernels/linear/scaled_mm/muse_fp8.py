@@ -37,7 +37,7 @@ except Exception:  # noqa: BLE001
     _rans = None
 
 _RANS_M = _rans is not None and hasattr(_rans, "rans_gemm_m_auto") and os.environ.get("MUSERANS_M", "1") != "0"
-_stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False}
+_stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False, "m_shapes_checked": set(), "fused_m_checked": set()}
 _decode_gemm_operand = None
 _consume_rans_prologue = None
 
@@ -77,21 +77,56 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
         try:
             blob = _rans.rans_pack(w.t().contiguous().view(torch.uint8))
             if _self_check(lambda xq, out: _rans.rans_gemv_auto(blob, xq.view(-1), ws.reshape(-1), xs.reshape(-1), out, n, k), w, ws, xs):
-                if _RANS_M and _stats["rans"] == 0:
-                    for cm in (12, 16):
+                if _RANS_M and (n, k) not in _stats["m_shapes_checked"]:
+                    for cm in (7, 12, 16):
                         gen_m = torch.Generator(device=w.device).manual_seed(n * 137 + k + 19 + cm)
                         xm = (torch.randn(cm, k, generator=gen_m, device=w.device) * 1.5 / xs.float().reshape(1, 1)).clamp(-448, 448).to(torch.float8_e4m3fn)
                         got_m = torch.empty(cm, n, dtype=torch.bfloat16, device=w.device)
-                        ref_lo = torch.empty(8, n, dtype=torch.bfloat16, device=w.device)
-                        ref_hi = torch.empty(cm - 8, n, dtype=torch.bfloat16, device=w.device)
+                        ref_m = torch.empty(cm, n, dtype=torch.bfloat16, device=w.device)
                         _rans.rans_gemm_m_auto(blob, xm, ws.reshape(-1), xs.reshape(-1), got_m, n, k)
-                        _rans.rans_gemm_m_auto(blob, xm[:8].contiguous(), ws.reshape(-1), xs.reshape(-1), ref_lo, n, k)
-                        _rans.rans_gemm_m_auto(blob, xm[8:].contiguous(), ws.reshape(-1), xs.reshape(-1), ref_hi, n, k)
-                        if not (
-                            torch.equal(got_m[:8].view(torch.int16), ref_lo.view(torch.int16))
-                            and torch.equal(got_m[8:].view(torch.int16), ref_hi.view(torch.int16))
-                        ):
-                            raise RuntimeError(f"muserans kM16 self-check mismatch at M={cm}")
+                        for r in range(cm):
+                            _rans.rans_gemv_auto(blob, xm[r].contiguous(), ws.reshape(-1), xs.reshape(-1), ref_m[r], n, k)
+                        if not torch.equal(got_m.view(torch.int16), ref_m.view(torch.int16)):
+                            raise RuntimeError(f"muserans multi-M self-check mismatch at M={cm}, shape=({n},{k})")
+                    _stats["m_shapes_checked"].add((n, k))
+                if (
+                    _RANS_M
+                    and hasattr(_rans, "rans_gemm_m_fused_auto")
+                    and hasattr(_rans, "rans_gemv_fused_auto")
+                    and (n, k) in ((6656, 4096), (6656, 19968))
+                    and (n, k) not in _stats["fused_m_checked"]
+                ):
+                    act_m = 1 if k == 4096 else 2
+                    gen_f = torch.Generator(device=w.device).manual_seed(n * 251 + k + act_m)
+                    for cm in (7, 16):
+                        if act_m == 1:
+                            x0_f = (torch.randn(cm, k, generator=gen_f, device=w.device) * 2.5).to(torch.bfloat16)
+                            x1_f = (torch.randn(cm, k, generator=gen_f, device=w.device) * 2.5).to(torch.bfloat16)
+                        else:
+                            x0_f = (torch.randn(cm, 2 * k, generator=gen_f, device=w.device) * 2.5).to(torch.bfloat16)
+                            x1_f = x0_f
+                        got_f = torch.empty(cm, n, dtype=torch.bfloat16, device=w.device)
+                        ref_f = torch.empty(cm, n, dtype=torch.bfloat16, device=w.device)
+                        _rans.rans_gemm_m_fused_auto(
+                            blob, x0_f, x1_f, ws.reshape(-1), xs.reshape(-1), got_f, n, k, act_m
+                        )
+                        for r in range(cm):
+                            _rans.rans_gemv_fused_auto(
+                                blob,
+                                x0_f[r].contiguous(),
+                                x1_f[r].contiguous(),
+                                ws.reshape(-1),
+                                xs.reshape(-1),
+                                ref_f[r],
+                                n,
+                                k,
+                                act_m,
+                            )
+                        if not torch.equal(got_f.view(torch.int16), ref_f.view(torch.int16)):
+                            raise RuntimeError(
+                                f"muserans tiled fused self-check mismatch at M={cm}, shape=({n},{k}), act={act_m}"
+                            )
+                    _stats["fused_m_checked"].add((n, k))
                 _stats["admitted"] += 1
                 _stats["rans"] += 1
                 # The magic byte 'A' at blob[0] marks the compressed format for the op (one uint8 buffer either way).

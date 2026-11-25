@@ -386,10 +386,12 @@ struct BrProb {
   const uint32_t* lut;
   const uint16_t* x;
   __nv_bfloat16* out;
+  __nv_bfloat16* out2;
   int M;
   int N;
   int K;
   int tw;
+  int nb_split;
   int pdl_mode;
   uint32_t base_m1;
   size_t stream_bytes;
@@ -416,8 +418,28 @@ static int br_pdl_cfg() {
   return mode;
 }
 
-template <bool kPar4, bool kM16 = false>
-__global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
+__device__ __forceinline__ void br_quad_transpose_4x4(
+    int t, uint4 qv, uint32_t& o0, uint32_t& o1, uint32_t& o2, uint32_t& o3) {
+  uint32_t u0 = (t & 1) ? qv.x : qv.y;
+  uint32_t u1 = (t & 1) ? qv.z : qv.w;
+  u0 = __shfl_xor_sync(0xffffffffu, u0, 1);
+  u1 = __shfl_xor_sync(0xffffffffu, u1, 1);
+  const uint32_t p0 = (t & 1) ? u0 : qv.x;
+  const uint32_t p1 = (t & 1) ? qv.y : u0;
+  const uint32_t p2 = (t & 1) ? u1 : qv.z;
+  const uint32_t p3 = (t & 1) ? qv.w : u1;
+  uint32_t v0 = (t & 2) ? p0 : p2;
+  uint32_t v1 = (t & 2) ? p1 : p3;
+  v0 = __shfl_xor_sync(0xffffffffu, v0, 2);
+  v1 = __shfl_xor_sync(0xffffffffu, v1, 2);
+  o0 = (t & 2) ? v0 : p0;
+  o1 = (t & 2) ? v1 : p1;
+  o2 = (t & 2) ? p2 : v0;
+  o3 = (t & 2) ? p3 : v1;
+}
+
+template <bool kPar4, bool kM16 = false, int kTileSteps = 0>
+__global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
   __shared__ __align__(16) uint32_t sh_lut[4096];
   extern __shared__ __align__(16) unsigned char smem[];
 
@@ -427,7 +449,11 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
   const int K = pb.K;
   const int S = K >> 5;
 
-  const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  constexpr bool kTiledXs = (kTileSteps > 0);
+  constexpr uint32_t kXBytes = static_cast<uint32_t>(kTileSteps) * 1024u;
+  uint32_t* const xs32 = reinterpret_cast<uint32_t*>(smem);
+  uint4* const xs_u4 = reinterpret_cast<uint4*>(smem);
+  const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(smem)) + kXBytes;
   const uint32_t ring_s = ((sbase0 + kRB - 1u) & ~(kRB - 1u)) + static_cast<uint32_t>(wib) * kRB;
 
   const int q_w = pb.tw / gridDim.x;
@@ -510,12 +536,38 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
   } else {
     asm volatile("cp.async.wait_group 0;" ::: "memory");
   }
-  __syncthreads();
 
   if (pb.pdl_mode & 1) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
-  if (!active) return;
+
+  const bool x_align16 = ((reinterpret_cast<uintptr_t>(pb.x) & 15u) == 0u);
+  auto fill_bf16_tile = [&](int s_base, int cur_S) {
+    const int n_u4 = cur_S << 6;  // cur_S * 64 uint4s (16 rows x 4 16B quarters)
+#pragma unroll 1
+    for (int u = tid; u < n_u4; u += blockDim.x) {
+      const int s_loc = u >> 6;
+      const int m = (u >> 2) & 15;
+      if (m < pb.M) {
+        const int q = u & 3;
+        const uint16_t* xp = pb.x + static_cast<size_t>(m) * K + 32 * (s_base + s_loc) + 8 * q;
+        const uint4 v = x_align16
+            ? __ldg(reinterpret_cast<const uint4*>(xp))
+            : make_uint4(__ldg(reinterpret_cast<const uint32_t*>(xp)),
+                         __ldg(reinterpret_cast<const uint32_t*>(xp + 2)),
+                         __ldg(reinterpret_cast<const uint32_t*>(xp + 4)),
+                         __ldg(reinterpret_cast<const uint32_t*>(xp + 6)));
+        xs_u4[(s_loc << 6) | (q << 4) | m] = v;
+      }
+    }
+  };
+  if constexpr (kTiledXs) {
+    fill_bf16_tile(0, S < kTileSteps ? S : kTileSteps);
+  }
+  __syncthreads();
+  if constexpr (!kTiledXs) {
+    if (!active) return;
+  }
 
   const int g = lane >> 2;
   const int t = lane & 3;
@@ -527,16 +579,21 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       valid_m ? reinterpret_cast<const uint32_t*>(pb.x + static_cast<size_t>(g) * K + 2 * t) : nullptr;
   const uint32_t* xrow32_hi =
       valid_m_hi ? reinterpret_cast<const uint32_t*>(pb.x + static_cast<size_t>(g + 8) * K + 2 * t) : nullptr;
+  const int quad_m = g + ((t & 2) ? 8 : 0);
+  const bool quad_valid = kM16 ? (quad_m < pb.M) : ((t < 2) && valid_m);
+  const uint16_t* const quad_x_ptr = quad_valid ? (pb.x + static_cast<size_t>(quad_m) * K + ((t & 1) << 3)) : nullptr;
   const uint32_t base_m1 = pb.base_m1;
 
-  asm volatile("cp.async.wait_group %0;" ::"n"(kRG - 2) : "memory");
-  __syncwarp();
   uint32_t st[kNS];
-#pragma unroll
-  for (int s = 0; s < kNS; ++s) {
-    st[s] = br_lds32(ring_s + ((128u * s + 4u * lane) & (kRB - 1u)));
-  }
   uint32_t pwb = 128u * kNS;
+  if (active) {
+    asm volatile("cp.async.wait_group %0;" ::"n"(kRG - 2) : "memory");
+    __syncwarp();
+#pragma unroll
+    for (int s = 0; s < kNS; ++s) {
+      st[s] = br_lds32(ring_s + ((128u * s + 4u * lane) & (kRB - 1u)));
+    }
+  }
 
   if constexpr (kPar4) {
     const uint32_t lane16 = static_cast<uint32_t>(lane) * 16u;
@@ -556,22 +613,59 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
     asm volatile("cp.async.commit_group;" ::: "memory");                                                      \
     issued++;                                                                                                 \
   }
-    for (int nb = w; nb < NB; nb += pb.tw) {
+    const int R_max = kTiledXs ? ((NB + pb.tw - 1) / pb.tw) : 0;
+    for (int r_iter = 0, nb = w; kTiledXs ? (r_iter < R_max) : (nb < NB); ++r_iter, nb += pb.tw) {
+      const bool has_nb = kTiledXs ? (active && (nb < NB)) : true;
       float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
-      const int trig_s = ((pb.pdl_mode & 2) && (nb + pb.tw >= NB)) ? ((S > 16) ? (S - 16) : 0) : -1;
+      const int trig_s = (has_nb && (pb.pdl_mode & 2) && (nb + pb.tw >= NB)) ? ((S > 16) ? (S - 16) : 0) : -1;
       for (int s = 0; s < S; ++s) {
+        if constexpr (kTiledXs) {
+          if ((s & (kTileSteps - 1)) == 0 && (r_iter > 0 || s > 0)) {
+            __syncthreads();
+            fill_bf16_tile(s, (S - s) < kTileSteps ? (S - s) : kTileSteps);
+            __syncthreads();
+          }
+          if (!has_nb) continue;
+        }
         if (s == trig_s) {
           asm volatile("griddepcontrol.launch_dependents;");
         }
-        // Pre-issue 4 (or 8 for kM16) L1/L2 activation loads and all 4 independent LUT loads in parallel.
-        const uint32_t a0 = valid_m ? __ldg(xrow32 + 16 * s) : 0u;
-        const uint32_t a2 = valid_m ? __ldg(xrow32 + 16 * s + 4) : 0u;
-        const uint32_t a4 = valid_m ? __ldg(xrow32 + 16 * s + 8) : 0u;
-        const uint32_t a6 = valid_m ? __ldg(xrow32 + 16 * s + 12) : 0u;
-        const uint32_t a1 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s) : 0u;
-        const uint32_t a3 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 4) : 0u;
-        const uint32_t a5 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 8) : 0u;
-        const uint32_t a7 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 12) : 0u;
+        // Pre-issue activation loads and all 4 independent LUT loads in parallel.
+        uint32_t a0 = 0u, a1 = 0u, a2 = 0u, a3 = 0u, a4 = 0u, a5 = 0u, a6 = 0u, a7 = 0u;
+        if constexpr (kTiledXs) {
+          const int s_loc = s & (kTileSteps - 1);
+          const int b_off = s_loc << 8;
+          if (valid_m) {
+            a0 = xs32[b_off | lane];
+            a2 = xs32[b_off | 64 | lane];
+            a4 = xs32[b_off | 128 | lane];
+            a6 = xs32[b_off | 192 | lane];
+          }
+          if constexpr (kM16) {
+            if (valid_m_hi) {
+              a1 = xs32[b_off | 32 | lane];
+              a3 = xs32[b_off | 96 | lane];
+              a5 = xs32[b_off | 160 | lane];
+              a7 = xs32[b_off | 224 | lane];
+            }
+          }
+        } else if (x_align16) {
+          const uint4 qv0 = quad_valid ? __ldg(reinterpret_cast<const uint4*>(quad_x_ptr + 32 * s))
+                                       : make_uint4(0u, 0u, 0u, 0u);
+          const uint4 qv1 = quad_valid ? __ldg(reinterpret_cast<const uint4*>(quad_x_ptr + 32 * s + 16))
+                                       : make_uint4(0u, 0u, 0u, 0u);
+          br_quad_transpose_4x4(t, qv0, a0, a2, a1, a3);
+          br_quad_transpose_4x4(t, qv1, a4, a6, a5, a7);
+        } else {
+          a0 = valid_m ? __ldg(xrow32 + 16 * s) : 0u;
+          a2 = valid_m ? __ldg(xrow32 + 16 * s + 4) : 0u;
+          a4 = valid_m ? __ldg(xrow32 + 16 * s + 8) : 0u;
+          a6 = valid_m ? __ldg(xrow32 + 16 * s + 12) : 0u;
+          a1 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s) : 0u;
+          a3 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 4) : 0u;
+          a5 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 8) : 0u;
+          a7 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 12) : 0u;
+        }
 
         const uint32_t le0 = sh_lut[st[0] & 4095u];
         const uint32_t le1 = sh_lut[st[1] & 4095u];
@@ -707,22 +801,38 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
           st[3] = n3 ? ((x3 << 16) | r3) : x3;
         }
       }
-      if (valid_m) {
+      if (has_nb && valid_m) {
         __nv_bfloat162 r;
         r.x = __float2bfloat16_rn(c0);
         r.y = __float2bfloat16_rn(c1);
-        *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * pb.N + nb * 8 + 2 * t) = r;
-        if constexpr (kM16) {
-          if (valid_m_hi) {
-            __nv_bfloat162 r2;
-            r2.x = __float2bfloat16_rn(c2);
-            r2.y = __float2bfloat16_rn(c3);
-            *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * pb.N + nb * 8 + 2 * t) = r2;
+        if (pb.out2 != nullptr && nb >= pb.nb_split) {
+          const int n1 = pb.N - pb.nb_split * 8;
+          const int col1 = (nb - pb.nb_split) * 8 + 2 * t;
+          *reinterpret_cast<__nv_bfloat162*>(pb.out2 + static_cast<size_t>(g) * n1 + col1) = r;
+          if constexpr (kM16) {
+            if (valid_m_hi) {
+              __nv_bfloat162 r2;
+              r2.x = __float2bfloat16_rn(c2);
+              r2.y = __float2bfloat16_rn(c3);
+              *reinterpret_cast<__nv_bfloat162*>(pb.out2 + static_cast<size_t>(g + 8) * n1 + col1) = r2;
+            }
+          }
+        } else {
+          const int n0 = (pb.out2 != nullptr) ? (pb.nb_split * 8) : pb.N;
+          const int col0 = nb * 8 + 2 * t;
+          *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * n0 + col0) = r;
+          if constexpr (kM16) {
+            if (valid_m_hi) {
+              __nv_bfloat162 r2;
+              r2.x = __float2bfloat16_rn(c2);
+              r2.y = __float2bfloat16_rn(c3);
+              *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * n0 + col0) = r2;
+            }
           }
         }
       }
     }
-    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    if (active) asm volatile("cp.async.wait_group 0;" ::: "memory");
 #undef BR_ISSUE_FAST
     return;
   }
@@ -838,13 +948,29 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       __nv_bfloat162 r;
       r.x = __float2bfloat16_rn(c0);
       r.y = __float2bfloat16_rn(c1);
-      *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * pb.N + nb * 8 + 2 * t) = r;
-      if constexpr (kM16) {
-        if (valid_m_hi) {
-          __nv_bfloat162 r2;
-          r2.x = __float2bfloat16_rn(c2);
-          r2.y = __float2bfloat16_rn(c3);
-          *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * pb.N + nb * 8 + 2 * t) = r2;
+      if (pb.out2 != nullptr && nb >= pb.nb_split) {
+        const int n1 = pb.N - pb.nb_split * 8;
+        const int col1 = (nb - pb.nb_split) * 8 + 2 * t;
+        *reinterpret_cast<__nv_bfloat162*>(pb.out2 + static_cast<size_t>(g) * n1 + col1) = r;
+        if constexpr (kM16) {
+          if (valid_m_hi) {
+            __nv_bfloat162 r2;
+            r2.x = __float2bfloat16_rn(c2);
+            r2.y = __float2bfloat16_rn(c3);
+            *reinterpret_cast<__nv_bfloat162*>(pb.out2 + static_cast<size_t>(g + 8) * n1 + col1) = r2;
+          }
+        }
+      } else {
+        const int n0 = (pb.out2 != nullptr) ? (pb.nb_split * 8) : pb.N;
+        const int col0 = nb * 8 + 2 * t;
+        *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * n0 + col0) = r;
+        if constexpr (kM16) {
+          if (valid_m_hi) {
+            __nv_bfloat162 r2;
+            r2.x = __float2bfloat16_rn(c2);
+            r2.y = __float2bfloat16_rn(c3);
+            *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * n0 + col0) = r2;
+          }
         }
       }
     }
@@ -922,19 +1048,21 @@ static void br_set_attrs_once() {
   if (done) return;
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   cudaThreadExchangeStreamCaptureMode(&mode);
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       static_cast<int>(kMaxSmem - kLutBytes));
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       static_cast<int>(kMaxSmem - kLutBytes));
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       static_cast<int>(kMaxSmem - kLutBytes));
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       static_cast<int>(kMaxSmem - kLutBytes));
+#define BR_PREP_48K(P4, M16V, TS) \
+  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<P4, M16V, TS>, cudaFuncAttributePreferredSharedMemoryCarveout, 50); \
+  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<P4, M16V, TS>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+  BR_PREP_48K(true, false, 0)
+  BR_PREP_48K(false, false, 0)
+  BR_PREP_48K(true, true, 0)
+  BR_PREP_48K(false, true, 0)
+  BR_PREP_48K(true, true, 8)
+  BR_PREP_48K(true, true, 16)
+#undef BR_PREP_48K
   cudaThreadExchangeStreamCaptureMode(&mode);
   done = true;
 }
 
-template <bool kPar4, bool kM16 = false>
+template <bool kPar4, bool kM16 = false, int kTileSteps = 0>
 static inline void br_launch_k(int blocks, int threads, size_t dsmem, cudaStream_t st, BrProb pb) {
   if ((pb.pdl_mode & 1) != 0) {
     cudaLaunchConfig_t lcfg = {};
@@ -947,11 +1075,49 @@ static inline void br_launch_k(int blocks, int threads, size_t dsmem, cudaStream
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     lcfg.attrs = attr;
     lcfg.numAttrs = 1;
-    cudaError_t err = cudaLaunchKernelEx(&lcfg, br_pair_mma_gemm_kernel<kPar4, kM16>, pb);
+    cudaError_t err = cudaLaunchKernelEx(&lcfg, br_pair_mma_gemm_kernel<kPar4, kM16, kTileSteps>, pb);
     TORCH_CHECK(err == cudaSuccess, "br_pair_mma_gemm_kernel PDL launch failed: ", cudaGetErrorString(err));
   } else {
-    br_pair_mma_gemm_kernel<kPar4, kM16><<<blocks, threads, dsmem, st>>>(pb);
+    br_pair_mma_gemm_kernel<kPar4, kM16, kTileSteps><<<blocks, threads, dsmem, st>>>(pb);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
+static inline void br_dispatch_gemm(const BrCfg& cfg, int M, cudaStream_t st, const BrProb& pb) {
+  TORCH_CHECK(cfg.wpb <= 20, "bf16_rans_gemm: wpb exceeds launch bounds (20)");
+  static const bool par4_en = []() {
+    const char* env = std::getenv("MUSE_BF16_RANS_PAR4");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  static const bool tiled_xs_en = []() {
+    const char* env = std::getenv("MUSE_BF16_RANS_TILED_XS");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  br_set_attrs_once();
+  if (par4_en && M > 8 && tiled_xs_en && cfg.wpb <= 18) {
+    if (cfg.wpb <= 14) {
+      const size_t dsmem = 16384u + kRB + static_cast<size_t>(cfg.wpb) * kRB;
+      br_launch_k<true, true, 16>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    } else {
+      const size_t dsmem = 8192u + kRB + static_cast<size_t>(cfg.wpb) * kRB;
+      br_launch_k<true, true, 8>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    }
+    return;
+  }
+  size_t dsmem = kRB + static_cast<size_t>(cfg.wpb) * kRB;
+  if (cfg.blocks == 48 && dsmem < 40960u) dsmem = 40960u;
+  if (par4_en) {
+    if (M > 8) {
+      br_launch_k<true, true, 0>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    } else {
+      br_launch_k<true, false, 0>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    }
+  } else {
+    if (M > 8) {
+      br_launch_k<false, true, 0>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    } else {
+      br_launch_k<false, false, 0>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    }
   }
 }
 
@@ -1132,39 +1298,20 @@ static void bf16_rans_gemm_into(torch::Tensor x, torch::Tensor blob, torch::Tens
   pb.lut = reinterpret_cast<const uint32_t*>(b + kHdrBytes);
   pb.x = reinterpret_cast<const uint16_t*>(x.data_ptr());
   pb.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  pb.out2 = nullptr;
   pb.M = M;
   pb.N = static_cast<int>(N);
   pb.K = static_cast<int>(K);
   pb.tw = cfg.tw;
+  pb.nb_split = 0;
   const int pdl_cfg = br_pdl_cfg();
   pb.pdl_mode = (pdl_cfg == 2) ? 3 : ((pdl_cfg == 1) ? 1 : 0);
   pb.base_m1 = static_cast<uint32_t>(base_exp) - 1u;
   pb.stream_bytes = (blob_bytes > soff + 64u) ? (blob_bytes - soff - 64u) : 0u;
   pb.tpf_stride = br_tpf_stride();
 
-  TORCH_CHECK(cfg.wpb <= 24, "bf16_rans_gemm_into: wpb exceeds launch bounds (24)");
-  size_t dsmem = kRB + static_cast<size_t>(cfg.wpb) * kRB;
-  if (cfg.blocks == 48 && dsmem < 40960u) dsmem = 40960u;
-  br_set_attrs_once();
-
-  static const bool par4_en = []() {
-    const char* env = std::getenv("MUSE_BF16_RANS_PAR4");
-    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
-  }();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  if (par4_en) {
-    if (M > 8) {
-      br_launch_k<true, true>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-    } else {
-      br_launch_k<true, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-    }
-  } else {
-    if (M > 8) {
-      br_launch_k<false, true>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-    } else {
-      br_launch_k<false, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-    }
-  }
+  br_dispatch_gemm(cfg, M, st, pb);
 }
 
 torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int64_t K, int64_t base_exp) {
@@ -1175,6 +1322,46 @@ torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int
 
 void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp) {
   bf16_rans_gemm_into(x, blob, out, N, K, base_exp);
+}
+
+void bf16_rans_gemm_dual(
+    torch::Tensor x, torch::Tensor blob, torch::Tensor out0, torch::Tensor out1,
+    int64_t N0, int64_t N1, int64_t K, int64_t base_exp) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(),
+              "x must be contiguous CUDA bf16 [M, K]");
+  const int M = static_cast<int>(x.size(0));
+  const int64_t N = N0 + N1;
+  TORCH_CHECK(M >= 1 && M <= 16 && x.size(1) == K && N0 % 8 == 0 && N1 % 8 == 0 && K % 32 == 0, "bad shape");
+  TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "bad blob");
+  TORCH_CHECK(out0.is_cuda() && out0.scalar_type() == torch::kBFloat16 && out0.is_contiguous() && out0.numel() == M * N0, "bad out0");
+  TORCH_CHECK(out1.is_cuda() && out1.scalar_type() == torch::kBFloat16 && out1.is_contiguous() && out1.numel() == M * N1, "bad out1");
+
+  const BrCfg cfg = br_pick_cfg(static_cast<int>(N), static_cast<int>(K));
+  const size_t soff = br_stream_off(cfg.tw);
+  const size_t blob_bytes = static_cast<size_t>(blob.numel());
+  const uint8_t* b = reinterpret_cast<const uint8_t*>(blob.data_ptr());
+
+  BrProb pb;
+  pb.hdr = b;
+  pb.stream = b + soff;
+  pb.woff16 = reinterpret_cast<const int*>(b + br_woff_off());
+  pb.lut = reinterpret_cast<const uint32_t*>(b + kHdrBytes);
+  pb.x = reinterpret_cast<const uint16_t*>(x.data_ptr());
+  pb.out = reinterpret_cast<__nv_bfloat16*>(out0.data_ptr());
+  pb.out2 = reinterpret_cast<__nv_bfloat16*>(out1.data_ptr());
+  pb.M = M;
+  pb.N = static_cast<int>(N);
+  pb.K = static_cast<int>(K);
+  pb.tw = cfg.tw;
+  pb.nb_split = static_cast<int>(N0 / 8);
+  const int pdl_cfg = br_pdl_cfg();
+  pb.pdl_mode = (pdl_cfg == 2) ? 3 : ((pdl_cfg == 1) ? 1 : 0);
+  pb.base_m1 = static_cast<uint32_t>(base_exp) - 1u;
+  pb.stream_bytes = (blob_bytes > soff + 64u) ? (blob_bytes - soff - 64u) : 0u;
+  pb.tpf_stride = br_tpf_stride();
+
+  auto st = c10::cuda::getCurrentCUDAStream().stream();
+  br_dispatch_gemm(cfg, M, st, pb);
 }
 
 int64_t bf16_rans_base(torch::Tensor blob) {

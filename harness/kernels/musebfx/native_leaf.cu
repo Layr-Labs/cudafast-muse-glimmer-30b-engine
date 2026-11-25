@@ -36,15 +36,19 @@ __global__ void native_leaf_prepare_tree_kernel(
   seq_lens[0] = seq_lens[0] + (tree_m - 7);
 }
 
-// 1-level multi-leaf tree setup (rows 7..tree_m-1), launched as 1 warp (<<<1, 32>>>, <2 us):
-//   - dynamic_mode==1 (default, tree_vals!=null, tree_k>=6): provably optimal additive scorer
-//     over all 30 candidates (k in 1..6, rank in 1..5 = #2..#6):
+// 1-level & multi-level (L1..L6) multi-leaf tree setup (rows 7..tree_m-1), 1 warp (<<<1, 32>>>, <2.5 us):
+//   - dynamic_mode==1 (default, tree_vals!=null, tree_k>=6): additive survival-weighted scorer
+//     over all 30 L1 candidates (k in 1..6, rank in 1..5 = #2..#6):
 //       e_{k,r} = exp((z_{k,r} - z_{k,0}) / T), Z_k = sum_{r=0..5} e_{k,r} + c_tail * e_{k,5}
 //       A_0 = 1, A_k = A_{k-1} * (gamma / Z_k), score(k, r) = A_{k-1} * (gamma * e_{k,r} / Z_k)
-//     Uses (tree_m - 7) warp-max passes to place the exact top-(tree_m-7) leaves into rows 7..tree_m-1.
-//   - dynamic_mode==0 (or selftest_mode!=0): static Candidate B topology:
-//     M=12 (5 leaves): (d1#2, d1#3, d2#2, d2#3, d3#2) -> k={1,1,2,2,3}, rank={1,2,1,2,1}
-//     M=16 (9 leaves): + (d1#4, d3#3, d4#2, d5#2)     -> k={1,3,4,5},   rank={3,2,1,1}
+//   - When tree_l2_mode!=0 (sentinel -3, stride 2 packed-nibble ancestor table in leaf_flag):
+//     * Winning L1 leaf at slot r_p (depth k in 1..5) spawns BOTH:
+//         (a) aligned continuation child (parent=r_p, depth=k+1, tok=d_{k+1}#1) at
+//             best_s * l2_couple * min(1, gamma / Z_{k+1}), and
+//         (b) off-by-1 shift recovery child (parent=r_p, depth=k+1, tok=d_k#1, deduped against d_{k+1}#1)
+//             at best_s * shift_couple * min(1, gamma / Z_k).
+//     * Winning L2+ continuation node at slot r_p (depth k in 2..5) spawns deep chain continuation
+//       (L3..L6) at best_s * 0.85 * p_next, preserving alignment/shift mode.
 __global__ void native_leaf_setup_tree_kernel(
     int32_t* __restrict__ leaf_flag,
     const int64_t* __restrict__ tree_top,
@@ -54,21 +58,38 @@ __global__ void native_leaf_setup_tree_kernel(
     int64_t* __restrict__ positions,
     int64_t* __restrict__ saved_leaf_toks,
     int32_t* __restrict__ saved_leaf_k,
+    int32_t* __restrict__ saved_leaf_parent,
     int tree_m,
     int tree_k,
     int selftest_mode,
     int dynamic_mode,
     float inv_temp,
     float tail_c,
-    float gamma) {
+    float gamma,
+    int tree_l2_mode,
+    float l2_couple,
+    int always_active,
+    float shift_couple) {
   const int tid = threadIdx.x;
-  const bool high_acc = (req_acc_state != nullptr && req_acc_state[2] != 0);
+  const bool high_acc = (req_acc_state != nullptr && req_acc_state[2] != 0 && always_active == 0);
+  // Active on rounds 0..1 and whenever rolling mean >= 2.5 (c * 2 >= 5 * r); disables only on r >= 2 && c * 2 < 5 * r.
+  const bool l2_regime_ok = (req_acc_state == nullptr) || (req_acc_state[0] < 2) ||
+                             (req_acc_state[1] * 2 >= 5 * req_acc_state[0]);
+  const float eff_l2_couple = l2_regime_ok ? l2_couple : 0.0f;
+  const float eff_shift_couple = l2_regime_ok ? shift_couple : 0.0f;
+  const bool use_l2 = (tree_l2_mode != 0 && saved_leaf_parent != nullptr && selftest_mode == 0 && dynamic_mode != 0);
 
-  // Chain rows 0..6: plain causal lengths p+1 .. p+7, no KV remap.
+  // Chain rows 0..6: plain causal lengths p+1 .. p+7, zero KV remap.
   if (tid < 7) {
-    leaf_flag[1 + 3 * tid + 0] = tree_m - 1 - tid;
-    leaf_flag[1 + 3 * tid + 1] = -1;
-    leaf_flag[1 + 3 * tid + 2] = -1;
+    if (use_l2) {
+      const int b2 = 1 + 2 * tid;
+      leaf_flag[b2 + 0] = tree_m - 1 - tid;
+      leaf_flag[b2 + 1] = 0;
+    } else {
+      leaf_flag[1 + 3 * tid + 0] = tree_m - 1 - tid;
+      leaf_flag[1 + 3 * tid + 1] = -1;
+      leaf_flag[1 + 3 * tid + 2] = -1;
+    }
   }
 
   const int num_leaves = tree_m - 7;
@@ -94,6 +115,9 @@ __global__ void native_leaf_setup_tree_kernel(
             valid = (top1 == dk && cand >= 0 && cand != dk);
           }
         }
+        if (saved_leaf_parent != nullptr) {
+          saved_leaf_parent[r] = 0;
+        }
         if (valid) {
           any_active = true;
           input_ids[r] = static_cast<int32_t>(cand);
@@ -117,12 +141,20 @@ __global__ void native_leaf_setup_tree_kernel(
     return;
   }
 
-  // Dynamic per-step GPU leaf allocator across 30 candidates (k in 1..6, rank in 1..5).
+  // Dynamic per-step GPU leaf allocator across 30 L1 candidates + coupled L2..L6 & shift children.
+  constexpr int kMaxPool = 64;
   __shared__ float s_Z[6];
   __shared__ float s_A[6];
   __shared__ float s_z0[6];
   __shared__ int64_t s_dk[6];
   __shared__ uint8_t s_valid_row[6];
+  __shared__ float s_pool_score[kMaxPool];
+  __shared__ int64_t s_pool_cand[kMaxPool];
+  __shared__ uint8_t s_pool_k[kMaxPool];
+  __shared__ uint8_t s_pool_parent[kMaxPool];
+  __shared__ uint8_t s_pool_shift[kMaxPool];
+  __shared__ uint32_t s_pool_anc[kMaxPool];
+  __shared__ int s_pool_len;
   __shared__ int s_any_active;
 
   if (tid < 6) {
@@ -153,6 +185,8 @@ __global__ void native_leaf_setup_tree_kernel(
       s_Z[tid] = 1e30f;
     }
   }
+  s_pool_score[tid] = -1.0f;
+  s_pool_score[tid + 32] = -1.0f;
   __syncwarp();
 
   if (tid == 0) {
@@ -166,13 +200,11 @@ __global__ void native_leaf_setup_tree_kernel(
         a = 0.0f;
       }
     }
+    s_pool_len = 30;
     s_any_active = 0;
   }
   __syncwarp();
 
-  float my_score = -1.0f;
-  int my_k = 0;
-  int64_t my_cand = -1;
   if (tid < 30) {
     const int row_idx = tid / 5;                  // 0..5 -> depth k = row_idx + 1
     const int rank = 1 + (tid - row_idx * 5);     // 1..5 -> candidate rank #2..#6
@@ -191,52 +223,143 @@ __global__ void native_leaf_setup_tree_kernel(
         }
       }
       if (ok) {
+        const int k = row_idx + 1;
+        uint32_t base_anc = 0u;
+        for (int j = 0; j < k - 1; ++j) {
+          base_anc |= (static_cast<uint32_t>(j + 1) << (j << 2));
+        }
         const float pr = gamma * __expf((zr - s_z0[row_idx]) * inv_temp) / s_Z[row_idx];
-        my_score = s_A[row_idx] * pr;
-        my_k = row_idx + 1;
-        my_cand = cand;
+        s_pool_score[tid] = s_A[row_idx] * pr;
+        s_pool_cand[tid] = cand;
+        s_pool_k[tid] = static_cast<uint8_t>(k);
+        s_pool_parent[tid] = 0;
+        s_pool_shift[tid] = 0;
+        s_pool_anc[tid] = base_anc;
       }
     }
   }
+  __syncwarp();
 
   for (int li = 0; li < num_leaves; ++li) {
     const int r = 7 + li;
-    float best_s = my_score;
-    int best_lane = tid;
+    const int plen = s_pool_len;
+    float best_s = (tid < plen) ? s_pool_score[tid] : -1.0f;
+    int best_idx = tid;
+    const int i2 = tid + 32;
+    if (i2 < plen) {
+      const float s2 = s_pool_score[i2];
+      if (s2 > best_s) {
+        best_s = s2;
+        best_idx = i2;
+      }
+    }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
       const float os = __shfl_xor_sync(0xffffffffu, best_s, o);
-      const int ol = __shfl_xor_sync(0xffffffffu, best_lane, o);
-      if (os > best_s || (os == best_s && ol < best_lane)) {
+      const int oi = __shfl_xor_sync(0xffffffffu, best_idx, o);
+      if (os > best_s || (os == best_s && oi < best_idx)) {
         best_s = os;
-        best_lane = ol;
+        best_idx = oi;
       }
     }
-    if (best_s > 0.0f) {
-      if (tid == best_lane) {
-        input_ids[r] = static_cast<int32_t>(my_cand);
-        positions[r] = positions[my_k];
-        saved_leaf_toks[r] = my_cand;
-        saved_leaf_k[r] = my_k;
-        leaf_flag[1 + 3 * r + 0] = tree_m - (my_k + 1);
-        leaf_flag[1 + 3 * r + 1] = tree_m - my_k;
-        leaf_flag[1 + 3 * r + 2] = tree_m - r;
+    if (tid == 0) {
+      if (best_s > 0.0f) {
+        s_pool_score[best_idx] = -1.0f;
+        const int64_t win_cand = s_pool_cand[best_idx];
+        const int win_k = static_cast<int>(s_pool_k[best_idx]);
+        const int win_par = static_cast<int>(s_pool_parent[best_idx]);
+        const int win_shift = static_cast<int>(s_pool_shift[best_idx]);
+        const uint32_t cur_anc = s_pool_anc[best_idx] |
+                                 (static_cast<uint32_t>(r) << ((win_k - 1) << 2));
+
+        input_ids[r] = static_cast<int32_t>(win_cand);
+        positions[r] = positions[win_k];
+        saved_leaf_toks[r] = win_cand;
+        saved_leaf_k[r] = win_k;
+        if (saved_leaf_parent != nullptr) {
+          saved_leaf_parent[r] = win_par;
+        }
+        if (use_l2) {
+          const int b2 = 1 + 2 * r;
+          leaf_flag[b2 + 0] = tree_m - (win_k + 1);
+          leaf_flag[b2 + 1] = static_cast<int32_t>(cur_anc);
+        } else {
+          leaf_flag[1 + 3 * r + 0] = tree_m - (win_k + 1);
+          leaf_flag[1 + 3 * r + 1] = tree_m - win_k;
+          leaf_flag[1 + 3 * r + 2] = tree_m - r;
+        }
         s_any_active = 1;
-        my_score = -1.0f;
+
+        if (use_l2 && win_k >= 1 && win_k <= 5) {
+          if (win_par == 0) {
+            int64_t aligned_tok = -1;
+            if (eff_l2_couple > 0.0f && s_valid_row[win_k] && s_pool_len < kMaxPool) {
+              const float p_next0 = fminf(1.0f, gamma / s_Z[win_k]);
+              aligned_tok = s_dk[win_k];
+              if (aligned_tok >= 0 && p_next0 > 0.0f) {
+                const int ci = s_pool_len++;
+                s_pool_score[ci] = best_s * eff_l2_couple * p_next0;
+                s_pool_cand[ci] = aligned_tok;
+                s_pool_k[ci] = static_cast<uint8_t>(win_k + 1);
+                s_pool_parent[ci] = static_cast<uint8_t>(r);
+                s_pool_shift[ci] = 0;
+                s_pool_anc[ci] = cur_anc;
+              }
+            }
+            if (eff_shift_couple > 0.0f && s_valid_row[win_k - 1] && s_pool_len < kMaxPool) {
+              const float p_cur0 = fminf(1.0f, gamma / s_Z[win_k - 1]);
+              const int64_t shift_tok = s_dk[win_k - 1];
+              if (shift_tok >= 0 && shift_tok != aligned_tok && p_cur0 > 0.0f) {
+                const int ci = s_pool_len++;
+                s_pool_score[ci] = best_s * eff_shift_couple * p_cur0;
+                s_pool_cand[ci] = shift_tok;
+                s_pool_k[ci] = static_cast<uint8_t>(win_k + 1);
+                s_pool_parent[ci] = static_cast<uint8_t>(r);
+                s_pool_shift[ci] = 1;
+                s_pool_anc[ci] = cur_anc;
+              }
+            }
+          } else if (eff_l2_couple > 0.0f && s_pool_len < kMaxPool) {
+            // L3..L6 deep chain continuation along aligned (win_shift=0) or shifted (win_shift=1) draft chain.
+            const int src_idx = win_k - win_shift;
+            if (src_idx >= 0 && src_idx < 6 && s_valid_row[src_idx]) {
+              const float p_cont = fminf(1.0f, gamma / s_Z[src_idx]);
+              const int64_t cont_tok = s_dk[src_idx];
+              if (cont_tok >= 0 && p_cont > 0.0f) {
+                const int ci = s_pool_len++;
+                s_pool_score[ci] = best_s * 0.85f * p_cont;
+                s_pool_cand[ci] = cont_tok;
+                s_pool_k[ci] = static_cast<uint8_t>(win_k + 1);
+                s_pool_parent[ci] = static_cast<uint8_t>(r);
+                s_pool_shift[ci] = static_cast<uint8_t>(win_shift);
+                s_pool_anc[ci] = cur_anc;
+              }
+            }
+          }
+        }
+      } else {
+        input_ids[r] = input_ids[0];
+        saved_leaf_toks[r] = -1;
+        saved_leaf_k[r] = 0;
+        if (saved_leaf_parent != nullptr) {
+          saved_leaf_parent[r] = 0;
+        }
+        if (use_l2) {
+          const int b2 = 1 + 2 * r;
+          leaf_flag[b2 + 0] = tree_m - 1 - r;
+          leaf_flag[b2 + 1] = 0;
+        } else {
+          leaf_flag[1 + 3 * r + 0] = tree_m - 1 - r;
+          leaf_flag[1 + 3 * r + 1] = -1;
+          leaf_flag[1 + 3 * r + 2] = -1;
+        }
       }
-    } else if (tid == 0) {
-      input_ids[r] = input_ids[0];
-      saved_leaf_toks[r] = -1;
-      saved_leaf_k[r] = 0;
-      leaf_flag[1 + 3 * r + 0] = tree_m - 1 - r;
-      leaf_flag[1 + 3 * r + 1] = -1;
-      leaf_flag[1 + 3 * r + 2] = -1;
     }
     __syncwarp();
   }
 
   if (tid == 0) {
-    leaf_flag[0] = s_any_active ? -1 : 0;
+    leaf_flag[0] = s_any_active ? (use_l2 ? -3 : -1) : 0;
   }
 }
 
@@ -245,8 +368,10 @@ __global__ void native_leaf_commit_tree_kernel(
     int32_t* __restrict__ prev_ns,
     int32_t* __restrict__ hit_flag,
     int32_t* __restrict__ hit_src_row,
+    int hit_buf_len,
     const int64_t* __restrict__ saved_leaf_toks,
     const int32_t* __restrict__ saved_leaf_k,
+    const int32_t* __restrict__ saved_leaf_parent,
     const int64_t* __restrict__ leaf_u_toks,
     int64_t* __restrict__ sampled_tokens,
     int32_t* __restrict__ num_sampled,
@@ -260,19 +385,44 @@ __global__ void native_leaf_commit_tree_kernel(
   leaf_flag[0] = 0;  // Clear immediately so non-tree steps see 0.
   int32_t ns = num_sampled[0];
   int32_t nr = num_rejected[0];
-  int32_t hit_dst = 0;
-  int32_t hit_src = 0;
+  int nhits = 0;
+  int32_t hit_dst[6] = {0, 0, 0, 0, 0, 0};
+  int32_t hit_src[6] = {0, 0, 0, 0, 0, 0};
 
-  // Supports hits at ALL draft depths k = 1..6 (including k=6 promoting ns=6 -> 7, nr=0).
+  // Supports L1 hits at ALL draft depths k = 1..6 AND multi-level (L2..L6) chain/shift hits (ns <= 7).
   if (mode < 0 && ns >= 1 && ns <= 6 && no_hit_mode == 0) {
     const int64_t tok_k = sampled_tokens[ns - 1];
     for (int r = 7; r < tree_m; ++r) {
-      if (saved_leaf_k[r] == ns && saved_leaf_toks[r] >= 0 && tok_k == saved_leaf_toks[r]) {
-        sampled_tokens[ns] = leaf_u_toks[r - 7];
-        hit_dst = ns;
-        hit_src = r;
+      const int par = (saved_leaf_parent != nullptr) ? saved_leaf_parent[r] : 0;
+      if (par == 0 && saved_leaf_k[r] == ns && saved_leaf_toks[r] >= 0 && tok_k == saved_leaf_toks[r]) {
+        int64_t u_cur = leaf_u_toks[r - 7];
+        sampled_tokens[ns] = u_cur;
+        hit_dst[0] = ns;
+        hit_src[0] = r;
+        nhits = 1;
         ns += 1;
         nr -= 1;
+        int r_cur = r;
+        while (mode <= -2 && saved_leaf_parent != nullptr && nhits < hit_buf_len &&
+               nhits < 6 && ns <= 6 && nr >= 1) {
+          bool found_child = false;
+          for (int rc = r_cur + 1; rc < tree_m; ++rc) {
+            if (saved_leaf_parent[rc] == r_cur && saved_leaf_k[rc] == ns &&
+                saved_leaf_toks[rc] >= 0 && u_cur == saved_leaf_toks[rc]) {
+              u_cur = leaf_u_toks[rc - 7];
+              sampled_tokens[ns] = u_cur;
+              hit_dst[nhits] = ns;
+              hit_src[nhits] = rc;
+              nhits += 1;
+              ns += 1;
+              nr -= 1;
+              r_cur = rc;
+              found_child = true;
+              break;
+            }
+          }
+          if (!found_child) break;
+        }
         num_sampled[0] = ns;
         num_rejected[0] = nr;
         break;
@@ -280,8 +430,10 @@ __global__ void native_leaf_commit_tree_kernel(
     }
   }
 
-  hit_flag[0] = hit_dst;
-  hit_src_row[0] = hit_src;
+  for (int h = 0; h < hit_buf_len; ++h) {
+    hit_flag[h] = (h < 6) ? hit_dst[h] : 0;
+    hit_src_row[h] = (h < 6) ? hit_src[h] : 0;
+  }
   prev_ns[0] = ns;
 
   if (req_acc_state != nullptr) {
@@ -298,13 +450,16 @@ __global__ void native_leaf_commit_tree_kernel(
   if (stats != nullptr && stats_len >= 4) {
     stats[0] += 1;
     if (mode < 0) stats[1] += 1;
-    if (hit_dst > 0) {
+    if (nhits > 0) {
       stats[2] += 1;
-      if (stats_len >= 10 && hit_dst >= 1 && hit_dst <= 6) {
-        stats[3 + hit_dst] += 1;  // stats[4..9] = hits at depth k=1..6
+      if (stats_len >= 10 && hit_dst[0] >= 1 && hit_dst[0] <= 6) {
+        stats[3 + hit_dst[0]] += 1;  // stats[4..9] = L1 hits at depth k=1..6
       }
-      if (stats_len >= 19 && hit_src >= 7 && hit_src < 16) {
-        stats[10 + (hit_src - 7)] += 1;  // stats[10..18] = hits by leaf slot 0..8
+      if (stats_len >= 19 && hit_src[0] >= 7 && hit_src[0] < 16) {
+        stats[10 + (hit_src[0] - 7)] += 1;  // stats[10..18] = L1 hits by leaf slot 0..8
+      }
+      if (stats_len >= 20 && nhits >= 2) {
+        stats[19] += (nhits - 1);  // stats[19] = extra L2..L6 continuation tokens committed
       }
     }
   }
@@ -469,11 +624,13 @@ __global__ void native_leaf_commit_kernel(
   }
 }
 
-// Copies row `src_row` (or `src_row_ptr[0]` if non-null) -> row `dst_row = hit_flag[0]` across up to 8 tensors.
+// Copies row `src_row` (or `src_row_ptr[0..hit_len-1]` if non-null) -> row `dst_row = hit_flag[0..hit_len-1]` across up to 8 tensors.
+// Note 1 <= dst_h <= 6 < 7 <= src_h <= 15 on L1..L6 hits, so all src and dst rows are strictly disjoint.
 // Grid: (num_tensors), Block: 256 threads. Early-exits in ~1 us when hit_flag[0] == 0.
 __global__ void native_leaf_fix_hidden_kernel(
     const int32_t* __restrict__ hit_flag,
     const int32_t* __restrict__ src_row_ptr,
+    int hit_len,
     const uint64_t* __restrict__ tensor_ptrs,
     int num_tensors,
     int64_t row_stride_u4,
@@ -491,16 +648,30 @@ __global__ void native_leaf_fix_hidden_kernel(
   for (int64_t i = threadIdx.x; i < copy_u4; i += blockDim.x) {
     dst[i] = src[i];
   }
+  if (src_row_ptr != nullptr) {
+    for (int h = 1; h < hit_len; ++h) {
+      const int dh = hit_flag[h];
+      const int sh = src_row_ptr[h];
+      if (dh <= 0 || sh <= 0) break;
+      uint4* p_dst = base + static_cast<int64_t>(dh) * row_stride_u4;
+      const uint4* p_src = base + static_cast<int64_t>(sh) * row_stride_u4;
+      for (int64_t i = threadIdx.x; i < copy_u4; i += blockDim.x) {
+        p_dst[i] = p_src[i];
+      }
+    }
+  }
 }
 
-// Copies KV cache slot(p+src_row) -> slot(p+dst_row) for both KV heads (K+V = 1024 B/layer)
-// across all target GQA-16 layers in a single launch.
+// Copies KV cache slot(p+src_row) -> slot(p+dst_row) (plus L2..L6 continuation hits)
+// for both KV heads (K+V = 1024 B/layer) across all target GQA-16 layers in a single launch.
 // Grid: (num_layers), Block: 64 threads (1 uint4 per thread -> 2 heads x 32 uint4 = 1024 B).
 __global__ void native_leaf_fix_kv_all_layers_kernel(
     const int32_t* __restrict__ hit_flag,
     const int32_t* __restrict__ src_row_ptr,
+    int hit_len,
     const int64_t* __restrict__ slot_mappings,
     int64_t slot_stride,
+    int64_t slot_cols,
     const uint64_t* __restrict__ kv_ptrs,
     const int64_t* __restrict__ stride_block,
     const int64_t* __restrict__ stride_head,
@@ -512,20 +683,14 @@ __global__ void native_leaf_fix_kv_all_layers_kernel(
   const int dst_row = hit_flag[0];
   if (dst_row <= 0) return;
   const int eff_src = (src_row_ptr != nullptr) ? src_row_ptr[0] : src_row;
-  if (eff_src <= 0) return;
+  if (eff_src <= 0 || dst_row >= slot_cols || eff_src >= slot_cols) return;
   const int L = blockIdx.x;
   if (L >= num_layers) return;
   const int gi = layer_gid[L];
   const int64_t s_dst = slot_mappings[static_cast<int64_t>(gi) * slot_stride + dst_row];
   const int64_t s_src = slot_mappings[static_cast<int64_t>(gi) * slot_stride + eff_src];
-  if (s_dst < 0 || s_src < 0) return;
 
   const int64_t bs = static_cast<int64_t>(block_size[L]);
-  const int64_t blk_dst = s_dst / bs;
-  const int64_t off_dst = s_dst - blk_dst * bs;
-  const int64_t blk_src = s_src / bs;
-  const int64_t off_src = s_src - blk_src * bs;
-
   const int t = threadIdx.x;
   const int h = t >> 5;     // 0 or 1 (2 KV heads)
   const int vec = t & 31;   // 0..31 (32 * 16B = 512B = 256 bf16 = 128 K + 128 V)
@@ -535,9 +700,34 @@ __global__ void native_leaf_fix_kv_all_layers_kernel(
   const int64_t sH = stride_head[L];
   const int64_t sS = stride_slot[L];
 
-  uint4* dst = reinterpret_cast<uint4*>(kv + blk_dst * sB + h * sH + off_dst * sS);
-  const uint4* src = reinterpret_cast<const uint4*>(kv + blk_src * sB + h * sH + off_src * sS);
-  dst[vec] = src[vec];
+  if (s_dst >= 0 && s_src >= 0) {
+    const int64_t blk_dst = s_dst / bs;
+    const int64_t off_dst = s_dst - blk_dst * bs;
+    const int64_t blk_src = s_src / bs;
+    const int64_t off_src = s_src - blk_src * bs;
+    uint4* dst = reinterpret_cast<uint4*>(kv + blk_dst * sB + h * sH + off_dst * sS);
+    const uint4* src = reinterpret_cast<const uint4*>(kv + blk_src * sB + h * sH + off_src * sS);
+    dst[vec] = src[vec];
+  }
+
+  if (src_row_ptr != nullptr) {
+    for (int m = 1; m < hit_len; ++m) {
+      const int dm = hit_flag[m];
+      const int sm = src_row_ptr[m];
+      if (dm <= 0 || sm <= 0 || dm >= slot_cols || sm >= slot_cols) break;
+      const int64_t s_dm = slot_mappings[static_cast<int64_t>(gi) * slot_stride + dm];
+      const int64_t s_sm = slot_mappings[static_cast<int64_t>(gi) * slot_stride + sm];
+      if (s_dm >= 0 && s_sm >= 0) {
+        const int64_t blk_dm = s_dm / bs;
+        const int64_t off_dm = s_dm - blk_dm * bs;
+        const int64_t blk_sm = s_sm / bs;
+        const int64_t off_sm = s_sm - blk_sm * bs;
+        uint4* p_dst = reinterpret_cast<uint4*>(kv + blk_dm * sB + h * sH + off_dm * sS);
+        const uint4* p_src = reinterpret_cast<const uint4*>(kv + blk_sm * sB + h * sH + off_sm * sS);
+        p_dst[vec] = p_src[vec];
+      }
+    }
+  }
 }
 
 }  // namespace
@@ -581,9 +771,15 @@ void native_leaf_setup_tree(
     bool dynamic_mode,
     double temp,
     double tail_c,
-    double gamma) {
+    double gamma,
+    c10::optional<torch::Tensor> saved_leaf_parent,
+    bool tree_l2_mode,
+    double l2_couple,
+    bool always_active,
+    double shift_couple) {
   TORCH_CHECK(tree_m >= 8 && tree_m <= 16, "tree_m must be in 8..16");
-  TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32 && leaf_flag.numel() >= 1 + tree_m * 3);
+  const int64_t min_lf = tree_l2_mode ? (1 + tree_m * 2) : (1 + tree_m * 3);
+  TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32 && leaf_flag.numel() >= min_lf);
   TORCH_CHECK(tree_top.is_cuda() && tree_top.scalar_type() == torch::kInt64 && tree_top.numel() >= 20);
   TORCH_CHECK(input_ids.is_cuda() && input_ids.scalar_type() == torch::kInt32 && input_ids.numel() >= tree_m);
   TORCH_CHECK(positions.is_cuda() && positions.scalar_type() == torch::kInt64 && positions.numel() >= tree_m);
@@ -591,6 +787,12 @@ void native_leaf_setup_tree(
               saved_leaf_toks.numel() >= tree_m);
   TORCH_CHECK(saved_leaf_k.is_cuda() && saved_leaf_k.scalar_type() == torch::kInt32 &&
               saved_leaf_k.numel() >= tree_m);
+  int32_t* parent_ptr = nullptr;
+  if (saved_leaf_parent.has_value() && saved_leaf_parent.value().defined() &&
+      saved_leaf_parent.value().numel() >= tree_m) {
+    TORCH_CHECK(saved_leaf_parent.value().is_cuda() && saved_leaf_parent.value().scalar_type() == torch::kInt32);
+    parent_ptr = saved_leaf_parent.value().data_ptr<int32_t>();
+  }
   const int tree_k = (tree_top.numel() >= 36) ? 6 : 4;
   const int32_t* acc_ptr = nullptr;
   if (req_acc_state.has_value() && req_acc_state.value().defined() && req_acc_state.value().numel() >= 3) {
@@ -605,6 +807,8 @@ void native_leaf_setup_tree(
   const float eff_temp = (temp > 1e-3) ? static_cast<float>(temp) : 1.35f;
   const float eff_tail = (tail_c >= 0.0) ? static_cast<float>(tail_c) : 4.0f;
   const float eff_gamma = (gamma > 0.0 && gamma <= 1.0) ? static_cast<float>(gamma) : 0.92f;
+  const float eff_couple = (l2_couple >= 0.0) ? static_cast<float>(l2_couple) : 0.0f;
+  const float eff_shift = (shift_couple >= 0.0) ? static_cast<float>(shift_couple) : 0.0f;
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   native_leaf_setup_tree_kernel<<<1, 32, 0, st>>>(
       leaf_flag.data_ptr<int32_t>(),
@@ -615,13 +819,18 @@ void native_leaf_setup_tree(
       positions.data_ptr<int64_t>(),
       saved_leaf_toks.data_ptr<int64_t>(),
       saved_leaf_k.data_ptr<int32_t>(),
+      parent_ptr,
       static_cast<int>(tree_m),
       tree_k,
       static_cast<int>(selftest_mode),
       dynamic_mode ? 1 : 0,
       1.0f / eff_temp,
       eff_tail,
-      eff_gamma);
+      eff_gamma,
+      (tree_l2_mode && parent_ptr != nullptr) ? 1 : 0,
+      eff_couple,
+      always_active ? 1 : 0,
+      eff_shift);
 }
 
 void native_leaf_commit_tree(
@@ -638,12 +847,13 @@ void native_leaf_commit_tree(
     int64_t tree_m,
     c10::optional<torch::Tensor> stats,
     bool no_hit_mode,
-    c10::optional<torch::Tensor> req_acc_state) {
+    c10::optional<torch::Tensor> req_acc_state,
+    c10::optional<torch::Tensor> saved_leaf_parent) {
   TORCH_CHECK(tree_m >= 8 && tree_m <= 16, "tree_m must be in 8..16");
   TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32);
   TORCH_CHECK(prev_ns.is_cuda() && prev_ns.scalar_type() == torch::kInt32);
-  TORCH_CHECK(hit_flag.is_cuda() && hit_flag.scalar_type() == torch::kInt32);
-  TORCH_CHECK(hit_src_row.is_cuda() && hit_src_row.scalar_type() == torch::kInt32);
+  TORCH_CHECK(hit_flag.is_cuda() && hit_flag.scalar_type() == torch::kInt32 && hit_flag.numel() >= 1);
+  TORCH_CHECK(hit_src_row.is_cuda() && hit_src_row.scalar_type() == torch::kInt32 && hit_src_row.numel() >= 1);
   TORCH_CHECK(saved_leaf_toks.is_cuda() && saved_leaf_toks.scalar_type() == torch::kInt64 &&
               saved_leaf_toks.numel() >= tree_m);
   TORCH_CHECK(saved_leaf_k.is_cuda() && saved_leaf_k.scalar_type() == torch::kInt32 &&
@@ -654,6 +864,13 @@ void native_leaf_commit_tree(
               sampled_tokens.numel() >= 7);
   TORCH_CHECK(num_sampled.is_cuda() && num_sampled.scalar_type() == torch::kInt32);
   TORCH_CHECK(num_rejected.is_cuda() && num_rejected.scalar_type() == torch::kInt32);
+  const int hit_buf_len = static_cast<int>(std::min(hit_flag.numel(), hit_src_row.numel()));
+  const int32_t* parent_ptr = nullptr;
+  if (saved_leaf_parent.has_value() && saved_leaf_parent.value().defined() &&
+      saved_leaf_parent.value().numel() >= tree_m) {
+    TORCH_CHECK(saved_leaf_parent.value().is_cuda() && saved_leaf_parent.value().scalar_type() == torch::kInt32);
+    parent_ptr = saved_leaf_parent.value().data_ptr<int32_t>();
+  }
   int64_t* stats_ptr = nullptr;
   int stats_len = 0;
   if (stats.has_value() && stats.value().defined() && stats.value().numel() >= 4) {
@@ -672,8 +889,10 @@ void native_leaf_commit_tree(
       prev_ns.data_ptr<int32_t>(),
       hit_flag.data_ptr<int32_t>(),
       hit_src_row.data_ptr<int32_t>(),
+      hit_buf_len,
       saved_leaf_toks.data_ptr<int64_t>(),
       saved_leaf_k.data_ptr<int32_t>(),
+      parent_ptr,
       leaf_u_toks.data_ptr<int64_t>(),
       sampled_tokens.data_ptr<int64_t>(),
       num_sampled.data_ptr<int32_t>(),
@@ -792,21 +1011,24 @@ void native_leaf_fix_hidden(
     int64_t copy_bytes,
     int64_t src_row,
     c10::optional<torch::Tensor> src_row_buf) {
-  TORCH_CHECK(hit_flag.is_cuda() && hit_flag.scalar_type() == torch::kInt32);
+  TORCH_CHECK(hit_flag.is_cuda() && hit_flag.scalar_type() == torch::kInt32 && hit_flag.numel() >= 1);
   TORCH_CHECK(tensor_ptrs.is_cuda() && tensor_ptrs.scalar_type() == torch::kInt64);
   const int num_tensors = static_cast<int>(tensor_ptrs.numel());
   if (num_tensors <= 0 || copy_bytes <= 0) return;
   TORCH_CHECK((row_stride_bytes & 15) == 0 && (copy_bytes & 15) == 0,
               "native_leaf_fix_hidden requires 16-byte aligned row stride and copy size");
   const int32_t* src_ptr = nullptr;
+  int hit_len = 1;
   if (src_row_buf.has_value() && src_row_buf.value().defined() && src_row_buf.value().numel() >= 1) {
     TORCH_CHECK(src_row_buf.value().is_cuda() && src_row_buf.value().scalar_type() == torch::kInt32);
     src_ptr = src_row_buf.value().data_ptr<int32_t>();
+    hit_len = static_cast<int>(std::min(hit_flag.numel(), src_row_buf.value().numel()));
   }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   native_leaf_fix_hidden_kernel<<<num_tensors, 256, 0, st>>>(
       hit_flag.data_ptr<int32_t>(),
       src_ptr,
+      hit_len,
       reinterpret_cast<const uint64_t*>(tensor_ptrs.data_ptr<int64_t>()),
       num_tensors,
       row_stride_bytes >> 4,
@@ -825,22 +1047,26 @@ void native_leaf_fix_kv(
     torch::Tensor layer_gid,
     int64_t src_row,
     c10::optional<torch::Tensor> src_row_buf) {
-  TORCH_CHECK(hit_flag.is_cuda() && hit_flag.scalar_type() == torch::kInt32);
+  TORCH_CHECK(hit_flag.is_cuda() && hit_flag.scalar_type() == torch::kInt32 && hit_flag.numel() >= 1);
   TORCH_CHECK(slot_mappings.is_cuda() && slot_mappings.scalar_type() == torch::kInt64 &&
               slot_mappings.dim() == 2 && slot_mappings.size(1) > src_row && slot_mappings.stride(1) == 1);
   const int num_layers = static_cast<int>(kv_ptrs.numel());
   if (num_layers <= 0) return;
   const int32_t* src_ptr = nullptr;
+  int hit_len = 1;
   if (src_row_buf.has_value() && src_row_buf.value().defined() && src_row_buf.value().numel() >= 1) {
     TORCH_CHECK(src_row_buf.value().is_cuda() && src_row_buf.value().scalar_type() == torch::kInt32);
     src_ptr = src_row_buf.value().data_ptr<int32_t>();
+    hit_len = static_cast<int>(std::min(hit_flag.numel(), src_row_buf.value().numel()));
   }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   native_leaf_fix_kv_all_layers_kernel<<<num_layers, 64, 0, st>>>(
       hit_flag.data_ptr<int32_t>(),
       src_ptr,
+      hit_len,
       slot_mappings.data_ptr<int64_t>(),
       slot_mappings.stride(0),
+      slot_mappings.size(1),
       reinterpret_cast<const uint64_t*>(kv_ptrs.data_ptr<int64_t>()),
       stride_block.data_ptr<int64_t>(),
       stride_head.data_ptr<int64_t>(),

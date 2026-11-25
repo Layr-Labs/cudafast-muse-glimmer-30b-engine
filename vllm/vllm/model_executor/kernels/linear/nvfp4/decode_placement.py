@@ -76,6 +76,8 @@ ATTN_SURPLUS = float(os.environ.get("MUSE_ATTN_PLACEMENT_SURPLUS", "2.5"))
 
 def _drop_model_page_cache() -> None:
     """Release clean checkpoint file pages back to Linux free memory on unified-RAM hosts."""
+    if os.environ.get("MUSE_KEEP_PAGECACHE", "0").strip() not in ("0", "", "false", "no"):
+        return
     if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
         return
     model_dir = os.environ.get("RESIDENT_MODEL_DIR", "")
@@ -952,9 +954,36 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             torch.cuda.empty_cache()
 
 
+def _run_post_decode_registrations(model: torch.nn.Module) -> None:
+    if hasattr(model, "register_stacked_bf16_attn"):
+        try:
+            model.register_stacked_bf16_attn()
+            torch.cuda.synchronize()
+        except Exception as err:  # noqa: BLE001
+            logger.warning("Stacked BF16 attn post-placement registration skipped: %s", err)
+    try:
+        import muse_marlin6_gemv as _m6
+    except Exception as err:  # noqa: BLE001
+        logger.warning("Decode6 import for post-placement registration skipped: %s", err)
+        return
+    if hasattr(_m6, "register_all_gate_up_swiglu"):
+        try:
+            _m6.register_all_gate_up_swiglu(model)
+        except Exception as err:  # noqa: BLE001
+            logger.warning("Decode6 gate_up_swiglu registration skipped: %s", err)
+    if hasattr(_m6, "register_all_oproj_sigmoid"):
+        try:
+            _m6.register_all_oproj_sigmoid(model)
+        except Exception as err:  # noqa: BLE001
+            logger.warning("Decode6 oproj_sigmoid registration skipped: %s", err)
+
+
 def place_decode_weights(model: torch.nn.Module) -> None:
     """Move decode weights that landed on slow device memory; never raises."""
-    if not ENABLED or not torch.cuda.is_available():
+    if not torch.cuda.is_available():
+        return
+    if not ENABLED:
+        _run_post_decode_registrations(model)
         return
     try:
         from muse_marlin_gemv import decode_linear
@@ -1323,15 +1352,7 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             "Decode weight placement: %d groups, timed GEMV sum reduced by %.3f ms per token, %.2f s",
             n_groups, saved_ms, time.perf_counter() - began,
         )
-        try:
-            import muse_marlin6_gemv as _m6
-            if hasattr(_m6, "register_all_gate_up_swiglu"):
-                _m6.register_all_gate_up_swiglu(model)
-            if hasattr(_m6, "register_all_oproj_sigmoid"):
-                _m6.register_all_oproj_sigmoid(model)
-        except Exception as err:  # noqa: BLE001
-            import traceback
-            logger.warning("Decode6 post-placement registration skipped: %s\n%s", err, traceback.format_exc())
+        _run_post_decode_registrations(model)
         _post_reg_done = True
     except Exception as err:  # noqa: BLE001 - the load must go on
         logger.warning("Decode weight placement failed and was skipped: %s", err)
@@ -1341,12 +1362,4 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             _SLOW_HOLD.clear()
             torch.cuda.empty_cache()
     if not _post_reg_done:
-        try:
-            import muse_marlin6_gemv as _m6
-            if hasattr(_m6, "register_all_gate_up_swiglu"):
-                _m6.register_all_gate_up_swiglu(model)
-            if hasattr(_m6, "register_all_oproj_sigmoid"):
-                _m6.register_all_oproj_sigmoid(model)
-        except Exception as err:  # noqa: BLE001
-            import traceback
-            logger.warning("Decode6 post-placement registration skipped: %s\n%s", err, traceback.format_exc())
+        _run_post_decode_registrations(model)
