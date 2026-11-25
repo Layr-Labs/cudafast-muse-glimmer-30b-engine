@@ -20,6 +20,7 @@ Controls:
 """
 from __future__ import annotations
 
+import atexit
 import os
 from typing import Any
 
@@ -53,13 +54,14 @@ _POLICY_RAW = os.environ.get("MUSE_NATIVE_LEAF_POLICY", "d1").strip().lower()
 POLICY = 1 if _POLICY_RAW == "margin" else 0
 MARGIN_ALPHA = float(os.environ.get("MUSE_NATIVE_LEAF_MARGIN_ALPHA", "1.0"))
 TREE_DYNAMIC = os.environ.get("MUSE_TREE_DYNAMIC", "1").strip() not in ("0", "", "false", "no")
-TREE_L2 = os.environ.get("MUSE_TREE_L2", "1").strip() not in ("0", "", "false", "no")
-TREE_L2_COUPLE = float(os.environ.get("MUSE_TREE_L2_COUPLE", "0.45"))
-TREE_SHIFT_COUPLE = float(os.environ.get("MUSE_TREE_SHIFT_COUPLE", "0.20"))
-TREE_ALWAYS_ACTIVE = os.environ.get("MUSE_TREE_ALWAYS_ACTIVE", "0").strip() in ("1", "true", "yes")
 TREE_TEMP = float(os.environ.get("MUSE_TREE_TEMP", "1.35"))
 TREE_TAIL = float(os.environ.get("MUSE_TREE_TAIL", "4.0"))
 TREE_GAMMA = float(os.environ.get("MUSE_TREE_GAMMA", "0.92"))
+TREE_MAX_DEPTH = max(1, min(6, int(os.environ.get("MUSE_TREE_MAX_DEPTH", "6"))))
+TREE_SUB_COEF = float(os.environ.get("MUSE_TREE_SUB_COEF", "0.55"))
+TREE_SHF_COEF = float(os.environ.get("MUSE_TREE_SHF_COEF", "0.20"))
+TREE_CONT_DECAY = float(os.environ.get("MUSE_TREE_CONT_DECAY", "0.88"))
+LEAF_STATS = os.environ.get("MUSE_LEAF_STATS", "0").strip() in ("1", "true", "yes")
 _ST_RAW = os.environ.get("MUSE_NATIVE_LEAF_SELFTEST", "0").strip().lower()
 SELFTEST = 1 if _ST_RAW in ("1", "true", "yes") else (2 if _ST_RAW == "2" else 0)
 NOHIT = os.environ.get("MUSE_NATIVE_LEAF_NOHIT", "0").strip() in ("1", "true", "yes")
@@ -70,22 +72,21 @@ class _NativeLeafState:
         self.ready: bool = False
         self.m8_ready: bool = False
         self.tree_m_ready: int = 0
-        self.tree_l2_ready: bool = False
         self.device: torch.device | None = None
-        self.leaf_flag: torch.Tensor | None = None        # int32[96] shared with muse_gqa16_attn
-        self.prev_ns: torch.Tensor | None = None          # int32[1]
-        self.hit_flag: torch.Tensor | None = None         # int32[2] [dst1, dst2]
-        self.hit_src_row: torch.Tensor | None = None      # int32[2] [src1, src2]
-        self.alt_ids: torch.Tensor | None = None          # int64[4] (d1_b1, d1_b2, d2_b1, d2_b2)
-        self.alt_margins: torch.Tensor | None = None      # float32[2] (margin_d1, margin_d2)
-        self.tree_top: torch.Tensor | None = None         # int64[36] ([6, 6] top-6 for d1..d6)
-        self.tree_vals: torch.Tensor | None = None        # float32[36] ([6, 6] top-6 logits for d1..d6)
-        self.req_acc_state: torch.Tensor | None = None    # int32[3] [rounds, committed, high_acc_flag]
-        self.saved_alt_tok: torch.Tensor | None = None    # int64[1] (legacy M=7/M=8)
-        self.saved_leaf_toks: torch.Tensor | None = None  # int64[16] (tree mode)
-        self.saved_leaf_k: torch.Tensor | None = None     # int32[16] (tree mode)
-        self.saved_leaf_parent: torch.Tensor | None = None  # int32[16] (0=L1, 7..14=parent row for L2)
-        self.stats: torch.Tensor | None = None            # int64[20] [steps, mode, hits, clamps, k1..6, li0..8, l2_hits]
+        self.leaf_flag: torch.Tensor | None = None          # int32[49] shared with muse_gqa16_attn
+        self.prev_ns: torch.Tensor | None = None            # int32[1]
+        self.hit_flag: torch.Tensor | None = None           # int32[14] [dst0, hit_len, dst0, src0, ..., dst5, src5]
+        self.hit_src_row: torch.Tensor | None = None        # int32[1] (0=miss, r=winning initial leaf row 7..15)
+        self.alt_ids: torch.Tensor | None = None            # int64[4] (d1_b1, d1_b2, d2_b1, d2_b2)
+        self.alt_margins: torch.Tensor | None = None        # float32[2] (margin_d1, margin_d2)
+        self.tree_top: torch.Tensor | None = None           # int64[36] ([6, 6] top-6 for d1..d6)
+        self.tree_vals: torch.Tensor | None = None          # float32[36] ([6, 6] top-6 logits for d1..d6)
+        self.req_acc_state: torch.Tensor | None = None      # int32[3] [rounds, committed, high_acc_flag]
+        self.saved_alt_tok: torch.Tensor | None = None      # int64[1] (legacy M=7/M=8)
+        self.saved_leaf_toks: torch.Tensor | None = None    # int64[16] (tree mode)
+        self.saved_leaf_k: torch.Tensor | None = None       # int32[16] (tree mode)
+        self.saved_leaf_parent: torch.Tensor | None = None  # int32[16] (-1=1-level root, 7..15=parent row)
+        self.stats: torch.Tensor | None = None              # int64[32] telemetry counters
         # Static 52-layer target KV metadata for 1-launch all-layer KV fix on hit.
         self.num_layers: int = 0
         self.kv_ptrs: torch.Tensor | None = None
@@ -98,9 +99,27 @@ class _NativeLeafState:
         self._hid_ptr_cache: dict[tuple[int, ...], torch.Tensor] = {}
         self._last_req_id: str | None = None
         self._logged_active: bool = False
+        self._atexit_registered: bool = False
 
 
 _S = _NativeLeafState()
+
+
+def _dump_stats(tag: str) -> None:
+    if not LEAF_STATS or not _S.ready or _S.stats is None:
+        return
+    try:
+        st = _S.stats.detach().cpu().tolist()
+        if len(st) >= 32 and st[0] > 0:
+            logger.info(
+                "native_leaf_stats[%s]: steps=%d active=%d hits=%d deep_hits=%d extra_toks=%d deep_bonus=%d "
+                "total_ns=%d max_len=%d len1..6=%s k1..6=%s slots0..8=%s reached_d2/3/4+=%d/%d/%d",
+                tag, st[0], st[1], st[2], st[3], st[25], st[26], st[27], st[28],
+                st[19:25], st[4:10], st[10:19], st[29], st[30], st[31],
+            )
+            _S.stats.zero_()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def is_ready() -> bool:
@@ -299,8 +318,8 @@ def init_kv_table(
         _S.leaf_flag = lf
         _S.leaf_flag.zero_()
         _S.prev_ns = torch.full((1,), 7, dtype=torch.int32, device=device)
-        _S.hit_flag = torch.zeros((6,), dtype=torch.int32, device=device)
-        _S.hit_src_row = torch.zeros((6,), dtype=torch.int32, device=device)
+        _S.hit_flag = torch.zeros((14,), dtype=torch.int32, device=device)
+        _S.hit_src_row = torch.zeros((1,), dtype=torch.int32, device=device)
         if (
             _S.alt_ids is None
             or _S.alt_ids.device != device
@@ -341,8 +360,8 @@ def init_kv_table(
         _S.saved_alt_tok = torch.full((1,), -1, dtype=torch.int64, device=device)
         _S.saved_leaf_toks = torch.full((16,), -1, dtype=torch.int64, device=device)
         _S.saved_leaf_k = torch.zeros((16,), dtype=torch.int32, device=device)
-        _S.saved_leaf_parent = torch.zeros((16,), dtype=torch.int32, device=device)
-        _S.stats = torch.zeros((20,), dtype=torch.int64, device=device)
+        _S.saved_leaf_parent = torch.full((16,), -1, dtype=torch.int32, device=device)
+        _S.stats = torch.zeros((32,), dtype=torch.int64, device=device)
         _S.num_layers = len(kv_ptrs)
         _S.kv_ptrs = torch.tensor(kv_ptrs, dtype=torch.int64, device=device)
         _S.stride_block = torch.tensor(s_blk, dtype=torch.int64, device=device)
@@ -364,19 +383,15 @@ def init_kv_table(
             )
             else 0
         )
-        _S.tree_l2_ready = bool(
-            _S.tree_m_ready >= 12
-            and TREE_L2
-            and lf.numel() >= (1 + _S.tree_m_ready * 2)
-            and hasattr(g16, "is_leaf2_verify_admitted")
-            and g16.is_leaf2_verify_admitted(device)
-        )
         _S.ready = True
+        if LEAF_STATS and not _S._atexit_registered:
+            _S._atexit_registered = True
+            atexit.register(_dump_stats, "atexit")
     logger.info(
-        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, l2=%d[c=%.2f,s=%.2f], dynamic=%d [T=%.2f,tail=%.1f,g=%.2f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d)",
-        _S.num_layers, _S.tree_m_ready, int(_S.tree_l2_ready), TREE_L2_COUPLE, TREE_SHIFT_COUPLE,
-        int(TREE_DYNAMIC), TREE_TEMP, TREE_TAIL, TREE_GAMMA,
-        int(_S.m8_ready), _POLICY_RAW, MARGIN_ALPHA, LOW_THRESH, int(SELFTEST), int(NOHIT),
+        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, dynamic=%d [depth<=%d,T=%.2f,tail=%.1f,g=%.2f,sub=%.2f,shf=%.2f,cont=%.2f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d, stats=%d)",
+        _S.num_layers, _S.tree_m_ready, int(TREE_DYNAMIC), TREE_MAX_DEPTH, TREE_TEMP, TREE_TAIL, TREE_GAMMA,
+        TREE_SUB_COEF, TREE_SHF_COEF, TREE_CONT_DECAY,
+        int(_S.m8_ready), _POLICY_RAW, MARGIN_ALPHA, LOW_THRESH, int(SELFTEST), int(NOHIT), int(LEAF_STATS),
     )
     return True
 
@@ -394,6 +409,8 @@ def on_non_leaf_step(req_id: str | None, num_draft_tokens: int) -> None:
     )
     _S.leaf_flag[:1].zero_()
     if req_id is None or req_id != _S._last_req_id or num_draft_tokens == 0:
+        if LEAF_STATS and _S._last_req_id is not None and (req_id != _S._last_req_id or num_draft_tokens == 0):
+            _dump_stats(str(_S._last_req_id))
         _S._last_req_id = req_id
         _S.prev_ns.fill_(7)
         _S.alt_ids.fill_(-1)
@@ -469,6 +486,8 @@ def setup_step(
         _S.leaf_flag[:1].zero_()
         return False
     if req_id != _S._last_req_id:
+        if LEAF_STATS and _S._last_req_id is not None:
+            _dump_stats(str(_S._last_req_id))
         _S._last_req_id = req_id
         _S.prev_ns.fill_(7)
         _S.alt_ids.fill_(-1)
@@ -502,10 +521,10 @@ def setup_step(
                 TREE_TAIL,
                 TREE_GAMMA,
                 _S.saved_leaf_parent,
-                bool(_S.tree_l2_ready and TREE_L2),
-                TREE_L2_COUPLE,
-                TREE_ALWAYS_ACTIVE,
-                TREE_SHIFT_COUPLE,
+                TREE_MAX_DEPTH,
+                TREE_SUB_COEF,
+                TREE_SHF_COEF,
+                TREE_CONT_DECAY,
             )
         except TypeError:
             bfx.native_leaf_setup_tree(
@@ -617,7 +636,6 @@ def commit_and_fix(
             )
         src_row_buf = _S.hit_src_row
     else:
-        _S.hit_flag.zero_()
         bfx.native_leaf_commit(
             _S.leaf_flag,
             _S.prev_ns,

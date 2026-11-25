@@ -162,84 +162,6 @@ __global__ void __launch_bounds__(512) embed_norm_m1(
     }
   }
 }
-
-// Multi-row exact M=1..16 decode embedding + weightless RMSNorm (1 CTA of 512 threads per row).
-// Identical per-row FP32 reduction tree as embed_norm_m1 and ATen's gpu_reduce_kernel<vt0=4>.
-template <typename Id, bool kPdl>
-__global__ void __launch_bounds__(512) embed_norm_m(
-    const Id* __restrict__ ids, const uint2* __restrict__ table, float eps,
-    uint2* __restrict__ out, int width) {
-  if constexpr (kPdl) {
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;");
-  } else {
-    asm volatile("griddepcontrol.launch_dependents;");
-  }
-  __shared__ float smem[512];
-  const int row = static_cast<int>(blockIdx.x);
-  const int t = threadIdx.x;
-  const int vec4 = width >> 2;
-  const long long id = static_cast<long long>(ids[row]);
-  const uint2* row_ptr = table + id * static_cast<size_t>(vec4);
-  uint2* out_row = out + static_cast<size_t>(row) * static_cast<size_t>(vec4);
-
-  float f[4][4];
-  float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-#pragma unroll
-  for (int it = 0; it < 4; ++it) {
-    const int idx = t + it * 512;
-    if (idx < vec4) {
-      const uint2 raw = row_ptr[idx];
-      const float x0 = __uint_as_float(raw.x << 16);
-      const float x1 = __uint_as_float(raw.x & 0xffff0000u);
-      const float x2 = __uint_as_float(raw.y << 16);
-      const float x3 = __uint_as_float(raw.y & 0xffff0000u);
-      f[it][0] = x0;
-      f[it][1] = x1;
-      f[it][2] = x2;
-      f[it][3] = x3;
-      acc0 = __fadd_rn(acc0, __fmul_rn(x0, x0));
-      acc1 = __fadd_rn(acc1, __fmul_rn(x1, x1));
-      acc2 = __fadd_rn(acc2, __fmul_rn(x2, x2));
-      acc3 = __fadd_rn(acc3, __fmul_rn(x3, x3));
-    }
-  }
-  float v = __fadd_rn(__fadd_rn(__fadd_rn(acc0, acc1), acc2), acc3);
-  smem[t] = v;
-#pragma unroll
-  for (int offset = 256; offset >= 32; offset >>= 1) {
-    __syncthreads();
-    if (t < offset) {
-      v = __fadd_rn(v, smem[t + offset]);
-      smem[t] = v;
-    }
-  }
-  __syncthreads();
-  if (t < 32) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, offset));
-    }
-    if (t == 0) {
-      const float factor = static_cast<float>(1.0 / static_cast<double>(width));
-      const float mean = __fmul_rn(v, factor);
-      smem[0] = rsqrtf(__fadd_rn(mean, eps));
-    }
-  }
-  __syncthreads();
-  const float r = smem[0];
-#pragma unroll
-  for (int it = 0; it < 4; ++it) {
-    const int idx = t + it * 512;
-    if (idx < vec4) {
-      const unsigned lo0 = bf16_rne(__fmul_rn(f[it][0], r));
-      const unsigned hi0 = bf16_rne(__fmul_rn(f[it][1], r));
-      const unsigned lo1 = bf16_rne(__fmul_rn(f[it][2], r));
-      const unsigned hi1 = bf16_rne(__fmul_rn(f[it][3], r));
-      out_row[idx] = make_uint2(lo0 | (hi0 << 16), lo1 | (hi1 << 16));
-    }
-  }
-}
 // Exact 1-request C++ CUDA replacement for Triton _post_update_kernel (input_batch.py).
 // Overlaps metadata preloads behind lm_head+lmpost via SM121 PDL, waits before reading
 // sampled_tokens, and immediately triggers single_decode_prep via launch_dependents.
@@ -407,33 +329,6 @@ extern "C" int muse_embed_norm_m1(const void* ids, int ids_64, const void* table
         static_cast<uint2*>(out), width);
   else
     embed_norm_m1<int, false><<<1, 512, 0, stream>>>(
-        static_cast<const int*>(ids), static_cast<const uint2*>(table), eps,
-        static_cast<uint2*>(out), width);
-  return static_cast<int>(cudaGetLastError());
-}
-
-extern "C" int muse_embed_norm_m(const void* ids, int ids_64, const void* table, float eps,
-                                 void* out, int rows, int width, cudaStream_t stream) {
-  if (rows <= 0 || rows > 16 || width <= 0 || (width & 7) != 0 || width > 8192)
-    return cudaErrorInvalidValue;
-  const bool use_pdl = decode_tail_pdl_enabled();
-  if (use_pdl) {
-    if (ids_64)
-      return static_cast<int>(launch_pdl(
-          embed_norm_m<long long, true>, rows, 512, stream,
-          static_cast<const long long*>(ids), static_cast<const uint2*>(table), eps,
-          static_cast<uint2*>(out), width));
-    return static_cast<int>(launch_pdl(
-        embed_norm_m<int, true>, rows, 512, stream,
-        static_cast<const int*>(ids), static_cast<const uint2*>(table), eps,
-        static_cast<uint2*>(out), width));
-  }
-  if (ids_64)
-    embed_norm_m<long long, false><<<rows, 512, 0, stream>>>(
-        static_cast<const long long*>(ids), static_cast<const uint2*>(table), eps,
-        static_cast<uint2*>(out), width);
-  else
-    embed_norm_m<int, false><<<rows, 512, 0, stream>>>(
         static_cast<const int*>(ids), static_cast<const uint2*>(table), eps,
         static_cast<uint2*>(out), width);
   return static_cast<int>(cudaGetLastError());

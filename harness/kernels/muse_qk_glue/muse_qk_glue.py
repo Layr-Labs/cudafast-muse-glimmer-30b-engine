@@ -77,7 +77,6 @@ MULTI_HPW = int(os.environ.get("MUSE_QK_MULTI_HPW", "9"))
 MULTI_MIN_TOKENS = 64
 DECODE_HPW = int(os.environ.get("MUSE_QK_DECODE_HPW", "2"))
 PREFILL_KV_HPW = int(os.environ.get("MUSE_QK_PREFILL_KV_HPW", "6"))
-VERIFY_KV_HPW = int(os.environ.get("MUSE_QK_VERIFY_KV_HPW", "2"))
 FUSE_KVCACHE = os.environ.get("MUSE_QK_FUSE_KVCACHE", "1").strip() not in ("0", "", "false", "no")
 FUSE_KVCACHE_PREFILL = FUSE_KVCACHE and os.environ.get("MUSE_QK_FUSE_KVCACHE_PREFILL", "1").strip() not in ("0", "", "false", "no")
 _multi_state: dict[str, bool | None] = {"admitted": None}
@@ -278,13 +277,12 @@ def self_check(device: torch.device) -> bool:
                                         offs = valid_slots % block_size
                                         kv_ref[blks, :, offs, :128] = k0[valid_mask].view(-1, 2, 128)
                                         kv_ref[blks, :, offs, 128:] = x[valid_mask, 4352:].view(-1, 2, 128)
-                                        hpw_p = VERIFY_KV_HPW if m_p <= 16 else PREFILL_KV_HPW
                                         st1 = _kv_prefill(
                                             x.data_ptr(), p_ptr, c_ptr, q1.data_ptr(),
                                             kv_got.data_ptr(), slots_p.data_ptr(),
                                             m_p, q_first, c_rows, block_size,
                                             kv_got.stride(0), kv_got.stride(2), kv_got.stride(1),
-                                            eps, qscale, int(use_rope), cf32, hpw_p, stream,
+                                            eps, qscale, int(use_rope), cf32, PREFILL_KV_HPW, stream,
                                         )
                                         torch.cuda.synchronize()
                                         if (
@@ -476,12 +474,11 @@ def run_qk_norm_rope_kvcache_prefill(
     q_first_row: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, bool]:
     num_tokens = int(qkv.shape[0]) if qkv.ndim == 2 else -1
-    hpw_use = VERIFY_KV_HPW if num_tokens <= 16 else PREFILL_KV_HPW
     if (
         not FUSE_KVCACHE_PREFILL
         or _kv_prefill is None
         or not _kv_prefill_state.get("admitted")
-        or hpw_use not in (2, 4, 5, 6, 9)
+        or PREFILL_KV_HPW not in (2, 4, 5, 6, 9)
         or qkv.ndim != 2
         or num_tokens <= 1
         or qkv.shape[1] != 4608
@@ -569,7 +566,7 @@ def run_qk_norm_rope_kvcache_prefill(
             float(qscale),
             int(use_rope),
             cache_fp32,
-            hpw_use,
+            PREFILL_KV_HPW,
             stream,
         )
     if st:

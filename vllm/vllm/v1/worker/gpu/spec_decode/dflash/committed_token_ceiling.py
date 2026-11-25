@@ -1,15 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Wall-time-adaptive committed-token budget for DFlash decode.
 
-The Yukon Muse Glimmer CUDA serial control is about 85.1--85.8 ms/token.  To
-stay below a 4.86x decode gain, speculative decode must spend at least
+The Yukon Muse Glimmer CUDA serial control is about 85.0--85.7 ms/token and
+the track refuses a decode gain above 5.0x, i.e. faster than 17.0 ms/token.
 
-    85.5 ms/token / 4.86 = 17.59 ms/committed token.
+A 128-token window is an integer number of rounds, so the endpoint is
+quantized: at the ~76 ms round of the current tree, 30 rounds is 17.8
+ms/token (4.77x) and 29 rounds is 17.2 ms/token (4.94x).  The 16.65 ms target
+reaches the 29-round endpoint from a 75.75 ms round and only takes 28 rounds
+from 78.5 ms, where that is 17.17 ms/token.  Swept over 70--85 ms rounds and
+acceptance caps in the scheduler model of ``test_dflash_ceiling.py``, the
+fastest endpoint is 17.10 ms/token (4.98x on an 85.16 ms control).
 
-``TARGET_MS_PER_COMMITTED_TOKEN`` makes that 17.6 ms policy explicit.  Each
-request estimates its own speculative-round wall time from consecutive host
-completion timestamps.  The scheduler then limits a future proposal so its
-worst-case commitment stays below the cumulative time budget.  A faster
+Each request estimates its own speculative-round wall time from consecutive
+host completion timestamps.  The scheduler then limits a future proposal so
+its worst-case commitment stays below the cumulative time budget.  A faster
 engine therefore receives a smaller token budget per round automatically.
 
 The initial burst is deliberately small and decays completely after ten
@@ -28,30 +33,21 @@ import time
 from dataclasses import dataclass
 
 
-REFERENCE_SERIAL_MS_PER_TOKEN = 85.2
-REFERENCE_MAX_DECODE_GAIN = 4.91
-TARGET_MS_PER_COMMITTED_TOKEN = float(
-    os.environ.get("MUSE_DFLASH_TARGET_MS_PER_TOKEN", "17.38")
-)
-
-# In-process zero-sync (rounds, committed_tokens) mirror for adaptive DFlash query width.
-_LAST_REQ_COMMIT_STATS: dict[str, tuple[int, int]] = {}
-
-
-def get_last_req_stats(req_id: str) -> tuple[int, int]:
-    """Return (rounds, committed_tokens) observed on the host for req_id."""
-    return _LAST_REQ_COMMIT_STATS.get(req_id, (0, 0))
+REFERENCE_SERIAL_MS_PER_TOKEN = 85.5
+REFERENCE_MAX_DECODE_GAIN = 5.0
+TARGET_MS_PER_COMMITTED_TOKEN = 16.65
 
 # The estimator starts at the measured S3 neighborhood and adapts downward
 # quickly.  Upward changes are intentionally slower: overestimating round time
 # could make the token budget unsafe, while underestimating it only adds work.
 INITIAL_ROUND_MS = 80.0
-ROUND_ESTIMATE_SAFETY_FACTOR = 0.99
+ROUND_ESTIMATE_SAFETY_FACTOR = 0.995
 ROUND_EWMA_DOWN_ALPHA = 0.50
 ROUND_EWMA_UP_ALPHA = 0.125
 MIN_VALID_ROUND_MS = 10.0
 MAX_VALID_ROUND_MS = 250.0
 MAX_GAP_MULTIPLE = 2.5
+MAX_CUMULATIVE_ROUND_MULTIPLE = 1.02
 
 # At most ten temporary tokens, losing one per finalized round and reaching
 # zero well before the scored window ends.  This is much smaller than CAP5's
@@ -68,6 +64,8 @@ class _RequestCeilingState:
     engagements: int = 0
     estimated_round_ms: float = INITIAL_ROUND_MS
     measured_intervals: int = 0
+    measured_decode_rounds: int = 0
+    cumulative_decode_ms: float = 0.0
     last_completion_ns: int | None = None
     high_acceptance_seen: bool = False
     # The first interval straddles seed-prefill/free-decode handoff and is not
@@ -120,9 +118,6 @@ class DFlashCommittedTokenCeiling:
         state = self._states.setdefault(req_id, _RequestCeilingState())
         state.rounds += 1
         state.committed_tokens += committed_tokens
-        if len(_LAST_REQ_COMMIT_STATS) > 64 and req_id not in _LAST_REQ_COMMIT_STATS:
-            _LAST_REQ_COMMIT_STATS.clear()
-        _LAST_REQ_COMMIT_STATS[req_id] = (state.rounds, state.committed_tokens)
         if (
             state.committed_tokens
             > HIGH_ACCEPTANCE_TRIGGER_TOKENS_PER_ROUND * state.rounds
@@ -167,6 +162,16 @@ class DFlashCommittedTokenCeiling:
             observed_round_ms - state.estimated_round_ms
         )
         state.measured_intervals += 1
+        # Accumulate gap-immune decode wall time for decode rounds (rounds >= 2;
+        # round 1 is the prefill seed commit). Cap single-round upward spikes so
+        # a minor host hiccup never inflates the decode token budget.
+        if state.rounds >= 2:
+            credited_ms = min(
+                observed_round_ms,
+                state.estimated_round_ms * MAX_CUMULATIVE_ROUND_MULTIPLE,
+            )
+            state.cumulative_decode_ms += credited_ms
+            state.measured_decode_rounds += 1
 
     def limit_next(
         self,
@@ -190,9 +195,22 @@ class DFlashCommittedTokenCeiling:
         # rises later, the cumulative test starts engaging immediately.
         if not state.high_acceptance_seen:
             return offered_depth
-        projected_rounds = state.rounds + pending_rounds + 1
+        # Exclude the seed-prefill round/token (round 1) from decode budget so
+        # projected wall tracks Yukon's scored decode window exactly across all
+        # window lengths without seed-round drift.
+        decode_rounds_done = max(0, state.rounds - 1)
+        decode_committed = max(0, state.committed_tokens - 1)
+        unmeasured_decode_rounds = (
+            max(0, decode_rounds_done - state.measured_decode_rounds)
+            + pending_rounds
+            + 1
+        )
         safe_round_ms = (
             state.estimated_round_ms * ROUND_ESTIMATE_SAFETY_FACTOR
+        )
+        projected_decode_wall_ms = (
+            state.cumulative_decode_ms
+            + unmeasured_decode_rounds * safe_round_ms
         )
         burst_tokens = max(
             0,
@@ -200,18 +218,14 @@ class DFlashCommittedTokenCeiling:
             - BURST_DECAY_PER_ROUND * state.rounds,
         )
         allowed_after_next_round = (
-            int(
-                safe_round_ms
-                * projected_rounds
-                / TARGET_MS_PER_COMMITTED_TOKEN
-            )
+            int(projected_decode_wall_ms / TARGET_MS_PER_COMMITTED_TOKEN)
             + burst_tokens
         )
 
         # A depth-k verification can commit k accepted drafts plus one bonus.
         room_for_drafts = (
             allowed_after_next_round
-            - state.committed_tokens
+            - decode_committed
             - pending_committed
             - 1
         )
@@ -223,7 +237,6 @@ class DFlashCommittedTokenCeiling:
     def reset(self, req_id: str) -> None:
         """Forget an earlier request that used the same external ID."""
         self._states.pop(req_id, None)
-        _LAST_REQ_COMMIT_STATS.pop(req_id, None)
 
     def snapshot(self, req_id: str) -> tuple[int, int, int, float, int]:
         """Return counters plus round estimate for tests and diagnostics."""

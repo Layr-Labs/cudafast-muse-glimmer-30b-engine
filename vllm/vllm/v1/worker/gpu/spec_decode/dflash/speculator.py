@@ -43,34 +43,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
 
-        # Each request emits (bonus + N mask) query tokens, plus optional extra
-        # unsampled bidirectional mask slots inside the m16n8k16 MMA tile.
-        from vllm.model_executor.models.qwen3_dflash import (
-            _is_muse_glimmer_assistant,
-            dflash_has_any_non_causal,
-        )
-
-        _extra_q = (
-            int(os.environ.get("VLLM_MUSE_DFLASH_EXTRA_QUERY", "9"))
-            if _is_muse_glimmer_assistant(self.draft_model_config.hf_config)
-            and os.environ.get("VLLM_MUSE_DFLASH_CAUSAL", "0") == "0"
-            else 0
-        )
-        self.num_query_per_req = (
-            1 + self.num_speculative_steps + max(0, _extra_q)
-        )
-        self.low_acc_query_per_req = 1 + self.num_speculative_steps
-        self.adaptive_q_enabled = (
-            self.num_query_per_req > self.low_acc_query_per_req
-            and os.environ.get("MUSE_DFLASH_ADAPTIVE_Q", "0") != "0"
-        )
-        self.adaptive_q_thresh = float(
-            os.environ.get("MUSE_DFLASH_ADAPTIVE_Q_THRESH", "3.0")
-        )
+        # Each request emits exactly (bonus + N mask) query tokens per step.
+        self.num_query_per_req = 1 + self.num_speculative_steps
 
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
         )
+
+        from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
 
         self.requires_non_causal = dflash_has_any_non_causal(
             self.draft_model_config.hf_config
@@ -115,7 +95,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         ).repeat(self.max_num_reqs)
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
-        self.query_cudagraph_manager_low: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
         self._ctx_kv_cg_entries: dict[tuple, torch.cuda.CUDAGraph] = {}
         self._ctx_kv_cg_rejected: set[tuple] = set()
@@ -124,39 +103,13 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
-        comp_cfg = self.vllm_config.compilation_config
-        max_draft_cg = self.max_num_reqs * self.num_query_per_req
-        need_extra = (
-            comp_cfg.max_cudagraph_capture_size is not None
-            and comp_cfg.max_cudagraph_capture_size > 0
-            and (
-                max_draft_cg > comp_cfg.max_cudagraph_capture_size
-                or (
-                    self.adaptive_q_enabled
-                    and comp_cfg.cudagraph_capture_sizes
-                    and self.low_acc_query_per_req
-                    not in comp_cfg.cudagraph_capture_sizes
-                )
-            )
-        )
-        if need_extra:
-            import copy
-
-            comp_cfg = copy.copy(comp_cfg)
-            extra_sizes = {max_draft_cg}
-            if self.adaptive_q_enabled:
-                extra_sizes.add(self.low_acc_query_per_req)
-            comp_cfg.cudagraph_capture_sizes = sorted(
-                {*(comp_cfg.cudagraph_capture_sizes or ()), *extra_sizes}
-            )
-            comp_cfg.max_cudagraph_capture_size = comp_cfg.cudagraph_capture_sizes[-1]
+        # The draft's attention differs from the target's in causality.
         return replace(
             self.vllm_config,
             attention_config=replace(
                 self.vllm_config.attention_config,
                 use_non_causal=self.requires_non_causal,
             ),
-            compilation_config=comp_cfg,
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -178,20 +131,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             cudagraph_mode = CUDAGraphMode.NONE
 
-        attn_cfg = self.attn_vllm_config
         self.query_cudagraph_manager = DFlashCudaGraphManager(
-            attn_cfg,
+            self.vllm_config,
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
         )
-        if self.adaptive_q_enabled and cudagraph_mode != CUDAGraphMode.NONE:
-            self.query_cudagraph_manager_low = DFlashCudaGraphManager(
-                attn_cfg,
-                self.device,
-                cudagraph_mode,
-                decode_query_len=self.low_acc_query_per_req,
-            )
 
     def capture(self) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
@@ -211,20 +156,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
-        if self.query_cudagraph_manager_low is not None:
-            self.sample_indices.zero_()
-            self.sample_pos.zero_()
-            self.sample_idx_mapping.zero_()
-            self.query_cudagraph_manager_low.capture(
-                self._generate_draft,
-                self.input_buffers,
-                self.block_tables,
-                self.attn_groups,
-                self.kv_cache_config,
-                self.max_model_len,
-                causal=self._group_causal,
-                progress_bar_desc=f"Capturing {self._speculator_name.lower()} low-acc Q={self.low_acc_query_per_req} CUDA graphs",
-            )
 
     def load_draft_model(
         self,
@@ -332,16 +263,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
         num_sample = num_reqs * self.num_speculative_steps
-        if (
-            num_reqs == 1
-            and not self.sample_from_anchor
-            and num_tokens_padded >= 1 + num_sample
-            and last_hidden_states.is_contiguous()
-            and os.environ.get("MUSE_DFLASH_FAST_SAMPLE", "1") != "0"
-        ):
-            sample_hidden_states = last_hidden_states[1 : 1 + num_sample]
-        else:
-            sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
         draft_tokens = self.sample_draft(
@@ -370,14 +292,14 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> dict[str, Any] | None:
         if not self.draft_attn_layer_names:
             return None
-        eff_q = self.num_query_per_req if num_query_per_req is None else num_query_per_req
+        assert num_query_per_req is None  # Omitted for DFlash, read from self instead
         return super()._build_draft_attn_metadata(
             num_reqs,
             num_reqs_padded,
             num_tokens_padded,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             step=step,
-            num_query_per_req=eff_q,
+            num_query_per_req=self.num_query_per_req,
             causal=causal,
             query_start_loc_np=query_start_loc_np,
         )
@@ -412,28 +334,10 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
-        step_q_len = self.num_query_per_req
-        cg_mgr = self.query_cudagraph_manager
-        if (
-            self.adaptive_q_enabled
-            and not dummy_run
-            and not is_profile
-            and num_reqs == 1
-            and self.query_cudagraph_manager_low is not None
-        ):
-            from vllm.v1.worker.gpu.spec_decode.dflash.committed_token_ceiling import (
-                get_last_req_stats,
-            )
-
-            r_cnt, c_cnt = get_last_req_stats(input_batch.req_ids[0])
-            if r_cnt >= 2 and c_cnt < self.adaptive_q_thresh * r_cnt:
-                step_q_len = self.low_acc_query_per_req
-                cg_mgr = self.query_cudagraph_manager_low
-
-        num_query_tokens = num_reqs * step_q_len
+        num_query_tokens = num_reqs * self.num_query_per_req
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
-            max_seq_len + step_q_len, self.max_model_len
+            max_seq_len + self.num_query_per_req, self.max_model_len
         )
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
@@ -442,13 +346,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         # request's query length to include any rejected positions.
         def _build_ctx_hidden() -> torch.Tensor:
             if aux_hidden_states:
-                if (
-                    hasattr(self.model, "combine_aux_into")
-                    and self.model.combine_aux_into(
-                        aux_hidden_states, self.hidden_states[:num_target_tokens]
-                    )
-                ):
-                    return self.hidden_states[:num_target_tokens]
                 if aux_hidden_states[0].shape[0] > num_target_tokens:
                     aux_cat = torch.cat(
                         [h[:num_target_tokens] for h in aux_hidden_states], dim=-1
@@ -509,7 +406,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.block_tables.input_block_tables[gid],
                 self.block_tables.kernel_block_sizes[gid],
                 self.parallel_drafting_token_id,
-                step_q_len,
+                self.num_query_per_req,
                 self.num_speculative_steps,
                 self.max_num_reqs,
                 self.max_num_tokens,
@@ -599,7 +496,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 ran_ctx_graph = True
             elif (
                 cg_key not in self._ctx_kv_cg_rejected
-                and len(self._ctx_kv_cg_entries) < 32
+                and len(self._ctx_kv_cg_entries) < 16
             ):
                 context_hidden_states = _build_ctx_hidden()
                 self.model.precompute_and_store_context_kv(
@@ -640,12 +537,12 @@ class DFlashSpeculator(DraftModelSpeculator):
                 context_slots,
             )
 
-        # Every DFlash step has exactly step_q_len tokens, so we can use FULL CGs
+        # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            cg_mgr,
+            self.query_cudagraph_manager,
             num_reqs,
             num_query_tokens,
-            uniform_token_count=step_q_len,
+            uniform_token_count=self.num_query_per_req,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
@@ -659,16 +556,15 @@ class DFlashSpeculator(DraftModelSpeculator):
         self._prepare_eplb_forward(num_query_tokens)
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            assert cg_mgr is not None
-            cg_mgr.run_fullgraph(batch_desc)
+            assert self.query_cudagraph_manager is not None
+            self.query_cudagraph_manager.run_fullgraph(batch_desc)
         else:
             draft_attn_metadata = self._build_draft_attn_metadata(
                 num_reqs=num_reqs,
                 num_reqs_padded=num_reqs_padded,
                 num_tokens_padded=num_tokens_padded,
                 seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
-                step=step_q_len,
-                num_query_per_req=step_q_len,
+                step=self.num_query_per_req,
                 causal=self._group_causal,
             )
             draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
@@ -794,11 +690,7 @@ def _prepare_dflash_inputs_kernel(
     # Otherwise (DFlash default) the anchor is the bonus token and only the mask tokens
     # at offsets > 0 are sampled from, each AT its own position.
     sample_off = 0 if SAMPLE_FROM_ANCHOR else 1
-    is_sample = (
-        is_query
-        & (query_off >= sample_off)
-        & (query_off < sample_off + num_speculative_steps)
-    )
+    is_sample = is_query & (query_off >= sample_off)
     sample_idx = req_idx * num_speculative_steps + (query_off - sample_off)
     sample_pos = query_pos + 1 if SAMPLE_FROM_ANCHOR else query_pos
     tl.store(out_sample_indices_ptr + sample_idx, query_idx, mask=is_sample)
@@ -844,10 +736,9 @@ def _prepare_dflash_inputs_kernel(
             # captured CG sees PAD slots (no K/V write) for replay sizes
             # larger than the current request count.
             q_pad_start = num_reqs * num_query_per_req
-            q_pad_end = tl.minimum(max_num_tokens, max_num_reqs * num_query_per_req)
-            for i in range(q_pad_start, q_pad_end, BLOCK_SIZE):
+            for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):
                 block = i + tl.arange(0, BLOCK_SIZE)
-                mask = block < q_pad_end
+                mask = block < max_num_tokens
                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
 
 

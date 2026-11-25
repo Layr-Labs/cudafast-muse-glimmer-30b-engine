@@ -238,7 +238,7 @@ class VllmBackend:
 
         spec = speculative_config(cfg)
         if cfg.depth:
-            draft_vocab_size = int(os.environ.get("MUSE_DRAFT_VOCAB_SIZE", "129024"))
+            draft_vocab_size = int(os.environ.get("MUSE_DRAFT_VOCAB_SIZE", "98304"))
             draft_vocab_mode = os.environ.get("MUSE_DRAFT_VOCAB_MODE", "ascii_bpe")
             configure_draft_vocab(cfg.model_dir, draft_vocab_size, draft_vocab_mode)
         # PORT DRIFT (vLLM 0.27.1, Muse Glimmer 30B): a multimodal checkpoint
@@ -381,14 +381,6 @@ class VllmBackend:
     WARMUP_SEED_DECODE_STEPS = 4
 
     def _warm_up(self) -> None:
-        if os.environ.get("RESIDENT_FAST_WARMUP", "0").strip() not in ("0", "", "false", "no"):
-            fast_prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_SEED_TOKENS)]
-            for top_flag in (True, False):
-                self.start(fast_prompt, top_logits=top_flag)
-                for _ in range(self.WARMUP_SEED_DECODE_STEPS):
-                    self.step()
-                self.abort()
-            return
         prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_PROMPT_TOKENS)]
         for i in range(self.WARMUP_ROUNDS):
             # Both request shapes the phases use: the timed phases' greedy-only

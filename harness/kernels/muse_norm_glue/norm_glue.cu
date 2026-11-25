@@ -650,30 +650,6 @@ __global__ void __launch_bounds__(128) mul_silu_slice_bf16_kernel(
   out_all[row * kInterVec8 + col] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
 }
 
-__global__ void __launch_bounds__(128) mul_silu_slice_fp8_kernel(
-    const uint4* __restrict__ gu_all, const float* __restrict__ scale, uint2* __restrict__ out_all) {
-  const int col = blockIdx.x * 128 + threadIdx.x;
-  if (col >= kInterVec8) return;
-  const float inv_s = full_divide(1.0f, __ldg(scale));
-  const size_t row = blockIdx.y;
-  const uint4* gu = gu_all + row * (2 * kInterVec8);
-  const uint4 g = ld16_cs(gu + col);
-  const uint4 u = ld16_cs(gu + col + kInterVec8);
-  const uint32_t gw[4] = {g.x, g.y, g.z, g.w}, uw[4] = {u.x, u.y, u.z, u.w};
-  uint16_t ow[4];
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const float gl = bf_lo(gw[i]), gh = bf_hi(gw[i]);
-    const float ul = bf_lo(uw[i]), uh = bf_hi(uw[i]);
-    const float ql = clamp448(__fmul_rn(__fmul_rn(triton_silu(gl), ul), inv_s));
-    const float qh = clamp448(__fmul_rn(__fmul_rn(triton_silu(gh), uh), inv_s));
-    ow[i] = fp8x2(ql, qh);
-  }
-  const uint32_t lo = static_cast<uint32_t>(ow[0]) | (static_cast<uint32_t>(ow[1]) << 16);
-  const uint32_t hi = static_cast<uint32_t>(ow[2]) | (static_cast<uint32_t>(ow[3]) << 16);
-  out_all[row * kInterVec8 + col] = make_uint2(lo, hi);
-}
-
 // Layer-51 final post-FF norm + residual + model.norm (compiled bf5b0726...):
 //   tensors: (d, res, x, sumsq_x, w_post, w_ff, w_in, out_h2_fp32, out_bf16)
 //   h1 = res + (a * x) * (w_post + 1)             (FMUL, FADD, FMUL, FADD)
@@ -1316,14 +1292,6 @@ int muse_norm_glue_mul_silu_slice_bf16(const void* gu, void* out, int rows, cuda
   const dim3 grid((kInterVec8 + 127) / 128, static_cast<unsigned>(rows));
   mul_silu_slice_bf16_kernel<<<grid, 128, 0, stream>>>(
       static_cast<const uint4*>(gu), static_cast<uint4*>(out));
-  return static_cast<int>(cudaGetLastError());
-}
-
-int muse_norm_glue_mul_silu_slice_fp8(const void* gu, const void* scale, void* out, int rows, cudaStream_t stream) {
-  if (rows <= 0) return -1;
-  const dim3 grid((kInterVec8 + 127) / 128, static_cast<unsigned>(rows));
-  mul_silu_slice_fp8_kernel<<<grid, 128, 0, stream>>>(
-      static_cast<const uint4*>(gu), static_cast<const float*>(scale), static_cast<uint2*>(out));
   return static_cast<int>(cudaGetLastError());
 }
 

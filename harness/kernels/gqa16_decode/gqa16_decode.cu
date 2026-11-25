@@ -271,12 +271,9 @@ __device__ __forceinline__ void issue_kv_tile_async(
     int64_t stride_slot,
     int64_t stride_kv_head,
     int tid,
-    int leaf_remap_dst = -1,
-    int leaf_remap_src = -1,
-    int leaf_remap_dst2 = -1,
-    int leaf_remap_src2 = -1,
-    int leaf_p0 = -1,
-    uint32_t leaf_anc_pack = 0u) {
+    int leaf_remap_base = -1,
+    int leaf_p_start = 0,
+    uint32_t leaf_remap_packed = 0u) {
   int phys_blk0 = 0, slot_base0 = 0;
   const bool half0_any = (tok_base < seqlen_k) && (tok_base + 16 > k_start);
   if (half0_any) {
@@ -294,9 +291,7 @@ __device__ __forceinline__ void issue_kv_tile_async(
   }
 
   const int64_t head_v_off = static_cast<int64_t>(kv_head) * stride_kv_head + (IsV ? 128 : 0);
-  const bool has_remap = ((leaf_anc_pack != 0u) && (tok_base + 32 > leaf_p0 + 1)) ||
-                         ((leaf_remap_dst >= tok_base) && (leaf_remap_dst < tok_base + 32)) ||
-                         ((leaf_remap_dst2 >= tok_base) && (leaf_remap_dst2 < tok_base + 32));
+  const bool has_remap = (leaf_remap_base >= 0) && (tok_base + 32 > leaf_remap_base);
   const bool full_valid = !has_remap && (tok_base >= k_start) && (tok_base + 32 <= seqlen_k) &&
                           ((block_size == 16) || (slot_base0 + 16 <= block_size && slot_base1 + 16 <= block_size));
 
@@ -323,18 +318,9 @@ __device__ __forceinline__ void issue_kv_tile_async(
       const int c = idx & 15;
       const int tok = tok_base + r;
       if (tok >= k_start && tok < seqlen_k) {
-        int tok_eff = tok;
-        if (leaf_anc_pack != 0u) {
-          const uint32_t j = static_cast<uint32_t>(tok - (leaf_p0 + 1));
-          if (j < 6u) {
-            const uint32_t sr = (leaf_anc_pack >> (j << 2)) & 0xFu;
-            if (sr != 0u) tok_eff = leaf_p0 + static_cast<int>(sr);
-          }
-        } else if (tok == leaf_remap_dst) {
-          tok_eff = leaf_remap_src;
-        } else if (tok == leaf_remap_dst2) {
-          tok_eff = leaf_remap_src2;
-        }
+        const int tok_eff = (leaf_remap_base >= 0 && tok >= leaf_remap_base)
+            ? (leaf_p_start + static_cast<int>((leaf_remap_packed >> ((tok - leaf_remap_base) << 2)) & 0xFu))
+            : tok;
         const int lb = (block_size == 16) ? (tok_eff >> 4) : (tok_eff / block_size);
         const int slot = (block_size == 16) ? (tok_eff & 15) : (tok_eff - lb * block_size);
         const int phys_blk = __ldg(block_table + lb);
@@ -2182,12 +2168,9 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
   const int tid_in_grp  = lane & 3;
 
   int seqlen_k = seqused_k_ptr[0];
-  int leaf_remap_dst = -1;
-  int leaf_remap_src = -1;
-  int leaf_remap_dst2 = -1;
-  int leaf_remap_src2 = -1;
-  int leaf_p0 = -1;
-  uint32_t leaf_anc_pack = 0u;
+  int leaf_remap_base = -1;
+  int leaf_p_start = 0;
+  uint32_t leaf_remap_packed = 0u;
   if constexpr (kMultiQDirect) {
     const int q0 = cu_seqlens_q_ptr[0];
     const int actual_m = cu_seqlens_q_ptr[1] - q0;
@@ -2195,57 +2178,35 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
     if (q_idx >= actual_m) return;
     q_ptr += static_cast<int64_t>(q0 + q_idx) * q_tok_stride;
     out_ptr += static_cast<int64_t>(q0 + q_idx) * out_tok_stride;
-    if (leaf_flag_ptr != nullptr && leaf_flag_ptr[0] == -3 && actual_m <= 16 && seqlen_k >= actual_m) {
-      // Generalized multi-level (L1..L6) packed-nibble tree remap table (sentinel leaf_flag_ptr[0] == -3):
-      // entry q_idx sits at [1 + 2*q_idx + {0: seq_sub, 1: anc_pack}].
-      const int base = 1 + q_idx * 2;
-      const int seq_sub = leaf_flag_ptr[base];
-      leaf_p0 = seqlen_k - actual_m;
-      leaf_anc_pack = static_cast<uint32_t>(leaf_flag_ptr[base + 1]);
-      seqlen_k -= seq_sub;
-    } else if (leaf_flag_ptr != nullptr && leaf_flag_ptr[0] == -2 && actual_m <= 16 && seqlen_k >= actual_m) {
-      // Generalized 2-level (L1 + L2) tree remap table (sentinel leaf_flag_ptr[0] == -2):
-      // entry q_idx sits at [1 + 5*q_idx + {0: seq_sub, 1: dst1_sub, 2: src1_sub, 3: dst2_sub, 4: src2_sub}].
-      const int base = 1 + q_idx * 5;
-      const int seq_sub = leaf_flag_ptr[base];
-      const int dst1_sub = leaf_flag_ptr[base + 1];
-      const int src1_sub = leaf_flag_ptr[base + 2];
-      const int dst2_sub = leaf_flag_ptr[base + 3];
-      const int src2_sub = leaf_flag_ptr[base + 4];
-      if (dst1_sub >= 0) {
-        leaf_remap_src = seqlen_k - src1_sub;
-        leaf_remap_dst = seqlen_k - dst1_sub;
-      }
-      if (dst2_sub >= 0) {
-        leaf_remap_src2 = seqlen_k - src2_sub;
-        leaf_remap_dst2 = seqlen_k - dst2_sub;
-      }
-      seqlen_k -= seq_sub;
-    } else if (leaf_flag_ptr != nullptr && leaf_flag_ptr[0] < 0 && actual_m <= 16 && seqlen_k >= actual_m) {
-      // Generalized 1-level tree remap table (sentinel leaf_flag_ptr[0] == -1):
-      // entry q_idx sits at [1 + 3*q_idx + {0: seq_sub, 1: dst_sub, 2: src_sub}].
+    if (leaf_flag_ptr != nullptr && leaf_flag_ptr[0] < 0 && actual_m <= 16 && seqlen_k >= actual_m) {
+      // Generalized arbitrary-depth (1..6-level) bit-packed tree remap table (sentinel leaf_flag_ptr[0] == -1):
+      // entry q_idx sits at [1 + 3*q_idx + {0: seq_sub, 1: base_sub, 2: remap_packed}] inside int32[49].
+      // For base_sub >= 0, logical KV positions tok = (seqlen_k - base_sub) + j (j = 0..5) remap to
+      // physical slot (seqlen_k - actual_m) + ((remap_packed >> (4*j)) & 0xF).
       const int base = 1 + q_idx * 3;
       const int seq_sub = leaf_flag_ptr[base];
-      const int dst_sub = leaf_flag_ptr[base + 1];
-      const int src_sub = leaf_flag_ptr[base + 2];
-      if (dst_sub >= 0) {
-        leaf_remap_src = seqlen_k - src_sub;
-        leaf_remap_dst = seqlen_k - dst_sub;
+      const int base_sub = leaf_flag_ptr[base + 1];
+      if (base_sub >= 0) {
+        leaf_p_start = seqlen_k - actual_m;
+        leaf_remap_base = seqlen_k - base_sub;
+        leaf_remap_packed = static_cast<uint32_t>(leaf_flag_ptr[base + 2]);
       }
       seqlen_k -= seq_sub;
     } else if (q_idx == 7 && actual_m == 8 && leaf_flag_ptr != nullptr) {
       const int lk = leaf_flag_ptr[0];
       if ((lk == 1 || lk == 2) && seqlen_k >= 8) {
-        leaf_remap_src = seqlen_k - 1;       // p + 7 (slot where qk_norm_rope_kvcache wrote alt's K/V)
-        leaf_remap_dst = seqlen_k - 8 + lk;  // p + lk (exact logical position of row lk)
-        seqlen_k = seqlen_k - 7 + lk;        // p + lk + 1 (0-ULP identical to row lk!)
+        leaf_p_start = seqlen_k - 8;
+        leaf_remap_base = leaf_p_start + lk;  // p + lk (exact logical position of row lk)
+        leaf_remap_packed = 7u;               // nibble 0 -> physical row 7 (p + 7)
+        seqlen_k = leaf_p_start + lk + 1;     // p + lk + 1 (0-ULP identical to row lk!)
       } else {
         seqlen_k -= (actual_m - 1 - q_idx);
       }
     } else if (q_idx == 6 && actual_m == 7 && leaf_flag_ptr != nullptr && leaf_flag_ptr[0] > 0 && seqlen_k >= 7) {
-      leaf_remap_src = seqlen_k - 1;  // p + 6 (slot where qk_norm_rope_kvcache wrote alt's K/V)
-      leaf_remap_dst = seqlen_k - 6;  // p + 1 (exact logical position of row 1)
-      seqlen_k -= 5;                  // p + 2 (0-ULP identical to row 1!)
+      leaf_p_start = seqlen_k - 7;
+      leaf_remap_base = leaf_p_start + 1;     // p + 1 (exact logical position of row 1)
+      leaf_remap_packed = 6u;                 // nibble 0 -> physical row 6 (p + 6)
+      seqlen_k -= 5;                          // p + 2 (0-ULP identical to row 1!)
     } else {
       seqlen_k -= (actual_m - 1 - q_idx);
     }
@@ -2303,14 +2264,12 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
       for (int ch = 0; ch < 4; ++ch) {
         issue_kv_tile_async<false>(smem.kv[ch], kv_ptr, block_table, block_tok_base + (ch << 5),
                                    k_start, seqlen_k, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-                                   leaf_remap_dst, leaf_remap_src, leaf_remap_dst2, leaf_remap_src2,
-                                   leaf_p0, leaf_anc_pack);
+                                   leaf_remap_base, leaf_p_start, leaf_remap_packed);
         cp_async_commit();
       }
       issue_kv_tile_async<true>(smem.kv[4], kv_ptr, block_table, block_tok_base,
                                 k_start, seqlen_k, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-                                leaf_remap_dst, leaf_remap_src, leaf_remap_dst2, leaf_remap_src2,
-                                leaf_p0, leaf_anc_pack);
+                                leaf_remap_base, leaf_p_start, leaf_remap_packed);
       cp_async_commit();
 
       cp_async_wait<4>();
@@ -2324,8 +2283,7 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
       __syncthreads();
       issue_kv_tile_async<true>(smem.kv[0], kv_ptr, block_table, block_tok_base + 32,
                                 k_start, seqlen_k, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-                                leaf_remap_dst, leaf_remap_src, leaf_remap_dst2, leaf_remap_src2,
-                                leaf_p0, leaf_anc_pack);
+                                leaf_remap_base, leaf_p_start, leaf_remap_packed);
       cp_async_commit();
 
       cp_async_wait<4>();
@@ -2339,8 +2297,7 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
       __syncthreads();
       issue_kv_tile_async<true>(smem.kv[1], kv_ptr, block_table, block_tok_base + 64,
                                 k_start, seqlen_k, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-                                leaf_remap_dst, leaf_remap_src, leaf_remap_dst2, leaf_remap_src2,
-                                leaf_p0, leaf_anc_pack);
+                                leaf_remap_base, leaf_p_start, leaf_remap_packed);
       cp_async_commit();
 
       cp_async_wait<4>();
@@ -2354,8 +2311,7 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
       __syncthreads();
       issue_kv_tile_async<true>(smem.kv[2], kv_ptr, block_table, block_tok_base + 96,
                                 k_start, seqlen_k, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-                                leaf_remap_dst, leaf_remap_src, leaf_remap_dst2, leaf_remap_src2,
-                                leaf_p0, leaf_anc_pack);
+                                leaf_remap_base, leaf_p_start, leaf_remap_packed);
       cp_async_commit();
 
       cp_async_wait<4>();

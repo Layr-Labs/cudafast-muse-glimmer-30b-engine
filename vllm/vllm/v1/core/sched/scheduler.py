@@ -274,8 +274,6 @@ class Scheduler(SchedulerInterface):
                 # When native multi-leaf tree (M=12/16) or M=8 zero-clamp 1-leaf verify
                 # is active at depth=6, reserve extra KV lookahead slots so rows 7..M-1
                 # are always backed in the request's block table.
-                import os as _os
-
                 _extra_leaf_slots = 0
                 if self.num_spec_tokens == 6:
                     from vllm.v1.worker.gpu.spec_decode.dflash.native_leaf import (
@@ -283,25 +281,8 @@ class Scheduler(SchedulerInterface):
                     )
 
                     _extra_leaf_slots = max(0, desired_verify_m() - 7)
-                _hf = speculative_config.draft_model_config.hf_config
-                _archs = getattr(_hf, "architectures", None) or ()
-                _is_mg = (
-                    getattr(_hf, "model_type", None) == "muse_glimmer_assistant"
-                    or getattr(getattr(_hf, "model", None), "model_type", None)
-                    == "muse_glimmer_assistant"
-                    or "DFlashMuseGlimmerAssistantModel" in _archs
-                    or "MuseGlimmerAssistantModel" in _archs
-                )
-                _extra_q = (
-                    int(_os.environ.get("VLLM_MUSE_DFLASH_EXTRA_QUERY", "9"))
-                    if _is_mg
-                    and _os.environ.get("VLLM_MUSE_DFLASH_CAUSAL", "0") == "0"
-                    else 0
-                )
                 self.num_lookahead_tokens = (
-                    self.num_spec_tokens
-                    + 1
-                    + max(_extra_leaf_slots, max(0, _extra_q))
+                    self.num_spec_tokens + 1 + _extra_leaf_slots
                 )
             if speculative_config.use_dspark():
                 # DSpark drafts a block of num_spec_tokens query tokens in which the

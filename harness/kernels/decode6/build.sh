@@ -8,7 +8,7 @@ mkdir -p "${KERNELS_OUT:?}"
 tmp="$(mktemp -d "$KERNELS_OUT/build.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 torch_include="$(python3 -c 'import importlib.util, pathlib; print(pathlib.Path(importlib.util.find_spec("torch").origin).parent / "include")')"
-TMPDIR="$tmp" nvcc -O3 --threads 4 --expt-relaxed-constexpr -std=c++17 --shared --cudart shared \
+TMPDIR="$tmp" nvcc -O3 --expt-relaxed-constexpr -std=c++17 --shared --cudart shared \
     -Xcompiler=-fPIC -gencode arch=compute_121a,code=sm_121a -I"$torch_include" \
     "$src/gemv6.cu" "$src/gemv6_srans.cu" "$src/gemv6_srans_down.cu" "$src/gemv6_tma4.cu" -o "$KERNELS_OUT/libmuse_marlin6.so"
 install -m 0644 "$src/muse_marlin6_gemv.py" "$KERNELS_OUT/muse_marlin6_gemv.py"

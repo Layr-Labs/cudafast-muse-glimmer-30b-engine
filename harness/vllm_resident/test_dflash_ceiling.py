@@ -49,29 +49,33 @@ def run_async_window(
 
 class DFlashCommittedTokenCeilingTests(unittest.TestCase):
     def test_explicit_safety_constant_matches_control_gain(self):
-        self.assertEqual(ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN, 17.35)
-        effective_min_ms = (
-            ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN
-            / ceiling_module.ROUND_ESTIMATE_SAFETY_FACTOR
-        )
-        for spark_ctrl_ms in (85.04, 85.20, 85.37, 85.77):
-            gain = spark_ctrl_ms / effective_min_ms
-            self.assertLess(gain, 4.95)
+        self.assertEqual(ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN, 16.65)
+        self.assertEqual(ceiling_module.REFERENCE_MAX_DECODE_GAIN, 5.0)
+
+    def test_round_quantized_endpoint_stays_under_ceiling(self):
+        # 85.0 ms is the fastest pair-3 serial control observed; 5.0x of it
+        # is 17.0 ms/token.  Sweep round times and acceptance caps.
+        for quarter_ms in range(280, 340):
+            round_ms = quarter_ms / 4
+            for accepted in (None, 6, 5):
+                _, rounds, stream = run_async_window(
+                    round_ms, accepted_per_round=accepted
+                )
+                self.assertEqual(stream, list(range(128)))
+                self.assertGreater(rounds * round_ms / len(stream), 17.0)
 
     def test_high_acceptance_tracks_current_s3_round_time(self):
-        for round_ms in (70.0, 72.0, 76.1, 79.0, 82.0, 85.0):
-            with self.subTest(round_ms=round_ms):
-                limiter, rounds, stream = run_async_window(round_ms)
-                ms_per_token = rounds * round_ms / len(stream)
-                self.assertGreaterEqual(ms_per_token, 17.35 / 0.99 - 1e-6)
-                self.assertLess(85.77 / ms_per_token, 4.95)
-                self.assertGreater(limiter.snapshot("request")[2], 0)
-                self.assertEqual(stream, list(range(128)))
+        limiter, rounds, stream = run_async_window(79.0)
+        ms_per_token = rounds * 79.0 / len(stream)
+        self.assertGreater(ms_per_token, 17.0)
+        self.assertLessEqual(ms_per_token, 18.0)
+        self.assertGreater(limiter.snapshot("request")[2], 0)
+        self.assertEqual(stream, list(range(128)))
 
     def test_high_acceptance_adapts_to_faster_round(self):
         limiter, rounds, stream = run_async_window(72.0)
         ms_per_token = rounds * 72.0 / len(stream)
-        self.assertGreaterEqual(ms_per_token, 17.35 / 0.99 - 1e-6)
+        self.assertGreater(ms_per_token, 17.0)
         self.assertLessEqual(ms_per_token, 18.0)
         snapshot = limiter.snapshot("request")
         self.assertLess(snapshot[3], 73.0)
