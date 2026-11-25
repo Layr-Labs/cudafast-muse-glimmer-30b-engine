@@ -30,21 +30,21 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-DEFAULT_TREE_M = "16"
+DEFAULT_TREE_M = "24"
 ENABLED = os.environ.get("MUSE_NATIVE_LEAF", "1").strip() not in ("0", "", "false", "no")
 M8_ENABLED = os.environ.get("MUSE_NATIVE_LEAF_M8", "1").strip() not in ("0", "", "false", "no")
 try:
     _TREE_M_RAW = int(os.environ.get("MUSE_NATIVE_TREE_M", DEFAULT_TREE_M).strip() or "0")
 except ValueError:
     _TREE_M_RAW = 0
-TREE_M = _TREE_M_RAW if _TREE_M_RAW in (12, 16) else 0
+TREE_M = _TREE_M_RAW if _TREE_M_RAW in (12, 16, 24) else 0
 
 
 def desired_verify_m() -> int:
     """Single source of truth for configured bs=1 depth-6 verify width (16, 12, 8, or 7)."""
     if not ENABLED:
         return 7
-    if TREE_M in (12, 16):
+    if TREE_M in (12, 16, 24):
         return TREE_M
     if M8_ENABLED:
         return 8
@@ -76,7 +76,7 @@ class _NativeLeafState:
         self.m8_ready: bool = False
         self.tree_m_ready: int = 0
         self.device: torch.device | None = None
-        self.leaf_flag: torch.Tensor | None = None          # int32[49] shared with muse_gqa16_attn
+        self.leaf_flag: torch.Tensor | None = None          # int32[73] shared with muse_gqa16_attn
         self.prev_ns: torch.Tensor | None = None            # int32[1]
         self.hit_flag: torch.Tensor | None = None           # int32[14] [dst0, hit_len, dst0, src0, ..., dst5, src5]
         self.hit_src_row: torch.Tensor | None = None        # int32[1] (0=miss, r=winning initial leaf row 7..15)
@@ -86,9 +86,9 @@ class _NativeLeafState:
         self.tree_vals: torch.Tensor | None = None          # float32[36] ([6, 6] top-6 logits for d1..d6)
         self.req_acc_state: torch.Tensor | None = None      # int32[3] [rounds, committed, high_acc_flag]
         self.saved_alt_tok: torch.Tensor | None = None      # int64[1] (legacy M=7/M=8)
-        self.saved_leaf_toks: torch.Tensor | None = None    # int64[16] (tree mode)
-        self.saved_leaf_k: torch.Tensor | None = None       # int32[16] (tree mode)
-        self.saved_leaf_parent: torch.Tensor | None = None  # int32[16] (-1=1-level root, 7..15=parent row)
+        self.saved_leaf_toks: torch.Tensor | None = None    # int64[24] (tree mode)
+        self.saved_leaf_k: torch.Tensor | None = None       # int32[24] (tree mode)
+        self.saved_leaf_parent: torch.Tensor | None = None  # int32[24] (-1=1-level root, 7..23=parent row)
         self.stats: torch.Tensor | None = None              # int64[32] telemetry counters
         # Static 52-layer target KV metadata for 1-launch all-layer KV fix on hit.
         self.num_layers: int = 0
@@ -137,7 +137,7 @@ def active_verify_m() -> int:
     """Return active verify width for bs=1 depth-6 verify: 16, 12, 8, or 7."""
     if not (ENABLED and _S.ready):
         return 7
-    if _S.tree_m_ready in (12, 16):
+    if _S.tree_m_ready in (12, 16, 24):
         return _S.tree_m_ready
     if M8_ENABLED and _S.m8_ready:
         return 8
@@ -169,6 +169,35 @@ def _get_gqa16():
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+def _all_m24_kernels_admitted(device: torch.device, g16: Any) -> bool:
+    """Admission is fail-closed: a missing M=24 participant keeps record M=16."""
+    if not bool(getattr(g16, "is_m24_verify_admitted", lambda _d: False)(device)):
+        return False
+    # cx1 owns the target weight-streaming paths.  Each module reports a
+    # load-time [0:16]/[8:24] overlap self-test; an absent module/flag is a
+    # rejection, never an optimistic enable.
+    for module_name, flag_name in (
+        ("muse_marlin6_gemv", "decode6_m24_admitted"),
+        ("muse_rans_ext", "rans_m24_admitted"),
+    ):
+        try:
+            module = __import__(module_name)
+            if not bool(getattr(module, flag_name, lambda _d: False)(device)):
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+    # The BF16 rANS lane (stacked qkv+gate blobs) must also run natively at
+    # M=24; otherwise 17..24-row forwards would leave its fast path.
+    try:
+        from vllm.model_executor.models import muse_glimmer as _mg
+
+        if not bool(getattr(_mg, "bf16_rans_m24_admitted", lambda: False)()):
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 
 def get_alt_buf(device: torch.device) -> torch.Tensor | None:
@@ -361,9 +390,9 @@ def init_kv_table(
             _S.tree_vals.fill_(-1e30)
         _S.req_acc_state = torch.zeros((3,), dtype=torch.int32, device=device)
         _S.saved_alt_tok = torch.full((1,), -1, dtype=torch.int64, device=device)
-        _S.saved_leaf_toks = torch.full((16,), -1, dtype=torch.int64, device=device)
-        _S.saved_leaf_k = torch.zeros((16,), dtype=torch.int32, device=device)
-        _S.saved_leaf_parent = torch.full((16,), -1, dtype=torch.int32, device=device)
+        _S.saved_leaf_toks = torch.full((24,), -1, dtype=torch.int64, device=device)
+        _S.saved_leaf_k = torch.zeros((24,), dtype=torch.int32, device=device)
+        _S.saved_leaf_parent = torch.full((24,), -1, dtype=torch.int32, device=device)
         _S.stats = torch.zeros((32,), dtype=torch.int64, device=device)
         _S.num_layers = len(kv_ptrs)
         _S.kv_ptrs = torch.tensor(kv_ptrs, dtype=torch.int64, device=device)
@@ -375,11 +404,13 @@ def init_kv_table(
         _S._hid_ptr_cache.clear()
         _S._last_req_id = None
         _S.m8_ready = bool(M8_ENABLED and hasattr(bfx, "native_leaf_prepare_m8"))
+        m24_ok = TREE_M == 24 and _all_m24_kernels_admitted(device, g16)
+        requested_tree_m = 24 if m24_ok else (16 if TREE_M == 24 else TREE_M)
         _S.tree_m_ready = (
-            TREE_M
+            requested_tree_m
             if (
-                TREE_M in (12, 16)
-                and lf.numel() >= 49
+                requested_tree_m in (12, 16, 24)
+                and lf.numel() >= 1 + 3 * requested_tree_m
                 and hasattr(bfx, "native_leaf_prepare_tree")
                 and hasattr(bfx, "native_leaf_setup_tree")
                 and hasattr(bfx, "native_leaf_commit_tree")
@@ -439,7 +470,7 @@ def prepare_m8(positions: torch.Tensor, seq_lens: torch.Tensor) -> bool:
 @torch.no_grad()
 def prepare_tree(positions: torch.Tensor, seq_lens: torch.Tensor, verify_m: int) -> bool:
     """Zero-sync GPU prep: positions[7..verify_m-1] = p+7..p+verify_m-1, seq_lens[0] += verify_m-7."""
-    if not is_ready() or verify_m < 8 or verify_m > 16:
+    if not is_ready() or verify_m < 8 or verify_m > 24:
         return False
     bfx = _get_bfx()
     if bfx is None:

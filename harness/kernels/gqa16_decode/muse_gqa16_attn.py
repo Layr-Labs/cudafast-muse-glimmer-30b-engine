@@ -93,7 +93,8 @@ _state: dict[int, tuple[bool, int, int]] = {}  # dev_idx -> (admitted, scale_mod
 _prefill_state: dict[int, tuple[bool, int]] = {}  # dev_idx -> (admitted, scale_mode)
 _verify_state: dict[int, tuple[bool, int]] = {}  # dev_idx -> (admitted, scale_mode)
 _leaf_verify_admitted: dict[int, bool] = {}  # dev_idx -> 0-ULP native 1-leaf verify admitted
-_leaf_flag_bufs: dict[int, torch.Tensor] = {}  # dev_idx -> static int32[1] device flag
+_m24_verify_admitted: dict[int, bool] = {}
+_leaf_flag_bufs: dict[int, torch.Tensor] = {}  # dev_idx -> static int32[73] device table
 _pending_prefill: tuple | None = None
 _pf_counts: dict[str, int] = {"defer": 0, "fused1": 0, "fused2": 0, "direct0": 0, "flush": 0, "miss": 0}
 
@@ -106,7 +107,7 @@ def get_leaf_flag(device: torch.device) -> torch.Tensor | None:
     if torch.cuda.is_current_stream_capturing():
         return None
     with torch.inference_mode(False):
-        buf = torch.zeros((49,), dtype=torch.int32, device=device)
+        buf = torch.zeros((73,), dtype=torch.int32, device=device)
     _leaf_flag_bufs[idx] = buf
     return buf
 
@@ -120,6 +121,14 @@ def is_leaf_verify_admitted(device: torch.device) -> bool:
             return False
         self_check_verify(device)
     return bool(_leaf_verify_admitted.get(idx, False))
+
+
+def is_m24_verify_admitted(device: torch.device) -> bool:
+    """True only after the verifier's M=24 and 5-bit tree remap self-check."""
+    if not is_leaf_verify_admitted(device):
+        return False
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    return bool(_m24_verify_admitted.get(idx, False))
 
 
 def _get_scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
@@ -368,7 +377,7 @@ def self_check_verify(device: torch.device) -> bool:
 
         for cand_mode in (1, 3):
             all_match = True
-            for m_tok in (2, 4, 7, 8, 12, 16):
+            for m_tok in (2, 4, 7, 8, 12, 16, 24):
                 q = (torch.randn((m_tok, 32, 128), generator=gen, device=device) * 1.1).to(torch.bfloat16).contiguous()
                 cu_q = torch.tensor([0, m_tok], dtype=torch.int32, device=device)
                 for seq_k in (518, 640):
@@ -538,7 +547,7 @@ def self_check_verify(device: torch.device) -> bool:
                         break
                 if not leaf_all:
                     break
-                # 3) Generalized bit-packed arbitrary-depth (1..6-level) tree table mode (sentinel -1, int32[49]):
+                # 3) Generalized 5-bit arbitrary-depth (1..6-level) tree table mode (sentinel -1, int32[73]):
                 #    Test M=12 1-level (5 leaves), M=16 1-level (9 leaves), AND M=16 deep 6-level + 3-level branches!
                 #    Each tree spec is (tree_m, tuple of (k_r, parent_row)) for rows r = 7..tree_m-1.
                 for tree_m, tree_nodes in (
@@ -546,12 +555,13 @@ def self_check_verify(device: torch.device) -> bool:
                     (16, ((1, -1), (1, -1), (2, -1), (2, -1), (3, -1), (1, -1), (3, -1), (4, -1), (5, -1))),
                     # Deep 6-level chain (rows 7..12 -> k=1..6) + 3-level branch (rows 13..15 -> k=2..4):
                     (16, ((1, -1), (2, 7), (3, 8), (4, 9), (5, 10), (6, 11), (2, -1), (3, 13), (4, 14))),
+                    (24, ((1, -1), (2, 7), (3, 8), (4, 9), (5, 10), (6, 11), (2, -1), (3, 13), (4, 14), (1, -1), (2, 17), (3, 18), (4, 19), (5, 20), (6, 21), (3, -1), (4, 23))),
                 ):
                     if seq_k < tree_m:
                         continue
                     kv_t = kv_l.clone()
                     q_t = (torch.randn((tree_m, 32, 128), generator=gen_l, device=device) * 1.1).to(torch.bfloat16).contiguous()
-                    tbl = [-1] + [0] * 48
+                    tbl = [-1] + [0] * 72
                     for q_i in range(7):
                         tbl[1 + 3 * q_i] = tree_m - 1 - q_i
                         tbl[1 + 3 * q_i + 1] = -1
@@ -570,11 +580,11 @@ def self_check_verify(device: torch.device) -> bool:
                         if par < 0:
                             b_sub = tree_m - lk
                             dp = 1
-                            pkd = r_row & 0xF
+                            pkd = r_row & 0x1F
                         else:
                             b_sub = row_base_sub[par]
                             dp = row_depth[par] + 1
-                            pkd = row_packed[par] | ((r_row & 0xF) << (4 * (dp - 1)))
+                            pkd = row_packed[par] | ((r_row & 0x1F) << (5 * (dp - 1)))
                         row_base_sub[r_row] = b_sub
                         row_depth[r_row] = dp
                         row_packed[r_row] = pkd
@@ -625,10 +635,11 @@ def self_check_verify(device: torch.device) -> bool:
             logger.warning("muse_gqa16_attn: native 1-leaf verify self-check raised on cuda:%d", idx, exc_info=True)
             leaf_ok = False
     _leaf_verify_admitted[idx] = leaf_ok
+    _m24_verify_admitted[idx] = bool(ok and leaf_ok)
     if ok:
         logger.info(
-            "muse_gqa16_attn: strict 0-ULP verify (M=2..16) admitted on cuda:%d (grid_splits=%d, pipe=%d, scale_mode=%d, native_leaf=%d)",
-            idx, g_splits, int(VERIFY_PIPE), scale_mode, int(leaf_ok),
+            "muse_gqa16_attn: strict 0-ULP verify (M=2..24) admitted on cuda:%d (grid_splits=%d, pipe=%d, scale_mode=%d, native_leaf=%d, m24=%d)",
+            idx, g_splits, int(VERIFY_PIPE), scale_mode, int(leaf_ok), int(_m24_verify_admitted[idx]),
         )
     else:
         logger.warning("muse_gqa16_attn: strict 0-ULP verify self-check failed on cuda:%d; keeping stock FA2", idx)
@@ -649,7 +660,7 @@ def try_verify_gqa16(
 ) -> bool:
     if not VERIFY_ENABLED or _lib is None or not hasattr(_lib, "muse_gqa16_verify"):
         return False
-    if num_actual_tokens < 2 or num_actual_tokens > 16 or max_num_splits not in (0, 1):
+    if num_actual_tokens < 2 or num_actual_tokens > 24 or max_num_splits not in (0, 1):
         return False
     device = query.device
     idx = device.index if device.index is not None else torch.cuda.current_device()
@@ -704,7 +715,7 @@ def try_verify_gqa16(
     if (
         NATIVE_LEAF_ENABLED
         and g_splits == 1
-        and 7 <= num_actual_tokens <= 16
+        and 7 <= num_actual_tokens <= 24
         and _leaf_verify_admitted.get(idx, False)
         and hasattr(_lib, "muse_gqa16_verify_leaf")
     ):

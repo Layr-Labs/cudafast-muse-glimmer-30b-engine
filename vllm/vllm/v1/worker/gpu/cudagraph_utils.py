@@ -246,7 +246,7 @@ class CudaGraphManager:
         else:
             decode_query_lens = [self.decode_query_len]
 
-        # Native multi-leaf tree (M=12/16) or M=8 zero-clamp verify: capture ONLY the
+        # Native multi-leaf tree (M=12/16/24) or M=8 zero-clamp verify: capture ONLY the
         # single bs=1 FULL (num_tokens=target_m, num_reqs=1, uniform_token_count=target_m)
         # graph alongside (7, 1, 7), without polluting decode_query_lens with multi-req graphs.
         _target_leaf_m = 0
@@ -468,7 +468,9 @@ class CudaGraphManager:
                             set_graph_pool_id(current_platform.graph_pool_handle())
                         persist_set = False
                         cap_stream = current_platform.current_stream()
-                        if 1 <= desc.num_tokens <= 16:
+                        # The M=24 tree graph has the same persistent norm arena
+                        # contract as the record's M<=16 decode graphs.
+                        if 1 <= desc.num_tokens <= 24:
                             try:
                                 import l2pf as _l2pf_mod
                                 arena = getattr(

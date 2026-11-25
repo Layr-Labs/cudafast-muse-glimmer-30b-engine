@@ -369,7 +369,7 @@ __global__ void Marlin(
     num_groups = 416;
   }
   if constexpr (fuse_lmpost) {
-    static_assert(scale6 && (m_block_size_8 || (multi_m && thread_m_blocks == 1)) &&
+    static_assert(scale6 && (m_block_size_8 || (multi_m && thread_m_blocks <= 2)) &&
                   !gate_up_grid && !gate_v48 && !half_split &&
                   ((thread_n_blocks == 4 && threads == 128) ||
                    (thread_n_blocks == 8 && threads == 256)) &&
@@ -398,7 +398,7 @@ __global__ void Marlin(
     prob_k = lda = 6656;
     num_groups = 416;
   } else if constexpr (fixed_shape == 3) {
-    static_assert(scale6 && (m_block_size_8 || (multi_m && thread_m_blocks == 1)) &&
+    static_assert(scale6 && (m_block_size_8 || (multi_m && thread_m_blocks <= 2)) &&
                   down_ilv && !gate_up_grid && !gate_v48 &&
                   !split2 && !half_split && !gate_up_swiglu && !fuse_mul_sigmoid &&
                   thread_n_blocks == 8 && threads == 256 && thread_k_blocks == 8);
@@ -416,6 +416,9 @@ __global__ void Marlin(
   [[maybe_unused]] int lm_bi = 0x7fffffff;
   [[maybe_unused]] float lm_bv1 = -__int_as_float(0x7f800000);
   [[maybe_unused]] int lm_bi1 = 0x7fffffff;
+  // M=17..24 (thread_m_blocks == 2): running argmax of the second 16-row tile (rows 16..23).
+  [[maybe_unused]] float lm_bv2 = -__int_as_float(0x7f800000);
+  [[maybe_unused]] int lm_bi2 = 0x7fffffff;
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -3586,6 +3589,16 @@ __global__ void Marlin(
                   if (has_r0) upd(frag_c[0][j][1][1], cb1, lm_bv, lm_bi);
                   if (has_r1) upd(frag_c[0][j][1][3], cb1, lm_bv1, lm_bi1);
                 }
+                if constexpr (thread_m_blocks == 2) {
+                  // Second 16-row tile: rows 16 + r0 (rows 24..31 are never valid at M<=24).
+                  // Same fragment slots and column order as tile 0, so each row's
+                  // running max sees columns in exactly the M=16 order.
+                  const bool has_r2 = (r0 + 16) < prob_m;
+                  if (ca0 < org_vocab_size && has_r2) upd(frag_c[1][j][0][0], ca0, lm_bv2, lm_bi2);
+                  if (ca1 < org_vocab_size && has_r2) upd(frag_c[1][j][0][1], ca1, lm_bv2, lm_bi2);
+                  if (cb0 < org_vocab_size && has_r2) upd(frag_c[1][j][1][0], cb0, lm_bv2, lm_bi2);
+                  if (cb1 < org_vocab_size && has_r2) upd(frag_c[1][j][1][1], cb1, lm_bv2, lm_bi2);
+                }
               }
             }
           }
@@ -3721,7 +3734,7 @@ __global__ void Marlin(
       int* const sh_last = sh_bi + 128;
 
       constexpr int active_threads = 32 * tb_n_warps;
-      constexpr int sh_row_stride = m_block_size_8 ? 8 : 16;
+      constexpr int sh_row_stride = m_block_size_8 ? 8 : (thread_m_blocks == 2 ? 24 : 16);
       if (threadIdx.x < active_threads) {
         const int lane = threadIdx.x & 31;
         const int w = threadIdx.x >> 5;
@@ -3763,20 +3776,40 @@ __global__ void Marlin(
               lm_bi1 = oi1;
             }
           }
+          if constexpr (thread_m_blocks == 2) {
+#pragma unroll
+            for (int off = 2; off >= 1; off >>= 1) {
+              const float ov2 = __shfl_xor_sync(0xffffffffu, lm_bv2, off);
+              const int oi2 = __shfl_xor_sync(0xffffffffu, lm_bi2, off);
+              if ((ov2 > lm_bv2) || (ov2 == lm_bv2 && oi2 < lm_bi2)) {
+                lm_bv2 = ov2;
+                lm_bi2 = oi2;
+              }
+            }
+          }
           if ((lane & 3) == 0) {
             const int r0 = lane >> 2;
-            sh_bv[w * 16 + r0] = lm_bv;
-            sh_bi[w * 16 + r0] = lm_bi;
-            sh_bv[w * 16 + r0 + 8] = lm_bv1;
-            sh_bi[w * 16 + r0 + 8] = lm_bi1;
+            sh_bv[w * sh_row_stride + r0] = lm_bv;
+            sh_bi[w * sh_row_stride + r0] = lm_bi;
+            sh_bv[w * sh_row_stride + r0 + 8] = lm_bv1;
+            sh_bi[w * sh_row_stride + r0 + 8] = lm_bi1;
+            if constexpr (thread_m_blocks == 2) {
+              sh_bv[w * sh_row_stride + r0 + 16] = lm_bv2;
+              sh_bi[w * sh_row_stride + r0 + 16] = lm_bi2;
+            }
           }
         }
       }
       __syncthreads();
 
+      // M<=16 retains the record's exact scratch layout.  M=24 needs one
+      // additional 8-row tile; keep the row-major reduction buffers adjacent
+      // so every CTA still consumes the same decoded B fragments once.
+      constexpr int lmpost_rows = thread_m_blocks == 2 ? 24 : 16;
+      constexpr int lmpost_entries = lmpost_rows * 128;
       float* const g_bv = reinterpret_cast<float*>(C0);
-      int* const g_bi = reinterpret_cast<int*>(g_bv + 2048);
-      int* const g_done = g_bi + 2048;
+      int* const g_bi = reinterpret_cast<int*>(g_bv + lmpost_entries);
+      int* const g_done = g_bi + lmpost_entries;
       if (static_cast<int>(threadIdx.x) < prob_m) {
         const int r = static_cast<int>(threadIdx.x);
         float bv = sh_bv[r];

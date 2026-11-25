@@ -1502,6 +1502,26 @@ _BF16_DUAL_WS_ADMITTED: set[int] = set()
 _BF16_DUAL_RANS_M: dict[int, tuple[torch.Tensor, int]] = {}
 _BF16_DUAL_RANS_M_GATE_PTRS: set[int] = set()
 _BF16_DUAL_RANS_M_LAYERS: set[int] = set()
+# M=24 is an independently admitted kernel family.  Keeping this false until
+# the native overlap oracle succeeds is intentional: a 24-row tree may only
+# be enabled when every target-linear participant says so.
+_BF16_RANS_M24_ADMITTED = False
+_BF16_M24_CHECKED = 0
+_BF16_M24_BAD = False
+
+
+def _bf16_rans_m24_note(ok: bool) -> None:
+    """Record one layer's bitwise [0:16]/[8:24] overlap result; any failure disables M=24 for good."""
+    global _BF16_RANS_M24_ADMITTED, _BF16_M24_CHECKED, _BF16_M24_BAD
+    if ok:
+        _BF16_M24_CHECKED += 1
+    else:
+        _BF16_M24_BAD = True
+    _BF16_RANS_M24_ADMITTED = _BF16_M24_CHECKED > 0 and not _BF16_M24_BAD
+
+
+def bf16_rans_m24_admitted() -> bool:
+    return _BF16_RANS_M24_ADMITTED
 
 
 def update_bf16_dual_rans_m(idx_qkv: torch.Tensor, blob: torch.Tensor) -> None:
@@ -1526,7 +1546,7 @@ def _muse_bf16_qkv_or_stacked_impl(
         out = torch.mm(x, w_cat.t())
         return out[:, :4608].contiguous(), out[:, 4608:].contiguous()
     if (
-        2 <= x.shape[0] <= 16
+        (2 <= x.shape[0] <= 16 or (17 <= x.shape[0] <= 24 and bf16_rans_m24_admitted()))
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16
@@ -1587,7 +1607,7 @@ def _muse_bf16_gate_fill_impl(
             if rc == 0:
                 return
     if (
-        2 <= x.shape[0] <= 16
+        (2 <= x.shape[0] <= 16 or (17 <= x.shape[0] <= 24 and bf16_rans_m24_admitted()))
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16
@@ -1596,6 +1616,12 @@ def _muse_bf16_gate_fill_impl(
         and gate.is_contiguous()
     ):
         if idx_gate.data_ptr() in _BF16_DUAL_RANS_M_GATE_PTRS:
+            return
+        if x.shape[0] > 16:
+            # M=17..24 is only validated on the stacked qkv+gate blob; anything else keeps the generic lane below.
+            gate.copy_(
+                torch.ops.vllm.muse_bf16_lane_linear.default(x, w_gate, packed_gate, idx_gate)
+            )
             return
         import muse_bf16_lane as _bf16
 
@@ -2621,6 +2647,32 @@ class MuseGlimmerForCausalLM(
                                             ):
                                                 ok_dual = False
                                                 break
+                                    if ok_dual and os.environ.get("MUSE_BF16_RANS_M24", "1") != "0":
+                                        # M=17..24 native single-pass kernel: the existing M<=16 launches are the oracle
+                                        # over [0:16] and [8:24] (overlap makes rows 8..15 observable twice).
+                                        try:
+                                            xm24 = (
+                                                torch.randn((24, 6656), generator=g2, device=qw.device) * 1.5
+                                            ).to(torch.bfloat16)
+                                            gq, gg = _bfx.rans_gemm_dual(xm24, blob_cat, 4608, 4096, 6656, bexp_cat)
+                                            rq0, rg0 = _bfx.rans_gemm_dual(
+                                                xm24[:16].contiguous(), blob_cat, 4608, 4096, 6656, bexp_cat
+                                            )
+                                            rq1, rg1 = _bfx.rans_gemm_dual(
+                                                xm24[8:].contiguous(), blob_cat, 4608, 4096, 6656, bexp_cat
+                                            )
+                                            ok24 = (
+                                                torch.equal(gq[:16].view(torch.int16), rq0.view(torch.int16))
+                                                and torch.equal(gq[8:].view(torch.int16), rq1.view(torch.int16))
+                                                and torch.equal(gg[:16].view(torch.int16), rg0.view(torch.int16))
+                                                and torch.equal(gg[8:].view(torch.int16), rg1.view(torch.int16))
+                                            )
+                                        except Exception as exc24:  # noqa: BLE001
+                                            logger.warning("BF16 rANS M=24 self-check failed on layer %d: %s", attn.layer_idx, exc24)
+                                            ok24 = False
+                                        _bf16_rans_m24_note(bool(ok24))
+                                        if not ok24:
+                                            logger.warning("BF16 rANS M=24 overlap MISMATCH on layer %d; M=24 disabled", attn.layer_idx)
                                     if ok_dual:
                                         attn.register_buffer(
                                             "_bf16_qkv_gate_rans_m", blob_cat, persistent=False
@@ -2650,6 +2702,12 @@ class MuseGlimmerForCausalLM(
             logger.info(
                 "Attention dual decode rANS: %d BF16 stacked qkv+gate (8704x6656, 0-ULP)",
                 bf16_dual_rans_cnt,
+            )
+        if _BF16_M24_CHECKED or _BF16_M24_BAD:
+            logger.info(
+                "BF16 rANS M=24 overlap self-check [0:16]/[8:24]: %d layers admitted bitwise, %s",
+                _BF16_M24_CHECKED,
+                "REJECTED (record M=16 path)" if _BF16_M24_BAD else "M=24 enabled",
             )
 
 

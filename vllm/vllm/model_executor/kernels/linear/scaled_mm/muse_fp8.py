@@ -92,6 +92,16 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
                             and torch.equal(got_m[8:].view(torch.int16), ref_hi.view(torch.int16))
                         ):
                             raise RuntimeError(f"muserans kM16 self-check mismatch at M={cm}")
+                if _RANS_M and hasattr(_rans, "rans_m24_check_blob") and os.environ.get("MUSERANS_M24", "1") != "0":
+                    # M=17..24 single-pass kernel: bitwise [0:16]/[8:24] overlap against the M<=16 launches on this real
+                    # blob; a mismatch poisons the M=24 admission globally (callers keep the record M=16 tree).
+                    m24_ok = bool(_rans.rans_m24_check_blob(blob, ws.reshape(-1), xs.reshape(-1), n, k))
+                    _stats["m24_checked"] = _stats.get("m24_checked", 0) + 1
+                    if not m24_ok:
+                        _stats["m24_rejected"] = _stats.get("m24_rejected", 0) + 1
+                        logger.warning("muserans: M=24 overlap self-check MISMATCH on N=%d K=%d; M=24 disabled", n, k)
+                    elif _stats["m24_checked"] in (1, 42, 49):
+                        logger.info("muserans: M=24 overlap self-check [0:16]/[8:24] admitted bitwise on %d rANS FP8 layers", _stats["m24_checked"])
                 if (
                     _RANS_M
                     and os.environ.get("MUSE_RANS_PROLOGUE_M16", "0") != "0"
@@ -204,6 +214,21 @@ def _muse_fp8_scaled_mm(
             if fused is not None:
                 return fused
         # verify-width rows: the same rANS stream and the same per-row MMA chain as the M == 1 GEMV
+        out = torch.empty((A.shape[0], n), dtype=torch.bfloat16, device=A.device)
+        _rans.rans_gemm_m_auto(packed, A, Bs.reshape(-1), As.reshape(-1), out, n, k)
+        return out
+    if (
+        16 < A.shape[0] <= 24
+        and _RANS_M
+        and packed.numel() > 0
+        and packed.numel() != n * k
+        and A.is_contiguous()
+        and A.dtype == torch.float8_e4m3fn
+        and _scales_ok(As, Bs, n)
+        and hasattr(_rans, "rans_m24_is_admitted")
+        and _rans.rans_m24_is_admitted()
+    ):
+        # single weight pass for 17..24 rows (admitted only after the bitwise [0:16]/[8:24] overlap self-test)
         out = torch.empty((A.shape[0], n), dtype=torch.bfloat16, device=A.device)
         _rans.rans_gemm_m_auto(packed, A, Bs.reshape(-1), As.reshape(-1), out, n, k)
         return out

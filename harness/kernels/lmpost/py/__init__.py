@@ -191,7 +191,7 @@ def greedy_verify(
     fn = getattr(_lib, "lmpost_greedy_verify", None)
     if (
         fn is None
-        or not (2 <= m <= 16)
+        or not (2 <= m <= 24)
         or target_argmax.dtype != torch.int64
         or not target_argmax.is_contiguous()
         or target_argmax.numel() < m
