@@ -98,6 +98,8 @@ torch::Tensor bf16_rans_unpack(torch::Tensor blob, int64_t N, int64_t K);
 torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int64_t K, int64_t base_exp);
 void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp);
 int64_t bf16_rans_base(torch::Tensor blob);
+torch::Tensor int3_pack(torch::Tensor W);
+torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm", &bfx_gemm);
@@ -106,4 +108,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_gemm", &bf16_rans_gemm);
   m.def("rans_gemm_out", &bf16_rans_gemm_out);
   m.def("rans_base", &bf16_rans_base);
+  m.def("int3_pack", &int3_pack);
+  m.def("int3_gemm", &int3_gemm);
 }

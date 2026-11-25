@@ -178,7 +178,7 @@ def consume_down_swiglu(x: torch.Tensor, down_gs_ptr: int) -> torch.Tensor | Non
 def consume_rans_prologue(
     A: torch.Tensor, As: torch.Tensor, packed: torch.Tensor, n: int, k: int, Bs: torch.Tensor
 ) -> torch.Tensor | None:
-    """Consume a pending M=1 fused activation+FP8 prologue inside muse_fp8_scaled_mm."""
+    """Consume a pending M=1..8 fused activation+FP8 prologue inside muse_fp8_scaled_mm."""
     global _pending_rans_prologue
     if _pending_rans_prologue is None:
         return None
@@ -191,6 +191,7 @@ def consume_rans_prologue(
         return None
     import muse_rans_ext as _rans
 
+    m = int(A.shape[0]) if A.ndim == 2 else 1
     if act_mode == 0:
         out = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
         _rans.rans_gemv_auto(packed, x0.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
@@ -198,6 +199,33 @@ def consume_rans_prologue(
         del x0, x1
         return out
     aux = x1 if x1 is not None else x0
+    if m > 1:
+        if not skipped:
+            if torch.cuda.is_current_stream_capturing():
+                del x0, x1, aux
+                return None
+            ref = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
+            got = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
+            _rans.rans_gemm_m_auto(packed, A, Bs.reshape(-1), As.reshape(-1), ref, n, k)
+            _rans.rans_gemm_m_fused_auto(
+                packed, x0, aux, Bs.reshape(-1), As.reshape(-1), got, n, k, act_mode
+            )
+            torch.cuda.synchronize()
+            if torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+                _prologue_state[scale_ptr] = "admitted"
+                _prologue_counts["admitted"] += 1
+            else:
+                _prologue_state[scale_ptr] = "rejected"
+                _prologue_counts["rejected"] += 1
+            del x0, x1, aux
+            return ref
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
+        _rans.rans_gemm_m_fused_auto(
+            packed, x0, aux, Bs.reshape(-1), As.reshape(-1), out, n, k, act_mode
+        )
+        _prologue_counts["fused_launches"] += 1
+        del x0, x1, aux
+        return out
     if not skipped:
         if torch.cuda.is_current_stream_capturing():
             return None
@@ -338,16 +366,21 @@ class _MulSiluSliceSwap:
                     n_sw = int(numel_t)
                 except Exception:
                     n_sw = -1
-                if n_sw == 19968 and gu_t.data_ptr() == gu_ptr:
+                if n_sw > 0 and n_sw % 19968 == 0 and (n_sw // 19968) <= 8 and gu_t.data_ptr() == gu_ptr:
+                    m_rows = n_sw // 19968
                     if fused_launched:
+                        if m_rows == 1:
+                            sw_view = sw_entry["swiglu_out"][:, :19968]
+                        else:
+                            sw_view = sw_entry["swiglu_out_m"].view(-1)[:n_sw].view(m_rows, 19968)
                         _expect_down_swiglu = (
                             out_t.data_ptr(),
-                            sw_entry["swiglu_out"][:, :19968],
+                            sw_view,
                             sw_entry["down_gs_ptr"],
                         )
                         _swiglu_gu_counts["skipped"] += 1
                         return None
-                    if sw_entry["state"] == "prechecked" and not torch.cuda.is_current_stream_capturing() and check_args is not None:
+                    if m_rows == 1 and sw_entry["state"] == "prechecked" and not torch.cuda.is_current_stream_capturing() and check_args is not None:
                         orig_run(kernel, *args, **kwargs)
                         try:
                             import muse_marlin6_gemv as _m6
@@ -509,15 +542,19 @@ class _RansPrologueHook:
         global _pending_rans_prologue
         if kwargs.get("benchmark_run", False):
             return orig_run(kernel, *args, **kwargs)
-        if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
-            return None
         if _pending_rans_prologue is not None:
+            if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
+                return None
             return orig_run(kernel, *args, **kwargs)
         try:
             import muse_rans_ext as _rans
             if not hasattr(_rans, "rans_gemv_fused_auto"):
+                if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
+                    return None
                 return orig_run(kernel, *args, **kwargs)
         except Exception:
+            if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
+                return None
             return orig_run(kernel, *args, **kwargs)
         if self.act_mode == 1:
             if len(args) != 5:
@@ -527,15 +564,20 @@ class _RansPrologueHook:
                 n_el = int(numel)
             except Exception:
                 return orig_run(kernel, *args, **kwargs)
+            max_m_fuse = 8 if hasattr(_rans, "rans_gemm_m_fused_auto") else 1
             if (
-                n_el != 4096
+                n_el <= 0
+                or (n_el & 4095) != 0
+                or (n_el >> 12) > max_m_fuse
                 or not all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gate, attn, scale, out))
                 or gate.dtype != torch.bfloat16 or attn.dtype != torch.bfloat16
-                or gate.numel() != 4096 or attn.numel() != 4096
+                or gate.numel() != n_el or attn.numel() != n_el
                 or ((gate.data_ptr() | attn.data_ptr()) & 7) != 0
                 or scale.dtype != torch.float32 or scale.numel() != 1
-                or out.dtype != torch.float8_e4m3fn or out.numel() != 4096
+                or out.dtype != torch.float8_e4m3fn or out.numel() != n_el
             ):
+                if self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
+                    return None
                 return orig_run(kernel, *args, **kwargs)
             x0, x1 = gate, attn
         else:
