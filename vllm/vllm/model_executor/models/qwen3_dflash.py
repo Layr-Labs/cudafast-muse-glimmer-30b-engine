@@ -520,7 +520,11 @@ class DFlashQwen3Model(nn.Module):
         )
         if self._fused_kv_bias is None:
             all_kv_flat = None
-            if getattr(self, "_fkv_mnv4", None) is not None or getattr(self, "_fkv_mfp8", None) is not None:
+            if (
+                getattr(self, "_fkv_mi3", None) is not None
+                or getattr(self, "_fkv_mnv4", None) is not None
+                or getattr(self, "_fkv_mfp8", None) is not None
+            ):
                 from vllm.model_executor.layers import muse_draft_fp8
                 all_kv_flat = muse_draft_fp8.tensor_apply(self, "fkv", normed_context_states, self._fused_kv_weight)
             if all_kv_flat is None:
@@ -595,7 +599,17 @@ class DFlashQwen3Model(nn.Module):
         positions_repeated = context_positions.repeat(L)
         cos_sin_cache = self._rope_cos_sin_cache
         if cos_sin_cache.dtype != all_k_flat.dtype:
-            cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
+            cached = getattr(self, "_rope_cos_sin_cache_cast", None)
+            if (
+                cached is None
+                or cached.dtype != all_k_flat.dtype
+                or cached.device != all_k_flat.device
+            ):
+                cached = cos_sin_cache.to(
+                    device=all_k_flat.device, dtype=all_k_flat.dtype
+                )
+                self._rope_cos_sin_cache_cast = cached
+            cos_sin_cache = cached
         ops.rotary_embedding(
             positions_repeated,
             all_k_flat,
@@ -833,7 +847,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             from vllm.model_executor.layers import muse_bfx
             n = muse_bfx.attach_drafter(self.model)
             has_q_fkv = (
-                getattr(self.model, "_fkv_mnv4", None) is not None
+                getattr(self.model, "_fkv_mi3", None) is not None
+                or getattr(self.model, "_fkv_mnv4", None) is not None
                 or getattr(self.model, "_fkv_mfp8", None) is not None
             )
             kv = (

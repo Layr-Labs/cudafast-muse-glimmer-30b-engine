@@ -62,6 +62,7 @@ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.gpu.spec_decode.dflash.decode_ceiling import DFlashDecodeCeiling
 
 logger = init_logger(__name__)
 
@@ -94,6 +95,12 @@ class Scheduler(SchedulerInterface):
             )
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
+        spec_config = vllm_config.speculative_config
+        self.dflash_decode_ceiling = (
+            DFlashDecodeCeiling()
+            if spec_config is not None and spec_config.method == "dflash"
+            else None
+        )
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -1195,6 +1202,27 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+        ceiling = self.dflash_decode_ceiling
+        if (
+            ceiling is not None
+            and self.scheduler_config.async_scheduling
+            and num_spec_tokens_to_schedule > 0
+        ):
+            for req_id in num_scheduled_tokens:
+                request = self.requests[req_id]
+                if len(request._output_token_ids) == 0:
+                    continue
+                in_flight_committed = max(request.num_output_placeholders, 0)
+                current_depth = len(scheduled_spec_decode_tokens.get(req_id, ()))
+                future_depth = ceiling.limit_next(
+                    req_id,
+                    num_spec_tokens_to_schedule,
+                    pending_rounds=1 + int(in_flight_committed > 0),
+                    pending_committed=in_flight_committed + current_depth + 1,
+                )
+                num_spec_tokens_to_schedule = min(
+                    num_spec_tokens_to_schedule, future_depth
+                )
 
         scheduled_encoder_input_stats = None
         if (
@@ -1803,6 +1831,20 @@ class Scheduler(SchedulerInterface):
             prefill_stats = None
             status_before_stop = request.status
             num_output_tokens_before = len(request._output_token_ids)
+            ceiling = self.dflash_decode_ceiling
+            if ceiling is not None and generated_token_ids and not output_is_stale:
+                if num_output_tokens_before == 0:
+                    ceiling.observe_seed(req_id)
+                else:
+                    sched_drafts = len(
+                        scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
+                    )
+                    ceiling.observe_commit(
+                        req_id,
+                        len(generated_token_ids),
+                        scheduled_draft_tokens=sched_drafts,
+                        completed_at_ns=time.monotonic_ns(),
+                    )
 
             # Check for stop and update request status.
             if new_token_ids:
@@ -2158,6 +2200,12 @@ class Scheduler(SchedulerInterface):
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue
+
+            ceiling = self.dflash_decode_ceiling
+            if ceiling is not None and len(request._output_token_ids) > 0:
+                depth = ceiling.limit_next(req_id, len(spec_token_ids))
+                if depth < len(spec_token_ids):
+                    spec_token_ids = spec_token_ids[:depth]
 
             # Add newly generated spec token ids to the request.
             if self.structured_output_manager.should_advance(request):

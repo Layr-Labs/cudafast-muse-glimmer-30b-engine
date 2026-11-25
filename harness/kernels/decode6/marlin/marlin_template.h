@@ -2534,7 +2534,76 @@ __global__ void Marlin(
     __syncthreads();
 
     if constexpr (gate_up_swiglu) {
-      if (slice_col < 264) {
+      if constexpr (multi_m) {
+        __shared__ int swiglu_pair_old;
+        const uint32_t* const sh_u32 = reinterpret_cast<const uint32_t*>(sh_red);
+        if (slice_col < 264) {
+          if (threadIdx.x < 32) {
+            for (int r = 0; r < prob_m; ++r) {
+              const uint32_t gw = sh_u32[r * (4 * c_sh_stride) + threadIdx.x];
+              const uint32_t uw = sh_u32[r * (4 * c_sh_stride) + threadIdx.x + 32];
+              const float g0 = __uint_as_float(gw << 16);
+              const float g1 = __uint_as_float(gw & 0xffff0000u);
+              const float u0 = __uint_as_float(uw << 16);
+              const float u1 = __uint_as_float(uw & 0xffff0000u);
+              __nv_bfloat162 res = __floats2bfloat162_rn(
+                  __fmul_rn(marlin_swiglu_silu(g0), u0),
+                  __fmul_rn(marlin_swiglu_silu(g1), u1));
+              reinterpret_cast<uint32_t*>(C0 + r * 2496 + slice_col * 8)[threadIdx.x] =
+                  *reinterpret_cast<uint32_t*>(&res);
+            }
+          }
+        } else {
+          const bool is_up = (slice_col >= 288);
+          const int m_pair = is_up ? (slice_col - 288) : (slice_col - 264);
+          int4* const my_slot = C0 + prob_m * 2496 + m_pair * (prob_m * 32) + (is_up ? prob_m * 16 : 0);
+          const int4* const other_slot = C0 + prob_m * 2496 + m_pair * (prob_m * 32) + (is_up ? 0 : prob_m * 16);
+          int* const plock = (pair_locks != nullptr ? pair_locks : (locks + 24)) + m_pair;
+          if (threadIdx.x < prob_m * 16) {
+            const int r_s = threadIdx.x >> 4;
+            const int c_s = threadIdx.x & 15;
+            const int4 v = sh_red[r_s * c_sh_stride + c_s];
+            asm volatile("st.global.wb.v4.b32 [%0], {%1, %2, %3, %4};\n"
+                         :
+                         : "l"(my_slot + threadIdx.x), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                         : "memory");
+          }
+          __syncthreads();
+          if (threadIdx.x == 0) {
+            int old = 0;
+            asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;\n"
+                         : "=r"(old)
+                         : "l"(plock)
+                         : "memory");
+            if (old == 1) {
+              asm volatile("st.global.wb.b32 [%0], 0;\n" ::"l"(plock) : "memory");
+            }
+            swiglu_pair_old = old;
+          }
+          __syncthreads();
+          if (swiglu_pair_old == 1 && threadIdx.x < 64) {
+            const uint32_t* const other_u32 = reinterpret_cast<const uint32_t*>(other_slot);
+            for (int r = 0; r < prob_m; ++r) {
+              const uint32_t own_w = sh_u32[r * (4 * c_sh_stride) + threadIdx.x];
+              uint32_t oth_w;
+              asm volatile("ld.global.ca.b32 %0, [%1];\n"
+                           : "=r"(oth_w)
+                           : "l"(other_u32 + r * 64 + threadIdx.x));
+              const uint32_t gw = is_up ? oth_w : own_w;
+              const uint32_t uw = is_up ? own_w : oth_w;
+              const float g0 = __uint_as_float(gw << 16);
+              const float g1 = __uint_as_float(gw & 0xffff0000u);
+              const float u0 = __uint_as_float(uw << 16);
+              const float u1 = __uint_as_float(uw & 0xffff0000u);
+              __nv_bfloat162 res = __floats2bfloat162_rn(
+                  __fmul_rn(marlin_swiglu_silu(g0), u0),
+                  __fmul_rn(marlin_swiglu_silu(g1), u1));
+              reinterpret_cast<uint32_t*>(C0 + r * 2496 + 2112 + m_pair * 16)[threadIdx.x] =
+                  *reinterpret_cast<uint32_t*>(&res);
+            }
+          }
+        }
+      } else if (slice_col < 264) {
         if (threadIdx.x < 32) {
           const uint32_t gw = reinterpret_cast<const uint32_t*>(sh_red)[threadIdx.x];
           const uint32_t uw = reinterpret_cast<const uint32_t*>(sh_red)[threadIdx.x + 32];
