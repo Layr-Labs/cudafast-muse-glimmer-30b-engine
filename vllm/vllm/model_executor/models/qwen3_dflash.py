@@ -291,6 +291,7 @@ class DFlashQwen3Attention(nn.Module):
                 self.num_kv_heads,
                 float(self.q_norm.variance_epsilon),
                 bool(self.rotary_emb.is_neox_style),
+                self.attn.layer_name,
             )
             v = qkv[..., self.q_size + self.kv_size :]
             attn_output = self.attn(q, k, v)
@@ -981,13 +982,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 )
         if static_logits.dim() == 2 and static_logits.shape[0] >= 1:
             if tree_top_buf is not None and tree_top_buf.numel() >= 36:
+                tk_w = 8 if tree_top_buf.numel() >= 48 else 6
                 n_tt = min(6, static_logits.shape[0])
-                tk6 = static_logits[:n_tt].topk(6, dim=-1)
+                tk6 = static_logits[:n_tt].topk(tk_w, dim=-1)
                 tree_top_buf.fill_(-1)
-                tree_top_buf[: 6 * n_tt].copy_(vocab_map[tk6.indices].reshape(-1))
-                if tree_vals_buf is not None and tree_vals_buf.numel() >= 36:
+                tree_top_buf[: tk_w * n_tt].copy_(vocab_map[tk6.indices].reshape(-1))
+                if tree_vals_buf is not None and tree_vals_buf.numel() >= tk_w * 6:
                     tree_vals_buf.fill_(-1e30)
-                    tree_vals_buf[: 6 * n_tt].copy_(tk6.values.to(torch.float32).reshape(-1))
+                    tree_vals_buf[: tk_w * n_tt].copy_(tk6.values.to(torch.float32).reshape(-1))
                 if alt_buf is not None:
                     n_t2 = min(2, n_tt, alt_buf.numel() // 2)
                     alt_buf[: 2 * n_t2].copy_(vocab_map[tk6.indices[:n_t2, :2]].reshape(-1))

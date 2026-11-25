@@ -381,6 +381,14 @@ class VllmBackend:
     WARMUP_SEED_DECODE_STEPS = 4
 
     def _warm_up(self) -> None:
+        if os.environ.get("RESIDENT_FAST_WARMUP", "0").strip() not in ("0", "", "false", "no"):
+            fast_prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_SEED_TOKENS)]
+            for top_flag in (True, False):
+                self.start(fast_prompt, top_logits=top_flag)
+                for _ in range(self.WARMUP_SEED_DECODE_STEPS):
+                    self.step()
+                self.abort()
+            return
         prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_PROMPT_TOKENS)]
         for i in range(self.WARMUP_ROUNDS):
             # Both request shapes the phases use: the timed phases' greedy-only

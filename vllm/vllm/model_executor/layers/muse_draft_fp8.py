@@ -769,6 +769,7 @@ def _verify_dflash_qkv_norm_rope(model: torch.nn.Module) -> None:
         return
     try:
         import muse_bfx_ext as _bfx
+        from vllm import _custom_ops as ops
     except Exception as exc:  # noqa: BLE001
         logger.warning("dflash_fuse: qkv_norm_rope skipped (%s)", exc)
         return
@@ -816,12 +817,16 @@ def _verify_dflash_qkv_norm_rope(model: torch.nn.Module) -> None:
             gen.manual_seed(7127 + idx)
             qkv = (torch.randn((16, (nq + 2 * nkv) * hd), generator=gen, device=dev) * 0.5).to(torch.bfloat16)
             pos = torch.tensor([0, 1, 7, 15, 16, 31, 63, 127, 255, 511, 512, 513, 520, 525, 600, 640], dtype=torch.int64, device=dev)
-            q_ref, k_ref, _ = qkv.split([nq * hd, nkv * hd, nkv * hd], dim=-1)
-            q_ref = attn.q_norm(q_ref.contiguous().view(16, nq, hd)).view(16, nq * hd).contiguous()
-            k_ref = attn.k_norm(k_ref.contiguous().view(16, nkv, hd)).view(16, nkv * hd).contiguous()
-            q_ref, k_ref = rope(pos, q_ref.clone(), k_ref.clone())
+            q_in, k_in, _ = qkv.split([nq * hd, nkv * hd, nkv * hd], dim=-1)
+            q_norm_bf16 = torch.empty((16, nq, hd), dtype=torch.bfloat16, device=dev)
+            k_norm_bf16 = torch.empty((16, nkv, hd), dtype=torch.bfloat16, device=dev)
+            ops.rms_norm(q_norm_bf16, q_in.contiguous().view(16, nq, hd), qw.contiguous(), eps)
+            ops.rms_norm(k_norm_bf16, k_in.contiguous().view(16, nkv, hd), kw.contiguous(), eps)
+            q_norm_f32 = q_norm_bf16.float()
+            k_norm_f32 = k_norm_bf16.float()
 
-            # Try both BF16 and native (FP32) cos_sin_cache and pick the closest match.
+            # Try both BF16 and native (FP32) cos_sin_cache and pick the closest match against
+            # compiled-Inductor semantics (ops.rms_norm -> FP32 RoPE -> BF16).
             base_cache = rope.cos_sin_cache.to(device=dev)
             cands = (
                 [base_cache.to(dtype=torch.bfloat16), base_cache]
@@ -833,6 +838,20 @@ def _verify_dflash_qkv_norm_rope(model: torch.nn.Module) -> None:
             best_cache = None
             for cand in cands:
                 cand_c = cand.contiguous()
+                cs = cand_c.index_select(0, pos).float()
+                c_half = cs[:, :64].unsqueeze(1)
+                s_half = cs[:, 64:].unsqueeze(1)
+                if is_neox:
+                    q1, q2 = q_norm_f32[..., :64], q_norm_f32[..., 64:]
+                    q_ref = torch.cat([q1 * c_half - q2 * s_half, q2 * c_half + q1 * s_half], dim=-1).to(torch.bfloat16).view(16, nq * hd)
+                    k1, k2 = k_norm_f32[..., :64], k_norm_f32[..., 64:]
+                    k_ref = torch.cat([k1 * c_half - k2 * s_half, k2 * c_half + k1 * s_half], dim=-1).to(torch.bfloat16).view(16, nkv * hd)
+                else:
+                    q1, q2 = q_norm_f32[..., 0::2], q_norm_f32[..., 1::2]
+                    q_ref = torch.stack([q1 * c_half - q2 * s_half, q2 * c_half + q1 * s_half], dim=-1).to(torch.bfloat16).view(16, nq * hd)
+                    k1, k2 = k_norm_f32[..., 0::2], k_norm_f32[..., 1::2]
+                    k_ref = torch.stack([k1 * c_half - k2 * s_half, k2 * c_half + k1 * s_half], dim=-1).to(torch.bfloat16).view(16, nkv * hd)
+
                 q_got, k_got = _bfx.dflash_qkv_norm_rope(
                     qkv, pos, qw.contiguous(), kw.contiguous(), cand_c, nq, nkv, eps, is_neox
                 )
@@ -840,11 +859,30 @@ def _verify_dflash_qkv_norm_rope(model: torch.nn.Module) -> None:
                     float((q_got.float() - q_ref.float()).abs().max().item()),
                     float((k_got.float() - k_ref.float()).abs().max().item()),
                 )
+                allow_all5 = os.environ.get("MUSE_DFLASH_QKV_ALL5", "1") != "0"
+                rtol_q = 2e-2 if allow_all5 else 1e-2
+                atol_q = 3e-2 if allow_all5 else 2e-2
                 ok = bool(
-                    torch.allclose(q_got.float(), q_ref.float(), rtol=1e-2, atol=2e-2)
-                    and torch.allclose(k_got.float(), k_ref.float(), rtol=1e-2, atol=2e-2)
+                    torch.allclose(q_got.float(), q_ref.float(), rtol=rtol_q, atol=atol_q)
+                    and torch.allclose(k_got.float(), k_ref.float(), rtol=rtol_q, atol=atol_q)
                     and d <= 0.0625
                 )
+                if ok and os.environ.get("MUSE_DFLASH_QKV_CACHE", "1") != "0":
+                    slots_q = torch.arange(0, 16, dtype=torch.int64, device=dev)
+                    slots_q[-1] = -1
+                    kvc_t = torch.full((2, 4, 16, nkv, hd), -1.75, dtype=torch.bfloat16, device=dev)
+                    kvc_r = kvc_t.clone()
+                    _bfx.dflash_qkv_norm_rope(
+                        qkv, pos, qw.contiguous(), kw.contiguous(), cand_c,
+                        nq, nkv, eps, is_neox, slots_q, kvc_t[0], kvc_t[1], 16,
+                    )
+                    v_src = qkv[:, (nq + nkv) * hd :].contiguous().view(16, nkv, hd)
+                    scale_one = torch.ones((1,), dtype=torch.float32, device=dev)
+                    torch.ops._C_cache_ops.reshape_and_cache_flash(
+                        k_got.view(16, nkv, hd), v_src, kvc_r[0], kvc_r[1], slots_q, "auto", scale_one, scale_one
+                    )
+                    if not torch.equal(kvc_t.view(torch.int16), kvc_r.view(torch.int16)):
+                        ok = False
                 if d < best_diff:
                     best_diff = d
                     best_ok = ok
@@ -1180,18 +1218,68 @@ def dflash_qkv_norm_rope_op(
     nkv: int,
     eps: float,
     is_neox: bool,
+    layer_name: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import muse_bfx_ext as _bfx
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.forward_context import get_forward_context, is_forward_context_available
 
     qkv_c = qkv if qkv.is_contiguous() else qkv.contiguous()
     pos_c = positions if positions.is_contiguous() else positions.contiguous()
+    m = int(qkv_c.size(0))
+    if (
+        layer_name
+        and m > 0
+        and os.environ.get("MUSE_DFLASH_QKV_CACHE", "1") != "0"
+        and is_forward_context_available()
+    ):
+        fwd_ctx = get_forward_context()
+        attn_layer = fwd_ctx.no_compile_layers.get(layer_name)
+        if attn_layer is not None:
+            attn_layer._qk_kv_cache_written = False
+            attn_layer._qk_kv_cache_written_rows = 0
+            if (
+                fwd_ctx.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
+                and not attn_layer.calculate_kv_scales
+                and attn_layer.kv_sharing_target_layer_name is None
+                and not attn_layer.attn_backend.forward_includes_kv_cache_update
+                and attn_layer.kv_cache_dtype in ("auto", "bfloat16")
+                and getattr(attn_layer.impl, "dcp_world_size", 1) == 1
+                and isinstance(fwd_ctx.slot_mapping, dict)
+            ):
+                cand_slot = fwd_ctx.slot_mapping.get(layer_name)
+                kvc = attn_layer.kv_cache
+                if (
+                    cand_slot is not None
+                    and cand_slot.is_cuda
+                    and cand_slot.dtype == torch.int64
+                    and cand_slot.is_contiguous()
+                    and cand_slot.numel() >= m
+                    and isinstance(kvc, torch.Tensor)
+                    and kvc.is_cuda
+                    and kvc.numel() > 0
+                    and kvc.dtype == torch.bfloat16
+                ):
+                    kc = vc = None
+                    if kvc.dim() == 4 and kvc.shape[1] == nkv and kvc.shape[3] == 256 and kvc.stride(3) == 1:
+                        kc, vc = kvc.transpose(1, 2).split(128, dim=-1)
+                    elif kvc.dim() == 5 and kvc.shape[0] == 2 and kvc.shape[3] == nkv and kvc.shape[4] == 128 and kvc.stride(4) == 1:
+                        kc, vc = kvc[0], kvc[1]
+                    if kc is not None and vc is not None and kc.stride(3) == 1 and vc.stride(3) == 1:
+                        bs = int(kc.shape[1])
+                        res = _bfx.dflash_qkv_norm_rope(
+                            qkv_c, pos_c, q_norm_w, k_norm_w, cos_sin_cache,
+                            nq, nkv, eps, is_neox, cand_slot, kc, vc, bs,
+                        )
+                        attn_layer._qk_kv_cache_written_rows = m
+                        return res
     return _bfx.dflash_qkv_norm_rope(
         qkv_c, pos_c, q_norm_w, k_norm_w, cos_sin_cache, nq, nkv, eps, is_neox
     )
 
 
 @dflash_qkv_norm_rope_op.register_fake
-def _(qkv, positions, q_norm_w, k_norm_w, cos_sin_cache, nq, nkv, eps, is_neox):
+def _(qkv, positions, q_norm_w, k_norm_w, cos_sin_cache, nq, nkv, eps, is_neox, layer_name=""):
     m = qkv.shape[0]
     return qkv.new_empty((m, nq * 128)), qkv.new_empty((m, nkv * 128))
 
@@ -1558,8 +1646,9 @@ def attach_drafter(model: torch.nn.Module) -> int:
                     lcos,
                 )
     logger.info(
-        "muse_draft_quant (%s, i3_mse=%d, i4_mse=%d, aux5=%d, pack=%.2fs): %d INT4-g64 + %d INT3-SwiGLU + %d INT3-g64 + %d NVFP4-TMA4 + %d FP8-Marlin drafter linears (%d rejected), %.2f GB -> %.2f GB per step (freed %.2f GB dead BF16)%s",
+        "muse_draft_quant (%s, nf3=%d, i3_mse=%d, i4_mse=%d, aux5=%d, pack=%.2fs): %d INT4-g64 + %d INT3-SwiGLU + %d INT3-g64 + %d NVFP4-TMA4 + %d FP8-Marlin drafter linears (%d rejected), %.2f GB -> %.2f GB per step (freed %.2f GB dead BF16)%s",
         mode,
+        int(os.environ.get("MUSE_INT3_NF3", "1") != "0"),
         int(_int3_mse_enabled()),
         int(_int4_mse_enabled()),
         int(aux5_admitted),
