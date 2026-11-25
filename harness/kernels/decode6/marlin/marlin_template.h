@@ -303,7 +303,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool gate_up_swiglu_fp8 = false,
           const bool tma_ovlp = false,
           const bool half_split = false,
-          const bool fast_pal16 = false>
+          const bool fast_pal16 = false,
+          const bool multi_m = false>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -346,7 +347,7 @@ __global__ void Marlin(
 #endif
 ) {
   if constexpr (scale6) {
-    prob_m = 1;
+    if constexpr (!multi_m) prob_m = 1;
     lda = prob_k;
     num_groups = prob_k >> 4;
     has_bias = false;
@@ -737,7 +738,7 @@ __global__ void Marlin(
   // overall size of a tile
   constexpr int a_sh_stage = a_sh_stride * m_block_size;
   constexpr int a_sh_stage_step =
-      (scale6 && m_block_size_8 && (tma_ovlp || stages != 4 || half_split || fast_pal16 || fixed_shape == 3))
+      (!multi_m && scale6 && m_block_size_8 && (tma_ovlp || stages != 4 || half_split || fast_pal16 || fixed_shape == 3))
           ? a_sh_stride
           : a_sh_stage;
   // number of shared write iterations for a tile
@@ -1103,7 +1104,7 @@ __global__ void Marlin(
     }
   }
   constexpr bool fast_m1_red =
-      scale6 && m_block_size_8 && (tma_ovlp || fast_pal16 || stages == 3 || half_split || fixed_shape == 3);
+      !multi_m && scale6 && m_block_size_8 && (tma_ovlp || fast_pal16 || stages == 3 || half_split || fixed_shape == 3);
 #ifdef MUSE_SCALE_TMA4
   static_assert(scale6 && (threads == 256 || threads == 128),
                 "TMA4 rANS scales require M = 1 decode config (128 or 256 threads)");
@@ -2448,7 +2449,7 @@ __global__ void Marlin(
     int c_sh_rd = c_sh_stride * (threadIdx.x / (2 * thread_n_blocks)) +
                   (threadIdx.x % (2 * thread_n_blocks));
 
-    int c_gl_wr_end = (fixed_shape == 3 ? (202048 / 8) : c_gl_stride) * prob_m;
+    int c_gl_wr_end = ((fixed_shape == 3 && !multi_m) ? (202048 / 8) : c_gl_stride) * prob_m;
     // We first reorder in shared memory to guarantee the most efficient final
     // global write patterns
     auto write = [&](int idx, float c0, float c1, FragS& s, FragS& b_bias) {

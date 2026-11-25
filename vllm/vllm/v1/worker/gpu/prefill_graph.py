@@ -172,8 +172,11 @@ def prefill_graph_unsupported(runner, num_tokens: int) -> str | None:
     ) != (1, 1, 1) or runner.use_dcp:
         return "parallelism"
     if (
-        runner.lora_config
+        runner.speculator is not None
+        or runner.speculative_config is not None
+        or runner.lora_config
         or runner.is_pooling_model
+        or runner.use_aux_hidden_state_outputs
         or runner.is_encoder_decoder
         or runner.pcp_manager is not None
         or getattr(runner.cache_config, "calculate_kv_scales", False)
@@ -200,11 +203,7 @@ def capture_prefill_graph(runner) -> PrefillGraph | None:
         return None
     started = time.perf_counter()
     graph = None
-    prepare_tile = (
-        None
-        if runner.use_aux_hidden_state_outputs
-        else getattr(runner.model, "prepare_final_sample_tile", None)
-    )
+    prepare_tile = getattr(runner.model, "prepare_final_sample_tile", None)
     if prepare_tile is not None:
         try:
             sample_tile = prepare_tile(num_tokens)
@@ -322,21 +321,11 @@ class PrefillGraph:
         self.graph = torch.cuda.CUDAGraph()
         get_offloader().sync_prev_onload()
         with torch.cuda.graph(self.graph, self.pool):
-            self.model_output = self._forward()
+            self.hidden_states = self._forward()
             get_offloader().join_after_forward()
         torch.accelerator.synchronize()
-        if isinstance(self.model_output, tuple):
-            if (
-                len(self.model_output) != 2
-                or not isinstance(self.model_output[0], torch.Tensor)
-                or not isinstance(self.model_output[1], list)
-            ):
-                raise TypeError(f"model returned unexpected tuple {type(self.model_output).__name__}")
-            self.hidden_states = self.model_output[0]
-        elif isinstance(self.model_output, torch.Tensor):
-            self.hidden_states = self.model_output
-        else:
-            raise TypeError(f"model returned {type(self.model_output).__name__}")
+        if not isinstance(self.hidden_states, torch.Tensor):
+            raise TypeError(f"model returned {type(self.hidden_states).__name__}")
         if self.final_sample_tile:
             logger.info("Prefill graph captured both final FFN tiles on the compiled backbone")
             plans = getattr(self.sample_tile, "attn_plans", None)
@@ -500,7 +489,7 @@ class PrefillGraph:
             if not pairs and self.embed_input_ids is not None and os.environ.get("VLLM_PREFILL_GRAPH_FAST", "1") != "0":
                 self._fast_verified = True
         self.replays += 1
-        return self.model_output
+        return self.hidden_states
 
     def can_fast_replay(
         self,
@@ -549,7 +538,7 @@ class PrefillGraph:
         self._fast_replays += 1
         if self._fast_replays == 1:
             logger.info("Prefill graph: fast replay active (skipping 52-layer metadata and _plan)")
-        return self.model_output
+        return self.hidden_states
 
     def stage_zero_prep(
         self,

@@ -73,6 +73,10 @@ _sk_tma4_ilv = getattr(_lib, "muse_marlin6_sk_tma4_ilv", None)
 if _sk_tma4_ilv is not None:
     _sk_tma4_ilv.argtypes = _gemv6.argtypes
     _sk_tma4_ilv.restype = ctypes.c_int
+_sk_tma4_ilv_m = getattr(_lib, "muse_marlin6_sk_tma4_ilv_m", None)
+if _sk_tma4_ilv_m is not None:
+    _sk_tma4_ilv_m.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
+    _sk_tma4_ilv_m.restype = ctypes.c_int
 _sk_tma4_gated = getattr(_lib, "muse_marlin6_sk_tma4_gated", None)
 if _sk_tma4_gated is not None:
     _sk_tma4_gated.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
@@ -874,6 +878,30 @@ def decode_linear6(
                 raise RuntimeError(f"SM121 Marlin gate_up SwiGLU launch failed with CUDA error {status}")
             _notify_gate_up_swiglu(out_buf.data_ptr(), sw_entry, True, None)
             return out_buf
+        if x.ndim == 2 and 1 < x.shape[0] <= 8 and is_tma4_ilv(scales6) and _sk_tma4_ilv_m is not None:
+            m = int(x.shape[0])
+            output = x.new_empty((m, eff_n))
+            status = _sk_tma4_ilv_m(
+                x.data_ptr(), tiled_weight.data_ptr(), output.data_ptr(), partials.data_ptr(),
+                scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
+                m, eff_n, k, blocks, x.device.index, torch.cuda.current_stream().cuda_stream,
+            )
+            if status:
+                raise RuntimeError(f"SM121 Marlin multi-M (scale6) launch failed with CUDA error {status}")
+            if lm_pad128:
+                return output[:, :n].contiguous()
+            if (n, k) == (GATE_UP_N, GATE_UP_K) and global_scale.data_ptr() in _SWIGLU_GATE_UP:
+                head = output[:, :33792].view(m, 264, 2, 64)
+                return torch.cat(
+                    (
+                        head[:, :, 0, :].reshape(m, 16896),
+                        output[:, 33792:36864],
+                        head[:, :, 1, :].reshape(m, 16896),
+                        output[:, 36864:],
+                    ),
+                    dim=1,
+                )
+            return output
         output = x.new_empty((*x.shape[:-1], n))
         kernel = _gate_up if use_grid else _gemv6
         if is_tma4_ilv(scales6):

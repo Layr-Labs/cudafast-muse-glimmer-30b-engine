@@ -109,10 +109,12 @@ except (ImportError, OSError):
 try:
     # 6-bit block-scale codes for the tiled decode GEMV (harness/kernels/decode6)
     from muse_marlin6_gemv import STATS as _scale6_stats
+    from muse_marlin6_gemv import is_tma4_ilv as _is_tma4_ilv
     from muse_marlin6_gemv import prepare_decode_layout6
 except (ImportError, OSError):
     prepare_decode_layout6 = None
     _scale6_stats = None
+    _is_tma4_ilv = None
 
 logger = init_logger(__name__)
 
@@ -234,20 +236,22 @@ def _marlin_fp4_single(
     decode_fixed_grid: bool = False,
 ) -> torch.Tensor:
     if (
-        x.shape[0] == 1
+        1 <= x.shape[0] <= 8
         and x.dtype == torch.bfloat16
         and decode_weight is not None
         and decode_scales is not None
     ):
         if decode_palette is not None:
             # decode_scales holds the layer's 6-bit codes into decode_palette
-            return torch.ops.vllm.marlin_tiled_decode6.default(
-                x, decode_weight, decode_scales, decode_palette, weight_global_scale, workspace,
-                size_n, size_k, decode_fixed_grid,
+            if x.shape[0] == 1 or (_is_tma4_ilv is not None and _is_tma4_ilv(decode_scales)):
+                return torch.ops.vllm.marlin_tiled_decode6.default(
+                    x, decode_weight, decode_scales, decode_palette, weight_global_scale, workspace,
+                    size_n, size_k, decode_fixed_grid,
+                )
+        elif x.shape[0] == 1:
+            return torch.ops.vllm.marlin_tiled_decode.default(
+                x, decode_weight, decode_scales, weight_global_scale, workspace, size_n, size_k
             )
-        return torch.ops.vllm.marlin_tiled_decode.default(
-            x, decode_weight, decode_scales, weight_global_scale, workspace, size_n, size_k
-        )
     return apply_fp4_marlin_linear(
         input=x,
         weight=weight,
