@@ -157,6 +157,10 @@ def _muse_fp8_scaled_mm(
         and A.dtype == torch.float8_e4m3fn
         and _scales_ok(As, Bs, n)
     ):
+        if _consume_rans_prologue is not None:
+            fused = _consume_rans_prologue(A, As, packed, n, k, Bs)
+            if fused is not None:
+                return fused
         # verify-width rows: the same rANS stream and the same per-row MMA chain as the M == 1 GEMV
         out = torch.empty((A.shape[0], n), dtype=torch.bfloat16, device=A.device)
         _rans.rans_gemm_m_auto(packed, A, Bs.reshape(-1), As.reshape(-1), out, n, k)

@@ -999,7 +999,7 @@ __device__ __forceinline__ void issue_v_dsplit_async(
   }
 }
 
-template <int kBlockN, int kDSplits>
+template <int kBlockN, int kDSplits, bool kMultiQ = false>
 __global__ __launch_bounds__(128, 2) void gqa16_1pass_dsplit_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
     const __nv_bfloat16* __restrict__ kv_ptr,
@@ -1013,7 +1013,10 @@ __global__ __launch_bounds__(128, 2) void gqa16_1pass_dsplit_kernel(
     int64_t out_head_stride,
     int64_t stride_block,
     int64_t stride_slot,
-    int64_t stride_kv_head) {
+    int64_t stride_kv_head,
+    const int32_t* __restrict__ cu_seqlens_q_ptr = nullptr,
+    int64_t q_tok_stride = 0,
+    int64_t out_tok_stride = 0) {
   static_assert(kBlockN == 64 || kBlockN == 128, "kBlockN must be 64 or 128");
   static_assert(kDSplits == 4 || kDSplits == 8 || kDSplits == 16, "kDSplits must be 4, 8, or 16");
   constexpr int kShift        = (kBlockN == 128) ? 7 : 6;
@@ -1034,7 +1037,17 @@ __global__ __launch_bounds__(128, 2) void gqa16_1pass_dsplit_kernel(
   const int group_id   = lane >> 2;
   const int tid_in_grp = lane & 3;
 
-  const int seqlen_k = seqused_k_ptr[0];
+  int seqlen_k = seqused_k_ptr[0];
+  if constexpr (kMultiQ) {
+    const int q0 = cu_seqlens_q_ptr[0];
+    const int actual_m = cu_seqlens_q_ptr[1] - q0;
+    const int q_idx = blockIdx.z;
+    if (q_idx >= actual_m) return;
+    q_ptr += static_cast<int64_t>(q0 + q_idx) * q_tok_stride;
+    out_ptr += static_cast<int64_t>(q0 + q_idx) * out_tok_stride;
+    seqlen_k -= (actual_m - 1 - q_idx);
+    if (seqlen_k < 0) seqlen_k = 0;
+  }
   const int k_start  = (window_left >= 0)
       ? ((seqlen_k - 1 - window_left > 0) ? (seqlen_k - 1 - window_left) : 0)
       : 0;
@@ -1229,7 +1242,7 @@ __global__ __launch_bounds__(128, 2) void gqa16_1pass_dsplit_kernel(
   }
 }
 
-template <int kDSplits>
+template <int kDSplits, bool kMultiQ = false>
 __global__ __launch_bounds__(128, 2) void gqa16_1pass_dsplit_pipe_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
     const __nv_bfloat16* __restrict__ kv_ptr,
@@ -1243,7 +1256,10 @@ __global__ __launch_bounds__(128, 2) void gqa16_1pass_dsplit_pipe_kernel(
     int64_t out_head_stride,
     int64_t stride_block,
     int64_t stride_slot,
-    int64_t stride_kv_head) {
+    int64_t stride_kv_head,
+    const int32_t* __restrict__ cu_seqlens_q_ptr = nullptr,
+    int64_t q_tok_stride = 0,
+    int64_t out_tok_stride = 0) {
   static_assert(kDSplits == 4 || kDSplits == 8 || kDSplits == 16, "kDSplits must be 4, 8, or 16");
   constexpr int kBlockN       = 128;
   constexpr int kShift        = 7;
@@ -1262,7 +1278,17 @@ __global__ __launch_bounds__(128, 2) void gqa16_1pass_dsplit_pipe_kernel(
   const int group_id   = lane >> 2;
   const int tid_in_grp = lane & 3;
 
-  const int seqlen_k = seqused_k_ptr[0];
+  int seqlen_k = seqused_k_ptr[0];
+  if constexpr (kMultiQ) {
+    const int q0 = cu_seqlens_q_ptr[0];
+    const int actual_m = cu_seqlens_q_ptr[1] - q0;
+    const int q_idx = blockIdx.z;
+    if (q_idx >= actual_m) return;
+    q_ptr += static_cast<int64_t>(q0 + q_idx) * q_tok_stride;
+    out_ptr += static_cast<int64_t>(q0 + q_idx) * out_tok_stride;
+    seqlen_k -= (actual_m - 1 - q_idx);
+    if (seqlen_k < 0) seqlen_k = 0;
+  }
   const int k_start  = (window_left >= 0)
       ? ((seqlen_k - 1 - window_left > 0) ? (seqlen_k - 1 - window_left) : 0)
       : 0;
@@ -2099,6 +2125,7 @@ __device__ __forceinline__ void combine_splits_pipe_exact(
   *reinterpret_cast<uint4*>(dst + 8) = make_uint4(packed[4], packed[5], packed[6], packed[7]);
 }
 
+template <bool kMultiQDirect = false>
 __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
     const __nv_bfloat16* __restrict__ kv_ptr,
@@ -2117,7 +2144,10 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
     int64_t out_head_stride,
     int64_t stride_block,
     int64_t stride_slot,
-    int64_t stride_kv_head) {
+    int64_t stride_kv_head,
+    const int32_t* __restrict__ cu_seqlens_q_ptr = nullptr,
+    int64_t q_tok_stride = 0,
+    int64_t out_tok_stride = 0) {
   __shared__ Pipe128Storage smem;
 
   const int worker_idx  = blockIdx.x;
@@ -2129,7 +2159,17 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
   const int group_id    = lane >> 2;
   const int tid_in_grp  = lane & 3;
 
-  const int seqlen_k = seqused_k_ptr[0];
+  int seqlen_k = seqused_k_ptr[0];
+  if constexpr (kMultiQDirect) {
+    const int q0 = cu_seqlens_q_ptr[0];
+    const int actual_m = cu_seqlens_q_ptr[1] - q0;
+    const int q_idx = blockIdx.z;
+    if (q_idx >= actual_m) return;
+    q_ptr += static_cast<int64_t>(q0 + q_idx) * q_tok_stride;
+    out_ptr += static_cast<int64_t>(q0 + q_idx) * out_tok_stride;
+    seqlen_k -= (actual_m - 1 - q_idx);
+    if (seqlen_k < 0) seqlen_k = 0;
+  }
   const int k_start = (window_left >= 0)
       ? ((seqlen_k - 1 - window_left > 0) ? (seqlen_k - 1 - window_left) : 0)
       : 0;
@@ -2383,34 +2423,56 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
       if (tid_in_grp == 0) {
         smem.warp_sum[group_id]     = inv0;
         smem.warp_sum[group_id + 8] = inv1;
-        const float lse0 = empty0 ? -INFINITY
-                                  : fma_rn_ftz_f32(row_max0, softmax_scale, mul_ftz_f32(fast_log2f(row_sum0), kLn2));
-        const float lse1 = empty1 ? -INFINITY
-                                  : fma_rn_ftz_f32(row_max1, softmax_scale, mul_ftz_f32(fast_log2f(row_sum1), kLn2));
-        float* lse_slot = lse_partial + (kv_head * kMaxSplits + s_slot) * 16;
-        st_cg_f32(lse_slot + group_id,     lse0);
-        st_cg_f32(lse_slot + group_id + 8, lse1);
+        if constexpr (!kMultiQDirect) {
+          const float lse0 = empty0 ? -INFINITY
+                                    : fma_rn_ftz_f32(row_max0, softmax_scale, mul_ftz_f32(fast_log2f(row_sum0), kLn2));
+          const float lse1 = empty1 ? -INFINITY
+                                    : fma_rn_ftz_f32(row_max1, softmax_scale, mul_ftz_f32(fast_log2f(row_sum1), kLn2));
+          float* lse_slot = lse_partial + (kv_head * kMaxSplits + s_slot) * 16;
+          st_cg_f32(lse_slot + group_id,     lse0);
+          st_cg_f32(lse_slot + group_id + 8, lse1);
+        }
       }
     }
     __syncthreads();
 
     const float inv0 = smem.warp_sum[group_id];
     const float inv1 = smem.warp_sum[group_id + 8];
-    float* o_slot = o_partial + (kv_head * kMaxSplits + s_slot) * 16 * 128;
-    #pragma unroll
-    for (int dt = 0; dt < 4; ++dt) {
-      const int d_col = (warp_id << 5) + (dt << 3) + (tid_in_grp << 1);
-      st_cg_f32x2(o_slot + group_id * 128 + d_col,
-                  mul_ftz_f32(o_frag[dt][0], inv0), mul_ftz_f32(o_frag[dt][1], inv0));
-      st_cg_f32x2(o_slot + (group_id + 8) * 128 + d_col,
-                  mul_ftz_f32(o_frag[dt][2], inv1), mul_ftz_f32(o_frag[dt][3], inv1));
+    if constexpr (kMultiQDirect) {
+      #pragma unroll
+      for (int dt = 0; dt < 4; ++dt) {
+        const int d_col = (warp_id << 5) + (dt << 3) + (tid_in_grp << 1);
+        const __nv_bfloat162 ob0 = __floats2bfloat162_rn(
+            mul_ftz_f32(o_frag[dt][0], inv0), mul_ftz_f32(o_frag[dt][1], inv0));
+        const __nv_bfloat162 ob1 = __floats2bfloat162_rn(
+            mul_ftz_f32(o_frag[dt][2], inv1), mul_ftz_f32(o_frag[dt][3], inv1));
+        *reinterpret_cast<uint32_t*>(
+            out_ptr + static_cast<int64_t>(kv_head * 16 + group_id) * out_head_stride + d_col) =
+            *reinterpret_cast<const uint32_t*>(&ob0);
+        *reinterpret_cast<uint32_t*>(
+            out_ptr + static_cast<int64_t>(kv_head * 16 + group_id + 8) * out_head_stride + d_col) =
+            *reinterpret_cast<const uint32_t*>(&ob1);
+      }
+      return;
+    } else {
+      float* o_slot = o_partial + (kv_head * kMaxSplits + s_slot) * 16 * 128;
+      #pragma unroll
+      for (int dt = 0; dt < 4; ++dt) {
+        const int d_col = (warp_id << 5) + (dt << 3) + (tid_in_grp << 1);
+        st_cg_f32x2(o_slot + group_id * 128 + d_col,
+                    mul_ftz_f32(o_frag[dt][0], inv0), mul_ftz_f32(o_frag[dt][1], inv0));
+        st_cg_f32x2(o_slot + (group_id + 8) * 128 + d_col,
+                    mul_ftz_f32(o_frag[dt][2], inv1), mul_ftz_f32(o_frag[dt][3], inv1));
+      }
+      __syncthreads();
     }
-    __syncthreads();
   }
 
-  combine_splits_pipe_exact(
-      smem, out_ptr, o_partial, lse_partial, split_cnt,
-      kv_head, active_workers, fa2_splits, s_begin, s_end, out_head_stride, tid);
+  if constexpr (!kMultiQDirect) {
+    combine_splits_pipe_exact(
+        smem, out_ptr, o_partial, lse_partial, split_cnt,
+        kv_head, active_workers, fa2_splits, s_begin, s_end, out_head_stride, tid);
+  }
 }
 
 }  // namespace muse_gqa16
@@ -3100,4 +3162,92 @@ extern "C" int muse_gqa16_prefill(
         q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
   }
   return static_cast<int>(err);
+}
+
+extern "C" int muse_gqa16_verify(
+    const void* q_ptr,
+    const void* kv_ptr,
+    void* out_ptr,
+    const void* seqused_k_ptr,
+    const void* block_table_ptr,
+    const void* cu_seqlens_q_ptr,
+    int max_q,
+    int block_size,
+    int window_left,
+    int grid_splits,
+    int mode,
+    float softmax_scale,
+    int64_t q_tok_stride,
+    int64_t q_head_stride,
+    int64_t out_tok_stride,
+    int64_t out_head_stride,
+    int64_t stride_block,
+    int64_t stride_slot,
+    int64_t stride_kv_head,
+    void* cuda_stream) {
+  if (!q_ptr || !kv_ptr || !out_ptr || !seqused_k_ptr || !block_table_ptr || !cu_seqlens_q_ptr ||
+      max_q < 1 || max_q > 16 ||
+      (grid_splits != 1 && grid_splits != 4 && grid_splits != 8 && grid_splits != 16) ||
+      block_size < 16 || (block_size & 15) != 0) {
+    return 1;
+  }
+  const bool use_scale_mode3 = ((mode & 3) == 3);
+  const bool use_pipe128     = ((mode & 16) != 0);
+  const float scale_log2 =
+      use_scale_mode3
+          ? (softmax_scale * muse_gqa16::kLog2e)
+          : static_cast<float>(static_cast<double>(softmax_scale) * 1.44269504088896340736);
+  const cudaStream_t stream = static_cast<cudaStream_t>(cuda_stream);
+  const dim3 grid(static_cast<unsigned>(grid_splits), 2u, static_cast<unsigned>(max_q));
+  const auto* q = static_cast<const __nv_bfloat16*>(q_ptr);
+  const auto* kv = static_cast<const __nv_bfloat16*>(kv_ptr);
+  auto* out = static_cast<__nv_bfloat16*>(out_ptr);
+  const auto* sk = static_cast<const int32_t*>(seqused_k_ptr);
+  const auto* bt = static_cast<const int32_t*>(block_table_ptr);
+  const auto* cuq = static_cast<const int32_t*>(cu_seqlens_q_ptr);
+
+  if (grid_splits == 1) {
+    muse_gqa16::gqa16_fa2_block128_pipe_kernel<true><<<grid, dim3(128u, 1u, 1u), 0, stream>>>(
+        q, kv, out, nullptr, nullptr, nullptr, sk, bt, block_size, window_left, 1,
+        softmax_scale, scale_log2, q_head_stride, out_head_stride,
+        stride_block, stride_slot, stride_kv_head, cuq, q_tok_stride, out_tok_stride);
+    return static_cast<int>(cudaGetLastError());
+  }
+
+  if (use_pipe128) {
+    if (grid_splits == 4) {
+      muse_gqa16::gqa16_1pass_dsplit_pipe_kernel<4, true><<<grid, dim3(128u, 1u, 1u), 0, stream>>>(
+          q, kv, out, sk, bt, block_size, window_left, scale_log2,
+          q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
+          cuq, q_tok_stride, out_tok_stride);
+    } else if (grid_splits == 8) {
+      muse_gqa16::gqa16_1pass_dsplit_pipe_kernel<8, true><<<grid, dim3(128u, 1u, 1u), 0, stream>>>(
+          q, kv, out, sk, bt, block_size, window_left, scale_log2,
+          q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
+          cuq, q_tok_stride, out_tok_stride);
+    } else {
+      muse_gqa16::gqa16_1pass_dsplit_pipe_kernel<16, true><<<grid, dim3(128u, 1u, 1u), 0, stream>>>(
+          q, kv, out, sk, bt, block_size, window_left, scale_log2,
+          q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
+          cuq, q_tok_stride, out_tok_stride);
+    }
+  } else {
+    if (grid_splits == 4) {
+      muse_gqa16::gqa16_1pass_dsplit_kernel<128, 4, true><<<grid, dim3(128u, 1u, 1u), 0, stream>>>(
+          q, kv, out, sk, bt, block_size, window_left, scale_log2,
+          q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
+          cuq, q_tok_stride, out_tok_stride);
+    } else if (grid_splits == 8) {
+      muse_gqa16::gqa16_1pass_dsplit_kernel<128, 8, true><<<grid, dim3(128u, 1u, 1u), 0, stream>>>(
+          q, kv, out, sk, bt, block_size, window_left, scale_log2,
+          q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
+          cuq, q_tok_stride, out_tok_stride);
+    } else {
+      muse_gqa16::gqa16_1pass_dsplit_kernel<128, 16, true><<<grid, dim3(128u, 1u, 1u), 0, stream>>>(
+          q, kv, out, sk, bt, block_size, window_left, scale_log2,
+          q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
+          cuq, q_tok_stride, out_tok_stride);
+    }
+  }
+  return static_cast<int>(cudaGetLastError());
 }
