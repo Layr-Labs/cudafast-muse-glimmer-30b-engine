@@ -49,6 +49,10 @@ def lib():
     if ss is not None:
         ss.argtypes = [p, p, ctypes.c_int, p]
         ss.restype = ctypes.c_int
+    ss8 = getattr(native, "muse_norm_glue_mul_silu_slice_fp8", None)
+    if ss8 is not None:
+        ss8.argtypes = [p, p, p, ctypes.c_int, p]
+        ss8.restype = ctypes.c_int
     pdl = getattr(native, "muse_norm_glue_set_pdl", None)
     if pdl is not None:
         pdl.argtypes = [ctypes.c_int]
@@ -161,3 +165,12 @@ def mul_silu_slice_bf16(gu, out, rows, stream):
     err = fn(_ptr(gu), _ptr(out), int(rows), stream)
     if err:
         raise RuntimeError(f"muse_norm_glue mul_silu_slice_bf16 launch returned CUDA status {err}")
+
+
+def mul_silu_slice_fp8(gu, scale, out, rows, stream):
+    fn = getattr(lib(), "muse_norm_glue_mul_silu_slice_fp8", None)
+    if fn is None:
+        raise RuntimeError("muse_norm_glue_mul_silu_slice_fp8 unavailable")
+    err = fn(_ptr(gu), _ptr(scale), _ptr(out), int(rows), stream)
+    if err:
+        raise RuntimeError(f"muse_norm_glue mul_silu_slice_fp8 launch returned CUDA status {err}")
