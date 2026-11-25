@@ -75,6 +75,10 @@ try:
     import muse_gqa16_attn
 except (ImportError, OSError):
     muse_gqa16_attn = None
+try:
+    from vllm.v1.worker.gpu.spec_decode.dflash import muse_leaf as _muse_leaf
+except Exception:  # noqa: BLE001
+    _muse_leaf = None
 
 logger = init_logger(__name__)
 
@@ -959,6 +963,29 @@ class FlashAttentionImpl(AttentionImpl):
                     if attn_metadata.sliding_window is not None
                     else self.sliding_window
                 )
+                if _muse_leaf is not None and _muse_leaf._DBG.get("vlog", 0) < 6:
+                    _muse_leaf._DBG["vlog"] = _muse_leaf._DBG.get("vlog", 0) + 1
+                    _muse_leaf._DBG.setdefault("vseen", []).append(
+                        (int(num_actual_tokens), int(query.shape[0]), int(attn_metadata.query_start_loc.shape[0]),
+                         bool(torch.cuda.is_current_stream_capturing())))
+                _leaf = (
+                    _muse_leaf is not None
+                    and _muse_leaf.ENABLED
+                    and num_actual_tokens == 7
+                    and attn_metadata.query_start_loc.shape[0] == 2
+                )
+                _leaf_side = None
+                _leaf_tok = None
+                if _leaf:
+                    _mns0 = attn_metadata.max_num_splits
+
+                    def _run0(q, kv, o, sk, bt, cu, n, sc, w):
+                        return muse_gqa16_attn.try_verify_gqa16(
+                            query=q, kv_cache=kv, output=o, seqused_k=sk, block_table=bt, cu_seqlens_q=cu,
+                            num_actual_tokens=n, softmax_scale=sc, window=w, max_num_splits=_mns0,
+                        )
+
+                    _leaf_tok = _muse_leaf.prep_hook(query, kv_cache, attn_metadata, window, self.scale, _run0, layer)
                 if muse_gqa16_attn.try_verify_gqa16(
                     query=query,
                     kv_cache=kv_cache,
@@ -971,6 +998,8 @@ class FlashAttentionImpl(AttentionImpl):
                     window=window,
                     max_num_splits=attn_metadata.max_num_splits,
                 ):
+                    if _leaf and _leaf_tok is not None:
+                        _muse_leaf.leaf_hook(output, _leaf_tok)
                     return output
 
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
