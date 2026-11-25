@@ -37,12 +37,18 @@ __global__ void native_leaf_prepare_tree_kernel(
   seq_lens[0] = seq_lens[0] + (tree_m - 7);
 }
 
-// Calibrated path-probability scorer for Q=16 hybrid INT4/INT3 (fit on 25 held-out prompts / 775 steps / 2,432 pos).
-// p(j,r) = exp(a_j + [post] a2_j + c_r + beta*(z_r - z_0)) / (1 + sum_{r<6} exp(...)), top-6 logits only.
-__constant__ float kCalA[6] = {2.306506f, 1.887325f, 1.855997f, 2.466950f, 2.011343f, 2.128308f};
-__constant__ float kCalA2[6] = {0.000000f, -2.179998f, -1.811194f, -2.501970f, -1.662824f, -1.848898f};
-__constant__ float kCalC[6] = {0.000000f, -0.577494f, -1.005365f, -1.001172f, -1.611217f, -2.073095f};
-#define CAL_BETA 0.818139f
+// Calibrated path-probability scorer for Q=16 hybrid INT4/INT3 (5-fold CV validated on 25 real prompts / 737 steps).
+// Pre-miss:  p(j,r) = exp(a_j + w_sm*sm_c + w_z0*z0_c + c_r + beta*(z_r - z_0)) / (1 + sum_{r<6} exp(...))
+// Post-miss: p_post(j,r) = exp(a_j + a2 + w_z0p*z0_c + c_r + beta_post*(z_r - z_0)) / (1 + sum_{r<6} exp(...))
+// L3+ after L2 sub hit resyncs with drafter top-1 (uses p1[j], empirical 63.3%); L1 also spawns d_{k+1}#2 via p2post (14.2%).
+__constant__ float kCalA[6] = {1.675690f, 1.258784f, 1.070196f, 1.171448f, 1.102070f, 0.731610f};
+__constant__ float kCalC[6] = {0.000000f, -0.402942f, -0.763639f, -0.817452f, -1.416669f, -1.642223f};
+#define CAL_A2 (-1.614419f)
+#define CAL_BETA 0.851144f
+#define CAL_BETA_POST 0.326972f
+#define CAL_W_SM_PRE 0.472339f
+#define CAL_W_Z0_PRE 0.201693f
+#define CAL_W_Z0_POST 0.178773f
 #define CAL_SHIFT 0.0349f
 
 // Arbitrary-depth (1..6-level) dynamic multi-leaf tree setup (rows 7..tree_m-1), launched as 1 warp (<<<1, 32>>>, <2 us):
@@ -195,8 +201,10 @@ __global__ void native_leaf_setup_tree_kernel(
   __shared__ float s_A[6];
   __shared__ float s_p1[6];
   __shared__ float s_p1post[6];
+  __shared__ float s_p2post[6];
   __shared__ float s_pr[6][6];
   __shared__ float s_z0[6];
+  __shared__ float s_margin[6];
   __shared__ int64_t s_dk[6];
   __shared__ uint8_t s_valid_row[6];
   __shared__ int s_any_active;
@@ -206,12 +214,13 @@ __global__ void native_leaf_setup_tree_kernel(
   __shared__ int8_t s_cand_k[64];
   __shared__ int8_t s_cand_par[64];
   __shared__ int8_t s_cand_depth[64];
-  __shared__ int8_t s_cand_kind[64];  // 0=1-level, 1=sub-continuation, 2=shift-continuation
+  __shared__ int8_t s_cand_kind[64];  // 0=1-level, 1=sub-continuation, 2=shift-continuation, 3=alt2-continuation
   __shared__ int s_num_cands;
 
   __shared__ int s_row_base_sub[16];
   __shared__ uint32_t s_row_packed[16];
 
+  // Pass 1: validate rows & gather per-position top-1 margin z0 - z1 for step-level difficulty context.
   if (tid < 6) {
     const int k = tid + 1;
     const int64_t dk = static_cast<int64_t>(input_ids[k]);
@@ -222,8 +231,27 @@ __global__ void native_leaf_setup_tree_kernel(
     const bool row_ok = (!high_acc) && (top1 == dk) && (z0 > -1e20f);
     s_valid_row[tid] = row_ok ? 1 : 0;
     s_z0[tid] = z0;
+    const int64_t top2 = tree_top[base + 1];
+    const float z1 = tree_vals[base + 1];
+    s_margin[tid] = (row_ok && top2 >= 0 && z1 > -1e20f) ? (z0 - z1) : 2.5f;
+  }
+  __syncwarp();
+
+  if (tid < 6) {
+    const int base = tid * tree_k;
+    const float z0 = s_z0[tid];
+    const bool row_ok = (s_valid_row[tid] != 0);
     if (row_ok) {
       if (calib_mode != 0) {
+        float sm_c = (s_margin[0] + s_margin[1] + s_margin[2] +
+                      s_margin[3] + s_margin[4] + s_margin[5]) * (1.0f / 6.0f) - 2.5f;
+        if (sm_c < -2.0f) sm_c = -2.0f;
+        if (sm_c > 2.5f) sm_c = 2.5f;
+        float z0_c = z0 - 36.0f;
+        if (z0_c < -10.0f) z0_c = -10.0f;
+        if (z0_c > 6.0f) z0_c = 6.0f;
+        const float a_pre = kCalA[tid] + CAL_W_SM_PRE * sm_c + CAL_W_Z0_PRE * z0_c;
+        const float a_post = kCalA[tid] + CAL_A2 + CAL_W_Z0_POST * z0_c;
         float e0[6], e1[6];
         float den0 = 1.0f, den1 = 1.0f;
 #pragma unroll
@@ -231,9 +259,11 @@ __global__ void native_leaf_setup_tree_kernel(
           const int64_t tok_r = tree_top[base + rk];
           const float zr = tree_vals[base + rk];
           if (rk == 0 || (tok_r >= 0 && zr > -1e20f)) {
-            const float g = kCalC[rk] + CAL_BETA * (zr - z0);
-            e0[rk] = __expf(kCalA[tid] + g);
-            e1[rk] = __expf(kCalA[tid] + kCalA2[tid] + g);
+            const float dz = zr - z0;
+            const float g0 = kCalC[rk] + CAL_BETA * dz;
+            const float g1 = kCalC[rk] + CAL_BETA_POST * dz;
+            e0[rk] = __expf(a_pre + g0);
+            e1[rk] = __expf(a_post + g1);
           } else {
             e0[rk] = 0.0f;
             e1[rk] = 0.0f;
@@ -246,6 +276,7 @@ __global__ void native_leaf_setup_tree_kernel(
           s_pr[tid][rk] = e0[rk] / den0;
         }
         s_p1post[tid] = e1[0] / den1;
+        s_p2post[tid] = e1[1] / den1;
         s_Z[tid] = den0;
         s_p1[tid] = s_pr[tid][0];
       } else {
@@ -266,11 +297,13 @@ __global__ void native_leaf_setup_tree_kernel(
         const float p1 = eff_gamma / z_tot;
         s_p1[tid] = (p1 < 1.0f) ? p1 : 1.0f;
         s_p1post[tid] = 0.0f;
+        s_p2post[tid] = 0.0f;
       }
     } else {
       s_Z[tid] = 1e30f;
       s_p1[tid] = 0.0f;
       s_p1post[tid] = 0.0f;
+      s_p2post[tid] = 0.0f;
     }
   }
   __syncwarp();
@@ -384,10 +417,13 @@ __global__ void native_leaf_setup_tree_kernel(
         if (li + 1 < num_leaves && dp < eff_max_depth && k_r < 6 && saved_leaf_parent != nullptr) {
           const int k_child = k_r + 1;
           int64_t sub_tok_spawned = -1;
+          int64_t alt2_tok_spawned = -1;
           // 1) Aligned substitution continuation (`sub`, kind=1): d_{k_r+1}#1 = s_dk[k_r].
-          if ((kind == 0 || kind == 1) && s_valid_row[k_r] && s_num_cands < 64) {
+          //    After L2 sub hit (kind==1), context has resynced with drafter top-1 -> use s_p1[k_r] (empirical 63.3%).
+          if ((kind == 0 || kind == 1 || kind == 3) && s_valid_row[k_r] && s_num_cands < 64) {
+            const float p_cont = (kind == 1) ? s_p1[k_r] : s_p1post[k_r];
             const float child_s = (calib_mode != 0)
-                ? (best_s * s_p1post[k_r])
+                ? (best_s * p_cont)
                 : (best_s * ((kind == 0) ? sub_coef : cont_decay) * s_p1[k_r]);
             const int64_t sub_tok = s_dk[k_r];
             if (child_s > 0.0f && sub_tok >= 0) {
@@ -401,12 +437,29 @@ __global__ void native_leaf_setup_tree_kernel(
               sub_tok_spawned = sub_tok;
             }
           }
-          // 2) Off-by-1 shift recovery (`shf`, kind=2): d_{k_r}#1 = s_dk[k_r - 1].
+          // 2) Post-miss top-2 continuation (`alt2`, kind=3): d_{k_r+1}#2 = tree_top[k_r*tree_k + 1] (empirical 14.2%).
+          if (calib_mode != 0 && kind == 0 && s_valid_row[k_r] && s_num_cands < 64) {
+            const int64_t alt2_tok = tree_top[k_r * tree_k + 1];
+            if (alt2_tok >= 0 && alt2_tok != sub_tok_spawned) {
+              const float child_s = best_s * s_p2post[k_r];
+              if (child_s > 0.0f) {
+                const int slot = s_num_cands++;
+                s_cand_score[slot] = child_s;
+                s_cand_tok[slot] = alt2_tok;
+                s_cand_k[slot] = static_cast<int8_t>(k_child);
+                s_cand_par[slot] = static_cast<int8_t>(r);
+                s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
+                s_cand_kind[slot] = 3;
+                alt2_tok_spawned = alt2_tok;
+              }
+            }
+          }
+          // 3) Off-by-1 shift recovery (`shf`, kind=2): d_{k_r}#1 = s_dk[k_r - 1].
           if ((kind == 0 || kind == 2) && s_valid_row[k_r - 1] && s_num_cands < 64) {
             const int64_t shf_tok = s_dk[k_r - 1];
-            if (shf_tok >= 0 && shf_tok != sub_tok_spawned) {
+            if (shf_tok >= 0 && shf_tok != sub_tok_spawned && shf_tok != alt2_tok_spawned) {
               const float child_s = (calib_mode != 0)
-                  ? ((kind == 0) ? (best_s * CAL_SHIFT) : (best_s * s_p1post[k_r - 1]))
+                  ? ((kind == 0) ? (best_s * CAL_SHIFT) : (best_s * s_p1[k_r - 1]))
                   : ((kind == 0) ? (best_s * shf_coef) : (best_s * cont_decay * s_p1[k_r - 1]));
               if (child_s > 0.0f) {
                 const int slot = s_num_cands++;

@@ -483,6 +483,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.model.update_draft_prompt_tail(
                 input_batch.input_ids[:num_target_tokens],
                 ctx_pos_slice,
+                num_rejected=num_rejected,
+                extra_ids=self.input_buffers.input_ids[:1],
             )
 
         ran_ctx_graph = False
