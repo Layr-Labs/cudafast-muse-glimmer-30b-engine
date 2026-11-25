@@ -36,7 +36,6 @@ try:
 except Exception:  # noqa: BLE001
     _rans = None
 
-_RANS_M = _rans is not None and hasattr(_rans, "rans_gemm_m_auto") and os.environ.get("MUSERANS_M", "1") != "0"
 _stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False}
 _decode_gemm_operand = None
 _consume_rans_prologue = None
@@ -76,7 +75,16 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
     if _rans is not None:
         try:
             blob = _rans.rans_pack(w.t().contiguous().view(torch.uint8))
-            if _self_check(lambda xq, out: _rans.rans_gemv_auto(blob, xq.view(-1), ws.reshape(-1), xs.reshape(-1), out, n, k), w, ws, xs):
+            if _self_check(
+                lambda xq, out: (
+                    _rans.rans_gemv_auto(blob, xq.view(-1), ws.reshape(-1), xs.reshape(-1), out, n, k)
+                    if xq.shape[0] == 1
+                    else _rans.rans_gemm_auto(blob, xq, ws.reshape(-1), xs.reshape(-1), out, int(xq.shape[0]), n, k)
+                ),
+                w,
+                ws,
+                xs,
+            ):
                 _stats["admitted"] += 1
                 _stats["rans"] += 1
                 # The magic byte 'A' at blob[0] marks the compressed format for the op (one uint8 buffer either way).
@@ -103,16 +111,19 @@ def _self_check(run, w_kn: torch.Tensor, sb: torch.Tensor, sa: torch.Tensor) -> 
     k, n = w_kn.shape
     gen = torch.Generator(device=w_kn.device)
     gen.manual_seed(n * 131 + k + 7)
-    for trial in range(4):
-        x = torch.randn(1, k, generator=gen, device=w_kn.device) * (0.05, 1.0, 8.0, 40.0)[trial]
-        x[:, ::3] *= 16
-        x[:, 1::2] = -x[:, ::2]
-        xq = (x / sa.float().reshape(1, 1)).clamp(-448, 448).to(torch.float8_e4m3fn)
-        ref = _cutlass(xq, w_kn, sa, sb)
-        got = torch.empty(1, n, dtype=torch.bfloat16, device=w_kn.device)
-        run(xq, got)
-        if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
-            return False
+    for m in (1, 7):
+        if m > 1 and not hasattr(_rans, "rans_gemm_auto"):
+            continue
+        for trial in range(4 if m == 1 else 2):
+            x = torch.randn(m, k, generator=gen, device=w_kn.device) * (0.05, 1.0, 8.0, 40.0)[trial]
+            x[:, ::3] *= 16
+            x[:, 1::2] = -x[:, ::2]
+            xq = (x / sa.float().reshape(1, 1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+            ref = _cutlass(xq, w_kn, sa, sb)
+            got = torch.empty(m, n, dtype=torch.bfloat16, device=w_kn.device)
+            run(xq, got)
+            if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+                return False
     return True
 
 
@@ -132,35 +143,33 @@ def _muse_fp8_scaled_mm(
     if A.shape[0] <= 16 and _decode_gemm_operand is not None:
         A = _decode_gemm_operand(A)
     k, n = B.shape
-    if A.shape[0] == 1 and packed.numel() > 0 and A.is_contiguous() and _scales_ok(As, Bs, n):
+    m = int(A.shape[0])
+    if 1 <= m <= 8 and packed.numel() > 0 and A.is_contiguous() and _scales_ok(As, Bs, n):
+        is_rans = packed.numel() != n * k
         if (
-            packed.numel() != n * k
+            is_rans
             and _consume_rans_prologue is not None
             and _rans is not None
+            and (m == 1 or hasattr(_rans, "rans_gemm_auto"))
             and hasattr(_rans, "rans_gemv_fused_auto")
         ):
             fused = _consume_rans_prologue(A, As, packed, n, k, Bs)
             if fused is not None:
                 return fused
-        out = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
-        if packed.numel() == n * k:
-            _mf.gemv(packed, A, Bs, As, out, n, k)
-        else:
+        if not is_rans:
+            if m == 1:
+                out = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
+                _mf.gemv(packed, A, Bs, As, out, n, k)
+                return out
+            return _small_row_fp8(A, B, As, Bs)
+        if m == 1:
+            out = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
             _rans.rans_gemv_auto(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
-        return out
-    if (
-        1 < A.shape[0] <= 8
-        and _RANS_M
-        and packed.numel() > 0
-        and packed.numel() != n * k
-        and A.is_contiguous()
-        and A.dtype == torch.float8_e4m3fn
-        and _scales_ok(As, Bs, n)
-    ):
-        # verify-width rows: the same rANS stream and the same per-row MMA chain as the M == 1 GEMV
-        out = torch.empty((A.shape[0], n), dtype=torch.bfloat16, device=A.device)
-        _rans.rans_gemm_m_auto(packed, A, Bs.reshape(-1), As.reshape(-1), out, n, k)
-        return out
+            return out
+        if hasattr(_rans, "rans_gemm_auto"):
+            out = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
+            _rans.rans_gemm_auto(packed, A, Bs.reshape(-1), As.reshape(-1), out, m, n, k)
+            return out
     return _small_row_fp8(A, B, As, Bs)
 
 

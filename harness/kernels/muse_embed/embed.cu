@@ -162,6 +162,147 @@ __global__ void __launch_bounds__(512) embed_norm_m1(
     }
   }
 }
+
+// Multi-CTA exact M=1..16 embedding + weightless RMSNorm (width <= 8192, width % 8 == 0).
+// One CTA (512 threads) per row, preserving the exact ATen reduction and accumulation order.
+template <typename Id, bool kPdl>
+__global__ void __launch_bounds__(512) embed_norm_multi(
+    const Id* __restrict__ ids, const uint2* __restrict__ table, float eps,
+    uint2* __restrict__ out, int width) {
+  if constexpr (kPdl) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;");
+  } else {
+    asm volatile("griddepcontrol.launch_dependents;");
+  }
+  __shared__ float smem[512];
+  const int t = threadIdx.x;
+  const int row = static_cast<int>(blockIdx.x);
+  const int vec4 = width >> 2;
+  const long long id = static_cast<long long>(ids[row]);
+  const uint2* row_ptr = table + id * static_cast<size_t>(vec4);
+  uint2* out_row = out + static_cast<size_t>(row) * static_cast<size_t>(vec4);
+
+  float f[4][4];
+  float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+#pragma unroll
+  for (int it = 0; it < 4; ++it) {
+    const int idx = t + it * 512;
+    if (idx < vec4) {
+      const uint2 raw = row_ptr[idx];
+      const float x0 = __uint_as_float(raw.x << 16);
+      const float x1 = __uint_as_float(raw.x & 0xffff0000u);
+      const float x2 = __uint_as_float(raw.y << 16);
+      const float x3 = __uint_as_float(raw.y & 0xffff0000u);
+      f[it][0] = x0;
+      f[it][1] = x1;
+      f[it][2] = x2;
+      f[it][3] = x3;
+      acc0 = __fadd_rn(acc0, __fmul_rn(x0, x0));
+      acc1 = __fadd_rn(acc1, __fmul_rn(x1, x1));
+      acc2 = __fadd_rn(acc2, __fmul_rn(x2, x2));
+      acc3 = __fadd_rn(acc3, __fmul_rn(x3, x3));
+    }
+  }
+  float v = __fadd_rn(__fadd_rn(__fadd_rn(acc0, acc1), acc2), acc3);
+  smem[t] = v;
+#pragma unroll
+  for (int offset = 256; offset >= 32; offset >>= 1) {
+    __syncthreads();
+    if (t < offset) {
+      v = __fadd_rn(v, smem[t + offset]);
+      smem[t] = v;
+    }
+  }
+  __syncthreads();
+  if (t < 32) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, offset));
+    }
+    if (t == 0) {
+      const float factor = static_cast<float>(1.0 / static_cast<double>(width));
+      const float mean = __fmul_rn(v, factor);
+      smem[0] = rsqrtf(__fadd_rn(mean, eps));
+    }
+  }
+  __syncthreads();
+  const float r = smem[0];
+#pragma unroll
+  for (int it = 0; it < 4; ++it) {
+    const int idx = t + it * 512;
+    if (idx < vec4) {
+      const unsigned lo0 = bf16_rne(__fmul_rn(f[it][0], r));
+      const unsigned hi0 = bf16_rne(__fmul_rn(f[it][1], r));
+      const unsigned lo1 = bf16_rne(__fmul_rn(f[it][2], r));
+      const unsigned hi1 = bf16_rne(__fmul_rn(f[it][3], r));
+      out_row[idx] = make_uint2(lo0 | (hi0 << 16), lo1 | (hi1 << 16));
+    }
+  }
+}
+
+// Single-CTA exact M=1 greedy speculative verification kernel matching
+// RejectionSampler + _insert_resampled_kernel + get_num_sampled_and_rejected.
+template <bool kPdl>
+__global__ void __launch_bounds__(32) greedy_verify_m1_kernel(
+    int num_logits,
+    int sampled_stride,
+    const int64_t* __restrict__ target_argmax,
+    const int32_t* __restrict__ input_ids,
+    const int64_t* __restrict__ logits_indices,
+    int64_t* __restrict__ sampled_out,
+    int32_t* __restrict__ num_sampled_out,
+    int32_t* __restrict__ num_rejected_out,
+    const int32_t* __restrict__ seq_lens,
+    const int32_t* __restrict__ idx_mapping,
+    const int32_t* __restrict__ prefill_len) {
+  int32_t req_state_idx = -1;
+  int32_t sl = 0;
+  int32_t pl = 0;
+  if constexpr (kPdl) {
+    if (threadIdx.x == 0) {
+      req_state_idx = idx_mapping[0];
+      sl = seq_lens[0];
+      if (req_state_idx >= 0) {
+        pl = prefill_len[req_state_idx];
+      }
+    }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;");
+  }
+  if (threadIdx.x != 0) return;
+  if constexpr (!kPdl) {
+    req_state_idx = idx_mapping[0];
+    sl = seq_lens[0];
+    if (req_state_idx >= 0) {
+      pl = prefill_len[req_state_idx];
+    }
+  }
+  const int num_draft = num_logits - 1;
+  int accepted_len = 0;
+  bool accepted = true;
+  for (int i = 0; i < num_draft; ++i) {
+    const int64_t t_tok = target_argmax[i];
+    const int64_t idx_i = logits_indices ? logits_indices[i + 1] : static_cast<int64_t>(i + 1);
+    const int64_t d_tok = static_cast<int64_t>(input_ids[idx_i]);
+    if (accepted) {
+      accepted = (t_tok == d_tok);
+      sampled_out[i] = accepted ? d_tok : t_tok;
+      if (accepted) accepted_len += 1;
+    } else {
+      sampled_out[i] = 0;
+    }
+  }
+  sampled_out[num_draft] = (accepted_len == num_draft) ? target_argmax[num_draft] : 0;
+  for (int i = num_logits; i < sampled_stride; ++i) {
+    sampled_out[i] = 0;
+  }
+  const bool is_chunked = (req_state_idx >= 0) && (sl < pl);
+  const int32_t ns = is_chunked ? 0 : (accepted_len + 1);
+  const int32_t nr = is_chunked ? 0 : (num_logits - ns);
+  num_sampled_out[0] = ns;
+  num_rejected_out[0] = nr;
+}
 // Exact 1-request C++ CUDA replacement for Triton _post_update_kernel (input_batch.py).
 // Overlaps metadata preloads behind lm_head+lmpost via SM121 PDL, waits before reading
 // sampled_tokens, and immediately triggers single_decode_prep via launch_dependents.
@@ -331,6 +472,67 @@ extern "C" int muse_embed_norm_m1(const void* ids, int ids_64, const void* table
     embed_norm_m1<int, false><<<1, 512, 0, stream>>>(
         static_cast<const int*>(ids), static_cast<const uint2*>(table), eps,
         static_cast<uint2*>(out), width);
+  return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int muse_embed_norm_multi(const void* ids, int ids_64, const void* table, float eps,
+                                     void* out, int rows, int width, cudaStream_t stream) {
+  if (rows <= 0 || rows > 16 || width <= 0 || (width & 7) != 0 || width > 8192) {
+    return cudaErrorInvalidValue;
+  }
+  const bool use_pdl = decode_tail_pdl_enabled();
+  if (use_pdl) {
+    if (ids_64) {
+      return static_cast<int>(launch_pdl(
+          embed_norm_multi<long long, true>, rows, 512, stream,
+          static_cast<const long long*>(ids), static_cast<const uint2*>(table), eps,
+          static_cast<uint2*>(out), width));
+    }
+    return static_cast<int>(launch_pdl(
+        embed_norm_multi<int, true>, rows, 512, stream,
+        static_cast<const int*>(ids), static_cast<const uint2*>(table), eps,
+        static_cast<uint2*>(out), width));
+  }
+  if (ids_64) {
+    embed_norm_multi<long long, false><<<rows, 512, 0, stream>>>(
+        static_cast<const long long*>(ids), static_cast<const uint2*>(table), eps,
+        static_cast<uint2*>(out), width);
+  } else {
+    embed_norm_multi<int, false><<<rows, 512, 0, stream>>>(
+        static_cast<const int*>(ids), static_cast<const uint2*>(table), eps,
+        static_cast<uint2*>(out), width);
+  }
+  return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int muse_greedy_verify_m1(
+    int num_logits, int sampled_stride, const void* target_argmax, const void* input_ids,
+    const void* logits_indices, void* sampled_out, void* num_sampled_out, void* num_rejected_out,
+    const void* seq_lens, const void* idx_mapping, const void* prefill_len, cudaStream_t stream) {
+  if (num_logits < 1 || num_logits > 8 || sampled_stride < num_logits) {
+    return cudaErrorInvalidValue;
+  }
+  if (!target_argmax || !input_ids || !sampled_out || !num_sampled_out || !num_rejected_out ||
+      !seq_lens || !idx_mapping || !prefill_len) {
+    return cudaErrorInvalidValue;
+  }
+  if (decode_tail_pdl_enabled()) {
+    return static_cast<int>(launch_pdl(
+        greedy_verify_m1_kernel<true>, 1, 32, stream,
+        num_logits, sampled_stride,
+        static_cast<const int64_t*>(target_argmax), static_cast<const int32_t*>(input_ids),
+        static_cast<const int64_t*>(logits_indices), static_cast<int64_t*>(sampled_out),
+        static_cast<int32_t*>(num_sampled_out), static_cast<int32_t*>(num_rejected_out),
+        static_cast<const int32_t*>(seq_lens), static_cast<const int32_t*>(idx_mapping),
+        static_cast<const int32_t*>(prefill_len)));
+  }
+  greedy_verify_m1_kernel<false><<<1, 32, 0, stream>>>(
+      num_logits, sampled_stride,
+      static_cast<const int64_t*>(target_argmax), static_cast<const int32_t*>(input_ids),
+      static_cast<const int64_t*>(logits_indices), static_cast<int64_t*>(sampled_out),
+      static_cast<int32_t*>(num_sampled_out), static_cast<int32_t*>(num_rejected_out),
+      static_cast<const int32_t*>(seq_lens), static_cast<const int32_t*>(idx_mapping),
+      static_cast<const int32_t*>(prefill_len));
   return static_cast<int>(cudaGetLastError());
 }
 

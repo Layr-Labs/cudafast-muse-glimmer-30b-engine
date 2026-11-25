@@ -651,7 +651,7 @@ class Session:
                 if kind == "musefp8":
                     a, weight, packed, sa, sb = args
                     k, n = weight.shape
-                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
+                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and 1 <= a.shape[0] <= 8
                             and a.is_contiguous() and 0 < packed.numel() != n * k):
                         from vllm.model_executor.kernels.linear.scaled_mm.muse_fp8 import _scales_ok
                         if _scales_ok(sa, sb, n):

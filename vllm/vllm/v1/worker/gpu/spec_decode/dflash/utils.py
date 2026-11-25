@@ -64,6 +64,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             if draft_embed is not None:
                 del draft_inner.embed_tokens
             draft_inner.embed_tokens = target_embed
+        draft_embed = None
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(dflash_model, "lm_head", None)
@@ -73,5 +74,16 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if draft_lm_head is not None:
             del dflash_model.lm_head
         dflash_model.lm_head = target_lm_head
+    draft_lm_head = None
+
+    if hasattr(dflash_model, "model") and hasattr(
+        dflash_model.model, "_enable_tc_rans"
+    ):
+        import gc
+        import torch
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        dflash_model.model._enable_tc_rans()
 
     return dflash_model

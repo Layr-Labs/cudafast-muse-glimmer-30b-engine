@@ -331,145 +331,6 @@ swiglu_ws_256_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_const
   }
 }
 
-
-// 9-warp WS ST=3 BM=128 (26 exact 48-SM waves, 4-SM lockstep L2 B sharing, consume_stage_pipe, PDL)
-constexpr int NT_WS9 = (NWARP + 1) * 32;
-
-__device__ __forceinline__ void consume_stage_pipe_sw(
-    uint32_t abase, uint32_t wbase, int wm, int wn, int ar, int ach, int br, int bch, float (&acc)[2][NW][4]) {
-  uint32_t a_cur[2][4], b_cur[NW][2];
-  auto load_ks = [&](int ks, uint32_t (&a)[2][4], uint32_t (&b)[NW][2]) {
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      const int r = wm * 32 + i * 16 + ar;
-      ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, a[i]);
-    }
-#pragma unroll
-    for (int j = 0; j < NW / 2; ++j) {
-      const int r = wn * NW * 8 + j * 16 + br;
-      uint32_t qd[4];
-      ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, qd);
-      b[2 * j][0] = qd[0]; b[2 * j][1] = qd[1];
-      b[2 * j + 1][0] = qd[2]; b[2 * j + 1][1] = qd[3];
-    }
-  };
-  load_ks(0, a_cur, b_cur);
-#pragma unroll
-  for (int ks = 0; ks < KT / 32; ++ks) {
-    uint32_t a_nxt[2][4], b_nxt[NW][2];
-    if (ks + 1 < KT / 32) load_ks(ks + 1, a_nxt, b_nxt);
-#pragma unroll
-    for (int i = 0; i < 2; ++i)
-#pragma unroll
-      for (int j = 0; j < NW; ++j) mma_fp8(a_cur[i], b_cur[j][0], b_cur[j][1], acc[i][j]);
-    if (ks + 1 < KT / 32) {
-#pragma unroll
-      for (int i = 0; i < 2; ++i)
-#pragma unroll
-        for (int k = 0; k < 4; ++k) a_cur[i][k] = a_nxt[i][k];
-#pragma unroll
-      for (int j = 0; j < NW; ++j) { b_cur[j][0] = b_nxt[j][0]; b_cur[j][1] = b_nxt[j][1]; }
-    }
-  }
-}
-
-template <bool kPdl = false>
-__global__ void __launch_bounds__(NT_WS9, 1)
-swiglu_ws9_st3_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
-                      const float* sa_p, const float* sb_p, const float* down_p, uint8_t* out) {
-  constexpr int BM_T = 128, ST_T = 3, ASZ = BM_T * KT, STB = ASZ + WSZ;
-  constexpr int NTN = N_DIM / BN, NTILES = 4 * NTN, NKT = K_DIM / KT;
-  static_assert(NTILES == 26 * 48, "26 exact waves on 48 SMs");
-  extern __shared__ uint8_t sm_raw[];
-  __shared__ __align__(8) unsigned long long bars[2 * ST_T];
-  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
-  const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
-  const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST_T;
-  if (tid == 0) {
-#pragma unroll
-    for (int s = 0; s < ST_T; ++s) { mbar_init(full0 + 8 * s, 1); mbar_init(empty0 + 8 * s, NWARP); }
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-  }
-  __syncthreads();
-
-  if (warp == NWARP) {
-    if (lane == 0) {
-      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA) : "memory");
-      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
-      int s = 0, par = 0, g = 0;
-      const uint64_t pol_el = tma_pol_el(), pol_ef = tma_pol_ef();
-      if constexpr (kPdl) {
-        const int nt0 = b >> 2;
-#pragma unroll
-        for (int ps = 0; ps < ST_T; ++ps) {
-          const uint32_t bar = full0 + 8 * ps, dst = sbase + ps * STB;
-          mbar_expect_tx_only(bar, WSZ);
-          tma2d_hint(dst + ASZ, &tmB, ps * KT, nt0 * BN, bar, pol_ef);
-        }
-        pdl_wait();
-      }
-      for (int ti = 0; ti < 26; ++ti) {
-        const int t = b + ti * 48, nt = t >> 2, band = t & 3;
-        const int row0 = band * BM_T, col0 = nt * BN;
-        for (int kt = 0; kt < NKT; ++kt) {
-          if (g >= ST_T) {
-            mbar_wait(empty0 + 8 * s, par ^ 1);
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-          }
-          const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB;
-          if constexpr (kPdl) {
-            if (g < ST_T) {
-              mbar_expect_tx(bar, ASZ);
-              tma2d_hint(dst, &tmA, kt * KT, row0, bar, pol_el);
-              ++g;
-              if (++s == ST_T) { s = 0; par ^= 1; }
-              continue;
-            }
-          }
-          mbar_expect_tx(bar, STB);
-          tma2d_hint(dst, &tmA, kt * KT, row0, bar, pol_el);
-          tma2d_hint(dst + ASZ, &tmB, kt * KT, col0, bar, pol_ef);
-          ++g;
-          if (++s == ST_T) { s = 0; par ^= 1; }
-        }
-      }
-    }
-    return;
-  }
-
-  const int wm = warp % WM, wn = warp / WM;
-  const float sa = __ldg(sa_p), sb = __ldg(sb_p);
-  float inv_down;
-  asm("div.full.f32 %0, 0f3F800000, %1;" : "=f"(inv_down) : "f"(__ldg(down_p)));
-  const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ach = lane >> 4;
-  const int br = (lane & 7) + (lane >> 4) * 8, bch = (lane >> 3) & 1;
-  float acc[2][NW][4] = {};
-  int s = 0, par = 0;
-  for (int ti = 0; ti < 26; ++ti) {
-    const int t = b + ti * 48, nt = t >> 2, band = t & 3;
-    for (int kt = 0; kt < NKT; ++kt) {
-      if constexpr (kPdl) { if (ti == 25 && kt == NKT - 12) pdl_launch_dependents(); }
-      mbar_wait(full0 + 8 * s, par);
-      const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-      consume_stage_pipe_sw(abase, wbase, wm, wn, ar, ach, br, bch, acc);
-      __syncwarp();
-      if (lane == 0) mbar_arrive(empty0 + 8 * s);
-      if (++s == ST_T) { s = 0; par ^= 1; }
-    }
-    const int rb0 = band * BM_T + wm * 32;
-    const int out_col0 = (nt * BN + wn * NW * 8) / 2;
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      epilogue_swiglu_fp8(acc[i], out, rb0 + i * 16, out_col0, lane, sa, sb, inv_down);
-#pragma unroll
-      for (int j = 0; j < NW; ++j)
-#pragma unroll
-        for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
-    }
-  }
-}
-
 static int g_ws_pdl_override = -1;
 static bool ws_pdl_enabled() {
   if (g_ws_pdl_override >= 0) return g_ws_pdl_override != 0;
@@ -515,8 +376,6 @@ extern "C" int swiglu_ws_init(cudaStream_t stream) {
   if (e != cudaSuccess) return int(e);
   e = cudaFuncSetAttribute(
       swiglu_ws_256_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
-  if (e == cudaSuccess) e = cudaFuncSetAttribute(swiglu_ws9_st3_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
-  if (e == cudaSuccess) e = cudaFuncSetAttribute(swiglu_ws9_st3_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   if (e != cudaSuccess) return int(e);
   int diffs = 0;
   e = cudaMemcpyToSymbolAsync(ws_silu_diffs, &diffs, sizeof(int), 0, cudaMemcpyHostToDevice, stream);
@@ -533,26 +392,7 @@ extern "C" int swiglu_ws_run(const void* a, const void* b, const float* sa, cons
                              void* d, cudaStream_t stream) {
   using namespace swiglu_ws;
   if (!encode || (((uintptr_t)a | (uintptr_t)b | (uintptr_t)d) & 15)) return -1;
-  static const bool use_ws9 = []() {
-    const char* env = std::getenv("MUSE_FP8_SWIGLU_WS9");
-    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
-  }();
   CUtensorMap tmA, tmB;
-  if (use_ws9) {
-    if (!encode_tma2d(&tmA, a, K_DIM, M_DIM, 128) || !encode_tma2d(&tmB, b, K_DIM, N_DIM, BN)) return -3;
-    if (ws_pdl_enabled()) {
-      cudaLaunchConfig_t cfg = {};
-      cfg.gridDim = dim3(48, 1, 1); cfg.blockDim = dim3(NT_WS9, 1, 1);
-      cfg.dynamicSmemBytes = SMEM_MAX; cfg.stream = stream;
-      cudaLaunchAttribute attr[1];
-      attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      attr[0].val.programmaticStreamSerializationAllowed = 1;
-      cfg.attrs = attr; cfg.numAttrs = 1;
-      return int(cudaLaunchKernelEx(&cfg, swiglu_ws9_st3_kernel<true>, tmA, tmB, sa, sb, down, static_cast<uint8_t*>(d)));
-    }
-    swiglu_ws9_st3_kernel<false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA, tmB, sa, sb, down, static_cast<uint8_t*>(d));
-    return int(cudaGetLastError());
-  }
   if (!encode_tma2d(&tmA, a, K_DIM, M_DIM, 256) || !encode_tma2d(&tmB, b, K_DIM, N_DIM, BN)) return -3;
   if (ws_pdl_enabled()) {
     cudaLaunchConfig_t cfg = {};
@@ -570,4 +410,3 @@ extern "C" int swiglu_ws_run(const void* a, const void* b, const float* sa, cons
   swiglu_ws_256_kernel<false><<<48, NT, SMEM_MAX, stream>>>(tmA, tmB, sa, sb, down, static_cast<uint8_t*>(d));
   return int(cudaGetLastError());
 }
-

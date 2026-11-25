@@ -19,14 +19,18 @@ logger = init_logger("vllm.muse_bf16_lane")
 _WIDTH = 6656
 _ROWS = (4096, 4608)
 _INDEX_BYTES = 36
+_MULTI_M = os.environ.get("MUSE_BF16_LANE_MULTI_M", "1") != "0"
+_HAS_GEMM_M: bool | None = None
 _stats = dict(admitted=0, rejected=0, bytes=0, rans=0, logged=False)
 
 
 @cache
 def _lib():
+    global _HAS_GEMM_M
     try:
         native = ctypes.CDLL(str(Path(__file__).with_name("muse_bf16_lane.so")))
     except OSError:
+        _HAS_GEMM_M = False
         return None
     ptr = ctypes.c_void_p
     native.muse_bf16_lane_pack.argtypes = [ptr, ctypes.c_int, ptr, ctypes.c_size_t, ptr, ctypes.c_int]
@@ -44,6 +48,10 @@ def _lib():
         native.muse_bf16_rans_pass2.restype = ctypes.c_int
         native.muse_bf16_rans_gemv.argtypes = [ctypes.c_int, ctypes.c_size_t, ptr, ptr, ptr, ptr]
         native.muse_bf16_rans_gemv.restype = ctypes.c_int
+    _HAS_GEMM_M = hasattr(native, "muse_bf16_rans_gemm_m")
+    if _HAS_GEMM_M:
+        native.muse_bf16_rans_gemm_m.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_size_t, ptr, ptr, ptr, ptr]
+        native.muse_bf16_rans_gemm_m.restype = ctypes.c_int
     if hasattr(native, "muse_bf16_lane_set_pdl"):
         native.muse_bf16_lane_set_pdl.argtypes = [ctypes.c_int]
         native.muse_bf16_lane_set_pdl.restype = ctypes.c_int
@@ -60,13 +68,19 @@ def set_pdl(mode: int) -> int | None:
 
 
 def _launch(x, payload, index, n):
-    out = x.new_empty((1, n))
+    m = int(x.shape[0])
+    out = x.new_empty((m, n))
     with torch.cuda.device(x.device):
         stream = torch.cuda.current_stream(x.device)
         if index.numel() == 1:
-            error = _lib().muse_bf16_rans_gemv(
-                n, payload.numel(), x.data_ptr(), payload.data_ptr(), out.data_ptr(), stream.cuda_stream,
-            )
+            if m == 1:
+                error = _lib().muse_bf16_rans_gemv(
+                    n, payload.numel(), x.data_ptr(), payload.data_ptr(), out.data_ptr(), stream.cuda_stream,
+                )
+            else:
+                error = _lib().muse_bf16_rans_gemm_m(
+                    m, n, payload.numel(), x.data_ptr(), payload.data_ptr(), out.data_ptr(), stream.cuda_stream,
+                )
         else:
             error = _lib().muse_bf16_lane_gemv(
                 1, n, x.data_ptr(), payload.data_ptr(), index.data_ptr(),
@@ -161,6 +175,14 @@ def _verify_probes(weight: torch.Tensor, packed: torch.Tensor, device_index: tor
         result = _launch(x, packed, device_index, n)
         if not torch.equal(expected.view(torch.int16), result.view(torch.int16)):
             return False
+    if device_index.numel() == 1:
+        x7 = torch.randn((7, k), generator=rng, device=weight.device) * 2.0
+        x7[:, ::2].mul_(-1.0)
+        x7 = x7.to(torch.bfloat16)
+        expected7 = torch.cat([F.linear(x7[r : r + 1], weight) for r in range(7)], dim=0)
+        result7 = _launch(x7, packed, device_index, n)
+        if not torch.equal(expected7.view(torch.int16), result7.view(torch.int16)):
+            return False
     return True
 
 
@@ -193,69 +215,13 @@ def _prepare(weight):
     return packed, device_index
 
 
-_M_RANS: dict[int, tuple[torch.Tensor, int]] = {}
-_M_RANS_STATS = {"admitted": 0, "rejected": 0, "logged": False}
-
-
-def _prepare_m_rans(weight: torch.Tensor) -> tuple[torch.Tensor, int] | None:
-    if os.environ.get("MUSE_BF16_RANS_M", "1") == "0":
-        return None
-    try:
-        import muse_bfx_ext as _bfx
-    except Exception:  # noqa: BLE001
-        return None
-    if not hasattr(_bfx, "rans_pack") or not hasattr(_bfx, "rans_gemm"):
-        return None
-    n, k = weight.shape
-    if n not in _ROWS or k != _WIDTH or not weight.is_cuda or weight.dtype != torch.bfloat16:
-        return None
-    wc = weight.detach().contiguous()
-    blob = _bfx.rans_pack(wc)
-    unp = _bfx.rans_unpack(blob, n, k)
-    if not torch.equal(unp.view(torch.int16), wc.view(torch.int16)):
-        del unp, blob
-        return None
-    del unp
-    bexp = int(_bfx.rans_base(blob))
-    gen = torch.Generator(device=weight.device)
-    gen.manual_seed(n * 193 + k + 17)
-    for scale in (0.05, 0.5, 2.0, 12.0):
-        x = (torch.randn((7, k), generator=gen, device=weight.device) * scale).to(torch.bfloat16)
-        ref = F.linear(x, wc)
-        got = _bfx.rans_gemm(x, blob, n, k, bexp)
-        if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
-            del blob
-            return None
-    return blob, bexp
-
-
-def get_m_rans(index: torch.Tensor) -> tuple[torch.Tensor, int] | None:
-    return _M_RANS.get(index.data_ptr())
-
-
-def update_m_rans(index: torch.Tensor, blob: torch.Tensor) -> None:
-    entry = _M_RANS.get(index.data_ptr())
-    if entry is not None:
-        _M_RANS[index.data_ptr()] = (blob, entry[1])
-
-
 def _decode(x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor,
             index: torch.Tensor) -> torch.Tensor:
     n = weight.shape[0]
-    if (2 <= x.shape[0] <= 8 and x.ndim == 2 and x.shape[1] == _WIDTH
-            and x.dtype == torch.bfloat16 and x.is_cuda and x.is_contiguous()
-            and n in _ROWS):
-        entry = _M_RANS.get(index.data_ptr())
-        if entry is not None:
-            import muse_bfx_ext as _bfx
-            blob, bexp = entry
-            if not _M_RANS_STATS["logged"]:
-                _M_RANS_STATS["logged"] = True
-                logger.info("muse_bf16_lane multi-M rANS MMA: %d target BF16 layers admitted bitwise (0-ULP)",
-                            _M_RANS_STATS["admitted"])
-            return _bfx.rans_gemm(x, blob, n, _WIDTH, bexp)
     idx_ok = index.numel() == 1 or index.shape == (n, _INDEX_BYTES)
-    if (x.shape != (1, _WIDTH) or x.dtype != torch.bfloat16
+    m = int(x.shape[0]) if x.ndim == 2 else 0
+    can_m = (m == 1) or (_MULTI_M and 1 <= m <= 8 and index.numel() == 1 and getattr(_lib(), "muse_bf16_rans_gemm_m", None) is not None)
+    if (x.ndim != 2 or not can_m or x.shape[1] != _WIDTH or x.dtype != torch.bfloat16
             or not x.is_cuda or not x.is_contiguous() or x.device != packed.device
             or n not in _ROWS or not idx_ok or index.device != x.device
             or index.dtype != torch.uint8 or not index.is_contiguous()
@@ -309,20 +275,6 @@ class _MuseBF16Lane(UnquantizedLinearMethod):
         layer.muse_bf16_lane_weight, layer.muse_bf16_lane_index = buffers
         _stats["admitted"] += 1
         _stats["bytes"] += sum(t.nbytes for t in buffers)
-        layer.register_buffer("muse_bf16_rans_m", None, persistent=False)
-        try:
-            with torch.no_grad():
-                m_res = _prepare_m_rans(layer.weight)
-        except Exception as error:  # noqa: BLE001
-            logger.warning("muse_bf16_lane multi-M rANS admission failed for %s (%s)", layer.prefix, error)
-            m_res = None
-        if m_res is not None:
-            blob_m, bexp_m = m_res
-            layer.muse_bf16_rans_m = blob_m
-            _M_RANS[layer.muse_bf16_lane_index.data_ptr()] = (blob_m, bexp_m)
-            _M_RANS_STATS["admitted"] += 1
-        else:
-            _M_RANS_STATS["rejected"] += 1
 
     def apply(self, layer, x, bias=None):
         packed = getattr(layer, "muse_bf16_lane_weight", None)
@@ -330,9 +282,16 @@ class _MuseBF16Lane(UnquantizedLinearMethod):
                 or x.dtype != torch.bfloat16 or not x.is_contiguous()):
             return super().apply(layer, x, bias)
         args = (x, layer.weight, packed, layer.muse_bf16_lane_index)
+        has_gemm_m = _HAS_GEMM_M if _HAS_GEMM_M is not None else (getattr(_lib(), "muse_bf16_rans_gemm_m", None) is not None)
+        use_m = (
+            _MULTI_M
+            and layer.muse_bf16_lane_index.numel() == 1
+            and has_gemm_m
+        )
         if torch.compiler.is_compiling():
-            return torch.cond(x.shape[0] <= 8, _packed_branch, _dense_branch, args)
-        if 1 <= x.shape[0] <= 8:
+            pred = (x.shape[0] <= 8) if use_m else (x.shape[0] == 1)
+            return torch.cond(pred, _packed_branch, _dense_branch, args)
+        if x.shape[0] == 1 or (use_m and 1 <= x.shape[0] <= 8):
             return _packed_branch(*args)
         return super().apply(layer, x, bias)
 

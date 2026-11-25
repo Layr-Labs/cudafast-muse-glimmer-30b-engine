@@ -1042,12 +1042,14 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                     if stats is not None and PLACE_SCALES6:
                         try:
                             import muse_marlin6_gemv as _m6
+                            transfer_fn = getattr(_m6, "transfer_scale_metadata", None)
                             ilv_set = getattr(_m6, "_DOWN_ILV_SCALES", None)
                             lm_split2_set = getattr(_m6, "_LM_SPLIT2_SCALES", None)
                             lm_split2_cache = getattr(_m6, "_LM_SPLIT2_CACHE", None)
                             lm_pad128_set = getattr(_m6, "_LM_PAD128_SCALES", None)
                             lm_pad128_cache = getattr(_m6, "_LM_PAD128_CACHE", None)
                         except (ImportError, OSError):
+                            transfer_fn = None
                             ilv_set = None
                             lm_split2_set = None
                             lm_split2_cache = None
@@ -1066,20 +1068,24 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                                         dst = torch.empty_like(s6)
                                     dst.copy_(s6)
                                     if torch.equal(dst, s6):
-                                        m._buffers["_marlin_decode_scales6"] = dst
-                                        if ilv_set is not None and old_ptr in ilv_set:
-                                            ilv_set.discard(old_ptr)
-                                            ilv_set.add(dst.data_ptr())
-                                        if lm_split2_set is not None and old_ptr in lm_split2_set:
-                                            lm_split2_set.discard(old_ptr)
-                                            lm_split2_set.add(dst.data_ptr())
-                                        if lm_split2_cache is not None and old_ptr in lm_split2_cache:
-                                            lm_split2_cache[dst.data_ptr()] = lm_split2_cache.pop(old_ptr)
-                                        if lm_pad128_set is not None and old_ptr in lm_pad128_set:
-                                            lm_pad128_set.discard(old_ptr)
-                                            lm_pad128_set.add(dst.data_ptr())
-                                        if lm_pad128_cache is not None and old_ptr in lm_pad128_cache:
-                                            lm_pad128_cache[dst.data_ptr()] = lm_pad128_cache.pop(old_ptr)
+                                        if callable(transfer_fn):
+                                            transfer_fn(s6, dst)
+                                            m._buffers["_marlin_decode_scales6"] = dst
+                                        else:
+                                            m._buffers["_marlin_decode_scales6"] = dst
+                                            if ilv_set is not None and old_ptr in ilv_set:
+                                                ilv_set.discard(old_ptr)
+                                                ilv_set.add(dst.data_ptr())
+                                            if lm_split2_set is not None and old_ptr in lm_split2_set:
+                                                lm_split2_set.discard(old_ptr)
+                                                lm_split2_set.add(dst.data_ptr())
+                                            if lm_split2_cache is not None and old_ptr in lm_split2_cache:
+                                                lm_split2_cache[dst.data_ptr()] = lm_split2_cache.pop(old_ptr)
+                                            if lm_pad128_set is not None and old_ptr in lm_pad128_set:
+                                                lm_pad128_set.discard(old_ptr)
+                                                lm_pad128_set.add(dst.data_ptr())
+                                            if lm_pad128_cache is not None and old_ptr in lm_pad128_cache:
+                                                lm_pad128_cache[dst.data_ptr()] = lm_pad128_cache.pop(old_ptr)
                                         moved_s6 += 1
                                         bytes_s6 += dst.numel() * dst.element_size()
                                 except RuntimeError:
@@ -1168,67 +1174,6 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                         n, k, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
                         b[0], b[1], b[2], a[0], a[1], a[2], b[3], a[3],
                     )
-            # Also place multi-M BF16 rANS MMA blobs (muse_bf16_rans_m) for verify-width target BF16 attention
-            try:
-                import muse_bfx_ext as _bfx_ext
-                if hasattr(_bfx_ext, "rans_gemm_out") and hasattr(_bf16_mod, "get_m_rans"):
-                    for (n, k), layers in attn_bf16_groups.items():
-                        m_layers = [l for l in layers if l._buffers.get("muse_bf16_rans_m") is not None]
-                        if not m_layers:
-                            continue
-                        dev = m_layers[0]._buffers["muse_bf16_rans_m"].device
-                        max_len = max(l._buffers["muse_bf16_rans_m"].numel() for l in m_layers)
-                        x7 = torch.zeros((7, k), dtype=torch.bfloat16, device=dev)
-                        out7 = torch.empty((7, n), dtype=torch.bfloat16, device=dev)
-                        bexps = [_bf16_mod.get_m_rans(l.muse_bf16_lane_index)[1] for l in m_layers]
-                        def _tm(buf, be):
-                            ts = []
-                            for _ in range(4):
-                                evict_buf.zero_()
-                                e0 = torch.cuda.Event(enable_timing=True)
-                                e1 = torch.cuda.Event(enable_timing=True)
-                                e0.record()
-                                _bfx_ext.rans_gemm_out(x7, buf, out7, n, k, be)
-                                e1.record()
-                                torch.cuda.synchronize(dev)
-                                ts.append(e0.elapsed_time(e1))
-                            ts.sort()
-                            return ts[len(ts) // 2]
-                        _bfx_ext.rans_gemm_out(x7, m_layers[0]._buffers["muse_bf16_rans_m"], out7, n, k, bexps[0])
-                        torch.cuda.synchronize(dev)
-                        ht = [_tm(l._buffers["muse_bf16_rans_m"], bexps[i]) for i, l in enumerate(m_layers)]
-                        ref_b = m_layers[0]._buffers["muse_bf16_rans_m"]
-                        spares, st_list = [], []
-                        for si in range(min(15, len(m_layers) * 2)):
-                            sb = torch.empty(max_len, dtype=torch.uint8, device=dev)
-                            sb[:ref_b.numel()].copy_(ref_b)
-                            st_list.append((_tm(sb[:ref_b.numel()], bexps[0]), si))
-                            spares.append(sb)
-                        st_list.sort(key=lambda pair: pair[0])
-                        at = list(ht)
-                        sp_i = moved_m = 0
-                        for hi in sorted(range(len(m_layers)), key=lambda idx: -ht[idx]):
-                            if sp_i >= len(st_list):
-                                break
-                            t_sp, si = st_list[sp_i]
-                            if t_sp < ht[hi] * 0.99:
-                                h = m_layers[hi]._buffers["muse_bf16_rans_m"]
-                                dst = spares[si][:h.numel()]
-                                dst.copy_(h)
-                                tn = _tm(dst, bexps[hi])
-                                if tn < ht[hi]:
-                                    m_layers[hi]._buffers["muse_bf16_rans_m"] = dst
-                                    _bf16_mod.update_m_rans(m_layers[hi].muse_bf16_lane_index, dst)
-                                    at[hi] = tn
-                                    moved_m += 1
-                                sp_i += 1
-                        del spares, x7, out7
-                        logger.info(
-                            "Decode BF16 multi-M rANS placement %dx%d: %d blobs (~%.0f MiB), %d moved; sum %.3f -> %.3f ms",
-                            n, k, len(m_layers), max_len / (1 << 20), moved_m, sum(ht), sum(at),
-                        )
-            except Exception as err:  # noqa: BLE001
-                logger.warning("Decode BF16 multi-M rANS placement skipped: %s", err)
         if PLACE_ATTN and attn_rans_groups and _rans_ext is not None:
             for (n, k), layers in sorted(
                 attn_rans_groups.items(),
