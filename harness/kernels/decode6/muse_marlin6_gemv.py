@@ -141,6 +141,7 @@ _SWIGLU_GATE_UP: dict[int, dict] = {}
 _GATE_UP_TILE_ORDER: dict[torch.device, torch.Tensor] = {}
 _GATED_OPROJ: set[int] = set()
 _ALL_OPROJ_GATED_READY: bool = False
+_ALLOW_STRIDED_LM_M: bool = False
 _LMPOST_BUFS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 _consume_down_swiglu = None
 _notify_gate_up_swiglu = None
@@ -925,7 +926,7 @@ def decode_linear6(
             if status:
                 raise RuntimeError(f"SM121 Marlin multi-M (scale6) launch failed with CUDA error {status}")
             if lm_pad128:
-                return output[:, :n].contiguous()
+                return output[:, :n] if _ALLOW_STRIDED_LM_M else output[:, :n].contiguous()
             if (n, k) == (GATE_UP_N, GATE_UP_K) and global_scale.data_ptr() in _SWIGLU_GATE_UP:
                 order = _GATE_UP_TILE_ORDER.get(output.device)
                 if order is not None and output.is_contiguous():

@@ -483,9 +483,9 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[2],)
         if kind in ("cutlass_fp8", "mm"):
             return (args[1],)
-        if kind == "muse_bf16_lane" and args[0].shape[0] == 1 and args[0].is_contiguous():
+        if kind == "muse_bf16_lane" and 1 <= args[0].shape[0] <= 8 and args[0].is_contiguous():
             return (args[2],)
-        if kind == "muse_bf16_gate" and args[1].shape[0] == 1 and args[1].is_contiguous():
+        if kind == "muse_bf16_gate" and 1 <= args[1].shape[0] <= 8 and args[1].is_contiguous():
             return (args[3],)
         if kind == "marlin_tiled":
             return (args[1], args[2])
@@ -651,7 +651,7 @@ class Session:
                 if kind == "musefp8":
                     a, weight, packed, sa, sb = args
                     k, n = weight.shape
-                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
+                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and 1 <= a.shape[0] <= 8
                             and a.is_contiguous() and 0 < packed.numel() != n * k):
                         from vllm.model_executor.kernels.linear.scaled_mm.muse_fp8 import _scales_ok
                         if _scales_ok(sa, sb, n):
@@ -665,7 +665,7 @@ class Session:
                 elif kind == "muse_bf16_lane":
                     a, weight, packed, index = args
                     n, k = weight.shape
-                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
+                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and 1 <= a.shape[0] <= 8
                             and a.is_contiguous() and index.numel() == 1):
                         nbytes = (
                             BYTES_RANS_AFTER_ATTN
@@ -679,7 +679,7 @@ class Session:
                 elif kind == "muse_bf16_gate":
                     _, a, weight, packed, index = args
                     n, k = weight.shape
-                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
+                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and 1 <= a.shape[0] <= 8
                             and a.is_contiguous() and index.numel() == 1):
                         nbytes = BYTES_RANS_GATE
                         if nbytes == 0:

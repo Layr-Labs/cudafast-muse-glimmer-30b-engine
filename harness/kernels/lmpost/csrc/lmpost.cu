@@ -11,6 +11,7 @@ namespace lmpost {
 constexpr int kBlock = 256;
 constexpr int kWarps = kBlock / 32;
 constexpr int kArgmaxGrid = 128;
+constexpr int kArgmaxGridM = 64;
 
 __device__ __forceinline__ bool is_better(float va, int ia, float vb, int ib) {
   return (va > vb) || (va == vb && ia < ib);
@@ -130,6 +131,65 @@ softcap_argmax_kernel(const __nv_bfloat16* __restrict__ logits, const uint16_t* 
   }
 }
 
+template <bool Aligned>
+__global__ void __launch_bounds__(kBlock)
+softcap_argmax_m_kernel(const __nv_bfloat16* __restrict__ logits, const uint16_t* __restrict__ lut,
+                        int64_t* __restrict__ out_tokens, float* __restrict__ scratch_val,
+                        int* __restrict__ scratch_idx, int* __restrict__ done_cnt,
+                        int n, int row_stride) {
+  __shared__ float sv[kWarps];
+  __shared__ int si[kWarps];
+  __shared__ int am_last;
+
+  const int row = static_cast<int>(blockIdx.y);
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int gtid = blockIdx.x * kBlock + tid;
+  const int stride = gridDim.x * kBlock;
+  const __nv_bfloat16* row_logits = logits + static_cast<size_t>(row) * static_cast<size_t>(row_stride);
+
+  float bv = -INFINITY;
+  int bi = 0x7fffffff;
+
+  int vec_end = 0;
+  if constexpr (Aligned) {
+    const int n_vec = n >> 3;
+    vec_end = n_vec << 3;
+    const uint4* vec = reinterpret_cast<const uint4*>(row_logits);
+    for (int i = gtid; i < n_vec; i += stride) {
+      uint4 v = vec[i];
+      const uint16_t* p = reinterpret_cast<const uint16_t*>(&v);
+      const int base_idx = i << 3;
+#pragma unroll
+      for (int k = 0; k < 8; ++k) pick_better(bv, bi, lut_to_float(lut, p[k]), base_idx + k);
+    }
+  }
+  const uint16_t* raw = reinterpret_cast<const uint16_t*>(row_logits);
+  for (int i = vec_end + gtid; i < n; i += stride) {
+    pick_better(bv, bi, lut_to_float(lut, raw[i]), i);
+  }
+
+  block_reduce_max(bv, bi, sv, si, warp, lane);
+  const int row_base = row * static_cast<int>(gridDim.x);
+  if (tid == 0) {
+    scratch_val[row_base + blockIdx.x] = bv;
+    scratch_idx[row_base + blockIdx.x] = bi;
+    __threadfence();
+    am_last = (atomicAdd(done_cnt + row, 1) == static_cast<int>(gridDim.x) - 1) ? 1 : 0;
+  }
+  __syncthreads();
+  if (am_last) {
+    bv = (tid < static_cast<int>(gridDim.x)) ? ((const volatile float*)(scratch_val + row_base))[tid] : -INFINITY;
+    bi = (tid < static_cast<int>(gridDim.x)) ? ((const volatile int*)(scratch_idx + row_base))[tid] : 0x7fffffff;
+    block_reduce_max(bv, bi, sv, si, warp, lane);
+    if (tid == 0) {
+      done_cnt[row] = 0;
+      out_tokens[row] = static_cast<int64_t>(bi);
+    }
+  }
+}
+
 }  // namespace lmpost
 
 extern "C" int lmpost_init() {
@@ -141,7 +201,11 @@ extern "C" int lmpost_init() {
   if (rc != cudaSuccess) return (int)rc;
   rc = cudaFuncGetAttributes(&attr, lmpost::softcap_argmax_kernel<true>);
   if (rc != cudaSuccess) return (int)rc;
-  return (int)cudaFuncGetAttributes(&attr, lmpost::softcap_argmax_kernel<false>);
+  rc = cudaFuncGetAttributes(&attr, lmpost::softcap_argmax_kernel<false>);
+  if (rc != cudaSuccess) return (int)rc;
+  rc = cudaFuncGetAttributes(&attr, lmpost::softcap_argmax_m_kernel<true>);
+  if (rc != cudaSuccess) return (int)rc;
+  return (int)cudaFuncGetAttributes(&attr, lmpost::softcap_argmax_m_kernel<false>);
 }
 
 extern "C" int lmpost_softcap_inplace(void* logits, const void* lut, int total_elems, void* stream) {
@@ -180,6 +244,26 @@ extern "C" int lmpost_softcap_argmax(const void* logits, const void* lut, void* 
     softcap_argmax_kernel<false><<<kArgmaxGrid, kBlock, 0, st>>>(
         (const __nv_bfloat16*)logits, (const uint16_t*)lut, (int64_t*)out_token, (float*)scratch_val,
         (int*)scratch_idx, (int*)done_cnt, n);
+  }
+  return (int)cudaGetLastError();
+}
+
+extern "C" int lmpost_softcap_argmax_m(const void* logits, const void* lut, void* out_tokens,
+                                       void* scratch_val, void* scratch_idx, void* done_cnt,
+                                       int m, int n, int row_stride, void* stream) {
+  using namespace lmpost;
+  if (m <= 0 || m > 16 || n <= 0 || row_stride < n) return (int)cudaErrorInvalidValue;
+  cudaStream_t st = (cudaStream_t)stream;
+  const dim3 grid(kArgmaxGridM, static_cast<unsigned>(m), 1u);
+  const bool aligned = (((uintptr_t)logits & 15) == 0) && ((row_stride & 7) == 0) && (n >= 8);
+  if (aligned) {
+    softcap_argmax_m_kernel<true><<<grid, kBlock, 0, st>>>(
+        (const __nv_bfloat16*)logits, (const uint16_t*)lut, (int64_t*)out_tokens,
+        (float*)scratch_val, (int*)scratch_idx, (int*)done_cnt, n, row_stride);
+  } else {
+    softcap_argmax_m_kernel<false><<<grid, kBlock, 0, st>>>(
+        (const __nv_bfloat16*)logits, (const uint16_t*)lut, (int64_t*)out_tokens,
+        (float*)scratch_val, (int*)scratch_idx, (int*)done_cnt, n, row_stride);
   }
   return (int)cudaGetLastError();
 }

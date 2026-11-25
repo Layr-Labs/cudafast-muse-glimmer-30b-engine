@@ -306,6 +306,124 @@ __global__ void __launch_bounds__(128) single_decode_prep_kernel(
         b_num * static_cast<int64_t>(bs) + static_cast<int64_t>(b_off);
   }
 }
+
+// Multi-row (1..16) exact embedding + weightless RMSNorm (1 CTA per row, 512 threads, same reduction order as m1).
+template <typename Id, bool kPdl>
+__global__ void __launch_bounds__(512) embed_norm_m(
+    const Id* __restrict__ ids, const uint2* __restrict__ table, float eps,
+    uint2* __restrict__ out, int width) {
+  if constexpr (kPdl) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;");
+  } else {
+    asm volatile("griddepcontrol.launch_dependents;");
+  }
+  __shared__ float smem[512];
+  const int row = static_cast<int>(blockIdx.x);
+  const int t = threadIdx.x;
+  const int vec4 = width >> 2;
+  const long long id = static_cast<long long>(ids[row]);
+  const uint2* row_ptr = table + id * static_cast<size_t>(vec4);
+  uint2* out_row = out + static_cast<size_t>(row) * static_cast<size_t>(vec4);
+
+  float f[4][4];
+  float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+#pragma unroll
+  for (int it = 0; it < 4; ++it) {
+    const int idx = t + it * 512;
+    if (idx < vec4) {
+      const uint2 raw = row_ptr[idx];
+      const float x0 = __uint_as_float(raw.x << 16);
+      const float x1 = __uint_as_float(raw.x & 0xffff0000u);
+      const float x2 = __uint_as_float(raw.y << 16);
+      const float x3 = __uint_as_float(raw.y & 0xffff0000u);
+      f[it][0] = x0;
+      f[it][1] = x1;
+      f[it][2] = x2;
+      f[it][3] = x3;
+      acc0 = __fadd_rn(acc0, __fmul_rn(x0, x0));
+      acc1 = __fadd_rn(acc1, __fmul_rn(x1, x1));
+      acc2 = __fadd_rn(acc2, __fmul_rn(x2, x2));
+      acc3 = __fadd_rn(acc3, __fmul_rn(x3, x3));
+    }
+  }
+  float v = __fadd_rn(__fadd_rn(__fadd_rn(acc0, acc1), acc2), acc3);
+  smem[t] = v;
+#pragma unroll
+  for (int offset = 256; offset >= 32; offset >>= 1) {
+    __syncthreads();
+    if (t < offset) {
+      v = __fadd_rn(v, smem[t + offset]);
+      smem[t] = v;
+    }
+  }
+  __syncthreads();
+  if (t < 32) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, offset));
+    }
+    if (t == 0) {
+      const float factor = static_cast<float>(1.0 / static_cast<double>(width));
+      const float mean = __fmul_rn(v, factor);
+      smem[0] = rsqrtf(__fadd_rn(mean, eps));
+    }
+  }
+  __syncthreads();
+  const float r = smem[0];
+#pragma unroll
+  for (int it = 0; it < 4; ++it) {
+    const int idx = t + it * 512;
+    if (idx < vec4) {
+      const unsigned lo0 = bf16_rne(__fmul_rn(f[it][0], r));
+      const unsigned hi0 = bf16_rne(__fmul_rn(f[it][1], r));
+      const unsigned lo1 = bf16_rne(__fmul_rn(f[it][2], r));
+      const unsigned hi1 = bf16_rne(__fmul_rn(f[it][3], r));
+      out_row[idx] = make_uint2(lo0 | (hi0 << 16), lo1 | (hi1 << 16));
+    }
+  }
+}
+
+// Single-CTA exact 1-request greedy rejection + get_num_sampled_and_rejected.
+template <bool kPdl>
+__global__ void __launch_bounds__(32) greedy_reject_m_kernel(
+    const int64_t* __restrict__ target_tokens,
+    const int32_t* __restrict__ input_ids,
+    const int64_t* __restrict__ logits_indices,
+    const int32_t* __restrict__ seq_lens,
+    const int32_t* __restrict__ idx_mapping,
+    const int32_t* __restrict__ prefill_len,
+    int32_t* __restrict__ num_sampled_out,
+    int32_t* __restrict__ num_rejected_out,
+    int num_logits) {
+  if constexpr (kPdl) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;");
+  }
+  if (threadIdx.x != 0) return;
+  const int32_t req_state_idx = idx_mapping[0];
+  const int32_t seq_len = seq_lens[0];
+  const int32_t plen = prefill_len[req_state_idx];
+  if (seq_len < plen) {
+    num_sampled_out[0] = 0;
+    num_rejected_out[0] = 0;
+    return;
+  }
+  int32_t accepted = 0;
+  for (int i = 0; i < num_logits - 1; ++i) {
+    const int64_t t = target_tokens[i];
+    const int64_t idx = logits_indices ? logits_indices[i + 1] : static_cast<int64_t>(i + 1);
+    const int64_t d = static_cast<int64_t>(input_ids[idx]);
+    if (t == d) {
+      accepted += 1;
+    } else {
+      break;
+    }
+  }
+  const int32_t ns = accepted + 1;
+  num_sampled_out[0] = ns;
+  num_rejected_out[0] = num_logits - ns;
+}
 }  // namespace
 
 extern "C" int muse_embed_norm_m1(const void* ids, int ids_64, const void* table, float eps,
@@ -389,6 +507,34 @@ extern "C" int muse_single_decode_prep(
   return static_cast<int>(cudaGetLastError());
 }
 
+extern "C" int muse_embed_norm_m(const void* ids, int ids_64, const void* table, float eps,
+                                 void* out, int rows, int width, cudaStream_t stream) {
+  if (rows <= 0 || rows > 16 || width <= 0 || (width & 7) != 0 || width > 8192) {
+    return cudaErrorInvalidValue;
+  }
+  const bool use_pdl = decode_tail_pdl_enabled();
+  if (use_pdl) {
+    if (ids_64)
+      return static_cast<int>(launch_pdl(
+          embed_norm_m<long long, true>, rows, 512, stream,
+          static_cast<const long long*>(ids), static_cast<const uint2*>(table), eps,
+          static_cast<uint2*>(out), width));
+    return static_cast<int>(launch_pdl(
+        embed_norm_m<int, true>, rows, 512, stream,
+        static_cast<const int*>(ids), static_cast<const uint2*>(table), eps,
+        static_cast<uint2*>(out), width));
+  }
+  if (ids_64)
+    embed_norm_m<long long, false><<<rows, 512, 0, stream>>>(
+        static_cast<const long long*>(ids), static_cast<const uint2*>(table), eps,
+        static_cast<uint2*>(out), width);
+  else
+    embed_norm_m<int, false><<<rows, 512, 0, stream>>>(
+        static_cast<const int*>(ids), static_cast<const uint2*>(table), eps,
+        static_cast<uint2*>(out), width);
+  return static_cast<int>(cudaGetLastError());
+}
+
 extern "C" int muse_embed_square(const void* ids, int ids_64, const void* table, void* x2, int rows, int width,
                                  cudaStream_t stream) {
   if (rows <= 0 || width % 8) return cudaErrorInvalidValue;
@@ -417,5 +563,31 @@ extern "C" int muse_embed_scale(const void* ids, int ids_64, const void* table, 
   else
     embed_scale<int><<<grid, kThreads, 0, stream>>>(static_cast<const int*>(ids), static_cast<const uint4*>(table),
                                                      static_cast<const float*>(inv), static_cast<uint4*>(out), vec);
+  return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int muse_greedy_reject_m(
+    const void* target_tokens, const void* input_ids, const void* logits_indices,
+    const void* seq_lens, const void* idx_mapping, const void* prefill_len,
+    void* num_sampled_out, void* num_rejected_out, int num_logits, cudaStream_t stream) {
+  if (!target_tokens || !input_ids || !seq_lens || !idx_mapping || !prefill_len ||
+      !num_sampled_out || !num_rejected_out || num_logits < 2 || num_logits > 16) {
+    return cudaErrorInvalidValue;
+  }
+  if (decode_tail_pdl_enabled()) {
+    return static_cast<int>(launch_pdl(
+        greedy_reject_m_kernel<true>, 1, 32, stream,
+        static_cast<const int64_t*>(target_tokens), static_cast<const int32_t*>(input_ids),
+        static_cast<const int64_t*>(logits_indices), static_cast<const int32_t*>(seq_lens),
+        static_cast<const int32_t*>(idx_mapping), static_cast<const int32_t*>(prefill_len),
+        static_cast<int32_t*>(num_sampled_out), static_cast<int32_t*>(num_rejected_out),
+        num_logits));
+  }
+  greedy_reject_m_kernel<false><<<1, 32, 0, stream>>>(
+      static_cast<const int64_t*>(target_tokens), static_cast<const int32_t*>(input_ids),
+      static_cast<const int64_t*>(logits_indices), static_cast<const int32_t*>(seq_lens),
+      static_cast<const int32_t*>(idx_mapping), static_cast<const int32_t*>(prefill_len),
+      static_cast<int32_t*>(num_sampled_out), static_cast<int32_t*>(num_rejected_out),
+      num_logits);
   return static_cast<int>(cudaGetLastError());
 }

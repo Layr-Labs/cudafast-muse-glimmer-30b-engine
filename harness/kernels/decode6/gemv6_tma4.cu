@@ -737,6 +737,12 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
         input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
         nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
   }
+  static const int m_st = decode6_tma4_stages("MUSE_TMA4_M_STAGES", 3);
+  if (m_st == 3) {
+    return launch_tma4_impl<128, 256, false, true, false, false, false, false, 3, false, 0, false, true, false, true, true>(
+        input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
+        nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
+  }
   return launch_tma4_impl<128, 256, false, true, false, false, false, false, 4, false, 0, false, true, false, true, true>(
       input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
       nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
