@@ -10,8 +10,10 @@
 //   1 barrier/step, 2x N-tile A reuse, 2 MiB TLB prefetch, native M<=16 m16n8k16, and zero-cat aux5 fc input.
 #include <torch/extension.h>
 #include <cuda_runtime.h>
+#include <cuda/atomic>
 #include <cuda_bf16.h>
 #include <c10/cuda/CUDAStream.h>
+#include <algorithm>
 #include <cstdlib>
 #include <stdint.h>
 
@@ -494,17 +496,14 @@ __global__ void int4_reduce_splitk_kernel(
   C[idx] = __float2bfloat16_rn(sum);
 }
 
-// Persistent 144-CTA (3 CTAs/SM x 48 SMs) Stream-K W4A16 GEMM with continuous cross-tile cp.async.cg
-// pipeline (zero pipeline drain across N-tile boundaries, zero tail-wave quantization, zero second
-// reduce launch, lock-free atomicAdd + self-zeroing atomicExch, zero-div aux5 seg stepping, SM121 safe).
 template <bool kM16, bool kAux5>
 __global__ void __launch_bounds__(128, 3) int4_mma_streamk_kernel(
     const __nv_bfloat16* __restrict__ A,
     Aux5Desc aux5,
     const uint8_t* __restrict__ W_packed,
     __nv_bfloat16* __restrict__ C,
-    float* __restrict__ sk_partials,  // [max_n_blocks, 16, 64] zero-initialized & self-zeroing
-    int* __restrict__ sk_done,        // [max_n_blocks] zero-initialized & self-zeroing
+    float* __restrict__ sk_partials,
+    int* __restrict__ sk_done,
     int M, int N, int K, int n_blocks, int grid_ctas, int pdl_mode) {
   __shared__ Int4StageSmem<kM16 ? 16 : 8> smem;
   __shared__ int s_is_last;
@@ -517,8 +516,23 @@ __global__ void __launch_bounds__(128, 3) int4_mma_streamk_kernel(
   const int total_iters = n_blocks * num_kg;
 
   const int cta_id = blockIdx.x;
-  const int iter_start = static_cast<int>((static_cast<int64_t>(cta_id) * total_iters) / grid_ctas);
-  const int iter_end = static_cast<int>((static_cast<int64_t>(cta_id + 1) * total_iters) / grid_ctas);
+  int iter_start, iter_end;
+  if constexpr (kAux5) {
+    iter_start = static_cast<int>((static_cast<int64_t>(cta_id) * total_iters) / grid_ctas);
+    iter_end = static_cast<int>((static_cast<int64_t>(cta_id + 1) * total_iters) / grid_ctas);
+  } else {
+    const int whole_tiles = 2 * n_blocks - grid_ctas;
+    if (cta_id < whole_tiles) {
+      iter_start = cta_id * num_kg;
+      iter_end = iter_start + num_kg;
+    } else {
+      const int split_cta = cta_id - whole_tiles;
+      const int tile_start = (whole_tiles + split_cta / 2) * num_kg;
+      const int mid = tile_start + num_kg / 2;
+      iter_start = (split_cta & 1) ? mid : tile_start;
+      iter_end = (split_cta & 1) ? tile_start + num_kg : mid;
+    }
+  }
   const int my_iters = iter_end - iter_start;
   if (my_iters <= 0) return;
 
@@ -750,6 +764,46 @@ __global__ void __launch_bounds__(128, 3) int4_mma_streamk_kernel(
             *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * N + col1) = int4_bf16x2_u32(d2_1, d3_1);
           }
         }
+      } else if constexpr (!kAux5) {
+        static_assert(kM16);
+        const int split_tile = cur_n - (2 * n_blocks - grid_ctas);
+        const int half = seg_start_kg != 0;
+        constexpr int tile_size = 16 * 64;
+        float* pair_p = sk_partials + static_cast<size_t>(split_tile) * (2 * tile_size);
+        auto store_pair = [](float* p, float x, float y) {
+          *reinterpret_cast<float2*>(p) = make_float2(x, y);
+        };
+        float* mine = pair_p + half * tile_size + g * 64;
+        store_pair(mine + local_c0, d0_0, d1_0);
+        store_pair(mine + local_c1, d0_1, d1_1);
+        store_pair(mine + 8 * 64 + local_c0, d2_0, d3_0);
+        store_pair(mine + 8 * 64 + local_c1, d2_1, d3_1);
+
+        __syncthreads();
+        if (tid == 0) {
+          cuda::atomic_ref<int, cuda::thread_scope_device> arrivals(sk_done[split_tile]);
+          s_is_last = (arrivals.fetch_add(1, cuda::memory_order_acq_rel) == 1);
+        }
+        __syncthreads();
+        if (s_is_last) {
+          const float* peer = pair_p + (1 - half) * tile_size + g * 64;
+          auto fold_pair = [&](int row_offset, int col, float x, float y) {
+            const float2 other = __ldcg(
+                reinterpret_cast<const float2*>(peer + row_offset * 64 + col));
+            const float a = half ? __fadd_rn(other.x, x) : __fadd_rn(x, other.x);
+            const float b = half ? __fadd_rn(other.y, y) : __fadd_rn(y, other.y);
+            *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + row_offset) * N
+                                        + cur_n * kRowsPerCTA + col) = int4_bf16x2_u32(a, b);
+          };
+          fold_pair(0, local_c0, d0_0, d1_0);
+          fold_pair(0, local_c1, d0_1, d1_1);
+          fold_pair(8, local_c0, d2_0, d3_0);
+          fold_pair(8, local_c1, d2_1, d3_1);
+          if (tid == 0) {
+            cuda::atomic_ref<int, cuda::thread_scope_device> arrivals(sk_done[split_tile]);
+            arrivals.store(0, cuda::memory_order_relaxed);
+          }
+        }
       } else {
         float* tile_p = sk_partials + static_cast<size_t>(cur_n) * (16 * 64);
         if (g < M) {
@@ -850,21 +904,29 @@ static inline void int4_launch_pdl(
   TORCH_CHECK(err == cudaSuccess, "int4_mma_streamk_kernel launch failed: ", cudaGetErrorString(err));
 }
 
-void ensure_int4_sk_scratch(const torch::TensorOptions& opts, int n_blocks,
+template <bool kQuery>
+void ensure_int4_sk_scratch(const torch::TensorOptions& opts, int need,
                             float*& partials_ptr, int*& done_ptr) {
+  constexpr int partials_per_tile = (kQuery ? 2 : 1) * 16 * 64;
   static torch::Tensor g_sk_partials;
   static torch::Tensor g_sk_done;
   static int g_sk_cap = 0;
   static uint32_t g_sk_slot = 0;
-  if (!g_sk_partials.defined() || g_sk_partials.device() != opts.device() || g_sk_cap < n_blocks) {
-    const int cap = (n_blocks > 1024) ? n_blocks : 1024;
-    g_sk_partials = torch::zeros({2, static_cast<int64_t>(cap) * 16 * 64}, opts.dtype(torch::kFloat32));
+  if (!g_sk_partials.defined() || g_sk_partials.device() != opts.device() || g_sk_cap < need) {
+    const int cap = kQuery ? need : std::max(need, 1024);
+    const auto shape = {int64_t{2}, static_cast<int64_t>(cap) * partials_per_tile};
+    if constexpr (kQuery) {
+      g_sk_partials = torch::empty(shape, opts.dtype(torch::kFloat32));
+    } else {
+      g_sk_partials = torch::zeros(shape, opts.dtype(torch::kFloat32));
+    }
     g_sk_done = torch::zeros({2, cap}, opts.dtype(torch::kInt32));
     g_sk_cap = cap;
   }
   const int slot = static_cast<int>(g_sk_slot & 1u);
   g_sk_slot ^= 1u;
-  partials_ptr = g_sk_partials.data_ptr<float>() + static_cast<size_t>(slot) * static_cast<size_t>(g_sk_cap) * 16 * 64;
+  partials_ptr = g_sk_partials.data_ptr<float>()
+      + static_cast<size_t>(slot) * g_sk_cap * partials_per_tile;
   done_ptr = g_sk_done.data_ptr<int>() + static_cast<size_t>(slot) * static_cast<size_t>(g_sk_cap);
 }
 
@@ -874,19 +936,26 @@ torch::Tensor launch_int4_gemm(
     bool is_aux5,
     torch::Tensor W_packed,
     const torch::TensorOptions& opts,
-    int M, int64_t N, int64_t K) {
+    int M, int64_t N, int64_t K, bool query_streamk = false) {
   auto C = torch::empty({M, N}, opts);
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int n_blocks = static_cast<int>(N / kRowsPerCTA);
   const bool use_m16 = (M > 8);
   const int sk_grid = int4_sk_grid();
-  if (is_aux5 && sk_grid > 0) {
-    const int total_iters = n_blocks * static_cast<int>(K >> 6);
-    const int grid = (sk_grid < total_iters) ? sk_grid : total_iters;
+  const bool split_query =
+      query_streamk && M == 16 && K >= 128 && n_blocks > 0 && n_blocks < sk_grid;
+  if (sk_grid > 0 && (is_aux5 || split_query)) {
+    const int grid = is_aux5
+        ? std::min(sk_grid, n_blocks * static_cast<int>(K >> 6))
+        : std::min(sk_grid, 2 * n_blocks);
     const int pdl_mode = int4_pdl_mode();
     float* p_ptr = nullptr;
     int* d_ptr = nullptr;
-    ensure_int4_sk_scratch(opts, n_blocks, p_ptr, d_ptr);
+    if (is_aux5) {
+      ensure_int4_sk_scratch<false>(opts, n_blocks, p_ptr, d_ptr);
+    } else {
+      ensure_int4_sk_scratch<true>(opts, sk_grid / 2, p_ptr, d_ptr);
+    }
     if (is_aux5) {
       if (use_m16) {
         int4_launch_pdl(
@@ -902,19 +971,11 @@ torch::Tensor launch_int4_gemm(
             p_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
       }
     } else {
-      if (use_m16) {
-        int4_launch_pdl(
-            int4_mma_streamk_kernel<true, false>, grid, kThreads, st, pdl_mode,
-            A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
-            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-            p_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
-      } else {
-        int4_launch_pdl(
-            int4_mma_streamk_kernel<false, false>, grid, kThreads, st, pdl_mode,
-            A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
-            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-            p_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
-      }
+      int4_launch_pdl(
+          int4_mma_streamk_kernel<true, false>, grid, kThreads, st, pdl_mode,
+          A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+          reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+          p_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
     }
     return C;
   }
@@ -1017,7 +1078,8 @@ torch::Tensor int4_pack(torch::Tensor W, bool mse_opt = true) {
   return out;
 }
 
-torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K) {
+torch::Tensor int4_gemm(
+    torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K, bool query_streamk) {
   TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous(),
               "int4_gemm expects contiguous CUDA BF16 [M, K]");
   const int M = static_cast<int>(A.size(0));
@@ -1026,7 +1088,7 @@ torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
   Aux5Desc dummy{};
   return launch_int4_gemm(
       reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
-      dummy, false, W_packed, A.options(), M, N, K);
+      dummy, false, W_packed, A.options(), M, N, K, query_streamk);
 }
 
 torch::Tensor int4_gemm_aux5(

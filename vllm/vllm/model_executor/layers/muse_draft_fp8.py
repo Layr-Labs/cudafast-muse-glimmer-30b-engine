@@ -618,7 +618,8 @@ def _try_int4_buffer(
     w: torch.Tensor,
     metrics: dict[str, float] | None = None,
     check_aux5: bool = False,
-) -> tuple[torch.Tensor, bool] | None:
+    query_streamk: bool = False,
+) -> tuple[torch.Tensor, bool, bool] | None:
     import muse_bfx_ext as _bfx
 
     if not hasattr(_bfx, "int4_pack") or not hasattr(_bfx, "int4_gemm"):
@@ -634,11 +635,25 @@ def _try_int4_buffer(
         blob = _bfx.int4_pack(w_c)
     gen = torch.Generator(device=w.device)
     gen.manual_seed(4049 + n + 19 * k)
+    streamk_ok = False
     for m in (1, 7, 8, 16):
         x = (torch.randn((m, k), generator=gen, device=w.device) * 0.5).to(w.dtype)
         got = _bfx.int4_gemm(x, blob, n, k)
         if got.shape != (m, n) or not bool(torch.isfinite(got).all()):
             return None
+        if query_streamk and m == 16:
+            candidate = _bfx.int4_gemm(x, blob, n, k, True)
+            repeat = _bfx.int4_gemm(x, blob, n, k, True)
+            streamk_ok = torch.equal(
+                candidate.view(torch.int16), repeat.view(torch.int16)
+            ) and torch.allclose(candidate.float(), got.float(), rtol=2e-2, atol=2e-3)
+            if streamk_ok:
+                got = candidate
+            else:
+                logger.warning(
+                    "muse_draft_int4: split query check failed on (%d,%d); using direct INT4",
+                    n, k,
+                )
         dense = F.linear(x, w_c).float()
         got_f = got.float()
         cos = F.cosine_similarity(got_f.flatten(), dense.flatten(), dim=0).item()
@@ -677,7 +692,7 @@ def _try_int4_buffer(
             aux5_ok = False
             logger.warning("muse_draft_int4: aux5 check failed (%s)", exc)
     torch.cuda.synchronize(w.device)
-    return blob, aux5_ok
+    return blob, aux5_ok, streamk_ok
 
 
 # ---------------------------------------------------------------------------
@@ -942,12 +957,18 @@ def attach_linear(layer: torch.nn.Module, mode: str = "int3", name: str = "", le
     if mode == "int4":
         try:
             m: dict[str, float] = {}
-            res4 = _try_int4_buffer(w.data, metrics=m, check_aux5=(leaf == "fc"))
+            res4 = _try_int4_buffer(
+                w.data,
+                metrics=m,
+                check_aux5=(leaf == "fc"),
+                query_streamk=leaf in ("qkv_proj", "o_proj"),
+            )
             if res4 is not None:
-                blob, aux5_ok = res4
+                blob, aux5_ok, streamk_ok = res4
                 layer.register_buffer("_mi4_blob", blob, persistent=False)
                 layer._mi4 = (n, k)
                 layer._mi4_aux5_ok = aux5_ok
+                layer._mi4_query_streamk = streamk_ok
                 layer._mfp8 = (n, k)  # sentinel so muse_bfx skips this layer
                 qbytes = blob.numel() * blob.element_size()
                 _stats["admitted_int4"] += 1
@@ -1039,7 +1060,7 @@ def attach_tensor(mod: torch.nn.Module, prefix: str, w: torch.Tensor, mode: str 
             m: dict[str, float] = {}
             res4 = _try_int4_buffer(w.data, metrics=m, check_aux5=False)
             if res4 is not None:
-                blob, _ = res4
+                blob, _, _ = res4
                 mod.register_buffer(f"_{prefix}_mi4_blob", blob, persistent=False)
                 setattr(mod, f"_{prefix}_mi4", (n, k))
                 qbytes = blob.numel() * blob.element_size()
@@ -1116,20 +1137,29 @@ def attach_tensor(mod: torch.nn.Module, prefix: str, w: torch.Tensor, mode: str 
 
 
 @torch.library.custom_op("muse::draft_int4_linear", mutates_args=())
-def draft_int4_linear(x: torch.Tensor, w: torch.Tensor, blob: torch.Tensor, n: int, k: int) -> torch.Tensor:
+def draft_int4_linear(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    blob: torch.Tensor,
+    n: int,
+    k: int,
+    query_streamk: bool,
+) -> torch.Tensor:
     shape = x.shape
     x2 = x.reshape(-1, shape[-1])
     if x2.dtype == torch.bfloat16 and (1 <= x2.size(0) <= MAX_M_INT4 or w.numel() == 0):
         import muse_bfx_ext as _bfx
 
-        out = _run_chunked(x2, MAX_M_INT4, lambda xc: _bfx.int4_gemm(xc, blob, n, k))
+        out = _run_chunked(
+            x2, MAX_M_INT4, lambda xc: _bfx.int4_gemm(xc, blob, n, k, query_streamk)
+        )
     else:
         out = F.linear(x2, w)
     return out.reshape(*shape[:-1], n)
 
 
 @draft_int4_linear.register_fake
-def _(x, w, blob, n, k):
+def _(x, w, blob, n, k, query_streamk):
     return x.new_empty((*x.shape[:-1], n))
 
 
@@ -1266,7 +1296,9 @@ def _(x, w, w_ilv, coded, pal, mgs, ws, n, k):
 def layer_apply(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
     if getattr(layer, "_mi4", None) is not None:
         n, k = layer._mi4
-        return torch.ops.muse.draft_int4_linear(x, layer.weight, layer._mi4_blob, n, k)
+        return torch.ops.muse.draft_int4_linear(
+            x, layer.weight, layer._mi4_blob, n, k, layer._mi4_query_streamk
+        )
     if getattr(layer, "_mi3", None) is not None:
         n, k = layer._mi3
         return torch.ops.muse.draft_int3_linear(x, layer.weight, layer._mi3_blob, n, k)
@@ -1292,7 +1324,9 @@ def layer_apply(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
 def tensor_apply(mod: torch.nn.Module, prefix: str, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor | None:
     if getattr(mod, f"_{prefix}_mi4", None) is not None:
         n, k = getattr(mod, f"_{prefix}_mi4")
-        return torch.ops.muse.draft_int4_linear(x, w, getattr(mod, f"_{prefix}_mi4_blob"), n, k)
+        return torch.ops.muse.draft_int4_linear(
+            x, w, getattr(mod, f"_{prefix}_mi4_blob"), n, k, False
+        )
     if getattr(mod, f"_{prefix}_mi3", None) is not None:
         n, k = getattr(mod, f"_{prefix}_mi3")
         return torch.ops.muse.draft_int3_linear(x, w, getattr(mod, f"_{prefix}_mi3_blob"), n, k)

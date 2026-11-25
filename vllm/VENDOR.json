@@ -302,6 +302,10 @@
     {
       "file": "harness/kernels/musebfx/{int3_mma.cu,int4_mma.cu}; vllm/vllm/model_executor/layers/muse_draft_fp8.py",
       "why": "Zero-tail-wave 144-CTA (3 CTAs/SM x 48 SMs) persistent Stream-K W3A16/W4A16 drafter GEMM (MUSE_DRAFT_SK_GRID=144 default, 0 restores legacy direct/split-K): replaces wave-quantized direct/split-K grids (81.2% weighted SM wave efficiency -> 99.6% across all 22 drafter linears) with int3_mma_streamk_kernel<kM16, kSwiglu> and int4_mma_streamk_kernel<kM16, kAux5> streaming linearly through contiguous W_packed with zero cross-tile cp.async.cg pipeline drain, zero integer division in the hot K-loop, lock-free FP32 atomicAdd + last-CTA self-zeroing atomicExch (eliminating all 6 split-K reduce kernel launches and full-tile partial traffic), and SM121 odd-UR safety (zero L2::cache_hint/createpolicy)."
+    },
+    {
+      "file": "harness/kernels/musebfx/{int4_mma.cu,bfx.cu}; vllm/model_executor/layers/muse_draft_fp8.py",
+      "why": "Extend the existing INT4 Stream-K mainloop to the full-Q DFlash attention projections, which used the direct kernel in the parent. A subset of output tiles is bisected with a fixed two-part FP32 fold and a single CTA arrival counter; whole tiles bypass scratch. Load-time admission compares identical packed weights and requires bitwise repeatability. Context projection, smaller query shapes, target verification and prefill routing are unchanged."
     }
   ],
   "carried_from": {

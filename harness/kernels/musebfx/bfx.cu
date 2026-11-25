@@ -111,7 +111,8 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
 torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true);
 torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K);
 torch::Tensor int4_pack(torch::Tensor W, bool mse_opt = true);
-torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+torch::Tensor int4_gemm(
+    torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K, bool query_streamk);
 torch::Tensor int4_gemm_aux5(
     torch::Tensor h0, torch::Tensor h1, torch::Tensor h2, torch::Tensor h3, torch::Tensor h4,
     torch::Tensor W_packed, int64_t N, int64_t K);
@@ -208,7 +209,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int3_pack_swiglu", &int3_pack_swiglu, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
   m.def("int3_gemm_swiglu", &int3_gemm_swiglu);
   m.def("int4_pack", &int4_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
-  m.def("int4_gemm", &int4_gemm);
+  m.def("int4_gemm", &int4_gemm, pybind11::arg("A"), pybind11::arg("W_packed"),
+        pybind11::arg("N"), pybind11::arg("K"), pybind11::arg("query_streamk") = false);
   m.def("int4_gemm_aux5", &int4_gemm_aux5);
   m.def("dflash_kv_post", &dflash_kv_post);
   m.def("dflash_qkv_norm_rope", &dflash_qkv_norm_rope);
