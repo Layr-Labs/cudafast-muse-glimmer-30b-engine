@@ -250,6 +250,10 @@
     {
       "file": "vllm/model_executor/layers/muse_bfx.py, vllm/model_executor/models/qwen3_dflash.py, vllm/model_executor/models/muse_glimmer.py, vllm/model_executor/kernels/linear/nvfp4/decode_placement.py, vllm/v1/attention/backends/flash_attn.py",
       "why": "Lossless 12-bit exponent-pair BF16 rANS + inline escape (~10.6 bits/weight, 100% bit-exact verified at load) with K32 2x mma.sync.m16n8k16 Tensor-Core GEMM, 48-CTA persistent cp.async (L2::evict_first), 2 MiB TLB prefetch, dual-sided SM121 PDL, and GB10 UMA DRAM placement across all 12 target BF16 attention projections at verify width M=2..8 (strict 0-ULP bitwise admitted vs F.linear, with 32-SM gate overlap on output_gate_proj); zero-bank-conflict M=2..8 activation layout in muserans; and strict 0-ULP 512-token prefill kernels (gqa16_prefill_v3, fp8ws PDL + 9-warp ST=3, muse_fp8_swiglu WS9 ST=3)."
+    },
+    {
+      "file": "harness/kernels/gqa16_decode/{gqa16_decode.cu,muse_gqa16_attn.py}; vllm/v1/attention/backends/flash_attn.py; vllm/v1/worker/gpu/spec_decode/dflash/speculator.py; vllm/model_executor/models/qwen3_dflash.py",
+      "why": "Strict 0-ULP FA2-exact multi-row (q_len=2..8) GQA-16 shared-KV-tile verify attention (gqa16_verify_pair_1pass_kernel<128/64> with 2 queries/CTA -> 8 CTAs for q_len=7 fitting 32 gate + 8 l2pf + 8 attn = 48 SMs on GB10 without preemption, plus zero-atomic in-CTA split-KV kBlockN=128 fallback gqa16_verify_splitkv_kernel, MUSE_GQA16_VERIFY=0 disables) with eager runtime 0-ULP self-check admission per window/split regime against flash_attn_varlen_func before CUDA graph capture; and elimination of redundant DFlash out-of-graph context hidden-state copy in DFlashSpeculator.propose plus dtype-cached RoPE cos_sin_cache in DFlashQwen3Model.precompute_and_store_context_kv."
     }
   ],
   "carried_from": {

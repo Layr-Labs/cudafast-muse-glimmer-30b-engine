@@ -33,6 +33,7 @@ ONE_PASS_MAX_TOKENS = int(os.environ.get("MUSE_GQA16_1PASS_MAX_TOKENS", "2176"))
 PREFILL_ENABLED = os.environ.get("MUSE_GQA16_PREFILL", "1").strip() not in ("0", "", "false", "no")
 PREFILL_FUSE_ENABLED = os.environ.get("MUSE_GQA16_PREFILL_FUSE", "1").strip() not in ("0", "", "false", "no")
 PREFILL_PDL_ENABLED = os.environ.get("MUSE_GQA16_PREFILL_PDL", "1").strip() not in ("0", "", "false", "no")
+VERIFY_ENABLED = os.environ.get("MUSE_GQA16_VERIFY", "1").strip() not in ("0", "", "false", "no")
 
 _lib = None
 try:
@@ -58,12 +59,29 @@ try:
             ctypes.c_void_p,
         ]
         _lib.muse_gqa16_prefill.restype = ctypes.c_int
+    if hasattr(_lib, "muse_gqa16_verify"):
+        _lib.muse_gqa16_verify.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_void_p,
+        ]
+        _lib.muse_gqa16_verify.restype = ctypes.c_int
 except OSError:
     _lib = None
 
 _scratch: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_verify_scratch: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 _state: dict[int, tuple[bool, int, int]] = {}  # dev_idx -> (admitted, scale_mode, num_sms)
 _prefill_state: dict[int, tuple[bool, int]] = {}  # dev_idx -> (admitted, scale_mode)
+# dev_idx -> (sw_mode_ns0, full_mode_ns0, sw_mode_ns1, full_mode_ns1, scale_mode, num_sms)
+# mode encoding: 0=disabled, 1=pair_1pass_k128, 2=pair_1pass_k64,
+#                3=splitkv_k128(bnhm=32), 4=splitkv_k128(bnhm=4), 5=splitkv_k128(bnhm=2)
+_verify_state: dict[int, tuple[int, int, int, int, int, int]] = {}
 _pending_prefill: tuple | None = None
 _pf_counts: dict[str, int] = {"defer": 0, "fused1": 0, "fused2": 0, "direct0": 0, "flush": 0, "miss": 0}
 
@@ -655,5 +673,291 @@ def try_prefill_gqa16(
         max_seqlen_q, q_offset, 16, 0, st[1], 0, softmax_scale,
         query.stride(0), query.stride(1), output.stride(0),
         kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), stream,
+    )
+    return rc == 0
+
+
+def _get_verify_scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor] | None:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    bufs = _verify_scratch.get(idx)
+    if bufs is not None:
+        return bufs
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    # Sized for up to 8 verify query rows x 2 KV heads x MAX_SPLITS splits.
+    o_part = torch.empty((8, 2, MAX_SPLITS, 16, 128), dtype=torch.float32, device=device)
+    lse_part = torch.full((8, 2, MAX_SPLITS, 16), float("-inf"), dtype=torch.float32, device=device)
+    bufs = (o_part, lse_part)
+    _verify_scratch[idx] = bufs
+    return bufs
+
+
+def _resolve_verify_launch(
+    mode_id: int, max_seqlen_k: int, num_sms: int, scale_mode: int
+) -> tuple[int, int]:
+    """Return (fa2_splits, run_mode) for muse_gqa16_verify."""
+    if mode_id == 1:
+        return 1, scale_mode
+    if mode_id == 2:
+        return 1, scale_mode | 4
+    if mode_id == 3:
+        return fa2_num_splits_heuristic(max_seqlen_k, num_sms, 32), scale_mode
+    if mode_id == 4:
+        return fa2_num_splits_heuristic(max_seqlen_k, num_sms, 4), scale_mode
+    if mode_id == 5:
+        return fa2_num_splits_heuristic(max_seqlen_k, num_sms, 2), scale_mode
+    return 0, scale_mode
+
+
+def self_check_verify(device: torch.device) -> bool:
+    if not VERIFY_ENABLED or _lib is None or not hasattr(_lib, "muse_gqa16_verify") or device.type != "cuda":
+        return False
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    cached = _verify_state.get(idx)
+    if cached is not None:
+        return (cached[0] != 0) or (cached[1] != 0) or (cached[2] != 0) or (cached[3] != 0)
+    if torch.cuda.is_current_stream_capturing():
+        return False
+
+    sw_mode_ns0 = 0
+    full_mode_ns0 = 0
+    sw_mode_ns1 = 0
+    full_mode_ns1 = 0
+    scale_mode = 1
+    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    try:
+        from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+
+        gen = torch.Generator(device=device).manual_seed(20261125)
+        scale = float(128.0 ** -0.5)
+        num_blocks = 192
+        block_size = 16
+        raw_kv = (torch.randn((num_blocks, block_size, 2, 256), generator=gen, device=device) * 0.8).to(torch.bfloat16)
+        raw_kv[0].zero_()
+        kv_cache = raw_kv.permute(0, 2, 1, 3)
+        k_cache, v_cache = kv_cache.transpose(1, 2).split(128, dim=-1)
+        perm = torch.randperm(num_blocks - 1, generator=gen, device=device, dtype=torch.int32) + 1
+        bt = perm.unsqueeze(0).contiguous()
+        stream = torch.cuda.current_stream(device).cuda_stream
+
+        # Reuse scale_mode from M=1 decode self-check if already verified, else probe (1, 3).
+        prev_st = _state.get(idx)
+        scale_cands = (prev_st[1],) if (prev_st is not None and prev_st[0]) else (1, 3)
+
+        def _probe_regime(
+            windows: tuple[tuple[int, int], ...],
+            ns: int,
+            cand_modes: tuple[int, ...],
+            s_mode: int,
+        ) -> int:
+            q_cases = (
+                (7, (7, 17, 64, 66, 128, 131, 513, 519, 576, 640, 2050, 2500)),
+                (2, (8, 66, 131, 513, 640, 2050)),
+                (8, (8, 66, 131, 513, 640, 2050)),
+            )
+            # Precompute stock FA2 reference outputs once for this regime.
+            refs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, int], int, int, torch.Tensor]] = []
+            for q_len, seq_ks in q_cases:
+                cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+                for seq_k in seq_ks:
+                    for win in windows:
+                        bt_cur = bt.clone()
+                        if win[0] >= 0 and seq_k - q_len > win[0]:
+                            expired_pages = (seq_k - q_len - win[0]) // block_size
+                            if expired_pages > 0:
+                                bt_cur[0, :expired_pages] = 0
+                        max_sk_list = (seq_k,) if ns == 1 else (seq_k, 8192)
+                        for max_sk in max_sk_list:
+                            q = (torch.randn((q_len, 32, 128), generator=gen, device=device) * 1.5).to(torch.bfloat16).contiguous()
+                            sk = torch.tensor([seq_k], dtype=torch.int32, device=device)
+                            ref = torch.empty_like(q)
+                            flash_attn_varlen_func(
+                                q=q, k=k_cache, v=v_cache, out=ref,
+                                cu_seqlens_q=cu_q, max_seqlen_q=q_len,
+                                seqused_k=sk, max_seqlen_k=max_sk,
+                                softmax_scale=scale, causal=True,
+                                window_size=list(win), block_table=bt_cur,
+                                fa_version=2, num_splits=ns,
+                            )
+                            refs.append((q, sk, bt_cur, win, q_len, max_sk, ref))
+            torch.cuda.synchronize(device)
+
+            for m_id in cand_modes:
+                o_ptr = 0
+                lse_ptr = 0
+                if m_id >= 3:
+                    vbufs = _get_verify_scratch(device)
+                    if vbufs is None:
+                        continue
+                    o_ptr = vbufs[0].data_ptr()
+                    lse_ptr = vbufs[1].data_ptr()
+                all_ok = True
+                for q, sk, bt_cur, win, q_len, max_sk, ref in refs:
+                    f_splits, run_mode = _resolve_verify_launch(m_id, max_sk, num_sms, s_mode)
+                    if f_splits < 1 or f_splits > MAX_SPLITS:
+                        all_ok = False
+                        break
+                    got = torch.empty_like(q)
+                    rc = _lib.muse_gqa16_verify(
+                        q.data_ptr(), kv_cache.data_ptr(), got.data_ptr(),
+                        o_ptr, lse_ptr,
+                        sk.data_ptr(), bt_cur.data_ptr(),
+                        q_len, block_size, win[0], f_splits, run_mode, scale,
+                        q.stride(0), q.stride(1), got.stride(0), got.stride(1),
+                        kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
+                        stream,
+                    )
+                    torch.cuda.synchronize(device)
+                    if (
+                        rc != 0
+                        or not torch.isfinite(got).all()
+                        or not torch.equal(ref.view(torch.int16), got.view(torch.int16))
+                    ):
+                        all_ok = False
+                        break
+                if all_ok:
+                    return m_id
+            return 0
+
+        for cand_s in scale_cands:
+            sw0 = _probe_regime(((511, 0), (2047, 0)), 0, (1, 2), cand_s)
+            full0 = _probe_regime(((-1, -1),), 0, (1, 2, 3, 4, 5), cand_s)
+            if sw0 != 0 or full0 != 0:
+                scale_mode = cand_s
+                sw_mode_ns0 = sw0
+                full_mode_ns0 = full0
+                sw_mode_ns1 = _probe_regime(((511, 0), (2047, 0)), 1, (1, 2), cand_s)
+                full_mode_ns1 = _probe_regime(((-1, -1),), 1, (1, 2), cand_s)
+                break
+
+        # Release split-KV verify scratch if neither admitted full mode needs it.
+        if full_mode_ns0 < 3 and full_mode_ns1 < 3:
+            _verify_scratch.pop(idx, None)
+    except Exception:  # noqa: BLE001
+        logger.warning("muse_gqa16_attn: verify self-check raised on cuda:%d", idx, exc_info=True)
+        sw_mode_ns0 = full_mode_ns0 = sw_mode_ns1 = full_mode_ns1 = 0
+        _verify_scratch.pop(idx, None)
+
+    _verify_state[idx] = (sw_mode_ns0, full_mode_ns0, sw_mode_ns1, full_mode_ns1, scale_mode, num_sms)
+    admitted_any = (sw_mode_ns0 != 0) or (full_mode_ns0 != 0) or (sw_mode_ns1 != 0) or (full_mode_ns1 != 0)
+    if admitted_any:
+        logger.info(
+            "muse_gqa16_attn: verify strict 0-ULP admitted on cuda:%d (sw_ns0=%d, full_ns0=%d, sw_ns1=%d, full_ns1=%d, scale_mode=%d)",
+            idx, sw_mode_ns0, full_mode_ns0, sw_mode_ns1, full_mode_ns1, scale_mode,
+        )
+    else:
+        logger.warning("muse_gqa16_attn: verify strict 0-ULP self-check failed on cuda:%d; keeping stock FlashAttention-2", idx)
+    return admitted_any
+
+
+def try_verify_gqa16(
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    output: torch.Tensor,
+    seqused_k: torch.Tensor | None,
+    block_table: torch.Tensor | None,
+    cu_seqlens_q: torch.Tensor,
+    softmax_scale: float,
+    window: tuple[int, int] | list[int] | None,
+    max_seqlen_k: int = 8192,
+    max_num_splits: int = 0,
+) -> bool:
+    if not VERIFY_ENABLED or _lib is None or not hasattr(_lib, "muse_gqa16_verify"):
+        return False
+    device = query.device
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    vst = _verify_state.get(idx)
+    if vst is None:
+        if torch.cuda.is_current_stream_capturing() or not self_check_verify(device):
+            return False
+        vst = _verify_state[idx]
+
+    sw_ns0, full_ns0, sw_ns1, full_ns1, scale_mode, num_sms = vst
+    w_left = -1
+    if window is not None:
+        if window[1] > 0:
+            return False
+        w_left = int(window[0])
+
+    if max_num_splits == 0:
+        mode_id = sw_ns0 if w_left >= 0 else full_ns0
+    elif max_num_splits == 1:
+        mode_id = sw_ns1 if w_left >= 0 else full_ns1
+    else:
+        return False
+    if mode_id == 0:
+        return False
+
+    if (
+        seqused_k is None
+        or block_table is None
+        or query.dtype != torch.bfloat16
+        or kv_cache.dtype != torch.bfloat16
+        or output.dtype != torch.bfloat16
+        or query.ndim != 3
+        or output.ndim != 3
+        or query.shape != output.shape
+        or not (2 <= query.shape[0] <= 8)
+        or query.shape[1] != 32
+        or query.shape[2] != 128
+        or query.stride(2) != 1
+        or output.stride(2) != 1
+        or (query.stride(0) & 7) != 0
+        or (query.stride(1) & 7) != 0
+        or (output.stride(0) & 7) != 0
+        or (output.stride(1) & 7) != 0
+        or kv_cache.ndim != 4
+        or kv_cache.shape[1] != 2
+        or kv_cache.shape[3] != 256
+        or kv_cache.stride(3) != 1
+        or cu_seqlens_q.shape[0] != 2
+        or seqused_k.dtype != torch.int32
+        or block_table.dtype != torch.int32
+        or block_table.ndim != 2
+        or block_table.stride(1) != 1
+        or ((query.data_ptr() | kv_cache.data_ptr() | output.data_ptr()) & 15) != 0
+    ):
+        return False
+
+    block_size = int(kv_cache.shape[2])
+    if block_size < 16 or (block_size & 15) != 0:
+        return False
+
+    f_splits, run_mode = _resolve_verify_launch(mode_id, int(max_seqlen_k), num_sms, scale_mode)
+    if f_splits < 1 or f_splits > MAX_SPLITS:
+        return False
+
+    o_ptr = 0
+    lse_ptr = 0
+    if f_splits > 1:
+        vbufs = _get_verify_scratch(device)
+        if vbufs is None:
+            return False
+        o_ptr = vbufs[0].data_ptr()
+        lse_ptr = vbufs[1].data_ptr()
+
+    stream = torch.cuda.current_stream(device).cuda_stream
+    rc = _lib.muse_gqa16_verify(
+        query.data_ptr(),
+        kv_cache.data_ptr(),
+        output.data_ptr(),
+        o_ptr,
+        lse_ptr,
+        seqused_k.data_ptr(),
+        block_table.data_ptr(),
+        int(query.shape[0]),
+        block_size,
+        w_left,
+        f_splits,
+        run_mode,
+        softmax_scale,
+        query.stride(0),
+        query.stride(1),
+        output.stride(0),
+        output.stride(1),
+        kv_cache.stride(0),
+        kv_cache.stride(2),
+        kv_cache.stride(1),
+        stream,
     )
     return rc == 0

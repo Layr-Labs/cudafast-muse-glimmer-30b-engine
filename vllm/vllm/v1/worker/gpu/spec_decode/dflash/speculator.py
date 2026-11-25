@@ -340,19 +340,26 @@ class DFlashSpeculator(DraftModelSpeculator):
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
         if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
+            if aux_hidden_states[0].shape[0] > num_target_tokens:
+                aux_cat = torch.cat(
+                    [h[:num_target_tokens] for h in aux_hidden_states], dim=-1
+                )
+            else:
+                aux_cat = torch.cat(aux_hidden_states, dim=-1)
+            context_hidden_states = self.model.combine_hidden_states(aux_cat)[
+                :num_target_tokens
+            ]
         else:
-            hidden_states = last_hidden_states
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+            context_hidden_states = last_hidden_states[:num_target_tokens]
+        if not context_hidden_states.is_contiguous():
+            context_hidden_states = context_hidden_states.contiguous()
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
             self.model.precompute_and_store_context_kv(
-                self.hidden_states[:num_target_tokens],
+                context_hidden_states,
                 self.context_positions[:num_target_tokens],
             )
             # DFlash processes all speculative tokens in one forward pass,
@@ -415,7 +422,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
         self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
+            context_hidden_states,
             self.context_positions[:num_target_tokens],
             context_slots,
         )
