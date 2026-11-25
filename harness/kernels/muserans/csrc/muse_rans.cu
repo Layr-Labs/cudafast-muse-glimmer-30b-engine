@@ -406,13 +406,15 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
   if (pb.act_mode == 0) {
-    if (!pb.x_global)
-      for (int i = tid; i < pb.M * S * 4; i += blockDim.x) {
-        const int m = i / (S * 4), j = i - m * (S * 4);
-        int s = j >> 2, tt = j & 3;
+    if (!pb.x_global) {
+      const int stride_s = 4 * pb.M;
+      for (int i = tid; i < S * stride_s; i += blockDim.x) {
+        const int s = i / stride_s, rem = i - s * stride_s;
+        const int m = rem >> 2, tt = rem & 3;
         const uint8_t* xm = pb.x + (size_t)m * K;
         xs[i] = make_uint2(*(const uint32_t*)(xm + 32 * s + 4 * tt), *(const uint32_t*)(xm + 32 * s + 16 + 4 * tt));
       }
+    }
   } else if (pb.act_mode == 1) {
     const float inv_sa = rans_full_rcp(__ldg(pb.sa));
     const uint16_t* gate_u16 = (const uint16_t*)pb.x;
@@ -537,7 +539,7 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
           const uint8_t* xm = pb.x + (size_t)g * K + 32 * s + 4 * t;
           a = make_uint2(__ldg((const uint32_t*)xm), __ldg((const uint32_t*)(xm + 16)));
         } else {
-          a = xs[g * (S * 4) + s * 4 + t];
+          a = xs[s * (4 * pb.M) + lane];
         }
       }
       rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);

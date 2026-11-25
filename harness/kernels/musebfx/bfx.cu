@@ -93,4 +93,17 @@ torch::Tensor bfx_gemm(torch::Tensor x, torch::Tensor lo, torch::Tensor nib, tor
   return out;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("gemm", &bfx_gemm); }
+torch::Tensor bf16_rans_pack(torch::Tensor W);
+torch::Tensor bf16_rans_unpack(torch::Tensor blob, int64_t N, int64_t K);
+torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int64_t K, int64_t base_exp);
+void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp);
+int64_t bf16_rans_base(torch::Tensor blob);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("gemm", &bfx_gemm);
+  m.def("rans_pack", &bf16_rans_pack);
+  m.def("rans_unpack", &bf16_rans_unpack);
+  m.def("rans_gemm", &bf16_rans_gemm);
+  m.def("rans_gemm_out", &bf16_rans_gemm_out);
+  m.def("rans_base", &bf16_rans_base);
+}

@@ -1091,6 +1091,8 @@ class FlashAttentionImpl(AttentionImpl):
 
                 q_arg = query[:num_actual_tokens]
                 out_arg = output[:num_actual_tokens]
+                orig_max_seqlen_q = max_seqlen_q
+                tail = None
                 if (
                     muse_final_slab is not None
                     and mm_mask_mod is None
@@ -1115,6 +1117,32 @@ class FlashAttentionImpl(AttentionImpl):
                         out_arg = output[num_actual_tokens - tail_rows : num_actual_tokens]
                         cu_seqlens_q = tail_cu_q
                         max_seqlen_q = tail_rows
+
+                if (
+                    self._gqa16_decode_eligible
+                    and self.vllm_flash_attn_version == 2
+                    and causal is True
+                    and dynamic_causal is None
+                    and mm_mask_mod is None
+                    and rswa_mask_mod_fn is None
+                    and self.alibi_slopes is None
+                    and self.logits_soft_cap == 0
+                    and self.sinks is None
+                    and muse_gqa16_attn.try_prefill_gqa16(
+                        query=q_arg,
+                        kv_cache=kv_cache,
+                        output=out_arg,
+                        block_table=block_table,
+                        cu_seqlens_q=cu_seqlens_q,
+                        orig_max_seqlen_q=orig_max_seqlen_q,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        window=sliding_window_size,
+                        allow_defer=(tail is None),
+                    )
+                ):
+                    return output
 
                 flash_attn_varlen_func(
                     q=q_arg,
