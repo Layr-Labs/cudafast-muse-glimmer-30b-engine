@@ -224,6 +224,7 @@ class VllmBackend:
 
     def __init__(self, cfg: VllmConfig):
         from vllm import EngineArgs, LLMEngine, SamplingParams
+        from vllm.model_executor.draft_vocab import configure_draft_vocab
         from vllm.sampling_params import RequestOutputKind
         from vllm.usage.usage_lib import UsageContext
         from vllm.v1.executor.abstract import Executor
@@ -236,6 +237,12 @@ class VllmBackend:
             muse_sandwich.install()
 
         spec = speculative_config(cfg)
+        # 64k is the measured guarded winner on the fde28e8 record.  Keep the
+        # environment override for the 8k/16k/32k diagnostics and full-head 0.
+        draft_vocab_size = int(os.environ.get("MUSE_DRAFT_VOCAB_SIZE", "65536"))
+        if cfg.depth:
+            tree = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            configure_draft_vocab(cfg.model_dir, tree, draft_vocab_size)
         # PORT DRIFT (vLLM 0.27.1, Muse Glimmer 30B): a multimodal checkpoint
         # needs a tokenizer even when the caller only sends token IDs, because
         # the renderer builds the model's multimodal processor at engine start
