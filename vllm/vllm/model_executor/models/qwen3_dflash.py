@@ -428,6 +428,8 @@ class DFlashQwen3Model(nn.Module):
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
         )
+        self._tc_rans_mod = None
+        self._tc_rans_logged = False
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         embeds = self.embed_tokens(input_ids)
@@ -501,6 +503,87 @@ class DFlashQwen3Model(nn.Module):
 
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
+        if (
+            isinstance(self._rope_cos_sin_cache, torch.Tensor)
+            and self._rope_cos_sin_cache.dtype != self._fused_kv_weight.dtype
+        ):
+            self._rope_cos_sin_cache = self._rope_cos_sin_cache.to(
+                dtype=self._fused_kv_weight.dtype
+            )
+        self._fused_kv_tc_rans: torch.Tensor | None = None
+        self._fused_kv_n = int(self._fused_kv_weight.shape[0])
+        self._fused_kv_k = int(self._fused_kv_weight.shape[1])
+
+    def _enable_tc_rans(self) -> None:
+        if not hasattr(self, "_num_attn_layers"):
+            return
+        if get_tensor_model_parallel_world_size() != 1:
+            return
+        w_kv = getattr(self, "_fused_kv_weight", None)
+        if not isinstance(w_kv, torch.Tensor) or not w_kv.is_cuda or w_kv.dtype != torch.bfloat16:
+            return
+        try:
+            import muse_bf16_tc_rans as _tc_rans
+        except (ImportError, OSError):
+            return
+        if not _tc_rans.available(w_kv.device):
+            return
+        self._tc_rans_mod = _tc_rans
+        torch.cuda.empty_cache()
+        # Pack and free decoder linears smallest-to-largest first so ~1.6 GiB of raw
+        # BF16 weights is released before packing larger buffers (gate_up, fc, fused_kv).
+        layers_to_enable: list[tuple[nn.Module, bool]] = []
+        for attr_chain in (
+            ("self_attn", "o_proj"),
+            ("self_attn", "qkv_proj"),
+            ("mlp", "down_proj"),
+            ("mlp", "gate_up_proj"),
+        ):
+            for layer in self.layers:
+                sub = layer
+                for a in attr_chain:
+                    sub = getattr(sub, a)
+                layers_to_enable.append((sub, True))
+        if getattr(self, "use_aux_hidden_state", False) and hasattr(self, "fc"):
+            layers_to_enable.append((self.fc, False))
+        for mod, free_raw in layers_to_enable:
+            if _tc_rans.enable_layer(mod, free_raw_weight=free_raw):
+                mod.quant_method.process_weights_after_loading(mod)
+        admitted_now = sum(
+            1
+            for mod, _ in layers_to_enable
+            if getattr(mod, "_tc_rans_blob", None) is not None
+        )
+        vcfg = getattr(self, "vllm_config", None)
+        if admitted_now > 0 and vcfg is not None:
+            ac = getattr(vcfg, "additional_config", None)
+            if ac is None or isinstance(ac, dict):
+                vcfg.additional_config = {
+                    **(ac or {}),
+                    "muse_dflash_tc_rans_admitted": admitted_now,
+                }
+        torch.cuda.empty_cache()
+        if self._fused_kv_tc_rans is None:
+            kv_c = w_kv.contiguous()
+            kv_blob = _tc_rans.pack(kv_c)
+            if kv_blob is not None:
+                kv_rec = _tc_rans.decode(kv_blob, self._fused_kv_n, self._fused_kv_k)
+                if torch.equal(kv_rec.view(torch.int16), kv_c.view(torch.int16)):
+                    self._fused_kv_tc_rans = kv_blob
+                del kv_rec
+            del kv_c
+        if not getattr(self, "_tc_rans_logged", False):
+            self._tc_rans_logged = True
+            st = _tc_rans._stats
+            mb = 1024.0 * 1024.0
+            logger.info(
+                "DFlash muse_bf16_tc_rans: admitted=%d packed=%.2f MB raw=%.2f MB freed=%.2f MB (fused_kv=%s)",
+                st["admitted"],
+                st["packed_bytes"] / mb,
+                st["raw_bytes"] / mb,
+                st["freed_bytes"] / mb,
+                self._fused_kv_tc_rans is not None,
+            )
 
     def _project_context_kv(
         self,
@@ -518,9 +601,26 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
-        all_kv_flat = F.linear(
-            normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-        )
+        kv_blob = getattr(self, "_fused_kv_tc_rans", None)
+        tc_rans_mod = getattr(self, "_tc_rans_mod", None)
+        if (
+            kv_blob is not None
+            and tc_rans_mod is not None
+            and 1 <= num_ctx <= 8
+            and normed_context_states.is_cuda
+            and normed_context_states.dtype == torch.bfloat16
+        ):
+            all_kv_flat = tc_rans_mod.gemm(
+                normed_context_states,
+                kv_blob,
+                self._fused_kv_n,
+                self._fused_kv_k,
+                bias=self._fused_kv_bias,
+            )
+        else:
+            all_kv_flat = F.linear(
+                normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+            )
         # Single contiguous copy that separates K/V and transposes to
         # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
@@ -813,6 +913,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             skip_substrs=skip_substrs,
         )
         loader.load_weights(model_weights.items())
+        model_weights.clear()
+        del model_weights
+        del loader
+        torch.cuda.empty_cache()
         self.model._build_fused_kv_buffers()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:

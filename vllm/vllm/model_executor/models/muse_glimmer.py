@@ -2287,6 +2287,8 @@ class MuseGlimmerForCausalLM(
     def prepare_final_sample_tile(self, n: int):
         if n != 512 or not get_pp_group().is_last_rank or not get_pp_group().is_first_rank:
             return None
+        if any(lid >= self.model.end_layer for lid in self.model.aux_hidden_state_layers):
+            return None
         try:
             import muse_final_slab
         except (ImportError, OSError):
