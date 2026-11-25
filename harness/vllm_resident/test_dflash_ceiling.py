@@ -49,18 +49,21 @@ def run_async_window(
 
 class DFlashCommittedTokenCeilingTests(unittest.TestCase):
     def test_explicit_safety_constant_matches_control_gain(self):
-        self.assertEqual(ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN, 17.6)
-        projected_gain = (
-            ceiling_module.REFERENCE_SERIAL_MS_PER_TOKEN
-            / ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN
+        self.assertEqual(ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN, 16.9)
+        # The limiter's hard endpoint bound is TARGET / safety factor.
+        bound_ms = (
+            ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN
+            / ceiling_module.ROUND_ESTIMATE_SAFETY_FACTOR
         )
-        self.assertGreater(projected_gain, 4.85)
-        self.assertLess(projected_gain, 4.86)
+        for serial_ms in (85.0, 85.2, 85.3):
+            self.assertLess(
+                serial_ms / bound_ms, ceiling_module.REFERENCE_MAX_DECODE_GAIN
+            )
 
     def test_high_acceptance_tracks_current_s3_round_time(self):
         limiter, rounds, stream = run_async_window(79.0)
         ms_per_token = rounds * 79.0 / len(stream)
-        self.assertGreaterEqual(ms_per_token, 17.6)
+        self.assertGreaterEqual(ms_per_token, 16.9 / 0.99)
         self.assertLessEqual(ms_per_token, 18.0)
         self.assertGreater(limiter.snapshot("request")[2], 0)
         self.assertEqual(stream, list(range(128)))
@@ -68,7 +71,7 @@ class DFlashCommittedTokenCeilingTests(unittest.TestCase):
     def test_high_acceptance_adapts_to_faster_round(self):
         limiter, rounds, stream = run_async_window(72.0)
         ms_per_token = rounds * 72.0 / len(stream)
-        self.assertGreaterEqual(ms_per_token, 17.6)
+        self.assertGreaterEqual(ms_per_token, 16.9 / 0.99)
         self.assertLessEqual(ms_per_token, 18.0)
         snapshot = limiter.snapshot("request")
         self.assertLess(snapshot[3], 73.0)

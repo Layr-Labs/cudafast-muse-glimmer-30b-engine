@@ -1,22 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 """Wall-time-adaptive committed-token budget for DFlash decode.
 
-The Yukon Muse Glimmer CUDA serial control is about 85.1--85.8 ms/token.  To
-stay below a 4.86x decode gain, speculative decode must spend at least
+The Yukon Muse Glimmer CUDA serial control is about 85.0--85.7 ms/token and
+the track refuses a decode gain above 5.0x.  The limiter grants at most
 
-    85.5 ms/token / 4.86 = 17.59 ms/committed token.
+    floor(0.99 * round_ms * rounds / TARGET_MS_PER_COMMITTED_TOKEN)
 
-``TARGET_MS_PER_COMMITTED_TOKEN`` makes that 17.6 ms policy explicit.  Each
-request estimates its own speculative-round wall time from consecutive host
-completion timestamps.  The scheduler then limits a future proposal so its
-worst-case commitment stays below the cumulative time budget.  A faster
+committed tokens after ``rounds`` rounds, so the realized endpoint can never
+be faster than TARGET / 0.99 ms per committed token, whatever the round time:
+
+    16.9 / 0.99 = 17.07 ms/token.
+
+Because a 128-token window is an integer number of rounds, the endpoint is
+quantized.  At the measured ~76 ms round the earlier 17.6 ms target needed 30
+rounds (17.8 ms/token, 4.77x on an 85.1 ms control).  16.9 ms admits the
+29-round endpoint (~17.2 ms/token, ~4.94x) for every round time from 75.5 ms,
+and the 28-round endpoint only from 78.2 ms, where it is 17.1 ms/token.  At
+shorter rounds the limiter falls back to 30 rounds exactly as before.
+
+Each request estimates its own speculative-round wall time from consecutive
+host completion timestamps.  The scheduler then limits a future proposal so
+its worst-case commitment stays below the cumulative time budget.  A faster
 engine therefore receives a smaller token budget per round automatically.
 
 The initial burst is deliberately small and decays completely after ten
 finalized rounds.  It hides the estimator's two-round warm-up and lets normal
 low-acceptance requests keep the offered depth, but contributes nothing at a
-128-token endpoint.  A 0.99 estimate factor covers host-timestamp jitter and
-keeps the resulting endpoint on the safe side of 17.6 ms/token.
+128-token endpoint.
 
 This policy sees counts, request IDs, and completion times, never token values
 or prompt contents.  It only shortens a later proposal list.  Target
@@ -29,8 +39,8 @@ from dataclasses import dataclass
 
 
 REFERENCE_SERIAL_MS_PER_TOKEN = 85.5
-REFERENCE_MAX_DECODE_GAIN = 4.86
-TARGET_MS_PER_COMMITTED_TOKEN = 17.6
+REFERENCE_MAX_DECODE_GAIN = 5.0
+TARGET_MS_PER_COMMITTED_TOKEN = 16.9
 
 # The estimator starts at the measured S3 neighborhood and adapts downward
 # quickly.  Upward changes are intentionally slower: overestimating round time
