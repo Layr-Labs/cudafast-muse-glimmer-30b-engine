@@ -151,7 +151,8 @@ def _register(mod: torch.nn.Module, prefix: str, enc: dict) -> None:
 
 def attach_linear(layer: torch.nn.Module) -> bool:
     w = getattr(layer, "weight", None)
-    if w is None or getattr(layer, "bias", None) is not None or getattr(layer, "_bfx", False):
+    if w is None or getattr(layer, "bias", None) is not None or getattr(layer, "_bfx", False) \
+            or getattr(layer, "_mfp8", None) is not None:
         return False
     if _try_lane(layer):
         layer._bfx = True
@@ -260,6 +261,8 @@ def _(x, w, codes, scales, lut):
 
 def attach4(layer: torch.nn.Module) -> bool:
     w = getattr(layer, "weight", None)
+    if getattr(layer, "_nf4", False) or getattr(layer, "_mfp8", None) is not None:
+        return False
     if (_ext is None or not hasattr(_ext, "gemm4") or w is None or getattr(layer, "bias", None) is not None
             or w.dtype != torch.bfloat16 or w.dim() != 2 or w.shape[1] % CH):
         return False
@@ -280,3 +283,13 @@ def attach4_tensor(owner: torch.nn.Module, name: str, w: torch.Tensor) -> bool:
     owner.register_buffer(f"_nf4_{name}_scales", scales, persistent=False)
     owner.register_buffer(f"_nf4_{name}_lut", lut, persistent=False)
     return True
+
+
+def attach_drafter_mlp4(model: torch.nn.Module) -> int:
+    n = 0
+    if not DRAFT4:
+        return 0
+    for name, mod in model.named_modules():
+        if name.split(".")[-1] in ("gate_up_proj", "down_proj"):
+            n += attach4(mod)
+    return n

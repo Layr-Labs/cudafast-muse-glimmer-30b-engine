@@ -155,14 +155,19 @@ __global__ void __launch_bounds__(256) nf4_kernel(const __nv_bfloat16* __restric
       xs[m][(k & 15) * 32 + (k >> 4)] = __bfloat162float(x[(size_t)m * K + kc + k]);
     }
     __syncthreads();
+    uint64_t cw[R];
 #pragma unroll
-    for (int r = 0; r < R; r++) {
-      const uint64_t cw = (uint64_t)C[r].x | ((uint64_t)C[r].y << 32);
+    for (int r = 0; r < R; r++) cw[r] = (uint64_t)C[r].x | ((uint64_t)C[r].y << 32);
 #pragma unroll
-      for (int i = 0; i < 16; i++) {
-        const float w = lt[(cw >> (4 * i)) & 0xF] * S[r];
+    for (int i = 0; i < 16; i++) {
+      float xv[M];
 #pragma unroll
-        for (int m = 0; m < M; m++) acc[r][m] = fmaf(w, xs[m][i * 32 + lane], acc[r][m]);
+      for (int m = 0; m < M; m++) xv[m] = xs[m][i * 32 + lane];
+#pragma unroll
+      for (int r = 0; r < R; r++) {
+        const float w = lt[(cw[r] >> (4 * i)) & 0xF] * S[r];
+#pragma unroll
+        for (int m = 0; m < M; m++) acc[r][m] = fmaf(w, xv[m], acc[r][m]);
       }
     }
   }

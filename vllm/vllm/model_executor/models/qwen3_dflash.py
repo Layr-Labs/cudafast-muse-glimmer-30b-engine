@@ -821,6 +821,16 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         import os
         if os.environ.get("MUSE_BFX", "1") != "0":
             from vllm.model_executor.layers import muse_bfx
+            # 4-bit NF4 drafter MLP first; the remaining drafter linears go to FP8 Marlin below
+            n4 = muse_bfx.attach_drafter_mlp4(self.model)
+            logger.info("muse_bfx: %d drafter MLP linears on NF4", n4)
+        try:
+            from vllm.model_executor.layers import muse_draft_fp8
+            muse_draft_fp8.attach_drafter(self.model)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("muse_draft_fp8: skipped (%s)", e)
+        if os.environ.get("MUSE_BFX", "1") != "0":
+            from vllm.model_executor.layers import muse_bfx
             n = muse_bfx.attach_drafter(self.model)
             kv = muse_bfx.attach_tensor(self.model, "fkv", self.model._fused_kv_weight) if self.model._fused_kv_bias is None else False
             logger.info("muse_bfx: coded %d drafter linears, fused kv %s", n, kv)

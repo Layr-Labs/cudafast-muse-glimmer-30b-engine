@@ -225,6 +225,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if bias is None and getattr(layer, "_mfp8", None) is not None:
+            from vllm.model_executor.layers import muse_draft_fp8
+
+            return muse_draft_fp8.layer_apply(layer, x)
         if bias is None and getattr(layer, "_bfx", False):
             from vllm.model_executor.layers import muse_bfx
 

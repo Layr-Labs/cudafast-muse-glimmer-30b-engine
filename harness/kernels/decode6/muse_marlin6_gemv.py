@@ -132,6 +132,9 @@ _LM_SPLIT2_CACHE: dict[int, bool] = {}
 _LM_PAD128_SCALES: set[int] = set()
 _LM_PAD128_CACHE: dict[int, bool] = {}
 _SWIGLU_GATE_UP: dict[int, dict] = {}
+# The paired gate_up layout has 624 BF16 tiles of 64 columns; the multi-row verify output is un-paired by one gather.
+# Built once at weight registration, before CUDA graph capture.
+_GATE_UP_TILE_ORDER: dict[torch.device, torch.Tensor] = {}
 _GATED_OPROJ: set[int] = set()
 _ALL_OPROJ_GATED_READY: bool = False
 _LMPOST_BUFS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -891,6 +894,11 @@ def decode_linear6(
             if lm_pad128:
                 return output[:, :n].contiguous()
             if (n, k) == (GATE_UP_N, GATE_UP_K) and global_scale.data_ptr() in _SWIGLU_GATE_UP:
+                order = _GATE_UP_TILE_ORDER.get(output.device)
+                if order is not None and output.is_contiguous():
+                    # One exact gather of the 624 64-column tiles (newjordan 833fb6c4) instead of two strided
+                    # copies plus a concatenation: same values, same positions.
+                    return output.view(m, 624, 64).index_select(1, order).view(m, n)
                 head = output[:, :33792].view(m, 264, 2, 64)
                 return torch.cat(
                     (
@@ -1314,6 +1322,9 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
                 gu.register_buffer("_marlin_decode_scales6", s6_backup, persistent=False)
             continue
         del w_backup, s6_backup
+        if dev not in _GATE_UP_TILE_ORDER:
+            tiles = [*range(0, 528, 2), *range(528, 576), *range(1, 528, 2), *range(576, 624)]
+            _GATE_UP_TILE_ORDER[dev] = torch.tensor(tiles, dtype=torch.int64, device=dev)
         if is_fp8:
             _SWIGLU_GATE_UP[gs_key] = {
                 "swiglu_out": swiglu_out,
