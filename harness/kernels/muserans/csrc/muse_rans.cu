@@ -56,8 +56,13 @@ __device__ __forceinline__ void rans_mma_e4m3_m16(float& d0, float& d1, float& d
                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #endif
 }
-__device__ __forceinline__ uint64_t rans_policy_evict_first() { uint64_t pol; asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol)); return pol; }
-__device__ __forceinline__ void rans_cp_async16_s(uint32_t smem_dst, const void* gsrc, uint64_t pol) { asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(smem_dst), "l"(gsrc), "l"(pol)); }
+__device__ __forceinline__ void rans_cp_async16_s(uint32_t smem_dst, const void* gsrc) {
+  // Materialize L2::evict_first policy locally per copy to avoid sm_121a ptxas odd-UR descriptor bug;
+  // .L2::256B requests full 256B DRAM sectors for contiguous 512B-aligned warp ring refills.
+  uint64_t pol;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  asm volatile("cp.async.cg.shared.global.L2::256B.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(smem_dst), "l"(gsrc), "l"(pol));
+}
 __device__ __forceinline__ void rans_cp_async16_ca(uint32_t smem_dst, const void* gsrc) { asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(smem_dst), "l"(gsrc)); }
 __device__ __forceinline__ void rans_cp_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
 template <int N>
@@ -385,12 +390,11 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
   const uint8_t* ws = pb.stream;
   uint32_t wbytes = 0;
   int gmin = 0, toffw = 0, issued = 0;
-  const uint64_t pol = rans_policy_evict_first();
 #define RANS_ISSUE()                                                                                          \
   {                                                                                                         \
     _Pragma("unroll") for (uint32_t pc = 0; pc < GB / 512u; pc++) {                                         \
       uint32_t boff = (uint32_t)issued * GB + pc * 512u + (uint32_t)lane * 16u;                             \
-      if (boff < wbytes) rans_cp_async16_s(ring_s + (boff & (RB - 1u)), pb.ilv ? (pb.stream + ((((issued < gmin) ? ((size_t)issued * pb.tw + w) : (size_t)(toffw + issued - gmin)) << GBS) + pc * 512u + (uint32_t)lane * 16u)) : (ws + boff), pol); \
+      if (boff < wbytes) rans_cp_async16_s(ring_s + (boff & (RB - 1u)), pb.ilv ? (pb.stream + ((((issued < gmin) ? ((size_t)issued * pb.tw + w) : (size_t)(toffw + issued - gmin)) << GBS) + pc * 512u + (uint32_t)lane * 16u)) : (ws + boff)); \
     }                                                                                                       \
     rans_cp_commit();                                                                                         \
     issued++;                                                                                               \
@@ -407,7 +411,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
   if (lut_first) {
     const uint32_t lut_sa = (uint32_t)__cvta_generic_to_shared(lut_s);
     for (int i = tid; i < RANS_LUT_BYTES / 16; i += blockDim.x)
-      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(lut_sa + 16u * (uint32_t)i), "l"(((const uint4*)pb.lut) + i));
+      asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;" ::"r"(lut_sa + 16u * (uint32_t)i), "l"(((const uint4*)pb.lut) + i));
     rans_cp_commit();
 #if RANS_PREISSUE
     if (active && fast_preissue) {
@@ -427,8 +431,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
           uint32_t boff = (uint32_t)i * GB + pc * 512u + (uint32_t)lane * 16u;
           rans_cp_async16_s(
               ring_s + (boff & (RB - 1u)),
-              pb.stream + ((((size_t)i * pb.tw + w) << GBS) + pc * 512u + (uint32_t)lane * 16u),
-              pol);
+              pb.stream + ((((size_t)i * pb.tw + w) << GBS) + pc * 512u + (uint32_t)lane * 16u));
         }
         rans_cp_commit();
       }
@@ -736,7 +739,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
                 const uint32_t boff = ((uint32_t)issued << GBS) + lane16;
                 if (boff < wbytes) {
                   const uint8_t* src = (issued < gmin) ? ilv_ptr : (tail_w + ((size_t)(issued - gmin) << GBS));
-                  rans_cp_async16_s(ring_lane + (((uint32_t)issued << GBS) & (RB - 1u)), src, pol);
+                  rans_cp_async16_s(ring_lane + (((uint32_t)issued << GBS) & (RB - 1u)), src);
                 }
                 if (issued < gmin) ilv_ptr += stride_g;
                 rans_cp_commit();
@@ -1008,20 +1011,45 @@ static RansCfg rans_pick_cfg(int N, int K) {
 
 static void rans_normalize(const int64_t* counts, int32_t* f) {
   int64_t total = 0;
-  for (int i = 0; i < 256; i++) total += counts[i];
-  TORCH_CHECK(total > 0);
+  int active = 0;
+  for (int i = 0; i < 256; i++) {
+    total += counts[i];
+    if (counts[i] > 0) ++active;
+  }
+  TORCH_CHECK(total > 0 && active <= 4096);
   int sum = 0;
   for (int i = 0; i < 256; i++) {
-    if (counts[i] > 0) { long v = std::lround((double)counts[i] * 4096.0 / (double)total); f[i] = (int)std::max(1L, v); } else f[i] = 0;
+    if (counts[i] > 0) {
+      long v = std::floor((double)counts[i] * 4096.0 / (double)total);
+      f[i] = (int)std::max(1L, v);
+    } else {
+      f[i] = 0;
+    }
     sum += f[i];
   }
-  int diff = 4096 - sum;
-  while (diff != 0) {
-    int k = 0;
-    for (int i = 1; i < 256; i++) if (f[i] > f[k]) k = i;
-    int step = diff > 0 ? diff : std::max(diff, -(f[k] - 1));
-    TORCH_CHECK(step != 0, "cannot normalize frequencies");
-    f[k] += step; diff -= step;
+  while (sum < 4096) {
+    int best = -1;
+    double best_gain = -1.0;
+    for (int i = 0; i < 256; i++) {
+      if (f[i] <= 0) continue;
+      double gain = (double)counts[i] * std::log(((double)f[i] + 1.0) / (double)f[i]);
+      if (gain > best_gain) { best_gain = gain; best = i; }
+    }
+    TORCH_CHECK(best >= 0, "cannot normalize frequencies (+)");
+    f[best]++;
+    sum++;
+  }
+  while (sum > 4096) {
+    int best = -1;
+    double best_loss = 1e300;
+    for (int i = 0; i < 256; i++) {
+      if (f[i] <= 1) continue;
+      double loss = (double)counts[i] * std::log((double)f[i] / ((double)f[i] - 1.0));
+      if (loss < best_loss) { best_loss = loss; best = i; }
+    }
+    TORCH_CHECK(best >= 0, "cannot normalize frequencies (-)");
+    f[best]--;
+    sum--;
   }
 }
 
@@ -1068,10 +1096,44 @@ torch::Tensor rans_pack_cfg(torch::Tensor W, int64_t tw, int64_t ns, int64_t ilv
   for (int w = 0; w <= tw; w++) tab_i[w] = woff16[w];
   if (ilv > 0) {
     std::vector<int64_t> G(tw);
-    for (int w = 0; w < tw; w++) G[w] = ((int64_t)(woff16[w + 1] - woff16[w]) * 16 + ((int64_t)1 << ilv) - 1) >> ilv;
-    gmin = (int32_t)(*std::min_element(G.begin(), G.end()));
+    int64_t sum_g = 0;
+    for (int w = 0; w < tw; w++) {
+      G[w] = ((int64_t)(woff16[w + 1] - woff16[w]) * 16 + ((int64_t)1 << ilv) - 1) >> ilv;
+      sum_g += G[w];
+    }
+    std::vector<int64_t> Gs = G;
+    std::sort(Gs.begin(), Gs.end());
+    int64_t gmin64 = Gs[0];
+    // Default 12% only on mixed-Q/K/V shapes (N == 4608 or N == 8704) where low-entropy K/V warps
+    // drag down min(G) and scatter Q warps into tail_w; keep uniform-entropy shapes at 0 (no holes).
+    static const int ilv_pct_env = []() -> int {
+      const char* env = std::getenv("MUSERANS_ILV_PCT");
+      if (!env || !*env) return -1;
+      long v = std::strtol(env, nullptr, 10);
+      return (v >= 0 && v <= 50) ? static_cast<int>(v) : -1;
+    }();
+    const int ilv_pct = (ilv_pct_env >= 0) ? ilv_pct_env : ((N == 4608 || N == 8704) ? 12 : 0);
+    if (ilv_pct > 0 && tw >= 16) {
+      int idx = (int)((int64_t)tw * ilv_pct / 100);
+      if (idx >= tw) idx = (int)tw - 1;
+      const int64_t max_pad = sum_g / 50;  // <= 2% virtual padding cap
+      while (idx > 0) {
+        const int64_t cand = Gs[idx];
+        int64_t pad = 0;
+        for (int j = 0; j < idx; j++) pad += (cand - Gs[j]);
+        if (pad <= max_pad) {
+          gmin64 = cand;
+          break;
+        }
+        idx--;
+      }
+    }
+    gmin = (int32_t)gmin64;
     int64_t t = (int64_t)gmin * tw;
-    for (int w = 0; w < tw; w++) { tab_i[tw + 1 + w] = (int32_t)t; t += G[w] - gmin; }
+    for (int w = 0; w < tw; w++) {
+      tab_i[tw + 1 + w] = (int32_t)t;
+      if (G[w] > gmin) t += G[w] - gmin;
+    }
     stream_bytes = (size_t)t << ilv;
   }
   const size_t soff = rans_stream_off((int)tw);
@@ -1265,7 +1327,7 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
     const char* env = std::getenv("MUSERANS_SMEM_LOCK48");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
-  if (M == 1 && lock48 && blocks == 48 && dsmem < 40960) dsmem = 40960;
+  if (lock48 && blocks == 48 && dsmem < 40960) dsmem = 40960;
   rans_set_attrs_once();
   static const bool xsmem_en = []() {
     const char* env = std::getenv("MUSERANS_XSMEM");

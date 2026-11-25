@@ -2223,10 +2223,12 @@ __global__ void Marlin(
       auto red_idx = threadIdx.x / b_sh_stride_threads;
       if constexpr (multi_m && !m_block_size_8 && !is_a_8bit) {
         // Chunked reduction over j = 0..7:
-        // - fixed_shape != 3: 3 passes (3+3+2) -> 9 syncs (down from 12), sh_red = 6,144 B (total 62,880 B <= 62 KiB < 63 KiB SM121 64 KiB L1 carveout).
-        // - fixed_shape == 3 (lm_head, RANS_CAP=4096): 4 passes (2+2+2+2) -> sh_red = 4,096 B (total 62,624 B <= 62 KiB).
+        // - stages == 4 && threads == 256: 1 pass (8) -> 3 syncs (down from 9/12), sh_red = 16,384 B
+        //   (total 85,408 B / 87,200 B <= 84/86 KiB <= 99 KiB opt-in SMEM; already in 100 KiB SMEM carveout).
+        // - stages == 3, fixed_shape != 3: 3 passes (3+3+2) -> 9 syncs, sh_red = 6,144 B (total <= 62 KiB -> 64 KiB L1).
+        // - stages == 3, fixed_shape == 3: 4 passes (2+2+2+2) -> sh_red = 4,096 B (total <= 62 KiB).
         // Preserves exact per-element FP32 addition order (strict 0-ULP).
-        constexpr int red_j_chunk = (fixed_shape == 3) ? 2 : 3;
+        constexpr int red_j_chunk = (stages == 4 && threads == 256) ? 8 : ((fixed_shape == 3) ? 2 : 3);
         constexpr int red_sh_stride = b_sh_stride_threads * red_j_chunk;
         constexpr int red_sh_delta = b_sh_stride_threads;
         int red_sh_rd = red_sh_stride * red_idx + (threadIdx.x % b_sh_stride_threads);
@@ -2636,28 +2638,43 @@ __global__ void Marlin(
 
     if constexpr (gate_up_swiglu) {
       if constexpr (multi_m) {
-        const uint32_t* const sh_u32 = reinterpret_cast<const uint32_t*>(sh_red);
+        auto swiglu_bf16x2 = [&](uint32_t gw, uint32_t uw) -> uint32_t {
+          const float g0 = __uint_as_float(gw << 16);
+          const float g1 = __uint_as_float(gw & 0xffff0000u);
+          const float u0 = __uint_as_float(uw << 16);
+          const float u1 = __uint_as_float(uw & 0xffff0000u);
+          __nv_bfloat162 res = __floats2bfloat162_rn(
+              __fmul_rn(marlin_swiglu_silu(g0), u0),
+              __fmul_rn(marlin_swiglu_silu(g1), u1));
+          return *reinterpret_cast<uint32_t*>(&res);
+        };
+        auto swiglu_fp8x2 = [&](uint32_t gw, uint32_t uw) -> uint16_t {
+          const float g0 = __uint_as_float(gw << 16);
+          const float g1 = __uint_as_float(gw & 0xffff0000u);
+          const float u0 = __uint_as_float(uw << 16);
+          const float u1 = __uint_as_float(uw & 0xffff0000u);
+          return marlin_pack_fp8x2(
+              __fmul_rn(__fmul_rn(marlin_swiglu_silu(g0), u0), inv_fp8_scale),
+              __fmul_rn(__fmul_rn(marlin_swiglu_silu(g1), u1), inv_fp8_scale));
+        };
+        const uint4* const sh_u4 = reinterpret_cast<const uint4*>(sh_red);
         if (slice_col < 264) {
-          for (int idx = threadIdx.x; idx < prob_m * 32; idx += threads) {
-            const int r = idx >> 5;
-            const int c = idx & 31;
-            const uint32_t gw = sh_u32[r * (4 * c_sh_stride) + c];
-            const uint32_t uw = sh_u32[r * (4 * c_sh_stride) + c + 32];
-            const float g0 = __uint_as_float(gw << 16);
-            const float g1 = __uint_as_float(gw & 0xffff0000u);
-            const float u0 = __uint_as_float(uw << 16);
-            const float u1 = __uint_as_float(uw & 0xffff0000u);
+          for (int idx = threadIdx.x; idx < prob_m * 8; idx += threads) {
+            const int r = idx >> 3;
+            const int c = idx & 7;
+            const uint4 gv = sh_u4[r * c_sh_stride + c];
+            const uint4 uv = sh_u4[r * c_sh_stride + c + 8];
             if constexpr (gate_up_swiglu_fp8) {
-              reinterpret_cast<uint16_t*>(fp8_out_ptr + r * 19968 + slice_col * 64)[c] =
-                  marlin_pack_fp8x2(
-                      __fmul_rn(__fmul_rn(marlin_swiglu_silu(g0), u0), inv_fp8_scale),
-                      __fmul_rn(__fmul_rn(marlin_swiglu_silu(g1), u1), inv_fp8_scale));
+              const uint32_t p0 = static_cast<uint32_t>(swiglu_fp8x2(gv.x, uv.x));
+              const uint32_t p1 = static_cast<uint32_t>(swiglu_fp8x2(gv.y, uv.y));
+              const uint32_t p2 = static_cast<uint32_t>(swiglu_fp8x2(gv.z, uv.z));
+              const uint32_t p3 = static_cast<uint32_t>(swiglu_fp8x2(gv.w, uv.w));
+              reinterpret_cast<uint2*>(fp8_out_ptr + r * 19968 + slice_col * 64)[c] =
+                  make_uint2(p0 | (p1 << 16), p2 | (p3 << 16));
             } else {
-              __nv_bfloat162 res = __floats2bfloat162_rn(
-                  __fmul_rn(marlin_swiglu_silu(g0), u0),
-                  __fmul_rn(marlin_swiglu_silu(g1), u1));
-              reinterpret_cast<uint32_t*>(C0 + r * 2496 + slice_col * 8)[c] =
-                  *reinterpret_cast<uint32_t*>(&res);
+              reinterpret_cast<uint4*>(C0 + r * 2496 + slice_col * 8)[c] = make_uint4(
+                  swiglu_bf16x2(gv.x, uv.x), swiglu_bf16x2(gv.y, uv.y),
+                  swiglu_bf16x2(gv.z, uv.z), swiglu_bf16x2(gv.w, uv.w));
             }
           }
         } else {
@@ -2689,32 +2706,27 @@ __global__ void Marlin(
           }
           __syncthreads();
           if (sh_red[prob_m * c_sh_stride].x == 1) {
-            const uint32_t* const other_u32 = reinterpret_cast<const uint32_t*>(other_slot);
-            for (int idx = threadIdx.x; idx < prob_m * 64; idx += threads) {
-              const int r = idx >> 6;
-              const int c = idx & 63;
-              const uint32_t own_w = sh_u32[r * (4 * c_sh_stride) + c];
-              uint32_t oth_w;
-              asm volatile("ld.global.ca.b32 %0, [%1];\n"
-                           : "=r"(oth_w)
-                           : "l"(other_u32 + r * 64 + c));
-              const uint32_t gw = is_up ? oth_w : own_w;
-              const uint32_t uw = is_up ? own_w : oth_w;
-              const float g0 = __uint_as_float(gw << 16);
-              const float g1 = __uint_as_float(gw & 0xffff0000u);
-              const float u0 = __uint_as_float(uw << 16);
-              const float u1 = __uint_as_float(uw & 0xffff0000u);
+            for (int idx = threadIdx.x; idx < prob_m * 16; idx += threads) {
+              const int r = idx >> 4;
+              const int c = idx & 15;
+              const uint4 own_v = sh_u4[r * c_sh_stride + c];
+              uint4 oth_v;
+              asm volatile("ld.global.ca.v4.b32 {%0, %1, %2, %3}, [%4];\n"
+                           : "=r"(oth_v.x), "=r"(oth_v.y), "=r"(oth_v.z), "=r"(oth_v.w)
+                           : "l"(other_slot + r * 16 + c));
+              const uint4 gv = is_up ? oth_v : own_v;
+              const uint4 uv = is_up ? own_v : oth_v;
               if constexpr (gate_up_swiglu_fp8) {
-                reinterpret_cast<uint16_t*>(fp8_out_ptr + r * 19968 + 16896 + m_pair * 128)[c] =
-                    marlin_pack_fp8x2(
-                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g0), u0), inv_fp8_scale),
-                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g1), u1), inv_fp8_scale));
+                const uint32_t p0 = static_cast<uint32_t>(swiglu_fp8x2(gv.x, uv.x));
+                const uint32_t p1 = static_cast<uint32_t>(swiglu_fp8x2(gv.y, uv.y));
+                const uint32_t p2 = static_cast<uint32_t>(swiglu_fp8x2(gv.z, uv.z));
+                const uint32_t p3 = static_cast<uint32_t>(swiglu_fp8x2(gv.w, uv.w));
+                reinterpret_cast<uint2*>(fp8_out_ptr + r * 19968 + 16896 + m_pair * 128)[c] =
+                    make_uint2(p0 | (p1 << 16), p2 | (p3 << 16));
               } else {
-                __nv_bfloat162 res = __floats2bfloat162_rn(
-                    __fmul_rn(marlin_swiglu_silu(g0), u0),
-                    __fmul_rn(marlin_swiglu_silu(g1), u1));
-                reinterpret_cast<uint32_t*>(C0 + r * 2496 + 2112 + m_pair * 16)[c] =
-                    *reinterpret_cast<uint32_t*>(&res);
+                reinterpret_cast<uint4*>(C0 + r * 2496 + 2112 + m_pair * 16)[c] = make_uint4(
+                    swiglu_bf16x2(gv.x, uv.x), swiglu_bf16x2(gv.y, uv.y),
+                    swiglu_bf16x2(gv.z, uv.z), swiglu_bf16x2(gv.w, uv.w));
               }
             }
           }

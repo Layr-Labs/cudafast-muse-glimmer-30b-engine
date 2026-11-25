@@ -1475,7 +1475,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 g_or_fn.replay()
             return out_view
-        if sig in self._decode_embed_cg_rejected or len(entries) >= 8:
+        if sig in self._decode_embed_cg_rejected or len(entries) >= 16:
             return None
 
         ref_out = self.model_state.get_mm_embeddings(
@@ -2224,16 +2224,46 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     num_active_loras=num_active_loras,
                 )
         else:
-            batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-                self.cudagraph_manager,
-                num_reqs,
-                num_toks,
-                uniform_tok_count,
-                self.dp_size,
-                self.dp_rank,
-                need_eager=is_profile or skip_compiled,
-                num_active_loras=num_active_loras,
-            )
+            clamped_desc = None
+            if (
+                not dummy_run
+                and not is_profile
+                and not skip_compiled
+                and self.dp_size == 1
+                and self.pcp_manager is None
+                and self.cudagraph_manager is not None
+                and num_reqs == 1
+                and 2 <= num_toks < self.decode_query_len
+                and uniform_tok_count == num_toks
+                and _leaf_req_id is not None
+                and _leaf_req_idx is not None
+                and len(
+                    scheduler_output.scheduled_spec_decode_tokens.get(
+                        _leaf_req_id, ()
+                    )
+                )
+                == num_toks - 1
+                and int(self.req_states.num_computed_prefill_tokens[_leaf_req_idx])
+                >= int(self.req_states.prefill_len.np[_leaf_req_idx])
+                and int(self.req_states.num_computed_tokens_np[_leaf_req_idx])
+                >= int(self.req_states.prefill_len.np[_leaf_req_idx])
+            ):
+                clamped_desc = self.cudagraph_manager.dispatch_clamped_full(
+                    num_toks, num_active_loras
+                )
+            if clamped_desc is not None:
+                batch_desc, num_tokens_across_dp = clamped_desc, None
+            else:
+                batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+                    self.cudagraph_manager,
+                    num_reqs,
+                    num_toks,
+                    uniform_tok_count,
+                    self.dp_size,
+                    self.dp_rank,
+                    need_eager=is_profile or skip_compiled,
+                    num_active_loras=num_active_loras,
+                )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
