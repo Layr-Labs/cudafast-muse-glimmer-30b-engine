@@ -587,11 +587,21 @@ def try_decode_gqa16(
     return rc == 0
 
 
-def self_check_prefill(device: torch.device) -> bool:
-    if not PREFILL_ENABLED or _lib is None or not hasattr(_lib, "muse_gqa16_prefill") or device.type != "cuda":
+_FUSE_CONSUMER_WIRED = False
+
+
+def self_check_prefill(device: torch.device, block_size: int = 16) -> bool:
+    if (
+        not PREFILL_ENABLED
+        or _lib is None
+        or not hasattr(_lib, "muse_gqa16_prefill")
+        or device.type != "cuda"
+        or block_size not in (16, 32, 64)
+    ):
         return False
     idx = device.index if device.index is not None else torch.cuda.current_device()
-    cached = _prefill_state.get(idx)
+    key = (idx, int(block_size))
+    cached = _prefill_state.get(key)
     if cached is not None:
         return cached[0]
     if torch.cuda.is_current_stream_capturing():
@@ -605,14 +615,14 @@ def self_check_prefill(device: torch.device) -> bool:
 
         gen = torch.Generator(device=device).manual_seed(20261125)
         scale = float(128.0 ** -0.5)
-        num_blocks = 40
-        block_size = 16
+        n_req_blocks = 512 // block_size
+        num_blocks = n_req_blocks + 8
         raw_kv = (torch.randn((num_blocks, block_size, 2, 256), generator=gen, device=device) * 0.8).to(torch.bfloat16)
         raw_kv[0].zero_()
         kv_cache = raw_kv.permute(0, 2, 1, 3)
         k_cache, v_cache = kv_cache.transpose(1, 2).split(128, dim=-1)
         perm = torch.randperm(num_blocks - 1, generator=gen, device=device, dtype=torch.int32) + 1
-        bt = perm[:32].unsqueeze(0).contiguous()
+        bt = perm[:n_req_blocks].unsqueeze(0).contiguous()
         sk = torch.tensor([512], dtype=torch.int32, device=device)
         stream = torch.cuda.current_stream(device).cuda_stream
         fp8_scale = torch.tensor([0.045], dtype=torch.float32, device=device)
@@ -678,17 +688,17 @@ def self_check_prefill(device: torch.device) -> bool:
                 ok = True
                 break
     except Exception:  # noqa: BLE001
-        logger.warning("muse_gqa16_attn: prefill self-check raised on cuda:%d", idx, exc_info=True)
+        logger.warning("muse_gqa16_attn: prefill self-check raised on cuda:%d (bs=%d)", idx, block_size, exc_info=True)
         ok = False
 
-    _prefill_state[idx] = (ok, scale_mode)
+    _prefill_state[key] = (ok, scale_mode)
     if ok:
         logger.info(
-            "muse_gqa16_attn: prefill strict 0-ULP admitted on cuda:%d (fuse=%d, pdl=%d, scale_mode=%d)",
-            idx, int(PREFILL_FUSE_ENABLED), int(PREFILL_PDL_ENABLED), scale_mode,
+            "muse_gqa16_attn: prefill strict 0-ULP admitted on cuda:%d (bs=%d, fuse=%d, pdl=%d, scale_mode=%d)",
+            idx, block_size, int(PREFILL_FUSE_ENABLED), int(PREFILL_PDL_ENABLED), scale_mode,
         )
     else:
-        logger.warning("muse_gqa16_attn: prefill strict 0-ULP self-check failed on cuda:%d", idx)
+        logger.warning("muse_gqa16_attn: prefill strict 0-ULP self-check failed on cuda:%d (bs=%d)", idx, block_size)
     return ok
 
 
@@ -698,11 +708,11 @@ def flush_pending_prefill(stream: int | None = None) -> None:
     if pend is None:
         return
     _pending_prefill = None
-    _out_ptr, _out_numel, q, kv_cache, bt, out, seqlen_q, q_offset, scale, scale_mode, saved_stream = pend
+    _out_ptr, _out_numel, q, kv_cache, bt, out, seqlen_q, q_offset, block_size, scale, scale_mode, saved_stream = pend
     st = saved_stream if stream is None else int(stream)
     rc = _lib.muse_gqa16_prefill(
         q.data_ptr(), kv_cache.data_ptr(), 0, 0, out.data_ptr(), bt.data_ptr(),
-        seqlen_q, q_offset, 16, 0, scale_mode, 0, scale,
+        seqlen_q, q_offset, block_size, 0, scale_mode, 0, scale,
         q.stride(0), q.stride(1), out.stride(0),
         kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), st,
     )
@@ -722,7 +732,7 @@ def consume_prefill_mul_sigmoid(
     if pend is None:
         return False
     _pending_prefill = None
-    out_ptr, out_numel, q, kv_cache, bt, out_arg, seqlen_q, q_offset, scale, scale_mode, saved_stream = pend
+    out_ptr, out_numel, q, kv_cache, bt, out_arg, seqlen_q, q_offset, block_size, scale, scale_mode, saved_stream = pend
     st = saved_stream if stream is None else int(stream)
     is_fp8 = fp8_scale is not None
     out_align_mask = 7 if is_fp8 else 15
@@ -738,7 +748,7 @@ def consume_prefill_mul_sigmoid(
     ):
         rc_f = _lib.muse_gqa16_prefill(
             q.data_ptr(), kv_cache.data_ptr(), 0, 0, out_arg.data_ptr(), bt.data_ptr(),
-            seqlen_q, q_offset, 16, 0, scale_mode, 0, scale,
+            seqlen_q, q_offset, block_size, 0, scale_mode, 0, scale,
             q.stride(0), q.stride(1), out_arg.stride(0),
             kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), st,
         )
@@ -750,7 +760,7 @@ def consume_prefill_mul_sigmoid(
     pdl = 1 if PREFILL_PDL_ENABLED else 0
     rc = _lib.muse_gqa16_prefill(
         q.data_ptr(), kv_cache.data_ptr(), gate.data_ptr(), fp8_ptr, out.data_ptr(), bt.data_ptr(),
-        seqlen_q, q_offset, 16, mode, scale_mode, pdl, scale,
+        seqlen_q, q_offset, block_size, mode, scale_mode, pdl, scale,
         q.stride(0), q.stride(1), 4096,
         kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), st,
     )
@@ -781,13 +791,22 @@ def try_prefill_gqa16(
         return False
     if _pending_prefill is not None:
         flush_pending_prefill()
+    if kv_cache.ndim != 4:
+        return False
+    block_size = int(kv_cache.shape[2])
+    if block_size not in (16, 32, 64):
+        return False
+    # For small tails (e.g. Layer-51 64-row final slab), FA2 is faster than 16-CTA gqa16_prefill.
+    if max_seqlen_q < 128:
+        return False
     device = query.device
     idx = device.index if device.index is not None else torch.cuda.current_device()
-    st = _prefill_state.get(idx)
+    key = (idx, block_size)
+    st = _prefill_state.get(key)
     if st is None:
-        if torch.cuda.is_current_stream_capturing() or not self_check_prefill(device):
+        if torch.cuda.is_current_stream_capturing() or not self_check_prefill(device, block_size):
             return False
-        st = _prefill_state[idx]
+        st = _prefill_state[key]
     elif not st[0]:
         return False
 
@@ -796,7 +815,6 @@ def try_prefill_gqa16(
         or orig_max_seqlen_q != max_seqlen_k
         or max_seqlen_k < 128
         or (max_seqlen_k & 127) != 0
-        or max_seqlen_q <= 0
         or max_seqlen_q > max_seqlen_k
         or (max_seqlen_q & 7) != 0
         or cu_seqlens_q.shape[0] != 2
@@ -813,15 +831,13 @@ def try_prefill_gqa16(
         or query.stride(2) != 1
         or (query.stride(0) & 7) != 0
         or (query.stride(1) & 7) != 0
-        or kv_cache.ndim != 4
         or kv_cache.shape[1] != 2
-        or kv_cache.shape[2] != 16
         or kv_cache.shape[3] != 256
         or kv_cache.stride(3) != 1
         or block_table.dtype != torch.int32
         or block_table.ndim != 2
         or block_table.stride(1) != 1
-        or block_table.shape[1] < (max_seqlen_k >> 4)
+        or block_table.shape[1] < (max_seqlen_k // block_size)
         or ((query.data_ptr() | kv_cache.data_ptr() | output.data_ptr()) & 15) != 0
     ):
         _pf_counts["miss"] += 1
@@ -845,7 +861,7 @@ def try_prefill_gqa16(
         return False
 
     stream = torch.cuda.current_stream(device).cuda_stream
-    if allow_defer and q_offset == 0 and PREFILL_FUSE_ENABLED:
+    if allow_defer and _FUSE_CONSUMER_WIRED and q_offset == 0 and PREFILL_FUSE_ENABLED:
         _pending_prefill = (
             output.data_ptr(),
             output.numel(),
@@ -855,6 +871,7 @@ def try_prefill_gqa16(
             output,
             max_seqlen_q,
             q_offset,
+            block_size,
             softmax_scale,
             st[1],
             stream,
@@ -863,7 +880,7 @@ def try_prefill_gqa16(
 
     rc = _lib.muse_gqa16_prefill(
         query.data_ptr(), kv_cache.data_ptr(), 0, 0, output.data_ptr(), block_table.data_ptr(),
-        max_seqlen_q, q_offset, 16, 0, st[1], 0, softmax_scale,
+        max_seqlen_q, q_offset, block_size, 0, st[1], 0, softmax_scale,
         query.stride(0), query.stride(1), output.stride(0),
         kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), stream,
     )

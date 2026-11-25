@@ -33,18 +33,40 @@ logger = init_logger(__name__)
 
 MAX_M_FP8 = 16
 MAX_M_NVFP4 = 8
-_NAMES = ("qkv_proj", "o_proj", "gate_up_proj", "down_proj", "fc")
+_DECODER_NAMES = ("o_proj", "qkv_proj", "down_proj", "gate_up_proj")
+_NAMES = (*_DECODER_NAMES, "fc")
 _MLP_FC_NAMES = ("gate_up_proj", "down_proj", "fc")
+_ATTN_NAMES = ("qkv_proj", "o_proj")
+_ATTN_FC_NAMES = ("qkv_proj", "o_proj", "fc")
+_ATTN_FC_DN_NAMES = ("qkv_proj", "o_proj", "down_proj", "fc")
 _stats = {
     "admitted_int3": 0,
+    "admitted_int4": 0,
     "admitted_nvfp4": 0,
     "admitted_fp8": 0,
+    "admitted_m512_fp8": 0,
     "rejected": 0,
     "bytes_bf16": 0,
     "bytes_quant": 0,
+    "bytes_freed": 0,
 }
 
 _SHARED_PARTIALS: dict[int, torch.Tensor] = {}
+_BFX_EXT = None
+_BFX_TRIED = False
+
+
+def _get_bfx():
+    global _BFX_EXT, _BFX_TRIED
+    if not _BFX_TRIED:
+        _BFX_TRIED = True
+        try:
+            import muse_bfx_ext as _bfx
+
+            _BFX_EXT = _bfx
+        except Exception:  # noqa: BLE001
+            _BFX_EXT = None
+    return _BFX_EXT
 
 
 def enabled() -> bool:
@@ -276,13 +298,14 @@ def _quantize_nvfp4_tma4(w: torch.Tensor, max_pal: int = 64):
     return qw, ms, mgs, w_ilv, coded, pal, ws
 
 
-def _run_nvfp4_tma4(
+def _run_nvfp4_tma4_into(
     x2: torch.Tensor,
     w_ilv: torch.Tensor,
     coded: torch.Tensor,
     pal: torch.Tensor,
     mgs: torch.Tensor,
     ws: torch.Tensor,
+    out: torch.Tensor,
     n: int,
     k: int,
 ) -> torch.Tensor:
@@ -291,7 +314,6 @@ def _run_nvfp4_tma4(
     if not x2.is_contiguous() or x2.data_ptr() % 16:
         x2 = x2.clone(memory_format=torch.contiguous_format)
     m = int(x2.shape[0])
-    out = x2.new_empty((m, n))
     partials = _get_partials(x2.device)
     st = d6._sk_tma4_ilv_m(
         x2.data_ptr(),
@@ -312,6 +334,20 @@ def _run_nvfp4_tma4(
     if st:
         raise RuntimeError(f"muse_marlin6_sk_tma4_ilv_m failed with CUDA error {st}")
     return out
+
+
+def _run_nvfp4_tma4(
+    x2: torch.Tensor,
+    w_ilv: torch.Tensor,
+    coded: torch.Tensor,
+    pal: torch.Tensor,
+    mgs: torch.Tensor,
+    ws: torch.Tensor,
+    n: int,
+    k: int,
+) -> torch.Tensor:
+    out = x2.new_empty((int(x2.shape[0]), n))
+    return _run_nvfp4_tma4_into(x2, w_ilv, coded, pal, mgs, ws, out, n, k)
 
 
 def _check_nvfp4(w: torch.Tensor, qw, ms, mgs, w_ilv, coded, pal, ws) -> bool:
@@ -423,17 +459,94 @@ def _try_int3_buffer(w: torch.Tensor) -> torch.Tensor | None:
     return blob
 
 
+def _try_int4_buffer(w: torch.Tensor) -> torch.Tensor | None:
+    bfx = _get_bfx()
+    if bfx is None or not hasattr(bfx, "int4_pack") or not hasattr(bfx, "int4_gemm"):
+        return None
+    n, k = w.shape
+    if n % 64 != 0 or k % 64 != 0:
+        return None
+    w_c = w.contiguous()
+    blob = bfx.int4_pack(w_c)
+    gen = torch.Generator(device=w.device)
+    gen.manual_seed(4051 + n + 23 * k)
+    for m in (1, 7, 8):
+        x = (torch.randn((m, k), generator=gen, device=w.device) * 0.5).to(w.dtype)
+        got = bfx.int4_gemm(x, blob, n, k)
+        if got.shape != (m, n) or not bool(torch.isfinite(got).all()):
+            return None
+        dense = F.linear(x, w_c).float()
+        cos = F.cosine_similarity(got.float().flatten(), dense.flatten(), dim=0).item()
+        if not cos >= 0.99:
+            logger.warning("muse_draft_int4: low cosine %.5f on (%d,%d) M=%d", cos, n, k, m)
+            return None
+    torch.cuda.synchronize(w.device)
+    return blob
+
+
+def _free_bf16_enabled() -> bool:
+    return os.environ.get("MUSE_DRAFT_FREE_BF16", "1") != "0"
+
+
+def _m512_fp8_enabled() -> bool:
+    return os.environ.get("MUSE_DRAFT_M512_FP8", "1") != "0"
+
+
+def _pack_fp8_large_m(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Pack BF16 [N, K] into column-major FP8 [K, N] + per-channel fp32 scale [1, N] for M > 8 cutlass_scaled_mm."""
+    import vllm._custom_ops as ops
+
+    n, k = w.shape
+    if n % 16 != 0 or k % 16 != 0:
+        return None
+    q, s = _quantize_rows_fp8(w)
+    b_t = q.t()  # [K, N], column-major stride (1, K), zero-copy view over row-major q [N, K]
+    sb = s.view(1, n).contiguous()
+    gen = torch.Generator(device=w.device)
+    gen.manual_seed(4049 + n + 19 * k)
+    try:
+        x = (torch.randn((16, k), generator=gen, device=w.device) * 0.5).to(w.dtype)
+        xq, xs = ops.scaled_fp8_quant(x, use_per_token_if_dynamic=True)
+        got = ops.cutlass_scaled_mm(xq, b_t, scale_a=xs, scale_b=sb, out_dtype=w.dtype)
+        if got.shape != (16, n) or not bool(torch.isfinite(got).all()):
+            return None
+        dense = F.linear(x, w).float()
+        cos = F.cosine_similarity(got.float().flatten(), dense.flatten(), dim=0).item()
+        if not cos >= 0.995:
+            logger.warning("muse_draft_m512_fp8: low cosine %.5f on (%d,%d)", cos, n, k)
+            return None
+        torch.cuda.synchronize(w.device)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("muse_draft_m512_fp8: check failed on (%d,%d) (%s); keeping BF16", n, k, e)
+        return None
+    return b_t, sb
+
+
+def _run_fp8_large_m(x2: torch.Tensor, b_t: torch.Tensor, sb: torch.Tensor) -> torch.Tensor:
+    import vllm._custom_ops as ops
+
+    xq, xs = ops.scaled_fp8_quant(x2.contiguous(), use_per_token_if_dynamic=True)
+    return ops.cutlass_scaled_mm(xq, b_t, scale_a=xs, scale_b=sb, out_dtype=x2.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Attachment (modules + fused KV tensor) and custom ops
 # ---------------------------------------------------------------------------
 
-def attach_linear(layer: torch.nn.Module, mode: str = "int3") -> bool:
+def attach_linear(
+    layer: torch.nn.Module,
+    mode: str = "int3",
+    *,
+    free_bf16: bool = False,
+    attach_m512_fp8: bool = False,
+) -> bool:
     w = getattr(layer, "weight", None)
     if (
         w is None
         or getattr(layer, "bias", None) is not None
         or getattr(layer, "_mfp8", None) is not None
         or getattr(layer, "_mnv4", None) is not None
+        or getattr(layer, "_mi4", None) is not None
         or getattr(layer, "_mi3", None) is not None
         or not isinstance(w, torch.Tensor)
         or w.dtype != torch.bfloat16
@@ -445,7 +558,22 @@ def attach_linear(layer: torch.nn.Module, mode: str = "int3") -> bool:
     if n % 64 or k % 128:
         return False
 
-    if mode == "int3":
+    admitted = False
+    if mode == "int4":
+        try:
+            blob = _try_int4_buffer(w.data)
+            if blob is not None:
+                layer.register_buffer("_mi4_blob", blob, persistent=False)
+                layer._mi4 = (n, k)
+                layer._mfp8 = (n, k)  # sentinel so muse_bfx skips this layer
+                _stats["admitted_int4"] += 1
+                _stats["bytes_bf16"] += n * k * 2
+                _stats["bytes_quant"] += blob.numel() * blob.element_size()
+                admitted = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("muse_draft_int4: attach failed for %s (%s); trying NVFP4", tuple(w.shape), e)
+
+    if not admitted and mode == "int3":
         try:
             blob = _try_int3_buffer(w.data)
             if blob is not None:
@@ -455,11 +583,11 @@ def attach_linear(layer: torch.nn.Module, mode: str = "int3") -> bool:
                 _stats["admitted_int3"] += 1
                 _stats["bytes_bf16"] += n * k * 2
                 _stats["bytes_quant"] += blob.numel() * blob.element_size()
-                return True
+                admitted = True
         except Exception as e:  # noqa: BLE001
             logger.warning("muse_draft_int3: attach failed for %s (%s); trying NVFP4", tuple(w.shape), e)
 
-    if mode in ("int3", "nvfp4"):
+    if not admitted and mode in ("int4", "int3", "nvfp4"):
         try:
             res = _try_nvfp4_tma4_buffers(w.data)
             if res is not None:
@@ -476,37 +604,75 @@ def attach_linear(layer: torch.nn.Module, mode: str = "int3") -> bool:
                 _stats["bytes_quant"] += (
                     w_ilv.numel() * w_ilv.element_size() + coded.numel() * coded.element_size()
                 )
-                return True
+                admitted = True
         except Exception as e:  # noqa: BLE001
             logger.warning("muse_draft_nvfp4: attach failed for %s (%s); trying FP8", tuple(w.shape), e)
 
-    try:
-        q, s, qweight, scales, ws = _pack_fp8(w.data.contiguous())
-    except Exception as e:  # noqa: BLE001
-        logger.warning("muse_draft_fp8: pack failed for %s (%s)", tuple(w.shape), e)
-        _stats["rejected"] += 1
-        return False
-    if not _check_fp8(w.data, q, s, qweight, scales, ws):
-        _stats["rejected"] += 1
-        return False
-    del q, s
-    layer.register_buffer("_mfp8_qweight", qweight, persistent=False)
-    layer.register_buffer("_mfp8_scales", scales, persistent=False)
-    layer.register_buffer("_mfp8_ws", ws, persistent=False)
-    layer._mfp8 = (n, k)
-    _stats["admitted_fp8"] += 1
-    _stats["bytes_bf16"] += n * k * 2
-    _stats["bytes_quant"] += qweight.numel() * qweight.element_size()
+    if not admitted:
+        try:
+            q, s, qweight, scales, ws = _pack_fp8(w.data.contiguous())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("muse_draft_fp8: pack failed for %s (%s)", tuple(w.shape), e)
+            _stats["rejected"] += 1
+            return False
+        if not _check_fp8(w.data, q, s, qweight, scales, ws):
+            _stats["rejected"] += 1
+            return False
+        del q, s
+        layer.register_buffer("_mfp8_qweight", qweight, persistent=False)
+        layer.register_buffer("_mfp8_scales", scales, persistent=False)
+        layer.register_buffer("_mfp8_ws", ws, persistent=False)
+        layer._mfp8 = (n, k)
+        _stats["admitted_fp8"] += 1
+        _stats["bytes_bf16"] += n * k * 2
+        _stats["bytes_quant"] += qweight.numel() * qweight.element_size()
+        admitted = True
+
+    has_m512_fp8 = False
+    if attach_m512_fp8 and _m512_fp8_enabled():
+        fp8_lm = _pack_fp8_large_m(w.data.contiguous())
+        if fp8_lm is not None:
+            b_t, sb = fp8_lm
+            layer.register_buffer("_m512_fp8_bt", b_t, persistent=False)
+            layer.register_buffer("_m512_fp8_sb", sb, persistent=False)
+            _stats["admitted_m512_fp8"] += 1
+            has_m512_fp8 = True
+
+    if free_bf16 and _free_bf16_enabled() and (not attach_m512_fp8 or has_m512_fp8):
+        bf16_bytes = w.numel() * w.element_size()
+        w.data = torch.empty((0,), dtype=w.dtype, device=w.device)
+        _stats["bytes_freed"] += bf16_bytes
     return True
 
 
-def attach_tensor(mod: torch.nn.Module, prefix: str, w: torch.Tensor, mode: str = "int3") -> bool:
+def attach_tensor(
+    mod: torch.nn.Module,
+    prefix: str,
+    w: torch.Tensor,
+    mode: str = "int3",
+    *,
+    attach_m512_fp8: bool = False,
+) -> bool:
     if not enabled() or w is None or w.dtype != torch.bfloat16 or w.dim() != 2 or not w.is_cuda:
         return False
     n, k = w.shape
     if n % 64 or k % 128:
         return False
-    if mode == "int3":
+    admitted = False
+    if mode == "int4":
+        try:
+            blob = _try_int4_buffer(w.data)
+            if blob is not None:
+                mod.register_buffer(f"_{prefix}_mi4_blob", blob, persistent=False)
+                setattr(mod, f"_{prefix}_mi4", (n, k))
+                _stats["admitted_int4"] += 1
+                _stats["bytes_bf16"] += n * k * 2
+                _stats["bytes_quant"] += blob.numel() * blob.element_size()
+                admitted = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("muse_draft_int4: tensor %s attach failed (%s); trying NVFP4", prefix, e)
+
+    if not admitted and mode == "int3":
         try:
             blob = _try_int3_buffer(w.data)
             if blob is not None:
@@ -515,11 +681,11 @@ def attach_tensor(mod: torch.nn.Module, prefix: str, w: torch.Tensor, mode: str 
                 _stats["admitted_int3"] += 1
                 _stats["bytes_bf16"] += n * k * 2
                 _stats["bytes_quant"] += blob.numel() * blob.element_size()
-                return True
+                admitted = True
         except Exception as e:  # noqa: BLE001
             logger.warning("muse_draft_int3: tensor %s attach failed (%s); trying NVFP4", prefix, e)
 
-    if mode in ("int3", "nvfp4"):
+    if not admitted and mode in ("int4", "int3", "nvfp4"):
         try:
             res = _try_nvfp4_tma4_buffers(w.data)
             if res is not None:
@@ -535,66 +701,149 @@ def attach_tensor(mod: torch.nn.Module, prefix: str, w: torch.Tensor, mode: str 
                 _stats["bytes_quant"] += (
                     w_ilv.numel() * w_ilv.element_size() + coded.numel() * coded.element_size()
                 )
-                return True
+                admitted = True
         except Exception as e:  # noqa: BLE001
             logger.warning("muse_draft_nvfp4: tensor %s attach failed (%s); trying FP8", prefix, e)
 
-    try:
-        q, s, qweight, scales, ws = _pack_fp8(w.data.contiguous())
-    except Exception as e:  # noqa: BLE001
-        logger.warning("muse_draft_fp8: tensor %s pack failed (%s)", prefix, e)
-        _stats["rejected"] += 1
-        return False
-    if not _check_fp8(w.data, q, s, qweight, scales, ws):
-        _stats["rejected"] += 1
-        return False
-    del q, s
-    mod.register_buffer(f"_{prefix}_mfp8_qweight", qweight, persistent=False)
-    mod.register_buffer(f"_{prefix}_mfp8_scales", scales, persistent=False)
-    mod.register_buffer(f"_{prefix}_mfp8_ws", ws, persistent=False)
-    setattr(mod, f"_{prefix}_mfp8", (n, k))
-    _stats["admitted_fp8"] += 1
-    _stats["bytes_bf16"] += n * k * 2
-    _stats["bytes_quant"] += qweight.numel() * qweight.element_size()
+    if not admitted:
+        try:
+            q, s, qweight, scales, ws = _pack_fp8(w.data.contiguous())
+        except Exception as e:  # noqa: BLE001
+            logger.warning("muse_draft_fp8: tensor %s pack failed (%s)", prefix, e)
+            _stats["rejected"] += 1
+            return False
+        if not _check_fp8(w.data, q, s, qweight, scales, ws):
+            _stats["rejected"] += 1
+            return False
+        del q, s
+        mod.register_buffer(f"_{prefix}_mfp8_qweight", qweight, persistent=False)
+        mod.register_buffer(f"_{prefix}_mfp8_scales", scales, persistent=False)
+        mod.register_buffer(f"_{prefix}_mfp8_ws", ws, persistent=False)
+        setattr(mod, f"_{prefix}_mfp8", (n, k))
+        _stats["admitted_fp8"] += 1
+        _stats["bytes_bf16"] += n * k * 2
+        _stats["bytes_quant"] += qweight.numel() * qweight.element_size()
+        admitted = True
+
+    if attach_m512_fp8 and _m512_fp8_enabled():
+        fp8_lm = _pack_fp8_large_m(w.data.contiguous())
+        if fp8_lm is not None:
+            b_t, sb = fp8_lm
+            mod.register_buffer(f"_{prefix}_m512_fp8_bt", b_t, persistent=False)
+            mod.register_buffer(f"_{prefix}_m512_fp8_sb", sb, persistent=False)
+            _stats["admitted_m512_fp8"] += 1
     return True
 
 
-@torch.library.custom_op("muse::draft_int3_linear", mutates_args=())
-def draft_int3_linear(x: torch.Tensor, w: torch.Tensor, blob: torch.Tensor) -> torch.Tensor:
+@torch.library.custom_op("muse::draft_int4_linear", mutates_args=())
+def draft_int4_linear(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    blob: torch.Tensor,
+    n: int,
+    k: int,
+    fp8_bt: torch.Tensor | None = None,
+    fp8_sb: torch.Tensor | None = None,
+) -> torch.Tensor:
     shape = x.shape
     x2 = x.reshape(-1, shape[-1])
-    n, k = w.shape
-    if 1 <= x2.size(0) <= MAX_M_NVFP4 and x2.dtype == torch.bfloat16:
-        import muse_bfx_ext as _bfx
-
-        out = _bfx.int3_gemm(x2.contiguous(), blob, n, k)
-    else:
+    m = int(x2.size(0))
+    if 1 <= m <= MAX_M_NVFP4 and x2.dtype == torch.bfloat16:
+        bfx = _get_bfx()
+        out = bfx.int4_gemm(x2.contiguous(), blob, n, k)
+    elif fp8_bt is not None and fp8_sb is not None and m > 0 and x2.dtype == torch.bfloat16:
+        out = _run_fp8_large_m(x2, fp8_bt, fp8_sb)
+    elif w.numel() == n * k:
         out = F.linear(x2, w)
+    elif m == 0:
+        out = x2.new_empty((0, n))
+    else:
+        bfx = _get_bfx()
+        xc = x2.contiguous()
+        out = xc.new_empty((m, n))
+        for r0 in range(0, m, MAX_M_NVFP4):
+            r1 = min(m, r0 + MAX_M_NVFP4)
+            bfx.int4_gemm_out(xc[r0:r1], blob, out[r0:r1], n, k)
+    return out.reshape(*shape[:-1], n)
+
+
+@draft_int4_linear.register_fake
+def _(x, w, blob, n, k, fp8_bt=None, fp8_sb=None):
+    return x.new_empty((*x.shape[:-1], n))
+
+
+@torch.library.custom_op("muse::draft_int3_linear", mutates_args=())
+def draft_int3_linear(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    blob: torch.Tensor,
+    n: int,
+    k: int,
+    fp8_bt: torch.Tensor | None = None,
+    fp8_sb: torch.Tensor | None = None,
+) -> torch.Tensor:
+    shape = x.shape
+    x2 = x.reshape(-1, shape[-1])
+    m = int(x2.size(0))
+    if 1 <= m <= MAX_M_NVFP4 and x2.dtype == torch.bfloat16:
+        bfx = _get_bfx()
+        out = bfx.int3_gemm(x2.contiguous(), blob, n, k)
+    elif fp8_bt is not None and fp8_sb is not None and m > 0 and x2.dtype == torch.bfloat16:
+        out = _run_fp8_large_m(x2, fp8_bt, fp8_sb)
+    elif w.numel() == n * k:
+        out = F.linear(x2, w)
+    elif m == 0:
+        out = x2.new_empty((0, n))
+    else:
+        bfx = _get_bfx()
+        xc = x2.contiguous()
+        out = xc.new_empty((m, n))
+        for r0 in range(0, m, MAX_M_NVFP4):
+            r1 = min(m, r0 + MAX_M_NVFP4)
+            bfx.int3_gemm_out(xc[r0:r1], blob, out[r0:r1], n, k)
     return out.reshape(*shape[:-1], n)
 
 
 @draft_int3_linear.register_fake
-def _(x, w, blob):
-    return x.new_empty((*x.shape[:-1], w.shape[0]))
+def _(x, w, blob, n, k, fp8_bt=None, fp8_sb=None):
+    return x.new_empty((*x.shape[:-1], n))
 
 
 @torch.library.custom_op("muse::draft_fp8_linear", mutates_args=())
 def draft_fp8_linear(
-    x: torch.Tensor, w: torch.Tensor, qweight: torch.Tensor, scales: torch.Tensor, ws: torch.Tensor
+    x: torch.Tensor,
+    w: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    ws: torch.Tensor,
+    n: int,
+    k: int,
+    fp8_bt: torch.Tensor | None = None,
+    fp8_sb: torch.Tensor | None = None,
 ) -> torch.Tensor:
     shape = x.shape
     x2 = x.reshape(-1, shape[-1])
-    n, k = w.shape
-    if 1 <= x2.size(0) <= MAX_M_FP8 and x2.dtype == torch.bfloat16:
+    m = int(x2.size(0))
+    if 1 <= m <= MAX_M_FP8 and x2.dtype == torch.bfloat16:
         out = _marlin_fp8(x2.contiguous(), qweight, scales, ws, n, k)
-    else:
+    elif fp8_bt is not None and fp8_sb is not None and m > 0 and x2.dtype == torch.bfloat16:
+        out = _run_fp8_large_m(x2, fp8_bt, fp8_sb)
+    elif w.numel() == n * k:
         out = F.linear(x2, w)
+    elif m == 0:
+        out = x2.new_empty((0, n))
+    else:
+        xc = x2.contiguous()
+        out = xc.new_empty((m, n))
+        for r0 in range(0, m, MAX_M_FP8):
+            r1 = min(m, r0 + MAX_M_FP8)
+            out[r0:r1] = _marlin_fp8(xc[r0:r1], qweight, scales, ws, n, k)
     return out.reshape(*shape[:-1], n)
 
 
 @draft_fp8_linear.register_fake
-def _(x, w, qweight, scales, ws):
-    return x.new_empty((*x.shape[:-1], w.shape[0]))
+def _(x, w, qweight, scales, ws, n, k, fp8_bt=None, fp8_sb=None):
+    return x.new_empty((*x.shape[:-1], n))
 
 
 @torch.library.custom_op("muse::draft_nvfp4_linear", mutates_args=())
@@ -606,26 +855,51 @@ def draft_nvfp4_linear(
     pal: torch.Tensor,
     mgs: torch.Tensor,
     ws: torch.Tensor,
+    n: int,
+    k: int,
+    fp8_bt: torch.Tensor | None = None,
+    fp8_sb: torch.Tensor | None = None,
 ) -> torch.Tensor:
     shape = x.shape
     x2 = x.reshape(-1, shape[-1])
-    n, k = w.shape
-    if 1 <= x2.size(0) <= MAX_M_NVFP4 and x2.dtype == torch.bfloat16:
+    m = int(x2.size(0))
+    if 1 <= m <= MAX_M_NVFP4 and x2.dtype == torch.bfloat16:
         out = _run_nvfp4_tma4(x2, w_ilv, coded, pal, mgs, ws, n, k)
-    else:
+    elif fp8_bt is not None and fp8_sb is not None and m > 0 and x2.dtype == torch.bfloat16:
+        out = _run_fp8_large_m(x2, fp8_bt, fp8_sb)
+    elif w.numel() == n * k:
         out = F.linear(x2, w)
+    elif m == 0:
+        out = x2.new_empty((0, n))
+    else:
+        xc = x2.contiguous()
+        out = xc.new_empty((m, n))
+        for r0 in range(0, m, MAX_M_NVFP4):
+            r1 = min(m, r0 + MAX_M_NVFP4)
+            _run_nvfp4_tma4_into(xc[r0:r1], w_ilv, coded, pal, mgs, ws, out[r0:r1], n, k)
     return out.reshape(*shape[:-1], n)
 
 
 @draft_nvfp4_linear.register_fake
-def _(x, w, w_ilv, coded, pal, mgs, ws):
-    return x.new_empty((*x.shape[:-1], w.shape[0]))
+def _(x, w, w_ilv, coded, pal, mgs, ws, n, k, fp8_bt=None, fp8_sb=None):
+    return x.new_empty((*x.shape[:-1], n))
 
 
 def layer_apply(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
-    if getattr(layer, "_mi3", None) is not None:
-        return torch.ops.muse.draft_int3_linear(x, layer.weight, layer._mi3_blob)
-    if getattr(layer, "_mnv4", None) is not None:
+    fp8_bt = getattr(layer, "_m512_fp8_bt", None)
+    fp8_sb = getattr(layer, "_m512_fp8_sb", None)
+    mi4 = getattr(layer, "_mi4", None)
+    if mi4 is not None:
+        return torch.ops.muse.draft_int4_linear(
+            x, layer.weight, layer._mi4_blob, mi4[0], mi4[1], fp8_bt, fp8_sb
+        )
+    mi3 = getattr(layer, "_mi3", None)
+    if mi3 is not None:
+        return torch.ops.muse.draft_int3_linear(
+            x, layer.weight, layer._mi3_blob, mi3[0], mi3[1], fp8_bt, fp8_sb
+        )
+    mnv4 = getattr(layer, "_mnv4", None)
+    if mnv4 is not None:
         return torch.ops.muse.draft_nvfp4_linear(
             x,
             layer.weight,
@@ -634,16 +908,40 @@ def layer_apply(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
             layer._mnv4_pal,
             layer._mnv4_gs,
             layer._mnv4_ws,
+            mnv4[0],
+            mnv4[1],
+            fp8_bt,
+            fp8_sb,
         )
+    mfp8 = layer._mfp8
     return torch.ops.muse.draft_fp8_linear(
-        x, layer.weight, layer._mfp8_qweight, layer._mfp8_scales, layer._mfp8_ws
+        x,
+        layer.weight,
+        layer._mfp8_qweight,
+        layer._mfp8_scales,
+        layer._mfp8_ws,
+        mfp8[0],
+        mfp8[1],
+        fp8_bt,
+        fp8_sb,
     )
 
 
 def tensor_apply(mod: torch.nn.Module, prefix: str, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor | None:
-    if getattr(mod, f"_{prefix}_mi3", None) is not None:
-        return torch.ops.muse.draft_int3_linear(x, w, getattr(mod, f"_{prefix}_mi3_blob"))
-    if getattr(mod, f"_{prefix}_mnv4", None) is not None:
+    fp8_bt = getattr(mod, f"_{prefix}_m512_fp8_bt", None)
+    fp8_sb = getattr(mod, f"_{prefix}_m512_fp8_sb", None)
+    mi4 = getattr(mod, f"_{prefix}_mi4", None)
+    if mi4 is not None:
+        return torch.ops.muse.draft_int4_linear(
+            x, w, getattr(mod, f"_{prefix}_mi4_blob"), mi4[0], mi4[1], fp8_bt, fp8_sb
+        )
+    mi3 = getattr(mod, f"_{prefix}_mi3", None)
+    if mi3 is not None:
+        return torch.ops.muse.draft_int3_linear(
+            x, w, getattr(mod, f"_{prefix}_mi3_blob"), mi3[0], mi3[1], fp8_bt, fp8_sb
+        )
+    mnv4 = getattr(mod, f"_{prefix}_mnv4", None)
+    if mnv4 is not None:
         return torch.ops.muse.draft_nvfp4_linear(
             x,
             w,
@@ -652,16 +950,268 @@ def tensor_apply(mod: torch.nn.Module, prefix: str, x: torch.Tensor, w: torch.Te
             getattr(mod, f"_{prefix}_mnv4_pal"),
             getattr(mod, f"_{prefix}_mnv4_gs"),
             getattr(mod, f"_{prefix}_mnv4_ws"),
+            mnv4[0],
+            mnv4[1],
+            fp8_bt,
+            fp8_sb,
         )
-    if getattr(mod, f"_{prefix}_mfp8", None) is not None:
+    mfp8 = getattr(mod, f"_{prefix}_mfp8", None)
+    if mfp8 is not None:
         return torch.ops.muse.draft_fp8_linear(
             x,
             w,
             getattr(mod, f"_{prefix}_mfp8_qweight"),
             getattr(mod, f"_{prefix}_mfp8_scales"),
             getattr(mod, f"_{prefix}_mfp8_ws"),
+            mfp8[0],
+            mfp8[1],
+            fp8_bt,
+            fp8_sb,
         )
     return None
+
+
+def has_tensor(mod: torch.nn.Module, prefix: str) -> bool:
+    return (
+        getattr(mod, f"_{prefix}_mi4", None) is not None
+        or getattr(mod, f"_{prefix}_mi3", None) is not None
+        or getattr(mod, f"_{prefix}_mnv4", None) is not None
+        or getattr(mod, f"_{prefix}_mfp8", None) is not None
+    )
+
+
+def tensor_apply_into(mod: torch.nn.Module, prefix: str, x: torch.Tensor, out: torch.Tensor) -> bool:
+    if x.dtype != torch.bfloat16 or out.dtype != torch.bfloat16 or not out.is_contiguous():
+        return False
+    m = int(x.size(0))
+    if m == 0:
+        return True
+    if m > MAX_M_NVFP4:
+        return False
+    mi4 = getattr(mod, f"_{prefix}_mi4", None)
+    if mi4 is not None:
+        bfx = _get_bfx()
+        if bfx is None or not hasattr(bfx, "int4_gemm_out"):
+            return False
+        n, k = mi4
+        if x.size(1) != k or out.shape != (m, n):
+            return False
+        bfx.int4_gemm_out(x.contiguous(), getattr(mod, f"_{prefix}_mi4_blob"), out, n, k)
+        return True
+    mi3 = getattr(mod, f"_{prefix}_mi3", None)
+    if mi3 is not None:
+        bfx = _get_bfx()
+        if bfx is None or not hasattr(bfx, "int3_gemm_out"):
+            return False
+        n, k = mi3
+        if x.size(1) != k or out.shape != (m, n):
+            return False
+        bfx.int3_gemm_out(x.contiguous(), getattr(mod, f"_{prefix}_mi3_blob"), out, n, k)
+        return True
+    mnv4 = getattr(mod, f"_{prefix}_mnv4", None)
+    if mnv4 is not None:
+        n, k = mnv4
+        if x.size(1) != k or out.shape != (m, n):
+            return False
+        _run_nvfp4_tma4_into(
+            x,
+            getattr(mod, f"_{prefix}_mnv4_w_ilv"),
+            getattr(mod, f"_{prefix}_mnv4_coded"),
+            getattr(mod, f"_{prefix}_mnv4_pal"),
+            getattr(mod, f"_{prefix}_mnv4_gs"),
+            getattr(mod, f"_{prefix}_mnv4_ws"),
+            out,
+            n,
+            k,
+        )
+        return True
+    return False
+
+
+def fc_aux5_apply(layer: torch.nn.Module, aux_list: list[torch.Tensor], out: torch.Tensor) -> bool:
+    mi4 = getattr(layer, "_mi4", None)
+    mi3 = getattr(layer, "_mi3", None)
+    bfx = _get_bfx()
+    if (
+        (mi4 is None and mi3 is None)
+        or bfx is None
+        or len(aux_list) != 5
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+    ):
+        return False
+    if mi4 is not None:
+        if not hasattr(bfx, "int4_gemm_aux5_out"):
+            return False
+        n, k = mi4
+        blob = layer._mi4_blob
+        fn = bfx.int4_gemm_aux5_out
+    else:
+        if not hasattr(bfx, "int3_gemm_aux5_out"):
+            return False
+        n, k = mi3
+        blob = layer._mi3_blob
+        fn = bfx.int3_gemm_aux5_out
+    m = int(out.size(0))
+    if m == 0:
+        return True
+    if m > MAX_M_NVFP4 or out.size(1) != n or k % 5 != 0:
+        return False
+    k_each = k // 5
+    if k_each % 64 != 0:
+        return False
+    sliced: list[torch.Tensor] = []
+    for a in aux_list:
+        if a.dtype != torch.bfloat16 or a.dim() != 2 or a.size(0) < m or a.size(1) != k_each:
+            return False
+        s = a[:m]
+        if not s.is_contiguous() or (s.data_ptr() & 15) != 0:
+            return False
+        sliced.append(s)
+    fn(sliced[0], sliced[1], sliced[2], sliced[3], sliced[4], blob, out, n, k_each)
+    return True
+
+
+def dflash_kv_post(
+    all_kv_flat: torch.Tensor,
+    k_norm_weights: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor | None,
+    kv_ptrs: list[int],
+    block_size: int,
+    stride_block: int,
+    stride_kv_head: int,
+    stride_slot: int,
+    eps: float,
+) -> bool:
+    bfx = _get_bfx()
+    if bfx is None or not hasattr(bfx, "dflash_kv_post"):
+        return False
+    bfx.dflash_kv_post(
+        all_kv_flat,
+        k_norm_weights,
+        cos_sin_cache,
+        positions,
+        slot_mapping,
+        kv_ptrs,
+        block_size,
+        stride_block,
+        stride_kv_head,
+        stride_slot,
+        eps,
+    )
+    return True
+
+
+def argmax_bf16_into(
+    logits: torch.Tensor, sval: torch.Tensor, sidx: torch.Tensor, out_tok: torch.Tensor
+) -> bool:
+    bfx = _get_bfx()
+    if (
+        bfx is None
+        or not hasattr(bfx, "dflash_argmax_bf16")
+        or logits.dtype != torch.bfloat16
+        or logits.dim() != 2
+        or logits.stride(1) != 1
+        or logits.stride(0) < logits.size(1)
+        or (logits.stride(0) & 7) != 0
+        or (logits.size(1) & 7) != 0
+        or (logits.data_ptr() & 15) != 0
+        or not (1 <= logits.size(0) <= 8)
+        or out_tok.dtype != torch.int64
+        or not out_tok.is_contiguous()
+        or out_tok.numel() != logits.size(0)
+    ):
+        return False
+    bfx.dflash_argmax_bf16(logits, sval, sidx, out_tok)
+    return True
+
+
+def prepare_draft_lmhead_buffers(
+    lm_head: torch.nn.Module, org_vocab: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, int, int, int] | None:
+    try:
+        import muse_marlin6_gemv as d6
+    except Exception:  # noqa: BLE001
+        return None
+    if d6._sk_tma4_ilv_m is None:
+        return None
+    tiled_weight = getattr(lm_head, "_marlin_decode_weight", None)
+    scales6 = getattr(lm_head, "_marlin_decode_scales6", None)
+    palette = getattr(lm_head, "_marlin_decode_palette", None)
+    gs = getattr(lm_head, "weight_global_scale", None)
+    ws = getattr(lm_head, "workspace", None)
+    n = int(getattr(lm_head, "output_size_per_partition", 0))
+    k = int(getattr(lm_head, "input_size_per_partition", 0))
+    if (
+        tiled_weight is None
+        or scales6 is None
+        or palette is None
+        or gs is None
+        or ws is None
+        or getattr(lm_head, "tp_size", 1) != 1
+        or getattr(lm_head, "bias", None) is not None
+        or (n, k) != (d6.LM_HEAD_N, d6.LM_HEAD_K)
+        or not d6.is_tma4_ilv(scales6)
+        or org_vocab <= 0
+        or org_vocab > n
+        or (org_vocab & 7) != 0
+    ):
+        return None
+    eff_n = d6.LM_HEAD_PAD128_N if d6.is_lm_pad128(scales6) else n
+    if (eff_n & 7) != 0:
+        return None
+    blocks = 96 if d6.is_lm_split2(scales6) else 48
+    tile_n = 128 if eff_n % 128 == 0 else 64
+    out_padded = torch.empty((8, eff_n), dtype=torch.bfloat16, device=device)
+    partials = torch.empty((blocks, 16, tile_n), dtype=torch.float32, device=device)
+    return out_padded, partials, eff_n, k, blocks
+
+
+def launch_draft_lmhead_raw(
+    x: torch.Tensor,
+    lm_head: torch.nn.Module,
+    org_vocab: int,
+    out_padded: torch.Tensor,
+    partials: torch.Tensor,
+    eff_n: int,
+    k: int,
+    blocks: int,
+) -> torch.Tensor | None:
+    import muse_marlin6_gemv as d6
+
+    m = int(x.shape[0])
+    if (
+        x.ndim != 2
+        or not (1 < m <= 8)
+        or x.shape[1] != k
+        or x.dtype != torch.bfloat16
+        or not x.is_contiguous()
+        or (x.data_ptr() & 15) != 0
+        or out_padded.shape[0] < m
+        or out_padded.shape[1] != eff_n
+    ):
+        return None
+    status = d6._sk_tma4_ilv_m(
+        x.data_ptr(),
+        lm_head._marlin_decode_weight.data_ptr(),
+        out_padded.data_ptr(),
+        partials.data_ptr(),
+        lm_head._marlin_decode_scales6.data_ptr(),
+        lm_head._marlin_decode_palette.data_ptr(),
+        lm_head.weight_global_scale.data_ptr(),
+        lm_head.workspace.data_ptr(),
+        m,
+        eff_n,
+        k,
+        blocks,
+        x.device.index or 0,
+        torch.cuda.current_stream(x.device).cuda_stream,
+    )
+    if status:
+        raise RuntimeError(f"draft lm_head _sk_tma4_ilv_m failed with CUDA error {status}")
+    return out_padded[:m, :org_vocab]
 
 
 def place_drafter_quant(model: torch.nn.Module) -> int:
@@ -670,7 +1220,10 @@ def place_drafter_quant(model: torch.nn.Module) -> int:
         return 0
     groups: dict[tuple[str, int, int], list[tuple[torch.nn.Module, str, tuple]]] = {}
     for _, mod in model.named_modules():
-        if getattr(mod, "_mi3", None) is not None:
+        if getattr(mod, "_mi4", None) is not None:
+            n, k = mod._mi4
+            groups.setdefault(("int4", n, k), []).append((mod, "_mi4_blob", ()))
+        elif getattr(mod, "_mi3", None) is not None:
             n, k = mod._mi3
             groups.setdefault(("int3", n, k), []).append((mod, "_mi3_blob", ()))
         elif getattr(mod, "_mnv4", None) is not None:
@@ -683,7 +1236,10 @@ def place_drafter_quant(model: torch.nn.Module) -> int:
             groups.setdefault(("fp8", n, k), []).append(
                 (mod, "_mfp8_qweight", (mod._mfp8_scales, mod._mfp8_ws))
             )
-    if getattr(model, "_fkv_mi3", None) is not None:
+    if getattr(model, "_fkv_mi4", None) is not None:
+        n, k = model._fkv_mi4
+        groups.setdefault(("int4", n, k), []).append((model, "_fkv_mi4_blob", ()))
+    elif getattr(model, "_fkv_mi3", None) is not None:
         n, k = model._fkv_mi3
         groups.setdefault(("int3", n, k), []).append((model, "_fkv_mi3_blob", ()))
     elif getattr(model, "_fkv_mnv4", None) is not None:
@@ -719,10 +1275,12 @@ def place_drafter_quant(model: torch.nn.Module) -> int:
             continue
 
         def _time_buf(buf: torch.Tensor, meta: tuple) -> float:
-            if kind == "int3":
-                import muse_bfx_ext as _bfx
-
-                run = lambda: _bfx.int3_gemm(x, buf, n, k)
+            if kind == "int4":
+                bfx = _get_bfx()
+                run = lambda: bfx.int4_gemm(x, buf, n, k)
+            elif kind == "int3":
+                bfx = _get_bfx()
+                run = lambda: bfx.int3_gemm(x, buf, n, k)
             elif kind == "nvfp4":
                 coded, pal, mgs, ws = meta
                 run = lambda: _run_nvfp4_tma4(x, buf, coded, pal, mgs, ws, n, k)
@@ -791,30 +1349,79 @@ def attach_drafter(model: torch.nn.Module) -> int:
         return 0
     mode = _quant_mode()
     n = 0
+    by_leaf: dict[str, list[torch.nn.Module]] = {s: [] for s in _NAMES}
     for name, mod in model.named_modules():
         leaf = name.split(".")[-1]
-        if leaf in _NAMES:
-            if mode == "int3":
-                lm = "int3"
-            elif mode == "nvfp4":
-                lm = "nvfp4"
-            elif mode == "hybrid":
-                lm = "nvfp4" if leaf in _MLP_FC_NAMES else "fp8"
-            else:
-                lm = "fp8"
-            n += attach_linear(mod, mode=lm)
-    if getattr(model, "_fused_kv_weight", None) is not None and getattr(model, "_fused_kv_bias", None) is None:
-        fkv_mode = "int3" if mode == "int3" else ("nvfp4" if mode == "nvfp4" else "fp8")
-        n += attach_tensor(model, "fkv", model._fused_kv_weight, mode=fkv_mode)
+        if leaf in by_leaf:
+            by_leaf[leaf].append(mod)
+
+    def _pick_mode(leaf: str) -> str:
+        if mode == "hybrid_int4_dn":
+            return "int4" if leaf in _ATTN_FC_DN_NAMES else "int3"
+        if mode == "hybrid_int4_fc":
+            return "int4" if leaf in _ATTN_FC_NAMES else "int3"
+        if mode == "hybrid_int4":
+            return "int4" if leaf in _ATTN_NAMES else "int3"
+        if mode == "hybrid_nvfp4":
+            return "nvfp4" if leaf in _ATTN_NAMES else "int3"
+        if mode == "int4":
+            return "int4"
+        if mode == "int3":
+            return "int3"
+        if mode == "nvfp4":
+            return "nvfp4"
+        if mode == "hybrid":
+            return "nvfp4" if leaf in _MLP_FC_NAMES else "fp8"
+        return "fp8"
+
+    # Pack and release decoder-only BF16 weights smallest-to-largest first to free ~4.54 GB
+    # before packing fc/fkv and running GB10 UMA DRAM placement.
+    for leaf in _DECODER_NAMES:
+        lm = _pick_mode(leaf)
+        for mod in by_leaf[leaf]:
+            if attach_linear(mod, mode=lm, free_bf16=True, attach_m512_fp8=False):
+                n += 1
+                if _free_bf16_enabled():
+                    torch.cuda.empty_cache()
+
+    for mod in by_leaf["fc"]:
+        if attach_linear(mod, mode=_pick_mode("fc"), free_bf16=True, attach_m512_fp8=True):
+            n += 1
+            if _free_bf16_enabled():
+                torch.cuda.empty_cache()
+
+    fkv_w = getattr(model, "_fused_kv_weight", None)
+    if fkv_w is not None and getattr(model, "_fused_kv_bias", None) is None:
+        if mode in ("hybrid_int4_dn", "hybrid_int4_fc", "hybrid_int4", "int4"):
+            fkv_mode = "int4"
+        elif mode in ("hybrid_nvfp4", "nvfp4"):
+            fkv_mode = "nvfp4"
+        elif mode == "int3":
+            fkv_mode = "int3"
+        else:
+            fkv_mode = "fp8"
+        if attach_tensor(model, "fkv", fkv_w, mode=fkv_mode, attach_m512_fp8=True):
+            n += 1
+            if _free_bf16_enabled() and getattr(model, "_fkv_m512_fp8_bt", None) is not None:
+                bf16_bytes = fkv_w.numel() * fkv_w.element_size()
+                model._fused_kv_weight = torch.empty((0,), dtype=fkv_w.dtype, device=fkv_w.device)
+                _stats["bytes_freed"] += bf16_bytes
+                del fkv_w
+                torch.cuda.empty_cache()
+
     place_drafter_quant(model)
     logger.info(
-        "muse_draft_quant (%s): %d INT3-g64 + %d NVFP4-TMA4 + %d FP8-Marlin drafter linears (%d rejected), %.2f GB -> %.2f GB per step",
+        "muse_draft_quant (%s): %d INT4-g64 + %d INT3-g64 + %d NVFP4-TMA4 + %d FP8-Marlin drafter linears "
+        "(%d M>8 FP8, %d rejected), %.2f GB -> %.2f GB/step, %.2f GB BF16 freed",
         mode,
+        _stats["admitted_int4"],
         _stats["admitted_int3"],
         _stats["admitted_nvfp4"],
         _stats["admitted_fp8"],
+        _stats["admitted_m512_fp8"],
         _stats["rejected"],
         _stats["bytes_bf16"] / 1e9,
         _stats["bytes_quant"] / 1e9,
+        _stats["bytes_freed"] / 1e9,
     )
     return n
