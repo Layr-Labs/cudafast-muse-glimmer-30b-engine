@@ -1433,13 +1433,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or not self.cudagraph_manager._graphs_captured
             or torch.cuda.is_current_stream_capturing()
             or input_batch.num_reqs != 1
-            or input_batch.num_tokens != 1
-            or input_batch.num_tokens_after_padding != 1
+            or not (1 <= input_batch.num_tokens <= 16)
+            or input_batch.num_tokens_after_padding != input_batch.num_tokens
             or int(input_batch.num_computed_tokens_np[0]) < int(input_batch.prefill_len_np[0])
         ):
             return None
-        ids_1 = input_batch.input_ids[:1]
-        dst_1 = enc_runner.inputs_embeds[:1]
+        n_tok = int(input_batch.num_tokens)
+        ids_1 = input_batch.input_ids[:n_tok]
+        dst_1 = enc_runner.inputs_embeds[:n_tok]
         if not ids_1.is_contiguous() or not dst_1.is_contiguous():
             return None
         entries = getattr(self, "_decode_embed_cg_entries", None)
@@ -1458,7 +1459,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 g_or_fn.replay()
             return out_view
-        if sig in self._decode_embed_cg_rejected or len(entries) >= 4:
+        if sig in self._decode_embed_cg_rejected or len(entries) >= 8:
             return None
 
         ref_out = self.model_state.get_mm_embeddings(
@@ -1488,7 +1489,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logger.warning("decode muse_embed eager mismatch; keeping eager get_mm_embeddings")
                 return dst_1
             if (
-                envs.os.environ.get("VLLM_DECODE_EMBED_DIRECT", "1") != "0"
+                n_tok == 1
+                and envs.os.environ.get("VLLM_DECODE_EMBED_DIRECT", "1") != "0"
                 and getattr(_me, "is_single_kernel_m1", lambda: False)()
             ):
                 table_ptr = lm.embed_tokens.weight.data_ptr()
@@ -1539,7 +1541,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 return dst_1
             entries[sig] = (g, dst_1)
             logger.info(
-                "Captured M=1 decode muse_embed CUDA graph (shape=%s)",
+                "Captured M=%d decode muse_embed CUDA graph (shape=%s)",
+                n_tok,
                 tuple(dst_1.shape),
             )
             return dst_1
@@ -1672,8 +1675,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
         )
 
+    def _allows_dflash_prefill_graph(self) -> bool:
+        sc = self.speculative_config
+        return (
+            sc is not None
+            and getattr(sc, "method", None) == "dflash"
+            and bool(self.use_aux_hidden_state_outputs)
+            and self.speculator is not None
+        )
+
     def _can_zero_prep_prefill(self, scheduler_output: SchedulerOutput) -> bool:
         pg = self.prefill_graph
+        dflash_ok = self._allows_dflash_prefill_graph()
         if (
             pg is None
             or not pg._fast_verified
@@ -1697,6 +1710,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or self.use_dcp
             or self.use_pp
             or self.model_config.rswa_window is not None
+            or ((self.use_aux_hidden_state_outputs or self.speculator is not None) and not dflash_ok)
             or not self.supports_mm_inputs
             or self.model.requires_raw_input_tokens
             or self.block_tables.cp_size != 1
@@ -2104,9 +2118,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.prompt_logprobs_worker is not None
                 and not self.prompt_logprobs_worker.uses_prompt_logprobs[input_batch.idx_mapping_np[0]]
                 and input_batch.cu_num_logits_np[-1] == 1
-                and self.speculator is None
+                and ((self.speculator is None and not self.use_aux_hidden_state_outputs) or self._allows_dflash_prefill_graph())
                 and self.pcp_manager is None
-                and not self.use_aux_hidden_state_outputs
             ))
             and block_tables is not None
             and slot_mappings is not None
@@ -2375,9 +2388,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             self.prompt_logprobs_worker is not None
                             and not self.prompt_logprobs_worker.uses_prompt_logprobs[input_batch.idx_mapping_np[0]]
                             and input_batch.cu_num_logits_np[-1] == 1
-                            and self.speculator is None
+                            and ((self.speculator is None and not self.use_aux_hidden_state_outputs) or self._allows_dflash_prefill_graph())
                             and self.pcp_manager is None
-                            and not self.use_aux_hidden_state_outputs
                         ))
                     ):
                         model_output = prefill_graph.try_replay(
@@ -2490,10 +2502,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # LOCAL PATCH (two-stage output wait, async_utils.wait_for_output): for
         # a one-request prefill step, mark in stream order where the forward
         # ends and the sampling tail begins. A decode step needs no mark: the
-        # host waits for it with the next step already queued. A speculative
-        # verify step (num_tokens > 1 only because of its draft tokens) is such
-        # a decode step: no event, no tail spin-poll; the copy event alone.
+        # host waits for it with the next step already queued.
         forward_done = None
+        # Speculative verify steps (num_draft_tokens > 0) are decode steps: no
+        # event and no tail spin-poll (from i34-9 e95c7eaa cut 5).
         if (
             input_batch.num_reqs == 1
             and input_batch.num_tokens > 1

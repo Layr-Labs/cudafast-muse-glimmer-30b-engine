@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -95,6 +96,8 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        self._argmax_sval = torch.empty(256, dtype=torch.float32, device=device)
+        self._argmax_sidx = torch.empty(256, dtype=torch.int32, device=device)
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -203,9 +206,10 @@ class DFlashSpeculator(DraftModelSpeculator):
                 for ln in group.layer_names
             }
             gid_to_idx = {gid: i for i, gid in enumerate(self.draft_kv_cache_group_ids)}
-            self._layer_group_idx = [
-                gid_to_idx[name_to_gid[name]] for name in layer_names
-            ]
+            if len(self.draft_kv_cache_group_ids) > 1:
+                self._layer_group_idx = [
+                    gid_to_idx[name_to_gid[name]] for name in layer_names
+                ]
             if hasattr(self.model, "get_draft_attn_causal"):
                 self._group_causal = {
                     name_to_gid[name]: layer_causal
@@ -258,7 +262,34 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
         num_sample = num_reqs * self.num_speculative_steps
-        sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        if (
+            num_reqs == 1
+            and not self.sample_from_anchor
+            and num_tokens_padded == self.num_query_per_req
+            and last_hidden_states.is_contiguous()
+            and os.environ.get("MUSE_DFLASH_FAST_SAMPLE", "1") != "0"
+        ):
+            sample_hidden_states = last_hidden_states[1 : 1 + num_sample]
+        else:
+            sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+
+        if (
+            self.draft_logits is None
+            and not self.use_local_argmax_reduction
+            and 1 <= num_sample <= 8
+            and getattr(self.model, "draft_id_to_target_id", None) is None
+            and os.environ.get("MUSE_DFLASH_FAST_ARGMAX", "1") != "0"
+        ):
+            from vllm.model_executor.layers import muse_draft_fp8
+
+            logits = self.model.compute_logits(sample_hidden_states)
+            if logits is not None and muse_draft_fp8.argmax_bf16_into(
+                logits,
+                self._argmax_sval,
+                self._argmax_sidx,
+                self.draft_tokens[:num_reqs].view(-1),
+            ):
+                return
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
         draft_tokens = self.sample_draft(
@@ -330,7 +361,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
-        max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        max_seq_len = (
+            int(input_batch.seq_lens_cpu_upper_bound[0])
+            if num_reqs == 1
+            else input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        )
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
@@ -340,15 +375,23 @@ class DFlashSpeculator(DraftModelSpeculator):
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
         if aux_hidden_states:
-            if aux_hidden_states[0].shape[0] > num_target_tokens:
-                aux_cat = torch.cat(
-                    [h[:num_target_tokens] for h in aux_hidden_states], dim=-1
+            if (
+                hasattr(self.model, "combine_aux_into")
+                and self.model.combine_aux_into(
+                    aux_hidden_states, self.hidden_states[:num_target_tokens]
                 )
+            ):
+                context_hidden_states = self.hidden_states[:num_target_tokens]
             else:
-                aux_cat = torch.cat(aux_hidden_states, dim=-1)
-            context_hidden_states = self.model.combine_hidden_states(aux_cat)[
-                :num_target_tokens
-            ]
+                if aux_hidden_states[0].shape[0] > num_target_tokens:
+                    aux_cat = torch.cat(
+                        [h[:num_target_tokens] for h in aux_hidden_states], dim=-1
+                    )
+                else:
+                    aux_cat = torch.cat(aux_hidden_states, dim=-1)
+                context_hidden_states = self.model.combine_hidden_states(aux_cat)[
+                    :num_target_tokens
+                ]
         else:
             context_hidden_states = last_hidden_states[:num_target_tokens]
         if not context_hidden_states.is_contiguous():
@@ -626,9 +669,10 @@ def _prepare_dflash_inputs_kernel(
             # captured CG sees PAD slots (no K/V write) for replay sizes
             # larger than the current request count.
             q_pad_start = num_reqs * num_query_per_req
-            for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):
+            q_pad_end = tl.minimum(max_num_tokens, max_num_reqs * num_query_per_req)
+            for i in range(q_pad_start, q_pad_end, BLOCK_SIZE):
                 block = i + tl.arange(0, BLOCK_SIZE)
-                mask = block < max_num_tokens
+                mask = block < q_pad_end
                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
 
 
@@ -670,7 +714,11 @@ def prepare_dflash_inputs(
     assert num_reqs > 0
     # Cover the longest possible per-request span (ctx + query). Use the max
     # per-request query length, not the total token count across the batch.
-    max_target_query_len = int(input_batch.num_scheduled_tokens.max())
+    max_target_query_len = (
+        int(input_batch.num_scheduled_tokens[0])
+        if num_reqs == 1
+        else int(input_batch.num_scheduled_tokens.max())
+    )
     max_tokens_per_req = max_target_query_len + num_query_per_req
     BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)

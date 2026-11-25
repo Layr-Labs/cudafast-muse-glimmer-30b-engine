@@ -100,6 +100,23 @@ void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, 
 int64_t bf16_rans_base(torch::Tensor blob);
 torch::Tensor int3_pack(torch::Tensor W);
 torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+void int3_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K);
+void int3_gemm_aux5_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K_each);
+torch::Tensor int4_pack(torch::Tensor W);
+torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+void int4_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K);
+void int4_gemm_aux5_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K_each);
+void dflash_kv_post(
+    torch::Tensor all_kv_flat, torch::Tensor k_norm_weights, torch::Tensor cos_sin_cache,
+    torch::Tensor positions, c10::optional<torch::Tensor> slot_mapping,
+    const std::vector<int64_t>& kv_ptrs, int64_t block_size,
+    int64_t stride_block, int64_t stride_kv_head, int64_t stride_slot, double eps);
+void dflash_argmax_bf16(torch::Tensor logits, torch::Tensor scratch_val, torch::Tensor scratch_idx,
+                        torch::Tensor out_tok);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm", &bfx_gemm);
@@ -110,4 +127,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_base", &bf16_rans_base);
   m.def("int3_pack", &int3_pack);
   m.def("int3_gemm", &int3_gemm);
+  m.def("int3_gemm_out", &int3_gemm_out);
+  m.def("int3_gemm_aux5_out", &int3_gemm_aux5_out);
+  m.def("int4_pack", &int4_pack);
+  m.def("int4_gemm", &int4_gemm);
+  m.def("int4_gemm_out", &int4_gemm_out);
+  m.def("int4_gemm_aux5_out", &int4_gemm_aux5_out);
+  m.def("dflash_kv_post", &dflash_kv_post);
+  m.def("dflash_argmax_bf16", &dflash_argmax_bf16);
 }
