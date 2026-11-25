@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -284,6 +285,18 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = (
                     self.num_spec_tokens + 1 + _extra_leaf_slots
                 )
+                draft_hf_cfg = getattr(
+                    getattr(speculative_config, "draft_model_config", None),
+                    "hf_config",
+                    None,
+                )
+                if (
+                    getattr(draft_hf_cfg, "model_type", None)
+                    == "muse_glimmer_assistant"
+                    and self.num_spec_tokens == 6
+                    and int(os.environ.get("VLLM_DFLASH_QUERY_LEN", "8")) == 8
+                ):
+                    self.num_lookahead_tokens = max(self.num_lookahead_tokens, 8)
             if speculative_config.use_dspark():
                 # DSpark drafts a block of num_spec_tokens query tokens in which the
                 # anchor itself is the first prediction position (no separate bonus

@@ -1539,6 +1539,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     tuple(dst_1.shape),
                 )
                 return dst_1
+            if (
+                2 <= n_tok <= 16
+                and envs.os.environ.get("VLLM_DECODE_EMBED_DIRECT", "1") != "0"
+                and getattr(_me, "is_single_kernel_m", lambda: False)()
+            ):
+                table_ptr = lm.embed_tokens.weight.data_ptr()
+                ids_ptr = ids_1.data_ptr()
+                ids_64 = int(ids_1.dtype == torch.int64)
+                dst_ptr = dst_1.data_ptr()
+                eps_f = float(lm.embed_norm.eps)
+                rows_i = int(n_tok)
+                width_i = int(dst_1.shape[1])
+                fn_m = _me._lib.muse_embed_norm_m
+                dev_m = self.device
+
+                def _run_direct_m():
+                    rc = fn_m(
+                        ids_ptr, ids_64, table_ptr, eps_f, dst_ptr, rows_i, width_i,
+                        torch.cuda.current_stream(dev_m).cuda_stream,
+                    )
+                    if rc:
+                        raise RuntimeError(f"muse_embed_norm_m failed with CUDA error {rc}")
+
+                dst_1.zero_()
+                _run_direct_m()
+                if not torch.equal(dst_1.view(torch.int16), ref_copy.view(torch.int16)):
+                    dst_1.copy_(ref_copy)
+                    self._decode_embed_cg_rejected.add(sig)
+                    logger.warning("decode muse_embed direct M=%d mismatch; keeping eager path", n_tok)
+                    return dst_1
+                entries[sig] = (_run_direct_m, dst_1)
+                logger.info(
+                    "Armed direct 1-kernel M=%d decode muse_embed_norm_m (shape=%s)",
+                    n_tok,
+                    tuple(dst_1.shape),
+                )
+                return dst_1
             main_st = torch.cuda.current_stream(self.device)
             cap_st = self._decode_embed_cg_cap_stream
             cap_st.wait_stream(main_st)

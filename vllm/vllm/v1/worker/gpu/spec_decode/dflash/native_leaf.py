@@ -53,6 +53,9 @@ _POLICY_RAW = os.environ.get("MUSE_NATIVE_LEAF_POLICY", "d1").strip().lower()
 POLICY = 1 if _POLICY_RAW == "margin" else 0
 MARGIN_ALPHA = float(os.environ.get("MUSE_NATIVE_LEAF_MARGIN_ALPHA", "1.0"))
 TREE_DYNAMIC = os.environ.get("MUSE_TREE_DYNAMIC", "1").strip() not in ("0", "", "false", "no")
+TREE2_ENABLED = os.environ.get("MUSE_TREE_L2", "1").strip() not in ("0", "", "false", "no")
+TREE_L2_COUPLE = float(os.environ.get("MUSE_TREE_L2_COUPLE", "0.35"))
+TREE_ALWAYS_ACTIVE = os.environ.get("MUSE_TREE_ALWAYS_ACTIVE", "1").strip() not in ("0", "", "false", "no")
 TREE_TEMP = float(os.environ.get("MUSE_TREE_TEMP", "1.35"))
 TREE_TAIL = float(os.environ.get("MUSE_TREE_TAIL", "4.0"))
 TREE_GAMMA = float(os.environ.get("MUSE_TREE_GAMMA", "0.92"))
@@ -66,11 +69,12 @@ class _NativeLeafState:
         self.ready: bool = False
         self.m8_ready: bool = False
         self.tree_m_ready: int = 0
+        self.tree2_ready: bool = False
         self.device: torch.device | None = None
-        self.leaf_flag: torch.Tensor | None = None       # int32[49] shared with muse_gqa16_attn
+        self.leaf_flag: torch.Tensor | None = None       # int32[81] shared with muse_gqa16_attn
         self.prev_ns: torch.Tensor | None = None         # int32[1]
-        self.hit_flag: torch.Tensor | None = None        # int32[1] (0=miss, k=hit depth 1..6)
-        self.hit_src_row: torch.Tensor | None = None     # int32[1] (0=miss, r=winning leaf row 7..15)
+        self.hit_flag: torch.Tensor | None = None        # int32[2] ([dst1, dst2] hit depths 1..6)
+        self.hit_src_row: torch.Tensor | None = None     # int32[2] ([src1, src2] winning leaf rows 7..15)
         self.alt_ids: torch.Tensor | None = None         # int64[4] (d1_b1, d1_b2, d2_b1, d2_b2)
         self.alt_margins: torch.Tensor | None = None     # float32[2] (margin_d1, margin_d2)
         self.tree_top: torch.Tensor | None = None        # int64[36] ([6, 6] top-6 for d1..d6)
@@ -79,7 +83,8 @@ class _NativeLeafState:
         self.saved_alt_tok: torch.Tensor | None = None   # int64[1] (legacy M=7/M=8)
         self.saved_leaf_toks: torch.Tensor | None = None # int64[16] (tree mode)
         self.saved_leaf_k: torch.Tensor | None = None    # int32[16] (tree mode)
-        self.stats: torch.Tensor | None = None           # int64[19] [steps, mode, hits, clamps, k1..6, li0..8]
+        self.saved_leaf_parent: torch.Tensor | None = None # int32[16] (0=L1 leaf, 7..15=L2 parent row)
+        self.stats: torch.Tensor | None = None           # int64[20] [steps, mode, hits, clamps, k1..6, li0..8, l2_hits]
         # Static 52-layer target KV metadata for 1-launch all-layer KV fix on hit.
         self.num_layers: int = 0
         self.kv_ptrs: torch.Tensor | None = None
@@ -288,13 +293,14 @@ def init_kv_table(
     if not kv_ptrs:
         return False
 
+    tree2_admitted = bool(getattr(g16, "is_leaf_tree2_admitted", lambda _d: False)(device))
     with torch.inference_mode(False):
         _S.device = device
         _S.leaf_flag = lf
         _S.leaf_flag.zero_()
         _S.prev_ns = torch.full((1,), 7, dtype=torch.int32, device=device)
-        _S.hit_flag = torch.zeros((1,), dtype=torch.int32, device=device)
-        _S.hit_src_row = torch.zeros((1,), dtype=torch.int32, device=device)
+        _S.hit_flag = torch.zeros((2,), dtype=torch.int32, device=device)
+        _S.hit_src_row = torch.zeros((2,), dtype=torch.int32, device=device)
         if (
             _S.alt_ids is None
             or _S.alt_ids.device != device
@@ -335,7 +341,8 @@ def init_kv_table(
         _S.saved_alt_tok = torch.full((1,), -1, dtype=torch.int64, device=device)
         _S.saved_leaf_toks = torch.full((16,), -1, dtype=torch.int64, device=device)
         _S.saved_leaf_k = torch.zeros((16,), dtype=torch.int32, device=device)
-        _S.stats = torch.zeros((19,), dtype=torch.int64, device=device)
+        _S.saved_leaf_parent = torch.zeros((16,), dtype=torch.int32, device=device)
+        _S.stats = torch.zeros((20,), dtype=torch.int64, device=device)
         _S.num_layers = len(kv_ptrs)
         _S.kv_ptrs = torch.tensor(kv_ptrs, dtype=torch.int64, device=device)
         _S.stride_block = torch.tensor(s_blk, dtype=torch.int64, device=device)
@@ -357,10 +364,17 @@ def init_kv_table(
             )
             else 0
         )
+        _S.tree2_ready = bool(
+            TREE2_ENABLED
+            and _S.tree_m_ready in (12, 16)
+            and lf.numel() >= 81
+            and tree2_admitted
+        )
         _S.ready = True
     logger.info(
-        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, dynamic=%d [T=%.2f,tail=%.1f,g=%.2f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d)",
-        _S.num_layers, _S.tree_m_ready, int(TREE_DYNAMIC), TREE_TEMP, TREE_TAIL, TREE_GAMMA,
+        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, tree2=%d [c=%.2f, always=%d], dynamic=%d [T=%.2f,tail=%.1f,g=%.2f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d)",
+        _S.num_layers, _S.tree_m_ready, int(_S.tree2_ready), TREE_L2_COUPLE, int(TREE_ALWAYS_ACTIVE),
+        int(TREE_DYNAMIC), TREE_TEMP, TREE_TAIL, TREE_GAMMA,
         int(_S.m8_ready), _POLICY_RAW, MARGIN_ALPHA, LOW_THRESH, int(SELFTEST), int(NOHIT),
     )
     return True
@@ -486,6 +500,10 @@ def setup_step(
                 TREE_TEMP,
                 TREE_TAIL,
                 TREE_GAMMA,
+                _S.saved_leaf_parent,
+                _S.tree2_ready,
+                TREE_L2_COUPLE,
+                TREE_ALWAYS_ACTIVE,
             )
         except TypeError:
             bfx.native_leaf_setup_tree(
@@ -498,6 +516,11 @@ def setup_step(
                 eff_m,
                 SELFTEST,
                 _S.req_acc_state,
+                _S.tree_vals,
+                TREE_DYNAMIC,
+                TREE_TEMP,
+                TREE_TAIL,
+                TREE_GAMMA,
             )
         return True
     bfx.native_leaf_setup(
@@ -560,22 +583,41 @@ def commit_and_fix(
             and _S.saved_leaf_toks is not None
             and _S.saved_leaf_k is not None
         )
-        bfx.native_leaf_commit_tree(
-            _S.leaf_flag,
-            _S.prev_ns,
-            _S.hit_flag,
-            _S.hit_src_row,
-            _S.saved_leaf_toks,
-            _S.saved_leaf_k,
-            leaf_u_tok,
-            sampled_tokens,
-            num_sampled,
-            num_rejected,
-            eff_m,
-            _S.stats,
-            NOHIT,
-            _S.req_acc_state,
-        )
+        try:
+            bfx.native_leaf_commit_tree(
+                _S.leaf_flag,
+                _S.prev_ns,
+                _S.hit_flag,
+                _S.hit_src_row,
+                _S.saved_leaf_toks,
+                _S.saved_leaf_k,
+                leaf_u_tok,
+                sampled_tokens,
+                num_sampled,
+                num_rejected,
+                eff_m,
+                _S.stats,
+                NOHIT,
+                _S.req_acc_state,
+                _S.saved_leaf_parent,
+            )
+        except TypeError:
+            bfx.native_leaf_commit_tree(
+                _S.leaf_flag,
+                _S.prev_ns,
+                _S.hit_flag,
+                _S.hit_src_row,
+                _S.saved_leaf_toks,
+                _S.saved_leaf_k,
+                leaf_u_tok,
+                sampled_tokens,
+                num_sampled,
+                num_rejected,
+                eff_m,
+                _S.stats,
+                NOHIT,
+                _S.req_acc_state,
+            )
         src_row_buf = _S.hit_src_row
     else:
         bfx.native_leaf_commit(

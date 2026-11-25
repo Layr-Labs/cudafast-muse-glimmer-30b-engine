@@ -43,8 +43,18 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
 
-        # Each request emits exactly (bonus + N mask) query tokens per step.
+        # Each request emits (bonus + N mask) query tokens per step.
+        # Muse-Glimmer-30B-assistant was trained as a Q=8 block-diffusion drafter
+        # (1 anchor + 7 masks); emitting Q=8 while sampling the first 6 masks gives
+        # d1..d6 and their top-6 tree logits their trained right-hand context at 0 extra MMA tiles.
         self.num_query_per_req = 1 + self.num_speculative_steps
+        if (
+            getattr(self.draft_model_config.hf_config, "model_type", None)
+            == "muse_glimmer_assistant"
+            and self.num_speculative_steps == 6
+            and int(os.environ.get("VLLM_DFLASH_QUERY_LEN", "8")) == 8
+        ):
+            self.num_query_per_req = 8
 
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
@@ -690,7 +700,11 @@ def _prepare_dflash_inputs_kernel(
     # Otherwise (DFlash default) the anchor is the bonus token and only the mask tokens
     # at offsets > 0 are sampled from, each AT its own position.
     sample_off = 0 if SAMPLE_FROM_ANCHOR else 1
-    is_sample = is_query & (query_off >= sample_off)
+    is_sample = (
+        is_query
+        & (query_off >= sample_off)
+        & ((query_off - sample_off) < num_speculative_steps)
+    )
     sample_idx = req_idx * num_speculative_steps + (query_off - sample_off)
     sample_pos = query_pos + 1 if SAMPLE_FROM_ANCHOR else query_pos
     tl.store(out_sample_indices_ptr + sample_idx, query_idx, mask=is_sample)

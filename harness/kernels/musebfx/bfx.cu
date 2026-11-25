@@ -128,7 +128,11 @@ void native_leaf_setup_tree(
     bool dynamic_mode = true,
     double temp = 1.35,
     double tail_c = 4.0,
-    double gamma = 0.92);
+    double gamma = 0.92,
+    c10::optional<torch::Tensor> saved_leaf_parent = c10::nullopt,
+    bool tree2_mode = false,
+    double l2_couple = 0.35,
+    bool ignore_high_acc = true);
 void native_leaf_commit_tree(
     torch::Tensor leaf_flag, torch::Tensor prev_ns,
     torch::Tensor hit_flag, torch::Tensor hit_src_row,
@@ -137,7 +141,8 @@ void native_leaf_commit_tree(
     torch::Tensor num_sampled, torch::Tensor num_rejected,
     int64_t tree_m = 12,
     c10::optional<torch::Tensor> stats = c10::nullopt, bool no_hit_mode = false,
-    c10::optional<torch::Tensor> req_acc_state = c10::nullopt);
+    c10::optional<torch::Tensor> req_acc_state = c10::nullopt,
+    c10::optional<torch::Tensor> saved_leaf_parent = c10::nullopt);
 void native_leaf_setup(
     torch::Tensor leaf_flag, torch::Tensor prev_ns, torch::Tensor alt_ids,
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor saved_alt_tok,
@@ -196,7 +201,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("dynamic_mode") = true,
         pybind11::arg("temp") = 1.35,
         pybind11::arg("tail_c") = 4.0,
-        pybind11::arg("gamma") = 0.92);
+        pybind11::arg("gamma") = 0.92,
+        pybind11::arg("saved_leaf_parent") = c10::nullopt,
+        pybind11::arg("tree2_mode") = false,
+        pybind11::arg("l2_couple") = 0.35,
+        pybind11::arg("ignore_high_acc") = true);
   m.def("native_leaf_commit_tree", &native_leaf_commit_tree,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"),
         pybind11::arg("hit_flag"), pybind11::arg("hit_src_row"),
@@ -205,7 +214,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("num_sampled"), pybind11::arg("num_rejected"),
         pybind11::arg("tree_m") = 12,
         pybind11::arg("stats") = c10::nullopt, pybind11::arg("no_hit_mode") = false,
-        pybind11::arg("req_acc_state") = c10::nullopt);
+        pybind11::arg("req_acc_state") = c10::nullopt,
+        pybind11::arg("saved_leaf_parent") = c10::nullopt);
   m.def("native_leaf_setup", &native_leaf_setup,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"), pybind11::arg("alt_ids"),
         pybind11::arg("input_ids"), pybind11::arg("positions"), pybind11::arg("saved_alt_tok"),
