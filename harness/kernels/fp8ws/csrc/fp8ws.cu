@@ -81,14 +81,14 @@ __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* map, int 
 }
 __device__ __forceinline__ void ldsm4(uint32_t a, uint32_t (&r)[4]) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a) : "memory");
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
 }
 __device__ __forceinline__ void mma(const uint32_t (&a)[4], uint32_t b0, uint32_t b1, float (&c)[4]) {
   asm volatile("mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
                : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1),
-                 "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]) : "memory");
+                 "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
 }
 __device__ __forceinline__ uint32_t cvt2(float lo, float hi, float sa, float sb) {
   float x = __fmul_rn(__fmul_rn(lo, sb), sa);
@@ -262,42 +262,51 @@ __device__ __forceinline__ void consume_stage(uint32_t abase, uint32_t wbase, in
 template <int MW, int NW_CUR = NW, bool IsBf16 = false>
 __device__ __forceinline__ void consume_stage_pipe(uint32_t abase, uint32_t wbase, int wm, int wn, int ar, int ach,
                                                    int br, int bch, float (&acc)[MW][NW_CUR][4]) {
-  auto load_a = [&](int ks, uint32_t (&a)[MW][4]) {
-#pragma unroll
-    for (int i = 0; i < MW; ++i) {
-      const int r = wm * MW * 16 + i * 16 + ar;
-      ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, a[i]);
-    }
+  static_assert((MW == 1 || MW == 2) && (NW_CUR >= 4) && ((NW_CUR & 1) == 0), "consume_stage_pipe shape");
+  auto load_a_i = [&](int ks, int i, uint32_t (&a)[MW][4]) {
+    const int r = wm * MW * 16 + i * 16 + ar;
+    ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, a[i]);
   };
-  auto load_b = [&](int ks, uint32_t (&b)[NW_CUR][2]) {
-#pragma unroll
-    for (int j = 0; j < NW_CUR / 2; ++j) {
-      const int r = wn * NW_CUR * 8 + j * 16 + br;
-      uint32_t qd[4];
-      ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, qd);
-      b[2 * j][0] = qd[0];
-      b[2 * j][1] = qd[1];
-      b[2 * j + 1][0] = qd[2];
-      b[2 * j + 1][1] = qd[3];
-    }
+  auto load_b_j = [&](int ks, int j, uint32_t (&b)[NW_CUR][2]) {
+    const int r = wn * NW_CUR * 8 + j * 16 + br;
+    uint32_t qd[4];
+    ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, qd);
+    b[2 * j][0] = qd[0];
+    b[2 * j][1] = qd[1];
+    b[2 * j + 1][0] = qd[2];
+    b[2 * j + 1][1] = qd[3];
   };
   uint32_t a[2][MW][4], b[2][NW_CUR][2];
-  load_a(0, a[0]);
-  load_b(0, b[0]);
+#pragma unroll
+  for (int i = 0; i < MW; ++i) load_a_i(0, i, a[0]);
+#pragma unroll
+  for (int j = 0; j < NW_CUR / 2; ++j) load_b_j(0, j, b[0]);
 #pragma unroll
   for (int ks = 0; ks < KT / 32; ++ks) {
     const int cur = ks & 1, nxt = cur ^ 1;
-    if (ks + 1 < KT / 32) {
-      load_a(ks + 1, a[nxt]);
-      load_b(ks + 1, b[nxt]);
-    }
 #pragma unroll
-    for (int i = 0; i < MW; ++i)
+    for (int i = 0; i < MW; ++i) {
 #pragma unroll
       for (int j = 0; j < NW_CUR; ++j) {
         if constexpr (IsBf16) mma_bf16(a[cur][i], b[cur][j][0], b[cur][j][1], acc[i][j]);
         else mma(a[cur][i], b[cur][j][0], b[cur][j][1], acc[i][j]);
+        if (ks + 1 < KT / 32) {
+          if constexpr (MW == 2) {
+            if (i == 0 && (j == 0 || j == 2)) {
+              load_a_i(ks + 1, j >> 1, a[nxt]);
+            } else if (i == 1 && (j & 1) == 0) {
+              load_b_j(ks + 1, j >> 1, b[nxt]);
+            }
+          } else {
+            if (j == 0) {
+              load_a_i(ks + 1, 0, a[nxt]);
+            } else if (j <= NW_CUR / 2) {
+              load_b_j(ks + 1, j - 1, b[nxt]);
+            }
+          }
+        }
       }
+    }
   }
 }
 

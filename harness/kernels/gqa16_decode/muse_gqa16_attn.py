@@ -619,57 +619,67 @@ def self_check_prefill(device: torch.device) -> bool:
 
         for cand_mode in (1, 3):
             all_match = True
-            for seq_q, q_off in ((512, 0), (64, 448)):
-                q = (torch.randn((seq_q, 32, 128), generator=gen, device=device) * 1.4).to(torch.bfloat16).contiguous()
-                gate = (torch.randn((seq_q, 4096), generator=gen, device=device) * 1.3).to(torch.bfloat16).contiguous()
-                cu_q = torch.tensor([0, seq_q], dtype=torch.int32, device=device)
-                for win in ((-1, -1), (511, 0)):
-                    ref = torch.empty_like(q)
-                    flash_attn_varlen_func(
-                        q=q, k=k_cache, v=v_cache, out=ref,
-                        cu_seqlens_q=cu_q, max_seqlen_q=seq_q,
-                        seqused_k=sk, max_seqlen_k=512,
-                        softmax_scale=scale, causal=True,
-                        window_size=list(win), block_table=bt,
-                        fa_version=2, num_splits=0,
-                    )
-                    # Mode 0: plain BF16
-                    got0 = torch.empty_like(q)
-                    rc0 = _lib.muse_gqa16_prefill(
-                        q.data_ptr(), kv_cache.data_ptr(), 0, 0, got0.data_ptr(), bt.data_ptr(),
-                        seq_q, q_off, block_size, 0, cand_mode, 0, scale,
-                        q.stride(0), q.stride(1), got0.stride(0),
-                        kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), stream,
-                    )
-                    # Mode 1: fused mul_sigmoid BF16 (with PDL producer)
-                    ref1 = torch.empty((seq_q, 4096), dtype=torch.bfloat16, device=device)
-                    G.mul_sigmoid_bf16(gate, ref.view(seq_q, 4096), ref1, seq_q * 4096, stream)
-                    got1 = torch.empty_like(ref1)
-                    rc1 = _lib.muse_gqa16_prefill(
-                        q.data_ptr(), kv_cache.data_ptr(), gate.data_ptr(), 0, got1.data_ptr(), bt.data_ptr(),
-                        seq_q, q_off, block_size, 1, cand_mode, int(PREFILL_PDL_ENABLED), scale,
-                        q.stride(0), q.stride(1), 4096,
-                        kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), stream,
-                    )
-                    # Mode 2: fused mul_sigmoid_fp8 (with PDL producer)
-                    ref2 = torch.empty((seq_q, 4096), dtype=torch.float8_e4m3fn, device=device)
-                    G.mul_sigmoid_fp8(gate, ref.view(seq_q, 4096), fp8_scale, ref2, seq_q * 4096, stream)
-                    got2 = torch.empty_like(ref2)
-                    rc2 = _lib.muse_gqa16_prefill(
-                        q.data_ptr(), kv_cache.data_ptr(), gate.data_ptr(), fp8_scale.data_ptr(),
-                        got2.data_ptr(), bt.data_ptr(),
-                        seq_q, q_off, block_size, 2, cand_mode, int(PREFILL_PDL_ENABLED), scale,
-                        q.stride(0), q.stride(1), 4096,
-                        kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), stream,
-                    )
-                    torch.cuda.synchronize(device)
-                    if (
-                        rc0 != 0 or rc1 != 0 or rc2 != 0
-                        or not torch.equal(ref.view(torch.int16), got0.view(torch.int16))
-                        or not torch.equal(ref1.view(torch.int16), got1.view(torch.int16))
-                        or not torch.equal(ref2.view(torch.uint8), got2.view(torch.uint8))
-                    ):
-                        all_match = False
+            for block_size in (16, 64):
+                num_blocks = (512 // block_size) + 8
+                raw_kv = (torch.randn((num_blocks, block_size, 2, 256), generator=gen, device=device) * 0.8).to(torch.bfloat16)
+                raw_kv[0].zero_()
+                kv_cache = raw_kv.permute(0, 2, 1, 3)
+                k_cache, v_cache = kv_cache.transpose(1, 2).split(128, dim=-1)
+                perm = torch.randperm(num_blocks - 1, generator=gen, device=device, dtype=torch.int32) + 1
+                bt = perm[: (512 // block_size)].unsqueeze(0).contiguous()
+                for seq_q, q_off in ((512, 0), (64, 448)):
+                    q = (torch.randn((seq_q, 32, 128), generator=gen, device=device) * 1.4).to(torch.bfloat16).contiguous()
+                    gate = (torch.randn((seq_q, 4096), generator=gen, device=device) * 1.3).to(torch.bfloat16).contiguous()
+                    cu_q = torch.tensor([0, seq_q], dtype=torch.int32, device=device)
+                    for win in ((-1, -1), (511, 0)):
+                        ref = torch.empty_like(q)
+                        flash_attn_varlen_func(
+                            q=q, k=k_cache, v=v_cache, out=ref,
+                            cu_seqlens_q=cu_q, max_seqlen_q=seq_q,
+                            seqused_k=sk, max_seqlen_k=512,
+                            softmax_scale=scale, causal=True,
+                            window_size=list(win), block_table=bt,
+                            fa_version=2, num_splits=0,
+                        )
+                        # Mode 0: plain BF16
+                        got0 = torch.empty_like(q)
+                        rc0 = _lib.muse_gqa16_prefill(
+                            q.data_ptr(), kv_cache.data_ptr(), 0, 0, got0.data_ptr(), bt.data_ptr(),
+                            seq_q, q_off, block_size, 0, cand_mode, 0, scale,
+                            q.stride(0), q.stride(1), got0.stride(0),
+                            kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), stream,
+                        )
+                        # Mode 1: fused mul_sigmoid BF16 (with PDL producer)
+                        ref1 = torch.empty((seq_q, 4096), dtype=torch.bfloat16, device=device)
+                        G.mul_sigmoid_bf16(gate, ref.view(seq_q, 4096), ref1, seq_q * 4096, stream)
+                        got1 = torch.empty_like(ref1)
+                        rc1 = _lib.muse_gqa16_prefill(
+                            q.data_ptr(), kv_cache.data_ptr(), gate.data_ptr(), 0, got1.data_ptr(), bt.data_ptr(),
+                            seq_q, q_off, block_size, 1, cand_mode, int(PREFILL_PDL_ENABLED), scale,
+                            q.stride(0), q.stride(1), 4096,
+                            kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), stream,
+                        )
+                        # Mode 2: fused mul_sigmoid_fp8 (with PDL producer)
+                        ref2 = torch.empty((seq_q, 4096), dtype=torch.float8_e4m3fn, device=device)
+                        G.mul_sigmoid_fp8(gate, ref.view(seq_q, 4096), fp8_scale, ref2, seq_q * 4096, stream)
+                        got2 = torch.empty_like(ref2)
+                        rc2 = _lib.muse_gqa16_prefill(
+                            q.data_ptr(), kv_cache.data_ptr(), gate.data_ptr(), fp8_scale.data_ptr(),
+                            got2.data_ptr(), bt.data_ptr(),
+                            seq_q, q_off, block_size, 2, cand_mode, int(PREFILL_PDL_ENABLED), scale,
+                            q.stride(0), q.stride(1), 4096,
+                            kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), stream,
+                        )
+                        torch.cuda.synchronize(device)
+                        if (
+                            rc0 != 0 or rc1 != 0 or rc2 != 0
+                            or not torch.equal(ref.view(torch.int16), got0.view(torch.int16))
+                            or not torch.equal(ref1.view(torch.int16), got1.view(torch.int16))
+                            or not torch.equal(ref2.view(torch.uint8), got2.view(torch.uint8))
+                        ):
+                            all_match = False
+                            break
+                    if not all_match:
                         break
                 if not all_match:
                     break
@@ -700,9 +710,10 @@ def flush_pending_prefill(stream: int | None = None) -> None:
     _pending_prefill = None
     _out_ptr, _out_numel, q, kv_cache, bt, out, seqlen_q, q_offset, scale, scale_mode, saved_stream = pend
     st = saved_stream if stream is None else int(stream)
+    bs = int(kv_cache.shape[2])
     rc = _lib.muse_gqa16_prefill(
         q.data_ptr(), kv_cache.data_ptr(), 0, 0, out.data_ptr(), bt.data_ptr(),
-        seqlen_q, q_offset, 16, 0, scale_mode, 0, scale,
+        seqlen_q, q_offset, bs, 0, scale_mode, 0, scale,
         q.stride(0), q.stride(1), out.stride(0),
         kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), st,
     )
@@ -724,6 +735,7 @@ def consume_prefill_mul_sigmoid(
     _pending_prefill = None
     out_ptr, out_numel, q, kv_cache, bt, out_arg, seqlen_q, q_offset, scale, scale_mode, saved_stream = pend
     st = saved_stream if stream is None else int(stream)
+    bs = int(kv_cache.shape[2])
     is_fp8 = fp8_scale is not None
     out_align_mask = 7 if is_fp8 else 15
     if (
@@ -738,7 +750,7 @@ def consume_prefill_mul_sigmoid(
     ):
         rc_f = _lib.muse_gqa16_prefill(
             q.data_ptr(), kv_cache.data_ptr(), 0, 0, out_arg.data_ptr(), bt.data_ptr(),
-            seqlen_q, q_offset, 16, 0, scale_mode, 0, scale,
+            seqlen_q, q_offset, bs, 0, scale_mode, 0, scale,
             q.stride(0), q.stride(1), out_arg.stride(0),
             kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), st,
         )
@@ -750,7 +762,7 @@ def consume_prefill_mul_sigmoid(
     pdl = 1 if PREFILL_PDL_ENABLED else 0
     rc = _lib.muse_gqa16_prefill(
         q.data_ptr(), kv_cache.data_ptr(), gate.data_ptr(), fp8_ptr, out.data_ptr(), bt.data_ptr(),
-        seqlen_q, q_offset, 16, mode, scale_mode, pdl, scale,
+        seqlen_q, q_offset, bs, mode, scale_mode, pdl, scale,
         q.stride(0), q.stride(1), 4096,
         kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), st,
     )
@@ -815,13 +827,13 @@ def try_prefill_gqa16(
         or (query.stride(1) & 7) != 0
         or kv_cache.ndim != 4
         or kv_cache.shape[1] != 2
-        or kv_cache.shape[2] != 16
+        or kv_cache.shape[2] not in (16, 64)
         or kv_cache.shape[3] != 256
         or kv_cache.stride(3) != 1
         or block_table.dtype != torch.int32
         or block_table.ndim != 2
         or block_table.stride(1) != 1
-        or block_table.shape[1] < (max_seqlen_k >> 4)
+        or block_table.shape[1] < (max_seqlen_k // int(kv_cache.shape[2]))
         or ((query.data_ptr() | kv_cache.data_ptr() | output.data_ptr()) & 15) != 0
     ):
         _pf_counts["miss"] += 1
@@ -845,7 +857,14 @@ def try_prefill_gqa16(
         return False
 
     stream = torch.cuda.current_stream(device).cuda_stream
-    if allow_defer and q_offset == 0 and PREFILL_FUSE_ENABLED:
+    can_defer = allow_defer and q_offset == 0 and PREFILL_FUSE_ENABLED
+    if can_defer:
+        try:
+            from vllm.model_executor.models import muse_glimmer_norm_glue as _ng_mod
+            can_defer = bool(getattr(_ng_mod, "_installed", False) and getattr(_ng_mod, "_MUL_SIGMOID_GLUE", False))
+        except Exception:
+            can_defer = False
+    if can_defer:
         _pending_prefill = (
             output.data_ptr(),
             output.numel(),
@@ -861,9 +880,10 @@ def try_prefill_gqa16(
         )
         return True
 
+    bs = int(kv_cache.shape[2])
     rc = _lib.muse_gqa16_prefill(
         query.data_ptr(), kv_cache.data_ptr(), 0, 0, output.data_ptr(), block_table.data_ptr(),
-        max_seqlen_q, q_offset, 16, 0, st[1], 0, softmax_scale,
+        max_seqlen_q, q_offset, bs, 0, st[1], 0, softmax_scale,
         query.stride(0), query.stride(1), output.stride(0),
         kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), stream,
     )

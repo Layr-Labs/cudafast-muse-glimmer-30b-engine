@@ -266,6 +266,10 @@
     {
       "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
       "why": "bs=1 speculative-decode host cuts (from i34-9, Yukon submissions 9ba5da7f-8db5-430c-a3f5-d3da1a13d186 / 1cf35c6e-2e8d-4cc8-a354-d2132af5831d): one-request draft steps read query_start_loc, cu_num_logits, expanded_idx_mapping and expanded_local_pos from read-only tensors built once in load_model (same contents) instead of a pin + H2D copy and an expand kernel per step; the per-step draft-token gather handed to DraftTokensHandler is skipped when no structured-output request needs its contents (only its shape is read); the rejection sampler skips the identity cu_num_logits shift when the chunk starts at 0."
+    },
+    {
+      "file": "vllm/model_executor/models/qwen3_dflash.py, vllm/model_executor/draft_vocab.py, vllm/model_executor/layers/quantization/modelopt.py, vllm/v1/worker/gpu/spec_decode/dflash/utils.py, vllm/v1/worker/gpu/spec_decode/dflash/speculator.py, vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/prefill_graph.py, vllm/model_executor/models/muse_glimmer_norm_glue.py, vllm/model_executor/layers/muse_draft_fp8.py",
+      "why": "Bidirectional non-causal sliding-window attention for MuseGlimmerAssistantModel DFlash block-diffusion drafting; deterministic BPE merge-rank reduced draft vocabulary (98,304 rows, exact 16x6,144 zero-split-K multiple) running on 3-stage TMA4-ILV MultiM GEMV paired with a dynamic <=512-row exact-NVFP4 per-prompt OOV tail argmax kernel (harness/kernels/musebfx/draft_vocab_tail.cu, verified at load to 0.00000 parity error against the static head); strict 0-ULP target verify and prefill improvements including MultiM Decode6 k-loop overlap, tight SMEM, fused gated o_proj mul_sigmoid, multi-row lmpost6_m greedy verify, 4 MiB L2-persisting RMSNorm arena, CUDA-graph-captured DFlash context-KV and multi-token embedding, Layer-51 final-layer prefill slab enabled under DFlash, gqa16 block64 prefill fusion, 3-slice FP32 gate TMA fold, and fp8ws pipelined consumption."
     }
   ],
   "carried_from": {

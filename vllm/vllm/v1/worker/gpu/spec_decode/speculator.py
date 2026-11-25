@@ -291,6 +291,10 @@ class DraftModelSpeculator(BaseSpeculator):
     def _greedy_sample_draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
+        if hasattr(self.model, "draft_argmax"):
+            fast = self.model.draft_argmax(hidden_states)
+            if fast is not None:
+                return fast
         logits = self.model.compute_logits(hidden_states)
         return logits.argmax(dim=-1)
 

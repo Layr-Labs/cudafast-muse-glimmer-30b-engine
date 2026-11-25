@@ -98,8 +98,18 @@ torch::Tensor bf16_rans_unpack(torch::Tensor blob, int64_t N, int64_t K);
 torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int64_t K, int64_t base_exp);
 void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp);
 int64_t bf16_rans_base(torch::Tensor blob);
-torch::Tensor int3_pack(torch::Tensor W);
+torch::Tensor int3_pack(torch::Tensor W, bool mse_opt = true);
 torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+void draft_vocab_update_tail(
+    torch::Tensor input_ids, torch::Tensor positions, torch::Tensor in_static_vocab,
+    torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor tail_seen);
+torch::Tensor draft_vocab_tail_argmax(
+    torch::Tensor A, torch::Tensor static_logits, torch::Tensor vocab_map,
+    torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor raw_w,
+    torch::Tensor raw_s, torch::Tensor global_scale, double logit_scale);
+torch::Tensor draft_vocab_score_rows(
+    torch::Tensor A, torch::Tensor row_ids, torch::Tensor raw_w,
+    torch::Tensor raw_s, torch::Tensor global_scale, double logit_scale);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm", &bfx_gemm);
@@ -108,6 +118,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_gemm", &bf16_rans_gemm);
   m.def("rans_gemm_out", &bf16_rans_gemm_out);
   m.def("rans_base", &bf16_rans_base);
-  m.def("int3_pack", &int3_pack);
+  m.def("int3_pack", &int3_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
   m.def("int3_gemm", &int3_gemm);
+  m.def("draft_vocab_update_tail", &draft_vocab_update_tail);
+  m.def("draft_vocab_tail_argmax", &draft_vocab_tail_argmax,
+        pybind11::arg("A"), pybind11::arg("static_logits"), pybind11::arg("vocab_map"),
+        pybind11::arg("tail_ids"), pybind11::arg("tail_count"), pybind11::arg("raw_w"),
+        pybind11::arg("raw_s"), pybind11::arg("global_scale"), pybind11::arg("logit_scale") = 1.0);
+  m.def("draft_vocab_score_rows", &draft_vocab_score_rows,
+        pybind11::arg("A"), pybind11::arg("row_ids"), pybind11::arg("raw_w"),
+        pybind11::arg("raw_s"), pybind11::arg("global_scale"), pybind11::arg("logit_scale") = 1.0);
 }

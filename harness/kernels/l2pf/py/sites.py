@@ -113,6 +113,12 @@ TAIL_TLB = os.environ.get("L2PF_LM_HEAD_TAIL_TLB", "1") != "0"
 TLB_EARLY = frozenset(x for x in os.environ.get("L2PF_TLB_EARLY", "qkv,gate,o").replace(" ", "").split(",") if x)
 _SITE_NAMES = ("qkv", "gate", "o", "gate_up", "down")
 SKIP_SWIGLU_ACT = os.environ.get("L2PF_SKIP_SWIGLU_ACT", "0") != "0"
+# Verify-width (M > 1) trim: drop redundant 2 MiB TLB-only launches on muserans sites
+# (already self-prefetching in muse_rans.cu), M=1-only BF16 packed buffers, and small
+# (<32 MiB) attention sites while keeping all 260 sites tracked so norm pre-warm and
+# lm_head tail TLB pre-warm stay active (~246 -> ~85-86 launches). Set L2PF_TRIM_M7=0 to A/B.
+TRIM_M7 = os.environ.get("L2PF_TRIM_M7", "1") != "0"
+TRIM_M7_MIN_BYTES = _env_bytes("L2PF_TRIM_M7_MIN_MB", 32 << 20)
 
 # Compressed one-row projections measured with the same captured stream edges.
 _RANS_SKIP_PREFETCH = {
@@ -418,7 +424,9 @@ def _targets():
             pkt.default  # noqa: B018 - materialize the overload
         except (AttributeError, RuntimeError):
             continue
-        out.append((pkt, "default", kind, False))
+        # Proxy the packet so both torch.ops._C.<op>(...) (e.g. uncompressed NVFP4 o_proj
+        # fallback at M > 1) and Inductor's torch.ops._C.<op>.default(...) are recorded.
+        out.append((torch.ops._C, name, kind, True))
     try:
         import glimmer_fp8_ext
     except (ImportError, OSError):
@@ -475,6 +483,16 @@ def _targets():
     return out
 
 
+def _batch_m(kind: str, args) -> int:
+    try:
+        t = args[1] if kind == "muse_bf16_gate" else args[0]
+        if isinstance(t, torch.Tensor) and t.ndim >= 2:
+            return int(t.shape[0])
+    except IndexError:
+        pass
+    return 1
+
+
 def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
     try:
         if kind == "marlin":
@@ -483,9 +501,9 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[2],)
         if kind in ("cutlass_fp8", "mm"):
             return (args[1],)
-        if kind == "muse_bf16_lane" and args[0].shape[0] == 1 and args[0].is_contiguous():
+        if kind == "muse_bf16_lane" and 1 <= args[0].shape[0] <= 8 and args[0].is_contiguous():
             return (args[2],)
-        if kind == "muse_bf16_gate" and args[1].shape[0] == 1 and args[1].is_contiguous():
+        if kind == "muse_bf16_gate" and 1 <= args[1].shape[0] <= 8 and args[1].is_contiguous():
             return (args[3],)
         if kind == "marlin_tiled":
             return (args[1], args[2])
@@ -543,6 +561,7 @@ class Session:
         self.tail_off = -1
         self.tail_early = False
         self.tlb_moved = 0
+        self._max_m = 1
 
     # -- patching
     @contextlib.contextmanager
@@ -597,6 +616,7 @@ class Session:
         self.stopped = False
         self._attn = False
         self._prev_big = False
+        self._max_m = 1
         with self._patched(self._on_record, True):
             yield
         if not self.stopped:
@@ -620,6 +640,9 @@ class Session:
         if key is None:
             return
         ws = _weights_of(kind, args)
+        m_rows = _batch_m(kind, args)
+        if m_rows > self._max_m:
+            self._max_m = m_rows
         site = _Site(kind, key, self._attn)
         self._attn = False
         prev_big, self._prev_big = self._prev_big, False
@@ -628,7 +651,11 @@ class Session:
             if wbytes > MAX_WEIGHT:
                 self._prev_big = True
                 site.mlp = "act" if prev_big else "norm"
-                if (
+                if m_rows > 1 and TRIM_M7 and kind == "musefp8":
+                    # muse_rans.cu already issues internal 2 MiB TLB prefetches in block 0;
+                    # skip redundant side-stream TLB launches at verify width (M > 1).
+                    site.descs = []
+                elif (
                     prev_big
                     and SKIP_SWIGLU_ACT
                     and kind == "marlin_tiled"
@@ -645,6 +672,14 @@ class Session:
                         site.descs += tlb_descs(ws[0], mb_b, TLB_STRIDE)
                         for w_extra in ws[1:]:
                             site.descs += tlb_descs(w_extra, 0, TLB_STRIDE)
+            elif m_rows > 1 and (
+                kind in ("muse_bf16_lane", "muse_bf16_gate")
+                or (TRIM_M7 and (kind == "musefp8" or wbytes < TRIM_M7_MIN_BYTES))
+            ):
+                # At M > 1, BF16 uses the separate multi-M rANS blob (not packed), and with
+                # TRIM_M7 we skip redundant muserans TLB walks and small (<32 MiB) attention
+                # sites while still keeping the site recorded so len(self.sites) == 260.
+                site.descs = []
             else:
                 nbytes = budget(wbytes, site.after_attn)
                 skip_all = False
@@ -730,10 +765,13 @@ class Session:
             if self.ranges is not None and not _inside(descs, self.ranges):
                 continue
             slices[lyr] = descs
+        trim_m7_active = self._max_m > 1 and TRIM_M7
         for lyr, descs in slices.items():
             for k in (0, 3, 4):
                 site = self.sites[SITES_PER_LAYER * lyr + k]
                 if site.skip_act:
+                    continue
+                if trim_m7_active and not site.descs:
                     continue
                 extra = list(descs)
                 if k == 4 and NORM_NEXT and (lyr + 1) in slices:

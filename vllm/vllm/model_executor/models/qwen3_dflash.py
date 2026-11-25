@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import io
+import os
 from collections.abc import Iterable
 
 import torch
@@ -60,6 +61,10 @@ def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
     override = (getattr(config, "dflash_config", None) or {}).get("causal")
     if override is not None:
         return override
+    if os.environ.get("MUSE_DFLASH_BIDIR", "1") != "0":
+        archs = getattr(config, "architectures", None) or ()
+        if any("MuseGlimmerAssistant" in a for a in archs):
+            return False
     layer_types = getattr(config, "layer_types", None)
     return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
 
@@ -741,6 +746,69 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         """Per-layer attention causality, aligned with
         get_draft_kv_cache_layer_names."""
         return [layer.self_attn.causal for layer in self.model.layers]
+
+    def update_draft_prompt_tail(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        lm_head = self.lm_head
+        if not getattr(lm_head, "prompt_tail_admitted", False):
+            return
+        if not input_ids.is_cuda or input_ids.numel() == 0:
+            return
+        try:
+            import muse_bfx_ext as _bfx
+
+            _bfx.draft_vocab_update_tail(
+                input_ids,
+                positions,
+                lm_head.in_static_vocab,
+                lm_head.tail_ids,
+                lm_head.tail_count,
+                lm_head.tail_seen,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def draft_argmax(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if self.draft_id_to_target_id is not None:
+            return None
+        vocab_map = getattr(self, "draft_vocab_token_ids", None)
+        if vocab_map is None:
+            return None
+        static_logits = self.logits_processor(self.lm_head, hidden_states)
+        if static_logits is None:
+            return None
+        lm_head = self.lm_head
+        if (
+            getattr(lm_head, "prompt_tail_admitted", False)
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.dim() == 2
+            and 1 <= hidden_states.shape[0] <= 8
+            and static_logits.dtype == torch.bfloat16
+        ):
+            import muse_bfx_ext as _bfx
+
+            x_c = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
+            sl_c = static_logits if static_logits.is_contiguous() else static_logits.contiguous()
+            logit_scale = float(getattr(self.logits_processor, "scale", 1.0))
+            return _bfx.draft_vocab_tail_argmax(
+                x_c,
+                sl_c,
+                vocab_map,
+                lm_head.tail_ids,
+                lm_head.tail_count,
+                lm_head.full_raw_w,
+                lm_head.full_raw_s,
+                lm_head.full_global_scale,
+                logit_scale,
+            )
+        return vocab_map[static_logits.argmax(dim=-1)]
 
     def compute_logits(
         self,

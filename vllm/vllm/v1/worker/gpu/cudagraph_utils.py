@@ -380,7 +380,7 @@ class CudaGraphManager:
                             set_graph_pool_id(current_platform.graph_pool_handle())
                         persist_set = False
                         cap_stream = current_platform.current_stream()
-                        if desc.num_tokens == 1:
+                        if 1 <= desc.num_tokens <= 8:
                             try:
                                 import l2pf as _l2pf_mod
                                 arena = getattr(

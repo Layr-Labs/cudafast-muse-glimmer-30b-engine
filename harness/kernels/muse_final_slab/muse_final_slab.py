@@ -263,22 +263,55 @@ def gate_if_active(x, weight):
     if RESTRICT and plan.gate_decode1 is not None:
         d1 = plan.gate_decode1
         import muse_marlin6_gemv as _m6
-        prev_notify = getattr(_m6, "_notify_gate_up_swiglu", None)
-        if prev_notify is not None:
-            _m6._notify_gate_up_swiglu = None
-        try:
-            gu = torch.ops.vllm.marlin_tiled_decode6.default(
-                x[-1:], d1.weight, d1.scales6, d1.palette, d1.global_scale, d1.workspace,
-                d1.n, d1.k, d1.fixed_grid,
-            )
-        finally:
+        sw_entry = _m6._SWIGLU_GATE_UP.get(d1.global_scale.data_ptr())
+        if sw_entry is not None:
+            if (
+                sw_entry.get("state") == "admitted"
+                and not sw_entry.get("is_fp8", False)
+                and _m6.is_tma4(d1.scales6)
+            ):
+                x_row = x[-1:]
+                if not x_row.is_contiguous() or x_row.data_ptr() % 16:
+                    x_row = x_row.clone(memory_format=torch.contiguous_format)
+                sw_buf = sw_entry["swiglu_out"]
+                partials = x_row.new_empty((48, 16, 128), dtype=torch.float32)
+                with torch.cuda.device(x_row.device):
+                    stream = torch.cuda.current_stream(x_row.device).cuda_stream
+                    if sw_entry.get("is_ilv", False) and _m6._sk_tma4_ilv_swiglu is not None:
+                        status = _m6._sk_tma4_ilv_swiglu(
+                            x_row.data_ptr(), d1.weight.data_ptr(), sw_buf.data_ptr(), partials.data_ptr(),
+                            d1.scales6.data_ptr(), d1.palette.data_ptr(), d1.global_scale.data_ptr(),
+                            d1.workspace.data_ptr(), d1.n, d1.k, 48, x_row.device.index, stream,
+                        )
+                    elif not sw_entry.get("is_ilv", False) and _m6._gate_up_tma4_swiglu is not None:
+                        status = _m6._gate_up_tma4_swiglu(
+                            x_row.data_ptr(), d1.weight.data_ptr(), sw_buf.data_ptr(), partials.data_ptr(),
+                            d1.scales6.data_ptr(), d1.palette.data_ptr(), d1.global_scale.data_ptr(),
+                            d1.workspace.data_ptr(), 0, d1.n, d1.k, 48, x_row.device.index, stream,
+                        )
+                    else:
+                        status = -1
+                if status == 0:
+                    out[-1:].copy_(sw_buf[:, :marlinw_down.INNER])
+                    calls[0] += 1
+                    return out
+        else:
+            prev_notify = getattr(_m6, "_notify_gate_up_swiglu", None)
             if prev_notify is not None:
-                _m6._notify_gate_up_swiglu = prev_notify
-        g_f = gu[:, :marlinw_down.INNER].float()
-        u_f = gu[:, marlinw_down.INNER:].float()
-        out[-1:].copy_(((g_f / (1.0 + torch.exp(-g_f))) * u_f).to(torch.bfloat16))
-        calls[0] += 1
-        return out
+                _m6._notify_gate_up_swiglu = None
+            try:
+                gu = torch.ops.vllm.marlin_tiled_decode6.default(
+                    x[-1:], d1.weight, d1.scales6, d1.palette, d1.global_scale, d1.workspace,
+                    d1.n, d1.k, d1.fixed_grid,
+                )
+            finally:
+                if prev_notify is not None:
+                    _m6._notify_gate_up_swiglu = prev_notify
+            g_f = gu[:, :marlinw_down.INNER].float()
+            u_f = gu[:, marlinw_down.INNER:].float()
+            out[-1:].copy_(((g_f / (1.0 + torch.exp(-g_f))) * u_f).to(torch.bfloat16))
+            calls[0] += 1
+            return out
     tile = x[-TILE_ROWS:]
     dest = out[-TILE_ROWS:]
     g, _ = _native[x.device]

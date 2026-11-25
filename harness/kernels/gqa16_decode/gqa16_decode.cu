@@ -2739,7 +2739,7 @@ __device__ __forceinline__ void ldsm4_v_pair64(
       : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]) : "r"(addr));
 }
 
-template <bool IsV>
+template <bool IsV, bool kBlock64>
 __device__ __forceinline__ void issue_kv64_paged(
     uint4 smem_tile[64][16],
     const __nv_bfloat16* __restrict__ kv_ptr,
@@ -2754,18 +2754,29 @@ __device__ __forceinline__ void issue_kv64_paged(
   const int r_in_16 = tid >> 4;
   const int c = tid & 15;
   const int c_phys = c ^ (r_in_16 & 7);
-  const int lb_base = tok_base >> 4;
-  #pragma unroll
-  for (int u = 0; u < 4; ++u) {
-    const int phys_blk = __ldg(block_table + lb_base + u);
-    const int r = (u << 4) + r_in_16;
-    const int64_t row_off = static_cast<int64_t>(phys_blk) * stride_block
-                          + static_cast<int64_t>(r_in_16) * stride_slot + head_v_off;
-    cp_async_16(smem_u32(&smem_tile[r][c_phys]), kv_ptr + row_off + (c << 3));
+  if constexpr (kBlock64) {
+    const int phys_blk = __ldg(block_table + (tok_base >> 6));
+    const int64_t blk_base = static_cast<int64_t>(phys_blk) * stride_block + head_v_off;
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int r = (u << 4) + r_in_16;
+      const int64_t row_off = blk_base + static_cast<int64_t>(r) * stride_slot;
+      cp_async_16(smem_u32(&smem_tile[r][c_phys]), kv_ptr + row_off + (c << 3));
+    }
+  } else {
+    const int lb_base = tok_base >> 4;
+    #pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const int phys_blk = __ldg(block_table + lb_base + u);
+      const int r = (u << 4) + r_in_16;
+      const int64_t row_off = static_cast<int64_t>(phys_blk) * stride_block
+                            + static_cast<int64_t>(r_in_16) * stride_slot + head_v_off;
+      cp_async_16(smem_u32(&smem_tile[r][c_phys]), kv_ptr + row_off + (c << 3));
+    }
   }
 }
 
-template <int Mode, bool kPdlProd>
+template <int Mode, bool kPdlProd, bool kBlock64>
 __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
     const __nv_bfloat16* __restrict__ kv_ptr,
@@ -2831,8 +2842,8 @@ __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
   float row_max0 = -INFINITY, row_max1 = -INFINITY;
   float row_sum0 = 0.0f, row_sum1 = 0.0f;
 
-  issue_kv64_paged<false>(kv_smem[0], kv_ptr, block_table, (nb_max - 1) << 7,
-                          kv_head, stride_block, stride_slot, stride_kv_head, tid);
+  issue_kv64_paged<false, kBlock64>(kv_smem[0], kv_ptr, block_table, (nb_max - 1) << 7,
+                                    kv_head, stride_block, stride_slot, stride_kv_head, tid);
   cp_async_commit();
 
   for (int nb = nb_max - 1; nb >= 0; --nb) {
@@ -2843,8 +2854,8 @@ __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
       s_frag[ni][0] = 0.0f; s_frag[ni][1] = 0.0f; s_frag[ni][2] = 0.0f; s_frag[ni][3] = 0.0f;
     }
 
-    issue_kv64_paged<false>(kv_smem[1], kv_ptr, block_table, block_tok_base + 64,
-                            kv_head, stride_block, stride_slot, stride_kv_head, tid);
+    issue_kv64_paged<false, kBlock64>(kv_smem[1], kv_ptr, block_table, block_tok_base + 64,
+                                      kv_head, stride_block, stride_slot, stride_kv_head, tid);
     cp_async_commit();
     cp_async_wait<1>();
     __syncthreads();
@@ -2866,8 +2877,8 @@ __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
     }
     __syncthreads();
 
-    issue_kv64_paged<true>(kv_smem[0], kv_ptr, block_table, block_tok_base,
-                           kv_head, stride_block, stride_slot, stride_kv_head, tid);
+    issue_kv64_paged<true, kBlock64>(kv_smem[0], kv_ptr, block_table, block_tok_base,
+                                     kv_head, stride_block, stride_slot, stride_kv_head, tid);
     cp_async_commit();
     cp_async_wait<1>();
     __syncthreads();
@@ -2889,8 +2900,8 @@ __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
     }
     __syncthreads();
 
-    issue_kv64_paged<true>(kv_smem[1], kv_ptr, block_table, block_tok_base + 64,
-                           kv_head, stride_block, stride_slot, stride_kv_head, tid);
+    issue_kv64_paged<true, kBlock64>(kv_smem[1], kv_ptr, block_table, block_tok_base + 64,
+                                     kv_head, stride_block, stride_slot, stride_kv_head, tid);
     cp_async_commit();
 
     float m0 = -INFINITY, m1 = -INFINITY;
@@ -2983,8 +2994,8 @@ __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
     __syncthreads();
 
     if (nb > 0) {
-      issue_kv64_paged<false>(kv_smem[0], kv_ptr, block_table, (nb - 1) << 7,
-                              kv_head, stride_block, stride_slot, stride_kv_head, tid);
+      issue_kv64_paged<false, kBlock64>(kv_smem[0], kv_ptr, block_table, (nb - 1) << 7,
+                                        kv_head, stride_block, stride_slot, stride_kv_head, tid);
       cp_async_commit();
       cp_async_wait<1>();
     } else {
@@ -3086,7 +3097,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
   }
 }
 
-template <int Mode>
+template <int Mode, bool kBlock64>
 static inline cudaError_t launch_prefill_mode(
     bool pdl_prod, dim3 grid, dim3 block, cudaStream_t st,
     const __nv_bfloat16* q, const __nv_bfloat16* kv, const __nv_bfloat16* gate,
@@ -3106,11 +3117,11 @@ static inline cudaError_t launch_prefill_mode(
     cfg.attrs = attr;
     cfg.numAttrs = 1;
     return cudaLaunchKernelEx(
-        &cfg, gqa16_prefill_v3_kernel<Mode, true>,
+        &cfg, gqa16_prefill_v3_kernel<Mode, true, kBlock64>,
         q, kv, gate, fp8_scale, out, bt, seqlen_q, q_offset, scale_log2,
         q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
   }
-  gqa16_prefill_v3_kernel<Mode, false><<<grid, block, 0, st>>>(
+  gqa16_prefill_v3_kernel<Mode, false, kBlock64><<<grid, block, 0, st>>>(
       q, kv, gate, fp8_scale, out, bt, seqlen_q, q_offset, scale_log2,
       q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
   return cudaGetLastError();
@@ -3128,7 +3139,7 @@ extern "C" int muse_gqa16_prefill(
     void* cuda_stream) {
   if (!q_ptr || !kv_ptr || !out_ptr || !block_table_ptr ||
       seqlen_q <= 0 || (seqlen_q & 7) != 0 || q_offset < 0 || (q_offset & 7) != 0 ||
-      block_size != 16 || mode < 0 || mode > 2) {
+      (block_size != 16 && block_size != 64) || mode < 0 || mode > 2) {
     return 1;
   }
   const bool use_scale_mode3 = ((scale_mode & 3) == 3);
@@ -3145,21 +3156,40 @@ extern "C" int muse_gqa16_prefill(
   const auto* fp8_scale = static_cast<const float*>(fp8_scale_ptr);
   const auto* bt = static_cast<const int32_t*>(block_table_ptr);
   cudaError_t err;
-  if (mode == 0) {
-    err = muse_gqa16_pf::launch_prefill_mode<0>(
-        pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
-        seqlen_q, q_offset, scale_log2,
-        q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
-  } else if (mode == 1) {
-    err = muse_gqa16_pf::launch_prefill_mode<1>(
-        pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
-        seqlen_q, q_offset, scale_log2,
-        q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
+  if (block_size == 64) {
+    if (mode == 0) {
+      err = muse_gqa16_pf::launch_prefill_mode<0, true>(
+          pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
+          seqlen_q, q_offset, scale_log2,
+          q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
+    } else if (mode == 1) {
+      err = muse_gqa16_pf::launch_prefill_mode<1, true>(
+          pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
+          seqlen_q, q_offset, scale_log2,
+          q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
+    } else {
+      err = muse_gqa16_pf::launch_prefill_mode<2, true>(
+          pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
+          seqlen_q, q_offset, scale_log2,
+          q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
+    }
   } else {
-    err = muse_gqa16_pf::launch_prefill_mode<2>(
-        pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
-        seqlen_q, q_offset, scale_log2,
-        q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
+    if (mode == 0) {
+      err = muse_gqa16_pf::launch_prefill_mode<0, false>(
+          pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
+          seqlen_q, q_offset, scale_log2,
+          q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
+    } else if (mode == 1) {
+      err = muse_gqa16_pf::launch_prefill_mode<1, false>(
+          pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
+          seqlen_q, q_offset, scale_log2,
+          q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
+    } else {
+      err = muse_gqa16_pf::launch_prefill_mode<2, false>(
+          pdl_prod != 0, grid, block, st, q, kv, gate, fp8_scale, out_ptr, bt,
+          seqlen_q, q_offset, scale_log2,
+          q_tok_stride, q_head_stride, out_tok_stride, stride_block, stride_slot, stride_kv_head);
+    }
   }
   return static_cast<int>(err);
 }

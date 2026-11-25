@@ -50,6 +50,7 @@ _DROP_BF16 = os.environ.get("VLLM_MUSE_GLIMMER_DECODE_DROP_BF16", "1") == "1"
 _RANS_PROLOGUE = os.environ.get("MUSE_RANS_PROLOGUE_FUSE", "1") != "0"
 _MUL_SIGMOID_GLUE = os.environ.get("MUSE_MUL_SIGMOID_GLUE", "1") != "0"
 _OPROJ_SIGMOID_FUSE = os.environ.get("MUSE_OPROJ_SIGMOID_FUSE", "1") != "0"
+_OPROJ_SIGMOID_FUSE_M = os.environ.get("MUSE_OPROJ_SIGMOID_FUSE_M", "1") != "0"
 _MUL_SILU_SLICE_GLUE = os.environ.get("MUSE_MUL_SILU_SLICE_GLUE", "1") != "0"
 _REQUANT = "triton_poi_fused__to_copy_clamp_mul_reciprocal_0"
 _REQUANT_BODY = "f7a07e4acde4818e0fe4bcb2f62a211fa163724414f5efcce3d93ee433b8300f"
@@ -83,7 +84,8 @@ _pending_gate_up_swiglu = None  # (out_ptr, sw_entry, fused_launched, check_args
 _expect_down_swiglu = None      # (triton_out_ptr, swiglu_view, down_gs_ptr)
 _swiglu_gu_counts = Counter()
 _pending_oproj_sigmoid = None   # (out_ptr, gate, attn, skipped)
-_oproj_fuse_state = "unchecked"  # "unchecked" -> "admitted" | "rejected"
+_oproj_fuse_state = "unchecked"    # M=1: "unchecked" -> "admitted" | "rejected"
+_oproj_fuse_m_state = "unchecked"  # M=2..8: "unchecked" -> "admitted" | "rejected"
 _oproj_sig_counts = Counter()
 
 
@@ -96,44 +98,63 @@ def consume_oproj_sigmoid(
     global_scale: torch.Tensor,
     workspace: torch.Tensor,
 ) -> torch.Tensor | None:
-    global _pending_oproj_sigmoid, _oproj_fuse_state
+    global _pending_oproj_sigmoid, _oproj_fuse_state, _oproj_fuse_m_state
     if _pending_oproj_sigmoid is None:
         return None
     ptr, gate, attn, skipped = _pending_oproj_sigmoid
     _pending_oproj_sigmoid = None
     import muse_marlin6_gemv as _m6
 
-    if x.data_ptr() != ptr or gs_ptr not in _m6._GATED_OPROJ:
+    is_m = x.ndim == 2 and 1 < x.shape[0] <= 8 and x.shape[1] == _m6.OPROJ_K
+    allowed = _m6._GATED_OPROJ_M if is_m else _m6._GATED_OPROJ
+    if x.data_ptr() != ptr or gs_ptr not in allowed or gate.numel() != x.numel() or attn.numel() != x.numel():
         if skipped:
             raise RuntimeError("muse_glimmer_norm_glue: skipped mul_sigmoid did not reach expected NVFP4 o_proj")
-        _oproj_fuse_state = "rejected"
+        if is_m:
+            _oproj_fuse_m_state = "rejected"
+        else:
+            _oproj_fuse_state = "rejected"
         del gate, attn
         return None
     out_shape = (*x.shape[:-1], _m6.OPROJ_N)
+    launch_fn = _m6.launch_oproj_gated6_m if is_m else _m6.launch_oproj_gated6
     if not skipped:
         if torch.cuda.is_current_stream_capturing():
             del gate, attn
             return None
         try:
             ref = _m6.decode_linear6(x, tiled_weight, scales6, palette, global_scale, workspace, _m6.OPROJ_N, _m6.OPROJ_K, False)
-            got = _m6.launch_oproj_gated6(gate, attn, tiled_weight, scales6, palette, global_scale, workspace, out_shape)
+            got = launch_fn(gate, attn, tiled_weight, scales6, palette, global_scale, workspace, out_shape)
             torch.cuda.synchronize(x.device)
             if torch.equal(got.view(torch.int16), ref.view(torch.int16)) and int(torch.count_nonzero(workspace).item()) == 0:
-                _oproj_fuse_state = "admitted"
-                _oproj_sig_counts["admitted"] += 1
-                logger.info("Decode6 o_proj fused mul_sigmoid prologue: live forward admitted bitwise")
+                if is_m:
+                    _oproj_fuse_m_state = "admitted"
+                    _oproj_sig_counts["admitted_m"] += 1
+                    logger.info("Decode6 o_proj fused mul_sigmoid M=2..8 prologue: live forward admitted bitwise (m=%d)", int(x.shape[0]))
+                else:
+                    _oproj_fuse_state = "admitted"
+                    _oproj_sig_counts["admitted"] += 1
+                    logger.info("Decode6 o_proj fused mul_sigmoid prologue: live forward admitted bitwise")
+            else:
+                if is_m:
+                    _oproj_fuse_m_state = "rejected"
+                    _oproj_sig_counts["rejected_m"] += 1
+                else:
+                    _oproj_fuse_state = "rejected"
+                    _oproj_sig_counts["rejected"] += 1
+            del gate, attn
+            return ref
+        except Exception:
+            if is_m:
+                _oproj_fuse_m_state = "rejected"
+                _oproj_sig_counts["rejected_m"] += 1
             else:
                 _oproj_fuse_state = "rejected"
                 _oproj_sig_counts["rejected"] += 1
             del gate, attn
-            return ref
-        except Exception:
-            _oproj_fuse_state = "rejected"
-            _oproj_sig_counts["rejected"] += 1
-            del gate, attn
             return None
-    out = _m6.launch_oproj_gated6(gate, attn, tiled_weight, scales6, palette, global_scale, workspace, out_shape)
-    _oproj_sig_counts["fused_launches"] += 1
+    out = launch_fn(gate, attn, tiled_weight, scales6, palette, global_scale, workspace, out_shape)
+    _oproj_sig_counts["fused_launches_m" if is_m else "fused_launches"] += 1
     del gate, attn
     return out
 
@@ -256,25 +277,49 @@ def consume_rans_prologue(
     return out
 
 
+def _flush_gqa16_prefill(stream=None) -> None:
+    try:
+        import muse_gqa16_attn as _gqa
+        if _gqa._pending_prefill is not None:
+            _gqa.flush_pending_prefill(stream)
+    except Exception:
+        pass
+
+
+def _consume_gqa16_prefill(attn, gate, out, fp8_scale=None, stream=None) -> bool:
+    try:
+        import muse_gqa16_attn as _gqa
+        if _gqa._pending_prefill is not None:
+            return _gqa.consume_prefill_mul_sigmoid(attn, gate, out, fp8_scale, stream)
+    except Exception:
+        pass
+    return False
+
+
 class _MulSigmoidSwap:
     def __init__(self) -> None:
         self.state = "unchecked"
 
     def run(self, kernel, orig_run, args, kwargs):
-        global _pending_oproj_sigmoid, _oproj_fuse_state
+        global _pending_oproj_sigmoid, _oproj_fuse_state, _oproj_fuse_m_state
         if kwargs.get("benchmark_run", False):
             return orig_run(kernel, *args, **kwargs)
         if _pending_oproj_sigmoid is not None:
             if _pending_oproj_sigmoid[3]:
                 raise RuntimeError("muse_glimmer_norm_glue: skipped mul_sigmoid was never consumed by o_proj")
-            _oproj_fuse_state = "rejected"
+            if _pending_oproj_sigmoid[1].numel() > 4096:
+                _oproj_fuse_m_state = "rejected"
+            else:
+                _oproj_fuse_state = "rejected"
             _pending_oproj_sigmoid = None
         if self.state == "rejected" or len(args) != 4:
+            _flush_gqa16_prefill(kwargs.get("stream"))
             return orig_run(kernel, *args, **kwargs)
         gate, attn, out, numel = args
         try:
             n_el = int(numel)
         except Exception:
+            _flush_gqa16_prefill(kwargs.get("stream"))
             return orig_run(kernel, *args, **kwargs)
         stream = kwargs.get("stream")
         if (
@@ -292,10 +337,12 @@ class _MulSigmoidSwap:
                 for t in (gate, attn, out)
             )
         ):
+            _flush_gqa16_prefill(stream)
             return orig_run(kernel, *args, **kwargs)
         import muse_norm_glue as G
 
         if self.state == "unchecked":
+            _flush_gqa16_prefill(stream)
             if torch.cuda.is_current_stream_capturing():
                 return orig_run(kernel, *args, **kwargs)
             ok = False
@@ -331,6 +378,8 @@ class _MulSigmoidSwap:
                 except Exception:
                     pass
             return None
+        if n_el > 4096 and _consume_gqa16_prefill(attn, gate, out, None, stream):
+            return None
         if _OPROJ_SIGMOID_FUSE and _oproj_fuse_state != "rejected" and n_el == 4096:
             try:
                 import muse_marlin6_gemv as _m6
@@ -345,6 +394,20 @@ class _MulSigmoidSwap:
                         return None
             except Exception:
                 _oproj_fuse_state = "rejected"
+        elif _OPROJ_SIGMOID_FUSE_M and _oproj_fuse_m_state != "rejected" and 8192 <= n_el <= 8 * 4096:
+            try:
+                import muse_marlin6_gemv as _m6
+                if getattr(_m6, "_ALL_OPROJ_GATED_M_READY", False):
+                    if _oproj_fuse_m_state == "admitted":
+                        _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, True)
+                        _oproj_sig_counts["skipped_m"] += 1
+                        return None
+                    if _oproj_fuse_m_state == "unchecked" and not torch.cuda.is_current_stream_capturing():
+                        G.mul_sigmoid_bf16(gate, attn, out, n_el, stream)
+                        _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, False)
+                        return None
+            except Exception:
+                _oproj_fuse_m_state = "rejected"
         G.mul_sigmoid_bf16(gate, attn, out, n_el, stream)
         return None
 
@@ -507,6 +570,7 @@ class _RansPrologueHook:
         import muse_norm_glue as G
 
         if self.fp8_glue_state == "unchecked":
+            _flush_gqa16_prefill(stream)
             if torch.cuda.is_current_stream_capturing():
                 return False
             ok = False
@@ -535,6 +599,8 @@ class _RansPrologueHook:
             self.fp8_glue_state = "admitted" if ok else "rejected"
             logger.info("Prefill mul_sigmoid_fp8 glue: %s", self.fp8_glue_state)
             return True
+        if _consume_gqa16_prefill(attn, gate, out, scale, stream):
+            return True
         G.mul_sigmoid_fp8(gate, attn, scale, out, n_el, stream)
         return True
 
@@ -545,24 +611,32 @@ class _RansPrologueHook:
         if _pending_rans_prologue is not None:
             if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
                 return None
+            if self.act_mode == 1:
+                _flush_gqa16_prefill(kwargs.get("stream"))
             return orig_run(kernel, *args, **kwargs)
         try:
             import muse_rans_ext as _rans
             if not hasattr(_rans, "rans_gemv_fused_auto"):
                 if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
                     return None
+                if self.act_mode == 1:
+                    _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
         except Exception:
             if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
                 return None
+            if self.act_mode == 1:
+                _flush_gqa16_prefill(kwargs.get("stream"))
             return orig_run(kernel, *args, **kwargs)
         if self.act_mode == 1:
             if len(args) != 5:
+                _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
             gate, attn, scale, out, numel = args
             try:
                 n_el = int(numel)
             except Exception:
+                _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
             max_m_fuse = 8 if hasattr(_rans, "rans_gemm_m_fused_auto") else 1
             if (
@@ -578,6 +652,7 @@ class _RansPrologueHook:
             ):
                 if self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
                     return None
+                _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
             x0, x1 = gate, attn
         else:
