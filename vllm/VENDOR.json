@@ -230,6 +230,14 @@
     {
       "file": "harness/kernels/decode6/{gemv6.cu,gemv6_tma4.cu,marlin/dequant.h,marlin/marlin_template.h,muse_marlin6_gemv.py}",
       "why": "Wave-29a strict 0-ULP Decode6 co-residency, scale pre-dequantization, and M=1 reduction optimizations: (1) switch all 18 NVFP4 attention output_gate_proj (4096x6656) decode launches from 24-CTA GateV48 (101 KiB SMEM, 24 idle SMs) to 48-CTA TileN=128 256-thread Stages=3 TMA4-ILV with dynamic SMEM capped at 48 KiB (MUSE_NV6_GATE_BLOCKS=48 default, 0/24 restores GateV48; MUSE_NV6_GATE_S3=0 restores Stages=4), eliminating 24-SM starvation while co-residing alongside both 16-CTA sliding-window and 8-CTA full-attention gqa16_decode on SM121 with zero preemption; (2) signed-safe 64-entry BF16 shared-memory scale palette sh_pal16 (MUSE_TMA4_PAL16=1 default, 0 disables; adapted from SP5D's published Yukon submissions bf840d51-f7de-463e-ac2a-5cf07c2e9400, commit 92b4f1ed02a72bd61399439d0b0465aa11cfa3a7, and 284a0f10-661e-4123-91db-5da6356cc6a0, commit bbbb81fcc568b1eff11b8f2b8e928ae7ba008b53) converting all 8-bit FP8/S0E5M3 scale bytes (including >= 0x80) into lane-permuted BF16 inside tma_decode over a 4-stage scale ring and eliding all per-subtile dequant_fp8_scales ALU in matmul across TMA4-ILV gate_up_swiglu, down_proj, qkv, output_gate, and gated o_proj, plus 1-instruction LOP3 FP4->BF16 unpack in dequant.h (from SP5D bf840d51); and (3) M=1 row-0 pruned thread_block_reduce, global_reduce_fp32, write_result, and compact sh_a/sh_red/sh_a_gated shared-memory layout (adapted from SP5D 284a0f10 while preserving FragC layout for all fused epilogues, 0 spills, 0 odd-UR, verified 0-ULP bitwise per layer)."
+    },
+    {
+      "file": "vllm/v1/worker/gpu/prefill_graph.py, vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/dflash/speculator.py",
+      "why": "Enable the 512-token whole-forward prefill CUDA graph (including zero-prep replay) when DFlash auxiliary hidden states are enabled, skip the DFlash drafter on max_tokens == 1 batches in the V2 GPU model runner (matching V1's _drafts_can_be_verified), and skip redundant eager Python attention-metadata and slot-mapping construction on FULL CUDA graph replays for both the target verify step and DFlash draft step."
+    },
+    {
+      "file": "vllm/v1/worker/gpu/model_runner.py",
+      "why": "bs=1 speculative-decode host cuts: one-request draft steps read query_start_loc, cu_num_logits, expanded_idx_mapping and expanded_local_pos from read-only tensors built once in load_model (same contents) instead of a pin + H2D copy and an expand kernel per step, and the per-step draft-token gather handed to DraftTokensHandler is skipped when no structured-output request needs its contents (only its shape is read)."
     }
   ],
   "carried_from": {

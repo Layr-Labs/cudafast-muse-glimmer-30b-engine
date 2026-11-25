@@ -409,6 +409,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             + self.model_state.num_new_sampled_tokens_per_step
         )
 
+        # LOCAL PATCH (bs=1 spec-decode host cut): constant one-request metadata
+        # for draft steps of 1..decode_query_len tokens, built once here so a
+        # step reads it instead of a pin + H2D copy (query_start_loc,
+        # cu_num_logits) and an expand kernel. Only read downstream.
+        _n_max = self.decode_query_len
+        for _nt in range(1, _n_max + 1):
+            if _nt not in self._qsl_const_gpu:
+                self._qsl_const_gpu[_nt] = torch.tensor(
+                    [0] + [_nt] * self.max_num_reqs,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+        self._spec_cu_logits_np = [
+            np.array([0, _n], dtype=np.int32) for _n in range(_n_max + 1)
+        ]
+        self._spec_cu_logits_gpu = torch.tensor(
+            [[0, _n] for _n in range(_n_max + 1)],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._spec_local_pos_gpu = torch.arange(
+            _n_max, dtype=torch.int32, device=self.device
+        )
+        self._spec_idx_rep_gpu = (
+            self._req_idx_gpu[:, None].expand(-1, _n_max).contiguous()
+        )
+
         # Initialize samplers. Model states may override via custom_sampler().
         if self.is_last_pp_rank and not self.is_pooling_model:
             self.sampler = Sampler(
@@ -1070,16 +1097,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
-            num_logits = num_draft_tokens_per_req + num_bonus_tokens
-            cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
-            cu_num_logits_np[0] = 0
-            np.cumsum(num_logits, out=cu_num_logits_np[1:])
-            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
-
-            max_expand_len = self.decode_query_len
-            expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
-                idx_mapping, total_num_logits, cu_num_logits, max_expand_len
+            # LOCAL PATCH (bs=1 spec-decode host cut): a one-request draft step's
+            # logits metadata is [0, n], full(n, req_idx) and arange(n) for
+            # n = total_num_logits; serve read-only cached copies instead of a
+            # pin + H2D copy, two allocations and an expand kernel every step.
+            spec_meta = (
+                self._spec_logits_meta_1(int(idx_mapping_np[0]), total_num_logits)
+                if num_reqs == 1
+                else None
             )
+            if spec_meta is not None:
+                (
+                    cu_num_logits_np,
+                    cu_num_logits,
+                    expanded_idx_mapping,
+                    expanded_local_pos,
+                ) = spec_meta
+            else:
+                num_logits = num_draft_tokens_per_req + num_bonus_tokens
+                cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+                cu_num_logits_np[0] = 0
+                np.cumsum(num_logits, out=cu_num_logits_np[1:])
+                cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+
+                max_expand_len = self.decode_query_len
+                expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+                    idx_mapping, total_num_logits, cu_num_logits, max_expand_len
+                )
 
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
@@ -1205,6 +1249,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_lens=prompt_lens,
         )
         return pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
+
+    def _spec_logits_meta_1(
+        self, req_idx: int, n: int
+    ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        # Cached (cu_num_logits_np, cu_num_logits, expanded_idx_mapping,
+        # expanded_local_pos) for one request at state index req_idx with n
+        # logits; identical in content to the cumsum/expand_idx_mapping path.
+        idx_rep = getattr(self, "_spec_idx_rep_gpu", None)
+        if (
+            idx_rep is None
+            or not 0 <= req_idx < idx_rep.shape[0]
+            or not 1 <= n <= idx_rep.shape[1]
+        ):
+            return None
+        return (
+            self._spec_cu_logits_np[n],
+            self._spec_cu_logits_gpu[n],
+            idx_rep[req_idx, :n],
+            self._spec_local_pos_gpu[:n],
+        )
 
     def prepare_attn(
         self, input_batch: InputBatch
@@ -1633,8 +1697,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or self.use_dcp
             or self.use_pp
             or self.model_config.rswa_window is not None
-            or self.use_aux_hidden_state_outputs
-            or self.speculator is not None
             or not self.supports_mm_inputs
             or self.model.requires_raw_input_tokens
             or self.block_tables.cp_size != 1
@@ -1894,12 +1956,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.kv_cache_config,
                     self.req_states.num_computed_tokens.gpu,
                 )
+                if self.use_aux_hidden_state_outputs:
+                    assert isinstance(model_output, tuple)
+                    zp_hidden_states, zp_aux_hidden_states = model_output
+                else:
+                    assert isinstance(model_output, torch.Tensor)
+                    zp_hidden_states = model_output
+                    zp_aux_hidden_states = None
                 self.execute_model_state = ExecuteModelState(
                     input_batch=input_batch,
                     attn_metadata=None,
                     slot_mappings_by_layer=None,
-                    hidden_states=model_output,
-                    aux_hidden_states=None,
+                    hidden_states=zp_hidden_states,
+                    aux_hidden_states=zp_aux_hidden_states,
                     finished_req_ids=scheduler_output.finished_req_ids,
                     compact_sample=pg.final_sample_tile,
                 )
@@ -2052,7 +2121,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_eager_attn_meta = fast_prefill_replay or (
             not dummy_run
             and batch_desc.cg_mode == CUDAGraphMode.FULL
-            and self.speculator is None
+            and (
+                self.speculator is None
+                or (
+                    self.speculative_config is not None
+                    and self.speculative_config.method == "dflash"
+                )
+            )
             and self.cudagraph_manager is not None
             and batch_desc in self.cudagraph_manager.graphs
         )
@@ -2498,37 +2573,49 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         if self.speculator is not None:
-            assert self.sampler is not None
-            # Let the target override the hidden state fed to the drafter
-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
-            # target returns a persistent buffer sized at max_num_batched_tokens;
-            # slice to the active token count that propose() expects.
-            spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            draft_tokens = self.speculator.propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings_by_layer,
-                spec_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                self.req_states.last_sampled_tokens,
-                self.req_states.next_prefill_tokens,
-                self.sampler.sampling_states.temperature.gpu,
-                self.sampler.sampling_states.seeds.gpu,
-                mm_inputs=mm_inputs,
+            req_ids = input_batch.req_ids
+            idx_np = input_batch.idx_mapping_np
+            skip_draft = len(req_ids) > 0 and all(
+                int(self.req_states.max_seq_len[idx_np[i]])
+                <= int(self.req_states.prompt_len.np[idx_np[i]]) + 1
+                for i in range(len(req_ids))
             )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-
+            if not skip_draft:
+                assert self.sampler is not None
+                # Let the target override the hidden state fed to the drafter
+                # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
+                # target returns a persistent buffer sized at max_num_batched_tokens;
+                # slice to the active token count that propose() expects.
+                spec_hidden_states = hidden_states
+                if hasattr(self.model, "get_mtp_target_hidden_states"):
+                    pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                draft_tokens = self.speculator.propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings_by_layer,
+                    spec_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    self.req_states.last_sampled_tokens,
+                    self.req_states.next_prefill_tokens,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    mm_inputs=mm_inputs,
+                )
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
+            # LOCAL PATCH (bs=1 spec-decode host cut): without structured-output
+            # requests set_draft_tokens reads only shape[1] of this tensor, so
+            # skip the per-step gather (index kernel + allocation) there.
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                self.req_states.draft_tokens[input_batch.idx_mapping]
+                if input_batch.has_structured_output_reqs
+                else self.req_states.draft_tokens[:0],
             )
 
         # Post-step KV connector related operations.
