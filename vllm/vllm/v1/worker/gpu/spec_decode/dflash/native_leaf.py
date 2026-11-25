@@ -61,6 +61,9 @@ TREE_MAX_DEPTH = max(1, min(6, int(os.environ.get("MUSE_TREE_MAX_DEPTH", "6"))))
 TREE_SUB_COEF = float(os.environ.get("MUSE_TREE_SUB_COEF", "0.55"))
 TREE_SHF_COEF = float(os.environ.get("MUSE_TREE_SHF_COEF", "0.20"))
 TREE_CONT_DECAY = float(os.environ.get("MUSE_TREE_CONT_DECAY", "0.88"))
+TREE_ADAPT_GAMMA = os.environ.get("MUSE_TREE_ADAPT_GAMMA", "1").strip() not in ("0", "", "false", "no")
+TREE_CALIB = os.environ.get("MUSE_TREE_CALIB", "1").strip() not in ("0", "", "false", "no")
+TREE_HIGH_ACC_CPC = float(os.environ.get("MUSE_TREE_HIGH_ACC_CPC", "0"))
 LEAF_STATS = os.environ.get("MUSE_LEAF_STATS", "0").strip() in ("1", "true", "yes")
 _ST_RAW = os.environ.get("MUSE_NATIVE_LEAF_SELFTEST", "0").strip().lower()
 SELFTEST = 1 if _ST_RAW in ("1", "true", "yes") else (2 if _ST_RAW == "2" else 0)
@@ -388,9 +391,9 @@ def init_kv_table(
             _S._atexit_registered = True
             atexit.register(_dump_stats, "atexit")
     logger.info(
-        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, dynamic=%d [depth<=%d,T=%.2f,tail=%.1f,g=%.2f,sub=%.2f,shf=%.2f,cont=%.2f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d, stats=%d)",
-        _S.num_layers, _S.tree_m_ready, int(TREE_DYNAMIC), TREE_MAX_DEPTH, TREE_TEMP, TREE_TAIL, TREE_GAMMA,
-        TREE_SUB_COEF, TREE_SHF_COEF, TREE_CONT_DECAY,
+        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, dynamic=%d [calib=%d,depth<=%d,T=%.2f,tail=%.1f,g=%.2f,adapt=%d,sub=%.2f,shf=%.2f,cont=%.2f,hi_cpc=%.1f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d, stats=%d)",
+        _S.num_layers, _S.tree_m_ready, int(TREE_DYNAMIC), int(TREE_CALIB), TREE_MAX_DEPTH, TREE_TEMP, TREE_TAIL, TREE_GAMMA,
+        int(TREE_ADAPT_GAMMA), TREE_SUB_COEF, TREE_SHF_COEF, TREE_CONT_DECAY, TREE_HIGH_ACC_CPC,
         int(_S.m8_ready), _POLICY_RAW, MARGIN_ALPHA, LOW_THRESH, int(SELFTEST), int(NOHIT), int(LEAF_STATS),
     )
     return True

@@ -136,6 +136,46 @@ __device__ __forceinline__ uint4 ld16_cs(const uint4* ptr) {
   return r;
 }
 
+// 16B coalesced load/store via even-lane uint4 + warp-pair shuffle (0-ULP identical per-thread uint2
+// layout to ld8/st8; safe inside chunk_valid(c) because chunk 6 active set [0..127] is 4 full warps).
+__device__ __forceinline__ uint2 ld8_v4(const __nv_bfloat16* base, int c) {
+  uint4 v = make_uint4(0u, 0u, 0u, 0u);
+  const int even_t = threadIdx.x & ~1;
+  if ((threadIdx.x & 1) == 0) {
+    v = *reinterpret_cast<const uint4*>(base + c * 1024 + even_t * 4);
+  }
+  const uint32_t hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
+  const uint32_t hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
+  return ((threadIdx.x & 1) == 0) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+}
+
+__device__ __forceinline__ uint2 ldg8_v4(const __nv_bfloat16* base, int c) {
+  uint4 v = make_uint4(0u, 0u, 0u, 0u);
+  const int even_t = threadIdx.x & ~1;
+  if ((threadIdx.x & 1) == 0) {
+    v = __ldg(reinterpret_cast<const uint4*>(base + c * 1024 + even_t * 4));
+  }
+  const uint32_t hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
+  const uint32_t hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
+  return ((threadIdx.x & 1) == 0) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+}
+
+__device__ __forceinline__ void st8_v4(__nv_bfloat16* base, int c, uint2 val) {
+  const uint32_t odd_x = __shfl_xor_sync(0xffffffffu, val.x, 1);
+  const uint32_t odd_y = __shfl_xor_sync(0xffffffffu, val.y, 1);
+  if ((threadIdx.x & 1) == 0) {
+    *reinterpret_cast<uint4*>(base + c * 1024 + threadIdx.x * 4) =
+        make_uint4(val.x, val.y, odd_x, odd_y);
+  }
+}
+
+__device__ __forceinline__ void st4_v2(uint8_t* base, int c, uint32_t val) {
+  const uint32_t odd_v = __shfl_xor_sync(0xffffffffu, val, 1);
+  if ((threadIdx.x & 1) == 0) {
+    *reinterpret_cast<uint2*>(base + c * 1024 + threadIdx.x * 4) = make_uint2(val, odd_v);
+  }
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Post-attention norm + residual + pre-feedforward norm (compiled ..._mean_mul_pow_rsqrt_1 and the FP8 variant
 // ..._clamp_..._reciprocal_rsqrt_1):
@@ -333,30 +373,24 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
   const __nv_bfloat16* d = d_all + row * kHidden;
   const __nv_bfloat16* res = res_all + row * kHidden;
   uint2 ud[kChunks], uf[kChunks], ui[kChunks];
-  uint2 ux[kChunks], ur[kChunks], uw[kChunks];
   float h1_pre[kChunks][4];
-  float a = 0.f;
   float inv_scale = 0.f;
   float gate_inv = 0.f;
   if constexpr (kPdl) {
-    const float s_x = sumsq_x[row];
+    const float s_x = __ldg(sumsq_x + row);
+    const float a = inv_rms(s_x, 1e-08f);
+    if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
+    if constexpr (kGateOut) gate_inv = full_divide(1.0f, __ldg(gate_scale));
+    // Precompute h1_pre chunk-by-chunk before pdl_wait() so ux/ur/uw never consume live regs post-wait.
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) {
-        ux[c] = ld8(x, c);
-        ur[c] = ld8(res, c);
-        uw[c] = ld8(w_post, c);
-        uf[c] = ld8(w_ff, c);
-        ui[c] = ld8(w_in, c);
-      }
-    }
-    a = inv_rms(s_x, 1e-08f);
-    if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(*scale);
-    if constexpr (kGateOut) gate_inv = full_divide(1.0f, *gate_scale);
-#pragma unroll
-    for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) {
-        Row4 xv = unpack(ux[c]), rv = unpack(ur[c]), wv = unpack(uw[c]);
+        const uint2 uxc = ld8_v4(x, c);
+        const uint2 urc = ld8_v4(res, c);
+        const uint2 uwc = ldg8_v4(w_post, c);
+        uf[c] = ldg8_v4(w_ff, c);
+        ui[c] = ldg8_v4(w_in, c);
+        Row4 xv = unpack(uxc), rv = unpack(urc), wv = unpack(uwc);
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
           const float t1 = __fmul_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f));
@@ -368,21 +402,27 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
     pdl_launch_dependents();
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) ud[c] = ld8(d, c);
+      if (chunk_valid(c)) ud[c] = ld8_v4(d, c);
     }
   } else {
+    const float a = inv_rms(__ldg(sumsq_x + row), 1e-08f);
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) {
-        ud[c] = ld8(d, c);
-        ux[c] = ld8(x, c);
-        ur[c] = ld8(res, c);
-        uw[c] = ld8(w_post, c);
-        uf[c] = ld8(w_ff, c);
-        ui[c] = ld8(w_in, c);
+        ud[c] = ld8_v4(d, c);
+        const uint2 uxc = ld8_v4(x, c);
+        const uint2 urc = ld8_v4(res, c);
+        const uint2 uwc = ldg8_v4(w_post, c);
+        uf[c] = ldg8_v4(w_ff, c);
+        ui[c] = ldg8_v4(w_in, c);
+        Row4 xv = unpack(uxc), rv = unpack(urc), wv = unpack(uwc);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const float t1 = __fmul_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f));
+          h1_pre[c][e] = __fadd_rn(rv.v[e], t1);
+        }
       }
     }
-    a = inv_rms(sumsq_x[row], 1e-08f);
   }
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -402,31 +442,23 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
     if (chunk_valid(c)) {
       Row4 dv = unpack(ud[c]), fv = unpack(uf[c]);
       float h2[4];
-      if constexpr (kPdl) {
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
-          h2[e] = __fmaf_rn(__fmul_rn(cd, dv.v[e]), __fadd_rn(fv.v[e], 1.0f), h1_pre[c][e]);
-          acc2[e] = __fmaf_rn(h2[e], h2[e], acc2[e]);
-        }
-      } else {
-        Row4 xv = unpack(ux[c]), rv = unpack(ur[c]), wv = unpack(uw[c]);
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-          const float t1 = __fmul_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f));
-          const float h1 = __fadd_rn(rv.v[e], t1);
-          h2[e] = __fmaf_rn(__fmul_rn(cd, dv.v[e]), __fadd_rn(fv.v[e], 1.0f), h1);
-          acc2[e] = __fmaf_rn(h2[e], h2[e], acc2[e]);
-        }
+      for (int e = 0; e < 4; ++e) {
+        h2[e] = __fmaf_rn(__fmul_rn(cd, dv.v[e]), __fadd_rn(fv.v[e], 1.0f), h1_pre[c][e]);
+        acc2[e] = __fmaf_rn(h2[e], h2[e], acc2[e]);
       }
       hb[c].x = pack_bf16x2(h2[0], h2[1]);
       hb[c].y = pack_bf16x2(h2[2], h2[3]);
-      *reinterpret_cast<uint2*>(x + c * 1024 + threadIdx.x * 4) = hb[c];
+      st8_v4(x, c, hb[c]);
     }
   }
   const float s_h = row_sum(acc2, red[1]);
   const float e_r = inv_rms(s_h, 1e-05f);
-  if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(*scale);
-  if constexpr (!kPdl && kGateOut) gate_inv = full_divide(1.0f, *gate_scale);
+  if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
+  if constexpr (!kPdl && kGateOut) gate_inv = full_divide(1.0f, __ldg(gate_scale));
+  __nv_bfloat16* const out_bf16_row = kWriteBf16 ? (out_bf16_all + row * kHidden) : nullptr;
+  uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
+  uint8_t* const out_gate_row = kGateOut ? (out_gate_all + row * kHidden) : nullptr;
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
@@ -434,23 +466,22 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
       float y[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) y[e] = __fmul_rn(__fmul_rn(e_r, hv.v[e]), __fadd_rn(iv.v[e], 1.0f));
-      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
       uint2 o;
       o.x = pack_bf16x2(y[0], y[1]);
       o.y = pack_bf16x2(y[2], y[3]);
       if constexpr (kWriteBf16) {
-        *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
+        st8_v4(out_bf16_row, c, o);
       }
       if constexpr (kFp8Out) {
         uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
                      (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
-        *reinterpret_cast<uint32_t*>(out_fp8_all + off) = q;
+        st4_v2(out_fp8_row, c, q);
       }
       if constexpr (kGateOut) {
         const float g0 = bf_lo(o.x), g1 = bf_hi(o.x), g2 = bf_lo(o.y), g3 = bf_hi(o.y);
         uint32_t gq = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g0)), clamp448(__fmul_rn(gate_inv, g1)))) |
                       (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g2)), clamp448(__fmul_rn(gate_inv, g3)))) << 16);
-        *reinterpret_cast<uint32_t*>(out_gate_all + off) = gq;
+        st4_v2(out_gate_row, c, gq);
       }
     }
   }
@@ -648,6 +679,30 @@ __global__ void __launch_bounds__(128) mul_silu_slice_bf16_kernel(
     ow[i] = pack_bf16x2(__fmul_rn(triton_silu(gl), ul), __fmul_rn(triton_silu(gh), uh));
   }
   out_all[row * kInterVec8 + col] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
+}
+
+__global__ void __launch_bounds__(128) mul_silu_slice_fp8_kernel(
+    const uint4* __restrict__ gu_all, const float* __restrict__ scale, uint2* __restrict__ out_all) {
+  const int col = blockIdx.x * 128 + threadIdx.x;
+  if (col >= kInterVec8) return;
+  const float inv_s = full_divide(1.0f, __ldg(scale));
+  const size_t row = blockIdx.y;
+  const uint4* gu = gu_all + row * (2 * kInterVec8);
+  const uint4 g = ld16_cs(gu + col);
+  const uint4 u = ld16_cs(gu + col + kInterVec8);
+  const uint32_t gw[4] = {g.x, g.y, g.z, g.w}, uw[4] = {u.x, u.y, u.z, u.w};
+  uint16_t ow[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float gl = bf_lo(gw[i]), gh = bf_hi(gw[i]);
+    const float ul = bf_lo(uw[i]), uh = bf_hi(uw[i]);
+    const float ql = clamp448(__fmul_rn(__fmul_rn(triton_silu(gl), ul), inv_s));
+    const float qh = clamp448(__fmul_rn(__fmul_rn(triton_silu(gh), uh), inv_s));
+    ow[i] = fp8x2(ql, qh);
+  }
+  const uint32_t lo = static_cast<uint32_t>(ow[0]) | (static_cast<uint32_t>(ow[1]) << 16);
+  const uint32_t hi = static_cast<uint32_t>(ow[2]) | (static_cast<uint32_t>(ow[3]) << 16);
+  out_all[row * kInterVec8 + col] = make_uint2(lo, hi);
 }
 
 // Layer-51 final post-FF norm + residual + model.norm (compiled bf5b0726...):
@@ -1292,6 +1347,14 @@ int muse_norm_glue_mul_silu_slice_bf16(const void* gu, void* out, int rows, cuda
   const dim3 grid((kInterVec8 + 127) / 128, static_cast<unsigned>(rows));
   mul_silu_slice_bf16_kernel<<<grid, 128, 0, stream>>>(
       static_cast<const uint4*>(gu), static_cast<uint4*>(out));
+  return static_cast<int>(cudaGetLastError());
+}
+
+int muse_norm_glue_mul_silu_slice_fp8(const void* gu, const void* scale, void* out, int rows, cudaStream_t stream) {
+  if (rows <= 0) return -1;
+  const dim3 grid((kInterVec8 + 127) / 128, static_cast<unsigned>(rows));
+  mul_silu_slice_fp8_kernel<<<grid, 128, 0, stream>>>(
+      static_cast<const uint4*>(gu), static_cast<const float*>(scale), static_cast<uint2*>(out));
   return static_cast<int>(cudaGetLastError());
 }
 

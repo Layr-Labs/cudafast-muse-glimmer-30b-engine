@@ -134,7 +134,7 @@ __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* map, int 
 // int4 / int offsets of its codes and scales inside a stage, to which 4 b_row / s_row per k16 row are added.
 // A CTA may run several tiles back to back (kTilesPerCta): q0 is the position of this tile's first k-tile in the CTA's
 // k-tile stream of length `total`, and the copies keep running across the tile boundary.
-template <int MB, bool kPdl = false, class Produce, class OnTile>
+template <int MB, bool kPdl = false, bool kPdlProd = false, class Produce, class OnTile>
 __device__ __forceinline__ void k_loop(
     float (&acc)[MB][2][2][4], const int iters, const int b_rd, const int b_row, const int s_rd, const int s_row,
     Produce&& produce, OnTile&& on_tile, const int q0 = 0, const int total_or_0 = 0,
@@ -257,6 +257,9 @@ __device__ __forceinline__ void k_loop(
   const int stop = on_tile(t);
 #pragma unroll 1
   for (; t < stop; t++) {
+    if constexpr (kPdlProd) {
+      if (t == ((iters - 8 > t0) ? (iters - 8) : t0) && q0 + iters == total) pdl_launch_dependents();
+    }
     const int q = q0 + t;
     const int s = q & (kStages - 1);
     const int ns = (q + 1) & (kStages - 1);
@@ -406,10 +409,9 @@ __device__ __forceinline__ void down_tile(
     }
   };
   // codes: int4 (64 g + 32 nb + lane), int2 sh2 of it; scales: int 32 g + 2 (8 nb + lane / 4) + sh2
-  k_loop<MB, (kPdlMode == 2)>(acc, k1, kABytes / 4 + 4 * (32 * nb + lane) + 2 * sh2, 256,
+  k_loop<MB, (kPdlMode == 2), (kPdlMode != 0)>(acc, k1, kABytes / 4 + 4 * (32 * nb + lane) + 2 * sh2, 256,
                               (kABytes + kBBytes) / 4 + 2 * (8 * nb + (lane >> 2)) + sh2, 32, produce, cuts, 0, 0,
                               kLater ? scratch + (size_t)(piece >> 12) * (kThreads * 32) : nullptr, k0);
-  if constexpr (kPdlMode != 0) pdl_launch_dependents();
   __syncthreads();
   {
     const int role = (piece >> 10) & 3;
@@ -651,12 +653,9 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
 #pragma unroll 1
   for (int ti = 0; ti < kTilesPerCta; ti++) {
   const int slice_col = col0 + ti;
-  k_loop<8, (kPdlMode == 2)>(c, kTiles, kABytes / 4 + 4 * (128 * cw + lane) + 2 * jh, 128,
+  k_loop<8, (kPdlMode == 2), (kPdlMode != 0)>(c, kTiles, kABytes / 4 + 4 * (128 * cw + lane) + 2 * jh, 128,
                   (kABytes + kBBytes) / 4 + 64 * cw + 2 * (lane >> 2) + jh, 16, produce, [](int) { return kTiles; }, ti * kTiles,
                   kTilesPerCta * kTiles);
-  if constexpr (kPdlMode != 0) {
-    if (ti + 1 == kTilesPerCta) pdl_launch_dependents();
-  }
   __syncthreads();
 
   // Reduce the two k-warps: P = A0 (kw 0) + A1 (kw 1).

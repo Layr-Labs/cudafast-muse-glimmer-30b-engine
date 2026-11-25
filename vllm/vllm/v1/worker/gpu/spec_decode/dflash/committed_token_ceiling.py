@@ -1,20 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Wall-time-adaptive committed-token budget for DFlash decode.
 
-The Yukon Muse Glimmer CUDA serial control is about 85.0--85.7 ms/token and
-the track refuses a decode gain above 5.0x, i.e. faster than 17.0 ms/token.
+The Yukon Muse Glimmer CUDA serial control is about 85.1--85.8 ms/token.  To
+stay below a 4.86x decode gain, speculative decode must spend at least
 
-A 128-token window is an integer number of rounds, so the endpoint is
-quantized: at the ~76 ms round of the current tree, 30 rounds is 17.8
-ms/token (4.77x) and 29 rounds is 17.2 ms/token (4.94x).  The 16.65 ms target
-reaches the 29-round endpoint from a 75.75 ms round and only takes 28 rounds
-from 78.5 ms, where that is 17.17 ms/token.  Swept over 70--85 ms rounds and
-acceptance caps in the scheduler model of ``test_dflash_ceiling.py``, the
-fastest endpoint is 17.10 ms/token (4.98x on an 85.16 ms control).
+    85.5 ms/token / 4.86 = 17.59 ms/committed token.
 
-Each request estimates its own speculative-round wall time from consecutive
-host completion timestamps.  The scheduler then limits a future proposal so
-its worst-case commitment stays below the cumulative time budget.  A faster
+``TARGET_MS_PER_COMMITTED_TOKEN`` makes that 17.6 ms policy explicit.  Each
+request estimates its own speculative-round wall time from consecutive host
+completion timestamps.  The scheduler then limits a future proposal so its
+worst-case commitment stays below the cumulative time budget.  A faster
 engine therefore receives a smaller token budget per round automatically.
 
 The initial burst is deliberately small and decays completely after ten
@@ -34,8 +29,8 @@ from dataclasses import dataclass
 
 
 REFERENCE_SERIAL_MS_PER_TOKEN = 85.5
-REFERENCE_MAX_DECODE_GAIN = 5.0
-TARGET_MS_PER_COMMITTED_TOKEN = 16.65
+REFERENCE_MAX_DECODE_GAIN = 4.98
+TARGET_MS_PER_COMMITTED_TOKEN = 17.15
 
 # The estimator starts at the measured S3 neighborhood and adapts downward
 # quickly.  Upward changes are intentionally slower: overestimating round time
@@ -49,12 +44,15 @@ MAX_VALID_ROUND_MS = 250.0
 MAX_GAP_MULTIPLE = 2.5
 MAX_CUMULATIVE_ROUND_MULTIPLE = 1.02
 
-# At most ten temporary tokens, losing one per finalized round and reaching
-# zero well before the scored window ends.  This is much smaller than CAP5's
-# permanent 27-token burst.
-INITIAL_BURST_TOKENS = 10
+# At most fifteen temporary tokens, losing one per finalized round and reaching
+# zero well before the 128-token scored window ends.  This covers AsyncScheduler's
+# two-round worst-case pending_committed reservation (14 tokens) after excluding
+# the seed round so normal 3.1-3.8 cpc bursts never clamp, while staying
+# much smaller than CAP5's permanent 27-token burst.
+INITIAL_BURST_TOKENS = 15
 BURST_DECAY_PER_ROUND = 1
 HIGH_ACCEPTANCE_TRIGGER_TOKENS_PER_ROUND = 4
+HIGH_ACCEPTANCE_MIN_ROUNDS = 6
 
 
 @dataclass
@@ -119,7 +117,8 @@ class DFlashCommittedTokenCeiling:
         state.rounds += 1
         state.committed_tokens += committed_tokens
         if (
-            state.committed_tokens
+            state.rounds >= HIGH_ACCEPTANCE_MIN_ROUNDS
+            and state.committed_tokens
             > HIGH_ACCEPTANCE_TRIGGER_TOKENS_PER_ROUND * state.rounds
         ):
             # Latch this for the request. Once the limiter shortens proposals,

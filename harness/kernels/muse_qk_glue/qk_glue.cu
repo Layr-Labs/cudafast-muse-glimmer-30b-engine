@@ -488,6 +488,8 @@ __global__ void qk_norm_rope_kvcache_prefill_kernel(
   }
 
   // Wait for preceding qkv GEMM strictly after all independent loads (slot_mapping, positions, cos_sin_cache).
+  // Do NOT emit griddepcontrol.launch_dependents here: non-PDL consumers (FlashAttention, M=2..6 verify) lack
+  // griddepcontrol.wait and would race on q_out / kv_cache writes.
   if constexpr (kPdl) pdl_wait();
 
   uint2 raw[HPW];

@@ -6,6 +6,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include <tuple>
 #include <vector>
 
 constexpr int CH = 512;   // k chunk
@@ -94,13 +95,26 @@ torch::Tensor bfx_gemm(torch::Tensor x, torch::Tensor lo, torch::Tensor nib, tor
   return out;
 }
 
+#include <tuple>
 torch::Tensor bf16_rans_pack(torch::Tensor W);
 torch::Tensor bf16_rans_unpack(torch::Tensor blob, int64_t N, int64_t K);
 torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int64_t K, int64_t base_exp);
 void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp);
+std::tuple<torch::Tensor, torch::Tensor> bf16_rans_gemm_dual(
+    torch::Tensor x, torch::Tensor blob, int64_t N1, int64_t N2, int64_t K, int64_t base_exp);
+void bf16_rans_gemm_dual_out(
+    torch::Tensor x, torch::Tensor blob, torch::Tensor out1, torch::Tensor out2,
+    int64_t N1, int64_t N2, int64_t K, int64_t base_exp);
 int64_t bf16_rans_base(torch::Tensor blob);
 torch::Tensor int3_pack(torch::Tensor W, bool mse_opt = true);
 torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true);
+torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K);
+torch::Tensor int4_pack(torch::Tensor W, bool mse_opt = true);
+torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+torch::Tensor int4_gemm_aux5(
+    torch::Tensor h0, torch::Tensor h1, torch::Tensor h2, torch::Tensor h3, torch::Tensor h4,
+    torch::Tensor W_packed, int64_t N, int64_t K);
 void dflash_kv_post(
     torch::Tensor all_kv_flat, torch::Tensor positions, torch::Tensor k_norm_w,
     torch::Tensor cos_sin_cache,
@@ -108,6 +122,10 @@ void dflash_kv_post(
     const std::vector<torch::Tensor>& v_caches,
     const std::vector<torch::Tensor>& slot_mappings,
     int64_t nkv, int64_t block_size, double eps, bool is_neox);
+std::tuple<torch::Tensor, torch::Tensor> dflash_qkv_norm_rope(
+    torch::Tensor qkv, torch::Tensor positions, torch::Tensor q_norm_w,
+    torch::Tensor k_norm_w, torch::Tensor cos_sin_cache,
+    int64_t nq, int64_t nkv, double eps, bool is_neox);
 void draft_vocab_update_tail(
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor in_static_vocab,
     torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor tail_seen);
@@ -182,10 +200,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_unpack", &bf16_rans_unpack);
   m.def("rans_gemm", &bf16_rans_gemm);
   m.def("rans_gemm_out", &bf16_rans_gemm_out);
+  m.def("rans_gemm_dual", &bf16_rans_gemm_dual);
+  m.def("rans_gemm_dual_out", &bf16_rans_gemm_dual_out);
   m.def("rans_base", &bf16_rans_base);
   m.def("int3_pack", &int3_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
   m.def("int3_gemm", &int3_gemm);
+  m.def("int3_pack_swiglu", &int3_pack_swiglu, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
+  m.def("int3_gemm_swiglu", &int3_gemm_swiglu);
+  m.def("int4_pack", &int4_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
+  m.def("int4_gemm", &int4_gemm);
+  m.def("int4_gemm_aux5", &int4_gemm_aux5);
   m.def("dflash_kv_post", &dflash_kv_post);
+  m.def("dflash_qkv_norm_rope", &dflash_qkv_norm_rope);
   m.def("draft_vocab_update_tail", &draft_vocab_update_tail);
   m.def("draft_vocab_tail_argmax", &draft_vocab_tail_argmax,
         pybind11::arg("A"), pybind11::arg("static_logits"), pybind11::arg("vocab_map"),

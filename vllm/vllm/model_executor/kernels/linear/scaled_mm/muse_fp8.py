@@ -37,7 +37,7 @@ except Exception:  # noqa: BLE001
     _rans = None
 
 _RANS_M = _rans is not None and hasattr(_rans, "rans_gemm_m_auto") and os.environ.get("MUSERANS_M", "1") != "0"
-_stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False}
+_stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False, "fused_m_checked": set()}
 _decode_gemm_operand = None
 _consume_rans_prologue = None
 
@@ -92,6 +92,33 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
                             and torch.equal(got_m[8:].view(torch.int16), ref_hi.view(torch.int16))
                         ):
                             raise RuntimeError(f"muserans kM16 self-check mismatch at M={cm}")
+                if (
+                    _RANS_M
+                    and os.environ.get("MUSE_RANS_PROLOGUE_M16", "0") != "0"
+                    and hasattr(_rans, "rans_gemm_m_fused_auto")
+                    and hasattr(_rans, "rans_gemv_fused_auto")
+                    and (n, k) in ((6656, 4096), (6656, 19968))
+                    and (n, k) not in _stats["fused_m_checked"]
+                ):
+                    act_mode = 1 if k == 4096 else 2
+                    for cm in (7, 12, 16):
+                        gen_f = torch.Generator(device=w.device).manual_seed(n * 149 + k + 31 + cm)
+                        if act_mode == 1:
+                            fx0 = (torch.randn(cm, k, generator=gen_f, device=w.device) * 1.5).to(torch.bfloat16).contiguous()
+                            fx1 = (torch.randn(cm, k, generator=gen_f, device=w.device) * 1.5).to(torch.bfloat16).contiguous()
+                        else:
+                            fx0 = (torch.randn(cm, 2 * k, generator=gen_f, device=w.device) * 1.5).to(torch.bfloat16).contiguous()
+                            fx1 = fx0
+                        fgot = torch.empty(cm, n, dtype=torch.bfloat16, device=w.device)
+                        fref = torch.empty(cm, n, dtype=torch.bfloat16, device=w.device)
+                        _rans.rans_gemm_m_fused_auto(blob, fx0, fx1, ws.reshape(-1), xs.reshape(-1), fgot, n, k, act_mode)
+                        for rr in range(cm):
+                            _rans.rans_gemv_fused_auto(
+                                blob, fx0[rr], fx1[rr], ws.reshape(-1), xs.reshape(-1), fref[rr : rr + 1], n, k, act_mode
+                            )
+                        if not torch.equal(fgot.view(torch.int16), fref.view(torch.int16)):
+                            raise RuntimeError(f"muserans fused M={cm} act_mode={act_mode} self-check mismatch")
+                    _stats["fused_m_checked"].add((n, k))
                 _stats["admitted"] += 1
                 _stats["rans"] += 1
                 # The magic byte 'A' at blob[0] marks the compressed format for the op (one uint8 buffer either way).

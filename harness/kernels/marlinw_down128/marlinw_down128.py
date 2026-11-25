@@ -23,7 +23,7 @@ SMS = 48
 ENABLED = os.environ.get("MARLIN_DOWN128", "1") == "1"
 ATTN_ENABLED = os.environ.get("MARLIN_ATTN128", "1") == "1"
 _ALL_ATTN_SHAPES = {(4608, 6656): "qkv", (6656, 4096): "o_proj", (4096, 6656): "gate"}
-_raw_attn_shapes = os.environ.get("MARLIN_ATTN128_SHAPES", "qkv,o_proj")
+_raw_attn_shapes = os.environ.get("MARLIN_ATTN128_SHAPES", "qkv,o_proj,gate")
 _enabled_attn = set() if _raw_attn_shapes in ("", "0") else set(_raw_attn_shapes.split(","))
 ATTN_SHAPES = {k: v for k, v in _ALL_ATTN_SHAPES.items() if v in _enabled_attn}
 ATTN_TMA_ENABLED = ATTN_ENABLED and os.environ.get("MARLIN_ATTN_TMA", "1") == "1"

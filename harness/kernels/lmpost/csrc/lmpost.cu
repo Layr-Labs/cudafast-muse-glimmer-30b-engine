@@ -3,6 +3,7 @@
 // and fused 1-pass softcap+argmax for serial M=1 decode without logprobs.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include <math.h>
 #include <stdint.h>
 
@@ -130,17 +131,38 @@ softcap_argmax_kernel(const __nv_bfloat16* __restrict__ logits, const uint16_t* 
   }
 }
 
-__global__ void greedy_verify_kernel(
+static bool lmpost_pdl_enabled() {
+  static const bool on = []() {
+    const char* env = std::getenv("MUSE_LMPOST_PDL");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  return on;
+}
+
+template <bool kPdl>
+__global__ void __launch_bounds__(32) greedy_verify_kernel(
     const int64_t* __restrict__ target_argmax,
     const int32_t* __restrict__ input_ids,
     const int64_t* __restrict__ logits_indices,
     int32_t* __restrict__ num_sampled_out,
     int32_t* __restrict__ num_rejected_out,
     int m) {
+  int64_t draft_toks[15];
+  if constexpr (kPdl) {
+    if (threadIdx.x == 0) {
+      for (int i = 0; i < m - 1; ++i) {
+        const int64_t idx = logits_indices ? logits_indices[i + 1] : static_cast<int64_t>(i + 1);
+        draft_toks[i] = static_cast<int64_t>(input_ids[idx]);
+      }
+    }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
+  if (threadIdx.x != 0) return;
   int accepted = 0;
   for (int i = 0; i < m - 1; ++i) {
-    const int64_t idx = logits_indices ? logits_indices[i + 1] : static_cast<int64_t>(i + 1);
-    const int64_t draft_tok = static_cast<int64_t>(input_ids[idx]);
+    const int64_t draft_tok = kPdl
+        ? draft_toks[i]
+        : static_cast<int64_t>(input_ids[logits_indices ? logits_indices[i + 1] : static_cast<int64_t>(i + 1)]);
     if (target_argmax[i] == draft_tok) {
       ++accepted;
     } else {
@@ -165,7 +187,9 @@ extern "C" int lmpost_init() {
   if (rc != cudaSuccess) return (int)rc;
   rc = cudaFuncGetAttributes(&attr, lmpost::softcap_argmax_kernel<false>);
   if (rc != cudaSuccess) return (int)rc;
-  return (int)cudaFuncGetAttributes(&attr, lmpost::greedy_verify_kernel);
+  rc = cudaFuncGetAttributes(&attr, lmpost::greedy_verify_kernel<true>);
+  if (rc != cudaSuccess) return (int)rc;
+  return (int)cudaFuncGetAttributes(&attr, lmpost::greedy_verify_kernel<false>);
 }
 
 extern "C" int lmpost_softcap_inplace(void* logits, const void* lut, int total_elems, void* stream) {
@@ -212,11 +236,29 @@ extern "C" int lmpost_greedy_verify(const void* target_argmax, const void* input
                                     const void* logits_indices, void* num_sampled_out,
                                     void* num_rejected_out, int m, void* stream) {
   using namespace lmpost;
-  if (m < 2 || m > 8 || target_argmax == nullptr || input_ids == nullptr ||
+  if (m < 2 || m > 16 || target_argmax == nullptr || input_ids == nullptr ||
       num_sampled_out == nullptr || num_rejected_out == nullptr) {
     return (int)cudaErrorInvalidValue;
   }
-  greedy_verify_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(
+  cudaStream_t st = (cudaStream_t)stream;
+  if (lmpost_pdl_enabled()) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(1, 1, 1);
+    cfg.blockDim = dim3(32, 1, 1);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = st;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    return (int)cudaLaunchKernelEx(
+        &cfg, greedy_verify_kernel<true>,
+        (const int64_t*)target_argmax, (const int32_t*)input_ids,
+        (const int64_t*)logits_indices, (int32_t*)num_sampled_out,
+        (int32_t*)num_rejected_out, m);
+  }
+  greedy_verify_kernel<false><<<1, 32, 0, st>>>(
       (const int64_t*)target_argmax, (const int32_t*)input_ids,
       (const int64_t*)logits_indices, (int32_t*)num_sampled_out,
       (int32_t*)num_rejected_out, m);

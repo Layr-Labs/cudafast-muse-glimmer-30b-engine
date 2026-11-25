@@ -174,7 +174,7 @@ __device__ __forceinline__ uint32_t sel4(uint32_t v0, uint32_t v1, uint32_t v2, 
   return selp(hi, lo, i & 2);
 }
 
-__device__ __forceinline__ uint8_t eval_pair_fp8(float g_acc, float u_acc, float sa, float sb, float inv_down) {
+__device__ __forceinline__ float eval_pair_scaled(float g_acc, float u_acc, float sa, float sb, float inv_down) {
   const float g_f = __fmul_rn(__fmul_rn(g_acc, sb), sa);
   const float u_f = __fmul_rn(__fmul_rn(u_acc, sb), sa);
   uint32_t packed_bf16;
@@ -182,10 +182,7 @@ __device__ __forceinline__ uint8_t eval_pair_fp8(float g_acc, float u_acc, float
   const float g_bf = __uint_as_float(packed_bf16 << 16);
   const float u_bf = __uint_as_float(packed_bf16 & 0xffff0000u);
   const float silu = swiglu_silu(g_bf);
-  const float q = __fmul_rn(__fmul_rn(silu, u_bf), inv_down);
-  uint16_t conv;
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %1;" : "=h"(conv) : "f"(q));
-  return static_cast<uint8_t>(conv & 0xffu);
+  return __fmul_rn(__fmul_rn(silu, u_bf), inv_down);
 }
 
 __device__ __forceinline__ void epilogue_swiglu_fp8(const float (&acc)[NW][4], uint8_t* out, int row0, int out_col0,
@@ -198,8 +195,12 @@ __device__ __forceinline__ void epilogue_swiglu_fp8(const float (&acc)[NW][4], u
     uint32_t b_lo[4], b_hi[4];
 #pragma unroll
     for (int m = 0; m < 4; ++m) {
-      b_lo[m] = eval_pair_fp8(acc[j0 + m][0], acc[j0 + m][1], sa, sb, inv_down);
-      b_hi[m] = eval_pair_fp8(acc[j0 + m][2], acc[j0 + m][3], sa, sb, inv_down);
+      const float q_lo = eval_pair_scaled(acc[j0 + m][0], acc[j0 + m][1], sa, sb, inv_down);
+      const float q_hi = eval_pair_scaled(acc[j0 + m][2], acc[j0 + m][3], sa, sb, inv_down);
+      uint16_t conv;
+      asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(conv) : "f"(q_hi), "f"(q_lo));
+      b_lo[m] = static_cast<uint32_t>(conv & 0xffu);
+      b_hi[m] = static_cast<uint32_t>(conv >> 8);
     }
     auto store_row = [&](int r_off, const uint32_t (&bv)[4]) {
       const uint32_t s1 = __shfl_xor_sync(0xffffffffu, sel4(bv[0], bv[1], bv[2], bv[3], q ^ 1), 1);
@@ -337,38 +338,40 @@ constexpr int NT_WS9 = (NWARP + 1) * 32;
 
 __device__ __forceinline__ void consume_stage_pipe_sw(
     uint32_t abase, uint32_t wbase, int wm, int wn, int ar, int ach, int br, int bch, float (&acc)[2][NW][4]) {
-  uint32_t a_cur[2][4], b_cur[NW][2];
-  auto load_ks = [&](int ks, uint32_t (&a)[2][4], uint32_t (&b)[NW][2]) {
-#pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      const int r = wm * 32 + i * 16 + ar;
-      ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, a[i]);
-    }
-#pragma unroll
-    for (int j = 0; j < NW / 2; ++j) {
-      const int r = wn * NW * 8 + j * 16 + br;
-      uint32_t qd[4];
-      ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, qd);
-      b[2 * j][0] = qd[0]; b[2 * j][1] = qd[1];
-      b[2 * j + 1][0] = qd[2]; b[2 * j + 1][1] = qd[3];
-    }
+  auto load_a_i = [&](int ks, int i, uint32_t (&a)[2][4]) {
+    const int r = wm * 32 + i * 16 + ar;
+    ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, a[i]);
   };
-  load_ks(0, a_cur, b_cur);
+  auto load_b_j = [&](int ks, int j, uint32_t (&b)[NW][2]) {
+    const int r = wn * NW * 8 + j * 16 + br;
+    uint32_t qd[4];
+    ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, qd);
+    b[2 * j][0] = qd[0];
+    b[2 * j][1] = qd[1];
+    b[2 * j + 1][0] = qd[2];
+    b[2 * j + 1][1] = qd[3];
+  };
+  uint32_t a[2][2][4], b[2][NW][2];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) load_a_i(0, i, a[0]);
+#pragma unroll
+  for (int j = 0; j < NW / 2; ++j) load_b_j(0, j, b[0]);
 #pragma unroll
   for (int ks = 0; ks < KT / 32; ++ks) {
-    uint32_t a_nxt[2][4], b_nxt[NW][2];
-    if (ks + 1 < KT / 32) load_ks(ks + 1, a_nxt, b_nxt);
+    const int cur = ks & 1, nxt = cur ^ 1;
 #pragma unroll
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < 2; ++i) {
 #pragma unroll
-      for (int j = 0; j < NW; ++j) mma_fp8(a_cur[i], b_cur[j][0], b_cur[j][1], acc[i][j]);
-    if (ks + 1 < KT / 32) {
-#pragma unroll
-      for (int i = 0; i < 2; ++i)
-#pragma unroll
-        for (int k = 0; k < 4; ++k) a_cur[i][k] = a_nxt[i][k];
-#pragma unroll
-      for (int j = 0; j < NW; ++j) { b_cur[j][0] = b_nxt[j][0]; b_cur[j][1] = b_nxt[j][1]; }
+      for (int j = 0; j < NW; ++j) {
+        mma_fp8(a[cur][i], b[cur][j][0], b[cur][j][1], acc[i][j]);
+        if (ks + 1 < KT / 32) {
+          if (i == 0 && (j == 0 || j == 2)) {
+            load_a_i(ks + 1, j >> 1, a[nxt]);
+          } else if (i == 1 && (j & 1) == 0) {
+            load_b_j(ks + 1, j >> 1, b[nxt]);
+          }
+        }
+      }
     }
   }
 }

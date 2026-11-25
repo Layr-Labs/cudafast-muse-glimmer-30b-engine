@@ -19,6 +19,7 @@ import torch
 
 ENABLED = os.environ.get("MUSE_EMBED_FUSED", "1") == "1"
 ENABLED_M1 = os.environ.get("MUSE_EMBED_FUSED_M1", "1") != "0"
+ENABLED_MM = os.environ.get("MUSE_EMBED_FUSED_MM", "1") != "0"
 ENABLED_TAIL = os.environ.get("MUSE_FAST_DECODE_TAIL", "1") != "0"
 _lib = None
 _post_update_m1_fn = None
@@ -34,6 +35,10 @@ try:
     if _m1 is not None:
         _m1.argtypes = [_p, ctypes.c_int, _p, ctypes.c_float, _p, ctypes.c_int, _p]
         _m1.restype = ctypes.c_int
+    _mm = getattr(_lib, "muse_embed_norm_m", None)
+    if _mm is not None:
+        _mm.argtypes = [_p, ctypes.c_int, _p, ctypes.c_float, _p, ctypes.c_int, ctypes.c_int, _p]
+        _mm.restype = ctypes.c_int
     _pu = getattr(_lib, "muse_post_update_m1", None)
     if _pu is not None:
         _pu.argtypes = [
@@ -158,7 +163,15 @@ def fast_single_decode_prep(
         raise RuntimeError(f"muse_single_decode_prep failed with CUDA error {rc}")
     return True
 
-state = {"admitted": None, "admitted_m1": None, "fused_calls": 0, "m1_calls": 0, "reason": ""}
+state = {
+    "admitted": None,
+    "admitted_m1": None,
+    "admitted_mm": None,
+    "fused_calls": 0,
+    "m1_calls": 0,
+    "mm_calls": 0,
+    "reason": "",
+}
 
 
 def _fused_m1(ids, table, eps, out):
@@ -169,6 +182,16 @@ def _fused_m1(ids, table, eps, out):
     )
     if status:
         raise RuntimeError(f"muse_embed norm_m1 launch returned CUDA error {status}")
+
+
+def _fused_m(ids, table, eps, out):
+    rows, width = out.shape
+    stream = torch.cuda.current_stream(out.device).cuda_stream
+    status = _lib.muse_embed_norm_m(
+        ids.data_ptr(), int(ids.dtype == torch.int64), table.data_ptr(), float(eps), out.data_ptr(), rows, width, stream
+    )
+    if status:
+        raise RuntimeError(f"muse_embed norm_m launch returned CUDA error {status}")
 
 
 def _admit_m1(model, ids, out, table) -> bool:
@@ -194,8 +217,37 @@ def _admit_m1(model, ids, out, table) -> bool:
     return True
 
 
+def _admit_m(model, ids, out, table) -> bool:
+    if not ENABLED_MM or _lib is None or getattr(_lib, "muse_embed_norm_m", None) is None:
+        return False
+    width = table.shape[1]
+    if width <= 0 or (width & 7) != 0 or width > 8192:
+        return False
+    dev = out.device
+    eps = model.embed_norm.eps
+    gen = torch.Generator(device=dev)
+    gen.manual_seed(20261125)
+    cases = []
+    if 1 <= ids.shape[0] <= 16:
+        cases.append(ids.clone())
+    for rows in (2, 7, 12, 16):
+        cases.append(torch.randint(0, table.shape[0], (rows,), generator=gen, device=dev, dtype=ids.dtype))
+    for case in cases:
+        mine = torch.empty((int(case.shape[0]), width), dtype=torch.bfloat16, device=dev)
+        _fused_m(case, table, eps, mine)
+        theirs = model.embed_norm(model.embed_tokens(case))
+        torch.cuda.synchronize()
+        if not torch.equal(mine.view(torch.int16), theirs.view(torch.int16)):
+            return False
+    return True
+
+
 def is_single_kernel_m1() -> bool:
     return bool(ENABLED and ENABLED_M1 and state["admitted_m1"] is True)
+
+
+def is_single_kernel_m() -> bool:
+    return bool(ENABLED and ENABLED_MM and state["admitted_mm"] is True)
 
 
 def _fused(ids, table, eps, out):
@@ -286,6 +338,14 @@ def embed_into(model, ids, out) -> bool:
             _fused_m1(ids, table, model.embed_norm.eps, out)
             state["fused_calls"] += 1
             state["m1_calls"] += 1
+            return True
+    if 1 < out.shape[0] <= 16 and ENABLED_MM:
+        if state["admitted_mm"] is None and not torch.cuda.is_current_stream_capturing():
+            state["admitted_mm"] = _admit_m(model, ids, out, table)
+        if state["admitted_mm"] is True:
+            _fused_m(ids, table, model.embed_norm.eps, out)
+            state["fused_calls"] += 1
+            state["mm_calls"] += 1
             return True
     _fused(ids, table, model.embed_norm.eps, out)
     state["fused_calls"] += 1

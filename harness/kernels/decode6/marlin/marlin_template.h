@@ -1451,8 +1451,8 @@ __global__ void Marlin(
   auto cp_async4_stream = [&](void* smem_ptr, const void* glob_ptr) { cp_async4(smem_ptr, glob_ptr); };
 #endif
   auto load_mul_sigmoid_int4 = [&](int idx) -> int4 {
-    const uint4 g = reinterpret_cast<const uint4*>(A)[idx];
-    const uint4 av = reinterpret_cast<const uint4*>(A_aux)[idx];
+    const uint4 g = __ldg(&reinterpret_cast<const uint4*>(A)[idx]);
+    const uint4 av = __ldg(&reinterpret_cast<const uint4*>(A_aux)[idx]);
     const uint32_t gw[4] = {g.x, g.y, g.z, g.w};
     const uint32_t aw[4] = {av.x, av.y, av.z, av.w};
     uint32_t ow[4];
@@ -1497,10 +1497,18 @@ __global__ void Marlin(
       } else {
   #pragma unroll
         for (int i = 0; i < a_sh_wr_iters; i++) {
-          cp_async4_pred(
-              &sh_a_stage[a_sh_wr_trans[i]],
-              &A[a_gl_rd_delta_i * i + cur_a_off],
-              a_sh_wr_pred[i]);
+          if constexpr (multi_m && scale6) {
+            // Cache A in the 64 KiB L1 carveout (cp.async.ca) while B streams via L2::evict_first.
+            cp_async4_ca_pred(
+                &sh_a_stage[a_sh_wr_trans[i]],
+                &A[a_gl_rd_delta_i * i + cur_a_off],
+                a_sh_wr_pred[i]);
+          } else {
+            cp_async4_pred(
+                &sh_a_stage[a_sh_wr_trans[i]],
+                &A[a_gl_rd_delta_i * i + cur_a_off],
+                a_sh_wr_pred[i]);
+          }
         }
       }
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
@@ -2213,6 +2221,64 @@ __global__ void Marlin(
     constexpr int red_off = threads / b_sh_stride_threads / 2;
     if (red_off >= 1) {
       auto red_idx = threadIdx.x / b_sh_stride_threads;
+      if constexpr (multi_m && !m_block_size_8 && !is_a_8bit) {
+        // Chunked reduction over j = 0..7:
+        // - fixed_shape != 3: 3 passes (3+3+2) -> 9 syncs (down from 12), sh_red = 6,144 B (total 62,880 B <= 62 KiB < 63 KiB SM121 64 KiB L1 carveout).
+        // - fixed_shape == 3 (lm_head, RANS_CAP=4096): 4 passes (2+2+2+2) -> sh_red = 4,096 B (total 62,624 B <= 62 KiB).
+        // Preserves exact per-element FP32 addition order (strict 0-ULP).
+        constexpr int red_j_chunk = (fixed_shape == 3) ? 2 : 3;
+        constexpr int red_sh_stride = b_sh_stride_threads * red_j_chunk;
+        constexpr int red_sh_delta = b_sh_stride_threads;
+        int red_sh_rd = red_sh_stride * red_idx + (threadIdx.x % b_sh_stride_threads);
+  #pragma unroll
+        for (int m_block = 0; m_block < thread_m_blocks; m_block++) {
+  #pragma unroll
+          for (int j_base = 0; j_base < 8; j_base += red_j_chunk) {
+            const int j_len = (j_base + red_j_chunk <= 8) ? red_j_chunk : (8 - j_base);
+  #pragma unroll
+            for (int i = red_off; i > 0; i /= 2) {
+              if (i <= red_idx && red_idx < 2 * i) {
+  #pragma unroll
+                for (int jl = 0; jl < red_j_chunk; jl++) {
+                  if (jl < j_len) {
+                    const int j = j_base + jl;
+                    int red_sh_wr =
+                        red_sh_delta * jl + (red_sh_rd - red_sh_stride * i);
+                    if (i < red_off) {
+                      float* c_rd = reinterpret_cast<float*>(
+                          &sh_red[red_sh_delta * jl + red_sh_rd]);
+                      float* c_wr = reinterpret_cast<float*>(&sh_red[red_sh_wr]);
+  #pragma unroll
+                      for (int k = 0; k < 4; k++)
+                        reinterpret_cast<FragC*>(
+                            frag_c)[8 * m_block + j][k] += c_rd[k] + c_wr[k];
+                    }
+                    sh_red[red_sh_wr] =
+                        reinterpret_cast<int4*>(&frag_c)[8 * m_block + j];
+                  }
+                }
+              }
+              __syncthreads();
+            }
+            if (red_idx == 0) {
+  #pragma unroll
+              for (int jl = 0; jl < red_j_chunk; jl++) {
+                if (jl < j_len) {
+                  const int j = j_base + jl;
+                  float* c_rd = reinterpret_cast<float*>(
+                      &sh_red[red_sh_delta * jl + red_sh_rd]);
+  #pragma unroll
+                  for (int k = 0; k < 4; k++)
+                    reinterpret_cast<FragC*>(
+                        frag_c)[8 * m_block + j][k] += c_rd[k];
+                }
+              }
+            }
+            __syncthreads();
+          }
+        }
+        return;
+      }
       constexpr int red_j_shift = m_block_size_8 ? 1 : 0;
       constexpr int red_sh_stride =
           b_sh_stride_threads * ((is_a_8bit ? 2 : 4) * 2 >> red_j_shift);
@@ -2581,11 +2647,18 @@ __global__ void Marlin(
             const float g1 = __uint_as_float(gw & 0xffff0000u);
             const float u0 = __uint_as_float(uw << 16);
             const float u1 = __uint_as_float(uw & 0xffff0000u);
-            __nv_bfloat162 res = __floats2bfloat162_rn(
-                __fmul_rn(marlin_swiglu_silu(g0), u0),
-                __fmul_rn(marlin_swiglu_silu(g1), u1));
-            reinterpret_cast<uint32_t*>(C0 + r * 2496 + slice_col * 8)[c] =
-                *reinterpret_cast<uint32_t*>(&res);
+            if constexpr (gate_up_swiglu_fp8) {
+              reinterpret_cast<uint16_t*>(fp8_out_ptr + r * 19968 + slice_col * 64)[c] =
+                  marlin_pack_fp8x2(
+                      __fmul_rn(__fmul_rn(marlin_swiglu_silu(g0), u0), inv_fp8_scale),
+                      __fmul_rn(__fmul_rn(marlin_swiglu_silu(g1), u1), inv_fp8_scale));
+            } else {
+              __nv_bfloat162 res = __floats2bfloat162_rn(
+                  __fmul_rn(marlin_swiglu_silu(g0), u0),
+                  __fmul_rn(marlin_swiglu_silu(g1), u1));
+              reinterpret_cast<uint32_t*>(C0 + r * 2496 + slice_col * 8)[c] =
+                  *reinterpret_cast<uint32_t*>(&res);
+            }
           }
         } else {
           const bool is_up = (slice_col >= 288);
@@ -2631,11 +2704,18 @@ __global__ void Marlin(
               const float g1 = __uint_as_float(gw & 0xffff0000u);
               const float u0 = __uint_as_float(uw << 16);
               const float u1 = __uint_as_float(uw & 0xffff0000u);
-              __nv_bfloat162 res = __floats2bfloat162_rn(
-                  __fmul_rn(marlin_swiglu_silu(g0), u0),
-                  __fmul_rn(marlin_swiglu_silu(g1), u1));
-              reinterpret_cast<uint32_t*>(C0 + r * 2496 + 2112 + m_pair * 16)[c] =
-                  *reinterpret_cast<uint32_t*>(&res);
+              if constexpr (gate_up_swiglu_fp8) {
+                reinterpret_cast<uint16_t*>(fp8_out_ptr + r * 19968 + 16896 + m_pair * 128)[c] =
+                    marlin_pack_fp8x2(
+                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g0), u0), inv_fp8_scale),
+                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g1), u1), inv_fp8_scale));
+              } else {
+                __nv_bfloat162 res = __floats2bfloat162_rn(
+                    __fmul_rn(marlin_swiglu_silu(g0), u0),
+                    __fmul_rn(marlin_swiglu_silu(g1), u1));
+                reinterpret_cast<uint32_t*>(C0 + r * 2496 + 2112 + m_pair * 16)[c] =
+                    *reinterpret_cast<uint32_t*>(&res);
+              }
             }
           }
         }
@@ -2834,17 +2914,33 @@ __global__ void Marlin(
     }
     if (pdl_cons) {
       asm volatile("griddepcontrol.wait;" ::: "memory");
+      if constexpr (!fuse_mul_sigmoid && a_sh_wr_iters == 1) {
+        int4 a_pre[stages - 1];
   #pragma unroll
-      for (int i = 0; i < stages - 1; i++) {
-        if (pre_a_pred[i]) {
-          int4* sh_a_stage = sh_a + a_sh_stage_step * i;
+        for (int i = 0; i < stages - 1; i++) {
+          if (pre_a_pred[i] && a_sh_wr_pred[0]) {
+            a_pre[i] = __ldg(&A[pre_a_off[i]]);
+          }
+        }
   #pragma unroll
-          for (int j = 0; j < a_sh_wr_iters; j++) {
-            if (a_sh_wr_pred[j]) {
-              if constexpr (fuse_mul_sigmoid && multi_m) {
-                sh_a_stage[a_sh_wr_trans[j]] = load_mul_sigmoid_int4(a_gl_rd_delta_i * j + pre_a_off[i]);
-              } else {
-                sh_a_stage[a_sh_wr_trans[j]] = A[a_gl_rd_delta_i * j + pre_a_off[i]];
+        for (int i = 0; i < stages - 1; i++) {
+          if (pre_a_pred[i] && a_sh_wr_pred[0]) {
+            (sh_a + a_sh_stage_step * i)[a_sh_wr_trans[0]] = a_pre[i];
+          }
+        }
+      } else {
+  #pragma unroll
+        for (int i = 0; i < stages - 1; i++) {
+          if (pre_a_pred[i]) {
+            int4* sh_a_stage = sh_a + a_sh_stage_step * i;
+  #pragma unroll
+            for (int j = 0; j < a_sh_wr_iters; j++) {
+              if (a_sh_wr_pred[j]) {
+                if constexpr (fuse_mul_sigmoid && multi_m) {
+                  sh_a_stage[a_sh_wr_trans[j]] = load_mul_sigmoid_int4(a_gl_rd_delta_i * j + pre_a_off[i]);
+                } else {
+                  sh_a_stage[a_sh_wr_trans[j]] = __ldg(&A[a_gl_rd_delta_i * j + pre_a_off[i]]);
+                }
               }
             }
           }

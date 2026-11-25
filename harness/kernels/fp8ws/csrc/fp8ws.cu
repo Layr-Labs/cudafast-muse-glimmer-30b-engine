@@ -300,24 +300,34 @@ __device__ __forceinline__ void consume_stage_pipe(uint32_t abase, uint32_t wbas
         }
       }
     } else {
-      if (ks + 1 < KT / 32) {
 #pragma unroll
-        for (int i = 0; i < MW; ++i) load_a_i(ks + 1, i, a[nxt]);
-#pragma unroll
-        for (int j = 0; j < NW_CUR / 2; ++j) load_b_j(ks + 1, j, b[nxt]);
-      }
-#pragma unroll
-      for (int i = 0; i < MW; ++i)
+      for (int i = 0; i < MW; ++i) {
 #pragma unroll
         for (int j = 0; j < NW_CUR; ++j) {
           if constexpr (IsBf16) mma_bf16(a[cur][i], b[cur][j][0], b[cur][j][1], acc[i][j]);
           else mma(a[cur][i], b[cur][j][0], b[cur][j][1], acc[i][j]);
+          if (ks + 1 < KT / 32) {
+            if constexpr (MW == 1) {
+              if (j == 0) {
+                load_a_i(ks + 1, 0, a[nxt]);
+              } else if ((j & 1) == 1 && (j >> 1) < NW_CUR / 2) {
+                load_b_j(ks + 1, j >> 1, b[nxt]);
+              }
+            } else {
+              if (i == 0 && j < MW) {
+                load_a_i(ks + 1, j, a[nxt]);
+              } else if (i == 1 && (j & 1) == 0 && (j >> 1) < NW_CUR / 2) {
+                load_b_j(ks + 1, j >> 1, b[nxt]);
+              }
+            }
+          }
         }
+      }
     }
   }
 }
 
-template <int N, int K>
+template <int N, int K, bool kPdl = false>
 __global__ void __launch_bounds__(NT, 1)
 gemm(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB, const Params p) {
   using S = Shape<N, K>;
@@ -330,9 +340,13 @@ gemm(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMa
   const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
   const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST;
   const int grid = gridDim.x;
-  if ((int)blockIdx.x >= NTILES) return;
+  if ((int)blockIdx.x >= NTILES) {
+    if constexpr (kPdl) pdl_launch_dependents();
+    return;
+  }
   const int nmine = (NTILES - blockIdx.x + grid - 1) / grid;
   const int total = nmine * NKT;
+  const int pdl_trig = (total > 10) ? (total - 10) : 0;
   if (tid == 0) {
     for (int s = 0; s < ST; ++s) { mbar_init(full0 + 8 * s, 1); mbar_init(empty0 + 8 * s, NWARP); }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -349,7 +363,31 @@ gemm(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMa
     tma2d_hint(dst, &tmA, kt * KT, band * BM, bar, tma_pol_el());
     tma2d_hint(dst + ASZ, &tmB, kt * KT, nt * BN, bar, tma_pol_ef());
   };
-  if (tid == 0) {
+  if constexpr (kPdl) {
+    if (tid == 0) {
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
+      const uint64_t pol_ef = tma_pol_ef();
+      for (int s = 0; s < ST - 1 && s < total; ++s) {
+        const int ti0 = s / NKT, kt0 = s - ti0 * NKT;
+        const int t0 = blockIdx.x + ti0 * grid, nt0 = t0 / NB;
+        const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB;
+        mbar_expect_tx_only(bar, WSZ);
+        tma2d_hint(dst + ASZ, &tmB, kt0 * KT, nt0 * BN, bar, pol_ef);
+      }
+    }
+    pdl_wait();
+    if (tid == 0) {
+      const uint64_t pol_el = tma_pol_el();
+      for (int s = 0; s < ST - 1 && s < total; ++s) {
+        const int ti0 = s / NKT, kt0 = s - ti0 * NKT;
+        const int t0 = blockIdx.x + ti0 * grid, nt0 = t0 / NB, band0 = t0 - nt0 * NB;
+        const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB;
+        mbar_expect_tx(bar, ASZ);
+        tma2d_hint(dst, &tmA, kt0 * KT, band0 * BM, bar, pol_el);
+      }
+    }
+  } else if (tid == 0) {
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
     for (int s = 0; s < ST - 1 && s < total; ++s) produce(s);
@@ -367,13 +405,17 @@ gemm(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMa
   const int br = (lane & 7) + (lane >> 4) * 8, bch = (lane >> 3) & 1;
   int kt = 0, ti = 0;
   for (int g = 0; g < total; ++g) {
+    if constexpr (kPdl) {
+      if (g == pdl_trig) pdl_launch_dependents();
+    }
     const int s = g % ST, n = g / ST;
     const int t = blockIdx.x + ti * grid, nt = t / NB, band = t - nt * NB;
     const int rb0 = band * BM + wm * MW * 16;
     if (tid == 0 && g + ST - 1 < total) produce(g + ST - 1);
     mbar_wait(full0 + 8 * s, n & 1);
     const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-    consume_stage<MW>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+    if constexpr (MW == 2) consume_stage_pipe<MW>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+    else                   consume_stage<MW>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
     __syncwarp();
     if (lane == 0) mbar_arrive(empty0 + 8 * s);
     if (++kt == NKT) {
@@ -1357,7 +1399,7 @@ gemm_hybrid_6656_st3(const __grid_constant__ CUtensorMap tmA128,
   }
 
   const int rb0 = row0_2 + warp * 16;
-  constexpr int kPdlTrig = (NKT > 8) ? (NKT - 8) : 0;
+  constexpr int kPdlTrig = (K == 19968) ? (NKT - 20) : ((NKT > 10) ? (NKT - 10) : 0);
   if (is48) {
     float acc2[1][6][4] = {};
     for (int kt = 0; kt < NKT; ++kt) {
@@ -1514,7 +1556,7 @@ gemm_dual_a_st3(const __grid_constant__ CUtensorMap tmA0,
   }
 
   const int rb0 = row0_2 + wm * 32;
-  constexpr int kPdlTrig = NKT - 8;
+  constexpr int kPdlTrig = NKT - 12;
   if (is96) {
     float acc2[2][6][4] = {};
     for (int kt = 0; kt < NKT; ++kt) {
@@ -1753,7 +1795,11 @@ template <int N, int K>
 static cudaError_t launch_shape(const CUtensorMap& tmA, const CUtensorMap& tmB, const Params& p, cudaStream_t st) {
   using S = Shape<N, K>;
   constexpr int T = S::NTILES;
-  gemm<N, K><<<num_sms < T ? num_sms : T, NT, S::SMEM, st>>>(tmA, tmB, p);
+  const int grid = num_sms < T ? num_sms : T;
+  if (fp8ws_pdl_enabled()) {
+    return launch_ex_pdl(gemm<N, K, true>, grid, NT, S::SMEM, st, tmA, tmB, p);
+  }
+  gemm<N, K, false><<<grid, NT, S::SMEM, st>>>(tmA, tmB, p);
   return cudaGetLastError();
 }
 
@@ -1809,7 +1855,9 @@ extern "C" int fp8ws_init() {
   if (e == cudaSuccess) e = cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev);
 #define FP8WS_ATTR(N, K)                                                                                       \
   if (e == cudaSuccess)                                                                                        \
-    e = cudaFuncSetAttribute(gemm<N, K>, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape<N, K>::SMEM)
+    e = cudaFuncSetAttribute(gemm<N, K, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape<N, K>::SMEM); \
+  if (e == cudaSuccess)                                                                                        \
+    e = cudaFuncSetAttribute(gemm<N, K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape<N, K>::SMEM)
   FP8WS_ATTR(4608, 6656);
   FP8WS_ATTR(4096, 6656);
   FP8WS_ATTR(6656, 4096);

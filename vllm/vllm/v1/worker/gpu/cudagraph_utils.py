@@ -5,6 +5,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import product
+import os
 from typing import Any, NamedTuple, Protocol
 
 import torch
@@ -345,6 +346,42 @@ class CudaGraphManager:
                     descs_by_token_lora[(_target_leaf_m, num_active_loras)].append(
                         pw_desc
                     )
+
+        if (
+            separate_decode_routine
+            and decode_mode == CUDAGraphMode.FULL
+            and self.decode_query_len > 1
+            and os.environ.get("VLLM_MUSE_CLAMPED_FULL_CG", "0") == "1"
+        ):
+            # Opt-in bs=1 FULL CUDA graphs for ceiling-clamped verify widths
+            # (2 .. decode_query_len-1); default OFF to avoid hijacking short
+            # prefills or capturing M=1 FULL graphs.
+            for clamped_m in range(2, self.decode_query_len):
+                for num_active_loras in self.lora_capture_cases:
+                    clamped_desc = BatchExecutionDescriptor(
+                        cg_mode=CUDAGraphMode.FULL,
+                        num_tokens=clamped_m,
+                        num_reqs=1,
+                        uniform_token_count=clamped_m,
+                        num_active_loras=num_active_loras,
+                    )
+                    if clamped_desc not in descs_by_mode[CUDAGraphMode.FULL]:
+                        descs_by_mode[CUDAGraphMode.FULL].append(clamped_desc)
+                    key_m = (clamped_m, num_active_loras)
+                    if clamped_desc not in descs_by_token_lora[key_m]:
+                        descs_by_token_lora[key_m].insert(0, clamped_desc)
+                    # Preserve piecewise fallback for non-uniform / multi-req batches
+                    # at token counts not originally in capture_sizes (e.g. m=3,5,6).
+                    if mixed_mode and not any(
+                        d.cg_mode == mixed_mode for d in descs_by_token_lora[key_m]
+                    ):
+                        for pw_d in descs_by_mode[mixed_mode]:
+                            if (
+                                pw_d.num_active_loras == num_active_loras
+                                and pw_d.num_tokens >= clamped_m
+                            ):
+                                descs_by_token_lora[key_m].append(pw_d)
+                                break
 
         if not descs_by_token_lora:
             return

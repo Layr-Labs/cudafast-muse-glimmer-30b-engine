@@ -900,7 +900,7 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
                     dev = ref.weight.device
                     x = ((torch.arange(512 * gk, device=dev) % 11).float() - 5.0).mul(0.07).to(torch.bfloat16).reshape(512, gk).contiguous()
                     if (
-                        (gn, gk) in ((4608, 6656), (6656, 4096))
+                        (gn, gk) in ((4608, 6656), (4096, 6656), (6656, 4096))
                         and _route is not None
                         and _route.marlinw_down128 is not None
                         and all(l.weight.data_ptr() in _route._attn128_weights for l in glayers)
@@ -1157,13 +1157,35 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                 _bf16_lib = _bf16_mod._lib()
             except (ImportError, OSError, AttributeError):
                 _bf16_lib = None
+            try:
+                from vllm.model_executor.models.muse_glimmer import (
+                    _BF16_DUAL_RANS_M,
+                    _BF16_DUAL_RANS_M_GATE_PTRS,
+                    update_bf16_dual_rans_m,
+                )
+            except Exception:
+                _BF16_DUAL_RANS_M = {}
+                _BF16_DUAL_RANS_M_GATE_PTRS = set()
+                update_bf16_dual_rans_m = None
+            place_bf16_m1_dual = os.environ.get("MUSE_PLACE_BF16_M1_DUAL", "0").strip() not in ("0", "", "false", "no")
             if _bf16_lib is not None and hasattr(_bf16_lib, "muse_bf16_rans_gemv"):
                 for (n, k), layers in sorted(
                     attn_bf16_groups.items(),
                     key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_bf16_lane_weight"].numel() for l in kv[1])),
                 ):
+                    bf16_layers = [
+                        l for l in layers
+                        if place_bf16_m1_dual
+                        or getattr(l, "muse_bf16_lane_index", None) is None
+                        or (
+                            l.muse_bf16_lane_index.data_ptr() not in _BF16_DUAL_RANS_M
+                            and l.muse_bf16_lane_index.data_ptr() not in _BF16_DUAL_RANS_M_GATE_PTRS
+                        )
+                    ]
+                    if not bf16_layers:
+                        continue
                     try:
-                        stats = _place_bf16_rans_group(_bf16_lib, layers, n, k, evict_buf, rejected_hold)
+                        stats = _place_bf16_rans_group(_bf16_lib, bf16_layers, n, k, evict_buf, rejected_hold)
                     except Exception as err:  # noqa: BLE001
                         logger.warning("Decode BF16 rANS attn placement skipped for %dx%d: %s", n, k, err)
                         continue
@@ -1183,7 +1205,12 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                 import muse_bfx_ext as _bfx_ext
                 if hasattr(_bfx_ext, "rans_gemm_out") and hasattr(_bf16_mod, "get_m_rans"):
                     for (n, k), layers in attn_bf16_groups.items():
-                        m_layers = [l for l in layers if l._buffers.get("muse_bf16_rans_m") is not None]
+                        m_layers = [
+                            l for l in layers
+                            if l._buffers.get("muse_bf16_rans_m") is not None
+                            and l.muse_bf16_lane_index.data_ptr() not in _BF16_DUAL_RANS_M
+                            and l.muse_bf16_lane_index.data_ptr() not in _BF16_DUAL_RANS_M_GATE_PTRS
+                        ]
                         if not m_layers:
                             continue
                         dev = m_layers[0]._buffers["muse_bf16_rans_m"].device
@@ -1215,7 +1242,9 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                             st_list.append((_tm(sb[:ref_b.numel()], bexps[0]), si))
                             spares.append(sb)
                         st_list.sort(key=lambda pair: pair[0])
+                        slow_cut = median(ht + [t for t, _ in st_list])
                         at = list(ht)
+                        used_spares: set[int] = set()
                         sp_i = moved_m = 0
                         for hi in sorted(range(len(m_layers)), key=lambda idx: -ht[idx]):
                             if sp_i >= len(st_list):
@@ -1229,13 +1258,103 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                                 if tn < ht[hi]:
                                     m_layers[hi]._buffers["muse_bf16_rans_m"] = dst
                                     _bf16_mod.update_m_rans(m_layers[hi].muse_bf16_lane_index, dst)
+                                    used_spares.add(si)
+                                    rejected_hold.append(h)
+                                    if ht[hi] > slow_cut:
+                                        _SLOW_HOLD.append(h)
                                     at[hi] = tn
                                     moved_m += 1
                                 sp_i += 1
+                        for t_sp, si in st_list:
+                            if si not in used_spares:
+                                rejected_hold.append(spares[si])
+                                if t_sp > slow_cut:
+                                    _SLOW_HOLD.append(spares[si])
                         del spares, x7, out7
                         logger.info(
                             "Decode BF16 multi-M rANS placement %dx%d: %d blobs (~%.0f MiB), %d moved; sum %.3f -> %.3f ms",
                             n, k, len(m_layers), max_len / (1 << 20), moved_m, sum(ht), sum(at),
+                        )
+                if (
+                    hasattr(_bfx_ext, "rans_gemm_dual_out")
+                    and update_bf16_dual_rans_m is not None
+                    and _BF16_DUAL_RANS_M
+                ):
+                    dual_mods = [
+                        m for m in model.modules()
+                        if m._buffers.get("_bf16_qkv_gate_rans_m") is not None
+                        and hasattr(m, "qkv_proj")
+                        and getattr(m.qkv_proj, "muse_bf16_lane_index", None) is not None
+                        and m.qkv_proj.muse_bf16_lane_index.data_ptr() in _BF16_DUAL_RANS_M
+                    ]
+                    if dual_mods:
+                        dev = dual_mods[0]._buffers["_bf16_qkv_gate_rans_m"].device
+                        max_len = max(m._buffers["_bf16_qkv_gate_rans_m"].numel() for m in dual_mods)
+                        x16 = torch.zeros((16, 6656), dtype=torch.bfloat16, device=dev)
+                        oq16 = torch.empty((16, 4608), dtype=torch.bfloat16, device=dev)
+                        og16 = torch.empty((16, 4096), dtype=torch.bfloat16, device=dev)
+                        bexps = [
+                            _BF16_DUAL_RANS_M[m.qkv_proj.muse_bf16_lane_index.data_ptr()][1]
+                            for m in dual_mods
+                        ]
+                        def _tm_dual(buf, be):
+                            ts = []
+                            for _ in range(4):
+                                evict_buf.zero_()
+                                e0 = torch.cuda.Event(enable_timing=True)
+                                e1 = torch.cuda.Event(enable_timing=True)
+                                e0.record()
+                                _bfx_ext.rans_gemm_dual_out(x16, buf, oq16, og16, 4608, 4096, 6656, be)
+                                e1.record()
+                                torch.cuda.synchronize(dev)
+                                ts.append(e0.elapsed_time(e1))
+                            ts.sort()
+                            return ts[len(ts) // 2]
+                        _bfx_ext.rans_gemm_dual_out(
+                            x16, dual_mods[0]._buffers["_bf16_qkv_gate_rans_m"], oq16, og16, 4608, 4096, 6656, bexps[0]
+                        )
+                        torch.cuda.synchronize(dev)
+                        ht = [_tm_dual(m._buffers["_bf16_qkv_gate_rans_m"], bexps[i]) for i, m in enumerate(dual_mods)]
+                        ref_b = dual_mods[0]._buffers["_bf16_qkv_gate_rans_m"]
+                        spares, st_list = [], []
+                        for si in range(min(15, len(dual_mods) * 2)):
+                            sb = torch.empty(max_len, dtype=torch.uint8, device=dev)
+                            sb[:ref_b.numel()].copy_(ref_b)
+                            st_list.append((_tm_dual(sb[:ref_b.numel()], bexps[0]), si))
+                            spares.append(sb)
+                        st_list.sort(key=lambda pair: pair[0])
+                        slow_cut = median(ht + [t for t, _ in st_list])
+                        at = list(ht)
+                        used_spares_d: set[int] = set()
+                        sp_i = moved_d = 0
+                        for hi in sorted(range(len(dual_mods)), key=lambda idx: -ht[idx]):
+                            if sp_i >= len(st_list):
+                                break
+                            t_sp, si = st_list[sp_i]
+                            if t_sp < ht[hi] * 0.99:
+                                h = dual_mods[hi]._buffers["_bf16_qkv_gate_rans_m"]
+                                dst = spares[si][:h.numel()]
+                                dst.copy_(h)
+                                tn = _tm_dual(dst, bexps[hi])
+                                if tn < ht[hi]:
+                                    dual_mods[hi]._buffers["_bf16_qkv_gate_rans_m"] = dst
+                                    update_bf16_dual_rans_m(dual_mods[hi].qkv_proj.muse_bf16_lane_index, dst)
+                                    used_spares_d.add(si)
+                                    rejected_hold.append(h)
+                                    if ht[hi] > slow_cut:
+                                        _SLOW_HOLD.append(h)
+                                    at[hi] = tn
+                                    moved_d += 1
+                                sp_i += 1
+                        for t_sp, si in st_list:
+                            if si not in used_spares_d:
+                                rejected_hold.append(spares[si])
+                                if t_sp > slow_cut:
+                                    _SLOW_HOLD.append(spares[si])
+                        del spares, x16, oq16, og16
+                        logger.info(
+                            "Decode BF16 stacked qkv+gate rANS placement 8704x6656: %d blobs (~%.0f MiB), %d moved; sum %.3f -> %.3f ms",
+                            len(dual_mods), max_len / (1 << 20), moved_d, sum(ht), sum(at),
                         )
             except Exception as err:  # noqa: BLE001
                 logger.warning("Decode BF16 multi-M rANS placement skipped: %s", err)

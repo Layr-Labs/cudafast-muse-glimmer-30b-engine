@@ -14,6 +14,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include <stdint.h>
 
 namespace {
@@ -36,14 +37,13 @@ __global__ void native_leaf_prepare_tree_kernel(
   seq_lens[0] = seq_lens[0] + (tree_m - 7);
 }
 
-
-// Calibrated path-probability scorer (fit on 12 logged prompts / 1587 steps, see /root/treesim/calib.json).
+// Calibrated path-probability scorer for Q=16 hybrid INT4/INT3 (fit on 25 held-out prompts / 775 steps / 2,432 pos).
 // p(j,r) = exp(a_j + [post] a2_j + c_r + beta*(z_r - z_0)) / (1 + sum_{r<6} exp(...)), top-6 logits only.
-__constant__ float kCalA[6] = {2.424960f, 2.398534f, 2.506250f, 2.405109f, 1.847292f, 1.554834f};
-__constant__ float kCalA2[6] = {0.000000f, -1.911495f, -1.996907f, -1.750445f, -1.656647f, -1.742837f};
-__constant__ float kCalC[6] = {0.000000f, -0.562780f, -0.737762f, -0.996889f, -1.154073f, -1.388877f};
-#define CAL_BETA 0.714893f
-#define CAL_SHIFT 0.0650f
+__constant__ float kCalA[6] = {2.306506f, 1.887325f, 1.855997f, 2.466950f, 2.011343f, 2.128308f};
+__constant__ float kCalA2[6] = {0.000000f, -2.179998f, -1.811194f, -2.501970f, -1.662824f, -1.848898f};
+__constant__ float kCalC[6] = {0.000000f, -0.577494f, -1.005365f, -1.001172f, -1.611217f, -2.073095f};
+#define CAL_BETA 0.818139f
+#define CAL_SHIFT 0.0349f
 
 // Arbitrary-depth (1..6-level) dynamic multi-leaf tree setup (rows 7..tree_m-1), launched as 1 warp (<<<1, 32>>>, <2 us):
 //   - Bit-packed remap inside int32[49] (1 + 16*3):
@@ -76,10 +76,27 @@ __global__ void native_leaf_setup_tree_kernel(
     int max_depth,
     float sub_coef,
     float shf_coef,
-    float cont_decay) {
+    float cont_decay,
+    int adapt_gamma,
+    int calib_mode) {
   const int tid = threadIdx.x;
   const bool high_acc = (req_acc_state != nullptr && req_acc_state[2] != 0);
   const int eff_max_depth = (max_depth < 1) ? 1 : ((max_depth > 6) ? 6 : max_depth);
+  // Online request-adaptive gamma_eff (used only when calib_mode == 0).
+  float eff_gamma = gamma;
+  if (calib_mode == 0 && adapt_gamma != 0 && req_acc_state != nullptr) {
+    const int32_t rr = req_acc_state[0];
+    const int32_t cc = req_acc_state[1];
+    if (rr >= 3 && cc > rr) {
+      const float mean_ns = static_cast<float>(cc) / static_cast<float>(rr);
+      const float chain_ns = (mean_ns > 1.45f) ? (mean_ns - 0.45f) : 1.0f;
+      const float p_emp = (chain_ns - 1.0f) / chain_ns;
+      const float g_adapt = 0.5f * gamma + 0.5f * (p_emp + 0.18f);
+      if (g_adapt < eff_gamma) {
+        eff_gamma = (g_adapt < 0.78f) ? 0.78f : g_adapt;
+      }
+    }
+  }
 
   // Chain rows 0..6: plain causal lengths p+1 .. p+7, no KV remap.
   if (tid < 7) {
@@ -206,27 +223,50 @@ __global__ void native_leaf_setup_tree_kernel(
     s_valid_row[tid] = row_ok ? 1 : 0;
     s_z0[tid] = z0;
     if (row_ok) {
-      float e0[6], e1[6];
-      float den0 = 1.0f, den1 = 1.0f;
+      if (calib_mode != 0) {
+        float e0[6], e1[6];
+        float den0 = 1.0f, den1 = 1.0f;
 #pragma unroll
-      for (int rk = 0; rk < 6; ++rk) {
-        const int64_t tok_r = tree_top[base + rk];
-        const float zr = tree_vals[base + rk];
-        if (rk == 0 || (tok_r >= 0 && zr > -1e20f)) {
-          const float g = kCalC[rk] + CAL_BETA * (zr - z0);
-          e0[rk] = __expf(kCalA[tid] + g);
-          e1[rk] = __expf(kCalA[tid] + kCalA2[tid] + g);
-        } else {
-          e0[rk] = 0.0f; e1[rk] = 0.0f;
+        for (int rk = 0; rk < 6; ++rk) {
+          const int64_t tok_r = tree_top[base + rk];
+          const float zr = tree_vals[base + rk];
+          if (rk == 0 || (tok_r >= 0 && zr > -1e20f)) {
+            const float g = kCalC[rk] + CAL_BETA * (zr - z0);
+            e0[rk] = __expf(kCalA[tid] + g);
+            e1[rk] = __expf(kCalA[tid] + kCalA2[tid] + g);
+          } else {
+            e0[rk] = 0.0f;
+            e1[rk] = 0.0f;
+          }
+          den0 += e0[rk];
+          den1 += e1[rk];
         }
-        den0 += e0[rk];
-        den1 += e1[rk];
-      }
 #pragma unroll
-      for (int rk = 0; rk < 6; ++rk) s_pr[tid][rk] = e0[rk] / den0;
-      s_p1post[tid] = e1[0] / den1;
-      s_Z[tid] = den0;
-      s_p1[tid] = s_pr[tid][0];
+        for (int rk = 0; rk < 6; ++rk) {
+          s_pr[tid][rk] = e0[rk] / den0;
+        }
+        s_p1post[tid] = e1[0] / den1;
+        s_Z[tid] = den0;
+        s_p1[tid] = s_pr[tid][0];
+      } else {
+        float sum_e = 1.0f;
+        float last_e = 0.0f;
+#pragma unroll
+        for (int rk = 1; rk < 6; ++rk) {
+          const int64_t tok_r = tree_top[base + rk];
+          const float zr = tree_vals[base + rk];
+          if (tok_r >= 0 && zr > -1e20f) {
+            const float er = __expf((zr - z0) * inv_temp);
+            sum_e += er;
+            last_e = er;
+          }
+        }
+        const float z_tot = sum_e + tail_c * last_e;
+        s_Z[tid] = z_tot;
+        const float p1 = eff_gamma / z_tot;
+        s_p1[tid] = (p1 < 1.0f) ? p1 : 1.0f;
+        s_p1post[tid] = 0.0f;
+      }
     } else {
       s_Z[tid] = 1e30f;
       s_p1[tid] = 0.0f;
@@ -271,7 +311,9 @@ __global__ void native_leaf_setup_tree_kernel(
         }
       }
       if (ok) {
-        const float pr = s_pr[row_idx][rank];
+        const float pr = (calib_mode != 0)
+            ? s_pr[row_idx][rank]
+            : (eff_gamma * __expf((zr - s_z0[row_idx]) * inv_temp) / s_Z[row_idx]);
         s_cand_score[tid] = s_A[row_idx] * pr;
         s_cand_tok[tid] = cand;
         s_cand_k[tid] = static_cast<int8_t>(row_idx + 1);
@@ -344,7 +386,9 @@ __global__ void native_leaf_setup_tree_kernel(
           int64_t sub_tok_spawned = -1;
           // 1) Aligned substitution continuation (`sub`, kind=1): d_{k_r+1}#1 = s_dk[k_r].
           if ((kind == 0 || kind == 1) && s_valid_row[k_r] && s_num_cands < 64) {
-            const float child_s = best_s * s_p1post[k_r];
+            const float child_s = (calib_mode != 0)
+                ? (best_s * s_p1post[k_r])
+                : (best_s * ((kind == 0) ? sub_coef : cont_decay) * s_p1[k_r]);
             const int64_t sub_tok = s_dk[k_r];
             if (child_s > 0.0f && sub_tok >= 0) {
               const int slot = s_num_cands++;
@@ -361,9 +405,9 @@ __global__ void native_leaf_setup_tree_kernel(
           if ((kind == 0 || kind == 2) && s_valid_row[k_r - 1] && s_num_cands < 64) {
             const int64_t shf_tok = s_dk[k_r - 1];
             if (shf_tok >= 0 && shf_tok != sub_tok_spawned) {
-              const float child_s = (kind == 0)
-                  ? (best_s * CAL_SHIFT)
-                  : (best_s * s_p1post[k_r - 1]);
+              const float child_s = (calib_mode != 0)
+                  ? ((kind == 0) ? (best_s * CAL_SHIFT) : (best_s * s_p1post[k_r - 1]))
+                  : ((kind == 0) ? (best_s * shf_coef) : (best_s * cont_decay * s_p1[k_r - 1]));
               if (child_s > 0.0f) {
                 const int slot = s_num_cands++;
                 s_cand_score[slot] = child_s;
@@ -415,7 +459,8 @@ __global__ void native_leaf_commit_tree_kernel(
     int stats_len,
     int32_t* __restrict__ req_acc_state,
     int tree_m,
-    int no_hit_mode) {
+    int no_hit_mode,
+    float high_acc_cpc) {
   const int mode = leaf_flag[0];
   leaf_flag[0] = 0;  // Clear immediately so non-tree steps see 0.
   int32_t ns = num_sampled[0];
@@ -472,9 +517,11 @@ __global__ void native_leaf_commit_tree_kernel(
     const int32_t c = req_acc_state[1] + ns;
     req_acc_state[0] = r;
     req_acc_state[1] = c;
-    // Dynamic high-acceptance pause (un-pauses if mean drops <= 4.0); value 2 = hard latch from ceiling clamp.
+    // On M=16 verify, pausing leaves saves 0.00 ms because FULL(16) always runs; keep all 9 leaves
+    // active unless committed_token_ceiling hard-latches req_acc_state[2]==2 (or MUSE_TREE_HIGH_ACC_CPC > 0).
     if (req_acc_state[2] != 2) {
-      req_acc_state[2] = (r >= 4 && c > 4 * r) ? 1 : 0;
+      req_acc_state[2] =
+          (high_acc_cpc > 0.0f && r >= 4 && static_cast<float>(c) > high_acc_cpc * static_cast<float>(r)) ? 1 : 0;
     }
   }
 
@@ -863,6 +910,14 @@ void native_leaf_setup_tree(
   const float eff_sub = (sub_coef >= 0.0) ? static_cast<float>(sub_coef) : 0.55f;
   const float eff_shf = (shf_coef >= 0.0) ? static_cast<float>(shf_coef) : 0.20f;
   const float eff_cont = (cont_decay >= 0.0) ? static_cast<float>(cont_decay) : 0.88f;
+  static const int adapt_gamma_env = []() -> int {
+    const char* s = std::getenv("MUSE_TREE_ADAPT_GAMMA");
+    return (!s || !*s || std::strtol(s, nullptr, 10) != 0) ? 1 : 0;
+  }();
+  static const int calib_env = []() -> int {
+    const char* s = std::getenv("MUSE_TREE_CALIB");
+    return (!s || !*s || std::strtol(s, nullptr, 10) != 0) ? 1 : 0;
+  }();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   native_leaf_setup_tree_kernel<<<1, 32, 0, st>>>(
       leaf_flag.data_ptr<int32_t>(),
@@ -884,7 +939,9 @@ void native_leaf_setup_tree(
       eff_depth,
       eff_sub,
       eff_shf,
-      eff_cont);
+      eff_cont,
+      adapt_gamma_env,
+      calib_env);
 }
 
 void native_leaf_commit_tree(
@@ -936,6 +993,12 @@ void native_leaf_commit_tree(
     TORCH_CHECK(saved_leaf_parent.value().is_cuda() && saved_leaf_parent.value().scalar_type() == torch::kInt32);
     parent_ptr = saved_leaf_parent.value().data_ptr<int32_t>();
   }
+  static const float high_acc_cpc_env = []() -> float {
+    const char* s = std::getenv("MUSE_TREE_HIGH_ACC_CPC");
+    if (!s || !*s) return 0.0f;
+    const double v = std::strtod(s, nullptr);
+    return (v > 0.0) ? static_cast<float>(v) : 0.0f;
+  }();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   native_leaf_commit_tree_kernel<<<1, 1, 0, st>>>(
       leaf_flag.data_ptr<int32_t>(),
@@ -954,7 +1017,8 @@ void native_leaf_commit_tree(
       stats_len,
       acc_ptr,
       static_cast<int>(tree_m),
-      no_hit_mode ? 1 : 0);
+      no_hit_mode ? 1 : 0,
+      high_acc_cpc_env);
 }
 
 void native_leaf_setup(
