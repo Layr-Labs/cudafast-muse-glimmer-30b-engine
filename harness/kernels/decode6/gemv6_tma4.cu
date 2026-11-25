@@ -644,6 +644,24 @@ extern "C" int muse_marlin6_sk_tma4_ilv_swiglu_fp8(
       n, k, 48, device, stream, nullptr, nullptr, nullptr, 0, nullptr, fp8_scale, fp8_out);
 }
 
+extern "C" int muse_marlin6_sk_tma4_ilv_swiglu_fp8_m(
+    const int4* input, const int4* weight, int4* scratch_out, int4* partials,
+    const int4* coded, const int4* palette, const float* global_scale,
+    int* locks, const float* fp8_scale, uint8_t* fp8_out,
+    int m, int n, int k, int blocks, int device, cudaStream_t stream) {
+  if (m < 1 || m > 16 || n != 39936 || k != 6656 || blocks != 48 ||
+      fp8_scale == nullptr || fp8_out == nullptr)
+    return cudaErrorInvalidValue;
+  static const int gu_st = decode6_tma4_stages("MUSE_TMA4_SWIGLU_M_STAGES", 3);
+  if (gu_st == 3)
+    return launch_tma4_m<128, 256, false, true, false, true, false, false, 3, false, 0, true, true, false, true>(
+        input, weight, scratch_out, partials, coded, palette, global_scale, locks,
+        n, k, 48, device, stream, nullptr, nullptr, nullptr, 0, nullptr, fp8_scale, fp8_out, m);
+  return launch_tma4_m<128, 256, false, true, false, true, false, false, 4, false, 0, true, true, false, true>(
+      input, weight, scratch_out, partials, coded, palette, global_scale, locks,
+      n, k, 48, device, stream, nullptr, nullptr, nullptr, 0, nullptr, fp8_scale, fp8_out, m);
+}
+
 extern "C" int muse_marlin6_sk_tma4_lmpost(
     const int4* input, const int4* weight, int4* scratch, int4* partials,
     const int4* coded, const int4* palette, const float* global_scale, int* locks,
