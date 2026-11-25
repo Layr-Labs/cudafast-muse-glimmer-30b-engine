@@ -3,7 +3,7 @@
 
 Replaces verify row 6 (d6, rarely reached in low-acceptance regimes) with `alt`, the drafter's
 2nd-best token for position p+1, when the prior verify committed <= MUSE_NATIVE_LEAF_THRESH
-tokens (default 3). Unlike side-stream 2-row attention (+1.8 ms/step), this uses a 5-line
+tokens (default 4). Unlike side-stream 2-row attention (+1.8 ms/step), this uses a 5-line
 logical KV-index remap inside gqa16_fa2_block128_pipe_kernel<true>:
   - Row 6 writes its RoPE(p+1) K/V directly into slot p+6 (never read by causal rows 0..5).
   - gqa16_verify runs row 6 with seqlen_k = p+2 and remaps tok==(p+1) -> (p+6) for both K and V,
@@ -30,7 +30,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 ENABLED = os.environ.get("MUSE_NATIVE_LEAF", "1").strip() not in ("0", "", "false", "no")
-LOW_THRESH = int(os.environ.get("MUSE_NATIVE_LEAF_THRESH", "3"))
+LOW_THRESH = int(os.environ.get("MUSE_NATIVE_LEAF_THRESH", "4"))
 SELFTEST = os.environ.get("MUSE_NATIVE_LEAF_SELFTEST", "0").strip() in ("1", "true", "yes")
 NOHIT = os.environ.get("MUSE_NATIVE_LEAF_NOHIT", "0").strip() in ("1", "true", "yes")
 
