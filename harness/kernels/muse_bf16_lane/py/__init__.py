@@ -44,6 +44,9 @@ def _lib():
         native.muse_bf16_rans_pass2.restype = ctypes.c_int
         native.muse_bf16_rans_gemv.argtypes = [ctypes.c_int, ctypes.c_size_t, ptr, ptr, ptr, ptr]
         native.muse_bf16_rans_gemv.restype = ctypes.c_int
+    if hasattr(native, "muse_bf16_rans_gemm_m"):
+        native.muse_bf16_rans_gemm_m.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_size_t, ptr, ptr, ptr, ptr, ptr]
+        native.muse_bf16_rans_gemm_m.restype = ctypes.c_int
     if hasattr(native, "muse_bf16_lane_set_pdl"):
         native.muse_bf16_lane_set_pdl.argtypes = [ctypes.c_int]
         native.muse_bf16_lane_set_pdl.restype = ctypes.c_int
@@ -82,7 +85,7 @@ def _pack_rans(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None
     if native is None or not hasattr(native, "muse_bf16_rans_gemv"):
         return None
     rows, k = weight.shape
-    tw = 576 if rows == 4608 else (512 if rows == 4096 else rows // 8)
+    tw = 576 if rows == 4608 else (512 if rows == 4096 else min(rows // 8, 768))
     if tw <= 0:
         return None
     dev = weight.device

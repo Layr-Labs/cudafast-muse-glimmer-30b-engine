@@ -244,8 +244,8 @@
       "why": "Route 2..8-row FP8 GEMMs (the speculative verify width) through the rANS-compressed decode stream (muserans rans_gemm_m_auto): A rows 0..M-1 of the same m16n8k32 MMA chain, so every row is bitwise the M == 1 GEMV."
     },
     {
-      "file": "vllm/model_executor/layers/muse_draft_fp8.py, vllm/model_executor/layers/linear.py, vllm/model_executor/models/qwen3_dflash.py, vllm/model_executor/layers/muse_bfx.py; harness/kernels/decode6/muse_marlin6_gemv.py",
-      "why": "Drafter-only: FP8 e4m3 per-row weight-only copies of the pinned DFlash drafter's bias-free linears, run through stock Marlin W8A16 at 1..16 rows (BF16 weight kept for larger M); load-time checked, any failure keeps the previous path; target untouched. Multi-row paired gate_up output un-paired by one exact 64-column tile gather (newjordan 833fb6c4)."
+      "file": "vllm/model_executor/layers/muse_bfx.py",
+      "why": "DFlash drafter MLP weights (gate_up, down) held as 4-bit NF4 codes with a bf16 per-32 scale (fitted at load from the pinned BF16 weights; proposals only, the target verifies every committed token) read by harness/kernels/musebfx nf4 GEMM at <= 8 rows; drafter attention/fc keep the lossless 12-bit code (split-K for long K)."
     }
   ],
   "carried_from": {
