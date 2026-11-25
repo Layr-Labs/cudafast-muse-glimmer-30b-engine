@@ -417,10 +417,13 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
     }
   } else if (pb.act_mode == 1) {
     const float inv_sa = rans_full_rcp(__ldg(pb.sa));
-    const uint16_t* gate_u16 = (const uint16_t*)pb.x;
-    const uint16_t* attn_u16 = pb.x_aux;
-    for (int i = tid; i < S * 4; i += blockDim.x) {
-      const int base0 = 32 * (i >> 2) + 4 * (i & 3);
+    const int stride_s = 4 * pb.M;
+    for (int i = tid; i < S * stride_s; i += blockDim.x) {
+      const int s = i / stride_s, rem = i - s * stride_s;
+      const int m = rem >> 2, tt = rem & 3;
+      const uint16_t* gate_u16 = (const uint16_t*)pb.x + (size_t)m * K;
+      const uint16_t* attn_u16 = pb.x_aux + (size_t)m * K;
+      const int base0 = 32 * s + 4 * tt;
       const int base1 = base0 + 16;
       const uint2 g0 = *(const uint2*)(gate_u16 + base0), a0 = *(const uint2*)(attn_u16 + base0);
       const uint2 g1 = *(const uint2*)(gate_u16 + base1), a1 = *(const uint2*)(attn_u16 + base1);
@@ -789,15 +792,14 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   pb.pdl_mode = pdl_mode;
   size_t dsmem = rans_dsmem(K, wpb, 9, rg);
   if (M > 1) {
-    // M rows: stage M*K bytes of x if it fits with this wpb, else fewer warps per block, else read x from global.
+    // M rows: stage M*K bytes of x if it fits with this wpb, else read x from global (act_mode==0 only).
     if (rans_fits(M * K, wpb, 9, rg)) {
       dsmem = rans_dsmem(M * K, wpb, 9, rg);
     } else {
+      TORCH_CHECK(act_mode == 0, "rans fused act_mode requires M*K to fit in smem");
       pb.x_global = 1; dsmem = rans_dsmem(0, wpb, 9, rg);
     }
     blocks = (tw + wpb - 1) / wpb;
-    pb.strided_w = 0;
-    pb.pdl_mode = 0;
   }
   TORCH_CHECK(M > 1 || rans_fits(K, wpb, 9, rg), "rans smem too large (K too large for smem staging of x): ", dsmem);
   static const bool lock48 = []() {
@@ -857,8 +859,30 @@ void rans_gemm_m_auto(torch::Tensor blob, torch::Tensor x, torch::Tensor sb, tor
   TORCH_CHECK(sa.is_cuda() && sa.scalar_type() == torch::kFloat && sa.numel() == 1, "bad sa");
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == x.size(0) * N, "bad out");
   RansCfg c = rans_pick_cfg((int)N, (int)K);
+  // Verify-width down projections cannot stage all M activation rows in shared memory. Grouping the 832 independent
+  // output warps into 44 CTAs x 19 warps cuts the launch tail from 14 to 4 inactive warp slots and removes three
+  // duplicated CTA LUT/prologue copies. The packed stream and every warp's k-ordered MMA chain are unchanged.
+  if (N == 6656 && K == 19968) c.wpb = 19;
   rans_launch((const uint8_t*)blob.data_ptr(), (size_t)blob.numel(), c.tw, c.ns, c.wpb, c.rg, c.ilv, (const uint8_t*)x.data_ptr(), nullptr, 0, (const float*)sb.data_ptr(), sb.numel() == 1, (const float*)sa.data_ptr(), (__nv_bfloat16*)out.data_ptr(),
               (int)N, (int)K, c10::cuda::getCurrentCUDAStream(), (int)x.size(0));
+}
+
+void rans_gemm_m_fused_auto(torch::Tensor blob, torch::Tensor x0, torch::Tensor x1, torch::Tensor sb, torch::Tensor sa, torch::Tensor out, int64_t N, int64_t K, int64_t act_mode) {
+  TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "blob must be contiguous uint8");
+  TORCH_CHECK(N > 0 && K > 0 && N % 8 == 0 && K % 64 == 0, "need N%8==0 and K%64==0");
+  TORCH_CHECK(act_mode == 1, "rans_gemm_m_fused_auto supports act_mode == 1");
+  TORCH_CHECK(x0.is_cuda() && x0.scalar_type() == torch::kBFloat16 && x0.is_contiguous(), "x0 must be contiguous bf16");
+  TORCH_CHECK(x1.is_cuda() && x1.scalar_type() == torch::kBFloat16 && x1.is_contiguous(), "x1 must be contiguous bf16");
+  TORCH_CHECK(x0.numel() == x1.numel() && x0.numel() % K == 0, "x0/x1 numel mismatch");
+  const int64_t M = x0.numel() / K;
+  TORCH_CHECK(M >= 1 && M <= 8, "M must be in 1..8");
+  TORCH_CHECK(((reinterpret_cast<uintptr_t>(x0.data_ptr()) | reinterpret_cast<uintptr_t>(x1.data_ptr())) & 7u) == 0u, "x0/x1 must be 8-byte aligned");
+  TORCH_CHECK(sb.is_cuda() && sb.scalar_type() == torch::kFloat && sb.is_contiguous() && (sb.numel() == N || sb.numel() == 1), "bad sb");
+  TORCH_CHECK(sa.is_cuda() && sa.scalar_type() == torch::kFloat && sa.numel() == 1, "bad sa");
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == M * N, "bad out");
+  RansCfg c = rans_pick_cfg((int)N, (int)K);
+  rans_launch((const uint8_t*)blob.data_ptr(), (size_t)blob.numel(), c.tw, c.ns, c.wpb, c.rg, c.ilv, (const uint8_t*)x0.data_ptr(), (const uint16_t*)x1.data_ptr(), 1, (const float*)sb.data_ptr(), sb.numel() == 1, (const float*)sa.data_ptr(), (__nv_bfloat16*)out.data_ptr(),
+              (int)N, (int)K, c10::cuda::getCurrentCUDAStream(), (int)M);
 }
 
 int64_t rans_tpf_kb() { return static_cast<int64_t>(rans_tpf_stride() >> 10); }
@@ -894,6 +918,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_gemv_auto", &rans_gemv_auto);
   m.def("rans_gemm_m_auto", &rans_gemm_m_auto);
   m.def("rans_gemv_fused_auto", &rans_gemv_fused_auto);
+  m.def("rans_gemm_m_fused_auto", &rans_gemm_m_fused_auto);
   m.def("rans_gemv_cfg", &rans_gemv_cfg);
   m.def("rans_cfg_info", &rans_cfg_info);
   m.def("rans_blob_cfg", &rans_blob_cfg);
