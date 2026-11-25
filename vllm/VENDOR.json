@@ -246,6 +246,10 @@
     {
       "file": "vllm/model_executor/layers/muse_draft_fp8.py, vllm/model_executor/layers/linear.py, vllm/model_executor/models/qwen3_dflash.py, vllm/model_executor/layers/muse_bfx.py; harness/kernels/decode6/muse_marlin6_gemv.py",
       "why": "Drafter-only: FP8 e4m3 per-row weight-only copies of the pinned DFlash drafter's bias-free linears, run through stock Marlin W8A16 at 1..16 rows (BF16 weight kept for larger M); load-time checked, any failure keeps the previous path; target untouched. Multi-row paired gate_up output un-paired by one exact 64-column tile gather (newjordan 833fb6c4)."
+    },
+    {
+      "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
+      "why": "bs=1 speculative-decode host cuts: one-request draft steps read query_start_loc, cu_num_logits, expanded_idx_mapping and expanded_local_pos from read-only tensors built once in load_model (same contents) instead of a pin + H2D copy and an expand kernel per step; the per-step draft-token gather handed to DraftTokensHandler is skipped when no structured-output request needs its contents (only its shape is read); in RejectionSampler._verify_in_chunks the identity shift cu_num_logits - 0 is replaced by read-only slices when the chunk starts at logit 0."
     }
   ],
   "carried_from": {
