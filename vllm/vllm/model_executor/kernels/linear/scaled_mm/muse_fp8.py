@@ -37,6 +37,12 @@ except Exception:  # noqa: BLE001
     _rans = None
 
 _stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False}
+# Verify-step rows (M = 2..8, the drafter's verify batch): the rANS blob through the same per-row MMA chain and
+# epilogue as the M <= 16 CUTLASS tile, admitted per (N, K) only when every layer of that shape matched
+# _small_row_fp8 bitwise at load. MUSERANS_ROWS=0 keeps every M > 1 call on _small_row_fp8.
+_ROWS_MAX = 8
+_rows_ok: dict[tuple[int, int], bool] = {}
+_ROWS = os.environ.get("MUSERANS_ROWS", "1") != "0"
 _decode_gemm_operand = None
 _consume_rans_prologue = None
 
@@ -78,6 +84,9 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
             if _self_check(lambda xq, out: _rans.rans_gemv_auto(blob, xq.view(-1), ws.reshape(-1), xs.reshape(-1), out, n, k), w, ws, xs):
                 _stats["admitted"] += 1
                 _stats["rans"] += 1
+                if _ROWS and hasattr(_rans, "rans_gemm_rows_auto"):
+                    ok_rows = _rows_check(blob, w, ws, xs)
+                    _rows_ok[(n, k)] = _rows_ok.get((n, k), True) and ok_rows
                 # The magic byte 'A' at blob[0] marks the compressed format for the op (one uint8 buffer either way).
                 layer.register_buffer("muse_fp8_packed", blob, persistent=False)
                 return blob
@@ -95,6 +104,29 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
     # A buffer, so the weight-range bookkeeping (l2pf) sees it as model memory.
     layer.register_buffer("muse_fp8_packed", packed, persistent=False)
     return packed
+
+
+def _rows_check(blob: torch.Tensor, w_kn: torch.Tensor, sb: torch.Tensor, sa: torch.Tensor) -> bool:
+    """rans_gemm_rows_auto vs _small_row_fp8 (the M <= 16 path it replaces) on this weight, bitwise, for M = 2, 7, 8
+    with large and cancelling activations."""
+    k, n = w_kn.shape
+    gen = torch.Generator(device=w_kn.device)
+    gen.manual_seed(n * 131 + k + 11)
+    try:
+        for m, scale in ((7, 0.05), (7, 1.0), (7, 40.0), (2, 8.0), (8, 8.0)):
+            x = torch.randn(m, k, generator=gen, device=w_kn.device) * scale
+            x[:, ::3] *= 16
+            x[:, 1::2] = -x[:, ::2]
+            xq = (x / sa.float().reshape(1, 1)).clamp(-448, 448).to(torch.float8_e4m3fn).contiguous()
+            ref = _small_row_fp8(xq, w_kn, sa, sb)
+            got = torch.empty(m, n, dtype=torch.bfloat16, device=w_kn.device)
+            _rans.rans_gemm_rows_auto(blob, xq, sb.reshape(-1), sa.reshape(-1), got, n, k)
+            if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+                return False
+    except Exception as e:  # noqa: BLE001
+        logger.warning("muserans rows: self-check failed (%s); M > 1 stays on the CUTLASS tile", e)
+        return False
+    return True
 
 
 def _self_check(run, w_kn: torch.Tensor, sb: torch.Tensor, sa: torch.Tensor) -> bool:
@@ -128,6 +160,8 @@ def _muse_fp8_scaled_mm(
             "attention gate GEMV on %d blocks",
             _stats["admitted"], _stats["rans"], tpf_note, _stats["rejected"], gate_blks,
         )
+        logger.info("muserans verify rows (M 2..%d): %s", _ROWS_MAX,
+                    ", ".join(f"{n}x{k} {'on' if v else 'OFF'}" for (n, k), v in sorted(_rows_ok.items())) or "none")
     if A.shape[0] <= 16 and _decode_gemm_operand is not None:
         A = _decode_gemm_operand(A)
     k, n = B.shape
@@ -146,6 +180,17 @@ def _muse_fp8_scaled_mm(
             _mf.gemv(packed, A, Bs, As, out, n, k)
         else:
             _rans.rans_gemv_auto(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
+        return out
+    if (
+        1 < A.shape[0] <= _ROWS_MAX
+        and packed.numel() > 0
+        and packed.numel() != n * k
+        and _rows_ok.get((n, k), False)
+        and A.is_contiguous()
+        and _scales_ok(As, Bs, n)
+    ):
+        out = torch.empty((A.shape[0], n), dtype=torch.bfloat16, device=A.device)
+        _rans.rans_gemm_rows_auto(packed, A, Bs.reshape(-1), As.reshape(-1), out, n, k)
         return out
     return _small_row_fp8(A, B, As, Bs)
 
