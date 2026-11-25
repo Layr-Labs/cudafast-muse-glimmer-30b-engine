@@ -234,6 +234,10 @@
     {
       "file": "vllm/v1/worker/gpu/prefill_graph.py, vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/dflash/speculator.py",
       "why": "Enable the 512-token whole-forward prefill CUDA graph (including zero-prep replay) when DFlash auxiliary hidden states are enabled, skip the DFlash drafter on max_tokens == 1 batches in the V2 GPU model runner (matching V1's _drafts_can_be_verified), and skip redundant eager Python attention-metadata and slot-mapping construction on FULL CUDA graph replays for both the target verify step and DFlash draft step."
+    },
+    {
+      "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
+      "why": "bs=1 speculative-decode host cuts: one-request draft steps read query_start_loc, cu_num_logits, expanded_idx_mapping and expanded_local_pos from read-only tensors built once in load_model (same contents) instead of a pin + H2D copy and an expand kernel per step, and the per-step draft-token gather handed to DraftTokensHandler is skipped when no structured-output request needs its contents (only its shape is read); in RejectionSampler._verify_in_chunks the identity shift cu_num_logits - 0 is replaced by read-only slices when the chunk starts at logit 0."
     }
   ],
   "carried_from": {
