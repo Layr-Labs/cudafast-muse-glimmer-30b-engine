@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import io
+import os
 from collections.abc import Iterable
 
 import torch
@@ -502,6 +503,36 @@ class DFlashQwen3Model(nn.Module):
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
 
+    def _enable_bf16_rans_rows(self) -> None:
+        """Lossless rANS repack of the K = 6656 BF16 linears (qkv_proj, gate_up_proj) for M <= 8.
+
+        Runs after _build_fused_kv_buffers (which copies the K/V rows out of
+        qkv_proj.weight). The weights stay in place, byte-identical; the blob is a
+        non-persistent buffer read by muse_bf16_lane's rows kernel for calls with
+        1..8 rows, and M > 8 or any rejected layer keeps F.linear.
+        MUSE_DRAFTER_RANS=0 (read once, here) turns it off.
+        """
+        if os.environ.get("MUSE_DRAFTER_RANS", "1") == "0":
+            return
+        if get_tensor_model_parallel_world_size() != 1:
+            return
+        try:
+            from muse_bf16_lane import enable_rows
+        except ImportError:
+            return
+        admitted = rejected = 0
+        for layer in self.layers:
+            for linear in (layer.self_attn.qkv_proj, layer.mlp.gate_up_proj):
+                if enable_rows(linear):
+                    admitted += 1
+                else:
+                    rejected += 1
+        logger.info(
+            "DFlash drafter BF16 rANS rows (M <= 8): %d linears admitted, %d kept on F.linear",
+            admitted,
+            rejected,
+        )
+
     def _project_context_kv(
         self,
         context_states: torch.Tensor,
@@ -814,6 +845,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
         loader.load_weights(model_weights.items())
         self.model._build_fused_kv_buffers()
+        # After _build_fused_kv_buffers: it copies K/V rows out of qkv_proj.weight.
+        self.model._enable_bf16_rans_rows()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.
