@@ -130,26 +130,139 @@ softcap_argmax_kernel(const __nv_bfloat16* __restrict__ logits, const uint16_t* 
   }
 }
 
-__global__ void greedy_verify_kernel(
-    const int64_t* __restrict__ target_argmax,
-    const int32_t* __restrict__ input_ids,
-    const int64_t* __restrict__ logits_indices,
-    int32_t* __restrict__ num_sampled_out,
-    int32_t* __restrict__ num_rejected_out,
-    int m) {
-  int accepted = 0;
-  for (int i = 0; i < m - 1; ++i) {
-    const int64_t idx = logits_indices ? logits_indices[i + 1] : static_cast<int64_t>(i + 1);
-    const int64_t draft_tok = static_cast<int64_t>(input_ids[idx]);
-    if (target_argmax[i] == draft_tok) {
-      ++accepted;
-    } else {
-      break;
+template <bool Aligned>
+__global__ void softcap_inplace_strided_kernel(
+    __nv_bfloat16* __restrict__ logits,
+    const uint16_t* __restrict__ lut,
+    int cols,
+    int row_stride) {
+  __nv_bfloat16* row = logits + static_cast<size_t>(blockIdx.y) * static_cast<size_t>(row_stride);
+  const int gtid = blockIdx.x * kBlock + threadIdx.x;
+  const int stride = gridDim.x * kBlock;
+  int vec_end = 0;
+  if constexpr (Aligned) {
+    const int n_vec = cols >> 3;
+    vec_end = n_vec << 3;
+    uint4* vec = reinterpret_cast<uint4*>(row);
+    for (int i = gtid; i < n_vec; i += stride) {
+      uint4 v = vec[i];
+      uint16_t* p = reinterpret_cast<uint16_t*>(&v);
+#pragma unroll
+      for (int k = 0; k < 8; ++k) p[k] = __ldg(lut + p[k]);
+      vec[i] = v;
     }
   }
-  const int32_t ns = static_cast<int32_t>(accepted + 1);
-  num_sampled_out[0] = ns;
-  num_rejected_out[0] = static_cast<int32_t>(m) - ns;
+  uint16_t* raw = reinterpret_cast<uint16_t*>(row);
+  for (int i = vec_end + gtid; i < cols; i += stride) {
+    raw[i] = __ldg(lut + raw[i]);
+  }
+}
+
+template <bool Aligned>
+__global__ void __launch_bounds__(kBlock)
+softcap_argmax_rows_strided_kernel(
+    const __nv_bfloat16* __restrict__ logits,
+    const uint16_t* __restrict__ lut,
+    int* __restrict__ out_argmax_i32,
+    const void* __restrict__ draft_ids,
+    int draft_ids_64,
+    int64_t* __restrict__ sampled_out,
+    int* __restrict__ num_sampled_out,
+    int* __restrict__ num_rejected_out,
+    float* __restrict__ scratch_val,
+    int* __restrict__ scratch_idx,
+    int* __restrict__ done_cnt,
+    int rows,
+    int n,
+    int row_stride) {
+  __shared__ float sv[kWarps];
+  __shared__ int si[kWarps];
+  __shared__ int am_last;
+
+  const int r = blockIdx.y;
+  const __nv_bfloat16* row_logits =
+      logits + static_cast<size_t>(r) * static_cast<size_t>(row_stride);
+  float* r_sv = scratch_val + r * kArgmaxGrid;
+  int* r_si = scratch_idx + r * kArgmaxGrid;
+  int* r_dc = done_cnt + r;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int gtid = blockIdx.x * kBlock + tid;
+  const int stride = gridDim.x * kBlock;
+
+  float bv = -INFINITY;
+  int bi = 0x7fffffff;
+
+  int vec_end = 0;
+  if constexpr (Aligned) {
+    const int n_vec = n >> 3;
+    vec_end = n_vec << 3;
+    const uint4* vec = reinterpret_cast<const uint4*>(row_logits);
+    for (int i = gtid; i < n_vec; i += stride) {
+      uint4 v = vec[i];
+      const uint16_t* p = reinterpret_cast<const uint16_t*>(&v);
+      const int base_idx = i << 3;
+#pragma unroll
+      for (int k = 0; k < 8; ++k) pick_better(bv, bi, lut_to_float(lut, p[k]), base_idx + k);
+    }
+  }
+  const uint16_t* raw = reinterpret_cast<const uint16_t*>(row_logits);
+  for (int i = vec_end + gtid; i < n; i += stride) {
+    pick_better(bv, bi, lut_to_float(lut, raw[i]), i);
+  }
+
+  block_reduce_max(bv, bi, sv, si, warp, lane);
+  if (tid == 0) {
+    r_sv[blockIdx.x] = bv;
+    r_si[blockIdx.x] = bi;
+    asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+    am_last = (atomicAdd(r_dc, 1) == static_cast<int>(gridDim.x) - 1) ? 1 : 0;
+  }
+  __syncthreads();
+  if (am_last) {
+    asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+    bv = (tid < static_cast<int>(gridDim.x)) ? ((const volatile float*)r_sv)[tid] : -INFINITY;
+    bi = (tid < static_cast<int>(gridDim.x)) ? ((const volatile int*)r_si)[tid] : 0x7fffffff;
+    block_reduce_max(bv, bi, sv, si, warp, lane);
+    if (tid == 0) {
+      *r_dc = 0;
+      out_argmax_i32[r] = bi;
+      if (sampled_out != nullptr) {
+        asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+        int* rows_dc = done_cnt + rows;
+        if (atomicAdd(rows_dc, 1) == rows - 1) {
+          asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+          *rows_dc = 0;
+          int accepted_len = 0;
+          bool accepted = true;
+          const volatile int* row_am = static_cast<const volatile int*>(out_argmax_i32);
+          for (int i = 0; i < rows - 1; ++i) {
+            const int64_t t_tok = static_cast<int64_t>(row_am[i]);
+            const int64_t d_tok = draft_ids_64
+                                      ? static_cast<const int64_t*>(draft_ids)[i + 1]
+                                      : static_cast<int64_t>(static_cast<const int32_t*>(draft_ids)[i + 1]);
+            if (accepted) {
+              if (t_tok == d_tok) {
+                sampled_out[i] = d_tok;
+                accepted_len += 1;
+              } else {
+                sampled_out[i] = t_tok;
+                accepted = false;
+              }
+            }
+          }
+          if (accepted) {
+            sampled_out[rows - 1] = static_cast<int64_t>(row_am[rows - 1]);
+          }
+          const int n_samp = accepted_len + 1;
+          *num_sampled_out = n_samp;
+          *num_rejected_out = rows - n_samp;
+        }
+      }
+    }
+  }
 }
 
 }  // namespace lmpost
@@ -161,11 +274,17 @@ extern "C" int lmpost_init() {
   if (rc != cudaSuccess) return (int)rc;
   rc = cudaFuncGetAttributes(&attr, lmpost::softcap_inplace_scalar);
   if (rc != cudaSuccess) return (int)rc;
+  rc = cudaFuncGetAttributes(&attr, lmpost::softcap_inplace_strided_kernel<true>);
+  if (rc != cudaSuccess) return (int)rc;
+  rc = cudaFuncGetAttributes(&attr, lmpost::softcap_inplace_strided_kernel<false>);
+  if (rc != cudaSuccess) return (int)rc;
   rc = cudaFuncGetAttributes(&attr, lmpost::softcap_argmax_kernel<true>);
   if (rc != cudaSuccess) return (int)rc;
   rc = cudaFuncGetAttributes(&attr, lmpost::softcap_argmax_kernel<false>);
   if (rc != cudaSuccess) return (int)rc;
-  return (int)cudaFuncGetAttributes(&attr, lmpost::greedy_verify_kernel);
+  rc = cudaFuncGetAttributes(&attr, lmpost::softcap_argmax_rows_strided_kernel<true>);
+  if (rc != cudaSuccess) return (int)rc;
+  return (int)cudaFuncGetAttributes(&attr, lmpost::softcap_argmax_rows_strided_kernel<false>);
 }
 
 extern "C" int lmpost_softcap_inplace(void* logits, const void* lut, int total_elems, void* stream) {
@@ -208,17 +327,78 @@ extern "C" int lmpost_softcap_argmax(const void* logits, const void* lut, void* 
   return (int)cudaGetLastError();
 }
 
-extern "C" int lmpost_greedy_verify(const void* target_argmax, const void* input_ids,
-                                    const void* logits_indices, void* num_sampled_out,
-                                    void* num_rejected_out, int m, void* stream) {
+extern "C" int lmpost_softcap_inplace_strided(
+    void* logits, const void* lut, int rows, int cols, int row_stride, void* stream) {
   using namespace lmpost;
-  if (m < 2 || m > 8 || target_argmax == nullptr || input_ids == nullptr ||
-      num_sampled_out == nullptr || num_rejected_out == nullptr) {
+  if (rows <= 0 || cols <= 0 || row_stride < cols) return (int)cudaErrorInvalidValue;
+  cudaStream_t st = (cudaStream_t)stream;
+  const bool aligned = (((uintptr_t)logits & 15) == 0) && ((row_stride & 7) == 0) && (cols >= 8);
+  const int n_units = aligned ? (cols >> 3) : cols;
+  int grid_x = (n_units + kBlock - 1) / kBlock;
+  if (grid_x < 1) grid_x = 1;
+  if (grid_x > 256) grid_x = 256;
+  dim3 grid(grid_x, rows);
+  if (aligned) {
+    softcap_inplace_strided_kernel<true><<<grid, kBlock, 0, st>>>(
+        (__nv_bfloat16*)logits, (const uint16_t*)lut, cols, row_stride);
+  } else {
+    softcap_inplace_strided_kernel<false><<<grid, kBlock, 0, st>>>(
+        (__nv_bfloat16*)logits, (const uint16_t*)lut, cols, row_stride);
+  }
+  return (int)cudaGetLastError();
+}
+
+extern "C" int lmpost_argmax_rows_strided(
+    const void* logits, const void* lut, void* out_argmax_i32,
+    void* scratch_val, void* scratch_idx, void* done_cnt,
+    int rows, int vocab_size, int row_stride, void* stream) {
+  using namespace lmpost;
+  if (rows <= 0 || rows > 16 || vocab_size <= 0 || row_stride < vocab_size) {
     return (int)cudaErrorInvalidValue;
   }
-  greedy_verify_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(
-      (const int64_t*)target_argmax, (const int32_t*)input_ids,
-      (const int64_t*)logits_indices, (int32_t*)num_sampled_out,
-      (int32_t*)num_rejected_out, m);
+  cudaStream_t st = (cudaStream_t)stream;
+  dim3 grid(kArgmaxGrid, rows);
+  const bool aligned = (((uintptr_t)logits & 15) == 0) && ((row_stride & 7) == 0) && (vocab_size >= 8);
+  if (aligned) {
+    softcap_argmax_rows_strided_kernel<true><<<grid, kBlock, 0, st>>>(
+        (const __nv_bfloat16*)logits, (const uint16_t*)lut, (int*)out_argmax_i32,
+        nullptr, 0, nullptr, nullptr, nullptr,
+        (float*)scratch_val, (int*)scratch_idx, (int*)done_cnt,
+        rows, vocab_size, row_stride);
+  } else {
+    softcap_argmax_rows_strided_kernel<false><<<grid, kBlock, 0, st>>>(
+        (const __nv_bfloat16*)logits, (const uint16_t*)lut, (int*)out_argmax_i32,
+        nullptr, 0, nullptr, nullptr, nullptr,
+        (float*)scratch_val, (int*)scratch_idx, (int*)done_cnt,
+        rows, vocab_size, row_stride);
+  }
+  return (int)cudaGetLastError();
+}
+
+extern "C" int lmpost_greedy_verify_strided(
+    const void* logits, const void* lut, const void* draft_ids, int draft_ids_64,
+    void* out_argmax_i32, void* sampled_out, void* num_sampled_out, void* num_rejected_out,
+    void* scratch_val, void* scratch_idx, void* done_cnt,
+    int rows, int vocab_size, int row_stride, void* stream) {
+  using namespace lmpost;
+  if (rows < 2 || rows > 16 || vocab_size <= 0 || row_stride < vocab_size) {
+    return (int)cudaErrorInvalidValue;
+  }
+  cudaStream_t st = (cudaStream_t)stream;
+  dim3 grid(kArgmaxGrid, rows);
+  const bool aligned = (((uintptr_t)logits & 15) == 0) && ((row_stride & 7) == 0) && (vocab_size >= 8);
+  if (aligned) {
+    softcap_argmax_rows_strided_kernel<true><<<grid, kBlock, 0, st>>>(
+        (const __nv_bfloat16*)logits, (const uint16_t*)lut, (int*)out_argmax_i32,
+        draft_ids, draft_ids_64, (int64_t*)sampled_out, (int*)num_sampled_out, (int*)num_rejected_out,
+        (float*)scratch_val, (int*)scratch_idx, (int*)done_cnt,
+        rows, vocab_size, row_stride);
+  } else {
+    softcap_argmax_rows_strided_kernel<false><<<grid, kBlock, 0, st>>>(
+        (const __nv_bfloat16*)logits, (const uint16_t*)lut, (int*)out_argmax_i32,
+        draft_ids, draft_ids_64, (int64_t*)sampled_out, (int*)num_sampled_out, (int*)num_rejected_out,
+        (float*)scratch_val, (int*)scratch_idx, (int*)done_cnt,
+        rows, vocab_size, row_stride);
+  }
   return (int)cudaGetLastError();
 }

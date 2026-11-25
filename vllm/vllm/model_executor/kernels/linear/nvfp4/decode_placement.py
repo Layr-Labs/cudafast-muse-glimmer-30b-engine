@@ -1062,16 +1062,6 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                                     if s6.dim() == 2 and s6.shape[1] == 32 and (s6.shape[0] + 64) * 32 < (1 << 20):
                                         dst_base = torch.empty((s6.shape[0] + 64, 32), dtype=s6.dtype, device=s6.device)
                                         dst = dst_base[: s6.shape[0]]
-                                    elif (
-                                        s6.dim() == 2
-                                        and s6.shape[1] == 32
-                                        and getattr(m, "output_size_per_partition", None) == 39936
-                                        and getattr(m, "input_size_per_partition", None) == 6656
-                                    ):
-                                        # Reserve +128 KiB fast-pool headroom so register_all_gate_up_swiglu
-                                        # always updates paired scales6 in-place without spilling to slow DRAM.
-                                        dst_base = torch.empty((s6.shape[0] + 4096, 32), dtype=s6.dtype, device=s6.device)
-                                        dst = dst_base[: s6.shape[0]]
                                     else:
                                         dst = torch.empty_like(s6)
                                     dst.copy_(s6)
@@ -1324,14 +1314,18 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             n_groups, saved_ms, time.perf_counter() - began,
         )
         try:
+            if hasattr(model, "register_stacked_bf16_attn"):
+                model.register_stacked_bf16_attn()
+        except Exception as err:  # noqa: BLE001
+            logger.warning("BF16 stacked attn registration skipped: %s", err)
+        try:
             import muse_marlin6_gemv as _m6
             if hasattr(_m6, "register_all_gate_up_swiglu"):
                 _m6.register_all_gate_up_swiglu(model)
             if hasattr(_m6, "register_all_oproj_sigmoid"):
                 _m6.register_all_oproj_sigmoid(model)
         except Exception as err:  # noqa: BLE001
-            import traceback
-            logger.warning("Decode6 post-placement registration skipped: %s\n%s", err, traceback.format_exc())
+            logger.warning("Decode6 post-placement registration skipped: %s", err)
         _post_reg_done = True
     except Exception as err:  # noqa: BLE001 - the load must go on
         logger.warning("Decode weight placement failed and was skipped: %s", err)
@@ -1342,11 +1336,15 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             torch.cuda.empty_cache()
     if not _post_reg_done:
         try:
+            if hasattr(model, "register_stacked_bf16_attn"):
+                model.register_stacked_bf16_attn()
+        except Exception as err:  # noqa: BLE001
+            logger.warning("BF16 stacked attn registration skipped: %s", err)
+        try:
             import muse_marlin6_gemv as _m6
             if hasattr(_m6, "register_all_gate_up_swiglu"):
                 _m6.register_all_gate_up_swiglu(model)
             if hasattr(_m6, "register_all_oproj_sigmoid"):
                 _m6.register_all_oproj_sigmoid(model)
         except Exception as err:  # noqa: BLE001
-            import traceback
-            logger.warning("Decode6 post-placement registration skipped: %s\n%s", err, traceback.format_exc())
+            logger.warning("Decode6 post-placement registration skipped: %s", err)

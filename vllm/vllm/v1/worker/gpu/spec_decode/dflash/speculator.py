@@ -30,6 +30,14 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _leaf_alt_from(logits, vocab: int) -> None:
+    """One-leaf verify (muse_leaf): the drafter's top-4 for the first draft position."""
+    from vllm.v1.worker.gpu.spec_decode.dflash import muse_leaf as _ml
+
+    if _ml.ENABLED and _ml.S.alt is not None and logits is not None:
+        _ml.S.alt.copy_(logits[0, :vocab].topk(4).indices)
+
+
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
@@ -43,14 +51,26 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
 
-        # Each request emits exactly (bonus + N mask) query tokens per step.
-        self.num_query_per_req = 1 + self.num_speculative_steps
+        # Each request emits (bonus + N mask) query tokens, plus optional extra
+        # unsampled bidirectional mask slots to fill the Tensor-Core M=8 tile.
+        from vllm.model_executor.models.qwen3_dflash import (
+            _is_muse_glimmer_assistant,
+            dflash_has_any_non_causal,
+        )
+
+        _extra_q = (
+            int(os.environ.get("VLLM_MUSE_DFLASH_EXTRA_QUERY", "1"))
+            if _is_muse_glimmer_assistant(self.draft_model_config.hf_config)
+            and os.environ.get("VLLM_MUSE_DFLASH_CAUSAL", "0") == "0"
+            else 0
+        )
+        self.num_query_per_req = (
+            1 + self.num_speculative_steps + max(0, _extra_q)
+        )
 
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
         )
-
-        from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
 
         self.requires_non_causal = dflash_has_any_non_causal(
             self.draft_model_config.hf_config
@@ -96,10 +116,8 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
-        self._ctx_kv_cg_entries: dict[tuple, torch.cuda.CUDAGraph] = {}
-        self._ctx_kv_cg_rejected: set[tuple] = set()
-        self._ctx_kv_cg_pool = torch.cuda.graph_pool_handle()
-        self._ctx_kv_cg_stream = torch.cuda.Stream(device=device)
+        self._argmax_sval = torch.empty(256, dtype=torch.float32, device=device)
+        self._argmax_sidx = torch.empty(256, dtype=torch.int32, device=device)
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -208,9 +226,10 @@ class DFlashSpeculator(DraftModelSpeculator):
                 for ln in group.layer_names
             }
             gid_to_idx = {gid: i for i, gid in enumerate(self.draft_kv_cache_group_ids)}
-            self._layer_group_idx = [
-                gid_to_idx[name_to_gid[name]] for name in layer_names
-            ]
+            if len(self.draft_kv_cache_group_ids) > 1:
+                self._layer_group_idx = [
+                    gid_to_idx[name_to_gid[name]] for name in layer_names
+                ]
             if hasattr(self.model, "get_draft_attn_causal"):
                 self._group_causal = {
                     name_to_gid[name]: layer_causal
@@ -263,7 +282,37 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
         num_sample = num_reqs * self.num_speculative_steps
-        sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        if (
+            num_reqs == 1
+            and not self.sample_from_anchor
+            and num_tokens_padded == self.num_query_per_req
+            and last_hidden_states.is_contiguous()
+            and os.environ.get("MUSE_DFLASH_FAST_SAMPLE", "1") != "0"
+        ):
+            sample_hidden_states = last_hidden_states[1 : 1 + num_sample]
+        else:
+            sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+
+        if (
+            self.draft_logits is None
+            and not self.use_local_argmax_reduction
+            and 1 <= num_sample <= 8
+            and getattr(self.model, "draft_id_to_target_id", None) is None
+            and os.environ.get("MUSE_DFLASH_FAST_ARGMAX", "1") != "0"
+        ):
+            from vllm.model_executor.layers import muse_draft_fp8
+
+            out_tok_view = self.draft_tokens[:num_reqs].view(-1)
+            if self._try_draft_lmhead_graph(sample_hidden_states, out_tok_view, muse_draft_fp8):
+                return
+            logits = self.model.compute_logits(sample_hidden_states)
+            if logits is not None and muse_draft_fp8.argmax_bf16_into(
+                logits,
+                self._argmax_sval,
+                self._argmax_sidx,
+                out_tok_view,
+            ):
+                return
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
         draft_tokens = self.sample_draft(
@@ -278,6 +327,131 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_tokens[:num_reqs] = draft_tokens.view(
             num_reqs, self.num_speculative_steps
         )
+
+    def _try_draft_lmhead_graph(
+        self,
+        sample_hidden_states: torch.Tensor,
+        out_tok_view: torch.Tensor,
+        muse_draft_fp8: Any,
+    ) -> bool:
+        num_sample = int(sample_hidden_states.shape[0])
+        if (
+            os.environ.get("VLLM_DFLASH_LMHEAD_GRAPH", "1") == "0"
+            or self.query_cudagraph_manager is None
+            or not getattr(self.query_cudagraph_manager, "_graphs_captured", False)
+            or torch.cuda.is_current_stream_capturing()
+            or not (2 <= num_sample <= 8)
+            or sample_hidden_states.ndim != 2
+            or sample_hidden_states.dtype != torch.bfloat16
+            or not sample_hidden_states.is_contiguous()
+            or (sample_hidden_states.data_ptr() & 15) != 0
+            or out_tok_view.dtype != torch.int64
+            or not out_tok_view.is_contiguous()
+            or out_tok_view.numel() != num_sample
+        ):
+            return False
+
+        entries = getattr(self, "_draft_lmhead_cg_entries", None)
+        if entries is None:
+            entries = {}
+            self._draft_lmhead_cg_entries = entries
+            self._draft_lmhead_cg_rejected: set[tuple] = set()
+            self._draft_lmhead_cg_pool = torch.cuda.graph_pool_handle()
+            self._draft_lmhead_cg_stream = torch.cuda.Stream(device=self.device)
+            self._draft_lmhead_raw_bufs = None
+            self._draft_lmhead_raw_checked = False
+
+        sig = (sample_hidden_states.data_ptr(), num_sample, out_tok_view.data_ptr())
+        entry = entries.get(sig)
+        if entry is not None:
+            entry.replay()
+            return True
+        if sig in self._draft_lmhead_cg_rejected or len(entries) >= 8:
+            return False
+
+        ref_logits = self.model.compute_logits(sample_hidden_states)
+        if ref_logits is None or not muse_draft_fp8.argmax_bf16_into(
+            ref_logits, self._argmax_sval, self._argmax_sidx, out_tok_view
+        ):
+            self._draft_lmhead_cg_rejected.add(sig)
+            return False
+        ref_tok = out_tok_view.clone()
+        del ref_logits
+
+        if not self._draft_lmhead_raw_checked:
+            self._draft_lmhead_raw_checked = True
+            lp = getattr(self.model, "logits_processor", None)
+            lm_head = getattr(self.model, "lm_head", None)
+            if (
+                lp is not None
+                and lm_head is not None
+                and not getattr(lp, "logits_as_input", False)
+                and getattr(lp, "soft_cap", None) is None
+                and float(getattr(lp, "scale", 1.0)) == 1.0
+            ):
+                org_vocab = int(getattr(lp, "org_vocab_size", getattr(lm_head, "org_vocab_size", 0)))
+                prep = muse_draft_fp8.prepare_draft_lmhead_buffers(lm_head, org_vocab, self.device)
+                if prep is not None:
+                    self._draft_lmhead_raw_bufs = (lm_head, org_vocab, *prep)
+
+        raw_bufs = self._draft_lmhead_raw_bufs
+        if raw_bufs is None:
+            self._draft_lmhead_cg_rejected.add(sig)
+            return True
+
+        lm_head, org_vocab, out_padded, partials, eff_n, k_dim, blocks = raw_bufs
+        try:
+            out_tok_view.fill_(-1)
+            strided_logits = muse_draft_fp8.launch_draft_lmhead_raw(
+                sample_hidden_states, lm_head, org_vocab, out_padded, partials, eff_n, k_dim, blocks
+            )
+            if strided_logits is None or not muse_draft_fp8.argmax_bf16_into(
+                strided_logits, self._argmax_sval, self._argmax_sidx, out_tok_view
+            ):
+                out_tok_view.copy_(ref_tok)
+                self._draft_lmhead_cg_rejected.add(sig)
+                return True
+            if not torch.equal(out_tok_view, ref_tok):
+                out_tok_view.copy_(ref_tok)
+                self._draft_lmhead_cg_rejected.add(sig)
+                logger.warning("DFlash draft lm_head strided eager mismatch; keeping eager path")
+                return True
+
+            main_st = torch.cuda.current_stream(self.device)
+            cap_st = self._draft_lmhead_cg_stream
+            cap_st.wait_stream(main_st)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.stream(cap_st):
+                with torch.cuda.graph(g, pool=self._draft_lmhead_cg_pool, stream=cap_st):
+                    sl = muse_draft_fp8.launch_draft_lmhead_raw(
+                        sample_hidden_states, lm_head, org_vocab, out_padded, partials, eff_n, k_dim, blocks
+                    )
+                    if sl is None or not muse_draft_fp8.argmax_bf16_into(
+                        sl, self._argmax_sval, self._argmax_sidx, out_tok_view
+                    ):
+                        raise RuntimeError("draft lm_head+argmax refused during CUDA graph capture")
+                    _leaf_alt_from(sl, org_vocab)
+            main_st.wait_stream(cap_st)
+            out_tok_view.fill_(-1)
+            g.replay()
+            if not torch.equal(out_tok_view, ref_tok):
+                out_tok_view.copy_(ref_tok)
+                self._draft_lmhead_cg_rejected.add(sig)
+                logger.warning("DFlash draft lm_head CUDA graph mismatch; keeping eager path")
+                return True
+            entries[sig] = g
+            logger.info(
+                "Captured DFlash strided lm_head+argmax CUDA graph (M=%d, vocab=%d, stride=%d)",
+                num_sample,
+                org_vocab,
+                eff_n,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            out_tok_view.copy_(ref_tok)
+            self._draft_lmhead_cg_rejected.add(sig)
+            logger.warning("DFlash draft lm_head CUDA graph skipped (%s); keeping eager path", exc)
+            return True
 
     def _build_draft_attn_metadata(
         self,
@@ -335,7 +509,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
-        max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        max_seq_len = (
+            int(input_batch.seq_lens_cpu_upper_bound[0])
+            if num_reqs == 1
+            else input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        )
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
@@ -344,26 +522,33 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        def _build_ctx_hidden() -> torch.Tensor:
-            if aux_hidden_states:
+        if aux_hidden_states:
+            if (
+                hasattr(self.model, "combine_aux_into")
+                and self.model.combine_aux_into(
+                    aux_hidden_states, self.hidden_states[:num_target_tokens]
+                )
+            ):
+                context_hidden_states = self.hidden_states[:num_target_tokens]
+            else:
                 if aux_hidden_states[0].shape[0] > num_target_tokens:
                     aux_cat = torch.cat(
                         [h[:num_target_tokens] for h in aux_hidden_states], dim=-1
                     )
                 else:
                     aux_cat = torch.cat(aux_hidden_states, dim=-1)
-                out = self.model.combine_hidden_states(aux_cat)[:num_target_tokens]
-            else:
-                out = last_hidden_states[:num_target_tokens]
-            if not out.is_contiguous():
-                out = out.contiguous()
-            return out
+                context_hidden_states = self.model.combine_hidden_states(aux_cat)[
+                    :num_target_tokens
+                ]
+        else:
+            context_hidden_states = last_hidden_states[:num_target_tokens]
+        if not context_hidden_states.is_contiguous():
+            context_hidden_states = context_hidden_states.contiguous()
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
-            context_hidden_states = _build_ctx_hidden()
             self.model.precompute_and_store_context_kv(
                 context_hidden_states,
                 self.context_positions[:num_target_tokens],
@@ -427,115 +612,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        ctx_pos_slice = self.context_positions[:num_target_tokens]
-        if (
-            not dummy_run
-            and not is_profile
-            and num_reqs == 1
-            and hasattr(self.model, "update_draft_prompt_tail")
-        ):
-            self.model.update_draft_prompt_tail(
-                input_batch.input_ids[:num_target_tokens],
-                ctx_pos_slice,
-            )
-
-        ran_ctx_graph = False
-        if (
-            os.environ.get("VLLM_DFLASH_CTX_KV_GRAPH", "1") != "0"
-            and not dummy_run
-            and not is_profile
-            and num_reqs == 1
-            and 1 <= num_target_tokens <= self.num_query_per_req
-            and not torch.cuda.is_current_stream_capturing()
-            and self.query_cudagraph_manager is not None
-            and self.query_cudagraph_manager._graphs_captured
-        ):
-            if aux_hidden_states:
-                src_sig = tuple(
-                    (h.data_ptr(), h.dtype, tuple(h.shape), tuple(h.stride()))
-                    for h in aux_hidden_states
-                )
-            else:
-                src_sig = (
-                    (
-                        last_hidden_states.data_ptr(),
-                        last_hidden_states.dtype,
-                        tuple(last_hidden_states.shape),
-                        tuple(last_hidden_states.stride()),
-                    ),
-                )
-            pos_sig = (
-                ctx_pos_slice.data_ptr(),
-                ctx_pos_slice.dtype,
-                tuple(ctx_pos_slice.shape),
-                tuple(ctx_pos_slice.stride()),
-            )
-            slot_sig = (
-                tuple(
-                    (s.data_ptr(), s.dtype, tuple(s.shape), tuple(s.stride()))
-                    if s is not None
-                    else None
-                    for s in context_slots
-                )
-                if isinstance(context_slots, list)
-                else (
-                    (
-                        context_slots.data_ptr(),
-                        context_slots.dtype,
-                        tuple(context_slots.shape),
-                        tuple(context_slots.stride()),
-                    )
-                    if context_slots is not None
-                    else None,
-                )
-            )
-            cg_key = (num_target_tokens, src_sig, pos_sig, slot_sig)
-            cg = self._ctx_kv_cg_entries.get(cg_key)
-            if cg is not None:
-                cg.replay()
-                ran_ctx_graph = True
-            elif (
-                cg_key not in self._ctx_kv_cg_rejected
-                and len(self._ctx_kv_cg_entries) < 16
-            ):
-                context_hidden_states = _build_ctx_hidden()
-                self.model.precompute_and_store_context_kv(
-                    context_hidden_states,
-                    ctx_pos_slice,
-                    context_slots,
-                )
-                ran_ctx_graph = True
-                try:
-                    main_st = torch.cuda.current_stream(self.device)
-                    cap_st = self._ctx_kv_cg_stream
-                    cap_st.wait_stream(main_st)
-                    g = torch.cuda.CUDAGraph()
-                    with torch.cuda.stream(cap_st):
-                        with torch.cuda.graph(
-                            g, pool=self._ctx_kv_cg_pool, stream=cap_st
-                        ):
-                            ctx_h = _build_ctx_hidden()
-                            self.model.precompute_and_store_context_kv(
-                                ctx_h,
-                                ctx_pos_slice,
-                                context_slots,
-                            )
-                    main_st.wait_stream(cap_st)
-                    self._ctx_kv_cg_entries[cg_key] = g
-                except Exception as exc:
-                    self._ctx_kv_cg_rejected.add(cg_key)
-                    logger.warning(
-                        "DFlash context-KV CUDA graph capture skipped (%s); keeping eager path",
-                        exc,
-                    )
-
-        if not ran_ctx_graph:
-            context_hidden_states = _build_ctx_hidden()
-            self.model.precompute_and_store_context_kv(
-                context_hidden_states,
-                ctx_pos_slice,
-                context_slots,
-            )
+        self.model.precompute_and_store_context_kv(
+            context_hidden_states,
+            self.context_positions[:num_target_tokens],
+            context_slots,
+        )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
@@ -690,7 +771,11 @@ def _prepare_dflash_inputs_kernel(
     # Otherwise (DFlash default) the anchor is the bonus token and only the mask tokens
     # at offsets > 0 are sampled from, each AT its own position.
     sample_off = 0 if SAMPLE_FROM_ANCHOR else 1
-    is_sample = is_query & (query_off >= sample_off)
+    is_sample = (
+        is_query
+        & (query_off >= sample_off)
+        & (query_off < sample_off + num_speculative_steps)
+    )
     sample_idx = req_idx * num_speculative_steps + (query_off - sample_off)
     sample_pos = query_pos + 1 if SAMPLE_FROM_ANCHOR else query_pos
     tl.store(out_sample_indices_ptr + sample_idx, query_idx, mask=is_sample)
@@ -736,9 +821,10 @@ def _prepare_dflash_inputs_kernel(
             # captured CG sees PAD slots (no K/V write) for replay sizes
             # larger than the current request count.
             q_pad_start = num_reqs * num_query_per_req
-            for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):
+            q_pad_end = tl.minimum(max_num_tokens, max_num_reqs * num_query_per_req)
+            for i in range(q_pad_start, q_pad_end, BLOCK_SIZE):
                 block = i + tl.arange(0, BLOCK_SIZE)
-                mask = block < max_num_tokens
+                mask = block < q_pad_end
                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
 
 
@@ -780,7 +866,11 @@ def prepare_dflash_inputs(
     assert num_reqs > 0
     # Cover the longest possible per-request span (ctx + query). Use the max
     # per-request query length, not the total token count across the batch.
-    max_target_query_len = int(input_batch.num_scheduled_tokens.max())
+    max_target_query_len = (
+        int(input_batch.num_scheduled_tokens[0])
+        if num_reqs == 1
+        else int(input_batch.num_scheduled_tokens.max())
+    )
     max_tokens_per_req = max_target_query_len + num_query_per_req
     BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)

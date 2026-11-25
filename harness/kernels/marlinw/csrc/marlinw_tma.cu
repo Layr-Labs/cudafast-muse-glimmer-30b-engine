@@ -326,9 +326,8 @@ __device__ __forceinline__ void down_tile(
     const CUtensorMap* tmA, const CUtensorMap* tmB, const CUtensorMap* tmS, int4* __restrict__ C0,
     float4* __restrict__ scratch, const float gs, const int row0, const int col, const int slot, const int cut_a,
     const int cut_b, const int k_tiles
-    , const int piece, volatile int* const flags, const int cut_a2 = -1, const int cut_b2 = -1
+    , const int piece, volatile int* const flags
     ) {
-  constexpr bool kTwoCuts = (kCols == 4096);
   extern __shared__ int4 sh[];
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -340,7 +339,6 @@ __device__ __forceinline__ void down_tile(
   float acc[MB][2][2][4];
   const int n_first = 4 - ((row0 >> 4) & 3);  // m-blocks in the chunk containing row0
   float4* my_scratch = scratch + ((size_t)slot * 256 + tid) * 32;
-  float4* my_scratch2 = scratch + ((size_t)(slot + 1) * 256 + tid) * 32;
   // K pieces. piece = k0 | role << 10 | index << 12: this CTA runs k-tiles [k0, k0 + k_tiles) of its tile (k0 a
   // multiple of 8). role 0: the whole tile. 1: first piece (chains from +0, state stored at the end). 2: middle piece
   // (state loaded, state stored). 3: last piece (state loaded, epilogue). The state is every thread's accumulator
@@ -359,7 +357,7 @@ __device__ __forceinline__ void down_tile(
   }
   // Runs before k-tile t; returns the k-tile before which it has to run again (the next cut, or the end).
   auto cuts = [&](const int t) {
-    if (t == cut_a || t == cut_b || (kTwoCuts && (t == cut_a2 || t == cut_b2))) {
+    if (t == cut_a || t == cut_b) {
       __syncthreads();
 #pragma unroll
       for (int i = 0; i < MB; i++) {
@@ -369,14 +367,6 @@ __device__ __forceinline__ void down_tile(
           for (int e = 0; e < 4; e++) my_scratch[i * 4 + e] = reinterpret_cast<float4*>(acc[i])[e];
 #pragma unroll
           for (int e = 0; e < 16; e++) reinterpret_cast<float*>(acc[i])[e] = 0.0f;
-        } else if constexpr (kTwoCuts) {
-          const int ci2 = i < n_first ? cut_a2 : cut_b2;
-          if (ci2 == t) {
-#pragma unroll
-            for (int e = 0; e < 4; e++) my_scratch2[i * 4 + e] = reinterpret_cast<float4*>(acc[i])[e];
-#pragma unroll
-            for (int e = 0; e < 16; e++) reinterpret_cast<float*>(acc[i])[e] = 0.0f;
-          }
         }
       }
       __syncthreads();
@@ -384,10 +374,6 @@ __device__ __forceinline__ void down_tile(
     int stop = k1;
     if (cut_a > t && cut_a < stop) stop = cut_a;
     if (cut_b > t && cut_b < stop) stop = cut_b;
-    if constexpr (kTwoCuts) {
-      if (cut_a2 > t && cut_a2 < stop) stop = cut_a2;
-      if (cut_b2 > t && cut_b2 < stop) stop = cut_b2;
-    }
     return stop;
   };
   auto produce = [&](const int g, const uint32_t dst, const uint32_t bar, const int mode) {
@@ -444,46 +430,18 @@ __device__ __forceinline__ void down_tile(
     if (cut_a >= 0 || cut_b >= 0) {
       const float4* s0 = scratch + ((size_t)slot * 256 + tid) * 32;
       const float4* s1 = scratch + ((size_t)slot * 256 + tid + 128) * 32;
-      const float4* s0_2 = scratch + ((size_t)(slot + 1) * 256 + tid) * 32;
-      const float4* s1_2 = scratch + ((size_t)(slot + 1) * 256 + tid + 128) * 32;
 #pragma unroll
       for (int i = 0; i < MB; i++) {
         const int ci = i < n_first ? cut_a : cut_b;
         if (ci >= 0) {
-          if constexpr (kTwoCuts) {
-            const int ci2 = i < n_first ? cut_a2 : cut_b2;
-            if (ci2 >= 0) {
 #pragma unroll
-              for (int e = 0; e < 4; e++) {
-                const float4 x = s0[i * 4 + e], y = s1[i * 4 + e];
-                const float4 x2 = s0_2[i * 4 + e], y2 = s1_2[i * 4 + e];
-                float* c = reinterpret_cast<float*>(acc[i]) + 4 * e;
-                c[0] = (x.x + y.x) + ((x2.x + y2.x) + c[0]);
-                c[1] = (x.y + y.y) + ((x2.y + y2.y) + c[1]);
-                c[2] = (x.z + y.z) + ((x2.z + y2.z) + c[2]);
-                c[3] = (x.w + y.w) + ((x2.w + y2.w) + c[3]);
-              }
-            } else {
-#pragma unroll
-              for (int e = 0; e < 4; e++) {
-                const float4 x = s0[i * 4 + e], y = s1[i * 4 + e];
-                float* c = reinterpret_cast<float*>(acc[i]) + 4 * e;
-                c[0] = (x.x + y.x) + c[0];
-                c[1] = (x.y + y.y) + c[1];
-                c[2] = (x.z + y.z) + c[2];
-                c[3] = (x.w + y.w) + c[3];
-              }
-            }
-          } else {
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-              const float4 x = s0[i * 4 + e], y = s1[i * 4 + e];
-              float* c = reinterpret_cast<float*>(acc[i]) + 4 * e;
-              c[0] = (x.x + y.x) + c[0];
-              c[1] = (x.y + y.y) + c[1];
-              c[2] = (x.z + y.z) + c[2];
-              c[3] = (x.w + y.w) + c[3];
-            }
+          for (int e = 0; e < 4; e++) {
+            const float4 x = s0[i * 4 + e], y = s1[i * 4 + e];
+            float* c = reinterpret_cast<float*>(acc[i]) + 4 * e;
+            c[0] = (x.x + y.x) + c[0];
+            c[1] = (x.y + y.y) + c[1];
+            c[2] = (x.z + y.z) + c[2];
+            c[3] = (x.w + y.w) + c[3];
           }
         }
       }
@@ -563,14 +521,12 @@ __global__ void __launch_bounds__(kThreads, 1) down(
   const int4 w0 = work[2 * blockIdx.x];
   const int4 w1 = work[2 * blockIdx.x + 1];
   const float gs = gs_ptr[0];
-  const int cut_a2 = (kCols == 4096) ? static_cast<int>(static_cast<int16_t>(w0.z & 0xFFFF)) : -1;
-  const int cut_b2 = (kCols == 4096) ? static_cast<int>(static_cast<int16_t>((w0.z >> 16) & 0xFFFF)) : -1;
   if (w1.w & 2048)
     down_tile<8, true, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
-                       reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
+                       reinterpret_cast<volatile int*>(work + 2 * gridDim.x));
   else
     down_tile<8, false, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
-                        reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
+                        reinterpret_cast<volatile int*>(work + 2 * gridDim.x));
 }
 #else
 // ---------------------------------------------------------------------------------------------------------------

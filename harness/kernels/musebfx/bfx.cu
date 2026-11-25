@@ -97,36 +97,27 @@ torch::Tensor bf16_rans_pack(torch::Tensor W);
 torch::Tensor bf16_rans_unpack(torch::Tensor blob, int64_t N, int64_t K);
 torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int64_t K, int64_t base_exp);
 void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp);
+void bf16_rans_gemm_dual(torch::Tensor x, torch::Tensor blob, torch::Tensor out0, torch::Tensor out1, int64_t N0, int64_t N1, int64_t K, int64_t base_exp);
 int64_t bf16_rans_base(torch::Tensor blob);
-torch::Tensor int3_pack(torch::Tensor W, bool mse_opt = true);
+torch::Tensor int3_pack(torch::Tensor W);
 torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
-void draft_vocab_update_tail(
-    torch::Tensor input_ids, torch::Tensor positions, torch::Tensor in_static_vocab,
-    torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor tail_seen);
-torch::Tensor draft_vocab_tail_argmax(
-    torch::Tensor A, torch::Tensor static_logits, torch::Tensor vocab_map,
-    torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor raw_w,
-    torch::Tensor raw_s, torch::Tensor global_scale, double logit_scale,
-    c10::optional<torch::Tensor> out_top2_row0 = c10::nullopt);
-torch::Tensor draft_vocab_score_rows(
-    torch::Tensor A, torch::Tensor row_ids, torch::Tensor raw_w,
-    torch::Tensor raw_s, torch::Tensor global_scale, double logit_scale);
-void native_leaf_setup(
-    torch::Tensor leaf_flag, torch::Tensor prev_ns, torch::Tensor alt_ids,
-    torch::Tensor input_ids, torch::Tensor positions, torch::Tensor saved_alt_tok,
-    int64_t low_thresh, bool selftest_mode);
-void native_leaf_commit(
-    torch::Tensor leaf_flag, torch::Tensor prev_ns, torch::Tensor hit_flag,
-    torch::Tensor saved_alt_tok, torch::Tensor leaf_u_tok, torch::Tensor sampled_tokens,
-    torch::Tensor num_sampled, torch::Tensor num_rejected,
-    c10::optional<torch::Tensor> stats, bool no_hit_mode);
-void native_leaf_fix_hidden(
-    torch::Tensor hit_flag, torch::Tensor tensor_ptrs,
-    int64_t row_stride_bytes, int64_t copy_bytes);
-void native_leaf_fix_kv(
-    torch::Tensor hit_flag, torch::Tensor slot_mappings,
-    torch::Tensor kv_ptrs, torch::Tensor stride_block, torch::Tensor stride_head,
-    torch::Tensor stride_slot, torch::Tensor block_size, torch::Tensor layer_gid);
+void int3_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K);
+void int3_gemm_aux5_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K_each);
+torch::Tensor int4_pack(torch::Tensor W);
+torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+void int4_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K);
+void int4_gemm_aux5_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K_each);
+void dflash_kv_post(
+    torch::Tensor all_kv_flat, torch::Tensor k_norm_weights, torch::Tensor cos_sin_cache,
+    torch::Tensor positions, c10::optional<torch::Tensor> slot_mapping,
+    const std::vector<int64_t>& kv_ptrs, int64_t block_size,
+    int64_t stride_block, int64_t stride_kv_head, int64_t stride_slot, double eps);
+void dflash_argmax_bf16(torch::Tensor logits, torch::Tensor scratch_val, torch::Tensor scratch_idx,
+                        torch::Tensor out_tok);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm", &bfx_gemm);
@@ -134,27 +125,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_unpack", &bf16_rans_unpack);
   m.def("rans_gemm", &bf16_rans_gemm);
   m.def("rans_gemm_out", &bf16_rans_gemm_out);
+  m.def("rans_gemm_dual", &bf16_rans_gemm_dual);
   m.def("rans_base", &bf16_rans_base);
-  m.def("int3_pack", &int3_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
+  m.def("int3_pack", &int3_pack);
   m.def("int3_gemm", &int3_gemm);
-  m.def("draft_vocab_update_tail", &draft_vocab_update_tail);
-  m.def("draft_vocab_tail_argmax", &draft_vocab_tail_argmax,
-        pybind11::arg("A"), pybind11::arg("static_logits"), pybind11::arg("vocab_map"),
-        pybind11::arg("tail_ids"), pybind11::arg("tail_count"), pybind11::arg("raw_w"),
-        pybind11::arg("raw_s"), pybind11::arg("global_scale"), pybind11::arg("logit_scale") = 1.0,
-        pybind11::arg("out_top2_row0") = c10::nullopt);
-  m.def("draft_vocab_score_rows", &draft_vocab_score_rows,
-        pybind11::arg("A"), pybind11::arg("row_ids"), pybind11::arg("raw_w"),
-        pybind11::arg("raw_s"), pybind11::arg("global_scale"), pybind11::arg("logit_scale") = 1.0);
-  m.def("native_leaf_setup", &native_leaf_setup,
-        pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"), pybind11::arg("alt_ids"),
-        pybind11::arg("input_ids"), pybind11::arg("positions"), pybind11::arg("saved_alt_tok"),
-        pybind11::arg("low_thresh") = 3, pybind11::arg("selftest_mode") = false);
-  m.def("native_leaf_commit", &native_leaf_commit,
-        pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"), pybind11::arg("hit_flag"),
-        pybind11::arg("saved_alt_tok"), pybind11::arg("leaf_u_tok"), pybind11::arg("sampled_tokens"),
-        pybind11::arg("num_sampled"), pybind11::arg("num_rejected"),
-        pybind11::arg("stats") = c10::nullopt, pybind11::arg("no_hit_mode") = false);
-  m.def("native_leaf_fix_hidden", &native_leaf_fix_hidden);
-  m.def("native_leaf_fix_kv", &native_leaf_fix_kv);
+  m.def("int3_gemm_out", &int3_gemm_out);
+  m.def("int3_gemm_aux5_out", &int3_gemm_aux5_out);
+  m.def("int4_pack", &int4_pack);
+  m.def("int4_gemm", &int4_gemm);
+  m.def("int4_gemm_out", &int4_gemm_out);
+  m.def("int4_gemm_aux5_out", &int4_gemm_aux5_out);
+  m.def("dflash_kv_post", &dflash_kv_post);
+  m.def("dflash_argmax_bf16", &dflash_argmax_bf16);
 }

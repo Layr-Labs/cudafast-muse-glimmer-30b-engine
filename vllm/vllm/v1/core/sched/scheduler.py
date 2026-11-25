@@ -270,8 +270,27 @@ class Scheduler(SchedulerInterface):
             if speculative_config.use_dflash():
                 # DFlash requires an extra lookahead slot since it uses in-fill-style
                 # decoding instead of standard next-token sampling, so it has a query
-                # for the last sampled token plus queries for each draft token.
-                self.num_lookahead_tokens = self.num_spec_tokens + 1
+                # for the last sampled token plus queries for each draft token (plus
+                # any extra unsampled bidirectional mask slots).
+                import os as _os
+
+                _hf = speculative_config.draft_model_config.hf_config
+                _is_mg = (
+                    getattr(_hf, "model_type", None) == "muse_glimmer_assistant"
+                    or getattr(getattr(_hf, "model", None), "model_type", None)
+                    == "muse_glimmer_assistant"
+                    or "DFlashMuseGlimmerAssistantModel"
+                    in (getattr(_hf, "architectures", None) or ())
+                )
+                _extra_q = (
+                    int(_os.environ.get("VLLM_MUSE_DFLASH_EXTRA_QUERY", "1"))
+                    if _is_mg
+                    and _os.environ.get("VLLM_MUSE_DFLASH_CAUSAL", "0") == "0"
+                    else 0
+                )
+                self.num_lookahead_tokens = (
+                    self.num_spec_tokens + 1 + max(0, _extra_q)
+                )
             if speculative_config.use_dspark():
                 # DSpark drafts a block of num_spec_tokens query tokens in which the
                 # anchor itself is the first prediction position (no separate bonus

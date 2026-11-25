@@ -113,18 +113,14 @@ TAIL_TLB = os.environ.get("L2PF_LM_HEAD_TAIL_TLB", "1") != "0"
 TLB_EARLY = frozenset(x for x in os.environ.get("L2PF_TLB_EARLY", "qkv,gate,o").replace(" ", "").split(",") if x)
 _SITE_NAMES = ("qkv", "gate", "o", "gate_up", "down")
 SKIP_SWIGLU_ACT = os.environ.get("L2PF_SKIP_SWIGLU_ACT", "0") != "0"
-# Verify-width (M > 1) trim: drop redundant 2 MiB TLB-only launches on muserans sites
-# (already self-prefetching in muse_rans.cu), M=1-only BF16 packed buffers, and small
-# (<32 MiB) attention sites while keeping all 260 sites tracked so norm pre-warm and
-# lm_head tail TLB pre-warm stay active (~246 -> ~85-86 launches). Set L2PF_TRIM_M7=0 to A/B.
-TRIM_M7 = os.environ.get("L2PF_TRIM_M7", "1") != "0"
-TRIM_M7_MIN_BYTES = _env_bytes("L2PF_TRIM_M7_MIN_MB", 32 << 20)
+VERIFY_SITES = os.environ.get("L2PF_VERIFY_SITES", "1") != "0"
 
 # Compressed one-row projections measured with the same captured stream edges.
 _RANS_SKIP_PREFETCH = {
     (6656, 4096, True),
     (4608, 6656, False),
     (4096, 6656, False),
+    (8704, 6656, False),
 }
 
 
@@ -424,9 +420,10 @@ def _targets():
             pkt.default  # noqa: B018 - materialize the overload
         except (AttributeError, RuntimeError):
             continue
-        # Proxy the packet so both torch.ops._C.<op>(...) (e.g. uncompressed NVFP4 o_proj
-        # fallback at M > 1) and Inductor's torch.ops._C.<op>.default(...) are recorded.
-        out.append((torch.ops._C, name, kind, True))
+        if VERIFY_SITES and name == "marlin_gemm":
+            out.append((torch.ops._C, name, kind, True))
+        else:
+            out.append((pkt, "default", kind, False))
     try:
         import glimmer_fp8_ext
     except (ImportError, OSError):
@@ -448,6 +445,13 @@ def _targets():
         lane_bf16 = torch.ops.vllm.muse_bf16_lane_linear
         lane_bf16.default  # noqa: B018
         out.append((lane_bf16, "default", "muse_bf16_lane", False))
+        if VERIFY_SITES:
+            try:
+                bs_pkt = torch.ops.vllm.muse_bf16_qkv_or_stacked
+                bs_pkt.default  # noqa: B018
+                out.append((bs_pkt, "default", "muse_bf16_stacked", False))
+            except (AttributeError, RuntimeError):
+                pass
         try:
             bgpkt = torch.ops.vllm.muse_bf16_gate_fill
             bgpkt.default  # noqa: B018
@@ -483,16 +487,6 @@ def _targets():
     return out
 
 
-def _batch_m(kind: str, args) -> int:
-    try:
-        t = args[1] if kind == "muse_bf16_gate" else args[0]
-        if isinstance(t, torch.Tensor) and t.ndim >= 2:
-            return int(t.shape[0])
-    except IndexError:
-        pass
-    return 1
-
-
 def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
     try:
         if kind == "marlin":
@@ -501,10 +495,43 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[2],)
         if kind in ("cutlass_fp8", "mm"):
             return (args[1],)
-        if kind == "muse_bf16_lane" and 1 <= args[0].shape[0] <= 8 and args[0].is_contiguous():
-            return (args[2],)
-        if kind == "muse_bf16_gate" and 1 <= args[1].shape[0] <= 8 and args[1].is_contiguous():
-            return (args[3],)
+        if kind == "muse_bf16_lane" and args[0].is_contiguous():
+            if args[0].shape[0] == 1:
+                return (args[2],)
+            if VERIFY_SITES and 2 <= args[0].shape[0] <= 8:
+                import muse_bf16_lane as _bf16
+
+                ent = _bf16.get_m_rans(args[3]) if hasattr(_bf16, "get_m_rans") else None
+                if ent is not None:
+                    return (ent[0],)
+        if kind == "muse_bf16_stacked" and args[0].is_contiguous():
+            if args[0].shape[0] == 1:
+                return (args[3],)
+            if VERIFY_SITES and 2 <= args[0].shape[0] <= 8:
+                try:
+                    from vllm.model_executor.models import muse_glimmer as _mg
+
+                    dual_dec = getattr(_mg, "_BF16_DUAL_DECODE", None)
+                    if dual_dec is not None:
+                        d_ent = dual_dec.get(args[1].data_ptr())
+                        if d_ent is not None:
+                            return (d_ent[0],)
+                except Exception:  # noqa: BLE001
+                    pass
+                import muse_bf16_lane as _bf16
+
+                ent = _bf16.get_m_rans(args[4]) if hasattr(_bf16, "get_m_rans") else None
+                if ent is not None:
+                    return (ent[0],)
+        if kind == "muse_bf16_gate" and args[1].is_contiguous():
+            if args[1].shape[0] == 1:
+                return (args[3],)
+            if VERIFY_SITES and 2 <= args[1].shape[0] <= 8:
+                import muse_bf16_lane as _bf16
+
+                ent = _bf16.get_m_rans(args[4]) if hasattr(_bf16, "get_m_rans") else None
+                if ent is not None:
+                    return (ent[0],)
         if kind == "marlin_tiled":
             return (args[1], args[2])
     except IndexError:
@@ -522,6 +549,8 @@ class _Site:
     unassisted: bool = False
     mlp: str = ""  # "norm" / "act": a GEMM above MAX_WEIGHT after a norm / an activation
     skip_act: bool = False
+    layer: int = 0
+    role: str = ""  # "qkv" / "gate" / "o" / "gate_up" / "down"
 
 
 def _is_admitted_swiglu_down(down_gs_ptr: int) -> bool:
@@ -556,12 +585,13 @@ class Session:
         self._pending = False
         self._attn = False
         self._prev_big = False
+        self._layer = 0
+        self._has_qkv = False
         self.norm_sites = 0
         self.tail_descs: list[tuple[int, int, int, int]] = []
         self.tail_off = -1
         self.tail_early = False
         self.tlb_moved = 0
-        self._max_m = 1
 
     # -- patching
     @contextlib.contextmanager
@@ -616,7 +646,8 @@ class Session:
         self.stopped = False
         self._attn = False
         self._prev_big = False
-        self._max_m = 1
+        self._layer = 0
+        self._has_qkv = False
         with self._patched(self._on_record, True):
             yield
         if not self.stopped:
@@ -640,10 +671,7 @@ class Session:
         if key is None:
             return
         ws = _weights_of(kind, args)
-        m_rows = _batch_m(kind, args)
-        if m_rows > self._max_m:
-            self._max_m = m_rows
-        site = _Site(kind, key, self._attn)
+        site = _Site(kind, key, self._attn, layer=self._layer)
         self._attn = False
         prev_big, self._prev_big = self._prev_big, False
         try:
@@ -651,11 +679,8 @@ class Session:
             if wbytes > MAX_WEIGHT:
                 self._prev_big = True
                 site.mlp = "act" if prev_big else "norm"
-                if m_rows > 1 and TRIM_M7 and kind == "musefp8":
-                    # muse_rans.cu already issues internal 2 MiB TLB prefetches in block 0;
-                    # skip redundant side-stream TLB launches at verify width (M > 1).
-                    site.descs = []
-                elif (
+                site.role = "down" if prev_big else "gate_up"
+                if (
                     prev_big
                     and SKIP_SWIGLU_ACT
                     and kind == "marlin_tiled"
@@ -672,21 +697,21 @@ class Session:
                         site.descs += tlb_descs(ws[0], mb_b, TLB_STRIDE)
                         for w_extra in ws[1:]:
                             site.descs += tlb_descs(w_extra, 0, TLB_STRIDE)
-            elif m_rows > 1 and (
-                kind in ("muse_bf16_lane", "muse_bf16_gate")
-                or (TRIM_M7 and (kind == "musefp8" or wbytes < TRIM_M7_MIN_BYTES))
-            ):
-                # At M > 1, BF16 uses the separate multi-M rANS blob (not packed), and with
-                # TRIM_M7 we skip redundant muserans TLB walks and small (<32 MiB) attention
-                # sites while still keeping the site recorded so len(self.sites) == 260.
-                site.descs = []
             else:
+                if site.after_attn:
+                    site.role = "o"
+                elif not self._has_qkv:
+                    site.role = "qkv"
+                    self._has_qkv = True
+                else:
+                    site.role = "gate"
                 nbytes = budget(wbytes, site.after_attn)
                 skip_all = False
+                max_r = 8 if VERIFY_SITES else 1
                 if kind == "musefp8":
                     a, weight, packed, sa, sb = args
                     k, n = weight.shape
-                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
+                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and 1 <= a.shape[0] <= max_r
                             and a.is_contiguous() and 0 < packed.numel() != n * k):
                         from vllm.model_executor.kernels.linear.scaled_mm.muse_fp8 import _scales_ok
                         if _scales_ok(sa, sb, n):
@@ -700,8 +725,8 @@ class Session:
                 elif kind == "muse_bf16_lane":
                     a, weight, packed, index = args
                     n, k = weight.shape
-                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
-                            and a.is_contiguous() and index.numel() == 1):
+                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and 1 <= a.shape[0] <= max_r
+                            and a.is_contiguous() and (index.numel() == 1 or a.shape[0] > 1)):
                         nbytes = (
                             BYTES_RANS_AFTER_ATTN
                             if site.after_attn
@@ -711,11 +736,19 @@ class Session:
                             site.unassisted = True
                             if (n, k) == (4096, 6656) and BF16_GATE_NONE:
                                 skip_all = True
+                elif kind == "muse_bf16_stacked":
+                    a, w_cat = args[0], args[1]
+                    n, k = w_cat.shape
+                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and 1 <= a.shape[0] <= max_r
+                            and a.is_contiguous()):
+                        nbytes = BYTES_RANS_QKV
+                        if nbytes == 0:
+                            site.unassisted = True
                 elif kind == "muse_bf16_gate":
                     _, a, weight, packed, index = args
                     n, k = weight.shape
-                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and a.shape[0] == 1
-                            and a.is_contiguous() and index.numel() == 1):
+                    if ((n, k, site.after_attn) in _RANS_SKIP_PREFETCH and 1 <= a.shape[0] <= max_r
+                            and a.is_contiguous() and (index.numel() == 1 or a.shape[0] > 1)):
                         nbytes = BYTES_RANS_GATE
                         if nbytes == 0:
                             site.unassisted = True
@@ -733,19 +766,23 @@ class Session:
                 else:
                     site.descs = weight_descs(ws, nbytes)
                     if not site.unassisted and TLB_PREFETCH and (
-                            kind in ("musefp8", "musefp8_gate", "muse_bf16_lane", "muse_bf16_gate") or TLB_ALL):
+                            kind in ("musefp8", "musefp8_gate", "muse_bf16_lane", "muse_bf16_stacked", "muse_bf16_gate") or TLB_ALL):
                         site.descs += tlb_descs(ws[0], nbytes, TLB_STRIDE)
             if self.ranges is not None and not _inside(site.descs, self.ranges):
                 site.descs = []
         except Exception:  # noqa: BLE001 - a site without ranges is still a site
             site.descs = []
         self.sites.append(site)
+        if site.role == "down":
+            self._layer += 1
+            self._has_qkv = False
 
     def _norm_prewarm(self) -> int:
         """Append each layer's norm-weight slice to its first (qkv), gate_up and down sites, so the norm kernels that
         follow find their weights in L2 instead of queueing behind the bulk weight prefetch."""
         hint = NORM_HINT
-        if not NORM_PREWARM or not hint or len(self.sites) != SITES_PER_LAYER * len(hint):
+        num_layers = sum(1 for s in self.sites if s.role == "down")
+        if not NORM_PREWARM or not hint or num_layers != len(hint):
             return 0
         added = 0
         slices: dict[int, list[tuple[int, int, int, int]]] = {}
@@ -765,16 +802,17 @@ class Session:
             if self.ranges is not None and not _inside(descs, self.ranges):
                 continue
             slices[lyr] = descs
-        trim_m7_active = self._max_m > 1 and TRIM_M7
+        by_layer_role: dict[tuple[int, str], _Site] = {}
+        for s in self.sites:
+            if s.role in ("qkv", "gate_up", "down") and (s.layer, s.role) not in by_layer_role:
+                by_layer_role[(s.layer, s.role)] = s
         for lyr, descs in slices.items():
-            for k in (0, 3, 4):
-                site = self.sites[SITES_PER_LAYER * lyr + k]
-                if site.skip_act:
-                    continue
-                if trim_m7_active and not site.descs:
+            for role in ("qkv", "gate_up", "down"):
+                site = by_layer_role.get((lyr, role))
+                if site is None or site.skip_act:
                     continue
                 extra = list(descs)
-                if k == 4 and NORM_NEXT and (lyr + 1) in slices:
+                if role == "down" and NORM_NEXT and (lyr + 1) in slices:
                     extra += slices[lyr + 1]
                 site.descs = (extra + list(site.descs)) if NORM_FIRST else (list(site.descs) + extra)
                 added += 1
@@ -786,10 +824,11 @@ class Session:
         self.tail_off = -1
         self.tail_early = False
         self.tlb_moved = 0
-        if TLB_EARLY and len(self.sites) == SITES_PER_LAYER * 52:
+        num_layers = sum(1 for s in self.sites if s.role == "down")
+        if TLB_EARLY and num_layers == 52:
             for i in range(1, len(self.sites)):  # ascending: a moved row lands on a site already visited
                 cur, prev = self.sites[i], self.sites[i - 1]
-                if _SITE_NAMES[i % SITES_PER_LAYER] not in TLB_EARLY or prev.skip_act or not prev.descs:
+                if cur.role not in TLB_EARLY or prev.skip_act or not prev.descs:
                     continue
                 moved = [d for d in cur.descs if _is_tlb(d)]
                 if not moved:
@@ -798,7 +837,7 @@ class Session:
                 prev.descs = list(prev.descs) + moved
                 self.tlb_moved += 1
         tail = [d for d in TAIL_DESCS if TAIL_TLB or not _is_tlb(d)]
-        tail_ok = bool(tail) and len(self.sites) == SITES_PER_LAYER * 52 and (
+        tail_ok = bool(tail) and num_layers == 52 and (
             self.ranges is None or _inside(tail, self.ranges))
         host = self.sites[-1] if TAIL_EARLY == 1 else (self.sites[-2] if TAIL_EARLY >= 2 else None)
         if tail_ok and host is not None and not host.skip_act:

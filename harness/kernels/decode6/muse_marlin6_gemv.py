@@ -73,10 +73,6 @@ _sk_tma4_ilv_lmpost = getattr(_lib, "muse_marlin6_sk_tma4_ilv_lmpost", None)
 if _sk_tma4_ilv_lmpost is not None:
     _sk_tma4_ilv_lmpost.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
     _sk_tma4_ilv_lmpost.restype = ctypes.c_int
-_sk_tma4_ilv_lmpost_m = getattr(_lib, "muse_marlin6_sk_tma4_ilv_lmpost_m", None)
-if _sk_tma4_ilv_lmpost_m is not None:
-    _sk_tma4_ilv_lmpost_m.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
-    _sk_tma4_ilv_lmpost_m.restype = ctypes.c_int
 _sk_tma4_ilv = getattr(_lib, "muse_marlin6_sk_tma4_ilv", None)
 if _sk_tma4_ilv is not None:
     _sk_tma4_ilv.argtypes = _gemv6.argtypes
@@ -93,10 +89,6 @@ _sk_tma4_ilv_gated = getattr(_lib, "muse_marlin6_sk_tma4_ilv_gated", None)
 if _sk_tma4_ilv_gated is not None:
     _sk_tma4_ilv_gated.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
     _sk_tma4_ilv_gated.restype = ctypes.c_int
-_sk_tma4_ilv_gated_m = getattr(_lib, "muse_marlin6_sk_tma4_ilv_gated_m", None)
-if _sk_tma4_ilv_gated_m is not None:
-    _sk_tma4_ilv_gated_m.argtypes = [ctypes.c_void_p] * 9 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
-    _sk_tma4_ilv_gated_m.restype = ctypes.c_int
 _get_gate_blocks = getattr(_lib, "muse_marlin6_get_gate_blocks", None)
 if _get_gate_blocks is not None:
     _get_gate_blocks.argtypes = []
@@ -149,10 +141,9 @@ _SWIGLU_GATE_UP: dict[int, dict] = {}
 _GATE_UP_TILE_ORDER: dict[torch.device, torch.Tensor] = {}
 _GATED_OPROJ: set[int] = set()
 _ALL_OPROJ_GATED_READY: bool = False
-_GATED_OPROJ_M: set[int] = set()
-_ALL_OPROJ_GATED_M_READY: bool = False
 _LMPOST_BUFS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-_LMPOST_M_BUFS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_LM_VERIFY_BUFS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_ALLOW_STRIDED_LM_OUT: bool = False
 _consume_down_swiglu = None
 _notify_gate_up_swiglu = None
 _consume_oproj_sigmoid = None
@@ -844,16 +835,9 @@ def decode_linear6(
         _consume_oproj_sigmoid is not None
         and not fixed_grid
         and (n, k) == (OPROJ_N, OPROJ_K)
-        and (
-            (x.numel() == k and global_scale.data_ptr() in _GATED_OPROJ and is_tma4(scales6))
-            or (
-                x.ndim == 2
-                and 1 < x.shape[0] <= 8
-                and x.shape[1] == k
-                and global_scale.data_ptr() in _GATED_OPROJ_M
-                and is_tma4_ilv(scales6)
-            )
-        )
+        and x.numel() == k
+        and global_scale.data_ptr() in _GATED_OPROJ
+        and is_tma4(scales6)
     ):
         op_res = _consume_oproj_sigmoid(
             x, global_scale.data_ptr(), tiled_weight, scales6, palette, global_scale, workspace
@@ -934,7 +918,22 @@ def decode_linear6(
                     raise RuntimeError(f"SM121 Marlin multi-M gate_up SwiGLU launch failed with CUDA error {status}")
                 _notify_gate_up_swiglu(out_buf_m.data_ptr(), sw_entry_m, True, None)
                 return out_buf_m
-            output = x.new_empty((m, eff_n))
+            if lm_pad128 and _ALLOW_STRIDED_LM_OUT:
+                dev_idx = x.device.index if x.device.index is not None else torch.cuda.current_device()
+                vbufs = _LM_VERIFY_BUFS.get(dev_idx)
+                if vbufs is None and not torch.cuda.is_current_stream_capturing():
+                    vbufs = (
+                        torch.empty((8, LM_HEAD_PAD128_N), dtype=x.dtype, device=x.device),
+                        torch.empty((96, 16, 128), dtype=torch.float32, device=x.device),
+                    )
+                    _LM_VERIFY_BUFS[dev_idx] = vbufs
+                if vbufs is not None:
+                    output = vbufs[0][:m]
+                    partials = vbufs[1][:blocks]
+                else:
+                    output = x.new_empty((m, eff_n))
+            else:
+                output = x.new_empty((m, eff_n))
             status = _sk_tma4_ilv_m(
                 x.data_ptr(), tiled_weight.data_ptr(), output.data_ptr(), partials.data_ptr(),
                 scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
@@ -943,6 +942,8 @@ def decode_linear6(
             if status:
                 raise RuntimeError(f"SM121 Marlin multi-M (scale6) launch failed with CUDA error {status}")
             if lm_pad128:
+                if _ALLOW_STRIDED_LM_OUT:
+                    return output[:, :n]
                 return output[:, :n].contiguous()
             if (n, k) == (GATE_UP_N, GATE_UP_K) and global_scale.data_ptr() in _SWIGLU_GATE_UP:
                 order = _GATE_UP_TILE_ORDER.get(output.device)
@@ -1011,20 +1012,6 @@ def _get_lmpost_bufs(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
             torch.empty((96, 16, 128), dtype=torch.float32, device=dev),
         )
         _LMPOST_BUFS[idx] = bufs
-    return bufs
-
-
-def _get_lmpost_m_bufs(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dedicated scratch/partials for MultiM (M=2..8) lm_head+lmpost so g_bv[0..1023]
-    never overlaps M=1's g_done counter at int32[256]."""
-    idx = dev.index if dev.index is not None else torch.cuda.current_device()
-    bufs = _LMPOST_M_BUFS.get(idx)
-    if bufs is None:
-        bufs = (
-            torch.zeros(1040, dtype=torch.int64, device=dev),
-            torch.empty((96, 16, 128), dtype=torch.float32, device=dev),
-        )
-        _LMPOST_M_BUFS[idx] = bufs
     return bufs
 
 
@@ -1137,122 +1124,6 @@ def admit_tma4_lmpost(
     return True
 
 
-def launch_lmhead_lmpost6_m(
-    x: torch.Tensor,
-    layer: torch.nn.Module,
-    lut: torch.Tensor,
-    out_tokens: torch.Tensor,
-    org_vocab_size: int,
-) -> bool:
-    s6 = getattr(layer, "_marlin_decode_scales6", None)
-    if (
-        s6 is None
-        or _sk_tma4_ilv_lmpost_m is None
-        or not is_tma4_ilv(s6)
-        or not x.is_contiguous()
-        or x.data_ptr() % 16 != 0
-        or x.ndim != 2
-        or not (1 <= x.shape[0] <= 8)
-        or x.shape[1] != layer.input_size_per_partition
-        or not out_tokens.is_contiguous()
-        or out_tokens.dtype != torch.int64
-        or out_tokens.numel() < x.shape[0]
-    ):
-        return False
-    m = int(x.shape[0])
-    n, k = layer.output_size_per_partition, layer.input_size_per_partition
-    lm_pad128 = (n, k) == (LM_HEAD_N, LM_HEAD_K) and is_lm_pad128(s6)
-    eff_n = LM_HEAD_PAD128_N if lm_pad128 else n
-    blocks = 96 if is_lm_split2(s6) else 48
-    scratch, partials = _get_lmpost_m_bufs(x.device)
-    with torch.cuda.device(x.device):
-        rc = _sk_tma4_ilv_lmpost_m(
-            x.data_ptr(),
-            layer._marlin_decode_weight.data_ptr(),
-            scratch.data_ptr(),
-            partials.data_ptr(),
-            s6.data_ptr(),
-            layer._marlin_decode_palette.data_ptr(),
-            layer.weight_global_scale.data_ptr(),
-            layer.workspace.data_ptr(),
-            lut.data_ptr(),
-            out_tokens.data_ptr(),
-            int(org_vocab_size),
-            m,
-            eff_n,
-            k,
-            blocks,
-            x.device.index,
-            torch.cuda.current_stream().cuda_stream,
-        )
-    if rc:
-        raise RuntimeError(f"muse_marlin6_sk_tma4_ilv_lmpost_m failed with CUDA error {rc}")
-    return True
-
-
-def admit_tma4_lmpost_m(
-    layer: torch.nn.Module,
-    lut: torch.Tensor,
-    org_vocab_size: int,
-    lmpost_argmax,
-    mult: float,
-    cap: float | None,
-) -> bool:
-    if os.environ.get("MUSE_FUSE_LMHEAD_LMPOST_M", "1") == "0":
-        return False
-    scales6 = getattr(layer, "_marlin_decode_scales6", None)
-    if (
-        scales6 is None
-        or _sk_tma4_ilv_lmpost_m is None
-        or getattr(layer, "_marlin_decode_weight", None) is None
-        or getattr(layer, "_marlin_decode_palette", None) is None
-        or getattr(layer, "marlin_decode6_fixed_grid", False)
-        or not is_tma4_ilv(scales6)
-    ):
-        return False
-    n, k = layer.output_size_per_partition, layer.input_size_per_partition
-    pad128 = (n, k) == (LM_HEAD_N, LM_HEAD_K) and is_lm_pad128(scales6)
-    if (n, k) != (LM_HEAD_N, LM_HEAD_K) or not (0 < org_vocab_size <= n):
-        return False
-    dev = scales6.device
-    scratch, _ = _get_lmpost_m_bufs(dev)
-    gen = torch.Generator(device=dev).manual_seed(20261128)
-    for cm in (7, 2):
-        out_tok = torch.empty((1, cm), dtype=torch.int64, device=dev)
-        for mag in (0.05, 1.5, 16.0):
-            x = (torch.randn((cm, k), generator=gen, device=dev) * mag).to(torch.bfloat16).contiguous()
-            raw = decode_linear6(
-                x, layer._marlin_decode_weight, scales6, layer._marlin_decode_palette,
-                layer.weight_global_scale, layer.workspace, n, k, False,
-            )
-            if org_vocab_size < n:
-                raw = raw[:, :org_vocab_size].contiguous()
-            refs = []
-            for r in range(cm):
-                ref_r = lmpost_argmax(raw[r : r + 1].contiguous(), mult, cap)
-                if ref_r is None:
-                    return False
-                refs.append(ref_r.view(-1))
-            ref = torch.cat(refs, dim=0).view(1, cm)
-            out_tok.fill_(-1)
-            if not launch_lmhead_lmpost6_m(x, layer, lut, out_tok, org_vocab_size):
-                return False
-            torch.cuda.synchronize(dev)
-            if (
-                not torch.equal(out_tok, ref)
-                or int(torch.count_nonzero(layer.workspace).item()) != 0
-                or int(scratch.view(torch.int32)[2048].item()) != 0
-            ):
-                logger.warning("Fused multi-M lm_head+lmpost self-check mismatch (m=%d); keeping 2-kernel path", cm)
-                return False
-    layer.marlin_decode6_lmpost_m_admitted = True
-    logger.info(
-        "Fused multi-M lm_head+lmpost decode6 kernel admitted bitwise (n=%d, vocab=%d, k=%d, split2=%s, pad128=%s)",
-        n, org_vocab_size, k, is_lm_split2(scales6), pad128,
-    )
-    return True
-
-
 def _pair_gate_up_tensors(w_raw: torch.Tensor, s_raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Repack [312, 416, 256] int32 weights and [312, 416, 128] uint8 scales so part-1 tiles 0..263
     pair 64 gate + 64 up cols in shared memory, part-1 tiles 264..287 hold pure full-K gate cols
@@ -1296,8 +1167,6 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
         return 0
     count_bf16 = 0
     count_fp8 = 0
-    count_m = 0
-    count_reused = 0
     for lyr in layers:
         mlp = getattr(lyr, "mlp", None)
         gu = getattr(mlp, "gate_up_proj", None)
@@ -1505,8 +1374,6 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
                 gu.register_buffer("_marlin_decode_scales6", s6_backup, persistent=False)
             continue
         del w_backup, s6_backup
-        if reused_s6:
-            count_reused += 1
         if dev not in _GATE_UP_TILE_ORDER:
             tiles = [*range(0, 528, 2), *range(528, 576), *range(1, 528, 2), *range(576, 624)]
             _GATE_UP_TILE_ORDER[dev] = torch.tensor(tiles, dtype=torch.int64, device=dev)
@@ -1527,39 +1394,30 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
                 try:
                     import muse_norm_glue as G
                     gen_m = torch.Generator(device=dev).manual_seed(20261127 + count_bf16)
+                    xm = (torch.randn((7, GATE_UP_K), generator=gen_m, device=dev) * 0.6).to(torch.bfloat16).contiguous()
+                    out_raw = torch.empty((7, GATE_UP_N), dtype=torch.bfloat16, device=dev)
                     sw_buf_m = torch.empty((8, GATE_UP_N), dtype=torch.bfloat16, device=dev)
-                    check_ms = (7, 8) if count_bf16 == 0 else (7,)
-                    m_ok = True
-                    for cm in check_ms:
-                        xm = (torch.randn((cm, GATE_UP_K), generator=gen_m, device=dev) * 0.6).to(torch.bfloat16).contiguous()
-                        out_raw = torch.empty((cm, GATE_UP_N), dtype=torch.bfloat16, device=dev)
-                        ref_sw_m = torch.empty((cm, DOWN_K), dtype=torch.bfloat16, device=dev)
-                        with torch.cuda.device(dev):
-                            st_m = torch.cuda.current_stream().cuda_stream
-                            rc_r = _sk_tma4_ilv_m(
-                                xm.data_ptr(), w.data_ptr(), out_raw.data_ptr(), partials.data_ptr(),
-                                s6_new.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
-                                gu.workspace.data_ptr(), cm, GATE_UP_N, GATE_UP_K, 48, dev.index, st_m,
-                            )
-                            unpaired = out_raw.view(cm, 624, 64).index_select(1, _GATE_UP_TILE_ORDER[dev]).reshape(cm, GATE_UP_N).contiguous()
-                            G.mul_silu_slice_bf16(unpaired, ref_sw_m, cm, st_m)
-                            rc_f = _sk_tma4_ilv_swiglu_m(
-                                xm.data_ptr(), w.data_ptr(), sw_buf_m.data_ptr(), partials.data_ptr(),
-                                s6_new.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
-                                gu.workspace.data_ptr(), cm, GATE_UP_N, GATE_UP_K, 48, dev.index, st_m,
-                            )
-                        torch.cuda.synchronize(dev)
-                        got_sw_m = sw_buf_m.view(-1)[: cm * DOWN_K].view(cm, DOWN_K)
-                        if not (rc_r == 0 and rc_f == 0 and int(torch.count_nonzero(gu.workspace).item()) == 0 and torch.equal(got_sw_m.view(torch.int16), ref_sw_m.view(torch.int16))):
-                            m_ok = False
-                            del xm, out_raw, unpaired, ref_sw_m
-                            break
-                        del xm, out_raw, unpaired, ref_sw_m
-                    if m_ok:
+                    ref_sw_m = torch.empty((7, DOWN_K), dtype=torch.bfloat16, device=dev)
+                    with torch.cuda.device(dev):
+                        st_m = torch.cuda.current_stream().cuda_stream
+                        rc_r = _sk_tma4_ilv_m(
+                            xm.data_ptr(), w.data_ptr(), out_raw.data_ptr(), partials.data_ptr(),
+                            s6_new.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
+                            gu.workspace.data_ptr(), 7, GATE_UP_N, GATE_UP_K, 48, dev.index, st_m,
+                        )
+                        unpaired = out_raw.view(7, 624, 64).index_select(1, _GATE_UP_TILE_ORDER[dev]).reshape(7, GATE_UP_N).contiguous()
+                        G.mul_silu_slice_bf16(unpaired, ref_sw_m, 7, st_m)
+                        rc_f = _sk_tma4_ilv_swiglu_m(
+                            xm.data_ptr(), w.data_ptr(), sw_buf_m.data_ptr(), partials.data_ptr(),
+                            s6_new.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
+                            gu.workspace.data_ptr(), 7, GATE_UP_N, GATE_UP_K, 48, dev.index, st_m,
+                        )
+                    torch.cuda.synchronize(dev)
+                    got_sw_m = sw_buf_m.view(-1)[: 7 * DOWN_K].view(7, DOWN_K)
+                    if rc_r == 0 and rc_f == 0 and int(torch.count_nonzero(gu.workspace).item()) == 0 and torch.equal(got_sw_m.view(torch.int16), ref_sw_m.view(torch.int16)):
                         swiglu_out_m = sw_buf_m
-                        count_m += 1
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning_once("Decode6 multi-M gate_up SwiGLU check failed: %s", exc)
+                    del xm, out_raw, unpaired, ref_sw_m
+                except Exception:
                     swiglu_out_m = None
             _SWIGLU_GATE_UP[gs_key] = {
                 "swiglu_out": swiglu_out,
@@ -1573,8 +1431,8 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
     total = count_bf16 + count_fp8
     if total:
         logger.info(
-            "Decode6 paired gate_up SwiGLU admitted bitwise on %d MLP layers (%d BF16->NVFP4, %d FP8->rANS, %d multi-M, %d/%d reused fast-pool scales6)",
-            total, count_bf16, count_fp8, count_m, count_reused, total,
+            "Decode6 paired gate_up SwiGLU admitted bitwise on %d MLP layers (%d BF16->NVFP4, %d FP8->rANS)",
+            total, count_bf16, count_fp8,
         )
     return total
 
@@ -1606,48 +1464,12 @@ def launch_oproj_gated6(
     return output
 
 
-def launch_oproj_gated6_m(
-    gate: torch.Tensor,
-    attn: torch.Tensor,
-    tiled_weight: torch.Tensor,
-    scales6: torch.Tensor,
-    palette: torch.Tensor,
-    global_scale: torch.Tensor,
-    workspace: torch.Tensor,
-    out_shape: tuple[int, ...],
-) -> torch.Tensor:
-    if _sk_tma4_ilv_gated_m is None or not is_tma4_ilv(scales6):
-        raise RuntimeError("SM121 Marlin multi-M o_proj gated kernel unavailable")
-    m = int(gate.numel() // OPROJ_K)
-    if m < 1 or m > 8 or gate.numel() != m * OPROJ_K or attn.numel() != m * OPROJ_K:
-        raise RuntimeError(f"SM121 Marlin multi-M o_proj gated invalid shape: m={m}")
-    if not gate.is_contiguous() or gate.data_ptr() % 16:
-        gate = gate.clone(memory_format=torch.contiguous_format)
-    if not attn.is_contiguous() or attn.data_ptr() % 16:
-        attn = attn.clone(memory_format=torch.contiguous_format)
-    partials = gate.new_empty((48, 16, 128), dtype=torch.float32)
-    output = gate.new_empty(out_shape)
-    with torch.cuda.device(gate.device):
-        status = _sk_tma4_ilv_gated_m(
-            gate.data_ptr(), attn.data_ptr(), tiled_weight.data_ptr(), output.data_ptr(),
-            partials.data_ptr(), scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(),
-            workspace.data_ptr(), m, OPROJ_N, OPROJ_K, 48,
-            gate.device.index, torch.cuda.current_stream().cuda_stream,
-        )
-    if status:
-        raise RuntimeError(f"SM121 Marlin multi-M o_proj gated launch failed with CUDA error {status}")
-    return output
-
-
 def register_all_oproj_sigmoid(model: torch.nn.Module) -> int:
-    global _ALL_OPROJ_GATED_READY, _ALL_OPROJ_GATED_M_READY
+    global _ALL_OPROJ_GATED_READY
     _ALL_OPROJ_GATED_READY = False
-    _ALL_OPROJ_GATED_M_READY = False
     _GATED_OPROJ.clear()
-    _GATED_OPROJ_M.clear()
     if os.environ.get("MUSE_OPROJ_SIGMOID_FUSE", "1") == "0" or (_sk_tma4_ilv_gated is None and _sk_tma4_gated is None):
         return 0
-    want_m = os.environ.get("MUSE_OPROJ_SIGMOID_FUSE_M", "1") != "0" and _sk_tma4_ilv_gated_m is not None
     try:
         import muse_norm_glue as _ng
         if _ng.lib() is None or not hasattr(_ng, "mul_sigmoid_bf16"):
@@ -1660,7 +1482,6 @@ def register_all_oproj_sigmoid(model: torch.nn.Module) -> int:
         return 0
     non_fp8_total = 0
     admitted = 0
-    admitted_m = 0
     for lyr in layers:
         sa = getattr(lyr, "self_attn", None)
         op = getattr(sa, "o_proj", None)
@@ -1705,34 +1526,9 @@ def register_all_oproj_sigmoid(model: torch.nn.Module) -> int:
         if ok:
             _GATED_OPROJ.add(gs.data_ptr())
             admitted += 1
-            if want_m and is_tma4_ilv(s6):
-                tmp7 = torch.empty((7, OPROJ_K), dtype=torch.bfloat16, device=dev)
-                ok_m = True
-                try:
-                    with torch.cuda.device(dev):
-                        stream = torch.cuda.current_stream().cuda_stream
-                        for sig in (0.05, 1.0, 5.0, 24.0):
-                            rg7 = (torch.randn((7, OPROJ_K), generator=gen, device=dev) * sig).to(torch.bfloat16).contiguous()
-                            ra7 = (torch.randn((7, OPROJ_K), generator=gen, device=dev) * sig).to(torch.bfloat16).contiguous()
-                            ra7[:, 1::2] = -ra7[:, ::2]
-                            _ng.mul_sigmoid_bf16(rg7, ra7, tmp7, 7 * OPROJ_K, stream)
-                            ref7 = decode_linear6(tmp7, w, s6, pal, gs, ws, OPROJ_N, OPROJ_K, False)
-                            got7 = launch_oproj_gated6_m(rg7, ra7, w, s6, pal, gs, ws, (7, OPROJ_N))
-                            torch.cuda.synchronize(dev)
-                            if not torch.equal(got7.view(torch.int16), ref7.view(torch.int16)) or int(torch.count_nonzero(ws).item()) != 0:
-                                ok_m = False
-                                break
-                except Exception:
-                    ok_m = False
-                if ok_m:
-                    _GATED_OPROJ_M.add(gs.data_ptr())
-                    admitted_m += 1
     if non_fp8_total > 0 and admitted == non_fp8_total:
         _ALL_OPROJ_GATED_READY = True
         logger.info("Decode6 o_proj fused mul_sigmoid prologue prechecked bitwise on %d/%d NVFP4 layers", admitted, non_fp8_total)
-    if non_fp8_total > 0 and admitted_m == non_fp8_total:
-        _ALL_OPROJ_GATED_M_READY = True
-        logger.info("Decode6 o_proj fused mul_sigmoid M=2..8 prologue prechecked bitwise on %d/%d NVFP4 layers", admitted_m, non_fp8_total)
     return admitted
 
 
@@ -2059,18 +1855,9 @@ def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
     if coded.numel() > c.numel():
         logger.warning("TMA4 (%dx%d) rejected: coded %d > c %d", n, k, coded.numel(), c.numel())
         return False
-    want_draft_lm_ilv = (
-        not fixed_grid
-        and k == LM_HEAD_K
-        and n >= 16384
-        and n % 128 == 0
-        and n != GATE_UP_N
-        and os.environ.get("MUSE_LM_HEAD_ILV", "1") != "0"
-    )
     want_ilv = _sk_tma4_ilv is not None and (
         want_gu_ilv
         or want_lm_ilv
-        or want_draft_lm_ilv
         or (
             not fixed_grid
             and (
