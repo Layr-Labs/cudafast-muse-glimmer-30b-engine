@@ -35,6 +35,17 @@ __device__ __forceinline__ void int3_mma_m16n8k16(
       : "r"(a0), "r"(0u), "r"(a2), "r"(0u), "r"(b0), "r"(b1));
 }
 
+__device__ __forceinline__ void int3_mma_m16n8k16_full(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
 __device__ __forceinline__ uint64_t int3_pol_ef() {
   uint64_t pol;
   asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
@@ -43,6 +54,10 @@ __device__ __forceinline__ uint64_t int3_pol_ef() {
 
 __device__ __forceinline__ void int3_cp_async16_ef(uint32_t sd, const void* gs, uint64_t pol) {
   asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(sd), "l"(gs), "l"(pol));
+}
+
+__device__ __forceinline__ void int3_cp_async16_cg(uint32_t sd, const void* gs) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(sd), "l"(gs));
 }
 
 __device__ __forceinline__ void int3_cp_async16_ca(uint32_t sd, const void* gs) {
@@ -254,30 +269,33 @@ __global__ void int3_pack_kernel(
   }
 }
 
+template <int kMaxM>
 struct alignas(16) Int3StageSmem {
-  uint8_t w[kStages][kStepWBytes];     // 6 * 1792 = 10752 B
-  __nv_bfloat16 a[kStages][8][64];     // 6 * 1024 = 6144 B
-};                                     // Total = 16896 B (16.5 KiB)
+  uint8_t w[kStages][kStepWBytes];         // 6 * 1792 = 10752 B
+  __nv_bfloat16 a[kStages][kMaxM][64];     // 6 * 1024 = 6144 B (M<=8) or 12288 B (M<=16)
+};                                         // Total = 16.5 KiB (M<=8) or 22.5 KiB (M<=16), 3 CTAs/SM
 
-// Persistent 48-CTA / 96-CTA or direct GEMM with optional split-K (for small N/64 like down/fc).
-// When kSplitK == 1, writes directly to BF16 C.
-// When kSplitK > 1, grid = (N/64, kSplitK), accumulates to FP32 partials, then final CTA reduces?
-// Even simpler: use 1-pass persistent 48-CTA or direct (N/64) for N>=10240, and 4-way split-K via atomicAdd to FP32 + tiny epilogue or persistent!
-template <bool kSplitK>
+// Direct / split-K W3A16 Tensor-Core GEMM.
+// kM16=false serves M=1..8 (16.5 KiB SMEM); kM16=true populates full m16n8k16 A rows 0..15 (22.5 KiB SMEM,
+// plain cp.async.cg without L2::cache_hint to stay immune to SM121 odd-UR hazard) with zero extra weight reads.
+template <bool kSplitK, bool kM16 = false>
 __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
     const __nv_bfloat16* __restrict__ A,
     const uint8_t* __restrict__ W_packed,
     __nv_bfloat16* __restrict__ C,
     float* __restrict__ C_fp32,
     int M, int N, int K, int split_k) {
-  __shared__ Int3StageSmem smem;
+  __shared__ Int3StageSmem<kM16 ? 16 : 8> smem;
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
   const int g = lane >> 2;
   const int t = lane & 3;
   const int num_kg = K >> 6;
-  const uint64_t pol = int3_pol_ef();
+  uint64_t pol = 0ull;
+  if constexpr (!kM16) {
+    pol = int3_pol_ef();
+  }
 
   const int cta_n = blockIdx.x;
   const int sk_idx = kSplitK ? blockIdx.y : 0;
@@ -302,9 +320,21 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
   auto issue_stage = [&](int kg, int st) {
     if (tid < kStepWU4) {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
-      int3_cp_async16_ef(sd, w_cta + static_cast<size_t>(kg) * kStepWBytes + tid * 16, pol);
+      if constexpr (kM16) {
+        int3_cp_async16_cg(sd, w_cta + static_cast<size_t>(kg) * kStepWBytes + tid * 16);
+      } else {
+        int3_cp_async16_ef(sd, w_cta + static_cast<size_t>(kg) * kStepWBytes + tid * 16, pol);
+      }
     }
-    if (tid < 64) {
+    if constexpr (kM16) {
+      // All 128 threads load up to 16 rows x 8 uint4s (64 BF16 elems/row).
+      const int row = tid >> 3;
+      const int col8 = tid & 7;
+      if (row < M) {
+        const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][row][col8 * 8]));
+        int3_cp_async16_ca(sd, A + static_cast<size_t>(row) * K + kg * 64 + col8 * 8);
+      }
+    } else if (tid < 64) {
       const int row = tid >> 3;
       const int col8 = tid & 7;
       if (row < M) {
@@ -324,6 +354,7 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
 
   float d0_0 = 0.0f, d1_0 = 0.0f, d2_0 = 0.0f, d3_0 = 0.0f;
   float d0_1 = 0.0f, d1_1 = 0.0f, d2_1 = 0.0f, d3_1 = 0.0f;
+  const bool has_hi = kM16 && ((g + 8) < M);
 
   int st = 0;
   for (int i = 0; i < my_kgs; ++i) {
@@ -346,10 +377,19 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
     // Load A + both W tiles from stage `st`, then immediately issue stage `i + 5` into free slot!
     const uint32_t* a_row_u32 = reinterpret_cast<const uint32_t*>(&smem.a[st][g][0]);
     uint32_t a0_r[4], a2_r[4];
+    uint32_t a1_r[4], a3_r[4];
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
       a0_r[s] = (g < M) ? a_row_u32[s * 8 + t] : 0u;
       a2_r[s] = (g < M) ? a_row_u32[s * 8 + 4 + t] : 0u;
+    }
+    if constexpr (kM16) {
+      const uint32_t* a_hi_u32 = reinterpret_cast<const uint32_t*>(&smem.a[st][g + 8][0]);
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        a1_r[s] = has_hi ? a_hi_u32[s * 8 + t] : 0u;
+        a3_r[s] = has_hi ? a_hi_u32[s * 8 + 4 + t] : 0u;
+      }
     }
 
     const uint8_t* wt0 = &smem.w[st][(warp * 2 + 0) * kTileBytes];
@@ -367,8 +407,6 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
     const float zr1 = __bfloat162float(sz1.y);
 
     // Next write slot is (st + kPreload) % kStages = (st + 5) % 6 (last read 1 iter ago, before __syncthreads()!).
-    // Wait: to be 100% sure ALL warps finished reading (st + 5) % 6, notice we ALREADY loaded everything from `st`
-    // into registers above, AND the previous __syncthreads() guarantees all warps finished reading `st - 1 = (st + 5) % 6`!
     const int next_i = i + kPreload;
     if (next_i < my_kgs) {
       const int next_st = (st + kPreload >= kStages) ? (st + kPreload - kStages) : (st + kPreload);
@@ -387,7 +425,11 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
                                           __fmaf_rn(static_cast<float>(q1), sc0, zr0));
       const uint32_t b1 = int3_bf16x2_u32(__fmaf_rn(static_cast<float>(q2), sc0, zr0),
                                           __fmaf_rn(static_cast<float>(q3), sc0, zr0));
-      int3_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0_r[s], a2_r[s], b0, b1);
+      if constexpr (kM16) {
+        int3_mma_m16n8k16_full(d0_0, d1_0, d2_0, d3_0, a0_r[s], a1_r[s], a2_r[s], a3_r[s], b0, b1);
+      } else {
+        int3_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0_r[s], a2_r[s], b0, b1);
+      }
 
       const uint32_t p0 = (lo2_1 & 3u) | ((hi1_1 & 1u) << 2);
       const uint32_t p1 = ((lo2_1 >> 2) & 3u) | (((hi1_1 >> 1) & 1u) << 2);
@@ -399,15 +441,19 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
                                           __fmaf_rn(static_cast<float>(p1), sc1, zr1));
       const uint32_t c1 = int3_bf16x2_u32(__fmaf_rn(static_cast<float>(p2), sc1, zr1),
                                           __fmaf_rn(static_cast<float>(p3), sc1, zr1));
-      int3_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0_r[s], a2_r[s], c0, c1);
+      if constexpr (kM16) {
+        int3_mma_m16n8k16_full(d0_1, d1_1, d2_1, d3_1, a0_r[s], a1_r[s], a2_r[s], a3_r[s], c0, c1);
+      } else {
+        int3_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0_r[s], a2_r[s], c0, c1);
+      }
     }
 
     st = (st + 1 == kStages) ? 0 : (st + 1);
   }
 
+  const int col0 = cta_n * kRowsPerCTA + (warp * 2 + 0) * 8 + 2 * t;
+  const int col1 = cta_n * kRowsPerCTA + (warp * 2 + 1) * 8 + 2 * t;
   if (g < M) {
-    const int col0 = cta_n * kRowsPerCTA + (warp * 2 + 0) * 8 + 2 * t;
-    const int col1 = cta_n * kRowsPerCTA + (warp * 2 + 1) * 8 + 2 * t;
     if constexpr (!kSplitK) {
       *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col0) = int3_bf16x2_u32(d0_0, d1_0);
       *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col1) = int3_bf16x2_u32(d0_1, d1_1);
@@ -416,6 +462,20 @@ __global__ void __launch_bounds__(128, 3) int3_mma_gemm_kernel(
       float* p1 = C_fp32 + (static_cast<size_t>(sk_idx) * M + g) * N + col1;
       p0[0] = d0_0; p0[1] = d1_0;
       p1[0] = d0_1; p1[1] = d1_1;
+    }
+  }
+  if constexpr (kM16) {
+    if (has_hi) {
+      const int ghi = g + 8;
+      if constexpr (!kSplitK) {
+        *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(ghi) * N + col0) = int3_bf16x2_u32(d2_0, d3_0);
+        *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(ghi) * N + col1) = int3_bf16x2_u32(d2_1, d3_1);
+      } else {
+        float* p0 = C_fp32 + (static_cast<size_t>(sk_idx) * M + ghi) * N + col0;
+        float* p1 = C_fp32 + (static_cast<size_t>(sk_idx) * M + ghi) * N + col1;
+        p0[0] = d2_0; p0[1] = d3_0;
+        p1[0] = d2_1; p1[1] = d3_1;
+      }
     }
   }
 }
@@ -464,7 +524,7 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
   TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous(),
               "int3_gemm expects contiguous CUDA BF16 [M, K]");
   const int M = static_cast<int>(A.size(0));
-  TORCH_CHECK(M >= 1 && M <= 8 && A.size(1) == K && N % kRowsPerCTA == 0 && K % 64 == 0,
+  TORCH_CHECK(M >= 1 && M <= 16 && A.size(1) == K && N % kRowsPerCTA == 0 && K % 64 == 0,
               "int3_gemm shape mismatch");
   auto C = torch::empty({M, N}, A.options());
   auto st = c10::cuda::getCurrentCUDAStream().stream();
@@ -476,24 +536,41 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
   if (n_blocks <= 128 && K >= 16384) {
     split_k = (K >= 28672) ? 4 : 3;
   }
+  const bool use_m16 = (M > 8);
   if (split_k == 1) {
-    int3_mma_gemm_kernel<false><<<n_blocks, kThreads, 0, st>>>(
-        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
-        W_packed.data_ptr<uint8_t>(),
-        reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-        nullptr, M, static_cast<int>(N), static_cast<int>(K), 1);
+    if (use_m16) {
+      int3_mma_gemm_kernel<false, true><<<n_blocks, kThreads, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+          W_packed.data_ptr<uint8_t>(),
+          reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+          nullptr, M, static_cast<int>(N), static_cast<int>(K), 1);
+    } else {
+      int3_mma_gemm_kernel<false, false><<<n_blocks, kThreads, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+          W_packed.data_ptr<uint8_t>(),
+          reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+          nullptr, M, static_cast<int>(N), static_cast<int>(K), 1);
+    }
   } else {
     const int64_t need = static_cast<int64_t>(split_k) * M * N;
-    const int64_t alloc = (need > 4 * 8 * 6656) ? need : (4 * 8 * 6656);
+    const int64_t alloc = (need > 4 * 16 * 6656) ? need : (4 * 16 * 6656);
     if (!g_partials.defined() || g_partials.device() != A.device() || g_partials_cap < need) {
       g_partials = torch::empty({alloc}, A.options().dtype(torch::kFloat32));
       g_partials_cap = alloc;
     }
-    int3_mma_gemm_kernel<true><<<dim3(n_blocks, split_k, 1), kThreads, 0, st>>>(
-        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
-        W_packed.data_ptr<uint8_t>(),
-        nullptr, g_partials.data_ptr<float>(),
-        M, static_cast<int>(N), static_cast<int>(K), split_k);
+    if (use_m16) {
+      int3_mma_gemm_kernel<true, true><<<dim3(n_blocks, split_k, 1), kThreads, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+          W_packed.data_ptr<uint8_t>(),
+          nullptr, g_partials.data_ptr<float>(),
+          M, static_cast<int>(N), static_cast<int>(K), split_k);
+    } else {
+      int3_mma_gemm_kernel<true, false><<<dim3(n_blocks, split_k, 1), kThreads, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+          W_packed.data_ptr<uint8_t>(),
+          nullptr, g_partials.data_ptr<float>(),
+          M, static_cast<int>(N), static_cast<int>(K), split_k);
+    }
     const int total = M * static_cast<int>(N);
     int3_reduce_splitk_kernel<<<(total + 255) / 256, 256, 0, st>>>(
         g_partials.data_ptr<float>(),

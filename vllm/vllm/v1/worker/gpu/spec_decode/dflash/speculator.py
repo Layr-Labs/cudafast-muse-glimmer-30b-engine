@@ -43,18 +43,33 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
 
-        # Each request emits exactly (bonus + N mask) query tokens per step.
-        self.num_query_per_req = 1 + self.num_speculative_steps
-
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
         )
 
-        from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
+        from vllm.model_executor.models.qwen3_dflash import (
+            dflash_has_any_non_causal,
+            dflash_query_len,
+        )
 
         self.requires_non_causal = dflash_has_any_non_causal(
             self.draft_model_config.hf_config
         )
+
+        # Each request emits (bonus + N sampled masks + optional trailing context masks) query tokens.
+        self.num_query_per_req = dflash_query_len(
+            self.draft_model_config.hf_config, self.num_speculative_steps
+        )
+        self.extra_query_tokens = max(
+            0, self.num_query_per_req - (1 + self.num_speculative_steps)
+        )
+        if self.extra_query_tokens > 0:
+            logger.info(
+                "DFlash bidirectional full-tile query window active: Q=%d (1 anchor + %d sampled + %d trailing mask)",
+                self.num_query_per_req,
+                self.num_speculative_steps,
+                self.extra_query_tokens,
+            )
 
         # Whether the anchor query position is itself a prediction. DFlash default uses
         # the anchor as the bonus token (only mask tokens predict); DSpark samples from
@@ -131,8 +146,30 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             cudagraph_mode = CUDAGraphMode.NONE
 
+        cg_vllm_config = self.vllm_config
+        comp_cfg = self.vllm_config.compilation_config
+        if (
+            comp_cfg is not None
+            and comp_cfg.cudagraph_capture_sizes
+            and self.num_query_per_req > comp_cfg.max_cudagraph_capture_size
+        ):
+            new_sizes = sorted(
+                set(comp_cfg.cudagraph_capture_sizes) | {self.num_query_per_req}
+            )
+            cg_vllm_config = replace(
+                self.vllm_config,
+                compilation_config=replace(
+                    comp_cfg,
+                    cudagraph_capture_sizes=new_sizes,
+                    max_cudagraph_capture_size=max(
+                        comp_cfg.max_cudagraph_capture_size,
+                        self.num_query_per_req,
+                    ),
+                ),
+            )
+
         self.query_cudagraph_manager = DFlashCudaGraphManager(
-            self.vllm_config,
+            cg_vllm_config,
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
@@ -346,6 +383,15 @@ class DFlashSpeculator(DraftModelSpeculator):
         # request's query length to include any rejected positions.
         def _build_ctx_hidden() -> torch.Tensor:
             if aux_hidden_states:
+                if (
+                    len(aux_hidden_states) == 5
+                    and hasattr(self.model, "combine_hidden_states_aux5")
+                ):
+                    out = self.model.combine_hidden_states_aux5(
+                        aux_hidden_states, num_target_tokens
+                    )
+                    if out is not None:
+                        return out if out.is_contiguous() else out.contiguous()
                 if aux_hidden_states[0].shape[0] > num_target_tokens:
                     aux_cat = torch.cat(
                         [h[:num_target_tokens] for h in aux_hidden_states], dim=-1
@@ -678,6 +724,7 @@ def _prepare_dflash_inputs_kernel(
         other=0,
     ).to(tl.int64)
     q_slot = q_block_id * block_size + (query_pos % block_size)
+    q_slot = tl.where(query_pos < max_model_len, q_slot, PAD_SLOT_ID)
 
     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
     clamped_query_pos = tl.minimum(query_pos, max_model_len - 1)
@@ -687,10 +734,15 @@ def _prepare_dflash_inputs_kernel(
     # --- Sample indices / positions / idx_mapping ---
     # When SAMPLE_FROM_ANCHOR (DSpark), so we sample at EVERY query position
     # and each position k predicts the NEXT token (sampled position = query_pos + 1).
-    # Otherwise (DFlash default) the anchor is the bonus token and only the mask tokens
-    # at offsets > 0 are sampled from, each AT its own position.
+    # Otherwise (DFlash default) the anchor is the bonus token and only the first
+    # num_speculative_steps mask tokens (offsets 1..num_speculative_steps) are
+    # sampled; any trailing masks beyond that act purely as bidirectional context.
     sample_off = 0 if SAMPLE_FROM_ANCHOR else 1
-    is_sample = is_query & (query_off >= sample_off)
+    is_sample = (
+        is_query
+        & (query_off >= sample_off)
+        & (query_off < sample_off + num_speculative_steps)
+    )
     sample_idx = req_idx * num_speculative_steps + (query_off - sample_off)
     sample_pos = query_pos + 1 if SAMPLE_FROM_ANCHOR else query_pos
     tl.store(out_sample_indices_ptr + sample_idx, query_idx, mask=is_sample)
@@ -702,7 +754,10 @@ def _prepare_dflash_inputs_kernel(
         # seq_lens is the absolute sequence length the draft attention
         # reads up to (context + query), not just the count of accepted
         # tokens this step.
-        tl.store(out_seq_lens_ptr + req_idx, last_valid_pos + 1 + num_query_per_req)
+        tl.store(
+            out_seq_lens_ptr + req_idx,
+            tl.minimum(last_valid_pos + 1 + num_query_per_req, max_model_len),
+        )
         # Copy sampling state.
         tl.store(
             out_temperature_ptr + req_state_idx,
