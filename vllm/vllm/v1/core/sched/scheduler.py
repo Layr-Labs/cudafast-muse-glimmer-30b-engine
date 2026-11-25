@@ -281,8 +281,20 @@ class Scheduler(SchedulerInterface):
                     )
 
                     _extra_leaf_slots = max(0, desired_verify_m() - 7)
+                from vllm.model_executor.models.qwen3_dflash import dflash_query_len
+
+                _draft_cfg = getattr(
+                    speculative_config.draft_model_config, "hf_config", None
+                )
+                _extra_q_slots = max(
+                    0,
+                    dflash_query_len(_draft_cfg, self.num_spec_tokens)
+                    - (self.num_spec_tokens + 1),
+                )
                 self.num_lookahead_tokens = (
-                    self.num_spec_tokens + 1 + _extra_leaf_slots
+                    self.num_spec_tokens
+                    + 1
+                    + max(_extra_leaf_slots, _extra_q_slots)
                 )
             if speculative_config.use_dspark():
                 # DSpark drafts a block of num_spec_tokens query tokens in which the

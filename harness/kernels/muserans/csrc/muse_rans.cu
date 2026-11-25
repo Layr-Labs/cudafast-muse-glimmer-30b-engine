@@ -32,6 +32,8 @@
 #define RANS_LUT_BYTES 16384
 #define RANS_HDR_BYTES 256
 #define RANS_MAX_SMEM (99 * 1024)
+constexpr uint32_t kRansXStrideU4 = 68u;                       // 16 rows * 4 uint4 + 4 pad -> 0 bank conflicts on write & read
+constexpr uint32_t kRansXsmemBytes = 2u * 8u * kRansXStrideU4 * 16u;  // 17,408 B (2 buffers x 8 pairs = 16 K-steps)
 #ifndef RANS_PREISSUE
 #define RANS_PREISSUE 1
 #endif
@@ -61,6 +63,22 @@ template <int N>
 __device__ __forceinline__ void rans_cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
 __device__ __forceinline__ uint32_t rans_lds32(uint32_t addr) { uint32_t v; asm volatile("ld.shared.u32 %0, [%1];" : "=r"(v) : "r"(addr)); return v; }
 __device__ __forceinline__ uint32_t rans_lds16(uint32_t addr) { unsigned short v; asm volatile("ld.shared.u16 %0, [%1];" : "=h"(v) : "r"(addr)); return (uint32_t)v; }
+__device__ __forceinline__ void rans_xpose4(uint4 v, int t, uint32_t& o0, uint32_t& o1, uint32_t& o2, uint32_t& o3) {
+  const bool t1 = (t & 1) != 0;
+  const bool t2 = (t & 2) != 0;
+  const uint32_t s0 = __shfl_xor_sync(0xffffffffu, t1 ? v.x : v.y, 1);
+  const uint32_t s1 = __shfl_xor_sync(0xffffffffu, t1 ? v.z : v.w, 1);
+  const uint32_t p0 = t1 ? s0 : v.x;
+  const uint32_t p1 = t1 ? v.y : s0;
+  const uint32_t p2 = t1 ? s1 : v.z;
+  const uint32_t p3 = t1 ? v.w : s1;
+  const uint32_t r0 = __shfl_xor_sync(0xffffffffu, t2 ? p0 : p2, 2);
+  const uint32_t r1 = __shfl_xor_sync(0xffffffffu, t2 ? p1 : p3, 2);
+  o0 = t2 ? r0 : p0;
+  o1 = t2 ? r1 : p1;
+  o2 = t2 ? p2 : r0;
+  o3 = t2 ? p3 : r1;
+}
 
 __device__ __forceinline__ size_t rans_phys(const int* __restrict__ woff16, int tw, int gmin, int ilv, int w, uint32_t lb) {
   if (ilv == 0) return (size_t)woff16[w] * 16 + lb;
@@ -336,7 +354,7 @@ static size_t rans_tpf_stride() {
   return stride;
 }
 
-template <int NS, int GBS, int RG, int kIlvMode = 0, int kXGlobalMode = 2, bool kPar4 = false, int kMaxThreads = 1024, bool kM16 = false>
+template <int NS, int GBS, int RG, int kIlvMode = 0, int kXGlobalMode = 2, bool kPar4 = false, int kMaxThreads = 1024, bool kM16 = false, bool kXsmem = false, int kActMode = 0>
 __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) {
   constexpr uint32_t GB = 1u << GBS;
   constexpr uint32_t RB = GB * (uint32_t)RG;
@@ -345,8 +363,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
   const int tid = threadIdx.x, lane = tid & 31, wib = tid >> 5, wpb = blockDim.x >> 5;
   const int K = pb.K, S = K >> 5;
   uint2* xs = (uint2*)smem;
+  uint4* const x_smem_u4 = reinterpret_cast<uint4*>(smem);
   const bool x_global = (kXGlobalMode == 1) ? true : ((kXGlobalMode == 0) ? false : (pb.x_global != 0));
-  const int xbytes = x_global ? 0 : pb.M * ((K + 15) & ~15);
+  const int xbytes = kXsmem ? (int)kRansXsmemBytes : (x_global ? 0 : pb.M * ((K + 15) & ~15));
   const uint32_t sbase0 = (uint32_t)__cvta_generic_to_shared(smem) + (uint32_t)xbytes;
   const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + (uint32_t)wib * RB;
   int w;
@@ -440,65 +459,67 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
     // before reading pb.x / pb.x_aux in any act_mode (0, 1, or 2).
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
-  if (pb.act_mode == 0) {
-    if (!x_global) {
+  if constexpr (!kM16 && kXGlobalMode != 1) {
+    if (pb.act_mode == 0) {
+      if (!x_global) {
+        const int stride_s = 4 * pb.M;
+        const uint32_t inv_m24 = rans_inv_m24(pb.M);
+        for (int i = tid; i < S * stride_s; i += blockDim.x) {
+          const int q = i >> 2, tt = i & 3;
+          const int s = (inv_m24 != 0u) ? (int)(((uint64_t)(uint32_t)q * inv_m24) >> 24) : (q / pb.M);
+          const int m = q - s * pb.M;
+          const uint8_t* xm = pb.x + (size_t)m * K;
+          xs[i] = make_uint2(*(const uint32_t*)(xm + 32 * s + 4 * tt), *(const uint32_t*)(xm + 32 * s + 16 + 4 * tt));
+        }
+      }
+    } else if (pb.act_mode == 1) {
+      const float inv_sa = rans_full_rcp(__ldg(pb.sa));
       const int stride_s = 4 * pb.M;
       const uint32_t inv_m24 = rans_inv_m24(pb.M);
       for (int i = tid; i < S * stride_s; i += blockDim.x) {
         const int q = i >> 2, tt = i & 3;
         const int s = (inv_m24 != 0u) ? (int)(((uint64_t)(uint32_t)q * inv_m24) >> 24) : (q / pb.M);
         const int m = q - s * pb.M;
-        const uint8_t* xm = pb.x + (size_t)m * K;
-        xs[i] = make_uint2(*(const uint32_t*)(xm + 32 * s + 4 * tt), *(const uint32_t*)(xm + 32 * s + 16 + 4 * tt));
+        const uint16_t* gate_u16 = (const uint16_t*)pb.x + (size_t)m * K;
+        const uint16_t* attn_u16 = pb.x_aux + (size_t)m * K;
+        const int base0 = 32 * s + 4 * tt;
+        const int base1 = base0 + 16;
+        const uint2 g0 = *(const uint2*)(gate_u16 + base0), a0 = *(const uint2*)(attn_u16 + base0);
+        const uint2 g1 = *(const uint2*)(gate_u16 + base1), a1 = *(const uint2*)(attn_u16 + base1);
+        auto q4 = [&](uint2 gu, uint2 au) {
+          float gf0 = __uint_as_float((gu.x & 0xffffu) << 16), gf1 = __uint_as_float(gu.x & 0xffff0000u);
+          float gf2 = __uint_as_float((gu.y & 0xffffu) << 16), gf3 = __uint_as_float(gu.y & 0xffff0000u);
+          float af0 = __uint_as_float((au.x & 0xffffu) << 16), af1 = __uint_as_float(au.x & 0xffff0000u);
+          float af2 = __uint_as_float((au.y & 0xffffu) << 16), af3 = __uint_as_float(au.y & 0xffff0000u);
+          return rans_pack_fp8x4(
+              __fmul_rn(__fmul_rn(rans_triton_sigmoid(gf0), af0), inv_sa),
+              __fmul_rn(__fmul_rn(rans_triton_sigmoid(gf1), af1), inv_sa),
+              __fmul_rn(__fmul_rn(rans_triton_sigmoid(gf2), af2), inv_sa),
+              __fmul_rn(__fmul_rn(rans_triton_sigmoid(gf3), af3), inv_sa));
+        };
+        xs[i] = make_uint2(q4(g0, a0), q4(g1, a1));
       }
-    }
-  } else if (pb.act_mode == 1) {
-    const float inv_sa = rans_full_rcp(__ldg(pb.sa));
-    const int stride_s = 4 * pb.M;
-    const uint32_t inv_m24 = rans_inv_m24(pb.M);
-    for (int i = tid; i < S * stride_s; i += blockDim.x) {
-      const int q = i >> 2, tt = i & 3;
-      const int s = (inv_m24 != 0u) ? (int)(((uint64_t)(uint32_t)q * inv_m24) >> 24) : (q / pb.M);
-      const int m = q - s * pb.M;
-      const uint16_t* gate_u16 = (const uint16_t*)pb.x + (size_t)m * K;
-      const uint16_t* attn_u16 = pb.x_aux + (size_t)m * K;
-      const int base0 = 32 * s + 4 * tt;
-      const int base1 = base0 + 16;
-      const uint2 g0 = *(const uint2*)(gate_u16 + base0), a0 = *(const uint2*)(attn_u16 + base0);
-      const uint2 g1 = *(const uint2*)(gate_u16 + base1), a1 = *(const uint2*)(attn_u16 + base1);
-      auto q4 = [&](uint2 gu, uint2 au) {
-        float gf0 = __uint_as_float((gu.x & 0xffffu) << 16), gf1 = __uint_as_float(gu.x & 0xffff0000u);
-        float gf2 = __uint_as_float((gu.y & 0xffffu) << 16), gf3 = __uint_as_float(gu.y & 0xffff0000u);
-        float af0 = __uint_as_float((au.x & 0xffffu) << 16), af1 = __uint_as_float(au.x & 0xffff0000u);
-        float af2 = __uint_as_float((au.y & 0xffffu) << 16), af3 = __uint_as_float(au.y & 0xffff0000u);
-        return rans_pack_fp8x4(
-            __fmul_rn(__fmul_rn(rans_triton_sigmoid(gf0), af0), inv_sa),
-            __fmul_rn(__fmul_rn(rans_triton_sigmoid(gf1), af1), inv_sa),
-            __fmul_rn(__fmul_rn(rans_triton_sigmoid(gf2), af2), inv_sa),
-            __fmul_rn(__fmul_rn(rans_triton_sigmoid(gf3), af3), inv_sa));
-      };
-      xs[i] = make_uint2(q4(g0, a0), q4(g1, a1));
-    }
-  } else {
-    const float inv_sa = rans_full_rcp(__ldg(pb.sa));
-    const uint16_t* gu_u16 = (const uint16_t*)pb.x;
-    for (int i = tid; i < S * 4; i += blockDim.x) {
-      const int base0 = 32 * (i >> 2) + 4 * (i & 3);
-      const int base1 = base0 + 16;
-      const uint2 g0 = *(const uint2*)(gu_u16 + base0), u0 = *(const uint2*)(gu_u16 + K + base0);
-      const uint2 g1 = *(const uint2*)(gu_u16 + base1), u1 = *(const uint2*)(gu_u16 + K + base1);
-      auto s4 = [&](uint2 gu, uint2 uu) {
-        float gf0 = __uint_as_float((gu.x & 0xffffu) << 16), gf1 = __uint_as_float(gu.x & 0xffff0000u);
-        float gf2 = __uint_as_float((gu.y & 0xffffu) << 16), gf3 = __uint_as_float(gu.y & 0xffff0000u);
-        float uf0 = __uint_as_float((uu.x & 0xffffu) << 16), uf1 = __uint_as_float(uu.x & 0xffff0000u);
-        float uf2 = __uint_as_float((uu.y & 0xffffu) << 16), uf3 = __uint_as_float(uu.y & 0xffff0000u);
-        return rans_pack_fp8x4(
-            __fmul_rn(__fmul_rn(rans_triton_silu(gf0), uf0), inv_sa),
-            __fmul_rn(__fmul_rn(rans_triton_silu(gf1), uf1), inv_sa),
-            __fmul_rn(__fmul_rn(rans_triton_silu(gf2), uf2), inv_sa),
-            __fmul_rn(__fmul_rn(rans_triton_silu(gf3), uf3), inv_sa));
-      };
-      xs[i] = make_uint2(s4(g0, u0), s4(g1, u1));
+    } else {
+      const float inv_sa = rans_full_rcp(__ldg(pb.sa));
+      const uint16_t* gu_u16 = (const uint16_t*)pb.x;
+      for (int i = tid; i < S * 4; i += blockDim.x) {
+        const int base0 = 32 * (i >> 2) + 4 * (i & 3);
+        const int base1 = base0 + 16;
+        const uint2 g0 = *(const uint2*)(gu_u16 + base0), u0 = *(const uint2*)(gu_u16 + K + base0);
+        const uint2 g1 = *(const uint2*)(gu_u16 + base1), u1 = *(const uint2*)(gu_u16 + K + base1);
+        auto s4 = [&](uint2 gu, uint2 uu) {
+          float gf0 = __uint_as_float((gu.x & 0xffffu) << 16), gf1 = __uint_as_float(gu.x & 0xffff0000u);
+          float gf2 = __uint_as_float((gu.y & 0xffffu) << 16), gf3 = __uint_as_float(gu.y & 0xffff0000u);
+          float uf0 = __uint_as_float((uu.x & 0xffffu) << 16), uf1 = __uint_as_float(uu.x & 0xffff0000u);
+          float uf2 = __uint_as_float((uu.y & 0xffffu) << 16), uf3 = __uint_as_float(uu.y & 0xffff0000u);
+          return rans_pack_fp8x4(
+              __fmul_rn(__fmul_rn(rans_triton_silu(gf0), uf0), inv_sa),
+              __fmul_rn(__fmul_rn(rans_triton_silu(gf1), uf1), inv_sa),
+              __fmul_rn(__fmul_rn(rans_triton_silu(gf2), uf2), inv_sa),
+              __fmul_rn(__fmul_rn(rans_triton_silu(gf3), uf3), inv_sa));
+        };
+        xs[i] = make_uint2(s4(g0, u0), s4(g1, u1));
+      }
     }
   }
 #if RANS_PREISSUE
@@ -520,18 +541,22 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
   if (lut_first) rans_cp_wait<0>();
 #endif
   __syncthreads();
-  if (!active) return;
+  if constexpr (!kXsmem) {
+    if (!active) return;
+  }
   const int g = lane >> 2, t = lane & 3;
   const uint32_t lt = (1u << lane) - 1u;
   const int NB = pb.N >> 3;
 
   // Read initial rANS states once for the continuous warp stream
-  rans_cp_wait<RG - 2>();
-  __syncwarp();
   uint32_t states[NS];
+  if (active) {
+    rans_cp_wait<RG - 2>();
+    __syncwarp();
 #pragma unroll
-  for (int state = 0; state < NS; ++state) {
-    states[state] = rans_lds32(ring_s | ((128u * state + 4u * lane) & (RB - 1u)));
+    for (int state = 0; state < NS; ++state) {
+      states[state] = rans_lds32(ring_s | ((128u * state + 4u * lane) & (RB - 1u)));
+    }
   }
   uint32_t pwb = 128u * NS;
 
@@ -544,125 +569,225 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
     const bool valid_m = (g < pb.M);
     const bool valid_m_hi = kM16 && ((g + 8) < pb.M);
     const int stride_s = 4 * pb.M;
-    const uint8_t* const x_row_base = valid_m ? (pb.x + (size_t)g * K + 4 * t) : nullptr;
-    const uint8_t* const x_row_hi = valid_m_hi ? (pb.x + (size_t)(g + 8) * K + 4 * t) : nullptr;
-    for (int nb = w; nb < NB; nb += pb.tw) {
+    // Vectorized 2-step (64 B = 4 uint4 across t=0..3) activation pointers for kXGlobalMode == 1 (K%64==0 -> S even).
+    const uint4* const x_u4_base = valid_m ? reinterpret_cast<const uint4*>(pb.x + (size_t)g * K + 16 * t) : nullptr;
+    const uint4* const x_u4_hi = valid_m_hi ? reinterpret_cast<const uint4*>(pb.x + (size_t)(g + 8) * K + 16 * t) : nullptr;
+    const float sa_v = __ldg(pb.sa);
+    const float inv_sa = (kActMode != 0) ? rans_full_rcp(sa_v) : 0.f;
+    auto load_x_chunk = [&](int buf, int s_base) {
+      const int total_u4 = 32 * pb.M;  // 16 K-steps = 8 pairs x 4 uint4 per row
+      for (int idx = tid; idx < total_u4; idx += blockDim.x) {
+        const int m = idx >> 5;
+        const int p = (idx >> 2) & 7;
+        const int u = idx & 3;
+        const int elem_u4 = (s_base << 1) + 4 * p + u;
+        uint4 v;
+        if constexpr (kActMode == 0) {
+          const uint4* src = reinterpret_cast<const uint4*>(pb.x + (size_t)m * K) + elem_u4;
+          v = __ldg(src);
+        } else if constexpr (kActMode == 1) {
+          const uint4* g_row = reinterpret_cast<const uint4*>(reinterpret_cast<const uint16_t*>(pb.x) + (size_t)m * K);
+          const uint4* a_row = reinterpret_cast<const uint4*>(pb.x_aux + (size_t)m * K);
+          const uint4 g_lo = __ldg(g_row + (elem_u4 << 1));
+          const uint4 g_hi = __ldg(g_row + (elem_u4 << 1) + 1);
+          const uint4 a_lo = __ldg(a_row + (elem_u4 << 1));
+          const uint4 a_hi = __ldg(a_row + (elem_u4 << 1) + 1);
+          auto q4 = [&](uint32_t gx, uint32_t gy, uint32_t ax, uint32_t ay) {
+            float gf0 = __uint_as_float((gx & 0xffffu) << 16), gf1 = __uint_as_float(gx & 0xffff0000u);
+            float gf2 = __uint_as_float((gy & 0xffffu) << 16), gf3 = __uint_as_float(gy & 0xffff0000u);
+            float af0 = __uint_as_float((ax & 0xffffu) << 16), af1 = __uint_as_float(ax & 0xffff0000u);
+            float af2 = __uint_as_float((ay & 0xffffu) << 16), af3 = __uint_as_float(ay & 0xffff0000u);
+            return rans_pack_fp8x4(
+                __fmul_rn(__fmul_rn(rans_triton_sigmoid(gf0), af0), inv_sa),
+                __fmul_rn(__fmul_rn(rans_triton_sigmoid(gf1), af1), inv_sa),
+                __fmul_rn(__fmul_rn(rans_triton_sigmoid(gf2), af2), inv_sa),
+                __fmul_rn(__fmul_rn(rans_triton_sigmoid(gf3), af3), inv_sa));
+          };
+          v = make_uint4(q4(g_lo.x, g_lo.y, a_lo.x, a_lo.y), q4(g_lo.z, g_lo.w, a_lo.z, a_lo.w),
+                         q4(g_hi.x, g_hi.y, a_hi.x, a_hi.y), q4(g_hi.z, g_hi.w, a_hi.z, a_hi.w));
+        } else {
+          const uint4* g_row = reinterpret_cast<const uint4*>(reinterpret_cast<const uint16_t*>(pb.x) + (size_t)m * (size_t)(2 * K));
+          const uint4* u_row = reinterpret_cast<const uint4*>(reinterpret_cast<const uint16_t*>(pb.x) + (size_t)m * (size_t)(2 * K) + K);
+          const uint4 g_lo = __ldg(g_row + (elem_u4 << 1));
+          const uint4 g_hi = __ldg(g_row + (elem_u4 << 1) + 1);
+          const uint4 u_lo = __ldg(u_row + (elem_u4 << 1));
+          const uint4 u_hi = __ldg(u_row + (elem_u4 << 1) + 1);
+          auto s4 = [&](uint32_t gx, uint32_t gy, uint32_t ux, uint32_t uy) {
+            float gf0 = __uint_as_float((gx & 0xffffu) << 16), gf1 = __uint_as_float(gx & 0xffff0000u);
+            float gf2 = __uint_as_float((gy & 0xffffu) << 16), gf3 = __uint_as_float(gy & 0xffff0000u);
+            float uf0 = __uint_as_float((ux & 0xffffu) << 16), uf1 = __uint_as_float(ux & 0xffff0000u);
+            float uf2 = __uint_as_float((uy & 0xffffu) << 16), uf3 = __uint_as_float(uy & 0xffff0000u);
+            return rans_pack_fp8x4(
+                __fmul_rn(__fmul_rn(rans_triton_silu(gf0), uf0), inv_sa),
+                __fmul_rn(__fmul_rn(rans_triton_silu(gf1), uf1), inv_sa),
+                __fmul_rn(__fmul_rn(rans_triton_silu(gf2), uf2), inv_sa),
+                __fmul_rn(__fmul_rn(rans_triton_silu(gf3), uf3), inv_sa));
+          };
+          v = make_uint4(s4(g_lo.x, g_lo.y, u_lo.x, u_lo.y), s4(g_lo.z, g_lo.w, u_lo.z, u_lo.w),
+                         s4(g_hi.x, g_hi.y, u_hi.x, u_hi.y), s4(g_hi.z, g_hi.w, u_hi.z, u_hi.w));
+        }
+        x_smem_u4[(buf * 8 + p) * kRansXStrideU4 + m * 4 + u] = v;
+      }
+    };
+    const int R_max = (NB + pb.tw - 1) / pb.tw;
+    for (int r_i = 0; r_i < R_max; ++r_i) {
+      const int nb = w + r_i * pb.tw;
+      const bool do_nb = active && (nb < NB);
       float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+      uint2 a_next = make_uint2(0u, 0u);
+      uint2 a_hi_next = make_uint2(0u, 0u);
       // SM121 PDL producer trigger: emit launch_dependents ~12.5 us (16 k-steps) before the final chunk
       // completes so the following 1-CTA norm can preload its 66 KB cold weights on the idle SM.
-      const int trig_s = ((pb.pdl_mode & 2) && (nb + pb.tw >= NB)) ? ((S > 16) ? (S - 16) : 0) : -1;
-      for (int s = 0; s < S; s++) {
-        if (s == trig_s) {
-          asm volatile("griddepcontrol.launch_dependents;");
-        }
-        // Pre-issue all 4 independent LUT loads and activation load ahead of ring refill so they overlap wait_group.
-        const uint32_t e0 = ((const uint32_t*)lut_s)[states[0] & 4095u];
-        const uint32_t e1 = ((const uint32_t*)lut_s)[states[1] & 4095u];
-        const uint32_t e2 = ((const uint32_t*)lut_s)[states[2] & 4095u];
-        const uint32_t e3 = ((const uint32_t*)lut_s)[states[3] & 4095u];
-        uint2 a = make_uint2(0u, 0u);
-        if (valid_m) {
-          if constexpr (kXGlobalMode == 1) {
-            const uint8_t* xm = x_row_base + 32 * s;
-            a = make_uint2(__ldg((const uint32_t*)xm), __ldg((const uint32_t*)(xm + 16)));
-          } else {
-            a = xs[s * stride_s + lane];
-          }
-        }
-        uint2 a_hi = make_uint2(0u, 0u);
-        if constexpr (kM16) {
-          if (valid_m_hi) {
-            const uint8_t* xm_hi = x_row_hi + 32 * s;
-            a_hi = make_uint2(__ldg((const uint32_t*)xm_hi), __ldg((const uint32_t*)(xm_hi + 16)));
-          }
-        }
-        // Gated ring refill: pwb advances ~192-256 B/step while GB=512 B, so skip sync+wait when curg is unchanged.
-        const int curg = (int)(pwb >> GBS);
-        if (issued <= curg + (RG - 1)) {
-          __syncwarp();
-          do {
-            const uint32_t boff = ((uint32_t)issued << GBS) + lane16;
-            if (boff < wbytes) {
-              const uint8_t* src = (issued < gmin) ? ilv_ptr : (tail_w + ((size_t)(issued - gmin) << GBS));
-              rans_cp_async16_s(ring_lane + (((uint32_t)issued << GBS) & (RB - 1u)), src, pol);
-            }
-            if (issued < gmin) ilv_ptr += stride_g;
-            rans_cp_commit();
-            issued++;
-          } while (issued <= curg + (RG - 1));
-          rans_cp_wait<RG - 2>();
-          __syncwarp();
-        }
-        const uint32_t na = pwb + 4u * (uint32_t)lane;
-        uint32_t nw;
-        if ((pwb & 2u) == 0u) {
-          nw = rans_lds32(ring_s | (na & (RB - 1u)));
-        } else {
-          nw = rans_lds16(ring_s | (na & (RB - 1u))) | (rans_lds16(ring_s | ((na + 2u) & (RB - 1u))) << 16);
-        }
-        pwb += 128u;
-        // Advance all 4 independent rANS states and compute renorm offsets in registers.
-        const uint32_t xh0 = states[0] >> 12;
-        const uint32_t x0 = ((e0 >> 8) & 4095u) * xh0 + xh0 + (e0 >> 20);
-        const uint32_t xh1 = states[1] >> 12;
-        const uint32_t x1 = ((e1 >> 8) & 4095u) * xh1 + xh1 + (e1 >> 20);
-        const uint32_t xh2 = states[2] >> 12;
-        const uint32_t x2 = ((e2 >> 8) & 4095u) * xh2 + xh2 + (e2 >> 20);
-        const uint32_t xh3 = states[3] >> 12;
-        const uint32_t x3 = ((e3 >> 8) & 4095u) * xh3 + xh3 + (e3 >> 20);
-        const bool n0 = x0 < RANS_L;
-        const bool n1 = x1 < RANS_L;
-        const bool n2 = x2 < RANS_L;
-        const bool n3 = x3 < RANS_L;
-        const uint32_t m0 = __ballot_sync(0xffffffffu, n0);
-        const uint32_t m1 = __ballot_sync(0xffffffffu, n1);
-        const uint32_t m2 = __ballot_sync(0xffffffffu, n2);
-        const uint32_t m3 = __ballot_sync(0xffffffffu, n3);
-        const uint32_t p0 = pwb;
-        const uint32_t p1 = p0 + (__popc(m0) << 1);
-        const uint32_t p2 = p1 + (__popc(m1) << 1);
-        const uint32_t p3 = p2 + (__popc(m2) << 1);
-        pwb = p3 + (__popc(m3) << 1);
-        // Issue all 4 conditional lds16 renorm loads in parallel before MMA so MMA hides their latency.
-        const uint32_t r0 = n0 ? rans_lds16(ring_s | ((p0 + (__popc(m0 & lt) << 1)) & (RB - 1u))) : 0u;
-        const uint32_t r1 = n1 ? rans_lds16(ring_s | ((p1 + (__popc(m1 & lt) << 1)) & (RB - 1u))) : 0u;
-        const uint32_t r2 = n2 ? rans_lds16(ring_s | ((p2 + (__popc(m2 & lt) << 1)) & (RB - 1u))) : 0u;
-        const uint32_t r3 = n3 ? rans_lds16(ring_s | ((p3 + (__popc(m3 & lt) << 1)) & (RB - 1u))) : 0u;
-        // Assemble FP8 B-operand and execute MMA while r0..r3 are in flight.
-        const uint32_t Pw01 = __byte_perm(e0, e1, 0x7740);
-        const uint32_t Pw23 = __byte_perm(e2, e3, 0x7740);
-        const uint32_t Pw = __byte_perm(Pw01, Pw23, 0x5410);
-        const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
-        const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
-        const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-        const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
-        const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
-        if constexpr (kM16) {
-          rans_mma_e4m3_m16(c0, c1, c2, c3, a.x, a_hi.x, a.y, a_hi.y, bw0, bw1);
-        } else {
-          rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
-        }
-        // Commit next-iteration rANS states.
-        states[0] = n0 ? ((x0 << 16) | r0) : x0;
-        states[1] = n1 ? ((x1 << 16) | r1) : x1;
-        states[2] = n2 ? ((x2 << 16) | r2) : x2;
-        states[3] = n3 ? ((x3 << 16) | r3) : x3;
+      const int trig_s = (do_nb && (pb.pdl_mode & 2) && (nb + pb.tw >= NB)) ? ((S > 16) ? (S - 16) : 0) : -1;
+      if constexpr (kXsmem) {
+        load_x_chunk(0, 0);
+        __syncthreads();
       }
-      if (valid_m) {
-        const float sa_v = __ldg(pb.sa);
-        int n = nb * 8 + 2 * t;
-        float s0 = pb.sb_scalar ? pb.sb[0] : pb.sb[n], s1 = pb.sb_scalar ? pb.sb[0] : pb.sb[n + 1];
-        __nv_bfloat162 r; r.x = __float2bfloat16_rn(sa_v * (s0 * c0)); r.y = __float2bfloat16_rn(sa_v * (s1 * c1));
+      const int cs_step = kXsmem ? 16 : S;
+      for (int cs = 0; cs < S; cs += cs_step) {
+        const int cur_buf = (cs >> 4) & 1;
+        if constexpr (kXsmem) {
+          if (cs + 16 < S) load_x_chunk(cur_buf ^ 1, cs + 16);
+        }
+        if (do_nb) {
+          const int s_end = kXsmem ? (cs + 16) : S;
+          for (int s = cs; s < s_end; s++) {
+            if (s == trig_s) {
+              asm volatile("griddepcontrol.launch_dependents;");
+            }
+            // Pre-issue all 4 independent LUT loads and activation load ahead of ring refill so they overlap wait_group.
+            const uint32_t e0 = ((const uint32_t*)lut_s)[states[0] & 4095u];
+            const uint32_t e1 = ((const uint32_t*)lut_s)[states[1] & 4095u];
+            const uint32_t e2 = ((const uint32_t*)lut_s)[states[2] & 4095u];
+            const uint32_t e3 = ((const uint32_t*)lut_s)[states[3] & 4095u];
+            uint2 a = make_uint2(0u, 0u);
+            uint2 a_hi = make_uint2(0u, 0u);
+            uint4 v_lo = make_uint4(0u, 0u, 0u, 0u);
+            uint4 v_hi = make_uint4(0u, 0u, 0u, 0u);
+            if constexpr (kXsmem) {
+              if ((s & 1) == 0) {
+                const uint32_t xbase = (cur_buf * 8 + ((s - cs) >> 1)) * kRansXStrideU4;
+                if (valid_m) v_lo = x_smem_u4[xbase + g * 4 + t];
+                if constexpr (kM16) {
+                  if (valid_m_hi) v_hi = x_smem_u4[xbase + (g + 8) * 4 + t];
+                }
+              }
+            } else if constexpr (kXGlobalMode == 1) {
+              if ((s & 1) == 0) {
+                if (valid_m) v_lo = __ldg(x_u4_base + (s << 1));
+                if constexpr (kM16) {
+                  if (valid_m_hi) v_hi = __ldg(x_u4_hi + (s << 1));
+                }
+              }
+            } else {
+              if (valid_m) a = xs[s * stride_s + lane];
+            }
+            // Gated ring refill: pwb advances ~192-256 B/step while GB=512 B, so skip sync+wait when curg is unchanged.
+            const int curg = (int)(pwb >> GBS);
+            if (issued <= curg + (RG - 1)) {
+              __syncwarp();
+              do {
+                const uint32_t boff = ((uint32_t)issued << GBS) + lane16;
+                if (boff < wbytes) {
+                  const uint8_t* src = (issued < gmin) ? ilv_ptr : (tail_w + ((size_t)(issued - gmin) << GBS));
+                  rans_cp_async16_s(ring_lane + (((uint32_t)issued << GBS) & (RB - 1u)), src, pol);
+                }
+                if (issued < gmin) ilv_ptr += stride_g;
+                rans_cp_commit();
+                issued++;
+              } while (issued <= curg + (RG - 1));
+              rans_cp_wait<RG - 2>();
+              __syncwarp();
+            }
+            const uint32_t na = pwb + 4u * (uint32_t)lane;
+            uint32_t nw;
+            if ((pwb & 2u) == 0u) {
+              nw = rans_lds32(ring_s | (na & (RB - 1u)));
+            } else {
+              nw = rans_lds16(ring_s | (na & (RB - 1u))) | (rans_lds16(ring_s | ((na + 2u) & (RB - 1u))) << 16);
+            }
+            pwb += 128u;
+            // Advance all 4 independent rANS states and compute renorm offsets in registers.
+            const uint32_t xh0 = states[0] >> 12;
+            const uint32_t x0 = ((e0 >> 8) & 4095u) * xh0 + xh0 + (e0 >> 20);
+            const uint32_t xh1 = states[1] >> 12;
+            const uint32_t x1 = ((e1 >> 8) & 4095u) * xh1 + xh1 + (e1 >> 20);
+            const uint32_t xh2 = states[2] >> 12;
+            const uint32_t x2 = ((e2 >> 8) & 4095u) * xh2 + xh2 + (e2 >> 20);
+            const uint32_t xh3 = states[3] >> 12;
+            const uint32_t x3 = ((e3 >> 8) & 4095u) * xh3 + xh3 + (e3 >> 20);
+            const bool n0 = x0 < RANS_L;
+            const bool n1 = x1 < RANS_L;
+            const bool n2 = x2 < RANS_L;
+            const bool n3 = x3 < RANS_L;
+            const uint32_t m0 = __ballot_sync(0xffffffffu, n0);
+            const uint32_t m1 = __ballot_sync(0xffffffffu, n1);
+            const uint32_t m2 = __ballot_sync(0xffffffffu, n2);
+            const uint32_t m3 = __ballot_sync(0xffffffffu, n3);
+            const uint32_t p0 = pwb;
+            const uint32_t p1 = p0 + (__popc(m0) << 1);
+            const uint32_t p2 = p1 + (__popc(m1) << 1);
+            const uint32_t p3 = p2 + (__popc(m2) << 1);
+            pwb = p3 + (__popc(m3) << 1);
+            // Issue all 4 conditional lds16 renorm loads in parallel before MMA so MMA hides their latency.
+            const uint32_t r0 = n0 ? rans_lds16(ring_s | ((p0 + (__popc(m0 & lt) << 1)) & (RB - 1u))) : 0u;
+            const uint32_t r1 = n1 ? rans_lds16(ring_s | ((p1 + (__popc(m1 & lt) << 1)) & (RB - 1u))) : 0u;
+            const uint32_t r2 = n2 ? rans_lds16(ring_s | ((p2 + (__popc(m2 & lt) << 1)) & (RB - 1u))) : 0u;
+            const uint32_t r3 = n3 ? rans_lds16(ring_s | ((p3 + (__popc(m3 & lt) << 1)) & (RB - 1u))) : 0u;
+            // Assemble FP8 B-operand and transpose pre-issued uint4 activations while r0..r3 are in flight.
+            const uint32_t Pw01 = __byte_perm(e0, e1, 0x7740);
+            const uint32_t Pw23 = __byte_perm(e2, e3, 0x7740);
+            const uint32_t Pw = __byte_perm(Pw01, Pw23, 0x5410);
+            const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
+            const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
+            const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
+            const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
+            const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
+            if constexpr (kXsmem || kXGlobalMode == 1) {
+              if ((s & 1) == 0) {
+                rans_xpose4(v_lo, t, a.x, a.y, a_next.x, a_next.y);
+                if constexpr (kM16) {
+                  rans_xpose4(v_hi, t, a_hi.x, a_hi.y, a_hi_next.x, a_hi_next.y);
+                }
+              } else {
+                a = a_next;
+                if constexpr (kM16) a_hi = a_hi_next;
+              }
+            }
+            if constexpr (kM16) {
+              rans_mma_e4m3_m16(c0, c1, c2, c3, a.x, a_hi.x, a.y, a_hi.y, bw0, bw1);
+            } else {
+              rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
+            }
+            // Commit next-iteration rANS states.
+            states[0] = n0 ? ((x0 << 16) | r0) : x0;
+            states[1] = n1 ? ((x1 << 16) | r1) : x1;
+            states[2] = n2 ? ((x2 << 16) | r2) : x2;
+            states[3] = n3 ? ((x3 << 16) | r3) : x3;
+          }
+        }
+        if constexpr (kXsmem) {
+          if (cs + 16 < S) __syncthreads();
+        }
+      }
+      if (do_nb && valid_m) {
+        const int n = nb * 8 + 2 * t;
+        const float2 sb2 = pb.sb_scalar ? make_float2(__ldg(pb.sb), __ldg(pb.sb))
+                                        : __ldg(reinterpret_cast<const float2*>(pb.sb + n));
+        __nv_bfloat162 r; r.x = __float2bfloat16_rn(sa_v * (sb2.x * c0)); r.y = __float2bfloat16_rn(sa_v * (sb2.y * c1));
         *(__nv_bfloat162*)(pb.out + (size_t)g * pb.N + n) = r;
         if constexpr (kM16) {
           if (valid_m_hi) {
-            __nv_bfloat162 r2; r2.x = __float2bfloat16_rn(sa_v * (s0 * c2)); r2.y = __float2bfloat16_rn(sa_v * (s1 * c3));
+            __nv_bfloat162 r2; r2.x = __float2bfloat16_rn(sa_v * (sb2.x * c2)); r2.y = __float2bfloat16_rn(sa_v * (sb2.y * c3));
             *(__nv_bfloat162*)(pb.out + (size_t)(g + 8) * pb.N + n) = r2;
           }
         }
       }
+      if constexpr (kXsmem) {
+        if (r_i + 1 < R_max) __syncthreads();
+      }
     }
-    rans_cp_wait<0>();
+    if (active) rans_cp_wait<0>();
     return;
   }
 
@@ -904,9 +1029,18 @@ static void rans_set_attrs_once() {
 #define RANS_PREP(NSV, RGV) cudaFuncSetAttribute(rans_gemv_kernel<NSV, 9, RGV>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
   RANS_PREP(1, 4) RANS_PREP(1, 8) RANS_PREP(2, 4) RANS_PREP(2, 8) RANS_PREP(4, 4) RANS_PREP(4, 8)
 #undef RANS_PREP
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 0, true, 640, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 0, true, 640, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  // x_global=1 kernels (kM16 & M<=8 down) use at most 42 KiB dsmem (wpb<=20) + 16 KiB LUT <= 64 KiB:
+  // cap dynamic SMEM at 48 KiB and request 50% carveout -> 64 KiB L1 data cache instead of 28 KiB.
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, false, true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, false, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
   cudaThreadExchangeStreamCaptureMode(&mode);
   done = true;
 }
@@ -920,7 +1054,7 @@ static void rans_check_io(const torch::Tensor& blob, const torch::Tensor& x, con
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == N, "out must be a contiguous bfloat16 cuda tensor with N elements");
 }
 
-template <int NSV, int RGV, int kIlvMode = 0, int kXGlobalMode = 2, bool kPar4 = false, int kMaxThreads = 1024, bool kM16 = false>
+template <int NSV, int RGV, int kIlvMode = 0, int kXGlobalMode = 2, bool kPar4 = false, int kMaxThreads = 1024, bool kM16 = false, bool kXsmem = false, int kActMode = 0>
 static inline void rans_launch_k(int blocks, int threads, size_t dsmem, cudaStream_t st, RansProb pb) {
   if ((pb.pdl_mode & 1) != 0) {
     cudaLaunchConfig_t cfg = {};
@@ -933,10 +1067,10 @@ static inline void rans_launch_k(int blocks, int threads, size_t dsmem, cudaStre
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
-    cudaError_t err = cudaLaunchKernelEx(&cfg, rans_gemv_kernel<NSV, 9, RGV, kIlvMode, kXGlobalMode, kPar4, kMaxThreads, kM16>, pb);
+    cudaError_t err = cudaLaunchKernelEx(&cfg, rans_gemv_kernel<NSV, 9, RGV, kIlvMode, kXGlobalMode, kPar4, kMaxThreads, kM16, kXsmem, kActMode>, pb);
     TORCH_CHECK(err == cudaSuccess, "rans_gemv_kernel PDL launch failed: ", cudaGetErrorString(err));
   } else {
-    rans_gemv_kernel<NSV, 9, RGV, kIlvMode, kXGlobalMode, kPar4, kMaxThreads, kM16><<<blocks, threads, dsmem, st>>>(pb);
+    rans_gemv_kernel<NSV, 9, RGV, kIlvMode, kXGlobalMode, kPar4, kMaxThreads, kM16, kXsmem, kActMode><<<blocks, threads, dsmem, st>>>(pb);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
@@ -997,12 +1131,24 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   }
   pb.pdl_mode = pdl_mode;
   size_t dsmem = rans_dsmem(K, wpb, 9, rg);
+  const size_t dsmem_xsmem = kRansXsmemBytes + ((size_t)rg << 9) + (size_t)wpb * ((size_t)rg << 9);
+  const bool x_aligned16 = ((reinterpret_cast<uintptr_t>(x) & 15u) == 0u) &&
+                           (act_mode != 1 || ((reinterpret_cast<uintptr_t>(x_aux) & 15u) == 0u));
+  bool use_xsmem_fused = false;
   if (M > 1) {
-    // M rows: stage M*K bytes of x if M<=8 and it fits with this wpb; for M>8 always read x from global (__ldg).
-    if (M <= 8 && rans_fits(M * K, wpb, 9, rg)) {
+    // M rows: stage M*K bytes of x if M<=8 and it fits with this wpb (for act_mode 0 or 1);
+    // for M>8 (or act_mode 2 where M*K doesn't fit), use chunked SMEM (kXsmem) or global __ldg.
+    if (act_mode != 2 && M <= 8 && rans_fits(M * K, wpb, 9, rg)) {
       dsmem = rans_dsmem(M * K, wpb, 9, rg);
+    } else if (act_mode == 1 || act_mode == 2) {
+      const bool can_xsmem_fused = par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 20 &&
+                                   x_aligned16 && ((K >> 5) % 16 == 0) &&
+                                   dsmem_xsmem <= (size_t)(RANS_MAX_SMEM - RANS_LUT_BYTES);
+      TORCH_CHECK(can_xsmem_fused, "rans fused multi-M requires par4/ns4/rg4/ilv9, 16B-aligned x, S%16==0, and smem fit");
+      pb.x_global = 1;
+      use_xsmem_fused = true;
+      dsmem = dsmem_xsmem;
     } else {
-      TORCH_CHECK(act_mode == 0, "rans fused act_mode requires M<=8 and M*K to fit in smem");
       pb.x_global = 1; dsmem = rans_dsmem(0, wpb, 9, rg);
     }
     if (pb.w_split == 0) blocks = (tw + wpb - 1) / wpb;
@@ -1014,15 +1160,42 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   }();
   if (M == 1 && lock48 && blocks == 48 && dsmem < 40960) dsmem = 40960;
   rans_set_attrs_once();
-  if (par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 20) {
+  static const bool xsmem_en = []() {
+    const char* env = std::getenv("MUSERANS_XSMEM");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  if (use_xsmem_fused) {
     if (M > 8) {
-      rans_launch_k<4, 4, 1, 1, true, 640, true>(blocks, wpb * 32, dsmem, st, pb);
-    } else if (pb.x_global) {
-      rans_launch_k<4, 4, 1, 1, true, 640, false>(blocks, wpb * 32, dsmem, st, pb);
+      if (act_mode == 1) {
+        rans_launch_k<4, 4, 1, 1, true, 640, true, true, 1>(blocks, wpb * 32, dsmem_xsmem, st, pb);
+      } else {
+        rans_launch_k<4, 4, 1, 1, true, 640, true, true, 2>(blocks, wpb * 32, dsmem_xsmem, st, pb);
+      }
     } else {
-      rans_launch_k<4, 4, 1, 0, true, 640, false>(blocks, wpb * 32, dsmem, st, pb);
+      if (act_mode == 1) {
+        rans_launch_k<4, 4, 1, 1, true, 640, false, true, 1>(blocks, wpb * 32, dsmem_xsmem, st, pb);
+      } else {
+        rans_launch_k<4, 4, 1, 1, true, 640, false, true, 2>(blocks, wpb * 32, dsmem_xsmem, st, pb);
+      }
     }
     return;
+  }
+  if (par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 20) {
+    if (M > 8 && x_aligned16) {
+      if (xsmem_en && K >= 6656 && ((K >> 5) % 16 == 0) && dsmem_xsmem <= (size_t)(RANS_MAX_SMEM - RANS_LUT_BYTES)) {
+        rans_launch_k<4, 4, 1, 1, true, 640, true, true, 0>(blocks, wpb * 32, dsmem_xsmem, st, pb);
+        return;
+      } else if (dsmem <= 48u * 1024u) {
+        rans_launch_k<4, 4, 1, 1, true, 640, true, false, 0>(blocks, wpb * 32, dsmem, st, pb);
+        return;
+      }
+    } else if (pb.x_global && x_aligned16 && dsmem <= 48u * 1024u) {
+      rans_launch_k<4, 4, 1, 1, true, 640, false, false, 0>(blocks, wpb * 32, dsmem, st, pb);
+      return;
+    } else if (!pb.x_global) {
+      rans_launch_k<4, 4, 1, 0, true, 640, false, false, 0>(blocks, wpb * 32, dsmem, st, pb);
+      return;
+    }
   }
 #define RANS_L2(NSV, RGV) \
   if (ns == NSV && rg == RGV) rans_launch_k<NSV, RGV>(blocks, wpb * 32, dsmem, st, pb);
@@ -1086,18 +1259,31 @@ void rans_gemm_m_auto(torch::Tensor blob, torch::Tensor x, torch::Tensor sb, tor
 void rans_gemm_m_fused_auto(torch::Tensor blob, torch::Tensor x0, torch::Tensor x1, torch::Tensor sb, torch::Tensor sa, torch::Tensor out, int64_t N, int64_t K, int64_t act_mode) {
   TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "blob must be contiguous uint8");
   TORCH_CHECK(N > 0 && K > 0 && N % 8 == 0 && K % 64 == 0, "need N%8==0 and K%64==0");
-  TORCH_CHECK(act_mode == 1, "rans_gemm_m_fused_auto supports act_mode == 1");
+  TORCH_CHECK(act_mode == 1 || act_mode == 2, "rans_gemm_m_fused_auto supports act_mode 1 or 2");
   TORCH_CHECK(x0.is_cuda() && x0.scalar_type() == torch::kBFloat16 && x0.is_contiguous(), "x0 must be contiguous bf16");
-  TORCH_CHECK(x1.is_cuda() && x1.scalar_type() == torch::kBFloat16 && x1.is_contiguous(), "x1 must be contiguous bf16");
-  TORCH_CHECK(x0.numel() == x1.numel() && x0.numel() % K == 0, "x0/x1 numel mismatch");
-  const int64_t M = x0.numel() / K;
-  TORCH_CHECK(M >= 1 && M <= 8, "M must be in 1..8");
-  TORCH_CHECK(((reinterpret_cast<uintptr_t>(x0.data_ptr()) | reinterpret_cast<uintptr_t>(x1.data_ptr())) & 7u) == 0u, "x0/x1 must be 8-byte aligned");
+  const uint16_t* aux_ptr = nullptr;
+  int64_t M = 0;
+  if (act_mode == 1) {
+    TORCH_CHECK(x1.is_cuda() && x1.scalar_type() == torch::kBFloat16 && x1.is_contiguous(), "x1 must be contiguous bf16");
+    TORCH_CHECK(x0.numel() == x1.numel() && x0.numel() % K == 0, "x0/x1 numel mismatch");
+    M = x0.numel() / K;
+    TORCH_CHECK(M >= 1 && M <= 16, "M must be in 1..16");
+    const uintptr_t align_mask = (M > 8) ? 15u : 7u;
+    TORCH_CHECK(((reinterpret_cast<uintptr_t>(x0.data_ptr()) | reinterpret_cast<uintptr_t>(x1.data_ptr())) & align_mask) == 0u, "x0/x1 alignment mismatch");
+    aux_ptr = (const uint16_t*)x1.data_ptr();
+  } else {
+    TORCH_CHECK(x0.numel() % (2 * K) == 0, "act_mode 2 x0 numel must be M*2*K");
+    M = x0.numel() / (2 * K);
+    TORCH_CHECK(M >= 1 && M <= 16, "M must be in 1..16");
+    const uintptr_t align_mask = (M > 1) ? 15u : 7u;
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(x0.data_ptr()) & align_mask) == 0u, "x0 alignment mismatch");
+  }
   TORCH_CHECK(sb.is_cuda() && sb.scalar_type() == torch::kFloat && sb.is_contiguous() && (sb.numel() == N || sb.numel() == 1), "bad sb");
   TORCH_CHECK(sa.is_cuda() && sa.scalar_type() == torch::kFloat && sa.numel() == 1, "bad sa");
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == M * N, "bad out");
   RansCfg c = rans_pick_cfg((int)N, (int)K);
-  rans_launch((const uint8_t*)blob.data_ptr(), (size_t)blob.numel(), c.tw, c.ns, c.wpb, c.rg, c.ilv, (const uint8_t*)x0.data_ptr(), (const uint16_t*)x1.data_ptr(), 1, (const float*)sb.data_ptr(), sb.numel() == 1, (const float*)sa.data_ptr(), (__nv_bfloat16*)out.data_ptr(),
+  if (N == 6656 && K == 19968 && M > 1) c.wpb = 19;
+  rans_launch((const uint8_t*)blob.data_ptr(), (size_t)blob.numel(), c.tw, c.ns, c.wpb, c.rg, c.ilv, (const uint8_t*)x0.data_ptr(), aux_ptr, (int)act_mode, (const float*)sb.data_ptr(), sb.numel() == 1, (const float*)sa.data_ptr(), (__nv_bfloat16*)out.data_ptr(),
               (int)N, (int)K, c10::cuda::getCurrentCUDAStream(), (int)M);
 }
 

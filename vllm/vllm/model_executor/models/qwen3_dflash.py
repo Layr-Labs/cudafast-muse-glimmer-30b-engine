@@ -77,6 +77,31 @@ def dflash_has_any_non_causal(config: Qwen3Config) -> bool:
     )
 
 
+def dflash_query_len(config: Qwen3Config | None, num_spec_tokens: int) -> int:
+    """Resolve bidirectional DFlash query block length (VLLM_DFLASH_QUERY_LEN).
+
+    Default 16 runs one full m16n8k16 MMA tile (1 anchor + num_spec_tokens sampled
+    masks + trailing unsampled context masks matching DFlash's block-16 training
+    distribution). Set VLLM_DFLASH_QUERY_LEN=7 (or 0) to restore stock 1 + N.
+    """
+    base_q = 1 + max(0, int(num_spec_tokens))
+    if config is None or num_spec_tokens <= 0:
+        return base_q
+    raw = os.environ.get("VLLM_DFLASH_QUERY_LEN", "16").strip()
+    try:
+        wanted = int(raw)
+    except ValueError:
+        return base_q
+    if wanted <= base_q:
+        return base_q
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    if dflash_config.get("sample_from_anchor", False):
+        return base_q
+    if not dflash_has_any_non_causal(config):
+        return base_q
+    return min(wanted, 16)
+
+
 def _get_dflash_fc_input_size(vllm_config: VllmConfig) -> int:
     spec_config = vllm_config.speculative_config
     config = spec_config.draft_model_config.hf_config
@@ -507,14 +532,10 @@ class DFlashQwen3Model(nn.Module):
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
 
-    def _project_context_kv(
+    def _project_context_kv_flat(
         self,
         context_states: torch.Tensor,
-        num_ctx: int,
-        num_layers: int,
-        num_kv_heads: int,
-        head_dim: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # --- Fused KV projection (one GEMM for all layers) ---
         normed_context_states = torch.empty_like(context_states)
         ops.rms_norm(
@@ -526,7 +547,8 @@ class DFlashQwen3Model(nn.Module):
         if self._fused_kv_bias is None:
             all_kv_flat = None
             if (
-                getattr(self, "_fkv_mi3", None) is not None
+                getattr(self, "_fkv_mi4", None) is not None
+                or getattr(self, "_fkv_mi3", None) is not None
                 or getattr(self, "_fkv_mnv4", None) is not None
                 or getattr(self, "_fkv_mfp8", None) is not None
             ):
@@ -539,6 +561,17 @@ class DFlashQwen3Model(nn.Module):
             all_kv_flat = F.linear(
                 normed_context_states, self._fused_kv_weight, self._fused_kv_bias
             )
+        return all_kv_flat
+
+    def _project_context_kv(
+        self,
+        context_states: torch.Tensor,
+        num_ctx: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        all_kv_flat = self._project_context_kv_flat(context_states)
         # Single contiguous copy that separates K/V and transposes to
         # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
@@ -593,6 +626,94 @@ class DFlashQwen3Model(nn.Module):
         kv = self._kv_size
         hd = self._head_dim
         nkv = self._num_kv_heads
+
+        # Fused 1-kernel context-KV post-GEMM (replaces permute + k_norm + pos.repeat + RoPE + 5x cache scatter).
+        if (
+            context_slot_mapping is not None
+            and getattr(self, "_dflash_fuse_kv_ok", False)
+            and os.environ.get("MUSE_DFLASH_FUSE_KV_POST", "1") != "0"
+            and hd == 128
+            and self._rope_head_size == 128
+            and 1 <= L <= 8
+            and context_states.is_cuda
+            and context_states.dtype == torch.bfloat16
+            and context_positions.is_cuda
+            and context_positions.dtype == torch.int64
+        ):
+            per_layer = isinstance(context_slot_mapping, (list, tuple))
+            slots_list = (
+                list(context_slot_mapping) if per_layer else [context_slot_mapping] * L
+            )
+            if all(s is not None for s in slots_list):
+                try:
+                    import muse_bfx_ext as _bfx
+
+                    if hasattr(_bfx, "dflash_kv_post"):
+                        k_caches = []
+                        v_caches = []
+                        block_size = 0
+                        ok_layout = True
+                        for i in range(L):
+                            attn = self._attn_layers[i]
+                            if getattr(attn.impl, "kv_cache_dtype", "auto") != "auto":
+                                ok_layout = False
+                                break
+                            kvc = attn.kv_cache
+                            if kvc is None or not kvc.is_cuda or kvc.dtype != torch.bfloat16:
+                                ok_layout = False
+                                break
+                            if kvc.dim() == 4 and kvc.shape[1] == nkv and kvc.shape[3] == 2 * hd:
+                                kc, vc = kvc.transpose(1, 2).split(hd, dim=-1)
+                            elif kvc.dim() == 5 and kvc.shape[0] == 2 and kvc.shape[3] == nkv and kvc.shape[4] == hd:
+                                kc, vc = kvc[0], kvc[1]
+                            else:
+                                ok_layout = False
+                                break
+                            if kc.stride(3) != 1 or vc.stride(3) != 1:
+                                ok_layout = False
+                                break
+                            bs_i = int(kc.shape[1])
+                            if block_size == 0:
+                                block_size = bs_i
+                            elif block_size != bs_i:
+                                ok_layout = False
+                                break
+                            k_caches.append(kc)
+                            v_caches.append(vc)
+
+                        if ok_layout and block_size > 0:
+                            cos_sin_cache = self._rope_cos_sin_cache
+                            if cos_sin_cache.dtype != context_states.dtype:
+                                cast_cache = getattr(self, "_rope_cos_sin_cache_cast", None)
+                                if (
+                                    cast_cache is None
+                                    or cast_cache.dtype != context_states.dtype
+                                    or cast_cache.device != context_states.device
+                                ):
+                                    cast_cache = cos_sin_cache.to(
+                                        device=context_states.device, dtype=context_states.dtype
+                                    )
+                                    self._rope_cos_sin_cache_cast = cast_cache
+                                cos_sin_cache = cast_cache
+                            all_kv_flat = self._project_context_kv_flat(context_states)
+                            if not all_kv_flat.is_contiguous():
+                                all_kv_flat = all_kv_flat.contiguous()
+                            _bfx.dflash_kv_post(
+                                all_kv_flat,
+                                context_positions if context_positions.is_contiguous() else context_positions.contiguous(),
+                                self._k_norm_weights,
+                                cos_sin_cache,
+                                k_caches,
+                                v_caches,
+                                [s if s.is_contiguous() else s.contiguous() for s in slots_list],
+                                nkv,
+                                block_size,
+                                float(self._rms_norm_eps),
+                                bool(self._rope_is_neox),
+                            )
+                            return
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning_once("dflash_kv_post skipped (%s); using stock path", exc)
 
         all_k, all_v = self._project_context_kv(context_states, num_ctx, L, nkv, hd)
         all_k_normed = self._normalize_context_k(all_k)
@@ -893,6 +1014,44 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             context_states, context_positions, context_slot_mapping
         )
 
+    def combine_hidden_states_aux5(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        num_tokens: int,
+    ) -> torch.Tensor | None:
+        """Zero-cat 5-aux-tensor INT4 fc projection for small M <= 16 (CUDA-graph safe)."""
+        if (
+            not self.model.use_aux_hidden_state
+            or len(aux_hidden_states) != 5
+            or not (1 <= num_tokens <= 16)
+        ):
+            return None
+        fc = self.model.fc
+        if not getattr(fc, "_mi4_aux5_ok", False):
+            return None
+        mi4 = getattr(fc, "_mi4", None)
+        if mi4 is None:
+            return None
+        n, k = mi4
+        k_sub = k // 5
+        hs: list[torch.Tensor] = []
+        for h in aux_hidden_states:
+            if (
+                not h.is_cuda
+                or h.dtype != torch.bfloat16
+                or h.dim() != 2
+                or h.shape[0] < num_tokens
+                or h.shape[1] != k_sub
+                or h.stride(1) != 1
+                or (h.stride(0) % 8 != 0)
+                or (h.data_ptr() % 16 != 0)
+            ):
+                return None
+            hs.append(h[:num_tokens] if h.shape[0] > num_tokens else h)
+        return torch.ops.muse.draft_int4_aux5_linear(
+            hs[0], hs[1], hs[2], hs[3], hs[4], fc._mi4_blob, n, k
+        )
+
     def combine_hidden_states(
         self,
         hidden_states: torch.Tensor,
@@ -970,7 +1129,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             from vllm.model_executor.layers import muse_bfx
             n = muse_bfx.attach_drafter(self.model)
             has_q_fkv = (
-                getattr(self.model, "_fkv_mi3", None) is not None
+                getattr(self.model, "_fkv_mi4", None) is not None
+                or getattr(self.model, "_fkv_mi3", None) is not None
                 or getattr(self.model, "_fkv_mnv4", None) is not None
                 or getattr(self.model, "_fkv_mfp8", None) is not None
             )

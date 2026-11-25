@@ -452,7 +452,7 @@ def self_check_verify(device: torch.device) -> bool:
             cu_q8 = torch.tensor([0, 8], dtype=torch.int32, device=device)
             st_l = torch.cuda.current_stream(device).cuda_stream
             leaf_all = True
-            for seq_k in (16, 17, 32, 33, 128, 129, 134, 520):
+            for seq_k in (16, 17, 32, 33, 45, 46, 48, 128, 129, 134, 141, 142, 520):
                 # 1) Legacy M=7: identical K/V at p+1 (seq_k-6) and p+6 (seq_k-1), Q[6] == Q[1].
                 kv_cur = kv_l.clone()
                 p1 = seq_k - 6
@@ -538,10 +538,14 @@ def self_check_verify(device: torch.device) -> bool:
                         break
                 if not leaf_all:
                     break
-                # 3) Generalized 1-level multi-leaf tree table mode (sentinel -1): test M=12 (5 leaves) & M=16 (9 leaves).
-                for tree_m, leaf_ks in (
-                    (12, (1, 1, 2, 2, 3)),
-                    (16, (1, 1, 2, 2, 3, 1, 3, 4, 5)),
+                # 3) Generalized bit-packed arbitrary-depth (1..6-level) tree table mode (sentinel -1, int32[49]):
+                #    Test M=12 1-level (5 leaves), M=16 1-level (9 leaves), AND M=16 deep 6-level + 3-level branches!
+                #    Each tree spec is (tree_m, tuple of (k_r, parent_row)) for rows r = 7..tree_m-1.
+                for tree_m, tree_nodes in (
+                    (12, ((1, -1), (1, -1), (2, -1), (2, -1), (3, -1))),
+                    (16, ((1, -1), (1, -1), (2, -1), (2, -1), (3, -1), (1, -1), (3, -1), (4, -1), (5, -1))),
+                    # Deep 6-level chain (rows 7..12 -> k=1..6) + 3-level branch (rows 13..15 -> k=2..4):
+                    (16, ((1, -1), (2, 7), (3, 8), (4, 9), (5, 10), (6, 11), (2, -1), (3, 13), (4, 14))),
                 ):
                     if seq_k < tree_m:
                         continue
@@ -551,8 +555,11 @@ def self_check_verify(device: torch.device) -> bool:
                     for q_i in range(7):
                         tbl[1 + 3 * q_i] = tree_m - 1 - q_i
                         tbl[1 + 3 * q_i + 1] = -1
-                        tbl[1 + 3 * q_i + 2] = -1
-                    for li, lk in enumerate(leaf_ks):
+                        tbl[1 + 3 * q_i + 2] = 0
+                    row_base_sub = [-1] * tree_m
+                    row_depth = [0] * tree_m
+                    row_packed = [0] * tree_m
+                    for li, (lk, par) in enumerate(tree_nodes):
                         r_row = 7 + li
                         pk = seq_k - tree_m + lk
                         pr = seq_k - tree_m + r_row
@@ -560,9 +567,20 @@ def self_check_verify(device: torch.device) -> bool:
                         br, sr_slot = int(bt_l[0, pr // bs_l].item()), pr % bs_l
                         kv_t[br, :, sr_slot, :].copy_(kv_t[bk, :, sk_slot, :])
                         q_t[r_row].copy_(q_t[lk])
+                        if par < 0:
+                            b_sub = tree_m - lk
+                            dp = 1
+                            pkd = r_row & 0xF
+                        else:
+                            b_sub = row_base_sub[par]
+                            dp = row_depth[par] + 1
+                            pkd = row_packed[par] | ((r_row & 0xF) << (4 * (dp - 1)))
+                        row_base_sub[r_row] = b_sub
+                        row_depth[r_row] = dp
+                        row_packed[r_row] = pkd
                         tbl[1 + 3 * r_row] = tree_m - (lk + 1)
-                        tbl[1 + 3 * r_row + 1] = tree_m - lk
-                        tbl[1 + 3 * r_row + 2] = tree_m - r_row
+                        tbl[1 + 3 * r_row + 1] = b_sub
+                        tbl[1 + 3 * r_row + 2] = pkd
                     lf_tbl = torch.tensor(tbl, dtype=torch.int32, device=device)
                     cu_qt = torch.tensor([0, tree_m], dtype=torch.int32, device=device)
                     k_ct, v_ct = kv_t.transpose(1, 2).split(128, dim=-1)
@@ -592,8 +610,8 @@ def self_check_verify(device: torch.device) -> bool:
                         ):
                             leaf_all = False
                             break
-                        for li, lk in enumerate(leaf_ks):
-                            if not torch.equal(got_t[7 + li].view(torch.int16), got_t[lk].view(torch.int16)):
+                        for li, (lk, _par) in enumerate(tree_nodes):
+                            if not torch.equal(got_t[7 + li].view(torch.int16), ref_t[lk].view(torch.int16)):
                                 leaf_all = False
                                 break
                         if not leaf_all:

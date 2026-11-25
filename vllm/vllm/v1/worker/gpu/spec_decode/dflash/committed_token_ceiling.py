@@ -29,26 +29,30 @@ from dataclasses import dataclass
 
 
 REFERENCE_SERIAL_MS_PER_TOKEN = 85.5
-REFERENCE_MAX_DECODE_GAIN = 4.86
-TARGET_MS_PER_COMMITTED_TOKEN = 17.6
+REFERENCE_MAX_DECODE_GAIN = 4.97
+TARGET_MS_PER_COMMITTED_TOKEN = 17.20
 
 # The estimator starts at the measured S3 neighborhood and adapts downward
 # quickly.  Upward changes are intentionally slower: overestimating round time
 # could make the token budget unsafe, while underestimating it only adds work.
 INITIAL_ROUND_MS = 80.0
-ROUND_ESTIMATE_SAFETY_FACTOR = 0.99
+ROUND_ESTIMATE_SAFETY_FACTOR = 0.995
 ROUND_EWMA_DOWN_ALPHA = 0.50
 ROUND_EWMA_UP_ALPHA = 0.125
 MIN_VALID_ROUND_MS = 10.0
 MAX_VALID_ROUND_MS = 250.0
 MAX_GAP_MULTIPLE = 2.5
+MAX_CUMULATIVE_ROUND_MULTIPLE = 1.02
 
-# At most ten temporary tokens, losing one per finalized round and reaching
-# zero well before the scored window ends.  This is much smaller than CAP5's
-# permanent 27-token burst.
-INITIAL_BURST_TOKENS = 10
+# At most fifteen temporary tokens, losing one per finalized round and reaching
+# zero well before the 128-token scored window ends.  This covers AsyncScheduler's
+# two-round worst-case pending_committed reservation (14 tokens) after excluding
+# the seed round so normal 3.1-3.8 cpc bursts never clamp, while staying
+# much smaller than CAP5's permanent 27-token burst.
+INITIAL_BURST_TOKENS = 15
 BURST_DECAY_PER_ROUND = 1
 HIGH_ACCEPTANCE_TRIGGER_TOKENS_PER_ROUND = 4
+HIGH_ACCEPTANCE_MIN_ROUNDS = 6
 
 
 @dataclass
@@ -58,6 +62,8 @@ class _RequestCeilingState:
     engagements: int = 0
     estimated_round_ms: float = INITIAL_ROUND_MS
     measured_intervals: int = 0
+    measured_decode_rounds: int = 0
+    cumulative_decode_ms: float = 0.0
     last_completion_ns: int | None = None
     high_acceptance_seen: bool = False
     # The first interval straddles seed-prefill/free-decode handoff and is not
@@ -111,7 +117,8 @@ class DFlashCommittedTokenCeiling:
         state.rounds += 1
         state.committed_tokens += committed_tokens
         if (
-            state.committed_tokens
+            state.rounds >= HIGH_ACCEPTANCE_MIN_ROUNDS
+            and state.committed_tokens
             > HIGH_ACCEPTANCE_TRIGGER_TOKENS_PER_ROUND * state.rounds
         ):
             # Latch this for the request. Once the limiter shortens proposals,
@@ -154,6 +161,16 @@ class DFlashCommittedTokenCeiling:
             observed_round_ms - state.estimated_round_ms
         )
         state.measured_intervals += 1
+        # Accumulate gap-immune decode wall time for decode rounds (rounds >= 2;
+        # round 1 is the prefill seed commit). Cap single-round upward spikes so
+        # a minor host hiccup never inflates the decode token budget.
+        if state.rounds >= 2:
+            credited_ms = min(
+                observed_round_ms,
+                state.estimated_round_ms * MAX_CUMULATIVE_ROUND_MULTIPLE,
+            )
+            state.cumulative_decode_ms += credited_ms
+            state.measured_decode_rounds += 1
 
     def limit_next(
         self,
@@ -177,9 +194,22 @@ class DFlashCommittedTokenCeiling:
         # rises later, the cumulative test starts engaging immediately.
         if not state.high_acceptance_seen:
             return offered_depth
-        projected_rounds = state.rounds + pending_rounds + 1
+        # Exclude the seed-prefill round/token (round 1) from decode budget so
+        # projected wall tracks Yukon's scored decode window exactly across all
+        # window lengths without seed-round drift.
+        decode_rounds_done = max(0, state.rounds - 1)
+        decode_committed = max(0, state.committed_tokens - 1)
+        unmeasured_decode_rounds = (
+            max(0, decode_rounds_done - state.measured_decode_rounds)
+            + pending_rounds
+            + 1
+        )
         safe_round_ms = (
             state.estimated_round_ms * ROUND_ESTIMATE_SAFETY_FACTOR
+        )
+        projected_decode_wall_ms = (
+            state.cumulative_decode_ms
+            + unmeasured_decode_rounds * safe_round_ms
         )
         burst_tokens = max(
             0,
@@ -187,18 +217,14 @@ class DFlashCommittedTokenCeiling:
             - BURST_DECAY_PER_ROUND * state.rounds,
         )
         allowed_after_next_round = (
-            int(
-                safe_round_ms
-                * projected_rounds
-                / TARGET_MS_PER_COMMITTED_TOKEN
-            )
+            int(projected_decode_wall_ms / TARGET_MS_PER_COMMITTED_TOKEN)
             + burst_tokens
         )
 
         # A depth-k verification can commit k accepted drafts plus one bonus.
         room_for_drafts = (
             allowed_after_next_round
-            - state.committed_tokens
+            - decode_committed
             - pending_committed
             - 1
         )
