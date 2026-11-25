@@ -1433,13 +1433,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or not self.cudagraph_manager._graphs_captured
             or torch.cuda.is_current_stream_capturing()
             or input_batch.num_reqs != 1
-            or input_batch.num_tokens != 1
-            or input_batch.num_tokens_after_padding != 1
+            or not (1 <= input_batch.num_tokens <= 16)
+            or input_batch.num_tokens_after_padding != input_batch.num_tokens
             or int(input_batch.num_computed_tokens_np[0]) < int(input_batch.prefill_len_np[0])
         ):
             return None
-        ids_1 = input_batch.input_ids[:1]
-        dst_1 = enc_runner.inputs_embeds[:1]
+        n_tok = int(input_batch.num_tokens)
+        ids_1 = input_batch.input_ids[:n_tok]
+        dst_1 = enc_runner.inputs_embeds[:n_tok]
         if not ids_1.is_contiguous() or not dst_1.is_contiguous():
             return None
         entries = getattr(self, "_decode_embed_cg_entries", None)
@@ -1458,7 +1459,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 g_or_fn.replay()
             return out_view
-        if sig in self._decode_embed_cg_rejected or len(entries) >= 4:
+        if sig in self._decode_embed_cg_rejected or len(entries) >= 8:
             return None
 
         ref_out = self.model_state.get_mm_embeddings(
@@ -1488,7 +1489,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logger.warning("decode muse_embed eager mismatch; keeping eager get_mm_embeddings")
                 return dst_1
             if (
-                envs.os.environ.get("VLLM_DECODE_EMBED_DIRECT", "1") != "0"
+                n_tok == 1
+                and envs.os.environ.get("VLLM_DECODE_EMBED_DIRECT", "1") != "0"
                 and getattr(_me, "is_single_kernel_m1", lambda: False)()
             ):
                 table_ptr = lm.embed_tokens.weight.data_ptr()
@@ -1539,7 +1541,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 return dst_1
             entries[sig] = (g, dst_1)
             logger.info(
-                "Captured M=1 decode muse_embed CUDA graph (shape=%s)",
+                "Captured M=%d decode muse_embed CUDA graph (shape=%s)",
+                n_tok,
                 tuple(dst_1.shape),
             )
             return dst_1
@@ -1549,6 +1552,172 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logger.warning("decode muse_embed graph capture skipped (%s); keeping eager path", exc)
             return dst_1
 
+    def _try_fast_greedy_verify(
+        self,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        grammar_output: GrammarOutput | None,
+        compact_sample: bool,
+    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor] | None:
+        greedy_verify_fn = getattr(self.model, "_lmpost_greedy_verify_strided", None)
+        if (
+            greedy_verify_fn is None
+            or compact_sample
+            or grammar_output is not None
+            or envs.os.environ.get("VLLM_MUSE_FAST_GREEDY_VERIFY", "1") == "0"
+            or input_batch.num_reqs != 1
+            or not (1 <= input_batch.num_draft_tokens <= 15)
+            or self.rejection_sampler is None
+            or self.speculator is None
+            or self.rejection_sampler.use_block_verification
+            or self.rejection_sampler.synthetic_conditional_rates is not None
+            or self.sampler is None
+            or self.sampler.compute_nans
+        ):
+            return None
+        state = getattr(self, "_fast_greedy_verify_state", "unchecked")
+        if state == "rejected":
+            return None
+        n_comp = int(input_batch.num_computed_tokens_np[0])
+        n_sched = int(input_batch.num_scheduled_tokens[0])
+        prefill_len = int(input_batch.prefill_len_np[0])
+        if n_comp + n_sched < prefill_len or int(input_batch.cu_num_logits_np[0]) != 0:
+            return None
+        num_logits = int(input_batch.cu_num_logits_np[1])
+        query_end = int(input_batch.query_start_loc_np[1])
+        logits_start = query_end - num_logits
+        if (
+            num_logits != input_batch.num_draft_tokens + 1
+            or not (2 <= num_logits <= 16)
+            or logits_start < 0
+            or query_end > hidden_states.shape[0]
+            or query_end > input_batch.input_ids.shape[0]
+        ):
+            return None
+        idx_mapping_np = input_batch.idx_mapping_np
+        s_states = self.sampler.sampling_states
+        lp = self.model.logits_processor
+        if (
+            s_states.temperature.np[idx_mapping_np[0]] != 0.0
+            or s_states.max_num_logprobs(idx_mapping_np) != NO_LOGPROBS
+            or self.sampler.logprob_token_ids_state.max_num_token_ids(idx_mapping_np) != 0
+            or self.sampler._requires_logits_processing(idx_mapping_np)
+            or getattr(lp, "soft_cap", None) is not None
+            or float(getattr(lp, "scale", 1.0)) != 1.0
+        ):
+            return None
+
+        sample_hs = hidden_states[logits_start:query_end]
+        draft_ids = input_batch.input_ids[logits_start:query_end]
+        mult = self.model.output_multiplier
+        cap = self.model.final_logit_softcapping
+        max_spec = int(self.rejection_sampler.num_speculative_steps)
+
+        if state == "unchecked":
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            ref_hs = hidden_states[input_batch.logits_indices]
+            ref_logits = self.model.compute_logits(ref_hs)
+            ref_out = self.rejection_sampler(ref_logits, input_batch, self.speculator.draft_logits)
+            ok = False
+            try:
+                try:
+                    import muse_marlin6_gemv as _m6
+                except Exception:
+                    _m6 = None
+                prev_flag = getattr(_m6, "_ALLOW_STRIDED_LM_OUT", False) if _m6 is not None else False
+                try:
+                    if _m6 is not None:
+                        _m6._ALLOW_STRIDED_LM_OUT = True
+                    raw = lp(self.model.lm_head, sample_hs)
+                finally:
+                    if _m6 is not None:
+                        _m6._ALLOW_STRIDED_LM_OUT = prev_flag
+                got = greedy_verify_fn(raw, mult, cap, draft_ids, max_spec) if raw is not None else None
+                if got is not None:
+                    g_samp, g_ns, g_nr = got
+                    torch.cuda.synchronize(self.device)
+                    n_s = int(ref_out.num_sampled.item())
+                    ok = (
+                        torch.equal(g_ns, ref_out.num_sampled)
+                        and torch.equal(g_nr, ref_out.num_rejected)
+                        and 1 <= n_s <= num_logits
+                        and torch.equal(g_samp[:, :n_s], ref_out.sampled_token_ids[:, :n_s])
+                    )
+                    if ok:
+                        import lmpost as _lmp
+                        am = _lmp.argmax_rows_strided(raw, mult, cap)
+                        ok = am is not None
+                        if ok:
+                            v_sz = int(raw.shape[1])
+                            base_buf = torch.full((4, v_sz + 64), -2.0, dtype=torch.bfloat16, device=self.device)
+                            syn_view = base_buf[:, :v_sz]
+                            # Row 0: unique max at 17; Row 1: exact BF16 tie at 99 and 500 -> must pick 99;
+                            # Row 2: unique max at 12345; Row 3 (bonus): exact BF16 tie at 7 and 200000 -> must pick 7.
+                            syn_view[0, 17] = 3.5
+                            syn_view[1, 99] = 2.25
+                            syn_view[1, 500] = 2.25
+                            syn_view[2, 12345] = 4.0
+                            syn_view[3, 7] = 1.75
+                            syn_view[3, min(200000, v_sz - 1)] = 1.75
+                            # Case A: 0-accept, Case B: partial 2-accept + tie, Case C: full 3-accept + bonus tie
+                            for d_list, exp_toks, exp_ns, exp_nr in (
+                                ([0, 88, 99, 12345], [17], 1, 3),
+                                ([0, 17, 99, 555], [17, 99, 12345], 3, 1),
+                                ([0, 17, 99, 12345], [17, 99, 12345, 7], 4, 0),
+                            ):
+                                d_t = torch.tensor(d_list, dtype=draft_ids.dtype, device=self.device)
+                                s_res = greedy_verify_fn(syn_view, mult, cap, d_t, max(max_spec, 3))
+                                torch.cuda.synchronize(self.device)
+                                if (
+                                    s_res is None
+                                    or int(s_res[1].item()) != exp_ns
+                                    or int(s_res[2].item()) != exp_nr
+                                    or s_res[0][0, :exp_ns].tolist() != exp_toks
+                                ):
+                                    ok = False
+                                    break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Fast greedy verify self-check failed (%s); keeping stock rejection sampler", exc)
+                ok = False
+            self._fast_greedy_verify_state = "admitted" if ok else "rejected"
+            if ok:
+                logger.info(
+                    "lmpost fused strided greedy speculative verify admitted (0-ULP, raw_stride=%d)",
+                    int(raw.stride(0)) if raw is not None else -1,
+                )
+            return ref_out, ref_out.num_sampled, ref_out.num_rejected
+
+        try:
+            import muse_marlin6_gemv as _m6
+        except Exception:
+            _m6 = None
+        prev_flag = getattr(_m6, "_ALLOW_STRIDED_LM_OUT", False) if _m6 is not None else False
+        try:
+            if _m6 is not None:
+                _m6._ALLOW_STRIDED_LM_OUT = True
+            raw = lp(self.model.lm_head, sample_hs)
+        finally:
+            if _m6 is not None:
+                _m6._ALLOW_STRIDED_LM_OUT = prev_flag
+        if raw is None:
+            return None
+        res = greedy_verify_fn(raw, mult, cap, draft_ids, max_spec)
+        if res is None:
+            return None
+        sampled, num_sampled, num_rejected = res
+        return (
+            SamplerOutput(
+                sampled_token_ids=sampled,
+                logprobs_tensors=None,
+                num_nans=None,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+            ),
+            num_sampled,
+            num_rejected,
+        )
+
     def sample(
         self,
         hidden_states: torch.Tensor,
@@ -1556,6 +1725,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
         compact_sample: bool = False,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        fast_verify = self._try_fast_greedy_verify(
+            hidden_states, input_batch, grammar_output, compact_sample
+        )
+        if fast_verify is not None:
+            return fast_verify
         # LOCAL PATCH (SP5D, Yukon submission 98c1361e): a one-request step without draft tokens that completes its
         # prompt takes its sampling row as a slice (the row logits_indices would gather), and a greedy step without
         # logprobs, penalties, bias or grammar takes the token from lmpost's fused softcap + argmax.
@@ -1672,8 +1846,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
         )
 
+    def _allows_dflash_prefill_graph(self) -> bool:
+        sc = self.speculative_config
+        return (
+            sc is not None
+            and getattr(sc, "method", None) == "dflash"
+            and bool(self.use_aux_hidden_state_outputs)
+            and self.speculator is not None
+        )
+
     def _can_zero_prep_prefill(self, scheduler_output: SchedulerOutput) -> bool:
         pg = self.prefill_graph
+        dflash_ok = self._allows_dflash_prefill_graph()
         if (
             pg is None
             or not pg._fast_verified
@@ -1697,6 +1881,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or self.use_dcp
             or self.use_pp
             or self.model_config.rswa_window is not None
+            or ((self.use_aux_hidden_state_outputs or self.speculator is not None) and not dflash_ok)
             or not self.supports_mm_inputs
             or self.model.requires_raw_input_tokens
             or self.block_tables.cp_size != 1
@@ -2104,9 +2289,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.prompt_logprobs_worker is not None
                 and not self.prompt_logprobs_worker.uses_prompt_logprobs[input_batch.idx_mapping_np[0]]
                 and input_batch.cu_num_logits_np[-1] == 1
-                and self.speculator is None
+                and ((self.speculator is None and not self.use_aux_hidden_state_outputs) or self._allows_dflash_prefill_graph())
                 and self.pcp_manager is None
-                and not self.use_aux_hidden_state_outputs
             ))
             and block_tables is not None
             and slot_mappings is not None
@@ -2375,9 +2559,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             self.prompt_logprobs_worker is not None
                             and not self.prompt_logprobs_worker.uses_prompt_logprobs[input_batch.idx_mapping_np[0]]
                             and input_batch.cu_num_logits_np[-1] == 1
-                            and self.speculator is None
+                            and ((self.speculator is None and not self.use_aux_hidden_state_outputs) or self._allows_dflash_prefill_graph())
                             and self.pcp_manager is None
-                            and not self.use_aux_hidden_state_outputs
                         ))
                     ):
                         model_output = prefill_graph.try_replay(
@@ -2490,10 +2673,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # LOCAL PATCH (two-stage output wait, async_utils.wait_for_output): for
         # a one-request prefill step, mark in stream order where the forward
         # ends and the sampling tail begins. A decode step needs no mark: the
-        # host waits for it with the next step already queued. A speculative
-        # verify step (num_tokens > 1 only because of its draft tokens) is such
-        # a decode step: no event, no tail spin-poll; the copy event alone.
+        # host waits for it with the next step already queued.
         forward_done = None
+        # Speculative verify steps (num_draft_tokens > 0) are decode steps: no
+        # event and no tail spin-poll (from i34-9 e95c7eaa cut 5).
         if (
             input_batch.num_reqs == 1
             and input_batch.num_tokens > 1
