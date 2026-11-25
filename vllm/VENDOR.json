@@ -246,6 +246,14 @@
     {
       "file": "vllm/model_executor/layers/muse_draft_fp8.py, vllm/model_executor/layers/linear.py, vllm/model_executor/models/qwen3_dflash.py, vllm/model_executor/layers/muse_bfx.py; harness/kernels/decode6/muse_marlin6_gemv.py",
       "why": "Drafter-only: FP8 e4m3 per-row weight-only copies of the pinned DFlash drafter's bias-free linears, run through stock Marlin W8A16 at 1..16 rows (BF16 weight kept for larger M); load-time checked, any failure keeps the previous path; target untouched. Multi-row paired gate_up output un-paired by one exact 64-column tile gather (newjordan 833fb6c4)."
+    },
+    {
+      "file": "vllm/model_executor/layers/muse_draft_nvfp4.py, vllm/model_executor/layers/linear.py, vllm/model_executor/models/qwen3_dflash.py, vllm/model_executor/layers/muse_bfx.py; harness/kernels/decode6/{gemv6_tma4.cu,marlin/marlin_template.h,muse_marlin6_gemv.py}",
+      "why": "Drafter-only W4A16 copies in the target's native NVFP4 format (E2M1 values, group-16 E4M3 scales, FP32 global scale), with stock max-abs or FP8-rounded MSE scale selection. All 21 DFlash linears use coded-scale TMA4-ILV decode6 for M=1..8 only after bitwise admission against stock Marlin at every M; larger prompt rows retain BF16. The target is unchanged."
+    },
+    {
+      "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
+      "why": "Batch-size-1 speculative-decode host cuts from i34-9 (Yukon submissions 9ba5da7f-8db5-430c-a3f5-d3da1a13d186 and 1cf35c6e-2e8d-4cc8-a354-d2132af5831d): cache immutable one-request logits metadata, skip an unused draft-token gather without structured output, and skip an identity cu_num_logits shift."
     }
   ],
   "carried_from": {

@@ -644,7 +644,8 @@ extern "C" int muse_marlin6_sk_tma4_ilv(const int4* input, const int4* weight, i
           input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream);
     }
   } else if (!((n == 39936 && k == 6656) || (n == 6656 && k == 19968) ||
-               (n == 4608 && k == 6656) || (n == 6656 && k == 4096))) {
+               (n == 4608 && k == 6656) || (n == 6656 && k == 4096) ||
+               (n == 6144 && k == 6656) || (n == 6656 && k == 33280))) {
     return cudaErrorInvalidValue;
   }
   if (n == 6656 && k == 19968) {

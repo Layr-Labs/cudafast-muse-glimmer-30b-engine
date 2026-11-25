@@ -125,6 +125,11 @@ OPROJ_N, OPROJ_K = 6656, 4096
 LM_HEAD_N, LM_HEAD_K = 202048, 6656
 LM_HEAD_PAD128_N = 202112
 ATTN_ILV_SHAPES = {(4608, 6656), (6656, 4096), (4096, 6656)}
+# Load-time W4A16 copies of the DFlash projections use the same generic
+# stream-K launch as target attention weights.  These two DFlash-only shapes
+# must also stay interleaved because the multi-M kernel consumes TMA4 only in
+# that layout.
+DRAFT_ILV_SHAPES = {(6144, 6656), (6656, 33280)}
 _TMA4_SCHED_CACHE: dict[tuple, tuple] = {}
 _DOWN_ILV_SCALES: set[int] = set()
 _LM_SPLIT2_SCALES: set[int] = set()
@@ -566,7 +571,11 @@ def encode_tma4_scales(
         split2=split2, lm_pad128=lm_pad128, lm_blocks=lm_blocks,
     )
     warps = threads // 32
-    rans_cap = 4096 if lm_pad128 else (3200 if threads == 256 else 2048)
+    # 6144x6656 (the DFlash QKV projection) has exactly 52 stages per CTA.
+    # Its max-abs NVFP4 scale stream needs 3,248 bytes on the pinned weights,
+    # just above the target-only 3,200-byte ceiling.  One extra 64-byte line
+    # keeps this shape on TMA4-ILV without changing any encoded values.
+    rans_cap = 4096 if lm_pad128 else (3264 if threads == 256 else 2048)
     sb_wc = torch.empty(total_sbs * warps, dtype=torch.int32, device=dev)
     with torch.cuda.device(dev):
         stream = torch.cuda.current_stream().cuda_stream
@@ -1779,7 +1788,8 @@ def admit_tma4(layer: torch.nn.Module, fixed_grid: bool) -> bool:
             not fixed_grid
             and (
                 ((n, k) == (DOWN_N, DOWN_K) and os.environ.get("MUSE_DOWN_ILV", "1") != "0")
-                or ((n, k) in ATTN_ILV_SHAPES and gb in (24, 48) and os.environ.get("MUSE_ATTN_ILV", "1") != "0")
+                or (((n, k) in ATTN_ILV_SHAPES or (n, k) in DRAFT_ILV_SHAPES)
+                    and gb in (24, 48) and os.environ.get("MUSE_ATTN_ILV", "1") != "0")
             )
         )
     )

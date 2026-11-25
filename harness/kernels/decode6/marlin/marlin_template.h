@@ -1109,7 +1109,7 @@ __global__ void Marlin(
   static_assert(scale6 && (threads == 256 || threads == 128),
                 "TMA4 rANS scales require M = 1 decode config (128 or 256 threads)");
   constexpr int kTmaWarps = threads / 32;
-  constexpr int RANS_CAP = (fixed_shape == 3) ? 4096 : ((threads == 256) ? 3200 : 2048);
+  constexpr int RANS_CAP = (fixed_shape == 3) ? 4096 : ((threads == 256) ? 3264 : 2048);
   uint32_t* sh_states = reinterpret_cast<uint32_t*>(sh_pal + (fast_pal16 ? 128 : 64));
   unsigned char* sh_rslot = reinterpret_cast<unsigned char*>(sh_states + threads);
   uint32_t* sh_rlut = reinterpret_cast<uint32_t*>(sh_rslot + 2 * RANS_CAP);

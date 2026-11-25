@@ -409,6 +409,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             + self.model_state.num_new_sampled_tokens_per_step
         )
 
+        # LOCAL PATCH (bs=1 spec-decode host cut): constant one-request metadata
+        # for draft steps of 1..decode_query_len tokens, built once here so a
+        # step reads it instead of a pin + H2D copy (query_start_loc,
+        # cu_num_logits) and an expand kernel. Only read downstream.
+        _n_max = self.decode_query_len
+        for _nt in range(1, _n_max + 1):
+            if _nt not in self._qsl_const_gpu:
+                self._qsl_const_gpu[_nt] = torch.tensor(
+                    [0] + [_nt] * self.max_num_reqs,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+        self._spec_cu_logits_np = [
+            np.array([0, _n], dtype=np.int32) for _n in range(_n_max + 1)
+        ]
+        self._spec_cu_logits_gpu = torch.tensor(
+            [[0, _n] for _n in range(_n_max + 1)],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._spec_local_pos_gpu = torch.arange(
+            _n_max, dtype=torch.int32, device=self.device
+        )
+        self._spec_idx_rep_gpu = (
+            self._req_idx_gpu[:, None].expand(-1, _n_max).contiguous()
+        )
+
         # Initialize samplers. Model states may override via custom_sampler().
         if self.is_last_pp_rank and not self.is_pooling_model:
             self.sampler = Sampler(
@@ -1070,16 +1097,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
-            num_logits = num_draft_tokens_per_req + num_bonus_tokens
-            cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
-            cu_num_logits_np[0] = 0
-            np.cumsum(num_logits, out=cu_num_logits_np[1:])
-            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
-
-            max_expand_len = self.decode_query_len
-            expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
-                idx_mapping, total_num_logits, cu_num_logits, max_expand_len
+            # LOCAL PATCH (bs=1 spec-decode host cut): a one-request draft step's
+            # logits metadata is [0, n], full(n, req_idx) and arange(n) for
+            # n = total_num_logits; serve read-only cached copies instead of a
+            # pin + H2D copy, two allocations and an expand kernel every step.
+            spec_meta = (
+                self._spec_logits_meta_1(int(idx_mapping_np[0]), total_num_logits)
+                if num_reqs == 1
+                else None
             )
+            if spec_meta is not None:
+                (
+                    cu_num_logits_np,
+                    cu_num_logits,
+                    expanded_idx_mapping,
+                    expanded_local_pos,
+                ) = spec_meta
+            else:
+                num_logits = num_draft_tokens_per_req + num_bonus_tokens
+                cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+                cu_num_logits_np[0] = 0
+                np.cumsum(num_logits, out=cu_num_logits_np[1:])
+                cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+
+                max_expand_len = self.decode_query_len
+                expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+                    idx_mapping, total_num_logits, cu_num_logits, max_expand_len
+                )
 
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
@@ -1205,6 +1249,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_lens=prompt_lens,
         )
         return pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
+
+    def _spec_logits_meta_1(
+        self, req_idx: int, n: int
+    ) -> tuple[np.ndarray, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        # Cached (cu_num_logits_np, cu_num_logits, expanded_idx_mapping,
+        # expanded_local_pos) for one request at state index req_idx with n
+        # logits; identical in content to the cumsum/expand_idx_mapping path.
+        idx_rep = getattr(self, "_spec_idx_rep_gpu", None)
+        if (
+            idx_rep is None
+            or not 0 <= req_idx < idx_rep.shape[0]
+            or not 1 <= n <= idx_rep.shape[1]
+        ):
+            return None
+        return (
+            self._spec_cu_logits_np[n],
+            self._spec_cu_logits_gpu[n],
+            idx_rep[req_idx, :n],
+            self._spec_local_pos_gpu[:n],
+        )
 
     def prepare_attn(
         self, input_batch: InputBatch
@@ -2544,9 +2608,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
+            # LOCAL PATCH (bs=1 spec-decode host cut): without structured-output
+            # requests set_draft_tokens reads only shape[1] of this tensor, so
+            # skip the per-step gather (index kernel + allocation) there.
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                self.req_states.draft_tokens[input_batch.idx_mapping]
+                if input_batch.has_structured_output_reqs
+                else self.req_states.draft_tokens[:0],
             )
 
         # Post-step KV connector related operations.

@@ -819,14 +819,27 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         loader.load_weights(model_weights.items())
         self.model._build_fused_kv_buffers()
         import os
-        try:
-            from vllm.model_executor.layers import muse_draft_fp8
-            muse_draft_fp8.attach_drafter(self.model)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("muse_draft_fp8: skipped (%s)", e)
+        draft_quant = os.environ.get("MUSE_DRAFT_QUANT", "nvfp4-mse").lower()
+        if draft_quant.startswith("nvfp4") or draft_quant in ("mse", "maxabs", "amax"):
+            try:
+                from vllm.model_executor.layers import muse_draft_nvfp4
+
+                muse_draft_nvfp4.attach_drafter(self.model)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("muse_draft_nvfp4: skipped (%s)", e)
+        elif draft_quant == "fp8" or (draft_quant == "auto" and os.environ.get("MUSE_DRAFT_FP8", "1") != "0"):
+            try:
+                from vllm.model_executor.layers import muse_draft_fp8
+
+                muse_draft_fp8.attach_drafter(self.model)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("muse_draft_fp8: skipped (%s)", e)
         if os.environ.get("MUSE_BFX", "1") != "0":
             from vllm.model_executor.layers import muse_bfx
-            n = muse_bfx.attach_drafter(self.model)
+            # `bf16` is the comparison/control mode: retain the common fused-KV
+            # optimization without silently replacing its linear layers.
+            n = (muse_bfx.attach_drafter(self.model)
+                 if draft_quant not in ("bf16", "none", "off") else 0)
             kv = muse_bfx.attach_tensor(self.model, "fkv", self.model._fused_kv_weight) if self.model._fused_kv_bias is None else False
             logger.info("muse_bfx: coded %d drafter linears, fused kv %s", n, kv)
 
