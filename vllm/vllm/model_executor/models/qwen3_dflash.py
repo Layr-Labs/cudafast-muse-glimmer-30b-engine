@@ -899,6 +899,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        num_rejected: torch.Tensor | None = None,
+        extra_ids: torch.Tensor | None = None,
     ) -> None:
         lm_head = self.lm_head
         if not getattr(lm_head, "prompt_tail_admitted", False):
@@ -908,14 +910,26 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         try:
             import muse_bfx_ext as _bfx
 
-            _bfx.draft_vocab_update_tail(
-                input_ids,
-                positions,
-                lm_head.in_static_vocab,
-                lm_head.tail_ids,
-                lm_head.tail_count,
-                lm_head.tail_seen,
-            )
+            try:
+                _bfx.draft_vocab_update_tail(
+                    input_ids,
+                    positions,
+                    lm_head.in_static_vocab,
+                    lm_head.tail_ids,
+                    lm_head.tail_count,
+                    lm_head.tail_seen,
+                    num_rejected,
+                    extra_ids,
+                )
+            except TypeError:
+                _bfx.draft_vocab_update_tail(
+                    input_ids,
+                    positions,
+                    lm_head.in_static_vocab,
+                    lm_head.tail_ids,
+                    lm_head.tail_count,
+                    lm_head.tail_seen,
+                )
         except Exception:  # noqa: BLE001
             pass
 
@@ -980,7 +994,21 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                     logit_scale,
                 )
         if static_logits.dim() == 2 and static_logits.shape[0] >= 1:
-            if tree_top_buf is not None and tree_top_buf.numel() >= 36:
+            if tree_top_buf is not None and tree_top_buf.numel() >= 48:
+                n_tt = min(6, static_logits.shape[0])
+                tk8 = static_logits[:n_tt].topk(8, dim=-1)
+                tree_top_buf.fill_(-1)
+                tree_top_buf[: 8 * n_tt].copy_(vocab_map[tk8.indices].reshape(-1))
+                if tree_vals_buf is not None and tree_vals_buf.numel() >= 48:
+                    tree_vals_buf.fill_(-1e30)
+                    tree_vals_buf[: 8 * n_tt].copy_(tk8.values.to(torch.float32).reshape(-1))
+                if alt_buf is not None:
+                    n_t2 = min(2, n_tt, alt_buf.numel() // 2)
+                    alt_buf[: 2 * n_t2].copy_(vocab_map[tk8.indices[:n_t2, :2]].reshape(-1))
+                if margin_buf is not None:
+                    n_t2 = min(2, n_tt, margin_buf.numel())
+                    margin_buf[:n_t2].copy_((tk8.values[:n_t2, 0] - tk8.values[:n_t2, 1]).to(torch.float32))
+            elif tree_top_buf is not None and tree_top_buf.numel() >= 36:
                 n_tt = min(6, static_logits.shape[0])
                 tk6 = static_logits[:n_tt].topk(6, dim=-1)
                 tree_top_buf.fill_(-1)
