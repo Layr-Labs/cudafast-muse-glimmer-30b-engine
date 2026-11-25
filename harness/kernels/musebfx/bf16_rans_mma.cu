@@ -35,6 +35,16 @@ __device__ __forceinline__ void bf16_mma_m16n8k16(
       : "r"(a0), "r"(0u), "r"(a2), "r"(0u), "r"(b0), "r"(b1));
 }
 
+__device__ __forceinline__ void bf16_mma_m16n8k16_m16(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
 __device__ __forceinline__ uint64_t br_pol_ef() {
   uint64_t pol;
   asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
@@ -406,7 +416,7 @@ static int br_pdl_cfg() {
   return mode;
 }
 
-template <bool kPar4>
+template <bool kPar4, bool kM16 = false>
 __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
   __shared__ __align__(16) uint32_t sh_lut[4096];
   extern __shared__ __align__(16) unsigned char smem[];
@@ -512,8 +522,11 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
   const uint32_t lt = (1u << lane) - 1u;
   const int NB = pb.N >> 3;
   const bool valid_m = (g < pb.M);
+  const bool valid_m_hi = kM16 && ((g + 8) < pb.M);
   const uint32_t* xrow32 =
       valid_m ? reinterpret_cast<const uint32_t*>(pb.x + static_cast<size_t>(g) * K + 2 * t) : nullptr;
+  const uint32_t* xrow32_hi =
+      valid_m_hi ? reinterpret_cast<const uint32_t*>(pb.x + static_cast<size_t>(g + 8) * K + 2 * t) : nullptr;
   const uint32_t base_m1 = pb.base_m1;
 
   asm volatile("cp.async.wait_group %0;" ::"n"(kRG - 2) : "memory");
@@ -550,11 +563,15 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
         if (s == trig_s) {
           asm volatile("griddepcontrol.launch_dependents;");
         }
-        // Pre-issue 4 L1/L2 activation loads and all 4 independent LUT loads in parallel.
+        // Pre-issue 4 (or 8 for kM16) L1/L2 activation loads and all 4 independent LUT loads in parallel.
         const uint32_t a0 = valid_m ? __ldg(xrow32 + 16 * s) : 0u;
         const uint32_t a2 = valid_m ? __ldg(xrow32 + 16 * s + 4) : 0u;
         const uint32_t a4 = valid_m ? __ldg(xrow32 + 16 * s + 8) : 0u;
         const uint32_t a6 = valid_m ? __ldg(xrow32 + 16 * s + 12) : 0u;
+        const uint32_t a1 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s) : 0u;
+        const uint32_t a3 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 4) : 0u;
+        const uint32_t a5 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 8) : 0u;
+        const uint32_t a7 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 12) : 0u;
 
         const uint32_t le0 = sh_lut[st[0] & 4095u];
         const uint32_t le1 = sh_lut[st[1] & 4095u];
@@ -667,13 +684,21 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
         const uint32_t sm23 = __byte_perm(sm_w0, 0u, 0x4342);
         const uint32_t b0 = ((sm01 & 0x00800080u) << 8) | (sm01 & 0x007F007Fu) | (e0 << 7) | (e1 << 23);
         const uint32_t b1 = ((sm23 & 0x00800080u) << 8) | (sm23 & 0x007F007Fu) | (e2 << 7) | (e3 << 23);
-        bf16_mma_m16n8k16(c0, c1, c2, c3, a0, a2, b0, b1);
+        if constexpr (kM16) {
+          bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+        } else {
+          bf16_mma_m16n8k16(c0, c1, c2, c3, a0, a2, b0, b1);
+        }
 
         const uint32_t sm45 = __byte_perm(sm_w1, 0u, 0x4140);
         const uint32_t sm67 = __byte_perm(sm_w1, 0u, 0x4342);
         const uint32_t b2 = ((sm45 & 0x00800080u) << 8) | (sm45 & 0x007F007Fu) | (e4 << 7) | (e5 << 23);
         const uint32_t b3 = ((sm67 & 0x00800080u) << 8) | (sm67 & 0x007F007Fu) | (e6 << 7) | (e7 << 23);
-        bf16_mma_m16n8k16(c0, c1, c2, c3, a4, a6, b2, b3);
+        if constexpr (kM16) {
+          bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a4, a5, a6, a7, b2, b3);
+        } else {
+          bf16_mma_m16n8k16(c0, c1, c2, c3, a4, a6, b2, b3);
+        }
 
         if (!had_esc) {
           st[0] = n0 ? ((x0 << 16) | r0) : x0;
@@ -687,6 +712,14 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
         r.x = __float2bfloat16_rn(c0);
         r.y = __float2bfloat16_rn(c1);
         *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * pb.N + nb * 8 + 2 * t) = r;
+        if constexpr (kM16) {
+          if (valid_m_hi) {
+            __nv_bfloat162 r2;
+            r2.x = __float2bfloat16_rn(c2);
+            r2.y = __float2bfloat16_rn(c3);
+            *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * pb.N + nb * 8 + 2 * t) = r2;
+          }
+        }
       }
     }
     asm volatile("cp.async.wait_group 0;" ::: "memory");
@@ -701,11 +734,15 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       if (s == trig_s) {
         asm volatile("griddepcontrol.launch_dependents;");
       }
-      // Pre-issue 4 L1/L2 activation loads for the two K16 MMAs
+      // Pre-issue 4 (or 8 for kM16) L1/L2 activation loads for the two K16 MMAs
       const uint32_t a0 = valid_m ? __ldg(xrow32 + 16 * s) : 0u;
       const uint32_t a2 = valid_m ? __ldg(xrow32 + 16 * s + 4) : 0u;
       const uint32_t a4 = valid_m ? __ldg(xrow32 + 16 * s + 8) : 0u;
       const uint32_t a6 = valid_m ? __ldg(xrow32 + 16 * s + 12) : 0u;
+      const uint32_t a1 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s) : 0u;
+      const uint32_t a3 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 4) : 0u;
+      const uint32_t a5 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 8) : 0u;
+      const uint32_t a7 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 12) : 0u;
 
       __syncwarp();
       const int curg = static_cast<int>(pwb >> 9);
@@ -781,19 +818,35 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       const uint32_t sm23 = __byte_perm(sm_w0, 0u, 0x4342);
       const uint32_t b0 = ((sm01 & 0x00800080u) << 8) | (sm01 & 0x007F007Fu) | (e0 << 7) | (e1 << 23);
       const uint32_t b1 = ((sm23 & 0x00800080u) << 8) | (sm23 & 0x007F007Fu) | (e2 << 7) | (e3 << 23);
-      bf16_mma_m16n8k16(c0, c1, c2, c3, a0, a2, b0, b1);
+      if constexpr (kM16) {
+        bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+      } else {
+        bf16_mma_m16n8k16(c0, c1, c2, c3, a0, a2, b0, b1);
+      }
 
       const uint32_t sm45 = __byte_perm(sm_w1, 0u, 0x4140);
       const uint32_t sm67 = __byte_perm(sm_w1, 0u, 0x4342);
       const uint32_t b2 = ((sm45 & 0x00800080u) << 8) | (sm45 & 0x007F007Fu) | (e4 << 7) | (e5 << 23);
       const uint32_t b3 = ((sm67 & 0x00800080u) << 8) | (sm67 & 0x007F007Fu) | (e6 << 7) | (e7 << 23);
-      bf16_mma_m16n8k16(c0, c1, c2, c3, a4, a6, b2, b3);
+      if constexpr (kM16) {
+        bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a4, a5, a6, a7, b2, b3);
+      } else {
+        bf16_mma_m16n8k16(c0, c1, c2, c3, a4, a6, b2, b3);
+      }
     }
     if (valid_m) {
       __nv_bfloat162 r;
       r.x = __float2bfloat16_rn(c0);
       r.y = __float2bfloat16_rn(c1);
       *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * pb.N + nb * 8 + 2 * t) = r;
+      if constexpr (kM16) {
+        if (valid_m_hi) {
+          __nv_bfloat162 r2;
+          r2.x = __float2bfloat16_rn(c2);
+          r2.y = __float2bfloat16_rn(c3);
+          *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * pb.N + nb * 8 + 2 * t) = r2;
+        }
+      }
     }
   }
   asm volatile("cp.async.wait_group 0;" ::: "memory");
@@ -869,15 +922,19 @@ static void br_set_attrs_once() {
   if (done) return;
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   cudaThreadExchangeStreamCaptureMode(&mode);
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(kMaxSmem - kLutBytes));
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(kMaxSmem - kLutBytes));
+  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(kMaxSmem - kLutBytes));
+  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(kMaxSmem - kLutBytes));
   cudaThreadExchangeStreamCaptureMode(&mode);
   done = true;
 }
 
-template <bool kPar4>
+template <bool kPar4, bool kM16 = false>
 static inline void br_launch_k(int blocks, int threads, size_t dsmem, cudaStream_t st, BrProb pb) {
   if ((pb.pdl_mode & 1) != 0) {
     cudaLaunchConfig_t lcfg = {};
@@ -890,10 +947,10 @@ static inline void br_launch_k(int blocks, int threads, size_t dsmem, cudaStream
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     lcfg.attrs = attr;
     lcfg.numAttrs = 1;
-    cudaError_t err = cudaLaunchKernelEx(&lcfg, br_pair_mma_gemm_kernel<kPar4>, pb);
+    cudaError_t err = cudaLaunchKernelEx(&lcfg, br_pair_mma_gemm_kernel<kPar4, kM16>, pb);
     TORCH_CHECK(err == cudaSuccess, "br_pair_mma_gemm_kernel PDL launch failed: ", cudaGetErrorString(err));
   } else {
-    br_pair_mma_gemm_kernel<kPar4><<<blocks, threads, dsmem, st>>>(pb);
+    br_pair_mma_gemm_kernel<kPar4, kM16><<<blocks, threads, dsmem, st>>>(pb);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
@@ -1058,7 +1115,7 @@ static void bf16_rans_gemm_into(torch::Tensor x, torch::Tensor blob, torch::Tens
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(),
               "x must be contiguous CUDA bf16 [M, K]");
   const int M = static_cast<int>(x.size(0));
-  TORCH_CHECK(M >= 1 && M <= 8 && x.size(1) == K && N % 8 == 0 && K % 32 == 0, "bad shape");
+  TORCH_CHECK(M >= 1 && M <= 16 && x.size(1) == K && N % 8 == 0 && K % 32 == 0, "bad shape");
   TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "bad blob");
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == M * N,
               "bad out");
@@ -1096,9 +1153,17 @@ static void bf16_rans_gemm_into(torch::Tensor x, torch::Tensor blob, torch::Tens
   }();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   if (par4_en) {
-    br_launch_k<true>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    if (M > 8) {
+      br_launch_k<true, true>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    } else {
+      br_launch_k<true, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    }
   } else {
-    br_launch_k<false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    if (M > 8) {
+      br_launch_k<false, true>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    } else {
+      br_launch_k<false, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    }
   }
 }
 

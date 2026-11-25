@@ -245,6 +245,40 @@ class CudaGraphManager:
         else:
             decode_query_lens = [self.decode_query_len]
 
+        # Native multi-leaf tree (M=12/16) or M=8 zero-clamp verify: capture a FULL
+        # (num_tokens=target_m, num_reqs=1, uniform_token_count=target_m) graph alongside (7, 1, 7).
+        import os as _os
+
+        _target_leaf_m = 0
+        if (
+            self.decode_query_len == 7
+            and _os.environ.get("MUSE_NATIVE_LEAF", "1").strip()
+            not in ("0", "", "false", "no")
+        ):
+            try:
+                _tm = int(_os.environ.get("MUSE_NATIVE_TREE_M", "12").strip() or "0")
+            except ValueError:
+                _tm = 0
+            if _tm in (12, 16):
+                _target_leaf_m = _tm
+            elif _os.environ.get("MUSE_NATIVE_LEAF_M8", "1").strip() not in (
+                "0", "", "false", "no"
+            ):
+                _target_leaf_m = 8
+        if _target_leaf_m > 7:
+            if _target_leaf_m not in decode_query_lens:
+                decode_query_lens = list(decode_query_lens) + [_target_leaf_m]
+            max_decode_tokens = max(
+                max_decode_tokens, self.max_num_reqs * _target_leaf_m
+            )
+            if (
+                max_cg_capture_size is not None
+                and max_cg_capture_size < _target_leaf_m
+            ):
+                max_cg_capture_size = _target_leaf_m
+            if _target_leaf_m not in capture_sizes:
+                capture_sizes = sorted(capture_sizes + [_target_leaf_m])
+
         for num_tokens, num_active_loras in product(
             capture_sizes, self.lora_capture_cases
         ):

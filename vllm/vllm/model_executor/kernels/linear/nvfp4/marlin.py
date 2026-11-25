@@ -236,7 +236,7 @@ def _marlin_fp4_single(
     decode_fixed_grid: bool = False,
 ) -> torch.Tensor:
     if (
-        1 <= x.shape[0] <= 8
+        1 <= x.shape[0] <= 16
         and x.dtype == torch.bfloat16
         and decode_weight is not None
         and decode_scales is not None

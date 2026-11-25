@@ -1252,7 +1252,7 @@ class _GateSideStream:
             if x.shape[0] == 1:
                 if getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
                     return
-            elif 2 <= x.shape[0] <= 8:
+            elif 2 <= x.shape[0] <= 16:
                 if getattr(bf16_gate, "muse_bf16_rans_m", None) is None:
                     return
             else:
@@ -1562,7 +1562,7 @@ def _muse_bf16_gate_fill_impl(
             if rc == 0:
                 return
     if (
-        2 <= x.shape[0] <= 8
+        2 <= x.shape[0] <= 16
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16

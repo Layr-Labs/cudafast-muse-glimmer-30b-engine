@@ -369,7 +369,8 @@ __global__ void Marlin(
     num_groups = 416;
   }
   if constexpr (fuse_lmpost) {
-    static_assert(scale6 && m_block_size_8 && !gate_up_grid && !gate_v48 && !half_split &&
+    static_assert(scale6 && (m_block_size_8 || (multi_m && thread_m_blocks == 1)) &&
+                  !gate_up_grid && !gate_v48 && !half_split &&
                   ((thread_n_blocks == 4 && threads == 128) ||
                    (thread_n_blocks == 8 && threads == 256)) &&
                   c_type_id == vllm::kBFloat16.id());
@@ -397,7 +398,8 @@ __global__ void Marlin(
     prob_k = lda = 6656;
     num_groups = 416;
   } else if constexpr (fixed_shape == 3) {
-    static_assert(scale6 && m_block_size_8 && down_ilv && !gate_up_grid && !gate_v48 &&
+    static_assert(scale6 && (m_block_size_8 || (multi_m && thread_m_blocks == 1)) &&
+                  down_ilv && !gate_up_grid && !gate_v48 &&
                   !split2 && !half_split && !gate_up_swiglu && !fuse_mul_sigmoid &&
                   thread_n_blocks == 8 && threads == 256 && thread_k_blocks == 8);
     prob_n = 202112;
@@ -2570,9 +2572,9 @@ __global__ void Marlin(
       if constexpr (multi_m) {
         const uint32_t* const sh_u32 = reinterpret_cast<const uint32_t*>(sh_red);
         if (slice_col < 264) {
-          if (threadIdx.x < prob_m * 32) {
-            const int r = threadIdx.x >> 5;
-            const int c = threadIdx.x & 31;
+          for (int idx = threadIdx.x; idx < prob_m * 32; idx += threads) {
+            const int r = idx >> 5;
+            const int c = idx & 31;
             const uint32_t gw = sh_u32[r * (4 * c_sh_stride) + c];
             const uint32_t uw = sh_u32[r * (4 * c_sh_stride) + c + 32];
             const float g0 = __uint_as_float(gw << 16);
@@ -2591,13 +2593,13 @@ __global__ void Marlin(
           int4* const my_slot = C0 + prob_m * 2496 + m_pair * (prob_m * 32) + (is_up ? prob_m * 16 : 0);
           const int4* const other_slot = C0 + prob_m * 2496 + m_pair * (prob_m * 32) + (is_up ? 0 : prob_m * 16);
           int* const plock = (pair_locks != nullptr ? pair_locks : (locks + 24)) + m_pair;
-          if (threadIdx.x < prob_m * 16) {
-            const int r_s = threadIdx.x >> 4;
-            const int c_s = threadIdx.x & 15;
+          for (int idx = threadIdx.x; idx < prob_m * 16; idx += threads) {
+            const int r_s = idx >> 4;
+            const int c_s = idx & 15;
             const int4 v = sh_red[r_s * c_sh_stride + c_s];
             asm volatile("st.global.wb.v4.b32 [%0], {%1, %2, %3, %4};\n"
                          :
-                         : "l"(my_slot + threadIdx.x), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                         : "l"(my_slot + idx), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
                          : "memory");
           }
           __syncthreads();
@@ -3401,53 +3403,92 @@ __global__ void Marlin(
         if constexpr (multi_m) {
           if (last && threadIdx.x < active_threads) {
             const int lane = threadIdx.x & 31;
-            const int row0 = (lane & 3) << 1;
-            const bool has_r0 = row0 < prob_m;
-            const bool has_r1 = (row0 + 1) < prob_m;
-            const int base_col = slice_col * (thread_n_blocks * 16) + 64 * (threadIdx.x >> 5);
-            const int g = lane >> 2;
+            if constexpr (m_block_size_8) {
+              const int row0 = (lane & 3) << 1;
+              const bool has_r0 = row0 < prob_m;
+              const bool has_r1 = (row0 + 1) < prob_m;
+              const int base_col = slice_col * (thread_n_blocks * 16) + 64 * (threadIdx.x >> 5);
+              const int g = lane >> 2;
   #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-              const int col0 = base_col + 16 * j + g;
-              const int col2 = col0 + 8;
-              if (col0 < org_vocab_size) {
-                if (has_r0) {
-                  const __nv_bfloat16 b0 = Cdtype::float2num(frag_c[0][j][0][0] * global_scale_f32);
-                  const uint16_t m0 = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&b0));
-                  const float v0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m0));
-                  if ((v0 > lm_bv) || (v0 == lm_bv && col0 < lm_bi)) {
-                    lm_bv = v0;
-                    lm_bi = col0;
+              for (int j = 0; j < 4; ++j) {
+                const int col0 = base_col + 16 * j + g;
+                const int col2 = col0 + 8;
+                if (col0 < org_vocab_size) {
+                  if (has_r0) {
+                    const __nv_bfloat16 b0 = Cdtype::float2num(frag_c[0][j][0][0] * global_scale_f32);
+                    const uint16_t m0 = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&b0));
+                    const float v0 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m0));
+                    if ((v0 > lm_bv) || (v0 == lm_bv && col0 < lm_bi)) {
+                      lm_bv = v0;
+                      lm_bi = col0;
+                    }
+                  }
+                  if (has_r1) {
+                    const __nv_bfloat16 b1 = Cdtype::float2num(frag_c[0][j][0][1] * global_scale_f32);
+                    const uint16_t m1 = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&b1));
+                    const float v1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m1));
+                    if ((v1 > lm_bv1) || (v1 == lm_bv1 && col0 < lm_bi1)) {
+                      lm_bv1 = v1;
+                      lm_bi1 = col0;
+                    }
                   }
                 }
-                if (has_r1) {
-                  const __nv_bfloat16 b1 = Cdtype::float2num(frag_c[0][j][0][1] * global_scale_f32);
-                  const uint16_t m1 = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&b1));
-                  const float v1 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m1));
-                  if ((v1 > lm_bv1) || (v1 == lm_bv1 && col0 < lm_bi1)) {
-                    lm_bv1 = v1;
-                    lm_bi1 = col0;
+                if (col2 < org_vocab_size) {
+                  if (has_r0) {
+                    const __nv_bfloat16 b2 = Cdtype::float2num(frag_c[0][j][0][2] * global_scale_f32);
+                    const uint16_t m2 = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&b2));
+                    const float v2 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m2));
+                    if ((v2 > lm_bv) || (v2 == lm_bv && col2 < lm_bi)) {
+                      lm_bv = v2;
+                      lm_bi = col2;
+                    }
+                  }
+                  if (has_r1) {
+                    const __nv_bfloat16 b3 = Cdtype::float2num(frag_c[0][j][0][3] * global_scale_f32);
+                    const uint16_t m3 = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&b3));
+                    const float v3 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m3));
+                    if ((v3 > lm_bv1) || (v3 == lm_bv1 && col2 < lm_bi1)) {
+                      lm_bv1 = v3;
+                      lm_bi1 = col2;
+                    }
                   }
                 }
               }
-              if (col2 < org_vocab_size) {
-                if (has_r0) {
-                  const __nv_bfloat16 b2 = Cdtype::float2num(frag_c[0][j][0][2] * global_scale_f32);
-                  const uint16_t m2 = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&b2));
-                  const float v2 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m2));
-                  if ((v2 > lm_bv) || (v2 == lm_bv && col2 < lm_bi)) {
-                    lm_bv = v2;
-                    lm_bi = col2;
-                  }
+            } else {
+              const int r0 = lane >> 2;
+              const bool has_r0 = r0 < prob_m;
+              const bool has_r1 = (r0 + 8) < prob_m;
+              const int base_col = slice_col * (thread_n_blocks * 16) + 64 * (threadIdx.x >> 5) + ((lane & 3) << 1);
+              auto upd = [&](float raw_c, int col, float& bv, int& bi) {
+                const __nv_bfloat16 bf = Cdtype::float2num(raw_c * global_scale_f32);
+                const uint16_t m = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&bf));
+                const float v = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m));
+                if ((v > bv) || (v == bv && col < bi)) {
+                  bv = v;
+                  bi = col;
                 }
-                if (has_r1) {
-                  const __nv_bfloat16 b3 = Cdtype::float2num(frag_c[0][j][0][3] * global_scale_f32);
-                  const uint16_t m3 = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&b3));
-                  const float v3 = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m3));
-                  if ((v3 > lm_bv1) || (v3 == lm_bv1 && col2 < lm_bi1)) {
-                    lm_bv1 = v3;
-                    lm_bi1 = col2;
-                  }
+              };
+  #pragma unroll
+              for (int j = 0; j < 4; ++j) {
+                const int ca0 = base_col + 16 * j;
+                const int ca1 = ca0 + 1;
+                if (ca0 < org_vocab_size) {
+                  if (has_r0) upd(frag_c[0][j][0][0], ca0, lm_bv, lm_bi);
+                  if (has_r1) upd(frag_c[0][j][0][2], ca0, lm_bv1, lm_bi1);
+                }
+                if (ca1 < org_vocab_size) {
+                  if (has_r0) upd(frag_c[0][j][0][1], ca1, lm_bv, lm_bi);
+                  if (has_r1) upd(frag_c[0][j][0][3], ca1, lm_bv1, lm_bi1);
+                }
+                const int cb0 = ca0 + 8;
+                const int cb1 = cb0 + 1;
+                if (cb0 < org_vocab_size) {
+                  if (has_r0) upd(frag_c[0][j][1][0], cb0, lm_bv, lm_bi);
+                  if (has_r1) upd(frag_c[0][j][1][2], cb0, lm_bv1, lm_bi1);
+                }
+                if (cb1 < org_vocab_size) {
+                  if (has_r0) upd(frag_c[0][j][1][1], cb1, lm_bv, lm_bi);
+                  if (has_r1) upd(frag_c[0][j][1][3], cb1, lm_bv1, lm_bi1);
                 }
               }
             }
@@ -3580,47 +3621,73 @@ __global__ void Marlin(
     if constexpr (multi_m) {
       __syncthreads();
       float* const sh_bv = reinterpret_cast<float*>(sh);
-      int* const sh_bi = reinterpret_cast<int*>(sh_bv + 64);
-      int* const sh_last = sh_bi + 64;
+      int* const sh_bi = reinterpret_cast<int*>(sh_bv + 128);
+      int* const sh_last = sh_bi + 128;
 
       constexpr int active_threads = 32 * tb_n_warps;
+      constexpr int sh_row_stride = m_block_size_8 ? 8 : 16;
       if (threadIdx.x < active_threads) {
         const int lane = threadIdx.x & 31;
         const int w = threadIdx.x >> 5;
+        if constexpr (m_block_size_8) {
 #pragma unroll
-        for (int off = 16; off >= 4; off >>= 1) {
-          const float ov0 = __shfl_xor_sync(0xffffffffu, lm_bv, off);
-          const int oi0 = __shfl_xor_sync(0xffffffffu, lm_bi, off);
-          if ((ov0 > lm_bv) || (ov0 == lm_bv && oi0 < lm_bi)) {
-            lm_bv = ov0;
-            lm_bi = oi0;
+          for (int off = 16; off >= 4; off >>= 1) {
+            const float ov0 = __shfl_xor_sync(0xffffffffu, lm_bv, off);
+            const int oi0 = __shfl_xor_sync(0xffffffffu, lm_bi, off);
+            if ((ov0 > lm_bv) || (ov0 == lm_bv && oi0 < lm_bi)) {
+              lm_bv = ov0;
+              lm_bi = oi0;
+            }
+            const float ov1 = __shfl_xor_sync(0xffffffffu, lm_bv1, off);
+            const int oi1 = __shfl_xor_sync(0xffffffffu, lm_bi1, off);
+            if ((ov1 > lm_bv1) || (ov1 == lm_bv1 && oi1 < lm_bi1)) {
+              lm_bv1 = ov1;
+              lm_bi1 = oi1;
+            }
           }
-          const float ov1 = __shfl_xor_sync(0xffffffffu, lm_bv1, off);
-          const int oi1 = __shfl_xor_sync(0xffffffffu, lm_bi1, off);
-          if ((ov1 > lm_bv1) || (ov1 == lm_bv1 && oi1 < lm_bi1)) {
-            lm_bv1 = ov1;
-            lm_bi1 = oi1;
+          if (lane < 4) {
+            sh_bv[w * 8 + (lane << 1)] = lm_bv;
+            sh_bi[w * 8 + (lane << 1)] = lm_bi;
+            sh_bv[w * 8 + (lane << 1) + 1] = lm_bv1;
+            sh_bi[w * 8 + (lane << 1) + 1] = lm_bi1;
           }
-        }
-        if (lane < 4) {
-          sh_bv[w * 8 + (lane << 1)] = lm_bv;
-          sh_bi[w * 8 + (lane << 1)] = lm_bi;
-          sh_bv[w * 8 + (lane << 1) + 1] = lm_bv1;
-          sh_bi[w * 8 + (lane << 1) + 1] = lm_bi1;
+        } else {
+#pragma unroll
+          for (int off = 2; off >= 1; off >>= 1) {
+            const float ov0 = __shfl_xor_sync(0xffffffffu, lm_bv, off);
+            const int oi0 = __shfl_xor_sync(0xffffffffu, lm_bi, off);
+            if ((ov0 > lm_bv) || (ov0 == lm_bv && oi0 < lm_bi)) {
+              lm_bv = ov0;
+              lm_bi = oi0;
+            }
+            const float ov1 = __shfl_xor_sync(0xffffffffu, lm_bv1, off);
+            const int oi1 = __shfl_xor_sync(0xffffffffu, lm_bi1, off);
+            if ((ov1 > lm_bv1) || (ov1 == lm_bv1 && oi1 < lm_bi1)) {
+              lm_bv1 = ov1;
+              lm_bi1 = oi1;
+            }
+          }
+          if ((lane & 3) == 0) {
+            const int r0 = lane >> 2;
+            sh_bv[w * 16 + r0] = lm_bv;
+            sh_bi[w * 16 + r0] = lm_bi;
+            sh_bv[w * 16 + r0 + 8] = lm_bv1;
+            sh_bi[w * 16 + r0 + 8] = lm_bi1;
+          }
         }
       }
       __syncthreads();
 
       float* const g_bv = reinterpret_cast<float*>(C0);
-      int* const g_bi = reinterpret_cast<int*>(g_bv + 1024);
-      int* const g_done = g_bi + 1024;
+      int* const g_bi = reinterpret_cast<int*>(g_bv + 2048);
+      int* const g_done = g_bi + 2048;
       if (static_cast<int>(threadIdx.x) < prob_m) {
         const int r = static_cast<int>(threadIdx.x);
         float bv = sh_bv[r];
         int bi = sh_bi[r];
         for (int w = 1; w < tb_n_warps; ++w) {
-          const float ov = sh_bv[w * 8 + r];
-          const int oi = sh_bi[w * 8 + r];
+          const float ov = sh_bv[w * sh_row_stride + r];
+          const int oi = sh_bi[w * sh_row_stride + r];
           if ((ov > bv) || (ov == bv && oi < bi)) {
             bv = ov;
             bi = oi;

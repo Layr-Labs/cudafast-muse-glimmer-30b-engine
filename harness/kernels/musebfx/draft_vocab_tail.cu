@@ -55,6 +55,28 @@ __device__ __forceinline__ void dvt_top2_insert(
   }
 }
 
+__device__ __forceinline__ void dvt_top4_insert(
+    float& v1, int& i1, float& v2, int& i2,
+    float& v3, int& i3, float& v4, int& i4,
+    float cand_v, int cand_i) {
+  if (cand_i == i1 || cand_i == i2 || cand_i == i3 || cand_i == i4) return;
+  if (dvt_better(cand_v, cand_i, v1, i1)) {
+    v4 = v3; i4 = i3;
+    v3 = v2; i3 = i2;
+    v2 = v1; i2 = i1;
+    v1 = cand_v; i1 = cand_i;
+  } else if (dvt_better(cand_v, cand_i, v2, i2)) {
+    v4 = v3; i4 = i3;
+    v3 = v2; i3 = i2;
+    v2 = cand_v; i2 = cand_i;
+  } else if (dvt_better(cand_v, cand_i, v3, i3)) {
+    v4 = v3; i4 = i3;
+    v3 = cand_v; i3 = cand_i;
+  } else if (dvt_better(cand_v, cand_i, v4, i4)) {
+    v4 = cand_v; i4 = cand_i;
+  }
+}
+
 // 1-CTA GPU tail updater (~3 us, zero CPU-GPU sync).
 // Automatically resets when positions[0] == 0 (start of a new prompt) and appends any unique
 // OOV token IDs (in_static_vocab[tok] == 0) into tail_ids[0..max_tail-1].
@@ -170,7 +192,7 @@ __device__ __forceinline__ float dvt_warp_nvfp4_dot(
 
 // Fused static-logits reduction + dynamic prompt-tail exact-NVFP4 scoring.
 // Grid: (16, M), Block: 256 threads (8 warps).
-// When out_vals2/out_ids2 are non-null, row m==0 also tracks exact top-2 across static + tail.
+// Tracks exact top-4 for rows m=0..1 (when out_vals3!=null) and top-2 for rows m=0..top2_max-1.
 __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ static_logits,
@@ -184,6 +206,11 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
     int32_t* __restrict__ out_ids,
     float* __restrict__ out_vals2,
     int32_t* __restrict__ out_ids2,
+    float* __restrict__ out_vals3,
+    int32_t* __restrict__ out_ids3,
+    float* __restrict__ out_vals4,
+    int32_t* __restrict__ out_ids4,
+    int top2_max_rows,
     int V_static,
     int K,
     int max_tail,
@@ -194,13 +221,19 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
   __shared__ int32_t s_ids[kS2Warps];
   __shared__ float s_vals2[kS2Warps];
   __shared__ int32_t s_ids2[kS2Warps];
+  __shared__ float s_vals3[kS2Warps];
+  __shared__ int32_t s_ids3[kS2Warps];
+  __shared__ float s_vals4[kS2Warps];
+  __shared__ int32_t s_ids4[kS2Warps];
 
   const int cta_c = blockIdx.x;  // 0 .. 15
   const int m = blockIdx.y;      // 0 .. M-1
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
-  const bool want_top2 = (m == 0 && out_vals2 != nullptr && out_ids2 != nullptr);
+  const bool want_top4 = (m < 2 && out_vals3 != nullptr && out_ids3 != nullptr &&
+                          out_vals4 != nullptr && out_ids4 != nullptr);
+  const bool want_top2 = (!want_top4 && m < top2_max_rows && out_vals2 != nullptr && out_ids2 != nullptr);
 
   // Phase 1: Reduce static_logits[m, chunk] from L2 cache.
   const __nv_bfloat16* sl_row = static_logits + static_cast<size_t>(m) * V_static;
@@ -212,10 +245,20 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
   int best_id = 0x7fffffff;
   float best2_val = -1e30f;
   int best2_id = 0x7fffffff;
+  float best3_val = -1e30f;
+  int best3_id = 0x7fffffff;
+  float best4_val = -1e30f;
+  int best4_id = 0x7fffffff;
 
   for (int j = j_start + tid; j < j_end; j += blockDim.x) {
     const float v = __bfloat162float(__ldg(&sl_row[j]));
-    if (want_top2) {
+    if (want_top4) {
+      if (v >= best4_val) {
+        const int orig_id = static_cast<int>(__ldg(&vocab_map[j]));
+        dvt_top4_insert(best_val, best_id, best2_val, best2_id,
+                        best3_val, best3_id, best4_val, best4_id, v, orig_id);
+      }
+    } else if (want_top2) {
       if (v >= best2_val) {
         const int orig_id = static_cast<int>(__ldg(&vocab_map[j]));
         dvt_top2_insert(best_val, best_id, best2_val, best2_id, v, orig_id);
@@ -228,12 +271,23 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
       }
     }
   }
-  // Warp reduce Phase 1 -> lane 0 holds warp's best static (val, orig_id) [and 2nd best for m==0].
+  // Warp reduce Phase 1 -> lane 0 holds warp's best static candidates.
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) {
     const float ov = __shfl_xor_sync(0xffffffffu, best_val, o);
     const int oi = __shfl_xor_sync(0xffffffffu, best_id, o);
-    if (want_top2) {
+    if (want_top4) {
+      const float ov2 = __shfl_xor_sync(0xffffffffu, best2_val, o);
+      const int oi2 = __shfl_xor_sync(0xffffffffu, best2_id, o);
+      const float ov3 = __shfl_xor_sync(0xffffffffu, best3_val, o);
+      const int oi3 = __shfl_xor_sync(0xffffffffu, best3_id, o);
+      const float ov4 = __shfl_xor_sync(0xffffffffu, best4_val, o);
+      const int oi4 = __shfl_xor_sync(0xffffffffu, best4_id, o);
+      dvt_top4_insert(best_val, best_id, best2_val, best2_id, best3_val, best3_id, best4_val, best4_id, ov, oi);
+      dvt_top4_insert(best_val, best_id, best2_val, best2_id, best3_val, best3_id, best4_val, best4_id, ov2, oi2);
+      dvt_top4_insert(best_val, best_id, best2_val, best2_id, best3_val, best3_id, best4_val, best4_id, ov3, oi3);
+      dvt_top4_insert(best_val, best_id, best2_val, best2_id, best3_val, best3_id, best4_val, best4_id, ov4, oi4);
+    } else if (want_top2) {
       const float ov2 = __shfl_xor_sync(0xffffffffu, best2_val, o);
       const int oi2 = __shfl_xor_sync(0xffffffffu, best2_id, o);
       dvt_top2_insert(best_val, best_id, best2_val, best2_id, ov, oi);
@@ -269,7 +323,10 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
         const float val = dvt_warp_nvfp4_dot(
             a_row, s_a0, s_a1, use_smem_a, raw_w, raw_s, tok, K, num_g, lane, total_scale);
         if (lane == 0) {
-          if (want_top2) {
+          if (want_top4) {
+            dvt_top4_insert(best_val, best_id, best2_val, best2_id,
+                            best3_val, best3_id, best4_val, best4_id, val, tok);
+          } else if (want_top2) {
             dvt_top2_insert(best_val, best_id, best2_val, best2_id, val, tok);
           } else if (dvt_better(val, tok, best_val, best_id)) {
             best_val = val;
@@ -283,9 +340,15 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
   if (lane == 0) {
     s_vals[warp] = best_val;
     s_ids[warp] = best_id;
-    if (want_top2) {
+    if (want_top4 || want_top2) {
       s_vals2[warp] = best2_val;
       s_ids2[warp] = best2_id;
+    }
+    if (want_top4) {
+      s_vals3[warp] = best3_val;
+      s_ids3[warp] = best3_id;
+      s_vals4[warp] = best4_val;
+      s_ids4[warp] = best4_id;
     }
   }
   __syncthreads();
@@ -293,13 +356,28 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
   if (warp == 0 && lane < kS2Warps) {
     float bv = s_vals[lane];
     int bi = s_ids[lane];
-    float bv2 = want_top2 ? s_vals2[lane] : -1e30f;
-    int bi2 = want_top2 ? s_ids2[lane] : 0x7fffffff;
+    float bv2 = (want_top4 || want_top2) ? s_vals2[lane] : -1e30f;
+    int bi2 = (want_top4 || want_top2) ? s_ids2[lane] : 0x7fffffff;
+    float bv3 = want_top4 ? s_vals3[lane] : -1e30f;
+    int bi3 = want_top4 ? s_ids3[lane] : 0x7fffffff;
+    float bv4 = want_top4 ? s_vals4[lane] : -1e30f;
+    int bi4 = want_top4 ? s_ids4[lane] : 0x7fffffff;
 #pragma unroll
     for (int o = 4; o > 0; o >>= 1) {
       const float ov = __shfl_xor_sync(0xffu, bv, o);
       const int oi = __shfl_xor_sync(0xffu, bi, o);
-      if (want_top2) {
+      if (want_top4) {
+        const float ov2 = __shfl_xor_sync(0xffu, bv2, o);
+        const int oi2 = __shfl_xor_sync(0xffu, bi2, o);
+        const float ov3 = __shfl_xor_sync(0xffu, bv3, o);
+        const int oi3 = __shfl_xor_sync(0xffu, bi3, o);
+        const float ov4 = __shfl_xor_sync(0xffu, bv4, o);
+        const int oi4 = __shfl_xor_sync(0xffu, bi4, o);
+        dvt_top4_insert(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, ov, oi);
+        dvt_top4_insert(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, ov2, oi2);
+        dvt_top4_insert(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, ov3, oi3);
+        dvt_top4_insert(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, ov4, oi4);
+      } else if (want_top2) {
         const float ov2 = __shfl_xor_sync(0xffu, bv2, o);
         const int oi2 = __shfl_xor_sync(0xffu, bi2, o);
         dvt_top2_insert(bv, bi, bv2, bi2, ov, oi);
@@ -312,9 +390,15 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
     if (lane == 0) {
       out_vals[m * kS2CTAsPerRow + cta_c] = bv;
       out_ids[m * kS2CTAsPerRow + cta_c] = bi;
-      if (want_top2) {
-        out_vals2[cta_c] = bv2;
-        out_ids2[cta_c] = bi2;
+      if (want_top4 || want_top2) {
+        out_vals2[m * kS2CTAsPerRow + cta_c] = bv2;
+        out_ids2[m * kS2CTAsPerRow + cta_c] = bi2;
+      }
+      if (want_top4) {
+        out_vals3[m * kS2CTAsPerRow + cta_c] = bv3;
+        out_ids3[m * kS2CTAsPerRow + cta_c] = bi3;
+        out_vals4[m * kS2CTAsPerRow + cta_c] = bv4;
+        out_ids4[m * kS2CTAsPerRow + cta_c] = bi4;
       }
     }
   }
@@ -325,22 +409,50 @@ __global__ void draft_vocab_final_reduce_kernel(
     const int32_t* __restrict__ in_ids,
     const float* __restrict__ in_vals2,
     const int32_t* __restrict__ in_ids2,
+    const float* __restrict__ in_vals3,
+    const int32_t* __restrict__ in_ids3,
+    const float* __restrict__ in_vals4,
+    const int32_t* __restrict__ in_ids4,
     int64_t* __restrict__ out_tokens,
-    int64_t* __restrict__ out_top2_row0,
+    int64_t* __restrict__ out_top2,
+    int top2_rows,
+    float* __restrict__ out_margins,
+    int margin_rows,
+    int64_t* __restrict__ out_tree_top,
+    int tree_top_rows,
     int M) {
   const int m = blockIdx.x;
   const int lane = threadIdx.x;
   if (m >= M || lane >= kS2CTAsPerRow) return;
-  const bool want_top2 = (m == 0 && out_top2_row0 != nullptr && in_vals2 != nullptr && in_ids2 != nullptr);
+  const bool want_top4 = (m < 2 && out_tree_top != nullptr && in_vals3 != nullptr && in_ids3 != nullptr &&
+                          in_vals4 != nullptr && in_ids4 != nullptr);
+  const bool want_top2 = (!want_top4 && ((m < top2_rows && out_top2 != nullptr) ||
+                                         (m < tree_top_rows && out_tree_top != nullptr)) &&
+                          in_vals2 != nullptr && in_ids2 != nullptr);
   float bv = in_vals[m * kS2CTAsPerRow + lane];
   int bi = in_ids[m * kS2CTAsPerRow + lane];
-  float bv2 = want_top2 ? in_vals2[lane] : -1e30f;
-  int bi2 = want_top2 ? in_ids2[lane] : 0x7fffffff;
+  float bv2 = (want_top4 || want_top2) ? in_vals2[m * kS2CTAsPerRow + lane] : -1e30f;
+  int bi2 = (want_top4 || want_top2) ? in_ids2[m * kS2CTAsPerRow + lane] : 0x7fffffff;
+  float bv3 = want_top4 ? in_vals3[m * kS2CTAsPerRow + lane] : -1e30f;
+  int bi3 = want_top4 ? in_ids3[m * kS2CTAsPerRow + lane] : 0x7fffffff;
+  float bv4 = want_top4 ? in_vals4[m * kS2CTAsPerRow + lane] : -1e30f;
+  int bi4 = want_top4 ? in_ids4[m * kS2CTAsPerRow + lane] : 0x7fffffff;
 #pragma unroll
   for (int o = kS2CTAsPerRow / 2; o > 0; o >>= 1) {
     const float ov = __shfl_xor_sync(0xffffu, bv, o);
     const int oi = __shfl_xor_sync(0xffffu, bi, o);
-    if (want_top2) {
+    if (want_top4) {
+      const float ov2 = __shfl_xor_sync(0xffffu, bv2, o);
+      const int oi2 = __shfl_xor_sync(0xffffu, bi2, o);
+      const float ov3 = __shfl_xor_sync(0xffffu, bv3, o);
+      const int oi3 = __shfl_xor_sync(0xffffu, bi3, o);
+      const float ov4 = __shfl_xor_sync(0xffffu, bv4, o);
+      const int oi4 = __shfl_xor_sync(0xffffu, bi4, o);
+      dvt_top4_insert(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, ov, oi);
+      dvt_top4_insert(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, ov2, oi2);
+      dvt_top4_insert(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, ov3, oi3);
+      dvt_top4_insert(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, ov4, oi4);
+    } else if (want_top2) {
       const float ov2 = __shfl_xor_sync(0xffffu, bv2, o);
       const int oi2 = __shfl_xor_sync(0xffffu, bi2, o);
       dvt_top2_insert(bv, bi, bv2, bi2, ov, oi);
@@ -352,9 +464,18 @@ __global__ void draft_vocab_final_reduce_kernel(
   }
   if (lane == 0) {
     out_tokens[m] = static_cast<int64_t>(bi);
-    if (want_top2) {
-      out_top2_row0[0] = static_cast<int64_t>(bi);
-      out_top2_row0[1] = (bi2 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi2);
+    if ((want_top4 || want_top2) && out_top2 != nullptr && m < top2_rows) {
+      out_top2[2 * m + 0] = static_cast<int64_t>(bi);
+      out_top2[2 * m + 1] = (bi2 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi2);
+      if (out_margins != nullptr && m < margin_rows) {
+        out_margins[m] = (bi2 == 0x7fffffff) ? 1e30f : (bv - bv2);
+      }
+    }
+    if (out_tree_top != nullptr && m < tree_top_rows) {
+      out_tree_top[4 * m + 0] = static_cast<int64_t>(bi);
+      out_tree_top[4 * m + 1] = (bi2 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi2);
+      out_tree_top[4 * m + 2] = (want_top4 && bi3 != 0x7fffffff) ? static_cast<int64_t>(bi3) : -1;
+      out_tree_top[4 * m + 3] = (want_top4 && bi4 != 0x7fffffff) ? static_cast<int64_t>(bi4) : -1;
     }
   }
 }
@@ -388,6 +509,10 @@ struct DraftVocabScratch {
   torch::Tensor s2_ids;
   torch::Tensor s2_vals2;
   torch::Tensor s2_ids2;
+  torch::Tensor s2_vals3;
+  torch::Tensor s2_ids3;
+  torch::Tensor s2_vals4;
+  torch::Tensor s2_ids4;
   c10::DeviceIndex dev = -1;
 };
 
@@ -398,8 +523,12 @@ DraftVocabScratch& get_dvt_scratch(torch::Device device) {
     auto opt_i32 = torch::TensorOptions().dtype(torch::kInt32).device(device);
     sc.s2_vals = torch::empty({kMaxM, kS2CTAsPerRow}, opt_f32);
     sc.s2_ids = torch::empty({kMaxM, kS2CTAsPerRow}, opt_i32);
-    sc.s2_vals2 = torch::empty({kS2CTAsPerRow}, opt_f32);
-    sc.s2_ids2 = torch::empty({kS2CTAsPerRow}, opt_i32);
+    sc.s2_vals2 = torch::empty({5, kS2CTAsPerRow}, opt_f32);
+    sc.s2_ids2 = torch::empty({5, kS2CTAsPerRow}, opt_i32);
+    sc.s2_vals3 = torch::empty({2, kS2CTAsPerRow}, opt_f32);
+    sc.s2_ids3 = torch::empty({2, kS2CTAsPerRow}, opt_i32);
+    sc.s2_vals4 = torch::empty({2, kS2CTAsPerRow}, opt_f32);
+    sc.s2_ids4 = torch::empty({2, kS2CTAsPerRow}, opt_i32);
     sc.dev = device.index();
   }
   return sc;
@@ -450,7 +579,9 @@ torch::Tensor draft_vocab_tail_argmax(
     torch::Tensor raw_s,
     torch::Tensor global_scale,
     double logit_scale,
-    c10::optional<torch::Tensor> out_top2_row0 = c10::nullopt) {
+    c10::optional<torch::Tensor> out_top2_row0 = c10::nullopt,
+    c10::optional<torch::Tensor> out_margins = c10::nullopt,
+    c10::optional<torch::Tensor> out_tree_top = c10::nullopt) {
   TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous());
   TORCH_CHECK(static_logits.is_cuda() && static_logits.scalar_type() == torch::kBFloat16 &&
               static_logits.dim() == 2 && static_logits.is_contiguous());
@@ -463,17 +594,38 @@ torch::Tensor draft_vocab_tail_argmax(
   TORCH_CHECK(K == raw_w.size(1) * 2 && (K % 16) == 0);
 
   int64_t* top2_ptr = nullptr;
+  int top2_rows = 0;
   if (out_top2_row0.has_value() && out_top2_row0.value().defined() && out_top2_row0.value().numel() >= 2) {
     TORCH_CHECK(out_top2_row0.value().is_cuda() && out_top2_row0.value().scalar_type() == torch::kInt64);
     top2_ptr = out_top2_row0.value().data_ptr<int64_t>();
+    top2_rows = (out_top2_row0.value().numel() >= 4 && M >= 2) ? 2 : 1;
+  }
+  float* margin_ptr = nullptr;
+  int margin_rows = 0;
+  if (out_margins.has_value() && out_margins.value().defined() && out_margins.value().numel() >= 1) {
+    TORCH_CHECK(out_margins.value().is_cuda() && out_margins.value().scalar_type() == torch::kFloat32);
+    margin_ptr = out_margins.value().data_ptr<float>();
+    margin_rows = std::min(static_cast<int>(out_margins.value().numel()), top2_rows);
+  }
+  int64_t* tree_top_ptr = nullptr;
+  int tree_top_rows = 0;
+  if (out_tree_top.has_value() && out_tree_top.value().defined() && out_tree_top.value().numel() >= 4) {
+    TORCH_CHECK(out_tree_top.value().is_cuda() && out_tree_top.value().scalar_type() == torch::kInt64);
+    tree_top_ptr = out_tree_top.value().data_ptr<int64_t>();
+    tree_top_rows = std::min(5, std::min(M, static_cast<int>(out_tree_top.value().numel() / 4)));
   }
 
   auto& sc = get_dvt_scratch(A.device());
   auto out = torch::empty({M}, A.options().dtype(torch::kInt64));
   auto st = c10::cuda::getCurrentCUDAStream().stream();
 
-  float* v2_ptr = top2_ptr ? sc.s2_vals2.data_ptr<float>() : nullptr;
-  int32_t* i2_ptr = top2_ptr ? sc.s2_ids2.data_ptr<int32_t>() : nullptr;
+  const int top2_max_rows = std::max(top2_rows, tree_top_rows);
+  float* v2_ptr = (top2_max_rows > 0) ? sc.s2_vals2.data_ptr<float>() : nullptr;
+  int32_t* i2_ptr = (top2_max_rows > 0) ? sc.s2_ids2.data_ptr<int32_t>() : nullptr;
+  float* v3_ptr = (tree_top_ptr != nullptr) ? sc.s2_vals3.data_ptr<float>() : nullptr;
+  int32_t* i3_ptr = (tree_top_ptr != nullptr) ? sc.s2_ids3.data_ptr<int32_t>() : nullptr;
+  float* v4_ptr = (tree_top_ptr != nullptr) ? sc.s2_vals4.data_ptr<float>() : nullptr;
+  int32_t* i4_ptr = (tree_top_ptr != nullptr) ? sc.s2_ids4.data_ptr<int32_t>() : nullptr;
 
   draft_vocab_tail_argmax_kernel<<<dim3(kS2CTAsPerRow, M), 256, 0, st>>>(
       reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
@@ -488,11 +640,18 @@ torch::Tensor draft_vocab_tail_argmax(
       sc.s2_ids.data_ptr<int32_t>(),
       v2_ptr,
       i2_ptr,
+      v3_ptr,
+      i3_ptr,
+      v4_ptr,
+      i4_ptr,
+      top2_max_rows,
       V_static, K, max_tail, static_cast<float>(logit_scale));
 
   draft_vocab_final_reduce_kernel<<<M, 32, 0, st>>>(
       sc.s2_vals.data_ptr<float>(), sc.s2_ids.data_ptr<int32_t>(),
-      v2_ptr, i2_ptr, out.data_ptr<int64_t>(), top2_ptr, M);
+      v2_ptr, i2_ptr, v3_ptr, i3_ptr, v4_ptr, i4_ptr,
+      out.data_ptr<int64_t>(), top2_ptr, top2_rows,
+      margin_ptr, margin_rows, tree_top_ptr, tree_top_rows, M);
   return out;
 }
 

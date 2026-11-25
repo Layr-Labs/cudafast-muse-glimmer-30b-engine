@@ -2174,7 +2174,28 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
     if (q_idx >= actual_m) return;
     q_ptr += static_cast<int64_t>(q0 + q_idx) * q_tok_stride;
     out_ptr += static_cast<int64_t>(q0 + q_idx) * out_tok_stride;
-    if (q_idx == 6 && actual_m == 7 && leaf_flag_ptr != nullptr && leaf_flag_ptr[0] != 0 && seqlen_k >= 7) {
+    if (leaf_flag_ptr != nullptr && leaf_flag_ptr[0] < 0 && actual_m <= 16 && seqlen_k >= actual_m) {
+      // Generalized 1-level tree remap table (sentinel leaf_flag_ptr[0] == -1):
+      // entry q_idx sits at [1 + 3*q_idx + {0: seq_sub, 1: dst_sub, 2: src_sub}].
+      const int base = 1 + q_idx * 3;
+      const int seq_sub = leaf_flag_ptr[base];
+      const int dst_sub = leaf_flag_ptr[base + 1];
+      const int src_sub = leaf_flag_ptr[base + 2];
+      if (dst_sub >= 0) {
+        leaf_remap_src = seqlen_k - src_sub;
+        leaf_remap_dst = seqlen_k - dst_sub;
+      }
+      seqlen_k -= seq_sub;
+    } else if (q_idx == 7 && actual_m == 8 && leaf_flag_ptr != nullptr) {
+      const int lk = leaf_flag_ptr[0];
+      if ((lk == 1 || lk == 2) && seqlen_k >= 8) {
+        leaf_remap_src = seqlen_k - 1;       // p + 7 (slot where qk_norm_rope_kvcache wrote alt's K/V)
+        leaf_remap_dst = seqlen_k - 8 + lk;  // p + lk (exact logical position of row lk)
+        seqlen_k = seqlen_k - 7 + lk;        // p + lk + 1 (0-ULP identical to row lk!)
+      } else {
+        seqlen_k -= (actual_m - 1 - q_idx);
+      }
+    } else if (q_idx == 6 && actual_m == 7 && leaf_flag_ptr != nullptr && leaf_flag_ptr[0] > 0 && seqlen_k >= 7) {
       leaf_remap_src = seqlen_k - 1;  // p + 6 (slot where qk_norm_rope_kvcache wrote alt's K/V)
       leaf_remap_dst = seqlen_k - 6;  // p + 1 (exact logical position of row 1)
       seqlen_k -= 5;                  // p + 2 (0-ULP identical to row 1!)

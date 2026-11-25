@@ -786,6 +786,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _nl
 
         alt_buf = _nl.get_alt_buf(hidden_states.device) if _nl.ENABLED else None
+        margin_buf = _nl.get_margin_buf(hidden_states.device) if _nl.ENABLED else None
+        tree_top_buf = _nl.get_tree_top_buf(hidden_states.device) if _nl.ENABLED else None
         lm_head = self.lm_head
         if (
             getattr(lm_head, "prompt_tail_admitted", False)
@@ -812,6 +814,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                     lm_head.full_global_scale,
                     logit_scale,
                     alt_buf,
+                    margin_buf,
+                    tree_top_buf,
                 )
             except TypeError:
                 return _bfx.draft_vocab_tail_argmax(
@@ -825,8 +829,24 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                     lm_head.full_global_scale,
                     logit_scale,
                 )
-        if alt_buf is not None and static_logits.dim() == 2 and static_logits.shape[0] >= 1:
-            alt_buf.copy_(vocab_map[static_logits[0].topk(2).indices])
+        if static_logits.dim() == 2 and static_logits.shape[0] >= 1:
+            if tree_top_buf is not None and tree_top_buf.numel() >= 20:
+                n_tt = min(5, static_logits.shape[0])
+                tk4 = static_logits[:n_tt].topk(4, dim=-1)
+                tree_top_buf.fill_(-1)
+                tree_top_buf[: 4 * n_tt].copy_(vocab_map[tk4.indices].reshape(-1))
+                if alt_buf is not None:
+                    n_t2 = min(2, n_tt, alt_buf.numel() // 2)
+                    alt_buf[: 2 * n_t2].copy_(vocab_map[tk4.indices[:n_t2, :2]].reshape(-1))
+                if margin_buf is not None:
+                    n_t2 = min(2, n_tt, margin_buf.numel())
+                    margin_buf[:n_t2].copy_((tk4.values[:n_t2, 0] - tk4.values[:n_t2, 1]).to(torch.float32))
+            elif alt_buf is not None:
+                n_t2 = min(2, static_logits.shape[0], alt_buf.numel() // 2)
+                tk = static_logits[:n_t2].topk(2, dim=-1)
+                alt_buf[: 2 * n_t2].copy_(vocab_map[tk.indices].reshape(-1))
+                if margin_buf is not None and margin_buf.numel() >= n_t2:
+                    margin_buf[:n_t2].copy_((tk.values[:, 0] - tk.values[:, 1]).to(torch.float32))
         return vocab_map[static_logits.argmax(dim=-1)]
 
     def compute_logits(

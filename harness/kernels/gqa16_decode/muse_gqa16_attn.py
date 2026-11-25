@@ -106,7 +106,7 @@ def get_leaf_flag(device: torch.device) -> torch.Tensor | None:
     if torch.cuda.is_current_stream_capturing():
         return None
     with torch.inference_mode(False):
-        buf = torch.zeros((1,), dtype=torch.int32, device=device)
+        buf = torch.zeros((49,), dtype=torch.int32, device=device)
     _leaf_flag_bufs[idx] = buf
     return buf
 
@@ -368,7 +368,7 @@ def self_check_verify(device: torch.device) -> bool:
 
         for cand_mode in (1, 3):
             all_match = True
-            for m_tok in (2, 4, 7, 8):
+            for m_tok in (2, 4, 7, 8, 12, 16):
                 q = (torch.randn((m_tok, 32, 128), generator=gen, device=device) * 1.1).to(torch.bfloat16).contiguous()
                 cu_q = torch.tensor([0, m_tok], dtype=torch.int32, device=device)
                 for seq_k in (518, 640):
@@ -446,11 +446,14 @@ def self_check_verify(device: torch.device) -> bool:
             perm_l = torch.randperm(nblks_l - 1, generator=gen_l, device=device, dtype=torch.int32) + 1
             bt_l = perm_l.unsqueeze(0).contiguous()
             lf_on = torch.ones((1,), dtype=torch.int32, device=device)
+            lf_k1 = torch.tensor([1], dtype=torch.int32, device=device)
+            lf_k2 = torch.tensor([2], dtype=torch.int32, device=device)
             cu_q7 = torch.tensor([0, 7], dtype=torch.int32, device=device)
+            cu_q8 = torch.tensor([0, 8], dtype=torch.int32, device=device)
             st_l = torch.cuda.current_stream(device).cuda_stream
             leaf_all = True
             for seq_k in (16, 17, 32, 33, 128, 129, 134, 520):
-                # Place identical K/V at p+1 (seq_k-6) and p+6 (seq_k-1), and identical Q at row 1 and row 6.
+                # 1) Legacy M=7: identical K/V at p+1 (seq_k-6) and p+6 (seq_k-1), Q[6] == Q[1].
                 kv_cur = kv_l.clone()
                 p1 = seq_k - 6
                 p6 = seq_k - 1
@@ -493,6 +496,112 @@ def self_check_verify(device: torch.device) -> bool:
                         break
                 if not leaf_all:
                     break
+                # 2) M=8 zero-clamp: test both lk=1 (row 7 == row 1) and lk=2 (row 7 == row 2) plus full chain got[:7] == ref[:7].
+                for lk, lf_t in ((1, lf_k1), (2, lf_k2)):
+                    kv_m8 = kv_l.clone()
+                    pk = seq_k - 8 + lk
+                    p7 = seq_k - 1
+                    bk, sk_slot = int(bt_l[0, pk // bs_l].item()), pk % bs_l
+                    b7, s7_slot = int(bt_l[0, p7 // bs_l].item()), p7 % bs_l
+                    kv_m8[b7, :, s7_slot, :].copy_(kv_m8[bk, :, sk_slot, :])
+                    k_c8, v_c8 = kv_m8.transpose(1, 2).split(128, dim=-1)
+                    q_m8 = (torch.randn((8, 32, 128), generator=gen_l, device=device) * 1.1).to(torch.bfloat16).contiguous()
+                    q_m8[7].copy_(q_m8[lk])
+                    for win in ((-1, -1), (511, 0)):
+                        ref_m8 = torch.empty((8, 32, 128), dtype=torch.bfloat16, device=device)
+                        flash_attn_varlen_func(
+                            q=q_m8, k=k_c8, v=v_c8, out=ref_m8,
+                            cu_seqlens_q=cu_q8, max_seqlen_q=8,
+                            seqused_k=sk, max_seqlen_k=8192,
+                            softmax_scale=scale_l, causal=True,
+                            window_size=win, block_table=bt_l, fa_version=2,
+                        )
+                        got_m8 = torch.zeros_like(q_m8)
+                        rc_m8 = _lib.muse_gqa16_verify_leaf(
+                            q_m8.data_ptr(), kv_m8.data_ptr(), got_m8.data_ptr(),
+                            sk.data_ptr(), bt_l.data_ptr(), cu_q8.data_ptr(),
+                            8, bs_l, win[0], 1, scale_mode | pipe_bit, scale_l,
+                            q_m8.stride(0), q_m8.stride(1), got_m8.stride(0), got_m8.stride(1),
+                            kv_m8.stride(0), kv_m8.stride(2), kv_m8.stride(1),
+                            lf_t.data_ptr(), st_l,
+                        )
+                        torch.cuda.synchronize(device)
+                        if (
+                            rc_m8 != 0
+                            or not torch.isfinite(got_m8).all()
+                            or not torch.equal(got_m8[7].view(torch.int16), got_m8[lk].view(torch.int16))
+                            or not torch.equal(got_m8[:7].view(torch.int16), ref_m8[:7].view(torch.int16))
+                        ):
+                            leaf_all = False
+                            break
+                    if not leaf_all:
+                        break
+                if not leaf_all:
+                    break
+                # 3) Generalized 1-level multi-leaf tree table mode (sentinel -1): test M=12 (5 leaves) & M=16 (9 leaves).
+                for tree_m, leaf_ks in (
+                    (12, (1, 1, 2, 2, 3)),
+                    (16, (1, 1, 2, 2, 3, 1, 2, 4, 5)),
+                ):
+                    if seq_k < tree_m:
+                        continue
+                    kv_t = kv_l.clone()
+                    q_t = (torch.randn((tree_m, 32, 128), generator=gen_l, device=device) * 1.1).to(torch.bfloat16).contiguous()
+                    tbl = [-1] + [0] * 48
+                    for q_i in range(7):
+                        tbl[1 + 3 * q_i] = tree_m - 1 - q_i
+                        tbl[1 + 3 * q_i + 1] = -1
+                        tbl[1 + 3 * q_i + 2] = -1
+                    for li, lk in enumerate(leaf_ks):
+                        r_row = 7 + li
+                        pk = seq_k - tree_m + lk
+                        pr = seq_k - tree_m + r_row
+                        bk, sk_slot = int(bt_l[0, pk // bs_l].item()), pk % bs_l
+                        br, sr_slot = int(bt_l[0, pr // bs_l].item()), pr % bs_l
+                        kv_t[br, :, sr_slot, :].copy_(kv_t[bk, :, sk_slot, :])
+                        q_t[r_row].copy_(q_t[lk])
+                        tbl[1 + 3 * r_row] = tree_m - (lk + 1)
+                        tbl[1 + 3 * r_row + 1] = tree_m - lk
+                        tbl[1 + 3 * r_row + 2] = tree_m - r_row
+                    lf_tbl = torch.tensor(tbl, dtype=torch.int32, device=device)
+                    cu_qt = torch.tensor([0, tree_m], dtype=torch.int32, device=device)
+                    k_ct, v_ct = kv_t.transpose(1, 2).split(128, dim=-1)
+                    for win in ((-1, -1), (511, 0)):
+                        ref_t = torch.empty((tree_m, 32, 128), dtype=torch.bfloat16, device=device)
+                        flash_attn_varlen_func(
+                            q=q_t, k=k_ct, v=v_ct, out=ref_t,
+                            cu_seqlens_q=cu_qt, max_seqlen_q=tree_m,
+                            seqused_k=sk, max_seqlen_k=8192,
+                            softmax_scale=scale_l, causal=True,
+                            window_size=win, block_table=bt_l, fa_version=2,
+                        )
+                        got_t = torch.zeros_like(q_t)
+                        rc_t = _lib.muse_gqa16_verify_leaf(
+                            q_t.data_ptr(), kv_t.data_ptr(), got_t.data_ptr(),
+                            sk.data_ptr(), bt_l.data_ptr(), cu_qt.data_ptr(),
+                            tree_m, bs_l, win[0], 1, scale_mode | pipe_bit, scale_l,
+                            q_t.stride(0), q_t.stride(1), got_t.stride(0), got_t.stride(1),
+                            kv_t.stride(0), kv_t.stride(2), kv_t.stride(1),
+                            lf_tbl.data_ptr(), st_l,
+                        )
+                        torch.cuda.synchronize(device)
+                        if (
+                            rc_t != 0
+                            or not torch.isfinite(got_t).all()
+                            or not torch.equal(got_t[:7].view(torch.int16), ref_t[:7].view(torch.int16))
+                        ):
+                            leaf_all = False
+                            break
+                        for li, lk in enumerate(leaf_ks):
+                            if not torch.equal(got_t[7 + li].view(torch.int16), got_t[lk].view(torch.int16)):
+                                leaf_all = False
+                                break
+                        if not leaf_all:
+                            break
+                    if not leaf_all:
+                        break
+                if not leaf_all:
+                    break
             leaf_ok = leaf_all
         except Exception:  # noqa: BLE001
             logger.warning("muse_gqa16_attn: native 1-leaf verify self-check raised on cuda:%d", idx, exc_info=True)
@@ -500,7 +609,7 @@ def self_check_verify(device: torch.device) -> bool:
     _leaf_verify_admitted[idx] = leaf_ok
     if ok:
         logger.info(
-            "muse_gqa16_attn: strict 0-ULP verify (M=2..8) admitted on cuda:%d (grid_splits=%d, pipe=%d, scale_mode=%d, native_leaf=%d)",
+            "muse_gqa16_attn: strict 0-ULP verify (M=2..16) admitted on cuda:%d (grid_splits=%d, pipe=%d, scale_mode=%d, native_leaf=%d)",
             idx, g_splits, int(VERIFY_PIPE), scale_mode, int(leaf_ok),
         )
     else:
@@ -522,7 +631,7 @@ def try_verify_gqa16(
 ) -> bool:
     if not VERIFY_ENABLED or _lib is None or not hasattr(_lib, "muse_gqa16_verify"):
         return False
-    if num_actual_tokens < 2 or num_actual_tokens > 8 or max_num_splits not in (0, 1):
+    if num_actual_tokens < 2 or num_actual_tokens > 16 or max_num_splits not in (0, 1):
         return False
     device = query.device
     idx = device.index if device.index is not None else torch.cuda.current_device()
@@ -577,7 +686,7 @@ def try_verify_gqa16(
     if (
         NATIVE_LEAF_ENABLED
         and g_splits == 1
-        and 7 <= num_actual_tokens <= 8
+        and 7 <= num_actual_tokens <= 16
         and _leaf_verify_admitted.get(idx, False)
         and hasattr(_lib, "muse_gqa16_verify_leaf")
     ):

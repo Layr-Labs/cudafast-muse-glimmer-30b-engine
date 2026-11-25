@@ -107,26 +107,54 @@ torch::Tensor draft_vocab_tail_argmax(
     torch::Tensor A, torch::Tensor static_logits, torch::Tensor vocab_map,
     torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor raw_w,
     torch::Tensor raw_s, torch::Tensor global_scale, double logit_scale,
-    c10::optional<torch::Tensor> out_top2_row0 = c10::nullopt);
+    c10::optional<torch::Tensor> out_top2_row0 = c10::nullopt,
+    c10::optional<torch::Tensor> out_margins = c10::nullopt,
+    c10::optional<torch::Tensor> out_tree_top = c10::nullopt);
 torch::Tensor draft_vocab_score_rows(
     torch::Tensor A, torch::Tensor row_ids, torch::Tensor raw_w,
     torch::Tensor raw_s, torch::Tensor global_scale, double logit_scale);
+void native_leaf_prepare_m8(
+    torch::Tensor positions, torch::Tensor seq_lens);
+void native_leaf_prepare_tree(
+    torch::Tensor positions, torch::Tensor seq_lens, int64_t tree_m);
+void native_leaf_setup_tree(
+    torch::Tensor leaf_flag, torch::Tensor tree_top,
+    torch::Tensor input_ids, torch::Tensor positions,
+    torch::Tensor saved_leaf_toks, torch::Tensor saved_leaf_k,
+    int64_t tree_m = 12, int64_t selftest_mode = 0,
+    c10::optional<torch::Tensor> req_acc_state = c10::nullopt);
+void native_leaf_commit_tree(
+    torch::Tensor leaf_flag, torch::Tensor prev_ns,
+    torch::Tensor hit_flag, torch::Tensor hit_src_row,
+    torch::Tensor saved_leaf_toks, torch::Tensor saved_leaf_k,
+    torch::Tensor leaf_u_toks, torch::Tensor sampled_tokens,
+    torch::Tensor num_sampled, torch::Tensor num_rejected,
+    int64_t tree_m = 12,
+    c10::optional<torch::Tensor> stats = c10::nullopt, bool no_hit_mode = false,
+    c10::optional<torch::Tensor> req_acc_state = c10::nullopt);
 void native_leaf_setup(
     torch::Tensor leaf_flag, torch::Tensor prev_ns, torch::Tensor alt_ids,
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor saved_alt_tok,
-    int64_t low_thresh, bool selftest_mode);
+    int64_t low_thresh = 3, int64_t selftest_mode = 0,
+    c10::optional<torch::Tensor> alt_margins = c10::nullopt,
+    c10::optional<torch::Tensor> req_acc_state = c10::nullopt,
+    bool m8_mode = false, int64_t policy = 0, double margin_alpha = 1.0);
 void native_leaf_commit(
     torch::Tensor leaf_flag, torch::Tensor prev_ns, torch::Tensor hit_flag,
     torch::Tensor saved_alt_tok, torch::Tensor leaf_u_tok, torch::Tensor sampled_tokens,
     torch::Tensor num_sampled, torch::Tensor num_rejected,
-    c10::optional<torch::Tensor> stats, bool no_hit_mode);
+    c10::optional<torch::Tensor> stats = c10::nullopt, bool no_hit_mode = false,
+    c10::optional<torch::Tensor> req_acc_state = c10::nullopt, bool m8_mode = false);
 void native_leaf_fix_hidden(
     torch::Tensor hit_flag, torch::Tensor tensor_ptrs,
-    int64_t row_stride_bytes, int64_t copy_bytes);
+    int64_t row_stride_bytes, int64_t copy_bytes, int64_t src_row = 6,
+    c10::optional<torch::Tensor> src_row_buf = c10::nullopt);
 void native_leaf_fix_kv(
     torch::Tensor hit_flag, torch::Tensor slot_mappings,
     torch::Tensor kv_ptrs, torch::Tensor stride_block, torch::Tensor stride_head,
-    torch::Tensor stride_slot, torch::Tensor block_size, torch::Tensor layer_gid);
+    torch::Tensor stride_slot, torch::Tensor block_size, torch::Tensor layer_gid,
+    int64_t src_row = 6,
+    c10::optional<torch::Tensor> src_row_buf = c10::nullopt);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm", &bfx_gemm);
@@ -142,19 +170,54 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("A"), pybind11::arg("static_logits"), pybind11::arg("vocab_map"),
         pybind11::arg("tail_ids"), pybind11::arg("tail_count"), pybind11::arg("raw_w"),
         pybind11::arg("raw_s"), pybind11::arg("global_scale"), pybind11::arg("logit_scale") = 1.0,
-        pybind11::arg("out_top2_row0") = c10::nullopt);
+        pybind11::arg("out_top2_row0") = c10::nullopt,
+        pybind11::arg("out_margins") = c10::nullopt,
+        pybind11::arg("out_tree_top") = c10::nullopt);
   m.def("draft_vocab_score_rows", &draft_vocab_score_rows,
         pybind11::arg("A"), pybind11::arg("row_ids"), pybind11::arg("raw_w"),
         pybind11::arg("raw_s"), pybind11::arg("global_scale"), pybind11::arg("logit_scale") = 1.0);
+  m.def("native_leaf_prepare_m8", &native_leaf_prepare_m8);
+  m.def("native_leaf_prepare_tree", &native_leaf_prepare_tree,
+        pybind11::arg("positions"), pybind11::arg("seq_lens"), pybind11::arg("tree_m") = 12);
+  m.def("native_leaf_setup_tree", &native_leaf_setup_tree,
+        pybind11::arg("leaf_flag"), pybind11::arg("tree_top"),
+        pybind11::arg("input_ids"), pybind11::arg("positions"),
+        pybind11::arg("saved_leaf_toks"), pybind11::arg("saved_leaf_k"),
+        pybind11::arg("tree_m") = 12, pybind11::arg("selftest_mode") = 0,
+        pybind11::arg("req_acc_state") = c10::nullopt);
+  m.def("native_leaf_commit_tree", &native_leaf_commit_tree,
+        pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"),
+        pybind11::arg("hit_flag"), pybind11::arg("hit_src_row"),
+        pybind11::arg("saved_leaf_toks"), pybind11::arg("saved_leaf_k"),
+        pybind11::arg("leaf_u_toks"), pybind11::arg("sampled_tokens"),
+        pybind11::arg("num_sampled"), pybind11::arg("num_rejected"),
+        pybind11::arg("tree_m") = 12,
+        pybind11::arg("stats") = c10::nullopt, pybind11::arg("no_hit_mode") = false,
+        pybind11::arg("req_acc_state") = c10::nullopt);
   m.def("native_leaf_setup", &native_leaf_setup,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"), pybind11::arg("alt_ids"),
         pybind11::arg("input_ids"), pybind11::arg("positions"), pybind11::arg("saved_alt_tok"),
-        pybind11::arg("low_thresh") = 3, pybind11::arg("selftest_mode") = false);
+        pybind11::arg("low_thresh") = 3, pybind11::arg("selftest_mode") = 0,
+        pybind11::arg("alt_margins") = c10::nullopt,
+        pybind11::arg("req_acc_state") = c10::nullopt,
+        pybind11::arg("m8_mode") = false,
+        pybind11::arg("policy") = 0,
+        pybind11::arg("margin_alpha") = 1.0);
   m.def("native_leaf_commit", &native_leaf_commit,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"), pybind11::arg("hit_flag"),
         pybind11::arg("saved_alt_tok"), pybind11::arg("leaf_u_tok"), pybind11::arg("sampled_tokens"),
         pybind11::arg("num_sampled"), pybind11::arg("num_rejected"),
-        pybind11::arg("stats") = c10::nullopt, pybind11::arg("no_hit_mode") = false);
-  m.def("native_leaf_fix_hidden", &native_leaf_fix_hidden);
-  m.def("native_leaf_fix_kv", &native_leaf_fix_kv);
+        pybind11::arg("stats") = c10::nullopt, pybind11::arg("no_hit_mode") = false,
+        pybind11::arg("req_acc_state") = c10::nullopt, pybind11::arg("m8_mode") = false);
+  m.def("native_leaf_fix_hidden", &native_leaf_fix_hidden,
+        pybind11::arg("hit_flag"), pybind11::arg("tensor_ptrs"),
+        pybind11::arg("row_stride_bytes"), pybind11::arg("copy_bytes"),
+        pybind11::arg("src_row") = 6,
+        pybind11::arg("src_row_buf") = c10::nullopt);
+  m.def("native_leaf_fix_kv", &native_leaf_fix_kv,
+        pybind11::arg("hit_flag"), pybind11::arg("slot_mappings"),
+        pybind11::arg("kv_ptrs"), pybind11::arg("stride_block"), pybind11::arg("stride_head"),
+        pybind11::arg("stride_slot"), pybind11::arg("block_size"), pybind11::arg("layer_gid"),
+        pybind11::arg("src_row") = 6,
+        pybind11::arg("src_row_buf") = c10::nullopt);
 }

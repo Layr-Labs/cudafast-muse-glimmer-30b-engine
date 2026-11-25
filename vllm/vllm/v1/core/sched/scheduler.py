@@ -271,7 +271,30 @@ class Scheduler(SchedulerInterface):
                 # DFlash requires an extra lookahead slot since it uses in-fill-style
                 # decoding instead of standard next-token sampling, so it has a query
                 # for the last sampled token plus queries for each draft token.
-                self.num_lookahead_tokens = self.num_spec_tokens + 1
+                # When native multi-leaf tree (M=12/16) or M=8 zero-clamp 1-leaf verify
+                # is active at depth=6, reserve extra KV lookahead slots so rows 7..M-1
+                # are always backed in the request's block table.
+                import os as _os
+
+                _extra_leaf_slots = 0
+                if (
+                    self.num_spec_tokens == 6
+                    and _os.environ.get("MUSE_NATIVE_LEAF", "1").strip()
+                    not in ("0", "", "false", "no")
+                ):
+                    try:
+                        _tm = int(_os.environ.get("MUSE_NATIVE_TREE_M", "12").strip() or "0")
+                    except ValueError:
+                        _tm = 0
+                    if _tm in (12, 16):
+                        _extra_leaf_slots = _tm - 7
+                    elif _os.environ.get("MUSE_NATIVE_LEAF_M8", "1").strip() not in (
+                        "0", "", "false", "no"
+                    ):
+                        _extra_leaf_slots = 1
+                self.num_lookahead_tokens = (
+                    self.num_spec_tokens + 1 + _extra_leaf_slots
+                )
             if speculative_config.use_dspark():
                 # DSpark drafts a block of num_spec_tokens query tokens in which the
                 # anchor itself is the first prediction position (no separate bonus

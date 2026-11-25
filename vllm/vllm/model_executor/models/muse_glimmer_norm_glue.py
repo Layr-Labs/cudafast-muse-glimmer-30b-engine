@@ -105,7 +105,7 @@ def consume_oproj_sigmoid(
     _pending_oproj_sigmoid = None
     import muse_marlin6_gemv as _m6
 
-    is_m = x.ndim == 2 and 1 < x.shape[0] <= 8 and x.shape[1] == _m6.OPROJ_K
+    is_m = x.ndim == 2 and 1 < x.shape[0] <= 16 and x.shape[1] == _m6.OPROJ_K
     allowed = _m6._GATED_OPROJ_M if is_m else _m6._GATED_OPROJ
     if x.data_ptr() != ptr or gs_ptr not in allowed or gate.numel() != x.numel() or attn.numel() != x.numel():
         if skipped:
@@ -394,7 +394,7 @@ class _MulSigmoidSwap:
                         return None
             except Exception:
                 _oproj_fuse_state = "rejected"
-        elif _OPROJ_SIGMOID_FUSE_M and _oproj_fuse_m_state != "rejected" and 8192 <= n_el <= 8 * 4096:
+        elif _OPROJ_SIGMOID_FUSE_M and _oproj_fuse_m_state != "rejected" and 8192 <= n_el <= 16 * 4096:
             try:
                 import muse_marlin6_gemv as _m6
                 if getattr(_m6, "_ALL_OPROJ_GATED_M_READY", False):
@@ -429,7 +429,7 @@ class _MulSiluSliceSwap:
                     n_sw = int(numel_t)
                 except Exception:
                     n_sw = -1
-                if n_sw > 0 and n_sw % 19968 == 0 and (n_sw // 19968) <= 8 and gu_t.data_ptr() == gu_ptr:
+                if n_sw > 0 and n_sw % 19968 == 0 and (n_sw // 19968) <= 16 and gu_t.data_ptr() == gu_ptr:
                     m_rows = n_sw // 19968
                     if fused_launched:
                         if m_rows == 1:

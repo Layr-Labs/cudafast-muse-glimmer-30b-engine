@@ -77,6 +77,20 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
         try:
             blob = _rans.rans_pack(w.t().contiguous().view(torch.uint8))
             if _self_check(lambda xq, out: _rans.rans_gemv_auto(blob, xq.view(-1), ws.reshape(-1), xs.reshape(-1), out, n, k), w, ws, xs):
+                if _RANS_M and _stats["rans"] == 0:
+                    gen12 = torch.Generator(device=w.device).manual_seed(n * 137 + k + 19)
+                    x12 = (torch.randn(12, k, generator=gen12, device=w.device) * 1.5 / xs.float().reshape(1, 1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+                    got12 = torch.empty(12, n, dtype=torch.bfloat16, device=w.device)
+                    ref_lo = torch.empty(8, n, dtype=torch.bfloat16, device=w.device)
+                    ref_hi = torch.empty(4, n, dtype=torch.bfloat16, device=w.device)
+                    _rans.rans_gemm_m_auto(blob, x12, ws.reshape(-1), xs.reshape(-1), got12, n, k)
+                    _rans.rans_gemm_m_auto(blob, x12[:8].contiguous(), ws.reshape(-1), xs.reshape(-1), ref_lo, n, k)
+                    _rans.rans_gemm_m_auto(blob, x12[8:].contiguous(), ws.reshape(-1), xs.reshape(-1), ref_hi, n, k)
+                    if not (
+                        torch.equal(got12[:8].view(torch.int16), ref_lo.view(torch.int16))
+                        and torch.equal(got12[8:].view(torch.int16), ref_hi.view(torch.int16))
+                    ):
+                        raise RuntimeError("muserans kM16 self-check mismatch")
                 _stats["admitted"] += 1
                 _stats["rans"] += 1
                 # The magic byte 'A' at blob[0] marks the compressed format for the op (one uint8 buffer either way).
@@ -149,7 +163,7 @@ def _muse_fp8_scaled_mm(
             _rans.rans_gemv_auto(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
         return out
     if (
-        1 < A.shape[0] <= 8
+        1 < A.shape[0] <= 16
         and _RANS_M
         and packed.numel() > 0
         and packed.numel() != n * k
