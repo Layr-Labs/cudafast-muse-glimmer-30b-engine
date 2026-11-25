@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -406,9 +407,13 @@ struct BrProb {
   const uint32_t* lut;
   const uint16_t* x;
   __nv_bfloat16* out;
+  __nv_bfloat16* out2;
   int M;
   int N;
   int K;
+  int N1;
+  int N2;
+  int nb_split;
   int tw;
   int pdl_mode;
   uint32_t base_m1;
@@ -781,16 +786,20 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
         }
       }
       if (do_nb && valid_m) {
+        const bool is_out2 = (pb.out2 != nullptr && nb >= pb.nb_split);
+        __nv_bfloat16* const dst_out = is_out2 ? pb.out2 : pb.out;
+        const int dst_N = (pb.out2 != nullptr) ? (is_out2 ? pb.N2 : pb.N1) : pb.N;
+        const int dst_nb = is_out2 ? (nb - pb.nb_split) : nb;
         __nv_bfloat162 r;
         r.x = __float2bfloat16_rn(c0);
         r.y = __float2bfloat16_rn(c1);
-        *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * pb.N + nb * 8 + 2 * t) = r;
+        *reinterpret_cast<__nv_bfloat162*>(dst_out + static_cast<size_t>(g) * dst_N + dst_nb * 8 + 2 * t) = r;
         if constexpr (kM16) {
           if (valid_m_hi) {
             __nv_bfloat162 r2;
             r2.x = __float2bfloat16_rn(c2);
             r2.y = __float2bfloat16_rn(c3);
-            *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * pb.N + nb * 8 + 2 * t) = r2;
+            *reinterpret_cast<__nv_bfloat162*>(dst_out + static_cast<size_t>(g + 8) * dst_N + dst_nb * 8 + 2 * t) = r2;
           }
         }
       }
@@ -911,16 +920,20 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       }
     }
     if (valid_m) {
+      const bool is_out2 = (pb.out2 != nullptr && nb >= pb.nb_split);
+      __nv_bfloat16* const dst_out = is_out2 ? pb.out2 : pb.out;
+      const int dst_N = (pb.out2 != nullptr) ? (is_out2 ? pb.N2 : pb.N1) : pb.N;
+      const int dst_nb = is_out2 ? (nb - pb.nb_split) : nb;
       __nv_bfloat162 r;
       r.x = __float2bfloat16_rn(c0);
       r.y = __float2bfloat16_rn(c1);
-      *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * pb.N + nb * 8 + 2 * t) = r;
+      *reinterpret_cast<__nv_bfloat162*>(dst_out + static_cast<size_t>(g) * dst_N + dst_nb * 8 + 2 * t) = r;
       if constexpr (kM16) {
         if (valid_m_hi) {
           __nv_bfloat162 r2;
           r2.x = __float2bfloat16_rn(c2);
           r2.y = __float2bfloat16_rn(c3);
-          *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * pb.N + nb * 8 + 2 * t) = r2;
+          *reinterpret_cast<__nv_bfloat162*>(dst_out + static_cast<size_t>(g + 8) * dst_N + dst_nb * 8 + 2 * t) = r2;
         }
       }
     }
@@ -950,6 +963,7 @@ static BrCfg br_pick_cfg(int N, int K) {
   if (NB == 4992) return BrCfg{624, 48, 13};   // gate_up (39936): exact R=8 chunks/warp
   if (NB == 768)  return BrCfg{768, 48, 16};   // qkv (6144): exact R=1
   if (NB == 1280) return BrCfg{640, 48, 14};   // fkv (10240): exact R=2
+  if (NB == 1088) return BrCfg{544, 48, 12};   // stacked target qkv+output_gate (8704): exact R=2, 48 SMs
   if (NB == 832)  return BrCfg{832, 48, 18};   // o_proj / down / fc (6656)
   if (NB == 576)  return BrCfg{576, 48, 12};   // target qkv (4608)
   if (NB == 512) {
@@ -1191,14 +1205,15 @@ torch::Tensor bf16_rans_unpack(torch::Tensor blob, int64_t N, int64_t K) {
   return out;
 }
 
-static void bf16_rans_gemm_into(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp) {
+static void bf16_rans_gemm_launch(
+    torch::Tensor x, torch::Tensor blob,
+    __nv_bfloat16* out1_ptr, __nv_bfloat16* out2_ptr,
+    int64_t N, int64_t N1, int64_t N2, int64_t K, int64_t base_exp) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(),
               "x must be contiguous CUDA bf16 [M, K]");
   const int M = static_cast<int>(x.size(0));
   TORCH_CHECK(M >= 1 && M <= 16 && x.size(1) == K && N % 8 == 0 && K % 32 == 0, "bad shape");
   TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "bad blob");
-  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == M * N,
-              "bad out");
 
   const BrCfg cfg = br_pick_cfg(static_cast<int>(N), static_cast<int>(K));
   const size_t soff = br_stream_off(cfg.tw);
@@ -1211,10 +1226,14 @@ static void bf16_rans_gemm_into(torch::Tensor x, torch::Tensor blob, torch::Tens
   pb.woff16 = reinterpret_cast<const int*>(b + br_woff_off());
   pb.lut = reinterpret_cast<const uint32_t*>(b + kHdrBytes);
   pb.x = reinterpret_cast<const uint16_t*>(x.data_ptr());
-  pb.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  pb.out = out1_ptr;
+  pb.out2 = out2_ptr;
   pb.M = M;
   pb.N = static_cast<int>(N);
   pb.K = static_cast<int>(K);
+  pb.N1 = static_cast<int>(N1);
+  pb.N2 = static_cast<int>(N2);
+  pb.nb_split = static_cast<int>(N1 >> 3);
   pb.tw = cfg.tw;
   const int pdl_cfg = br_pdl_cfg();
   pb.pdl_mode = (pdl_cfg == 2) ? 3 : ((pdl_cfg == 1) ? 1 : 0);
@@ -1222,7 +1241,7 @@ static void bf16_rans_gemm_into(torch::Tensor x, torch::Tensor blob, torch::Tens
   pb.stream_bytes = (blob_bytes > soff + 64u) ? (blob_bytes - soff - 64u) : 0u;
   pb.tpf_stride = br_tpf_stride();
 
-  TORCH_CHECK(cfg.wpb <= 20, "bf16_rans_gemm_into: wpb exceeds launch bounds (20)");
+  TORCH_CHECK(cfg.wpb <= 20, "bf16_rans_gemm_launch: wpb exceeds launch bounds (20)");
   size_t dsmem = kRB + static_cast<size_t>(cfg.wpb) * kRB;
   if (cfg.blocks == 48 && dsmem < 40960u) dsmem = 40960u;
   const size_t dsmem_xsmem = kBrXsmemBytes + kRB + static_cast<size_t>(cfg.wpb) * kRB;
@@ -1261,6 +1280,13 @@ static void bf16_rans_gemm_into(torch::Tensor x, torch::Tensor blob, torch::Tens
   }
 }
 
+static void bf16_rans_gemm_into(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp) {
+  const int64_t M = x.size(0);
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == M * N,
+              "bad out");
+  bf16_rans_gemm_launch(x, blob, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nullptr, N, N, 0, K, base_exp);
+}
+
 torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int64_t K, int64_t base_exp) {
   auto out = torch::empty({x.size(0), N}, x.options());
   bf16_rans_gemm_into(x, blob, out, N, K, base_exp);
@@ -1269,6 +1295,30 @@ torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int
 
 void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp) {
   bf16_rans_gemm_into(x, blob, out, N, K, base_exp);
+}
+
+void bf16_rans_gemm_dual_out(
+    torch::Tensor x, torch::Tensor blob, torch::Tensor out1, torch::Tensor out2,
+    int64_t N1, int64_t N2, int64_t K, int64_t base_exp) {
+  const int64_t M = x.size(0);
+  TORCH_CHECK(N1 > 0 && N2 > 0 && N1 % 8 == 0 && N2 % 8 == 0, "bad dual N split");
+  TORCH_CHECK(out1.is_cuda() && out1.scalar_type() == torch::kBFloat16 && out1.is_contiguous() &&
+              out1.numel() == M * N1, "bad out1");
+  TORCH_CHECK(out2.is_cuda() && out2.scalar_type() == torch::kBFloat16 && out2.is_contiguous() &&
+              out2.numel() == M * N2, "bad out2");
+  bf16_rans_gemm_launch(
+      x, blob,
+      reinterpret_cast<__nv_bfloat16*>(out1.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(out2.data_ptr()),
+      N1 + N2, N1, N2, K, base_exp);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> bf16_rans_gemm_dual(
+    torch::Tensor x, torch::Tensor blob, int64_t N1, int64_t N2, int64_t K, int64_t base_exp) {
+  auto out1 = torch::empty({x.size(0), N1}, x.options());
+  auto out2 = torch::empty({x.size(0), N2}, x.options());
+  bf16_rans_gemm_dual_out(x, blob, out1, out2, N1, N2, K, base_exp);
+  return std::make_tuple(out1, out2);
 }
 
 int64_t bf16_rans_base(torch::Tensor blob) {

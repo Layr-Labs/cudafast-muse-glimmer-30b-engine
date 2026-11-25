@@ -80,15 +80,15 @@ __device__ __forceinline__ void apply_rmsnorm_rope_hd128(
       s2 = __bfloat162float(sb[2]); s3 = __bfloat162float(sb[3]);
     }
     if (lane < 16) {
-      o0 = __fmaf_rn(y0, c0, -__fmul_rn(p0, s0));
-      o1 = __fmaf_rn(y1, c1, -__fmul_rn(p1, s1));
-      o2 = __fmaf_rn(y2, c2, -__fmul_rn(p2, s2));
-      o3 = __fmaf_rn(y3, c3, -__fmul_rn(p3, s3));
+      o0 = __fsub_rn(__fmul_rn(y0, c0), __fmul_rn(p0, s0));
+      o1 = __fsub_rn(__fmul_rn(y1, c1), __fmul_rn(p1, s1));
+      o2 = __fsub_rn(__fmul_rn(y2, c2), __fmul_rn(p2, s2));
+      o3 = __fsub_rn(__fmul_rn(y3, c3), __fmul_rn(p3, s3));
     } else {
-      o0 = __fmaf_rn(y0, c0, __fmul_rn(p0, s0));
-      o1 = __fmaf_rn(y1, c1, __fmul_rn(p1, s1));
-      o2 = __fmaf_rn(y2, c2, __fmul_rn(p2, s2));
-      o3 = __fmaf_rn(y3, c3, __fmul_rn(p3, s3));
+      o0 = __fadd_rn(__fmul_rn(y0, c0), __fmul_rn(p0, s0));
+      o1 = __fadd_rn(__fmul_rn(y1, c1), __fmul_rn(p1, s1));
+      o2 = __fadd_rn(__fmul_rn(y2, c2), __fmul_rn(p2, s2));
+      o3 = __fadd_rn(__fmul_rn(y3, c3), __fmul_rn(p3, s3));
     }
   } else {
     const int d_lo = lane * 2;
@@ -102,10 +102,10 @@ __device__ __forceinline__ void apply_rmsnorm_rope_hd128(
       c0 = __bfloat162float(row[d_lo + 0]); c1 = __bfloat162float(row[d_lo + 1]);
       s0 = __bfloat162float(row[64 + d_lo + 0]); s1 = __bfloat162float(row[64 + d_lo + 1]);
     }
-    o0 = __fmaf_rn(y0, c0, -__fmul_rn(y1, s0));
-    o1 = __fmaf_rn(y1, c0,  __fmul_rn(y0, s0));
-    o2 = __fmaf_rn(y2, c1, -__fmul_rn(y3, s1));
-    o3 = __fmaf_rn(y3, c1,  __fmul_rn(y2, s1));
+    o0 = __fsub_rn(__fmul_rn(y0, c0), __fmul_rn(y1, s0));
+    o1 = __fadd_rn(__fmul_rn(y1, c0), __fmul_rn(y0, s0));
+    o2 = __fsub_rn(__fmul_rn(y2, c1), __fmul_rn(y3, s1));
+    o3 = __fadd_rn(__fmul_rn(y3, c1), __fmul_rn(y2, s1));
   }
 
   __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(&out_v);
