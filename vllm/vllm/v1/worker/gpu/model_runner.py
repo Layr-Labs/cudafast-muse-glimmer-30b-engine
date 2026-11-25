@@ -2498,31 +2498,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         if self.speculator is not None:
-            assert self.sampler is not None
-            # Let the target override the hidden state fed to the drafter
-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
-            # target returns a persistent buffer sized at max_num_batched_tokens;
-            # slice to the active token count that propose() expects.
-            spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            draft_tokens = self.speculator.propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings_by_layer,
-                spec_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                self.req_states.last_sampled_tokens,
-                self.req_states.next_prefill_tokens,
-                self.sampler.sampling_states.temperature.gpu,
-                self.sampler.sampling_states.seeds.gpu,
-                mm_inputs=mm_inputs,
+            req_ids = input_batch.req_ids
+            idx_np = input_batch.idx_mapping_np
+            skip_draft = len(req_ids) > 0 and all(
+                int(self.req_states.max_seq_len[idx_np[i]])
+                <= int(self.req_states.prompt_len.np[idx_np[i]]) + 1
+                for i in range(len(req_ids))
             )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-
+            if not skip_draft:
+                assert self.sampler is not None
+                # Let the target override the hidden state fed to the drafter
+                # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
+                # target returns a persistent buffer sized at max_num_batched_tokens;
+                # slice to the active token count that propose() expects.
+                spec_hidden_states = hidden_states
+                if hasattr(self.model, "get_mtp_target_hidden_states"):
+                    pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                draft_tokens = self.speculator.propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings_by_layer,
+                    spec_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    self.req_states.last_sampled_tokens,
+                    self.req_states.next_prefill_tokens,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    mm_inputs=mm_inputs,
+                )
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
