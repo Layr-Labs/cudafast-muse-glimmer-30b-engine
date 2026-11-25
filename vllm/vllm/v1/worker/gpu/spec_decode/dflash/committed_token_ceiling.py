@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 REFERENCE_SERIAL_MS_PER_TOKEN = 85.5
 REFERENCE_MAX_DECODE_GAIN = 4.86
-TARGET_MS_PER_COMMITTED_TOKEN = 17.6
+TARGET_MS_PER_COMMITTED_TOKEN = 17.25
 
 # The estimator starts at the measured S3 neighborhood and adapts downward
 # quickly.  Upward changes are intentionally slower: overestimating round time
