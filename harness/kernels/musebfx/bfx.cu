@@ -82,14 +82,14 @@ __global__ void __launch_bounds__(256) bfx_kernel(const __nv_bfloat16* __restric
 torch::Tensor bfx_gemm(torch::Tensor x, torch::Tensor lo, torch::Tensor nib, torch::Tensor base, torch::Tensor rowptr,
                        torch::Tensor ecol, torch::Tensor eval) {
   const int M = x.size(0), K = x.size(1), N = lo.size(0);
-  TORCH_CHECK(M >= 1 && M <= 8 && K % CH == 0 && lo.size(1) == K && x.is_contiguous() && x.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(M >= 1 && M <= 16 && K % CH == 0 && lo.size(1) == K && x.is_contiguous() && x.scalar_type() == torch::kBFloat16);
   auto out = torch::empty({M, N}, x.options());
   dim3 grid((N + WARPS * RPW - 1) / (WARPS * RPW));
   auto st = c10::cuda::getCurrentCUDAStream().stream();
 #define L_(MM) case MM: bfx_kernel<MM><<<grid, 256, 0, st>>>((const __nv_bfloat16*)x.data_ptr(), lo.data_ptr<uint8_t>(), \
     nib.data_ptr<uint8_t>(), base.data_ptr<int>(), rowptr.data_ptr<int>(), ecol.data_ptr<int>(), \
     (const __nv_bfloat16*)eval.data_ptr(), (__nv_bfloat16*)out.data_ptr(), N, K); break;
-  switch (M) { L_(1) L_(2) L_(3) L_(4) L_(5) L_(6) L_(7) L_(8) }
+  switch (M) { L_(1) L_(2) L_(3) L_(4) L_(5) L_(6) L_(7) L_(8) L_(9) L_(10) L_(11) L_(12) L_(13) L_(14) L_(15) L_(16) }
 #undef L_
   return out;
 }
@@ -98,16 +98,64 @@ torch::Tensor bf16_rans_pack(torch::Tensor W);
 torch::Tensor bf16_rans_unpack(torch::Tensor blob, int64_t N, int64_t K);
 torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int64_t K, int64_t base_exp);
 void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp);
+void bf16_rans_gemm_dual(
+    torch::Tensor x, torch::Tensor blob, torch::Tensor out0, torch::Tensor out1,
+    int64_t N0, int64_t N1, int64_t K, int64_t base_exp);
 int64_t bf16_rans_base(torch::Tensor blob);
 torch::Tensor int3_pack(torch::Tensor W, bool mse_opt = true);
+torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true);
 torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+void int3_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K);
+torch::Tensor int3_swiglu_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t H, int64_t K);
+void int3_swiglu_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t H, int64_t K);
+void int3_gemm_aux5_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K_each);
+void int3_gemm_aux5_rmsnorm_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor norm_weight, torch::Tensor C, int64_t N, int64_t K_each, double eps);
+torch::Tensor int4_pack(torch::Tensor W, bool mse_opt = true);
+torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+void int4_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K);
+void int4_gemm_aux5_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K_each);
+void int4_gemm_aux5_rmsnorm_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor norm_weight, torch::Tensor C, int64_t N, int64_t K_each, double eps);
 void dflash_kv_post(
-    torch::Tensor all_kv_flat, torch::Tensor positions, torch::Tensor k_norm_w,
-    torch::Tensor cos_sin_cache,
-    const std::vector<torch::Tensor>& k_caches,
-    const std::vector<torch::Tensor>& v_caches,
-    const std::vector<torch::Tensor>& slot_mappings,
-    int64_t nkv, int64_t block_size, double eps, bool is_neox);
+    torch::Tensor all_kv_flat, torch::Tensor k_norm_weights, torch::Tensor cos_sin_cache,
+    torch::Tensor positions, c10::optional<torch::Tensor> slot_mapping,
+    const std::vector<int64_t>& kv_ptrs, int64_t block_size,
+    int64_t stride_block, int64_t stride_kv_head, int64_t stride_slot, double eps);
+void dflash_qkv_norm_rope_cache(
+    torch::Tensor qkv, torch::Tensor q_norm_weight, torch::Tensor k_norm_weight,
+    torch::Tensor cos_sin_cache, torch::Tensor positions, torch::Tensor q_out,
+    c10::optional<torch::Tensor> k_out, c10::optional<torch::Tensor> slot_mapping,
+    int64_t kv_ptr, int64_t block_size, int64_t stride_block, int64_t stride_kv_head,
+    int64_t stride_slot, int64_t v_offset, double eps);
+void dflash_prepare_inputs(
+    torch::Tensor out_input_ids, torch::Tensor out_query_positions,
+    torch::Tensor out_query_start_loc, torch::Tensor out_seq_lens,
+    torch::Tensor out_query_slot_mapping, torch::Tensor out_context_positions,
+    torch::Tensor out_context_slot_mapping, torch::Tensor out_sample_indices,
+    torch::Tensor out_sample_pos, torch::Tensor out_sample_idx_mapping,
+    torch::Tensor out_temperature, torch::Tensor out_seeds,
+    torch::Tensor target_positions, torch::Tensor target_query_start_loc,
+    torch::Tensor idx_mapping, torch::Tensor last_sampled,
+    torch::Tensor next_prefill_tokens, torch::Tensor num_sampled,
+    torch::Tensor num_rejected, torch::Tensor in_temperature,
+    torch::Tensor in_seeds, torch::Tensor block_table,
+    int64_t block_table_stride, int64_t parallel_drafting_token_id,
+    int64_t block_size, int64_t num_query_per_req,
+    int64_t num_speculative_steps, int64_t max_num_reqs,
+    int64_t max_num_tokens, int64_t max_model_len, int64_t pad_slot_id,
+    c10::optional<torch::Tensor> target_input_ids = c10::nullopt,
+    int64_t tail_num_tokens = 0,
+    c10::optional<torch::Tensor> in_static_vocab = c10::nullopt,
+    c10::optional<torch::Tensor> tail_ids = c10::nullopt,
+    c10::optional<torch::Tensor> tail_count = c10::nullopt,
+    c10::optional<torch::Tensor> tail_seen = c10::nullopt);
 void draft_vocab_update_tail(
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor in_static_vocab,
     torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor tail_seen);
@@ -118,7 +166,8 @@ torch::Tensor draft_vocab_tail_argmax(
     c10::optional<torch::Tensor> out_top2_row0 = c10::nullopt,
     c10::optional<torch::Tensor> out_margins = c10::nullopt,
     c10::optional<torch::Tensor> out_tree_top = c10::nullopt,
-    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt);
+    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt,
+    c10::optional<torch::Tensor> out_tokens = c10::nullopt);
 torch::Tensor draft_vocab_score_rows(
     torch::Tensor A, torch::Tensor row_ids, torch::Tensor raw_w,
     torch::Tensor raw_s, torch::Tensor global_scale, double logit_scale);
@@ -182,10 +231,46 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_unpack", &bf16_rans_unpack);
   m.def("rans_gemm", &bf16_rans_gemm);
   m.def("rans_gemm_out", &bf16_rans_gemm_out);
+  m.def("rans_gemm_dual", &bf16_rans_gemm_dual);
   m.def("rans_base", &bf16_rans_base);
   m.def("int3_pack", &int3_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
+  m.def("int3_pack_swiglu", &int3_pack_swiglu, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
   m.def("int3_gemm", &int3_gemm);
+  m.def("int3_gemm_out", &int3_gemm_out);
+  m.def("int3_swiglu_gemm", &int3_swiglu_gemm);
+  m.def("int3_swiglu_gemm_out", &int3_swiglu_gemm_out);
+  m.def("int3_gemm_aux5_out", &int3_gemm_aux5_out);
+  m.def("int3_gemm_aux5_rmsnorm_out", &int3_gemm_aux5_rmsnorm_out);
+  m.def("int4_pack", &int4_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
+  m.def("int4_gemm", &int4_gemm);
+  m.def("int4_gemm_out", &int4_gemm_out);
+  m.def("int4_gemm_aux5_out", &int4_gemm_aux5_out);
+  m.def("int4_gemm_aux5_rmsnorm_out", &int4_gemm_aux5_rmsnorm_out);
   m.def("dflash_kv_post", &dflash_kv_post);
+  m.def("dflash_qkv_norm_rope_cache", &dflash_qkv_norm_rope_cache);
+  m.def("dflash_prepare_inputs", &dflash_prepare_inputs,
+        pybind11::arg("out_input_ids"), pybind11::arg("out_query_positions"),
+        pybind11::arg("out_query_start_loc"), pybind11::arg("out_seq_lens"),
+        pybind11::arg("out_query_slot_mapping"), pybind11::arg("out_context_positions"),
+        pybind11::arg("out_context_slot_mapping"), pybind11::arg("out_sample_indices"),
+        pybind11::arg("out_sample_pos"), pybind11::arg("out_sample_idx_mapping"),
+        pybind11::arg("out_temperature"), pybind11::arg("out_seeds"),
+        pybind11::arg("target_positions"), pybind11::arg("target_query_start_loc"),
+        pybind11::arg("idx_mapping"), pybind11::arg("last_sampled"),
+        pybind11::arg("next_prefill_tokens"), pybind11::arg("num_sampled"),
+        pybind11::arg("num_rejected"), pybind11::arg("in_temperature"),
+        pybind11::arg("in_seeds"), pybind11::arg("block_table"),
+        pybind11::arg("block_table_stride"), pybind11::arg("parallel_drafting_token_id"),
+        pybind11::arg("block_size"), pybind11::arg("num_query_per_req"),
+        pybind11::arg("num_speculative_steps"), pybind11::arg("max_num_reqs"),
+        pybind11::arg("max_num_tokens"), pybind11::arg("max_model_len"),
+        pybind11::arg("pad_slot_id"),
+        pybind11::arg("target_input_ids") = c10::nullopt,
+        pybind11::arg("tail_num_tokens") = 0,
+        pybind11::arg("in_static_vocab") = c10::nullopt,
+        pybind11::arg("tail_ids") = c10::nullopt,
+        pybind11::arg("tail_count") = c10::nullopt,
+        pybind11::arg("tail_seen") = c10::nullopt);
   m.def("draft_vocab_update_tail", &draft_vocab_update_tail);
   m.def("draft_vocab_tail_argmax", &draft_vocab_tail_argmax,
         pybind11::arg("A"), pybind11::arg("static_logits"), pybind11::arg("vocab_map"),
@@ -194,7 +279,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("out_top2_row0") = c10::nullopt,
         pybind11::arg("out_margins") = c10::nullopt,
         pybind11::arg("out_tree_top") = c10::nullopt,
-        pybind11::arg("out_tree_vals") = c10::nullopt);
+        pybind11::arg("out_tree_vals") = c10::nullopt,
+        pybind11::arg("out_tokens") = c10::nullopt);
   m.def("draft_vocab_score_rows", &draft_vocab_score_rows,
         pybind11::arg("A"), pybind11::arg("row_ids"), pybind11::arg("raw_w"),
         pybind11::arg("raw_s"), pybind11::arg("global_scale"), pybind11::arg("logit_scale") = 1.0);

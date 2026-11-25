@@ -1450,9 +1450,7 @@ __global__ void Marlin(
 #else
   auto cp_async4_stream = [&](void* smem_ptr, const void* glob_ptr) { cp_async4(smem_ptr, glob_ptr); };
 #endif
-  auto load_mul_sigmoid_int4 = [&](int idx) -> int4 {
-    const uint4 g = reinterpret_cast<const uint4*>(A)[idx];
-    const uint4 av = reinterpret_cast<const uint4*>(A_aux)[idx];
+  auto eval_mul_sigmoid_int4 = [&](uint4 g, uint4 av) -> int4 {
     const uint32_t gw[4] = {g.x, g.y, g.z, g.w};
     const uint32_t aw[4] = {av.x, av.y, av.z, av.w};
     uint32_t ow[4];
@@ -1470,6 +1468,11 @@ __global__ void Marlin(
     return make_int4(static_cast<int>(ow[0]), static_cast<int>(ow[1]),
                      static_cast<int>(ow[2]), static_cast<int>(ow[3]));
   };
+  auto load_mul_sigmoid_int4 = [&](int idx) -> int4 {
+    const uint4 g = reinterpret_cast<const uint4*>(A)[idx];
+    const uint4 av = reinterpret_cast<const uint4*>(A_aux)[idx];
+    return eval_mul_sigmoid_int4(g, av);
+  };
   // Asynchronously fetch the next A, B and s tile from global to the next
   // shared memory pipeline location.
   auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true) {
@@ -1477,13 +1480,32 @@ __global__ void Marlin(
       int4* sh_a_stage = sh_a + a_sh_stage_step * pipe;
       const int cur_a_off = down_ilv ? (a_gl_rd_base + a_gl_rd_delta_o * ilv_a_kt)
                                      : (a_gl_rd + a_gl_rd_delta_o * a_off);
+      int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+  #pragma unroll
+      for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++) {
+        constexpr int count = div_ceil(b_sh_stride, threads);
+        int b_gl_idx =
+            b_gl_rd + (i % count) * threads +
+            b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
+
+        cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
+      }
       if constexpr (fuse_mul_sigmoid) {
         if constexpr (multi_m) {
+          uint4 g_buf[a_sh_wr_iters];
+          uint4 av_buf[a_sh_wr_iters];
   #pragma unroll
           for (int i = 0; i < a_sh_wr_iters; i++) {
             if (a_sh_wr_pred[i]) {
-              sh_a_stage[a_sh_wr_trans[i]] =
-                  load_mul_sigmoid_int4(a_gl_rd_delta_i * i + cur_a_off);
+              const int a_idx = a_gl_rd_delta_i * i + cur_a_off;
+              g_buf[i] = reinterpret_cast<const uint4*>(A)[a_idx];
+              av_buf[i] = reinterpret_cast<const uint4*>(A_aux)[a_idx];
+            }
+          }
+  #pragma unroll
+          for (int i = 0; i < a_sh_wr_iters; i++) {
+            if (a_sh_wr_pred[i]) {
+              sh_a_stage[a_sh_wr_trans[i]] = eval_mul_sigmoid_int4(g_buf[i], av_buf[i]);
             }
           }
         } else {
@@ -1502,16 +1524,6 @@ __global__ void Marlin(
               &A[a_gl_rd_delta_i * i + cur_a_off],
               a_sh_wr_pred[i]);
         }
-      }
-      int4* sh_b_stage = sh_b + b_sh_stage * pipe;
-  #pragma unroll
-      for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++) {
-        constexpr int count = div_ceil(b_sh_stride, threads);
-        int b_gl_idx =
-            b_gl_rd + (i % count) * threads +
-            b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
-
-        cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
       }
 
       if constexpr (down_ilv) {
@@ -2581,11 +2593,18 @@ __global__ void Marlin(
             const float g1 = __uint_as_float(gw & 0xffff0000u);
             const float u0 = __uint_as_float(uw << 16);
             const float u1 = __uint_as_float(uw & 0xffff0000u);
-            __nv_bfloat162 res = __floats2bfloat162_rn(
-                __fmul_rn(marlin_swiglu_silu(g0), u0),
-                __fmul_rn(marlin_swiglu_silu(g1), u1));
-            reinterpret_cast<uint32_t*>(C0 + r * 2496 + slice_col * 8)[c] =
-                *reinterpret_cast<uint32_t*>(&res);
+            if constexpr (gate_up_swiglu_fp8) {
+              reinterpret_cast<uint16_t*>(fp8_out_ptr + r * 19968 + slice_col * 64)[c] =
+                  marlin_pack_fp8x2(
+                      __fmul_rn(__fmul_rn(marlin_swiglu_silu(g0), u0), inv_fp8_scale),
+                      __fmul_rn(__fmul_rn(marlin_swiglu_silu(g1), u1), inv_fp8_scale));
+            } else {
+              __nv_bfloat162 res = __floats2bfloat162_rn(
+                  __fmul_rn(marlin_swiglu_silu(g0), u0),
+                  __fmul_rn(marlin_swiglu_silu(g1), u1));
+              reinterpret_cast<uint32_t*>(C0 + r * 2496 + slice_col * 8)[c] =
+                  *reinterpret_cast<uint32_t*>(&res);
+            }
           }
         } else {
           const bool is_up = (slice_col >= 288);
@@ -2631,11 +2650,18 @@ __global__ void Marlin(
               const float g1 = __uint_as_float(gw & 0xffff0000u);
               const float u0 = __uint_as_float(uw << 16);
               const float u1 = __uint_as_float(uw & 0xffff0000u);
-              __nv_bfloat162 res = __floats2bfloat162_rn(
-                  __fmul_rn(marlin_swiglu_silu(g0), u0),
-                  __fmul_rn(marlin_swiglu_silu(g1), u1));
-              reinterpret_cast<uint32_t*>(C0 + r * 2496 + 2112 + m_pair * 16)[c] =
-                  *reinterpret_cast<uint32_t*>(&res);
+              if constexpr (gate_up_swiglu_fp8) {
+                reinterpret_cast<uint16_t*>(fp8_out_ptr + r * 19968 + 16896 + m_pair * 128)[c] =
+                    marlin_pack_fp8x2(
+                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g0), u0), inv_fp8_scale),
+                        __fmul_rn(__fmul_rn(marlin_swiglu_silu(g1), u1), inv_fp8_scale));
+              } else {
+                __nv_bfloat162 res = __floats2bfloat162_rn(
+                    __fmul_rn(marlin_swiglu_silu(g0), u0),
+                    __fmul_rn(marlin_swiglu_silu(g1), u1));
+                reinterpret_cast<uint32_t*>(C0 + r * 2496 + 2112 + m_pair * 16)[c] =
+                    *reinterpret_cast<uint32_t*>(&res);
+              }
             }
           }
         }

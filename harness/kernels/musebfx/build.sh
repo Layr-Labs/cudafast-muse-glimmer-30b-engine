@@ -12,8 +12,8 @@ import pathlib, shutil, sys
 from torch.utils.cpp_extension import load
 source, build, out = map(pathlib.Path, sys.argv[1:])
 name = "muse_bfx_ext"
-load(name=name, sources=[str(source / "bfx.cu"), str(source / "bf16_rans_mma.cu"), str(source / "int3_mma.cu"), str(source / "dflash_fuse.cu"), str(source / "draft_vocab_tail.cu"), str(source / "native_leaf.cu")],
-     extra_cuda_cflags=["-O3", "-std=c++17", "-gencode=arch=compute_121a,code=sm_121a",
+load(name=name, sources=[str(source / "bfx.cu"), str(source / "bf16_rans_mma.cu"), str(source / "int3_mma.cu"), str(source / "int4_mma.cu"), str(source / "dflash_post.cu"), str(source / "draft_vocab_tail.cu"), str(source / "native_leaf.cu")],
+     extra_cuda_cflags=["-O3", "--threads=4", "-std=c++17", "-gencode=arch=compute_121a,code=sm_121a",
                         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__"],
      extra_cflags=["-O3"], build_directory=str(build), verbose=False)
 shutil.copy2(build / f"{name}.so", out / f"{name}.so")

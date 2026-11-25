@@ -48,6 +48,8 @@ _AUDIT = os.environ.get("VLLM_MUSE_GLIMMER_NORM_GLUE_AUDIT", "0") == "1"
 _DECODE_GATE_FOLD = os.environ.get("VLLM_MUSE_GLIMMER_DECODE_GATE_FOLD", "1") == "1"
 _DROP_BF16 = os.environ.get("VLLM_MUSE_GLIMMER_DECODE_DROP_BF16", "1") == "1"
 _RANS_PROLOGUE = os.environ.get("MUSE_RANS_PROLOGUE_FUSE", "1") != "0"
+_RANS_FUSE_M16 = os.environ.get("MUSE_RANS_FUSE_M16", "1") != "0"
+_RANS_FUSE_SILU_M = os.environ.get("MUSE_RANS_FUSE_SILU_M", "1") != "0"
 _MUL_SIGMOID_GLUE = os.environ.get("MUSE_MUL_SIGMOID_GLUE", "1") != "0"
 _OPROJ_SIGMOID_FUSE = os.environ.get("MUSE_OPROJ_SIGMOID_FUSE", "1") != "0"
 _OPROJ_SIGMOID_FUSE_M = os.environ.get("MUSE_OPROJ_SIGMOID_FUSE_M", "1") != "0"
@@ -77,7 +79,8 @@ _gate_layers: dict[int, _GateLayer] = {}
 _pending_decode = None  # (out_bf16_ptr, _GateLayer, rows, folded)
 _expect_decode = None   # (requant_out_ptr, _GateLayer, rows, folded)
 _gate_counts = Counter()
-_prologue_state: dict[int, str] = {}  # scale_ptr -> "admitted" | "rejected"
+_prologue_state: dict[int, str] = {}    # M=1 scale_ptr -> "admitted" | "rejected"
+_prologue_m_state: dict[int, str] = {}  # M=2..16 scale_ptr -> "admitted" | "rejected"
 _pending_rans_prologue = None  # (out_fp8_ptr, act_mode, x0, x1, scale_ptr, skipped)
 _prologue_counts = Counter()
 _pending_gate_up_swiglu = None  # (out_ptr, sw_entry, fused_launched, check_args)
@@ -130,7 +133,7 @@ def consume_oproj_sigmoid(
                 if is_m:
                     _oproj_fuse_m_state = "admitted"
                     _oproj_sig_counts["admitted_m"] += 1
-                    logger.info("Decode6 o_proj fused mul_sigmoid M=2..8 prologue: live forward admitted bitwise (m=%d)", int(x.shape[0]))
+                    logger.info("Decode6 o_proj fused mul_sigmoid M=2..16 prologue: live forward admitted bitwise (m=%d)", int(x.shape[0]))
                 else:
                     _oproj_fuse_state = "admitted"
                     _oproj_sig_counts["admitted"] += 1
@@ -164,7 +167,7 @@ def notify_gate_up_swiglu(out_ptr: int, sw_entry: dict, fused_launched: bool, ch
     _pending_gate_up_swiglu = (out_ptr, sw_entry, fused_launched, check_args)
 
 
-def try_consume_gate_up_swiglu_fp8(gu_ptr: int, s_ptr: int, out_ptr: int) -> bool:
+def try_consume_gate_up_swiglu_fp8(gu_ptr: int, s_ptr: int, out_ptr: int, m_rows: int = 1) -> bool:
     global _pending_gate_up_swiglu, _pending_rans_prologue
     if _pending_gate_up_swiglu is None:
         return False
@@ -179,7 +182,8 @@ def try_consume_gate_up_swiglu_fp8(gu_ptr: int, s_ptr: int, out_ptr: int) -> boo
         return False
     if gu_ptr != exp_gu_ptr or s_ptr != sw_entry["fp8_scale_ptr"]:
         raise RuntimeError("muse_glimmer_norm_glue: fused FP8 gate_up SwiGLU output did not match silu_fp8 args")
-    _pending_rans_prologue = (out_ptr, 0, sw_entry["swiglu_fp8_out"], None, s_ptr, True)
+    fp8_buf = sw_entry["swiglu_fp8_out"] if m_rows == 1 else sw_entry["swiglu_fp8_out_m"][:m_rows]
+    _pending_rans_prologue = (out_ptr, 0, fp8_buf, None, s_ptr, True)
     _swiglu_gu_counts["fp8_skipped"] += 1
     return True
 
@@ -199,23 +203,30 @@ def consume_down_swiglu(x: torch.Tensor, down_gs_ptr: int) -> torch.Tensor | Non
 def consume_rans_prologue(
     A: torch.Tensor, As: torch.Tensor, packed: torch.Tensor, n: int, k: int, Bs: torch.Tensor
 ) -> torch.Tensor | None:
-    """Consume a pending M=1..8 fused activation+FP8 prologue inside muse_fp8_scaled_mm."""
+    """Consume a pending M=1..16 fused activation+FP8 prologue inside muse_fp8_scaled_mm."""
     global _pending_rans_prologue
     if _pending_rans_prologue is None:
         return None
     ptr, act_mode, x0, x1, scale_ptr, skipped = _pending_rans_prologue
     _pending_rans_prologue = None
+    m = int(A.shape[0]) if A.ndim == 2 else 1
     if A.data_ptr() != ptr or As.data_ptr() != scale_ptr:
         if skipped:
             raise RuntimeError("muse_glimmer_norm_glue: skipped prologue did not reach expected FP8 GEMM")
-        _prologue_state[scale_ptr] = "rejected"
+        if m > 1:
+            _prologue_m_state[scale_ptr] = "rejected"
+        else:
+            _prologue_state[scale_ptr] = "rejected"
         return None
     import muse_rans_ext as _rans
 
-    m = int(A.shape[0]) if A.ndim == 2 else 1
     if act_mode == 0:
-        out = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
-        _rans.rans_gemv_auto(packed, x0.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
+        if m > 1:
+            out = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
+            _rans.rans_gemm_m_auto(packed, x0, Bs.reshape(-1), As.reshape(-1), out, n, k)
+        else:
+            out = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
+            _rans.rans_gemv_auto(packed, x0.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
         _swiglu_gu_counts["fp8_down_redirected"] += 1
         del x0, x1
         return out
@@ -233,11 +244,17 @@ def consume_rans_prologue(
             )
             torch.cuda.synchronize()
             if torch.equal(got.view(torch.int16), ref.view(torch.int16)):
-                _prologue_state[scale_ptr] = "admitted"
-                _prologue_counts["admitted"] += 1
+                _prologue_m_state[scale_ptr] = "admitted"
+                _prologue_counts["admitted_m"] += 1
+                if _prologue_counts["admitted_m"] in (1, 42, 49):
+                    logger.info(
+                        "Decode M>1 rANS prologue fusion: %d FP8 layers admitted bitwise (m=%d)",
+                        _prologue_counts["admitted_m"],
+                        m,
+                    )
             else:
-                _prologue_state[scale_ptr] = "rejected"
-                _prologue_counts["rejected"] += 1
+                _prologue_m_state[scale_ptr] = "rejected"
+                _prologue_counts["rejected_m"] += 1
             del x0, x1, aux
             return ref
         out = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
@@ -543,6 +560,63 @@ class _RansPrologueHook:
     def __init__(self, act_mode: int) -> None:
         self.act_mode = act_mode
         self.fp8_glue_state = "unchecked"
+        self.silu_fp8_glue_state = "unchecked"
+
+    def _try_silu_slice_fp8(self, kernel, orig_run, args, kwargs) -> bool:
+        if not _MUL_SILU_SLICE_GLUE or self.silu_fp8_glue_state == "rejected" or len(args) != 4:
+            return False
+        gu, scale, out, numel = args
+        try:
+            n_el = int(numel)
+        except Exception:
+            return False
+        stream = kwargs.get("stream")
+        if (
+            stream is None
+            or n_el <= 19968
+            or n_el % 19968 != 0
+            or (n_el // 19968) > _MAX_ROWS
+            or not all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gu, scale, out))
+            or gu.dtype != torch.bfloat16 or gu.numel() != 2 * n_el
+            or (gu.data_ptr() & 15) != 0
+            or scale.dtype != torch.float32 or scale.numel() != 1
+            or out.dtype != torch.float8_e4m3fn or out.numel() != n_el
+            or (out.data_ptr() & 7) != 0
+        ):
+            return False
+        import muse_norm_glue as G
+
+        rows = n_el // 19968
+        if self.silu_fp8_glue_state == "unchecked":
+            if torch.cuda.is_current_stream_capturing():
+                return False
+            ok = False
+            try:
+                gu_c, s_c = gu.clone(), scale.clone()
+                mine = torch.empty_like(out)
+                orig_run(kernel, *args, **kwargs)
+                G.mul_silu_slice_fp8(gu_c, s_c, mine, rows, stream)
+                torch.cuda.synchronize()
+                ok = torch.equal(out.view(torch.uint8), mine.view(torch.uint8))
+                if ok:
+                    gen = torch.Generator(device=out.device).manual_seed(20261124)
+                    for sig in (0.1, 1.0, 5.0, 20.0):
+                        rgu = (torch.randn((2, 39936), generator=gen, device=out.device) * sig).to(torch.bfloat16)
+                        ro = torch.empty((2, 19968), dtype=torch.float8_e4m3fn, device=out.device)
+                        mo = torch.empty_like(ro)
+                        orig_run(kernel, rgu, s_c, ro, 2 * 19968, **kwargs)
+                        G.mul_silu_slice_fp8(rgu, s_c, mo, 2, stream)
+                        torch.cuda.synchronize()
+                        if not torch.equal(ro.view(torch.uint8), mo.view(torch.uint8)):
+                            ok = False
+                            break
+            except Exception:
+                ok = False
+            self.silu_fp8_glue_state = "admitted" if ok else "rejected"
+            logger.info("Decode M>1 mul_silu_slice_fp8 glue: %s", self.silu_fp8_glue_state)
+            return True
+        G.mul_silu_slice_fp8(gu, scale, out, rows, stream)
+        return True
 
     def _try_prefill_sigmoid_fp8(self, kernel, orig_run, args, kwargs) -> bool:
         if not _MUL_SIGMOID_GLUE or self.fp8_glue_state == "rejected" or len(args) != 5:
@@ -638,7 +712,7 @@ class _RansPrologueHook:
             except Exception:
                 _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
-            max_m_fuse = 8 if hasattr(_rans, "rans_gemm_m_fused_auto") else 1
+            max_m_fuse = (16 if _RANS_FUSE_M16 else 8) if hasattr(_rans, "rans_gemm_m_fused_auto") else 1
             if (
                 n_el <= 0
                 or (n_el & 4095) != 0
@@ -654,6 +728,7 @@ class _RansPrologueHook:
                     return None
                 _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
+            m_rows = n_el >> 12
             x0, x1 = gate, attn
         else:
             if len(args) != 4:
@@ -664,25 +739,42 @@ class _RansPrologueHook:
             except Exception:
                 return orig_run(kernel, *args, **kwargs)
             if (
-                n_el != 19968
+                n_el <= 0
+                or n_el % 19968 != 0
+                or (n_el // 19968) > _MAX_ROWS
                 or not all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gu, scale, out))
-                or gu.dtype != torch.bfloat16 or gu.numel() != 39936
+                or gu.dtype != torch.bfloat16 or gu.numel() != 2 * n_el
                 or (gu.data_ptr() & 7) != 0
                 or scale.dtype != torch.float32 or scale.numel() != 1
-                or out.dtype != torch.float8_e4m3fn or out.numel() != 19968
+                or out.dtype != torch.float8_e4m3fn or out.numel() != n_el
             ):
+                if self._try_silu_slice_fp8(kernel, orig_run, args, kwargs):
+                    return None
+                return orig_run(kernel, *args, **kwargs)
+            m_rows = n_el // 19968
+            if try_consume_gate_up_swiglu_fp8(gu.data_ptr(), scale.data_ptr(), out.data_ptr(), m_rows):
+                return None
+            if m_rows > 1 and not (_RANS_FUSE_SILU_M and hasattr(_rans, "rans_gemm_m_fused_auto")):
+                if self._try_silu_slice_fp8(kernel, orig_run, args, kwargs):
+                    return None
                 return orig_run(kernel, *args, **kwargs)
             x0, x1 = gu, None
-            if try_consume_gate_up_swiglu_fp8(gu.data_ptr(), scale.data_ptr(), out.data_ptr()):
-                return None
         s_ptr = scale.data_ptr()
-        st = _prologue_state.get(s_ptr, "unchecked")
+        st = (_prologue_m_state if m_rows > 1 else _prologue_state).get(s_ptr, "unchecked")
         if st == "rejected":
+            if self.act_mode == 1 and m_rows > 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
+                return None
+            if self.act_mode == 2 and m_rows > 1 and self._try_silu_slice_fp8(kernel, orig_run, args, kwargs):
+                return None
             return orig_run(kernel, *args, **kwargs)
         if st == "admitted":
             _pending_rans_prologue = (out.data_ptr(), self.act_mode, x0, x1, s_ptr, True)
             return None
         if torch.cuda.is_current_stream_capturing():
+            if self.act_mode == 1 and m_rows > 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
+                return None
+            if self.act_mode == 2 and m_rows > 1 and self._try_silu_slice_fp8(kernel, orig_run, args, kwargs):
+                return None
             return orig_run(kernel, *args, **kwargs)
         orig_run(kernel, *args, **kwargs)
         _pending_rans_prologue = (out.data_ptr(), self.act_mode, x0, x1, s_ptr, False)

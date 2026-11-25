@@ -1,0 +1,722 @@
+// SPDX-License-Identifier: Apache-2.0
+// muse_int4_mma: 4-bit asymmetric group-64 W4A16 weight-only Tensor-Core GEMM for the pinned DFlash drafter.
+// Format (4.50 bits/weight, 0 wasted bits, 16-byte aligned):
+//   Each 8x64 tile (8 output rows x 64 K cols) is 288 bytes (18 x uint4):
+//     [0..255]   uint2 q4[32]        : for lane l=(r<<2)|t, 16 x 4-bit unsigned ints (q4.x = s=0,1; q4.y = s=2,3)
+//     [256..287] __nv_bfloat162 sz[8]: (scale, zero) for rows r=0..7 (w = q * scale + zero, q in 0..15)
+//   Tiles are stored in [N/64, K/64, 8] order (2304 bytes = 144 x uint4 per 4-warp CTA per K=64 step).
+//   Supports M = 1..16 inside a single m16n8k16 MMA tile with warp-parallel clipping + 5-iter ALS MSE packer.
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <c10/cuda/CUDAStream.h>
+#include <stdint.h>
+
+namespace {
+
+constexpr int kWarpsPerBlock = 4;
+constexpr int kThreads = kWarpsPerBlock * 32;                    // 128
+constexpr int kNTilesPerWarp = 2;                                // 16 N-rows per warp -> 2x A reuse
+constexpr int kNTilesPerCTA = kWarpsPerBlock * kNTilesPerWarp;   // 8
+constexpr int kRowsPerCTA = kNTilesPerCTA * 8;                   // 64
+constexpr int kTileBytes = 288;                                  // 18 * 16
+constexpr int kStepWBytes = kNTilesPerCTA * kTileBytes;          // 2304 = 144 * 16
+constexpr int kStepWU4 = kStepWBytes / 16;                       // 144
+constexpr int kStages = 4;                                       // 18.0 KiB SMEM -> 5 CTAs/SM on sm_121a
+
+__device__ __forceinline__ float int4_u4_to_f32(uint32_t q) {
+  return __uint_as_float(0x4B000000u | q) - 8388608.0f;
+}
+
+__device__ __forceinline__ void int4_mma_m16n8k16(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint64_t int4_pol_ef() {
+  uint64_t pol;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  return pol;
+}
+
+__device__ __forceinline__ void int4_cp_async16_ef(uint32_t sd, const void* gs, uint64_t pol) {
+  asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(sd), "l"(gs), "l"(pol));
+}
+
+__device__ __forceinline__ void int4_cp_async16_ca(uint32_t sd, const void* gs) {
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(sd), "l"(gs));
+}
+
+__device__ __forceinline__ uint32_t int4_bf16x2_u32(float f0, float f1) {
+  __nv_bfloat162 v = __floats2bfloat162_rn(f0, f1);
+  return *reinterpret_cast<const uint32_t*>(&v);
+}
+
+__device__ __forceinline__ float int4_subwarp4_sum(float v) {
+  v += __shfl_xor_sync(0xffffffffu, v, 1);
+  v += __shfl_xor_sync(0xffffffffu, v, 2);
+  return v;
+}
+
+// GPU packer: BF16 [N, K] (N%64==0, K%64==0) -> uint8 [N/64, K/64, 8, 288]
+// Grid: (N/8, K/64), Block: 32 threads (1 warp per 8x64 tile).
+template <bool kMseOpt>
+__global__ void int4_pack_kernel(
+    const __nv_bfloat16* __restrict__ W,
+    uint8_t* __restrict__ out,
+    int N, int K) {
+  const int n_tile = blockIdx.x;        // 0 .. N/8 - 1
+  const int kg = blockIdx.y;            // 0 .. K/64 - 1
+  const int lane = threadIdx.x;         // 0 .. 31
+  const int r = lane >> 2;              // 0 .. 7
+  const int t = lane & 3;               // 0 .. 3
+  const int row = n_tile * 8 + r;
+  const int k_base = kg * 64;
+
+  float vals[16];
+  float rmin = 1e30f;
+  float rmax = -1e30f;
+  const __nv_bfloat16* wrow = W + static_cast<size_t>(row) * K + k_base;
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    const int kb = s * 16 + 2 * t;
+    vals[4 * s + 0] = __bfloat162float(wrow[kb + 0]);
+    vals[4 * s + 1] = __bfloat162float(wrow[kb + 1]);
+    vals[4 * s + 2] = __bfloat162float(wrow[kb + 8]);
+    vals[4 * s + 3] = __bfloat162float(wrow[kb + 9]);
+  }
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    rmin = fminf(rmin, vals[i]);
+    rmax = fmaxf(rmax, vals[i]);
+  }
+  rmin = fminf(rmin, __shfl_xor_sync(0xffffffffu, rmin, 1));
+  rmin = fminf(rmin, __shfl_xor_sync(0xffffffffu, rmin, 2));
+  rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 1));
+  rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 2));
+
+  float sc_mm = (rmax - rmin) * (1.0f / 15.0f);
+  if (sc_mm < 1e-30f) sc_mm = 1e-30f;
+  __nv_bfloat162 sz_bf = __floats2bfloat162_rn(sc_mm, rmin);
+
+  if constexpr (kMseOpt) {
+    float lsum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      lsum += vals[i];
+    }
+    const float sw = int4_subwarp4_sum(lsum);
+    const float mu = sw * (1.0f / 64.0f);
+
+    float lvar = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const float d = vals[i] - mu;
+      lvar = __fmaf_rn(d, d, lvar);
+    }
+    const float std_v = sqrtf(fmaxf(int4_subwarp4_sum(lvar) * (1.0f / 64.0f), 0.0f));
+
+    auto eval_cand = [&](float sc_in, float zr_in, __nv_bfloat162& out_sz, float& out_mse) {
+      if (!(sc_in > 1e-30f)) sc_in = 1e-30f;
+      out_sz = __floats2bfloat162_rn(sc_in, zr_in);
+      const float sc_q = __bfloat162float(out_sz.x);
+      const float zr_q = __bfloat162float(out_sz.y);
+      const float inv_sc = (sc_q > 1e-30f) ? (1.0f / sc_q) : 0.0f;
+      float err = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        int q = __float2int_rn((vals[i] - zr_q) * inv_sc);
+        if (q < 0) q = 0;
+        if (q > 15) q = 15;
+        const float w_hat = __bfloat162float(
+            __float2bfloat16_rn(__fmaf_rn(static_cast<float>(q), sc_q, zr_q)));
+        const float diff = vals[i] - w_hat;
+        err = __fmaf_rn(diff, diff, err);
+      }
+      out_mse = int4_subwarp4_sum(err);
+    };
+
+    __nv_bfloat162 best_sz = sz_bf;
+    float best_mse = 0.0f;
+    eval_cand(sc_mm, rmin, best_sz, best_mse);
+
+    __nv_bfloat162 try_sz;
+    float try_mse;
+    auto consider_interval = [&](float lo, float hi) {
+      eval_cand((hi - lo) * (1.0f / 15.0f), lo, try_sz, try_mse);
+      if (try_mse < best_mse) {
+        best_mse = try_mse;
+        best_sz = try_sz;
+      }
+    };
+
+    const float mid = 0.5f * (rmin + rmax);
+    const float half = 0.5f * (rmax - rmin);
+    constexpr float kMidAlphas[4] = {0.95f, 0.90f, 0.84f, 0.78f};
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      const float h = half * kMidAlphas[c];
+      consider_interval(mid - h, mid + h);
+    }
+
+    constexpr float kStdCs[5] = {2.90f, 2.60f, 2.30f, 2.05f, 1.80f};
+#pragma unroll
+    for (int c = 0; c < 5; ++c) {
+      const float d = std_v * kStdCs[c];
+      consider_interval(fmaxf(rmin, mu - d), fminf(rmax, mu + d));
+    }
+
+    constexpr float kOneSideCs[2] = {2.50f, 2.10f};
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+      const float d = std_v * kOneSideCs[c];
+      consider_interval(rmin, fminf(rmax, mu + d));
+      consider_interval(fmaxf(rmin, mu - d), rmax);
+    }
+
+    float cur_sc = __bfloat162float(best_sz.x);
+    float cur_zr = __bfloat162float(best_sz.y);
+#pragma unroll
+    for (int it = 0; it < 5; ++it) {
+      const float inv_cur = (cur_sc > 1e-30f) ? (1.0f / cur_sc) : 0.0f;
+      float lsq = 0.0f;
+      float lsqq = 0.0f;
+      float lsqw = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 16; ++i) {
+        int q = __float2int_rn((vals[i] - cur_zr) * inv_cur);
+        if (q < 0) q = 0;
+        if (q > 15) q = 15;
+        const float fq = static_cast<float>(q);
+        lsq += fq;
+        lsqq = __fmaf_rn(fq, fq, lsqq);
+        lsqw = __fmaf_rn(fq, vals[i], lsqw);
+      }
+      const float sq = int4_subwarp4_sum(lsq);
+      const float sqq = int4_subwarp4_sum(lsqq);
+      const float sqw = int4_subwarp4_sum(lsqw);
+      const float denom = 64.0f * sqq - sq * sq;
+      if (denom > 0.5f) {
+        const float cand_sc = (64.0f * sqw - sq * sw) / denom;
+        const float cand_zr = (sw - cand_sc * sq) * (1.0f / 64.0f);
+        if (cand_sc > 1e-30f && cand_sc < 1e30f && fabsf(cand_zr) < 1e30f) {
+          cur_sc = cand_sc;
+          cur_zr = cand_zr;
+        }
+      }
+      eval_cand(cur_sc, cur_zr, try_sz, try_mse);
+      if (try_mse < best_mse) {
+        best_mse = try_mse;
+        best_sz = try_sz;
+      }
+    }
+
+    uint32_t sz_bits = *reinterpret_cast<const uint32_t*>(&best_sz);
+    sz_bits = __shfl_sync(0xffffffffu, sz_bits, r << 2);
+    sz_bf = *reinterpret_cast<const __nv_bfloat162*>(&sz_bits);
+  }
+
+  const float sc_q = __bfloat162float(sz_bf.x);
+  const float zr_q = __bfloat162float(sz_bf.y);
+  const float inv_sc = (sc_q > 1e-30f) ? (1.0f / sc_q) : 0.0f;
+
+  uint32_t q_lo = 0u;
+  uint32_t q_hi = 0u;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    int q = __float2int_rn((vals[i] - zr_q) * inv_sc);
+    if (q < 0) q = 0;
+    if (q > 15) q = 15;
+    q_lo |= (static_cast<uint32_t>(q) << (4 * i));
+  }
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    int q = __float2int_rn((vals[8 + i] - zr_q) * inv_sc);
+    if (q < 0) q = 0;
+    if (q > 15) q = 15;
+    q_hi |= (static_cast<uint32_t>(q) << (4 * i));
+  }
+
+  const int cta_n = n_tile >> 3;         // 0 .. N/64 - 1
+  const int sub_tile = n_tile & 7;       // 0 .. 7
+  const int num_kg = K >> 6;
+  const size_t tile_idx = (static_cast<size_t>(cta_n) * num_kg + kg) * kNTilesPerCTA + sub_tile;
+  uint8_t* dst = out + tile_idx * kTileBytes;
+
+  reinterpret_cast<uint2*>(dst)[lane] = make_uint2(q_lo, q_hi);
+  if (t == 0) {
+    reinterpret_cast<__nv_bfloat162*>(dst + 256)[r] = sz_bf;
+  }
+}
+
+struct alignas(16) Int4StageSmem {
+  uint8_t w[kStages][kStepWBytes];     // 6 * 2304 = 13824 B
+  __nv_bfloat16 a[kStages][16][72];    // 6 * 2304 = 13824 B (bank-conflict-free 144B row stride)
+};                                     // Total = 27648 B (27.0 KiB)
+
+struct Int4Aux5Ptrs {
+  const __nv_bfloat16* p0;
+  const __nv_bfloat16* p1;
+  const __nv_bfloat16* p2;
+  const __nv_bfloat16* p3;
+  const __nv_bfloat16* p4;
+  int kg_each;
+};
+
+__device__ __forceinline__ const __nv_bfloat16* int4_aux5_ptr(const Int4Aux5Ptrs& a, int ci) {
+  return (ci == 0) ? a.p0 : (ci == 1) ? a.p1 : (ci == 2) ? a.p2 : (ci == 3) ? a.p3 : a.p4;
+}
+
+template <bool kSplitK, bool kAux5 = false>
+__global__ void __launch_bounds__(128, 5) int4_mma_gemm_kernel(
+    const __nv_bfloat16* __restrict__ A,
+    Int4Aux5Ptrs aux5,
+    const uint8_t* __restrict__ W_packed,
+    __nv_bfloat16* __restrict__ C,
+    float* __restrict__ C_fp32,
+    int M, int N, int K, int split_k) {
+  __shared__ Int4StageSmem smem;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const int num_kg = K >> 6;
+  const uint64_t pol = int4_pol_ef();
+
+  const int cta_n = blockIdx.x;
+  const int sk_idx = kSplitK ? blockIdx.y : 0;
+  const int kg_per_sk = kSplitK ? ((num_kg + split_k - 1) / split_k) : num_kg;
+  const int kg_start = kSplitK ? (sk_idx * kg_per_sk) : 0;
+  int kg_end = kSplitK ? (kg_start + kg_per_sk) : num_kg;
+  if (kg_end > num_kg) kg_end = num_kg;
+  const int my_kgs = kg_end - kg_start;
+  if (my_kgs <= 0) return;
+
+  const size_t cta_stride_bytes = static_cast<size_t>(num_kg) * kStepWBytes;
+  const uint8_t* w_cta = W_packed + static_cast<size_t>(cta_n) * cta_stride_bytes;
+
+  if (cta_n == 0 && sk_idx == 0) {
+    const size_t total_bytes = static_cast<size_t>(N / kRowsPerCTA) * cta_stride_bytes;
+    for (size_t off = static_cast<size_t>(tid) << 21; off < total_bytes; off += static_cast<size_t>(kThreads) << 21) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(W_packed + off));
+    }
+  }
+
+  auto issue_stage = [&](int kg, int st) {
+    const uint8_t* w_step = w_cta + static_cast<size_t>(kg) * kStepWBytes;
+    {
+      const uint32_t sd0 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
+      int4_cp_async16_ef(sd0, w_step + tid * 16, pol);
+      if (tid < (kStepWU4 - kThreads)) {
+        const int u = kThreads + tid;
+        const uint32_t sd1 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][u * 16]));
+        int4_cp_async16_ef(sd1, w_step + u * 16, pol);
+      }
+    }
+    {
+      const int row = tid >> 3;
+      const int col8 = tid & 7;
+      if (row < M) {
+        const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][row][col8 * 8]));
+        if constexpr (kAux5) {
+          const int ke = aux5.kg_each;
+          int ci = 0;
+          int kg_loc = kg;
+          if (kg_loc >= ke) { kg_loc -= ke; ci = 1; }
+          if (kg_loc >= ke) { kg_loc -= ke; ci = 2; }
+          if (kg_loc >= ke) { kg_loc -= ke; ci = 3; }
+          if (kg_loc >= ke) { kg_loc -= ke; ci = 4; }
+          const int k_each = ke << 6;
+          int4_cp_async16_ca(sd, int4_aux5_ptr(aux5, ci) + static_cast<size_t>(row) * k_each + kg_loc * 64 + col8 * 8);
+        } else {
+          int4_cp_async16_ca(sd, A + static_cast<size_t>(row) * K + kg * 64 + col8 * 8);
+        }
+      }
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  };
+
+  constexpr int kPreload = kStages - 1;
+  const int preload = (my_kgs < kPreload) ? my_kgs : kPreload;
+  for (int i = 0; i < preload; ++i) {
+    issue_stage(kg_start + i, i);
+  }
+
+  float d0_0 = 0.0f, d1_0 = 0.0f, d2_0 = 0.0f, d3_0 = 0.0f;
+  float d0_1 = 0.0f, d1_1 = 0.0f, d2_1 = 0.0f, d3_1 = 0.0f;
+
+  int st = 0;
+  for (int i = 0; i < my_kgs; ++i) {
+    const int rem = my_kgs - 1 - i;
+    if (rem >= 2) {
+      asm volatile("cp.async.wait_group 2;\n" ::: "memory");
+    } else if (rem == 1) {
+      asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+    } else {
+      asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    }
+    __syncthreads();
+
+    const int g1 = g + 8;
+    const uint32_t* a_row0_u32 = reinterpret_cast<const uint32_t*>(&smem.a[st][g][0]);
+    const uint32_t* a_row1_u32 = reinterpret_cast<const uint32_t*>(&smem.a[st][g1][0]);
+    uint32_t a0_r[4], a1_r[4], a2_r[4], a3_r[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      a0_r[s] = (g < M) ? a_row0_u32[s * 8 + t] : 0u;
+      a2_r[s] = (g < M) ? a_row0_u32[s * 8 + 4 + t] : 0u;
+      a1_r[s] = (g1 < M) ? a_row1_u32[s * 8 + t] : 0u;
+      a3_r[s] = (g1 < M) ? a_row1_u32[s * 8 + 4 + t] : 0u;
+    }
+
+    const uint8_t* wt0 = &smem.w[st][(warp * 2 + 0) * kTileBytes];
+    const uint8_t* wt1 = &smem.w[st][(warp * 2 + 1) * kTileBytes];
+    uint2 q4_0 = reinterpret_cast<const uint2*>(wt0)[lane];
+    const __nv_bfloat162 sz0 = reinterpret_cast<const __nv_bfloat162*>(wt0 + 256)[g];
+    const float sc0 = __bfloat162float(sz0.x);
+    const float zr0 = __bfloat162float(sz0.y);
+
+    uint2 q4_1 = reinterpret_cast<const uint2*>(wt1)[lane];
+    const __nv_bfloat162 sz1 = reinterpret_cast<const __nv_bfloat162*>(wt1 + 256)[g];
+    const float sc1 = __bfloat162float(sz1.x);
+    const float zr1 = __bfloat162float(sz1.y);
+
+    const int next_i = i + kPreload;
+    if (next_i < my_kgs) {
+      const int next_st = (st + kPreload >= kStages) ? (st + kPreload - kStages) : (st + kPreload);
+      issue_stage(kg_start + next_i, next_st);
+    }
+
+    uint32_t w0_arr[2] = {q4_0.x, q4_0.y};
+    uint32_t w1_arr[2] = {q4_1.x, q4_1.y};
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const uint32_t pk0 = w0_arr[s >> 1] >> ((s & 1) * 16);
+      const uint32_t q0 = pk0 & 15u;
+      const uint32_t q1 = (pk0 >> 4) & 15u;
+      const uint32_t q2 = (pk0 >> 8) & 15u;
+      const uint32_t q3 = (pk0 >> 12) & 15u;
+      const uint32_t b0 = int4_bf16x2_u32(__fmaf_rn(int4_u4_to_f32(q0), sc0, zr0),
+                                          __fmaf_rn(int4_u4_to_f32(q1), sc0, zr0));
+      const uint32_t b1 = int4_bf16x2_u32(__fmaf_rn(int4_u4_to_f32(q2), sc0, zr0),
+                                          __fmaf_rn(int4_u4_to_f32(q3), sc0, zr0));
+      int4_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0_r[s], a1_r[s], a2_r[s], a3_r[s], b0, b1);
+
+      const uint32_t pk1 = w1_arr[s >> 1] >> ((s & 1) * 16);
+      const uint32_t p0 = pk1 & 15u;
+      const uint32_t p1 = (pk1 >> 4) & 15u;
+      const uint32_t p2 = (pk1 >> 8) & 15u;
+      const uint32_t p3 = (pk1 >> 12) & 15u;
+      const uint32_t c0 = int4_bf16x2_u32(__fmaf_rn(int4_u4_to_f32(p0), sc1, zr1),
+                                          __fmaf_rn(int4_u4_to_f32(p1), sc1, zr1));
+      const uint32_t c1 = int4_bf16x2_u32(__fmaf_rn(int4_u4_to_f32(p2), sc1, zr1),
+                                          __fmaf_rn(int4_u4_to_f32(p3), sc1, zr1));
+      int4_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0_r[s], a1_r[s], a2_r[s], a3_r[s], c0, c1);
+    }
+
+    st = (st + 1 == kStages) ? 0 : (st + 1);
+  }
+
+  const int col0 = cta_n * kRowsPerCTA + (warp * 2 + 0) * 8 + 2 * t;
+  const int col1 = cta_n * kRowsPerCTA + (warp * 2 + 1) * 8 + 2 * t;
+  if (g < M) {
+    if constexpr (!kSplitK) {
+      *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col0) = int4_bf16x2_u32(d0_0, d1_0);
+      *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col1) = int4_bf16x2_u32(d0_1, d1_1);
+    } else {
+      float* p0 = C_fp32 + (static_cast<size_t>(sk_idx) * M + g) * N + col0;
+      float* p1 = C_fp32 + (static_cast<size_t>(sk_idx) * M + g) * N + col1;
+      p0[0] = d0_0; p0[1] = d1_0;
+      p1[0] = d0_1; p1[1] = d1_1;
+    }
+  }
+  if (g + 8 < M) {
+    const int g1 = g + 8;
+    if constexpr (!kSplitK) {
+      *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g1) * N + col0) = int4_bf16x2_u32(d2_0, d3_0);
+      *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g1) * N + col1) = int4_bf16x2_u32(d2_1, d3_1);
+    } else {
+      float* p0 = C_fp32 + (static_cast<size_t>(sk_idx) * M + g1) * N + col0;
+      float* p1 = C_fp32 + (static_cast<size_t>(sk_idx) * M + g1) * N + col1;
+      p0[0] = d2_0; p0[1] = d3_0;
+      p1[0] = d2_1; p1[1] = d3_1;
+    }
+  }
+}
+
+__global__ void int4_reduce_splitk_kernel(
+    const float* __restrict__ C_fp32,
+    __nv_bfloat16* __restrict__ C,
+    int M, int N, int split_k) {
+  const int idx4 = (blockIdx.x * blockDim.x + threadIdx.x) << 2;
+  const int total = M * N;
+  if (idx4 >= total) return;
+  float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+  for (int s = 0; s < split_k; ++s) {
+    const float4 v = *reinterpret_cast<const float4*>(C_fp32 + static_cast<size_t>(s) * total + idx4);
+    s0 += v.x; s1 += v.y; s2 += v.z; s3 += v.w;
+  }
+  uint2 out_u2;
+  out_u2.x = int4_bf16x2_u32(s0, s1);
+  out_u2.y = int4_bf16x2_u32(s2, s3);
+  *reinterpret_cast<uint2*>(C + idx4) = out_u2;
+}
+
+__global__ void __launch_bounds__(256) int4_reduce_splitk_rmsnorm_kernel(
+    const float* __restrict__ C_fp32,
+    const __nv_bfloat16* __restrict__ norm_w,
+    __nv_bfloat16* __restrict__ normed_out,
+    int M, int N, int split_k, float eps) {
+  __shared__ float s_warp[8];
+  const int m = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  if (m >= M) return;
+  const size_t total = static_cast<size_t>(M) * N;
+  const size_t row_off = static_cast<size_t>(m) * N;
+
+  float ss = 0.0f;
+  for (int c = tid * 4; c < N; c += 1024) {
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int s = 0; s < split_k; ++s) {
+      const float4 v = *reinterpret_cast<const float4*>(C_fp32 + s * total + row_off + c);
+      a0 += v.x; a1 += v.y; a2 += v.z; a3 += v.w;
+    }
+    const float x0 = __bfloat162float(__float2bfloat16_rn(a0));
+    const float x1 = __bfloat162float(__float2bfloat16_rn(a1));
+    const float x2 = __bfloat162float(__float2bfloat16_rn(a2));
+    const float x3 = __bfloat162float(__float2bfloat16_rn(a3));
+    ss += x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3;
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  if (lane == 0) s_warp[warp] = ss;
+  __syncthreads();
+  if (warp == 0) {
+    float v = (lane < 8) ? s_warp[lane] : 0.0f;
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffu, v, o);
+    if (lane == 0) s_warp[0] = rsqrtf(v / static_cast<float>(N) + eps);
+  }
+  __syncthreads();
+  const float rms = s_warp[0];
+
+  for (int c = tid * 4; c < N; c += 1024) {
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int s = 0; s < split_k; ++s) {
+      const float4 v = *reinterpret_cast<const float4*>(C_fp32 + s * total + row_off + c);
+      a0 += v.x; a1 += v.y; a2 += v.z; a3 += v.w;
+    }
+    const float x0 = __bfloat162float(__float2bfloat16_rn(a0));
+    const float x1 = __bfloat162float(__float2bfloat16_rn(a1));
+    const float x2 = __bfloat162float(__float2bfloat16_rn(a2));
+    const float x3 = __bfloat162float(__float2bfloat16_rn(a3));
+    const uint2 wu2 = __ldg(reinterpret_cast<const uint2*>(norm_w + c));
+    const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wu2);
+    uint2 out_u2;
+    out_u2.x = int4_bf16x2_u32(x0 * rms * __bfloat162float(wb[0]), x1 * rms * __bfloat162float(wb[1]));
+    out_u2.y = int4_bf16x2_u32(x2 * rms * __bfloat162float(wb[2]), x3 * rms * __bfloat162float(wb[3]));
+    *reinterpret_cast<uint2*>(normed_out + row_off + c) = out_u2;
+  }
+}
+
+static void int4_ensure_carveout() {
+  static bool initialized = false;
+  if (!initialized) {
+    initialized = true;
+    cudaFuncSetAttribute(int4_mma_gemm_kernel<false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(int4_mma_gemm_kernel<false, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(int4_mma_gemm_kernel<true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(int4_mma_gemm_kernel<true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  }
+}
+
+static void int4_gemm_launch(
+    const __nv_bfloat16* a_ptr,
+    Int4Aux5Ptrs aux5,
+    bool is_aux5,
+    const uint8_t* w_ptr,
+    __nv_bfloat16* c_ptr,
+    const __nv_bfloat16* norm_w_ptr,
+    float norm_eps,
+    const torch::TensorOptions& opts,
+    int M, int N, int K) {
+  int4_ensure_carveout();
+  auto st = c10::cuda::getCurrentCUDAStream().stream();
+  const int n_blocks = N / kRowsPerCTA;
+  static torch::Tensor g_partials;
+  static int64_t g_partials_cap = 0;
+  int split_k = (norm_w_ptr != nullptr) ? 2 : 1;
+  if (n_blocks <= 128 && K >= 16384) {
+    split_k = (K >= 28672) ? 4 : 3;
+  }
+  if (split_k == 1) {
+    if (is_aux5) {
+      int4_mma_gemm_kernel<false, true><<<n_blocks, kThreads, 0, st>>>(
+          nullptr, aux5, w_ptr, c_ptr, nullptr, M, N, K, 1);
+    } else {
+      int4_mma_gemm_kernel<false, false><<<n_blocks, kThreads, 0, st>>>(
+          a_ptr, aux5, w_ptr, c_ptr, nullptr, M, N, K, 1);
+    }
+  } else {
+    const int64_t need = static_cast<int64_t>(split_k) * M * N;
+    const int64_t alloc = (need > 4 * 16 * 6656) ? need : (4 * 16 * 6656);
+    if (!g_partials.defined() || g_partials.device() != opts.device() || g_partials_cap < need) {
+      g_partials = torch::empty({alloc}, opts.dtype(torch::kFloat32));
+      g_partials_cap = alloc;
+    }
+    if (is_aux5) {
+      int4_mma_gemm_kernel<true, true><<<dim3(n_blocks, split_k, 1), kThreads, 0, st>>>(
+          nullptr, aux5, w_ptr, nullptr, g_partials.data_ptr<float>(), M, N, K, split_k);
+    } else {
+      int4_mma_gemm_kernel<true, false><<<dim3(n_blocks, split_k, 1), kThreads, 0, st>>>(
+          a_ptr, aux5, w_ptr, nullptr, g_partials.data_ptr<float>(), M, N, K, split_k);
+    }
+    if (norm_w_ptr != nullptr) {
+      int4_reduce_splitk_rmsnorm_kernel<<<M, 256, 0, st>>>(
+          g_partials.data_ptr<float>(), norm_w_ptr, c_ptr, M, N, split_k, norm_eps);
+    } else {
+      const int total4 = (M * N) >> 2;
+      int4_reduce_splitk_kernel<<<(total4 + 255) / 256, 256, 0, st>>>(
+          g_partials.data_ptr<float>(), c_ptr, M, N, split_k);
+    }
+  }
+}
+
+}  // namespace
+
+torch::Tensor int4_pack(torch::Tensor W, bool mse_opt = true) {
+  TORCH_CHECK(W.is_cuda() && W.scalar_type() == torch::kBFloat16 && W.dim() == 2 && W.is_contiguous(),
+              "int4_pack expects contiguous CUDA BF16 [N, K]");
+  const int N = static_cast<int>(W.size(0));
+  const int K = static_cast<int>(W.size(1));
+  TORCH_CHECK(N % kRowsPerCTA == 0 && K % 64 == 0, "int4_pack requires N%64==0 and K%64==0");
+  const int64_t total_bytes = static_cast<int64_t>(N / 8) * static_cast<int64_t>(K / 64) * kTileBytes;
+  auto out = torch::empty({total_bytes}, W.options().dtype(torch::kUInt8));
+  dim3 grid(N / 8, K / 64);
+  auto st = c10::cuda::getCurrentCUDAStream().stream();
+  if (mse_opt) {
+    int4_pack_kernel<true><<<grid, 32, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
+        out.data_ptr<uint8_t>(),
+        N, K);
+  } else {
+    int4_pack_kernel<false><<<grid, 32, 0, st>>>(
+        reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
+        out.data_ptr<uint8_t>(),
+        N, K);
+  }
+  return out;
+}
+
+torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K) {
+  TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous(),
+              "int4_gemm expects contiguous CUDA BF16 [M, K]");
+  const int M = static_cast<int>(A.size(0));
+  TORCH_CHECK(M >= 1 && M <= 16 && A.size(1) == K && N % kRowsPerCTA == 0 && K % 64 == 0,
+              "int4_gemm shape mismatch");
+  auto C = torch::empty({M, N}, A.options());
+  Int4Aux5Ptrs dummy = {};
+  int4_gemm_launch(
+      reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+      dummy, false,
+      W_packed.data_ptr<uint8_t>(),
+      reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+      nullptr, 0.0f,
+      A.options(), M, static_cast<int>(N), static_cast<int>(K));
+  return C;
+}
+
+void int4_gemm_out(torch::Tensor A, torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K) {
+  TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous(),
+              "int4_gemm_out expects contiguous CUDA BF16 [M, K]");
+  const int M = static_cast<int>(A.size(0));
+  TORCH_CHECK(M >= 1 && M <= 16 && A.size(1) == K && N % kRowsPerCTA == 0 && K % 64 == 0,
+              "int4_gemm_out shape mismatch");
+  TORCH_CHECK(C.is_cuda() && C.scalar_type() == torch::kBFloat16 && C.is_contiguous() && C.numel() == M * N,
+              "int4_gemm_out bad C");
+  Int4Aux5Ptrs dummy = {};
+  int4_gemm_launch(
+      reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+      dummy, false,
+      W_packed.data_ptr<uint8_t>(),
+      reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+      nullptr, 0.0f,
+      A.options(), M, static_cast<int>(N), static_cast<int>(K));
+}
+
+void int4_gemm_aux5_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor C, int64_t N, int64_t K_each) {
+  const int64_t K = K_each * 5;
+  TORCH_CHECK(N % kRowsPerCTA == 0 && K_each % 64 == 0, "int4_gemm_aux5_out requires N%64==0 and K_each%64==0");
+  const torch::Tensor* xs[5] = {&x0, &x1, &x2, &x3, &x4};
+  const int M = static_cast<int>(x0.size(0));
+  TORCH_CHECK(M >= 1 && M <= 16, "int4_gemm_aux5_out requires 1 <= M <= 16");
+  Int4Aux5Ptrs aux5 = {};
+  aux5.kg_each = static_cast<int>(K_each >> 6);
+  for (int i = 0; i < 5; ++i) {
+    TORCH_CHECK(xs[i]->is_cuda() && xs[i]->scalar_type() == torch::kBFloat16 && xs[i]->dim() == 2 &&
+                xs[i]->size(0) == M && xs[i]->size(1) == K_each && xs[i]->is_contiguous(),
+                "int4_gemm_aux5_out bad aux tensor");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(xs[i]->data_ptr()) & 15u) == 0u,
+                "int4_gemm_aux5_out requires 16B alignment");
+  }
+  aux5.p0 = reinterpret_cast<const __nv_bfloat16*>(x0.data_ptr());
+  aux5.p1 = reinterpret_cast<const __nv_bfloat16*>(x1.data_ptr());
+  aux5.p2 = reinterpret_cast<const __nv_bfloat16*>(x2.data_ptr());
+  aux5.p3 = reinterpret_cast<const __nv_bfloat16*>(x3.data_ptr());
+  aux5.p4 = reinterpret_cast<const __nv_bfloat16*>(x4.data_ptr());
+  TORCH_CHECK(C.is_cuda() && C.scalar_type() == torch::kBFloat16 && C.is_contiguous() && C.numel() == M * N,
+              "int4_gemm_aux5_out bad C");
+  int4_gemm_launch(
+      nullptr, aux5, true,
+      W_packed.data_ptr<uint8_t>(),
+      reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+      nullptr, 0.0f,
+      x0.options(), M, static_cast<int>(N), static_cast<int>(K));
+}
+
+void int4_gemm_aux5_rmsnorm_out(
+    torch::Tensor x0, torch::Tensor x1, torch::Tensor x2, torch::Tensor x3, torch::Tensor x4,
+    torch::Tensor W_packed, torch::Tensor norm_weight, torch::Tensor C, int64_t N, int64_t K_each, double eps) {
+  const int64_t K = K_each * 5;
+  TORCH_CHECK(N % kRowsPerCTA == 0 && K_each % 64 == 0, "int4_gemm_aux5_rmsnorm_out requires N%64==0 and K_each%64==0");
+  const torch::Tensor* xs[5] = {&x0, &x1, &x2, &x3, &x4};
+  const int M = static_cast<int>(x0.size(0));
+  TORCH_CHECK(M >= 1 && M <= 16, "int4_gemm_aux5_rmsnorm_out requires 1 <= M <= 16");
+  TORCH_CHECK(norm_weight.is_cuda() && norm_weight.scalar_type() == torch::kBFloat16 &&
+              norm_weight.is_contiguous() && norm_weight.numel() == N,
+              "int4_gemm_aux5_rmsnorm_out bad norm_weight");
+  Int4Aux5Ptrs aux5 = {};
+  aux5.kg_each = static_cast<int>(K_each >> 6);
+  for (int i = 0; i < 5; ++i) {
+    TORCH_CHECK(xs[i]->is_cuda() && xs[i]->scalar_type() == torch::kBFloat16 && xs[i]->dim() == 2 &&
+                xs[i]->size(0) == M && xs[i]->size(1) == K_each && xs[i]->is_contiguous(),
+                "int4_gemm_aux5_rmsnorm_out bad aux tensor");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(xs[i]->data_ptr()) & 15u) == 0u,
+                "int4_gemm_aux5_rmsnorm_out requires 16B alignment");
+  }
+  aux5.p0 = reinterpret_cast<const __nv_bfloat16*>(x0.data_ptr());
+  aux5.p1 = reinterpret_cast<const __nv_bfloat16*>(x1.data_ptr());
+  aux5.p2 = reinterpret_cast<const __nv_bfloat16*>(x2.data_ptr());
+  aux5.p3 = reinterpret_cast<const __nv_bfloat16*>(x3.data_ptr());
+  aux5.p4 = reinterpret_cast<const __nv_bfloat16*>(x4.data_ptr());
+  TORCH_CHECK(C.is_cuda() && C.scalar_type() == torch::kBFloat16 && C.is_contiguous() && C.numel() == M * N,
+              "int4_gemm_aux5_rmsnorm_out bad C");
+  int4_gemm_launch(
+      nullptr, aux5, true,
+      W_packed.data_ptr<uint8_t>(),
+      reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(norm_weight.data_ptr()),
+      static_cast<float>(eps),
+      x0.options(), M, static_cast<int>(N), static_cast<int>(K));
+}

@@ -761,7 +761,8 @@ torch::Tensor draft_vocab_tail_argmax(
     c10::optional<torch::Tensor> out_top2_row0 = c10::nullopt,
     c10::optional<torch::Tensor> out_margins = c10::nullopt,
     c10::optional<torch::Tensor> out_tree_top = c10::nullopt,
-    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt) {
+    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt,
+    c10::optional<torch::Tensor> out_tokens = c10::nullopt) {
   TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous());
   TORCH_CHECK(static_logits.is_cuda() && static_logits.scalar_type() == torch::kBFloat16 &&
               static_logits.dim() == 2 && static_logits.is_contiguous());
@@ -809,7 +810,15 @@ torch::Tensor draft_vocab_tail_argmax(
   }
 
   auto& sc = get_dvt_scratch(A.device());
-  auto out = torch::empty({M}, A.options().dtype(torch::kInt64));
+  torch::Tensor out;
+  if (out_tokens.has_value() && out_tokens.value().defined() &&
+      out_tokens.value().is_cuda() && out_tokens.value().is_contiguous() &&
+      out_tokens.value().scalar_type() == torch::kInt64 &&
+      out_tokens.value().numel() >= M) {
+    out = out_tokens.value().narrow(0, 0, M);
+  } else {
+    out = torch::empty({M}, A.options().dtype(torch::kInt64));
+  }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
 
   const int top2_max_rows = std::max(top2_rows, tree_top_rows);

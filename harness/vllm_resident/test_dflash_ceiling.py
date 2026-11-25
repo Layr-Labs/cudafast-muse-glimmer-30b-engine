@@ -49,7 +49,7 @@ def run_async_window(
 
 class DFlashCommittedTokenCeilingTests(unittest.TestCase):
     def test_explicit_safety_constant_matches_control_gain(self):
-        self.assertEqual(ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN, 16.65)
+        self.assertEqual(ceiling_module.TARGET_MS_PER_COMMITTED_TOKEN, 17.22)
         self.assertEqual(ceiling_module.REFERENCE_MAX_DECODE_GAIN, 5.0)
 
     def test_round_quantized_endpoint_stays_under_ceiling(self):

@@ -283,8 +283,8 @@ __global__ __launch_bounds__(288) void qk_norm_rope_kvcache_m1_kernel(
       if (slot >= 0) {
         const uint2 v0 = *reinterpret_cast<const uint2*>(qkv + 4352 + lane * 4);
         const uint2 v1 = *reinterpret_cast<const uint2*>(qkv + 4480 + lane * 4);
-        const int64_t blk = (block_size == 16) ? (slot >> 4) : (slot / block_size);
-        const int64_t off = (block_size == 16) ? (slot & 15) : (slot - blk * block_size);
+        const int64_t blk = (block_size == 16) ? (slot >> 4) : ((block_size == 64) ? (slot >> 6) : (slot / block_size));
+        const int64_t off = (block_size == 16) ? (slot & 15) : ((block_size == 64) ? (slot & 63) : (slot - blk * block_size));
         __nv_bfloat16* dst = kv_cache + blk * stride_block + off * stride_slot + 128 + lane * 4;
         *reinterpret_cast<uint2*>(dst) = v0;
         *reinterpret_cast<uint2*>(dst + stride_kv_head) = v1;
@@ -325,8 +325,8 @@ __global__ __launch_bounds__(288) void qk_norm_rope_kvcache_m1_kernel(
 
   __nv_bfloat16* k_cache_base = nullptr;
   if (warp_id == 16 && k_slot >= 0) {
-    const int64_t blk = (block_size == 16) ? (k_slot >> 4) : (k_slot / block_size);
-    const int64_t off = (block_size == 16) ? (k_slot & 15) : (k_slot - blk * block_size);
+    const int64_t blk = (block_size == 16) ? (k_slot >> 4) : ((block_size == 64) ? (k_slot >> 6) : (k_slot / block_size));
+    const int64_t off = (block_size == 16) ? (k_slot & 15) : ((block_size == 64) ? (k_slot & 63) : (k_slot - blk * block_size));
     k_cache_base = kv_cache + blk * stride_block + off * stride_slot + lane * 4;
   }
 
@@ -482,8 +482,8 @@ __global__ void qk_norm_rope_kvcache_prefill_kernel(
 
   __nv_bfloat16* kv_base = nullptr;
   if (slot >= 0) {
-    const int64_t blk = (block_size == 16) ? (slot >> 4) : (slot / block_size);
-    const int64_t off = (block_size == 16) ? (slot & 15) : (slot - blk * block_size);
+    const int64_t blk = (block_size == 16) ? (slot >> 4) : ((block_size == 64) ? (slot >> 6) : (slot / block_size));
+    const int64_t off = (block_size == 16) ? (slot & 15) : ((block_size == 64) ? (slot & 63) : (slot - blk * block_size));
     kv_base = kv_cache + blk * stride_block + off * stride_slot + lane * 4;
   }
 
@@ -577,7 +577,7 @@ int launch_kvcache_prefill(
     int64_t stride_block, int64_t stride_slot, int64_t stride_kv_head,
     float eps, float qscale, int use_rope, int cache_fp32, cudaStream_t stream) {
   constexpr int kGroups = (34 + HPW - 1) / HPW;
-  const int threads = 128;
+  const int threads = (HPW == 2 && num_tokens <= 16) ? 192 : 128;
   const int wpb = threads >> 5;
   const int blocks = (num_tokens * kGroups + wpb - 1) / wpb;
   const auto* q = static_cast<const __nv_bfloat16*>(qkv);

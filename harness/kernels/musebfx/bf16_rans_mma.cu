@@ -24,8 +24,6 @@ constexpr uint32_t kGB = 512u;
 constexpr uint32_t kRG = 4u;
 constexpr uint32_t kRB = kGB * kRG;  // 2048 B per warp
 constexpr uint32_t kMaxSmem = 99u * 1024u;
-constexpr uint32_t kBrXStrideU4 = 68u;                       // 16 rows * 4 uint4 + 4 pad -> 0 bank conflicts on write & read
-constexpr uint32_t kBrXsmemBytes = 2u * 16u * kBrXStrideU4 * 16u;  // 34,816 B (2 buffers x 16 K-steps)
 
 __device__ __forceinline__ void bf16_mma_m16n8k16(
     float& d0, float& d1, float& d2, float& d3,
@@ -67,24 +65,6 @@ __device__ __forceinline__ uint32_t br_lds16(uint32_t a) {
   unsigned short v;
   asm volatile("ld.shared.u16 %0, [%1];" : "=h"(v) : "r"(a));
   return static_cast<uint32_t>(v);
-}
-
-__device__ __forceinline__ void br_xpose4(
-    uint4 v, int t, uint32_t& o0, uint32_t& o1, uint32_t& o2, uint32_t& o3) {
-  const bool t1 = (t & 1) != 0;
-  const bool t2 = (t & 2) != 0;
-  const uint32_t s0 = __shfl_xor_sync(0xffffffffu, t1 ? v.x : v.y, 1);
-  const uint32_t s1 = __shfl_xor_sync(0xffffffffu, t1 ? v.z : v.w, 1);
-  const uint32_t p0 = t1 ? s0 : v.x;
-  const uint32_t p1 = t1 ? v.y : s0;
-  const uint32_t p2 = t1 ? s1 : v.z;
-  const uint32_t p3 = t1 ? v.w : s1;
-  const uint32_t r0 = __shfl_xor_sync(0xffffffffu, t2 ? p0 : p2, 2);
-  const uint32_t r1 = __shfl_xor_sync(0xffffffffu, t2 ? p1 : p3, 2);
-  o0 = t2 ? r0 : p0;
-  o1 = t2 ? r1 : p1;
-  o2 = t2 ? p2 : r0;
-  o3 = t2 ? p3 : r1;
 }
 
 __device__ __forceinline__ size_t br_phys_off(const int* __restrict__ woff16, int tw, int gmin, int w, uint32_t lb) {
@@ -406,10 +386,12 @@ struct BrProb {
   const uint32_t* lut;
   const uint16_t* x;
   __nv_bfloat16* out;
+  __nv_bfloat16* out2;
   int M;
   int N;
   int K;
   int tw;
+  int nb_split;
   int pdl_mode;
   uint32_t base_m1;
   size_t stream_bytes;
@@ -436,7 +418,27 @@ static int br_pdl_cfg() {
   return mode;
 }
 
-template <bool kPar4, bool kM16 = false, bool kXsmem = false>
+__device__ __forceinline__ void br_quad_transpose_4x4(
+    int t, uint4 qv, uint32_t& o0, uint32_t& o1, uint32_t& o2, uint32_t& o3) {
+  uint32_t u0 = (t & 1) ? qv.x : qv.y;
+  uint32_t u1 = (t & 1) ? qv.z : qv.w;
+  u0 = __shfl_xor_sync(0xffffffffu, u0, 1);
+  u1 = __shfl_xor_sync(0xffffffffu, u1, 1);
+  const uint32_t p0 = (t & 1) ? u0 : qv.x;
+  const uint32_t p1 = (t & 1) ? qv.y : u0;
+  const uint32_t p2 = (t & 1) ? u1 : qv.z;
+  const uint32_t p3 = (t & 1) ? qv.w : u1;
+  uint32_t v0 = (t & 2) ? p0 : p2;
+  uint32_t v1 = (t & 2) ? p1 : p3;
+  v0 = __shfl_xor_sync(0xffffffffu, v0, 2);
+  v1 = __shfl_xor_sync(0xffffffffu, v1, 2);
+  o0 = (t & 2) ? v0 : p0;
+  o1 = (t & 2) ? v1 : p1;
+  o2 = (t & 2) ? p2 : v0;
+  o3 = (t & 2) ? p3 : v1;
+}
+
+template <bool kPar4, bool kM16 = false, int kTileSteps = 0>
 __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
   __shared__ __align__(16) uint32_t sh_lut[4096];
   extern __shared__ __align__(16) unsigned char smem[];
@@ -447,8 +449,11 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
   const int K = pb.K;
   const int S = K >> 5;
 
-  uint4* const x_smem_u4 = reinterpret_cast<uint4*>(smem);
-  const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(smem)) + (kXsmem ? kBrXsmemBytes : 0u);
+  constexpr bool kTiledXs = (kTileSteps > 0);
+  constexpr uint32_t kXBytes = static_cast<uint32_t>(kTileSteps) * 1024u;
+  uint32_t* const xs32 = reinterpret_cast<uint32_t*>(smem);
+  uint4* const xs_u4 = reinterpret_cast<uint4*>(smem);
+  const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(smem)) + kXBytes;
   const uint32_t ring_s = ((sbase0 + kRB - 1u) & ~(kRB - 1u)) + static_cast<uint32_t>(wib) * kRB;
 
   const int q_w = pb.tw / gridDim.x;
@@ -531,12 +536,36 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
   } else {
     asm volatile("cp.async.wait_group 0;" ::: "memory");
   }
-  __syncthreads();
 
   if (pb.pdl_mode & 1) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
-  if constexpr (!kXsmem) {
+
+  const bool x_align16 = ((reinterpret_cast<uintptr_t>(pb.x) & 15u) == 0u);
+  auto fill_bf16_tile = [&](int s_base, int cur_S) {
+    const int n_u4 = cur_S << 6;  // cur_S * 64 uint4s (16 rows x 4 16B quarters)
+#pragma unroll 1
+    for (int u = tid; u < n_u4; u += blockDim.x) {
+      const int s_loc = u >> 6;
+      const int m = (u >> 2) & 15;
+      if (m < pb.M) {
+        const int q = u & 3;
+        const uint16_t* xp = pb.x + static_cast<size_t>(m) * K + 32 * (s_base + s_loc) + 8 * q;
+        const uint4 v = x_align16
+            ? __ldg(reinterpret_cast<const uint4*>(xp))
+            : make_uint4(__ldg(reinterpret_cast<const uint32_t*>(xp)),
+                         __ldg(reinterpret_cast<const uint32_t*>(xp + 2)),
+                         __ldg(reinterpret_cast<const uint32_t*>(xp + 4)),
+                         __ldg(reinterpret_cast<const uint32_t*>(xp + 6)));
+        xs_u4[(s_loc << 6) | (q << 4) | m] = v;
+      }
+    }
+  };
+  if constexpr (kTiledXs) {
+    fill_bf16_tile(0, S < kTileSteps ? S : kTileSteps);
+  }
+  __syncthreads();
+  if constexpr (!kTiledXs) {
     if (!active) return;
   }
 
@@ -550,14 +579,13 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       valid_m ? reinterpret_cast<const uint32_t*>(pb.x + static_cast<size_t>(g) * K + 2 * t) : nullptr;
   const uint32_t* xrow32_hi =
       valid_m_hi ? reinterpret_cast<const uint32_t*>(pb.x + static_cast<size_t>(g + 8) * K + 2 * t) : nullptr;
-  // Vectorized 1-step (64 B = 4 uint4 across t=0..3) pointers for kPar4 (K%32==0 -> 2*K%64==0, 16B aligned).
-  const uint4* xrow_u4 =
-      valid_m ? reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(g) * K + 8 * t) : nullptr;
-  const uint4* xrow_u4_hi =
-      valid_m_hi ? reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(g + 8) * K + 8 * t) : nullptr;
+  const int quad_m = g + ((t & 2) ? 8 : 0);
+  const bool quad_valid = kM16 ? (quad_m < pb.M) : ((t < 2) && valid_m);
+  const uint16_t* const quad_x_ptr = quad_valid ? (pb.x + static_cast<size_t>(quad_m) * K + ((t & 1) << 3)) : nullptr;
   const uint32_t base_m1 = pb.base_m1;
 
   uint32_t st[kNS];
+  uint32_t pwb = 128u * kNS;
   if (active) {
     asm volatile("cp.async.wait_group %0;" ::"n"(kRG - 2) : "memory");
     __syncwarp();
@@ -566,7 +594,6 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       st[s] = br_lds32(ring_s + ((128u * s + 4u * lane) & (kRB - 1u)));
     }
   }
-  uint32_t pwb = 128u * kNS;
 
   if constexpr (kPar4) {
     const uint32_t lane16 = static_cast<uint32_t>(lane) * 16u;
@@ -586,147 +613,153 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
     asm volatile("cp.async.commit_group;" ::: "memory");                                                      \
     issued++;                                                                                                 \
   }
-    auto load_x_chunk = [&](int buf, int s_base) {
-      const int total_u4 = 64 * pb.M;
-      for (int idx = tid; idx < total_u4; idx += blockDim.x) {
-        const int m = idx >> 6;
-        const int sl = (idx >> 2) & 15;
-        const int u = idx & 3;
-        const uint4* src = reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(m) * K) + 4 * (s_base + sl) + u;
-        x_smem_u4[(buf * 16 + sl) * kBrXStrideU4 + m * 4 + u] = __ldg(src);
-      }
-    };
-    const int R_max = (NB + pb.tw - 1) / pb.tw;
-    for (int r_i = 0; r_i < R_max; ++r_i) {
-      const int nb = w + r_i * pb.tw;
-      const bool do_nb = active && (nb < NB);
+    const int R_max = kTiledXs ? ((NB + pb.tw - 1) / pb.tw) : 0;
+    for (int r_iter = 0, nb = w; kTiledXs ? (r_iter < R_max) : (nb < NB); ++r_iter, nb += pb.tw) {
+      const bool has_nb = kTiledXs ? (active && (nb < NB)) : true;
       float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
-      const int trig_s = (do_nb && (pb.pdl_mode & 2) && (nb + pb.tw >= NB)) ? ((S > 16) ? (S - 16) : 0) : -1;
-      if constexpr (kXsmem) {
-        load_x_chunk(0, 0);
-        __syncthreads();
-      }
-      const int cs_step = kXsmem ? 16 : S;
-      for (int cs = 0; cs < S; cs += cs_step) {
-        const int cur_buf = (cs >> 4) & 1;
-        if constexpr (kXsmem) {
-          if (cs + 16 < S) load_x_chunk(cur_buf ^ 1, cs + 16);
+      const int trig_s = (has_nb && (pb.pdl_mode & 2) && (nb + pb.tw >= NB)) ? ((S > 16) ? (S - 16) : 0) : -1;
+      for (int s = 0; s < S; ++s) {
+        if constexpr (kTiledXs) {
+          if ((s & (kTileSteps - 1)) == 0 && (r_iter > 0 || s > 0)) {
+            __syncthreads();
+            fill_bf16_tile(s, (S - s) < kTileSteps ? (S - s) : kTileSteps);
+            __syncthreads();
+          }
+          if (!has_nb) continue;
         }
-        if (do_nb) {
-          const int s_end = kXsmem ? (cs + 16) : S;
-          for (int s = cs; s < s_end; ++s) {
-            if (s == trig_s) {
-              asm volatile("griddepcontrol.launch_dependents;");
+        if (s == trig_s) {
+          asm volatile("griddepcontrol.launch_dependents;");
+        }
+        // Pre-issue activation loads and all 4 independent LUT loads in parallel.
+        uint32_t a0 = 0u, a1 = 0u, a2 = 0u, a3 = 0u, a4 = 0u, a5 = 0u, a6 = 0u, a7 = 0u;
+        if constexpr (kTiledXs) {
+          const int s_loc = s & (kTileSteps - 1);
+          const int b_off = s_loc << 8;
+          if (valid_m) {
+            a0 = xs32[b_off | lane];
+            a2 = xs32[b_off | 64 | lane];
+            a4 = xs32[b_off | 128 | lane];
+            a6 = xs32[b_off | 192 | lane];
+          }
+          if constexpr (kM16) {
+            if (valid_m_hi) {
+              a1 = xs32[b_off | 32 | lane];
+              a3 = xs32[b_off | 96 | lane];
+              a5 = xs32[b_off | 160 | lane];
+              a7 = xs32[b_off | 224 | lane];
             }
-            // Pre-issue 1 (or 2 for kM16) vectorized uint4 activation loads (SMEM or L1/L2) + 4 LUT loads.
-            uint4 v_lo = make_uint4(0u, 0u, 0u, 0u);
-            uint4 v_hi = make_uint4(0u, 0u, 0u, 0u);
-            if constexpr (kXsmem) {
-              const uint32_t xbase = (cur_buf * 16 + (s - cs)) * kBrXStrideU4;
-              if (valid_m) v_lo = x_smem_u4[xbase + g * 4 + t];
-              if constexpr (kM16) {
-                if (valid_m_hi) v_hi = x_smem_u4[xbase + (g + 8) * 4 + t];
-              }
-            } else {
-              if (valid_m) v_lo = __ldg(xrow_u4 + 4 * s);
-              if constexpr (kM16) {
-                if (valid_m_hi) v_hi = __ldg(xrow_u4_hi + 4 * s);
-              }
-            }
+          }
+        } else if (x_align16) {
+          const uint4 qv0 = quad_valid ? __ldg(reinterpret_cast<const uint4*>(quad_x_ptr + 32 * s))
+                                       : make_uint4(0u, 0u, 0u, 0u);
+          const uint4 qv1 = quad_valid ? __ldg(reinterpret_cast<const uint4*>(quad_x_ptr + 32 * s + 16))
+                                       : make_uint4(0u, 0u, 0u, 0u);
+          br_quad_transpose_4x4(t, qv0, a0, a2, a1, a3);
+          br_quad_transpose_4x4(t, qv1, a4, a6, a5, a7);
+        } else {
+          a0 = valid_m ? __ldg(xrow32 + 16 * s) : 0u;
+          a2 = valid_m ? __ldg(xrow32 + 16 * s + 4) : 0u;
+          a4 = valid_m ? __ldg(xrow32 + 16 * s + 8) : 0u;
+          a6 = valid_m ? __ldg(xrow32 + 16 * s + 12) : 0u;
+          a1 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s) : 0u;
+          a3 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 4) : 0u;
+          a5 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 8) : 0u;
+          a7 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 12) : 0u;
+        }
 
-            const uint32_t le0 = sh_lut[st[0] & 4095u];
-            const uint32_t le1 = sh_lut[st[1] & 4095u];
-            const uint32_t le2 = sh_lut[st[2] & 4095u];
-            const uint32_t le3 = sh_lut[st[3] & 4095u];
+        const uint32_t le0 = sh_lut[st[0] & 4095u];
+        const uint32_t le1 = sh_lut[st[1] & 4095u];
+        const uint32_t le2 = sh_lut[st[2] & 4095u];
+        const uint32_t le3 = sh_lut[st[3] & 4095u];
 
-            const int curg = static_cast<int>(pwb >> 9);
-            if (issued <= curg + static_cast<int>(kRG) - 1) {
-              __syncwarp();
-              do {
-                BR_ISSUE_FAST();
-              } while (issued <= curg + static_cast<int>(kRG) - 1);
-              asm volatile("cp.async.wait_group %0;" ::"n"(kRG - 2) : "memory");
-              __syncwarp();
-            }
+        const int curg = static_cast<int>(pwb >> 9);
+        if (issued <= curg + static_cast<int>(kRG) - 1) {
+          __syncwarp();
+          do {
+            BR_ISSUE_FAST();
+          } while (issued <= curg + static_cast<int>(kRG) - 1);
+          asm volatile("cp.async.wait_group %0;" ::"n"(kRG - 2) : "memory");
+          __syncwarp();
+        }
 
-            const uint32_t na = pwb + 8u * static_cast<uint32_t>(lane);
-            uint32_t sm_w0, sm_w1;
-            if ((pwb & 2u) == 0u) {
-              sm_w0 = br_lds32(ring_s + (na & (kRB - 1u)));
-              sm_w1 = br_lds32(ring_s + ((na + 4u) & (kRB - 1u)));
-            } else {
-              sm_w0 = br_lds16(ring_s + (na & (kRB - 1u))) | (br_lds16(ring_s + ((na + 2u) & (kRB - 1u))) << 16);
-              sm_w1 = br_lds16(ring_s + ((na + 4u) & (kRB - 1u))) | (br_lds16(ring_s + ((na + 6u) & (kRB - 1u))) << 16);
-            }
-            pwb += 256u;
+        const uint32_t na = pwb + 8u * static_cast<uint32_t>(lane);
+        uint32_t sm_w0, sm_w1;
+        if ((pwb & 2u) == 0u) {
+          sm_w0 = br_lds32(ring_s + (na & (kRB - 1u)));
+          sm_w1 = br_lds32(ring_s + ((na + 4u) & (kRB - 1u)));
+        } else {
+          sm_w0 = br_lds16(ring_s + (na & (kRB - 1u))) | (br_lds16(ring_s + ((na + 2u) & (kRB - 1u))) << 16);
+          sm_w1 = br_lds16(ring_s + ((na + 4u) & (kRB - 1u))) | (br_lds16(ring_s + ((na + 6u) & (kRB - 1u))) << 16);
+        }
+        pwb += 256u;
 
-            // 4 independent 12-bit rANS updates + warp ballots in parallel.
-            const uint32_t xh0 = st[0] >> 12;
-            const uint32_t x0 = ((le0 >> 8) & 4095u) * xh0 + xh0 + (le0 >> 20);
-            const uint32_t xh1 = st[1] >> 12;
-            const uint32_t x1 = ((le1 >> 8) & 4095u) * xh1 + xh1 + (le1 >> 20);
-            const uint32_t xh2 = st[2] >> 12;
-            const uint32_t x2 = ((le2 >> 8) & 4095u) * xh2 + xh2 + (le2 >> 20);
-            const uint32_t xh3 = st[3] >> 12;
-            const uint32_t x3 = ((le3 >> 8) & 4095u) * xh3 + xh3 + (le3 >> 20);
-            const bool n0 = x0 < kRansL;
-            const bool n1 = x1 < kRansL;
-            const bool n2 = x2 < kRansL;
-            const bool n3 = x3 < kRansL;
-            const uint32_t m0 = __ballot_sync(0xffffffffu, n0);
-            const uint32_t m1 = __ballot_sync(0xffffffffu, n1);
-            const uint32_t m2 = __ballot_sync(0xffffffffu, n2);
-            const uint32_t m3 = __ballot_sync(0xffffffffu, n3);
-            const uint32_t p0 = pwb;
-            const uint32_t p1 = p0 + (__popc(m0) << 1);
-            const uint32_t p2 = p1 + (__popc(m1) << 1);
-            const uint32_t p3 = p2 + (__popc(m2) << 1);
-            pwb = p3 + (__popc(m3) << 1);
+        // 4 independent 12-bit rANS updates + warp ballots in parallel.
+        const uint32_t xh0 = st[0] >> 12;
+        const uint32_t x0 = ((le0 >> 8) & 4095u) * xh0 + xh0 + (le0 >> 20);
+        const uint32_t xh1 = st[1] >> 12;
+        const uint32_t x1 = ((le1 >> 8) & 4095u) * xh1 + xh1 + (le1 >> 20);
+        const uint32_t xh2 = st[2] >> 12;
+        const uint32_t x2 = ((le2 >> 8) & 4095u) * xh2 + xh2 + (le2 >> 20);
+        const uint32_t xh3 = st[3] >> 12;
+        const uint32_t x3 = ((le3 >> 8) & 4095u) * xh3 + xh3 + (le3 >> 20);
+        const bool n0 = x0 < kRansL;
+        const bool n1 = x1 < kRansL;
+        const bool n2 = x2 < kRansL;
+        const bool n3 = x3 < kRansL;
+        const uint32_t m0 = __ballot_sync(0xffffffffu, n0);
+        const uint32_t m1 = __ballot_sync(0xffffffffu, n1);
+        const uint32_t m2 = __ballot_sync(0xffffffffu, n2);
+        const uint32_t m3 = __ballot_sync(0xffffffffu, n3);
+        const uint32_t p0 = pwb;
+        const uint32_t p1 = p0 + (__popc(m0) << 1);
+        const uint32_t p2 = p1 + (__popc(m1) << 1);
+        const uint32_t p3 = p2 + (__popc(m2) << 1);
+        pwb = p3 + (__popc(m3) << 1);
 
-            // Issue all 4 conditional lds16 renorms in parallel.
-            const uint32_t r0 = n0 ? br_lds16(ring_s + ((p0 + (__popc(m0 & lt) << 1)) & (kRB - 1u))) : 0u;
-            const uint32_t r1 = n1 ? br_lds16(ring_s + ((p1 + (__popc(m1 & lt) << 1)) & (kRB - 1u))) : 0u;
-            const uint32_t r2 = n2 ? br_lds16(ring_s + ((p2 + (__popc(m2 & lt) << 1)) & (kRB - 1u))) : 0u;
-            const uint32_t r3 = n3 ? br_lds16(ring_s + ((p3 + (__popc(m3 & lt) << 1)) & (kRB - 1u))) : 0u;
+        // Issue all 4 conditional lds16 renorms in parallel.
+        const uint32_t r0 = n0 ? br_lds16(ring_s + ((p0 + (__popc(m0 & lt) << 1)) & (kRB - 1u))) : 0u;
+        const uint32_t r1 = n1 ? br_lds16(ring_s + ((p1 + (__popc(m1 & lt) << 1)) & (kRB - 1u))) : 0u;
+        const uint32_t r2 = n2 ? br_lds16(ring_s + ((p2 + (__popc(m2 & lt) << 1)) & (kRB - 1u))) : 0u;
+        const uint32_t r3 = n3 ? br_lds16(ring_s + ((p3 + (__popc(m3 & lt) << 1)) & (kRB - 1u))) : 0u;
 
-            const uint32_t Pw01 = __byte_perm(le0, le1, 0x7740);
-            const uint32_t Pw23 = __byte_perm(le2, le3, 0x7740);
-            const uint32_t Pw = __byte_perm(Pw01, Pw23, 0x5410);
+        const uint32_t Pw01 = __byte_perm(le0, le1, 0x7740);
+        const uint32_t Pw23 = __byte_perm(le2, le3, 0x7740);
+        const uint32_t Pw = __byte_perm(Pw01, Pw23, 0x5410);
 
-            const uint32_t hi4 = (Pw >> 4) & 0x0F0F0F0Fu;
-            const uint32_t lo4 = Pw & 0x0F0F0F0Fu;
-            const uint32_t esc_bits = ((hi4 + 0x01010101u) | (lo4 + 0x01010101u)) & 0x10101010u;
+        const uint32_t hi4 = (Pw >> 4) & 0x0F0F0F0Fu;
+        const uint32_t lo4 = Pw & 0x0F0F0F0Fu;
+        const uint32_t esc_bits = ((hi4 + 0x01010101u) | (lo4 + 0x01010101u)) & 0x10101010u;
 
-            uint32_t c0_ = hi4 & 15u, c1_ = lo4 & 15u;
-            uint32_t c2_ = (hi4 >> 8) & 15u, c3_ = (lo4 >> 8) & 15u;
-            uint32_t c4_ = (hi4 >> 16) & 15u, c5_ = (lo4 >> 16) & 15u;
-            uint32_t c6_ = (hi4 >> 24) & 15u, c7_ = (lo4 >> 24) & 15u;
+        uint32_t c0_ = hi4 & 15u, c1_ = lo4 & 15u;
+        uint32_t c2_ = (hi4 >> 8) & 15u, c3_ = (lo4 >> 8) & 15u;
+        uint32_t c4_ = (hi4 >> 16) & 15u, c5_ = (lo4 >> 16) & 15u;
+        uint32_t c6_ = (hi4 >> 24) & 15u, c7_ = (lo4 >> 24) & 15u;
 
-            uint32_t e0 = c0_ ? (base_m1 + c0_) : 0u;
-            uint32_t e1 = c1_ ? (base_m1 + c1_) : 0u;
-            uint32_t e2 = c2_ ? (base_m1 + c2_) : 0u;
-            uint32_t e3 = c3_ ? (base_m1 + c3_) : 0u;
-            uint32_t e4 = c4_ ? (base_m1 + c4_) : 0u;
-            uint32_t e5 = c5_ ? (base_m1 + c5_) : 0u;
-            uint32_t e6 = c6_ ? (base_m1 + c6_) : 0u;
-            uint32_t e7 = c7_ ? (base_m1 + c7_) : 0u;
+        uint32_t e0 = c0_ ? (base_m1 + c0_) : 0u;
+        uint32_t e1 = c1_ ? (base_m1 + c1_) : 0u;
+        uint32_t e2 = c2_ ? (base_m1 + c2_) : 0u;
+        uint32_t e3 = c3_ ? (base_m1 + c3_) : 0u;
+        uint32_t e4 = c4_ ? (base_m1 + c4_) : 0u;
+        uint32_t e5 = c5_ ? (base_m1 + c5_) : 0u;
+        uint32_t e6 = c6_ ? (base_m1 + c6_) : 0u;
+        uint32_t e7 = c7_ ? (base_m1 + c7_) : 0u;
 
-            const bool had_esc = __any_sync(0xffffffffu, esc_bits != 0u);
-            if (__builtin_expect(had_esc, 0)) {
-              // Commit renorms before BR_ISSUE_FAST() can overwrite ring_s.
-              st[0] = n0 ? ((x0 << 16) | r0) : x0;
-              st[1] = n1 ? ((x1 << 16) | r1) : x1;
-              st[2] = n2 ? ((x2 << 16) | r2) : x2;
-              st[3] = n3 ? ((x3 << 16) | r3) : x3;
-              const int cg2 = static_cast<int>(pwb >> 9);
-              if (issued <= cg2 + static_cast<int>(kRG) - 1) {
-                __syncwarp();
-                do {
-                  BR_ISSUE_FAST();
-                } while (issued <= cg2 + static_cast<int>(kRG) - 1);
-                asm volatile("cp.async.wait_group %0;" ::"n"(kRG - 2) : "memory");
-                __syncwarp();
-              }
+        const bool had_esc = __any_sync(0xffffffffu, esc_bits != 0u);
+        if (__builtin_expect(had_esc, 0)) {
+          // Commit renorms before BR_ISSUE_FAST() can overwrite ring_s.
+          st[0] = n0 ? ((x0 << 16) | r0) : x0;
+          st[1] = n1 ? ((x1 << 16) | r1) : x1;
+          st[2] = n2 ? ((x2 << 16) | r2) : x2;
+          st[3] = n3 ? ((x3 << 16) | r3) : x3;
+          const int cg2 = static_cast<int>(pwb >> 9);
+          if (issued <= cg2 + static_cast<int>(kRG) - 1) {
+            __syncwarp();
+            do {
+              BR_ISSUE_FAST();
+            } while (issued <= cg2 + static_cast<int>(kRG) - 1);
+            asm volatile("cp.async.wait_group %0;" ::"n"(kRG - 2) : "memory");
+            __syncwarp();
+          }
 #define BR_ESC_P(ci, ei)                                                                             \
   {                                                                                                  \
     const bool is_e = ((ci) == 15u);                                                                 \
@@ -736,66 +769,67 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       pwb += __popc(em) << 1;                                                                        \
     }                                                                                                \
   }
-              BR_ESC_P(c0_, e0) BR_ESC_P(c1_, e1) BR_ESC_P(c2_, e2) BR_ESC_P(c3_, e3)
-              BR_ESC_P(c4_, e4) BR_ESC_P(c5_, e5) BR_ESC_P(c6_, e6) BR_ESC_P(c7_, e7)
+          BR_ESC_P(c0_, e0) BR_ESC_P(c1_, e1) BR_ESC_P(c2_, e2) BR_ESC_P(c3_, e3)
+          BR_ESC_P(c4_, e4) BR_ESC_P(c5_, e5) BR_ESC_P(c6_, e6) BR_ESC_P(c7_, e7)
 #undef BR_ESC_P
-            }
-
-            uint32_t a0, a2, a4, a6;
-            br_xpose4(v_lo, t, a0, a2, a4, a6);
-            uint32_t a1 = 0u, a3 = 0u, a5 = 0u, a7 = 0u;
-            if constexpr (kM16) {
-              br_xpose4(v_hi, t, a1, a3, a5, a7);
-            }
-
-            const uint32_t sm01 = __byte_perm(sm_w0, 0u, 0x4140);
-            const uint32_t sm23 = __byte_perm(sm_w0, 0u, 0x4342);
-            const uint32_t b0 = ((sm01 & 0x00800080u) << 8) | (sm01 & 0x007F007Fu) | (e0 << 7) | (e1 << 23);
-            const uint32_t b1 = ((sm23 & 0x00800080u) << 8) | (sm23 & 0x007F007Fu) | (e2 << 7) | (e3 << 23);
-            if constexpr (kM16) {
-              bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
-            } else {
-              bf16_mma_m16n8k16(c0, c1, c2, c3, a0, a2, b0, b1);
-            }
-
-            const uint32_t sm45 = __byte_perm(sm_w1, 0u, 0x4140);
-            const uint32_t sm67 = __byte_perm(sm_w1, 0u, 0x4342);
-            const uint32_t b2 = ((sm45 & 0x00800080u) << 8) | (sm45 & 0x007F007Fu) | (e4 << 7) | (e5 << 23);
-            const uint32_t b3 = ((sm67 & 0x00800080u) << 8) | (sm67 & 0x007F007Fu) | (e6 << 7) | (e7 << 23);
-            if constexpr (kM16) {
-              bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a4, a5, a6, a7, b2, b3);
-            } else {
-              bf16_mma_m16n8k16(c0, c1, c2, c3, a4, a6, b2, b3);
-            }
-
-            if (!had_esc) {
-              st[0] = n0 ? ((x0 << 16) | r0) : x0;
-              st[1] = n1 ? ((x1 << 16) | r1) : x1;
-              st[2] = n2 ? ((x2 << 16) | r2) : x2;
-              st[3] = n3 ? ((x3 << 16) | r3) : x3;
-            }
-          }
         }
-        if constexpr (kXsmem) {
-          if (cs + 16 < S) __syncthreads();
+
+        const uint32_t sm01 = __byte_perm(sm_w0, 0u, 0x4140);
+        const uint32_t sm23 = __byte_perm(sm_w0, 0u, 0x4342);
+        const uint32_t b0 = ((sm01 & 0x00800080u) << 8) | (sm01 & 0x007F007Fu) | (e0 << 7) | (e1 << 23);
+        const uint32_t b1 = ((sm23 & 0x00800080u) << 8) | (sm23 & 0x007F007Fu) | (e2 << 7) | (e3 << 23);
+        if constexpr (kM16) {
+          bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
+        } else {
+          bf16_mma_m16n8k16(c0, c1, c2, c3, a0, a2, b0, b1);
+        }
+
+        const uint32_t sm45 = __byte_perm(sm_w1, 0u, 0x4140);
+        const uint32_t sm67 = __byte_perm(sm_w1, 0u, 0x4342);
+        const uint32_t b2 = ((sm45 & 0x00800080u) << 8) | (sm45 & 0x007F007Fu) | (e4 << 7) | (e5 << 23);
+        const uint32_t b3 = ((sm67 & 0x00800080u) << 8) | (sm67 & 0x007F007Fu) | (e6 << 7) | (e7 << 23);
+        if constexpr (kM16) {
+          bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a4, a5, a6, a7, b2, b3);
+        } else {
+          bf16_mma_m16n8k16(c0, c1, c2, c3, a4, a6, b2, b3);
+        }
+
+        if (!had_esc) {
+          st[0] = n0 ? ((x0 << 16) | r0) : x0;
+          st[1] = n1 ? ((x1 << 16) | r1) : x1;
+          st[2] = n2 ? ((x2 << 16) | r2) : x2;
+          st[3] = n3 ? ((x3 << 16) | r3) : x3;
         }
       }
-      if (do_nb && valid_m) {
+      if (has_nb && valid_m) {
         __nv_bfloat162 r;
         r.x = __float2bfloat16_rn(c0);
         r.y = __float2bfloat16_rn(c1);
-        *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * pb.N + nb * 8 + 2 * t) = r;
-        if constexpr (kM16) {
-          if (valid_m_hi) {
-            __nv_bfloat162 r2;
-            r2.x = __float2bfloat16_rn(c2);
-            r2.y = __float2bfloat16_rn(c3);
-            *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * pb.N + nb * 8 + 2 * t) = r2;
+        if (pb.out2 != nullptr && nb >= pb.nb_split) {
+          const int n1 = pb.N - pb.nb_split * 8;
+          const int col1 = (nb - pb.nb_split) * 8 + 2 * t;
+          *reinterpret_cast<__nv_bfloat162*>(pb.out2 + static_cast<size_t>(g) * n1 + col1) = r;
+          if constexpr (kM16) {
+            if (valid_m_hi) {
+              __nv_bfloat162 r2;
+              r2.x = __float2bfloat16_rn(c2);
+              r2.y = __float2bfloat16_rn(c3);
+              *reinterpret_cast<__nv_bfloat162*>(pb.out2 + static_cast<size_t>(g + 8) * n1 + col1) = r2;
+            }
+          }
+        } else {
+          const int n0 = (pb.out2 != nullptr) ? (pb.nb_split * 8) : pb.N;
+          const int col0 = nb * 8 + 2 * t;
+          *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * n0 + col0) = r;
+          if constexpr (kM16) {
+            if (valid_m_hi) {
+              __nv_bfloat162 r2;
+              r2.x = __float2bfloat16_rn(c2);
+              r2.y = __float2bfloat16_rn(c3);
+              *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * n0 + col0) = r2;
+            }
           }
         }
-      }
-      if constexpr (kXsmem) {
-        if (r_i + 1 < R_max) __syncthreads();
       }
     }
     if (active) asm volatile("cp.async.wait_group 0;" ::: "memory");
@@ -914,13 +948,29 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       __nv_bfloat162 r;
       r.x = __float2bfloat16_rn(c0);
       r.y = __float2bfloat16_rn(c1);
-      *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * pb.N + nb * 8 + 2 * t) = r;
-      if constexpr (kM16) {
-        if (valid_m_hi) {
-          __nv_bfloat162 r2;
-          r2.x = __float2bfloat16_rn(c2);
-          r2.y = __float2bfloat16_rn(c3);
-          *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * pb.N + nb * 8 + 2 * t) = r2;
+      if (pb.out2 != nullptr && nb >= pb.nb_split) {
+        const int n1 = pb.N - pb.nb_split * 8;
+        const int col1 = (nb - pb.nb_split) * 8 + 2 * t;
+        *reinterpret_cast<__nv_bfloat162*>(pb.out2 + static_cast<size_t>(g) * n1 + col1) = r;
+        if constexpr (kM16) {
+          if (valid_m_hi) {
+            __nv_bfloat162 r2;
+            r2.x = __float2bfloat16_rn(c2);
+            r2.y = __float2bfloat16_rn(c3);
+            *reinterpret_cast<__nv_bfloat162*>(pb.out2 + static_cast<size_t>(g + 8) * n1 + col1) = r2;
+          }
+        }
+      } else {
+        const int n0 = (pb.out2 != nullptr) ? (pb.nb_split * 8) : pb.N;
+        const int col0 = nb * 8 + 2 * t;
+        *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * n0 + col0) = r;
+        if constexpr (kM16) {
+          if (valid_m_hi) {
+            __nv_bfloat162 r2;
+            r2.x = __float2bfloat16_rn(c2);
+            r2.y = __float2bfloat16_rn(c3);
+            *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * n0 + col0) = r2;
+          }
         }
       }
     }
@@ -962,7 +1012,7 @@ static BrCfg br_pick_cfg(int N, int K) {
     const int R = (NB + blocks * wcap - 1) / (blocks * wcap);
     const int tw = (NB + R - 1) / R;
     const int wpb = (tw + blocks - 1) / blocks;
-    if (wpb <= 20) return BrCfg{tw, blocks, wpb};
+    if (wpb <= 24) return BrCfg{tw, blocks, wpb};
   }
   return BrCfg{NB, blocks, (NB + blocks - 1) / blocks};
 }
@@ -998,23 +1048,21 @@ static void br_set_attrs_once() {
   if (done) return;
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   cudaThreadExchangeStreamCaptureMode(&mode);
-  // All production shapes use wpb <= 18 -> dsmem <= 40 KiB (+ 16 KiB LUT <= 64 KiB) for non-xsmem,
-  // and <= 72 KiB (+ 16 KiB LUT <= 88 KiB <= 99 KiB) for cooperative K-chunked xsmem.
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<false, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       static_cast<int>(kMaxSmem - kLutBytes));
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       static_cast<int>(kMaxSmem - kLutBytes));
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<false, true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       static_cast<int>(kMaxSmem - kLutBytes));
+#define BR_PREP_48K(P4, M16V, TS) \
+  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<P4, M16V, TS>, cudaFuncAttributePreferredSharedMemoryCarveout, 50); \
+  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<P4, M16V, TS>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+  BR_PREP_48K(true, false, 0)
+  BR_PREP_48K(false, false, 0)
+  BR_PREP_48K(true, true, 0)
+  BR_PREP_48K(false, true, 0)
+  BR_PREP_48K(true, true, 8)
+  BR_PREP_48K(true, true, 16)
+#undef BR_PREP_48K
   cudaThreadExchangeStreamCaptureMode(&mode);
   done = true;
 }
 
-template <bool kPar4, bool kM16 = false, bool kXsmem = false>
+template <bool kPar4, bool kM16 = false, int kTileSteps = 0>
 static inline void br_launch_k(int blocks, int threads, size_t dsmem, cudaStream_t st, BrProb pb) {
   if ((pb.pdl_mode & 1) != 0) {
     cudaLaunchConfig_t lcfg = {};
@@ -1027,11 +1075,49 @@ static inline void br_launch_k(int blocks, int threads, size_t dsmem, cudaStream
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     lcfg.attrs = attr;
     lcfg.numAttrs = 1;
-    cudaError_t err = cudaLaunchKernelEx(&lcfg, br_pair_mma_gemm_kernel<kPar4, kM16, kXsmem>, pb);
+    cudaError_t err = cudaLaunchKernelEx(&lcfg, br_pair_mma_gemm_kernel<kPar4, kM16, kTileSteps>, pb);
     TORCH_CHECK(err == cudaSuccess, "br_pair_mma_gemm_kernel PDL launch failed: ", cudaGetErrorString(err));
   } else {
-    br_pair_mma_gemm_kernel<kPar4, kM16, kXsmem><<<blocks, threads, dsmem, st>>>(pb);
+    br_pair_mma_gemm_kernel<kPar4, kM16, kTileSteps><<<blocks, threads, dsmem, st>>>(pb);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
+static inline void br_dispatch_gemm(const BrCfg& cfg, int M, cudaStream_t st, const BrProb& pb) {
+  TORCH_CHECK(cfg.wpb <= 20, "bf16_rans_gemm: wpb exceeds launch bounds (20)");
+  static const bool par4_en = []() {
+    const char* env = std::getenv("MUSE_BF16_RANS_PAR4");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  static const bool tiled_xs_en = []() {
+    const char* env = std::getenv("MUSE_BF16_RANS_TILED_XS");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  br_set_attrs_once();
+  if (par4_en && M > 8 && tiled_xs_en && cfg.wpb <= 18) {
+    if (cfg.wpb <= 14) {
+      const size_t dsmem = 16384u + kRB + static_cast<size_t>(cfg.wpb) * kRB;
+      br_launch_k<true, true, 16>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    } else {
+      const size_t dsmem = 8192u + kRB + static_cast<size_t>(cfg.wpb) * kRB;
+      br_launch_k<true, true, 8>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    }
+    return;
+  }
+  size_t dsmem = kRB + static_cast<size_t>(cfg.wpb) * kRB;
+  if (cfg.blocks == 48 && dsmem < 40960u) dsmem = 40960u;
+  if (par4_en) {
+    if (M > 8) {
+      br_launch_k<true, true, 0>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    } else {
+      br_launch_k<true, false, 0>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    }
+  } else {
+    if (M > 8) {
+      br_launch_k<false, true, 0>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    } else {
+      br_launch_k<false, false, 0>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    }
   }
 }
 
@@ -1212,53 +1298,20 @@ static void bf16_rans_gemm_into(torch::Tensor x, torch::Tensor blob, torch::Tens
   pb.lut = reinterpret_cast<const uint32_t*>(b + kHdrBytes);
   pb.x = reinterpret_cast<const uint16_t*>(x.data_ptr());
   pb.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  pb.out2 = nullptr;
   pb.M = M;
   pb.N = static_cast<int>(N);
   pb.K = static_cast<int>(K);
   pb.tw = cfg.tw;
+  pb.nb_split = 0;
   const int pdl_cfg = br_pdl_cfg();
   pb.pdl_mode = (pdl_cfg == 2) ? 3 : ((pdl_cfg == 1) ? 1 : 0);
   pb.base_m1 = static_cast<uint32_t>(base_exp) - 1u;
   pb.stream_bytes = (blob_bytes > soff + 64u) ? (blob_bytes - soff - 64u) : 0u;
   pb.tpf_stride = br_tpf_stride();
 
-  TORCH_CHECK(cfg.wpb <= 20, "bf16_rans_gemm_into: wpb exceeds launch bounds (20)");
-  size_t dsmem = kRB + static_cast<size_t>(cfg.wpb) * kRB;
-  if (cfg.blocks == 48 && dsmem < 40960u) dsmem = 40960u;
-  const size_t dsmem_xsmem = kBrXsmemBytes + kRB + static_cast<size_t>(cfg.wpb) * kRB;
-  br_set_attrs_once();
-
-  static const bool par4_en = []() {
-    const char* env = std::getenv("MUSE_BF16_RANS_PAR4");
-    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
-  }();
-  static const bool xsmem_en = []() {
-    const char* env = std::getenv("MUSE_BF16_RANS_XSMEM");
-    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
-  }();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  const bool x_aligned16 = ((reinterpret_cast<uintptr_t>(pb.x) & 15u) == 0u);
-  if (par4_en && x_aligned16) {
-    if (M > 8) {
-      if (xsmem_en && ((K >> 5) % 16 == 0) && dsmem_xsmem <= static_cast<size_t>(kMaxSmem - kLutBytes)) {
-        br_launch_k<true, true, true>(cfg.blocks, cfg.wpb * 32, dsmem_xsmem, st, pb);
-      } else if (dsmem <= 48u * 1024u) {
-        br_launch_k<true, true, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-      } else {
-        br_launch_k<false, true, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-      }
-    } else if (dsmem <= 48u * 1024u) {
-      br_launch_k<true, false, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-    } else {
-      br_launch_k<false, false, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-    }
-  } else {
-    if (M > 8) {
-      br_launch_k<false, true, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-    } else {
-      br_launch_k<false, false, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-    }
-  }
+  br_dispatch_gemm(cfg, M, st, pb);
 }
 
 torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int64_t K, int64_t base_exp) {
@@ -1269,6 +1322,46 @@ torch::Tensor bf16_rans_gemm(torch::Tensor x, torch::Tensor blob, int64_t N, int
 
 void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, int64_t N, int64_t K, int64_t base_exp) {
   bf16_rans_gemm_into(x, blob, out, N, K, base_exp);
+}
+
+void bf16_rans_gemm_dual(
+    torch::Tensor x, torch::Tensor blob, torch::Tensor out0, torch::Tensor out1,
+    int64_t N0, int64_t N1, int64_t K, int64_t base_exp) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(),
+              "x must be contiguous CUDA bf16 [M, K]");
+  const int M = static_cast<int>(x.size(0));
+  const int64_t N = N0 + N1;
+  TORCH_CHECK(M >= 1 && M <= 16 && x.size(1) == K && N0 % 8 == 0 && N1 % 8 == 0 && K % 32 == 0, "bad shape");
+  TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "bad blob");
+  TORCH_CHECK(out0.is_cuda() && out0.scalar_type() == torch::kBFloat16 && out0.is_contiguous() && out0.numel() == M * N0, "bad out0");
+  TORCH_CHECK(out1.is_cuda() && out1.scalar_type() == torch::kBFloat16 && out1.is_contiguous() && out1.numel() == M * N1, "bad out1");
+
+  const BrCfg cfg = br_pick_cfg(static_cast<int>(N), static_cast<int>(K));
+  const size_t soff = br_stream_off(cfg.tw);
+  const size_t blob_bytes = static_cast<size_t>(blob.numel());
+  const uint8_t* b = reinterpret_cast<const uint8_t*>(blob.data_ptr());
+
+  BrProb pb;
+  pb.hdr = b;
+  pb.stream = b + soff;
+  pb.woff16 = reinterpret_cast<const int*>(b + br_woff_off());
+  pb.lut = reinterpret_cast<const uint32_t*>(b + kHdrBytes);
+  pb.x = reinterpret_cast<const uint16_t*>(x.data_ptr());
+  pb.out = reinterpret_cast<__nv_bfloat16*>(out0.data_ptr());
+  pb.out2 = reinterpret_cast<__nv_bfloat16*>(out1.data_ptr());
+  pb.M = M;
+  pb.N = static_cast<int>(N);
+  pb.K = static_cast<int>(K);
+  pb.tw = cfg.tw;
+  pb.nb_split = static_cast<int>(N0 / 8);
+  const int pdl_cfg = br_pdl_cfg();
+  pb.pdl_mode = (pdl_cfg == 2) ? 3 : ((pdl_cfg == 1) ? 1 : 0);
+  pb.base_m1 = static_cast<uint32_t>(base_exp) - 1u;
+  pb.stream_bytes = (blob_bytes > soff + 64u) ? (blob_bytes - soff - 64u) : 0u;
+  pb.tpf_stride = br_tpf_stride();
+
+  auto st = c10::cuda::getCurrentCUDAStream().stream();
+  br_dispatch_gemm(cfg, M, st, pb);
 }
 
 int64_t bf16_rans_base(torch::Tensor blob) {
