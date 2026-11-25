@@ -29,17 +29,33 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+DEFAULT_TREE_M = "16"
 ENABLED = os.environ.get("MUSE_NATIVE_LEAF", "1").strip() not in ("0", "", "false", "no")
 M8_ENABLED = os.environ.get("MUSE_NATIVE_LEAF_M8", "1").strip() not in ("0", "", "false", "no")
 try:
-    _TREE_M_RAW = int(os.environ.get("MUSE_NATIVE_TREE_M", "12").strip() or "0")
+    _TREE_M_RAW = int(os.environ.get("MUSE_NATIVE_TREE_M", DEFAULT_TREE_M).strip() or "0")
 except ValueError:
     _TREE_M_RAW = 0
 TREE_M = _TREE_M_RAW if _TREE_M_RAW in (12, 16) else 0
+
+
+def desired_verify_m() -> int:
+    """Single source of truth for configured bs=1 depth-6 verify width (16, 12, 8, or 7)."""
+    if not ENABLED:
+        return 7
+    if TREE_M in (12, 16):
+        return TREE_M
+    if M8_ENABLED:
+        return 8
+    return 7
 LOW_THRESH = int(os.environ.get("MUSE_NATIVE_LEAF_THRESH", "3"))
 _POLICY_RAW = os.environ.get("MUSE_NATIVE_LEAF_POLICY", "d1").strip().lower()
 POLICY = 1 if _POLICY_RAW == "margin" else 0
 MARGIN_ALPHA = float(os.environ.get("MUSE_NATIVE_LEAF_MARGIN_ALPHA", "1.0"))
+TREE_DYNAMIC = os.environ.get("MUSE_TREE_DYNAMIC", "1").strip() not in ("0", "", "false", "no")
+TREE_TEMP = float(os.environ.get("MUSE_TREE_TEMP", "1.35"))
+TREE_TAIL = float(os.environ.get("MUSE_TREE_TAIL", "4.0"))
+TREE_GAMMA = float(os.environ.get("MUSE_TREE_GAMMA", "0.92"))
 _ST_RAW = os.environ.get("MUSE_NATIVE_LEAF_SELFTEST", "0").strip().lower()
 SELFTEST = 1 if _ST_RAW in ("1", "true", "yes") else (2 if _ST_RAW == "2" else 0)
 NOHIT = os.environ.get("MUSE_NATIVE_LEAF_NOHIT", "0").strip() in ("1", "true", "yes")
@@ -53,16 +69,17 @@ class _NativeLeafState:
         self.device: torch.device | None = None
         self.leaf_flag: torch.Tensor | None = None       # int32[49] shared with muse_gqa16_attn
         self.prev_ns: torch.Tensor | None = None         # int32[1]
-        self.hit_flag: torch.Tensor | None = None        # int32[1] (0=miss, k=hit depth 1..5)
+        self.hit_flag: torch.Tensor | None = None        # int32[1] (0=miss, k=hit depth 1..6)
         self.hit_src_row: torch.Tensor | None = None     # int32[1] (0=miss, r=winning leaf row 7..15)
         self.alt_ids: torch.Tensor | None = None         # int64[4] (d1_b1, d1_b2, d2_b1, d2_b2)
         self.alt_margins: torch.Tensor | None = None     # float32[2] (margin_d1, margin_d2)
-        self.tree_top: torch.Tensor | None = None        # int64[20] ([5, 4] top-4 for d1..d5)
+        self.tree_top: torch.Tensor | None = None        # int64[36] ([6, 6] top-6 for d1..d6)
+        self.tree_vals: torch.Tensor | None = None       # float32[36] ([6, 6] top-6 logits for d1..d6)
         self.req_acc_state: torch.Tensor | None = None   # int32[3] [rounds, committed, high_acc_flag]
         self.saved_alt_tok: torch.Tensor | None = None   # int64[1] (legacy M=7/M=8)
         self.saved_leaf_toks: torch.Tensor | None = None # int64[16] (tree mode)
         self.saved_leaf_k: torch.Tensor | None = None    # int32[16] (tree mode)
-        self.stats: torch.Tensor | None = None           # int64[18] [steps, mode, hits, clamps, k1..5, li0..8]
+        self.stats: torch.Tensor | None = None           # int64[19] [steps, mode, hits, clamps, k1..6, li0..8]
         # Static 52-layer target KV metadata for 1-launch all-layer KV fix on hit.
         self.num_layers: int = 0
         self.kv_ptrs: torch.Tensor | None = None
@@ -163,21 +180,39 @@ def get_margin_buf(device: torch.device) -> torch.Tensor | None:
 
 
 def get_tree_top_buf(device: torch.device) -> torch.Tensor | None:
-    """Return fixed-address int64[20] ([5, 4]) buffer for drafter rows 0..4 top-4/top-2 (CUDA-graph safe)."""
+    """Return fixed-address int64[36] ([6, 6]) buffer for drafter rows 0..5 top-6 IDs (CUDA-graph safe)."""
     if not ENABLED or TREE_M == 0 or device.type != "cuda":
         return None
     if (
         _S.tree_top is not None
         and _S.tree_top.device == device
-        and _S.tree_top.numel() >= 20
+        and _S.tree_top.numel() >= 36
         and not _S.tree_top.is_inference()
     ):
         return _S.tree_top
     if torch.cuda.is_current_stream_capturing():
         return _S.tree_top if (_S.tree_top is not None and _S.tree_top.device == device) else None
     with torch.inference_mode(False):
-        _S.tree_top = torch.full((20,), -1, dtype=torch.int64, device=device)
+        _S.tree_top = torch.full((36,), -1, dtype=torch.int64, device=device)
     return _S.tree_top
+
+
+def get_tree_vals_buf(device: torch.device) -> torch.Tensor | None:
+    """Return fixed-address float32[36] ([6, 6]) buffer for drafter rows 0..5 top-6 logits (CUDA-graph safe)."""
+    if not ENABLED or TREE_M == 0 or device.type != "cuda":
+        return None
+    if (
+        _S.tree_vals is not None
+        and _S.tree_vals.device == device
+        and _S.tree_vals.numel() >= 36
+        and not _S.tree_vals.is_inference()
+    ):
+        return _S.tree_vals
+    if torch.cuda.is_current_stream_capturing():
+        return _S.tree_vals if (_S.tree_vals is not None and _S.tree_vals.device == device) else None
+    with torch.inference_mode(False):
+        _S.tree_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
+    return _S.tree_vals
 
 
 def init_kv_table(
@@ -281,17 +316,26 @@ def init_kv_table(
         if (
             _S.tree_top is None
             or _S.tree_top.device != device
-            or _S.tree_top.numel() < 20
+            or _S.tree_top.numel() < 36
             or _S.tree_top.is_inference()
         ):
-            _S.tree_top = torch.full((20,), -1, dtype=torch.int64, device=device)
+            _S.tree_top = torch.full((36,), -1, dtype=torch.int64, device=device)
         else:
             _S.tree_top.fill_(-1)
+        if (
+            _S.tree_vals is None
+            or _S.tree_vals.device != device
+            or _S.tree_vals.numel() < 36
+            or _S.tree_vals.is_inference()
+        ):
+            _S.tree_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
+        else:
+            _S.tree_vals.fill_(-1e30)
         _S.req_acc_state = torch.zeros((3,), dtype=torch.int32, device=device)
         _S.saved_alt_tok = torch.full((1,), -1, dtype=torch.int64, device=device)
         _S.saved_leaf_toks = torch.full((16,), -1, dtype=torch.int64, device=device)
         _S.saved_leaf_k = torch.zeros((16,), dtype=torch.int32, device=device)
-        _S.stats = torch.zeros((18,), dtype=torch.int64, device=device)
+        _S.stats = torch.zeros((19,), dtype=torch.int64, device=device)
         _S.num_layers = len(kv_ptrs)
         _S.kv_ptrs = torch.tensor(kv_ptrs, dtype=torch.int64, device=device)
         _S.stride_block = torch.tensor(s_blk, dtype=torch.int64, device=device)
@@ -315,8 +359,9 @@ def init_kv_table(
         )
         _S.ready = True
     logger.info(
-        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d)",
-        _S.num_layers, _S.tree_m_ready, int(_S.m8_ready), _POLICY_RAW, MARGIN_ALPHA, LOW_THRESH, int(SELFTEST), int(NOHIT),
+        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, dynamic=%d [T=%.2f,tail=%.1f,g=%.2f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d)",
+        _S.num_layers, _S.tree_m_ready, int(TREE_DYNAMIC), TREE_TEMP, TREE_TAIL, TREE_GAMMA,
+        int(_S.m8_ready), _POLICY_RAW, MARGIN_ALPHA, LOW_THRESH, int(SELFTEST), int(NOHIT),
     )
     return True
 
@@ -341,11 +386,13 @@ def on_non_leaf_step(req_id: str | None, num_draft_tokens: int) -> None:
             _S.alt_margins.fill_(1e30)
         if _S.tree_top is not None:
             _S.tree_top.fill_(-1)
+        if _S.tree_vals is not None:
+            _S.tree_vals.fill_(-1e30)
         _S.req_acc_state.zero_()
     elif 0 < num_draft_tokens < 6:
-        # Ceiling shortened depth on high-acceptance request -> keep leaf mode off.
+        # Ceiling shortened depth on high-acceptance request -> hard-latch leaf mode off.
         _S.prev_ns.fill_(7)
-        _S.req_acc_state[2:3].fill_(1)
+        _S.req_acc_state[2:3].fill_(2)
 
 
 @torch.no_grad()
@@ -414,6 +461,8 @@ def setup_step(
             _S.alt_margins.fill_(1e30)
         if _S.tree_top is not None:
             _S.tree_top.fill_(-1)
+        if _S.tree_vals is not None:
+            _S.tree_vals.fill_(-1e30)
         _S.req_acc_state.zero_()
     if eff_m > 8:
         assert (
@@ -421,17 +470,35 @@ def setup_step(
             and _S.saved_leaf_toks is not None
             and _S.saved_leaf_k is not None
         )
-        bfx.native_leaf_setup_tree(
-            _S.leaf_flag,
-            _S.tree_top,
-            input_ids,
-            positions,
-            _S.saved_leaf_toks,
-            _S.saved_leaf_k,
-            eff_m,
-            SELFTEST,
-            _S.req_acc_state,
-        )
+        try:
+            bfx.native_leaf_setup_tree(
+                _S.leaf_flag,
+                _S.tree_top,
+                input_ids,
+                positions,
+                _S.saved_leaf_toks,
+                _S.saved_leaf_k,
+                eff_m,
+                SELFTEST,
+                _S.req_acc_state,
+                _S.tree_vals,
+                TREE_DYNAMIC,
+                TREE_TEMP,
+                TREE_TAIL,
+                TREE_GAMMA,
+            )
+        except TypeError:
+            bfx.native_leaf_setup_tree(
+                _S.leaf_flag,
+                _S.tree_top,
+                input_ids,
+                positions,
+                _S.saved_leaf_toks,
+                _S.saved_leaf_k,
+                eff_m,
+                SELFTEST,
+                _S.req_acc_state,
+            )
         return True
     bfx.native_leaf_setup(
         _S.leaf_flag,

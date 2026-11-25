@@ -541,7 +541,7 @@ def self_check_verify(device: torch.device) -> bool:
                 # 3) Generalized 1-level multi-leaf tree table mode (sentinel -1): test M=12 (5 leaves) & M=16 (9 leaves).
                 for tree_m, leaf_ks in (
                     (12, (1, 1, 2, 2, 3)),
-                    (16, (1, 1, 2, 2, 3, 1, 2, 4, 5)),
+                    (16, (1, 1, 2, 2, 3, 1, 3, 4, 5)),
                 ):
                     if seq_k < tree_m:
                         continue

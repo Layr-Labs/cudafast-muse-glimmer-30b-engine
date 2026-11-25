@@ -109,7 +109,8 @@ torch::Tensor draft_vocab_tail_argmax(
     torch::Tensor raw_s, torch::Tensor global_scale, double logit_scale,
     c10::optional<torch::Tensor> out_top2_row0 = c10::nullopt,
     c10::optional<torch::Tensor> out_margins = c10::nullopt,
-    c10::optional<torch::Tensor> out_tree_top = c10::nullopt);
+    c10::optional<torch::Tensor> out_tree_top = c10::nullopt,
+    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt);
 torch::Tensor draft_vocab_score_rows(
     torch::Tensor A, torch::Tensor row_ids, torch::Tensor raw_w,
     torch::Tensor raw_s, torch::Tensor global_scale, double logit_scale);
@@ -122,7 +123,12 @@ void native_leaf_setup_tree(
     torch::Tensor input_ids, torch::Tensor positions,
     torch::Tensor saved_leaf_toks, torch::Tensor saved_leaf_k,
     int64_t tree_m = 12, int64_t selftest_mode = 0,
-    c10::optional<torch::Tensor> req_acc_state = c10::nullopt);
+    c10::optional<torch::Tensor> req_acc_state = c10::nullopt,
+    c10::optional<torch::Tensor> tree_vals = c10::nullopt,
+    bool dynamic_mode = true,
+    double temp = 1.35,
+    double tail_c = 4.0,
+    double gamma = 0.92);
 void native_leaf_commit_tree(
     torch::Tensor leaf_flag, torch::Tensor prev_ns,
     torch::Tensor hit_flag, torch::Tensor hit_src_row,
@@ -172,7 +178,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("raw_s"), pybind11::arg("global_scale"), pybind11::arg("logit_scale") = 1.0,
         pybind11::arg("out_top2_row0") = c10::nullopt,
         pybind11::arg("out_margins") = c10::nullopt,
-        pybind11::arg("out_tree_top") = c10::nullopt);
+        pybind11::arg("out_tree_top") = c10::nullopt,
+        pybind11::arg("out_tree_vals") = c10::nullopt);
   m.def("draft_vocab_score_rows", &draft_vocab_score_rows,
         pybind11::arg("A"), pybind11::arg("row_ids"), pybind11::arg("raw_w"),
         pybind11::arg("raw_s"), pybind11::arg("global_scale"), pybind11::arg("logit_scale") = 1.0);
@@ -184,7 +191,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("input_ids"), pybind11::arg("positions"),
         pybind11::arg("saved_leaf_toks"), pybind11::arg("saved_leaf_k"),
         pybind11::arg("tree_m") = 12, pybind11::arg("selftest_mode") = 0,
-        pybind11::arg("req_acc_state") = c10::nullopt);
+        pybind11::arg("req_acc_state") = c10::nullopt,
+        pybind11::arg("tree_vals") = c10::nullopt,
+        pybind11::arg("dynamic_mode") = true,
+        pybind11::arg("temp") = 1.35,
+        pybind11::arg("tail_c") = 4.0,
+        pybind11::arg("gamma") = 0.92);
   m.def("native_leaf_commit_tree", &native_leaf_commit_tree,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"),
         pybind11::arg("hit_flag"), pybind11::arg("hit_src_row"),

@@ -274,24 +274,13 @@ class Scheduler(SchedulerInterface):
                 # When native multi-leaf tree (M=12/16) or M=8 zero-clamp 1-leaf verify
                 # is active at depth=6, reserve extra KV lookahead slots so rows 7..M-1
                 # are always backed in the request's block table.
-                import os as _os
-
                 _extra_leaf_slots = 0
-                if (
-                    self.num_spec_tokens == 6
-                    and _os.environ.get("MUSE_NATIVE_LEAF", "1").strip()
-                    not in ("0", "", "false", "no")
-                ):
-                    try:
-                        _tm = int(_os.environ.get("MUSE_NATIVE_TREE_M", "12").strip() or "0")
-                    except ValueError:
-                        _tm = 0
-                    if _tm in (12, 16):
-                        _extra_leaf_slots = _tm - 7
-                    elif _os.environ.get("MUSE_NATIVE_LEAF_M8", "1").strip() not in (
-                        "0", "", "false", "no"
-                    ):
-                        _extra_leaf_slots = 1
+                if self.num_spec_tokens == 6:
+                    from vllm.v1.worker.gpu.spec_decode.dflash.native_leaf import (
+                        desired_verify_m,
+                    )
+
+                    _extra_leaf_slots = max(0, desired_verify_m() - 7)
                 self.num_lookahead_tokens = (
                     self.num_spec_tokens + 1 + _extra_leaf_slots
                 )

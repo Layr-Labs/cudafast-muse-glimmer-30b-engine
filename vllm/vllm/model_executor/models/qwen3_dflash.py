@@ -788,6 +788,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         alt_buf = _nl.get_alt_buf(hidden_states.device) if _nl.ENABLED else None
         margin_buf = _nl.get_margin_buf(hidden_states.device) if _nl.ENABLED else None
         tree_top_buf = _nl.get_tree_top_buf(hidden_states.device) if _nl.ENABLED else None
+        tree_vals_buf = _nl.get_tree_vals_buf(hidden_states.device) if _nl.ENABLED else None
         lm_head = self.lm_head
         if (
             getattr(lm_head, "prompt_tail_admitted", False)
@@ -816,6 +817,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                     alt_buf,
                     margin_buf,
                     tree_top_buf,
+                    tree_vals_buf,
                 )
             except TypeError:
                 return _bfx.draft_vocab_tail_argmax(
@@ -830,7 +832,21 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                     logit_scale,
                 )
         if static_logits.dim() == 2 and static_logits.shape[0] >= 1:
-            if tree_top_buf is not None and tree_top_buf.numel() >= 20:
+            if tree_top_buf is not None and tree_top_buf.numel() >= 36:
+                n_tt = min(6, static_logits.shape[0])
+                tk6 = static_logits[:n_tt].topk(6, dim=-1)
+                tree_top_buf.fill_(-1)
+                tree_top_buf[: 6 * n_tt].copy_(vocab_map[tk6.indices].reshape(-1))
+                if tree_vals_buf is not None and tree_vals_buf.numel() >= 36:
+                    tree_vals_buf.fill_(-1e30)
+                    tree_vals_buf[: 6 * n_tt].copy_(tk6.values.to(torch.float32).reshape(-1))
+                if alt_buf is not None:
+                    n_t2 = min(2, n_tt, alt_buf.numel() // 2)
+                    alt_buf[: 2 * n_t2].copy_(vocab_map[tk6.indices[:n_t2, :2]].reshape(-1))
+                if margin_buf is not None:
+                    n_t2 = min(2, n_tt, margin_buf.numel())
+                    margin_buf[:n_t2].copy_((tk6.values[:n_t2, 0] - tk6.values[:n_t2, 1]).to(torch.float32))
+            elif tree_top_buf is not None and tree_top_buf.numel() >= 20:
                 n_tt = min(5, static_logits.shape[0])
                 tk4 = static_logits[:n_tt].topk(4, dim=-1)
                 tree_top_buf.fill_(-1)
