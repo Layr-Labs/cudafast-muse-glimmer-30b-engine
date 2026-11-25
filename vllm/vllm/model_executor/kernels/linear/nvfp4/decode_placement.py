@@ -1042,12 +1042,14 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                     if stats is not None and PLACE_SCALES6:
                         try:
                             import muse_marlin6_gemv as _m6
+                            transfer_fn = getattr(_m6, "transfer_scale_metadata", None)
                             ilv_set = getattr(_m6, "_DOWN_ILV_SCALES", None)
                             lm_split2_set = getattr(_m6, "_LM_SPLIT2_SCALES", None)
                             lm_split2_cache = getattr(_m6, "_LM_SPLIT2_CACHE", None)
                             lm_pad128_set = getattr(_m6, "_LM_PAD128_SCALES", None)
                             lm_pad128_cache = getattr(_m6, "_LM_PAD128_CACHE", None)
                         except (ImportError, OSError):
+                            transfer_fn = None
                             ilv_set = None
                             lm_split2_set = None
                             lm_split2_cache = None
@@ -1066,20 +1068,24 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                                         dst = torch.empty_like(s6)
                                     dst.copy_(s6)
                                     if torch.equal(dst, s6):
-                                        m._buffers["_marlin_decode_scales6"] = dst
-                                        if ilv_set is not None and old_ptr in ilv_set:
-                                            ilv_set.discard(old_ptr)
-                                            ilv_set.add(dst.data_ptr())
-                                        if lm_split2_set is not None and old_ptr in lm_split2_set:
-                                            lm_split2_set.discard(old_ptr)
-                                            lm_split2_set.add(dst.data_ptr())
-                                        if lm_split2_cache is not None and old_ptr in lm_split2_cache:
-                                            lm_split2_cache[dst.data_ptr()] = lm_split2_cache.pop(old_ptr)
-                                        if lm_pad128_set is not None and old_ptr in lm_pad128_set:
-                                            lm_pad128_set.discard(old_ptr)
-                                            lm_pad128_set.add(dst.data_ptr())
-                                        if lm_pad128_cache is not None and old_ptr in lm_pad128_cache:
-                                            lm_pad128_cache[dst.data_ptr()] = lm_pad128_cache.pop(old_ptr)
+                                        if callable(transfer_fn):
+                                            transfer_fn(s6, dst)
+                                            m._buffers["_marlin_decode_scales6"] = dst
+                                        else:
+                                            m._buffers["_marlin_decode_scales6"] = dst
+                                            if ilv_set is not None and old_ptr in ilv_set:
+                                                ilv_set.discard(old_ptr)
+                                                ilv_set.add(dst.data_ptr())
+                                            if lm_split2_set is not None and old_ptr in lm_split2_set:
+                                                lm_split2_set.discard(old_ptr)
+                                                lm_split2_set.add(dst.data_ptr())
+                                            if lm_split2_cache is not None and old_ptr in lm_split2_cache:
+                                                lm_split2_cache[dst.data_ptr()] = lm_split2_cache.pop(old_ptr)
+                                            if lm_pad128_set is not None and old_ptr in lm_pad128_set:
+                                                lm_pad128_set.discard(old_ptr)
+                                                lm_pad128_set.add(dst.data_ptr())
+                                            if lm_pad128_cache is not None and old_ptr in lm_pad128_cache:
+                                                lm_pad128_cache[dst.data_ptr()] = lm_pad128_cache.pop(old_ptr)
                                         moved_s6 += 1
                                         bytes_s6 += dst.numel() * dst.element_size()
                                 except RuntimeError:

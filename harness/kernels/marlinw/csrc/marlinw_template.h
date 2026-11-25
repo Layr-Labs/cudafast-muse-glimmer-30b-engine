@@ -242,7 +242,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
           const bool is_zp_float,  // is zero point of float16 type?
-          const bool fast_fp4 = false
+          const bool fast_fp4 = false,
+          const bool pdl_prod = false
           >
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
@@ -2035,6 +2036,11 @@ __global__ void Marlin(
 
       if (use_atomic_add && slice_count > 1 && slice_idx != 0)
         wait_negative_and_add(&locks[locks_off]);
+      if constexpr (pdl_prod) {
+        if (last || use_atomic_add) {
+          asm volatile("griddepcontrol.launch_dependents;");
+        }
+      }
       if (last || use_atomic_add)
         // only the last block in a slice actually writes the result
         write_result(last);

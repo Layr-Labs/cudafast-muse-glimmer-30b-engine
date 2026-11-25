@@ -89,14 +89,6 @@ class Backend(Protocol):
 
     def step(self) -> list[Emit]: ...
 
-    def begin_spec_run(self, count: int) -> None:
-        """Bound and pipeline the one timed speculative run."""
-        ...
-
-    def end_spec_run(self) -> None:
-        """Return to non-lookahead stepping before the timed reply."""
-        ...
-
     def abort(self) -> bool:
         """Drop the request. True when it was still generating."""
         ...
@@ -320,17 +312,6 @@ class VllmBackend:
         ):
             client.defer_settle = True
             self._settle_core = client.settle
-        # DFlash's V2 runner can apply speculative rejection corrections and
-        # draft-token updates while two batches are in flight. Keep that
-        # machinery dormant for prefill/correctness, though: a globally async
-        # engine would queue decode work before free_decode_begin replies. The
-        # timed run enables it only after its exact token count is known.
-        self._async_core = None
-        self._spec_run_pipelined = False
-        core = getattr(client, "engine_core", None)
-        if cfg.depth > 0 and core is not None and core.batch_queue is not None:
-            core.step_fn = core.step
-            self._async_core = core
         # VLLM_RESIDENT_ARGMAX_ONLY=0 keeps the top-k on every request.
         self._argmax_only = os.environ.get("VLLM_RESIDENT_ARGMAX_ONLY", "1") != "0"
         self._SamplingParams = SamplingParams
@@ -452,41 +433,6 @@ class VllmBackend:
             emitted = self._collect()
         return emitted
 
-    def begin_spec_run(self, count: int) -> None:
-        core = self._async_core
-        if core is None:
-            return
-        if self._spec_run_pipelined:
-            raise RuntimeError("a speculative run is already pipelined")
-        if core.batch_queue:
-            raise RuntimeError("cannot pipeline with an occupied batch queue")
-        if self._live is None:
-            raise RuntimeError("cannot pipeline without a live request")
-        request = core.scheduler.requests.get(self._live)
-        # A bounded sync (used by diagnostics and correctness probes) may have
-        # completed the request already.  Its next cycle will start a fresh
-        # request, so retain the synchronous path for that run.
-        if request is None or not self._engine.has_unfinished_requests():
-            return
-        # max_tokens counts every output after the prompt, including the seed
-        # token already produced by free_decode_begin. This bound lets the
-        # async scheduler prove that no N+1 batch is needed, so all GPU work
-        # belongs to free_decode_run(N)'s timed window.
-        request.max_tokens = request.num_output_tokens + count
-        if request.sampling_params is not None:
-            request.sampling_params.max_tokens = request.max_tokens
-        core.step_fn = core.step_with_batch_queue
-        self._spec_run_pipelined = True
-
-    def end_spec_run(self) -> None:
-        core = self._async_core
-        if core is None or not self._spec_run_pipelined:
-            return
-        if core.batch_queue:
-            raise RuntimeError("pipelined speculative run left a batch in flight")
-        core.step_fn = core.step
-        self._spec_run_pipelined = False
-
     def abort(self) -> bool:
         running = False
         if self._live is not None:
@@ -499,11 +445,6 @@ class VllmBackend:
         if self._settle_core is not None:
             # Nothing is live now: the core may still own a deferred cleanup.
             self._settle_core()
-        if getattr(self, "_spec_run_pipelined", False):
-            async_core = self._async_core
-            assert async_core is not None
-            async_core.step_fn = async_core.step
-            self._spec_run_pipelined = False
         return running
 
     def settle(self) -> None:
@@ -596,12 +537,6 @@ class FakeBackend:
             self._ctx.append(e.token)
             out.append(e)
         return out
-
-    def begin_spec_run(self, count: int) -> None:
-        pass
-
-    def end_spec_run(self) -> None:
-        pass
 
     def abort(self) -> bool:
         running = self._ctx is not None and self._left != 0

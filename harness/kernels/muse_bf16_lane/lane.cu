@@ -396,12 +396,30 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
     // are preloaded from immutable blob; wait for predecessor before reading x_in.
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
-  for (int i = tid; i < kWidth; i += blockDim.x) {
-    const int tile = i / kValues;
-    const int rem = i - tile * kValues;
-    const int step = rem >> 5;
-    const int ln = rem & 31;
-    sh_x[tile * kValues + ln * kSteps + step] = x_in[i];
+  if ((reinterpret_cast<uintptr_t>(x_in) & 15u) == 0u) {
+    for (int v = tid; v < (kWidth >> 3); v += blockDim.x) {
+      const int tile = v >> 5;
+      const int step = (v >> 2) & 7;
+      const int ln0 = (v & 3) << 3;
+      const uint4 x4 = reinterpret_cast<const uint4*>(x_in)[v];
+      uint16_t* dst = sh_x + tile * kValues + ln0 * kSteps + step;
+      dst[0 * kSteps] = static_cast<uint16_t>(x4.x);
+      dst[1 * kSteps] = static_cast<uint16_t>(x4.x >> 16);
+      dst[2 * kSteps] = static_cast<uint16_t>(x4.y);
+      dst[3 * kSteps] = static_cast<uint16_t>(x4.y >> 16);
+      dst[4 * kSteps] = static_cast<uint16_t>(x4.z);
+      dst[5 * kSteps] = static_cast<uint16_t>(x4.z >> 16);
+      dst[6 * kSteps] = static_cast<uint16_t>(x4.w);
+      dst[7 * kSteps] = static_cast<uint16_t>(x4.w >> 16);
+    }
+  } else {
+    for (int i = tid; i < kWidth; i += blockDim.x) {
+      const int tile = i >> 8;
+      const int rem = i & 255;
+      const int step = rem >> 5;
+      const int ln = rem & 31;
+      sh_x[tile * kValues + ln * kSteps + step] = x_in[i];
+    }
   }
   if (active) {
     asm volatile("cp.async.wait_group %0;" ::"n"(RG - 1) : "memory");
@@ -432,7 +450,7 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
       __syncwarp();
       const int curg = static_cast<int>(pwb >> 9);
       while (issued <= curg + static_cast<int>(RG) - 1) BF_ISSUE();
-      asm volatile("cp.async.wait_group %0;" ::"n"(RG - 2) : "memory");
+      asm volatile("cp.async.wait_group %0;" ::"n"(1) : "memory");
       __syncwarp();
       uint32_t lo0, lo1;
       const uint32_t a0 = pwb + 8u * static_cast<uint32_t>(lane);
@@ -447,20 +465,29 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
       const uint4 x4 = reinterpret_cast<const uint4*>(sh_x + tile * kValues + lane * kSteps)[0];
       const uint32_t xw[4] = {x4.x, x4.y, x4.z, x4.w};
 #pragma unroll
-      for (int step = 0; step < kSteps; ++step) {
-        uint32_t& rx = st[step & 3];
-        const uint32_t e = sh_lut[rx & 1023u];
-        rx = ((e >> 8) & 2047u) * (rx >> 10) + (e >> 19);
-        const uint32_t exp_bits = (e & 255u) << 23;
-        const uint32_t sm_dup = __byte_perm(lo0, lo1, (step << 12) | (step << 8));
-        const bool need = rx < kRansL;
-        const uint32_t msk = __ballot_sync(0xffffffffu, need);
-        if (need) rx = (rx << 16) | lds16(ring_s + ((pwb + (__popc(msk & lt) << 1)) & (RB - 1u)));
-        pwb += __popc(msk) << 1;
-        const float wv = __uint_as_float((sm_dup & 0x807F0000u) | exp_bits);
-        const uint32_t xpair = xw[step >> 1];
-        const float xv = __uint_as_float((step & 1) ? (xpair & 0xFFFF0000u) : (xpair << 16));
-        accum = __fmaf_rn(xv, wv, accum);
+      for (int half = 0; half < 2; ++half) {
+        const uint32_t e0 = sh_lut[st[0] & 1023u];
+        const uint32_t e1 = sh_lut[st[1] & 1023u];
+        const uint32_t e2 = sh_lut[st[2] & 1023u];
+        const uint32_t e3 = sh_lut[st[3] & 1023u];
+        const uint32_t es[4] = {e0, e1, e2, e3};
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const int step = half * 4 + q;
+          const uint32_t e = es[q];
+          uint32_t& rx = st[q];
+          rx = ((e >> 8) & 2047u) * (rx >> 10) + (e >> 19);
+          const uint32_t exp_bits = (e & 255u) << 23;
+          const uint32_t sm_dup = __byte_perm(lo0, lo1, (step << 12) | (step << 8));
+          const bool need = rx < kRansL;
+          const uint32_t msk = __ballot_sync(0xffffffffu, need);
+          if (need) rx = (rx << 16) | lds16(ring_s + ((pwb + (__popc(msk & lt) << 1)) & (RB - 1u)));
+          pwb += __popc(msk) << 1;
+          const float wv = __uint_as_float((sm_dup & 0x807F0000u) | exp_bits);
+          const uint32_t xpair = xw[step >> 1];
+          const float xv = __uint_as_float((step & 1) ? (xpair & 0xFFFF0000u) : (xpair << 16));
+          accum = __fmaf_rn(xv, wv, accum);
+        }
       }
     }
 #pragma unroll
@@ -473,6 +500,188 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
   }
   asm volatile("cp.async.wait_group 0;" ::: "memory");
 #undef BF_ISSUE
+}
+
+template <int kM>
+__global__ void __launch_bounds__(512, 1) bf16_rans_gemm_m_kernel(
+    const uint16_t* __restrict__ x_in,
+    const uint8_t* __restrict__ blob,
+    uint16_t* __restrict__ out,
+    int rows,
+    size_t blob_bytes,
+    size_t tpf_stride,
+    int pdl_mode) {
+  constexpr uint32_t GB = 512u;
+  constexpr uint32_t RG = 4u;
+  constexpr uint32_t RB = GB * RG;
+  __shared__ __align__(16) uint32_t sh_lut[1024];
+  extern __shared__ __align__(16) unsigned char smem[];
+
+  const int tid = threadIdx.x, lane = tid & 31, wib = tid >> 5;
+  const uint32_t* meta = reinterpret_cast<const uint32_t*>(blob + 4096);
+  const bool fast_shape = (rows == 4096 || rows == 4608);
+  const int tw = fast_shape ? ((rows == 4096) ? 512 : 576) : static_cast<int>(__ldg(&meta[1]));
+  const int soff = fast_shape ? ((rows == 4096) ? 8704 : 9216) : static_cast<int>(__ldg(&meta[3]));
+
+  const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + static_cast<uint32_t>(wib) * RB;
+  const int q_w = tw / gridDim.x;
+  const int rem_w = tw % gridDim.x;
+  const int w_cnt = q_w + (blockIdx.x < rem_w ? 1 : 0);
+  const int w = blockIdx.x * q_w + (blockIdx.x < rem_w ? blockIdx.x : rem_w) + wib;
+  const bool active = wib < w_cnt && w < tw;
+
+  const int* woff16 = reinterpret_cast<const int*>(blob + 4112);
+  const uint8_t* stream = blob + soff;
+  uint32_t wbytes = 0;
+  int gmin = 0, toffw = 0, issued = 0;
+  const uint64_t pol = pol_ef();
+
+#define BFM_ISSUE() { \
+    uint32_t boff = static_cast<uint32_t>(issued) * 512u + static_cast<uint32_t>(lane) * 16u; \
+    if (boff < wbytes) { \
+      size_t gi = (issued < gmin) ? (static_cast<size_t>(issued) * tw + w) : static_cast<size_t>(toffw + issued - gmin); \
+      cp_async16_ef(ring_s + (boff & (RB - 1u)), stream + (gi << 9) + static_cast<uint32_t>(lane) * 16u, pol); \
+    } \
+    asm volatile("cp.async.commit_group;" ::: "memory"); \
+    issued++; \
+  }
+
+  const uint32_t lut_sa = static_cast<uint32_t>(__cvta_generic_to_shared(sh_lut));
+  for (int i = tid; i < 256; i += blockDim.x) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                 ::"r"(lut_sa + 16u * static_cast<uint32_t>(i)),
+                   "l"(reinterpret_cast<const uint4*>(blob) + i));
+  }
+  asm volatile("cp.async.commit_group;" ::: "memory");
+  int pre_gmin = 0, pre_wo0 = 0, pre_wo1 = 0, pre_tof = 0;
+  if (active && fast_shape) {
+    pre_gmin = static_cast<int>(__ldg(&meta[2]));
+    pre_wo0 = __ldg(woff16 + w);
+    pre_wo1 = __ldg(woff16 + w + 1);
+    pre_tof = __ldg(woff16 + tw + 1 + w);
+  }
+  if (active) {
+    if (fast_shape) {
+#pragma unroll
+      for (int i = 0; i < static_cast<int>(RG) - 1; ++i) {
+        const uint32_t boff = static_cast<uint32_t>(i) * 512u + static_cast<uint32_t>(lane) * 16u;
+        cp_async16_ef(
+            ring_s + (boff & (RB - 1u)),
+            stream + (((static_cast<size_t>(i) * tw + w) << 9) + static_cast<uint32_t>(lane) * 16u),
+            pol);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+      }
+      issued = static_cast<int>(RG) - 1;
+    } else {
+      gmin = static_cast<int>(__ldg(&meta[2]));
+      wbytes = static_cast<uint32_t>(woff16[w + 1] - woff16[w]) * 16u;
+      toffw = woff16[tw + 1 + w];
+#pragma unroll
+      for (int i = 0; i < static_cast<int>(RG) - 1; ++i) BFM_ISSUE();
+    }
+  }
+  if (blockIdx.x == 0 && tpf_stride > 0 && blob_bytes > static_cast<size_t>(soff) + 64u) {
+    const size_t sbytes = blob_bytes - static_cast<size_t>(soff) - 64u;
+    for (size_t off = static_cast<size_t>(tid) * tpf_stride; off < sbytes;
+         off += static_cast<size_t>(blockDim.x) * tpf_stride) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(stream + off));
+    }
+  }
+  if (active && fast_shape) {
+    gmin = pre_gmin;
+    wbytes = static_cast<uint32_t>(pre_wo1 - pre_wo0) * 16u;
+    toffw = pre_tof;
+  }
+  if (pdl_mode & 1) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
+  if (active) {
+    asm volatile("cp.async.wait_group %0;" ::"n"(RG - 1) : "memory");
+  } else {
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+  }
+  __syncthreads();
+  if (!active) return;
+
+  const uint32_t lt = (1u << lane) - 1u;
+  asm volatile("cp.async.wait_group %0;" ::"n"(RG - 2) : "memory");
+  __syncwarp();
+  uint32_t st[kNS];
+#pragma unroll
+  for (int s = 0; s < kNS; ++s) {
+    st[s] = lds32(ring_s + ((128u * s + 4u * lane) & (RB - 1u)));
+  }
+  uint32_t pwb = 128u * kNS;
+
+  for (int row = w; row < rows; row += tw) {
+    float accum[kM];
+#pragma unroll
+    for (int m = 0; m < kM; ++m) accum[m] = 0.0f;
+    const int trig_tile = ((pdl_mode & 2) && (row + tw >= rows)) ? (kTiles - 12) : -1;
+    for (int tile = 0; tile < kTiles; ++tile) {
+      if (tile == trig_tile) {
+        asm volatile("griddepcontrol.launch_dependents;");
+      }
+      __syncwarp();
+      const int curg = static_cast<int>(pwb >> 9);
+      while (issued <= curg + static_cast<int>(RG) - 1) BFM_ISSUE();
+      asm volatile("cp.async.wait_group %0;" ::"n"(1) : "memory");
+      __syncwarp();
+      uint32_t lo0, lo1;
+      const uint32_t a0 = pwb + 8u * static_cast<uint32_t>(lane);
+      if ((pwb & 2u) == 0u) {
+        lo0 = lds32(ring_s + (a0 & (RB - 1u)));
+        lo1 = lds32(ring_s + ((a0 + 4u) & (RB - 1u)));
+      } else {
+        lo0 = lds16(ring_s + (a0 & (RB - 1u))) | (lds16(ring_s + ((a0 + 2u) & (RB - 1u))) << 16);
+        lo1 = lds16(ring_s + ((a0 + 4u) & (RB - 1u))) | (lds16(ring_s + ((a0 + 6u) & (RB - 1u))) << 16);
+      }
+      pwb += 256u;
+#pragma unroll
+      for (int half = 0; half < 2; ++half) {
+        const uint32_t e0 = sh_lut[st[0] & 1023u];
+        const uint32_t e1 = sh_lut[st[1] & 1023u];
+        const uint32_t e2 = sh_lut[st[2] & 1023u];
+        const uint32_t e3 = sh_lut[st[3] & 1023u];
+        const uint32_t es[4] = {e0, e1, e2, e3};
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const int step = half * 4 + q;
+          const uint32_t e = es[q];
+          uint32_t& rx = st[q];
+          rx = ((e >> 8) & 2047u) * (rx >> 10) + (e >> 19);
+          const uint32_t exp_bits = (e & 255u) << 23;
+          const uint32_t sm_dup = __byte_perm(lo0, lo1, (step << 12) | (step << 8));
+          const bool need = rx < kRansL;
+          const uint32_t msk = __ballot_sync(0xffffffffu, need);
+          if (need) rx = (rx << 16) | lds16(ring_s + ((pwb + (__popc(msk & lt) << 1)) & (RB - 1u)));
+          pwb += __popc(msk) << 1;
+          const float wv = __uint_as_float((sm_dup & 0x807F0000u) | exp_bits);
+          const size_t x_off = static_cast<size_t>(tile) * kValues + static_cast<size_t>(step) * kLanes + lane;
+#pragma unroll
+          for (int m = 0; m < kM; ++m) {
+            const uint16_t x16 = __ldg(x_in + static_cast<size_t>(m) * kWidth + x_off);
+            const float xv = __uint_as_float(static_cast<uint32_t>(x16) << 16);
+            accum[m] = __fmaf_rn(xv, wv, accum[m]);
+          }
+        }
+      }
+    }
+#pragma unroll
+    for (int m = 0; m < kM; ++m) {
+      float acc_m = accum[m];
+#pragma unroll
+      for (int dist = 16; dist > 0; dist >>= 1) {
+        acc_m = __fadd_rn(acc_m, __shfl_down_sync(0xffffffffu, acc_m, dist));
+      }
+      if (lane == 0) {
+        asm volatile("cvt.rn.bf16.f32 %0, %1;" : "=h"(out[static_cast<size_t>(m) * rows + row]) : "f"(acc_m));
+      }
+    }
+  }
+  asm volatile("cp.async.wait_group 0;" ::: "memory");
+#undef BFM_ISSUE
 }
 
 bool valid_rows(int rows) {
@@ -602,6 +811,81 @@ extern "C" int muse_bf16_lane_set_pdl(int mode) {
   const int prev = bf16_pdl_cfg();
   g_bf16_pdl_override = (mode == 0 || mode == 1 || mode == 2) ? mode : -1;
   return prev;
+}
+
+extern "C" int muse_bf16_rans_gemv(
+    int rows, size_t blob_bytes, const void* input, const void* blob, void* output, cudaStream_t stream);
+
+extern "C" int muse_bf16_rans_gemm_m(
+    int m, int rows, size_t blob_bytes, const void* input, const void* blob, void* output, cudaStream_t stream) {
+  if (m == 1) return muse_bf16_rans_gemv(rows, blob_bytes, input, blob, output, stream);
+  if (m < 2 || m > 8 || !valid_rows(rows)) return cudaErrorInvalidValue;
+  const int tw = (rows == 4608) ? 576 : ((rows == 4096) ? 512 : (rows / 8));
+  if (tw <= 0) return cudaErrorInvalidValue;
+  static const bool bf16_gate32 = []() {
+    const char* env = std::getenv("MUSE_BF16_GATE_32_BLOCKS");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  const int blocks = (bf16_gate32 && rows == 4096 && tw == 512) ? 32 : ((tw < 48) ? tw : 48);
+  const int wpb = (tw + blocks - 1) / blocks;
+  const size_t rb = 4u * 512u;
+  size_t dsmem = rb + static_cast<size_t>(wpb) * rb;
+  static const bool bf16_lock48 = []() {
+    const char* env = std::getenv("MUSE_BF16_SMEM_LOCK48");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  if (bf16_lock48 && blocks == 48 && dsmem < 40960) dsmem = 40960;
+  static bool init = false;
+  if (!init) {
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    cudaFuncSetAttribute(bf16_rans_gemm_m_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, 75 * 1024);
+    cudaFuncSetAttribute(bf16_rans_gemm_m_kernel<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, 75 * 1024);
+    cudaFuncSetAttribute(bf16_rans_gemm_m_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, 75 * 1024);
+    cudaFuncSetAttribute(bf16_rans_gemm_m_kernel<5>, cudaFuncAttributeMaxDynamicSharedMemorySize, 75 * 1024);
+    cudaFuncSetAttribute(bf16_rans_gemm_m_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, 75 * 1024);
+    cudaFuncSetAttribute(bf16_rans_gemm_m_kernel<7>, cudaFuncAttributeMaxDynamicSharedMemorySize, 75 * 1024);
+    cudaFuncSetAttribute(bf16_rans_gemm_m_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, 75 * 1024);
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    init = true;
+  }
+  const int pdl_cfg = bf16_pdl_cfg();
+  const int pdl_mode = (pdl_cfg == 2) ? 3 : ((pdl_cfg == 1) ? 1 : 0);
+  const auto* x_arg = static_cast<const uint16_t*>(input);
+  const auto* b_arg = static_cast<const uint8_t*>(blob);
+  auto* o_arg = static_cast<uint16_t*>(output);
+  const size_t tpf_arg = bf16_tpf_stride();
+
+  auto launch = [&](auto kernel) -> int {
+    if ((pdl_mode & 1) != 0) {
+      cudaLaunchConfig_t cfg = {};
+      cfg.gridDim = dim3(blocks, 1, 1);
+      cfg.blockDim = dim3(wpb * 32, 1, 1);
+      cfg.dynamicSmemBytes = dsmem;
+      cfg.stream = stream;
+      cudaLaunchAttribute attr[1];
+      attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr[0].val.programmaticStreamSerializationAllowed = 1;
+      cfg.attrs = attr;
+      cfg.numAttrs = 1;
+      return static_cast<int>(cudaLaunchKernelEx(
+          &cfg, kernel, x_arg, b_arg, o_arg, rows, blob_bytes, tpf_arg, pdl_mode));
+    }
+    kernel<<<blocks, wpb * 32, dsmem, stream>>>(
+        x_arg, b_arg, o_arg, rows, blob_bytes, tpf_arg, pdl_mode);
+    return static_cast<int>(cudaGetLastError());
+  };
+
+  switch (m) {
+    case 2: return launch(bf16_rans_gemm_m_kernel<2>);
+    case 3: return launch(bf16_rans_gemm_m_kernel<3>);
+    case 4: return launch(bf16_rans_gemm_m_kernel<4>);
+    case 5: return launch(bf16_rans_gemm_m_kernel<5>);
+    case 6: return launch(bf16_rans_gemm_m_kernel<6>);
+    case 7: return launch(bf16_rans_gemm_m_kernel<7>);
+    case 8: return launch(bf16_rans_gemm_m_kernel<8>);
+    default: return cudaErrorInvalidValue;
+  }
 }
 
 extern "C" int muse_bf16_rans_gemv(int rows, size_t blob_bytes, const void* input, const void* blob, void* output, cudaStream_t stream) {

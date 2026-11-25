@@ -236,18 +236,6 @@
       "why": "Enable the 512-token whole-forward prefill CUDA graph (including zero-prep replay) when DFlash auxiliary hidden states are enabled, skip the DFlash drafter on max_tokens == 1 batches in the V2 GPU model runner (matching V1's _drafts_can_be_verified), and skip redundant eager Python attention-metadata and slot-mapping construction on FULL CUDA graph replays for both the target verify step and DFlash draft step."
     },
     {
-      "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
-      "why": "bs=1 speculative-decode host cuts: one-request draft steps read query_start_loc, cu_num_logits, expanded_idx_mapping and expanded_local_pos from read-only tensors built once in load_model (same contents) instead of a pin + H2D copy and an expand kernel per step, and the per-step draft-token gather handed to DraftTokensHandler is skipped when no structured-output request needs its contents (only its shape is read); in RejectionSampler._verify_in_chunks the identity shift cu_num_logits - 0 is replaced by read-only slices when the chunk starts at logit 0."
-    },
-    {
-      "file": "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py; vllm/model_executor/models/qwen3_dflash.py",
-      "why": "Lossless DFlash context-prep trim from jungjipdo 5be7aa15: drop the out-of-graph copy of combined aux hidden states into a staging buffer in DFlashSpeculator.propose, and cache the dtype-cast RoPE cos_sin_cache in precompute_and_store_context_kv."
-    },
-    {
-      "file": "vllm/config/vllm.py",
-      "why": "Allow DFlash to use vLLM's existing V2 async scheduler, matching the already-supported EAGLE and DSpark speculative paths. This queues the next fixed single-request verify batch before the prior round's host output bookkeeping, while the V2 runner applies rejection corrections and draft-token updates on device."
-    },
-    {
       "file": "vllm/model_executor/layers/muse_bfx.py, vllm/model_executor/layers/linear.py, vllm/model_executor/models/qwen3_dflash.py",
       "why": "Lossless 12-bit coded BF16 weights (sign+mantissa byte plus a 4-bit per-row exponent window, out-of-window values in an exact per-row escape list) for the DFlash drafter's linears, fc and fused context-KV projection at <= 8 rows (harness/kernels/musebfx); every weight is checked bit for bit at load; > 8 rows use the dense weight."
     },
@@ -264,8 +252,12 @@
       "why": "Lossless 12-bit exponent-pair BF16 rANS + inline escape (~10.6 bits/weight, 100% bit-exact verified at load) with K32 2x mma.sync.m16n8k16 Tensor-Core GEMM, 48-CTA persistent cp.async (L2::evict_first), 2 MiB TLB prefetch, dual-sided SM121 PDL, and GB10 UMA DRAM placement across all 12 target BF16 attention projections at verify width M=2..8 (strict 0-ULP bitwise admitted vs F.linear, with 32-SM gate overlap on output_gate_proj); zero-bank-conflict M=2..8 activation layout in muserans; and strict 0-ULP 512-token prefill kernels (gqa16_prefill_v3, fp8ws PDL + 9-warp ST=3, muse_fp8_swiglu WS9 ST=3)."
     },
     {
-      "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
-      "why": "bs=1 speculative-decode host cuts (from i34-9, Yukon submissions 9ba5da7f-8db5-430c-a3f5-d3da1a13d186 / 1cf35c6e-2e8d-4cc8-a354-d2132af5831d): one-request draft steps read query_start_loc, cu_num_logits, expanded_idx_mapping and expanded_local_pos from read-only tensors built once in load_model (same contents) instead of a pin + H2D copy and an expand kernel per step; the per-step draft-token gather handed to DraftTokensHandler is skipped when no structured-output request needs its contents (only its shape is read); the rejection sampler skips the identity cu_num_logits shift when the chunk starts at 0."
+      "file": "vllm/v1/worker/gpu/input_batch.py, vllm/v1/worker/gpu/spec_decode/dflash/utils.py",
+      "why": "Single-request post_update fast path via muse_embed.fast_post_update_m1 in input_batch.py (falling back to _post_update_kernel), and immediate release of temporary draft_embed / draft_lm_head local references after sharing target embed_tokens / lm_head in dflash/utils.py."
+    },
+    {
+      "file": "vllm/model_executor/kernels/linear/nvfp4/marlin.py, vllm/model_executor/kernels/linear/nvfp4/decode_placement.py, vllm/model_executor/kernels/linear/scaled_mm/muse_fp8.py, vllm/model_executor/models/muse_glimmer.py, vllm/model_executor/models/muse_glimmer_norm_glue.py, vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/prefill_graph.py, vllm/v1/worker/gpu/spec_decode/dflash/speculator.py; harness/kernels/{decode6,l2pf,marlinw,marlinw_attn,marlinw_down128,muse_bf16_lane,muse_embed,muse_final_slab,muse_qk_glue,muserans}",
+      "why": "v22 unified 0-ULP decode, prefill, and DFlash optimizations + GB10 boot/capture hardening: (1) kernel throughput & PDL: persistent TMA4-ILV down projection, MARLINW_TMA_KTILES_PER_CTA=26 / SWAIT10 / mbar_inval + 2 MiB TLB prefetch, 1-warp marlinw_down128, l2pf multi-site TMA prefetch, qk_glue dual-sided PDL + small-M HPW=2 (MUSE_QK_SMALL_KV_HPW=2), and cp.async LUT + wait_group 1 in muse_bf16_lane (preserving muse_bfx M=2..8 target BF16 rANS overlap); (2) 512-token PrefillGraph + zero-prep int64 replay + Layer-51 muse_final_slab (with muse_norm_glue.mul_silu_slice_bf16 and decode1 bitwise verification) alongside DFlash (aux_hidden_state_layers < end_layer); (3) native Multi-M (1<=M<=8) decode6 TMA4-ILV linear (arbitrary k%128==0, n%128==0 shapes including NVFP4 drafter projections), paired BF16/FP8 SwiGLU gate_up (MUSE_GATE_UP_SWIGLU_FP8 default 0, M=7 probe7 check, 2D view fix, relaxed stream-capture dynamic-SMEM attribute setup, dedicated sh_pair_old, and generation-counted transfer_scale_metadata synced in decode_placement.py), and fused lm_head+lmpost; (4) native Multi-M (1<=M<=8) muserans FP8 linear across act_mode 0/1/2 on zero-bank-conflict xs layout, keyed by (scale_ptr, is_multi_m) with rans_fused_fits guard in muse_glimmer_norm_glue.py; and (5) Multi-M (2<=M<=16) muse_embed_norm_multi, single-CTA muse_greedy_verify_m1 fused with M=2..8 lm_head+lmpost (VLLM_FUSED_GREEDY_VERIFY=1), and fused DFlash draft lm_head+argmax inside DFlash FULL CUDA graphs (VLLM_DFLASH_FUSED_LMHEAD=1)."
     }
   ],
   "carried_from": {
