@@ -25,6 +25,9 @@ static bool qk_pdl_enabled() {
 }
 
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void pdl_launch_dependents() {
+  asm volatile("griddepcontrol.launch_dependents;");
+}
 
 template <typename... KArgs, typename... Args>
 static cudaError_t launch_ex_pdl(void (*kernel)(KArgs...), int blocks, int threads, cudaStream_t stream,
@@ -259,7 +262,7 @@ __global__ void qk_norm_rope_multi_kernel(
   }
 }
 
-template <bool UseRope, bool CacheFP32>
+template <bool UseRope, bool CacheFP32, bool UsePdl = false>
 __global__ __launch_bounds__(288) void qk_norm_rope_kvcache_m1_kernel(
     const __nv_bfloat16* __restrict__ qkv,
     const int64_t* __restrict__ positions,
@@ -277,58 +280,68 @@ __global__ __launch_bounds__(288) void qk_norm_rope_kvcache_m1_kernel(
     float qscale) {
   const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
-  if (warp_id >= 17) {
+
+  // Preload all predecessor-independent metadata (slot_mapping, positions, cos/sin cache,
+  // and KV-cache target pointers) before waiting on qkv via SM121 PDL.
+  const int64_t slot = (warp_id == 16 || warp_id == 17) ? slot_mapping[0] : -1;
+  __nv_bfloat16* v_dst = nullptr;
+  __nv_bfloat16* k_cache_base = nullptr;
+  if (slot >= 0) {
+    const int64_t blk = (block_size == 16) ? (slot >> 4) : (slot / block_size);
+    const int64_t off = (block_size == 16) ? (slot & 15) : (slot - blk * block_size);
+    __nv_bfloat16* base = kv_cache + blk * stride_block + off * stride_slot + lane * 4;
     if (warp_id == 17) {
-      const int64_t slot = slot_mapping[0];
-      if (slot >= 0) {
-        const uint2 v0 = *reinterpret_cast<const uint2*>(qkv + 4352 + lane * 4);
-        const uint2 v1 = *reinterpret_cast<const uint2*>(qkv + 4480 + lane * 4);
-        const int64_t blk = (block_size == 16) ? (slot >> 4) : (slot / block_size);
-        const int64_t off = (block_size == 16) ? (slot & 15) : (slot - blk * block_size);
-        __nv_bfloat16* dst = kv_cache + blk * stride_block + off * stride_slot + 128 + lane * 4;
-        *reinterpret_cast<uint2*>(dst) = v0;
-        *reinterpret_cast<uint2*>(dst + stride_kv_head) = v1;
+      v_dst = base + 128;
+    } else if (warp_id == 16) {
+      k_cache_base = base;
+    }
+  }
+
+  float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+  if (warp_id < 17) {
+    if constexpr (UseRope) {
+      int64_t pos = positions[0];
+      if (pos < 0) pos += cache_rows;
+      const int d_lo = (lane & 15) * 4;
+      if constexpr (CacheFP32) {
+        const float* row = reinterpret_cast<const float*>(cos_sin_cache) + pos * 128;
+        const float4 cv = *reinterpret_cast<const float4*>(row + d_lo);
+        const float4 sv = *reinterpret_cast<const float4*>(row + 64 + d_lo);
+        c0 = cv.x; c1 = cv.y; c2 = cv.z; c3 = cv.w;
+        s0 = sv.x; s1 = sv.y; s2 = sv.z; s3 = sv.w;
+      } else {
+        const __nv_bfloat16* row = reinterpret_cast<const __nv_bfloat16*>(cos_sin_cache) + pos * 128;
+        const uint2 cv = *reinterpret_cast<const uint2*>(row + d_lo);
+        const uint2 sv = *reinterpret_cast<const uint2*>(row + 64 + d_lo);
+        const __nv_bfloat16* cb = reinterpret_cast<const __nv_bfloat16*>(&cv);
+        const __nv_bfloat16* sb = reinterpret_cast<const __nv_bfloat16*>(&sv);
+        c0 = __bfloat162float(cb[0]); c1 = __bfloat162float(cb[1]);
+        c2 = __bfloat162float(cb[2]); c3 = __bfloat162float(cb[3]);
+        s0 = __bfloat162float(sb[0]); s1 = __bfloat162float(sb[1]);
+        s2 = __bfloat162float(sb[2]); s3 = __bfloat162float(sb[3]);
       }
+    }
+  }
+
+  if constexpr (UsePdl) {
+    pdl_wait();
+    pdl_launch_dependents();
+  }
+
+  if (warp_id >= 17) {
+    if (v_dst != nullptr) {
+      const uint2 v0 = *reinterpret_cast<const uint2*>(qkv + 4352 + lane * 4);
+      const uint2 v1 = *reinterpret_cast<const uint2*>(qkv + 4480 + lane * 4);
+      *reinterpret_cast<uint2*>(v_dst) = v0;
+      *reinterpret_cast<uint2*>(v_dst + stride_kv_head) = v1;
     }
     return;
   }
 
   const int h0 = warp_id * 2;
-  const int64_t k_slot = (warp_id == 16) ? slot_mapping[0] : -1;
   uint2 raw[2];
   raw[0] = *reinterpret_cast<const uint2*>(qkv + h0 * 128 + lane * 4);
   raw[1] = *reinterpret_cast<const uint2*>(qkv + (h0 + 1) * 128 + lane * 4);
-
-  float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
-  if constexpr (UseRope) {
-    int64_t pos = positions[0];
-    if (pos < 0) pos += cache_rows;
-    const int d_lo = (lane & 15) * 4;
-    if constexpr (CacheFP32) {
-      const float* row = reinterpret_cast<const float*>(cos_sin_cache) + pos * 128;
-      const float4 cv = *reinterpret_cast<const float4*>(row + d_lo);
-      const float4 sv = *reinterpret_cast<const float4*>(row + 64 + d_lo);
-      c0 = cv.x; c1 = cv.y; c2 = cv.z; c3 = cv.w;
-      s0 = sv.x; s1 = sv.y; s2 = sv.z; s3 = sv.w;
-    } else {
-      const __nv_bfloat16* row = reinterpret_cast<const __nv_bfloat16*>(cos_sin_cache) + pos * 128;
-      const uint2 cv = *reinterpret_cast<const uint2*>(row + d_lo);
-      const uint2 sv = *reinterpret_cast<const uint2*>(row + 64 + d_lo);
-      const __nv_bfloat16* cb = reinterpret_cast<const __nv_bfloat16*>(&cv);
-      const __nv_bfloat16* sb = reinterpret_cast<const __nv_bfloat16*>(&sv);
-      c0 = __bfloat162float(cb[0]); c1 = __bfloat162float(cb[1]);
-      c2 = __bfloat162float(cb[2]); c3 = __bfloat162float(cb[3]);
-      s0 = __bfloat162float(sb[0]); s1 = __bfloat162float(sb[1]);
-      s2 = __bfloat162float(sb[2]); s3 = __bfloat162float(sb[3]);
-    }
-  }
-
-  __nv_bfloat16* k_cache_base = nullptr;
-  if (warp_id == 16 && k_slot >= 0) {
-    const int64_t blk = (block_size == 16) ? (k_slot >> 4) : (k_slot / block_size);
-    const int64_t off = (block_size == 16) ? (k_slot & 15) : (k_slot - blk * block_size);
-    k_cache_base = kv_cache + blk * stride_block + off * stride_slot + lane * 4;
-  }
 
 #pragma unroll
   for (int j = 0; j < 2; ++j) {
@@ -669,18 +682,38 @@ extern "C" int muse_qk_norm_rope_kvcache_m1(
   auto* ko = static_cast<__nv_bfloat16*>(k_out);
   auto* kvc = static_cast<__nv_bfloat16*>(kv_cache);
   const auto* sm = static_cast<const int64_t*>(slot_mapping);
+  if (muse_qk_glue::qk_pdl_enabled()) {
+    if (use_rope) {
+      if (cache_fp32) {
+        return static_cast<int>(muse_qk_glue::launch_ex_pdl(
+            muse_qk_glue::qk_norm_rope_kvcache_m1_kernel<true, true, true>, 2, 288, stream,
+            q, pos, cos_sin_cache, qo, ko, kvc, sm,
+            cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale));
+      } else {
+        return static_cast<int>(muse_qk_glue::launch_ex_pdl(
+            muse_qk_glue::qk_norm_rope_kvcache_m1_kernel<true, false, true>, 2, 288, stream,
+            q, pos, cos_sin_cache, qo, ko, kvc, sm,
+            cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale));
+      }
+    } else {
+      return static_cast<int>(muse_qk_glue::launch_ex_pdl(
+          muse_qk_glue::qk_norm_rope_kvcache_m1_kernel<false, true, true>, 2, 288, stream,
+          q, pos, cos_sin_cache, qo, ko, kvc, sm,
+          cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale));
+    }
+  }
   if (use_rope) {
     if (cache_fp32) {
-      muse_qk_glue::qk_norm_rope_kvcache_m1_kernel<true, true><<<2, 288, 0, stream>>>(
+      muse_qk_glue::qk_norm_rope_kvcache_m1_kernel<true, true, false><<<2, 288, 0, stream>>>(
           q, pos, cos_sin_cache, qo, ko, kvc, sm,
           cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale);
     } else {
-      muse_qk_glue::qk_norm_rope_kvcache_m1_kernel<true, false><<<2, 288, 0, stream>>>(
+      muse_qk_glue::qk_norm_rope_kvcache_m1_kernel<true, false, false><<<2, 288, 0, stream>>>(
           q, pos, cos_sin_cache, qo, ko, kvc, sm,
           cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale);
     }
   } else {
-    muse_qk_glue::qk_norm_rope_kvcache_m1_kernel<false, true><<<2, 288, 0, stream>>>(
+    muse_qk_glue::qk_norm_rope_kvcache_m1_kernel<false, true, false><<<2, 288, 0, stream>>>(
         q, pos, cos_sin_cache, qo, ko, kvc, sm,
         cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale);
   }

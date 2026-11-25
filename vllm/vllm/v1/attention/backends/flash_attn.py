@@ -926,52 +926,31 @@ class FlashAttentionImpl(AttentionImpl):
 
         if (
             self._gqa16_decode_eligible
+            and num_actual_tokens == 1
+            and attn_metadata.max_query_len == 1
             and not attn_metadata.use_cascade
             and attn_metadata.causal is True
             and attn_metadata.mm_prefix_range_tensor is None
             and attn_metadata.rswa_prefix_lens is None
         ):
-            if num_actual_tokens == 1 and attn_metadata.max_query_len == 1:
-                window = (
-                    attn_metadata.sliding_window
-                    if attn_metadata.sliding_window is not None
-                    else self.sliding_window
-                )
-                if muse_gqa16_attn.try_decode_gqa16(
-                    query=query,
-                    kv_cache=kv_cache,
-                    output=output,
-                    seqused_k=attn_metadata.seq_lens,
-                    block_table=attn_metadata.block_table,
-                    cu_seqlens_q=attn_metadata.query_start_loc,
-                    softmax_scale=self.scale,
-                    window=window,
-                    max_seqlen_k=attn_metadata.max_seq_len,
-                    max_num_splits=attn_metadata.max_num_splits,
-                ):
-                    return output
-            elif (
-                2 <= num_actual_tokens <= 16
-                and attn_metadata.max_query_len == num_actual_tokens
+            window = (
+                attn_metadata.sliding_window
+                if attn_metadata.sliding_window is not None
+                else self.sliding_window
+            )
+            if muse_gqa16_attn.try_decode_gqa16(
+                query=query,
+                kv_cache=kv_cache,
+                output=output,
+                seqused_k=attn_metadata.seq_lens,
+                block_table=attn_metadata.block_table,
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                softmax_scale=self.scale,
+                window=window,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                max_num_splits=attn_metadata.max_num_splits,
             ):
-                window = (
-                    attn_metadata.sliding_window
-                    if attn_metadata.sliding_window is not None
-                    else self.sliding_window
-                )
-                if muse_gqa16_attn.try_verify_gqa16(
-                    query=query,
-                    kv_cache=kv_cache,
-                    output=output,
-                    seqused_k=attn_metadata.seq_lens,
-                    block_table=attn_metadata.block_table,
-                    cu_seqlens_q=attn_metadata.query_start_loc,
-                    num_actual_tokens=num_actual_tokens,
-                    softmax_scale=self.scale,
-                    window=window,
-                    max_num_splits=attn_metadata.max_num_splits,
-                ):
-                    return output
+                return output
 
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)

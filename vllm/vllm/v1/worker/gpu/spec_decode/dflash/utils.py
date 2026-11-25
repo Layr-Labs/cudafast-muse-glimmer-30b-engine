@@ -64,6 +64,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             if draft_embed is not None:
                 del draft_inner.embed_tokens
             draft_inner.embed_tokens = target_embed
+        draft_embed = None
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(dflash_model, "lm_head", None)
@@ -72,13 +73,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     ):
         if draft_lm_head is not None:
             del dflash_model.lm_head
-        reduced_head = getattr(target_lm_head, "_draft_vocab_head", None)
-        if reduced_head is not None:
-            dflash_model.register_buffer(
-                "draft_vocab_token_ids", reduced_head.token_ids, persistent=False
-            )
-            dflash_model.lm_head = reduced_head
-        else:
-            dflash_model.lm_head = target_lm_head
+        dflash_model.lm_head = target_lm_head
+    draft_lm_head = None
 
     return dflash_model

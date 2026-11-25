@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import io
-import os
 from collections.abc import Iterable
 
 import torch
@@ -61,10 +60,6 @@ def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
     override = (getattr(config, "dflash_config", None) or {}).get("causal")
     if override is not None:
         return override
-    if os.environ.get("MUSE_DFLASH_BIDIR", "1") != "0":
-        archs = getattr(config, "architectures", None) or ()
-        if any("MuseGlimmerAssistant" in a for a in archs):
-            return False
     layer_types = getattr(config, "layer_types", None)
     return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
 
@@ -525,11 +520,7 @@ class DFlashQwen3Model(nn.Module):
         )
         if self._fused_kv_bias is None:
             all_kv_flat = None
-            if (
-                getattr(self, "_fkv_mi3", None) is not None
-                or getattr(self, "_fkv_mnv4", None) is not None
-                or getattr(self, "_fkv_mfp8", None) is not None
-            ):
+            if getattr(self, "_fkv_mnv4", None) is not None or getattr(self, "_fkv_mfp8", None) is not None:
                 from vllm.model_executor.layers import muse_draft_fp8
                 all_kv_flat = muse_draft_fp8.tensor_apply(self, "fkv", normed_context_states, self._fused_kv_weight)
             if all_kv_flat is None:
@@ -604,17 +595,7 @@ class DFlashQwen3Model(nn.Module):
         positions_repeated = context_positions.repeat(L)
         cos_sin_cache = self._rope_cos_sin_cache
         if cos_sin_cache.dtype != all_k_flat.dtype:
-            cast_cache = getattr(self, "_rope_cos_sin_cache_cast", None)
-            if (
-                cast_cache is None
-                or cast_cache.dtype != all_k_flat.dtype
-                or cast_cache.device != all_k_flat.device
-            ):
-                cast_cache = cos_sin_cache.to(
-                    device=all_k_flat.device, dtype=all_k_flat.dtype
-                )
-                self._rope_cos_sin_cache_cast = cast_cache
-            cos_sin_cache = cast_cache
+            cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
         ops.rotary_embedding(
             positions_repeated,
             all_k_flat,
@@ -747,124 +728,6 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         get_draft_kv_cache_layer_names."""
         return [layer.self_attn.causal for layer in self.model.layers]
 
-    def update_draft_prompt_tail(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> None:
-        lm_head = self.lm_head
-        if not getattr(lm_head, "prompt_tail_admitted", False):
-            return
-        if not input_ids.is_cuda or input_ids.numel() == 0:
-            return
-        try:
-            import muse_bfx_ext as _bfx
-
-            _bfx.draft_vocab_update_tail(
-                input_ids,
-                positions,
-                lm_head.in_static_vocab,
-                lm_head.tail_ids,
-                lm_head.tail_count,
-                lm_head.tail_seen,
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
-    def draft_argmax(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        if self.draft_id_to_target_id is not None:
-            return None
-        vocab_map = getattr(self, "draft_vocab_token_ids", None)
-        if vocab_map is None:
-            return None
-        static_logits = self.logits_processor(self.lm_head, hidden_states)
-        if static_logits is None:
-            return None
-        from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _nl
-
-        alt_buf = _nl.get_alt_buf(hidden_states.device) if _nl.ENABLED else None
-        margin_buf = _nl.get_margin_buf(hidden_states.device) if _nl.ENABLED else None
-        tree_top_buf = _nl.get_tree_top_buf(hidden_states.device) if _nl.ENABLED else None
-        tree_vals_buf = _nl.get_tree_vals_buf(hidden_states.device) if _nl.ENABLED else None
-        lm_head = self.lm_head
-        if (
-            getattr(lm_head, "prompt_tail_admitted", False)
-            and hidden_states.is_cuda
-            and hidden_states.dtype == torch.bfloat16
-            and hidden_states.dim() == 2
-            and 1 <= hidden_states.shape[0] <= 8
-            and static_logits.dtype == torch.bfloat16
-        ):
-            import muse_bfx_ext as _bfx
-
-            x_c = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
-            sl_c = static_logits if static_logits.is_contiguous() else static_logits.contiguous()
-            logit_scale = float(getattr(self.logits_processor, "scale", 1.0))
-            try:
-                return _bfx.draft_vocab_tail_argmax(
-                    x_c,
-                    sl_c,
-                    vocab_map,
-                    lm_head.tail_ids,
-                    lm_head.tail_count,
-                    lm_head.full_raw_w,
-                    lm_head.full_raw_s,
-                    lm_head.full_global_scale,
-                    logit_scale,
-                    alt_buf,
-                    margin_buf,
-                    tree_top_buf,
-                    tree_vals_buf,
-                )
-            except TypeError:
-                return _bfx.draft_vocab_tail_argmax(
-                    x_c,
-                    sl_c,
-                    vocab_map,
-                    lm_head.tail_ids,
-                    lm_head.tail_count,
-                    lm_head.full_raw_w,
-                    lm_head.full_raw_s,
-                    lm_head.full_global_scale,
-                    logit_scale,
-                )
-        if static_logits.dim() == 2 and static_logits.shape[0] >= 1:
-            if tree_top_buf is not None and tree_top_buf.numel() >= 36:
-                n_tt = min(6, static_logits.shape[0])
-                tk6 = static_logits[:n_tt].topk(6, dim=-1)
-                tree_top_buf.fill_(-1)
-                tree_top_buf[: 6 * n_tt].copy_(vocab_map[tk6.indices].reshape(-1))
-                if tree_vals_buf is not None and tree_vals_buf.numel() >= 36:
-                    tree_vals_buf.fill_(-1e30)
-                    tree_vals_buf[: 6 * n_tt].copy_(tk6.values.to(torch.float32).reshape(-1))
-                if alt_buf is not None:
-                    n_t2 = min(2, n_tt, alt_buf.numel() // 2)
-                    alt_buf[: 2 * n_t2].copy_(vocab_map[tk6.indices[:n_t2, :2]].reshape(-1))
-                if margin_buf is not None:
-                    n_t2 = min(2, n_tt, margin_buf.numel())
-                    margin_buf[:n_t2].copy_((tk6.values[:n_t2, 0] - tk6.values[:n_t2, 1]).to(torch.float32))
-            elif tree_top_buf is not None and tree_top_buf.numel() >= 20:
-                n_tt = min(5, static_logits.shape[0])
-                tk4 = static_logits[:n_tt].topk(4, dim=-1)
-                tree_top_buf.fill_(-1)
-                tree_top_buf[: 4 * n_tt].copy_(vocab_map[tk4.indices].reshape(-1))
-                if alt_buf is not None:
-                    n_t2 = min(2, n_tt, alt_buf.numel() // 2)
-                    alt_buf[: 2 * n_t2].copy_(vocab_map[tk4.indices[:n_t2, :2]].reshape(-1))
-                if margin_buf is not None:
-                    n_t2 = min(2, n_tt, margin_buf.numel())
-                    margin_buf[:n_t2].copy_((tk4.values[:n_t2, 0] - tk4.values[:n_t2, 1]).to(torch.float32))
-            elif alt_buf is not None:
-                n_t2 = min(2, static_logits.shape[0], alt_buf.numel() // 2)
-                tk = static_logits[:n_t2].topk(2, dim=-1)
-                alt_buf[: 2 * n_t2].copy_(vocab_map[tk.indices].reshape(-1))
-                if margin_buf is not None and margin_buf.numel() >= n_t2:
-                    margin_buf[:n_t2].copy_((tk.values[:, 0] - tk.values[:, 1]).to(torch.float32))
-        return vocab_map[static_logits.argmax(dim=-1)]
-
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
@@ -970,8 +833,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             from vllm.model_executor.layers import muse_bfx
             n = muse_bfx.attach_drafter(self.model)
             has_q_fkv = (
-                getattr(self.model, "_fkv_mi3", None) is not None
-                or getattr(self.model, "_fkv_mnv4", None) is not None
+                getattr(self.model, "_fkv_mnv4", None) is not None
                 or getattr(self.model, "_fkv_mfp8", None) is not None
             )
             kv = (

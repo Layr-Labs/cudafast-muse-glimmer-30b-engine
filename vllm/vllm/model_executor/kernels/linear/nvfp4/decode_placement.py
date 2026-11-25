@@ -1042,12 +1042,14 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                     if stats is not None and PLACE_SCALES6:
                         try:
                             import muse_marlin6_gemv as _m6
+                            transfer_fn = getattr(_m6, "transfer_scale_metadata", None)
                             ilv_set = getattr(_m6, "_DOWN_ILV_SCALES", None)
                             lm_split2_set = getattr(_m6, "_LM_SPLIT2_SCALES", None)
                             lm_split2_cache = getattr(_m6, "_LM_SPLIT2_CACHE", None)
                             lm_pad128_set = getattr(_m6, "_LM_PAD128_SCALES", None)
                             lm_pad128_cache = getattr(_m6, "_LM_PAD128_CACHE", None)
                         except (ImportError, OSError):
+                            transfer_fn = None
                             ilv_set = None
                             lm_split2_set = None
                             lm_split2_cache = None
@@ -1062,34 +1064,28 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                                     if s6.dim() == 2 and s6.shape[1] == 32 and (s6.shape[0] + 64) * 32 < (1 << 20):
                                         dst_base = torch.empty((s6.shape[0] + 64, 32), dtype=s6.dtype, device=s6.device)
                                         dst = dst_base[: s6.shape[0]]
-                                    elif (
-                                        s6.dim() == 2
-                                        and s6.shape[1] == 32
-                                        and getattr(m, "output_size_per_partition", None) == 39936
-                                        and getattr(m, "input_size_per_partition", None) == 6656
-                                    ):
-                                        # Reserve +128 KiB fast-pool headroom so register_all_gate_up_swiglu
-                                        # always updates paired scales6 in-place without spilling to slow DRAM.
-                                        dst_base = torch.empty((s6.shape[0] + 4096, 32), dtype=s6.dtype, device=s6.device)
-                                        dst = dst_base[: s6.shape[0]]
                                     else:
                                         dst = torch.empty_like(s6)
                                     dst.copy_(s6)
                                     if torch.equal(dst, s6):
-                                        m._buffers["_marlin_decode_scales6"] = dst
-                                        if ilv_set is not None and old_ptr in ilv_set:
-                                            ilv_set.discard(old_ptr)
-                                            ilv_set.add(dst.data_ptr())
-                                        if lm_split2_set is not None and old_ptr in lm_split2_set:
-                                            lm_split2_set.discard(old_ptr)
-                                            lm_split2_set.add(dst.data_ptr())
-                                        if lm_split2_cache is not None and old_ptr in lm_split2_cache:
-                                            lm_split2_cache[dst.data_ptr()] = lm_split2_cache.pop(old_ptr)
-                                        if lm_pad128_set is not None and old_ptr in lm_pad128_set:
-                                            lm_pad128_set.discard(old_ptr)
-                                            lm_pad128_set.add(dst.data_ptr())
-                                        if lm_pad128_cache is not None and old_ptr in lm_pad128_cache:
-                                            lm_pad128_cache[dst.data_ptr()] = lm_pad128_cache.pop(old_ptr)
+                                        if callable(transfer_fn):
+                                            transfer_fn(s6, dst)
+                                            m._buffers["_marlin_decode_scales6"] = dst
+                                        else:
+                                            m._buffers["_marlin_decode_scales6"] = dst
+                                            if ilv_set is not None and old_ptr in ilv_set:
+                                                ilv_set.discard(old_ptr)
+                                                ilv_set.add(dst.data_ptr())
+                                            if lm_split2_set is not None and old_ptr in lm_split2_set:
+                                                lm_split2_set.discard(old_ptr)
+                                                lm_split2_set.add(dst.data_ptr())
+                                            if lm_split2_cache is not None and old_ptr in lm_split2_cache:
+                                                lm_split2_cache[dst.data_ptr()] = lm_split2_cache.pop(old_ptr)
+                                            if lm_pad128_set is not None and old_ptr in lm_pad128_set:
+                                                lm_pad128_set.discard(old_ptr)
+                                                lm_pad128_set.add(dst.data_ptr())
+                                            if lm_pad128_cache is not None and old_ptr in lm_pad128_cache:
+                                                lm_pad128_cache[dst.data_ptr()] = lm_pad128_cache.pop(old_ptr)
                                         moved_s6 += 1
                                         bytes_s6 += dst.numel() * dst.element_size()
                                 except RuntimeError:
@@ -1330,8 +1326,7 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             if hasattr(_m6, "register_all_oproj_sigmoid"):
                 _m6.register_all_oproj_sigmoid(model)
         except Exception as err:  # noqa: BLE001
-            import traceback
-            logger.warning("Decode6 post-placement registration skipped: %s\n%s", err, traceback.format_exc())
+            logger.warning("Decode6 post-placement registration skipped: %s", err)
         _post_reg_done = True
     except Exception as err:  # noqa: BLE001 - the load must go on
         logger.warning("Decode weight placement failed and was skipped: %s", err)
@@ -1348,5 +1343,4 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             if hasattr(_m6, "register_all_oproj_sigmoid"):
                 _m6.register_all_oproj_sigmoid(model)
         except Exception as err:  # noqa: BLE001
-            import traceback
-            logger.warning("Decode6 post-placement registration skipped: %s\n%s", err, traceback.format_exc())
+            logger.warning("Decode6 post-placement registration skipped: %s", err)

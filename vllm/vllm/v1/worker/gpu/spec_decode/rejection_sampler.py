@@ -183,15 +183,8 @@ class RejectionSampler:
         for start, end in _iter_request_chunks(cu_num_logits_np, max_chunk_logits):
             lo = int(cu_num_logits_np[start])
             hi = int(cu_num_logits_np[end])
-            # LOCAL PATCH (bs=1 spec-decode host cut): with lo == 0 the shift is the
-            # identity; pass read-only slices instead of allocating and launching an
-            # elementwise subtract every step (no kernel stores into cu_num_logits).
-            if lo == 0:
-                chunk_cu_num_logits_np = cu_num_logits_np[start : end + 1]
-                chunk_cu_num_logits = input_batch.cu_num_logits[start : end + 1]
-            else:
-                chunk_cu_num_logits_np = cu_num_logits_np[start : end + 1] - lo
-                chunk_cu_num_logits = input_batch.cu_num_logits[start : end + 1] - lo
+            chunk_cu_num_logits_np = cu_num_logits_np[start : end + 1] - lo
+            chunk_cu_num_logits = input_batch.cu_num_logits[start : end + 1] - lo
             # draft_logits uses persistent request-state indices and stays global.
             processed_logits, sampled, num_sampled = self._verify(
                 logits[lo:hi],

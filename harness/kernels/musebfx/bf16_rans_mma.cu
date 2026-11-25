@@ -35,16 +35,6 @@ __device__ __forceinline__ void bf16_mma_m16n8k16(
       : "r"(a0), "r"(0u), "r"(a2), "r"(0u), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ void bf16_mma_m16n8k16_m16(
-    float& d0, float& d1, float& d2, float& d3,
-    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
-
 __device__ __forceinline__ uint64_t br_pol_ef() {
   uint64_t pol;
   asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
@@ -416,8 +406,7 @@ static int br_pdl_cfg() {
   return mode;
 }
 
-template <bool kPar4, bool kM16 = false>
-__global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
+__global__ void __launch_bounds__(1024, 1) br_pair_mma_gemm_kernel(BrProb pb) {
   __shared__ __align__(16) uint32_t sh_lut[4096];
   extern __shared__ __align__(16) unsigned char smem[];
 
@@ -522,11 +511,8 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
   const uint32_t lt = (1u << lane) - 1u;
   const int NB = pb.N >> 3;
   const bool valid_m = (g < pb.M);
-  const bool valid_m_hi = kM16 && ((g + 8) < pb.M);
   const uint32_t* xrow32 =
       valid_m ? reinterpret_cast<const uint32_t*>(pb.x + static_cast<size_t>(g) * K + 2 * t) : nullptr;
-  const uint32_t* xrow32_hi =
-      valid_m_hi ? reinterpret_cast<const uint32_t*>(pb.x + static_cast<size_t>(g + 8) * K + 2 * t) : nullptr;
   const uint32_t base_m1 = pb.base_m1;
 
   asm volatile("cp.async.wait_group %0;" ::"n"(kRG - 2) : "memory");
@@ -538,195 +524,6 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
   }
   uint32_t pwb = 128u * kNS;
 
-  if constexpr (kPar4) {
-    const uint32_t lane16 = static_cast<uint32_t>(lane) * 16u;
-    const uint32_t ring_lane = ring_s + lane16;
-    const size_t stride_g = static_cast<size_t>(pb.tw) << 9;
-    const uint8_t* const tail_w = pb.stream + (static_cast<size_t>(toffw) << 9) + lane16;
-    const uint8_t* ilv_ptr =
-        pb.stream + ((static_cast<size_t>(issued) * static_cast<size_t>(pb.tw) + static_cast<size_t>(w)) << 9) + lane16;
-#define BR_ISSUE_FAST()                                                                                       \
-  {                                                                                                           \
-    const uint32_t boff = (static_cast<uint32_t>(issued) << 9) + lane16;                                      \
-    if (boff < wbytes) {                                                                                      \
-      const uint8_t* src = (issued < gmin) ? ilv_ptr : (tail_w + (static_cast<size_t>(issued - gmin) << 9)); \
-      br_cp_async16_ef(ring_lane + ((static_cast<uint32_t>(issued) << 9) & (kRB - 1u)), src, pol);            \
-    }                                                                                                         \
-    if (issued < gmin) ilv_ptr += stride_g;                                                                   \
-    asm volatile("cp.async.commit_group;" ::: "memory");                                                      \
-    issued++;                                                                                                 \
-  }
-    for (int nb = w; nb < NB; nb += pb.tw) {
-      float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
-      const int trig_s = ((pb.pdl_mode & 2) && (nb + pb.tw >= NB)) ? ((S > 16) ? (S - 16) : 0) : -1;
-      for (int s = 0; s < S; ++s) {
-        if (s == trig_s) {
-          asm volatile("griddepcontrol.launch_dependents;");
-        }
-        // Pre-issue 4 (or 8 for kM16) L1/L2 activation loads and all 4 independent LUT loads in parallel.
-        const uint32_t a0 = valid_m ? __ldg(xrow32 + 16 * s) : 0u;
-        const uint32_t a2 = valid_m ? __ldg(xrow32 + 16 * s + 4) : 0u;
-        const uint32_t a4 = valid_m ? __ldg(xrow32 + 16 * s + 8) : 0u;
-        const uint32_t a6 = valid_m ? __ldg(xrow32 + 16 * s + 12) : 0u;
-        const uint32_t a1 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s) : 0u;
-        const uint32_t a3 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 4) : 0u;
-        const uint32_t a5 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 8) : 0u;
-        const uint32_t a7 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 12) : 0u;
-
-        const uint32_t le0 = sh_lut[st[0] & 4095u];
-        const uint32_t le1 = sh_lut[st[1] & 4095u];
-        const uint32_t le2 = sh_lut[st[2] & 4095u];
-        const uint32_t le3 = sh_lut[st[3] & 4095u];
-
-        const int curg = static_cast<int>(pwb >> 9);
-        if (issued <= curg + static_cast<int>(kRG) - 1) {
-          __syncwarp();
-          do {
-            BR_ISSUE_FAST();
-          } while (issued <= curg + static_cast<int>(kRG) - 1);
-          asm volatile("cp.async.wait_group %0;" ::"n"(kRG - 2) : "memory");
-          __syncwarp();
-        }
-
-        const uint32_t na = pwb + 8u * static_cast<uint32_t>(lane);
-        uint32_t sm_w0, sm_w1;
-        if ((pwb & 2u) == 0u) {
-          sm_w0 = br_lds32(ring_s + (na & (kRB - 1u)));
-          sm_w1 = br_lds32(ring_s + ((na + 4u) & (kRB - 1u)));
-        } else {
-          sm_w0 = br_lds16(ring_s + (na & (kRB - 1u))) | (br_lds16(ring_s + ((na + 2u) & (kRB - 1u))) << 16);
-          sm_w1 = br_lds16(ring_s + ((na + 4u) & (kRB - 1u))) | (br_lds16(ring_s + ((na + 6u) & (kRB - 1u))) << 16);
-        }
-        pwb += 256u;
-
-        // 4 independent 12-bit rANS updates + warp ballots in parallel.
-        const uint32_t xh0 = st[0] >> 12;
-        const uint32_t x0 = ((le0 >> 8) & 4095u) * xh0 + xh0 + (le0 >> 20);
-        const uint32_t xh1 = st[1] >> 12;
-        const uint32_t x1 = ((le1 >> 8) & 4095u) * xh1 + xh1 + (le1 >> 20);
-        const uint32_t xh2 = st[2] >> 12;
-        const uint32_t x2 = ((le2 >> 8) & 4095u) * xh2 + xh2 + (le2 >> 20);
-        const uint32_t xh3 = st[3] >> 12;
-        const uint32_t x3 = ((le3 >> 8) & 4095u) * xh3 + xh3 + (le3 >> 20);
-        const bool n0 = x0 < kRansL;
-        const bool n1 = x1 < kRansL;
-        const bool n2 = x2 < kRansL;
-        const bool n3 = x3 < kRansL;
-        const uint32_t m0 = __ballot_sync(0xffffffffu, n0);
-        const uint32_t m1 = __ballot_sync(0xffffffffu, n1);
-        const uint32_t m2 = __ballot_sync(0xffffffffu, n2);
-        const uint32_t m3 = __ballot_sync(0xffffffffu, n3);
-        const uint32_t p0 = pwb;
-        const uint32_t p1 = p0 + (__popc(m0) << 1);
-        const uint32_t p2 = p1 + (__popc(m1) << 1);
-        const uint32_t p3 = p2 + (__popc(m2) << 1);
-        pwb = p3 + (__popc(m3) << 1);
-
-        // Issue all 4 conditional lds16 renorms in parallel.
-        const uint32_t r0 = n0 ? br_lds16(ring_s + ((p0 + (__popc(m0 & lt) << 1)) & (kRB - 1u))) : 0u;
-        const uint32_t r1 = n1 ? br_lds16(ring_s + ((p1 + (__popc(m1 & lt) << 1)) & (kRB - 1u))) : 0u;
-        const uint32_t r2 = n2 ? br_lds16(ring_s + ((p2 + (__popc(m2 & lt) << 1)) & (kRB - 1u))) : 0u;
-        const uint32_t r3 = n3 ? br_lds16(ring_s + ((p3 + (__popc(m3 & lt) << 1)) & (kRB - 1u))) : 0u;
-
-        const uint32_t Pw01 = __byte_perm(le0, le1, 0x7740);
-        const uint32_t Pw23 = __byte_perm(le2, le3, 0x7740);
-        const uint32_t Pw = __byte_perm(Pw01, Pw23, 0x5410);
-
-        const uint32_t hi4 = (Pw >> 4) & 0x0F0F0F0Fu;
-        const uint32_t lo4 = Pw & 0x0F0F0F0Fu;
-        const uint32_t esc_bits = ((hi4 + 0x01010101u) | (lo4 + 0x01010101u)) & 0x10101010u;
-
-        uint32_t c0_ = hi4 & 15u, c1_ = lo4 & 15u;
-        uint32_t c2_ = (hi4 >> 8) & 15u, c3_ = (lo4 >> 8) & 15u;
-        uint32_t c4_ = (hi4 >> 16) & 15u, c5_ = (lo4 >> 16) & 15u;
-        uint32_t c6_ = (hi4 >> 24) & 15u, c7_ = (lo4 >> 24) & 15u;
-
-        uint32_t e0 = c0_ ? (base_m1 + c0_) : 0u;
-        uint32_t e1 = c1_ ? (base_m1 + c1_) : 0u;
-        uint32_t e2 = c2_ ? (base_m1 + c2_) : 0u;
-        uint32_t e3 = c3_ ? (base_m1 + c3_) : 0u;
-        uint32_t e4 = c4_ ? (base_m1 + c4_) : 0u;
-        uint32_t e5 = c5_ ? (base_m1 + c5_) : 0u;
-        uint32_t e6 = c6_ ? (base_m1 + c6_) : 0u;
-        uint32_t e7 = c7_ ? (base_m1 + c7_) : 0u;
-
-        const bool had_esc = __any_sync(0xffffffffu, esc_bits != 0u);
-        if (__builtin_expect(had_esc, 0)) {
-          // Commit renorms before BR_ISSUE_FAST() can overwrite ring_s.
-          st[0] = n0 ? ((x0 << 16) | r0) : x0;
-          st[1] = n1 ? ((x1 << 16) | r1) : x1;
-          st[2] = n2 ? ((x2 << 16) | r2) : x2;
-          st[3] = n3 ? ((x3 << 16) | r3) : x3;
-          const int cg2 = static_cast<int>(pwb >> 9);
-          if (issued <= cg2 + static_cast<int>(kRG) - 1) {
-            __syncwarp();
-            do {
-              BR_ISSUE_FAST();
-            } while (issued <= cg2 + static_cast<int>(kRG) - 1);
-            asm volatile("cp.async.wait_group %0;" ::"n"(kRG - 2) : "memory");
-            __syncwarp();
-          }
-#define BR_ESC_P(ci, ei)                                                                             \
-  {                                                                                                  \
-    const bool is_e = ((ci) == 15u);                                                                 \
-    const uint32_t em = __ballot_sync(0xffffffffu, is_e);                                            \
-    if (em) {                                                                                        \
-      if (is_e) (ei) = br_lds16(ring_s + ((pwb + (__popc(em & lt) << 1)) & (kRB - 1u)));             \
-      pwb += __popc(em) << 1;                                                                        \
-    }                                                                                                \
-  }
-          BR_ESC_P(c0_, e0) BR_ESC_P(c1_, e1) BR_ESC_P(c2_, e2) BR_ESC_P(c3_, e3)
-          BR_ESC_P(c4_, e4) BR_ESC_P(c5_, e5) BR_ESC_P(c6_, e6) BR_ESC_P(c7_, e7)
-#undef BR_ESC_P
-        }
-
-        const uint32_t sm01 = __byte_perm(sm_w0, 0u, 0x4140);
-        const uint32_t sm23 = __byte_perm(sm_w0, 0u, 0x4342);
-        const uint32_t b0 = ((sm01 & 0x00800080u) << 8) | (sm01 & 0x007F007Fu) | (e0 << 7) | (e1 << 23);
-        const uint32_t b1 = ((sm23 & 0x00800080u) << 8) | (sm23 & 0x007F007Fu) | (e2 << 7) | (e3 << 23);
-        if constexpr (kM16) {
-          bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
-        } else {
-          bf16_mma_m16n8k16(c0, c1, c2, c3, a0, a2, b0, b1);
-        }
-
-        const uint32_t sm45 = __byte_perm(sm_w1, 0u, 0x4140);
-        const uint32_t sm67 = __byte_perm(sm_w1, 0u, 0x4342);
-        const uint32_t b2 = ((sm45 & 0x00800080u) << 8) | (sm45 & 0x007F007Fu) | (e4 << 7) | (e5 << 23);
-        const uint32_t b3 = ((sm67 & 0x00800080u) << 8) | (sm67 & 0x007F007Fu) | (e6 << 7) | (e7 << 23);
-        if constexpr (kM16) {
-          bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a4, a5, a6, a7, b2, b3);
-        } else {
-          bf16_mma_m16n8k16(c0, c1, c2, c3, a4, a6, b2, b3);
-        }
-
-        if (!had_esc) {
-          st[0] = n0 ? ((x0 << 16) | r0) : x0;
-          st[1] = n1 ? ((x1 << 16) | r1) : x1;
-          st[2] = n2 ? ((x2 << 16) | r2) : x2;
-          st[3] = n3 ? ((x3 << 16) | r3) : x3;
-        }
-      }
-      if (valid_m) {
-        __nv_bfloat162 r;
-        r.x = __float2bfloat16_rn(c0);
-        r.y = __float2bfloat16_rn(c1);
-        *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * pb.N + nb * 8 + 2 * t) = r;
-        if constexpr (kM16) {
-          if (valid_m_hi) {
-            __nv_bfloat162 r2;
-            r2.x = __float2bfloat16_rn(c2);
-            r2.y = __float2bfloat16_rn(c3);
-            *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * pb.N + nb * 8 + 2 * t) = r2;
-          }
-        }
-      }
-    }
-    asm volatile("cp.async.wait_group 0;" ::: "memory");
-#undef BR_ISSUE_FAST
-    return;
-  }
-
   for (int nb = w; nb < NB; nb += pb.tw) {
     float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
     const int trig_s = ((pb.pdl_mode & 2) && (nb + pb.tw >= NB)) ? ((S > 16) ? (S - 16) : 0) : -1;
@@ -734,15 +531,11 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       if (s == trig_s) {
         asm volatile("griddepcontrol.launch_dependents;");
       }
-      // Pre-issue 4 (or 8 for kM16) L1/L2 activation loads for the two K16 MMAs
+      // Pre-issue 4 L1/L2 activation loads for the two K16 MMAs
       const uint32_t a0 = valid_m ? __ldg(xrow32 + 16 * s) : 0u;
       const uint32_t a2 = valid_m ? __ldg(xrow32 + 16 * s + 4) : 0u;
       const uint32_t a4 = valid_m ? __ldg(xrow32 + 16 * s + 8) : 0u;
       const uint32_t a6 = valid_m ? __ldg(xrow32 + 16 * s + 12) : 0u;
-      const uint32_t a1 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s) : 0u;
-      const uint32_t a3 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 4) : 0u;
-      const uint32_t a5 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 8) : 0u;
-      const uint32_t a7 = (kM16 && valid_m_hi) ? __ldg(xrow32_hi + 16 * s + 12) : 0u;
 
       __syncwarp();
       const int curg = static_cast<int>(pwb >> 9);
@@ -818,35 +611,19 @@ __global__ void __launch_bounds__(768, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       const uint32_t sm23 = __byte_perm(sm_w0, 0u, 0x4342);
       const uint32_t b0 = ((sm01 & 0x00800080u) << 8) | (sm01 & 0x007F007Fu) | (e0 << 7) | (e1 << 23);
       const uint32_t b1 = ((sm23 & 0x00800080u) << 8) | (sm23 & 0x007F007Fu) | (e2 << 7) | (e3 << 23);
-      if constexpr (kM16) {
-        bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
-      } else {
-        bf16_mma_m16n8k16(c0, c1, c2, c3, a0, a2, b0, b1);
-      }
+      bf16_mma_m16n8k16(c0, c1, c2, c3, a0, a2, b0, b1);
 
       const uint32_t sm45 = __byte_perm(sm_w1, 0u, 0x4140);
       const uint32_t sm67 = __byte_perm(sm_w1, 0u, 0x4342);
       const uint32_t b2 = ((sm45 & 0x00800080u) << 8) | (sm45 & 0x007F007Fu) | (e4 << 7) | (e5 << 23);
       const uint32_t b3 = ((sm67 & 0x00800080u) << 8) | (sm67 & 0x007F007Fu) | (e6 << 7) | (e7 << 23);
-      if constexpr (kM16) {
-        bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a4, a5, a6, a7, b2, b3);
-      } else {
-        bf16_mma_m16n8k16(c0, c1, c2, c3, a4, a6, b2, b3);
-      }
+      bf16_mma_m16n8k16(c0, c1, c2, c3, a4, a6, b2, b3);
     }
     if (valid_m) {
       __nv_bfloat162 r;
       r.x = __float2bfloat16_rn(c0);
       r.y = __float2bfloat16_rn(c1);
       *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g) * pb.N + nb * 8 + 2 * t) = r;
-      if constexpr (kM16) {
-        if (valid_m_hi) {
-          __nv_bfloat162 r2;
-          r2.x = __float2bfloat16_rn(c2);
-          r2.y = __float2bfloat16_rn(c3);
-          *reinterpret_cast<__nv_bfloat162*>(pb.out + static_cast<size_t>(g + 8) * pb.N + nb * 8 + 2 * t) = r2;
-        }
-      }
     }
   }
   asm volatile("cp.async.wait_group 0;" ::: "memory");
@@ -922,37 +699,10 @@ static void br_set_attrs_once() {
   if (done) return;
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   cudaThreadExchangeStreamCaptureMode(&mode);
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       static_cast<int>(kMaxSmem - kLutBytes));
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       static_cast<int>(kMaxSmem - kLutBytes));
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       static_cast<int>(kMaxSmem - kLutBytes));
-  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  cudaFuncSetAttribute(br_pair_mma_gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(kMaxSmem - kLutBytes));
   cudaThreadExchangeStreamCaptureMode(&mode);
   done = true;
-}
-
-template <bool kPar4, bool kM16 = false>
-static inline void br_launch_k(int blocks, int threads, size_t dsmem, cudaStream_t st, BrProb pb) {
-  if ((pb.pdl_mode & 1) != 0) {
-    cudaLaunchConfig_t lcfg = {};
-    lcfg.gridDim = dim3(blocks, 1, 1);
-    lcfg.blockDim = dim3(threads, 1, 1);
-    lcfg.dynamicSmemBytes = dsmem;
-    lcfg.stream = st;
-    cudaLaunchAttribute attr[1];
-    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr[0].val.programmaticStreamSerializationAllowed = 1;
-    lcfg.attrs = attr;
-    lcfg.numAttrs = 1;
-    cudaError_t err = cudaLaunchKernelEx(&lcfg, br_pair_mma_gemm_kernel<kPar4, kM16>, pb);
-    TORCH_CHECK(err == cudaSuccess, "br_pair_mma_gemm_kernel PDL launch failed: ", cudaGetErrorString(err));
-  } else {
-    br_pair_mma_gemm_kernel<kPar4, kM16><<<blocks, threads, dsmem, st>>>(pb);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-  }
 }
 
 }  // namespace
@@ -1115,7 +865,7 @@ static void bf16_rans_gemm_into(torch::Tensor x, torch::Tensor blob, torch::Tens
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(),
               "x must be contiguous CUDA bf16 [M, K]");
   const int M = static_cast<int>(x.size(0));
-  TORCH_CHECK(M >= 1 && M <= 16 && x.size(1) == K && N % 8 == 0 && K % 32 == 0, "bad shape");
+  TORCH_CHECK(M >= 1 && M <= 8 && x.size(1) == K && N % 8 == 0 && K % 32 == 0, "bad shape");
   TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "bad blob");
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == M * N,
               "bad out");
@@ -1142,28 +892,27 @@ static void bf16_rans_gemm_into(torch::Tensor x, torch::Tensor blob, torch::Tens
   pb.stream_bytes = (blob_bytes > soff + 64u) ? (blob_bytes - soff - 64u) : 0u;
   pb.tpf_stride = br_tpf_stride();
 
-  TORCH_CHECK(cfg.wpb <= 24, "bf16_rans_gemm_into: wpb exceeds launch bounds (24)");
   size_t dsmem = kRB + static_cast<size_t>(cfg.wpb) * kRB;
   if (cfg.blocks == 48 && dsmem < 40960u) dsmem = 40960u;
   br_set_attrs_once();
 
-  static const bool par4_en = []() {
-    const char* env = std::getenv("MUSE_BF16_RANS_PAR4");
-    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
-  }();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  if (par4_en) {
-    if (M > 8) {
-      br_launch_k<true, true>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-    } else {
-      br_launch_k<true, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-    }
+  if ((pb.pdl_mode & 1) != 0) {
+    cudaLaunchConfig_t lcfg = {};
+    lcfg.gridDim = dim3(cfg.blocks, 1, 1);
+    lcfg.blockDim = dim3(cfg.wpb * 32, 1, 1);
+    lcfg.dynamicSmemBytes = dsmem;
+    lcfg.stream = st;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    lcfg.attrs = attr;
+    lcfg.numAttrs = 1;
+    cudaError_t err = cudaLaunchKernelEx(&lcfg, br_pair_mma_gemm_kernel, pb);
+    TORCH_CHECK(err == cudaSuccess, "br_pair_mma_gemm_kernel PDL launch failed: ", cudaGetErrorString(err));
   } else {
-    if (M > 8) {
-      br_launch_k<false, true>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-    } else {
-      br_launch_k<false, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
-    }
+    br_pair_mma_gemm_kernel<<<cfg.blocks, cfg.wpb * 32, dsmem, st>>>(pb);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
 
