@@ -798,6 +798,38 @@ def pack_scales6(tiled_scales: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     return packed, palette
 
 
+_PAIRED_GATE_UP_PERM: dict[int, torch.Tensor] = {}
+
+
+def paired_gate_up_perm_cpu() -> torch.Tensor:
+    """Source column of the paired gate/up output for every natural column [gate 0..19967 | up 0..19967].
+
+    Paired layout (register_all_gate_up_swiglu): 264 tiles of [64 gate | 64 up] (columns 0..33791), then the gate tail
+    (33792..36863, natural gate 16896..19967) and the up tail (36864..39935, natural up 16896..19967)."""
+    j = torch.arange(GATE_UP_N, dtype=torch.int64)
+    half = GATE_UP_N // 2  # 19968
+    head = 16896
+    src = torch.empty_like(j)
+    g = j[:head]
+    src[:head] = (g // 64) * 128 + g % 64
+    src[head:half] = 33792 + (j[head:half] - head)
+    u = j[half:half + head] - half
+    src[half:half + head] = (u // 64) * 128 + 64 + u % 64
+    src[half + head:] = j[half + head:]
+    return src
+
+
+def _paired_gate_up_perm(device: torch.device) -> torch.Tensor | None:
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    perm = _PAIRED_GATE_UP_PERM.get(idx)
+    if perm is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None  # never allocate a persistent index inside a graph capture; the cat path is used
+        perm = paired_gate_up_perm_cpu().to(device)
+        _PAIRED_GATE_UP_PERM[idx] = perm
+    return perm
+
+
 def decode_linear6(
     x: torch.Tensor,
     tiled_weight: torch.Tensor,
@@ -891,6 +923,10 @@ def decode_linear6(
             if lm_pad128:
                 return output[:, :n].contiguous()
             if (n, k) == (GATE_UP_N, GATE_UP_K) and global_scale.data_ptr() in _SWIGLU_GATE_UP:
+                perm = _paired_gate_up_perm(output.device)
+                if perm is not None:
+                    # one gather instead of two strided copies and a cat: the same columns in the same order
+                    return torch.index_select(output, 1, perm)
                 head = output[:, :33792].view(m, 264, 2, 64)
                 return torch.cat(
                     (
@@ -1340,6 +1376,12 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
             "Decode6 paired gate_up SwiGLU admitted bitwise on %d MLP layers (%d BF16->NVFP4, %d FP8->rANS)",
             total, count_bf16, count_fp8,
         )
+    if total > 0 and torch.cuda.is_available():
+        # Build the paired->natural column index for the multi-row path now, outside any graph capture.
+        try:
+            _paired_gate_up_perm(torch.device("cuda", torch.cuda.current_device()))
+        except Exception:  # noqa: BLE001 - optional: the cat path stays
+            pass
     return total
 
 

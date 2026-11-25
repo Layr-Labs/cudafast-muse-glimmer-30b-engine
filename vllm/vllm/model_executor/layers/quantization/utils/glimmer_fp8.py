@@ -84,6 +84,55 @@ def _stock_scaled_mm(a, b, scale_a, scale_b):
     return ops.cutlass_scaled_mm(a, b, out_dtype=torch.bfloat16, scale_a=scale_a, scale_b=scale_b, bias=None)
 
 
+# DFlash verify rows (M = 2..8): the 16x32x512 tile measured fastest for one row also serves the verify block. Both
+# tiles are one 16-row M tile over the same SM120 mainloop with the same per-element k order, so each output row is
+# the same mma chain; a shape is admitted only after the 512 tile reproduces today's M = 2..16 tile bit for bit on a
+# real weight of that shape at M = 2, 7 and 8. Unadmitted shapes keep their _CFG tile.
+_ROWS512_MAX_M = 8
+_rows512_ok: dict[tuple[int, int], bool] = {}
+
+
+def admit_rows512(weight: torch.Tensor, weight_scale: torch.Tensor, input_scale: torch.Tensor) -> bool:
+    """Load time, once per (N, K): admit the 512-deep tile for 2..8 rows if bitwise equal to the _CFG tile."""
+    if (_ext is None or weight is None or weight_scale is None or input_scale is None or weight.dim() != 2
+            or weight.dtype != torch.float8_e4m3fn or not weight.is_cuda
+            or weight.stride(0) != 1 or weight.stride(1) != weight.size(0)
+            or weight_scale.numel() != 1 or input_scale.numel() != 1
+            or weight_scale.dtype != torch.float32 or input_scale.dtype != torch.float32):
+        return False
+    key = (weight.size(1), weight.size(0))
+    cfg = _CFG.get(key)
+    if cfg is None:
+        return False
+    if key in _rows512_ok:
+        return _rows512_ok[key]
+    ok = True
+    try:
+        sa, sb = input_scale.reshape(1), weight_scale.reshape(1)
+        gen = torch.Generator(device=weight.device)
+        gen.manual_seed(key[0] * 31 + key[1])
+        for m in (2, 7, 8):
+            for mag in (0.05, 1.0, 40.0):
+                x = torch.randn(m, key[1], generator=gen, device=weight.device) * mag
+                x[:, ::3] *= 16
+                x[:, 1::2] = -x[:, ::2]
+                xq = (x / sa.float()).clamp(-448, 448).to(torch.float8_e4m3fn).contiguous()
+                ref = _ext.gemm(xq, weight, sa, sb, cfg)
+                got = _ext.gemm(xq, weight, sa, sb, 512)
+                if got.shape != ref.shape or not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+                    ok = False
+                    break
+            if not ok:
+                break
+    except Exception as e:  # noqa: BLE001
+        logger.warning("glimmer_fp8: 512-tile verify-rows check failed (%s); keeping the M=2..16 tile", e)
+        ok = False
+    _rows512_ok[key] = ok
+    logger.info("glimmer_fp8: %dx%d FP8 GEMM %s the 16x32x512 tile for 2..%d rows", key[0], key[1],
+                "admits" if ok else "keeps its tile instead of", _ROWS512_MAX_M)
+    return ok
+
+
 def admit_prefill(weight: torch.Tensor, weight_scale: torch.Tensor, input_scale: torch.Tensor) -> bool:
     """Load time: admit this FP8 layer's prompt-sized GEMMs to muse_fp8_prefill if bitwise equal to the stock op."""
     if (_prefill is None or weight is None or weight_scale is None or input_scale is None
@@ -160,7 +209,7 @@ def fp8_scaled_mm(a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale
             and a.is_contiguous() and b.stride(0) == 1 and b.stride(1) == b.size(0)):
         cfg = _CFG.get((b.size(1), b.size(0)))
         if cfg is not None:
-            if a.size(0) == 1:
+            if a.size(0) == 1 or (a.size(0) <= _ROWS512_MAX_M and _rows512_ok.get((b.size(1), b.size(0)), False)):
                 cfg = 512
             return _ext.gemm(a, b, scale_a.reshape(1), scale_b.reshape(1), cfg)
     return ops.cutlass_scaled_mm(a, b, out_dtype=torch.bfloat16, scale_a=scale_a, scale_b=scale_b, bias=None)
