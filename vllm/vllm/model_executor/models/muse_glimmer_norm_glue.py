@@ -50,8 +50,8 @@ _DROP_BF16 = os.environ.get("VLLM_MUSE_GLIMMER_DECODE_DROP_BF16", "1") == "1"
 _RANS_PROLOGUE = os.environ.get("MUSE_RANS_PROLOGUE_FUSE", "1") != "0"
 _MUL_SIGMOID_GLUE = os.environ.get("MUSE_MUL_SIGMOID_GLUE", "1") != "0"
 _OPROJ_SIGMOID_FUSE = os.environ.get("MUSE_OPROJ_SIGMOID_FUSE", "1") != "0"
-_OPROJ_SIGMOID_FUSE_M = os.environ.get("MUSE_OPROJ_SIGMOID_FUSE_M", "1") != "0"
 _MUL_SILU_SLICE_GLUE = os.environ.get("MUSE_MUL_SILU_SLICE_GLUE", "1") != "0"
+_MUSERANS_MULTI_M = os.environ.get("MUSE_RANS_MULTI_M", os.environ.get("MUSERANS_M", "0")) != "0"
 _REQUANT = "triton_poi_fused__to_copy_clamp_mul_reciprocal_0"
 _REQUANT_BODY = "f7a07e4acde4818e0fe4bcb2f62a211fa163724414f5efcce3d93ee433b8300f"
 _SIGMOID_FP8_HASH = "68ddaaf112b7f2fbd8d452b5eb8b93c39567cfe29e167a625d3194458669ad01"
@@ -77,15 +77,14 @@ _gate_layers: dict[int, _GateLayer] = {}
 _pending_decode = None  # (out_bf16_ptr, _GateLayer, rows, folded)
 _expect_decode = None   # (requant_out_ptr, _GateLayer, rows, folded)
 _gate_counts = Counter()
-_prologue_state: dict[int, str] = {}  # scale_ptr -> "admitted" | "rejected"
-_pending_rans_prologue = None  # (out_fp8_ptr, act_mode, x0, x1, scale_ptr, skipped)
+_prologue_state: dict[tuple[int, bool], str] = {}  # (scale_ptr, is_multi_m) -> "admitted" | "rejected"
+_pending_rans_prologue = None  # (out_fp8_ptr, act_mode, x0, x1, scale_ptr, skipped, is_multi_m)
 _prologue_counts = Counter()
 _pending_gate_up_swiglu = None  # (out_ptr, sw_entry, fused_launched, check_args)
 _expect_down_swiglu = None      # (triton_out_ptr, swiglu_view, down_gs_ptr)
 _swiglu_gu_counts = Counter()
 _pending_oproj_sigmoid = None   # (out_ptr, gate, attn, skipped)
-_oproj_fuse_state = "unchecked"    # M=1: "unchecked" -> "admitted" | "rejected"
-_oproj_fuse_m_state = "unchecked"  # M=2..8: "unchecked" -> "admitted" | "rejected"
+_oproj_fuse_state = "unchecked"  # "unchecked" -> "admitted" | "rejected"
 _oproj_sig_counts = Counter()
 
 
@@ -98,63 +97,44 @@ def consume_oproj_sigmoid(
     global_scale: torch.Tensor,
     workspace: torch.Tensor,
 ) -> torch.Tensor | None:
-    global _pending_oproj_sigmoid, _oproj_fuse_state, _oproj_fuse_m_state
+    global _pending_oproj_sigmoid, _oproj_fuse_state
     if _pending_oproj_sigmoid is None:
         return None
     ptr, gate, attn, skipped = _pending_oproj_sigmoid
     _pending_oproj_sigmoid = None
     import muse_marlin6_gemv as _m6
 
-    is_m = x.ndim == 2 and 1 < x.shape[0] <= 16 and x.shape[1] == _m6.OPROJ_K
-    allowed = _m6._GATED_OPROJ_M if is_m else _m6._GATED_OPROJ
-    if x.data_ptr() != ptr or gs_ptr not in allowed or gate.numel() != x.numel() or attn.numel() != x.numel():
+    if x.data_ptr() != ptr or gs_ptr not in _m6._GATED_OPROJ:
         if skipped:
             raise RuntimeError("muse_glimmer_norm_glue: skipped mul_sigmoid did not reach expected NVFP4 o_proj")
-        if is_m:
-            _oproj_fuse_m_state = "rejected"
-        else:
-            _oproj_fuse_state = "rejected"
+        _oproj_fuse_state = "rejected"
         del gate, attn
         return None
     out_shape = (*x.shape[:-1], _m6.OPROJ_N)
-    launch_fn = _m6.launch_oproj_gated6_m if is_m else _m6.launch_oproj_gated6
     if not skipped:
         if torch.cuda.is_current_stream_capturing():
             del gate, attn
             return None
         try:
             ref = _m6.decode_linear6(x, tiled_weight, scales6, palette, global_scale, workspace, _m6.OPROJ_N, _m6.OPROJ_K, False)
-            got = launch_fn(gate, attn, tiled_weight, scales6, palette, global_scale, workspace, out_shape)
+            got = _m6.launch_oproj_gated6(gate, attn, tiled_weight, scales6, palette, global_scale, workspace, out_shape)
             torch.cuda.synchronize(x.device)
             if torch.equal(got.view(torch.int16), ref.view(torch.int16)) and int(torch.count_nonzero(workspace).item()) == 0:
-                if is_m:
-                    _oproj_fuse_m_state = "admitted"
-                    _oproj_sig_counts["admitted_m"] += 1
-                    logger.info("Decode6 o_proj fused mul_sigmoid M=2..8 prologue: live forward admitted bitwise (m=%d)", int(x.shape[0]))
-                else:
-                    _oproj_fuse_state = "admitted"
-                    _oproj_sig_counts["admitted"] += 1
-                    logger.info("Decode6 o_proj fused mul_sigmoid prologue: live forward admitted bitwise")
-            else:
-                if is_m:
-                    _oproj_fuse_m_state = "rejected"
-                    _oproj_sig_counts["rejected_m"] += 1
-                else:
-                    _oproj_fuse_state = "rejected"
-                    _oproj_sig_counts["rejected"] += 1
-            del gate, attn
-            return ref
-        except Exception:
-            if is_m:
-                _oproj_fuse_m_state = "rejected"
-                _oproj_sig_counts["rejected_m"] += 1
+                _oproj_fuse_state = "admitted"
+                _oproj_sig_counts["admitted"] += 1
+                logger.info("Decode6 o_proj fused mul_sigmoid prologue: live forward admitted bitwise")
             else:
                 _oproj_fuse_state = "rejected"
                 _oproj_sig_counts["rejected"] += 1
             del gate, attn
+            return ref
+        except Exception:
+            _oproj_fuse_state = "rejected"
+            _oproj_sig_counts["rejected"] += 1
+            del gate, attn
             return None
-    out = launch_fn(gate, attn, tiled_weight, scales6, palette, global_scale, workspace, out_shape)
-    _oproj_sig_counts["fused_launches_m" if is_m else "fused_launches"] += 1
+    out = _m6.launch_oproj_gated6(gate, attn, tiled_weight, scales6, palette, global_scale, workspace, out_shape)
+    _oproj_sig_counts["fused_launches"] += 1
     del gate, attn
     return out
 
@@ -164,7 +144,7 @@ def notify_gate_up_swiglu(out_ptr: int, sw_entry: dict, fused_launched: bool, ch
     _pending_gate_up_swiglu = (out_ptr, sw_entry, fused_launched, check_args)
 
 
-def try_consume_gate_up_swiglu_fp8(gu_ptr: int, s_ptr: int, out_ptr: int) -> bool:
+def try_consume_gate_up_swiglu_fp8(gu_ptr: int, s_ptr: int, out_ptr: int, rows: int = 1) -> bool:
     global _pending_gate_up_swiglu, _pending_rans_prologue
     if _pending_gate_up_swiglu is None:
         return False
@@ -179,7 +159,8 @@ def try_consume_gate_up_swiglu_fp8(gu_ptr: int, s_ptr: int, out_ptr: int) -> boo
         return False
     if gu_ptr != exp_gu_ptr or s_ptr != sw_entry["fp8_scale_ptr"]:
         raise RuntimeError("muse_glimmer_norm_glue: fused FP8 gate_up SwiGLU output did not match silu_fp8 args")
-    _pending_rans_prologue = (out_ptr, 0, sw_entry["swiglu_fp8_out"], None, s_ptr, True)
+    fp8_view = sw_entry["swiglu_fp8_out"].view(-1)[: rows * 19968].view(rows, 19968)
+    _pending_rans_prologue = (out_ptr, 0, fp8_view, None, s_ptr, True, rows > 1)
     _swiglu_gu_counts["fp8_skipped"] += 1
     return True
 
@@ -199,101 +180,76 @@ def consume_down_swiglu(x: torch.Tensor, down_gs_ptr: int) -> torch.Tensor | Non
 def consume_rans_prologue(
     A: torch.Tensor, As: torch.Tensor, packed: torch.Tensor, n: int, k: int, Bs: torch.Tensor
 ) -> torch.Tensor | None:
-    """Consume a pending M=1..8 fused activation+FP8 prologue inside muse_fp8_scaled_mm."""
+    """Consume a pending M=1 fused activation+FP8 prologue inside muse_fp8_scaled_mm."""
     global _pending_rans_prologue
     if _pending_rans_prologue is None:
         return None
-    ptr, act_mode, x0, x1, scale_ptr, skipped = _pending_rans_prologue
+    ptr, act_mode, x0, x1, scale_ptr, skipped, is_multi_m = _pending_rans_prologue
     _pending_rans_prologue = None
+    st_key = (scale_ptr, is_multi_m)
     if A.data_ptr() != ptr or As.data_ptr() != scale_ptr:
         if skipped:
             raise RuntimeError("muse_glimmer_norm_glue: skipped prologue did not reach expected FP8 GEMM")
-        _prologue_state[scale_ptr] = "rejected"
+        _prologue_state[st_key] = "rejected"
         return None
     import muse_rans_ext as _rans
 
-    m = int(A.shape[0]) if A.ndim == 2 else 1
     if act_mode == 0:
-        out = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
-        _rans.rans_gemv_auto(packed, x0.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
+        rows = x0.shape[0] if x0.dim() >= 2 else 1
+        out = torch.empty((rows, n), dtype=torch.bfloat16, device=A.device)
+        if rows == 1:
+            _rans.rans_gemv_auto(packed, x0.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
+        else:
+            _rans.rans_gemm_auto(packed, x0.reshape(rows, k), Bs.reshape(-1), As.reshape(-1), out, rows, n, k)
         _swiglu_gu_counts["fp8_down_redirected"] += 1
         del x0, x1
         return out
     aux = x1 if x1 is not None else x0
-    if m > 1:
-        if not skipped:
-            if torch.cuda.is_current_stream_capturing():
-                del x0, x1, aux
-                return None
-            ref = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
-            got = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
-            _rans.rans_gemm_m_auto(packed, A, Bs.reshape(-1), As.reshape(-1), ref, n, k)
-            _rans.rans_gemm_m_fused_auto(
-                packed, x0, aux, Bs.reshape(-1), As.reshape(-1), got, n, k, act_mode
-            )
-            torch.cuda.synchronize()
-            if torch.equal(got.view(torch.int16), ref.view(torch.int16)):
-                _prologue_state[scale_ptr] = "admitted"
-                _prologue_counts["admitted"] += 1
-            else:
-                _prologue_state[scale_ptr] = "rejected"
-                _prologue_counts["rejected"] += 1
-            del x0, x1, aux
-            return ref
-        out = torch.empty((m, n), dtype=torch.bfloat16, device=A.device)
-        _rans.rans_gemm_m_fused_auto(
-            packed, x0, aux, Bs.reshape(-1), As.reshape(-1), out, n, k, act_mode
-        )
-        _prologue_counts["fused_launches"] += 1
-        del x0, x1, aux
-        return out
+    rows = A.shape[0] if A.dim() >= 2 else 1
     if not skipped:
         if torch.cuda.is_current_stream_capturing():
             return None
-        ref = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
-        got = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
-        _rans.rans_gemv_auto(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), ref, n, k)
-        _rans.rans_gemv_fused_auto(
-            packed, x0.view(-1), aux.view(-1), Bs.reshape(-1), As.reshape(-1), got, n, k, act_mode
-        )
+        ref = torch.empty((rows, n), dtype=torch.bfloat16, device=A.device)
+        got = torch.empty((rows, n), dtype=torch.bfloat16, device=A.device)
+        if rows == 1:
+            _rans.rans_gemv_auto(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), ref, n, k)
+            _rans.rans_gemv_fused_auto(
+                packed, x0.view(-1), aux.view(-1), Bs.reshape(-1), As.reshape(-1), got, n, k, act_mode
+            )
+        else:
+            if not hasattr(_rans, "rans_gemm_auto") or not hasattr(_rans, "rans_gemm_fused_auto"):
+                return None
+            if not (hasattr(_rans, "rans_fused_fits") and _rans.rans_fused_fits(rows, n, k)):
+                _prologue_state[st_key] = "rejected"
+                return None
+            _rans.rans_gemm_auto(packed, A, Bs.reshape(-1), As.reshape(-1), ref, rows, n, k)
+            _rans.rans_gemm_fused_auto(
+                packed, x0, aux, Bs.reshape(-1), As.reshape(-1), got, rows, n, k, act_mode
+            )
         torch.cuda.synchronize()
         if torch.equal(got.view(torch.int16), ref.view(torch.int16)):
-            _prologue_state[scale_ptr] = "admitted"
+            _prologue_state[st_key] = "admitted"
             _prologue_counts["admitted"] += 1
             if _prologue_counts["admitted"] in (1, 42, 54):
                 logger.info("Decode rANS prologue fusion: %d FP8 layers admitted", _prologue_counts["admitted"])
         else:
-            _prologue_state[scale_ptr] = "rejected"
+            _prologue_state[st_key] = "rejected"
             _prologue_counts["rejected"] += 1
         del x0, x1, aux
         return ref
     # Hold x0/x1 alive across output allocation so caching allocator cannot alias them.
-    out = torch.empty((1, n), dtype=torch.bfloat16, device=A.device)
-    _rans.rans_gemv_fused_auto(
-        packed, x0.view(-1), aux.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k, act_mode
-    )
+    out = torch.empty((rows, n), dtype=torch.bfloat16, device=A.device)
+    if rows == 1:
+        _rans.rans_gemv_fused_auto(
+            packed, x0.view(-1), aux.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k, act_mode
+        )
+    else:
+        _rans.rans_gemm_fused_auto(
+            packed, x0, aux, Bs.reshape(-1), As.reshape(-1), out, rows, n, k, act_mode
+        )
     _prologue_counts["fused_launches"] += 1
     del x0, x1, aux
     return out
-
-
-def _flush_gqa16_prefill(stream=None) -> None:
-    try:
-        import muse_gqa16_attn as _gqa
-        if _gqa._pending_prefill is not None:
-            _gqa.flush_pending_prefill(stream)
-    except Exception:
-        pass
-
-
-def _consume_gqa16_prefill(attn, gate, out, fp8_scale=None, stream=None) -> bool:
-    try:
-        import muse_gqa16_attn as _gqa
-        if _gqa._pending_prefill is not None:
-            return _gqa.consume_prefill_mul_sigmoid(attn, gate, out, fp8_scale, stream)
-    except Exception:
-        pass
-    return False
 
 
 class _MulSigmoidSwap:
@@ -301,25 +257,20 @@ class _MulSigmoidSwap:
         self.state = "unchecked"
 
     def run(self, kernel, orig_run, args, kwargs):
-        global _pending_oproj_sigmoid, _oproj_fuse_state, _oproj_fuse_m_state
+        global _pending_oproj_sigmoid, _oproj_fuse_state
         if kwargs.get("benchmark_run", False):
             return orig_run(kernel, *args, **kwargs)
         if _pending_oproj_sigmoid is not None:
             if _pending_oproj_sigmoid[3]:
                 raise RuntimeError("muse_glimmer_norm_glue: skipped mul_sigmoid was never consumed by o_proj")
-            if _pending_oproj_sigmoid[1].numel() > 4096:
-                _oproj_fuse_m_state = "rejected"
-            else:
-                _oproj_fuse_state = "rejected"
+            _oproj_fuse_state = "rejected"
             _pending_oproj_sigmoid = None
         if self.state == "rejected" or len(args) != 4:
-            _flush_gqa16_prefill(kwargs.get("stream"))
             return orig_run(kernel, *args, **kwargs)
         gate, attn, out, numel = args
         try:
             n_el = int(numel)
         except Exception:
-            _flush_gqa16_prefill(kwargs.get("stream"))
             return orig_run(kernel, *args, **kwargs)
         stream = kwargs.get("stream")
         if (
@@ -337,12 +288,10 @@ class _MulSigmoidSwap:
                 for t in (gate, attn, out)
             )
         ):
-            _flush_gqa16_prefill(stream)
             return orig_run(kernel, *args, **kwargs)
         import muse_norm_glue as G
 
         if self.state == "unchecked":
-            _flush_gqa16_prefill(stream)
             if torch.cuda.is_current_stream_capturing():
                 return orig_run(kernel, *args, **kwargs)
             ok = False
@@ -378,8 +327,6 @@ class _MulSigmoidSwap:
                 except Exception:
                     pass
             return None
-        if n_el > 4096 and _consume_gqa16_prefill(attn, gate, out, None, stream):
-            return None
         if _OPROJ_SIGMOID_FUSE and _oproj_fuse_state != "rejected" and n_el == 4096:
             try:
                 import muse_marlin6_gemv as _m6
@@ -394,20 +341,6 @@ class _MulSigmoidSwap:
                         return None
             except Exception:
                 _oproj_fuse_state = "rejected"
-        elif _OPROJ_SIGMOID_FUSE_M and _oproj_fuse_m_state != "rejected" and 8192 <= n_el <= 16 * 4096:
-            try:
-                import muse_marlin6_gemv as _m6
-                if getattr(_m6, "_ALL_OPROJ_GATED_M_READY", False):
-                    if _oproj_fuse_m_state == "admitted":
-                        _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, True)
-                        _oproj_sig_counts["skipped_m"] += 1
-                        return None
-                    if _oproj_fuse_m_state == "unchecked" and not torch.cuda.is_current_stream_capturing():
-                        G.mul_sigmoid_bf16(gate, attn, out, n_el, stream)
-                        _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, False)
-                        return None
-            except Exception:
-                _oproj_fuse_m_state = "rejected"
         G.mul_sigmoid_bf16(gate, attn, out, n_el, stream)
         return None
 
@@ -429,13 +362,10 @@ class _MulSiluSliceSwap:
                     n_sw = int(numel_t)
                 except Exception:
                     n_sw = -1
-                if n_sw > 0 and n_sw % 19968 == 0 and (n_sw // 19968) <= 16 and gu_t.data_ptr() == gu_ptr:
-                    m_rows = n_sw // 19968
+                if n_sw % 19968 == 0 and 1 <= (n_sw // 19968) <= 8 and gu_t.data_ptr() == gu_ptr:
+                    rows = n_sw // 19968
+                    sw_view = sw_entry["swiglu_out"].view(-1)[: rows * 19968].view(rows, 19968)
                     if fused_launched:
-                        if m_rows == 1:
-                            sw_view = sw_entry["swiglu_out"][:, :19968]
-                        else:
-                            sw_view = sw_entry["swiglu_out_m"].view(-1)[:n_sw].view(m_rows, 19968)
                         _expect_down_swiglu = (
                             out_t.data_ptr(),
                             sw_view,
@@ -443,26 +373,36 @@ class _MulSiluSliceSwap:
                         )
                         _swiglu_gu_counts["skipped"] += 1
                         return None
-                    if m_rows == 1 and sw_entry["state"] == "prechecked" and not torch.cuda.is_current_stream_capturing() and check_args is not None:
+                    if sw_entry["state"] == "prechecked" and not torch.cuda.is_current_stream_capturing() and check_args is not None:
                         orig_run(kernel, *args, **kwargs)
                         try:
                             import muse_marlin6_gemv as _m6
                             x_c, w_c, s6_c, pal_c, gs_c, ws_c, part_c = check_args
                             sw_out = sw_entry["swiglu_out"]
-                            pl = sw_entry["pair_locks"]
                             with torch.cuda.device(out_t.device):
-                                rc = _m6._gate_up_tma4_swiglu(
-                                    x_c.data_ptr(), w_c.data_ptr(), sw_out.data_ptr(), part_c.data_ptr(),
-                                    s6_c.data_ptr(), pal_c.data_ptr(), gs_c.data_ptr(), ws_c.data_ptr(),
-                                    pl.data_ptr(), 39936, 6656, 48,
-                                    out_t.device.index, torch.cuda.current_stream().cuda_stream,
-                                )
+                                if sw_entry.get("is_ilv"):
+                                    rc = _m6._sk_tma4_ilv_swiglu_m(
+                                        x_c.data_ptr(), w_c.data_ptr(), sw_out.data_ptr(), part_c.data_ptr(),
+                                        s6_c.data_ptr(), pal_c.data_ptr(), gs_c.data_ptr(), ws_c.data_ptr(),
+                                        rows, 39936, 6656, 48,
+                                        out_t.device.index, torch.cuda.current_stream().cuda_stream,
+                                    )
+                                    pl_ok = True
+                                else:
+                                    pl = sw_entry["pair_locks"]
+                                    rc = _m6._gate_up_tma4_swiglu_m(
+                                        x_c.data_ptr(), w_c.data_ptr(), sw_out.data_ptr(), part_c.data_ptr(),
+                                        s6_c.data_ptr(), pal_c.data_ptr(), gs_c.data_ptr(), ws_c.data_ptr(),
+                                        pl.data_ptr(), rows, 39936, 6656, 48,
+                                        out_t.device.index, torch.cuda.current_stream().cuda_stream,
+                                    )
+                                    pl_ok = int(torch.count_nonzero(pl).item()) == 0
                             torch.cuda.synchronize(out_t.device)
                             if (
                                 rc == 0
-                                and int(torch.count_nonzero(pl).item()) == 0
+                                and pl_ok
                                 and int(torch.count_nonzero(ws_c).item()) == 0
-                                and torch.equal(sw_out[:, :19968].view(torch.int16), out_t.view(torch.int16))
+                                and torch.equal(sw_view.view(torch.int16), out_t.view(torch.int16))
                             ):
                                 sw_entry["state"] = "admitted"
                                 _swiglu_gu_counts["admitted"] += 1
@@ -555,7 +495,7 @@ class _RansPrologueHook:
         stream = kwargs.get("stream")
         if (
             stream is None
-            or n_el <= 4096
+            or n_el <= 8 * 4096
             or (n_el & 4095) != 0
             or n_el > 8192 * 4096
             or not all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gate, attn, scale, out))
@@ -570,7 +510,6 @@ class _RansPrologueHook:
         import muse_norm_glue as G
 
         if self.fp8_glue_state == "unchecked":
-            _flush_gqa16_prefill(stream)
             if torch.cuda.is_current_stream_capturing():
                 return False
             ok = False
@@ -599,50 +538,77 @@ class _RansPrologueHook:
             self.fp8_glue_state = "admitted" if ok else "rejected"
             logger.info("Prefill mul_sigmoid_fp8 glue: %s", self.fp8_glue_state)
             return True
-        if _consume_gqa16_prefill(attn, gate, out, scale, stream):
-            return True
         G.mul_sigmoid_fp8(gate, attn, scale, out, n_el, stream)
         return True
 
     def run(self, kernel, orig_run, args, kwargs):
-        global _pending_rans_prologue
+        global _pending_rans_prologue, _pending_gate_up_swiglu
         if kwargs.get("benchmark_run", False):
             return orig_run(kernel, *args, **kwargs)
+        if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
+            return None
+        # -- act_mode == 2: check if this is a silu_fp8 call we can redirect via fused SwiGLU --
+        if self.act_mode == 2 and _pending_gate_up_swiglu is not None and len(args) == 4:
+            gu, scale, out, numel = args
+            try:
+                n_el = int(numel)
+            except Exception:
+                n_el = -1
+            if (
+                n_el >= 19968
+                and n_el % 19968 == 0
+                and 1 <= (n_el // 19968) <= 8
+                and all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gu, scale, out))
+                and gu.dtype == torch.bfloat16 and gu.numel() == (n_el // 19968) * 39936
+                and (gu.data_ptr() & 7) == 0
+                and scale.dtype == torch.float32 and scale.numel() == 1
+                and out.dtype == torch.float8_e4m3fn and out.numel() == n_el
+            ):
+                rows = n_el // 19968
+                # Flush any stale pending prologue before consuming gate_up_swiglu
+                if _pending_rans_prologue is not None:
+                    if _pending_rans_prologue[5]:  # skipped=True
+                        _pending_rans_prologue = None
+                        raise RuntimeError("muse_glimmer_norm_glue: skipped prologue was never consumed before silu_fp8")
+                    else:
+                        _prologue_state[(_pending_rans_prologue[4], _pending_rans_prologue[6])] = "rejected"
+                        _pending_rans_prologue = None
+                if (rows == 1 or _MUSERANS_MULTI_M) and try_consume_gate_up_swiglu_fp8(gu.data_ptr(), scale.data_ptr(), out.data_ptr(), rows):
+                    return None
+        # Drop a pending gate_up SwiGLU that the silu_fp8 path above did not consume (e.g. rows > 8).
+        if self.act_mode == 2 and _pending_gate_up_swiglu is not None:
+            if _pending_gate_up_swiglu[2]:
+                _pending_gate_up_swiglu = None
+                raise RuntimeError("muse_glimmer_norm_glue: fused FP8 gate_up SwiGLU was never consumed")
+            _pending_gate_up_swiglu = None
+        # -- stale pending prologue from a previous layer --
         if _pending_rans_prologue is not None:
-            if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
-                return None
-            if self.act_mode == 1:
-                _flush_gqa16_prefill(kwargs.get("stream"))
-            return orig_run(kernel, *args, **kwargs)
+            if _pending_rans_prologue[5]:  # skipped=True
+                _pending_rans_prologue = None
+                raise RuntimeError("muse_glimmer_norm_glue: skipped prologue was never consumed before next prologue")
+            else:
+                _prologue_state[(_pending_rans_prologue[4], _pending_rans_prologue[6])] = "rejected"
+                _pending_rans_prologue = None
         try:
             import muse_rans_ext as _rans
             if not hasattr(_rans, "rans_gemv_fused_auto"):
-                if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
-                    return None
-                if self.act_mode == 1:
-                    _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
         except Exception:
-            if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
-                return None
-            if self.act_mode == 1:
-                _flush_gqa16_prefill(kwargs.get("stream"))
             return orig_run(kernel, *args, **kwargs)
         if self.act_mode == 1:
             if len(args) != 5:
-                _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
             gate, attn, scale, out, numel = args
             try:
                 n_el = int(numel)
             except Exception:
-                _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
-            max_m_fuse = 8 if hasattr(_rans, "rans_gemm_m_fused_auto") else 1
+            rows = n_el // 4096
             if (
-                n_el <= 0
-                or (n_el & 4095) != 0
-                or (n_el >> 12) > max_m_fuse
+                n_el < 4096
+                or (n_el % 4096) != 0
+                or not (1 <= rows <= 8)
+                or (rows > 1 and not (_MUSERANS_MULTI_M and hasattr(_rans, "rans_gemm_fused_auto") and hasattr(_rans, "rans_fused_fits") and _rans.rans_fused_fits(rows, 6656, 4096)))
                 or not all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gate, attn, scale, out))
                 or gate.dtype != torch.bfloat16 or attn.dtype != torch.bfloat16
                 or gate.numel() != n_el or attn.numel() != n_el
@@ -650,9 +616,6 @@ class _RansPrologueHook:
                 or scale.dtype != torch.float32 or scale.numel() != 1
                 or out.dtype != torch.float8_e4m3fn or out.numel() != n_el
             ):
-                if self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
-                    return None
-                _flush_gqa16_prefill(kwargs.get("stream"))
                 return orig_run(kernel, *args, **kwargs)
             x0, x1 = gate, attn
         else:
@@ -664,28 +627,36 @@ class _RansPrologueHook:
             except Exception:
                 return orig_run(kernel, *args, **kwargs)
             if (
-                n_el != 19968
-                or not all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gu, scale, out))
-                or gu.dtype != torch.bfloat16 or gu.numel() != 39936
-                or (gu.data_ptr() & 7) != 0
-                or scale.dtype != torch.float32 or scale.numel() != 1
-                or out.dtype != torch.float8_e4m3fn or out.numel() != 19968
+                n_el >= 19968
+                and n_el % 19968 == 0
+                and 1 <= (n_el // 19968) <= 8
+                and all(isinstance(t, torch.Tensor) and t.is_cuda and t.is_contiguous() for t in (gu, scale, out))
+                and gu.dtype == torch.bfloat16 and gu.numel() == (n_el // 19968) * 39936
+                and (gu.data_ptr() & 7) == 0
+                and scale.dtype == torch.float32 and scale.numel() == 1
+                and out.dtype == torch.float8_e4m3fn and out.numel() == n_el
             ):
+                rows = n_el // 19968
+                x0, x1 = gu, None
+                if (rows == 1 or _MUSERANS_MULTI_M) and try_consume_gate_up_swiglu_fp8(gu.data_ptr(), scale.data_ptr(), out.data_ptr(), rows):
+                    return None
+                if rows > 1 and not (_MUSERANS_MULTI_M and hasattr(_rans, "rans_gemm_fused_auto") and hasattr(_rans, "rans_fused_fits") and _rans.rans_fused_fits(rows, 6656, 19968)):
+                    return orig_run(kernel, *args, **kwargs)
+            else:
                 return orig_run(kernel, *args, **kwargs)
-            x0, x1 = gu, None
-            if try_consume_gate_up_swiglu_fp8(gu.data_ptr(), scale.data_ptr(), out.data_ptr()):
-                return None
+            rows = n_el // 19968
         s_ptr = scale.data_ptr()
-        st = _prologue_state.get(s_ptr, "unchecked")
+        st_key = (s_ptr, rows > 1)
+        st = _prologue_state.get(st_key, "unchecked")
         if st == "rejected":
             return orig_run(kernel, *args, **kwargs)
         if st == "admitted":
-            _pending_rans_prologue = (out.data_ptr(), self.act_mode, x0, x1, s_ptr, True)
+            _pending_rans_prologue = (out.data_ptr(), self.act_mode, x0, x1, s_ptr, True, rows > 1)
             return None
         if torch.cuda.is_current_stream_capturing():
             return orig_run(kernel, *args, **kwargs)
         orig_run(kernel, *args, **kwargs)
-        _pending_rans_prologue = (out.data_ptr(), self.act_mode, x0, x1, s_ptr, False)
+        _pending_rans_prologue = (out.data_ptr(), self.act_mode, x0, x1, s_ptr, False, rows > 1)
         return None
 
 

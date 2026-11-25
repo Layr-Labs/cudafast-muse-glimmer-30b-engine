@@ -1252,7 +1252,7 @@ class _GateSideStream:
             if x.shape[0] == 1:
                 if getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
                     return
-            elif 2 <= x.shape[0] <= 16:
+            elif 2 <= x.shape[0] <= 8:
                 if getattr(bf16_gate, "muse_bf16_rans_m", None) is None:
                     return
             else:
@@ -1562,7 +1562,7 @@ def _muse_bf16_gate_fill_impl(
             if rc == 0:
                 return
     if (
-        2 <= x.shape[0] <= 16
+        2 <= x.shape[0] <= 8
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16
@@ -2312,6 +2312,8 @@ class MuseGlimmerForCausalLM(
 
     def prepare_final_sample_tile(self, n: int):
         if n != 512 or not get_pp_group().is_last_rank or not get_pp_group().is_first_rank:
+            return None
+        if any(lid >= self.model.end_layer for lid in self.model.aux_hidden_state_layers):
             return None
         try:
             import muse_final_slab

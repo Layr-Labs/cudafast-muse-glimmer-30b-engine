@@ -19,10 +19,14 @@ import torch
 
 ENABLED = os.environ.get("MUSE_EMBED_FUSED", "1") == "1"
 ENABLED_M1 = os.environ.get("MUSE_EMBED_FUSED_M1", "1") != "0"
+ENABLED_MULTI = os.environ.get("MUSE_EMBED_FUSED_MULTI", "0") != "0"
 ENABLED_TAIL = os.environ.get("MUSE_FAST_DECODE_TAIL", "1") != "0"
+ENABLED_VERIFY = os.environ.get("VLLM_FUSED_GREEDY_VERIFY", "0") != "0"
 _lib = None
+_multi_fn = None
 _post_update_m1_fn = None
 _single_decode_prep_fn = None
+_greedy_verify_m1_fn = None
 try:
     _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_embed.so")))
     _p = ctypes.c_void_p
@@ -34,6 +38,11 @@ try:
     if _m1 is not None:
         _m1.argtypes = [_p, ctypes.c_int, _p, ctypes.c_float, _p, ctypes.c_int, _p]
         _m1.restype = ctypes.c_int
+    _multi = getattr(_lib, "muse_embed_norm_multi", None)
+    if _multi is not None:
+        _multi.argtypes = [_p, ctypes.c_int, _p, ctypes.c_float, _p, ctypes.c_int, ctypes.c_int, _p]
+        _multi.restype = ctypes.c_int
+        _multi_fn = _multi
     _pu = getattr(_lib, "muse_post_update_m1", None)
     if _pu is not None:
         _pu.argtypes = [
@@ -48,8 +57,19 @@ try:
         ]
         _dp.restype = ctypes.c_int
         _single_decode_prep_fn = _dp
+    _gv = getattr(_lib, "muse_greedy_verify_m1", None)
+    if _gv is not None:
+        _gv.argtypes = [
+            ctypes.c_int, ctypes.c_int, _p, _p, _p, _p, _p, _p, _p, _p, _p, _p,
+        ]
+        _gv.restype = ctypes.c_int
+        _greedy_verify_m1_fn = _gv
 except OSError:
     _lib = None
+    _multi_fn = None
+    _post_update_m1_fn = None
+    _single_decode_prep_fn = None
+    _greedy_verify_m1_fn = None
 
 
 def fast_post_update_m1(
@@ -158,7 +178,117 @@ def fast_single_decode_prep(
         raise RuntimeError(f"muse_single_decode_prep failed with CUDA error {rc}")
     return True
 
-state = {"admitted": None, "admitted_m1": None, "fused_calls": 0, "m1_calls": 0, "reason": ""}
+
+def fast_greedy_verify_m1(
+    target_argmax: torch.Tensor,
+    input_ids: torch.Tensor,
+    logits_indices: torch.Tensor | None,
+    sampled_out: torch.Tensor,
+    num_sampled_out: torch.Tensor,
+    num_rejected_out: torch.Tensor,
+    seq_lens: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    prefill_len: torch.Tensor,
+) -> bool:
+    if not ENABLED_VERIFY or _greedy_verify_m1_fn is None:
+        return False
+    if (
+        target_argmax.dim() != 1
+        or target_argmax.dtype != torch.int64
+        or not target_argmax.is_contiguous()
+        or not target_argmax.is_cuda
+    ):
+        return False
+    num_logits = int(target_argmax.shape[0])
+    if num_logits < 1 or num_logits > 8:
+        return False
+    dev = target_argmax.device
+    if (
+        input_ids.dim() != 1
+        or input_ids.dtype != torch.int32
+        or not input_ids.is_contiguous()
+        or input_ids.device != dev
+    ):
+        return False
+    if logits_indices is None:
+        if input_ids.shape[0] < num_logits:
+            return False
+        logits_indices_ptr = 0
+    else:
+        if (
+            logits_indices.dim() != 1
+            or logits_indices.dtype != torch.int64
+            or not logits_indices.is_contiguous()
+            or logits_indices.shape[0] < num_logits
+            or logits_indices.device != dev
+        ):
+            return False
+        logits_indices_ptr = logits_indices.data_ptr()
+    if (
+        sampled_out.dim() != 2
+        or sampled_out.shape[0] != 1
+        or sampled_out.shape[1] < num_logits
+        or sampled_out.dtype != torch.int64
+        or not sampled_out.is_contiguous()
+        or sampled_out.device != dev
+    ):
+        return False
+    if (
+        num_sampled_out.dim() != 1
+        or num_sampled_out.shape[0] < 1
+        or num_sampled_out.dtype != torch.int32
+        or not num_sampled_out.is_contiguous()
+        or num_sampled_out.device != dev
+        or num_rejected_out.dim() != 1
+        or num_rejected_out.shape[0] < 1
+        or num_rejected_out.dtype != torch.int32
+        or not num_rejected_out.is_contiguous()
+        or num_rejected_out.device != dev
+        or seq_lens.dim() != 1
+        or seq_lens.shape[0] < 1
+        or seq_lens.dtype != torch.int32
+        or not seq_lens.is_contiguous()
+        or seq_lens.device != dev
+        or idx_mapping.dim() != 1
+        or idx_mapping.shape[0] != 1
+        or idx_mapping.dtype != torch.int32
+        or not idx_mapping.is_contiguous()
+        or idx_mapping.device != dev
+        or prefill_len.dim() != 1
+        or prefill_len.shape[0] < 1
+        or prefill_len.dtype != torch.int32
+        or not prefill_len.is_contiguous()
+        or prefill_len.device != dev
+    ):
+        return False
+    rc = _greedy_verify_m1_fn(
+        num_logits,
+        int(sampled_out.shape[1]),
+        target_argmax.data_ptr(),
+        input_ids.data_ptr(),
+        logits_indices_ptr,
+        sampled_out.data_ptr(),
+        num_sampled_out.data_ptr(),
+        num_rejected_out.data_ptr(),
+        seq_lens.data_ptr(),
+        idx_mapping.data_ptr(),
+        prefill_len.data_ptr(),
+        torch.cuda.current_stream(dev).cuda_stream,
+    )
+    if rc:
+        raise RuntimeError(f"muse_greedy_verify_m1 failed with CUDA error {rc}")
+    return True
+
+
+state = {
+    "admitted": None,
+    "admitted_m1": None,
+    "admitted_multi": None,
+    "fused_calls": 0,
+    "m1_calls": 0,
+    "multi_calls": 0,
+    "reason": "",
+}
 
 
 def _fused_m1(ids, table, eps, out):
@@ -196,6 +326,46 @@ def _admit_m1(model, ids, out, table) -> bool:
 
 def is_single_kernel_m1() -> bool:
     return bool(ENABLED and ENABLED_M1 and state["admitted_m1"] is True)
+
+
+def _fused_multi(ids, table, eps, out):
+    rows, width = out.shape
+    stream = torch.cuda.current_stream(out.device).cuda_stream
+    status = _multi_fn(
+        ids.data_ptr(), int(ids.dtype == torch.int64), table.data_ptr(), float(eps),
+        out.data_ptr(), rows, width, stream,
+    )
+    if status:
+        raise RuntimeError(f"muse_embed norm_multi launch returned CUDA error {status}")
+
+
+def _admit_multi(model, ids, out, table) -> bool:
+    if not ENABLED_MULTI or _lib is None or _multi_fn is None:
+        return False
+    width = table.shape[1]
+    if width <= 0 or (width & 7) != 0 or width > 8192:
+        return False
+    dev = out.device
+    eps = model.embed_norm.eps
+    gen = torch.Generator(device=dev)
+    gen.manual_seed(20261125)
+    cases = []
+    if 1 <= ids.shape[0] <= 16:
+        cases.append(ids.clone())
+    for m in (1, 2, 7, 8):
+        cases.append(torch.randint(0, table.shape[0], (m,), generator=gen, device=dev, dtype=ids.dtype))
+    for case in cases:
+        mine = torch.empty((case.shape[0], width), dtype=torch.bfloat16, device=dev)
+        _fused_multi(case, table, eps, mine)
+        theirs = model.embed_norm(model.embed_tokens(case))
+        torch.cuda.synchronize()
+        if not torch.equal(mine.view(torch.int16), theirs.view(torch.int16)):
+            return False
+    return True
+
+
+def is_single_kernel_multi() -> bool:
+    return bool(ENABLED and ENABLED_MULTI and state["admitted_multi"] is True)
 
 
 def _fused(ids, table, eps, out):
@@ -286,6 +456,14 @@ def embed_into(model, ids, out) -> bool:
             _fused_m1(ids, table, model.embed_norm.eps, out)
             state["fused_calls"] += 1
             state["m1_calls"] += 1
+            return True
+    if 1 < out.shape[0] <= 16 and ENABLED_MULTI:
+        if state["admitted_multi"] is None and not torch.cuda.is_current_stream_capturing():
+            state["admitted_multi"] = _admit_multi(model, ids, out, table)
+        if state["admitted_multi"] is True:
+            _fused_multi(ids, table, model.embed_norm.eps, out)
+            state["fused_calls"] += 1
+            state["multi_calls"] += 1
             return True
     _fused(ids, table, model.embed_norm.eps, out)
     state["fused_calls"] += 1

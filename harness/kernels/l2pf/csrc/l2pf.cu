@@ -78,6 +78,48 @@ __global__ void prefetch_desc_spread_kernel(const unsigned long long* __restrict
   }
 }
 
+__global__ void prefetch_kv_window_kernel(const uint8_t* __restrict__ kv_ptr,
+                                          const int32_t* __restrict__ block_table,
+                                          const int32_t* __restrict__ seqused_k_ptr,
+                                          int block_size,
+                                          int window_left,
+                                          int64_t stride_block_bytes,
+                                          int64_t stride_slot_bytes,
+                                          int64_t stride_kv_head_bytes) {
+  const int seqlen_k = seqused_k_ptr[0];
+  if (seqlen_k <= 0 || block_size <= 0) return;
+  const int k_start = (window_left >= 0 && seqlen_k - 1 - window_left > 0)
+                          ? (seqlen_k - 1 - window_left)
+                          : 0;
+  const int b_min = k_start / block_size;
+  const int b_max = (seqlen_k + block_size - 1) / block_size;
+  const int nblks = b_max - b_min;
+  if (nblks <= 0) return;
+  const int nthr = static_cast<int>(gridDim.x * blockDim.x);
+  const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  const int total_units = nblks * 2;
+  const bool slot_contig = (stride_slot_bytes == 512);
+  for (int idx = tid; idx < total_units; idx += nthr) {
+    const int b = b_min + (idx >> 1);
+    const int kh = idx & 1;
+    const int blk_id = block_table[b];
+    if (blk_id < 0) continue;
+    const uint8_t* p = kv_ptr + static_cast<int64_t>(blk_id) * stride_block_bytes +
+                       static_cast<int64_t>(kh) * stride_kv_head_bytes;
+    if (slot_contig) {
+      const uint32_t bytes = static_cast<uint32_t>(block_size) * 512u;
+      for (uint32_t off = 0; off < bytes; off += kMaxPiece) {
+        const uint32_t n = (bytes - off < kMaxPiece) ? (bytes - off) : kMaxPiece;
+        bulk_prefetch(p + off, n);
+      }
+    } else {
+      for (int s = 0; s < block_size; ++s) {
+        bulk_prefetch(p + static_cast<int64_t>(s) * stride_slot_bytes, 512u);
+      }
+    }
+  }
+}
+
 }  // namespace l2pf
 
 extern "C" {
@@ -110,6 +152,19 @@ int l2pf_prefetch_desc(const void* desc, int ndesc, int blocks, int threads, voi
     return -1;
   l2pf::prefetch_desc_kernel<<<blocks, threads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       (const unsigned long long*)desc, ndesc);
+  return (int)cudaGetLastError();
+}
+
+int l2pf_prefetch_kv_window(const void* kv_ptr, const int32_t* block_table, const int32_t* seqused_k_ptr,
+                            int block_size, int window_left, int64_t stride_block_elems,
+                            int64_t stride_slot_elems, int64_t stride_kv_head_elems,
+                            int blocks, int threads, void* stream) {
+  if (!kv_ptr || !block_table || !seqused_k_ptr || block_size <= 0 || blocks < 1 ||
+      threads < 32 || threads > 1024 || reinterpret_cast<uintptr_t>(kv_ptr) % 16)
+    return -1;
+  l2pf::prefetch_kv_window_kernel<<<blocks, threads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(kv_ptr), block_table, seqused_k_ptr, block_size, window_left,
+      stride_block_elems * 2, stride_slot_elems * 2, stride_kv_head_elems * 2);
   return (int)cudaGetLastError();
 }
 

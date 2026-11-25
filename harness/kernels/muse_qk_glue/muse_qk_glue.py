@@ -77,12 +77,14 @@ MULTI_HPW = int(os.environ.get("MUSE_QK_MULTI_HPW", "9"))
 MULTI_MIN_TOKENS = 64
 DECODE_HPW = int(os.environ.get("MUSE_QK_DECODE_HPW", "2"))
 PREFILL_KV_HPW = int(os.environ.get("MUSE_QK_PREFILL_KV_HPW", "6"))
+SMALL_KV_HPW = int(os.environ.get("MUSE_QK_SMALL_KV_HPW", "2"))
 FUSE_KVCACHE = os.environ.get("MUSE_QK_FUSE_KVCACHE", "1").strip() not in ("0", "", "false", "no")
 FUSE_KVCACHE_PREFILL = FUSE_KVCACHE and os.environ.get("MUSE_QK_FUSE_KVCACHE_PREFILL", "1").strip() not in ("0", "", "false", "no")
 _multi_state: dict[str, bool | None] = {"admitted": None}
 _decode_state: dict[str, bool | None] = {"admitted": None}
 _kv_m1_state: dict[str, bool | None] = {"admitted": None}
 _kv_prefill_state: dict[str, bool | None] = {"admitted": None}
+_kv_small_state: dict[str, bool | None] = {"admitted": None}
 
 ENABLED = os.environ.get("VLLM_MUSE_GLIMMER_QK_FUSED", "1").strip() not in ("0", "", "false", "no")
 _checked: dict[int, bool] = {}
@@ -239,11 +241,13 @@ def self_check(device: torch.device) -> bool:
                     break
             _kv_m1_state["admitted"] = kvok
             logger.info("muse_qk_glue: M=1 fused QK-norm+RoPE+KV-cache kernel %s", "admitted" if kvok else "REJECTED")
-        if ok and _kv_prefill is not None and FUSE_KVCACHE_PREFILL and _kv_prefill_state["admitted"] is None:
-            pkvok = PREFILL_KV_HPW in (2, 4, 5, 6, 9)
+        if ok and _kv_prefill is not None and FUSE_KVCACHE_PREFILL:
             stream = torch.cuda.current_stream(device).cuda_stream
-            if pkvok:
-                for m_p in (16, 512):
+
+            def _check_kv_prefill(hpw: int, m_sizes: tuple[int, ...]) -> bool:
+                if hpw not in (2, 4, 5, 6, 9):
+                    return False
+                for m_p in m_sizes:
                     pos_p = torch.arange(m_p, dtype=torch.int64, device=device) % int(cache.shape[0])
                     for layout in ("NHD", "HND"):
                         for block_size in (16, 32):
@@ -282,7 +286,7 @@ def self_check(device: torch.device) -> bool:
                                             kv_got.data_ptr(), slots_p.data_ptr(),
                                             m_p, q_first, c_rows, block_size,
                                             kv_got.stride(0), kv_got.stride(2), kv_got.stride(1),
-                                            eps, qscale, int(use_rope), cf32, PREFILL_KV_HPW, stream,
+                                            eps, qscale, int(use_rope), cf32, hpw, stream,
                                         )
                                         torch.cuda.synchronize()
                                         if (
@@ -290,20 +294,17 @@ def self_check(device: torch.device) -> bool:
                                             or not torch.equal(q0[q_first:].view(torch.int16), q1[q_first:].view(torch.int16))
                                             or not torch.equal(raw_ref.view(torch.int16), raw_got.view(torch.int16))
                                         ):
-                                            pkvok = False
-                                            break
-                                    if not pkvok:
-                                        break
-                                if not pkvok:
-                                    break
-                            if not pkvok:
-                                break
-                        if not pkvok:
-                            break
-                    if not pkvok:
-                        break
-            _kv_prefill_state["admitted"] = pkvok
-            logger.info("muse_qk_glue: M>1 (HPW=%d) fused QK-norm+RoPE+KV-cache prefill kernel %s", PREFILL_KV_HPW, "admitted" if pkvok else "REJECTED")
+                                            return False
+                return True
+
+            if _kv_prefill_state["admitted"] is None:
+                pkvok = _check_kv_prefill(PREFILL_KV_HPW, (16, 512))
+                _kv_prefill_state["admitted"] = pkvok
+                logger.info("muse_qk_glue: M>1 (HPW=%d) fused QK-norm+RoPE+KV-cache prefill kernel %s", PREFILL_KV_HPW, "admitted" if pkvok else "REJECTED")
+            if _kv_small_state["admitted"] is None:
+                skvok = _check_kv_prefill(SMALL_KV_HPW, (7,))
+                _kv_small_state["admitted"] = skvok
+                logger.info("muse_qk_glue: M<=16 (HPW=%d) fused QK-norm+RoPE+KV-cache small prefill kernel %s", SMALL_KV_HPW, "admitted" if skvok else "REJECTED")
     except Exception:  # noqa: BLE001
         logger.warning("muse_qk_glue: self-check raised on cuda:%d", idx, exc_info=True)
         ok = False
@@ -474,11 +475,14 @@ def run_qk_norm_rope_kvcache_prefill(
     q_first_row: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, bool]:
     num_tokens = int(qkv.shape[0]) if qkv.ndim == 2 else -1
+    use_small = num_tokens <= 16 and bool(_kv_small_state.get("admitted"))
+    hpw = SMALL_KV_HPW if use_small else PREFILL_KV_HPW
+    admitted = bool(_kv_small_state.get("admitted")) if use_small else bool(_kv_prefill_state.get("admitted"))
     if (
         not FUSE_KVCACHE_PREFILL
         or _kv_prefill is None
-        or not _kv_prefill_state.get("admitted")
-        or PREFILL_KV_HPW not in (2, 4, 5, 6, 9)
+        or not admitted
+        or hpw not in (2, 4, 5, 6, 9)
         or qkv.ndim != 2
         or num_tokens <= 1
         or qkv.shape[1] != 4608
@@ -566,7 +570,7 @@ def run_qk_norm_rope_kvcache_prefill(
             float(qscale),
             int(use_rope),
             cache_fp32,
-            PREFILL_KV_HPW,
+            hpw,
             stream,
         )
     if st:

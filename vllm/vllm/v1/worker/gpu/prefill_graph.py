@@ -151,6 +151,16 @@ def _plan(dst: Any, src: Any, pairs: list, seen: dict, path: str) -> str | None:
     return None if same is True else f"{path}: {type(dst).__name__} differs"
 
 
+def _is_dflash_runner(runner) -> bool:
+    sc = runner.speculative_config
+    return (
+        sc is not None
+        and getattr(sc, "method", None) == "dflash"
+        and bool(runner.use_aux_hidden_state_outputs)
+        and runner.speculator is not None
+    )
+
+
 def prefill_graph_unsupported(runner, num_tokens: int) -> str | None:
     """Why the whole-forward prefill graph cannot serve this engine."""
     if os.environ.get("VLLM_PREFILL_GRAPH", "1") == "0":
@@ -171,8 +181,10 @@ def prefill_graph_unsupported(runner, num_tokens: int) -> str | None:
         pc.data_parallel_size,
     ) != (1, 1, 1) or runner.use_dcp:
         return "parallelism"
+    dflash_ok = _is_dflash_runner(runner)
     if (
-        runner.lora_config
+        ((runner.speculator is not None or runner.speculative_config is not None or runner.use_aux_hidden_state_outputs) and not dflash_ok)
+        or runner.lora_config
         or runner.is_pooling_model
         or runner.is_encoder_decoder
         or runner.pcp_manager is not None
@@ -183,33 +195,15 @@ def prefill_graph_unsupported(runner, num_tokens: int) -> str | None:
 
     if runner.kv_connector is not NO_OP_KV_CONNECTOR:
         return "kv connector"
+    draft_attn = getattr(runner.speculator, "draft_attn_layer_names", ()) if dflash_ok else ()
     for groups in runner.attn_groups:
         for group in groups:
+            if draft_attn and all(ln in draft_attn for ln in group.layer_names):
+                continue
             name = group.backend.get_name()
             if name != "FLASH_ATTN":
                 return f"attention backend {name}"
     return None
-
-
-def dflash_final_slab_safe(runner) -> bool:
-    """True when DFlash aux hidden states are all tapped strictly before the final layer."""
-    if os.environ.get("MUSE_FINAL_SLAB_DFLASH", "1") == "0":
-        return False
-    if not getattr(runner, "use_aux_hidden_state_outputs", False):
-        return False
-    spec_cfg = getattr(runner, "speculative_config", None)
-    if spec_cfg is None or getattr(spec_cfg, "method", None) != "dflash":
-        return False
-    inner = getattr(getattr(runner, "model", None), "model", None)
-    aux_layers = getattr(inner, "aux_hidden_state_layers", ())
-    end_layer = int(getattr(inner, "end_layer", 0))
-    # MuseGlimmerModel appends aux hidden state (layer_idx + 1) after layer_idx, so
-    # indices < end_layer are all captured before the final layer (end_layer - 1) runs.
-    return (
-        bool(aux_layers)
-        and end_layer > 0
-        and all(0 <= int(idx) < end_layer for idx in aux_layers)
-    )
 
 
 def capture_prefill_graph(runner) -> PrefillGraph | None:
@@ -221,11 +215,7 @@ def capture_prefill_graph(runner) -> PrefillGraph | None:
         return None
     started = time.perf_counter()
     graph = None
-    prepare_tile = (
-        getattr(runner.model, "prepare_final_sample_tile", None)
-        if (not runner.use_aux_hidden_state_outputs or dflash_final_slab_safe(runner))
-        else None
-    )
+    prepare_tile = getattr(runner.model, "prepare_final_sample_tile", None)
     if prepare_tile is not None:
         try:
             sample_tile = prepare_tile(num_tokens)
@@ -270,6 +260,8 @@ class PrefillGraph:
         self.num_tokens = n
         self.vllm_config = runner.vllm_config
         self.model = runner.model
+        self.use_aux_hidden_state_outputs = bool(runner.use_aux_hidden_state_outputs)
+        self.aux_hidden_states: list[torch.Tensor] | None = None
         self.sample_tile = sample_tile
         self.final_sample_tile = sample_tile is not None
         self.replays = 0
@@ -343,21 +335,25 @@ class PrefillGraph:
         self.graph = torch.cuda.CUDAGraph()
         get_offloader().sync_prev_onload()
         with torch.cuda.graph(self.graph, self.pool):
-            self.model_output = self._forward()
+            out = self._forward()
             get_offloader().join_after_forward()
         torch.accelerator.synchronize()
-        if isinstance(self.model_output, tuple):
+        if self.use_aux_hidden_state_outputs:
             if (
-                len(self.model_output) != 2
-                or not isinstance(self.model_output[0], torch.Tensor)
-                or not isinstance(self.model_output[1], list)
+                not isinstance(out, tuple)
+                or len(out) != 2
+                or not isinstance(out[0], torch.Tensor)
+                or not isinstance(out[1], list)
+                or not out[1]
+                or not all(isinstance(t, torch.Tensor) and t.shape[0] == n for t in out[1])
             ):
-                raise TypeError(f"model returned unexpected tuple {type(self.model_output).__name__}")
-            self.hidden_states = self.model_output[0]
-        elif isinstance(self.model_output, torch.Tensor):
-            self.hidden_states = self.model_output
+                raise TypeError(f"unexpected aux output from model: {type(out).__name__}")
+            self.hidden_states, self.aux_hidden_states = out
         else:
-            raise TypeError(f"model returned {type(self.model_output).__name__}")
+            if not isinstance(out, torch.Tensor):
+                raise TypeError(f"model returned {type(out).__name__}")
+            self.hidden_states = out
+            self.aux_hidden_states = None
         if self.final_sample_tile:
             logger.info("Prefill graph captured both final FFN tiles on the compiled backbone")
             plans = getattr(self.sample_tile, "attn_plans", None)
@@ -391,7 +387,7 @@ class PrefillGraph:
             self._zp_seq_lens_gpu[0] = n
             self._zp_qsl_gpu = torch.full_like(ib.query_start_loc, n)
             self._zp_qsl_gpu[0] = 0
-            self._zp_logits_indices_gpu = torch.tensor([n - 1], dtype=torch.int32, device=dev)
+            self._zp_logits_indices_gpu = torch.tensor([n - 1], dtype=torch.int64, device=dev)
             self._zp_pin_ids = torch.empty((n,), dtype=torch.int32, pin_memory=True)
             self._zp_pin_ids_np = self._zp_pin_ids.numpy()
             num_g = bt.num_kv_cache_groups
@@ -471,8 +467,9 @@ class PrefillGraph:
                 return self.model(**self.model_inputs)
             with self.sample_tile.capture():
                 out = self.model(**self.model_inputs)
-                if isinstance(out, tuple):
-                    return (out[0][-64:], out[1])
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, aux_hidden_states = out
+                    return hidden_states[-64:], aux_hidden_states
                 return out[-64:]
 
     def try_replay(
@@ -523,7 +520,11 @@ class PrefillGraph:
             if not pairs and self.embed_input_ids is not None and os.environ.get("VLLM_PREFILL_GRAPH_FAST", "1") != "0":
                 self._fast_verified = True
         self.replays += 1
-        return self.model_output
+        return (
+            (self.hidden_states, self.aux_hidden_states)
+            if self.use_aux_hidden_state_outputs
+            else self.hidden_states
+        )
 
     def can_fast_replay(
         self,
@@ -572,7 +573,11 @@ class PrefillGraph:
         self._fast_replays += 1
         if self._fast_replays == 1:
             logger.info("Prefill graph: fast replay active (skipping 52-layer metadata and _plan)")
-        return self.model_output
+        return (
+            (self.hidden_states, self.aux_hidden_states)
+            if self.use_aux_hidden_state_outputs
+            else self.hidden_states
+        )
 
     def stage_zero_prep(
         self,

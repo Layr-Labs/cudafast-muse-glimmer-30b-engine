@@ -130,28 +130,6 @@ softcap_argmax_kernel(const __nv_bfloat16* __restrict__ logits, const uint16_t* 
   }
 }
 
-__global__ void greedy_verify_kernel(
-    const int64_t* __restrict__ target_argmax,
-    const int32_t* __restrict__ input_ids,
-    const int64_t* __restrict__ logits_indices,
-    int32_t* __restrict__ num_sampled_out,
-    int32_t* __restrict__ num_rejected_out,
-    int m) {
-  int accepted = 0;
-  for (int i = 0; i < m - 1; ++i) {
-    const int64_t idx = logits_indices ? logits_indices[i + 1] : static_cast<int64_t>(i + 1);
-    const int64_t draft_tok = static_cast<int64_t>(input_ids[idx]);
-    if (target_argmax[i] == draft_tok) {
-      ++accepted;
-    } else {
-      break;
-    }
-  }
-  const int32_t ns = static_cast<int32_t>(accepted + 1);
-  num_sampled_out[0] = ns;
-  num_rejected_out[0] = static_cast<int32_t>(m) - ns;
-}
-
 }  // namespace lmpost
 
 extern "C" int lmpost_init() {
@@ -163,9 +141,7 @@ extern "C" int lmpost_init() {
   if (rc != cudaSuccess) return (int)rc;
   rc = cudaFuncGetAttributes(&attr, lmpost::softcap_argmax_kernel<true>);
   if (rc != cudaSuccess) return (int)rc;
-  rc = cudaFuncGetAttributes(&attr, lmpost::softcap_argmax_kernel<false>);
-  if (rc != cudaSuccess) return (int)rc;
-  return (int)cudaFuncGetAttributes(&attr, lmpost::greedy_verify_kernel);
+  return (int)cudaFuncGetAttributes(&attr, lmpost::softcap_argmax_kernel<false>);
 }
 
 extern "C" int lmpost_softcap_inplace(void* logits, const void* lut, int total_elems, void* stream) {
@@ -205,20 +181,5 @@ extern "C" int lmpost_softcap_argmax(const void* logits, const void* lut, void* 
         (const __nv_bfloat16*)logits, (const uint16_t*)lut, (int64_t*)out_token, (float*)scratch_val,
         (int*)scratch_idx, (int*)done_cnt, n);
   }
-  return (int)cudaGetLastError();
-}
-
-extern "C" int lmpost_greedy_verify(const void* target_argmax, const void* input_ids,
-                                    const void* logits_indices, void* num_sampled_out,
-                                    void* num_rejected_out, int m, void* stream) {
-  using namespace lmpost;
-  if (m < 2 || m > 8 || target_argmax == nullptr || input_ids == nullptr ||
-      num_sampled_out == nullptr || num_rejected_out == nullptr) {
-    return (int)cudaErrorInvalidValue;
-  }
-  greedy_verify_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(
-      (const int64_t*)target_argmax, (const int32_t*)input_ids,
-      (const int64_t*)logits_indices, (int32_t*)num_sampled_out,
-      (int32_t*)num_rejected_out, m);
   return (int)cudaGetLastError();
 }
