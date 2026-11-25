@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import io
+import os
 from collections.abc import Iterable
 
 import torch
@@ -502,6 +503,53 @@ class DFlashQwen3Model(nn.Module):
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
 
+    def _enable_bf16_rans_rows(self) -> None:
+        """Lossless rANS repack of the BF16 linears for M <= 8: qkv_proj, gate_up_proj
+        (K 6656), o_proj (K 4096), down_proj (K 19968) and the context fc (K 33280).
+
+        Runs after _build_fused_kv_buffers (which copies the K/V rows out of
+        qkv_proj.weight). The weights stay in place, byte-identical; the blob is a
+        non-persistent buffer read by muse_bf16_lane's rows kernel for calls with
+        1..8 rows, and M > 8 or any rejected layer keeps F.linear.
+        MUSE_DRAFTER_RANS=0 (read once, here) turns it all off; MUSE_DRAFTER_RANS_EXT=0
+        keeps only qkv_proj / gate_up_proj.
+        """
+        if os.environ.get("MUSE_DRAFTER_RANS", "1") == "0":
+            return
+        if get_tensor_model_parallel_world_size() != 1:
+            return
+        try:
+            from muse_bf16_lane import enable_rows
+        except ImportError:
+            return
+        # K 6656 (as in 08b): qkv_proj, gate_up_proj.
+        linears = [
+            m for layer in self.layers for m in (layer.self_attn.qkv_proj, layer.mlp.gate_up_proj)
+        ]
+        # Runtime-width extension, MUSE_DRAFTER_RANS_EXT=0 keeps only the K 6656 pair:
+        # o_proj (K 4096), down_proj (K 19968) and the context fc (K 33280), which
+        # combine_hidden_states runs eagerly on the verify step's target rows
+        # (M = 1 + depth <= 8; prefill M > 8 stays on F.linear inside the op).
+        extra = []
+        if os.environ.get("MUSE_DRAFTER_RANS_EXT", "1") != "0":
+            extra = [m for layer in self.layers for m in (layer.self_attn.o_proj, layer.mlp.down_proj)]
+            fc = getattr(self, "fc", None)
+            if self.use_aux_hidden_state and fc is not None:
+                extra.append(fc)
+        # A bias would send every call back to F.linear: do not spend a blob on it.
+        biased = [m for m in extra if getattr(m, "bias", None) is not None]
+        admitted, rejected = 0, len(biased)
+        for linear in linears + [m for m in extra if getattr(m, "bias", None) is None]:
+            if enable_rows(linear):
+                admitted += 1
+            else:
+                rejected += 1
+        logger.info(
+            "DFlash drafter BF16 rANS rows (M <= 8): %d linears admitted, %d kept on F.linear",
+            admitted,
+            rejected,
+        )
+
     def _project_context_kv(
         self,
         context_states: torch.Tensor,
@@ -814,6 +862,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
         loader.load_weights(model_weights.items())
         self.model._build_fused_kv_buffers()
+        # After _build_fused_kv_buffers: it copies K/V rows out of qkv_proj.weight.
+        self.model._enable_bf16_rans_rows()
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.

@@ -475,6 +475,470 @@ __global__ void __launch_bounds__(512, 1) bf16_rans_gemv_kernel(
 #undef BF_ISSUE
 }
 
+// ---------------------------------------------------------------- rANS BF16 multi-row GEMM (M = 1..8)
+// Same blob layout and the same per-lane decode loop as bf16_rans_gemv_kernel: the weight stream is decoded
+// once and every decoded weight feeds M fp32 accumulators, accum[m] = fma(x[m][k], w[k], accum[m]).
+// M activation rows (M * 6656 * 2 B, up to 104 KiB) do not fit beside the decode rings in shared memory, so
+// each lane reads x[m][k] with __ldg (L1/L2) at the k it is decoding: k = tile * 256 + step * 32 + lane.
+// tw / gmin / soff always come from the blob header (no fast_shape constants) and each warp walks virtual
+// warp streams w = gwarp, gwarp + G, ... (G = total warps), so any rows works (drafter qkv 6144 -> tw 768,
+// gate_up 39936 -> tw 4992). Plain stream-ordered launch: no PDL wait / trigger.
+// Unpack = true decodes the blob back to the BF16 matrix out[rows][6656] (exact round-trip check at load).
+constexpr int kRowsMaxM = 8;
+constexpr int kRowsWarps = 8;
+constexpr uint32_t kRowsRG = 4u;
+constexpr uint32_t kRowsRB = 512u * kRowsRG;
+
+__device__ __forceinline__ void rows_issue(uint32_t ring_s, const uint8_t* stream, uint64_t pol, int issued,
+                                           int tw, int w, int gmin, int toffw, uint32_t wbytes, int lane) {
+  const uint32_t boff = static_cast<uint32_t>(issued) * 512u + static_cast<uint32_t>(lane) * 16u;
+  if (boff < wbytes) {
+    const size_t gi = (issued < gmin) ? (static_cast<size_t>(issued) * tw + w)
+                                      : static_cast<size_t>(toffw + issued - gmin);
+    cp_async16_ef(ring_s + (boff & (kRowsRB - 1u)), stream + (gi << 9) + static_cast<uint32_t>(lane) * 16u, pol);
+  }
+  asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+template <int M, bool Unpack>
+__global__ void __launch_bounds__(kRowsWarps * 32, 2) bf16_rans_rows_kernel(
+    const uint16_t* __restrict__ x_in,  // k-major [kWidth][8] bf16, rows 0..M-1 zero padded (unused when Unpack)
+    const uint8_t* __restrict__ blob,
+    uint16_t* __restrict__ out,         // [M, rows] bf16; Unpack: [rows, kWidth] bf16
+    int rows,
+    size_t blob_bytes,
+    size_t tpf_stride) {
+  static_assert(M >= 1 && M <= kRowsMaxM, "rows kernel supports M = 1..8");
+  constexpr uint32_t RG = kRowsRG;
+  constexpr uint32_t RB = kRowsRB;
+  __shared__ __align__(16) uint32_t sh_lut[1024];
+  extern __shared__ __align__(16) unsigned char smem[];
+
+  const int tid = threadIdx.x, lane = tid & 31, wib = tid >> 5;
+  const uint32_t* meta = reinterpret_cast<const uint32_t*>(blob + 4096);
+  const int tw = static_cast<int>(__ldg(&meta[1]));
+  const int gmin = static_cast<int>(__ldg(&meta[2]));
+  const int soff = static_cast<int>(__ldg(&meta[3]));
+  const int* woff16 = reinterpret_cast<const int*>(blob + 4112);
+  const uint8_t* stream = blob + soff;
+  const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + static_cast<uint32_t>(wib) * RB;
+  const uint64_t pol = pol_ef();
+  const uint32_t lt = (1u << lane) - 1u;
+
+  const uint32_t lut_sa = static_cast<uint32_t>(__cvta_generic_to_shared(sh_lut));
+  for (int i = tid; i < 256; i += blockDim.x) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                 ::"r"(lut_sa + 16u * static_cast<uint32_t>(i)),
+                   "l"(reinterpret_cast<const uint4*>(blob) + i));
+  }
+  asm volatile("cp.async.commit_group;" ::: "memory");
+  // Same GMMU translation warm-up as the one-row kernel (MUSE_BF16_TLB_PREFETCH, block 0 only).
+  if (blockIdx.x == 0 && tpf_stride > 0 && blob_bytes > static_cast<size_t>(soff) + 64u) {
+    const size_t sbytes = blob_bytes - static_cast<size_t>(soff) - 64u;
+    for (size_t off = static_cast<size_t>(tid) * tpf_stride; off < sbytes;
+         off += static_cast<size_t>(blockDim.x) * tpf_stride) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(stream + off));
+    }
+  }
+  asm volatile("cp.async.wait_group 0;" ::: "memory");
+  __syncthreads();
+
+  const int nwarps = static_cast<int>(gridDim.x) * kRowsWarps;
+  for (int w = static_cast<int>(blockIdx.x) * kRowsWarps + wib; w < tw; w += nwarps) {
+    const uint32_t wbytes = static_cast<uint32_t>(__ldg(woff16 + w + 1) - __ldg(woff16 + w)) * 16u;
+    const int toffw = __ldg(woff16 + tw + 1 + w);
+    int issued = 0;
+#pragma unroll
+    for (int i = 0; i < static_cast<int>(RG) - 1; ++i) {
+      rows_issue(ring_s, stream, pol, issued, tw, w, gmin, toffw, wbytes, lane);
+      ++issued;
+    }
+    asm volatile("cp.async.wait_group %0;" ::"n"(RG - 2) : "memory");
+    __syncwarp();
+    uint32_t st[kNS];
+#pragma unroll
+    for (int s = 0; s < kNS; ++s) {
+      st[s] = lds32(ring_s + ((128u * s + 4u * lane) & (RB - 1u)));
+    }
+    uint32_t pwb = 128u * kNS;
+
+    for (int row = w; row < rows; row += tw) {
+      float accum[M];
+#pragma unroll
+      for (int m = 0; m < M; ++m) accum[m] = 0.0f;
+      for (int tile = 0; tile < kTiles; ++tile) {
+        __syncwarp();
+        const int curg = static_cast<int>(pwb >> 9);
+        while (issued <= curg + static_cast<int>(RG) - 1) {
+          rows_issue(ring_s, stream, pol, issued, tw, w, gmin, toffw, wbytes, lane);
+          ++issued;
+        }
+        asm volatile("cp.async.wait_group %0;" ::"n"(RG - 2) : "memory");
+        __syncwarp();
+        uint32_t lo0, lo1;
+        const uint32_t a0 = pwb + 8u * static_cast<uint32_t>(lane);
+        if ((pwb & 2u) == 0u) {
+          lo0 = lds32(ring_s + (a0 & (RB - 1u)));
+          lo1 = lds32(ring_s + ((a0 + 4u) & (RB - 1u)));
+        } else {
+          lo0 = lds16(ring_s + (a0 & (RB - 1u))) | (lds16(ring_s + ((a0 + 2u) & (RB - 1u))) << 16);
+          lo1 = lds16(ring_s + ((a0 + 4u) & (RB - 1u))) | (lds16(ring_s + ((a0 + 6u) & (RB - 1u))) << 16);
+        }
+        pwb += 256u;
+        const int kbase = tile * kValues + lane;
+#pragma unroll
+        for (int step = 0; step < kSteps; ++step) {
+          uint32_t& rx = st[step & 3];
+          const uint32_t e = sh_lut[rx & 1023u];
+          rx = ((e >> 8) & 2047u) * (rx >> 10) + (e >> 19);
+          const uint32_t exp_bits = (e & 255u) << 23;
+          const uint32_t sm_dup = __byte_perm(lo0, lo1, (step << 12) | (step << 8));
+          const bool need = rx < kRansL;
+          const uint32_t msk = __ballot_sync(0xffffffffu, need);
+          if (need) rx = (rx << 16) | lds16(ring_s + ((pwb + (__popc(msk & lt) << 1)) & (RB - 1u)));
+          pwb += __popc(msk) << 1;
+          const uint32_t wbits = (sm_dup & 0x807F0000u) | exp_bits;
+          const int k = kbase + step * kLanes;
+          if constexpr (Unpack) {
+            out[static_cast<size_t>(row) * kWidth + k] = static_cast<uint16_t>(wbits >> 16);
+          } else {
+            const float wv = __uint_as_float(wbits);
+            // x_in is k-major [kWidth][8] bf16 (rows 0..M-1, zero padded): one 16-byte load serves every row
+            const uint4 x8 = __ldg(reinterpret_cast<const uint4*>(x_in) + k);
+            const uint32_t xw8[4] = {x8.x, x8.y, x8.z, x8.w};
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+              const uint32_t xp = xw8[m >> 1];
+              const float xv = __uint_as_float((m & 1) ? (xp & 0xFFFF0000u) : (xp << 16));
+              accum[m] = __fmaf_rn(xv, wv, accum[m]);
+            }
+          }
+        }
+      }
+      if constexpr (!Unpack) {
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+          float a = accum[m];
+#pragma unroll
+          for (int dist = 16; dist > 0; dist >>= 1) {
+            a = __fadd_rn(a, __shfl_down_sync(0xffffffffu, a, dist));
+          }
+          if (lane == 0) {
+            asm volatile("cvt.rn.bf16.f32 %0, %1;" : "=h"(out[static_cast<size_t>(m) * rows + row]) : "f"(a));
+          }
+        }
+      }
+    }
+    // Drain this stream's ring before the next virtual warp stream reuses it.
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    __syncwarp();
+  }
+}
+
+static int bf16_rows_sm_count() {
+  static const int nsm = []() -> int {
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    int dev = 0, n = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || n <= 0) {
+      cudaGetLastError();
+      n = 48;
+    }
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    return n;
+  }();
+  return nsm;
+}
+
+template <int M, bool Unpack>
+static int launch_bf16_rans_rows(int rows, size_t blob_bytes, const void* input, const void* blob, void* output,
+                                 cudaStream_t stream) {
+  // tw = rows / 8 (the _pack_rans layout); the kernel reads the real tw from the blob and grid-strides.
+  const int tw = rows / 8;
+  int blocks = (tw + kRowsWarps - 1) / kRowsWarps;
+  const int cap = 2 * bf16_rows_sm_count();
+  if (blocks > cap) blocks = cap;
+  if (blocks < 1) blocks = 1;
+  const size_t dsmem = static_cast<size_t>(kRowsRB) * (1 + kRowsWarps);  // 18 KiB: alignment slack + rings
+  bf16_rans_rows_kernel<M, Unpack><<<blocks, kRowsWarps * 32, dsmem, stream>>>(
+      static_cast<const uint16_t*>(input), static_cast<const uint8_t*>(blob), static_cast<uint16_t*>(output),
+      rows, blob_bytes, bf16_tpf_stride());
+  return cudaGetLastError();
+}
+
+// ---------------------------------------------------------------- runtime-width variants (K % 256 == 0)
+// Copies of bf16_enc_pass1/pass2_kernel and bf16_rans_rows_kernel with kWidth / kTiles replaced by a runtime
+// width / (width / 256): DFlash drafter o_proj (K 4096), down_proj (K 19968), fc (K 33280). Same blob format;
+// the blob does not record width, the caller passes it. The K = 6656 kernels and entries are unchanged.
+__global__ void bf16_enc_pass1_w_kernel(const uint16_t* __restrict__ W, int rows, int tw, int width,
+                                        const uint32_t* __restrict__ enc_f, const uint32_t* __restrict__ enc_c,
+                                      uint32_t* __restrict__ warp_bytes16) {
+  __shared__ uint32_t sf[256], sc[256];
+  for (int i = threadIdx.x; i < 256; i += blockDim.x) { sf[i] = enc_f[i]; sc[i] = enc_c[i]; }
+  __syncthreads();
+  const int lane = threadIdx.x & 31;
+  const int w = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (w >= tw) return;
+  const int tiles = width / kValues;
+  uint32_t st[kNS];
+#pragma unroll
+  for (int s = 0; s < kNS; ++s) st[s] = kRansL;
+  int rlast = w;
+  while (rlast + tw < rows) rlast += tw;
+  uint32_t tot_u16 = 0;
+  for (int row = rlast; row >= w; row -= tw) {
+    const uint16_t* src = W + static_cast<size_t>(row) * width;
+    for (int tile = tiles - 1; tile >= 0; --tile) {
+      const uint16_t* tsrc = src + tile * kValues + lane;
+      uint32_t ws = 0;
+#pragma unroll
+      for (int step = kSteps - 1; step >= 0; --step) {
+        uint32_t& x = st[step & 3];
+        const uint32_t sy = (tsrc[step * kLanes] >> 7) & 255u;
+        const uint32_t fs = sf[sy], cs = sc[sy];
+        const bool emit = static_cast<uint64_t>(x) >= (static_cast<uint64_t>(fs) << 22);
+        ws += __popc(__ballot_sync(0xffffffffu, emit));
+        if (emit) x >>= 16;
+        x = ((x / fs) << 10) + (x % fs) + cs;
+      }
+      tot_u16 += 128u + ws;
+    }
+  }
+  if (lane == 0) warp_bytes16[w] = (128u * kNS + 2u * tot_u16 + 15u) / 16u;
+}
+
+__global__ void bf16_enc_pass2_w_kernel(const uint16_t* __restrict__ W, int rows, int tw, int width, int gmin,
+                                        const uint32_t* __restrict__ enc_f, const uint32_t* __restrict__ enc_c,
+                                      const int* __restrict__ woff16, uint8_t* __restrict__ stream) {
+  __shared__ uint32_t sf[256], sc[256];
+  for (int i = threadIdx.x; i < 256; i += blockDim.x) { sf[i] = enc_f[i]; sc[i] = enc_c[i]; }
+  __syncthreads();
+  const int lane = threadIdx.x & 31;
+  const int w = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (w >= tw) return;
+  const int tiles = width / kValues;
+  const uint32_t lt = (1u << lane) - 1u;
+  uint32_t st[kNS];
+#pragma unroll
+  for (int s = 0; s < kNS; ++s) st[s] = kRansL;
+  int rlast = w;
+  while (rlast + tw < rows) rlast += tw;
+  uint32_t tot_u16 = 0;
+  for (int row = rlast; row >= w; row -= tw) {
+    const uint16_t* src = W + static_cast<size_t>(row) * width;
+    for (int tile = tiles - 1; tile >= 0; --tile) {
+      const uint16_t* tsrc = src + tile * kValues + lane;
+      uint32_t ws = 0;
+#pragma unroll
+      for (int step = kSteps - 1; step >= 0; --step) {
+        uint32_t& x = st[step & 3];
+        const uint32_t sy = (tsrc[step * kLanes] >> 7) & 255u;
+        const uint32_t fs = sf[sy], cs = sc[sy];
+        const bool emit = static_cast<uint64_t>(x) >= (static_cast<uint64_t>(fs) << 22);
+        ws += __popc(__ballot_sync(0xffffffffu, emit));
+        if (emit) x >>= 16;
+        x = ((x / fs) << 10) + (x % fs) + cs;
+      }
+      tot_u16 += 128u + ws;
+    }
+  }
+  const uint32_t lbase = 128u * kNS;
+  uint32_t posw = tot_u16;
+#pragma unroll
+  for (int s = 0; s < kNS; ++s) st[s] = kRansL;
+  for (int row = rlast; row >= w; row -= tw) {
+    const uint16_t* src = W + static_cast<size_t>(row) * width;
+    for (int tile = tiles - 1; tile >= 0; --tile) {
+      const uint16_t* tsrc = src + tile * kValues + lane;
+      uint16_t lo_u16[4] = {0, 0, 0, 0};
+#pragma unroll
+      for (int step = kSteps - 1; step >= 0; --step) {
+        const uint16_t word = tsrc[step * kLanes];
+        const uint32_t sm = ((word >> 8) & 128u) | (word & 127u);
+        lo_u16[step >> 1] |= static_cast<uint16_t>(sm << (8 * (step & 1)));
+        uint32_t& x = st[step & 3];
+        const uint32_t sy = (word >> 7) & 255u;
+        const uint32_t fs = sf[sy], cs = sc[sy];
+        const bool emit = static_cast<uint64_t>(x) >= (static_cast<uint64_t>(fs) << 22);
+        const uint32_t msk = __ballot_sync(0xffffffffu, emit);
+        posw -= __popc(msk);
+        if (emit) {
+          *reinterpret_cast<uint16_t*>(stream + phys_off(woff16, tw, gmin, w, lbase + 2u * (posw + __popc(msk & lt)))) =
+              static_cast<uint16_t>(x & 0xFFFFu);
+          x >>= 16;
+        }
+        x = ((x / fs) << 10) + (x % fs) + cs;
+      }
+      posw -= 128u;
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        *reinterpret_cast<uint16_t*>(stream + phys_off(woff16, tw, gmin, w, lbase + 2u * (posw + 4u * lane + q))) = lo_u16[q];
+      }
+    }
+  }
+#pragma unroll
+  for (int s = 0; s < kNS; ++s) {
+    *reinterpret_cast<uint32_t*>(stream + phys_off(woff16, tw, gmin, w, 128u * s + 4u * lane)) = st[s];
+  }
+}
+
+template <int M, bool Unpack>
+__global__ void __launch_bounds__(kRowsWarps * 32, 2) bf16_rans_rows_w_kernel(
+    const uint16_t* __restrict__ x_in,  // k-major [width][8] bf16, rows 0..M-1 zero padded (unused when Unpack)
+    const uint8_t* __restrict__ blob,
+    uint16_t* __restrict__ out,         // [M, rows] bf16; Unpack: [rows, width] bf16
+    int rows,
+    int width,
+    size_t blob_bytes,
+    size_t tpf_stride) {
+  static_assert(M >= 1 && M <= kRowsMaxM, "rows kernel supports M = 1..8");
+  const int tiles = width / kValues;
+  constexpr uint32_t RG = kRowsRG;
+  constexpr uint32_t RB = kRowsRB;
+  __shared__ __align__(16) uint32_t sh_lut[1024];
+  extern __shared__ __align__(16) unsigned char smem[];
+
+  const int tid = threadIdx.x, lane = tid & 31, wib = tid >> 5;
+  const uint32_t* meta = reinterpret_cast<const uint32_t*>(blob + 4096);
+  const int tw = static_cast<int>(__ldg(&meta[1]));
+  const int gmin = static_cast<int>(__ldg(&meta[2]));
+  const int soff = static_cast<int>(__ldg(&meta[3]));
+  const int* woff16 = reinterpret_cast<const int*>(blob + 4112);
+  const uint8_t* stream = blob + soff;
+  const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + static_cast<uint32_t>(wib) * RB;
+  const uint64_t pol = pol_ef();
+  const uint32_t lt = (1u << lane) - 1u;
+
+  const uint32_t lut_sa = static_cast<uint32_t>(__cvta_generic_to_shared(sh_lut));
+  for (int i = tid; i < 256; i += blockDim.x) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                 ::"r"(lut_sa + 16u * static_cast<uint32_t>(i)),
+                   "l"(reinterpret_cast<const uint4*>(blob) + i));
+  }
+  asm volatile("cp.async.commit_group;" ::: "memory");
+  // Same GMMU translation warm-up as the one-row kernel (MUSE_BF16_TLB_PREFETCH, block 0 only).
+  if (blockIdx.x == 0 && tpf_stride > 0 && blob_bytes > static_cast<size_t>(soff) + 64u) {
+    const size_t sbytes = blob_bytes - static_cast<size_t>(soff) - 64u;
+    for (size_t off = static_cast<size_t>(tid) * tpf_stride; off < sbytes;
+         off += static_cast<size_t>(blockDim.x) * tpf_stride) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(stream + off));
+    }
+  }
+  asm volatile("cp.async.wait_group 0;" ::: "memory");
+  __syncthreads();
+
+  const int nwarps = static_cast<int>(gridDim.x) * kRowsWarps;
+  for (int w = static_cast<int>(blockIdx.x) * kRowsWarps + wib; w < tw; w += nwarps) {
+    const uint32_t wbytes = static_cast<uint32_t>(__ldg(woff16 + w + 1) - __ldg(woff16 + w)) * 16u;
+    const int toffw = __ldg(woff16 + tw + 1 + w);
+    int issued = 0;
+#pragma unroll
+    for (int i = 0; i < static_cast<int>(RG) - 1; ++i) {
+      rows_issue(ring_s, stream, pol, issued, tw, w, gmin, toffw, wbytes, lane);
+      ++issued;
+    }
+    asm volatile("cp.async.wait_group %0;" ::"n"(RG - 2) : "memory");
+    __syncwarp();
+    uint32_t st[kNS];
+#pragma unroll
+    for (int s = 0; s < kNS; ++s) {
+      st[s] = lds32(ring_s + ((128u * s + 4u * lane) & (RB - 1u)));
+    }
+    uint32_t pwb = 128u * kNS;
+
+    for (int row = w; row < rows; row += tw) {
+      float accum[M];
+#pragma unroll
+      for (int m = 0; m < M; ++m) accum[m] = 0.0f;
+      for (int tile = 0; tile < tiles; ++tile) {
+        __syncwarp();
+        const int curg = static_cast<int>(pwb >> 9);
+        while (issued <= curg + static_cast<int>(RG) - 1) {
+          rows_issue(ring_s, stream, pol, issued, tw, w, gmin, toffw, wbytes, lane);
+          ++issued;
+        }
+        asm volatile("cp.async.wait_group %0;" ::"n"(RG - 2) : "memory");
+        __syncwarp();
+        uint32_t lo0, lo1;
+        const uint32_t a0 = pwb + 8u * static_cast<uint32_t>(lane);
+        if ((pwb & 2u) == 0u) {
+          lo0 = lds32(ring_s + (a0 & (RB - 1u)));
+          lo1 = lds32(ring_s + ((a0 + 4u) & (RB - 1u)));
+        } else {
+          lo0 = lds16(ring_s + (a0 & (RB - 1u))) | (lds16(ring_s + ((a0 + 2u) & (RB - 1u))) << 16);
+          lo1 = lds16(ring_s + ((a0 + 4u) & (RB - 1u))) | (lds16(ring_s + ((a0 + 6u) & (RB - 1u))) << 16);
+        }
+        pwb += 256u;
+        const int kbase = tile * kValues + lane;
+#pragma unroll
+        for (int step = 0; step < kSteps; ++step) {
+          uint32_t& rx = st[step & 3];
+          const uint32_t e = sh_lut[rx & 1023u];
+          rx = ((e >> 8) & 2047u) * (rx >> 10) + (e >> 19);
+          const uint32_t exp_bits = (e & 255u) << 23;
+          const uint32_t sm_dup = __byte_perm(lo0, lo1, (step << 12) | (step << 8));
+          const bool need = rx < kRansL;
+          const uint32_t msk = __ballot_sync(0xffffffffu, need);
+          if (need) rx = (rx << 16) | lds16(ring_s + ((pwb + (__popc(msk & lt) << 1)) & (RB - 1u)));
+          pwb += __popc(msk) << 1;
+          const uint32_t wbits = (sm_dup & 0x807F0000u) | exp_bits;
+          const int k = kbase + step * kLanes;
+          if constexpr (Unpack) {
+            out[static_cast<size_t>(row) * width + k] = static_cast<uint16_t>(wbits >> 16);
+          } else {
+            const float wv = __uint_as_float(wbits);
+            // x_in is k-major [width][8] bf16 (rows 0..M-1, zero padded): one 16-byte load serves every row
+            const uint4 x8 = __ldg(reinterpret_cast<const uint4*>(x_in) + k);
+            const uint32_t xw8[4] = {x8.x, x8.y, x8.z, x8.w};
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+              const uint32_t xp = xw8[m >> 1];
+              const float xv = __uint_as_float((m & 1) ? (xp & 0xFFFF0000u) : (xp << 16));
+              accum[m] = __fmaf_rn(xv, wv, accum[m]);
+            }
+          }
+        }
+      }
+      if constexpr (!Unpack) {
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+          float a = accum[m];
+#pragma unroll
+          for (int dist = 16; dist > 0; dist >>= 1) {
+            a = __fadd_rn(a, __shfl_down_sync(0xffffffffu, a, dist));
+          }
+          if (lane == 0) {
+            asm volatile("cvt.rn.bf16.f32 %0, %1;" : "=h"(out[static_cast<size_t>(m) * rows + row]) : "f"(a));
+          }
+        }
+      }
+    }
+    // Drain this stream's ring before the next virtual warp stream reuses it.
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    __syncwarp();
+  }
+}
+
+template <int M, bool Unpack>
+static int launch_bf16_rans_rows_w(int rows, int width, size_t blob_bytes, const void* input, const void* blob,
+                                   void* output, cudaStream_t stream) {
+  // Grid as in launch_bf16_rans_rows (8 warps/block, <= 2 blocks/SM). The kernel reads tw from the blob and
+  // grid-strides, so the packer's tw only affects balance (py: tw = min(rows / 8, 16 * #SM) -> 768 on GB10).
+  const int tw = rows / 8;
+  int blocks = (tw + kRowsWarps - 1) / kRowsWarps;
+  const int cap = 2 * bf16_rows_sm_count();
+  if (blocks > cap) blocks = cap;
+  if (blocks < 1) blocks = 1;
+  const size_t dsmem = static_cast<size_t>(kRowsRB) * (1 + kRowsWarps);
+  bf16_rans_rows_w_kernel<M, Unpack><<<blocks, kRowsWarps * 32, dsmem, stream>>>(
+      static_cast<const uint16_t*>(input), static_cast<const uint8_t*>(blob), static_cast<uint16_t*>(output),
+      rows, width, blob_bytes, bf16_tpf_stride());
+  return cudaGetLastError();
+}
+
 bool valid_rows(int rows) {
   return rows > 0 && rows <= 4608 && rows % 4 == 0;
 }
@@ -654,4 +1118,79 @@ extern "C" int muse_bf16_rans_gemv(int rows, size_t blob_bytes, const void* inpu
   bf16_rans_gemv_kernel<<<blocks, wpb * 32, dsmem, stream>>>(
       x_arg, b_arg, o_arg, rows, blob_bytes, tpf_arg, pdl_mode);
   return cudaGetLastError();
+}
+
+// M = 1..8 activation rows against one rANS blob (any rows >= 8, K = 6656): out[m * rows + n], bf16.
+// Not PDL: plain launch on `stream`; no host sync (CUDA-graph capturable).
+extern "C" int muse_bf16_rans_rows(int rows, size_t blob_bytes, const void* input, const void* blob,
+                                   void* output, int m, cudaStream_t stream) {
+  if (rows < 8 || blob_bytes <= 4112u || input == nullptr || blob == nullptr || output == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  switch (m) {
+    case 1: return launch_bf16_rans_rows<1, false>(rows, blob_bytes, input, blob, output, stream);
+    case 2: return launch_bf16_rans_rows<2, false>(rows, blob_bytes, input, blob, output, stream);
+    case 3: return launch_bf16_rans_rows<3, false>(rows, blob_bytes, input, blob, output, stream);
+    case 4: return launch_bf16_rans_rows<4, false>(rows, blob_bytes, input, blob, output, stream);
+    case 5: return launch_bf16_rans_rows<5, false>(rows, blob_bytes, input, blob, output, stream);
+    case 6: return launch_bf16_rans_rows<6, false>(rows, blob_bytes, input, blob, output, stream);
+    case 7: return launch_bf16_rans_rows<7, false>(rows, blob_bytes, input, blob, output, stream);
+    case 8: return launch_bf16_rans_rows<8, false>(rows, blob_bytes, input, blob, output, stream);
+    default: return cudaErrorInvalidValue;
+  }
+}
+
+// Decodes a rANS blob back to the BF16 matrix output[rows][6656] with the rows kernel's decode loop
+// (load-time exact round-trip check).
+extern "C" int muse_bf16_rans_unpack(int rows, size_t blob_bytes, const void* blob, void* output,
+                                     cudaStream_t stream) {
+  if (rows < 8 || blob_bytes <= 4112u || blob == nullptr || output == nullptr) return cudaErrorInvalidValue;
+  return launch_bf16_rans_rows<1, true>(rows, blob_bytes, nullptr, blob, output, stream);
+}
+
+// ---------------------------------------------------------------- runtime-width entries (K % 256 == 0)
+static bool valid_width(int width) { return width >= kValues && width % kValues == 0; }
+
+extern "C" int muse_bf16_rans_pass1_w(const uint16_t* W, int rows, int tw, int width,
+                                      const uint32_t* f, const uint32_t* c, uint32_t* wb, cudaStream_t stream) {
+  if (!valid_width(width) || rows <= 0 || tw <= 0) return cudaErrorInvalidValue;
+  bf16_enc_pass1_w_kernel<<<(tw + 3) / 4, 128, 0, stream>>>(W, rows, tw, width, f, c, wb);
+  return cudaGetLastError();
+}
+
+extern "C" int muse_bf16_rans_pass2_w(const uint16_t* W, int rows, int tw, int width, int gmin,
+                                      const uint32_t* f, const uint32_t* c, const int* woff, uint8_t* s,
+                                      cudaStream_t stream) {
+  if (!valid_width(width) || rows <= 0 || tw <= 0) return cudaErrorInvalidValue;
+  bf16_enc_pass2_w_kernel<<<(tw + 3) / 4, 128, 0, stream>>>(W, rows, tw, width, gmin, f, c, woff, s);
+  return cudaGetLastError();
+}
+
+// M = 1..8 rows, x k-major [width][8] bf16 (rows >= M zero padded), out [M, rows] bf16. Plain launch, no PDL.
+extern "C" int muse_bf16_rans_rows_w(int rows, int width, size_t blob_bytes, const void* input, const void* blob,
+                                     void* output, int m, cudaStream_t stream) {
+  if (rows < 8 || !valid_width(width) || blob_bytes <= 4112u || input == nullptr || blob == nullptr ||
+      output == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  switch (m) {
+    case 1: return launch_bf16_rans_rows_w<1, false>(rows, width, blob_bytes, input, blob, output, stream);
+    case 2: return launch_bf16_rans_rows_w<2, false>(rows, width, blob_bytes, input, blob, output, stream);
+    case 3: return launch_bf16_rans_rows_w<3, false>(rows, width, blob_bytes, input, blob, output, stream);
+    case 4: return launch_bf16_rans_rows_w<4, false>(rows, width, blob_bytes, input, blob, output, stream);
+    case 5: return launch_bf16_rans_rows_w<5, false>(rows, width, blob_bytes, input, blob, output, stream);
+    case 6: return launch_bf16_rans_rows_w<6, false>(rows, width, blob_bytes, input, blob, output, stream);
+    case 7: return launch_bf16_rans_rows_w<7, false>(rows, width, blob_bytes, input, blob, output, stream);
+    case 8: return launch_bf16_rans_rows_w<8, false>(rows, width, blob_bytes, input, blob, output, stream);
+    default: return cudaErrorInvalidValue;
+  }
+}
+
+// Exact round-trip decode of a runtime-width blob into output[rows][width].
+extern "C" int muse_bf16_rans_unpack_w(int rows, int width, size_t blob_bytes, const void* blob, void* output,
+                                       cudaStream_t stream) {
+  if (rows < 8 || !valid_width(width) || blob_bytes <= 4112u || blob == nullptr || output == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  return launch_bf16_rans_rows_w<1, true>(rows, width, blob_bytes, nullptr, blob, output, stream);
 }
