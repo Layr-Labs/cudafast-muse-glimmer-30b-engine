@@ -214,6 +214,17 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        for name in ("_bmma_bits", "_bmma_meta"):
+            if hasattr(layer, name):
+                delattr(layer, name)
+        if (current_platform.is_cuda() and not envs.VLLM_BATCH_INVARIANT
+                and layer.weight.dtype == torch.bfloat16 and layer.weight.shape == (39936, 6656)
+                and getattr(layer, "bias", None) is None):
+            try:
+                from muse_bmma import prepare
+                prepare(layer)
+            except (ImportError, OSError, RuntimeError) as exc:
+                logger.warning("BF16 tile preparation unavailable; keeping dense: %s", exc)
         if current_platform.is_cpu():
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
@@ -227,6 +238,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        if bias is None and hasattr(layer, "_bmma_meta"):
+            return torch.ops.vllm.muse_bmma_gate(x, layer.weight, layer._bmma_bits, layer._bmma_meta)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
 
