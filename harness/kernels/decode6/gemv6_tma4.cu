@@ -712,7 +712,12 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
         nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
   }
   if (n == 6656 && k == 19968) {
-    return launch_tma4_impl<128, 256, false, true, false, false, false, false, 4, false, 1, false, true, false, true, true>(
+    return launch_tma4_impl<128, 256, false, true, false, false, false, false, 3, false, 1, false, true, false, true, true>(
+        input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
+        nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
+  }
+  if (n == 39936 && k == 6656) {
+    return launch_tma4_impl<128, 256, false, true, false, false, false, false, 3, false, 0, false, true, false, true, true>(
         input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
         nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
   }
