@@ -53,6 +53,10 @@ _sk_tma4_ilv_swiglu = getattr(_lib, "muse_marlin6_sk_tma4_ilv_swiglu", None)
 if _sk_tma4_ilv_swiglu is not None:
     _sk_tma4_ilv_swiglu.argtypes = _gemv6.argtypes
     _sk_tma4_ilv_swiglu.restype = ctypes.c_int
+_sk_tma4_ilv_swiglu_m = getattr(_lib, "muse_marlin6_sk_tma4_ilv_swiglu_m", None)
+if _sk_tma4_ilv_swiglu_m is not None:
+    _sk_tma4_ilv_swiglu_m.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 5 + [ctypes.c_void_p]
+    _sk_tma4_ilv_swiglu_m.restype = ctypes.c_int
 _sk_tma4_ilv_swiglu_fp8 = getattr(_lib, "muse_marlin6_sk_tma4_ilv_swiglu_fp8", None)
 if _sk_tma4_ilv_swiglu_fp8 is not None:
     _sk_tma4_ilv_swiglu_fp8.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
@@ -816,7 +820,12 @@ def decode_linear6(
         STATS["logged"] = True
         logger.info("NVFP4 decode GEMV with 6-bit block scales: %d layers, %d kept uncompressed",
                     STATS["admitted"], STATS["kept"])
-    if _consume_down_swiglu is not None and not fixed_grid and (n, k) == (DOWN_N, DOWN_K) and x.numel() == k:
+    if (
+        _consume_down_swiglu is not None
+        and not fixed_grid
+        and (n, k) == (DOWN_N, DOWN_K)
+        and (x.numel() == k or (x.ndim == 2 and 1 <= x.shape[0] <= 8 and x.shape[1] == k))
+    ):
         x_sw = _consume_down_swiglu(x, global_scale.data_ptr())
         if x_sw is not None:
             x = x_sw
@@ -883,6 +892,30 @@ def decode_linear6(
             return out_buf
         if x.ndim == 2 and 1 < x.shape[0] <= 8 and is_tma4_ilv(scales6) and _sk_tma4_ilv_m is not None:
             m = int(x.shape[0])
+            sw_entry_m = (
+                _SWIGLU_GATE_UP.get(global_scale.data_ptr())
+                if (
+                    (n, k) == (GATE_UP_N, GATE_UP_K)
+                    and _sk_tma4_ilv_swiglu_m is not None
+                    and _notify_gate_up_swiglu is not None
+                )
+                else None
+            )
+            if (
+                sw_entry_m is not None
+                and sw_entry_m["state"] == "admitted"
+                and sw_entry_m.get("swiglu_out_m") is not None
+            ):
+                out_buf_m = sw_entry_m["swiglu_out_m"][:m]
+                status = _sk_tma4_ilv_swiglu_m(
+                    x.data_ptr(), tiled_weight.data_ptr(), out_buf_m.data_ptr(), partials.data_ptr(),
+                    scales6.data_ptr(), palette.data_ptr(), global_scale.data_ptr(), workspace.data_ptr(),
+                    m, n, k, 48, x.device.index, torch.cuda.current_stream().cuda_stream,
+                )
+                if status:
+                    raise RuntimeError(f"SM121 Marlin multi-M gate_up SwiGLU launch failed with CUDA error {status}")
+                _notify_gate_up_swiglu(out_buf_m.data_ptr(), sw_entry_m, True, None)
+                return out_buf_m
             output = x.new_empty((m, eff_n))
             status = _sk_tma4_ilv_m(
                 x.data_ptr(), tiled_weight.data_ptr(), output.data_ptr(), partials.data_ptr(),
@@ -1337,8 +1370,39 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
             }
             count_fp8 += 1
         else:
+            swiglu_out_m = None
+            if is_ilv and _sk_tma4_ilv_swiglu_m is not None and _sk_tma4_ilv_m is not None and os.environ.get("MUSE_GATE_UP_SWIGLU_M", "1") != "0":
+                try:
+                    import muse_norm_glue as G
+                    gen_m = torch.Generator(device=dev).manual_seed(20261127 + count_bf16)
+                    xm = (torch.randn((7, GATE_UP_K), generator=gen_m, device=dev) * 0.6).to(torch.bfloat16).contiguous()
+                    out_raw = torch.empty((7, GATE_UP_N), dtype=torch.bfloat16, device=dev)
+                    sw_buf_m = torch.empty((8, GATE_UP_N), dtype=torch.bfloat16, device=dev)
+                    ref_sw_m = torch.empty((7, DOWN_K), dtype=torch.bfloat16, device=dev)
+                    with torch.cuda.device(dev):
+                        st_m = torch.cuda.current_stream().cuda_stream
+                        rc_r = _sk_tma4_ilv_m(
+                            xm.data_ptr(), w.data_ptr(), out_raw.data_ptr(), partials.data_ptr(),
+                            s6_new.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
+                            gu.workspace.data_ptr(), 7, GATE_UP_N, GATE_UP_K, 48, dev.index, st_m,
+                        )
+                        unpaired = out_raw.view(7, 624, 64).index_select(1, _GATE_UP_TILE_ORDER[dev]).reshape(7, GATE_UP_N).contiguous()
+                        G.mul_silu_slice_bf16(unpaired, ref_sw_m, 7, st_m)
+                        rc_f = _sk_tma4_ilv_swiglu_m(
+                            xm.data_ptr(), w.data_ptr(), sw_buf_m.data_ptr(), partials.data_ptr(),
+                            s6_new.data_ptr(), pal.data_ptr(), gu.weight_global_scale.data_ptr(),
+                            gu.workspace.data_ptr(), 7, GATE_UP_N, GATE_UP_K, 48, dev.index, st_m,
+                        )
+                    torch.cuda.synchronize(dev)
+                    got_sw_m = sw_buf_m.view(-1)[: 7 * DOWN_K].view(7, DOWN_K)
+                    if rc_r == 0 and rc_f == 0 and int(torch.count_nonzero(gu.workspace).item()) == 0 and torch.equal(got_sw_m.view(torch.int16), ref_sw_m.view(torch.int16)):
+                        swiglu_out_m = sw_buf_m
+                    del xm, out_raw, unpaired, ref_sw_m
+                except Exception:
+                    swiglu_out_m = None
             _SWIGLU_GATE_UP[gs_key] = {
                 "swiglu_out": swiglu_out,
+                "swiglu_out_m": swiglu_out_m,
                 "down_gs_ptr": dn.weight_global_scale.data_ptr(),
                 "is_fp8": False,
                 "is_ilv": is_ilv,

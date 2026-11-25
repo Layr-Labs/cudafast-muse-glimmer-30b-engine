@@ -236,6 +236,18 @@
       "why": "Enable the 512-token whole-forward prefill CUDA graph (including zero-prep replay) when DFlash auxiliary hidden states are enabled, skip the DFlash drafter on max_tokens == 1 batches in the V2 GPU model runner (matching V1's _drafts_can_be_verified), and skip redundant eager Python attention-metadata and slot-mapping construction on FULL CUDA graph replays for both the target verify step and DFlash draft step."
     },
     {
+      "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
+      "why": "bs=1 speculative-decode host cuts: one-request draft steps read query_start_loc, cu_num_logits, expanded_idx_mapping and expanded_local_pos from read-only tensors built once in load_model (same contents) instead of a pin + H2D copy and an expand kernel per step, and the per-step draft-token gather handed to DraftTokensHandler is skipped when no structured-output request needs its contents (only its shape is read); in RejectionSampler._verify_in_chunks the identity shift cu_num_logits - 0 is replaced by read-only slices when the chunk starts at logit 0."
+    },
+    {
+      "file": "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py; vllm/model_executor/models/qwen3_dflash.py",
+      "why": "Lossless DFlash context-prep trim from jungjipdo 5be7aa15: drop the out-of-graph copy of combined aux hidden states into a staging buffer in DFlashSpeculator.propose, and cache the dtype-cast RoPE cos_sin_cache in precompute_and_store_context_kv."
+    },
+    {
+      "file": "vllm/config/vllm.py",
+      "why": "Allow DFlash to use vLLM's existing V2 async scheduler, matching the already-supported EAGLE and DSpark speculative paths. This queues the next fixed single-request verify batch before the prior round's host output bookkeeping, while the V2 runner applies rejection corrections and draft-token updates on device."
+    },
+    {
       "file": "vllm/model_executor/layers/muse_bfx.py, vllm/model_executor/layers/linear.py, vllm/model_executor/models/qwen3_dflash.py",
       "why": "Lossless 12-bit coded BF16 weights (sign+mantissa byte plus a 4-bit per-row exponent window, out-of-window values in an exact per-row escape list) for the DFlash drafter's linears, fc and fused context-KV projection at <= 8 rows (harness/kernels/musebfx); every weight is checked bit for bit at load; > 8 rows use the dense weight."
     },
@@ -250,6 +262,10 @@
     {
       "file": "vllm/model_executor/layers/muse_bfx.py, vllm/model_executor/models/qwen3_dflash.py, vllm/model_executor/models/muse_glimmer.py, vllm/model_executor/kernels/linear/nvfp4/decode_placement.py, vllm/v1/attention/backends/flash_attn.py",
       "why": "Lossless 12-bit exponent-pair BF16 rANS + inline escape (~10.6 bits/weight, 100% bit-exact verified at load) with K32 2x mma.sync.m16n8k16 Tensor-Core GEMM, 48-CTA persistent cp.async (L2::evict_first), 2 MiB TLB prefetch, dual-sided SM121 PDL, and GB10 UMA DRAM placement across all 12 target BF16 attention projections at verify width M=2..8 (strict 0-ULP bitwise admitted vs F.linear, with 32-SM gate overlap on output_gate_proj); zero-bank-conflict M=2..8 activation layout in muserans; and strict 0-ULP 512-token prefill kernels (gqa16_prefill_v3, fp8ws PDL + 9-warp ST=3, muse_fp8_swiglu WS9 ST=3)."
+    },
+    {
+      "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
+      "why": "bs=1 speculative-decode host cuts (from i34-9, Yukon submissions 9ba5da7f-8db5-430c-a3f5-d3da1a13d186 / 1cf35c6e-2e8d-4cc8-a354-d2132af5831d): one-request draft steps read query_start_loc, cu_num_logits, expanded_idx_mapping and expanded_local_pos from read-only tensors built once in load_model (same contents) instead of a pin + H2D copy and an expand kernel per step; the per-step draft-token gather handed to DraftTokensHandler is skipped when no structured-output request needs its contents (only its shape is read); the rejection sampler skips the identity cu_num_logits shift when the chunk starts at 0."
     }
   ],
   "carried_from": {
