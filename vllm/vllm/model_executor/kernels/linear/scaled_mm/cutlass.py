@@ -209,6 +209,9 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         # admitted per layer by a bitwise check against cutlass_scaled_mm; None keeps the small-row FP8 op.
         w_name, w_s_name, i_s_name, _ = self.layer_param_names
         self.muse_packed = muse_fp8.prepare(layer, w_name, w_s_name, i_s_name)
+        self.muse_verify_mlp = muse_fp8.admit_verify_mlp(
+            self.muse_packed, getattr(layer, w_name, None), getattr(layer, w_s_name, None), getattr(layer, i_s_name, None)
+        )
         # Muse Glimmer: prompt-sized (M > 16) GEMMs of this layer through muse_fp8_prefill when bitwise equal to
         # cutlass_scaled_mm on this weight (glimmer_fp8.admit_prefill); otherwise the stock op as before.
         admit_prefill(getattr(layer, w_name, None), getattr(layer, w_s_name, None), getattr(layer, i_s_name, None))
@@ -277,7 +280,7 @@ class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         packed = getattr(self, "muse_packed", None)
         if packed is not None and pad_k == 0 and pad_n == 0 and bias is None and out_dtype == torch.bfloat16:
             # M == 1 -> musefp8; any other M -> fp8_scaled_mm below, inside the op.
-            out = torch.ops.vllm.muse_fp8_scaled_mm(A, B, packed, As, Bs)
+            out = torch.ops.vllm.muse_fp8_scaled_mm(A, B, packed, As, Bs, self.muse_verify_mlp)
             return out.view(*output_shape[:-1], output_size)
         if bias is None and out_dtype == torch.bfloat16:
             output = fp8_scaled_mm(A, B, As, Bs)

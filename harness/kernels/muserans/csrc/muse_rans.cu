@@ -279,7 +279,7 @@ struct RansProb {
   const uint8_t* hdr; const uint8_t* stream; const int* woff16; const uint32_t* lut;
   const uint8_t* x; const uint16_t* x_aux; int act_mode;
   const float* sb; int sb_scalar; const float* sa;
-  __nv_bfloat16* out; int N; int K; int tw; int ilv; int strided_w; int lut_first; int pdl_mode; size_t stream_bytes; size_t tpf_stride;
+  __nv_bfloat16* out; int N; int K; int tw; int ilv; int strided_w; int lut_first; int pdl_mode; int rows; size_t stream_bytes; size_t tpf_stride;
 };
 
 static int g_rans_pdl_override = -1;
@@ -311,7 +311,7 @@ static size_t rans_tpf_stride() {
   return stride;
 }
 
-template <int NS, int GBS, int RG>
+template <int NS, int GBS, int RG, bool Multi = false>
 __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   constexpr uint32_t GB = 1u << GBS;
   constexpr uint32_t RB = GB * (uint32_t)RG;
@@ -320,7 +320,7 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
   const int tid = threadIdx.x, lane = tid & 31, wib = tid >> 5, wpb = blockDim.x >> 5;
   const int K = pb.K, S = K >> 5;
   uint2* xs = (uint2*)smem;
-  const int xbytes = (K + 15) & ~15;
+  const int xbytes = Multi ? 0 : ((K + 15) & ~15);
   const uint32_t sbase0 = (uint32_t)__cvta_generic_to_shared(smem) + (uint32_t)xbytes;
   const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + (uint32_t)wib * RB;
   const int w = pb.strided_w ? (wib * gridDim.x + blockIdx.x) : (blockIdx.x * wpb + wib);
@@ -404,7 +404,10 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
     // before reading pb.x / pb.x_aux in any act_mode (0, 1, or 2).
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
-  if (pb.act_mode == 0) {
+  if constexpr (Multi) {
+    // Read contiguous FP8 rows through the read-only cache in the MMA loop. Reserving M*K bytes of shared
+    // memory would force extra waves or exceed SM121 capacity for a down projection. No fused producer here.
+  } else if (pb.act_mode == 0) {
     for (int i = tid; i < S * 4; i += blockDim.x) {
       int s = i >> 2, tt = i & 3;
       xs[i] = make_uint2(*(const uint32_t*)(pb.x + 32 * s + 4 * tt), *(const uint32_t*)(pb.x + 32 * s + 16 + 4 * tt));
@@ -527,16 +530,25 @@ __global__ void __launch_bounds__(1024, 1) rans_gemv_kernel(RansProb pb) {
       const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
       const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
       const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
-      uint2 a = xs[s * 4 + t];
-      a.x = (g == 0) ? a.x : 0u; a.y = (g == 0) ? a.y : 0u;
+      uint2 a;
+      if constexpr (Multi) {
+        a = make_uint2(0, 0);
+        if (g < pb.rows) {
+          const uint8_t *xp = pb.x + (size_t)g * K + s * 32 + t * 4;
+          a = make_uint2(__ldg((const uint32_t*)xp), __ldg((const uint32_t*)(xp + 16)));
+        }
+      } else {
+        a = xs[s * 4 + t];
+        a.x = (g == 0) ? a.x : 0u; a.y = (g == 0) ? a.y : 0u;
+      }
       rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
     }
-    if (lane < 4) {
+    if (Multi ? (g < pb.rows) : (lane < 4)) {
       const float sa_v = __ldg(pb.sa);
       int n = nb * 8 + 2 * t;
       float s0 = pb.sb_scalar ? pb.sb[0] : pb.sb[n], s1 = pb.sb_scalar ? pb.sb[0] : pb.sb[n + 1];
       __nv_bfloat162 r; r.x = __float2bfloat16_rn(sa_v * (s0 * c0)); r.y = __float2bfloat16_rn(sa_v * (s1 * c1));
-      *(__nv_bfloat162*)(pb.out + n) = r;
+      *(__nv_bfloat162*)(pb.out + (Multi ? (size_t)g * pb.N : 0) + n) = r;
     }
   }
   rans_cp_wait<0>();
@@ -705,20 +717,22 @@ static void rans_set_attrs_once() {
 #define RANS_PREP(NSV, RGV) cudaFuncSetAttribute(rans_gemv_kernel<NSV, 9, RGV>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
   RANS_PREP(1, 4) RANS_PREP(1, 8) RANS_PREP(2, 4) RANS_PREP(2, 8) RANS_PREP(4, 4) RANS_PREP(4, 8)
 #undef RANS_PREP
+  cudaFuncSetAttribute(rans_gemv_kernel<2, 9, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(RANS_MAX_SMEM - RANS_LUT_BYTES));
   cudaThreadExchangeStreamCaptureMode(&mode);
   done = true;
 }
 
-static void rans_check_io(const torch::Tensor& blob, const torch::Tensor& x, const torch::Tensor& sb, const torch::Tensor& sa, const torch::Tensor& out, int64_t N, int64_t K) {
+static void rans_check_io(const torch::Tensor& blob, const torch::Tensor& x, const torch::Tensor& sb, const torch::Tensor& sa, const torch::Tensor& out, int64_t N, int64_t K, int64_t rows = 1) {
   TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "blob must be a contiguous uint8 cuda tensor");
   TORCH_CHECK(N > 0 && K > 0 && N % 8 == 0 && K % 64 == 0, "need N%8==0 and K%64==0");
-  TORCH_CHECK(x.is_cuda() && x.element_size() == 1 && x.numel() == K && x.is_contiguous(), "x must be a contiguous 1-byte (FP8 e4m3) cuda tensor with K elements");
+  TORCH_CHECK(x.is_cuda() && x.element_size() == 1 && x.numel() == rows * K && x.is_contiguous(), "x must be contiguous FP8 with rows*K elements");
   TORCH_CHECK(sb.is_cuda() && sb.scalar_type() == torch::kFloat && sb.is_contiguous() && (sb.numel() == N || sb.numel() == 1), "sb must be a contiguous float32 cuda tensor with N (per-channel) or 1 (scalar) elements");
   TORCH_CHECK(sa.is_cuda() && sa.scalar_type() == torch::kFloat && sa.numel() == 1, "sa must be a float32 cuda tensor with 1 element");
-  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == N, "out must be a contiguous bfloat16 cuda tensor with N elements");
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == rows * N, "out must be contiguous BF16 with rows*N elements");
 }
 
-template <int NSV, int RGV>
+template <int NSV, int RGV, bool Multi = false>
 static inline void rans_launch_k(int blocks, int threads, size_t dsmem, cudaStream_t st, RansProb pb) {
   if ((pb.pdl_mode & 1) != 0) {
     cudaLaunchConfig_t cfg = {};
@@ -731,19 +745,20 @@ static inline void rans_launch_k(int blocks, int threads, size_t dsmem, cudaStre
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
-    cudaError_t err = cudaLaunchKernelEx(&cfg, rans_gemv_kernel<NSV, 9, RGV>, pb);
+    cudaError_t err = cudaLaunchKernelEx(&cfg, rans_gemv_kernel<NSV, 9, RGV, Multi>, pb);
     TORCH_CHECK(err == cudaSuccess, "rans_gemv_kernel PDL launch failed: ", cudaGetErrorString(err));
   } else {
-    rans_gemv_kernel<NSV, 9, RGV><<<blocks, threads, dsmem, st>>>(pb);
+    rans_gemv_kernel<NSV, 9, RGV, Multi><<<blocks, threads, dsmem, st>>>(pb);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
 
-static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, int wpb, int rg, int ilv, const uint8_t* x, const uint16_t* x_aux, int act_mode, const float* sb, int sb_scalar, const float* sa, __nv_bfloat16* out, int N, int K, cudaStream_t st) {
+template <bool Multi = false>
+static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, int wpb, int rg, int ilv, const uint8_t* x, const uint16_t* x_aux, int act_mode, const float* sb, int sb_scalar, const float* sa, __nv_bfloat16* out, int N, int K, cudaStream_t st, int rows = 1) {
   const size_t soff = rans_stream_off(tw);
   RansProb pb;
   pb.hdr = blob; pb.stream = blob + soff; pb.woff16 = (const int*)(blob + rans_woff_off()); pb.lut = (const uint32_t*)(blob + RANS_HDR_BYTES);
-  pb.x = x; pb.x_aux = x_aux; pb.act_mode = act_mode;
+  pb.x = x; pb.x_aux = x_aux; pb.act_mode = act_mode; pb.rows = rows;
   pb.sb = sb; pb.sb_scalar = sb_scalar; pb.sa = sa; pb.out = out; pb.N = N; pb.K = K; pb.tw = tw; pb.ilv = ilv;
   pb.stream_bytes = (blob_bytes > soff + 64u) ? (blob_bytes - soff - 64u) : 0u;
   pb.tpf_stride = rans_tpf_stride();
@@ -774,7 +789,7 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
     pdl_mode = 3;
   }
   pb.pdl_mode = pdl_mode;
-  size_t dsmem = rans_dsmem(K, wpb, 9, rg);
+  size_t dsmem = rans_dsmem(Multi ? 0 : K, wpb, 9, rg);
   TORCH_CHECK(rans_fits(K, wpb, 9, rg), "rans smem too large (K too large for smem staging of x): ", dsmem);
   static const bool lock48 = []() {
     const char* env = std::getenv("MUSERANS_SMEM_LOCK48");
@@ -782,6 +797,12 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   }();
   if (lock48 && blocks == 48 && dsmem < 40960) dsmem = 40960;
   rans_set_attrs_once();
+  if constexpr (Multi) {
+    TORCH_CHECK(rg == 4 && (ns == 2 || ns == 4), "multi needs default encoder layout");
+    if (ns == 4) rans_launch_k<4, 4, true>(blocks, wpb * 32, dsmem, st, pb);
+    else         rans_launch_k<2, 4, true>(blocks, wpb * 32, dsmem, st, pb);
+    return;
+  }
 #define RANS_L2(NSV, RGV) \
   if (ns == NSV && rg == RGV) rans_launch_k<NSV, RGV>(blocks, wpb * 32, dsmem, st, pb);
   RANS_L2(1, 4) RANS_L2(1, 8) RANS_L2(2, 4) RANS_L2(2, 8) RANS_L2(4, 4) RANS_L2(4, 8)
@@ -799,6 +820,18 @@ void rans_gemv_auto(torch::Tensor blob, torch::Tensor x, torch::Tensor sb, torch
   RansCfg c = rans_pick_cfg((int)N, (int)K);
   rans_launch((const uint8_t*)blob.data_ptr(), (size_t)blob.numel(), c.tw, c.ns, c.wpb, c.rg, c.ilv, (const uint8_t*)x.data_ptr(), nullptr, 0, (const float*)sb.data_ptr(), sb.numel() == 1, (const float*)sa.data_ptr(), (__nv_bfloat16*)out.data_ptr(),
               (int)N, (int)K, c10::cuda::getCurrentCUDAStream());
+}
+
+// As for rans_gemv_auto, blob must come from rans_pack on this projection. No header readback in capture.
+void rans_multi_auto(torch::Tensor blob, torch::Tensor x, torch::Tensor sb, torch::Tensor sa, torch::Tensor out, int64_t N, int64_t K) {
+  TORCH_CHECK(x.dim() == 2 && x.size(0) >= 2 && x.size(0) <= 8 && x.size(1) == K, "multi requires [2..8, K]");
+  TORCH_CHECK(x.scalar_type() == at::kFloat8_e4m3fn && out.dim() == 2 && out.size(0) == x.size(0) && out.size(1) == N, "multi FP8 -> BF16 shape mismatch");
+  TORCH_CHECK(blob.device() == x.device() && sb.device() == x.device() && sa.device() == x.device() && out.device() == x.device(), "multi device mismatch");
+  TORCH_CHECK((reinterpret_cast<uintptr_t>(x.data_ptr()) & 3u) == 0 && (reinterpret_cast<uintptr_t>(out.data_ptr()) & 3u) == 0, "multi needs aligned FP8 input and BF16 output");
+  rans_check_io(blob, x, sb, sa, out, N, K, x.size(0));
+  const RansCfg c = rans_pick_cfg((int)N, (int)K);
+  rans_launch<true>((const uint8_t*)blob.data_ptr(), (size_t)blob.numel(), c.tw, c.ns, c.wpb, c.rg, c.ilv, (const uint8_t*)x.data_ptr(), nullptr, 0, (const float*)sb.data_ptr(), sb.numel() == 1, (const float*)sa.data_ptr(), (__nv_bfloat16*)out.data_ptr(),
+                    (int)N, (int)K, c10::cuda::getCurrentCUDAStream(), (int)x.size(0));
 }
 
 void rans_gemv_fused_auto(torch::Tensor blob, torch::Tensor x0, torch::Tensor x1, torch::Tensor sb, torch::Tensor sa, torch::Tensor out, int64_t N, int64_t K, int64_t act_mode) {
@@ -847,6 +880,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_unpack", &rans_unpack);
   m.def("rans_blob_info", &rans_blob_info);
   m.def("rans_gemv_auto", &rans_gemv_auto);
+  m.def("rans_multi_auto", &rans_multi_auto);
   m.def("rans_gemv_fused_auto", &rans_gemv_fused_auto);
   m.def("rans_gemv_cfg", &rans_gemv_cfg);
   m.def("rans_cfg_info", &rans_cfg_info);

@@ -234,6 +234,10 @@
     {
       "file": "vllm/v1/worker/gpu/prefill_graph.py, vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/dflash/speculator.py",
       "why": "Enable the 512-token whole-forward prefill CUDA graph (including zero-prep replay) when DFlash auxiliary hidden states are enabled, skip the DFlash drafter on max_tokens == 1 batches in the V2 GPU model runner (matching V1's _drafts_can_be_verified), and skip redundant eager Python attention-metadata and slot-mapping construction on FULL CUDA graph replays for both the target verify step and DFlash draft step."
+    },
+    {
+      "file": "harness/kernels/{muserans/csrc/muse_rans.cu,decode6/muse_marlin6_gemv.py}; vllm/model_executor/kernels/linear/scaled_mm/{muse_fp8,cutlass}.py",
+      "why": "Share the unchanged lossless FP8 MLP weight stream across all admitted verification rows, with per-layer exact BF16 admission and stock fallbacks. Restore paired NVFP4 gate/up columns by one exact gather of 64-column tiles. Keep the complete promoted DFlash runner including auxiliary-tap prefill graph and graph replay metadata, with no additional last-row reduction."
     }
   ],
   "carried_from": {

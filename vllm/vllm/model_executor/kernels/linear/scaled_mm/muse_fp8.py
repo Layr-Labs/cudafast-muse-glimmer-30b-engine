@@ -5,7 +5,8 @@ For one token, `musefp8.gemv` issues the same chain of mma.sync m16n8k32 e4m3 in
 SM120 M16 cutlass kernel behind `ops.cutlass_scaled_mm`, and the same ScaledEpilogue arithmetic
 (bf16_rn(scale_a * fp32(scale_b * acc))), so its output is bitwise identical; it reads a fragment-ordered copy of the
 weight, made once at load, which streams faster. Every layer is admitted only after a load-time bitwise comparison with
-`ops.cutlass_scaled_mm` on its own weight. Anything else (M > 1, a missing or disabled extension, unusual shapes or
+`ops.cutlass_scaled_mm` on its own weight. For 2..8 rows the two large FP8 MLP projections can use the same compressed stream in a multi-row MMA; this is
+admitted separately on every layer before weight placement. Anything else (a missing or disabled extension, unusual shapes or
 scales) goes to the tree's small-row FP8 op (`glimmer_fp8.fp8_scaled_mm`: the G2 CUTLASS tile, else stock cutlass)
 unchanged. The M test lives inside an opaque custom op, so torch.compile never bakes a branch on M into the graph.
 """
@@ -36,7 +37,7 @@ try:
 except Exception:  # noqa: BLE001
     _rans = None
 
-_stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False}
+_stats = {"verify_mlp": 0, "admitted": 0, "rejected": 0, "rans": 0, "logged": False}
 _decode_gemm_operand = None
 _consume_rans_prologue = None
 
@@ -115,11 +116,40 @@ def _self_check(run, w_kn: torch.Tensor, sb: torch.Tensor, sa: torch.Tensor) -> 
     return True
 
 
+def admit_verify_mlp(packed, w, sb, sa) -> bool:
+    """Attach this decision to the owning layer, not a data_ptr (placement may move the same weights)."""
+    if (packed is None or _rans is None or not hasattr(_rans, "rans_multi_auto")
+            or os.environ.get("MUSERANS_VERIFY_MLP", "1") == "0" or w is None or w.ndim != 2):
+        return False
+    k, n = w.shape
+    if ((n, k) not in ((39936, 6656), (6656, 19968)) or packed.numel() == n * k
+            or not _scales_ok(sa, sb, n) or sb.numel() != 1):
+        return False
+    try:
+        gen = torch.Generator(device=w.device).manual_seed(719 + n + k)
+        with torch.cuda.device(w.device):
+            for m in range(2, 9):
+                x = torch.randn((m, k), generator=gen, device=w.device)
+                x[:, 1::2] = -x[:, ::2]
+                a = (x * (0.5 if m % 2 else 31.0)).clamp(-448, 448).to(torch.float8_e4m3fn)
+                ref = _cutlass(a, w, sa, sb)
+                got = torch.empty_like(ref)
+                _rans.rans_multi_auto(packed, a, sb, sa, got, n, k)
+                if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+                    return False
+    except (ValueError, RuntimeError) as e:
+        logger.warning("muserans: multi-row MLP admission skipped: %s", e)
+        return False
+    _stats["verify_mlp"] += 1
+    return True
+
+
 def _muse_fp8_scaled_mm(
-    A: torch.Tensor, B: torch.Tensor, packed: torch.Tensor, As: torch.Tensor, Bs: torch.Tensor
+    A: torch.Tensor, B: torch.Tensor, packed: torch.Tensor, As: torch.Tensor, Bs: torch.Tensor, verify_mlp: bool = False
 ) -> torch.Tensor:
     if not _stats["logged"]:
         _stats["logged"] = True
+        logger.info("muserans: %d multi-row FP8 MLP projections admitted", _stats["verify_mlp"])
         tpf_kb = _rans.rans_tpf_kb() if (_rans is not None and hasattr(_rans, "rans_tpf_kb")) else 0
         tpf_note = f", translation prefetch every {tpf_kb} KiB" if tpf_kb > 0 else ", translation prefetch off"
         gate_blks = 32 if os.environ.get("MUSERANS_GATE_32_BLOCKS", "1") != "0" else 47
@@ -147,11 +177,18 @@ def _muse_fp8_scaled_mm(
         else:
             _rans.rans_gemv_auto(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
         return out
+    if (verify_mlp and 2 <= A.shape[0] <= 8 and A.is_contiguous() and A.data_ptr() % 4 == 0
+            and A.dtype == torch.float8_e4m3fn and B.dtype == A.dtype and A.device == B.device == packed.device
+            and _scales_ok(As, Bs, n) and Bs.numel() == 1 and As.device == Bs.device == A.device):
+        out = A.new_empty((A.shape[0], n), dtype=torch.bfloat16)
+        with torch.cuda.device(A.device):
+            _rans.rans_multi_auto(packed, A, Bs, As, out, n, k)
+        return out
     return _small_row_fp8(A, B, As, Bs)
 
 
 def _muse_fp8_scaled_mm_fake(
-    A: torch.Tensor, B: torch.Tensor, packed: torch.Tensor, As: torch.Tensor, Bs: torch.Tensor
+    A: torch.Tensor, B: torch.Tensor, packed: torch.Tensor, As: torch.Tensor, Bs: torch.Tensor, verify_mlp: bool = False
 ) -> torch.Tensor:
     return torch.empty((A.shape[0], B.shape[1]), dtype=torch.bfloat16, device=A.device)
 
