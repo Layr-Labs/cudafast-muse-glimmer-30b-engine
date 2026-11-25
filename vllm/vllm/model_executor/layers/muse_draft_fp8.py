@@ -164,6 +164,105 @@ def attach_linear(layer: torch.nn.Module) -> bool:
     return True
 
 
+_I4_GROUP = 32
+
+
+def _fit_i4_groups(v: torch.Tensor):
+    # v: FP32 [out, groups, 32]. Two starts and two alternating least
+    # squares updates. Use the actual BF16 scale when choosing the codes.
+    bound = torch.maximum(v.amax(-1) / 7, -v.amin(-1) / 8).clamp_min_(1e-12)
+    best_err = torch.full_like(bound, float("inf"))
+    best_s = bound
+    for init in (1.0, 0.84):
+        sc = bound * init
+        for _ in range(2):
+            q = torch.round(v / sc.unsqueeze(-1)).clamp_(-8, 7)
+            sc = ((v * q).sum(-1) / q.square().sum(-1).clamp_min_(1)).clamp_min_(1e-12)
+        sc = sc.to(torch.bfloat16).float()
+        q = torch.round(v / sc.unsqueeze(-1)).clamp_(-8, 7)
+        err = (v - q * sc.unsqueeze(-1)).square_().sum(-1)
+        best_s = torch.where(err < best_err, sc, best_s)
+        best_err = torch.minimum(err, best_err)
+    return torch.round(v / best_s.unsqueeze(-1)).clamp_(-8, 7), best_s
+
+
+def _i4_gemm(x, qweight, scales, ws, n, k):
+    import vllm._custom_ops as ops
+    from vllm.scalar_type import scalar_types
+
+    return ops.marlin_gemm(a=x, c=None, b_q_weight=qweight, b_bias=None, b_scales=scales,
+                           a_scales=None, global_scale=None, b_zeros=None, g_idx=None, perm=None,
+                           workspace=ws, b_q_type=scalar_types.uint4b8,
+                           size_m=x.shape[0], size_n=n, size_k=k,
+                           use_atomic_add=False, use_fp32_reduce=True)
+
+
+@torch.no_grad()
+def _try_mlp_i4(layer) -> bool:
+    import vllm._custom_ops as ops
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_make_workspace_new, marlin_permute_scales,
+    )
+
+    w = layer.weight.detach()
+    if (not w.is_cuda or w.dtype != torch.bfloat16 or getattr(layer, "bias", None) is not None
+            or w.shape not in ((39936, 6656), (6656, 19968))):
+        return False
+    n, k = w.shape
+    g = _I4_GROUP
+    packed = torch.empty((k // 8, n), dtype=torch.int32, device=w.device)
+    scales = torch.empty((k // g, n), dtype=w.dtype, device=w.device)
+    gen = torch.Generator(device=w.device).manual_seed(107 * n + k)
+    x = torch.randn((16, k), dtype=w.dtype, device=w.device, generator=gen)
+    ref = torch.empty((16, n), dtype=w.dtype, device=w.device)
+    shift = torch.arange(8, dtype=torch.int32, device=w.device) * 4
+    for i in range(0, n, 256):
+        wf = w[i:i+256].reshape(-1, k // g, g).float()
+        q, sc = _fit_i4_groups(wf)
+        cols = sc.shape[0]
+        decoded = (q * sc.unsqueeze(-1)).reshape(cols, k).to(w.dtype)
+        ref[:, i:i+cols] = F.linear(x, decoded)
+        codes = (q.reshape(cols, -1, 8).to(torch.int32) + 8) << shift
+        packed[:, i:i+cols] = codes.sum(-1, dtype=torch.int32).T
+        scales[:, i:i+cols] = sc.T
+    perm = torch.empty(0, dtype=torch.int, device=w.device)
+    qw = ops.gptq_marlin_repack(b_q_weight=packed, perm=perm, size_k=k, size_n=n, num_bits=4)
+    del packed
+    sc = marlin_permute_scales(scales, k, n, g)
+    ws = marlin_make_workspace_new(w.device)
+    for m in (1, 7, 16):
+        got = _i4_gemm(x[:m], qw, sc, ws, n, k).float()
+        refm = ref[:m].float()
+        if not ((got - refm).abs().max() <= 0.02 * refm.abs().max() + 0.001).item():
+            return False
+        dense = F.linear(x[:m], w).float()
+        if not (F.cosine_similarity(got.flatten(), dense.flatten(), dim=0).item() >= 0.99):
+            return False
+    layer.register_buffer("_mi4_qw", qw, persistent=False)
+    layer.register_buffer("_mi4_scales", sc, persistent=False)
+    layer.register_buffer("_mi4_ws", ws, persistent=False)
+    layer._mi4 = True
+    logger.info("DFlash MLP i4/g32 admitted %dx%d: %d packed + scale bytes", n, k, qw.nbytes + sc.nbytes)
+    return True
+
+
+@torch.library.custom_op("muse::draft_i4_mlp", mutates_args=())
+def draft_i4_mlp(x: torch.Tensor, w: torch.Tensor, qw: torch.Tensor, sc: torch.Tensor,
+                 ws: torch.Tensor) -> torch.Tensor:
+    n, k = w.shape
+    x2 = x.reshape(-1, k)
+    if 1 <= x2.size(0) <= MAX_M and x2.dtype == torch.bfloat16:
+        z = _i4_gemm(x2.contiguous(), qw, sc, ws, n, k)
+    else:
+        z = F.linear(x2, w)
+    return z.reshape(*x.shape[:-1], n)
+
+
+@draft_i4_mlp.register_fake
+def _(x, w, qw, sc, ws):
+    return x.new_empty((*x.shape[:-1], w.shape[0]))
+
+
 @torch.library.custom_op("muse::draft_fp8_linear", mutates_args=())
 def draft_fp8_linear(
     x: torch.Tensor, w: torch.Tensor, qweight: torch.Tensor, scales: torch.Tensor, ws: torch.Tensor
@@ -192,6 +291,14 @@ def attach_drafter(model: torch.nn.Module) -> int:
         return 0
     n = 0
     for name, mod in model.named_modules():
+        if (name.split(".")[-1] in ("gate_up_proj", "down_proj")
+                and os.environ.get("MUSE_DRAFT_MLP_I4", "1") != "0"):
+            try:
+                if _try_mlp_i4(mod):
+                    n += 1
+                    continue
+            except (RuntimeError, ImportError, AttributeError, ValueError) as err:
+                logger.warning("DFlash MLP i4 not admitted on %s: %s", name, err)
         if name.split(".")[-1] in _NAMES:
             n += attach_linear(mod)
     logger.info(

@@ -225,6 +225,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if bias is None and getattr(layer, "_mi4", False):
+            return torch.ops.muse.draft_i4_mlp(x, layer.weight, layer._mi4_qw, layer._mi4_scales, layer._mi4_ws)
         if bias is None and getattr(layer, "_mfp8", None) is not None:
             from vllm.model_executor.layers import muse_draft_fp8
 

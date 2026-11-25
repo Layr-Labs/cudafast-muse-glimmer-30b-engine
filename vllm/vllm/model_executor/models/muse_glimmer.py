@@ -1491,12 +1491,45 @@ def _init_qk_fused() -> bool:
 _BF16_DUAL_WS_ADMITTED: set[int] = set()
 
 
+def _prepare_verify7(layer) -> None:
+    # Keep the parent's serial/prefill storage. Admit a second *lossless*
+    # layout only for 7-row BF16 QKV/gate in stacked attention blocks.
+    w = layer.weight.detach()
+    n, k = w.shape
+    layer.verify7_base = -1
+    layer.register_buffer("verify7_blob", None, persistent=False)
+    try:
+        import muse_bfx_ext as ext
+
+        blob = ext.rans_pack(w)
+        if (blob.nbytes >= w.nbytes or not torch.equal(
+            ext.rans_unpack(blob, n, k).view(torch.int16), w.view(torch.int16)
+        )):
+            return
+        base = int(ext.rans_base(blob))
+        gen = torch.Generator(device=w.device).manual_seed(n * 193 + k + 17)
+        for scale in (0.05, 0.5, 2.0, 12.0):
+            x = (torch.randn((7, k), device=w.device, generator=gen) * scale).to(w.dtype)
+            ref = torch.nn.functional.linear(x, w)
+            res = ext.rans_gemm(x, blob, n, k, base)
+            if not torch.equal(ref.view(torch.int16), res.view(torch.int16)):
+                return
+        layer.verify7_blob = blob
+        layer.verify7_base = base
+        logger.info("BF16 verify7: admitted %s %dx%d (%d packed bytes)",
+                    layer.prefix, n, k, blob.numel())
+    except (ImportError, RuntimeError, AttributeError, ValueError) as err:
+        logger.warning("BF16 verify7: retaining dense %s: %s", layer.prefix, err)
+
+
 def _muse_bf16_qkv_or_stacked_impl(
     x: torch.Tensor,
     w_cat: torch.Tensor,
     w_qkv: torch.Tensor,
     packed_qkv: torch.Tensor,
     idx_qkv: torch.Tensor,
+    verify_blob: torch.Tensor | None,
+    verify_base: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.ndim == 2 and x.shape == (512, 6656) and x.is_contiguous():
         if w_cat.data_ptr() in _BF16_DUAL_WS_ADMITTED:
@@ -1506,7 +1539,13 @@ def _muse_bf16_qkv_or_stacked_impl(
                 return dual
         out = torch.mm(x, w_cat.t())
         return out[:, :4608].contiguous(), out[:, 4608:].contiguous()
-    qkv = torch.ops.vllm.muse_bf16_lane_linear.default(x, w_qkv, packed_qkv, idx_qkv)
+    if (verify_blob is not None and verify_base >= 0 and x.shape == (7, 6656)
+            and x.dtype == torch.bfloat16 and x.is_contiguous() and x.device == verify_blob.device):
+        import muse_bfx_ext as ext
+
+        qkv = ext.rans_gemm(x, verify_blob, 4608, 6656, verify_base)
+    else:
+        qkv = torch.ops.vllm.muse_bf16_lane_linear.default(x, w_qkv, packed_qkv, idx_qkv)
     return qkv, x.new_empty((x.shape[0], 4096))
 
 
@@ -1516,6 +1555,8 @@ def _muse_bf16_qkv_or_stacked_fake(
     w_qkv: torch.Tensor,
     packed_qkv: torch.Tensor,
     idx_qkv: torch.Tensor,
+    verify_blob: torch.Tensor | None,
+    verify_base: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return x.new_empty((x.shape[0], 4608)), x.new_empty((x.shape[0], 4096))
 
@@ -1526,8 +1567,17 @@ def _muse_bf16_gate_fill_impl(
     w_gate: torch.Tensor,
     packed_gate: torch.Tensor,
     idx_gate: torch.Tensor,
+    verify_blob: torch.Tensor | None,
+    verify_base: int,
 ) -> None:
     if x.ndim == 2 and x.shape == (512, 6656) and x.is_contiguous():
+        return
+    if (verify_blob is not None and verify_base >= 0 and x.shape == (7, 6656)
+            and x.dtype == torch.bfloat16 and x.is_contiguous() and x.device == verify_blob.device
+            and gate.is_contiguous()):
+        import muse_bfx_ext as ext
+
+        ext.rans_gemm_out(x, verify_blob, gate, 4096, 6656, verify_base)
         return
     if (
         x.shape == (1, 6656)
@@ -1564,6 +1614,8 @@ def _muse_bf16_gate_fill_fake(
     w_gate: torch.Tensor,
     packed_gate: torch.Tensor,
     idx_gate: torch.Tensor,
+    verify_blob: torch.Tensor | None,
+    verify_base: int,
 ) -> None:
     return
 
@@ -1778,6 +1830,8 @@ class MuseGlimmerAttention(nn.Module):
                 self.qkv_proj.weight,
                 self.qkv_proj.muse_bf16_lane_weight,
                 self.qkv_proj.muse_bf16_lane_index,
+                self.qkv_proj.verify7_blob,
+                self.qkv_proj.verify7_base,
             )
             dep = torch.ops.vllm.muse_glimmer_gate_fork(hidden_states, self.layer_idx)
             torch.ops.vllm.muse_bf16_gate_fill(
@@ -1786,6 +1840,8 @@ class MuseGlimmerAttention(nn.Module):
                 self.output_gate_proj.weight,
                 self.output_gate_proj.muse_bf16_lane_weight,
                 self.output_gate_proj.muse_bf16_lane_index,
+                self.output_gate_proj.verify7_blob,
+                self.output_gate_proj.verify7_base,
             )
             gate_dep = torch.ops.vllm.muse_glimmer_gate_switch(gate, dep, [qkv])
         else:
@@ -2480,6 +2536,8 @@ class MuseGlimmerForCausalLM(
                         qkv.weight.data = w_cat[:4608]
                         gate.weight.data = w_cat[4608:]
                         attn.register_buffer("_bf16_qkv_gate_w", w_cat, persistent=False)
+                        _prepare_verify7(qkv)
+                        _prepare_verify7(gate)
                         attn._bf16_dual_prefill = True
                         bf16_stack_cnt += 1
                         try:

@@ -246,6 +246,14 @@
     {
       "file": "vllm/model_executor/layers/muse_draft_fp8.py, vllm/model_executor/layers/linear.py, vllm/model_executor/models/qwen3_dflash.py, vllm/model_executor/layers/muse_bfx.py; harness/kernels/decode6/muse_marlin6_gemv.py",
       "why": "Drafter-only: FP8 e4m3 per-row weight-only copies of the pinned DFlash drafter's bias-free linears, run through stock Marlin W8A16 at 1..16 rows (BF16 weight kept for larger M); load-time checked, any failure keeps the previous path; target untouched. Multi-row paired gate_up output un-paired by one exact 64-column tile gather (newjordan 833fb6c4)."
+    },
+    {
+      "file": "vllm/model_executor/models/muse_glimmer.py; harness/kernels/musebfx",
+      "why": "Seven-row target verification in the six stacked BF16 attention blocks uses a smaller, losslessly packed layout for QKV/gate. Roundtrip and four bitwise BF16 GEMM probes per weight at load; optional graph buffer and direct gate write, dense fallback. Other widths and pinned drafter dispatch unchanged."
+    },
+    {
+      "file": "vllm/model_executor/layers/muse_draft_fp8.py, vllm/model_executor/layers/linear.py, vllm/model_executor/layers/muse_bfx.py",
+      "why": "Small-row proposal MLP only: fit signed INT4 codes and BF16 scales per 32 input channels using per-group least squares and the pinned Marlin operator. Probe vs dequantized and original weights before admission; fall back to parent FP8 on failure. BF16 input, FP32 reduction; large rows retain dense BF16. No target weight or activation is quantized by this path."
     }
   ],
   "carried_from": {
