@@ -36,6 +36,7 @@ try:
 except Exception:  # noqa: BLE001
     _rans = None
 
+_RANS_M = _rans is not None and hasattr(_rans, "rans_gemm_m_auto") and os.environ.get("MUSERANS_M", "1") != "0"
 _stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False}
 _decode_gemm_operand = None
 _consume_rans_prologue = None
@@ -146,6 +147,19 @@ def _muse_fp8_scaled_mm(
             _mf.gemv(packed, A, Bs, As, out, n, k)
         else:
             _rans.rans_gemv_auto(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
+        return out
+    if (
+        1 < A.shape[0] <= 8
+        and _RANS_M
+        and packed.numel() > 0
+        and packed.numel() != n * k
+        and A.is_contiguous()
+        and A.dtype == torch.float8_e4m3fn
+        and _scales_ok(As, Bs, n)
+    ):
+        # verify-width rows: the same rANS stream and the same per-row MMA chain as the M == 1 GEMV
+        out = torch.empty((A.shape[0], n), dtype=torch.bfloat16, device=A.device)
+        _rans.rans_gemm_m_auto(packed, A, Bs.reshape(-1), As.reshape(-1), out, n, k)
         return out
     return _small_row_fp8(A, B, As, Bs)
 

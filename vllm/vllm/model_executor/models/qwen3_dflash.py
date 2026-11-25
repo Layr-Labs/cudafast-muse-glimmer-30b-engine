@@ -518,9 +518,13 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
-        all_kv_flat = F.linear(
-            normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-        )
+        if self._fused_kv_bias is None:
+            from vllm.model_executor.layers import muse_bfx
+            all_kv_flat = muse_bfx.tensor_apply(self, "fkv", normed_context_states, self._fused_kv_weight)
+        else:
+            all_kv_flat = F.linear(
+                normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+            )
         # Single contiguous copy that separates K/V and transposes to
         # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
@@ -814,6 +818,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
         loader.load_weights(model_weights.items())
         self.model._build_fused_kv_buffers()
+        import os
+        if os.environ.get("MUSE_BFX", "1") != "0":
+            from vllm.model_executor.layers import muse_bfx
+            n = muse_bfx.attach_drafter(self.model)
+            kv = muse_bfx.attach_tensor(self.model, "fkv", self.model._fused_kv_weight) if self.model._fused_kv_bias is None else False
+            logger.info("muse_bfx: coded %d drafter linears, fused kv %s", n, kv)
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.
