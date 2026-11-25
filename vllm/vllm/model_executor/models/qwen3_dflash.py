@@ -747,6 +747,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        draft_vocab_token_ids = getattr(self, "draft_vocab_token_ids", None)
+        if draft_vocab_token_ids is not None and getattr(
+            self, "draft_vocab_fake_mask", False
+        ):
+            masked = torch.full_like(logits, -float("inf"))
+            selected = logits.index_select(-1, draft_vocab_token_ids)
+            masked.index_copy_(-1, draft_vocab_token_ids, selected)
+            logits = masked
         if self.draft_id_to_target_id is None:
             return logits
 
@@ -758,6 +766,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
         logits_new[:, targets] = logits
         return logits_new
+
+    def map_draft_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        draft_vocab_token_ids = getattr(self, "draft_vocab_token_ids", None)
+        if draft_vocab_token_ids is None or getattr(
+            self, "draft_vocab_fake_mask", False
+        ):
+            return tokens
+        return draft_vocab_token_ids[tokens]
 
     def precompute_and_store_context_kv(
         self,

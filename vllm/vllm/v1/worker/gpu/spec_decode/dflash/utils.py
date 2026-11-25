@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
@@ -72,6 +74,15 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     ):
         if draft_lm_head is not None:
             del dflash_model.lm_head
-        dflash_model.lm_head = target_lm_head
+        reduced_head = getattr(target_lm_head, "_draft_vocab_head", None)
+        use_fake_mask = os.environ.get("MUSE_DRAFT_VOCAB_FAKE", "0") == "1"
+        if reduced_head is not None:
+            dflash_model.register_buffer(
+                "draft_vocab_token_ids", reduced_head.token_ids, persistent=False
+            )
+            dflash_model.draft_vocab_fake_mask = use_fake_mask
+        dflash_model.lm_head = (
+            target_lm_head if reduced_head is None or use_fake_mask else reduced_head
+        )
 
     return dflash_model

@@ -266,6 +266,10 @@
     {
       "file": "vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/rejection_sampler.py",
       "why": "bs=1 speculative-decode host cuts (from i34-9, Yukon submissions 9ba5da7f-8db5-430c-a3f5-d3da1a13d186 / 1cf35c6e-2e8d-4cc8-a354-d2132af5831d): one-request draft steps read query_start_loc, cu_num_logits, expanded_idx_mapping and expanded_local_pos from read-only tensors built once in load_model (same contents) instead of a pin + H2D copy and an expand kernel per step; the per-step draft-token gather handed to DraftTokensHandler is skipped when no structured-output request needs its contents (only its shape is read); the rejection sampler skips the identity cu_num_logits shift when the chunk starts at 0."
+    },
+    {
+      "file": "harness/vllm_resident/backends.py; vllm/vllm/model_executor/draft_vocab.py, vllm/vllm/model_executor/layers/quantization/modelopt.py, vllm/vllm/model_executor/models/qwen3_dflash.py, vllm/vllm/v1/worker/gpu/spec_decode/{dflash/utils.py,speculator.py}",
+      "why": "Drafter-only reduced-vocabulary greedy head: deterministically rank tokens from a bounded public multilingual code/prose corpus at boot, gather a separate contiguous copy of selected NVFP4 lm_head rows and scales before target-head packing, dispatch only DFlash logits through the copy, and map subset argmax indices back to target token IDs. The target lm_head and exact verifier remain untouched; 8k/16k/32k/64k sizes and a full-head disable are available through MUSE_DRAFT_VOCAB_SIZE."
     }
   ],
   "carried_from": {

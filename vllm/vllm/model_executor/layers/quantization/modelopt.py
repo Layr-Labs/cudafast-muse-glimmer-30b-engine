@@ -1393,6 +1393,60 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         )
         del layer.weight_scale_2
 
+        # The target lm_head is still in logical [vocab, hidden/2] row order
+        # here.  Preserve the target layer exactly, while making a separate,
+        # contiguous row-subset copy for greedy DFlash logits.  Attaching via
+        # object.__setattr__ intentionally keeps this private head out of the
+        # target model's named_modules traversal; DFlash registers it only
+        # after its own weight loading/finalization has completed.
+        from vllm.model_executor.draft_vocab import get_draft_vocab_token_ids
+
+        draft_ids = get_draft_vocab_token_ids()
+        if (
+            draft_ids is not None
+            and layer.output_size_per_partition >= 200000
+            and max(draft_ids) < layer.output_size_per_partition
+        ):
+            ids = torch.tensor(
+                draft_ids, dtype=torch.long, device=layer.weight.device
+            )
+            draft_head = torch.nn.Module()
+            draft_head.params_dtype = layer.params_dtype
+            draft_head.input_size_per_partition = layer.input_size_per_partition
+            draft_head.output_size_per_partition = len(draft_ids)
+            draft_head.output_partition_sizes = [len(draft_ids)]
+            draft_head.logical_widths = [len(draft_ids)]
+            draft_head.has_bias = False
+            draft_head.register_parameter("bias", None)
+            draft_head.register_parameter(
+                "weight",
+                Parameter(
+                    layer.weight.index_select(0, ids).contiguous(),
+                    requires_grad=False,
+                ),
+            )
+            draft_head.register_parameter(
+                "weight_scale",
+                Parameter(
+                    layer.weight_scale.index_select(0, ids).contiguous(),
+                    requires_grad=False,
+                ),
+            )
+            draft_head.register_parameter(
+                "weight_global_scale",
+                Parameter(layer.weight_global_scale.clone(), requires_grad=False),
+            )
+            draft_head.register_buffer("token_ids", ids, persistent=False)
+            draft_head.quant_method = self
+            draft_head.tp_size = 1
+            draft_head.org_vocab_size = len(draft_ids)
+            self.kernel.process_weights_after_loading(draft_head)
+            object.__setattr__(layer, "_draft_vocab_head", draft_head)
+            logger.info(
+                "Prepared contiguous %d-row NVFP4 head for greedy DFlash",
+                len(draft_ids),
+            )
+
         self.kernel.process_weights_after_loading(layer)
 
     def apply(

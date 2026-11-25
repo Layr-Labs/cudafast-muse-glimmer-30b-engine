@@ -292,7 +292,9 @@ class DraftModelSpeculator(BaseSpeculator):
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
         logits = self.model.compute_logits(hidden_states)
-        return logits.argmax(dim=-1)
+        tokens = logits.argmax(dim=-1)
+        map_tokens = getattr(self.model, "map_draft_tokens", None)
+        return map_tokens(tokens) if map_tokens is not None else tokens
 
     def sample_draft(
         self,
