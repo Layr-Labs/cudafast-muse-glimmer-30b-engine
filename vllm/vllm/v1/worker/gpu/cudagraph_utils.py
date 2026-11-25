@@ -256,7 +256,7 @@ class CudaGraphManager:
             not in ("0", "", "false", "no")
         ):
             try:
-                _tm = int(_os.environ.get("MUSE_NATIVE_TREE_M", "12").strip() or "0")
+                _tm = int(_os.environ.get("MUSE_NATIVE_TREE_M", "16").strip() or "0")
             except ValueError:
                 _tm = 0
             if _tm in (12, 16):

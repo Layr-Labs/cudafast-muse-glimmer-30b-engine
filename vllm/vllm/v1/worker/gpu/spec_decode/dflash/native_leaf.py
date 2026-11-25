@@ -32,7 +32,7 @@ logger = init_logger(__name__)
 ENABLED = os.environ.get("MUSE_NATIVE_LEAF", "1").strip() not in ("0", "", "false", "no")
 M8_ENABLED = os.environ.get("MUSE_NATIVE_LEAF_M8", "1").strip() not in ("0", "", "false", "no")
 try:
-    _TREE_M_RAW = int(os.environ.get("MUSE_NATIVE_TREE_M", "12").strip() or "0")
+    _TREE_M_RAW = int(os.environ.get("MUSE_NATIVE_TREE_M", "16").strip() or "0")
 except ValueError:
     _TREE_M_RAW = 0
 TREE_M = _TREE_M_RAW if _TREE_M_RAW in (12, 16) else 0
