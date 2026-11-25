@@ -6,6 +6,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include <vector>
 
 constexpr int CH = 512;   // k chunk
 constexpr int RPW = 2;    // rows per warp
@@ -100,6 +101,13 @@ void bf16_rans_gemm_out(torch::Tensor x, torch::Tensor blob, torch::Tensor out, 
 int64_t bf16_rans_base(torch::Tensor blob);
 torch::Tensor int3_pack(torch::Tensor W, bool mse_opt = true);
 torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+void dflash_kv_post(
+    torch::Tensor all_kv_flat, torch::Tensor positions, torch::Tensor k_norm_w,
+    torch::Tensor cos_sin_cache,
+    const std::vector<torch::Tensor>& k_caches,
+    const std::vector<torch::Tensor>& v_caches,
+    const std::vector<torch::Tensor>& slot_mappings,
+    int64_t nkv, int64_t block_size, double eps, bool is_neox);
 void draft_vocab_update_tail(
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor in_static_vocab,
     torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor tail_seen);
@@ -128,7 +136,12 @@ void native_leaf_setup_tree(
     bool dynamic_mode = true,
     double temp = 1.35,
     double tail_c = 4.0,
-    double gamma = 0.92);
+    double gamma = 0.92,
+    c10::optional<torch::Tensor> saved_leaf_parent = c10::nullopt,
+    int64_t max_depth = 6,
+    double sub_coef = 0.55,
+    double shf_coef = 0.20,
+    double cont_decay = 0.88);
 void native_leaf_commit_tree(
     torch::Tensor leaf_flag, torch::Tensor prev_ns,
     torch::Tensor hit_flag, torch::Tensor hit_src_row,
@@ -137,7 +150,8 @@ void native_leaf_commit_tree(
     torch::Tensor num_sampled, torch::Tensor num_rejected,
     int64_t tree_m = 12,
     c10::optional<torch::Tensor> stats = c10::nullopt, bool no_hit_mode = false,
-    c10::optional<torch::Tensor> req_acc_state = c10::nullopt);
+    c10::optional<torch::Tensor> req_acc_state = c10::nullopt,
+    c10::optional<torch::Tensor> saved_leaf_parent = c10::nullopt);
 void native_leaf_setup(
     torch::Tensor leaf_flag, torch::Tensor prev_ns, torch::Tensor alt_ids,
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor saved_alt_tok,
@@ -171,6 +185,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_base", &bf16_rans_base);
   m.def("int3_pack", &int3_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
   m.def("int3_gemm", &int3_gemm);
+  m.def("dflash_kv_post", &dflash_kv_post);
   m.def("draft_vocab_update_tail", &draft_vocab_update_tail);
   m.def("draft_vocab_tail_argmax", &draft_vocab_tail_argmax,
         pybind11::arg("A"), pybind11::arg("static_logits"), pybind11::arg("vocab_map"),
@@ -196,7 +211,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("dynamic_mode") = true,
         pybind11::arg("temp") = 1.35,
         pybind11::arg("tail_c") = 4.0,
-        pybind11::arg("gamma") = 0.92);
+        pybind11::arg("gamma") = 0.92,
+        pybind11::arg("saved_leaf_parent") = c10::nullopt,
+        pybind11::arg("max_depth") = 6,
+        pybind11::arg("sub_coef") = 0.55,
+        pybind11::arg("shf_coef") = 0.20,
+        pybind11::arg("cont_decay") = 0.88);
   m.def("native_leaf_commit_tree", &native_leaf_commit_tree,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"),
         pybind11::arg("hit_flag"), pybind11::arg("hit_src_row"),
@@ -205,7 +225,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("num_sampled"), pybind11::arg("num_rejected"),
         pybind11::arg("tree_m") = 12,
         pybind11::arg("stats") = c10::nullopt, pybind11::arg("no_hit_mode") = false,
-        pybind11::arg("req_acc_state") = c10::nullopt);
+        pybind11::arg("req_acc_state") = c10::nullopt,
+        pybind11::arg("saved_leaf_parent") = c10::nullopt);
   m.def("native_leaf_setup", &native_leaf_setup,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"), pybind11::arg("alt_ids"),
         pybind11::arg("input_ids"), pybind11::arg("positions"), pybind11::arg("saved_alt_tok"),

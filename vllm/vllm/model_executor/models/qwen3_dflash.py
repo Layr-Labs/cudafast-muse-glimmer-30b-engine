@@ -507,14 +507,10 @@ class DFlashQwen3Model(nn.Module):
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
 
-    def _project_context_kv(
+    def _project_context_kv_flat(
         self,
         context_states: torch.Tensor,
-        num_ctx: int,
-        num_layers: int,
-        num_kv_heads: int,
-        head_dim: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         # --- Fused KV projection (one GEMM for all layers) ---
         normed_context_states = torch.empty_like(context_states)
         ops.rms_norm(
@@ -539,6 +535,17 @@ class DFlashQwen3Model(nn.Module):
             all_kv_flat = F.linear(
                 normed_context_states, self._fused_kv_weight, self._fused_kv_bias
             )
+        return all_kv_flat
+
+    def _project_context_kv(
+        self,
+        context_states: torch.Tensor,
+        num_ctx: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        all_kv_flat = self._project_context_kv_flat(context_states)
         # Single contiguous copy that separates K/V and transposes to
         # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
@@ -593,6 +600,94 @@ class DFlashQwen3Model(nn.Module):
         kv = self._kv_size
         hd = self._head_dim
         nkv = self._num_kv_heads
+
+        # Fused 1-kernel context-KV post-GEMM (replaces permute + k_norm + pos.repeat + RoPE + 5x cache scatter).
+        if (
+            context_slot_mapping is not None
+            and getattr(self, "_dflash_fuse_kv_ok", False)
+            and os.environ.get("MUSE_DFLASH_FUSE_KV_POST", "1") != "0"
+            and hd == 128
+            and self._rope_head_size == 128
+            and 1 <= L <= 8
+            and context_states.is_cuda
+            and context_states.dtype == torch.bfloat16
+            and context_positions.is_cuda
+            and context_positions.dtype == torch.int64
+        ):
+            per_layer = isinstance(context_slot_mapping, (list, tuple))
+            slots_list = (
+                list(context_slot_mapping) if per_layer else [context_slot_mapping] * L
+            )
+            if all(s is not None for s in slots_list):
+                try:
+                    import muse_bfx_ext as _bfx
+
+                    if hasattr(_bfx, "dflash_kv_post"):
+                        k_caches = []
+                        v_caches = []
+                        block_size = 0
+                        ok_layout = True
+                        for i in range(L):
+                            attn = self._attn_layers[i]
+                            if getattr(attn.impl, "kv_cache_dtype", "auto") != "auto":
+                                ok_layout = False
+                                break
+                            kvc = attn.kv_cache
+                            if kvc is None or not kvc.is_cuda or kvc.dtype != torch.bfloat16:
+                                ok_layout = False
+                                break
+                            if kvc.dim() == 4 and kvc.shape[1] == nkv and kvc.shape[3] == 2 * hd:
+                                kc, vc = kvc.transpose(1, 2).split(hd, dim=-1)
+                            elif kvc.dim() == 5 and kvc.shape[0] == 2 and kvc.shape[3] == nkv and kvc.shape[4] == hd:
+                                kc, vc = kvc[0], kvc[1]
+                            else:
+                                ok_layout = False
+                                break
+                            if kc.stride(3) != 1 or vc.stride(3) != 1:
+                                ok_layout = False
+                                break
+                            bs_i = int(kc.shape[1])
+                            if block_size == 0:
+                                block_size = bs_i
+                            elif block_size != bs_i:
+                                ok_layout = False
+                                break
+                            k_caches.append(kc)
+                            v_caches.append(vc)
+
+                        if ok_layout and block_size > 0:
+                            cos_sin_cache = self._rope_cos_sin_cache
+                            if cos_sin_cache.dtype != context_states.dtype:
+                                cast_cache = getattr(self, "_rope_cos_sin_cache_cast", None)
+                                if (
+                                    cast_cache is None
+                                    or cast_cache.dtype != context_states.dtype
+                                    or cast_cache.device != context_states.device
+                                ):
+                                    cast_cache = cos_sin_cache.to(
+                                        device=context_states.device, dtype=context_states.dtype
+                                    )
+                                    self._rope_cos_sin_cache_cast = cast_cache
+                                cos_sin_cache = cast_cache
+                            all_kv_flat = self._project_context_kv_flat(context_states)
+                            if not all_kv_flat.is_contiguous():
+                                all_kv_flat = all_kv_flat.contiguous()
+                            _bfx.dflash_kv_post(
+                                all_kv_flat,
+                                context_positions if context_positions.is_contiguous() else context_positions.contiguous(),
+                                self._k_norm_weights,
+                                cos_sin_cache,
+                                k_caches,
+                                v_caches,
+                                [s if s.is_contiguous() else s.contiguous() for s in slots_list],
+                                nkv,
+                                block_size,
+                                float(self._rms_norm_eps),
+                                bool(self._rope_is_neox),
+                            )
+                            return
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning_once("dflash_kv_post skipped (%s); using stock path", exc)
 
         all_k, all_v = self._project_context_kv(context_states, num_ctx, L, nkv, hd)
         all_k_normed = self._normalize_context_k(all_k)
