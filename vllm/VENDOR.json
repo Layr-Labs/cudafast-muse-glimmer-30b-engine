@@ -286,6 +286,10 @@
     {
       "file": "harness/kernels/gqa16_decode/{gqa16_decode.cu,muse_gqa16_attn.py}; harness/kernels/musebfx/{bf16_rans_mma.cu,bfx.cu,build.sh,dflash_fuse.cu,native_leaf.cu}; harness/kernels/muserans/csrc/muse_rans.cu; vllm/vllm/model_executor/layers/muse_draft_fp8.py; vllm/vllm/model_executor/models/qwen3_dflash.py; vllm/vllm/v1/worker/gpu/spec_decode/dflash/{committed_token_ceiling.py,native_leaf.py}",
       "why": "Arbitrary-depth (1..6-level) bit-packed dynamic M=16 tree verify, strict 0-ULP M<=16 rANS SMEM activation staging + LDG.E.128 butterfly transpose, dead drafter BF16 release + 0-ULP dflash_kv_post fusion, and cumulative-wall committed-token ceiling built on 40f7f4a8: (1) packs up to 6 suffix KV remaps into one uint32 register inside existing leaf_flag[49] for gqa16_fa2_block128_pipe_kernel<true> (0-ULP boot self-checked on 6-level deep chain + 3-level branch across full & SWA) paired with a 64-slot 1-warp dynamic tree builder spawning aligned sub (d_{k+1}#1) and shift (d_k#1) continuations and 1-launch multi-node commit/hidden/52-layer KV fixup (MUSE_TREE_MAX_DEPTH=1 restores 1-level); (2) replaces scattered stride-K LDG.E.32 in muserans kM16 and bf16_rans_mma kM16 with vectorized LDG.E.128 + 4-lane butterfly shuffle, 64 KiB L1 carveout, 96-reg launch bounds on br_pair, and double-buffered cooperative K_CHUNK=16 SMEM activation staging (strict 0-ULP bitwise admitted across 117/117 FP8 and 12/12 BF16 layers); (3) releases ~4.67 GB dead query-only drafter BF16 weights before read-only L2-flush DRAM placement and fuses 9 context-KV post-GEMM launches into 1 load-verified 0-ULP dflash_kv_post kernel; and (4) switches committed_token_ceiling.py to gap-safe cumulative decode wall time with TARGET_MS_PER_COMMITTED_TOKEN=17.35 and 0.995 safety factor."
+    },
+    {
+      "file": "(documentation only) vllm/VENDOR.json",
+      "why": "Re-filing of e-man07 1a38707c (3.0250) with no executable change, to take a second official measurement of the same tree; the only difference is this entry."
     }
   ],
   "carried_from": {
