@@ -209,32 +209,35 @@ __device__ __forceinline__ void k_loop(
     fbq[o] = *reinterpret_cast<const int2*>(reinterpret_cast<const int*>(sa) + b_rd + b_row * g);
     fsq[o] = reinterpret_cast<const int*>(sa)[s_rd + s_row * g];
   };
+  auto dequant_scales = [&](const int o, nv_bfloat162 (&sc)[2]) {
+    dequant_fp8_scales<nv_bfloat162, vllm::kFE4M3fn.id()>(fsq[o], sc);
+  };
+  auto dequant_quarter = [&](const int o, const int jj, const nv_bfloat162 s) {
+    FragB& b0 = bb[o][jj][0];
+    FragB& b1 = bb[o][jj][1];
+    const int bq1 = jj == 0 ? fbq[o].x : fbq[o].y;
+    // The four registers of dequant<.., kFE2M1f, true>(bq1 << 8) and (bq1), bit for bit: per register the two
+    // nibbles are isolated, copied to the sign position and to the exponent/mantissa position by one multiply
+    // (the copies cannot overlap) and masked: bit 15 <- sign, bits 8:6 <- e1 e0 m, the same in the upper half.
+    {
+      const unsigned u = static_cast<unsigned>(bq1);
+      reinterpret_cast<unsigned*>(&b1)[1] = (u & 0x80008000u) | ((u >> 6) & 0x01c001c0u);
+      reinterpret_cast<unsigned*>(&b1)[0] = (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
+      reinterpret_cast<unsigned*>(&b0)[1] = ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
+      reinterpret_cast<unsigned*>(&b0)[0] = ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
+    }
+    const nv_bfloat162 s0 = __bfloat162bfloat162(reinterpret_cast<const nv_bfloat16*>(&s)[0]);
+    const nv_bfloat162 s1 = __bfloat162bfloat162(reinterpret_cast<const nv_bfloat16*>(&s)[1]);
+    b0[0] = __hmul2(b0[0], s0);
+    b0[1] = __hmul2(b0[1], s0);
+    b1[0] = __hmul2(b1[0], s1);
+    b1[1] = __hmul2(b1[1], s1);
+  };
   auto dequant_to = [&](const int o) {
     nv_bfloat162 sc[2];
-    dequant_fp8_scales<nv_bfloat162, vllm::kFE4M3fn.id()>(fsq[o], sc);
-#pragma unroll
-    for (int jj = 0; jj < 2; jj++) {
-      FragB& b0 = bb[o][jj][0];
-      FragB& b1 = bb[o][jj][1];
-      const int bq1 = jj == 0 ? fbq[o].x : fbq[o].y;
-      // The four registers of dequant<.., kFE2M1f, true>(bq1 << 8) and (bq1), bit for bit: per register the two
-      // nibbles are isolated, copied to the sign position and to the exponent/mantissa position by one multiply
-      // (the copies cannot overlap) and masked: bit 15 <- sign, bits 8:6 <- e1 e0 m, the same in the upper half.
-      {
-        const unsigned u = static_cast<unsigned>(bq1);
-        reinterpret_cast<unsigned*>(&b1)[1] = (u & 0x80008000u) | ((u >> 6) & 0x01c001c0u);
-        reinterpret_cast<unsigned*>(&b1)[0] = (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
-        reinterpret_cast<unsigned*>(&b0)[1] = ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
-        reinterpret_cast<unsigned*>(&b0)[0] = ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
-      }
-      const nv_bfloat162 s = sc[jj];
-      const nv_bfloat162 s0 = __bfloat162bfloat162(reinterpret_cast<const nv_bfloat16*>(&s)[0]);
-      const nv_bfloat162 s1 = __bfloat162bfloat162(reinterpret_cast<const nv_bfloat16*>(&s)[1]);
-      b0[0] = __hmul2(b0[0], s0);
-      b0[1] = __hmul2(b0[1], s0);
-      b1[0] = __hmul2(b1[0], s1);
-      b1[1] = __hmul2(b1[1], s1);
-    }
+    dequant_scales(o, sc);
+    dequant_quarter(o, 0, sc[0]);
+    dequant_quarter(o, 1, sc[1]);
   };
 
   if (resume) {  // a later K piece of a tile: both chains continue from the state the previous piece left
@@ -264,9 +267,9 @@ __device__ __forceinline__ void k_loop(
     const int s = q & (kStages - 1);
     const int ns = (q + 1) & (kStages - 1);
     if (tid == 0 && q + kDist < total) start_copy(q + kDist);
-    // k-half 0 of k-tile t (operands already in registers); meanwhile k-half 1 of the same stage is loaded.
+    // k-half 0 of k-tile t: load k-half 1 codes/scales before releasing empty_bar early,
+    // then overlap register-only dequant(1) across the second 16 MMAs of k-half 0.
     load_bs(1, s);
-    dequant_to(1);
     {
       const uint32_t sa = sbase + kStageBytes * s + a_rd1;
 #pragma unroll
@@ -278,28 +281,52 @@ __device__ __forceinline__ void k_loop(
     }
     __syncwarp();
     if (lane == 0) mbar_arrive(empty_bar + 8 * s);  // warp-aggregated empty signal
-#pragma unroll
-    for (int i = 0; i < MB; i++) {
-      mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
-      mma16(fa[0][i], bb[0][1][1], acc[i][1][1]);
-    }
-    // k-half 1 of k-tile t; meanwhile k-half 0 of k-tile t + 1 is loaded.
-    if (t + 1 < iters) mbar_wait(full_bar + 8 * ns, ((q + 1) / kStages) & 1);
-    load_bs(0, ns);
-    dequant_to(0);
     {
-      const uint32_t sa = sbase + kStageBytes * ns + a_rd0;
+      nv_bfloat162 sc1[2];
+      dequant_scales(1, sc1);
+#pragma unroll
+      for (int i = 0; i < MB; i++) {
+        if (i == 0) dequant_quarter(1, 0, sc1[0]);
+        if (i == MB / 2) dequant_quarter(1, 1, sc1[1]);
+        mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
+        mma16(fa[0][i], bb[0][1][1], acc[i][1][1]);
+      }
+    }
+    // k-half 1 of k-tile t: wait/load/ldsm4/dequant k-tile t+1 only while t+1 < iters.
+    if (t + 1 < iters) {
+      mbar_wait(full_bar + 8 * ns, ((q + 1) / kStages) & 1);
+      load_bs(0, ns);
+      {
+        const uint32_t sa = sbase + kStageBytes * ns + a_rd0;
+#pragma unroll
+        for (int i = 0; i < MB; i++) {
+          mma16(fa[1][i], bb[1][0][0], acc[i][0][0]);
+          mma16(fa[1][i], bb[1][0][1], acc[i][0][1]);
+          ldsm4(fa[0][i], sa + 2048 * i);
+        }
+      }
+      {
+        nv_bfloat162 sc0[2];
+        dequant_scales(0, sc0);
+#pragma unroll
+        for (int i = 0; i < MB; i++) {
+          if (i == 0) dequant_quarter(0, 0, sc0[0]);
+          if (i == MB / 2) dequant_quarter(0, 1, sc0[1]);
+          mma16(fa[1][i], bb[1][1][0], acc[i][1][0]);
+          mma16(fa[1][i], bb[1][1][1], acc[i][1][1]);
+        }
+      }
+    } else {
 #pragma unroll
       for (int i = 0; i < MB; i++) {
         mma16(fa[1][i], bb[1][0][0], acc[i][0][0]);
         mma16(fa[1][i], bb[1][0][1], acc[i][0][1]);
-        ldsm4(fa[0][i], sa + 2048 * i);
       }
-    }
 #pragma unroll
-    for (int i = 0; i < MB; i++) {
-      mma16(fa[1][i], bb[1][1][0], acc[i][1][0]);
-      mma16(fa[1][i], bb[1][1][1], acc[i][1][1]);
+      for (int i = 0; i < MB; i++) {
+        mma16(fa[1][i], bb[1][1][0], acc[i][1][0]);
+        mma16(fa[1][i], bb[1][1][1], acc[i][1][1]);
+      }
     }
   }
   }
@@ -734,42 +761,62 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
   __syncthreads();
   {
     const uint32_t* shw = reinterpret_cast<const uint32_t*>(epi);
+    const int r_in_warp = lane >> 3;  // 4 rows per warp per iter
+    const int c_in_row = lane & 7;    // 8 threads per row, 4 uint32_t (8 elements) per thread
 #ifdef MARLINW_TMA_FP8
     float inverse;
     asm("div.full.f32 %0, 0f3F800000, %1;" : "=f"(inverse) : "f"(*down_input_scale));
-    uint16_t* o8 = reinterpret_cast<uint16_t*>(out);
-#pragma unroll 4
-    for (int row = warp; row < 128; row += 8) {
-      uint32_t gates = shw[row * 68 + lane], ups = shw[row * 68 + lane + 32];
-      float scaled[2];
+    uint2* o8 = reinterpret_cast<uint2*>(out);
 #pragma unroll
-      for (int e = 0; e < 2; e++) {
-        auto gate = reinterpret_cast<const __nv_bfloat16*>(&gates)[e];
-        auto up = reinterpret_cast<const __nv_bfloat16*>(&ups)[e];
-        const float silu = swiglu_silu(__bfloat162float(gate));
-        const float product = __fmul_rn(silu, __bfloat162float(up));
-        const float q = __fmul_rn(product, inverse);
-        scaled[e] = q < -448.0f ? -448.0f : (q > 448.0f ? 448.0f : q);
+    for (int it = 0; it < 4; it++) {
+      const int row = warp * 16 + it * 4 + r_in_warp;
+      const uint4 g4 = *reinterpret_cast<const uint4*>(shw + row * 68 + c_in_row * 4);
+      const uint4 u4 = *reinterpret_cast<const uint4*>(shw + row * 68 + 32 + c_in_row * 4);
+      const uint32_t gs_arr[4] = {g4.x, g4.y, g4.z, g4.w};
+      const uint32_t us_arr[4] = {u4.x, u4.y, u4.z, u4.w};
+      uint16_t conv[4];
+#pragma unroll
+      for (int p = 0; p < 4; p++) {
+        float scaled[2];
+#pragma unroll
+        for (int e = 0; e < 2; e++) {
+          auto gate = reinterpret_cast<const __nv_bfloat16*>(&gs_arr[p])[e];
+          auto up = reinterpret_cast<const __nv_bfloat16*>(&us_arr[p])[e];
+          const float silu = swiglu_silu(__bfloat162float(gate));
+          const float product = __fmul_rn(silu, __bfloat162float(up));
+          const float q = __fmul_rn(product, inverse);
+          scaled[e] = q < -448.0f ? -448.0f : (q > 448.0f ? 448.0f : q);
+        }
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(conv[p]) : "f"(scaled[1]), "f"(scaled[0]));
       }
-      uint16_t converted;
-      asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(converted) : "f"(scaled[1]), "f"(scaled[0]));
-      o8[(size_t)(chunk * 128 + row) * (kFused / 4) + slice_col * 32 + lane] = converted;
+      uint2 packed;
+      packed.x = static_cast<uint32_t>(conv[0]) | (static_cast<uint32_t>(conv[1]) << 16);
+      packed.y = static_cast<uint32_t>(conv[2]) | (static_cast<uint32_t>(conv[3]) << 16);
+      o8[(size_t)(chunk * 128 + row) * (kFused / 16) + slice_col * 8 + c_in_row] = packed;
     }
 #else
-    uint32_t* o = reinterpret_cast<uint32_t*>(out);
-#pragma unroll 4
-    for (int row = warp; row < 128; row += 8) {
-      uint32_t gates = shw[row * 68 + lane], ups = shw[row * 68 + lane + 32];
-      uint32_t prod;
+    uint4* o = reinterpret_cast<uint4*>(out);
 #pragma unroll
-      for (int e = 0; e < 2; e++) {
-        auto gate = reinterpret_cast<const __nv_bfloat16*>(&gates)[e];
-        auto up = reinterpret_cast<const __nv_bfloat16*>(&ups)[e];
-        // swiglu_product with the table entry replaced by its definition (silu_check: equal for all patterns)
-        reinterpret_cast<__nv_bfloat16*>(&prod)[e] =
-            __float2bfloat16_rn(__fmul_rn(swiglu_silu(__bfloat162float(gate)), __bfloat162float(up)));
+    for (int it = 0; it < 4; it++) {
+      const int row = warp * 16 + it * 4 + r_in_warp;
+      const uint4 g4 = *reinterpret_cast<const uint4*>(shw + row * 68 + c_in_row * 4);
+      const uint4 u4 = *reinterpret_cast<const uint4*>(shw + row * 68 + 32 + c_in_row * 4);
+      const uint32_t gs_arr[4] = {g4.x, g4.y, g4.z, g4.w};
+      const uint32_t us_arr[4] = {u4.x, u4.y, u4.z, u4.w};
+      uint32_t prod[4];
+#pragma unroll
+      for (int p = 0; p < 4; p++) {
+#pragma unroll
+        for (int e = 0; e < 2; e++) {
+          auto gate = reinterpret_cast<const __nv_bfloat16*>(&gs_arr[p])[e];
+          auto up = reinterpret_cast<const __nv_bfloat16*>(&us_arr[p])[e];
+          // swiglu_product with the table entry replaced by its definition (silu_check: equal for all patterns)
+          reinterpret_cast<__nv_bfloat16*>(&prod[p])[e] =
+              __float2bfloat16_rn(__fmul_rn(swiglu_silu(__bfloat162float(gate)), __bfloat162float(up)));
+        }
       }
-      o[(size_t)(chunk * 128 + row) * (kFused / 4) + slice_col * 32 + lane] = prod;
+      o[(size_t)(chunk * 128 + row) * (kFused / 16) + slice_col * 8 + c_in_row] =
+          make_uint4(prod[0], prod[1], prod[2], prod[3]);
     }
 #endif
   }
@@ -961,7 +1008,7 @@ extern "C" int swiglu_fp8_gemm(const void* x, const void* w, const void* scales,
   using namespace MARLIN_NAMESPACE_NAME;
   constexpr int m = 512, n = kFused, k = 6656;
   if (!encode || stride < k || stride % 8) return cudaErrorInvalidValue;
-  if (((uintptr_t)x | (uintptr_t)w | (uintptr_t)scales) & 15) return cudaErrorInvalidValue;
+  if (((uintptr_t)x | (uintptr_t)w | (uintptr_t)scales | (uintptr_t)out) & 15) return cudaErrorInvalidValue;
   CUtensorMap tmA, tmB, tmS;
   if (!map2d(&tmA, x, 1, 2 * k, m, 2 * (uint64_t)stride, 128, 128, true) ||
       !map2d(&tmB, w, 4, 2 * n, k / 16, 8 * n, 128, 4, false) ||
@@ -1007,7 +1054,7 @@ extern "C" int swiglu_gemm(const void* x, const void* w, const void* scales, con
   using namespace MARLIN_NAMESPACE_NAME;
   constexpr int m = 512, n = kFused, k = 6656;
   if (!encode || stride < k || stride % 8) return cudaErrorInvalidValue;
-  if (((uintptr_t)x | (uintptr_t)w | (uintptr_t)scales) & 15) return cudaErrorInvalidValue;
+  if (((uintptr_t)x | (uintptr_t)w | (uintptr_t)scales | (uintptr_t)out) & 15) return cudaErrorInvalidValue;
   CUtensorMap tmA, tmB, tmS;
   if (!map2d(&tmA, x, 1, 2 * k, m, 2 * (uint64_t)stride, 128, 128, true) ||
       !map2d(&tmB, w, 4, 2 * n, k / 16, 8 * n, 128, 4, false) ||
