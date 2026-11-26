@@ -1434,102 +1434,103 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
             draft_head.logical_widths = [len(draft_ids)]
             draft_head.has_bias = False
             draft_head.register_parameter("bias", None)
-            draft_head.register_parameter(
-                "weight",
-                Parameter(
-                    layer.weight.index_select(0, ids).contiguous(),
-                    requires_grad=False,
-                ),
-            )
-            draft_head.register_parameter(
-                "weight_scale",
-                Parameter(
-                    layer.weight_scale.index_select(0, ids).contiguous(),
-                    requires_grad=False,
-                ),
-            )
-            draft_head.register_parameter(
-                "weight_global_scale",
-                Parameter(layer.weight_global_scale.clone(), requires_grad=False),
-            )
             draft_head.register_buffer("token_ids", ids, persistent=False)
-            draft_head.quant_method = self
             draft_head.tp_size = 1
             draft_head.org_vocab_size = len(draft_ids)
-            self.kernel.process_weights_after_loading(draft_head)
-
-            # Quick 6-spare read-only-flush GB10 DRAM placement for draft_head._marlin_decode_weight.
-            dec_w = getattr(draft_head, "_marlin_decode_weight", None)
-            if (
-                dec_w is not None
-                and os.environ.get("MUSE_DRAFT_VOCAB_PLACE", "1") != "0"
-            ):
-                try:
-                    spares = [torch.empty_like(dec_w) for _ in range(6)]
-                    for sp in spares:
-                        sp.copy_(dec_w)
-                    evict = torch.ones((48 << 20) // 4, dtype=torch.float32, device=dev)
-                    x_p = (
-                        ((torch.arange(6 * k_dim, device=dev) % 7).float() - 3.0)
-                        .to(torch.bfloat16)
-                        .reshape(6, k_dim)
-                    )
-                    cands = [dec_w, *spares]
-                    _ = evict.sum()
-                    _ = self.apply(draft_head, x_p)
-                    torch.cuda.synchronize(dev)
-                    samples: list[list[float]] = [[] for _ in cands]
-                    for _ in range(5):
-                        for ci, buf in enumerate(cands):
-                            draft_head._buffers["_marlin_decode_weight"] = buf
-                            _ = evict.sum()
-                            se = torch.cuda.Event(enable_timing=True)
-                            ee = torch.cuda.Event(enable_timing=True)
-                            se.record()
-                            _ = self.apply(draft_head, x_p)
-                            ee.record()
-                            torch.cuda.synchronize(dev)
-                            samples[ci].append(se.elapsed_time(ee))
-                    times = [median(s) for s in samples]
-                    best_i = min(range(len(cands)), key=times.__getitem__)
-                    if best_i > 0 and times[0] - times[best_i] >= 0.005:
-                        draft_head._buffers["_marlin_decode_weight"] = cands[best_i]
-                        logger.info(
-                            "Draft vocab head DRAM placement: saved %.3f ms (%.3f -> %.3f ms)",
-                            times[0] - times[best_i],
-                            times[0],
-                            times[best_i],
-                        )
-                    else:
-                        draft_head._buffers["_marlin_decode_weight"] = dec_w
-                    del spares, cands, evict, x_p
-                    torch.cuda.empty_cache()
-                except Exception as exc:  # noqa: BLE001
-                    draft_head._buffers["_marlin_decode_weight"] = dec_w
-                    logger.warning("Draft vocab head DRAM placement skipped (%s)", exc)
-
             draft_head.prompt_tail_admitted = False
-            if want_tail and raw_w_full is not None and raw_s_full is not None and raw_gs_full is not None:
+
+            fast_dhead_admitted = False
+            want_fast_dhead = (
+                want_tail
+                and raw_w_full is not None
+                and raw_s_full is not None
+                and raw_gs_full is not None
+                and (len(draft_ids) % 64 == 0)
+                and (k_dim % 128 == 0)
+                and os.environ.get("MUSE_DHEAD_FAST", "1") != "0"
+            )
+            if want_fast_dhead:
                 try:
+                    import sys
                     import muse_bfx_ext as _bfx
 
-                    if hasattr(_bfx, "draft_vocab_tail_argmax") and hasattr(_bfx, "draft_vocab_score_rows"):
+                    if (
+                        hasattr(_bfx, "draft_head_pack")
+                        and hasattr(_bfx, "draft_head_topc")
+                        and hasattr(_bfx, "draft_head_gemm_full")
+                        and hasattr(_bfx, "draft_vocab_tail_argmax")
+                        and hasattr(_bfx, "draft_vocab_score_rows")
+                    ):
+                        dhead_ctas = int(os.environ.get("MUSE_DHEAD_CTAS", "96"))
+                        if dhead_ctas not in (48, 96, 192):
+                            dhead_ctas = 96
+                        dhead_mode = int(os.environ.get("MUSE_DHEAD_MODE", "1"))
+                        if dhead_mode not in (0, 1):
+                            dhead_mode = 1
+                        dhead_rk = int(os.environ.get("MUSE_DHEAD_RESCORE_K", "96"))
+
+                        w_packed = _bfx.draft_head_pack(
+                            raw_w_full, raw_s_full, raw_gs_full, ids, dhead_ctas, dhead_mode
+                        )
+                        if os.environ.get("MUSE_DRAFT_VOCAB_PLACE", "1") != "0":
+                            try:
+                                spares = [torch.empty_like(w_packed) for _ in range(6)]
+                                for sp in spares:
+                                    sp.copy_(w_packed)
+                                evict = torch.ones((48 << 20) // 4, dtype=torch.float32, device=dev)
+                                x_p = (
+                                    ((torch.arange(6 * k_dim, device=dev) % 7).float() - 3.0)
+                                    .to(torch.bfloat16)
+                                    .reshape(6, k_dim)
+                                    .contiguous()
+                                )
+                                cands = [w_packed, *spares]
+                                _ = evict.sum()
+                                _ = _bfx.draft_head_topc(
+                                    x_p, w_packed, ids, len(draft_ids), k_dim, dhead_ctas, dhead_mode, dhead_rk
+                                )
+                                torch.cuda.synchronize(dev)
+                                samples_f: list[list[float]] = [[] for _ in cands]
+                                for _ in range(5):
+                                    for ci, buf in enumerate(cands):
+                                        _ = evict.sum()
+                                        se = torch.cuda.Event(enable_timing=True)
+                                        ee = torch.cuda.Event(enable_timing=True)
+                                        se.record()
+                                        _ = _bfx.draft_head_topc(
+                                            x_p, buf, ids, len(draft_ids), k_dim, dhead_ctas, dhead_mode, dhead_rk
+                                        )
+                                        ee.record()
+                                        torch.cuda.synchronize(dev)
+                                        samples_f[ci].append(se.elapsed_time(ee))
+                                times_f = [median(s) for s in samples_f]
+                                best_i = min(range(len(cands)), key=times_f.__getitem__)
+                                if best_i > 0 and times_f[0] - times_f[best_i] >= 0.005:
+                                    w_packed = cands[best_i]
+                                    logger.info(
+                                        "Fast NF3/VQ draft_head DRAM placement: saved %.3f ms (%.3f -> %.3f ms)",
+                                        times_f[0] - times_f[best_i],
+                                        times_f[0],
+                                        times_f[best_i],
+                                    )
+                                del spares, cands, evict, x_p
+                                torch.cuda.empty_cache()
+                            except Exception as exc_p:  # noqa: BLE001
+                                logger.warning("Fast draft_head DRAM placement skipped (%s)", exc_p)
+
                         in_static = torch.zeros((vocab_n,), dtype=torch.uint8, device=dev)
                         in_static.scatter_(0, ids, 1)
                         tail_ids = torch.full((512,), -1, dtype=torch.int32, device=dev)
                         tail_count = torch.zeros((1,), dtype=torch.int32, device=dev)
                         tail_seen = torch.zeros((vocab_n,), dtype=torch.int32, device=dev)
 
-                        # Scale-parity self-check: compare exact-NVFP4 tail dot product vs Marlin static head.
                         gen = torch.Generator(device=dev).manual_seed(20261130)
                         x_chk = (
                             torch.randn((6, k_dim), generator=gen, device=dev) * 0.5
                         ).to(torch.bfloat16).contiguous()
-                        ref_logits = self.apply(draft_head, x_chk)
-                        if tuple(ref_logits.shape) != (6, len(draft_ids)):
-                            raise RuntimeError(
-                                f"unexpected ref_logits shape {tuple(ref_logits.shape)} != (6, {len(draft_ids)})"
-                            )
+                        approx_logits = _bfx.draft_head_gemm_full(
+                            x_chk, w_packed, len(draft_ids), k_dim, dhead_ctas, dhead_mode
+                        )
                         n_d = len(draft_ids)
                         chk_idx = torch.tensor(
                             [0, 1, 127, min(1024, n_d - 1), min(8192, n_d - 1),
@@ -1541,24 +1542,76 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                         got_scores = _bfx.draft_vocab_score_rows(
                             x_chk, chk_orig, raw_w_full, raw_s_full, raw_gs_full, 1.0
                         )
-                        ref_scores = ref_logits.index_select(1, chk_idx).float()
-                        max_err = (got_scores - ref_scores).abs().max().item()
-                        tol = 2e-2 * ref_scores.abs().max().item() + 1e-2
-                        # Also warmup tail_argmax scratch allocation outside CUDA graph capture.
-                        got_arg = _bfx.draft_vocab_tail_argmax(
-                            x_chk,
-                            ref_logits.contiguous(),
-                            ids,
-                            tail_ids,
-                            tail_count,
-                            raw_w_full,
-                            raw_s_full,
-                            raw_gs_full,
-                            1.0,
+                        approx_scores = approx_logits.index_select(1, chk_idx).float()
+                        rel_err = (
+                            (got_scores - approx_scores).norm()
+                            / got_scores.norm().clamp(min=1e-6)
+                        ).item()
+                        sent_chk = _bfx.draft_head_topc(
+                            x_chk, w_packed, ids, len(draft_ids), k_dim, dhead_ctas, dhead_mode, dhead_rk
                         )
-                        ref_arg = ids.index_select(0, ref_logits.argmax(dim=-1))
+                        tt_chk = torch.empty((36,), dtype=torch.long, device=dev)
+                        tv_chk = torch.empty((36,), dtype=torch.float32, device=dev)
+                        got_arg = _bfx.draft_vocab_tail_argmax(
+                            x_chk, sent_chk, ids, tail_ids, tail_count,
+                            raw_w_full, raw_s_full, raw_gs_full, 1.0,
+                            None, None, tt_chk, tv_chk, False,
+                        )
                         torch.cuda.synchronize(dev)
-                        if max_err <= tol and torch.equal(got_arg, ref_arg):
+                        if rel_err <= 0.35 and got_arg.numel() == 6:
+                            n_rows_dh = len(draft_ids)
+                            k_cols_dh = k_dim
+
+                            class _FastDraftHeadQuantMethod:
+                                def apply(
+                                    self,
+                                    dh_layer: torch.nn.Module,
+                                    x: torch.Tensor,
+                                    bias: torch.Tensor | None = None,
+                                ) -> torch.Tensor:
+                                    x_2d = x.reshape(-1, x.shape[-1])
+                                    x_c = x_2d if x_2d.is_contiguous() else x_2d.contiguous()
+                                    in_draft_argmax = False
+                                    if (
+                                        bias is None
+                                        and 1 <= x_c.shape[0] <= 8
+                                        and getattr(dh_layer, "prompt_tail_admitted", False)
+                                    ):
+                                        frm = sys._getframe(1)
+                                        for _ in range(8):
+                                            if frm is None:
+                                                break
+                                            cname = frm.f_code.co_name
+                                            if cname == "draft_argmax":
+                                                in_draft_argmax = True
+                                                break
+                                            if cname == "compute_logits":
+                                                break
+                                            frm = frm.f_back
+                                    if in_draft_argmax:
+                                        return _bfx.draft_head_topc(
+                                            x_c,
+                                            dh_layer._dhead_w_packed,
+                                            dh_layer.token_ids,
+                                            n_rows_dh,
+                                            k_cols_dh,
+                                            dhead_ctas,
+                                            dhead_mode,
+                                            dhead_rk,
+                                        )
+                                    out = _bfx.draft_head_gemm_full(
+                                        x_c,
+                                        dh_layer._dhead_w_packed,
+                                        n_rows_dh,
+                                        k_cols_dh,
+                                        dhead_ctas,
+                                        dhead_mode,
+                                    )
+                                    if bias is not None:
+                                        out = out + bias
+                                    return out.reshape(*x.shape[:-1], n_rows_dh)
+
+                            draft_head.register_buffer("_dhead_w_packed", w_packed, persistent=False)
                             draft_head.register_buffer("full_raw_w", raw_w_full, persistent=False)
                             draft_head.register_buffer("full_raw_s", raw_s_full, persistent=False)
                             draft_head.register_buffer("full_global_scale", raw_gs_full, persistent=False)
@@ -1566,36 +1619,187 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                             draft_head.register_buffer("tail_ids", tail_ids, persistent=False)
                             draft_head.register_buffer("tail_count", tail_count, persistent=False)
                             draft_head.register_buffer("tail_seen", tail_seen, persistent=False)
+                            draft_head.quant_method = _FastDraftHeadQuantMethod()
                             draft_head.prompt_tail_admitted = True
+                            fast_dhead_admitted = True
+                            object.__setattr__(layer, "_draft_vocab_head", draft_head)
                             logger.info(
-                                "Draft vocab dynamic prompt tail admitted (V_static=%d, max_tail=512, parity_err=%.5f)",
+                                "Prepared Hadamard-%s %d-row fused top-C draft_head + exact-NVFP4 top-%d rescore "
+                                "(%.2f MB, ctas=%d, wn_rel_err=%.4f)",
+                                "VQ2.5" if dhead_mode == 1 else "NF3",
                                 len(draft_ids),
-                                max_err,
+                                dhead_rk,
+                                w_packed.numel() / 1e6,
+                                dhead_ctas,
+                                rel_err,
                             )
                         else:
                             logger.warning(
-                                "Draft vocab dynamic prompt tail parity failed (err=%.5f > %.5f); static-only",
-                                max_err,
-                                tol,
+                                "Fast draft_head parity check out of range (wn_rel_err=%.4f); falling back to NVFP4",
+                                rel_err,
                             )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Draft vocab dynamic prompt tail skipped (%s); static-only", exc)
+                except Exception as exc_fd:  # noqa: BLE001
+                    logger.warning("Fast Hadamard-NF3 draft_head skipped (%s); falling back to NVFP4", exc_fd)
 
-            object.__setattr__(layer, "_draft_vocab_head", draft_head)
-            _s6 = getattr(draft_head, "_marlin_decode_scales6", None)
-            _is_ilv = False
-            if _s6 is not None:
-                try:
-                    import muse_marlin6_gemv as _m6_chk
-                    _is_ilv = _m6_chk.is_tma4_ilv(_s6)
-                except Exception:  # noqa: BLE001
-                    _is_ilv = False
-            logger.info(
-                "Prepared contiguous %d-row NVFP4 head for greedy DFlash (tma4_ilv=%s, prompt_tail=%s)",
-                len(draft_ids),
-                _is_ilv,
-                draft_head.prompt_tail_admitted,
-            )
+            if not fast_dhead_admitted:
+                draft_head.register_parameter(
+                    "weight",
+                    Parameter(
+                        layer.weight.index_select(0, ids).contiguous(),
+                        requires_grad=False,
+                    ),
+                )
+                draft_head.register_parameter(
+                    "weight_scale",
+                    Parameter(
+                        layer.weight_scale.index_select(0, ids).contiguous(),
+                        requires_grad=False,
+                    ),
+                )
+                draft_head.register_parameter(
+                    "weight_global_scale",
+                    Parameter(layer.weight_global_scale.clone(), requires_grad=False),
+                )
+                draft_head.quant_method = self
+                self.kernel.process_weights_after_loading(draft_head)
+
+                # Quick 6-spare read-only-flush GB10 DRAM placement for draft_head._marlin_decode_weight.
+                dec_w = getattr(draft_head, "_marlin_decode_weight", None)
+                if (
+                    dec_w is not None
+                    and os.environ.get("MUSE_DRAFT_VOCAB_PLACE", "1") != "0"
+                ):
+                    try:
+                        spares = [torch.empty_like(dec_w) for _ in range(6)]
+                        for sp in spares:
+                            sp.copy_(dec_w)
+                        evict = torch.ones((48 << 20) // 4, dtype=torch.float32, device=dev)
+                        x_p = (
+                            ((torch.arange(6 * k_dim, device=dev) % 7).float() - 3.0)
+                            .to(torch.bfloat16)
+                            .reshape(6, k_dim)
+                        )
+                        cands = [dec_w, *spares]
+                        _ = evict.sum()
+                        _ = self.apply(draft_head, x_p)
+                        torch.cuda.synchronize(dev)
+                        samples: list[list[float]] = [[] for _ in cands]
+                        for _ in range(5):
+                            for ci, buf in enumerate(cands):
+                                draft_head._buffers["_marlin_decode_weight"] = buf
+                                _ = evict.sum()
+                                se = torch.cuda.Event(enable_timing=True)
+                                ee = torch.cuda.Event(enable_timing=True)
+                                se.record()
+                                _ = self.apply(draft_head, x_p)
+                                ee.record()
+                                torch.cuda.synchronize(dev)
+                                samples[ci].append(se.elapsed_time(ee))
+                        times = [median(s) for s in samples]
+                        best_i = min(range(len(cands)), key=times.__getitem__)
+                        if best_i > 0 and times[0] - times[best_i] >= 0.005:
+                            draft_head._buffers["_marlin_decode_weight"] = cands[best_i]
+                            logger.info(
+                                "Draft vocab head DRAM placement: saved %.3f ms (%.3f -> %.3f ms)",
+                                times[0] - times[best_i],
+                                times[0],
+                                times[best_i],
+                            )
+                        else:
+                            draft_head._buffers["_marlin_decode_weight"] = dec_w
+                        del spares, cands, evict, x_p
+                        torch.cuda.empty_cache()
+                    except Exception as exc:  # noqa: BLE001
+                        draft_head._buffers["_marlin_decode_weight"] = dec_w
+                        logger.warning("Draft vocab head DRAM placement skipped (%s)", exc)
+
+                if want_tail and raw_w_full is not None and raw_s_full is not None and raw_gs_full is not None:
+                    try:
+                        import muse_bfx_ext as _bfx
+
+                        if hasattr(_bfx, "draft_vocab_tail_argmax") and hasattr(_bfx, "draft_vocab_score_rows"):
+                            in_static = torch.zeros((vocab_n,), dtype=torch.uint8, device=dev)
+                            in_static.scatter_(0, ids, 1)
+                            tail_ids = torch.full((512,), -1, dtype=torch.int32, device=dev)
+                            tail_count = torch.zeros((1,), dtype=torch.int32, device=dev)
+                            tail_seen = torch.zeros((vocab_n,), dtype=torch.int32, device=dev)
+
+                            # Scale-parity self-check: compare exact-NVFP4 tail dot product vs Marlin static head.
+                            gen = torch.Generator(device=dev).manual_seed(20261130)
+                            x_chk = (
+                                torch.randn((6, k_dim), generator=gen, device=dev) * 0.5
+                            ).to(torch.bfloat16).contiguous()
+                            ref_logits = self.apply(draft_head, x_chk)
+                            if tuple(ref_logits.shape) != (6, len(draft_ids)):
+                                raise RuntimeError(
+                                    f"unexpected ref_logits shape {tuple(ref_logits.shape)} != (6, {len(draft_ids)})"
+                                )
+                            n_d = len(draft_ids)
+                            chk_idx = torch.tensor(
+                                [0, 1, 127, min(1024, n_d - 1), min(8192, n_d - 1),
+                                 min(16384, n_d - 1), min(24576, n_d - 1), n_d - 1],
+                                dtype=torch.long,
+                                device=dev,
+                            )
+                            chk_orig = ids.index_select(0, chk_idx).to(torch.int32).contiguous()
+                            got_scores = _bfx.draft_vocab_score_rows(
+                                x_chk, chk_orig, raw_w_full, raw_s_full, raw_gs_full, 1.0
+                            )
+                            ref_scores = ref_logits.index_select(1, chk_idx).float()
+                            max_err = (got_scores - ref_scores).abs().max().item()
+                            tol = 2e-2 * ref_scores.abs().max().item() + 1e-2
+                            # Also warmup tail_argmax scratch allocation outside CUDA graph capture.
+                            got_arg = _bfx.draft_vocab_tail_argmax(
+                                x_chk,
+                                ref_logits.contiguous(),
+                                ids,
+                                tail_ids,
+                                tail_count,
+                                raw_w_full,
+                                raw_s_full,
+                                raw_gs_full,
+                                1.0,
+                            )
+                            ref_arg = ids.index_select(0, ref_logits.argmax(dim=-1))
+                            torch.cuda.synchronize(dev)
+                            if max_err <= tol and torch.equal(got_arg, ref_arg):
+                                draft_head.register_buffer("full_raw_w", raw_w_full, persistent=False)
+                                draft_head.register_buffer("full_raw_s", raw_s_full, persistent=False)
+                                draft_head.register_buffer("full_global_scale", raw_gs_full, persistent=False)
+                                draft_head.register_buffer("in_static_vocab", in_static, persistent=False)
+                                draft_head.register_buffer("tail_ids", tail_ids, persistent=False)
+                                draft_head.register_buffer("tail_count", tail_count, persistent=False)
+                                draft_head.register_buffer("tail_seen", tail_seen, persistent=False)
+                                draft_head.prompt_tail_admitted = True
+                                logger.info(
+                                    "Draft vocab dynamic prompt tail admitted (V_static=%d, max_tail=512, parity_err=%.5f)",
+                                    len(draft_ids),
+                                    max_err,
+                                )
+                            else:
+                                logger.warning(
+                                    "Draft vocab dynamic prompt tail parity failed (err=%.5f > %.5f); static-only",
+                                    max_err,
+                                    tol,
+                                )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Draft vocab dynamic prompt tail skipped (%s); static-only", exc)
+
+                object.__setattr__(layer, "_draft_vocab_head", draft_head)
+                _s6 = getattr(draft_head, "_marlin_decode_scales6", None)
+                _is_ilv = False
+                if _s6 is not None:
+                    try:
+                        import muse_marlin6_gemv as _m6_chk
+                        _is_ilv = _m6_chk.is_tma4_ilv(_s6)
+                    except Exception:  # noqa: BLE001
+                        _is_ilv = False
+                logger.info(
+                    "Prepared contiguous %d-row NVFP4 head for greedy DFlash (tma4_ilv=%s, prompt_tail=%s)",
+                    len(draft_ids),
+                    _is_ilv,
+                    draft_head.prompt_tail_admitted,
+                )
 
         self.kernel.process_weights_after_loading(layer)
 

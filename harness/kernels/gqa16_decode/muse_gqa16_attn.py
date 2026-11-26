@@ -399,31 +399,33 @@ def self_check_verify(device: torch.device) -> bool:
                         break
                 if not all_match:
                     break
-            # Also verify padded CUDA-graph replay (grid max_q=8, runtime actual_m=7).
+            # Also verify padded CUDA-graph replay (grid max_q=8, runtime actual_m=7 and actual_m=4, plus grid max_q=16, actual_m=12).
             if all_match:
-                q8 = (torch.randn((8, 32, 128), generator=gen, device=device) * 1.1).to(torch.bfloat16).contiguous()
-                cu_q7 = torch.tensor([0, 7], dtype=torch.int32, device=device)
-                sk = torch.tensor([640], dtype=torch.int32, device=device)
-                ref7 = torch.empty((7, 32, 128), dtype=torch.bfloat16, device=device)
-                flash_attn_varlen_func(
-                    q=q8[:7], k=k_cache, v=v_cache, out=ref7,
-                    cu_seqlens_q=cu_q7, max_seqlen_q=7,
-                    seqused_k=sk, max_seqlen_k=8192,
-                    softmax_scale=scale, causal=True,
-                    window_size=(511, 0), block_table=bt, fa_version=2,
-                )
-                got8 = torch.zeros_like(q8)
-                rc = _lib.muse_gqa16_verify(
-                    q8.data_ptr(), kv_cache.data_ptr(), got8.data_ptr(),
-                    sk.data_ptr(), bt.data_ptr(), cu_q7.data_ptr(),
-                    8, block_size, 511, g_splits, cand_mode | pipe_bit, scale,
-                    q8.stride(0), q8.stride(1), got8.stride(0), got8.stride(1),
-                    kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
-                    stream,
-                )
-                torch.cuda.synchronize(device)
-                if rc != 0 or not torch.equal(ref7.view(torch.int16), got8[:7].view(torch.int16)):
-                    all_match = False
+                for pad_max_q, pad_m in ((8, 7), (8, 4), (16, 12)):
+                    qp = (torch.randn((pad_max_q, 32, 128), generator=gen, device=device) * 1.1).to(torch.bfloat16).contiguous()
+                    cu_qp = torch.tensor([0, pad_m], dtype=torch.int32, device=device)
+                    sk = torch.tensor([640], dtype=torch.int32, device=device)
+                    refp = torch.empty((pad_m, 32, 128), dtype=torch.bfloat16, device=device)
+                    flash_attn_varlen_func(
+                        q=qp[:pad_m], k=k_cache, v=v_cache, out=refp,
+                        cu_seqlens_q=cu_qp, max_seqlen_q=pad_m,
+                        seqused_k=sk, max_seqlen_k=8192,
+                        softmax_scale=scale, causal=True,
+                        window_size=(511, 0), block_table=bt, fa_version=2,
+                    )
+                    gotp = torch.zeros_like(qp)
+                    rc = _lib.muse_gqa16_verify(
+                        qp.data_ptr(), kv_cache.data_ptr(), gotp.data_ptr(),
+                        sk.data_ptr(), bt.data_ptr(), cu_qp.data_ptr(),
+                        pad_max_q, block_size, 511, g_splits, cand_mode | pipe_bit, scale,
+                        qp.stride(0), qp.stride(1), gotp.stride(0), gotp.stride(1),
+                        kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
+                        stream,
+                    )
+                    torch.cuda.synchronize(device)
+                    if rc != 0 or not torch.equal(refp.view(torch.int16), gotp[:pad_m].view(torch.int16)):
+                        all_match = False
+                        break
             if all_match:
                 ok = True
                 scale_mode = cand_mode

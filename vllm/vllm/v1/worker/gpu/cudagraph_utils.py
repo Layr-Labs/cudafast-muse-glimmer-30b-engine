@@ -411,7 +411,32 @@ class CudaGraphManager:
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
         """
+        persist_enabled = os.environ.get("MUSE_PERSIST_NORMS", "1") != "0"
+        persist_limit_bytes = int(float(os.environ.get("MUSE_PERSIST_LIMIT_MB", "3.0")) * (1 << 20))
+        persist_miss_streaming = os.environ.get("MUSE_PERSIST_MISS_STREAMING", "0") != "0"
+        persist_keep_for_prefill = os.environ.get("MUSE_PERSIST_KEEP_FOR_PREFILL", "0") != "0"
+        persist_arena: torch.Tensor | None = None
+        persist_arena_bytes = 0
+        if persist_enabled:
+            cap_model = getattr(self, "_capture_model", None)
+            if cap_model is not None:
+                persist_arena = getattr(cap_model, "_persisting_norm_arena", None)
+                if persist_arena is not None:
+                    persist_arena_bytes = int(
+                        getattr(cap_model, "_persisting_norm_arena_bytes", 0)
+                        or persist_arena.numel()
+                    )
+        persisted_graph_count = 0
+        stream_matched_all = True
+
         with graph_capture(device=self.device):
+            if persist_arena is not None and persist_arena_bytes > 0 and persist_limit_bytes > 0:
+                try:
+                    import l2pf as _l2pf_mod
+                    if hasattr(_l2pf_mod, "set_persisting_limit"):
+                        _l2pf_mod.set_persisting_limit(persist_limit_bytes)
+                except Exception:
+                    pass
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -458,18 +483,32 @@ class CudaGraphManager:
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
                         persist_set = False
-                        cap_stream = current_platform.current_stream()
-                        if 1 <= desc.num_tokens <= 16:
+                        if getattr(torch.cuda.graph, "default_capture_stream", None) is None:
+                            torch.cuda.graph.default_capture_stream = torch.cuda.Stream(
+                                device=self.device
+                            )
+                        cap_stream = torch.cuda.graph.default_capture_stream
+                        if (
+                            1 <= desc.num_tokens <= 16
+                            and persist_arena is not None
+                            and persist_arena_bytes > 0
+                        ):
                             try:
                                 import l2pf as _l2pf_mod
-                                arena = getattr(
-                                    getattr(self, "_capture_model", None),
-                                    "_persisting_norm_arena",
-                                    None,
-                                )
-                                if arena is not None and hasattr(_l2pf_mod, "set_persisting_window"):
+                                if hasattr(_l2pf_mod, "set_stream_window"):
+                                    persist_set = _l2pf_mod.set_stream_window(
+                                        persist_arena.data_ptr(),
+                                        persist_arena_bytes,
+                                        cap_stream,
+                                        hit_ratio=1.0,
+                                        miss_streaming=persist_miss_streaming,
+                                    )
+                                elif hasattr(_l2pf_mod, "set_persisting_window"):
                                     persist_set = _l2pf_mod.set_persisting_window(
-                                        arena.data_ptr(), arena.numel(), 4 << 20, cap_stream
+                                        persist_arena.data_ptr(),
+                                        persist_arena_bytes,
+                                        persist_limit_bytes,
+                                        cap_stream,
                                     )
                             except Exception:
                                 persist_set = False
@@ -478,6 +517,13 @@ class CudaGraphManager:
                                 torch.cuda.graph(graph, self.pool),
                                 l2pf.apply() if l2pf is not None else nullcontext(),
                             ):
+                                if persist_set:
+                                    persisted_graph_count += 1
+                                    if (
+                                        current_platform.current_stream().cuda_stream
+                                        != cap_stream.cuda_stream
+                                    ):
+                                        stream_matched_all = False
                                 forward_fn(CUDAGraphMode.NONE)
                                 # Join offloader's copy stream after forward to avoid
                                 # unjoined stream error. The last layer's start_prefetch
@@ -485,10 +531,13 @@ class CudaGraphManager:
                                 # the next forward pass.
                                 get_offloader().join_after_forward()
                         finally:
-                            if persist_set:
+                            if persist_set and not persist_keep_for_prefill:
                                 try:
                                     import l2pf as _l2pf_mod
-                                    _l2pf_mod.set_persisting_window(0, 0, 0, cap_stream)
+                                    if hasattr(_l2pf_mod, "clear_stream_window"):
+                                        _l2pf_mod.clear_stream_window(cap_stream)
+                                    else:
+                                        _l2pf_mod.set_persisting_window(0, 0, 0, cap_stream)
                                 except Exception:
                                     pass
                         if l2pf is not None:
@@ -499,6 +548,33 @@ class CudaGraphManager:
                             )
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
+        if persisted_graph_count > 0 and persist_arena is not None:
+            try:
+                import l2pf as _l2pf_mod
+                if hasattr(_l2pf_mod, "prime_persisting"):
+                    _l2pf_mod.prime_persisting(
+                        persist_arena.data_ptr(),
+                        persist_arena_bytes,
+                        current_platform.current_stream(),
+                    )
+                cur_lim, max_p, max_w, l2_sz = (
+                    _l2pf_mod.get_persisting_info()
+                    if hasattr(_l2pf_mod, "get_persisting_info")
+                    else (0, 0, 0, 0)
+                )
+                logger.info(
+                    "L2 persisting active on %d FULL graphs (stream_match=%s, miss_stream=%s): window=%.2f MiB, hw_limit=%.2f/%.2f MiB (max_win=%.2f MiB, L2=%.2f MiB)",
+                    persisted_graph_count,
+                    stream_matched_all,
+                    persist_miss_streaming,
+                    persist_arena_bytes / (1 << 20),
+                    cur_lim / (1 << 20),
+                    max_p / (1 << 20),
+                    max_w / (1 << 20),
+                    l2_sz / (1 << 20),
+                )
+            except Exception:
+                pass
         self._graphs_captured = True
 
     def dispatch(

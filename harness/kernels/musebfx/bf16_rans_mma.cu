@@ -25,8 +25,9 @@ constexpr uint32_t kGB = 512u;
 constexpr uint32_t kRG = 4u;
 constexpr uint32_t kRB = kGB * kRG;  // 2048 B per warp
 constexpr uint32_t kMaxSmem = 99u * 1024u;
-constexpr uint32_t kBrXStrideU4 = 68u;                       // 16 rows * 4 uint4 + 4 pad -> 0 bank conflicts on write & read
-constexpr uint32_t kBrXsmemBytes = 2u * 16u * kBrXStrideU4 * 16u;  // 34,816 B (2 buffers x 16 K-steps)
+constexpr uint32_t kBrXRowU4 = 64u;                          // 16 K-steps * 4 uint4/step = 1024 B/row (128B XOR swizzled)
+constexpr uint32_t kBrXsmemBytes = 2u * 16u * kBrXRowU4 * 16u;    // 32,768 B (2 buffers x 16 rows x 16 K-steps)
+constexpr uint32_t kBrXsmemBytesM8 = 2u * 8u * kBrXRowU4 * 16u;   // 16,384 B (2 buffers x 8 rows x 16 K-steps)
 
 __device__ __forceinline__ void bf16_mma_m16n8k16(
     float& d0, float& d1, float& d2, float& d3,
@@ -90,6 +91,29 @@ __device__ __forceinline__ void br_xpose4(
   o1 = t2 ? r1 : p1;
   o2 = t2 ? p2 : r0;
   o3 = t2 ? p3 : r1;
+}
+
+__device__ __forceinline__ void br_ldsm4_x16(
+    uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3,
+    uint32_t buf_base_b, int c_base, int lane) {
+  const int m_row = lane & 15;
+  const int c_log = c_base | (lane >> 4);
+  const int c_phys = c_log ^ (m_row & 7);
+  const uint32_t addr = buf_base_b + static_cast<uint32_t>(((m_row << 6) + c_phys) << 4);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+               : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+               : "r"(addr));
+}
+
+__device__ __forceinline__ void br_ldsm2_x8(
+    uint32_t& a0, uint32_t& a2, uint32_t buf_base_b, int c_base, int lane) {
+  const int m_row = lane & 7;
+  const int c_log = c_base | ((lane >> 3) & 1);
+  const int c_phys = c_log ^ m_row;
+  const uint32_t addr = buf_base_b + static_cast<uint32_t>(((m_row << 6) + c_phys) << 4);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+               : "=r"(a0), "=r"(a2)
+               : "r"(addr));
 }
 
 __device__ __forceinline__ size_t br_phys_off(const int* __restrict__ woff16, int tw, int gmin, int w, uint32_t lb) {
@@ -457,8 +481,11 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
   const int K = pb.K;
   const int S = K >> 5;
 
+  constexpr uint32_t kXRows = kM16 ? 16u : 8u;
+  constexpr uint32_t kXBufU4 = kXRows * kBrXRowU4;
+  constexpr uint32_t kXBytes = 2u * kXBufU4 * 16u;
   uint4* const x_smem_u4 = reinterpret_cast<uint4*>(smem);
-  const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(smem)) + (kXsmem ? kBrXsmemBytes : 0u);
+  const uint32_t sbase0 = static_cast<uint32_t>(__cvta_generic_to_shared(smem)) + (kXsmem ? kXBytes : 0u);
   const uint32_t ring_s = ((sbase0 + kRB - 1u) & ~(kRB - 1u)) + static_cast<uint32_t>(wib) * kRB;
 
   const int q_w = pb.tw / gridDim.x;
@@ -543,41 +570,48 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
   const bool xsmem_async = (pb.xsmem_async != 0);
   auto load_x_chunk_sync = [&](int buf, int s_base) {
     const int total_u4 = 64 * pb.M;
-    const uint32_t buf_u4 = static_cast<uint32_t>(buf * 16) * kBrXStrideU4;
+    const uint32_t buf_u4 = static_cast<uint32_t>(buf) * kXBufU4;
     for (int base_i = tid; base_i < total_u4; base_i += 3 * static_cast<int>(blockDim.x)) {
       const int i0 = base_i;
       const int i1 = base_i + static_cast<int>(blockDim.x);
       const int i2 = base_i + 2 * static_cast<int>(blockDim.x);
-      const int m0 = i0 >> 6, sl0 = (i0 >> 2) & 15, u0 = i0 & 3;
-      const uint4 v0 = __ldg(reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(m0) * K) + 4 * (s_base + sl0) + u0);
+      const int m0 = i0 >> 6, c0_l = i0 & 63;
+      const uint4 v0 = __ldg(reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(m0) * K) + ((s_base << 2) + c0_l));
       uint4 v1 = make_uint4(0u, 0u, 0u, 0u), v2 = make_uint4(0u, 0u, 0u, 0u);
-      int m1 = 0, sl1 = 0, u1 = 0, m2 = 0, sl2 = 0, u2 = 0;
+      int m1 = 0, c1_l = 0, m2 = 0, c2_l = 0;
       if (i1 < total_u4) {
-        m1 = i1 >> 6; sl1 = (i1 >> 2) & 15; u1 = i1 & 3;
-        v1 = __ldg(reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(m1) * K) + 4 * (s_base + sl1) + u1);
+        m1 = i1 >> 6; c1_l = i1 & 63;
+        v1 = __ldg(reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(m1) * K) + ((s_base << 2) + c1_l));
       }
       if (i2 < total_u4) {
-        m2 = i2 >> 6; sl2 = (i2 >> 2) & 15; u2 = i2 & 3;
-        v2 = __ldg(reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(m2) * K) + 4 * (s_base + sl2) + u2);
+        m2 = i2 >> 6; c2_l = i2 & 63;
+        v2 = __ldg(reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(m2) * K) + ((s_base << 2) + c2_l));
       }
-      x_smem_u4[buf_u4 + static_cast<uint32_t>(sl0) * kBrXStrideU4 + static_cast<uint32_t>(m0 * 4 + u0)] = v0;
-      if (i1 < total_u4) x_smem_u4[buf_u4 + static_cast<uint32_t>(sl1) * kBrXStrideU4 + static_cast<uint32_t>(m1 * 4 + u1)] = v1;
-      if (i2 < total_u4) x_smem_u4[buf_u4 + static_cast<uint32_t>(sl2) * kBrXStrideU4 + static_cast<uint32_t>(m2 * 4 + u2)] = v2;
+      x_smem_u4[buf_u4 + static_cast<uint32_t>((m0 << 6) + (c0_l ^ (m0 & 7)))] = v0;
+      if (i1 < total_u4) x_smem_u4[buf_u4 + static_cast<uint32_t>((m1 << 6) + (c1_l ^ (m1 & 7)))] = v1;
+      if (i2 < total_u4) x_smem_u4[buf_u4 + static_cast<uint32_t>((m2 << 6) + (c2_l ^ (m2 & 7)))] = v2;
     }
   };
   auto load_x_chunk_async = [&](int buf, int s_base) {
     const int total_u4 = 64 * pb.M;
-    const uint32_t buf_b = x_smem_base + static_cast<uint32_t>(buf * 16) * (kBrXStrideU4 * 16u);
+    const uint32_t buf_b = x_smem_base + static_cast<uint32_t>(buf) * (kXBufU4 * 16u);
     for (int idx = tid; idx < total_u4; idx += blockDim.x) {
       const int m = idx >> 6;
-      const int sl = (idx >> 2) & 15;
-      const int u = idx & 3;
-      const uint32_t dst = buf_b + (static_cast<uint32_t>(sl) * kBrXStrideU4 + static_cast<uint32_t>(m * 4 + u)) * 16u;
-      const uint4* src = reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(m) * K) + 4 * (s_base + sl) + u;
+      const int c_l = idx & 63;
+      const uint32_t dst = buf_b + static_cast<uint32_t>(((m << 6) + (c_l ^ (m & 7))) << 4);
+      const uint4* src = reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(m) * K) + ((s_base << 2) + c_l);
       br_cp_async16_ca(dst, src);
     }
   };
   if constexpr (kXsmem && kPar4) {
+    if (static_cast<uint32_t>(pb.M) < kXRows) {
+      const int pad_u4 = static_cast<int>(kXRows - static_cast<uint32_t>(pb.M)) << 6;
+      const uint32_t base_m = static_cast<uint32_t>(pb.M) << 6;
+      for (int idx = tid; idx < pad_u4; idx += blockDim.x) {
+        x_smem_u4[base_m + static_cast<uint32_t>(idx)] = make_uint4(0u, 0u, 0u, 0u);
+        x_smem_u4[kXBufU4 + base_m + static_cast<uint32_t>(idx)] = make_uint4(0u, 0u, 0u, 0u);
+      }
+    }
     // Overlap chunk-0 activation load with in-flight sh_lut & kRG-1 weight cp.asyncs;
     // synced together by the single __syncthreads() below.
     if (xsmem_async) {
@@ -684,13 +718,18 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
               } while (issued <= curg + static_cast<int>(kRG) - 1);
             }
             // Pre-issue 1 (or 2 for kM16) vectorized uint4 activation loads (SMEM or L1/L2) + 4 LUT loads.
+            uint32_t a0 = 0u, a1 = 0u, a2 = 0u, a3 = 0u, a4 = 0u, a5 = 0u, a6 = 0u, a7 = 0u;
             uint4 v_lo = make_uint4(0u, 0u, 0u, 0u);
             uint4 v_hi = make_uint4(0u, 0u, 0u, 0u);
             if constexpr (kXsmem) {
-              const uint32_t xbase = (cur_buf * 16 + (s - cs)) * kBrXStrideU4;
-              if (valid_m) v_lo = x_smem_u4[xbase + g * 4 + t];
+              const uint32_t buf_b = x_smem_base + static_cast<uint32_t>(cur_buf) * (kXBufU4 * 16u);
+              const int c_base = (s - cs) << 2;
               if constexpr (kM16) {
-                if (valid_m_hi) v_hi = x_smem_u4[xbase + (g + 8) * 4 + t];
+                br_ldsm4_x16(a0, a1, a2, a3, buf_b, c_base, lane);
+                br_ldsm4_x16(a4, a5, a6, a7, buf_b, c_base | 2, lane);
+              } else {
+                br_ldsm2_x8(a0, a2, buf_b, c_base, lane);
+                br_ldsm2_x8(a4, a6, buf_b, c_base | 2, lane);
               }
             } else {
               if (valid_m) v_lo = __ldg(xrow_u4 + 4 * s);
@@ -756,11 +795,11 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
             uint32_t e6 = c6_ ? (base_m1 + c6_) : 0u;
             uint32_t e7 = c7_ ? (base_m1 + c7_) : 0u;
 
-            uint32_t a0, a2, a4, a6;
-            br_xpose4(v_lo, t, a0, a2, a4, a6);
-            uint32_t a1 = 0u, a3 = 0u, a5 = 0u, a7 = 0u;
-            if constexpr (kM16) {
-              br_xpose4(v_hi, t, a1, a3, a5, a7);
+            if constexpr (!kXsmem) {
+              br_xpose4(v_lo, t, a0, a2, a4, a6);
+              if constexpr (kM16) {
+                br_xpose4(v_hi, t, a1, a3, a5, a7);
+              }
             }
 
             // Wait for weight ring group right before issuing sm_w0/sm_w1 and r0..r3 LDS in parallel.
@@ -1108,6 +1147,8 @@ static void br_set_attrs_once() {
   cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
   cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(kMaxSmem - kLutBytes));
+  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(kMaxSmem - kLutBytes));
   cudaFuncSetAttribute(br_pair_mma_gemm_kernel<false, true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(kMaxSmem - kLutBytes));
   cudaThreadExchangeStreamCaptureMode(&mode);
@@ -1327,7 +1368,15 @@ static void bf16_rans_gemm_launch(
   TORCH_CHECK(M >= 1 && M <= 16 && x.size(1) == K && N % 8 == 0 && K % 32 == 0, "bad shape");
   TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "bad blob");
 
-  const BrCfg cfg = br_pick_cfg(static_cast<int>(N), static_cast<int>(K));
+  BrCfg cfg = br_pick_cfg(static_cast<int>(N), static_cast<int>(K));
+  static const bool gate_m48 = []() {
+    const char* env = std::getenv("MUSE_BF16_GATE_M48");
+    return env && *env && std::strtol(env, nullptr, 10) != 0;
+  }();
+  if (gate_m48 && M > 1 && N == 4096 && K == 6656 && out2_ptr == nullptr && cfg.tw == 512) {
+    cfg.blocks = 48;
+    cfg.wpb = 11;  // 32 CTAs x 11 warps + 16 CTAs x 10 warps = 512 warps (0-repack!)
+  }
   const size_t soff = br_stream_off(cfg.tw);
   const size_t blob_bytes = static_cast<size_t>(blob.numel());
   const uint8_t* b = reinterpret_cast<const uint8_t*>(blob.data_ptr());
@@ -1348,7 +1397,8 @@ static void bf16_rans_gemm_launch(
   pb.nb_split = static_cast<int>(N1 >> 3);
   pb.tw = cfg.tw;
   const int pdl_cfg = br_pdl_cfg();
-  pb.pdl_mode = (pdl_cfg == 2) ? 3 : ((pdl_cfg == 1) ? 1 : 0);
+  const bool side_gate = (N == 4096 && K == 6656 && out2_ptr == nullptr);
+  pb.pdl_mode = (pdl_cfg == 2) ? (side_gate ? 1 : 3) : ((pdl_cfg == 1) ? 1 : 0);
   static const bool xsmem_async_en = []() {
     const char* env = std::getenv("MUSE_BF16_RANS_XSMEM_ASYNC");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
@@ -1361,7 +1411,7 @@ static void bf16_rans_gemm_launch(
   TORCH_CHECK(cfg.wpb <= 20, "bf16_rans_gemm_launch: wpb exceeds launch bounds (20)");
   size_t dsmem = kRB + static_cast<size_t>(cfg.wpb) * kRB;
   if (cfg.blocks == 48 && dsmem < 40960u) dsmem = 40960u;
-  const size_t dsmem_xsmem = kBrXsmemBytes + kRB + static_cast<size_t>(cfg.wpb) * kRB;
+  const size_t dsmem_xsmem = ((M > 8) ? kBrXsmemBytes : kBrXsmemBytesM8) + kRB + static_cast<size_t>(cfg.wpb) * kRB;
   br_set_attrs_once();
 
   static const bool par4_en = []() {
@@ -1371,6 +1421,11 @@ static void bf16_rans_gemm_launch(
   static const bool xsmem_en = []() {
     const char* env = std::getenv("MUSE_BF16_RANS_XSMEM");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  static const int m8_min_m = []() -> int {
+    const char* env = std::getenv("MUSE_BF16_RANS_M8_MIN_M");
+    if (!env || !*env) return 2;
+    return static_cast<int>(std::strtol(env, nullptr, 10));
   }();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const bool x_aligned16 = ((reinterpret_cast<uintptr_t>(pb.x) & 15u) == 0u);
@@ -1383,6 +1438,9 @@ static void bf16_rans_gemm_launch(
       } else {
         br_launch_k<false, true, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
       }
+    } else if (M >= m8_min_m && xsmem_en && ((K >> 5) % 16 == 0) &&
+               dsmem_xsmem <= static_cast<size_t>(kMaxSmem - kLutBytes)) {
+      br_launch_k<true, false, true>(cfg.blocks, cfg.wpb * 32, dsmem_xsmem, st, pb);
     } else if (dsmem <= 48u * 1024u) {
       br_launch_k<true, false, false>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
     } else {
