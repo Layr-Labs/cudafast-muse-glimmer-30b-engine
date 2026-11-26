@@ -23,11 +23,13 @@ SMS = 48
 ENABLED = os.environ.get("MARLIN_DOWN128", "1") == "1"
 ATTN_ENABLED = os.environ.get("MARLIN_ATTN128", "1") == "1"
 _ALL_ATTN_SHAPES = {(4608, 6656): "qkv", (6656, 4096): "o_proj", (4096, 6656): "gate"}
-_raw_attn_shapes = os.environ.get("MARLIN_ATTN128_SHAPES", "qkv,o_proj,gate")
+_raw_attn_shapes = os.environ.get("MARLIN_ATTN128_SHAPES", "qkv,o_proj")
 _enabled_attn = set() if _raw_attn_shapes in ("", "0") else set(_raw_attn_shapes.split(","))
 ATTN_SHAPES = {k: v for k, v in _ALL_ATTN_SHAPES.items() if v in _enabled_attn}
 ATTN_TMA_ENABLED = ATTN_ENABLED and os.environ.get("MARLIN_ATTN_TMA", "1") == "1"
 TMA_SHFL_EPI = os.environ.get("MARLIN_TMA_SHFL_EPI", "0") != "0"
+TMA_ATTN_SHFL_EPI = os.environ.get("MARLIN_TMA_ATTN_SHFL_EPI", "1") != "0"
+_cur_shfl_epi: int | None = None
 _DEFAULT_TAIL = {(6656, 19968): 16, (4608, 6656): 0, (4096, 6656): 8, (6656, 4096): 16}
 _plans: dict = {}
 _scratch_cache: dict[tuple[int, int], torch.Tensor] = {}
@@ -73,7 +75,8 @@ if TMA_ENABLED or ATTN_TMA_ENABLED:
         if _tma_set_shfl_epi is not None:
             _tma_set_shfl_epi.argtypes = [ctypes.c_int]
             _tma_set_shfl_epi.restype = None
-            _tma_set_shfl_epi(1 if TMA_SHFL_EPI else 0)
+            _cur_shfl_epi = 1 if TMA_SHFL_EPI else 0
+            _tma_set_shfl_epi(_cur_shfl_epi)
         _tma_set_pdl = getattr(_tma_library, "marlinw_tma_set_pdl", None)
         if _tma_set_pdl is not None:
             _tma_set_pdl.argtypes = [ctypes.c_int]
@@ -385,12 +388,21 @@ def gemm(x, weight, scales, global_scale, p: Prepared, tma: bool = False):
     stream = torch.cuda.current_stream(x.device).cuda_stream
     with torch.cuda.device(x.device):
         if tma:
+            global _cur_shfl_epi
             if (p.n, p.k) == (COLUMNS, INNER):
+                want_shfl = 1 if TMA_SHFL_EPI else 0
+                if _tma_set_shfl_epi is not None and _cur_shfl_epi != want_shfl:
+                    _tma_set_shfl_epi(want_shfl)
+                    _cur_shfl_epi = want_shfl
                 status = _tma_main(
                     x.data_ptr(), weight.data_ptr(), out.data_ptr(), scratch.data_ptr(),
                     scales.data_ptr(), global_scale.data_ptr(), p.tma_work.data_ptr(), p.tma_grid,
                     x.stride(0), stream)
             else:
+                want_shfl = 1 if (TMA_SHFL_EPI or TMA_ATTN_SHFL_EPI) else 0
+                if _tma_set_shfl_epi is not None and _cur_shfl_epi != want_shfl:
+                    _tma_set_shfl_epi(want_shfl)
+                    _cur_shfl_epi = want_shfl
                 status = _tma_shape_main(
                     x.data_ptr(), weight.data_ptr(), out.data_ptr(), scratch.data_ptr(),
                     scales.data_ptr(), global_scale.data_ptr(), p.tma_work.data_ptr(), p.tma_grid,

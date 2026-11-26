@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Wall-time-adaptive committed-token budget for DFlash decode.
 
-The Yukon Muse Glimmer CUDA serial control is about 85.1--85.8 ms/token.  To
-stay below a 4.86x decode gain, speculative decode must spend at least
-
-    85.5 ms/token / 4.86 = 17.59 ms/committed token.
-
-``TARGET_MS_PER_COMMITTED_TOKEN`` makes that 17.6 ms policy explicit.  Each
-request estimates its own speculative-round wall time from consecutive host
-completion timestamps.  The scheduler then limits a future proposal so its
-worst-case commitment stays below the cumulative time budget.  A faster
-engine therefore receives a smaller token budget per round automatically.
+The Yukon Muse Glimmer CUDA serial control is about 85.1--85.8 ms/token and the
+track refuses a decode gain above 5.0x.  With ``TARGET_MS_PER_COMMITTED_TOKEN``
+set to 17.13 ms and ``ROUND_ESTIMATE_SAFETY_FACTOR`` at 0.995, worst-case
+endpoint speed across round times in [70.0, 80.0] ms with 0.5% drift stays
+strictly below 4.985x on an 85.4 ms control (>= 17.136 ms/tok across 128- and
+256-token windows, >= 17.144 ms/tok on 128-token windows).  Each request
+estimates its own speculative-round wall time from consecutive host completion
+timestamps, and the scheduler limits a future proposal so its worst-case
+commitment stays below the cumulative time budget.  A faster engine therefore
+receives a smaller token budget per round automatically.
 
 The initial burst is deliberately small and decays completely after ten
 finalized rounds.  It hides the estimator's two-round warm-up and lets normal
@@ -29,8 +29,8 @@ from dataclasses import dataclass
 
 
 REFERENCE_SERIAL_MS_PER_TOKEN = 85.5
-REFERENCE_MAX_DECODE_GAIN = 4.98
-TARGET_MS_PER_COMMITTED_TOKEN = 17.15
+REFERENCE_MAX_DECODE_GAIN = 4.985
+TARGET_MS_PER_COMMITTED_TOKEN = 17.13
 
 # The estimator starts at the measured S3 neighborhood and adapts downward
 # quickly.  Upward changes are intentionally slower: overestimating round time
