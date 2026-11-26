@@ -55,7 +55,7 @@ __constant__ float kCalC[6] = {0.000000f, -0.402942f, -0.763639f, -0.817452f, -1
 //   - Bit-packed remap inside int32[49] (1 + 16*3):
 //       leaf_flag[1 + 3*r + 0] = seq_sub  (seqlen_k_eff = seqlen_k - seq_sub)
 //       leaf_flag[1 + 3*r + 1] = base_sub (-1 for causal rows; else tree_m - k0 of root ancestor)
-//       leaf_flag[1 + 3*r + 2] = remap_packed (nibble j = physical row r_j in 0..15 for tok = p + k0 + j, j=0..5)
+//       leaf_flag[1 + 3*r + 2] = remap_packed (5-bit field j = physical row r_j in 0..31 for tok = p + k0 + j, j=0..5)
 //   - dynamic_mode==1 (default, tree_vals!=null, tree_k>=6): greedy EV allocator across 30 1-level candidates
 //     plus dynamically spawned arbitrary-depth (2..max_depth <= 6) zero-extra-drafter children:
 //       - Substitution continuation (`sub`, kind=1): aligned d_{k+1}#1 -> d_{k+2}#1 -> ... -> d_6#1
@@ -119,29 +119,29 @@ __global__ void native_leaf_setup_tree_kernel(
     if (tid == 0) {
       constexpr int kLeafK[9] = {1, 1, 2, 2, 3, 1, 3, 4, 5};
       constexpr int kLeafRank[9] = {1, 2, 1, 2, 1, 3, 2, 1, 1};
-      int row_base_sub[16];
-      int row_depth[16];
-      uint32_t row_packed[16];
+      int row_base_sub[32];
+      int row_depth[32];
+      uint32_t row_packed[32];
       bool any_active = false;
       for (int li = 0; li < num_leaves; ++li) {
         const int r = 7 + li;
-        int k = kLeafK[li];
+        int k = (li < 9) ? kLeafK[li] : 1;
         int par = -1;
         int64_t cand = -1;
         bool valid = false;
         if (!high_acc) {
           if (selftest_mode != 0) {
-            // Deep chain selftest: rows 7..12 mirror d1..d6 (depth 1..6), rows 13..15 mirror d1..d3 (depth 1).
+            // Deep chain selftest: rows 7..12 mirror d1..d6 (depth 1..6), rows 13.. mirror d1..d6 (depth 1) cyclically.
             if (li < 6) {
               k = li + 1;
               par = (li == 0) ? -1 : (r - 1);
             } else {
-              k = (li - 6) + 1;
+              k = ((li - 6) % 6) + 1;
               par = -1;
             }
             cand = static_cast<int64_t>(input_ids[k]);
             valid = true;
-          } else {
+          } else if (li < 9) {
             const int rank = kLeafRank[li];
             const int64_t dk = static_cast<int64_t>(input_ids[k]);
             const int64_t top1 = tree_top[(k - 1) * tree_k + 0];
@@ -157,11 +157,11 @@ __global__ void native_leaf_setup_tree_kernel(
           if (par < 0) {
             b_sub = tree_m - k;
             dp = 1;
-            pkd = static_cast<uint32_t>(r) & 0xFu;
+            pkd = static_cast<uint32_t>(r) & 0x1Fu;
           } else {
             b_sub = row_base_sub[par];
             dp = row_depth[par] + 1;
-            pkd = row_packed[par] | ((static_cast<uint32_t>(r) & 0xFu) << (4 * (dp - 1)));
+            pkd = row_packed[par] | ((static_cast<uint32_t>(r) & 0x1Fu) << (5 * (dp - 1)));
           }
           row_base_sub[r] = b_sub;
           row_depth[r] = dp;
@@ -217,8 +217,8 @@ __global__ void native_leaf_setup_tree_kernel(
   __shared__ int8_t s_cand_kind[64];  // 0=1-level, 1=sub-continuation, 2=shift-continuation, 3=alt2-continuation
   __shared__ int s_num_cands;
 
-  __shared__ int s_row_base_sub[16];
-  __shared__ uint32_t s_row_packed[16];
+  __shared__ int s_row_base_sub[32];
+  __shared__ uint32_t s_row_packed[32];
 
   // Pass 1: validate rows & gather per-position top-1 margin z0 - z1 for step-level difficulty context.
   if (tid < 6) {
@@ -393,10 +393,10 @@ __global__ void native_leaf_setup_tree_kernel(
         uint32_t pkd = 0u;
         if (par < 0) {
           b_sub = tree_m - k_r;
-          pkd = static_cast<uint32_t>(r) & 0xFu;
+          pkd = static_cast<uint32_t>(r) & 0x1Fu;
         } else {
           b_sub = s_row_base_sub[par];
-          pkd = s_row_packed[par] | ((static_cast<uint32_t>(r) & 0xFu) << (4 * (dp - 1)));
+          pkd = s_row_packed[par] | ((static_cast<uint32_t>(r) & 0x1Fu) << (5 * (dp - 1)));
         }
         s_row_base_sub[r] = b_sub;
         s_row_packed[r] = pkd;
@@ -900,7 +900,7 @@ void native_leaf_prepare_tree(
     torch::Tensor positions,
     torch::Tensor seq_lens,
     int64_t tree_m) {
-  TORCH_CHECK(tree_m >= 8 && tree_m <= 16, "tree_m must be in 8..16");
+  TORCH_CHECK(tree_m >= 8 && tree_m <= 32, "tree_m must be in 8..32");
   TORCH_CHECK(positions.is_cuda() && positions.scalar_type() == torch::kInt64 && positions.numel() >= tree_m);
   TORCH_CHECK(seq_lens.is_cuda() && seq_lens.scalar_type() == torch::kInt32 && seq_lens.numel() >= 1);
   auto st = c10::cuda::getCurrentCUDAStream().stream();
@@ -930,7 +930,7 @@ void native_leaf_setup_tree(
     double sub_coef,
     double shf_coef,
     double cont_decay) {
-  TORCH_CHECK(tree_m >= 8 && tree_m <= 16, "tree_m must be in 8..16");
+  TORCH_CHECK(tree_m >= 8 && tree_m <= 32, "tree_m must be in 8..32");
   TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32 && leaf_flag.numel() >= 1 + tree_m * 3);
   TORCH_CHECK(tree_top.is_cuda() && tree_top.scalar_type() == torch::kInt64 && tree_top.numel() >= 20);
   TORCH_CHECK(input_ids.is_cuda() && input_ids.scalar_type() == torch::kInt32 && input_ids.numel() >= tree_m);
@@ -1013,7 +1013,7 @@ void native_leaf_commit_tree(
     bool no_hit_mode,
     c10::optional<torch::Tensor> req_acc_state,
     c10::optional<torch::Tensor> saved_leaf_parent) {
-  TORCH_CHECK(tree_m >= 8 && tree_m <= 16, "tree_m must be in 8..16");
+  TORCH_CHECK(tree_m >= 8 && tree_m <= 32, "tree_m must be in 8..32");
   TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32);
   TORCH_CHECK(prev_ns.is_cuda() && prev_ns.scalar_type() == torch::kInt32);
   TORCH_CHECK(hit_flag.is_cuda() && hit_flag.scalar_type() == torch::kInt32 && hit_flag.numel() >= 1);

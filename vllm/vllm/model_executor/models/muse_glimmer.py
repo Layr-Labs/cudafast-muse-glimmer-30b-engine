@@ -1197,7 +1197,7 @@ class _GateSideStream:
 
     def __init__(self) -> None:
         self.max_tokens = int(
-            os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "16")
+            os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "32")
         )
         self.stream: torch.cuda.Stream | None = None
         self.fork_event: torch.cuda.Event | None = None
@@ -1252,7 +1252,7 @@ class _GateSideStream:
             if x.shape[0] == 1:
                 if getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
                     return
-            elif 2 <= x.shape[0] <= 16:
+            elif 2 <= x.shape[0] <= 32:
                 if layer_idx in _BF16_DUAL_RANS_M_LAYERS:
                     return
                 if getattr(bf16_gate, "muse_bf16_rans_m", None) is None:
@@ -1526,7 +1526,7 @@ def _muse_bf16_qkv_or_stacked_impl(
         out = torch.mm(x, w_cat.t())
         return out[:, :4608].contiguous(), out[:, 4608:].contiguous()
     if (
-        2 <= x.shape[0] <= 16
+        2 <= x.shape[0] <= 32
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16
@@ -1587,7 +1587,7 @@ def _muse_bf16_gate_fill_impl(
             if rc == 0:
                 return
     if (
-        2 <= x.shape[0] <= 16
+        2 <= x.shape[0] <= 32
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16
@@ -2589,7 +2589,7 @@ class MuseGlimmerForCausalLM(
                                                 ok_dual = False
                                                 break
                                     if ok_dual:
-                                        for cm in (12, 16):
+                                        for cm in (12, 16, 17, 24, 32):
                                             xm = (
                                                 torch.randn((cm, 6656), generator=g2, device=qw.device)
                                                 * 1.5
@@ -2598,7 +2598,7 @@ class MuseGlimmerForCausalLM(
                                                 xm, blob_cat, 4608, 4096, 6656, bexp_cat
                                             )
                                             rq0, rg0 = _bfx.rans_gemm_dual(
-                                                xm[:8].contiguous(),
+                                                xm[: (8 if cm <= 16 else 16)].contiguous(),
                                                 blob_cat,
                                                 4608,
                                                 4096,
@@ -2606,7 +2606,7 @@ class MuseGlimmerForCausalLM(
                                                 bexp_cat,
                                             )
                                             rq1, rg1 = _bfx.rans_gemm_dual(
-                                                xm[8:].contiguous(),
+                                                xm[(8 if cm <= 16 else 16):].contiguous(),
                                                 blob_cat,
                                                 4608,
                                                 4096,
@@ -2614,10 +2614,10 @@ class MuseGlimmerForCausalLM(
                                                 bexp_cat,
                                             )
                                             if not (
-                                                torch.equal(gq[:8].view(torch.int16), rq0.view(torch.int16))
-                                                and torch.equal(gq[8:].view(torch.int16), rq1.view(torch.int16))
-                                                and torch.equal(gg[:8].view(torch.int16), rg0.view(torch.int16))
-                                                and torch.equal(gg[8:].view(torch.int16), rg1.view(torch.int16))
+                                                torch.equal(gq[: rq0.shape[0]].view(torch.int16), rq0.view(torch.int16))
+                                                and torch.equal(gq[rq0.shape[0]:].view(torch.int16), rq1.view(torch.int16))
+                                                and torch.equal(gg[: rg0.shape[0]].view(torch.int16), rg0.view(torch.int16))
+                                                and torch.equal(gg[rg0.shape[0]:].view(torch.int16), rg1.view(torch.int16))
                                             ):
                                                 ok_dual = False
                                                 break

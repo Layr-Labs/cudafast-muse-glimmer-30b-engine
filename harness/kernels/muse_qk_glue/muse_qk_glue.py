@@ -78,6 +78,16 @@ MULTI_MIN_TOKENS = 64
 DECODE_HPW = int(os.environ.get("MUSE_QK_DECODE_HPW", "2"))
 DECODE_KV_HPW = int(os.environ.get("MUSE_QK_DECODE_KV_HPW", "6"))
 PREFILL_KV_HPW = int(os.environ.get("MUSE_QK_PREFILL_KV_HPW", "6"))
+# Wide tree verify (17..32 rows): 9 heads per warp measured -0.20 ms/round in situ at M=32 (glimmer-28).
+WIDE_KV_HPW = int(os.environ.get("MUSE_QK_WIDE_KV_HPW", "9"))
+
+
+def _kv_hpw(num_tokens: int) -> int:
+    if num_tokens <= 16:
+        return DECODE_KV_HPW
+    if num_tokens <= 32:
+        return WIDE_KV_HPW
+    return PREFILL_KV_HPW
 FUSE_KVCACHE = os.environ.get("MUSE_QK_FUSE_KVCACHE", "1").strip() not in ("0", "", "false", "no")
 FUSE_KVCACHE_PREFILL = FUSE_KVCACHE and os.environ.get("MUSE_QK_FUSE_KVCACHE_PREFILL", "1").strip() not in ("0", "", "false", "no")
 _multi_state: dict[str, bool | None] = {"admitted": None}
@@ -241,11 +251,11 @@ def self_check(device: torch.device) -> bool:
             _kv_m1_state["admitted"] = kvok
             logger.info("muse_qk_glue: M=1 fused QK-norm+RoPE+KV-cache kernel %s", "admitted" if kvok else "REJECTED")
         if ok and _kv_prefill is not None and FUSE_KVCACHE_PREFILL and _kv_prefill_state["admitted"] is None:
-            pkvok = PREFILL_KV_HPW in (2, 4, 5, 6, 9) and DECODE_KV_HPW in (2, 4, 5, 6, 9)
+            pkvok = PREFILL_KV_HPW in (2, 4, 5, 6, 9) and DECODE_KV_HPW in (2, 4, 5, 6, 9) and WIDE_KV_HPW in (2, 4, 5, 6, 9)
             stream = torch.cuda.current_stream(device).cuda_stream
             if pkvok:
-                for m_p in (16, 512):
-                    hpw_p = DECODE_KV_HPW if m_p <= 16 else PREFILL_KV_HPW
+                for m_p in (16, 32, 512):
+                    hpw_p = _kv_hpw(m_p)
                     pos_p = torch.arange(m_p, dtype=torch.int64, device=device) % int(cache.shape[0])
                     for layout in ("NHD", "HND"):
                         for block_size in (16, 32):
@@ -552,7 +562,7 @@ def run_qk_norm_rope_kvcache_prefill(
     q_out = qkv.new_empty((num_tokens, 4096))
     k_out = qkv.new_empty((num_tokens, 256))
 
-    hpw = DECODE_KV_HPW if num_tokens <= 16 else PREFILL_KV_HPW
+    hpw = _kv_hpw(num_tokens)
     with torch.cuda.device(qkv.device):
         stream = torch.cuda.current_stream(qkv.device).cuda_stream
         st = _kv_prefill(

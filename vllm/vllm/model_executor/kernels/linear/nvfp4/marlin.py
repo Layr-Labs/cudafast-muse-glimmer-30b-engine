@@ -236,7 +236,7 @@ def _marlin_fp4_single(
     decode_fixed_grid: bool = False,
 ) -> torch.Tensor:
     if (
-        1 <= x.shape[0] <= 16
+        1 <= x.shape[0] <= 32
         and x.dtype == torch.bfloat16
         and decode_weight is not None
         and decode_scales is not None
@@ -252,6 +252,38 @@ def _marlin_fp4_single(
             return torch.ops.vllm.marlin_tiled_decode.default(
                 x, decode_weight, decode_scales, weight_global_scale, workspace, size_n, size_k
             )
+    if (
+        16 < x.shape[0] <= 32
+        and x.ndim == 2
+        and x.dtype == torch.bfloat16
+        and decode_weight is not None
+    ):
+        # Wide tree verify (M=17..32) on a layer that runs stock Marlin at M=16 (not TMA4-ILV admitted):
+        # stock Marlin picks a different M-tile/reduction for M>16, so its rows would not match the M=16
+        # rows bit for bit. Run it as two exact 16-row calls (the second half zero-padded to 16 rows) so
+        # rows 0..15 are the record's M=16 rows and rows 16.. use the same 16-row arithmetic.
+        lo = apply_fp4_marlin_linear(
+            input=x[:16].contiguous(),
+            weight=weight,
+            weight_scale=weight_scale,
+            weight_global_scale=weight_global_scale,
+            workspace=workspace,
+            size_n=size_n,
+            size_k=size_k,
+        )
+        rest = x[16:]
+        hi_in = rest.new_zeros((16, x.shape[1]))
+        hi_in[: rest.shape[0]].copy_(rest)
+        hi = apply_fp4_marlin_linear(
+            input=hi_in,
+            weight=weight,
+            weight_scale=weight_scale,
+            weight_global_scale=weight_global_scale,
+            workspace=workspace,
+            size_n=size_n,
+            size_k=size_k,
+        )
+        return torch.cat((lo, hi[: rest.shape[0]]), dim=0)
     return apply_fp4_marlin_linear(
         input=x,
         weight=weight,

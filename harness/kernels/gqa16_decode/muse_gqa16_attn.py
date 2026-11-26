@@ -106,7 +106,7 @@ def get_leaf_flag(device: torch.device) -> torch.Tensor | None:
     if torch.cuda.is_current_stream_capturing():
         return None
     with torch.inference_mode(False):
-        buf = torch.zeros((49,), dtype=torch.int32, device=device)
+        buf = torch.zeros((97,), dtype=torch.int32, device=device)  # 1 + 3 * 32 rows
     _leaf_flag_bufs[idx] = buf
     return buf
 
@@ -546,12 +546,19 @@ def self_check_verify(device: torch.device) -> bool:
                     (16, ((1, -1), (1, -1), (2, -1), (2, -1), (3, -1), (1, -1), (3, -1), (4, -1), (5, -1))),
                     # Deep 6-level chain (rows 7..12 -> k=1..6) + 3-level branch (rows 13..15 -> k=2..4):
                     (16, ((1, -1), (2, 7), (3, 8), (4, 9), (5, 10), (6, 11), (2, -1), (3, 13), (4, 14))),
+                    # Wide verify (5-bit row fields): 17 1-level leaves, and a 32-row tree whose second 6-level
+                    # chain and 3-level branches sit in rows 19..31 (parents >= 16).
+                    (24, tuple(((i % 6) + 1, -1) for i in range(17))),
+                    (32, ((1, -1), (2, 7), (3, 8), (4, 9), (5, 10), (6, 11))
+                         + tuple(((i % 6) + 1, -1) for i in range(6))
+                         + ((1, -1), (2, 19), (3, 20), (4, 21), (5, 22), (6, 23))
+                         + ((2, -1), (3, 25), (4, 26), (1, -1), (2, 28), (5, -1), (6, -1))),
                 ):
                     if seq_k < tree_m:
                         continue
                     kv_t = kv_l.clone()
                     q_t = (torch.randn((tree_m, 32, 128), generator=gen_l, device=device) * 1.1).to(torch.bfloat16).contiguous()
-                    tbl = [-1] + [0] * 48
+                    tbl = [-1] + [0] * 96  # 1 + 3 * 32 rows
                     for q_i in range(7):
                         tbl[1 + 3 * q_i] = tree_m - 1 - q_i
                         tbl[1 + 3 * q_i + 1] = -1
@@ -570,11 +577,11 @@ def self_check_verify(device: torch.device) -> bool:
                         if par < 0:
                             b_sub = tree_m - lk
                             dp = 1
-                            pkd = r_row & 0xF
+                            pkd = r_row & 0x1F
                         else:
                             b_sub = row_base_sub[par]
                             dp = row_depth[par] + 1
-                            pkd = row_packed[par] | ((r_row & 0xF) << (4 * (dp - 1)))
+                            pkd = row_packed[par] | ((r_row & 0x1F) << (5 * (dp - 1)))
                         row_base_sub[r_row] = b_sub
                         row_depth[r_row] = dp
                         row_packed[r_row] = pkd
@@ -649,7 +656,7 @@ def try_verify_gqa16(
 ) -> bool:
     if not VERIFY_ENABLED or _lib is None or not hasattr(_lib, "muse_gqa16_verify"):
         return False
-    if num_actual_tokens < 2 or num_actual_tokens > 16 or max_num_splits not in (0, 1):
+    if num_actual_tokens < 2 or num_actual_tokens > 32 or max_num_splits not in (0, 1):
         return False
     device = query.device
     idx = device.index if device.index is not None else torch.cuda.current_device()
@@ -704,7 +711,7 @@ def try_verify_gqa16(
     if (
         NATIVE_LEAF_ENABLED
         and g_splits == 1
-        and 7 <= num_actual_tokens <= 16
+        and 7 <= num_actual_tokens <= 32
         and _leaf_verify_admitted.get(idx, False)
         and hasattr(_lib, "muse_gqa16_verify_leaf")
     ):

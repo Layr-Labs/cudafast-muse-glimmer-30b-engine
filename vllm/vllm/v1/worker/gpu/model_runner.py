@@ -418,7 +418,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # for draft steps of 1..max(decode_query_len, 16) tokens, built once here so a
         # step reads it instead of a pin + H2D copy (query_start_loc,
         # cu_num_logits) and an expand kernel. Only read downstream.
-        _n_max = max(self.decode_query_len, 16)
+        _n_max = max(self.decode_query_len, 32)  # tree verify up to M=32
         for _nt in range(1, _n_max + 1):
             if _nt not in self._qsl_const_gpu:
                 self._qsl_const_gpu[_nt] = torch.tensor(
@@ -427,10 +427,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     device=self.device,
                 )
         self._qsl_tree_np = {
-            _tm: np.array([0, _tm], dtype=np.int32) for _tm in (8, 12, 16)
+            _tm: np.array([0, _tm], dtype=np.int32) for _tm in (8, 12, 16, 24, 32)
         }
         self._num_sched_tree_np = {
-            _tm: np.array([_tm], dtype=np.int32) for _tm in (8, 12, 16)
+            _tm: np.array([_tm], dtype=np.int32) for _tm in (8, 12, 16, 24, 32)
         }
         self._spec_cu_logits_np = [
             np.array([0, _n], dtype=np.int32) for _n in range(_n_max + 1)
@@ -1449,7 +1449,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or not self.cudagraph_manager._graphs_captured
             or torch.cuda.is_current_stream_capturing()
             or input_batch.num_reqs != 1
-            or not (1 <= input_batch.num_tokens <= 16)
+            or not (1 <= input_batch.num_tokens <= 32)
             or input_batch.num_tokens_after_padding != input_batch.num_tokens
             or int(input_batch.num_computed_tokens_np[0]) < int(input_batch.prefill_len_np[0])
         ):
@@ -1509,7 +1509,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 and getattr(_me, "is_single_kernel_m1", lambda: False)()
             )
             can_direct_mm = (
-                1 < n_tok <= 16
+                1 < n_tok <= 32
                 and getattr(_me, "is_single_kernel_m", lambda: False)()
             )
             if (

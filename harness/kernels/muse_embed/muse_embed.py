@@ -228,9 +228,9 @@ def _admit_m(model, ids, out, table) -> bool:
     gen = torch.Generator(device=dev)
     gen.manual_seed(20261125)
     cases = []
-    if 1 <= ids.shape[0] <= 16:
+    if 1 <= ids.shape[0] <= 32:
         cases.append(ids.clone())
-    for rows in (2, 7, 12, 16):
+    for rows in (2, 7, 12, 16, 24, 32):
         cases.append(torch.randint(0, table.shape[0], (rows,), generator=gen, device=dev, dtype=ids.dtype))
     for case in cases:
         mine = torch.empty((int(case.shape[0]), width), dtype=torch.bfloat16, device=dev)
@@ -339,7 +339,7 @@ def embed_into(model, ids, out) -> bool:
             state["fused_calls"] += 1
             state["m1_calls"] += 1
             return True
-    if 1 < out.shape[0] <= 16 and ENABLED_MM:
+    if 1 < out.shape[0] <= 32 and ENABLED_MM:
         if state["admitted_mm"] is None and not torch.cuda.is_current_stream_capturing():
             state["admitted_mm"] = _admit_m(model, ids, out, table)
         if state["admitted_mm"] is True:
