@@ -57,8 +57,72 @@ def lib():
             ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_void_p,
         ]
         h.l2pf_set_persisting_window.restype = ctypes.c_int
+    if hasattr(h, "l2pf_set_persisting_limit"):
+        h.l2pf_set_persisting_limit.argtypes = [ctypes.c_size_t]
+        h.l2pf_set_persisting_limit.restype = ctypes.c_int
+    if hasattr(h, "l2pf_get_persisting_info"):
+        h.l2pf_get_persisting_info.argtypes = [
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        h.l2pf_get_persisting_info.restype = ctypes.c_int
+    if hasattr(h, "l2pf_set_stream_window"):
+        h.l2pf_set_stream_window.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_float, ctypes.c_int, ctypes.c_void_p,
+        ]
+        h.l2pf_set_stream_window.restype = ctypes.c_int
+    if hasattr(h, "l2pf_prime_persisting"):
+        h.l2pf_prime_persisting.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        h.l2pf_prime_persisting.restype = ctypes.c_int
     _lib = h
     return h
+
+
+def set_persisting_limit(limit_bytes: int) -> bool:
+    h = lib()
+    if h is None or not hasattr(h, "l2pf_set_persisting_limit"):
+        return False
+    return h.l2pf_set_persisting_limit(int(limit_bytes)) == 0
+
+
+def get_persisting_info() -> tuple[int, int, int, int]:
+    h = lib()
+    if h is None or not hasattr(h, "l2pf_get_persisting_info"):
+        return (0, 0, 0, 0)
+    cur = ctypes.c_size_t(0)
+    mp, mw, l2 = ctypes.c_int(0), ctypes.c_int(0), ctypes.c_int(0)
+    h.l2pf_get_persisting_info(ctypes.byref(cur), ctypes.byref(mp), ctypes.byref(mw), ctypes.byref(l2))
+    return (int(cur.value), int(mp.value), int(mw.value), int(l2.value))
+
+
+def set_stream_window(
+    base_ptr: int,
+    num_bytes: int,
+    stream: torch.cuda.Stream,
+    *,
+    hit_ratio: float = 1.0,
+    miss_streaming: bool = False,
+) -> bool:
+    h = lib()
+    if h is None or not hasattr(h, "l2pf_set_stream_window"):
+        return False
+    rc = h.l2pf_set_stream_window(
+        base_ptr, int(num_bytes), float(hit_ratio), 1 if miss_streaming else 0, stream.cuda_stream
+    )
+    return rc == 0
+
+
+def clear_stream_window(stream: torch.cuda.Stream) -> bool:
+    return set_stream_window(0, 0, stream, hit_ratio=0.0, miss_streaming=False)
+
+
+def prime_persisting(base_ptr: int, num_bytes: int, stream: torch.cuda.Stream) -> bool:
+    h = lib()
+    if h is None or not hasattr(h, "l2pf_prime_persisting"):
+        return False
+    return h.l2pf_prime_persisting(base_ptr, int(num_bytes), stream.cuda_stream) == 0
 
 
 def set_persisting_window(base_ptr: int, num_bytes: int, limit_bytes: int, stream: torch.cuda.Stream) -> bool:
