@@ -415,10 +415,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         # LOCAL PATCH (bs=1 spec-decode host cut): constant one-request metadata
-        # for draft steps of 1..max(decode_query_len, 16) tokens, built once here so a
+        # for draft steps of 1..max(decode_query_len, 24) tokens, built once here so a
         # step reads it instead of a pin + H2D copy (query_start_loc,
         # cu_num_logits) and an expand kernel. Only read downstream.
-        _n_max = max(self.decode_query_len, 16)
+        # Keep M=24 metadata resident even though the current admitted tree is
+        # M=16.  A wider tree must not allocate or H2D-copy this bookkeeping in
+        # its timed loop; it may only be enabled after every target fast kernel
+        # has an exact M=24 admission.
+        _n_max = max(self.decode_query_len, 24)
         for _nt in range(1, _n_max + 1):
             if _nt not in self._qsl_const_gpu:
                 self._qsl_const_gpu[_nt] = torch.tensor(
@@ -427,10 +431,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     device=self.device,
                 )
         self._qsl_tree_np = {
-            _tm: np.array([0, _tm], dtype=np.int32) for _tm in (8, 12, 16)
+            _tm: np.array([0, _tm], dtype=np.int32) for _tm in (8, 12, 16, 24)
         }
         self._num_sched_tree_np = {
-            _tm: np.array([_tm], dtype=np.int32) for _tm in (8, 12, 16)
+            _tm: np.array([_tm], dtype=np.int32) for _tm in (8, 12, 16, 24)
         }
         self._spec_cu_logits_np = [
             np.array([0, _n], dtype=np.int32) for _n in range(_n_max + 1)
@@ -640,6 +644,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
         if self.speculator is not None and _native_leaf.ENABLED:
+            # Decide every lazily-admitted M=24 piece BEFORE the tree width / graph capture: the fused lm_head+lmpost
+            # admission (M<=16 then M=24) normally runs at the first verify sample, too late for arming.
+            try:
+                import muse_marlin6_gemv as _m6_early
+
+                _m6_early.admit_lmhead_m_early(self.model)
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning("early lm_head admission skipped: %r", _exc)
             draft_layers = getattr(self.speculator, "draft_attn_layer_names", None)
             _native_leaf.init_kv_table(
                 kv_caches_dict, self.kv_cache_config, draft_layers, self.device
@@ -2175,7 +2187,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if _leaf_req_id is not None
             else None
         )
-        _target_leaf_m = _native_leaf.active_verify_m()
+        _high_acc_ids = getattr(
+            scheduler_output, "dflash_high_acceptance_req_ids", None
+        )
+        _target_leaf_m = _native_leaf.active_verify_m(
+            bool(_high_acc_ids)
+            and _leaf_req_id is not None
+            and _leaf_req_id in _high_acc_ids
+        )
         extra_leaf_candidate = (
             _target_leaf_m > 7
             and not dummy_run

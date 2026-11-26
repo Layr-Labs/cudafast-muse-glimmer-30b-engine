@@ -508,9 +508,9 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[2],)
         if kind in ("cutlass_fp8", "mm"):
             return (args[1],)
-        if kind == "muse_bf16_lane" and 1 <= args[0].shape[0] <= 16 and args[0].is_contiguous():
+        if kind == "muse_bf16_lane" and 1 <= args[0].shape[0] <= 24 and args[0].is_contiguous():
             return (args[2],)
-        if kind == "muse_bf16_stacked" and 1 <= args[0].shape[0] <= 16 and args[0].is_contiguous():
+        if kind == "muse_bf16_stacked" and 1 <= args[0].shape[0] <= 24 and args[0].is_contiguous():
             if args[0].shape[0] == 1:
                 return (args[3],)
             try:
@@ -524,7 +524,7 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             except Exception:  # noqa: BLE001
                 pass
             return (args[3],)
-        if kind == "muse_bf16_gate" and 1 <= args[1].shape[0] <= 16 and args[1].is_contiguous():
+        if kind == "muse_bf16_gate" and 1 <= args[1].shape[0] <= 24 and args[1].is_contiguous():
             return (args[3],)
         if kind == "marlin_tiled":
             return (args[1], args[2])

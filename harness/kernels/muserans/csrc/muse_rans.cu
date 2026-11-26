@@ -19,6 +19,7 @@
 #include <cuda_bf16.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <vector>
 #include <algorithm>
@@ -356,10 +357,14 @@ static size_t rans_tpf_stride() {
   return stride;
 }
 
-template <int NS, int GBS, int RG, int kIlvMode = 0, int kXGlobalMode = 2, bool kPar4 = false, int kMaxThreads = 1024, bool kM16 = false, bool kXsmem = false, int kActMode = 0>
+template <int NS, int GBS, int RG, int kIlvMode = 0, int kXGlobalMode = 2, bool kPar4 = false, int kMaxThreads = 1024, bool kM16 = false, bool kXsmem = false, int kActMode = 0, bool kM24 = false>
 __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) {
   constexpr uint32_t GB = 1u << GBS;
   constexpr uint32_t RB = GB * (uint32_t)RG;
+  // kM24 (M = 17..24): the kM16 chain on rows 0..15 is untouched; rows 16..23 ride a second accumulator tile
+  // (m16 tile, rows 8..15 of the tile zero) fed by the SAME decoded B fragments. Global-x par4 path only.
+  static_assert(!kM24 || (kM16 && kPar4 && NS == 4 && GBS == 9 && kIlvMode == 1 && kXGlobalMode == 1 && !kXsmem && kActMode == 0),
+                "kM24 requires the global-x par4 kM16 configuration");
   __shared__ __align__(16) uint32_t lut_s[4096];
   extern __shared__ __align__(16) unsigned char smem[];
   const int tid = threadIdx.x, lane = tid & 31, wib = tid >> 5, wpb = blockDim.x >> 5;
@@ -688,6 +693,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
     // Vectorized 2-step (64 B = 4 uint4 across t=0..3) activation pointers for kXGlobalMode == 1 (K%64==0 -> S even).
     const uint4* const x_u4_base = valid_m ? reinterpret_cast<const uint4*>(pb.x + (size_t)g * K + 16 * t) : nullptr;
     const uint4* const x_u4_hi = valid_m_hi ? reinterpret_cast<const uint4*>(pb.x + (size_t)(g + 8) * K + 16 * t) : nullptr;
+    const bool valid_m_24 = kM24 && ((g + 16) < pb.M);
+    const uint4* const x_u4_24 = valid_m_24 ? reinterpret_cast<const uint4*>(pb.x + (size_t)(g + 16) * K + 16 * t) : nullptr;
     const int R_max = (NB + pb.tw - 1) / pb.tw;
     int cur_buf = 0;
     for (int r_i = 0; r_i < R_max; ++r_i) {
@@ -696,6 +703,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
       float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
       uint2 a_next = make_uint2(0u, 0u);
       uint2 a_hi_next = make_uint2(0u, 0u);
+      float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;  // kM24 second tile (rows 16..23 in d0/d1; d2/d3 are zero-row padding)
+      uint2 a24_next = make_uint2(0u, 0u);
       // SM121 PDL producer trigger: emit launch_dependents ~12.5 us (16 k-steps) before the final chunk
       // completes so the following 1-CTA norm can preload its 66 KB cold weights on the idle SM.
       const int trig_s = (do_nb && (pb.pdl_mode & 2) && (nb + pb.tw >= NB)) ? ((S > 16) ? (S - 16) : 0) : -1;
@@ -751,8 +760,10 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             const uint32_t e3 = ((const uint32_t*)lut_s)[states[3] & 4095u];
             uint2 a = make_uint2(0u, 0u);
             uint2 a_hi = make_uint2(0u, 0u);
+            uint2 a24 = make_uint2(0u, 0u);
             uint4 v_lo = make_uint4(0u, 0u, 0u, 0u);
             uint4 v_hi = make_uint4(0u, 0u, 0u, 0u);
+            uint4 v_24 = make_uint4(0u, 0u, 0u, 0u);
             if constexpr (kXsmem) {
               if ((s & 1) == 0) {
                 const uint32_t xbase = (cur_buf * 16 + ((s - cs) >> 1)) * kRansXStrideU4;
@@ -766,6 +777,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
                 if (valid_m) v_lo = __ldg(x_u4_base + (s << 1));
                 if constexpr (kM16) {
                   if (valid_m_hi) v_hi = __ldg(x_u4_hi + (s << 1));
+                }
+                if constexpr (kM24) {
+                  if (valid_m_24) v_24 = __ldg(x_u4_24 + (s << 1));
                 }
               }
             } else {
@@ -811,9 +825,13 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
                 if constexpr (kM16) {
                   rans_xpose4(v_hi, t, a_hi.x, a_hi.y, a_hi_next.x, a_hi_next.y);
                 }
+                if constexpr (kM24) {
+                  rans_xpose4(v_24, t, a24.x, a24.y, a24_next.x, a24_next.y);
+                }
               } else {
                 a = a_next;
                 if constexpr (kM16) a_hi = a_hi_next;
+                if constexpr (kM24) a24 = a24_next;
               }
             }
             // Wait for ring group right before reading nw and r0..r3 in parallel.
@@ -839,6 +857,10 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
               rans_mma_e4m3_m16(c0, c1, c2, c3, a.x, a_hi.x, a.y, a_hi.y, bw0, bw1);
             } else {
               rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
+            }
+            if constexpr (kM24) {
+              // Same decoded bw0/bw1, second row tile: a1 = a3 = 0 (rows 24..31 of the tile), so d0/d1 = rows 16..23.
+              rans_mma_e4m3(d0, d1, d2, d3, a24.x, a24.y, bw0, bw1);
             }
             // Commit next-iteration rANS states.
             states[0] = n0 ? ((x0 << 16) | r0) : x0;
@@ -870,6 +892,12 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
           if (valid_m_hi) {
             __nv_bfloat162 r2; r2.x = __float2bfloat16_rn(sa_v * (sb2.x * c2)); r2.y = __float2bfloat16_rn(sa_v * (sb2.y * c3));
             *(__nv_bfloat162*)(pb.out + (size_t)(g + 8) * pb.N + n) = r2;
+          }
+        }
+        if constexpr (kM24) {
+          if (valid_m_24) {
+            __nv_bfloat162 r3; r3.x = __float2bfloat16_rn(sa_v * (sb2.x * d0)); r3.y = __float2bfloat16_rn(sa_v * (sb2.y * d1));
+            *(__nv_bfloat162*)(pb.out + (size_t)(g + 16) * pb.N + n) = r3;
           }
         }
       }
@@ -1138,6 +1166,8 @@ static void rans_set_attrs_once() {
   cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
   cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
   cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, false, 0, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, false, 0, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
   cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
   cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
   cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
@@ -1156,7 +1186,7 @@ static void rans_check_io(const torch::Tensor& blob, const torch::Tensor& x, con
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == N, "out must be a contiguous bfloat16 cuda tensor with N elements");
 }
 
-template <int NSV, int RGV, int kIlvMode = 0, int kXGlobalMode = 2, bool kPar4 = false, int kMaxThreads = 1024, bool kM16 = false, bool kXsmem = false, int kActMode = 0>
+template <int NSV, int RGV, int kIlvMode = 0, int kXGlobalMode = 2, bool kPar4 = false, int kMaxThreads = 1024, bool kM16 = false, bool kXsmem = false, int kActMode = 0, bool kM24 = false>
 static inline void rans_launch_k(int blocks, int threads, size_t dsmem, cudaStream_t st, RansProb pb) {
   if ((pb.pdl_mode & 1) != 0) {
     cudaLaunchConfig_t cfg = {};
@@ -1169,10 +1199,10 @@ static inline void rans_launch_k(int blocks, int threads, size_t dsmem, cudaStre
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
-    cudaError_t err = cudaLaunchKernelEx(&cfg, rans_gemv_kernel<NSV, 9, RGV, kIlvMode, kXGlobalMode, kPar4, kMaxThreads, kM16, kXsmem, kActMode>, pb);
+    cudaError_t err = cudaLaunchKernelEx(&cfg, rans_gemv_kernel<NSV, 9, RGV, kIlvMode, kXGlobalMode, kPar4, kMaxThreads, kM16, kXsmem, kActMode, kM24>, pb);
     TORCH_CHECK(err == cudaSuccess, "rans_gemv_kernel PDL launch failed: ", cudaGetErrorString(err));
   } else {
-    rans_gemv_kernel<NSV, 9, RGV, kIlvMode, kXGlobalMode, kPar4, kMaxThreads, kM16, kXsmem, kActMode><<<blocks, threads, dsmem, st>>>(pb);
+    rans_gemv_kernel<NSV, 9, RGV, kIlvMode, kXGlobalMode, kPar4, kMaxThreads, kM16, kXsmem, kActMode, kM24><<<blocks, threads, dsmem, st>>>(pb);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
@@ -1181,6 +1211,7 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   const size_t soff = rans_stream_off(tw);
   RansProb pb;
   pb.hdr = blob; pb.stream = blob + soff; pb.woff16 = (const int*)(blob + rans_woff_off()); pb.lut = (const uint32_t*)(blob + RANS_HDR_BYTES);
+  TORCH_CHECK(M >= 1 && M <= 24 && (M <= 16 || act_mode == 0), "rans multi-M: M must be 1..16 (fused act modes) or 17..24 (plain FP8 rows only)");
   pb.x = x; pb.x_aux = x_aux; pb.act_mode = act_mode; pb.M = M; pb.x_global = 0; pb.w_split = 0;
   static const bool xsmem_async_en = []() {
     const char* env = std::getenv("MUSERANS_XSMEM_ASYNC");
@@ -1267,6 +1298,14 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   }();
   if (M == 1 && lock48 && blocks == 48 && dsmem < 40960) dsmem = 40960;
   rans_set_attrs_once();
+  if (M > 16) {
+    // M = 17..24: one weight pass; rows 0..15 = the unchanged kM16 MMA chain, rows 16..23 = second accumulator tile fed by the
+    // same decoded B fragments (kM24). Only the global-x par4 configuration exists; anything else is refused (callers fall back).
+    TORCH_CHECK(par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 20 && x_aligned16 && pb.x_global && dsmem <= 48u * 1024u,
+                "rans M=24 needs par4/ns4/rg4/ilv9, wpb<=20, 16B-aligned x and <=48 KiB smem");
+    rans_launch_k<4, 4, 1, 1, true, 640, true, false, 0, true>(blocks, wpb * 32, dsmem, st, pb);
+    return;
+  }
   static const bool xsmem_en = []() {
     const char* env = std::getenv("MUSERANS_XSMEM");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
@@ -1352,10 +1391,16 @@ void rans_gemv_fused_auto(torch::Tensor blob, torch::Tensor x0, torch::Tensor x1
               (int)N, (int)K, c10::cuda::getCurrentCUDAStream());
 }
 
+// M = 17..24 admission state: 0 unknown, 1 admitted (bitwise [0:16]/[8:24] overlap vs the M<=16 kernels), -1 rejected.
+static int g_rans_m24_state = 0;
+static bool g_rans_m24_probe = false;
+static bool g_rans_m24_layer_bad = false;
+
 void rans_gemm_m_auto(torch::Tensor blob, torch::Tensor x, torch::Tensor sb, torch::Tensor sa, torch::Tensor out, int64_t N, int64_t K) {
+  TORCH_CHECK(x.dim() == 2 && (x.size(0) <= 16 || (x.size(0) <= 24 && (g_rans_m24_probe || g_rans_m24_state == 1))), "rans M>16 is only available after the M=24 overlap self-test admitted it");
   TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "blob must be a contiguous uint8 cuda tensor");
   TORCH_CHECK(N > 0 && K > 0 && N % 8 == 0 && K % 64 == 0, "need N%8==0 and K%64==0");
-  TORCH_CHECK(x.is_cuda() && x.element_size() == 1 && x.dim() == 2 && x.size(1) == K && x.size(0) >= 1 && x.size(0) <= 16 && x.is_contiguous(), "x must be contiguous [M<=16, K] fp8");
+  TORCH_CHECK(x.is_cuda() && x.element_size() == 1 && x.dim() == 2 && x.size(1) == K && x.size(0) >= 1 && x.size(0) <= 24 && x.is_contiguous(), "x must be contiguous [M<=24, K] fp8");
   TORCH_CHECK(sb.is_cuda() && sb.scalar_type() == torch::kFloat && sb.is_contiguous() && (sb.numel() == N || sb.numel() == 1), "bad sb");
   TORCH_CHECK(sa.is_cuda() && sa.scalar_type() == torch::kFloat && sa.numel() == 1, "bad sa");
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == x.size(0) * N, "bad out");
@@ -1399,6 +1444,90 @@ void rans_gemm_m_fused_auto(torch::Tensor blob, torch::Tensor x0, torch::Tensor 
               (int)N, (int)K, c10::cuda::getCurrentCUDAStream(), (int)M);
 }
 
+// Bitwise overlap oracle for one packed blob: native M=24 (and M=19) rows vs existing M<=16 launches over [0:16] and [8:24]
+// (resp. [3:19]); the overlap makes rows 8..15 observable from both tiles. x is random FP8 with moderate exponents.
+// Deterministic (no global RNG touched) FP8 e4m3 bytes with moderate exponents (4..11 -> no NaN/Inf), shape [rows, cols].
+static torch::Tensor rans_m24_det_fp8(int64_t rows, int64_t cols, uint64_t seed, torch::Device dev) {
+  auto i32 = torch::TensorOptions().dtype(torch::kInt32).device(dev);
+  auto h = torch::arange(rows * cols, i32);
+  h = h * 1103515245 + (int64_t)(12345u + (uint32_t)(seed & 0x3fffffffu));
+  h = at::bitwise_xor(h, at::bitwise_right_shift(h, 15));
+  h = h * 1103515245 + 12345;
+  auto r = at::bitwise_and(at::bitwise_right_shift(h, 13), 255);
+  auto b = at::bitwise_and(r, 0x80) + at::bitwise_left_shift(at::bitwise_and(at::bitwise_right_shift(r, 3), 7) + 4, 3) + at::bitwise_and(r, 7);
+  return b.to(torch::kUInt8).view({rows, cols}).contiguous();
+}
+
+static bool rans_m24_overlap_ok(const torch::Tensor& blob, const torch::Tensor& sb, const torch::Tensor& sa, int64_t N, int64_t K, uint64_t seed) {
+  const bool prev_probe = g_rans_m24_probe;
+  g_rans_m24_probe = true;
+  bool ok = true;
+  try {
+    for (int64_t M : {24, 19, 17}) {
+      auto xm = rans_m24_det_fp8(M, K, seed + (uint64_t)M, blob.device());
+      auto got = torch::empty({M, N}, blob.options().dtype(torch::kBFloat16));
+      rans_gemm_m_auto(blob, xm, sb, sa, got, N, K);
+      const int64_t o = M - 16;  // second window [o:M]; for M=24 this is [8:24]
+      auto xa = xm.narrow(0, 0, 16).contiguous();
+      auto xb = xm.narrow(0, o, 16).contiguous();
+      auto ra = torch::empty({16, N}, got.options());
+      auto rb = torch::empty({16, N}, got.options());
+      rans_gemm_m_auto(blob, xa, sb, sa, ra, N, K);
+      rans_gemm_m_auto(blob, xb, sb, sa, rb, N, K);
+      ok = ok && torch::equal(got.narrow(0, 0, 16).view(torch::kInt16), ra.view(torch::kInt16));
+      ok = ok && torch::equal(got.narrow(0, o, 16).view(torch::kInt16), rb.view(torch::kInt16));
+      if (!ok) break;
+    }
+    cudaDeviceSynchronize();
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "muserans: M=24 overlap self-test exception N=%ld K=%ld: %s\n", (long)N, (long)K, e.what());
+    ok = false;
+  }
+  g_rans_m24_probe = prev_probe;
+  return ok;
+}
+
+// Per-layer check on the real packed blob (called from muse_fp8.prepare); a mismatch poisons M=24 globally.
+bool rans_m24_check_blob(torch::Tensor blob, torch::Tensor sb, torch::Tensor sa, int64_t N, int64_t K) {
+  const bool ok = rans_m24_overlap_ok(blob, sb, sa, N, K, (uint64_t)(N * 1315423911ull + K));
+  if (!ok) { g_rans_m24_layer_bad = true; g_rans_m24_state = -1; }
+  return ok;
+}
+
+// True iff M=17..24 may be launched (state==1); never runs anything (safe during graph capture / dispatch).
+bool rans_m24_is_admitted() { return g_rans_m24_state == 1; }
+
+// Full admission: synthetic blobs for every FP8 projection shape of the target, native M=24 vs M<=16 over [0:16]/[8:24]. Cached.
+bool rans_m24_admitted(torch::Device device) {
+  if (g_rans_m24_state != 0) return g_rans_m24_state == 1;
+  cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(c10::cuda::getCurrentCUDAStream(), &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) return false;
+  if (g_rans_m24_layer_bad) { g_rans_m24_state = -1; return false; }
+  bool ok = true;
+  try {
+    const int64_t shapes[5][2] = {{4608, 6656}, {4096, 6656}, {39936, 6656}, {6656, 4096}, {6656, 19968}};
+    for (const auto& sh : shapes) {
+      const int64_t N = sh[0], K = sh[1];
+      auto fopts = torch::TensorOptions().dtype(torch::kFloat).device(device);
+      auto W = rans_m24_det_fp8(N, K, (uint64_t)(N + 3 * K), device);
+      auto blob = rans_pack(W);
+      W = torch::Tensor();
+      auto sb = (torch::arange(N, fopts).remainder(7) * 0.125f + 0.5f).contiguous();
+      auto sa = torch::full({1}, 0.37f, fopts);
+      const bool one = rans_m24_overlap_ok(blob, sb, sa, N, K, (uint64_t)(N * 7919ull + K));
+      std::fprintf(stderr, "muserans: M=24 overlap self-test [0:16]/[8:24] N=%ld K=%ld %s\n", (long)N, (long)K, one ? "admitted bitwise" : "MISMATCH");
+      ok = ok && one;
+      if (!ok) break;
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "muserans: M=24 admission exception: %s\n", e.what());
+    ok = false;
+  }
+  g_rans_m24_state = (ok && !g_rans_m24_layer_bad) ? 1 : -1;
+  std::fprintf(stderr, "muserans: M=24 %s\n", g_rans_m24_state == 1 ? "admitted bitwise (all FP8 projection shapes)" : "REJECTED, record M=16 path stays");
+  return g_rans_m24_state == 1;
+}
+
 int64_t rans_tpf_kb() { return static_cast<int64_t>(rans_tpf_stride() >> 10); }
 
 std::vector<int64_t> rans_cfg_info(int64_t N, int64_t K) { RansCfg c = rans_pick_cfg((int)N, (int)K); return {c.tw, c.wpb, c.ns, c.rg, c.ilv}; }
@@ -1431,6 +1560,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_blob_info", &rans_blob_info);
   m.def("rans_gemv_auto", &rans_gemv_auto);
   m.def("rans_gemm_m_auto", &rans_gemm_m_auto);
+  m.def("rans_m24_admitted", &rans_m24_admitted);
+  m.def("rans_m24_is_admitted", &rans_m24_is_admitted);
+  m.def("rans_m24_check_blob", &rans_m24_check_blob);
   m.def("rans_gemv_fused_auto", &rans_gemv_fused_auto);
   m.def("rans_gemm_m_fused_auto", &rans_gemm_m_fused_auto);
   m.def("rans_gemv_cfg", &rans_gemv_cfg);
