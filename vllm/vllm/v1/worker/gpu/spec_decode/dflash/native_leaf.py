@@ -65,6 +65,9 @@ TREE_ADAPT_GAMMA = os.environ.get("MUSE_TREE_ADAPT_GAMMA", "1").strip() not in (
 TREE_CALIB = os.environ.get("MUSE_TREE_CALIB", "1").strip() not in ("0", "", "false", "no")
 TREE_HIGH_ACC_CPC = float(os.environ.get("MUSE_TREE_HIGH_ACC_CPC", "0"))
 LEAF_STATS = os.environ.get("MUSE_LEAF_STATS", "0").strip() in ("1", "true", "yes")
+TR_ENABLED = os.environ.get("MUSE_TR_MODE", "1").strip() not in ("0", "", "false", "no")
+HIST_CAP = 16384
+TR_LOG_CAP = 2048
 _ST_RAW = os.environ.get("MUSE_NATIVE_LEAF_SELFTEST", "0").strip().lower()
 SELFTEST = 1 if _ST_RAW in ("1", "true", "yes") else (2 if _ST_RAW == "2" else 0)
 NOHIT = os.environ.get("MUSE_NATIVE_LEAF_NOHIT", "0").strip() in ("1", "true", "yes")
@@ -89,7 +92,13 @@ class _NativeLeafState:
         self.saved_leaf_toks: torch.Tensor | None = None    # int64[16] (tree mode)
         self.saved_leaf_k: torch.Tensor | None = None       # int32[16] (tree mode)
         self.saved_leaf_parent: torch.Tensor | None = None  # int32[16] (-1=1-level root, 7..15=parent row)
-        self.stats: torch.Tensor | None = None              # int64[32] telemetry counters
+        self.hist: torch.Tensor | None = None               # int32[16384] exact committed token history
+        self.hist_len: torch.Tensor | None = None           # int32[1] valid history length
+        self.saved_pos0: torch.Tensor | None = None         # int64[1] step anchor position p0
+        self.saved_row_ctx: torch.Tensor | None = None      # int32[16, 4] per-row (cur, prv1, prv2, pos_r)
+        self.tr_log: torch.Tensor | None = None             # int32[2048, 8] per-request 30B target recycle log
+        self.tr_state: torch.Tensor | None = None           # int32[4] [tr_len, tr_step, last_p0, reserved]
+        self.stats: torch.Tensor | None = None              # int64[44] telemetry counters
         # Static 52-layer target KV metadata for 1-launch all-layer KV fix on hit.
         self.num_layers: int = 0
         self.kv_ptrs: torch.Tensor | None = None
@@ -101,11 +110,20 @@ class _NativeLeafState:
         # Cached device pointer array for hidden_states + aux_hidden_states (0 H2D copies steady state).
         self._hid_ptr_cache: dict[tuple[int, ...], torch.Tensor] = {}
         self._last_req_id: str | None = None
+        self._hist_req_id: str | None = None
         self._logged_active: bool = False
         self._atexit_registered: bool = False
 
 
 _S = _NativeLeafState()
+
+
+def _reset_tr_state() -> None:
+    if _S.tr_state is not None:
+        _S.tr_state[:2].zero_()
+        _S.tr_state[2:3].fill_(-1)
+    if _S.saved_row_ctx is not None:
+        _S.saved_row_ctx.fill_(-1)
 
 
 def _dump_stats(tag: str) -> None:
@@ -114,11 +132,16 @@ def _dump_stats(tag: str) -> None:
     try:
         st = _S.stats.detach().cpu().tolist()
         if len(st) >= 32 and st[0] > 0:
+            pl_extra = ""
+            if len(st) >= 36:
+                pl_extra = f" hist_ok/bad={st[32]}/{st[33]} pl_roots={st[34]} pl_boosts={st[35]}"
+            if len(st) >= 40:
+                pl_extra += f" tr_boosts={st[36]} tr_roots={st[37]} tr_conts={st[38]} tr_rows={st[39]}"
             logger.info(
                 "native_leaf_stats[%s]: steps=%d active=%d hits=%d deep_hits=%d extra_toks=%d deep_bonus=%d "
-                "total_ns=%d max_len=%d len1..6=%s k1..6=%s slots0..8=%s reached_d2/3/4+=%d/%d/%d",
+                "total_ns=%d max_len=%d len1..6=%s k1..6=%s slots0..8=%s reached_d2/3/4+=%d/%d/%d%s",
                 tag, st[0], st[1], st[2], st[3], st[25], st[26], st[27], st[28],
-                st[19:25], st[4:10], st[10:19], st[29], st[30], st[31],
+                st[19:25], st[4:10], st[10:19], st[29], st[30], st[31], pl_extra,
             )
             _S.stats.zero_()
     except Exception:  # noqa: BLE001
@@ -243,6 +266,36 @@ def get_tree_vals_buf(device: torch.device) -> torch.Tensor | None:
     return _S.tree_vals
 
 
+def _reset_hist_for_req(req_id: str | None) -> None:
+    if req_id == _S._hist_req_id and req_id is not None:
+        return
+    _S._hist_req_id = req_id
+    if _S.hist_len is not None:
+        _S.hist_len.zero_()
+    if _S.saved_pos0 is not None:
+        _S.saved_pos0.fill_(-1)
+    _reset_tr_state()
+
+
+def get_hist_bufs(
+    device: torch.device,
+    req_id: str | None = None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Return fixed-address (hist int32[16384], hist_len int32[1]) buffers for exact committed token history."""
+    if not (ENABLED and _S.ready) or device.type != "cuda":
+        return None, None
+    if (
+        _S.hist is not None
+        and _S.hist_len is not None
+        and _S.hist.device == device
+        and _S.hist_len.device == device
+    ):
+        if req_id is not None and req_id != _S._hist_req_id:
+            _reset_hist_for_req(req_id)
+        return _S.hist, _S.hist_len
+    return None, None
+
+
 def init_kv_table(
     kv_caches_dict: dict[str, torch.Tensor],
     kv_cache_config: Any,
@@ -364,7 +417,13 @@ def init_kv_table(
         _S.saved_leaf_toks = torch.full((16,), -1, dtype=torch.int64, device=device)
         _S.saved_leaf_k = torch.zeros((16,), dtype=torch.int32, device=device)
         _S.saved_leaf_parent = torch.full((16,), -1, dtype=torch.int32, device=device)
-        _S.stats = torch.zeros((32,), dtype=torch.int64, device=device)
+        _S.hist = torch.full((HIST_CAP,), -1, dtype=torch.int32, device=device)
+        _S.hist_len = torch.zeros((1,), dtype=torch.int32, device=device)
+        _S.saved_pos0 = torch.full((1,), -1, dtype=torch.int64, device=device)
+        _S.saved_row_ctx = torch.full((16, 4), -1, dtype=torch.int32, device=device)
+        _S.tr_log = torch.zeros((TR_LOG_CAP, 8), dtype=torch.int32, device=device)
+        _S.tr_state = torch.tensor([0, 0, -1, 0], dtype=torch.int32, device=device)
+        _S.stats = torch.zeros((44,), dtype=torch.int64, device=device)
         _S.num_layers = len(kv_ptrs)
         _S.kv_ptrs = torch.tensor(kv_ptrs, dtype=torch.int64, device=device)
         _S.stride_block = torch.tensor(s_blk, dtype=torch.int64, device=device)
@@ -374,6 +433,7 @@ def init_kv_table(
         _S.layer_gid = torch.tensor(gids, dtype=torch.int32, device=device)
         _S._hid_ptr_cache.clear()
         _S._last_req_id = None
+        _S._hist_req_id = None
         _S.m8_ready = bool(M8_ENABLED and hasattr(bfx, "native_leaf_prepare_m8"))
         _S.tree_m_ready = (
             TREE_M
@@ -400,8 +460,20 @@ def init_kv_table(
 
 
 @torch.no_grad()
-def on_non_leaf_step(req_id: str | None, num_draft_tokens: int) -> None:
-    """Clear leaf flag on any non-leaf step and reset state on request switch / prefill / ceiling clamp."""
+def on_non_leaf_step(
+    req_id: str | None,
+    num_draft_tokens: int,
+    *,
+    is_prefill: bool | None = None,
+) -> None:
+    """Clear leaf flag on any non-leaf step and reset state on request switch / prefill.
+
+    Never permanently latch ``req_acc_state[2]`` off when ``committed_token_ceiling``
+    shortens a single proposal (``0 <= num_draft_tokens < 6``): bypassing leaves on
+    that shortened step is already handled by ``leaf_flag[0] = 0``, while subsequent
+    ``num_draft_tokens == 6`` steps run ``FULL(16)`` at fixed cost and keep all 9
+    speculative tree leaves active.
+    """
     if not _S.ready:
         return
     assert (
@@ -411,8 +483,14 @@ def on_non_leaf_step(req_id: str | None, num_draft_tokens: int) -> None:
         and _S.req_acc_state is not None
     )
     _S.leaf_flag[:1].zero_()
-    if req_id is None or req_id != _S._last_req_id or num_draft_tokens == 0:
-        if LEAF_STATS and _S._last_req_id is not None and (req_id != _S._last_req_id or num_draft_tokens == 0):
+    is_req_switch = req_id is None or req_id != _S._last_req_id
+    if req_id is None or req_id != _S._hist_req_id:
+        _reset_hist_for_req(req_id)
+    reset_req = is_req_switch or (
+        num_draft_tokens == 0 if is_prefill is None else is_prefill
+    )
+    if reset_req:
+        if LEAF_STATS and _S._last_req_id is not None:
             _dump_stats(str(_S._last_req_id))
         _S._last_req_id = req_id
         _S.prev_ns.fill_(7)
@@ -424,10 +502,7 @@ def on_non_leaf_step(req_id: str | None, num_draft_tokens: int) -> None:
         if _S.tree_vals is not None:
             _S.tree_vals.fill_(-1e30)
         _S.req_acc_state.zero_()
-    elif 0 < num_draft_tokens < 6:
-        # Ceiling shortened depth on high-acceptance request -> hard-latch leaf mode off.
-        _S.prev_ns.fill_(7)
-        _S.req_acc_state[2:3].fill_(2)
+        _reset_tr_state()
 
 
 @torch.no_grad()
@@ -488,6 +563,8 @@ def setup_step(
     ):
         _S.leaf_flag[:1].zero_()
         return False
+    if req_id != _S._hist_req_id:
+        _reset_hist_for_req(req_id)
     if req_id != _S._last_req_id:
         if LEAF_STATS and _S._last_req_id is not None:
             _dump_stats(str(_S._last_req_id))
@@ -501,12 +578,15 @@ def setup_step(
         if _S.tree_vals is not None:
             _S.tree_vals.fill_(-1e30)
         _S.req_acc_state.zero_()
+        _reset_tr_state()
     if eff_m > 8:
         assert (
             _S.tree_top is not None
             and _S.saved_leaf_toks is not None
             and _S.saved_leaf_k is not None
         )
+        tr_log_arg = _S.tr_log if TR_ENABLED else None
+        tr_state_arg = _S.tr_state if TR_ENABLED else None
         try:
             bfx.native_leaf_setup_tree(
                 _S.leaf_flag,
@@ -528,19 +608,53 @@ def setup_step(
                 TREE_SUB_COEF,
                 TREE_SHF_COEF,
                 TREE_CONT_DECAY,
+                _S.hist,
+                _S.hist_len,
+                _S.saved_pos0,
+                _S.stats,
+                _S.saved_row_ctx,
+                tr_log_arg,
+                tr_state_arg,
             )
         except TypeError:
-            bfx.native_leaf_setup_tree(
-                _S.leaf_flag,
-                _S.tree_top,
-                input_ids,
-                positions,
-                _S.saved_leaf_toks,
-                _S.saved_leaf_k,
-                eff_m,
-                SELFTEST,
-                _S.req_acc_state,
-            )
+            try:
+                bfx.native_leaf_setup_tree(
+                    _S.leaf_flag,
+                    _S.tree_top,
+                    input_ids,
+                    positions,
+                    _S.saved_leaf_toks,
+                    _S.saved_leaf_k,
+                    eff_m,
+                    SELFTEST,
+                    _S.req_acc_state,
+                    _S.tree_vals,
+                    TREE_DYNAMIC,
+                    TREE_TEMP,
+                    TREE_TAIL,
+                    TREE_GAMMA,
+                    _S.saved_leaf_parent,
+                    TREE_MAX_DEPTH,
+                    TREE_SUB_COEF,
+                    TREE_SHF_COEF,
+                    TREE_CONT_DECAY,
+                    _S.hist,
+                    _S.hist_len,
+                    _S.saved_pos0,
+                    _S.stats,
+                )
+            except TypeError:
+                bfx.native_leaf_setup_tree(
+                    _S.leaf_flag,
+                    _S.tree_top,
+                    input_ids,
+                    positions,
+                    _S.saved_leaf_toks,
+                    _S.saved_leaf_k,
+                    eff_m,
+                    SELFTEST,
+                    _S.req_acc_state,
+                )
         return True
     bfx.native_leaf_setup(
         _S.leaf_flag,
@@ -602,6 +716,8 @@ def commit_and_fix(
             and _S.saved_leaf_toks is not None
             and _S.saved_leaf_k is not None
         )
+        tr_log_arg = _S.tr_log if TR_ENABLED else None
+        tr_state_arg = _S.tr_state if TR_ENABLED else None
         try:
             bfx.native_leaf_commit_tree(
                 _S.leaf_flag,
@@ -619,24 +735,52 @@ def commit_and_fix(
                 NOHIT,
                 _S.req_acc_state,
                 _S.saved_leaf_parent,
+                _S.hist,
+                _S.hist_len,
+                _S.saved_pos0,
+                _S.saved_row_ctx,
+                tr_log_arg,
+                tr_state_arg,
             )
         except TypeError:
-            bfx.native_leaf_commit_tree(
-                _S.leaf_flag,
-                _S.prev_ns,
-                _S.hit_flag,
-                _S.hit_src_row,
-                _S.saved_leaf_toks,
-                _S.saved_leaf_k,
-                leaf_u_tok,
-                sampled_tokens,
-                num_sampled,
-                num_rejected,
-                eff_m,
-                _S.stats,
-                NOHIT,
-                _S.req_acc_state,
-            )
+            try:
+                bfx.native_leaf_commit_tree(
+                    _S.leaf_flag,
+                    _S.prev_ns,
+                    _S.hit_flag,
+                    _S.hit_src_row,
+                    _S.saved_leaf_toks,
+                    _S.saved_leaf_k,
+                    leaf_u_tok,
+                    sampled_tokens,
+                    num_sampled,
+                    num_rejected,
+                    eff_m,
+                    _S.stats,
+                    NOHIT,
+                    _S.req_acc_state,
+                    _S.saved_leaf_parent,
+                    _S.hist,
+                    _S.hist_len,
+                    _S.saved_pos0,
+                )
+            except TypeError:
+                bfx.native_leaf_commit_tree(
+                    _S.leaf_flag,
+                    _S.prev_ns,
+                    _S.hit_flag,
+                    _S.hit_src_row,
+                    _S.saved_leaf_toks,
+                    _S.saved_leaf_k,
+                    leaf_u_tok,
+                    sampled_tokens,
+                    num_sampled,
+                    num_rejected,
+                    eff_m,
+                    _S.stats,
+                    NOHIT,
+                    _S.req_acc_state,
+                )
         src_row_buf = _S.hit_src_row
     else:
         bfx.native_leaf_commit(
