@@ -15,9 +15,9 @@ import torch
 
 try:
     from vllm.logger import init_logger
-    logger = init_logger(__name__)
+    logger = init_logger("vllm.muse_prefill_attn")
 except Exception:  # noqa: BLE001
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger("vllm.muse_prefill_attn")
 
 ENABLED = os.environ.get("MUSE_PREFILL_ATTN_FUSED", "1").strip() not in ("0", "", "false", "no")
 PDL_ENABLED = os.environ.get("MUSE_PREFILL_ATTN_PDL", "1").strip() not in ("0", "", "false", "no")

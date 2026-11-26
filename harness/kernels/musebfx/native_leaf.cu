@@ -46,8 +46,12 @@ __global__ void native_leaf_prepare_tree_kernel(
 // Pre-miss:  p(j,r) = exp(a_j + w_sm*sm_c + w_z0*z0_c + c_r + beta*(z_r - z_0)) / (1 + sum_{r<6} exp(...))
 // Post-miss: p_post(j,r) = exp(a_j + a2 + w_z0p*z0_c + c_r + beta_post*(z_r - z_0)) / (1 + sum_{r<6} exp(...))
 // L3+ after L2 sub hit resyncs with drafter top-1 (uses p1[j], empirical 63.3%); L1 also spawns d_{k+1}#2 via p2post (14.2%).
+constexpr int kMaxTreeK = 8;
+
 __constant__ float kCalA[6] = {1.675690f, 1.258784f, 1.070196f, 1.171448f, 1.102070f, 0.731610f};
-__constant__ float kCalC[6] = {0.000000f, -0.402942f, -0.763639f, -0.817452f, -1.416669f, -1.642223f};
+__constant__ float kCalC[8] = {
+    0.000000f, -0.402942f, -0.763639f, -0.817452f,
+    -1.416669f, -1.642223f, -1.860000f, -2.060000f};
 #define CAL_A2 (-1.614419f)
 #define CAL_BETA 0.851144f
 #define CAL_BETA_POST 0.326972f
@@ -145,6 +149,10 @@ struct TrKnobs {
   float ch_near_t6;      // child continuation prob on conflict-free near-frontier recycled unigram in DFlash top-6
   float ch_near_oov;     // child continuation prob on conflict-free near-frontier OOV recycled unigram
   float ch_t6_agree;     // child continuation prob when monomorphic (cnt>=2, tier0>=1) 30B & DFlash top-6 agree
+  float b_d1_tri;        // log-odds boost to DFlash top-1 (rk==0) on monomorphic 30B recycled trigram match
+  float b_d1_bg;         // log-odds boost to DFlash top-1 (rk==0) on tier-0 confirmed 30B recycled bigram match
+  float ch_a1_bg_t6;     // child continuation prob on fresh age==1 (dist<=8) 30B bigram in DFlash top-K
+  float ch_a1_bg_oov;    // child continuation prob on fresh age==1 (dist<=8) 30B OOV bigram
 };
 
 struct AntiChimeraKnobs {
@@ -158,6 +166,12 @@ struct AntiChimeraKnobs {
   float rev_alpha;       // smoothing for N_in(v)
   float rev_cap;         // max reverse log-odds penalty
   float ent_lambda;      // entropy-coupling chimera discount on unverified off-chain sub (rp==0)
+  float lh_copy_w;       // 1-step copy-chain lookahead tie-breaker weight (non-compounding)
+  float stutter_scale;   // multiplier on unconfirmed [tok -> tok] stutter sub continuation
+  float skip_root_bg;    // left-shift (d_{j+2}) root weight on M>16 when (anc_j -> d_{j+2}) in history
+  float skip_lh_w;       // lookahead tie-breaker weight for left-shift root matching d_{j+2}
+  float skip_coef;       // left-shift child continuation scale * s_p1[k_r + 1]
+  float shf_unseen_scale;// insertion-shift unseen probability scale * s_p1[k_r - 1] on M>16
 };
 
 struct CascadeKnobs {
@@ -591,6 +605,10 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     }
   }
 
+  __shared__ int s_row_base_sub[32];
+  __shared__ int s_row_depth[32];
+  __shared__ uint32_t s_row_packed[32];
+
   const int num_leaves = tree_m - 7;
   if (dynamic_mode == 0 || selftest_mode != 0 || tree_vals == nullptr || tree_k < 6) {
     if (tid == 0) {
@@ -601,9 +619,6 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       }
       constexpr int kLeafK[9] = {1, 1, 2, 2, 3, 1, 3, 4, 5};
       constexpr int kLeafRank[9] = {1, 2, 1, 2, 1, 3, 2, 1, 1};
-      int row_base_sub[32];
-      int row_depth[32];
-      uint32_t row_packed[32];
       bool any_active = false;
       for (int li = 0; li < num_leaves; ++li) {
         const int r = 7 + li;
@@ -641,13 +656,13 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             dp = 1;
             pkd = static_cast<uint32_t>(r) & 0x1Fu;
           } else {
-            b_sub = row_base_sub[par];
-            dp = row_depth[par] + 1;
-            pkd = row_packed[par] | ((static_cast<uint32_t>(r) & 0x1Fu) << (5 * (dp - 1)));
+            b_sub = s_row_base_sub[par];
+            dp = s_row_depth[par] + 1;
+            pkd = s_row_packed[par] | ((static_cast<uint32_t>(r) & 0x1Fu) << (5 * (dp - 1)));
           }
-          row_base_sub[r] = b_sub;
-          row_depth[r] = dp;
-          row_packed[r] = pkd;
+          s_row_base_sub[r] = b_sub;
+          s_row_depth[r] = dp;
+          s_row_packed[r] = pkd;
           input_ids[r] = static_cast<int32_t>(cand);
           positions[r] = positions[k];
           saved_leaf_toks[r] = cand;
@@ -659,9 +674,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           leaf_flag[1 + 3 * r + 1] = b_sub;
           leaf_flag[1 + 3 * r + 2] = static_cast<int32_t>(pkd);
         } else {
-          row_base_sub[r] = -1;
-          row_depth[r] = 0;
-          row_packed[r] = 0u;
+          s_row_base_sub[r] = -1;
+          s_row_depth[r] = 0;
+          s_row_packed[r] = 0u;
           input_ids[r] = input_ids[0];
           saved_leaf_toks[r] = -1;
           saved_leaf_k[r] = 0;
@@ -681,24 +696,27 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     return;
   }
 
-  // Dynamic per-step GPU arbitrary-depth (1..6-level) tree allocator + fused prompt lookup (up to 96 candidates).
+  const int tk = (tree_k >= 8) ? 8 : 6;
+
+  // Dynamic per-step GPU arbitrary-depth (1..6-level) tree allocator + fused prompt lookup (up to 192 candidates).
   __shared__ int32_t s_h[kPlWindowMax];
   __shared__ int32_t s_ctx[22];
-  __shared__ int32_t s_top[6][6];
+  __shared__ int32_t s_top[6][kMaxTreeK];
   __shared__ uint32_t s_w_pl_key[8][6];
-  __shared__ uint32_t s_w_cand_key[8][6][6];
+  __shared__ uint32_t s_w_cand_key[8][6][kMaxTreeK];
   __shared__ uint32_t s_pl_key[6];
-  __shared__ uint32_t s_cand_key[6][6];
-  // Wave-62 smoothed Markov bigram/trigram coherence + 0.00ms Anti-Chimera incoming counts (~2.2 KiB SMEM).
-  __shared__ uint32_t s_alt_cnt[5][6];
-  __shared__ uint32_t s_in_cnt[5][6];
-  __shared__ uint32_t s_bg_cnt[5][6][6];
-  __shared__ uint32_t s_bg3_mask[5][6];
-  __shared__ uint32_t s_bg_key[5][6][6];
-  __shared__ uint32_t s_shf_bg[5][5];
-  __shared__ int32_t s_uniq_min[5][5];
-  __shared__ int32_t s_uniq_max[5][5];
-  __shared__ int32_t s_uniq_hp[5][5];
+  __shared__ uint32_t s_cand_key[6][kMaxTreeK];
+  // Wave-62/69 smoothed Markov bigram/trigram coherence + 0.00ms Anti-Chimera incoming counts (~3.4 KiB SMEM).
+  __shared__ uint32_t s_alt_cnt[5][kMaxTreeK];
+  __shared__ uint32_t s_in_cnt[5][kMaxTreeK];
+  __shared__ uint32_t s_bg_cnt[5][kMaxTreeK][kMaxTreeK];
+  __shared__ uint32_t s_bg3_mask[5][kMaxTreeK];
+  __shared__ uint32_t s_bg_key[5][kMaxTreeK][kMaxTreeK];
+  __shared__ uint32_t s_shf_bg[5][kMaxTreeK];
+  __shared__ uint32_t s_skip_bg[5];
+  __shared__ int32_t s_uniq_min[5][kMaxTreeK];
+  __shared__ int32_t s_uniq_max[5][kMaxTreeK];
+  __shared__ int32_t s_uniq_hp[5][kMaxTreeK];
   // Wave-63 anchor monomorphism & L2-resident 30B Target Recycling active buffer (~12.8 KiB SMEM).
   __shared__ uint32_t s_anc_u1_cnt[6];
   __shared__ uint32_t s_anc_bg2_cnt[6];
@@ -717,7 +735,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __shared__ int32_t s_tr_u[kTrActiveCap];
   __shared__ int32_t s_tr_st[kTrActiveCap];
   __shared__ int32_t s_tr_pos_tier[kTrActiveCap];
-  __shared__ float s_tr_b_rk[6][6];
+  __shared__ float s_tr_b_rk[6][kMaxTreeK];
   __shared__ int32_t s_tr_oov_tok[6];
   __shared__ float s_tr_oov_w[6];
   __shared__ int32_t s_leaf_tok_r[32];
@@ -735,8 +753,11 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __shared__ float s_p_oov[6];
   __shared__ float s_p1post[6];
   __shared__ float s_p2post[6];
-  __shared__ float s_pr[6][6];
-  __shared__ float s_e1[6][6];
+  __shared__ float s_pr[6][kMaxTreeK];
+  __shared__ float s_e0[6][kMaxTreeK];
+  __shared__ float s_e1[6][kMaxTreeK];
+  __shared__ float s_p_post_vec[kMaxTreeK];
+  __shared__ int32_t s_spawned[16];
   __shared__ float s_den1[6];
   __shared__ float s_z0[6];
   __shared__ float s_margin[6];
@@ -744,17 +765,17 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __shared__ uint8_t s_valid_row[6];
   __shared__ int s_any_active;
 
-  constexpr int kCandCap = 160;
+  constexpr int kCandCap = 192;
   __shared__ float s_cand_score[kCandCap];
   __shared__ float s_cand_prob[kCandCap];
   __shared__ int64_t s_cand_tok[kCandCap];
   __shared__ int8_t s_cand_k[kCandCap];
   __shared__ int8_t s_cand_par[kCandCap];
   __shared__ int8_t s_cand_depth[kCandCap];
-  __shared__ int8_t s_cand_kind[kCandCap];  // 0=1-level, 1=sub, 2=shift, 3=alt2, 4=pl_root, 5=pl_cont, 6=coh_cont, 7=tr, 8=casc_chain, 9=casc_alt
+  __shared__ int8_t s_cand_kind[kCandCap];  // 0=1-lvl, 1=sub, 2=shf, 3=alt2, 4=pl_root, 5=pl_cont, 6=coh_cont, 7=tr, 8=casc_chain, 9=casc_alt, 10=skip-1
   __shared__ int16_t s_cand_hpos[kCandCap]; // index in s_h matching s_cand_tok (-1 if none)
   __shared__ int8_t s_cand_ml[kCandCap];    // history match length 0..16
-  __shared__ int8_t s_cand_rk[kCandCap];    // rank 0..5 in row (k-1), or -1 if non-top6
+  __shared__ int8_t s_cand_rk[kCandCap];    // rank 0..7 in row (k-1), or -1 if non-topK
   __shared__ int s_num_cands;
   __shared__ int s_casc_mode;
   __shared__ int s_casc_b;
@@ -762,9 +783,6 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __shared__ int64_t s_casc_top[6][2];
   __shared__ float s_casc_p1[6];
   __shared__ float s_casc_p2[6];
-
-  __shared__ int s_row_base_sub[32];
-  __shared__ uint32_t s_row_packed[32];
 
   // Pass 1: validate rows, gather context tokens & top-6 IDs, and verify fail-closed history + recycle + cascade sync.
   if (tid == 0) {
@@ -864,36 +882,35 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     s_tr_oov_tok[tid] = -1;
     s_tr_oov_w[tid] = 0.0f;
 #pragma unroll
-    for (int r = 0; r < 6; ++r) {
-      const int64_t tv = tree_top[base + r];
+    for (int r = 0; r < kMaxTreeK; ++r) {
+      const int64_t tv = (r < tk) ? tree_top[base + r] : -1;
       s_top[tid][r] = (tv >= 0) ? static_cast<int32_t>(tv) : -1;
       s_tr_b_rk[tid][r] = 0.0f;
     }
   } else if (tid == 6) {
     s_ctx[15] = input_ids[0];
   }
-  if (tid < 180) {
-    const int j = tid / 36;
-    const int rem = tid - j * 36;
-    const int r = rem / 6;
-    const int rp = rem - r * 6;
+  for (int idx = tid; idx < 5 * kMaxTreeK * kMaxTreeK; idx += 256) {
+    const int j = idx / (kMaxTreeK * kMaxTreeK);
+    const int rem = idx - j * (kMaxTreeK * kMaxTreeK);
+    const int r = rem / kMaxTreeK;
+    const int rp = rem - r * kMaxTreeK;
     s_bg_cnt[j][r][rp] = 0u;
     s_bg_key[j][r][rp] = 0u;
   }
-  if (tid < 30) {
-    const int j = tid / 6;
-    const int r = tid - j * 6;
+  if (tid < 5 * kMaxTreeK) {
+    const int j = tid / kMaxTreeK;
+    const int r = tid - j * kMaxTreeK;
     s_alt_cnt[j][r] = 0u;
     s_in_cnt[j][r] = 0u;
     s_bg3_mask[j][r] = 0u;
+    s_shf_bg[j][r] = 0u;
+    s_uniq_min[j][r] = 2147483647;
+    s_uniq_max[j][r] = -1;
+    s_uniq_hp[j][r] = -1;
   }
-  if (tid < 25) {
-    const int j = tid / 5;
-    const int rm = tid - j * 5;
-    s_shf_bg[j][rm] = 0u;
-    s_uniq_min[j][rm] = 2147483647;
-    s_uniq_max[j][rm] = -1;
-    s_uniq_hp[j][rm] = -1;
+  if (tid < 5) {
+    s_skip_bg[tid] = 0u;
   }
   __syncthreads();
 
@@ -901,7 +918,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   // Markov bigram/trigram co-occurrence counts, Anti-Chimera incoming counts, shift-bigram flags,
   // unique OOV successors, and 30B recycle log.
   const bool scan_bg = (bg.bg_mode != 0 || bg.uniq_mode != 0 || bg.shf_cal != 0 || ac.ac_mode != 0);
-  const bool scan_anc = (pl.mode != 0 || tr.mode != 0 || tr.det_sh_root != 0);
+  const bool scan_anc = (pl.mode != 0 || tr.mode != 0 || tr.det_sh_root != 0 || ac.skip_root_bg > 0.0f);
   if ((scan_anc || scan_bg) && s_hist_ok != 0 && s_win >= 2) {
     const int win = s_win;
     const int h_base = s_h_base;
@@ -917,11 +934,11 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
 
     uint32_t pl_k[6] = {0u, 0u, 0u, 0u, 0u, 0u};
     uint32_t u1_c[6] = {0u, 0u, 0u, 0u, 0u, 0u};
-    uint32_t c_k[6][6];
+    uint32_t c_k[6][kMaxTreeK];
 #pragma unroll
     for (int j = 0; j < 6; ++j) {
 #pragma unroll
-      for (int r = 0; r < 6; ++r) {
+      for (int r = 0; r < kMaxTreeK; ++r) {
         c_k[j][r] = 0u;
       }
     }
@@ -936,6 +953,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         for (int j = 0; j < 6; ++j) {
           if (h_i == anchors[j]) {
             ++u1_c[j];
+            if (j < 5 && ac.skip_root_bg > 0.0f && nxt == s_ctx[16 + j + 1]) {
+              s_skip_bg[j] = 1u;
+            }
             int ml = 1;
             while (ml < 16 && i - ml >= 0 && s_h[i - ml] == s_ctx[15 + j - ml]) {
               ++ml;
@@ -960,8 +980,8 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
                 pl_k[j] = key;
               }
 #pragma unroll
-              for (int r = 0; r < 6; ++r) {
-                if (nxt == s_top[j][r] && key > c_k[j][r]) {
+              for (int r = 0; r < kMaxTreeK; ++r) {
+                if (r < tk && nxt == s_top[j][r] && key > c_k[j][r]) {
                   c_k[j][r] = key;
                 }
               }
@@ -974,8 +994,8 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
 #pragma unroll
           for (int j = 0; j < 5; ++j) {
 #pragma unroll
-            for (int rp = 0; rp < 6; ++rp) {
-              if (nxt == s_top[j + 1][rp]) {
+            for (int rp = 0; rp < kMaxTreeK; ++rp) {
+              if (rp < tk && nxt == s_top[j + 1][rp]) {
                 atomicAdd(&s_in_cnt[j][rp], 1u);
               }
             }
@@ -986,7 +1006,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         for (int j = 0; j < 5; ++j) {
           const int32_t anc_j = anchors[j];
           const int32_t dk_j = s_ctx[16 + j];
-          for (int r = r_start; r < 6; ++r) {
+          for (int r = r_start; r < tk; ++r) {
             const int32_t tok_r = s_top[j][r];
             if (tok_r >= 0 && h_i == tok_r) {
               atomicAdd(&s_alt_cnt[j][r], 1u);
@@ -1004,8 +1024,8 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
                 bool tri_checked = false;
                 int ml_b = 1;
 #pragma unroll
-                for (int rp = 0; rp < 6; ++rp) {
-                  if (nxt == s_top[j + 1][rp]) {
+                for (int rp = 0; rp < kMaxTreeK; ++rp) {
+                  if (rp < tk && nxt == s_top[j + 1][rp]) {
                     atomicAdd(&s_bg_cnt[j][r][rp], 1u);
                     if (!tri_checked) {
                       tri_checked = true;
@@ -1031,27 +1051,39 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       }
     }
 
-    // Pass 2b: collaborative 256-thread anti-echo compaction of active 30B recycle log entries into SMEM.
-    if (tr.mode != 0 && tr_log != nullptr && tr_state != nullptr && tr_cap > 0) {
+    // Pass 2b: warp-0 deterministic (__ballot_sync + __popc, zero atomicAdd) anti-echo compaction of active 30B recycle log entries into SMEM.
+    if (warp == 0 && tr.mode != 0 && tr_log != nullptr && tr_state != nullptr && tr_cap > 0) {
       int n_log = tr_state[0];
       if (n_log > tr_cap) n_log = tr_cap;
       const int cur_st = s_tr_cur_step;
-      for (int idx = n_log - 1 - tid; idx >= 0; idx -= 256) {
-        const int base8 = idx * 8;
-        const int32_t st_t = tr_log[base8 + 5];
-        const int32_t tier_t = tr_log[base8 + 7];
-        const int32_t u_val = tr_log[base8 + 4];
-        if ((tier_t == 0 || (cur_st - st_t) == 1) && u_val >= 0 && u_val < vocab_size) {
-          const int dst = atomicAdd(&s_tr_active_n, 1);
-          if (dst < kTrActiveCap) {
-            s_tr_cur[dst] = tr_log[base8 + 1];
-            s_tr_p1[dst] = tr_log[base8 + 2];
-            s_tr_p2[dst] = tr_log[base8 + 3];
-            s_tr_u[dst] = u_val;
-            s_tr_st[dst] = st_t;
-            s_tr_pos_tier[dst] = (tr_log[base8 + 6] << 1) | (tier_t & 1);
-          }
+      const uint32_t lane_lt = (1u << lane) - 1u;
+      int out_n = 0;
+      for (int base_idx = n_log - 1; base_idx >= 0 && out_n < kTrActiveCap; base_idx -= 32) {
+        const int idx = base_idx - lane;
+        bool keep = false;
+        int base8 = 0;
+        int32_t st_t = 0, tier_t = 0, u_val = -1;
+        if (idx >= 0) {
+          base8 = idx * 8;
+          st_t = tr_log[base8 + 5];
+          tier_t = tr_log[base8 + 7];
+          u_val = tr_log[base8 + 4];
+          keep = ((tier_t == 0 || (cur_st - st_t) == 1) && u_val >= 0 && u_val < vocab_size);
         }
+        const uint32_t msk = __ballot_sync(0xffffffffu, keep);
+        const int dst = out_n + __popc(msk & lane_lt);
+        if (keep && dst < kTrActiveCap) {
+          s_tr_cur[dst] = tr_log[base8 + 1];
+          s_tr_p1[dst] = tr_log[base8 + 2];
+          s_tr_p2[dst] = tr_log[base8 + 3];
+          s_tr_u[dst] = u_val;
+          s_tr_st[dst] = st_t;
+          s_tr_pos_tier[dst] = (tr_log[base8 + 6] << 1) | (tier_t & 1);
+        }
+        out_n += __popc(msk);
+      }
+      if (lane == 0) {
+        s_tr_active_n = (out_n > kTrActiveCap) ? kTrActiveCap : out_n;
       }
     }
 
@@ -1064,7 +1096,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         if (wu > 0u) atomicAdd(&s_anc_u1_cnt[j], wu);
       }
 #pragma unroll
-      for (int r = 0; r < 6; ++r) {
+      for (int r = 0; r < kMaxTreeK; ++r) {
         const uint32_t cwm = __reduce_max_sync(0xffffffffu, c_k[j][r]);
         if (lane == 0) s_w_cand_key[warp][j][r] = cwm;
       }
@@ -1081,7 +1113,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         const uint32_t fm = __reduce_max_sync(0xffu, s_w_pl_key[lane][j]);
         if (lane == 0) s_pl_key[j] = fm;
 #pragma unroll
-        for (int r = 0; r < 6; ++r) {
+        for (int r = 0; r < kMaxTreeK; ++r) {
           const uint32_t cfm = __reduce_max_sync(0xffu, s_w_cand_key[lane][j][r]);
           if (lane == 0) s_cand_key[j][r] = cfm;
         }
@@ -1093,7 +1125,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     if (lane < 6) {
       s_pl_key[lane] = 0u;
 #pragma unroll
-      for (int r = 0; r < 6; ++r) {
+      for (int r = 0; r < kMaxTreeK; ++r) {
         s_cand_key[lane][r] = 0u;
       }
     }
@@ -1113,13 +1145,14 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       const int pos_j = p0_i32 + j;
 
       int u_cnt = 0, u_min = 2147483647, u_max = -1;
-      int bg_c = 0, bg_min = 2147483647, bg_max = -1;
+      int bg_c = 0, bg_t0_c = 0, bg_min = 2147483647, bg_max = -1;
       int tri_c = 0, tri_min = 2147483647, tri_max = -1;
       int near_c = 0, near_min = 2147483647, near_max = -1;
       int a1_pos_c = 0, a1_pos_min = 2147483647, a1_pos_max = -1;
       int a1_bg_c = 0, a1_bg_min = 2147483647, a1_bg_max = -1;
-      int tot_a1 = 0, a1_v1 = 0, a1_v2 = 0, a1_v3 = 0, a1_v4 = 0, a1_v5 = 0;
-      const int32_t t1 = s_top[j][1], t2 = s_top[j][2], t3 = s_top[j][3], t4 = s_top[j][4], t5 = s_top[j][5];
+      int tot_a1 = 0, a1_v1 = 0, a1_v2 = 0, a1_v3 = 0, a1_v4 = 0, a1_v5 = 0, a1_v6 = 0, a1_v7 = 0;
+      const int32_t t1 = s_top[j][1], t2 = s_top[j][2], t3 = s_top[j][3], t4 = s_top[j][4];
+      const int32_t t5 = s_top[j][5], t6 = s_top[j][6], t7 = s_top[j][7];
 
       for (int idx = lane; idx < n_act; idx += 32) {
         if (s_tr_cur[idx] != cur) continue;
@@ -1144,6 +1177,8 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           if (u_t == t3) a1_v3 += w;
           if (u_t == t4) a1_v4 += w;
           if (u_t == t5) a1_v5 += w;
+          if (u_t == t6) a1_v6 += w;
+          if (u_t == t7) a1_v7 += w;
         }
         if (age == 1 && dist <= 3 && u_t != cur) {
           a1_pos_c += 1;
@@ -1162,6 +1197,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         }
         if (prv1 >= 0 && p1_t == prv1) {
           bg_c += 1;
+          if (tier_t == 0) bg_t0_c += 1;
           if (u_t < bg_min) bg_min = u_t;
           if (u_t > bg_max) bg_max = u_t;
           if (prv2 >= 0 && p2_t == prv2) {
@@ -1177,6 +1213,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         u_min = __reduce_min_sync(0xffffffffu, u_min);
         u_max = __reduce_max_sync(0xffffffffu, u_max);
         bg_c = __reduce_add_sync(0xffffffffu, bg_c);
+        bg_t0_c = __reduce_add_sync(0xffffffffu, bg_t0_c);
         bg_min = __reduce_min_sync(0xffffffffu, bg_min);
         bg_max = __reduce_max_sync(0xffffffffu, bg_max);
         tri_c = __reduce_add_sync(0xffffffffu, tri_c);
@@ -1197,22 +1234,36 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         a1_v3 = __reduce_add_sync(0xffffffffu, a1_v3);
         a1_v4 = __reduce_add_sync(0xffffffffu, a1_v4);
         a1_v5 = __reduce_add_sync(0xffffffffu, a1_v5);
+        a1_v6 = __reduce_add_sync(0xffffffffu, a1_v6);
+        a1_v7 = __reduce_add_sync(0xffffffffu, a1_v7);
 
         if (lane == 0) {
-          const int a1_v[6] = {0, a1_v1, a1_v2, a1_v3, a1_v4, a1_v5};
           const uint32_t anc_u1 = s_anc_u1_cnt[j];
-          for (int rk = 1; rk < 6; ++rk) {
-            const int32_t cand = s_top[j][rk];
-            if (cand < 0) continue;
-            float b = 0.0f;
-            if (tri_c >= 1 && tri_min == tri_max && tri_min == cand && tr.b_t6_tri > b) b = tr.b_t6_tri;
-            if (bg_c >= 1 && bg_min == bg_max && bg_min == cand && tr.b_t6_bg > b) b = tr.b_t6_bg;
-            if (near_c >= 1 && near_min == near_max && near_min == cand && u_min == u_max && anc_u1 <= 3u) {
-              if (tr.b_t6_near > b) b = tr.b_t6_near;
-            } else if (tot_a1 >= 2 && a1_v[rk] * 3 >= tot_a1 * 2 && anc_u1 <= 3u) {
-              if (tr.b_t6_near > b) b = tr.b_t6_near;
+          const int32_t dk0 = s_top[j][0];
+          if (dk0 >= 0) {
+            float b0 = 0.0f;
+            if (tri_c >= 1 && tri_min == tri_max && tri_min == dk0 && tr.b_d1_tri > b0) b0 = tr.b_d1_tri;
+            if (bg_t0_c >= 1 && bg_min == bg_max && bg_min == dk0 && tr.b_d1_bg > b0) b0 = tr.b_d1_bg;
+            s_tr_b_rk[j][0] = b0;
+          }
+#pragma unroll
+          for (int rk = 1; rk < kMaxTreeK; ++rk) {
+            if (rk < tk) {
+              const int32_t cand = s_top[j][rk];
+              if (cand >= 0) {
+                const int a1_vr = (rk == 1) ? a1_v1 : ((rk == 2) ? a1_v2 : ((rk == 3) ? a1_v3 :
+                                  ((rk == 4) ? a1_v4 : ((rk == 5) ? a1_v5 : ((rk == 6) ? a1_v6 : a1_v7)))));
+                float b = 0.0f;
+                if (tri_c >= 1 && tri_min == tri_max && tri_min == cand && tr.b_t6_tri > b) b = tr.b_t6_tri;
+                if (bg_c >= 1 && bg_min == bg_max && bg_min == cand && tr.b_t6_bg > b) b = tr.b_t6_bg;
+                if (near_c >= 1 && near_min == near_max && near_min == cand && u_min == u_max && anc_u1 <= 3u) {
+                  if (tr.b_t6_near > b) b = tr.b_t6_near;
+                } else if (tot_a1 >= 2 && a1_vr * 3 >= tot_a1 * 2 && anc_u1 <= 3u) {
+                  if (tr.b_t6_near > b) b = tr.b_t6_near;
+                }
+                s_tr_b_rk[j][rk] = b;
+              }
             }
-            s_tr_b_rk[j][rk] = b;
           }
           const int32_t dk32 = static_cast<int32_t>(s_dk[j]);
           if (tri_c >= 2 && tri_min == tri_max && tri_min != dk32 && tr.oov_tri_p > 0.0f) {
@@ -1237,7 +1288,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     __syncwarp();
   }
 
-  // Pass 3 (warp 0 only): calibrated probabilities + online Empirical-Bayes + DDTree + Multi-Future Cascade 9-leaf EV tree.
+  // Pass 3 (warp 0 only): calibrated probabilities + online Empirical-Bayes + DDTree (0 stack spill).
   if (tid < 6) {
     const int base = tid * tree_k;
     const float z0 = s_z0[tid];
@@ -1274,43 +1325,44 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         const float a_base = kCalA[tid] + ck.a_shift + eb_delta_a;
         const float a_pre = a_base + ck.w_sm_pre * sm_c + ck.w_z0_pre * z0_c;
         const float a_post = a_base + ck.a2 + ck.w_z0_post * z0_c;
-        float e0[6], e1[6];
         float den0 = 1.0f, den1 = 1.0f;
 #pragma unroll
-        for (int rk = 0; rk < 6; ++rk) {
-          const int64_t tok_r = tree_top[base + rk];
-          const float zr = tree_vals[base + rk];
-          if (rk == 0 || (tok_r >= 0 && zr > -1e20f)) {
-            const float dz = zr - z0;
-            float b_pl = 0.0f;
-            if (pl.mode != 0 && s_hist_ok != 0) {
-              const int raw_ml = static_cast<int>(s_cand_key[tid][rk] >> 16);
-              if (raw_ml >= 1) {
-                const int ml = (raw_ml > 6) ? 6 : raw_ml;
-                b_pl = (rk == 0) ? pl.boost_d1[ml] : pl.boost_alt[ml];
+        for (int rk = 0; rk < kMaxTreeK; ++rk) {
+          float v0 = 0.0f;
+          float v1 = 0.0f;
+          if (rk < tk) {
+            const int64_t tok_r = tree_top[base + rk];
+            const float zr = tree_vals[base + rk];
+            if (rk == 0 || (tok_r >= 0 && zr > -1e20f)) {
+              const float dz = zr - z0;
+              float b_pl = 0.0f;
+              if (pl.mode != 0 && s_hist_ok != 0) {
+                const int raw_ml = static_cast<int>(s_cand_key[tid][rk] >> 16);
+                if (raw_ml >= 1) {
+                  const int ml = (raw_ml > 6) ? 6 : raw_ml;
+                  b_pl = (rk == 0) ? pl.boost_d1[ml] : pl.boost_alt[ml];
+                }
               }
+              const float b_tr = s_tr_b_rk[tid][rk];
+              const float b_eff = (b_pl > b_tr) ? b_pl : b_tr;
+              const float g0 = kCalC[rk] + ck.beta * dz + b_eff;
+              const float g1 = kCalC[rk] + ck.beta_post * dz;
+              v0 = __expf(a_pre + g0);
+              v1 = __expf(a_post + g1);
             }
-            const float b_tr = s_tr_b_rk[tid][rk];
-            const float b_eff = (b_pl > b_tr) ? b_pl : b_tr;
-            const float g0 = kCalC[rk] + ck.beta * dz + b_eff;
-            const float g1 = kCalC[rk] + ck.beta_post * dz;
-            e0[rk] = __expf(a_pre + g0);
-            e1[rk] = __expf(a_post + g1);
-          } else {
-            e0[rk] = 0.0f;
-            e1[rk] = 0.0f;
           }
-          den0 += e0[rk];
-          den1 += e1[rk];
+          s_e0[tid][rk] = v0;
+          s_e1[tid][rk] = v1;
+          den0 += v0;
+          den1 += v1;
         }
 #pragma unroll
-        for (int rk = 0; rk < 6; ++rk) {
-          s_pr[tid][rk] = e0[rk] / den0;
-          s_e1[tid][rk] = e1[rk];
+        for (int rk = 0; rk < kMaxTreeK; ++rk) {
+          s_pr[tid][rk] = s_e0[tid][rk] / den0;
         }
         s_den1[tid] = den1;
-        s_p1post[tid] = e1[0] / den1;
-        s_p2post[tid] = (e1[1] / den1) * ck.alt2_scale;
+        s_p1post[tid] = s_e1[tid][0] / den1;
+        s_p2post[tid] = (s_e1[tid][1] / den1) * ck.alt2_scale;
         s_Z[tid] = den0;
         s_p1[tid] = s_pr[tid][0];
         s_p_oov[tid] = 1.0f / den0;
@@ -1318,13 +1370,15 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         float sum_e = 1.0f;
         float last_e = 0.0f;
 #pragma unroll
-        for (int rk = 1; rk < 6; ++rk) {
-          const int64_t tok_r = tree_top[base + rk];
-          const float zr = tree_vals[base + rk];
-          if (tok_r >= 0 && zr > -1e20f) {
-            const float er = __expf((zr - z0) * inv_temp);
-            sum_e += er;
-            last_e = er;
+        for (int rk = 1; rk < kMaxTreeK; ++rk) {
+          if (rk < tk) {
+            const int64_t tok_r = tree_top[base + rk];
+            const float zr = tree_vals[base + rk];
+            if (tok_r >= 0 && zr > -1e20f) {
+              const float er = __expf((zr - z0) * inv_temp);
+              sum_e += er;
+              last_e = er;
+            }
           }
         }
         const float z_tot = sum_e + tail_c * last_e;
@@ -1336,7 +1390,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         s_p2post[tid] = 0.0f;
         s_den1[tid] = 1.0f;
 #pragma unroll
-        for (int rk = 0; rk < 6; ++rk) {
+        for (int rk = 0; rk < kMaxTreeK; ++rk) {
           s_e1[tid][rk] = 0.0f;
         }
       }
@@ -1348,12 +1402,12 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       s_p2post[tid] = 0.0f;
       s_den1[tid] = 1.0f;
 #pragma unroll
-      for (int rk = 0; rk < 6; ++rk) {
+      for (int rk = 0; rk < kMaxTreeK; ++rk) {
         s_e1[tid][rk] = 0.0f;
       }
     }
 
-    // Calibrate Pass-2 coherent Future-B (mode==1) or Pass-1 saved backup (mode==2) logits.
+    // Calibrate Pass-2 coherent Future-B (mode==1) or Pass-1 saved backup (mode==2) logits (0 stack arrays).
     s_casc_top[tid][0] = -1;
     s_casc_top[tid][1] = -1;
     s_casc_p1[tid] = 0.0f;
@@ -1381,31 +1435,30 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         const int rel_j = (s_casc_mode == 1 && tid > s_casc_b) ? (tid - (s_casc_b + 1)) : tid;
         const float ca_pre = kCalA[rel_j] + ck.a_shift + eb_delta_a +
                              ck.w_sm_pre * c_sm + ck.w_z0_pre * c_z0;
-        float ce[6];
-        float cerel[6];
+        float ce0 = 0.0f, ce1 = 0.0f, cerel0 = 0.0f, cerel1 = 0.0f;
         float cden = 1.0f;
         float cden_rel = 0.0f;
 #pragma unroll
         for (int rk = 0; rk < 6; ++rk) {
           const int64_t ctr = cascade_toks[cbase + rk];
           const float czr = cascade_vals[cbase + rk];
+          float vr_rel = 0.0f, vr_e = 0.0f;
           if (rk == 0 || (ctr >= 0 && ctr < static_cast<int64_t>(vocab_size) && czr > -1e20f)) {
             const float cg = kCalC[rk] + ck.beta * (czr - cz0);
-            cerel[rk] = __expf(cg);
-            ce[rk] = __expf(ca_pre + cg);
-          } else {
-            cerel[rk] = 0.0f;
-            ce[rk] = 0.0f;
+            vr_rel = __expf(cg);
+            vr_e = __expf(ca_pre + cg);
           }
-          cden_rel += cerel[rk];
-          cden += ce[rk];
+          if (rk == 0) { cerel0 = vr_rel; ce0 = vr_e; }
+          else if (rk == 1) { cerel1 = vr_rel; ce1 = vr_e; }
+          cden_rel += vr_rel;
+          cden += vr_e;
         }
         const float cinv_rel = (cden_rel > 0.0f) ? (1.0f / cden_rel) : 0.0f;
-        const float cp1_raw = ce[0] / cden;
-        const float cp2_raw = (s_casc_top[tid][1] >= 0) ? (ce[1] / cden) : 0.0f;
+        const float cp1_raw = ce0 / cden;
+        const float cp2_raw = (s_casc_top[tid][1] >= 0) ? (ce1 / cden) : 0.0f;
         if (s_casc_mode == 1 && tid > s_casc_b) {
-          const float cq1 = cerel[0] * cinv_rel;
-          const float cq2 = (s_casc_top[tid][1] >= 0) ? (cerel[1] * cinv_rel) : 0.0f;
+          const float cq1 = cerel0 * cinv_rel;
+          const float cq2 = (s_casc_top[tid][1] >= 0) ? (cerel1 * cinv_rel) : 0.0f;
           s_casc_p1[tid] = (cp1_raw > 0.78f * cq1) ? cp1_raw : (0.78f * cq1);
           s_casc_p2[tid] = (cp2_raw > 0.72f * cq2) ? cp2_raw : (0.72f * cq2);
         } else {
@@ -1417,6 +1470,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   }
   __syncwarp();
 
+  const int num_1lvl = 6 * (tk - 1);
   if (tid == 0) {
     float a = 1.0f;
     for (int j = 0; j < 6; ++j) {
@@ -1428,11 +1482,20 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       }
     }
     s_any_active = 0;
-    s_num_cands = 30;
+    s_num_cands = num_1lvl;
   }
   __syncwarp();
 
-  // Initialize 30 1-level DFlash candidates in slots 0..29, clear slots 30..kCandCap-1.
+  auto cand_lh = [&](int k_pos, int hpos_v, int ml_v) -> float {
+    if (ac.lh_copy_w > 0.0f && k_pos < 6 && pl.mode != 0 && s_hist_ok != 0 &&
+        hpos_v >= 0 && hpos_v + 1 < s_win && ml_v >= pl.cont_from_df_n) {
+      const int nml = (ml_v + 1 > 6) ? 6 : (ml_v + 1);
+      return 1.0f + ac.lh_copy_w * pl.cont_p[nml];
+    }
+    return 1.0f;
+  };
+
+  // Clear all kCandCap slots across warp 0, then populate 6*(tk-1) 1-level DFlash roots.
 #pragma unroll
   for (int off = 0; off < kCandCap; off += 32) {
     s_cand_score[tid + off] = -1.0f;
@@ -1441,9 +1504,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     s_cand_ml[tid + off] = 0;
     s_cand_rk[tid + off] = -1;
   }
-  if (tid < 30) {
-    const int row_idx = tid / 5;                  // 0..5 -> depth k = row_idx + 1
-    const int rank = 1 + (tid - row_idx * 5);     // 1..5 -> candidate rank #2..#6
+  for (int ci = tid; ci < num_1lvl; ci += 32) {
+    const int row_idx = ci / (tk - 1);                  // 0..5 -> depth k = row_idx + 1
+    const int rank = 1 + (ci - row_idx * (tk - 1));     // 1..(tk-1) -> candidate rank #2..#tk
     if (s_valid_row[row_idx] && s_A[row_idx] > 0.0f) {
       const int base = row_idx * tree_k;
       const int64_t cand = tree_top[base + rank];
@@ -1463,35 +1526,44 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             ? s_pr[row_idx][rank]
             : (eff_gamma * __expf((zr - s_z0[row_idx]) * inv_temp) / s_Z[row_idx]);
         const float cprob = s_A[row_idx] * pr;
-        s_cand_score[tid] = cprob;
-        s_cand_prob[tid] = cprob;
-        s_cand_tok[tid] = cand;
-        s_cand_k[tid] = static_cast<int8_t>(row_idx + 1);
-        s_cand_par[tid] = -1;
-        s_cand_depth[tid] = 1;
-        s_cand_kind[tid] = 0;
-        s_cand_rk[tid] = static_cast<int8_t>(rank);
+        int hp_i = -1;
+        int ml_i = 0;
         if (pl.mode != 0 && s_hist_ok != 0) {
           const uint32_t ck_j = s_cand_key[row_idx][rank];
           if (ck_j != 0u) {
-            s_cand_hpos[tid] = static_cast<int16_t>((ck_j & 0xFFFFu) + 1u);
-            s_cand_ml[tid] = static_cast<int8_t>(ck_j >> 16);
+            hp_i = static_cast<int>((ck_j & 0xFFFFu) + 1u);
+            ml_i = static_cast<int>(ck_j >> 16);
+            s_cand_hpos[ci] = static_cast<int16_t>(hp_i);
+            s_cand_ml[ci] = static_cast<int8_t>(ml_i);
           }
         }
+        float lh = cand_lh(row_idx + 1, hp_i, ml_i);
+        if (ac.skip_lh_w > 0.0f && row_idx < 5 && s_valid_row[row_idx + 1] != 0 && cand == s_dk[row_idx + 1]) {
+          lh *= (1.0f + ac.skip_lh_w * s_p1[row_idx + 1]);
+        }
+        s_cand_prob[ci] = cprob;
+        s_cand_score[ci] = cprob * lh;
+        s_cand_tok[ci] = cand;
+        s_cand_k[ci] = static_cast<int8_t>(row_idx + 1);
+        s_cand_par[ci] = -1;
+        s_cand_depth[ci] = 1;
+        s_cand_kind[ci] = 0;
+        s_cand_rk[ci] = static_cast<int8_t>(rank);
       }
     }
   }
   __syncwarp();
 
-  // Inject standalone OOV prompt-lookup & monomorphic 30B recycled roots (and floor in-top-6 copy candidates).
-  if (tid == 0 && (pl.mode != 0 || tr.mode != 0 || tr.det_sh_root != 0) && s_hist_ok != 0 && s_win >= 2) {
+  // Inject standalone OOV prompt-lookup, left-shift (M>16), & monomorphic 30B recycled roots.
+  if (tid == 0 && (pl.mode != 0 || tr.mode != 0 || tr.det_sh_root != 0 || ac.skip_root_bg > 0.0f) &&
+      s_hist_ok != 0 && s_win >= 2) {
     bool any_pl_root = false;
     bool any_boost = false;
     bool any_tr_boost = false;
     bool any_tr_root = false;
     for (int j = 0; j < 6; ++j) {
       if (!s_valid_row[j] || !(s_A[j] > 0.0f)) continue;
-      for (int rk = 0; rk < 6; ++rk) {
+      for (int rk = 0; rk < tk; ++rk) {
         if (pl.mode != 0) {
           const int raw_cml = static_cast<int>(s_cand_key[j][rk] >> 16);
           if (raw_cml >= 1) {
@@ -1544,31 +1616,36 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             const float j_scale = (j == 0) ? 1.0f : pl.mid_scale;
             const float pl_s = s_A[j] * gate * rw * j_scale;
             int ex_slot = -1;
-            for (int r = 0; r < 5; ++r) {
-              const int sl = j * 5 + r;
+            for (int r = 0; r < tk - 1; ++r) {
+              const int sl = j * (tk - 1) + r;
               if (s_cand_prob[sl] > -0.5f && s_cand_tok[sl] == tok) {
                 ex_slot = sl;
                 break;
               }
             }
+            const float lh = cand_lh(j + 1, hpos, eff_ml);
             if (ex_slot >= 0) {
+              if (s_cand_hpos[ex_slot] < 0 || eff_ml > static_cast<int>(s_cand_ml[ex_slot])) {
+                s_cand_hpos[ex_slot] = static_cast<int16_t>(hpos);
+                s_cand_ml[ex_slot] = static_cast<int8_t>(eff_ml);
+              }
               if (pl.in_top6_floor != 0) {
                 const float t6_s = s_A[j] * (1.0f - s_p1[j]) * t6w * j_scale;
                 const float fl_s = (t6_s > pl_s) ? t6_s : pl_s;
                 if (fl_s > s_cand_prob[ex_slot]) {
                   s_cand_prob[ex_slot] = fl_s;
-                  s_cand_score[ex_slot] = fl_s;
                   any_pl_root = true;
                 }
               }
-              if (s_cand_hpos[ex_slot] < 0 || eff_ml > static_cast<int>(s_cand_ml[ex_slot])) {
-                s_cand_hpos[ex_slot] = static_cast<int16_t>(hpos);
-                s_cand_ml[ex_slot] = static_cast<int8_t>(eff_ml);
+              const float upd_sc = s_cand_prob[ex_slot] *
+                  cand_lh(j + 1, static_cast<int>(s_cand_hpos[ex_slot]), static_cast<int>(s_cand_ml[ex_slot]));
+              if (upd_sc > s_cand_score[ex_slot]) {
+                s_cand_score[ex_slot] = upd_sc;
               }
             } else if (pl_s > 0.0f && s_num_cands < kCandCap) {
               const int slot = s_num_cands++;
-              s_cand_score[slot] = pl_s;
               s_cand_prob[slot] = pl_s;
+              s_cand_score[slot] = pl_s * lh;
               s_cand_tok[slot] = tok;
               s_cand_k[slot] = static_cast<int8_t>(j + 1);
               s_cand_par[slot] = -1;
@@ -1579,6 +1656,36 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
               s_cand_rk[slot] = -1;
               any_pl_root = true;
             }
+          }
+        }
+      }
+      // Left-shift (skip-1) history-confirmed root on 25-leaf wide tree (M>16).
+      if (tree_m > 16 && calib_mode != 0 && j <= 3 && s_valid_row[j + 1] != 0 &&
+          ac.skip_root_bg > 0.0f && s_skip_bg[j] != 0u) {
+        const int64_t sk_tok = s_dk[j + 1];
+        if (sk_tok >= 0 && sk_tok != s_dk[j] && s_num_cands < kCandCap) {
+          int ex_sk = -1;
+          for (int ic = 0; ic < s_num_cands; ++ic) {
+            if (s_cand_prob[ic] > -0.5f && static_cast<int>(s_cand_k[ic]) == j + 1 &&
+                static_cast<int>(s_cand_par[ic]) == -1 && s_cand_tok[ic] == sk_tok) {
+              ex_sk = ic;
+              break;
+            }
+          }
+          const float sk_p = s_A[j] * (1.0f - s_p1[j]) * ac.skip_root_bg;
+          const float sk_lh = 1.0f + ac.skip_lh_w * s_p1[j + 1];
+          if (ex_sk < 0 && sk_p > 0.0f) {
+            const int slot = s_num_cands++;
+            s_cand_prob[slot] = sk_p;
+            s_cand_score[slot] = sk_p * sk_lh;
+            s_cand_tok[slot] = sk_tok;
+            s_cand_k[slot] = static_cast<int8_t>(j + 1);
+            s_cand_par[slot] = -1;
+            s_cand_depth[slot] = 1;
+            s_cand_kind[slot] = 10;
+            s_cand_hpos[slot] = -1;
+            s_cand_ml[slot] = 0;
+            s_cand_rk[slot] = -1;
           }
         }
       }
@@ -1603,7 +1710,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           if (ex_slot >= 0) {
             if (tr_s > s_cand_prob[ex_slot]) {
               s_cand_prob[ex_slot] = tr_s;
-              s_cand_score[ex_slot] = tr_s;
+              const float upd_sc = tr_s * cand_lh(
+                  j + 1, static_cast<int>(s_cand_hpos[ex_slot]), static_cast<int>(s_cand_ml[ex_slot]));
+              if (upd_sc > s_cand_score[ex_slot]) s_cand_score[ex_slot] = upd_sc;
               any_tr_root = true;
             }
           } else if (tr_s > 0.0f && s_num_cands < kCandCap) {
@@ -1635,14 +1744,13 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   // Seed Multi-Future Cascade root (mode==1 Future-B branch, or mode==2 first diverging Pass-1 backup).
   if (tid == 0 && s_casc_mode != 0) {
     if (s_casc_mode == 1) {
-      const int ex = s_casc_b * 5 + (s_casc_r - 1);
-      if (ex >= 0 && ex < 30 && s_cand_prob[ex] > 0.0f) {
-        // Prevent low-z0 / EB OOV inflation from starving the Future-B root when no OOV PL match exists.
+      const int ex = s_casc_b * (tk - 1) + (s_casc_r - 1);
+      if (ex >= 0 && ex < num_1lvl && s_cand_prob[ex] > 0.0f) {
         const int b_base = s_casc_b * tree_k;
         const float bz0 = tree_vals[b_base + 0];
         float bden_rel = 0.0f;
         float ber_star = 0.0f;
-        for (int rk = 0; rk < 6; ++rk) {
+        for (int rk = 0; rk < tk; ++rk) {
           const int64_t btok = tree_top[b_base + rk];
           const float bzr = tree_vals[b_base + rk];
           if (rk == 0 || (btok >= 0 && bzr > -1e20f)) {
@@ -1680,8 +1788,8 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         const float p_bk = s_A[m_div] * csk.backup_w * (1.0f - s_p1[m_div]) * s_casc_p1[m_div];
         const float lh = (m_div + 1 < 6) ? (1.0f + csk.lookahead_w * s_casc_p1[m_div + 1]) : 1.0f;
         int ex_slot = -1;
-        for (int r = 0; r < 5; ++r) {
-          const int sl = m_div * 5 + r;
+        for (int r = 0; r < tk - 1; ++r) {
+          const int sl = m_div * (tk - 1) + r;
           if (s_cand_prob[sl] > -0.5f && s_cand_tok[sl] == old_tok) {
             ex_slot = sl;
             break;
@@ -1764,6 +1872,8 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           int u_tot_c = 0, t0_u_c = 0, u_min_c = 2147483647, u_max_c = -1;
           int bg_t0_c = 0, bg_min_c = 2147483647, bg_max_c = -1;
           int tri_t0_c = 0, tri_min_c = 2147483647, tri_max_c = -1;
+          int a1_bg_c = 0, a1_bg_min = 2147483647, a1_bg_max = -1;
+          int a1_tri_c = 0, a1_tri_min = 2147483647, a1_tri_max = -1;
           int near_c = 0;
 
           for (int idx = lane; idx < n_act; idx += 32) {
@@ -1782,14 +1892,26 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             if (u_t < u_min_c) u_min_c = u_t;
             if (u_t > u_max_c) u_max_c = u_t;
             if (age <= 2 && dist <= 12) near_c += 1;
-            if (pv_r >= 0 && p1_t == pv_r && tier_t == 0) {
-              bg_t0_c += 1;
-              if (u_t < bg_min_c) bg_min_c = u_t;
-              if (u_t > bg_max_c) bg_max_c = u_t;
-              if (pv2_r >= 0 && p2_t == pv2_r) {
-                tri_t0_c += 1;
-                if (u_t < tri_min_c) tri_min_c = u_t;
-                if (u_t > tri_max_c) tri_max_c = u_t;
+            if (pv_r >= 0 && p1_t == pv_r) {
+              if (tier_t == 0) {
+                bg_t0_c += 1;
+                if (u_t < bg_min_c) bg_min_c = u_t;
+                if (u_t > bg_max_c) bg_max_c = u_t;
+                if (pv2_r >= 0 && p2_t == pv2_r) {
+                  tri_t0_c += 1;
+                  if (u_t < tri_min_c) tri_min_c = u_t;
+                  if (u_t > tri_max_c) tri_max_c = u_t;
+                }
+              }
+              if (age == 1 && dist <= 8) {
+                a1_bg_c += 1;
+                if (u_t < a1_bg_min) a1_bg_min = u_t;
+                if (u_t > a1_bg_max) a1_bg_max = u_t;
+                if (pv2_r >= 0 && p2_t == pv2_r) {
+                  a1_tri_c += 1;
+                  if (u_t < a1_tri_min) a1_tri_min = u_t;
+                  if (u_t > a1_tri_max) a1_tri_max = u_t;
+                }
               }
             }
           }
@@ -1806,57 +1928,79 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             tri_t0_c = __reduce_add_sync(0xffffffffu, tri_t0_c);
             tri_min_c = __reduce_min_sync(0xffffffffu, tri_min_c);
             tri_max_c = __reduce_max_sync(0xffffffffu, tri_max_c);
+            a1_bg_c = __reduce_add_sync(0xffffffffu, a1_bg_c);
+            a1_bg_min = __reduce_min_sync(0xffffffffu, a1_bg_min);
+            a1_bg_max = __reduce_max_sync(0xffffffffu, a1_bg_max);
+            a1_tri_c = __reduce_add_sync(0xffffffffu, a1_tri_c);
+            a1_tri_min = __reduce_min_sync(0xffffffffu, a1_tri_min);
+            a1_tri_max = __reduce_max_sync(0xffffffffu, a1_tri_max);
 
             int sh_occ = 0;
             bool sh_conflict = false;
             bool sh_bg_conflict = false;
+            bool sh_a1_conflict = false;
             const bool is_tri_mono = (tri_t0_c >= 2 && tri_min_c == tri_max_c);
             if (!is_tri_mono && ((bg_t0_c >= 1 && bg_min_c == bg_max_c) ||
+                                 (a1_bg_c >= 1 && a1_bg_min == a1_bg_max) ||
                                  (u_min_c == u_max_c && u_min_c != tok32))) {
               int my_occ = 0;
               int my_conf = 0;
               int my_bg_conf = 0;
+              int my_a1_conf = 0;
               const int win_m1 = s_win - 1;
               for (int hi = lane; hi < win_m1; hi += 32) {
                 if (s_h[hi] == tok32) {
                   my_occ += 1;
                   const int32_t nxt_h = s_h[hi + 1];
                   if (nxt_h != u_min_c) my_conf = 1;
-                  if (hi >= 1 && s_h[hi - 1] == pv_r && nxt_h != bg_min_c) my_bg_conf = 1;
+                  if (hi >= 1 && s_h[hi - 1] == pv_r) {
+                    if (nxt_h != bg_min_c) my_bg_conf = 1;
+                    if (nxt_h != a1_bg_min) my_a1_conf = 1;
+                  }
                 }
               }
               sh_occ = __reduce_add_sync(0xffffffffu, my_occ);
               sh_conflict = (__ballot_sync(0xffffffffu, my_conf) != 0u);
               sh_bg_conflict = (__ballot_sync(0xffffffffu, my_bg_conf) != 0u);
+              sh_a1_conflict = (__ballot_sync(0xffffffffu, my_a1_conf) != 0u);
             }
 
             if (lane == 0) {
               const int j_ch = k_w;
-              auto in_ch_top6 = [&](int32_t cand_c) -> bool {
+              auto in_ch_topK = [&](int32_t cand_c) -> bool {
                 if (!s_valid_row[j_ch]) return false;
 #pragma unroll
-                for (int rp = 0; rp < 6; ++rp) {
-                  if (s_top[j_ch][rp] == cand_c) return true;
+                for (int rp = 0; rp < kMaxTreeK; ++rp) {
+                  if (rp < tk && s_top[j_ch][rp] == cand_c) return true;
                 }
                 return false;
               };
               if (is_tri_mono) {
                 s_tr_ch_tok = static_cast<int64_t>(tri_min_c);
-                s_tr_ch_p = in_ch_top6(tri_min_c) ? tr.ch_bg_t6 : tr.ch_bg_oov;
+                s_tr_ch_p = in_ch_topK(tri_min_c) ? tr.ch_bg_t6 : tr.ch_bg_oov;
               } else if (bg_t0_c >= 2 && bg_min_c == bg_max_c &&
-                         (!sh_bg_conflict || (near_c >= 2 && in_ch_top6(bg_min_c)))) {
+                         (!sh_bg_conflict || (near_c >= 2 && in_ch_topK(bg_min_c)))) {
                 s_tr_ch_tok = static_cast<int64_t>(bg_min_c);
-                s_tr_ch_p = in_ch_top6(bg_min_c) ? tr.ch_bg_t6 : tr.ch_bg_oov;
+                s_tr_ch_p = in_ch_topK(bg_min_c) ? tr.ch_bg_t6 : tr.ch_bg_oov;
+              } else if (a1_tri_c >= 1 && a1_tri_min == a1_tri_max && a1_tri_min != tok32 &&
+                         !sh_a1_conflict && tr.ch_a1_bg_t6 > 0.0f) {
+                s_tr_ch_tok = static_cast<int64_t>(a1_tri_min);
+                s_tr_ch_p = in_ch_topK(a1_tri_min) ? tr.ch_bg_t6 : tr.ch_a1_bg_oov;
               } else if (bg_t0_c >= 1 && bg_min_c == bg_max_c && !sh_bg_conflict &&
-                         tr.ch_bg1_t6 > 0.0f && in_ch_top6(bg_min_c)) {
+                         tr.ch_bg1_t6 > 0.0f && in_ch_topK(bg_min_c)) {
                 s_tr_ch_tok = static_cast<int64_t>(bg_min_c);
                 s_tr_ch_p = tr.ch_bg1_t6;
+              } else if (a1_bg_c >= 1 && a1_bg_min == a1_bg_max && a1_bg_min != tok32 &&
+                         !sh_a1_conflict && tr.ch_a1_bg_t6 > 0.0f &&
+                         (a1_bg_c >= 2 || in_ch_topK(a1_bg_min))) {
+                s_tr_ch_tok = static_cast<int64_t>(a1_bg_min);
+                s_tr_ch_p = in_ch_topK(a1_bg_min) ? tr.ch_a1_bg_t6 : tr.ch_a1_bg_oov;
               } else if (u_min_c == u_max_c && u_min_c != tok32) {
-                const bool in_t6 = in_ch_top6(u_min_c);
+                const bool in_tk = in_ch_topK(u_min_c);
                 if (near_c >= 1 && !sh_conflict && (sh_occ == 0 || (t0_u_c >= 2 && sh_occ <= 3))) {
                   s_tr_ch_tok = static_cast<int64_t>(u_min_c);
-                  s_tr_ch_p = in_t6 ? tr.ch_near_t6 : tr.ch_near_oov;
-                } else if (in_t6 && t0_u_c >= 1 && u_tot_c >= 2 && sh_occ <= 3) {
+                  s_tr_ch_p = in_tk ? tr.ch_near_t6 : tr.ch_near_oov;
+                } else if (in_tk && t0_u_c >= 1 && u_tot_c >= 2 && sh_occ <= 3) {
                   s_tr_ch_tok = static_cast<int64_t>(u_min_c);
                   s_tr_ch_p = tr.ch_t6_agree;
                 }
@@ -1868,9 +2012,13 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       }
     }
     if (tid == 0) {
+      const float best_prob = (best_s > 0.0f) ? s_cand_prob[best_idx] : -1.0f;
+      if (best_s > 0.0f) {
+        s_cand_score[best_idx] = -1.0f;
+        s_cand_prob[best_idx] = -1.0f;
+      }
       const int64_t sel_tok = (best_s > 0.0f) ? s_cand_tok[best_idx] : -1;
       if (best_s > 0.0f && sel_tok >= 0 && sel_tok < static_cast<int64_t>(vocab_size)) {
-        const float best_prob = s_cand_prob[best_idx];
         const int64_t tok = sel_tok;
         const int k_r = static_cast<int>(s_cand_k[best_idx]);
         const int par = static_cast<int>(s_cand_par[best_idx]);
@@ -1879,8 +2027,6 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         const int hpos = static_cast<int>(s_cand_hpos[best_idx]);
         const int ml = static_cast<int>(s_cand_ml[best_idx]);
         const int rk_in_row = static_cast<int>(s_cand_rk[best_idx]);
-        s_cand_score[best_idx] = -1.0f;
-        s_cand_prob[best_idx] = -1.0f;
         if (kind == 8 || kind == 9) {
           casc_row_mask |= (1u << r);
           if (stats != nullptr && stats_len >= 48) {
@@ -1898,6 +2044,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           pkd = s_row_packed[par] | ((static_cast<uint32_t>(r) & 0x1Fu) << (5 * (dp - 1)));
         }
         s_row_base_sub[r] = b_sub;
+        s_row_depth[r] = dp;
         s_row_packed[r] = pkd;
 
         input_ids[r] = static_cast<int32_t>(tok);
@@ -1912,18 +2059,21 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         leaf_flag[1 + 3 * r + 2] = static_cast<int32_t>(pkd);
         s_any_active = 1;
 
-        // Dynamically spawn depth+1 children (up to eff_max_depth <= 6, k_child <= 6).
+        // Dynamically spawn depth+1 children (up to eff_max_depth <= 6, k_child <= 6, 0 stack spill).
         if (li + 1 < num_leaves && dp < eff_max_depth && k_r < 6 && saved_leaf_parent != nullptr) {
           const int k_child = k_r + 1;
           const int j_par = k_r - 1;  // 0..4
           const int j_ch = k_r;       // 1..5
-          int64_t spawned[12];
           int n_spawned = 0;
           auto already_spawned = [&](int64_t t) -> bool {
+            const int32_t t32 = static_cast<int32_t>(t);
             for (int si = 0; si < n_spawned; ++si) {
-              if (spawned[si] == t) return true;
+              if (s_spawned[si] == t32) return true;
             }
             return false;
+          };
+          auto record_spawn = [&](int64_t t) {
+            if (n_spawned < 16) s_spawned[n_spawned++] = static_cast<int32_t>(t);
           };
           const int root_ml = (kind == 5) ? (ml - (dp - 1)) : ml;
           const int max_pl_dp = (root_ml <= 4) ? pl.max_dp_4 : ((root_ml == 5) ? pl.max_dp_5 : pl.max_dp_6);
@@ -1939,73 +2089,66 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             stats[38] += 1;
           }
 
-          // Compute smoothed Markov bigram/trigram + 0.00ms Anti-Chimera post-miss distribution.
+          // Compute smoothed Markov bigram/trigram + 0.00ms Anti-Chimera post-miss distribution (SMEM scratch).
           const bool allow_bg_kind =
               (kind == 0) || (bg.bg_sub != 0 && kind == 1) || (bg.bg_off != 0 && (kind == 3 || kind == 6));
           const bool use_bg = (calib_mode != 0 && (bg.bg_mode != 0 || ac.ac_mode != 0) && s_hist_ok != 0 &&
                                s_valid_row[j_ch] != 0 && rk_in_row >= 0 && allow_bg_kind);
           const uint32_t ac_u = use_bg ? s_alt_cnt[j_par][rk_in_row] : 0u;
           const uint32_t m3 = use_bg ? s_bg3_mask[j_par][rk_in_row] : 0u;
-          float p_post_vec[6];
           uint32_t bg_mask = 0u;
           bool has_p_post_vec = false;
-          if (calib_mode != 0 && s_valid_row[j_ch] != 0 && kind < 8) {
-            float deltas[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+          if (calib_mode != 0 && s_valid_row[j_ch] != 0 && (kind < 8 || kind == 10)) {
             bool any_delta = false;
+            float den1_mod = 1.0f;
             const float inv_den = (ac_u > 0u) ? (1.0f / (static_cast<float>(ac_u) + bg.bg_alpha)) : 0.0f;
             const float min_p = (kind == 1) ? bg.sub_min_p : bg.bg_min_p;
             const float fwd_pen = (ac.ac_mode != 0 && use_bg && static_cast<int>(ac_u) >= ac.min_u)
                 ? fminf(ac.fwd_cap, ac.fwd_lambda * __logf(1.0f + static_cast<float>(ac_u) / ac.fwd_alpha))
                 : 0.0f;
 #pragma unroll
-            for (int rp = 0; rp < 6; ++rp) {
-              float dv = 0.0f;
-              const uint32_t cnt_rp = (use_bg && ac_u > 0u) ? s_bg_cnt[j_par][rk_in_row][rp] : 0u;
-              if (bg.bg_mode != 0 && cnt_rp > 0u) {
-                const float p_bg = static_cast<float>(cnt_rp) * inv_den;
-                const bool is3 = ((m3 & (1u << rp)) != 0u) && (p_bg >= bg.tri_min_p);
-                if (p_bg >= min_p) dv += bg.f2 + bg.w2 * p_bg;
-                if (is3) dv += bg.f3 + bg.w3 * p_bg;
-                if (dv > 0.0f) bg_mask |= (1u << rp);
-              } else if (ac.ac_mode != 0 && cnt_rp == 0u) {
-                // 1) Forward Anti-Chimera Contradiction: u occurred repeatedly in history & NEVER preceded v.
-                if (fwd_pen > 0.0f) {
-                  dv -= (kind == 1) ? (0.5f * fwd_pen) : fwd_pen;
-                }
-                // 2) Reverse Exclusive-Owner Anti-Chimera Penalty: v repeatedly follows d_j#1, NEVER u.
-                if (use_bg && kind != 1 && rk_in_row >= 1) {
-                  const uint32_t vin = s_in_cnt[j_par][rp];
-                  const uint32_t own_cnt = s_bg_cnt[j_par][0][rp];
-                  if (static_cast<int>(vin) >= ac.min_v && own_cnt > 0u) {
-                    const float ofrac = static_cast<float>(own_cnt) / (static_cast<float>(vin) + ac.rev_alpha);
-                    dv -= fminf(ac.rev_cap, ac.rev_lambda * ofrac);
+            for (int rp = 0; rp < kMaxTreeK; ++rp) {
+              float ev = 0.0f;
+              if (rp < tk) {
+                ev = s_e1[j_ch][rp];
+                float dv = 0.0f;
+                const uint32_t cnt_rp = (use_bg && ac_u > 0u) ? s_bg_cnt[j_par][rk_in_row][rp] : 0u;
+                if (bg.bg_mode != 0 && cnt_rp > 0u) {
+                  const float p_bg = static_cast<float>(cnt_rp) * inv_den;
+                  const bool is3 = ((m3 & (1u << rp)) != 0u) && (p_bg >= bg.tri_min_p);
+                  if (p_bg >= min_p) dv += bg.f2 + bg.w2 * p_bg;
+                  if (is3) dv += bg.f3 + bg.w3 * p_bg;
+                  if (dv > 0.0f) bg_mask |= (1u << rp);
+                } else if (ac.ac_mode != 0 && cnt_rp == 0u) {
+                  if (fwd_pen > 0.0f) {
+                    dv -= (kind == 1) ? (0.5f * fwd_pen) : fwd_pen;
+                  }
+                  if (use_bg && kind != 1 && rk_in_row >= 1) {
+                    const uint32_t vin = s_in_cnt[j_par][rp];
+                    const uint32_t own_cnt = s_bg_cnt[j_par][0][rp];
+                    if (static_cast<int>(vin) >= ac.min_v && own_cnt > 0u) {
+                      const float ofrac = static_cast<float>(own_cnt) / (static_cast<float>(vin) + ac.rev_alpha);
+                      dv -= fminf(ac.rev_cap, ac.rev_lambda * ofrac);
+                    }
+                  }
+                  if (rp == 0 && kind == 0 && ac.ent_lambda > 0.0f &&
+                      s_margin[j_par] < 2.0f && s_p1[j_ch] < 0.75f) {
+                    dv -= ac.ent_lambda * (1.0f - s_p1[j_ch]) * (1.0f - 0.5f * s_margin[j_par]);
                   }
                 }
-                // 3) Cross-Position Entropy-Coupling Chimera Discount on unverified off-chain sub (rp==0).
-                if (rp == 0 && kind == 0 && ac.ent_lambda > 0.0f &&
-                    s_margin[j_par] < 2.0f && s_p1[j_ch] < 0.75f) {
-                  dv -= ac.ent_lambda * (1.0f - s_p1[j_ch]) * (1.0f - 0.5f * s_margin[j_par]);
+                if (dv != 0.0f) {
+                  any_delta = true;
+                  if (ev > 0.0f) ev *= __expf(dv);
                 }
               }
-              deltas[rp] = dv;
-              if (dv != 0.0f) any_delta = true;
+              s_p_post_vec[rp] = ev;
+              den1_mod += ev;
             }
             if (any_delta) {
-              float e1_mod[6];
-              float den1_mod = 1.0f;
-#pragma unroll
-              for (int rp = 0; rp < 6; ++rp) {
-                float ev = s_e1[j_ch][rp];
-                if (ev > 0.0f && deltas[rp] != 0.0f) {
-                  ev *= __expf(deltas[rp]);
-                }
-                e1_mod[rp] = ev;
-                den1_mod += ev;
-              }
               const float inv_d1 = 1.0f / den1_mod;
 #pragma unroll
-              for (int rp = 0; rp < 6; ++rp) {
-                p_post_vec[rp] = e1_mod[rp] * inv_d1;
+              for (int rp = 0; rp < kMaxTreeK; ++rp) {
+                s_p_post_vec[rp] *= inv_d1;
               }
               has_p_post_vec = true;
             }
@@ -2061,7 +2204,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
                 s_cand_hpos[slot] = agrees_pl1 ? static_cast<int16_t>(hpos + 1) : -1;
                 s_cand_ml[slot] = agrees_pl1 ? static_cast<int8_t>(next_ml) : 0;
                 s_cand_rk[slot] = -1;
-                spawned[n_spawned++] = c1;
+                record_spawn(c1);
               }
             }
             if (kind == 8 && s_num_cands < kCandCap) {
@@ -2085,14 +2228,14 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
                   s_cand_hpos[slot] = agrees_pl2 ? static_cast<int16_t>(hpos + 1) : -1;
                   s_cand_ml[slot] = agrees_pl2 ? static_cast<int8_t>(next_ml) : 0;
                   s_cand_rk[slot] = -1;
-                  spawned[n_spawned++] = c2;
+                  record_spawn(c2);
                 }
               }
             }
           }
 
-          // 1) Aligned substitution continuation (`sub`, kind=1): d_{k_r+1}#1 = s_dk[k_r].
-          if ((kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 5 || kind == 6 || kind == 7) &&
+          // 1) Aligned substitution continuation (`sub`, kind=1): d_{k_r+1}#1 = s_dk[k_r] (with anti-stutter).
+          if ((kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 5 || kind == 6 || kind == 7 || kind == 10) &&
               s_valid_row[j_ch] && s_num_cands < kCandCap) {
             const int64_t sub_tok = s_dk[j_ch];
             const bool agrees_pl = (can_pl_cont && pl_next_tok == sub_tok && pl_cp > 0.0f);
@@ -2100,24 +2243,27 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             float p_cont;
             if (kind == 1) {
               p_cont = s_p1[j_ch];
-              if (has_p_post_vec && ((bg_mask & 1u) != 0u) && p_post_vec[0] > p_cont) {
-                p_cont = p_post_vec[0];
+              if (has_p_post_vec && ((bg_mask & 1u) != 0u) && s_p_post_vec[0] > p_cont) {
+                p_cont = s_p_post_vec[0];
               }
             } else {
-              p_cont = has_p_post_vec ? p_post_vec[0] : s_p1post[j_ch];
+              p_cont = has_p_post_vec ? s_p_post_vec[0] : s_p1post[j_ch];
             }
             if (agrees_pl && pl_cp > p_cont) p_cont = pl_cp;
             if (agrees_tr && tr_ch_p > p_cont) p_cont = tr_ch_p;
-            const float child_s = (calib_mode != 0)
+            if (sub_tok == tok && !agrees_pl && !agrees_tr && ((bg_mask & 1u) == 0u)) {
+              p_cont *= ac.stutter_scale;
+            }
+            const float child_p = (calib_mode != 0)
                 ? (best_prob * p_cont)
                 : (best_prob * ((kind == 0) ? sub_coef : cont_decay) * s_p1[j_ch]);
-            if (child_s > 0.0f && sub_tok >= 0 && !already_spawned(sub_tok)) {
+            if (child_p > 0.0f && sub_tok >= 0 && !already_spawned(sub_tok)) {
               int16_t ch_hp = -1;
               int8_t ch_ml = 0;
               resolve_bg_hpos(0, agrees_pl, ch_hp, ch_ml);
               const int slot = s_num_cands++;
-              s_cand_score[slot] = child_s;
-              s_cand_prob[slot] = child_s;
+              s_cand_prob[slot] = child_p;
+              s_cand_score[slot] = child_p * cand_lh(k_child, static_cast<int>(ch_hp), static_cast<int>(ch_ml));
               s_cand_tok[slot] = sub_tok;
               s_cand_k[slot] = static_cast<int8_t>(k_child);
               s_cand_par[slot] = static_cast<int8_t>(r);
@@ -2126,36 +2272,71 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
               s_cand_hpos[slot] = ch_hp;
               s_cand_ml[slot] = ch_ml;
               s_cand_rk[slot] = 0;
-              spawned[n_spawned++] = sub_tok;
+              record_spawn(sub_tok);
             }
           }
-          // 2) Post-miss top-2 (`alt2`, kind=3) + Markov-coherent / 30B-recycled r'=2..5 (`coh_cont`, kind=6).
-          if (calib_mode != 0 && s_valid_row[j_ch] && kind < 8) {
-            for (int rp = 1; rp < 6; ++rp) {
+          // 1b) Left-shift / deletion recovery (`skip-1`, kind=10): s_dk[k_r + 1] when tok == s_dk[k_r] or kind==10.
+          if (calib_mode != 0 && ac.skip_coef > 0.0f && k_r + 1 < 6 && s_valid_row[k_r + 1] != 0 &&
+              (tok == s_dk[k_r] || kind == 10) && s_num_cands < kCandCap) {
+            const int64_t skip_tok = s_dk[k_r + 1];
+            if (skip_tok >= 0 && !already_spawned(skip_tok)) {
+              const bool agrees_pl = (can_pl_cont && pl_next_tok == skip_tok && pl_cp > 0.0f);
+              const bool agrees_tr = (tr_ch_tok == skip_tok && tr_ch_p > 0.0f);
+              float p_skip = ((kind == 10) ? cont_decay : ac.skip_coef) * s_p1[k_r + 1];
+              if (agrees_pl && pl_cp > p_skip) p_skip = pl_cp;
+              if (agrees_tr && tr_ch_p > p_skip) p_skip = tr_ch_p;
+              const float child_p = best_prob * p_skip;
+              if (child_p > 0.0f) {
+                const int ch_hp_i = agrees_pl ? (hpos + 1) : -1;
+                const int ch_ml_i = agrees_pl ? next_ml : 0;
+                float sk_lh = cand_lh(k_child, ch_hp_i, ch_ml_i);
+                if (ac.skip_lh_w > 0.0f && k_r + 2 < 6 && s_valid_row[k_r + 2] != 0) {
+                  sk_lh *= (1.0f + ac.skip_lh_w * s_p1[k_r + 2]);
+                }
+                const int slot = s_num_cands++;
+                s_cand_prob[slot] = child_p;
+                s_cand_score[slot] = child_p * sk_lh;
+                s_cand_tok[slot] = skip_tok;
+                s_cand_k[slot] = static_cast<int8_t>(k_child);
+                s_cand_par[slot] = static_cast<int8_t>(r);
+                s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
+                s_cand_kind[slot] = 10;
+                s_cand_hpos[slot] = static_cast<int16_t>(ch_hp_i);
+                s_cand_ml[slot] = static_cast<int8_t>(ch_ml_i);
+                s_cand_rk[slot] = -1;
+                record_spawn(skip_tok);
+              }
+            }
+          }
+          // 2) Post-miss top-2 (`alt2`, kind=3) + Markov-coherent / 30B-recycled / wide r'=2..tk-1 (`coh_cont`, kind=6).
+          if (calib_mode != 0 && s_valid_row[j_ch] && (kind < 8 || kind == 10)) {
+            for (int rp = 1; rp < tk; ++rp) {
               if (s_num_cands >= kCandCap) break;
               const int64_t ctok = tree_top[j_ch * tree_k + rp];
               if (ctok < 0 || already_spawned(ctok)) continue;
               const bool is_bg_hit = ((bg_mask & (1u << rp)) != 0u);
               const bool agrees_tr = (tr_ch_tok == ctok && tr_ch_p > 0.0f);
               const bool allow_wide = (tree_m > 16) &&
-                  ((kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 7) && (rp == 1 || rp == 2));
+                  (((kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 6 || kind == 7 || kind == 10) &&
+                    (rp == 1 || rp == 2)) ||
+                   (rp == 3 && kind == 0 && k_r <= 2 && s_margin[j_ch] < 1.8f));
               if (!(((kind == 0 || kind == 4 || kind == 7) && rp == 1) || allow_wide || is_bg_hit || agrees_tr)) {
                 continue;
               }
               const bool agrees_pl = (can_pl_cont && pl_next_tok == ctok && pl_cp > 0.0f);
               float p_c = has_p_post_vec
-                  ? ((rp == 1) ? (p_post_vec[1] * ck.alt2_scale) : p_post_vec[rp])
+                  ? ((rp == 1) ? (s_p_post_vec[1] * ck.alt2_scale) : s_p_post_vec[rp])
                   : ((rp == 1) ? s_p2post[j_ch] : (s_e1[j_ch][rp] / s_den1[j_ch]));
               if (agrees_pl && pl_cp > p_c) p_c = pl_cp;
               if (agrees_tr && tr_ch_p > p_c) p_c = tr_ch_p;
-              const float child_s = best_prob * p_c;
-              if (child_s > 0.0f) {
+              const float child_p = best_prob * p_c;
+              if (child_p > 0.0f) {
                 int16_t ch_hp = -1;
                 int8_t ch_ml = 0;
                 resolve_bg_hpos(rp, agrees_pl, ch_hp, ch_ml);
                 const int slot = s_num_cands++;
-                s_cand_score[slot] = child_s;
-                s_cand_prob[slot] = child_s;
+                s_cand_prob[slot] = child_p;
+                s_cand_score[slot] = child_p * cand_lh(k_child, static_cast<int>(ch_hp), static_cast<int>(ch_ml));
                 s_cand_tok[slot] = ctok;
                 s_cand_k[slot] = static_cast<int8_t>(k_child);
                 s_cand_par[slot] = static_cast<int8_t>(r);
@@ -2164,7 +2345,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
                 s_cand_hpos[slot] = ch_hp;
                 s_cand_ml[slot] = ch_ml;
                 s_cand_rk[slot] = static_cast<int8_t>(rp);
-                spawned[n_spawned++] = ctok;
+                record_spawn(ctok);
               }
             }
           }
@@ -2177,7 +2358,10 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
               float p_shf;
               if (kind == 0 || kind == 4 || kind == 7) {
                 if (bg.shf_cal != 0 && kind == 0 && rk_in_row >= 1) {
-                  p_shf = (s_hist_ok != 0 && s_shf_bg[j_par][rk_in_row - 1] != 0u) ? bg.shf_hi : bg.shf_lo;
+                  const float unseen_shf = (tree_m > 16 && ac.shf_unseen_scale > 0.0f)
+                      ? fmaxf(bg.shf_lo, ac.shf_unseen_scale * s_p1[k_r - 1])
+                      : bg.shf_lo;
+                  p_shf = (s_hist_ok != 0 && s_shf_bg[j_par][rk_in_row - 1] != 0u) ? bg.shf_hi : unseen_shf;
                 } else {
                   p_shf = ck.shf;
                 }
@@ -2186,22 +2370,24 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
               }
               if (agrees_pl && pl_cp > p_shf) p_shf = pl_cp;
               if (agrees_tr && tr_ch_p > p_shf) p_shf = tr_ch_p;
-              const float child_s = (calib_mode != 0)
+              const float child_p = (calib_mode != 0)
                   ? (best_prob * p_shf)
                   : ((kind == 0) ? (best_prob * shf_coef) : (best_prob * cont_decay * s_p1[k_r - 1]));
-              if (child_s > 0.0f) {
+              if (child_p > 0.0f) {
+                const int ch_hp_i = agrees_pl ? (hpos + 1) : -1;
+                const int ch_ml_i = agrees_pl ? next_ml : 0;
                 const int slot = s_num_cands++;
-                s_cand_score[slot] = child_s;
-                s_cand_prob[slot] = child_s;
+                s_cand_prob[slot] = child_p;
+                s_cand_score[slot] = child_p * cand_lh(k_child, ch_hp_i, ch_ml_i);
                 s_cand_tok[slot] = shf_tok;
                 s_cand_k[slot] = static_cast<int8_t>(k_child);
                 s_cand_par[slot] = static_cast<int8_t>(r);
                 s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
                 s_cand_kind[slot] = 2;
-                s_cand_hpos[slot] = agrees_pl ? static_cast<int16_t>(hpos + 1) : -1;
-                s_cand_ml[slot] = agrees_pl ? static_cast<int8_t>(next_ml) : 0;
+                s_cand_hpos[slot] = static_cast<int16_t>(ch_hp_i);
+                s_cand_ml[slot] = static_cast<int8_t>(ch_ml_i);
                 s_cand_rk[slot] = -1;
-                spawned[n_spawned++] = shf_tok;
+                record_spawn(shf_tok);
               }
             }
           }
@@ -2209,11 +2395,11 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           if (can_pl_cont && pl_next_tok >= 0 && pl_cp > 0.0f &&
               !already_spawned(pl_next_tok) && s_num_cands < kCandCap) {
             const float p_use = (tr_ch_tok == pl_next_tok && tr_ch_p > pl_cp) ? tr_ch_p : pl_cp;
-            const float child_s = best_prob * p_use;
-            if (child_s > 0.0f) {
+            const float child_p = best_prob * p_use;
+            if (child_p > 0.0f) {
               const int slot = s_num_cands++;
-              s_cand_score[slot] = child_s;
-              s_cand_prob[slot] = child_s;
+              s_cand_prob[slot] = child_p;
+              s_cand_score[slot] = child_p * cand_lh(k_child, hpos + 1, next_ml);
               s_cand_tok[slot] = pl_next_tok;
               s_cand_k[slot] = static_cast<int8_t>(k_child);
               s_cand_par[slot] = static_cast<int8_t>(r);
@@ -2222,7 +2408,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
               s_cand_hpos[slot] = static_cast<int16_t>(hpos + 1);
               s_cand_ml[slot] = static_cast<int8_t>(next_ml);
               s_cand_rk[slot] = -1;
-              spawned[n_spawned++] = pl_next_tok;
+              record_spawn(pl_next_tok);
             }
           }
           // 5) Branch-conditioned unique OOV successor (deterministic nxt occurring >=2 times in s_h).
@@ -2236,20 +2422,22 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
               if (!already_spawned(utok)) {
                 float p_u = (uc == 2u) ? bg.uniq_p2 : bg.uniq_p3;
                 if (tr_ch_tok == utok && tr_ch_p > p_u) p_u = tr_ch_p;
-                const float child_s = best_prob * p_u;
-                if (child_s > 0.0f) {
+                const float child_p = best_prob * p_u;
+                if (child_p > 0.0f) {
+                  const int hp_u = static_cast<int>(s_uniq_hp[j_par][rk_in_row - 1]);
+                  const int ml_u = (uc == 2u) ? 3 : 4;
                   const int slot = s_num_cands++;
-                  s_cand_score[slot] = child_s;
-                  s_cand_prob[slot] = child_s;
+                  s_cand_prob[slot] = child_p;
+                  s_cand_score[slot] = child_p * cand_lh(k_child, hp_u, ml_u);
                   s_cand_tok[slot] = utok;
                   s_cand_k[slot] = static_cast<int8_t>(k_child);
                   s_cand_par[slot] = static_cast<int8_t>(r);
                   s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
                   s_cand_kind[slot] = 5;
-                  s_cand_hpos[slot] = static_cast<int16_t>(s_uniq_hp[j_par][rk_in_row - 1]);
-                  s_cand_ml[slot] = (uc == 2u) ? 3 : 4;
+                  s_cand_hpos[slot] = static_cast<int16_t>(hp_u);
+                  s_cand_ml[slot] = static_cast<int8_t>(ml_u);
                   s_cand_rk[slot] = -1;
-                  spawned[n_spawned++] = utok;
+                  record_spawn(utok);
                 }
               }
             }
@@ -2257,11 +2445,11 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           // 6) Pure 30B Target-Recycled OOV continuation (`tr_cont`, kind=7).
           if (calib_mode != 0 && tr_ch_tok >= 0 && tr_ch_p > 0.0f &&
               !already_spawned(tr_ch_tok) && s_num_cands < kCandCap) {
-            const float child_s = best_prob * tr_ch_p;
-            if (child_s > 0.0f) {
+            const float child_p = best_prob * tr_ch_p;
+            if (child_p > 0.0f) {
               const int slot = s_num_cands++;
-              s_cand_score[slot] = child_s;
-              s_cand_prob[slot] = child_s;
+              s_cand_prob[slot] = child_p;
+              s_cand_score[slot] = child_p;
               s_cand_tok[slot] = tr_ch_tok;
               s_cand_k[slot] = static_cast<int8_t>(k_child);
               s_cand_par[slot] = static_cast<int8_t>(r);
@@ -2270,12 +2458,13 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
               s_cand_hpos[slot] = -1;
               s_cand_ml[slot] = 0;
               s_cand_rk[slot] = -1;
-              spawned[n_spawned++] = tr_ch_tok;
+              record_spawn(tr_ch_tok);
             }
           }
         }
       } else {
         s_row_base_sub[r] = -1;
+        s_row_depth[r] = 0;
         s_row_packed[r] = 0u;
         input_ids[r] = input_ids[0];
         saved_leaf_toks[r] = -1;
@@ -2310,10 +2499,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         pos_r = p0_i32 + saved_leaf_k[tid];
       }
     }
-    saved_row_ctx[tid * 4 + 0] = cur_r;
-    saved_row_ctx[tid * 4 + 1] = prv1_r;
-    saved_row_ctx[tid * 4 + 2] = prv2_r;
-    saved_row_ctx[tid * 4 + 3] = pos_r;
+    reinterpret_cast<int4*>(saved_row_ctx)[tid] = make_int4(cur_r, prv1_r, prv2_r, pos_r);
   }
 
   if (tid == 0) {
@@ -2324,7 +2510,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   }
 }
 
-__global__ void native_leaf_commit_tree_kernel(
+__global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
     int32_t* __restrict__ leaf_flag,
     int32_t* __restrict__ prev_ns,
     int32_t* __restrict__ hit_flag,
@@ -2353,211 +2539,317 @@ __global__ void native_leaf_commit_tree_kernel(
     int tr_cap,
     int vocab_size,
     int chain_all_valid,
-    int32_t* __restrict__ cascade_meta) {
-  const int mode = leaf_flag[0];
-  leaf_flag[0] = 0;  // Clear immediately so non-tree steps see 0.
-  int32_t ns = num_sampled[0];
-  int32_t nr = num_rejected[0];
-  const int32_t raw_ns = ns;
-  uint32_t casc_row_mask = 0u;
-  int32_t casc_m_div1 = 0;
-  if (cascade_meta != nullptr) {
-    casc_row_mask = static_cast<uint32_t>(cascade_meta[5]);
-    casc_m_div1 = cascade_meta[6];
-    cascade_meta[5] = 0;
-    cascade_meta[6] = 0;
-  }
-  int32_t casc_hit_cnt = 0;
-  int32_t raw_u[32];
-  const bool can_rec_tr = (no_hit_mode == 0 && tr_log != nullptr && tr_state != nullptr &&
-                           saved_row_ctx != nullptr && tr_cap > 0);
-  if (can_rec_tr) {
-    // Only fused lmpost populates sampled_tokens[raw_ns..6]; stock rejection_sampler allocates
-    // sampled with new_empty and leaves slots >= raw_ns uninitialized, so never read past raw_ns
-    // unless chain_all_valid != 0, and always range-check against vocab_size.
-    const int chain_lim = (chain_all_valid != 0) ? 7 : ((raw_ns < 0) ? 0 : ((raw_ns < 7) ? raw_ns : 7));
-    for (int r = 0; r < 7 && r < tree_m; ++r) {
-      if (r < chain_lim) {
-        const int64_t v = sampled_tokens[r];
-        raw_u[r] = (v >= 0 && v < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v) : -1;
+    int32_t* __restrict__ cascade_meta,
+    const uint8_t* __restrict__ in_static_vocab,
+    int32_t* __restrict__ tail_ids,
+    int32_t* __restrict__ tail_count,
+    int32_t* __restrict__ tail_seen,
+    int max_tail,
+    int oov_preadmit_mode) {
+  const int lane = threadIdx.x;
+  __shared__ int32_t s_raw_u[32];
+  __shared__ uint32_t s_exact_mask;
+  __shared__ uint32_t s_matched_mask;
+  __shared__ int32_t s_eff_raw_ns;
+  __shared__ int32_t s_final_ns;
+  __shared__ int32_t s_len0;
+  __shared__ int32_t s_step_id;
+  __shared__ int32_t s_ctx_p0;
+  __shared__ int32_t s_do_tr;
+  __shared__ int32_t s_do_oov;
+
+  const int32_t init_ns = num_sampled[0];
+  if (lane < tree_m) {
+    int32_t uv = -1;
+    if (no_hit_mode == 0) {
+      if (lane < 7) {
+        const int chain_lim = (chain_all_valid != 0) ? 7 : ((init_ns < 0) ? 0 : ((init_ns < 7) ? init_ns : 7));
+        if (lane < chain_lim) {
+          const int64_t v = sampled_tokens[lane];
+          uv = (v >= 0 && v < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v) : -1;
+        }
       } else {
-        raw_u[r] = -1;
+        const int64_t v = leaf_u_toks[lane - 7];
+        uv = (v >= 0 && v < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v) : -1;
       }
     }
-    for (int r = 7; r < tree_m; ++r) {
-      const int64_t v = leaf_u_toks[r - 7];
-      raw_u[r] = (v >= 0 && v < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v) : -1;
-    }
+    s_raw_u[lane] = uv;
   }
-  uint32_t matched_mask = 0u;
-  int32_t hit_dst0 = 0;
-  int32_t hit_src0 = 0;
-  int32_t hit_len = 0;
+  __syncwarp();
 
-  // Supports arbitrary-depth (1..6-level) commits up to ns == 7 (nr == 0) strictly preserving ns + nr == 7.
-  if (mode < 0 && ns >= 1 && ns <= 6 && no_hit_mode == 0) {
-    int32_t cur_parent = -1;
-    for (int stage = 0; stage < 6 && ns <= 6; ++stage) {
-      const int64_t tok_k = sampled_tokens[ns - 1];
-      int matched_r = -1;
-      for (int r = 7; r < tree_m; ++r) {
-        const int32_t par = (saved_leaf_parent != nullptr) ? saved_leaf_parent[r] : -1;
-        if (par == cur_parent && saved_leaf_k[r] == ns &&
-            saved_leaf_toks[r] >= 0 && tok_k == saved_leaf_toks[r]) {
-          matched_r = r;
-          break;
+  if (lane == 0) {
+    const int mode = leaf_flag[0];
+    leaf_flag[0] = 0;  // Clear immediately so non-tree steps see 0.
+    int32_t ns = init_ns;
+    int32_t nr = num_rejected[0];
+    const int32_t raw_ns = ns;
+    uint32_t casc_row_mask = 0u;
+    int32_t casc_m_div1 = 0;
+    if (cascade_meta != nullptr) {
+      casc_row_mask = static_cast<uint32_t>(cascade_meta[5]);
+      casc_m_div1 = cascade_meta[6];
+      cascade_meta[5] = 0;
+      cascade_meta[6] = 0;
+    }
+    int32_t casc_hit_cnt = 0;
+    uint32_t matched_mask = 0u;
+    int32_t hit_dst0 = 0;
+    int32_t hit_src0 = 0;
+    int32_t hit_len = 0;
+
+    // Supports arbitrary-depth (1..6-level) commits up to ns == 7 (nr == 0) strictly preserving ns + nr == 7.
+    if (mode < 0 && ns >= 1 && ns <= 6 && no_hit_mode == 0) {
+      int32_t cur_parent = -1;
+      for (int stage = 0; stage < 6 && ns <= 6; ++stage) {
+        const int64_t tok_k = sampled_tokens[ns - 1];
+        int matched_r = -1;
+        for (int r = 7; r < tree_m; ++r) {
+          const int32_t par = (saved_leaf_parent != nullptr) ? saved_leaf_parent[r] : -1;
+          if (par == cur_parent && saved_leaf_k[r] == ns &&
+              saved_leaf_toks[r] >= 0 && tok_k == saved_leaf_toks[r]) {
+            matched_r = r;
+            break;
+          }
+        }
+        if (matched_r < 0) break;
+        const int32_t u_r = s_raw_u[matched_r];
+        if (u_r < 0) break;
+        matched_mask |= (1u << matched_r);
+        const int32_t dst_r = ns;
+        sampled_tokens[dst_r] = static_cast<int64_t>(u_r);
+        if ((casc_row_mask & (1u << matched_r)) != 0u) {
+          casc_hit_cnt += 1;
+        }
+        if (hit_len == 0) {
+          hit_dst0 = dst_r;
+          hit_src0 = matched_r;
+        }
+        if (hit_flag_len >= 2 + 2 * (hit_len + 1)) {
+          hit_flag[2 + 2 * hit_len] = dst_r;
+          hit_flag[3 + 2 * hit_len] = matched_r;
+        }
+        hit_len += 1;
+        ns += 1;
+        nr -= 1;
+        cur_parent = matched_r;
+      }
+      if (hit_len > 0) {
+        num_sampled[0] = ns;
+        num_rejected[0] = nr;
+      }
+    }
+
+    hit_flag[0] = hit_dst0;
+    if (hit_flag_len >= 2) {
+      hit_flag[1] = hit_len;
+    }
+    hit_src_row[0] = hit_src0;
+    prev_ns[0] = ns;
+    s_eff_raw_ns = raw_ns;
+    s_final_ns = ns;
+    s_matched_mask = matched_mask;
+    s_exact_mask = 0u;
+    s_do_oov = (no_hit_mode == 0 && oov_preadmit_mode > 0 &&
+                in_static_vocab != nullptr && tail_ids != nullptr &&
+                tail_count != nullptr && tail_seen != nullptr && max_tail > 0 &&
+                saved_pos0 != nullptr && saved_pos0[0] >= 1)
+        ? 1
+        : 0;
+
+    // Append exact committed tokens (including tree leaf hits!) directly to token history.
+    if (hist != nullptr && hist_len != nullptr && saved_pos0 != nullptr) {
+      const int64_t p0 = saved_pos0[0];
+      if (p0 >= 0 && hist_len[0] == static_cast<int32_t>(p0 + 1)) {
+        const int64_t new_len = p0 + 1 + ns;
+        if (new_len <= hist_cap) {
+          for (int i = 0; i < ns; ++i) {
+            hist[p0 + 1 + i] = static_cast<int32_t>(sampled_tokens[i]);
+          }
+          hist_len[0] = static_cast<int32_t>(new_len);
+        } else {
+          hist_len[0] = -1;
         }
       }
-      if (matched_r < 0) break;
-      matched_mask |= (1u << matched_r);
-      const int32_t dst_r = ns;
-      sampled_tokens[dst_r] = leaf_u_toks[matched_r - 7];
-      if ((casc_row_mask & (1u << matched_r)) != 0u) {
-        casc_hit_cnt += 1;
-      }
-      if (hit_len == 0) {
-        hit_dst0 = dst_r;
-        hit_src0 = matched_r;
-      }
-      if (hit_flag_len >= 2 + 2 * (hit_len + 1)) {
-        hit_flag[2 + 2 * hit_len] = dst_r;
-        hit_flag[3 + 2 * hit_len] = matched_r;
-      }
-      hit_len += 1;
-      ns += 1;
-      nr -= 1;
-      cur_parent = matched_r;
     }
-    if (hit_len > 0) {
-      num_sampled[0] = ns;
-      num_rejected[0] = nr;
-    }
-  }
 
-  hit_flag[0] = hit_dst0;
-  if (hit_flag_len >= 2) {
-    hit_flag[1] = hit_len;
-  }
-  hit_src_row[0] = hit_src0;
-  prev_ns[0] = ns;
-
-  // Append exact committed tokens (including tree leaf hits!) directly to token history.
-  if (hist != nullptr && hist_len != nullptr && saved_pos0 != nullptr) {
-    const int64_t p0 = saved_pos0[0];
-    if (p0 >= 0 && hist_len[0] == static_cast<int32_t>(p0 + 1)) {
-      const int64_t new_len = p0 + 1 + ns;
-      if (new_len <= hist_cap) {
-        for (int i = 0; i < ns; ++i) {
-          hist[p0 + 1 + i] = static_cast<int32_t>(sampled_tokens[i]);
+    int32_t do_tr = 0;
+    if (no_hit_mode == 0 && tr_log != nullptr && tr_state != nullptr &&
+        saved_row_ctx != nullptr && tr_cap > 0 && saved_pos0 != nullptr) {
+      const int64_t p0 = saved_pos0[0];
+      const int32_t ctx_p0 = saved_row_ctx[3];
+      if (p0 >= 0 && ctx_p0 == static_cast<int32_t>(p0) && saved_row_ctx[0] >= 0) {
+        int32_t len = tr_state[0];
+        int32_t step_id = tr_state[1];
+        if (len < 0 || (len > 0 && p0 <= static_cast<int64_t>(tr_state[2]))) {
+          len = 0;
+          step_id = 0;
         }
-        hist_len[0] = static_cast<int32_t>(new_len);
+        uint32_t exact_mask = 0u;
+        for (int r = 0; r < 7 && r < tree_m; ++r) {
+          if (r < raw_ns) exact_mask |= (1u << r);
+        }
+        for (int r = 7; r < tree_m; ++r) {
+          if (saved_row_ctx[r * 4 + 0] < 0) continue;
+          const int32_t par = (saved_leaf_parent != nullptr) ? saved_leaf_parent[r] : -1;
+          const int32_t k = saved_leaf_k[r];
+          bool ex = false;
+          if (par < 0) {
+            ex = (k > 0 && k <= raw_ns);
+          } else if (par >= 7 && par < r) {
+            ex = ((exact_mask & (1u << par)) != 0u) && ((matched_mask & (1u << par)) != 0u);
+          }
+          if (ex) exact_mask |= (1u << r);
+        }
+        s_exact_mask = exact_mask;
+        s_len0 = len;
+        s_step_id = step_id;
+        s_ctx_p0 = ctx_p0;
+        do_tr = 1;
       } else {
-        hist_len[0] = -1;
+        saved_row_ctx[3] = -1;
       }
     }
-  }
+    s_do_tr = do_tr;
 
-  // Append all active 30B-verified (cur, prv1, prv2) -> raw_u[r] pairs to per-request tr_log.
-  if (can_rec_tr && saved_pos0 != nullptr) {
-    const int64_t p0 = saved_pos0[0];
-    const int32_t ctx_p0 = saved_row_ctx[3];
-    saved_row_ctx[3] = -1;  // Consume once so non-tree steps cannot re-read stale row contexts.
-    if (p0 >= 0 && ctx_p0 == static_cast<int32_t>(p0) && saved_row_ctx[0] >= 0) {
-      int32_t len = tr_state[0];
-      int32_t step_id = tr_state[1];
-      if (len < 0 || (len > 0 && p0 <= static_cast<int64_t>(tr_state[2]))) {
-        len = 0;
-        step_id = 0;
-      }
-      uint32_t exact_mask = 0u;
-      for (int r = 0; r < 7 && r < tree_m; ++r) {
-        if (r < raw_ns) exact_mask |= (1u << r);
-      }
-      for (int r = 7; r < tree_m; ++r) {
-        if (saved_row_ctx[r * 4 + 0] < 0) continue;
-        const int32_t par = (saved_leaf_parent != nullptr) ? saved_leaf_parent[r] : -1;
-        const int32_t k = saved_leaf_k[r];
-        bool ex = false;
-        if (par < 0) {
-          ex = (k > 0 && k <= raw_ns);
-        } else if (par >= 7 && par < r) {
-          ex = ((exact_mask & (1u << par)) != 0u) && ((matched_mask & (1u << par)) != 0u);
+    if (req_acc_state != nullptr) {
+      const int32_t r = req_acc_state[0] + 1;
+      const int32_t c = req_acc_state[1] + ns;
+      req_acc_state[0] = r;
+      req_acc_state[1] = c;
+      req_acc_state[2] =
+          (high_acc_cpc > 0.0f && r >= 4 && static_cast<float>(c) > high_acc_cpc * static_cast<float>(r)) ? 1 : 0;
+    }
+
+    if (stats != nullptr && stats_len >= 4) {
+      stats[0] += 1;
+      if (mode < 0) stats[1] += 1;
+      if (hit_len > 0) {
+        stats[2] += 1;
+        if (hit_len >= 2) stats[3] += 1;
+        if (stats_len >= 10 && hit_dst0 >= 1 && hit_dst0 <= 6) {
+          stats[3 + hit_dst0] += 1;
         }
-        if (ex) exact_mask |= (1u << r);
-      }
-      int appended = 0;
-      for (int r = 0; r < tree_m; ++r) {
-        const int32_t cur_t = saved_row_ctx[r * 4 + 0];
-        const int32_t u_t = raw_u[r];
-        if (cur_t < 0 || cur_t >= vocab_size || u_t < 0 || u_t >= vocab_size) continue;
-        if (len >= tr_cap) break;
-        const int base8 = len * 8;
-        tr_log[base8 + 0] = r;
-        tr_log[base8 + 1] = cur_t;
-        tr_log[base8 + 2] = saved_row_ctx[r * 4 + 1];
-        tr_log[base8 + 3] = saved_row_ctx[r * 4 + 2];
-        tr_log[base8 + 4] = u_t;
-        tr_log[base8 + 5] = step_id;
-        tr_log[base8 + 6] = (r == 0) ? ctx_p0 : saved_row_ctx[r * 4 + 3];
-        tr_log[base8 + 7] = ((exact_mask & (1u << r)) != 0u) ? 0 : 1;
-        len += 1;
-        appended += 1;
-      }
-      tr_state[0] = len;
-      tr_state[1] = step_id + 1;
-      tr_state[2] = static_cast<int32_t>(p0);
-      if (stats != nullptr && stats_len >= 40) {
-        stats[39] += appended;
-      }
-    }
-  }
-
-  if (req_acc_state != nullptr) {
-    const int32_t r = req_acc_state[0] + 1;
-    const int32_t c = req_acc_state[1] + ns;
-    req_acc_state[0] = r;
-    req_acc_state[1] = c;
-    // On M=16 verify, pausing leaves saves 0.00 ms because FULL(16) always runs; keep all 9 leaves
-    // active whenever depth==6 returns (never permanently latch off after a ceiling-clamped step).
-    req_acc_state[2] =
-        (high_acc_cpc > 0.0f && r >= 4 && static_cast<float>(c) > high_acc_cpc * static_cast<float>(r)) ? 1 : 0;
-  }
-
-  if (stats != nullptr && stats_len >= 4) {
-    stats[0] += 1;
-    if (mode < 0) stats[1] += 1;
-    if (hit_len > 0) {
-      stats[2] += 1;
-      if (hit_len >= 2) stats[3] += 1;
-      if (stats_len >= 10 && hit_dst0 >= 1 && hit_dst0 <= 6) {
-        stats[3 + hit_dst0] += 1;  // stats[4..9] = initial 1-level hit depth k=1..6
-      }
-      if (stats_len >= 19 && hit_src0 >= 7 && hit_src0 < 16) {
-        stats[10 + (hit_src0 - 7)] += 1;  // stats[10..18] = winning initial leaf slot 0..8
+        if (stats_len >= 19 && hit_src0 >= 7 && hit_src0 < 16) {
+          stats[10 + (hit_src0 - 7)] += 1;
+        }
+        if (stats_len >= 32) {
+          const int hl = (hit_len <= 6) ? hit_len : 6;
+          stats[18 + hl] += 1;
+          stats[25] += hit_len;
+          if (hit_len > 1) {
+            stats[26] += (hit_len - 1);
+            stats[29] += 1;
+            if (hit_len >= 3) stats[30] += 1;
+            if (hit_len >= 4) stats[31] += 1;
+          }
+          if (hit_len > stats[28]) stats[28] = hit_len;
+        }
       }
       if (stats_len >= 32) {
-        const int hl = (hit_len <= 6) ? hit_len : 6;
-        stats[18 + hl] += 1;                 // stats[19..24] = hit_len histogram 1..6
-        stats[25] += hit_len;                // total extra tokens committed by tree
-        if (hit_len > 1) {
-          stats[26] += (hit_len - 1);        // deep bonus tokens (stage >= 1)
-          stats[29] += 1;                    // reached depth >= 2
-          if (hit_len >= 3) stats[30] += 1;  // reached depth >= 3
-          if (hit_len >= 4) stats[31] += 1;  // reached depth >= 4
+        stats[27] += ns;
+      }
+      if (stats_len >= 48) {
+        if (casc_hit_cnt > 0) {
+          stats[44] += 1;
+          stats[45] += casc_hit_cnt;
         }
-        if (hit_len > stats[28]) stats[28] = hit_len;  // max hit_len seen
+        if (casc_m_div1 > 0 && raw_ns >= casc_m_div1 + 1) {
+          stats[47] += (raw_ns - casc_m_div1);
+        }
       }
     }
-    if (stats_len >= 32) {
-      stats[27] += ns;  // total committed tokens
-    }
-    if (stats_len >= 48) {
-      if (casc_hit_cnt > 0) {
-        stats[44] += 1;
-        stats[45] += casc_hit_cnt;
+  }
+  __syncwarp();
+
+  // Warp-deterministic (__ballot_sync + __popc, zero atomicAdd) 32-row OOV pre-admission:
+  // Pass A admits committed sampled_tokens[0..ns-1] (including tree hits);
+  // Pass B pre-admits 30B greedy cone predictions across ALL 32 verified rows into tail_ids[512].
+  if (s_do_oov != 0) {
+    auto admit_warp_tok = [&](int32_t tok_a) {
+      int won = 0;
+      if (tok_a >= 0 && tok_a < vocab_size && in_static_vocab[tok_a] == 0) {
+        if (atomicExch(&tail_seen[tok_a], 1) == 0) {
+          won = 1;
+        }
       }
-      if (casc_m_div1 > 0 && raw_ns >= casc_m_div1 + 1) {
-        stats[47] += (raw_ns - casc_m_div1);
+      const uint32_t won_mask = __ballot_sync(0xffffffffu, won);
+      if (won_mask != 0u) {
+        int base_cnt = 0;
+        if (lane == 0) {
+          base_cnt = tail_count[0];
+          if (base_cnt < 0) base_cnt = 0;
+        }
+        base_cnt = __shfl_sync(0xffffffffu, base_cnt, 0);
+        const int off = __popc(won_mask & ((1u << lane) - 1u));
+        const int slot = base_cnt + off;
+        if (won) {
+          if (slot < max_tail) {
+            tail_ids[slot] = tok_a;
+          } else {
+            tail_seen[tok_a] = 0;
+          }
+        }
+        if (lane == 0) {
+          const int total_won = __popc(won_mask);
+          const int new_cnt = (base_cnt + total_won <= max_tail) ? (base_cnt + total_won) : max_tail;
+          tail_count[0] = new_cnt;
+        }
+      }
+    };
+
+    int32_t tok_commit = -1;
+    if (lane < s_final_ns) {
+      const int64_t sv = sampled_tokens[lane];
+      if (sv >= 0 && sv < static_cast<int64_t>(vocab_size)) {
+        tok_commit = static_cast<int32_t>(sv);
+      }
+    }
+    admit_warp_tok(tok_commit);
+
+    if (oov_preadmit_mode >= 2 && chain_all_valid != 0) {
+      int32_t tok_cone = -1;
+      if (lane < tree_m) {
+        const bool row_ok = (oov_preadmit_mode >= 3)
+            ? (lane <= 6 || saved_leaf_k[lane] > 0)
+            : (((s_exact_mask & (1u << lane)) != 0u) || lane <= s_eff_raw_ns ||
+               ((s_matched_mask & (1u << lane)) != 0u));
+        if (row_ok) {
+          tok_cone = s_raw_u[lane];
+        }
+      }
+      admit_warp_tok(tok_cone);
+    }
+  }
+
+  // Warp-parallel 32-lane coalesced int4 append to tr_log (~1.5 us vs ~35 us scalar).
+  if (s_do_tr != 0) {
+    int4 ctx4 = make_int4(-1, -1, -1, -1);
+    int32_t u_t = -1;
+    if (lane < tree_m) {
+      ctx4 = reinterpret_cast<const int4*>(saved_row_ctx)[lane];
+      u_t = s_raw_u[lane];
+    }
+    const bool valid = (lane < tree_m && ctx4.x >= 0 && ctx4.x < vocab_size && u_t >= 0 && u_t < vocab_size);
+    const uint32_t vmask = __ballot_sync(0xffffffffu, valid);
+    const int off = __popc(vmask & ((1u << lane) - 1u));
+    const int dst = s_len0 + off;
+    if (valid && dst < tr_cap) {
+      int4* tr4 = reinterpret_cast<int4*>(tr_log);
+      const int32_t pos_val = (lane == 0) ? s_ctx_p0 : ctx4.w;
+      const int32_t tier_val = ((s_exact_mask & (1u << lane)) != 0u) ? 0 : 1;
+      tr4[dst * 2 + 0] = make_int4(lane, ctx4.x, ctx4.y, ctx4.z);
+      tr4[dst * 2 + 1] = make_int4(u_t, s_step_id, pos_val, tier_val);
+    }
+    if (lane == 0) {
+      const int total_v = __popc(vmask);
+      const int new_len = (s_len0 + total_v <= tr_cap) ? (s_len0 + total_v) : tr_cap;
+      const int appended = (new_len > s_len0) ? (new_len - s_len0) : 0;
+      saved_row_ctx[3] = -1;
+      tr_state[0] = new_len;
+      tr_state[1] = s_step_id + 1;
+      tr_state[2] = s_ctx_p0;
+      if (stats != nullptr && stats_len >= 40) {
+        stats[39] += appended;
       }
     }
   }
@@ -2919,6 +3211,12 @@ static const AntiChimeraKnobs& get_ac_knobs_env() {
     v.rev_alpha = env_f("MUSE_AC_REV_ALPHA", 2.0f);
     v.rev_cap = env_f("MUSE_AC_REV_CAP", 0.90f);
     v.ent_lambda = env_f("MUSE_AC_ENT_LAMBDA", 0.35f);
+    v.lh_copy_w = env_f("MUSE_LH_COPY_W", 0.18f);
+    v.stutter_scale = env_f("MUSE_STUTTER_SCALE", 0.08f);
+    v.skip_root_bg = env_f("MUSE_SKIP_ROOT_BG", 0.30f);
+    v.skip_lh_w = env_f("MUSE_SKIP_LH_W", 0.22f);
+    v.skip_coef = env_f("MUSE_SKIP_COEF", 0.58f);
+    v.shf_unseen_scale = env_f("MUSE_SHF_UNSEEN_SCALE", 0.065f);
     return v;
   }();
   return a;
@@ -3022,14 +3320,15 @@ void native_leaf_setup_tree(
               saved_leaf_toks.numel() >= tree_m);
   TORCH_CHECK(saved_leaf_k.is_cuda() && saved_leaf_k.scalar_type() == torch::kInt32 &&
               saved_leaf_k.numel() >= tree_m);
-  const int tree_k = (tree_top.numel() >= 36) ? 6 : 4;
+  const int tree_k = (tree_top.numel() >= 48) ? 8 : ((tree_top.numel() >= 36) ? 6 : 4);
   const int32_t* acc_ptr = nullptr;
   if (req_acc_state.has_value() && req_acc_state.value().defined() && req_acc_state.value().numel() >= 3) {
     TORCH_CHECK(req_acc_state.value().is_cuda() && req_acc_state.value().scalar_type() == torch::kInt32);
     acc_ptr = req_acc_state.value().data_ptr<int32_t>();
   }
   const float* vals_ptr = nullptr;
-  if (tree_vals.has_value() && tree_vals.value().defined() && tree_vals.value().numel() >= 36) {
+  if (tree_vals.has_value() && tree_vals.value().defined() &&
+      tree_vals.value().numel() >= static_cast<int64_t>(6 * tree_k)) {
     TORCH_CHECK(tree_vals.value().is_cuda() && tree_vals.value().scalar_type() == torch::kFloat32);
     vals_ptr = tree_vals.value().data_ptr<float>();
   }
@@ -3164,6 +3463,10 @@ void native_leaf_setup_tree(
     t.ch_near_t6 = env_f("MUSE_TR_CH_NEAR_T6", 0.82f);
     t.ch_near_oov = env_f("MUSE_TR_CH_NEAR_OOV", 0.62f);
     t.ch_t6_agree = env_f("MUSE_TR_CH_T6_AGREE", 0.72f);
+    t.b_d1_tri = env_f("MUSE_TR_B_D1_TRI", 0.90f);
+    t.b_d1_bg = env_f("MUSE_TR_B_D1_BG", 0.60f);
+    t.ch_a1_bg_t6 = env_f("MUSE_TR_CH_A1_BG_T6", 0.80f);
+    t.ch_a1_bg_oov = env_f("MUSE_TR_CH_A1_BG_OOV", 0.58f);
     return t;
   }();
   int32_t* row_ctx_ptr = nullptr;
@@ -3275,7 +3578,11 @@ void native_leaf_commit_tree(
     c10::optional<torch::Tensor> tr_state,
     int64_t vocab_size,
     bool chain_all_valid,
-    c10::optional<torch::Tensor> cascade_meta) {
+    c10::optional<torch::Tensor> cascade_meta,
+    c10::optional<torch::Tensor> in_static_vocab,
+    c10::optional<torch::Tensor> tail_ids,
+    c10::optional<torch::Tensor> tail_count,
+    c10::optional<torch::Tensor> tail_seen) {
   TORCH_CHECK(tree_m >= 8 && tree_m <= 32, "tree_m must be in 8..32");
   TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32);
   TORCH_CHECK(prev_ns.is_cuda() && prev_ns.scalar_type() == torch::kInt32);
@@ -3356,8 +3663,40 @@ void native_leaf_commit_tree(
     TORCH_CHECK(cascade_meta.value().is_cuda() && cascade_meta.value().scalar_type() == torch::kInt32);
     casc_meta_ptr = cascade_meta.value().data_ptr<int32_t>();
   }
+  const int eff_vocab = static_cast<int>(vocab_size > 0 ? vocab_size : 202048);
+  static const int oov_preadmit_env = []() -> int {
+    const char* s = std::getenv("MUSE_OOV_PREADMIT");
+    return (!s || !*s) ? 2 : static_cast<int>(std::strtol(s, nullptr, 10));
+  }();
+  const uint8_t* in_sv_ptr = nullptr;
+  int32_t* t_ids_ptr = nullptr;
+  int32_t* t_cnt_ptr = nullptr;
+  int32_t* t_seen_ptr = nullptr;
+  int max_tail = 0;
+  if (oov_preadmit_env > 0 &&
+      in_static_vocab.has_value() && in_static_vocab.value().defined() &&
+      tail_ids.has_value() && tail_ids.value().defined() &&
+      tail_count.has_value() && tail_count.value().defined() &&
+      tail_seen.has_value() && tail_seen.value().defined() &&
+      in_static_vocab.value().numel() >= eff_vocab &&
+      tail_seen.value().numel() >= eff_vocab &&
+      tail_ids.value().numel() > 0 &&
+      tail_count.value().numel() >= 1) {
+    TORCH_CHECK(in_static_vocab.value().is_cuda() && in_static_vocab.value().scalar_type() == torch::kUInt8 &&
+                in_static_vocab.value().is_contiguous());
+    TORCH_CHECK(tail_ids.value().is_cuda() && tail_ids.value().scalar_type() == torch::kInt32 &&
+                tail_ids.value().is_contiguous());
+    TORCH_CHECK(tail_count.value().is_cuda() && tail_count.value().scalar_type() == torch::kInt32);
+    TORCH_CHECK(tail_seen.value().is_cuda() && tail_seen.value().scalar_type() == torch::kInt32 &&
+                tail_seen.value().is_contiguous());
+    in_sv_ptr = in_static_vocab.value().data_ptr<uint8_t>();
+    t_ids_ptr = tail_ids.value().data_ptr<int32_t>();
+    t_cnt_ptr = tail_count.value().data_ptr<int32_t>();
+    t_seen_ptr = tail_seen.value().data_ptr<int32_t>();
+    max_tail = static_cast<int>(tail_ids.value().numel());
+  }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  native_leaf_commit_tree_kernel<<<1, 1, 0, st>>>(
+  native_leaf_commit_tree_kernel<<<1, 32, 0, st>>>(
       leaf_flag.data_ptr<int32_t>(),
       prev_ns.data_ptr<int32_t>(),
       hit_flag.data_ptr<int32_t>(),
@@ -3384,9 +3723,15 @@ void native_leaf_commit_tree(
       tr_log_ptr,
       tr_state_ptr,
       tr_cap,
-      static_cast<int>(vocab_size > 0 ? vocab_size : 202048),
+      eff_vocab,
       chain_all_valid ? 1 : 0,
-      casc_meta_ptr);
+      casc_meta_ptr,
+      in_sv_ptr,
+      t_ids_ptr,
+      t_cnt_ptr,
+      t_seen_ptr,
+      max_tail,
+      oov_preadmit_env);
 }
 
 void native_leaf_setup(

@@ -51,7 +51,7 @@ MAX_CUMULATIVE_ROUND_MULTIPLE = 1.02
 # two-round worst-case pending_committed reservation (14 tokens) after excluding
 # the seed round so normal 3.1-3.8 cpc bursts never clamp, while staying
 # much smaller than CAP5's permanent 27-token burst.
-INITIAL_BURST_TOKENS = 15
+INITIAL_BURST_TOKENS = 18
 BURST_DECAY_PER_ROUND = 1
 HIGH_ACCEPTANCE_TRIGGER_TOKENS_PER_ROUND = 4
 HIGH_ACCEPTANCE_MIN_ROUNDS = 6
@@ -230,7 +230,7 @@ class DFlashCommittedTokenCeiling:
             - pending_committed
             - 1
         )
-        limited_depth = min(offered_depth, max(1, room_for_drafts))
+        limited_depth = min(offered_depth, max(0, room_for_drafts))
         if limited_depth < offered_depth:
             state.engagements += 1
         return limited_depth

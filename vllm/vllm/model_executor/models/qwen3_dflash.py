@@ -1082,6 +1082,16 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         tree_top_buf = _nl.get_tree_top_buf(hidden_states.device) if _nl.ENABLED else None
         tree_vals_buf = _nl.get_tree_vals_buf(hidden_states.device) if _nl.ENABLED else None
         lm_head = self.lm_head
+        if _nl.ENABLED and (
+            getattr(lm_head, "prompt_tail_admitted", False)
+            or getattr(lm_head, "fast_dhead_admitted", False)
+        ):
+            _nl.register_draft_tail_bufs(
+                lm_head.in_static_vocab,
+                lm_head.tail_ids,
+                lm_head.tail_count,
+                lm_head.tail_seen,
+            )
         if (
             getattr(lm_head, "fast_dhead_admitted", False)
             and hidden_states.is_cuda
