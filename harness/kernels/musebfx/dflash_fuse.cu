@@ -178,8 +178,14 @@ __global__ void dflash_kv_post_kernel(
 
   const int64_t slot = desc.slots[l][m];
   if (slot < 0) return;
-  const int64_t block_idx = slot / block_size;
-  const int64_t block_off = slot - block_idx * block_size;
+  int64_t block_idx, block_off;
+  if (block_size == 64) {
+    block_idx = slot >> 6;
+    block_off = slot & 63;
+  } else {
+    block_idx = slot / block_size;
+    block_off = slot - block_idx * block_size;
+  }
 
   const int kv_stride = nkv * kHeadDim;
   const size_t base_ml = static_cast<size_t>(m * L + l) * (2 * kv_stride);
