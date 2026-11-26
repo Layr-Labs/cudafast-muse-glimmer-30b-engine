@@ -2512,14 +2512,23 @@ __global__ void __launch_bounds__(128, 4) dhf_stage1_kernel(
       const uint32_t* u1 = reinterpret_cast<const uint32_t*>(wt1);
       const uint32_t c24_0 = __funnelshift_r(u0[w_idx150], need_hi150 ? u0[w_idx150 + 1] : 0u, b_off150) & 0x00FFFFFFu;
       const uint32_t c24_1 = __funnelshift_r(u1[w_idx150], need_hi150 ? u1[w_idx150 + 1] : 0u, b_off150) & 0x00FFFFFFu;
+      uint32_t a0, a2, a0_n = 0u, a2_n = 0u;
+      dhf_ldmatrix_x2(a0, a2, a_stage_base + ldm_off[0]);
+      uint2 b = smem.lut[c24_0 & 63u];
+      uint2 c = smem.lut[c24_1 & 63u];
 #pragma unroll
       for (int s = 0; s < 4; ++s) {
-        uint32_t a0, a2;
-        dhf_ldmatrix_x2(a0, a2, a_stage_base + ldm_off[s]);
-        const uint2 b = smem.lut[(c24_0 >> (6 * s)) & 63u];
-        const uint2 c = smem.lut[(c24_1 >> (6 * s)) & 63u];
+        uint2 b_n = b, c_n = c;
+        if (s < 3) {
+          dhf_ldmatrix_x2(a0_n, a2_n, a_stage_base + ldm_off[s + 1]);
+          b_n = smem.lut[(c24_0 >> (6 * (s + 1))) & 63u];
+          c_n = smem.lut[(c24_1 >> (6 * (s + 1))) & 63u];
+        }
         dhf_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0, a2, b.x, b.y);
         dhf_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0, a2, c.x, c.y);
+        if (s < 3) {
+          a0 = a0_n; a2 = a2_n; b = b_n; c = c_n;
+        }
       }
     } else if constexpr (kMode == 158) {
       const uint32_t* u0 = reinterpret_cast<const uint32_t*>(wt0);
@@ -2543,34 +2552,49 @@ __global__ void __launch_bounds__(128, 4) dhf_stage1_kernel(
 
       const uint32_t idx0[4] = {q0_0, q0_1, q0_2, q0_3};
       const uint32_t idx1[4] = {q1_0, q1_1, q1_2, q1_3};
+      uint32_t a0, a2, a0_n = 0u, a2_n = 0u;
+      dhf_ldmatrix_x2(a0, a2, a_stage_base + ldm_off[0]);
+      uint2 b = smem.lut[idx0[0]];
+      uint2 c = smem.lut[idx1[0]];
 #pragma unroll
       for (int s = 0; s < 4; ++s) {
-        uint32_t a0, a2;
-        dhf_ldmatrix_x2(a0, a2, a_stage_base + ldm_off[s]);
-        const uint2 b = smem.lut[idx0[s]];
-        const uint2 c = smem.lut[idx1[s]];
+        uint2 b_n = b, c_n = c;
+        if (s < 3) {
+          dhf_ldmatrix_x2(a0_n, a2_n, a_stage_base + ldm_off[s + 1]);
+          b_n = smem.lut[idx0[s + 1]];
+          c_n = smem.lut[idx1[s + 1]];
+        }
         dhf_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0, a2, b.x, b.y);
         dhf_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0, a2, c.x, c.y);
+        if (s < 3) {
+          a0 = a0_n; a2 = a2_n; b = b_n; c = c_n;
+        }
       }
     } else {
       const uint32_t q32_0 = reinterpret_cast<const uint32_t*>(wt0)[lane];
       const uint32_t q32_1 = reinterpret_cast<const uint32_t*>(wt1)[lane];
+      uint32_t a0, a2, a0_n = 0u, a2_n = 0u;
+      uint32_t b0, b1, c0, c1, b0_n = 0u, b1_n = 0u, c0_n = 0u, c1_n = 0u;
+      dhf_ldmatrix_x2(a0, a2, a_stage_base + ldm_off[0]);
+      dhf_deq2_k16<0>(q32_0, b0, b1);
+      dhf_deq2_k16<0>(q32_1, c0, c1);
 #pragma unroll
       for (int s = 0; s < 4; ++s) {
-        uint32_t a0, a2;
-        dhf_ldmatrix_x2(a0, a2, a_stage_base + ldm_off[s]);
-        uint32_t b0, b1, c0, c1;
         if (s == 0) {
-          dhf_deq2_k16<0>(q32_0, b0, b1); dhf_deq2_k16<0>(q32_1, c0, c1);
+          dhf_ldmatrix_x2(a0_n, a2_n, a_stage_base + ldm_off[1]);
+          dhf_deq2_k16<1>(q32_0, b0_n, b1_n); dhf_deq2_k16<1>(q32_1, c0_n, c1_n);
         } else if (s == 1) {
-          dhf_deq2_k16<1>(q32_0, b0, b1); dhf_deq2_k16<1>(q32_1, c0, c1);
+          dhf_ldmatrix_x2(a0_n, a2_n, a_stage_base + ldm_off[2]);
+          dhf_deq2_k16<2>(q32_0, b0_n, b1_n); dhf_deq2_k16<2>(q32_1, c0_n, c1_n);
         } else if (s == 2) {
-          dhf_deq2_k16<2>(q32_0, b0, b1); dhf_deq2_k16<2>(q32_1, c0, c1);
-        } else {
-          dhf_deq2_k16<3>(q32_0, b0, b1); dhf_deq2_k16<3>(q32_1, c0, c1);
+          dhf_ldmatrix_x2(a0_n, a2_n, a_stage_base + ldm_off[3]);
+          dhf_deq2_k16<3>(q32_0, b0_n, b1_n); dhf_deq2_k16<3>(q32_1, c0_n, c1_n);
         }
         dhf_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0, a2, b0, b1);
         dhf_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0, a2, c0, c1);
+        if (s < 3) {
+          a0 = a0_n; a2 = a2_n; b0 = b0_n; b1 = b1_n; c0 = c0_n; c1 = c1_n;
+        }
       }
     }
 

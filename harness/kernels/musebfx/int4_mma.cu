@@ -614,23 +614,39 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_kernel(
     const float sc1_f = kNf4 ? __bfloat162float(sz1.x) : 0.0f;
     const float zr1_f = kNf4 ? __bfloat162float(sz1.y) : 0.0f;
 
+    uint32_t a0, a1 = 0u, a2, a3 = 0u;
+    uint32_t b0, b1, c0, c1;
+    {
+      const int pcol8_0 = ldm_col_off ^ (ldm_row & 7);
+      const uint32_t addr0 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][ldm_row][pcol8_0 * 8]));
+      if constexpr (kM16) {
+        int4_ldmatrix_x4(a0, a1, a2, a3, addr0);
+      } else {
+        int4_ldmatrix_x2(a0, a2, addr0);
+      }
+      int4_deq4_k16<kNf4, false>(q0_lo, sc0_2, zr0_2, sc0_f, zr0_f, b0, b1);
+      int4_deq4_k16<kNf4, false>(q1_lo, sc1_2, zr1_2, sc1_f, zr1_f, c0, c1);
+    }
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
-      const int pcol8 = (2 * s + ldm_col_off) ^ (ldm_row & 7);
-      const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][ldm_row][pcol8 * 8]));
-      uint32_t a0, a1, a2, a3;
-      if constexpr (kM16) {
-        int4_ldmatrix_x4(a0, a1, a2, a3, addr);
-      } else {
-        int4_ldmatrix_x2(a0, a2, addr);
-      }
-      uint32_t b0, b1, c0, c1;
-      if ((s & 1) == 0) {
-        int4_deq4_k16<kNf4, false>((s < 2) ? q0_lo : q0_hi, sc0_2, zr0_2, sc0_f, zr0_f, b0, b1);
-        int4_deq4_k16<kNf4, false>((s < 2) ? q1_lo : q1_hi, sc1_2, zr1_2, sc1_f, zr1_f, c0, c1);
-      } else {
-        int4_deq4_k16<kNf4, true>((s < 2) ? q0_lo : q0_hi, sc0_2, zr0_2, sc0_f, zr0_f, b0, b1);
-        int4_deq4_k16<kNf4, true>((s < 2) ? q1_lo : q1_hi, sc1_2, zr1_2, sc1_f, zr1_f, c0, c1);
+      uint32_t a0_n = 0u, a1_n = 0u, a2_n = 0u, a3_n = 0u;
+      uint32_t b0_n = 0u, b1_n = 0u, c0_n = 0u, c1_n = 0u;
+      if (s < 3) {
+        const int sn = s + 1;
+        const int pcol8 = (2 * sn + ldm_col_off) ^ (ldm_row & 7);
+        const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][ldm_row][pcol8 * 8]));
+        if constexpr (kM16) {
+          int4_ldmatrix_x4(a0_n, a1_n, a2_n, a3_n, addr);
+        } else {
+          int4_ldmatrix_x2(a0_n, a2_n, addr);
+        }
+        if ((sn & 1) == 0) {
+          int4_deq4_k16<kNf4, false>((sn < 2) ? q0_lo : q0_hi, sc0_2, zr0_2, sc0_f, zr0_f, b0_n, b1_n);
+          int4_deq4_k16<kNf4, false>((sn < 2) ? q1_lo : q1_hi, sc1_2, zr1_2, sc1_f, zr1_f, c0_n, c1_n);
+        } else {
+          int4_deq4_k16<kNf4, true>((sn < 2) ? q0_lo : q0_hi, sc0_2, zr0_2, sc0_f, zr0_f, b0_n, b1_n);
+          int4_deq4_k16<kNf4, true>((sn < 2) ? q1_lo : q1_hi, sc1_2, zr1_2, sc1_f, zr1_f, c0_n, c1_n);
+        }
       }
       if constexpr (kM16) {
         int4_mma_m16n8k16_full(d0_0, d1_0, d2_0, d3_0, a0, a1, a2, a3, b0, b1);
@@ -638,6 +654,10 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_kernel(
       } else {
         int4_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0, a2, b0, b1);
         int4_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0, a2, c0, c1);
+      }
+      if (s < 3) {
+        a0 = a0_n; a1 = a1_n; a2 = a2_n; a3 = a3_n;
+        b0 = b0_n; b1 = b1_n; c0 = c0_n; c1 = c1_n;
       }
     }
 
@@ -1333,23 +1353,39 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
     const float sc1_f = kNf4 ? __bfloat162float(sz1.x) : 0.0f;
     const float zr1_f = kNf4 ? __bfloat162float(sz1.y) : 0.0f;
 
+    uint32_t a0, a1 = 0u, a2, a3 = 0u;
+    uint32_t b0, b1, c0, c1;
+    {
+      const int pcol8_0 = ldm_col_off ^ (ldm_row & 7);
+      const uint32_t addr0 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][ldm_row][pcol8_0 * 8]));
+      if constexpr (kM16) {
+        int4_ldmatrix_x4(a0, a1, a2, a3, addr0);
+      } else {
+        int4_ldmatrix_x2(a0, a2, addr0);
+      }
+      int4_deq4_k16<kNf4, false>(q0_lo, sc0_2, zr0_2, sc0_f, zr0_f, b0, b1);
+      int4_deq4_k16<kNf4, false>(q1_lo, sc1_2, zr1_2, sc1_f, zr1_f, c0, c1);
+    }
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
-      const int pcol8 = (2 * s + ldm_col_off) ^ (ldm_row & 7);
-      const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][ldm_row][pcol8 * 8]));
-      uint32_t a0, a1, a2, a3;
-      if constexpr (kM16) {
-        int4_ldmatrix_x4(a0, a1, a2, a3, addr);
-      } else {
-        int4_ldmatrix_x2(a0, a2, addr);
-      }
-      uint32_t b0, b1, c0, c1;
-      if ((s & 1) == 0) {
-        int4_deq4_k16<kNf4, false>((s < 2) ? q0_lo : q0_hi, sc0_2, zr0_2, sc0_f, zr0_f, b0, b1);
-        int4_deq4_k16<kNf4, false>((s < 2) ? q1_lo : q1_hi, sc1_2, zr1_2, sc1_f, zr1_f, c0, c1);
-      } else {
-        int4_deq4_k16<kNf4, true>((s < 2) ? q0_lo : q0_hi, sc0_2, zr0_2, sc0_f, zr0_f, b0, b1);
-        int4_deq4_k16<kNf4, true>((s < 2) ? q1_lo : q1_hi, sc1_2, zr1_2, sc1_f, zr1_f, c0, c1);
+      uint32_t a0_n = 0u, a1_n = 0u, a2_n = 0u, a3_n = 0u;
+      uint32_t b0_n = 0u, b1_n = 0u, c0_n = 0u, c1_n = 0u;
+      if (s < 3) {
+        const int sn = s + 1;
+        const int pcol8 = (2 * sn + ldm_col_off) ^ (ldm_row & 7);
+        const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][ldm_row][pcol8 * 8]));
+        if constexpr (kM16) {
+          int4_ldmatrix_x4(a0_n, a1_n, a2_n, a3_n, addr);
+        } else {
+          int4_ldmatrix_x2(a0_n, a2_n, addr);
+        }
+        if ((sn & 1) == 0) {
+          int4_deq4_k16<kNf4, false>((sn < 2) ? q0_lo : q0_hi, sc0_2, zr0_2, sc0_f, zr0_f, b0_n, b1_n);
+          int4_deq4_k16<kNf4, false>((sn < 2) ? q1_lo : q1_hi, sc1_2, zr1_2, sc1_f, zr1_f, c0_n, c1_n);
+        } else {
+          int4_deq4_k16<kNf4, true>((sn < 2) ? q0_lo : q0_hi, sc0_2, zr0_2, sc0_f, zr0_f, b0_n, b1_n);
+          int4_deq4_k16<kNf4, true>((sn < 2) ? q1_lo : q1_hi, sc1_2, zr1_2, sc1_f, zr1_f, c0_n, c1_n);
+        }
       }
       if constexpr (kM16) {
         int4_mma_m16n8k16_full(d0_0, d1_0, d2_0, d3_0, a0, a1, a2, a3, b0, b1);
@@ -1357,6 +1393,10 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
       } else {
         int4_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0, a2, b0, b1);
         int4_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0, a2, c0, c1);
+      }
+      if (s < 3) {
+        a0 = a0_n; a1 = a1_n; a2 = a2_n; a3 = a3_n;
+        b0 = b0_n; b1 = b1_n; c0 = c0_n; c1 = c1_n;
       }
     }
 
