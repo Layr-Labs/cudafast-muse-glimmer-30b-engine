@@ -338,40 +338,34 @@ constexpr int NT_WS9 = (NWARP + 1) * 32;
 
 __device__ __forceinline__ void consume_stage_pipe_sw(
     uint32_t abase, uint32_t wbase, int wm, int wn, int ar, int ach, int br, int bch, float (&acc)[2][NW][4]) {
-  auto load_a_i = [&](int ks, int i, uint32_t (&a)[2][4]) {
+  constexpr int NP = NW / 2;
+  auto load_a_i = [&](int ks, int i, uint32_t (&ai)[4]) {
     const int r = wm * 32 + i * 16 + ar;
-    ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, a[i]);
+    ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, ai);
   };
-  auto load_b_j = [&](int ks, int j, uint32_t (&b)[NW][2]) {
-    const int r = wn * NW * 8 + j * 16 + br;
-    uint32_t qd[4];
-    ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, qd);
-    b[2 * j][0] = qd[0];
-    b[2 * j][1] = qd[1];
-    b[2 * j + 1][0] = qd[2];
-    b[2 * j + 1][1] = qd[3];
+  auto load_b_p = [&](int ks, int p, uint32_t (&bp)[4]) {
+    const int r = wn * NW * 8 + p * 16 + br;
+    ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, bp);
   };
-  uint32_t a[2][2][4], b[2][NW][2];
-#pragma unroll
-  for (int i = 0; i < 2; ++i) load_a_i(0, i, a[0]);
-#pragma unroll
-  for (int j = 0; j < NW / 2; ++j) load_b_j(0, j, b[0]);
+  uint32_t a[2][4], bbuf[2][4];
+  load_a_i(0, 0, a[0]);
+  load_a_i(0, 1, a[1]);
+  load_b_p(0, 0, bbuf[0]);
 #pragma unroll
   for (int ks = 0; ks < KT / 32; ++ks) {
-    const int cur = ks & 1, nxt = cur ^ 1;
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-#pragma unroll
-      for (int j = 0; j < NW; ++j) {
-        mma_fp8(a[cur][i], b[cur][j][0], b[cur][j][1], acc[i][j]);
-        if (ks + 1 < KT / 32) {
-          if (i == 0 && (j == 0 || j == 2)) {
-            load_a_i(ks + 1, j >> 1, a[nxt]);
-          } else if (i == 1 && (j & 1) == 0) {
-            load_b_j(ks + 1, j >> 1, b[nxt]);
-          }
-        }
-      }
+    for (int jp = 0; jp < NP; ++jp) {
+      const int q = ks * NP + jp;
+      uint32_t (&bc)[4] = bbuf[q & 1];
+      uint32_t (&bn)[4] = bbuf[(q + 1) & 1];
+      if (jp + 1 < NP)           load_b_p(ks, jp + 1, bn);
+      else if (ks + 1 < KT / 32) load_b_p(ks + 1, 0, bn);
+      mma_fp8(a[0], bc[0], bc[1], acc[0][2 * jp]);
+      mma_fp8(a[0], bc[2], bc[3], acc[0][2 * jp + 1]);
+      if (jp == NP - 1 && ks + 1 < KT / 32) load_a_i(ks + 1, 0, a[0]);
+      mma_fp8(a[1], bc[0], bc[1], acc[1][2 * jp]);
+      mma_fp8(a[1], bc[2], bc[3], acc[1][2 * jp + 1]);
+      if (jp == NP - 1 && ks + 1 < KT / 32) load_a_i(ks + 1, 1, a[1]);
     }
   }
 }

@@ -115,6 +115,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         self._ctx_kv_cg_rejected: set[tuple] = set()
         self._ctx_kv_cg_pool = torch.cuda.graph_pool_handle()
         self._ctx_kv_cg_stream = torch.cuda.Stream(device=device)
+        self._cascade_body_graph: torch.cuda.CUDAGraph | None = None
+        self._cascade_cond_exec_id: int | None = None
+        self._cascade_desc: Any = None
+        self._cascade_launch_fn: Any = None
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -193,6 +197,209 @@ class DFlashSpeculator(DraftModelSpeculator):
             causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
+        self._capture_cascade_cond_graph()
+
+    def _capture_cascade_cond_graph(self) -> None:
+        """Build GPU-conditional Pass-2 DFlash cascade graph (zero-sync cudaGraphCondTypeIf)."""
+        self._cascade_body_graph = None
+        self._cascade_cond_exec_id = None
+        self._cascade_desc = None
+        self._cascade_launch_fn = None
+        if os.environ.get("MUSE_DFLASH_CASCADE", "1").strip() in ("0", "", "false", "no"):
+            return
+        if (
+            self.query_cudagraph_manager is None
+            or self.num_query_per_req != 16
+            or self.num_speculative_steps != 6
+            or self.sample_from_anchor
+            or self.dp_size != 1
+        ):
+            return
+        target_desc = None
+        for desc in self.query_cudagraph_manager.graphs:
+            if (
+                desc.cg_mode == CUDAGraphMode.FULL
+                and desc.num_reqs == 1
+                and desc.num_tokens == self.num_query_per_req
+                and desc.num_active_loras == 0
+            ):
+                target_desc = desc
+                break
+        if target_desc is None:
+            return
+        try:
+            import muse_bfx_ext as _bfx
+            from vllm.distributed.device_communicators.pynccl_allocator import (
+                set_graph_pool_id,
+            )
+            from vllm.distributed.parallel_state import graph_capture
+            from vllm.platforms import current_platform
+            from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _nl
+            from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import (
+                _prepare_dflash_inputs_to_capture,
+            )
+
+            if not (
+                _nl.ENABLED
+                and _nl.TREE_M > 0
+                and hasattr(_bfx, "dflash_cascade_clone_capturing_graph")
+                and hasattr(_bfx, "dflash_cascade_build_cond_graph")
+                and hasattr(_bfx, "dflash_cascade_launch_cond_graph")
+                and hasattr(_bfx, "dflash_cascade_post_restore")
+            ):
+                return
+            cascade_bufs = _nl.get_cascade_bufs(self.device)
+            tree_top = _nl.get_tree_top_buf(self.device)
+            tree_vals = _nl.get_tree_vals_buf(self.device)
+            alt_ids = _nl.get_alt_buf(self.device)
+            alt_margins = _nl.get_margin_buf(self.device)
+            if cascade_bufs is None or tree_top is None or tree_vals is None:
+                return
+            (
+                cascade_meta,
+                cascade_toks,
+                cascade_vals,
+                p1_save_draft,
+                p1_save_top,
+                p1_save_vals,
+                p1_save_alt,
+                p1_save_margins,
+                req_acc_state,
+                stats,
+            ) = cascade_bufs
+
+            num_tokens = self.num_query_per_req
+            mask_tok_id = int(self.parallel_drafting_token_id)
+            draft_row0 = self.draft_tokens[0]
+            cascade_meta[:1].zero_()
+
+            # Warmup Pass-2 body outside graph capture so scratch & allocator pool are primed.
+            warm_state = _prepare_dflash_inputs_to_capture(
+                1,
+                num_tokens,
+                self.input_buffers,
+                self.block_tables,
+                self.attn_groups,
+                self.kv_cache_config,
+                self.max_model_len,
+                skip_attn=False,
+                causal=self._group_causal,
+            )
+            self._generate_draft(
+                1,
+                num_tokens,
+                warm_state.attn_metadata,
+                warm_state.slot_mappings,
+                None,
+                CUDAGraphMode.NONE,
+            )
+            _bfx.dflash_cascade_post_restore(
+                self.input_buffers.input_ids,
+                draft_row0,
+                tree_top,
+                tree_vals,
+                cascade_meta,
+                cascade_toks,
+                cascade_vals,
+                p1_save_draft,
+                p1_save_top,
+                p1_save_vals,
+                mask_tok_id,
+                alt_ids,
+                alt_margins,
+                p1_save_alt,
+                p1_save_margins,
+            )
+            torch.cuda.synchronize(self.device)
+
+            cap_state = _prepare_dflash_inputs_to_capture(
+                1,
+                num_tokens,
+                self.input_buffers,
+                self.block_tables,
+                self.attn_groups,
+                self.kv_cache_config,
+                self.max_model_len,
+                skip_attn=False,
+                causal=self._group_causal,
+            )
+            pool = self.query_cudagraph_manager.pool
+            pass2_graph = torch.cuda.CUDAGraph()
+            cloned_id = -1
+            with graph_capture(device=self.device):
+                if pool is not None:
+                    set_graph_pool_id(pool)
+                else:
+                    set_graph_pool_id(current_platform.graph_pool_handle())
+                with torch.cuda.graph(pass2_graph, pool):
+                    self._generate_draft(
+                        1,
+                        num_tokens,
+                        cap_state.attn_metadata,
+                        cap_state.slot_mappings,
+                        None,
+                        CUDAGraphMode.NONE,
+                    )
+                    _bfx.dflash_cascade_post_restore(
+                        self.input_buffers.input_ids,
+                        draft_row0,
+                        tree_top,
+                        tree_vals,
+                        cascade_meta,
+                        cascade_toks,
+                        cascade_vals,
+                        p1_save_draft,
+                        p1_save_top,
+                        p1_save_vals,
+                        mask_tok_id,
+                        alt_ids,
+                        alt_margins,
+                        p1_save_alt,
+                        p1_save_margins,
+                    )
+                    cloned_id = int(_bfx.dflash_cascade_clone_capturing_graph())
+
+            exec_id = int(
+                _bfx.dflash_cascade_build_cond_graph(
+                    cloned_id,
+                    False,
+                    self.input_buffers.input_ids,
+                    self.input_buffers.positions,
+                    draft_row0,
+                    tree_top,
+                    tree_vals,
+                    cascade_meta,
+                    p1_save_draft,
+                    p1_save_top,
+                    p1_save_vals,
+                    mask_tok_id,
+                    alt_ids,
+                    alt_margins,
+                    p1_save_alt,
+                    p1_save_margins,
+                    req_acc_state,
+                    stats,
+                )
+            )
+            cascade_meta.zero_()
+            self._cascade_body_graph = pass2_graph
+            self._cascade_cond_exec_id = exec_id
+            self._cascade_desc = target_desc
+            self._cascade_launch_fn = _bfx.dflash_cascade_launch_cond_graph
+            logger.info(
+                "DFlash GPU-conditional Pass-2 cascade graph armed (Q=%d, exec_id=%d)",
+                num_tokens,
+                exec_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._cascade_body_graph = None
+            self._cascade_cond_exec_id = None
+            self._cascade_desc = None
+            self._cascade_launch_fn = None
+            logger.warning(
+                "DFlash GPU-conditional Pass-2 cascade capture skipped (%s); keeping Pass-1 only",
+                exc,
+            )
 
     def load_draft_model(
         self,
@@ -807,6 +1014,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
             self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            if (
+                not dummy_run
+                and not is_profile
+                and num_reqs == 1
+                and self._cascade_cond_exec_id is not None
+                and batch_desc == self._cascade_desc
+            ):
+                self._cascade_launch_fn(self._cascade_cond_exec_id)
         else:
             draft_attn_metadata = self._build_draft_attn_metadata(
                 num_reqs=num_reqs,
