@@ -78,6 +78,12 @@ __device__ __forceinline__ uint32_t int4_bf16x2_u32(float f0, float f1) {
   return *reinterpret_cast<const uint32_t*>(&v);
 }
 
+__device__ __forceinline__ float2 int4_ldcg_f2(const float2* ptr) {
+  float2 v;
+  asm volatile("ld.global.cg.v2.f32 {%0, %1}, [%2];" : "=f"(v.x), "=f"(v.y) : "l"(ptr));
+  return v;
+}
+
 // Native BF16x2 4-bit dequant using Marlin-interleaved nibbles ((q0,q1) in [3:0]&[19:16], etc.):
 // 0x41804180 | ((q << sh) & 0x00780078) == bf16x2(16+q0, 16+q1) exact -> HADD2(-16) -> HFMA2(sc, zr).
 // Bit-exact with rn_bf16(fma(float(q), sc, zr)), 0 I2F, 0 F2FP.
@@ -611,8 +617,9 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
     Aux5Desc aux5,
     const uint8_t* __restrict__ W_packed,
     __nv_bfloat16* __restrict__ C,
-    float* __restrict__ sk_partials,  // [max_n_blocks, 16, 64] zero-initialized & self-zeroing
-    int* __restrict__ sk_done,        // [max_n_blocks] zero-initialized & self-zeroing
+    float* __restrict__ sk_partials,    // [max_n_blocks, 16, 64] zero-initialized & self-zeroing (>=4-part fallback)
+    float* __restrict__ sk_multi_part,  // [max_n_blocks, 3, 16, 64] uninitialized dedicated 2/3-part slots (nullptr disables)
+    int* __restrict__ sk_done,          // [max_n_blocks] zero-initialized & self-zeroing
     int M, int N, int K, int n_blocks, int grid_ctas, int pdl_mode) {
   __shared__ Int4StageSmem<kM16 ? 16 : 8> smem;
   __shared__ int s_is_last;
@@ -839,53 +846,193 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
           }
         }
       } else {
-        float* tile_p = sk_partials + static_cast<size_t>(cur_n) * (16 * 64);
-        if (g < M) {
-          float* row_p = tile_p + g * 64;
-          atomicAdd(&row_p[local_c0 + 0], d0_0);
-          atomicAdd(&row_p[local_c0 + 1], d1_0);
-          atomicAdd(&row_p[local_c1 + 0], d0_1);
-          atomicAdd(&row_p[local_c1 + 1], d1_1);
-        }
-        if constexpr (kM16) {
-          if (has_hi) {
-            float* row_p = tile_p + (g + 8) * 64;
-            atomicAdd(&row_p[local_c0 + 0], d2_0);
-            atomicAdd(&row_p[local_c0 + 1], d3_0);
-            atomicAdd(&row_p[local_c1 + 0], d2_1);
-            atomicAdd(&row_p[local_c1 + 1], d3_1);
+        const int tile_lo = cur_n * num_kg;
+        const int tile_hi = tile_lo + num_kg;
+        int num_parts = 0;
+        int part_role = 0;
+        if (sk_multi_part != nullptr) {
+          if (seg_start_kg == 0 && cur_kg + 1 < num_kg) {
+            if (cta_id + 1 < grid_ctas) {
+              const int next_end = static_cast<int>((static_cast<int64_t>(cta_id + 2) * total_iters) / grid_ctas);
+              if (next_end >= tile_hi) {
+                num_parts = 2;
+                part_role = 0;
+              } else if (cta_id + 2 < grid_ctas) {
+                const int next2_end = static_cast<int>((static_cast<int64_t>(cta_id + 3) * total_iters) / grid_ctas);
+                if (next2_end >= tile_hi) {
+                  num_parts = 3;
+                  part_role = 0;
+                }
+              }
+            }
+          } else if (seg_start_kg > 0 && cur_kg + 1 < num_kg) {
+            if (cta_id > 0 && cta_id + 1 < grid_ctas) {
+              const int prev_start = static_cast<int>((static_cast<int64_t>(cta_id - 1) * total_iters) / grid_ctas);
+              const int next_end = static_cast<int>((static_cast<int64_t>(cta_id + 2) * total_iters) / grid_ctas);
+              if (prev_start <= tile_lo && next_end >= tile_hi) {
+                num_parts = 3;
+                part_role = 1;
+              }
+            }
+          } else if (seg_start_kg > 0 && cur_kg + 1 == num_kg) {
+            if (cta_id > 0) {
+              const int prev_start = static_cast<int>((static_cast<int64_t>(cta_id - 1) * total_iters) / grid_ctas);
+              if (prev_start <= tile_lo) {
+                num_parts = 2;
+                part_role = 1;
+              } else if (cta_id >= 2) {
+                const int prev2_start = static_cast<int>((static_cast<int64_t>(cta_id - 2) * total_iters) / grid_ctas);
+                if (prev2_start <= tile_lo) {
+                  num_parts = 3;
+                  part_role = 2;
+                }
+              }
+            }
           }
         }
-        __threadfence();
-        __syncthreads();
-        if (tid == 0) {
-          s_is_last = (atomicAdd(&sk_done[cur_n], seg_kgs) + seg_kgs == num_kg) ? 1 : 0;
-        }
-        __syncthreads();
-        if (s_is_last) {
+        if (num_parts >= 2) {
+          // 2-part & 3-part non-atomic reduction: coalesced float2 stores + 1 int32 arrival counter
+          // + L2-coherent float2 loads. Canonical (slot0 + slot1) + slot2 order => bit-deterministic
+          // across all CTA arrival permutations (covers 104/104 tiles of fc at grid=144 with 0 FP32 atomics).
+          float* tile_mp = sk_multi_part + static_cast<size_t>(cur_n) * (3 * 16 * 64);
+          float* my_p = tile_mp + static_cast<size_t>(part_role) * (16 * 64);
+          if (g < M) {
+            float* row_p = my_p + g * 64;
+            *reinterpret_cast<float2*>(&row_p[local_c0]) = make_float2(d0_0, d1_0);
+            *reinterpret_cast<float2*>(&row_p[local_c1]) = make_float2(d0_1, d1_1);
+          }
+          if constexpr (kM16) {
+            if (has_hi) {
+              float* row_p = my_p + (g + 8) * 64;
+              *reinterpret_cast<float2*>(&row_p[local_c0]) = make_float2(d2_0, d3_0);
+              *reinterpret_cast<float2*>(&row_p[local_c1]) = make_float2(d2_1, d3_1);
+            }
+          }
+          __threadfence();
+          __syncthreads();
+          if (tid == 0) {
+            s_is_last = (atomicAdd(&sk_done[cur_n], 1) == (num_parts - 1)) ? 1 : 0;
+          }
+          __syncthreads();
+          if (s_is_last) {
+            if (num_parts == 2) {
+              const float* peer_p = tile_mp + static_cast<size_t>(1 - part_role) * (16 * 64);
+              if (g < M) {
+                const float* row_p = peer_p + g * 64;
+                const float2 p0 = int4_ldcg_f2(reinterpret_cast<const float2*>(&row_p[local_c0]));
+                const float2 p1 = int4_ldcg_f2(reinterpret_cast<const float2*>(&row_p[local_c1]));
+                *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col0) =
+                    int4_bf16x2_u32(d0_0 + p0.x, d1_0 + p0.y);
+                *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col1) =
+                    int4_bf16x2_u32(d0_1 + p1.x, d1_1 + p1.y);
+              }
+              if constexpr (kM16) {
+                if (has_hi) {
+                  const float* row_p = peer_p + (g + 8) * 64;
+                  const float2 p0 = int4_ldcg_f2(reinterpret_cast<const float2*>(&row_p[local_c0]));
+                  const float2 p1 = int4_ldcg_f2(reinterpret_cast<const float2*>(&row_p[local_c1]));
+                  *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * N + col0) =
+                      int4_bf16x2_u32(d2_0 + p0.x, d3_0 + p0.y);
+                  *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * N + col1) =
+                      int4_bf16x2_u32(d2_1 + p1.x, d3_1 + p1.y);
+                }
+              }
+            } else {
+              const int peer_a = (part_role == 0) ? 1 : 0;
+              const int peer_b = (part_role == 2) ? 1 : 2;
+              const float* pa_base = tile_mp + static_cast<size_t>(peer_a) * (16 * 64);
+              const float* pb_base = tile_mp + static_cast<size_t>(peer_b) * (16 * 64);
+              auto reduce3 = [&](float mx, float my, float2 va, float2 vb) -> uint32_t {
+                float x0, x1, x2, y0, y1, y2;
+                if (part_role == 0) {
+                  x0 = mx; x1 = va.x; x2 = vb.x;
+                  y0 = my; y1 = va.y; y2 = vb.y;
+                } else if (part_role == 1) {
+                  x0 = va.x; x1 = mx; x2 = vb.x;
+                  y0 = va.y; y1 = my; y2 = vb.y;
+                } else {
+                  x0 = va.x; x1 = vb.x; x2 = mx;
+                  y0 = va.y; y1 = vb.y; y2 = my;
+                }
+                return int4_bf16x2_u32((x0 + x1) + x2, (y0 + y1) + y2);
+              };
+              if (g < M) {
+                const float* row_a = pa_base + g * 64;
+                const float* row_b = pb_base + g * 64;
+                const float2 a0 = int4_ldcg_f2(reinterpret_cast<const float2*>(&row_a[local_c0]));
+                const float2 b0 = int4_ldcg_f2(reinterpret_cast<const float2*>(&row_b[local_c0]));
+                const float2 a1 = int4_ldcg_f2(reinterpret_cast<const float2*>(&row_a[local_c1]));
+                const float2 b1 = int4_ldcg_f2(reinterpret_cast<const float2*>(&row_b[local_c1]));
+                *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col0) = reduce3(d0_0, d1_0, a0, b0);
+                *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col1) = reduce3(d0_1, d1_1, a1, b1);
+              }
+              if constexpr (kM16) {
+                if (has_hi) {
+                  const float* row_a = pa_base + (g + 8) * 64;
+                  const float* row_b = pb_base + (g + 8) * 64;
+                  const float2 a0 = int4_ldcg_f2(reinterpret_cast<const float2*>(&row_a[local_c0]));
+                  const float2 b0 = int4_ldcg_f2(reinterpret_cast<const float2*>(&row_b[local_c0]));
+                  const float2 a1 = int4_ldcg_f2(reinterpret_cast<const float2*>(&row_a[local_c1]));
+                  const float2 b1 = int4_ldcg_f2(reinterpret_cast<const float2*>(&row_b[local_c1]));
+                  *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * N + col0) = reduce3(d2_0, d3_0, a0, b0);
+                  *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * N + col1) = reduce3(d2_1, d3_1, a1, b1);
+                }
+              }
+            }
+            __syncthreads();
+            if (tid == 0) {
+              atomicExch(&sk_done[cur_n], 0);
+            }
+          }
+        } else {
+          float* tile_p = sk_partials + static_cast<size_t>(cur_n) * (16 * 64);
           if (g < M) {
             float* row_p = tile_p + g * 64;
-            const float s0_0 = atomicExch(&row_p[local_c0 + 0], 0.0f);
-            const float s1_0 = atomicExch(&row_p[local_c0 + 1], 0.0f);
-            const float s0_1 = atomicExch(&row_p[local_c1 + 0], 0.0f);
-            const float s1_1 = atomicExch(&row_p[local_c1 + 1], 0.0f);
-            *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col0) = int4_bf16x2_u32(s0_0, s1_0);
-            *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col1) = int4_bf16x2_u32(s0_1, s1_1);
+            atomicAdd(&row_p[local_c0 + 0], d0_0);
+            atomicAdd(&row_p[local_c0 + 1], d1_0);
+            atomicAdd(&row_p[local_c1 + 0], d0_1);
+            atomicAdd(&row_p[local_c1 + 1], d1_1);
           }
           if constexpr (kM16) {
             if (has_hi) {
               float* row_p = tile_p + (g + 8) * 64;
-              const float s2_0 = atomicExch(&row_p[local_c0 + 0], 0.0f);
-              const float s3_0 = atomicExch(&row_p[local_c0 + 1], 0.0f);
-              const float s2_1 = atomicExch(&row_p[local_c1 + 0], 0.0f);
-              const float s3_1 = atomicExch(&row_p[local_c1 + 1], 0.0f);
-              *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * N + col0) = int4_bf16x2_u32(s2_0, s3_0);
-              *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * N + col1) = int4_bf16x2_u32(s2_1, s3_1);
+              atomicAdd(&row_p[local_c0 + 0], d2_0);
+              atomicAdd(&row_p[local_c0 + 1], d3_0);
+              atomicAdd(&row_p[local_c1 + 0], d2_1);
+              atomicAdd(&row_p[local_c1 + 1], d3_1);
             }
           }
+          __threadfence();
           __syncthreads();
           if (tid == 0) {
-            atomicExch(&sk_done[cur_n], 0);
+            s_is_last = (atomicAdd(&sk_done[cur_n], seg_kgs) + seg_kgs == num_kg) ? 1 : 0;
+          }
+          __syncthreads();
+          if (s_is_last) {
+            if (g < M) {
+              float* row_p = tile_p + g * 64;
+              const float s0_0 = atomicExch(&row_p[local_c0 + 0], 0.0f);
+              const float s1_0 = atomicExch(&row_p[local_c0 + 1], 0.0f);
+              const float s0_1 = atomicExch(&row_p[local_c1 + 0], 0.0f);
+              const float s1_1 = atomicExch(&row_p[local_c1 + 1], 0.0f);
+              *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col0) = int4_bf16x2_u32(s0_0, s1_0);
+              *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col1) = int4_bf16x2_u32(s0_1, s1_1);
+            }
+            if constexpr (kM16) {
+              if (has_hi) {
+                float* row_p = tile_p + (g + 8) * 64;
+                const float s2_0 = atomicExch(&row_p[local_c0 + 0], 0.0f);
+                const float s3_0 = atomicExch(&row_p[local_c0 + 1], 0.0f);
+                const float s2_1 = atomicExch(&row_p[local_c1 + 0], 0.0f);
+                const float s3_1 = atomicExch(&row_p[local_c1 + 1], 0.0f);
+                *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * N + col0) = int4_bf16x2_u32(s2_0, s3_0);
+                *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * N + col1) = int4_bf16x2_u32(s2_1, s3_1);
+              }
+            }
+            __syncthreads();
+            if (tid == 0) {
+              atomicExch(&sk_done[cur_n], 0);
+            }
           }
         }
       }
@@ -953,11 +1100,22 @@ float* ensure_int4_splitk_partials(const torch::TensorOptions& opts, int64_t nee
   return g_partials.data_ptr<float>() + static_cast<size_t>(slot) * static_cast<size_t>(g_partials_cap);
 }
 
+bool int4_two_part_red_enabled() {
+  static const bool on = []() -> bool {
+    const char* s = std::getenv("MUSE_INT4_TWO_PART_RED");
+    if (!s || !*s) return true;
+    return std::atoi(s) != 0;
+  }();
+  return on;
+}
+
 void ensure_int4_sk_scratch(const torch::TensorOptions& opts, int n_blocks,
-                            float*& partials_ptr, int*& done_ptr) {
+                            float*& partials_ptr, float*& two_part_ptr, int*& done_ptr) {
   static torch::Tensor g_sk_partials;
+  static torch::Tensor g_sk_two_part;
   static torch::Tensor g_sk_done;
   static int g_sk_cap = 0;
+  static int g_sk_tp_cap = 0;
   static uint32_t g_sk_slot = 0;
   if (!g_sk_partials.defined() || g_sk_partials.device() != opts.device() || g_sk_cap < n_blocks) {
     const int cap = (n_blocks > 1024) ? n_blocks : 1024;
@@ -965,9 +1123,18 @@ void ensure_int4_sk_scratch(const torch::TensorOptions& opts, int n_blocks,
     g_sk_done = torch::zeros({2, cap}, opts.dtype(torch::kInt32));
     g_sk_cap = cap;
   }
+  const bool use_tp = int4_two_part_red_enabled();
+  if (use_tp && (!g_sk_two_part.defined() || g_sk_two_part.device() != opts.device() || g_sk_tp_cap < n_blocks)) {
+    const int tp_cap = (n_blocks > 256) ? n_blocks : 256;
+    g_sk_two_part = torch::empty({2, static_cast<int64_t>(tp_cap) * 3 * 16 * 64}, opts.dtype(torch::kFloat32));
+    g_sk_tp_cap = tp_cap;
+  }
   const int slot = static_cast<int>(g_sk_slot & 1u);
   g_sk_slot ^= 1u;
   partials_ptr = g_sk_partials.data_ptr<float>() + static_cast<size_t>(slot) * static_cast<size_t>(g_sk_cap) * 16 * 64;
+  two_part_ptr = use_tp
+      ? (g_sk_two_part.data_ptr<float>() + static_cast<size_t>(slot) * static_cast<size_t>(g_sk_tp_cap) * 3 * 16 * 64)
+      : nullptr;
   done_ptr = g_sk_done.data_ptr<int>() + static_cast<size_t>(slot) * static_cast<size_t>(g_sk_cap);
 }
 
@@ -988,20 +1155,21 @@ torch::Tensor launch_int4_gemm(
     const int total_iters = n_blocks * static_cast<int>(K >> 6);
     const int grid = (sk_grid < total_iters) ? sk_grid : total_iters;
     float* p_ptr = nullptr;
+    float* tp_ptr = nullptr;
     int* d_ptr = nullptr;
-    ensure_int4_sk_scratch(opts, n_blocks, p_ptr, d_ptr);
+    ensure_int4_sk_scratch(opts, n_blocks, p_ptr, tp_ptr, d_ptr);
     if (use_m16) {
       int4_launch_pdl(
           int4_mma_streamk_kernel<true, true>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
           static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          p_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
+          p_ptr, tp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
     } else {
       int4_launch_pdl(
           int4_mma_streamk_kernel<false, true>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
           static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          p_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
+          p_ptr, tp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
     }
     return C;
   }
