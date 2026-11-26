@@ -31,24 +31,45 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 DEFAULT_TREE_M = "16"
+DEFAULT_TREE_WIDE_M = "32"
 ENABLED = os.environ.get("MUSE_NATIVE_LEAF", "1").strip() not in ("0", "", "false", "no")
 M8_ENABLED = os.environ.get("MUSE_NATIVE_LEAF_M8", "1").strip() not in ("0", "", "false", "no")
 try:
     _TREE_M_RAW = int(os.environ.get("MUSE_NATIVE_TREE_M", DEFAULT_TREE_M).strip() or "0")
 except ValueError:
     _TREE_M_RAW = 0
-TREE_M = _TREE_M_RAW if _TREE_M_RAW in (12, 16) else 0
+TREE_M = _TREE_M_RAW if _TREE_M_RAW in (12, 16, 20, 24, 32) else 0
+try:
+    _TREE_WIDE_M_RAW = int(os.environ.get("MUSE_NATIVE_TREE_WIDE_M", DEFAULT_TREE_WIDE_M).strip() or "0")
+except ValueError:
+    _TREE_WIDE_M_RAW = 0
+TREE_WIDE_M = (
+    _TREE_WIDE_M_RAW
+    if (_TREE_WIDE_M_RAW in (20, 24, 32) and TREE_M > 0 and _TREE_WIDE_M_RAW > TREE_M)
+    else 0
+)
+TREE_WIDE_GATE = os.environ.get("MUSE_NATIVE_TREE_WIDE_GATE", "cpc").strip().lower()
+TREE_WIDE_CPC = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_CPC", "4.8"))
+TREE_WIDE_SM = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_SM", "2.0"))
+
+
+def desired_verify_ms() -> tuple[int, ...]:
+    """Configured bs=1 depth-6 verify widths > 7 to capture as FULL CUDA graphs."""
+    if not ENABLED:
+        return ()
+    if TREE_M in (12, 16, 20, 24, 32):
+        if TREE_WIDE_M > TREE_M:
+            return (TREE_M, TREE_WIDE_M)
+        return (TREE_M,)
+    if M8_ENABLED:
+        return (8,)
+    return ()
 
 
 def desired_verify_m() -> int:
-    """Single source of truth for configured bs=1 depth-6 verify width (16, 12, 8, or 7)."""
-    if not ENABLED:
-        return 7
-    if TREE_M in (12, 16):
-        return TREE_M
-    if M8_ENABLED:
-        return 8
-    return 7
+    """Single source of truth for max configured bs=1 depth-6 verify width (32..7)."""
+    ms = desired_verify_ms()
+    return max(ms) if ms else 7
 LOW_THRESH = int(os.environ.get("MUSE_NATIVE_LEAF_THRESH", "3"))
 _POLICY_RAW = os.environ.get("MUSE_NATIVE_LEAF_POLICY", "d1").strip().lower()
 POLICY = 1 if _POLICY_RAW == "margin" else 0
@@ -67,7 +88,7 @@ TREE_HIGH_ACC_CPC = float(os.environ.get("MUSE_TREE_HIGH_ACC_CPC", "0"))
 LEAF_STATS = os.environ.get("MUSE_LEAF_STATS", "0").strip() in ("1", "true", "yes")
 TR_ENABLED = os.environ.get("MUSE_TR_MODE", "1").strip() not in ("0", "", "false", "no")
 HIST_CAP = 16384
-TR_LOG_CAP = 2048
+TR_LOG_CAP = 4096
 _ST_RAW = os.environ.get("MUSE_NATIVE_LEAF_SELFTEST", "0").strip().lower()
 SELFTEST = 1 if _ST_RAW in ("1", "true", "yes") else (2 if _ST_RAW == "2" else 0)
 NOHIT = os.environ.get("MUSE_NATIVE_LEAF_NOHIT", "0").strip() in ("1", "true", "yes")
@@ -78,26 +99,27 @@ class _NativeLeafState:
         self.ready: bool = False
         self.m8_ready: bool = False
         self.tree_m_ready: int = 0
+        self.tree_wide_m_ready: int = 0
         self.vocab_size: int = 202048
         self.device: torch.device | None = None
-        self.leaf_flag: torch.Tensor | None = None          # int32[49] shared with muse_gqa16_attn
+        self.leaf_flag: torch.Tensor | None = None          # int32[97] shared with muse_gqa16_attn
         self.prev_ns: torch.Tensor | None = None            # int32[1]
         self.hit_flag: torch.Tensor | None = None           # int32[14] [dst0, hit_len, dst0, src0, ..., dst5, src5]
-        self.hit_src_row: torch.Tensor | None = None        # int32[1] (0=miss, r=winning initial leaf row 7..15)
+        self.hit_src_row: torch.Tensor | None = None        # int32[1] (0=miss, r=winning initial leaf row 7..31)
         self.alt_ids: torch.Tensor | None = None            # int64[4] (d1_b1, d1_b2, d2_b1, d2_b2)
         self.alt_margins: torch.Tensor | None = None        # float32[2] (margin_d1, margin_d2)
         self.tree_top: torch.Tensor | None = None           # int64[36] ([6, 6] top-6 for d1..d6)
         self.tree_vals: torch.Tensor | None = None          # float32[36] ([6, 6] top-6 logits for d1..d6)
         self.req_acc_state: torch.Tensor | None = None      # int32[3] [rounds, committed, high_acc_flag]
         self.saved_alt_tok: torch.Tensor | None = None      # int64[1] (legacy M=7/M=8)
-        self.saved_leaf_toks: torch.Tensor | None = None    # int64[16] (tree mode)
-        self.saved_leaf_k: torch.Tensor | None = None       # int32[16] (tree mode)
-        self.saved_leaf_parent: torch.Tensor | None = None  # int32[16] (-1=1-level root, 7..15=parent row)
+        self.saved_leaf_toks: torch.Tensor | None = None    # int64[32] (tree mode)
+        self.saved_leaf_k: torch.Tensor | None = None       # int32[32] (tree mode)
+        self.saved_leaf_parent: torch.Tensor | None = None  # int32[32] (-1=1-level root, 7..31=parent row)
         self.hist: torch.Tensor | None = None               # int32[16384] exact committed token history
         self.hist_len: torch.Tensor | None = None           # int32[1] valid history length
         self.saved_pos0: torch.Tensor | None = None         # int64[1] step anchor position p0
-        self.saved_row_ctx: torch.Tensor | None = None      # int32[16, 4] per-row (cur, prv1, prv2, pos_r)
-        self.tr_log: torch.Tensor | None = None             # int32[2048, 8] per-request 30B target recycle log
+        self.saved_row_ctx: torch.Tensor | None = None      # int32[32, 4] per-row (cur, prv1, prv2, pos_r)
+        self.tr_log: torch.Tensor | None = None             # int32[4096, 8] per-request 30B target recycle log
         self.tr_state: torch.Tensor | None = None           # int32[4] [tr_len, tr_step, last_p0, reserved]
         self.stats: torch.Tensor | None = None              # int64[52] telemetry counters
         self.cascade_meta: torch.Tensor | None = None       # int32[8] Pass-2 cascade metadata & row mask
@@ -120,6 +142,8 @@ class _NativeLeafState:
         self._hid_ptr_cache: dict[tuple[int, ...], torch.Tensor] = {}
         self._last_req_id: str | None = None
         self._hist_req_id: str | None = None
+        self._host_req_id: str | None = None
+        self._host_rounds: int = 0
         self._logged_active: bool = False
         self._atexit_registered: bool = False
 
@@ -171,14 +195,42 @@ def is_m8_ready() -> bool:
 
 
 def active_verify_m() -> int:
-    """Return active verify width for bs=1 depth-6 verify: 16, 12, 8, or 7."""
+    """Return active base verify width for bs=1 depth-6 verify: 32, 24, 20, 16, 12, 8, or 7."""
     if not (ENABLED and _S.ready):
         return 7
-    if _S.tree_m_ready in (12, 16):
+    if _S.tree_m_ready in (12, 16, 20, 24, 32):
         return _S.tree_m_ready
     if M8_ENABLED and _S.m8_ready:
         return 8
     return 7
+
+
+def select_verify_m(req_id: str | None, decoded_tokens: int) -> int:
+    """Select per-step verify width (adaptive wide M=32 on hard steps vs base M=16 on easy steps).
+
+    Default `cpc` gate is 100% zero-sync on the host: uses `decoded_tokens` (from
+    `req_states.num_computed_tokens_np - prefill_len`) divided by host-counted verify rounds.
+    """
+    base_m = active_verify_m()
+    wide_m = _S.tree_wide_m_ready
+    if wide_m <= base_m or req_id is None:
+        return base_m
+    if req_id != _S._host_req_id or decoded_tokens <= 0:
+        _S._host_req_id = req_id
+        _S._host_rounds = 0
+    if TREE_WIDE_GATE == "always":
+        return wide_m
+    if TREE_WIDE_GATE == "sm":
+        if _S._host_rounds == 0 or _S.tree_vals is None or _S.tree_vals.numel() < 36:
+            return wide_m
+        sm_val = float((_S.tree_vals[0:36:6] - _S.tree_vals[1:36:6]).mean().item())
+        return wide_m if sm_val < TREE_WIDE_SM else base_m
+    # Default zero-sync `cpc` gate: enable wide_m on step 0 or while running verify cpc < TREE_WIDE_CPC.
+    # decoded_tokens = num_computed_tokens - prefill_len == sum(committed_tokens[0..round-1]).
+    if _S._host_rounds == 0:
+        return wide_m
+    verify_committed = max(0, int(decoded_tokens))
+    return wide_m if (float(verify_committed) < TREE_WIDE_CPC * float(_S._host_rounds)) else base_m
 
 
 def _get_bfx():
@@ -522,13 +574,13 @@ def init_kv_table(
         else:
             _S.req_acc_state.zero_()
         _S.saved_alt_tok = torch.full((1,), -1, dtype=torch.int64, device=device)
-        _S.saved_leaf_toks = torch.full((16,), -1, dtype=torch.int64, device=device)
-        _S.saved_leaf_k = torch.zeros((16,), dtype=torch.int32, device=device)
-        _S.saved_leaf_parent = torch.full((16,), -1, dtype=torch.int32, device=device)
+        _S.saved_leaf_toks = torch.full((32,), -1, dtype=torch.int64, device=device)
+        _S.saved_leaf_k = torch.zeros((32,), dtype=torch.int32, device=device)
+        _S.saved_leaf_parent = torch.full((32,), -1, dtype=torch.int32, device=device)
         _S.hist = torch.full((HIST_CAP,), -1, dtype=torch.int32, device=device)
         _S.hist_len = torch.zeros((1,), dtype=torch.int32, device=device)
         _S.saved_pos0 = torch.full((1,), -1, dtype=torch.int64, device=device)
-        _S.saved_row_ctx = torch.full((16, 4), -1, dtype=torch.int32, device=device)
+        _S.saved_row_ctx = torch.full((32, 4), -1, dtype=torch.int32, device=device)
         _S.tr_log = torch.zeros((TR_LOG_CAP, 8), dtype=torch.int32, device=device)
         _S.tr_state = torch.tensor([0, 0, -1, 0], dtype=torch.int32, device=device)
         if (
@@ -551,15 +603,30 @@ def init_kv_table(
         _S._hid_ptr_cache.clear()
         _S._last_req_id = None
         _S._hist_req_id = None
+        _S._host_req_id = None
+        _S._host_rounds = 0
         _S.m8_ready = bool(M8_ENABLED and hasattr(bfx, "native_leaf_prepare_m8"))
+        _has_tree_ops = (
+            hasattr(bfx, "native_leaf_prepare_tree")
+            and hasattr(bfx, "native_leaf_setup_tree")
+            and hasattr(bfx, "native_leaf_commit_tree")
+        )
         _S.tree_m_ready = (
             TREE_M
             if (
-                TREE_M in (12, 16)
-                and lf.numel() >= 49
-                and hasattr(bfx, "native_leaf_prepare_tree")
-                and hasattr(bfx, "native_leaf_setup_tree")
-                and hasattr(bfx, "native_leaf_commit_tree")
+                TREE_M in (12, 16, 20, 24, 32)
+                and lf.numel() >= 1 + 3 * TREE_M
+                and _has_tree_ops
+            )
+            else 0
+        )
+        _S.tree_wide_m_ready = (
+            TREE_WIDE_M
+            if (
+                _S.tree_m_ready > 0
+                and TREE_WIDE_M > _S.tree_m_ready
+                and lf.numel() >= 1 + 3 * TREE_WIDE_M
+                and _has_tree_ops
             )
             else 0
         )
@@ -568,8 +635,9 @@ def init_kv_table(
             _S._atexit_registered = True
             atexit.register(_dump_stats, "atexit")
     logger.info(
-        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, dynamic=%d [calib=%d,depth<=%d,T=%.2f,tail=%.1f,g=%.2f,adapt=%d,sub=%.2f,shf=%.2f,cont=%.2f,hi_cpc=%.1f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d, stats=%d)",
-        _S.num_layers, _S.tree_m_ready, int(TREE_DYNAMIC), int(TREE_CALIB), TREE_MAX_DEPTH, TREE_TEMP, TREE_TAIL, TREE_GAMMA,
+        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, wide_m=%d [gate=%s,cpc=%.2f,sm=%.2f], dynamic=%d [calib=%d,depth<=%d,T=%.2f,tail=%.1f,g=%.2f,adapt=%d,sub=%.2f,shf=%.2f,cont=%.2f,hi_cpc=%.1f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d, stats=%d)",
+        _S.num_layers, _S.tree_m_ready, _S.tree_wide_m_ready, TREE_WIDE_GATE, TREE_WIDE_CPC, TREE_WIDE_SM,
+        int(TREE_DYNAMIC), int(TREE_CALIB), TREE_MAX_DEPTH, TREE_TEMP, TREE_TAIL, TREE_GAMMA,
         int(TREE_ADAPT_GAMMA), TREE_SUB_COEF, TREE_SHF_COEF, TREE_CONT_DECAY, TREE_HIGH_ACC_CPC,
         int(_S.m8_ready), _POLICY_RAW, MARGIN_ALPHA, LOW_THRESH, int(SELFTEST), int(NOHIT), int(LEAF_STATS),
     )
@@ -610,6 +678,8 @@ def on_non_leaf_step(
         if LEAF_STATS and _S._last_req_id is not None:
             _dump_stats(str(_S._last_req_id))
         _S._last_req_id = req_id
+        _S._host_req_id = req_id
+        _S._host_rounds = 0
         _S.prev_ns.fill_(7)
         _S.alt_ids.fill_(-1)
         if _S.alt_margins is not None:
@@ -633,7 +703,7 @@ def prepare_m8(positions: torch.Tensor, seq_lens: torch.Tensor) -> bool:
 @torch.no_grad()
 def prepare_tree(positions: torch.Tensor, seq_lens: torch.Tensor, verify_m: int) -> bool:
     """Zero-sync GPU prep: positions[7..verify_m-1] = p+7..p+verify_m-1, seq_lens[0] += verify_m-7."""
-    if not is_ready() or verify_m < 8 or verify_m > 16:
+    if not is_ready() or verify_m < 8 or verify_m > 32:
         return False
     bfx = _get_bfx()
     if bfx is None:
@@ -688,6 +758,8 @@ def setup_step(
         if LEAF_STATS and _S._last_req_id is not None:
             _dump_stats(str(_S._last_req_id))
         _S._last_req_id = req_id
+        _S._host_req_id = req_id
+        _S._host_rounds = 0
         _S.prev_ns.fill_(7)
         _S.alt_ids.fill_(-1)
         if _S.alt_margins is not None:
@@ -780,6 +852,7 @@ def setup_step(
                     SELFTEST,
                     _S.req_acc_state,
                 )
+        _S._host_rounds += 1
         return True
     bfx.native_leaf_setup(
         _S.leaf_flag,

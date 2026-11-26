@@ -28,10 +28,10 @@ import time
 from dataclasses import dataclass
 
 
-REFERENCE_SERIAL_MS_PER_TOKEN = 84.4
-REFERENCE_MAX_DECODE_GAIN = 4.98
+REFERENCE_SERIAL_MS_PER_TOKEN = 84.5
+REFERENCE_MAX_DECODE_GAIN = 4.95
 TARGET_MS_PER_COMMITTED_TOKEN = float(
-    os.environ.get("VLLM_DFLASH_CEILING_TARGET_MS", "16.90")
+    os.environ.get("VLLM_DFLASH_CEILING_TARGET_MS", "17.08")
 )
 
 # The estimator starts at the measured S3 neighborhood and adapts downward
@@ -230,7 +230,7 @@ class DFlashCommittedTokenCeiling:
             - pending_committed
             - 1
         )
-        limited_depth = min(offered_depth, max(0, room_for_drafts))
+        limited_depth = min(offered_depth, max(1, room_for_drafts))
         if limited_depth < offered_depth:
             state.engagements += 1
         return limited_depth

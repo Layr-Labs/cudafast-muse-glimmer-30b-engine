@@ -185,6 +185,19 @@ torch::Tensor draft_head_topc(
 torch::Tensor draft_head_gemm_full(
     torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K,
     int64_t grid_ctas = 96, int64_t mode = 0);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> dhead_fast_pack(
+    torch::Tensor raw_w, torch::Tensor raw_s, torch::Tensor global_scale,
+    torch::Tensor vocab_map, int64_t mode = 150);
+torch::Tensor dhead_fast_argmax(
+    torch::Tensor A, torch::Tensor blob, torch::Tensor row_scales,
+    torch::Tensor col_scales, torch::Tensor packed_tok_ids,
+    torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor raw_w,
+    torch::Tensor raw_s, torch::Tensor global_scale, double logit_scale = 1.0,
+    int64_t mode = 150, int64_t topk = 192,
+    c10::optional<torch::Tensor> out_top2_row0 = c10::nullopt,
+    c10::optional<torch::Tensor> out_margins = c10::nullopt,
+    c10::optional<torch::Tensor> out_tree_top = c10::nullopt,
+    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt);
 void native_leaf_prepare_m8(
     torch::Tensor positions, torch::Tensor seq_lens);
 void native_leaf_prepare_tree(
@@ -379,6 +392,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("draft_head_gemm_full", &draft_head_gemm_full,
         pybind11::arg("A"), pybind11::arg("W_packed"), pybind11::arg("N"), pybind11::arg("K"),
         pybind11::arg("grid_ctas") = 96, pybind11::arg("mode") = 0);
+  m.def("dhead_fast_pack", &dhead_fast_pack,
+        pybind11::arg("raw_w"), pybind11::arg("raw_s"), pybind11::arg("global_scale"),
+        pybind11::arg("vocab_map"), pybind11::arg("mode") = 150);
+  m.def("dhead_fast_argmax", &dhead_fast_argmax,
+        pybind11::arg("A"), pybind11::arg("blob"), pybind11::arg("row_scales"),
+        pybind11::arg("col_scales"), pybind11::arg("packed_tok_ids"),
+        pybind11::arg("tail_ids"), pybind11::arg("tail_count"), pybind11::arg("raw_w"),
+        pybind11::arg("raw_s"), pybind11::arg("global_scale"), pybind11::arg("logit_scale") = 1.0,
+        pybind11::arg("mode") = 150, pybind11::arg("topk") = 192,
+        pybind11::arg("out_top2_row0") = c10::nullopt,
+        pybind11::arg("out_margins") = c10::nullopt,
+        pybind11::arg("out_tree_top") = c10::nullopt,
+        pybind11::arg("out_tree_vals") = c10::nullopt);
   m.def("native_leaf_prepare_m8", &native_leaf_prepare_m8);
   m.def("native_leaf_prepare_tree", &native_leaf_prepare_tree,
         pybind11::arg("positions"), pybind11::arg("seq_lens"), pybind11::arg("tree_m") = 12);

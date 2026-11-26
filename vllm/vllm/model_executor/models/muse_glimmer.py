@@ -1197,7 +1197,7 @@ class _GateSideStream:
 
     def __init__(self) -> None:
         self.max_tokens = int(
-            os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "16")
+            os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "32")
         )
         self.stream: torch.cuda.Stream | None = None
         self.fork_event: torch.cuda.Event | None = None
@@ -1252,7 +1252,7 @@ class _GateSideStream:
             if x.shape[0] == 1:
                 if getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
                     return
-            elif 2 <= x.shape[0] <= 16:
+            elif 2 <= x.shape[0] <= 32:
                 if layer_idx in _BF16_DUAL_RANS_M_LAYERS:
                     return
                 if getattr(bf16_gate, "muse_bf16_rans_m", None) is None:
@@ -1602,7 +1602,7 @@ def _muse_bf16_qkv_or_stacked_impl(
         out = torch.mm(x, w_cat.t())
         return out[:, :4608].contiguous(), out[:, 4608:].contiguous()
     if (
-        2 <= x.shape[0] <= 16
+        2 <= x.shape[0] <= 32
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16
@@ -1663,7 +1663,7 @@ def _muse_bf16_gate_fill_impl(
             if rc == 0:
                 return
     if (
-        2 <= x.shape[0] <= 16
+        2 <= x.shape[0] <= 32
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16
@@ -2625,23 +2625,88 @@ class MuseGlimmerForCausalLM(
         if get_tensor_model_parallel_world_size() != 1:
             return
         want_bf16_stack = os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_PREFILL", "1") != "0"
-        if not want_bf16_stack:
-            return
         want_bf16_stack_decode = (
-            os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_DECODE", "0") != "0"
+            want_bf16_stack
+            and os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_DECODE", "0") != "0"
             and os.environ.get("MUSE_BF16_RANS_M", "1") != "0"
         )
         bf16_stack_cnt = 0
         bf16_dual_rans_cnt = 0
+        nvfp4_dual_cnt = 0
+        try:
+            import marlinw_down128 as _md128
+            from vllm.model_executor.kernels.linear.nvfp4 import marlin as _nvfp4_marlin
+        except (ImportError, OSError):
+            _md128 = None
+            _nvfp4_marlin = None
+        want_nvfp4_dual = (
+            _md128 is not None
+            and _nvfp4_marlin is not None
+            and getattr(_md128, "ATTN_DUAL_TMA_ENABLED", False)
+            and hasattr(_md128, "gemm_dual_qkv_gate")
+            and hasattr(_nvfp4_marlin, "register_nvfp4_dual_qkv_gate")
+        )
+        if not want_bf16_stack and not want_nvfp4_dual:
+            return
         for layer in islice(self.model.layers, self.model.start_layer, self.model.end_layer):
             attn = layer.self_attn
-            if not attn.use_output_gate or attn.gate_fork_point != "qkv":
+            if not attn.use_output_gate:
                 continue
             qkv = attn.qkv_proj
             gate = attn.output_gate_proj
             qw = getattr(qkv, "weight", None)
             gw = getattr(gate, "weight", None)
             if qw is None or gw is None or not qw.is_cuda or not gw.is_cuda:
+                continue
+            if (
+                want_nvfp4_dual
+                and qw.dtype == torch.int32
+                and gw.dtype == torch.int32
+                and qw.data_ptr() in _nvfp4_marlin._attn128_weights
+                and gw.data_ptr() in _nvfp4_marlin._attn128_weights
+                and getattr(qkv, "output_size_per_partition", 0) == 4608
+                and getattr(qkv, "input_size_per_partition", 0) == 6656
+                and getattr(gate, "output_size_per_partition", 0) == 4096
+                and getattr(gate, "input_size_per_partition", 0) == 6656
+                and getattr(qkv, "weight_global_scale", None) is not None
+                and getattr(gate, "weight_global_scale", None) is not None
+            ):
+                try:
+                    gen = torch.Generator(device=qw.device).manual_seed(20261126 + attn.layer_idx)
+                    probe = torch.randn((512, 6656), generator=gen, device=qw.device, dtype=torch.bfloat16)
+                    ref_q = _md128.gemm_shape(
+                        probe, qw, qkv.weight_scale, qkv.weight_global_scale, 4608, 6656
+                    )
+                    ref_g = _md128.gemm_shape(
+                        probe, gw, gate.weight_scale, gate.weight_global_scale, 4096, 6656
+                    )
+                    dual1 = _md128.gemm_dual_qkv_gate(
+                        probe,
+                        qw, qkv.weight_scale, qkv.weight_global_scale,
+                        gw, gate.weight_scale, gate.weight_global_scale,
+                    )
+                    # Second launch verifies zero residual scratch/state corruption across repeated calls.
+                    dual2 = _md128.gemm_dual_qkv_gate(
+                        probe,
+                        qw, qkv.weight_scale, qkv.weight_global_scale,
+                        gw, gate.weight_scale, gate.weight_global_scale,
+                    )
+                    if (
+                        ref_q is not None
+                        and ref_g is not None
+                        and dual1 is not None
+                        and dual2 is not None
+                        and torch.equal(dual1[0].view(torch.int16), ref_q.view(torch.int16))
+                        and torch.equal(dual1[1].view(torch.int16), ref_g.view(torch.int16))
+                        and torch.equal(dual2[0].view(torch.int16), ref_q.view(torch.int16))
+                        and torch.equal(dual2[1].view(torch.int16), ref_g.view(torch.int16))
+                    ):
+                        _nvfp4_marlin.register_nvfp4_dual_qkv_gate(qkv, gate)
+                        nvfp4_dual_cnt += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("NVFP4 dual TMA qkv+gate skipped on layer %d: %s", attn.layer_idx, exc)
+                continue
+            if not want_bf16_stack or attn.gate_fork_point != "qkv":
                 continue
             if (
                 qw.dtype == torch.bfloat16
@@ -2779,8 +2844,11 @@ class MuseGlimmerForCausalLM(
                                 )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("BF16 stacked qkv+gate prefill skipped on layer %d: %s", attn.layer_idx, exc)
-        if bf16_stack_cnt:
-            logger.info("Attention dual prefill: %d BF16 stacked qkv+gate", bf16_stack_cnt)
+        if bf16_stack_cnt or nvfp4_dual_cnt:
+            logger.info(
+                "Attention dual prefill: %d BF16 stacked qkv+gate, %d NVFP4 TMA dual qkv+gate",
+                bf16_stack_cnt, nvfp4_dual_cnt,
+            )
         if bf16_dual_rans_cnt:
             logger.info(
                 "Attention dual decode rANS: %d BF16 stacked qkv+gate (8704x6656, 0-ULP)",

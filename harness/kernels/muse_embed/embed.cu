@@ -266,8 +266,6 @@ __global__ void __launch_bounds__(32) post_update_m1_kernel(
       req_state_idx = idx_mapping[0];
       if (req_state_idx >= 0) {
         total_len = total_len_ptr[req_state_idx];
-        num_sampled = num_sampled_ptr[0];
-        num_rejected = num_rejected_ptr[0];
         if (query_start_loc != nullptr) {
           query_len = query_start_loc[1] - query_start_loc[0];
         }
@@ -290,6 +288,8 @@ __global__ void __launch_bounds__(32) post_update_m1_kernel(
     num_computed = num_computed_tokens[req_state_idx];
   } else {
     if (req_state_idx < 0) return;
+    num_sampled = num_sampled_ptr[0];
+    num_rejected = num_rejected_ptr[0];
   }
   const int32_t computed_delta = query_len - num_rejected;
   if (num_sampled == 1) {

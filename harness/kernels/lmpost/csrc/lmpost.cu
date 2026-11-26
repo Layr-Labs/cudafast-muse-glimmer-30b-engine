@@ -229,7 +229,7 @@ extern "C" int lmpost_greedy_verify(const void* target_argmax, const void* input
                                     const void* logits_indices, void* num_sampled_out,
                                     void* num_rejected_out, int m, void* stream) {
   using namespace lmpost;
-  if (m < 2 || m > 16 || target_argmax == nullptr || input_ids == nullptr ||
+  if (m < 2 || m > 32 || target_argmax == nullptr || input_ids == nullptr ||
       num_sampled_out == nullptr || num_rejected_out == nullptr) {
     return (int)cudaErrorInvalidValue;
   }

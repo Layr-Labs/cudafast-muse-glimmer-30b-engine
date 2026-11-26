@@ -426,10 +426,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         # LOCAL PATCH (bs=1 spec-decode host cut): constant one-request metadata
-        # for draft steps of 1..max(decode_query_len, 16) tokens, built once here so a
+        # for draft steps of 1..max(decode_query_len, 32) tokens, built once here so a
         # step reads it instead of a pin + H2D copy (query_start_loc,
         # cu_num_logits) and an expand kernel. Only read downstream.
-        _n_max = max(self.decode_query_len, 16)
+        _n_max = max(self.decode_query_len, 32)
         for _nt in range(1, _n_max + 1):
             if _nt not in self._qsl_const_gpu:
                 self._qsl_const_gpu[_nt] = torch.tensor(
@@ -438,10 +438,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     device=self.device,
                 )
         self._qsl_tree_np = {
-            _tm: np.array([0, _tm], dtype=np.int32) for _tm in (8, 12, 16)
+            _tm: np.array([0, _tm], dtype=np.int32) for _tm in (8, 12, 16, 20, 24, 32)
         }
         self._num_sched_tree_np = {
-            _tm: np.array([_tm], dtype=np.int32) for _tm in (8, 12, 16)
+            _tm: np.array([_tm], dtype=np.int32) for _tm in (8, 12, 16, 20, 24, 32)
         }
         self._spec_cu_logits_np = [
             np.array([0, _n], dtype=np.int32) for _n in range(_n_max + 1)
@@ -2639,7 +2639,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if _leaf_req_id is not None
             else None
         )
-        _target_leaf_m = _native_leaf.active_verify_m()
+        _leaf_decoded = (
+            int(self.req_states.num_computed_tokens_np[_leaf_req_idx])
+            - int(self.req_states.prefill_len.np[_leaf_req_idx])
+            if _leaf_req_idx is not None
+            else 0
+        )
+        _target_leaf_m = _native_leaf.select_verify_m(_leaf_req_id, _leaf_decoded)
         extra_leaf_candidate = (
             _target_leaf_m > 7
             and not dummy_run

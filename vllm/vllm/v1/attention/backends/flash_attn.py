@@ -956,7 +956,7 @@ class FlashAttentionImpl(AttentionImpl):
                 ):
                     return output
             elif (
-                2 <= num_actual_tokens <= 16
+                2 <= num_actual_tokens <= 32
                 and attn_metadata.max_query_len == num_actual_tokens
             ):
                 window = (
