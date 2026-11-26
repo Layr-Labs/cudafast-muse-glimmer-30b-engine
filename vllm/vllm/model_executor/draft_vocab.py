@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -101,6 +102,38 @@ def _is_pure_ascii_token(tok_str: str, b2u_inv: dict[str, int]) -> bool:
 
 def _is_single_byte_token(tok_str: str, b2u_inv: dict[str, int]) -> bool:
     return len(tok_str) == 1 and (tok_str in b2u_inv or ord(tok_str) < 256)
+
+
+def _is_valid_utf8_prose_token(tok_str: str, b2u_inv: dict[str, int]) -> bool:
+    """True if decoded bytes form valid UTF-8 Latin/Greek/Punctuation/Math (no split bytes or CJK)."""
+    if not tok_str:
+        return False
+    raw = bytearray()
+    for ch in tok_str:
+        b = b2u_inv.get(ch)
+        if b is None:
+            o = ord(ch)
+            if o >= 256:
+                return False
+            b = o
+        raw.append(b)
+    try:
+        dec = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    has_non_ascii = False
+    for c in dec:
+        cp = ord(c)
+        if cp < 0x80:
+            continue
+        has_non_ascii = True
+        if not (
+            0x00A0 <= cp <= 0x024F  # Latin-1 Supplement + Latin Extended-A/B
+            or 0x0370 <= cp <= 0x03FF  # Greek (alpha, beta, pi, sigma, ...)
+            or 0x2000 <= cp <= 0x22FF  # General Punctuation (’, “, ”, —, –, …, •), Superscripts, Arrows, Math
+        ):
+            return False
+    return has_non_ascii
 
 
 def _decode_ascii_alpha(tok_str: str, b2u_inv: dict[str, int]) -> str:
@@ -268,13 +301,28 @@ def configure_draft_vocab(
             merge_rank[tid] = r
 
     forced = _special_token_ids(model_path, vocab_size)
+    for entry in added_list:
+        idx = entry.get("id")
+        content = str(entry.get("content", ""))
+        if (
+            isinstance(idx, int)
+            and 0 <= idx < vocab_size
+            and entry.get("special")
+            and "reserved_special_token" not in content
+        ):
+            forced.add(idx)
     b2u_inv = _bytes_to_unicode_inv()
     mode_norm = mode.strip().lower()
     use_ascii_tier = mode_norm != "bpe"
+    use_utf8_tier = (
+        os.environ.get("MUSE_DRAFT_VOCAB_UTF8", "1" if size >= 120000 else "0").strip()
+        not in ("0", "", "false", "no")
+    )
 
     tier0: list[int] = []  # forced special tokens + all single-byte base tokens
     tier1: list[tuple[int, int]] = []  # ASCII BPE tokens (or all BPE tokens in `bpe` mode)
-    tier2: list[tuple[int, int]] = []  # non-ASCII BPE tokens (in `ascii_bpe` mode)
+    tier2_utf8: list[tuple[int, int]] = []  # valid UTF-8 Latin/Greek/Punctuation/Math BPE tokens
+    tier2: list[tuple[int, int]] = []  # remaining non-ASCII BPE tokens
     tier3: list[int] = []  # unforced added / placeholder tokens
 
     for tid in range(vocab_size):
@@ -291,6 +339,8 @@ def configure_draft_vocab(
         rank = merge_rank.get(tid, len(merges) + tid)
         if not use_ascii_tier or _is_pure_ascii_token(s, b2u_inv):
             tier1.append((rank, tid))
+        elif use_utf8_tier and _is_valid_utf8_prose_token(s, b2u_inv):
+            tier2_utf8.append((rank, tid))
         else:
             tier2.append((rank, tid))
 
@@ -298,12 +348,14 @@ def configure_draft_vocab(
     tier1.sort()
     if mode_norm == "ascii_lm":
         tier1 = _rerank_ascii_tier_self_lm(tier1, id_to_str, b2u_inv)
+    tier2_utf8.sort()
     tier2.sort()
     tier3.sort()
 
     chosen: list[int] = []
     chosen.extend(tier0)
     chosen.extend(tid for _, tid in tier1)
+    chosen.extend(tid for _, tid in tier2_utf8)
     chosen.extend(tid for _, tid in tier2)
     chosen.extend(tier3)
     # Sort final selected IDs? Keeping sorted ID order preserves ascending original-ID locality
