@@ -138,7 +138,8 @@ torch::Tensor draft_vocab_tail_argmax(
     c10::optional<torch::Tensor> out_top2_row0 = c10::nullopt,
     c10::optional<torch::Tensor> out_margins = c10::nullopt,
     c10::optional<torch::Tensor> out_tree_top = c10::nullopt,
-    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt);
+    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt,
+    bool vocab_map_sorted = false);
 torch::Tensor draft_vocab_score_rows(
     torch::Tensor A, torch::Tensor row_ids, torch::Tensor raw_w,
     torch::Tensor raw_s, torch::Tensor global_scale, double logit_scale);
@@ -226,7 +227,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("out_top2_row0") = c10::nullopt,
         pybind11::arg("out_margins") = c10::nullopt,
         pybind11::arg("out_tree_top") = c10::nullopt,
-        pybind11::arg("out_tree_vals") = c10::nullopt);
+        pybind11::arg("out_tree_vals") = c10::nullopt,
+        pybind11::arg("vocab_map_sorted") = false);
   m.def("draft_vocab_score_rows", &draft_vocab_score_rows,
         pybind11::arg("A"), pybind11::arg("row_ids"), pybind11::arg("raw_w"),
         pybind11::arg("raw_s"), pybind11::arg("global_scale"), pybind11::arg("logit_scale") = 1.0);

@@ -980,6 +980,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                     margin_buf,
                     tree_top_buf,
                     tree_vals_buf,
+                    vocab_map_sorted=True,
                 )
             except TypeError:
                 return _bfx.draft_vocab_tail_argmax(
