@@ -1348,7 +1348,8 @@ static void bf16_rans_gemm_launch(
   pb.nb_split = static_cast<int>(N1 >> 3);
   pb.tw = cfg.tw;
   const int pdl_cfg = br_pdl_cfg();
-  pb.pdl_mode = (pdl_cfg == 2) ? 3 : ((pdl_cfg == 1) ? 1 : 0);
+  const bool side_gate = (N == 4096 && K == 6656 && out2_ptr == nullptr);
+  pb.pdl_mode = (pdl_cfg == 2) ? (side_gate ? 1 : 3) : ((pdl_cfg == 1) ? 1 : 0);
   static const bool xsmem_async_en = []() {
     const char* env = std::getenv("MUSE_BF16_RANS_XSMEM_ASYNC");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
