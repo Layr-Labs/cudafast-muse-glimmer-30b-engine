@@ -749,7 +749,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
         }
         if (do_nb) {
           const int s_end = kXsmem ? ((cs + 32 < S) ? (cs + 32) : S) : S;
-          auto do_k_step = [&](int s, bool check_trig) __attribute__((always_inline)) {
+          auto do_k_step = [&](int s, bool check_trig, auto phase_tag) __attribute__((always_inline)) {
+            constexpr int kPhase = decltype(phase_tag)::value;
             if (check_trig && s == trig_s) {
               asm volatile("griddepcontrol.launch_dependents;");
             }
@@ -787,10 +788,17 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
                 rans_ldsm2_x8(a.x, a.y, buf_b, s - cs, lane);
               }
             } else if constexpr (kXGlobalMode == 1) {
-              if ((s & 1) == 0) {
+              if constexpr (kPhase == 0) {
                 if (valid_m) v_lo = __ldg(x_u4_base + (s << 1));
                 if constexpr (kM16) {
                   if (valid_m_hi) v_hi = __ldg(x_u4_hi + (s << 1));
+                }
+              } else if constexpr (kPhase < 0) {
+                if ((s & 1) == 0) {
+                  if (valid_m) v_lo = __ldg(x_u4_base + (s << 1));
+                  if constexpr (kM16) {
+                    if (valid_m_hi) v_hi = __ldg(x_u4_hi + (s << 1));
+                  }
                 }
               }
             } else {
@@ -831,14 +839,24 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
             const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
             if constexpr (!kXsmem && kXGlobalMode == 1) {
-              if ((s & 1) == 0) {
+              if constexpr (kPhase == 0) {
                 rans_xpose4(v_lo, t, a.x, a.y, a_next.x, a_next.y);
                 if constexpr (kM16) {
                   rans_xpose4(v_hi, t, a_hi.x, a_hi.y, a_hi_next.x, a_hi_next.y);
                 }
-              } else {
+              } else if constexpr (kPhase == 1) {
                 a = a_next;
                 if constexpr (kM16) a_hi = a_hi_next;
+              } else {
+                if ((s & 1) == 0) {
+                  rans_xpose4(v_lo, t, a.x, a.y, a_next.x, a_next.y);
+                  if constexpr (kM16) {
+                    rans_xpose4(v_hi, t, a_hi.x, a_hi.y, a_hi_next.x, a_hi_next.y);
+                  }
+                } else {
+                  a = a_next;
+                  if constexpr (kM16) a_hi = a_hi_next;
+                }
               }
             }
             // Wait for ring group right before reading nw and r0..r3 in parallel.
@@ -871,27 +889,43 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             states[2] = n2 ? ((x2 << 16) | r2) : x2;
             states[3] = n3 ? ((x3 << 16) | r3) : x3;
           };
+          struct PhaseDyn { enum : int { value = -1 }; };
+          struct PhaseEven { enum : int { value = 0 }; };
+          struct PhaseOdd { enum : int { value = 1 }; };
           if constexpr (kXsmem) {
             if (pb.unroll2 == 2 && cs + 32 <= S && (trig_s < cs || trig_s >= cs + 32)) {
 #pragma unroll 4
               for (int sl = 0; sl < 32; ++sl) {
-                do_k_step(cs + sl, false);
+                do_k_step(cs + sl, false, PhaseDyn{});
               }
             } else if (pb.unroll2 && cs + 32 <= S && (trig_s < cs || trig_s >= cs + 32)) {
 #pragma unroll 2
               for (int sl = 0; sl < 32; ++sl) {
-                do_k_step(cs + sl, false);
+                do_k_step(cs + sl, false, PhaseDyn{});
               }
             } else {
 #pragma unroll 1
               for (int s = cs; s < s_end; s++) {
-                do_k_step(s, true);
+                do_k_step(s, true, PhaseDyn{});
+              }
+            }
+          } else if constexpr (kXGlobalMode == 1) {
+            if (((cs & 1) == 0) && (((s_end - cs) & 1) == 0)) {
+#pragma unroll 1
+              for (int s = cs; s < s_end; s += 2) {
+                do_k_step(s, true, PhaseEven{});
+                do_k_step(s + 1, true, PhaseOdd{});
+              }
+            } else {
+#pragma unroll 1
+              for (int s = cs; s < s_end; s++) {
+                do_k_step(s, true, PhaseDyn{});
               }
             }
           } else {
 #pragma unroll 1
             for (int s = cs; s < s_end; s++) {
-              do_k_step(s, true);
+              do_k_step(s, true, PhaseDyn{});
             }
           }
         }
