@@ -1432,6 +1432,113 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logger.warning("lm_head+lmpost graph capture skipped (%s); keeping eager path", exc)
             return ref_tok
 
+    def _try_verify_lmpost_graph(
+        self,
+        sample_hidden_states: torch.Tensor,
+        lm_head: Any,
+        lut: torch.Tensor,
+        org_vocab: int,
+        input_ids: torch.Tensor,
+        verify_m: int,
+        buf_cols: int,
+        out_cols: int,
+        _m6: Any,
+        _lmp: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        # 4-slot ring of the verify-path lm_head+lmpost+greedy_verify (2 launches -> 1 graph
+        # launch). Only the sliced path (logits_indices None): every input is then a
+        # persistent buffer. Returns (sampled_buf, sampled_view, num_sampled, num_rejected).
+        if (
+            envs.os.environ.get("VLLM_VERIFY_LMHEAD_GRAPH", "1") == "0"
+            or self.cudagraph_manager is None
+            or not self.cudagraph_manager._graphs_captured
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        entries = getattr(self, "_verify_lmhead_cg_entries", None)
+        if entries is None:
+            entries = {}
+            self._verify_lmhead_cg_entries = entries
+            self._verify_lmhead_cg_rejected: set[tuple] = set()
+            self._verify_lmhead_cg_pool = torch.cuda.graph_pool_handle()
+            self._verify_lmhead_cg_cap_stream = torch.cuda.Stream(device=self.device)
+            self._verify_lmhead_cg_step = 0
+        sig = (
+            sample_hidden_states.data_ptr(),
+            tuple(sample_hidden_states.shape),
+            input_ids.data_ptr(),
+            int(verify_m),
+            int(buf_cols),
+            int(out_cols),
+        )
+        entry = entries.get(sig)
+        if entry is not None:
+            graphs, slots = entry
+            slot = self._verify_lmhead_cg_step & 3
+            self._verify_lmhead_cg_step += 1
+            graphs[slot].replay()
+            return slots[slot]
+        if sig in self._verify_lmhead_cg_rejected or len(entries) >= 8:
+            return None
+        try:
+            ref_buf = torch.empty((1, buf_cols), dtype=torch.int64, device=self.device)
+            ref_sv = ref_buf[:, :out_cols]
+            ref_ns = torch.empty((1,), dtype=torch.int32, device=self.device)
+            ref_nr = torch.empty((1,), dtype=torch.int32, device=self.device)
+            if not (
+                _m6.launch_lmhead_lmpost6_m(sample_hidden_states, lm_head, lut, ref_buf, org_vocab)
+                and _lmp.greedy_verify(ref_sv, input_ids, None, ref_ns, ref_nr, verify_m)
+            ):
+                self._verify_lmhead_cg_rejected.add(sig)
+                return None
+            slots = []
+            for _ in range(4):
+                s_buf = torch.empty((1, buf_cols), dtype=torch.int64, device=self.device)
+                n_s = torch.empty((1,), dtype=torch.int32, device=self.device)
+                n_r = torch.empty((1,), dtype=torch.int32, device=self.device)
+                slots.append((s_buf, s_buf[:, :out_cols], n_s, n_r))
+            graphs: list[torch.cuda.CUDAGraph] = []
+            main_st = torch.cuda.current_stream(self.device)
+            cap_st = self._verify_lmhead_cg_cap_stream
+            cap_st.wait_stream(main_st)
+            with torch.cuda.stream(cap_st):
+                for slot in range(4):
+                    g = torch.cuda.CUDAGraph()
+                    s_buf, s_v, n_s, n_r = slots[slot]
+                    with torch.cuda.graph(g, pool=self._verify_lmhead_cg_pool, stream=cap_st):
+                        if not (
+                            _m6.launch_lmhead_lmpost6_m(sample_hidden_states, lm_head, lut, s_buf, org_vocab)
+                            and _lmp.greedy_verify(s_v, input_ids, None, n_s, n_r, verify_m)
+                        ):
+                            raise RuntimeError("verify lm_head+lmpost refused during capture")
+                    graphs.append(g)
+            main_st.wait_stream(cap_st)
+            s_buf0, _, n_s0, n_r0 = slots[0]
+            s_buf0.fill_(-1)
+            n_s0.fill_(-1)
+            n_r0.fill_(-1)
+            graphs[0].replay()
+            rows = int(sample_hidden_states.shape[0])  # columns the kernel writes
+            if not (
+                torch.equal(s_buf0[:, :rows], ref_buf[:, :rows])
+                and torch.equal(n_s0, ref_ns)
+                and torch.equal(n_r0, ref_nr)
+            ):
+                self._verify_lmhead_cg_rejected.add(sig)
+                logger.warning("verify lm_head+lmpost graph mismatch vs eager; keeping eager path")
+                return (ref_buf, ref_sv, ref_ns, ref_nr)
+            entries[sig] = (graphs, slots)
+            self._verify_lmhead_cg_step = 1
+            logger.info(
+                "Captured fused verify lm_head+lmpost+greedy_verify CUDA graph (4-slot ring, shape=%s)",
+                tuple(sample_hidden_states.shape),
+            )
+            return slots[0]
+        except Exception as exc:  # noqa: BLE001
+            self._verify_lmhead_cg_rejected.add(sig)
+            logger.warning("verify lm_head+lmpost graph capture skipped (%s); keeping eager path", exc)
+            return None
+
     def _try_decode_embed_graph(
         self,
         scheduled_encoder_inputs: dict[str, list[int]],
@@ -1723,15 +1830,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         if getattr(lm_head, "marlin_decode6_lmpost_m_admitted", False):
                             out_cols = self.rejection_sampler.num_speculative_steps + 1
                             buf_cols = max(out_cols, leaf_verify_m) if extra_leaf else out_cols
-                            sampled_v_buf = torch.empty(
-                                (1, buf_cols),
-                                dtype=torch.int64,
-                                device=self.device,
+                            cg_res = (
+                                self._try_verify_lmpost_graph(
+                                    sample_hidden_states,
+                                    lm_head,
+                                    lut,
+                                    org_vocab,
+                                    input_batch.input_ids,
+                                    verify_m,
+                                    buf_cols,
+                                    out_cols,
+                                    _m6,
+                                    _lmp,
+                                )
+                                if can_verify_slice
+                                else None
                             )
-                            sampled_v = sampled_v_buf[:, :out_cols]
-                            num_sampled_v = torch.empty((1,), dtype=torch.int32, device=self.device)
-                            num_rejected_v = torch.empty((1,), dtype=torch.int32, device=self.device)
-                            if (
+                            if cg_res is not None:
+                                sampled_v_buf, sampled_v, num_sampled_v, num_rejected_v = cg_res
+                            else:
+                                sampled_v_buf = torch.empty(
+                                    (1, buf_cols),
+                                    dtype=torch.int64,
+                                    device=self.device,
+                                )
+                                sampled_v = sampled_v_buf[:, :out_cols]
+                                num_sampled_v = torch.empty((1,), dtype=torch.int32, device=self.device)
+                                num_rejected_v = torch.empty((1,), dtype=torch.int32, device=self.device)
+                            if cg_res is not None or (
                                 _m6.launch_lmhead_lmpost6_m(
                                     sample_hidden_states, lm_head, lut, sampled_v_buf, org_vocab
                                 )
