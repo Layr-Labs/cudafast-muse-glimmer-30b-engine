@@ -83,6 +83,7 @@ from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
+    check_tree_chain_prep,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
     post_update,
@@ -327,6 +328,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._single_decode_prep_armed = False
         self._single_decode_prep_verified = False
         self._single_decode_prep_failed = False
+        self._tree_chain_prep_ok: bool | None = None
         self._qsl_const_gpu: dict[int, torch.Tensor] = {}
         for _nt in (1, 2, 512):
             _qsl = [0] + [_nt] * self.max_num_reqs
@@ -1055,7 +1057,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
     def prepare_inputs(
-        self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
+        self,
+        scheduler_output: SchedulerOutput,
+        batch_desc: BatchExecutionDescriptor,
+        *,
+        tree_verify: bool = False,
     ) -> InputBatch:
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
@@ -1144,73 +1150,126 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
         num_reqs_padded = batch_desc.num_reqs or num_reqs
-        query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
-        query_start_loc_np[0] = 0
-        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
-        # Pad for full CUDA graph mode.
-        # Some attention backends like FA3 require query_start_loc to be non-decreasing.
-        query_start_loc_np[num_reqs + 1 :] = num_tokens
-        _qsl_cached = self._qsl_const_gpu.get(num_tokens) if num_reqs == 1 else None
-        if _qsl_cached is not None:
-            self.input_buffers.query_start_loc.copy_(_qsl_cached, non_blocking=True)
-        else:
-            async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
-        query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
-        query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
         prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
         computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens
         num_computed_prefill_tokens_np = computed_prefill_tokens_np[idx_mapping_np]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
 
-        # Get prefill tokens if any.
-        if np.any(is_prefilling_np):
-            prepare_prefill_inputs(
+        fused_chain = (
+            tree_verify
+            and num_tokens == 7
+            and total_num_logits == 7
+            and self.max_num_reqs == num_reqs_padded == num_reqs == 1
+            and not self.use_dcp
+            and not is_prefilling_np[0]
+            and envs.os.environ.get("VLLM_TREE_CHAIN_PREP_FUSE", "1") != "0"
+        )
+        if fused_chain and self._tree_chain_prep_ok is None:
+            if torch.cuda.is_current_stream_capturing():
+                fused_chain = False
+            else:
+                try:
+                    self._tree_chain_prep_ok = bool(check_tree_chain_prep(self.device))
+                    if self._tree_chain_prep_ok:
+                        logger.info(
+                            "Fused single-request tree-chain input preparation admitted (exact integer check)"
+                        )
+                    else:
+                        logger.warning(
+                            "Fused single-request tree-chain input preparation rejected; keeping stock path"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    self._tree_chain_prep_ok = False
+                    logger.warning(
+                        "Fused single-request tree-chain input preparation check raised (%s); keeping stock path",
+                        exc,
+                    )
+        if fused_chain and not self._tree_chain_prep_ok:
+            fused_chain = False
+
+        if fused_chain:
+            query_start_loc_np = np.array([0, num_tokens], dtype=np.int32)
+            query_start_loc = self.input_buffers.query_start_loc[:2]
+            seq_lens = self.input_buffers.seq_lens[:1]
+            dcp_local_seq_lens = None
+            logits_indices = combine_sampled_and_draft_tokens(
                 self.input_buffers.input_ids,
-                self.req_states.next_prefill_tokens,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+                verify_positions=self.input_buffers.positions,
+                verify_computed=self.req_states.num_computed_tokens.gpu,
+            )
+        else:
+            query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
+            query_start_loc_np[0] = 0
+            np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
+            # Pad for full CUDA graph mode.
+            # Some attention backends like FA3 require query_start_loc to be non-decreasing.
+            query_start_loc_np[num_reqs + 1 :] = num_tokens
+            _qsl_cached = self._qsl_const_gpu.get(num_tokens) if num_reqs == 1 else None
+            if _qsl_cached is not None:
+                self.input_buffers.query_start_loc.copy_(_qsl_cached, non_blocking=True)
+            else:
+                async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
+            query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
+            query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
+
+            # Get prefill tokens if any.
+            if np.any(is_prefilling_np):
+                prepare_prefill_inputs(
+                    self.input_buffers.input_ids,
+                    self.req_states.next_prefill_tokens,
+                    idx_mapping,
+                    query_start_loc,
+                    self.req_states.all_token_ids.gpu,
+                    self.req_states.prefill_len.gpu,
+                    self.req_states.num_computed_tokens.gpu,
+                )
+
+            # Prepare positions and seq_lens.
+            prepare_pos_seq_lens(
                 idx_mapping,
                 query_start_loc,
-                self.req_states.all_token_ids.gpu,
-                self.req_states.prefill_len.gpu,
                 self.req_states.num_computed_tokens.gpu,
-            )
-
-        # Prepare positions and seq_lens.
-        prepare_pos_seq_lens(
-            idx_mapping,
-            query_start_loc,
-            self.req_states.num_computed_tokens.gpu,
-            self.input_buffers.positions,
-            self.input_buffers.seq_lens,
-        )
-        seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
-
-        dcp_local_seq_lens = None
-        if self.use_dcp:
-            # Prepare dcp local seq_lens.
-            prepare_dcp_local_seq_lens(
-                self.input_buffers.dcp_local_seq_lens,
+                self.input_buffers.positions,
                 self.input_buffers.seq_lens,
-                num_reqs,
-                self.dcp_size,
-                self.dcp_rank,
-                self.cp_interleave,
             )
-            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
+            seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
-        # Some input token ids are directly read from the last sampled tokens
-        # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
-            self.input_buffers.input_ids,
-            idx_mapping,
-            self.req_states.last_sampled_tokens,
-            query_start_loc,
-            seq_lens,
-            self.req_states.prefill_len.gpu,
-            self.req_states.draft_tokens,
-            cu_num_logits,
-            total_num_logits,
-            self.model_state.num_new_sampled_tokens_per_step,
-        )
+            dcp_local_seq_lens = None
+            if self.use_dcp:
+                # Prepare dcp local seq_lens.
+                prepare_dcp_local_seq_lens(
+                    self.input_buffers.dcp_local_seq_lens,
+                    self.input_buffers.seq_lens,
+                    num_reqs,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    self.cp_interleave,
+                )
+                dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
+
+            # Some input token ids are directly read from the last sampled tokens
+            # and draft tokens. Also, get the logits indices to sample tokens from.
+            logits_indices = combine_sampled_and_draft_tokens(
+                self.input_buffers.input_ids,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
@@ -2282,7 +2341,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 from dataclasses import replace as _dc_replace
 
                 self._single_decode_prep_armed = False
-                input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+                input_batch = self.prepare_inputs(
+                    scheduler_output, batch_desc, tree_verify=True
+                )
                 # Upgrade forward-only metadata to M=_target_leaf_m (8/12/16) while keeping
                 # input_batch at M=7 (query_start_loc=[0, 7]) for postprocess_sampled & propose.
                 _native_leaf.prepare_tree(
