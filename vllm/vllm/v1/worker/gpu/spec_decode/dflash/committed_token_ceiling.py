@@ -28,10 +28,10 @@ import time
 from dataclasses import dataclass
 
 
-REFERENCE_SERIAL_MS_PER_TOKEN = 84.4
+REFERENCE_SERIAL_MS_PER_TOKEN = 85.5
 REFERENCE_MAX_DECODE_GAIN = 4.98
 TARGET_MS_PER_COMMITTED_TOKEN = float(
-    os.environ.get("VLLM_DFLASH_CEILING_TARGET_MS", "16.90")
+    os.environ.get("VLLM_DFLASH_CEILING_TARGET_MS", "17.05")
 )
 
 # The estimator starts at the measured S3 neighborhood and adapts downward

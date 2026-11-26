@@ -1438,7 +1438,7 @@ __global__ void Marlin(
   // locally per copy to avoid ptxas odd-UR descriptor allocation on sm_121a.
   auto cp_async4_stream = [&](void* smem_ptr, const void* glob_ptr) {
     const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    if constexpr (fuse_lmpost && down_ilv && fixed_shape != 3) {
+    if constexpr (fuse_lmpost && down_ilv && (fixed_shape != 3 || multi_m)) {
       asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;\n" ::"r"(smem), "l"(glob_ptr));
     } else {
       uint64_t stream_policy;
@@ -1992,34 +1992,21 @@ __global__ void Marlin(
       FragB frag_b1;
       int b_quant_0, b_quant_1;
 
-      if constexpr (b_type_id == vllm::kFE2M1f.id() &&
-                    a_type_id == vllm::kBFloat16.id() && dequant_skip_flop) {
-        const uint32_t u = static_cast<uint32_t>(frag_b_quant[k2][0][j]);
-        reinterpret_cast<uint32_t*>(&frag_b1)[1] =
-            lop3<(0xf0 & 0xcc) | 0xaa>(u, 0x80008000, (u >> 6) & 0x01c001c0u);
-        reinterpret_cast<uint32_t*>(&frag_b1)[0] =
-            (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
-        reinterpret_cast<uint32_t*>(&frag_b0)[1] =
-            ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
-        reinterpret_cast<uint32_t*>(&frag_b0)[0] =
-            ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
+      if constexpr (b_type_id == vllm::kFE2M1f.id()) {
+        b_quant_1 = frag_b_quant[k2][0][j];
+        b_quant_0 = b_quant_1 << 8;
+      } else if constexpr (b_type.size_bits() == 4) {
+        b_quant_0 = frag_b_quant[k2][0][j];
+        b_quant_1 = b_quant_0 >> 8;
       } else {
-        if constexpr (b_type_id == vllm::kFE2M1f.id()) {
-          b_quant_1 = frag_b_quant[k2][0][j];
-          b_quant_0 = b_quant_1 << 8;
-        } else if constexpr (b_type.size_bits() == 4) {
-          b_quant_0 = frag_b_quant[k2][0][j];
-          b_quant_1 = b_quant_0 >> 8;
-        } else {
-          static_assert(b_type.size_bits() == 8);
-          int* frag_b_quant_ptr = reinterpret_cast<int*>(frag_b_quant[k2]);
-          b_quant_0 = frag_b_quant_ptr[j * 2 + 0];
-          b_quant_1 = frag_b_quant_ptr[j * 2 + 1];
-        }
-
-        dequant_data(b_quant_0, reinterpret_cast<scalar_32bit_t*>(&frag_b0));
-        dequant_data(b_quant_1, reinterpret_cast<scalar_32bit_t*>(&frag_b1));
+        static_assert(b_type.size_bits() == 8);
+        int* frag_b_quant_ptr = reinterpret_cast<int*>(frag_b_quant[k2]);
+        b_quant_0 = frag_b_quant_ptr[j * 2 + 0];
+        b_quant_1 = frag_b_quant_ptr[j * 2 + 1];
       }
+
+      dequant_data(b_quant_0, reinterpret_cast<scalar_32bit_t*>(&frag_b0));
+      dequant_data(b_quant_1, reinterpret_cast<scalar_32bit_t*>(&frag_b1));
 
       if constexpr (dequant_skip_flop && has_zp && !is_zp_float && !is_a_8bit) {
         sub_zp<a_type_id>(frag_b0, frag_zp[j], 0);
@@ -2515,44 +2502,15 @@ __global__ void Marlin(
 
     if (!first) {
       float* frag_c_ptr = reinterpret_cast<float*>(&frag_c);
-      if constexpr (!m_block_size_8 && fixed_shape != 3) {
-        float4 rd[th_size];
   #pragma unroll
-        for (int k = 0; k < th_size; k++) {
-          rd[k] = reinterpret_cast<const float4*>(C_tmp)[c_cur_offset + active_threads * k + threadIdx.x];
-        }
-  #pragma unroll
-        for (int k = 0; k < th_size; k++) {
-          frag_c_ptr[k * 4 + 0] += rd[k].x;
-          frag_c_ptr[k * 4 + 1] += rd[k].y;
-          frag_c_ptr[k * 4 + 2] += rd[k].z;
-          frag_c_ptr[k * 4 + 3] += rd[k].w;
-        }
-      } else if constexpr (m_block_size_8 && fixed_shape != 3) {
-        constexpr int kh_size = th_size / 2;
-        float4 rd[kh_size];
-  #pragma unroll
-        for (int kh = 0; kh < kh_size; kh++) {
-          rd[kh] = reinterpret_cast<const float4*>(C_tmp)[c_cur_offset + active_threads * (2 * kh) + threadIdx.x];
-        }
-  #pragma unroll
-        for (int kh = 0; kh < kh_size; kh++) {
-          frag_c_ptr[kh * 8 + 0] += rd[kh].x;
-          frag_c_ptr[kh * 8 + 1] += rd[kh].y;
-          frag_c_ptr[kh * 8 + 2] += rd[kh].z;
-          frag_c_ptr[kh * 8 + 3] += rd[kh].w;
-        }
-      } else {
-  #pragma unroll
-        for (int k = 0; k < th_size; k += (m_block_size_8 ? 2 : 1)) {
-          sh_red[threadIdx.x] =
-              C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
+      for (int k = 0; k < th_size; k += (m_block_size_8 ? 2 : 1)) {
+        sh_red[threadIdx.x] =
+            C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
 
-          float* sh_c_ptr = reinterpret_cast<float*>(&sh_red[threadIdx.x]);
+        float* sh_c_ptr = reinterpret_cast<float*>(&sh_red[threadIdx.x]);
   #pragma unroll
-          for (int f = 0; f < 4; f++) {
-            frag_c_ptr[k * 4 + f] += sh_c_ptr[f];
-          }
+        for (int f = 0; f < 4; f++) {
+          frag_c_ptr[k * 4 + f] += sh_c_ptr[f];
         }
       }
     }

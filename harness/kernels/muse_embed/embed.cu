@@ -382,84 +382,6 @@ __global__ void __launch_bounds__(128) single_decode_prep_kernel(
         b_num * static_cast<int64_t>(bs) + static_cast<int64_t>(b_off);
   }
 }
-
-// Exact 1-request C++ CUDA fused prep for bs=1 speculative tree verify (M=8..32).
-// Replaces is_padding fills + prepare_pos_seq_lens + combine_sampled_and_draft_tokens +
-// native_leaf_prepare_tree + query_start_loc copy + gather_block_tables + compute_slot_mappings
-// in a single 128-thread PDL launch (9 launches -> 1 launch).
-template <bool kPdl>
-__global__ void __launch_bounds__(128) single_tree_prep_kernel(
-    const int32_t* __restrict__ idx_mapping,
-    const int32_t* __restrict__ num_computed_tokens,
-    const int64_t* __restrict__ last_sampled_tokens,
-    const int64_t* __restrict__ draft_tokens,
-    int64_t draft_tokens_stride,
-    int num_draft,
-    int verify_m,
-    int32_t* __restrict__ input_ids,
-    int64_t* __restrict__ pos,
-    int32_t* __restrict__ seq_lens,
-    int seq_lens_len,
-    int32_t* __restrict__ query_start_loc,
-    int qsl_len,
-    uint8_t* __restrict__ is_padding,
-    const uint64_t* __restrict__ src_bt_ptrs,
-    const uint64_t* __restrict__ dst_bt_ptrs,
-    const int64_t* __restrict__ bt_strides,
-    const int32_t* __restrict__ num_blocks,
-    int64_t num_blocks_stride,
-    const int32_t* __restrict__ block_sizes,
-    int64_t* __restrict__ slot_mappings,
-    int64_t slot_mappings_stride) {
-  const int gid = static_cast<int>(blockIdx.x);
-  const int tid = static_cast<int>(threadIdx.x);
-  const int32_t req_idx = idx_mapping[0];
-  const int64_t stride = bt_strides[gid];
-  const int32_t* const src_ptr =
-      reinterpret_cast<const int32_t*>(static_cast<uintptr_t>(src_bt_ptrs[gid])) +
-      static_cast<int64_t>(req_idx) * stride;
-  int32_t* const dst_ptr = reinterpret_cast<int32_t*>(static_cast<uintptr_t>(dst_bt_ptrs[gid]));
-  const int32_t bs = block_sizes[gid];
-  if constexpr (kPdl) {
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;");
-  }
-  const int32_t num_comp = num_computed_tokens[req_idx];
-  const int32_t nblk = num_blocks[static_cast<int64_t>(gid) * num_blocks_stride + req_idx];
-  if (gid == 0) {
-    if (tid == 0) {
-      input_ids[0] = static_cast<int32_t>(last_sampled_tokens[req_idx]);
-      seq_lens[0] = num_comp + verify_m;
-      query_start_loc[0] = 0;
-    } else if (tid <= num_draft) {
-      input_ids[tid] = static_cast<int32_t>(
-          draft_tokens[static_cast<int64_t>(req_idx) * draft_tokens_stride + (tid - 1)]);
-    }
-    if (tid < verify_m) {
-      pos[tid] = static_cast<int64_t>(num_comp) + static_cast<int64_t>(tid);
-      if (is_padding != nullptr) {
-        is_padding[tid] = (tid >= (1 + num_draft)) ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
-      }
-    }
-    for (int i = 1 + tid; i < seq_lens_len; i += 128) {
-      seq_lens[i] = 0;
-    }
-    for (int i = 1 + tid; i < qsl_len; i += 128) {
-      query_start_loc[i] = verify_m;
-    }
-  }
-  for (int i = tid; i < nblk; i += 128) {
-    dst_ptr[i] = src_ptr[i];
-  }
-  if (tid < verify_m) {
-    const int32_t p = num_comp + tid;
-    const int32_t b_idx = p / bs;
-    const int32_t b_off = p % bs;
-    const int64_t b_num = static_cast<int64_t>(src_ptr[b_idx]);
-    slot_mappings[static_cast<int64_t>(gid) * slot_mappings_stride + tid] =
-        b_num * static_cast<int64_t>(bs) + static_cast<int64_t>(b_off);
-  }
-}
 }  // namespace
 
 extern "C" int muse_embed_norm_m1(const void* ids, int ids_64, const void* table, float eps,
@@ -490,7 +412,7 @@ extern "C" int muse_embed_norm_m1(const void* ids, int ids_64, const void* table
 
 extern "C" int muse_embed_norm_m(const void* ids, int ids_64, const void* table, float eps,
                                  void* out, int rows, int width, cudaStream_t stream) {
-  if (rows <= 0 || rows > 32 || width <= 0 || (width & 7) != 0 || width > 8192)
+  if (rows <= 0 || rows > 16 || width <= 0 || (width & 7) != 0 || width > 8192)
     return cudaErrorInvalidValue;
   const bool use_pdl = decode_tail_pdl_enabled();
   if (use_pdl) {
@@ -563,44 +485,6 @@ extern "C" int muse_single_decode_prep(
       static_cast<const int32_t*>(idx_mapping), static_cast<const int32_t*>(num_computed_tokens),
       static_cast<const int64_t*>(last_sampled_tokens), static_cast<int32_t*>(input_ids),
       static_cast<int64_t*>(pos), static_cast<int32_t*>(seq_lens),
-      static_cast<const uint64_t*>(src_bt_ptrs), static_cast<const uint64_t*>(dst_bt_ptrs),
-      static_cast<const int64_t*>(bt_strides), static_cast<const int32_t*>(num_blocks),
-      num_blocks_stride, static_cast<const int32_t*>(block_sizes),
-      static_cast<int64_t*>(slot_mappings), slot_mappings_stride);
-  return static_cast<int>(cudaGetLastError());
-}
-
-extern "C" int muse_single_tree_prep(
-    int num_groups, const void* idx_mapping, const void* num_computed_tokens,
-    const void* last_sampled_tokens, const void* draft_tokens, int64_t draft_tokens_stride,
-    int num_draft, int verify_m, void* input_ids, void* pos, void* seq_lens, int seq_lens_len,
-    void* query_start_loc, int qsl_len, void* is_padding,
-    const void* src_bt_ptrs, const void* dst_bt_ptrs, const void* bt_strides,
-    const void* num_blocks, int64_t num_blocks_stride, const void* block_sizes,
-    void* slot_mappings, int64_t slot_mappings_stride, cudaStream_t stream) {
-  if (num_groups <= 0 || num_draft < 1 || num_draft > 7 || verify_m <= num_draft || verify_m > 32 ||
-      seq_lens_len < 1 || qsl_len < 2) {
-    return cudaErrorInvalidValue;
-  }
-  if (decode_tail_pdl_enabled()) {
-    return static_cast<int>(launch_pdl(
-        single_tree_prep_kernel<true>, num_groups, 128, stream,
-        static_cast<const int32_t*>(idx_mapping), static_cast<const int32_t*>(num_computed_tokens),
-        static_cast<const int64_t*>(last_sampled_tokens), static_cast<const int64_t*>(draft_tokens),
-        draft_tokens_stride, num_draft, verify_m, static_cast<int32_t*>(input_ids),
-        static_cast<int64_t*>(pos), static_cast<int32_t*>(seq_lens), seq_lens_len,
-        static_cast<int32_t*>(query_start_loc), qsl_len, static_cast<uint8_t*>(is_padding),
-        static_cast<const uint64_t*>(src_bt_ptrs), static_cast<const uint64_t*>(dst_bt_ptrs),
-        static_cast<const int64_t*>(bt_strides), static_cast<const int32_t*>(num_blocks),
-        num_blocks_stride, static_cast<const int32_t*>(block_sizes),
-        static_cast<int64_t*>(slot_mappings), slot_mappings_stride));
-  }
-  single_tree_prep_kernel<false><<<num_groups, 128, 0, stream>>>(
-      static_cast<const int32_t*>(idx_mapping), static_cast<const int32_t*>(num_computed_tokens),
-      static_cast<const int64_t*>(last_sampled_tokens), static_cast<const int64_t*>(draft_tokens),
-      draft_tokens_stride, num_draft, verify_m, static_cast<int32_t*>(input_ids),
-      static_cast<int64_t*>(pos), static_cast<int32_t*>(seq_lens), seq_lens_len,
-      static_cast<int32_t*>(query_start_loc), qsl_len, static_cast<uint8_t*>(is_padding),
       static_cast<const uint64_t*>(src_bt_ptrs), static_cast<const uint64_t*>(dst_bt_ptrs),
       static_cast<const int64_t*>(bt_strides), static_cast<const int32_t*>(num_blocks),
       num_blocks_stride, static_cast<const int32_t*>(block_sizes),

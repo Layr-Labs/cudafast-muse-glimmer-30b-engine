@@ -102,17 +102,9 @@ except (ImportError, OSError):
     marlinw_attn = None
 
 try:
-    from muse_marlin_gemv import (
-        M32_STATS as _tiled_m32_stats,
-        is_m32_admitted as _is_tiled_m32_admitted,
-        prepare_decode_layout,
-        verify_decode_layout_m32,
-    )
+    from muse_marlin_gemv import prepare_decode_layout
 except (ImportError, OSError):
     prepare_decode_layout = None
-    verify_decode_layout_m32 = None
-    _is_tiled_m32_admitted = None
-    _tiled_m32_stats = None
 
 try:
     # 6-bit block-scale codes for the tiled decode GEMV (harness/kernels/decode6)
@@ -214,13 +206,11 @@ def _log_prompt_stats() -> None:
         if marlin_swiglu is not None and hasattr(marlin_swiglu, "counts"):
             fast, passed = marlin_swiglu.counts()
             if fast:
-                ilv_n = marlin_swiglu.ilv_count() if hasattr(marlin_swiglu, "ilv_count") else 0
-                tma.append(f"gate/up {passed} of {fast} layers (ilv {ilv_n})")
+                tma.append(f"gate/up {passed} of {fast} layers")
         if marlin_swiglu_fp8 is not None and hasattr(marlin_swiglu_fp8, "counts"):
             fp8_passed = marlin_swiglu_fp8.counts()
             if fp8_passed:
-                fp8_ilv = marlin_swiglu_fp8.ilv_count() if hasattr(marlin_swiglu_fp8, "ilv_count") else 0
-                tma.append(f"gate/up_fp8 {fp8_passed} layers (ilv {fp8_ilv})")
+                tma.append(f"gate/up_fp8 {fp8_passed} layers")
         if tma:
             logger.info("TMA-fed 128-row prefill GEMM admitted: %s", ", ".join(tma))
         attn = _prompt_stats["attn"]
@@ -246,7 +236,7 @@ def _marlin_fp4_single(
     decode_fixed_grid: bool = False,
 ) -> torch.Tensor:
     if (
-        1 <= x.shape[0] <= 32
+        1 <= x.shape[0] <= 16
         and x.dtype == torch.bfloat16
         and decode_weight is not None
         and decode_scales is not None
@@ -258,30 +248,10 @@ def _marlin_fp4_single(
                     x, decode_weight, decode_scales, decode_palette, weight_global_scale, workspace,
                     size_n, size_k, decode_fixed_grid,
                 )
-        elif x.shape[0] == 1 or (
-            os.environ.get("MUSE_TILED_DECODE_M32", "1") != "0"
-            and _is_tiled_m32_admitted is not None
-            and _is_tiled_m32_admitted(decode_scales)
-        ):
+        elif x.shape[0] == 1:
             return torch.ops.vllm.marlin_tiled_decode.default(
                 x, decode_weight, decode_scales, weight_global_scale, workspace, size_n, size_k
             )
-    if x.shape[0] > 16 and x.shape[0] <= 32 and x.dtype == torch.bfloat16:
-        # Stock ops.marlin_gemm switches (1,8,8) -> (2,16,4) at M>16 causing 1-ULP KV drift;
-        # split into 16-row chunks as a 0-ULP safety net if tiled decode M32 was not admitted.
-        out = x.new_empty((x.shape[0], size_n))
-        for start in range(0, x.shape[0], 16):
-            end = min(start + 16, x.shape[0])
-            out[start:end] = apply_fp4_marlin_linear(
-                input=x[start:end],
-                weight=weight,
-                weight_scale=weight_scale,
-                weight_global_scale=weight_global_scale,
-                workspace=workspace,
-                size_n=size_n,
-                size_k=size_k,
-            )
-        return out
     return apply_fp4_marlin_linear(
         input=x,
         weight=weight,
@@ -982,29 +952,6 @@ class MarlinNvFp4LinearKernel(NvFp4LinearKernel):
                     layer._buffers.pop("_marlin_decode_scales6", None)
                     layer._buffers.pop("_marlin_decode_palette", None)
                     logger.warning_once("NVFP4 scale palette admission failed; retaining tiled decode: %s", exc)
-            if (
-                getattr(layer, "_marlin_decode_palette", None) is None
-                and getattr(layer, "_marlin_decode_weight", None) is not None
-                and verify_decode_layout_m32 is not None
-            ):
-                size_n = layer.output_size_per_partition
-                size_k = layer.input_size_per_partition
-                ok = verify_decode_layout_m32(
-                    layer,
-                    lambda x_in: apply_fp4_marlin_linear(
-                        input=x_in,
-                        weight=layer.weight,
-                        weight_scale=layer.weight_scale,
-                        weight_global_scale=layer.weight_global_scale,
-                        workspace=layer.workspace,
-                        size_n=size_n,
-                        size_k=size_k,
-                    ),
-                )
-                logger.info(
-                    "NVFP4 uncompressed tiled decode M=1..32 self-check (%dx%d): %s",
-                    size_n, size_k, "ADMITTED (0-ULP)" if ok else "REJECTED",
-                )
 
     def apply_weights(
         self,

@@ -24,7 +24,6 @@ ENABLED_TAIL = os.environ.get("MUSE_FAST_DECODE_TAIL", "1") != "0"
 _lib = None
 _post_update_m1_fn = None
 _single_decode_prep_fn = None
-_single_tree_prep_fn = None
 try:
     _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_embed.so")))
     _p = ctypes.c_void_p
@@ -54,15 +53,6 @@ try:
         ]
         _dp.restype = ctypes.c_int
         _single_decode_prep_fn = _dp
-    _tp = getattr(_lib, "muse_single_tree_prep", None)
-    if _tp is not None:
-        _tp.argtypes = [
-            ctypes.c_int, _p, _p, _p, _p, ctypes.c_int64, ctypes.c_int, ctypes.c_int,
-            _p, _p, _p, ctypes.c_int, _p, ctypes.c_int, _p,
-            _p, _p, _p, _p, ctypes.c_int64, _p, _p, ctypes.c_int64, _p,
-        ]
-        _tp.restype = ctypes.c_int
-        _single_tree_prep_fn = _tp
 except OSError:
     _lib = None
 
@@ -173,93 +163,6 @@ def fast_single_decode_prep(
         raise RuntimeError(f"muse_single_decode_prep failed with CUDA error {rc}")
     return True
 
-
-def fast_single_tree_prep(
-    num_groups: int,
-    idx_mapping: torch.Tensor,
-    num_computed_tokens: torch.Tensor,
-    last_sampled_tokens: torch.Tensor,
-    draft_tokens: torch.Tensor,
-    num_draft: int,
-    verify_m: int,
-    input_ids: torch.Tensor,
-    positions: torch.Tensor,
-    seq_lens: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    is_padding: torch.Tensor | None,
-    src_bt_ptrs: torch.Tensor,
-    dst_bt_ptrs: torch.Tensor,
-    bt_strides: torch.Tensor,
-    num_blocks: torch.Tensor,
-    block_sizes: torch.Tensor,
-    slot_mappings: torch.Tensor,
-) -> bool:
-    if (
-        not ENABLED_TAIL
-        or _single_tree_prep_fn is None
-        or num_groups <= 0
-        or not (1 <= num_draft <= 7)
-        or not (num_draft < verify_m <= 32)
-        or idx_mapping.dtype != torch.int32
-        or num_computed_tokens.dtype != torch.int32
-        or last_sampled_tokens.dtype != torch.int64
-        or not last_sampled_tokens.is_contiguous()
-        or draft_tokens.dtype != torch.int64
-        or draft_tokens.ndim != 2
-        or draft_tokens.stride(1) != 1
-        or draft_tokens.shape[1] < num_draft
-        or input_ids.dtype != torch.int32
-        or input_ids.numel() < verify_m
-        or positions.dtype != torch.int64
-        or positions.numel() < verify_m
-        or seq_lens.dtype != torch.int32
-        or seq_lens.numel() < 1
-        or query_start_loc.dtype != torch.int32
-        or query_start_loc.numel() < 2
-        or (
-            is_padding is not None
-            and (is_padding.dtype != torch.bool or not is_padding.is_contiguous() or is_padding.numel() < verify_m)
-        )
-        or src_bt_ptrs.dtype != torch.uint64
-        or dst_bt_ptrs.dtype != torch.uint64
-        or bt_strides.dtype != torch.int64
-        or num_blocks.dtype != torch.int32
-        or block_sizes.dtype != torch.int32
-        or slot_mappings.dtype != torch.int64
-        or slot_mappings.shape[1] < verify_m
-    ):
-        return False
-    rc = _single_tree_prep_fn(
-        int(num_groups),
-        idx_mapping.data_ptr(),
-        num_computed_tokens.data_ptr(),
-        last_sampled_tokens.data_ptr(),
-        draft_tokens.data_ptr(),
-        int(draft_tokens.stride(0)),
-        int(num_draft),
-        int(verify_m),
-        input_ids.data_ptr(),
-        positions.data_ptr(),
-        seq_lens.data_ptr(),
-        int(seq_lens.numel()),
-        query_start_loc.data_ptr(),
-        int(query_start_loc.numel()),
-        is_padding.data_ptr() if is_padding is not None else 0,
-        src_bt_ptrs.data_ptr(),
-        dst_bt_ptrs.data_ptr(),
-        bt_strides.data_ptr(),
-        num_blocks.data_ptr(),
-        int(num_blocks.stride(0)),
-        block_sizes.data_ptr(),
-        slot_mappings.data_ptr(),
-        int(slot_mappings.stride(0)),
-        torch.cuda.current_stream(idx_mapping.device).cuda_stream,
-    )
-    if rc:
-        raise RuntimeError(f"muse_single_tree_prep failed with CUDA error {rc}")
-    return True
-
-
 state = {
     "admitted": None,
     "admitted_m1": None,
@@ -325,9 +228,9 @@ def _admit_m(model, ids, out, table) -> bool:
     gen = torch.Generator(device=dev)
     gen.manual_seed(20261125)
     cases = []
-    if 1 <= ids.shape[0] <= 32:
+    if 1 <= ids.shape[0] <= 16:
         cases.append(ids.clone())
-    for rows in (2, 7, 16, 32):
+    for rows in (2, 7, 12, 16):
         cases.append(torch.randint(0, table.shape[0], (rows,), generator=gen, device=dev, dtype=ids.dtype))
     for case in cases:
         mine = torch.empty((int(case.shape[0]), width), dtype=torch.bfloat16, device=dev)
@@ -436,7 +339,7 @@ def embed_into(model, ids, out) -> bool:
             state["fused_calls"] += 1
             state["m1_calls"] += 1
             return True
-    if 1 < out.shape[0] <= 32 and ENABLED_MM:
+    if 1 < out.shape[0] <= 16 and ENABLED_MM:
         if state["admitted_mm"] is None and not torch.cuda.is_current_stream_capturing():
             state["admitted_mm"] = _admit_m(model, ids, out, table)
         if state["admitted_mm"] is True:

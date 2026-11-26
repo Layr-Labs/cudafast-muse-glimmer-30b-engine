@@ -147,24 +147,31 @@ __global__ void __launch_bounds__(32) greedy_verify_kernel(
     int32_t* __restrict__ num_sampled_out,
     int32_t* __restrict__ num_rejected_out,
     int m) {
-  const int lane = static_cast<int>(threadIdx.x);
-  int64_t draft_tok = 0;
-  if (lane < m - 1) {
-    const int64_t idx = logits_indices ? logits_indices[lane + 1] : static_cast<int64_t>(lane + 1);
-    draft_tok = static_cast<int64_t>(input_ids[idx]);
-  }
+  int64_t draft_toks[15];
   if constexpr (kPdl) {
+    if (threadIdx.x == 0) {
+      for (int i = 0; i < m - 1; ++i) {
+        const int64_t idx = logits_indices ? logits_indices[i + 1] : static_cast<int64_t>(i + 1);
+        draft_toks[i] = static_cast<int64_t>(input_ids[idx]);
+      }
+    }
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;");
   }
-  const bool match = (lane < m - 1) && (target_argmax[lane] == draft_tok);
-  const uint32_t mask = __ballot_sync(0xffffffffu, match);
-  if (lane == 0) {
-    const int accepted = __ffs(~mask) - 1;
-    const int32_t ns = static_cast<int32_t>(accepted + 1);
-    num_sampled_out[0] = ns;
-    num_rejected_out[0] = static_cast<int32_t>(m) - ns;
+  if (threadIdx.x != 0) return;
+  int accepted = 0;
+  for (int i = 0; i < m - 1; ++i) {
+    const int64_t draft_tok = kPdl
+        ? draft_toks[i]
+        : static_cast<int64_t>(input_ids[logits_indices ? logits_indices[i + 1] : static_cast<int64_t>(i + 1)]);
+    if (target_argmax[i] == draft_tok) {
+      ++accepted;
+    } else {
+      break;
+    }
   }
+  const int32_t ns = static_cast<int32_t>(accepted + 1);
+  num_sampled_out[0] = ns;
+  num_rejected_out[0] = static_cast<int32_t>(m) - ns;
 }
 
 }  // namespace lmpost

@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from collections import Counter
 from pathlib import Path
 
@@ -102,96 +101,6 @@ def _is_pure_ascii_token(tok_str: str, b2u_inv: dict[str, int]) -> bool:
 
 def _is_single_byte_token(tok_str: str, b2u_inv: dict[str, int]) -> bool:
     return len(tok_str) == 1 and (tok_str in b2u_inv or ord(tok_str) < 256)
-
-
-_ENG_CURLY_SUFFIXES = frozenset(("s", "t", "re", "ve", "ll", "d", "m"))
-_GREEK_MATH_CPS = frozenset(range(0x0391, 0x03AA)) | frozenset(range(0x03B1, 0x03CA))
-
-
-def _is_english_typo_math_utf8_token(tok_str: str, b2u_inv: dict[str, int]) -> bool:
-    """True for high-frequency English typography, math/logic operators, units, or single Greek symbols."""
-    if not tok_str:
-        return False
-    raw = bytearray()
-    for ch in tok_str:
-        b = b2u_inv.get(ch)
-        if b is None:
-            o = ord(ch)
-            if o >= 256:
-                return False
-            b = o
-        raw.append(b)
-    try:
-        dec = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return False
-    # Exclude NBSP+word tokens (e.g. '\xa0the') and long whitespace-only runs.
-    if "\xa0" in dec and any(c.isalpha() for c in dec):
-        return False
-    if len(dec) > 8 and not dec.strip("\xa0 \u200b\u200c\u200d\u2009\u2002\u2003\u202f\n\t"):
-        return False
-    # If curly apostrophe ’ is followed by ASCII letters, allow only English contractions (’s, ’t, ’re, ’ve, ’ll, ’d, ’m).
-    if "’" in dec:
-        parts = dec.split("’")
-        for tail in parts[1:]:
-            alpha_prefix = []
-            for ch in tail:
-                if "a" <= ch <= "z" or "A" <= ch <= "Z":
-                    alpha_prefix.append(ch.lower())
-                else:
-                    break
-            if alpha_prefix and "".join(alpha_prefix) not in _ENG_CURLY_SUFFIXES:
-                return False
-    n_non_ascii = 0
-    n_greek = 0
-    for c in dec:
-        cp = ord(c)
-        if cp < 0x80:
-            continue
-        n_non_ascii += 1
-        if cp in _GREEK_MATH_CPS:
-            n_greek += 1
-            if n_greek > 1:
-                return False
-        elif not (
-            0x00A0 <= cp <= 0x00BF
-            or cp in (0x00D7, 0x00F7)
-            or 0x2000 <= cp <= 0x22FF
-        ):
-            return False
-    return n_non_ascii > 0
-
-
-def _is_valid_utf8_prose_token(tok_str: str, b2u_inv: dict[str, int]) -> bool:
-    """True if decoded bytes form valid UTF-8 Latin/Greek/Punctuation/Math (no split bytes or CJK)."""
-    if not tok_str:
-        return False
-    raw = bytearray()
-    for ch in tok_str:
-        b = b2u_inv.get(ch)
-        if b is None:
-            o = ord(ch)
-            if o >= 256:
-                return False
-            b = o
-        raw.append(b)
-    try:
-        dec = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return False
-    has_non_ascii = False
-    for c in dec:
-        cp = ord(c)
-        if cp < 0x80:
-            continue
-        has_non_ascii = True
-        if not (
-            0x00A0 <= cp <= 0x024F  # Latin-1 Supplement + Latin Extended-A/B
-            or 0x0370 <= cp <= 0x03FF  # Greek (alpha, beta, pi, sigma, ...)
-            or 0x2000 <= cp <= 0x22FF  # General Punctuation (’, “, ”, —, –, …, •), Superscripts, Arrows, Math
-        ):
-            return False
-    return has_non_ascii
 
 
 def _decode_ascii_alpha(tok_str: str, b2u_inv: dict[str, int]) -> str:
@@ -359,35 +268,13 @@ def configure_draft_vocab(
             merge_rank[tid] = r
 
     forced = _special_token_ids(model_path, vocab_size)
-    for entry in added_list:
-        idx = entry.get("id")
-        content = str(entry.get("content", ""))
-        if (
-            isinstance(idx, int)
-            and 0 <= idx < vocab_size
-            and entry.get("special")
-            and "reserved_special_token" not in content
-        ):
-            forced.add(idx)
     b2u_inv = _bytes_to_unicode_inv()
     mode_norm = mode.strip().lower()
     use_ascii_tier = mode_norm != "bpe"
-    use_utf8_tier = (
-        os.environ.get("MUSE_DRAFT_VOCAB_UTF8", "1" if size >= 120000 else "0").strip()
-        not in ("0", "", "false", "no")
-    )
-    default_utf8_swap = "256" if (use_ascii_tier and 65536 <= size < 120000) else "0"
-    try:
-        utf8_swap = max(0, int(os.environ.get("MUSE_DRAFT_UTF8_SWAP", default_utf8_swap).strip() or "0"))
-    except ValueError:
-        utf8_swap = 0
-    utf8_swap_max_rank = int(os.environ.get("MUSE_DRAFT_UTF8_MAX_RANK", "90000"))
 
     tier0: list[int] = []  # forced special tokens + all single-byte base tokens
     tier1: list[tuple[int, int]] = []  # ASCII BPE tokens (or all BPE tokens in `bpe` mode)
-    tier2_typo: list[tuple[int, int]] = []  # English typography / math / 1-Greek UTF-8 tokens
-    tier2_utf8: list[tuple[int, int]] = []  # valid UTF-8 Latin/Greek/Punctuation/Math BPE tokens
-    tier2: list[tuple[int, int]] = []  # remaining non-ASCII BPE tokens
+    tier2: list[tuple[int, int]] = []  # non-ASCII BPE tokens (in `ascii_bpe` mode)
     tier3: list[int] = []  # unforced added / placeholder tokens
 
     for tid in range(vocab_size):
@@ -404,10 +291,6 @@ def configure_draft_vocab(
         rank = merge_rank.get(tid, len(merges) + tid)
         if not use_ascii_tier or _is_pure_ascii_token(s, b2u_inv):
             tier1.append((rank, tid))
-        elif utf8_swap > 0 and rank < utf8_swap_max_rank and _is_english_typo_math_utf8_token(s, b2u_inv):
-            tier2_typo.append((rank, tid))
-        elif use_utf8_tier and _is_valid_utf8_prose_token(s, b2u_inv):
-            tier2_utf8.append((rank, tid))
         else:
             tier2.append((rank, tid))
 
@@ -415,23 +298,12 @@ def configure_draft_vocab(
     tier1.sort()
     if mode_norm == "ascii_lm":
         tier1 = _rerank_ascii_tier_self_lm(tier1, id_to_str, b2u_inv)
-    tier2_typo.sort()
-    tier2_utf8.sort()
     tier2.sort()
     tier3.sort()
 
     chosen: list[int] = []
     chosen.extend(tier0)
-    if utf8_swap > 0 and tier2_typo and len(tier0) + len(tier1) > size:
-        swap_ids = [tid for _, tid in tier2_typo[:utf8_swap]]
-        ascii_keep = max(0, size - len(tier0) - len(swap_ids))
-        chosen.extend(tid for _, tid in tier1[:ascii_keep])
-        chosen.extend(swap_ids)
-        chosen.extend(tid for _, tid in tier1[ascii_keep:])
-    else:
-        chosen.extend(tid for _, tid in tier1)
-        chosen.extend(tid for _, tid in tier2_typo)
-    chosen.extend(tid for _, tid in tier2_utf8)
+    chosen.extend(tid for _, tid in tier1)
     chosen.extend(tid for _, tid in tier2)
     chosen.extend(tier3)
     # Sort final selected IDs? Keeping sorted ID order preserves ascending original-ID locality

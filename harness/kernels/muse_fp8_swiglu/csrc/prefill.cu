@@ -478,7 +478,7 @@ static bool ws_pdl_enabled() {
   if (g_ws_pdl_override >= 0) return g_ws_pdl_override != 0;
   static const bool env_on = []() {
     const char* env = std::getenv("MUSE_FP8_SWIGLU_PDL");
-    return env && *env && std::strtol(env, nullptr, 10) != 0;
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
   return env_on;
 }
@@ -499,23 +499,10 @@ static bool encode_tma2d(CUtensorMap* tm, const void* ptr, int k, int rows, int 
 }
 }  // namespace swiglu_ws
 
-#include "fp8_gemm_2cta.cuh"
-
 extern "C" int swiglu_ws_set_pdl(int on) {
   const int old = swiglu_ws::ws_pdl_enabled() ? 1 : 0;
   swiglu_ws::g_ws_pdl_override = (on < 0) ? -1 : (on != 0 ? 1 : 0);
   return old;
-}
-
-extern "C" int swiglu_ws_query_occ(int mode) {
-  using namespace swiglu_ws;
-  int nb = 0;
-  switch (mode) {
-    case 0: cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, swiglu_ws9_st3_kernel<false>, NT_WS9, SMEM_MAX); break;
-    case 2: cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, swiglu_ws8_256x128_st2_kernel<false, false, true>, NT, SMEM_MAX); break;
-    case 3: cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, swiglu_ws9_st3_lut_kernel<false, false, true>, NT_WS9, SMEM_MAX); break;
-  }
-  return nb;
 }
 
 extern "C" int swiglu_ws_init(cudaStream_t stream) {
@@ -526,23 +513,13 @@ extern "C" int swiglu_ws_init(cudaStream_t stream) {
     if (e != cudaSuccess || !fn || q != cudaDriverEntryPointSuccess) return e != cudaSuccess ? int(e) : -2;
     encode = (EncodeFn)fn;
   }
-  auto set_smem = [](auto k, int bytes) -> cudaError_t {
-    return cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-  };
-  cudaError_t e = set_smem(swiglu_ws9_st3_kernel<true>, SMEM_MAX);
-  if (e == cudaSuccess) e = set_smem(swiglu_ws9_st3_kernel<false>, SMEM_MAX);
-  if (e == cudaSuccess) e = set_smem(swiglu_ws8_256x128_st2_kernel<false, false, true>, SMEM_MAX);
-  if (e == cudaSuccess) e = set_smem(swiglu_ws8_256x128_st2_kernel<true, false, true>, SMEM_MAX);
-  if (e == cudaSuccess) e = set_smem(swiglu_ws8_256x128_st2_kernel<true, true, true>, SMEM_MAX);
-  if (e == cudaSuccess) e = set_smem(swiglu_ws9_st3_lut_kernel<false, false, true>, SMEM_MAX);
-  if (e == cudaSuccess) e = set_smem(swiglu_ws9_st3_lut_kernel<true, false, true>, SMEM_MAX);
-  if (e == cudaSuccess) e = set_smem(swiglu_ws9_st3_lut_kernel<true, true, true>, SMEM_MAX);
-  if (e == cudaSuccess) e = set_smem(fp8_6656_ws8_256_st2_st4_kernel<19968, false>, SMEM_MAX);
-  if (e == cudaSuccess) e = set_smem(fp8_6656_ws8_256_st2_st4_kernel<19968, true>, SMEM_MAX);
-  if (e == cudaSuccess) e = set_smem(fp8_dual_a_ws8_256_kernel<false>, SMEM_MAX);
-  if (e == cudaSuccess) e = set_smem(fp8_dual_a_ws8_256_kernel<true>, SMEM_MAX);
-  if (e == cudaSuccess) e = set_smem(bf16_dual_ws8_256_kernel<false>, SMEM_MAX);
-  if (e == cudaSuccess) e = set_smem(bf16_dual_ws8_256_kernel<true>, SMEM_MAX);
+  cudaError_t e = cudaFuncSetAttribute(
+      swiglu_ws_256_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  if (e != cudaSuccess) return int(e);
+  e = cudaFuncSetAttribute(
+      swiglu_ws_256_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  if (e == cudaSuccess) e = cudaFuncSetAttribute(swiglu_ws9_st3_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  if (e == cudaSuccess) e = cudaFuncSetAttribute(swiglu_ws9_st3_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   if (e != cudaSuccess) return int(e);
   int diffs = 0;
   e = cudaMemcpyToSymbolAsync(ws_silu_diffs, &diffs, sizeof(int), 0, cudaMemcpyHostToDevice, stream);
@@ -555,110 +532,45 @@ extern "C" int swiglu_ws_init(cudaStream_t stream) {
   return diffs == 0 ? 0 : -5;
 }
 
-extern "C" int swiglu_ws_run_mode(int mode, int pdl, const void* a, const void* b, const float* sa, const float* sb,
-                                  const float* down, void* d, cudaStream_t stream) {
-  using namespace swiglu_ws;
-  if (!encode || (((uintptr_t)a | (uintptr_t)b | (uintptr_t)d) & 15)) return -1;
-  uint8_t* out = static_cast<uint8_t*>(d);
-  CUtensorMap tmA, tmB;
-  switch (mode) {
-    case 0:
-      if (!encode_tma2d(&tmA, a, K_DIM, M_DIM, 128) || !encode_tma2d(&tmB, b, K_DIM, N_DIM, 128)) return -3;
-      if (pdl) return int(launch_pdl_ex(swiglu_ws9_st3_kernel<true>, 48, NT_WS9, SMEM_MAX, stream, tmA, tmB, sa, sb, down, out));
-      swiglu_ws9_st3_kernel<false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA, tmB, sa, sb, down, out);
-      return int(cudaGetLastError());
-    case 2:
-      if (!encode_tma2d(&tmA, a, K_DIM, M_DIM, 256) || !encode_tma2d(&tmB, b, K_DIM, N_DIM, 128)) return -3;
-      if (pdl >= 2) return int(launch_pdl_ex(swiglu_ws8_256x128_st2_kernel<true, true, true>, 48, NT, SMEM_MAX, stream, tmA, tmB, sa, sb, down, out));
-      if (pdl == 1) return int(launch_pdl_ex(swiglu_ws8_256x128_st2_kernel<true, false, true>, 48, NT, SMEM_MAX, stream, tmA, tmB, sa, sb, down, out));
-      swiglu_ws8_256x128_st2_kernel<false, false, true><<<48, NT, SMEM_MAX, stream>>>(tmA, tmB, sa, sb, down, out);
-      return int(cudaGetLastError());
-    case 3:
-      if (!encode_tma2d(&tmA, a, K_DIM, M_DIM, 128) || !encode_tma2d(&tmB, b, K_DIM, N_DIM, 128)) return -3;
-      if (pdl >= 2) return int(launch_pdl_ex(swiglu_ws9_st3_lut_kernel<true, true, true>, 48, NT_WS9, SMEM_MAX, stream, tmA, tmB, sa, sb, down, out));
-      if (pdl == 1) return int(launch_pdl_ex(swiglu_ws9_st3_lut_kernel<true, false, true>, 48, NT_WS9, SMEM_MAX, stream, tmA, tmB, sa, sb, down, out));
-      swiglu_ws9_st3_lut_kernel<false, false, true><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA, tmB, sa, sb, down, out);
-      return int(cudaGetLastError());
-  }
-  return -2;
-}
-
-static int g_gemm_pdl_override = -1;
-static int gemm_pdl_enabled() {
-  if (g_gemm_pdl_override >= 0) return g_gemm_pdl_override;
-  static const int env_on = []() {
-    const char* env = std::getenv("FP8WS_PDL");
-    return (!env || !*env || std::strtol(env, nullptr, 10) != 0) ? 1 : 0;
-  }();
-  return env_on;
-}
-
-extern "C" int muse_fp8_set_gemm_pdl(int on) {
-  const int old = gemm_pdl_enabled();
-  g_gemm_pdl_override = (on < 0) ? -1 : (on != 0 ? 1 : 0);
-  return old;
-}
-
-extern "C" int muse_fp8_gemm_6656(int mode, int pdl, const void* a, const void* b, const float* sa, const float* sb,
-                                  void* c, int k, cudaStream_t stream) {
-  using namespace swiglu_ws;
-  if (!encode || k != 19968 || (((uintptr_t)a | (uintptr_t)b | (uintptr_t)c) & 15)) return -1;
-  __nv_bfloat16* out = static_cast<__nv_bfloat16*>(c);
-  CUtensorMap tmA256, tmA128, tmB128, tmB48, tmB32;
-  if (!encode_tma2d(&tmA256, a, k, M_DIM, 256) || !encode_tma2d(&tmA128, a, k, M_DIM, 128)) return -3;
-  if (!encode_tma2d(&tmB128, b, k, 6656, 128) || !encode_tma2d(&tmB48, b, k, 6656, 48) ||
-      !encode_tma2d(&tmB32, b, k, 6656, 32)) return -4;
-  const int use_pdl = (pdl < 0) ? gemm_pdl_enabled() : pdl;
-  if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws8_256_st2_st4_kernel<19968, true>, 48, NT, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out));
-  fp8_6656_ws8_256_st2_st4_kernel<19968, false><<<48, NT, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out);
-  return int(cudaGetLastError());
-}
-
-extern "C" int muse_fp8_dual_a(int mode, int pdl, const void* a0, const void* a1, const void* b0, const void* b1,
-                               const float* sa0, const float* sa1, const float* sb0, const float* sb1,
-                               void* c0, void* c1, cudaStream_t stream) {
-  using namespace swiglu_ws;
-  if (!encode || (((uintptr_t)a0 | (uintptr_t)a1 | (uintptr_t)b0 | (uintptr_t)b1 | (uintptr_t)c0 | (uintptr_t)c1) & 15)) return -1;
-  __nv_bfloat16* o0 = static_cast<__nv_bfloat16*>(c0);
-  __nv_bfloat16* o1 = static_cast<__nv_bfloat16*>(c1);
-  CUtensorMap tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96;
-  if (!encode_tma2d(&tmA0, a0, 6656, M_DIM, 256) || !encode_tma2d(&tmA1, a1, 6656, M_DIM, 256)) return -3;
-  if (!encode_tma2d(&tmB0, b0, 6656, 4608, 128)) return -4;
-  if (!encode_tma2d(&tmB1_128, b1, 6656, 4096, 128) || !encode_tma2d(&tmB1_112, b1, 6656, 4096, 112) ||
-      !encode_tma2d(&tmB1_96, b1, 6656, 4096, 96)) return -5;
-  const int use_pdl = (pdl < 0) ? gemm_pdl_enabled() : pdl;
-  if (use_pdl) return int(launch_pdl_ex(fp8_dual_a_ws8_256_kernel<true>, 48, NT, SMEM_MAX, stream, tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1));
-  fp8_dual_a_ws8_256_kernel<false><<<48, NT, SMEM_MAX, stream>>>(tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1);
-  return int(cudaGetLastError());
-}
-
-extern "C" int muse_bf16_dual_stacked(int mode, int pdl, const void* a, const void* w_cat, void* c0, void* c1, cudaStream_t stream) {
-  using namespace swiglu_ws;
-  if (!encode || (((uintptr_t)a | (uintptr_t)w_cat | (uintptr_t)c0 | (uintptr_t)c1) & 15)) return -1;
-  CUtensorMap tmA256, tmB_128, tmB_112, tmB_96;
-  if (!encode_tma2d(&tmA256, a, 2 * 6656, M_DIM, 256)) return -3;
-  if (!encode_tma2d(&tmB_128, w_cat, 2 * 6656, 8704, 128) || !encode_tma2d(&tmB_112, w_cat, 2 * 6656, 8704, 112) ||
-      !encode_tma2d(&tmB_96, w_cat, 2 * 6656, 8704, 96)) return -4;
-  __nv_bfloat16* o0 = static_cast<__nv_bfloat16*>(c0);
-  __nv_bfloat16* o1 = static_cast<__nv_bfloat16*>(c1);
-  const int use_pdl = (pdl < 0) ? gemm_pdl_enabled() : pdl;
-  if (use_pdl) return int(launch_pdl_ex(bf16_dual_ws8_256_kernel<true>, 48, NT, SMEM_MAX, stream, tmA256, tmB_128, tmB_112, tmB_96, o0, o1));
-  bf16_dual_ws8_256_kernel<false><<<48, NT, SMEM_MAX, stream>>>(tmA256, tmB_128, tmB_112, tmB_96, o0, o1);
-  return int(cudaGetLastError());
-}
-
 extern "C" int swiglu_ws_run(const void* a, const void* b, const float* sa, const float* sb, const float* down,
                              void* d, cudaStream_t stream) {
   using namespace swiglu_ws;
-  static const int sw_mode = []() {
-    const char* env = std::getenv("MUSE_FP8_SWIGLU_MODE");
-    return (env && *env) ? int(std::strtol(env, nullptr, 10)) : 3;
+  if (!encode || (((uintptr_t)a | (uintptr_t)b | (uintptr_t)d) & 15)) return -1;
+  static const bool use_ws9 = []() {
+    const char* env = std::getenv("MUSE_FP8_SWIGLU_WS9");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
-  static const int sw_pdl_def = []() {
-    const char* env = std::getenv("MUSE_FP8_SWIGLU_PDL");
-    return (!env || !*env) ? 2 : int(std::strtol(env, nullptr, 10));
-  }();
-  const int pdl = (g_ws_pdl_override >= 0) ? (g_ws_pdl_override != 0 ? 2 : 0) : sw_pdl_def;
-  return swiglu_ws_run_mode(sw_mode, pdl, a, b, sa, sb, down, d, stream);
+  CUtensorMap tmA, tmB;
+  if (use_ws9) {
+    if (!encode_tma2d(&tmA, a, K_DIM, M_DIM, 128) || !encode_tma2d(&tmB, b, K_DIM, N_DIM, BN)) return -3;
+    if (ws_pdl_enabled()) {
+      cudaLaunchConfig_t cfg = {};
+      cfg.gridDim = dim3(48, 1, 1); cfg.blockDim = dim3(NT_WS9, 1, 1);
+      cfg.dynamicSmemBytes = SMEM_MAX; cfg.stream = stream;
+      cudaLaunchAttribute attr[1];
+      attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr[0].val.programmaticStreamSerializationAllowed = 1;
+      cfg.attrs = attr; cfg.numAttrs = 1;
+      return int(cudaLaunchKernelEx(&cfg, swiglu_ws9_st3_kernel<true>, tmA, tmB, sa, sb, down, static_cast<uint8_t*>(d)));
+    }
+    swiglu_ws9_st3_kernel<false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA, tmB, sa, sb, down, static_cast<uint8_t*>(d));
+    return int(cudaGetLastError());
+  }
+  if (!encode_tma2d(&tmA, a, K_DIM, M_DIM, 256) || !encode_tma2d(&tmB, b, K_DIM, N_DIM, BN)) return -3;
+  if (ws_pdl_enabled()) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(48, 1, 1);
+    cfg.blockDim = dim3(NT, 1, 1);
+    cfg.dynamicSmemBytes = SMEM_MAX;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    return int(cudaLaunchKernelEx(&cfg, swiglu_ws_256_kernel<true>, tmA, tmB, sa, sb, down, static_cast<uint8_t*>(d)));
+  }
+  swiglu_ws_256_kernel<false><<<48, NT, SMEM_MAX, stream>>>(tmA, tmB, sa, sb, down, static_cast<uint8_t*>(d));
+  return int(cudaGetLastError());
 }
 

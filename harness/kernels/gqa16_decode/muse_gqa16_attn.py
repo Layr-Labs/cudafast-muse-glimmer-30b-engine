@@ -36,6 +36,7 @@ PREFILL_PDL_ENABLED = os.environ.get("MUSE_GQA16_PREFILL_PDL", "1").strip() not 
 VERIFY_ENABLED = os.environ.get("MUSE_GQA16_VERIFY", "1").strip() not in ("0", "", "false", "no")
 VERIFY_SPLITS = int(os.environ.get("MUSE_GQA16_VERIFY_SPLITS", "1"))
 VERIFY_PIPE = os.environ.get("MUSE_GQA16_VERIFY_PIPE", "1").strip() not in ("0", "", "false", "no")
+VERIFY_2Q = os.environ.get("MUSE_GQA16_VERIFY_2Q", "1").strip() not in ("0", "", "false", "no")
 NATIVE_LEAF_ENABLED = os.environ.get("MUSE_NATIVE_LEAF", "1").strip() not in ("0", "", "false", "no")
 
 _lib = None
@@ -85,6 +86,18 @@ try:
             ctypes.c_void_p,
         ]
         _lib.muse_gqa16_verify_leaf.restype = ctypes.c_int
+    if hasattr(_lib, "muse_gqa16_verify_leaf_2q"):
+        _lib.muse_gqa16_verify_leaf_2q.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        _lib.muse_gqa16_verify_leaf_2q.restype = ctypes.c_int
 except OSError:
     _lib = None
 
@@ -93,6 +106,7 @@ _state: dict[int, tuple[bool, int, int]] = {}  # dev_idx -> (admitted, scale_mod
 _prefill_state: dict[int, tuple[bool, int]] = {}  # dev_idx -> (admitted, scale_mode)
 _verify_state: dict[int, tuple[bool, int]] = {}  # dev_idx -> (admitted, scale_mode)
 _leaf_verify_admitted: dict[int, bool] = {}  # dev_idx -> 0-ULP native 1-leaf verify admitted
+_verify_2q_admitted: dict[int, bool] = {}  # dev_idx -> 0-ULP 256-thread 2-row shared-KV verify admitted
 _leaf_flag_bufs: dict[int, torch.Tensor] = {}  # dev_idx -> static int32[1] device flag
 _pending_prefill: tuple | None = None
 _pf_counts: dict[str, int] = {"defer": 0, "fused1": 0, "fused2": 0, "direct0": 0, "flush": 0, "miss": 0}
@@ -399,33 +413,31 @@ def self_check_verify(device: torch.device) -> bool:
                         break
                 if not all_match:
                     break
-            # Also verify padded CUDA-graph replay (grid max_q=8, runtime actual_m=7 and actual_m=4, plus grid max_q=16, actual_m=12).
+            # Also verify padded CUDA-graph replay (grid max_q=8, runtime actual_m=7).
             if all_match:
-                for pad_max_q, pad_m in ((8, 7), (8, 4), (16, 12)):
-                    qp = (torch.randn((pad_max_q, 32, 128), generator=gen, device=device) * 1.1).to(torch.bfloat16).contiguous()
-                    cu_qp = torch.tensor([0, pad_m], dtype=torch.int32, device=device)
-                    sk = torch.tensor([640], dtype=torch.int32, device=device)
-                    refp = torch.empty((pad_m, 32, 128), dtype=torch.bfloat16, device=device)
-                    flash_attn_varlen_func(
-                        q=qp[:pad_m], k=k_cache, v=v_cache, out=refp,
-                        cu_seqlens_q=cu_qp, max_seqlen_q=pad_m,
-                        seqused_k=sk, max_seqlen_k=8192,
-                        softmax_scale=scale, causal=True,
-                        window_size=(511, 0), block_table=bt, fa_version=2,
-                    )
-                    gotp = torch.zeros_like(qp)
-                    rc = _lib.muse_gqa16_verify(
-                        qp.data_ptr(), kv_cache.data_ptr(), gotp.data_ptr(),
-                        sk.data_ptr(), bt.data_ptr(), cu_qp.data_ptr(),
-                        pad_max_q, block_size, 511, g_splits, cand_mode | pipe_bit, scale,
-                        qp.stride(0), qp.stride(1), gotp.stride(0), gotp.stride(1),
-                        kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
-                        stream,
-                    )
-                    torch.cuda.synchronize(device)
-                    if rc != 0 or not torch.equal(refp.view(torch.int16), gotp[:pad_m].view(torch.int16)):
-                        all_match = False
-                        break
+                q8 = (torch.randn((8, 32, 128), generator=gen, device=device) * 1.1).to(torch.bfloat16).contiguous()
+                cu_q7 = torch.tensor([0, 7], dtype=torch.int32, device=device)
+                sk = torch.tensor([640], dtype=torch.int32, device=device)
+                ref7 = torch.empty((7, 32, 128), dtype=torch.bfloat16, device=device)
+                flash_attn_varlen_func(
+                    q=q8[:7], k=k_cache, v=v_cache, out=ref7,
+                    cu_seqlens_q=cu_q7, max_seqlen_q=7,
+                    seqused_k=sk, max_seqlen_k=8192,
+                    softmax_scale=scale, causal=True,
+                    window_size=(511, 0), block_table=bt, fa_version=2,
+                )
+                got8 = torch.zeros_like(q8)
+                rc = _lib.muse_gqa16_verify(
+                    q8.data_ptr(), kv_cache.data_ptr(), got8.data_ptr(),
+                    sk.data_ptr(), bt.data_ptr(), cu_q7.data_ptr(),
+                    8, block_size, 511, g_splits, cand_mode | pipe_bit, scale,
+                    q8.stride(0), q8.stride(1), got8.stride(0), got8.stride(1),
+                    kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
+                    stream,
+                )
+                torch.cuda.synchronize(device)
+                if rc != 0 or not torch.equal(ref7.view(torch.int16), got8[:7].view(torch.int16)):
+                    all_match = False
             if all_match:
                 ok = True
                 scale_mode = cand_mode
@@ -627,10 +639,129 @@ def self_check_verify(device: torch.device) -> bool:
             logger.warning("muse_gqa16_attn: native 1-leaf verify self-check raised on cuda:%d", idx, exc_info=True)
             leaf_ok = False
     _leaf_verify_admitted[idx] = leaf_ok
+    v2q_ok = False
+    if ok and g_splits == 1 and VERIFY_2Q and hasattr(_lib, "muse_gqa16_verify_leaf_2q"):
+        try:
+            from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+
+            gen_2q = torch.Generator(device=device).manual_seed(20261130)
+            scale_2q = float(128.0 ** -0.5)
+            bs_2q = 16
+            nblks_2q = 64
+            kv_2q_base = (torch.randn((nblks_2q, 2, bs_2q, 256), generator=gen_2q, device=device) * 0.6).to(torch.bfloat16)
+            perm_2q = torch.randperm(nblks_2q - 1, generator=gen_2q, device=device, dtype=torch.int32) + 1
+            bt_2q = perm_2q.unsqueeze(0).contiguous()
+            st_2q = torch.cuda.current_stream(device).cuda_stream
+            k_c2q, v_c2q = kv_2q_base.transpose(1, 2).split(128, dim=-1)
+            v2q_all = True
+            # (1) Plain causal M in (2, 7, 8, 12, 16) including odd M=7, block-128 & SWA boundaries.
+            for m_test in (2, 7, 8, 12, 16):
+                q_2q = (torch.randn((m_test, 32, 128), generator=gen_2q, device=device) * 1.1).to(torch.bfloat16).contiguous()
+                cu_q2q = torch.tensor([0, m_test], dtype=torch.int32, device=device)
+                for seq_k in (16, 17, 128, 129, 134, 520, 528):
+                    if seq_k < m_test:
+                        continue
+                    sk = torch.tensor([seq_k], dtype=torch.int32, device=device)
+                    for win in ((-1, -1), (511, 0)):
+                        ref_2q = torch.empty((m_test, 32, 128), dtype=torch.bfloat16, device=device)
+                        flash_attn_varlen_func(
+                            q=q_2q, k=k_c2q, v=v_c2q, out=ref_2q,
+                            cu_seqlens_q=cu_q2q, max_seqlen_q=m_test,
+                            seqused_k=sk, max_seqlen_k=8192,
+                            softmax_scale=scale_2q, causal=True,
+                            window_size=win, block_table=bt_2q, fa_version=2,
+                        )
+                        got_2q = torch.zeros_like(q_2q)
+                        rc_2q = _lib.muse_gqa16_verify_leaf_2q(
+                            q_2q.data_ptr(), kv_2q_base.data_ptr(), got_2q.data_ptr(),
+                            sk.data_ptr(), bt_2q.data_ptr(), cu_q2q.data_ptr(),
+                            m_test, bs_2q, win[0], 1, scale_mode | pipe_bit, scale_2q,
+                            q_2q.stride(0), q_2q.stride(1), got_2q.stride(0), got_2q.stride(1),
+                            kv_2q_base.stride(0), kv_2q_base.stride(2), kv_2q_base.stride(1),
+                            0, st_2q,
+                        )
+                        torch.cuda.synchronize(device)
+                        if (
+                            rc_2q != 0
+                            or not torch.isfinite(got_2q).all()
+                            or not torch.equal(got_2q.view(torch.int16), ref_2q.view(torch.int16))
+                        ):
+                            v2q_all = False
+                            break
+                    if not v2q_all:
+                        break
+                if not v2q_all:
+                    break
+            # (2) Bit-packed arbitrary-depth (6-level chain + 3-level branch, sentinel -1, int32[49]) exact 0-ULP match vs 1Q.
+            if v2q_all and leaf_ok and hasattr(_lib, "muse_gqa16_verify_leaf"):
+                q_t = (torch.randn((16, 32, 128), generator=gen_2q, device=device) * 1.1).to(torch.bfloat16).contiguous()
+                cu_q16 = torch.tensor([0, 16], dtype=torch.int32, device=device)
+                deep_nodes = ((1, -1), (2, 7), (3, 8), (4, 9), (5, 10), (6, 11), (2, -1), (3, 13), (4, 14))
+                tbl = [-1] + [0] * 48
+                for q_i in range(7):
+                    tbl[1 + 3 * q_i] = 15 - q_i
+                    tbl[1 + 3 * q_i + 1] = -1
+                    tbl[1 + 3 * q_i + 2] = 0
+                row_bsub = [-1] * 16
+                row_dp = [0] * 16
+                row_pk = [0] * 16
+                for li, (lk, par) in enumerate(deep_nodes):
+                    r_row = 7 + li
+                    if par < 0:
+                        b_sub = 16 - lk
+                        dp = 1
+                        pkd = r_row & 0xF
+                    else:
+                        b_sub = row_bsub[par]
+                        dp = row_dp[par] + 1
+                        pkd = row_pk[par] | ((r_row & 0xF) << (4 * (dp - 1)))
+                    row_bsub[r_row] = b_sub
+                    row_dp[r_row] = dp
+                    row_pk[r_row] = pkd
+                    tbl[1 + 3 * r_row] = 16 - (lk + 1)
+                    tbl[1 + 3 * r_row + 1] = b_sub
+                    tbl[1 + 3 * r_row + 2] = pkd
+                lf_t = torch.tensor(tbl, dtype=torch.int32, device=device)
+                for seq_k in (16, 46, 129, 142, 520, 528):
+                    sk = torch.tensor([seq_k], dtype=torch.int32, device=device)
+                    for win in ((-1, -1), (511, 0)):
+                        got_1q = torch.zeros_like(q_t)
+                        got_2q = torch.zeros_like(q_t)
+                        rc_1q = _lib.muse_gqa16_verify_leaf(
+                            q_t.data_ptr(), kv_2q_base.data_ptr(), got_1q.data_ptr(),
+                            sk.data_ptr(), bt_2q.data_ptr(), cu_q16.data_ptr(),
+                            16, bs_2q, win[0], 1, scale_mode | pipe_bit, scale_2q,
+                            q_t.stride(0), q_t.stride(1), got_1q.stride(0), got_1q.stride(1),
+                            kv_2q_base.stride(0), kv_2q_base.stride(2), kv_2q_base.stride(1),
+                            lf_t.data_ptr(), st_2q,
+                        )
+                        rc_2q = _lib.muse_gqa16_verify_leaf_2q(
+                            q_t.data_ptr(), kv_2q_base.data_ptr(), got_2q.data_ptr(),
+                            sk.data_ptr(), bt_2q.data_ptr(), cu_q16.data_ptr(),
+                            16, bs_2q, win[0], 1, scale_mode | pipe_bit, scale_2q,
+                            q_t.stride(0), q_t.stride(1), got_2q.stride(0), got_2q.stride(1),
+                            kv_2q_base.stride(0), kv_2q_base.stride(2), kv_2q_base.stride(1),
+                            lf_t.data_ptr(), st_2q,
+                        )
+                        torch.cuda.synchronize(device)
+                        if (
+                            rc_1q != 0
+                            or rc_2q != 0
+                            or not torch.equal(got_2q.view(torch.int16), got_1q.view(torch.int16))
+                        ):
+                            v2q_all = False
+                            break
+                    if not v2q_all:
+                        break
+            v2q_ok = v2q_all
+        except Exception:  # noqa: BLE001
+            logger.warning("muse_gqa16_attn: 2Q shared-KV verify self-check raised on cuda:%d", idx, exc_info=True)
+            v2q_ok = False
+    _verify_2q_admitted[idx] = v2q_ok
     if ok:
         logger.info(
-            "muse_gqa16_attn: strict 0-ULP verify (M=2..16) admitted on cuda:%d (grid_splits=%d, pipe=%d, scale_mode=%d, native_leaf=%d)",
-            idx, g_splits, int(VERIFY_PIPE), scale_mode, int(leaf_ok),
+            "muse_gqa16_attn: strict 0-ULP verify (M=2..16) admitted on cuda:%d (grid_splits=%d, pipe=%d, scale_mode=%d, native_leaf=%d, verify_2q=%d)",
+            idx, g_splits, int(VERIFY_PIPE), scale_mode, int(leaf_ok), int(v2q_ok),
         )
     else:
         logger.warning("muse_gqa16_attn: strict 0-ULP verify self-check failed on cuda:%d; keeping stock FA2", idx)
@@ -713,7 +844,36 @@ def try_verify_gqa16(
         lf = get_leaf_flag(device)
         if lf is not None:
             leaf_ptr = lf.data_ptr()
-    if leaf_ptr != 0:
+    if (
+        VERIFY_2Q
+        and g_splits == 1
+        and _verify_2q_admitted.get(idx, False)
+        and hasattr(_lib, "muse_gqa16_verify_leaf_2q")
+    ):
+        rc = _lib.muse_gqa16_verify_leaf_2q(
+            query.data_ptr(),
+            kv_cache.data_ptr(),
+            output.data_ptr(),
+            seqused_k.data_ptr(),
+            block_table.data_ptr(),
+            cu_seqlens_q.data_ptr(),
+            int(num_actual_tokens),
+            block_size,
+            w_left,
+            g_splits,
+            vst[1] | pipe_bit,
+            softmax_scale,
+            query.stride(0),
+            query.stride(1),
+            output.stride(0),
+            output.stride(1),
+            kv_cache.stride(0),
+            kv_cache.stride(2),
+            kv_cache.stride(1),
+            leaf_ptr,
+            stream,
+        )
+    elif leaf_ptr != 0:
         rc = _lib.muse_gqa16_verify_leaf(
             query.data_ptr(),
             kv_cache.data_ptr(),

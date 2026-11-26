@@ -15,11 +15,6 @@ _ready = set()
 _lib = None
 _lib3 = None
 _fast3 = set()
-_ilv_layers: dict[int, object] = {}
-
-
-def _ilv_enabled() -> bool:
-    return os.environ.get("MARLINW_GATEUP_ILV", "1") != "0"
 
 
 def _load(name):
@@ -31,10 +26,6 @@ def _load(name):
     lib.swiglu_fp8_prepare.restype = ctypes.c_int
     lib.swiglu_fp8_gemm.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int, ctypes.c_void_p]
     lib.swiglu_fp8_gemm.restype = ctypes.c_int
-    ilv = getattr(lib, "swiglu_fp8_gemm_ilv", None)
-    if ilv is not None:
-        ilv.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int, ctypes.c_void_p]
-        ilv.restype = ctypes.c_int
     sp = getattr(lib, "marlinw_tma_set_pdl", None)
     if sp is not None:
         sp.argtypes = [ctypes.c_int]
@@ -62,19 +53,6 @@ def _run(lib, x, weight, scales, global_scale, down_scale):
     return out
 
 
-def _run_ilv(lib, x, w_ilv, s_ilv, global_scale, down_scale):
-    out = x.new_empty((512, 19968), dtype=torch.float8_e4m3fn)
-    with torch.cuda.device(x.device):
-        status = lib.swiglu_fp8_gemm_ilv(
-            x.data_ptr(), w_ilv.data_ptr(), s_ilv.data_ptr(),
-            global_scale.data_ptr(), down_scale.data_ptr(), out.data_ptr(), x.stride(0),
-            torch.cuda.current_stream(x.device).cuda_stream,
-        )
-    if status:
-        raise RuntimeError(f"Paired SwiGLU FP8 ilv launch returned CUDA status {status}")
-    return out
-
-
 def _check_input(gen, device):
     x = torch.randn((512, 6656), generator=gen, device=device, dtype=torch.float32)
     x[:, ::7] *= 12.0
@@ -92,23 +70,6 @@ def _check(layer, lib):
             ds = torch.tensor([ds_val], dtype=torch.float32, device=weight.device)
             a = _run(_lib, x, weight, scales, gs, ds)
             b = _run(lib, x, weight, scales, gs, ds)
-            if not torch.equal(a.view(torch.uint8), b.view(torch.uint8)):
-                return False
-        return True
-    except Exception:
-        return False
-
-
-def _check_ilv(layer, lib, w_ilv, s_ilv):
-    try:
-        weight, scales, gs = layer.weight, layer.weight_scale, layer.weight_global_scale
-        gen = torch.Generator(device=weight.device)
-        gen.manual_seed(0x57161F8 + weight.data_ptr())
-        for ds_val in (0.015625, 0.125):
-            x = _check_input(gen, weight.device)
-            ds = torch.tensor([ds_val], dtype=torch.float32, device=weight.device)
-            a = _run(_lib, x, weight, scales, gs, ds)
-            b = _run_ilv(lib, x, w_ilv, s_ilv, gs, ds)
             if not torch.equal(a.view(torch.uint8), b.view(torch.uint8)):
                 return False
         return True
@@ -137,11 +98,6 @@ def prepare(layer):
         _ready.add(device)
     if _lib3 is not None and _check(layer, _lib3):
         _fast3.add(layer.weight.data_ptr())
-        if _ilv_enabled() and hasattr(_lib3, "swiglu_fp8_gemm_ilv"):
-            from . import swiglu as _swiglu
-            w_ilv, s_ilv = _swiglu.ensure_interleaved_buffers(layer)
-            if w_ilv is not None and _check_ilv(layer, _lib3, w_ilv, s_ilv):
-                _ilv_layers[layer.weight.data_ptr()] = layer
     return True
 
 
@@ -149,16 +105,10 @@ def moved(old_ptr: int, new_ptr: int) -> None:
     if old_ptr in _fast3:
         _fast3.discard(old_ptr)
         _fast3.add(new_ptr)
-    if old_ptr in _ilv_layers:
-        _ilv_layers[new_ptr] = _ilv_layers.pop(old_ptr)
 
 
 def counts() -> int:
     return len(_fast3)
-
-
-def ilv_count() -> int:
-    return len(_ilv_layers)
 
 
 def gemm(x, weight, scales, global_scale, down_scale):
@@ -169,13 +119,5 @@ def gemm(x, weight, scales, global_scale, down_scale):
         raise RuntimeError("Paired SwiGLU was called before layer preparation")
     if down_scale.dtype != torch.float32 or down_scale.numel() != 1 or down_scale.device != x.device:
         raise ValueError("The next FP8 linear requires its original per-tensor FP32 activation scale")
-    ptr = weight.data_ptr()
-    layer = _ilv_layers.get(ptr)
-    if layer is not None and _lib3 is not None:
-        bufs = layer._buffers
-        return _run_ilv(
-            _lib3, x, bufs["paired_marlin_swiglu_weight"], bufs["paired_marlin_swiglu_scale"],
-            global_scale, down_scale,
-        )
-    lib = _lib3 if (_lib3 is not None and ptr in _fast3) else _lib
+    lib = _lib3 if (_lib3 is not None and weight.data_ptr() in _fast3) else _lib
     return _run(lib, x, weight, scales, global_scale, down_scale)
