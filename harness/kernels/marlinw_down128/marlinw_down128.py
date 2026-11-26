@@ -248,10 +248,21 @@ def tma_work_lists_shape(n: int, k: int, shared_bytes: int):
         work = [row for both in blocks for row in both] + [(0, 0, 0, 0)] * ((split_n + 3) // 4)
         return work, len(blocks), slots
     if (n, k) == (4096, 6656):
-        # 128 whole tiles without 3-piece split-K scratch handoffs or spin-waits (down<4096> drops 255 -> 242 regs, -0.33 ms).
-        blocks = [block(tile, 0, k_tiles, 0, 0) for tile in order]
-        work = [row for both in blocks for row in both] + [(0, 0, 0, 0)]
-        return work, len(blocks), max(slots, 1)
+        # 128 tiles = 96 whole + 32 split into 3 K pieces (40, 32, 32).
+        # Wave schedule keeps all 48 SMs balanced at 272-280 k-tiles (99% SM efficiency) with zero stall.
+        split_n = 32
+        sizes = (40, 32, 32)
+        starts = (0, sizes[0], sizes[0] + sizes[1])
+        whole, split = order[:-split_n], order[-split_n:]
+        slots = split_n
+        whole_blocks = lambda a, b: [block(tile, 0, k_tiles, 0, 0) for tile in whole[a:b]]
+        pieces = lambda p, a, b: [block(split[i], starts[p], sizes[p], p + 1, i) for i in range(a, b)]
+        blocks = (pieces(0, 0, 32) + whole_blocks(0, 16)
+                  + pieces(1, 0, 16) + whole_blocks(16, 32) + whole_blocks(32, 48)
+                  + pieces(1, 16, 32) + pieces(2, 0, 16) + pieces(2, 16, 32)
+                  + whole_blocks(48, 96))
+        work = [row for both in blocks for row in both] + [(0, 0, 0, 0)] * ((split_n + 3) // 4)
+        return work, len(blocks), slots
     raise ValueError(f"unsupported TMA shape {n}x{k}")
 
 
