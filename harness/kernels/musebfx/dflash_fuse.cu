@@ -178,8 +178,8 @@ __global__ void dflash_kv_post_kernel(
 
   const int64_t slot = desc.slots[l][m];
   if (slot < 0) return;
-  const int64_t block_idx = slot / block_size;
-  const int64_t block_off = slot - block_idx * block_size;
+  const int64_t block_idx = (block_size == 16) ? (slot >> 4) : (slot / block_size);
+  const int64_t block_off = (block_size == 16) ? (slot & 15) : (slot - block_idx * block_size);
 
   const int kv_stride = nkv * kHeadDim;
   const size_t base_ml = static_cast<size_t>(m * L + l) * (2 * kv_stride);
@@ -199,6 +199,16 @@ __global__ void dflash_kv_post_kernel(
   *reinterpret_cast<uint2*>(v_dst + lane * 4) = v_out_v;
 }
 
+struct QkvCacheDesc {
+  __nv_bfloat16* k_cache;
+  __nv_bfloat16* v_cache;
+  const int64_t* slots;
+  int64_t k_sb, k_sn, k_sh;
+  int64_t v_sb, v_sn, v_sh;
+  int block_size;
+  int enabled;
+};
+
 template <bool kNeox, bool kCacheFP32>
 __global__ void dflash_qkv_norm_rope_kernel(
     const __nv_bfloat16* __restrict__ qkv,         // [M, (nq + 2*nkv) * 128]
@@ -208,6 +218,7 @@ __global__ void dflash_qkv_norm_rope_kernel(
     const void* __restrict__ cos_sin_cache,        // [cache_rows, 128]
     __nv_bfloat16* __restrict__ q_out,             // [M, nq * 128]
     __nv_bfloat16* __restrict__ k_out,             // [M, nkv * 128]
+    QkvCacheDesc cdesc,
     int M, int nq, int nkv, int cache_rows, float eps, int pdl_mode) {
   const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int total_h = nq + nkv;
@@ -242,11 +253,220 @@ __global__ void dflash_qkv_norm_rope_kernel(
     apply_rmsnorm_rope_hd128<kNeox, kCacheFP32>(
         row_in + static_cast<size_t>(nq + kh) * kHeadDim,
         wraw, cos_sin_cache, pos, cache_rows, eps, lane, out_v);
+    uint2 v_out_v = {};
+    if (cdesc.enabled) {
+      v_out_v = *reinterpret_cast<const uint2*>(
+          row_in + static_cast<size_t>(nq + nkv + kh) * kHeadDim + lane * 4);
+    }
     if ((pdl_mode & 2) != 0) {
       asm volatile("griddepcontrol.launch_dependents;");
     }
-    __nv_bfloat16* dst = k_out + (static_cast<size_t>(m) * nkv + kh) * kHeadDim;
-    *reinterpret_cast<uint2*>(dst + lane * 4) = out_v;
+    if (cdesc.enabled) {
+      const int64_t slot = cdesc.slots[m];
+      if (slot >= 0) {
+        const int64_t b = (cdesc.block_size == 16) ? (slot >> 4) : (slot / cdesc.block_size);
+        const int64_t o = (cdesc.block_size == 16) ? (slot & 15) : (slot - b * cdesc.block_size);
+        __nv_bfloat16* k_dst = cdesc.k_cache + b * cdesc.k_sb + o * cdesc.k_sn + kh * cdesc.k_sh;
+        __nv_bfloat16* v_dst = cdesc.v_cache + b * cdesc.v_sb + o * cdesc.v_sn + kh * cdesc.v_sh;
+        *reinterpret_cast<uint2*>(k_dst + lane * 4) = out_v;
+        *reinterpret_cast<uint2*>(v_dst + lane * 4) = v_out_v;
+      }
+    } else {
+      __nv_bfloat16* dst = k_out + (static_cast<size_t>(m) * nkv + kh) * kHeadDim;
+      *reinterpret_cast<uint2*>(dst + lane * 4) = out_v;
+    }
+  }
+}
+
+template <typename LastSampT, typename TailIdT>
+__global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
+    int32_t* __restrict__ out_input_ids,
+    int64_t* __restrict__ out_query_positions,
+    int32_t* __restrict__ out_query_start_loc,
+    int32_t* __restrict__ out_seq_lens,
+    int64_t* __restrict__ out_query_slot_mapping,
+    int64_t* __restrict__ out_context_positions,
+    int64_t* __restrict__ out_context_slot_mapping,
+    int64_t* __restrict__ out_sample_indices,
+    int64_t* __restrict__ out_sample_pos,
+    int32_t* __restrict__ out_sample_idx_mapping,
+    float* __restrict__ out_temperature,
+    int64_t* __restrict__ out_seeds,
+    const int64_t* __restrict__ target_positions,
+    const int32_t* __restrict__ target_query_start_loc,
+    const int32_t* __restrict__ idx_mapping,
+    const LastSampT* __restrict__ last_sampled,
+    const int32_t* __restrict__ next_prefill_tokens,
+    const int32_t* __restrict__ num_sampled,
+    const int32_t* __restrict__ num_rejected,
+    const float* __restrict__ in_temperature,
+    const int64_t* __restrict__ in_seeds,
+    const int32_t* __restrict__ block_table,
+    int64_t block_table_stride,
+    int32_t parallel_drafting_token_id,
+    int64_t block_size,
+    int num_query_per_req,
+    int num_speculative_steps,
+    int max_num_reqs,
+    int max_num_tokens,
+    int64_t max_model_len,
+    int64_t pad_slot_id,
+    const TailIdT* __restrict__ target_input_ids,
+    int tail_num_tokens,
+    const uint8_t* __restrict__ in_static_vocab,
+    int32_t* __restrict__ tail_ids,
+    int32_t* __restrict__ tail_count,
+    int32_t* __restrict__ tail_seen,
+    int vocab_size,
+    int max_tail,
+    int include_bonus) {
+  __shared__ int32_t s_req_state_idx;
+  __shared__ int32_t s_ctx_start;
+  __shared__ int32_t s_num_ctx;
+  __shared__ int32_t s_valid_tail_len;
+  __shared__ int32_t s_bonus_token;
+  __shared__ int64_t s_last_valid_pos;
+  __shared__ int s_tail_reset;
+  __shared__ int s_tail_old_cnt;
+
+  const int tid = threadIdx.x;
+  if (tid == 0) {
+    const int32_t req_state_idx = idx_mapping[0];
+    const int32_t ctx_start = target_query_start_loc[0];
+    const int32_t ctx_end = target_query_start_loc[1];
+    const int32_t num_ctx = ctx_end - ctx_start;
+    const int32_t nr = num_rejected[0];
+    const int32_t valid_ctx_end = ctx_end - nr;
+    const int32_t ns = num_sampled[0];
+    const int32_t bonus_token = (ns > 0)
+        ? static_cast<int32_t>(last_sampled[req_state_idx])
+        : static_cast<int32_t>(next_prefill_tokens[req_state_idx]);
+    const int64_t last_valid_pos = target_positions[valid_ctx_end - 1];
+
+    int32_t valid_end = valid_ctx_end;
+    if (valid_end > tail_num_tokens) valid_end = tail_num_tokens;
+    int32_t valid_tail_len = valid_end - ctx_start;
+    if (valid_tail_len < 0) valid_tail_len = 0;
+
+    s_req_state_idx = req_state_idx;
+    s_ctx_start = ctx_start;
+    s_num_ctx = num_ctx;
+    s_valid_tail_len = valid_tail_len;
+    s_bonus_token = bonus_token;
+    s_last_valid_pos = last_valid_pos;
+
+    out_query_start_loc[0] = 0;
+    const int64_t raw_sl = last_valid_pos + 1 + num_query_per_req;
+    out_seq_lens[0] = static_cast<int32_t>((raw_sl < max_model_len) ? raw_sl : max_model_len);
+    out_temperature[req_state_idx] = in_temperature[req_state_idx];
+    out_seeds[req_state_idx] = in_seeds[req_state_idx];
+
+    if (in_static_vocab != nullptr && tail_num_tokens > 0) {
+      s_tail_reset = (target_positions[ctx_start] == 0) ? 1 : 0;
+      int oc = tail_count[0];
+      if (oc < 0) oc = 0;
+      if (oc > max_tail) oc = max_tail;
+      s_tail_old_cnt = oc;
+    } else {
+      s_tail_reset = 0;
+      s_tail_old_cnt = 0;
+    }
+  }
+  __syncthreads();
+
+  const int32_t req_state_idx = s_req_state_idx;
+  const int32_t ctx_start = s_ctx_start;
+  const int32_t num_ctx = s_num_ctx;
+  const int32_t valid_tail_len = s_valid_tail_len;
+  const int32_t bonus_token = s_bonus_token;
+  const int64_t last_valid_pos = s_last_valid_pos;
+
+  for (int j = tid; j < num_ctx; j += 256) {
+    const int64_t ctx_pos = target_positions[ctx_start + j];
+    int64_t ctx_blk = (block_size == 16) ? (ctx_pos >> 4) : (ctx_pos / block_size);
+    if (ctx_blk > block_table_stride - 1) ctx_blk = block_table_stride - 1;
+    const int64_t ctx_bid = static_cast<int64_t>(block_table[ctx_blk]);
+    const int64_t ctx_off = (block_size == 16) ? (ctx_pos & 15) : (ctx_pos % block_size);
+    out_context_positions[ctx_start + j] = ctx_pos;
+    out_context_slot_mapping[ctx_start + j] = ctx_bid * block_size + ctx_off;
+  }
+
+  for (int q = tid; q < num_query_per_req; q += 256) {
+    const int64_t query_pos = last_valid_pos + 1 + q;
+    const int32_t input_id = (q == 0) ? bonus_token : parallel_drafting_token_id;
+    int64_t q_blk = (block_size == 16) ? (query_pos >> 4) : (query_pos / block_size);
+    if (q_blk > block_table_stride - 1) q_blk = block_table_stride - 1;
+    const int64_t q_bid = static_cast<int64_t>(block_table[q_blk]);
+    const int64_t q_off = (block_size == 16) ? (query_pos & 15) : (query_pos % block_size);
+    out_input_ids[q] = input_id;
+    out_query_positions[q] = (query_pos < max_model_len - 1) ? query_pos : (max_model_len - 1);
+    out_query_slot_mapping[q] = (query_pos < max_model_len) ? (q_bid * block_size + q_off) : pad_slot_id;
+    if (q >= 1 && q < 1 + num_speculative_steps) {
+      const int s = q - 1;
+      out_sample_indices[s] = q;
+      out_sample_pos[s] = query_pos;
+      out_sample_idx_mapping[s] = req_state_idx;
+    }
+  }
+
+  for (int i = 1 + tid; i <= max_num_reqs; i += 256) {
+    out_query_start_loc[i] = num_query_per_req;
+  }
+  for (int i = 1 + tid; i < max_num_reqs; i += 256) {
+    out_seq_lens[i] = 0;
+  }
+  const int pad_end = max_num_reqs * num_speculative_steps;
+  for (int i = num_speculative_steps + tid; i < pad_end; i += 256) {
+    out_sample_indices[i] = 0;
+    out_sample_pos[i] = 0;
+    out_sample_idx_mapping[i] = -1;
+  }
+  const int q_pad_end = (max_num_tokens < max_num_reqs * num_query_per_req)
+                            ? max_num_tokens
+                            : (max_num_reqs * num_query_per_req);
+  for (int i = num_query_per_req + tid; i < q_pad_end; i += 256) {
+    out_query_slot_mapping[i] = pad_slot_id;
+  }
+
+  if (in_static_vocab != nullptr && tail_num_tokens > 0) {
+    if (s_tail_reset) {
+      for (int i = tid; i < s_tail_old_cnt; i += 256) {
+        const int prev_tok = tail_ids[i];
+        if (prev_tok >= 0 && prev_tok < vocab_size) {
+          tail_seen[prev_tok] = 0;
+        }
+      }
+      for (int i = tid; i < max_tail; i += 256) {
+        tail_ids[i] = -1;
+      }
+      if (tid == 0) {
+        tail_count[0] = 0;
+      }
+      __syncthreads();
+    }
+    const int scan_end = valid_tail_len + (include_bonus ? 1 : 0);
+    for (int i = tid; i < scan_end; i += 256) {
+      const int64_t raw_tok = (i < valid_tail_len)
+          ? static_cast<int64_t>(target_input_ids[ctx_start + i])
+          : static_cast<int64_t>(bonus_token);
+      if (raw_tok >= 0 && raw_tok < vocab_size) {
+        const int tok = static_cast<int>(raw_tok);
+        if (in_static_vocab[tok] == 0) {
+          if (atomicExch(&tail_seen[tok], 1) == 0) {
+            const int slot = atomicAdd(tail_count, 1);
+            if (slot < max_tail) {
+              tail_ids[slot] = tok;
+            } else {
+              tail_seen[tok] = 0;
+            }
+          }
+        }
+      }
+    }
+    __syncthreads();
+    if (tid == 0 && tail_count[0] > max_tail) {
+      tail_count[0] = max_tail;
+    }
   }
 }
 
@@ -331,7 +551,11 @@ std::tuple<torch::Tensor, torch::Tensor> dflash_qkv_norm_rope(
     int64_t nq,
     int64_t nkv,
     double eps,
-    bool is_neox) {
+    bool is_neox,
+    c10::optional<torch::Tensor> slot_mapping,
+    c10::optional<torch::Tensor> k_cache,
+    c10::optional<torch::Tensor> v_cache,
+    int64_t block_size) {
   TORCH_CHECK(qkv.is_cuda() && qkv.scalar_type() == torch::kBFloat16 &&
               qkv.dim() == 2 && qkv.is_contiguous());
   TORCH_CHECK(positions.is_cuda() && positions.scalar_type() == torch::kInt64 && positions.is_contiguous());
@@ -347,6 +571,25 @@ std::tuple<torch::Tensor, torch::Tensor> dflash_qkv_norm_rope(
   auto q_out = torch::empty({M, nq * kHeadDim}, qkv.options());
   auto k_out = torch::empty({M, nkv * kHeadDim}, qkv.options());
   if (M == 0) return {q_out, k_out};
+
+  QkvCacheDesc cdesc{};
+  if (slot_mapping.has_value() && slot_mapping->defined() &&
+      k_cache.has_value() && k_cache->defined() &&
+      v_cache.has_value() && v_cache->defined()) {
+    TORCH_CHECK(slot_mapping->is_cuda() && slot_mapping->scalar_type() == torch::kInt64 &&
+                slot_mapping->is_contiguous() && slot_mapping->numel() >= M);
+    TORCH_CHECK(k_cache->is_cuda() && k_cache->scalar_type() == torch::kBFloat16 &&
+                k_cache->dim() == 4 && k_cache->stride(3) == 1);
+    TORCH_CHECK(v_cache->is_cuda() && v_cache->scalar_type() == torch::kBFloat16 &&
+                v_cache->dim() == 4 && v_cache->stride(3) == 1);
+    cdesc.k_cache = reinterpret_cast<__nv_bfloat16*>(k_cache->data_ptr());
+    cdesc.v_cache = reinterpret_cast<__nv_bfloat16*>(v_cache->data_ptr());
+    cdesc.slots = slot_mapping->data_ptr<int64_t>();
+    cdesc.k_sb = k_cache->stride(0); cdesc.k_sn = k_cache->stride(1); cdesc.k_sh = k_cache->stride(2);
+    cdesc.v_sb = v_cache->stride(0); cdesc.v_sn = v_cache->stride(1); cdesc.v_sh = v_cache->stride(2);
+    cdesc.block_size = static_cast<int>(block_size);
+    cdesc.enabled = 1;
+  }
 
   const int total_warps = M * static_cast<int>(nq + nkv);
   const int blocks = (total_warps + 3) / 4;
@@ -366,7 +609,7 @@ std::tuple<torch::Tensor, torch::Tensor> dflash_qkv_norm_rope(
       static_cast<const void*>(cos_sin_cache.data_ptr()), \
       reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr()), \
       reinterpret_cast<__nv_bfloat16*>(k_out.data_ptr()), \
-      M, static_cast<int>(nq), static_cast<int>(nkv), cache_rows, static_cast<float>(eps), pdl_mode)
+      cdesc, M, static_cast<int>(nq), static_cast<int>(nkv), cache_rows, static_cast<float>(eps), pdl_mode)
 
   if (is_neox) {
     if (cache_f32) { LAUNCH_QKVNR(true, true); }
@@ -377,4 +620,154 @@ std::tuple<torch::Tensor, torch::Tensor> dflash_qkv_norm_rope(
   }
 #undef LAUNCH_QKVNR
   return {q_out, k_out};
+}
+
+void dflash_prepare_inputs(
+    torch::Tensor out_input_ids,
+    torch::Tensor out_query_positions,
+    torch::Tensor out_query_start_loc,
+    torch::Tensor out_seq_lens,
+    torch::Tensor out_query_slot_mapping,
+    torch::Tensor out_context_positions,
+    torch::Tensor out_context_slot_mapping,
+    torch::Tensor out_sample_indices,
+    torch::Tensor out_sample_pos,
+    torch::Tensor out_sample_idx_mapping,
+    torch::Tensor out_temperature,
+    torch::Tensor out_seeds,
+    torch::Tensor target_positions,
+    torch::Tensor target_query_start_loc,
+    torch::Tensor idx_mapping,
+    torch::Tensor last_sampled,
+    torch::Tensor next_prefill_tokens,
+    torch::Tensor num_sampled,
+    torch::Tensor num_rejected,
+    torch::Tensor in_temperature,
+    torch::Tensor in_seeds,
+    torch::Tensor block_table,
+    int64_t block_table_stride,
+    int64_t parallel_drafting_token_id,
+    int64_t block_size,
+    int64_t num_query_per_req,
+    int64_t num_speculative_steps,
+    int64_t max_num_reqs,
+    int64_t max_num_tokens,
+    int64_t max_model_len,
+    int64_t pad_slot_id,
+    c10::optional<torch::Tensor> target_input_ids,
+    int64_t tail_num_tokens,
+    c10::optional<torch::Tensor> in_static_vocab,
+    c10::optional<torch::Tensor> tail_ids,
+    c10::optional<torch::Tensor> tail_count,
+    c10::optional<torch::Tensor> tail_seen) {
+  TORCH_CHECK(out_input_ids.scalar_type() == torch::kInt32 && out_query_positions.scalar_type() == torch::kInt64 &&
+                  out_query_start_loc.scalar_type() == torch::kInt32 && out_seq_lens.scalar_type() == torch::kInt32 &&
+                  out_query_slot_mapping.scalar_type() == torch::kInt64 &&
+                  out_context_positions.scalar_type() == torch::kInt64 &&
+                  out_context_slot_mapping.scalar_type() == torch::kInt64 &&
+                  out_sample_indices.scalar_type() == torch::kInt64 &&
+                  out_sample_pos.scalar_type() == torch::kInt64 &&
+                  out_sample_idx_mapping.scalar_type() == torch::kInt32 &&
+                  out_temperature.scalar_type() == torch::kFloat32 && out_seeds.scalar_type() == torch::kInt64,
+              "dflash_prepare_inputs bad output dtypes");
+  TORCH_CHECK(target_positions.scalar_type() == torch::kInt64 &&
+                  target_query_start_loc.scalar_type() == torch::kInt32 &&
+                  idx_mapping.scalar_type() == torch::kInt32 &&
+                  num_sampled.scalar_type() == torch::kInt32 &&
+                  num_rejected.scalar_type() == torch::kInt32 &&
+                  in_temperature.scalar_type() == torch::kFloat32 &&
+                  in_seeds.scalar_type() == torch::kInt64 &&
+                  block_table.scalar_type() == torch::kInt32,
+              "dflash_prepare_inputs bad input dtypes");
+
+  const uint8_t* static_vocab_ptr = nullptr;
+  int32_t* tail_ids_ptr = nullptr;
+  int32_t* tail_count_ptr = nullptr;
+  int32_t* tail_seen_ptr = nullptr;
+  int vocab_size = 0;
+  int max_tail = 0;
+  int eff_tail_tokens = 0;
+  bool tail_i64 = false;
+  const void* target_ids_raw = nullptr;
+
+  if (target_input_ids.has_value() && target_input_ids->defined() &&
+      in_static_vocab.has_value() && in_static_vocab->defined() &&
+      tail_ids.has_value() && tail_ids->defined() &&
+      tail_count.has_value() && tail_count->defined() &&
+      tail_seen.has_value() && tail_seen->defined() && tail_num_tokens > 0) {
+    TORCH_CHECK(target_input_ids->is_contiguous(), "dflash_prepare_inputs non-contiguous target_input_ids");
+    tail_i64 = (target_input_ids->scalar_type() == torch::kInt64);
+    TORCH_CHECK(tail_i64 || target_input_ids->scalar_type() == torch::kInt32,
+                "dflash_prepare_inputs bad target_input_ids dtype");
+    target_ids_raw = target_input_ids->data_ptr();
+    static_vocab_ptr = in_static_vocab->data_ptr<uint8_t>();
+    tail_ids_ptr = tail_ids->data_ptr<int32_t>();
+    tail_count_ptr = tail_count->data_ptr<int32_t>();
+    tail_seen_ptr = tail_seen->data_ptr<int32_t>();
+    vocab_size = static_cast<int>(in_static_vocab->numel());
+    max_tail = static_cast<int>(tail_ids->numel());
+    eff_tail_tokens = static_cast<int>(tail_num_tokens);
+  }
+
+  const bool ls_i64 = (last_sampled.scalar_type() == torch::kInt64);
+  TORCH_CHECK(ls_i64 || last_sampled.scalar_type() == torch::kInt32, "bad last_sampled dtype");
+  TORCH_CHECK(next_prefill_tokens.scalar_type() == torch::kInt32, "bad next_prefill_tokens dtype");
+
+  static const int include_bonus = []() -> int {
+    const char* s = std::getenv("MUSE_TAIL_ZERO_LAG");
+    return (!s || !*s || std::atoi(s) != 0) ? 1 : 0;
+  }();
+  auto st = c10::cuda::getCurrentCUDAStream().stream();
+#define LAUNCH_PREP(LST, TIDT) \
+  dflash_prepare_inputs_kernel<LST, TIDT><<<1, 256, 0, st>>>( \
+      out_input_ids.data_ptr<int32_t>(), \
+      out_query_positions.data_ptr<int64_t>(), \
+      out_query_start_loc.data_ptr<int32_t>(), \
+      out_seq_lens.data_ptr<int32_t>(), \
+      out_query_slot_mapping.data_ptr<int64_t>(), \
+      out_context_positions.data_ptr<int64_t>(), \
+      out_context_slot_mapping.data_ptr<int64_t>(), \
+      out_sample_indices.data_ptr<int64_t>(), \
+      out_sample_pos.data_ptr<int64_t>(), \
+      out_sample_idx_mapping.data_ptr<int32_t>(), \
+      out_temperature.data_ptr<float>(), \
+      out_seeds.data_ptr<int64_t>(), \
+      target_positions.data_ptr<int64_t>(), \
+      target_query_start_loc.data_ptr<int32_t>(), \
+      idx_mapping.data_ptr<int32_t>(), \
+      last_sampled.data_ptr<LST>(), \
+      next_prefill_tokens.data_ptr<int32_t>(), \
+      num_sampled.data_ptr<int32_t>(), \
+      num_rejected.data_ptr<int32_t>(), \
+      in_temperature.data_ptr<float>(), \
+      in_seeds.data_ptr<int64_t>(), \
+      block_table.data_ptr<int32_t>(), \
+      block_table_stride, \
+      static_cast<int32_t>(parallel_drafting_token_id), \
+      block_size, \
+      static_cast<int>(num_query_per_req), \
+      static_cast<int>(num_speculative_steps), \
+      static_cast<int>(max_num_reqs), \
+      static_cast<int>(max_num_tokens), \
+      max_model_len, \
+      pad_slot_id, \
+      reinterpret_cast<const TIDT*>(target_ids_raw), \
+      eff_tail_tokens, \
+      static_vocab_ptr, \
+      tail_ids_ptr, \
+      tail_count_ptr, \
+      tail_seen_ptr, \
+      vocab_size, \
+      max_tail, \
+      include_bonus)
+
+  if (ls_i64) {
+    if (tail_i64) { LAUNCH_PREP(int64_t, int64_t); }
+    else { LAUNCH_PREP(int64_t, int32_t); }
+  } else {
+    if (tail_i64) { LAUNCH_PREP(int32_t, int64_t); }
+    else { LAUNCH_PREP(int32_t, int32_t); }
+  }
+#undef LAUNCH_PREP
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
