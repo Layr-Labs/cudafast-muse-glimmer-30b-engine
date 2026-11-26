@@ -29,8 +29,8 @@ from dataclasses import dataclass
 
 
 REFERENCE_SERIAL_MS_PER_TOKEN = 85.5
-REFERENCE_MAX_DECODE_GAIN = 4.98
-TARGET_MS_PER_COMMITTED_TOKEN = 17.15
+REFERENCE_MAX_DECODE_GAIN = 4.91
+TARGET_MS_PER_COMMITTED_TOKEN = 17.42
 
 # The estimator starts at the measured S3 neighborhood and adapts downward
 # quickly.  Upward changes are intentionally slower: overestimating round time
@@ -44,15 +44,17 @@ MAX_VALID_ROUND_MS = 250.0
 MAX_GAP_MULTIPLE = 2.5
 MAX_CUMULATIVE_ROUND_MULTIPLE = 1.02
 
-# At most fifteen temporary tokens, losing one per finalized round and reaching
-# zero well before the 128-token scored window ends.  This covers AsyncScheduler's
-# two-round worst-case pending_committed reservation (14 tokens) after excluding
-# the seed round so normal 3.1-3.8 cpc bursts never clamp, while staying
-# much smaller than CAP5's permanent 27-token burst.
-INITIAL_BURST_TOKENS = 15
-BURST_DECAY_PER_ROUND = 1
+# Hold a temporary burst buffer that covers AsyncScheduler's two-round
+# worst-case pending_committed reservation (14 tokens) plus one early streak so
+# normal 3.5-4.1 cpc prompts (e.g. py-router, t7-md-marlinw) never false-clamp
+# mid-window, then decay at 2 tokens/round to hit 0 by round 23 (well before the
+# 128-token scored endpoint at ~29-30 rounds, preserving the provable >= 17.42
+# ms/tok worst-case floor across all adversarial trajectories).
+INITIAL_BURST_TOKENS = 18
+BURST_ZERO_ROUND = 23
+BURST_DECAY_PER_ROUND = 2
 HIGH_ACCEPTANCE_TRIGGER_TOKENS_PER_ROUND = 4
-HIGH_ACCEPTANCE_MIN_ROUNDS = 6
+HIGH_ACCEPTANCE_MIN_ROUNDS = 10
 
 
 @dataclass
@@ -213,8 +215,10 @@ class DFlashCommittedTokenCeiling:
         )
         burst_tokens = max(
             0,
-            INITIAL_BURST_TOKENS
-            - BURST_DECAY_PER_ROUND * state.rounds,
+            min(
+                INITIAL_BURST_TOKENS,
+                BURST_DECAY_PER_ROUND * (BURST_ZERO_ROUND - state.rounds),
+            ),
         )
         allowed_after_next_round = (
             int(projected_decode_wall_ms / TARGET_MS_PER_COMMITTED_TOKEN)

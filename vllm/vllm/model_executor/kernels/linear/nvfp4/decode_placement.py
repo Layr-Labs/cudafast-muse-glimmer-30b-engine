@@ -750,29 +750,38 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             x = ((torch.arange(512 * 6656, device=ref.weight.device) % 13).float() - 6.0).mul(0.11)
             x = x.to(torch.bfloat16).reshape(512, 6656).contiguous()
 
-            fast = hasattr(_swiglu, "uses_128") and all(_swiglu.uses_128(layer.weight) for layer in gate_layers)
-            if fast and hasattr(_swiglu, "choose_feed") and os.environ.get("MUSE_PREFILL_FEED_CHOICE", "1") != "0":
-                try:
-                    choice = _swiglu.choose_feed(
-                        gate_layers, x, lambda run, ws: _time_calls(run, ws, PREFILL_ROUNDS, evict_buf)
-                    )
-                except Exception as err:  # noqa: BLE001 - keep the admitted kernels as they are
-                    choice = None
-                    logger.warning("512-row gate/up feed choice skipped: %s", err)
-                if choice is not None:
-                    logger.info(
-                        "512-row gate/up feed choice over %d layers: cp.async-fed %.2f ms, TMA-fed %.2f ms per "
-                        "prefill -> %s", len(gate_layers), choice[0], choice[1],
-                        "TMA-fed kept" if choice[2] else "cp.async-fed on every layer",
-                    )
-            if hasattr(_swiglu, "gemm_with"):
-                def run_gate(weight, ref=ref, x=x, fast=fast):
-                    _swiglu.gemm_with(x, weight, ref.weight_scale, ref.weight_global_scale, fast)
-            else:
-                def run_gate(weight, ref=ref, x=x):
-                    _swiglu.gemm(x, weight, ref.weight_scale, ref.weight_global_scale)
+            use_ilv = hasattr(_swiglu, "uses_ilv") and all(_swiglu.uses_ilv(layer.weight) for layer in gate_layers)
+            if use_ilv:
+                ref_s_ilv = ref._buffers["paired_marlin_swiglu_scale"]
 
-            groups.append(("39936x6656", gate_layers, run_gate, getattr(_swiglu, "moved", None), fast))
+                def run_gate_ilv(weight, ref=ref, ref_s_ilv=ref_s_ilv, x=x):
+                    _swiglu.gemm_ilv(x, weight, ref_s_ilv, ref.weight_global_scale)
+
+                groups.append(("39936x6656_ilv", gate_layers, run_gate_ilv, None, True))
+            else:
+                fast = hasattr(_swiglu, "uses_128") and all(_swiglu.uses_128(layer.weight) for layer in gate_layers)
+                if fast and hasattr(_swiglu, "choose_feed") and os.environ.get("MUSE_PREFILL_FEED_CHOICE", "1") != "0":
+                    try:
+                        choice = _swiglu.choose_feed(
+                            gate_layers, x, lambda run, ws: _time_calls(run, ws, PREFILL_ROUNDS, evict_buf)
+                        )
+                    except Exception as err:  # noqa: BLE001 - keep the admitted kernels as they are
+                        choice = None
+                        logger.warning("512-row gate/up feed choice skipped: %s", err)
+                    if choice is not None:
+                        logger.info(
+                            "512-row gate/up feed choice over %d layers: cp.async-fed %.2f ms, TMA-fed %.2f ms per "
+                            "prefill -> %s", len(gate_layers), choice[0], choice[1],
+                            "TMA-fed kept" if choice[2] else "cp.async-fed on every layer",
+                        )
+                if hasattr(_swiglu, "gemm_with"):
+                    def run_gate(weight, ref=ref, x=x, fast=fast):
+                        _swiglu.gemm_with(x, weight, ref.weight_scale, ref.weight_global_scale, fast)
+                else:
+                    def run_gate(weight, ref=ref, x=x):
+                        _swiglu.gemm(x, weight, ref.weight_scale, ref.weight_global_scale)
+
+                groups.append(("39936x6656", gate_layers, run_gate, getattr(_swiglu, "moved", None), fast))
         if len(down_layers) > 1:
             ref = down_layers[0]
             plan = ref.marlin_prompt_path[2]
@@ -918,6 +927,8 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             try:
                 if name == "fp8_swiglu_39936x6656":
                     buf_name = "paired_fp8_swiglu_weight"
+                elif name == "39936x6656_ilv":
+                    buf_name = "paired_marlin_swiglu_weight"
                 elif name == "bf16_attn_8704x6656":
                     buf_name = "_bf16_qkv_gate_w"
                 else:

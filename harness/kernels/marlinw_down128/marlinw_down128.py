@@ -27,7 +27,7 @@ _raw_attn_shapes = os.environ.get("MARLIN_ATTN128_SHAPES", "qkv,o_proj,gate")
 _enabled_attn = set() if _raw_attn_shapes in ("", "0") else set(_raw_attn_shapes.split(","))
 ATTN_SHAPES = {k: v for k, v in _ALL_ATTN_SHAPES.items() if v in _enabled_attn}
 ATTN_TMA_ENABLED = ATTN_ENABLED and os.environ.get("MARLIN_ATTN_TMA", "1") == "1"
-TMA_SHFL_EPI = os.environ.get("MARLIN_TMA_SHFL_EPI", "0") != "0"
+TMA_SHFL_EPI = os.environ.get("MARLIN_TMA_SHFL_EPI", "1") != "0"
 _DEFAULT_TAIL = {(6656, 19968): 16, (4608, 6656): 0, (4096, 6656): 8, (6656, 4096): 16}
 _plans: dict = {}
 _scratch_cache: dict[tuple[int, int], torch.Tensor] = {}
@@ -89,7 +89,12 @@ _tma_ready = set()  # devices on which the TMA-fed kernel initialized
 _tma_weights = set()  # weight data pointers whose layer passed the comparison with the TMA-fed kernel
 _admitted = 0  # layers offered to admit_tma (those on the 128x128 tile)
 SPLIT = 16  # tiles the TMA-fed kernel runs as three K pieces (= hand-over states = flag words)
-PIECES = (120, 96, 96)  # k-tiles of the first / middle / last piece (the later two run a slower loop copy)
+_raw_pieces = os.environ.get("D128_PIECES", "").strip()
+PIECES = (
+    tuple(int(x) for x in _raw_pieces.split(","))
+    if _raw_pieces and len(_raw_pieces.split(",")) == 3
+    else (104, 104, 104)
+)  # balanced 3-piece K-split (strictly dominates (120,96,96) for any kLater overhead <15.4%)
 
 
 def _get_scratch(device: torch.device, slots: int) -> torch.Tensor:

@@ -25,16 +25,37 @@ template<class Fragment> struct PairSwiGLU {
         constexpr int Num=Fragment::kElements;
         static_assert(Num>=2 && Num%2==0, "Each register fragment must contain an even adjacent N pair");
         cutlass::Array<cutlass::float_e2m1_t,Num> out;
-        #pragma unroll
-        for (int i=0;i<Num;i+=2) {
-            const float silu=__ldg(bf16_silu + (__float_as_uint(halves[i])>>16));
-            float inverse;
-            asm("div.full.f32 %0, %1, %2;" : "=f"(inverse) : "f"(1.0f), "f"(scale[i]));
-            const float q=__fmul_rn(__fmul_rn(silu,halves[i+1]),inverse);
-            const float clamped=q < -448.f ? -448.f : (q>448.f ? 448.f : q);
-            unsigned value=__nv_cvt_float_to_fp8(clamped,__NV_SATFINITE,__NV_E4M3);
-            out[i]=cutlass::float_e2m1_t::bitcast(value&15);
-            out[i+1]=cutlass::float_e2m1_t::bitcast(value>>4);
+        // scale is a scalar broadcast across the entire tile: hoist div.full.f32 once per fragment!
+        float inverse;
+        asm("div.full.f32 %0, %1, %2;" : "=f"(inverse) : "f"(1.0f), "f"(scale[0]));
+        if constexpr (Num >= 4 && Num % 4 == 0) {
+            #pragma unroll
+            for (int i=0;i<Num;i+=4) {
+                const float s0 = swiglu_silu(halves[i]);
+                const float s1 = swiglu_silu(halves[i+2]);
+                const float q0 = __fmul_rn(__fmul_rn(s0, halves[i+1]), inverse);
+                const float q1 = __fmul_rn(__fmul_rn(s1, halves[i+3]), inverse);
+                const float c0 = q0 < -448.f ? -448.f : (q0 > 448.f ? 448.f : q0);
+                const float c1 = q1 < -448.f ? -448.f : (q1 > 448.f ? 448.f : q1);
+                uint16_t conv;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(conv) : "f"(c1), "f"(c0));
+                const unsigned v0 = conv & 0xffu;
+                const unsigned v1 = conv >> 8;
+                out[i]   = cutlass::float_e2m1_t::bitcast(v0 & 15);
+                out[i+1] = cutlass::float_e2m1_t::bitcast(v0 >> 4);
+                out[i+2] = cutlass::float_e2m1_t::bitcast(v1 & 15);
+                out[i+3] = cutlass::float_e2m1_t::bitcast(v1 >> 4);
+            }
+        } else {
+            #pragma unroll
+            for (int i=0;i<Num;i+=2) {
+                const float silu = swiglu_silu(halves[i]);
+                const float q = __fmul_rn(__fmul_rn(silu, halves[i+1]), inverse);
+                const float clamped = q < -448.f ? -448.f : (q > 448.f ? 448.f : q);
+                unsigned value = __nv_cvt_float_to_fp8(clamped, __NV_SATFINITE, __NV_E4M3);
+                out[i] = cutlass::float_e2m1_t::bitcast(value & 15);
+                out[i+1] = cutlass::float_e2m1_t::bitcast(value >> 4);
+            }
         }
         return out;
     }
@@ -379,13 +400,22 @@ __device__ __forceinline__ void consume_stage_pipe_sw(
 template <bool kPdl = false>
 __global__ void __launch_bounds__(NT_WS9, 1)
 swiglu_ws9_st3_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
-                      const float* sa_p, const float* sb_p, const float* down_p, uint8_t* out) {
+                      const float* sa_p, const float* sb_p, const float* down_p, uint8_t* out,
+                      const uint8_t* __restrict__ w_raw) {
   constexpr int BM_T = 128, ST_T = 3, ASZ = BM_T * KT, STB = ASZ + WSZ;
   constexpr int NTN = N_DIM / BN, NTILES = 4 * NTN, NKT = K_DIM / KT;
   static_assert(NTILES == 26 * 48, "26 exact waves on 48 SMs");
   extern __shared__ uint8_t sm_raw[];
   __shared__ __align__(8) unsigned long long bars[2 * ST_T];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
+  if (b == 0 && w_raw != nullptr) {
+    constexpr size_t kTpf = 2048u << 10;
+    constexpr size_t kWBytes = static_cast<size_t>(N_DIM) * static_cast<size_t>(K_DIM);
+    for (size_t off = static_cast<size_t>(tid) * kTpf; off < kWBytes;
+         off += static_cast<size_t>(NT_WS9) * kTpf) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(w_raw + off));
+    }
+  }
   const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
   const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST_T;
   if (tid == 0) {
@@ -483,18 +513,39 @@ static bool ws_pdl_enabled() {
   return env_on;
 }
 
+static bool ws_tlb_enabled() {
+  static const bool on = []() {
+    const char* env = std::getenv("MUSE_FP8_SWIGLU_TLB");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  return on;
+}
+
+static CUtensorMapL2promotion ws_tmab_l2_promo() {
+  static const CUtensorMapL2promotion p = []() {
+    const char* env = std::getenv("MUSE_FP8_SWIGLU_TMAB_L2_PROMO");
+    long v = (!env || !*env) ? 128 : std::strtol(env, nullptr, 10);
+    if (v == 0) return CU_TENSOR_MAP_L2_PROMOTION_NONE;
+    if (v == 64) return CU_TENSOR_MAP_L2_PROMOTION_L2_64B;
+    if (v == 256) return CU_TENSOR_MAP_L2_PROMOTION_L2_256B;
+    return CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
+  }();
+  return p;
+}
+
 typedef CUresult (*EncodeFn)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
                              const cuuint64_t*, const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave,
                              CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
 static EncodeFn encode = nullptr;
 
-static bool encode_tma2d(CUtensorMap* tm, const void* ptr, int k, int rows, int box_rows) {
+static bool encode_tma2d(CUtensorMap* tm, const void* ptr, int k, int rows, int box_rows,
+                         CUtensorMapL2promotion l2p = CU_TENSOR_MAP_L2_PROMOTION_L2_256B) {
   cuuint64_t dims[2] = {(cuuint64_t)k, (cuuint64_t)rows};
   cuuint64_t strides[1] = {(cuuint64_t)k};
   cuuint32_t box[2] = {(cuuint32_t)KT, (cuuint32_t)box_rows};
   cuuint32_t es[2] = {1, 1};
   return encode(tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<void*>(ptr), dims, strides, box, es,
-                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, l2p,
                 CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 }  // namespace swiglu_ws
@@ -541,8 +592,10 @@ extern "C" int swiglu_ws_run(const void* a, const void* b, const float* sa, cons
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
   CUtensorMap tmA, tmB;
+  const CUtensorMapL2promotion b_l2p = ws_tmab_l2_promo();
   if (use_ws9) {
-    if (!encode_tma2d(&tmA, a, K_DIM, M_DIM, 128) || !encode_tma2d(&tmB, b, K_DIM, N_DIM, BN)) return -3;
+    if (!encode_tma2d(&tmA, a, K_DIM, M_DIM, 128) || !encode_tma2d(&tmB, b, K_DIM, N_DIM, BN, b_l2p)) return -3;
+    const uint8_t* w_raw = ws_tlb_enabled() ? static_cast<const uint8_t*>(b) : nullptr;
     if (ws_pdl_enabled()) {
       cudaLaunchConfig_t cfg = {};
       cfg.gridDim = dim3(48, 1, 1); cfg.blockDim = dim3(NT_WS9, 1, 1);
@@ -551,12 +604,14 @@ extern "C" int swiglu_ws_run(const void* a, const void* b, const float* sa, cons
       attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
       attr[0].val.programmaticStreamSerializationAllowed = 1;
       cfg.attrs = attr; cfg.numAttrs = 1;
-      return int(cudaLaunchKernelEx(&cfg, swiglu_ws9_st3_kernel<true>, tmA, tmB, sa, sb, down, static_cast<uint8_t*>(d)));
+      return int(cudaLaunchKernelEx(&cfg, swiglu_ws9_st3_kernel<true>, tmA, tmB, sa, sb, down,
+                                    static_cast<uint8_t*>(d), w_raw));
     }
-    swiglu_ws9_st3_kernel<false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA, tmB, sa, sb, down, static_cast<uint8_t*>(d));
+    swiglu_ws9_st3_kernel<false><<<48, NT_WS9, SMEM_MAX, stream>>>(
+        tmA, tmB, sa, sb, down, static_cast<uint8_t*>(d), w_raw);
     return int(cudaGetLastError());
   }
-  if (!encode_tma2d(&tmA, a, K_DIM, M_DIM, 256) || !encode_tma2d(&tmB, b, K_DIM, N_DIM, BN)) return -3;
+  if (!encode_tma2d(&tmA, a, K_DIM, M_DIM, 256) || !encode_tma2d(&tmB, b, K_DIM, N_DIM, BN, b_l2p)) return -3;
   if (ws_pdl_enabled()) {
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(48, 1, 1);

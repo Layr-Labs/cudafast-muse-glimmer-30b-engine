@@ -319,7 +319,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ]
         self._zp_cg_ok: bool | None = None
         self._logits_indices_0_gpu = torch.zeros(1, dtype=torch.int64, device=self.device)
+        self._logits_indices_7_gpu = torch.arange(7, dtype=torch.int64, device=self.device)
         self._ones_1_np = np.ones(1, dtype=np.int32)
+        self._six_1_np = np.array([6], dtype=np.int32)
+        self._seven_1_np = np.array([7], dtype=np.int32)
+        self._qsl_7_np = np.array([0, 7], dtype=np.int32)
         self._false_1_np = np.zeros(1, dtype=np.bool_)
         self._single_decode_prep_enabled = (
             envs.os.environ.get("VLLM_FUSED_DECODE_PREP", "1") != "0"
@@ -327,6 +331,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._single_decode_prep_armed = False
         self._single_decode_prep_verified = False
         self._single_decode_prep_failed = False
+        self._single_tree_prep_enabled = (
+            envs.os.environ.get("VLLM_FUSED_TREE_PREP", "1") != "0"
+        )
+        self._single_tree_prep_verified: set[int] = set()
+        self._single_tree_prep_failed = False
         self._qsl_const_gpu: dict[int, torch.Tensor] = {}
         for _nt in (1, 2, 512):
             _qsl = [0] + [_nt] * self.max_num_reqs
@@ -418,7 +427,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # for draft steps of 1..max(decode_query_len, 16) tokens, built once here so a
         # step reads it instead of a pin + H2D copy (query_start_loc,
         # cu_num_logits) and an expand kernel. Only read downstream.
-        _n_max = max(self.decode_query_len, 16)
+        _n_max = max(self.decode_query_len, 32)
         for _nt in range(1, _n_max + 1):
             if _nt not in self._qsl_const_gpu:
                 self._qsl_const_gpu[_nt] = torch.tensor(
@@ -427,10 +436,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     device=self.device,
                 )
         self._qsl_tree_np = {
-            _tm: np.array([0, _tm], dtype=np.int32) for _tm in (8, 12, 16)
+            _tm: np.array([0, _tm], dtype=np.int32) for _tm in (8, 12, 16, 20, 24, 32)
         }
         self._num_sched_tree_np = {
-            _tm: np.array([_tm], dtype=np.int32) for _tm in (8, 12, 16)
+            _tm: np.array([_tm], dtype=np.int32) for _tm in (8, 12, 16, 20, 24, 32)
         }
         self._spec_cu_logits_np = [
             np.array([0, _n], dtype=np.int32) for _n in range(_n_max + 1)
@@ -956,6 +965,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.model_state.apply_staged_writes()
         self.block_tables.apply_staged_writes()
 
+    def _flush_deferred_zp_leaf_reset(self) -> None:
+        zp_leaf_rid = getattr(self, "_zp_leaf_reset_req_id", None)
+        if zp_leaf_rid is None:
+            return
+        self._zp_leaf_reset_req_id = None
+        _native_leaf.on_non_leaf_step(zp_leaf_rid, 0)
+
     def add_requests(
         self, scheduler_output: SchedulerOutput, *, defer_gpu_writes: bool = False
     ) -> None:
@@ -1449,7 +1465,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or not self.cudagraph_manager._graphs_captured
             or torch.cuda.is_current_stream_capturing()
             or input_batch.num_reqs != 1
-            or not (1 <= input_batch.num_tokens <= 16)
+            or not (1 <= input_batch.num_tokens <= 32)
             or input_batch.num_tokens_after_padding != input_batch.num_tokens
             or int(input_batch.num_computed_tokens_np[0]) < int(input_batch.prefill_len_np[0])
         ):
@@ -1509,7 +1525,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 and getattr(_me, "is_single_kernel_m1", lambda: False)()
             )
             can_direct_mm = (
-                1 < n_tok <= 16
+                1 < n_tok <= 32
                 and getattr(_me, "is_single_kernel_m", lambda: False)()
             )
             if (
@@ -1723,14 +1739,31 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         if getattr(lm_head, "marlin_decode6_lmpost_m_admitted", False):
                             out_cols = self.rejection_sampler.num_speculative_steps + 1
                             buf_cols = max(out_cols, leaf_verify_m) if extra_leaf else out_cols
-                            sampled_v_buf = torch.empty(
-                                (1, buf_cols),
-                                dtype=torch.int64,
-                                device=self.device,
-                            )
+                            ring = getattr(self, "_lmpost_verify_ring", None)
+                            if ring is None or ring[0][0].shape[1] < buf_cols:
+                                ring_cols = max(buf_cols, 32)
+                                ring = (
+                                    [
+                                        torch.empty((1, ring_cols), dtype=torch.int64, device=self.device)
+                                        for _ in range(4)
+                                    ],
+                                    [
+                                        torch.empty((1,), dtype=torch.int32, device=self.device)
+                                        for _ in range(4)
+                                    ],
+                                    [
+                                        torch.empty((1,), dtype=torch.int32, device=self.device)
+                                        for _ in range(4)
+                                    ],
+                                )
+                                self._lmpost_verify_ring = ring
+                                self._lmpost_verify_ring_step = 0
+                            slot = self._lmpost_verify_ring_step & 3
+                            self._lmpost_verify_ring_step += 1
+                            sampled_v_buf = ring[0][slot][:, :buf_cols]
                             sampled_v = sampled_v_buf[:, :out_cols]
-                            num_sampled_v = torch.empty((1,), dtype=torch.int32, device=self.device)
-                            num_rejected_v = torch.empty((1,), dtype=torch.int32, device=self.device)
+                            num_sampled_v = ring[1][slot]
+                            num_rejected_v = ring[2][slot]
                             if (
                                 _m6.launch_lmhead_lmpost6_m(
                                     sample_hidden_states, lm_head, lut, sampled_v_buf, org_vocab
@@ -2059,6 +2092,208 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return input_batch, block_tables, slot_mappings
 
+    def _try_prepare_single_tree(
+        self,
+        scheduler_output: SchedulerOutput,
+        batch_desc: BatchExecutionDescriptor,
+        req_id: str,
+        req_idx: int,
+        verify_m: int,
+    ) -> tuple[InputBatch, InputBatch, tuple[torch.Tensor, ...], torch.Tensor] | None:
+        if (
+            not self._single_tree_prep_enabled
+            or self._single_tree_prep_failed
+            or batch_desc.cg_mode != CUDAGraphMode.FULL
+            or batch_desc.num_reqs != 1
+            or batch_desc.num_tokens != verify_m
+            or self.use_dcp
+            or self.pcp_manager is not None
+            or self.block_tables.cp_size != 1
+            or self.model_state.num_new_sampled_tokens_per_step != 1
+            or torch.cuda.is_current_stream_capturing()
+            or verify_m not in self._qsl_tree_np
+            or verify_m not in self._num_sched_tree_np
+            or 7 not in self._qsl_const_gpu
+        ):
+            return None
+        num_comp = int(self.req_states.num_computed_tokens_np[req_idx])
+        pref_len = int(self.req_states.prefill_len.np[req_idx])
+        num_comp_pref = int(self.req_states.num_computed_prefill_tokens[req_idx])
+        if num_comp_pref < pref_len or num_comp < pref_len:
+            return None
+        spec_meta = self._spec_logits_meta_1(req_idx, 7)
+        if spec_meta is None:
+            return None
+        idx_mapping_np = np.array([req_idx], dtype=np.int32)
+        if 0 <= req_idx < len(self._req_idx_views):
+            idx_mapping = self._req_idx_views[req_idx]
+        else:
+            idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        pad_buf = self.input_buffers.is_padding if envs.VLLM_MOE_SKIP_PADDING else None
+        res = self.block_tables.prepare_single_tree_step(
+            idx_mapping,
+            self.req_states.num_computed_tokens.gpu,
+            self.req_states.last_sampled_tokens,
+            self.req_states.draft_tokens,
+            6,
+            verify_m,
+            self.input_buffers.input_ids,
+            self.input_buffers.positions,
+            self.input_buffers.seq_lens,
+            self.input_buffers.query_start_loc,
+            pad_buf,
+        )
+        if res is None:
+            return None
+        block_tables, slot_mappings = res
+        if verify_m not in self._single_tree_prep_verified:
+            from dataclasses import replace as _dc_replace
+
+            got_ids = self.input_buffers.input_ids[:7].clone()
+            got_pos = self.input_buffers.positions[:verify_m].clone()
+            got_sl = self.input_buffers.seq_lens.clone()
+            got_qsl = self.input_buffers.query_start_loc.clone()
+            got_pad = self.input_buffers.is_padding[:verify_m].clone() if pad_buf is not None else None
+            got_slots = slot_mappings.clone()
+            got_bts = [bt.clone() for bt in block_tables]
+
+            ref_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            _native_leaf.prepare_tree(
+                self.input_buffers.positions,
+                self.input_buffers.seq_lens,
+                verify_m,
+            )
+            self.input_buffers.query_start_loc.copy_(
+                self._qsl_const_gpu[verify_m], non_blocking=True
+            )
+            ref_batch.query_start_loc = self._qsl_const_gpu[7][:2]
+            ref_fwd = _dc_replace(
+                ref_batch,
+                num_tokens=verify_m,
+                num_scheduled_tokens=self._num_sched_tree_np[verify_m],
+                query_start_loc=self.input_buffers.query_start_loc[:2],
+                query_start_loc_np=self._qsl_tree_np[verify_m],
+                seq_lens_cpu_upper_bound=ref_batch.seq_lens_cpu_upper_bound
+                + (verify_m - 7),
+            )
+            ref_bts, ref_slots = self.prepare_attn(ref_fwd)
+            ok = (
+                torch.equal(got_ids, self.input_buffers.input_ids[:7])
+                and torch.equal(got_pos, self.input_buffers.positions[:verify_m])
+                and torch.equal(got_sl, self.input_buffers.seq_lens)
+                and torch.equal(got_qsl, self.input_buffers.query_start_loc)
+                and (
+                    got_pad is None
+                    or torch.equal(got_pad, self.input_buffers.is_padding[:verify_m])
+                )
+                and torch.equal(got_slots, ref_slots)
+                and torch.equal(self._logits_indices_7_gpu, ref_batch.logits_indices)
+                and all(torch.equal(g_bt, r_bt) for g_bt, r_bt in zip(got_bts, ref_bts))
+            )
+            if ok:
+                self._single_tree_prep_verified.add(verify_m)
+                logger.info(
+                    "Single-req M=%d tree fused prep verified bitwise and active",
+                    verify_m,
+                )
+            else:
+                self._single_tree_prep_failed = True
+                logger.warning(
+                    "Single-req M=%d tree fused prep mismatch; keeping stock prep",
+                    verify_m,
+                )
+            return ref_batch, ref_fwd, ref_bts, ref_slots
+
+        (
+            cu_num_logits_np,
+            cu_num_logits,
+            expanded_idx_mapping,
+            expanded_local_pos,
+        ) = spec_meta
+        seq_ub_7 = torch.from_numpy(np.array([num_comp + 7], dtype=np.int32))
+        seq_ub_m = torch.from_numpy(np.array([num_comp + verify_m], dtype=np.int32))
+        max_seq_len_np = (
+            self.req_states.max_seq_len[idx_mapping_np] if self.use_pp else None
+        )
+        prompt_lens = (
+            self.req_states.prompt_len.gpu[idx_mapping]
+            if self.model_config.rswa_window is not None
+            else None
+        )
+        num_comp_np = np.array([num_comp], dtype=np.int32)
+        pref_len_np = np.array([pref_len], dtype=np.int32)
+        num_comp_pref_np = np.array([num_comp_pref], dtype=np.int32)
+        seq_lens_v = self.input_buffers.seq_lens[:1]
+        input_ids_v = self.input_buffers.input_ids[:verify_m]
+        positions_v = self.input_buffers.positions[:verify_m]
+        is_padding_v = self.input_buffers.is_padding[:verify_m]
+        has_so = scheduler_output.has_structured_output_requests
+        input_batch = InputBatch(
+            req_ids=[req_id],
+            num_reqs=1,
+            num_reqs_after_padding=1,
+            idx_mapping=idx_mapping,
+            idx_mapping_np=idx_mapping_np,
+            expanded_idx_mapping=expanded_idx_mapping,
+            expanded_local_pos=expanded_local_pos,
+            num_scheduled_tokens=self._seven_1_np,
+            num_tokens=7,
+            num_tokens_after_padding=verify_m,
+            num_draft_tokens=6,
+            num_draft_tokens_per_req=self._six_1_np,
+            query_start_loc=self._qsl_const_gpu[7][:2],
+            query_start_loc_np=self._qsl_7_np,
+            seq_lens=seq_lens_v,
+            seq_lens_cpu_upper_bound=seq_ub_7,
+            dcp_local_seq_lens=None,
+            num_computed_tokens_np=num_comp_np,
+            prefill_len_np=pref_len_np,
+            num_computed_prefill_tokens_np=num_comp_pref_np,
+            is_prefilling_np=self._false_1_np,
+            max_seq_len_np=max_seq_len_np,
+            input_ids=input_ids_v,
+            positions=positions_v,
+            is_padding=is_padding_v,
+            logits_indices=self._logits_indices_7_gpu,
+            cu_num_logits=cu_num_logits,
+            cu_num_logits_np=cu_num_logits_np,
+            has_structured_output_reqs=has_so,
+            prompt_lens=prompt_lens,
+        )
+        fwd_batch = InputBatch(
+            req_ids=[req_id],
+            num_reqs=1,
+            num_reqs_after_padding=1,
+            idx_mapping=idx_mapping,
+            idx_mapping_np=idx_mapping_np,
+            expanded_idx_mapping=expanded_idx_mapping,
+            expanded_local_pos=expanded_local_pos,
+            num_scheduled_tokens=self._num_sched_tree_np[verify_m],
+            num_tokens=verify_m,
+            num_tokens_after_padding=verify_m,
+            num_draft_tokens=6,
+            num_draft_tokens_per_req=self._six_1_np,
+            query_start_loc=self.input_buffers.query_start_loc[:2],
+            query_start_loc_np=self._qsl_tree_np[verify_m],
+            seq_lens=seq_lens_v,
+            seq_lens_cpu_upper_bound=seq_ub_m,
+            dcp_local_seq_lens=None,
+            num_computed_tokens_np=num_comp_np,
+            prefill_len_np=pref_len_np,
+            num_computed_prefill_tokens_np=num_comp_pref_np,
+            is_prefilling_np=self._false_1_np,
+            max_seq_len_np=max_seq_len_np,
+            input_ids=input_ids_v,
+            positions=positions_v,
+            is_padding=is_padding_v,
+            logits_indices=self._logits_indices_7_gpu,
+            cu_num_logits=cu_num_logits,
+            cu_num_logits_np=cu_num_logits_np,
+            has_structured_output_reqs=has_so,
+            prompt_lens=prompt_lens,
+        )
+        return input_batch, fwd_batch, block_tables, slot_mappings
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -2069,6 +2304,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         self._flush_deferred_zp_writes()
+        self._flush_deferred_zp_leaf_reset()
         if (
             not dummy_run
             and not is_profile
@@ -2107,6 +2343,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.add_requests(scheduler_output)
                     self.update_requests(scheduler_output)
                     self.block_tables.apply_staged_writes()
+                self._leaf_step = False
+                self._leaf_verify_m = 7
+                self._zp_leaf_reset_req_id = nr.req_id if _native_leaf.ENABLED else None
                 input_batch = self._build_zero_prep_batch(nr.req_id, pg.num_tokens)
                 self.model_state.preprocess_state(
                     input_batch,
@@ -2175,7 +2414,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if _leaf_req_id is not None
             else None
         )
-        _target_leaf_m = _native_leaf.active_verify_m()
+        _base_leaf_m = _native_leaf.active_verify_m()
+        _leaf_decoded = (
+            max(
+                0,
+                int(self.req_states.num_computed_tokens_np[_leaf_req_idx])
+                - int(self.req_states.prefill_len.np[_leaf_req_idx]),
+            )
+            if _leaf_req_idx is not None
+            else 0
+        )
+        _target_leaf_m = _native_leaf.select_verify_m(_leaf_req_id, _leaf_decoded)
+        if (
+            _target_leaf_m > _base_leaf_m
+            and _leaf_req_idx is not None
+            and int(self.req_states.num_computed_tokens_np[_leaf_req_idx])
+            + _target_leaf_m
+            > self.max_model_len
+        ):
+            _target_leaf_m = _base_leaf_m
         extra_leaf_candidate = (
             _target_leaf_m > 7
             and not dummy_run
@@ -2208,6 +2465,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 need_eager=False,
                 num_active_loras=num_active_loras,
             )
+            if (
+                (
+                    batch_desc.cg_mode != CUDAGraphMode.FULL
+                    or batch_desc.num_tokens != _target_leaf_m
+                )
+                and _target_leaf_m > _base_leaf_m > 7
+            ):
+                _target_leaf_m = _base_leaf_m
+                batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+                    self.cudagraph_manager,
+                    1,
+                    _target_leaf_m,
+                    _target_leaf_m,
+                    self.dp_size,
+                    self.dp_rank,
+                    need_eager=False,
+                    num_active_loras=num_active_loras,
+                )
             if (
                 batch_desc.cg_mode != CUDAGraphMode.FULL
                 or batch_desc.num_tokens != _target_leaf_m
@@ -2279,31 +2554,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             if extra_leaf_candidate:
-                from dataclasses import replace as _dc_replace
-
                 self._single_decode_prep_armed = False
-                input_batch = self.prepare_inputs(scheduler_output, batch_desc)
-                # Upgrade forward-only metadata to M=_target_leaf_m (8/12/16) while keeping
-                # input_batch at M=7 (query_start_loc=[0, 7]) for postprocess_sampled & propose.
-                _native_leaf.prepare_tree(
-                    self.input_buffers.positions,
-                    self.input_buffers.seq_lens,
-                    _target_leaf_m,
+                fast_tree = (
+                    self._try_prepare_single_tree(
+                        scheduler_output,
+                        batch_desc,
+                        _leaf_req_id,
+                        _leaf_req_idx,
+                        _target_leaf_m,
+                    )
+                    if _leaf_req_id is not None and _leaf_req_idx is not None
+                    else None
                 )
-                self.input_buffers.query_start_loc.copy_(
-                    self._qsl_const_gpu[_target_leaf_m], non_blocking=True
-                )
-                input_batch.query_start_loc = self._qsl_const_gpu[7][:2]
-                fwd_batch = _dc_replace(
-                    input_batch,
-                    num_tokens=_target_leaf_m,
-                    num_scheduled_tokens=self._num_sched_tree_np[_target_leaf_m],
-                    query_start_loc=self.input_buffers.query_start_loc[:2],
-                    query_start_loc_np=self._qsl_tree_np[_target_leaf_m],
-                    seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound
-                    + (_target_leaf_m - 7),
-                )
-                block_tables, slot_mappings = self.prepare_attn(fwd_batch)
+                if fast_tree is not None:
+                    input_batch, fwd_batch, block_tables, slot_mappings = fast_tree
+                else:
+                    from dataclasses import replace as _dc_replace
+
+                    input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+                    # Upgrade forward-only metadata to M=_target_leaf_m (8/12/16/32) while keeping
+                    # input_batch at M=7 (query_start_loc=[0, 7]) for postprocess_sampled & propose.
+                    _native_leaf.prepare_tree(
+                        self.input_buffers.positions,
+                        self.input_buffers.seq_lens,
+                        _target_leaf_m,
+                    )
+                    self.input_buffers.query_start_loc.copy_(
+                        self._qsl_const_gpu[_target_leaf_m], non_blocking=True
+                    )
+                    input_batch.query_start_loc = self._qsl_const_gpu[7][:2]
+                    fwd_batch = _dc_replace(
+                        input_batch,
+                        num_tokens=_target_leaf_m,
+                        num_scheduled_tokens=self._num_sched_tree_np[_target_leaf_m],
+                        query_start_loc=self.input_buffers.query_start_loc[:2],
+                        query_start_loc_np=self._qsl_tree_np[_target_leaf_m],
+                        seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound
+                        + (_target_leaf_m - 7),
+                    )
+                    block_tables, slot_mappings = self.prepare_attn(fwd_batch)
                 self._leaf_step = _native_leaf.setup_step(
                     input_batch.req_ids[0],
                     input_batch.input_ids,
@@ -2766,6 +3055,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             self._flush_deferred_zp_writes()
+            self._flush_deferred_zp_leaf_reset()
             # Non-last PP rank: hidden_states is None because this rank produced
             # IntermediateTensors instead of final hidden states. Receive the
             # sampled tokens broadcast from the last rank and update local state.
@@ -2920,6 +3210,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
         self._flush_deferred_zp_writes()
+        self._flush_deferred_zp_leaf_reset()
         self.postprocess_sampled(
             input_batch.idx_mapping,
             sampler_output.sampled_token_ids,
@@ -2960,7 +3251,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler.sampling_states.seeds.gpu,
                     mm_inputs=mm_inputs,
                 )
-                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+                if (
+                    input_batch.num_reqs == 1
+                    and draft_tokens.shape == (1, self.req_states.draft_tokens.shape[1])
+                ):
+                    _ridx = int(input_batch.idx_mapping_np[0])
+                    self.req_states.draft_tokens[_ridx : _ridx + 1].copy_(draft_tokens)
+                else:
+                    self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
@@ -2987,6 +3285,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @step_eplb_after()
     def pool(self) -> AsyncPoolingOutput | ModelRunnerOutput | None:
         self._flush_deferred_zp_writes()
+        self._flush_deferred_zp_leaf_reset()
         if self.execute_model_state is None:
             # The prior execute_model call must have failed.
             return None

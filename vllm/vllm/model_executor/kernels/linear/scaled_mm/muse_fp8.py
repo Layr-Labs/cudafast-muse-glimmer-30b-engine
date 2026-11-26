@@ -78,20 +78,17 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
             blob = _rans.rans_pack(w.t().contiguous().view(torch.uint8))
             if _self_check(lambda xq, out: _rans.rans_gemv_auto(blob, xq.view(-1), ws.reshape(-1), xs.reshape(-1), out, n, k), w, ws, xs):
                 if _RANS_M and _stats["rans"] == 0:
-                    for cm in (12, 16):
+                    for cm in (12, 16, 32):
                         gen_m = torch.Generator(device=w.device).manual_seed(n * 137 + k + 19 + cm)
                         xm = (torch.randn(cm, k, generator=gen_m, device=w.device) * 1.5 / xs.float().reshape(1, 1)).clamp(-448, 448).to(torch.float8_e4m3fn)
                         got_m = torch.empty(cm, n, dtype=torch.bfloat16, device=w.device)
-                        ref_lo = torch.empty(8, n, dtype=torch.bfloat16, device=w.device)
-                        ref_hi = torch.empty(cm - 8, n, dtype=torch.bfloat16, device=w.device)
                         _rans.rans_gemm_m_auto(blob, xm, ws.reshape(-1), xs.reshape(-1), got_m, n, k)
-                        _rans.rans_gemm_m_auto(blob, xm[:8].contiguous(), ws.reshape(-1), xs.reshape(-1), ref_lo, n, k)
-                        _rans.rans_gemm_m_auto(blob, xm[8:].contiguous(), ws.reshape(-1), xs.reshape(-1), ref_hi, n, k)
-                        if not (
-                            torch.equal(got_m[:8].view(torch.int16), ref_lo.view(torch.int16))
-                            and torch.equal(got_m[8:].view(torch.int16), ref_hi.view(torch.int16))
-                        ):
-                            raise RuntimeError(f"muserans kM16 self-check mismatch at M={cm}")
+                        for s0 in range(0, cm, 8):
+                            s1 = min(cm, s0 + 8)
+                            ref_sl = torch.empty(s1 - s0, n, dtype=torch.bfloat16, device=w.device)
+                            _rans.rans_gemm_m_auto(blob, xm[s0:s1].contiguous(), ws.reshape(-1), xs.reshape(-1), ref_sl, n, k)
+                            if not torch.equal(got_m[s0:s1].view(torch.int16), ref_sl.view(torch.int16)):
+                                raise RuntimeError(f"muserans kM16/32 self-check mismatch at M={cm}")
                 if (
                     _RANS_M
                     and os.environ.get("MUSE_RANS_PROLOGUE_M16", "0") != "0"
@@ -171,7 +168,7 @@ def _muse_fp8_scaled_mm(
             "attention gate GEMV on %d blocks",
             _stats["admitted"], _stats["rans"], tpf_note, _stats["rejected"], gate_blks,
         )
-    if A.shape[0] <= 16 and _decode_gemm_operand is not None:
+    if A.shape[0] <= 32 and _decode_gemm_operand is not None:
         A = _decode_gemm_operand(A)
     k, n = B.shape
     if A.shape[0] == 1 and packed.numel() > 0 and A.is_contiguous() and _scales_ok(As, Bs, n):
@@ -191,7 +188,7 @@ def _muse_fp8_scaled_mm(
             _rans.rans_gemv_auto(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
         return out
     if (
-        1 < A.shape[0] <= 16
+        1 < A.shape[0] <= 32
         and _RANS_M
         and packed.numel() > 0
         and packed.numel() != n * k

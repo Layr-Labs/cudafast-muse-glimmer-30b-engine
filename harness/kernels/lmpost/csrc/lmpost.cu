@@ -147,7 +147,7 @@ __global__ void __launch_bounds__(32) greedy_verify_kernel(
     int32_t* __restrict__ num_sampled_out,
     int32_t* __restrict__ num_rejected_out,
     int m) {
-  int64_t draft_toks[15];
+  int64_t draft_toks[31];
   if constexpr (kPdl) {
     if (threadIdx.x == 0) {
       for (int i = 0; i < m - 1; ++i) {
@@ -236,7 +236,7 @@ extern "C" int lmpost_greedy_verify(const void* target_argmax, const void* input
                                     const void* logits_indices, void* num_sampled_out,
                                     void* num_rejected_out, int m, void* stream) {
   using namespace lmpost;
-  if (m < 2 || m > 16 || target_argmax == nullptr || input_ids == nullptr ||
+  if (m < 2 || m > 32 || target_argmax == nullptr || input_ids == nullptr ||
       num_sampled_out == nullptr || num_rejected_out == nullptr) {
     return (int)cudaErrorInvalidValue;
   }

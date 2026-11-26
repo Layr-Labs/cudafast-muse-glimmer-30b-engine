@@ -1197,7 +1197,7 @@ class _GateSideStream:
 
     def __init__(self) -> None:
         self.max_tokens = int(
-            os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "16")
+            os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "32")
         )
         self.stream: torch.cuda.Stream | None = None
         self.fork_event: torch.cuda.Event | None = None
@@ -1252,7 +1252,7 @@ class _GateSideStream:
             if x.shape[0] == 1:
                 if getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
                     return
-            elif 2 <= x.shape[0] <= 16:
+            elif 2 <= x.shape[0] <= 32:
                 if layer_idx in _BF16_DUAL_RANS_M_LAYERS:
                     return
                 if getattr(bf16_gate, "muse_bf16_rans_m", None) is None:
@@ -1446,6 +1446,62 @@ def _muse_qk_norm_rope_impl(
                             q_first_row = _mfs.q_first_row_if_active(attn_layer)
                         except (ImportError, OSError, AttributeError):
                             q_first_row = 0
+                    pdl_prod = False
+                    if (
+                        muse_qk_glue.PDL_PROD_ENABLED
+                        and q_first_row == 0
+                        and getattr(attn_layer.impl, "_gqa16_decode_eligible", False)
+                        and (2 <= qkv.shape[0] <= 32 or qkv.shape[0] == 512)
+                    ):
+                        try:
+                            import muse_gqa16_attn as _mga
+
+                            attn_meta = fwd_ctx.attn_metadata
+                            layer_meta = (
+                                attn_meta.get(attn_layer.layer_name)
+                                if isinstance(attn_meta, dict)
+                                else attn_meta
+                            )
+                            if layer_meta is not None:
+                                dev_idx = (
+                                    qkv.device.index
+                                    if qkv.device.index is not None
+                                    else torch.cuda.current_device()
+                                )
+                                qsl = getattr(layer_meta, "query_start_loc", None)
+                                has_single_seq = (
+                                    qsl is not None
+                                    and qsl.shape[0] == 2
+                                    and getattr(layer_meta, "causal", False) is True
+                                    and getattr(layer_meta, "block_table", None) is not None
+                                )
+                                if has_single_seq and 2 <= qkv.shape[0] <= 32:
+                                    _mq_pdl_ok = qkv.shape[0] <= 16 or (
+                                        os.environ.get("MUSE_GQA16_MULTIQ_PDL", "0").strip()
+                                        not in ("0", "", "false", "no")
+                                    )
+                                    pdl_prod = (
+                                        _mq_pdl_ok
+                                        and _mga.VERIFY_ENABLED
+                                        and _mga.VERIFY_SPLITS == 1
+                                        and _mga._verify_state.get(dev_idx, (False, 0))[0]
+                                        and getattr(layer_meta, "num_actual_tokens", -1) == qkv.shape[0]
+                                        and getattr(layer_meta, "max_query_len", -1) == qkv.shape[0]
+                                        and getattr(layer_meta, "seq_lens", None) is not None
+                                    )
+                                elif has_single_seq and qkv.shape[0] == 512:
+                                    pdl_prod = (
+                                        _mga.PREFILL_ENABLED
+                                        and _mga.PREFILL_FUSE_ENABLED
+                                        and _mga.PREFILL_PDL_ENABLED
+                                        and _mga._prefill_state.get(dev_idx, (False, 0))[0]
+                                        and kv_cache.ndim == 4
+                                        and kv_cache.shape[2] in (16, 64)
+                                        and getattr(layer_meta, "max_query_len", -1) == 512
+                                        and getattr(layer_meta, "max_seq_len", -1) == 512
+                                    )
+                        except (ImportError, OSError, AttributeError):
+                            pdl_prod = False
                     q_out, k_out, wrote = muse_qk_glue.run_qk_norm_rope_kvcache_prefill(
                         qkv,
                         positions,
@@ -1456,6 +1512,7 @@ def _muse_qk_norm_rope_impl(
                         kv_cache,
                         layer_slot,
                         q_first_row=q_first_row,
+                        pdl_prod=pdl_prod,
                     )
                     if wrote:
                         attn_layer._qk_kv_cache_written_rows = int(qkv.shape[0])
@@ -1526,7 +1583,7 @@ def _muse_bf16_qkv_or_stacked_impl(
         out = torch.mm(x, w_cat.t())
         return out[:, :4608].contiguous(), out[:, 4608:].contiguous()
     if (
-        2 <= x.shape[0] <= 16
+        2 <= x.shape[0] <= 32
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16
@@ -1587,7 +1644,7 @@ def _muse_bf16_gate_fill_impl(
             if rc == 0:
                 return
     if (
-        2 <= x.shape[0] <= 16
+        2 <= x.shape[0] <= 32
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16
@@ -2493,7 +2550,7 @@ class MuseGlimmerForCausalLM(
         if not want_bf16_stack:
             return
         want_bf16_stack_decode = (
-            os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_DECODE", "1") != "0"
+            os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_DECODE", "0") != "0"
             and os.environ.get("MUSE_BF16_RANS_M", "1") != "0"
         )
         bf16_stack_cnt = 0
@@ -2589,7 +2646,7 @@ class MuseGlimmerForCausalLM(
                                                 ok_dual = False
                                                 break
                                     if ok_dual:
-                                        for cm in (12, 16):
+                                        for cm in (12, 16, 32):
                                             xm = (
                                                 torch.randn((cm, 6656), generator=g2, device=qw.device)
                                                 * 1.5
@@ -2597,29 +2654,23 @@ class MuseGlimmerForCausalLM(
                                             gq, gg = _bfx.rans_gemm_dual(
                                                 xm, blob_cat, 4608, 4096, 6656, bexp_cat
                                             )
-                                            rq0, rg0 = _bfx.rans_gemm_dual(
-                                                xm[:8].contiguous(),
-                                                blob_cat,
-                                                4608,
-                                                4096,
-                                                6656,
-                                                bexp_cat,
-                                            )
-                                            rq1, rg1 = _bfx.rans_gemm_dual(
-                                                xm[8:].contiguous(),
-                                                blob_cat,
-                                                4608,
-                                                4096,
-                                                6656,
-                                                bexp_cat,
-                                            )
-                                            if not (
-                                                torch.equal(gq[:8].view(torch.int16), rq0.view(torch.int16))
-                                                and torch.equal(gq[8:].view(torch.int16), rq1.view(torch.int16))
-                                                and torch.equal(gg[:8].view(torch.int16), rg0.view(torch.int16))
-                                                and torch.equal(gg[8:].view(torch.int16), rg1.view(torch.int16))
-                                            ):
-                                                ok_dual = False
+                                            for s0 in range(0, cm, 8):
+                                                s1 = min(cm, s0 + 8)
+                                                rq_sl, rg_sl = _bfx.rans_gemm_dual(
+                                                    xm[s0:s1].contiguous(),
+                                                    blob_cat,
+                                                    4608,
+                                                    4096,
+                                                    6656,
+                                                    bexp_cat,
+                                                )
+                                                if not (
+                                                    torch.equal(gq[s0:s1].view(torch.int16), rq_sl.view(torch.int16))
+                                                    and torch.equal(gg[s0:s1].view(torch.int16), rg_sl.view(torch.int16))
+                                                ):
+                                                    ok_dual = False
+                                                    break
+                                            if not ok_dual:
                                                 break
                                     if ok_dual:
                                         attn.register_buffer(

@@ -87,8 +87,8 @@ def _free_bf16_enabled() -> bool:
     return os.environ.get("MUSE_DRAFT_FREE_BF16", "1") != "0"
 
 
-def _parse_layer_selectors(env_name: str) -> tuple[str, ...]:
-    raw = os.environ.get(env_name, "").strip()
+def _parse_layer_selectors(env_name: str, default: str = "") -> tuple[str, ...]:
+    raw = os.environ.get(env_name, default).strip()
     if not raw or raw in ("0", "none", "off", "false"):
         return ()
     tokens: list[str] = []
@@ -1512,7 +1512,7 @@ def attach_drafter(model: torch.nn.Module) -> int:
     mode = _quant_mode()
     sens_fp8 = _parse_layer_selectors("MUSE_DRAFT_SENSITIVE_FP8")
     sens_nvfp4 = _parse_layer_selectors("MUSE_DRAFT_SENSITIVE_NVFP4")
-    sens_int4 = _parse_layer_selectors("MUSE_DRAFT_SENSITIVE_INT4")
+    sens_int4 = _parse_layer_selectors("MUSE_DRAFT_SENSITIVE_INT4", "gate_up_proj,down_proj")
     _layer_metrics.clear()
     n = 0
     if _int3_swiglu_enabled():
