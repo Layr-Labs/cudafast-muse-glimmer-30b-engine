@@ -7,7 +7,7 @@ Tensor-Core GEMM, 48-CTA persistent cp.async (L2::evict_first), 2 MiB TLB prefet
 and load-time DRAM placement across GB10 UMA banks.
 
 Fallback path (MUSE_BFX_RANS=0): original 12-bit coded BF16 + CSR escape kernel (bfx_linear).
-Rows > 8 always use dense F.linear unchanged.
+The rANS path supports up to 16 rows. The CUDA-core fallback supports up to eight rows.
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ except ImportError:  # kernels not built: dense path
 
 CH = 512
 MAX_M = 8
+MAX_RANS_M = 16
 _USE_RANS = os.environ.get("MUSE_BFX_RANS", "1") != "0"
 _PLACE_RANS = os.environ.get("MUSE_BFX_PLACE", "1") != "0"
 
@@ -99,10 +100,12 @@ def _encode_rans(w: torch.Tensor) -> tuple[torch.Tensor, int] | None:
     ):
         return None
     N, K = w.shape
-    if N % 8 != 0 or K % 32 != 0:
+    if N == 0 or K == 0 or N % 8 != 0 or K % 32 != 0:
         return None
     wc = w.contiguous()
     blob = _ext.rans_pack(wc)
+    if blob.numel() >= wc.numel() * wc.element_size():
+        return None
     unp = _ext.rans_unpack(blob, N, K)
     ok = torch.equal(unp.view(torch.int16), wc.view(torch.int16))
     del unp
@@ -134,7 +137,7 @@ def _(x, w, lo, nib, base, rowptr, ecol, ev):
 def bfx_rans_linear(x: torch.Tensor, w: torch.Tensor, blob: torch.Tensor, base_exp: int) -> torch.Tensor:
     shape = x.shape
     x2 = x.reshape(-1, shape[-1])
-    if 1 <= x2.size(0) <= MAX_M and x2.dtype == torch.bfloat16:
+    if 1 <= x2.size(0) <= MAX_RANS_M and x2.dtype == torch.bfloat16:
         out = _ext.rans_gemm(x2.contiguous(), blob, w.shape[0], w.shape[1], base_exp)
     else:
         out = F.linear(x2, w)
@@ -153,8 +156,11 @@ def _register(mod: torch.nn.Module, prefix: str, enc: dict) -> None:
 
 def attach_linear(layer: torch.nn.Module) -> bool:
     w = getattr(layer, "weight", None)
-    if w is None or getattr(layer, "bias", None) is not None or getattr(layer, "_bfx", False) \
-            or getattr(layer, "_mfp8", None) is not None:
+    if (
+        w is None
+        or getattr(layer, "bias", None) is not None
+        or getattr(layer, "_bfx", False)
+    ):
         return False
     rans = _encode_rans(w.data)
     if rans is not None:

@@ -247,19 +247,6 @@ class CudaGraphManager:
         else:
             decode_query_lens = [self.decode_query_len]
 
-        # Native multi-leaf tree (M=12/16) or M=8 zero-clamp verify: capture ONLY the
-        # single bs=1 FULL (num_tokens=target_m, num_reqs=1, uniform_token_count=target_m)
-        # graph alongside (7, 1, 7), without polluting decode_query_lens with multi-req graphs.
-        _target_leaf_m = 0
-        if self.decode_query_len == 7:
-            from vllm.v1.worker.gpu.spec_decode.dflash.native_leaf import (
-                desired_verify_m,
-            )
-
-            _target_leaf_m = desired_verify_m()
-            if _target_leaf_m <= 7:
-                _target_leaf_m = 0
-
         for num_tokens, num_active_loras in product(
             capture_sizes, self.lora_capture_cases
         ):
@@ -313,48 +300,10 @@ class CudaGraphManager:
         if (
             separate_decode_routine
             and decode_mode == CUDAGraphMode.FULL
-            and _target_leaf_m > 7
-        ):
-            for num_active_loras in self.lora_capture_cases:
-                leaf_desc = BatchExecutionDescriptor(
-                    cg_mode=CUDAGraphMode.FULL,
-                    num_tokens=_target_leaf_m,
-                    num_reqs=1,
-                    uniform_token_count=_target_leaf_m,
-                    num_active_loras=num_active_loras,
-                )
-                if leaf_desc not in descs_by_mode[CUDAGraphMode.FULL]:
-                    descs_by_mode[CUDAGraphMode.FULL].append(leaf_desc)
-                    descs_by_token_lora[(_target_leaf_m, num_active_loras)].insert(
-                        0, leaf_desc
-                    )
-                if mixed_mode and not any(
-                    d.cg_mode == mixed_mode
-                    for d in descs_by_token_lora[(_target_leaf_m, num_active_loras)]
-                ):
-                    pw_num_reqs = (
-                        min(_target_leaf_m, self.max_num_reqs)
-                        if mixed_mode == CUDAGraphMode.FULL
-                        else None
-                    )
-                    pw_desc = BatchExecutionDescriptor(
-                        cg_mode=mixed_mode,
-                        num_tokens=_target_leaf_m,
-                        num_reqs=pw_num_reqs,
-                        num_active_loras=num_active_loras,
-                    )
-                    descs_by_mode[mixed_mode].append(pw_desc)
-                    descs_by_token_lora[(_target_leaf_m, num_active_loras)].append(
-                        pw_desc
-                    )
-
-        if (
-            separate_decode_routine
-            and decode_mode == CUDAGraphMode.FULL
             and self.decode_query_len > 1
             and os.environ.get("VLLM_MUSE_CLAMPED_FULL_CG", "1") != "0"
         ):
-            # Capture bs=1 FULL CUDA graphs for ceiling-clamped speculative verify widths
+            # Capture bs=1 FULL CUDA graphs for shortened speculative verify widths
             # (2 .. decode_query_len-1). Kept OUT of self._candidates and stored in
             # self._clamped_full_descs so normal dispatch() can NEVER hijack short prefills,
             # chunked prefill tails, dummy runs, or M=1; model_runner routes strictly

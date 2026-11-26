@@ -383,15 +383,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         # request's query length to include any rejected positions.
         def _build_ctx_hidden() -> torch.Tensor:
             if aux_hidden_states:
-                if (
-                    len(aux_hidden_states) == 5
-                    and hasattr(self.model, "combine_hidden_states_aux5")
-                ):
-                    out = self.model.combine_hidden_states_aux5(
-                        aux_hidden_states, num_target_tokens
-                    )
-                    if out is not None:
-                        return out if out.is_contiguous() else out.contiguous()
                 if aux_hidden_states[0].shape[0] > num_target_tokens:
                     aux_cat = torch.cat(
                         [h[:num_target_tokens] for h in aux_hidden_states], dim=-1
@@ -474,19 +465,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
         ctx_pos_slice = self.context_positions[:num_target_tokens]
-        if (
-            not dummy_run
-            and not is_profile
-            and num_reqs == 1
-            and hasattr(self.model, "update_draft_prompt_tail")
-        ):
-            self.model.update_draft_prompt_tail(
-                input_batch.input_ids[:num_target_tokens],
-                ctx_pos_slice,
-                num_rejected=num_rejected,
-                extra_ids=self.input_buffers.input_ids[:1],
-            )
-
         ran_ctx_graph = False
         if (
             os.environ.get("VLLM_DFLASH_CTX_KV_GRAPH", "1") != "0"
