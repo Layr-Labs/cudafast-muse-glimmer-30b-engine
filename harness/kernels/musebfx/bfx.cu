@@ -112,6 +112,8 @@ torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true);
 torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K);
 torch::Tensor int4_pack(torch::Tensor W, bool mse_opt = true);
 torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+torch::Tensor int4_pack_swiglu(torch::Tensor W, bool mse_opt = true);
+torch::Tensor int4_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K);
 torch::Tensor int4_gemm_aux5(
     torch::Tensor h0, torch::Tensor h1, torch::Tensor h2, torch::Tensor h3, torch::Tensor h4,
     torch::Tensor W_packed, int64_t N, int64_t K);
@@ -125,7 +127,33 @@ void dflash_kv_post(
 std::tuple<torch::Tensor, torch::Tensor> dflash_qkv_norm_rope(
     torch::Tensor qkv, torch::Tensor positions, torch::Tensor q_norm_w,
     torch::Tensor k_norm_w, torch::Tensor cos_sin_cache,
-    int64_t nq, int64_t nkv, double eps, bool is_neox);
+    int64_t nq, int64_t nkv, double eps, bool is_neox,
+    c10::optional<torch::Tensor> slot_mapping = c10::nullopt,
+    c10::optional<torch::Tensor> k_cache = c10::nullopt,
+    c10::optional<torch::Tensor> v_cache = c10::nullopt,
+    int64_t block_size = 16);
+void dflash_prepare_inputs(
+    torch::Tensor out_input_ids, torch::Tensor out_query_positions,
+    torch::Tensor out_query_start_loc, torch::Tensor out_seq_lens,
+    torch::Tensor out_query_slot_mapping, torch::Tensor out_context_positions,
+    torch::Tensor out_context_slot_mapping, torch::Tensor out_sample_indices,
+    torch::Tensor out_sample_pos, torch::Tensor out_sample_idx_mapping,
+    torch::Tensor out_temperature, torch::Tensor out_seeds,
+    torch::Tensor target_positions, torch::Tensor target_query_start_loc,
+    torch::Tensor idx_mapping, torch::Tensor last_sampled,
+    torch::Tensor next_prefill_tokens, torch::Tensor num_sampled,
+    torch::Tensor num_rejected, torch::Tensor in_temperature,
+    torch::Tensor in_seeds, torch::Tensor block_table,
+    int64_t block_table_stride, int64_t parallel_drafting_token_id,
+    int64_t block_size, int64_t num_query_per_req,
+    int64_t num_speculative_steps, int64_t max_num_reqs,
+    int64_t max_num_tokens, int64_t max_model_len, int64_t pad_slot_id,
+    c10::optional<torch::Tensor> target_input_ids = c10::nullopt,
+    int64_t tail_num_tokens = 0,
+    c10::optional<torch::Tensor> in_static_vocab = c10::nullopt,
+    c10::optional<torch::Tensor> tail_ids = c10::nullopt,
+    c10::optional<torch::Tensor> tail_count = c10::nullopt,
+    c10::optional<torch::Tensor> tail_seen = c10::nullopt);
 void draft_vocab_update_tail(
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor in_static_vocab,
     torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor tail_seen,
@@ -211,9 +239,42 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int3_gemm_swiglu", &int3_gemm_swiglu);
   m.def("int4_pack", &int4_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
   m.def("int4_gemm", &int4_gemm);
+  m.def("int4_pack_swiglu", &int4_pack_swiglu, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
+  m.def("int4_gemm_swiglu", &int4_gemm_swiglu);
   m.def("int4_gemm_aux5", &int4_gemm_aux5);
   m.def("dflash_kv_post", &dflash_kv_post);
-  m.def("dflash_qkv_norm_rope", &dflash_qkv_norm_rope);
+  m.def("dflash_qkv_norm_rope", &dflash_qkv_norm_rope,
+        pybind11::arg("qkv"), pybind11::arg("positions"),
+        pybind11::arg("q_norm_w"), pybind11::arg("k_norm_w"),
+        pybind11::arg("cos_sin_cache"), pybind11::arg("nq"),
+        pybind11::arg("nkv"), pybind11::arg("eps"), pybind11::arg("is_neox"),
+        pybind11::arg("slot_mapping") = c10::nullopt,
+        pybind11::arg("k_cache") = c10::nullopt,
+        pybind11::arg("v_cache") = c10::nullopt,
+        pybind11::arg("block_size") = 16);
+  m.def("dflash_prepare_inputs", &dflash_prepare_inputs,
+        pybind11::arg("out_input_ids"), pybind11::arg("out_query_positions"),
+        pybind11::arg("out_query_start_loc"), pybind11::arg("out_seq_lens"),
+        pybind11::arg("out_query_slot_mapping"), pybind11::arg("out_context_positions"),
+        pybind11::arg("out_context_slot_mapping"), pybind11::arg("out_sample_indices"),
+        pybind11::arg("out_sample_pos"), pybind11::arg("out_sample_idx_mapping"),
+        pybind11::arg("out_temperature"), pybind11::arg("out_seeds"),
+        pybind11::arg("target_positions"), pybind11::arg("target_query_start_loc"),
+        pybind11::arg("idx_mapping"), pybind11::arg("last_sampled"),
+        pybind11::arg("next_prefill_tokens"), pybind11::arg("num_sampled"),
+        pybind11::arg("num_rejected"), pybind11::arg("in_temperature"),
+        pybind11::arg("in_seeds"), pybind11::arg("block_table"),
+        pybind11::arg("block_table_stride"), pybind11::arg("parallel_drafting_token_id"),
+        pybind11::arg("block_size"), pybind11::arg("num_query_per_req"),
+        pybind11::arg("num_speculative_steps"), pybind11::arg("max_num_reqs"),
+        pybind11::arg("max_num_tokens"), pybind11::arg("max_model_len"),
+        pybind11::arg("pad_slot_id"),
+        pybind11::arg("target_input_ids") = c10::nullopt,
+        pybind11::arg("tail_num_tokens") = 0,
+        pybind11::arg("in_static_vocab") = c10::nullopt,
+        pybind11::arg("tail_ids") = c10::nullopt,
+        pybind11::arg("tail_count") = c10::nullopt,
+        pybind11::arg("tail_seen") = c10::nullopt);
   m.def("draft_vocab_update_tail", &draft_vocab_update_tail,
         pybind11::arg("input_ids"), pybind11::arg("positions"), pybind11::arg("in_static_vocab"),
         pybind11::arg("tail_ids"), pybind11::arg("tail_count"), pybind11::arg("tail_seen"),

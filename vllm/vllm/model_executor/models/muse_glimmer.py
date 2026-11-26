@@ -2493,7 +2493,7 @@ class MuseGlimmerForCausalLM(
         if not want_bf16_stack:
             return
         want_bf16_stack_decode = (
-            os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_DECODE", "1") != "0"
+            os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_DECODE", "0") != "0"
             and os.environ.get("MUSE_BF16_RANS_M", "1") != "0"
         )
         bf16_stack_cnt = 0

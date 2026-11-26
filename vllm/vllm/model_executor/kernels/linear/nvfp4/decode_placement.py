@@ -952,9 +952,24 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
             torch.cuda.empty_cache()
 
 
+def _run_post_decode_registrations(model: torch.nn.Module) -> None:
+    try:
+        import muse_marlin6_gemv as _m6
+        if hasattr(_m6, "register_all_gate_up_swiglu"):
+            _m6.register_all_gate_up_swiglu(model)
+        if hasattr(_m6, "register_all_oproj_sigmoid"):
+            _m6.register_all_oproj_sigmoid(model)
+    except Exception as err:  # noqa: BLE001
+        import traceback
+        logger.warning("Decode6 post-placement registration skipped: %s\n%s", err, traceback.format_exc())
+
+
 def place_decode_weights(model: torch.nn.Module) -> None:
     """Move decode weights that landed on slow device memory; never raises."""
-    if not ENABLED or not torch.cuda.is_available():
+    if not torch.cuda.is_available():
+        return
+    if not ENABLED:
+        _run_post_decode_registrations(model)
         return
     try:
         from muse_marlin_gemv import decode_linear
@@ -1442,15 +1457,7 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             "Decode weight placement: %d groups, timed GEMV sum reduced by %.3f ms per token, %.2f s",
             n_groups, saved_ms, time.perf_counter() - began,
         )
-        try:
-            import muse_marlin6_gemv as _m6
-            if hasattr(_m6, "register_all_gate_up_swiglu"):
-                _m6.register_all_gate_up_swiglu(model)
-            if hasattr(_m6, "register_all_oproj_sigmoid"):
-                _m6.register_all_oproj_sigmoid(model)
-        except Exception as err:  # noqa: BLE001
-            import traceback
-            logger.warning("Decode6 post-placement registration skipped: %s\n%s", err, traceback.format_exc())
+        _run_post_decode_registrations(model)
         _post_reg_done = True
     except Exception as err:  # noqa: BLE001 - the load must go on
         logger.warning("Decode weight placement failed and was skipped: %s", err)
@@ -1460,12 +1467,4 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             _SLOW_HOLD.clear()
             torch.cuda.empty_cache()
     if not _post_reg_done:
-        try:
-            import muse_marlin6_gemv as _m6
-            if hasattr(_m6, "register_all_gate_up_swiglu"):
-                _m6.register_all_gate_up_swiglu(model)
-            if hasattr(_m6, "register_all_oproj_sigmoid"):
-                _m6.register_all_oproj_sigmoid(model)
-        except Exception as err:  # noqa: BLE001
-            import traceback
-            logger.warning("Decode6 post-placement registration skipped: %s\n%s", err, traceback.format_exc())
+        _run_post_decode_registrations(model)

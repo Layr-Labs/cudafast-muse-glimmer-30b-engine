@@ -2502,15 +2502,44 @@ __global__ void Marlin(
 
     if (!first) {
       float* frag_c_ptr = reinterpret_cast<float*>(&frag_c);
+      if constexpr (!m_block_size_8 && fixed_shape != 3) {
+        float4 rd[th_size];
   #pragma unroll
-      for (int k = 0; k < th_size; k += (m_block_size_8 ? 2 : 1)) {
-        sh_red[threadIdx.x] =
-            C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
+        for (int k = 0; k < th_size; k++) {
+          rd[k] = reinterpret_cast<const float4*>(C_tmp)[c_cur_offset + active_threads * k + threadIdx.x];
+        }
+  #pragma unroll
+        for (int k = 0; k < th_size; k++) {
+          frag_c_ptr[k * 4 + 0] += rd[k].x;
+          frag_c_ptr[k * 4 + 1] += rd[k].y;
+          frag_c_ptr[k * 4 + 2] += rd[k].z;
+          frag_c_ptr[k * 4 + 3] += rd[k].w;
+        }
+      } else if constexpr (m_block_size_8 && fixed_shape != 3) {
+        constexpr int kh_size = th_size / 2;
+        float4 rd[kh_size];
+  #pragma unroll
+        for (int kh = 0; kh < kh_size; kh++) {
+          rd[kh] = reinterpret_cast<const float4*>(C_tmp)[c_cur_offset + active_threads * (2 * kh) + threadIdx.x];
+        }
+  #pragma unroll
+        for (int kh = 0; kh < kh_size; kh++) {
+          frag_c_ptr[kh * 8 + 0] += rd[kh].x;
+          frag_c_ptr[kh * 8 + 1] += rd[kh].y;
+          frag_c_ptr[kh * 8 + 2] += rd[kh].z;
+          frag_c_ptr[kh * 8 + 3] += rd[kh].w;
+        }
+      } else {
+  #pragma unroll
+        for (int k = 0; k < th_size; k += (m_block_size_8 ? 2 : 1)) {
+          sh_red[threadIdx.x] =
+              C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
 
-        float* sh_c_ptr = reinterpret_cast<float*>(&sh_red[threadIdx.x]);
+          float* sh_c_ptr = reinterpret_cast<float*>(&sh_red[threadIdx.x]);
   #pragma unroll
-        for (int f = 0; f < 4; f++) {
-          frag_c_ptr[k * 4 + f] += sh_c_ptr[f];
+          for (int f = 0; f < 4; f++) {
+            frag_c_ptr[k * 4 + f] += sh_c_ptr[f];
+          }
         }
       }
     }

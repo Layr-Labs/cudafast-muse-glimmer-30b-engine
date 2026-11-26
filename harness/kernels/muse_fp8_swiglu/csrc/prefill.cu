@@ -478,7 +478,7 @@ static bool ws_pdl_enabled() {
   if (g_ws_pdl_override >= 0) return g_ws_pdl_override != 0;
   static const bool env_on = []() {
     const char* env = std::getenv("MUSE_FP8_SWIGLU_PDL");
-    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+    return env && *env && std::strtol(env, nullptr, 10) != 0;
   }();
   return env_on;
 }
