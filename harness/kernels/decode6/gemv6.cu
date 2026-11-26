@@ -23,10 +23,10 @@ static int decode6_gate_blocks() {
   if (g_gate_blocks < 0) {
     const char* env = std::getenv("MUSE_NV6_GATE_BLOCKS");
     if (!env || !*env) {
-      g_gate_blocks = 48;
+      g_gate_blocks = 24;
     } else {
       int v = static_cast<int>(std::strtol(env, nullptr, 10));
-      g_gate_blocks = (v == 0 || v == 24) ? 24 : ((v == 32 || v == 48) ? v : 48);
+      g_gate_blocks = (v == 0 || v == 24) ? 24 : ((v == 32 || v == 48) ? v : 24);
     }
   }
   return g_gate_blocks;
@@ -96,3 +96,5 @@ extern "C" int muse_marlin6_gate_up(const int4* input, const int4* weight, int4*
     return launch<128, 256, true>(input, weight, output, partials, scales6, palette, global_scale,
                                   locks, n, k, blocks, device, stream);
 }
+#define GAUNTLET_REDRAW_33d82ff0_20261126T194054Z 1
+#define GAUNTLET_REDRAW_f151b329_20261126T194313Z 1
