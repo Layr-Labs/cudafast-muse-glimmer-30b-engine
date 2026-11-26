@@ -1008,20 +1008,45 @@ static RansCfg rans_pick_cfg(int N, int K) {
 
 static void rans_normalize(const int64_t* counts, int32_t* f) {
   int64_t total = 0;
-  for (int i = 0; i < 256; i++) total += counts[i];
-  TORCH_CHECK(total > 0);
+  int active = 0;
+  for (int i = 0; i < 256; i++) {
+    total += counts[i];
+    if (counts[i] > 0) ++active;
+  }
+  TORCH_CHECK(total > 0 && active <= 4096);
   int sum = 0;
   for (int i = 0; i < 256; i++) {
-    if (counts[i] > 0) { long v = std::lround((double)counts[i] * 4096.0 / (double)total); f[i] = (int)std::max(1L, v); } else f[i] = 0;
+    if (counts[i] > 0) {
+      long v = std::floor((double)counts[i] * 4096.0 / (double)total);
+      f[i] = (int)std::max(1L, v);
+    } else {
+      f[i] = 0;
+    }
     sum += f[i];
   }
-  int diff = 4096 - sum;
-  while (diff != 0) {
-    int k = 0;
-    for (int i = 1; i < 256; i++) if (f[i] > f[k]) k = i;
-    int step = diff > 0 ? diff : std::max(diff, -(f[k] - 1));
-    TORCH_CHECK(step != 0, "cannot normalize frequencies");
-    f[k] += step; diff -= step;
+  while (sum < 4096) {
+    int best = -1;
+    double best_gain = -1.0;
+    for (int i = 0; i < 256; i++) {
+      if (f[i] <= 0) continue;
+      double gain = (double)counts[i] * std::log(((double)f[i] + 1.0) / (double)f[i]);
+      if (gain > best_gain) { best_gain = gain; best = i; }
+    }
+    TORCH_CHECK(best >= 0, "cannot normalize frequencies (+)");
+    f[best]++;
+    sum++;
+  }
+  while (sum > 4096) {
+    int best = -1;
+    double best_loss = 1e300;
+    for (int i = 0; i < 256; i++) {
+      if (f[i] <= 1) continue;
+      double loss = (double)counts[i] * std::log((double)f[i] / ((double)f[i] - 1.0));
+      if (loss < best_loss) { best_loss = loss; best = i; }
+    }
+    TORCH_CHECK(best >= 0, "cannot normalize frequencies (-)");
+    f[best]--;
+    sum--;
   }
 }
 
@@ -1068,10 +1093,44 @@ torch::Tensor rans_pack_cfg(torch::Tensor W, int64_t tw, int64_t ns, int64_t ilv
   for (int w = 0; w <= tw; w++) tab_i[w] = woff16[w];
   if (ilv > 0) {
     std::vector<int64_t> G(tw);
-    for (int w = 0; w < tw; w++) G[w] = ((int64_t)(woff16[w + 1] - woff16[w]) * 16 + ((int64_t)1 << ilv) - 1) >> ilv;
-    gmin = (int32_t)(*std::min_element(G.begin(), G.end()));
+    int64_t sum_g = 0;
+    for (int w = 0; w < tw; w++) {
+      G[w] = ((int64_t)(woff16[w + 1] - woff16[w]) * 16 + ((int64_t)1 << ilv) - 1) >> ilv;
+      sum_g += G[w];
+    }
+    std::vector<int64_t> Gs = G;
+    std::sort(Gs.begin(), Gs.end());
+    int64_t gmin64 = Gs[0];
+    // Raise interleaved floor gmin from strict min(G) to the ilv_pct-th percentile (capped at <=2% blob
+    // padding; warps with G[w] < gmin skip unused slots via `boff < wbytes`, so ZERO extra DRAM reads!)
+    // so outlier low-entropy warps never scatter the bulk of warps into non-contiguous tail_w fetches.
+    static const int ilv_pct = []() -> int {
+      const char* env = std::getenv("MUSERANS_ILV_PCT");
+      if (!env || !*env) return 12;
+      long v = std::strtol(env, nullptr, 10);
+      return (v >= 0 && v <= 50) ? static_cast<int>(v) : 12;
+    }();
+    if (ilv_pct > 0 && tw >= 16) {
+      int idx = (int)((int64_t)tw * ilv_pct / 100);
+      if (idx >= tw) idx = (int)tw - 1;
+      const int64_t max_pad = sum_g / 50;  // <= 2% virtual padding cap
+      while (idx > 0) {
+        const int64_t cand = Gs[idx];
+        int64_t pad = 0;
+        for (int j = 0; j < idx; j++) pad += (cand - Gs[j]);
+        if (pad <= max_pad) {
+          gmin64 = cand;
+          break;
+        }
+        idx--;
+      }
+    }
+    gmin = (int32_t)gmin64;
     int64_t t = (int64_t)gmin * tw;
-    for (int w = 0; w < tw; w++) { tab_i[tw + 1 + w] = (int32_t)t; t += G[w] - gmin; }
+    for (int w = 0; w < tw; w++) {
+      tab_i[tw + 1 + w] = (int32_t)t;
+      if (G[w] > gmin) t += G[w] - gmin;
+    }
     stream_bytes = (size_t)t << ilv;
   }
   const size_t soff = rans_stream_off((int)tw);
@@ -1265,7 +1324,7 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
     const char* env = std::getenv("MUSERANS_SMEM_LOCK48");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
-  if (M == 1 && lock48 && blocks == 48 && dsmem < 40960) dsmem = 40960;
+  if (lock48 && blocks == 48 && dsmem < 40960) dsmem = 40960;
   rans_set_attrs_once();
   static const bool xsmem_en = []() {
     const char* env = std::getenv("MUSERANS_XSMEM");

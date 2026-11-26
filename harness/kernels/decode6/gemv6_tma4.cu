@@ -16,7 +16,7 @@ namespace {
 static size_t decode6_tpf_stride() {
   static size_t stride = []() -> size_t {
     const char* env = std::getenv("MUSE_DECODE6_TLB_PREFETCH");
-    if (!env || !*env) return 0u;
+    if (!env || !*env) return 2048u << 10;  // 2 MiB default (matches muse_rans.cu; replaces 85x side-stream l2pf)
     long kb = std::strtol(env, nullptr, 10);
     return kb > 0 ? (static_cast<size_t>(kb) << 10) : 0u;
   }();
@@ -617,7 +617,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_swiglu_m(
     int* locks, int m, int n, int k, int blocks, int device, cudaStream_t stream) {
   if (m < 1 || m > 16 || n != 39936 || k != 6656 || blocks != 48)
     return cudaErrorInvalidValue;
-  static const int gu_st = decode6_tma4_stages("MUSE_TMA4_SWIGLU_M_STAGES", 3);  // S3 NVFP4TUNE: 3-stage multi-M gate_up
+  static const int gu_st = decode6_tma4_stages("MUSE_TMA4_SWIGLU_M_STAGES", 4);  // 4-stage multi-M gate_up (74 KiB <= 100 KiB SMEM, 1 CTA/SM)
   if (gu_st == 3)
     return launch_tma4_m<128, 256, false, true, false, true, false, false, 3, false, 0, false, true, false, true>(
         input, weight, output, partials, coded, palette, global_scale, locks,
@@ -656,7 +656,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_swiglu_fp8_m(
   if (m < 1 || m > 16 || n != 39936 || k != 6656 || blocks != 48 ||
       fp8_scale == nullptr || fp8_out == nullptr)
     return cudaErrorInvalidValue;
-  static const int gu_st = decode6_tma4_stages("MUSE_TMA4_SWIGLU_M_STAGES", 3);
+  static const int gu_st = decode6_tma4_stages("MUSE_TMA4_SWIGLU_M_STAGES", 4);
   if (gu_st == 3)
     return launch_tma4_m<128, 256, false, true, false, true, false, false, 3, false, 0, true, true, false, true>(
         input, weight, scratch_out, partials, coded, palette, global_scale, locks,
@@ -880,12 +880,26 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
           input, weight, output, partials, coded, palette, global_scale, locks, n, k, 24, device, stream,
           nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
     }
+    static const int g48_st = decode6_tma4_stages("MUSE_TMA4_M_STAGES", 3);
+    if (g48_st == 4) {
+      return launch_tma4_m<128, 256, false, true, false, false, false, false, 4, false, 0, false, true, false, true>(
+          input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
+          nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
+    }
     return launch_tma4_m<128, 256, false, true, false, false, false, false, 3, false, 0, false, true, false, true>(
         input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
         nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
   }
   if (n == 6656 && k == 19968) {
-    static const int dn_st = decode6_tma4_stages("MUSE_TMA4_DOWN_M_STAGES", 3);
+    static const int dn_env = []() -> int {
+      const char* env = std::getenv("MUSE_TMA4_DOWN_M_STAGES");
+      if (env && *env) {
+        long v = std::strtol(env, nullptr, 10);
+        if (v == 3 || v == 4) return static_cast<int>(v);
+      }
+      return 0;
+    }();
+    const int dn_st = (dn_env != 0) ? dn_env : ((m > 8) ? 4 : 3);
     if (dn_st == 4) {
       return launch_tma4_m<128, 256, false, true, false, false, false, false, 4, false, 1, false, true, false, true>(
           input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
@@ -896,6 +910,12 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
         nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
   }
   if (k == 6656 && n >= 16384 && n % 128 == 0) {
+    static const int dh_st = decode6_tma4_stages("MUSE_TMA4_DRAFT_HEAD_STAGES", 4);
+    if (dh_st == 4) {
+      return launch_tma4_m<128, 256, false, true, false, false, false, false, 4, false, 0, false, true, false, true>(
+          input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
+          nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
+    }
     return launch_tma4_m<128, 256, false, true, false, false, false, false, 3, false, 0, false, true, false, true>(
         input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
         nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);

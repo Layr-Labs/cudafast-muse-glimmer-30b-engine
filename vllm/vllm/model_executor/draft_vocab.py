@@ -6,7 +6,13 @@ Derived deterministically once at resident boot strictly from the pinned checkpo
 `tokenizer.json` and `config.json` (zero external weights, zero Python-only corpus bias,
 < 0.05 s startup).
 
-Modes (`MUSE_DRAFT_VOCAB_MODE`, default `ascii_bpe`):
+Modes (`MUSE_DRAFT_VOCAB_MODE`, default `ascii_lm`):
+  - `ascii_lm`: forced special tokens -> all 256 raw byte tokens -> top 50,000 pure-ASCII
+    BPE tokens preserved verbatim in exact merge-rank order -> remaining pure-ASCII BPE
+    tokens re-ranked by exact BPE merge rank plus a self-bootstrapped character 3/4-gram
+    log-likelihood trained strictly on the tokenizer's own top-12,000 pure-ASCII BPE
+    tokens (demotes rare foreign Latin-script tail entries in favor of productive English
+    and code tokens at zero extra DRAM bytes) -> remaining non-ASCII BPE tokens.
   - `ascii_bpe`: forced special tokens -> all 256 raw byte tokens -> all pure-ASCII
     BPE tokens (covering Python, Rust, Go, SQL, C/C++, TS/JS, Shell, YAML, JSON, Markdown,
     and English prose proportionally to pretraining frequency) ordered by exact BPE merge
@@ -22,6 +28,8 @@ error at ~15 us overhead.
 from __future__ import annotations
 
 import json
+import math
+from collections import Counter
 from pathlib import Path
 
 from vllm.logger import init_logger
@@ -95,8 +103,116 @@ def _is_single_byte_token(tok_str: str, b2u_inv: dict[str, int]) -> bool:
     return len(tok_str) == 1 and (tok_str in b2u_inv or ord(tok_str) < 256)
 
 
+def _decode_ascii_alpha(tok_str: str, b2u_inv: dict[str, int]) -> str:
+    """Extract lowercase ASCII alphabetic characters from a pure-ASCII BPE token."""
+    chars: list[str] = []
+    for ch in tok_str:
+        b = b2u_inv.get(ch)
+        if b is None:
+            b = ord(ch)
+        if 65 <= b <= 90:
+            chars.append(chr(b + 32))
+        elif 97 <= b <= 122:
+            chars.append(chr(b))
+    return "".join(chars)
+
+
+def _rerank_ascii_tier_self_lm(
+    tier1: list[tuple[int, int]],
+    id_to_str: dict[int, str],
+    b2u_inv: dict[str, int],
+    *,
+    keep_top: int = 50000,
+    lm_top_n: int = 12000,
+    lm_weight: float = 150000.0,
+    lm_center: float = 2.6,
+    min_alpha_len: int = 3,
+) -> list[tuple[int, int]]:
+    """Re-rank pure-ASCII BPE tail tokens using a self-bootstrapped char 3/4-gram LM.
+
+    Trained strictly from the tokenizer's own top-`lm_top_n` pure-ASCII BPE tokens
+    (weighted by inverse log-rank). Preserves the top `keep_top` pure-ASCII tokens
+    verbatim in merge-rank order, and adjusts only the lower tail (`tier1[keep_top:]`)
+    so productive English/code tokens outrank rare foreign Latin-script tail entries.
+    """
+    if len(tier1) <= keep_top or lm_top_n <= 0:
+        return tier1
+
+    alphas = [_decode_ascii_alpha(id_to_str.get(tid, ""), b2u_inv) for _, tid in tier1]
+
+    c3: Counter[str] = Counter()
+    c2: Counter[str] = Counter()
+    c4: Counter[str] = Counter()
+    c3_ctx: Counter[str] = Counter()
+    fit_n = min(lm_top_n, len(tier1))
+    for idx in range(fit_n):
+        alpha = alphas[idx]
+        if len(alpha) < 2:
+            continue
+        w = 1.0 / math.log2(idx + 4.0)
+        pad = f"^{alpha}$"
+        n_pad = len(pad)
+        for i in range(n_pad - 2):
+            c3[pad[i : i + 3]] += w
+            c2[pad[i : i + 2]] += w
+        if n_pad >= 4:
+            for i in range(n_pad - 3):
+                c4[pad[i : i + 4]] += w
+                c3_ctx[pad[i : i + 3]] += w
+
+    if not c3 or not c4:
+        return tier1
+
+    vocab_alpha = 28.0
+    smooth = 0.05
+    log_smooth = math.log(smooth)
+    default_denom = math.log(smooth * vocab_alpha)
+    c2_denom = {k: math.log(v + smooth * vocab_alpha) for k, v in c2.items()}
+    c3_denom = {k: math.log(v + smooth * vocab_alpha) for k, v in c3_ctx.items()}
+    log_c3 = {k: math.log(v + smooth) - c2_denom[k[:2]] for k, v in c3.items()}
+    log_c4 = {k: math.log(v + smooth) - c3_denom[k[:3]] for k, v in c4.items()}
+
+    tail_scored: list[tuple[float, int, int]] = []
+    for idx in range(keep_top, len(tier1)):
+        rank, tid = tier1[idx]
+        alpha = alphas[idx]
+        if len(alpha) < min_alpha_len:
+            eff = float(rank)
+        else:
+            pad = f"^{alpha}$"
+            m3 = len(pad) - 2
+            s3 = 0.0
+            for i in range(m3):
+                tri = pad[i : i + 3]
+                lp = log_c3.get(tri)
+                if lp is not None:
+                    s3 += lp
+                else:
+                    s3 += log_smooth - c2_denom.get(tri[:2], default_denom)
+            s3 /= m3
+
+            m4 = len(pad) - 3
+            s4 = 0.0
+            for i in range(m4):
+                quad = pad[i : i + 4]
+                lp = log_c4.get(quad)
+                if lp is not None:
+                    s4 += lp
+                else:
+                    s4 += log_smooth - c3_denom.get(quad[:3], default_denom)
+            s4 /= m4
+
+            sc = 0.5 * (s3 + s4)
+            eff = rank - lm_weight * (sc + lm_center)
+        tail_scored.append((eff, rank, tid))
+
+    tail_scored.sort(key=lambda item: (item[0], item[1], item[2]))
+    head = tier1[:keep_top]
+    return head + [(rank, tid) for _, rank, tid in tail_scored]
+
+
 def configure_draft_vocab(
-    model_dir: str, size: int, mode: str = "ascii_bpe"
+    model_dir: str, size: int, mode: str = "ascii_lm"
 ) -> None:
     """Install a deterministic BPE merge-rank vocabulary subset before target weight load."""
     global _TOKEN_IDS, _VOCAB_SIZE
@@ -180,6 +296,8 @@ def configure_draft_vocab(
 
     tier0.sort()
     tier1.sort()
+    if mode_norm == "ascii_lm":
+        tier1 = _rerank_ascii_tier_self_lm(tier1, id_to_str, b2u_inv)
     tier2.sort()
     tier3.sort()
 

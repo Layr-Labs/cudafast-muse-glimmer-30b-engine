@@ -118,6 +118,7 @@ SKIP_SWIGLU_ACT = os.environ.get("L2PF_SKIP_SWIGLU_ACT", "0") != "0"
 # (<32 MiB) attention sites while keeping all 260 sites tracked so norm pre-warm and
 # lm_head tail TLB pre-warm stay active (~246 -> ~85-86 launches). Set L2PF_TRIM_M7=0 to A/B.
 TRIM_M7 = os.environ.get("L2PF_TRIM_M7", "1") != "0"
+TRIM_M7_MARLIN = os.environ.get("L2PF_TRIM_M7_MARLIN", "1") != "0"
 TRIM_M7_MIN_BYTES = _env_bytes("L2PF_TRIM_M7_MIN_MB", 32 << 20)
 
 # Compressed one-row projections measured with the same captured stream edges.
@@ -677,9 +678,11 @@ class Session:
                 self._prev_big = True
                 site.mlp = "act" if prev_big else "norm"
                 site.role = "down" if prev_big else "gate_up"
-                if m_rows > 1 and TRIM_M7 and kind == "musefp8":
-                    # muse_rans.cu already issues internal 2 MiB TLB prefetches in block 0;
-                    # skip redundant side-stream TLB launches at verify width (M > 1).
+                if m_rows > 1 and TRIM_M7 and (
+                    kind == "musefp8" or (TRIM_M7_MARLIN and kind == "marlin_tiled")
+                ):
+                    # muse_rans.cu and gemv6_tma4.cu (MUSE_DECODE6_TLB_PREFETCH=2048) already issue
+                    # internal 2 MiB TLB prefetches in block 0; skip contending side-stream MLP launches.
                     site.descs = []
                 elif (
                     prev_big
