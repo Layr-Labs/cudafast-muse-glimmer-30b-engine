@@ -8,7 +8,6 @@ nvcc -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
     --expt-relaxed-constexpr -DENABLE_FP8 ${D128_FLAGS:-} -gencode arch=compute_121a,code=sm_121a \
     -I "$here/../marlinw/csrc" -I "$torch_include" -Xptxas -v \
     -o "$KERNELS_OUT/libmarlinw_down128.so" "$here/marlinw_down128.cu"
-# The same tiles fed by TMA (source shared with marlinw's gate/up + SwiGLU kernel).
 nvcc -O3 -std=c++17 -shared -Xcompiler -fPIC -lineinfo \
     --expt-relaxed-constexpr -DENABLE_FP8 -gencode arch=compute_121a,code=sm_121a \
     -I "$here/../marlinw/csrc" -I "$torch_include" -Xptxas -v \

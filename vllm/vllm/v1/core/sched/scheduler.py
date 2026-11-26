@@ -546,6 +546,23 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (
+                self.dflash_committed_token_ceiling is not None
+                and self.scheduler_config.async_scheduling
+                and self.use_v2_model_runner
+                and request.spec_token_ids
+                and not request.is_prefill_chunk
+            ):
+                in_flight_committed = max(request.num_output_placeholders, 0)
+                allowed_depth = self.dflash_committed_token_ceiling.limit_next(
+                    request.request_id,
+                    len(request.spec_token_ids),
+                    pending_rounds=int(in_flight_committed > 0),
+                    pending_committed=in_flight_committed,
+                )
+                if allowed_depth < len(request.spec_token_ids):
+                    request.spec_token_ids = request.spec_token_ids[:allowed_depth]
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -1232,6 +1249,7 @@ class Scheduler(SchedulerInterface):
         if (
             ceiling is not None
             and self.scheduler_config.async_scheduling
+            and not self.use_v2_model_runner
             and num_spec_tokens_to_schedule > 0
         ):
             # Async scheduling produces the proposal for the round *after*

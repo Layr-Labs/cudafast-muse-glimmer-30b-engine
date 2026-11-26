@@ -83,6 +83,7 @@ from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
+    check_tree_chain_prep,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
     post_update,
@@ -327,6 +328,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._single_decode_prep_armed = False
         self._single_decode_prep_verified = False
         self._single_decode_prep_failed = False
+        self._tree_chain_prep_ok: bool | None = None
         self._qsl_const_gpu: dict[int, torch.Tensor] = {}
         for _nt in (1, 2, 512):
             _qsl = [0] + [_nt] * self.max_num_reqs
@@ -1055,7 +1057,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
     def prepare_inputs(
-        self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
+        self,
+        scheduler_output: SchedulerOutput,
+        batch_desc: BatchExecutionDescriptor,
+        *,
+        tree_verify: bool = False,
     ) -> InputBatch:
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
@@ -1144,73 +1150,126 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
         num_reqs_padded = batch_desc.num_reqs or num_reqs
-        query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
-        query_start_loc_np[0] = 0
-        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
-        # Pad for full CUDA graph mode.
-        # Some attention backends like FA3 require query_start_loc to be non-decreasing.
-        query_start_loc_np[num_reqs + 1 :] = num_tokens
-        _qsl_cached = self._qsl_const_gpu.get(num_tokens) if num_reqs == 1 else None
-        if _qsl_cached is not None:
-            self.input_buffers.query_start_loc.copy_(_qsl_cached, non_blocking=True)
-        else:
-            async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
-        query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
-        query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
         prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
         computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens
         num_computed_prefill_tokens_np = computed_prefill_tokens_np[idx_mapping_np]
         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
 
-        # Get prefill tokens if any.
-        if np.any(is_prefilling_np):
-            prepare_prefill_inputs(
+        fused_chain = (
+            tree_verify
+            and num_tokens == 7
+            and total_num_logits == 7
+            and self.max_num_reqs == num_reqs_padded == num_reqs == 1
+            and not self.use_dcp
+            and not is_prefilling_np[0]
+            and envs.os.environ.get("VLLM_TREE_CHAIN_PREP_FUSE", "1") != "0"
+        )
+        if fused_chain and self._tree_chain_prep_ok is None:
+            if torch.cuda.is_current_stream_capturing():
+                fused_chain = False
+            else:
+                try:
+                    self._tree_chain_prep_ok = bool(check_tree_chain_prep(self.device))
+                    if self._tree_chain_prep_ok:
+                        logger.info(
+                            "Fused single-request tree-chain input preparation admitted (exact integer check)"
+                        )
+                    else:
+                        logger.warning(
+                            "Fused single-request tree-chain input preparation rejected; keeping stock path"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    self._tree_chain_prep_ok = False
+                    logger.warning(
+                        "Fused single-request tree-chain input preparation check raised (%s); keeping stock path",
+                        exc,
+                    )
+        if fused_chain and not self._tree_chain_prep_ok:
+            fused_chain = False
+
+        if fused_chain:
+            query_start_loc_np = np.array([0, num_tokens], dtype=np.int32)
+            query_start_loc = self.input_buffers.query_start_loc[:2]
+            seq_lens = self.input_buffers.seq_lens[:1]
+            dcp_local_seq_lens = None
+            logits_indices = combine_sampled_and_draft_tokens(
                 self.input_buffers.input_ids,
-                self.req_states.next_prefill_tokens,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+                verify_positions=self.input_buffers.positions,
+                verify_computed=self.req_states.num_computed_tokens.gpu,
+            )
+        else:
+            query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
+            query_start_loc_np[0] = 0
+            np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
+            # Pad for full CUDA graph mode.
+            # Some attention backends like FA3 require query_start_loc to be non-decreasing.
+            query_start_loc_np[num_reqs + 1 :] = num_tokens
+            _qsl_cached = self._qsl_const_gpu.get(num_tokens) if num_reqs == 1 else None
+            if _qsl_cached is not None:
+                self.input_buffers.query_start_loc.copy_(_qsl_cached, non_blocking=True)
+            else:
+                async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
+            query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
+            query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
+
+            # Get prefill tokens if any.
+            if np.any(is_prefilling_np):
+                prepare_prefill_inputs(
+                    self.input_buffers.input_ids,
+                    self.req_states.next_prefill_tokens,
+                    idx_mapping,
+                    query_start_loc,
+                    self.req_states.all_token_ids.gpu,
+                    self.req_states.prefill_len.gpu,
+                    self.req_states.num_computed_tokens.gpu,
+                )
+
+            # Prepare positions and seq_lens.
+            prepare_pos_seq_lens(
                 idx_mapping,
                 query_start_loc,
-                self.req_states.all_token_ids.gpu,
-                self.req_states.prefill_len.gpu,
                 self.req_states.num_computed_tokens.gpu,
-            )
-
-        # Prepare positions and seq_lens.
-        prepare_pos_seq_lens(
-            idx_mapping,
-            query_start_loc,
-            self.req_states.num_computed_tokens.gpu,
-            self.input_buffers.positions,
-            self.input_buffers.seq_lens,
-        )
-        seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
-
-        dcp_local_seq_lens = None
-        if self.use_dcp:
-            # Prepare dcp local seq_lens.
-            prepare_dcp_local_seq_lens(
-                self.input_buffers.dcp_local_seq_lens,
+                self.input_buffers.positions,
                 self.input_buffers.seq_lens,
-                num_reqs,
-                self.dcp_size,
-                self.dcp_rank,
-                self.cp_interleave,
             )
-            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
+            seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
-        # Some input token ids are directly read from the last sampled tokens
-        # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
-            self.input_buffers.input_ids,
-            idx_mapping,
-            self.req_states.last_sampled_tokens,
-            query_start_loc,
-            seq_lens,
-            self.req_states.prefill_len.gpu,
-            self.req_states.draft_tokens,
-            cu_num_logits,
-            total_num_logits,
-            self.model_state.num_new_sampled_tokens_per_step,
-        )
+            dcp_local_seq_lens = None
+            if self.use_dcp:
+                # Prepare dcp local seq_lens.
+                prepare_dcp_local_seq_lens(
+                    self.input_buffers.dcp_local_seq_lens,
+                    self.input_buffers.seq_lens,
+                    num_reqs,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    self.cp_interleave,
+                )
+                dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
+
+            # Some input token ids are directly read from the last sampled tokens
+            # and draft tokens. Also, get the logits indices to sample tokens from.
+            logits_indices = combine_sampled_and_draft_tokens(
+                self.input_buffers.input_ids,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
@@ -1353,7 +1412,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._lmhead_cg_step += 1
             graphs[slot].replay()
             return outs[slot]
-        if sig in self._lmhead_cg_rejected or len(entries) >= 4:
+        if sig in self._lmhead_cg_rejected or len(entries) >= 16:
             return None
 
         mult = self.model.output_multiplier
@@ -1432,6 +1491,134 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logger.warning("lm_head+lmpost graph capture skipped (%s); keeping eager path", exc)
             return ref_tok
 
+    def _try_verify_lmpost_graph(
+        self,
+        sample_hidden_states: torch.Tensor,
+        lm_head: Any,
+        lut: torch.Tensor,
+        org_vocab: int,
+        input_ids: torch.Tensor,
+        logits_indices: torch.Tensor | None,
+        verify_m: int,
+        buf_cols: int,
+        out_cols: int,
+        extra_leaf: bool,
+        leaf_verify_m: int,
+        _m6: Any,
+        _lmp: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None] | None:
+        if (
+            sample_hidden_states.shape[0] < 7
+            or envs.os.environ.get("VLLM_VERIFY_LMHEAD_GRAPH", "1") == "0"
+            or self.cudagraph_manager is None
+            or not self.cudagraph_manager._graphs_captured
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        entries = getattr(self, "_verify_lmhead_cg_entries", None)
+        if entries is None:
+            entries = {}
+            self._verify_lmhead_cg_entries = entries
+            self._verify_lmhead_cg_rejected: set[tuple] = set()
+            self._verify_lmhead_cg_pool = torch.cuda.graph_pool_handle()
+            self._verify_lmhead_cg_cap_stream = torch.cuda.Stream(device=self.device)
+            self._verify_lmhead_cg_step = 0
+        idx_ptr = logits_indices.data_ptr() if logits_indices is not None else 0
+        leaf_active = int(bool(getattr(self, "_leaf_step", False)))
+        sig = (
+            sample_hidden_states.data_ptr(),
+            tuple(sample_hidden_states.shape),
+            input_ids.data_ptr(),
+            idx_ptr,
+            int(verify_m),
+            int(buf_cols),
+            int(out_cols),
+            int(extra_leaf),
+            int(leaf_verify_m),
+            leaf_active,
+        )
+        entry = entries.get(sig)
+        if entry is not None:
+            graphs, slots = entry
+            slot = self._verify_lmhead_cg_step & 3
+            self._verify_lmhead_cg_step += 1
+            graphs[slot].replay()
+            return slots[slot]
+        if sig in self._verify_lmhead_cg_rejected or len(entries) >= 64:
+            return None
+        try:
+            ref_buf = torch.full((1, buf_cols), -1, dtype=torch.int64, device=self.device)
+            ref_sv = ref_buf[:, :out_cols]
+            ref_ns = torch.empty((1,), dtype=torch.int32, device=self.device)
+            ref_nr = torch.empty((1,), dtype=torch.int32, device=self.device)
+            if not (
+                _m6.launch_lmhead_lmpost6_m(sample_hidden_states, lm_head, lut, ref_buf, org_vocab)
+                and _lmp.greedy_verify(ref_sv, input_ids, logits_indices, ref_ns, ref_nr, verify_m)
+            ):
+                self._verify_lmhead_cg_rejected.add(sig)
+                return None
+            slots = []
+            slot_bufs = []
+            for _ in range(4):
+                s_buf = torch.full((1, buf_cols), -1, dtype=torch.int64, device=self.device)
+                s_v = s_buf[:, :out_cols]
+                n_s = torch.empty((1,), dtype=torch.int32, device=self.device)
+                n_r = torch.empty((1,), dtype=torch.int32, device=self.device)
+                if extra_leaf:
+                    leaf_u = s_buf[0, 7:leaf_verify_m]
+                elif getattr(self, "_leaf_step", False) and verify_m == 7:
+                    leaf_u = s_v[0, 6:7]
+                else:
+                    leaf_u = None
+                slot_bufs.append(s_buf)
+                slots.append((s_v, n_s, n_r, leaf_u))
+            graphs: list[torch.cuda.CUDAGraph] = []
+            main_st = torch.cuda.current_stream(self.device)
+            cap_st = self._verify_lmhead_cg_cap_stream
+            cap_st.wait_stream(main_st)
+            with torch.cuda.stream(cap_st):
+                for slot in range(4):
+                    g = torch.cuda.CUDAGraph()
+                    s_buf = slot_bufs[slot]
+                    s_v, n_s, n_r, _ = slots[slot]
+                    with torch.cuda.graph(g, pool=self._verify_lmhead_cg_pool, stream=cap_st):
+                        if not (
+                            _m6.launch_lmhead_lmpost6_m(sample_hidden_states, lm_head, lut, s_buf, org_vocab)
+                            and _lmp.greedy_verify(s_v, input_ids, logits_indices, n_s, n_r, verify_m)
+                        ):
+                            raise RuntimeError("verify lm_head+lmpost refused during capture")
+                    graphs.append(g)
+            main_st.wait_stream(cap_st)
+            slot_bufs[0].fill_(-1)
+            slots[0][1].fill_(-1)
+            slots[0][2].fill_(-1)
+            graphs[0].replay()
+            rows = int(sample_hidden_states.shape[0])
+            if not (
+                torch.equal(slot_bufs[0][:, :rows], ref_buf[:, :rows])
+                and torch.equal(slots[0][1], ref_ns)
+                and torch.equal(slots[0][2], ref_nr)
+            ):
+                self._verify_lmhead_cg_rejected.add(sig)
+                logger.warning("verify lm_head+lmpost graph mismatch vs eager; keeping eager path")
+                ref_leaf = (
+                    ref_buf[0, 7:leaf_verify_m]
+                    if extra_leaf
+                    else (ref_sv[0, 6:7] if getattr(self, "_leaf_step", False) and verify_m == 7 else None)
+                )
+                return (ref_sv, ref_ns, ref_nr, ref_leaf)
+            entries[sig] = (graphs, slots)
+            self._verify_lmhead_cg_step = 1
+            logger.info(
+                "Captured 2-node fused verify lm_head+lmpost+greedy_verify CUDA graph (4-slot ring, shape=%s)",
+                tuple(sample_hidden_states.shape),
+            )
+            return slots[0]
+        except Exception as exc:  # noqa: BLE001
+            self._verify_lmhead_cg_rejected.add(sig)
+            logger.warning("verify lm_head+lmpost graph capture skipped (%s); keeping eager path", exc)
+            return None
+
     def _try_decode_embed_graph(
         self,
         scheduled_encoder_inputs: dict[str, list[int]],
@@ -1475,7 +1662,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 g_or_fn.replay()
             return out_view
-        if sig in self._decode_embed_cg_rejected or len(entries) >= 16:
+        if sig in self._decode_embed_cg_rejected or len(entries) >= 32:
             return None
 
         ref_out = self.model_state.get_mm_embeddings(
@@ -1695,8 +1882,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 and not self.sampler._requires_logits_processing(idx_mapping_np)
             ):
                 try:
-                    import lmpost as _lmp
-                    import muse_marlin6_gemv as _m6
+                    _lmp = getattr(self, "_cached_lmp_mod", None)
+                    _m6 = getattr(self, "_cached_m6_mod", None)
+                    if _lmp is None or _m6 is None:
+                        import lmpost as _lmp
+                        import muse_marlin6_gemv as _m6
+                        self._cached_lmp_mod = _lmp
+                        self._cached_m6_mod = _m6
                     lm_head = self.model.lm_head
                     lp = self.model.logits_processor
                     org_vocab = int(getattr(lp, "org_vocab_size", getattr(lm_head, "org_vocab_size", 0)))
@@ -1710,19 +1902,61 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         and sample_hidden_states.is_contiguous()
                         and (sample_hidden_states.data_ptr() & 15) == 0
                     ):
-                        mult = float(self.model.output_multiplier)
-                        cap = self.model.final_logit_softcapping
-                        lut = _lmp._get_lut(self.device, mult, cap)
+                        lut = getattr(self, "_cached_lmp_lut", None)
+                        if lut is None:
+                            mult = float(self.model.output_multiplier)
+                            cap = self.model.final_logit_softcapping
+                            lut = _lmp._get_lut(self.device, mult, cap)
+                            self._cached_lmp_lut = lut
+                            self._cached_lmp_mult_cap = (mult, cap)
                         if (
                             getattr(lm_head, "marlin_decode6_lmpost_m_admitted", None) is None
                             and not torch.cuda.is_current_stream_capturing()
                         ):
+                            mult, cap = self._cached_lmp_mult_cap
                             lm_head.marlin_decode6_lmpost_m_admitted = _m6.admit_tma4_lmpost_m(
                                 lm_head, lut, org_vocab, lmpost_argmax, mult, cap
                             )
                         if getattr(lm_head, "marlin_decode6_lmpost_m_admitted", False):
                             out_cols = self.rejection_sampler.num_speculative_steps + 1
                             buf_cols = max(out_cols, leaf_verify_m) if extra_leaf else out_cols
+                            logits_idx_arg = None if can_verify_slice else input_batch.logits_indices
+                            cg_res = self._try_verify_lmpost_graph(
+                                sample_hidden_states,
+                                lm_head,
+                                lut,
+                                org_vocab,
+                                input_batch.input_ids,
+                                logits_idx_arg,
+                                verify_m,
+                                buf_cols,
+                                out_cols,
+                                extra_leaf,
+                                leaf_verify_m,
+                                _m6,
+                                _lmp,
+                            )
+                            if cg_res is not None:
+                                sampled_v, num_sampled_v, num_rejected_v, leaf_u = cg_res
+                                if leaf_u is not None:
+                                    self._leaf_u_tok = leaf_u
+                                if not getattr(self, "_lmpost_verify_logged", False):
+                                    self._lmpost_verify_logged = True
+                                    logger.info(
+                                        "lmpost fused multi-M lm_head+argmax + greedy verify active (m=%d)",
+                                        leaf_verify_m if extra_leaf else verify_m,
+                                    )
+                                return (
+                                    SamplerOutput(
+                                        sampled_token_ids=sampled_v,
+                                        logprobs_tensors=None,
+                                        num_nans=None,
+                                        num_sampled=num_sampled_v,
+                                        num_rejected=num_rejected_v,
+                                    ),
+                                    num_sampled_v,
+                                    num_rejected_v,
+                                )
                             sampled_v_buf = torch.empty(
                                 (1, buf_cols),
                                 dtype=torch.int64,
@@ -2282,7 +2516,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 from dataclasses import replace as _dc_replace
 
                 self._single_decode_prep_armed = False
-                input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+                input_batch = self.prepare_inputs(
+                    scheduler_output, batch_desc, tree_verify=True
+                )
                 # Upgrade forward-only metadata to M=_target_leaf_m (8/12/16) while keeping
                 # input_batch at M=7 (query_start_loc=[0, 7]) for postprocess_sampled & propose.
                 _native_leaf.prepare_tree(
@@ -2342,9 +2578,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         if self._leaf_step:
                             self._leaf_slot_mappings = slot_mappings
                     else:
+                        _is_prefill_step = (
+                            input_batch.num_draft_tokens == 0
+                            and (
+                                _leaf_req_idx is None
+                                or int(
+                                    self.req_states.num_computed_prefill_tokens[
+                                        _leaf_req_idx
+                                    ]
+                                )
+                                < int(self.req_states.prefill_len.np[_leaf_req_idx])
+                            )
+                        )
                         _native_leaf.on_non_leaf_step(
                             input_batch.req_ids[0] if input_batch.req_ids else None,
                             input_batch.num_draft_tokens,
+                            is_prefill=_is_prefill_step,
                         )
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
