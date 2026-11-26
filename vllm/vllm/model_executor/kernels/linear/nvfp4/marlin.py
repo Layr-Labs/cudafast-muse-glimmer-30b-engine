@@ -53,6 +53,15 @@ except (ImportError, OSError):
 
 _down128_weights: set[int] = set()
 _attn128_weights: set[int] = set()
+_nvfp4_dual_qkv: dict[int, torch.nn.Module] = {}
+_pending_nvfp4_dual_gate: tuple[int, int, torch.Tensor] | None = None
+
+
+def register_nvfp4_dual_qkv_gate(
+    qkv_layer: torch.nn.Module, gate_layer: torch.nn.Module
+) -> None:
+    """Register an admitted 0-ULP fused TMA qkv+gate pair for 512-row NVFP4 prefill."""
+    _nvfp4_dual_qkv[qkv_layer.weight.data_ptr()] = gate_layer
 
 
 # Which 512-row MLP kernel each call ran (Python runs on eager forwards and on graph capture, not on replay), logged
@@ -90,6 +99,8 @@ def down128_moved(old_ptr: int, new_ptr: int) -> None:
     if old_ptr in _attn128_weights:
         _attn128_weights.discard(old_ptr)
         _attn128_weights.add(new_ptr)
+    if old_ptr in _nvfp4_dual_qkv:
+        _nvfp4_dual_qkv[new_ptr] = _nvfp4_dual_qkv.pop(old_ptr)
 
 try:
     import muse_final_slab
@@ -227,8 +238,8 @@ def _log_prompt_stats() -> None:
         if any(a + r for a, r in attn.values()):
             logger.info(
                 "Narrow NVFP4 attention prefill GEMM (admitted/rejected): qkv %d/%d, "
-                "gate %d/%d, o %d/%d (128x128 admitted: %d)",
-                *attn["qkv"], *attn["gate"], *attn["o"], len(_attn128_weights),
+                "gate %d/%d, o %d/%d (128x128 admitted: %d, dual qkv+gate: %d)",
+                *attn["qkv"], *attn["gate"], *attn["o"], len(_attn128_weights), len(_nvfp4_dual_qkv),
             )
 
 
@@ -471,7 +482,36 @@ def _marlin_fp4_narrow_attn(
             out = muse_final_slab.attn_if_active(x, weight, weight_scale, weight_global_scale)
             if out is not None:
                 return out
+        global _pending_nvfp4_dual_gate
         if marlinw_down128 is not None and weight.data_ptr() in _attn128_weights:
+            if (
+                size_n == 4096
+                and size_k == 6656
+                and _pending_nvfp4_dual_gate is not None
+                and _pending_nvfp4_dual_gate[0] == x.data_ptr()
+                and _pending_nvfp4_dual_gate[1] == weight.data_ptr()
+            ):
+                gate_out = _pending_nvfp4_dual_gate[2]
+                _pending_nvfp4_dual_gate = None
+                return gate_out
+            if (
+                size_n == 4608
+                and size_k == 6656
+                and getattr(marlinw_down128, "ATTN_DUAL_TMA_ENABLED", False)
+            ):
+                gate_layer = _nvfp4_dual_qkv.get(weight.data_ptr())
+                if gate_layer is not None:
+                    dual = marlinw_down128.gemm_dual_qkv_gate(
+                        x,
+                        weight, weight_scale, weight_global_scale,
+                        gate_layer.weight, gate_layer.weight_scale, gate_layer.weight_global_scale,
+                    )
+                    if dual is not None:
+                        qkv_out, gate_out = dual
+                        _pending_nvfp4_dual_gate = (
+                            x.data_ptr(), gate_layer.weight.data_ptr(), gate_out
+                        )
+                        return qkv_out
             out = marlinw_down128.gemm_shape(
                 x, weight, weight_scale, weight_global_scale, size_n, size_k
             )

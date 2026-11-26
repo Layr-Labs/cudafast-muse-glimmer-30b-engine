@@ -872,7 +872,29 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             states[3] = n3 ? ((x3 << 16) | r3) : x3;
           };
           if constexpr (kXsmem) {
-            if (pb.unroll2 == 2 && cs + 32 <= S && (trig_s < cs || trig_s >= cs + 32)) {
+            if constexpr (kActMode != 2) {
+              if (pb.unroll2 == 2 && ((s_end - cs) & 15) == 0 && (trig_s < 0 || (trig_s & 15) == 0)) {
+                for (int sb16 = cs; sb16 < s_end; sb16 += 16) {
+                  if (sb16 == trig_s) {
+                    asm volatile("griddepcontrol.launch_dependents;");
+                  }
+#pragma unroll 4
+                  for (int sl = 0; sl < 16; ++sl) {
+                    do_k_step(sb16 + sl, false);
+                  }
+                }
+              } else if (pb.unroll2 && cs + 32 <= S && (trig_s < cs || trig_s >= cs + 32)) {
+#pragma unroll 2
+                for (int sl = 0; sl < 32; ++sl) {
+                  do_k_step(cs + sl, false);
+                }
+              } else {
+#pragma unroll 1
+                for (int s = cs; s < s_end; s++) {
+                  do_k_step(s, true);
+                }
+              }
+            } else if (pb.unroll2 == 2 && cs + 32 <= S && (trig_s < cs || trig_s >= cs + 32)) {
 #pragma unroll 4
               for (int sl = 0; sl < 32; ++sl) {
                 do_k_step(cs + sl, false);

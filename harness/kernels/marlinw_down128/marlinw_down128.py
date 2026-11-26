@@ -23,15 +23,17 @@ SMS = 48
 ENABLED = os.environ.get("MARLIN_DOWN128", "1") == "1"
 ATTN_ENABLED = os.environ.get("MARLIN_ATTN128", "1") == "1"
 _ALL_ATTN_SHAPES = {(4608, 6656): "qkv", (6656, 4096): "o_proj", (4096, 6656): "gate"}
-_raw_attn_shapes = os.environ.get("MARLIN_ATTN128_SHAPES", "qkv")
+_raw_attn_shapes = os.environ.get("MARLIN_ATTN128_SHAPES", "qkv,o_proj,gate")
 _enabled_attn = set() if _raw_attn_shapes in ("", "0") else set(_raw_attn_shapes.split(","))
 ATTN_SHAPES = {k: v for k, v in _ALL_ATTN_SHAPES.items() if v in _enabled_attn}
 ATTN_TMA_ENABLED = ATTN_ENABLED and os.environ.get("MARLIN_ATTN_TMA", "1") == "1"
+ATTN_DUAL_TMA_ENABLED = ATTN_TMA_ENABLED and os.environ.get("MARLIN_ATTN_DUAL_TMA", "1") != "0"
 TMA_SHFL_EPI = os.environ.get("MARLIN_TMA_SHFL_EPI", "1") != "0"
 TMA_ATTN_SHFL_EPI = os.environ.get("MARLIN_TMA_ATTN_SHFL_EPI", "1") != "0"
 _cur_shfl_epi: int | None = None
 _DEFAULT_TAIL = {(6656, 19968): 16, (4608, 6656): 0, (4096, 6656): 8, (6656, 4096): 16}
 _plans: dict = {}
+_dual_plans: dict = {}
 _scratch_cache: dict[tuple[int, int], torch.Tensor] = {}
 
 _library = ctypes.CDLL(str(Path(__file__).with_name("libmarlinw_down128.so")))
@@ -49,13 +51,14 @@ _shape_main.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 4 + [ctypes.c_vo
 _shape_main.restype = ctypes.c_int
 
 TMA_ENABLED = ENABLED and os.environ.get("MARLIN_DOWN128_TMA", "1") == "1"
-_tma_init = _tma_main = _tma_shape_init = _tma_shape_main = None
+_tma_init = _tma_main = _tma_shape_init = _tma_shape_main = _tma_dual_init = _tma_dual_main = None
 if TMA_ENABLED or ATTN_TMA_ENABLED:
     try:
         _tma_library = ctypes.CDLL(str(Path(__file__).with_name("libmarlinw_down128t.so")))
     except OSError:
         TMA_ENABLED = False
         ATTN_TMA_ENABLED = False
+        ATTN_DUAL_TMA_ENABLED = False
     else:
         _tma_init = _tma_library.marlinw_down128_init
         _tma_init.argtypes = [ctypes.POINTER(ctypes.c_int)]
@@ -71,6 +74,16 @@ if TMA_ENABLED or ATTN_TMA_ENABLED:
         if _tma_shape_main is not None:
             _tma_shape_main.argtypes = [ctypes.c_void_p] * 7 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
             _tma_shape_main.restype = ctypes.c_int
+        _tma_dual_init = getattr(_tma_library, "marlinw_down128_dual_tma_init", None)
+        if _tma_dual_init is not None:
+            _tma_dual_init.argtypes = [ctypes.POINTER(ctypes.c_int)]
+            _tma_dual_init.restype = ctypes.c_int
+        _tma_dual_main = getattr(_tma_library, "marlinw_down128_dual_tma_main", None)
+        if _tma_dual_main is not None:
+            _tma_dual_main.argtypes = [ctypes.c_void_p] * 11 + [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+            _tma_dual_main.restype = ctypes.c_int
+        if _tma_dual_init is None or _tma_dual_main is None:
+            ATTN_DUAL_TMA_ENABLED = False
         _tma_set_shfl_epi = getattr(_tma_library, "marlinw_down128_set_shfl_epi", None)
         if _tma_set_shfl_epi is not None:
             _tma_set_shfl_epi.argtypes = [ctypes.c_int]
@@ -326,6 +339,107 @@ def tma_work_lists(shared_bytes: int, sizes=PIECES):
     assert len(blocks) == len(whole) + 3 * SPLIT
     work = [row for both in blocks for row in both] + [(0, 0, 0, 0)] * ((SPLIT + 3) // 4)
     return work, len(blocks), slots
+
+
+def tma_work_lists_dual_qkv_gate(shared_bytes: int):
+    """Work list for the fused 4-stage TMA gate (4096x6656) + qkv (4608x6656) kernel."""
+    k_tiles = 6656 // 64
+    cut_q = _shape_cuts(4608, 6656, shared_bytes)
+    if any(c != (-1, -1) for c in cut_q.values()):
+        raise ValueError("unexpected K-cut in qkv (4608x6656) shape")
+    cut_g = _shape_cuts(4096, 6656, shared_bytes)
+    slots = 0
+    slot_of: dict[tuple[int, int], int] = {}
+
+    def qkv_block(tile):
+        col, pair = tile
+        return [(128 * pair, col, 8, 0), (-1, -1, k_tiles, 0)]
+
+    def gate_block(tile):
+        nonlocal slots
+        col, pair = tile
+        (ca, ca2), (cb, cb2) = cut_g[(col // 2, 2 * pair)], cut_g[(col // 2, 2 * pair + 1)]
+        slot = 0
+        has1 = ca >= 0 or cb >= 0
+        has2 = ca2 >= 0 or cb2 >= 0
+        if has1:
+            if tile not in slot_of:
+                slot_of[tile] = slots
+                slots += 2 if has2 else 1
+            slot = slot_of[tile]
+        w0_z = (ca2 & 0xFFFF) | ((cb2 & 0xFFFF) << 16)
+        if w0_z >= 0x80000000:
+            w0_z -= 0x100000000
+        return [(128 * pair, col, w0_z, slot), (ca, cb, k_tiles, 1 << 30)]
+
+    blocks = (
+        [gate_block((col, pair)) for col in range(32) for pair in range(4)]
+        + [qkv_block((col, pair)) for col in range(36) for pair in range(4)]
+    )
+    assert len(blocks) == 272
+    work = [row for both in blocks for row in both]
+    return work, len(blocks), max(slots, 1)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedDual:
+    work: torch.Tensor
+    grid: int
+    slots: int
+    active_blocks_per_sm: int
+
+
+def prepare_dual_qkv_gate(device: torch.device) -> PreparedDual | None:
+    if not ATTN_DUAL_TMA_ENABLED or _tma_dual_init is None or _tma_dual_main is None:
+        return None
+    props = torch.cuda.get_device_properties(device)
+    if props.multi_processor_count != SMS or torch.cuda.get_device_capability(device) != (12, 1):
+        return None
+    active = ctypes.c_int()
+    with torch.cuda.device(device):
+        status = _tma_dual_init(ctypes.byref(active))
+    if status != 0 or active.value != 1:
+        return None
+    work, grid, slots = tma_work_lists_dual_qkv_gate(props.shared_memory_per_block_optin)
+    return PreparedDual(torch.tensor(work, dtype=torch.int32, device=device), grid, slots, active.value)
+
+
+def gemm_dual_qkv_gate(x, w_q, s_q, gs_q, w_g, s_g, gs_g):
+    """Fused 512x6656 -> (512x4608, 512x4096) TMA GEMM for paired NVFP4 qkv + output_gate."""
+    if (
+        not ATTN_DUAL_TMA_ENABLED
+        or _tma_dual_main is None
+        or x.shape != (ROWS, 6656)
+        or x.dtype != torch.bfloat16
+        or x.stride(1) != 1
+        or x.stride(0) % 8
+        or x.data_ptr() % 16
+    ):
+        return None
+    plan = _dual_plans.get(x.device)
+    if plan is None and x.device not in _dual_plans:
+        plan = _dual_plans[x.device] = prepare_dual_qkv_gate(x.device)
+    if plan is None or x.device != plan.work.device:
+        return None
+    out_q = x.new_empty((ROWS, 4608))
+    out_g = x.new_empty((ROWS, 4096))
+    scratch = _get_scratch(x.device, plan.slots)
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+    with torch.cuda.device(x.device):
+        global _cur_shfl_epi
+        want_shfl = 1 if (TMA_SHFL_EPI or TMA_ATTN_SHFL_EPI) else 0
+        if _tma_set_shfl_epi is not None and _cur_shfl_epi != want_shfl:
+            _tma_set_shfl_epi(want_shfl)
+            _cur_shfl_epi = want_shfl
+        status = _tma_dual_main(
+            x.data_ptr(),
+            w_q.data_ptr(), s_q.data_ptr(), gs_q.data_ptr(), out_q.data_ptr(),
+            w_g.data_ptr(), s_g.data_ptr(), gs_g.data_ptr(), out_g.data_ptr(),
+            scratch.data_ptr(), plan.work.data_ptr(), plan.grid, x.stride(0), stream,
+        )
+    if status:
+        raise RuntimeError(f"MarlinW 128x128 dual qkv+gate launch returned CUDA error {status}")
+    return out_q, out_g
 
 
 @dataclass(frozen=True, slots=True)
