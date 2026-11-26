@@ -59,14 +59,20 @@ constexpr int kBBytes = 4096;       // 4 k16 rows x 128 columns of fe2m1 codes
 constexpr int kSBytes = 512;        // 4 k16 rows x 128 fe4m3 scales
 constexpr int kStageBytes = 21 * 1024;
 // The epilogues stage their reduction in the same window: 64 KiB (down) / 34 KiB (gate/up) from its start.
-constexpr int kTilesPerCta = 1;  // column tiles per CTA (gate/up)
 // With several tiles per CTA the epilogue must not touch the stages that already hold the next tile: it stages in
 // the last stage (free at a tile boundary) plus kEpiExtra bytes after it.
 constexpr int kEpiBytes = 128 * 68 * 4;
-constexpr int kEpiExtra = (kTilesPerCta > 1 && kEpiBytes > kStageBytes) ? kEpiBytes - kStageBytes : 0;
-constexpr int kStagesBytes = kStages * kStageBytes + kEpiExtra + 1024 + 128;
-constexpr int kShared = kStagesBytes > 66 * 1024 ? kStagesBytes : 66 * 1024;
-static_assert(kShared <= 101376, "shared window");
+constexpr int kEpiExtraFor(int tiles) {
+  return (tiles > 1 && kEpiBytes > kStageBytes) ? (kEpiBytes - kStageBytes) : 0;
+}
+constexpr int kSharedFor(int tiles) {
+  const int bytes = kStages * kStageBytes + kEpiExtraFor(tiles) + 1024 + 128;
+  return bytes > 66 * 1024 ? bytes : 66 * 1024;
+}
+#ifndef MARLINW_TMA_GATEUP
+constexpr int kShared = kSharedFor(1);
+#endif
+static_assert(kSharedFor(1) <= 101376 && kSharedFor(13) <= 101376 && kSharedFor(26) <= 101376, "shared window");
 constexpr auto kBF = vllm::kBFloat16.id();
 
 using T = MarlinScalarType<kBF>;
@@ -134,7 +140,7 @@ __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* map, int 
 // int4 / int offsets of its codes and scales inside a stage, to which 4 b_row / s_row per k16 row are added.
 // A CTA may run several tiles back to back (kTilesPerCta): q0 is the position of this tile's first k-tile in the CTA's
 // k-tile stream of length `total`, and the copies keep running across the tile boundary.
-template <int MB, bool kPdl = false, bool kPdlProd = false, class Produce, class OnTile>
+template <int MB, bool kPdl = false, bool kPdlProd = false, int kEpiExtraVal = 0, class Produce, class OnTile>
 __device__ __forceinline__ void k_loop(
     float (&acc)[MB][2][2][4], const int iters, const int b_rd, const int b_row, const int s_rd, const int s_row,
     Produce&& produce, OnTile&& on_tile, const int q0 = 0, const int total_or_0 = 0,
@@ -152,7 +158,7 @@ __device__ __forceinline__ void k_loop(
   // ldmatrix: m-block j of k-half kk sits at 16 (a_rd[kk] + 128 j) (the swizzle term does not depend on j)
   const uint32_t a_rd0 = 16 * (8 * (lane & 15) + (((lane >> 4) + 4 * kw) ^ (lane & 7)));
   const uint32_t a_rd1 = 16 * (8 * (lane & 15) + (((lane >> 4) + 4 * kw + 2) ^ (lane & 7)));
-  const uint32_t full_bar = sbase + kStages * kStageBytes + kEpiExtra;
+  const uint32_t full_bar = sbase + kStages * kStageBytes + kEpiExtraVal;
   const uint32_t empty_bar = full_bar + 8 * kStages;
   if (q0 == 0) {
     if (tid == 0) {
@@ -209,32 +215,35 @@ __device__ __forceinline__ void k_loop(
     fbq[o] = *reinterpret_cast<const int2*>(reinterpret_cast<const int*>(sa) + b_rd + b_row * g);
     fsq[o] = reinterpret_cast<const int*>(sa)[s_rd + s_row * g];
   };
+  auto dequant_scales = [&](const int o, nv_bfloat162 (&sc)[2]) {
+    dequant_fp8_scales<nv_bfloat162, vllm::kFE4M3fn.id()>(fsq[o], sc);
+  };
+  auto dequant_quarter = [&](const int o, const int jj, const nv_bfloat162 s) {
+    FragB& b0 = bb[o][jj][0];
+    FragB& b1 = bb[o][jj][1];
+    const int bq1 = jj == 0 ? fbq[o].x : fbq[o].y;
+    // The four registers of dequant<.., kFE2M1f, true>(bq1 << 8) and (bq1), bit for bit: per register the two
+    // nibbles are isolated, copied to the sign position and to the exponent/mantissa position by one multiply
+    // (the copies cannot overlap) and masked: bit 15 <- sign, bits 8:6 <- e1 e0 m, the same in the upper half.
+    {
+      const unsigned u = static_cast<unsigned>(bq1);
+      reinterpret_cast<unsigned*>(&b1)[1] = (u & 0x80008000u) | ((u >> 6) & 0x01c001c0u);
+      reinterpret_cast<unsigned*>(&b1)[0] = (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
+      reinterpret_cast<unsigned*>(&b0)[1] = ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
+      reinterpret_cast<unsigned*>(&b0)[0] = ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
+    }
+    const nv_bfloat162 s0 = __bfloat162bfloat162(reinterpret_cast<const nv_bfloat16*>(&s)[0]);
+    const nv_bfloat162 s1 = __bfloat162bfloat162(reinterpret_cast<const nv_bfloat16*>(&s)[1]);
+    b0[0] = __hmul2(b0[0], s0);
+    b0[1] = __hmul2(b0[1], s0);
+    b1[0] = __hmul2(b1[0], s1);
+    b1[1] = __hmul2(b1[1], s1);
+  };
   auto dequant_to = [&](const int o) {
     nv_bfloat162 sc[2];
-    dequant_fp8_scales<nv_bfloat162, vllm::kFE4M3fn.id()>(fsq[o], sc);
-#pragma unroll
-    for (int jj = 0; jj < 2; jj++) {
-      FragB& b0 = bb[o][jj][0];
-      FragB& b1 = bb[o][jj][1];
-      const int bq1 = jj == 0 ? fbq[o].x : fbq[o].y;
-      // The four registers of dequant<.., kFE2M1f, true>(bq1 << 8) and (bq1), bit for bit: per register the two
-      // nibbles are isolated, copied to the sign position and to the exponent/mantissa position by one multiply
-      // (the copies cannot overlap) and masked: bit 15 <- sign, bits 8:6 <- e1 e0 m, the same in the upper half.
-      {
-        const unsigned u = static_cast<unsigned>(bq1);
-        reinterpret_cast<unsigned*>(&b1)[1] = (u & 0x80008000u) | ((u >> 6) & 0x01c001c0u);
-        reinterpret_cast<unsigned*>(&b1)[0] = (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
-        reinterpret_cast<unsigned*>(&b0)[1] = ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
-        reinterpret_cast<unsigned*>(&b0)[0] = ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
-      }
-      const nv_bfloat162 s = sc[jj];
-      const nv_bfloat162 s0 = __bfloat162bfloat162(reinterpret_cast<const nv_bfloat16*>(&s)[0]);
-      const nv_bfloat162 s1 = __bfloat162bfloat162(reinterpret_cast<const nv_bfloat16*>(&s)[1]);
-      b0[0] = __hmul2(b0[0], s0);
-      b0[1] = __hmul2(b0[1], s0);
-      b1[0] = __hmul2(b1[0], s1);
-      b1[1] = __hmul2(b1[1], s1);
-    }
+    dequant_scales(o, sc);
+    dequant_quarter(o, 0, sc[0]);
+    dequant_quarter(o, 1, sc[1]);
   };
 
   if (resume) {  // a later K piece of a tile: both chains continue from the state the previous piece left
@@ -264,9 +273,9 @@ __device__ __forceinline__ void k_loop(
     const int s = q & (kStages - 1);
     const int ns = (q + 1) & (kStages - 1);
     if (tid == 0 && q + kDist < total) start_copy(q + kDist);
-    // k-half 0 of k-tile t (operands already in registers); meanwhile k-half 1 of the same stage is loaded.
+    // k-half 0 of k-tile t: load k-half 1 codes/scales before releasing empty_bar early,
+    // then overlap register-only dequant(1) across the second 16 MMAs of k-half 0.
     load_bs(1, s);
-    dequant_to(1);
     {
       const uint32_t sa = sbase + kStageBytes * s + a_rd1;
 #pragma unroll
@@ -278,28 +287,53 @@ __device__ __forceinline__ void k_loop(
     }
     __syncwarp();
     if (lane == 0) mbar_arrive(empty_bar + 8 * s);  // warp-aggregated empty signal
-#pragma unroll
-    for (int i = 0; i < MB; i++) {
-      mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
-      mma16(fa[0][i], bb[0][1][1], acc[i][1][1]);
-    }
-    // k-half 1 of k-tile t; meanwhile k-half 0 of k-tile t + 1 is loaded.
-    if (t + 1 < iters) mbar_wait(full_bar + 8 * ns, ((q + 1) / kStages) & 1);
-    load_bs(0, ns);
-    dequant_to(0);
     {
-      const uint32_t sa = sbase + kStageBytes * ns + a_rd0;
+      nv_bfloat162 sc1[2];
+      dequant_scales(1, sc1);
+#pragma unroll
+      for (int i = 0; i < MB; i++) {
+        if (i == 0) dequant_quarter(1, 0, sc1[0]);
+        if (i == MB / 2) dequant_quarter(1, 1, sc1[1]);
+        mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
+        mma16(fa[0][i], bb[0][1][1], acc[i][1][1]);
+      }
+    }
+    // k-half 1 of k-tile t: wait/load/ldsm4/dequant k-tile t+1 only while t+1 < iters
+    // (eliminates dead tail reads/dequant on t == iters - 1 and overlaps dequant(0) with MMA).
+    if (t + 1 < iters) {
+      mbar_wait(full_bar + 8 * ns, ((q + 1) / kStages) & 1);
+      load_bs(0, ns);
+      {
+        const uint32_t sa = sbase + kStageBytes * ns + a_rd0;
+#pragma unroll
+        for (int i = 0; i < MB; i++) {
+          mma16(fa[1][i], bb[1][0][0], acc[i][0][0]);
+          mma16(fa[1][i], bb[1][0][1], acc[i][0][1]);
+          ldsm4(fa[0][i], sa + 2048 * i);
+        }
+      }
+      {
+        nv_bfloat162 sc0[2];
+        dequant_scales(0, sc0);
+#pragma unroll
+        for (int i = 0; i < MB; i++) {
+          if (i == 0) dequant_quarter(0, 0, sc0[0]);
+          if (i == MB / 2) dequant_quarter(0, 1, sc0[1]);
+          mma16(fa[1][i], bb[1][1][0], acc[i][1][0]);
+          mma16(fa[1][i], bb[1][1][1], acc[i][1][1]);
+        }
+      }
+    } else {
 #pragma unroll
       for (int i = 0; i < MB; i++) {
         mma16(fa[1][i], bb[1][0][0], acc[i][0][0]);
         mma16(fa[1][i], bb[1][0][1], acc[i][0][1]);
-        ldsm4(fa[0][i], sa + 2048 * i);
       }
-    }
 #pragma unroll
-    for (int i = 0; i < MB; i++) {
-      mma16(fa[1][i], bb[1][1][0], acc[i][1][0]);
-      mma16(fa[1][i], bb[1][1][1], acc[i][1][1]);
+      for (int i = 0; i < MB; i++) {
+        mma16(fa[1][i], bb[1][1][0], acc[i][1][0]);
+        mma16(fa[1][i], bb[1][1][1], acc[i][1][1]);
+      }
     }
   }
   }
@@ -599,7 +633,7 @@ __global__ void silu_check() {
   if (__float_as_uint(direct) != __float_as_uint(bf16_silu[word])) atomicAdd(&silu_differences, 1);
 }
 
-template <int kPdlMode = 0>
+template <int kPdlMode = 0, int kTilesPerCta = 1>
 __global__ void __launch_bounds__(kThreads, 1) gateup(
     const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
     const __grid_constant__ CUtensorMap tmS, char* __restrict__ out,
@@ -660,7 +694,7 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
 #pragma unroll 1
   for (int ti = 0; ti < kTilesPerCta; ti++) {
   const int slice_col = col0 + ti;
-  k_loop<8, (kPdlMode == 2), (kPdlMode != 0)>(c, kTiles, kABytes / 4 + 4 * (128 * cw + lane) + 2 * jh, 128,
+  k_loop<8, (kPdlMode == 2), (kPdlMode != 0), kEpiExtraFor(kTilesPerCta)>(c, kTiles, kABytes / 4 + 4 * (128 * cw + lane) + 2 * jh, 128,
                   (kABytes + kBBytes) / 4 + 64 * cw + 2 * (lane >> 2) + jh, 16, produce, [](int) { return kTiles; }, ti * kTiles,
                   kTilesPerCta * kTiles);
   __syncthreads();
@@ -734,44 +768,68 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
   __syncthreads();
   {
     const uint32_t* shw = reinterpret_cast<const uint32_t*>(epi);
+    const int r_in_warp = lane >> 3;  // 4 rows per warp per iter
+    const int c_in_row = lane & 7;    // 8 threads per row, 4 uint32_t (8 elements) per thread
 #ifdef MARLINW_TMA_FP8
     float inverse;
     asm("div.full.f32 %0, 0f3F800000, %1;" : "=f"(inverse) : "f"(*down_input_scale));
-    uint16_t* o8 = reinterpret_cast<uint16_t*>(out);
-#pragma unroll 4
-    for (int row = warp; row < 128; row += 8) {
-      uint32_t gates = shw[row * 68 + lane], ups = shw[row * 68 + lane + 32];
-      float scaled[2];
+    uint2* o8 = reinterpret_cast<uint2*>(out);
 #pragma unroll
-      for (int e = 0; e < 2; e++) {
-        auto gate = reinterpret_cast<const __nv_bfloat16*>(&gates)[e];
-        auto up = reinterpret_cast<const __nv_bfloat16*>(&ups)[e];
-        const float silu = swiglu_silu(__bfloat162float(gate));
-        const float product = __fmul_rn(silu, __bfloat162float(up));
-        const float q = __fmul_rn(product, inverse);
-        scaled[e] = q < -448.0f ? -448.0f : (q > 448.0f ? 448.0f : q);
+    for (int it = 0; it < 4; it++) {
+      const int row = warp * 16 + it * 4 + r_in_warp;
+      const uint4 g4 = *reinterpret_cast<const uint4*>(shw + row * 68 + c_in_row * 4);
+      const uint4 u4 = *reinterpret_cast<const uint4*>(shw + row * 68 + 32 + c_in_row * 4);
+      const uint32_t gs_arr[4] = {g4.x, g4.y, g4.z, g4.w};
+      const uint32_t us_arr[4] = {u4.x, u4.y, u4.z, u4.w};
+      uint16_t conv[4];
+#pragma unroll
+      for (int p = 0; p < 4; p++) {
+        float scaled[2];
+#pragma unroll
+        for (int e = 0; e < 2; e++) {
+          auto gate = reinterpret_cast<const __nv_bfloat16*>(&gs_arr[p])[e];
+          auto up = reinterpret_cast<const __nv_bfloat16*>(&us_arr[p])[e];
+          const float silu = swiglu_silu(__bfloat162float(gate));
+          const float product = __fmul_rn(silu, __bfloat162float(up));
+          const float q = __fmul_rn(product, inverse);
+          scaled[e] = q < -448.0f ? -448.0f : (q > 448.0f ? 448.0f : q);
+        }
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(conv[p]) : "f"(scaled[1]), "f"(scaled[0]));
       }
-      uint16_t converted;
-      asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(converted) : "f"(scaled[1]), "f"(scaled[0]));
-      o8[(size_t)(chunk * 128 + row) * (kFused / 4) + slice_col * 32 + lane] = converted;
+      uint2 packed;
+      packed.x = static_cast<uint32_t>(conv[0]) | (static_cast<uint32_t>(conv[1]) << 16);
+      packed.y = static_cast<uint32_t>(conv[2]) | (static_cast<uint32_t>(conv[3]) << 16);
+      o8[(size_t)(chunk * 128 + row) * (kFused / 16) + slice_col * 8 + c_in_row] = packed;
     }
 #else
-    uint32_t* o = reinterpret_cast<uint32_t*>(out);
-#pragma unroll 4
-    for (int row = warp; row < 128; row += 8) {
-      uint32_t gates = shw[row * 68 + lane], ups = shw[row * 68 + lane + 32];
-      uint32_t prod;
+    uint4* o = reinterpret_cast<uint4*>(out);
 #pragma unroll
-      for (int e = 0; e < 2; e++) {
-        auto gate = reinterpret_cast<const __nv_bfloat16*>(&gates)[e];
-        auto up = reinterpret_cast<const __nv_bfloat16*>(&ups)[e];
-        // swiglu_product with the table entry replaced by its definition (silu_check: equal for all patterns)
-        reinterpret_cast<__nv_bfloat16*>(&prod)[e] =
-            __float2bfloat16_rn(__fmul_rn(swiglu_silu(__bfloat162float(gate)), __bfloat162float(up)));
+    for (int it = 0; it < 4; it++) {
+      const int row = warp * 16 + it * 4 + r_in_warp;
+      const uint4 g4 = *reinterpret_cast<const uint4*>(shw + row * 68 + c_in_row * 4);
+      const uint4 u4 = *reinterpret_cast<const uint4*>(shw + row * 68 + 32 + c_in_row * 4);
+      const uint32_t gs_arr[4] = {g4.x, g4.y, g4.z, g4.w};
+      const uint32_t us_arr[4] = {u4.x, u4.y, u4.z, u4.w};
+      uint32_t prod[4];
+#pragma unroll
+      for (int p = 0; p < 4; p++) {
+#pragma unroll
+        for (int e = 0; e < 2; e++) {
+          auto gate = reinterpret_cast<const __nv_bfloat16*>(&gs_arr[p])[e];
+          auto up = reinterpret_cast<const __nv_bfloat16*>(&us_arr[p])[e];
+          // swiglu_product with the table entry replaced by its definition (silu_check: equal for all patterns)
+          reinterpret_cast<__nv_bfloat16*>(&prod[p])[e] =
+              __float2bfloat16_rn(__fmul_rn(swiglu_silu(__bfloat162float(gate)), __bfloat162float(up)));
+        }
       }
-      o[(size_t)(chunk * 128 + row) * (kFused / 4) + slice_col * 32 + lane] = prod;
+      o[(size_t)(chunk * 128 + row) * (kFused / 16) + slice_col * 8 + c_in_row] =
+          make_uint4(prod[0], prod[1], prod[2], prod[3]);
     }
 #endif
+  }
+  // Ensure every warp finishes reading epi (stage kStages - 1) before the next tile starts TMA into it.
+  if constexpr (kTilesPerCta > 1) {
+    if (ti + 1 < kTilesPerCta) __syncthreads();
   }
   }  // tiles of this CTA
 }
@@ -842,6 +900,52 @@ extern "C" int marlinw_tma_set_pdl(int mode) {
   MARLIN_NAMESPACE_NAME::g_tma_pdl_override = (mode == 0 || mode == 1 || mode == 2) ? mode : -1;
   return old;
 }
+
+#ifdef MARLINW_TMA_GATEUP
+namespace MARLIN_NAMESPACE_NAME {
+static int g_tma_tiles_override = -1;
+static int tma_tiles_per_cta() {
+  if (g_tma_tiles_override > 0) return g_tma_tiles_override;
+  static const int env_tiles = []() -> int {
+    const char* env = std::getenv("MARLINW_TMA_TILES_PER_CTA");
+    if (!env || !*env) return 26;  // default 26 (48 persistent CTAs = 1/SM); override 1 or 13 via env
+    long v = std::strtol(env, nullptr, 10);
+    return (v == 1 || v == 13 || v == 26) ? static_cast<int>(v) : 1;
+  }();
+  return env_tiles;
+}
+
+template <int kT>
+static cudaError_t prepare_gateup_tiles() {
+  constexpr int smem = kSharedFor(kT);
+  auto status = cudaFuncSetAttribute(gateup<0, kT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  if (status != cudaSuccess) return status;
+  status = cudaFuncSetAttribute(gateup<1, kT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  if (status != cudaSuccess) return status;
+  return cudaFuncSetAttribute(gateup<2, kT>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+}
+
+template <int kT, typename... Args>
+static cudaError_t launch_gateup_tiles(int pm, cudaStream_t stream, const Args&... args) {
+  constexpr int m = 512, n = kFused;
+  static_assert((n / 128) % kT == 0, "tiles per CTA");
+  constexpr int grid = (m / 128) * (n / 128) / kT;
+  constexpr int smem = kSharedFor(kT);
+  if (pm == 2) {
+    return launch_ex_pdl(gateup<2, kT>, grid, kThreads, smem, stream, args...);
+  }
+  auto kernel = (pm == 1) ? gateup<1, kT> : gateup<0, kT>;
+  kernel<<<grid, kThreads, smem, stream>>>(args...);
+  return cudaGetLastError();
+}
+}  // namespace MARLIN_NAMESPACE_NAME
+
+extern "C" int marlinw_tma_set_tiles(int tiles) {
+  const int old = MARLIN_NAMESPACE_NAME::tma_tiles_per_cta();
+  MARLIN_NAMESPACE_NAME::g_tma_tiles_override = (tiles == 1 || tiles == 13 || tiles == 26) ? tiles : -1;
+  return old;
+}
+#endif
 
 #ifndef MARLINW_TMA_GATEUP
 // Same C ABI as libmarlinw_down128.so, plus multi-shape TMA entrypoints (qkv 4608x6656, o_proj 6656x4096, gate 4096x6656).
@@ -940,11 +1044,11 @@ extern "C" int swiglu_fp8_prepare() {
   using namespace MARLIN_NAMESPACE_NAME;
   auto status = find_encode();
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(gateup<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  status = prepare_gateup_tiles<1>();
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(gateup<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  status = prepare_gateup_tiles<13>();
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(gateup<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  status = prepare_gateup_tiles<26>();
   if (status != cudaSuccess) return status;
   swiglu_initialize<<<256, 256>>>();
   int differences = 0;
@@ -961,24 +1065,23 @@ extern "C" int swiglu_fp8_gemm(const void* x, const void* w, const void* scales,
   using namespace MARLIN_NAMESPACE_NAME;
   constexpr int m = 512, n = kFused, k = 6656;
   if (!encode || stride < k || stride % 8) return cudaErrorInvalidValue;
-  if (((uintptr_t)x | (uintptr_t)w | (uintptr_t)scales) & 15) return cudaErrorInvalidValue;
+  if (((uintptr_t)x | (uintptr_t)w | (uintptr_t)scales | (uintptr_t)out) & 15) return cudaErrorInvalidValue;
   CUtensorMap tmA, tmB, tmS;
   if (!map2d(&tmA, x, 1, 2 * k, m, 2 * (uint64_t)stride, 128, 128, true) ||
       !map2d(&tmB, w, 4, 2 * n, k / 16, 8 * n, 128, 4, false) ||
       !map2d(&tmS, scales, 1, n, k / 16, n, 64, 4, false))
     return cudaErrorInvalidValue;
-  static_assert((n / 128) % kTilesPerCta == 0, "tiles per CTA");
-  constexpr int grid = (m / 128) * (n / 128) / kTilesPerCta;
   const int pm = tma_pdl_mode();
+  const int tiles = tma_tiles_per_cta();
   const uint8_t* w_raw = reinterpret_cast<const uint8_t*>(w);
-  if (pm == 2) {
-    return launch_ex_pdl(gateup<2>, grid, kThreads, kShared, stream, tmA, tmB, tmS, static_cast<char*>(out),
-                         static_cast<const float*>(global), w_raw, down_input_scale);
-  }
-  auto kernel = (pm == 1) ? gateup<1> : gateup<0>;
-  kernel<<<grid, kThreads, kShared, stream>>>(
-      tmA, tmB, tmS, static_cast<char*>(out), static_cast<const float*>(global), w_raw, down_input_scale);
-  return cudaGetLastError();
+  if (tiles == 26)
+    return launch_gateup_tiles<26>(pm, stream, tmA, tmB, tmS, static_cast<char*>(out),
+                                   static_cast<const float*>(global), w_raw, down_input_scale);
+  if (tiles == 13)
+    return launch_gateup_tiles<13>(pm, stream, tmA, tmB, tmS, static_cast<char*>(out),
+                                   static_cast<const float*>(global), w_raw, down_input_scale);
+  return launch_gateup_tiles<1>(pm, stream, tmA, tmB, tmS, static_cast<char*>(out),
+                                static_cast<const float*>(global), w_raw, down_input_scale);
 }
 #else
 // Same C ABI as libmarlinw_swiglu2.so.
@@ -986,11 +1089,11 @@ extern "C" int swiglu_prepare() {
   using namespace MARLIN_NAMESPACE_NAME;
   auto status = find_encode();
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(gateup<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  status = prepare_gateup_tiles<1>();
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(gateup<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  status = prepare_gateup_tiles<13>();
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(gateup<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  status = prepare_gateup_tiles<26>();
   if (status != cudaSuccess) return status;
   swiglu_initialize<<<256, 256>>>();
   int differences = 0;
@@ -1007,24 +1110,23 @@ extern "C" int swiglu_gemm(const void* x, const void* w, const void* scales, con
   using namespace MARLIN_NAMESPACE_NAME;
   constexpr int m = 512, n = kFused, k = 6656;
   if (!encode || stride < k || stride % 8) return cudaErrorInvalidValue;
-  if (((uintptr_t)x | (uintptr_t)w | (uintptr_t)scales) & 15) return cudaErrorInvalidValue;
+  if (((uintptr_t)x | (uintptr_t)w | (uintptr_t)scales | (uintptr_t)out) & 15) return cudaErrorInvalidValue;
   CUtensorMap tmA, tmB, tmS;
   if (!map2d(&tmA, x, 1, 2 * k, m, 2 * (uint64_t)stride, 128, 128, true) ||
       !map2d(&tmB, w, 4, 2 * n, k / 16, 8 * n, 128, 4, false) ||
       !map2d(&tmS, scales, 1, n, k / 16, n, 64, 4, false))
     return cudaErrorInvalidValue;
-  static_assert((n / 128) % kTilesPerCta == 0, "tiles per CTA");
-  constexpr int grid = (m / 128) * (n / 128) / kTilesPerCta;
   const int pm = tma_pdl_mode();
+  const int tiles = tma_tiles_per_cta();
   const uint8_t* w_raw = reinterpret_cast<const uint8_t*>(w);
-  if (pm == 2) {
-    return launch_ex_pdl(gateup<2>, grid, kThreads, kShared, stream, tmA, tmB, tmS, static_cast<char*>(out),
-                         static_cast<const float*>(global), w_raw);
-  }
-  auto kernel = (pm == 1) ? gateup<1> : gateup<0>;
-  kernel<<<grid, kThreads, kShared, stream>>>(
-      tmA, tmB, tmS, static_cast<char*>(out), static_cast<const float*>(global), w_raw);
-  return cudaGetLastError();
+  if (tiles == 26)
+    return launch_gateup_tiles<26>(pm, stream, tmA, tmB, tmS, static_cast<char*>(out),
+                                   static_cast<const float*>(global), w_raw);
+  if (tiles == 13)
+    return launch_gateup_tiles<13>(pm, stream, tmA, tmB, tmS, static_cast<char*>(out),
+                                   static_cast<const float*>(global), w_raw);
+  return launch_gateup_tiles<1>(pm, stream, tmA, tmB, tmS, static_cast<char*>(out),
+                                static_cast<const float*>(global), w_raw);
 }
 #endif
 #endif
