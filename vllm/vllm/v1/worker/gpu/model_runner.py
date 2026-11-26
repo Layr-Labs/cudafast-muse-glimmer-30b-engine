@@ -2310,6 +2310,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.positions,
                     slot_mappings,
                     verify_m=_target_leaf_m,
+                    all_token_ids=self.req_states.all_token_ids.gpu,
+                    total_len=self.req_states.total_len.gpu,
+                    req_idx=_leaf_req_idx,
                 )
                 self._leaf_verify_m = _target_leaf_m
                 if self._leaf_step:
