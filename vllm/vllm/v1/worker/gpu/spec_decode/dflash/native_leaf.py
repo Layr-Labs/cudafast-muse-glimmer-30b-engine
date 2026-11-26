@@ -65,6 +65,14 @@ TREE_ADAPT_GAMMA = os.environ.get("MUSE_TREE_ADAPT_GAMMA", "1").strip() not in (
 TREE_CALIB = os.environ.get("MUSE_TREE_CALIB", "1").strip() not in ("0", "", "false", "no")
 TREE_HIGH_ACC_CPC = float(os.environ.get("MUSE_TREE_HIGH_ACC_CPC", "0"))
 LEAF_STATS = os.environ.get("MUSE_LEAF_STATS", "0").strip() in ("1", "true", "yes")
+# Leaf latch with recovery. A committed-token-ceiling clamp still switches tree leaves off (as in the parent), but
+# leaves come back after LEAF_RELATCH_ROUNDS consecutive full-depth steps with no clamp. A request that is really
+# ceiling-bound keeps being clamped and so stays latched exactly like the parent; a coding continuation that only had a
+# fast start (the ceiling arms on >4 tokens/round over the first 6 rounds) stops being clamped once its budget catches
+# up and gets its tree back. The ceiling's token budget, which bounds the committed-token rate, is untouched; clamped
+# steps never run the tree, and a full-depth tree round commits at most depth + 1 tokens, as the budget reserves.
+LEAF_RELATCH_ROUNDS = max(1, int(os.environ.get("MUSE_TREE_LEAF_RECOVER_ROUNDS", "8")))
+LATCH_AFTER_CLAMPS = max(1, int(os.environ.get("MUSE_TREE_LATCH_AFTER_CLAMPS", "1")))
 _ST_RAW = os.environ.get("MUSE_NATIVE_LEAF_SELFTEST", "0").strip().lower()
 SELFTEST = 1 if _ST_RAW in ("1", "true", "yes") else (2 if _ST_RAW == "2" else 0)
 NOHIT = os.environ.get("MUSE_NATIVE_LEAF_NOHIT", "0").strip() in ("1", "true", "yes")
@@ -101,6 +109,8 @@ class _NativeLeafState:
         # Cached device pointer array for hidden_states + aux_hidden_states (0 H2D copies steady state).
         self._hid_ptr_cache: dict[tuple[int, ...], torch.Tensor] = {}
         self._last_req_id: str | None = None
+        self._clamps = 0
+        self._since_clamp = 0
         self._logged_active: bool = False
         self._atexit_registered: bool = False
 
@@ -414,6 +424,9 @@ def on_non_leaf_step(req_id: str | None, num_draft_tokens: int) -> None:
     if req_id is None or req_id != _S._last_req_id or num_draft_tokens == 0:
         if LEAF_STATS and _S._last_req_id is not None and (req_id != _S._last_req_id or num_draft_tokens == 0):
             _dump_stats(str(_S._last_req_id))
+        if req_id is None or req_id != _S._last_req_id:
+            _S._clamps = 0
+            _S._since_clamp = 0
         _S._last_req_id = req_id
         _S.prev_ns.fill_(7)
         _S.alt_ids.fill_(-1)
@@ -425,9 +438,15 @@ def on_non_leaf_step(req_id: str | None, num_draft_tokens: int) -> None:
             _S.tree_vals.fill_(-1e30)
         _S.req_acc_state.zero_()
     elif 0 < num_draft_tokens < 6:
-        # Ceiling shortened depth on high-acceptance request -> hard-latch leaf mode off.
+        # Ceiling shortened depth on a high-acceptance request -> hard-latch leaf mode off once clamps repeat.
         _S.prev_ns.fill_(7)
-        _S.req_acc_state[2:3].fill_(2)
+        _S._clamps += 1
+        _S._since_clamp = 0
+        if _S._clamps >= LATCH_AFTER_CLAMPS:
+            _S.req_acc_state[2:3].fill_(2)
+        if _S._clamps <= 8:
+            logger.info("native_leaf: ceiling clamp %d (depth %d)%s", _S._clamps, num_draft_tokens,
+                        " -> leaves latched off" if _S._clamps >= LATCH_AFTER_CLAMPS else "")
 
 
 @torch.no_grad()
@@ -491,6 +510,8 @@ def setup_step(
     if req_id != _S._last_req_id:
         if LEAF_STATS and _S._last_req_id is not None:
             _dump_stats(str(_S._last_req_id))
+        _S._clamps = 0
+        _S._since_clamp = 0
         _S._last_req_id = req_id
         _S.prev_ns.fill_(7)
         _S.alt_ids.fill_(-1)
@@ -502,6 +523,13 @@ def setup_step(
             _S.tree_vals.fill_(-1e30)
         _S.req_acc_state.zero_()
     if eff_m > 8:
+        # Full-depth tree step: no clamp this round. Re-arm leaves after a clamp-free streak.
+        _S._since_clamp += 1
+        if _S._clamps >= LATCH_AFTER_CLAMPS and _S._since_clamp == LEAF_RELATCH_ROUNDS:
+            _S.req_acc_state[2:3].fill_(0)
+            if _S._clamps <= 32:
+                logger.info("native_leaf: leaves back on after %d clamp-free rounds (clamps so far %d)",
+                            LEAF_RELATCH_ROUNDS, _S._clamps)
         assert (
             _S.tree_top is not None
             and _S.saved_leaf_toks is not None
