@@ -36,6 +36,7 @@ PREFILL_PDL_ENABLED = os.environ.get("MUSE_GQA16_PREFILL_PDL", "1").strip() not 
 VERIFY_ENABLED = os.environ.get("MUSE_GQA16_VERIFY", "1").strip() not in ("0", "", "false", "no")
 VERIFY_SPLITS = int(os.environ.get("MUSE_GQA16_VERIFY_SPLITS", "1"))
 VERIFY_PIPE = os.environ.get("MUSE_GQA16_VERIFY_PIPE", "1").strip() not in ("0", "", "false", "no")
+VERIFY_GATE_EPILOGUE = os.environ.get("MUSE_VERIFY_GATE_EPILOGUE", "1").strip() not in ("0", "", "false", "no")
 NATIVE_LEAF_ENABLED = os.environ.get("MUSE_NATIVE_LEAF", "1").strip() not in ("0", "", "false", "no")
 
 _lib = None
@@ -85,6 +86,18 @@ try:
             ctypes.c_void_p,
         ]
         _lib.muse_gqa16_verify_leaf.restype = ctypes.c_int
+    if hasattr(_lib, "muse_gqa16_verify_leaf_gated"):
+        _lib.muse_gqa16_verify_leaf_gated.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        _lib.muse_gqa16_verify_leaf_gated.restype = ctypes.c_int
 except OSError:
     _lib = None
 
@@ -93,9 +106,12 @@ _state: dict[int, tuple[bool, int, int]] = {}  # dev_idx -> (admitted, scale_mod
 _prefill_state: dict[int, tuple[bool, int]] = {}  # dev_idx -> (admitted, scale_mode)
 _verify_state: dict[int, tuple[bool, int]] = {}  # dev_idx -> (admitted, scale_mode)
 _leaf_verify_admitted: dict[int, bool] = {}  # dev_idx -> 0-ULP native 1-leaf verify admitted
-_leaf_flag_bufs: dict[int, torch.Tensor] = {}  # dev_idx -> static int32[1] device flag
+_verify_gate_admitted: dict[int, bool] = {}  # dev_idx -> 0-ULP verify BF16 output-gate epilogue admitted
+_leaf_flag_bufs: dict[int, torch.Tensor] = {}  # dev_idx -> static int32[97] device flag
 _pending_prefill: tuple | None = None
+_pending_verify: tuple | None = None
 _pf_counts: dict[str, int] = {"defer": 0, "fused1": 0, "fused2": 0, "direct0": 0, "flush": 0, "miss": 0}
+_vf_counts: dict[str, int] = {"defer": 0, "fused_bf16": 0, "flush": 0}
 
 
 def get_leaf_flag(device: torch.device) -> torch.Tensor | None:
@@ -634,14 +650,134 @@ def self_check_verify(device: torch.device) -> bool:
             logger.warning("muse_gqa16_attn: native 1-leaf verify self-check raised on cuda:%d", idx, exc_info=True)
             leaf_ok = False
     _leaf_verify_admitted[idx] = leaf_ok
+    vgate_ok = False
+    if ok and g_splits == 1 and VERIFY_GATE_EPILOGUE and hasattr(_lib, "muse_gqa16_verify_leaf_gated"):
+        try:
+            import muse_norm_glue as G
+
+            gate_all = True
+            gen_g = torch.Generator(device=device).manual_seed(20261127)
+            stream_g = torch.cuda.current_stream(device).cuda_stream
+            for bs_g, sk_g, m_g in ((64, 528, 16), (64, 580, 16), (64, 544, 32), (64, 580, 32), (16, 142, 7), (64, 520, 2)):
+                n_blk_g = (sk_g + bs_g - 1) // bs_g + 1
+                kv_g = (torch.randn((n_blk_g, bs_g, 2, 256), generator=gen_g, device=device) * 0.7).to(torch.bfloat16)
+                kv_g_v = kv_g.permute(0, 2, 1, 3)
+                q_g = (torch.randn((m_g, 32, 128), generator=gen_g, device=device) * 0.7).to(torch.bfloat16)
+                bt_g = torch.arange(n_blk_g, dtype=torch.int32, device=device).unsqueeze(0)
+                sk_t = torch.tensor([sk_g], dtype=torch.int32, device=device)
+                cuq_t = torch.tensor([0, m_g], dtype=torch.int32, device=device)
+                attn_ref = torch.empty_like(q_g)
+                rc_u = _lib.muse_gqa16_verify_leaf(
+                    q_g.data_ptr(), kv_g_v.data_ptr(), attn_ref.data_ptr(),
+                    sk_t.data_ptr(), bt_g.data_ptr(), cuq_t.data_ptr(),
+                    m_g, bs_g, -1, 1, scale_mode | (16 if VERIFY_PIPE else 0),
+                    float(128.0 ** -0.5),
+                    q_g.stride(0), q_g.stride(1), attn_ref.stride(0), attn_ref.stride(1),
+                    kv_g_v.stride(0), kv_g_v.stride(2), kv_g_v.stride(1), 0, stream_g,
+                )
+                if rc_u != 0:
+                    gate_all = False
+                    break
+                for sig_g in (0.1, 1.0, 5.0, 20.0):
+                    gate_t = (torch.randn((m_g, 32, 128), generator=gen_g, device=device) * sig_g).to(torch.bfloat16)
+                    ref_out = torch.empty_like(q_g)
+                    got_out = torch.empty_like(q_g)
+                    G.mul_sigmoid_bf16(gate_t.view(-1), attn_ref.view(-1), ref_out.view(-1), ref_out.numel(), stream_g)
+                    rc_g = _lib.muse_gqa16_verify_leaf_gated(
+                        q_g.data_ptr(), kv_g_v.data_ptr(), gate_t.data_ptr(), got_out.data_ptr(),
+                        sk_t.data_ptr(), bt_g.data_ptr(), cuq_t.data_ptr(),
+                        m_g, bs_g, -1, 1, scale_mode | (16 if VERIFY_PIPE else 0),
+                        float(128.0 ** -0.5),
+                        q_g.stride(0), q_g.stride(1), got_out.stride(0), got_out.stride(1),
+                        kv_g_v.stride(0), kv_g_v.stride(2), kv_g_v.stride(1), 0, stream_g,
+                    )
+                    torch.cuda.synchronize(device)
+                    if rc_g != 0 or not torch.equal(got_out.view(torch.int16), ref_out.view(torch.int16)):
+                        gate_all = False
+                        break
+                if not gate_all:
+                    break
+            vgate_ok = gate_all
+        except Exception:  # noqa: BLE001
+            logger.warning("muse_gqa16_attn: verify BF16 gate epilogue self-check raised on cuda:%d", idx, exc_info=True)
+            vgate_ok = False
+    _verify_gate_admitted[idx] = vgate_ok
     if ok:
         logger.info(
-            "muse_gqa16_attn: strict 0-ULP verify (M=2..32) admitted on cuda:%d (grid_splits=%d, pipe=%d, scale_mode=%d, native_leaf=%d)",
-            idx, g_splits, int(VERIFY_PIPE), scale_mode, int(leaf_ok),
+            "muse_gqa16_attn: strict 0-ULP verify (M=2..32) admitted on cuda:%d (grid_splits=%d, pipe=%d, scale_mode=%d, native_leaf=%d, gate_epi=%d)",
+            idx, g_splits, int(VERIFY_PIPE), scale_mode, int(leaf_ok), int(vgate_ok),
         )
     else:
         logger.warning("muse_gqa16_attn: strict 0-ULP verify self-check failed on cuda:%d; keeping stock FA2", idx)
     return ok
+
+
+def flush_pending_verify(stream=None) -> None:
+    global _pending_verify
+    p = _pending_verify
+    if p is None:
+        return
+    _pending_verify = None
+    (
+        _out_ptr, _numel, query, kv_cache, output, seqused_k, block_table, cu_seqlens_q,
+        num_actual_tokens, block_size, w_left, mode_flags, softmax_scale, leaf_ptr, p_stream,
+    ) = p
+    st = int(p_stream) if stream is None else int(stream)
+    if leaf_ptr != 0:
+        rc = _lib.muse_gqa16_verify_leaf(
+            query.data_ptr(), kv_cache.data_ptr(), output.data_ptr(),
+            seqused_k.data_ptr(), block_table.data_ptr(), cu_seqlens_q.data_ptr(),
+            num_actual_tokens, block_size, w_left, 1, mode_flags, softmax_scale,
+            query.stride(0), query.stride(1), output.stride(0), output.stride(1),
+            kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), leaf_ptr, st,
+        )
+    else:
+        rc = _lib.muse_gqa16_verify(
+            query.data_ptr(), kv_cache.data_ptr(), output.data_ptr(),
+            seqused_k.data_ptr(), block_table.data_ptr(), cu_seqlens_q.data_ptr(),
+            num_actual_tokens, block_size, w_left, 1, mode_flags, softmax_scale,
+            query.stride(0), query.stride(1), output.stride(0), output.stride(1),
+            kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), st,
+        )
+    _vf_counts["flush"] += 1
+    if rc != 0:
+        raise RuntimeError(f"muse_gqa16_verify flush failed with cuda error {rc}")
+
+
+def consume_verify_mul_sigmoid(attn: torch.Tensor, gate: torch.Tensor, out: torch.Tensor, stream) -> bool:
+    global _pending_verify
+    p = _pending_verify
+    if p is None:
+        return False
+    (
+        out_ptr, numel, query, kv_cache, attn_buf, seqused_k, block_table, cu_seqlens_q,
+        num_actual_tokens, block_size, w_left, mode_flags, softmax_scale, leaf_ptr, p_stream,
+    ) = p
+    st = int(stream)
+    if (
+        attn.data_ptr() != out_ptr
+        or attn.numel() != numel
+        or st != int(p_stream)
+        or not gate.is_cuda or not out.is_cuda
+        or gate.dtype != torch.bfloat16 or out.dtype != torch.bfloat16
+        or not gate.is_contiguous() or not out.is_contiguous()
+        or gate.numel() != numel or out.numel() != numel
+        or ((gate.data_ptr() | out.data_ptr()) & 15) != 0
+    ):
+        flush_pending_verify(stream)
+        return False
+    _pending_verify = None
+    rc = _lib.muse_gqa16_verify_leaf_gated(
+        query.data_ptr(), kv_cache.data_ptr(), gate.data_ptr(), out.data_ptr(),
+        seqused_k.data_ptr(), block_table.data_ptr(), cu_seqlens_q.data_ptr(),
+        num_actual_tokens, block_size, w_left, 1, mode_flags, softmax_scale,
+        query.stride(0), query.stride(1), attn_buf.stride(0), attn_buf.stride(1),
+        kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1), leaf_ptr, st,
+    )
+    if rc != 0:
+        raise RuntimeError(f"muse_gqa16_verify_leaf_gated failed with cuda error {rc}")
+    _vf_counts["fused_bf16"] += 1
+    return True
 
 
 def try_verify_gqa16(
@@ -720,6 +856,49 @@ def try_verify_gqa16(
         lf = get_leaf_flag(device)
         if lf is not None:
             leaf_ptr = lf.data_ptr()
+    if leaf_ptr != 0 or g_splits == 1:
+        global _pending_verify
+        if _pending_verify is not None:
+            flush_pending_verify(stream)
+        can_defer = (
+            VERIFY_GATE_EPILOGUE
+            and g_splits == 1
+            and _verify_gate_admitted.get(idx, False)
+            and output.is_contiguous()
+            and output.shape == (num_actual_tokens, 32, 128)
+        )
+        if can_defer:
+            try:
+                from vllm.model_executor.models import muse_glimmer_norm_glue as _ng_mod
+                from vllm.model_executor.models import muse_glimmer as _mg_mod
+                side_active = bool(getattr(getattr(_mg_mod, "_gate_side_stream", None), "active", False))
+                can_defer = (
+                    not side_active
+                    and bool(getattr(_ng_mod, "_installed", False))
+                    and bool(getattr(_ng_mod, "_MUL_SIGMOID_GLUE", False))
+                )
+            except Exception:
+                can_defer = False
+        if can_defer:
+            _pending_verify = (
+                output.data_ptr(),
+                output.numel(),
+                query,
+                kv_cache,
+                output,
+                seqused_k,
+                block_table,
+                cu_seqlens_q,
+                int(num_actual_tokens),
+                block_size,
+                w_left,
+                vst[1] | pipe_bit,
+                softmax_scale,
+                leaf_ptr,
+                stream,
+            )
+            _vf_counts["defer"] += 1
+            return True
     if leaf_ptr != 0:
         rc = _lib.muse_gqa16_verify_leaf(
             query.data_ptr(),

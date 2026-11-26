@@ -315,6 +315,8 @@ def _flush_gqa16_prefill(stream=None) -> None:
         import muse_gqa16_attn as _gqa
         if _gqa._pending_prefill is not None:
             _gqa.flush_pending_prefill(stream)
+        if getattr(_gqa, "_pending_verify", None) is not None:
+            _gqa.flush_pending_verify(stream)
     except Exception:
         pass
 
@@ -330,6 +332,16 @@ def _consume_gqa16_prefill(attn, gate, out, fp8_scale=None, stream=None) -> bool
         import muse_gqa16_attn as _gqa
         if _gqa._pending_prefill is not None:
             return _gqa.consume_prefill_mul_sigmoid(attn, gate, out, fp8_scale, stream)
+    except Exception:
+        pass
+    return False
+
+
+def _consume_gqa16_verify(attn, gate, out, stream=None) -> bool:
+    try:
+        import muse_gqa16_attn as _gqa
+        if getattr(_gqa, "_pending_verify", None) is not None:
+            return _gqa.consume_verify_mul_sigmoid(attn, gate, out, stream)
     except Exception:
         pass
     return False
@@ -418,6 +430,8 @@ class _MulSigmoidSwap:
                     pass
             return None
         if n_el > 4096 and _consume_gqa16_prefill(attn, gate, out, None, stream):
+            return None
+        if 8192 <= n_el <= 32 * 4096 and _consume_gqa16_verify(attn, gate, out, stream):
             return None
         if _OPROJ_SIGMOID_FUSE and _oproj_fuse_state != "rejected" and n_el == 4096:
             try:
@@ -704,6 +718,13 @@ class _RansPrologueHook:
         global _pending_rans_prologue
         if kwargs.get("benchmark_run", False):
             return orig_run(kernel, *args, **kwargs)
+        if self.act_mode == 1:
+            try:
+                import muse_gqa16_attn as _gqa
+                if getattr(_gqa, "_pending_verify", None) is not None:
+                    _gqa.flush_pending_verify(kwargs.get("stream"))
+            except Exception:
+                pass
         if _pending_rans_prologue is not None:
             if self.act_mode == 1 and self._try_prefill_sigmoid_fp8(kernel, orig_run, args, kwargs):
                 return None
@@ -1397,6 +1418,13 @@ def install_norm_glue() -> None:
                 swap = None
             self.__dict__["_norm_glue_swap"] = swap
         if swap is None:
+            if not kwargs.get("benchmark_run", False):
+                try:
+                    import muse_gqa16_attn as _gqa
+                    if getattr(_gqa, "_pending_verify", None) is not None:
+                        _gqa.flush_pending_verify(kwargs.get("stream"))
+                except Exception:
+                    pass
             return prev_run(self, *args, **kwargs)
         return swap.run(self, prev_run, args, kwargs)
 
