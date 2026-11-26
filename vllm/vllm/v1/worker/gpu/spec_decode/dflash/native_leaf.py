@@ -17,10 +17,24 @@ Controls:
   MUSE_NATIVE_LEAF_THRESH=3   activate leaf mode when prior verify committed <= thresh
   MUSE_NATIVE_LEAF_SELFTEST=0 1 places d1 in row 6 to verify bitwise logits[6] == logits[1]
   MUSE_NATIVE_LEAF_NOHIT=0    1 disables hit promotion (diagnostic)
+  MUSE_TREE_ECHO=1            target-echo candidates (0 restores the parent tree exactly)
+  MUSE_TREE_ECHO_LOGIT=-1.0   scorer logit of the depth-1 echo candidate relative to the drafter top-1
+                              (deeper echoes are discounted per depth, see _echo_depth_logits)
+
+Target-echo candidates (tree mode, proposals only):
+  A verify pass computes the target argmax for every chain row, including the rows after the
+  first rejected draft token. Those "stale" outputs are the target's own continuation of a
+  context that differs from the committed one in the rejected token(s). After the commit the
+  stale output of chain row ns+j-1 predicts exactly the position of the next round's draft
+  token d_j, so it is offered to the next round's tree allocator as one more candidate at
+  depth j whenever the new draft's top-6 for that depth does not already contain it (it takes
+  the place of the rank-6 entry). If it is already listed at rank 3..6 that entry is raised to
+  the echo logit of its depth. Column 0 (the main chain) and rank 2 are never modified.
 """
 from __future__ import annotations
 
 import atexit
+import math
 import os
 from typing import Any
 
@@ -68,6 +82,23 @@ LEAF_STATS = os.environ.get("MUSE_LEAF_STATS", "0").strip() in ("1", "true", "ye
 _ST_RAW = os.environ.get("MUSE_NATIVE_LEAF_SELFTEST", "0").strip().lower()
 SELFTEST = 1 if _ST_RAW in ("1", "true", "yes") else (2 if _ST_RAW == "2" else 0)
 NOHIT = os.environ.get("MUSE_NATIVE_LEAF_NOHIT", "0").strip() in ("1", "true", "yes")
+ECHO = os.environ.get("MUSE_TREE_ECHO", "1").strip() not in ("0", "", "false", "no")
+try:
+    ECHO_LOGIT = float(os.environ.get("MUSE_TREE_ECHO_LOGIT", "-1.0").strip() or "-1.0")
+except ValueError:
+    ECHO_LOGIT = -1.0
+ECHO_LOGIT = max(-8.0, min(0.0, ECHO_LOGIT))
+# Mirrors kCalA[6] / kCalC[6] / CAL_A2 / CAL_BETA of the calibrated scorer in native_leaf.cu: a
+# candidate in rank column r with logit z scores exp(a + kCalC[r] + CAL_BETA * (z - z0)), so the
+# offset dz[r] = (G - kCalC[r]) / CAL_BETA gives an echo candidate the scorer logit G relative to
+# the drafter top-1, whichever column carries it.
+_ECHO_CAL_A = (1.675690, 1.258784, 1.070196, 1.171448, 1.102070, 0.731610)
+_ECHO_CAL_C = (0.000000, -0.402942, -0.763639, -0.817452, -1.416669, -1.642223)
+_ECHO_CAL_A2 = -1.614419
+_ECHO_CAL_BETA = 0.851144
+# The echo needs the calibrated dynamic allocator (the uncalibrated scorer derives its tail
+# mass from the last listed logit, which an injected value would distort).
+ECHO_ACTIVE = bool(ECHO and TREE_DYNAMIC and TREE_CALIB and SELFTEST == 0 and TREE_M in (12, 16))
 
 
 class _NativeLeafState:
@@ -90,6 +121,12 @@ class _NativeLeafState:
         self.saved_leaf_k: torch.Tensor | None = None       # int32[16] (tree mode)
         self.saved_leaf_parent: torch.Tensor | None = None  # int32[16] (-1=1-level root, 7..15=parent row)
         self.stats: torch.Tensor | None = None              # int64[32] telemetry counters
+        self.echo_ext: torch.Tensor | None = None           # int64[13] chain target argmax 0..6, then -1
+        self.echo_toks: torch.Tensor | None = None          # int64[6] echo candidate for next-round d1..d6
+        self.echo_ar: torch.Tensor | None = None            # int64[6] 0..5
+        self.echo_dz: torch.Tensor | None = None            # float32[6, 6] per-depth, per-rank logit offset
+        self.echo_live: bool = False                        # host flag: echo_toks belongs to the next verify
+        self.echo_off: bool = False                         # host flag: latched off after a host-side error
         # Static 52-layer target KV metadata for 1-launch all-layer KV fix on hit.
         self.num_layers: int = 0
         self.kv_ptrs: torch.Tensor | None = None
@@ -243,6 +280,88 @@ def get_tree_vals_buf(device: torch.device) -> torch.Tensor | None:
     return _S.tree_vals
 
 
+def _echo_depth_logits() -> list[float]:
+    """Scorer logit of the echo candidate at depth 1..6.
+
+    The depth-1 echo saw one wrong token (the rejected draft token). The depth-j echo additionally
+    saw the j-1 old draft tokens that followed the rejected one, so it is only as good as those
+    post-miss tokens. Each extra depth is discounted by the scorer's own post-miss versus pre-miss
+    top-1 odds at neutral features, log(sigmoid(a_j + CAL_A2) / sigmoid(a_j)) (about -0.7 per
+    depth), instead of a new free constant.
+    """
+    out = [ECHO_LOGIT]
+    for j in range(1, 6):
+        a = _ECHO_CAL_A[j]
+        p_pre = 1.0 / (1.0 + math.exp(-a))
+        p_post = 1.0 / (1.0 + math.exp(-(a + _ECHO_CAL_A2)))
+        out.append(out[-1] + math.log(p_post / p_pre))
+    return out
+
+
+def _echo_dz_table(device: torch.device) -> torch.Tensor:
+    """float32[6, 6] (row = depth - 1, column = rank - 1) logit offsets vs the row's top-1.
+
+    Columns 0 and 1 hold -1e30, so the main chain and the rank-2 entry are never modified.
+    """
+    rows = [
+        [-1e30, -1e30] + [(g - c) / _ECHO_CAL_BETA for c in _ECHO_CAL_C[2:]]
+        for g in _echo_depth_logits()
+    ]
+    return torch.tensor(rows, dtype=torch.float32, device=device)
+
+
+def _echo_capture(
+    sampled_row: torch.Tensor,
+    ns: torch.Tensor,
+    ext: torch.Tensor,
+    ar: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """out[j-1] <- target argmax of chain row ns+j-1 (j=1..6), or -1 when that row does not exist.
+
+    sampled_row: int64[>=7], the target argmax of chain rows 0..6 after the tree commit (entries
+    below the final ns are the committed tokens, entries from ns on are the stale outputs).
+    ns: int32[1], the final committed count (1..7). ext: int64[13] scratch whose tail stays -1.
+    No host sync: three tiny device ops.
+    """
+    ext[:7].copy_(sampled_row[:7])
+    idx = (ns + ar).clamp_(0, 12)
+    out.copy_(ext[idx])
+
+
+def _echo_inject(
+    top: torch.Tensor,
+    vals: torch.Tensor,
+    echo: torch.Tensor,
+    dz: torch.Tensor,
+) -> None:
+    """Offer echo[j] as a depth-(j+1) candidate inside the drafter top-6 tables (in place).
+
+    top: int64[6, 6] view of tree_top, vals: float32[6, 6] view of tree_vals (row = depth - 1,
+    column = rank - 1). Column 0 is never written. A valid echo token that is absent from its
+    row replaces the rank-6 entry; an echo token found in columns 2..5 (or just placed in column
+    5) gets its logit raised to z0 + dz[row, column] (a freshly placed echo therefore scores at
+    least as high as the rank-6 entry it replaces). Rows with echo < 0 are left bit-identical.
+    """
+    e = echo.unsqueeze(1)
+    present = top.eq(e) & e.ge(0)
+    fresh = present.any(dim=1).logical_not_() & echo.ge(0)
+    top[:, 5].copy_(torch.where(fresh, echo, top[:, 5]))
+    present[:, 5].logical_or_(fresh)
+    vals.copy_(torch.where(present, torch.maximum(vals, vals[:, :1] + dz), vals))
+
+
+def _echo_clear() -> None:
+    _S.echo_live = False
+
+
+def _echo_fail(exc: Exception) -> None:
+    """A host-side error in the echo path switches the echo off for the process (parent tree)."""
+    _S.echo_live = False
+    _S.echo_off = True
+    logger.warning("native_leaf: target echo disabled after error (%s)", exc)
+
+
 def init_kv_table(
     kv_caches_dict: dict[str, torch.Tensor],
     kv_cache_config: Any,
@@ -365,6 +484,11 @@ def init_kv_table(
         _S.saved_leaf_k = torch.zeros((16,), dtype=torch.int32, device=device)
         _S.saved_leaf_parent = torch.full((16,), -1, dtype=torch.int32, device=device)
         _S.stats = torch.zeros((32,), dtype=torch.int64, device=device)
+        _S.echo_ext = torch.full((13,), -1, dtype=torch.int64, device=device)
+        _S.echo_toks = torch.full((6,), -1, dtype=torch.int64, device=device)
+        _S.echo_ar = torch.arange(6, dtype=torch.int64, device=device)
+        _S.echo_dz = _echo_dz_table(device)
+        _S.echo_live = False
         _S.num_layers = len(kv_ptrs)
         _S.kv_ptrs = torch.tensor(kv_ptrs, dtype=torch.int64, device=device)
         _S.stride_block = torch.tensor(s_blk, dtype=torch.int64, device=device)
@@ -391,8 +515,8 @@ def init_kv_table(
             _S._atexit_registered = True
             atexit.register(_dump_stats, "atexit")
     logger.info(
-        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, dynamic=%d [calib=%d,depth<=%d,T=%.2f,tail=%.1f,g=%.2f,adapt=%d,sub=%.2f,shf=%.2f,cont=%.2f,hi_cpc=%.1f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d, stats=%d)",
-        _S.num_layers, _S.tree_m_ready, int(TREE_DYNAMIC), int(TREE_CALIB), TREE_MAX_DEPTH, TREE_TEMP, TREE_TAIL, TREE_GAMMA,
+        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, echo=%d@%.2f, dynamic=%d [calib=%d,depth<=%d,T=%.2f,tail=%.1f,g=%.2f,adapt=%d,sub=%.2f,shf=%.2f,cont=%.2f,hi_cpc=%.1f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d, stats=%d)",
+        _S.num_layers, _S.tree_m_ready, int(ECHO_ACTIVE), ECHO_LOGIT, int(TREE_DYNAMIC), int(TREE_CALIB), TREE_MAX_DEPTH, TREE_TEMP, TREE_TAIL, TREE_GAMMA,
         int(TREE_ADAPT_GAMMA), TREE_SUB_COEF, TREE_SHF_COEF, TREE_CONT_DECAY, TREE_HIGH_ACC_CPC,
         int(_S.m8_ready), _POLICY_RAW, MARGIN_ALPHA, LOW_THRESH, int(SELFTEST), int(NOHIT), int(LEAF_STATS),
     )
@@ -411,6 +535,7 @@ def on_non_leaf_step(req_id: str | None, num_draft_tokens: int) -> None:
         and _S.req_acc_state is not None
     )
     _S.leaf_flag[:1].zero_()
+    _echo_clear()
     if req_id is None or req_id != _S._last_req_id or num_draft_tokens == 0:
         if LEAF_STATS and _S._last_req_id is not None and (req_id != _S._last_req_id or num_draft_tokens == 0):
             _dump_stats(str(_S._last_req_id))
@@ -487,8 +612,12 @@ def setup_step(
         or slot_mappings.stride(1) != 1
     ):
         _S.leaf_flag[:1].zero_()
+        _echo_clear()
         return False
+    echo_live = _S.echo_live
+    _S.echo_live = False
     if req_id != _S._last_req_id:
+        echo_live = False
         if LEAF_STATS and _S._last_req_id is not None:
             _dump_stats(str(_S._last_req_id))
         _S._last_req_id = req_id
@@ -507,6 +636,21 @@ def setup_step(
             and _S.saved_leaf_toks is not None
             and _S.saved_leaf_k is not None
         )
+        if (
+            echo_live
+            and ECHO_ACTIVE
+            and _S.tree_vals is not None
+            and _S.echo_toks is not None
+            and _S.echo_dz is not None
+            and _S.tree_top.numel() == 36
+            and _S.tree_vals.numel() == 36
+        ):
+            # Previous verify of this request left the target's stale chain outputs: offer them
+            # to the allocator before it reads the drafter top-6 tables (in place, same stream).
+            try:
+                _echo_inject(_S.tree_top.view(6, 6), _S.tree_vals.view(6, 6), _S.echo_toks, _S.echo_dz)
+            except Exception as exc:  # noqa: BLE001
+                _echo_fail(exc)
         try:
             bfx.native_leaf_setup_tree(
                 _S.leaf_flag,
@@ -638,7 +782,31 @@ def commit_and_fix(
                 _S.req_acc_state,
             )
         src_row_buf = _S.hit_src_row
+        # Target echo: keep the stale chain outputs for the next round. Only on the fused
+        # lm_head+argmax verify path, recognised by leaf_u_tok being columns 7.. of the very
+        # buffer sampled_tokens views (all 16 entries are then in-vocabulary target argmax ids;
+        # the stock sampler path may leave placeholders in rejected columns).
+        _S.echo_live = False
+        if (
+            ECHO_ACTIVE
+            and not _S.echo_off
+            and _S.echo_ext is not None
+            and _S.echo_toks is not None
+            and _S.echo_ar is not None
+            and sampled_tokens.dtype == torch.int64
+            and sampled_tokens.is_cuda
+            and sampled_tokens.numel() == 7
+            and leaf_u_tok.dtype == torch.int64
+            and leaf_u_tok.numel() == eff_m - 7
+            and leaf_u_tok.data_ptr() == sampled_tokens.data_ptr() + 7 * 8
+        ):
+            try:
+                _echo_capture(sampled_tokens.reshape(-1), _S.prev_ns, _S.echo_ext, _S.echo_ar, _S.echo_toks)
+                _S.echo_live = True
+            except Exception as exc:  # noqa: BLE001
+                _echo_fail(exc)
     else:
+        _S.echo_live = False
         bfx.native_leaf_commit(
             _S.leaf_flag,
             _S.prev_ns,
