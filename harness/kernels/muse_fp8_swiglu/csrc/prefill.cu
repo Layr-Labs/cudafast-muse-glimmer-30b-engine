@@ -294,26 +294,48 @@ swiglu_ws_256_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_const
     if (tid == 0 && g + 1 < total) produce(g + 1);
     mbar_wait(full0 + 8 * s, n & 1);
     const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-#pragma unroll
-    for (int ks = 0; ks < KT / 32; ++ks) {
-      uint32_t a_reg[MW][4], b_reg[NW][2];
-#pragma unroll
-      for (int i = 0; i < MW; ++i) {
+    {
+      constexpr int NP = NW / 2;
+      constexpr int NKS = KT / 32;
+      auto load_a_i = [&](int ks, int i, uint32_t (&a)[MW][4]) {
         const int r = wm * MW * 16 + i * 16 + ar;
-        ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, a_reg[i]);
+        ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, a[i]);
+      };
+      auto load_bp = [&](int ks, int jp, uint32_t (&bp)[4]) {
+        const int r = wn * NW * 8 + jp * 16 + br;
+        ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, bp);
+      };
+      uint32_t a_reg[2][MW][4];
+      uint32_t bp[2][4];
+#pragma unroll
+      for (int i = 0; i < MW; ++i) load_a_i(0, i, a_reg[0]);
+      load_bp(0, 0, bp[0]);
+#pragma unroll
+      for (int ks = 0; ks < NKS; ++ks) {
+        const int cur = ks & 1, nxt = cur ^ 1;
+#pragma unroll
+        for (int jp = 0; jp < NP; ++jp) {
+          const int step = ks * NP + jp;
+          const int bcur = step & 1, bnxt = bcur ^ 1;
+          const int j0 = 2 * jp, j1 = j0 + 1;
+          if (jp + 1 < NP) {
+            load_bp(ks, jp + 1, bp[bnxt]);
+          } else if (ks + 1 < NKS) {
+            load_bp(ks + 1, 0, bp[bnxt]);
+          }
+          mma_fp8(a_reg[cur][0], bp[bcur][0], bp[bcur][1], acc[0][j0]);
+          mma_fp8(a_reg[cur][0], bp[bcur][2], bp[bcur][3], acc[0][j1]);
+          mma_fp8(a_reg[cur][1], bp[bcur][0], bp[bcur][1], acc[1][j0]);
+          mma_fp8(a_reg[cur][1], bp[bcur][2], bp[bcur][3], acc[1][j1]);
+          if (ks + 1 < NKS) {
+            load_a_i(ks + 1, jp, a_reg[nxt]);
+          }
+          mma_fp8(a_reg[cur][2], bp[bcur][0], bp[bcur][1], acc[2][j0]);
+          mma_fp8(a_reg[cur][2], bp[bcur][2], bp[bcur][3], acc[2][j1]);
+          mma_fp8(a_reg[cur][3], bp[bcur][0], bp[bcur][1], acc[3][j0]);
+          mma_fp8(a_reg[cur][3], bp[bcur][2], bp[bcur][3], acc[3][j1]);
+        }
       }
-#pragma unroll
-      for (int j = 0; j < NW / 2; ++j) {
-        const int r = wn * NW * 8 + j * 16 + br;
-        uint32_t qd[4];
-        ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, qd);
-        b_reg[2 * j][0] = qd[0]; b_reg[2 * j][1] = qd[1];
-        b_reg[2 * j + 1][0] = qd[2]; b_reg[2 * j + 1][1] = qd[3];
-      }
-#pragma unroll
-      for (int i = 0; i < MW; ++i)
-#pragma unroll
-        for (int j = 0; j < NW; ++j) mma_fp8(a_reg[i], b_reg[j][0], b_reg[j][1], acc[i][j]);
     }
     __syncwarp();
     if (lane == 0) mbar_arrive(empty0 + 8 * s);
@@ -338,40 +360,43 @@ constexpr int NT_WS9 = (NWARP + 1) * 32;
 
 __device__ __forceinline__ void consume_stage_pipe_sw(
     uint32_t abase, uint32_t wbase, int wm, int wn, int ar, int ach, int br, int bch, float (&acc)[2][NW][4]) {
+  constexpr int NP = NW / 2;
+  constexpr int NKS = KT / 32;
   auto load_a_i = [&](int ks, int i, uint32_t (&a)[2][4]) {
     const int r = wm * 32 + i * 16 + ar;
     ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, a[i]);
   };
-  auto load_b_j = [&](int ks, int j, uint32_t (&b)[NW][2]) {
-    const int r = wn * NW * 8 + j * 16 + br;
-    uint32_t qd[4];
-    ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, qd);
-    b[2 * j][0] = qd[0];
-    b[2 * j][1] = qd[1];
-    b[2 * j + 1][0] = qd[2];
-    b[2 * j + 1][1] = qd[3];
+  auto load_bp = [&](int ks, int jp, uint32_t (&bp)[4]) {
+    const int r = wn * NW * 8 + jp * 16 + br;
+    ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, bp);
   };
-  uint32_t a[2][2][4], b[2][NW][2];
+  // Streaming 2-slot B-pair ring (8 regs vs 32 regs) + jp-outer 4-QMMA/B-LDSM scheduling
+  // preserving exact ascending-K (ks=0..3) accumulation order (0-ULP bit-identical).
+  uint32_t a[2][2][4];
+  uint32_t bp[2][4];
 #pragma unroll
   for (int i = 0; i < 2; ++i) load_a_i(0, i, a[0]);
+  load_bp(0, 0, bp[0]);
 #pragma unroll
-  for (int j = 0; j < NW / 2; ++j) load_b_j(0, j, b[0]);
-#pragma unroll
-  for (int ks = 0; ks < KT / 32; ++ks) {
+  for (int ks = 0; ks < NKS; ++ks) {
     const int cur = ks & 1, nxt = cur ^ 1;
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-#pragma unroll
-      for (int j = 0; j < NW; ++j) {
-        mma_fp8(a[cur][i], b[cur][j][0], b[cur][j][1], acc[i][j]);
-        if (ks + 1 < KT / 32) {
-          if (i == 0 && (j == 0 || j == 2)) {
-            load_a_i(ks + 1, j >> 1, a[nxt]);
-          } else if (i == 1 && (j & 1) == 0) {
-            load_b_j(ks + 1, j >> 1, b[nxt]);
-          }
-        }
+    for (int jp = 0; jp < NP; ++jp) {
+      const int step = ks * NP + jp;
+      const int bcur = step & 1, bnxt = bcur ^ 1;
+      const int j0 = 2 * jp, j1 = j0 + 1;
+      if (jp + 1 < NP) {
+        load_bp(ks, jp + 1, bp[bnxt]);
+      } else if (ks + 1 < NKS) {
+        load_bp(ks + 1, 0, bp[bnxt]);
       }
+      mma_fp8(a[cur][0], bp[bcur][0], bp[bcur][1], acc[0][j0]);
+      mma_fp8(a[cur][0], bp[bcur][2], bp[bcur][3], acc[0][j1]);
+      if (ks + 1 < NKS && jp < 2) {
+        load_a_i(ks + 1, jp, a[nxt]);
+      }
+      mma_fp8(a[cur][1], bp[bcur][0], bp[bcur][1], acc[1][j0]);
+      mma_fp8(a[cur][1], bp[bcur][2], bp[bcur][3], acc[1][j1]);
     }
   }
 }
