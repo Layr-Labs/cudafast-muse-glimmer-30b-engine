@@ -81,6 +81,11 @@ _sk_tma4_ilv_lmpost_m = getattr(_lib, "muse_marlin6_sk_tma4_ilv_lmpost_m", None)
 if _sk_tma4_ilv_lmpost_m is not None:
     _sk_tma4_ilv_lmpost_m.argtypes = [ctypes.c_void_p] * 10 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
     _sk_tma4_ilv_lmpost_m.restype = ctypes.c_int
+# H2 (MUSE_LM_MIPS): the same fused Pad128 lm_head + lmpost kernels restricted to a 128-column tile mask.
+_lmmips_lmpost = getattr(_lib, "muse_marlin6_lmmips_lmpost", None)
+if _lmmips_lmpost is not None:
+    _lmmips_lmpost.argtypes = [ctypes.c_void_p] * 13 + [ctypes.c_int] * 7 + [ctypes.c_void_p]
+    _lmmips_lmpost.restype = ctypes.c_int
 _sk_tma4_ilv = getattr(_lib, "muse_marlin6_sk_tma4_ilv", None)
 if _sk_tma4_ilv is not None:
     _sk_tma4_ilv.argtypes = _gemv6.argtypes
@@ -1053,7 +1058,7 @@ def _get_lmpost_m_bufs(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     return bufs
 
 
-def launch_lmhead_lmpost6(
+def _launch_lmhead_lmpost6_dense(
     x: torch.Tensor,
     layer: torch.nn.Module,
     lut: torch.Tensor,
@@ -1143,7 +1148,7 @@ def admit_tma4_lmpost(
             raw = raw[:, :org_vocab_size].contiguous()
         ref = lmpost_argmax(raw, mult, cap)
         out_tok.fill_(-1)
-        if not launch_lmhead_lmpost6(x, layer, lut, out_tok, org_vocab_size):
+        if not _launch_lmhead_lmpost6_dense(x, layer, lut, out_tok, org_vocab_size):
             return False
         torch.cuda.synchronize(dev)
         if (
@@ -1159,10 +1164,11 @@ def admit_tma4_lmpost(
         "Fused lm_head+lmpost decode6 kernel admitted bitwise (n=%d, vocab=%d, k=%d, ilv=%s, split2=%s, pad128=%s)",
         n, org_vocab_size, k, is_ilv, is_lm_split2(scales6), pad128,
     )
+    _maybe_admit_lmmips(layer, lut, org_vocab_size, lmpost_argmax, mult, cap, multi=False)
     return True
 
 
-def launch_lmhead_lmpost6_m(
+def _launch_lmhead_lmpost6_m_dense(
     x: torch.Tensor,
     layer: torch.nn.Module,
     lut: torch.Tensor,
@@ -1260,7 +1266,7 @@ def admit_tma4_lmpost_m(
                 refs.append(ref_r.view(-1))
             ref = torch.cat(refs, dim=0).view(1, cm)
             out_tok.fill_(-1)
-            if not launch_lmhead_lmpost6_m(x, layer, lut, out_tok, org_vocab_size):
+            if not _launch_lmhead_lmpost6_m_dense(x, layer, lut, out_tok, org_vocab_size):
                 return False
             torch.cuda.synchronize(dev)
             if (
@@ -1275,7 +1281,273 @@ def admit_tma4_lmpost_m(
         "Fused multi-M lm_head+lmpost decode6 kernel admitted bitwise (n=%d, vocab=%d, k=%d, split2=%s, pad128=%s)",
         n, org_vocab_size, k, is_lm_split2(scales6), pad128,
     )
+    _maybe_admit_lmmips(layer, lut, org_vocab_size, lmpost_argmax, mult, cap, multi=True)
     return True
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# H2 (MUSE_LM_MIPS=1, default off): exact subspace branch-and-bound lm_head argmax (harness/kernels/lmmips).
+_LMMIPS_REQUIRED = ("tma4_tile_states", "build_state", "self_check", "run", "_load")
+_lmmips_cached = None
+
+
+def _lmmips_mod():
+    """The lmmips package built next to this file ($KERNELS_OUT/lmmips), loaded by path so a stale or shadowing
+    `lmmips` elsewhere on sys.path cannot be picked up; falls back to `import lmmips`. Raises ImportError naming
+    the module file if a required symbol (e.g. tma4_tile_states) is missing."""
+    global _lmmips_cached
+    if _lmmips_cached is not None:
+        return _lmmips_cached
+    import importlib
+    import importlib.util
+    import sys
+
+    mod = None
+    init = Path(__file__).with_name("lmmips") / "__init__.py"
+    if init.is_file():
+        spec = importlib.util.spec_from_file_location("lmmips", init, submodule_search_locations=[str(init.parent)])
+        if spec is not None and spec.loader is not None:
+            mod = importlib.util.module_from_spec(spec)
+            prev = sys.modules.get("lmmips")
+            sys.modules["lmmips"] = mod
+            try:
+                spec.loader.exec_module(mod)
+            except Exception:
+                if prev is None:
+                    sys.modules.pop("lmmips", None)
+                else:
+                    sys.modules["lmmips"] = prev
+                raise
+    if mod is None:
+        try:
+            mod = importlib.import_module("lmmips")
+        except ImportError:
+            return None
+    missing = [a for a in _LMMIPS_REQUIRED if not hasattr(mod, a)]
+    if missing:
+        raise ImportError(
+            f"lmmips module {getattr(mod, '__file__', '?')} lacks {', '.join(missing)} (stale build? rerun "
+            "harness/kernels/lmmips/build.sh)"
+        )
+    _lmmips_cached = mod
+    return mod
+
+
+def _lmmips_active(layer: torch.nn.Module, multi: bool):
+    st = getattr(layer, "_lmmips_state", None)
+    if st is None or not st.ok.get("multi" if multi else "single", False):
+        return None
+    if os.environ.get("MUSE_LM_MIPS", "0") in ("", "0"):
+        return None
+    return st
+
+
+def _lmmips_masked_launcher(layer: torch.nn.Module, lut: torch.Tensor, org_vocab_size: int, lmm):
+    s6 = layer._marlin_decode_scales6
+    # the masked kernel walks only kept tiles and resumes each CTA's rANS scale stream from these entry states
+    tile_states = getattr(layer, "_lmmips_tile_states", None)
+    if tile_states is None:
+        tile_states = lmm.tma4_tile_states(s6)  # exported in lmmips.__all__
+        layer._lmmips_tile_states = tile_states
+    ts_ptr = tile_states.data_ptr()
+    n, k = LM_HEAD_PAD128_N, layer.input_size_per_partition
+    blocks = 96 if is_lm_split2(s6) else 48
+    w_ptr = layer._marlin_decode_weight.data_ptr()
+    s_ptr = s6.data_ptr()
+    p_ptr = layer._marlin_decode_palette.data_ptr()
+    g_ptr = layer.weight_global_scale.data_ptr()
+    ws_ptr = layer.workspace.data_ptr()
+    lut_ptr = lut.data_ptr()
+
+    def launch(x: torch.Tensor, mask: torch.Tensor, tok: torch.Tensor, val: torch.Tensor, multi: bool) -> None:
+        scratch, partials = (_get_lmpost_m_bufs if multi else _get_lmpost_bufs)(x.device)
+        rc = _lmmips_lmpost(
+            x.data_ptr(), w_ptr, scratch.data_ptr(), partials.data_ptr(), s_ptr, p_ptr, g_ptr, ws_ptr,
+            lut_ptr, tok.data_ptr(), val.data_ptr(), mask.data_ptr(), ts_ptr,
+            int(org_vocab_size), int(x.shape[0]), int(multi), n, k, blocks, x.device.index,
+            torch.cuda.current_stream(x.device).cuda_stream,
+        )
+        if rc:
+            raise RuntimeError(f"muse_marlin6_lmmips_lmpost failed with CUDA error {rc}")
+
+    # ts_ptr is a raw pointer into tile_states: keep the tensor alive as long as the launcher exists, even if
+    # layer._lmmips_tile_states is later cleared.
+    launch._tile_states = tile_states
+    return launch
+
+
+def _lmmips_probe_rows(layer: torch.nn.Module, n: int, k: int) -> torch.Tensor:
+    """Effective dense rows W~ [n, k] bf16 = bf16(fl32(b * g)), read through the dense GEMV with identity probes."""
+    dev = layer._marlin_decode_scales6.device
+    wt = torch.empty((n, k), dtype=torch.bfloat16, device=dev)
+    eye = torch.zeros((16, k), dtype=torch.bfloat16, device=dev)
+    for j0 in range(0, k, 16):
+        eye.zero_()
+        cols = min(16, k - j0)
+        eye[torch.arange(cols, device=dev), j0 + torch.arange(cols, device=dev)] = 1.0
+        out = decode_linear6(
+            eye[:cols].contiguous(), layer._marlin_decode_weight, layer._marlin_decode_scales6,
+            layer._marlin_decode_palette, layer.weight_global_scale, layer.workspace, n, k, False,
+        )
+        wt[:, j0 : j0 + cols] = out[:, :n].T
+    return wt
+
+
+def _lmmips_masked_bitwise(layer, lut, org_vocab_size, lmpost_argmax, mult, cap, launch, lmm) -> bool:
+    """Masked kernel == dense GEMV restricted to the kept tiles (tokens and softcapped values), random masks."""
+    n, k = layer.output_size_per_partition, layer.input_size_per_partition
+    dev = layer._marlin_decode_scales6.device
+    n_tiles = LM_HEAD_PAD128_N // 128
+    gen = torch.Generator(device=dev).manual_seed(20261129)
+    lut_f = lut.view(torch.bfloat16).float()
+    tok = torch.empty(16, dtype=torch.int64, device=dev)
+    val = torch.empty(16, dtype=torch.float32, device=dev)
+    mask = torch.zeros(64, dtype=torch.int32, device=dev)
+    for multi, m, p_keep in ((False, 1, 0.05), (False, 1, 1.0), (True, 16, 0.1), (True, 7, 0.02), (True, 12, 1.0),
+                             (True, 1, 0.3), (True, 16, 0.0)):
+        x = (torch.randn((m, k), generator=gen, device=dev) * 2.0).to(torch.bfloat16).contiguous()
+        keep = torch.rand(n_tiles, generator=gen, device=dev) < p_keep
+        bits = torch.zeros(64 * 32, dtype=torch.int64, device=dev)
+        bits[:n_tiles] = keep.to(torch.int64)
+        words = (bits.view(64, 32) << torch.arange(32, device=dev)).sum(1)
+        mask.copy_(torch.where(words >= 2 ** 31, words - 2 ** 32, words).to(torch.int32))
+        raw = decode_linear6(
+            x, layer._marlin_decode_weight, layer._marlin_decode_scales6, layer._marlin_decode_palette,
+            layer.weight_global_scale, layer.workspace, n, k, False,
+        )[:, :org_vocab_size]
+        final = lut_f[raw.contiguous().view(torch.int16).to(torch.int64) & 0xFFFF]
+        ref_v, ref_t = lmm.masked_argmax(final.cpu(), keep.cpu(), org_vocab_size)
+        tok.fill_(-1)
+        val.fill_(float("nan"))
+        launch(x, mask, tok, val, multi)
+        torch.cuda.synchronize(dev)
+        if not (torch.equal(tok[:m].cpu(), ref_t) and torch.equal(val[:m].cpu().view(torch.int32),
+                                                                   ref_v.view(torch.int32))):
+            logger.warning("H2 masked lm_head kernel mismatch (multi=%s, m=%d, keep=%.2f); H2 disabled",
+                           multi, m, p_keep)
+            return False
+    return True
+
+
+def _lmmips_error_model_ok(layer, st, wt, org_vocab_size) -> bool:
+    """Audit the dense error model on random probes: |bf16 dense - x.W~| <= err_i + ||x|| delta_v + ulp/2."""
+    n, k = layer.output_size_per_partition, layer.input_size_per_partition
+    dev = wt.device
+    gen = torch.Generator(device=dev).manual_seed(20261130)
+    for mag in (1.0, 40.0, 160.0):
+        x = (torch.randn((16, k), generator=gen, device=dev) * (mag / math.sqrt(k))).to(torch.bfloat16)
+        raw = decode_linear6(
+            x.contiguous(), layer._marlin_decode_weight, layer._marlin_decode_scales6, layer._marlin_decode_palette,
+            layer.weight_global_scale, layer.workspace, n, k, False,
+        )[:, :org_vocab_size].double()
+        xd = x.double()
+        xn = xd.norm(dim=1, keepdim=True)
+        for a in range(0, org_vocab_size, 32768):
+            b = min(org_vocab_size, a + 32768)
+            ref = xd @ wt[a:b].double().T
+            dl = st.sd.aux[a:b, 2].double()[None]
+            tol = st.coef * xn * st.sd.wmax + xn * dl + raw[:, a:b].abs() * 2.0 ** -8 + 1e-30
+            if bool(((raw[:, a:b] - ref).abs() > tol).any()):
+                logger.warning("H2 dense error-model audit failed (|x|=%.0f); H2 disabled", mag)
+                return False
+    return True
+
+
+def _maybe_admit_lmmips(layer, lut, org_vocab_size, lmpost_argmax, mult, cap, multi: bool) -> None:
+    if os.environ.get("MUSE_LM_MIPS", "0") in ("", "0") or torch.cuda.is_current_stream_capturing():
+        return
+    key = "multi" if multi else "single"
+    st = getattr(layer, "_lmmips_state", None)
+    if st is not None and key in st.ok:
+        return
+    if getattr(layer, "_lmmips_failed", False):
+        return
+    try:
+        lmm = _lmmips_mod()
+        s6 = getattr(layer, "_marlin_decode_scales6", None)
+        n, k = layer.output_size_per_partition, layer.input_size_per_partition
+        if (
+            lmm is None or lmm._load() is None or _lmmips_lmpost is None or s6 is None
+            or not is_tma4_ilv(s6) or (n, k) != (LM_HEAD_N, LM_HEAD_K) or not is_lm_pad128(s6)
+            or layer.weight_global_scale.numel() < 1
+        ):
+            logger.info("H2 lm_head MIPS unavailable for this layout; keeping the dense lm_head")
+            layer._lmmips_failed = True
+            return
+        launch = _lmmips_masked_launcher(layer, lut, org_vocab_size, lmm)
+        wt = None
+        if st is None:
+            if not _lmmips_masked_bitwise(layer, lut, org_vocab_size, lmpost_argmax, mult, cap, launch, lmm):
+                layer._lmmips_failed = True
+                return
+            wt = _lmmips_probe_rows(layer, n, k)
+            g = float(layer.weight_global_scale.reshape(-1)[0].float().item())
+            st = lmm.build_state(wt, g, lut, org_vocab_size)
+            if not _lmmips_error_model_ok(layer, st, wt, org_vocab_size):
+                layer._lmmips_failed = True
+                return
+            layer._lmmips_state = st
+        if wt is None:
+            # self-check probes use real rows; a local (~2.7 GB bf16) re-read per path, never kept on the layer
+            wt = _lmmips_probe_rows(layer, n, k)
+        if multi:
+            def dense(x, out):
+                return _launch_lmhead_lmpost6_m_dense(x, layer, lut, out, org_vocab_size)
+        else:
+            def dense(x, out):
+                return _launch_lmhead_lmpost6_dense(x, layer, lut, out, org_vocab_size)
+        n_vec = max(1, int(os.environ.get("MUSE_LM_MIPS_SELFCHECK", "500")))
+        ok = lmm.self_check(st, wt, launch, dense, multi, n_vec)
+        st.ok[key] = ok
+        st.launch = launch
+        if not ok:
+            logger.warning("H2 lm_head MIPS self-check failed (%s); keeping the dense lm_head", key)
+        if "multi" in st.ok and "single" in st.ok and not any(st.ok.values()):
+            layer._lmmips_tile_states = None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("H2 lm_head MIPS admission skipped (%s); keeping the dense lm_head", exc)
+        layer._lmmips_failed = True
+    finally:
+        if getattr(layer, "_lmmips_failed", False):
+            layer._lmmips_tile_states = None  # not admitted: release the tile-state table
+
+
+def launch_lmhead_lmpost6(
+    x: torch.Tensor,
+    layer: torch.nn.Module,
+    lut: torch.Tensor,
+    out_token: torch.Tensor,
+    org_vocab_size: int,
+) -> bool:
+    st = _lmmips_active(layer, multi=False)
+    if (
+        st is not None
+        and x.is_contiguous() and x.data_ptr() % 16 == 0
+        and x.shape == (1, layer.input_size_per_partition)
+        and out_token.shape == (1, 1) and out_token.dtype == torch.int64
+    ):
+        _lmmips_mod().run(st, x, out_token, st.launch, multi=False)
+        return True
+    return _launch_lmhead_lmpost6_dense(x, layer, lut, out_token, org_vocab_size)
+
+
+def launch_lmhead_lmpost6_m(
+    x: torch.Tensor,
+    layer: torch.nn.Module,
+    lut: torch.Tensor,
+    out_tokens: torch.Tensor,
+    org_vocab_size: int,
+) -> bool:
+    st = _lmmips_active(layer, multi=True)
+    if (
+        st is not None
+        and x.is_contiguous() and x.data_ptr() % 16 == 0
+        and x.ndim == 2 and 1 <= x.shape[0] <= 16 and x.shape[1] == layer.input_size_per_partition
+        and out_tokens.is_contiguous() and out_tokens.dtype == torch.int64 and out_tokens.numel() >= x.shape[0]
+    ):
+        _lmmips_mod().run(st, x, out_tokens, st.launch, multi=True)
+        return True
+    return _launch_lmhead_lmpost6_m_dense(x, layer, lut, out_tokens, org_vocab_size)
 
 
 def _pair_gate_up_tensors(w_raw: torch.Tensor, s_raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

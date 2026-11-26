@@ -305,7 +305,11 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool half_split = false,
           const bool fast_pal16 = false,
           const bool multi_m = false,
-          const bool kloop_ovlp = false>
+          const bool kloop_ovlp = false,
+          // H2 (MUSE_LM_MIPS): fused lm_head+lmpost with a per-128-column tile mask. Each CTA walks only its kept
+          // tiles: a masked tile issues no A/B/scale fetch, no rANS decode, no MMA, no reduction and never enters
+          // the argmax (the rANS stream resumes from lm_tile_states). Kept tiles are bit-identical to the dense kernel.
+          const bool lm_mask = false>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -346,7 +350,33 @@ __global__ void Marlin(
     ,
     int tma_pdl_mode = 0
 #endif
+    ,
+    // lm_mask only: bit t of word t / 32 = 1 -> tile t (columns 128 t .. 128 t + 127) is evaluated
+    const uint32_t* __restrict__ lm_tile_mask = nullptr,
+    // lm_mask only: per-row softcapped value of the selected token (-inf if no kept column)
+    float* __restrict__ lmpost_val = nullptr,
+    // lm_mask only: u32 [1579][threads] rANS decoder state at the first scale symbol of each tile
+    const uint32_t* __restrict__ lm_tile_states = nullptr
 ) {
+  static_assert(!lm_mask || (fuse_lmpost && fixed_shape == 3 && down_ilv && scale6 && !split2 && !gate_v48 &&
+                             threads == 256),
+                "the H2 tile mask is built for the fused 202112-column lm_head + lmpost configuration only");
+#ifndef MUSE_SCALE_TMA4
+  static_assert(!lm_mask, "the H2 tile mask needs the TMA4 rANS scale stream");
+#endif
+  // H2: bit j of lm_kept <=> this CTA's j-th tile (blockIdx.x + j * gridDim.x, at most 33 of them) is kept.
+  // lm_next_kept(j) = the first kept local tile >= j, or -1.
+  [[maybe_unused]] uint64_t lm_kept = 0;
+  if constexpr (lm_mask) {
+    int j = 0;
+    for (int t = static_cast<int>(blockIdx.x); t < 1579; t += static_cast<int>(gridDim.x), ++j) {
+      if ((__ldg(lm_tile_mask + (t >> 5)) >> (t & 31)) & 1u) lm_kept |= 1ull << j;
+    }
+  }
+  [[maybe_unused]] auto lm_next_kept = [&](int j) -> int {
+    const uint64_t rest = (j < 64) ? (lm_kept & (~0ull << j)) : 0ull;
+    return rest ? (__ffsll(static_cast<long long>(rest)) - 1) : -1;
+  };
   if constexpr (scale6) {
     if constexpr (!multi_m) prob_m = 1;
     lda = prob_k;
@@ -719,6 +749,11 @@ __global__ void Marlin(
     slice_col = static_cast<int>(blockIdx.x);
     slice_row = 0;
     slice_iters = (slice_col < 1579) ? 52 : 0;
+    if constexpr (lm_mask) {
+      const int j0 = lm_next_kept(0);
+      slice_col = static_cast<int>(blockIdx.x) + max(j0, 0) * static_cast<int>(gridDim.x);
+      slice_iters = (j0 >= 0) ? 52 : 0;
+    }
     slice_count = 1;
     slice_idx = 0;
     locks_off = 0;
@@ -1127,7 +1162,12 @@ __global__ void Marlin(
   const uint32_t* tma_sb_row = tma_blk_it + gridDim.x;
   const size_t tma_meta_u32 = ((static_cast<size_t>(4 + gridDim.x + tma_max_sbs) + 3) / 4) * 4;
   const uint32_t* tma_off16 = tma_u32 + 1024 + tma_meta_u32;
-  const int tma_iters = static_cast<int>(tma_blk_it[blockIdx.x]);
+  // H2: tma_iters, tma_q and super-block numbers count kept stages only; tma_issue maps a kept super-block to its
+  // stored one and tma_decode reloads the rANS state when it enters a tile after skipped ones.
+  const int tma_iters = lm_mask ? (__popcll(static_cast<long long>(lm_kept)) * 52)
+                                : static_cast<int>(tma_blk_it[blockIdx.x]);
+  [[maybe_unused]] int tma_iss_rsb = -1;   // lm_mask: stored super-block of the last tma_issue (thread 0)
+  [[maybe_unused]] int tma_dec_tile = -1;  // lm_mask: local tile of the last tile-start tma_decode
   const int tma_num_sbs = (tma_iters + 3) >> 2;
   const unsigned char* tma_var_g = reinterpret_cast<const unsigned char*>(zp_ptr);
   int tma_slice_base = 0, tma_done = 0, tma_q = 0;
@@ -1153,7 +1193,14 @@ __global__ void Marlin(
     if constexpr (gate_up_grid) {
       gsb = static_cast<uint32_t>(((blockIdx.x / 48) * 13 + sb) * 48 + (blockIdx.x % 48));
     } else {
-      gsb = __ldg(tma_sb_row + sb) + blockIdx.x;
+      int rsb = sb;
+      if constexpr (lm_mask) {
+        // called for sb = 0, 1, 2, ... in order; 52 stages = 13 super-blocks per tile
+        rsb = tma_iss_rsb + 1;
+        if (rsb % 13 == 0) rsb = lm_next_kept(rsb / 13) * 13;
+        tma_iss_rsb = rsb;
+      }
+      gsb = __ldg(tma_sb_row + rsb) + blockIdx.x;
     }
     const uint32_t o0 = __ldg(tma_off16 + gsb);
     const uint32_t o1 = __ldg(tma_off16 + gsb + 1);
@@ -1182,6 +1229,17 @@ __global__ void Marlin(
   }
   auto tma_decode = [&](int X) {
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if constexpr (lm_mask) {
+      if (X % 52 == 0) {
+        const int jt = lm_next_kept(tma_dec_tile + 1);
+        if (jt != tma_dec_tile + 1) {
+          tma_x = __ldg(lm_tile_states +
+                        static_cast<size_t>(static_cast<int>(blockIdx.x) + jt * static_cast<int>(gridDim.x)) * threads +
+                        threadIdx.x);
+        }
+        tma_dec_tile = jt;
+      }
+    }
     if ((X & 3) == 0) {
       const int sb = X >> 2;
       const int slot = sb & 1;
@@ -1450,6 +1508,25 @@ __global__ void Marlin(
 #else
   auto cp_async4_stream = [&](void* smem_ptr, const void* glob_ptr) { cp_async4(smem_ptr, glob_ptr); };
 #endif
+  // H2 tile mask. With fixed_shape == 3 a CTA's stored B stage ilv_f belongs to its local tile ilv_f / 52, and
+  // b_gl_rd advances by ilv_delta_p1 per stage below ilv_step_p1end and by ilv_delta_hi after it. lm_b_next() runs
+  // after every fetch: at a tile boundary it moves ilv_f and b_gl_rd to the next kept tile (ilv_a_kt is 0 at every
+  // tile boundary, so it needs no change).
+  [[maybe_unused]] auto lm_b_skip_to = [&](int target_f) {
+    const int n1 = max(0, min(target_f, ilv_step_p1end) - ilv_f);
+    const int n2 = (target_f - ilv_f) - n1;
+    b_gl_rd += n1 * ilv_delta_p1 + n2 * ilv_delta_hi;
+    ilv_f = target_f;
+  };
+  [[maybe_unused]] auto lm_b_next = [&]() {
+    if constexpr (lm_mask) {
+      if (ilv_f % 52 == 0) {
+        const int jn = lm_next_kept(ilv_f / 52);
+        if (jn >= 0) lm_b_skip_to(jn * 52);
+      }
+    }
+  };
+  lm_b_next();
   auto load_mul_sigmoid_int4 = [&](int idx) -> int4 {
     const uint4 g = __ldg(&reinterpret_cast<const uint4*>(A)[idx]);
     const uint4 av = __ldg(&reinterpret_cast<const uint4*>(A_aux)[idx]);
@@ -1542,6 +1619,7 @@ __global__ void Marlin(
         } else if (++ilv_a_kt == k_tiles) {
           ilv_a_kt = 0;
         }
+        lm_b_next();
       } else {
         b_gl_rd += b_gl_rd_delta_o;
       }
@@ -1626,6 +1704,7 @@ __global__ void Marlin(
         } else if (++ilv_a_kt == k_tiles) {
           ilv_a_kt = 0;
         }
+        lm_b_next();
       } else {
         b_gl_rd += b_gl_rd_delta_o;
       }
@@ -2928,7 +3007,7 @@ __global__ void Marlin(
     }
 
     if constexpr (scale6) {
-      if (blockIdx.x == 0 && !tlb_done && tpf_stride > 0) {
+      if (!lm_mask && blockIdx.x == 0 && !tlb_done && tpf_stride > 0) {
         tlb_done = true;
         const uint8_t* b_base = reinterpret_cast<const uint8_t*>(B);
         const size_t b_bytes = (static_cast<size_t>(prob_n) * static_cast<size_t>(prob_k)) >> 1;
@@ -3061,6 +3140,12 @@ __global__ void Marlin(
   }
 #ifdef MUSE_SCALE_TMA4
   else {
+    if constexpr (lm_mask) {
+      // no kept tile: drain the LUT/state bulk copy, go straight to the argmax. Barrier first so threads 1..255
+      // do not poll the mbarrier before thread 0 has initialised it.
+      __syncthreads();
+      tma_wait(0, 0);
+    }
     if (tma_pdl_mode & 1) asm volatile("griddepcontrol.wait;" ::: "memory");
     if (tma_pdl_mode & 2) asm volatile("griddepcontrol.launch_dependents;");
   }
@@ -3679,6 +3764,11 @@ __global__ void Marlin(
         slice_row = 0;
         slice_col += static_cast<int>(gridDim.x);
         slice_iters = (slice_col < 1579) ? 52 : 0;
+        if constexpr (lm_mask) {
+          const int jn = lm_next_kept((slice_col - static_cast<int>(blockIdx.x)) / static_cast<int>(gridDim.x));
+          slice_col = static_cast<int>(blockIdx.x) + max(jn, 0) * static_cast<int>(gridDim.x);
+          slice_iters = (jn >= 0) ? 52 : 0;
+        }
         is_first_matmul_in_slice = true;
       } else {
         slice_row = 0;
@@ -3878,6 +3968,7 @@ __global__ void Marlin(
           }
           if (lane == 0) {
             lmpost_out[r] = static_cast<int64_t>(fi);
+            if constexpr (lm_mask) lmpost_val[r] = fv;
           }
         }
         __syncthreads();
@@ -3977,6 +4068,7 @@ __global__ void Marlin(
         if (lane == 0) {
           *g_done = 0;
           *lmpost_out = static_cast<int64_t>(fi);
+          if constexpr (lm_mask) *lmpost_val = fv;
         }
       }
     }
