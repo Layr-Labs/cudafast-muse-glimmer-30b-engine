@@ -125,7 +125,11 @@ void dflash_kv_post(
 std::tuple<torch::Tensor, torch::Tensor> dflash_qkv_norm_rope(
     torch::Tensor qkv, torch::Tensor positions, torch::Tensor q_norm_w,
     torch::Tensor k_norm_w, torch::Tensor cos_sin_cache,
-    int64_t nq, int64_t nkv, double eps, bool is_neox);
+    int64_t nq, int64_t nkv, double eps, bool is_neox,
+    c10::optional<torch::Tensor> slot_mapping = c10::nullopt,
+    c10::optional<torch::Tensor> k_cache = c10::nullopt,
+    c10::optional<torch::Tensor> v_cache = c10::nullopt,
+    int64_t block_size = 16);
 void draft_vocab_update_tail(
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor in_static_vocab,
     torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor tail_seen,
@@ -138,7 +142,8 @@ torch::Tensor draft_vocab_tail_argmax(
     c10::optional<torch::Tensor> out_top2_row0 = c10::nullopt,
     c10::optional<torch::Tensor> out_margins = c10::nullopt,
     c10::optional<torch::Tensor> out_tree_top = c10::nullopt,
-    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt);
+    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt,
+    bool vocab_map_sorted = false);
 torch::Tensor draft_vocab_score_rows(
     torch::Tensor A, torch::Tensor row_ids, torch::Tensor raw_w,
     torch::Tensor raw_s, torch::Tensor global_scale, double logit_scale);
@@ -213,7 +218,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int4_gemm", &int4_gemm);
   m.def("int4_gemm_aux5", &int4_gemm_aux5);
   m.def("dflash_kv_post", &dflash_kv_post);
-  m.def("dflash_qkv_norm_rope", &dflash_qkv_norm_rope);
+  m.def("dflash_qkv_norm_rope", &dflash_qkv_norm_rope,
+        pybind11::arg("qkv"), pybind11::arg("positions"),
+        pybind11::arg("q_norm_w"), pybind11::arg("k_norm_w"),
+        pybind11::arg("cos_sin_cache"), pybind11::arg("nq"),
+        pybind11::arg("nkv"), pybind11::arg("eps"), pybind11::arg("is_neox"),
+        pybind11::arg("slot_mapping") = c10::nullopt,
+        pybind11::arg("k_cache") = c10::nullopt,
+        pybind11::arg("v_cache") = c10::nullopt,
+        pybind11::arg("block_size") = 16);
   m.def("draft_vocab_update_tail", &draft_vocab_update_tail,
         pybind11::arg("input_ids"), pybind11::arg("positions"), pybind11::arg("in_static_vocab"),
         pybind11::arg("tail_ids"), pybind11::arg("tail_count"), pybind11::arg("tail_seen"),
@@ -226,7 +239,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("out_top2_row0") = c10::nullopt,
         pybind11::arg("out_margins") = c10::nullopt,
         pybind11::arg("out_tree_top") = c10::nullopt,
-        pybind11::arg("out_tree_vals") = c10::nullopt);
+        pybind11::arg("out_tree_vals") = c10::nullopt,
+        pybind11::arg("vocab_map_sorted") = false);
   m.def("draft_vocab_score_rows", &draft_vocab_score_rows,
         pybind11::arg("A"), pybind11::arg("row_ids"), pybind11::arg("raw_w"),
         pybind11::arg("raw_s"), pybind11::arg("global_scale"), pybind11::arg("logit_scale") = 1.0);

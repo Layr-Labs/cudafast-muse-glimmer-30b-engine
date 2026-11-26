@@ -291,6 +291,7 @@ class DFlashQwen3Attention(nn.Module):
                 self.num_kv_heads,
                 float(self.q_norm.variance_epsilon),
                 bool(self.rotary_emb.is_neox_style),
+                self.attn.layer_name if getattr(self, "_dflash_qkv_cache_ok", False) else "",
             )
             v = qkv[..., self.q_size + self.kv_size :]
             attn_output = self.attn(q, k, v)
@@ -980,6 +981,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                     margin_buf,
                     tree_top_buf,
                     tree_vals_buf,
+                    vocab_map_sorted=True,
                 )
             except TypeError:
                 return _bfx.draft_vocab_tail_argmax(
