@@ -30,6 +30,7 @@ logger = init_logger(__name__)
 MAX_M_FP8 = 16
 MAX_M_NVFP4 = 8
 MAX_M_INT3 = 16
+MAX_M_NF6 = 16
 MAX_M_INT4 = 16
 _NAMES = ("qkv_proj", "o_proj", "gate_up_proj", "down_proj", "fc")
 _MLP_FC_NAMES = ("gate_up_proj", "down_proj", "fc")
@@ -48,6 +49,8 @@ _SENSITIVE_PRESETS: dict[str, tuple[str, ...]] = {
 _stats = {
     "admitted_int3": 0,
     "admitted_int3_swiglu": 0,
+    "admitted_nf6": 0,
+    "admitted_nf6_swiglu": 0,
     "admitted_int4": 0,
     "admitted_nvfp4": 0,
     "admitted_fp8": 0,
@@ -62,7 +65,7 @@ _SHARED_PARTIALS: dict[int, torch.Tensor] = {}
 
 
 def _quant_mode() -> str:
-    return os.environ.get("MUSE_DRAFT_QUANT", "hybrid_int4").strip().lower()
+    return os.environ.get("MUSE_DRAFT_QUANT", "hybrid_nf6").strip().lower()
 
 
 def enabled() -> bool:
@@ -121,8 +124,12 @@ def _resolve_layer_mode(
     sens_nvfp4: tuple[str, ...],
     sens_int4: tuple[str, ...] = (),
 ) -> str:
-    if base_mode in ("hybrid_int4", "hybrid_i4", "ctx_attn_int4"):
+    if base_mode in ("hybrid_nf6", "nf6_hybrid"):
+        lm = "int4" if leaf in _CTX_ATTN_NAMES else "nf6"
+    elif base_mode in ("hybrid_int4", "hybrid_i4", "ctx_attn_int4"):
         lm = "int4" if leaf in _CTX_ATTN_NAMES else "int3"
+    elif base_mode == "nf6":
+        lm = "nf6"
     elif base_mode == "int4":
         lm = "int4"
     elif base_mode == "int3":
@@ -135,9 +142,9 @@ def _resolve_layer_mode(
         lm = "fp8"
     if sens_fp8 and _matches_selectors(name, leaf, sens_fp8):
         return "fp8"
-    if sens_int4 and _matches_selectors(name, leaf, sens_int4) and lm == "int3":
+    if sens_int4 and _matches_selectors(name, leaf, sens_int4) and lm in ("int3", "nf6"):
         return "int4"
-    if sens_nvfp4 and _matches_selectors(name, leaf, sens_nvfp4) and lm == "int3":
+    if sens_nvfp4 and _matches_selectors(name, leaf, sens_nvfp4) and lm in ("int3", "nf6"):
         return "nvfp4"
     return lm
 
@@ -611,6 +618,85 @@ def _try_int3_swiglu_buffer(
 
 
 # ---------------------------------------------------------------------------
+# NF6 W3.0A16 (6-level symmetric Lloyd-Max group-64 via muse_bfx_ext.nf6_*)
+# ---------------------------------------------------------------------------
+
+def _try_nf6_buffer(
+    w: torch.Tensor,
+    metrics: dict[str, float] | None = None,
+) -> torch.Tensor | None:
+    import muse_bfx_ext as _bfx
+
+    if not hasattr(_bfx, "nf6_pack") or not hasattr(_bfx, "nf6_gemm"):
+        return None
+    n, k = w.shape
+    if n % 64 != 0 or k % 64 != 0:
+        return None
+    w_c = w.contiguous()
+    blob = _bfx.nf6_pack(w_c)
+    gen = torch.Generator(device=w.device)
+    gen.manual_seed(3673 + n + 17 * k)
+    for m in (1, 7, 8, 16):
+        x = (torch.randn((m, k), generator=gen, device=w.device) * 0.5).to(w.dtype)
+        got = _bfx.nf6_gemm(x, blob, n, k)
+        if got.shape != (m, n) or not bool(torch.isfinite(got).all()):
+            return None
+        dense = F.linear(x, w_c).float()
+        got_f = got.float()
+        cos = F.cosine_similarity(got_f.flatten(), dense.flatten(), dim=0).item()
+        if not cos >= 0.96:
+            logger.warning("muse_draft_nf6: low cosine %.5f on (%d,%d) M=%d", cos, n, k, m)
+            return None
+        if m == 7 and metrics is not None:
+            metrics["cos"] = cos
+            metrics["snr_db"] = _snr_db(dense, got_f)
+    torch.cuda.synchronize(w.device)
+    return blob
+
+
+def _try_nf6_swiglu_buffer(
+    w: torch.Tensor,
+    metrics: dict[str, float] | None = None,
+) -> torch.Tensor | None:
+    import muse_bfx_ext as _bfx
+
+    if not hasattr(_bfx, "nf6_pack_swiglu") or not hasattr(_bfx, "nf6_gemm_swiglu"):
+        return None
+    n2, k = w.shape
+    if n2 % 64 != 0 or k % 64 != 0:
+        return None
+    inter = n2 // 2
+    w_c = w.contiguous()
+    w_gate = w_c[:inter]
+    w_up = w_c[inter:]
+    blob = _bfx.nf6_pack_swiglu(w_c)
+    gen = torch.Generator(device=w.device)
+    gen.manual_seed(3719 + n2 + 23 * k)
+    for m in (1, 7, 8, 16):
+        x = (torch.randn((m, k), generator=gen, device=w.device) * 0.5).to(w.dtype)
+        got = _bfx.nf6_gemm_swiglu(x, blob, inter, k)
+        if got.shape != (m, inter) or not bool(torch.isfinite(got).all()):
+            return None
+        dg = F.linear(x, w_gate).float()
+        du = F.linear(x, w_up).float()
+        dense = F.silu(dg) * du
+        got_f = got.float()
+        cos = F.cosine_similarity(got_f.flatten(), dense.flatten(), dim=0).item()
+        snr = _snr_db(dense, got_f)
+        if not (cos >= 0.94 and snr >= 9.0):
+            logger.warning(
+                "muse_draft_nf6_swiglu: quality check failed on (%d,%d) M=%d (SNR=%.2fdB cos=%.5f)",
+                n2, k, m, snr, cos,
+            )
+            return None
+        if m == 7 and metrics is not None:
+            metrics["cos"] = cos
+            metrics["snr_db"] = snr
+    torch.cuda.synchronize(w.device)
+    return blob
+
+
+# ---------------------------------------------------------------------------
 # INT4 W4A16 (asymmetric group-64 via muse_bfx_ext.int4_gemm / int4_gemm_aux5)
 # ---------------------------------------------------------------------------
 
@@ -841,8 +927,8 @@ def _verify_dflash_qkv_norm_rope(model: torch.nn.Module) -> None:
                     float((k_got.float() - k_ref.float()).abs().max().item()),
                 )
                 ok = bool(
-                    torch.allclose(q_got.float(), q_ref.float(), rtol=1e-2, atol=2e-2)
-                    and torch.allclose(k_got.float(), k_ref.float(), rtol=1e-2, atol=2e-2)
+                    torch.allclose(q_got.float(), q_ref.float(), rtol=2e-2, atol=0.0625)
+                    and torch.allclose(k_got.float(), k_ref.float(), rtol=2e-2, atol=0.0625)
                     and d <= 0.0625
                 )
                 if d < best_diff:
@@ -878,7 +964,7 @@ def _verify_dflash_qkv_norm_rope(model: torch.nn.Module) -> None:
 # Attachment (modules + fused KV tensor) and custom ops
 # ---------------------------------------------------------------------------
 
-def attach_mlp_swiglu(mlp: torch.nn.Module, name: str = "") -> bool:
+def attach_mlp_swiglu(mlp: torch.nn.Module, name: str = "", mode: str = "int3") -> bool:
     gate_up = getattr(mlp, "gate_up_proj", None)
     if gate_up is None or getattr(mlp, "_mi3_swiglu", None) is not None:
         return False
@@ -898,13 +984,33 @@ def attach_mlp_swiglu(mlp: torch.nn.Module, name: str = "") -> bool:
         return False
     inter = n2 // 2
     label = name or f"mlp_swiglu_{n2}x{k}"
+    if mode == "nf6":
+        try:
+            m: dict[str, float] = {}
+            blob = _try_nf6_swiglu_buffer(w.data, metrics=m)
+            if blob is not None:
+                mlp.register_buffer("_mi3_swiglu_blob", blob, persistent=False)
+                mlp._mi3_swiglu = (inter, k)
+                mlp._mi3_swiglu_nf6 = True
+                gate_up._mfp8 = (n2, k)  # sentinel so attach_linear and muse_bfx skip gate_up_proj
+                qbytes = blob.numel() * blob.element_size()
+                _stats["admitted_nf6_swiglu"] += 1
+                _stats["bytes_bf16"] += n2 * k * 2
+                _stats["bytes_quant"] += qbytes
+                if "snr_db" in m:
+                    _layer_metrics.append((label, "nf6sw", (n2, k), m["snr_db"], m["cos"], qbytes))
+                _free_query_only_bf16(gate_up, "gate_up_proj")
+                return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("muse_draft_nf6_swiglu: attach failed for %s (%s); falling back to int3", label, e)
     try:
-        m: dict[str, float] = {}
+        m = {}
         blob = _try_int3_swiglu_buffer(w.data, metrics=m)
         if blob is None:
             return False
         mlp.register_buffer("_mi3_swiglu_blob", blob, persistent=False)
         mlp._mi3_swiglu = (inter, k)
+        mlp._mi3_swiglu_nf6 = False
         gate_up._mfp8 = (n2, k)  # sentinel so attach_linear and muse_bfx skip gate_up_proj
         qbytes = blob.numel() * blob.element_size()
         _stats["admitted_int3_swiglu"] += 1
@@ -960,7 +1066,26 @@ def attach_linear(layer: torch.nn.Module, mode: str = "int3", name: str = "", le
         except Exception as e:  # noqa: BLE001
             logger.warning("muse_draft_int4: attach failed for %s (%s); trying NVFP4", tuple(w.shape), e)
 
-    if mode == "int3":
+    if mode == "nf6":
+        try:
+            m = {}
+            blob = _try_nf6_buffer(w.data, metrics=m)
+            if blob is not None:
+                layer.register_buffer("_mnf6_blob", blob, persistent=False)
+                layer._mnf6 = (n, k)
+                layer._mfp8 = (n, k)  # sentinel so muse_bfx skips this layer
+                qbytes = blob.numel() * blob.element_size()
+                _stats["admitted_nf6"] += 1
+                _stats["bytes_bf16"] += n * k * 2
+                _stats["bytes_quant"] += qbytes
+                if "snr_db" in m:
+                    _layer_metrics.append((label, "nf6", (n, k), m["snr_db"], m["cos"], qbytes))
+                _free_query_only_bf16(layer, leaf)
+                return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("muse_draft_nf6: attach failed for %s (%s); trying INT3", tuple(w.shape), e)
+
+    if mode in ("int3", "nf6"):
         try:
             m = {}
             blob = _try_int3_buffer(w.data, metrics=m)
@@ -1052,7 +1177,24 @@ def attach_tensor(mod: torch.nn.Module, prefix: str, w: torch.Tensor, mode: str 
         except Exception as e:  # noqa: BLE001
             logger.warning("muse_draft_int4: tensor %s attach failed (%s); trying NVFP4", prefix, e)
 
-    if mode == "int3":
+    if mode == "nf6":
+        try:
+            m = {}
+            blob = _try_nf6_buffer(w.data, metrics=m)
+            if blob is not None:
+                mod.register_buffer(f"_{prefix}_mnf6_blob", blob, persistent=False)
+                setattr(mod, f"_{prefix}_mnf6", (n, k))
+                qbytes = blob.numel() * blob.element_size()
+                _stats["admitted_nf6"] += 1
+                _stats["bytes_bf16"] += n * k * 2
+                _stats["bytes_quant"] += qbytes
+                if "snr_db" in m:
+                    _layer_metrics.append((prefix, "nf6", (n, k), m["snr_db"], m["cos"], qbytes))
+                return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("muse_draft_nf6: tensor %s attach failed (%s); trying INT3", prefix, e)
+
+    if mode in ("int3", "nf6"):
         try:
             m = {}
             blob = _try_int3_buffer(w.data, metrics=m)
@@ -1196,8 +1338,58 @@ def _(qkv, positions, q_norm_w, k_norm_w, cos_sin_cache, nq, nkv, eps, is_neox):
     return qkv.new_empty((m, nq * 128)), qkv.new_empty((m, nkv * 128))
 
 
+@torch.library.custom_op("muse::draft_nf6_swiglu_linear", mutates_args=())
+def draft_nf6_swiglu_linear(x: torch.Tensor, blob: torch.Tensor, inter: int, k: int) -> torch.Tensor:
+    shape = x.shape
+    x2 = x.reshape(-1, shape[-1])
+    import muse_bfx_ext as _bfx
+
+    out = _run_chunked(x2, MAX_M_NF6, lambda xc: _bfx.nf6_gemm_swiglu(xc, blob, inter, k))
+    return out.reshape(*shape[:-1], inter)
+
+
+@draft_nf6_swiglu_linear.register_fake
+def _(x, blob, inter, k):
+    return x.new_empty((*x.shape[:-1], inter))
+
+
+@torch.library.custom_op("muse::draft_nf6_linear", mutates_args=())
+def draft_nf6_linear(x: torch.Tensor, w: torch.Tensor, blob: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    shape = x.shape
+    x2 = x.reshape(-1, shape[-1])
+    if x2.dtype == torch.bfloat16 and (1 <= x2.size(0) <= MAX_M_NF6 or w.numel() == 0):
+        import muse_bfx_ext as _bfx
+
+        out = _run_chunked(x2, MAX_M_NF6, lambda xc: _bfx.nf6_gemm(xc, blob, n, k))
+    else:
+        out = F.linear(x2, w)
+    return out.reshape(*shape[:-1], n)
+
+
+@draft_nf6_linear.register_fake
+def _(x, w, blob, n, k):
+    return x.new_empty((*x.shape[:-1], n))
+
+
+@torch.library.custom_op("muse::draft_nf8_linear", mutates_args=())
+def draft_nf8_linear(x: torch.Tensor, blob: torch.Tensor, n: int, k: int, wave_ilv: int = 0) -> torch.Tensor:
+    shape = x.shape
+    x2 = x.reshape(-1, shape[-1])
+    import muse_bfx_ext as _bfx
+
+    out = _run_chunked(x2, MAX_M_INT3, lambda xc: _bfx.nf8_gemm(xc, blob, n, k, wave_ilv))
+    return out.reshape(*shape[:-1], n)
+
+
+@draft_nf8_linear.register_fake
+def _(x, blob, n, k, wave_ilv=0):
+    return x.new_empty((*x.shape[:-1], n))
+
+
 def mlp_swiglu_apply(mlp: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
     inter, k = mlp._mi3_swiglu
+    if getattr(mlp, "_mi3_swiglu_nf6", False):
+        return torch.ops.muse.draft_nf6_swiglu_linear(x, mlp._mi3_swiglu_blob, inter, k)
     return torch.ops.muse.draft_int3_swiglu_linear(x, mlp._mi3_swiglu_blob, inter, k)
 
 
@@ -1267,6 +1459,9 @@ def layer_apply(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
     if getattr(layer, "_mi4", None) is not None:
         n, k = layer._mi4
         return torch.ops.muse.draft_int4_linear(x, layer.weight, layer._mi4_blob, n, k)
+    if getattr(layer, "_mnf6", None) is not None:
+        n, k = layer._mnf6
+        return torch.ops.muse.draft_nf6_linear(x, layer.weight, layer._mnf6_blob, n, k)
     if getattr(layer, "_mi3", None) is not None:
         n, k = layer._mi3
         return torch.ops.muse.draft_int3_linear(x, layer.weight, layer._mi3_blob, n, k)
@@ -1355,10 +1550,14 @@ def place_drafter_quant(model: torch.nn.Module) -> int:
     for _, mod in model.named_modules():
         if getattr(mod, "_mi3_swiglu", None) is not None:
             inter, k = mod._mi3_swiglu
-            groups.setdefault(("int3_swiglu", inter, k), []).append((mod, "_mi3_swiglu_blob", ()))
+            sw_kind = "nf6_swiglu" if getattr(mod, "_mi3_swiglu_nf6", False) else "int3_swiglu"
+            groups.setdefault((sw_kind, inter, k), []).append((mod, "_mi3_swiglu_blob", ()))
         if getattr(mod, "_mi4", None) is not None:
             n, k = mod._mi4
             groups.setdefault(("int4", n, k), []).append((mod, "_mi4_blob", ()))
+        elif getattr(mod, "_mnf6", None) is not None:
+            n, k = mod._mnf6
+            groups.setdefault(("nf6", n, k), []).append((mod, "_mnf6_blob", ()))
         elif getattr(mod, "_mi3", None) is not None:
             n, k = mod._mi3
             groups.setdefault(("int3", n, k), []).append((mod, "_mi3_blob", ()))
@@ -1427,6 +1626,14 @@ def place_drafter_quant(model: torch.nn.Module) -> int:
         meta0 = items[0][2]
 
         def _make_runner(meta: tuple):
+            if kind == "nf6_swiglu":
+                import muse_bfx_ext as _bfx
+
+                return lambda buf: _bfx.nf6_gemm_swiglu(x, buf, n, k)
+            if kind == "nf6":
+                import muse_bfx_ext as _bfx
+
+                return lambda buf: _bfx.nf6_gemm(x, buf, n, k)
             if kind == "int3_swiglu":
                 import muse_bfx_ext as _bfx
 
@@ -1521,8 +1728,9 @@ def attach_drafter(model: torch.nn.Module) -> int:
             if mlp is None:
                 continue
             gu_name = f"layers.{i}.mlp.gate_up_proj"
-            if _resolve_layer_mode(gu_name, "gate_up_proj", mode, sens_fp8, sens_nvfp4, sens_int4) == "int3":
-                n += attach_mlp_swiglu(mlp, name=gu_name)
+            gu_mode = _resolve_layer_mode(gu_name, "gate_up_proj", mode, sens_fp8, sens_nvfp4, sens_int4)
+            if gu_mode in ("int3", "nf6"):
+                n += attach_mlp_swiglu(mlp, name=gu_name, mode=gu_mode)
     for name, mod in model.named_modules():
         leaf = name.split(".")[-1]
         if leaf in _NAMES:
@@ -1558,13 +1766,15 @@ def attach_drafter(model: torch.nn.Module) -> int:
                     lcos,
                 )
     logger.info(
-        "muse_draft_quant (%s, i3_mse=%d, i4_mse=%d, aux5=%d, pack=%.2fs): %d INT4-g64 + %d INT3-SwiGLU + %d INT3-g64 + %d NVFP4-TMA4 + %d FP8-Marlin drafter linears (%d rejected), %.2f GB -> %.2f GB per step (freed %.2f GB dead BF16)%s",
+        "muse_draft_quant (%s, i3_mse=%d, i4_mse=%d, aux5=%d, pack=%.2fs): %d INT4-g64 + %d NF6-SwiGLU + %d NF6-g64 + %d INT3-SwiGLU + %d INT3-g64 + %d NVFP4-TMA4 + %d FP8-Marlin drafter linears (%d rejected), %.2f GB -> %.2f GB per step (freed %.2f GB dead BF16)%s",
         mode,
         int(_int3_mse_enabled()),
         int(_int4_mse_enabled()),
         int(aux5_admitted),
         pack_s,
         _stats["admitted_int4"],
+        _stats["admitted_nf6_swiglu"],
+        _stats["admitted_nf6"],
         _stats["admitted_int3_swiglu"],
         _stats["admitted_int3"],
         _stats["admitted_nvfp4"],

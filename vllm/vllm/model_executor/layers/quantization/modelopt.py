@@ -1434,79 +1434,204 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
             draft_head.logical_widths = [len(draft_ids)]
             draft_head.has_bias = False
             draft_head.register_parameter("bias", None)
-            draft_head.register_parameter(
-                "weight",
-                Parameter(
-                    layer.weight.index_select(0, ids).contiguous(),
-                    requires_grad=False,
-                ),
-            )
-            draft_head.register_parameter(
-                "weight_scale",
-                Parameter(
-                    layer.weight_scale.index_select(0, ids).contiguous(),
-                    requires_grad=False,
-                ),
-            )
-            draft_head.register_parameter(
-                "weight_global_scale",
-                Parameter(layer.weight_global_scale.clone(), requires_grad=False),
-            )
             draft_head.register_buffer("token_ids", ids, persistent=False)
             draft_head.quant_method = self
             draft_head.tp_size = 1
             draft_head.org_vocab_size = len(draft_ids)
-            self.kernel.process_weights_after_loading(draft_head)
 
-            # Quick 6-spare read-only-flush GB10 DRAM placement for draft_head._marlin_decode_weight.
-            dec_w = getattr(draft_head, "_marlin_decode_weight", None)
-            if (
-                dec_w is not None
-                and os.environ.get("MUSE_DRAFT_VOCAB_PLACE", "1") != "0"
-            ):
+            head_quant = os.environ.get("MUSE_DRAFT_HEAD_QUANT", "nf8").strip().lower()
+            use_quant_head = (
+                head_quant in ("nf8", "int3")
+                and (len(draft_ids) % 64 == 0)
+                and (k_dim % 64 == 0)
+            )
+            exact_chk_bf16 = None
+            if use_quant_head:
                 try:
-                    spares = [torch.empty_like(dec_w) for _ in range(6)]
-                    for sp in spares:
-                        sp.copy_(dec_w)
-                    evict = torch.ones((48 << 20) // 4, dtype=torch.float32, device=dev)
-                    x_p = (
-                        ((torch.arange(6 * k_dim, device=dev) % 7).float() - 3.0)
-                        .to(torch.bfloat16)
-                        .reshape(6, k_dim)
+                    import time as _time
+                    import muse_bfx_ext as _bfx
+                    import vllm.model_executor.layers.muse_draft_fp8  # noqa: F401 (registers custom_ops)
+
+                    t_hq = _time.perf_counter()
+                    n_d = len(draft_ids)
+                    e2m1_lut = torch.tensor(
+                        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+                        dtype=torch.float32,
+                        device=dev,
                     )
-                    cands = [dec_w, *spares]
-                    _ = evict.sum()
-                    _ = self.apply(draft_head, x_p)
-                    torch.cuda.synchronize(dev)
-                    samples: list[list[float]] = [[] for _ in cands]
-                    for _ in range(5):
-                        for ci, buf in enumerate(cands):
-                            draft_head._buffers["_marlin_decode_weight"] = buf
-                            _ = evict.sum()
-                            se = torch.cuda.Event(enable_timing=True)
-                            ee = torch.cuda.Event(enable_timing=True)
-                            se.record()
-                            _ = self.apply(draft_head, x_p)
-                            ee.record()
-                            torch.cuda.synchronize(dev)
-                            samples[ci].append(se.elapsed_time(ee))
-                    times = [median(s) for s in samples]
-                    best_i = min(range(len(cands)), key=times.__getitem__)
-                    if best_i > 0 and times[0] - times[best_i] >= 0.005:
-                        draft_head._buffers["_marlin_decode_weight"] = cands[best_i]
-                        logger.info(
-                            "Draft vocab head DRAM placement: saved %.3f ms (%.3f -> %.3f ms)",
-                            times[0] - times[best_i],
-                            times[0],
-                            times[best_i],
-                        )
+                    gs_val = float(layer.weight_global_scale.detach().float().reshape(-1)[0].item())
+                    # Use 12288-row chunks (192 CTAs * 64 rows = exact wave size for wave_ilv=192).
+                    wave_ilv = 192 if (head_quant == "nf8" and os.environ.get("MUSE_DRAFT_HEAD_WILV", "1") != "0") else 0
+                    chunk_rows = 12288 if wave_ilv == 192 else 8192
+                    w_u8_full = layer.weight.detach()
+                    s_u8_full = layer.weight_scale.detach()
+                    chk_idx_list = [
+                        0, 1, 127, min(1024, n_d - 1), min(8192, n_d - 1),
+                        min(16384, n_d - 1), min(24576, n_d - 1), n_d - 1,
+                    ]
+                    chk_rows_bf16 = torch.empty((len(chk_idx_list), k_dim), dtype=torch.bfloat16, device=dev)
+                    chk_map = {idx: pos for pos, idx in enumerate(chk_idx_list)}
+
+                    chunks: list[torch.Tensor] = []
+                    for r0 in range(0, n_d, chunk_rows):
+                        r1 = min(n_d, r0 + chunk_rows)
+                        c_ids = ids[r0:r1]
+                        w_sub = w_u8_full.index_select(0, c_ids)
+                        s_sub = s_u8_full.index_select(0, c_ids).float() * gs_val
+                        lo = e2m1_lut[(w_sub & 0x0F).long()]
+                        hi = e2m1_lut[((w_sub >> 4) & 0x0F).long()]
+                        w_f = torch.stack((lo, hi), dim=-1).reshape(r1 - r0, k_dim // 16, 16)
+                        w_bf = (w_f * s_sub.unsqueeze(-1)).reshape(r1 - r0, k_dim).to(torch.bfloat16)
+                        for idx, pos in chk_map.items():
+                            if r0 <= idx < r1:
+                                chk_rows_bf16[pos].copy_(w_bf[idx - r0])
+                        if head_quant == "nf8":
+                            chunks.append(_bfx.nf8_pack(w_bf, wave_ilv))
+                        else:
+                            chunks.append(_bfx.int3_pack(w_bf, True))
+                        del w_sub, s_sub, lo, hi, w_f, w_bf
+                    blob = torch.cat(chunks, dim=0).contiguous()
+                    del chunks
+                    exact_chk_bf16 = chk_rows_bf16
+                    if head_quant == "nf8":
+                        draft_head.register_buffer("_draft_nf8_blob", blob, persistent=False)
+                        draft_head._draft_nf8 = (n_d, k_dim, wave_ilv)
+                        attr_name = "_draft_nf8_blob"
                     else:
-                        draft_head._buffers["_marlin_decode_weight"] = dec_w
-                    del spares, cands, evict, x_p
-                    torch.cuda.empty_cache()
+                        draft_head.register_buffer("_draft_int3_blob", blob, persistent=False)
+                        draft_head._draft_int3 = (n_d, k_dim)
+                        attr_name = "_draft_int3_blob"
+                    torch.cuda.synchronize(dev)
+                    logger.info(
+                        "Packed %d-row %s draft head (%.2f MB, wave_ilv=%d) in %.2fs",
+                        n_d,
+                        head_quant.upper(),
+                        blob.numel() / 1e6,
+                        wave_ilv,
+                        _time.perf_counter() - t_hq,
+                    )
+
+                    # Quick 6-spare read-only-flush GB10 DRAM placement for quantized draft head blob.
+                    if os.environ.get("MUSE_DRAFT_VOCAB_PLACE", "1") != "0":
+                        try:
+                            spares = [torch.empty_like(blob) for _ in range(6)]
+                            for sp in spares:
+                                sp.copy_(blob)
+                            evict = torch.ones((48 << 20) // 4, dtype=torch.float32, device=dev)
+                            x_p = (
+                                ((torch.arange(6 * k_dim, device=dev) % 7).float() - 3.0)
+                                .to(torch.bfloat16)
+                                .reshape(6, k_dim)
+                            )
+                            cands = [blob, *spares]
+                            _ = evict.sum()
+                            _ = self.apply(draft_head, x_p)
+                            torch.cuda.synchronize(dev)
+                            samples: list[list[float]] = [[] for _ in cands]
+                            for _ in range(5):
+                                for ci, buf in enumerate(cands):
+                                    draft_head._buffers[attr_name] = buf
+                                    _ = evict.sum()
+                                    se = torch.cuda.Event(enable_timing=True)
+                                    ee = torch.cuda.Event(enable_timing=True)
+                                    se.record()
+                                    _ = self.apply(draft_head, x_p)
+                                    ee.record()
+                                    torch.cuda.synchronize(dev)
+                                    samples[ci].append(se.elapsed_time(ee))
+                            times = [median(s) for s in samples]
+                            best_i = min(range(len(cands)), key=times.__getitem__)
+                            if best_i > 0 and times[0] - times[best_i] >= 0.005:
+                                draft_head._buffers[attr_name] = cands[best_i]
+                                logger.info(
+                                    "Draft %s head DRAM placement: saved %.3f ms (%.3f -> %.3f ms)",
+                                    head_quant.upper(),
+                                    times[0] - times[best_i],
+                                    times[0],
+                                    times[best_i],
+                                )
+                            else:
+                                draft_head._buffers[attr_name] = blob
+                            del spares, cands, evict, x_p
+                            torch.cuda.empty_cache()
+                        except Exception as exc:  # noqa: BLE001
+                            draft_head._buffers[attr_name] = blob
+                            logger.warning("Draft %s head DRAM placement skipped (%s)", head_quant.upper(), exc)
                 except Exception as exc:  # noqa: BLE001
-                    draft_head._buffers["_marlin_decode_weight"] = dec_w
-                    logger.warning("Draft vocab head DRAM placement skipped (%s)", exc)
+                    logger.warning("Quantized %s draft head failed (%s); falling back to NVFP4", head_quant, exc)
+                    use_quant_head = False
+
+            if not use_quant_head:
+                draft_head.register_parameter(
+                    "weight",
+                    Parameter(
+                        layer.weight.index_select(0, ids).contiguous(),
+                        requires_grad=False,
+                    ),
+                )
+                draft_head.register_parameter(
+                    "weight_scale",
+                    Parameter(
+                        layer.weight_scale.index_select(0, ids).contiguous(),
+                        requires_grad=False,
+                    ),
+                )
+                draft_head.register_parameter(
+                    "weight_global_scale",
+                    Parameter(layer.weight_global_scale.clone(), requires_grad=False),
+                )
+                self.kernel.process_weights_after_loading(draft_head)
+
+                # Quick 6-spare read-only-flush GB10 DRAM placement for draft_head._marlin_decode_weight.
+                dec_w = getattr(draft_head, "_marlin_decode_weight", None)
+                if (
+                    dec_w is not None
+                    and os.environ.get("MUSE_DRAFT_VOCAB_PLACE", "1") != "0"
+                ):
+                    try:
+                        spares = [torch.empty_like(dec_w) for _ in range(6)]
+                        for sp in spares:
+                            sp.copy_(dec_w)
+                        evict = torch.ones((48 << 20) // 4, dtype=torch.float32, device=dev)
+                        x_p = (
+                            ((torch.arange(6 * k_dim, device=dev) % 7).float() - 3.0)
+                            .to(torch.bfloat16)
+                            .reshape(6, k_dim)
+                        )
+                        cands = [dec_w, *spares]
+                        _ = evict.sum()
+                        _ = self.apply(draft_head, x_p)
+                        torch.cuda.synchronize(dev)
+                        samples = [[] for _ in cands]
+                        for _ in range(5):
+                            for ci, buf in enumerate(cands):
+                                draft_head._buffers["_marlin_decode_weight"] = buf
+                                _ = evict.sum()
+                                se = torch.cuda.Event(enable_timing=True)
+                                ee = torch.cuda.Event(enable_timing=True)
+                                se.record()
+                                _ = self.apply(draft_head, x_p)
+                                ee.record()
+                                torch.cuda.synchronize(dev)
+                                samples[ci].append(se.elapsed_time(ee))
+                        times = [median(s) for s in samples]
+                        best_i = min(range(len(cands)), key=times.__getitem__)
+                        if best_i > 0 and times[0] - times[best_i] >= 0.005:
+                            draft_head._buffers["_marlin_decode_weight"] = cands[best_i]
+                            logger.info(
+                                "Draft vocab head DRAM placement: saved %.3f ms (%.3f -> %.3f ms)",
+                                times[0] - times[best_i],
+                                times[0],
+                                times[best_i],
+                            )
+                        else:
+                            draft_head._buffers["_marlin_decode_weight"] = dec_w
+                        del spares, cands, evict, x_p
+                        torch.cuda.empty_cache()
+                    except Exception as exc:  # noqa: BLE001
+                        draft_head._buffers["_marlin_decode_weight"] = dec_w
+                        logger.warning("Draft vocab head DRAM placement skipped (%s)", exc)
 
             draft_head.prompt_tail_admitted = False
             if want_tail and raw_w_full is not None and raw_s_full is not None and raw_gs_full is not None:
@@ -1541,7 +1666,11 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                         got_scores = _bfx.draft_vocab_score_rows(
                             x_chk, chk_orig, raw_w_full, raw_s_full, raw_gs_full, 1.0
                         )
-                        ref_scores = ref_logits.index_select(1, chk_idx).float()
+                        if exact_chk_bf16 is not None:
+                            ref_scores = torch.matmul(x_chk.float(), exact_chk_bf16.float().t())
+                            del exact_chk_bf16
+                        else:
+                            ref_scores = ref_logits.index_select(1, chk_idx).float()
                         max_err = (got_scores - ref_scores).abs().max().item()
                         tol = 2e-2 * ref_scores.abs().max().item() + 1e-2
                         # Also warmup tail_argmax scratch allocation outside CUDA graph capture.
@@ -1605,6 +1734,16 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        nf8_meta = getattr(layer, "_draft_nf8", None)
+        if nf8_meta is not None and bias is None and x.dtype == torch.bfloat16:
+            n, k, wave_ilv = nf8_meta
+            return torch.ops.muse.draft_nf8_linear(x, layer._draft_nf8_blob, n, k, wave_ilv)
+        i3_meta = getattr(layer, "_draft_int3", None)
+        if i3_meta is not None and bias is None and x.dtype == torch.bfloat16:
+            n, k = i3_meta
+            return torch.ops.muse.draft_int3_linear(
+                x, x.new_empty((0,)), layer._draft_int3_blob, n, k
+            )
         return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
 
