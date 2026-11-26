@@ -2008,84 +2008,92 @@ __global__ void Marlin(
   // dequantization and matmul operations.
   #pragma unroll
     for (int j = 0; j < 4; j++) {
-      FragB frag_b0;
-      FragB frag_b1;
-      int b_quant_0, b_quant_1;
-
-      if constexpr (b_type_id == vllm::kFE2M1f.id() &&
-                    a_type_id == vllm::kBFloat16.id() && dequant_skip_flop) {
-        const uint32_t u = static_cast<uint32_t>(frag_b_quant[k2][0][j]);
-        reinterpret_cast<uint32_t*>(&frag_b1)[1] =
-            lop3<(0xf0 & 0xcc) | 0xaa>(u, 0x80008000, (u >> 6) & 0x01c001c0u);
-        reinterpret_cast<uint32_t*>(&frag_b1)[0] =
-            (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
-        reinterpret_cast<uint32_t*>(&frag_b0)[1] =
-            ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
-        reinterpret_cast<uint32_t*>(&frag_b0)[0] =
-            ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
-      } else {
-        if constexpr (b_type_id == vllm::kFE2M1f.id()) {
-          b_quant_1 = frag_b_quant[k2][0][j];
-          b_quant_0 = b_quant_1 << 8;
-        } else if constexpr (b_type.size_bits() == 4) {
-          b_quant_0 = frag_b_quant[k2][0][j];
-          b_quant_1 = b_quant_0 >> 8;
+      auto dequant_scale_j = [&](int jj, FragB& fb0, FragB& fb1) {
+        if constexpr (b_type_id == vllm::kFE2M1f.id() &&
+                      a_type_id == vllm::kBFloat16.id() && dequant_skip_flop) {
+          const uint32_t u = static_cast<uint32_t>(frag_b_quant[k2][0][jj]);
+          reinterpret_cast<uint32_t*>(&fb1)[1] =
+              lop3<(0xf0 & 0xcc) | 0xaa>(u, 0x80008000, (u >> 6) & 0x01c001c0u);
+          reinterpret_cast<uint32_t*>(&fb1)[0] =
+              (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
+          reinterpret_cast<uint32_t*>(&fb0)[1] =
+              ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
+          reinterpret_cast<uint32_t*>(&fb0)[0] =
+              ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
         } else {
-          static_assert(b_type.size_bits() == 8);
-          int* frag_b_quant_ptr = reinterpret_cast<int*>(frag_b_quant[k2]);
-          b_quant_0 = frag_b_quant_ptr[j * 2 + 0];
-          b_quant_1 = frag_b_quant_ptr[j * 2 + 1];
+          int b_quant_0, b_quant_1;
+          if constexpr (b_type_id == vllm::kFE2M1f.id()) {
+            b_quant_1 = frag_b_quant[k2][0][jj];
+            b_quant_0 = b_quant_1 << 8;
+          } else if constexpr (b_type.size_bits() == 4) {
+            b_quant_0 = frag_b_quant[k2][0][jj];
+            b_quant_1 = b_quant_0 >> 8;
+          } else {
+            static_assert(b_type.size_bits() == 8);
+            int* frag_b_quant_ptr = reinterpret_cast<int*>(frag_b_quant[k2]);
+            b_quant_0 = frag_b_quant_ptr[jj * 2 + 0];
+            b_quant_1 = frag_b_quant_ptr[jj * 2 + 1];
+          }
+
+          dequant_data(b_quant_0, reinterpret_cast<scalar_32bit_t*>(&fb0));
+          dequant_data(b_quant_1, reinterpret_cast<scalar_32bit_t*>(&fb1));
         }
 
-        dequant_data(b_quant_0, reinterpret_cast<scalar_32bit_t*>(&frag_b0));
-        dequant_data(b_quant_1, reinterpret_cast<scalar_32bit_t*>(&frag_b1));
-      }
+        if constexpr (dequant_skip_flop && has_zp && !is_zp_float && !is_a_8bit) {
+          sub_zp<a_type_id>(fb0, frag_zp[jj], 0);
+          sub_zp<a_type_id>(fb1, frag_zp[jj], 1);
+        }
 
-      if constexpr (dequant_skip_flop && has_zp && !is_zp_float && !is_a_8bit) {
-        sub_zp<a_type_id>(frag_b0, frag_zp[j], 0);
-        sub_zp<a_type_id>(frag_b1, frag_zp[j], 1);
-      }
+        if constexpr (has_act_order && !is_a_8bit) {
+          static_assert(group_blocks != -1);
+          scale4<a_type_id>(fb0, act_frag_s[k2][0][jj], act_frag_s[k2][1][jj],
+                            act_frag_s[k2][2][jj], act_frag_s[k2][3][jj], 0);
+          scale4<a_type_id>(fb1, act_frag_s[k2][0][jj], act_frag_s[k2][1][jj],
+                            act_frag_s[k2][2][jj], act_frag_s[k2][3][jj], 1);
+        } else if constexpr (!dequant_skip_flop && has_zp && !is_zp_float &&
+                             group_blocks == -1 && !is_a_8bit) {
+          int idx = (threadIdx.x / 4) % 2;
+          scalar_t2 s2 = Adtype::nums2num2(
+              reinterpret_cast<scalar_t*>(&frag_s[jj / 2][jj % 2 * 2 + 0])[idx],
+              reinterpret_cast<scalar_t*>(&frag_s[jj / 2][jj % 2 * 2 + 1])[idx]);
+          if (is_new_zp) frag_zp[jj] = __hmul2(frag_zp[jj], s2);
+          scale_and_sub<a_type_id>(fb0, s2.x, frag_zp[jj].x);
+          scale_and_sub<a_type_id>(fb1, s2.y, frag_zp[jj].y);
+        } else if constexpr (!dequant_skip_flop && has_zp && group_blocks != -1 &&
+                             !is_a_8bit) {
+          if (is_new_zp)
+            frag_zp[jj] = __hmul2(frag_zp[jj],
+                                  *reinterpret_cast<scalar_t2*>(&frag_s[k2][jj]));
+          scale_and_sub<a_type_id>(fb0, frag_s[k2][jj][0].x, frag_zp[jj].x);
+          scale_and_sub<a_type_id>(fb1, frag_s[k2][jj][0].y, frag_zp[jj].y);
+        } else if constexpr (group_blocks != -1 && !is_a_8bit) {
+          scale<a_type_id>(fb0, frag_s[k2][jj], 0);
+          scale<a_type_id>(fb1, frag_s[k2][jj], 1);
+        }
+      };
 
-      // Apply scale to frag_b0
-      if constexpr (has_act_order && !is_a_8bit) {
-        static_assert(group_blocks != -1);
-        scale4<a_type_id>(frag_b0, act_frag_s[k2][0][j], act_frag_s[k2][1][j],
-                          act_frag_s[k2][2][j], act_frag_s[k2][3][j], 0);
-        scale4<a_type_id>(frag_b1, act_frag_s[k2][0][j], act_frag_s[k2][1][j],
-                          act_frag_s[k2][2][j], act_frag_s[k2][3][j], 1);
-      } else if constexpr (!dequant_skip_flop && has_zp && !is_zp_float &&
-                           group_blocks == -1 && !is_a_8bit) {
-        int idx = (threadIdx.x / 4) % 2;
-        scalar_t2 s2 = Adtype::nums2num2(
-            reinterpret_cast<scalar_t*>(&frag_s[j / 2][j % 2 * 2 + 0])[idx],
-            reinterpret_cast<scalar_t*>(&frag_s[j / 2][j % 2 * 2 + 1])[idx]);
-        if (is_new_zp) frag_zp[j] = __hmul2(frag_zp[j], s2);
-        scale_and_sub<a_type_id>(frag_b0, s2.x, frag_zp[j].x);
-        scale_and_sub<a_type_id>(frag_b1, s2.y, frag_zp[j].y);
-      } else if constexpr (!dequant_skip_flop && has_zp && group_blocks != -1 &&
-                           !is_a_8bit) {
-        if (is_new_zp)
-          frag_zp[j] = __hmul2(frag_zp[j],
-                               *reinterpret_cast<scalar_t2*>(&frag_s[k2][j]));
-        scale_and_sub<a_type_id>(frag_b0, frag_s[k2][j][0].x, frag_zp[j].x);
-        scale_and_sub<a_type_id>(frag_b1, frag_s[k2][j][0].y, frag_zp[j].y);
-      } else if constexpr (group_blocks != -1 && !is_a_8bit) {
-        scale<a_type_id>(frag_b0, frag_s[k2][j], 0);
-        scale<a_type_id>(frag_b1, frag_s[k2][j], 1);
-      }
+      FragB cur_b0;
+      FragB cur_b1;
+      FragB nxt_b0;
+      FragB nxt_b1;
+      if (j == 0) dequant_scale_j(0, cur_b0, cur_b1);
 
   #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
         if constexpr (m_block_size_8) {
-          mma_trans<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b0, frag_b1,
+          mma_trans<a_type_id, use_fp16_accum>(frag_a[k2][i], cur_b0, cur_b1,
                                                frag_c[i][j][0]);
+          if (i == 0 && j + 1 < 4) dequant_scale_j(j + 1, nxt_b0, nxt_b1);
         } else {
-          mma<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b0,
+          mma<a_type_id, use_fp16_accum>(frag_a[k2][i], cur_b0,
                                          frag_c[i][j][0]);
-          mma<a_type_id, use_fp16_accum>(frag_a[k2][i], frag_b1,
+          if (i == 0 && j + 1 < 4) dequant_scale_j(j + 1, nxt_b0, nxt_b1);
+          mma<a_type_id, use_fp16_accum>(frag_a[k2][i], cur_b1,
                                          frag_c[i][j][1]);
         }
       }
+      cur_b0 = nxt_b0;
+      cur_b1 = nxt_b1;
     }
   };
 
