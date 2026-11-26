@@ -199,6 +199,18 @@ __global__ void dflash_kv_post_kernel(
   *reinterpret_cast<uint2*>(v_dst + lane * 4) = v_out_v;
 }
 
+// Optional paged KV-cache scatter fused into dflash_qkv_norm_rope (one
+// launch per drafter layer instead of qkv_norm_rope + reshape_and_cache_flash).
+struct QkvCacheDesc {
+  __nv_bfloat16* k_cache;
+  __nv_bfloat16* v_cache;
+  const int64_t* slots;
+  int64_t k_sb, k_sn, k_sh;
+  int64_t v_sb, v_sn, v_sh;
+  int block_size;
+  int enabled;
+};
+
 template <bool kNeox, bool kCacheFP32>
 __global__ void dflash_qkv_norm_rope_kernel(
     const __nv_bfloat16* __restrict__ qkv,         // [M, (nq + 2*nkv) * 128]
@@ -208,6 +220,7 @@ __global__ void dflash_qkv_norm_rope_kernel(
     const void* __restrict__ cos_sin_cache,        // [cache_rows, 128]
     __nv_bfloat16* __restrict__ q_out,             // [M, nq * 128]
     __nv_bfloat16* __restrict__ k_out,             // [M, nkv * 128]
+    QkvCacheDesc cdesc,
     int M, int nq, int nkv, int cache_rows, float eps, int pdl_mode) {
   const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int total_h = nq + nkv;
@@ -242,11 +255,29 @@ __global__ void dflash_qkv_norm_rope_kernel(
     apply_rmsnorm_rope_hd128<kNeox, kCacheFP32>(
         row_in + static_cast<size_t>(nq + kh) * kHeadDim,
         wraw, cos_sin_cache, pos, cache_rows, eps, lane, out_v);
+    uint2 v_out_v = {};
+    if (cdesc.enabled) {
+      v_out_v = *reinterpret_cast<const uint2*>(
+          row_in + static_cast<size_t>(nq + nkv + kh) * kHeadDim + lane * 4);
+    }
     if ((pdl_mode & 2) != 0) {
       asm volatile("griddepcontrol.launch_dependents;");
     }
+    // k_out is always written so the returned K stays valid for any
+    // consumer (and for the unfused cache update if the skip is not taken).
     __nv_bfloat16* dst = k_out + (static_cast<size_t>(m) * nkv + kh) * kHeadDim;
     *reinterpret_cast<uint2*>(dst + lane * 4) = out_v;
+    if (cdesc.enabled) {
+      const int64_t slot = cdesc.slots[m];
+      if (slot >= 0) {
+        const int64_t b = (cdesc.block_size == 16) ? (slot >> 4) : (slot / cdesc.block_size);
+        const int64_t o = (cdesc.block_size == 16) ? (slot & 15) : (slot - b * cdesc.block_size);
+        __nv_bfloat16* k_dst = cdesc.k_cache + b * cdesc.k_sb + o * cdesc.k_sn + kh * cdesc.k_sh;
+        __nv_bfloat16* v_dst = cdesc.v_cache + b * cdesc.v_sb + o * cdesc.v_sn + kh * cdesc.v_sh;
+        *reinterpret_cast<uint2*>(k_dst + lane * 4) = out_v;
+        *reinterpret_cast<uint2*>(v_dst + lane * 4) = v_out_v;
+      }
+    }
   }
 }
 
@@ -331,7 +362,11 @@ std::tuple<torch::Tensor, torch::Tensor> dflash_qkv_norm_rope(
     int64_t nq,
     int64_t nkv,
     double eps,
-    bool is_neox) {
+    bool is_neox,
+    c10::optional<torch::Tensor> slot_mapping,
+    c10::optional<torch::Tensor> k_cache,
+    c10::optional<torch::Tensor> v_cache,
+    int64_t block_size) {
   TORCH_CHECK(qkv.is_cuda() && qkv.scalar_type() == torch::kBFloat16 &&
               qkv.dim() == 2 && qkv.is_contiguous());
   TORCH_CHECK(positions.is_cuda() && positions.scalar_type() == torch::kInt64 && positions.is_contiguous());
@@ -347,6 +382,28 @@ std::tuple<torch::Tensor, torch::Tensor> dflash_qkv_norm_rope(
   auto q_out = torch::empty({M, nq * kHeadDim}, qkv.options());
   auto k_out = torch::empty({M, nkv * kHeadDim}, qkv.options());
   if (M == 0) return {q_out, k_out};
+
+  QkvCacheDesc cdesc{};
+  if (slot_mapping.has_value() && slot_mapping->defined() &&
+      k_cache.has_value() && k_cache->defined() &&
+      v_cache.has_value() && v_cache->defined()) {
+    TORCH_CHECK(slot_mapping->is_cuda() && slot_mapping->scalar_type() == torch::kInt64 &&
+                slot_mapping->is_contiguous() && slot_mapping->numel() >= M);
+    TORCH_CHECK(k_cache->is_cuda() && k_cache->scalar_type() == torch::kBFloat16 &&
+                k_cache->dim() == 4 && k_cache->stride(3) == 1 &&
+                k_cache->size(2) == nkv && k_cache->size(3) == kHeadDim);
+    TORCH_CHECK(v_cache->is_cuda() && v_cache->scalar_type() == torch::kBFloat16 &&
+                v_cache->dim() == 4 && v_cache->stride(3) == 1 &&
+                v_cache->size(2) == nkv && v_cache->size(3) == kHeadDim);
+    TORCH_CHECK(block_size > 0 && k_cache->size(1) == block_size && v_cache->size(1) == block_size);
+    cdesc.k_cache = reinterpret_cast<__nv_bfloat16*>(k_cache->data_ptr());
+    cdesc.v_cache = reinterpret_cast<__nv_bfloat16*>(v_cache->data_ptr());
+    cdesc.slots = slot_mapping->data_ptr<int64_t>();
+    cdesc.k_sb = k_cache->stride(0); cdesc.k_sn = k_cache->stride(1); cdesc.k_sh = k_cache->stride(2);
+    cdesc.v_sb = v_cache->stride(0); cdesc.v_sn = v_cache->stride(1); cdesc.v_sh = v_cache->stride(2);
+    cdesc.block_size = static_cast<int>(block_size);
+    cdesc.enabled = 1;
+  }
 
   const int total_warps = M * static_cast<int>(nq + nkv);
   const int blocks = (total_warps + 3) / 4;
@@ -366,7 +423,7 @@ std::tuple<torch::Tensor, torch::Tensor> dflash_qkv_norm_rope(
       static_cast<const void*>(cos_sin_cache.data_ptr()), \
       reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr()), \
       reinterpret_cast<__nv_bfloat16*>(k_out.data_ptr()), \
-      M, static_cast<int>(nq), static_cast<int>(nkv), cache_rows, static_cast<float>(eps), pdl_mode)
+      cdesc, M, static_cast<int>(nq), static_cast<int>(nkv), cache_rows, static_cast<float>(eps), pdl_mode)
 
   if (is_neox) {
     if (cache_f32) { LAUNCH_QKVNR(true, true); }
