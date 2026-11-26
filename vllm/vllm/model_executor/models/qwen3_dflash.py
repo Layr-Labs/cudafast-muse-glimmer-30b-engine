@@ -269,6 +269,7 @@ class DFlashQwen3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        tail_slice_m6: bool = False,
     ) -> torch.Tensor:
         """DFlash attention assumes that the KV cache is already populated
         with the context K/V from the target model's hidden states. This forward op
@@ -291,9 +292,12 @@ class DFlashQwen3Attention(nn.Module):
                 self.num_kv_heads,
                 float(self.q_norm.variance_epsilon),
                 bool(self.rotary_emb.is_neox_style),
+                self.attn.layer_name if getattr(self, "_dflash_qkv_cache_ok", False) else "",
             )
             v = qkv[..., self.q_size + self.kv_size :]
             attn_output = self.attn(q, k, v)
+            if tail_slice_m6:
+                attn_output = attn_output[1:7]
             output, _ = self.o_proj(attn_output)
             return output
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -310,6 +314,8 @@ class DFlashQwen3Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
+        if tail_slice_m6:
+            attn_output = attn_output[1:7]
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -376,19 +382,55 @@ class DFlashQwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        tail_slice_m6: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        use_fuse_norm = (
+            getattr(self, "_dflash_fuse_norm_ok", False)
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.dim() == 2
+            and hidden_states.shape[-1] <= 8192
+            and hidden_states.shape[-1] % 8 == 0
+        )
         if residual is not None:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            if use_fuse_norm:
+                hidden_states, residual = torch.ops.muse.dflash_fused_add_rms_norm(
+                    hidden_states,
+                    residual,
+                    self.input_layernorm.weight,
+                    float(self.input_layernorm.variance_epsilon),
+                )
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            if use_fuse_norm:
+                hidden_states = torch.ops.muse.dflash_rms_norm(
+                    hidden_states,
+                    self.input_layernorm.weight,
+                    float(self.input_layernorm.variance_epsilon),
+                )
+            else:
+                hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            tail_slice_m6=tail_slice_m6,
         )
+        if tail_slice_m6:
+            residual = residual[1:7]
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if use_fuse_norm:
+            hidden_states, residual = torch.ops.muse.dflash_fused_add_rms_norm(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                float(self.post_attention_layernorm.variance_epsilon),
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
         if getattr(self.mlp, "_mi3_swiglu", None) is not None:
             from vllm.model_executor.layers import muse_draft_fp8
 
@@ -564,13 +606,28 @@ class DFlashQwen3Model(nn.Module):
         context_states: torch.Tensor,
     ) -> torch.Tensor:
         # --- Fused KV projection (one GEMM for all layers) ---
-        normed_context_states = torch.empty_like(context_states)
-        ops.rms_norm(
-            normed_context_states,
-            context_states,
-            self._hidden_norm_weight,
-            self._rms_norm_eps,
-        )
+        if (
+            getattr(self, "_dflash_fuse_norm_ok", False)
+            and os.environ.get("MUSE_DFLASH_FUSE_NORM", "1") != "0"
+            and context_states.is_cuda
+            and context_states.dtype == torch.bfloat16
+            and context_states.dim() == 2
+            and context_states.shape[-1] <= 8192
+            and context_states.shape[-1] % 8 == 0
+        ):
+            normed_context_states = torch.ops.muse.dflash_rms_norm(
+                context_states,
+                self._hidden_norm_weight,
+                float(self._rms_norm_eps),
+            )
+        else:
+            normed_context_states = torch.empty_like(context_states)
+            ops.rms_norm(
+                normed_context_states,
+                context_states,
+                self._hidden_norm_weight,
+                self._rms_norm_eps,
+            )
         if self._fused_kv_bias is None:
             all_kv_flat = None
             if (
@@ -673,72 +730,92 @@ class DFlashQwen3Model(nn.Module):
             )
             if all(s is not None for s in slots_list):
                 try:
-                    import muse_bfx_ext as _bfx
+                    kv_ptrs = tuple(
+                        (None if a.kv_cache is None else a.kv_cache.data_ptr())
+                        for a in self._attn_layers
+                    )
+                    cache_entry = getattr(self, "_dflash_kv_post_cache", None)
+                    if cache_entry is None or cache_entry[0] != kv_ptrs:
+                        import muse_bfx_ext as _bfx
 
-                    if hasattr(_bfx, "dflash_kv_post"):
+                        kv_post_fn = getattr(_bfx, "dflash_kv_post", None)
                         k_caches = []
                         v_caches = []
                         block_size = 0
-                        ok_layout = True
-                        for i in range(L):
-                            attn = self._attn_layers[i]
-                            if getattr(attn.impl, "kv_cache_dtype", "auto") != "auto":
-                                ok_layout = False
-                                break
-                            kvc = attn.kv_cache
-                            if kvc is None or not kvc.is_cuda or kvc.dtype != torch.bfloat16:
-                                ok_layout = False
-                                break
-                            if kvc.dim() == 4 and kvc.shape[1] == nkv and kvc.shape[3] == 2 * hd:
-                                kc, vc = kvc.transpose(1, 2).split(hd, dim=-1)
-                            elif kvc.dim() == 5 and kvc.shape[0] == 2 and kvc.shape[3] == nkv and kvc.shape[4] == hd:
-                                kc, vc = kvc[0], kvc[1]
-                            else:
-                                ok_layout = False
-                                break
-                            if kc.stride(3) != 1 or vc.stride(3) != 1:
-                                ok_layout = False
-                                break
-                            bs_i = int(kc.shape[1])
-                            if block_size == 0:
-                                block_size = bs_i
-                            elif block_size != bs_i:
-                                ok_layout = False
-                                break
-                            k_caches.append(kc)
-                            v_caches.append(vc)
-
+                        ok_layout = kv_post_fn is not None
+                        if ok_layout:
+                            for i in range(L):
+                                attn = self._attn_layers[i]
+                                if getattr(attn.impl, "kv_cache_dtype", "auto") != "auto":
+                                    ok_layout = False
+                                    break
+                                kvc = attn.kv_cache
+                                if kvc is None or not kvc.is_cuda or kvc.dtype != torch.bfloat16:
+                                    ok_layout = False
+                                    break
+                                if kvc.dim() == 4 and kvc.shape[1] == nkv and kvc.shape[3] == 2 * hd:
+                                    kc, vc = kvc.transpose(1, 2).split(hd, dim=-1)
+                                elif kvc.dim() == 5 and kvc.shape[0] == 2 and kvc.shape[3] == nkv and kvc.shape[4] == hd:
+                                    kc, vc = kvc[0], kvc[1]
+                                else:
+                                    ok_layout = False
+                                    break
+                                if kc.stride(3) != 1 or vc.stride(3) != 1:
+                                    ok_layout = False
+                                    break
+                                bs_i = int(kc.shape[1])
+                                if block_size == 0:
+                                    block_size = bs_i
+                                elif block_size != bs_i:
+                                    ok_layout = False
+                                    break
+                                k_caches.append(kc)
+                                v_caches.append(vc)
                         if ok_layout and block_size > 0:
-                            cos_sin_cache = self._rope_cos_sin_cache
-                            if cos_sin_cache.dtype != context_states.dtype:
-                                cast_cache = getattr(self, "_rope_cos_sin_cache_cast", None)
-                                if (
-                                    cast_cache is None
-                                    or cast_cache.dtype != context_states.dtype
-                                    or cast_cache.device != context_states.device
-                                ):
-                                    cast_cache = cos_sin_cache.to(
-                                        device=context_states.device, dtype=context_states.dtype
-                                    )
-                                    self._rope_cos_sin_cache_cast = cast_cache
-                                cos_sin_cache = cast_cache
-                            all_kv_flat = self._project_context_kv_flat(context_states)
-                            if not all_kv_flat.is_contiguous():
-                                all_kv_flat = all_kv_flat.contiguous()
-                            _bfx.dflash_kv_post(
-                                all_kv_flat,
-                                context_positions if context_positions.is_contiguous() else context_positions.contiguous(),
-                                self._k_norm_weights,
-                                cos_sin_cache,
-                                k_caches,
-                                v_caches,
-                                [s if s.is_contiguous() else s.contiguous() for s in slots_list],
-                                nkv,
-                                block_size,
-                                float(self._rms_norm_eps),
-                                bool(self._rope_is_neox),
-                            )
-                            return
+                            cache_entry = (kv_ptrs, kv_post_fn, k_caches, v_caches, block_size)
+                        else:
+                            cache_entry = (kv_ptrs, None, None, None, 0)
+                        self._dflash_kv_post_cache = cache_entry
+
+                    _, kv_post_fn, k_caches, v_caches, block_size = cache_entry
+                    if kv_post_fn is not None:
+                        cos_sin_cache = self._rope_cos_sin_cache
+                        if cos_sin_cache.dtype != context_states.dtype:
+                            cast_cache = getattr(self, "_rope_cos_sin_cache_cast", None)
+                            if (
+                                cast_cache is None
+                                or cast_cache.dtype != context_states.dtype
+                                or cast_cache.device != context_states.device
+                            ):
+                                cast_cache = cos_sin_cache.to(
+                                    device=context_states.device, dtype=context_states.dtype
+                                )
+                                self._rope_cos_sin_cache_cast = cast_cache
+                            cos_sin_cache = cast_cache
+                        all_kv_flat = self._project_context_kv_flat(context_states)
+                        if not all_kv_flat.is_contiguous():
+                            all_kv_flat = all_kv_flat.contiguous()
+                        pos_arg = (
+                            context_positions
+                            if context_positions.is_contiguous()
+                            else context_positions.contiguous()
+                        )
+                        if not all(s.is_contiguous() for s in slots_list):
+                            slots_list = [s if s.is_contiguous() else s.contiguous() for s in slots_list]
+                        kv_post_fn(
+                            all_kv_flat,
+                            pos_arg,
+                            self._k_norm_weights,
+                            cos_sin_cache,
+                            k_caches,
+                            v_caches,
+                            slots_list,
+                            nkv,
+                            block_size,
+                            float(self._rms_norm_eps),
+                            bool(self._rope_is_neox),
+                        )
+                        return
                 except Exception as exc:  # noqa: BLE001
                     logger.warning_once("dflash_kv_post skipped (%s); using stock path", exc)
 
@@ -812,7 +889,60 @@ class DFlashQwen3Model(nn.Module):
                 hidden_states=hidden_states,
                 residual=residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if (
+            getattr(self, "_dflash_fuse_norm_ok", False)
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.dim() == 2
+            and hidden_states.shape[-1] <= 8192
+            and hidden_states.shape[-1] % 8 == 0
+            and residual is not None
+        ):
+            hidden_states, _ = torch.ops.muse.dflash_fused_add_rms_norm(
+                hidden_states,
+                residual,
+                self.norm.weight,
+                float(self.norm.variance_epsilon),
+            )
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
+    def forward_tail_m6(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Eager/CUDA-graph forward slicing Layer-4 post-attention [1:7] -> M=6 (0-ULP exact)."""
+        if input_embeds is None:
+            input_embeds = self.embed_input_ids(input_ids)
+
+        hidden_states = input_embeds
+        residual = None
+        last_idx = len(self.layers) - 1
+        for idx, layer in enumerate(self.layers):
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                tail_slice_m6=(idx == last_idx),
+            )
+        if (
+            getattr(self, "_dflash_fuse_norm_ok", False)
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.dim() == 2
+            and hidden_states.shape[-1] <= 8192
+            and hidden_states.shape[-1] % 8 == 0
+            and residual is not None
+        ):
+            hidden_states, _ = torch.ops.muse.dflash_fused_add_rms_norm(
+                hidden_states,
+                residual,
+                self.norm.weight,
+                float(self.norm.variance_epsilon),
+            )
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
     def _preprocess(
@@ -884,7 +1014,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
+        tail_slice_m6: bool = False,
     ) -> torch.Tensor:
+        if tail_slice_m6:
+            return self.model.forward_tail_m6(input_ids, positions, inputs_embeds)
         return self.model(input_ids, positions, inputs_embeds)
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
@@ -965,6 +1098,22 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             x_c = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
             sl_c = static_logits if static_logits.is_contiguous() else static_logits.contiguous()
             logit_scale = float(getattr(self.logits_processor, "scale", 1.0))
+            vm_sorted = getattr(self, "_draft_vocab_map_sorted", None)
+            if vm_sorted is None:
+                if os.environ.get("MUSE_DVT_PACKED_TOP6", "1") == "0":
+                    vm_sorted = False
+                    self._draft_vocab_map_sorted = False
+                elif torch.cuda.is_current_stream_capturing():
+                    vm_sorted = False
+                else:
+                    vm_sorted = bool(
+                        vocab_map.dim() == 1
+                        and (
+                            vocab_map.numel() <= 1
+                            or bool((vocab_map[1:] > vocab_map[:-1]).all().item())
+                        )
+                    )
+                    self._draft_vocab_map_sorted = vm_sorted
             try:
                 return _bfx.draft_vocab_tail_argmax(
                     x_c,
@@ -980,19 +1129,37 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                     margin_buf,
                     tree_top_buf,
                     tree_vals_buf,
+                    vm_sorted,
                 )
             except TypeError:
-                return _bfx.draft_vocab_tail_argmax(
-                    x_c,
-                    sl_c,
-                    vocab_map,
-                    lm_head.tail_ids,
-                    lm_head.tail_count,
-                    lm_head.full_raw_w,
-                    lm_head.full_raw_s,
-                    lm_head.full_global_scale,
-                    logit_scale,
-                )
+                try:
+                    return _bfx.draft_vocab_tail_argmax(
+                        x_c,
+                        sl_c,
+                        vocab_map,
+                        lm_head.tail_ids,
+                        lm_head.tail_count,
+                        lm_head.full_raw_w,
+                        lm_head.full_raw_s,
+                        lm_head.full_global_scale,
+                        logit_scale,
+                        alt_buf,
+                        margin_buf,
+                        tree_top_buf,
+                        tree_vals_buf,
+                    )
+                except TypeError:
+                    return _bfx.draft_vocab_tail_argmax(
+                        x_c,
+                        sl_c,
+                        vocab_map,
+                        lm_head.tail_ids,
+                        lm_head.tail_count,
+                        lm_head.full_raw_w,
+                        lm_head.full_raw_s,
+                        lm_head.full_global_scale,
+                        logit_scale,
+                    )
         if static_logits.dim() == 2 and static_logits.shape[0] >= 1:
             if tree_top_buf is not None and tree_top_buf.numel() >= 48:
                 n_tt = min(6, static_logits.shape[0])

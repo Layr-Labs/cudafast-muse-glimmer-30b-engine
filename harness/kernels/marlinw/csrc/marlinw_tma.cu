@@ -350,17 +350,15 @@ __device__ __forceinline__ void down_tile(
   // registers (scratch slot `index`), so the chains of a split tile are the chains of the whole tile, HMMA for HMMA.
   // A later piece waits until its predecessor has published the state: flags[index] goes 0 -> 1 (first piece
   // done) -> 2 (middle piece done) -> 0 (taken by the last piece).
-  const int k0 = (kCols == 6656 && kLater) ? (piece & 1023) : 0;
+  const int k0 = piece & 1023;
   const int k1 = k0 + k_tiles;
-  if constexpr (kCols == 6656 && kLater) {
-    if (tid == 0 && (piece & 2048)) {
-      volatile int* const flag = flags + (piece >> 12);
-      const int before = ((piece >> 10) & 3) - 1;
-      while (*flag != before) {
-      }
-      __threadfence();  // acquire: the predecessor's state (stored before its release fence + flag) is visible
-      if (before == 2) *flag = 0;
+  if (tid == 0 && (piece & 2048)) {
+    volatile int* const flag = flags + (piece >> 12);
+    const int before = ((piece >> 10) & 3) - 1;
+    while (*flag != before) {
     }
+    __threadfence();  // acquire: the predecessor's state (stored before its release fence + flag) is visible
+    if (before == 2) *flag = 0;
   }
   // Runs before k-tile t; returns the k-tile before which it has to run again (the next cut, or the end).
   auto cuts = [&](const int t) {
@@ -415,9 +413,9 @@ __device__ __forceinline__ void down_tile(
                               (kABytes + kBBytes) / 4 + 2 * (8 * nb + (lane >> 2)) + sh2, 32, produce, cuts, 0, 0,
                               kLater ? scratch + (size_t)(piece >> 12) * (kThreads * 32) : nullptr, k0);
   __syncthreads();
-  if constexpr (kCols == 6656) {
+  {
     const int role = (piece >> 10) & 3;
-    if (kLater ? (role == 2) : (role == 1)) {
+    if (role == 1 || role == 2) {
       float4* const hand = scratch + (size_t)(piece >> 12) * (kThreads * 32);
 #pragma unroll
       for (int e = 0; e < MB * 4; e++) hand[e * kThreads + tid] = reinterpret_cast<float4*>(acc)[e];
@@ -569,17 +567,12 @@ __global__ void __launch_bounds__(kThreads, 1) down(
   const float gs = gs_ptr[0];
   const int cut_a2 = (kCols == 4096) ? static_cast<int>(static_cast<int16_t>(w0.z & 0xFFFF)) : -1;
   const int cut_b2 = (kCols == 4096) ? static_cast<int>(static_cast<int16_t>((w0.z >> 16) & 0xFFFF)) : -1;
-  if constexpr (kCols == 6656) {
-    if (w1.w & 2048)
-      down_tile<8, true, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
-                         reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
-    else
-      down_tile<8, false, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
-                          reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
-  } else {
+  if (w1.w & 2048)
+    down_tile<8, true, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
+                       reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
+  else
     down_tile<8, false, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
                         reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
-  }
 }
 #else
 // ---------------------------------------------------------------------------------------------------------------
@@ -618,11 +611,11 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmS) : "memory");
   }
-  if (blockIdx.x == 0 && w_raw != nullptr) {
+  if (blockIdx.x < 48 && w_raw != nullptr && tid < 2) {
     constexpr size_t kTpf = 2048u << 10;
     constexpr size_t kWBytes = (static_cast<size_t>(kFused) * 6656u) >> 1;
-    for (size_t off = static_cast<size_t>(tid) * kTpf; off < kWBytes;
-         off += static_cast<size_t>(kThreads) * kTpf) {
+    const size_t off = (static_cast<size_t>(blockIdx.x) * 2u + static_cast<size_t>(tid)) * kTpf;
+    if (off < kWBytes) {
       asm volatile("prefetch.global.L2 [%0];" ::"l"(w_raw + off));
     }
   }
@@ -812,9 +805,9 @@ static int tma_pdl_mode() {
   if (g_tma_pdl_override >= 0) return g_tma_pdl_override;
   static const int env_mode = []() -> int {
     const char* env = std::getenv("MARLINW_TMA_PDL");
-    if (!env || !*env) return 1;  // default 1 = zero-overhead producer-only (2 = dual, 0 = off)
+    if (!env || !*env) return 2;
     long v = std::strtol(env, nullptr, 10);
-    return (v == 0 || v == 1 || v == 2) ? static_cast<int>(v) : 1;
+    return (v == 0 || v == 1 || v == 2) ? static_cast<int>(v) : 2;
   }();
   return env_mode;
 }

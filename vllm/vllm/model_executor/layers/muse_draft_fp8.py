@@ -49,6 +49,7 @@ _stats = {
     "admitted_int3": 0,
     "admitted_int3_swiglu": 0,
     "admitted_int4": 0,
+    "admitted_int4_swiglu": 0,
     "admitted_nvfp4": 0,
     "admitted_fp8": 0,
     "rejected": 0,
@@ -618,7 +619,8 @@ def _try_int4_buffer(
     w: torch.Tensor,
     metrics: dict[str, float] | None = None,
     check_aux5: bool = False,
-) -> tuple[torch.Tensor, bool] | None:
+    check_query_streamk: bool = False,
+) -> tuple[torch.Tensor, bool, bool] | None:
     import muse_bfx_ext as _bfx
 
     if not hasattr(_bfx, "int4_pack") or not hasattr(_bfx, "int4_gemm"):
@@ -667,8 +669,13 @@ def _try_int4_buffer(
                 ]
                 hs = [h[:m] for h in hs_full]
                 got_a5 = _bfx.int4_gemm_aux5(hs[0], hs[1], hs[2], hs[3], hs[4], blob, n, k)
+                got_a5_b = _bfx.int4_gemm_aux5(hs[0], hs[1], hs[2], hs[3], hs[4], blob, n, k)
                 ref_cat = _bfx.int4_gemm(torch.cat(hs, dim=-1).contiguous(), blob, n, k)
                 max_diff = (got_a5.float() - ref_cat.float()).abs().max().item()
+                if not torch.equal(got_a5.view(torch.int16), got_a5_b.view(torch.int16)):
+                    aux5_ok = False
+                    logger.warning("muse_draft_int4: aux5 non-deterministic on (%d,%d) M=%d", n, k, m)
+                    break
                 if not torch.allclose(got_a5.float(), ref_cat.float(), rtol=2e-2, atol=2e-3):
                     aux5_ok = False
                     logger.warning("muse_draft_int4: aux5 mismatch on (%d,%d) M=%d (max_diff=%.5f)", n, k, m, max_diff)
@@ -676,8 +683,78 @@ def _try_int4_buffer(
         except Exception as exc:  # noqa: BLE001
             aux5_ok = False
             logger.warning("muse_draft_int4: aux5 check failed (%s)", exc)
+    query_sk_ok = False
+    if (
+        check_query_streamk
+        and os.environ.get("MUSE_DRAFT_INT4_QUERY_SK", "1") != "0"
+    ):
+        query_sk_ok = True
+        try:
+            for m in (6, 7, 16):
+                x = (torch.randn((m, k), generator=gen, device=w.device) * 0.5).to(w.dtype)
+                ref = _bfx.int4_gemm(x, blob, n, k, False)
+                got_a = _bfx.int4_gemm(x, blob, n, k, True)
+                got_b = _bfx.int4_gemm(x, blob, n, k, True)
+                if not torch.equal(got_a.view(torch.int16), got_b.view(torch.int16)):
+                    query_sk_ok = False
+                    logger.warning("muse_draft_int4: query_streamk non-deterministic on (%d,%d) M=%d", n, k, m)
+                    break
+                if not torch.allclose(got_a.float(), ref.float(), rtol=2e-2, atol=2e-3):
+                    max_diff = (got_a.float() - ref.float()).abs().max().item()
+                    query_sk_ok = False
+                    logger.warning("muse_draft_int4: query_streamk mismatch on (%d,%d) M=%d (max_diff=%.5f)", n, k, m, max_diff)
+                    break
+        except Exception as exc:  # noqa: BLE001
+            query_sk_ok = False
+            logger.warning("muse_draft_int4: query_streamk check failed (%s)", exc)
     torch.cuda.synchronize(w.device)
-    return blob, aux5_ok
+    return blob, aux5_ok, query_sk_ok
+
+
+def _try_int4_swiglu_buffer(
+    w: torch.Tensor,
+    metrics: dict[str, float] | None = None,
+) -> torch.Tensor | None:
+    import muse_bfx_ext as _bfx
+
+    if not hasattr(_bfx, "int4_pack_swiglu") or not hasattr(_bfx, "int4_gemm_swiglu"):
+        return None
+    n2, k = w.shape
+    if n2 % 64 != 0 or k % 64 != 0:
+        return None
+    inter = n2 // 2
+    w_c = w.contiguous()
+    w_gate = w_c[:inter]
+    w_up = w_c[inter:]
+    mse_opt = _int4_mse_enabled()
+    try:
+        blob = _bfx.int4_pack_swiglu(w_c, mse_opt)
+    except TypeError:
+        blob = _bfx.int4_pack_swiglu(w_c)
+    gen = torch.Generator(device=w.device)
+    gen.manual_seed(4583 + n2 + 29 * k)
+    for m in (1, 7, 8, 16):
+        x = (torch.randn((m, k), generator=gen, device=w.device) * 0.5).to(w.dtype)
+        got = _bfx.int4_gemm_swiglu(x, blob, inter, k)
+        if got.shape != (m, inter) or not bool(torch.isfinite(got).all()):
+            return None
+        dg = F.linear(x, w_gate).float()
+        du = F.linear(x, w_up).float()
+        dense = F.silu(dg) * du
+        got_f = got.float()
+        cos = F.cosine_similarity(got_f.flatten(), dense.flatten(), dim=0).item()
+        snr = _snr_db(dense, got_f)
+        if not (cos >= 0.985 and snr >= 15.0):
+            logger.warning(
+                "muse_draft_int4_swiglu: quality check failed on (%d,%d) M=%d (SNR=%.2fdB cos=%.5f)",
+                n2, k, m, snr, cos,
+            )
+            return None
+        if m == 7 and metrics is not None:
+            metrics["cos"] = cos
+            metrics["snr_db"] = snr
+    torch.cuda.synchronize(w.device)
+    return blob
 
 
 # ---------------------------------------------------------------------------
@@ -774,8 +851,15 @@ def _verify_dflash_qkv_norm_rope(model: torch.nn.Module) -> None:
         return
     if not hasattr(_bfx, "dflash_qkv_norm_rope"):
         return
+    try:
+        from vllm import _custom_ops as ops
+    except Exception:
+        ops = None
+    allow_all5 = ops is not None and os.environ.get("MUSE_DFLASH_QKV_ALL5", "1") != "0"
+    cache_fuse = os.environ.get("MUSE_DFLASH_QKV_CACHE", "1") != "0"
 
     admitted = 0
+    cache_admitted = 0
     worst_diff = 0.0
     for idx, layer in enumerate(layers):
         attn = getattr(layer, "self_attn", None)
@@ -816,10 +900,18 @@ def _verify_dflash_qkv_norm_rope(model: torch.nn.Module) -> None:
             gen.manual_seed(7127 + idx)
             qkv = (torch.randn((16, (nq + 2 * nkv) * hd), generator=gen, device=dev) * 0.5).to(torch.bfloat16)
             pos = torch.tensor([0, 1, 7, 15, 16, 31, 63, 127, 255, 511, 512, 513, 520, 525, 600, 640], dtype=torch.int64, device=dev)
-            q_ref, k_ref, _ = qkv.split([nq * hd, nkv * hd, nkv * hd], dim=-1)
-            q_ref = attn.q_norm(q_ref.contiguous().view(16, nq, hd)).view(16, nq * hd).contiguous()
-            k_ref = attn.k_norm(k_ref.contiguous().view(16, nkv, hd)).view(16, nkv * hd).contiguous()
-            q_ref, k_ref = rope(pos, q_ref.clone(), k_ref.clone())
+            q_in, k_in, _ = qkv.split([nq * hd, nkv * hd, nkv * hd], dim=-1)
+            if allow_all5:
+                q_norm_bf16 = torch.empty((16, nq, hd), dtype=torch.bfloat16, device=dev)
+                k_norm_bf16 = torch.empty((16, nkv, hd), dtype=torch.bfloat16, device=dev)
+                ops.rms_norm(q_norm_bf16, q_in.contiguous().view(16, nq, hd), qw.contiguous(), eps)
+                ops.rms_norm(k_norm_bf16, k_in.contiguous().view(16, nkv, hd), kw.contiguous(), eps)
+                q_norm_f32 = q_norm_bf16.float()
+                k_norm_f32 = k_norm_bf16.float()
+            else:
+                q_ref = attn.q_norm(q_in.contiguous().view(16, nq, hd)).view(16, nq * hd).contiguous()
+                k_ref = attn.k_norm(k_in.contiguous().view(16, nkv, hd)).view(16, nkv * hd).contiguous()
+                q_ref, k_ref = rope(pos, q_ref.clone(), k_ref.clone())
 
             # Try both BF16 and native (FP32) cos_sin_cache and pick the closest match.
             base_cache = rope.cos_sin_cache.to(device=dev)
@@ -833,6 +925,22 @@ def _verify_dflash_qkv_norm_rope(model: torch.nn.Module) -> None:
             best_cache = None
             for cand in cands:
                 cand_c = cand.contiguous()
+                if allow_all5:
+                    half = hd // 2
+                    cs = cand_c.index_select(0, pos).float()
+                    c_half = cs[:, :half].unsqueeze(1)
+                    s_half = cs[:, half:].unsqueeze(1)
+                    if is_neox:
+                        q1, q2 = q_norm_f32[..., :half], q_norm_f32[..., half:]
+                        q_ref = torch.cat([q1 * c_half - q2 * s_half, q2 * c_half + q1 * s_half], dim=-1).to(torch.bfloat16).view(16, nq * hd)
+                        k1, k2 = k_norm_f32[..., :half], k_norm_f32[..., half:]
+                        k_ref = torch.cat([k1 * c_half - k2 * s_half, k2 * c_half + k1 * s_half], dim=-1).to(torch.bfloat16).view(16, nkv * hd)
+                    else:
+                        q1, q2 = q_norm_f32[..., 0::2], q_norm_f32[..., 1::2]
+                        q_ref = torch.stack([q1 * c_half - q2 * s_half, q2 * c_half + q1 * s_half], dim=-1).to(torch.bfloat16).view(16, nq * hd)
+                        k1, k2 = k_norm_f32[..., 0::2], k_norm_f32[..., 1::2]
+                        k_ref = torch.stack([k1 * c_half - k2 * s_half, k2 * c_half + k1 * s_half], dim=-1).to(torch.bfloat16).view(16, nkv * hd)
+
                 q_got, k_got = _bfx.dflash_qkv_norm_rope(
                     qkv, pos, qw.contiguous(), kw.contiguous(), cand_c, nq, nkv, eps, is_neox
                 )
@@ -840,9 +948,11 @@ def _verify_dflash_qkv_norm_rope(model: torch.nn.Module) -> None:
                     float((q_got.float() - q_ref.float()).abs().max().item()),
                     float((k_got.float() - k_ref.float()).abs().max().item()),
                 )
+                rtol_q = 2e-2 if allow_all5 else 1e-2
+                atol_q = 3e-2 if allow_all5 else 2e-2
                 ok = bool(
-                    torch.allclose(q_got.float(), q_ref.float(), rtol=1e-2, atol=2e-2)
-                    and torch.allclose(k_got.float(), k_ref.float(), rtol=1e-2, atol=2e-2)
+                    torch.allclose(q_got.float(), q_ref.float(), rtol=rtol_q, atol=atol_q)
+                    and torch.allclose(k_got.float(), k_ref.float(), rtol=rtol_q, atol=atol_q)
                     and d <= 0.0625
                 )
                 if d < best_diff:
@@ -856,6 +966,20 @@ def _verify_dflash_qkv_norm_rope(model: torch.nn.Module) -> None:
                 attn._dflash_fuse_qkv_ok = True
                 admitted += 1
                 worst_diff = max(worst_diff, best_diff)
+                attn._dflash_qkv_cache_ok = False
+                if cache_fuse:
+                    try:
+                        attn._dflash_qkv_cache_ok = _check_dflash_qkv_cache(
+                            _bfx, qkv, pos, qw.contiguous(), kw.contiguous(), best_cache,
+                            nq, nkv, hd, eps, is_neox, dev,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("dflash_fuse: layer %d qkv kv-scatter check failed (%s); unfused", idx, exc)
+                        attn._dflash_qkv_cache_ok = False
+                    if attn._dflash_qkv_cache_ok:
+                        cache_admitted += 1
+                    else:
+                        logger.warning("dflash_fuse: layer %d qkv kv-scatter rejected; unfused cache write", idx)
             else:
                 logger.warning(
                     "dflash_fuse: layer %d qkv_norm_rope rejected (best_diff=%.5f, use_flashinfer=%s)",
@@ -867,10 +991,130 @@ def _verify_dflash_qkv_norm_rope(model: torch.nn.Module) -> None:
             logger.warning("dflash_fuse: layer %d qkv_norm_rope check failed (%s); keeping stock path", idx, exc)
 
     logger.info(
-        "dflash_fuse: qkv_norm_rope=%d/%d layers admitted (max_diff=%.5f)",
+        "dflash_fuse: qkv_norm_rope=%d/%d layers admitted (max_diff=%.5f, all5=%d, kv_scatter=%d)",
         admitted,
         len(layers),
         worst_diff,
+        int(allow_all5),
+        cache_admitted,
+    )
+
+
+def _check_dflash_qkv_cache(_bfx, qkv, pos, qw, kw, cos_sin, nq, nkv, hd, eps, is_neox, dev) -> bool:
+    """Bitwise check: fused K/V paged scatter == qkv_norm_rope + reshape_and_cache_flash.
+
+    Covers both KV layouts the runtime path accepts ([2,B,N,H,D] and the
+    FlashAttention (B,H,N,2D) view), both block sizes (16 and 64), PAD slots (-1),
+    out-of-order slots, and the returned Q/K tensors.
+    """
+    m = int(qkv.shape[0])
+    q_ref, k_ref = _bfx.dflash_qkv_norm_rope(qkv, pos, qw, kw, cos_sin, nq, nkv, eps, is_neox)
+    v_src = qkv[:, (nq + nkv) * hd :].contiguous().view(m, nkv, hd)
+    scale_one = torch.ones((1,), dtype=torch.float32, device=dev)
+    for bs, nblk, slot_list in (
+        (16, 4, [5, 0, 17, 63, 16, 1, 40, 2, 33, 47, 9, 60, 31, 50, 22, -1]),
+        (64, 2, [5, 0, 65, 127, 64, 1, 100, 2, 73, 111, 9, 120, 63, 95, 22, -1]),
+    ):
+        slots = torch.tensor(slot_list, dtype=torch.int64, device=dev)[:m].contiguous()
+        layouts = []
+        kvc5_t = torch.full((2, nblk, bs, nkv, hd), -1.75, dtype=torch.bfloat16, device=dev)
+        kvc5_r = kvc5_t.clone()
+        layouts.append((kvc5_t, kvc5_r, kvc5_t[0], kvc5_t[1], kvc5_r[0], kvc5_r[1]))
+        kvc4_t = torch.full((nblk, nkv, bs, 2 * hd), 3.25, dtype=torch.bfloat16, device=dev)
+        kvc4_r = kvc4_t.clone()
+        kt, vt = kvc4_t.transpose(1, 2).split(hd, dim=-1)
+        kr, vr = kvc4_r.transpose(1, 2).split(hd, dim=-1)
+        layouts.append((kvc4_t, kvc4_r, kt, vt, kr, vr))
+        for full_t, full_r, kc_t, vc_t, kc_r, vc_r in layouts:
+            q_got, k_got = _bfx.dflash_qkv_norm_rope(
+                qkv, pos, qw, kw, cos_sin, nq, nkv, eps, is_neox, slots, kc_t, vc_t, bs
+            )
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
+                k_ref.view(m, nkv, hd), v_src, kc_r, vc_r, slots, "auto", scale_one, scale_one
+            )
+            torch.cuda.synchronize(dev)
+            if not torch.equal(full_t.view(torch.int16), full_r.view(torch.int16)):
+                return False
+            if not (
+                torch.equal(q_got.view(torch.int16), q_ref.view(torch.int16))
+                and torch.equal(k_got.view(torch.int16), k_ref.view(torch.int16))
+            ):
+                return False
+    return True
+
+
+def _verify_dflash_rms_norm(model: torch.nn.Module) -> None:
+    if os.environ.get("MUSE_DFLASH_FUSE_NORM", "1") == "0":
+        return
+    try:
+        import muse_bfx_ext as _bfx
+        from vllm import _custom_ops as ops
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("dflash_fuse: rms_norm skipped (%s)", exc)
+        return
+    if not hasattr(_bfx, "dflash_rms_norm") or not hasattr(_bfx, "dflash_fused_add_rms_norm"):
+        return
+    norm_mod = getattr(model, "norm", None)
+    w = getattr(norm_mod, "weight", None)
+    if w is None or not w.is_cuda or w.dtype != torch.bfloat16 or w.dim() != 1:
+        return
+    k = int(w.shape[0])
+    if k <= 0 or k > 8192 or (k % 8) != 0:
+        return
+    eps = float(getattr(norm_mod, "variance_epsilon", 1e-6))
+    dev = w.device
+    norm_ok = False
+    max_diff = -1.0
+    max_res_diff = -1.0
+    try:
+        gen = torch.Generator(device=dev)
+        gen.manual_seed(7331 + k)
+        w_c = w.contiguous()
+        worst_d = 0.0
+        worst_rd = 0.0
+        all_ok = True
+        for m in (6, 7, 16):
+            x = (torch.randn((m, k), generator=gen, device=dev) * 0.5).to(torch.bfloat16)
+            r = (torch.randn((m, k), generator=gen, device=dev) * 0.5).to(torch.bfloat16)
+            ref1 = torch.empty_like(x)
+            ops.rms_norm(ref1, x, w_c, eps)
+            got1 = _bfx.dflash_rms_norm(x, w_c, eps)
+            d1 = float((got1.float() - ref1.float()).abs().max().item())
+            worst_d = max(worst_d, d1)
+            if not (bool(torch.isfinite(got1).all()) and torch.allclose(got1.float(), ref1.float(), rtol=1e-2, atol=1e-2)):
+                all_ok = False
+                break
+            x_ref = x.clone()
+            r_ref = r.clone()
+            ops.fused_add_rms_norm(x_ref, r_ref, w_c, eps)
+            got2, got_r = _bfx.dflash_fused_add_rms_norm(x, r, w_c, eps)
+            d2 = float((got2.float() - x_ref.float()).abs().max().item())
+            dr = float((got_r.float() - r_ref.float()).abs().max().item())
+            worst_d = max(worst_d, d2)
+            worst_rd = max(worst_rd, dr)
+            if not (
+                bool(torch.isfinite(got2).all())
+                and bool(torch.isfinite(got_r).all())
+                and torch.allclose(got2.float(), x_ref.float(), rtol=1e-2, atol=1e-2)
+                and torch.allclose(got_r.float(), r_ref.float(), rtol=1e-2, atol=1e-2)
+            ):
+                all_ok = False
+                break
+        max_diff = worst_d
+        max_res_diff = worst_rd
+        if all_ok and worst_d <= 0.03125 and worst_rd <= 0.03125:
+            norm_ok = True
+            model._dflash_fuse_norm_ok = True
+            for layer in getattr(model, "layers", ()):
+                layer._dflash_fuse_norm_ok = True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("dflash_fuse: rms_norm self-check failed (%s); keeping stock path", exc)
+    torch.cuda.synchronize(dev)
+    logger.info(
+        "dflash_fuse: rms_norm=%s (max_diff=%.5f, res_diff=%.5f)",
+        "admitted" if norm_ok else "off",
+        max_diff,
+        max_res_diff,
     )
 
 
@@ -878,7 +1122,7 @@ def _verify_dflash_qkv_norm_rope(model: torch.nn.Module) -> None:
 # Attachment (modules + fused KV tensor) and custom ops
 # ---------------------------------------------------------------------------
 
-def attach_mlp_swiglu(mlp: torch.nn.Module, name: str = "") -> bool:
+def attach_mlp_swiglu(mlp: torch.nn.Module, name: str = "", mode: str = "int3") -> bool:
     gate_up = getattr(mlp, "gate_up_proj", None)
     if gate_up is None or getattr(mlp, "_mi3_swiglu", None) is not None:
         return False
@@ -898,24 +1142,30 @@ def attach_mlp_swiglu(mlp: torch.nn.Module, name: str = "") -> bool:
         return False
     inter = n2 // 2
     label = name or f"mlp_swiglu_{n2}x{k}"
+    use_i4 = (mode == "int4")
     try:
         m: dict[str, float] = {}
-        blob = _try_int3_swiglu_buffer(w.data, metrics=m)
+        blob = _try_int4_swiglu_buffer(w.data, metrics=m) if use_i4 else _try_int3_swiglu_buffer(w.data, metrics=m)
         if blob is None:
             return False
         mlp.register_buffer("_mi3_swiglu_blob", blob, persistent=False)
         mlp._mi3_swiglu = (inter, k)
+        if use_i4:
+            mlp._mi4_swiglu = (inter, k)
         gate_up._mfp8 = (n2, k)  # sentinel so attach_linear and muse_bfx skip gate_up_proj
         qbytes = blob.numel() * blob.element_size()
-        _stats["admitted_int3_swiglu"] += 1
+        if use_i4:
+            _stats["admitted_int4_swiglu"] += 1
+        else:
+            _stats["admitted_int3_swiglu"] += 1
         _stats["bytes_bf16"] += n2 * k * 2
         _stats["bytes_quant"] += qbytes
         if "snr_db" in m:
-            _layer_metrics.append((label, "i3swg", (n2, k), m["snr_db"], m["cos"], qbytes))
+            _layer_metrics.append((label, "i4swg" if use_i4 else "i3swg", (n2, k), m["snr_db"], m["cos"], qbytes))
         _free_query_only_bf16(gate_up, "gate_up_proj")
         return True
     except Exception as e:  # noqa: BLE001
-        logger.warning("muse_draft_int3_swiglu: attach failed for %s (%s); falling back", label, e)
+        logger.warning("muse_draft_%s_swiglu: attach failed for %s (%s); falling back", mode, label, e)
         return False
 
 
@@ -942,12 +1192,19 @@ def attach_linear(layer: torch.nn.Module, mode: str = "int3", name: str = "", le
     if mode == "int4":
         try:
             m: dict[str, float] = {}
-            res4 = _try_int4_buffer(w.data, metrics=m, check_aux5=(leaf == "fc"))
+            want_qsk = leaf in ("qkv_proj", "o_proj")
+            res4 = _try_int4_buffer(
+                w.data,
+                metrics=m,
+                check_aux5=(leaf == "fc"),
+                check_query_streamk=want_qsk,
+            )
             if res4 is not None:
-                blob, aux5_ok = res4
+                blob, aux5_ok, qsk_ok = res4
                 layer.register_buffer("_mi4_blob", blob, persistent=False)
                 layer._mi4 = (n, k)
                 layer._mi4_aux5_ok = aux5_ok
+                layer._mi4_query_streamk = qsk_ok
                 layer._mfp8 = (n, k)  # sentinel so muse_bfx skips this layer
                 qbytes = blob.numel() * blob.element_size()
                 _stats["admitted_int4"] += 1
@@ -1037,11 +1294,18 @@ def attach_tensor(mod: torch.nn.Module, prefix: str, w: torch.Tensor, mode: str 
     if mode == "int4":
         try:
             m: dict[str, float] = {}
-            res4 = _try_int4_buffer(w.data, metrics=m, check_aux5=False)
+            want_qsk = (prefix == "fkv")
+            res4 = _try_int4_buffer(
+                w.data,
+                metrics=m,
+                check_aux5=False,
+                check_query_streamk=want_qsk,
+            )
             if res4 is not None:
-                blob, _ = res4
+                blob, _, qsk_ok = res4
                 mod.register_buffer(f"_{prefix}_mi4_blob", blob, persistent=False)
                 setattr(mod, f"_{prefix}_mi4", (n, k))
+                setattr(mod, f"_{prefix}_mi4_query_streamk", qsk_ok)
                 qbytes = blob.numel() * blob.element_size()
                 _stats["admitted_int4"] += 1
                 _stats["bytes_bf16"] += n * k * 2
@@ -1116,21 +1380,57 @@ def attach_tensor(mod: torch.nn.Module, prefix: str, w: torch.Tensor, mode: str 
 
 
 @torch.library.custom_op("muse::draft_int4_linear", mutates_args=())
-def draft_int4_linear(x: torch.Tensor, w: torch.Tensor, blob: torch.Tensor, n: int, k: int) -> torch.Tensor:
+def draft_int4_linear(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    blob: torch.Tensor,
+    n: int,
+    k: int,
+    query_streamk: bool = False,
+) -> torch.Tensor:
     shape = x.shape
     x2 = x.reshape(-1, shape[-1])
     if x2.dtype == torch.bfloat16 and (1 <= x2.size(0) <= MAX_M_INT4 or w.numel() == 0):
         import muse_bfx_ext as _bfx
 
-        out = _run_chunked(x2, MAX_M_INT4, lambda xc: _bfx.int4_gemm(xc, blob, n, k))
+        out = _run_chunked(x2, MAX_M_INT4, lambda xc: _bfx.int4_gemm(xc, blob, n, k, query_streamk))
     else:
         out = F.linear(x2, w)
     return out.reshape(*shape[:-1], n)
 
 
 @draft_int4_linear.register_fake
-def _(x, w, blob, n, k):
+def _(x, w, blob, n, k, query_streamk=False):
     return x.new_empty((*x.shape[:-1], n))
+
+
+@torch.library.custom_op("muse::dflash_rms_norm", mutates_args=())
+def dflash_rms_norm_op(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    import muse_bfx_ext as _bfx
+
+    xc = x if x.is_contiguous() else x.contiguous()
+    return _bfx.dflash_rms_norm(xc, weight, eps)
+
+
+@dflash_rms_norm_op.register_fake
+def _(x, weight, eps):
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("muse::dflash_fused_add_rms_norm", mutates_args=())
+def dflash_fused_add_rms_norm_op(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import muse_bfx_ext as _bfx
+
+    xc = x if x.is_contiguous() else x.contiguous()
+    rc = residual if residual.is_contiguous() else residual.contiguous()
+    return _bfx.dflash_fused_add_rms_norm(xc, rc, weight, eps)
+
+
+@dflash_fused_add_rms_norm_op.register_fake
+def _(x, residual, weight, eps):
+    return torch.empty_like(x), torch.empty_like(residual)
 
 
 @torch.library.custom_op("muse::draft_int4_aux5_linear", mutates_args=())
@@ -1160,7 +1460,11 @@ def draft_int3_swiglu_linear(x: torch.Tensor, blob: torch.Tensor, inter: int, k:
     x2 = x.reshape(-1, shape[-1])
     import muse_bfx_ext as _bfx
 
-    out = _run_chunked(x2, MAX_M_INT3, lambda xc: _bfx.int3_gemm_swiglu(xc, blob, inter, k))
+    i4_bytes = (inter // 4) * (k // 64) * 288
+    if blob.numel() == i4_bytes:
+        out = _run_chunked(x2, MAX_M_INT4, lambda xc: _bfx.int4_gemm_swiglu(xc, blob, inter, k))
+    else:
+        out = _run_chunked(x2, MAX_M_INT3, lambda xc: _bfx.int3_gemm_swiglu(xc, blob, inter, k))
     return out.reshape(*shape[:-1], inter)
 
 
@@ -1180,18 +1484,89 @@ def dflash_qkv_norm_rope_op(
     nkv: int,
     eps: float,
     is_neox: bool,
+    layer_name: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     import muse_bfx_ext as _bfx
 
     qkv_c = qkv if qkv.is_contiguous() else qkv.contiguous()
     pos_c = positions if positions.is_contiguous() else positions.contiguous()
+    if layer_name:
+        res = _dflash_qkv_norm_rope_kv_scatter(
+            _bfx, qkv_c, pos_c, q_norm_w, k_norm_w, cos_sin_cache, nq, nkv, eps, is_neox, layer_name
+        )
+        if res is not None:
+            return res
     return _bfx.dflash_qkv_norm_rope(
         qkv_c, pos_c, q_norm_w, k_norm_w, cos_sin_cache, nq, nkv, eps, is_neox
     )
 
 
+def _dflash_qkv_norm_rope_kv_scatter(
+    _bfx, qkv_c, pos_c, q_norm_w, k_norm_w, cos_sin_cache, nq, nkv, eps, is_neox, layer_name
+):
+    """Fused qkv_norm_rope + paged K/V scatter; returns None to use the unfused path.
+
+    On success marks the attention layer so unified_kv_cache_update skips the
+    (bit-identical) reshape_and_cache_flash for exactly these rows.
+    """
+    m = int(qkv_c.size(0))
+    if m <= 0 or os.environ.get("MUSE_DFLASH_QKV_CACHE", "1") == "0":
+        return None
+    try:
+        from vllm.config.compilation import CUDAGraphMode
+        from vllm.forward_context import get_forward_context, is_forward_context_available
+
+        if not is_forward_context_available():
+            return None
+        fwd_ctx = get_forward_context()
+        attn_layer = fwd_ctx.no_compile_layers.get(layer_name)
+        if attn_layer is None:
+            return None
+        attn_layer._qk_kv_cache_written = False
+        attn_layer._qk_kv_cache_written_rows = 0
+        if (
+            fwd_ctx.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+            or attn_layer.calculate_kv_scales
+            or attn_layer.kv_sharing_target_layer_name is not None
+            or attn_layer.attn_backend.forward_includes_kv_cache_update
+            or attn_layer.kv_cache_dtype not in ("auto", "bfloat16")
+            or getattr(attn_layer.impl, "dcp_world_size", 1) != 1
+            or not isinstance(fwd_ctx.slot_mapping, dict)
+        ):
+            return None
+        cand_slot = fwd_ctx.slot_mapping.get(layer_name)
+        kvc = attn_layer.kv_cache
+        if not (
+            cand_slot is not None
+            and cand_slot.is_cuda
+            and cand_slot.dtype == torch.int64
+            and cand_slot.is_contiguous()
+            and cand_slot.numel() >= m
+            and isinstance(kvc, torch.Tensor)
+            and kvc.is_cuda
+            and kvc.numel() > 0
+            and kvc.dtype == torch.bfloat16
+        ):
+            return None
+        kc = vc = None
+        if kvc.dim() == 4 and kvc.shape[1] == nkv and kvc.shape[3] == 256 and kvc.stride(3) == 1:
+            kc, vc = kvc.transpose(1, 2).split(128, dim=-1)
+        elif kvc.dim() == 5 and kvc.shape[0] == 2 and kvc.shape[3] == nkv and kvc.shape[4] == 128 and kvc.stride(4) == 1:
+            kc, vc = kvc[0], kvc[1]
+        if kc is None or vc is None or kc.stride(3) != 1 or vc.stride(3) != 1:
+            return None
+        res = _bfx.dflash_qkv_norm_rope(
+            qkv_c, pos_c, q_norm_w, k_norm_w, cos_sin_cache,
+            nq, nkv, eps, is_neox, cand_slot, kc, vc, int(kc.shape[1]),
+        )
+        attn_layer._qk_kv_cache_written_rows = m
+        return res
+    except Exception:
+        return None
+
+
 @dflash_qkv_norm_rope_op.register_fake
-def _(qkv, positions, q_norm_w, k_norm_w, cos_sin_cache, nq, nkv, eps, is_neox):
+def _(qkv, positions, q_norm_w, k_norm_w, cos_sin_cache, nq, nkv, eps, is_neox, layer_name=""):
     m = qkv.shape[0]
     return qkv.new_empty((m, nq * 128)), qkv.new_empty((m, nkv * 128))
 
@@ -1266,7 +1641,14 @@ def _(x, w, w_ilv, coded, pal, mgs, ws, n, k):
 def layer_apply(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
     if getattr(layer, "_mi4", None) is not None:
         n, k = layer._mi4
-        return torch.ops.muse.draft_int4_linear(x, layer.weight, layer._mi4_blob, n, k)
+        return torch.ops.muse.draft_int4_linear(
+            x,
+            layer.weight,
+            layer._mi4_blob,
+            n,
+            k,
+            bool(getattr(layer, "_mi4_query_streamk", False)),
+        )
     if getattr(layer, "_mi3", None) is not None:
         n, k = layer._mi3
         return torch.ops.muse.draft_int3_linear(x, layer.weight, layer._mi3_blob, n, k)
@@ -1292,7 +1674,14 @@ def layer_apply(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
 def tensor_apply(mod: torch.nn.Module, prefix: str, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor | None:
     if getattr(mod, f"_{prefix}_mi4", None) is not None:
         n, k = getattr(mod, f"_{prefix}_mi4")
-        return torch.ops.muse.draft_int4_linear(x, w, getattr(mod, f"_{prefix}_mi4_blob"), n, k)
+        return torch.ops.muse.draft_int4_linear(
+            x,
+            w,
+            getattr(mod, f"_{prefix}_mi4_blob"),
+            n,
+            k,
+            bool(getattr(mod, f"_{prefix}_mi4_query_streamk", False)),
+        )
     if getattr(mod, f"_{prefix}_mi3", None) is not None:
         n, k = getattr(mod, f"_{prefix}_mi3")
         return torch.ops.muse.draft_int3_linear(x, w, getattr(mod, f"_{prefix}_mi3_blob"), n, k)
@@ -1353,12 +1742,17 @@ def place_drafter_quant(model: torch.nn.Module) -> int:
         return 0
     groups: dict[tuple[str, int, int], list[tuple[torch.nn.Module, str, tuple]]] = {}
     for _, mod in model.named_modules():
-        if getattr(mod, "_mi3_swiglu", None) is not None:
+        if getattr(mod, "_mi4_swiglu", None) is not None:
+            inter, k = mod._mi4_swiglu
+            groups.setdefault(("int4_swiglu", inter, k), []).append((mod, "_mi3_swiglu_blob", ()))
+        elif getattr(mod, "_mi3_swiglu", None) is not None:
             inter, k = mod._mi3_swiglu
             groups.setdefault(("int3_swiglu", inter, k), []).append((mod, "_mi3_swiglu_blob", ()))
         if getattr(mod, "_mi4", None) is not None:
             n, k = mod._mi4
-            groups.setdefault(("int4", n, k), []).append((mod, "_mi4_blob", ()))
+            groups.setdefault(("int4", n, k), []).append(
+                (mod, "_mi4_blob", (bool(getattr(mod, "_mi4_query_streamk", False)),))
+            )
         elif getattr(mod, "_mi3", None) is not None:
             n, k = mod._mi3
             groups.setdefault(("int3", n, k), []).append((mod, "_mi3_blob", ()))
@@ -1374,7 +1768,9 @@ def place_drafter_quant(model: torch.nn.Module) -> int:
             )
     if getattr(model, "_fkv_mi4", None) is not None:
         n, k = model._fkv_mi4
-        groups.setdefault(("int4", n, k), []).append((model, "_fkv_mi4_blob", ()))
+        groups.setdefault(("int4", n, k), []).append(
+            (model, "_fkv_mi4_blob", (bool(getattr(model, "_fkv_mi4_query_streamk", False)),))
+        )
     elif getattr(model, "_fkv_mi3", None) is not None:
         n, k = model._fkv_mi3
         groups.setdefault(("int3", n, k), []).append((model, "_fkv_mi3_blob", ()))
@@ -1423,10 +1819,15 @@ def place_drafter_quant(model: torch.nn.Module) -> int:
         if not spares:
             continue
 
-        x = ((torch.arange(7 * k, device=dev) % 7).float() - 3.0).to(torch.bfloat16).reshape(7, k)
+        m_place = 7 if (kind in ("nvfp4", "fp8") or k >= 20000 or n == 10240) else 16
+        x = ((torch.arange(m_place * k, device=dev) % 7).float() - 3.0).to(torch.bfloat16).reshape(m_place, k)
         meta0 = items[0][2]
 
         def _make_runner(meta: tuple):
+            if kind == "int4_swiglu":
+                import muse_bfx_ext as _bfx
+
+                return lambda buf: _bfx.int4_gemm_swiglu(x, buf, n, k)
             if kind == "int3_swiglu":
                 import muse_bfx_ext as _bfx
 
@@ -1434,7 +1835,8 @@ def place_drafter_quant(model: torch.nn.Module) -> int:
             if kind == "int4":
                 import muse_bfx_ext as _bfx
 
-                return lambda buf: _bfx.int4_gemm(x, buf, n, k)
+                qsk = bool(meta[0]) if meta else False
+                return lambda buf: _bfx.int4_gemm(x, buf, n, k, qsk)
             if kind == "int3":
                 import muse_bfx_ext as _bfx
 
@@ -1521,8 +1923,9 @@ def attach_drafter(model: torch.nn.Module) -> int:
             if mlp is None:
                 continue
             gu_name = f"layers.{i}.mlp.gate_up_proj"
-            if _resolve_layer_mode(gu_name, "gate_up_proj", mode, sens_fp8, sens_nvfp4, sens_int4) == "int3":
-                n += attach_mlp_swiglu(mlp, name=gu_name)
+            gu_mode = _resolve_layer_mode(gu_name, "gate_up_proj", mode, sens_fp8, sens_nvfp4, sens_int4)
+            if gu_mode in ("int3", "int4"):
+                n += attach_mlp_swiglu(mlp, name=gu_name, mode=gu_mode)
     for name, mod in model.named_modules():
         leaf = name.split(".")[-1]
         if leaf in _NAMES:
@@ -1537,7 +1940,11 @@ def attach_drafter(model: torch.nn.Module) -> int:
     place_drafter_quant(model)
     _verify_dflash_kv_post(model)
     _verify_dflash_qkv_norm_rope(model)
+    _verify_dflash_rms_norm(model)
     aux5_admitted = bool(getattr(getattr(model, "fc", None), "_mi4_aux5_ok", False))
+    qsk_admitted = sum(
+        1 for _, mod in model.named_modules() if getattr(mod, "_mi4_query_streamk", False)
+    ) + int(bool(getattr(model, "_fkv_mi4_query_streamk", False)))
     snr_summary = ""
     if _layer_metrics:
         ranked = sorted(_layer_metrics, key=lambda x: x[3])
@@ -1558,13 +1965,17 @@ def attach_drafter(model: torch.nn.Module) -> int:
                     lcos,
                 )
     logger.info(
-        "muse_draft_quant (%s, i3_mse=%d, i4_mse=%d, aux5=%d, pack=%.2fs): %d INT4-g64 + %d INT3-SwiGLU + %d INT3-g64 + %d NVFP4-TMA4 + %d FP8-Marlin drafter linears (%d rejected), %.2f GB -> %.2f GB per step (freed %.2f GB dead BF16)%s",
+        "muse_draft_quant (%s, nf4=%s, nf3=%d, i3_mse=%d, i4_mse=%d, aux5=%d, qsk=%d, pack=%.2fs): %d INT4-g64 + %d INT4-SwiGLU + %d INT3-SwiGLU + %d INT3-g64 + %d NVFP4-TMA4 + %d FP8-Marlin drafter linears (%d rejected), %.2f GB -> %.2f GB per step (freed %.2f GB dead BF16)%s",
         mode,
+        os.environ.get("MUSE_INT4_NF4", "0"),
+        int(os.environ.get("MUSE_INT3_NF3", "1") != "0"),
         int(_int3_mse_enabled()),
         int(_int4_mse_enabled()),
         int(aux5_admitted),
+        qsk_admitted,
         pack_s,
         _stats["admitted_int4"],
+        _stats["admitted_int4_swiglu"],
         _stats["admitted_int3_swiglu"],
         _stats["admitted_int3"],
         _stats["admitted_nvfp4"],

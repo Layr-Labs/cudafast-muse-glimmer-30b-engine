@@ -336,6 +336,9 @@ def _combine_sampled_and_draft_tokens_kernel(
     logits_indices_ptr,
     BLOCK_SIZE: tl.constexpr,
     NUM_NEW_SAMPLED_TOKENS: tl.constexpr = 1,
+    positions_ptr=None,
+    computed_ptr=None,
+    SINGLE_VERIFY: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
@@ -348,7 +351,17 @@ def _combine_sampled_and_draft_tokens_kernel(
 
     # Compute the logits indices.
     block = tl.arange(0, BLOCK_SIZE)
-    query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
+    if SINGLE_VERIFY:
+        query_end = 7
+        computed = tl.load(computed_ptr + req_state_idx)
+        seq_len = computed + query_end
+        tl.store(query_start_loc_ptr, 0)
+        tl.store(query_start_loc_ptr + 1, query_end)
+        tl.store(seq_lens_ptr, seq_len)
+        tl.store(positions_ptr + block, computed + block, mask=block < query_end)
+    else:
+        query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
+        seq_len = tl.load(seq_lens_ptr + batch_idx)
     logits_start = query_end - num_logits
     tl.store(
         logits_indices_ptr + cu_num_logits_start + block,
@@ -356,7 +369,6 @@ def _combine_sampled_and_draft_tokens_kernel(
         mask=block < num_logits,
     )
 
-    seq_len = tl.load(seq_lens_ptr + batch_idx)
     prefill_len = tl.load(prefill_len_ptr + req_state_idx)
     if seq_len <= prefill_len:
         # Handling prefill tokens. No sampled or draft tokens.
@@ -394,6 +406,9 @@ def combine_sampled_and_draft_tokens(
     cu_num_logits: torch.Tensor,
     num_logits: int,
     num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
+    *,
+    verify_positions: torch.Tensor | None = None,
+    verify_computed: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert num_new_sampled_tokens in (0, 1), (
         f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
@@ -419,6 +434,9 @@ def combine_sampled_and_draft_tokens(
         cu_num_logits,
         logits_indices,
         NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
+        positions_ptr=verify_positions,
+        computed_ptr=verify_computed,
+        SINGLE_VERIFY=verify_positions is not None,
         # NOTE(woosuk): Add num_new_sampled_tokens to ensure the block covers the
         # last sampled token in addition to all draft tokens.
         BLOCK_SIZE=triton.next_power_of_2(
@@ -426,6 +444,35 @@ def combine_sampled_and_draft_tokens(
         ),
     )
     return logits_indices
+
+
+def check_tree_chain_prep(device: torch.device) -> bool:
+    """Check each produced tensor against the original preparation sequence."""
+    idx = torch.tensor([1], device=device, dtype=torch.int32)
+    prefill = torch.tensor([0, 17], device=device, dtype=torch.int32)
+    sampled = torch.tensor([[12], [83]], device=device, dtype=torch.int64)
+    drafts = torch.arange(12, device=device, dtype=torch.int64).reshape(2, 6)
+    cu_logits = torch.tensor([0, 7], device=device, dtype=torch.int32)
+    for count in (10, 14, 17, 63):
+        computed = torch.tensor([0, count], dtype=torch.int32, device=device)
+        outputs = []
+        for fused in (False, True):
+            ids = torch.full((16,), -19, dtype=torch.int32, device=device)
+            pos = torch.full((16,), -23, dtype=torch.int64, device=device)
+            seq = torch.full((1,), -31, dtype=torch.int32, device=device)
+            qsl = torch.full_like(cu_logits, -37)
+            if not fused:
+                qsl.copy_(cu_logits)
+                prepare_pos_seq_lens(idx, qsl, computed, pos, seq)
+            indices = combine_sampled_and_draft_tokens(
+                ids, idx, sampled, qsl, seq, prefill, drafts, cu_logits, 7,
+                verify_positions=pos if fused else None,
+                verify_computed=computed if fused else None,
+            )
+            outputs.append((ids, pos, seq, qsl, indices))
+        if not all(torch.equal(a, b) for a, b in zip(*outputs)):
+            return False
+    return True
 
 
 @triton.jit

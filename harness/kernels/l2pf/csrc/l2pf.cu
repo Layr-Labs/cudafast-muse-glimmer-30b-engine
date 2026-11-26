@@ -78,6 +78,15 @@ __global__ void prefetch_desc_spread_kernel(const unsigned long long* __restrict
   }
 }
 
+__global__ void prime_persisting_kernel(const uint8_t* __restrict__ p, size_t bytes) {
+  const size_t stride = (size_t)gridDim.x * blockDim.x * 128;
+  for (size_t off = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 128;
+       off + 4 <= bytes; off += stride) {
+    uint32_t v;
+    asm volatile("ld.global.cg.u32 %0, [%1];\n" : "=r"(v) : "l"(p + off));
+  }
+}
+
 }  // namespace l2pf
 
 extern "C" {
@@ -113,23 +122,90 @@ int l2pf_prefetch_desc(const void* desc, int ndesc, int blocks, int threads, voi
   return (int)cudaGetLastError();
 }
 
-int l2pf_set_persisting_window(const void* base_ptr, size_t num_bytes, size_t limit_bytes, void* stream) {
+int l2pf_set_persisting_limit(size_t limit_bytes) {
+  int dev = 0;
+  (void)cudaGetDevice(&dev);
   if (limit_bytes > 0) {
-    cudaError_t e = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, limit_bytes);
-    if (e != cudaSuccess) return (int)e;
+    int max_p = 0;
+    if (cudaDeviceGetAttribute(&max_p, cudaDevAttrMaxPersistingL2CacheSize, dev) == cudaSuccess &&
+        max_p > 0 && limit_bytes > (size_t)max_p) {
+      limit_bytes = (size_t)max_p;
+    }
+  }
+  cudaError_t e = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, limit_bytes);
+  if (limit_bytes == 0) {
+    (void)cudaCtxResetPersistingL2Cache();
+  }
+  return (int)e;
+}
+
+int l2pf_get_persisting_info(size_t* cur_limit, int* max_persist, int* max_window, int* l2_size) {
+  int dev = 0;
+  (void)cudaGetDevice(&dev);
+  size_t lim = 0;
+  cudaError_t e = cudaDeviceGetLimit(&lim, cudaLimitPersistingL2CacheSize);
+  if (cur_limit) *cur_limit = lim;
+  if (max_persist) {
+    *max_persist = 0;
+    (void)cudaDeviceGetAttribute(max_persist, cudaDevAttrMaxPersistingL2CacheSize, dev);
+  }
+  if (max_window) {
+    *max_window = 0;
+    (void)cudaDeviceGetAttribute(max_window, cudaDevAttrMaxAccessPolicyWindowSize, dev);
+  }
+  if (l2_size) {
+    *l2_size = 0;
+    (void)cudaDeviceGetAttribute(l2_size, cudaDevAttrL2CacheSize, dev);
+  }
+  return (int)e;
+}
+
+int l2pf_set_stream_window(const void* base_ptr, size_t num_bytes, float hit_ratio,
+                           int miss_streaming, void* stream) {
+  if (num_bytes > 0 && base_ptr != nullptr) {
+    int dev = 0, max_w = 0;
+    (void)cudaGetDevice(&dev);
+    if (cudaDeviceGetAttribute(&max_w, cudaDevAttrMaxAccessPolicyWindowSize, dev) == cudaSuccess &&
+        max_w > 0 && num_bytes > (size_t)max_w) {
+      num_bytes = (size_t)max_w;
+    }
   }
   cudaStreamAttrValue attr{};
-  attr.accessPolicyWindow.base_ptr = const_cast<void*>(base_ptr);
-  attr.accessPolicyWindow.num_bytes = num_bytes;
-  attr.accessPolicyWindow.hitRatio = (num_bytes > 0) ? 1.0f : 0.0f;
-  attr.accessPolicyWindow.hitProp = (num_bytes > 0) ? cudaAccessPropertyPersisting : cudaAccessPropertyNormal;
-  attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-  cudaError_t se = cudaStreamSetAttribute(reinterpret_cast<cudaStream_t>(stream),
-                                          cudaStreamAttributeAccessPolicyWindow, &attr);
-  if (limit_bytes == 0) {
-    (void)cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0);
+  if (num_bytes > 0 && base_ptr != nullptr) {
+    attr.accessPolicyWindow.base_ptr = const_cast<void*>(base_ptr);
+    attr.accessPolicyWindow.num_bytes = num_bytes;
+    attr.accessPolicyWindow.hitRatio = (hit_ratio > 0.0f && hit_ratio <= 1.0f) ? hit_ratio : 1.0f;
+    attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp =
+        miss_streaming ? cudaAccessPropertyStreaming : cudaAccessPropertyNormal;
+  } else {
+    attr.accessPolicyWindow.base_ptr = nullptr;
+    attr.accessPolicyWindow.num_bytes = 0;
+    attr.accessPolicyWindow.hitRatio = 0.0f;
+    attr.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+    attr.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
   }
-  return (int)se;
+  return (int)cudaStreamSetAttribute(reinterpret_cast<cudaStream_t>(stream),
+                                     cudaStreamAttributeAccessPolicyWindow, &attr);
+}
+
+int l2pf_prime_persisting(const void* base_ptr, size_t num_bytes, void* stream) {
+  if (!base_ptr || num_bytes < 4 || reinterpret_cast<uintptr_t>(base_ptr) % 4 != 0) return -1;
+  int rc = l2pf_set_stream_window(base_ptr, num_bytes, 1.0f, 0, stream);
+  if (rc != 0) return rc;
+  l2pf::prime_persisting_kernel<<<8, 128, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(base_ptr), num_bytes);
+  cudaError_t ke = cudaGetLastError();
+  (void)l2pf_set_stream_window(nullptr, 0, 0.0f, 0, stream);
+  return (int)ke;
+}
+
+int l2pf_set_persisting_window(const void* base_ptr, size_t num_bytes, size_t limit_bytes, void* stream) {
+  if (limit_bytes > 0) {
+    int le = l2pf_set_persisting_limit(limit_bytes);
+    if (le != 0) return le;
+  }
+  return l2pf_set_stream_window(base_ptr, num_bytes, 1.0f, 0, stream);
 }
 
 #ifdef __linux__
