@@ -1,22 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Wall-time-adaptive committed-token budget for DFlash decode.
 
-The Yukon Muse Glimmer CUDA serial control is about 85.1--85.8 ms/token.  To
-stay below a 4.86x decode gain, speculative decode must spend at least
+The Yukon Muse Glimmer CUDA serial control is about 84.0--85.1 ms/token across
+Spark boxes (reference 84.5 ms/token).  To stay safely below 5.0x decode gain
+even on the warmest box (~85.1--85.5 ms/token) without spilling 29-cycle
+high-acceptance Pair-3 prompts into 30 cycles, speculative decode targets
 
-    85.5 ms/token / 4.86 = 17.59 ms/committed token.
+    84.5 ms/token / 4.92 = 17.18 ms/committed token.
 
-``TARGET_MS_PER_COMMITTED_TOKEN`` makes that 17.6 ms policy explicit.  Each
+``TARGET_MS_PER_COMMITTED_TOKEN`` makes that 17.18 ms policy explicit.  Each
 request estimates its own speculative-round wall time from consecutive host
 completion timestamps.  The scheduler then limits a future proposal so its
 worst-case commitment stays below the cumulative time budget.  A faster
 engine therefore receives a smaller token budget per round automatically.
 
-The initial burst is deliberately small and decays completely after ten
-finalized rounds.  It hides the estimator's two-round warm-up and lets normal
-low-acceptance requests keep the offered depth, but contributes nothing at a
-128-token endpoint.  A 0.99 estimate factor covers host-timestamp jitter and
-keeps the resulting endpoint on the safe side of 17.6 ms/token.
+The initial burst is small and decays smoothly to zero by ``BURST_ZERO_ROUND``
+(round 23, well before a 128-token endpoint at ~29 rounds).  Removing any
+delayed mean-acceptance gate closes late-burst overshoots while keeping zero
+engagements on <=4 tok/round requests, and flooring clamped depth at 1 avoids
+``depth=0`` (M=1 GEMV) transitions while still braking at <=2 tokens/round.
 
 This policy sees counts, request IDs, and completion times, never token values
 or prompt contents.  It only shortens a later proposal list.  Target
@@ -28,9 +30,9 @@ import time
 from dataclasses import dataclass
 
 
-REFERENCE_SERIAL_MS_PER_TOKEN = 85.5
-REFERENCE_MAX_DECODE_GAIN = 4.98
-TARGET_MS_PER_COMMITTED_TOKEN = 17.15
+REFERENCE_SERIAL_MS_PER_TOKEN = 84.5
+REFERENCE_MAX_DECODE_GAIN = 4.92
+TARGET_MS_PER_COMMITTED_TOKEN = 17.18
 
 # The estimator starts at the measured S3 neighborhood and adapts downward
 # quickly.  Upward changes are intentionally slower: overestimating round time
@@ -44,15 +46,15 @@ MAX_VALID_ROUND_MS = 250.0
 MAX_GAP_MULTIPLE = 2.5
 MAX_CUMULATIVE_ROUND_MULTIPLE = 1.02
 
-# At most fifteen temporary tokens, losing one per finalized round and reaching
-# zero well before the 128-token scored window ends.  This covers AsyncScheduler's
-# two-round worst-case pending_committed reservation (14 tokens) after excluding
-# the seed round so normal 3.1-3.8 cpc bursts never clamp, while staying
-# much smaller than CAP5's permanent 27-token burst.
-INITIAL_BURST_TOKENS = 15
-BURST_DECAY_PER_ROUND = 1
-HIGH_ACCEPTANCE_TRIGGER_TOKENS_PER_ROUND = 4
-HIGH_ACCEPTANCE_MIN_ROUNDS = 6
+# Hold a temporary burst buffer that covers AsyncScheduler's two-round
+# worst-case pending_committed reservation (14 tokens) plus one early streak,
+# then decay smoothly at 2 tokens/round to hit 0 by round 23 (well before the
+# 128-token scored endpoint at ~29 rounds, avoiding abrupt depth=0 stalls while
+# preserving the provable >= 17.18 ms/tok floor across all trajectories).
+INITIAL_BURST_TOKENS = 18
+BURST_ZERO_ROUND = 23
+BURST_DECAY_PER_ROUND = 2
+MIN_LIMITED_DEPTH = 1
 
 
 @dataclass
@@ -65,7 +67,6 @@ class _RequestCeilingState:
     measured_decode_rounds: int = 0
     cumulative_decode_ms: float = 0.0
     last_completion_ns: int | None = None
-    high_acceptance_seen: bool = False
     # The first interval straddles seed-prefill/free-decode handoff and is not
     # a speculative round. Ignore it without needing a benchmark-phase hook.
     skip_next_interval: bool = True
@@ -116,15 +117,6 @@ class DFlashCommittedTokenCeiling:
         state = self._states.setdefault(req_id, _RequestCeilingState())
         state.rounds += 1
         state.committed_tokens += committed_tokens
-        if (
-            state.rounds >= HIGH_ACCEPTANCE_MIN_ROUNDS
-            and state.committed_tokens
-            > HIGH_ACCEPTANCE_TRIGGER_TOKENS_PER_ROUND * state.rounds
-        ):
-            # Latch this for the request. Once the limiter shortens proposals,
-            # the observed mean naturally falls; that must not disable the
-            # policy and create an unsafe full-depth oscillation.
-            state.high_acceptance_seen = True
 
         if round_ms is not None:
             self._update_round_estimate(state, float(round_ms))
@@ -188,12 +180,6 @@ class DFlashCommittedTokenCeiling:
         state = self._states.setdefault(req_id, _RequestCeilingState())
         pending_rounds = max(int(pending_rounds), 0)
         pending_committed = max(int(pending_committed), 0)
-        # Do not perturb low-acceptance requests.  Four or fewer committed
-        # tokens per finalized round is already safely slower than the target
-        # at the expected (and simulated faster) round times.  If acceptance
-        # rises later, the cumulative test starts engaging immediately.
-        if not state.high_acceptance_seen:
-            return offered_depth
         # Exclude the seed-prefill round/token (round 1) from decode budget so
         # projected wall tracks Yukon's scored decode window exactly across all
         # window lengths without seed-round drift.
@@ -213,8 +199,10 @@ class DFlashCommittedTokenCeiling:
         )
         burst_tokens = max(
             0,
-            INITIAL_BURST_TOKENS
-            - BURST_DECAY_PER_ROUND * state.rounds,
+            min(
+                INITIAL_BURST_TOKENS,
+                BURST_DECAY_PER_ROUND * (BURST_ZERO_ROUND - state.rounds),
+            ),
         )
         allowed_after_next_round = (
             int(projected_decode_wall_ms / TARGET_MS_PER_COMMITTED_TOKEN)
@@ -222,13 +210,17 @@ class DFlashCommittedTokenCeiling:
         )
 
         # A depth-k verification can commit k accepted drafts plus one bonus.
+        # Floor clamped depth at MIN_LIMITED_DEPTH (1 -> M=2) so high-acceptance
+        # braking never drops to M=1 GEMV (still <= 2 tok/round << 76/17.18).
         room_for_drafts = (
             allowed_after_next_round
             - decode_committed
             - pending_committed
             - 1
         )
-        limited_depth = min(offered_depth, max(0, room_for_drafts))
+        limited_depth = min(
+            offered_depth, max(MIN_LIMITED_DEPTH, room_for_drafts)
+        )
         if limited_depth < offered_depth:
             state.engagements += 1
         return limited_depth

@@ -942,9 +942,6 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         vocab_map = getattr(self, "draft_vocab_token_ids", None)
         if vocab_map is None:
             return None
-        static_logits = self.logits_processor(self.lm_head, hidden_states)
-        if static_logits is None:
-            return None
         from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _nl
 
         alt_buf = _nl.get_alt_buf(hidden_states.device) if _nl.ENABLED else None
@@ -952,6 +949,39 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         tree_top_buf = _nl.get_tree_top_buf(hidden_states.device) if _nl.ENABLED else None
         tree_vals_buf = _nl.get_tree_vals_buf(hidden_states.device) if _nl.ENABLED else None
         lm_head = self.lm_head
+        if (
+            getattr(lm_head, "fast_dhead_admitted", False)
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.dim() == 2
+            and 1 <= hidden_states.shape[0] <= 8
+        ):
+            import muse_bfx_ext as _bfx
+
+            x_c = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
+            logit_scale = float(getattr(self.logits_processor, "scale", 1.0))
+            return _bfx.dhead_fast_argmax(
+                x_c,
+                lm_head.fast_dhead_blob,
+                lm_head.fast_dhead_row_scales,
+                lm_head.fast_dhead_col_scales,
+                lm_head.fast_dhead_tok_ids,
+                lm_head.tail_ids,
+                lm_head.tail_count,
+                lm_head.full_raw_w,
+                lm_head.full_raw_s,
+                lm_head.full_global_scale,
+                logit_scale,
+                int(lm_head.fast_dhead_mode),
+                int(lm_head.fast_dhead_topk),
+                alt_buf,
+                margin_buf,
+                tree_top_buf,
+                tree_vals_buf,
+            )
+        static_logits = self.logits_processor(self.lm_head, hidden_states)
+        if static_logits is None:
+            return None
         if (
             getattr(lm_head, "prompt_tail_admitted", False)
             and hidden_states.is_cuda

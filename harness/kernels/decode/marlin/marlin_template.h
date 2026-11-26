@@ -238,7 +238,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float   // is zero point of float16 type?
+          const bool is_zp_float,  // is zero point of float16 type?
+          const bool multi_m = false
           >
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
@@ -268,8 +269,10 @@ __global__ void Marlin(
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
     int max_shared_mem) {
-  // Compile-time M = 1 specialization matching gemv.cu launch args to avoid local-memory spills.
-  prob_m = 1;
+  // Compile-time specialization matching gemv.cu launch args to avoid local-memory spills.
+  if constexpr (!multi_m) {
+    prob_m = 1;
+  }
   lda = prob_k;
   num_groups = prob_k >> 4;
   has_bias = false;
@@ -855,10 +858,17 @@ __global__ void Marlin(
       int4* sh_a_stage = sh_a + a_sh_stage * pipe;
   #pragma unroll
       for (int i = 0; i < a_sh_wr_iters; i++) {
-        cp_async4_pred(
-            &sh_a_stage[a_sh_wr_trans[i]],
-            &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
-            a_sh_wr_pred[i]);
+        if constexpr (multi_m && thread_m_blocks == 1) {
+          cp_async4_ca_pred(
+              &sh_a_stage[a_sh_wr_trans[i]],
+              &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
+              a_sh_wr_pred[i]);
+        } else {
+          cp_async4_pred(
+              &sh_a_stage[a_sh_wr_trans[i]],
+              &A[a_gl_rd_delta_i * i + a_gl_rd + a_gl_rd_delta_o * a_off],
+              a_sh_wr_pred[i]);
+        }
       }
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
   #pragma unroll
@@ -868,7 +878,7 @@ __global__ void Marlin(
             b_gl_rd + (i % count) * threads +
             b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
 
-        cp_async4(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
+        cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
       }
 
       b_gl_rd += b_gl_rd_delta_o;
@@ -895,7 +905,7 @@ __global__ void Marlin(
           // Only fetch scales if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
             if (s_sh_wr_pred) {
-              cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
+              cp_async4_stream(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
             }
             s_gl_rd += s_gl_rd_delta * s_tb_groups;
           }

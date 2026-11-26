@@ -36,6 +36,15 @@ int dvt_pdl_mode() {
   return mode;
 }
 
+bool dvt_fast_enabled() {
+  static const bool enabled = []() -> bool {
+    const char* s = std::getenv("MUSE_DVT_FAST");
+    if (!s || !*s) return true;
+    return std::atoi(s) != 0;
+  }();
+  return enabled;
+}
+
 template <typename... KArgs, typename... Args>
 static inline void dvt_launch_pdl(
     void (*kernel)(KArgs...), dim3 grid, int block, cudaStream_t st, int pdl_mode, Args... args) {
@@ -423,8 +432,11 @@ __device__ __forceinline__ float dvt_warp_nvfp4_dot(
 // Grid: (16, M), Block: 256 threads (8 warps).
 // Under SM121 PDL (pdl_mode & 1), Phase 2 (prompt-tail OOV scoring against A/raw_w) runs BEFORE
 // griddepcontrol.wait, overlapping with the tail of draft_head; Phase 1 then runs vectorized uint4
-// (8 BF16/load) scan of static_logits with short-circuit top-6 merge.
-__global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
+// (8 BF16/load) scan of static_logits with exact 8-wide BF16 __hmax2 skip and templated TopK merge.
+// TopK = 8 or 6: compile-time specialized (eliminates 5-way runtime branches, fits <=128 regs/thread
+// for 2 CTAs/SM = 1 wave at M=6); TopK = 0: generic fallback for all other shapes/modes.
+template <int TopK>
+__global__ void __launch_bounds__(256, 2) draft_vocab_tail_argmax_kernel(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ static_logits,
     const int64_t* __restrict__ vocab_map,
@@ -481,22 +493,22 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
-  const bool want_top8 = (tree_k >= 8 && m < tree_top_rows &&
+  const bool want_top8 = (TopK == 8) || (TopK == 0 && tree_k >= 8 && m < tree_top_rows &&
                           out_vals3 != nullptr && out_ids3 != nullptr &&
                           out_vals4 != nullptr && out_ids4 != nullptr &&
                           out_vals5 != nullptr && out_ids5 != nullptr &&
                           out_vals6 != nullptr && out_ids6 != nullptr &&
                           out_vals7 != nullptr && out_ids7 != nullptr &&
                           out_vals8 != nullptr && out_ids8 != nullptr);
-  const bool want_top6 = (!want_top8 && tree_k >= 6 && m < tree_top_rows &&
+  const bool want_top6 = (TopK == 6) || (TopK == 0 && !want_top8 && tree_k >= 6 && m < tree_top_rows &&
                           out_vals3 != nullptr && out_ids3 != nullptr &&
                           out_vals4 != nullptr && out_ids4 != nullptr &&
                           out_vals5 != nullptr && out_ids5 != nullptr &&
                           out_vals6 != nullptr && out_ids6 != nullptr);
-  const bool want_top4 = (!want_top8 && !want_top6 && m < 3 && m < tree_top_rows &&
+  const bool want_top4 = (TopK == 0 && !want_top8 && !want_top6 && m < 3 && m < tree_top_rows &&
                           out_vals3 != nullptr && out_ids3 != nullptr &&
                           out_vals4 != nullptr && out_ids4 != nullptr);
-  const bool want_top2 = (!want_top8 && !want_top6 && !want_top4 && m < top2_max_rows &&
+  const bool want_top2 = (TopK == 0 && !want_top8 && !want_top6 && !want_top4 && m < top2_max_rows &&
                           out_vals2 != nullptr && out_ids2 != nullptr);
 
   float best_val = -1e30f;
@@ -542,23 +554,38 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
         const float val = dvt_warp_nvfp4_dot(
             a_row, s_a0, s_a1, use_smem_a, raw_w, raw_s, tok, K, num_g, lane, total_scale);
         if (lane == 0) {
-          if (want_top8) {
-            dvt_top8_insert(best_val, best_id, best2_val, best2_id,
-                            best3_val, best3_id, best4_val, best4_id,
-                            best5_val, best5_id, best6_val, best6_id,
-                            best7_val, best7_id, best8_val, best8_id, val, tok);
-          } else if (want_top6) {
-            dvt_top6_insert(best_val, best_id, best2_val, best2_id,
-                            best3_val, best3_id, best4_val, best4_id,
-                            best5_val, best5_id, best6_val, best6_id, val, tok);
-          } else if (want_top4) {
-            dvt_top4_insert(best_val, best_id, best2_val, best2_id,
-                            best3_val, best3_id, best4_val, best4_id, val, tok);
-          } else if (want_top2) {
-            dvt_top2_insert(best_val, best_id, best2_val, best2_id, val, tok);
-          } else if (dvt_better(val, tok, best_val, best_id)) {
-            best_val = val;
-            best_id = tok;
+          if constexpr (TopK == 8) {
+            if (val >= best8_val) {
+              dvt_top8_insert(best_val, best_id, best2_val, best2_id,
+                              best3_val, best3_id, best4_val, best4_id,
+                              best5_val, best5_id, best6_val, best6_id,
+                              best7_val, best7_id, best8_val, best8_id, val, tok);
+            }
+          } else if constexpr (TopK == 6) {
+            if (val >= best6_val) {
+              dvt_top6_insert(best_val, best_id, best2_val, best2_id,
+                              best3_val, best3_id, best4_val, best4_id,
+                              best5_val, best5_id, best6_val, best6_id, val, tok);
+            }
+          } else {
+            if (want_top8) {
+              dvt_top8_insert(best_val, best_id, best2_val, best2_id,
+                              best3_val, best3_id, best4_val, best4_id,
+                              best5_val, best5_id, best6_val, best6_id,
+                              best7_val, best7_id, best8_val, best8_id, val, tok);
+            } else if (want_top6) {
+              dvt_top6_insert(best_val, best_id, best2_val, best2_id,
+                              best3_val, best3_id, best4_val, best4_id,
+                              best5_val, best5_id, best6_val, best6_id, val, tok);
+            } else if (want_top4) {
+              dvt_top4_insert(best_val, best_id, best2_val, best2_id,
+                              best3_val, best3_id, best4_val, best4_id, val, tok);
+            } else if (want_top2) {
+              dvt_top2_insert(best_val, best_id, best2_val, best2_id, val, tok);
+            } else if (dvt_better(val, tok, best_val, best_id)) {
+              best_val = val;
+              best_id = tok;
+            }
           }
         }
       }
@@ -578,7 +605,7 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
   const int j_end = (j_start + chunk < V_static) ? (j_start + chunk) : V_static;
 
   auto consider_static = [&](float v, int j_idx) {
-    if (want_top8) {
+    if constexpr (TopK == 8) {
       if (v >= best8_val) {
         const int orig_id = static_cast<int>(__ldg(&vocab_map[j_idx]));
         dvt_top8_insert(best_val, best_id, best2_val, best2_id,
@@ -586,29 +613,46 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
                         best5_val, best5_id, best6_val, best6_id,
                         best7_val, best7_id, best8_val, best8_id, v, orig_id);
       }
-    } else if (want_top6) {
+    } else if constexpr (TopK == 6) {
       if (v >= best6_val) {
         const int orig_id = static_cast<int>(__ldg(&vocab_map[j_idx]));
         dvt_top6_insert(best_val, best_id, best2_val, best2_id,
                         best3_val, best3_id, best4_val, best4_id,
                         best5_val, best5_id, best6_val, best6_id, v, orig_id);
       }
-    } else if (want_top4) {
-      if (v >= best4_val) {
+    } else {
+      if (want_top8) {
+        if (v >= best8_val) {
+          const int orig_id = static_cast<int>(__ldg(&vocab_map[j_idx]));
+          dvt_top8_insert(best_val, best_id, best2_val, best2_id,
+                          best3_val, best3_id, best4_val, best4_id,
+                          best5_val, best5_id, best6_val, best6_id,
+                          best7_val, best7_id, best8_val, best8_id, v, orig_id);
+        }
+      } else if (want_top6) {
+        if (v >= best6_val) {
+          const int orig_id = static_cast<int>(__ldg(&vocab_map[j_idx]));
+          dvt_top6_insert(best_val, best_id, best2_val, best2_id,
+                          best3_val, best3_id, best4_val, best4_id,
+                          best5_val, best5_id, best6_val, best6_id, v, orig_id);
+        }
+      } else if (want_top4) {
+        if (v >= best4_val) {
+          const int orig_id = static_cast<int>(__ldg(&vocab_map[j_idx]));
+          dvt_top4_insert(best_val, best_id, best2_val, best2_id,
+                          best3_val, best3_id, best4_val, best4_id, v, orig_id);
+        }
+      } else if (want_top2) {
+        if (v >= best2_val) {
+          const int orig_id = static_cast<int>(__ldg(&vocab_map[j_idx]));
+          dvt_top2_insert(best_val, best_id, best2_val, best2_id, v, orig_id);
+        }
+      } else if (v >= best_val) {
         const int orig_id = static_cast<int>(__ldg(&vocab_map[j_idx]));
-        dvt_top4_insert(best_val, best_id, best2_val, best2_id,
-                        best3_val, best3_id, best4_val, best4_id, v, orig_id);
-      }
-    } else if (want_top2) {
-      if (v >= best2_val) {
-        const int orig_id = static_cast<int>(__ldg(&vocab_map[j_idx]));
-        dvt_top2_insert(best_val, best_id, best2_val, best2_id, v, orig_id);
-      }
-    } else if (v >= best_val) {
-      const int orig_id = static_cast<int>(__ldg(&vocab_map[j_idx]));
-      if (dvt_better(v, orig_id, best_val, best_id)) {
-        best_val = v;
-        best_id = orig_id;
+        if (dvt_better(v, orig_id, best_val, best_id)) {
+          best_val = v;
+          best_id = orig_id;
+        }
       }
     }
   };
@@ -621,11 +665,29 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
       const uint4 v4 = __ldg(&sl_u4[j8]);
       const __nv_bfloat162* vp = reinterpret_cast<const __nv_bfloat162*>(&v4);
       const int j_base = j8 << 3;
+      if constexpr (TopK == 8 || TopK == 6) {
+        // Exact 3-instruction BF16 8-wide max skip (100% bit-exact incl. NaN/Inf/+-0/ties).
+        const __nv_bfloat162 m01 = __hmax2(vp[0], vp[1]);
+        const __nv_bfloat162 m23 = __hmax2(vp[2], vp[3]);
+        const __nv_bfloat162 m4 = __hmax2(m01, m23);
+        const float2 mf = __bfloat1622float2(m4);
+        const float max8 = fmaxf(mf.x, mf.y);
+        const float thresh = (TopK == 8) ? best8_val : best6_val;
+        if (max8 >= thresh) {
 #pragma unroll
-      for (int p = 0; p < 4; ++p) {
-        const float2 f = __bfloat1622float2(vp[p]);
-        consider_static(f.x, j_base + 2 * p + 0);
-        consider_static(f.y, j_base + 2 * p + 1);
+          for (int p = 0; p < 4; ++p) {
+            const float2 f = __bfloat1622float2(vp[p]);
+            consider_static(f.x, j_base + 2 * p + 0);
+            consider_static(f.y, j_base + 2 * p + 1);
+          }
+        }
+      } else {
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+          const float2 f = __bfloat1622float2(vp[p]);
+          consider_static(f.x, j_base + 2 * p + 0);
+          consider_static(f.y, j_base + 2 * p + 1);
+        }
       }
     }
   } else {
@@ -642,89 +704,148 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
   // Warp reduce merged Phase 1 + Phase 2 -> lane 0 holds warp's best candidates.
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) {
-    const float ov = __shfl_xor_sync(0xffffffffu, best_val, o);
-    const int oi = __shfl_xor_sync(0xffffffffu, best_id, o);
-    if (want_top8) {
-      const float ov2 = __shfl_xor_sync(0xffffffffu, best2_val, o);
-      const int oi2 = __shfl_xor_sync(0xffffffffu, best2_id, o);
-      const float ov3 = __shfl_xor_sync(0xffffffffu, best3_val, o);
-      const int oi3 = __shfl_xor_sync(0xffffffffu, best3_id, o);
-      const float ov4 = __shfl_xor_sync(0xffffffffu, best4_val, o);
-      const int oi4 = __shfl_xor_sync(0xffffffffu, best4_id, o);
-      const float ov5 = __shfl_xor_sync(0xffffffffu, best5_val, o);
-      const int oi5 = __shfl_xor_sync(0xffffffffu, best5_id, o);
-      const float ov6 = __shfl_xor_sync(0xffffffffu, best6_val, o);
-      const int oi6 = __shfl_xor_sync(0xffffffffu, best6_id, o);
-      const float ov7 = __shfl_xor_sync(0xffffffffu, best7_val, o);
-      const int oi7 = __shfl_xor_sync(0xffffffffu, best7_id, o);
-      const float ov8 = __shfl_xor_sync(0xffffffffu, best8_val, o);
-      const int oi8 = __shfl_xor_sync(0xffffffffu, best8_id, o);
-      dvt_top8_merge(best_val, best_id, best2_val, best2_id, best3_val, best3_id,
-                     best4_val, best4_id, best5_val, best5_id, best6_val, best6_id,
-                     best7_val, best7_id, best8_val, best8_id,
-                     ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6, ov7, oi7, ov8, oi8);
-    } else if (want_top6) {
-      const float ov2 = __shfl_xor_sync(0xffffffffu, best2_val, o);
-      const int oi2 = __shfl_xor_sync(0xffffffffu, best2_id, o);
-      const float ov3 = __shfl_xor_sync(0xffffffffu, best3_val, o);
-      const int oi3 = __shfl_xor_sync(0xffffffffu, best3_id, o);
-      const float ov4 = __shfl_xor_sync(0xffffffffu, best4_val, o);
-      const int oi4 = __shfl_xor_sync(0xffffffffu, best4_id, o);
-      const float ov5 = __shfl_xor_sync(0xffffffffu, best5_val, o);
-      const int oi5 = __shfl_xor_sync(0xffffffffu, best5_id, o);
-      const float ov6 = __shfl_xor_sync(0xffffffffu, best6_val, o);
-      const int oi6 = __shfl_xor_sync(0xffffffffu, best6_id, o);
-      dvt_top6_merge(best_val, best_id, best2_val, best2_id, best3_val, best3_id,
-                     best4_val, best4_id, best5_val, best5_id, best6_val, best6_id,
-                     ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6);
-    } else if (want_top4) {
-      const float ov2 = __shfl_xor_sync(0xffffffffu, best2_val, o);
-      const int oi2 = __shfl_xor_sync(0xffffffffu, best2_id, o);
-      const float ov3 = __shfl_xor_sync(0xffffffffu, best3_val, o);
-      const int oi3 = __shfl_xor_sync(0xffffffffu, best3_id, o);
-      const float ov4 = __shfl_xor_sync(0xffffffffu, best4_val, o);
-      const int oi4 = __shfl_xor_sync(0xffffffffu, best4_id, o);
-      dvt_top4_merge(best_val, best_id, best2_val, best2_id, best3_val, best3_id, best4_val, best4_id,
-                     ov, oi, ov2, oi2, ov3, oi3, ov4, oi4);
-    } else if (want_top2) {
-      const float ov2 = __shfl_xor_sync(0xffffffffu, best2_val, o);
-      const int oi2 = __shfl_xor_sync(0xffffffffu, best2_id, o);
-      if (ov >= best2_val) {
-        dvt_top2_insert(best_val, best_id, best2_val, best2_id, ov, oi);
-        if (ov2 >= best2_val) {
-          dvt_top2_insert(best_val, best_id, best2_val, best2_id, ov2, oi2);
-        }
+    if constexpr (TopK == 8) {
+      const float ov = __shfl_down_sync(0xffffffffu, best_val, o);
+      const int oi = __shfl_down_sync(0xffffffffu, best_id, o);
+      const float ov2 = __shfl_down_sync(0xffffffffu, best2_val, o);
+      const int oi2 = __shfl_down_sync(0xffffffffu, best2_id, o);
+      const float ov3 = __shfl_down_sync(0xffffffffu, best3_val, o);
+      const int oi3 = __shfl_down_sync(0xffffffffu, best3_id, o);
+      const float ov4 = __shfl_down_sync(0xffffffffu, best4_val, o);
+      const int oi4 = __shfl_down_sync(0xffffffffu, best4_id, o);
+      const float ov5 = __shfl_down_sync(0xffffffffu, best5_val, o);
+      const int oi5 = __shfl_down_sync(0xffffffffu, best5_id, o);
+      const float ov6 = __shfl_down_sync(0xffffffffu, best6_val, o);
+      const int oi6 = __shfl_down_sync(0xffffffffu, best6_id, o);
+      const float ov7 = __shfl_down_sync(0xffffffffu, best7_val, o);
+      const int oi7 = __shfl_down_sync(0xffffffffu, best7_id, o);
+      const float ov8 = __shfl_down_sync(0xffffffffu, best8_val, o);
+      const int oi8 = __shfl_down_sync(0xffffffffu, best8_id, o);
+      if (lane < o) {
+        dvt_top8_merge(best_val, best_id, best2_val, best2_id, best3_val, best3_id,
+                       best4_val, best4_id, best5_val, best5_id, best6_val, best6_id,
+                       best7_val, best7_id, best8_val, best8_id,
+                       ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6, ov7, oi7, ov8, oi8);
       }
-    } else if (dvt_better(ov, oi, best_val, best_id)) {
-      best_val = ov;
-      best_id = oi;
+    } else if constexpr (TopK == 6) {
+      const float ov = __shfl_down_sync(0xffffffffu, best_val, o);
+      const int oi = __shfl_down_sync(0xffffffffu, best_id, o);
+      const float ov2 = __shfl_down_sync(0xffffffffu, best2_val, o);
+      const int oi2 = __shfl_down_sync(0xffffffffu, best2_id, o);
+      const float ov3 = __shfl_down_sync(0xffffffffu, best3_val, o);
+      const int oi3 = __shfl_down_sync(0xffffffffu, best3_id, o);
+      const float ov4 = __shfl_down_sync(0xffffffffu, best4_val, o);
+      const int oi4 = __shfl_down_sync(0xffffffffu, best4_id, o);
+      const float ov5 = __shfl_down_sync(0xffffffffu, best5_val, o);
+      const int oi5 = __shfl_down_sync(0xffffffffu, best5_id, o);
+      const float ov6 = __shfl_down_sync(0xffffffffu, best6_val, o);
+      const int oi6 = __shfl_down_sync(0xffffffffu, best6_id, o);
+      if (lane < o) {
+        dvt_top6_merge(best_val, best_id, best2_val, best2_id, best3_val, best3_id,
+                       best4_val, best4_id, best5_val, best5_id, best6_val, best6_id,
+                       ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6);
+      }
+    } else {
+      const float ov = __shfl_xor_sync(0xffffffffu, best_val, o);
+      const int oi = __shfl_xor_sync(0xffffffffu, best_id, o);
+      if (want_top8) {
+        const float ov2 = __shfl_xor_sync(0xffffffffu, best2_val, o);
+        const int oi2 = __shfl_xor_sync(0xffffffffu, best2_id, o);
+        const float ov3 = __shfl_xor_sync(0xffffffffu, best3_val, o);
+        const int oi3 = __shfl_xor_sync(0xffffffffu, best3_id, o);
+        const float ov4 = __shfl_xor_sync(0xffffffffu, best4_val, o);
+        const int oi4 = __shfl_xor_sync(0xffffffffu, best4_id, o);
+        const float ov5 = __shfl_xor_sync(0xffffffffu, best5_val, o);
+        const int oi5 = __shfl_xor_sync(0xffffffffu, best5_id, o);
+        const float ov6 = __shfl_xor_sync(0xffffffffu, best6_val, o);
+        const int oi6 = __shfl_xor_sync(0xffffffffu, best6_id, o);
+        const float ov7 = __shfl_xor_sync(0xffffffffu, best7_val, o);
+        const int oi7 = __shfl_xor_sync(0xffffffffu, best7_id, o);
+        const float ov8 = __shfl_xor_sync(0xffffffffu, best8_val, o);
+        const int oi8 = __shfl_xor_sync(0xffffffffu, best8_id, o);
+        dvt_top8_merge(best_val, best_id, best2_val, best2_id, best3_val, best3_id,
+                       best4_val, best4_id, best5_val, best5_id, best6_val, best6_id,
+                       best7_val, best7_id, best8_val, best8_id,
+                       ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6, ov7, oi7, ov8, oi8);
+      } else if (want_top6) {
+        const float ov2 = __shfl_xor_sync(0xffffffffu, best2_val, o);
+        const int oi2 = __shfl_xor_sync(0xffffffffu, best2_id, o);
+        const float ov3 = __shfl_xor_sync(0xffffffffu, best3_val, o);
+        const int oi3 = __shfl_xor_sync(0xffffffffu, best3_id, o);
+        const float ov4 = __shfl_xor_sync(0xffffffffu, best4_val, o);
+        const int oi4 = __shfl_xor_sync(0xffffffffu, best4_id, o);
+        const float ov5 = __shfl_xor_sync(0xffffffffu, best5_val, o);
+        const int oi5 = __shfl_xor_sync(0xffffffffu, best5_id, o);
+        const float ov6 = __shfl_xor_sync(0xffffffffu, best6_val, o);
+        const int oi6 = __shfl_xor_sync(0xffffffffu, best6_id, o);
+        dvt_top6_merge(best_val, best_id, best2_val, best2_id, best3_val, best3_id,
+                       best4_val, best4_id, best5_val, best5_id, best6_val, best6_id,
+                       ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6);
+      } else if (want_top4) {
+        const float ov2 = __shfl_xor_sync(0xffffffffu, best2_val, o);
+        const int oi2 = __shfl_xor_sync(0xffffffffu, best2_id, o);
+        const float ov3 = __shfl_xor_sync(0xffffffffu, best3_val, o);
+        const int oi3 = __shfl_xor_sync(0xffffffffu, best3_id, o);
+        const float ov4 = __shfl_xor_sync(0xffffffffu, best4_val, o);
+        const int oi4 = __shfl_xor_sync(0xffffffffu, best4_id, o);
+        dvt_top4_merge(best_val, best_id, best2_val, best2_id, best3_val, best3_id, best4_val, best4_id,
+                       ov, oi, ov2, oi2, ov3, oi3, ov4, oi4);
+      } else if (want_top2) {
+        const float ov2 = __shfl_xor_sync(0xffffffffu, best2_val, o);
+        const int oi2 = __shfl_xor_sync(0xffffffffu, best2_id, o);
+        if (ov >= best2_val) {
+          dvt_top2_insert(best_val, best_id, best2_val, best2_id, ov, oi);
+          if (ov2 >= best2_val) {
+            dvt_top2_insert(best_val, best_id, best2_val, best2_id, ov2, oi2);
+          }
+        }
+      } else if (dvt_better(ov, oi, best_val, best_id)) {
+        best_val = ov;
+        best_id = oi;
+      }
     }
   }
 
   if (lane == 0) {
     s_vals[warp] = best_val;
     s_ids[warp] = best_id;
-    if (want_top8 || want_top6 || want_top4 || want_top2) {
-      s_vals2[warp] = best2_val;
-      s_ids2[warp] = best2_id;
-    }
-    if (want_top8 || want_top6 || want_top4) {
-      s_vals3[warp] = best3_val;
-      s_ids3[warp] = best3_id;
-      s_vals4[warp] = best4_val;
-      s_ids4[warp] = best4_id;
-    }
-    if (want_top8 || want_top6) {
-      s_vals5[warp] = best5_val;
-      s_ids5[warp] = best5_id;
-      s_vals6[warp] = best6_val;
-      s_ids6[warp] = best6_id;
-    }
-    if (want_top8) {
-      s_vals7[warp] = best7_val;
-      s_ids7[warp] = best7_id;
-      s_vals8[warp] = best8_val;
-      s_ids8[warp] = best8_id;
+    if constexpr (TopK == 8) {
+      s_vals2[warp] = best2_val; s_ids2[warp] = best2_id;
+      s_vals3[warp] = best3_val; s_ids3[warp] = best3_id;
+      s_vals4[warp] = best4_val; s_ids4[warp] = best4_id;
+      s_vals5[warp] = best5_val; s_ids5[warp] = best5_id;
+      s_vals6[warp] = best6_val; s_ids6[warp] = best6_id;
+      s_vals7[warp] = best7_val; s_ids7[warp] = best7_id;
+      s_vals8[warp] = best8_val; s_ids8[warp] = best8_id;
+    } else if constexpr (TopK == 6) {
+      s_vals2[warp] = best2_val; s_ids2[warp] = best2_id;
+      s_vals3[warp] = best3_val; s_ids3[warp] = best3_id;
+      s_vals4[warp] = best4_val; s_ids4[warp] = best4_id;
+      s_vals5[warp] = best5_val; s_ids5[warp] = best5_id;
+      s_vals6[warp] = best6_val; s_ids6[warp] = best6_id;
+    } else {
+      if (want_top8 || want_top6 || want_top4 || want_top2) {
+        s_vals2[warp] = best2_val;
+        s_ids2[warp] = best2_id;
+      }
+      if (want_top8 || want_top6 || want_top4) {
+        s_vals3[warp] = best3_val;
+        s_ids3[warp] = best3_id;
+        s_vals4[warp] = best4_val;
+        s_ids4[warp] = best4_id;
+      }
+      if (want_top8 || want_top6) {
+        s_vals5[warp] = best5_val;
+        s_ids5[warp] = best5_id;
+        s_vals6[warp] = best6_val;
+        s_ids6[warp] = best6_id;
+      }
+      if (want_top8) {
+        s_vals7[warp] = best7_val;
+        s_ids7[warp] = best7_id;
+        s_vals8[warp] = best8_val;
+        s_ids8[warp] = best8_id;
+      }
     }
   }
   __syncthreads();
@@ -732,105 +853,162 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
   if (warp == 0 && lane < kS2Warps) {
     float bv = s_vals[lane];
     int bi = s_ids[lane];
-    float bv2 = (want_top8 || want_top6 || want_top4 || want_top2) ? s_vals2[lane] : -1e30f;
-    int bi2 = (want_top8 || want_top6 || want_top4 || want_top2) ? s_ids2[lane] : 0x7fffffff;
-    float bv3 = (want_top8 || want_top6 || want_top4) ? s_vals3[lane] : -1e30f;
-    int bi3 = (want_top8 || want_top6 || want_top4) ? s_ids3[lane] : 0x7fffffff;
-    float bv4 = (want_top8 || want_top6 || want_top4) ? s_vals4[lane] : -1e30f;
-    int bi4 = (want_top8 || want_top6 || want_top4) ? s_ids4[lane] : 0x7fffffff;
-    float bv5 = (want_top8 || want_top6) ? s_vals5[lane] : -1e30f;
-    int bi5 = (want_top8 || want_top6) ? s_ids5[lane] : 0x7fffffff;
-    float bv6 = (want_top8 || want_top6) ? s_vals6[lane] : -1e30f;
-    int bi6 = (want_top8 || want_top6) ? s_ids6[lane] : 0x7fffffff;
-    float bv7 = want_top8 ? s_vals7[lane] : -1e30f;
-    int bi7 = want_top8 ? s_ids7[lane] : 0x7fffffff;
-    float bv8 = want_top8 ? s_vals8[lane] : -1e30f;
-    int bi8 = want_top8 ? s_ids8[lane] : 0x7fffffff;
+    float bv2 = (TopK == 8 || TopK == 6 || want_top8 || want_top6 || want_top4 || want_top2) ? s_vals2[lane] : -1e30f;
+    int bi2 = (TopK == 8 || TopK == 6 || want_top8 || want_top6 || want_top4 || want_top2) ? s_ids2[lane] : 0x7fffffff;
+    float bv3 = (TopK == 8 || TopK == 6 || want_top8 || want_top6 || want_top4) ? s_vals3[lane] : -1e30f;
+    int bi3 = (TopK == 8 || TopK == 6 || want_top8 || want_top6 || want_top4) ? s_ids3[lane] : 0x7fffffff;
+    float bv4 = (TopK == 8 || TopK == 6 || want_top8 || want_top6 || want_top4) ? s_vals4[lane] : -1e30f;
+    int bi4 = (TopK == 8 || TopK == 6 || want_top8 || want_top6 || want_top4) ? s_ids4[lane] : 0x7fffffff;
+    float bv5 = (TopK == 8 || TopK == 6 || want_top8 || want_top6) ? s_vals5[lane] : -1e30f;
+    int bi5 = (TopK == 8 || TopK == 6 || want_top8 || want_top6) ? s_ids5[lane] : 0x7fffffff;
+    float bv6 = (TopK == 8 || TopK == 6 || want_top8 || want_top6) ? s_vals6[lane] : -1e30f;
+    int bi6 = (TopK == 8 || TopK == 6 || want_top8 || want_top6) ? s_ids6[lane] : 0x7fffffff;
+    float bv7 = (TopK == 8 || want_top8) ? s_vals7[lane] : -1e30f;
+    int bi7 = (TopK == 8 || want_top8) ? s_ids7[lane] : 0x7fffffff;
+    float bv8 = (TopK == 8 || want_top8) ? s_vals8[lane] : -1e30f;
+    int bi8 = (TopK == 8 || want_top8) ? s_ids8[lane] : 0x7fffffff;
 #pragma unroll
     for (int o = 4; o > 0; o >>= 1) {
-      const float ov = __shfl_xor_sync(0xffu, bv, o);
-      const int oi = __shfl_xor_sync(0xffu, bi, o);
-      if (want_top8) {
-        const float ov2 = __shfl_xor_sync(0xffu, bv2, o);
-        const int oi2 = __shfl_xor_sync(0xffu, bi2, o);
-        const float ov3 = __shfl_xor_sync(0xffu, bv3, o);
-        const int oi3 = __shfl_xor_sync(0xffu, bi3, o);
-        const float ov4 = __shfl_xor_sync(0xffu, bv4, o);
-        const int oi4 = __shfl_xor_sync(0xffu, bi4, o);
-        const float ov5 = __shfl_xor_sync(0xffu, bv5, o);
-        const int oi5 = __shfl_xor_sync(0xffu, bi5, o);
-        const float ov6 = __shfl_xor_sync(0xffu, bv6, o);
-        const int oi6 = __shfl_xor_sync(0xffu, bi6, o);
-        const float ov7 = __shfl_xor_sync(0xffu, bv7, o);
-        const int oi7 = __shfl_xor_sync(0xffu, bi7, o);
-        const float ov8 = __shfl_xor_sync(0xffu, bv8, o);
-        const int oi8 = __shfl_xor_sync(0xffu, bi8, o);
-        dvt_top8_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, bv5, bi5, bv6, bi6, bv7, bi7, bv8, bi8,
-                       ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6, ov7, oi7, ov8, oi8);
-      } else if (want_top6) {
-        const float ov2 = __shfl_xor_sync(0xffu, bv2, o);
-        const int oi2 = __shfl_xor_sync(0xffu, bi2, o);
-        const float ov3 = __shfl_xor_sync(0xffu, bv3, o);
-        const int oi3 = __shfl_xor_sync(0xffu, bi3, o);
-        const float ov4 = __shfl_xor_sync(0xffu, bv4, o);
-        const int oi4 = __shfl_xor_sync(0xffu, bi4, o);
-        const float ov5 = __shfl_xor_sync(0xffu, bv5, o);
-        const int oi5 = __shfl_xor_sync(0xffu, bi5, o);
-        const float ov6 = __shfl_xor_sync(0xffu, bv6, o);
-        const int oi6 = __shfl_xor_sync(0xffu, bi6, o);
-        dvt_top6_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, bv5, bi5, bv6, bi6,
-                       ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6);
-      } else if (want_top4) {
-        const float ov2 = __shfl_xor_sync(0xffu, bv2, o);
-        const int oi2 = __shfl_xor_sync(0xffu, bi2, o);
-        const float ov3 = __shfl_xor_sync(0xffu, bv3, o);
-        const int oi3 = __shfl_xor_sync(0xffu, bi3, o);
-        const float ov4 = __shfl_xor_sync(0xffu, bv4, o);
-        const int oi4 = __shfl_xor_sync(0xffu, bi4, o);
-        dvt_top4_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, ov, oi, ov2, oi2, ov3, oi3, ov4, oi4);
-      } else if (want_top2) {
-        const float ov2 = __shfl_xor_sync(0xffu, bv2, o);
-        const int oi2 = __shfl_xor_sync(0xffu, bi2, o);
-        if (ov >= bv2) {
-          dvt_top2_insert(bv, bi, bv2, bi2, ov, oi);
-          if (ov2 >= bv2) {
-            dvt_top2_insert(bv, bi, bv2, bi2, ov2, oi2);
-          }
+      if constexpr (TopK == 8) {
+        const float ov = __shfl_down_sync(0xffu, bv, o);
+        const int oi = __shfl_down_sync(0xffu, bi, o);
+        const float ov2 = __shfl_down_sync(0xffu, bv2, o);
+        const int oi2 = __shfl_down_sync(0xffu, bi2, o);
+        const float ov3 = __shfl_down_sync(0xffu, bv3, o);
+        const int oi3 = __shfl_down_sync(0xffu, bi3, o);
+        const float ov4 = __shfl_down_sync(0xffu, bv4, o);
+        const int oi4 = __shfl_down_sync(0xffu, bi4, o);
+        const float ov5 = __shfl_down_sync(0xffu, bv5, o);
+        const int oi5 = __shfl_down_sync(0xffu, bi5, o);
+        const float ov6 = __shfl_down_sync(0xffu, bv6, o);
+        const int oi6 = __shfl_down_sync(0xffu, bi6, o);
+        const float ov7 = __shfl_down_sync(0xffu, bv7, o);
+        const int oi7 = __shfl_down_sync(0xffu, bi7, o);
+        const float ov8 = __shfl_down_sync(0xffu, bv8, o);
+        const int oi8 = __shfl_down_sync(0xffu, bi8, o);
+        if (lane < o) {
+          dvt_top8_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, bv5, bi5, bv6, bi6, bv7, bi7, bv8, bi8,
+                         ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6, ov7, oi7, ov8, oi8);
         }
-      } else if (dvt_better(ov, oi, bv, bi)) {
-        bv = ov;
-        bi = oi;
+      } else if constexpr (TopK == 6) {
+        const float ov = __shfl_down_sync(0xffu, bv, o);
+        const int oi = __shfl_down_sync(0xffu, bi, o);
+        const float ov2 = __shfl_down_sync(0xffu, bv2, o);
+        const int oi2 = __shfl_down_sync(0xffu, bi2, o);
+        const float ov3 = __shfl_down_sync(0xffu, bv3, o);
+        const int oi3 = __shfl_down_sync(0xffu, bi3, o);
+        const float ov4 = __shfl_down_sync(0xffu, bv4, o);
+        const int oi4 = __shfl_down_sync(0xffu, bi4, o);
+        const float ov5 = __shfl_down_sync(0xffu, bv5, o);
+        const int oi5 = __shfl_down_sync(0xffu, bi5, o);
+        const float ov6 = __shfl_down_sync(0xffu, bv6, o);
+        const int oi6 = __shfl_down_sync(0xffu, bi6, o);
+        if (lane < o) {
+          dvt_top6_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, bv5, bi5, bv6, bi6,
+                         ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6);
+        }
+      } else {
+        const float ov = __shfl_xor_sync(0xffu, bv, o);
+        const int oi = __shfl_xor_sync(0xffu, bi, o);
+        if (want_top8) {
+          const float ov2 = __shfl_xor_sync(0xffu, bv2, o);
+          const int oi2 = __shfl_xor_sync(0xffu, bi2, o);
+          const float ov3 = __shfl_xor_sync(0xffu, bv3, o);
+          const int oi3 = __shfl_xor_sync(0xffu, bi3, o);
+          const float ov4 = __shfl_xor_sync(0xffu, bv4, o);
+          const int oi4 = __shfl_xor_sync(0xffu, bi4, o);
+          const float ov5 = __shfl_xor_sync(0xffu, bv5, o);
+          const int oi5 = __shfl_xor_sync(0xffu, bi5, o);
+          const float ov6 = __shfl_xor_sync(0xffu, bv6, o);
+          const int oi6 = __shfl_xor_sync(0xffu, bi6, o);
+          const float ov7 = __shfl_xor_sync(0xffu, bv7, o);
+          const int oi7 = __shfl_xor_sync(0xffu, bi7, o);
+          const float ov8 = __shfl_xor_sync(0xffu, bv8, o);
+          const int oi8 = __shfl_xor_sync(0xffu, bi8, o);
+          dvt_top8_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, bv5, bi5, bv6, bi6, bv7, bi7, bv8, bi8,
+                         ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6, ov7, oi7, ov8, oi8);
+        } else if (want_top6) {
+          const float ov2 = __shfl_xor_sync(0xffu, bv2, o);
+          const int oi2 = __shfl_xor_sync(0xffu, bi2, o);
+          const float ov3 = __shfl_xor_sync(0xffu, bv3, o);
+          const int oi3 = __shfl_xor_sync(0xffu, bi3, o);
+          const float ov4 = __shfl_xor_sync(0xffu, bv4, o);
+          const int oi4 = __shfl_xor_sync(0xffu, bi4, o);
+          const float ov5 = __shfl_xor_sync(0xffu, bv5, o);
+          const int oi5 = __shfl_xor_sync(0xffu, bi5, o);
+          const float ov6 = __shfl_xor_sync(0xffu, bv6, o);
+          const int oi6 = __shfl_xor_sync(0xffu, bi6, o);
+          dvt_top6_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, bv5, bi5, bv6, bi6,
+                         ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6);
+        } else if (want_top4) {
+          const float ov2 = __shfl_xor_sync(0xffu, bv2, o);
+          const int oi2 = __shfl_xor_sync(0xffu, bi2, o);
+          const float ov3 = __shfl_xor_sync(0xffu, bv3, o);
+          const int oi3 = __shfl_xor_sync(0xffu, bi3, o);
+          const float ov4 = __shfl_xor_sync(0xffu, bv4, o);
+          const int oi4 = __shfl_xor_sync(0xffu, bi4, o);
+          dvt_top4_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, ov, oi, ov2, oi2, ov3, oi3, ov4, oi4);
+        } else if (want_top2) {
+          const float ov2 = __shfl_xor_sync(0xffu, bv2, o);
+          const int oi2 = __shfl_xor_sync(0xffu, bi2, o);
+          if (ov >= bv2) {
+            dvt_top2_insert(bv, bi, bv2, bi2, ov, oi);
+            if (ov2 >= bv2) {
+              dvt_top2_insert(bv, bi, bv2, bi2, ov2, oi2);
+            }
+          }
+        } else if (dvt_better(ov, oi, bv, bi)) {
+          bv = ov;
+          bi = oi;
+        }
       }
     }
     if (lane == 0) {
       out_vals[m * kS2CTAsPerRow + cta_c] = bv;
       out_ids[m * kS2CTAsPerRow + cta_c] = bi;
-      if (want_top8 || want_top6 || want_top4 || want_top2) {
-        out_vals2[m * kS2CTAsPerRow + cta_c] = bv2;
-        out_ids2[m * kS2CTAsPerRow + cta_c] = bi2;
-      }
-      if (want_top8 || want_top6 || want_top4) {
-        out_vals3[m * kS2CTAsPerRow + cta_c] = bv3;
-        out_ids3[m * kS2CTAsPerRow + cta_c] = bi3;
-        out_vals4[m * kS2CTAsPerRow + cta_c] = bv4;
-        out_ids4[m * kS2CTAsPerRow + cta_c] = bi4;
-      }
-      if (want_top8 || want_top6) {
-        out_vals5[m * kS2CTAsPerRow + cta_c] = bv5;
-        out_ids5[m * kS2CTAsPerRow + cta_c] = bi5;
-        out_vals6[m * kS2CTAsPerRow + cta_c] = bv6;
-        out_ids6[m * kS2CTAsPerRow + cta_c] = bi6;
-      }
-      if (want_top8) {
-        out_vals7[m * kS2CTAsPerRow + cta_c] = bv7;
-        out_ids7[m * kS2CTAsPerRow + cta_c] = bi7;
-        out_vals8[m * kS2CTAsPerRow + cta_c] = bv8;
-        out_ids8[m * kS2CTAsPerRow + cta_c] = bi8;
+      if constexpr (TopK == 8) {
+        out_vals2[m * kS2CTAsPerRow + cta_c] = bv2; out_ids2[m * kS2CTAsPerRow + cta_c] = bi2;
+        out_vals3[m * kS2CTAsPerRow + cta_c] = bv3; out_ids3[m * kS2CTAsPerRow + cta_c] = bi3;
+        out_vals4[m * kS2CTAsPerRow + cta_c] = bv4; out_ids4[m * kS2CTAsPerRow + cta_c] = bi4;
+        out_vals5[m * kS2CTAsPerRow + cta_c] = bv5; out_ids5[m * kS2CTAsPerRow + cta_c] = bi5;
+        out_vals6[m * kS2CTAsPerRow + cta_c] = bv6; out_ids6[m * kS2CTAsPerRow + cta_c] = bi6;
+        out_vals7[m * kS2CTAsPerRow + cta_c] = bv7; out_ids7[m * kS2CTAsPerRow + cta_c] = bi7;
+        out_vals8[m * kS2CTAsPerRow + cta_c] = bv8; out_ids8[m * kS2CTAsPerRow + cta_c] = bi8;
+      } else if constexpr (TopK == 6) {
+        out_vals2[m * kS2CTAsPerRow + cta_c] = bv2; out_ids2[m * kS2CTAsPerRow + cta_c] = bi2;
+        out_vals3[m * kS2CTAsPerRow + cta_c] = bv3; out_ids3[m * kS2CTAsPerRow + cta_c] = bi3;
+        out_vals4[m * kS2CTAsPerRow + cta_c] = bv4; out_ids4[m * kS2CTAsPerRow + cta_c] = bi4;
+        out_vals5[m * kS2CTAsPerRow + cta_c] = bv5; out_ids5[m * kS2CTAsPerRow + cta_c] = bi5;
+        out_vals6[m * kS2CTAsPerRow + cta_c] = bv6; out_ids6[m * kS2CTAsPerRow + cta_c] = bi6;
+      } else {
+        if (want_top8 || want_top6 || want_top4 || want_top2) {
+          out_vals2[m * kS2CTAsPerRow + cta_c] = bv2;
+          out_ids2[m * kS2CTAsPerRow + cta_c] = bi2;
+        }
+        if (want_top8 || want_top6 || want_top4) {
+          out_vals3[m * kS2CTAsPerRow + cta_c] = bv3;
+          out_ids3[m * kS2CTAsPerRow + cta_c] = bi3;
+          out_vals4[m * kS2CTAsPerRow + cta_c] = bv4;
+          out_ids4[m * kS2CTAsPerRow + cta_c] = bi4;
+        }
+        if (want_top8 || want_top6) {
+          out_vals5[m * kS2CTAsPerRow + cta_c] = bv5;
+          out_ids5[m * kS2CTAsPerRow + cta_c] = bi5;
+          out_vals6[m * kS2CTAsPerRow + cta_c] = bv6;
+          out_ids6[m * kS2CTAsPerRow + cta_c] = bi6;
+        }
+        if (want_top8) {
+          out_vals7[m * kS2CTAsPerRow + cta_c] = bv7;
+          out_ids7[m * kS2CTAsPerRow + cta_c] = bi7;
+          out_vals8[m * kS2CTAsPerRow + cta_c] = bv8;
+          out_ids8[m * kS2CTAsPerRow + cta_c] = bi8;
+        }
       }
     }
   }
 }
 
+template <int TopK>
 __global__ void draft_vocab_final_reduce_kernel(
     const float* __restrict__ in_vals,
     const int32_t* __restrict__ in_ids,
@@ -866,95 +1044,135 @@ __global__ void draft_vocab_final_reduce_kernel(
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
   if (lane >= kS2CTAsPerRow) return;
-  const bool want_top8 = (tree_k >= 8 && m < tree_top_rows && out_tree_top != nullptr &&
+  const bool want_top8 = (TopK == 8) || (TopK == 0 && tree_k >= 8 && m < tree_top_rows && out_tree_top != nullptr &&
                           in_vals3 != nullptr && in_ids3 != nullptr &&
                           in_vals4 != nullptr && in_ids4 != nullptr &&
                           in_vals5 != nullptr && in_ids5 != nullptr &&
                           in_vals6 != nullptr && in_ids6 != nullptr &&
                           in_vals7 != nullptr && in_ids7 != nullptr &&
                           in_vals8 != nullptr && in_ids8 != nullptr);
-  const bool want_top6 = (!want_top8 && tree_k >= 6 && m < tree_top_rows && out_tree_top != nullptr &&
+  const bool want_top6 = (TopK == 6) || (TopK == 0 && !want_top8 && tree_k >= 6 && m < tree_top_rows && out_tree_top != nullptr &&
                           in_vals3 != nullptr && in_ids3 != nullptr &&
                           in_vals4 != nullptr && in_ids4 != nullptr &&
                           in_vals5 != nullptr && in_ids5 != nullptr &&
                           in_vals6 != nullptr && in_ids6 != nullptr);
-  const bool want_top4 = (!want_top8 && !want_top6 && m < 3 && m < tree_top_rows && out_tree_top != nullptr &&
+  const bool want_top4 = (TopK == 0 && !want_top8 && !want_top6 && m < 3 && m < tree_top_rows && out_tree_top != nullptr &&
                           in_vals3 != nullptr && in_ids3 != nullptr &&
                           in_vals4 != nullptr && in_ids4 != nullptr);
-  const bool want_top2 = (!want_top8 && !want_top6 && !want_top4 &&
+  const bool want_top2 = (TopK == 0 && !want_top8 && !want_top6 && !want_top4 &&
                           ((m < top2_rows && out_top2 != nullptr) ||
                            (m < tree_top_rows && out_tree_top != nullptr)) &&
                           in_vals2 != nullptr && in_ids2 != nullptr);
   float bv = in_vals[m * kS2CTAsPerRow + lane];
   int bi = in_ids[m * kS2CTAsPerRow + lane];
-  float bv2 = (want_top8 || want_top6 || want_top4 || want_top2) ? in_vals2[m * kS2CTAsPerRow + lane] : -1e30f;
-  int bi2 = (want_top8 || want_top6 || want_top4 || want_top2) ? in_ids2[m * kS2CTAsPerRow + lane] : 0x7fffffff;
-  float bv3 = (want_top8 || want_top6 || want_top4) ? in_vals3[m * kS2CTAsPerRow + lane] : -1e30f;
-  int bi3 = (want_top8 || want_top6 || want_top4) ? in_ids3[m * kS2CTAsPerRow + lane] : 0x7fffffff;
-  float bv4 = (want_top8 || want_top6 || want_top4) ? in_vals4[m * kS2CTAsPerRow + lane] : -1e30f;
-  int bi4 = (want_top8 || want_top6 || want_top4) ? in_ids4[m * kS2CTAsPerRow + lane] : 0x7fffffff;
-  float bv5 = (want_top8 || want_top6) ? in_vals5[m * kS2CTAsPerRow + lane] : -1e30f;
-  int bi5 = (want_top8 || want_top6) ? in_ids5[m * kS2CTAsPerRow + lane] : 0x7fffffff;
-  float bv6 = (want_top8 || want_top6) ? in_vals6[m * kS2CTAsPerRow + lane] : -1e30f;
-  int bi6 = (want_top8 || want_top6) ? in_ids6[m * kS2CTAsPerRow + lane] : 0x7fffffff;
-  float bv7 = want_top8 ? in_vals7[m * kS2CTAsPerRow + lane] : -1e30f;
-  int bi7 = want_top8 ? in_ids7[m * kS2CTAsPerRow + lane] : 0x7fffffff;
-  float bv8 = want_top8 ? in_vals8[m * kS2CTAsPerRow + lane] : -1e30f;
-  int bi8 = want_top8 ? in_ids8[m * kS2CTAsPerRow + lane] : 0x7fffffff;
+  float bv2 = (TopK == 8 || TopK == 6 || want_top8 || want_top6 || want_top4 || want_top2) ? in_vals2[m * kS2CTAsPerRow + lane] : -1e30f;
+  int bi2 = (TopK == 8 || TopK == 6 || want_top8 || want_top6 || want_top4 || want_top2) ? in_ids2[m * kS2CTAsPerRow + lane] : 0x7fffffff;
+  float bv3 = (TopK == 8 || TopK == 6 || want_top8 || want_top6 || want_top4) ? in_vals3[m * kS2CTAsPerRow + lane] : -1e30f;
+  int bi3 = (TopK == 8 || TopK == 6 || want_top8 || want_top6 || want_top4) ? in_ids3[m * kS2CTAsPerRow + lane] : 0x7fffffff;
+  float bv4 = (TopK == 8 || TopK == 6 || want_top8 || want_top6 || want_top4) ? in_vals4[m * kS2CTAsPerRow + lane] : -1e30f;
+  int bi4 = (TopK == 8 || TopK == 6 || want_top8 || want_top6 || want_top4) ? in_ids4[m * kS2CTAsPerRow + lane] : 0x7fffffff;
+  float bv5 = (TopK == 8 || TopK == 6 || want_top8 || want_top6) ? in_vals5[m * kS2CTAsPerRow + lane] : -1e30f;
+  int bi5 = (TopK == 8 || TopK == 6 || want_top8 || want_top6) ? in_ids5[m * kS2CTAsPerRow + lane] : 0x7fffffff;
+  float bv6 = (TopK == 8 || TopK == 6 || want_top8 || want_top6) ? in_vals6[m * kS2CTAsPerRow + lane] : -1e30f;
+  int bi6 = (TopK == 8 || TopK == 6 || want_top8 || want_top6) ? in_ids6[m * kS2CTAsPerRow + lane] : 0x7fffffff;
+  float bv7 = (TopK == 8 || want_top8) ? in_vals7[m * kS2CTAsPerRow + lane] : -1e30f;
+  int bi7 = (TopK == 8 || want_top8) ? in_ids7[m * kS2CTAsPerRow + lane] : 0x7fffffff;
+  float bv8 = (TopK == 8 || want_top8) ? in_vals8[m * kS2CTAsPerRow + lane] : -1e30f;
+  int bi8 = (TopK == 8 || want_top8) ? in_ids8[m * kS2CTAsPerRow + lane] : 0x7fffffff;
 #pragma unroll
   for (int o = kS2CTAsPerRow / 2; o > 0; o >>= 1) {
-    const float ov = __shfl_xor_sync(0xffffu, bv, o);
-    const int oi = __shfl_xor_sync(0xffffu, bi, o);
-    if (want_top8) {
-      const float ov2 = __shfl_xor_sync(0xffffu, bv2, o);
-      const int oi2 = __shfl_xor_sync(0xffffu, bi2, o);
-      const float ov3 = __shfl_xor_sync(0xffffu, bv3, o);
-      const int oi3 = __shfl_xor_sync(0xffffu, bi3, o);
-      const float ov4 = __shfl_xor_sync(0xffffu, bv4, o);
-      const int oi4 = __shfl_xor_sync(0xffffu, bi4, o);
-      const float ov5 = __shfl_xor_sync(0xffffu, bv5, o);
-      const int oi5 = __shfl_xor_sync(0xffffu, bi5, o);
-      const float ov6 = __shfl_xor_sync(0xffffu, bv6, o);
-      const int oi6 = __shfl_xor_sync(0xffffu, bi6, o);
-      const float ov7 = __shfl_xor_sync(0xffffu, bv7, o);
-      const int oi7 = __shfl_xor_sync(0xffffu, bi7, o);
-      const float ov8 = __shfl_xor_sync(0xffffu, bv8, o);
-      const int oi8 = __shfl_xor_sync(0xffffu, bi8, o);
-      dvt_top8_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, bv5, bi5, bv6, bi6, bv7, bi7, bv8, bi8,
-                     ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6, ov7, oi7, ov8, oi8);
-    } else if (want_top6) {
-      const float ov2 = __shfl_xor_sync(0xffffu, bv2, o);
-      const int oi2 = __shfl_xor_sync(0xffffu, bi2, o);
-      const float ov3 = __shfl_xor_sync(0xffffu, bv3, o);
-      const int oi3 = __shfl_xor_sync(0xffffu, bi3, o);
-      const float ov4 = __shfl_xor_sync(0xffffu, bv4, o);
-      const int oi4 = __shfl_xor_sync(0xffffu, bi4, o);
-      const float ov5 = __shfl_xor_sync(0xffffu, bv5, o);
-      const int oi5 = __shfl_xor_sync(0xffffu, bi5, o);
-      const float ov6 = __shfl_xor_sync(0xffffu, bv6, o);
-      const int oi6 = __shfl_xor_sync(0xffffu, bi6, o);
-      dvt_top6_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, bv5, bi5, bv6, bi6,
-                     ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6);
-    } else if (want_top4) {
-      const float ov2 = __shfl_xor_sync(0xffffu, bv2, o);
-      const int oi2 = __shfl_xor_sync(0xffffu, bi2, o);
-      const float ov3 = __shfl_xor_sync(0xffffu, bv3, o);
-      const int oi3 = __shfl_xor_sync(0xffffu, bi3, o);
-      const float ov4 = __shfl_xor_sync(0xffffu, bv4, o);
-      const int oi4 = __shfl_xor_sync(0xffffu, bi4, o);
-      dvt_top4_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, ov, oi, ov2, oi2, ov3, oi3, ov4, oi4);
-    } else if (want_top2) {
-      const float ov2 = __shfl_xor_sync(0xffffu, bv2, o);
-      const int oi2 = __shfl_xor_sync(0xffffu, bi2, o);
-      if (ov >= bv2) {
-        dvt_top2_insert(bv, bi, bv2, bi2, ov, oi);
-        if (ov2 >= bv2) {
-          dvt_top2_insert(bv, bi, bv2, bi2, ov2, oi2);
-        }
+    if constexpr (TopK == 8) {
+      const float ov = __shfl_down_sync(0xffffu, bv, o);
+      const int oi = __shfl_down_sync(0xffffu, bi, o);
+      const float ov2 = __shfl_down_sync(0xffffu, bv2, o);
+      const int oi2 = __shfl_down_sync(0xffffu, bi2, o);
+      const float ov3 = __shfl_down_sync(0xffffu, bv3, o);
+      const int oi3 = __shfl_down_sync(0xffffu, bi3, o);
+      const float ov4 = __shfl_down_sync(0xffffu, bv4, o);
+      const int oi4 = __shfl_down_sync(0xffffu, bi4, o);
+      const float ov5 = __shfl_down_sync(0xffffu, bv5, o);
+      const int oi5 = __shfl_down_sync(0xffffu, bi5, o);
+      const float ov6 = __shfl_down_sync(0xffffu, bv6, o);
+      const int oi6 = __shfl_down_sync(0xffffu, bi6, o);
+      const float ov7 = __shfl_down_sync(0xffffu, bv7, o);
+      const int oi7 = __shfl_down_sync(0xffffu, bi7, o);
+      const float ov8 = __shfl_down_sync(0xffffu, bv8, o);
+      const int oi8 = __shfl_down_sync(0xffffu, bi8, o);
+      if (lane < o) {
+        dvt_top8_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, bv5, bi5, bv6, bi6, bv7, bi7, bv8, bi8,
+                       ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6, ov7, oi7, ov8, oi8);
       }
-    } else if (dvt_better(ov, oi, bv, bi)) {
-      bv = ov;
-      bi = oi;
+    } else if constexpr (TopK == 6) {
+      const float ov = __shfl_down_sync(0xffffu, bv, o);
+      const int oi = __shfl_down_sync(0xffffu, bi, o);
+      const float ov2 = __shfl_down_sync(0xffffu, bv2, o);
+      const int oi2 = __shfl_down_sync(0xffffu, bi2, o);
+      const float ov3 = __shfl_down_sync(0xffffu, bv3, o);
+      const int oi3 = __shfl_down_sync(0xffffu, bi3, o);
+      const float ov4 = __shfl_down_sync(0xffffu, bv4, o);
+      const int oi4 = __shfl_down_sync(0xffffu, bi4, o);
+      const float ov5 = __shfl_down_sync(0xffffu, bv5, o);
+      const int oi5 = __shfl_down_sync(0xffffu, bi5, o);
+      const float ov6 = __shfl_down_sync(0xffffu, bv6, o);
+      const int oi6 = __shfl_down_sync(0xffffu, bi6, o);
+      if (lane < o) {
+        dvt_top6_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, bv5, bi5, bv6, bi6,
+                       ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6);
+      }
+    } else {
+      const float ov = __shfl_xor_sync(0xffffu, bv, o);
+      const int oi = __shfl_xor_sync(0xffffu, bi, o);
+      if (want_top8) {
+        const float ov2 = __shfl_xor_sync(0xffffu, bv2, o);
+        const int oi2 = __shfl_xor_sync(0xffffu, bi2, o);
+        const float ov3 = __shfl_xor_sync(0xffffu, bv3, o);
+        const int oi3 = __shfl_xor_sync(0xffffu, bi3, o);
+        const float ov4 = __shfl_xor_sync(0xffffu, bv4, o);
+        const int oi4 = __shfl_xor_sync(0xffffu, bi4, o);
+        const float ov5 = __shfl_xor_sync(0xffffu, bv5, o);
+        const int oi5 = __shfl_xor_sync(0xffffu, bi5, o);
+        const float ov6 = __shfl_xor_sync(0xffffu, bv6, o);
+        const int oi6 = __shfl_xor_sync(0xffffu, bi6, o);
+        const float ov7 = __shfl_xor_sync(0xffffu, bv7, o);
+        const int oi7 = __shfl_xor_sync(0xffffu, bi7, o);
+        const float ov8 = __shfl_xor_sync(0xffffu, bv8, o);
+        const int oi8 = __shfl_xor_sync(0xffffu, bi8, o);
+        dvt_top8_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, bv5, bi5, bv6, bi6, bv7, bi7, bv8, bi8,
+                       ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6, ov7, oi7, ov8, oi8);
+      } else if (want_top6) {
+        const float ov2 = __shfl_xor_sync(0xffffu, bv2, o);
+        const int oi2 = __shfl_xor_sync(0xffffu, bi2, o);
+        const float ov3 = __shfl_xor_sync(0xffffu, bv3, o);
+        const int oi3 = __shfl_xor_sync(0xffffu, bi3, o);
+        const float ov4 = __shfl_xor_sync(0xffffu, bv4, o);
+        const int oi4 = __shfl_xor_sync(0xffffu, bi4, o);
+        const float ov5 = __shfl_xor_sync(0xffffu, bv5, o);
+        const int oi5 = __shfl_xor_sync(0xffffu, bi5, o);
+        const float ov6 = __shfl_xor_sync(0xffffu, bv6, o);
+        const int oi6 = __shfl_xor_sync(0xffffu, bi6, o);
+        dvt_top6_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, bv5, bi5, bv6, bi6,
+                       ov, oi, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6);
+      } else if (want_top4) {
+        const float ov2 = __shfl_xor_sync(0xffffu, bv2, o);
+        const int oi2 = __shfl_xor_sync(0xffffu, bi2, o);
+        const float ov3 = __shfl_xor_sync(0xffffu, bv3, o);
+        const int oi3 = __shfl_xor_sync(0xffffu, bi3, o);
+        const float ov4 = __shfl_xor_sync(0xffffu, bv4, o);
+        const int oi4 = __shfl_xor_sync(0xffffu, bi4, o);
+        dvt_top4_merge(bv, bi, bv2, bi2, bv3, bi3, bv4, bi4, ov, oi, ov2, oi2, ov3, oi3, ov4, oi4);
+      } else if (want_top2) {
+        const float ov2 = __shfl_xor_sync(0xffffu, bv2, o);
+        const int oi2 = __shfl_xor_sync(0xffffu, bi2, o);
+        if (ov >= bv2) {
+          dvt_top2_insert(bv, bi, bv2, bi2, ov, oi);
+          if (ov2 >= bv2) {
+            dvt_top2_insert(bv, bi, bv2, bi2, ov2, oi2);
+          }
+        }
+      } else if (dvt_better(ov, oi, bv, bi)) {
+        bv = ov;
+        bi = oi;
+      }
     }
   }
   if ((pdl_mode & 2) != 0) {
@@ -962,14 +1180,48 @@ __global__ void draft_vocab_final_reduce_kernel(
   }
   if (lane == 0) {
     out_tokens[m] = static_cast<int64_t>(bi);
-    if ((want_top8 || want_top6 || want_top4 || want_top2) && out_top2 != nullptr && m < top2_rows) {
+    if ((TopK == 8 || TopK == 6 || want_top8 || want_top6 || want_top4 || want_top2) && out_top2 != nullptr && m < top2_rows) {
       out_top2[2 * m + 0] = static_cast<int64_t>(bi);
       out_top2[2 * m + 1] = (bi2 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi2);
       if (out_margins != nullptr && m < margin_rows) {
         out_margins[m] = (bi2 == 0x7fffffff) ? 1e30f : (bv - bv2);
       }
     }
-    if (out_tree_top != nullptr && m < tree_top_rows) {
+    if constexpr (TopK == 8) {
+      out_tree_top[8 * m + 0] = static_cast<int64_t>(bi);
+      out_tree_top[8 * m + 1] = (bi2 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi2);
+      out_tree_top[8 * m + 2] = (bi3 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi3);
+      out_tree_top[8 * m + 3] = (bi4 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi4);
+      out_tree_top[8 * m + 4] = (bi5 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi5);
+      out_tree_top[8 * m + 5] = (bi6 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi6);
+      out_tree_top[8 * m + 6] = (bi7 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi7);
+      out_tree_top[8 * m + 7] = (bi8 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi8);
+      if (out_tree_vals != nullptr) {
+        out_tree_vals[8 * m + 0] = (bi == 0x7fffffff) ? -1e30f : bv;
+        out_tree_vals[8 * m + 1] = (bi2 == 0x7fffffff) ? -1e30f : bv2;
+        out_tree_vals[8 * m + 2] = (bi3 == 0x7fffffff) ? -1e30f : bv3;
+        out_tree_vals[8 * m + 3] = (bi4 == 0x7fffffff) ? -1e30f : bv4;
+        out_tree_vals[8 * m + 4] = (bi5 == 0x7fffffff) ? -1e30f : bv5;
+        out_tree_vals[8 * m + 5] = (bi6 == 0x7fffffff) ? -1e30f : bv6;
+        out_tree_vals[8 * m + 6] = (bi7 == 0x7fffffff) ? -1e30f : bv7;
+        out_tree_vals[8 * m + 7] = (bi8 == 0x7fffffff) ? -1e30f : bv8;
+      }
+    } else if constexpr (TopK == 6) {
+      out_tree_top[6 * m + 0] = static_cast<int64_t>(bi);
+      out_tree_top[6 * m + 1] = (bi2 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi2);
+      out_tree_top[6 * m + 2] = (bi3 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi3);
+      out_tree_top[6 * m + 3] = (bi4 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi4);
+      out_tree_top[6 * m + 4] = (bi5 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi5);
+      out_tree_top[6 * m + 5] = (bi6 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi6);
+      if (out_tree_vals != nullptr) {
+        out_tree_vals[6 * m + 0] = (bi == 0x7fffffff) ? -1e30f : bv;
+        out_tree_vals[6 * m + 1] = (bi2 == 0x7fffffff) ? -1e30f : bv2;
+        out_tree_vals[6 * m + 2] = (bi3 == 0x7fffffff) ? -1e30f : bv3;
+        out_tree_vals[6 * m + 3] = (bi4 == 0x7fffffff) ? -1e30f : bv4;
+        out_tree_vals[6 * m + 4] = (bi5 == 0x7fffffff) ? -1e30f : bv5;
+        out_tree_vals[6 * m + 5] = (bi6 == 0x7fffffff) ? -1e30f : bv6;
+      }
+    } else if (out_tree_top != nullptr && m < tree_top_rows) {
       if (tree_k >= 8) {
         out_tree_top[8 * m + 0] = static_cast<int64_t>(bi);
         out_tree_top[8 * m + 1] = (bi2 == 0x7fffffff) ? -1 : static_cast<int64_t>(bi2);
@@ -1225,50 +1477,64 @@ torch::Tensor draft_vocab_tail_argmax(
   int32_t* i8_ptr = (tree_top_ptr != nullptr && tree_k >= 8) ? sc.s2_ids8.data_ptr<int32_t>() : nullptr;
 
   const int pdl_mode = dvt_pdl_mode();
-  dvt_launch_pdl(
-      draft_vocab_tail_argmax_kernel, dim3(kS2CTAsPerRow, M), 256, st, pdl_mode,
-      reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(static_logits.data_ptr()),
-      vocab_map.data_ptr<int64_t>(),
-      tail_ids.data_ptr<int32_t>(),
-      tail_count.data_ptr<int32_t>(),
-      raw_w.data_ptr<uint8_t>(),
-      reinterpret_cast<const uint8_t*>(raw_s.data_ptr()),
-      global_scale.data_ptr<float>(),
-      sc.s2_vals.data_ptr<float>(),
-      sc.s2_ids.data_ptr<int32_t>(),
-      v2_ptr,
-      i2_ptr,
-      v3_ptr,
-      i3_ptr,
-      v4_ptr,
-      i4_ptr,
-      v5_ptr,
-      i5_ptr,
-      v6_ptr,
-      i6_ptr,
-      v7_ptr,
-      i7_ptr,
-      v8_ptr,
-      i8_ptr,
-      top2_max_rows,
-      tree_top_rows,
-      tree_k,
-      V_static, K, max_tail, static_cast<float>(logit_scale), pdl_mode);
+  const bool use_fast = dvt_fast_enabled();
+  const bool fast_top8 = (use_fast && tree_k == 8 && tree_top_rows >= M &&
+                          tree_top_ptr != nullptr && v8_ptr != nullptr && i8_ptr != nullptr);
+  const bool fast_top6 = (!fast_top8 && use_fast && tree_k == 6 && tree_top_rows >= M &&
+                          tree_top_ptr != nullptr && v6_ptr != nullptr && i6_ptr != nullptr);
+  auto launch_both = [&](auto stage1_kernel, auto stage2_kernel) {
+    dvt_launch_pdl(
+        stage1_kernel, dim3(kS2CTAsPerRow, M), 256, st, pdl_mode,
+        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(static_logits.data_ptr()),
+        vocab_map.data_ptr<int64_t>(),
+        tail_ids.data_ptr<int32_t>(),
+        tail_count.data_ptr<int32_t>(),
+        raw_w.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint8_t*>(raw_s.data_ptr()),
+        global_scale.data_ptr<float>(),
+        sc.s2_vals.data_ptr<float>(),
+        sc.s2_ids.data_ptr<int32_t>(),
+        v2_ptr,
+        i2_ptr,
+        v3_ptr,
+        i3_ptr,
+        v4_ptr,
+        i4_ptr,
+        v5_ptr,
+        i5_ptr,
+        v6_ptr,
+        i6_ptr,
+        v7_ptr,
+        i7_ptr,
+        v8_ptr,
+        i8_ptr,
+        top2_max_rows,
+        tree_top_rows,
+        tree_k,
+        V_static, K, max_tail, static_cast<float>(logit_scale), pdl_mode);
 
-  dvt_launch_pdl(
-      draft_vocab_final_reduce_kernel, dim3(M, 1, 1), 32, st, pdl_mode,
-      static_cast<const float*>(sc.s2_vals.data_ptr<float>()),
-      static_cast<const int32_t*>(sc.s2_ids.data_ptr<int32_t>()),
-      static_cast<const float*>(v2_ptr), static_cast<const int32_t*>(i2_ptr),
-      static_cast<const float*>(v3_ptr), static_cast<const int32_t*>(i3_ptr),
-      static_cast<const float*>(v4_ptr), static_cast<const int32_t*>(i4_ptr),
-      static_cast<const float*>(v5_ptr), static_cast<const int32_t*>(i5_ptr),
-      static_cast<const float*>(v6_ptr), static_cast<const int32_t*>(i6_ptr),
-      static_cast<const float*>(v7_ptr), static_cast<const int32_t*>(i7_ptr),
-      static_cast<const float*>(v8_ptr), static_cast<const int32_t*>(i8_ptr),
-      out.data_ptr<int64_t>(), top2_ptr, top2_rows,
-      margin_ptr, margin_rows, tree_top_ptr, tree_vals_ptr, tree_top_rows, tree_k, M, pdl_mode);
+    dvt_launch_pdl(
+        stage2_kernel, dim3(M, 1, 1), 32, st, pdl_mode,
+        static_cast<const float*>(sc.s2_vals.data_ptr<float>()),
+        static_cast<const int32_t*>(sc.s2_ids.data_ptr<int32_t>()),
+        static_cast<const float*>(v2_ptr), static_cast<const int32_t*>(i2_ptr),
+        static_cast<const float*>(v3_ptr), static_cast<const int32_t*>(i3_ptr),
+        static_cast<const float*>(v4_ptr), static_cast<const int32_t*>(i4_ptr),
+        static_cast<const float*>(v5_ptr), static_cast<const int32_t*>(i5_ptr),
+        static_cast<const float*>(v6_ptr), static_cast<const int32_t*>(i6_ptr),
+        static_cast<const float*>(v7_ptr), static_cast<const int32_t*>(i7_ptr),
+        static_cast<const float*>(v8_ptr), static_cast<const int32_t*>(i8_ptr),
+        out.data_ptr<int64_t>(), top2_ptr, top2_rows,
+        margin_ptr, margin_rows, tree_top_ptr, tree_vals_ptr, tree_top_rows, tree_k, M, pdl_mode);
+  };
+  if (fast_top8) {
+    launch_both(&draft_vocab_tail_argmax_kernel<8>, &draft_vocab_final_reduce_kernel<8>);
+  } else if (fast_top6) {
+    launch_both(&draft_vocab_tail_argmax_kernel<6>, &draft_vocab_final_reduce_kernel<6>);
+  } else {
+    launch_both(&draft_vocab_tail_argmax_kernel<0>, &draft_vocab_final_reduce_kernel<0>);
+  }
   return out;
 }
 

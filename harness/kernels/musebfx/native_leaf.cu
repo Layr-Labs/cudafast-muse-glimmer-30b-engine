@@ -42,7 +42,7 @@ __global__ void native_leaf_prepare_tree_kernel(
 // Post-miss: p_post(j,r) = exp(a_j + a2 + w_z0p*z0_c + c_r + beta_post*(z_r - z_0)) / (1 + sum_{r<6} exp(...))
 // L3+ after L2 sub hit resyncs with drafter top-1 (uses p1[j], empirical 63.3%); L1 also spawns d_{k+1}#2 via p2post (14.2%).
 __constant__ float kCalA[6] = {1.675690f, 1.258784f, 1.070196f, 1.171448f, 1.102070f, 0.731610f};
-__constant__ float kCalC[6] = {0.000000f, -0.402942f, -0.763639f, -0.817452f, -1.416669f, -1.642223f};
+__constant__ float kCalC[8] = {0.000000f, -0.402942f, -0.763639f, -0.817452f, -1.416669f, -1.642223f, -1.750000f, -1.900000f};
 #define CAL_A2 (-1.614419f)
 #define CAL_BETA 0.851144f
 #define CAL_BETA_POST 0.326972f
@@ -51,16 +51,17 @@ __constant__ float kCalC[6] = {0.000000f, -0.402942f, -0.763639f, -0.817452f, -1
 #define CAL_W_Z0_POST 0.178773f
 #define CAL_SHIFT 0.0349f
 
-// Arbitrary-depth (1..6-level) dynamic multi-leaf tree setup (rows 7..tree_m-1), launched as 1 warp (<<<1, 32>>>, <2 us):
-//   - Bit-packed remap inside int32[49] (1 + 16*3):
+// Arbitrary-depth (1..6-level) dynamic multi-leaf tree setup (rows 7..tree_m-1, tree_m <= 32), launched as 1 warp (<<<1, 32>>>, <3 us):
+//   - Bit-packed remap inside int32[97] (1 + 32*3):
 //       leaf_flag[1 + 3*r + 0] = seq_sub  (seqlen_k_eff = seqlen_k - seq_sub)
 //       leaf_flag[1 + 3*r + 1] = base_sub (-1 for causal rows; else tree_m - k0 of root ancestor)
-//       leaf_flag[1 + 3*r + 2] = remap_packed (nibble j = physical row r_j in 0..15 for tok = p + k0 + j, j=0..5)
-//   - dynamic_mode==1 (default, tree_vals!=null, tree_k>=6): greedy EV allocator across 30 1-level candidates
+//       leaf_flag[1 + 3*r + 2] = remap_packed (5-bit slot j = physical row r_j in 0..31 for tok = p + k0 + j, j=0..5)
+//   - dynamic_mode==1 (default, tree_vals!=null, tree_k>=6): greedy EV allocator across 1-level candidates
 //     plus dynamically spawned arbitrary-depth (2..max_depth <= 6) zero-extra-drafter children:
 //       - Substitution continuation (`sub`, kind=1): aligned d_{k+1}#1 -> d_{k+2}#1 -> ... -> d_6#1
 //       - Shift recovery (`shf`, kind=2): off-by-1 d_k#1 -> d_{k+1}#1 -> ... -> d_5#1
-//     Setting max_depth=1 reproduces pure 1-level Wave 15 identically.
+//       - Post-miss top-2 (`alt2`, kind=3) and for tree_m > 16 also top-8 L1 + `alt3` (kind=4) + L2 `alt2`.
+//     When tree_m <= 16, uses exact top-6 (eff_k=6, non-rich) preserving bit-identical Wave 34/37 M=16 behavior.
 //   - selftest_mode!=0: places a full deep chain (6-level on M=16, 5-level on M=12) mirroring d1..d6.
 __global__ void native_leaf_setup_tree_kernel(
     int32_t* __restrict__ leaf_flag,
@@ -119,29 +120,29 @@ __global__ void native_leaf_setup_tree_kernel(
     if (tid == 0) {
       constexpr int kLeafK[9] = {1, 1, 2, 2, 3, 1, 3, 4, 5};
       constexpr int kLeafRank[9] = {1, 2, 1, 2, 1, 3, 2, 1, 1};
-      int row_base_sub[16];
-      int row_depth[16];
-      uint32_t row_packed[16];
+      int row_base_sub[32];
+      int row_depth[32];
+      uint32_t row_packed[32];
       bool any_active = false;
       for (int li = 0; li < num_leaves; ++li) {
         const int r = 7 + li;
-        int k = kLeafK[li];
+        int k = (li < 9) ? kLeafK[li] : 1;
         int par = -1;
         int64_t cand = -1;
         bool valid = false;
         if (!high_acc) {
           if (selftest_mode != 0) {
-            // Deep chain selftest: rows 7..12 mirror d1..d6 (depth 1..6), rows 13..15 mirror d1..d3 (depth 1).
+            // Deep chain selftest: rows 7..12 mirror d1..d6 (depth 1..6), rows 13..tree_m-1 mirror d1..d6 (depth 1).
             if (li < 6) {
               k = li + 1;
               par = (li == 0) ? -1 : (r - 1);
             } else {
-              k = (li - 6) + 1;
+              k = ((li - 6) % 6) + 1;
               par = -1;
             }
             cand = static_cast<int64_t>(input_ids[k]);
             valid = true;
-          } else {
+          } else if (li < 9) {
             const int rank = kLeafRank[li];
             const int64_t dk = static_cast<int64_t>(input_ids[k]);
             const int64_t top1 = tree_top[(k - 1) * tree_k + 0];
@@ -157,11 +158,11 @@ __global__ void native_leaf_setup_tree_kernel(
           if (par < 0) {
             b_sub = tree_m - k;
             dp = 1;
-            pkd = static_cast<uint32_t>(r) & 0xFu;
+            pkd = static_cast<uint32_t>(r) & 0x1Fu;
           } else {
             b_sub = row_base_sub[par];
             dp = row_depth[par] + 1;
-            pkd = row_packed[par] | ((static_cast<uint32_t>(r) & 0xFu) << (4 * (dp - 1)));
+            pkd = row_packed[par] | ((static_cast<uint32_t>(r) & 0x1Fu) << (5 * (dp - 1)));
           }
           row_base_sub[r] = b_sub;
           row_depth[r] = dp;
@@ -196,29 +197,34 @@ __global__ void native_leaf_setup_tree_kernel(
     return;
   }
 
-  // Dynamic per-step GPU arbitrary-depth (1..6-level) tree allocator (1 warp, up to 64 candidates).
+  // Dynamic per-step GPU arbitrary-depth (1..6-level) tree allocator (1 warp, up to 128 candidates).
+  const bool wide_rich = (tree_m > 16);
+  const int eff_k = (wide_rich && tree_k >= 8) ? 8 : 6;
+  const int init_cands = 6 * (eff_k - 1);
+
   __shared__ float s_Z[6];
   __shared__ float s_A[6];
   __shared__ float s_p1[6];
   __shared__ float s_p1post[6];
   __shared__ float s_p2post[6];
-  __shared__ float s_pr[6][6];
+  __shared__ float s_p3post[6];
+  __shared__ float s_pr[6][8];
   __shared__ float s_z0[6];
   __shared__ float s_margin[6];
   __shared__ int64_t s_dk[6];
   __shared__ uint8_t s_valid_row[6];
   __shared__ int s_any_active;
 
-  __shared__ float s_cand_score[64];
-  __shared__ int64_t s_cand_tok[64];
-  __shared__ int8_t s_cand_k[64];
-  __shared__ int8_t s_cand_par[64];
-  __shared__ int8_t s_cand_depth[64];
-  __shared__ int8_t s_cand_kind[64];  // 0=1-level, 1=sub-continuation, 2=shift-continuation, 3=alt2-continuation
+  __shared__ float s_cand_score[128];
+  __shared__ int64_t s_cand_tok[128];
+  __shared__ int8_t s_cand_k[128];
+  __shared__ int8_t s_cand_par[128];
+  __shared__ int8_t s_cand_depth[128];
+  __shared__ int8_t s_cand_kind[128];  // 0=1-level, 1=sub, 2=shf, 3=alt2, 4=alt3
   __shared__ int s_num_cands;
 
-  __shared__ int s_row_base_sub[16];
-  __shared__ uint32_t s_row_packed[16];
+  __shared__ int s_row_base_sub[32];
+  __shared__ uint32_t s_row_packed[32];
 
   // Pass 1: validate rows & gather per-position top-1 margin z0 - z1 for step-level difficulty context.
   if (tid < 6) {
@@ -252,10 +258,9 @@ __global__ void native_leaf_setup_tree_kernel(
         if (z0_c > 6.0f) z0_c = 6.0f;
         const float a_pre = kCalA[tid] + CAL_W_SM_PRE * sm_c + CAL_W_Z0_PRE * z0_c;
         const float a_post = kCalA[tid] + CAL_A2 + CAL_W_Z0_POST * z0_c;
-        float e0[6], e1[6];
+        float e0[8], e1[8];
         float den0 = 1.0f, den1 = 1.0f;
-#pragma unroll
-        for (int rk = 0; rk < 6; ++rk) {
+        for (int rk = 0; rk < eff_k; ++rk) {
           const int64_t tok_r = tree_top[base + rk];
           const float zr = tree_vals[base + rk];
           if (rk == 0 || (tok_r >= 0 && zr > -1e20f)) {
@@ -271,19 +276,18 @@ __global__ void native_leaf_setup_tree_kernel(
           den0 += e0[rk];
           den1 += e1[rk];
         }
-#pragma unroll
-        for (int rk = 0; rk < 6; ++rk) {
+        for (int rk = 0; rk < eff_k; ++rk) {
           s_pr[tid][rk] = e0[rk] / den0;
         }
         s_p1post[tid] = e1[0] / den1;
         s_p2post[tid] = e1[1] / den1;
+        s_p3post[tid] = e1[2] / den1;
         s_Z[tid] = den0;
         s_p1[tid] = s_pr[tid][0];
       } else {
         float sum_e = 1.0f;
         float last_e = 0.0f;
-#pragma unroll
-        for (int rk = 1; rk < 6; ++rk) {
+        for (int rk = 1; rk < eff_k; ++rk) {
           const int64_t tok_r = tree_top[base + rk];
           const float zr = tree_vals[base + rk];
           if (tok_r >= 0 && zr > -1e20f) {
@@ -298,12 +302,14 @@ __global__ void native_leaf_setup_tree_kernel(
         s_p1[tid] = (p1 < 1.0f) ? p1 : 1.0f;
         s_p1post[tid] = 0.0f;
         s_p2post[tid] = 0.0f;
+        s_p3post[tid] = 0.0f;
       }
     } else {
       s_Z[tid] = 1e30f;
       s_p1[tid] = 0.0f;
       s_p1post[tid] = 0.0f;
       s_p2post[tid] = 0.0f;
+      s_p3post[tid] = 0.0f;
     }
   }
   __syncwarp();
@@ -319,16 +325,19 @@ __global__ void native_leaf_setup_tree_kernel(
       }
     }
     s_any_active = 0;
-    s_num_cands = 30;
+    s_num_cands = init_cands;
   }
   __syncwarp();
 
-  // Initialize 30 1-level candidates in slots 0..29, clear slots 30..63.
+  // Initialize 1-level candidates in slots 0..init_cands-1 (30 for K=6, 42 for K=8), clear all 128 slots.
   s_cand_score[tid] = -1.0f;
   s_cand_score[tid + 32] = -1.0f;
-  if (tid < 30) {
-    const int row_idx = tid / 5;                  // 0..5 -> depth k = row_idx + 1
-    const int rank = 1 + (tid - row_idx * 5);     // 1..5 -> candidate rank #2..#6
+  s_cand_score[tid + 64] = -1.0f;
+  s_cand_score[tid + 96] = -1.0f;
+  const int cands_per_row = eff_k - 1;
+  for (int cid = tid; cid < init_cands; cid += 32) {
+    const int row_idx = cid / cands_per_row;                  // 0..5 -> depth k = row_idx + 1
+    const int rank = 1 + (cid - row_idx * cands_per_row);     // 1..eff_k-1 -> candidate rank #2..#eff_k
     if (s_valid_row[row_idx] && s_A[row_idx] > 0.0f) {
       const int base = row_idx * tree_k;
       const int64_t cand = tree_top[base + rank];
@@ -347,12 +356,12 @@ __global__ void native_leaf_setup_tree_kernel(
         const float pr = (calib_mode != 0)
             ? s_pr[row_idx][rank]
             : (eff_gamma * __expf((zr - s_z0[row_idx]) * inv_temp) / s_Z[row_idx]);
-        s_cand_score[tid] = s_A[row_idx] * pr;
-        s_cand_tok[tid] = cand;
-        s_cand_k[tid] = static_cast<int8_t>(row_idx + 1);
-        s_cand_par[tid] = -1;
-        s_cand_depth[tid] = 1;
-        s_cand_kind[tid] = 0;
+        s_cand_score[cid] = s_A[row_idx] * pr;
+        s_cand_tok[cid] = cand;
+        s_cand_k[cid] = static_cast<int8_t>(row_idx + 1);
+        s_cand_par[cid] = -1;
+        s_cand_depth[cid] = 1;
+        s_cand_kind[cid] = 0;
       }
     }
   }
@@ -361,14 +370,17 @@ __global__ void native_leaf_setup_tree_kernel(
   for (int li = 0; li < num_leaves; ++li) {
     const int r = 7 + li;
     const int nc = s_num_cands;
-    float best_s = (tid < nc) ? s_cand_score[tid] : -1.0f;
+    float best_s = -1.0f;
     int best_idx = tid;
-    const int idx2 = tid + 32;
-    if (idx2 < nc) {
-      const float s2 = s_cand_score[idx2];
-      if (s2 > best_s) {
-        best_s = s2;
-        best_idx = idx2;
+#pragma unroll
+    for (int off = 0; off < 128; off += 32) {
+      const int idx = tid + off;
+      if (idx < nc) {
+        const float sv = s_cand_score[idx];
+        if (sv > best_s || (sv == best_s && idx < best_idx)) {
+          best_s = sv;
+          best_idx = idx;
+        }
       }
     }
 #pragma unroll
@@ -393,10 +405,10 @@ __global__ void native_leaf_setup_tree_kernel(
         uint32_t pkd = 0u;
         if (par < 0) {
           b_sub = tree_m - k_r;
-          pkd = static_cast<uint32_t>(r) & 0xFu;
+          pkd = static_cast<uint32_t>(r) & 0x1Fu;
         } else {
           b_sub = s_row_base_sub[par];
-          pkd = s_row_packed[par] | ((static_cast<uint32_t>(r) & 0xFu) << (4 * (dp - 1)));
+          pkd = s_row_packed[par] | ((static_cast<uint32_t>(r) & 0x1Fu) << (5 * (dp - 1)));
         }
         s_row_base_sub[r] = b_sub;
         s_row_packed[r] = pkd;
@@ -418,9 +430,10 @@ __global__ void native_leaf_setup_tree_kernel(
           const int k_child = k_r + 1;
           int64_t sub_tok_spawned = -1;
           int64_t alt2_tok_spawned = -1;
+          int64_t alt3_tok_spawned = -1;
           // 1) Aligned substitution continuation (`sub`, kind=1): d_{k_r+1}#1 = s_dk[k_r].
           //    After L2 sub hit (kind==1), context has resynced with drafter top-1 -> use s_p1[k_r] (empirical 63.3%).
-          if ((kind == 0 || kind == 1 || kind == 3) && s_valid_row[k_r] && s_num_cands < 64) {
+          if ((kind == 0 || kind == 1 || kind == 3 || kind == 4) && s_valid_row[k_r] && s_num_cands < 128) {
             const float p_cont = (kind == 1) ? s_p1[k_r] : s_p1post[k_r];
             const float child_s = (calib_mode != 0)
                 ? (best_s * p_cont)
@@ -438,7 +451,9 @@ __global__ void native_leaf_setup_tree_kernel(
             }
           }
           // 2) Post-miss top-2 continuation (`alt2`, kind=3): d_{k_r+1}#2 = tree_top[k_r*tree_k + 1] (empirical 14.2%).
-          if (calib_mode != 0 && kind == 0 && s_valid_row[k_r] && s_num_cands < 64) {
+          //    In wide_rich mode (tree_m > 16), also allow L2 alt2 branching from kind==1 or kind==3.
+          if (calib_mode != 0 && (kind == 0 || (wide_rich && (kind == 1 || kind == 3))) &&
+              s_valid_row[k_r] && s_num_cands < 128) {
             const int64_t alt2_tok = tree_top[k_r * tree_k + 1];
             if (alt2_tok >= 0 && alt2_tok != sub_tok_spawned) {
               const float child_s = best_s * s_p2post[k_r];
@@ -454,10 +469,30 @@ __global__ void native_leaf_setup_tree_kernel(
               }
             }
           }
-          // 3) Off-by-1 shift recovery (`shf`, kind=2): d_{k_r}#1 = s_dk[k_r - 1].
-          if ((kind == 0 || kind == 2) && s_valid_row[k_r - 1] && s_num_cands < 64) {
+          // 3) Post-miss top-3 continuation (`alt3`, kind=4, wide_rich tree_m > 16 only; includes L3 after sub/alt2).
+          if (wide_rich && calib_mode != 0 && (kind == 0 || kind == 1 || kind == 3) &&
+              s_valid_row[k_r] && s_num_cands < 128) {
+            const int64_t alt3_tok = tree_top[k_r * tree_k + 2];
+            if (alt3_tok >= 0 && alt3_tok != sub_tok_spawned && alt3_tok != alt2_tok_spawned) {
+              const float child_s = best_s * s_p3post[k_r];
+              if (child_s > 0.0f) {
+                const int slot = s_num_cands++;
+                s_cand_score[slot] = child_s;
+                s_cand_tok[slot] = alt3_tok;
+                s_cand_k[slot] = static_cast<int8_t>(k_child);
+                s_cand_par[slot] = static_cast<int8_t>(r);
+                s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
+                s_cand_kind[slot] = 4;
+                alt3_tok_spawned = alt3_tok;
+              }
+            }
+          }
+          // 4) Off-by-1 shift recovery (`shf`, kind=2): d_{k_r}#1 = s_dk[k_r - 1].
+          //    Skipped in wide_rich (0/196 empirical hits when top-8 + alt2/alt3 are active; M=16 unchanged).
+          if (!wide_rich && (kind == 0 || kind == 2) && s_valid_row[k_r - 1] && s_num_cands < 128) {
             const int64_t shf_tok = s_dk[k_r - 1];
-            if (shf_tok >= 0 && shf_tok != sub_tok_spawned && shf_tok != alt2_tok_spawned) {
+            if (shf_tok >= 0 && shf_tok != sub_tok_spawned && shf_tok != alt2_tok_spawned &&
+                shf_tok != alt3_tok_spawned) {
               const float child_s = (calib_mode != 0)
                   ? ((kind == 0) ? (best_s * CAL_SHIFT) : (best_s * s_p1[k_r - 1]))
                   : ((kind == 0) ? (best_s * shf_coef) : (best_s * cont_decay * s_p1[k_r - 1]));
@@ -900,7 +935,7 @@ void native_leaf_prepare_tree(
     torch::Tensor positions,
     torch::Tensor seq_lens,
     int64_t tree_m) {
-  TORCH_CHECK(tree_m >= 8 && tree_m <= 16, "tree_m must be in 8..16");
+  TORCH_CHECK(tree_m >= 8 && tree_m <= 32, "tree_m must be in 8..32");
   TORCH_CHECK(positions.is_cuda() && positions.scalar_type() == torch::kInt64 && positions.numel() >= tree_m);
   TORCH_CHECK(seq_lens.is_cuda() && seq_lens.scalar_type() == torch::kInt32 && seq_lens.numel() >= 1);
   auto st = c10::cuda::getCurrentCUDAStream().stream();
@@ -930,7 +965,7 @@ void native_leaf_setup_tree(
     double sub_coef,
     double shf_coef,
     double cont_decay) {
-  TORCH_CHECK(tree_m >= 8 && tree_m <= 16, "tree_m must be in 8..16");
+  TORCH_CHECK(tree_m >= 8 && tree_m <= 32, "tree_m must be in 8..32");
   TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32 && leaf_flag.numel() >= 1 + tree_m * 3);
   TORCH_CHECK(tree_top.is_cuda() && tree_top.scalar_type() == torch::kInt64 && tree_top.numel() >= 20);
   TORCH_CHECK(input_ids.is_cuda() && input_ids.scalar_type() == torch::kInt32 && input_ids.numel() >= tree_m);
@@ -939,14 +974,14 @@ void native_leaf_setup_tree(
               saved_leaf_toks.numel() >= tree_m);
   TORCH_CHECK(saved_leaf_k.is_cuda() && saved_leaf_k.scalar_type() == torch::kInt32 &&
               saved_leaf_k.numel() >= tree_m);
-  const int tree_k = (tree_top.numel() >= 36) ? 6 : 4;
+  const int tree_k = (tree_top.numel() >= 48) ? 8 : ((tree_top.numel() >= 36) ? 6 : 4);
   const int32_t* acc_ptr = nullptr;
   if (req_acc_state.has_value() && req_acc_state.value().defined() && req_acc_state.value().numel() >= 3) {
     TORCH_CHECK(req_acc_state.value().is_cuda() && req_acc_state.value().scalar_type() == torch::kInt32);
     acc_ptr = req_acc_state.value().data_ptr<int32_t>();
   }
   const float* vals_ptr = nullptr;
-  if (tree_vals.has_value() && tree_vals.value().defined() && tree_vals.value().numel() >= 36) {
+  if (tree_vals.has_value() && tree_vals.value().defined() && tree_vals.value().numel() >= 6 * tree_k) {
     TORCH_CHECK(tree_vals.value().is_cuda() && tree_vals.value().scalar_type() == torch::kFloat32);
     vals_ptr = tree_vals.value().data_ptr<float>();
   }
@@ -1013,7 +1048,7 @@ void native_leaf_commit_tree(
     bool no_hit_mode,
     c10::optional<torch::Tensor> req_acc_state,
     c10::optional<torch::Tensor> saved_leaf_parent) {
-  TORCH_CHECK(tree_m >= 8 && tree_m <= 16, "tree_m must be in 8..16");
+  TORCH_CHECK(tree_m >= 8 && tree_m <= 32, "tree_m must be in 8..32");
   TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32);
   TORCH_CHECK(prev_ns.is_cuda() && prev_ns.scalar_type() == torch::kInt32);
   TORCH_CHECK(hit_flag.is_cuda() && hit_flag.scalar_type() == torch::kInt32 && hit_flag.numel() >= 1);

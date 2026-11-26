@@ -1458,10 +1458,17 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
             draft_head.org_vocab_size = len(draft_ids)
             self.kernel.process_weights_after_loading(draft_head)
 
-            # Quick 6-spare read-only-flush GB10 DRAM placement for draft_head._marlin_decode_weight.
+            want_fast_dhead = (
+                want_tail
+                and os.environ.get("MUSE_DHEAD_FAST", "1") != "0"
+            )
+
+            # Quick 6-spare read-only-flush GB10 DRAM placement for draft_head._marlin_decode_weight
+            # (skip when fast 2-stage compressed draft head is enabled, since we place its blob instead).
             dec_w = getattr(draft_head, "_marlin_decode_weight", None)
             if (
                 dec_w is not None
+                and not want_fast_dhead
                 and os.environ.get("MUSE_DRAFT_VOCAB_PLACE", "1") != "0"
             ):
                 try:
@@ -1572,6 +1579,177 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                                 len(draft_ids),
                                 max_err,
                             )
+
+                            # Fast 2-stage compressed draft head (Stage 1: 1.625-bit ternary or 2-bit odd
+                            # MMA + fused in-CTA shortlist; Stage 2: exact NVFP4 rescore + prompt tail).
+                            draft_head.fast_dhead_admitted = False
+                            if (
+                                want_fast_dhead
+                                and hasattr(_bfx, "dhead_fast_pack")
+                                and hasattr(_bfx, "dhead_fast_argmax")
+                            ):
+                                try:
+                                    dh_bits = int(os.environ.get("MUSE_DHEAD_BITS", "158"))
+                                    if dh_bits not in (158, 2):
+                                        raise ValueError(f"unsupported MUSE_DHEAD_BITS={dh_bits}")
+                                    default_topk = 192 if dh_bits == 158 else 128
+                                    dh_topk = int(os.environ.get("MUSE_DHEAD_TOPK", str(default_topk)))
+                                    dh_topk = max(16, min(256, dh_topk))
+
+                                    dh_blob, dh_rscales, dh_cscales, dh_toks = _bfx.dhead_fast_pack(
+                                        raw_w_full, raw_s_full, raw_gs_full, ids, dh_bits
+                                    )
+                                    torch.cuda.synchronize(dev)
+
+                                    # Quick 6-spare GB10 DRAM placement for compressed Stage-1 blob.
+                                    best_lat_ms = 0.0
+                                    if os.environ.get("MUSE_DRAFT_VOCAB_PLACE", "1") != "0":
+                                        try:
+                                            spares = [torch.empty_like(dh_blob) for _ in range(6)]
+                                            for sp in spares:
+                                                sp.copy_(dh_blob)
+                                            evict = torch.ones((48 << 20) // 4, dtype=torch.float32, device=dev)
+                                            cands = [dh_blob, *spares]
+                                            _ = evict.sum()
+                                            _ = _bfx.dhead_fast_argmax(
+                                                x_chk, dh_blob, dh_rscales, dh_cscales, dh_toks,
+                                                tail_ids, tail_count, raw_w_full, raw_s_full, raw_gs_full,
+                                                1.0, dh_bits, dh_topk,
+                                            )
+                                            torch.cuda.synchronize(dev)
+                                            samples_dh: list[list[float]] = [[] for _ in cands]
+                                            for _ in range(5):
+                                                for ci, buf in enumerate(cands):
+                                                    _ = evict.sum()
+                                                    se = torch.cuda.Event(enable_timing=True)
+                                                    ee = torch.cuda.Event(enable_timing=True)
+                                                    se.record()
+                                                    _ = _bfx.dhead_fast_argmax(
+                                                        x_chk, buf, dh_rscales, dh_cscales, dh_toks,
+                                                        tail_ids, tail_count, raw_w_full, raw_s_full, raw_gs_full,
+                                                        1.0, dh_bits, dh_topk,
+                                                    )
+                                                    ee.record()
+                                                    torch.cuda.synchronize(dev)
+                                                    samples_dh[ci].append(se.elapsed_time(ee))
+                                            times_dh = [median(s) for s in samples_dh]
+                                            best_i = min(range(len(cands)), key=times_dh.__getitem__)
+                                            best_lat_ms = times_dh[best_i]
+                                            if best_i > 0 and times_dh[0] - times_dh[best_i] >= 0.005:
+                                                dh_blob = cands[best_i]
+                                                logger.info(
+                                                    "Fast draft head DRAM placement: saved %.3f ms (%.3f -> %.3f ms)",
+                                                    times_dh[0] - times_dh[best_i],
+                                                    times_dh[0],
+                                                    times_dh[best_i],
+                                                )
+                                            del spares, cands, evict
+                                            torch.cuda.empty_cache()
+                                        except Exception as exc_pl:  # noqa: BLE001
+                                            logger.warning("Fast draft head DRAM placement skipped (%s)", exc_pl)
+
+                                    # Load-time self-check: verify exact Stage-2 rescore parity + recall on
+                                    # realistic peaked probes (true lm_head directions + noise) AND warmup
+                                    # static scratch outside CUDA graph capture.
+                                    probe_n = 6
+                                    probe_pos = torch.tensor(
+                                        [0, 17, 1024, 16384, 49152, len(draft_ids) - 1],
+                                        dtype=torch.long,
+                                        device=dev,
+                                    )
+                                    probe_orig = ids.index_select(0, probe_pos)
+                                    # Decode 6 target rows by scoring against identity? Even simpler:
+                                    # decode from raw_w_full/raw_s_full directly in FP32 on GPU.
+                                    pw = raw_w_full.index_select(0, probe_orig)  # [6, K/2] uint8
+                                    ps = raw_s_full.index_select(0, probe_orig).view(torch.float8_e4m3fn).float()
+                                    e2m1_lut = torch.tensor(
+                                        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                                         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+                                        dtype=torch.float32,
+                                        device=dev,
+                                    )
+                                    lo_v = e2m1_lut[(pw & 0xF).long()]
+                                    hi_v = e2m1_lut[(pw >> 4).long()]
+                                    pw_f = torch.stack((lo_v, hi_v), dim=-1).reshape(probe_n, k_dim // 16, 16)
+                                    pw_f = (pw_f * ps.unsqueeze(-1) * raw_gs_full.float()).reshape(probe_n, k_dim)
+                                    # Realistic peaked hidden state (signal + noise -> z_1 ~ 6.5 sigma)
+                                    x_peak = (
+                                        pw_f / pw_f.norm(dim=-1, keepdim=True).clamp_min(1e-6) * 1.15
+                                        + torch.randn((probe_n, k_dim), generator=gen, device=dev) * (1.0 / (k_dim ** 0.5)) * 10.0
+                                    ).to(torch.bfloat16).contiguous()
+
+                                    ref_peak_logits = self.apply(draft_head, x_peak)
+                                    ref_peak_top8 = torch.empty((probe_n * 8,), dtype=torch.int64, device=dev)
+                                    ref_peak_vals = torch.empty((probe_n * 8,), dtype=torch.float32, device=dev)
+                                    ref_peak_arg = _bfx.draft_vocab_tail_argmax(
+                                        x_peak, ref_peak_logits.contiguous(), ids,
+                                        tail_ids, tail_count, raw_w_full, raw_s_full, raw_gs_full, 1.0,
+                                        None, None, ref_peak_top8, ref_peak_vals,
+                                    )
+                                    got_peak_top8 = torch.empty((probe_n * 8,), dtype=torch.int64, device=dev)
+                                    got_peak_vals = torch.empty((probe_n * 8,), dtype=torch.float32, device=dev)
+                                    got_peak_top2 = torch.empty((4,), dtype=torch.int64, device=dev)
+                                    got_peak_marg = torch.empty((2,), dtype=torch.float32, device=dev)
+                                    got_peak_arg = _bfx.dhead_fast_argmax(
+                                        x_peak, dh_blob, dh_rscales, dh_cscales, dh_toks,
+                                        tail_ids, tail_count, raw_w_full, raw_s_full, raw_gs_full, 1.0,
+                                        dh_bits, dh_topk, got_peak_top2, got_peak_marg,
+                                        got_peak_top8, got_peak_vals,
+                                    )
+                                    torch.cuda.synchronize(dev)
+
+                                    top1_hits = int((got_peak_arg == ref_peak_arg).sum().item())
+                                    # Exact NVFP4 rescore parity on returned top-8 token IDs.
+                                    valid_mask = got_peak_top8 >= 0
+                                    rescore_err = 0.0
+                                    if valid_mask.any().item():
+                                        chk_rows = got_peak_top8[:8].to(torch.int32).contiguous()
+                                        chk_exact = _bfx.draft_vocab_score_rows(
+                                            x_peak[:1].contiguous(), chk_rows,
+                                            raw_w_full, raw_s_full, raw_gs_full, 1.0,
+                                        ).reshape(-1)
+                                        rescore_err = (got_peak_vals[:8] - chk_exact).abs().max().item()
+                                    finite_ok = (
+                                        torch.isfinite(got_peak_vals).all().item()
+                                        and torch.isfinite(got_peak_marg).all().item()
+                                        and int((got_peak_arg >= 0).all().item()) == 1
+                                        and int((got_peak_arg < vocab_n).all().item()) == 1
+                                    )
+                                    if finite_ok and top1_hits == probe_n and rescore_err <= 1e-4:
+                                        draft_head.register_buffer("fast_dhead_blob", dh_blob, persistent=False)
+                                        draft_head.register_buffer("fast_dhead_row_scales", dh_rscales, persistent=False)
+                                        draft_head.register_buffer("fast_dhead_col_scales", dh_cscales, persistent=False)
+                                        draft_head.register_buffer("fast_dhead_tok_ids", dh_toks, persistent=False)
+                                        draft_head.fast_dhead_mode = dh_bits
+                                        draft_head.fast_dhead_topk = dh_topk
+                                        draft_head.fast_dhead_admitted = True
+                                        bpw = 1.625 if dh_bits == 158 else 2.000
+                                        logger.info(
+                                            "Fast 2-stage draft head admitted (mode=%d, bpw=%.3f, blob=%.1f MB, "
+                                            "topk=%d, peaked_top1=%d/%d, rescore_err=%.6f, lat=%.3f ms)",
+                                            dh_bits,
+                                            bpw,
+                                            dh_blob.numel() / (1024.0 * 1024.0),
+                                            dh_topk,
+                                            top1_hits,
+                                            probe_n,
+                                            rescore_err,
+                                            best_lat_ms,
+                                        )
+                                    else:
+                                        logger.warning(
+                                            "Fast 2-stage draft head self-check failed (finite=%s, top1=%d/%d, "
+                                            "rescore_err=%.6f); falling back to NVFP4 draft_head",
+                                            finite_ok,
+                                            top1_hits,
+                                            probe_n,
+                                            rescore_err,
+                                        )
+                                except Exception as exc_dh:  # noqa: BLE001
+                                    logger.warning(
+                                        "Fast 2-stage draft head skipped (%s); falling back to NVFP4 draft_head",
+                                        exc_dh,
+                                    )
                         else:
                             logger.warning(
                                 "Draft vocab dynamic prompt tail parity failed (err=%.5f > %.5f); static-only",

@@ -27,6 +27,38 @@ constexpr int kTileBytes = 224;                  // 14 * 16
 constexpr int kStepWBytes = kNTilesPerCTA * kTileBytes;  // 1792 = 112 * 16
 constexpr int kStepWU4 = kStepWBytes / 16;       // 112
 constexpr int kStages = 5;                       // 18.75 KiB SMEM (M<=16) -> 4 CTAs/SM (192 CTAs)
+constexpr int kWaveCTAs = 192;                   // 4 CTAs/SM * 48 SMs on GB10
+
+// Exact bijection [cta_n, kg] -> [wave(192), kg, slot_in_wave] so all concurrent CTAs in a wave
+// sweep linearly through contiguous DRAM slabs (344 KiB/step for 192 CTAs) with zero wasted bytes.
+__device__ __host__ __forceinline__ size_t int3_wave_step_idx(
+    int cta_n, int kg, int n_blocks, int num_kg) {
+  const int wave = cta_n / kWaveCTAs;
+  const int slot = cta_n - wave * kWaveCTAs;
+  const int wave_base = wave * kWaveCTAs;
+  const int w_size = (n_blocks - wave_base < kWaveCTAs) ? (n_blocks - wave_base) : kWaveCTAs;
+  return static_cast<size_t>(wave_base) * num_kg + static_cast<size_t>(kg) * w_size + slot;
+}
+
+// Exact bijection [cta_n, kg] -> [step, cta_id] matching balanced Stream-K (CTAs 0..r-1 get q+1 iters).
+__device__ __host__ __forceinline__ size_t int3_streamk_step_idx(
+    int cta_n, int kg, int n_blocks, int num_kg, int grid_ctas) {
+  const int total_iters = n_blocks * num_kg;
+  const int iter = cta_n * num_kg + kg;
+  const int q = total_iters / grid_ctas;
+  const int r = total_iters - q * grid_ctas;
+  const int cut = r * (q + 1);
+  int cta_id, step;
+  if (iter < cut) {
+    cta_id = iter / (q + 1);
+    step = iter - cta_id * (q + 1);
+  } else {
+    const int rem = iter - cut;
+    cta_id = r + rem / q;
+    step = rem - (cta_id - r) * q;
+  }
+  return static_cast<size_t>(step) * grid_ctas + cta_id;
+}
 
 __device__ __forceinline__ void int3_mma_m16n8k16(
     float& d0, float& d1, float& d2, float& d3,
@@ -115,7 +147,7 @@ template <bool kMseOpt>
 __global__ void int3_pack_kernel(
     const __nv_bfloat16* __restrict__ W,
     uint8_t* __restrict__ out,
-    int N, int K) {
+    int N, int K, int ilv_mode, int sk_grid) {
   const int n_tile = blockIdx.x;        // 0 .. N/8 - 1
   const int kg = blockIdx.y;            // 0 .. K/64 - 1
   const int lane = threadIdx.x;         // 0 .. 31
@@ -291,8 +323,17 @@ __global__ void int3_pack_kernel(
 
   const int cta_n = n_tile >> 3;         // 0 .. N/64 - 1
   const int sub_tile = n_tile & 7;       // 0 .. 7
+  const int n_blocks = N / kRowsPerCTA;
   const int num_kg = K >> 6;
-  const size_t tile_idx = (static_cast<size_t>(cta_n) * num_kg + kg) * kNTilesPerCTA + sub_tile;
+  size_t step_slot;
+  if (ilv_mode == 0) {
+    step_slot = static_cast<size_t>(cta_n) * num_kg + kg;
+  } else if (sk_grid > 0) {
+    step_slot = int3_streamk_step_idx(cta_n, kg, n_blocks, num_kg, sk_grid);
+  } else {
+    step_slot = int3_wave_step_idx(cta_n, kg, n_blocks, num_kg);
+  }
+  const size_t tile_idx = step_slot * kNTilesPerCTA + sub_tile;
   uint8_t* dst = out + tile_idx * kTileBytes;
 
   reinterpret_cast<uint32_t*>(dst)[lane] = lo2;
@@ -310,7 +351,7 @@ template <bool kMseOpt>
 __global__ void int3_pack_swiglu_kernel(
     const __nv_bfloat16* __restrict__ W,
     uint8_t* __restrict__ out,
-    int I, int K) {
+    int I, int K, int ilv_mode, int sk_grid) {
   const int pair_tile = blockIdx.x;      // 0 .. 2*(I/8) - 1; even=gate, odd=up
   const int kg = blockIdx.y;             // 0 .. K/64 - 1
   const int lane = threadIdx.x;          // 0 .. 31
@@ -480,8 +521,17 @@ __global__ void int3_pack_swiglu_kernel(
   // cta_n in [0 .. I/32 - 1], warp_slot in [0 .. 3], sub_tile = warp_slot*2 + is_up.
   const int cta_n = g_tile >> 2;
   const int sub_tile = ((g_tile & 3) << 1) | is_up;
+  const int n_blocks = I / 32;
   const int num_kg = K >> 6;
-  const size_t tile_idx = (static_cast<size_t>(cta_n) * num_kg + kg) * kNTilesPerCTA + sub_tile;
+  size_t step_slot;
+  if (ilv_mode == 0) {
+    step_slot = static_cast<size_t>(cta_n) * num_kg + kg;
+  } else if (sk_grid > 0) {
+    step_slot = int3_streamk_step_idx(cta_n, kg, n_blocks, num_kg, sk_grid);
+  } else {
+    step_slot = int3_wave_step_idx(cta_n, kg, n_blocks, num_kg);
+  }
+  const size_t tile_idx = step_slot * kNTilesPerCTA + sub_tile;
   uint8_t* dst = out + tile_idx * kTileBytes;
 
   reinterpret_cast<uint32_t*>(dst)[lane] = lo2;
@@ -505,7 +555,7 @@ __global__ void __launch_bounds__(128, 4) int3_mma_gemm_kernel(
     const uint8_t* __restrict__ W_packed,
     __nv_bfloat16* __restrict__ C,
     float* __restrict__ C_fp32,
-    int M, int N, int K, int split_k, int pdl_mode) {
+    int M, int N, int K, int split_k, int pdl_mode, int ilv_mode) {
   __shared__ Int3StageSmem<kM16 ? 16 : 8> smem;
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -513,6 +563,7 @@ __global__ void __launch_bounds__(128, 4) int3_mma_gemm_kernel(
   const int g = lane >> 2;
   const int t = lane & 3;
   const int num_kg = K >> 6;
+  const int n_blocks = N / kRowsPerCTA;
 
   const int cta_n = blockIdx.x;
   const int sk_idx = kSplitK ? blockIdx.y : 0;
@@ -523,12 +574,23 @@ __global__ void __launch_bounds__(128, 4) int3_mma_gemm_kernel(
   const int my_kgs = kg_end - kg_start;
   if (my_kgs <= 0) return;
 
-  const size_t cta_stride_bytes = static_cast<size_t>(num_kg) * kStepWBytes;
-  const uint8_t* w_cta = W_packed + static_cast<size_t>(cta_n) * cta_stride_bytes;
+  const uint8_t* w_base;
+  size_t w_kg_stride;
+  if (ilv_mode != 0) {
+    const int wave = cta_n / kWaveCTAs;
+    const int slot = cta_n - wave * kWaveCTAs;
+    const int wave_base = wave * kWaveCTAs;
+    const int w_size = (n_blocks - wave_base < kWaveCTAs) ? (n_blocks - wave_base) : kWaveCTAs;
+    w_base = W_packed + (static_cast<size_t>(wave_base) * num_kg + slot) * kStepWBytes;
+    w_kg_stride = static_cast<size_t>(w_size) * kStepWBytes;
+  } else {
+    w_base = W_packed + static_cast<size_t>(cta_n) * num_kg * kStepWBytes;
+    w_kg_stride = kStepWBytes;
+  }
 
   // Issue 2 MiB TLB prefetch from block (0, 0) (immutable W_packed: safe before PDL wait).
   if (cta_n == 0 && sk_idx == 0) {
-    const size_t total_bytes = static_cast<size_t>(N / kRowsPerCTA) * cta_stride_bytes;
+    const size_t total_bytes = static_cast<size_t>(n_blocks) * num_kg * kStepWBytes;
     for (size_t off = static_cast<size_t>(tid) << 21; off < total_bytes; off += static_cast<size_t>(kThreads) << 21) {
       asm volatile("prefetch.global.L2 [%0];" ::"l"(W_packed + off));
     }
@@ -542,7 +604,7 @@ __global__ void __launch_bounds__(128, 4) int3_mma_gemm_kernel(
   auto issue_w_only = [&](int kg, int st) {
     if (tid < kStepWU4) {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
-      int3_cp_async16_cg(sd, w_cta + static_cast<size_t>(kg) * kStepWBytes + tid * 16);
+      int3_cp_async16_cg(sd, w_base + static_cast<size_t>(kg) * w_kg_stride + tid * 16);
     }
     asm volatile("cp.async.commit_group;\n" ::: "memory");
   };
@@ -564,7 +626,7 @@ __global__ void __launch_bounds__(128, 4) int3_mma_gemm_kernel(
   auto issue_stage = [&](int kg, int st) {
     if (tid < kStepWU4) {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
-      int3_cp_async16_cg(sd, w_cta + static_cast<size_t>(kg) * kStepWBytes + tid * 16);
+      int3_cp_async16_cg(sd, w_base + static_cast<size_t>(kg) * w_kg_stride + tid * 16);
     }
     if constexpr (kM16) {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][a_row][a_swiz8 * 8]));
@@ -751,7 +813,7 @@ __global__ void __launch_bounds__(128, 4) int3_mma_gemm_swiglu_kernel(
     const __nv_bfloat16* __restrict__ A,
     const uint8_t* __restrict__ W_packed,
     __nv_bfloat16* __restrict__ C,
-    int M, int I, int K, int pdl_mode) {
+    int M, int I, int K, int pdl_mode, int ilv_mode) {
   __shared__ Int3StageSmem<kM16 ? 16 : 8> smem;
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -759,13 +821,25 @@ __global__ void __launch_bounds__(128, 4) int3_mma_gemm_swiglu_kernel(
   const int g = lane >> 2;
   const int t = lane & 3;
   const int num_kg = K >> 6;
+  const int n_blocks = I / 32;
   const int cta_n = blockIdx.x;
 
-  const size_t cta_stride_bytes = static_cast<size_t>(num_kg) * kStepWBytes;
-  const uint8_t* w_cta = W_packed + static_cast<size_t>(cta_n) * cta_stride_bytes;
+  const uint8_t* w_base;
+  size_t w_kg_stride;
+  if (ilv_mode != 0) {
+    const int wave = cta_n / kWaveCTAs;
+    const int slot = cta_n - wave * kWaveCTAs;
+    const int wave_base = wave * kWaveCTAs;
+    const int w_size = (n_blocks - wave_base < kWaveCTAs) ? (n_blocks - wave_base) : kWaveCTAs;
+    w_base = W_packed + (static_cast<size_t>(wave_base) * num_kg + slot) * kStepWBytes;
+    w_kg_stride = static_cast<size_t>(w_size) * kStepWBytes;
+  } else {
+    w_base = W_packed + static_cast<size_t>(cta_n) * num_kg * kStepWBytes;
+    w_kg_stride = kStepWBytes;
+  }
 
   if (cta_n == 0) {
-    const size_t total_bytes = static_cast<size_t>(I / 32) * cta_stride_bytes;
+    const size_t total_bytes = static_cast<size_t>(n_blocks) * num_kg * kStepWBytes;
     for (size_t off = static_cast<size_t>(tid) << 21; off < total_bytes; off += static_cast<size_t>(kThreads) << 21) {
       asm volatile("prefetch.global.L2 [%0];" ::"l"(W_packed + off));
     }
@@ -779,7 +853,7 @@ __global__ void __launch_bounds__(128, 4) int3_mma_gemm_swiglu_kernel(
   auto issue_w_only = [&](int kg, int st) {
     if (tid < kStepWU4) {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
-      int3_cp_async16_cg(sd, w_cta + static_cast<size_t>(kg) * kStepWBytes + tid * 16);
+      int3_cp_async16_cg(sd, w_base + static_cast<size_t>(kg) * w_kg_stride + tid * 16);
     }
     asm volatile("cp.async.commit_group;\n" ::: "memory");
   };
@@ -801,7 +875,7 @@ __global__ void __launch_bounds__(128, 4) int3_mma_gemm_swiglu_kernel(
   auto issue_stage = [&](int kg, int st) {
     if (tid < kStepWU4) {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
-      int3_cp_async16_cg(sd, w_cta + static_cast<size_t>(kg) * kStepWBytes + tid * 16);
+      int3_cp_async16_cg(sd, w_base + static_cast<size_t>(kg) * w_kg_stride + tid * 16);
     }
     if constexpr (kM16) {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][a_row][a_swiz8 * 8]));
@@ -928,7 +1002,7 @@ __global__ void __launch_bounds__(128, 4) int3_mma_streamk_kernel(
     __nv_bfloat16* __restrict__ C,
     float* __restrict__ sk_partials,  // [max_n_blocks, 16, 64] zero-initialized & self-zeroing
     int* __restrict__ sk_done,        // [max_n_blocks] zero-initialized & self-zeroing
-    int M, int out_cols, int K, int n_blocks, int grid_ctas, int pdl_mode) {
+    int M, int out_cols, int K, int n_blocks, int grid_ctas, int pdl_mode, int ilv_mode) {
   __shared__ Int3StageSmem<kM16 ? 16 : 8> smem;
   __shared__ int s_is_last;
   const int tid = threadIdx.x;
@@ -940,9 +1014,10 @@ __global__ void __launch_bounds__(128, 4) int3_mma_streamk_kernel(
   const int total_iters = n_blocks * num_kg;
 
   const int cta_id = blockIdx.x;
-  const int iter_start = static_cast<int>((static_cast<int64_t>(cta_id) * total_iters) / grid_ctas);
-  const int iter_end = static_cast<int>((static_cast<int64_t>(cta_id + 1) * total_iters) / grid_ctas);
-  const int my_iters = iter_end - iter_start;
+  const int q = total_iters / grid_ctas;
+  const int r = total_iters - q * grid_ctas;
+  const int my_iters = q + ((cta_id < r) ? 1 : 0);
+  const int iter_start = (cta_id < r) ? (cta_id * (q + 1)) : (r * (q + 1) + (cta_id - r) * q);
   if (my_iters <= 0) return;
 
   // Issue 2 MiB TLB prefetch from block 0 (immutable W_packed: safe before PDL wait).
@@ -957,7 +1032,10 @@ __global__ void __launch_bounds__(128, 4) int3_mma_streamk_kernel(
   int cur_kg = iter_start - cur_n * num_kg;
   int seg_start_kg = cur_kg;
 
-  int pre_iter = iter_start;
+  const uint8_t* w_ptr = (ilv_mode != 0)
+                             ? (W_packed + static_cast<size_t>(cta_id) * kStepWBytes)
+                             : (W_packed + static_cast<size_t>(iter_start) * kStepWBytes);
+  const size_t w_step_bytes = static_cast<size_t>((ilv_mode != 0) ? grid_ctas : 1) * kStepWBytes;
   int pre_kg = cur_kg;
 
   const int a_row = tid >> 3;
@@ -965,10 +1043,10 @@ __global__ void __launch_bounds__(128, 4) int3_mma_streamk_kernel(
   const int a_swiz8 = a_col8 ^ (a_row & 7);
   const bool a_valid = a_row < M;
 
-  auto issue_w_only = [&](int st, int w_iter) {
+  auto issue_w_only = [&](int st, const uint8_t* w_src) {
     if (tid < kStepWU4) {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
-      int3_cp_async16_cg(sd, W_packed + static_cast<size_t>(w_iter) * kStepWBytes + tid * 16);
+      int3_cp_async16_cg(sd, w_src + tid * 16);
     }
     asm volatile("cp.async.commit_group;\n" ::: "memory");
   };
@@ -988,7 +1066,7 @@ __global__ void __launch_bounds__(128, 4) int3_mma_streamk_kernel(
   auto issue_next = [&](int st) {
     if (tid < kStepWU4) {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
-      int3_cp_async16_cg(sd, W_packed + static_cast<size_t>(pre_iter) * kStepWBytes + tid * 16);
+      int3_cp_async16_cg(sd, w_ptr + tid * 16);
     }
     if constexpr (kM16) {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][a_row][a_swiz8 * 8]));
@@ -1000,7 +1078,7 @@ __global__ void __launch_bounds__(128, 4) int3_mma_streamk_kernel(
       int3_cp_async16_ca_z(sd, gs, a_valid ? 16 : 0);
     }
     asm volatile("cp.async.commit_group;\n" ::: "memory");
-    ++pre_iter;
+    w_ptr += w_step_bytes;
     if (++pre_kg == num_kg) pre_kg = 0;
   };
 
@@ -1008,12 +1086,12 @@ __global__ void __launch_bounds__(128, 4) int3_mma_streamk_kernel(
   const int preload = (my_iters < kPreload) ? my_iters : kPreload;
   if ((pdl_mode & 1) != 0) {
     for (int i = 0; i < preload; ++i) {
-      issue_w_only(i, pre_iter + i);
+      issue_w_only(i, w_ptr + static_cast<size_t>(i) * w_step_bytes);
     }
     asm volatile("griddepcontrol.wait;" ::: "memory");
     for (int i = 0; i < preload; ++i) {
       load_a_sync(i, pre_kg);
-      ++pre_iter;
+      w_ptr += w_step_bytes;
       if (++pre_kg == num_kg) pre_kg = 0;
     }
   } else {
@@ -1215,11 +1293,30 @@ int int3_sk_grid() {
   return g;
 }
 
+int int3_down_sk_grid() {
+  static const int g = []() -> int {
+    const char* s = std::getenv("MUSE_DRAFT_INT3_DOWN_SK");
+    if (!s || !*s) return 0;
+    const int v = std::atoi(s);
+    return (v >= 0 && v <= 576) ? v : 0;
+  }();
+  return g;
+}
+
 int int3_pdl_mode() {
   static const int mode = []() -> int {
     const char* s = std::getenv("MUSE_DRAFT_PDL");
     if (!s || !*s) return 3;
     return (std::atoi(s) != 0) ? 3 : 0;
+  }();
+  return mode;
+}
+
+int int3_ilv_mode() {
+  static const int mode = []() -> int {
+    const char* s = std::getenv("MUSE_DRAFT_ILV");
+    if (!s || !*s) return 1;
+    return (std::atoi(s) != 0) ? 1 : 0;
   }();
   return mode;
 }
@@ -1286,18 +1383,23 @@ torch::Tensor int3_pack(torch::Tensor W, bool mse_opt = true) {
   TORCH_CHECK(N % kRowsPerCTA == 0 && K % 64 == 0, "int3_pack requires N%64==0 and K%64==0");
   const int64_t total_bytes = static_cast<int64_t>(N / 8) * static_cast<int64_t>(K / 64) * kTileBytes;
   auto out = torch::empty({total_bytes}, W.options().dtype(torch::kUInt8));
+  const int n_blocks = N / kRowsPerCTA;
+  const int ilv_mode = int3_ilv_mode();
+  const int sk_raw = (int3_sk_grid() > 0) ? int3_sk_grid() : ((n_blocks <= 128 && K >= 16384) ? int3_down_sk_grid() : 0);
+  const int total_iters = n_blocks * (K >> 6);
+  const int sk_grid = (sk_raw > 0) ? ((sk_raw < total_iters) ? sk_raw : total_iters) : 0;
   dim3 grid(N / 8, K / 64);
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   if (mse_opt) {
     int3_pack_kernel<true><<<grid, 32, 0, st>>>(
         reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
         out.data_ptr<uint8_t>(),
-        N, K);
+        N, K, ilv_mode, sk_grid);
   } else {
     int3_pack_kernel<false><<<grid, 32, 0, st>>>(
         reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
         out.data_ptr<uint8_t>(),
-        N, K);
+        N, K, ilv_mode, sk_grid);
   }
   return out;
 }
@@ -1313,7 +1415,8 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
   const int n_blocks = static_cast<int>(N / kRowsPerCTA);
   const bool use_m16 = (M > 8);
   const int pdl_mode = int3_pdl_mode();
-  const int sk_grid = int3_sk_grid();
+  const int ilv_mode = int3_ilv_mode();
+  const int sk_grid = (int3_sk_grid() > 0) ? int3_sk_grid() : ((n_blocks <= 128 && K >= 16384) ? int3_down_sk_grid() : 0);
   if (sk_grid > 0) {
     const int total_iters = n_blocks * static_cast<int>(K >> 6);
     const int grid = (sk_grid < total_iters) ? sk_grid : total_iters;
@@ -1326,14 +1429,14 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          p_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
+          p_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, ilv_mode);
     } else {
       int3_launch_pdl(
           int3_mma_streamk_kernel<false, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          p_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
+          p_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, ilv_mode);
     }
     return C;
   }
@@ -1349,14 +1452,14 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1, pdl_mode);
+          static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1, pdl_mode, ilv_mode);
     } else {
       int3_launch_pdl(
           int3_mma_gemm_kernel<false, false>, grid, kThreads, st, pdl_mode,
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1, pdl_mode);
+          static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1, pdl_mode, ilv_mode);
     }
   } else {
     const int64_t need = static_cast<int64_t>(split_k) * M * N;
@@ -1368,14 +1471,14 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           static_cast<__nv_bfloat16*>(nullptr), partials_ptr,
-          M, static_cast<int>(N), static_cast<int>(K), split_k, pdl_mode);
+          M, static_cast<int>(N), static_cast<int>(K), split_k, pdl_mode, ilv_mode);
     } else {
       int3_launch_pdl(
           int3_mma_gemm_kernel<true, false>, grid, kThreads, st, pdl_mode,
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           static_cast<__nv_bfloat16*>(nullptr), partials_ptr,
-          M, static_cast<int>(N), static_cast<int>(K), split_k, pdl_mode);
+          M, static_cast<int>(N), static_cast<int>(K), split_k, pdl_mode, ilv_mode);
     }
     const int vtotal = (M * static_cast<int>(N)) >> 2;
     const dim3 rgrid((vtotal + 255) / 256, 1, 1);
@@ -1397,18 +1500,23 @@ torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true) {
   const int I = N2 / 2;
   const int64_t total_bytes = static_cast<int64_t>(N2 / 8) * static_cast<int64_t>(K / 64) * kTileBytes;
   auto out = torch::empty({total_bytes}, W.options().dtype(torch::kUInt8));
+  const int n_blocks = I / 32;
+  const int ilv_mode = int3_ilv_mode();
+  const int sk_raw = int3_sk_grid();
+  const int total_iters = n_blocks * (K >> 6);
+  const int sk_grid = (sk_raw > 0) ? ((sk_raw < total_iters) ? sk_raw : total_iters) : 0;
   dim3 grid(N2 / 8, K / 64);
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   if (mse_opt) {
     int3_pack_swiglu_kernel<true><<<grid, 32, 0, st>>>(
         reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
         out.data_ptr<uint8_t>(),
-        I, K);
+        I, K, ilv_mode, sk_grid);
   } else {
     int3_pack_swiglu_kernel<false><<<grid, 32, 0, st>>>(
         reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
         out.data_ptr<uint8_t>(),
-        I, K);
+        I, K, ilv_mode, sk_grid);
   }
   return out;
 }
@@ -1423,6 +1531,7 @@ torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t 
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int n_blocks = static_cast<int>(I / 32);
   const int pdl_mode = int3_pdl_mode();
+  const int ilv_mode = int3_ilv_mode();
   const int sk_grid = int3_sk_grid();
   if (sk_grid > 0) {
     const int total_iters = n_blocks * static_cast<int>(K >> 6);
@@ -1436,14 +1545,14 @@ torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t 
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          p_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), n_blocks, grid, pdl_mode);
+          p_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), n_blocks, grid, pdl_mode, ilv_mode);
     } else {
       int3_launch_pdl(
           int3_mma_streamk_kernel<false, true>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          p_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), n_blocks, grid, pdl_mode);
+          p_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), n_blocks, grid, pdl_mode, ilv_mode);
     }
     return C;
   }
@@ -1454,14 +1563,14 @@ torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t 
         reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
         W_packed.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-        M, static_cast<int>(I), static_cast<int>(K), pdl_mode);
+        M, static_cast<int>(I), static_cast<int>(K), pdl_mode, ilv_mode);
   } else {
     int3_launch_pdl(
         int3_mma_gemm_swiglu_kernel<false>, grid, kThreads, st, pdl_mode,
         reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
         W_packed.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-        M, static_cast<int>(I), static_cast<int>(K), pdl_mode);
+        M, static_cast<int>(I), static_cast<int>(K), pdl_mode, ilv_mode);
   }
   return C;
 }

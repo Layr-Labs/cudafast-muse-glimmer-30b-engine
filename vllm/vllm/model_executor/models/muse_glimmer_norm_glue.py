@@ -40,7 +40,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _H = 6656
-_MAX_ROWS = 16
+_MAX_ROWS = 32
 _MAX_POST_ATTN_ROWS = 4096
 # Diagnostics only: compare both kernels on every eligible launch made outside graph capture (real
 # activations of short prompts, which run without graphs). Off by default.
@@ -54,6 +54,9 @@ _RANS_PROLOGUE_M16 = os.environ.get("MUSE_RANS_PROLOGUE_M16", "0") != "0"
 _MUL_SIGMOID_GLUE = os.environ.get("MUSE_MUL_SIGMOID_GLUE", "1") != "0"
 _OPROJ_SIGMOID_FUSE = os.environ.get("MUSE_OPROJ_SIGMOID_FUSE", "1") != "0"
 _OPROJ_SIGMOID_FUSE_M = os.environ.get("MUSE_OPROJ_SIGMOID_FUSE_M", "1") != "0"
+# Cap fused mul_sigmoid+o_proj at M<=16 by default: at M=32, redundant 16x __expf per CTA across 48 CTAs
+# loses -49..-115 us/cyc vs standalone mul_sigmoid_bf16 + .cg o_proj (while M<=16 wins -89 us/cyc).
+_OPROJ_SIGMOID_FUSE_M_MAX = int(os.environ.get("MUSE_OPROJ_SIGMOID_FUSE_M_MAX", "16"))
 _MUL_SILU_SLICE_GLUE = os.environ.get("MUSE_MUL_SILU_SLICE_GLUE", "1") != "0"
 _REQUANT = "triton_poi_fused__to_copy_clamp_mul_reciprocal_0"
 _REQUANT_BODY = "f7a07e4acde4818e0fe4bcb2f62a211fa163724414f5efcce3d93ee433b8300f"
@@ -109,7 +112,7 @@ def consume_oproj_sigmoid(
     _pending_oproj_sigmoid = None
     import muse_marlin6_gemv as _m6
 
-    is_m = x.ndim == 2 and 1 < x.shape[0] <= 16 and x.shape[1] == _m6.OPROJ_K
+    is_m = x.ndim == 2 and 1 < x.shape[0] <= _OPROJ_SIGMOID_FUSE_M_MAX and x.shape[1] == _m6.OPROJ_K
     allowed = _m6._GATED_OPROJ_M if is_m else _m6._GATED_OPROJ
     if x.data_ptr() != ptr or gs_ptr not in allowed or gate.numel() != x.numel() or attn.numel() != x.numel():
         if skipped:
@@ -418,7 +421,7 @@ class _MulSigmoidSwap:
                         return None
             except Exception:
                 _oproj_fuse_state = "rejected"
-        elif _OPROJ_SIGMOID_FUSE_M and _oproj_fuse_m_state != "rejected" and 8192 <= n_el <= 16 * 4096:
+        elif _OPROJ_SIGMOID_FUSE_M and _oproj_fuse_m_state != "rejected" and 8192 <= n_el <= _OPROJ_SIGMOID_FUSE_M_MAX * 4096:
             try:
                 import muse_marlin6_gemv as _m6
                 if getattr(_m6, "_ALL_OPROJ_GATED_M_READY", False):
@@ -453,7 +456,7 @@ class _MulSiluSliceSwap:
                     n_sw = int(numel_t)
                 except Exception:
                     n_sw = -1
-                if n_sw > 0 and n_sw % 19968 == 0 and (n_sw // 19968) <= 16 and gu_t.data_ptr() == gu_ptr:
+                if n_sw > 0 and n_sw % 19968 == 0 and (n_sw // 19968) <= 32 and gu_t.data_ptr() == gu_ptr:
                     m_rows = n_sw // 19968
                     if fused_launched:
                         if m_rows == 1:

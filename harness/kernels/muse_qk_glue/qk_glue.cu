@@ -25,6 +25,14 @@ static bool qk_pdl_enabled() {
 }
 
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void pdl_launch_dependents() {
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+__device__ __forceinline__ uint2 ld8_cs(const void* ptr) {
+  uint2 r;
+  asm("ld.global.cs.v2.u32 {%0, %1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(ptr));
+  return r;
+}
 
 template <typename... KArgs, typename... Args>
 static cudaError_t launch_ex_pdl(void (*kernel)(KArgs...), int blocks, int threads, cudaStream_t stream,
@@ -425,7 +433,7 @@ int launch_multi(const void* qkv, const void* positions, const void* cos_sin_cac
   return static_cast<int>(cudaGetLastError());
 }
 
-template <bool UseRope, bool CacheFP32, int HPW, bool kPdl = false>
+template <bool UseRope, bool CacheFP32, int HPW, bool kPdl = false, bool kPdlProd = false>
 __global__ void qk_norm_rope_kvcache_prefill_kernel(
     const __nv_bfloat16* __restrict__ qkv,
     const int64_t* __restrict__ positions,
@@ -458,19 +466,19 @@ __global__ void qk_norm_rope_kvcache_prefill_kernel(
 
   float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
   if constexpr (UseRope) {
-    int64_t pos = positions[t];
+    int64_t pos = __ldg(positions + t);
     if (pos < 0) pos += cache_rows;
     const int d_lo = (lane & 15) * 4;
     if constexpr (CacheFP32) {
       const float* row = reinterpret_cast<const float*>(cos_sin_cache) + pos * 128;
-      const float4 cv = *reinterpret_cast<const float4*>(row + d_lo);
-      const float4 sv = *reinterpret_cast<const float4*>(row + 64 + d_lo);
+      const float4 cv = __ldg(reinterpret_cast<const float4*>(row + d_lo));
+      const float4 sv = __ldg(reinterpret_cast<const float4*>(row + 64 + d_lo));
       c0 = cv.x; c1 = cv.y; c2 = cv.z; c3 = cv.w;
       s0 = sv.x; s1 = sv.y; s2 = sv.z; s3 = sv.w;
     } else {
       const __nv_bfloat16* row = reinterpret_cast<const __nv_bfloat16*>(cos_sin_cache) + pos * 128;
-      const uint2 cv = *reinterpret_cast<const uint2*>(row + d_lo);
-      const uint2 sv = *reinterpret_cast<const uint2*>(row + 64 + d_lo);
+      const uint2 cv = __ldg(reinterpret_cast<const uint2*>(row + d_lo));
+      const uint2 sv = __ldg(reinterpret_cast<const uint2*>(row + 64 + d_lo));
       const __nv_bfloat16* cb = reinterpret_cast<const __nv_bfloat16*>(&cv);
       const __nv_bfloat16* sb = reinterpret_cast<const __nv_bfloat16*>(&sv);
       c0 = __bfloat162float(cb[0]); c1 = __bfloat162float(cb[1]);
@@ -487,17 +495,29 @@ __global__ void qk_norm_rope_kvcache_prefill_kernel(
     kv_base = kv_cache + blk * stride_block + off * stride_slot + lane * 4;
   }
 
-  // Wait for preceding qkv GEMM strictly after all independent loads (slot_mapping, positions, cos_sin_cache).
-  // Do NOT emit griddepcontrol.launch_dependents here: non-PDL consumers (FlashAttention, M=2..6 verify) lack
-  // griddepcontrol.wait and would race on q_out / kv_cache writes.
+  // Wait for preceding qkv GEMM strictly after all independent loads (slot_mapping, positions, cos_sin_cache),
+  // then immediately emit launch_dependents for PDL-safe consumers (gqa16_prefill / gate GEMM).
   if constexpr (kPdl) pdl_wait();
+  if constexpr (kPdlProd) pdl_launch_dependents();
 
+  // Stream dead qkv rows (.cs) so they do not evict q_out + kv_cache (4.7 MB) from L2 before gqa16_prefill.
+  const __nv_bfloat16* qkv_row = qkv + static_cast<size_t>(t) * 4608 + lane * 4;
   uint2 raw[HPW];
 #pragma unroll
   for (int j = 0; j < HPW; ++j) {
     const int h = h0 + j;
     if (h < 34 && (t >= q_first_row || h >= 32)) {
-      raw[j] = *reinterpret_cast<const uint2*>(qkv + static_cast<size_t>(t) * 4608 + h * 128 + lane * 4);
+      raw[j] = ld8_cs(qkv_row + h * 128);
+    }
+  }
+  // Early prefetch V heads alongside Q/K so the tail warp overlaps V global loads with Q/K norm+RoPE.
+  uint2 v_raw0{}, v_raw1{};
+  if (kv_base != nullptr) {
+    if (h0 <= 32 && h0 + HPW > 32) {
+      v_raw0 = ld8_cs(qkv_row + 4352);
+    }
+    if (h0 <= 33 && h0 + HPW > 33) {
+      v_raw1 = ld8_cs(qkv_row + 4480);
     }
   }
 
@@ -562,16 +582,215 @@ __global__ void qk_norm_rope_kvcache_prefill_kernel(
       *reinterpret_cast<uint2*>(q_out + static_cast<size_t>(t) * 4096 + h * 128 + lane * 4) = out_v;
     } else if (kv_base != nullptr) {
       const int64_t hk = static_cast<int64_t>(h - 32);
-      const uint2 v_raw = *reinterpret_cast<const uint2*>(
-          qkv + static_cast<size_t>(t) * 4608 + 4352 + hk * 128 + lane * 4);
       __nv_bfloat16* dst = kv_base + hk * stride_kv_head;
       *reinterpret_cast<uint2*>(dst) = out_v;
-      *reinterpret_cast<uint2*>(dst + 128) = v_raw;
+      *reinterpret_cast<uint2*>(dst + 128) = (hk == 0) ? v_raw0 : v_raw1;
     }
   }
 }
 
-template <int HPW>
+// Balanced 18-warp-per-token fused QK-norm + RoPE + KV-cache kernel for multi-token decode (M = 2..32).
+// Warps 0..15: 2 Q heads each; warp 16: 2 K heads; warp 17: 2 V heads (pure copy, zero norm/RoPE).
+// At M=16 (threads=64) and M=32 (threads=128), launches 144 CTAs = exact 3.0 CTAs/SM on 48-SM GB10
+// with zero tail-warp load imbalance (vs 24/48 CTAs and 33% tail imbalance in HPW=6 prefill kernel).
+// Evaluates the exact same 0-ULP FP32 reduction & RoPE instruction sequence.
+template <bool UseRope, bool CacheFP32, bool kPdlWait, bool kPdlProd>
+__global__ void qk_norm_rope_kvcache_decode_m_kernel(
+    const __nv_bfloat16* __restrict__ qkv,
+    const int64_t* __restrict__ positions,
+    const void* __restrict__ cos_sin_cache,
+    __nv_bfloat16* __restrict__ q_out,
+    __nv_bfloat16* __restrict__ kv_cache,
+    const int64_t* __restrict__ slot_mapping,
+    int num_tokens,
+    int cache_rows,
+    int block_size,
+    int64_t stride_block,
+    int64_t stride_slot,
+    int64_t stride_kv_head,
+    float eps,
+    float qscale) {
+  const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  if (warp_id >= num_tokens * 18) return;
+  const int lane = threadIdx.x & 31;
+  const int t = warp_id / 18;
+  const int w = warp_id - t * 18;
+  const __nv_bfloat16* qkv_row = qkv + static_cast<size_t>(t) * 4608 + lane * 4;
+
+  if (w == 17) {
+    const int64_t slot = slot_mapping[t];
+    __nv_bfloat16* dst = nullptr;
+    if (slot >= 0) {
+      const int64_t blk = (block_size == 16) ? (slot >> 4) : (slot / block_size);
+      const int64_t off = (block_size == 16) ? (slot & 15) : (slot - blk * block_size);
+      dst = kv_cache + blk * stride_block + off * stride_slot + 128 + lane * 4;
+    }
+    if constexpr (kPdlWait) pdl_wait();
+    if constexpr (kPdlProd) pdl_launch_dependents();
+    if (dst != nullptr) {
+      const uint2 v0 = *reinterpret_cast<const uint2*>(qkv_row + 4352);
+      const uint2 v1 = *reinterpret_cast<const uint2*>(qkv_row + 4480);
+      *reinterpret_cast<uint2*>(dst) = v0;
+      *reinterpret_cast<uint2*>(dst + stride_kv_head) = v1;
+    }
+    return;
+  }
+
+  __nv_bfloat16* k_cache_base = nullptr;
+  if (w == 16) {
+    const int64_t slot = slot_mapping[t];
+    if (slot >= 0) {
+      const int64_t blk = (block_size == 16) ? (slot >> 4) : (slot / block_size);
+      const int64_t off = (block_size == 16) ? (slot & 15) : (slot - blk * block_size);
+      k_cache_base = kv_cache + blk * stride_block + off * stride_slot + lane * 4;
+    }
+  }
+
+  float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+  if constexpr (UseRope) {
+    int64_t pos = positions[t];
+    if (pos < 0) pos += cache_rows;
+    const int d_lo = (lane & 15) * 4;
+    if constexpr (CacheFP32) {
+      const float* row = reinterpret_cast<const float*>(cos_sin_cache) + pos * 128;
+      const float4 cv = *reinterpret_cast<const float4*>(row + d_lo);
+      const float4 sv = *reinterpret_cast<const float4*>(row + 64 + d_lo);
+      c0 = cv.x; c1 = cv.y; c2 = cv.z; c3 = cv.w;
+      s0 = sv.x; s1 = sv.y; s2 = sv.z; s3 = sv.w;
+    } else {
+      const __nv_bfloat16* row = reinterpret_cast<const __nv_bfloat16*>(cos_sin_cache) + pos * 128;
+      const uint2 cv = *reinterpret_cast<const uint2*>(row + d_lo);
+      const uint2 sv = *reinterpret_cast<const uint2*>(row + 64 + d_lo);
+      const __nv_bfloat16* cb = reinterpret_cast<const __nv_bfloat16*>(&cv);
+      const __nv_bfloat16* sb = reinterpret_cast<const __nv_bfloat16*>(&sv);
+      c0 = __bfloat162float(cb[0]); c1 = __bfloat162float(cb[1]);
+      c2 = __bfloat162float(cb[2]); c3 = __bfloat162float(cb[3]);
+      s0 = __bfloat162float(sb[0]); s1 = __bfloat162float(sb[1]);
+      s2 = __bfloat162float(sb[2]); s3 = __bfloat162float(sb[3]);
+    }
+  }
+
+  if constexpr (kPdlWait) pdl_wait();
+  if constexpr (kPdlProd) pdl_launch_dependents();
+  if (w == 16 && k_cache_base == nullptr) return;
+
+  const int h0 = w * 2;
+  uint2 raw[2];
+  raw[0] = *reinterpret_cast<const uint2*>(qkv_row + h0 * 128);
+  raw[1] = *reinterpret_cast<const uint2*>(qkv_row + (h0 + 1) * 128);
+
+  const bool is_q = (w < 16);
+#pragma unroll
+  for (int j = 0; j < 2; ++j) {
+    const __nv_bfloat16* vb = reinterpret_cast<const __nv_bfloat16*>(&raw[j]);
+    const float x0 = __bfloat162float(vb[0]);
+    const float x1 = __bfloat162float(vb[1]);
+    const float x2 = __bfloat162float(vb[2]);
+    const float x3 = __bfloat162float(vb[3]);
+    float ss = __fmaf_rn(x0, x0, 0.0f);
+    ss = __fmaf_rn(x1, x1, ss);
+    ss = __fmaf_rn(x2, x2, ss);
+    ss = __fmaf_rn(x3, x3, ss);
+    ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 16));
+    ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 8));
+    ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 4));
+    ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 2));
+    ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 1));
+    float mean_v;
+    asm("div.full.f32 %0, %1, 0f43000000;" : "=f"(mean_v) : "f"(ss));
+    float r;
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(mean_v + eps));
+    float y0 = __fmul_rn(x0, r);
+    float y1 = __fmul_rn(x1, r);
+    float y2 = __fmul_rn(x2, r);
+    float y3 = __fmul_rn(x3, r);
+    if (is_q) {
+      y0 = __fmul_rn(y0, qscale);
+      y1 = __fmul_rn(y1, qscale);
+      y2 = __fmul_rn(y2, qscale);
+      y3 = __fmul_rn(y3, qscale);
+    }
+    float o0 = y0, o1 = y1, o2 = y2, o3 = y3;
+    if constexpr (UseRope) {
+      const float p0 = __shfl_xor_sync(0xffffffffu, y0, 16);
+      const float p1 = __shfl_xor_sync(0xffffffffu, y1, 16);
+      const float p2 = __shfl_xor_sync(0xffffffffu, y2, 16);
+      const float p3 = __shfl_xor_sync(0xffffffffu, y3, 16);
+      if (lane < 16) {
+        o0 = __fmaf_rn(y0, c0, -__fmul_rn(p0, s0));
+        o1 = __fmaf_rn(y1, c1, -__fmul_rn(p1, s1));
+        o2 = __fmaf_rn(y2, c2, -__fmul_rn(p2, s2));
+        o3 = __fmaf_rn(y3, c3, -__fmul_rn(p3, s3));
+      } else {
+        o0 = __fmaf_rn(y0, c0, __fmul_rn(p0, s0));
+        o1 = __fmaf_rn(y1, c1, __fmul_rn(p1, s1));
+        o2 = __fmaf_rn(y2, c2, __fmul_rn(p2, s2));
+        o3 = __fmaf_rn(y3, c3, __fmul_rn(p3, s3));
+      }
+    }
+    uint2 out_v;
+    __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(&out_v);
+    ob[0] = __float2bfloat16_rn(o0);
+    ob[1] = __float2bfloat16_rn(o1);
+    ob[2] = __float2bfloat16_rn(o2);
+    ob[3] = __float2bfloat16_rn(o3);
+    if (is_q) {
+      *reinterpret_cast<uint2*>(q_out + static_cast<size_t>(t) * 4096 + (h0 + j) * 128 + lane * 4) = out_v;
+    } else {
+      *reinterpret_cast<uint2*>(k_cache_base + static_cast<int64_t>(j) * stride_kv_head) = out_v;
+    }
+  }
+}
+
+template <bool kPdlProd>
+int launch_kvcache_decode_m_impl(
+    const void* qkv, const void* positions, const void* cos_sin_cache,
+    void* q_out, void* kv_cache, const void* slot_mapping,
+    int num_tokens, int cache_rows, int block_size,
+    int64_t stride_block, int64_t stride_slot, int64_t stride_kv_head,
+    float eps, float qscale, int use_rope, int cache_fp32, cudaStream_t stream) {
+  const int threads = (num_tokens <= 16) ? 64 : 128;
+  const int wpb = threads >> 5;
+  const int blocks = (num_tokens * 18 + wpb - 1) / wpb;
+  const auto* q = static_cast<const __nv_bfloat16*>(qkv);
+  const auto* pos = static_cast<const int64_t*>(positions);
+  auto* qo = static_cast<__nv_bfloat16*>(q_out);
+  auto* kv = static_cast<__nv_bfloat16*>(kv_cache);
+  const auto* sm = static_cast<const int64_t*>(slot_mapping);
+  if (qk_pdl_enabled()) {
+    if (use_rope) {
+      if (cache_fp32)
+        return static_cast<int>(launch_ex_pdl(qk_norm_rope_kvcache_decode_m_kernel<true, true, true, kPdlProd>,
+            blocks, threads, stream, q, pos, cos_sin_cache, qo, kv, sm, num_tokens, cache_rows,
+            block_size, stride_block, stride_slot, stride_kv_head, eps, qscale));
+      else
+        return static_cast<int>(launch_ex_pdl(qk_norm_rope_kvcache_decode_m_kernel<true, false, true, kPdlProd>,
+            blocks, threads, stream, q, pos, cos_sin_cache, qo, kv, sm, num_tokens, cache_rows,
+            block_size, stride_block, stride_slot, stride_kv_head, eps, qscale));
+    } else {
+      return static_cast<int>(launch_ex_pdl(qk_norm_rope_kvcache_decode_m_kernel<false, true, true, kPdlProd>,
+          blocks, threads, stream, q, pos, cos_sin_cache, qo, kv, sm, num_tokens, cache_rows,
+          block_size, stride_block, stride_slot, stride_kv_head, eps, qscale));
+    }
+  }
+  if (use_rope) {
+    if (cache_fp32)
+      qk_norm_rope_kvcache_decode_m_kernel<true, true, false, kPdlProd><<<blocks, threads, 0, stream>>>(
+          q, pos, cos_sin_cache, qo, kv, sm, num_tokens, cache_rows, block_size,
+          stride_block, stride_slot, stride_kv_head, eps, qscale);
+    else
+      qk_norm_rope_kvcache_decode_m_kernel<true, false, false, kPdlProd><<<blocks, threads, 0, stream>>>(
+          q, pos, cos_sin_cache, qo, kv, sm, num_tokens, cache_rows, block_size,
+          stride_block, stride_slot, stride_kv_head, eps, qscale);
+  } else {
+    qk_norm_rope_kvcache_decode_m_kernel<false, true, false, kPdlProd><<<blocks, threads, 0, stream>>>(
+        q, pos, cos_sin_cache, qo, kv, sm, num_tokens, cache_rows, block_size,
+        stride_block, stride_slot, stride_kv_head, eps, qscale);
+  }
+  return static_cast<int>(cudaGetLastError());
+}
+
+template <int HPW, bool kPdlProd = false>
 int launch_kvcache_prefill(
     const void* qkv, const void* positions, const void* cos_sin_cache,
     void* q_out, void* kv_cache, const void* slot_mapping,
@@ -590,30 +809,30 @@ int launch_kvcache_prefill(
   if (qk_pdl_enabled()) {
     if (use_rope) {
       if (cache_fp32)
-        return static_cast<int>(launch_ex_pdl(qk_norm_rope_kvcache_prefill_kernel<true, true, HPW, true>,
+        return static_cast<int>(launch_ex_pdl(qk_norm_rope_kvcache_prefill_kernel<true, true, HPW, true, kPdlProd>,
             blocks, threads, stream, q, pos, cos_sin_cache, qo, kv, sm, num_tokens, q_first_row, cache_rows,
             block_size, stride_block, stride_slot, stride_kv_head, eps, qscale));
       else
-        return static_cast<int>(launch_ex_pdl(qk_norm_rope_kvcache_prefill_kernel<true, false, HPW, true>,
+        return static_cast<int>(launch_ex_pdl(qk_norm_rope_kvcache_prefill_kernel<true, false, HPW, true, kPdlProd>,
             blocks, threads, stream, q, pos, cos_sin_cache, qo, kv, sm, num_tokens, q_first_row, cache_rows,
             block_size, stride_block, stride_slot, stride_kv_head, eps, qscale));
     } else {
-      return static_cast<int>(launch_ex_pdl(qk_norm_rope_kvcache_prefill_kernel<false, true, HPW, true>,
+      return static_cast<int>(launch_ex_pdl(qk_norm_rope_kvcache_prefill_kernel<false, true, HPW, true, kPdlProd>,
           blocks, threads, stream, q, pos, cos_sin_cache, qo, kv, sm, num_tokens, q_first_row, cache_rows,
           block_size, stride_block, stride_slot, stride_kv_head, eps, qscale));
     }
   }
   if (use_rope) {
     if (cache_fp32)
-      qk_norm_rope_kvcache_prefill_kernel<true, true, HPW, false><<<blocks, threads, 0, stream>>>(
+      qk_norm_rope_kvcache_prefill_kernel<true, true, HPW, false, kPdlProd><<<blocks, threads, 0, stream>>>(
           q, pos, cos_sin_cache, qo, kv, sm, num_tokens, q_first_row, cache_rows, block_size,
           stride_block, stride_slot, stride_kv_head, eps, qscale);
     else
-      qk_norm_rope_kvcache_prefill_kernel<true, false, HPW, false><<<blocks, threads, 0, stream>>>(
+      qk_norm_rope_kvcache_prefill_kernel<true, false, HPW, false, kPdlProd><<<blocks, threads, 0, stream>>>(
           q, pos, cos_sin_cache, qo, kv, sm, num_tokens, q_first_row, cache_rows, block_size,
           stride_block, stride_slot, stride_kv_head, eps, qscale);
   } else {
-    qk_norm_rope_kvcache_prefill_kernel<false, true, HPW, false><<<blocks, threads, 0, stream>>>(
+    qk_norm_rope_kvcache_prefill_kernel<false, true, HPW, false, kPdlProd><<<blocks, threads, 0, stream>>>(
         q, pos, cos_sin_cache, qo, kv, sm, num_tokens, q_first_row, cache_rows, block_size,
         stride_block, stride_slot, stride_kv_head, eps, qscale);
   }
@@ -628,22 +847,67 @@ extern "C" int muse_qk_glue_set_pdl(int on) {
   return old;
 }
 
+extern "C" int muse_qk_norm_rope_kvcache_decode_m(
+    const void* qkv, const void* positions, const void* cos_sin_cache,
+    void* q_out, void* kv_cache, const void* slot_mapping,
+    int num_tokens, int cache_rows, int block_size,
+    int64_t stride_block, int64_t stride_slot, int64_t stride_kv_head,
+    float eps, float qscale, int use_rope, int cache_fp32, int pdl_prod, cudaStream_t stream) {
+  if (num_tokens <= 0) return 0;
+  if (block_size <= 0) return 1;
+  if (pdl_prod != 0) {
+    return muse_qk_glue::launch_kvcache_decode_m_impl<true>(
+        qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping,
+        num_tokens, cache_rows, block_size, stride_block, stride_slot, stride_kv_head,
+        eps, qscale, use_rope, cache_fp32, stream);
+  }
+  return muse_qk_glue::launch_kvcache_decode_m_impl<false>(
+      qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping,
+      num_tokens, cache_rows, block_size, stride_block, stride_slot, stride_kv_head,
+      eps, qscale, use_rope, cache_fp32, stream);
+}
+
+extern "C" int muse_qk_norm_rope_kvcache_prefill_pdl(
+    const void* qkv, const void* positions, const void* cos_sin_cache,
+    void* q_out, void* kv_cache, const void* slot_mapping,
+    int num_tokens, int q_first_row, int cache_rows, int block_size,
+    int64_t stride_block, int64_t stride_slot, int64_t stride_kv_head,
+    float eps, float qscale, int use_rope, int cache_fp32, int hpw, int pdl_prod, cudaStream_t stream) {
+  if (num_tokens <= 0) return 0;
+  if (block_size <= 0) return 1;
+  if (pdl_prod != 0) {
+    switch (hpw) {
+      case 2: return muse_qk_glue::launch_kvcache_prefill<2, true>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
+      case 4: return muse_qk_glue::launch_kvcache_prefill<4, true>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
+      case 5: return muse_qk_glue::launch_kvcache_prefill<5, true>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
+      case 6: return muse_qk_glue::launch_kvcache_prefill<6, true>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
+      case 9: return muse_qk_glue::launch_kvcache_prefill<9, true>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
+      case 17: return muse_qk_glue::launch_kvcache_prefill<17, true>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
+      default: return 1;
+    }
+  }
+  switch (hpw) {
+    case 2: return muse_qk_glue::launch_kvcache_prefill<2, false>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
+    case 4: return muse_qk_glue::launch_kvcache_prefill<4, false>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
+    case 5: return muse_qk_glue::launch_kvcache_prefill<5, false>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
+    case 6: return muse_qk_glue::launch_kvcache_prefill<6, false>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
+    case 9: return muse_qk_glue::launch_kvcache_prefill<9, false>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
+    case 17: return muse_qk_glue::launch_kvcache_prefill<17, false>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
+    default: return 1;
+  }
+}
+
 extern "C" int muse_qk_norm_rope_kvcache_prefill(
     const void* qkv, const void* positions, const void* cos_sin_cache,
     void* q_out, void* kv_cache, const void* slot_mapping,
     int num_tokens, int q_first_row, int cache_rows, int block_size,
     int64_t stride_block, int64_t stride_slot, int64_t stride_kv_head,
     float eps, float qscale, int use_rope, int cache_fp32, int hpw, cudaStream_t stream) {
-  if (num_tokens <= 0) return 0;
-  if (block_size <= 0) return 1;
-  switch (hpw) {
-    case 2: return muse_qk_glue::launch_kvcache_prefill<2>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
-    case 4: return muse_qk_glue::launch_kvcache_prefill<4>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
-    case 5: return muse_qk_glue::launch_kvcache_prefill<5>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
-    case 6: return muse_qk_glue::launch_kvcache_prefill<6>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
-    case 9: return muse_qk_glue::launch_kvcache_prefill<9>(qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping, num_tokens, q_first_row, cache_rows, block_size, stride_block, stride_slot, stride_kv_head, eps, qscale, use_rope, cache_fp32, stream);
-    default: return 1;
-  }
+  return muse_qk_norm_rope_kvcache_prefill_pdl(
+      qkv, positions, cos_sin_cache, q_out, kv_cache, slot_mapping,
+      num_tokens, q_first_row, cache_rows, block_size,
+      stride_block, stride_slot, stride_kv_head,
+      eps, qscale, use_rope, cache_fp32, hpw, 0, stream);
 }
 
 extern "C" int muse_qk_norm_rope_kvcache_m1(
