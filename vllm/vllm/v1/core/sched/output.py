@@ -268,6 +268,11 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # DFlash committed-token ceiling: requests whose high-acceptance latch is
+    # set (host-side, from committed counts).  The worker runs the record M=16
+    # tree instead of the M=24 tree for these.  Width only; exactness unchanged.
+    dflash_high_acceptance_req_ids: set[str] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

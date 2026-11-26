@@ -1265,6 +1265,17 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs
             )
 
+        _high_acc_ids: set[str] | None = None
+        _ceil = self.dflash_committed_token_ceiling
+        if _ceil is not None and _ceil.enabled and scheduled_spec_decode_tokens:
+            _ceil_states = _ceil._states
+            _high_acc_ids = {
+                _rid
+                for _rid in num_scheduled_tokens
+                if (_st := _ceil_states.get(_rid)) is not None
+                and _st.high_acceptance_seen
+            } or None
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1285,6 +1296,7 @@ class Scheduler(SchedulerInterface):
             kv_cache_block_copies=pending_kv_cache_block_copies,
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            dflash_high_acceptance_req_ids=_high_acc_ids,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
 

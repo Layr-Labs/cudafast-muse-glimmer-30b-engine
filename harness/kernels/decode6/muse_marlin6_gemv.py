@@ -157,6 +157,18 @@ _GATED_OPROJ_M: set[int] = set()
 _ALL_OPROJ_GATED_M_READY: bool = False
 _LMPOST_BUFS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 _LMPOST_M_BUFS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+# This is deliberately separate from the legacy multi-M admission.  The
+# latter proves the 2..16 specialisation only; consumers building a 24-row
+# tree must not infer anything from it.
+_M24_ADMITTED_SCALES: set[int] = set()
+_M24_LMHEAD_SCALES: set[int] = set()
+
+
+def m24_admitted(global_scale: torch.Tensor | None = None) -> bool:
+    """Whether this decode6 weight has passed the 17..24 overlap check."""
+    if global_scale is None:
+        return bool(_M24_ADMITTED_SCALES)
+    return global_scale.data_ptr() in _M24_ADMITTED_SCALES
 _consume_down_swiglu = None
 _notify_gate_up_swiglu = None
 _consume_oproj_sigmoid = None
@@ -839,7 +851,9 @@ def decode_linear6(
         _consume_down_swiglu is not None
         and not fixed_grid
         and (n, k) == (DOWN_N, DOWN_K)
-        and (x.numel() == k or (x.ndim == 2 and 1 <= x.shape[0] <= 16 and x.shape[1] == k))
+        and (x.numel() == k or (x.ndim == 2 and 1 <= x.shape[0] <= 16 and x.shape[1] == k)
+             or (x.ndim == 2 and 17 <= x.shape[0] <= 24 and x.shape[1] == k
+                 and m24_admitted(global_scale)))
     ):
         x_sw = _consume_down_swiglu(x, global_scale.data_ptr())
         if x_sw is not None:
@@ -852,7 +866,7 @@ def decode_linear6(
             (x.numel() == k and global_scale.data_ptr() in _GATED_OPROJ and is_tma4(scales6))
             or (
                 x.ndim == 2
-                and 1 < x.shape[0] <= 16
+                and (1 < x.shape[0] <= 16 or (17 <= x.shape[0] <= 24 and m24_admitted(global_scale)))
                 and x.shape[1] == k
                 and global_scale.data_ptr() in _GATED_OPROJ_M
                 and is_tma4_ilv(scales6)
@@ -870,7 +884,8 @@ def decode_linear6(
     eff_n = LM_HEAD_PAD128_N if lm_pad128 else n
     blocks = 96 if (n, k) == (LM_HEAD_N, LM_HEAD_K) and is_lm_split2(scales6) else 48
     tile_n = 128 if eff_n % 128 == 0 else 64
-    partials = x.new_empty((blocks, 16, tile_n), dtype=torch.float32)
+    # M=17..24 uses two 16-row accumulator tiles: twice the per-lock fp32 partial slot.
+    partials = x.new_empty((blocks, 32 if (x.ndim == 2 and x.shape[0] > 16) else 16, tile_n), dtype=torch.float32)
     with torch.cuda.device(x.device):
         use_grid = fixed_grid and _gate_up is not None and x.numel() == k and (n, k) == (39936, 6656)
         sw_entry = (
@@ -912,13 +927,18 @@ def decode_linear6(
                 raise RuntimeError(f"SM121 Marlin gate_up SwiGLU launch failed with CUDA error {status}")
             _notify_gate_up_swiglu(out_buf.data_ptr(), sw_entry, True, None)
             return out_buf
-        if x.ndim == 2 and 1 < x.shape[0] <= 16 and is_tma4_ilv(scales6) and _sk_tma4_ilv_m is not None:
+        if (x.ndim == 2 and (1 < x.shape[0] <= 16 or
+                (17 <= x.shape[0] <= 24 and m24_admitted(global_scale)))
+                and is_tma4_ilv(scales6) and _sk_tma4_ilv_m is not None):
             m = int(x.shape[0])
             sw_entry_m = (
                 _SWIGLU_GATE_UP.get(global_scale.data_ptr())
                 if (
                     (n, k) == (GATE_UP_N, GATE_UP_K)
                     and _notify_gate_up_swiglu is not None
+                    # The norm-glue silu/down consumers only exist for <=16 rows; at 17..24 rows a fused SwiGLU
+                    # output would be fed to an un-swapped silu (or raise).  Use the plain admitted GEMM instead.
+                    and m <= 16
                 )
                 else None
             )
@@ -1040,14 +1060,16 @@ def _get_lmpost_bufs(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _get_lmpost_m_bufs(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dedicated scratch/partials for MultiM (M=2..16) lm_head+lmpost so g_bv[0..2047]
+    """Dedicated scratch/partials for MultiM (M=2..24) lm_head+lmpost so g_bv[0..2047]
     and g_bi[0..2047] never overlap M=1's g_done counter (g_done sits at int32[4096])."""
     idx = dev.index if dev.index is not None else torch.cuda.current_device()
     bufs = _LMPOST_M_BUFS.get(idx)
     if bufs is None:
         bufs = (
-            torch.zeros(2064, dtype=torch.int64, device=dev),
-            torch.empty((96, 16, 128), dtype=torch.float32, device=dev),
+            # M<=16 keeps the record layout (g_done at int32[4096]).  M=24 uses a disjoint region
+            # [4160, 4160 + 2*3072 + 1) (g_done at int32[10304]) so the two never share a counter or data.
+            torch.zeros(5200, dtype=torch.int64, device=dev),
+            torch.empty((96, 32, 128), dtype=torch.float32, device=dev),
         )
         _LMPOST_M_BUFS[idx] = bufs
     return bufs
@@ -1168,6 +1190,7 @@ def launch_lmhead_lmpost6_m(
     lut: torch.Tensor,
     out_tokens: torch.Tensor,
     org_vocab_size: int,
+    _admission_probe: bool = False,
 ) -> bool:
     s6 = getattr(layer, "_marlin_decode_scales6", None)
     if (
@@ -1177,7 +1200,8 @@ def launch_lmhead_lmpost6_m(
         or not x.is_contiguous()
         or x.data_ptr() % 16 != 0
         or x.ndim != 2
-        or not (1 <= x.shape[0] <= 16)
+        or not (1 <= x.shape[0] <= 24)
+        or (x.shape[0] > 16 and not (_admission_probe or getattr(layer, "marlin_decode6_lmpost_m24_admitted", False)))
         or x.shape[1] != layer.input_size_per_partition
         or not out_tokens.is_contiguous()
         or out_tokens.dtype != torch.int64
@@ -1242,14 +1266,29 @@ def admit_tma4_lmpost_m(
     dev = scales6.device
     scratch, _ = _get_lmpost_m_bufs(dev)
     gen = torch.Generator(device=dev).manual_seed(20261128)
-    for cm in (7, 12, 16, 2):
+    # M=24 must agree with two independently established <=16 windows.  The
+    # overlap [8:16] detects row addressing mistakes as well as arithmetic.
+    def _check_cm(cm: int) -> bool:
         out_tok = torch.empty((1, cm), dtype=torch.int64, device=dev)
         for mag in (0.05, 1.5, 16.0):
             x = (torch.randn((cm, k), generator=gen, device=dev) * mag).to(torch.bfloat16).contiguous()
-            raw = decode_linear6(
-                x, layer._marlin_decode_weight, scales6, layer._marlin_decode_palette,
-                layer.weight_global_scale, layer.workspace, n, k, False,
-            )
+            # Do not let the candidate M=24 kernel certify itself.  Its oracle
+            # is two pre-existing <=16 launches; this also preserves the exact
+            # K-order and epilogue used by the record implementation.
+            if cm > 16:
+                raw = torch.cat((
+                    decode_linear6(x[:16].contiguous(), layer._marlin_decode_weight, scales6,
+                                   layer._marlin_decode_palette, layer.weight_global_scale,
+                                   layer.workspace, n, k, False),
+                    decode_linear6(x[16:].contiguous(), layer._marlin_decode_weight, scales6,
+                                   layer._marlin_decode_palette, layer.weight_global_scale,
+                                   layer.workspace, n, k, False),
+                ), dim=0)
+            else:
+                raw = decode_linear6(
+                    x, layer._marlin_decode_weight, scales6, layer._marlin_decode_palette,
+                    layer.weight_global_scale, layer.workspace, n, k, False,
+                )
             if org_vocab_size < n:
                 raw = raw[:, :org_vocab_size].contiguous()
             refs = []
@@ -1260,22 +1299,220 @@ def admit_tma4_lmpost_m(
                 refs.append(ref_r.view(-1))
             ref = torch.cat(refs, dim=0).view(1, cm)
             out_tok.fill_(-1)
-            if not launch_lmhead_lmpost6_m(x, layer, lut, out_tok, org_vocab_size):
+            if not launch_lmhead_lmpost6_m(x, layer, lut, out_tok, org_vocab_size, _admission_probe=True):
                 return False
             torch.cuda.synchronize(dev)
+            if cm == 24:
+                # Compare the candidate directly with the two old, <=16
+                # windows [0:16] and [8:24].  This is deliberately not a
+                # comparison with another M=24 launch.
+                old0 = torch.empty((1, 16), dtype=torch.int64, device=dev)
+                old8 = torch.empty((1, 16), dtype=torch.int64, device=dev)
+                launch_lmhead_lmpost6_m(x[:16].contiguous(), layer, lut, old0, org_vocab_size)
+                launch_lmhead_lmpost6_m(x[8:].contiguous(), layer, lut, old8, org_vocab_size)
+                torch.cuda.synchronize(dev)
+                if not (torch.equal(out_tok[:, :16], old0) and torch.equal(out_tok[:, 8:24], old8)):
+                    logger.warning("Fused M=24 lm_head overlap self-check mismatch; keeping M=16 tree")
+                    return False
             if (
                 not torch.equal(out_tok, ref)
                 or int(torch.count_nonzero(layer.workspace).item()) != 0
-                or int(scratch.view(torch.int32)[4096].item()) != 0
+                or int(scratch.view(torch.int32)[(10304 if cm > 16 else 4096)].item()) != 0
             ):
                 logger.warning("Fused multi-M lm_head+lmpost self-check mismatch (m=%d); keeping 2-kernel path", cm)
                 return False
+        return True
+
+    for cm in (7, 12, 16, 2):
+        if not _check_cm(cm):
+            return False
     layer.marlin_decode6_lmpost_m_admitted = True
     logger.info(
         "Fused multi-M lm_head+lmpost decode6 kernel admitted bitwise (n=%d, vocab=%d, k=%d, split2=%s, pad128=%s)",
         n, org_vocab_size, k, is_lm_split2(scales6), pad128,
     )
+    # Native single-weight-pass M=17..24: its own bitwise check against the M<=16 windows [0:16] and [8:24];
+    # a failure leaves the M<=16 admission above untouched.
+    try:
+        m24_ok = _check_cm(24)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Fused M=24 lm_head check failed: %s", exc)
+        m24_ok = False
+    if m24_ok:
+        layer.marlin_decode6_lmpost_m24_admitted = True
+        _M24_ADMITTED_SCALES.add(layer.weight_global_scale.data_ptr())
+        _M24_LMHEAD_SCALES.add(layer.weight_global_scale.data_ptr())
+        logger.info(
+            "Fused multi-M lm_head+lmpost decode6 M=24 admitted bitwise (n=%d, vocab=%d, k=%d, split2=%s, pad128=%s)",
+            n, org_vocab_size, k, is_lm_split2(scales6), pad128,
+        )
     return True
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Native single-weight-pass M=17..24 admission.  The kernels (thread_m_blocks == 2 instantiation of the Marlin
+# template, two 16-row A/accumulator tiles sharing every dequantized B fragment) are launched through the same
+# entry points as M<=16; a layer is admitted only after M=24 matches two ordinary M<=16 launches bitwise on rows
+# [0:16] and [8:24] (the overlap makes every row observable twice).  Any mismatch/exception => M=16 tree.
+# ---------------------------------------------------------------------------------------------------------------
+_M24_MODEL_REF = None
+_M24_RESULT: dict[int, bool] = {}
+
+
+def _m24_note_model(model: torch.nn.Module) -> None:
+    global _M24_MODEL_REF
+    import weakref
+
+    try:
+        _M24_MODEL_REF = weakref.ref(model)
+    except TypeError:
+        _M24_MODEL_REF = lambda: model  # noqa: E731
+    _M24_RESULT.clear()
+
+
+def _m24_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    dt = torch.int16 if a.element_size() == 2 else torch.uint8
+    return torch.equal(a.contiguous().view(dt), b.contiguous().view(dt))
+
+
+def _m24_overlap(run, make_out, x24: torch.Tensor, dev: torch.device) -> bool:
+    """run(x, out) launches an M<=24 kernel; make_out(m) allocates its output; compare 24 vs 16 | 16 windows."""
+    x0 = x24[:16].contiguous()
+    x8 = x24[8:].contiguous()
+    o24, o0, o8 = make_out(24), make_out(16), make_out(16)
+    if not (run(x24, o24) and run(x0, o0) and run(x8, o8)):
+        return False
+    torch.cuda.synchronize(dev)
+    return _m24_equal(o24[:16], o0) and _m24_equal(o24[8:24], o8)
+
+
+def _m24_overlap_sw(run, make_out, x24: torch.Tensor, dev: torch.device, flat_cols: int) -> bool:
+    """Fused SwiGLU variants pack row r at r*flat_cols of the output buffer (scratch lives behind row m)."""
+    x0 = x24[:16].contiguous()
+    x8 = x24[8:].contiguous()
+    o24, o0, o8 = make_out(24), make_out(16), make_out(16)
+    if not (run(x24, o24) and run(x0, o0) and run(x8, o8)):
+        return False
+    torch.cuda.synchronize(dev)
+
+    def rows(o, m):
+        return o.reshape(-1)[: m * flat_cols].view(m, flat_cols)
+
+    r24 = rows(o24, 24)
+    return _m24_equal(r24[:16], rows(o0, 16)) and _m24_equal(r24[8:24], rows(o8, 16))
+
+
+def _m24_admit_module(mod: torch.nn.Module) -> bool:
+    gs = getattr(mod, "weight_global_scale", None)
+    s6 = getattr(mod, "_marlin_decode_scales6", None)
+    w = getattr(mod, "_marlin_decode_weight", None)
+    pal = getattr(mod, "_marlin_decode_palette", None)
+    ws = getattr(mod, "workspace", None)
+    if gs is None or s6 is None or w is None or pal is None or ws is None:
+        return False
+    n, k = mod.output_size_per_partition, mod.input_size_per_partition
+    key = gs.data_ptr()
+    if (n, k) == (LM_HEAD_N, LM_HEAD_K):
+        return bool(getattr(mod, "marlin_decode6_lmpost_m24_admitted", False)) and key in _M24_ADMITTED_SCALES
+    if not is_tma4_ilv(s6) or _sk_tma4_ilv_m is None or k % 128 or n % 128:
+        return False
+    dev = s6.device
+    gen = torch.Generator(device=dev).manual_seed(20261130 + (n ^ k))
+    partials = torch.empty((48, 32, 128), dtype=torch.float32, device=dev)
+    with torch.cuda.device(dev):
+        st = torch.cuda.current_stream().cuda_stream
+        ok = True
+        for mag in (0.05, 1.5, 16.0):
+            x = (torch.randn((24, k), generator=gen, device=dev) * mag).to(torch.bfloat16).contiguous()
+
+            def run_raw(xx, out):
+                return _sk_tma4_ilv_m(
+                    xx.data_ptr(), w.data_ptr(), out.data_ptr(), partials.data_ptr(), s6.data_ptr(),
+                    pal.data_ptr(), gs.data_ptr(), ws.data_ptr(), int(xx.shape[0]), n, k, 48, dev.index, st) == 0
+
+            ok = _m24_overlap(run_raw, lambda m: torch.empty((m, n), dtype=torch.bfloat16, device=dev), x, dev)
+            if not ok:
+                break
+            # The fused gate_up SwiGLU / gated o_proj epilogues are never used at 17..24 rows (see decode_linear6),
+            # so only the plain multi-M GEMM is admitted here.
+        if ok and int(torch.count_nonzero(ws).item()) != 0:
+            ok = False
+    return ok
+
+
+def admit_lmhead_m_early(model) -> bool:
+    """Run the (M<=16 + M=24) fused lm_head+lmpost admission at load time instead of at the first real verify step.
+
+    Same function, same arguments and same conditions as the sampler's lazy block in model_runner.sample; it only
+    runs earlier so that M=24 arming can be decided before the tree width is chosen and the graphs are captured.
+    The sampler skips its own call once `marlin_decode6_lmpost_m_admitted` is set."""
+    try:
+        import lmpost as _lmp
+
+        lm_head = model.lm_head
+        lp = model.logits_processor
+        am = getattr(model, "_lmpost_softcap_argmax", None)
+        if am is None or getattr(lm_head, "marlin_decode6_lmpost_m_admitted", None) is not None:
+            return bool(getattr(lm_head, "marlin_decode6_lmpost_m_admitted", False))
+        if (
+            getattr(lm_head, "tp_size", 1) != 1
+            or getattr(lm_head, "bias", None) is not None
+            or getattr(lp, "logits_as_input", False)
+            or getattr(lp, "soft_cap", None) is not None
+            or float(getattr(lp, "scale", 1.0)) != 1.0
+        ):
+            return False
+        org_vocab = int(getattr(lp, "org_vocab_size", getattr(lm_head, "org_vocab_size", 0)))
+        dev = lm_head._marlin_decode_scales6.device
+        mult = float(model.output_multiplier)
+        cap = model.final_logit_softcapping
+        lut = _lmp._get_lut(dev, mult, cap)
+        ok = admit_tma4_lmpost_m(lm_head, lut, org_vocab, am, mult, cap)
+        lm_head.marlin_decode6_lmpost_m_admitted = ok
+        logger.info("decode6 lm_head+lmpost admitted at load: M<=16=%s M=24=%s", ok,
+                    bool(getattr(lm_head, "marlin_decode6_lmpost_m24_admitted", False)))
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("early lm_head+lmpost admission failed (%r); lazy path / M=16 tree remain", exc)
+        return False
+
+
+def decode6_m24_admitted(device=None) -> bool:
+    """True iff every decode6 NVFP4 layer (MLP gate_up/down, o_proj, lm_head) passed the M=24 overlap check."""
+    ref = _M24_MODEL_REF
+    model = ref() if ref is not None else None
+    if model is None or not _M24_LMHEAD_SCALES:
+        return False
+    idx = device.index if isinstance(device, torch.device) else device
+    cached = _M24_RESULT.get(-1 if idx is None else int(idx))
+    if cached is not None:
+        return cached
+    ok = True
+    n_layers = 0
+    try:
+        for mod in model.modules():
+            if getattr(mod, "_marlin_decode_scales6", None) is None:
+                continue
+            if idx is not None and mod._marlin_decode_scales6.device.index != idx:
+                continue
+            n_layers += 1
+            if not _m24_admit_module(mod):
+                logger.warning("decode6 M=24 overlap check failed on %s (n=%s k=%s); keeping M=16 tree",
+                               type(mod).__name__, getattr(mod, "output_size_per_partition", None),
+                               getattr(mod, "input_size_per_partition", None))
+                ok = False
+                _M24_ADMITTED_SCALES.discard(mod.weight_global_scale.data_ptr())
+                break
+            _M24_ADMITTED_SCALES.add(mod.weight_global_scale.data_ptr())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("decode6 M=24 admission raised %r; keeping M=16 tree", exc)
+        ok = False
+    ok = ok and n_layers > 0
+    if ok:
+        logger.info("decode6 M=24 admitted bitwise (%d NVFP4 layers + lm_head, overlap [0:16]/[8:24])", n_layers)
+    _M24_RESULT[-1 if idx is None else int(idx)] = ok
+    return ok
+
 
 
 def _pair_gate_up_tensors(w_raw: torch.Tensor, s_raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1300,6 +1537,7 @@ def _pair_gate_up_tensors(w_raw: torch.Tensor, s_raw: torch.Tensor) -> tuple[tor
 
 
 def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
+    _m24_note_model(model)
     if os.environ.get("MUSE_GATE_UP_SWIGLU", "1") == "0":
         return 0
     want_fp8 = os.environ.get("MUSE_GATE_UP_SWIGLU_FP8", "1") != "0"
@@ -1417,7 +1655,7 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
 
         swiglu_out = torch.empty((1, GATE_UP_N), dtype=torch.bfloat16, device=dev)
         swiglu_fp8_out = torch.empty((1, DOWN_K), dtype=torch.float8_e4m3fn, device=dev) if is_fp8 else None
-        partials = torch.empty((48, 16, 128), dtype=torch.float32, device=dev)
+        partials = torch.empty((48, 32, 128), dtype=torch.float32, device=dev)
         ok = True
         with torch.cuda.device(dev):
             stream = torch.cuda.current_stream().cuda_stream
@@ -1547,8 +1785,8 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
             ):
                 try:
                     gen_fm = torch.Generator(device=dev).manual_seed(20261129 + count_fp8)
-                    sw_buf_m = torch.empty((16, GATE_UP_N), dtype=torch.bfloat16, device=dev)
-                    sw_fp8_buf_m = torch.empty((16, DOWN_K), dtype=torch.float8_e4m3fn, device=dev)
+                    sw_buf_m = torch.empty((24, GATE_UP_N), dtype=torch.bfloat16, device=dev)
+                    sw_fp8_buf_m = torch.empty((24, DOWN_K), dtype=torch.float8_e4m3fn, device=dev)
                     check_ms = (7, 8, 12, 16) if count_fp8 == 0 else (7, 16)
                     fm_ok = True
                     for cm in check_ms:
@@ -1620,7 +1858,7 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
                 try:
                     import muse_norm_glue as G
                     gen_m = torch.Generator(device=dev).manual_seed(20261127 + count_bf16)
-                    sw_buf_m = torch.empty((16, GATE_UP_N), dtype=torch.bfloat16, device=dev)
+                    sw_buf_m = torch.empty((24, GATE_UP_N), dtype=torch.bfloat16, device=dev)
                     check_ms = (7, 8, 12, 16) if count_bf16 == 0 else (7, 12)
                     m_ok = True
                     for cm in check_ms:
@@ -1712,13 +1950,13 @@ def launch_oproj_gated6_m(
     if _sk_tma4_ilv_gated_m is None or not is_tma4_ilv(scales6):
         raise RuntimeError("SM121 Marlin multi-M o_proj gated kernel unavailable")
     m = int(gate.numel() // OPROJ_K)
-    if m < 1 or m > 16 or gate.numel() != m * OPROJ_K or attn.numel() != m * OPROJ_K:
+    if m < 1 or m > 24 or gate.numel() != m * OPROJ_K or attn.numel() != m * OPROJ_K:
         raise RuntimeError(f"SM121 Marlin multi-M o_proj gated invalid shape: m={m}")
     if not gate.is_contiguous() or gate.data_ptr() % 16:
         gate = gate.clone(memory_format=torch.contiguous_format)
     if not attn.is_contiguous() or attn.data_ptr() % 16:
         attn = attn.clone(memory_format=torch.contiguous_format)
-    partials = gate.new_empty((48, 16, 128), dtype=torch.float32)
+    partials = gate.new_empty((48, 32 if m > 16 else 16, 128), dtype=torch.float32)
     output = gate.new_empty(out_shape)
     with torch.cuda.device(gate.device):
         status = _sk_tma4_ilv_gated_m(
@@ -1734,6 +1972,7 @@ def launch_oproj_gated6_m(
 
 def register_all_oproj_sigmoid(model: torch.nn.Module) -> int:
     global _ALL_OPROJ_GATED_READY, _ALL_OPROJ_GATED_M_READY
+    _m24_note_model(model)
     _ALL_OPROJ_GATED_READY = False
     _ALL_OPROJ_GATED_M_READY = False
     _GATED_OPROJ.clear()

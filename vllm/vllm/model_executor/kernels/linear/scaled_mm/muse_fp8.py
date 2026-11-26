@@ -61,7 +61,7 @@ def _scales_ok(As: torch.Tensor | None, Bs: torch.Tensor | None, n: int) -> bool
     )
 
 
-def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -> torch.Tensor | None:
+def _prepare_inner(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -> torch.Tensor | None:
     """Pack the layer's finished [K, N] column-major e4m3 weight for the M == 1 GEMV, check it, register it."""
     if _mf is None or _mf.lib() is None:
         return None
@@ -92,6 +92,16 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
                             and torch.equal(got_m[8:].view(torch.int16), ref_hi.view(torch.int16))
                         ):
                             raise RuntimeError(f"muserans kM16 self-check mismatch at M={cm}")
+                if _RANS_M and hasattr(_rans, "rans_m24_check_blob") and os.environ.get("MUSERANS_M24", "1") != "0":
+                    # M=17..24 single-pass kernel: bitwise [0:16]/[8:24] overlap against the M<=16 launches on this real
+                    # blob; a mismatch poisons the M=24 admission globally (callers keep the record M=16 tree).
+                    m24_ok = bool(_rans.rans_m24_check_blob(blob, ws.reshape(-1), xs.reshape(-1), n, k))
+                    _stats["m24_checked"] = _stats.get("m24_checked", 0) + 1
+                    if not m24_ok:
+                        _stats["m24_rejected"] = _stats.get("m24_rejected", 0) + 1
+                        logger.warning("muserans: M=24 overlap self-check MISMATCH on N=%d K=%d; M=24 disabled", n, k)
+                    elif _stats["m24_checked"] in (1, 42, 49):
+                        logger.info("muserans: M=24 overlap self-check [0:16]/[8:24] admitted bitwise on %d rANS FP8 layers", _stats["m24_checked"])
                 if (
                     _RANS_M
                     and os.environ.get("MUSE_RANS_PROLOGUE_M16", "0") != "0"
@@ -138,6 +148,52 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
     # A buffer, so the weight-range bookkeeping (l2pf) sees it as model memory.
     layer.register_buffer("muse_fp8_packed", packed, persistent=False)
     return packed
+
+
+_M24_FP8_NONRANS = {"checked": 0, "bad": 0}
+
+
+def _m24_cutlass_rows_ok(w, ws, xs) -> bool:
+    """Layers that do NOT run the rANS M=24 kernel execute `_small_row_fp8` at 17..24 rows. Check that op bitwise
+    against the M=1 reference (ops.cutlass_scaled_mm, one row at a time) on this layer's real weight."""
+    k, n = w.shape
+    gen = torch.Generator(device=w.device).manual_seed(n * 17 + k + 24)
+    for mag in (0.05, 1.0, 8.0):
+        x = torch.randn(24, k, generator=gen, device=w.device) * mag
+        xq = (x / xs.float().reshape(1, 1)).clamp(-448, 448).to(torch.float8_e4m3fn).contiguous()
+        got = _small_row_fp8(xq, w, xs, ws)
+        for r in (0, 7, 15, 16, 23):
+            ref = _cutlass(xq[r : r + 1].contiguous(), w, xs, ws)
+            if not torch.equal(got[r : r + 1].view(torch.int16), ref.view(torch.int16)):
+                return False
+    return True
+
+
+def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -> torch.Tensor | None:
+    packed = _prepare_inner(layer, w_name, w_s_name, i_s_name)
+    w = getattr(layer, w_name, None)
+    if w is None or not isinstance(w, torch.Tensor) or w.dim() != 2 or w.dtype != torch.float8_e4m3fn or not w.is_cuda:
+        return packed
+    k, n = w.shape
+    if packed is not None and packed.numel() > 0 and packed.numel() != n * k and _RANS_M:
+        return packed  # rANS layer: covered by rans_m24_check_blob
+    ws = getattr(layer, w_s_name, None)
+    xs = getattr(layer, i_s_name, None)
+    ok = False
+    try:
+        ok = _scales_ok(xs, ws, n) and _m24_cutlass_rows_ok(w, ws, xs)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("muse_fp8 M=24 non-rANS check raised: %r", e)
+    _M24_FP8_NONRANS["checked"] += 1
+    if not ok:
+        _M24_FP8_NONRANS["bad"] += 1
+        logger.warning("muse_fp8: non-rANS FP8 layer N=%d K=%d is not M=24-checked/bitwise; M=24 tree will not arm", n, k)
+    return packed
+
+
+def m24_fp8_ok() -> bool:
+    """False if any FP8 layer that runs outside the rANS M=24 kernel failed (or could not run) its M=24 check."""
+    return _M24_FP8_NONRANS["bad"] == 0
 
 
 def _self_check(run, w_kn: torch.Tensor, sb: torch.Tensor, sa: torch.Tensor) -> bool:
@@ -204,6 +260,21 @@ def _muse_fp8_scaled_mm(
             if fused is not None:
                 return fused
         # verify-width rows: the same rANS stream and the same per-row MMA chain as the M == 1 GEMV
+        out = torch.empty((A.shape[0], n), dtype=torch.bfloat16, device=A.device)
+        _rans.rans_gemm_m_auto(packed, A, Bs.reshape(-1), As.reshape(-1), out, n, k)
+        return out
+    if (
+        16 < A.shape[0] <= 24
+        and _RANS_M
+        and packed.numel() > 0
+        and packed.numel() != n * k
+        and A.is_contiguous()
+        and A.dtype == torch.float8_e4m3fn
+        and _scales_ok(As, Bs, n)
+        and hasattr(_rans, "rans_m24_is_admitted")
+        and _rans.rans_m24_is_admitted()
+    ):
+        # single weight pass for 17..24 rows (admitted only after the bitwise [0:16]/[8:24] overlap self-test)
         out = torch.empty((A.shape[0], n), dtype=torch.bfloat16, device=A.device)
         _rans.rans_gemm_m_auto(packed, A, Bs.reshape(-1), As.reshape(-1), out, n, k)
         return out

@@ -441,8 +441,11 @@ static int br_pdl_cfg() {
   return mode;
 }
 
-template <bool kPar4, bool kM16 = false, bool kXsmem = false>
+template <bool kPar4, bool kM16 = false, bool kXsmem = false, bool kM24 = false>
 __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
+  // kM24 (M = 17..24): rows 0..15 keep the exact kM16 MMA sequence; rows 16..23 use a second m16 tile (a1 = a3 = 0)
+  // fed by the same decoded B fragments b0..b3 (decoded once per K32 step). Global-x par4 only.
+  static_assert(!kM24 || (kPar4 && kM16 && !kXsmem), "kM24 requires the global-x par4 kM16 configuration");
   __shared__ __align__(16) uint32_t sh_lut[4096];
   extern __shared__ __align__(16) unsigned char smem[];
 
@@ -560,6 +563,9 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       valid_m ? reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(g) * K + 8 * t) : nullptr;
   const uint4* xrow_u4_hi =
       valid_m_hi ? reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(g + 8) * K + 8 * t) : nullptr;
+  const bool valid_m_24 = kM24 && ((g + 16) < pb.M);
+  const uint4* xrow_u4_24 =
+      valid_m_24 ? reinterpret_cast<const uint4*>(pb.x + static_cast<size_t>(g + 16) * K + 8 * t) : nullptr;
   const uint32_t base_m1 = pb.base_m1;
 
   uint32_t st[kNS];
@@ -606,6 +612,7 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
       const int nb = w + r_i * pb.tw;
       const bool do_nb = active && (nb < NB);
       float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+      float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;  // kM24 second tile (rows 16..23 in d0/d1; d2/d3 zero-row padding)
       const int trig_s = (do_nb && (pb.pdl_mode & 2) && (nb + pb.tw >= NB)) ? ((S > 16) ? (S - 16) : 0) : -1;
       if constexpr (kXsmem) {
         load_x_chunk(0, 0);
@@ -626,6 +633,7 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
             // Pre-issue 1 (or 2 for kM16) vectorized uint4 activation loads (SMEM or L1/L2) + 4 LUT loads.
             uint4 v_lo = make_uint4(0u, 0u, 0u, 0u);
             uint4 v_hi = make_uint4(0u, 0u, 0u, 0u);
+            uint4 v_24 = make_uint4(0u, 0u, 0u, 0u);
             if constexpr (kXsmem) {
               const uint32_t xbase = (cur_buf * 16 + (s - cs)) * kBrXStrideU4;
               if (valid_m) v_lo = x_smem_u4[xbase + g * 4 + t];
@@ -636,6 +644,9 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
               if (valid_m) v_lo = __ldg(xrow_u4 + 4 * s);
               if constexpr (kM16) {
                 if (valid_m_hi) v_hi = __ldg(xrow_u4_hi + 4 * s);
+              }
+              if constexpr (kM24) {
+                if (valid_m_24) v_24 = __ldg(xrow_u4_24 + 4 * s);
               }
             }
 
@@ -752,6 +763,10 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
             if constexpr (kM16) {
               br_xpose4(v_hi, t, a1, a3, a5, a7);
             }
+            uint32_t h0 = 0u, h2 = 0u, h4 = 0u, h6 = 0u;  // rows 16..23 fragments (kM24)
+            if constexpr (kM24) {
+              br_xpose4(v_24, t, h0, h2, h4, h6);
+            }
 
             const uint32_t sm01 = __byte_perm(sm_w0, 0u, 0x4140);
             const uint32_t sm23 = __byte_perm(sm_w0, 0u, 0x4342);
@@ -762,6 +777,9 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
             } else {
               bf16_mma_m16n8k16(c0, c1, c2, c3, a0, a2, b0, b1);
             }
+            if constexpr (kM24) {
+              bf16_mma_m16n8k16(d0, d1, d2, d3, h0, h2, b0, b1);
+            }
 
             const uint32_t sm45 = __byte_perm(sm_w1, 0u, 0x4140);
             const uint32_t sm67 = __byte_perm(sm_w1, 0u, 0x4342);
@@ -771,6 +789,9 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
               bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a4, a5, a6, a7, b2, b3);
             } else {
               bf16_mma_m16n8k16(c0, c1, c2, c3, a4, a6, b2, b3);
+            }
+            if constexpr (kM24) {
+              bf16_mma_m16n8k16(d0, d1, d2, d3, h4, h6, b2, b3);
             }
 
             if (!had_esc) {
@@ -800,6 +821,14 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
             r2.x = __float2bfloat16_rn(c2);
             r2.y = __float2bfloat16_rn(c3);
             *reinterpret_cast<__nv_bfloat162*>(dst_out + static_cast<size_t>(g + 8) * dst_N + dst_nb * 8 + 2 * t) = r2;
+          }
+        }
+        if constexpr (kM24) {
+          if (valid_m_24) {
+            __nv_bfloat162 r3;
+            r3.x = __float2bfloat16_rn(d0);
+            r3.y = __float2bfloat16_rn(d1);
+            *reinterpret_cast<__nv_bfloat162*>(dst_out + static_cast<size_t>(g + 16) * dst_N + dst_nb * 8 + 2 * t) = r3;
           }
         }
       }
@@ -1020,6 +1049,8 @@ static void br_set_attrs_once() {
                        static_cast<int>(kMaxSmem - kLutBytes));
   cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
   cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
+  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, true, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+  cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, true, false, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
   cudaFuncSetAttribute(br_pair_mma_gemm_kernel<true, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(kMaxSmem - kLutBytes));
   cudaFuncSetAttribute(br_pair_mma_gemm_kernel<false, true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1028,7 +1059,7 @@ static void br_set_attrs_once() {
   done = true;
 }
 
-template <bool kPar4, bool kM16 = false, bool kXsmem = false>
+template <bool kPar4, bool kM16 = false, bool kXsmem = false, bool kM24 = false>
 static inline void br_launch_k(int blocks, int threads, size_t dsmem, cudaStream_t st, BrProb pb) {
   if ((pb.pdl_mode & 1) != 0) {
     cudaLaunchConfig_t lcfg = {};
@@ -1041,10 +1072,10 @@ static inline void br_launch_k(int blocks, int threads, size_t dsmem, cudaStream
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     lcfg.attrs = attr;
     lcfg.numAttrs = 1;
-    cudaError_t err = cudaLaunchKernelEx(&lcfg, br_pair_mma_gemm_kernel<kPar4, kM16, kXsmem>, pb);
+    cudaError_t err = cudaLaunchKernelEx(&lcfg, br_pair_mma_gemm_kernel<kPar4, kM16, kXsmem, kM24>, pb);
     TORCH_CHECK(err == cudaSuccess, "br_pair_mma_gemm_kernel PDL launch failed: ", cudaGetErrorString(err));
   } else {
-    br_pair_mma_gemm_kernel<kPar4, kM16, kXsmem><<<blocks, threads, dsmem, st>>>(pb);
+    br_pair_mma_gemm_kernel<kPar4, kM16, kXsmem, kM24><<<blocks, threads, dsmem, st>>>(pb);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
@@ -1212,7 +1243,7 @@ static void bf16_rans_gemm_launch(
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(),
               "x must be contiguous CUDA bf16 [M, K]");
   const int M = static_cast<int>(x.size(0));
-  TORCH_CHECK(M >= 1 && M <= 16 && x.size(1) == K && N % 8 == 0 && K % 32 == 0, "bad shape");
+  TORCH_CHECK(M >= 1 && M <= 24 && x.size(1) == K && N % 8 == 0 && K % 32 == 0, "bad shape");
   TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "bad blob");
 
   const BrCfg cfg = br_pick_cfg(static_cast<int>(N), static_cast<int>(K));
@@ -1257,6 +1288,12 @@ static void bf16_rans_gemm_launch(
   }();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const bool x_aligned16 = ((reinterpret_cast<uintptr_t>(pb.x) & 15u) == 0u);
+  if (M > 16) {
+    // M = 17..24: one weight pass, second accumulator tile for rows 16..23 (callers gate this on the overlap self-test).
+    TORCH_CHECK(par4_en && x_aligned16 && dsmem <= 48u * 1024u, "bf16 rANS M=24 needs par4, 16B-aligned x and <=48 KiB smem");
+    br_launch_k<true, true, false, true>(cfg.blocks, cfg.wpb * 32, dsmem, st, pb);
+    return;
+  }
   if (par4_en && x_aligned16) {
     if (M > 8) {
       if (xsmem_en && ((K >> 5) % 16 == 0) && dsmem_xsmem <= static_cast<size_t>(kMaxSmem - kLutBytes)) {

@@ -208,7 +208,8 @@ template <int TileN, int Threads, bool GateUpGrid, bool DownIlv, bool GateV48,
           bool GateUpSwiglu, bool FuseLmPost, bool FuseMulSigmoid,
           int Stages, bool Split2, int FixedShape,
           bool GateUpSwigluFp8, bool TmaOvlp, bool HalfSplit, bool FastPal16,
-          bool MultiM = false, bool KloopOvlp = false, bool MBlock8 = true>
+          bool MultiM = false, bool KloopOvlp = false, bool MBlock8 = true,
+          int ThreadM = 1>
 int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* partials,
                      const int4* coded, const int4* palette, const float* global_scale,
                      int* locks, int n, int k, int grid, int device, cudaStream_t stream,
@@ -218,7 +219,7 @@ int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* 
                      uint8_t* fp8_out, int prob_m = 1) {
   auto kernel = muse_marlin6_tma4::Marlin<
       vllm::kBFloat16.id(), vllm::kFE2M1f.id(), vllm::kBFloat16.id(),
-      vllm::kFE4M3fn.id(), Threads, 1, TileN / 16, 8, MBlock8, Stages, 1, false, true,
+      vllm::kFE4M3fn.id(), Threads, ThreadM, TileN / 16, 8, MBlock8, Stages, 1, false, true,
       GateUpGrid, DownIlv, GateV48, GateUpSwiglu, FuseLmPost, FuseMulSigmoid, Split2,
       FixedShape, GateUpSwigluFp8, TmaOvlp, HalfSplit, FastPal16, MultiM, KloopOvlp>;
   static int cached_shared[16] = {0};
@@ -246,7 +247,26 @@ int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* 
       }
       return cudaSuccess;
     };
-    if constexpr (MultiM && !MBlock8 && TileN == 128 && Threads == 256 && Stages == 3 && FastPal16) {
+    if constexpr (ThreadM == 2) {
+      // Native M=17..24 (two 16-row A tiles, one weight pass).  Versus the M<=16 figures below the A stages are
+      // 2x (+4,096 B/stage for 128x256; +4,096 B/stage for 64x128) and sh_red must hold 32 output rows
+      // ((2*tn+1)*32*16 B = 8,704 B at tn=8; 4,608 B at tn=4):
+      //   128x256 S3: 62,880 + 12,288 + 2,560 = 77,728 B (FixedShape 3: 79,520 B) <= 78 KiB (79,872 B)
+      //   128x256 S4: 75,168 + 16,384 + 2,560 = 94,112 B (FixedShape 3: 95,904 B) <= 94 KiB (96,256 B)
+      //   64x128  S4: 48,048 + 16,384 + 240 = 64,672 B <= 70 KiB; all below the 99 KiB opt-in limit.
+      if constexpr (TileN == 128 && Threads == 256 && (Stages == 3 || Stages == 4)) {
+        shared = (Stages == 3) ? (78 * 1024) : (94 * 1024);
+        auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
+        if (status != cudaSuccess) { (void)cudaGetLastError(); return status; }
+      } else if constexpr (TileN == 64 && Threads == 128 && Stages == 4) {
+        shared = 70 * 1024;
+        auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
+        if (status != cudaSuccess) { (void)cudaGetLastError(); return status; }
+      } else {
+        auto status = set_optin_smem();
+        if (status != cudaSuccess) return status;
+      }
+    } else if constexpr (MultiM && !MBlock8 && TileN == 128 && Threads == 256 && Stages == 3 && FastPal16) {
       // Exact M<=16 SMEM: 3+3+2 sh_red (6,144 B) for FixedShape!=3, 2-chunk sh_red (4,368 B max) for FixedShape==3:
       // sh_b(24576)+sh_s(8192)+sh_a(12288)+pal(128)+states(1024)+rslot(6400|8192)+rlut(4096)+rbar(32)+sh_red(6144|4368)
       // = 62,880 B (FixedShape!=3) / 62,896 B (FixedShape==3) <= 62 KiB (< 63 KiB usable) -> full 64 KiB L1 cache/SM on SM121!
@@ -527,6 +547,15 @@ int launch_tma4_m(const int4* input, const int4* weight, int4* output, int4* par
                   int64_t* lmpost_out, int org_vocab_size,
                   const int4* input_aux, const float* fp8_scale,
                   uint8_t* fp8_out, int prob_m) {
+  if (prob_m > 16) {
+    // M=17..24: one weight pass, two 16-row A/accumulator tiles (rows 0..15 in the M=16 order).
+    return launch_tma4_impl<TileN, Threads, GateUpGrid, DownIlv, GateV48, GateUpSwiglu,
+                            FuseLmPost, FuseMulSigmoid, Stages, Split2, FixedShape,
+                            GateUpSwigluFp8, TmaOvlp, HalfSplit, FastPal16, true, true, false, 2>(
+        input, weight, output, partials, coded, palette, global_scale, locks,
+        n, k, grid, device, stream, pair_locks, lmpost_lut, lmpost_out,
+        org_vocab_size, input_aux, fp8_scale, fp8_out, prob_m);
+  }
   if (prob_m > 8) {
     return launch_tma4_impl<TileN, Threads, GateUpGrid, DownIlv, GateV48, GateUpSwiglu,
                             FuseLmPost, FuseMulSigmoid, Stages, Split2, FixedShape,
@@ -615,7 +644,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_swiglu_m(
     const int4* input, const int4* weight, int4* output, int4* partials,
     const int4* coded, const int4* palette, const float* global_scale,
     int* locks, int m, int n, int k, int blocks, int device, cudaStream_t stream) {
-  if (m < 1 || m > 16 || n != 39936 || k != 6656 || blocks != 48)
+  if (m < 1 || m > 24 || n != 39936 || k != 6656 || blocks != 48)
     return cudaErrorInvalidValue;
   static const int gu_st = decode6_tma4_stages("MUSE_TMA4_SWIGLU_M_STAGES", 3);  // S3 NVFP4TUNE: 3-stage multi-M gate_up
   if (gu_st == 3)
@@ -653,7 +682,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_swiglu_fp8_m(
     const int4* coded, const int4* palette, const float* global_scale,
     int* locks, const float* fp8_scale, uint8_t* fp8_out,
     int m, int n, int k, int blocks, int device, cudaStream_t stream) {
-  if (m < 1 || m > 16 || n != 39936 || k != 6656 || blocks != 48 ||
+  if (m < 1 || m > 24 || n != 39936 || k != 6656 || blocks != 48 ||
       fp8_scale == nullptr || fp8_out == nullptr)
     return cudaErrorInvalidValue;
   static const int gu_st = decode6_tma4_stages("MUSE_TMA4_SWIGLU_M_STAGES", 3);
@@ -717,7 +746,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_lmpost_m(
     const int4* coded, const int4* palette, const float* global_scale, int* locks,
     const uint16_t* lmpost_lut, int64_t* lmpost_out, int org_vocab_size,
     int m, int n, int k, int blocks, int device, cudaStream_t stream) {
-  if (m < 1 || m > 16 || (n != 202048 && n != 202112) || k != 6656 ||
+  if (m < 1 || m > 24 || (n != 202048 && n != 202112) || k != 6656 ||
       (blocks != 48 && blocks != 96) || org_vocab_size <= 0 || org_vocab_size > n ||
       lmpost_lut == nullptr || lmpost_out == nullptr) {
     return cudaErrorInvalidValue;
@@ -844,7 +873,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
                                           int4* partials, const int4* coded, const int4* palette,
                                           const float* global_scale, int* locks, int m, int n, int k,
                                           int blocks, int device, cudaStream_t stream) {
-  if (m < 1 || m > 16) return cudaErrorInvalidValue;
+  if (m < 1 || m > 24) return cudaErrorInvalidValue;
   if (n == 202112 && k == 6656 && (blocks == 48 || blocks == 96)) {
     const int st = decode6_lm128_stages(blocks);
     if (st == 3) {
@@ -915,7 +944,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_gated_m(
     const int4* gate, const int4* attn, const int4* weight, int4* output,
     int4* partials, const int4* coded, const int4* palette, const float* global_scale,
     int* locks, int m, int n, int k, int blocks, int device, cudaStream_t stream) {
-  if (m < 1 || m > 16 || n != 6656 || k != 4096 || blocks != 48 || gate == nullptr || attn == nullptr)
+  if (m < 1 || m > 24 || n != 6656 || k != 4096 || blocks != 48 || gate == nullptr || attn == nullptr)
     return cudaErrorInvalidValue;
   static const int m_st = decode6_tma4_stages("MUSE_TMA4_M_STAGES", 3);
   if (m_st == 4) {
