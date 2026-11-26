@@ -975,6 +975,7 @@ class FlashAttentionImpl(AttentionImpl):
                     softmax_scale=self.scale,
                     window=window,
                     max_num_splits=attn_metadata.max_num_splits,
+                    allow_gate_fuse=getattr(layer, "_muse_compiled_output_gate", False),
                 ):
                     return output
 

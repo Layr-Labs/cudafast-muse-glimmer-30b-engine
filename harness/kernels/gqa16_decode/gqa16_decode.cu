@@ -119,6 +119,53 @@ __device__ __forceinline__ float fast_rcpf(float x) {
   asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
 }
+__device__ __forceinline__ float gate_sigmoid_glue(float g) {
+  float sig;
+  asm("{\n\t"
+      ".reg .f32 ng, t, e, d;\n\t"
+      "sub.f32 ng, 0f00000000, %1;\n\t"
+      "mul.f32 t, ng, 0f3FB8AA3B;\n\t"
+      "ex2.approx.f32 e, t;\n\t"
+      "add.f32 d, e, 0f3F800000;\n\t"
+      "div.full.f32 %0, 0f3F800000, d;\n\t"
+      "}" : "=f"(sig) : "f"(g));
+  return sig;
+}
+
+template <bool kGate>
+__device__ __forceinline__ uint32_t gated_pair_u32(
+    float a0, float a1, const __nv_bfloat16* __restrict__ gate_pair) {
+  const __nv_bfloat162 raw = __floats2bfloat162_rn(a0, a1);
+  if constexpr (kGate) {
+    const float2 of = __bfloat1622float2(raw);
+    const __nv_bfloat162 graw = *reinterpret_cast<const __nv_bfloat162*>(gate_pair);
+    const float2 gf = __bfloat1622float2(graw);
+    const __nv_bfloat162 r = __floats2bfloat162_rn(
+        __fmul_rn(gate_sigmoid_glue(gf.x), of.x), __fmul_rn(gate_sigmoid_glue(gf.y), of.y));
+    return *reinterpret_cast<const uint32_t*>(&r);
+  } else {
+    return *reinterpret_cast<const uint32_t*>(&raw);
+  }
+}
+
+template <bool kGate>
+__device__ __forceinline__ void store_empty_verify_row(
+    __nv_bfloat16* dst, const __nv_bfloat16* gate) {
+  uint4 lo = make_uint4(0u, 0u, 0u, 0u);
+  uint4 hi = lo;
+  if constexpr (kGate) {
+    lo = make_uint4(gated_pair_u32<true>(0.0f, 0.0f, gate),
+                    gated_pair_u32<true>(0.0f, 0.0f, gate + 2),
+                    gated_pair_u32<true>(0.0f, 0.0f, gate + 4),
+                    gated_pair_u32<true>(0.0f, 0.0f, gate + 6));
+    hi = make_uint4(gated_pair_u32<true>(0.0f, 0.0f, gate + 8),
+                    gated_pair_u32<true>(0.0f, 0.0f, gate + 10),
+                    gated_pair_u32<true>(0.0f, 0.0f, gate + 12),
+                    gated_pair_u32<true>(0.0f, 0.0f, gate + 14));
+  }
+  *reinterpret_cast<uint4*>(dst) = lo;
+  *reinterpret_cast<uint4*>(dst + 8) = hi;
+}
 
 __device__ __forceinline__ void cp_async_16(uint32_t smem_dst, const void* gmem_src) {
   // Plain cp.async.cg without L2::cache_hint -> 0 uniform-register cache descriptors (0 odd-UR risk).
@@ -2156,7 +2203,7 @@ __device__ __forceinline__ void combine_splits_pipe_exact(
   *reinterpret_cast<uint4*>(dst + 8) = make_uint4(packed[4], packed[5], packed[6], packed[7]);
 }
 
-template <bool kMultiQDirect = false, bool kPdl = false>
+template <bool kMultiQDirect = false, bool kPdl = false, bool kGate = false>
 __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
     const __nv_bfloat16* __restrict__ kv_ptr,
@@ -2179,7 +2226,8 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
     const int32_t* __restrict__ cu_seqlens_q_ptr = nullptr,
     int64_t q_tok_stride = 0,
     int64_t out_tok_stride = 0,
-    const int32_t* __restrict__ leaf_flag_ptr = nullptr) {
+    const int32_t* __restrict__ leaf_flag_ptr = nullptr,
+    const __nv_bfloat16* __restrict__ gate_ptr = nullptr) {
   __shared__ Pipe128Storage smem;
 
   const int worker_idx  = blockIdx.x;
@@ -2202,6 +2250,7 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
     if (q_idx >= actual_m) return;
     q_ptr += static_cast<int64_t>(q0 + q_idx) * q_tok_stride;
     out_ptr += static_cast<int64_t>(q0 + q_idx) * out_tok_stride;
+    if constexpr (kGate) gate_ptr += static_cast<int64_t>(q0 + q_idx) * out_tok_stride;
     if (leaf_flag_ptr != nullptr && leaf_flag_ptr[0] < 0 && actual_m <= 16 && seqlen_k >= actual_m) {
       // Generalized arbitrary-depth (1..6-level) bit-packed tree remap table (sentinel leaf_flag_ptr[0] == -1):
       // entry q_idx sits at [1 + 3*q_idx + {0: seq_sub, 1: base_sub, 2: remap_packed}] inside int32[49].
@@ -2259,9 +2308,8 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
     if (worker_idx == 0) {
       const int q_local = tid >> 3;
       const int d_base = (tid & 7) << 4;
-      __nv_bfloat16* dst = out_ptr + static_cast<int64_t>(kv_head * 16 + q_local) * out_head_stride + d_base;
-      *reinterpret_cast<uint4*>(dst)     = make_uint4(0u, 0u, 0u, 0u);
-      *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0u, 0u, 0u, 0u);
+      const int64_t off = static_cast<int64_t>(kv_head * 16 + q_local) * out_head_stride + d_base;
+      store_empty_verify_row<kGate>(out_ptr + off, kGate ? gate_ptr + off : nullptr);
     }
     if constexpr (kPdl) {
       asm volatile("griddepcontrol.launch_dependents;");
@@ -2530,16 +2578,16 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
       #pragma unroll
       for (int dt = 0; dt < 4; ++dt) {
         const int d_col = (warp_id << 5) + (dt << 3) + (tid_in_grp << 1);
-        const __nv_bfloat162 ob0 = __floats2bfloat162_rn(
-            mul_ftz_f32(o_frag[dt][0], inv0), mul_ftz_f32(o_frag[dt][1], inv0));
-        const __nv_bfloat162 ob1 = __floats2bfloat162_rn(
-            mul_ftz_f32(o_frag[dt][2], inv1), mul_ftz_f32(o_frag[dt][3], inv1));
-        *reinterpret_cast<uint32_t*>(
-            out_ptr + static_cast<int64_t>(kv_head * 16 + group_id) * out_head_stride + d_col) =
-            *reinterpret_cast<const uint32_t*>(&ob0);
-        *reinterpret_cast<uint32_t*>(
-            out_ptr + static_cast<int64_t>(kv_head * 16 + group_id + 8) * out_head_stride + d_col) =
-            *reinterpret_cast<const uint32_t*>(&ob1);
+        const int64_t base_off = static_cast<int64_t>(kv_head * 16 + group_id) * out_head_stride + d_col;
+        const int64_t base_off1 = static_cast<int64_t>(kv_head * 16 + group_id + 8) * out_head_stride + d_col;
+        const uint32_t w0 = gated_pair_u32<kGate>(
+            mul_ftz_f32(o_frag[dt][0], inv0), mul_ftz_f32(o_frag[dt][1], inv0),
+            kGate ? gate_ptr + base_off : nullptr);
+        *reinterpret_cast<uint32_t*>(out_ptr + base_off) = w0;
+        const uint32_t w1 = gated_pair_u32<kGate>(
+            mul_ftz_f32(o_frag[dt][2], inv1), mul_ftz_f32(o_frag[dt][3], inv1),
+            kGate ? gate_ptr + base_off1 : nullptr);
+        *reinterpret_cast<uint32_t*>(out_ptr + base_off1) = w1;
       }
       return;
     } else {
@@ -2726,7 +2774,7 @@ __device__ __forceinline__ void pipe128_softmax_and_pv_step(
   __syncthreads();
 }
 
-template <int kQBatch, bool kPdl = false>
+template <int kQBatch, bool kPdl, bool kGate>
 __global__ __launch_bounds__(128, 1) void gqa16_fa2_block128_pipe_multiq_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
     const __nv_bfloat16* __restrict__ kv_ptr,
@@ -2744,7 +2792,8 @@ __global__ __launch_bounds__(128, 1) void gqa16_fa2_block128_pipe_multiq_kernel(
     const int32_t* __restrict__ cu_seqlens_q_ptr,
     int64_t q_tok_stride,
     int64_t out_tok_stride,
-    const int32_t* __restrict__ leaf_flag_ptr) {
+    const int32_t* __restrict__ leaf_flag_ptr,
+    const __nv_bfloat16* __restrict__ gate_ptr = nullptr) {
   extern __shared__ __align__(128) unsigned char dyn_smem[];
   auto& smem = *reinterpret_cast<MultiQPipe128Storage<kQBatch>*>(dyn_smem);
 
@@ -2866,10 +2915,9 @@ __global__ __launch_bounds__(128, 1) void gqa16_fa2_block128_pipe_multiq_kernel(
     if (empty_q[qb]) {
       const int q_local = tid >> 3;
       const int d_base = (tid & 7) << 4;
-      __nv_bfloat16* dst = out_ptr + static_cast<int64_t>(q0 + q_idx) * out_tok_stride +
-                           static_cast<int64_t>(kv_head * 16 + q_local) * out_head_stride + d_base;
-      *reinterpret_cast<uint4*>(dst)     = make_uint4(0u, 0u, 0u, 0u);
-      *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0u, 0u, 0u, 0u);
+      const int64_t off = static_cast<int64_t>(q0 + q_idx) * out_tok_stride +
+                          static_cast<int64_t>(kv_head * 16 + q_local) * out_head_stride + d_base;
+      store_empty_verify_row<kGate>(out_ptr + off, kGate ? gate_ptr + off : nullptr);
       continue;
     }
     if (!active_q[qb]) continue;
@@ -3158,39 +3206,42 @@ __global__ __launch_bounds__(128, 1) void gqa16_fa2_block128_pipe_multiq_kernel(
     const float inv0 = smem.base.warp_sum[group_id];
     const float inv1 = smem.base.warp_sum[group_id + 8];
     __nv_bfloat16* const out_row = out_ptr + static_cast<int64_t>(q0 + q_base + qb) * out_tok_stride;
+    const __nv_bfloat16* const gate_row =
+        kGate ? gate_ptr + static_cast<int64_t>(q0 + q_base + qb) * out_tok_stride : nullptr;
     #pragma unroll
     for (int dt = 0; dt < 4; ++dt) {
       const int d_col = (warp_id << 5) + (dt << 3) + (tid_in_grp << 1);
-      const __nv_bfloat162 ob0 = __floats2bfloat162_rn(
-          mul_ftz_f32(o_frag[qb][dt][0], inv0), mul_ftz_f32(o_frag[qb][dt][1], inv0));
-      const __nv_bfloat162 ob1 = __floats2bfloat162_rn(
-          mul_ftz_f32(o_frag[qb][dt][2], inv1), mul_ftz_f32(o_frag[qb][dt][3], inv1));
-      *reinterpret_cast<uint32_t*>(
-          out_row + static_cast<int64_t>(kv_head * 16 + group_id) * out_head_stride + d_col) =
-          *reinterpret_cast<const uint32_t*>(&ob0);
-      *reinterpret_cast<uint32_t*>(
-          out_row + static_cast<int64_t>(kv_head * 16 + group_id + 8) * out_head_stride + d_col) =
-          *reinterpret_cast<const uint32_t*>(&ob1);
+      const int64_t base_off = static_cast<int64_t>(kv_head * 16 + group_id) * out_head_stride + d_col;
+      const int64_t base_off1 = static_cast<int64_t>(kv_head * 16 + group_id + 8) * out_head_stride + d_col;
+      const uint32_t w0 = gated_pair_u32<kGate>(
+          mul_ftz_f32(o_frag[qb][dt][0], inv0), mul_ftz_f32(o_frag[qb][dt][1], inv0),
+          kGate ? gate_row + base_off : nullptr);
+      *reinterpret_cast<uint32_t*>(out_row + base_off) = w0;
+      const uint32_t w1 = gated_pair_u32<kGate>(
+          mul_ftz_f32(o_frag[qb][dt][2], inv1), mul_ftz_f32(o_frag[qb][dt][3], inv1),
+          kGate ? gate_row + base_off1 : nullptr);
+      *reinterpret_cast<uint32_t*>(out_row + base_off1) = w1;
     }
     __syncthreads();
   }
 }
 
+template <bool kGate>
 static void gqa16_multiq_set_attrs_once() {
   static bool done = false;
   if (done) return;
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   cudaThreadExchangeStreamCaptureMode(&mode);
-  cudaFuncSetAttribute(gqa16_fa2_block128_pipe_multiq_kernel<4, false>,
+  cudaFuncSetAttribute(gqa16_fa2_block128_pipe_multiq_kernel<4, false, kGate>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(sizeof(MultiQPipe128Storage<4>)));
-  cudaFuncSetAttribute(gqa16_fa2_block128_pipe_multiq_kernel<4, true>,
+  cudaFuncSetAttribute(gqa16_fa2_block128_pipe_multiq_kernel<4, true, kGate>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(sizeof(MultiQPipe128Storage<4>)));
-  cudaFuncSetAttribute(gqa16_fa2_block128_pipe_multiq_kernel<2, false>,
+  cudaFuncSetAttribute(gqa16_fa2_block128_pipe_multiq_kernel<2, false, kGate>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(sizeof(MultiQPipe128Storage<2>)));
-  cudaFuncSetAttribute(gqa16_fa2_block128_pipe_multiq_kernel<2, true>,
+  cudaFuncSetAttribute(gqa16_fa2_block128_pipe_multiq_kernel<2, true, kGate>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(sizeof(MultiQPipe128Storage<2>)));
   cudaThreadExchangeStreamCaptureMode(&mode);
@@ -4212,7 +4263,7 @@ __device__ __forceinline__ void wg2_pv_hi(
   }
 }
 
-template <bool kPdl>
+template <bool kPdl, bool kGate>
 __global__ __launch_bounds__(256, 1) void gqa16_verify_wg2_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
     const __nv_bfloat16* __restrict__ kv_ptr,
@@ -4230,7 +4281,8 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_wg2_kernel(
     const int32_t* __restrict__ cu_seqlens_q_ptr,
     int64_t q_tok_stride,
     int64_t out_tok_stride,
-    const int32_t* __restrict__ leaf_flag_ptr) {
+    const int32_t* __restrict__ leaf_flag_ptr,
+    const __nv_bfloat16* __restrict__ gate_ptr = nullptr) {
   extern __shared__ __align__(128) unsigned char dyn_smem[];
   auto& smem = *reinterpret_cast<Wg2Pipe128Storage*>(dyn_smem);
 
@@ -4337,10 +4389,9 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_wg2_kernel(
   if (smem.rows[wg].empty) {
     const int q_local = wg_tid >> 3;
     const int d_base = (wg_tid & 7) << 4;
-    __nv_bfloat16* dst = out_ptr + static_cast<int64_t>(smem.q0 + q_base + wg) * out_tok_stride +
-                         static_cast<int64_t>(kv_head * 16 + q_local) * out_head_stride + d_base;
-    *reinterpret_cast<uint4*>(dst)     = make_uint4(0u, 0u, 0u, 0u);
-    *reinterpret_cast<uint4*>(dst + 8) = make_uint4(0u, 0u, 0u, 0u);
+    const int64_t off = static_cast<int64_t>(smem.q0 + q_base + wg) * out_tok_stride +
+                        static_cast<int64_t>(kv_head * 16 + q_local) * out_head_stride + d_base;
+    muse_gqa16::store_empty_verify_row<kGate>(out_ptr + off, kGate ? gate_ptr + off : nullptr);
   }
 
   if (!smem.any_active) {
@@ -4633,28 +4684,35 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_wg2_kernel(
   const float inv0 = smem.warp_sum[wg][group_id];
   const float inv1 = smem.warp_sum[wg][group_id + 8];
   __nv_bfloat16* const out_row = out_ptr + static_cast<int64_t>(smem.q0 + q_base + wg) * out_tok_stride;
+  const __nv_bfloat16* const gate_row =
+      kGate ? gate_ptr + static_cast<int64_t>(smem.q0 + q_base + wg) * out_tok_stride : nullptr;
   #pragma unroll
   for (int dt = 0; dt < 4; ++dt) {
     const int d_col = (sub_w << 5) + (dt << 3) + (tid_in_grp << 1);
-    const __nv_bfloat162 ob0 = __floats2bfloat162_rn(mul_ftz_f32(o_frag[dt][0], inv0), mul_ftz_f32(o_frag[dt][1], inv0));
-    const __nv_bfloat162 ob1 = __floats2bfloat162_rn(mul_ftz_f32(o_frag[dt][2], inv1), mul_ftz_f32(o_frag[dt][3], inv1));
-    *reinterpret_cast<uint32_t*>(out_row + static_cast<int64_t>(kv_head * 16 + group_id) * out_head_stride + d_col) =
-        *reinterpret_cast<const uint32_t*>(&ob0);
-    *reinterpret_cast<uint32_t*>(out_row + static_cast<int64_t>(kv_head * 16 + group_id + 8) * out_head_stride + d_col) =
-        *reinterpret_cast<const uint32_t*>(&ob1);
+    const int64_t base_off = static_cast<int64_t>(kv_head * 16 + group_id) * out_head_stride + d_col;
+    const int64_t base_off1 = static_cast<int64_t>(kv_head * 16 + group_id + 8) * out_head_stride + d_col;
+    const uint32_t w0 = muse_gqa16::gated_pair_u32<kGate>(
+        mul_ftz_f32(o_frag[dt][0], inv0), mul_ftz_f32(o_frag[dt][1], inv0),
+        kGate ? gate_row + base_off : nullptr);
+    *reinterpret_cast<uint32_t*>(out_row + base_off) = w0;
+    const uint32_t w1 = muse_gqa16::gated_pair_u32<kGate>(
+        mul_ftz_f32(o_frag[dt][2], inv1), mul_ftz_f32(o_frag[dt][3], inv1),
+        kGate ? gate_row + base_off1 : nullptr);
+    *reinterpret_cast<uint32_t*>(out_row + base_off1) = w1;
   }
 }
 
+template <bool kGate>
 static void gqa16_wg2_set_attrs_once() {
   static bool done = false;
   if (done) return;
   cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
   cudaThreadExchangeStreamCaptureMode(&mode);
   constexpr int kWg2Smem = static_cast<int>(sizeof(Wg2Pipe128Storage));
-  cudaFuncSetAttribute(gqa16_verify_wg2_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, kWg2Smem);
-  cudaFuncSetAttribute(gqa16_verify_wg2_kernel<false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
-  cudaFuncSetAttribute(gqa16_verify_wg2_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, kWg2Smem);
-  cudaFuncSetAttribute(gqa16_verify_wg2_kernel<true>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
+  cudaFuncSetAttribute(gqa16_verify_wg2_kernel<false, kGate>, cudaFuncAttributeMaxDynamicSharedMemorySize, kWg2Smem);
+  cudaFuncSetAttribute(gqa16_verify_wg2_kernel<false, kGate>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
+  cudaFuncSetAttribute(gqa16_verify_wg2_kernel<true, kGate>, cudaFuncAttributeMaxDynamicSharedMemorySize, kWg2Smem);
+  cudaFuncSetAttribute(gqa16_verify_wg2_kernel<true, kGate>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
   cudaThreadExchangeStreamCaptureMode(&mode);
   done = true;
 }
@@ -4738,7 +4796,8 @@ extern "C" int muse_gqa16_prefill(
   return static_cast<int>(err);
 }
 
-extern "C" int muse_gqa16_verify_leaf(
+template <bool kGate>
+static int launch_gqa16_verify(
     const void* q_ptr,
     const void* kv_ptr,
     void* out_ptr,
@@ -4759,10 +4818,12 @@ extern "C" int muse_gqa16_verify_leaf(
     int64_t stride_slot,
     int64_t stride_kv_head,
     const void* leaf_flag_ptr,
+    const void* gate_ptr,
     void* cuda_stream) {
   if (!q_ptr || !kv_ptr || !out_ptr || !seqused_k_ptr || !block_table_ptr || !cu_seqlens_q_ptr ||
       max_q < 1 || max_q > 16 ||
       (grid_splits != 1 && grid_splits != 4 && grid_splits != 8 && grid_splits != 16) ||
+      (kGate && (gate_ptr == nullptr || grid_splits != 1)) ||
       block_size < 16 || (block_size & 15) != 0) {
     return 1;
   }
@@ -4781,6 +4842,7 @@ extern "C" int muse_gqa16_verify_leaf(
   const auto* bt = static_cast<const int32_t*>(block_table_ptr);
   const auto* cuq = static_cast<const int32_t*>(cu_seqlens_q_ptr);
   const auto* leaf_flag = static_cast<const int32_t*>(leaf_flag_ptr);
+  const auto* gate = static_cast<const __nv_bfloat16*>(gate_ptr);
 
   if (grid_splits == 1) {
     static const bool verify_pdl = []() {
@@ -4801,7 +4863,7 @@ extern "C" int muse_gqa16_verify_leaf(
       return static_cast<int>(cudaLaunchKernelEx(&cfg, kernel, args...));
     };
     if (max_q >= muse_gqa16_wg2::gqa16_wg2_min_q()) {
-      muse_gqa16_wg2::gqa16_wg2_set_attrs_once();
+      muse_gqa16_wg2::gqa16_wg2_set_attrs_once<kGate>();
       const dim3 wg2_grid(1u, 2u, static_cast<unsigned>((max_q + 1) >> 1));
       const dim3 wg2_block(256u, 1u, 1u);
       constexpr size_t wg2_smem = sizeof(muse_gqa16_wg2::Wg2Pipe128Storage);
@@ -4817,64 +4879,64 @@ extern "C" int muse_gqa16_verify_leaf(
         cfg.attrs = attr;
         cfg.numAttrs = 1;
         return static_cast<int>(cudaLaunchKernelEx(
-            &cfg, muse_gqa16_wg2::gqa16_verify_wg2_kernel<true>,
+            &cfg, muse_gqa16_wg2::gqa16_verify_wg2_kernel<true, kGate>,
             q, kv, out, sk, bt, block_size, window_left, scale_log2,
             q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
-            cuq, q_tok_stride, out_tok_stride, leaf_flag));
+            cuq, q_tok_stride, out_tok_stride, leaf_flag, gate));
       }
-      muse_gqa16_wg2::gqa16_verify_wg2_kernel<false><<<wg2_grid, wg2_block, wg2_smem, stream>>>(
+      muse_gqa16_wg2::gqa16_verify_wg2_kernel<false, kGate><<<wg2_grid, wg2_block, wg2_smem, stream>>>(
           q, kv, out, sk, bt, block_size, window_left, scale_log2,
           q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
-          cuq, q_tok_stride, out_tok_stride, leaf_flag);
+          cuq, q_tok_stride, out_tok_stride, leaf_flag, gate);
       return static_cast<int>(cudaGetLastError());
     }
     const int mq_mode = (max_q >= 2) ? muse_gqa16::gqa16_multiq_mode() : 0;
     if (mq_mode == 4) {
-      muse_gqa16::gqa16_multiq_set_attrs_once();
+      muse_gqa16::gqa16_multiq_set_attrs_once<kGate>();
       const dim3 mq_grid(1u, 2u, static_cast<unsigned>((max_q + 3) / 4));
       const size_t dsmem = sizeof(muse_gqa16::MultiQPipe128Storage<4>);
       if (verify_pdl) {
         return launch_pdl(
-            muse_gqa16::gqa16_fa2_block128_pipe_multiq_kernel<4, true>, mq_grid, dsmem,
+            muse_gqa16::gqa16_fa2_block128_pipe_multiq_kernel<4, true, kGate>, mq_grid, dsmem,
             q, kv, out, sk, bt, block_size, window_left, scale_log2,
             q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
-            cuq, q_tok_stride, out_tok_stride, leaf_flag);
+            cuq, q_tok_stride, out_tok_stride, leaf_flag, gate);
       }
-      muse_gqa16::gqa16_fa2_block128_pipe_multiq_kernel<4, false><<<mq_grid, dim3(128u, 1u, 1u), dsmem, stream>>>(
+      muse_gqa16::gqa16_fa2_block128_pipe_multiq_kernel<4, false, kGate><<<mq_grid, dim3(128u, 1u, 1u), dsmem, stream>>>(
           q, kv, out, sk, bt, block_size, window_left, scale_log2,
           q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
-          cuq, q_tok_stride, out_tok_stride, leaf_flag);
+          cuq, q_tok_stride, out_tok_stride, leaf_flag, gate);
       return static_cast<int>(cudaGetLastError());
     }
     if (mq_mode == 2) {
-      muse_gqa16::gqa16_multiq_set_attrs_once();
+      muse_gqa16::gqa16_multiq_set_attrs_once<kGate>();
       const dim3 mq_grid(1u, 2u, static_cast<unsigned>((max_q + 1) / 2));
       const size_t dsmem = sizeof(muse_gqa16::MultiQPipe128Storage<2>);
       if (verify_pdl) {
         return launch_pdl(
-            muse_gqa16::gqa16_fa2_block128_pipe_multiq_kernel<2, true>, mq_grid, dsmem,
+            muse_gqa16::gqa16_fa2_block128_pipe_multiq_kernel<2, true, kGate>, mq_grid, dsmem,
             q, kv, out, sk, bt, block_size, window_left, scale_log2,
             q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
-            cuq, q_tok_stride, out_tok_stride, leaf_flag);
+            cuq, q_tok_stride, out_tok_stride, leaf_flag, gate);
       }
-      muse_gqa16::gqa16_fa2_block128_pipe_multiq_kernel<2, false><<<mq_grid, dim3(128u, 1u, 1u), dsmem, stream>>>(
+      muse_gqa16::gqa16_fa2_block128_pipe_multiq_kernel<2, false, kGate><<<mq_grid, dim3(128u, 1u, 1u), dsmem, stream>>>(
           q, kv, out, sk, bt, block_size, window_left, scale_log2,
           q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
-          cuq, q_tok_stride, out_tok_stride, leaf_flag);
+          cuq, q_tok_stride, out_tok_stride, leaf_flag, gate);
       return static_cast<int>(cudaGetLastError());
     }
     if (verify_pdl) {
       return launch_pdl(
-          muse_gqa16::gqa16_fa2_block128_pipe_kernel<true, true>, grid, 0,
+          muse_gqa16::gqa16_fa2_block128_pipe_kernel<true, true, kGate>, grid, 0,
           q, kv, out, static_cast<float*>(nullptr), static_cast<float*>(nullptr),
           static_cast<int32_t*>(nullptr), sk, bt, block_size, window_left, 1,
           softmax_scale, scale_log2, q_head_stride, out_head_stride,
-          stride_block, stride_slot, stride_kv_head, cuq, q_tok_stride, out_tok_stride, leaf_flag);
+          stride_block, stride_slot, stride_kv_head, cuq, q_tok_stride, out_tok_stride, leaf_flag, gate);
     }
-    muse_gqa16::gqa16_fa2_block128_pipe_kernel<true, false><<<grid, dim3(128u, 1u, 1u), 0, stream>>>(
+    muse_gqa16::gqa16_fa2_block128_pipe_kernel<true, false, kGate><<<grid, dim3(128u, 1u, 1u), 0, stream>>>(
         q, kv, out, nullptr, nullptr, nullptr, sk, bt, block_size, window_left, 1,
         softmax_scale, scale_log2, q_head_stride, out_head_stride,
-        stride_block, stride_slot, stride_kv_head, cuq, q_tok_stride, out_tok_stride, leaf_flag);
+        stride_block, stride_slot, stride_kv_head, cuq, q_tok_stride, out_tok_stride, leaf_flag, gate);
     return static_cast<int>(cudaGetLastError());
   }
 
@@ -4916,6 +4978,20 @@ extern "C" int muse_gqa16_verify_leaf(
   return static_cast<int>(cudaGetLastError());
 }
 
+extern "C" int muse_gqa16_verify_leaf(
+    const void* q_ptr, const void* kv_ptr, void* out_ptr,
+    const void* seqused_k_ptr, const void* block_table_ptr, const void* cu_seqlens_q_ptr,
+    int max_q, int block_size, int window_left, int grid_splits, int mode, float softmax_scale,
+    int64_t q_tok_stride, int64_t q_head_stride, int64_t out_tok_stride, int64_t out_head_stride,
+    int64_t stride_block, int64_t stride_slot, int64_t stride_kv_head,
+    const void* leaf_flag_ptr, void* cuda_stream) {
+  return launch_gqa16_verify<false>(
+      q_ptr, kv_ptr, out_ptr, seqused_k_ptr, block_table_ptr, cu_seqlens_q_ptr,
+      max_q, block_size, window_left, grid_splits, mode, softmax_scale,
+      q_tok_stride, q_head_stride, out_tok_stride, out_head_stride,
+      stride_block, stride_slot, stride_kv_head, leaf_flag_ptr, nullptr, cuda_stream);
+}
+
 extern "C" int muse_gqa16_verify(
     const void* q_ptr,
     const void* kv_ptr,
@@ -4937,9 +5013,39 @@ extern "C" int muse_gqa16_verify(
     int64_t stride_slot,
     int64_t stride_kv_head,
     void* cuda_stream) {
-  return muse_gqa16_verify_leaf(
+  return launch_gqa16_verify<false>(
       q_ptr, kv_ptr, out_ptr, seqused_k_ptr, block_table_ptr, cu_seqlens_q_ptr,
       max_q, block_size, window_left, grid_splits, mode, softmax_scale,
       q_tok_stride, q_head_stride, out_tok_stride, out_head_stride,
-      stride_block, stride_slot, stride_kv_head, nullptr, cuda_stream);
+      stride_block, stride_slot, stride_kv_head, nullptr, nullptr, cuda_stream);
+}
+
+extern "C" int muse_gqa16_verify_gated(
+    const void* q_ptr,
+    const void* kv_ptr,
+    void* out_ptr,
+    const void* seqused_k_ptr,
+    const void* block_table_ptr,
+    const void* cu_seqlens_q_ptr,
+    int max_q,
+    int block_size,
+    int window_left,
+    int grid_splits,
+    int mode,
+    float softmax_scale,
+    int64_t q_tok_stride,
+    int64_t q_head_stride,
+    int64_t out_tok_stride,
+    int64_t out_head_stride,
+    int64_t stride_block,
+    int64_t stride_slot,
+    int64_t stride_kv_head,
+    const void* leaf_flag_ptr,
+    const void* gate_ptr,
+    void* cuda_stream) {
+  return launch_gqa16_verify<true>(
+      q_ptr, kv_ptr, out_ptr, seqused_k_ptr, block_table_ptr, cu_seqlens_q_ptr,
+      max_q, block_size, window_left, grid_splits, mode, softmax_scale,
+      q_tok_stride, q_head_stride, out_tok_stride, out_head_stride,
+      stride_block, stride_slot, stride_kv_head, leaf_flag_ptr, gate_ptr, cuda_stream);
 }

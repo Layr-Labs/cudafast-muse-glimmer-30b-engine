@@ -332,6 +332,23 @@ def _consume_gqa16_prefill(attn, gate, out, fp8_scale=None, stream=None) -> bool
     return False
 
 
+def _flush_gqa16_verify() -> None:
+    try:
+        import muse_gqa16_attn as _gqa
+    except ImportError:
+        return
+    _gqa.flush_pending_verify()
+
+
+def _consume_gqa16_verify(attn, gate, out, stream) -> bool:
+    try:
+        import muse_gqa16_attn as _gqa
+    except ImportError:
+        return False
+    return _gqa.consume_verify_mul_sigmoid(attn, gate, out, stream)
+
+
+
 class _MulSigmoidSwap:
     def __init__(self) -> None:
         self.state = "unchecked"
@@ -350,12 +367,14 @@ class _MulSigmoidSwap:
             _pending_oproj_sigmoid = None
         if self.state == "rejected" or len(args) != 4:
             _flush_gqa16_prefill(kwargs.get("stream"))
+            _flush_gqa16_verify()
             return orig_run(kernel, *args, **kwargs)
         gate, attn, out, numel = args
         try:
             n_el = int(numel)
         except Exception:
             _flush_gqa16_prefill(kwargs.get("stream"))
+            _flush_gqa16_verify()
             return orig_run(kernel, *args, **kwargs)
         stream = kwargs.get("stream")
         if (
@@ -374,11 +393,13 @@ class _MulSigmoidSwap:
             )
         ):
             _flush_gqa16_prefill(stream)
+            _flush_gqa16_verify()
             return orig_run(kernel, *args, **kwargs)
         import muse_norm_glue as G
 
         if self.state == "unchecked":
             _flush_gqa16_prefill(stream)
+            _flush_gqa16_verify()
             if torch.cuda.is_current_stream_capturing():
                 return orig_run(kernel, *args, **kwargs)
             ok = False
@@ -413,6 +434,8 @@ class _MulSigmoidSwap:
                         _pending_oproj_sigmoid = (out.data_ptr(), gate, attn, False)
                 except Exception:
                     pass
+            return None
+        if n_el > 4096 and _consume_gqa16_verify(attn, gate, out, stream):
             return None
         if n_el > 4096 and _consume_gqa16_prefill(attn, gate, out, None, stream):
             return None
@@ -1327,6 +1350,12 @@ def install_norm_glue() -> None:
         logger.info("muse_norm_glue or the Inductor launcher not available; decode norm glue disabled")
         return
 
+    try:
+        import muse_gqa16_attn as gqa16
+    except ImportError:
+        gqa16 = None
+    mul_sigmoid_swap_type = _MulSigmoidSwap
+
     def _fold_requant(autotuner, orig_run, args, kwargs) -> bool:
         global _pending_decode, _expect_decode
         if _pending_decode is None or len(args) != 4 or not all(isinstance(t, torch.Tensor) for t in args[:3]):
@@ -1393,6 +1422,8 @@ def install_norm_glue() -> None:
             except Exception:
                 swap = None
             self.__dict__["_norm_glue_swap"] = swap
+        if gqa16 is not None and gqa16._pending_verify is not None and not isinstance(swap, mul_sigmoid_swap_type):
+            gqa16.flush_pending_verify()
         if swap is None:
             return prev_run(self, *args, **kwargs)
         return swap.run(self, prev_run, args, kwargs)

@@ -85,6 +85,19 @@ try:
             ctypes.c_void_p,
         ]
         _lib.muse_gqa16_verify_leaf.restype = ctypes.c_int
+    if hasattr(_lib, "muse_gqa16_verify_gated"):
+        _lib.muse_gqa16_verify_gated.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_float,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        _lib.muse_gqa16_verify_gated.restype = ctypes.c_int
 except OSError:
     _lib = None
 
@@ -95,7 +108,11 @@ _verify_state: dict[int, tuple[bool, int]] = {}  # dev_idx -> (admitted, scale_m
 _leaf_verify_admitted: dict[int, bool] = {}  # dev_idx -> 0-ULP native 1-leaf verify admitted
 _leaf_flag_bufs: dict[int, torch.Tensor] = {}  # dev_idx -> static int32[1] device flag
 _pending_prefill: tuple | None = None
+_pending_verify: dict | None = None
+_verify_gate_admitted: dict[int, bool] = {}
+VERIFY_GATE_FUSE = os.environ.get("MUSE_GQA16_VERIFY_GATE_FUSE", "1").strip() not in ("0", "", "false", "no")
 _pf_counts: dict[str, int] = {"defer": 0, "fused1": 0, "fused2": 0, "direct0": 0, "flush": 0, "miss": 0}
+_vf_counts: dict[str, int] = {"defer": 0, "fused": 0, "flush": 0, "raw": 0}
 
 
 def get_leaf_flag(device: torch.device) -> torch.Tensor | None:
@@ -626,6 +643,80 @@ def self_check_verify(device: torch.device) -> bool:
         except Exception:  # noqa: BLE001
             logger.warning("muse_gqa16_attn: native 1-leaf verify self-check raised on cuda:%d", idx, exc_info=True)
             leaf_ok = False
+    gate_ok = False
+    if ok and VERIFY_GATE_FUSE and g_splits == 1 and hasattr(_lib, "muse_gqa16_verify_gated"):
+        try:
+            import muse_norm_glue as G
+
+            gen_g = torch.Generator(device=device).manual_seed(20261128)
+            scale_g = float(128.0 ** -0.5)
+            bs_g = 16
+            nblks_g = 512
+            kv_g = (torch.randn((nblks_g, 2, bs_g, 256), generator=gen_g, device=device) * 0.6).to(torch.bfloat16)
+            perm_g = torch.randperm(nblks_g - 1, generator=gen_g, device=device, dtype=torch.int32) + 1
+            bt_g = perm_g.unsqueeze(0).contiguous()
+            stream_g = torch.cuda.current_stream(device).cuda_stream
+            gate_all = True
+            cases = [(2, 2, 0), (8, 7, 0), (16, 12, 0), (16, 16, 0)]
+            if leaf_ok:
+                packed = [-1]
+                for row in range(16):
+                    if row < 7:
+                        packed.extend((15 - row, -1, 0))
+                    else:
+                        depth = 1 + (row - 7) % 6
+                        packed.extend((15 - depth, 16 - depth, row))
+                leaf_g = torch.tensor(packed, dtype=torch.int32, device=device)
+                cases.append((16, 16, leaf_g.data_ptr()))
+            for max_q, actual_q, leaf_g_ptr in cases:
+                q_g = (torch.randn((max_q, 32, 128), generator=gen_g, device=device) * 1.1).to(torch.bfloat16)
+                gate_t = (torch.randn((max_q, 4096), generator=gen_g, device=device) * 5.0).to(torch.bfloat16)
+                cu_qg = torch.tensor([0, actual_q], dtype=torch.int32, device=device)
+                sk_g = torch.tensor([640], dtype=torch.int32, device=device)
+                raw_g = torch.empty_like(q_g)
+                want_g = torch.empty_like(gate_t)
+                got_g = torch.zeros_like(q_g)
+                for w_left in (-1, 511):
+                    common = (sk_g.data_ptr(), bt_g.data_ptr(), cu_qg.data_ptr(),
+                              max_q, bs_g, w_left, 1, scale_mode | pipe_bit, scale_g,
+                              q_g.stride(0), q_g.stride(1), 4096, 128,
+                              kv_g.stride(0), kv_g.stride(2), kv_g.stride(1))
+                    if leaf_g_ptr:
+                        raw_rc = _lib.muse_gqa16_verify_leaf(
+                            q_g.data_ptr(), kv_g.data_ptr(), raw_g.data_ptr(),
+                            *common, leaf_g_ptr, stream_g,
+                        )
+                    else:
+                        raw_rc = _lib.muse_gqa16_verify(
+                            q_g.data_ptr(), kv_g.data_ptr(), raw_g.data_ptr(), *common, stream_g,
+                        )
+                    if raw_rc != 0:
+                        gate_all = False
+                        break
+                    G.mul_sigmoid_bf16(gate_t, raw_g.view(max_q, 4096), want_g, actual_q * 4096, stream_g)
+                    rc_g = _lib.muse_gqa16_verify_gated(
+                        q_g.data_ptr(), kv_g.data_ptr(), got_g.data_ptr(),
+                        *common, leaf_g_ptr, gate_t.data_ptr(), stream_g,
+                    )
+                    torch.cuda.synchronize(device)
+                    if (
+                        rc_g != 0
+                        or not torch.equal(want_g[:actual_q].view(torch.int16),
+                                           got_g[:actual_q].view(actual_q, 4096).view(torch.int16))
+                        or (actual_q < max_q and torch.count_nonzero(got_g[actual_q:]).item() != 0)
+                    ):
+                        gate_all = False
+                        break
+                if not gate_all:
+                    break
+            gate_ok = gate_all
+        except Exception:  # noqa: BLE001
+            logger.warning("muse_gqa16_attn: verify gate-fused self-check raised on cuda:%d", idx, exc_info=True)
+            gate_ok = False
+    _verify_gate_admitted[idx] = gate_ok
+    if gate_ok:
+        logger.info("muse_gqa16_attn: verify gate-fused epilogue strict 0-ULP admitted on cuda:%d", idx)
+
     _leaf_verify_admitted[idx] = leaf_ok
     if ok:
         logger.info(
@@ -635,6 +726,103 @@ def self_check_verify(device: torch.device) -> bool:
     else:
         logger.warning("muse_gqa16_attn: strict 0-ULP verify self-check failed on cuda:%d; keeping stock FA2", idx)
     return ok
+
+
+def _launch_verify_raw(pend: dict) -> int:
+    """Launch the deferred verify attention exactly as try_verify_gqa16 would have (raw epilogue,
+    original output tensor). Bit-identical to the never-deferred path."""
+    q = pend["q"]
+    kv = pend["kv_cache"]
+    out = pend["output"]
+    if pend["leaf_ptr"] != 0:
+        return _lib.muse_gqa16_verify_leaf(
+            q.data_ptr(), kv.data_ptr(), out.data_ptr(),
+            pend["seqused_k"].data_ptr(), pend["block_table"].data_ptr(), pend["cu_seqlens_q"].data_ptr(),
+            pend["rows"], pend["block_size"], pend["w_left"], pend["g_splits"], pend["mode"], pend["scale"],
+            q.stride(0), q.stride(1), out.stride(0), out.stride(1),
+            kv.stride(0), kv.stride(2), kv.stride(1),
+            pend["leaf_ptr"], pend["stream"],
+        )
+    return _lib.muse_gqa16_verify(
+        q.data_ptr(), kv.data_ptr(), out.data_ptr(),
+        pend["seqused_k"].data_ptr(), pend["block_table"].data_ptr(), pend["cu_seqlens_q"].data_ptr(),
+        pend["rows"], pend["block_size"], pend["w_left"], pend["g_splits"], pend["mode"], pend["scale"],
+        q.stride(0), q.stride(1), out.stride(0), out.stride(1),
+        kv.stride(0), kv.stride(2), kv.stride(1),
+        pend["stream"],
+    )
+
+
+def flush_pending_verify() -> None:
+    global _pending_verify
+    pend = _pending_verify
+    if pend is None:
+        return
+    _pending_verify = None
+    rc = _launch_verify_raw(pend)
+    _vf_counts["flush"] += 1
+    if rc != 0:
+        raise RuntimeError(f"muse_gqa16_verify flush failed with cuda error {rc}")
+
+
+def consume_verify_mul_sigmoid(
+    attn: torch.Tensor,
+    gate: torch.Tensor,
+    out: torch.Tensor,
+    stream: int,
+) -> bool:
+    """Consume the deferred verify attention at the mul_sigmoid interception point, launching it
+    with the gate fused into the epilogue and writing directly into the elementwise kernel's
+    output tensor. Returns False (after flushing the raw kernel) when any shape/stride/aliasing
+    requirement is unmet, in which case the caller must run the elementwise kernel itself."""
+    global _pending_verify
+    pend = _pending_verify
+    if pend is None:
+        return False
+    _pending_verify = None
+    rows = pend["rows"]
+    n_el = rows * 4096
+    eligible = (
+        attn.data_ptr() == pend["out_ptr"]
+        and int(stream) == pend["stream"]
+        and out.untyped_storage().data_ptr() != gate.untyped_storage().data_ptr()
+        and out.untyped_storage().data_ptr() != pend["q"].untyped_storage().data_ptr()
+        and out.untyped_storage().data_ptr() != pend["kv_cache"].untyped_storage().data_ptr()
+        and attn.numel() == n_el
+        and gate.numel() == n_el
+        and out.numel() == n_el
+        and attn.dtype == torch.bfloat16
+        and gate.dtype == torch.bfloat16
+        and out.dtype == torch.bfloat16
+        and attn.is_contiguous()
+        and gate.is_contiguous()
+        and out.is_contiguous()
+        and (out.data_ptr() & 15) == 0
+        and (gate.data_ptr() & 3) == 0
+        and hasattr(_lib, "muse_gqa16_verify_gated")
+    )
+    if not eligible:
+        rc_f = _launch_verify_raw(pend)
+        _vf_counts["flush"] += 1
+        if rc_f != 0:
+            raise RuntimeError(f"muse_gqa16_verify fallback flush failed with cuda error {rc_f}")
+        return False
+    q = pend["q"]
+    kv = pend["kv_cache"]
+    rc = _lib.muse_gqa16_verify_gated(
+        q.data_ptr(), kv.data_ptr(), out.data_ptr(),
+        pend["seqused_k"].data_ptr(), pend["block_table"].data_ptr(), pend["cu_seqlens_q"].data_ptr(),
+        rows, pend["block_size"], pend["w_left"], pend["g_splits"], pend["mode"], pend["scale"],
+        q.stride(0), q.stride(1), 4096, 128,
+        kv.stride(0), kv.stride(2), kv.stride(1),
+        pend["leaf_ptr"], gate.data_ptr(), pend["stream"],
+    )
+    if rc != 0:
+        raise RuntimeError(f"muse_gqa16_verify_gated fused launch failed with cuda error {rc}")
+    _vf_counts["fused"] += 1
+    if _vf_counts["fused"] in (1, 51):
+        logger.info("muse_gqa16_attn: verify gate-fused counts=%s", _vf_counts)
+    return True
 
 
 def try_verify_gqa16(
@@ -648,11 +836,16 @@ def try_verify_gqa16(
     softmax_scale: float,
     window: tuple[int, int] | None,
     max_num_splits: int = 0,
+    *,
+    allow_gate_fuse: bool = False,
 ) -> bool:
     if not VERIFY_ENABLED or _lib is None or not hasattr(_lib, "muse_gqa16_verify"):
         return False
     if num_actual_tokens < 2 or num_actual_tokens > 16 or max_num_splits not in (0, 1):
         return False
+    global _pending_verify
+    if _pending_verify is not None:
+        flush_pending_verify()
     device = query.device
     idx = device.index if device.index is not None else torch.cuda.current_device()
     vst = _verify_state.get(idx)
@@ -713,6 +906,43 @@ def try_verify_gqa16(
         lf = get_leaf_flag(device)
         if lf is not None:
             leaf_ptr = lf.data_ptr()
+    can_defer = (
+        allow_gate_fuse
+        and VERIFY_GATE_FUSE
+        and g_splits == 1
+        and hasattr(_lib, "muse_gqa16_verify_gated")
+        and _verify_gate_admitted.get(idx, False)
+    )
+    if can_defer:
+        try:
+            from vllm.model_executor.models import muse_glimmer_norm_glue as _ng_mod
+            can_defer = _ng_mod._installed and _ng_mod._MUL_SIGMOID_GLUE
+            if can_defer:
+                from vllm.model_executor.models.muse_glimmer import _gate_side_stream
+
+                can_defer = not _gate_side_stream.active and torch.cuda.is_current_stream_capturing()
+        except Exception:
+            can_defer = False
+    if can_defer:
+        _pending_verify = {
+            "out_ptr": output.data_ptr(),
+            "rows": int(num_actual_tokens),
+            "q": query,
+            "kv_cache": kv_cache,
+            "output": output,
+            "seqused_k": seqused_k,
+            "block_table": block_table,
+            "cu_seqlens_q": cu_seqlens_q,
+            "block_size": block_size,
+            "w_left": w_left,
+            "g_splits": g_splits,
+            "mode": vst[1] | pipe_bit,
+            "scale": softmax_scale,
+            "leaf_ptr": leaf_ptr,
+            "stream": stream,
+        }
+        _vf_counts["defer"] += 1
+        return True
     if leaf_ptr != 0:
         rc = _lib.muse_gqa16_verify_leaf(
             query.data_ptr(),
@@ -737,29 +967,31 @@ def try_verify_gqa16(
             leaf_ptr,
             stream,
         )
-    else:
-        rc = _lib.muse_gqa16_verify(
-            query.data_ptr(),
-            kv_cache.data_ptr(),
-            output.data_ptr(),
-            seqused_k.data_ptr(),
-            block_table.data_ptr(),
-            cu_seqlens_q.data_ptr(),
-            int(num_actual_tokens),
-            block_size,
-            w_left,
-            g_splits,
-            vst[1] | pipe_bit,
-            softmax_scale,
-            query.stride(0),
-            query.stride(1),
-            output.stride(0),
-            output.stride(1),
-            kv_cache.stride(0),
-            kv_cache.stride(2),
-            kv_cache.stride(1),
-            stream,
-        )
+        _vf_counts["raw"] += 1
+        return rc == 0
+    rc = _lib.muse_gqa16_verify(
+        query.data_ptr(),
+        kv_cache.data_ptr(),
+        output.data_ptr(),
+        seqused_k.data_ptr(),
+        block_table.data_ptr(),
+        cu_seqlens_q.data_ptr(),
+        int(num_actual_tokens),
+        block_size,
+        w_left,
+        g_splits,
+        vst[1] | pipe_bit,
+        softmax_scale,
+        query.stride(0),
+        query.stride(1),
+        output.stride(0),
+        output.stride(1),
+        kv_cache.stride(0),
+        kv_cache.stride(2),
+        kv_cache.stride(1),
+        stream,
+    )
+    _vf_counts["raw"] += 1
     return rc == 0
 
 
@@ -777,6 +1009,8 @@ def try_decode_gqa16(
 ) -> bool:
     if not ENABLED or _lib is None:
         return False
+    if _pending_verify is not None:
+        flush_pending_verify()
     device = query.device
     idx = device.index if device.index is not None else torch.cuda.current_device()
     st = _state.get(idx)

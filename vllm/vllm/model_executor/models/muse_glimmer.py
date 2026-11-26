@@ -1873,6 +1873,12 @@ class MuseGlimmerAttention(nn.Module):
             per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
         )
+        vllm_config = get_current_vllm_config_or_none()
+        self.attn._muse_compiled_output_gate = (
+            self.use_output_gate
+            and vllm_config is not None
+            and vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+        )
         if self._use_qk_fused:
             _register_qk_attn_layer(self.attn)
         self._fp8_shared_input_scale = False
