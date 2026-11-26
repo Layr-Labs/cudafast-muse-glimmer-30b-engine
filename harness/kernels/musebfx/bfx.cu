@@ -110,6 +110,12 @@ torch::Tensor int3_pack(torch::Tensor W, bool mse_opt = true);
 torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
 torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true);
 torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K);
+torch::Tensor nf6_pack(torch::Tensor W);
+torch::Tensor nf6_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+torch::Tensor nf6_pack_swiglu(torch::Tensor W);
+torch::Tensor nf6_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K);
+torch::Tensor nf8_pack(torch::Tensor W, int64_t wave_ilv = 0);
+torch::Tensor nf8_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K, int64_t wave_ilv = 0);
 torch::Tensor int4_pack(torch::Tensor W, bool mse_opt = true);
 torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
 torch::Tensor int4_gemm_aux5(
@@ -209,6 +215,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int3_gemm", &int3_gemm);
   m.def("int3_pack_swiglu", &int3_pack_swiglu, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
   m.def("int3_gemm_swiglu", &int3_gemm_swiglu);
+  m.def("nf6_pack", &nf6_pack);
+  m.def("nf6_gemm", &nf6_gemm);
+  m.def("nf6_pack_swiglu", &nf6_pack_swiglu);
+  m.def("nf6_gemm_swiglu", &nf6_gemm_swiglu);
+  m.def("nf8_pack", &nf8_pack, pybind11::arg("W"), pybind11::arg("wave_ilv") = 0);
+  m.def("nf8_gemm", &nf8_gemm, pybind11::arg("A"), pybind11::arg("W_packed"),
+        pybind11::arg("N"), pybind11::arg("K"), pybind11::arg("wave_ilv") = 0);
   m.def("int4_pack", &int4_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
   m.def("int4_gemm", &int4_gemm);
   m.def("int4_gemm_aux5", &int4_gemm_aux5);
