@@ -26,6 +26,8 @@ constexpr int kMaxM = 8;
 constexpr int kS2CTAsPerRow = 16;  // 96 CTAs at M=6 (2 CTAs/SM on GB10)
 constexpr int kS2Warps = 8;
 constexpr int kS2MaxGroups = 512;  // covers K <= 8192 (16 KiB SMEM)
+constexpr unsigned kStaticOffsetBits = 13;
+constexpr unsigned kStaticOffsetMask = (1u << kStaticOffsetBits) - 1u;
 
 int dvt_pdl_mode() {
   static const int mode = []() -> int {
@@ -419,11 +421,56 @@ __device__ __forceinline__ float dvt_warp_nvfp4_dot(
   return __bfloat162float(__float2bfloat16_rn(acc * total_scale));
 }
 
+__device__ __forceinline__ unsigned dvt_static_key(unsigned bits, unsigned col) {
+  const unsigned mag = bits & 0x7fffu;
+  if (mag > 0x7f80u || bits > (__float_as_uint(-1e30f) >> 16)) return 0;
+  const unsigned score = 0x8000u + ((bits & 0x8000u) ? -mag : mag);
+  return (score << kStaticOffsetBits) | (kStaticOffsetMask - col);
+}
+
+__device__ __forceinline__ void dvt_scan_static_keys(
+    const uint4* logits, int chunks8, unsigned (&keys)[6]) {
+  for (int j8 = threadIdx.x; j8 < chunks8; j8 += blockDim.x) {
+    const uint4 v = __ldg(logits + j8);
+    const unsigned words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const unsigned bits = (words[i >> 1] >> (16 * (i & 1))) & 0xffffu;
+      const unsigned key = dvt_static_key(bits, (j8 << 3) + i);
+      if (key > keys[5]) {
+#pragma unroll
+        for (int r = 5; r > 0; --r) {
+          keys[r] = max(keys[r], min(keys[r - 1], key));
+        }
+        keys[0] = max(keys[0], key);
+      }
+    }
+  }
+}
+
+__device__ __forceinline__ unsigned dvt_pop_static_warp_top6(
+    unsigned (&keys)[6], int lane) {
+  unsigned winner = 0;
+#pragma unroll
+  for (int r = 0; r < 6; ++r) {
+    const unsigned key = __reduce_max_sync(0xffffffffu, keys[0]);
+    if (lane == r) winner = key;
+    const bool take = key == keys[0];
+#pragma unroll
+    for (int j = 0; j < 5; ++j) {
+      keys[j] = take ? keys[j + 1] : keys[j];
+    }
+    keys[5] = take ? 0u : keys[5];
+  }
+  return winner;
+}
+
 // Fused static-logits reduction + dynamic prompt-tail exact-NVFP4 scoring.
 // Grid: (16, M), Block: 256 threads (8 warps).
 // Under SM121 PDL (pdl_mode & 1), Phase 2 (prompt-tail OOV scoring against A/raw_w) runs BEFORE
 // griddepcontrol.wait, overlapping with the tail of draft_head; Phase 1 then runs vectorized uint4
 // (8 BF16/load) scan of static_logits with short-circuit top-6 merge.
+template <bool kPackedTop6>
 __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ static_logits,
@@ -481,14 +528,14 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
-  const bool want_top8 = (tree_k >= 8 && m < tree_top_rows &&
+  const bool want_top8 = (!kPackedTop6 && tree_k >= 8 && m < tree_top_rows &&
                           out_vals3 != nullptr && out_ids3 != nullptr &&
                           out_vals4 != nullptr && out_ids4 != nullptr &&
                           out_vals5 != nullptr && out_ids5 != nullptr &&
                           out_vals6 != nullptr && out_ids6 != nullptr &&
                           out_vals7 != nullptr && out_ids7 != nullptr &&
                           out_vals8 != nullptr && out_ids8 != nullptr);
-  const bool want_top6 = (!want_top8 && tree_k >= 6 && m < tree_top_rows &&
+  const bool want_top6 = kPackedTop6 || (!want_top8 && tree_k >= 6 && m < tree_top_rows &&
                           out_vals3 != nullptr && out_ids3 != nullptr &&
                           out_vals4 != nullptr && out_ids4 != nullptr &&
                           out_vals5 != nullptr && out_ids5 != nullptr &&
@@ -571,7 +618,8 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
 
   // Phase 1: Reduce static_logits[m, chunk] from L2 cache via vectorized uint4 (8 BF16/load).
   const __nv_bfloat16* sl_row = static_logits + static_cast<size_t>(m) * V_static;
-  const bool vec8_ok = ((V_static & 7) == 0) && ((reinterpret_cast<uintptr_t>(sl_row) & 15u) == 0u);
+  const bool vec8_ok = kPackedTop6 ||
+                       (((V_static & 7) == 0) && ((reinterpret_cast<uintptr_t>(sl_row) & 15u) == 0u));
   const int chunk = vec8_ok ? ((((V_static + kS2CTAsPerRow - 1) / kS2CTAsPerRow) + 7) & ~7)
                             : ((V_static + kS2CTAsPerRow - 1) / kS2CTAsPerRow);
   const int j_start = cta_c * chunk;
@@ -613,7 +661,11 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
     }
   };
 
-  if (vec8_ok) {
+  unsigned static_keys[6] = {};
+  if constexpr (kPackedTop6) {
+    dvt_scan_static_keys(
+        reinterpret_cast<const uint4*>(sl_row + j_start), chunk >> 3, static_keys);
+  } else if (vec8_ok) {
     const uint4* sl_u4 = reinterpret_cast<const uint4*>(sl_row);
     const int j8_start = j_start >> 3;
     const int j8_end = j_end >> 3;
@@ -640,8 +692,34 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
   }
 
   // Warp reduce merged Phase 1 + Phase 2 -> lane 0 holds warp's best candidates.
+  if constexpr (kPackedTop6) {
+    const unsigned winner = dvt_pop_static_warp_top6(static_keys, lane);
+    if (lane < 6) {
+      float val = -1e30f;
+      int tok = 0x7fffffff;
+      if (winner != 0) {
+        const int col = j_start + (kStaticOffsetMask - (winner & kStaticOffsetMask));
+        val = __bfloat162float(__ldg(sl_row + col));
+        tok = static_cast<int>(__ldg(vocab_map + col));
+      }
+      float vals[6];
+      int ids[6];
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) {
+      for (int rank = 0; rank < 6; ++rank) {
+        vals[rank] = __shfl_sync(0x3fu, val, rank);
+        ids[rank] = __shfl_sync(0x3fu, tok, rank);
+      }
+      if (lane == 0) {
+        dvt_top6_merge(best_val, best_id, best2_val, best2_id,
+                       best3_val, best3_id, best4_val, best4_id,
+                       best5_val, best5_id, best6_val, best6_id,
+                       vals[0], ids[0], vals[1], ids[1], vals[2], ids[2],
+                       vals[3], ids[3], vals[4], ids[4], vals[5], ids[5]);
+      }
+    }
+  }
+#pragma unroll
+  for (int o = kPackedTop6 ? 0 : 16; o > 0; o >>= 1) {
     const float ov = __shfl_xor_sync(0xffffffffu, best_val, o);
     const int oi = __shfl_xor_sync(0xffffffffu, best_id, o);
     if (want_top8) {
@@ -1154,7 +1232,8 @@ torch::Tensor draft_vocab_tail_argmax(
     c10::optional<torch::Tensor> out_top2_row0 = c10::nullopt,
     c10::optional<torch::Tensor> out_margins = c10::nullopt,
     c10::optional<torch::Tensor> out_tree_top = c10::nullopt,
-    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt) {
+    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt,
+    bool vocab_map_sorted = false) {
   TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous());
   TORCH_CHECK(static_logits.is_cuda() && static_logits.scalar_type() == torch::kBFloat16 &&
               static_logits.dim() == 2 && static_logits.is_contiguous());
@@ -1225,8 +1304,13 @@ torch::Tensor draft_vocab_tail_argmax(
   int32_t* i8_ptr = (tree_top_ptr != nullptr && tree_k >= 8) ? sc.s2_ids8.data_ptr<int32_t>() : nullptr;
 
   const int pdl_mode = dvt_pdl_mode();
+  const bool packed_top6 = vocab_map_sorted && tree_k == 6 && tree_top_rows == M &&
+      V_static > 0 && V_static % (kS2CTAsPerRow * 8) == 0 &&
+      V_static <= kS2CTAsPerRow * (1 << kStaticOffsetBits) &&
+      (reinterpret_cast<uintptr_t>(static_logits.data_ptr()) & 15u) == 0;
   dvt_launch_pdl(
-      draft_vocab_tail_argmax_kernel, dim3(kS2CTAsPerRow, M), 256, st, pdl_mode,
+      packed_top6 ? draft_vocab_tail_argmax_kernel<true> : draft_vocab_tail_argmax_kernel<false>,
+      dim3(kS2CTAsPerRow, M), 256, st, pdl_mode,
       reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
       reinterpret_cast<const __nv_bfloat16*>(static_logits.data_ptr()),
       vocab_map.data_ptr<int64_t>(),
