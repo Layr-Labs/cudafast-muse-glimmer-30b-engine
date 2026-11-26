@@ -255,6 +255,12 @@ class DFlashSpeculator(DraftModelSpeculator):
                         layer_names, self.model.get_draft_attn_causal()
                     )
                 }
+        self._single_ctx_group = (
+            self._layer_group_idx is None or len(set(self._layer_group_idx)) <= 1
+        )
+        self._single_ctx_gidx = (
+            0 if not self._layer_group_idx else self._layer_group_idx[0]
+        )
 
     @torch.inference_mode()
     def _run_model(
@@ -264,6 +270,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        tail_slice_m6: bool = False,
     ) -> torch.Tensor:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
@@ -275,11 +282,23 @@ class DFlashSpeculator(DraftModelSpeculator):
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
         ):
-            last_hidden_states = self.model(
-                input_ids=self.input_buffers.input_ids[:num_tokens],
-                positions=self.input_buffers.positions[:num_tokens],
-                inputs_embeds=None,
-            )
+            if (
+                tail_slice_m6
+                and hasattr(self.model, "model")
+                and hasattr(self.model.model, "forward_tail_m6")
+            ):
+                last_hidden_states = self.model(
+                    input_ids=self.input_buffers.input_ids[:num_tokens],
+                    positions=self.input_buffers.positions[:num_tokens],
+                    inputs_embeds=None,
+                    tail_slice_m6=True,
+                )
+            else:
+                last_hidden_states = self.model(
+                    input_ids=self.input_buffers.input_ids[:num_tokens],
+                    positions=self.input_buffers.positions[:num_tokens],
+                    inputs_embeds=None,
+                )
         return last_hidden_states
 
     def _generate_draft(
@@ -291,16 +310,48 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
+        num_sample = num_reqs * self.num_speculative_steps
+        use_tail_slice = (
+            num_reqs == 1
+            and not self.sample_from_anchor
+            and num_tokens_padded == 16
+            and num_sample == 6
+            and attn_metadata is not None
+            and os.environ.get("MUSE_DFLASH_FAST_SAMPLE", "1") != "0"
+            and os.environ.get("MUSE_DFLASH_LAST_LAYER_SLICE", "1") != "0"
+        )
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
             slot_mappings,
             num_tokens_across_dp,
             cudagraph_runtime_mode,
+            tail_slice_m6=use_tail_slice,
         )
 
-        num_sample = num_reqs * self.num_speculative_steps
-        sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        if use_tail_slice and last_hidden_states.shape[0] == num_sample:
+            sample_hidden_states = last_hidden_states
+        elif (
+            num_reqs == 1
+            and not self.sample_from_anchor
+            and num_tokens_padded >= 1 + num_sample
+            and last_hidden_states.is_contiguous()
+            and os.environ.get("MUSE_DFLASH_FAST_SAMPLE", "1") != "0"
+        ):
+            sample_hidden_states = last_hidden_states[1 : 1 + num_sample]
+        else:
+            sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        if (
+            num_reqs == 1
+            and self.draft_logits is None
+            and not self.use_local_argmax_reduction
+            and hasattr(self.model, "draft_argmax")
+            and os.environ.get("MUSE_DFLASH_FAST_SAMPLE", "1") != "0"
+        ):
+            fast_toks = self.model.draft_argmax(sample_hidden_states)
+            if fast_toks is not None:
+                self.draft_tokens[:1] = fast_toks.view(1, self.num_speculative_steps)
+                return
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
         draft_tokens = self.sample_draft(
@@ -372,7 +423,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
-        max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        if num_reqs == 1:
+            max_seq_len = int(input_batch.seq_lens_cpu_upper_bound.numpy()[0])
+        else:
+            max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
@@ -430,35 +484,160 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
-        # Support multiple draft KV cache groups by preparing inputs once for each
-        for i, gid in enumerate(self.draft_kv_cache_group_ids):
-            prepare_dflash_inputs(
-                self.input_buffers,
-                self.block_tables.slot_mappings[gid],
-                self.context_positions,
-                self._context_slot_mappings[i],
-                self.sample_indices,
-                self.sample_pos,
-                self.sample_idx_mapping,
-                self.temperature,
-                self.seeds,
-                input_batch,
-                num_sampled,
-                num_rejected,
-                last_sampled,
-                next_prefill_tokens,
-                temperature,
-                seeds,
-                self.block_tables.input_block_tables[gid],
-                self.block_tables.kernel_block_sizes[gid],
-                self.parallel_drafting_token_id,
-                self.num_query_per_req,
-                self.num_speculative_steps,
-                self.max_num_reqs,
-                self.max_num_tokens,
-                self.max_model_len,
-                self.sample_from_anchor,
-            )
+        ran_cpp_prep = False
+        ran_fused_tail = False
+        if (
+            num_reqs == 1
+            and not self.sample_from_anchor
+            and len(self.draft_kv_cache_group_ids) == 1
+            and os.environ.get("MUSE_DFLASH_CPP_PREP", "1") != "0"
+        ):
+            try:
+                import muse_bfx_ext as _bfx
+
+                if hasattr(_bfx, "dflash_prepare_inputs"):
+                    from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _nl
+
+                    gid0 = self.draft_kv_cache_group_ids[0]
+                    bt0 = self.block_tables.input_block_tables[gid0]
+                    lm_head = getattr(self.model, "lm_head", None)
+                    want_ids_base = (
+                        not dummy_run
+                        and not is_profile
+                        and num_target_tokens > 0
+                        and input_batch.input_ids.is_cuda
+                        and input_batch.input_ids.is_contiguous()
+                    )
+                    want_tail = (
+                        want_ids_base
+                        and lm_head is not None
+                        and getattr(lm_head, "prompt_tail_admitted", False)
+                    )
+                    hist_req_id = input_batch.req_ids[0] if input_batch.req_ids else None
+                    hist_buf, hist_len_buf = (
+                        _nl.get_hist_bufs(self.device, hist_req_id)
+                        if (want_ids_base and _nl.ENABLED)
+                        else (None, None)
+                    )
+                    want_ids = want_tail or (hist_buf is not None)
+                    try:
+                        _bfx.dflash_prepare_inputs(
+                            self.input_buffers.input_ids,
+                            self.input_buffers.positions,
+                            self.input_buffers.query_start_loc,
+                            self.input_buffers.seq_lens,
+                            self.block_tables.slot_mappings[gid0],
+                            self.context_positions,
+                            self._context_slot_mappings[0],
+                            self.sample_indices,
+                            self.sample_pos,
+                            self.sample_idx_mapping,
+                            self.temperature,
+                            self.seeds,
+                            input_batch.positions,
+                            input_batch.query_start_loc,
+                            input_batch.idx_mapping,
+                            last_sampled,
+                            next_prefill_tokens,
+                            num_sampled,
+                            num_rejected,
+                            temperature,
+                            seeds,
+                            bt0,
+                            bt0.stride(0),
+                            self.parallel_drafting_token_id,
+                            self.block_tables.kernel_block_sizes[gid0],
+                            self.num_query_per_req,
+                            self.num_speculative_steps,
+                            self.max_num_reqs,
+                            self.max_num_tokens,
+                            self.max_model_len,
+                            PAD_SLOT_ID,
+                            input_batch.input_ids if want_ids else None,
+                            num_target_tokens if want_ids else 0,
+                            lm_head.in_static_vocab if want_tail else None,
+                            lm_head.tail_ids if want_tail else None,
+                            lm_head.tail_count if want_tail else None,
+                            lm_head.tail_seen if want_tail else None,
+                            hist_buf,
+                            hist_len_buf,
+                        )
+                    except TypeError:
+                        _bfx.dflash_prepare_inputs(
+                            self.input_buffers.input_ids,
+                            self.input_buffers.positions,
+                            self.input_buffers.query_start_loc,
+                            self.input_buffers.seq_lens,
+                            self.block_tables.slot_mappings[gid0],
+                            self.context_positions,
+                            self._context_slot_mappings[0],
+                            self.sample_indices,
+                            self.sample_pos,
+                            self.sample_idx_mapping,
+                            self.temperature,
+                            self.seeds,
+                            input_batch.positions,
+                            input_batch.query_start_loc,
+                            input_batch.idx_mapping,
+                            last_sampled,
+                            next_prefill_tokens,
+                            num_sampled,
+                            num_rejected,
+                            temperature,
+                            seeds,
+                            bt0,
+                            bt0.stride(0),
+                            self.parallel_drafting_token_id,
+                            self.block_tables.kernel_block_sizes[gid0],
+                            self.num_query_per_req,
+                            self.num_speculative_steps,
+                            self.max_num_reqs,
+                            self.max_num_tokens,
+                            self.max_model_len,
+                            PAD_SLOT_ID,
+                            input_batch.input_ids if want_tail else None,
+                            num_target_tokens if want_tail else 0,
+                            lm_head.in_static_vocab if want_tail else None,
+                            lm_head.tail_ids if want_tail else None,
+                            lm_head.tail_count if want_tail else None,
+                            lm_head.tail_seen if want_tail else None,
+                        )
+                    ran_cpp_prep = True
+                    ran_fused_tail = want_tail
+            except Exception:  # noqa: BLE001
+                ran_cpp_prep = False
+                ran_fused_tail = False
+
+        if not ran_cpp_prep:
+            # Support multiple draft KV cache groups by preparing inputs once for each
+            for i, gid in enumerate(self.draft_kv_cache_group_ids):
+                prepare_dflash_inputs(
+                    self.input_buffers,
+                    self.block_tables.slot_mappings[gid],
+                    self.context_positions,
+                    self._context_slot_mappings[i],
+                    self.sample_indices,
+                    self.sample_pos,
+                    self.sample_idx_mapping,
+                    self.temperature,
+                    self.seeds,
+                    input_batch,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    self.block_tables.input_block_tables[gid],
+                    self.block_tables.kernel_block_sizes[gid],
+                    self.parallel_drafting_token_id,
+                    self.num_query_per_req,
+                    self.num_speculative_steps,
+                    self.max_num_reqs,
+                    self.max_num_tokens,
+                    self.max_model_len,
+                    self.sample_from_anchor,
+                )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables
@@ -466,6 +645,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Each layer uses the context slots of its own kv-cache group.
         if dummy_run:
             context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
+        elif getattr(self, "_single_ctx_group", False):
+            context_slots = self._context_slot_mappings[self._single_ctx_gidx][
+                :num_target_tokens
+            ]
         elif self._layer_group_idx is not None:
             context_slots = [
                 self._context_slot_mappings[gidx][:num_target_tokens]
@@ -475,7 +658,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
         ctx_pos_slice = self.context_positions[:num_target_tokens]
         if (
-            not dummy_run
+            not ran_fused_tail
+            and not dummy_run
             and not is_profile
             and num_reqs == 1
             and hasattr(self.model, "update_draft_prompt_tail")
@@ -498,46 +682,63 @@ class DFlashSpeculator(DraftModelSpeculator):
             and self.query_cudagraph_manager is not None
             and self.query_cudagraph_manager._graphs_captured
         ):
-            if aux_hidden_states:
-                src_sig = tuple(
-                    (h.data_ptr(), h.dtype, tuple(h.shape), tuple(h.stride()))
-                    for h in aux_hidden_states
+            if (
+                aux_hidden_states
+                and len(aux_hidden_states) == 5
+                and isinstance(context_slots, torch.Tensor)
+            ):
+                cg_key: tuple = (
+                    num_target_tokens,
+                    aux_hidden_states[0].data_ptr(),
+                    aux_hidden_states[0].stride(0),
+                    aux_hidden_states[1].data_ptr(),
+                    aux_hidden_states[2].data_ptr(),
+                    aux_hidden_states[3].data_ptr(),
+                    aux_hidden_states[4].data_ptr(),
+                    ctx_pos_slice.data_ptr(),
+                    context_slots.data_ptr(),
                 )
             else:
-                src_sig = (
-                    (
-                        last_hidden_states.data_ptr(),
-                        last_hidden_states.dtype,
-                        tuple(last_hidden_states.shape),
-                        tuple(last_hidden_states.stride()),
-                    ),
-                )
-            pos_sig = (
-                ctx_pos_slice.data_ptr(),
-                ctx_pos_slice.dtype,
-                tuple(ctx_pos_slice.shape),
-                tuple(ctx_pos_slice.stride()),
-            )
-            slot_sig = (
-                tuple(
-                    (s.data_ptr(), s.dtype, tuple(s.shape), tuple(s.stride()))
-                    if s is not None
-                    else None
-                    for s in context_slots
-                )
-                if isinstance(context_slots, list)
-                else (
-                    (
-                        context_slots.data_ptr(),
-                        context_slots.dtype,
-                        tuple(context_slots.shape),
-                        tuple(context_slots.stride()),
+                if aux_hidden_states:
+                    src_sig = tuple(
+                        (h.data_ptr(), h.dtype, tuple(h.shape), tuple(h.stride()))
+                        for h in aux_hidden_states
                     )
-                    if context_slots is not None
-                    else None,
+                else:
+                    src_sig = (
+                        (
+                            last_hidden_states.data_ptr(),
+                            last_hidden_states.dtype,
+                            tuple(last_hidden_states.shape),
+                            tuple(last_hidden_states.stride()),
+                        ),
+                    )
+                pos_sig = (
+                    ctx_pos_slice.data_ptr(),
+                    ctx_pos_slice.dtype,
+                    tuple(ctx_pos_slice.shape),
+                    tuple(ctx_pos_slice.stride()),
                 )
-            )
-            cg_key = (num_target_tokens, src_sig, pos_sig, slot_sig)
+                slot_sig = (
+                    tuple(
+                        (s.data_ptr(), s.dtype, tuple(s.shape), tuple(s.stride()))
+                        if s is not None
+                        else None
+                        for s in context_slots
+                    )
+                    if isinstance(context_slots, list)
+                    else (
+                        (
+                            context_slots.data_ptr(),
+                            context_slots.dtype,
+                            tuple(context_slots.shape),
+                            tuple(context_slots.stride()),
+                        )
+                        if context_slots is not None
+                        else None,
+                    )
+                )
+                cg_key = (num_target_tokens, src_sig, pos_sig, slot_sig)
             cg = self._ctx_kv_cg_entries.get(cg_key)
             if cg is not None:
                 cg.replay()
