@@ -320,7 +320,7 @@ __device__ __forceinline__ void issue_kv_tile_async(
       const int tok = tok_base + r;
       if (tok >= k_start && tok < seqlen_k) {
         const int tok_eff = (leaf_remap_base >= 0 && tok >= leaf_remap_base)
-            ? (leaf_p_start + static_cast<int>((leaf_remap_packed >> ((tok - leaf_remap_base) << 2)) & 0xFu))
+            ? (leaf_p_start + static_cast<int>((leaf_remap_packed >> ((tok - leaf_remap_base) * 5)) & 0x1Fu))
             : tok;
         const int lb = (block_size == 16) ? (tok_eff >> 4) : (tok_eff / block_size);
         const int slot = (block_size == 16) ? (tok_eff & 15) : (tok_eff - lb * block_size);
@@ -2179,11 +2179,11 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
     if (q_idx >= actual_m) return;
     q_ptr += static_cast<int64_t>(q0 + q_idx) * q_tok_stride;
     out_ptr += static_cast<int64_t>(q0 + q_idx) * out_tok_stride;
-    if (leaf_flag_ptr != nullptr && leaf_flag_ptr[0] < 0 && actual_m <= 16 && seqlen_k >= actual_m) {
+    if (leaf_flag_ptr != nullptr && leaf_flag_ptr[0] < 0 && actual_m <= 32 && seqlen_k >= actual_m) {
       // Generalized arbitrary-depth (1..6-level) bit-packed tree remap table (sentinel leaf_flag_ptr[0] == -1):
       // entry q_idx sits at [1 + 3*q_idx + {0: seq_sub, 1: base_sub, 2: remap_packed}] inside int32[49].
       // For base_sub >= 0, logical KV positions tok = (seqlen_k - base_sub) + j (j = 0..5) remap to
-      // physical slot (seqlen_k - actual_m) + ((remap_packed >> (4*j)) & 0xF).
+      // physical slot (seqlen_k - actual_m) + ((remap_packed >> (5*j)) & 0x1F).
       const int base = 1 + q_idx * 3;
       const int seq_sub = leaf_flag_ptr[base];
       const int base_sub = leaf_flag_ptr[base + 1];
@@ -2778,7 +2778,7 @@ __global__ __launch_bounds__(128, 1) void gqa16_fa2_block128_pipe_multiq_kernel(
     int lrb = -1;
     int lps = 0;
     uint32_t lrp = 0u;
-    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 16 && sk >= actual_m) {
+    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 32 && sk >= actual_m) {
       const int base = 1 + q_idx * 3;
       const int seq_sub = leaf_flag_ptr[base];
       const int base_sub = leaf_flag_ptr[base + 1];
@@ -3934,7 +3934,7 @@ extern "C" int muse_gqa16_verify_leaf(
     const void* leaf_flag_ptr,
     void* cuda_stream) {
   if (!q_ptr || !kv_ptr || !out_ptr || !seqused_k_ptr || !block_table_ptr || !cu_seqlens_q_ptr ||
-      max_q < 1 || max_q > 16 ||
+      max_q < 1 || max_q > 32 ||
       (grid_splits != 1 && grid_splits != 4 && grid_splits != 8 && grid_splits != 16) ||
       block_size < 16 || (block_size & 15) != 0) {
     return 1;

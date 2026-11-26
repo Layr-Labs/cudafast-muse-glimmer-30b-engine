@@ -226,14 +226,15 @@ def _prepare_m_rans(weight: torch.Tensor) -> tuple[torch.Tensor, int] | None:
         if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
             del blob
             return None
-    for cm in (12, 16):
+    for cm in (12, 16, 17, 24, 32):
+        sp = 8 if cm <= 16 else 16  # kM32 rows = admitted kM16 [0:16] + M<=16 [16:]
         xm = (torch.randn((cm, k), generator=gen, device=weight.device) * 1.5).to(torch.bfloat16)
         got_m = _bfx.rans_gemm(xm, blob, n, k, bexp)
-        ref_lo = _bfx.rans_gemm(xm[:8].contiguous(), blob, n, k, bexp)
-        ref_hi = _bfx.rans_gemm(xm[8:].contiguous(), blob, n, k, bexp)
+        ref_lo = _bfx.rans_gemm(xm[:sp].contiguous(), blob, n, k, bexp)
+        ref_hi = _bfx.rans_gemm(xm[sp:].contiguous(), blob, n, k, bexp)
         if (
-            not torch.equal(got_m[:8].view(torch.int16), ref_lo.view(torch.int16))
-            or not torch.equal(got_m[8:].view(torch.int16), ref_hi.view(torch.int16))
+            not torch.equal(got_m[:sp].view(torch.int16), ref_lo.view(torch.int16))
+            or not torch.equal(got_m[sp:].view(torch.int16), ref_hi.view(torch.int16))
         ):
             del blob
             return None
@@ -253,7 +254,7 @@ def update_m_rans(index: torch.Tensor, blob: torch.Tensor) -> None:
 def _decode(x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor,
             index: torch.Tensor) -> torch.Tensor:
     n = weight.shape[0]
-    if (2 <= x.shape[0] <= 16 and x.ndim == 2 and x.shape[1] == _WIDTH
+    if (2 <= x.shape[0] <= 32 and x.ndim == 2 and x.shape[1] == _WIDTH
             and x.dtype == torch.bfloat16 and x.is_cuda and x.is_contiguous()
             and n in _ROWS):
         entry = _M_RANS.get(index.data_ptr())
@@ -342,8 +343,8 @@ class _MuseBF16Lane(UnquantizedLinearMethod):
             return super().apply(layer, x, bias)
         args = (x, layer.weight, packed, layer.muse_bf16_lane_index)
         if torch.compiler.is_compiling():
-            return torch.cond(x.shape[0] <= 16, _packed_branch, _dense_branch, args)
-        if 1 <= x.shape[0] <= 16:
+            return torch.cond(x.shape[0] <= 32, _packed_branch, _dense_branch, args)
+        if 1 <= x.shape[0] <= 32:
             return _packed_branch(*args)
         return super().apply(layer, x, bias)
 

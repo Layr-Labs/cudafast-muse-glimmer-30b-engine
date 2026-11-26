@@ -369,7 +369,7 @@ __global__ void Marlin(
     num_groups = 416;
   }
   if constexpr (fuse_lmpost) {
-    static_assert(scale6 && (m_block_size_8 || (multi_m && thread_m_blocks == 1)) &&
+    static_assert(scale6 && (m_block_size_8 || (multi_m && (thread_m_blocks == 1 || thread_m_blocks == 2))) &&
                   !gate_up_grid && !gate_v48 && !half_split &&
                   ((thread_n_blocks == 4 && threads == 128) ||
                    (thread_n_blocks == 8 && threads == 256)) &&
@@ -398,7 +398,7 @@ __global__ void Marlin(
     prob_k = lda = 6656;
     num_groups = 416;
   } else if constexpr (fixed_shape == 3) {
-    static_assert(scale6 && (m_block_size_8 || (multi_m && thread_m_blocks == 1)) &&
+    static_assert(scale6 && (m_block_size_8 || (multi_m && (thread_m_blocks == 1 || thread_m_blocks == 2))) &&
                   down_ilv && !gate_up_grid && !gate_v48 &&
                   !split2 && !half_split && !gate_up_swiglu && !fuse_mul_sigmoid &&
                   thread_n_blocks == 8 && threads == 256 && thread_k_blocks == 8);
@@ -416,6 +416,16 @@ __global__ void Marlin(
   [[maybe_unused]] int lm_bi = 0x7fffffff;
   [[maybe_unused]] float lm_bv1 = -__int_as_float(0x7f800000);
   [[maybe_unused]] int lm_bi1 = 0x7fffffff;
+  [[maybe_unused]] float lm_bv2 = -__int_as_float(0x7f800000);  // thread_m_blocks == 2: row r0 + 16
+  [[maybe_unused]] int lm_bi2 = 0x7fffffff;
+  [[maybe_unused]] float lm_bv3 = -__int_as_float(0x7f800000);  // thread_m_blocks == 2: row r0 + 24
+  [[maybe_unused]] int lm_bi3 = 0x7fffffff;
+  // Largest raw (pre-LUT) logit seen per accumulator: the softcap LUT is monotone (checked at admission), so a
+  // later raw value <= it at a larger column can never win and needs no LUT lookup.
+  [[maybe_unused]] float lm_rv = -__int_as_float(0x7f800000);
+  [[maybe_unused]] float lm_rv1 = -__int_as_float(0x7f800000);
+  [[maybe_unused]] float lm_rv2 = -__int_as_float(0x7f800000);
+  [[maybe_unused]] float lm_rv3 = -__int_as_float(0x7f800000);
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -3565,9 +3575,14 @@ __global__ void Marlin(
               const int r0 = lane >> 2;
               const bool has_r0 = r0 < prob_m;
               const bool has_r1 = (r0 + 8) < prob_m;
+              [[maybe_unused]] const bool has_r2 = (thread_m_blocks == 2) && (r0 + 16) < prob_m;
+              [[maybe_unused]] const bool has_r3 = (thread_m_blocks == 2) && (r0 + 24) < prob_m;
               const int base_col = slice_col * (thread_n_blocks * 16) + 64 * (threadIdx.x >> 5) + ((lane & 3) << 1);
-              auto upd = [&](float raw_c, int col, float& bv, int& bi) {
-                const __nv_bfloat16 bf = Cdtype::float2num(raw_c * global_scale_f32);
+              auto upd = [&](float raw_c, int col, float& bv, int& bi, float& rv) {
+                const float xs = raw_c * global_scale_f32;
+                if (xs <= rv && col > bi) return;  // LUT(xs) <= LUT(rv) == bv and a larger column: cannot win
+                if (xs > rv) rv = xs;
+                const __nv_bfloat16 bf = Cdtype::float2num(xs);
                 const uint16_t m = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&bf));
                 const float v = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m));
                 if ((v > bv) || (v == bv && col < bi)) {
@@ -3580,22 +3595,41 @@ __global__ void Marlin(
                 const int ca0 = base_col + 16 * j;
                 const int ca1 = ca0 + 1;
                 if (ca0 < org_vocab_size) {
-                  if (has_r0) upd(frag_c[0][j][0][0], ca0, lm_bv, lm_bi);
-                  if (has_r1) upd(frag_c[0][j][0][2], ca0, lm_bv1, lm_bi1);
+                  if (has_r0) upd(frag_c[0][j][0][0], ca0, lm_bv, lm_bi, lm_rv);
+                  if (has_r1) upd(frag_c[0][j][0][2], ca0, lm_bv1, lm_bi1, lm_rv1);
                 }
                 if (ca1 < org_vocab_size) {
-                  if (has_r0) upd(frag_c[0][j][0][1], ca1, lm_bv, lm_bi);
-                  if (has_r1) upd(frag_c[0][j][0][3], ca1, lm_bv1, lm_bi1);
+                  if (has_r0) upd(frag_c[0][j][0][1], ca1, lm_bv, lm_bi, lm_rv);
+                  if (has_r1) upd(frag_c[0][j][0][3], ca1, lm_bv1, lm_bi1, lm_rv1);
                 }
                 const int cb0 = ca0 + 8;
                 const int cb1 = cb0 + 1;
                 if (cb0 < org_vocab_size) {
-                  if (has_r0) upd(frag_c[0][j][1][0], cb0, lm_bv, lm_bi);
-                  if (has_r1) upd(frag_c[0][j][1][2], cb0, lm_bv1, lm_bi1);
+                  if (has_r0) upd(frag_c[0][j][1][0], cb0, lm_bv, lm_bi, lm_rv);
+                  if (has_r1) upd(frag_c[0][j][1][2], cb0, lm_bv1, lm_bi1, lm_rv1);
                 }
                 if (cb1 < org_vocab_size) {
-                  if (has_r0) upd(frag_c[0][j][1][1], cb1, lm_bv, lm_bi);
-                  if (has_r1) upd(frag_c[0][j][1][3], cb1, lm_bv1, lm_bi1);
+                  if (has_r0) upd(frag_c[0][j][1][1], cb1, lm_bv, lm_bi, lm_rv);
+                  if (has_r1) upd(frag_c[0][j][1][3], cb1, lm_bv1, lm_bi1, lm_rv1);
+                }
+                if constexpr (thread_m_blocks == 2) {
+                  constexpr int mb = (thread_m_blocks == 2) ? 1 : 0;
+                  if (ca0 < org_vocab_size) {
+                    if (has_r2) upd(frag_c[mb][j][0][0], ca0, lm_bv2, lm_bi2, lm_rv2);
+                    if (has_r3) upd(frag_c[mb][j][0][2], ca0, lm_bv3, lm_bi3, lm_rv3);
+                  }
+                  if (ca1 < org_vocab_size) {
+                    if (has_r2) upd(frag_c[mb][j][0][1], ca1, lm_bv2, lm_bi2, lm_rv2);
+                    if (has_r3) upd(frag_c[mb][j][0][3], ca1, lm_bv3, lm_bi3, lm_rv3);
+                  }
+                  if (cb0 < org_vocab_size) {
+                    if (has_r2) upd(frag_c[mb][j][1][0], cb0, lm_bv2, lm_bi2, lm_rv2);
+                    if (has_r3) upd(frag_c[mb][j][1][2], cb0, lm_bv3, lm_bi3, lm_rv3);
+                  }
+                  if (cb1 < org_vocab_size) {
+                    if (has_r2) upd(frag_c[mb][j][1][1], cb1, lm_bv2, lm_bi2, lm_rv2);
+                    if (has_r3) upd(frag_c[mb][j][1][3], cb1, lm_bv3, lm_bi3, lm_rv3);
+                  }
                 }
               }
             }
@@ -3727,12 +3761,13 @@ __global__ void Marlin(
   if constexpr (fuse_lmpost) {
     if constexpr (multi_m) {
       __syncthreads();
+      constexpr int kLmRows = m_block_size_8 ? 8 : (16 * thread_m_blocks);
       float* const sh_bv = reinterpret_cast<float*>(sh);
-      int* const sh_bi = reinterpret_cast<int*>(sh_bv + 128);
-      int* const sh_last = sh_bi + 128;
+      int* const sh_bi = reinterpret_cast<int*>(sh_bv + 8 * kLmRows);
+      int* const sh_last = sh_bi + 8 * kLmRows;
 
       constexpr int active_threads = 32 * tb_n_warps;
-      constexpr int sh_row_stride = m_block_size_8 ? 8 : 16;
+      constexpr int sh_row_stride = kLmRows;
       if (threadIdx.x < active_threads) {
         const int lane = threadIdx.x & 31;
         const int w = threadIdx.x >> 5;
@@ -3773,21 +3808,45 @@ __global__ void Marlin(
               lm_bv1 = ov1;
               lm_bi1 = oi1;
             }
+            if constexpr (thread_m_blocks == 2) {
+              const float ov2 = __shfl_xor_sync(0xffffffffu, lm_bv2, off);
+              const int oi2 = __shfl_xor_sync(0xffffffffu, lm_bi2, off);
+              if ((ov2 > lm_bv2) || (ov2 == lm_bv2 && oi2 < lm_bi2)) {
+                lm_bv2 = ov2;
+                lm_bi2 = oi2;
+              }
+              const float ov3 = __shfl_xor_sync(0xffffffffu, lm_bv3, off);
+              const int oi3 = __shfl_xor_sync(0xffffffffu, lm_bi3, off);
+              if ((ov3 > lm_bv3) || (ov3 == lm_bv3 && oi3 < lm_bi3)) {
+                lm_bv3 = ov3;
+                lm_bi3 = oi3;
+              }
+            }
           }
           if ((lane & 3) == 0) {
             const int r0 = lane >> 2;
-            sh_bv[w * 16 + r0] = lm_bv;
-            sh_bi[w * 16 + r0] = lm_bi;
-            sh_bv[w * 16 + r0 + 8] = lm_bv1;
-            sh_bi[w * 16 + r0 + 8] = lm_bi1;
+            sh_bv[w * sh_row_stride + r0] = lm_bv;
+            sh_bi[w * sh_row_stride + r0] = lm_bi;
+            sh_bv[w * sh_row_stride + r0 + 8] = lm_bv1;
+            sh_bi[w * sh_row_stride + r0 + 8] = lm_bi1;
+            if constexpr (thread_m_blocks == 2) {
+              sh_bv[w * sh_row_stride + r0 + 16] = lm_bv2;
+              sh_bi[w * sh_row_stride + r0 + 16] = lm_bi2;
+              sh_bv[w * sh_row_stride + r0 + 24] = lm_bv3;
+              sh_bi[w * sh_row_stride + r0 + 24] = lm_bi3;
+            }
           }
         }
       }
       __syncthreads();
 
+      // per-row CTA bests: [32 x 128] floats + ints for every multi-M width, then the done counter at int32[8192].
+      // One fixed layout for M<=16 and thread_m_blocks=2 so a 32-row call never overwrites the counter of a
+      // later <=16-row call that shares the scratch (scratch >= 8 * 128 * 32 + 4 B).
+      constexpr int kLmScr = 128 * 32;
       float* const g_bv = reinterpret_cast<float*>(C0);
-      int* const g_bi = reinterpret_cast<int*>(g_bv + 2048);
-      int* const g_done = g_bi + 2048;
+      int* const g_bi = reinterpret_cast<int*>(g_bv + kLmScr);
+      int* const g_done = g_bi + kLmScr;
       if (static_cast<int>(threadIdx.x) < prob_m) {
         const int r = static_cast<int>(threadIdx.x);
         float bv = sh_bv[r];
