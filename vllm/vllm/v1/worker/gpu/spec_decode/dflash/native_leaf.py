@@ -51,6 +51,9 @@ TREE_WIDE_M = (
 TREE_WIDE_GATE = os.environ.get("MUSE_NATIVE_TREE_WIDE_GATE", "cpc").strip().lower()
 TREE_WIDE_CPC = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_CPC", "4.8"))
 TREE_WIDE_SM = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_SM", "2.0"))
+TREE_TOP8 = os.environ.get("MUSE_TREE_TOP8", "1").strip().lower() not in ("0", "", "false", "no")
+TREE_TOP_K = 8 if TREE_TOP8 else 6
+TREE_TOP_NUMEL = 6 * TREE_TOP_K
 
 
 def desired_verify_ms() -> tuple[int, ...]:
@@ -175,6 +178,8 @@ def _dump_stats(tag: str) -> None:
                     f" casc[ev={st[40]} br={st[41]} dn={st[42]} "
                     f"pl={st[43]} hit={st[44]} ex={st[45]} dn_chg/hit={st[46]}/{st[47]}]"
                 )
+            if len(st) >= 64 and any(st[48:64]):
+                pl_extra += f" slots9..24={st[48:64]}"
             logger.info(
                 "native_leaf_stats[%s]: steps=%d active=%d hits=%d deep_hits=%d extra_toks=%d deep_bonus=%d "
                 "total_ns=%d max_len=%d len1..6=%s k1..6=%s slots0..8=%s reached_d2/3/4+=%d/%d/%d%s",
@@ -223,7 +228,8 @@ def select_verify_m(req_id: str | None, decoded_tokens: int) -> int:
     if TREE_WIDE_GATE == "sm":
         if _S._host_rounds == 0 or _S.tree_vals is None or _S.tree_vals.numel() < 36:
             return wide_m
-        sm_val = float((_S.tree_vals[0:36:6] - _S.tree_vals[1:36:6]).mean().item())
+        tk = 8 if _S.tree_vals.numel() >= 48 else 6
+        sm_val = float((_S.tree_vals[0 : 6 * tk : tk] - _S.tree_vals[1 : 6 * tk : tk]).mean().item())
         return wide_m if sm_val < TREE_WIDE_SM else base_m
     # Default zero-sync `cpc` gate: enable wide_m on step 0 or while running verify cpc < TREE_WIDE_CPC.
     # decoded_tokens = num_computed_tokens - prefill_len == sum(committed_tokens[0..round-1]).
@@ -297,38 +303,38 @@ def get_margin_buf(device: torch.device) -> torch.Tensor | None:
 
 
 def get_tree_top_buf(device: torch.device) -> torch.Tensor | None:
-    """Return fixed-address int64[36] ([6, 6]) buffer for drafter rows 0..5 top-6 IDs (CUDA-graph safe)."""
+    """Return fixed-address int64[6*TREE_TOP_K] buffer for drafter rows 0..5 top-K IDs (CUDA-graph safe)."""
     if not ENABLED or TREE_M == 0 or device.type != "cuda":
         return None
     if (
         _S.tree_top is not None
         and _S.tree_top.device == device
-        and _S.tree_top.numel() >= 36
+        and _S.tree_top.numel() >= TREE_TOP_NUMEL
         and not _S.tree_top.is_inference()
     ):
         return _S.tree_top
     if torch.cuda.is_current_stream_capturing():
         return _S.tree_top if (_S.tree_top is not None and _S.tree_top.device == device) else None
     with torch.inference_mode(False):
-        _S.tree_top = torch.full((36,), -1, dtype=torch.int64, device=device)
+        _S.tree_top = torch.full((TREE_TOP_NUMEL,), -1, dtype=torch.int64, device=device)
     return _S.tree_top
 
 
 def get_tree_vals_buf(device: torch.device) -> torch.Tensor | None:
-    """Return fixed-address float32[36] ([6, 6]) buffer for drafter rows 0..5 top-6 logits (CUDA-graph safe)."""
+    """Return fixed-address float32[6*TREE_TOP_K] buffer for drafter rows 0..5 top-K logits (CUDA-graph safe)."""
     if not ENABLED or TREE_M == 0 or device.type != "cuda":
         return None
     if (
         _S.tree_vals is not None
         and _S.tree_vals.device == device
-        and _S.tree_vals.numel() >= 36
+        and _S.tree_vals.numel() >= TREE_TOP_NUMEL
         and not _S.tree_vals.is_inference()
     ):
         return _S.tree_vals
     if torch.cuda.is_current_stream_capturing():
         return _S.tree_vals if (_S.tree_vals is not None and _S.tree_vals.device == device) else None
     with torch.inference_mode(False):
-        _S.tree_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
+        _S.tree_vals = torch.full((TREE_TOP_NUMEL,), -1e30, dtype=torch.float32, device=device)
     return _S.tree_vals
 
 
@@ -354,15 +360,20 @@ def get_cascade_bufs(
         and _S.cascade_meta.device == device
         and not _S.cascade_meta.is_inference()
         and _S.cascade_toks is not None
+        and _S.cascade_toks.numel() >= TREE_TOP_NUMEL
         and _S.cascade_vals is not None
+        and _S.cascade_vals.numel() >= TREE_TOP_NUMEL
         and _S.p1_save_draft is not None
         and _S.p1_save_top is not None
+        and _S.p1_save_top.numel() >= TREE_TOP_NUMEL
         and _S.p1_save_vals is not None
+        and _S.p1_save_vals.numel() >= TREE_TOP_NUMEL
         and _S.p1_save_alt is not None
         and _S.p1_save_margins is not None
         and _S.req_acc_state is not None
+        and _S.req_acc_state.numel() >= 5
         and _S.stats is not None
-        and _S.stats.numel() >= 52
+        and _S.stats.numel() >= 68
     ):
         return (
             _S.cascade_meta,
@@ -380,27 +391,27 @@ def get_cascade_bufs(
         return None
     with torch.inference_mode(False):
         _S.cascade_meta = torch.zeros((8,), dtype=torch.int32, device=device)
-        _S.cascade_toks = torch.full((36,), -1, dtype=torch.int64, device=device)
-        _S.cascade_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
+        _S.cascade_toks = torch.full((TREE_TOP_NUMEL,), -1, dtype=torch.int64, device=device)
+        _S.cascade_vals = torch.full((TREE_TOP_NUMEL,), -1e30, dtype=torch.float32, device=device)
         _S.p1_save_draft = torch.full((6,), -1, dtype=torch.int64, device=device)
-        _S.p1_save_top = torch.full((36,), -1, dtype=torch.int64, device=device)
-        _S.p1_save_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
+        _S.p1_save_top = torch.full((TREE_TOP_NUMEL,), -1, dtype=torch.int64, device=device)
+        _S.p1_save_vals = torch.full((TREE_TOP_NUMEL,), -1e30, dtype=torch.float32, device=device)
         _S.p1_save_alt = torch.full((4,), -1, dtype=torch.int64, device=device)
         _S.p1_save_margins = torch.full((2,), 1e30, dtype=torch.float32, device=device)
         if (
             _S.req_acc_state is None
             or _S.req_acc_state.device != device
-            or _S.req_acc_state.numel() < 3
+            or _S.req_acc_state.numel() < 5
             or _S.req_acc_state.is_inference()
         ):
-            _S.req_acc_state = torch.zeros((3,), dtype=torch.int32, device=device)
+            _S.req_acc_state = torch.zeros((5,), dtype=torch.int32, device=device)
         if (
             _S.stats is None
             or _S.stats.device != device
-            or _S.stats.numel() < 52
+            or _S.stats.numel() < 68
             or _S.stats.is_inference()
         ):
-            _S.stats = torch.zeros((52,), dtype=torch.int64, device=device)
+            _S.stats = torch.zeros((68,), dtype=torch.int64, device=device)
     return (
         _S.cascade_meta,
         _S.cascade_toks,
@@ -549,28 +560,28 @@ def init_kv_table(
         if (
             _S.tree_top is None
             or _S.tree_top.device != device
-            or _S.tree_top.numel() < 36
+            or _S.tree_top.numel() < TREE_TOP_NUMEL
             or _S.tree_top.is_inference()
         ):
-            _S.tree_top = torch.full((36,), -1, dtype=torch.int64, device=device)
+            _S.tree_top = torch.full((TREE_TOP_NUMEL,), -1, dtype=torch.int64, device=device)
         else:
             _S.tree_top.fill_(-1)
         if (
             _S.tree_vals is None
             or _S.tree_vals.device != device
-            or _S.tree_vals.numel() < 36
+            or _S.tree_vals.numel() < TREE_TOP_NUMEL
             or _S.tree_vals.is_inference()
         ):
-            _S.tree_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
+            _S.tree_vals = torch.full((TREE_TOP_NUMEL,), -1e30, dtype=torch.float32, device=device)
         else:
             _S.tree_vals.fill_(-1e30)
         if (
             _S.req_acc_state is None
             or _S.req_acc_state.device != device
-            or _S.req_acc_state.numel() < 3
+            or _S.req_acc_state.numel() < 5
             or _S.req_acc_state.is_inference()
         ):
-            _S.req_acc_state = torch.zeros((3,), dtype=torch.int32, device=device)
+            _S.req_acc_state = torch.zeros((5,), dtype=torch.int32, device=device)
         else:
             _S.req_acc_state.zero_()
         _S.saved_alt_tok = torch.full((1,), -1, dtype=torch.int64, device=device)
@@ -586,10 +597,10 @@ def init_kv_table(
         if (
             _S.stats is None
             or _S.stats.device != device
-            or _S.stats.numel() < 52
+            or _S.stats.numel() < 68
             or _S.stats.is_inference()
         ):
-            _S.stats = torch.zeros((52,), dtype=torch.int64, device=device)
+            _S.stats = torch.zeros((68,), dtype=torch.int64, device=device)
         else:
             _S.stats.zero_()
         get_cascade_bufs(device)
@@ -668,6 +679,8 @@ def on_non_leaf_step(
         and _S.req_acc_state is not None
     )
     _S.leaf_flag[:1].zero_()
+    if _S.cascade_meta is not None:
+        _S.cascade_meta[:1].zero_()
     is_req_switch = req_id is None or req_id != _S._last_req_id
     if req_id is None or req_id != _S._hist_req_id:
         _reset_hist_for_req(req_id)
@@ -751,6 +764,8 @@ def setup_step(
         or slot_mappings.stride(1) != 1
     ):
         _S.leaf_flag[:1].zero_()
+        if _S.cascade_meta is not None:
+            _S.cascade_meta[:1].zero_()
         return False
     if req_id != _S._hist_req_id:
         _reset_hist_for_req(req_id)

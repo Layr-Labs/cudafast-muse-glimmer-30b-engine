@@ -115,6 +115,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         self._ctx_kv_cg_rejected: set[tuple] = set()
         self._ctx_kv_cg_pool = torch.cuda.graph_pool_handle()
         self._ctx_kv_cg_stream = torch.cuda.Stream(device=device)
+        self._cascade_exec_id: int = 0
+        self._cascade_launch_fn: Any = None
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -182,6 +184,35 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_indices.zero_()
         self.sample_pos.zero_()
         self.sample_idx_mapping.zero_()
+        self._cascade_exec_id = 0
+        self._cascade_launch_fn = None
+
+        want_cascade = (
+            os.environ.get("MUSE_DFLASH_CASCADE", "0").strip().lower()
+            not in ("0", "", "false", "no")
+            and self.num_query_per_req == 16
+            and self.num_speculative_steps == 6
+            and not self.sample_from_anchor
+            and self.device.type == "cuda"
+        )
+        cascade_target_tokens = 0
+        if want_cascade:
+            try:
+                from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _nl
+
+                if (
+                    _nl.ENABLED
+                    and _nl.TREE_M > 0
+                    and _nl.get_tree_top_buf(self.device) is not None
+                    and _nl.get_tree_vals_buf(self.device) is not None
+                    and _nl.get_cascade_bufs(self.device) is not None
+                ):
+                    _nl.get_alt_buf(self.device)
+                    _nl.get_margin_buf(self.device)
+                    cascade_target_tokens = self.num_query_per_req
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DFlash cascade pre-init skipped (%s)", exc)
+
         assert self.query_cudagraph_manager is not None
         self.query_cudagraph_manager.capture(
             self._generate_draft,
@@ -192,7 +223,80 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.max_model_len,
             causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
+            cascade_clone_target_tokens=cascade_target_tokens,
         )
+
+        cloned_id = int(getattr(self.query_cudagraph_manager, "_cascade_cloned_id", 0))
+        if cascade_target_tokens > 0 and cloned_id > 0:
+            try:
+                import muse_bfx_ext as _bfx
+                from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _nl
+
+                tree_top = _nl.get_tree_top_buf(self.device)
+                tree_vals = _nl.get_tree_vals_buf(self.device)
+                alt_ids = _nl.get_alt_buf(self.device)
+                alt_margins = _nl.get_margin_buf(self.device)
+                cbufs = _nl.get_cascade_bufs(self.device)
+                if (
+                    hasattr(_bfx, "dflash_cascade_build_cond_graph")
+                    and hasattr(_bfx, "dflash_cascade_launch_cond_graph")
+                    and tree_top is not None
+                    and tree_vals is not None
+                    and cbufs is not None
+                ):
+                    (
+                        cascade_meta,
+                        cascade_toks,
+                        cascade_vals,
+                        p1_save_draft,
+                        p1_save_top,
+                        p1_save_vals,
+                        p1_save_alt,
+                        p1_save_margins,
+                        req_acc_state,
+                        stats,
+                    ) = cbufs
+                    exec_id = int(
+                        _bfx.dflash_cascade_build_cond_graph(
+                            cloned_id,
+                            False,
+                            self.input_buffers.input_ids,
+                            self.input_buffers.positions,
+                            self.draft_tokens[0],
+                            tree_top,
+                            tree_vals,
+                            cascade_meta,
+                            p1_save_draft,
+                            p1_save_top,
+                            p1_save_vals,
+                            int(self.parallel_drafting_token_id),
+                            alt_ids,
+                            alt_margins,
+                            p1_save_alt,
+                            p1_save_margins,
+                            req_acc_state,
+                            stats,
+                            cascade_toks,
+                            cascade_vals,
+                        )
+                    )
+                    if exec_id > 0:
+                        self._cascade_exec_id = exec_id
+                        self._cascade_launch_fn = _bfx.dflash_cascade_launch_cond_graph
+                        logger.info(
+                            "DFlash 2-pass conditional cascade CUDA graph armed "
+                            "(exec_id=%d, Q=%d, mask_id=%d)",
+                            exec_id,
+                            self.num_query_per_req,
+                            int(self.parallel_drafting_token_id),
+                        )
+            except Exception as exc:  # noqa: BLE001
+                self._cascade_exec_id = 0
+                self._cascade_launch_fn = None
+                logger.warning(
+                    "DFlash cascade conditional graph build skipped (%s); keeping 1-pass draft",
+                    exc,
+                )
 
     def load_draft_model(
         self,
@@ -807,6 +911,15 @@ class DFlashSpeculator(DraftModelSpeculator):
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
             self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            if (
+                self._cascade_exec_id > 0
+                and self._cascade_launch_fn is not None
+                and num_reqs == 1
+                and num_tokens_padded == 16
+                and not dummy_run
+                and not is_profile
+            ):
+                self._cascade_launch_fn(self._cascade_exec_id)
         else:
             draft_attn_metadata = self._build_draft_attn_metadata(
                 num_reqs=num_reqs,

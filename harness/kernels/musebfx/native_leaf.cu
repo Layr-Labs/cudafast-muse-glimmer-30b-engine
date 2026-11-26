@@ -47,7 +47,10 @@ __global__ void native_leaf_prepare_tree_kernel(
 // Post-miss: p_post(j,r) = exp(a_j + a2 + w_z0p*z0_c + c_r + beta_post*(z_r - z_0)) / (1 + sum_{r<6} exp(...))
 // L3+ after L2 sub hit resyncs with drafter top-1 (uses p1[j], empirical 63.3%); L1 also spawns d_{k+1}#2 via p2post (14.2%).
 __constant__ float kCalA[6] = {1.675690f, 1.258784f, 1.070196f, 1.171448f, 1.102070f, 0.731610f};
-__constant__ float kCalC[6] = {0.000000f, -0.402942f, -0.763639f, -0.817452f, -1.416669f, -1.642223f};
+__constant__ float kCalC[8] = {
+    0.000000f, -0.402942f, -0.763639f, -0.817452f,
+    -1.416669f, -1.642223f, -1.800000f, -2.000000f,
+};
 #define CAL_A2 (-1.614419f)
 #define CAL_BETA 0.851144f
 #define CAL_BETA_POST 0.326972f
@@ -112,8 +115,10 @@ struct BgEbKnobs {
   int shf_cal;          // 0=off (use ck.shf), 1=use shf_hi if (alt, dk[j]) in history else shf_lo
   float shf_lo;
   float shf_hi;
-  // Downward-bounded online Empirical-Bayes a_shift from req_acc_state [rounds, committed]
+  // Downward-bounded online Empirical-Bayes a_shift from req_acc_state:
+  //   [rounds, committed_ns, high_acc, raw_acc_drafts, raw_trials]
   int eb_mode;          // 0=off, 1=enabled
+  int eb_raw;           // 1=unbiased censored MLE from raw_acc_drafts/raw_trials (default 1), 0=legacy 1.35f formula
   int eb_min_r;
   float eb_p0;
   float eb_tau;
@@ -122,7 +127,30 @@ struct BgEbKnobs {
   float eb_hi;
 };
 
-constexpr int kTrActiveCap = 512;
+__device__ __forceinline__ float compute_eb_delta_a(
+    const BgEbKnobs& bg, const int32_t* req_acc_state, int req_acc_state_len) {
+  if (bg.eb_mode == 0 || req_acc_state == nullptr) return 0.0f;
+  const int32_t rr = req_acc_state[0];
+  const int32_t cc = req_acc_state[1];
+  if (rr < bg.eb_min_r || cc <= 0) return 0.0f;
+  float p_hat = 0.0f;
+  if (bg.eb_raw != 0 && req_acc_state_len >= 5 && req_acc_state[4] > 0) {
+    p_hat = static_cast<float>(req_acc_state[3]) / static_cast<float>(req_acc_state[4]);
+  } else {
+    const float mean_ns = static_cast<float>(cc) / static_cast<float>(rr);
+    const float den_m = (mean_ns - 0.35f > 0.25f) ? (mean_ns - 0.35f) : 0.25f;
+    p_hat = (mean_ns - 1.35f) / den_m;
+  }
+  if (p_hat < 0.35f) p_hat = 0.35f;
+  if (p_hat > 0.92f) p_hat = 0.92f;
+  const float p0 = bg.eb_p0;
+  const float p_post = (static_cast<float>(rr) * p_hat + bg.eb_tau * p0) /
+                       (static_cast<float>(rr) + bg.eb_tau);
+  const float da = (__logf(p_post / (1.0f - p_post)) - __logf(p0 / (1.0f - p0))) * bg.eb_scale;
+  return (da < bg.eb_lo) ? bg.eb_lo : ((da > bg.eb_hi) ? bg.eb_hi : da);
+}
+
+constexpr int kTrActiveCap = 640;
 
 struct TrKnobs {
   // Wave-63 GPU Target-Logit Token Recycling (16-row exact 30B argmax log + monomorphic suffix roots/continuations)
@@ -176,6 +204,7 @@ struct CascadeKnobs {
   float ddtree_w;       // DDTree local margin weight in [0, 1] (default 0.35)
   float lookahead_w;    // 1-step lookahead priority tie-breaker for kind==8 nodes (default 0.30)
   float backup_w;       // Pass-1 backup branch floor weight on mode==2 divergence (default 0.45)
+  float max_cpc;        // skip Pass 2 when req_acc_state rounds>=3 && cpc > max_cpc (default 4.6, 0=off)
 };
 
 struct CascadePrepArgs {
@@ -187,6 +216,7 @@ struct CascadePrepArgs {
   const int64_t* alt_ids;
   const float* alt_margins;
   const int32_t* req_acc_state;
+  int req_acc_state_len;
   int32_t* cascade_meta;
   int64_t* p1_save_draft;
   int64_t* p1_save_top;
@@ -195,6 +225,7 @@ struct CascadePrepArgs {
   float* p1_save_margins;
   int64_t* stats;
   int stats_len;
+  int tree_k;
   int32_t mask_token_id;
   int calib_mode;
   CalibKnobs ck;
@@ -206,7 +237,8 @@ struct CascadePrepArgs {
 
 __global__ void __launch_bounds__(64) dflash_cascade_gate_prep_kernel(CascadePrepArgs a) {
   const int tid = threadIdx.x;
-  if (tid < 36) {
+  const int n_top = 6 * a.tree_k;
+  if (tid < n_top) {
     a.p1_save_top[tid] = a.tree_top[tid];
     a.p1_save_vals[tid] = a.tree_vals[tid];
   }
@@ -222,7 +254,11 @@ __global__ void __launch_bounds__(64) dflash_cascade_gate_prep_kernel(CascadePre
   __syncthreads();
 
   const bool high_acc = (a.req_acc_state != nullptr && a.req_acc_state[2] != 0);
-  if (a.csk.mode == 0 || high_acc) {
+  const bool high_cpc = (a.csk.max_cpc > 0.0f && a.req_acc_state != nullptr &&
+                         a.req_acc_state[0] >= 3 &&
+                         static_cast<float>(a.req_acc_state[1]) >
+                             a.csk.max_cpc * static_cast<float>(a.req_acc_state[0]));
+  if (a.csk.mode == 0 || high_acc || high_cpc) {
     if (tid == 0) {
       a.cascade_meta[0] = 0;
       if (a.has_cond_handle != 0) {
@@ -239,7 +275,7 @@ __global__ void __launch_bounds__(64) dflash_cascade_gate_prep_kernel(CascadePre
   __shared__ float s_qrel[6][6];
 
   if (tid < 6) {
-    const int base = tid * 6;
+    const int base = tid * a.tree_k;
     const int64_t dk = a.p1_save_draft[tid];
     const int64_t top1 = a.p1_save_top[base + 0];
     const float z0 = a.p1_save_vals[base + 0];
@@ -253,25 +289,9 @@ __global__ void __launch_bounds__(64) dflash_cascade_gate_prep_kernel(CascadePre
   __syncthreads();
 
   if (tid < 6) {
-    const int base = tid * 6;
+    const int base = tid * a.tree_k;
     if (s_valid[tid] != 0) {
-      float eb_delta_a = 0.0f;
-      if (a.bg.eb_mode != 0 && a.req_acc_state != nullptr) {
-        const int32_t rr = a.req_acc_state[0];
-        const int32_t cc = a.req_acc_state[1];
-        if (rr >= a.bg.eb_min_r && cc > 0) {
-          const float mean_ns = static_cast<float>(cc) / static_cast<float>(rr);
-          const float den_m = (mean_ns - 0.35f > 0.25f) ? (mean_ns - 0.35f) : 0.25f;
-          float p_hat = (mean_ns - 1.35f) / den_m;
-          if (p_hat < 0.35f) p_hat = 0.35f;
-          if (p_hat > 0.92f) p_hat = 0.92f;
-          const float p0 = a.bg.eb_p0;
-          const float p_post = (static_cast<float>(rr) * p_hat + a.bg.eb_tau * p0) /
-                               (static_cast<float>(rr) + a.bg.eb_tau);
-          const float da = (__logf(p_post / (1.0f - p_post)) - __logf(p0 / (1.0f - p0))) * a.bg.eb_scale;
-          eb_delta_a = (da < a.bg.eb_lo) ? a.bg.eb_lo : ((da > a.bg.eb_hi) ? a.bg.eb_hi : da);
-        }
-      }
+      const float eb_delta_a = compute_eb_delta_a(a.bg, a.req_acc_state, a.req_acc_state_len);
       const float sm_mean = (s_margin[0] + s_margin[1] + s_margin[2] +
                              s_margin[3] + s_margin[4] + s_margin[5]) * (1.0f / 6.0f);
       float sm_c = ((a.csk.ddtree_w > 0.0f)
@@ -354,11 +374,11 @@ __global__ void __launch_bounds__(64) dflash_cascade_gate_prep_kernel(CascadePre
       if (s_valid[b] == 0 || !(A_rel[b] >= 0.18f)) break;
       const int64_t dk_b = a.p1_save_draft[b];
       for (int r = 1; r <= max_r; ++r) {
-        const int64_t alt_tok = a.p1_save_top[b * 6 + r];
+        const int64_t alt_tok = a.p1_save_top[b * a.tree_k + r];
         if (alt_tok < 0 || alt_tok >= 202048 || alt_tok == dk_b) continue;
         bool dup = false;
         for (int pr = 1; pr < r; ++pr) {
-          if (a.p1_save_top[b * 6 + pr] == alt_tok) {
+          if (a.p1_save_top[b * a.tree_k + pr] == alt_tok) {
             dup = true;
             break;
           }
@@ -452,21 +472,23 @@ __global__ void __launch_bounds__(64) dflash_cascade_post_restore_kernel(
     const float* __restrict__ p1_save_vals,
     const int64_t* __restrict__ p1_save_alt,
     const float* __restrict__ p1_save_margins,
-    int32_t mask_token_id) {
+    int32_t mask_token_id,
+    int tree_k) {
   const int tid = threadIdx.x;
+  const int n_top = 6 * tree_k;
   if (tid < 15) {
     input_ids[1 + tid] = mask_token_id;
   }
   const int mode = cascade_meta[0];
   const int b_star = cascade_meta[1];
   if (mode == 1) {
-    // Future-B branch: save Pass-2 top-6 into cascade_toks/vals and restore Pass-1 main chain.
-    if (tid < 36) {
+    // Future-B branch: save Pass-2 top-K into cascade_toks/vals and restore Pass-1 main chain.
+    if (tid < n_top) {
       cascade_toks[tid] = tree_top[tid];
       cascade_vals[tid] = tree_vals[tid];
     }
     __syncthreads();
-    if (tid < 36) {
+    if (tid < n_top) {
       tree_top[tid] = p1_save_top[tid];
       tree_vals[tid] = p1_save_vals[tid];
     }
@@ -483,12 +505,12 @@ __global__ void __launch_bounds__(64) dflash_cascade_post_restore_kernel(
     // Main-chain prefix denoising at m = b_star + 1: save Pass-1 into cascade_toks/vals as backup,
     // restore prefix 0..m-1 from Pass-1, and keep Pass-2's denoised suffix m..5 on main chain!
     const int m = (b_star + 1 < 1) ? 1 : ((b_star + 1 > 5) ? 5 : (b_star + 1));
-    if (tid < 36) {
+    if (tid < n_top) {
       cascade_toks[tid] = p1_save_top[tid];
       cascade_vals[tid] = p1_save_vals[tid];
     }
     __syncthreads();
-    if (tid < 6 * m) {
+    if (tid < tree_k * m) {
       tree_top[tid] = p1_save_top[tid];
       tree_vals[tid] = p1_save_vals[tid];
     }
@@ -519,6 +541,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     const int64_t* __restrict__ tree_top,
     const float* __restrict__ tree_vals,
     const int32_t* __restrict__ req_acc_state,
+    int req_acc_state_len,
     int32_t* __restrict__ input_ids,
     int64_t* __restrict__ positions,
     int64_t* __restrict__ saved_leaf_toks,
@@ -735,8 +758,8 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __shared__ float s_p_oov[6];
   __shared__ float s_p1post[6];
   __shared__ float s_p2post[6];
-  __shared__ float s_pr[6][6];
-  __shared__ float s_e1[6][6];
+  __shared__ float s_pr[6][8];
+  __shared__ float s_e1[6][8];
   __shared__ float s_den1[6];
   __shared__ float s_z0[6];
   __shared__ float s_margin[6];
@@ -744,7 +767,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __shared__ uint8_t s_valid_row[6];
   __shared__ int s_any_active;
 
-  constexpr int kCandCap = 160;
+  constexpr int kCandCap = 192;
   __shared__ float s_cand_score[kCandCap];
   __shared__ float s_cand_prob[kCandCap];
   __shared__ int64_t s_cand_tok[kCandCap];
@@ -1237,28 +1260,16 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     __syncwarp();
   }
 
-  // Pass 3 (warp 0 only): calibrated probabilities + online Empirical-Bayes + DDTree + Multi-Future Cascade 9-leaf EV tree.
+  // Pass 3 (warp 0 only): calibrated probabilities + online Empirical-Bayes + DDTree + Multi-Future Cascade EV tree.
+  const int eff_k = (tree_k >= 8) ? 8 : 6;
+  const int roots_per_row = (tree_k >= 8) ? 7 : 5;
+  const int n_init_roots = 6 * roots_per_row;
   if (tid < 6) {
     const int base = tid * tree_k;
     const float z0 = s_z0[tid];
     const bool row_ok = (s_valid_row[tid] != 0);
-    float eb_delta_a = 0.0f;
-    if (calib_mode != 0 && bg.eb_mode != 0 && req_acc_state != nullptr) {
-      const int32_t rr = req_acc_state[0];
-      const int32_t cc = req_acc_state[1];
-      if (rr >= bg.eb_min_r && cc > 0) {
-        const float mean_ns = static_cast<float>(cc) / static_cast<float>(rr);
-        const float den_m = (mean_ns - 0.35f > 0.25f) ? (mean_ns - 0.35f) : 0.25f;
-        float p_hat = (mean_ns - 1.35f) / den_m;
-        if (p_hat < 0.35f) p_hat = 0.35f;
-        if (p_hat > 0.92f) p_hat = 0.92f;
-        const float p0 = bg.eb_p0;
-        const float p_post = (static_cast<float>(rr) * p_hat + bg.eb_tau * p0) /
-                             (static_cast<float>(rr) + bg.eb_tau);
-        const float da = (__logf(p_post / (1.0f - p_post)) - __logf(p0 / (1.0f - p0))) * bg.eb_scale;
-        eb_delta_a = (da < bg.eb_lo) ? bg.eb_lo : ((da > bg.eb_hi) ? bg.eb_hi : da);
-      }
-    }
+    const float eb_delta_a =
+        (calib_mode != 0) ? compute_eb_delta_a(bg, req_acc_state, req_acc_state_len) : 0.0f;
     const float sm_mean = (s_margin[0] + s_margin[1] + s_margin[2] +
                            s_margin[3] + s_margin[4] + s_margin[5]) * (1.0f / 6.0f);
     if (row_ok) {
@@ -1274,28 +1285,33 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         const float a_base = kCalA[tid] + ck.a_shift + eb_delta_a;
         const float a_pre = a_base + ck.w_sm_pre * sm_c + ck.w_z0_pre * z0_c;
         const float a_post = a_base + ck.a2 + ck.w_z0_post * z0_c;
-        float e0[6], e1[6];
+        float e0[8], e1[8];
         float den0 = 1.0f, den1 = 1.0f;
 #pragma unroll
-        for (int rk = 0; rk < 6; ++rk) {
-          const int64_t tok_r = tree_top[base + rk];
-          const float zr = tree_vals[base + rk];
-          if (rk == 0 || (tok_r >= 0 && zr > -1e20f)) {
-            const float dz = zr - z0;
-            float b_pl = 0.0f;
-            if (pl.mode != 0 && s_hist_ok != 0) {
-              const int raw_ml = static_cast<int>(s_cand_key[tid][rk] >> 16);
-              if (raw_ml >= 1) {
-                const int ml = (raw_ml > 6) ? 6 : raw_ml;
-                b_pl = (rk == 0) ? pl.boost_d1[ml] : pl.boost_alt[ml];
+        for (int rk = 0; rk < 8; ++rk) {
+          if (rk < eff_k) {
+            const int64_t tok_r = tree_top[base + rk];
+            const float zr = tree_vals[base + rk];
+            if (rk == 0 || (tok_r >= 0 && zr > -1e20f)) {
+              const float dz = zr - z0;
+              float b_pl = 0.0f;
+              if (rk < 6 && pl.mode != 0 && s_hist_ok != 0) {
+                const int raw_ml = static_cast<int>(s_cand_key[tid][rk] >> 16);
+                if (raw_ml >= 1) {
+                  const int ml = (raw_ml > 6) ? 6 : raw_ml;
+                  b_pl = (rk == 0) ? pl.boost_d1[ml] : pl.boost_alt[ml];
+                }
               }
+              const float b_tr = (rk < 6) ? s_tr_b_rk[tid][rk] : 0.0f;
+              const float b_eff = (b_pl > b_tr) ? b_pl : b_tr;
+              const float g0 = kCalC[rk] + ck.beta * dz + b_eff;
+              const float g1 = kCalC[rk] + ck.beta_post * dz;
+              e0[rk] = __expf(a_pre + g0);
+              e1[rk] = __expf(a_post + g1);
+            } else {
+              e0[rk] = 0.0f;
+              e1[rk] = 0.0f;
             }
-            const float b_tr = s_tr_b_rk[tid][rk];
-            const float b_eff = (b_pl > b_tr) ? b_pl : b_tr;
-            const float g0 = kCalC[rk] + ck.beta * dz + b_eff;
-            const float g1 = kCalC[rk] + ck.beta_post * dz;
-            e0[rk] = __expf(a_pre + g0);
-            e1[rk] = __expf(a_post + g1);
           } else {
             e0[rk] = 0.0f;
             e1[rk] = 0.0f;
@@ -1304,7 +1320,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           den1 += e1[rk];
         }
 #pragma unroll
-        for (int rk = 0; rk < 6; ++rk) {
+        for (int rk = 0; rk < 8; ++rk) {
           s_pr[tid][rk] = e0[rk] / den0;
           s_e1[tid][rk] = e1[rk];
         }
@@ -1318,13 +1334,15 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         float sum_e = 1.0f;
         float last_e = 0.0f;
 #pragma unroll
-        for (int rk = 1; rk < 6; ++rk) {
-          const int64_t tok_r = tree_top[base + rk];
-          const float zr = tree_vals[base + rk];
-          if (tok_r >= 0 && zr > -1e20f) {
-            const float er = __expf((zr - z0) * inv_temp);
-            sum_e += er;
-            last_e = er;
+        for (int rk = 1; rk < 8; ++rk) {
+          if (rk < eff_k) {
+            const int64_t tok_r = tree_top[base + rk];
+            const float zr = tree_vals[base + rk];
+            if (tok_r >= 0 && zr > -1e20f) {
+              const float er = __expf((zr - z0) * inv_temp);
+              sum_e += er;
+              last_e = er;
+            }
           }
         }
         const float z_tot = sum_e + tail_c * last_e;
@@ -1336,7 +1354,8 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         s_p2post[tid] = 0.0f;
         s_den1[tid] = 1.0f;
 #pragma unroll
-        for (int rk = 0; rk < 6; ++rk) {
+        for (int rk = 0; rk < 8; ++rk) {
+          s_pr[tid][rk] = 0.0f;
           s_e1[tid][rk] = 0.0f;
         }
       }
@@ -1348,7 +1367,8 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       s_p2post[tid] = 0.0f;
       s_den1[tid] = 1.0f;
 #pragma unroll
-      for (int rk = 0; rk < 6; ++rk) {
+      for (int rk = 0; rk < 8; ++rk) {
+        s_pr[tid][rk] = 0.0f;
         s_e1[tid][rk] = 0.0f;
       }
     }
@@ -1359,7 +1379,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     s_casc_p1[tid] = 0.0f;
     s_casc_p2[tid] = 0.0f;
     if (s_casc_mode != 0 && cascade_toks != nullptr && cascade_vals != nullptr) {
-      const int cbase = tid * 6;
+      const int cbase = tid * tree_k;
       const int64_t ct0 = cascade_toks[cbase + 0];
       const float cz0 = cascade_vals[cbase + 0];
       if (ct0 >= 0 && ct0 < static_cast<int64_t>(vocab_size) && cz0 > -1e20f) {
@@ -1428,11 +1448,11 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       }
     }
     s_any_active = 0;
-    s_num_cands = 30;
+    s_num_cands = n_init_roots;
   }
   __syncwarp();
 
-  // Initialize 30 1-level DFlash candidates in slots 0..29, clear slots 30..kCandCap-1.
+  // Initialize 1-level DFlash candidates in slots 0..n_init_roots-1 (42 for top-8, 30 for top-6), clear rest.
 #pragma unroll
   for (int off = 0; off < kCandCap; off += 32) {
     s_cand_score[tid + off] = -1.0f;
@@ -1441,9 +1461,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     s_cand_ml[tid + off] = 0;
     s_cand_rk[tid + off] = -1;
   }
-  if (tid < 30) {
-    const int row_idx = tid / 5;                  // 0..5 -> depth k = row_idx + 1
-    const int rank = 1 + (tid - row_idx * 5);     // 1..5 -> candidate rank #2..#6
+  for (int ci = tid; ci < n_init_roots; ci += 32) {
+    const int row_idx = ci / roots_per_row;                  // 0..5 -> depth k = row_idx + 1
+    const int rank = 1 + (ci - row_idx * roots_per_row);     // 1..7 (top-8) or 1..5 (top-6)
     if (s_valid_row[row_idx] && s_A[row_idx] > 0.0f) {
       const int base = row_idx * tree_k;
       const int64_t cand = tree_top[base + rank];
@@ -1463,19 +1483,20 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             ? s_pr[row_idx][rank]
             : (eff_gamma * __expf((zr - s_z0[row_idx]) * inv_temp) / s_Z[row_idx]);
         const float cprob = s_A[row_idx] * pr;
-        s_cand_score[tid] = cprob;
-        s_cand_prob[tid] = cprob;
-        s_cand_tok[tid] = cand;
-        s_cand_k[tid] = static_cast<int8_t>(row_idx + 1);
-        s_cand_par[tid] = -1;
-        s_cand_depth[tid] = 1;
-        s_cand_kind[tid] = 0;
-        s_cand_rk[tid] = static_cast<int8_t>(rank);
-        if (pl.mode != 0 && s_hist_ok != 0) {
+        s_cand_score[ci] = cprob;
+        s_cand_prob[ci] = cprob;
+        s_cand_tok[ci] = cand;
+        s_cand_k[ci] = static_cast<int8_t>(row_idx + 1);
+        s_cand_par[ci] = -1;
+        s_cand_depth[ci] = 1;
+        s_cand_kind[ci] = 0;
+        // Ranks >= 6 stay -1 so 6-wide bigram/Anti-Chimera SMEM tables are never indexed OOB.
+        s_cand_rk[ci] = (rank < 6) ? static_cast<int8_t>(rank) : static_cast<int8_t>(-1);
+        if (rank < 6 && pl.mode != 0 && s_hist_ok != 0) {
           const uint32_t ck_j = s_cand_key[row_idx][rank];
           if (ck_j != 0u) {
-            s_cand_hpos[tid] = static_cast<int16_t>((ck_j & 0xFFFFu) + 1u);
-            s_cand_ml[tid] = static_cast<int8_t>(ck_j >> 16);
+            s_cand_hpos[ci] = static_cast<int16_t>((ck_j & 0xFFFFu) + 1u);
+            s_cand_ml[ci] = static_cast<int8_t>(ck_j >> 16);
           }
         }
       }
@@ -1544,8 +1565,8 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             const float j_scale = (j == 0) ? 1.0f : pl.mid_scale;
             const float pl_s = s_A[j] * gate * rw * j_scale;
             int ex_slot = -1;
-            for (int r = 0; r < 5; ++r) {
-              const int sl = j * 5 + r;
+            for (int r = 0; r < roots_per_row; ++r) {
+              const int sl = j * roots_per_row + r;
               if (s_cand_prob[sl] > -0.5f && s_cand_tok[sl] == tok) {
                 ex_slot = sl;
                 break;
@@ -1635,8 +1656,8 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   // Seed Multi-Future Cascade root (mode==1 Future-B branch, or mode==2 first diverging Pass-1 backup).
   if (tid == 0 && s_casc_mode != 0) {
     if (s_casc_mode == 1) {
-      const int ex = s_casc_b * 5 + (s_casc_r - 1);
-      if (ex >= 0 && ex < 30 && s_cand_prob[ex] > 0.0f) {
+      const int ex = s_casc_b * roots_per_row + (s_casc_r - 1);
+      if (ex >= 0 && ex < n_init_roots && s_cand_prob[ex] > 0.0f) {
         // Prevent low-z0 / EB OOV inflation from starving the Future-B root when no OOV PL match exists.
         const int b_base = s_casc_b * tree_k;
         const float bz0 = tree_vals[b_base + 0];
@@ -1680,8 +1701,8 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         const float p_bk = s_A[m_div] * csk.backup_w * (1.0f - s_p1[m_div]) * s_casc_p1[m_div];
         const float lh = (m_div + 1 < 6) ? (1.0f + csk.lookahead_w * s_casc_p1[m_div + 1]) : 1.0f;
         int ex_slot = -1;
-        for (int r = 0; r < 5; ++r) {
-          const int sl = m_div * 5 + r;
+        for (int r = 0; r < roots_per_row; ++r) {
+          const int sl = m_div * roots_per_row + r;
           if (s_cand_prob[sl] > -0.5f && s_cand_tok[sl] == old_tok) {
             ex_slot = sl;
             break;
@@ -1917,7 +1938,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           const int k_child = k_r + 1;
           const int j_par = k_r - 1;  // 0..4
           const int j_ch = k_r;       // 1..5
-          int64_t spawned[12];
+          int64_t spawned[16];
           int n_spawned = 0;
           auto already_spawned = [&](int64_t t) -> bool {
             for (int si = 0; si < n_spawned; ++si) {
@@ -1947,6 +1968,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           const uint32_t ac_u = use_bg ? s_alt_cnt[j_par][rk_in_row] : 0u;
           const uint32_t m3 = use_bg ? s_bg3_mask[j_par][rk_in_row] : 0u;
           float p_post_vec[6];
+          float inv_d1_mod = 0.0f;
           uint32_t bg_mask = 0u;
           bool has_p_post_vec = false;
           if (calib_mode != 0 && s_valid_row[j_ch] != 0 && kind < 8) {
@@ -2002,10 +2024,13 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
                 e1_mod[rp] = ev;
                 den1_mod += ev;
               }
-              const float inv_d1 = 1.0f / den1_mod;
+              for (int rp = 6; rp < eff_k; ++rp) {
+                den1_mod += s_e1[j_ch][rp];
+              }
+              inv_d1_mod = 1.0f / den1_mod;
 #pragma unroll
               for (int rp = 0; rp < 6; ++rp) {
-                p_post_vec[rp] = e1_mod[rp] * inv_d1;
+                p_post_vec[rp] = e1_mod[rp] * inv_d1_mod;
               }
               has_p_post_vec = true;
             }
@@ -2129,13 +2154,13 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
               spawned[n_spawned++] = sub_tok;
             }
           }
-          // 2) Post-miss top-2 (`alt2`, kind=3) + Markov-coherent / 30B-recycled r'=2..5 (`coh_cont`, kind=6).
+          // 2) Post-miss top-2 (`alt2`, kind=3) + Markov-coherent / 30B-recycled r'=2..eff_k-1 (`coh_cont`, kind=6).
           if (calib_mode != 0 && s_valid_row[j_ch] && kind < 8) {
-            for (int rp = 1; rp < 6; ++rp) {
+            for (int rp = 1; rp < eff_k; ++rp) {
               if (s_num_cands >= kCandCap) break;
               const int64_t ctok = tree_top[j_ch * tree_k + rp];
               if (ctok < 0 || already_spawned(ctok)) continue;
-              const bool is_bg_hit = ((bg_mask & (1u << rp)) != 0u);
+              const bool is_bg_hit = (rp < 6) && ((bg_mask & (1u << rp)) != 0u);
               const bool agrees_tr = (tr_ch_tok == ctok && tr_ch_p > 0.0f);
               const bool allow_wide = (tree_m > 16) &&
                   ((kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 7) && (rp == 1 || rp == 2));
@@ -2144,7 +2169,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
               }
               const bool agrees_pl = (can_pl_cont && pl_next_tok == ctok && pl_cp > 0.0f);
               float p_c = has_p_post_vec
-                  ? ((rp == 1) ? (p_post_vec[1] * ck.alt2_scale) : p_post_vec[rp])
+                  ? ((rp < 6)
+                         ? ((rp == 1) ? (p_post_vec[1] * ck.alt2_scale) : p_post_vec[rp])
+                         : (s_e1[j_ch][rp] * inv_d1_mod))
                   : ((rp == 1) ? s_p2post[j_ch] : (s_e1[j_ch][rp] / s_den1[j_ch]));
               if (agrees_pl && pl_cp > p_c) p_c = pl_cp;
               if (agrees_tr && tr_ch_p > p_c) p_c = tr_ch_p;
@@ -2152,7 +2179,12 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
               if (child_s > 0.0f) {
                 int16_t ch_hp = -1;
                 int8_t ch_ml = 0;
-                resolve_bg_hpos(rp, agrees_pl, ch_hp, ch_ml);
+                if (rp < 6) {
+                  resolve_bg_hpos(rp, agrees_pl, ch_hp, ch_ml);
+                } else if (agrees_pl) {
+                  ch_hp = static_cast<int16_t>(hpos + 1);
+                  ch_ml = static_cast<int8_t>(next_ml);
+                }
                 const int slot = s_num_cands++;
                 s_cand_score[slot] = child_s;
                 s_cand_prob[slot] = child_s;
@@ -2163,7 +2195,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
                 s_cand_kind[slot] = (rp == 1) ? 3 : 6;
                 s_cand_hpos[slot] = ch_hp;
                 s_cand_ml[slot] = ch_ml;
-                s_cand_rk[slot] = static_cast<int8_t>(rp);
+                s_cand_rk[slot] = (rp < 6) ? static_cast<int8_t>(rp) : static_cast<int8_t>(-1);
                 spawned[n_spawned++] = ctok;
               }
             }
@@ -2340,6 +2372,7 @@ __global__ void native_leaf_commit_tree_kernel(
     int64_t* __restrict__ stats,
     int stats_len,
     int32_t* __restrict__ req_acc_state,
+    int req_acc_state_len,
     int tree_m,
     int no_hit_mode,
     float high_acc_cpc,
@@ -2517,10 +2550,18 @@ __global__ void native_leaf_commit_tree_kernel(
     const int32_t c = req_acc_state[1] + ns;
     req_acc_state[0] = r;
     req_acc_state[1] = c;
-    // On M=16 verify, pausing leaves saves 0.00 ms because FULL(16) always runs; keep all 9 leaves
+    // On M=16/M=32 verify, pausing leaves saves 0.00 ms; keep all leaves
     // active whenever depth==6 returns (never permanently latch off after a ceiling-clamped step).
     req_acc_state[2] =
         (high_acc_cpc > 0.0f && r >= 4 && static_cast<float>(c) > high_acc_cpc * static_cast<float>(r)) ? 1 : 0;
+    if (req_acc_state_len >= 5) {
+      // Exact censored geometric counts from raw DFlash chain acceptance before tree recovery:
+      // raw_ns in 1..6 => (raw_ns-1) successes, raw_ns trials; raw_ns==7 => 6 successes, 6 trials (right-censored).
+      const int32_t raw_acc = (raw_ns > 1) ? ((raw_ns - 1 <= 6) ? (raw_ns - 1) : 6) : 0;
+      const int32_t raw_tr = (raw_ns >= 6) ? 6 : ((raw_ns >= 1) ? raw_ns : 1);
+      req_acc_state[3] += raw_acc;
+      req_acc_state[4] += raw_tr;
+    }
   }
 
   if (stats != nullptr && stats_len >= 4) {
@@ -2534,6 +2575,8 @@ __global__ void native_leaf_commit_tree_kernel(
       }
       if (stats_len >= 19 && hit_src0 >= 7 && hit_src0 < 16) {
         stats[10 + (hit_src0 - 7)] += 1;  // stats[10..18] = winning initial leaf slot 0..8
+      } else if (stats_len >= 64 && hit_src0 >= 16 && hit_src0 < 32) {
+        stats[48 + (hit_src0 - 16)] += 1;  // stats[48..63] = winning initial wide leaf slot 9..24
       }
       if (stats_len >= 32) {
         const int hl = (hit_len <= 6) ? hit_len : 6;
@@ -2887,6 +2930,7 @@ static const BgEbKnobs& get_bgeb_knobs_env() {
     v.shf_lo = env_f("MUSE_SHF_LO", 0.015f);
     v.shf_hi = env_f("MUSE_SHF_HI", 0.11f);
     v.eb_mode = env_i("MUSE_EB_MODE", 1);
+    v.eb_raw = env_i("MUSE_EB_RAW", 1);
     v.eb_min_r = env_i("MUSE_EB_MIN_R", 4);
     v.eb_p0 = env_f("MUSE_EB_P0", 0.72f);
     v.eb_tau = env_f("MUSE_EB_TAU", 6.0f);
@@ -2935,14 +2979,14 @@ static const CascadeKnobs& get_cascade_knobs_env() {
       return (s && *s) ? static_cast<float>(std::strtod(s, nullptr)) : def;
     };
     CascadeKnobs v{};
-    v.mode = env_i("MUSE_DFLASH_CASCADE", 1);
+    v.mode = env_i("MUSE_DFLASH_CASCADE", 0);
     v.denoise_mode = env_i("MUSE_CASCADE_DENOISE", 0);
     v.force_all = env_i("MUSE_CASCADE_FORCE_ALL", 0);
-    v.max_b = env_i("MUSE_CASCADE_MAX_B", 3);
-    v.max_r = env_i("MUSE_CASCADE_MAX_R", 2);
-    v.min_p = env_f("MUSE_CASCADE_MIN_P", 0.09f);
-    v.min_qrel = env_f("MUSE_CASCADE_MIN_QREL", 0.15f);
-    v.min_ev = env_f("MUSE_CASCADE_MIN_EV", 0.22f);
+    v.max_b = env_i("MUSE_CASCADE_MAX_B", 1);
+    v.max_r = env_i("MUSE_CASCADE_MAX_R", 1);
+    v.min_p = env_f("MUSE_CASCADE_MIN_P", 0.16f);
+    v.min_qrel = env_f("MUSE_CASCADE_MIN_QREL", 0.22f);
+    v.min_ev = env_f("MUSE_CASCADE_MIN_EV", 0.44f);
     v.branch_gain = env_f("MUSE_CASCADE_BRANCH_GAIN", 0.58f);
     v.denoise_min_a = env_f("MUSE_CASCADE_DENOISE_MIN_A", 0.50f);
     v.denoise_max_p1 = env_f("MUSE_CASCADE_DENOISE_MAX_P1", 0.60f);
@@ -2950,6 +2994,7 @@ static const CascadeKnobs& get_cascade_knobs_env() {
     v.ddtree_w = env_f("MUSE_DDTREE_W", 0.35f);
     v.lookahead_w = env_f("MUSE_CASCADE_LH", 0.30f);
     v.backup_w = env_f("MUSE_CASCADE_BACKUP_W", 0.45f);
+    v.max_cpc = env_f("MUSE_CASCADE_MAX_CPC", 4.2f);
     return v;
   }();
   return c;
@@ -3022,14 +3067,17 @@ void native_leaf_setup_tree(
               saved_leaf_toks.numel() >= tree_m);
   TORCH_CHECK(saved_leaf_k.is_cuda() && saved_leaf_k.scalar_type() == torch::kInt32 &&
               saved_leaf_k.numel() >= tree_m);
-  const int tree_k = (tree_top.numel() >= 36) ? 6 : 4;
+  const int tree_k = (tree_top.numel() >= 48) ? 8 : ((tree_top.numel() >= 36) ? 6 : 4);
   const int32_t* acc_ptr = nullptr;
+  int acc_len = 0;
   if (req_acc_state.has_value() && req_acc_state.value().defined() && req_acc_state.value().numel() >= 3) {
     TORCH_CHECK(req_acc_state.value().is_cuda() && req_acc_state.value().scalar_type() == torch::kInt32);
     acc_ptr = req_acc_state.value().data_ptr<int32_t>();
+    acc_len = static_cast<int>(req_acc_state.value().numel());
   }
   const float* vals_ptr = nullptr;
-  if (tree_vals.has_value() && tree_vals.value().defined() && tree_vals.value().numel() >= 36) {
+  if (tree_k >= 6 && tree_vals.has_value() && tree_vals.value().defined() &&
+      tree_vals.value().numel() >= 6 * tree_k) {
     TORCH_CHECK(tree_vals.value().is_cuda() && tree_vals.value().scalar_type() == torch::kFloat32);
     vals_ptr = tree_vals.value().data_ptr<float>();
   }
@@ -3192,12 +3240,14 @@ void native_leaf_setup_tree(
     casc_meta_ptr = cascade_meta.value().data_ptr<int32_t>();
   }
   const int64_t* casc_toks_ptr = nullptr;
-  if (cascade_toks.has_value() && cascade_toks.value().defined() && cascade_toks.value().numel() >= 36) {
+  if (tree_k >= 6 && cascade_toks.has_value() && cascade_toks.value().defined() &&
+      cascade_toks.value().numel() >= 6 * tree_k) {
     TORCH_CHECK(cascade_toks.value().is_cuda() && cascade_toks.value().scalar_type() == torch::kInt64);
     casc_toks_ptr = cascade_toks.value().data_ptr<int64_t>();
   }
   const float* casc_vals_ptr = nullptr;
-  if (cascade_vals.has_value() && cascade_vals.value().defined() && cascade_vals.value().numel() >= 36) {
+  if (tree_k >= 6 && cascade_vals.has_value() && cascade_vals.value().defined() &&
+      cascade_vals.value().numel() >= 6 * tree_k) {
     TORCH_CHECK(cascade_vals.value().is_cuda() && cascade_vals.value().scalar_type() == torch::kFloat32);
     casc_vals_ptr = cascade_vals.value().data_ptr<float>();
   }
@@ -3211,6 +3261,7 @@ void native_leaf_setup_tree(
       tree_top.data_ptr<int64_t>(),
       vals_ptr,
       acc_ptr,
+      acc_len,
       input_ids.data_ptr<int32_t>(),
       positions.data_ptr<int64_t>(),
       saved_leaf_toks.data_ptr<int64_t>(),
@@ -3299,9 +3350,11 @@ void native_leaf_commit_tree(
     stats_len = static_cast<int>(stats.value().numel());
   }
   int32_t* acc_ptr = nullptr;
+  int acc_len = 0;
   if (req_acc_state.has_value() && req_acc_state.value().defined() && req_acc_state.value().numel() >= 3) {
     TORCH_CHECK(req_acc_state.value().is_cuda() && req_acc_state.value().scalar_type() == torch::kInt32);
     acc_ptr = req_acc_state.value().data_ptr<int32_t>();
+    acc_len = static_cast<int>(req_acc_state.value().numel());
   }
   const int32_t* parent_ptr = nullptr;
   if (saved_leaf_parent.has_value() && saved_leaf_parent.value().defined() &&
@@ -3373,6 +3426,7 @@ void native_leaf_commit_tree(
       stats_ptr,
       stats_len,
       acc_ptr,
+      acc_len,
       static_cast<int>(tree_m),
       no_hit_mode ? 1 : 0,
       high_acc_cpc_env,
@@ -3610,9 +3664,13 @@ CascadePrepArgs make_cascade_prep_args(
   a.alt_margins = (alt_margins.has_value() && alt_margins.value().defined() && alt_margins.value().numel() >= 2)
       ? alt_margins.value().data_ptr<float>()
       : nullptr;
-  a.req_acc_state = (req_acc_state.has_value() && req_acc_state.value().defined() && req_acc_state.value().numel() >= 3)
-      ? req_acc_state.value().data_ptr<int32_t>()
-      : nullptr;
+  if (req_acc_state.has_value() && req_acc_state.value().defined() && req_acc_state.value().numel() >= 3) {
+    a.req_acc_state = req_acc_state.value().data_ptr<int32_t>();
+    a.req_acc_state_len = static_cast<int>(req_acc_state.value().numel());
+  } else {
+    a.req_acc_state = nullptr;
+    a.req_acc_state_len = 0;
+  }
   a.cascade_meta = cascade_meta.data_ptr<int32_t>();
   a.p1_save_draft = p1_save_draft.data_ptr<int64_t>();
   a.p1_save_top = p1_save_top.data_ptr<int64_t>();
@@ -3630,6 +3688,10 @@ CascadePrepArgs make_cascade_prep_args(
     a.stats = nullptr;
     a.stats_len = 0;
   }
+  a.tree_k = (tree_top.numel() >= 48 && tree_vals.numel() >= 48 &&
+              p1_save_top.numel() >= 48 && p1_save_vals.numel() >= 48)
+      ? 8
+      : 6;
   a.mask_token_id = static_cast<int32_t>(mask_token_id);
   static const int calib_env = []() -> int {
     const char* s = std::getenv("MUSE_TREE_CALIB");
@@ -3712,6 +3774,11 @@ void dflash_cascade_post_restore(
       ? p1_save_margins.value().data_ptr<float>()
       : nullptr;
 
+  const int tree_k = (tree_top.numel() >= 48 && tree_vals.numel() >= 48 &&
+                      cascade_toks.numel() >= 48 && cascade_vals.numel() >= 48 &&
+                      p1_save_top.numel() >= 48 && p1_save_vals.numel() >= 48)
+      ? 8
+      : 6;
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   dflash_cascade_post_restore_kernel<<<1, 64, 0, st>>>(
       input_ids.data_ptr<int32_t>(),
@@ -3728,7 +3795,8 @@ void dflash_cascade_post_restore(
       p1_save_vals.data_ptr<float>(),
       s_alt_ptr,
       s_marg_ptr,
-      static_cast<int32_t>(mask_token_id));
+      static_cast<int32_t>(mask_token_id),
+      tree_k);
 }
 
 int64_t dflash_cascade_clone_capturing_graph() {
@@ -3768,7 +3836,9 @@ int64_t dflash_cascade_build_cond_graph(
     c10::optional<torch::Tensor> p1_save_alt,
     c10::optional<torch::Tensor> p1_save_margins,
     c10::optional<torch::Tensor> req_acc_state,
-    c10::optional<torch::Tensor> stats) {
+    c10::optional<torch::Tensor> stats,
+    c10::optional<torch::Tensor> cascade_toks,
+    c10::optional<torch::Tensor> cascade_vals) {
   cudaGraph_t src_graph = nullptr;
   cudaGraph_t owned_clone = nullptr;
   if (is_raw_cuda_graph_ptr) {
@@ -3783,11 +3853,25 @@ int64_t dflash_cascade_build_cond_graph(
     g_cloned_graphs.erase(it);
   }
 
+  const bool add_post_restore =
+      (cascade_toks.has_value() && cascade_toks.value().defined() &&
+       cascade_vals.has_value() && cascade_vals.value().defined());
+  if (add_post_restore) {
+    TORCH_CHECK(cascade_toks.value().is_cuda() && cascade_toks.value().scalar_type() == torch::kInt64 &&
+                cascade_toks.value().numel() >= 36);
+    TORCH_CHECK(cascade_vals.value().is_cuda() && cascade_vals.value().scalar_type() == torch::kFloat32 &&
+                cascade_vals.value().numel() >= 36);
+  }
+
   CascadePrepArgs prep_args = make_cascade_prep_args(
       input_ids, query_positions, draft_tokens, tree_top, tree_vals,
       alt_ids, alt_margins, req_acc_state, cascade_meta,
       p1_save_draft, p1_save_top, p1_save_vals, p1_save_alt, p1_save_margins,
       stats, mask_token_id);
+  if (add_post_restore && prep_args.tree_k == 8 &&
+      (cascade_toks.value().numel() < 48 || cascade_vals.value().numel() < 48)) {
+    prep_args.tree_k = 6;
+  }
 
   cudaGraph_t outer_graph = nullptr;
   cudaError_t err = cudaGraphCreate(&outer_graph, 0);
@@ -3846,6 +3930,53 @@ int64_t dflash_cascade_build_cond_graph(
   if (err != cudaSuccess) {
     cudaGraphDestroy(outer_graph);
     TORCH_CHECK(false, "cudaGraphAddChildGraphNode(body) failed: ", cudaGetErrorString(err));
+  }
+
+  if (add_post_restore) {
+    int32_t* r_in = input_ids.data_ptr<int32_t>();
+    int64_t* r_dt = draft_tokens.data_ptr<int64_t>();
+    int64_t* r_tt = tree_top.data_ptr<int64_t>();
+    float* r_tv = tree_vals.data_ptr<float>();
+    int64_t* r_ai = (alt_ids.has_value() && alt_ids.value().defined() && alt_ids.value().numel() >= 4)
+        ? alt_ids.value().data_ptr<int64_t>()
+        : nullptr;
+    float* r_am = (alt_margins.has_value() && alt_margins.value().defined() && alt_margins.value().numel() >= 2)
+        ? alt_margins.value().data_ptr<float>()
+        : nullptr;
+    const int32_t* r_cm = cascade_meta.data_ptr<int32_t>();
+    int64_t* r_ct = cascade_toks.value().data_ptr<int64_t>();
+    float* r_cv = cascade_vals.value().data_ptr<float>();
+    const int64_t* r_sd = p1_save_draft.data_ptr<int64_t>();
+    const int64_t* r_st = p1_save_top.data_ptr<int64_t>();
+    const float* r_sv = p1_save_vals.data_ptr<float>();
+    const int64_t* r_sa = (p1_save_alt.has_value() && p1_save_alt.value().defined() && p1_save_alt.value().numel() >= 4)
+        ? p1_save_alt.value().data_ptr<int64_t>()
+        : nullptr;
+    const float* r_sm = (p1_save_margins.has_value() && p1_save_margins.value().defined() && p1_save_margins.value().numel() >= 2)
+        ? p1_save_margins.value().data_ptr<float>()
+        : nullptr;
+    int32_t r_mask = static_cast<int32_t>(mask_token_id);
+    int r_tk = prep_args.tree_k;
+
+    void* rargs[16] = {
+        &r_in, &r_dt, &r_tt, &r_tv, &r_ai, &r_am,
+        &r_cm, &r_ct, &r_cv,
+        &r_sd, &r_st, &r_sv, &r_sa, &r_sm, &r_mask, &r_tk,
+    };
+    cudaKernelNodeParams rparams{};
+    rparams.func = reinterpret_cast<void*>(dflash_cascade_post_restore_kernel);
+    rparams.gridDim = dim3(1, 1, 1);
+    rparams.blockDim = dim3(64, 1, 1);
+    rparams.sharedMemBytes = 0;
+    rparams.kernelParams = rargs;
+    rparams.extra = nullptr;
+
+    cudaGraphNode_t restore_node = nullptr;
+    err = cudaGraphAddKernelNode(&restore_node, body_graph, &child_node, 1, &rparams);
+    if (err != cudaSuccess) {
+      cudaGraphDestroy(outer_graph);
+      TORCH_CHECK(false, "cudaGraphAddKernelNode(post_restore) failed: ", cudaGetErrorString(err));
+    }
   }
 
   cudaGraphExec_t outer_exec = nullptr;

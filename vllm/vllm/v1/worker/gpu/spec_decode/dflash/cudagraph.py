@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -18,6 +19,8 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
 
 
 def _prepare_dflash_inputs_to_capture(
@@ -73,7 +76,10 @@ class DFlashCudaGraphManager(CudaGraphManager):
         max_model_len: int,
         causal: bool | Mapping[int, bool],
         progress_bar_desc: str = "Capturing CUDA graphs",
+        cascade_clone_target_tokens: int = 0,
     ) -> None:
+        self._cascade_cloned_id: int = 0
+
         def create_forward_fn(
             desc: BatchExecutionDescriptor,
             warmup: bool,
@@ -97,14 +103,38 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 causal=causal,
             )
             attn_metadata, slot_mappings = attn_state
-
-            return lambda cg_mode: forward_fn(
-                num_reqs,
-                num_tokens,
-                attn_metadata,
-                slot_mappings,
-                num_tokens_across_dp,
-                cg_mode,
+            want_cascade_clone = (
+                not warmup
+                and cascade_clone_target_tokens > 0
+                and desc.cg_mode == CUDAGraphMode.FULL
+                and num_reqs == 1
+                and num_tokens == cascade_clone_target_tokens
+                and self._cascade_cloned_id == 0
             )
+
+            def _run(cg_mode: CUDAGraphMode) -> None:
+                forward_fn(
+                    num_reqs,
+                    num_tokens,
+                    attn_metadata,
+                    slot_mappings,
+                    num_tokens_across_dp,
+                    cg_mode,
+                )
+                if want_cascade_clone and torch.cuda.is_current_stream_capturing():
+                    try:
+                        import muse_bfx_ext as _bfx
+
+                        if hasattr(_bfx, "dflash_cascade_clone_capturing_graph"):
+                            self._cascade_cloned_id = int(
+                                _bfx.dflash_cascade_clone_capturing_graph()
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "DFlash cascade graph clone skipped (%s); keeping 1-pass draft",
+                            exc,
+                        )
+
+            return _run
 
         super().capture(create_forward_fn, progress_bar_desc)

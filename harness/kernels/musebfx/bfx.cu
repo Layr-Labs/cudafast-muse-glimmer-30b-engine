@@ -283,7 +283,9 @@ int64_t dflash_cascade_build_cond_graph(
     c10::optional<torch::Tensor> p1_save_alt = c10::nullopt,
     c10::optional<torch::Tensor> p1_save_margins = c10::nullopt,
     c10::optional<torch::Tensor> req_acc_state = c10::nullopt,
-    c10::optional<torch::Tensor> stats = c10::nullopt);
+    c10::optional<torch::Tensor> stats = c10::nullopt,
+    c10::optional<torch::Tensor> cascade_toks = c10::nullopt,
+    c10::optional<torch::Tensor> cascade_vals = c10::nullopt);
 void dflash_cascade_launch_cond_graph(int64_t exec_id);
 void native_leaf_setup(
     torch::Tensor leaf_flag, torch::Tensor prev_ns, torch::Tensor alt_ids,
@@ -489,7 +491,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("p1_save_alt") = c10::nullopt,
         pybind11::arg("p1_save_margins") = c10::nullopt,
         pybind11::arg("req_acc_state") = c10::nullopt,
-        pybind11::arg("stats") = c10::nullopt);
+        pybind11::arg("stats") = c10::nullopt,
+        pybind11::arg("cascade_toks") = c10::nullopt,
+        pybind11::arg("cascade_vals") = c10::nullopt);
   m.def("dflash_cascade_launch_cond_graph", &dflash_cascade_launch_cond_graph,
         pybind11::arg("exec_id"));
   m.def("native_leaf_setup", &native_leaf_setup,

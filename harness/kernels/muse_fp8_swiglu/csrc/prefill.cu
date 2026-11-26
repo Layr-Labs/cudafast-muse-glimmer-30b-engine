@@ -539,6 +539,8 @@ extern "C" int swiglu_ws_init(cudaStream_t stream) {
   if (e == cudaSuccess) e = set_smem(swiglu_ws9_st3_lut_kernel<true, true, true>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(fp8_6656_ws8_256_st2_st4_kernel<19968, false>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(fp8_6656_ws8_256_st2_st4_kernel<19968, true>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_ws8_256_st2_st4_kernel<4096, false>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_ws8_256_st2_st4_kernel<4096, true>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(fp8_dual_a_ws8_256_kernel<false>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(fp8_dual_a_ws8_256_kernel<true>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(bf16_dual_ws8_256_kernel<false>, SMEM_MAX);
@@ -602,13 +604,18 @@ extern "C" int muse_fp8_set_gemm_pdl(int on) {
 extern "C" int muse_fp8_gemm_6656(int mode, int pdl, const void* a, const void* b, const float* sa, const float* sb,
                                   void* c, int k, cudaStream_t stream) {
   using namespace swiglu_ws;
-  if (!encode || k != 19968 || (((uintptr_t)a | (uintptr_t)b | (uintptr_t)c) & 15)) return -1;
+  if (!encode || (k != 19968 && k != 4096) || (((uintptr_t)a | (uintptr_t)b | (uintptr_t)c) & 15)) return -1;
   __nv_bfloat16* out = static_cast<__nv_bfloat16*>(c);
   CUtensorMap tmA256, tmA128, tmB128, tmB48, tmB32;
   if (!encode_tma2d(&tmA256, a, k, M_DIM, 256) || !encode_tma2d(&tmA128, a, k, M_DIM, 128)) return -3;
   if (!encode_tma2d(&tmB128, b, k, 6656, 128) || !encode_tma2d(&tmB48, b, k, 6656, 48) ||
       !encode_tma2d(&tmB32, b, k, 6656, 32)) return -4;
   const int use_pdl = (pdl < 0) ? gemm_pdl_enabled() : pdl;
+  if (k == 4096) {
+    if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws8_256_st2_st4_kernel<4096, true>, 48, NT, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out));
+    fp8_6656_ws8_256_st2_st4_kernel<4096, false><<<48, NT, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out);
+    return int(cudaGetLastError());
+  }
   if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws8_256_st2_st4_kernel<19968, true>, 48, NT, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out));
   fp8_6656_ws8_256_st2_st4_kernel<19968, false><<<48, NT, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out);
   return int(cudaGetLastError());
