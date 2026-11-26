@@ -2006,6 +2006,64 @@ __global__ void Marlin(
 
   // We have the m dimension as the inner loop in order to encourage overlapping
   // dequantization and matmul operations.
+  if constexpr (b_type_id == vllm::kFE2M1f.id() &&
+                a_type_id == vllm::kBFloat16.id() && dequant_skip_flop &&
+                !has_act_order && !has_zp && !is_a_8bit && group_blocks != -1) {
+    // 1-step software-pipelined j = 0..3 E2M1 dequant + BF16 scale -> HMMA overlap:
+    // hides IMAD/AND/LOP3/HMUL2 latency behind Tensor-Core MMAs (+4 regs, 0-ULP bit-identical).
+    auto dequant_nvfp4_j = [&](int jj, FragB& b0, FragB& b1) {
+      const uint32_t u = static_cast<uint32_t>(frag_b_quant[k2][0][jj]);
+      reinterpret_cast<uint32_t*>(&b1)[1] =
+          lop3<(0xf0 & 0xcc) | 0xaa>(u, 0x80008000, (u >> 6) & 0x01c001c0u);
+      reinterpret_cast<uint32_t*>(&b1)[0] =
+          (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
+      reinterpret_cast<uint32_t*>(&b0)[1] =
+          ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
+      reinterpret_cast<uint32_t*>(&b0)[0] =
+          ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
+    };
+    FragB cur_b0, cur_b1;
+    dequant_nvfp4_j(0, cur_b0, cur_b1);
+    scale<a_type_id>(cur_b0, frag_s[k2][0], 0);
+    scale<a_type_id>(cur_b1, frag_s[k2][0], 1);
+  #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      FragB nxt_b0, nxt_b1;
+      if (j < 3) {
+        dequant_nvfp4_j(j + 1, nxt_b0, nxt_b1);
+      }
+      if constexpr (m_block_size_8) {
+        if (j < 3) {
+          scale<a_type_id>(nxt_b0, frag_s[k2][j + 1], 0);
+          scale<a_type_id>(nxt_b1, frag_s[k2][j + 1], 1);
+        }
+  #pragma unroll
+        for (int i = 0; i < thread_m_blocks; i++) {
+          mma_trans<a_type_id, use_fp16_accum>(frag_a[k2][i], cur_b0, cur_b1,
+                                               frag_c[i][j][0]);
+        }
+      } else {
+  #pragma unroll
+        for (int i = 0; i < thread_m_blocks; i++) {
+          mma<a_type_id, use_fp16_accum>(frag_a[k2][i], cur_b0,
+                                         frag_c[i][j][0]);
+        }
+        if (j < 3) {
+          scale<a_type_id>(nxt_b0, frag_s[k2][j + 1], 0);
+          scale<a_type_id>(nxt_b1, frag_s[k2][j + 1], 1);
+        }
+  #pragma unroll
+        for (int i = 0; i < thread_m_blocks; i++) {
+          mma<a_type_id, use_fp16_accum>(frag_a[k2][i], cur_b1,
+                                         frag_c[i][j][1]);
+        }
+      }
+      if (j < 3) {
+        cur_b0 = nxt_b0;
+        cur_b1 = nxt_b1;
+      }
+    }
+  } else {
   #pragma unroll
     for (int j = 0; j < 4; j++) {
       FragB frag_b0;
@@ -2087,6 +2145,7 @@ __global__ void Marlin(
         }
       }
     }
+  }
   };
 
   auto matmul_a8 = [&](int k) {
