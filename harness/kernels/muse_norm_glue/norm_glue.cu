@@ -149,6 +149,17 @@ __device__ __forceinline__ uint2 ld8_v4(const __nv_bfloat16* base, int c) {
   return ((threadIdx.x & 1) == 0) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
 }
 
+__device__ __forceinline__ uint2 ld8_cs_v4(const __nv_bfloat16* base, int c) {
+  uint4 v = make_uint4(0u, 0u, 0u, 0u);
+  const int even_t = threadIdx.x & ~1;
+  if ((threadIdx.x & 1) == 0) {
+    v = ld16_cs(reinterpret_cast<const uint4*>(base + c * 1024 + even_t * 4));
+  }
+  const uint32_t hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
+  const uint32_t hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
+  return ((threadIdx.x & 1) == 0) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+}
+
 __device__ __forceinline__ uint2 ldg8_v4(const __nv_bfloat16* base, int c) {
   uint4 v = make_uint4(0u, 0u, 0u, 0u);
   const int even_t = threadIdx.x & ~1;
@@ -200,26 +211,26 @@ __global__ void __launch_bounds__(kThreads) post_attn_norm_decode(
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) {
-        ur[c] = ld8(res, c);
-        uw[c] = ld8(w_post, c);
-        up[c] = ld8(w_pre, c);
+        ur[c] = ld8_v4(res, c);
+        uw[c] = ldg8_v4(w_post, c);
+        up[c] = ldg8_v4(w_pre, c);
       }
     }
-    if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(*scale);
+    if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
     pdl_wait();
     pdl_launch_dependents();
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) ux[c] = ld8(x, c);
+      if (chunk_valid(c)) ux[c] = ld8_v4(x, c);
     }
   } else {
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) {
-        ux[c] = ld8(x, c);
-        ur[c] = ld8(res, c);
-        uw[c] = ld8(w_post, c);
-        up[c] = ld8(w_pre, c);
+        ux[c] = ld8_v4(x, c);
+        ur[c] = ld8_v4(res, c);
+        uw[c] = ldg8_v4(w_post, c);
+        up[c] = ldg8_v4(w_pre, c);
       }
     }
   }
@@ -250,7 +261,9 @@ __global__ void __launch_bounds__(kThreads) post_attn_norm_decode(
   }
   const float s_h = row_sum(acc2, red[1]);
   const float b = inv_rms(s_h, 1e-05f);
-  if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(*scale);
+  if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
+  __nv_bfloat16* const out_bf16_row = kBf16Out ? (out_bf16_all + row * kHidden) : nullptr;
+  uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
@@ -258,17 +271,16 @@ __global__ void __launch_bounds__(kThreads) post_attn_norm_decode(
       float y[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) y[e] = __fmul_rn(__fmul_rn(b, h[c][e]), __fadd_rn(pv.v[e], 1.0f));
-      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
       if constexpr (kBf16Out) {
         uint2 o;
         o.x = pack_bf16x2(y[0], y[1]);
         o.y = pack_bf16x2(y[2], y[3]);
-        *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
+        st8_v4(out_bf16_row, c, o);
       }
       if constexpr (kFp8Out) {
         uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
                      (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
-        *reinterpret_cast<uint32_t*>(out_fp8_all + off) = q;
+        st4_v2(out_fp8_row, c, q);
       }
     }
   }
@@ -291,7 +303,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
     // Preload predecessor-independent residual (6.8 MB across 512 rows) into SMEM and scale before waiting for o_proj.
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) sh_res[c * 256 + threadIdx.x] = ld8_cs(res, c);
+      if (chunk_valid(c)) sh_res[c * 256 + threadIdx.x] = ld8_cs_v4(res, c);
     }
     if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
     pdl_wait();
@@ -301,7 +313,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
-      ux[c] = ld8_cs(x, c);
+      ux[c] = ld8_cs_v4(x, c);
       Row4 v = unpack(ux[c]);
 #pragma unroll
       for (int e = 0; e < 4; ++e) acc[e] = __fmaf_rn(v.v[e], v.v[e], acc[e]);
@@ -316,8 +328,8 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
       Row4 xv = unpack(ux[c]);
-      Row4 rv = unpack(kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_cs(res, c));
-      Row4 wv = unpack(ldg8(w_post, c));
+      Row4 rv = unpack(kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_cs_v4(res, c));
+      Row4 wv = unpack(ldg8_v4(w_post, c));
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
         h[c][e] = __fmaf_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f), rv.v[e]);
@@ -328,24 +340,25 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
   const float s_h = row_sum(acc2, red[1]);
   const float b = inv_rms(s_h, 1e-05f);
   if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
+  __nv_bfloat16* const out_bf16_row = kBf16Out ? (out_bf16_all + row * kHidden) : nullptr;
+  uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
-      Row4 pv = unpack(ldg8(w_pre, c));
+      Row4 pv = unpack(ldg8_v4(w_pre, c));
       float y[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) y[e] = __fmul_rn(__fmul_rn(b, h[c][e]), __fadd_rn(pv.v[e], 1.0f));
-      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
       if constexpr (kBf16Out) {
         uint2 o;
         o.x = pack_bf16x2(y[0], y[1]);
         o.y = pack_bf16x2(y[2], y[3]);
-        *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
+        st8_v4(out_bf16_row, c, o);
       }
       if constexpr (kFp8Out) {
         uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
                      (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
-        *reinterpret_cast<uint32_t*>(out_fp8_all + off) = q;
+        st4_v2(out_fp8_row, c, q);
       }
     }
   }
@@ -507,7 +520,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
     const float s_x = __ldg(sumsq_x + row);
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) sh_res[c * 256 + threadIdx.x] = ld8_cs(res, c);
+      if (chunk_valid(c)) sh_res[c * 256 + threadIdx.x] = ld8_cs_v4(res, c);
     }
     a = inv_rms(s_x, 1e-08f);
     if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
@@ -518,7 +531,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
-      ud[c] = ld8_cs(d, c);
+      ud[c] = ld8_cs_v4(d, c);
       Row4 v = unpack(ud[c]);
 #pragma unroll
       for (int e = 0; e < 4; ++e) acc[e] = __fmaf_rn(v.v[e], v.v[e], acc[e]);
@@ -535,9 +548,9 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
-      Row4 xv = unpack(ld8_cs(x, c)), dv = unpack(ud[c]),
-           rv = unpack(kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_cs(res, c));
-      Row4 wv = unpack(ldg8(w_post, c)), fv = unpack(ldg8(w_ff, c));
+      Row4 xv = unpack(ld8_cs_v4(x, c)), dv = unpack(ud[c]),
+           rv = unpack(kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_cs_v4(res, c));
+      Row4 wv = unpack(ldg8_v4(w_post, c)), fv = unpack(ldg8_v4(w_ff, c));
       float h2[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
@@ -548,28 +561,29 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
       }
       hb[c].x = pack_bf16x2(h2[0], h2[1]);
       hb[c].y = pack_bf16x2(h2[2], h2[3]);
-      *reinterpret_cast<uint2*>(x + c * 1024 + threadIdx.x * 4) = hb[c];
+      st8_v4(x, c, hb[c]);
     }
   }
   const float s_h = row_sum(acc2, red[1]);
   const float e_r = inv_rms(s_h, 1e-05f);
   if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
+  __nv_bfloat16* const out_bf16_row = out_bf16_all + row * kHidden;
+  uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
-      Row4 hv = unpack(hb[c]), iv = unpack(ldg8(w_in, c));
+      Row4 hv = unpack(hb[c]), iv = unpack(ldg8_v4(w_in, c));
       float y[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) y[e] = __fmul_rn(__fmul_rn(e_r, hv.v[e]), __fadd_rn(iv.v[e], 1.0f));
-      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
       uint2 o;
       o.x = pack_bf16x2(y[0], y[1]);
       o.y = pack_bf16x2(y[2], y[3]);
-      *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
+      st8_v4(out_bf16_row, c, o);
       if constexpr (kFp8Out) {
         uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
                      (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
-        *reinterpret_cast<uint32_t*>(out_fp8_all + off) = q;
+        st4_v2(out_fp8_row, c, q);
       }
     }
   }
@@ -723,26 +737,20 @@ __global__ void __launch_bounds__(kThreads) post_ff_final_norm(
   const __nv_bfloat16* d = d_all + row * kHidden;
   const __nv_bfloat16* res = res_all + row * kHidden;
   const __nv_bfloat16* x = x_all + row * kHidden;
-  uint2 ud[kChunks], ur[kChunks], ux[kChunks], uw[kChunks], uf[kChunks], ui[kChunks];
+  uint2 ud[kChunks], uf[kChunks], ui[kChunks];
   float h1_pre[kChunks][4];
-  float a = 0.f;
+  const float a = inv_rms(__ldg(sumsq_x + row), 1e-08f);
   if constexpr (kPdl) {
-    const float s_x = sumsq_x[row];
+    // Precompute h1_pre chunk-by-chunk before pdl_wait() so ux/ur/uw never consume live regs post-wait.
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) {
-        ur[c] = ld8(res, c);
-        ux[c] = ld8(x, c);
-        uw[c] = ld8(w_post, c);
-        uf[c] = ld8(w_ff, c);
-        ui[c] = ld8(w_in, c);
-      }
-    }
-    a = inv_rms(s_x, 1e-08f);
-#pragma unroll
-    for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) {
-        Row4 xv = unpack(ux[c]), rv = unpack(ur[c]), wv = unpack(uw[c]);
+        const uint2 urc = ld8_v4(res, c);
+        const uint2 uxc = ld8_v4(x, c);
+        const uint2 uwc = ldg8_v4(w_post, c);
+        uf[c] = ldg8_v4(w_ff, c);
+        ui[c] = ldg8_v4(w_in, c);
+        Row4 xv = unpack(uxc), rv = unpack(urc), wv = unpack(uwc);
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
           const float t1 = __fmul_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f));
@@ -754,21 +762,26 @@ __global__ void __launch_bounds__(kThreads) post_ff_final_norm(
     pdl_launch_dependents();
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) ud[c] = ld8(d, c);
+      if (chunk_valid(c)) ud[c] = ld8_v4(d, c);
     }
   } else {
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) {
-        ud[c] = ld8(d, c);
-        ur[c] = ld8(res, c);
-        ux[c] = ld8(x, c);
-        uw[c] = ld8(w_post, c);
-        uf[c] = ld8(w_ff, c);
-        ui[c] = ld8(w_in, c);
+        ud[c] = ld8_v4(d, c);
+        const uint2 urc = ld8_v4(res, c);
+        const uint2 uxc = ld8_v4(x, c);
+        const uint2 uwc = ldg8_v4(w_post, c);
+        uf[c] = ldg8_v4(w_ff, c);
+        ui[c] = ldg8_v4(w_in, c);
+        Row4 xv = unpack(uxc), rv = unpack(urc), wv = unpack(uwc);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const float t1 = __fmul_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f));
+          h1_pre[c][e] = __fadd_rn(rv.v[e], t1);
+        }
       }
     }
-    a = inv_rms(sumsq_x[row], 1e-08f);
   }
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -787,21 +800,10 @@ __global__ void __launch_bounds__(kThreads) post_ff_final_norm(
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
       Row4 dv = unpack(ud[c]), fv = unpack(uf[c]);
-      if constexpr (kPdl) {
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
-          h2[c][e] = __fmaf_rn(__fmul_rn(cd, dv.v[e]), __fadd_rn(fv.v[e], 1.0f), h1_pre[c][e]);
-          acc2[e] = __fmaf_rn(h2[c][e], h2[c][e], acc2[e]);
-        }
-      } else {
-        Row4 xv = unpack(ux[c]), rv = unpack(ur[c]), wv = unpack(uw[c]);
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-          const float t1 = __fmul_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f));
-          const float h1 = __fadd_rn(rv.v[e], t1);
-          h2[c][e] = __fmaf_rn(__fmul_rn(cd, dv.v[e]), __fadd_rn(fv.v[e], 1.0f), h1);
-          acc2[e] = __fmaf_rn(h2[c][e], h2[c][e], acc2[e]);
-        }
+      for (int e = 0; e < 4; ++e) {
+        h2[c][e] = __fmaf_rn(__fmul_rn(cd, dv.v[e]), __fadd_rn(fv.v[e], 1.0f), h1_pre[c][e]);
+        acc2[e] = __fmaf_rn(h2[c][e], h2[c][e], acc2[e]);
       }
       if constexpr (kWriteH2) {
         const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
@@ -812,6 +814,7 @@ __global__ void __launch_bounds__(kThreads) post_ff_final_norm(
   }
   const float s_h = row_sum(acc2, red[1]);
   const float e_r = inv_rms(s_h, 1e-05f);
+  __nv_bfloat16* const out_bf16_row = out_bf16_all + row * kHidden;
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
@@ -821,11 +824,10 @@ __global__ void __launch_bounds__(kThreads) post_ff_final_norm(
       for (int e = 0; e < 4; ++e) {
         y[e] = __fmul_rn(__fmul_rn(e_r, h2[c][e]), __fadd_rn(iv.v[e], 0.0f));
       }
-      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
       uint2 o;
       o.x = pack_bf16x2(y[0], y[1]);
       o.y = pack_bf16x2(y[2], y[3]);
-      *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
+      st8_v4(out_bf16_row, c, o);
     }
   }
 }
@@ -845,22 +847,22 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
   if constexpr (kPdl) {
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) ui[c] = ld8(w_in, c);
+      if (chunk_valid(c)) ui[c] = ldg8_v4(w_in, c);
     }
-    inv_scale = full_divide(1.0f, *scale);
-    if constexpr (kGateOut) gate_inv = full_divide(1.0f, *gate_scale);
+    inv_scale = full_divide(1.0f, __ldg(scale));
+    if constexpr (kGateOut) gate_inv = full_divide(1.0f, __ldg(gate_scale));
     pdl_wait();
     pdl_launch_dependents();
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) ux[c] = ld8(x, c);
+      if (chunk_valid(c)) ux[c] = ld8_v4(x, c);
     }
   } else {
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) {
-        ux[c] = ld8(x, c);
-        ui[c] = ld8(w_in, c);
+        ux[c] = ld8_v4(x, c);
+        ui[c] = ldg8_v4(w_in, c);
       }
     }
   }
@@ -876,9 +878,12 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
   const float s_x = row_sum(acc, red);
   const float r = inv_rms(s_x, 1e-05f);
   if constexpr (!kPdl) {
-    inv_scale = full_divide(1.0f, *scale);
-    if constexpr (kGateOut) gate_inv = full_divide(1.0f, *gate_scale);
+    inv_scale = full_divide(1.0f, __ldg(scale));
+    if constexpr (kGateOut) gate_inv = full_divide(1.0f, __ldg(gate_scale));
   }
+  __nv_bfloat16* const out_bf16_row = kWriteBf16 ? (out_bf16_all + row * kHidden) : nullptr;
+  uint8_t* const out_fp8_row = out_fp8_all + row * kHidden;
+  uint8_t* const out_gate_row = kGateOut ? (out_gate_all + row * kHidden) : nullptr;
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
@@ -886,21 +891,20 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
       float y[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) y[e] = __fmul_rn(__fmul_rn(r, xv.v[e]), __fadd_rn(iv.v[e], 1.0f));
-      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
       uint2 o;
       o.x = pack_bf16x2(y[0], y[1]);
       o.y = pack_bf16x2(y[2], y[3]);
       if constexpr (kWriteBf16) {
-        *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
+        st8_v4(out_bf16_row, c, o);
       }
       uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
                    (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
-      *reinterpret_cast<uint32_t*>(out_fp8_all + off) = q;
+      st4_v2(out_fp8_row, c, q);
       if constexpr (kGateOut) {
         const float g0 = bf_lo(o.x), g1 = bf_hi(o.x), g2 = bf_lo(o.y), g3 = bf_hi(o.y);
         uint32_t gq = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g0)), clamp448(__fmul_rn(gate_inv, g1)))) |
                       (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g2)), clamp448(__fmul_rn(gate_inv, g3)))) << 16);
-        *reinterpret_cast<uint32_t*>(out_gate_all + off) = gq;
+        st4_v2(out_gate_row, c, gq);
       }
     }
   }

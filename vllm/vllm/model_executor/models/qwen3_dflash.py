@@ -291,6 +291,7 @@ class DFlashQwen3Attention(nn.Module):
                 self.num_kv_heads,
                 float(self.q_norm.variance_epsilon),
                 bool(self.rotary_emb.is_neox_style),
+                self.attn.layer_name if getattr(self, "_dflash_qkv_cache_ok", False) else "",
             )
             v = qkv[..., self.q_size + self.kv_size :]
             attn_output = self.attn(q, k, v)
@@ -673,72 +674,92 @@ class DFlashQwen3Model(nn.Module):
             )
             if all(s is not None for s in slots_list):
                 try:
-                    import muse_bfx_ext as _bfx
+                    kv_ptrs = tuple(
+                        (None if a.kv_cache is None else a.kv_cache.data_ptr())
+                        for a in self._attn_layers
+                    )
+                    cache_entry = getattr(self, "_dflash_kv_post_cache", None)
+                    if cache_entry is None or cache_entry[0] != kv_ptrs:
+                        import muse_bfx_ext as _bfx
 
-                    if hasattr(_bfx, "dflash_kv_post"):
+                        kv_post_fn = getattr(_bfx, "dflash_kv_post", None)
                         k_caches = []
                         v_caches = []
                         block_size = 0
-                        ok_layout = True
-                        for i in range(L):
-                            attn = self._attn_layers[i]
-                            if getattr(attn.impl, "kv_cache_dtype", "auto") != "auto":
-                                ok_layout = False
-                                break
-                            kvc = attn.kv_cache
-                            if kvc is None or not kvc.is_cuda or kvc.dtype != torch.bfloat16:
-                                ok_layout = False
-                                break
-                            if kvc.dim() == 4 and kvc.shape[1] == nkv and kvc.shape[3] == 2 * hd:
-                                kc, vc = kvc.transpose(1, 2).split(hd, dim=-1)
-                            elif kvc.dim() == 5 and kvc.shape[0] == 2 and kvc.shape[3] == nkv and kvc.shape[4] == hd:
-                                kc, vc = kvc[0], kvc[1]
-                            else:
-                                ok_layout = False
-                                break
-                            if kc.stride(3) != 1 or vc.stride(3) != 1:
-                                ok_layout = False
-                                break
-                            bs_i = int(kc.shape[1])
-                            if block_size == 0:
-                                block_size = bs_i
-                            elif block_size != bs_i:
-                                ok_layout = False
-                                break
-                            k_caches.append(kc)
-                            v_caches.append(vc)
-
+                        ok_layout = kv_post_fn is not None
+                        if ok_layout:
+                            for i in range(L):
+                                attn = self._attn_layers[i]
+                                if getattr(attn.impl, "kv_cache_dtype", "auto") != "auto":
+                                    ok_layout = False
+                                    break
+                                kvc = attn.kv_cache
+                                if kvc is None or not kvc.is_cuda or kvc.dtype != torch.bfloat16:
+                                    ok_layout = False
+                                    break
+                                if kvc.dim() == 4 and kvc.shape[1] == nkv and kvc.shape[3] == 2 * hd:
+                                    kc, vc = kvc.transpose(1, 2).split(hd, dim=-1)
+                                elif kvc.dim() == 5 and kvc.shape[0] == 2 and kvc.shape[3] == nkv and kvc.shape[4] == hd:
+                                    kc, vc = kvc[0], kvc[1]
+                                else:
+                                    ok_layout = False
+                                    break
+                                if kc.stride(3) != 1 or vc.stride(3) != 1:
+                                    ok_layout = False
+                                    break
+                                bs_i = int(kc.shape[1])
+                                if block_size == 0:
+                                    block_size = bs_i
+                                elif block_size != bs_i:
+                                    ok_layout = False
+                                    break
+                                k_caches.append(kc)
+                                v_caches.append(vc)
                         if ok_layout and block_size > 0:
-                            cos_sin_cache = self._rope_cos_sin_cache
-                            if cos_sin_cache.dtype != context_states.dtype:
-                                cast_cache = getattr(self, "_rope_cos_sin_cache_cast", None)
-                                if (
-                                    cast_cache is None
-                                    or cast_cache.dtype != context_states.dtype
-                                    or cast_cache.device != context_states.device
-                                ):
-                                    cast_cache = cos_sin_cache.to(
-                                        device=context_states.device, dtype=context_states.dtype
-                                    )
-                                    self._rope_cos_sin_cache_cast = cast_cache
-                                cos_sin_cache = cast_cache
-                            all_kv_flat = self._project_context_kv_flat(context_states)
-                            if not all_kv_flat.is_contiguous():
-                                all_kv_flat = all_kv_flat.contiguous()
-                            _bfx.dflash_kv_post(
-                                all_kv_flat,
-                                context_positions if context_positions.is_contiguous() else context_positions.contiguous(),
-                                self._k_norm_weights,
-                                cos_sin_cache,
-                                k_caches,
-                                v_caches,
-                                [s if s.is_contiguous() else s.contiguous() for s in slots_list],
-                                nkv,
-                                block_size,
-                                float(self._rms_norm_eps),
-                                bool(self._rope_is_neox),
-                            )
-                            return
+                            cache_entry = (kv_ptrs, kv_post_fn, k_caches, v_caches, block_size)
+                        else:
+                            cache_entry = (kv_ptrs, None, None, None, 0)
+                        self._dflash_kv_post_cache = cache_entry
+
+                    _, kv_post_fn, k_caches, v_caches, block_size = cache_entry
+                    if kv_post_fn is not None:
+                        cos_sin_cache = self._rope_cos_sin_cache
+                        if cos_sin_cache.dtype != context_states.dtype:
+                            cast_cache = getattr(self, "_rope_cos_sin_cache_cast", None)
+                            if (
+                                cast_cache is None
+                                or cast_cache.dtype != context_states.dtype
+                                or cast_cache.device != context_states.device
+                            ):
+                                cast_cache = cos_sin_cache.to(
+                                    device=context_states.device, dtype=context_states.dtype
+                                )
+                                self._rope_cos_sin_cache_cast = cast_cache
+                            cos_sin_cache = cast_cache
+                        all_kv_flat = self._project_context_kv_flat(context_states)
+                        if not all_kv_flat.is_contiguous():
+                            all_kv_flat = all_kv_flat.contiguous()
+                        pos_arg = (
+                            context_positions
+                            if context_positions.is_contiguous()
+                            else context_positions.contiguous()
+                        )
+                        if not all(s.is_contiguous() for s in slots_list):
+                            slots_list = [s if s.is_contiguous() else s.contiguous() for s in slots_list]
+                        kv_post_fn(
+                            all_kv_flat,
+                            pos_arg,
+                            self._k_norm_weights,
+                            cos_sin_cache,
+                            k_caches,
+                            v_caches,
+                            slots_list,
+                            nkv,
+                            block_size,
+                            float(self._rms_norm_eps),
+                            bool(self._rope_is_neox),
+                        )
+                        return
                 except Exception as exc:  # noqa: BLE001
                     logger.warning_once("dflash_kv_post skipped (%s); using stock path", exc)
 

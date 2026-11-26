@@ -166,6 +166,28 @@ class DraftVocabTest(unittest.TestCase):
             draft_vocab.configure_draft_vocab(tmp, 1024, mode="ascii_lm")
             self.assertIsNone(draft_vocab.get_draft_vocab_token_ids())
 
+    def test_non_reserved_special_tokens_preserved_and_reserved_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_synthetic_model(root)
+            tok_path = root / "tokenizer.json"
+            data = json.loads(tok_path.read_text(encoding="utf-8"))
+            base_id = max(e["id"] for e in data["added_tokens"]) + 1
+            eot_id = base_id
+            res_id = base_id + 1
+            data["added_tokens"].append({"id": eot_id, "content": "<|eot|>", "special": True})
+            data["added_tokens"].append(
+                {"id": res_id, "content": "<|reserved_special_token_42|>", "special": True}
+            )
+            tok_path.write_text(json.dumps(data), encoding="utf-8")
+
+            draft_vocab.configure_draft_vocab(str(root), 1024, mode="ascii_lm")
+            ids = draft_vocab.get_draft_vocab_token_ids()
+            self.assertIsNotNone(ids)
+            assert ids is not None
+            self.assertIn(eot_id, ids)
+            self.assertNotIn(res_id, ids)
+
 
 if __name__ == "__main__":
     unittest.main()

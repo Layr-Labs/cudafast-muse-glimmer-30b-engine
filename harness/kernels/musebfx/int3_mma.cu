@@ -73,6 +73,12 @@ __device__ __forceinline__ void int3_ldmatrix_x2(
       : "r"(smem_addr));
 }
 
+__device__ __forceinline__ float2 int3_ldcg_f2(const float2* ptr) {
+  float2 v;
+  asm volatile("ld.global.cg.v2.f32 {%0, %1}, [%2];" : "=f"(v.x), "=f"(v.y) : "l"(ptr));
+  return v;
+}
+
 __device__ __forceinline__ uint32_t int3_bf16x2_u32(float f0, float f1) {
   __nv_bfloat162 v = __floats2bfloat162_rn(f0, f1);
   return *reinterpret_cast<const uint32_t*>(&v);
@@ -84,20 +90,61 @@ __device__ __forceinline__ uint32_t int3_unpack_hi1(uint16_t hi1) {
 }
 
 // Native BF16x2 3-bit dequant using pair-interleaved lo2/hi1:
-// 0x41004100 | ((lo2<<4)&0x00300030) | ((hi32<<6)&0x00400040) == bf16x2(8+q0, 8+q1) exact
-// -> HADD2(-8.0) -> HFMA2(sc2, zr2): bit-exact with rn_bf16(fma(float(q), sc, zr)), 0 I2F, 0 F2FP.
+// - kNf3=false (uniform): 0x41004100 | ((lo2<<4)&0x00300030) | ((hi32<<6)&0x00400040) == bf16x2(8+q0, 8+q1)
+//   -> HADD2(-8.0) -> HFMA2(sc2, zr2): bit-exact with rn_bf16(fma(float(q), sc, zr)), 0 I2F, 0 F2FP.
+// - kNf3=true (non-uniform NormalFloat3, exact BF16 centroids +-0.109375, +-0.3359375, +-0.609375, +-1.0):
+//   register PRMT (__byte_perm) lookup of 2-bit magnitude + LOP3 sign bit from hi32 -> HFMA2(sc2, zr2).
+//   Zero extra weight bytes, zero SMEM LUT loads, +0.34..+0.74 dB SQNR across Gaussian/Student-t/Laplace MLP weights.
+template <bool kNf3>
 __device__ __forceinline__ void int3_deq4_k16(
     uint32_t lo2, uint32_t hi32, __nv_bfloat162 sc2, __nv_bfloat162 zr2, uint32_t& b0, uint32_t& b1) {
-  const uint32_t t0 = 0x41004100u | ((lo2 << 4) & 0x00300030u) | ((hi32 << 6) & 0x00400040u);
-  const uint32_t t1 = 0x41004100u | ((lo2 << 2) & 0x00300030u) | ((hi32 << 5) & 0x00400040u);
-  const uint32_t neg8_u = 0xC100C100u;
-  const __nv_bfloat162 neg8 = *reinterpret_cast<const __nv_bfloat162*>(&neg8_u);
-  const __nv_bfloat162 q01 = __hadd2(*reinterpret_cast<const __nv_bfloat162*>(&t0), neg8);
-  const __nv_bfloat162 q23 = __hadd2(*reinterpret_cast<const __nv_bfloat162*>(&t1), neg8);
-  const __nv_bfloat162 w01 = __hfma2(q01, sc2, zr2);
-  const __nv_bfloat162 w23 = __hfma2(q23, sc2, zr2);
-  b0 = *reinterpret_cast<const uint32_t*>(&w01);
-  b1 = *reinterpret_cast<const uint32_t*>(&w23);
+  if constexpr (kNf3) {
+    constexpr uint32_t kNf3Lut01 = 0x3EAC3DE0u;  // bf16(0.109375) | (bf16(0.3359375) << 16)
+    constexpr uint32_t kNf3Lut23 = 0x3F803F1Cu;  // bf16(0.609375) | (bf16(1.000000) << 16)
+    const uint32_t p0_lo = (lo2 & 3u) << 1;
+    const uint32_t p0_hi = (lo2 >> 15) & 6u;
+    const uint32_t sel0 = p0_lo | (p0_lo << 4) | (p0_hi << 8) | (p0_hi << 12) | 0x1010u;
+    const uint32_t q01_u = __byte_perm(kNf3Lut01, kNf3Lut23, sel0) | ((hi32 << 15) & 0x80008000u);
+
+    const uint32_t p1_lo = (lo2 >> 1) & 6u;
+    const uint32_t p1_hi = (lo2 >> 17) & 6u;
+    const uint32_t sel1 = p1_lo | (p1_lo << 4) | (p1_hi << 8) | (p1_hi << 12) | 0x1010u;
+    const uint32_t q23_u = __byte_perm(kNf3Lut01, kNf3Lut23, sel1) | ((hi32 << 14) & 0x80008000u);
+
+    const __nv_bfloat162 w01 = __hfma2(*reinterpret_cast<const __nv_bfloat162*>(&q01_u), sc2, zr2);
+    const __nv_bfloat162 w23 = __hfma2(*reinterpret_cast<const __nv_bfloat162*>(&q23_u), sc2, zr2);
+    b0 = *reinterpret_cast<const uint32_t*>(&w01);
+    b1 = *reinterpret_cast<const uint32_t*>(&w23);
+  } else {
+    const uint32_t t0 = 0x41004100u | ((lo2 << 4) & 0x00300030u) | ((hi32 << 6) & 0x00400040u);
+    const uint32_t t1 = 0x41004100u | ((lo2 << 2) & 0x00300030u) | ((hi32 << 5) & 0x00400040u);
+    const uint32_t neg8_u = 0xC100C100u;
+    const __nv_bfloat162 neg8 = *reinterpret_cast<const __nv_bfloat162*>(&neg8_u);
+    const __nv_bfloat162 q01 = __hadd2(*reinterpret_cast<const __nv_bfloat162*>(&t0), neg8);
+    const __nv_bfloat162 q23 = __hadd2(*reinterpret_cast<const __nv_bfloat162*>(&t1), neg8);
+    const __nv_bfloat162 w01 = __hfma2(q01, sc2, zr2);
+    const __nv_bfloat162 w23 = __hfma2(q23, sc2, zr2);
+    b0 = *reinterpret_cast<const uint32_t*>(&w01);
+    b1 = *reinterpret_cast<const uint32_t*>(&w23);
+  }
+}
+
+__device__ __forceinline__ float int3_nf3_quant_val(float u, int& mag, int& sgn) {
+  constexpr float kC0 = 0.109375f;
+  constexpr float kC1 = 0.3359375f;
+  constexpr float kC2 = 0.609375f;
+  constexpr float kC3 = 1.000000f;
+  const float au = fabsf(u);
+  float cmag;
+  if (au >= 0.47265625f) {
+    if (au >= 0.8046875f) { mag = 3; cmag = kC3; }
+    else { mag = 2; cmag = kC2; }
+  } else {
+    if (au >= 0.22265625f) { mag = 1; cmag = kC1; }
+    else { mag = 0; cmag = kC0; }
+  }
+  sgn = (u < 0.0f) ? 1 : 0;
+  return sgn ? -cmag : cmag;
 }
 
 __device__ __forceinline__ float int3_subwarp4_sum(float v) {
@@ -106,36 +153,18 @@ __device__ __forceinline__ float int3_subwarp4_sum(float v) {
   return v;
 }
 
-// GPU packer: BF16 [N, K] (N%64==0, K%64==0) -> uint8 [N/64, K/64, 8, 224]
-// Grid: (N/8, K/64), Block: 32 threads (1 warp per 8x64 tile).
-// When kMseOpt is true, optimizes per-group (scale, zero) via warp-parallel clipping search
-// (symmetric midpoint, mean+-std, and one-sided clips) + 5-iteration closed-form ALS
-// minimizing exact BF16-dequantized MSE (monotonically <= naive min-max on every group).
-template <bool kMseOpt>
-__global__ void int3_pack_kernel(
-    const __nv_bfloat16* __restrict__ W,
-    uint8_t* __restrict__ out,
-    int N, int K) {
-  const int n_tile = blockIdx.x;        // 0 .. N/8 - 1
-  const int kg = blockIdx.y;            // 0 .. K/64 - 1
-  const int lane = threadIdx.x;         // 0 .. 31
-  const int r = lane >> 2;              // 0 .. 7
-  const int t = lane & 3;               // 0 .. 3
-  const int row = n_tile * 8 + r;
-  const int k_base = kg * 64;
-
-  float vals[16];
+// Shared group-64 MSE+ALS packer for both int3_pack_kernel and int3_pack_swiglu_kernel.
+// kNf3=true packs non-uniform NormalFloat3 centroids (+-0.109375, +-0.3359375, +-0.609375, +-1.0);
+// kNf3=false packs uniform 0..7 levels. Both minimize exact BF16-dequantized MSE via 5-iter closed-form ALS.
+template <bool kMseOpt, bool kNf3>
+__device__ __forceinline__ void int3_pack_group_16(
+    const float vals[16],
+    int r,
+    uint32_t& lo2_out,
+    uint32_t& hi1_out,
+    __nv_bfloat162& sz_out) {
   float rmin = 1e30f;
   float rmax = -1e30f;
-  const __nv_bfloat16* wrow = W + static_cast<size_t>(row) * K + k_base;
-#pragma unroll
-  for (int s = 0; s < 4; ++s) {
-    const int kb = s * 16 + 2 * t;
-    vals[4 * s + 0] = __bfloat162float(wrow[kb + 0]);
-    vals[4 * s + 1] = __bfloat162float(wrow[kb + 1]);
-    vals[4 * s + 2] = __bfloat162float(wrow[kb + 8]);
-    vals[4 * s + 3] = __bfloat162float(wrow[kb + 9]);
-  }
 #pragma unroll
   for (int i = 0; i < 16; ++i) {
     rmin = fminf(rmin, vals[i]);
@@ -146,206 +175,12 @@ __global__ void int3_pack_kernel(
   rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 1));
   rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 2));
 
-  float sc_mm = (rmax - rmin) * (1.0f / 7.0f);
+  const float mid = 0.5f * (rmin + rmax);
+  const float half = 0.5f * (rmax - rmin);
+  float sc_mm = kNf3 ? half : ((rmax - rmin) * (1.0f / 7.0f));
+  const float zr_mm = kNf3 ? mid : rmin;
   if (sc_mm < 1e-30f) sc_mm = 1e-30f;
-  __nv_bfloat162 sz_bf = __floats2bfloat162_rn(sc_mm, rmin);
-
-  if constexpr (kMseOpt) {
-    float lsum = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-      lsum += vals[i];
-    }
-    const float sw = int3_subwarp4_sum(lsum);
-    const float mu = sw * (1.0f / 64.0f);
-
-    float lvar = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-      const float d = vals[i] - mu;
-      lvar = __fmaf_rn(d, d, lvar);
-    }
-    const float std_v = sqrtf(fmaxf(int3_subwarp4_sum(lvar) * (1.0f / 64.0f), 0.0f));
-
-    auto eval_cand = [&](float sc_in, float zr_in, __nv_bfloat162& out_sz, float& out_mse) {
-      if (!(sc_in > 1e-30f)) sc_in = 1e-30f;
-      out_sz = __floats2bfloat162_rn(sc_in, zr_in);
-      const float sc_q = __bfloat162float(out_sz.x);
-      const float zr_q = __bfloat162float(out_sz.y);
-      const float inv_sc = (sc_q > 1e-30f) ? (1.0f / sc_q) : 0.0f;
-      float err = 0.0f;
-#pragma unroll
-      for (int i = 0; i < 16; ++i) {
-        int q = __float2int_rn((vals[i] - zr_q) * inv_sc);
-        if (q < 0) q = 0;
-        if (q > 7) q = 7;
-        const float w_hat = __bfloat162float(
-            __float2bfloat16_rn(__fmaf_rn(static_cast<float>(q), sc_q, zr_q)));
-        const float diff = vals[i] - w_hat;
-        err = __fmaf_rn(diff, diff, err);
-      }
-      out_mse = int3_subwarp4_sum(err);
-    };
-
-    __nv_bfloat162 best_sz = sz_bf;
-    float best_mse = 0.0f;
-    eval_cand(sc_mm, rmin, best_sz, best_mse);
-
-    __nv_bfloat162 try_sz;
-    float try_mse;
-    auto consider_interval = [&](float lo, float hi) {
-      eval_cand((hi - lo) * (1.0f / 7.0f), lo, try_sz, try_mse);
-      if (try_mse < best_mse) {
-        best_mse = try_mse;
-        best_sz = try_sz;
-      }
-    };
-
-    // 4 symmetric midpoint shrinks (1.00 already evaluated as baseline min-max).
-    const float mid = 0.5f * (rmin + rmax);
-    const float half = 0.5f * (rmax - rmin);
-    constexpr float kMidAlphas[4] = {0.92f, 0.84f, 0.76f, 0.68f};
-#pragma unroll
-    for (int c = 0; c < 4; ++c) {
-      const float h = half * kMidAlphas[c];
-      consider_interval(mid - h, mid + h);
-    }
-
-    // 5 mean +/- c*std clips (immune to heavy-tail outliers on either side).
-    constexpr float kStdCs[5] = {2.60f, 2.30f, 2.00f, 1.75f, 1.50f};
-#pragma unroll
-    for (int c = 0; c < 5; ++c) {
-      const float d = std_v * kStdCs[c];
-      consider_interval(fmaxf(rmin, mu - d), fminf(rmax, mu + d));
-    }
-
-    // 4 one-sided clips (for asymmetric single-sided outlier groups).
-    constexpr float kOneSideCs[2] = {2.20f, 1.80f};
-#pragma unroll
-    for (int c = 0; c < 2; ++c) {
-      const float d = std_v * kOneSideCs[c];
-      consider_interval(rmin, fminf(rmax, mu + d));
-      consider_interval(fmaxf(rmin, mu - d), rmax);
-    }
-
-    // 5 iterations of exact closed-form ALS (1D linear regression on q -> (scale, zero)).
-    float cur_sc = __bfloat162float(best_sz.x);
-    float cur_zr = __bfloat162float(best_sz.y);
-#pragma unroll
-    for (int it = 0; it < 5; ++it) {
-      const float inv_cur = (cur_sc > 1e-30f) ? (1.0f / cur_sc) : 0.0f;
-      float lsq = 0.0f;
-      float lsqq = 0.0f;
-      float lsqw = 0.0f;
-#pragma unroll
-      for (int i = 0; i < 16; ++i) {
-        int q = __float2int_rn((vals[i] - cur_zr) * inv_cur);
-        if (q < 0) q = 0;
-        if (q > 7) q = 7;
-        const float fq = static_cast<float>(q);
-        lsq += fq;
-        lsqq = __fmaf_rn(fq, fq, lsqq);
-        lsqw = __fmaf_rn(fq, vals[i], lsqw);
-      }
-      const float sq = int3_subwarp4_sum(lsq);
-      const float sqq = int3_subwarp4_sum(lsqq);
-      const float sqw = int3_subwarp4_sum(lsqw);
-      const float denom = 64.0f * sqq - sq * sq;
-      if (denom > 0.5f) {
-        const float cand_sc = (64.0f * sqw - sq * sw) / denom;
-        const float cand_zr = (sw - cand_sc * sq) * (1.0f / 64.0f);
-        if (cand_sc > 1e-30f && cand_sc < 1e30f && fabsf(cand_zr) < 1e30f) {
-          cur_sc = cand_sc;
-          cur_zr = cand_zr;
-        }
-      }
-      eval_cand(cur_sc, cur_zr, try_sz, try_mse);
-      if (try_mse < best_mse) {
-        best_mse = try_mse;
-        best_sz = try_sz;
-      }
-    }
-
-    // Broadcast winning sz_bf from lane t==0 so all 4 threads pack with bit-identical (scale, zero).
-    uint32_t sz_bits = *reinterpret_cast<const uint32_t*>(&best_sz);
-    sz_bits = __shfl_sync(0xffffffffu, sz_bits, r << 2);
-    sz_bf = *reinterpret_cast<const __nv_bfloat162*>(&sz_bits);
-  }
-
-  const float sc_q = __bfloat162float(sz_bf.x);
-  const float zr_q = __bfloat162float(sz_bf.y);
-  const float inv_sc = (sc_q > 1e-30f) ? (1.0f / sc_q) : 0.0f;
-
-  uint32_t lo2 = 0u;
-  uint32_t hi1 = 0u;
-#pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    int q = __float2int_rn((vals[i] - zr_q) * inv_sc);
-    if (q < 0) q = 0;
-    if (q > 7) q = 7;
-    const int p = i >> 1;
-    const int h = i & 1;
-    lo2 |= (static_cast<uint32_t>(q & 3) << (2 * p + 16 * h));
-    hi1 |= (static_cast<uint32_t>((q >> 2) & 1) << (p + 8 * h));
-  }
-
-  const int cta_n = n_tile >> 3;         // 0 .. N/64 - 1
-  const int sub_tile = n_tile & 7;       // 0 .. 7
-  const int num_kg = K >> 6;
-  const size_t tile_idx = (static_cast<size_t>(cta_n) * num_kg + kg) * kNTilesPerCTA + sub_tile;
-  uint8_t* dst = out + tile_idx * kTileBytes;
-
-  reinterpret_cast<uint32_t*>(dst)[lane] = lo2;
-  reinterpret_cast<uint16_t*>(dst + 128)[lane] = static_cast<uint16_t>(hi1);
-  if (t == 0) {
-    reinterpret_cast<__nv_bfloat162*>(dst + 192)[r] = sz_bf;
-  }
-}
-
-// Paired gate_up packer: identical per-8-row independent (scale, zero) & MSE/ALS quantization
-// (zero SNR loss vs int3_pack!), but interleaves gate tile (sub_tile = 2*w) and matching up tile
-// (sub_tile = 2*w + 1) inside each CTA so one warp computes both gate and up in registers and
-// writes SiLU(gate) * up directly without an intermediate [M, 2*I] BF16 round-trip.
-template <bool kMseOpt>
-__global__ void int3_pack_swiglu_kernel(
-    const __nv_bfloat16* __restrict__ W,
-    uint8_t* __restrict__ out,
-    int I, int K) {
-  const int pair_tile = blockIdx.x;      // 0 .. 2*(I/8) - 1; even=gate, odd=up
-  const int kg = blockIdx.y;             // 0 .. K/64 - 1
-  const int lane = threadIdx.x;          // 0 .. 31
-  const int r = lane >> 2;               // 0 .. 7
-  const int t = lane & 3;                // 0 .. 3
-  const int g_tile = pair_tile >> 1;     // 0 .. I/8 - 1
-  const int is_up = pair_tile & 1;       // 0=gate, 1=up
-  const int row = (is_up ? I : 0) + g_tile * 8 + r;
-  const int k_base = kg * 64;
-
-  float vals[16];
-  float rmin = 1e30f;
-  float rmax = -1e30f;
-  const __nv_bfloat16* wrow = W + static_cast<size_t>(row) * K + k_base;
-#pragma unroll
-  for (int s = 0; s < 4; ++s) {
-    const int kb = s * 16 + 2 * t;
-    vals[4 * s + 0] = __bfloat162float(wrow[kb + 0]);
-    vals[4 * s + 1] = __bfloat162float(wrow[kb + 1]);
-    vals[4 * s + 2] = __bfloat162float(wrow[kb + 8]);
-    vals[4 * s + 3] = __bfloat162float(wrow[kb + 9]);
-  }
-#pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    rmin = fminf(rmin, vals[i]);
-    rmax = fmaxf(rmax, vals[i]);
-  }
-  rmin = fminf(rmin, __shfl_xor_sync(0xffffffffu, rmin, 1));
-  rmin = fminf(rmin, __shfl_xor_sync(0xffffffffu, rmin, 2));
-  rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 1));
-  rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffffu, rmax, 2));
-
-  float sc_mm = (rmax - rmin) * (1.0f / 7.0f);
-  if (sc_mm < 1e-30f) sc_mm = 1e-30f;
-  __nv_bfloat162 sz_bf = __floats2bfloat162_rn(sc_mm, rmin);
+  __nv_bfloat162 sz_bf = __floats2bfloat162_rn(sc_mm, zr_mm);
 
   if constexpr (kMseOpt) {
     float lsum = 0.0f;
@@ -371,11 +206,18 @@ __global__ void int3_pack_swiglu_kernel(
       float err = 0.0f;
 #pragma unroll
       for (int i = 0; i < 16; ++i) {
-        int q = __float2int_rn((vals[i] - zr_q) * inv_sc);
-        if (q < 0) q = 0;
-        if (q > 7) q = 7;
+        float c_val;
+        if constexpr (kNf3) {
+          int mag, sgn;
+          c_val = int3_nf3_quant_val((vals[i] - zr_q) * inv_sc, mag, sgn);
+        } else {
+          int q = __float2int_rn((vals[i] - zr_q) * inv_sc);
+          if (q < 0) q = 0;
+          if (q > 7) q = 7;
+          c_val = static_cast<float>(q);
+        }
         const float w_hat = __bfloat162float(
-            __float2bfloat16_rn(__fmaf_rn(static_cast<float>(q), sc_q, zr_q)));
+            __float2bfloat16_rn(__fmaf_rn(c_val, sc_q, zr_q)));
         const float diff = vals[i] - w_hat;
         err = __fmaf_rn(diff, diff, err);
       }
@@ -384,20 +226,20 @@ __global__ void int3_pack_swiglu_kernel(
 
     __nv_bfloat162 best_sz = sz_bf;
     float best_mse = 0.0f;
-    eval_cand(sc_mm, rmin, best_sz, best_mse);
+    eval_cand(sc_mm, zr_mm, best_sz, best_mse);
 
     __nv_bfloat162 try_sz;
     float try_mse;
     auto consider_interval = [&](float lo, float hi) {
-      eval_cand((hi - lo) * (1.0f / 7.0f), lo, try_sz, try_mse);
+      const float sc_c = kNf3 ? (0.5f * (hi - lo)) : ((hi - lo) * (1.0f / 7.0f));
+      const float zr_c = kNf3 ? (0.5f * (lo + hi)) : lo;
+      eval_cand(sc_c, zr_c, try_sz, try_mse);
       if (try_mse < best_mse) {
         best_mse = try_mse;
         best_sz = try_sz;
       }
     };
 
-    const float mid = 0.5f * (rmin + rmax);
-    const float half = 0.5f * (rmax - rmin);
     constexpr float kMidAlphas[4] = {0.92f, 0.84f, 0.76f, 0.68f};
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
@@ -405,9 +247,9 @@ __global__ void int3_pack_swiglu_kernel(
       consider_interval(mid - h, mid + h);
     }
 
-    constexpr float kStdCs[5] = {2.60f, 2.30f, 2.00f, 1.75f, 1.50f};
+    constexpr float kStdCs[6] = {3.00f, 2.60f, 2.30f, 2.00f, 1.75f, 1.50f};
 #pragma unroll
-    for (int c = 0; c < 5; ++c) {
+    for (int c = 0; c < 6; ++c) {
       const float d = std_v * kStdCs[c];
       consider_interval(fmaxf(rmin, mu - d), fminf(rmax, mu + d));
     }
@@ -422,16 +264,23 @@ __global__ void int3_pack_swiglu_kernel(
 
     float cur_sc = __bfloat162float(best_sz.x);
     float cur_zr = __bfloat162float(best_sz.y);
+    const float min_denom = kNf3 ? 1e-3f : 0.5f;
 #pragma unroll
     for (int it = 0; it < 5; ++it) {
       const float inv_cur = (cur_sc > 1e-30f) ? (1.0f / cur_sc) : 0.0f;
       float lsq = 0.0f, lsqq = 0.0f, lsqw = 0.0f;
 #pragma unroll
       for (int i = 0; i < 16; ++i) {
-        int q = __float2int_rn((vals[i] - cur_zr) * inv_cur);
-        if (q < 0) q = 0;
-        if (q > 7) q = 7;
-        const float fq = static_cast<float>(q);
+        float fq;
+        if constexpr (kNf3) {
+          int mag, sgn;
+          fq = int3_nf3_quant_val((vals[i] - cur_zr) * inv_cur, mag, sgn);
+        } else {
+          int q = __float2int_rn((vals[i] - cur_zr) * inv_cur);
+          if (q < 0) q = 0;
+          if (q > 7) q = 7;
+          fq = static_cast<float>(q);
+        }
         lsq += fq;
         lsqq = __fmaf_rn(fq, fq, lsqq);
         lsqw = __fmaf_rn(fq, vals[i], lsqw);
@@ -440,7 +289,7 @@ __global__ void int3_pack_swiglu_kernel(
       const float sqq = int3_subwarp4_sum(lsqq);
       const float sqw = int3_subwarp4_sum(lsqw);
       const float denom = 64.0f * sqq - sq * sq;
-      if (denom > 0.5f) {
+      if (denom > min_denom) {
         const float cand_sc = (64.0f * sqw - sq * sw) / denom;
         const float cand_zr = (sw - cand_sc * sq) * (1.0f / 64.0f);
         if (cand_sc > 1e-30f && cand_sc < 1e30f && fabsf(cand_zr) < 1e30f) {
@@ -468,14 +317,103 @@ __global__ void int3_pack_swiglu_kernel(
   uint32_t hi1 = 0u;
 #pragma unroll
   for (int i = 0; i < 16; ++i) {
-    int q = __float2int_rn((vals[i] - zr_q) * inv_sc);
-    if (q < 0) q = 0;
-    if (q > 7) q = 7;
+    uint32_t q_lo, q_hi;
+    if constexpr (kNf3) {
+      int mag, sgn;
+      (void)int3_nf3_quant_val((vals[i] - zr_q) * inv_sc, mag, sgn);
+      q_lo = static_cast<uint32_t>(mag);
+      q_hi = static_cast<uint32_t>(sgn);
+    } else {
+      int q = __float2int_rn((vals[i] - zr_q) * inv_sc);
+      if (q < 0) q = 0;
+      if (q > 7) q = 7;
+      q_lo = static_cast<uint32_t>(q & 3);
+      q_hi = static_cast<uint32_t>((q >> 2) & 1);
+    }
     const int p = i >> 1;
     const int h = i & 1;
-    lo2 |= (static_cast<uint32_t>(q & 3) << (2 * p + 16 * h));
-    hi1 |= (static_cast<uint32_t>((q >> 2) & 1) << (p + 8 * h));
+    lo2 |= (q_lo << (2 * p + 16 * h));
+    hi1 |= (q_hi << (p + 8 * h));
   }
+  lo2_out = lo2;
+  hi1_out = hi1;
+  sz_out = sz_bf;
+}
+
+template <bool kMseOpt, bool kNf3>
+__global__ void int3_pack_kernel(
+    const __nv_bfloat16* __restrict__ W,
+    uint8_t* __restrict__ out,
+    int N, int K) {
+  const int n_tile = blockIdx.x;        // 0 .. N/8 - 1
+  const int kg = blockIdx.y;            // 0 .. K/64 - 1
+  const int lane = threadIdx.x;         // 0 .. 31
+  const int r = lane >> 2;              // 0 .. 7
+  const int t = lane & 3;               // 0 .. 3
+  const int row = n_tile * 8 + r;
+  const int k_base = kg * 64;
+
+  float vals[16];
+  const __nv_bfloat16* wrow = W + static_cast<size_t>(row) * K + k_base;
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    const int kb = s * 16 + 2 * t;
+    vals[4 * s + 0] = __bfloat162float(wrow[kb + 0]);
+    vals[4 * s + 1] = __bfloat162float(wrow[kb + 1]);
+    vals[4 * s + 2] = __bfloat162float(wrow[kb + 8]);
+    vals[4 * s + 3] = __bfloat162float(wrow[kb + 9]);
+  }
+
+  uint32_t lo2 = 0u, hi1 = 0u;
+  __nv_bfloat162 sz_bf;
+  int3_pack_group_16<kMseOpt, kNf3>(vals, r, lo2, hi1, sz_bf);
+
+  const int cta_n = n_tile >> 3;         // 0 .. N/64 - 1
+  const int sub_tile = n_tile & 7;       // 0 .. 7
+  const int num_kg = K >> 6;
+  const size_t tile_idx = (static_cast<size_t>(cta_n) * num_kg + kg) * kNTilesPerCTA + sub_tile;
+  uint8_t* dst = out + tile_idx * kTileBytes;
+
+  reinterpret_cast<uint32_t*>(dst)[lane] = lo2;
+  reinterpret_cast<uint16_t*>(dst + 128)[lane] = static_cast<uint16_t>(hi1);
+  if (t == 0) {
+    reinterpret_cast<__nv_bfloat162*>(dst + 192)[r] = sz_bf;
+  }
+}
+
+// Paired gate_up packer: identical per-8-row independent (scale, zero) & MSE/ALS quantization
+// (zero SNR loss vs int3_pack!), but interleaves gate tile (sub_tile = 2*w) and matching up tile
+// (sub_tile = 2*w + 1) inside each CTA so one warp computes both gate and up in registers and
+// writes SiLU(gate) * up directly without an intermediate [M, 2*I] BF16 round-trip.
+template <bool kMseOpt, bool kNf3>
+__global__ void int3_pack_swiglu_kernel(
+    const __nv_bfloat16* __restrict__ W,
+    uint8_t* __restrict__ out,
+    int I, int K) {
+  const int pair_tile = blockIdx.x;      // 0 .. 2*(I/8) - 1; even=gate, odd=up
+  const int kg = blockIdx.y;             // 0 .. K/64 - 1
+  const int lane = threadIdx.x;          // 0 .. 31
+  const int r = lane >> 2;               // 0 .. 7
+  const int t = lane & 3;                // 0 .. 3
+  const int g_tile = pair_tile >> 1;     // 0 .. I/8 - 1
+  const int is_up = pair_tile & 1;       // 0=gate, 1=up
+  const int row = (is_up ? I : 0) + g_tile * 8 + r;
+  const int k_base = kg * 64;
+
+  float vals[16];
+  const __nv_bfloat16* wrow = W + static_cast<size_t>(row) * K + k_base;
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    const int kb = s * 16 + 2 * t;
+    vals[4 * s + 0] = __bfloat162float(wrow[kb + 0]);
+    vals[4 * s + 1] = __bfloat162float(wrow[kb + 1]);
+    vals[4 * s + 2] = __bfloat162float(wrow[kb + 8]);
+    vals[4 * s + 3] = __bfloat162float(wrow[kb + 9]);
+  }
+
+  uint32_t lo2 = 0u, hi1 = 0u;
+  __nv_bfloat162 sz_bf;
+  int3_pack_group_16<kMseOpt, kNf3>(vals, r, lo2, hi1, sz_bf);
 
   // cta_n in [0 .. I/32 - 1], warp_slot in [0 .. 3], sub_tile = warp_slot*2 + is_up.
   const int cta_n = g_tile >> 2;
@@ -499,7 +437,7 @@ struct alignas(16) Int3StageSmem {
 
 // Direct / split-K W3A16 Tensor-Core GEMM (cp.async.cg.L2::256B, XOR-swizzled ldmatrix,
 // BF16x2 HADD2+HFMA2 dequant, dual SM121 PDL, 4 CTAs/SM, SM121 odd-UR safe).
-template <bool kSplitK, bool kM16 = false>
+template <bool kSplitK, bool kM16 = false, bool kNf3 = true>
 __global__ void __launch_bounds__(128, 4) int3_mma_gemm_kernel(
     const __nv_bfloat16* __restrict__ A,
     const uint8_t* __restrict__ W_packed,
@@ -649,10 +587,10 @@ __global__ void __launch_bounds__(128, 4) int3_mma_gemm_kernel(
         int3_ldmatrix_x2(a0, a2, a_addr);
       }
       uint32_t b0, b1, c0, c1;
-      int3_deq4_k16(lo2_0, hi32_0, sc0_2, zr0_2, b0, b1);
+      int3_deq4_k16<kNf3>(lo2_0, hi32_0, sc0_2, zr0_2, b0, b1);
       lo2_0 >>= 4;
       hi32_0 >>= 2;
-      int3_deq4_k16(lo2_1, hi32_1, sc1_2, zr1_2, c0, c1);
+      int3_deq4_k16<kNf3>(lo2_1, hi32_1, sc1_2, zr1_2, c0, c1);
       lo2_1 >>= 4;
       hi32_1 >>= 2;
       if constexpr (kM16) {
@@ -746,7 +684,7 @@ __device__ __forceinline__ float int3_swiglu_f32(float gate, float up) {
 // Fused paired gate_up + SiLU*Mul W3A16 GEMM (cp.async.cg.L2::256B, XOR-swizzled ldmatrix,
 // BF16x2 HADD2+HFMA2 dequant, dual SM121 PDL, 4 CTAs/SM, SM121 odd-UR safe).
 // Each CTA computes 32 intermediate outputs (4 warps x 8 cols): tile 2*w = gate, tile 2*w+1 = up.
-template <bool kM16>
+template <bool kM16, bool kNf3 = true>
 __global__ void __launch_bounds__(128, 4) int3_mma_gemm_swiglu_kernel(
     const __nv_bfloat16* __restrict__ A,
     const uint8_t* __restrict__ W_packed,
@@ -886,10 +824,10 @@ __global__ void __launch_bounds__(128, 4) int3_mma_gemm_swiglu_kernel(
         int3_ldmatrix_x2(a0, a2, a_addr);
       }
       uint32_t b0, b1, c0, c1;
-      int3_deq4_k16(lo2_g, hi32_g, scg_2, zrg_2, b0, b1);
+      int3_deq4_k16<kNf3>(lo2_g, hi32_g, scg_2, zrg_2, b0, b1);
       lo2_g >>= 4;
       hi32_g >>= 2;
-      int3_deq4_k16(lo2_u, hi32_u, scu_2, zru_2, c0, c1);
+      int3_deq4_k16<kNf3>(lo2_u, hi32_u, scu_2, zru_2, c0, c1);
       lo2_u >>= 4;
       hi32_u >>= 2;
       if constexpr (kM16) {
@@ -921,13 +859,14 @@ __global__ void __launch_bounds__(128, 4) int3_mma_gemm_swiglu_kernel(
 // dual SM121 PDL, 4 CTAs/SM, SM121 odd-UR safe).
 // kSwiglu=false: C is [M, N], n_blocks = N / 64.
 // kSwiglu=true:  C is [M, I], n_blocks = I / 32 (tile 2*w = gate, tile 2*w+1 = up).
-template <bool kM16, bool kSwiglu>
+template <bool kM16, bool kSwiglu, bool kNf3 = true>
 __global__ void __launch_bounds__(128, 4) int3_mma_streamk_kernel(
     const __nv_bfloat16* __restrict__ A,
     const uint8_t* __restrict__ W_packed,
     __nv_bfloat16* __restrict__ C,
-    float* __restrict__ sk_partials,  // [max_n_blocks, 16, 64] zero-initialized & self-zeroing
-    int* __restrict__ sk_done,        // [max_n_blocks] zero-initialized & self-zeroing
+    float* __restrict__ sk_partials,    // [max_n_blocks, 16, 64] zero-initialized & self-zeroing (4+ parts)
+    float* __restrict__ sk_multi_part,  // [max_n_blocks, 3, 16, 64] non-atomic 2/3-part partials (nullptr disables)
+    int* __restrict__ sk_done,          // [max_n_blocks] zero-initialized & self-zeroing
     int M, int out_cols, int K, int n_blocks, int grid_ctas, int pdl_mode) {
   __shared__ Int3StageSmem<kM16 ? 16 : 8> smem;
   __shared__ int s_is_last;
@@ -1078,10 +1017,10 @@ __global__ void __launch_bounds__(128, 4) int3_mma_streamk_kernel(
         int3_ldmatrix_x2(a0, a2, a_addr);
       }
       uint32_t b0, b1, c0, c1;
-      int3_deq4_k16(lo2_0, hi32_0, sc0_2, zr0_2, b0, b1);
+      int3_deq4_k16<kNf3>(lo2_0, hi32_0, sc0_2, zr0_2, b0, b1);
       lo2_0 >>= 4;
       hi32_0 >>= 2;
-      int3_deq4_k16(lo2_1, hi32_1, sc1_2, zr1_2, c0, c1);
+      int3_deq4_k16<kNf3>(lo2_1, hi32_1, sc1_2, zr1_2, c0, c1);
       lo2_1 >>= 4;
       hi32_1 >>= 2;
       if constexpr (kM16) {
@@ -1127,70 +1066,202 @@ __global__ void __launch_bounds__(128, 4) int3_mma_streamk_kernel(
           }
         }
       } else {
-        // Partial tile split across consecutive CTAs: lock-free FP32 atomicAdd + last-arriving self-zeroing store.
-        float* tile_p = sk_partials + static_cast<size_t>(cur_n) * (16 * 64);
-        if (g < M) {
-          float* row_p = tile_p + g * 64;
-          atomicAdd(&row_p[local_c0 + 0], d0_0);
-          atomicAdd(&row_p[local_c0 + 1], d1_0);
-          atomicAdd(&row_p[local_c1 + 0], d0_1);
-          atomicAdd(&row_p[local_c1 + 1], d1_1);
-        }
-        if constexpr (kM16) {
-          if (has_hi) {
-            float* row_p = tile_p + (g + 8) * 64;
-            atomicAdd(&row_p[local_c0 + 0], d2_0);
-            atomicAdd(&row_p[local_c0 + 1], d3_0);
-            atomicAdd(&row_p[local_c1 + 0], d2_1);
-            atomicAdd(&row_p[local_c1 + 1], d3_1);
+        const int tile_lo = cur_n * num_kg;
+        const int tile_hi = tile_lo + num_kg;
+        int num_parts = 0;
+        int part_role = 0;
+        if (sk_multi_part != nullptr) {
+          if (seg_start_kg == 0 && cur_kg + 1 < num_kg) {
+            if (cta_id + 1 < grid_ctas) {
+              const int next_end = static_cast<int>((static_cast<int64_t>(cta_id + 2) * total_iters) / grid_ctas);
+              if (next_end >= tile_hi) {
+                num_parts = 2;
+                part_role = 0;
+              } else if (cta_id + 2 < grid_ctas) {
+                const int next2_end = static_cast<int>((static_cast<int64_t>(cta_id + 3) * total_iters) / grid_ctas);
+                if (next2_end >= tile_hi) {
+                  num_parts = 3;
+                  part_role = 0;
+                }
+              }
+            }
+          } else if (seg_start_kg > 0 && cur_kg + 1 < num_kg) {
+            if (cta_id > 0 && cta_id + 1 < grid_ctas) {
+              const int prev_start = static_cast<int>((static_cast<int64_t>(cta_id - 1) * total_iters) / grid_ctas);
+              const int next_end = static_cast<int>((static_cast<int64_t>(cta_id + 2) * total_iters) / grid_ctas);
+              if (prev_start <= tile_lo && next_end >= tile_hi) {
+                num_parts = 3;
+                part_role = 1;
+              }
+            }
+          } else if (seg_start_kg > 0 && cur_kg + 1 == num_kg) {
+            if (cta_id > 0) {
+              const int prev_start = static_cast<int>((static_cast<int64_t>(cta_id - 1) * total_iters) / grid_ctas);
+              if (prev_start <= tile_lo) {
+                num_parts = 2;
+                part_role = 1;
+              } else if (cta_id >= 2) {
+                const int prev2_start = static_cast<int>((static_cast<int64_t>(cta_id - 2) * total_iters) / grid_ctas);
+                if (prev2_start <= tile_lo) {
+                  num_parts = 3;
+                  part_role = 2;
+                }
+              }
+            }
           }
         }
-        __threadfence();
-        __syncthreads();
-        if (tid == 0) {
-          s_is_last = (atomicAdd(&sk_done[cur_n], seg_kgs) + seg_kgs == num_kg) ? 1 : 0;
-        }
-        __syncthreads();
-        if (s_is_last) {
+        auto emit_out = [&](int row, float s0_0, float s1_0, float s0_1, float s1_1) {
+          if constexpr (kSwiglu) {
+            const int col = cur_n * 32 + warp * 8 + 2 * t;
+            *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(row) * out_cols + col) =
+                int3_bf16x2_u32(int3_swiglu_f32(s0_0, s0_1), int3_swiglu_f32(s1_0, s1_1));
+          } else {
+            const int col0 = cur_n * kRowsPerCTA + local_c0;
+            const int col1 = cur_n * kRowsPerCTA + local_c1;
+            *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(row) * out_cols + col0) = int3_bf16x2_u32(s0_0, s1_0);
+            *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(row) * out_cols + col1) = int3_bf16x2_u32(s0_1, s1_1);
+          }
+        };
+        if (num_parts >= 2) {
+          // 2-part & 3-part non-atomic canonical Stream-K reduction: coalesced float2 stores +
+          // 1 int32 arrival counter + L2-coherent float2 loads in canonical (slot0 + slot1) + slot2 order.
+          float* tile_mp = sk_multi_part + static_cast<size_t>(cur_n) * (3 * 16 * 64);
+          float* my_p = tile_mp + static_cast<size_t>(part_role) * (16 * 64);
+          if (g < M) {
+            float* row_p = my_p + g * 64;
+            *reinterpret_cast<float2*>(&row_p[local_c0]) = make_float2(d0_0, d1_0);
+            *reinterpret_cast<float2*>(&row_p[local_c1]) = make_float2(d0_1, d1_1);
+          }
+          if constexpr (kM16) {
+            if (has_hi) {
+              float* row_p = my_p + (g + 8) * 64;
+              *reinterpret_cast<float2*>(&row_p[local_c0]) = make_float2(d2_0, d3_0);
+              *reinterpret_cast<float2*>(&row_p[local_c1]) = make_float2(d2_1, d3_1);
+            }
+          }
+          __threadfence();
+          __syncthreads();
+          if (tid == 0) {
+            s_is_last = (atomicAdd(&sk_done[cur_n], 1) == (num_parts - 1)) ? 1 : 0;
+          }
+          __syncthreads();
+          if (s_is_last) {
+            if (num_parts == 2) {
+              const float* peer_p = tile_mp + static_cast<size_t>(1 - part_role) * (16 * 64);
+              if (g < M) {
+                const float* row_p = peer_p + g * 64;
+                const float2 p0 = int3_ldcg_f2(reinterpret_cast<const float2*>(&row_p[local_c0]));
+                const float2 p1 = int3_ldcg_f2(reinterpret_cast<const float2*>(&row_p[local_c1]));
+                emit_out(g, d0_0 + p0.x, d1_0 + p0.y, d0_1 + p1.x, d1_1 + p1.y);
+              }
+              if constexpr (kM16) {
+                if (has_hi) {
+                  const float* row_p = peer_p + (g + 8) * 64;
+                  const float2 p0 = int3_ldcg_f2(reinterpret_cast<const float2*>(&row_p[local_c0]));
+                  const float2 p1 = int3_ldcg_f2(reinterpret_cast<const float2*>(&row_p[local_c1]));
+                  emit_out(g + 8, d2_0 + p0.x, d3_0 + p0.y, d2_1 + p1.x, d3_1 + p1.y);
+                }
+              }
+            } else {
+              const int peer_a = (part_role == 0) ? 1 : 0;
+              const int peer_b = (part_role == 2) ? 1 : 2;
+              const float* pa_base = tile_mp + static_cast<size_t>(peer_a) * (16 * 64);
+              const float* pb_base = tile_mp + static_cast<size_t>(peer_b) * (16 * 64);
+              auto sum3 = [&](float mx, float my, float2 va, float2 vb, float& ox, float& oy) {
+                float x0, x1, x2, y0, y1, y2;
+                if (part_role == 0) {
+                  x0 = mx; x1 = va.x; x2 = vb.x;
+                  y0 = my; y1 = va.y; y2 = vb.y;
+                } else if (part_role == 1) {
+                  x0 = va.x; x1 = mx; x2 = vb.x;
+                  y0 = va.y; y1 = my; y2 = vb.y;
+                } else {
+                  x0 = va.x; x1 = vb.x; x2 = mx;
+                  y0 = va.y; y1 = vb.y; y2 = my;
+                }
+                ox = (x0 + x1) + x2;
+                oy = (y0 + y1) + y2;
+              };
+              if (g < M) {
+                const float* row_a = pa_base + g * 64;
+                const float* row_b = pb_base + g * 64;
+                const float2 a0 = int3_ldcg_f2(reinterpret_cast<const float2*>(&row_a[local_c0]));
+                const float2 b0 = int3_ldcg_f2(reinterpret_cast<const float2*>(&row_b[local_c0]));
+                const float2 a1 = int3_ldcg_f2(reinterpret_cast<const float2*>(&row_a[local_c1]));
+                const float2 b1 = int3_ldcg_f2(reinterpret_cast<const float2*>(&row_b[local_c1]));
+                float s0_0, s1_0, s0_1, s1_1;
+                sum3(d0_0, d1_0, a0, b0, s0_0, s1_0);
+                sum3(d0_1, d1_1, a1, b1, s0_1, s1_1);
+                emit_out(g, s0_0, s1_0, s0_1, s1_1);
+              }
+              if constexpr (kM16) {
+                if (has_hi) {
+                  const float* row_a = pa_base + (g + 8) * 64;
+                  const float* row_b = pb_base + (g + 8) * 64;
+                  const float2 a0 = int3_ldcg_f2(reinterpret_cast<const float2*>(&row_a[local_c0]));
+                  const float2 b0 = int3_ldcg_f2(reinterpret_cast<const float2*>(&row_b[local_c0]));
+                  const float2 a1 = int3_ldcg_f2(reinterpret_cast<const float2*>(&row_a[local_c1]));
+                  const float2 b1 = int3_ldcg_f2(reinterpret_cast<const float2*>(&row_b[local_c1]));
+                  float s2_0, s3_0, s2_1, s3_1;
+                  sum3(d2_0, d3_0, a0, b0, s2_0, s3_0);
+                  sum3(d2_1, d3_1, a1, b1, s2_1, s3_1);
+                  emit_out(g + 8, s2_0, s3_0, s2_1, s3_1);
+                }
+              }
+            }
+            __syncthreads();
+            if (tid == 0) {
+              atomicExch(&sk_done[cur_n], 0);
+            }
+          }
+        } else {
+          // 4+ part fallback: lock-free FP32 atomicAdd + last-arriving self-zeroing store.
+          float* tile_p = sk_partials + static_cast<size_t>(cur_n) * (16 * 64);
           if (g < M) {
             float* row_p = tile_p + g * 64;
-            const float s0_0 = atomicExch(&row_p[local_c0 + 0], 0.0f);
-            const float s1_0 = atomicExch(&row_p[local_c0 + 1], 0.0f);
-            const float s0_1 = atomicExch(&row_p[local_c1 + 0], 0.0f);
-            const float s1_1 = atomicExch(&row_p[local_c1 + 1], 0.0f);
-            if constexpr (kSwiglu) {
-              const int col = cur_n * 32 + warp * 8 + 2 * t;
-              *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * out_cols + col) =
-                  int3_bf16x2_u32(int3_swiglu_f32(s0_0, s0_1), int3_swiglu_f32(s1_0, s1_1));
-            } else {
-              const int col0 = cur_n * kRowsPerCTA + local_c0;
-              const int col1 = cur_n * kRowsPerCTA + local_c1;
-              *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * out_cols + col0) = int3_bf16x2_u32(s0_0, s1_0);
-              *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * out_cols + col1) = int3_bf16x2_u32(s0_1, s1_1);
-            }
+            atomicAdd(&row_p[local_c0 + 0], d0_0);
+            atomicAdd(&row_p[local_c0 + 1], d1_0);
+            atomicAdd(&row_p[local_c1 + 0], d0_1);
+            atomicAdd(&row_p[local_c1 + 1], d1_1);
           }
           if constexpr (kM16) {
             if (has_hi) {
               float* row_p = tile_p + (g + 8) * 64;
-              const float s2_0 = atomicExch(&row_p[local_c0 + 0], 0.0f);
-              const float s3_0 = atomicExch(&row_p[local_c0 + 1], 0.0f);
-              const float s2_1 = atomicExch(&row_p[local_c1 + 0], 0.0f);
-              const float s3_1 = atomicExch(&row_p[local_c1 + 1], 0.0f);
-              if constexpr (kSwiglu) {
-                const int col = cur_n * 32 + warp * 8 + 2 * t;
-                *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * out_cols + col) =
-                    int3_bf16x2_u32(int3_swiglu_f32(s2_0, s2_1), int3_swiglu_f32(s3_0, s3_1));
-              } else {
-                const int col0 = cur_n * kRowsPerCTA + local_c0;
-                const int col1 = cur_n * kRowsPerCTA + local_c1;
-                *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * out_cols + col0) = int3_bf16x2_u32(s2_0, s3_0);
-                *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * out_cols + col1) = int3_bf16x2_u32(s2_1, s3_1);
-              }
+              atomicAdd(&row_p[local_c0 + 0], d2_0);
+              atomicAdd(&row_p[local_c0 + 1], d3_0);
+              atomicAdd(&row_p[local_c1 + 0], d2_1);
+              atomicAdd(&row_p[local_c1 + 1], d3_1);
             }
           }
+          __threadfence();
           __syncthreads();
           if (tid == 0) {
-            atomicExch(&sk_done[cur_n], 0);
+            s_is_last = (atomicAdd(&sk_done[cur_n], seg_kgs) + seg_kgs == num_kg) ? 1 : 0;
+          }
+          __syncthreads();
+          if (s_is_last) {
+            if (g < M) {
+              float* row_p = tile_p + g * 64;
+              const float s0_0 = atomicExch(&row_p[local_c0 + 0], 0.0f);
+              const float s1_0 = atomicExch(&row_p[local_c0 + 1], 0.0f);
+              const float s0_1 = atomicExch(&row_p[local_c1 + 0], 0.0f);
+              const float s1_1 = atomicExch(&row_p[local_c1 + 1], 0.0f);
+              emit_out(g, s0_0, s1_0, s0_1, s1_1);
+            }
+            if constexpr (kM16) {
+              if (has_hi) {
+                float* row_p = tile_p + (g + 8) * 64;
+                const float s2_0 = atomicExch(&row_p[local_c0 + 0], 0.0f);
+                const float s3_0 = atomicExch(&row_p[local_c0 + 1], 0.0f);
+                const float s2_1 = atomicExch(&row_p[local_c1 + 0], 0.0f);
+                const float s3_1 = atomicExch(&row_p[local_c1 + 1], 0.0f);
+                emit_out(g + 8, s2_0, s3_0, s2_1, s3_1);
+              }
+            }
+            __syncthreads();
+            if (tid == 0) {
+              atomicExch(&sk_done[cur_n], 0);
+            }
           }
         }
       }
@@ -1222,6 +1293,15 @@ int int3_pdl_mode() {
     return (std::atoi(s) != 0) ? 3 : 0;
   }();
   return mode;
+}
+
+bool int3_nf3_enabled() {
+  static const bool on = []() -> bool {
+    const char* s = std::getenv("MUSE_INT3_NF3");
+    if (!s || !*s) return true;
+    return std::atoi(s) != 0;
+  }();
+  return on;
 }
 
 template <typename... KArgs, typename... Args>
@@ -1258,11 +1338,22 @@ float* ensure_int3_splitk_partials(const torch::TensorOptions& opts, int64_t nee
   return g_partials.data_ptr<float>() + static_cast<size_t>(slot) * static_cast<size_t>(g_partials_cap);
 }
 
+bool int3_two_part_red_enabled() {
+  static const bool on = []() -> bool {
+    const char* s = std::getenv("MUSE_INT3_TWO_PART_RED");
+    if (!s || !*s) return true;
+    return std::atoi(s) != 0;
+  }();
+  return on;
+}
+
 void ensure_int3_sk_scratch(const torch::TensorOptions& opts, int n_blocks,
-                            float*& partials_ptr, int*& done_ptr) {
+                            float*& partials_ptr, float*& multi_part_ptr, int*& done_ptr) {
   static torch::Tensor g_sk_partials;
+  static torch::Tensor g_sk_multi_part;
   static torch::Tensor g_sk_done;
   static int g_sk_cap = 0;
+  static int g_sk_mp_cap = 0;
   static uint32_t g_sk_slot = 0;
   if (!g_sk_partials.defined() || g_sk_partials.device() != opts.device() || g_sk_cap < n_blocks) {
     const int cap = (n_blocks > 1024) ? n_blocks : 1024;
@@ -1270,9 +1361,18 @@ void ensure_int3_sk_scratch(const torch::TensorOptions& opts, int n_blocks,
     g_sk_done = torch::zeros({2, cap}, opts.dtype(torch::kInt32));
     g_sk_cap = cap;
   }
+  const bool use_mp = int3_two_part_red_enabled();
+  if (use_mp && (!g_sk_multi_part.defined() || g_sk_multi_part.device() != opts.device() || g_sk_mp_cap < n_blocks)) {
+    const int mp_cap = (n_blocks > 256) ? n_blocks : 256;
+    g_sk_multi_part = torch::empty({2, static_cast<int64_t>(mp_cap) * 3 * 16 * 64}, opts.dtype(torch::kFloat32));
+    g_sk_mp_cap = mp_cap;
+  }
   const int slot = static_cast<int>(g_sk_slot & 1u);
   g_sk_slot ^= 1u;
   partials_ptr = g_sk_partials.data_ptr<float>() + static_cast<size_t>(slot) * static_cast<size_t>(g_sk_cap) * 16 * 64;
+  multi_part_ptr = use_mp
+      ? (g_sk_multi_part.data_ptr<float>() + static_cast<size_t>(slot) * static_cast<size_t>(g_sk_mp_cap) * 3 * 16 * 64)
+      : nullptr;
   done_ptr = g_sk_done.data_ptr<int>() + static_cast<size_t>(slot) * static_cast<size_t>(g_sk_cap);
 }
 
@@ -1288,26 +1388,30 @@ torch::Tensor int3_pack(torch::Tensor W, bool mse_opt = true) {
   auto out = torch::empty({total_bytes}, W.options().dtype(torch::kUInt8));
   dim3 grid(N / 8, K / 64);
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  if (mse_opt) {
-    int3_pack_kernel<true><<<grid, 32, 0, st>>>(
-        reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
-        out.data_ptr<uint8_t>(),
-        N, K);
+  const bool nf3 = int3_nf3_enabled();
+  if (nf3) {
+    if (mse_opt) {
+      int3_pack_kernel<true, true><<<grid, 32, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), out.data_ptr<uint8_t>(), N, K);
+    } else {
+      int3_pack_kernel<false, true><<<grid, 32, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), out.data_ptr<uint8_t>(), N, K);
+    }
   } else {
-    int3_pack_kernel<false><<<grid, 32, 0, st>>>(
-        reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
-        out.data_ptr<uint8_t>(),
-        N, K);
+    if (mse_opt) {
+      int3_pack_kernel<true, false><<<grid, 32, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), out.data_ptr<uint8_t>(), N, K);
+    } else {
+      int3_pack_kernel<false, false><<<grid, 32, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), out.data_ptr<uint8_t>(), N, K);
+    }
   }
   return out;
 }
 
-torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K) {
-  TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous(),
-              "int3_gemm expects contiguous CUDA BF16 [M, K]");
+template <bool kNf3>
+static torch::Tensor int3_gemm_impl(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K) {
   const int M = static_cast<int>(A.size(0));
-  TORCH_CHECK(M >= 1 && M <= 16 && A.size(1) == K && N % kRowsPerCTA == 0 && K % 64 == 0,
-              "int3_gemm shape mismatch");
   auto C = torch::empty({M, N}, A.options());
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int n_blocks = static_cast<int>(N / kRowsPerCTA);
@@ -1318,22 +1422,23 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
     const int total_iters = n_blocks * static_cast<int>(K >> 6);
     const int grid = (sk_grid < total_iters) ? sk_grid : total_iters;
     float* p_ptr = nullptr;
+    float* mp_ptr = nullptr;
     int* d_ptr = nullptr;
-    ensure_int3_sk_scratch(A.options(), n_blocks, p_ptr, d_ptr);
+    ensure_int3_sk_scratch(A.options(), n_blocks, p_ptr, mp_ptr, d_ptr);
     if (use_m16) {
       int3_launch_pdl(
-          int3_mma_streamk_kernel<true, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+          int3_mma_streamk_kernel<true, false, kNf3>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          p_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
+          p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
     } else {
       int3_launch_pdl(
-          int3_mma_streamk_kernel<false, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+          int3_mma_streamk_kernel<false, false, kNf3>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          p_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
+          p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode);
     }
     return C;
   }
@@ -1345,14 +1450,14 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
     const dim3 grid(n_blocks, 1, 1);
     if (use_m16) {
       int3_launch_pdl(
-          int3_mma_gemm_kernel<false, true>, grid, kThreads, st, pdl_mode,
+          int3_mma_gemm_kernel<false, true, kNf3>, grid, kThreads, st, pdl_mode,
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
           static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1, pdl_mode);
     } else {
       int3_launch_pdl(
-          int3_mma_gemm_kernel<false, false>, grid, kThreads, st, pdl_mode,
+          int3_mma_gemm_kernel<false, false, kNf3>, grid, kThreads, st, pdl_mode,
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
@@ -1364,14 +1469,14 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
     const dim3 grid(n_blocks, split_k, 1);
     if (use_m16) {
       int3_launch_pdl(
-          int3_mma_gemm_kernel<true, true>, grid, kThreads, st, pdl_mode,
+          int3_mma_gemm_kernel<true, true, kNf3>, grid, kThreads, st, pdl_mode,
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           static_cast<__nv_bfloat16*>(nullptr), partials_ptr,
           M, static_cast<int>(N), static_cast<int>(K), split_k, pdl_mode);
     } else {
       int3_launch_pdl(
-          int3_mma_gemm_kernel<true, false>, grid, kThreads, st, pdl_mode,
+          int3_mma_gemm_kernel<true, false, kNf3>, grid, kThreads, st, pdl_mode,
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           static_cast<__nv_bfloat16*>(nullptr), partials_ptr,
@@ -1388,6 +1493,16 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
   return C;
 }
 
+torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K) {
+  TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous(),
+              "int3_gemm expects contiguous CUDA BF16 [M, K]");
+  const int M = static_cast<int>(A.size(0));
+  TORCH_CHECK(M >= 1 && M <= 16 && A.size(1) == K && N % kRowsPerCTA == 0 && K % 64 == 0,
+              "int3_gemm shape mismatch");
+  return int3_nf3_enabled() ? int3_gemm_impl<true>(A, W_packed, N, K)
+                            : int3_gemm_impl<false>(A, W_packed, N, K);
+}
+
 torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true) {
   TORCH_CHECK(W.is_cuda() && W.scalar_type() == torch::kBFloat16 && W.dim() == 2 && W.is_contiguous(),
               "int3_pack_swiglu expects contiguous CUDA BF16 [2*I, K]");
@@ -1399,26 +1514,30 @@ torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true) {
   auto out = torch::empty({total_bytes}, W.options().dtype(torch::kUInt8));
   dim3 grid(N2 / 8, K / 64);
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  if (mse_opt) {
-    int3_pack_swiglu_kernel<true><<<grid, 32, 0, st>>>(
-        reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
-        out.data_ptr<uint8_t>(),
-        I, K);
+  const bool nf3 = int3_nf3_enabled();
+  if (nf3) {
+    if (mse_opt) {
+      int3_pack_swiglu_kernel<true, true><<<grid, 32, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), out.data_ptr<uint8_t>(), I, K);
+    } else {
+      int3_pack_swiglu_kernel<false, true><<<grid, 32, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), out.data_ptr<uint8_t>(), I, K);
+    }
   } else {
-    int3_pack_swiglu_kernel<false><<<grid, 32, 0, st>>>(
-        reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
-        out.data_ptr<uint8_t>(),
-        I, K);
+    if (mse_opt) {
+      int3_pack_swiglu_kernel<true, false><<<grid, 32, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), out.data_ptr<uint8_t>(), I, K);
+    } else {
+      int3_pack_swiglu_kernel<false, false><<<grid, 32, 0, st>>>(
+          reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), out.data_ptr<uint8_t>(), I, K);
+    }
   }
   return out;
 }
 
-torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K) {
-  TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous(),
-              "int3_gemm_swiglu expects contiguous CUDA BF16 [M, K]");
+template <bool kNf3>
+static torch::Tensor int3_gemm_swiglu_impl(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K) {
   const int M = static_cast<int>(A.size(0));
-  TORCH_CHECK(M >= 1 && M <= 16 && A.size(1) == K && I % 32 == 0 && K % 64 == 0,
-              "int3_gemm_swiglu shape mismatch");
   auto C = torch::empty({M, I}, A.options());
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int n_blocks = static_cast<int>(I / 32);
@@ -1428,40 +1547,51 @@ torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t 
     const int total_iters = n_blocks * static_cast<int>(K >> 6);
     const int grid = (sk_grid < total_iters) ? sk_grid : total_iters;
     float* p_ptr = nullptr;
+    float* mp_ptr = nullptr;
     int* d_ptr = nullptr;
-    ensure_int3_sk_scratch(A.options(), n_blocks, p_ptr, d_ptr);
+    ensure_int3_sk_scratch(A.options(), n_blocks, p_ptr, mp_ptr, d_ptr);
     if (M > 8) {
       int3_launch_pdl(
-          int3_mma_streamk_kernel<true, true>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+          int3_mma_streamk_kernel<true, true, kNf3>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          p_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), n_blocks, grid, pdl_mode);
+          p_ptr, mp_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), n_blocks, grid, pdl_mode);
     } else {
       int3_launch_pdl(
-          int3_mma_streamk_kernel<false, true>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+          int3_mma_streamk_kernel<false, true, kNf3>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
           reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
           W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          p_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), n_blocks, grid, pdl_mode);
+          p_ptr, mp_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), n_blocks, grid, pdl_mode);
     }
     return C;
   }
   const dim3 grid(n_blocks, 1, 1);
   if (M > 8) {
     int3_launch_pdl(
-        int3_mma_gemm_swiglu_kernel<true>, grid, kThreads, st, pdl_mode,
+        int3_mma_gemm_swiglu_kernel<true, kNf3>, grid, kThreads, st, pdl_mode,
         reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
         W_packed.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
         M, static_cast<int>(I), static_cast<int>(K), pdl_mode);
   } else {
     int3_launch_pdl(
-        int3_mma_gemm_swiglu_kernel<false>, grid, kThreads, st, pdl_mode,
+        int3_mma_gemm_swiglu_kernel<false, kNf3>, grid, kThreads, st, pdl_mode,
         reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
         W_packed.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
         M, static_cast<int>(I), static_cast<int>(K), pdl_mode);
   }
   return C;
+}
+
+torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K) {
+  TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous(),
+              "int3_gemm_swiglu expects contiguous CUDA BF16 [M, K]");
+  const int M = static_cast<int>(A.size(0));
+  TORCH_CHECK(M >= 1 && M <= 16 && A.size(1) == K && I % 32 == 0 && K % 64 == 0,
+              "int3_gemm_swiglu shape mismatch");
+  return int3_nf3_enabled() ? int3_gemm_swiglu_impl<true>(A, W_packed, I, K)
+                            : int3_gemm_swiglu_impl<false>(A, W_packed, I, K);
 }
