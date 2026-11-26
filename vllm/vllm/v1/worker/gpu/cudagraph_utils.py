@@ -146,6 +146,7 @@ class CudaGraphManager:
         self._graphs_captured = False
 
         self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
+        self._clamped_full_descs: dict[tuple[int, int], BatchExecutionDescriptor] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
 
         # Breakable CUDA graph (PW CUDA graph without torch.compile)
@@ -351,11 +352,13 @@ class CudaGraphManager:
             separate_decode_routine
             and decode_mode == CUDAGraphMode.FULL
             and self.decode_query_len > 1
-            and os.environ.get("VLLM_MUSE_CLAMPED_FULL_CG", "0") == "1"
+            and os.environ.get("VLLM_MUSE_CLAMPED_FULL_CG", "1") != "0"
         ):
-            # Opt-in bs=1 FULL CUDA graphs for ceiling-clamped verify widths
-            # (2 .. decode_query_len-1); default OFF to avoid hijacking short
-            # prefills or capturing M=1 FULL graphs.
+            # Capture bs=1 FULL CUDA graphs for ceiling-clamped speculative verify widths
+            # (2 .. decode_query_len-1). Kept OUT of self._candidates and stored in
+            # self._clamped_full_descs so normal dispatch() can NEVER hijack short prefills,
+            # chunked prefill tails, dummy runs, or M=1; model_runner routes strictly
+            # decode-only clamped verify steps via dispatch_clamped_full().
             for clamped_m in range(2, self.decode_query_len):
                 for num_active_loras in self.lora_capture_cases:
                     clamped_desc = BatchExecutionDescriptor(
@@ -367,21 +370,9 @@ class CudaGraphManager:
                     )
                     if clamped_desc not in descs_by_mode[CUDAGraphMode.FULL]:
                         descs_by_mode[CUDAGraphMode.FULL].append(clamped_desc)
-                    key_m = (clamped_m, num_active_loras)
-                    if clamped_desc not in descs_by_token_lora[key_m]:
-                        descs_by_token_lora[key_m].insert(0, clamped_desc)
-                    # Preserve piecewise fallback for non-uniform / multi-req batches
-                    # at token counts not originally in capture_sizes (e.g. m=3,5,6).
-                    if mixed_mode and not any(
-                        d.cg_mode == mixed_mode for d in descs_by_token_lora[key_m]
-                    ):
-                        for pw_d in descs_by_mode[mixed_mode]:
-                            if (
-                                pw_d.num_active_loras == num_active_loras
-                                and pw_d.num_tokens >= clamped_m
-                            ):
-                                descs_by_token_lora[key_m].append(pw_d)
-                                break
+                    self._clamped_full_descs[(clamped_m, num_active_loras)] = (
+                        clamped_desc
+                    )
 
         if not descs_by_token_lora:
             return
@@ -537,6 +528,20 @@ class CudaGraphManager:
             num_reqs=num_reqs,
             num_active_loras=effective_loras,
         )
+
+    def dispatch_clamped_full(
+        self,
+        num_tokens: int,
+        num_active_loras: int,
+    ) -> BatchExecutionDescriptor | None:
+        """Return a captured bs=1 FULL graph for a verified decode-only clamped step (M=2..decode_query_len-1)."""
+        if not self._graphs_captured or num_tokens < 2:
+            return None
+        effective_loras = self._resolve_effective_loras(num_active_loras)
+        desc = self._clamped_full_descs.get((num_tokens, effective_loras))
+        if desc is not None and desc in self.graphs:
+            return desc
+        return None
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
         """Replay a captured FULL cudagraph."""
