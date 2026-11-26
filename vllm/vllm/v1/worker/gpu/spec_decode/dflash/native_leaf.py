@@ -64,6 +64,7 @@ TREE_CONT_DECAY = float(os.environ.get("MUSE_TREE_CONT_DECAY", "0.88"))
 TREE_ADAPT_GAMMA = os.environ.get("MUSE_TREE_ADAPT_GAMMA", "1").strip() not in ("0", "", "false", "no")
 TREE_CALIB = os.environ.get("MUSE_TREE_CALIB", "1").strip() not in ("0", "", "false", "no")
 TREE_HIGH_ACC_CPC = float(os.environ.get("MUSE_TREE_HIGH_ACC_CPC", "0"))
+TREE_UNLATCH_RECOVERY = os.environ.get("MUSE_TREE_UNLATCH_RECOVERY", "1").strip() not in ("0", "", "false", "no")
 LEAF_STATS = os.environ.get("MUSE_LEAF_STATS", "0").strip() in ("1", "true", "yes")
 _ST_RAW = os.environ.get("MUSE_NATIVE_LEAF_SELFTEST", "0").strip().lower()
 SELFTEST = 1 if _ST_RAW in ("1", "true", "yes") else (2 if _ST_RAW == "2" else 0)
@@ -425,9 +426,11 @@ def on_non_leaf_step(req_id: str | None, num_draft_tokens: int) -> None:
             _S.tree_vals.fill_(-1e30)
         _S.req_acc_state.zero_()
     elif 0 < num_draft_tokens < 6:
-        # Ceiling shortened depth on high-acceptance request -> hard-latch leaf mode off.
+        # Reset prev_ns on ceiling-shortened rounds; keep tree recovery unlatched so full
+        # M=16 tree verify resumes immediately whenever the ceiling restores depth 6.
         _S.prev_ns.fill_(7)
-        _S.req_acc_state[2:3].fill_(2)
+        if not TREE_UNLATCH_RECOVERY:
+            _S.req_acc_state[2:3].fill_(2)
 
 
 @torch.no_grad()

@@ -689,13 +689,12 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
     const uint4* const x_u4_base = valid_m ? reinterpret_cast<const uint4*>(pb.x + (size_t)g * K + 16 * t) : nullptr;
     const uint4* const x_u4_hi = valid_m_hi ? reinterpret_cast<const uint4*>(pb.x + (size_t)(g + 8) * K + 16 * t) : nullptr;
     const int R_max = (NB + pb.tw - 1) / pb.tw;
+    const float sb_s = pb.sb_scalar ? __ldg(pb.sb) : 0.0f;
     int cur_buf = 0;
     for (int r_i = 0; r_i < R_max; ++r_i) {
       const int nb = w + r_i * pb.tw;
       const bool do_nb = active && (nb < NB);
       float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
-      uint2 a_next = make_uint2(0u, 0u);
-      uint2 a_hi_next = make_uint2(0u, 0u);
       // SM121 PDL producer trigger: emit launch_dependents ~12.5 us (16 k-steps) before the final chunk
       // completes so the following 1-CTA norm can preload its 66 KB cold weights on the idle SM.
       const int trig_s = (do_nb && (pb.pdl_mode & 2) && (nb + pb.tw >= NB)) ? ((S > 16) ? (S - 16) : 0) : -1;
@@ -723,128 +722,281 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
         }
         if (do_nb) {
           const int s_end = kXsmem ? ((cs + 32 < S) ? (cs + 32) : S) : S;
-          for (int s = cs; s < s_end; s++) {
-            if (s == trig_s) {
-              asm volatile("griddepcontrol.launch_dependents;");
-            }
-            // Early-issue cp.async ring refill before LUT/ALU/xpose4 so DRAM/L2 latency overlaps compute.
-            const int curg = (int)(pwb >> GBS);
-            const bool need_refill = (issued <= curg + (RG - 1));
-            if (need_refill) {
-              __syncwarp();
-              do {
-                const uint32_t boff = ((uint32_t)issued << GBS) + lane16;
-                if (boff < wbytes) {
-                  const uint8_t* src = (issued < gmin) ? ilv_ptr : (tail_w + ((size_t)(issued - gmin) << GBS));
-                  rans_cp_async16_s(ring_lane + (((uint32_t)issued << GBS) & (RB - 1u)), src, pol);
+          if constexpr (kXsmem || kXGlobalMode == 1) {
+            // 2x unrolled inner K-loop: eliminates (s & 1) branches and loop-carried a_next/a_hi_next
+            // registers; odd step consumes register-resident (a1, a1_hi) with zero act load or xpose4.
+            for (int s = cs; s < s_end; s += 2) {
+              // --- Even step s ---
+              if (s == trig_s) {
+                asm volatile("griddepcontrol.launch_dependents;");
+              }
+              {
+                const int curg = (int)(pwb >> GBS);
+                const bool need_refill = (issued <= curg + (RG - 1));
+                if (need_refill) {
+                  __syncwarp();
+                  do {
+                    const uint32_t boff = ((uint32_t)issued << GBS) + lane16;
+                    if (boff < wbytes) {
+                      const uint8_t* src = (issued < gmin) ? ilv_ptr : (tail_w + ((size_t)(issued - gmin) << GBS));
+                      rans_cp_async16_s(ring_lane + (((uint32_t)issued << GBS) & (RB - 1u)), src, pol);
+                    }
+                    if (issued < gmin) ilv_ptr += stride_g;
+                    rans_cp_commit();
+                    x_commits++;
+                    issued++;
+                  } while (issued <= curg + (RG - 1));
                 }
-                if (issued < gmin) ilv_ptr += stride_g;
-                rans_cp_commit();
-                x_commits++;
-                issued++;
-              } while (issued <= curg + (RG - 1));
-            }
-            // Pre-issue all 4 independent LUT loads and activation load while ring refill is in flight.
-            const uint32_t e0 = ((const uint32_t*)lut_s)[states[0] & 4095u];
-            const uint32_t e1 = ((const uint32_t*)lut_s)[states[1] & 4095u];
-            const uint32_t e2 = ((const uint32_t*)lut_s)[states[2] & 4095u];
-            const uint32_t e3 = ((const uint32_t*)lut_s)[states[3] & 4095u];
-            uint2 a = make_uint2(0u, 0u);
-            uint2 a_hi = make_uint2(0u, 0u);
-            uint4 v_lo = make_uint4(0u, 0u, 0u, 0u);
-            uint4 v_hi = make_uint4(0u, 0u, 0u, 0u);
-            if constexpr (kXsmem) {
-              if ((s & 1) == 0) {
-                const uint32_t xbase = (cur_buf * 16 + ((s - cs) >> 1)) * kRansXStrideU4;
-                if (valid_m) v_lo = x_smem_u4[xbase + g * 4 + t];
+                const uint32_t e0 = ((const uint32_t*)lut_s)[states[0] & 4095u];
+                const uint32_t e1 = ((const uint32_t*)lut_s)[states[1] & 4095u];
+                const uint32_t e2 = ((const uint32_t*)lut_s)[states[2] & 4095u];
+                const uint32_t e3 = ((const uint32_t*)lut_s)[states[3] & 4095u];
+                uint4 v_lo = make_uint4(0u, 0u, 0u, 0u);
+                uint4 v_hi = make_uint4(0u, 0u, 0u, 0u);
+                if constexpr (kXsmem) {
+                  const uint32_t xbase = (cur_buf * 16 + ((s - cs) >> 1)) * kRansXStrideU4;
+                  if (valid_m) v_lo = x_smem_u4[xbase + g * 4 + t];
+                  if constexpr (kM16) {
+                    if (valid_m_hi) v_hi = x_smem_u4[xbase + (g + 8) * 4 + t];
+                  }
+                } else {
+                  if (valid_m) v_lo = __ldg(x_u4_base + (s << 1));
+                  if constexpr (kM16) {
+                    if (valid_m_hi) v_hi = __ldg(x_u4_hi + (s << 1));
+                  }
+                }
+                const uint32_t pwb_n = pwb;
+                const uint32_t na = pwb_n + 4u * (uint32_t)lane;
+                const uint32_t xh0 = states[0] >> 12;
+                const uint32_t x0 = ((e0 >> 8) & 4095u) * xh0 + xh0 + (e0 >> 20);
+                const uint32_t xh1 = states[1] >> 12;
+                const uint32_t x1 = ((e1 >> 8) & 4095u) * xh1 + xh1 + (e1 >> 20);
+                const uint32_t xh2 = states[2] >> 12;
+                const uint32_t x2 = ((e2 >> 8) & 4095u) * xh2 + xh2 + (e2 >> 20);
+                const uint32_t xh3 = states[3] >> 12;
+                const uint32_t x3 = ((e3 >> 8) & 4095u) * xh3 + xh3 + (e3 >> 20);
+                const bool n0 = x0 < RANS_L;
+                const bool n1 = x1 < RANS_L;
+                const bool n2 = x2 < RANS_L;
+                const bool n3 = x3 < RANS_L;
+                const uint32_t m0 = __ballot_sync(0xffffffffu, n0);
+                const uint32_t m1 = __ballot_sync(0xffffffffu, n1);
+                const uint32_t m2 = __ballot_sync(0xffffffffu, n2);
+                const uint32_t m3 = __ballot_sync(0xffffffffu, n3);
+                const uint32_t p0 = pwb_n + 128u;
+                const uint32_t p1 = p0 + (__popc(m0) << 1);
+                const uint32_t p2 = p1 + (__popc(m1) << 1);
+                const uint32_t p3 = p2 + (__popc(m2) << 1);
+                pwb = p3 + (__popc(m3) << 1);
+                const uint32_t ro0 = ring_s | ((p0 + (__popc(m0 & lt) << 1)) & (RB - 1u));
+                const uint32_t ro1 = ring_s | ((p1 + (__popc(m1 & lt) << 1)) & (RB - 1u));
+                const uint32_t ro2 = ring_s | ((p2 + (__popc(m2 & lt) << 1)) & (RB - 1u));
+                const uint32_t ro3 = ring_s | ((p3 + (__popc(m3 & lt) << 1)) & (RB - 1u));
+                const uint32_t Pw01 = __byte_perm(e0, e1, 0x7740);
+                const uint32_t Pw23 = __byte_perm(e2, e3, 0x7740);
+                const uint32_t Pw = __byte_perm(Pw01, Pw23, 0x5410);
+                const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
+                const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
+                uint2 a0, a1;
+                uint2 a0_hi = make_uint2(0u, 0u), a1_hi = make_uint2(0u, 0u);
+                rans_xpose4(v_lo, t, a0.x, a0.y, a1.x, a1.y);
                 if constexpr (kM16) {
-                  if (valid_m_hi) v_hi = x_smem_u4[xbase + (g + 8) * 4 + t];
+                  rans_xpose4(v_hi, t, a0_hi.x, a0_hi.y, a1_hi.x, a1_hi.y);
+                }
+                if (need_refill) {
+                  rans_cp_wait<RG - 2>();
+                  __syncwarp();
+                }
+                uint32_t nw;
+                if ((pwb_n & 2u) == 0u) {
+                  nw = rans_lds32(ring_s | (na & (RB - 1u)));
+                } else {
+                  nw = rans_lds16(ring_s | (na & (RB - 1u))) | (rans_lds16(ring_s | ((na + 2u) & (RB - 1u))) << 16);
+                }
+                const uint32_t r0 = n0 ? rans_lds16(ro0) : 0u;
+                const uint32_t r1 = n1 ? rans_lds16(ro1) : 0u;
+                const uint32_t r2 = n2 ? rans_lds16(ro2) : 0u;
+                const uint32_t r3 = n3 ? rans_lds16(ro3) : 0u;
+                const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
+                const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
+                const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
+                if constexpr (kM16) {
+                  rans_mma_e4m3_m16(c0, c1, c2, c3, a0.x, a0_hi.x, a0.y, a0_hi.y, bw0, bw1);
+                } else {
+                  rans_mma_e4m3(c0, c1, c2, c3, a0.x, a0.y, bw0, bw1);
+                }
+                states[0] = n0 ? ((x0 << 16) | r0) : x0;
+                states[1] = n1 ? ((x1 << 16) | r1) : x1;
+                states[2] = n2 ? ((x2 << 16) | r2) : x2;
+                states[3] = n3 ? ((x3 << 16) | r3) : x3;
+
+                // --- Odd step s + 1 (a1, a1_hi already resident in registers) ---
+                if (s + 1 < s_end) {
+                  if (s + 1 == trig_s) {
+                    asm volatile("griddepcontrol.launch_dependents;");
+                  }
+                  const int curg1 = (int)(pwb >> GBS);
+                  const bool need_refill1 = (issued <= curg1 + (RG - 1));
+                  if (need_refill1) {
+                    __syncwarp();
+                    do {
+                      const uint32_t boff = ((uint32_t)issued << GBS) + lane16;
+                      if (boff < wbytes) {
+                        const uint8_t* src = (issued < gmin) ? ilv_ptr : (tail_w + ((size_t)(issued - gmin) << GBS));
+                        rans_cp_async16_s(ring_lane + (((uint32_t)issued << GBS) & (RB - 1u)), src, pol);
+                      }
+                      if (issued < gmin) ilv_ptr += stride_g;
+                      rans_cp_commit();
+                      x_commits++;
+                      issued++;
+                    } while (issued <= curg1 + (RG - 1));
+                  }
+                  const uint32_t f0 = ((const uint32_t*)lut_s)[states[0] & 4095u];
+                  const uint32_t f1 = ((const uint32_t*)lut_s)[states[1] & 4095u];
+                  const uint32_t f2 = ((const uint32_t*)lut_s)[states[2] & 4095u];
+                  const uint32_t f3 = ((const uint32_t*)lut_s)[states[3] & 4095u];
+                  const uint32_t pwb_n1 = pwb;
+                  const uint32_t na1 = pwb_n1 + 4u * (uint32_t)lane;
+                  const uint32_t yh0 = states[0] >> 12;
+                  const uint32_t y0 = ((f0 >> 8) & 4095u) * yh0 + yh0 + (f0 >> 20);
+                  const uint32_t yh1 = states[1] >> 12;
+                  const uint32_t y1 = ((f1 >> 8) & 4095u) * yh1 + yh1 + (f1 >> 20);
+                  const uint32_t yh2 = states[2] >> 12;
+                  const uint32_t y2 = ((f2 >> 8) & 4095u) * yh2 + yh2 + (f2 >> 20);
+                  const uint32_t yh3 = states[3] >> 12;
+                  const uint32_t y3 = ((f3 >> 8) & 4095u) * yh3 + yh3 + (f3 >> 20);
+                  const bool q0 = y0 < RANS_L;
+                  const bool q1 = y1 < RANS_L;
+                  const bool q2 = y2 < RANS_L;
+                  const bool q3 = y3 < RANS_L;
+                  const uint32_t bm0 = __ballot_sync(0xffffffffu, q0);
+                  const uint32_t bm1 = __ballot_sync(0xffffffffu, q1);
+                  const uint32_t bm2 = __ballot_sync(0xffffffffu, q2);
+                  const uint32_t bm3 = __ballot_sync(0xffffffffu, q3);
+                  const uint32_t bp0 = pwb_n1 + 128u;
+                  const uint32_t bp1 = bp0 + (__popc(bm0) << 1);
+                  const uint32_t bp2 = bp1 + (__popc(bm1) << 1);
+                  const uint32_t bp3 = bp2 + (__popc(bm2) << 1);
+                  pwb = bp3 + (__popc(bm3) << 1);
+                  const uint32_t bro0 = ring_s | ((bp0 + (__popc(bm0 & lt) << 1)) & (RB - 1u));
+                  const uint32_t bro1 = ring_s | ((bp1 + (__popc(bm1 & lt) << 1)) & (RB - 1u));
+                  const uint32_t bro2 = ring_s | ((bp2 + (__popc(bm2 & lt) << 1)) & (RB - 1u));
+                  const uint32_t bro3 = ring_s | ((bp3 + (__popc(bm3 & lt) << 1)) & (RB - 1u));
+                  const uint32_t Qw01 = __byte_perm(f0, f1, 0x7740);
+                  const uint32_t Qw23 = __byte_perm(f2, f3, 0x7740);
+                  const uint32_t Qw = __byte_perm(Qw01, Qw23, 0x5410);
+                  const uint32_t hiF = (Qw >> 4) & 0x0F0F0F0Fu, loF = Qw & 0x0F0F0F0Fu;
+                  const uint32_t F0 = __byte_perm(hiF, loF, 0x5140), F1 = __byte_perm(hiF, loF, 0x7362);
+                  if (need_refill1) {
+                    rans_cp_wait<RG - 2>();
+                    __syncwarp();
+                  }
+                  uint32_t nw1;
+                  if ((pwb_n1 & 2u) == 0u) {
+                    nw1 = rans_lds32(ring_s | (na1 & (RB - 1u)));
+                  } else {
+                    nw1 = rans_lds16(ring_s | (na1 & (RB - 1u))) | (rans_lds16(ring_s | ((na1 + 2u) & (RB - 1u))) << 16);
+                  }
+                  const uint32_t rr0 = q0 ? rans_lds16(bro0) : 0u;
+                  const uint32_t rr1 = q1 ? rans_lds16(bro1) : 0u;
+                  const uint32_t rr2 = q2 ? rans_lds16(bro2) : 0u;
+                  const uint32_t rr3 = q3 ? rans_lds16(bro3) : 0u;
+                  const uint32_t v0 = __byte_perm(nw1, 0u, 0x1100), v1 = __byte_perm(nw1, 0u, 0x3322);
+                  const uint32_t cw0 = (v0 & 0x80078007u) | ((v0 >> 4) & 0x07800780u) | (F0 << 3);
+                  const uint32_t cw1 = (v1 & 0x80078007u) | ((v1 >> 4) & 0x07800780u) | (F1 << 3);
+                  if constexpr (kM16) {
+                    rans_mma_e4m3_m16(c0, c1, c2, c3, a1.x, a1_hi.x, a1.y, a1_hi.y, cw0, cw1);
+                  } else {
+                    rans_mma_e4m3(c0, c1, c2, c3, a1.x, a1.y, cw0, cw1);
+                  }
+                  states[0] = q0 ? ((y0 << 16) | rr0) : y0;
+                  states[1] = q1 ? ((y1 << 16) | rr1) : y1;
+                  states[2] = q2 ? ((y2 << 16) | rr2) : y2;
+                  states[3] = q3 ? ((y3 << 16) | rr3) : y3;
                 }
               }
-            } else if constexpr (kXGlobalMode == 1) {
-              if ((s & 1) == 0) {
-                if (valid_m) v_lo = __ldg(x_u4_base + (s << 1));
-                if constexpr (kM16) {
-                  if (valid_m_hi) v_hi = __ldg(x_u4_hi + (s << 1));
-                }
-              }
-            } else {
-              if (valid_m) a = xs[s * stride_s + lane];
             }
-            // Execute all ring-independent rANS state transitions, ballots, renorm addresses, exponent assembly,
-            // and activation transpose before waiting on the weight ring group.
-            const uint32_t pwb_n = pwb;
-            const uint32_t na = pwb_n + 4u * (uint32_t)lane;
-            const uint32_t xh0 = states[0] >> 12;
-            const uint32_t x0 = ((e0 >> 8) & 4095u) * xh0 + xh0 + (e0 >> 20);
-            const uint32_t xh1 = states[1] >> 12;
-            const uint32_t x1 = ((e1 >> 8) & 4095u) * xh1 + xh1 + (e1 >> 20);
-            const uint32_t xh2 = states[2] >> 12;
-            const uint32_t x2 = ((e2 >> 8) & 4095u) * xh2 + xh2 + (e2 >> 20);
-            const uint32_t xh3 = states[3] >> 12;
-            const uint32_t x3 = ((e3 >> 8) & 4095u) * xh3 + xh3 + (e3 >> 20);
-            const bool n0 = x0 < RANS_L;
-            const bool n1 = x1 < RANS_L;
-            const bool n2 = x2 < RANS_L;
-            const bool n3 = x3 < RANS_L;
-            const uint32_t m0 = __ballot_sync(0xffffffffu, n0);
-            const uint32_t m1 = __ballot_sync(0xffffffffu, n1);
-            const uint32_t m2 = __ballot_sync(0xffffffffu, n2);
-            const uint32_t m3 = __ballot_sync(0xffffffffu, n3);
-            const uint32_t p0 = pwb_n + 128u;
-            const uint32_t p1 = p0 + (__popc(m0) << 1);
-            const uint32_t p2 = p1 + (__popc(m1) << 1);
-            const uint32_t p3 = p2 + (__popc(m2) << 1);
-            pwb = p3 + (__popc(m3) << 1);
-            const uint32_t ro0 = ring_s | ((p0 + (__popc(m0 & lt) << 1)) & (RB - 1u));
-            const uint32_t ro1 = ring_s | ((p1 + (__popc(m1 & lt) << 1)) & (RB - 1u));
-            const uint32_t ro2 = ring_s | ((p2 + (__popc(m2 & lt) << 1)) & (RB - 1u));
-            const uint32_t ro3 = ring_s | ((p3 + (__popc(m3 & lt) << 1)) & (RB - 1u));
-            const uint32_t Pw01 = __byte_perm(e0, e1, 0x7740);
-            const uint32_t Pw23 = __byte_perm(e2, e3, 0x7740);
-            const uint32_t Pw = __byte_perm(Pw01, Pw23, 0x5410);
-            const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
-            const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
-            if constexpr (kXsmem || kXGlobalMode == 1) {
-              if ((s & 1) == 0) {
-                rans_xpose4(v_lo, t, a.x, a.y, a_next.x, a_next.y);
-                if constexpr (kM16) {
-                  rans_xpose4(v_hi, t, a_hi.x, a_hi.y, a_hi_next.x, a_hi_next.y);
-                }
+          } else {
+            for (int s = cs; s < s_end; s++) {
+              if (s == trig_s) {
+                asm volatile("griddepcontrol.launch_dependents;");
+              }
+              const int curg = (int)(pwb >> GBS);
+              const bool need_refill = (issued <= curg + (RG - 1));
+              if (need_refill) {
+                __syncwarp();
+                do {
+                  const uint32_t boff = ((uint32_t)issued << GBS) + lane16;
+                  if (boff < wbytes) {
+                    const uint8_t* src = (issued < gmin) ? ilv_ptr : (tail_w + ((size_t)(issued - gmin) << GBS));
+                    rans_cp_async16_s(ring_lane + (((uint32_t)issued << GBS) & (RB - 1u)), src, pol);
+                  }
+                  if (issued < gmin) ilv_ptr += stride_g;
+                  rans_cp_commit();
+                  x_commits++;
+                  issued++;
+                } while (issued <= curg + (RG - 1));
+              }
+              const uint32_t e0 = ((const uint32_t*)lut_s)[states[0] & 4095u];
+              const uint32_t e1 = ((const uint32_t*)lut_s)[states[1] & 4095u];
+              const uint32_t e2 = ((const uint32_t*)lut_s)[states[2] & 4095u];
+              const uint32_t e3 = ((const uint32_t*)lut_s)[states[3] & 4095u];
+              uint2 a = valid_m ? xs[s * stride_s + lane] : make_uint2(0u, 0u);
+              const uint32_t pwb_n = pwb;
+              const uint32_t na = pwb_n + 4u * (uint32_t)lane;
+              const uint32_t xh0 = states[0] >> 12;
+              const uint32_t x0 = ((e0 >> 8) & 4095u) * xh0 + xh0 + (e0 >> 20);
+              const uint32_t xh1 = states[1] >> 12;
+              const uint32_t x1 = ((e1 >> 8) & 4095u) * xh1 + xh1 + (e1 >> 20);
+              const uint32_t xh2 = states[2] >> 12;
+              const uint32_t x2 = ((e2 >> 8) & 4095u) * xh2 + xh2 + (e2 >> 20);
+              const uint32_t xh3 = states[3] >> 12;
+              const uint32_t x3 = ((e3 >> 8) & 4095u) * xh3 + xh3 + (e3 >> 20);
+              const bool n0 = x0 < RANS_L;
+              const bool n1 = x1 < RANS_L;
+              const bool n2 = x2 < RANS_L;
+              const bool n3 = x3 < RANS_L;
+              const uint32_t m0 = __ballot_sync(0xffffffffu, n0);
+              const uint32_t m1 = __ballot_sync(0xffffffffu, n1);
+              const uint32_t m2 = __ballot_sync(0xffffffffu, n2);
+              const uint32_t m3 = __ballot_sync(0xffffffffu, n3);
+              const uint32_t p0 = pwb_n + 128u;
+              const uint32_t p1 = p0 + (__popc(m0) << 1);
+              const uint32_t p2 = p1 + (__popc(m1) << 1);
+              const uint32_t p3 = p2 + (__popc(m2) << 1);
+              pwb = p3 + (__popc(m3) << 1);
+              const uint32_t ro0 = ring_s | ((p0 + (__popc(m0 & lt) << 1)) & (RB - 1u));
+              const uint32_t ro1 = ring_s | ((p1 + (__popc(m1 & lt) << 1)) & (RB - 1u));
+              const uint32_t ro2 = ring_s | ((p2 + (__popc(m2 & lt) << 1)) & (RB - 1u));
+              const uint32_t ro3 = ring_s | ((p3 + (__popc(m3 & lt) << 1)) & (RB - 1u));
+              const uint32_t Pw01 = __byte_perm(e0, e1, 0x7740);
+              const uint32_t Pw23 = __byte_perm(e2, e3, 0x7740);
+              const uint32_t Pw = __byte_perm(Pw01, Pw23, 0x5410);
+              const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
+              const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
+              if (need_refill) {
+                rans_cp_wait<RG - 2>();
+                __syncwarp();
+              }
+              uint32_t nw;
+              if ((pwb_n & 2u) == 0u) {
+                nw = rans_lds32(ring_s | (na & (RB - 1u)));
               } else {
-                a = a_next;
-                if constexpr (kM16) a_hi = a_hi_next;
+                nw = rans_lds16(ring_s | (na & (RB - 1u))) | (rans_lds16(ring_s | ((na + 2u) & (RB - 1u))) << 16);
               }
-            }
-            // Wait for ring group right before reading nw and r0..r3 in parallel.
-            if (need_refill) {
-              rans_cp_wait<RG - 2>();
-              __syncwarp();
-            }
-            uint32_t nw;
-            if ((pwb_n & 2u) == 0u) {
-              nw = rans_lds32(ring_s | (na & (RB - 1u)));
-            } else {
-              nw = rans_lds16(ring_s | (na & (RB - 1u))) | (rans_lds16(ring_s | ((na + 2u) & (RB - 1u))) << 16);
-            }
-            const uint32_t r0 = n0 ? rans_lds16(ro0) : 0u;
-            const uint32_t r1 = n1 ? rans_lds16(ro1) : 0u;
-            const uint32_t r2 = n2 ? rans_lds16(ro2) : 0u;
-            const uint32_t r3 = n3 ? rans_lds16(ro3) : 0u;
-            // Assemble FP8 B-operand from nw + E0/E1, issue MMA (hides r0..r3 LDS latency), commit states.
-            const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-            const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
-            const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
-            if constexpr (kM16) {
-              rans_mma_e4m3_m16(c0, c1, c2, c3, a.x, a_hi.x, a.y, a_hi.y, bw0, bw1);
-            } else {
+              const uint32_t r0 = n0 ? rans_lds16(ro0) : 0u;
+              const uint32_t r1 = n1 ? rans_lds16(ro1) : 0u;
+              const uint32_t r2 = n2 ? rans_lds16(ro2) : 0u;
+              const uint32_t r3 = n3 ? rans_lds16(ro3) : 0u;
+              const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
+              const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
+              const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
               rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
+              states[0] = n0 ? ((x0 << 16) | r0) : x0;
+              states[1] = n1 ? ((x1 << 16) | r1) : x1;
+              states[2] = n2 ? ((x2 << 16) | r2) : x2;
+              states[3] = n3 ? ((x3 << 16) | r3) : x3;
             }
-            // Commit next-iteration rANS states.
-            states[0] = n0 ? ((x0 << 16) | r0) : x0;
-            states[1] = n1 ? ((x1 << 16) | r1) : x1;
-            states[2] = n2 ? ((x2 << 16) | r2) : x2;
-            states[3] = n3 ? ((x3 << 16) | r3) : x3;
           }
         }
         if constexpr (kXsmem) {
@@ -862,7 +1014,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
       }
       if (do_nb && valid_m) {
         const int n = nb * 8 + 2 * t;
-        const float2 sb2 = pb.sb_scalar ? make_float2(__ldg(pb.sb), __ldg(pb.sb))
+        const float2 sb2 = pb.sb_scalar ? make_float2(sb_s, sb_s)
                                         : __ldg(reinterpret_cast<const float2*>(pb.sb + n));
         __nv_bfloat162 r; r.x = __float2bfloat16_rn(sa_v * (sb2.x * c0)); r.y = __float2bfloat16_rn(sa_v * (sb2.y * c1));
         *(__nv_bfloat162*)(pb.out + (size_t)g * pb.N + n) = r;
