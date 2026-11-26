@@ -18,6 +18,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cstdlib>
 #include <stdint.h>
+#include <type_traits>
 
 namespace {
 
@@ -423,7 +424,8 @@ __device__ __forceinline__ float dvt_warp_nvfp4_dot(
 // Grid: (16, M), Block: 256 threads (8 warps).
 // Under SM121 PDL (pdl_mode & 1), Phase 2 (prompt-tail OOV scoring against A/raw_w) runs BEFORE
 // griddepcontrol.wait, overlapping with the tail of draft_head; Phase 1 then runs vectorized uint4
-// (8 BF16/load) scan of static_logits with short-circuit top-6 merge.
+// (8 BF16/load) scan of static_logits with compile-time specialized kTopK (6/8/1, 0=generic fallback).
+template <int kTopK>
 __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
     const __nv_bfloat16* __restrict__ A,
     const __nv_bfloat16* __restrict__ static_logits,
@@ -457,47 +459,55 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
     int max_tail,
     float logit_scale,
     int pdl_mode) {
+  constexpr bool kHas2 = (kTopK == 0 || kTopK >= 2);
+  constexpr bool kHas4 = (kTopK == 0 || kTopK >= 4);
+  constexpr bool kHas6 = (kTopK == 0 || kTopK >= 6);
+  constexpr bool kHas8 = (kTopK == 0 || kTopK >= 8);
   __shared__ uint4 s_a0[kS2MaxGroups];  // 8192 B (stride 16 B -> 0 LDS.128 bank conflicts)
   __shared__ uint4 s_a1[kS2MaxGroups];  // 8192 B
   __shared__ float s_vals[kS2Warps];
   __shared__ int32_t s_ids[kS2Warps];
-  __shared__ float s_vals2[kS2Warps];
-  __shared__ int32_t s_ids2[kS2Warps];
-  __shared__ float s_vals3[kS2Warps];
-  __shared__ int32_t s_ids3[kS2Warps];
-  __shared__ float s_vals4[kS2Warps];
-  __shared__ int32_t s_ids4[kS2Warps];
-  __shared__ float s_vals5[kS2Warps];
-  __shared__ int32_t s_ids5[kS2Warps];
-  __shared__ float s_vals6[kS2Warps];
-  __shared__ int32_t s_ids6[kS2Warps];
-  __shared__ float s_vals7[kS2Warps];
-  __shared__ int32_t s_ids7[kS2Warps];
-  __shared__ float s_vals8[kS2Warps];
-  __shared__ int32_t s_ids8[kS2Warps];
+  __shared__ float s_vals2[kHas2 ? kS2Warps : 1];
+  __shared__ int32_t s_ids2[kHas2 ? kS2Warps : 1];
+  __shared__ float s_vals3[kHas4 ? kS2Warps : 1];
+  __shared__ int32_t s_ids3[kHas4 ? kS2Warps : 1];
+  __shared__ float s_vals4[kHas4 ? kS2Warps : 1];
+  __shared__ int32_t s_ids4[kHas4 ? kS2Warps : 1];
+  __shared__ float s_vals5[kHas6 ? kS2Warps : 1];
+  __shared__ int32_t s_ids5[kHas6 ? kS2Warps : 1];
+  __shared__ float s_vals6[kHas6 ? kS2Warps : 1];
+  __shared__ int32_t s_ids6[kHas6 ? kS2Warps : 1];
+  __shared__ float s_vals7[kHas8 ? kS2Warps : 1];
+  __shared__ int32_t s_ids7[kHas8 ? kS2Warps : 1];
+  __shared__ float s_vals8[kHas8 ? kS2Warps : 1];
+  __shared__ int32_t s_ids8[kHas8 ? kS2Warps : 1];
 
   const int cta_c = blockIdx.x;  // 0 .. 15
   const int m = blockIdx.y;      // 0 .. M-1
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
-  const bool want_top8 = (tree_k >= 8 && m < tree_top_rows &&
-                          out_vals3 != nullptr && out_ids3 != nullptr &&
-                          out_vals4 != nullptr && out_ids4 != nullptr &&
-                          out_vals5 != nullptr && out_ids5 != nullptr &&
-                          out_vals6 != nullptr && out_ids6 != nullptr &&
-                          out_vals7 != nullptr && out_ids7 != nullptr &&
-                          out_vals8 != nullptr && out_ids8 != nullptr);
-  const bool want_top6 = (!want_top8 && tree_k >= 6 && m < tree_top_rows &&
-                          out_vals3 != nullptr && out_ids3 != nullptr &&
-                          out_vals4 != nullptr && out_ids4 != nullptr &&
-                          out_vals5 != nullptr && out_ids5 != nullptr &&
-                          out_vals6 != nullptr && out_ids6 != nullptr);
-  const bool want_top4 = (!want_top8 && !want_top6 && m < 3 && m < tree_top_rows &&
-                          out_vals3 != nullptr && out_ids3 != nullptr &&
-                          out_vals4 != nullptr && out_ids4 != nullptr);
-  const bool want_top2 = (!want_top8 && !want_top6 && !want_top4 && m < top2_max_rows &&
-                          out_vals2 != nullptr && out_ids2 != nullptr);
+  const bool want_top8 = (kTopK == 8) ? true : ((kTopK == 0) &&
+                          (tree_k >= 8 && m < tree_top_rows &&
+                           out_vals3 != nullptr && out_ids3 != nullptr &&
+                           out_vals4 != nullptr && out_ids4 != nullptr &&
+                           out_vals5 != nullptr && out_ids5 != nullptr &&
+                           out_vals6 != nullptr && out_ids6 != nullptr &&
+                           out_vals7 != nullptr && out_ids7 != nullptr &&
+                           out_vals8 != nullptr && out_ids8 != nullptr));
+  const bool want_top6 = (kTopK == 6) ? true : ((kTopK == 0) &&
+                          (!want_top8 && tree_k >= 6 && m < tree_top_rows &&
+                           out_vals3 != nullptr && out_ids3 != nullptr &&
+                           out_vals4 != nullptr && out_ids4 != nullptr &&
+                           out_vals5 != nullptr && out_ids5 != nullptr &&
+                           out_vals6 != nullptr && out_ids6 != nullptr));
+  const bool want_top4 = (kTopK == 0) &&
+                          (!want_top8 && !want_top6 && m < 3 && m < tree_top_rows &&
+                           out_vals3 != nullptr && out_ids3 != nullptr &&
+                           out_vals4 != nullptr && out_ids4 != nullptr);
+  const bool want_top2 = (kTopK == 0) &&
+                          (!want_top8 && !want_top6 && !want_top4 && m < top2_max_rows &&
+                           out_vals2 != nullptr && out_ids2 != nullptr);
 
   float best_val = -1e30f;
   int best_id = 0x7fffffff;
@@ -704,27 +714,35 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
   if (lane == 0) {
     s_vals[warp] = best_val;
     s_ids[warp] = best_id;
-    if (want_top8 || want_top6 || want_top4 || want_top2) {
-      s_vals2[warp] = best2_val;
-      s_ids2[warp] = best2_id;
+    if constexpr (kHas2) {
+      if (want_top8 || want_top6 || want_top4 || want_top2) {
+        s_vals2[warp] = best2_val;
+        s_ids2[warp] = best2_id;
+      }
     }
-    if (want_top8 || want_top6 || want_top4) {
-      s_vals3[warp] = best3_val;
-      s_ids3[warp] = best3_id;
-      s_vals4[warp] = best4_val;
-      s_ids4[warp] = best4_id;
+    if constexpr (kHas4) {
+      if (want_top8 || want_top6 || want_top4) {
+        s_vals3[warp] = best3_val;
+        s_ids3[warp] = best3_id;
+        s_vals4[warp] = best4_val;
+        s_ids4[warp] = best4_id;
+      }
     }
-    if (want_top8 || want_top6) {
-      s_vals5[warp] = best5_val;
-      s_ids5[warp] = best5_id;
-      s_vals6[warp] = best6_val;
-      s_ids6[warp] = best6_id;
+    if constexpr (kHas6) {
+      if (want_top8 || want_top6) {
+        s_vals5[warp] = best5_val;
+        s_ids5[warp] = best5_id;
+        s_vals6[warp] = best6_val;
+        s_ids6[warp] = best6_id;
+      }
     }
-    if (want_top8) {
-      s_vals7[warp] = best7_val;
-      s_ids7[warp] = best7_id;
-      s_vals8[warp] = best8_val;
-      s_ids8[warp] = best8_id;
+    if constexpr (kHas8) {
+      if (want_top8) {
+        s_vals7[warp] = best7_val;
+        s_ids7[warp] = best7_id;
+        s_vals8[warp] = best8_val;
+        s_ids8[warp] = best8_id;
+      }
     }
   }
   __syncthreads();
@@ -732,20 +750,50 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
   if (warp == 0 && lane < kS2Warps) {
     float bv = s_vals[lane];
     int bi = s_ids[lane];
-    float bv2 = (want_top8 || want_top6 || want_top4 || want_top2) ? s_vals2[lane] : -1e30f;
-    int bi2 = (want_top8 || want_top6 || want_top4 || want_top2) ? s_ids2[lane] : 0x7fffffff;
-    float bv3 = (want_top8 || want_top6 || want_top4) ? s_vals3[lane] : -1e30f;
-    int bi3 = (want_top8 || want_top6 || want_top4) ? s_ids3[lane] : 0x7fffffff;
-    float bv4 = (want_top8 || want_top6 || want_top4) ? s_vals4[lane] : -1e30f;
-    int bi4 = (want_top8 || want_top6 || want_top4) ? s_ids4[lane] : 0x7fffffff;
-    float bv5 = (want_top8 || want_top6) ? s_vals5[lane] : -1e30f;
-    int bi5 = (want_top8 || want_top6) ? s_ids5[lane] : 0x7fffffff;
-    float bv6 = (want_top8 || want_top6) ? s_vals6[lane] : -1e30f;
-    int bi6 = (want_top8 || want_top6) ? s_ids6[lane] : 0x7fffffff;
-    float bv7 = want_top8 ? s_vals7[lane] : -1e30f;
-    int bi7 = want_top8 ? s_ids7[lane] : 0x7fffffff;
-    float bv8 = want_top8 ? s_vals8[lane] : -1e30f;
-    int bi8 = want_top8 ? s_ids8[lane] : 0x7fffffff;
+    float bv2 = -1e30f;
+    int bi2 = 0x7fffffff;
+    float bv3 = -1e30f;
+    int bi3 = 0x7fffffff;
+    float bv4 = -1e30f;
+    int bi4 = 0x7fffffff;
+    float bv5 = -1e30f;
+    int bi5 = 0x7fffffff;
+    float bv6 = -1e30f;
+    int bi6 = 0x7fffffff;
+    float bv7 = -1e30f;
+    int bi7 = 0x7fffffff;
+    float bv8 = -1e30f;
+    int bi8 = 0x7fffffff;
+    if constexpr (kHas2) {
+      if (want_top8 || want_top6 || want_top4 || want_top2) {
+        bv2 = s_vals2[lane];
+        bi2 = s_ids2[lane];
+      }
+    }
+    if constexpr (kHas4) {
+      if (want_top8 || want_top6 || want_top4) {
+        bv3 = s_vals3[lane];
+        bi3 = s_ids3[lane];
+        bv4 = s_vals4[lane];
+        bi4 = s_ids4[lane];
+      }
+    }
+    if constexpr (kHas6) {
+      if (want_top8 || want_top6) {
+        bv5 = s_vals5[lane];
+        bi5 = s_ids5[lane];
+        bv6 = s_vals6[lane];
+        bi6 = s_ids6[lane];
+      }
+    }
+    if constexpr (kHas8) {
+      if (want_top8) {
+        bv7 = s_vals7[lane];
+        bi7 = s_ids7[lane];
+        bv8 = s_vals8[lane];
+        bi8 = s_ids8[lane];
+      }
+    }
 #pragma unroll
     for (int o = 4; o > 0; o >>= 1) {
       const float ov = __shfl_xor_sync(0xffu, bv, o);
@@ -831,6 +879,7 @@ __global__ void __launch_bounds__(256) draft_vocab_tail_argmax_kernel(
   }
 }
 
+template <int kTopK>
 __global__ void draft_vocab_final_reduce_kernel(
     const float* __restrict__ in_vals,
     const int32_t* __restrict__ in_ids,
@@ -866,25 +915,29 @@ __global__ void draft_vocab_final_reduce_kernel(
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
   if (lane >= kS2CTAsPerRow) return;
-  const bool want_top8 = (tree_k >= 8 && m < tree_top_rows && out_tree_top != nullptr &&
-                          in_vals3 != nullptr && in_ids3 != nullptr &&
-                          in_vals4 != nullptr && in_ids4 != nullptr &&
-                          in_vals5 != nullptr && in_ids5 != nullptr &&
-                          in_vals6 != nullptr && in_ids6 != nullptr &&
-                          in_vals7 != nullptr && in_ids7 != nullptr &&
-                          in_vals8 != nullptr && in_ids8 != nullptr);
-  const bool want_top6 = (!want_top8 && tree_k >= 6 && m < tree_top_rows && out_tree_top != nullptr &&
-                          in_vals3 != nullptr && in_ids3 != nullptr &&
-                          in_vals4 != nullptr && in_ids4 != nullptr &&
-                          in_vals5 != nullptr && in_ids5 != nullptr &&
-                          in_vals6 != nullptr && in_ids6 != nullptr);
-  const bool want_top4 = (!want_top8 && !want_top6 && m < 3 && m < tree_top_rows && out_tree_top != nullptr &&
-                          in_vals3 != nullptr && in_ids3 != nullptr &&
-                          in_vals4 != nullptr && in_ids4 != nullptr);
-  const bool want_top2 = (!want_top8 && !want_top6 && !want_top4 &&
-                          ((m < top2_rows && out_top2 != nullptr) ||
-                           (m < tree_top_rows && out_tree_top != nullptr)) &&
-                          in_vals2 != nullptr && in_ids2 != nullptr);
+  const bool want_top8 = (kTopK == 8) ? true : ((kTopK == 0) &&
+                          (tree_k >= 8 && m < tree_top_rows && out_tree_top != nullptr &&
+                           in_vals3 != nullptr && in_ids3 != nullptr &&
+                           in_vals4 != nullptr && in_ids4 != nullptr &&
+                           in_vals5 != nullptr && in_ids5 != nullptr &&
+                           in_vals6 != nullptr && in_ids6 != nullptr &&
+                           in_vals7 != nullptr && in_ids7 != nullptr &&
+                           in_vals8 != nullptr && in_ids8 != nullptr));
+  const bool want_top6 = (kTopK == 6) ? true : ((kTopK == 0) &&
+                          (!want_top8 && tree_k >= 6 && m < tree_top_rows && out_tree_top != nullptr &&
+                           in_vals3 != nullptr && in_ids3 != nullptr &&
+                           in_vals4 != nullptr && in_ids4 != nullptr &&
+                           in_vals5 != nullptr && in_ids5 != nullptr &&
+                           in_vals6 != nullptr && in_ids6 != nullptr));
+  const bool want_top4 = (kTopK == 0) &&
+                          (!want_top8 && !want_top6 && m < 3 && m < tree_top_rows && out_tree_top != nullptr &&
+                           in_vals3 != nullptr && in_ids3 != nullptr &&
+                           in_vals4 != nullptr && in_ids4 != nullptr);
+  const bool want_top2 = (kTopK == 0) &&
+                          (!want_top8 && !want_top6 && !want_top4 &&
+                           ((m < top2_rows && out_top2 != nullptr) ||
+                            (m < tree_top_rows && out_tree_top != nullptr)) &&
+                           in_vals2 != nullptr && in_ids2 != nullptr);
   float bv = in_vals[m * kS2CTAsPerRow + lane];
   int bi = in_ids[m * kS2CTAsPerRow + lane];
   float bv2 = (want_top8 || want_top6 || want_top4 || want_top2) ? in_vals2[m * kS2CTAsPerRow + lane] : -1e30f;
@@ -1225,50 +1278,55 @@ torch::Tensor draft_vocab_tail_argmax(
   int32_t* i8_ptr = (tree_top_ptr != nullptr && tree_k >= 8) ? sc.s2_ids8.data_ptr<int32_t>() : nullptr;
 
   const int pdl_mode = dvt_pdl_mode();
-  dvt_launch_pdl(
-      draft_vocab_tail_argmax_kernel, dim3(kS2CTAsPerRow, M), 256, st, pdl_mode,
-      reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(static_logits.data_ptr()),
-      vocab_map.data_ptr<int64_t>(),
-      tail_ids.data_ptr<int32_t>(),
-      tail_count.data_ptr<int32_t>(),
-      raw_w.data_ptr<uint8_t>(),
-      reinterpret_cast<const uint8_t*>(raw_s.data_ptr()),
-      global_scale.data_ptr<float>(),
-      sc.s2_vals.data_ptr<float>(),
-      sc.s2_ids.data_ptr<int32_t>(),
-      v2_ptr,
-      i2_ptr,
-      v3_ptr,
-      i3_ptr,
-      v4_ptr,
-      i4_ptr,
-      v5_ptr,
-      i5_ptr,
-      v6_ptr,
-      i6_ptr,
-      v7_ptr,
-      i7_ptr,
-      v8_ptr,
-      i8_ptr,
-      top2_max_rows,
-      tree_top_rows,
-      tree_k,
-      V_static, K, max_tail, static_cast<float>(logit_scale), pdl_mode);
+  const bool all_top8 = (tree_k >= 8 && tree_top_rows >= M && tree_top_ptr != nullptr &&
+                         v8_ptr != nullptr && i8_ptr != nullptr);
+  const bool all_top6 = (!all_top8 && tree_k >= 6 && tree_top_rows >= M && tree_top_ptr != nullptr &&
+                         v6_ptr != nullptr && i6_ptr != nullptr);
+  const bool all_top1 = (top2_max_rows == 0 && tree_top_rows == 0);
 
-  dvt_launch_pdl(
-      draft_vocab_final_reduce_kernel, dim3(M, 1, 1), 32, st, pdl_mode,
-      static_cast<const float*>(sc.s2_vals.data_ptr<float>()),
-      static_cast<const int32_t*>(sc.s2_ids.data_ptr<int32_t>()),
-      static_cast<const float*>(v2_ptr), static_cast<const int32_t*>(i2_ptr),
-      static_cast<const float*>(v3_ptr), static_cast<const int32_t*>(i3_ptr),
-      static_cast<const float*>(v4_ptr), static_cast<const int32_t*>(i4_ptr),
-      static_cast<const float*>(v5_ptr), static_cast<const int32_t*>(i5_ptr),
-      static_cast<const float*>(v6_ptr), static_cast<const int32_t*>(i6_ptr),
-      static_cast<const float*>(v7_ptr), static_cast<const int32_t*>(i7_ptr),
-      static_cast<const float*>(v8_ptr), static_cast<const int32_t*>(i8_ptr),
-      out.data_ptr<int64_t>(), top2_ptr, top2_rows,
-      margin_ptr, margin_rows, tree_top_ptr, tree_vals_ptr, tree_top_rows, tree_k, M, pdl_mode);
+  auto dispatch_dvt = [&](auto tag) {
+    constexpr int kTK = decltype(tag)::value;
+    dvt_launch_pdl(
+        draft_vocab_tail_argmax_kernel<kTK>, dim3(kS2CTAsPerRow, M), 256, st, pdl_mode,
+        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(static_logits.data_ptr()),
+        vocab_map.data_ptr<int64_t>(),
+        tail_ids.data_ptr<int32_t>(),
+        tail_count.data_ptr<int32_t>(),
+        raw_w.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint8_t*>(raw_s.data_ptr()),
+        global_scale.data_ptr<float>(),
+        sc.s2_vals.data_ptr<float>(),
+        sc.s2_ids.data_ptr<int32_t>(),
+        v2_ptr, i2_ptr, v3_ptr, i3_ptr, v4_ptr, i4_ptr,
+        v5_ptr, i5_ptr, v6_ptr, i6_ptr, v7_ptr, i7_ptr, v8_ptr, i8_ptr,
+        top2_max_rows, tree_top_rows, tree_k,
+        V_static, K, max_tail, static_cast<float>(logit_scale), pdl_mode);
+
+    dvt_launch_pdl(
+        draft_vocab_final_reduce_kernel<kTK>, dim3(M, 1, 1), 32, st, pdl_mode,
+        static_cast<const float*>(sc.s2_vals.data_ptr<float>()),
+        static_cast<const int32_t*>(sc.s2_ids.data_ptr<int32_t>()),
+        static_cast<const float*>(v2_ptr), static_cast<const int32_t*>(i2_ptr),
+        static_cast<const float*>(v3_ptr), static_cast<const int32_t*>(i3_ptr),
+        static_cast<const float*>(v4_ptr), static_cast<const int32_t*>(i4_ptr),
+        static_cast<const float*>(v5_ptr), static_cast<const int32_t*>(i5_ptr),
+        static_cast<const float*>(v6_ptr), static_cast<const int32_t*>(i6_ptr),
+        static_cast<const float*>(v7_ptr), static_cast<const int32_t*>(i7_ptr),
+        static_cast<const float*>(v8_ptr), static_cast<const int32_t*>(i8_ptr),
+        out.data_ptr<int64_t>(), top2_ptr, top2_rows,
+        margin_ptr, margin_rows, tree_top_ptr, tree_vals_ptr, tree_top_rows, tree_k, M, pdl_mode);
+  };
+
+  if (all_top6) {
+    dispatch_dvt(std::integral_constant<int, 6>{});
+  } else if (all_top8) {
+    dispatch_dvt(std::integral_constant<int, 8>{});
+  } else if (all_top1) {
+    dispatch_dvt(std::integral_constant<int, 1>{});
+  } else {
+    dispatch_dvt(std::integral_constant<int, 0>{});
+  }
   return out;
 }
 
