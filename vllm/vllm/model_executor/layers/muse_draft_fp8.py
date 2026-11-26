@@ -63,7 +63,7 @@ _SHARED_PARTIALS: dict[int, torch.Tensor] = {}
 
 
 def _quant_mode() -> str:
-    return os.environ.get("MUSE_DRAFT_QUANT", "hybrid_int4").strip().lower()
+    return os.environ.get("MUSE_DRAFT_QUANT", "int4").strip().lower()
 
 
 def enabled() -> bool:
