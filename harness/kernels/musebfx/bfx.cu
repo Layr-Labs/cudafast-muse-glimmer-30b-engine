@@ -125,7 +125,11 @@ void dflash_kv_post(
 std::tuple<torch::Tensor, torch::Tensor> dflash_qkv_norm_rope(
     torch::Tensor qkv, torch::Tensor positions, torch::Tensor q_norm_w,
     torch::Tensor k_norm_w, torch::Tensor cos_sin_cache,
-    int64_t nq, int64_t nkv, double eps, bool is_neox);
+    int64_t nq, int64_t nkv, double eps, bool is_neox,
+    c10::optional<torch::Tensor> slot_mapping = c10::nullopt,
+    c10::optional<torch::Tensor> k_cache = c10::nullopt,
+    c10::optional<torch::Tensor> v_cache = c10::nullopt,
+    int64_t block_size = 16);
 void draft_vocab_update_tail(
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor in_static_vocab,
     torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor tail_seen,
@@ -161,7 +165,12 @@ void native_leaf_setup_tree(
     int64_t max_depth = 6,
     double sub_coef = 0.55,
     double shf_coef = 0.20,
-    double cont_decay = 0.88);
+    double cont_decay = 0.88,
+    c10::optional<torch::Tensor> pl_tok = c10::nullopt,
+    c10::optional<torch::Tensor> pl_meta = c10::nullopt);
+void native_leaf_prompt_lookup(
+    torch::Tensor all_token_ids, torch::Tensor total_len, int64_t req_idx,
+    torch::Tensor pl_tok, torch::Tensor pl_meta, int64_t window = 2048);
 void native_leaf_commit_tree(
     torch::Tensor leaf_flag, torch::Tensor prev_ns,
     torch::Tensor hit_flag, torch::Tensor hit_src_row,
@@ -213,7 +222,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int4_gemm", &int4_gemm);
   m.def("int4_gemm_aux5", &int4_gemm_aux5);
   m.def("dflash_kv_post", &dflash_kv_post);
-  m.def("dflash_qkv_norm_rope", &dflash_qkv_norm_rope);
+  m.def("dflash_qkv_norm_rope", &dflash_qkv_norm_rope,
+        pybind11::arg("qkv"), pybind11::arg("positions"),
+        pybind11::arg("q_norm_w"), pybind11::arg("k_norm_w"),
+        pybind11::arg("cos_sin_cache"), pybind11::arg("nq"),
+        pybind11::arg("nkv"), pybind11::arg("eps"), pybind11::arg("is_neox"),
+        pybind11::arg("slot_mapping") = c10::nullopt,
+        pybind11::arg("k_cache") = c10::nullopt,
+        pybind11::arg("v_cache") = c10::nullopt,
+        pybind11::arg("block_size") = 16);
   m.def("draft_vocab_update_tail", &draft_vocab_update_tail,
         pybind11::arg("input_ids"), pybind11::arg("positions"), pybind11::arg("in_static_vocab"),
         pybind11::arg("tail_ids"), pybind11::arg("tail_count"), pybind11::arg("tail_seen"),
@@ -248,7 +265,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("max_depth") = 6,
         pybind11::arg("sub_coef") = 0.55,
         pybind11::arg("shf_coef") = 0.20,
-        pybind11::arg("cont_decay") = 0.88);
+        pybind11::arg("cont_decay") = 0.88,
+        pybind11::arg("pl_tok") = c10::nullopt,
+        pybind11::arg("pl_meta") = c10::nullopt);
+  m.def("native_leaf_prompt_lookup", &native_leaf_prompt_lookup,
+        pybind11::arg("all_token_ids"), pybind11::arg("total_len"),
+        pybind11::arg("req_idx"), pybind11::arg("pl_tok"),
+        pybind11::arg("pl_meta"), pybind11::arg("window") = 2048);
   m.def("native_leaf_commit_tree", &native_leaf_commit_tree,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"),
         pybind11::arg("hit_flag"), pybind11::arg("hit_src_row"),

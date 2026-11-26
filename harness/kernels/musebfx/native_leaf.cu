@@ -50,6 +50,11 @@ __constant__ float kCalC[6] = {0.000000f, -0.402942f, -0.763639f, -0.817452f, -1
 #define CAL_W_Z0_PRE 0.201693f
 #define CAL_W_Z0_POST 0.178773f
 #define CAL_SHIFT 0.0349f
+// Prompt-lookup (PL) copy candidates: root score = s_A[m] * kCalPlRoot[n] (n = suffix-match length), continuation = best * CAL_PL_CONT.
+// Uncalibrated placeholders; calibrate with per-n hit rates before tuning.
+__constant__ float kCalPlRoot[4] = {0.0f, 0.12f, 0.30f, 0.45f};
+#define CAL_PL_CONT 0.8f
+constexpr int kPlWindowMax = 2048;
 
 // Arbitrary-depth (1..6-level) dynamic multi-leaf tree setup (rows 7..tree_m-1), launched as 1 warp (<<<1, 32>>>, <2 us):
 //   - Bit-packed remap inside int32[49] (1 + 16*3):
@@ -84,7 +89,9 @@ __global__ void native_leaf_setup_tree_kernel(
     float shf_coef,
     float cont_decay,
     int adapt_gamma,
-    int calib_mode) {
+    int calib_mode,
+    const int64_t* __restrict__ pl_tok,
+    const int32_t* __restrict__ pl_meta) {
   const int tid = threadIdx.x;
   const bool high_acc = (req_acc_state != nullptr && req_acc_state[2] != 0);
   const int eff_max_depth = (max_depth < 1) ? 1 : ((max_depth > 6) ? 6 : max_depth);
@@ -216,6 +223,9 @@ __global__ void native_leaf_setup_tree_kernel(
   __shared__ int8_t s_cand_depth[64];
   __shared__ int8_t s_cand_kind[64];  // 0=1-level, 1=sub-continuation, 2=shift-continuation, 3=alt2-continuation
   __shared__ int s_num_cands;
+  __shared__ int64_t s_pl_tok[6];
+  __shared__ int s_pl_len;
+  __shared__ int s_pl_n;
 
   __shared__ int s_row_base_sub[16];
   __shared__ uint32_t s_row_packed[16];
@@ -358,6 +368,49 @@ __global__ void native_leaf_setup_tree_kernel(
   }
   __syncwarp();
 
+  // Prompt-lookup copy root (kind=4): m = leading agreement of copy chain t1..t6 with drafter chain d1..d6.
+  // Copy token t_{m+1} != d_{m+1} by construction; its context rows 0..m are on-path (t_1..t_m == d_1..d_m).
+  if (tid == 0) {
+    s_pl_len = 0;
+    s_pl_n = 0;
+    if (pl_tok != nullptr && pl_meta != nullptr && !high_acc) {
+      int pl_len = pl_meta[0];
+      if (pl_len > 6) pl_len = 6;
+      if (pl_len < 0) pl_len = 0;
+      for (int i = 0; i < pl_len; ++i) s_pl_tok[i] = pl_tok[i];
+      s_pl_len = pl_len;
+      int pl_n = pl_meta[1];
+      s_pl_n = (pl_n < 1) ? 1 : ((pl_n > 3) ? 3 : pl_n);
+      int m = 0;
+      while (m < pl_len && static_cast<int64_t>(input_ids[m + 1]) == s_pl_tok[m]) ++m;
+      if (m < pl_len && s_A[m] > 0.0f) {
+        const float root_s = s_A[m] * kCalPlRoot[s_pl_n];
+        const int64_t root_tok = s_pl_tok[m];
+        int slot = -1;
+        // Merge with an existing 1-level drafter candidate for the same token/depth (upgrade to copy kind).
+        for (int c = 0; c < s_num_cands; ++c) {
+          if (s_cand_score[c] > 0.0f && s_cand_par[c] < 0 && s_cand_k[c] == m + 1 && s_cand_tok[c] == root_tok) {
+            slot = c;
+            break;
+          }
+        }
+        if (slot >= 0) {
+          if (root_s > s_cand_score[slot]) s_cand_score[slot] = root_s;
+          s_cand_kind[slot] = 4;
+        } else if (s_num_cands < 64) {
+          slot = s_num_cands++;
+          s_cand_score[slot] = root_s;
+          s_cand_tok[slot] = root_tok;
+          s_cand_k[slot] = static_cast<int8_t>(m + 1);
+          s_cand_par[slot] = -1;
+          s_cand_depth[slot] = 1;
+          s_cand_kind[slot] = 4;
+        }
+      }
+    }
+  }
+  __syncwarp();
+
   for (int li = 0; li < num_leaves; ++li) {
     const int r = 7 + li;
     const int nc = s_num_cands;
@@ -470,6 +523,19 @@ __global__ void native_leaf_setup_tree_kernel(
                 s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
                 s_cand_kind[slot] = 2;
               }
+            }
+          }
+          // 4) Prompt-lookup copy continuation (kind=4): t_{k_r+1} on the copy path (parent must be a copy node).
+          if (kind == 4 && s_pl_len > k_r && s_num_cands < 64) {
+            const float child_s = best_s * CAL_PL_CONT;
+            if (child_s > 0.0f) {
+              const int slot = s_num_cands++;
+              s_cand_score[slot] = child_s;
+              s_cand_tok[slot] = s_pl_tok[k_r];
+              s_cand_k[slot] = static_cast<int8_t>(k_child);
+              s_cand_par[slot] = static_cast<int8_t>(r);
+              s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
+              s_cand_kind[slot] = 4;
             }
           }
         }
@@ -929,7 +995,9 @@ void native_leaf_setup_tree(
     int64_t max_depth,
     double sub_coef,
     double shf_coef,
-    double cont_decay) {
+    double cont_decay,
+    c10::optional<torch::Tensor> pl_tok,
+    c10::optional<torch::Tensor> pl_meta) {
   TORCH_CHECK(tree_m >= 8 && tree_m <= 16, "tree_m must be in 8..16");
   TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32 && leaf_flag.numel() >= 1 + tree_m * 3);
   TORCH_CHECK(tree_top.is_cuda() && tree_top.scalar_type() == torch::kInt64 && tree_top.numel() >= 20);
@@ -955,6 +1023,14 @@ void native_leaf_setup_tree(
       saved_leaf_parent.value().numel() >= tree_m) {
     TORCH_CHECK(saved_leaf_parent.value().is_cuda() && saved_leaf_parent.value().scalar_type() == torch::kInt32);
     parent_ptr = saved_leaf_parent.value().data_ptr<int32_t>();
+  }
+  const int64_t* pl_tok_ptr = nullptr;
+  const int32_t* pl_meta_ptr = nullptr;
+  if (pl_tok.has_value() && pl_tok.value().defined() && pl_meta.has_value() && pl_meta.value().defined()) {
+    TORCH_CHECK(pl_tok.value().is_cuda() && pl_tok.value().scalar_type() == torch::kInt64 && pl_tok.value().numel() >= 6);
+    TORCH_CHECK(pl_meta.value().is_cuda() && pl_meta.value().scalar_type() == torch::kInt32 && pl_meta.value().numel() >= 2);
+    pl_tok_ptr = pl_tok.value().data_ptr<int64_t>();
+    pl_meta_ptr = pl_meta.value().data_ptr<int32_t>();
   }
   const float eff_temp = (temp > 1e-3) ? static_cast<float>(temp) : 1.35f;
   const float eff_tail = (tail_c >= 0.0) ? static_cast<float>(tail_c) : 4.0f;
@@ -994,7 +1070,96 @@ void native_leaf_setup_tree(
       eff_shf,
       eff_cont,
       adapt_gamma_env,
-      calib_env);
+      calib_env,
+      pl_tok_ptr,
+      pl_meta_ptr);
+}
+
+// Prompt-lookup suffix match over one request's committed history (single block, 256 threads).
+//   hist     = all_token_ids row of the request (int32, UVA); total_len_p = int32 device scalar; L = total_len
+//   Searches n=3,2,1 (longest first) for the most recent earlier occurrence j (j<=L-1) of the last n tokens.
+//   Output: pl_tok[i] = hist[j+i] for i < pl_meta[0] (<= 6), pl_meta = {len, n}; len = 0 and n = 0 on no match.
+__global__ void native_leaf_prompt_lookup_kernel(
+    const int32_t* __restrict__ hist,
+    const int32_t* __restrict__ total_len_p,
+    int64_t* __restrict__ pl_tok,
+    int32_t* __restrict__ pl_meta,
+    int window) {
+  __shared__ int32_t s_h[kPlWindowMax];
+  __shared__ int s_L;
+  __shared__ int s_lo;
+  __shared__ int s_best_j;
+  __shared__ int s_best_n;
+  const int tid = threadIdx.x;
+  if (tid == 0) {
+    int L = total_len_p[0];
+    if (L < 0) L = 0;
+    s_L = L;
+    s_lo = (L > window) ? (L - window) : 0;
+    s_best_j = -1;
+    s_best_n = 0;
+  }
+  __syncthreads();
+  const int L = s_L;
+  const int lo = s_lo;
+  for (int i = tid; i < L - lo; i += blockDim.x) {
+    s_h[i] = hist[lo + i];
+  }
+  __syncthreads();
+  for (int n = 3; n >= 1; --n) {
+    int bj = -1;
+    // Candidate j: end of an earlier occurrence, lo+n <= j <= L-1 (most recent wins via max).
+    for (int j = lo + n + tid; j <= L - 1; j += blockDim.x) {
+      bool ok = true;
+#pragma unroll
+      for (int t = 0; t < 3; ++t) {
+        if (t < n && s_h[j - n + t - lo] != s_h[L - n + t - lo]) {
+          ok = false;
+        }
+      }
+      if (ok && j > bj) bj = j;
+    }
+    if (bj >= 0) atomicMax(&s_best_j, bj);
+    __syncthreads();
+    if (tid == 0 && s_best_n == 0 && s_best_j >= 0) s_best_n = n;
+    __syncthreads();
+    if (s_best_n != 0) break;
+  }
+  if (tid == 0) {
+    const int n = s_best_n;
+    const int j = s_best_j;
+    int len = 0;
+    if (n > 0 && j >= 0) {
+      len = L - j;
+      if (len > 6) len = 6;
+    }
+    for (int i = 0; i < 6; ++i) {
+      pl_tok[i] = (i < len) ? static_cast<int64_t>(s_h[j + i - lo]) : -1;
+    }
+    pl_meta[0] = len;
+    pl_meta[1] = (len > 0) ? n : 0;
+  }
+}
+
+void native_leaf_prompt_lookup(
+    torch::Tensor all_token_ids,
+    torch::Tensor total_len,
+    int64_t req_idx,
+    torch::Tensor pl_tok,
+    torch::Tensor pl_meta,
+    int64_t window) {
+  TORCH_CHECK(all_token_ids.is_cuda() && all_token_ids.scalar_type() == torch::kInt32 && all_token_ids.dim() == 2);
+  TORCH_CHECK(total_len.is_cuda() && total_len.scalar_type() == torch::kInt32 && total_len.numel() > req_idx);
+  TORCH_CHECK(req_idx >= 0 && req_idx < all_token_ids.size(0), "req_idx out of range");
+  TORCH_CHECK(pl_tok.is_cuda() && pl_tok.scalar_type() == torch::kInt64 && pl_tok.numel() >= 6);
+  TORCH_CHECK(pl_meta.is_cuda() && pl_meta.scalar_type() == torch::kInt32 && pl_meta.numel() >= 2);
+  TORCH_CHECK(all_token_ids.stride(1) == 1, "all_token_ids rows must be contiguous");
+  const int win = static_cast<int>(window < 8 ? 8 : (window > kPlWindowMax ? kPlWindowMax : window));
+  const int32_t* hist = all_token_ids.data_ptr<int32_t>() + req_idx * all_token_ids.stride(0);
+  const int32_t* tl = total_len.data_ptr<int32_t>() + req_idx;
+  auto st = c10::cuda::getCurrentCUDAStream().stream();
+  native_leaf_prompt_lookup_kernel<<<1, 256, 0, st>>>(
+      hist, tl, pl_tok.data_ptr<int64_t>(), pl_meta.data_ptr<int32_t>(), win);
 }
 
 void native_leaf_commit_tree(

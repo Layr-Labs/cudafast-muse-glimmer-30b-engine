@@ -64,7 +64,18 @@ TREE_CONT_DECAY = float(os.environ.get("MUSE_TREE_CONT_DECAY", "0.88"))
 TREE_ADAPT_GAMMA = os.environ.get("MUSE_TREE_ADAPT_GAMMA", "1").strip() not in ("0", "", "false", "no")
 TREE_CALIB = os.environ.get("MUSE_TREE_CALIB", "1").strip() not in ("0", "", "false", "no")
 TREE_HIGH_ACC_CPC = float(os.environ.get("MUSE_TREE_HIGH_ACC_CPC", "0"))
+# Prompt-lookup copy candidates (default ON; "0" = kill switch, read at import).
+PL_ENABLED = os.environ.get("MUSE_PROMPT_LOOKUP", "1").strip() not in ("0", "", "false", "no")
+PL_WINDOW = 2048
 LEAF_STATS = os.environ.get("MUSE_LEAF_STATS", "0").strip() in ("1", "true", "yes")
+# Leaf latch with recovery. A committed-token-ceiling clamp still switches tree leaves off (as in the parent), but
+# leaves come back after LEAF_RELATCH_ROUNDS consecutive full-depth steps with no clamp. A request that is really
+# ceiling-bound keeps being clamped and so stays latched exactly like the parent; a coding continuation that only had a
+# fast start (the ceiling arms on >4 tokens/round over the first 6 rounds) stops being clamped once its budget catches
+# up and gets its tree back. The ceiling's token budget, which bounds the committed-token rate, is untouched; clamped
+# steps never run the tree, and a full-depth tree round commits at most depth + 1 tokens, as the budget reserves.
+LEAF_RELATCH_ROUNDS = max(1, int(os.environ.get("MUSE_TREE_LEAF_RECOVER_ROUNDS", "8")))
+LATCH_AFTER_CLAMPS = max(1, int(os.environ.get("MUSE_TREE_LATCH_AFTER_CLAMPS", "1")))
 _ST_RAW = os.environ.get("MUSE_NATIVE_LEAF_SELFTEST", "0").strip().lower()
 SELFTEST = 1 if _ST_RAW in ("1", "true", "yes") else (2 if _ST_RAW == "2" else 0)
 NOHIT = os.environ.get("MUSE_NATIVE_LEAF_NOHIT", "0").strip() in ("1", "true", "yes")
@@ -90,6 +101,8 @@ class _NativeLeafState:
         self.saved_leaf_k: torch.Tensor | None = None       # int32[16] (tree mode)
         self.saved_leaf_parent: torch.Tensor | None = None  # int32[16] (-1=1-level root, 7..15=parent row)
         self.stats: torch.Tensor | None = None              # int64[32] telemetry counters
+        self.pl_tok: torch.Tensor | None = None             # int64[6] prompt-lookup copy chain t1..t6
+        self.pl_meta: torch.Tensor | None = None            # int32[2] [len, n] (n = suffix-match length)
         # Static 52-layer target KV metadata for 1-launch all-layer KV fix on hit.
         self.num_layers: int = 0
         self.kv_ptrs: torch.Tensor | None = None
@@ -101,6 +114,8 @@ class _NativeLeafState:
         # Cached device pointer array for hidden_states + aux_hidden_states (0 H2D copies steady state).
         self._hid_ptr_cache: dict[tuple[int, ...], torch.Tensor] = {}
         self._last_req_id: str | None = None
+        self._clamps = 0
+        self._since_clamp = 0
         self._logged_active: bool = False
         self._atexit_registered: bool = False
 
@@ -241,6 +256,27 @@ def get_tree_vals_buf(device: torch.device) -> torch.Tensor | None:
     with torch.inference_mode(False):
         _S.tree_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
     return _S.tree_vals
+
+
+def get_pl_bufs(device: torch.device) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return fixed-address (int64[6] copy chain, int32[2] [len, n]) prompt-lookup buffers (CUDA-graph safe)."""
+    if not ENABLED or TREE_M == 0 or device.type != "cuda":
+        return None
+    if (
+        _S.pl_tok is not None
+        and _S.pl_meta is not None
+        and _S.pl_tok.device == device
+        and _S.pl_meta.device == device
+        and not _S.pl_tok.is_inference()
+        and not _S.pl_meta.is_inference()
+    ):
+        return _S.pl_tok, _S.pl_meta
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    with torch.inference_mode(False):
+        _S.pl_tok = torch.full((6,), -1, dtype=torch.int64, device=device)
+        _S.pl_meta = torch.zeros((2,), dtype=torch.int32, device=device)
+    return _S.pl_tok, _S.pl_meta
 
 
 def init_kv_table(
@@ -391,10 +427,10 @@ def init_kv_table(
             _S._atexit_registered = True
             atexit.register(_dump_stats, "atexit")
     logger.info(
-        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, dynamic=%d [calib=%d,depth<=%d,T=%.2f,tail=%.1f,g=%.2f,adapt=%d,sub=%.2f,shf=%.2f,cont=%.2f,hi_cpc=%.1f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d, stats=%d)",
+        "native_leaf: armed (%d target GQA-16 layers, tree_m=%d, dynamic=%d [calib=%d,depth<=%d,T=%.2f,tail=%.1f,g=%.2f,adapt=%d,sub=%.2f,shf=%.2f,cont=%.2f,hi_cpc=%.1f], m8=%d, policy=%s, alpha=%.2f, thresh<=%d, selftest=%d, nohit=%d, stats=%d, prompt_lookup=%d)",
         _S.num_layers, _S.tree_m_ready, int(TREE_DYNAMIC), int(TREE_CALIB), TREE_MAX_DEPTH, TREE_TEMP, TREE_TAIL, TREE_GAMMA,
         int(TREE_ADAPT_GAMMA), TREE_SUB_COEF, TREE_SHF_COEF, TREE_CONT_DECAY, TREE_HIGH_ACC_CPC,
-        int(_S.m8_ready), _POLICY_RAW, MARGIN_ALPHA, LOW_THRESH, int(SELFTEST), int(NOHIT), int(LEAF_STATS),
+        int(_S.m8_ready), _POLICY_RAW, MARGIN_ALPHA, LOW_THRESH, int(SELFTEST), int(NOHIT), int(LEAF_STATS), int(PL_ENABLED),
     )
     return True
 
@@ -414,6 +450,9 @@ def on_non_leaf_step(req_id: str | None, num_draft_tokens: int) -> None:
     if req_id is None or req_id != _S._last_req_id or num_draft_tokens == 0:
         if LEAF_STATS and _S._last_req_id is not None and (req_id != _S._last_req_id or num_draft_tokens == 0):
             _dump_stats(str(_S._last_req_id))
+        if req_id is None or req_id != _S._last_req_id:
+            _S._clamps = 0
+            _S._since_clamp = 0
         _S._last_req_id = req_id
         _S.prev_ns.fill_(7)
         _S.alt_ids.fill_(-1)
@@ -425,9 +464,15 @@ def on_non_leaf_step(req_id: str | None, num_draft_tokens: int) -> None:
             _S.tree_vals.fill_(-1e30)
         _S.req_acc_state.zero_()
     elif 0 < num_draft_tokens < 6:
-        # Ceiling shortened depth on high-acceptance request -> hard-latch leaf mode off.
+        # Ceiling shortened depth on a high-acceptance request -> hard-latch leaf mode off once clamps repeat.
         _S.prev_ns.fill_(7)
-        _S.req_acc_state[2:3].fill_(2)
+        _S._clamps += 1
+        _S._since_clamp = 0
+        if _S._clamps >= LATCH_AFTER_CLAMPS:
+            _S.req_acc_state[2:3].fill_(2)
+        if _S._clamps <= 8:
+            logger.info("native_leaf: ceiling clamp %d (depth %d)%s", _S._clamps, num_draft_tokens,
+                        " -> leaves latched off" if _S._clamps >= LATCH_AFTER_CLAMPS else "")
 
 
 @torch.no_grad()
@@ -461,8 +506,14 @@ def setup_step(
     slot_mappings: torch.Tensor,
     m8_mode: bool = False,
     verify_m: int | None = None,
+    all_token_ids: torch.Tensor | None = None,
+    total_len: torch.Tensor | None = None,
+    req_idx: int | None = None,
 ) -> bool:
-    """Zero-sync GPU setup for a bs=1, depth=6 verify step (tree M=12/16, M=8 zero-clamp, or legacy M=7)."""
+    """Zero-sync GPU setup for a bs=1, depth=6 verify step (tree M=12/16, M=8 zero-clamp, or legacy M=7).
+
+    all_token_ids/total_len/req_idx (optional) feed the prompt-lookup copy candidates (tree mode only).
+    """
     if not _S.ready:
         return False
     bfx = _get_bfx()
@@ -491,6 +542,8 @@ def setup_step(
     if req_id != _S._last_req_id:
         if LEAF_STATS and _S._last_req_id is not None:
             _dump_stats(str(_S._last_req_id))
+        _S._clamps = 0
+        _S._since_clamp = 0
         _S._last_req_id = req_id
         _S.prev_ns.fill_(7)
         _S.alt_ids.fill_(-1)
@@ -502,11 +555,33 @@ def setup_step(
             _S.tree_vals.fill_(-1e30)
         _S.req_acc_state.zero_()
     if eff_m > 8:
+        # Full-depth tree step: no clamp this round. Re-arm leaves after a clamp-free streak.
+        _S._since_clamp += 1
+        if _S._clamps >= LATCH_AFTER_CLAMPS and _S._since_clamp == LEAF_RELATCH_ROUNDS:
+            _S.req_acc_state[2:3].fill_(0)
+            if _S._clamps <= 32:
+                logger.info("native_leaf: leaves back on after %d clamp-free rounds (clamps so far %d)",
+                            LEAF_RELATCH_ROUNDS, _S._clamps)
         assert (
             _S.tree_top is not None
             and _S.saved_leaf_toks is not None
             and _S.saved_leaf_k is not None
         )
+        pl_tok = pl_meta = None
+        if (
+            PL_ENABLED
+            and all_token_ids is not None
+            and total_len is not None
+            and req_idx is not None
+            and hasattr(bfx, "native_leaf_prompt_lookup")
+        ):
+            bufs = get_pl_bufs(input_ids.device)
+            if bufs is not None:
+                pl_tok, pl_meta = bufs
+                # Suffix-match over committed history (t0 is the last token); 1 block, GPU-only, no sync.
+                bfx.native_leaf_prompt_lookup(
+                    all_token_ids, total_len, int(req_idx), pl_tok, pl_meta, PL_WINDOW
+                )
         try:
             bfx.native_leaf_setup_tree(
                 _S.leaf_flag,
@@ -528,6 +603,8 @@ def setup_step(
                 TREE_SUB_COEF,
                 TREE_SHF_COEF,
                 TREE_CONT_DECAY,
+                pl_tok=pl_tok,
+                pl_meta=pl_meta,
             )
         except TypeError:
             bfx.native_leaf_setup_tree(

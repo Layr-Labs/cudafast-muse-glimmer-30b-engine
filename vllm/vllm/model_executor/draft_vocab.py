@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -38,6 +39,7 @@ logger = init_logger(__name__)
 
 _TOKEN_IDS: tuple[int, ...] | None = None
 _VOCAB_SIZE: int = 0
+_CODE_SYNTAX_CHARS: frozenset[str] = frozenset("_.:/\\()[]{}=<>+*%&\t\n;`")
 
 
 def get_draft_vocab_token_ids() -> tuple[int, ...] | None:
@@ -84,19 +86,28 @@ def _special_token_ids(model_dir: Path, vocab_size: int) -> set[int]:
     return found
 
 
-def _is_pure_ascii_token(tok_str: str, b2u_inv: dict[str, int]) -> bool:
-    """True if every decoded byte of a ByteLevel BPE token is ASCII (< 128)."""
+def _decode_pure_ascii(tok_str: str, b2u_inv: dict[str, int]) -> str | None:
+    """Return decoded ASCII string if every byte of ByteLevel BPE token is < 128, else None."""
     if not tok_str:
-        return False
+        return None
+    chars: list[str] = []
     for ch in tok_str:
         b = b2u_inv.get(ch)
         if b is not None:
             if b >= 128:
-                return False
+                return None
+            chars.append(chr(b))
         else:
-            if ord(ch) >= 128:
-                return False
-    return True
+            o = ord(ch)
+            if o >= 128:
+                return None
+            chars.append(ch)
+    return "".join(chars)
+
+
+def _is_pure_ascii_token(tok_str: str, b2u_inv: dict[str, int]) -> bool:
+    """True if every decoded byte of a ByteLevel BPE token is ASCII (< 128)."""
+    return _decode_pure_ascii(tok_str, b2u_inv) is not None
 
 
 def _is_single_byte_token(tok_str: str, b2u_inv: dict[str, int]) -> bool:
@@ -236,6 +247,7 @@ def configure_draft_vocab(
     vocab_map: dict[str, int] = model_obj.get("vocab", {})
     added_list = data.get("added_tokens", [])
     added_ids: set[int] = set()
+    non_reserved_special_ids: set[int] = set()
     id_to_str: dict[int, str] = {}
     for s, idx in vocab_map.items():
         if isinstance(idx, int) and idx >= 0:
@@ -244,7 +256,10 @@ def configure_draft_vocab(
         idx = entry.get("id")
         if isinstance(idx, int) and idx >= 0:
             added_ids.add(idx)
-            id_to_str.setdefault(idx, str(entry.get("content", "")))
+            content = str(entry.get("content", ""))
+            id_to_str.setdefault(idx, content)
+            if entry.get("special") and "reserved_special_token" not in content:
+                non_reserved_special_ids.add(idx)
 
     vocab_size = (max(id_to_str) + 1) if id_to_str else 0
     _VOCAB_SIZE = vocab_size
@@ -267,13 +282,22 @@ def configure_draft_vocab(
         if tid is not None and tid not in merge_rank:
             merge_rank[tid] = r
 
-    forced = _special_token_ids(model_path, vocab_size)
+    forced = _special_token_ids(model_path, vocab_size) | {
+        idx for idx in non_reserved_special_ids if 0 <= idx < vocab_size
+    }
     b2u_inv = _bytes_to_unicode_inv()
     mode_norm = mode.strip().lower()
     use_ascii_tier = mode_norm != "bpe"
+    code_boost = os.environ.get("MUSE_DRAFT_VOCAB_CODE_BOOST", "1").strip().lower() not in (
+        "0",
+        "",
+        "false",
+        "no",
+    )
 
-    tier0: list[int] = []  # forced special tokens + all single-byte base tokens
+    tier0: list[int] = []  # forced special tokens (<|eot|>, <|eom|>, etc.) + all single-byte base tokens
     tier1: list[tuple[int, int]] = []  # ASCII BPE tokens (or all BPE tokens in `bpe` mode)
+    tier1_code_ids: set[int] = set()
     tier2: list[tuple[int, int]] = []  # non-ASCII BPE tokens (in `ascii_bpe` mode)
     tier3: list[int] = []  # unforced added / placeholder tokens
 
@@ -289,10 +313,16 @@ def configure_draft_vocab(
             tier0.append(tid)
             continue
         rank = merge_rank.get(tid, len(merges) + tid)
-        if not use_ascii_tier or _is_pure_ascii_token(s, b2u_inv):
+        if not use_ascii_tier:
             tier1.append((rank, tid))
         else:
-            tier2.append((rank, tid))
+            da = _decode_pure_ascii(s, b2u_inv)
+            if da is not None:
+                tier1.append((rank, tid))
+                if code_boost and any(ch in _CODE_SYNTAX_CHARS for ch in da):
+                    tier1_code_ids.add(tid)
+            else:
+                tier2.append((rank, tid))
 
     tier0.sort()
     tier1.sort()
@@ -303,23 +333,30 @@ def configure_draft_vocab(
 
     chosen: list[int] = []
     chosen.extend(tier0)
-    chosen.extend(tid for _, tid in tier1)
+    if use_ascii_tier and code_boost and size >= 65536 and tier1_code_ids:
+        core_keep = max(0, size - 10304)
+        chosen.extend(tid for _, tid in tier1[:core_keep])
+        chosen.extend(tid for _, tid in tier1[core_keep:] if tid in tier1_code_ids)
+        chosen.extend(tid for _, tid in tier1[core_keep:] if tid not in tier1_code_ids)
+    else:
+        chosen.extend(tid for _, tid in tier1)
     chosen.extend(tid for _, tid in tier2)
     chosen.extend(tier3)
-    # Sort final selected IDs? Keeping sorted ID order preserves ascending original-ID locality
-    # in DRAM and makes ties deterministic.
+    # Keeping sorted ID order preserves ascending original-ID locality in DRAM and makes ties deterministic.
     selected = tuple(sorted(chosen[:size]))
     _TOKEN_IDS = selected
     ascii_count = sum(
         1 for tid in selected if _is_pure_ascii_token(id_to_str.get(tid, ""), b2u_inv)
     )
     logger.info(
-        "Reduced DFlash vocabulary (%s): selected %d / %d tokens "
-        "(forced+bytes=%d, ascii=%d, merges=%d)",
+        "Reduced DFlash vocabulary (%s, code_boost=%d): selected %d / %d tokens "
+        "(forced+bytes=%d, ascii=%d, code_syntax=%d, merges=%d)",
         mode_norm,
+        int(code_boost),
         len(selected),
         vocab_size,
         len(tier0),
         ascii_count,
+        sum(1 for tid in selected if tid in tier1_code_ids),
         len(merges),
     )
