@@ -77,6 +77,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
     get_uniform_token_count,
+    upload_cudagraph,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -1490,6 +1491,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             raw_g = self.model.logits_processor(self.model.lm_head, sample_hidden_states)
                             if raw_g is None or not lmpost_into(raw_g, mult, cap, outs[slot]):
                                 raise RuntimeError("lmpost_into refused during capture")
+                    upload_cudagraph(g, cap_st)
                     graphs.append(g)
             main_st.wait_stream(cap_st)
             outs[0].fill_(-1)
@@ -1607,6 +1609,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             and _lmp.greedy_verify(s_v, input_ids, logits_indices, n_s, n_r, verify_m)
                         ):
                             raise RuntimeError("verify lm_head+lmpost refused during capture")
+                    upload_cudagraph(g, cap_st)
                     graphs.append(g)
             main_st.wait_stream(cap_st)
             slot_bufs[0].fill_(-1)
@@ -1656,7 +1659,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or not self.cudagraph_manager._graphs_captured
             or torch.cuda.is_current_stream_capturing()
             or input_batch.num_reqs != 1
-            or not (1 <= input_batch.num_tokens <= 16)
+            or not (1 <= input_batch.num_tokens <= 32)
             or input_batch.num_tokens_after_padding != input_batch.num_tokens
             or int(input_batch.num_computed_tokens_np[0]) < int(input_batch.prefill_len_np[0])
         ):
@@ -1716,7 +1719,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 and getattr(_me, "is_single_kernel_m1", lambda: False)()
             )
             can_direct_mm = (
-                1 < n_tok <= 16
+                1 < n_tok <= 32
                 and getattr(_me, "is_single_kernel_m", lambda: False)()
             )
             if (
@@ -2520,6 +2523,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return input_batch, fwd_batch, block_tables, slot_mappings
 
     @torch.inference_mode()
+    def pre_launch_prefill(self, tokens: list[int], pool_free: bool) -> bool:
+        """Pre-launch the 512-token PrefillGraph on canonical block IDs before add_request/schedule."""
+        self._prelaunched_prefill = None
+        self._next_prefill_pool_free = bool(pool_free)
+        pg = self.prefill_graph
+        if (
+            not pool_free
+            or envs.os.environ.get("VLLM_PREFILL_PRELAUNCH", "1").strip() in ("0", "", "false", "no")
+            or pg is None
+            or not pg._zp_verified
+            or not pg._fast_verified
+            or not pg._zp_enabled
+            or pg._zp_failed
+            or pg.embed_input_ids is None
+            or getattr(pg, "_zp_canonical_block_ids", None) is None
+            or len(tokens) != pg.num_tokens
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        canon_bids = pg._zp_canonical_block_ids
+        self._flush_deferred_zp_writes()
+        self._flush_deferred_zp_leaf_reset()
+        if not pg.stage_zero_prep(
+            self.input_buffers,
+            self.block_tables,
+            tokens,
+            canon_bids,  # type: ignore[arg-type]
+            PAD_SLOT_ID,
+            bool(envs.VLLM_MOE_SKIP_PADDING),
+        ):
+            return False
+        model_output = pg.fast_replay()
+        pg._zp_replays += 1
+        self._prelaunched_prefill = (tuple(tokens), canon_bids, model_output)
+        return True
+
+    @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -2530,6 +2570,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         self._flush_deferred_zp_writes()
         self._flush_deferred_zp_leaf_reset()
+        pre_prefill = getattr(self, "_prelaunched_prefill", None)
+        self._prelaunched_prefill = None
+        was_pool_free = bool(getattr(self, "_next_prefill_pool_free", False))
+        self._next_prefill_pool_free = False
         if (
             not dummy_run
             and not is_profile
@@ -2539,11 +2583,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             pg = self.prefill_graph
             nr = scheduler_output.scheduled_new_reqs[0]
+            bids_tuple = tuple(tuple(b) for b in nr.block_ids)
+            if (
+                was_pool_free
+                and not scheduler_output.new_block_ids_to_zero
+                and all(all(x <= 256 for x in b) for b in bids_tuple)
+            ):
+                pg._zp_canonical_block_ids = bids_tuple
             self._single_decode_prep_armed = False
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
-            if pg.stage_zero_prep(
+            adopted_output = None
+            if (
+                pre_prefill is not None
+                and not scheduler_output.new_block_ids_to_zero
+                and pre_prefill[1] == bids_tuple
+                and nr.prefill_token_ids is not None
+                and tuple(nr.prefill_token_ids) == pre_prefill[0]
+            ):
+                self.kv_connector.pre_forward(scheduler_output)
+                adopted_output = pre_prefill[2]
+                if not getattr(pg, "_prelaunch_logged", False):
+                    pg._prelaunch_logged = True
+                    logger.info(
+                        "Prefill graph: canonical pre-launch adopted (SamplingParams + add_request + schedule overlapped)"
+                    )
+            elif pg.stage_zero_prep(
                 self.input_buffers,
                 self.block_tables,
                 nr.prefill_token_ids,  # type: ignore[arg-type]
@@ -2552,10 +2618,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 bool(envs.VLLM_MOE_SKIP_PADDING),
             ):
                 self.kv_connector.pre_forward(scheduler_output)
-                model_output = pg.fast_replay()
+                adopted_output = pg.fast_replay()
                 pg._zp_replays += 1
                 if pg._zp_replays == 1:
                     logger.info("Prefill graph: zero-prep launch active (host prep overlapped behind graph)")
+            if adopted_output is not None:
+                model_output = adopted_output
                 # Overlap CPU request/sampler/block-table bookkeeping behind the running ~240 ms GPU graph!
                 # Defer the 4 Triton _apply_write_kernel launches off the backbone->lm_head critical path
                 # until right after AsyncOutput records the sampled-token copy_event.
@@ -2646,8 +2714,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else 0
         )
         _target_leaf_m = _native_leaf.select_verify_m(_leaf_req_id, _leaf_decoded)
+        _emit_tgt = getattr(self, "_spec_emit_target_len", None)
+        if _emit_tgt is not None and _leaf_req_idx is not None:
+            _rem_toks = int(_emit_tgt) - int(
+                self.req_states.num_computed_tokens_np[_leaf_req_idx]
+            )
+            if _rem_toks <= 1:
+                _target_leaf_m = 7
+            elif _rem_toks <= 6 and _target_leaf_m > 16:
+                _target_leaf_m = 16
+        _leaf_no_logprobs = (
+            self.sampler is not None
+            and _leaf_req_idx is not None
+            and int(self.sampler.sampling_states.num_logprobs[_leaf_req_idx])
+            == NO_LOGPROBS
+        )
         extra_leaf_candidate = (
-            _target_leaf_m > 7
+            _leaf_no_logprobs
+            and _target_leaf_m > 7
             and not dummy_run
             and not is_profile
             and not skip_compiled
@@ -2810,7 +2894,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 fwd_batch = input_batch
                 if _native_leaf.ENABLED:
                     if (
-                        input_batch.num_reqs == 1
+                        _leaf_no_logprobs
+                        and input_batch.num_reqs == 1
                         and input_batch.num_draft_tokens == 6
                         and input_batch.num_tokens == 7
                         and slot_mappings is not None
@@ -3305,12 +3390,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ends and the sampling tail begins. A decode step needs no mark: the
         # host waits for it with the next step already queued.
         forward_done = None
+        _emit_tgt_end = getattr(self, "_spec_emit_target_len", None)
+        _is_final_spec_step = (
+            _emit_tgt_end is not None
+            and input_batch.num_reqs == 1
+            and int(self.req_states.num_computed_tokens_np[input_batch.idx_mapping_np[0]]) + 1
+            >= int(_emit_tgt_end)
+        )
         # Speculative verify steps (num_draft_tokens > 0) are decode steps: no
-        # event and no tail spin-poll (from i34-9 e95c7eaa cut 5).
+        # event and no tail spin-poll except on the guaranteed final drained step.
         if (
             input_batch.num_reqs == 1
             and input_batch.num_tokens > 1
-            and input_batch.num_draft_tokens == 0
+            and (input_batch.num_draft_tokens == 0 or _is_final_spec_step)
         ):
             forward_done = torch.cuda.Event(blocking=True)
             forward_done.record(self.main_stream)
@@ -3432,10 +3524,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculator is not None:
             req_ids = input_batch.req_ids
             idx_np = input_batch.idx_mapping_np
-            skip_draft = len(req_ids) > 0 and all(
-                int(self.req_states.max_seq_len[idx_np[i]])
-                <= int(self.req_states.prompt_len.np[idx_np[i]]) + 1
-                for i in range(len(req_ids))
+            skip_draft = _is_final_spec_step or (
+                len(req_ids) > 0
+                and all(
+                    int(self.req_states.max_seq_len[idx_np[i]])
+                    <= int(self.req_states.prompt_len.np[idx_np[i]]) + 1
+                    for i in range(len(req_ids))
+                )
             )
             if not skip_draft:
                 assert self.sampler is not None

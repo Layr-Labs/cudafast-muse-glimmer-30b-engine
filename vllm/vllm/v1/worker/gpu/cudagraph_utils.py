@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -112,6 +113,38 @@ def get_uniform_token_count(
     ):
         return max_query_len
     return None
+
+
+_cudart_upload_fn: Any = False
+
+
+def upload_cudagraph(
+    graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream | None = None
+) -> None:
+    """Eagerly upload an instantiated CUDAGraph to the device via cudaGraphUpload
+    so first replay avoids lazy driver upload jitter."""
+    global _cudart_upload_fn
+    if _cudart_upload_fn is False:
+        try:
+            import ctypes
+
+            lib = ctypes.CDLL("libcudart.so")
+            fn = lib.cudaGraphUpload
+            fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            fn.restype = ctypes.c_int
+            _cudart_upload_fn = fn
+        except Exception:
+            _cudart_upload_fn = None
+    if _cudart_upload_fn is None:
+        return
+    try:
+        exec_ptr = int(graph.raw_cuda_graph_exec())
+        if not exec_ptr:
+            return
+        st = stream if stream is not None else current_platform.current_stream()
+        _cudart_upload_fn(ctypes.c_void_p(exec_ptr), ctypes.c_void_p(int(st.cuda_stream)))
+    except Exception:
+        pass
 
 
 class CudaGraphManager:
@@ -488,7 +521,7 @@ class CudaGraphManager:
                             )
                         cap_stream = torch.cuda.graph.default_capture_stream
                         if (
-                            1 <= desc.num_tokens <= 16
+                            1 <= desc.num_tokens <= 32
                             and persist_arena is not None
                             and persist_arena_bytes > 0
                         ):
@@ -546,6 +579,7 @@ class CudaGraphManager:
                                 l2pf.summary(),
                             )
                         self.graphs[desc] = graph
+                        upload_cudagraph(graph, cap_stream)
                         compilation_counter.num_cudagraph_captured += 1
         if persisted_graph_count > 0 and persist_arena is not None:
             try:

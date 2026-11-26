@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
+import os
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -28,6 +29,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+_CANONICAL_HEAD = max(0, int(os.environ.get("VLLM_CANONICAL_BLOCK_HEAD", "256")))
 
 
 class BlockHashToBlockMap:
@@ -740,6 +742,28 @@ class BlockPool:
         # Blocks without hash get evicted first - prepend them last to the tail
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
+        if (
+            _CANONICAL_HEAD > 0
+            and not self.enable_caching
+            and self.free_block_queue.num_free_blocks == self.num_gpu_blocks - 1
+        ):
+            self._canonical_head()
+
+    def _canonical_head(self) -> None:
+        """Restore canonical block IDs 1..K at the head of the free queue when fully idle."""
+        queue = self.free_block_queue
+        k = min(_CANONICAL_HEAD, self.num_gpu_blocks - 1)
+        block = queue.fake_free_list_head.next_free_block
+        block_id = 1
+        while block_id <= k and block is not None and block.block_id == block_id:
+            block = block.next_free_block
+            block_id += 1
+        if block_id > k:
+            return
+        head = self.blocks[1 : k + 1]
+        for block in head:
+            queue.remove(block)
+        queue.prepend_n(head)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.

@@ -921,7 +921,7 @@ __global__ void __launch_bounds__(128, 3) draft_head_fast_kernel(
   for (int p = 0; p < preload; ++p) {
     const int kg = p % num_kg;
     reinterpret_cast<uint4*>(smem.pipe.a[p])[tid] =
-        __ldg(&reinterpret_cast<const uint4*>(a_stage_ptr(kg))[tid]);
+        reinterpret_cast<const uint4*>(a_stage_ptr(kg))[tid];
   }
   __syncthreads();
 
@@ -2698,9 +2698,9 @@ __global__ void dhf_select_topk_kernel(
   __syncthreads();
 
 #pragma unroll
-  for (int pass = 0; pass < 3; ++pass) {
+  for (int pass = 0; pass < 4; ++pass) {
     const uint32_t shift = static_cast<uint32_t>(24 - pass * 8);
-    const uint32_t mask = (pass == 0) ? 0u : ((pass == 1) ? 0xFF000000u : 0xFFFF0000u);
+    const uint32_t mask = (pass == 0) ? 0u : (~0u << (32 - pass * 8));
     const uint32_t pref = s_prefix;
     s_hist[tid] = 0u;
     __syncthreads();
@@ -2731,10 +2731,10 @@ __global__ void dhf_select_topk_kernel(
     __syncthreads();
   }
 
-  const uint32_t thresh = s_prefix;  // exact top-24-bit threshold (bits 31..8)
-  // Emit strictly greater items first.
+  const uint32_t thresh = s_prefix;  // exact 32-bit float key threshold
+  // Emit strictly greater items first (strictly < K_cand items match, so all of them fit).
   for (int i = tid; i < N_in; i += 256) {
-    if ((s_keys[i] & 0xFFFFFF00u) > thresh && s_ids[i] >= 0) {
+    if (s_keys[i] > thresh && s_ids[i] >= 0) {
       const uint32_t slot = atomicAdd(&s_out_cnt, 1u);
       if (slot < static_cast<uint32_t>(K_cand)) {
         out[slot] = s_ids[i];
@@ -2743,13 +2743,24 @@ __global__ void dhf_select_topk_kernel(
   }
   __syncthreads();
 
-  // Fill remaining slots up to K_cand with items matching the 24-bit threshold bucket.
-  for (int i = tid; i < N_in; i += 256) {
-    if ((s_keys[i] & 0xFFFFFF00u) == thresh && s_ids[i] >= 0) {
-      const uint32_t slot = atomicAdd(&s_out_cnt, 1u);
-      if (slot < static_cast<uint32_t>(K_cand)) {
-        out[slot] = s_ids[i];
+  // Deterministically compact remaining slots up to K_cand from exact 32-bit tie bucket on warp 0.
+  if (tid < 32) {
+    uint32_t cur = s_out_cnt;
+    const uint32_t cap = static_cast<uint32_t>(K_cand);
+    for (int base = 0; base < N_in && cur < cap; base += 32) {
+      const int i = base + tid;
+      const bool hit = (i < N_in) && (s_keys[i] == thresh) && (s_ids[i] >= 0);
+      const uint32_t bmask = __ballot_sync(0xffffffffu, hit);
+      if (bmask != 0u) {
+        const uint32_t slot = cur + static_cast<uint32_t>(__popc(bmask & ((1u << tid) - 1u)));
+        if (hit && slot < cap) {
+          out[slot] = s_ids[i];
+        }
+        cur += static_cast<uint32_t>(__popc(bmask));
       }
+    }
+    if (tid == 0) {
+      s_out_cnt = (cur < cap) ? cur : cap;
     }
   }
   __syncthreads();
@@ -2862,8 +2873,8 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_kernel(
   if (use_smem_a) {
     const uint4* a_u4 = reinterpret_cast<const uint4*>(a_row);
     for (int g = tid; g < num_g; g += 256) {
-      s_a0[g] = __ldg(&a_u4[g * 2 + 0]);
-      s_a1[g] = __ldg(&a_u4[g * 2 + 1]);
+      s_a0[g] = a_u4[g * 2 + 0];
+      s_a1[g] = a_u4[g * 2 + 1];
     }
     __syncthreads();
   }
@@ -2877,11 +2888,11 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_kernel(
   const int stride_w = kS2CTAsPerRow * kS2Warps;  // 128
 
   // Phase A (before PDL wait): score dynamic prompt-tail OOV rows (already ready in memory!).
-  int tcnt = __ldg(tail_count);
+  int tcnt = tail_count[0];
   if (tcnt < 0) tcnt = 0;
   if (tcnt > max_tail) tcnt = max_tail;
   for (int idx = bid * kS2Warps + warp; idx < tcnt; idx += stride_w) {
-    const int tok = __ldg(&tail_ids[idx]);
+    const int tok = tail_ids[idx];
     if (tok >= 0) {
       const float val = dhf_warp_nvfp4_dot(
           a_row, s_a0, s_a1, use_smem_a, raw_w, raw_s, tok, K, num_g, lane, total_scale);
@@ -2899,7 +2910,7 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_kernel(
   // Phase B: score static shortlist candidates against exact raw NVFP4 weights.
   const int32_t* my_cands = cand_ids + static_cast<size_t>(m) * K_cand;
   for (int idx = bid * kS2Warps + warp; idx < K_cand; idx += stride_w) {
-    const int tok = __ldg(&my_cands[idx]);
+    const int tok = my_cands[idx];
     if (tok >= 0) {
       const float val = dhf_warp_nvfp4_dot(
           a_row, s_a0, s_a1, use_smem_a, raw_w, raw_s, tok, K, num_g, lane, total_scale);
