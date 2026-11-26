@@ -14,13 +14,9 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include <cuda_device_runtime_api.h>
 #include <cmath>
 #include <cstdlib>
-#include <cstring>
-#include <mutex>
 #include <stdint.h>
-#include <unordered_map>
 
 namespace {
 
@@ -145,6 +141,14 @@ struct TrKnobs {
   float ch_near_t6;      // child continuation prob on conflict-free near-frontier recycled unigram in DFlash top-6
   float ch_near_oov;     // child continuation prob on conflict-free near-frontier OOV recycled unigram
   float ch_t6_agree;     // child continuation prob when monomorphic (cnt>=2, tier0>=1) 30B & DFlash top-6 agree
+  float b_d1_tri;        // log-odds boost to DFlash top-1 (rk==0) on monomorphic 30B recycled trigram match
+  float b_d1_bg;         // log-odds boost to DFlash top-1 (rk==0) on tier-0 confirmed 30B recycled bigram match
+  float b_d1_near;       // log-odds boost to DFlash top-1 (rk==0) on fresh age==1 near-frontier 30B consensus
+  float uniq_tri3_root_p;// OOV/copy root weight on single-occurrence prompt 4-gram with rare 3-gram suffix
+  float rare_bg2_root_p; // OOV/copy root weight on rare-anchor (u1<=2) monomorphic prompt 3-gram
+  float det_bg2_2_root_p;// OOV/copy root weight on 2-occurrence unanimous prompt 3-gram (u1<=6)
+  float ch_a1_bg_t6;     // child continuation prob on fresh age==1 (dist<=8) 30B bigram in DFlash top-6
+  float ch_a1_bg_oov;    // child continuation prob on fresh age==1 (dist<=8) 30B OOV bigram
 };
 
 struct AntiChimeraKnobs {
@@ -158,351 +162,18 @@ struct AntiChimeraKnobs {
   float rev_alpha;       // smoothing for N_in(v)
   float rev_cap;         // max reverse log-odds penalty
   float ent_lambda;      // entropy-coupling chimera discount on unverified off-chain sub (rp==0)
+  float ddtree_w;        // DDTree position-specific local margin weight in [0, 1]
+  float lh_copy_w;       // 1-step copy-chain lookahead tie-breaker weight (non-compounding)
+  float root_fwd_lambda; // depth-1 root forward chimera penalty when N(anc)>=5 && (anc->alt)==0
 };
 
-struct CascadeKnobs {
-  int mode;             // 0=off, 1=enabled
-  int denoise_mode;     // 1=enable Action 2 (main-chain prefix denoising at m in {2,3}; default 0)
-  int force_all;        // 1=diagnostic force trigger on every eligible step
-  int max_b;            // max bifurcation slot b in 0..max_b (default 3 -> slots 0..3)
-  int max_r;            // max runner-up rank r in 1..max_r (default 2 -> ranks #2..#3)
-  float min_p;          // min effective reach probability for branch (default 0.09)
-  float min_qrel;       // min scale-invariant within-top6 runner-up share q_rel(b,r) (default 0.15)
-  float min_ev;         // min expected extra token EV to trigger Pass 2 (default 0.22)
-  float branch_gain;    // expected extra tokens per remaining slot (5 - b) (default 0.58)
-  float denoise_min_a;  // min prefix reachability A_m to trigger denoise (default 0.50)
-  float denoise_max_p1; // max p_1(m) fog threshold to trigger denoise (default 0.60)
-  float denoise_gain;   // expected extra tokens per remaining slot (6 - m) * fog (default 0.44)
-  float ddtree_w;       // DDTree local margin weight in [0, 1] (default 0.35)
-  float lookahead_w;    // 1-step lookahead priority tie-breaker for kind==8 nodes (default 0.30)
-  float backup_w;       // Pass-1 backup branch floor weight on mode==2 divergence (default 0.45)
+struct TailDropKnobs {
+  int mode;              // 0=off, 1=suffix-correlation-safe zero-clobber dynamic tail-drop
+  int min_chain;         // min kept main-chain prefix d1..d_{min_chain} (default 4 -> repurposes d5..d6)
+  float max_suf_p1;      // protect d_k whenever any suffix m>=k-1 has s_p1[m] >= max_suf_p1 (default 0.55)
+  float chain_bias;      // multiplier on correlated main-chain tail EV (default 1.15)
+  float corr_exp;        // positive-correlation exponent on cumulative s_A[j] (default 0.78)
 };
-
-struct CascadePrepArgs {
-  int32_t* input_ids;
-  const int64_t* query_positions;
-  const int64_t* draft_tokens;
-  const int64_t* tree_top;
-  const float* tree_vals;
-  const int64_t* alt_ids;
-  const float* alt_margins;
-  const int32_t* req_acc_state;
-  int32_t* cascade_meta;
-  int64_t* p1_save_draft;
-  int64_t* p1_save_top;
-  float* p1_save_vals;
-  int64_t* p1_save_alt;
-  float* p1_save_margins;
-  int64_t* stats;
-  int stats_len;
-  int32_t mask_token_id;
-  int calib_mode;
-  CalibKnobs ck;
-  BgEbKnobs bg;
-  CascadeKnobs csk;
-  cudaGraphConditionalHandle cond_handle;
-  int has_cond_handle;
-};
-
-__global__ void __launch_bounds__(64) dflash_cascade_gate_prep_kernel(CascadePrepArgs a) {
-  const int tid = threadIdx.x;
-  if (tid < 36) {
-    a.p1_save_top[tid] = a.tree_top[tid];
-    a.p1_save_vals[tid] = a.tree_vals[tid];
-  }
-  if (tid < 6) {
-    a.p1_save_draft[tid] = a.draft_tokens[tid];
-  }
-  if (tid < 4 && a.alt_ids != nullptr && a.p1_save_alt != nullptr) {
-    a.p1_save_alt[tid] = a.alt_ids[tid];
-  }
-  if (tid < 2 && a.alt_margins != nullptr && a.p1_save_margins != nullptr) {
-    a.p1_save_margins[tid] = a.alt_margins[tid];
-  }
-  __syncthreads();
-
-  const bool high_acc = (a.req_acc_state != nullptr && a.req_acc_state[2] != 0);
-  if (a.csk.mode == 0 || high_acc) {
-    if (tid == 0) {
-      a.cascade_meta[0] = 0;
-      if (a.has_cond_handle != 0) {
-        cudaGraphSetConditional(a.cond_handle, 0u);
-      }
-    }
-    return;
-  }
-
-  __shared__ float s_z0[6];
-  __shared__ float s_margin[6];
-  __shared__ uint8_t s_valid[6];
-  __shared__ float s_pr[6][6];
-  __shared__ float s_qrel[6][6];
-
-  if (tid < 6) {
-    const int base = tid * 6;
-    const int64_t dk = a.p1_save_draft[tid];
-    const int64_t top1 = a.p1_save_top[base + 0];
-    const float z0 = a.p1_save_vals[base + 0];
-    const bool ok = (dk >= 0 && dk < 202048 && top1 == dk && z0 > -1e20f);
-    s_valid[tid] = ok ? 1 : 0;
-    s_z0[tid] = z0;
-    const int64_t top2 = a.p1_save_top[base + 1];
-    const float z1 = a.p1_save_vals[base + 1];
-    s_margin[tid] = (ok && top2 >= 0 && z1 > -1e20f) ? (z0 - z1) : 2.5f;
-  }
-  __syncthreads();
-
-  if (tid < 6) {
-    const int base = tid * 6;
-    if (s_valid[tid] != 0) {
-      float eb_delta_a = 0.0f;
-      if (a.bg.eb_mode != 0 && a.req_acc_state != nullptr) {
-        const int32_t rr = a.req_acc_state[0];
-        const int32_t cc = a.req_acc_state[1];
-        if (rr >= a.bg.eb_min_r && cc > 0) {
-          const float mean_ns = static_cast<float>(cc) / static_cast<float>(rr);
-          const float den_m = (mean_ns - 0.35f > 0.25f) ? (mean_ns - 0.35f) : 0.25f;
-          float p_hat = (mean_ns - 1.35f) / den_m;
-          if (p_hat < 0.35f) p_hat = 0.35f;
-          if (p_hat > 0.92f) p_hat = 0.92f;
-          const float p0 = a.bg.eb_p0;
-          const float p_post = (static_cast<float>(rr) * p_hat + a.bg.eb_tau * p0) /
-                               (static_cast<float>(rr) + a.bg.eb_tau);
-          const float da = (__logf(p_post / (1.0f - p_post)) - __logf(p0 / (1.0f - p0))) * a.bg.eb_scale;
-          eb_delta_a = (da < a.bg.eb_lo) ? a.bg.eb_lo : ((da > a.bg.eb_hi) ? a.bg.eb_hi : da);
-        }
-      }
-      const float sm_mean = (s_margin[0] + s_margin[1] + s_margin[2] +
-                             s_margin[3] + s_margin[4] + s_margin[5]) * (1.0f / 6.0f);
-      float sm_c = ((a.csk.ddtree_w > 0.0f)
-                        ? (a.csk.ddtree_w * s_margin[tid] + (1.0f - a.csk.ddtree_w) * sm_mean)
-                        : sm_mean) - 2.5f;
-      if (sm_c < -2.0f) sm_c = -2.0f;
-      if (sm_c > 2.5f) sm_c = 2.5f;
-      float z0_c = s_z0[tid] - a.ck.z0_center;
-      if (z0_c < -10.0f) z0_c = -10.0f;
-      if (z0_c > 6.0f) z0_c = 6.0f;
-      const float a_pre = kCalA[tid] + a.ck.a_shift + eb_delta_a +
-                          a.ck.w_sm_pre * sm_c + a.ck.w_z0_pre * z0_c;
-      float e0[6];
-      float erel[6];
-      float den0 = 1.0f;
-      float den_rel = 0.0f;
-#pragma unroll
-      for (int rk = 0; rk < 6; ++rk) {
-        const int64_t tok_r = a.p1_save_top[base + rk];
-        const float zr = a.p1_save_vals[base + rk];
-        if (rk == 0 || (tok_r >= 0 && tok_r < 202048 && zr > -1e20f)) {
-          const float g = kCalC[rk] + a.ck.beta * (zr - s_z0[tid]);
-          erel[rk] = __expf(g);
-          e0[rk] = __expf(a_pre + g);
-        } else {
-          erel[rk] = 0.0f;
-          e0[rk] = 0.0f;
-        }
-        den_rel += erel[rk];
-        den0 += e0[rk];
-      }
-      const float inv_rel = (den_rel > 0.0f) ? (1.0f / den_rel) : 0.0f;
-#pragma unroll
-      for (int rk = 0; rk < 6; ++rk) {
-        s_pr[tid][rk] = e0[rk] / den0;
-        s_qrel[tid][rk] = erel[rk] * inv_rel;
-      }
-    } else {
-#pragma unroll
-      for (int rk = 0; rk < 6; ++rk) {
-        s_pr[tid][rk] = 0.0f;
-        s_qrel[tid][rk] = 0.0f;
-      }
-    }
-  }
-  __syncthreads();
-
-  if (tid == 0) {
-    if (a.stats != nullptr && a.stats_len >= 48) {
-      a.stats[40] += 1;
-    }
-    float A[6];
-    float A_rel[6];
-    float acc = 1.0f;
-    float acc_rel = 1.0f;
-    for (int j = 0; j < 6; ++j) {
-      A[j] = acc;
-      A_rel[j] = acc_rel;
-      if (s_valid[j] != 0) {
-        acc *= s_pr[j][0];
-        const float p0_eff = (s_pr[j][0] > 0.80f * s_qrel[j][0]) ? s_pr[j][0] : (0.80f * s_qrel[j][0]);
-        acc_rel *= p0_eff;
-      } else {
-        acc = 0.0f;
-        acc_rel = 0.0f;
-      }
-    }
-
-    float best_ev = -1.0f;
-    int best_mode = 0;
-    int best_b = 0;
-    int best_r = 1;
-    int64_t best_tok = -1;
-
-    const int max_b = (a.csk.max_b < 0) ? 0 : ((a.csk.max_b > 4) ? 4 : a.csk.max_b);
-    const int max_r = (a.csk.max_r < 1) ? 1 : ((a.csk.max_r > 5) ? 5 : a.csk.max_r);
-
-    // Action 1: Scale-invariant Multi-Future Branch (b in 0..max_b, r in 1..max_r).
-    for (int b = 0; b <= max_b; ++b) {
-      if (s_valid[b] == 0 || !(A_rel[b] >= 0.18f)) break;
-      const int64_t dk_b = a.p1_save_draft[b];
-      for (int r = 1; r <= max_r; ++r) {
-        const int64_t alt_tok = a.p1_save_top[b * 6 + r];
-        if (alt_tok < 0 || alt_tok >= 202048 || alt_tok == dk_b) continue;
-        bool dup = false;
-        for (int pr = 1; pr < r; ++pr) {
-          if (a.p1_save_top[b * 6 + pr] == alt_tok) {
-            dup = true;
-            break;
-          }
-        }
-        if (dup) continue;
-        const float qr = s_qrel[b][r];
-        if (qr < a.csk.min_qrel) continue;
-        const float pr_eff = (s_pr[b][r] > 0.78f * qr) ? s_pr[b][r] : (0.78f * qr);
-        const float p_reach = A_rel[b] * pr_eff;
-        if (p_reach >= a.csk.min_p) {
-          const float ev = p_reach * (a.csk.branch_gain * static_cast<float>(5 - b));
-          if (ev > best_ev) {
-            best_ev = ev;
-            best_mode = 1;
-            best_b = b;
-            best_r = r;
-            best_tok = alt_tok;
-          }
-        }
-      }
-    }
-
-    // Action 2: Iterative Main-Chain Prefix Denoising at m in {2, 3}
-    if (a.csk.denoise_mode != 0) {
-      for (int m = 2; m <= 3; ++m) {
-        if (s_valid[m] != 0 && A[m] >= a.csk.denoise_min_a && s_pr[m][0] <= a.csk.denoise_max_p1) {
-          const float p1_next = (m + 1 < 6 && s_valid[m + 1] != 0) ? s_pr[m + 1][0] : s_pr[m][0];
-          const float fog = 0.60f * (1.0f - s_pr[m][0]) + 0.40f * (1.0f - p1_next);
-          const float ev = A[m] * fog * (a.csk.denoise_gain * static_cast<float>(6 - m));
-          if (ev > best_ev) {
-            best_ev = ev;
-            best_mode = 2;
-            best_b = m - 1;
-            best_r = 0;
-            best_tok = a.p1_save_draft[m - 1];
-          }
-        }
-      }
-    }
-
-    if (a.csk.force_all != 0 && best_mode == 0 && s_valid[0] != 0 && a.p1_save_top[1] >= 0 &&
-        a.p1_save_top[1] < 202048 && a.p1_save_top[1] != a.p1_save_draft[0]) {
-      best_mode = 1;
-      best_b = 0;
-      best_r = 1;
-      best_tok = a.p1_save_top[1];
-      best_ev = 1.0f;
-    }
-
-    if (best_mode != 0 && best_tok >= 0 && best_tok < 202048 &&
-        (best_ev >= a.csk.min_ev || a.csk.force_all != 0)) {
-      for (int j = 0; j < best_b; ++j) {
-        a.input_ids[1 + j] = static_cast<int32_t>(a.p1_save_draft[j]);
-      }
-      a.input_ids[1 + best_b] = static_cast<int32_t>(best_tok);
-      for (int j = best_b + 1; j < 15; ++j) {
-        a.input_ids[1 + j] = a.mask_token_id;
-      }
-      a.cascade_meta[0] = best_mode;
-      a.cascade_meta[1] = best_b;
-      a.cascade_meta[2] = best_r;
-      a.cascade_meta[3] = static_cast<int32_t>(best_tok);
-      a.cascade_meta[4] = static_cast<int32_t>(a.query_positions[0]);
-      if (a.stats != nullptr && a.stats_len >= 48) {
-        a.stats[(best_mode == 1) ? 41 : 42] += 1;
-      }
-      if (a.has_cond_handle != 0) {
-        cudaGraphSetConditional(a.cond_handle, 1u);
-      }
-    } else {
-      a.cascade_meta[0] = 0;
-      if (a.has_cond_handle != 0) {
-        cudaGraphSetConditional(a.cond_handle, 0u);
-      }
-    }
-  }
-}
-
-__global__ void __launch_bounds__(64) dflash_cascade_post_restore_kernel(
-    int32_t* __restrict__ input_ids,
-    int64_t* __restrict__ draft_tokens,
-    int64_t* __restrict__ tree_top,
-    float* __restrict__ tree_vals,
-    int64_t* __restrict__ alt_ids,
-    float* __restrict__ alt_margins,
-    const int32_t* __restrict__ cascade_meta,
-    int64_t* __restrict__ cascade_toks,
-    float* __restrict__ cascade_vals,
-    const int64_t* __restrict__ p1_save_draft,
-    const int64_t* __restrict__ p1_save_top,
-    const float* __restrict__ p1_save_vals,
-    const int64_t* __restrict__ p1_save_alt,
-    const float* __restrict__ p1_save_margins,
-    int32_t mask_token_id) {
-  const int tid = threadIdx.x;
-  if (tid < 15) {
-    input_ids[1 + tid] = mask_token_id;
-  }
-  const int mode = cascade_meta[0];
-  const int b_star = cascade_meta[1];
-  if (mode == 1) {
-    // Future-B branch: save Pass-2 top-6 into cascade_toks/vals and restore Pass-1 main chain.
-    if (tid < 36) {
-      cascade_toks[tid] = tree_top[tid];
-      cascade_vals[tid] = tree_vals[tid];
-    }
-    __syncthreads();
-    if (tid < 36) {
-      tree_top[tid] = p1_save_top[tid];
-      tree_vals[tid] = p1_save_vals[tid];
-    }
-    if (tid < 6) {
-      draft_tokens[tid] = p1_save_draft[tid];
-    }
-    if (tid < 4 && alt_ids != nullptr && p1_save_alt != nullptr) {
-      alt_ids[tid] = p1_save_alt[tid];
-    }
-    if (tid < 2 && alt_margins != nullptr && p1_save_margins != nullptr) {
-      alt_margins[tid] = p1_save_margins[tid];
-    }
-  } else if (mode == 2) {
-    // Main-chain prefix denoising at m = b_star + 1: save Pass-1 into cascade_toks/vals as backup,
-    // restore prefix 0..m-1 from Pass-1, and keep Pass-2's denoised suffix m..5 on main chain!
-    const int m = (b_star + 1 < 1) ? 1 : ((b_star + 1 > 5) ? 5 : (b_star + 1));
-    if (tid < 36) {
-      cascade_toks[tid] = p1_save_top[tid];
-      cascade_vals[tid] = p1_save_vals[tid];
-    }
-    __syncthreads();
-    if (tid < 6 * m) {
-      tree_top[tid] = p1_save_top[tid];
-      tree_vals[tid] = p1_save_vals[tid];
-    }
-    if (tid < m) {
-      draft_tokens[tid] = p1_save_draft[tid];
-    }
-    if (tid < 4 && (tid / 2) < m && alt_ids != nullptr && p1_save_alt != nullptr) {
-      alt_ids[tid] = p1_save_alt[tid];
-    }
-    if (tid < 2 && tid < m && alt_margins != nullptr && p1_save_margins != nullptr) {
-      alt_margins[tid] = p1_save_margins[tid];
-    }
-  }
-}
 
 // Arbitrary-depth (1..6-level) dynamic multi-leaf tree setup (rows 7..tree_m-1), launched as <<<1, 256>>> (~3.5 us):
 //   - Bit-packed remap inside int32[49] (1 + 16*3):
@@ -553,13 +224,14 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     int tr_cap,
     int vocab_size,
     AntiChimeraKnobs ac,
-    int32_t* __restrict__ cascade_meta,
-    const int64_t* __restrict__ cascade_toks,
-    const float* __restrict__ cascade_vals,
-    CascadeKnobs csk) {
+    int allow_tail_drop,
+    TailDropKnobs td) {
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
+  __shared__ int s_row_base_sub[16];
+  __shared__ int s_row_depth[16];
+  __shared__ uint32_t s_row_packed[16];
   if (tid == 0 && saved_pos0 != nullptr) {
     saved_pos0[0] = positions[0];
   }
@@ -594,16 +266,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   const int num_leaves = tree_m - 7;
   if (dynamic_mode == 0 || selftest_mode != 0 || tree_vals == nullptr || tree_k < 6) {
     if (tid == 0) {
-      if (cascade_meta != nullptr) {
-        cascade_meta[0] = 0;
-        cascade_meta[5] = 0;
-        cascade_meta[6] = 0;
-      }
+      saved_leaf_k[0] = 6;
       constexpr int kLeafK[9] = {1, 1, 2, 2, 3, 1, 3, 4, 5};
       constexpr int kLeafRank[9] = {1, 2, 1, 2, 1, 3, 2, 1, 1};
-      int row_base_sub[16];
-      int row_depth[16];
-      uint32_t row_packed[16];
       bool any_active = false;
       for (int li = 0; li < num_leaves; ++li) {
         const int r = 7 + li;
@@ -641,13 +306,13 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             dp = 1;
             pkd = static_cast<uint32_t>(r) & 0xFu;
           } else {
-            b_sub = row_base_sub[par];
-            dp = row_depth[par] + 1;
-            pkd = row_packed[par] | ((static_cast<uint32_t>(r) & 0xFu) << (4 * (dp - 1)));
+            b_sub = s_row_base_sub[par];
+            dp = s_row_depth[par] + 1;
+            pkd = s_row_packed[par] | ((static_cast<uint32_t>(r) & 0xFu) << (4 * (dp - 1)));
           }
-          row_base_sub[r] = b_sub;
-          row_depth[r] = dp;
-          row_packed[r] = pkd;
+          s_row_base_sub[r] = b_sub;
+          s_row_depth[r] = dp;
+          s_row_packed[r] = pkd;
           input_ids[r] = static_cast<int32_t>(cand);
           positions[r] = positions[k];
           saved_leaf_toks[r] = cand;
@@ -659,9 +324,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           leaf_flag[1 + 3 * r + 1] = b_sub;
           leaf_flag[1 + 3 * r + 2] = static_cast<int32_t>(pkd);
         } else {
-          row_base_sub[r] = -1;
-          row_depth[r] = 0;
-          row_packed[r] = 0u;
+          s_row_base_sub[r] = -1;
+          s_row_depth[r] = 0;
+          s_row_packed[r] = 0u;
           input_ids[r] = input_ids[0];
           saved_leaf_toks[r] = -1;
           saved_leaf_k[r] = 0;
@@ -750,53 +415,33 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __shared__ int8_t s_cand_k[96];
   __shared__ int8_t s_cand_par[96];
   __shared__ int8_t s_cand_depth[96];
-  __shared__ int8_t s_cand_kind[96];  // 0=1-level, 1=sub, 2=shift, 3=alt2, 4=pl_root, 5=pl_cont, 6=coh_cont, 7=tr, 8=casc_chain, 9=casc_alt
+  __shared__ int8_t s_cand_kind[96];  // 0=1-level, 1=sub, 2=shift, 3=alt2, 4=pl_root, 5=pl_cont, 6=coh_cont, 7=tr
   __shared__ int16_t s_cand_hpos[96]; // index in s_h matching s_cand_tok (-1 if none)
   __shared__ int8_t s_cand_ml[96];    // history match length 0..16
   __shared__ int8_t s_cand_rk[96];    // rank 0..5 in row (k-1), or -1 if non-top6
   __shared__ int s_num_cands;
-  __shared__ int s_casc_mode;
-  __shared__ int s_casc_b;
-  __shared__ int s_casc_r;
-  __shared__ int64_t s_casc_top[6][2];
-  __shared__ float s_casc_p1[6];
-  __shared__ float s_casc_p2[6];
 
-  __shared__ int s_row_base_sub[16];
-  __shared__ uint32_t s_row_packed[16];
+  // Zero-spill SMEM scratch + Suffix-Correlation-Safe Dynamic Tail-Drop DDTree workspace.
+  __shared__ int32_t s_spawned[12];
+  __shared__ float s_p_post_vec[6];
+  __shared__ int s_chain_len;
+  __shared__ int s_n_off;
+  __shared__ int s_use_td;
+  __shared__ int s_total_slots;
+  __shared__ uint8_t s_j_unlocked[6];
+  __shared__ int32_t s_sel_tok[16];
+  __shared__ int8_t s_sel_k[16];
+  __shared__ int8_t s_sel_par_idx[16];
+  __shared__ int8_t s_sel_dp[16];
+  __shared__ int8_t s_sel_kind[16];
+  __shared__ int32_t s_sel_prv[16];
+  __shared__ int32_t s_sel_prv2[16];
+  __shared__ int s_row_of[16];
+  __shared__ int64_t s_p0_base;
 
-  // Pass 1: validate rows, gather context tokens & top-6 IDs, and verify fail-closed history + recycle + cascade sync.
+  // Pass 1: validate rows, gather context tokens & top-6 IDs, and verify fail-closed history + recycle sync.
   if (tid == 0) {
     const int64_t p0 = positions[0];
-    int cm = 0, cb = 0, cr = 0;
-    if (cascade_meta != nullptr) {
-      const int raw_m = cascade_meta[0];
-      const int raw_b = cascade_meta[1];
-      const int raw_r = cascade_meta[2];
-      const int32_t raw_tok = cascade_meta[3];
-      const int32_t raw_pos0 = cascade_meta[4];
-      cascade_meta[0] = 0;
-      cascade_meta[5] = 0;
-      cascade_meta[6] = 0;
-      if (!high_acc && csk.mode != 0 && cascade_toks != nullptr && cascade_vals != nullptr &&
-          (raw_m == 1 || raw_m == 2) && raw_b >= 0 && raw_b <= 4 &&
-          raw_tok >= 0 && raw_tok < vocab_size &&
-          static_cast<int32_t>(p0) == raw_pos0) {
-        if (raw_m == 1 && raw_r >= 1 && raw_r <= 5 &&
-            tree_top[raw_b * tree_k + raw_r] == static_cast<int64_t>(raw_tok)) {
-          cm = 1;
-          cb = raw_b;
-          cr = raw_r;
-        } else if (raw_m == 2 && raw_r == 0 && raw_b + 1 <= 5) {
-          cm = 2;
-          cb = raw_b;
-          cr = 0;
-        }
-      }
-    }
-    s_casc_mode = cm;
-    s_casc_b = cb;
-    s_casc_r = cr;
     const bool h_ok = (!high_acc && hist != nullptr && hist_len != nullptr &&
                        p0 >= 1 && p0 < hist_cap &&
                        hist_len[0] == static_cast<int32_t>(p0 + 1) &&
@@ -1117,7 +762,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       int near_c = 0, near_min = 2147483647, near_max = -1;
       int a1_pos_c = 0, a1_pos_min = 2147483647, a1_pos_max = -1;
       int a1_bg_c = 0, a1_bg_min = 2147483647, a1_bg_max = -1;
-      int tot_a1 = 0, a1_v1 = 0, a1_v2 = 0, a1_v3 = 0, a1_v4 = 0, a1_v5 = 0;
+      int t0_bg_c = 0;
+      int tot_a1 = 0, a1_v0 = 0, a1_v1 = 0, a1_v2 = 0, a1_v3 = 0, a1_v4 = 0, a1_v5 = 0;
+      const int32_t t0 = s_top[j][0];
       const int32_t t1 = s_top[j][1], t2 = s_top[j][2], t3 = s_top[j][3], t4 = s_top[j][4], t5 = s_top[j][5];
 
       for (int idx = lane; idx < n_act; idx += 32) {
@@ -1138,6 +785,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         if (age == 1 && dist <= 8) {
           const int w = (tier_t == 0) ? 2 : 1;
           tot_a1 += w;
+          if (u_t == t0) a1_v0 += w;
           if (u_t == t1) a1_v1 += w;
           if (u_t == t2) a1_v2 += w;
           if (u_t == t3) a1_v3 += w;
@@ -1161,6 +809,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         }
         if (prv1 >= 0 && p1_t == prv1) {
           bg_c += 1;
+          if (tier_t == 0) t0_bg_c += 1;
           if (u_t < bg_min) bg_min = u_t;
           if (u_t > bg_max) bg_max = u_t;
           if (prv2 >= 0 && p2_t == prv2) {
@@ -1176,6 +825,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         u_min = __reduce_min_sync(0xffffffffu, u_min);
         u_max = __reduce_max_sync(0xffffffffu, u_max);
         bg_c = __reduce_add_sync(0xffffffffu, bg_c);
+        t0_bg_c = __reduce_add_sync(0xffffffffu, t0_bg_c);
         bg_min = __reduce_min_sync(0xffffffffu, bg_min);
         bg_max = __reduce_max_sync(0xffffffffu, bg_max);
         tri_c = __reduce_add_sync(0xffffffffu, tri_c);
@@ -1191,6 +841,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         a1_bg_min = __reduce_min_sync(0xffffffffu, a1_bg_min);
         a1_bg_max = __reduce_max_sync(0xffffffffu, a1_bg_max);
         tot_a1 = __reduce_add_sync(0xffffffffu, tot_a1);
+        a1_v0 = __reduce_add_sync(0xffffffffu, a1_v0);
         a1_v1 = __reduce_add_sync(0xffffffffu, a1_v1);
         a1_v2 = __reduce_add_sync(0xffffffffu, a1_v2);
         a1_v3 = __reduce_add_sync(0xffffffffu, a1_v3);
@@ -1198,17 +849,28 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         a1_v5 = __reduce_add_sync(0xffffffffu, a1_v5);
 
         if (lane == 0) {
-          const int a1_v[6] = {0, a1_v1, a1_v2, a1_v3, a1_v4, a1_v5};
           const uint32_t anc_u1 = s_anc_u1_cnt[j];
+          if (t0 >= 0) {
+            float b0 = 0.0f;
+            if (tri_c >= 1 && tri_min == tri_max && tri_min == t0 && tr.b_d1_tri > b0) b0 = tr.b_d1_tri;
+            if (bg_c >= 2 && bg_min == bg_max && bg_min == t0 && t0_bg_c >= 1 && tr.b_d1_bg > b0) b0 = tr.b_d1_bg;
+            if (tot_a1 >= 2 && a1_v0 * 3 >= tot_a1 * 2 && anc_u1 <= 3u && tr.b_d1_near > b0) b0 = tr.b_d1_near;
+            s_tr_b_rk[j][0] = b0;
+            if (b0 > 0.0f && stats != nullptr && stats_len >= 48) {
+              stats[41] += 1;
+            }
+          }
+#pragma unroll
           for (int rk = 1; rk < 6; ++rk) {
             const int32_t cand = s_top[j][rk];
             if (cand < 0) continue;
+            const int a1_vr = (rk == 1) ? a1_v1 : ((rk == 2) ? a1_v2 : ((rk == 3) ? a1_v3 : ((rk == 4) ? a1_v4 : a1_v5)));
             float b = 0.0f;
             if (tri_c >= 1 && tri_min == tri_max && tri_min == cand && tr.b_t6_tri > b) b = tr.b_t6_tri;
             if (bg_c >= 1 && bg_min == bg_max && bg_min == cand && tr.b_t6_bg > b) b = tr.b_t6_bg;
             if (near_c >= 1 && near_min == near_max && near_min == cand && u_min == u_max && anc_u1 <= 3u) {
               if (tr.b_t6_near > b) b = tr.b_t6_near;
-            } else if (tot_a1 >= 2 && a1_v[rk] * 3 >= tot_a1 * 2 && anc_u1 <= 3u) {
+            } else if (tot_a1 >= 2 && a1_vr * 3 >= tot_a1 * 2 && anc_u1 <= 3u) {
               if (tr.b_t6_near > b) b = tr.b_t6_near;
             }
             s_tr_b_rk[j][rk] = b;
@@ -1236,34 +898,34 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     __syncwarp();
   }
 
-  // Pass 3 (warp 0 only): calibrated probabilities + online Empirical-Bayes + DDTree + Multi-Future Cascade 9-leaf EV tree.
+  // Pass 3 (warp 0 only): calibrated probabilities + online Empirical-Bayes + n-gram & Markov bigram 9-leaf EV tree.
   if (tid < 6) {
     const int base = tid * tree_k;
     const float z0 = s_z0[tid];
     const bool row_ok = (s_valid_row[tid] != 0);
-    float eb_delta_a = 0.0f;
-    if (calib_mode != 0 && bg.eb_mode != 0 && req_acc_state != nullptr) {
-      const int32_t rr = req_acc_state[0];
-      const int32_t cc = req_acc_state[1];
-      if (rr >= bg.eb_min_r && cc > 0) {
-        const float mean_ns = static_cast<float>(cc) / static_cast<float>(rr);
-        const float den_m = (mean_ns - 0.35f > 0.25f) ? (mean_ns - 0.35f) : 0.25f;
-        float p_hat = (mean_ns - 1.35f) / den_m;
-        if (p_hat < 0.35f) p_hat = 0.35f;
-        if (p_hat > 0.92f) p_hat = 0.92f;
-        const float p0 = bg.eb_p0;
-        const float p_post = (static_cast<float>(rr) * p_hat + bg.eb_tau * p0) /
-                             (static_cast<float>(rr) + bg.eb_tau);
-        const float da = (__logf(p_post / (1.0f - p_post)) - __logf(p0 / (1.0f - p0))) * bg.eb_scale;
-        eb_delta_a = (da < bg.eb_lo) ? bg.eb_lo : ((da > bg.eb_hi) ? bg.eb_hi : da);
-      }
-    }
-    const float sm_mean = (s_margin[0] + s_margin[1] + s_margin[2] +
-                           s_margin[3] + s_margin[4] + s_margin[5]) * (1.0f / 6.0f);
     if (row_ok) {
       if (calib_mode != 0) {
-        float sm_c = ((csk.ddtree_w > 0.0f)
-                          ? (csk.ddtree_w * s_margin[tid] + (1.0f - csk.ddtree_w) * sm_mean)
+        float eb_delta_a = 0.0f;
+        if (bg.eb_mode != 0 && req_acc_state != nullptr) {
+          const int32_t rr = req_acc_state[0];
+          const int32_t cc = req_acc_state[1];
+          if (rr >= bg.eb_min_r && cc > 0) {
+            const float mean_ns = static_cast<float>(cc) / static_cast<float>(rr);
+            const float den_m = (mean_ns - 0.35f > 0.25f) ? (mean_ns - 0.35f) : 0.25f;
+            float p_hat = (mean_ns - 1.35f) / den_m;
+            if (p_hat < 0.35f) p_hat = 0.35f;
+            if (p_hat > 0.92f) p_hat = 0.92f;
+            const float p0 = bg.eb_p0;
+            const float p_post = (static_cast<float>(rr) * p_hat + bg.eb_tau * p0) /
+                                 (static_cast<float>(rr) + bg.eb_tau);
+            const float da = (__logf(p_post / (1.0f - p_post)) - __logf(p0 / (1.0f - p0))) * bg.eb_scale;
+            eb_delta_a = (da < bg.eb_lo) ? bg.eb_lo : ((da > bg.eb_hi) ? bg.eb_hi : da);
+          }
+        }
+        const float sm_mean = (s_margin[0] + s_margin[1] + s_margin[2] +
+                               s_margin[3] + s_margin[4] + s_margin[5]) * (1.0f / 6.0f);
+        float sm_c = ((ac.ddtree_w > 0.0f)
+                          ? (ac.ddtree_w * s_margin[tid] + (1.0f - ac.ddtree_w) * sm_mean)
                           : sm_mean) - 2.5f;
         if (sm_c < -2.0f) sm_c = -2.0f;
         if (sm_c > 2.5f) sm_c = 2.5f;
@@ -1275,6 +937,12 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         const float a_post = a_base + ck.a2 + ck.w_z0_post * z0_c;
         float e0[6], e1[6];
         float den0 = 1.0f, den1 = 1.0f;
+        const uint32_t root_u1 = (s_hist_ok != 0) ? s_anc_u1_cnt[tid] : 0u;
+        const bool root_d1_bg = (s_hist_ok != 0) && ((s_cand_key[tid][0] >> 16) >= 1u);
+        const float root_ac_pen = (ac.ac_mode != 0 && ac.root_fwd_lambda > 0.0f && root_u1 >= 5u && root_d1_bg)
+            ? fminf(0.75f, ac.root_fwd_lambda * __logf(static_cast<float>(root_u1 + 1u) * 0.25f))
+            : 0.0f;
+        bool any_root_ac = false;
 #pragma unroll
         for (int rk = 0; rk < 6; ++rk) {
           const int64_t tok_r = tree_top[base + rk];
@@ -1282,15 +950,20 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           if (rk == 0 || (tok_r >= 0 && zr > -1e20f)) {
             const float dz = zr - z0;
             float b_pl = 0.0f;
+            int raw_ml = 0;
             if (pl.mode != 0 && s_hist_ok != 0) {
-              const int raw_ml = static_cast<int>(s_cand_key[tid][rk] >> 16);
+              raw_ml = static_cast<int>(s_cand_key[tid][rk] >> 16);
               if (raw_ml >= 1) {
                 const int ml = (raw_ml > 6) ? 6 : raw_ml;
                 b_pl = (rk == 0) ? pl.boost_d1[ml] : pl.boost_alt[ml];
               }
             }
             const float b_tr = s_tr_b_rk[tid][rk];
-            const float b_eff = (b_pl > b_tr) ? b_pl : b_tr;
+            float b_eff = (b_pl > b_tr) ? b_pl : b_tr;
+            if (rk >= 1 && root_ac_pen > 0.0f && raw_ml == 0 && b_tr == 0.0f) {
+              b_eff -= root_ac_pen;
+              any_root_ac = true;
+            }
             const float g0 = kCalC[rk] + ck.beta * dz + b_eff;
             const float g1 = kCalC[rk] + ck.beta_post * dz;
             e0[rk] = __expf(a_pre + g0);
@@ -1301,6 +974,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           }
           den0 += e0[rk];
           den1 += e1[rk];
+        }
+        if (any_root_ac && stats != nullptr && stats_len >= 48) {
+          atomicAdd(reinterpret_cast<unsigned long long*>(&stats[44]), 1ULL);
         }
 #pragma unroll
         for (int rk = 0; rk < 6; ++rk) {
@@ -1351,68 +1027,6 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         s_e1[tid][rk] = 0.0f;
       }
     }
-
-    // Calibrate Pass-2 coherent Future-B (mode==1) or Pass-1 saved backup (mode==2) logits.
-    s_casc_top[tid][0] = -1;
-    s_casc_top[tid][1] = -1;
-    s_casc_p1[tid] = 0.0f;
-    s_casc_p2[tid] = 0.0f;
-    if (s_casc_mode != 0 && cascade_toks != nullptr && cascade_vals != nullptr) {
-      const int cbase = tid * 6;
-      const int64_t ct0 = cascade_toks[cbase + 0];
-      const float cz0 = cascade_vals[cbase + 0];
-      if (ct0 >= 0 && ct0 < static_cast<int64_t>(vocab_size) && cz0 > -1e20f) {
-        s_casc_top[tid][0] = ct0;
-        const int64_t ct1 = cascade_toks[cbase + 1];
-        const float cz1 = cascade_vals[cbase + 1];
-        if (ct1 >= 0 && ct1 < static_cast<int64_t>(vocab_size) && ct1 != ct0 && cz1 > -1e20f) {
-          s_casc_top[tid][1] = ct1;
-        }
-        const float cm_loc = (ct1 >= 0 && cz1 > -1e20f) ? (cz0 - cz1) : 2.5f;
-        float c_sm = ((csk.ddtree_w > 0.0f)
-                          ? (csk.ddtree_w * cm_loc + (1.0f - csk.ddtree_w) * sm_mean)
-                          : sm_mean) - 2.5f;
-        if (c_sm < -2.0f) c_sm = -2.0f;
-        if (c_sm > 2.5f) c_sm = 2.5f;
-        float c_z0 = cz0 - ck.z0_center;
-        if (c_z0 < -10.0f) c_z0 = -10.0f;
-        if (c_z0 > 6.0f) c_z0 = 6.0f;
-        const int rel_j = (s_casc_mode == 1 && tid > s_casc_b) ? (tid - (s_casc_b + 1)) : tid;
-        const float ca_pre = kCalA[rel_j] + ck.a_shift + eb_delta_a +
-                             ck.w_sm_pre * c_sm + ck.w_z0_pre * c_z0;
-        float ce[6];
-        float cerel[6];
-        float cden = 1.0f;
-        float cden_rel = 0.0f;
-#pragma unroll
-        for (int rk = 0; rk < 6; ++rk) {
-          const int64_t ctr = cascade_toks[cbase + rk];
-          const float czr = cascade_vals[cbase + rk];
-          if (rk == 0 || (ctr >= 0 && ctr < static_cast<int64_t>(vocab_size) && czr > -1e20f)) {
-            const float cg = kCalC[rk] + ck.beta * (czr - cz0);
-            cerel[rk] = __expf(cg);
-            ce[rk] = __expf(ca_pre + cg);
-          } else {
-            cerel[rk] = 0.0f;
-            ce[rk] = 0.0f;
-          }
-          cden_rel += cerel[rk];
-          cden += ce[rk];
-        }
-        const float cinv_rel = (cden_rel > 0.0f) ? (1.0f / cden_rel) : 0.0f;
-        const float cp1_raw = ce[0] / cden;
-        const float cp2_raw = (s_casc_top[tid][1] >= 0) ? (ce[1] / cden) : 0.0f;
-        if (s_casc_mode == 1 && tid > s_casc_b) {
-          const float cq1 = cerel[0] * cinv_rel;
-          const float cq2 = (s_casc_top[tid][1] >= 0) ? (cerel[1] * cinv_rel) : 0.0f;
-          s_casc_p1[tid] = (cp1_raw > 0.78f * cq1) ? cp1_raw : (0.78f * cq1);
-          s_casc_p2[tid] = (cp2_raw > 0.72f * cq2) ? cp2_raw : (0.72f * cq2);
-        } else {
-          s_casc_p1[tid] = cp1_raw;
-          s_casc_p2[tid] = cp2_raw;
-        }
-      }
-    }
   }
   __syncwarp();
 
@@ -1430,6 +1044,15 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     s_num_cands = 30;
   }
   __syncwarp();
+
+  auto cand_lh = [&](int k_pos, int hpos_v, int ml_v) -> float {
+    if (ac.lh_copy_w > 0.0f && k_pos < 6 && pl.mode != 0 && s_hist_ok != 0 &&
+        hpos_v >= 0 && hpos_v + 1 < s_win && ml_v >= pl.cont_from_df_n) {
+      const int nml = (ml_v + 1 > 6) ? 6 : (ml_v + 1);
+      return 1.0f + ac.lh_copy_w * pl.cont_p[nml];
+    }
+    return 1.0f;
+  };
 
   // Initialize 30 1-level DFlash candidates in slots 0..29, clear slots 30..95.
   s_cand_score[tid] = -1.0f;
@@ -1469,21 +1092,25 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             ? s_pr[row_idx][rank]
             : (eff_gamma * __expf((zr - s_z0[row_idx]) * inv_temp) / s_Z[row_idx]);
         const float cprob = s_A[row_idx] * pr;
-        s_cand_score[tid] = cprob;
+        int hp_i = -1;
+        int ml_i = 0;
+        if (pl.mode != 0 && s_hist_ok != 0) {
+          const uint32_t ck_j = s_cand_key[row_idx][rank];
+          if (ck_j != 0u) {
+            hp_i = static_cast<int>((ck_j & 0xFFFFu) + 1u);
+            ml_i = static_cast<int>(ck_j >> 16);
+            s_cand_hpos[tid] = static_cast<int16_t>(hp_i);
+            s_cand_ml[tid] = static_cast<int8_t>(ml_i);
+          }
+        }
         s_cand_prob[tid] = cprob;
+        s_cand_score[tid] = cprob * cand_lh(row_idx + 1, hp_i, ml_i);
         s_cand_tok[tid] = cand;
         s_cand_k[tid] = static_cast<int8_t>(row_idx + 1);
         s_cand_par[tid] = -1;
         s_cand_depth[tid] = 1;
         s_cand_kind[tid] = 0;
         s_cand_rk[tid] = static_cast<int8_t>(rank);
-        if (pl.mode != 0 && s_hist_ok != 0) {
-          const uint32_t ck_j = s_cand_key[row_idx][rank];
-          if (ck_j != 0u) {
-            s_cand_hpos[tid] = static_cast<int16_t>((ck_j & 0xFFFFu) + 1u);
-            s_cand_ml[tid] = static_cast<int8_t>(ck_j >> 16);
-          }
-        }
       }
     }
   }
@@ -1495,6 +1122,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     bool any_boost = false;
     bool any_tr_boost = false;
     bool any_tr_root = false;
+    bool any_rare_pl = false;
     for (int j = 0; j < 6; ++j) {
       if (!s_valid_row[j] || !(s_A[j] > 0.0f)) continue;
       for (int rk = 0; rk < 6; ++rk) {
@@ -1519,6 +1147,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         float t6w = (pl.mode != 0 && raw_ml >= min_req && ml >= 1)
             ? ((pl.t6_root_p[ml] > 0.0f) ? pl.t6_root_p[ml] : pl.root_p[ml])
             : 0.0f;
+        bool is_rare_pl = false;
         if (rw == 0.0f && tr.det_sh_root != 0) {
           const int32_t dk32 = static_cast<int32_t>(s_dk[j]);
           if (s_anc_tri3_cnt[j] >= 2u && s_anc_tri3_min[j] >= 0 &&
@@ -1535,6 +1164,30 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             rw = tr.det_bg2_root_p;
             t6w = rw;
             eff_ml = 3;
+          } else if (s_anc_bg2_cnt[j] == 2u && s_anc_u1_cnt[j] <= 6u &&
+                     s_anc_bg2_min[j] >= 0 && s_anc_bg2_min[j] == s_anc_bg2_max[j] &&
+                     s_anc_bg2_min[j] != dk32 && s_p1[j] < 0.85f && tr.det_bg2_2_root_p > 0.0f) {
+            hpos = s_anc_bg2_hp[j];
+            rw = tr.det_bg2_2_root_p;
+            t6w = rw + 0.04f;
+            eff_ml = 3;
+            is_rare_pl = true;
+          } else if (raw_ml >= 3 && s_anc_tri3_cnt[j] == 1u && s_anc_bg2_cnt[j] <= 2u &&
+                     hpos >= 0 && hpos < s_win && s_h[hpos] != dk32 &&
+                     s_p1[j] < 0.84f && tr.uniq_tri3_root_p > 0.0f) {
+            rw = tr.uniq_tri3_root_p;
+            t6w = rw + 0.04f;
+            eff_ml = 3;
+            is_rare_pl = true;
+          } else if (raw_ml >= 2 && s_anc_u1_cnt[j] >= 1u && s_anc_u1_cnt[j] <= 2u &&
+                     s_anc_bg2_cnt[j] >= 1u && s_anc_bg2_min[j] >= 0 &&
+                     s_anc_bg2_min[j] == s_anc_bg2_max[j] && s_anc_bg2_min[j] != dk32 &&
+                     s_p1[j] < 0.80f && tr.rare_bg2_root_p > 0.0f) {
+            hpos = s_anc_bg2_hp[j];
+            rw = tr.rare_bg2_root_p;
+            t6w = rw + 0.04f;
+            eff_ml = 3;
+            is_rare_pl = true;
           }
         }
         if (rw > 0.0f && hpos >= 0 && hpos < s_win) {
@@ -1558,23 +1211,25 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
               }
             }
             if (ex_slot >= 0) {
+              if (s_cand_hpos[ex_slot] < 0 || eff_ml > static_cast<int>(s_cand_ml[ex_slot])) {
+                s_cand_hpos[ex_slot] = static_cast<int16_t>(hpos);
+                s_cand_ml[ex_slot] = static_cast<int8_t>(eff_ml);
+              }
               if (pl.in_top6_floor != 0) {
                 const float t6_s = s_A[j] * (1.0f - s_p1[j]) * t6w * j_scale;
                 const float fl_s = (t6_s > pl_s) ? t6_s : pl_s;
                 if (fl_s > s_cand_prob[ex_slot]) {
                   s_cand_prob[ex_slot] = fl_s;
-                  s_cand_score[ex_slot] = fl_s;
                   any_pl_root = true;
+                  if (is_rare_pl) any_rare_pl = true;
                 }
               }
-              if (s_cand_hpos[ex_slot] < 0 || eff_ml > static_cast<int>(s_cand_ml[ex_slot])) {
-                s_cand_hpos[ex_slot] = static_cast<int16_t>(hpos);
-                s_cand_ml[ex_slot] = static_cast<int8_t>(eff_ml);
-              }
+              s_cand_score[ex_slot] = s_cand_prob[ex_slot] * cand_lh(
+                  j + 1, static_cast<int>(s_cand_hpos[ex_slot]), static_cast<int>(s_cand_ml[ex_slot]));
             } else if (pl_s > 0.0f && s_num_cands < 96) {
               const int slot = s_num_cands++;
-              s_cand_score[slot] = pl_s;
               s_cand_prob[slot] = pl_s;
+              s_cand_score[slot] = pl_s * cand_lh(j + 1, hpos, eff_ml);
               s_cand_tok[slot] = tok;
               s_cand_k[slot] = static_cast<int8_t>(j + 1);
               s_cand_par[slot] = -1;
@@ -1584,6 +1239,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
               s_cand_ml[slot] = static_cast<int8_t>(eff_ml);
               s_cand_rk[slot] = -1;
               any_pl_root = true;
+              if (is_rare_pl) any_rare_pl = true;
             }
           }
         }
@@ -1609,13 +1265,14 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           if (ex_slot >= 0) {
             if (tr_s > s_cand_prob[ex_slot]) {
               s_cand_prob[ex_slot] = tr_s;
-              s_cand_score[ex_slot] = tr_s;
+              s_cand_score[ex_slot] = tr_s * cand_lh(
+                  j + 1, static_cast<int>(s_cand_hpos[ex_slot]), static_cast<int>(s_cand_ml[ex_slot]));
               any_tr_root = true;
             }
           } else if (tr_s > 0.0f && s_num_cands < 96) {
             const int slot = s_num_cands++;
-            s_cand_score[slot] = tr_s;
             s_cand_prob[slot] = tr_s;
+            s_cand_score[slot] = tr_s;
             s_cand_tok[slot] = otok;
             s_cand_k[slot] = static_cast<int8_t>(j + 1);
             s_cand_par[slot] = -1;
@@ -1636,107 +1293,99 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         if (any_tr_boost) stats[36] += 1;
         if (any_tr_root) stats[37] += 1;
       }
-    }
-  }
-  // Seed Multi-Future Cascade root (mode==1 Future-B branch, or mode==2 first diverging Pass-1 backup).
-  if (tid == 0 && s_casc_mode != 0) {
-    if (s_casc_mode == 1) {
-      const int ex = s_casc_b * 5 + (s_casc_r - 1);
-      if (ex >= 0 && ex < 30 && s_cand_prob[ex] > 0.0f) {
-        // Prevent low-z0 / EB OOV inflation from starving the Future-B root when no OOV PL match exists.
-        const int b_base = s_casc_b * tree_k;
-        const float bz0 = tree_vals[b_base + 0];
-        float bden_rel = 0.0f;
-        float ber_star = 0.0f;
-        for (int rk = 0; rk < 6; ++rk) {
-          const int64_t btok = tree_top[b_base + rk];
-          const float bzr = tree_vals[b_base + rk];
-          if (rk == 0 || (btok >= 0 && bzr > -1e20f)) {
-            const float ev = __expf(kCalC[rk] + ck.beta * (bzr - bz0));
-            bden_rel += ev;
-            if (rk == s_casc_r) ber_star = ev;
-          }
-        }
-        if (bden_rel > 0.0f) {
-          const float b_floor = s_A[s_casc_b] * (0.72f * (ber_star / bden_rel));
-          if (b_floor > s_cand_prob[ex]) {
-            s_cand_prob[ex] = b_floor;
-          }
-        }
-        s_cand_kind[ex] = 8;
-        const float lh = (s_casc_b + 1 < 6) ? (1.0f + csk.lookahead_w * s_casc_p1[s_casc_b + 1]) : 1.0f;
-        s_cand_score[ex] = s_cand_prob[ex] * lh;
-      }
-    } else if (s_casc_mode == 2) {
-      int m_div = -1;
-      for (int mj = s_casc_b + 1; mj < 6; ++mj) {
-        if (s_valid_row[mj] && s_A[mj] > 0.0f && s_casc_top[mj][0] >= 0 && s_casc_top[mj][0] != s_dk[mj]) {
-          m_div = mj;
-          break;
-        }
-      }
-      if (m_div >= 1) {
-        if (cascade_meta != nullptr) {
-          cascade_meta[6] = m_div + 1;
-        }
-        if (stats != nullptr && stats_len >= 48) {
-          stats[46] += 1;
-        }
-        const int64_t old_tok = s_casc_top[m_div][0];
-        const float p_bk = s_A[m_div] * csk.backup_w * (1.0f - s_p1[m_div]) * s_casc_p1[m_div];
-        const float lh = (m_div + 1 < 6) ? (1.0f + csk.lookahead_w * s_casc_p1[m_div + 1]) : 1.0f;
-        int ex_slot = -1;
-        for (int r = 0; r < 5; ++r) {
-          const int sl = m_div * 5 + r;
-          if (s_cand_prob[sl] > -0.5f && s_cand_tok[sl] == old_tok) {
-            ex_slot = sl;
-            break;
-          }
-        }
-        if (ex_slot >= 0) {
-          const float eff_p = (p_bk > s_cand_prob[ex_slot]) ? p_bk : s_cand_prob[ex_slot];
-          s_cand_prob[ex_slot] = eff_p;
-          s_cand_score[ex_slot] = eff_p * lh;
-          s_cand_kind[ex_slot] = 8;
-        } else if (p_bk > 0.0f && s_num_cands < 96) {
-          const int slot = s_num_cands++;
-          s_cand_prob[slot] = p_bk;
-          s_cand_score[slot] = p_bk * lh;
-          s_cand_tok[slot] = old_tok;
-          s_cand_k[slot] = static_cast<int8_t>(m_div + 1);
-          s_cand_par[slot] = -1;
-          s_cand_depth[slot] = 1;
-          s_cand_kind[slot] = 8;
-          s_cand_hpos[slot] = -1;
-          s_cand_ml[slot] = 0;
-          s_cand_rk[slot] = -1;
-        }
+      if (stats_len >= 48 && any_rare_pl) {
+        stats[43] += 1;
       }
     }
   }
   __syncwarp();
 
-  uint32_t casc_row_mask = 0u;
-  for (int li = 0; li < num_leaves; ++li) {
-    const int r = 7 + li;
-    const int nc = s_num_cands;
-    float best_s = (tid < nc) ? s_cand_score[tid] : -1.0f;
-    int best_idx = tid;
-    const int idx2 = tid + 32;
-    if (idx2 < nc) {
-      const float s2 = s_cand_score[idx2];
-      if (s2 > best_s) {
-        best_s = s2;
-        best_idx = idx2;
+  auto push_chain_cand = [&](int cj) {
+    if (cj < 6 && s_valid_row[cj] != 0 && s_A[cj] > 0.0f &&
+        s_dk[cj] >= 0 && s_dk[cj] < static_cast<int64_t>(vocab_size) && s_num_cands < 96) {
+      const float base_p = s_A[cj] * s_p1[cj];
+      if (base_p > 0.0f) {
+        const float a_corr = (td.corr_exp > 0.0f && td.corr_exp < 1.0f) ? powf(s_A[cj], td.corr_exp) : s_A[cj];
+        const float tail_mult = (cj + 1 < 6 && s_valid_row[cj + 1] != 0) ? (1.0f + s_p1[cj + 1]) : 1.0f;
+        const float mc_ev = a_corr * s_p1[cj] * tail_mult;
+        const int slot = s_num_cands++;
+        s_cand_prob[slot] = base_p;
+        s_cand_score[slot] = mc_ev * td.chain_bias;
+        s_cand_tok[slot] = s_dk[cj];
+        s_cand_k[slot] = static_cast<int8_t>(cj + 1);
+        s_cand_par[slot] = -2;
+        s_cand_depth[slot] = 1;
+        s_cand_kind[slot] = 10;
+        s_cand_hpos[slot] = -1;
+        s_cand_ml[slot] = 0;
+        s_cand_rk[slot] = 0;
       }
     }
-    const int idx3 = tid + 64;
-    if (idx3 < nc) {
-      const float s3 = s_cand_score[idx3];
-      if (s3 > best_s) {
-        best_s = s3;
-        best_idx = idx3;
+  };
+
+  if (tid == 0) {
+    s_p0_base = positions[0];
+    const int use_td = (td.mode != 0 && allow_tail_drop != 0 && calib_mode != 0 &&
+                        tree_m == 16 && saved_leaf_parent != nullptr && !high_acc &&
+                        s_valid_row[0] != 0) ? 1 : 0;
+    int min_c = (use_td != 0)
+        ? ((td.min_chain < 2) ? 2 : ((td.min_chain > 6) ? 6 : td.min_chain))
+        : 6;
+    if (use_td != 0 && min_c < 6) {
+      // Suffix-correlation guard: never amputate positively-correlated DFlash sweeps where a suffix step is confident.
+      while (min_c < 6 && s_valid_row[min_c] != 0) {
+        bool suf_strong = false;
+        for (int m = min_c; m < 6; ++m) {
+          if (s_valid_row[m] == 0) break;
+          const bool pl_strong = (pl.mode != 0 && s_hist_ok != 0 && (s_cand_key[m][0] >> 16) >= 3u);
+          if (s_p1[m] >= td.max_suf_p1 || s_tr_b_rk[m][0] > 0.0f || pl_strong) {
+            suf_strong = true;
+            break;
+          }
+        }
+        if (!suf_strong) break;
+        ++min_c;
       }
+    }
+    s_use_td = use_td;
+    s_chain_len = min_c;
+    s_n_off = 0;
+    s_total_slots = (use_td != 0) ? (tree_m - 1 - min_c) : num_leaves;
+    for (int j = 0; j < 6; ++j) {
+      s_j_unlocked[j] = (j <= min_c) ? 1 : 0;
+    }
+    if (use_td != 0 && min_c < 6) {
+      push_chain_cand(min_c);
+    }
+  }
+  __syncwarp();
+
+  const int total_slots = s_total_slots;
+  for (int li = 0; li < total_slots; ++li) {
+    const int nc = s_num_cands;
+    auto cand_eff_score = [&](int idx) -> float {
+      if (idx >= nc) return -1.0f;
+      const float sc = s_cand_score[idx];
+      if (!(sc > 0.0f)) return -1.0f;
+      if (s_cand_par[idx] == -1) {
+        const int kj = static_cast<int>(s_cand_k[idx]) - 1;
+        if (kj < 0 || kj >= 6 || s_j_unlocked[kj] == 0) return -1.0f;
+      }
+      return sc;
+    };
+    float best_s = cand_eff_score(tid);
+    int best_idx = tid;
+    const int s2_i = tid + 32;
+    const float s2 = cand_eff_score(s2_i);
+    if (s2 > best_s) {
+      best_s = s2;
+      best_idx = s2_i;
+    }
+    const int s3_i = tid + 64;
+    const float s3 = cand_eff_score(s3_i);
+    if (s3 > best_s) {
+      best_s = s3;
+      best_idx = s3_i;
     }
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
@@ -1747,34 +1396,38 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         best_idx = oi;
       }
     }
-    // Collaborative warp-0 30B Target Recycling continuation query for selected leaf (when active).
-    if (best_s > 0.0f) {
+    const bool is_chain_cand = (best_s > 0.0f && static_cast<int>(s_cand_kind[best_idx]) == 10);
+    // Collaborative warp-0 30B Target Recycling continuation query for selected off-chain leaf.
+    if (best_s > 0.0f && !is_chain_cand) {
+      const int si_cur = s_n_off;
       if (tid == 0) {
         const int32_t tok32 = static_cast<int32_t>(s_cand_tok[best_idx]);
         const int k_r = static_cast<int>(s_cand_k[best_idx]);
         const int par = static_cast<int>(s_cand_par[best_idx]);
-        s_leaf_tok_r[r] = tok32;
-        s_leaf_prv_r[r] = (par < 0) ? s_ctx[15 + k_r - 1] : s_leaf_tok_r[par];
-        s_leaf_prv2_r[r] = (par < 0) ? s_ctx[15 + k_r - 2] : s_leaf_prv_r[par];
+        s_sel_tok[si_cur] = tok32;
+        s_sel_prv[si_cur] = (par < 0) ? s_ctx[15 + k_r - 1] : s_sel_tok[par];
+        s_sel_prv2[si_cur] = (par < 0) ? s_ctx[15 + k_r - 2] : s_sel_prv[par];
         s_tr_ch_tok = -1;
         s_tr_ch_p = 0.0f;
       }
-      if (li + 1 < num_leaves && calib_mode != 0 && tr.mode != 0 && tr.cont_mode != 0 &&
+      if (li + 1 < total_slots && calib_mode != 0 && tr.mode != 0 && tr.cont_mode != 0 &&
           s_hist_ok != 0 && s_tr_active_n > 0 && saved_leaf_parent != nullptr) {
         __syncwarp();
         const int dp_w = static_cast<int>(s_cand_depth[best_idx]);
         const int k_w = static_cast<int>(s_cand_k[best_idx]);
         if (dp_w < eff_max_depth && dp_w < tr.max_tr_dp && k_w < 6) {
-          const int32_t tok32 = s_leaf_tok_r[r];
-          const int32_t pv_r = s_leaf_prv_r[r];
-          const int32_t pv2_r = s_leaf_prv2_r[r];
+          const int32_t tok32 = s_sel_tok[si_cur];
+          const int32_t pv_r = s_sel_prv[si_cur];
+          const int32_t pv2_r = s_sel_prv2[si_cur];
           const int n_act = s_tr_active_n;
           const int cur_st = s_tr_cur_step;
-          const int pos_leaf = static_cast<int>(positions[0]) + k_w;
+          const int pos_leaf = static_cast<int>(s_p0_base) + k_w;
 
           int u_tot_c = 0, t0_u_c = 0, u_min_c = 2147483647, u_max_c = -1;
           int bg_t0_c = 0, bg_min_c = 2147483647, bg_max_c = -1;
           int tri_t0_c = 0, tri_min_c = 2147483647, tri_max_c = -1;
+          int a1_bg_c = 0, a1_bg_min = 2147483647, a1_bg_max = -1;
+          int a1_tri_c = 0, a1_tri_min = 2147483647, a1_tri_max = -1;
           int near_c = 0;
 
           for (int idx = lane; idx < n_act; idx += 32) {
@@ -1793,14 +1446,26 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             if (u_t < u_min_c) u_min_c = u_t;
             if (u_t > u_max_c) u_max_c = u_t;
             if (age <= 2 && dist <= 12) near_c += 1;
-            if (pv_r >= 0 && p1_t == pv_r && tier_t == 0) {
-              bg_t0_c += 1;
-              if (u_t < bg_min_c) bg_min_c = u_t;
-              if (u_t > bg_max_c) bg_max_c = u_t;
-              if (pv2_r >= 0 && p2_t == pv2_r) {
-                tri_t0_c += 1;
-                if (u_t < tri_min_c) tri_min_c = u_t;
-                if (u_t > tri_max_c) tri_max_c = u_t;
+            if (pv_r >= 0 && p1_t == pv_r) {
+              if (tier_t == 0) {
+                bg_t0_c += 1;
+                if (u_t < bg_min_c) bg_min_c = u_t;
+                if (u_t > bg_max_c) bg_max_c = u_t;
+                if (pv2_r >= 0 && p2_t == pv2_r) {
+                  tri_t0_c += 1;
+                  if (u_t < tri_min_c) tri_min_c = u_t;
+                  if (u_t > tri_max_c) tri_max_c = u_t;
+                }
+              }
+              if (age == 1 && dist <= 8) {
+                a1_bg_c += 1;
+                if (u_t < a1_bg_min) a1_bg_min = u_t;
+                if (u_t > a1_bg_max) a1_bg_max = u_t;
+                if (pv2_r >= 0 && p2_t == pv2_r) {
+                  a1_tri_c += 1;
+                  if (u_t < a1_tri_min) a1_tri_min = u_t;
+                  if (u_t > a1_tri_max) a1_tri_max = u_t;
+                }
               }
             }
           }
@@ -1817,28 +1482,41 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             tri_t0_c = __reduce_add_sync(0xffffffffu, tri_t0_c);
             tri_min_c = __reduce_min_sync(0xffffffffu, tri_min_c);
             tri_max_c = __reduce_max_sync(0xffffffffu, tri_max_c);
+            a1_bg_c = __reduce_add_sync(0xffffffffu, a1_bg_c);
+            a1_bg_min = __reduce_min_sync(0xffffffffu, a1_bg_min);
+            a1_bg_max = __reduce_max_sync(0xffffffffu, a1_bg_max);
+            a1_tri_c = __reduce_add_sync(0xffffffffu, a1_tri_c);
+            a1_tri_min = __reduce_min_sync(0xffffffffu, a1_tri_min);
+            a1_tri_max = __reduce_max_sync(0xffffffffu, a1_tri_max);
 
             int sh_occ = 0;
             bool sh_conflict = false;
             bool sh_bg_conflict = false;
+            bool sh_a1_conflict = false;
             const bool is_tri_mono = (tri_t0_c >= 2 && tri_min_c == tri_max_c);
             if (!is_tri_mono && ((bg_t0_c >= 1 && bg_min_c == bg_max_c) ||
+                                 (a1_bg_c >= 1 && a1_bg_min == a1_bg_max) ||
                                  (u_min_c == u_max_c && u_min_c != tok32))) {
               int my_occ = 0;
               int my_conf = 0;
               int my_bg_conf = 0;
+              int my_a1_conf = 0;
               const int win_m1 = s_win - 1;
               for (int hi = lane; hi < win_m1; hi += 32) {
                 if (s_h[hi] == tok32) {
                   my_occ += 1;
                   const int32_t nxt_h = s_h[hi + 1];
                   if (nxt_h != u_min_c) my_conf = 1;
-                  if (hi >= 1 && s_h[hi - 1] == pv_r && nxt_h != bg_min_c) my_bg_conf = 1;
+                  if (hi >= 1 && s_h[hi - 1] == pv_r) {
+                    if (nxt_h != bg_min_c) my_bg_conf = 1;
+                    if (nxt_h != a1_bg_min) my_a1_conf = 1;
+                  }
                 }
               }
               sh_occ = __reduce_add_sync(0xffffffffu, my_occ);
               sh_conflict = (__ballot_sync(0xffffffffu, my_conf) != 0u);
               sh_bg_conflict = (__ballot_sync(0xffffffffu, my_bg_conf) != 0u);
+              sh_a1_conflict = (__ballot_sync(0xffffffffu, my_a1_conf) != 0u);
             }
 
             if (lane == 0) {
@@ -1858,10 +1536,21 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
                          (!sh_bg_conflict || (near_c >= 2 && in_ch_top6(bg_min_c)))) {
                 s_tr_ch_tok = static_cast<int64_t>(bg_min_c);
                 s_tr_ch_p = in_ch_top6(bg_min_c) ? tr.ch_bg_t6 : tr.ch_bg_oov;
+              } else if (a1_tri_c >= 1 && a1_tri_min == a1_tri_max && a1_tri_min != tok32 &&
+                         !sh_a1_conflict && tr.ch_a1_bg_t6 > 0.0f) {
+                s_tr_ch_tok = static_cast<int64_t>(a1_tri_min);
+                s_tr_ch_p = in_ch_top6(a1_tri_min) ? tr.ch_bg_t6 : tr.ch_a1_bg_oov;
+                if (stats != nullptr && stats_len >= 48) stats[42] += 1;
               } else if (bg_t0_c >= 1 && bg_min_c == bg_max_c && !sh_bg_conflict &&
                          tr.ch_bg1_t6 > 0.0f && in_ch_top6(bg_min_c)) {
                 s_tr_ch_tok = static_cast<int64_t>(bg_min_c);
                 s_tr_ch_p = tr.ch_bg1_t6;
+              } else if (a1_bg_c >= 1 && a1_bg_min == a1_bg_max && a1_bg_min != tok32 &&
+                         !sh_a1_conflict && tr.ch_a1_bg_t6 > 0.0f &&
+                         (a1_bg_c >= 2 || in_ch_top6(a1_bg_min))) {
+                s_tr_ch_tok = static_cast<int64_t>(a1_bg_min);
+                s_tr_ch_p = in_ch_top6(a1_bg_min) ? tr.ch_a1_bg_t6 : tr.ch_a1_bg_oov;
+                if (stats != nullptr && stats_len >= 48) stats[42] += 1;
               } else if (u_min_c == u_max_c && u_min_c != tok32) {
                 const bool in_t6 = in_ch_top6(u_min_c);
                 if (near_c >= 1 && !sh_conflict && (sh_occ == 0 || (t0_u_c >= 2 && sh_occ <= 3))) {
@@ -1879,433 +1568,442 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       }
     }
     if (tid == 0) {
-      const int64_t sel_tok = (best_s > 0.0f) ? s_cand_tok[best_idx] : -1;
-      if (best_s > 0.0f && sel_tok >= 0 && sel_tok < static_cast<int64_t>(vocab_size)) {
-        const float best_prob = s_cand_prob[best_idx];
-        const int64_t tok = sel_tok;
-        const int k_r = static_cast<int>(s_cand_k[best_idx]);
-        const int par = static_cast<int>(s_cand_par[best_idx]);
-        const int dp = static_cast<int>(s_cand_depth[best_idx]);
-        const int kind = static_cast<int>(s_cand_kind[best_idx]);
-        const int hpos = static_cast<int>(s_cand_hpos[best_idx]);
-        const int ml = static_cast<int>(s_cand_ml[best_idx]);
-        const int rk_in_row = static_cast<int>(s_cand_rk[best_idx]);
+      const float best_prob = (best_s > 0.0f) ? s_cand_prob[best_idx] : -1.0f;
+      if (best_s > 0.0f) {
         s_cand_score[best_idx] = -1.0f;
         s_cand_prob[best_idx] = -1.0f;
-        if (kind == 8 || kind == 9) {
-          casc_row_mask |= (1u << r);
-          if (stats != nullptr && stats_len >= 48) {
-            stats[43] += 1;
-          }
-        }
-
-        int b_sub = 0;
-        uint32_t pkd = 0u;
-        if (par < 0) {
-          b_sub = tree_m - k_r;
-          pkd = static_cast<uint32_t>(r) & 0xFu;
-        } else {
-          b_sub = s_row_base_sub[par];
-          pkd = s_row_packed[par] | ((static_cast<uint32_t>(r) & 0xFu) << (4 * (dp - 1)));
-        }
-        s_row_base_sub[r] = b_sub;
-        s_row_packed[r] = pkd;
-
-        input_ids[r] = static_cast<int32_t>(tok);
-        positions[r] = positions[k_r];
-        saved_leaf_toks[r] = tok;
-        saved_leaf_k[r] = k_r;
-        if (saved_leaf_parent != nullptr) {
-          saved_leaf_parent[r] = par;
-        }
-        leaf_flag[1 + 3 * r + 0] = tree_m - (k_r + 1);
-        leaf_flag[1 + 3 * r + 1] = b_sub;
-        leaf_flag[1 + 3 * r + 2] = static_cast<int32_t>(pkd);
-        s_any_active = 1;
-
-        // Dynamically spawn depth+1 children (up to eff_max_depth <= 6, k_child <= 6).
-        if (li + 1 < num_leaves && dp < eff_max_depth && k_r < 6 && saved_leaf_parent != nullptr) {
-          const int k_child = k_r + 1;
-          const int j_par = k_r - 1;  // 0..4
-          const int j_ch = k_r;       // 1..5
-          int64_t spawned[12];
-          int n_spawned = 0;
-          auto already_spawned = [&](int64_t t) -> bool {
-            for (int si = 0; si < n_spawned; ++si) {
-              if (spawned[si] == t) return true;
-            }
-            return false;
-          };
-          const int root_ml = (kind == 5) ? (ml - (dp - 1)) : ml;
-          const int max_pl_dp = (root_ml <= 4) ? pl.max_dp_4 : ((root_ml == 5) ? pl.max_dp_5 : pl.max_dp_6);
-          const bool can_pl_cont = (pl.mode != 0 && s_hist_ok != 0 && hpos >= 0 && hpos + 1 < s_win &&
-                                    dp < max_pl_dp && (kind == 4 || kind == 5 || ml >= pl.cont_from_df_n));
-          const int64_t pl_next_tok = can_pl_cont ? static_cast<int64_t>(s_h[hpos + 1]) : -1;
-          const int next_ml = (ml < 16) ? (ml + 1) : 16;
-          const int next_ml_b = (next_ml > 6) ? 6 : next_ml;
-          const float pl_cp = (can_pl_cont && next_ml_b >= 1) ? pl.cont_p[next_ml_b] : 0.0f;
-          const int64_t tr_ch_tok = s_tr_ch_tok;
-          const float tr_ch_p = s_tr_ch_p;
-          if (tr_ch_tok >= 0 && tr_ch_p > 0.0f && stats != nullptr && stats_len >= 40) {
-            stats[38] += 1;
-          }
-
-          // Compute smoothed Markov bigram/trigram + 0.00ms Anti-Chimera post-miss distribution.
-          const bool allow_bg_kind =
-              (kind == 0) || (bg.bg_sub != 0 && kind == 1) || (bg.bg_off != 0 && (kind == 3 || kind == 6));
-          const bool use_bg = (calib_mode != 0 && (bg.bg_mode != 0 || ac.ac_mode != 0) && s_hist_ok != 0 &&
-                               s_valid_row[j_ch] != 0 && rk_in_row >= 0 && allow_bg_kind);
-          const uint32_t ac_u = use_bg ? s_alt_cnt[j_par][rk_in_row] : 0u;
-          const uint32_t m3 = use_bg ? s_bg3_mask[j_par][rk_in_row] : 0u;
-          float p_post_vec[6];
-          uint32_t bg_mask = 0u;
-          bool has_p_post_vec = false;
-          if (calib_mode != 0 && s_valid_row[j_ch] != 0 && kind < 8) {
-            float deltas[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-            bool any_delta = false;
-            const float inv_den = (ac_u > 0u) ? (1.0f / (static_cast<float>(ac_u) + bg.bg_alpha)) : 0.0f;
-            const float min_p = (kind == 1) ? bg.sub_min_p : bg.bg_min_p;
-            const float fwd_pen = (ac.ac_mode != 0 && use_bg && static_cast<int>(ac_u) >= ac.min_u)
-                ? fminf(ac.fwd_cap, ac.fwd_lambda * __logf(1.0f + static_cast<float>(ac_u) / ac.fwd_alpha))
-                : 0.0f;
-#pragma unroll
-            for (int rp = 0; rp < 6; ++rp) {
-              float dv = 0.0f;
-              const uint32_t cnt_rp = (use_bg && ac_u > 0u) ? s_bg_cnt[j_par][rk_in_row][rp] : 0u;
-              if (bg.bg_mode != 0 && cnt_rp > 0u) {
-                const float p_bg = static_cast<float>(cnt_rp) * inv_den;
-                const bool is3 = ((m3 & (1u << rp)) != 0u) && (p_bg >= bg.tri_min_p);
-                if (p_bg >= min_p) dv += bg.f2 + bg.w2 * p_bg;
-                if (is3) dv += bg.f3 + bg.w3 * p_bg;
-                if (dv > 0.0f) bg_mask |= (1u << rp);
-              } else if (ac.ac_mode != 0 && cnt_rp == 0u) {
-                // 1) Forward Anti-Chimera Contradiction: u occurred repeatedly in history & NEVER preceded v.
-                if (fwd_pen > 0.0f) {
-                  dv -= (kind == 1) ? (0.5f * fwd_pen) : fwd_pen;
-                }
-                // 2) Reverse Exclusive-Owner Anti-Chimera Penalty: v repeatedly follows d_j#1, NEVER u.
-                if (use_bg && kind != 1 && rk_in_row >= 1) {
-                  const uint32_t vin = s_in_cnt[j_par][rp];
-                  const uint32_t own_cnt = s_bg_cnt[j_par][0][rp];
-                  if (static_cast<int>(vin) >= ac.min_v && own_cnt > 0u) {
-                    const float ofrac = static_cast<float>(own_cnt) / (static_cast<float>(vin) + ac.rev_alpha);
-                    dv -= fminf(ac.rev_cap, ac.rev_lambda * ofrac);
-                  }
-                }
-                // 3) Cross-Position Entropy-Coupling Chimera Discount on unverified off-chain sub (rp==0).
-                if (rp == 0 && kind == 0 && ac.ent_lambda > 0.0f &&
-                    s_margin[j_par] < 2.0f && s_p1[j_ch] < 0.75f) {
-                  dv -= ac.ent_lambda * (1.0f - s_p1[j_ch]) * (1.0f - 0.5f * s_margin[j_par]);
-                }
-              }
-              deltas[rp] = dv;
-              if (dv != 0.0f) any_delta = true;
-            }
-            if (any_delta) {
-              float e1_mod[6];
-              float den1_mod = 1.0f;
-#pragma unroll
-              for (int rp = 0; rp < 6; ++rp) {
-                float ev = s_e1[j_ch][rp];
-                if (ev > 0.0f && deltas[rp] != 0.0f) {
-                  ev *= __expf(deltas[rp]);
-                }
-                e1_mod[rp] = ev;
-                den1_mod += ev;
-              }
-              const float inv_d1 = 1.0f / den1_mod;
-#pragma unroll
-              for (int rp = 0; rp < 6; ++rp) {
-                p_post_vec[rp] = e1_mod[rp] * inv_d1;
-              }
-              has_p_post_vec = true;
-            }
-          }
-
-          auto resolve_bg_hpos = [&](int rp, bool agrees_pl, int16_t& out_hp, int8_t& out_ml) {
-            if (agrees_pl) {
-              out_hp = static_cast<int16_t>(hpos + 1);
-              out_ml = static_cast<int8_t>(next_ml);
-              return;
-            }
-            out_hp = -1;
-            out_ml = 0;
-            if (!use_bg || ac_u == 0u) return;
-            const uint32_t cnt_rp = s_bg_cnt[j_par][rk_in_row][rp];
-            if (cnt_rp == 0u) return;
-            const float p_bg = static_cast<float>(cnt_rp) / (static_cast<float>(ac_u) + bg.bg_alpha);
-            const bool is3 = ((m3 & (1u << rp)) != 0u) && (p_bg >= bg.tri_min_p);
-            const bool ok_hp = is3 || (bg.chp_bg2 != 0 && cnt_rp >= 2u && p_bg >= 0.45f);
-            if (ok_hp) {
-              const uint32_t bk = s_bg_key[j_par][rk_in_row][rp];
-              if (bk != 0u) {
-                const int bk_hp = static_cast<int>(bk & 0xFFFFu);
-                const int bk_ml = static_cast<int>(bk >> 16);
-                out_hp = static_cast<int16_t>(bk_hp);
-                out_ml = static_cast<int8_t>((bk_ml < 3) ? 3 : bk_ml);
-              }
-            }
-          };
-
-          // 0) Multi-Future Cascade coherent continuation (`casc_chain` kind=8, `casc_alt` kind=9).
-          if ((kind == 8 || kind == 9) && s_casc_mode != 0 && s_num_cands < 96) {
-            const int64_t c1 = s_casc_top[j_ch][0];
-            if (c1 >= 0 && c1 < static_cast<int64_t>(vocab_size) && !already_spawned(c1)) {
-              const bool agrees_pl1 = (can_pl_cont && pl_next_tok == c1 && pl_cp > 0.0f);
-              const bool agrees_tr1 = (tr_ch_tok == c1 && tr_ch_p > 0.0f);
-              float p_c1 = (kind == 8) ? s_casc_p1[j_ch] : (s_casc_p1[j_ch] * 0.55f);
-              if (agrees_pl1 && pl_cp > p_c1) p_c1 = pl_cp;
-              if (agrees_tr1 && tr_ch_p > p_c1) p_c1 = tr_ch_p;
-              const float ch_prob1 = best_prob * p_c1;
-              if (ch_prob1 > 0.0f) {
-                const float lh1 = (kind == 8 && j_ch + 1 < 6 && li + 2 < num_leaves)
-                    ? (1.0f + csk.lookahead_w * s_casc_p1[j_ch + 1])
-                    : 1.0f;
-                const int slot = s_num_cands++;
-                s_cand_prob[slot] = ch_prob1;
-                s_cand_score[slot] = ch_prob1 * lh1;
-                s_cand_tok[slot] = c1;
-                s_cand_k[slot] = static_cast<int8_t>(k_child);
-                s_cand_par[slot] = static_cast<int8_t>(r);
-                s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-                s_cand_kind[slot] = 8;
-                s_cand_hpos[slot] = agrees_pl1 ? static_cast<int16_t>(hpos + 1) : -1;
-                s_cand_ml[slot] = agrees_pl1 ? static_cast<int8_t>(next_ml) : 0;
-                s_cand_rk[slot] = -1;
-                spawned[n_spawned++] = c1;
-              }
-            }
-            if (kind == 8 && s_num_cands < 96) {
-              const int64_t c2 = s_casc_top[j_ch][1];
-              if (c2 >= 0 && c2 < static_cast<int64_t>(vocab_size) && !already_spawned(c2)) {
-                const bool agrees_pl2 = (can_pl_cont && pl_next_tok == c2 && pl_cp > 0.0f);
-                const bool agrees_tr2 = (tr_ch_tok == c2 && tr_ch_p > 0.0f);
-                float p_c2 = s_casc_p2[j_ch];
-                if (agrees_pl2 && pl_cp > p_c2) p_c2 = pl_cp;
-                if (agrees_tr2 && tr_ch_p > p_c2) p_c2 = tr_ch_p;
-                const float ch_prob2 = best_prob * p_c2;
-                if (ch_prob2 > 0.0f) {
-                  const int slot = s_num_cands++;
-                  s_cand_prob[slot] = ch_prob2;
-                  s_cand_score[slot] = ch_prob2;
-                  s_cand_tok[slot] = c2;
-                  s_cand_k[slot] = static_cast<int8_t>(k_child);
-                  s_cand_par[slot] = static_cast<int8_t>(r);
-                  s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-                  s_cand_kind[slot] = 9;
-                  s_cand_hpos[slot] = agrees_pl2 ? static_cast<int16_t>(hpos + 1) : -1;
-                  s_cand_ml[slot] = agrees_pl2 ? static_cast<int8_t>(next_ml) : 0;
-                  s_cand_rk[slot] = -1;
-                  spawned[n_spawned++] = c2;
-                }
-              }
-            }
-          }
-
-          // 1) Aligned substitution continuation (`sub`, kind=1): d_{k_r+1}#1 = s_dk[k_r].
-          if ((kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 5 || kind == 6 || kind == 7) &&
-              s_valid_row[j_ch] && s_num_cands < 96) {
-            const int64_t sub_tok = s_dk[j_ch];
-            const bool agrees_pl = (can_pl_cont && pl_next_tok == sub_tok && pl_cp > 0.0f);
-            const bool agrees_tr = (tr_ch_tok == sub_tok && tr_ch_p > 0.0f);
-            float p_cont;
-            if (kind == 1) {
-              p_cont = s_p1[j_ch];
-              if (has_p_post_vec && ((bg_mask & 1u) != 0u) && p_post_vec[0] > p_cont) {
-                p_cont = p_post_vec[0];
-              }
-            } else {
-              p_cont = has_p_post_vec ? p_post_vec[0] : s_p1post[j_ch];
-            }
-            if (agrees_pl && pl_cp > p_cont) p_cont = pl_cp;
-            if (agrees_tr && tr_ch_p > p_cont) p_cont = tr_ch_p;
-            const float child_s = (calib_mode != 0)
-                ? (best_prob * p_cont)
-                : (best_prob * ((kind == 0) ? sub_coef : cont_decay) * s_p1[j_ch]);
-            if (child_s > 0.0f && sub_tok >= 0 && !already_spawned(sub_tok)) {
-              int16_t ch_hp = -1;
-              int8_t ch_ml = 0;
-              resolve_bg_hpos(0, agrees_pl, ch_hp, ch_ml);
-              const int slot = s_num_cands++;
-              s_cand_score[slot] = child_s;
-              s_cand_prob[slot] = child_s;
-              s_cand_tok[slot] = sub_tok;
-              s_cand_k[slot] = static_cast<int8_t>(k_child);
-              s_cand_par[slot] = static_cast<int8_t>(r);
-              s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-              s_cand_kind[slot] = 1;
-              s_cand_hpos[slot] = ch_hp;
-              s_cand_ml[slot] = ch_ml;
-              s_cand_rk[slot] = 0;
-              spawned[n_spawned++] = sub_tok;
-            }
-          }
-          // 2) Post-miss top-2 (`alt2`, kind=3) + Markov-coherent / 30B-recycled r'=2..5 (`coh_cont`, kind=6).
-          if (calib_mode != 0 && s_valid_row[j_ch] && kind < 8) {
-            for (int rp = 1; rp < 6; ++rp) {
-              if (s_num_cands >= 96) break;
-              const int64_t ctok = tree_top[j_ch * tree_k + rp];
-              if (ctok < 0 || already_spawned(ctok)) continue;
-              const bool is_bg_hit = ((bg_mask & (1u << rp)) != 0u);
-              const bool agrees_tr = (tr_ch_tok == ctok && tr_ch_p > 0.0f);
-              if (!(((kind == 0 || kind == 4 || kind == 7) && rp == 1) || is_bg_hit || agrees_tr)) continue;
-              const bool agrees_pl = (can_pl_cont && pl_next_tok == ctok && pl_cp > 0.0f);
-              float p_c = has_p_post_vec
-                  ? ((rp == 1) ? (p_post_vec[1] * ck.alt2_scale) : p_post_vec[rp])
-                  : ((rp == 1) ? s_p2post[j_ch] : (s_e1[j_ch][rp] / s_den1[j_ch]));
-              if (agrees_pl && pl_cp > p_c) p_c = pl_cp;
-              if (agrees_tr && tr_ch_p > p_c) p_c = tr_ch_p;
-              const float child_s = best_prob * p_c;
-              if (child_s > 0.0f) {
-                int16_t ch_hp = -1;
-                int8_t ch_ml = 0;
-                resolve_bg_hpos(rp, agrees_pl, ch_hp, ch_ml);
-                const int slot = s_num_cands++;
-                s_cand_score[slot] = child_s;
-                s_cand_prob[slot] = child_s;
-                s_cand_tok[slot] = ctok;
-                s_cand_k[slot] = static_cast<int8_t>(k_child);
-                s_cand_par[slot] = static_cast<int8_t>(r);
-                s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-                s_cand_kind[slot] = (rp == 1) ? 3 : 6;
-                s_cand_hpos[slot] = ch_hp;
-                s_cand_ml[slot] = ch_ml;
-                s_cand_rk[slot] = static_cast<int8_t>(rp);
-                spawned[n_spawned++] = ctok;
-              }
-            }
-          }
-          // 3) Off-by-1 shift recovery (`shf`, kind=2): d_{k_r}#1 = s_dk[k_r - 1].
-          if ((kind == 0 || kind == 2 || kind == 4 || kind == 7) && s_valid_row[k_r - 1] && s_num_cands < 96) {
-            const int64_t shf_tok = s_dk[k_r - 1];
-            if (shf_tok >= 0 && !already_spawned(shf_tok)) {
-              const bool agrees_pl = (can_pl_cont && pl_next_tok == shf_tok && pl_cp > 0.0f);
-              const bool agrees_tr = (tr_ch_tok == shf_tok && tr_ch_p > 0.0f);
-              float p_shf;
-              if (kind == 0 || kind == 4 || kind == 7) {
-                if (bg.shf_cal != 0 && kind == 0 && rk_in_row >= 1) {
-                  p_shf = (s_hist_ok != 0 && s_shf_bg[j_par][rk_in_row - 1] != 0u) ? bg.shf_hi : bg.shf_lo;
-                } else {
-                  p_shf = ck.shf;
-                }
-              } else {
-                p_shf = s_p1[k_r - 1];
-              }
-              if (agrees_pl && pl_cp > p_shf) p_shf = pl_cp;
-              if (agrees_tr && tr_ch_p > p_shf) p_shf = tr_ch_p;
-              const float child_s = (calib_mode != 0)
-                  ? (best_prob * p_shf)
-                  : ((kind == 0) ? (best_prob * shf_coef) : (best_prob * cont_decay * s_p1[k_r - 1]));
-              if (child_s > 0.0f) {
-                const int slot = s_num_cands++;
-                s_cand_score[slot] = child_s;
-                s_cand_prob[slot] = child_s;
-                s_cand_tok[slot] = shf_tok;
-                s_cand_k[slot] = static_cast<int8_t>(k_child);
-                s_cand_par[slot] = static_cast<int8_t>(r);
-                s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-                s_cand_kind[slot] = 2;
-                s_cand_hpos[slot] = agrees_pl ? static_cast<int16_t>(hpos + 1) : -1;
-                s_cand_ml[slot] = agrees_pl ? static_cast<int8_t>(next_ml) : 0;
-                s_cand_rk[slot] = -1;
-                spawned[n_spawned++] = shf_tok;
-              }
-            }
-          }
-          // 4) Prompt-lookup copy continuation (`pl_cont`, kind=5): s_h[hpos + 1].
-          if (can_pl_cont && pl_next_tok >= 0 && pl_cp > 0.0f &&
-              !already_spawned(pl_next_tok) && s_num_cands < 96) {
-            const float p_use = (tr_ch_tok == pl_next_tok && tr_ch_p > pl_cp) ? tr_ch_p : pl_cp;
-            const float child_s = best_prob * p_use;
-            if (child_s > 0.0f) {
-              const int slot = s_num_cands++;
-              s_cand_score[slot] = child_s;
-              s_cand_prob[slot] = child_s;
-              s_cand_tok[slot] = pl_next_tok;
-              s_cand_k[slot] = static_cast<int8_t>(k_child);
-              s_cand_par[slot] = static_cast<int8_t>(r);
-              s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-              s_cand_kind[slot] = 5;
-              s_cand_hpos[slot] = static_cast<int16_t>(hpos + 1);
-              s_cand_ml[slot] = static_cast<int8_t>(next_ml);
-              s_cand_rk[slot] = -1;
-              spawned[n_spawned++] = pl_next_tok;
-            }
-          }
-          // 5) Branch-conditioned unique OOV successor (deterministic nxt occurring >=2 times in s_h).
-          if (calib_mode != 0 && bg.uniq_mode != 0 && s_hist_ok != 0 && rk_in_row >= 1 &&
-              (kind == 0 || (bg.bg_off != 0 && (kind == 3 || kind == 6))) && s_num_cands < 96) {
-            const uint32_t uc = s_alt_cnt[j_par][rk_in_row];
-            const int32_t umin = s_uniq_min[j_par][rk_in_row - 1];
-            const int32_t umax = s_uniq_max[j_par][rk_in_row - 1];
-            if (uc >= 2u && umin >= 0 && umin == umax) {
-              const int64_t utok = static_cast<int64_t>(umin);
-              if (!already_spawned(utok)) {
-                float p_u = (uc == 2u) ? bg.uniq_p2 : bg.uniq_p3;
-                if (tr_ch_tok == utok && tr_ch_p > p_u) p_u = tr_ch_p;
-                const float child_s = best_prob * p_u;
-                if (child_s > 0.0f) {
-                  const int slot = s_num_cands++;
-                  s_cand_score[slot] = child_s;
-                  s_cand_prob[slot] = child_s;
-                  s_cand_tok[slot] = utok;
-                  s_cand_k[slot] = static_cast<int8_t>(k_child);
-                  s_cand_par[slot] = static_cast<int8_t>(r);
-                  s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-                  s_cand_kind[slot] = 5;
-                  s_cand_hpos[slot] = static_cast<int16_t>(s_uniq_hp[j_par][rk_in_row - 1]);
-                  s_cand_ml[slot] = (uc == 2u) ? 3 : 4;
-                  s_cand_rk[slot] = -1;
-                  spawned[n_spawned++] = utok;
-                }
-              }
-            }
-          }
-          // 6) Pure 30B Target-Recycled OOV continuation (`tr_cont`, kind=7).
-          if (calib_mode != 0 && tr_ch_tok >= 0 && tr_ch_p > 0.0f &&
-              !already_spawned(tr_ch_tok) && s_num_cands < 96) {
-            const float child_s = best_prob * tr_ch_p;
-            if (child_s > 0.0f) {
-              const int slot = s_num_cands++;
-              s_cand_score[slot] = child_s;
-              s_cand_prob[slot] = child_s;
-              s_cand_tok[slot] = tr_ch_tok;
-              s_cand_k[slot] = static_cast<int8_t>(k_child);
-              s_cand_par[slot] = static_cast<int8_t>(r);
-              s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-              s_cand_kind[slot] = 7;
-              s_cand_hpos[slot] = -1;
-              s_cand_ml[slot] = 0;
-              s_cand_rk[slot] = -1;
-              spawned[n_spawned++] = tr_ch_tok;
-            }
-          }
+      }
+      if (is_chain_cand) {
+        const int new_cl = static_cast<int>(s_cand_k[best_idx]);
+        s_chain_len = new_cl;
+        if (new_cl < 6) {
+          s_j_unlocked[new_cl] = 1;
+          push_chain_cand(new_cl);
         }
       } else {
-        s_row_base_sub[r] = -1;
-        s_row_packed[r] = 0u;
-        input_ids[r] = input_ids[0];
-        saved_leaf_toks[r] = -1;
-        saved_leaf_k[r] = 0;
-        if (saved_leaf_parent != nullptr) {
-          saved_leaf_parent[r] = -1;
+        const int64_t sel_tok = (best_s > 0.0f) ? s_cand_tok[best_idx] : -1;
+        if (best_s > 0.0f && sel_tok >= 0 && sel_tok < static_cast<int64_t>(vocab_size) && s_n_off < 15) {
+          const int64_t tok = sel_tok;
+          const int k_r = static_cast<int>(s_cand_k[best_idx]);
+          const int par = static_cast<int>(s_cand_par[best_idx]);
+          const int dp = static_cast<int>(s_cand_depth[best_idx]);
+          const int kind = static_cast<int>(s_cand_kind[best_idx]);
+          const int hpos = static_cast<int>(s_cand_hpos[best_idx]);
+          const int ml = static_cast<int>(s_cand_ml[best_idx]);
+          const int rk_in_row = static_cast<int>(s_cand_rk[best_idx]);
+          const int si_cur = s_n_off++;
+          s_sel_tok[si_cur] = static_cast<int32_t>(tok);
+          s_sel_k[si_cur] = static_cast<int8_t>(k_r);
+          s_sel_par_idx[si_cur] = static_cast<int8_t>(par);
+          s_sel_dp[si_cur] = static_cast<int8_t>(dp);
+          s_sel_kind[si_cur] = static_cast<int8_t>(kind);
+          const int r = si_cur;
+
+          // Dynamically spawn depth+1 zero-extra-drafter children (up to eff_max_depth <= 6, k_child <= 6).
+          if (li + 1 < total_slots && dp < eff_max_depth && k_r < 6 && saved_leaf_parent != nullptr) {
+            const int k_child = k_r + 1;
+            const int j_par = k_r - 1;  // 0..4
+            const int j_ch = k_r;       // 1..5
+            int n_spawned = 0;
+            auto already_spawned = [&](int64_t t) -> bool {
+              const int32_t t32 = static_cast<int32_t>(t);
+              for (int si = 0; si < n_spawned; ++si) {
+                if (s_spawned[si] == t32) return true;
+              }
+              return false;
+            };
+            auto record_spawn = [&](int64_t t) {
+              if (n_spawned < 12) s_spawned[n_spawned++] = static_cast<int32_t>(t);
+            };
+            const int root_ml = (kind == 5) ? (ml - (dp - 1)) : ml;
+            const int max_pl_dp = (root_ml <= 4) ? pl.max_dp_4 : ((root_ml == 5) ? pl.max_dp_5 : pl.max_dp_6);
+            const bool can_pl_cont = (pl.mode != 0 && s_hist_ok != 0 && hpos >= 0 && hpos + 1 < s_win &&
+                                      dp < max_pl_dp && (kind == 4 || kind == 5 || ml >= pl.cont_from_df_n));
+            const int64_t pl_next_tok = can_pl_cont ? static_cast<int64_t>(s_h[hpos + 1]) : -1;
+            const int next_ml = (ml < 16) ? (ml + 1) : 16;
+            const int next_ml_b = (next_ml > 6) ? 6 : next_ml;
+            const float pl_cp = (can_pl_cont && next_ml_b >= 1) ? pl.cont_p[next_ml_b] : 0.0f;
+            const int64_t tr_ch_tok = s_tr_ch_tok;
+            const float tr_ch_p = s_tr_ch_p;
+            if (tr_ch_tok >= 0 && tr_ch_p > 0.0f && stats != nullptr && stats_len >= 40) {
+              stats[38] += 1;
+            }
+
+            // Compute smoothed Markov bigram/trigram + 0.00ms Anti-Chimera post-miss distribution (0 stack spill).
+            const bool allow_bg_kind =
+                (kind == 0) || (bg.bg_sub != 0 && kind == 1) || (bg.bg_off != 0 && (kind == 3 || kind == 6));
+            const bool use_bg = (calib_mode != 0 && (bg.bg_mode != 0 || ac.ac_mode != 0) && s_hist_ok != 0 &&
+                                 s_valid_row[j_ch] != 0 && rk_in_row >= 0 && allow_bg_kind);
+            const uint32_t ac_u = use_bg ? s_alt_cnt[j_par][rk_in_row] : 0u;
+            const uint32_t m3 = use_bg ? s_bg3_mask[j_par][rk_in_row] : 0u;
+            uint32_t bg_mask = 0u;
+            bool has_p_post_vec = false;
+            if (calib_mode != 0 && s_valid_row[j_ch] != 0) {
+              bool any_delta = false;
+              bool any_ac_pen = false;
+              float den1_mod = 1.0f;
+              const float inv_den = (ac_u > 0u) ? (1.0f / (static_cast<float>(ac_u) + bg.bg_alpha)) : 0.0f;
+              const float min_p = (kind == 1) ? bg.sub_min_p : bg.bg_min_p;
+              const float fwd_pen = (ac.ac_mode != 0 && use_bg && static_cast<int>(ac_u) >= ac.min_u)
+                  ? fminf(ac.fwd_cap, ac.fwd_lambda * __logf(1.0f + static_cast<float>(ac_u) / ac.fwd_alpha))
+                  : 0.0f;
+#pragma unroll
+              for (int rp = 0; rp < 6; ++rp) {
+                float dv = 0.0f;
+                const uint32_t cnt_rp = (use_bg && ac_u > 0u) ? s_bg_cnt[j_par][rk_in_row][rp] : 0u;
+                if (bg.bg_mode != 0 && cnt_rp > 0u) {
+                  const float p_bg = static_cast<float>(cnt_rp) * inv_den;
+                  const bool is3 = ((m3 & (1u << rp)) != 0u) && (p_bg >= bg.tri_min_p);
+                  if (p_bg >= min_p) dv += bg.f2 + bg.w2 * p_bg;
+                  if (is3) dv += bg.f3 + bg.w3 * p_bg;
+                  if (dv > 0.0f) bg_mask |= (1u << rp);
+                } else if (ac.ac_mode != 0 && cnt_rp == 0u) {
+                  if (fwd_pen > 0.0f) {
+                    dv -= (kind == 1) ? (0.5f * fwd_pen) : fwd_pen;
+                  }
+                  if (use_bg && kind != 1 && rk_in_row >= 1) {
+                    const uint32_t vin = s_in_cnt[j_par][rp];
+                    const uint32_t own_cnt = s_bg_cnt[j_par][0][rp];
+                    if (static_cast<int>(vin) >= ac.min_v && own_cnt > 0u) {
+                      const float ofrac = static_cast<float>(own_cnt) / (static_cast<float>(vin) + ac.rev_alpha);
+                      dv -= fminf(ac.rev_cap, ac.rev_lambda * ofrac);
+                    }
+                  }
+                  if (rp == 0 && kind == 0 && ac.ent_lambda > 0.0f &&
+                      s_margin[j_par] < 2.0f && s_p1[j_ch] < 0.75f) {
+                    dv -= ac.ent_lambda * (1.0f - s_p1[j_ch]) * (1.0f - 0.5f * s_margin[j_par]);
+                  }
+                  if (dv < 0.0f) any_ac_pen = true;
+                }
+                if (dv != 0.0f) any_delta = true;
+                float ev = s_e1[j_ch][rp];
+                if (ev > 0.0f && dv != 0.0f) {
+                  ev *= __expf(dv);
+                }
+                s_p_post_vec[rp] = ev;
+                den1_mod += ev;
+              }
+              if (any_ac_pen && stats != nullptr && stats_len >= 48) {
+                stats[40] += 1;
+              }
+              if (any_delta) {
+                const float inv_d1 = 1.0f / den1_mod;
+#pragma unroll
+                for (int rp = 0; rp < 6; ++rp) {
+                  s_p_post_vec[rp] *= inv_d1;
+                }
+                has_p_post_vec = true;
+              }
+            }
+
+            auto resolve_bg_hpos = [&](int rp, bool agrees_pl, int16_t& out_hp, int8_t& out_ml) {
+              if (agrees_pl) {
+                out_hp = static_cast<int16_t>(hpos + 1);
+                out_ml = static_cast<int8_t>(next_ml);
+                return;
+              }
+              out_hp = -1;
+              out_ml = 0;
+              if (!use_bg || ac_u == 0u) return;
+              const uint32_t cnt_rp = s_bg_cnt[j_par][rk_in_row][rp];
+              if (cnt_rp == 0u) return;
+              const float p_bg = static_cast<float>(cnt_rp) / (static_cast<float>(ac_u) + bg.bg_alpha);
+              const bool is3 = ((m3 & (1u << rp)) != 0u) && (p_bg >= bg.tri_min_p);
+              const bool ok_hp = is3 || (bg.chp_bg2 != 0 && cnt_rp >= 2u && p_bg >= 0.45f);
+              if (ok_hp) {
+                const uint32_t bk = s_bg_key[j_par][rk_in_row][rp];
+                if (bk != 0u) {
+                  const int bk_hp = static_cast<int>(bk & 0xFFFFu);
+                  const int bk_ml = static_cast<int>(bk >> 16);
+                  out_hp = static_cast<int16_t>(bk_hp);
+                  out_ml = static_cast<int8_t>((bk_ml < 3) ? 3 : bk_ml);
+                }
+              }
+            };
+
+            // 1) Aligned substitution continuation (`sub`, kind=1): d_{k_r+1}#1 = s_dk[k_r].
+            if ((kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 5 || kind == 6 || kind == 7) &&
+                s_valid_row[j_ch] && s_num_cands < 96) {
+              const int64_t sub_tok = s_dk[j_ch];
+              const bool agrees_pl = (can_pl_cont && pl_next_tok == sub_tok && pl_cp > 0.0f);
+              const bool agrees_tr = (tr_ch_tok == sub_tok && tr_ch_p > 0.0f);
+              float p_cont;
+              if (kind == 1) {
+                p_cont = s_p1[j_ch];
+                if (has_p_post_vec && ((bg_mask & 1u) != 0u) && s_p_post_vec[0] > p_cont) {
+                  p_cont = s_p_post_vec[0];
+                }
+              } else {
+                p_cont = has_p_post_vec ? s_p_post_vec[0] : s_p1post[j_ch];
+              }
+              if (agrees_pl && pl_cp > p_cont) p_cont = pl_cp;
+              if (agrees_tr && tr_ch_p > p_cont) p_cont = tr_ch_p;
+              const float child_p = (calib_mode != 0)
+                  ? (best_prob * p_cont)
+                  : (best_prob * ((kind == 0) ? sub_coef : cont_decay) * s_p1[j_ch]);
+              if (child_p > 0.0f && sub_tok >= 0 && !already_spawned(sub_tok)) {
+                int16_t ch_hp = -1;
+                int8_t ch_ml = 0;
+                resolve_bg_hpos(0, agrees_pl, ch_hp, ch_ml);
+                const int slot = s_num_cands++;
+                s_cand_prob[slot] = child_p;
+                s_cand_score[slot] = child_p * cand_lh(k_child, static_cast<int>(ch_hp), static_cast<int>(ch_ml));
+                s_cand_tok[slot] = sub_tok;
+                s_cand_k[slot] = static_cast<int8_t>(k_child);
+                s_cand_par[slot] = static_cast<int8_t>(r);
+                s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
+                s_cand_kind[slot] = 1;
+                s_cand_hpos[slot] = ch_hp;
+                s_cand_ml[slot] = ch_ml;
+                s_cand_rk[slot] = 0;
+                record_spawn(sub_tok);
+              }
+            }
+            // 2) Post-miss top-2 (`alt2`, kind=3) + Markov-coherent / 30B-recycled r'=2..5 (`coh_cont`, kind=6).
+            if (calib_mode != 0 && s_valid_row[j_ch]) {
+              for (int rp = 1; rp < 6; ++rp) {
+                if (s_num_cands >= 96) break;
+                const int64_t ctok = tree_top[j_ch * tree_k + rp];
+                if (ctok < 0 || already_spawned(ctok)) continue;
+                const bool is_bg_hit = ((bg_mask & (1u << rp)) != 0u);
+                const bool agrees_tr = (tr_ch_tok == ctok && tr_ch_p > 0.0f);
+                if (!(((kind == 0 || kind == 4 || kind == 7) && rp == 1) || is_bg_hit || agrees_tr)) continue;
+                const bool agrees_pl = (can_pl_cont && pl_next_tok == ctok && pl_cp > 0.0f);
+                float p_c = has_p_post_vec
+                    ? ((rp == 1) ? (s_p_post_vec[1] * ck.alt2_scale) : s_p_post_vec[rp])
+                    : ((rp == 1) ? s_p2post[j_ch] : (s_e1[j_ch][rp] / s_den1[j_ch]));
+                if (agrees_pl && pl_cp > p_c) p_c = pl_cp;
+                if (agrees_tr && tr_ch_p > p_c) p_c = tr_ch_p;
+                const float child_p = best_prob * p_c;
+                if (child_p > 0.0f) {
+                  int16_t ch_hp = -1;
+                  int8_t ch_ml = 0;
+                  resolve_bg_hpos(rp, agrees_pl, ch_hp, ch_ml);
+                  const int slot = s_num_cands++;
+                  s_cand_prob[slot] = child_p;
+                  s_cand_score[slot] = child_p * cand_lh(k_child, static_cast<int>(ch_hp), static_cast<int>(ch_ml));
+                  s_cand_tok[slot] = ctok;
+                  s_cand_k[slot] = static_cast<int8_t>(k_child);
+                  s_cand_par[slot] = static_cast<int8_t>(r);
+                  s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
+                  s_cand_kind[slot] = (rp == 1) ? 3 : 6;
+                  s_cand_hpos[slot] = ch_hp;
+                  s_cand_ml[slot] = ch_ml;
+                  s_cand_rk[slot] = static_cast<int8_t>(rp);
+                  record_spawn(ctok);
+                }
+              }
+            }
+            // 3) Off-by-1 shift recovery (`shf`, kind=2): d_{k_r}#1 = s_dk[k_r - 1].
+            if ((kind == 0 || kind == 2 || kind == 4 || kind == 7) && s_valid_row[k_r - 1] && s_num_cands < 96) {
+              const int64_t shf_tok = s_dk[k_r - 1];
+              if (shf_tok >= 0 && !already_spawned(shf_tok)) {
+                const bool agrees_pl = (can_pl_cont && pl_next_tok == shf_tok && pl_cp > 0.0f);
+                const bool agrees_tr = (tr_ch_tok == shf_tok && tr_ch_p > 0.0f);
+                float p_shf;
+                if (kind == 0 || kind == 4 || kind == 7) {
+                  if (bg.shf_cal != 0 && kind == 0 && rk_in_row >= 1) {
+                    p_shf = (s_hist_ok != 0 && s_shf_bg[j_par][rk_in_row - 1] != 0u) ? bg.shf_hi : bg.shf_lo;
+                  } else {
+                    p_shf = ck.shf;
+                  }
+                } else {
+                  p_shf = s_p1[k_r - 1];
+                }
+                if (agrees_pl && pl_cp > p_shf) p_shf = pl_cp;
+                if (agrees_tr && tr_ch_p > p_shf) p_shf = tr_ch_p;
+                const float child_p = (calib_mode != 0)
+                    ? (best_prob * p_shf)
+                    : ((kind == 0) ? (best_prob * shf_coef) : (best_prob * cont_decay * s_p1[k_r - 1]));
+                if (child_p > 0.0f) {
+                  const int ch_hp_i = agrees_pl ? (hpos + 1) : -1;
+                  const int ch_ml_i = agrees_pl ? next_ml : 0;
+                  const int slot = s_num_cands++;
+                  s_cand_prob[slot] = child_p;
+                  s_cand_score[slot] = child_p * cand_lh(k_child, ch_hp_i, ch_ml_i);
+                  s_cand_tok[slot] = shf_tok;
+                  s_cand_k[slot] = static_cast<int8_t>(k_child);
+                  s_cand_par[slot] = static_cast<int8_t>(r);
+                  s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
+                  s_cand_kind[slot] = 2;
+                  s_cand_hpos[slot] = static_cast<int16_t>(ch_hp_i);
+                  s_cand_ml[slot] = static_cast<int8_t>(ch_ml_i);
+                  s_cand_rk[slot] = -1;
+                  record_spawn(shf_tok);
+                }
+              }
+            }
+            // 4) Prompt-lookup copy continuation (`pl_cont`, kind=5): s_h[hpos + 1].
+            if (can_pl_cont && pl_next_tok >= 0 && pl_cp > 0.0f &&
+                !already_spawned(pl_next_tok) && s_num_cands < 96) {
+              const float p_use = (tr_ch_tok == pl_next_tok && tr_ch_p > pl_cp) ? tr_ch_p : pl_cp;
+              const float child_p = best_prob * p_use;
+              if (child_p > 0.0f) {
+                const int slot = s_num_cands++;
+                s_cand_prob[slot] = child_p;
+                s_cand_score[slot] = child_p * cand_lh(k_child, hpos + 1, next_ml);
+                s_cand_tok[slot] = pl_next_tok;
+                s_cand_k[slot] = static_cast<int8_t>(k_child);
+                s_cand_par[slot] = static_cast<int8_t>(r);
+                s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
+                s_cand_kind[slot] = 5;
+                s_cand_hpos[slot] = static_cast<int16_t>(hpos + 1);
+                s_cand_ml[slot] = static_cast<int8_t>(next_ml);
+                s_cand_rk[slot] = -1;
+                record_spawn(pl_next_tok);
+              }
+            }
+            // 5) Branch-conditioned unique OOV successor (deterministic nxt occurring >=2 times in s_h).
+            if (calib_mode != 0 && bg.uniq_mode != 0 && s_hist_ok != 0 && rk_in_row >= 1 &&
+                (kind == 0 || (bg.bg_off != 0 && (kind == 3 || kind == 6))) && s_num_cands < 96) {
+              const uint32_t uc = s_alt_cnt[j_par][rk_in_row];
+              const int32_t umin = s_uniq_min[j_par][rk_in_row - 1];
+              const int32_t umax = s_uniq_max[j_par][rk_in_row - 1];
+              if (uc >= 2u && umin >= 0 && umin == umax) {
+                const int64_t utok = static_cast<int64_t>(umin);
+                if (!already_spawned(utok)) {
+                  float p_u = (uc == 2u) ? bg.uniq_p2 : bg.uniq_p3;
+                  if (tr_ch_tok == utok && tr_ch_p > p_u) p_u = tr_ch_p;
+                  const float child_p = best_prob * p_u;
+                  if (child_p > 0.0f) {
+                    const int uhp = static_cast<int>(s_uniq_hp[j_par][rk_in_row - 1]);
+                    const int uml = (uc == 2u) ? 3 : 4;
+                    const int slot = s_num_cands++;
+                    s_cand_prob[slot] = child_p;
+                    s_cand_score[slot] = child_p * cand_lh(k_child, uhp, uml);
+                    s_cand_tok[slot] = utok;
+                    s_cand_k[slot] = static_cast<int8_t>(k_child);
+                    s_cand_par[slot] = static_cast<int8_t>(r);
+                    s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
+                    s_cand_kind[slot] = 5;
+                    s_cand_hpos[slot] = static_cast<int16_t>(uhp);
+                    s_cand_ml[slot] = static_cast<int8_t>(uml);
+                    s_cand_rk[slot] = -1;
+                    record_spawn(utok);
+                  }
+                }
+              }
+            }
+            // 6) Pure 30B Target-Recycled OOV continuation (`tr_cont`, kind=7).
+            if (calib_mode != 0 && tr_ch_tok >= 0 && tr_ch_p > 0.0f &&
+                !already_spawned(tr_ch_tok) && s_num_cands < 96) {
+              const float child_p = best_prob * tr_ch_p;
+              if (child_p > 0.0f) {
+                const int slot = s_num_cands++;
+                s_cand_prob[slot] = child_p;
+                s_cand_score[slot] = child_p;
+                s_cand_tok[slot] = tr_ch_tok;
+                s_cand_k[slot] = static_cast<int8_t>(k_child);
+                s_cand_par[slot] = static_cast<int8_t>(r);
+                s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
+                s_cand_kind[slot] = 7;
+                s_cand_hpos[slot] = -1;
+                s_cand_ml[slot] = 0;
+                s_cand_rk[slot] = -1;
+                record_spawn(tr_ch_tok);
+              }
+            }
+          }
         }
-        leaf_flag[1 + 3 * r + 0] = tree_m - 1 - r;
-        leaf_flag[1 + 3 * r + 1] = -1;
-        leaf_flag[1 + 3 * r + 2] = 0;
       }
     }
     __syncwarp();
   }
 
-  // Record per-row (cur, prv1, prv2, pos_r) for 16-row 30B Target Recycling commit in 1 parallel cycle.
+  // Zero-clobber topological physical row assignment (ascending k_r -> guarantees k_r <= r & par_row < r!).
+  if (tid == 0) {
+    const int chain_len = s_chain_len;
+    const int n_off = s_n_off;
+    const int64_t p0_base = s_p0_base;
+    for (int r = 0; r <= chain_len && r < tree_m; ++r) {
+      leaf_flag[1 + 3 * r + 0] = tree_m - 1 - r;
+      leaf_flag[1 + 3 * r + 1] = -1;
+      leaf_flag[1 + 3 * r + 2] = 0;
+      saved_leaf_toks[r] = -1;
+      saved_leaf_k[r] = (r == 0) ? chain_len : 0;
+      if (saved_leaf_parent != nullptr) {
+        saved_leaf_parent[r] = -1;
+      }
+      s_leaf_tok_r[r] = -1;
+      s_row_base_sub[r] = -1;
+      s_row_packed[r] = 0u;
+    }
+    int next_row = chain_len + 1;
+    for (int k_pass = 1; k_pass <= 6; ++k_pass) {
+      for (int si = 0; si < n_off; ++si) {
+        if (static_cast<int>(s_sel_k[si]) == k_pass && next_row < tree_m) {
+          const int r = next_row++;
+          s_row_of[si] = r;
+          const int k_r = k_pass;
+          const int p_si = static_cast<int>(s_sel_par_idx[si]);
+          const int par_row = (p_si < 0) ? -1 : s_row_of[p_si];
+          const int dp = static_cast<int>(s_sel_dp[si]);
+          const int32_t tok32 = s_sel_tok[si];
+
+          int b_sub = 0;
+          uint32_t pkd = 0u;
+          if (par_row < 0) {
+            b_sub = tree_m - k_r;
+            pkd = static_cast<uint32_t>(r) & 0xFu;
+          } else {
+            b_sub = s_row_base_sub[par_row];
+            pkd = s_row_packed[par_row] | ((static_cast<uint32_t>(r) & 0xFu) << (4 * (dp - 1)));
+          }
+          s_row_base_sub[r] = b_sub;
+          s_row_packed[r] = pkd;
+
+          input_ids[r] = tok32;
+          positions[r] = p0_base + static_cast<int64_t>(k_r);
+          saved_leaf_toks[r] = static_cast<int64_t>(tok32);
+          saved_leaf_k[r] = k_r;
+          if (saved_leaf_parent != nullptr) {
+            saved_leaf_parent[r] = par_row;
+          }
+          leaf_flag[1 + 3 * r + 0] = tree_m - (k_r + 1);
+          leaf_flag[1 + 3 * r + 1] = b_sub;
+          leaf_flag[1 + 3 * r + 2] = static_cast<int32_t>(pkd);
+          s_leaf_tok_r[r] = tok32;
+          s_leaf_prv_r[r] = s_sel_prv[si];
+          s_leaf_prv2_r[r] = s_sel_prv2[si];
+          s_any_active = 1;
+        }
+      }
+    }
+    for (int r = next_row; r < tree_m; ++r) {
+      s_row_base_sub[r] = -1;
+      s_row_packed[r] = 0u;
+      input_ids[r] = input_ids[0];
+      positions[r] = p0_base + static_cast<int64_t>(r);
+      saved_leaf_toks[r] = -1;
+      saved_leaf_k[r] = 0;
+      if (saved_leaf_parent != nullptr) {
+        saved_leaf_parent[r] = -1;
+      }
+      s_leaf_tok_r[r] = -1;
+      leaf_flag[1 + 3 * r + 0] = tree_m - 1 - r;
+      leaf_flag[1 + 3 * r + 1] = -1;
+      leaf_flag[1 + 3 * r + 2] = 0;
+    }
+    if (chain_len < 6) {
+      s_any_active = 1;
+      if (stats != nullptr && stats_len >= 52) {
+        stats[48] += 1;
+        stats[49] += (6 - chain_len);
+      }
+    }
+    leaf_flag[0] = s_any_active ? -1 : 0;
+  }
+  __syncwarp();
+
+  // Record per-row (cur, prv1, prv2, pos_r) via 16-lane coalesced int4 store in 1 parallel cycle.
   if (tid < tree_m && saved_row_ctx != nullptr) {
-    const int p0_i32 = static_cast<int>(positions[0]);
+    const int p0_i32 = static_cast<int>(s_p0_base);
+    const int chain_len = s_chain_len;
     const int32_t p_m1 = (s_hist_ok != 0 && s_ctx[14] >= 0) ? s_ctx[14] : -1;
     const int32_t p_m2 = (s_hist_ok != 0 && s_ctx[13] >= 0) ? s_ctx[13] : -1;
     int32_t cur_r = -1, prv1_r = -1, prv2_r = -1, pos_r = -1;
     if (!high_acc) {
-      if (tid < 7) {
+      if (tid <= chain_len) {
         cur_r = input_ids[tid];
         prv1_r = (tid == 0) ? p_m1 : input_ids[tid - 1];
         prv2_r = (tid == 0) ? p_m2 : ((tid == 1) ? p_m1 : input_ids[tid - 2]);
@@ -2317,21 +2015,11 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         pos_r = p0_i32 + saved_leaf_k[tid];
       }
     }
-    saved_row_ctx[tid * 4 + 0] = cur_r;
-    saved_row_ctx[tid * 4 + 1] = prv1_r;
-    saved_row_ctx[tid * 4 + 2] = prv2_r;
-    saved_row_ctx[tid * 4 + 3] = pos_r;
-  }
-
-  if (tid == 0) {
-    if (cascade_meta != nullptr) {
-      cascade_meta[5] = static_cast<int32_t>(casc_row_mask);
-    }
-    leaf_flag[0] = s_any_active ? -1 : 0;
+    reinterpret_cast<int4*>(saved_row_ctx)[tid] = make_int4(cur_r, prv1_r, prv2_r, pos_r);
   }
 }
 
-__global__ void native_leaf_commit_tree_kernel(
+__global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
     int32_t* __restrict__ leaf_flag,
     int32_t* __restrict__ prev_ns,
     int32_t* __restrict__ hit_flag,
@@ -2359,212 +2047,230 @@ __global__ void native_leaf_commit_tree_kernel(
     int32_t* __restrict__ tr_state,
     int tr_cap,
     int vocab_size,
-    int chain_all_valid,
-    int32_t* __restrict__ cascade_meta) {
-  const int mode = leaf_flag[0];
-  leaf_flag[0] = 0;  // Clear immediately so non-tree steps see 0.
-  int32_t ns = num_sampled[0];
-  int32_t nr = num_rejected[0];
-  const int32_t raw_ns = ns;
-  uint32_t casc_row_mask = 0u;
-  int32_t casc_m_div1 = 0;
-  if (cascade_meta != nullptr) {
-    casc_row_mask = static_cast<uint32_t>(cascade_meta[5]);
-    casc_m_div1 = cascade_meta[6];
-    cascade_meta[5] = 0;
-    cascade_meta[6] = 0;
-  }
-  int32_t casc_hit_cnt = 0;
-  int32_t raw_u[16];
-  const bool can_rec_tr = (no_hit_mode == 0 && tr_log != nullptr && tr_state != nullptr &&
-                           saved_row_ctx != nullptr && tr_cap > 0);
-  if (can_rec_tr) {
-    // Only fused lmpost populates sampled_tokens[raw_ns..6]; stock rejection_sampler allocates
-    // sampled with new_empty and leaves slots >= raw_ns uninitialized, so never read past raw_ns
-    // unless chain_all_valid != 0, and always range-check against vocab_size.
-    const int chain_lim = (chain_all_valid != 0) ? 7 : ((raw_ns < 0) ? 0 : ((raw_ns < 7) ? raw_ns : 7));
-    for (int r = 0; r < 7 && r < tree_m; ++r) {
-      if (r < chain_lim) {
-        const int64_t v = sampled_tokens[r];
-        raw_u[r] = (v >= 0 && v < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v) : -1;
-      } else {
-        raw_u[r] = -1;
-      }
-    }
-    for (int r = 7; r < tree_m; ++r) {
-      const int64_t v = leaf_u_toks[r - 7];
-      raw_u[r] = (v >= 0 && v < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v) : -1;
-    }
-  }
-  uint32_t matched_mask = 0u;
-  int32_t hit_dst0 = 0;
-  int32_t hit_src0 = 0;
-  int32_t hit_len = 0;
+    int chain_all_valid) {
+  const int lane = threadIdx.x;
+  __shared__ int32_t s_raw_u[16];
+  __shared__ uint32_t s_exact_mask;
+  __shared__ int32_t s_len0;
+  __shared__ int32_t s_step_id;
+  __shared__ int32_t s_ctx_p0;
+  __shared__ int32_t s_do_tr;
 
-  // Supports arbitrary-depth (1..6-level) commits up to ns == 7 (nr == 0) strictly preserving ns + nr == 7.
-  if (mode < 0 && ns >= 1 && ns <= 6 && no_hit_mode == 0) {
-    int32_t cur_parent = -1;
-    for (int stage = 0; stage < 6 && ns <= 6; ++stage) {
-      const int64_t tok_k = sampled_tokens[ns - 1];
-      int matched_r = -1;
-      for (int r = 7; r < tree_m; ++r) {
-        const int32_t par = (saved_leaf_parent != nullptr) ? saved_leaf_parent[r] : -1;
-        if (par == cur_parent && saved_leaf_k[r] == ns &&
-            saved_leaf_toks[r] >= 0 && tok_k == saved_leaf_toks[r]) {
-          matched_r = r;
-          break;
+  const int32_t init_ns = num_sampled[0];
+  if (lane < tree_m) {
+    int32_t uv = -1;
+    if (no_hit_mode == 0) {
+      if (lane < 7) {
+        const int chain_lim = (chain_all_valid != 0) ? 7 : ((init_ns < 0) ? 0 : ((init_ns < 7) ? init_ns : 7));
+        if (lane < chain_lim) {
+          const int64_t v = sampled_tokens[lane];
+          uv = (v >= 0 && v < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v) : -1;
         }
+      } else {
+        const int64_t v = leaf_u_toks[lane - 7];
+        uv = (v >= 0 && v < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v) : -1;
       }
-      if (matched_r < 0) break;
-      matched_mask |= (1u << matched_r);
-      const int32_t dst_r = ns;
-      sampled_tokens[dst_r] = leaf_u_toks[matched_r - 7];
-      if ((casc_row_mask & (1u << matched_r)) != 0u) {
-        casc_hit_cnt += 1;
-      }
-      if (hit_len == 0) {
-        hit_dst0 = dst_r;
-        hit_src0 = matched_r;
-      }
-      if (hit_flag_len >= 2 + 2 * (hit_len + 1)) {
-        hit_flag[2 + 2 * hit_len] = dst_r;
-        hit_flag[3 + 2 * hit_len] = matched_r;
-      }
-      hit_len += 1;
-      ns += 1;
-      nr -= 1;
-      cur_parent = matched_r;
     }
-    if (hit_len > 0) {
+    s_raw_u[lane] = uv;
+  }
+  __syncwarp();
+
+  if (lane == 0) {
+    const int mode = leaf_flag[0];
+    leaf_flag[0] = 0;  // Clear immediately so non-tree steps see 0.
+    int32_t ns = init_ns;
+    int32_t nr = num_rejected[0];
+    const int chain_len = (mode < 0 && saved_leaf_k[0] >= 1 && saved_leaf_k[0] <= 6) ? saved_leaf_k[0] : 6;
+    if (mode < 0 && no_hit_mode == 0 && ns > chain_len + 1) {
+      ns = chain_len + 1;
+      nr = 7 - ns;
       num_sampled[0] = ns;
       num_rejected[0] = nr;
+      if (stats != nullptr && stats_len >= 52) {
+        stats[51] += 1;
+      }
     }
-  }
+    const int32_t eff_raw_ns = ns;
+    uint32_t matched_mask = 0u;
+    int32_t hit_dst0 = 0;
+    int32_t hit_src0 = 0;
+    int32_t hit_len = 0;
 
-  hit_flag[0] = hit_dst0;
-  if (hit_flag_len >= 2) {
-    hit_flag[1] = hit_len;
-  }
-  hit_src_row[0] = hit_src0;
-  prev_ns[0] = ns;
-
-  // Append exact committed tokens (including tree leaf hits!) directly to token history.
-  if (hist != nullptr && hist_len != nullptr && saved_pos0 != nullptr) {
-    const int64_t p0 = saved_pos0[0];
-    if (p0 >= 0 && hist_len[0] == static_cast<int32_t>(p0 + 1)) {
-      const int64_t new_len = p0 + 1 + ns;
-      if (new_len <= hist_cap) {
-        for (int i = 0; i < ns; ++i) {
-          hist[p0 + 1 + i] = static_cast<int32_t>(sampled_tokens[i]);
+    // Supports arbitrary-depth (1..6-level) commits up to ns == 7 (nr == 0) strictly preserving ns + nr == 7.
+    if (mode < 0 && ns >= 1 && ns <= 6 && no_hit_mode == 0) {
+      int32_t cur_parent = -1;
+      for (int stage = 0; stage < 6 && ns <= 6; ++stage) {
+        const int64_t tok_k = sampled_tokens[ns - 1];
+        int matched_r = -1;
+        for (int r = chain_len + 1; r < tree_m; ++r) {
+          if (r < 7 && chain_all_valid == 0) continue;
+          const int32_t par = (saved_leaf_parent != nullptr) ? saved_leaf_parent[r] : -1;
+          if (par == cur_parent && saved_leaf_k[r] == ns &&
+              saved_leaf_toks[r] >= 0 && tok_k == saved_leaf_toks[r]) {
+            matched_r = r;
+            break;
+          }
         }
-        hist_len[0] = static_cast<int32_t>(new_len);
+        if (matched_r < 0) break;
+        const int32_t u_r = s_raw_u[matched_r];
+        if (u_r < 0) break;
+        matched_mask |= (1u << matched_r);
+        const int32_t dst_r = ns;
+        sampled_tokens[dst_r] = static_cast<int64_t>(u_r);
+        if (matched_r < 7 && stats != nullptr && stats_len >= 52) {
+          stats[50] += 1;
+        }
+        if (hit_len == 0) {
+          hit_dst0 = dst_r;
+          hit_src0 = matched_r;
+        }
+        if (hit_flag_len >= 2 + 2 * (hit_len + 1)) {
+          hit_flag[2 + 2 * hit_len] = dst_r;
+          hit_flag[3 + 2 * hit_len] = matched_r;
+        }
+        hit_len += 1;
+        ns += 1;
+        nr -= 1;
+        cur_parent = matched_r;
+      }
+      if (hit_len > 0) {
+        num_sampled[0] = ns;
+        num_rejected[0] = nr;
+      }
+    }
+
+    hit_flag[0] = hit_dst0;
+    if (hit_flag_len >= 2) {
+      hit_flag[1] = hit_len;
+    }
+    hit_src_row[0] = hit_src0;
+    prev_ns[0] = ns;
+
+    // Append exact committed tokens (including tree leaf hits!) directly to token history.
+    if (hist != nullptr && hist_len != nullptr && saved_pos0 != nullptr) {
+      const int64_t p0 = saved_pos0[0];
+      if (p0 >= 0 && hist_len[0] == static_cast<int32_t>(p0 + 1)) {
+        const int64_t new_len = p0 + 1 + ns;
+        if (new_len <= hist_cap) {
+          for (int i = 0; i < ns; ++i) {
+            hist[p0 + 1 + i] = static_cast<int32_t>(sampled_tokens[i]);
+          }
+          hist_len[0] = static_cast<int32_t>(new_len);
+        } else {
+          hist_len[0] = -1;
+        }
+      }
+    }
+
+    int32_t do_tr = 0;
+    if (no_hit_mode == 0 && tr_log != nullptr && tr_state != nullptr &&
+        saved_row_ctx != nullptr && tr_cap > 0 && saved_pos0 != nullptr) {
+      const int64_t p0 = saved_pos0[0];
+      const int32_t ctx_p0 = saved_row_ctx[3];
+      if (p0 >= 0 && ctx_p0 == static_cast<int32_t>(p0) && saved_row_ctx[0] >= 0) {
+        int32_t len = tr_state[0];
+        int32_t step_id = tr_state[1];
+        if (len < 0 || (len > 0 && p0 <= static_cast<int64_t>(tr_state[2]))) {
+          len = 0;
+          step_id = 0;
+        }
+        uint32_t exact_mask = 0u;
+        for (int r = 0; r <= chain_len && r < tree_m; ++r) {
+          if (r < eff_raw_ns) exact_mask |= (1u << r);
+        }
+        for (int r = chain_len + 1; r < tree_m; ++r) {
+          if (saved_row_ctx[r * 4 + 0] < 0) continue;
+          const int32_t par = (saved_leaf_parent != nullptr) ? saved_leaf_parent[r] : -1;
+          const int32_t k = saved_leaf_k[r];
+          bool ex = false;
+          if (par < 0) {
+            ex = (k > 0 && k <= eff_raw_ns);
+          } else if (par > chain_len && par < r) {
+            ex = ((exact_mask & (1u << par)) != 0u) && ((matched_mask & (1u << par)) != 0u);
+          }
+          if (ex) exact_mask |= (1u << r);
+        }
+        s_exact_mask = exact_mask;
+        s_len0 = len;
+        s_step_id = step_id;
+        s_ctx_p0 = ctx_p0;
+        do_tr = 1;
       } else {
-        hist_len[0] = -1;
+        saved_row_ctx[3] = -1;
       }
     }
-  }
+    s_do_tr = do_tr;
 
-  // Append all active 30B-verified (cur, prv1, prv2) -> raw_u[r] pairs to per-request tr_log.
-  if (can_rec_tr && saved_pos0 != nullptr) {
-    const int64_t p0 = saved_pos0[0];
-    const int32_t ctx_p0 = saved_row_ctx[3];
-    saved_row_ctx[3] = -1;  // Consume once so non-tree steps cannot re-read stale row contexts.
-    if (p0 >= 0 && ctx_p0 == static_cast<int32_t>(p0) && saved_row_ctx[0] >= 0) {
-      int32_t len = tr_state[0];
-      int32_t step_id = tr_state[1];
-      if (len < 0 || (len > 0 && p0 <= static_cast<int64_t>(tr_state[2]))) {
-        len = 0;
-        step_id = 0;
-      }
-      uint32_t exact_mask = 0u;
-      for (int r = 0; r < 7 && r < tree_m; ++r) {
-        if (r < raw_ns) exact_mask |= (1u << r);
-      }
-      for (int r = 7; r < tree_m; ++r) {
-        if (saved_row_ctx[r * 4 + 0] < 0) continue;
-        const int32_t par = (saved_leaf_parent != nullptr) ? saved_leaf_parent[r] : -1;
-        const int32_t k = saved_leaf_k[r];
-        bool ex = false;
-        if (par < 0) {
-          ex = (k > 0 && k <= raw_ns);
-        } else if (par >= 7 && par < r) {
-          ex = ((exact_mask & (1u << par)) != 0u) && ((matched_mask & (1u << par)) != 0u);
+    if (req_acc_state != nullptr) {
+      const int32_t r = req_acc_state[0] + 1;
+      const int32_t c = req_acc_state[1] + ns;
+      req_acc_state[0] = r;
+      req_acc_state[1] = c;
+      req_acc_state[2] =
+          (high_acc_cpc > 0.0f && r >= 4 && static_cast<float>(c) > high_acc_cpc * static_cast<float>(r)) ? 1 : 0;
+    }
+
+    if (stats != nullptr && stats_len >= 4) {
+      stats[0] += 1;
+      if (mode < 0) stats[1] += 1;
+      if (hit_len > 0) {
+        stats[2] += 1;
+        if (hit_len >= 2) stats[3] += 1;
+        if (stats_len >= 10 && hit_dst0 >= 1 && hit_dst0 <= 6) {
+          stats[3 + hit_dst0] += 1;
         }
-        if (ex) exact_mask |= (1u << r);
-      }
-      int appended = 0;
-      for (int r = 0; r < tree_m; ++r) {
-        const int32_t cur_t = saved_row_ctx[r * 4 + 0];
-        const int32_t u_t = raw_u[r];
-        if (cur_t < 0 || cur_t >= vocab_size || u_t < 0 || u_t >= vocab_size) continue;
-        if (len >= tr_cap) break;
-        const int base8 = len * 8;
-        tr_log[base8 + 0] = r;
-        tr_log[base8 + 1] = cur_t;
-        tr_log[base8 + 2] = saved_row_ctx[r * 4 + 1];
-        tr_log[base8 + 3] = saved_row_ctx[r * 4 + 2];
-        tr_log[base8 + 4] = u_t;
-        tr_log[base8 + 5] = step_id;
-        tr_log[base8 + 6] = (r == 0) ? ctx_p0 : saved_row_ctx[r * 4 + 3];
-        tr_log[base8 + 7] = ((exact_mask & (1u << r)) != 0u) ? 0 : 1;
-        len += 1;
-        appended += 1;
-      }
-      tr_state[0] = len;
-      tr_state[1] = step_id + 1;
-      tr_state[2] = static_cast<int32_t>(p0);
-      if (stats != nullptr && stats_len >= 40) {
-        stats[39] += appended;
-      }
-    }
-  }
-
-  if (req_acc_state != nullptr) {
-    const int32_t r = req_acc_state[0] + 1;
-    const int32_t c = req_acc_state[1] + ns;
-    req_acc_state[0] = r;
-    req_acc_state[1] = c;
-    // On M=16 verify, pausing leaves saves 0.00 ms because FULL(16) always runs; keep all 9 leaves
-    // active whenever depth==6 returns (never permanently latch off after a ceiling-clamped step).
-    req_acc_state[2] =
-        (high_acc_cpc > 0.0f && r >= 4 && static_cast<float>(c) > high_acc_cpc * static_cast<float>(r)) ? 1 : 0;
-  }
-
-  if (stats != nullptr && stats_len >= 4) {
-    stats[0] += 1;
-    if (mode < 0) stats[1] += 1;
-    if (hit_len > 0) {
-      stats[2] += 1;
-      if (hit_len >= 2) stats[3] += 1;
-      if (stats_len >= 10 && hit_dst0 >= 1 && hit_dst0 <= 6) {
-        stats[3 + hit_dst0] += 1;  // stats[4..9] = initial 1-level hit depth k=1..6
-      }
-      if (stats_len >= 19 && hit_src0 >= 7 && hit_src0 < 16) {
-        stats[10 + (hit_src0 - 7)] += 1;  // stats[10..18] = winning initial leaf slot 0..8
+        if (stats_len >= 19 && hit_src0 >= 7 && hit_src0 < 16) {
+          stats[10 + (hit_src0 - 7)] += 1;
+        }
+        if (stats_len >= 32) {
+          const int hl = (hit_len <= 6) ? hit_len : 6;
+          stats[18 + hl] += 1;
+          stats[25] += hit_len;
+          if (hit_len > 1) {
+            stats[26] += (hit_len - 1);
+            stats[29] += 1;
+            if (hit_len >= 3) stats[30] += 1;
+            if (hit_len >= 4) stats[31] += 1;
+          }
+          if (hit_len > stats[28]) stats[28] = hit_len;
+        }
       }
       if (stats_len >= 32) {
-        const int hl = (hit_len <= 6) ? hit_len : 6;
-        stats[18 + hl] += 1;                 // stats[19..24] = hit_len histogram 1..6
-        stats[25] += hit_len;                // total extra tokens committed by tree
-        if (hit_len > 1) {
-          stats[26] += (hit_len - 1);        // deep bonus tokens (stage >= 1)
-          stats[29] += 1;                    // reached depth >= 2
-          if (hit_len >= 3) stats[30] += 1;  // reached depth >= 3
-          if (hit_len >= 4) stats[31] += 1;  // reached depth >= 4
-        }
-        if (hit_len > stats[28]) stats[28] = hit_len;  // max hit_len seen
+        stats[27] += ns;
       }
     }
-    if (stats_len >= 32) {
-      stats[27] += ns;  // total committed tokens
+  }
+  __syncwarp();
+
+  // Warp-parallel 16-lane coalesced int4 append to tr_log (~1.5 us vs ~20 us scalar).
+  if (s_do_tr != 0) {
+    int4 ctx4 = make_int4(-1, -1, -1, -1);
+    int32_t u_t = -1;
+    if (lane < tree_m) {
+      ctx4 = reinterpret_cast<const int4*>(saved_row_ctx)[lane];
+      u_t = s_raw_u[lane];
     }
-    if (stats_len >= 48) {
-      if (casc_hit_cnt > 0) {
-        stats[44] += 1;
-        stats[45] += casc_hit_cnt;
-      }
-      if (casc_m_div1 > 0 && raw_ns >= casc_m_div1 + 1) {
-        stats[47] += (raw_ns - casc_m_div1);
+    const bool valid = (lane < tree_m && ctx4.x >= 0 && ctx4.x < vocab_size && u_t >= 0 && u_t < vocab_size);
+    const uint32_t vmask = __ballot_sync(0xffffffffu, valid);
+    const int off = __popc(vmask & ((1u << lane) - 1u));
+    const int dst = s_len0 + off;
+    if (valid && dst < tr_cap) {
+      int4* tr4 = reinterpret_cast<int4*>(tr_log);
+      const int32_t pos_val = (lane == 0) ? s_ctx_p0 : ctx4.w;
+      const int32_t tier_val = ((s_exact_mask & (1u << lane)) != 0u) ? 0 : 1;
+      tr4[dst * 2 + 0] = make_int4(lane, ctx4.x, ctx4.y, ctx4.z);
+      tr4[dst * 2 + 1] = make_int4(u_t, s_step_id, pos_val, tier_val);
+    }
+    if (lane == 0) {
+      const int total_v = __popc(vmask);
+      const int new_len = (s_len0 + total_v <= tr_cap) ? (s_len0 + total_v) : tr_cap;
+      const int appended = (new_len > s_len0) ? (new_len - s_len0) : 0;
+      saved_row_ctx[3] = -1;
+      tr_state[0] = new_len;
+      tr_state[1] = s_step_id + 1;
+      tr_state[2] = s_ctx_p0;
+      if (stats != nullptr && stats_len >= 40) {
+        stats[39] += appended;
       }
     }
   }
@@ -2755,7 +2461,7 @@ __global__ void native_leaf_fix_hidden_kernel(
     for (int h = 0; h < h_len; ++h) {
       const int dst_row = hit_flag[2 + 2 * h];
       const int eff_src = hit_flag[3 + 2 * h];
-      if (dst_row <= 0 || eff_src <= 0) continue;
+      if (dst_row <= 0 || eff_src <= 0 || dst_row == eff_src) continue;
       uint4* dst = base + static_cast<int64_t>(dst_row) * row_stride_u4;
       const uint4* src = base + static_cast<int64_t>(eff_src) * row_stride_u4;
       for (int64_t i = threadIdx.x; i < copy_u4; i += blockDim.x) {
@@ -2766,7 +2472,7 @@ __global__ void native_leaf_fix_hidden_kernel(
   }
 
   const int eff_src = (src_row_ptr != nullptr) ? src_row_ptr[0] : src_row;
-  if (eff_src <= 0) return;
+  if (eff_src <= 0 || dst0 == eff_src) return;
   uint4* dst = base + static_cast<int64_t>(dst0) * row_stride_u4;
   const uint4* src = base + static_cast<int64_t>(eff_src) * row_stride_u4;
   for (int64_t i = threadIdx.x; i < copy_u4; i += blockDim.x) {
@@ -2813,7 +2519,7 @@ __global__ void native_leaf_fix_kv_all_layers_kernel(
     for (int k = 0; k < h_len; ++k) {
       const int dst_row = hit_flag[2 + 2 * k];
       const int eff_src = hit_flag[3 + 2 * k];
-      if (dst_row <= 0 || eff_src <= 0) continue;
+      if (dst_row <= 0 || eff_src <= 0 || dst_row == eff_src) continue;
       const int64_t s_dst = slot_mappings[gi_off + dst_row];
       const int64_t s_src = slot_mappings[gi_off + eff_src];
       if (s_dst < 0 || s_src < 0) continue;
@@ -2829,7 +2535,7 @@ __global__ void native_leaf_fix_kv_all_layers_kernel(
   }
 
   const int eff_src = (src_row_ptr != nullptr) ? src_row_ptr[0] : src_row;
-  if (eff_src <= 0) return;
+  if (eff_src <= 0 || dst0 == eff_src) return;
   const int64_t s_dst = slot_mappings[gi_off + dst0];
   const int64_t s_src = slot_mappings[gi_off + eff_src];
   if (s_dst < 0 || s_src < 0) return;
@@ -2840,126 +2546,6 @@ __global__ void native_leaf_fix_kv_all_layers_kernel(
   uint4* dst = reinterpret_cast<uint4*>(kv + blk_dst * sB + h * sH + off_dst * sS);
   const uint4* src = reinterpret_cast<const uint4*>(kv + blk_src * sB + h * sH + off_src * sS);
   dst[vec] = src[vec];
-}
-
-static const CalibKnobs& get_calib_knobs_env() {
-  static const CalibKnobs ck = []() -> CalibKnobs {
-    auto env_f = [](const char* name, float def) -> float {
-      const char* s = std::getenv(name);
-      return (s && *s) ? static_cast<float>(std::strtod(s, nullptr)) : def;
-    };
-    return CalibKnobs{
-        env_f("MUSE_CAL_A_SHIFT", -0.18f),
-        env_f("MUSE_CAL_A2", CAL_A2),
-        env_f("MUSE_CAL_BETA", CAL_BETA),
-        env_f("MUSE_CAL_BETA_POST", CAL_BETA_POST),
-        env_f("MUSE_CAL_W_SM", CAL_W_SM_PRE),
-        env_f("MUSE_CAL_W_Z0", CAL_W_Z0_PRE),
-        env_f("MUSE_CAL_W_Z0_POST", CAL_W_Z0_POST),
-        env_f("MUSE_CAL_Z0_CENTER", 36.0f),
-        env_f("MUSE_CAL_SHIFT", CAL_SHIFT),
-        env_f("MUSE_CAL_ALT2", 1.20f),
-    };
-  }();
-  return ck;
-}
-
-static const BgEbKnobs& get_bgeb_knobs_env() {
-  static const BgEbKnobs b = []() -> BgEbKnobs {
-    auto env_i = [](const char* name, int def) -> int {
-      const char* s = std::getenv(name);
-      return (s && *s) ? static_cast<int>(std::strtol(s, nullptr, 10)) : def;
-    };
-    auto env_f = [](const char* name, float def) -> float {
-      const char* s = std::getenv(name);
-      return (s && *s) ? static_cast<float>(std::strtod(s, nullptr)) : def;
-    };
-    BgEbKnobs v{};
-    v.bg_mode = env_i("MUSE_BG_MODE", 1);
-    v.bg_sub = env_i("MUSE_BG_SUB", 1);
-    v.bg_off = env_i("MUSE_BG_OFF", 1);
-    v.chp_bg2 = env_i("MUSE_BG_CHP_BG2", 1);
-    v.bg_alpha = env_f("MUSE_BG_ALPHA", 4.0f);
-    v.bg_min_p = env_f("MUSE_BG_MIN_P", 0.10f);
-    v.sub_min_p = env_f("MUSE_BG_SUB_MIN_P", 0.25f);
-    v.tri_min_p = env_f("MUSE_BG_TRI_MIN_P", 0.06f);
-    v.f2 = env_f("MUSE_BG_F2", 0.50f);
-    v.w2 = env_f("MUSE_BG_W2", 3.00f);
-    v.f3 = env_f("MUSE_BG_F3", 1.00f);
-    v.w3 = env_f("MUSE_BG_W3", 1.50f);
-    v.uniq_mode = env_i("MUSE_UNIQ_MODE", 1);
-    v.uniq_p2 = env_f("MUSE_UNIQ_P2", 0.42f);
-    v.uniq_p3 = env_f("MUSE_UNIQ_P3", 0.70f);
-    v.shf_cal = env_i("MUSE_SHF_CAL", 1);
-    v.shf_lo = env_f("MUSE_SHF_LO", 0.015f);
-    v.shf_hi = env_f("MUSE_SHF_HI", 0.11f);
-    v.eb_mode = env_i("MUSE_EB_MODE", 1);
-    v.eb_min_r = env_i("MUSE_EB_MIN_R", 4);
-    v.eb_p0 = env_f("MUSE_EB_P0", 0.72f);
-    v.eb_tau = env_f("MUSE_EB_TAU", 6.0f);
-    v.eb_scale = env_f("MUSE_EB_SCALE", 1.0f);
-    v.eb_lo = env_f("MUSE_EB_LO", -0.50f);
-    v.eb_hi = env_f("MUSE_EB_HI", 0.0f);
-    return v;
-  }();
-  return b;
-}
-
-static const AntiChimeraKnobs& get_ac_knobs_env() {
-  static const AntiChimeraKnobs a = []() -> AntiChimeraKnobs {
-    auto env_i = [](const char* name, int def) -> int {
-      const char* s = std::getenv(name);
-      return (s && *s) ? static_cast<int>(std::strtol(s, nullptr, 10)) : def;
-    };
-    auto env_f = [](const char* name, float def) -> float {
-      const char* s = std::getenv(name);
-      return (s && *s) ? static_cast<float>(std::strtod(s, nullptr)) : def;
-    };
-    AntiChimeraKnobs v{};
-    v.ac_mode = env_i("MUSE_AC_MODE", 1);
-    v.min_u = env_i("MUSE_AC_MIN_U", 4);
-    v.fwd_lambda = env_f("MUSE_AC_FWD_LAMBDA", 0.45f);
-    v.fwd_alpha = env_f("MUSE_AC_FWD_ALPHA", 3.0f);
-    v.fwd_cap = env_f("MUSE_AC_FWD_CAP", 1.10f);
-    v.min_v = env_i("MUSE_AC_MIN_V", 3);
-    v.rev_lambda = env_f("MUSE_AC_REV_LAMBDA", 0.60f);
-    v.rev_alpha = env_f("MUSE_AC_REV_ALPHA", 2.0f);
-    v.rev_cap = env_f("MUSE_AC_REV_CAP", 0.90f);
-    v.ent_lambda = env_f("MUSE_AC_ENT_LAMBDA", 0.35f);
-    return v;
-  }();
-  return a;
-}
-
-static const CascadeKnobs& get_cascade_knobs_env() {
-  static const CascadeKnobs c = []() -> CascadeKnobs {
-    auto env_i = [](const char* name, int def) -> int {
-      const char* s = std::getenv(name);
-      return (s && *s) ? static_cast<int>(std::strtol(s, nullptr, 10)) : def;
-    };
-    auto env_f = [](const char* name, float def) -> float {
-      const char* s = std::getenv(name);
-      return (s && *s) ? static_cast<float>(std::strtod(s, nullptr)) : def;
-    };
-    CascadeKnobs v{};
-    v.mode = env_i("MUSE_DFLASH_CASCADE", 1);
-    v.denoise_mode = env_i("MUSE_CASCADE_DENOISE", 0);
-    v.force_all = env_i("MUSE_CASCADE_FORCE_ALL", 0);
-    v.max_b = env_i("MUSE_CASCADE_MAX_B", 3);
-    v.max_r = env_i("MUSE_CASCADE_MAX_R", 2);
-    v.min_p = env_f("MUSE_CASCADE_MIN_P", 0.09f);
-    v.min_qrel = env_f("MUSE_CASCADE_MIN_QREL", 0.15f);
-    v.min_ev = env_f("MUSE_CASCADE_MIN_EV", 0.22f);
-    v.branch_gain = env_f("MUSE_CASCADE_BRANCH_GAIN", 0.58f);
-    v.denoise_min_a = env_f("MUSE_CASCADE_DENOISE_MIN_A", 0.50f);
-    v.denoise_max_p1 = env_f("MUSE_CASCADE_DENOISE_MAX_P1", 0.60f);
-    v.denoise_gain = env_f("MUSE_CASCADE_DENOISE_GAIN", 0.44f);
-    v.ddtree_w = env_f("MUSE_DDTREE_W", 0.35f);
-    v.lookahead_w = env_f("MUSE_CASCADE_LH", 0.30f);
-    v.backup_w = env_f("MUSE_CASCADE_BACKUP_W", 0.45f);
-    return v;
-  }();
-  return c;
 }
 
 }  // namespace
@@ -3017,9 +2603,7 @@ void native_leaf_setup_tree(
     c10::optional<torch::Tensor> tr_log,
     c10::optional<torch::Tensor> tr_state,
     int64_t vocab_size,
-    c10::optional<torch::Tensor> cascade_meta,
-    c10::optional<torch::Tensor> cascade_toks,
-    c10::optional<torch::Tensor> cascade_vals) {
+    bool allow_tail_drop) {
   TORCH_CHECK(tree_m >= 8 && tree_m <= 16, "tree_m must be in 8..16");
   TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32 && leaf_flag.numel() >= 1 + tree_m * 3);
   TORCH_CHECK(tree_top.is_cuda() && tree_top.scalar_type() == torch::kInt64 && tree_top.numel() >= 20);
@@ -3061,6 +2645,24 @@ void native_leaf_setup_tree(
     const char* s = std::getenv("MUSE_TREE_CALIB");
     return (!s || !*s || std::strtol(s, nullptr, 10) != 0) ? 1 : 0;
   }();
+  static const CalibKnobs ck_env = []() -> CalibKnobs {
+    auto env_f = [](const char* name, float def) -> float {
+      const char* s = std::getenv(name);
+      return (s && *s) ? static_cast<float>(std::strtod(s, nullptr)) : def;
+    };
+    return CalibKnobs{
+        env_f("MUSE_CAL_A_SHIFT", -0.18f),
+        env_f("MUSE_CAL_A2", CAL_A2),
+        env_f("MUSE_CAL_BETA", CAL_BETA),
+        env_f("MUSE_CAL_BETA_POST", CAL_BETA_POST),
+        env_f("MUSE_CAL_W_SM", CAL_W_SM_PRE),
+        env_f("MUSE_CAL_W_Z0", CAL_W_Z0_PRE),
+        env_f("MUSE_CAL_W_Z0_POST", CAL_W_Z0_POST),
+        env_f("MUSE_CAL_Z0_CENTER", 36.0f),
+        env_f("MUSE_CAL_SHIFT", CAL_SHIFT),
+        env_f("MUSE_CAL_ALT2", 1.20f),
+    };
+  }();
   const int32_t* hist_ptr = nullptr;
   const int32_t* hist_len_ptr = nullptr;
   int hist_cap = 0;
@@ -3084,7 +2686,11 @@ void native_leaf_setup_tree(
     stats_ptr = stats.value().data_ptr<int64_t>();
     stats_len = static_cast<int>(stats.value().numel());
   }
-  static const PlKnobs pl_env = []() -> PlKnobs {
+  static const bool dyn_env = []() -> bool {
+    const char* s = std::getenv("MUSE_LEAF_DYN_ENV");
+    return s && *s && std::strtol(s, nullptr, 10) != 0;
+  }();
+  auto build_pl_knobs = []() -> PlKnobs {
     auto env_i = [](const char* name, int def) -> int {
       const char* s = std::getenv(name);
       return (s && *s) ? static_cast<int>(std::strtol(s, nullptr, 10)) : def;
@@ -3141,8 +2747,47 @@ void native_leaf_setup_tree(
     p.boost_d1[5] = env_f("MUSE_PL_BOOST_D1_5", 0.75f);
     p.boost_d1[6] = env_f("MUSE_PL_BOOST_D1_6", 0.90f);
     return p;
+  };
+  static const PlKnobs pl_static = build_pl_knobs();
+  const PlKnobs pl_env = dyn_env ? build_pl_knobs() : pl_static;
+  static const BgEbKnobs bg_env = []() -> BgEbKnobs {
+    auto env_i = [](const char* name, int def) -> int {
+      const char* s = std::getenv(name);
+      return (s && *s) ? static_cast<int>(std::strtol(s, nullptr, 10)) : def;
+    };
+    auto env_f = [](const char* name, float def) -> float {
+      const char* s = std::getenv(name);
+      return (s && *s) ? static_cast<float>(std::strtod(s, nullptr)) : def;
+    };
+    BgEbKnobs b{};
+    b.bg_mode = env_i("MUSE_BG_MODE", 1);
+    b.bg_sub = env_i("MUSE_BG_SUB", 1);
+    b.bg_off = env_i("MUSE_BG_OFF", 1);
+    b.chp_bg2 = env_i("MUSE_BG_CHP_BG2", 1);
+    b.bg_alpha = env_f("MUSE_BG_ALPHA", 4.0f);
+    b.bg_min_p = env_f("MUSE_BG_MIN_P", 0.10f);
+    b.sub_min_p = env_f("MUSE_BG_SUB_MIN_P", 0.25f);
+    b.tri_min_p = env_f("MUSE_BG_TRI_MIN_P", 0.06f);
+    b.f2 = env_f("MUSE_BG_F2", 0.50f);
+    b.w2 = env_f("MUSE_BG_W2", 3.00f);
+    b.f3 = env_f("MUSE_BG_F3", 1.00f);
+    b.w3 = env_f("MUSE_BG_W3", 1.50f);
+    b.uniq_mode = env_i("MUSE_UNIQ_MODE", 1);
+    b.uniq_p2 = env_f("MUSE_UNIQ_P2", 0.42f);
+    b.uniq_p3 = env_f("MUSE_UNIQ_P3", 0.70f);
+    b.shf_cal = env_i("MUSE_SHF_CAL", 1);
+    b.shf_lo = env_f("MUSE_SHF_LO", 0.015f);
+    b.shf_hi = env_f("MUSE_SHF_HI", 0.11f);
+    b.eb_mode = env_i("MUSE_EB_MODE", 1);
+    b.eb_min_r = env_i("MUSE_EB_MIN_R", 4);
+    b.eb_p0 = env_f("MUSE_EB_P0", 0.72f);
+    b.eb_tau = env_f("MUSE_EB_TAU", 6.0f);
+    b.eb_scale = env_f("MUSE_EB_SCALE", 1.0f);
+    b.eb_lo = env_f("MUSE_EB_LO", -0.50f);
+    b.eb_hi = env_f("MUSE_EB_HI", 0.0f);
+    return b;
   }();
-  static const TrKnobs tr_env = []() -> TrKnobs {
+  auto build_tr_knobs = []() -> TrKnobs {
     auto env_i = [](const char* name, int def) -> int {
       const char* s = std::getenv(name);
       return (s && *s) ? static_cast<int>(std::strtol(s, nullptr, 10)) : def;
@@ -3171,8 +2816,66 @@ void native_leaf_setup_tree(
     t.ch_near_t6 = env_f("MUSE_TR_CH_NEAR_T6", 0.82f);
     t.ch_near_oov = env_f("MUSE_TR_CH_NEAR_OOV", 0.62f);
     t.ch_t6_agree = env_f("MUSE_TR_CH_T6_AGREE", 0.72f);
+    t.b_d1_tri = env_f("MUSE_TR_B_D1_TRI", 1.10f);
+    t.b_d1_bg = env_f("MUSE_TR_B_D1_BG", 0.70f);
+    t.b_d1_near = env_f("MUSE_TR_B_D1_NEAR", 0.55f);
+    t.uniq_tri3_root_p = env_f("MUSE_UNIQ_TRI3_ROOT_P", 0.44f);
+    t.rare_bg2_root_p = env_f("MUSE_RARE_BG2_ROOT_P", 0.38f);
+    t.det_bg2_2_root_p = env_f("MUSE_DET_BG2_2_ROOT_P", 0.0f);
+    t.ch_a1_bg_t6 = env_f("MUSE_TR_CH_A1_BG_T6", 0.80f);
+    t.ch_a1_bg_oov = env_f("MUSE_TR_CH_A1_BG_OOV", 0.58f);
     return t;
-  }();
+  };
+  static const TrKnobs tr_static = build_tr_knobs();
+  const TrKnobs tr_env = dyn_env ? build_tr_knobs() : tr_static;
+
+  auto build_ac_knobs = []() -> AntiChimeraKnobs {
+    auto env_i = [](const char* name, int def) -> int {
+      const char* s = std::getenv(name);
+      return (s && *s) ? static_cast<int>(std::strtol(s, nullptr, 10)) : def;
+    };
+    auto env_f = [](const char* name, float def) -> float {
+      const char* s = std::getenv(name);
+      return (s && *s) ? static_cast<float>(std::strtod(s, nullptr)) : def;
+    };
+    AntiChimeraKnobs a{};
+    a.ac_mode = env_i("MUSE_AC_MODE", 1);
+    a.min_u = env_i("MUSE_AC_MIN_U", 4);
+    a.fwd_lambda = env_f("MUSE_AC_FWD_LAMBDA", 0.45f);
+    a.fwd_alpha = env_f("MUSE_AC_FWD_ALPHA", 3.0f);
+    a.fwd_cap = env_f("MUSE_AC_FWD_CAP", 1.10f);
+    a.min_v = env_i("MUSE_AC_MIN_V", 3);
+    a.rev_lambda = env_f("MUSE_AC_REV_LAMBDA", 0.60f);
+    a.rev_alpha = env_f("MUSE_AC_REV_ALPHA", 2.0f);
+    a.rev_cap = env_f("MUSE_AC_REV_CAP", 0.90f);
+    a.ent_lambda = env_f("MUSE_AC_ENT_LAMBDA", 0.35f);
+    a.ddtree_w = env_f("MUSE_DDTREE_W", 0.35f);
+    a.lh_copy_w = env_f("MUSE_LH_COPY_W", 0.18f);
+    a.root_fwd_lambda = env_f("MUSE_AC_ROOT_FWD", 0.0f);
+    return a;
+  };
+  static const AntiChimeraKnobs ac_static = build_ac_knobs();
+  const AntiChimeraKnobs ac_env = dyn_env ? build_ac_knobs() : ac_static;
+
+  auto build_td_knobs = []() -> TailDropKnobs {
+    auto env_i = [](const char* name, int def) -> int {
+      const char* s = std::getenv(name);
+      return (s && *s) ? static_cast<int>(std::strtol(s, nullptr, 10)) : def;
+    };
+    auto env_f = [](const char* name, float def) -> float {
+      const char* s = std::getenv(name);
+      return (s && *s) ? static_cast<float>(std::strtod(s, nullptr)) : def;
+    };
+    TailDropKnobs t{};
+    t.mode = env_i("MUSE_TAIL_DROP", 0);
+    t.min_chain = env_i("MUSE_TAIL_DROP_MIN_CHAIN", 4);
+    t.max_suf_p1 = env_f("MUSE_TAIL_DROP_MAX_SUF_P1", 0.55f);
+    t.chain_bias = env_f("MUSE_TAIL_DROP_CHAIN_BIAS", 1.15f);
+    t.corr_exp = env_f("MUSE_TAIL_DROP_CORR_EXP", 0.78f);
+    return t;
+  };
+  static const TailDropKnobs td_static = build_td_knobs();
+  const TailDropKnobs td_env = dyn_env ? build_td_knobs() : td_static;
   int32_t* row_ctx_ptr = nullptr;
   if (saved_row_ctx.has_value() && saved_row_ctx.value().defined() &&
       saved_row_ctx.value().numel() >= tree_m * 4) {
@@ -3193,25 +2896,6 @@ void native_leaf_setup_tree(
     tr_state_ptr = tr_state.value().data_ptr<int32_t>();
     tr_cap = static_cast<int>(tr_log.value().numel() / 8);
   }
-  int32_t* casc_meta_ptr = nullptr;
-  if (cascade_meta.has_value() && cascade_meta.value().defined() && cascade_meta.value().numel() >= 8) {
-    TORCH_CHECK(cascade_meta.value().is_cuda() && cascade_meta.value().scalar_type() == torch::kInt32);
-    casc_meta_ptr = cascade_meta.value().data_ptr<int32_t>();
-  }
-  const int64_t* casc_toks_ptr = nullptr;
-  if (cascade_toks.has_value() && cascade_toks.value().defined() && cascade_toks.value().numel() >= 36) {
-    TORCH_CHECK(cascade_toks.value().is_cuda() && cascade_toks.value().scalar_type() == torch::kInt64);
-    casc_toks_ptr = cascade_toks.value().data_ptr<int64_t>();
-  }
-  const float* casc_vals_ptr = nullptr;
-  if (cascade_vals.has_value() && cascade_vals.value().defined() && cascade_vals.value().numel() >= 36) {
-    TORCH_CHECK(cascade_vals.value().is_cuda() && cascade_vals.value().scalar_type() == torch::kFloat32);
-    casc_vals_ptr = cascade_vals.value().data_ptr<float>();
-  }
-  const CalibKnobs& ck_env = get_calib_knobs_env();
-  const BgEbKnobs& bg_env = get_bgeb_knobs_env();
-  const AntiChimeraKnobs& ac_env = get_ac_knobs_env();
-  const CascadeKnobs& csk_env = get_cascade_knobs_env();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   native_leaf_setup_tree_kernel<<<1, 256, 0, st>>>(
       leaf_flag.data_ptr<int32_t>(),
@@ -3252,10 +2936,8 @@ void native_leaf_setup_tree(
       tr_cap,
       static_cast<int>(vocab_size > 0 ? vocab_size : 202048),
       ac_env,
-      casc_meta_ptr,
-      casc_toks_ptr,
-      casc_vals_ptr,
-      csk_env);
+      allow_tail_drop ? 1 : 0,
+      td_env);
 }
 
 void native_leaf_commit_tree(
@@ -3281,8 +2963,7 @@ void native_leaf_commit_tree(
     c10::optional<torch::Tensor> tr_log,
     c10::optional<torch::Tensor> tr_state,
     int64_t vocab_size,
-    bool chain_all_valid,
-    c10::optional<torch::Tensor> cascade_meta) {
+    bool chain_all_valid) {
   TORCH_CHECK(tree_m >= 8 && tree_m <= 16, "tree_m must be in 8..16");
   TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32);
   TORCH_CHECK(prev_ns.is_cuda() && prev_ns.scalar_type() == torch::kInt32);
@@ -3358,13 +3039,8 @@ void native_leaf_commit_tree(
     tr_state_ptr = tr_state.value().data_ptr<int32_t>();
     tr_cap = static_cast<int>(tr_log.value().numel() / 8);
   }
-  int32_t* casc_meta_ptr = nullptr;
-  if (cascade_meta.has_value() && cascade_meta.value().defined() && cascade_meta.value().numel() >= 8) {
-    TORCH_CHECK(cascade_meta.value().is_cuda() && cascade_meta.value().scalar_type() == torch::kInt32);
-    casc_meta_ptr = cascade_meta.value().data_ptr<int32_t>();
-  }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  native_leaf_commit_tree_kernel<<<1, 1, 0, st>>>(
+  native_leaf_commit_tree_kernel<<<1, 32, 0, st>>>(
       leaf_flag.data_ptr<int32_t>(),
       prev_ns.data_ptr<int32_t>(),
       hit_flag.data_ptr<int32_t>(),
@@ -3392,8 +3068,7 @@ void native_leaf_commit_tree(
       tr_state_ptr,
       tr_cap,
       static_cast<int>(vocab_size > 0 ? vocab_size : 202048),
-      chain_all_valid ? 1 : 0,
-      casc_meta_ptr);
+      chain_all_valid ? 1 : 0);
 }
 
 void native_leaf_setup(
@@ -3563,320 +3238,4 @@ void native_leaf_fix_kv(
       layer_gid.data_ptr<int32_t>(),
       num_layers,
       static_cast<int>(src_row));
-}
-
-namespace {
-
-struct CondGraphEntry {
-  cudaGraph_t outer_graph = nullptr;
-  cudaGraphExec_t outer_exec = nullptr;
-};
-
-std::mutex g_cond_mu;
-int64_t g_next_cloned_id = 1;
-int64_t g_next_exec_id = 1;
-std::unordered_map<int64_t, cudaGraph_t> g_cloned_graphs;
-std::unordered_map<int64_t, CondGraphEntry> g_cond_execs;
-
-CascadePrepArgs make_cascade_prep_args(
-    torch::Tensor input_ids,
-    torch::Tensor query_positions,
-    torch::Tensor draft_tokens,
-    torch::Tensor tree_top,
-    torch::Tensor tree_vals,
-    c10::optional<torch::Tensor> alt_ids,
-    c10::optional<torch::Tensor> alt_margins,
-    c10::optional<torch::Tensor> req_acc_state,
-    torch::Tensor cascade_meta,
-    torch::Tensor p1_save_draft,
-    torch::Tensor p1_save_top,
-    torch::Tensor p1_save_vals,
-    c10::optional<torch::Tensor> p1_save_alt,
-    c10::optional<torch::Tensor> p1_save_margins,
-    c10::optional<torch::Tensor> stats,
-    int64_t mask_token_id) {
-  TORCH_CHECK(input_ids.is_cuda() && input_ids.scalar_type() == torch::kInt32 && input_ids.numel() >= 16);
-  TORCH_CHECK(query_positions.is_cuda() && query_positions.scalar_type() == torch::kInt64 && query_positions.numel() >= 1);
-  TORCH_CHECK(draft_tokens.is_cuda() && draft_tokens.scalar_type() == torch::kInt64 && draft_tokens.numel() >= 6);
-  TORCH_CHECK(tree_top.is_cuda() && tree_top.scalar_type() == torch::kInt64 && tree_top.numel() >= 36);
-  TORCH_CHECK(tree_vals.is_cuda() && tree_vals.scalar_type() == torch::kFloat32 && tree_vals.numel() >= 36);
-  TORCH_CHECK(cascade_meta.is_cuda() && cascade_meta.scalar_type() == torch::kInt32 && cascade_meta.numel() >= 8);
-  TORCH_CHECK(p1_save_draft.is_cuda() && p1_save_draft.scalar_type() == torch::kInt64 && p1_save_draft.numel() >= 6);
-  TORCH_CHECK(p1_save_top.is_cuda() && p1_save_top.scalar_type() == torch::kInt64 && p1_save_top.numel() >= 36);
-  TORCH_CHECK(p1_save_vals.is_cuda() && p1_save_vals.scalar_type() == torch::kFloat32 && p1_save_vals.numel() >= 36);
-
-  CascadePrepArgs a{};
-  a.input_ids = input_ids.data_ptr<int32_t>();
-  a.query_positions = query_positions.data_ptr<int64_t>();
-  a.draft_tokens = draft_tokens.data_ptr<int64_t>();
-  a.tree_top = tree_top.data_ptr<int64_t>();
-  a.tree_vals = tree_vals.data_ptr<float>();
-  a.alt_ids = (alt_ids.has_value() && alt_ids.value().defined() && alt_ids.value().numel() >= 4)
-      ? alt_ids.value().data_ptr<int64_t>()
-      : nullptr;
-  a.alt_margins = (alt_margins.has_value() && alt_margins.value().defined() && alt_margins.value().numel() >= 2)
-      ? alt_margins.value().data_ptr<float>()
-      : nullptr;
-  a.req_acc_state = (req_acc_state.has_value() && req_acc_state.value().defined() && req_acc_state.value().numel() >= 3)
-      ? req_acc_state.value().data_ptr<int32_t>()
-      : nullptr;
-  a.cascade_meta = cascade_meta.data_ptr<int32_t>();
-  a.p1_save_draft = p1_save_draft.data_ptr<int64_t>();
-  a.p1_save_top = p1_save_top.data_ptr<int64_t>();
-  a.p1_save_vals = p1_save_vals.data_ptr<float>();
-  a.p1_save_alt = (p1_save_alt.has_value() && p1_save_alt.value().defined() && p1_save_alt.value().numel() >= 4)
-      ? p1_save_alt.value().data_ptr<int64_t>()
-      : nullptr;
-  a.p1_save_margins = (p1_save_margins.has_value() && p1_save_margins.value().defined() && p1_save_margins.value().numel() >= 2)
-      ? p1_save_margins.value().data_ptr<float>()
-      : nullptr;
-  if (stats.has_value() && stats.value().defined() && stats.value().numel() >= 4) {
-    a.stats = stats.value().data_ptr<int64_t>();
-    a.stats_len = static_cast<int>(stats.value().numel());
-  } else {
-    a.stats = nullptr;
-    a.stats_len = 0;
-  }
-  a.mask_token_id = static_cast<int32_t>(mask_token_id);
-  static const int calib_env = []() -> int {
-    const char* s = std::getenv("MUSE_TREE_CALIB");
-    return (!s || !*s || std::strtol(s, nullptr, 10) != 0) ? 1 : 0;
-  }();
-  a.calib_mode = calib_env;
-  a.ck = get_calib_knobs_env();
-  a.bg = get_bgeb_knobs_env();
-  a.csk = get_cascade_knobs_env();
-  a.cond_handle = cudaGraphConditionalHandle{};
-  a.has_cond_handle = 0;
-  return a;
-}
-
-}  // namespace
-
-void dflash_cascade_gate_prep(
-    torch::Tensor input_ids,
-    torch::Tensor query_positions,
-    torch::Tensor draft_tokens,
-    torch::Tensor tree_top,
-    torch::Tensor tree_vals,
-    torch::Tensor cascade_meta,
-    torch::Tensor p1_save_draft,
-    torch::Tensor p1_save_top,
-    torch::Tensor p1_save_vals,
-    int64_t mask_token_id,
-    c10::optional<torch::Tensor> alt_ids,
-    c10::optional<torch::Tensor> alt_margins,
-    c10::optional<torch::Tensor> p1_save_alt,
-    c10::optional<torch::Tensor> p1_save_margins,
-    c10::optional<torch::Tensor> req_acc_state,
-    c10::optional<torch::Tensor> stats) {
-  CascadePrepArgs args = make_cascade_prep_args(
-      input_ids, query_positions, draft_tokens, tree_top, tree_vals,
-      alt_ids, alt_margins, req_acc_state, cascade_meta,
-      p1_save_draft, p1_save_top, p1_save_vals, p1_save_alt, p1_save_margins,
-      stats, mask_token_id);
-  auto st = c10::cuda::getCurrentCUDAStream().stream();
-  dflash_cascade_gate_prep_kernel<<<1, 64, 0, st>>>(args);
-}
-
-void dflash_cascade_post_restore(
-    torch::Tensor input_ids,
-    torch::Tensor draft_tokens,
-    torch::Tensor tree_top,
-    torch::Tensor tree_vals,
-    torch::Tensor cascade_meta,
-    torch::Tensor cascade_toks,
-    torch::Tensor cascade_vals,
-    torch::Tensor p1_save_draft,
-    torch::Tensor p1_save_top,
-    torch::Tensor p1_save_vals,
-    int64_t mask_token_id,
-    c10::optional<torch::Tensor> alt_ids,
-    c10::optional<torch::Tensor> alt_margins,
-    c10::optional<torch::Tensor> p1_save_alt,
-    c10::optional<torch::Tensor> p1_save_margins) {
-  TORCH_CHECK(input_ids.is_cuda() && input_ids.scalar_type() == torch::kInt32 && input_ids.numel() >= 16);
-  TORCH_CHECK(draft_tokens.is_cuda() && draft_tokens.scalar_type() == torch::kInt64 && draft_tokens.numel() >= 6);
-  TORCH_CHECK(tree_top.is_cuda() && tree_top.scalar_type() == torch::kInt64 && tree_top.numel() >= 36);
-  TORCH_CHECK(tree_vals.is_cuda() && tree_vals.scalar_type() == torch::kFloat32 && tree_vals.numel() >= 36);
-  TORCH_CHECK(cascade_meta.is_cuda() && cascade_meta.scalar_type() == torch::kInt32 && cascade_meta.numel() >= 8);
-  TORCH_CHECK(cascade_toks.is_cuda() && cascade_toks.scalar_type() == torch::kInt64 && cascade_toks.numel() >= 36);
-  TORCH_CHECK(cascade_vals.is_cuda() && cascade_vals.scalar_type() == torch::kFloat32 && cascade_vals.numel() >= 36);
-  TORCH_CHECK(p1_save_draft.is_cuda() && p1_save_draft.scalar_type() == torch::kInt64 && p1_save_draft.numel() >= 6);
-  TORCH_CHECK(p1_save_top.is_cuda() && p1_save_top.scalar_type() == torch::kInt64 && p1_save_top.numel() >= 36);
-  TORCH_CHECK(p1_save_vals.is_cuda() && p1_save_vals.scalar_type() == torch::kFloat32 && p1_save_vals.numel() >= 36);
-
-  int64_t* alt_ptr = (alt_ids.has_value() && alt_ids.value().defined() && alt_ids.value().numel() >= 4)
-      ? alt_ids.value().data_ptr<int64_t>()
-      : nullptr;
-  float* marg_ptr = (alt_margins.has_value() && alt_margins.value().defined() && alt_margins.value().numel() >= 2)
-      ? alt_margins.value().data_ptr<float>()
-      : nullptr;
-  const int64_t* s_alt_ptr = (p1_save_alt.has_value() && p1_save_alt.value().defined() && p1_save_alt.value().numel() >= 4)
-      ? p1_save_alt.value().data_ptr<int64_t>()
-      : nullptr;
-  const float* s_marg_ptr = (p1_save_margins.has_value() && p1_save_margins.value().defined() && p1_save_margins.value().numel() >= 2)
-      ? p1_save_margins.value().data_ptr<float>()
-      : nullptr;
-
-  auto st = c10::cuda::getCurrentCUDAStream().stream();
-  dflash_cascade_post_restore_kernel<<<1, 64, 0, st>>>(
-      input_ids.data_ptr<int32_t>(),
-      draft_tokens.data_ptr<int64_t>(),
-      tree_top.data_ptr<int64_t>(),
-      tree_vals.data_ptr<float>(),
-      alt_ptr,
-      marg_ptr,
-      cascade_meta.data_ptr<int32_t>(),
-      cascade_toks.data_ptr<int64_t>(),
-      cascade_vals.data_ptr<float>(),
-      p1_save_draft.data_ptr<int64_t>(),
-      p1_save_top.data_ptr<int64_t>(),
-      p1_save_vals.data_ptr<float>(),
-      s_alt_ptr,
-      s_marg_ptr,
-      static_cast<int32_t>(mask_token_id));
-}
-
-int64_t dflash_cascade_clone_capturing_graph() {
-  auto st = c10::cuda::getCurrentCUDAStream().stream();
-  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-  unsigned long long cap_id = 0;
-  cudaGraph_t raw_graph = nullptr;
-  cudaError_t err = cudaStreamGetCaptureInfo(st, &status, &cap_id, &raw_graph, nullptr, nullptr, nullptr);
-  TORCH_CHECK(err == cudaSuccess && status == cudaStreamCaptureStatusActive && raw_graph != nullptr,
-              "dflash_cascade_clone_capturing_graph requires an active capturing stream: ",
-              cudaGetErrorString(err));
-  cudaGraph_t cloned = nullptr;
-  err = cudaGraphClone(&cloned, raw_graph);
-  TORCH_CHECK(err == cudaSuccess && cloned != nullptr,
-              "cudaGraphClone failed: ", cudaGetErrorString(err));
-  std::lock_guard<std::mutex> lk(g_cond_mu);
-  const int64_t id = g_next_cloned_id++;
-  g_cloned_graphs[id] = cloned;
-  return id;
-}
-
-int64_t dflash_cascade_build_cond_graph(
-    int64_t graph_handle,
-    bool is_raw_cuda_graph_ptr,
-    torch::Tensor input_ids,
-    torch::Tensor query_positions,
-    torch::Tensor draft_tokens,
-    torch::Tensor tree_top,
-    torch::Tensor tree_vals,
-    torch::Tensor cascade_meta,
-    torch::Tensor p1_save_draft,
-    torch::Tensor p1_save_top,
-    torch::Tensor p1_save_vals,
-    int64_t mask_token_id,
-    c10::optional<torch::Tensor> alt_ids,
-    c10::optional<torch::Tensor> alt_margins,
-    c10::optional<torch::Tensor> p1_save_alt,
-    c10::optional<torch::Tensor> p1_save_margins,
-    c10::optional<torch::Tensor> req_acc_state,
-    c10::optional<torch::Tensor> stats) {
-  cudaGraph_t src_graph = nullptr;
-  cudaGraph_t owned_clone = nullptr;
-  if (is_raw_cuda_graph_ptr) {
-    src_graph = reinterpret_cast<cudaGraph_t>(static_cast<uintptr_t>(graph_handle));
-    TORCH_CHECK(src_graph != nullptr, "Null raw cudaGraph_t pointer");
-  } else {
-    std::lock_guard<std::mutex> lk(g_cond_mu);
-    auto it = g_cloned_graphs.find(graph_handle);
-    TORCH_CHECK(it != g_cloned_graphs.end(), "Unknown cloned graph handle: ", graph_handle);
-    src_graph = it->second;
-    owned_clone = src_graph;
-    g_cloned_graphs.erase(it);
-  }
-
-  CascadePrepArgs prep_args = make_cascade_prep_args(
-      input_ids, query_positions, draft_tokens, tree_top, tree_vals,
-      alt_ids, alt_margins, req_acc_state, cascade_meta,
-      p1_save_draft, p1_save_top, p1_save_vals, p1_save_alt, p1_save_margins,
-      stats, mask_token_id);
-
-  cudaGraph_t outer_graph = nullptr;
-  cudaError_t err = cudaGraphCreate(&outer_graph, 0);
-  TORCH_CHECK(err == cudaSuccess && outer_graph != nullptr,
-              "cudaGraphCreate failed: ", cudaGetErrorString(err));
-
-  cudaGraphConditionalHandle cond_handle{};
-  err = cudaGraphConditionalHandleCreate(&cond_handle, outer_graph, 0u, cudaGraphCondAssignDefault);
-  if (err != cudaSuccess) {
-    cudaGraphDestroy(outer_graph);
-    if (owned_clone != nullptr) cudaGraphDestroy(owned_clone);
-    TORCH_CHECK(false, "cudaGraphConditionalHandleCreate failed: ", cudaGetErrorString(err));
-  }
-  prep_args.cond_handle = cond_handle;
-  prep_args.has_cond_handle = 1;
-
-  cudaKernelNodeParams kparams{};
-  kparams.func = reinterpret_cast<void*>(dflash_cascade_gate_prep_kernel);
-  kparams.gridDim = dim3(1, 1, 1);
-  kparams.blockDim = dim3(64, 1, 1);
-  kparams.sharedMemBytes = 0;
-  void* kargs[1] = {&prep_args};
-  kparams.kernelParams = kargs;
-  kparams.extra = nullptr;
-
-  cudaGraphNode_t prep_node = nullptr;
-  err = cudaGraphAddKernelNode(&prep_node, outer_graph, nullptr, 0, &kparams);
-  if (err != cudaSuccess) {
-    cudaGraphDestroy(outer_graph);
-    if (owned_clone != nullptr) cudaGraphDestroy(owned_clone);
-    TORCH_CHECK(false, "cudaGraphAddKernelNode(prep) failed: ", cudaGetErrorString(err));
-  }
-
-  cudaGraphNodeParams cparams{};
-  std::memset(&cparams, 0, sizeof(cparams));
-  cparams.type = cudaGraphNodeTypeConditional;
-  cparams.conditional.handle = cond_handle;
-  cparams.conditional.type = cudaGraphCondTypeIf;
-  cparams.conditional.size = 1;
-
-  cudaGraphNode_t cond_node = nullptr;
-  err = cudaGraphAddNode(&cond_node, outer_graph, &prep_node, nullptr, 1, &cparams);
-  if (err != cudaSuccess) {
-    cudaGraphDestroy(outer_graph);
-    if (owned_clone != nullptr) cudaGraphDestroy(owned_clone);
-    TORCH_CHECK(false, "cudaGraphAddNode(conditional) failed: ", cudaGetErrorString(err));
-  }
-
-  cudaGraph_t body_graph = cparams.conditional.phGraph_out[0];
-  cudaGraphNode_t child_node = nullptr;
-  err = cudaGraphAddChildGraphNode(&child_node, body_graph, nullptr, 0, src_graph);
-  if (owned_clone != nullptr) {
-    cudaGraphDestroy(owned_clone);
-    owned_clone = nullptr;
-  }
-  if (err != cudaSuccess) {
-    cudaGraphDestroy(outer_graph);
-    TORCH_CHECK(false, "cudaGraphAddChildGraphNode(body) failed: ", cudaGetErrorString(err));
-  }
-
-  cudaGraphExec_t outer_exec = nullptr;
-  err = cudaGraphInstantiate(&outer_exec, outer_graph, 0);
-  if (err != cudaSuccess) {
-    cudaGraphDestroy(outer_graph);
-    TORCH_CHECK(false, "cudaGraphInstantiate(cond) failed: ", cudaGetErrorString(err));
-  }
-
-  std::lock_guard<std::mutex> lk(g_cond_mu);
-  const int64_t exec_id = g_next_exec_id++;
-  g_cond_execs[exec_id] = CondGraphEntry{outer_graph, outer_exec};
-  return exec_id;
-}
-
-void dflash_cascade_launch_cond_graph(int64_t exec_id) {
-  cudaGraphExec_t exec = nullptr;
-  {
-    std::lock_guard<std::mutex> lk(g_cond_mu);
-    auto it = g_cond_execs.find(exec_id);
-    TORCH_CHECK(it != g_cond_execs.end(), "Unknown conditional graph exec_id: ", exec_id);
-    exec = it->second.outer_exec;
-  }
-  auto st = c10::cuda::getCurrentCUDAStream().stream();
-  cudaError_t err = cudaGraphLaunch(exec, st);
-  TORCH_CHECK(err == cudaSuccess, "cudaGraphLaunch(cond) failed: ", cudaGetErrorString(err));
 }

@@ -12,7 +12,7 @@ _INNER = 19968
 _ROWS = 512
 _USE_WS = os.environ.get("MUSE_FP8_SWIGLU_WS", "1") != "0"
 _USE_FP8WS_ACCEL = os.environ.get("MUSE_FP8_SWIGLU_FP8WS", "1") != "0"
-_USE_DOWN = _USE_FP8WS_ACCEL and os.environ.get("MUSE_FP8_SWIGLU_DOWN", "1") != "0"
+_USE_DOWN = _USE_FP8WS_ACCEL and os.environ.get("MUSE_FP8_SWIGLU_DOWN", "0") != "0"
 _USE_DUAL_A = _USE_FP8WS_ACCEL and os.environ.get("MUSE_FP8_SWIGLU_DUAL_A", "1") != "0"
 _USE_BF16_DUAL = _USE_FP8WS_ACCEL and os.environ.get("MUSE_FP8_SWIGLU_BF16_DUAL", "1") != "0"
 

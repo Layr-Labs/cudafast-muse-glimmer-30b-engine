@@ -1438,6 +1438,7 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
             draft_head.tp_size = 1
             draft_head.org_vocab_size = len(draft_ids)
             draft_head.prompt_tail_admitted = False
+            draft_head.fast_dhead_admitted = False
 
             fast_dhead_admitted = False
             want_fast_dhead = (
@@ -1449,7 +1450,214 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                 and (k_dim % 128 == 0)
                 and os.environ.get("MUSE_DHEAD_FAST", "1") != "0"
             )
-            if want_fast_dhead:
+            if want_fast_dhead and os.environ.get("MUSE_DHEAD_TERNARY", "1") != "0":
+                try:
+                    import muse_bfx_ext as _bfx
+
+                    if (
+                        hasattr(_bfx, "dhead_fast_pack")
+                        and hasattr(_bfx, "dhead_fast_argmax")
+                        and hasattr(_bfx, "draft_vocab_score_rows")
+                    ):
+                        dh_bits = int(os.environ.get("MUSE_DHEAD_BITS", "158"))
+                        if dh_bits not in (158, 2):
+                            dh_bits = 158
+                        default_topk = 256 if dh_bits == 158 else 192
+                        dh_topk = max(16, min(256, int(os.environ.get("MUSE_DHEAD_TOPK", str(default_topk)))))
+
+                        dh_blob, dh_rscales, dh_cscales, dh_toks = _bfx.dhead_fast_pack(
+                            raw_w_full, raw_s_full, raw_gs_full, ids, dh_bits
+                        )
+                        in_static = torch.zeros((vocab_n,), dtype=torch.uint8, device=dev)
+                        in_static.scatter_(0, ids, 1)
+                        tail_ids = torch.full((512,), -1, dtype=torch.int32, device=dev)
+                        tail_count = torch.zeros((1,), dtype=torch.int32, device=dev)
+                        tail_seen = torch.zeros((vocab_n,), dtype=torch.int32, device=dev)
+                        ids_i32 = ids.to(torch.int32).contiguous()
+
+                        best_lat_ms = 0.0
+                        if os.environ.get("MUSE_DRAFT_VOCAB_PLACE", "1") != "0":
+                            try:
+                                spares = [torch.empty_like(dh_blob) for _ in range(6)]
+                                for sp in spares:
+                                    sp.copy_(dh_blob)
+                                evict = torch.ones((48 << 20) // 4, dtype=torch.float32, device=dev)
+                                x_p = (
+                                    ((torch.arange(6 * k_dim, device=dev) % 7).float() - 3.0)
+                                    .to(torch.bfloat16)
+                                    .reshape(6, k_dim)
+                                    .contiguous()
+                                )
+                                cands = [dh_blob, *spares]
+                                _ = evict.sum()
+                                _ = _bfx.dhead_fast_argmax(
+                                    x_p, dh_blob, dh_rscales, dh_cscales, dh_toks,
+                                    tail_ids, tail_count, raw_w_full, raw_s_full, raw_gs_full,
+                                    1.0, dh_bits, dh_topk,
+                                )
+                                torch.cuda.synchronize(dev)
+                                samples_dh: list[list[float]] = [[] for _ in cands]
+                                for _ in range(5):
+                                    for ci, buf in enumerate(cands):
+                                        _ = evict.sum()
+                                        se = torch.cuda.Event(enable_timing=True)
+                                        ee = torch.cuda.Event(enable_timing=True)
+                                        se.record()
+                                        _ = _bfx.dhead_fast_argmax(
+                                            x_p, buf, dh_rscales, dh_cscales, dh_toks,
+                                            tail_ids, tail_count, raw_w_full, raw_s_full, raw_gs_full,
+                                            1.0, dh_bits, dh_topk,
+                                        )
+                                        ee.record()
+                                        torch.cuda.synchronize(dev)
+                                        samples_dh[ci].append(se.elapsed_time(ee))
+                                times_dh = [median(s) for s in samples_dh]
+                                best_i = min(range(len(cands)), key=times_dh.__getitem__)
+                                best_lat_ms = times_dh[best_i]
+                                if best_i > 0 and times_dh[0] - times_dh[best_i] >= 0.005:
+                                    dh_blob = cands[best_i]
+                                    logger.info(
+                                        "Fast 2-stage ternary draft_head DRAM placement: saved %.3f ms (%.3f -> %.3f ms)",
+                                        times_dh[0] - times_dh[best_i],
+                                        times_dh[0],
+                                        times_dh[best_i],
+                                    )
+                                del spares, cands, evict, x_p
+                                torch.cuda.empty_cache()
+                            except Exception as exc_pl:  # noqa: BLE001
+                                logger.warning("Fast 2-stage draft_head DRAM placement skipped (%s)", exc_pl)
+
+                        gen = torch.Generator(device=dev).manual_seed(20261130)
+                        probe_n = 6
+                        probe_pos = torch.tensor(
+                            [0, 17, 1024, 16384, 49152, len(draft_ids) - 1],
+                            dtype=torch.long,
+                            device=dev,
+                        )
+                        probe_orig = ids.index_select(0, probe_pos)
+                        pw = raw_w_full.index_select(0, probe_orig)
+                        ps = raw_s_full.index_select(0, probe_orig).view(torch.float8_e4m3fn).float()
+                        e2m1_lut = torch.tensor(
+                            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+                            dtype=torch.float32,
+                            device=dev,
+                        )
+                        lo_v = e2m1_lut[(pw & 0xF).long()]
+                        hi_v = e2m1_lut[(pw >> 4).long()]
+                        pw_f = torch.stack((lo_v, hi_v), dim=-1).reshape(probe_n, k_dim // 16, 16)
+                        pw_f = (pw_f * ps.unsqueeze(-1) * raw_gs_full.float()).reshape(probe_n, k_dim)
+                        x_peak = (
+                            pw_f / pw_f.norm(dim=-1, keepdim=True).clamp_min(1e-6) * 1.15
+                            + torch.randn((probe_n, k_dim), generator=gen, device=dev) * (10.0 / (k_dim ** 0.5))
+                        ).to(torch.bfloat16).contiguous()
+
+                        ref_chunks = [
+                            _bfx.draft_vocab_score_rows(
+                                x_peak, ids_i32[s_i : s_i + 8192], raw_w_full, raw_s_full, raw_gs_full, 1.0
+                            )
+                            for s_i in range(0, len(draft_ids), 8192)
+                        ]
+                        ref_peak_logits = torch.cat(ref_chunks, dim=1)
+                        ref_peak_arg = ids.index_select(0, ref_peak_logits.argmax(dim=-1))
+
+                        got_peak_top6 = torch.empty((probe_n * 6,), dtype=torch.int64, device=dev)
+                        got_peak_vals = torch.empty((probe_n * 6,), dtype=torch.float32, device=dev)
+                        got_peak_top2 = torch.empty((4,), dtype=torch.int64, device=dev)
+                        got_peak_marg = torch.empty((2,), dtype=torch.float32, device=dev)
+                        got_peak_arg = _bfx.dhead_fast_argmax(
+                            x_peak, dh_blob, dh_rscales, dh_cscales, dh_toks,
+                            tail_ids, tail_count, raw_w_full, raw_s_full, raw_gs_full, 1.0,
+                            dh_bits, dh_topk, got_peak_top2, got_peak_marg,
+                            got_peak_top6, got_peak_vals,
+                        )
+                        torch.cuda.synchronize(dev)
+
+                        top1_hits = int((got_peak_arg == ref_peak_arg).sum().item())
+                        chk_rows = got_peak_top6[:6].to(torch.int32).contiguous()
+                        chk_exact = _bfx.draft_vocab_score_rows(
+                            x_peak[:1].contiguous(), chk_rows,
+                            raw_w_full, raw_s_full, raw_gs_full, 1.0,
+                        ).reshape(-1)
+                        rescore_err = (got_peak_vals[:6] - chk_exact).abs().max().item()
+                        finite_ok = (
+                            bool(torch.isfinite(got_peak_vals).all().item())
+                            and bool(torch.isfinite(got_peak_marg).all().item())
+                            and bool((got_peak_arg >= 0).all().item())
+                            and bool((got_peak_arg < vocab_n).all().item())
+                        )
+                        if finite_ok and top1_hits == probe_n and rescore_err <= 1e-4:
+                            class _FastTernaryDraftHeadQuantMethod:
+                                def apply(
+                                    self,
+                                    dh_layer: torch.nn.Module,
+                                    x: torch.Tensor,
+                                    bias: torch.Tensor | None = None,
+                                ) -> torch.Tensor:
+                                    x_2d = x.reshape(-1, x.shape[-1])
+                                    x_c = (x_2d if x_2d.is_contiguous() else x_2d.contiguous()).to(torch.bfloat16)
+                                    n_d_rows = int(dh_layer._dhead_ids_i32.numel())
+                                    out = torch.empty((x_c.shape[0], n_d_rows), dtype=x.dtype, device=x.device)
+                                    for s_i in range(0, n_d_rows, 8192):
+                                        c_ids = dh_layer._dhead_ids_i32[s_i : s_i + 8192]
+                                        sc = _bfx.draft_vocab_score_rows(
+                                            x_c,
+                                            c_ids,
+                                            dh_layer.full_raw_w,
+                                            dh_layer.full_raw_s,
+                                            dh_layer.full_global_scale,
+                                            1.0,
+                                        )
+                                        out[:, s_i : s_i + c_ids.numel()] = sc.to(x.dtype)
+                                    if bias is not None:
+                                        out = out + bias
+                                    return out.reshape(*x.shape[:-1], n_d_rows)
+
+                            draft_head.register_buffer("fast_dhead_blob", dh_blob, persistent=False)
+                            draft_head.register_buffer("fast_dhead_row_scales", dh_rscales, persistent=False)
+                            draft_head.register_buffer("fast_dhead_col_scales", dh_cscales, persistent=False)
+                            draft_head.register_buffer("fast_dhead_tok_ids", dh_toks, persistent=False)
+                            draft_head.register_buffer("_dhead_ids_i32", ids_i32, persistent=False)
+                            draft_head.register_buffer("full_raw_w", raw_w_full, persistent=False)
+                            draft_head.register_buffer("full_raw_s", raw_s_full, persistent=False)
+                            draft_head.register_buffer("full_global_scale", raw_gs_full, persistent=False)
+                            draft_head.register_buffer("in_static_vocab", in_static, persistent=False)
+                            draft_head.register_buffer("tail_ids", tail_ids, persistent=False)
+                            draft_head.register_buffer("tail_count", tail_count, persistent=False)
+                            draft_head.register_buffer("tail_seen", tail_seen, persistent=False)
+                            draft_head.fast_dhead_mode = dh_bits
+                            draft_head.fast_dhead_topk = dh_topk
+                            draft_head.fast_dhead_admitted = True
+                            draft_head.prompt_tail_admitted = True
+                            draft_head.quant_method = _FastTernaryDraftHeadQuantMethod()
+                            fast_dhead_admitted = True
+                            object.__setattr__(layer, "_draft_vocab_head", draft_head)
+                            bpw = 1.625 if dh_bits == 158 else 2.000
+                            logger.info(
+                                "Fast 2-stage ternary draft_head admitted (mode=%d, bpw=%.3f, blob=%.1f MB, "
+                                "topk=%d, peaked_top1=%d/%d, rescore_err=%.6f, lat=%.3f ms)",
+                                dh_bits,
+                                bpw,
+                                dh_blob.numel() / (1024.0 * 1024.0),
+                                dh_topk,
+                                top1_hits,
+                                probe_n,
+                                rescore_err,
+                                best_lat_ms,
+                            )
+                        else:
+                            logger.warning(
+                                "Fast 2-stage ternary draft_head self-check failed (finite=%s, top1=%d/%d, "
+                                "rescore_err=%.6f); falling back",
+                                finite_ok,
+                                top1_hits,
+                                probe_n,
+                                rescore_err,
+                            )
+                except Exception as exc_tdh:  # noqa: BLE001
+                    logger.warning("Fast 2-stage ternary draft_head skipped (%s); falling back", exc_tdh)
+
+            if want_fast_dhead and not fast_dhead_admitted:
                 try:
                     import sys
                     import muse_bfx_ext as _bfx
@@ -1461,12 +1669,12 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                         and hasattr(_bfx, "draft_vocab_tail_argmax")
                         and hasattr(_bfx, "draft_vocab_score_rows")
                     ):
-                        dhead_ctas = int(os.environ.get("MUSE_DHEAD_CTAS", "96"))
+                        dhead_ctas = int(os.environ.get("MUSE_DHEAD_CTAS", "192"))
                         if dhead_ctas not in (48, 96, 192):
-                            dhead_ctas = 96
-                        dhead_mode = int(os.environ.get("MUSE_DHEAD_MODE", "1"))
+                            dhead_ctas = 192
+                        dhead_mode = int(os.environ.get("MUSE_DHEAD_MODE", "2"))
                         if dhead_mode not in (0, 1, 2, 3):
-                            dhead_mode = 1
+                            dhead_mode = 2
                         dhead_rk = int(os.environ.get("MUSE_DHEAD_RESCORE_K", "96"))
 
                         w_packed = _bfx.draft_head_pack(

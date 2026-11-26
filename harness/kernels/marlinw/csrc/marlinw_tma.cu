@@ -140,7 +140,7 @@ __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* map, int 
 // A CTA may run several tiles back to back (kTilesPerCta): q0 is the position of this tile's first k-tile in the CTA's
 // k-tile stream of length `total`, and the copies keep running across the tile boundary.
 template <int MB, bool kPdl = false, bool kPdlProd = false, int kEpiExtraVal = 0, bool kSingleFa = false,
-          class Produce, class OnTile>
+          int kPdlLead = 8, class Produce, class OnTile>
 __device__ __forceinline__ void k_loop(
     float (&acc)[MB][2][2][4], const int iters, const int b_rd, const int b_row, const int s_rd, const int s_row,
     Produce&& produce, OnTile&& on_tile, const int q0 = 0, const int total_or_0 = 0,
@@ -269,7 +269,7 @@ __device__ __forceinline__ void k_loop(
 #pragma unroll 1
   for (; t < stop; t++) {
     if constexpr (kPdlProd) {
-      if (t == ((iters - 8 > t0) ? (iters - 8) : t0) && q0 + iters == total) pdl_launch_dependents();
+      if (t == ((iters - kPdlLead > t0) ? (iters - kPdlLead) : t0) && q0 + iters == total) pdl_launch_dependents();
     }
     const int q = q0 + t;
     const int s = q & (kStages - 1);
@@ -371,7 +371,8 @@ struct IntTag {
   static constexpr int value = V;
 };
 
-template <int MB, bool kLater, int kCols, bool kShflEpi = true, int kPdlMode = 0>  // kPdlMode: 0=off, 1=prod-only, 2=dual
+template <int MB, bool kLater, int kCols, bool kShflEpi = true, int kPdlMode = 0,
+          bool kSplitK = (kCols == 6656), int kPdlLead = 8>  // kPdlMode: 0=off, 1=prod-only, 2=dual
 __device__ __forceinline__ void down_tile(
     const CUtensorMap* tmA, const CUtensorMap* tmB, const CUtensorMap* tmS, int4* __restrict__ C0,
     float4* __restrict__ scratch, const float gs, const int row0, const int col, const int slot, const int cut_a,
@@ -379,6 +380,7 @@ __device__ __forceinline__ void down_tile(
     , const int piece, volatile int* const flags, const int cut_a2 = -1, const int cut_b2 = -1
     ) {
   constexpr bool kTwoCuts = (kCols == 4096);
+  constexpr bool kHasCuts = (kCols != 4608);
   extern __shared__ int4 sh[];
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -391,17 +393,13 @@ __device__ __forceinline__ void down_tile(
   const int n_first = 4 - ((row0 >> 4) & 3);  // m-blocks in the chunk containing row0
   float4* my_scratch = scratch + ((size_t)slot * 256 + tid) * 32;
   float4* my_scratch2 = scratch + ((size_t)(slot + 1) * 256 + tid) * 32;
-  // K pieces. piece = k0 | role << 10 | index << 12: this CTA runs k-tiles [k0, k0 + k_tiles) of its tile (k0 a
-  // multiple of 8). role 0: the whole tile. 1: first piece (chains from +0, state stored at the end). 2: middle piece
-  // (state loaded, state stored). 3: last piece (state loaded, epilogue). The state is every thread's accumulator
-  // registers (scratch slot `index`), so the chains of a split tile are the chains of the whole tile, HMMA for HMMA.
-  // A later piece waits until its predecessor has published the state: flags[index] goes 0 -> 1 (first piece
-  // done) -> 2 (middle piece done) -> 0 (taken by the last piece).
-  const int k0 = (kCols == 6656 && kLater) ? (piece & 1023) : 0;
+  // K pieces. piece = k0 | role << 10 | index << 12 (bit 30 reserved for dual-kernel target select)
+  const int k0 = (kSplitK && kLater) ? (piece & 1023) : 0;
   const int k1 = k0 + k_tiles;
-  if constexpr (kCols == 6656 && kLater) {
+  const int hand_idx = (piece >> 12) & 0x3FFFF;
+  if constexpr (kSplitK && kLater) {
     if (tid == 0 && (piece & 2048)) {
-      volatile int* const flag = flags + (piece >> 12);
+      volatile int* const flag = flags + hand_idx;
       const int before = ((piece >> 10) & 3) - 1;
       while (*flag != before) {
       }
@@ -411,36 +409,40 @@ __device__ __forceinline__ void down_tile(
   }
   // Runs before k-tile t; returns the k-tile before which it has to run again (the next cut, or the end).
   auto cuts = [&](const int t) {
-    if (t == cut_a || t == cut_b || (kTwoCuts && (t == cut_a2 || t == cut_b2))) {
-      __syncthreads();
+    if constexpr (!kHasCuts) {
+      return k1;
+    } else {
+      if (t == cut_a || t == cut_b || (kTwoCuts && (t == cut_a2 || t == cut_b2))) {
+        __syncthreads();
 #pragma unroll
-      for (int i = 0; i < MB; i++) {
-        const int ci = i < n_first ? cut_a : cut_b;
-        if (ci == t) {
+        for (int i = 0; i < MB; i++) {
+          const int ci = i < n_first ? cut_a : cut_b;
+          if (ci == t) {
 #pragma unroll
-          for (int e = 0; e < 4; e++) my_scratch[i * 4 + e] = reinterpret_cast<float4*>(acc[i])[e];
-#pragma unroll
-          for (int e = 0; e < 16; e++) reinterpret_cast<float*>(acc[i])[e] = 0.0f;
-        } else if constexpr (kTwoCuts) {
-          const int ci2 = i < n_first ? cut_a2 : cut_b2;
-          if (ci2 == t) {
-#pragma unroll
-            for (int e = 0; e < 4; e++) my_scratch2[i * 4 + e] = reinterpret_cast<float4*>(acc[i])[e];
+            for (int e = 0; e < 4; e++) my_scratch[i * 4 + e] = reinterpret_cast<float4*>(acc[i])[e];
 #pragma unroll
             for (int e = 0; e < 16; e++) reinterpret_cast<float*>(acc[i])[e] = 0.0f;
+          } else if constexpr (kTwoCuts) {
+            const int ci2 = i < n_first ? cut_a2 : cut_b2;
+            if (ci2 == t) {
+#pragma unroll
+              for (int e = 0; e < 4; e++) my_scratch2[i * 4 + e] = reinterpret_cast<float4*>(acc[i])[e];
+#pragma unroll
+              for (int e = 0; e < 16; e++) reinterpret_cast<float*>(acc[i])[e] = 0.0f;
+            }
           }
         }
+        __syncthreads();
       }
-      __syncthreads();
+      int stop = k1;
+      if (cut_a > t && cut_a < stop) stop = cut_a;
+      if (cut_b > t && cut_b < stop) stop = cut_b;
+      if constexpr (kTwoCuts) {
+        if (cut_a2 > t && cut_a2 < stop) stop = cut_a2;
+        if (cut_b2 > t && cut_b2 < stop) stop = cut_b2;
+      }
+      return stop;
     }
-    int stop = k1;
-    if (cut_a > t && cut_a < stop) stop = cut_a;
-    if (cut_b > t && cut_b < stop) stop = cut_b;
-    if constexpr (kTwoCuts) {
-      if (cut_a2 > t && cut_a2 < stop) stop = cut_a2;
-      if (cut_b2 > t && cut_b2 < stop) stop = cut_b2;
-    }
-    return stop;
   };
   auto produce = [&](const int g, const uint32_t dst, const uint32_t bar, const int mode) {
     if (mode == 0) {
@@ -458,20 +460,21 @@ __device__ __forceinline__ void down_tile(
     }
   };
   // codes: int4 (64 g + 32 nb + lane), int2 sh2 of it; scales: int 32 g + 2 (8 nb + lane / 4) + sh2
-  k_loop<MB, (kPdlMode == 2), (kPdlMode != 0)>(acc, k1, kABytes / 4 + 4 * (32 * nb + lane) + 2 * sh2, 256,
-                              (kABytes + kBBytes) / 4 + 2 * (8 * nb + (lane >> 2)) + sh2, 32, produce, cuts, 0, 0,
-                              kLater ? scratch + (size_t)(piece >> 12) * (kThreads * 32) : nullptr, k0);
+  k_loop<MB, (kPdlMode == 2), (kPdlMode != 0), 0, false, kPdlLead>(
+      acc, k1, kABytes / 4 + 4 * (32 * nb + lane) + 2 * sh2, 256,
+      (kABytes + kBBytes) / 4 + 2 * (8 * nb + (lane >> 2)) + sh2, 32, produce, cuts, 0, 0,
+      (kSplitK && kLater) ? scratch + (size_t)hand_idx * (kThreads * 32) : nullptr, k0);
   __syncthreads();
-  if constexpr (kCols == 6656) {
+  if constexpr (kSplitK) {
     const int role = (piece >> 10) & 3;
     if (kLater ? (role == 2) : (role == 1)) {
-      float4* const hand = scratch + (size_t)(piece >> 12) * (kThreads * 32);
+      float4* const hand = scratch + (size_t)hand_idx * (kThreads * 32);
 #pragma unroll
       for (int e = 0; e < MB * 4; e++) hand[e * kThreads + tid] = reinterpret_cast<float4*>(acc)[e];
       __threadfence();
       __syncthreads();
       if (tid == 0) {
-        flags[piece >> 12] = role;
+        flags[hand_idx] = role;
         __threadfence();
       }
       return;
@@ -510,6 +513,7 @@ __device__ __forceinline__ void down_tile(
           c[0] = r.x + c[0]; c[1] = r.y + c[1]; c[2] = r.z + c[2]; c[3] = r.w + c[3];
         }
       }
+      if constexpr (kHasCuts) {
       if (cut_a >= 0 || cut_b >= 0) {
         const float4* s0 = scratch + ((size_t)slot * 256 + t128) * 32;
         const float4* s1 = scratch + ((size_t)slot * 256 + t128 + 128) * 32;
@@ -557,6 +561,7 @@ __device__ __forceinline__ void down_tile(
             }
           }
         }
+      }
       }
       __nv_bfloat16* C = reinterpret_cast<__nv_bfloat16*>(C0);
       if constexpr (kShflEpi) {
@@ -761,6 +766,56 @@ __global__ void __launch_bounds__(kThreads, 1) down(
   } else {
     down_tile<8, false, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
                         reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
+  }
+}
+
+template <bool kShflEpi = true, int kPdlMode = 0>
+__global__ void __launch_bounds__(kThreads, 1) down_dual(
+    const __grid_constant__ CUtensorMap tmA8,
+    const __grid_constant__ CUtensorMap tmB_q, const __grid_constant__ CUtensorMap tmS_q,
+    const __grid_constant__ CUtensorMap tmB_g, const __grid_constant__ CUtensorMap tmS_g,
+    int4* __restrict__ Cq, int4* __restrict__ Cg, float4* __restrict__ scratch,
+    const float* __restrict__ gs_q_ptr, const float* __restrict__ gs_g_ptr,
+    int4* __restrict__ work,
+    const uint8_t* __restrict__ wq_raw, size_t wq_bytes,
+    const uint8_t* __restrict__ wg_raw, size_t wg_bytes) {
+  if (blockIdx.x == 0) {
+    constexpr size_t kTpf = 2048u << 10;
+    if (wq_raw != nullptr) {
+      for (size_t off = static_cast<size_t>(threadIdx.x) * kTpf; off < wq_bytes;
+           off += static_cast<size_t>(kThreads) * kTpf) {
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(wq_raw + off));
+      }
+    }
+    if (wg_raw != nullptr) {
+      for (size_t off = static_cast<size_t>(threadIdx.x) * kTpf; off < wg_bytes;
+           off += static_cast<size_t>(kThreads) * kTpf) {
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(wg_raw + off));
+      }
+    }
+  }
+  const int4 w0 = work[2 * blockIdx.x];
+  const int4 w1 = work[2 * blockIdx.x + 1];
+  if (w1.w & (1 << 30)) {
+    if (threadIdx.x == 0) {
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA8) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB_g) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmS_g) : "memory");
+    }
+    const int cut_a2 = static_cast<int>(static_cast<int16_t>(w0.z & 0xFFFF));
+    const int cut_b2 = static_cast<int>(static_cast<int16_t>((w0.z >> 16) & 0xFFFF));
+    down_tile<8, false, 4096, kShflEpi, kPdlMode, false, 24>(
+        &tmA8, &tmB_g, &tmS_g, Cg, scratch, gs_g_ptr[0], w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, 0,
+        nullptr, cut_a2, cut_b2);
+  } else {
+    if (threadIdx.x == 0) {
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA8) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB_q) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmS_q) : "memory");
+    }
+    down_tile<8, false, 4608, kShflEpi, kPdlMode, false, 24>(
+        &tmA8, &tmB_q, &tmS_q, Cq, scratch, gs_q_ptr[0], w0.x, w0.y, 0, -1, -1, w1.z, 0,
+        nullptr, -1, -1);
   }
 }
 #else
@@ -1317,6 +1372,18 @@ static int tma_pdl_mode() {
   return env_mode;
 }
 
+static int tma_dual_pdl_mode() {
+  if (g_tma_pdl_override >= 0) return g_tma_pdl_override;
+  static const int env_mode = []() -> int {
+    constexpr int kDefault = 2;  // Dual SM121 PDL on 272-CTA down_dual (Wave 6 overlaps qk_norm_rope via kPdlLead=24)
+    const char* env = std::getenv("MARLINW_DUAL_TMA_PDL");
+    if (!env || !*env) return kDefault;
+    long v = std::strtol(env, nullptr, 10);
+    return (v == 0 || v == 1 || v == 2) ? static_cast<int>(v) : kDefault;
+  }();
+  return env_mode;
+}
+
 template <typename Kernel, typename... Args>
 static cudaError_t launch_ex_pdl(Kernel kernel, int blocks, int threads, size_t smem, cudaStream_t st,
                                  const Args&... args) {
@@ -1431,6 +1498,80 @@ extern "C" int marlinw_down128_shape_tma_main(
     return launch_down_shape<4096>(input, weight, output, scratch, scales, global_scale, work, grid, k, row_stride,
                                    stream);
   return cudaErrorInvalidValue;
+}
+
+static int init_down_dual(int* active_blocks) {
+  using namespace MARLIN_NAMESPACE_NAME;
+  auto status = find_encode();
+  if (status != cudaSuccess) return status;
+  status = cudaFuncSetAttribute(down_dual<true, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  if (status != cudaSuccess) return status;
+  status = cudaFuncSetAttribute(down_dual<false, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  if (status != cudaSuccess) return status;
+  status = cudaFuncSetAttribute(down_dual<true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  if (status != cudaSuccess) return status;
+  status = cudaFuncSetAttribute(down_dual<false, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  if (status != cudaSuccess) return status;
+  status = cudaFuncSetAttribute(down_dual<true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  if (status != cudaSuccess) return status;
+  status = cudaFuncSetAttribute(down_dual<false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  if (status != cudaSuccess) return status;
+  int occ_s1 = 0, occ_n1 = 0, occ_s2 = 0, occ_n2 = 0;
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_s1, down_dual<true, 1>, kThreads, kShared);
+  if (status != cudaSuccess) return status;
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_n1, down_dual<false, 1>, kThreads, kShared);
+  if (status != cudaSuccess) return status;
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_s2, down_dual<true, 2>, kThreads, kShared);
+  if (status != cudaSuccess) return status;
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_n2, down_dual<false, 2>, kThreads, kShared);
+  if (status != cudaSuccess) return status;
+  int occ = occ_s1 < occ_n1 ? occ_s1 : occ_n1;
+  if (occ_s2 < occ) occ = occ_s2;
+  if (occ_n2 < occ) occ = occ_n2;
+  *active_blocks = occ;
+  return cudaSuccess;
+}
+
+extern "C" int marlinw_down128_dual_tma_init(int* active_blocks) {
+  return init_down_dual(active_blocks);
+}
+
+extern "C" int marlinw_down128_dual_tma_main(
+    const int4* input,
+    const int4* w_q, const int4* s_q, const float* gs_q, int4* out_q,
+    const int4* w_g, const int4* s_g, const float* gs_g, int4* out_g,
+    float4* scratch, const int4* work, int grid, int row_stride, cudaStream_t stream) {
+  using namespace MARLIN_NAMESPACE_NAME;
+  constexpr int kK = 6656;
+  constexpr int kNq = 4608;
+  constexpr int kNg = 4096;
+  if (!encode || row_stride < kK || row_stride % 8) return cudaErrorInvalidValue;
+  if (((uintptr_t)input | (uintptr_t)w_q | (uintptr_t)s_q | (uintptr_t)w_g | (uintptr_t)s_g) & 15)
+    return cudaErrorInvalidValue;
+  CUtensorMap tmA8, tmB_q, tmS_q, tmB_g, tmS_g;
+  if (!map2d(&tmA8, input, 1, 2 * (uint64_t)kK, 512, 2 * (uint64_t)row_stride, 128, 128, true) ||
+      !map2d(&tmB_q, w_q, 4, 2 * (uint64_t)kNq, (uint64_t)kK / 16, 8 * (uint64_t)kNq, 256, 4, false) ||
+      !map2d(&tmS_q, s_q, 1, (uint64_t)kNq, (uint64_t)kK / 16, (uint64_t)kNq, 128, 4, false) ||
+      !map2d(&tmB_g, w_g, 4, 2 * (uint64_t)kNg, (uint64_t)kK / 16, 8 * (uint64_t)kNg, 256, 4, false) ||
+      !map2d(&tmS_g, s_g, 1, (uint64_t)kNg, (uint64_t)kK / 16, (uint64_t)kNg, 128, 4, false))
+    return cudaErrorInvalidValue;
+  const int pm = tma_dual_pdl_mode();
+  constexpr size_t wq_bytes = (static_cast<size_t>(kNq) * static_cast<size_t>(kK)) >> 1;
+  constexpr size_t wg_bytes = (static_cast<size_t>(kNg) * static_cast<size_t>(kK)) >> 1;
+  const uint8_t* wq_raw = reinterpret_cast<const uint8_t*>(w_q);
+  const uint8_t* wg_raw = reinterpret_cast<const uint8_t*>(w_g);
+  if (pm == 2) {
+    auto kernel = g_shfl_epi ? down_dual<true, 2> : down_dual<false, 2>;
+    return launch_ex_pdl(kernel, grid, kThreads, kShared, stream, tmA8, tmB_q, tmS_q, tmB_g, tmS_g,
+                         out_q, out_g, scratch, gs_q, gs_g, const_cast<int4*>(work),
+                         wq_raw, wq_bytes, wg_raw, wg_bytes);
+  }
+  auto kernel = (pm == 1) ? (g_shfl_epi ? down_dual<true, 1> : down_dual<false, 1>)
+                          : (g_shfl_epi ? down_dual<true, 0> : down_dual<false, 0>);
+  kernel<<<grid, kThreads, kShared, stream>>>(
+      tmA8, tmB_q, tmS_q, tmB_g, tmS_g, out_q, out_g, scratch, gs_q, gs_g, const_cast<int4*>(work),
+      wq_raw, wq_bytes, wg_raw, wg_bytes);
+  return cudaGetLastError();
 }
 #else
 namespace MARLIN_NAMESPACE_NAME {

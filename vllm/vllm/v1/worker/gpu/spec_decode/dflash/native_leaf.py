@@ -99,15 +99,7 @@ class _NativeLeafState:
         self.saved_row_ctx: torch.Tensor | None = None      # int32[16, 4] per-row (cur, prv1, prv2, pos_r)
         self.tr_log: torch.Tensor | None = None             # int32[2048, 8] per-request 30B target recycle log
         self.tr_state: torch.Tensor | None = None           # int32[4] [tr_len, tr_step, last_p0, reserved]
-        self.stats: torch.Tensor | None = None              # int64[52] telemetry counters
-        self.cascade_meta: torch.Tensor | None = None       # int32[8] Pass-2 cascade metadata & row mask
-        self.cascade_toks: torch.Tensor | None = None       # int64[36] Pass-2 / backup top-6 tokens
-        self.cascade_vals: torch.Tensor | None = None       # float32[36] Pass-2 / backup top-6 logits
-        self.p1_save_draft: torch.Tensor | None = None      # int64[6] saved Pass-1 draft_tokens
-        self.p1_save_top: torch.Tensor | None = None        # int64[36] saved Pass-1 tree_top
-        self.p1_save_vals: torch.Tensor | None = None       # float32[36] saved Pass-1 tree_vals
-        self.p1_save_alt: torch.Tensor | None = None        # int64[4] saved Pass-1 alt_ids
-        self.p1_save_margins: torch.Tensor | None = None    # float32[2] saved Pass-1 alt_margins
+        self.stats: torch.Tensor | None = None              # int64[44] telemetry counters
         # Static 52-layer target KV metadata for 1-launch all-layer KV fix on hit.
         self.num_layers: int = 0
         self.kv_ptrs: torch.Tensor | None = None
@@ -146,11 +138,10 @@ def _dump_stats(tag: str) -> None:
                 pl_extra = f" hist_ok/bad={st[32]}/{st[33]} pl_roots={st[34]} pl_boosts={st[35]}"
             if len(st) >= 40:
                 pl_extra += f" tr_boosts={st[36]} tr_roots={st[37]} tr_conts={st[38]} tr_rows={st[39]}"
-            if len(st) >= 48 and st[40] > 0:
-                pl_extra += (
-                    f" casc[ev={st[40]} br={st[41]} dn={st[42]} "
-                    f"pl={st[43]} hit={st[44]} ex={st[45]} dn_chg/hit={st[46]}/{st[47]}]"
-                )
+            if len(st) >= 48:
+                pl_extra += f" ac_pen={st[40]} tr_d1={st[41]} tr_a1_cont={st[42]} rare_pl={st[43]} root_ac={st[44]}"
+            if len(st) >= 52 and (st[48] > 0 or st[50] > 0 or st[51] > 0):
+                pl_extra += f" td[st={st[48]} drop={st[49]} hit={st[50]} cl={st[51]}]"
             logger.info(
                 "native_leaf_stats[%s]: steps=%d active=%d hits=%d deep_hits=%d extra_toks=%d deep_bonus=%d "
                 "total_ns=%d max_len=%d len1..6=%s k1..6=%s slots0..8=%s reached_d2/3/4+=%d/%d/%d%s",
@@ -278,89 +269,6 @@ def get_tree_vals_buf(device: torch.device) -> torch.Tensor | None:
     with torch.inference_mode(False):
         _S.tree_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
     return _S.tree_vals
-
-
-def get_cascade_bufs(
-    device: torch.device,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-] | None:
-    """Return fixed-address Pass-2 cascade buffers (CUDA-graph safe)."""
-    if not ENABLED or TREE_M == 0 or device.type != "cuda":
-        return None
-    if (
-        _S.cascade_meta is not None
-        and _S.cascade_meta.device == device
-        and not _S.cascade_meta.is_inference()
-        and _S.cascade_toks is not None
-        and _S.cascade_vals is not None
-        and _S.p1_save_draft is not None
-        and _S.p1_save_top is not None
-        and _S.p1_save_vals is not None
-        and _S.p1_save_alt is not None
-        and _S.p1_save_margins is not None
-        and _S.req_acc_state is not None
-        and _S.stats is not None
-        and _S.stats.numel() >= 52
-    ):
-        return (
-            _S.cascade_meta,
-            _S.cascade_toks,
-            _S.cascade_vals,
-            _S.p1_save_draft,
-            _S.p1_save_top,
-            _S.p1_save_vals,
-            _S.p1_save_alt,
-            _S.p1_save_margins,
-            _S.req_acc_state,
-            _S.stats,
-        )
-    if torch.cuda.is_current_stream_capturing():
-        return None
-    with torch.inference_mode(False):
-        _S.cascade_meta = torch.zeros((8,), dtype=torch.int32, device=device)
-        _S.cascade_toks = torch.full((36,), -1, dtype=torch.int64, device=device)
-        _S.cascade_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
-        _S.p1_save_draft = torch.full((6,), -1, dtype=torch.int64, device=device)
-        _S.p1_save_top = torch.full((36,), -1, dtype=torch.int64, device=device)
-        _S.p1_save_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
-        _S.p1_save_alt = torch.full((4,), -1, dtype=torch.int64, device=device)
-        _S.p1_save_margins = torch.full((2,), 1e30, dtype=torch.float32, device=device)
-        if (
-            _S.req_acc_state is None
-            or _S.req_acc_state.device != device
-            or _S.req_acc_state.numel() < 3
-            or _S.req_acc_state.is_inference()
-        ):
-            _S.req_acc_state = torch.zeros((3,), dtype=torch.int32, device=device)
-        if (
-            _S.stats is None
-            or _S.stats.device != device
-            or _S.stats.numel() < 52
-            or _S.stats.is_inference()
-        ):
-            _S.stats = torch.zeros((52,), dtype=torch.int64, device=device)
-    return (
-        _S.cascade_meta,
-        _S.cascade_toks,
-        _S.cascade_vals,
-        _S.p1_save_draft,
-        _S.p1_save_top,
-        _S.p1_save_vals,
-        _S.p1_save_alt,
-        _S.p1_save_margins,
-        _S.req_acc_state,
-        _S.stats,
-    )
 
 
 def _reset_hist_for_req(req_id: str | None) -> None:
@@ -512,15 +420,7 @@ def init_kv_table(
             _S.tree_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
         else:
             _S.tree_vals.fill_(-1e30)
-        if (
-            _S.req_acc_state is None
-            or _S.req_acc_state.device != device
-            or _S.req_acc_state.numel() < 3
-            or _S.req_acc_state.is_inference()
-        ):
-            _S.req_acc_state = torch.zeros((3,), dtype=torch.int32, device=device)
-        else:
-            _S.req_acc_state.zero_()
+        _S.req_acc_state = torch.zeros((3,), dtype=torch.int32, device=device)
         _S.saved_alt_tok = torch.full((1,), -1, dtype=torch.int64, device=device)
         _S.saved_leaf_toks = torch.full((16,), -1, dtype=torch.int64, device=device)
         _S.saved_leaf_k = torch.zeros((16,), dtype=torch.int32, device=device)
@@ -531,16 +431,7 @@ def init_kv_table(
         _S.saved_row_ctx = torch.full((16, 4), -1, dtype=torch.int32, device=device)
         _S.tr_log = torch.zeros((TR_LOG_CAP, 8), dtype=torch.int32, device=device)
         _S.tr_state = torch.tensor([0, 0, -1, 0], dtype=torch.int32, device=device)
-        if (
-            _S.stats is None
-            or _S.stats.device != device
-            or _S.stats.numel() < 52
-            or _S.stats.is_inference()
-        ):
-            _S.stats = torch.zeros((52,), dtype=torch.int64, device=device)
-        else:
-            _S.stats.zero_()
-        get_cascade_bufs(device)
+        _S.stats = torch.zeros((56,), dtype=torch.int64, device=device)
         _S.num_layers = len(kv_ptrs)
         _S.kv_ptrs = torch.tensor(kv_ptrs, dtype=torch.int64, device=device)
         _S.stride_block = torch.tensor(s_blk, dtype=torch.int64, device=device)
@@ -618,8 +509,6 @@ def on_non_leaf_step(
             _S.tree_top.fill_(-1)
         if _S.tree_vals is not None:
             _S.tree_vals.fill_(-1e30)
-        if _S.cascade_meta is not None:
-            _S.cascade_meta.zero_()
         _S.req_acc_state.zero_()
         _reset_tr_state()
 
@@ -655,6 +544,7 @@ def setup_step(
     slot_mappings: torch.Tensor,
     m8_mode: bool = False,
     verify_m: int | None = None,
+    allow_tail_drop: bool = False,
 ) -> bool:
     """Zero-sync GPU setup for a bs=1, depth=6 verify step (tree M=12/16, M=8 zero-clamp, or legacy M=7)."""
     if not _S.ready:
@@ -696,8 +586,6 @@ def setup_step(
             _S.tree_top.fill_(-1)
         if _S.tree_vals is not None:
             _S.tree_vals.fill_(-1e30)
-        if _S.cascade_meta is not None:
-            _S.cascade_meta.zero_()
         _S.req_acc_state.zero_()
         _reset_tr_state()
     if eff_m > 8:
@@ -737,9 +625,7 @@ def setup_step(
                 tr_log_arg,
                 tr_state_arg,
                 _S.vocab_size,
-                _S.cascade_meta,
-                _S.cascade_toks,
-                _S.cascade_vals,
+                bool(allow_tail_drop),
             )
         except TypeError:
             try:
@@ -767,6 +653,9 @@ def setup_step(
                     _S.hist_len,
                     _S.saved_pos0,
                     _S.stats,
+                    _S.saved_row_ctx,
+                    tr_log_arg,
+                    tr_state_arg,
                 )
             except TypeError:
                 bfx.native_leaf_setup_tree(
@@ -869,7 +758,6 @@ def commit_and_fix(
                 tr_state_arg,
                 _S.vocab_size,
                 chain_all_valid,
-                _S.cascade_meta,
             )
         except TypeError:
             try:
@@ -892,6 +780,9 @@ def commit_and_fix(
                     _S.hist,
                     _S.hist_len,
                     _S.saved_pos0,
+                    _S.saved_row_ctx,
+                    tr_log_arg,
+                    tr_state_arg,
                 )
             except TypeError:
                 bfx.native_leaf_commit_tree(

@@ -490,9 +490,9 @@ extern "C" int muse_embed_norm_m1(const void* ids, int ids_64, const void* table
 
 extern "C" int muse_embed_norm_m(const void* ids, int ids_64, const void* table, float eps,
                                  void* out, int rows, int width, cudaStream_t stream) {
-  if (rows <= 0 || rows > 32 || width <= 0 || (width & 7) != 0 || width > 8192)
+  if (rows <= 0 || rows > 4096 || width <= 0 || (width & 7) != 0 || width > 8192)
     return cudaErrorInvalidValue;
-  const bool use_pdl = decode_tail_pdl_enabled();
+  const bool use_pdl = (rows <= 16) && decode_tail_pdl_enabled();
   if (use_pdl) {
     if (ids_64)
       return static_cast<int>(launch_pdl(

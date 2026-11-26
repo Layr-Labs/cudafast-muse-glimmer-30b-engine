@@ -2640,8 +2640,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else None
         )
         _target_leaf_m = _native_leaf.active_verify_m()
+        _leaf_no_logprobs = (
+            self.sampler is not None
+            and _leaf_req_idx is not None
+            and int(self.sampler.sampling_states.num_logprobs[_leaf_req_idx])
+            == NO_LOGPROBS
+        )
         extra_leaf_candidate = (
-            _target_leaf_m > 7
+            _leaf_no_logprobs
+            and _target_leaf_m > 7
             and not dummy_run
             and not is_profile
             and not skip_compiled
@@ -2804,7 +2811,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 fwd_batch = input_batch
                 if _native_leaf.ENABLED:
                     if (
-                        input_batch.num_reqs == 1
+                        _leaf_no_logprobs
+                        and input_batch.num_reqs == 1
                         and input_batch.num_draft_tokens == 6
                         and input_batch.num_tokens == 7
                         and slot_mappings is not None
