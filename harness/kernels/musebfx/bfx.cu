@@ -161,7 +161,12 @@ void native_leaf_setup_tree(
     int64_t max_depth = 6,
     double sub_coef = 0.55,
     double shf_coef = 0.20,
-    double cont_decay = 0.88);
+    double cont_decay = 0.88,
+    c10::optional<torch::Tensor> pl_tok = c10::nullopt,
+    c10::optional<torch::Tensor> pl_meta = c10::nullopt);
+void native_leaf_prompt_lookup(
+    torch::Tensor all_token_ids, torch::Tensor total_len, int64_t req_idx,
+    torch::Tensor pl_tok, torch::Tensor pl_meta, int64_t window = 2048);
 void native_leaf_commit_tree(
     torch::Tensor leaf_flag, torch::Tensor prev_ns,
     torch::Tensor hit_flag, torch::Tensor hit_src_row,
@@ -248,7 +253,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("max_depth") = 6,
         pybind11::arg("sub_coef") = 0.55,
         pybind11::arg("shf_coef") = 0.20,
-        pybind11::arg("cont_decay") = 0.88);
+        pybind11::arg("cont_decay") = 0.88,
+        pybind11::arg("pl_tok") = c10::nullopt,
+        pybind11::arg("pl_meta") = c10::nullopt);
+  m.def("native_leaf_prompt_lookup", &native_leaf_prompt_lookup,
+        pybind11::arg("all_token_ids"), pybind11::arg("total_len"),
+        pybind11::arg("req_idx"), pybind11::arg("pl_tok"),
+        pybind11::arg("pl_meta"), pybind11::arg("window") = 2048);
   m.def("native_leaf_commit_tree", &native_leaf_commit_tree,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"),
         pybind11::arg("hit_flag"), pybind11::arg("hit_src_row"),
