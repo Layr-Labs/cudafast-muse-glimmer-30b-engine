@@ -1432,7 +1432,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._lmhead_cg_step += 1
             graphs[slot].replay()
             return outs[slot]
-        if sig in self._lmhead_cg_rejected or len(entries) >= 4:
+        if sig in self._lmhead_cg_rejected or len(entries) >= 16:
             return None
 
         mult = self.model.output_multiplier
@@ -1564,7 +1564,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._verify_lmhead_cg_step += 1
             graphs[slot].replay()
             return slots[slot]
-        if sig in self._verify_lmhead_cg_rejected or len(entries) >= 16:
+        if sig in self._verify_lmhead_cg_rejected or len(entries) >= 64:
             return None
         try:
             ref_buf = torch.full((1, buf_cols), -1, dtype=torch.int64, device=self.device)

@@ -5570,7 +5570,7 @@ extern "C" int muse_gqa16_verify_leaf(
     };
     static const bool multiq_pdl = []() {
       const char* env = std::getenv("MUSE_GQA16_MULTIQ_PDL");
-      return env && *env && std::strtol(env, nullptr, 10) != 0;
+      return !env || !*env || std::strtol(env, nullptr, 10) != 0;
     }();
     const int mq_mode = (max_q >= 2) ? muse_gqa16::gqa16_multiq_mode(max_q) : 0;
     if (mq_mode == 8) {

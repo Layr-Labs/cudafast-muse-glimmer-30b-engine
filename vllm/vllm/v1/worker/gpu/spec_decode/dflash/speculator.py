@@ -745,7 +745,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 ran_ctx_graph = True
             elif (
                 cg_key not in self._ctx_kv_cg_rejected
-                and len(self._ctx_kv_cg_entries) < 16
+                and len(self._ctx_kv_cg_entries) < 64
             ):
                 context_hidden_states = _build_ctx_hidden()
                 self.model.precompute_and_store_context_kv(
