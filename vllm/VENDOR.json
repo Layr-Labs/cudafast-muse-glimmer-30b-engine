@@ -302,6 +302,10 @@
     {
       "file": "harness/kernels/musebfx/{int3_mma.cu,int4_mma.cu}; vllm/vllm/model_executor/layers/muse_draft_fp8.py",
       "why": "Zero-tail-wave 144-CTA (3 CTAs/SM x 48 SMs) persistent Stream-K W3A16/W4A16 drafter GEMM (MUSE_DRAFT_SK_GRID=144 default, 0 restores legacy direct/split-K): replaces wave-quantized direct/split-K grids (81.2% weighted SM wave efficiency -> 99.6% across all 22 drafter linears) with int3_mma_streamk_kernel<kM16, kSwiglu> and int4_mma_streamk_kernel<kM16, kAux5> streaming linearly through contiguous W_packed with zero cross-tile cp.async.cg pipeline drain, zero integer division in the hot K-loop, lock-free FP32 atomicAdd + last-CTA self-zeroing atomicExch (eliminating all 6 split-K reduce kernel launches and full-tile partial traffic), and SM121 odd-UR safety (zero L2::cache_hint/createpolicy)."
+    },
+    {
+      "file": "vllm/model_executor/layers/quantization/modelopt.py, vllm/model_executor/models/qwen3_dflash.py, vllm/model_executor/models/muse_glimmer.py, vllm/model_executor/kernels/linear/nvfp4/decode_placement.py, vllm/v1/core/block_pool.py, vllm/v1/worker/gpu_worker.py, vllm/v1/worker/gpu/cudagraph_utils.py, vllm/v1/worker/gpu/prefill_graph.py, vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/dflash/speculator.py, vllm/v1/worker/gpu/spec_decode/dflash/committed_token_ceiling.py, vllm/v1/worker/gpu/spec_decode/dflash/native_leaf.py",
+      "why": "VQ25 draft_head mode=1 default with 8-wide top-k admission, dynamic OOV tail buffer registration and reset for 32-row cone pre-admission, NO_LOGPROBS speculative tree guard, M=32 decode_embed/L2-persist/gqa16-PDL fixes, buddyinfo fragmentation sponge and early >128 MiB UMA placement with read-only L2 flush, canonical BlockPool head with pre-launch 512-token PrefillGraph replay, cudaGraphUpload pre-upload, and end-of-window emit_budget tail capping"
     }
   ],
   "carried_from": {

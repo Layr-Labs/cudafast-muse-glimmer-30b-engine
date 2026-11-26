@@ -1313,7 +1313,7 @@ int muse_norm_glue_mul_sigmoid_bf16(const void* gate, const void* attn, void* ou
   if (n <= 0 || (n & 7) != 0) return -1;
   const int vec8 = n >> 3;
   const int blocks = (vec8 + 255) / 256;
-  if (n <= 4096 * 16) {
+  if (n <= 4096 * 32) {
     mul_sigmoid_bf16_kernel<false, false><<<blocks, 256, 0, stream>>>(
         static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
         static_cast<uint4*>(out), vec8);
@@ -1334,7 +1334,7 @@ int muse_norm_glue_mul_sigmoid_fp8(const void* gate, const void* attn, const voi
   if (n <= 0 || (n & 7) != 0) return -1;
   const int vec8 = n >> 3;
   const int blocks = (vec8 + 255) / 256;
-  if (n > 4096 * 16 && norm_glue_prefill_pdl_enabled()) {
+  if (n > 4096 * 32 && norm_glue_prefill_pdl_enabled()) {
     mul_sigmoid_fp8_kernel<true><<<blocks, 256, 0, stream>>>(
         static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
         static_cast<const float*>(scale), static_cast<uint2*>(out), vec8);

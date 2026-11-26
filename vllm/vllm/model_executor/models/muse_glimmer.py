@@ -1496,7 +1496,7 @@ def _muse_qk_norm_rope_impl(
                                 )
                                 if has_single_seq and 2 <= qkv.shape[0] <= 32:
                                     _mq_pdl_ok = qkv.shape[0] <= 16 or (
-                                        os.environ.get("MUSE_GQA16_MULTIQ_PDL", "0").strip()
+                                        os.environ.get("MUSE_GQA16_MULTIQ_PDL", "1").strip()
                                         not in ("0", "", "false", "no")
                                     )
                                     pdl_prod = (
