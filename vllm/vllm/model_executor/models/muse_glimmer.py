@@ -1446,6 +1446,81 @@ def _muse_qk_norm_rope_impl(
                             q_first_row = _mfs.q_first_row_if_active(attn_layer)
                         except (ImportError, OSError, AttributeError):
                             q_first_row = 0
+                        if q_first_row == 0:
+                            try:
+                                import muse_prefill_attn as _mpa
+                                res_pf = _mpa.run_kv_only_and_stash(
+                                    qkv,
+                                    positions,
+                                    cos_sin_cache,
+                                    eps,
+                                    qscale,
+                                    use_rope,
+                                    kv_cache,
+                                    layer_slot,
+                                    q_first_row=0,
+                                )
+                                if res_pf is not None:
+                                    attn_layer._qk_kv_cache_written_rows = 512
+                                    return res_pf
+                            except (ImportError, OSError, AttributeError):
+                                pass
+                    pdl_prod = False
+                    if (
+                        muse_qk_glue.PDL_PROD_ENABLED
+                        and q_first_row == 0
+                        and getattr(attn_layer.impl, "_gqa16_decode_eligible", False)
+                        and (2 <= qkv.shape[0] <= 32 or qkv.shape[0] == 512)
+                    ):
+                        try:
+                            import muse_gqa16_attn as _mga
+
+                            attn_meta = fwd_ctx.attn_metadata
+                            layer_meta = (
+                                attn_meta.get(attn_layer.layer_name)
+                                if isinstance(attn_meta, dict)
+                                else attn_meta
+                            )
+                            if layer_meta is not None:
+                                dev_idx = (
+                                    qkv.device.index
+                                    if qkv.device.index is not None
+                                    else torch.cuda.current_device()
+                                )
+                                qsl = getattr(layer_meta, "query_start_loc", None)
+                                has_single_seq = (
+                                    qsl is not None
+                                    and qsl.shape[0] == 2
+                                    and getattr(layer_meta, "causal", False) is True
+                                    and getattr(layer_meta, "block_table", None) is not None
+                                )
+                                if has_single_seq and 2 <= qkv.shape[0] <= 32:
+                                    _mq_pdl_ok = qkv.shape[0] <= 16 or (
+                                        os.environ.get("MUSE_GQA16_MULTIQ_PDL", "0").strip()
+                                        not in ("0", "", "false", "no")
+                                    )
+                                    pdl_prod = (
+                                        _mq_pdl_ok
+                                        and _mga.VERIFY_ENABLED
+                                        and _mga.VERIFY_SPLITS == 1
+                                        and _mga._verify_state.get(dev_idx, (False, 0))[0]
+                                        and getattr(layer_meta, "num_actual_tokens", -1) == qkv.shape[0]
+                                        and getattr(layer_meta, "max_query_len", -1) == qkv.shape[0]
+                                        and getattr(layer_meta, "seq_lens", None) is not None
+                                    )
+                                elif has_single_seq and qkv.shape[0] == 512:
+                                    pdl_prod = (
+                                        _mga.PREFILL_ENABLED
+                                        and _mga.PREFILL_FUSE_ENABLED
+                                        and _mga.PREFILL_PDL_ENABLED
+                                        and _mga._prefill_state.get(dev_idx, (False, 0))[0]
+                                        and kv_cache.ndim == 4
+                                        and kv_cache.shape[2] in (16, 64)
+                                        and getattr(layer_meta, "max_query_len", -1) == 512
+                                        and getattr(layer_meta, "max_seq_len", -1) == 512
+                                    )
+                        except (ImportError, OSError, AttributeError):
+                            pdl_prod = False
                     q_out, k_out, wrote = muse_qk_glue.run_qk_norm_rope_kvcache_prefill(
                         qkv,
                         positions,
@@ -1456,6 +1531,7 @@ def _muse_qk_norm_rope_impl(
                         kv_cache,
                         layer_slot,
                         q_first_row=q_first_row,
+                        pdl_prod=pdl_prod,
                     )
                     if wrote:
                         attn_layer._qk_kv_cache_written_rows = int(qkv.shape[0])
@@ -2417,15 +2493,24 @@ class MuseGlimmerForCausalLM(
 
     def _pack_persisting_norm_arena(self) -> None:
         self._persisting_norm_arena = None
+        self._persisting_norm_arena_bytes = 0
         self._norm_arena_buf = None
-        persist = os.environ.get("MUSE_PERSIST_NORMS", "0") != "0"
+        persist = os.environ.get("MUSE_PERSIST_NORMS", "1") != "0"
         prewarm = os.environ.get("MUSE_NORM_PREWARM", "1") != "0"
+        rope_pos = int(os.environ.get("MUSE_PERSIST_ROPE_POS", "1024")) if persist else 0
+        if not persist:
+            try:
+                import l2pf as _l2pf_mod
+                if hasattr(_l2pf_mod, "set_persisting_limit"):
+                    _l2pf_mod.set_persisting_limit(0)
+            except Exception:  # noqa: BLE001
+                pass
         if not persist and not prewarm:
             return
         try:
             params: list[torch.nn.Parameter] = []
             param_layer: list[int] = []
-            total_bytes = 0
+            norm_bytes = 0
             dev = None
             for name, mod in self.model.named_modules():
                 if "norm" not in name.lower():
@@ -2443,10 +2528,35 @@ class MuseGlimmerForCausalLM(
                     params.append(w)
                     m_layer = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
                     param_layer.append(int(m_layer.group(1)) if m_layer else -1)
-                    total_bytes += ((w.numel() * 2 + 255) // 256) * 256
-            if not params or dev is None or total_bytes > (4 << 20):
+                    norm_bytes += ((w.numel() * 2 + 255) // 256) * 256
+            if not params or dev is None or norm_bytes > (4 << 20):
                 return
-            arena = torch.zeros((total_bytes,), dtype=torch.uint8, device=dev)
+
+            rope_caches: dict[int, torch.Tensor] = {}
+            if rope_pos > 0:
+                for layer in islice(self.model.layers, self.model.start_layer, self.model.end_layer):
+                    rot = getattr(getattr(layer, "self_attn", None), "rotary_emb", None)
+                    cs = getattr(rot, "cos_sin_cache", None)
+                    if (
+                        isinstance(cs, torch.Tensor)
+                        and cs.is_cuda
+                        and cs.device == dev
+                        and cs.is_contiguous()
+                        and cs.ndim == 2
+                    ):
+                        rope_caches.setdefault(cs.data_ptr(), cs)
+
+            rope_tensor = next(iter(rope_caches.values())) if len(rope_caches) == 1 else None
+            rope_full_bytes = 0
+            rope_window_bytes = 0
+            if rope_tensor is not None:
+                raw_rb = rope_tensor.numel() * rope_tensor.element_size()
+                rope_full_bytes = ((raw_rb + 255) // 256) * 256
+                row_bytes = int(rope_tensor.shape[1]) * rope_tensor.element_size()
+                active_rows = min(int(rope_tensor.shape[0]), rope_pos)
+                rope_window_bytes = ((active_rows * row_bytes + 255) // 256) * 256
+
+            arena = torch.zeros((norm_bytes + rope_full_bytes,), dtype=torch.uint8, device=dev)
             off = 0
             moved = 0
             layer_span: dict[int, list[int]] = {}
@@ -2462,11 +2572,31 @@ class MuseGlimmerForCausalLM(
                         lo_hi[0] = min(lo_hi[0], off)
                         lo_hi[1] = max(lo_hi[1], off + ((nb + 255) // 256) * 256)
                 off += ((nb + 255) // 256) * 256
+
+            rope_moved = 0
+            if moved and rope_tensor is not None:
+                rb = rope_tensor.numel() * rope_tensor.element_size()
+                rview = (
+                    arena[norm_bytes : norm_bytes + rb]
+                    .view(rope_tensor.dtype)
+                    .reshape(rope_tensor.shape)
+                )
+                rview.copy_(rope_tensor.data)
+                if torch.equal(rview.view(torch.int8), rope_tensor.data.view(torch.int8)):
+                    rope_tensor.data = rview
+                    rope_moved = 1
+                else:
+                    rope_window_bytes = 0
+
             if moved:
                 self._norm_arena_buf = arena
+                persist_bytes = norm_bytes + (rope_window_bytes if rope_moved else 0)
                 if persist:
                     self._persisting_norm_arena = arena
-                if prewarm and layer_span:
+                    self._persisting_norm_arena_bytes = persist_bytes
+                if prewarm and layer_span and (
+                    not persist or os.environ.get("MUSE_NORM_PREWARM_WITH_PERSIST", "0") != "0"
+                ):
                     try:
                         from l2pf import sites as _l2pf_sites
 
@@ -2480,8 +2610,13 @@ class MuseGlimmerForCausalLM(
                     except Exception:  # noqa: BLE001
                         pass
                 logger.info(
-                    "Packed %d RMSNorm weights into %.2f MiB contiguous L2-persisting arena",
-                    moved, total_bytes / (1 << 20),
+                    "Packed %d RMSNorm weights + %d RoPE cache (pos<=%d) into %.2f MiB L2-persisting window (alloc=%.2f MiB, persist=%s)",
+                    moved,
+                    rope_moved,
+                    rope_pos if rope_moved else 0,
+                    persist_bytes / (1 << 20),
+                    arena.numel() / (1 << 20),
+                    persist,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Persisting norm arena skipped: %s", exc)
@@ -2493,7 +2628,7 @@ class MuseGlimmerForCausalLM(
         if not want_bf16_stack:
             return
         want_bf16_stack_decode = (
-            os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_DECODE", "1") != "0"
+            os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_DECODE", "0") != "0"
             and os.environ.get("MUSE_BF16_RANS_M", "1") != "0"
         )
         bf16_stack_cnt = 0

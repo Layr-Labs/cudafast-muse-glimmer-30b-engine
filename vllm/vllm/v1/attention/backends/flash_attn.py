@@ -76,6 +76,11 @@ try:
 except (ImportError, OSError):
     muse_gqa16_attn = None
 
+try:
+    import muse_prefill_attn
+except (ImportError, OSError):
+    muse_prefill_attn = None
+
 logger = init_logger(__name__)
 
 
@@ -1139,7 +1144,7 @@ class FlashAttentionImpl(AttentionImpl):
                         cu_seqlens_q = tail_cu_q
                         max_seqlen_q = tail_rows
 
-                if (
+                _pf_eligible = (
                     self._gqa16_decode_eligible
                     and self.vllm_flash_attn_version == 2
                     and causal is True
@@ -1149,6 +1154,27 @@ class FlashAttentionImpl(AttentionImpl):
                     and self.alibi_slopes is None
                     and self.logits_soft_cap == 0
                     and self.sinks is None
+                )
+                if (
+                    muse_prefill_attn is not None
+                    and muse_prefill_attn.try_prefill_fused(
+                        query=q_arg,
+                        output=out_arg,
+                        cu_seqlens_q=cu_seqlens_q,
+                        orig_max_seqlen_q=orig_max_seqlen_q,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        window=sliding_window_size,
+                        allow_defer=(tail is None),
+                        eligible=_pf_eligible,
+                    )
+                ):
+                    return output
+
+                if (
+                    _pf_eligible
+                    and muse_gqa16_attn is not None
                     and muse_gqa16_attn.try_prefill_gqa16(
                         query=q_arg,
                         kv_cache=kv_cache,

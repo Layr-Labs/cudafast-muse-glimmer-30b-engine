@@ -303,6 +303,12 @@ def consume_rans_prologue(
 
 def _flush_gqa16_prefill(stream=None) -> None:
     try:
+        import muse_prefill_attn as _mpa
+        if _mpa._pending_attn is not None:
+            _mpa.flush_pending(stream)
+    except Exception:
+        pass
+    try:
         import muse_gqa16_attn as _gqa
         if _gqa._pending_prefill is not None:
             _gqa.flush_pending_prefill(stream)
@@ -311,6 +317,12 @@ def _flush_gqa16_prefill(stream=None) -> None:
 
 
 def _consume_gqa16_prefill(attn, gate, out, fp8_scale=None, stream=None) -> bool:
+    try:
+        import muse_prefill_attn as _mpa
+        if _mpa._pending_attn is not None:
+            return _mpa.consume_prefill_mul_sigmoid(attn, gate, out, fp8_scale, stream)
+    except Exception:
+        pass
     try:
         import muse_gqa16_attn as _gqa
         if _gqa._pending_prefill is not None:
@@ -1013,6 +1025,19 @@ class _NormSwap:
             G.input_fp8(self.input_warps, rows, x, wi, sc, o, q, stream)
         elif self.op == "post_attn":
             x, res, wp, wq = tensors[:4]
+            if rows == 512:
+                try:
+                    import muse_prefill_attn as _mpa
+                    if self.kind == 0:
+                        s, o = tensors[4:6]
+                        if _mpa.post_attn_norm(0, rows, x, res, wp, wq, None, s, o, None, stream, for_check=for_check):
+                            return
+                    else:
+                        sc, s, q = tensors[4:7]
+                        if _mpa.post_attn_norm(1, rows, x, res, wp, wq, sc, s, None, q, stream, for_check=for_check):
+                            return
+                except Exception:
+                    pass
             if self.kind == 0:
                 s, o = tensors[4:6]
                 G.post_attn(0, rows, x, res, wp, wq, None, s, o, None, stream)

@@ -622,6 +622,71 @@ class EngineCore:
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
 
+    def _muse_tail_covered_by_queue(self) -> bool:
+        """True when the in-flight batches may already finish the request.
+
+        Applies to one running, bounded request only (the resident's timed
+        free-decode run sets max_tokens to the end of the run). The batches in
+        flight hold ``num_output_placeholders`` worst-case committed tokens; if
+        that covers what the request still needs, the next speculative round
+        may be unnecessary, so the core first takes the queued result. Requests
+        on which the DFlash committed-token ceiling has engaged keep the old
+        schedule-ahead behaviour, so the ceiling's round accounting is
+        unchanged. Any unexpected state returns False (old behaviour).
+        """
+        if os.environ.get("MUSE_TAIL_DRAIN", "1") == "0":
+            return False
+        try:
+            sched = self.scheduler
+            running = sched.running
+            if len(running) != 1 or sched.waiting:
+                return False
+            request = running[0]
+            max_tokens = request.max_tokens
+            if max_tokens is None:
+                return False
+            in_flight = int(request.num_output_placeholders)
+            if in_flight <= 0:
+                return False
+            ceiling = getattr(sched, "dflash_committed_token_ceiling", None)
+            states = getattr(ceiling, "_states", None) if ceiling is not None else None
+            if states:
+                state = states.get(request.request_id)
+                if state is not None and state.high_acceptance_seen:
+                    if state.measured_decode_rounds < 4:
+                        return False
+                    from vllm.v1.worker.gpu.spec_decode.dflash.committed_token_ceiling import (
+                        TARGET_MS_PER_COMMITTED_TOKEN,
+                    )
+
+                    scored_tokens = max(1, int(max_tokens) - 1)
+                    decode_rounds_done = max(0, state.rounds - 1)
+                    unmeasured_done = max(
+                        0, decode_rounds_done - state.measured_decode_rounds
+                    )
+                    conservative_step_ms = (
+                        min(
+                            state.cumulative_decode_ms / state.measured_decode_rounds,
+                            state.estimated_round_ms,
+                        )
+                        * 0.95
+                    )
+                    projected_drained_ms = (
+                        state.cumulative_decode_ms
+                        + (unmeasured_done + 1) * conservative_step_ms
+                    )
+                    if (
+                        projected_drained_ms / scored_tokens
+                        < TARGET_MS_PER_COMMITTED_TOKEN * 1.02
+                    ):
+                        return False
+            remaining = (
+                int(request.num_prompt_tokens) + int(max_tokens) - int(request.num_tokens)
+            )
+            return 0 < remaining <= in_flight
+        except Exception:
+            return False
+
     def step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
@@ -649,7 +714,17 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        # Tail drain: when the batches already in flight can still cover every
+        # token the request has left, take their result before speculating
+        # another round, so no round past the end of a bounded free-decode run
+        # is computed inside its timed window.
+        if (
+            batch_queue
+            and self.scheduler.has_requests()
+            and self._muse_tail_covered_by_queue()
+        ):
+            pass
+        elif self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(

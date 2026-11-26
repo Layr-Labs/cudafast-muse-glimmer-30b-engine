@@ -111,10 +111,15 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
 torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true);
 torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K);
 torch::Tensor int4_pack(torch::Tensor W, bool mse_opt = true);
-torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K, bool query_streamk = false);
+torch::Tensor int4_pack_swiglu(torch::Tensor W, bool mse_opt = true);
+torch::Tensor int4_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K);
 torch::Tensor int4_gemm_aux5(
     torch::Tensor h0, torch::Tensor h1, torch::Tensor h2, torch::Tensor h3, torch::Tensor h4,
     torch::Tensor W_packed, int64_t N, int64_t K);
+torch::Tensor dflash_rms_norm(torch::Tensor input, torch::Tensor weight, double eps);
+std::tuple<torch::Tensor, torch::Tensor> dflash_fused_add_rms_norm(
+    torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void dflash_kv_post(
     torch::Tensor all_kv_flat, torch::Tensor positions, torch::Tensor k_norm_w,
     torch::Tensor cos_sin_cache,
@@ -125,7 +130,35 @@ void dflash_kv_post(
 std::tuple<torch::Tensor, torch::Tensor> dflash_qkv_norm_rope(
     torch::Tensor qkv, torch::Tensor positions, torch::Tensor q_norm_w,
     torch::Tensor k_norm_w, torch::Tensor cos_sin_cache,
-    int64_t nq, int64_t nkv, double eps, bool is_neox);
+    int64_t nq, int64_t nkv, double eps, bool is_neox,
+    c10::optional<torch::Tensor> slot_mapping = c10::nullopt,
+    c10::optional<torch::Tensor> k_cache = c10::nullopt,
+    c10::optional<torch::Tensor> v_cache = c10::nullopt,
+    int64_t block_size = 16);
+void dflash_prepare_inputs(
+    torch::Tensor out_input_ids, torch::Tensor out_query_positions,
+    torch::Tensor out_query_start_loc, torch::Tensor out_seq_lens,
+    torch::Tensor out_query_slot_mapping, torch::Tensor out_context_positions,
+    torch::Tensor out_context_slot_mapping, torch::Tensor out_sample_indices,
+    torch::Tensor out_sample_pos, torch::Tensor out_sample_idx_mapping,
+    torch::Tensor out_temperature, torch::Tensor out_seeds,
+    torch::Tensor target_positions, torch::Tensor target_query_start_loc,
+    torch::Tensor idx_mapping, torch::Tensor last_sampled,
+    torch::Tensor next_prefill_tokens, torch::Tensor num_sampled,
+    torch::Tensor num_rejected, torch::Tensor in_temperature,
+    torch::Tensor in_seeds, torch::Tensor block_table,
+    int64_t block_table_stride, int64_t parallel_drafting_token_id,
+    int64_t block_size, int64_t num_query_per_req,
+    int64_t num_speculative_steps, int64_t max_num_reqs,
+    int64_t max_num_tokens, int64_t max_model_len, int64_t pad_slot_id,
+    c10::optional<torch::Tensor> target_input_ids = c10::nullopt,
+    int64_t tail_num_tokens = 0,
+    c10::optional<torch::Tensor> in_static_vocab = c10::nullopt,
+    c10::optional<torch::Tensor> tail_ids = c10::nullopt,
+    c10::optional<torch::Tensor> tail_count = c10::nullopt,
+    c10::optional<torch::Tensor> tail_seen = c10::nullopt,
+    c10::optional<torch::Tensor> hist = c10::nullopt,
+    c10::optional<torch::Tensor> hist_len = c10::nullopt);
 void draft_vocab_update_tail(
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor in_static_vocab,
     torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor tail_seen,
@@ -138,10 +171,20 @@ torch::Tensor draft_vocab_tail_argmax(
     c10::optional<torch::Tensor> out_top2_row0 = c10::nullopt,
     c10::optional<torch::Tensor> out_margins = c10::nullopt,
     c10::optional<torch::Tensor> out_tree_top = c10::nullopt,
-    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt);
+    c10::optional<torch::Tensor> out_tree_vals = c10::nullopt,
+    bool vocab_map_sorted = false);
 torch::Tensor draft_vocab_score_rows(
     torch::Tensor A, torch::Tensor row_ids, torch::Tensor raw_w,
     torch::Tensor raw_s, torch::Tensor global_scale, double logit_scale);
+torch::Tensor draft_head_pack(
+    torch::Tensor raw_w, torch::Tensor raw_s, torch::Tensor global_scale,
+    torch::Tensor vocab_map, int64_t grid_ctas = 96, int64_t mode = 0);
+torch::Tensor draft_head_topc(
+    torch::Tensor A, torch::Tensor W_packed, torch::Tensor vocab_map,
+    int64_t N, int64_t K, int64_t grid_ctas = 96, int64_t mode = 0, int64_t rescore_k = 0);
+torch::Tensor draft_head_gemm_full(
+    torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K,
+    int64_t grid_ctas = 96, int64_t mode = 0);
 void native_leaf_prepare_m8(
     torch::Tensor positions, torch::Tensor seq_lens);
 void native_leaf_prepare_tree(
@@ -161,7 +204,18 @@ void native_leaf_setup_tree(
     int64_t max_depth = 6,
     double sub_coef = 0.55,
     double shf_coef = 0.20,
-    double cont_decay = 0.88);
+    double cont_decay = 0.88,
+    c10::optional<torch::Tensor> hist = c10::nullopt,
+    c10::optional<torch::Tensor> hist_len = c10::nullopt,
+    c10::optional<torch::Tensor> saved_pos0 = c10::nullopt,
+    c10::optional<torch::Tensor> stats = c10::nullopt,
+    c10::optional<torch::Tensor> saved_row_ctx = c10::nullopt,
+    c10::optional<torch::Tensor> tr_log = c10::nullopt,
+    c10::optional<torch::Tensor> tr_state = c10::nullopt,
+    int64_t vocab_size = 202048,
+    c10::optional<torch::Tensor> cascade_meta = c10::nullopt,
+    c10::optional<torch::Tensor> cascade_toks = c10::nullopt,
+    c10::optional<torch::Tensor> cascade_vals = c10::nullopt);
 void native_leaf_commit_tree(
     torch::Tensor leaf_flag, torch::Tensor prev_ns,
     torch::Tensor hit_flag, torch::Tensor hit_src_row,
@@ -171,7 +225,53 @@ void native_leaf_commit_tree(
     int64_t tree_m = 12,
     c10::optional<torch::Tensor> stats = c10::nullopt, bool no_hit_mode = false,
     c10::optional<torch::Tensor> req_acc_state = c10::nullopt,
-    c10::optional<torch::Tensor> saved_leaf_parent = c10::nullopt);
+    c10::optional<torch::Tensor> saved_leaf_parent = c10::nullopt,
+    c10::optional<torch::Tensor> hist = c10::nullopt,
+    c10::optional<torch::Tensor> hist_len = c10::nullopt,
+    c10::optional<torch::Tensor> saved_pos0 = c10::nullopt,
+    c10::optional<torch::Tensor> saved_row_ctx = c10::nullopt,
+    c10::optional<torch::Tensor> tr_log = c10::nullopt,
+    c10::optional<torch::Tensor> tr_state = c10::nullopt,
+    int64_t vocab_size = 202048,
+    bool chain_all_valid = false,
+    c10::optional<torch::Tensor> cascade_meta = c10::nullopt);
+void dflash_cascade_gate_prep(
+    torch::Tensor input_ids, torch::Tensor query_positions,
+    torch::Tensor draft_tokens, torch::Tensor tree_top, torch::Tensor tree_vals,
+    torch::Tensor cascade_meta, torch::Tensor p1_save_draft,
+    torch::Tensor p1_save_top, torch::Tensor p1_save_vals,
+    int64_t mask_token_id = 201818,
+    c10::optional<torch::Tensor> alt_ids = c10::nullopt,
+    c10::optional<torch::Tensor> alt_margins = c10::nullopt,
+    c10::optional<torch::Tensor> p1_save_alt = c10::nullopt,
+    c10::optional<torch::Tensor> p1_save_margins = c10::nullopt,
+    c10::optional<torch::Tensor> req_acc_state = c10::nullopt,
+    c10::optional<torch::Tensor> stats = c10::nullopt);
+void dflash_cascade_post_restore(
+    torch::Tensor input_ids, torch::Tensor draft_tokens,
+    torch::Tensor tree_top, torch::Tensor tree_vals,
+    torch::Tensor cascade_meta, torch::Tensor cascade_toks, torch::Tensor cascade_vals,
+    torch::Tensor p1_save_draft, torch::Tensor p1_save_top, torch::Tensor p1_save_vals,
+    int64_t mask_token_id = 201818,
+    c10::optional<torch::Tensor> alt_ids = c10::nullopt,
+    c10::optional<torch::Tensor> alt_margins = c10::nullopt,
+    c10::optional<torch::Tensor> p1_save_alt = c10::nullopt,
+    c10::optional<torch::Tensor> p1_save_margins = c10::nullopt);
+int64_t dflash_cascade_clone_capturing_graph();
+int64_t dflash_cascade_build_cond_graph(
+    int64_t graph_handle, bool is_raw_cuda_graph_ptr,
+    torch::Tensor input_ids, torch::Tensor query_positions,
+    torch::Tensor draft_tokens, torch::Tensor tree_top, torch::Tensor tree_vals,
+    torch::Tensor cascade_meta, torch::Tensor p1_save_draft,
+    torch::Tensor p1_save_top, torch::Tensor p1_save_vals,
+    int64_t mask_token_id = 201818,
+    c10::optional<torch::Tensor> alt_ids = c10::nullopt,
+    c10::optional<torch::Tensor> alt_margins = c10::nullopt,
+    c10::optional<torch::Tensor> p1_save_alt = c10::nullopt,
+    c10::optional<torch::Tensor> p1_save_margins = c10::nullopt,
+    c10::optional<torch::Tensor> req_acc_state = c10::nullopt,
+    c10::optional<torch::Tensor> stats = c10::nullopt);
+void dflash_cascade_launch_cond_graph(int64_t exec_id);
 void native_leaf_setup(
     torch::Tensor leaf_flag, torch::Tensor prev_ns, torch::Tensor alt_ids,
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor saved_alt_tok,
@@ -210,10 +310,48 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int3_pack_swiglu", &int3_pack_swiglu, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
   m.def("int3_gemm_swiglu", &int3_gemm_swiglu);
   m.def("int4_pack", &int4_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
-  m.def("int4_gemm", &int4_gemm);
+  m.def("int4_gemm", &int4_gemm, pybind11::arg("A"), pybind11::arg("W_packed"),
+        pybind11::arg("N"), pybind11::arg("K"), pybind11::arg("query_streamk") = false);
+  m.def("int4_pack_swiglu", &int4_pack_swiglu, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
+  m.def("int4_gemm_swiglu", &int4_gemm_swiglu);
   m.def("int4_gemm_aux5", &int4_gemm_aux5);
+  m.def("dflash_rms_norm", &dflash_rms_norm);
+  m.def("dflash_fused_add_rms_norm", &dflash_fused_add_rms_norm);
   m.def("dflash_kv_post", &dflash_kv_post);
-  m.def("dflash_qkv_norm_rope", &dflash_qkv_norm_rope);
+  m.def("dflash_qkv_norm_rope", &dflash_qkv_norm_rope,
+        pybind11::arg("qkv"), pybind11::arg("positions"),
+        pybind11::arg("q_norm_w"), pybind11::arg("k_norm_w"),
+        pybind11::arg("cos_sin_cache"), pybind11::arg("nq"),
+        pybind11::arg("nkv"), pybind11::arg("eps"), pybind11::arg("is_neox"),
+        pybind11::arg("slot_mapping") = c10::nullopt,
+        pybind11::arg("k_cache") = c10::nullopt,
+        pybind11::arg("v_cache") = c10::nullopt,
+        pybind11::arg("block_size") = 16);
+  m.def("dflash_prepare_inputs", &dflash_prepare_inputs,
+        pybind11::arg("out_input_ids"), pybind11::arg("out_query_positions"),
+        pybind11::arg("out_query_start_loc"), pybind11::arg("out_seq_lens"),
+        pybind11::arg("out_query_slot_mapping"), pybind11::arg("out_context_positions"),
+        pybind11::arg("out_context_slot_mapping"), pybind11::arg("out_sample_indices"),
+        pybind11::arg("out_sample_pos"), pybind11::arg("out_sample_idx_mapping"),
+        pybind11::arg("out_temperature"), pybind11::arg("out_seeds"),
+        pybind11::arg("target_positions"), pybind11::arg("target_query_start_loc"),
+        pybind11::arg("idx_mapping"), pybind11::arg("last_sampled"),
+        pybind11::arg("next_prefill_tokens"), pybind11::arg("num_sampled"),
+        pybind11::arg("num_rejected"), pybind11::arg("in_temperature"),
+        pybind11::arg("in_seeds"), pybind11::arg("block_table"),
+        pybind11::arg("block_table_stride"), pybind11::arg("parallel_drafting_token_id"),
+        pybind11::arg("block_size"), pybind11::arg("num_query_per_req"),
+        pybind11::arg("num_speculative_steps"), pybind11::arg("max_num_reqs"),
+        pybind11::arg("max_num_tokens"), pybind11::arg("max_model_len"),
+        pybind11::arg("pad_slot_id"),
+        pybind11::arg("target_input_ids") = c10::nullopt,
+        pybind11::arg("tail_num_tokens") = 0,
+        pybind11::arg("in_static_vocab") = c10::nullopt,
+        pybind11::arg("tail_ids") = c10::nullopt,
+        pybind11::arg("tail_count") = c10::nullopt,
+        pybind11::arg("tail_seen") = c10::nullopt,
+        pybind11::arg("hist") = c10::nullopt,
+        pybind11::arg("hist_len") = c10::nullopt);
   m.def("draft_vocab_update_tail", &draft_vocab_update_tail,
         pybind11::arg("input_ids"), pybind11::arg("positions"), pybind11::arg("in_static_vocab"),
         pybind11::arg("tail_ids"), pybind11::arg("tail_count"), pybind11::arg("tail_seen"),
@@ -226,10 +364,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("out_top2_row0") = c10::nullopt,
         pybind11::arg("out_margins") = c10::nullopt,
         pybind11::arg("out_tree_top") = c10::nullopt,
-        pybind11::arg("out_tree_vals") = c10::nullopt);
+        pybind11::arg("out_tree_vals") = c10::nullopt,
+        pybind11::arg("vocab_map_sorted") = false);
   m.def("draft_vocab_score_rows", &draft_vocab_score_rows,
         pybind11::arg("A"), pybind11::arg("row_ids"), pybind11::arg("raw_w"),
         pybind11::arg("raw_s"), pybind11::arg("global_scale"), pybind11::arg("logit_scale") = 1.0);
+  m.def("draft_head_pack", &draft_head_pack,
+        pybind11::arg("raw_w"), pybind11::arg("raw_s"), pybind11::arg("global_scale"),
+        pybind11::arg("vocab_map"), pybind11::arg("grid_ctas") = 96, pybind11::arg("mode") = 0);
+  m.def("draft_head_topc", &draft_head_topc,
+        pybind11::arg("A"), pybind11::arg("W_packed"), pybind11::arg("vocab_map"),
+        pybind11::arg("N"), pybind11::arg("K"),
+        pybind11::arg("grid_ctas") = 96, pybind11::arg("mode") = 0, pybind11::arg("rescore_k") = 0);
+  m.def("draft_head_gemm_full", &draft_head_gemm_full,
+        pybind11::arg("A"), pybind11::arg("W_packed"), pybind11::arg("N"), pybind11::arg("K"),
+        pybind11::arg("grid_ctas") = 96, pybind11::arg("mode") = 0);
   m.def("native_leaf_prepare_m8", &native_leaf_prepare_m8);
   m.def("native_leaf_prepare_tree", &native_leaf_prepare_tree,
         pybind11::arg("positions"), pybind11::arg("seq_lens"), pybind11::arg("tree_m") = 12);
@@ -248,7 +397,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("max_depth") = 6,
         pybind11::arg("sub_coef") = 0.55,
         pybind11::arg("shf_coef") = 0.20,
-        pybind11::arg("cont_decay") = 0.88);
+        pybind11::arg("cont_decay") = 0.88,
+        pybind11::arg("hist") = c10::nullopt,
+        pybind11::arg("hist_len") = c10::nullopt,
+        pybind11::arg("saved_pos0") = c10::nullopt,
+        pybind11::arg("stats") = c10::nullopt,
+        pybind11::arg("saved_row_ctx") = c10::nullopt,
+        pybind11::arg("tr_log") = c10::nullopt,
+        pybind11::arg("tr_state") = c10::nullopt,
+        pybind11::arg("vocab_size") = 202048,
+        pybind11::arg("cascade_meta") = c10::nullopt,
+        pybind11::arg("cascade_toks") = c10::nullopt,
+        pybind11::arg("cascade_vals") = c10::nullopt);
   m.def("native_leaf_commit_tree", &native_leaf_commit_tree,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"),
         pybind11::arg("hit_flag"), pybind11::arg("hit_src_row"),
@@ -258,7 +418,54 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("tree_m") = 12,
         pybind11::arg("stats") = c10::nullopt, pybind11::arg("no_hit_mode") = false,
         pybind11::arg("req_acc_state") = c10::nullopt,
-        pybind11::arg("saved_leaf_parent") = c10::nullopt);
+        pybind11::arg("saved_leaf_parent") = c10::nullopt,
+        pybind11::arg("hist") = c10::nullopt,
+        pybind11::arg("hist_len") = c10::nullopt,
+        pybind11::arg("saved_pos0") = c10::nullopt,
+        pybind11::arg("saved_row_ctx") = c10::nullopt,
+        pybind11::arg("tr_log") = c10::nullopt,
+        pybind11::arg("tr_state") = c10::nullopt,
+        pybind11::arg("vocab_size") = 202048,
+        pybind11::arg("chain_all_valid") = false,
+        pybind11::arg("cascade_meta") = c10::nullopt);
+  m.def("dflash_cascade_gate_prep", &dflash_cascade_gate_prep,
+        pybind11::arg("input_ids"), pybind11::arg("query_positions"),
+        pybind11::arg("draft_tokens"), pybind11::arg("tree_top"), pybind11::arg("tree_vals"),
+        pybind11::arg("cascade_meta"), pybind11::arg("p1_save_draft"),
+        pybind11::arg("p1_save_top"), pybind11::arg("p1_save_vals"),
+        pybind11::arg("mask_token_id") = 201818,
+        pybind11::arg("alt_ids") = c10::nullopt,
+        pybind11::arg("alt_margins") = c10::nullopt,
+        pybind11::arg("p1_save_alt") = c10::nullopt,
+        pybind11::arg("p1_save_margins") = c10::nullopt,
+        pybind11::arg("req_acc_state") = c10::nullopt,
+        pybind11::arg("stats") = c10::nullopt);
+  m.def("dflash_cascade_post_restore", &dflash_cascade_post_restore,
+        pybind11::arg("input_ids"), pybind11::arg("draft_tokens"),
+        pybind11::arg("tree_top"), pybind11::arg("tree_vals"),
+        pybind11::arg("cascade_meta"), pybind11::arg("cascade_toks"), pybind11::arg("cascade_vals"),
+        pybind11::arg("p1_save_draft"), pybind11::arg("p1_save_top"), pybind11::arg("p1_save_vals"),
+        pybind11::arg("mask_token_id") = 201818,
+        pybind11::arg("alt_ids") = c10::nullopt,
+        pybind11::arg("alt_margins") = c10::nullopt,
+        pybind11::arg("p1_save_alt") = c10::nullopt,
+        pybind11::arg("p1_save_margins") = c10::nullopt);
+  m.def("dflash_cascade_clone_capturing_graph", &dflash_cascade_clone_capturing_graph);
+  m.def("dflash_cascade_build_cond_graph", &dflash_cascade_build_cond_graph,
+        pybind11::arg("graph_handle"), pybind11::arg("is_raw_cuda_graph_ptr"),
+        pybind11::arg("input_ids"), pybind11::arg("query_positions"),
+        pybind11::arg("draft_tokens"), pybind11::arg("tree_top"), pybind11::arg("tree_vals"),
+        pybind11::arg("cascade_meta"), pybind11::arg("p1_save_draft"),
+        pybind11::arg("p1_save_top"), pybind11::arg("p1_save_vals"),
+        pybind11::arg("mask_token_id") = 201818,
+        pybind11::arg("alt_ids") = c10::nullopt,
+        pybind11::arg("alt_margins") = c10::nullopt,
+        pybind11::arg("p1_save_alt") = c10::nullopt,
+        pybind11::arg("p1_save_margins") = c10::nullopt,
+        pybind11::arg("req_acc_state") = c10::nullopt,
+        pybind11::arg("stats") = c10::nullopt);
+  m.def("dflash_cascade_launch_cond_graph", &dflash_cascade_launch_cond_graph,
+        pybind11::arg("exec_id"));
   m.def("native_leaf_setup", &native_leaf_setup,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"), pybind11::arg("alt_ids"),
         pybind11::arg("input_ids"), pybind11::arg("positions"), pybind11::arg("saved_alt_tok"),
