@@ -238,7 +238,7 @@ class VllmBackend:
 
         spec = speculative_config(cfg)
         if cfg.depth:
-            draft_vocab_size = int(os.environ.get("MUSE_DRAFT_VOCAB_SIZE", "98304"))
+            draft_vocab_size = int(os.environ.get("MUSE_DRAFT_VOCAB_SIZE", "129024"))
             draft_vocab_mode = os.environ.get("MUSE_DRAFT_VOCAB_MODE", "ascii_bpe")
             configure_draft_vocab(cfg.model_dir, draft_vocab_size, draft_vocab_mode)
         # PORT DRIFT (vLLM 0.27.1, Muse Glimmer 30B): a multimodal checkpoint
