@@ -233,7 +233,10 @@ __device__ __forceinline__ void k_loop(
       // (the copies cannot overlap) and masked: bit 15 <- sign, bits 8:6 <- e1 e0 m, the same in the upper half.
       {
         const unsigned u = static_cast<unsigned>(bq1);
-        reinterpret_cast<unsigned*>(&b1)[1] = (u & 0x80008000u) | ((u >> 6) & 0x01c001c0u);
+        unsigned b1_hi;
+        asm("lop3.b32 %0, %1, %2, %3, 0xEA;"
+            : "=r"(b1_hi) : "r"(u), "r"(0x80008000u), "r"((u >> 6) & 0x01c001c0u));
+        reinterpret_cast<unsigned*>(&b1)[1] = b1_hi;
         reinterpret_cast<unsigned*>(&b1)[0] = (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
         reinterpret_cast<unsigned*>(&b0)[1] = ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
         reinterpret_cast<unsigned*>(&b0)[0] = ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
@@ -840,6 +843,13 @@ constexpr int kFused = 39936;
 // (swiglu_silu, on the gate already rounded to BF16) instead of reading the table. silu_check runs both for every
 // BF16 pattern and counts the patterns whose FP32 results differ in any bit; swiglu_prepare refuses the library
 // unless that count is 0.
+__device__ __forceinline__ float marlin_clamp448(float y) {
+  float t, r;
+  asm("max.NaN.f32 %0, %1, 0fC3E00000;" : "=f"(t) : "f"(y));
+  asm("min.NaN.f32 %0, %1, 0f43E00000;" : "=f"(r) : "f"(t));
+  return r;
+}
+
 __device__ int silu_differences;
 __global__ void silu_check() {
   const unsigned word = 256u * blockIdx.x + threadIdx.x;
@@ -1006,7 +1016,7 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
         const float silu = swiglu_silu(__bfloat162float(gate));
         const float product = __fmul_rn(silu, __bfloat162float(up));
         const float q = __fmul_rn(product, inverse);
-        scaled[e] = q < -448.0f ? -448.0f : (q > 448.0f ? 448.0f : q);
+        scaled[e] = marlin_clamp448(q);
       }
       uint16_t converted;
       asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(converted) : "f"(scaled[1]), "f"(scaled[0]));
@@ -1262,8 +1272,8 @@ __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
       const __nv_bfloat16 bu1 = __float2bfloat16_rn(u1 * gs);
       const float q0 = __fmul_rn(__fmul_rn(swiglu_silu(__bfloat162float(bg0)), __bfloat162float(bu0)), inverse);
       const float q1 = __fmul_rn(__fmul_rn(swiglu_silu(__bfloat162float(bg1)), __bfloat162float(bu1)), inverse);
-      const float s0 = q0 < -448.0f ? -448.0f : (q0 > 448.0f ? 448.0f : q0);
-      const float s1 = q1 < -448.0f ? -448.0f : (q1 > 448.0f ? 448.0f : q1);
+      const float s0 = marlin_clamp448(q0);
+      const float s1 = marlin_clamp448(q1);
       uint16_t conv;
       asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(conv) : "f"(s1), "f"(s0));
       return static_cast<uint32_t>(conv);

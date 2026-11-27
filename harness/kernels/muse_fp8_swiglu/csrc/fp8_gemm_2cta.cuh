@@ -78,8 +78,8 @@ __device__ __forceinline__ void epilogue_swiglu_prmt(const float (&acc)[NW_CUR][
       const float q_hi = eval_pair_opt<kLutSilu>(acc[j0 + m][2], acc[j0 + m][3], sa, sb, inv_down);
       asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(conv[m]) : "f"(q_hi), "f"(q_lo));
     }
-    const uint32_t c01 = static_cast<uint32_t>(conv[0]) | (static_cast<uint32_t>(conv[1]) << 16);
-    const uint32_t c23 = static_cast<uint32_t>(conv[2]) | (static_cast<uint32_t>(conv[3]) << 16);
+    const uint32_t c01 = __byte_perm(static_cast<uint32_t>(conv[0]), static_cast<uint32_t>(conv[1]), 0x5410u);
+    const uint32_t c23 = __byte_perm(static_cast<uint32_t>(conv[2]), static_cast<uint32_t>(conv[3]), 0x5410u);
     const uint32_t w_lo = transpose4x4_bytes(__byte_perm(c01, c23, 0x6420u), q);
     const uint32_t w_hi = transpose4x4_bytes(__byte_perm(c01, c23, 0x7531u), q);
     out32[((size_t)(row0 + rq) * OUT_COLS + out_col0) / 4 + 4 * half + q] = w_lo;

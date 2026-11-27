@@ -2065,6 +2065,35 @@ __global__ void Marlin(
         cur_b1 = nxt_b1;
       }
     }
+  } else if constexpr (b_type_id == vllm::kFE2M1f.id() &&
+                       a_type_id == vllm::kBFloat16.id() && dequant_skip_flop &&
+                       !has_act_order && !has_zp && !is_a_8bit &&
+                       group_blocks != -1 && !m_block_size_8 &&
+                       thread_m_blocks == 2) {
+    // Zero-extra-register half-interleaved E2M1 dequant + BF16 scale -> HMMA overlap
+    // for thread_m_blocks == 2 (M = 32): starts HMMA(i=0, b0) as soon as b0 is scaled,
+    // overlaps dequant(b1) with HMMA(i=0, b0) and scale(b1) with HMMA(i=1, b0),
+    // keeping exact 0-ULP per-accumulator HMMA order and zero extra register pressure.
+  #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const uint32_t u = static_cast<uint32_t>(frag_b_quant[k2][0][j]);
+      FragB frag_b0;
+      reinterpret_cast<uint32_t*>(&frag_b0)[0] =
+          ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
+      reinterpret_cast<uint32_t*>(&frag_b0)[1] =
+          ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
+      scale<a_type_id>(frag_b0, frag_s[k2][j], 0);
+      mma<a_type_id, use_fp16_accum>(frag_a[k2][0], frag_b0, frag_c[0][j][0]);
+      FragB frag_b1;
+      reinterpret_cast<uint32_t*>(&frag_b1)[0] =
+          (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
+      reinterpret_cast<uint32_t*>(&frag_b1)[1] =
+          lop3<(0xf0 & 0xcc) | 0xaa>(u, 0x80008000, (u >> 6) & 0x01c001c0u);
+      mma<a_type_id, use_fp16_accum>(frag_a[k2][1], frag_b0, frag_c[1][j][0]);
+      scale<a_type_id>(frag_b1, frag_s[k2][j], 1);
+      mma<a_type_id, use_fp16_accum>(frag_a[k2][0], frag_b1, frag_c[0][j][1]);
+      mma<a_type_id, use_fp16_accum>(frag_a[k2][1], frag_b1, frag_c[1][j][1]);
+    }
   } else {
   #pragma unroll
     for (int j = 0; j < 4; j++) {
