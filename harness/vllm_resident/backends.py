@@ -391,19 +391,27 @@ class VllmBackend:
                 self.step()
             self.abort()
         # Exercise both low-acceptance (wide M=32 + M=16 4-slot verify_lmpost rings)
-        # and high-acceptance (ctx_kv[7] + ceiling clamp) 512-token seed shapes, then
-        # finish with 2 canonical max_tokens=1 seed prefills so _zp_canonical_block_ids
-        # and _zp_stage_graph are warm before reporting READY.
-        rep_seed = [1000 + (i % 8) for i in range(self.WARMUP_SEED_TOKENS)]
-        self.start(rep_seed, top_logits=False)
-        for _ in range(8):
-            self.step()
-        self.abort()
-        for i in range(3):
-            self.start(prompt[: self.WARMUP_SEED_TOKENS], max_tokens=(None if i == 0 else 1), top_logits=False)
-            if i == 0:
-                for _ in range(self.WARMUP_SEED_DECODE_STEPS):
-                    self.step()
+        # and high-acceptance (ctx_kv[7] + pipelined spec_run + emit_target M=16/M=7 tail)
+        # 512-token seed shapes, then finish with 2 canonical max_tokens=1 seed prefills
+        # so _zp_canonical_block_ids and _zp_stage_graph are warm before reporting READY.
+        for seed_tokens, spec_count in (
+            ([1000 + (i % 8) for i in range(self.WARMUP_SEED_TOKENS)], 24),
+            (prompt[: self.WARMUP_SEED_TOKENS], 24),
+        ):
+            self.start(seed_tokens, top_logits=False)
+            self.begin_spec_run(spec_count)
+            try:
+                produced = 0
+                while produced < spec_count:
+                    produced += len(self.step())
+            except Exception:
+                self.abort()
+                raise
+            else:
+                self.end_spec_run()
+            self.abort()
+        for _ in range(2):
+            self.start(prompt[: self.WARMUP_SEED_TOKENS], max_tokens=1, top_logits=False)
             self.abort()
 
     def _params(self, prompt_len: int, max_tokens: int | None = None, top_logits: bool = True):

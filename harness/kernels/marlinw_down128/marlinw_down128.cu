@@ -204,12 +204,18 @@ __device__ __forceinline__ void tile_body(
       FragB& b0 = bb[k2][jj][0];
       FragB& b1 = bb[k2][jj][1];
       int bq1 = jj == 0 ? fb[k2].x : fb[k2].y;
-      int bq0 = bq1 << 8;
 #ifdef D128_NODQ
+      int bq0 = bq1 << 8;
       *reinterpret_cast<int*>(&b0[0]) = bq0; *reinterpret_cast<int*>(&b0[1]) = bq1; *reinterpret_cast<int*>(&b1[0]) = bq0 ^ 1; *reinterpret_cast<int*>(&b1[1]) = bq1 ^ 3;
 #else
-      dequant<nv_bfloat162, vllm::kFE2M1f.id(), true>(bq0, reinterpret_cast<nv_bfloat162*>(&b0));
-      dequant<nv_bfloat162, vllm::kFE2M1f.id(), true>(bq1, reinterpret_cast<nv_bfloat162*>(&b1));
+      {
+        const unsigned u = static_cast<unsigned>(bq1);
+        reinterpret_cast<unsigned*>(&b1)[1] =
+            lop3<(0xf0 & 0xcc) | 0xaa>(u, 0x80008000, (u >> 6) & 0x01c001c0u);
+        reinterpret_cast<unsigned*>(&b1)[0] = (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
+        reinterpret_cast<unsigned*>(&b0)[1] = ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
+        reinterpret_cast<unsigned*>(&b0)[0] = ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
+      }
 #endif
       nv_bfloat162 s = sc[jj];
       nv_bfloat162 s0 = __bfloat162bfloat162(reinterpret_cast<nv_bfloat16*>(&s)[0]);

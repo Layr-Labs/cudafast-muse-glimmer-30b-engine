@@ -176,7 +176,8 @@ __device__ __forceinline__ void issue_kv64_flat(
     uint4 smem_tile[64][16],
     const __nv_bfloat16* __restrict__ flat_base,
     int tok_base,
-    int tid) {
+    int tid,
+    int n_u = 4) {
   const int r_in_16 = tid >> 4;
   const int c = tid & 15;
   const int c_phys = c ^ (r_in_16 & 7);
@@ -184,8 +185,10 @@ __device__ __forceinline__ void issue_kv64_flat(
       flat_base + static_cast<int64_t>(tok_base) * 128) + r_in_16 * 16 + c;
   #pragma unroll
   for (int u = 0; u < 4; ++u) {
-    const int r = (u << 4) + r_in_16;
-    cp_async_16(smem_u32(&smem_tile[r][c_phys]), src + u * 256);
+    if (u < n_u) {
+      const int r = (u << 4) + r_in_16;
+      cp_async_16(smem_u32(&smem_tile[r][c_phys]), src + u * 256);
+    }
   }
 }
 
@@ -487,6 +490,10 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   const int q_tok = (m_grp << 3) + warp_id;
   const int nb_max = (m_grp >> 4) + 1;           // 1..4
   const bool half_only = ((m_grp & 15) < 8);     // true when diagonal upper 64 KV tokens are 100% masked
+  // CTA-uniform causal diagonal tile bounds:
+  // Every warp in CTA m_grp falls in the same 8-column chunk ((m_grp & 15)) and 16-column tile (diag_u).
+  const int diag_ni_end = (m_grp & 15) + 1;      // 1..16 valid 8-col softmax chunks on diagonal block
+  const int diag_u = ((m_grp & 7) >> 1) + 1;     // 1..4 valid 16-row K/V tiles in the active diagonal 64-tok half
 
   // ---------------------------------------------------------------------------
   // 1. 4-head Interleaved Fused Q-RMSNorm + qscale + NEOX RoPE directly from raw qkv!
@@ -559,13 +566,14 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   float row_max0 = -INFINITY, row_max1 = -INFINITY;
   float row_sum0 = 0.0f, row_sum1 = 0.0f;
 
-  issue_kv64_flat(kv_smem[0], k_flat, (nb_max - 1) << 7, tid);
+  issue_kv64_flat(kv_smem[0], k_flat, (nb_max - 1) << 7, tid, half_only ? diag_u : 4);
   cp_async_commit();
 
   for (int nb = nb_max - 1; nb >= 0; --nb) {
     const int block_tok_base = nb << 7;
     const bool is_diag = (nb == nb_max - 1);
     const bool skip_hi = is_diag && half_only;
+    const int ni_lim = is_diag ? diag_ni_end : 16;
 
     float s_frag[16][4];
     #pragma unroll
@@ -574,16 +582,16 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     }
 
     if (!skip_hi) {
-      issue_kv64_flat(kv_smem[1], k_flat, block_tok_base + 64, tid);
+      issue_kv64_flat(kv_smem[1], k_flat, block_tok_base + 64, tid, is_diag ? diag_u : 4);
       cp_async_commit();
       cp_async_wait<1>();
     } else {
-      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base, tid);
+      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base, tid, diag_u);
       cp_async_commit();
       cp_async_wait<1>();
     }
     __syncthreads();
-    {
+    if (!skip_hi) {
       uint32_t b_cur[4], b_nxt[4];
       ldsm4_k_pair64(b_cur, kv_smem[0], 0, 0, lane);
       #pragma unroll
@@ -598,6 +606,21 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
           b_cur[0] = b_nxt[0]; b_cur[1] = b_nxt[1]; b_cur[2] = b_nxt[2]; b_cur[3] = b_nxt[3];
         }
       }
+    } else {
+      #pragma unroll
+      for (int sp = 0; sp < 4; ++sp) {
+        if (sp < diag_u) {
+          uint32_t b_cur[4], b_nxt[4];
+          ldsm4_k_pair64(b_cur, kv_smem[0], sp, 0, lane);
+          #pragma unroll
+          for (int ks = 0; ks < 8; ++ks) {
+            if (ks + 1 < 8) ldsm4_k_pair64(b_nxt, kv_smem[0], sp, ks + 1, lane);
+            mma_m16n8k16_bf16(q_frag[ks], b_cur[0], b_cur[1], s_frag[sp * 2 + 0]);
+            mma_m16n8k16_bf16(q_frag[ks], b_cur[2], b_cur[3], s_frag[sp * 2 + 1]);
+            b_cur[0] = b_nxt[0]; b_cur[1] = b_nxt[1]; b_cur[2] = b_nxt[2]; b_cur[3] = b_nxt[3];
+          }
+        }
+      }
     }
     __syncthreads();
 
@@ -606,7 +629,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
       cp_async_commit();
       cp_async_wait<1>();
       __syncthreads();
-      {
+      if (!is_diag) {
         uint32_t b_cur[4], b_nxt[4];
         ldsm4_k_pair64(b_cur, kv_smem[1], 0, 0, lane);
         #pragma unroll
@@ -621,23 +644,40 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
             b_cur[0] = b_nxt[0]; b_cur[1] = b_nxt[1]; b_cur[2] = b_nxt[2]; b_cur[3] = b_nxt[3];
           }
         }
+      } else {
+        #pragma unroll
+        for (int sp = 0; sp < 4; ++sp) {
+          if (sp < diag_u) {
+            uint32_t b_cur[4], b_nxt[4];
+            ldsm4_k_pair64(b_cur, kv_smem[1], sp, 0, lane);
+            #pragma unroll
+            for (int ks = 0; ks < 8; ++ks) {
+              if (ks + 1 < 8) ldsm4_k_pair64(b_nxt, kv_smem[1], sp, ks + 1, lane);
+              mma_m16n8k16_bf16(q_frag[ks], b_cur[0], b_cur[1], s_frag[8 + sp * 2 + 0]);
+              mma_m16n8k16_bf16(q_frag[ks], b_cur[2], b_cur[3], s_frag[8 + sp * 2 + 1]);
+              b_cur[0] = b_nxt[0]; b_cur[1] = b_nxt[1]; b_cur[2] = b_nxt[2]; b_cur[3] = b_nxt[3];
+            }
+          }
+        }
       }
       __syncthreads();
-      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base + 64, tid);
+      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base + 64, tid, is_diag ? diag_u : 4);
       cp_async_commit();
     }
 
     float m0 = -INFINITY, m1 = -INFINITY;
     #pragma unroll
     for (int ni = 0; ni < 16; ++ni) {
-      if (is_diag) {
-        const int col0 = block_tok_base + (ni << 3) + (tid_in_grp << 1);
-        const int col1 = col0 + 1;
-        if (col0 > q_tok) { s_frag[ni][0] = -INFINITY; s_frag[ni][2] = -INFINITY; }
-        if (col1 > q_tok) { s_frag[ni][1] = -INFINITY; s_frag[ni][3] = -INFINITY; }
+      if (ni < ni_lim) {
+        if (is_diag && ni == ni_lim - 1) {
+          const int col0 = block_tok_base + (ni << 3) + (tid_in_grp << 1);
+          const int col1 = col0 + 1;
+          if (col0 > q_tok) { s_frag[ni][0] = -INFINITY; s_frag[ni][2] = -INFINITY; }
+          if (col1 > q_tok) { s_frag[ni][1] = -INFINITY; s_frag[ni][3] = -INFINITY; }
+        }
+        m0 = max_ftz_f32(m0, max_ftz_f32(s_frag[ni][0], s_frag[ni][1]));
+        m1 = max_ftz_f32(m1, max_ftz_f32(s_frag[ni][2], s_frag[ni][3]));
       }
-      m0 = max_ftz_f32(m0, max_ftz_f32(s_frag[ni][0], s_frag[ni][1]));
-      m1 = max_ftz_f32(m1, max_ftz_f32(s_frag[ni][2], s_frag[ni][3]));
     }
     m0 = max_ftz_f32(m0, __shfl_xor_sync(0xffffffffu, m0, 2));
     m0 = max_ftz_f32(m0, __shfl_xor_sync(0xffffffffu, m0, 1));
@@ -671,28 +711,33 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     uint32_t p_frag[8][4];
     #pragma unroll
     for (int ni = 0; ni < 16; ++ni) {
-      const float p0 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][0], scale_log2), max_sc0));
-      const float p1 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][1], scale_log2), max_sc0));
-      const float p2 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][2], scale_log2), max_sc1));
-      const float p3 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][3], scale_log2), max_sc1));
-      if (ni == 0) {
-        if (is_diag) {
-          row_sum0 = add_ftz_f32(p0, p1);
-          row_sum1 = add_ftz_f32(p2, p3);
-        } else {
-          row_sum0 = add_ftz_f32(fma_rn_ftz_f32(row_sum0, sc0, p0), p1);
-          row_sum1 = add_ftz_f32(fma_rn_ftz_f32(row_sum1, sc1, p2), p3);
-        }
-      } else {
-        row_sum0 = add_ftz_f32(add_ftz_f32(row_sum0, p0), p1);
-        row_sum1 = add_ftz_f32(add_ftz_f32(row_sum1, p2), p3);
-      }
-      const __nv_bfloat162 pb0 = __floats2bfloat162_rn(p0, p1);
-      const __nv_bfloat162 pb1 = __floats2bfloat162_rn(p2, p3);
       const int kp = ni >> 1;
       const int hi = (ni & 1) << 1;
-      p_frag[kp][hi + 0] = *reinterpret_cast<const uint32_t*>(&pb0);
-      p_frag[kp][hi + 1] = *reinterpret_cast<const uint32_t*>(&pb1);
+      if (ni < ni_lim) {
+        const float p0 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][0], scale_log2), max_sc0));
+        const float p1 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][1], scale_log2), max_sc0));
+        const float p2 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][2], scale_log2), max_sc1));
+        const float p3 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][3], scale_log2), max_sc1));
+        if (ni == 0) {
+          if (is_diag) {
+            row_sum0 = add_ftz_f32(p0, p1);
+            row_sum1 = add_ftz_f32(p2, p3);
+          } else {
+            row_sum0 = add_ftz_f32(fma_rn_ftz_f32(row_sum0, sc0, p0), p1);
+            row_sum1 = add_ftz_f32(fma_rn_ftz_f32(row_sum1, sc1, p2), p3);
+          }
+        } else {
+          row_sum0 = add_ftz_f32(add_ftz_f32(row_sum0, p0), p1);
+          row_sum1 = add_ftz_f32(add_ftz_f32(row_sum1, p2), p3);
+        }
+        const __nv_bfloat162 pb0 = __floats2bfloat162_rn(p0, p1);
+        const __nv_bfloat162 pb1 = __floats2bfloat162_rn(p2, p3);
+        p_frag[kp][hi + 0] = *reinterpret_cast<const uint32_t*>(&pb0);
+        p_frag[kp][hi + 1] = *reinterpret_cast<const uint32_t*>(&pb1);
+      } else if (ni == ni_lim && (ni & 1) != 0) {
+        p_frag[kp][2] = 0u;
+        p_frag[kp][3] = 0u;
+      }
     }
 
     if (skip_hi) {
@@ -708,18 +753,18 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         }
       }
       __syncthreads();
-      uint32_t v_cur[4], v_nxt[4];
-      ldsm4_v_pair64(v_cur, kv_smem[1], 0, 0, lane);
       #pragma unroll
       for (int ks_local = 0; ks_local < 4; ++ks_local) {
-        #pragma unroll
-        for (int dp = 0; dp < 8; ++dp) {
-          const int n_dp = (dp + 1) & 7;
-          const int n_ks = ks_local + (dp == 7 ? 1 : 0);
-          if (n_ks < 4) ldsm4_v_pair64(v_nxt, kv_smem[1], n_dp, n_ks, lane);
-          mma_m16n8k16_bf16(p_frag[ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
-          mma_m16n8k16_bf16(p_frag[ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
-          v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
+        if (ks_local < diag_u) {
+          uint32_t v_cur[4], v_nxt[4];
+          ldsm4_v_pair64(v_cur, kv_smem[1], 0, ks_local, lane);
+          #pragma unroll
+          for (int dp = 0; dp < 8; ++dp) {
+            if (dp + 1 < 8) ldsm4_v_pair64(v_nxt, kv_smem[1], dp + 1, ks_local, lane);
+            mma_m16n8k16_bf16(p_frag[ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
+            mma_m16n8k16_bf16(p_frag[ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
+            v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
+          }
         }
       }
       __syncthreads();
@@ -755,7 +800,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         }
       }
       __syncthreads();
-      {
+      if (!is_diag) {
         uint32_t v_cur[4], v_nxt[4];
         ldsm4_v_pair64(v_cur, kv_smem[1], 0, 0, lane);
         #pragma unroll
@@ -768,6 +813,21 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
             mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
             mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
             v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
+          }
+        }
+      } else {
+        #pragma unroll
+        for (int ks_local = 0; ks_local < 4; ++ks_local) {
+          if (ks_local < diag_u) {
+            uint32_t v_cur[4], v_nxt[4];
+            ldsm4_v_pair64(v_cur, kv_smem[1], 0, ks_local, lane);
+            #pragma unroll
+            for (int dp = 0; dp < 8; ++dp) {
+              if (dp + 1 < 8) ldsm4_v_pair64(v_nxt, kv_smem[1], dp + 1, ks_local, lane);
+              mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
+              mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
+              v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
+            }
           }
         }
       }

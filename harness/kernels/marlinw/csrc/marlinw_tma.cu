@@ -233,7 +233,8 @@ __device__ __forceinline__ void k_loop(
       // (the copies cannot overlap) and masked: bit 15 <- sign, bits 8:6 <- e1 e0 m, the same in the upper half.
       {
         const unsigned u = static_cast<unsigned>(bq1);
-        reinterpret_cast<unsigned*>(&b1)[1] = (u & 0x80008000u) | ((u >> 6) & 0x01c001c0u);
+        reinterpret_cast<unsigned*>(&b1)[1] =
+            lop3<(0xf0 & 0xcc) | 0xaa>(u, 0x80008000u, (u >> 6) & 0x01c001c0u);
         reinterpret_cast<unsigned*>(&b1)[0] = (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
         reinterpret_cast<unsigned*>(&b0)[1] = ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
         reinterpret_cast<unsigned*>(&b0)[0] = ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
@@ -275,15 +276,19 @@ __device__ __forceinline__ void k_loop(
     const int s = q & (kStages - 1);
     const int ns = (q + 1) & (kStages - 1);
     if (tid == 0 && q + kDist < total) start_copy(q + kDist);
-    // k-half 0 of k-tile t (operands already in registers); meanwhile k-half 1 of the same stage is loaded.
+    // k-half 0 of k-tile t: issue LDS load_bs(1, s) up front and hide its 28-cycle LDS latency
+    // behind Quarter-0 mma16 + ldsm4, then run dequant_to(1) overlapping Quarter-1 mma16.
     load_bs(1, s);
-    dequant_to(1);
     if constexpr (kSingleFa) {
       const uint32_t sa = sbase + kStageBytes * s + a_rd1;
 #pragma unroll
       for (int i = 0; i < MB; i++) {
         mma16(fa[0][i], bb[0][0][0], acc[i][0][0]);
         mma16(fa[0][i], bb[0][0][1], acc[i][0][1]);
+      }
+      dequant_to(1);
+#pragma unroll
+      for (int i = 0; i < MB; i++) {
         mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
         mma16(fa[0][i], bb[0][1][1], acc[i][1][1]);
         ldsm4(fa[0][i], sa + 2048 * i);
@@ -294,7 +299,6 @@ __device__ __forceinline__ void k_loop(
       if (has_next) {
         mbar_wait(full_bar + 8 * ns, ((q + 1) / kStages) & 1);
         load_bs(0, ns);
-        dequant_to(0);
       }
       {
         const uint32_t sa0 = sbase + kStageBytes * ns + a_rd0;
@@ -302,6 +306,10 @@ __device__ __forceinline__ void k_loop(
         for (int i = 0; i < MB; i++) {
           mma16(fa[0][i], bb[1][0][0], acc[i][0][0]);
           mma16(fa[0][i], bb[1][0][1], acc[i][0][1]);
+        }
+        if (has_next) dequant_to(0);
+#pragma unroll
+        for (int i = 0; i < MB; i++) {
           mma16(fa[0][i], bb[1][1][0], acc[i][1][0]);
           mma16(fa[0][i], bb[1][1][1], acc[i][1][1]);
           if (has_next) ldsm4(fa[0][i], sa0 + 2048 * i);
@@ -319,24 +327,28 @@ __device__ __forceinline__ void k_loop(
       }
       __syncwarp();
       if (lane == 0) mbar_arrive(empty_bar + 8 * s);  // warp-aggregated empty signal
+      dequant_to(1);
 #pragma unroll
       for (int i = 0; i < MB; i++) {
         mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
         mma16(fa[0][i], bb[0][1][1], acc[i][1][1]);
       }
-      // k-half 1 of k-tile t; meanwhile k-half 0 of k-tile t + 1 is loaded.
-      if (t + 1 < iters) mbar_wait(full_bar + 8 * ns, ((q + 1) / kStages) & 1);
-      load_bs(0, ns);
-      dequant_to(0);
+      // k-half 1 of k-tile t; hide load_bs(0, ns) LDS latency behind Quarter-0 mma16 + ldsm4.
+      const bool has_next = (t + 1 < iters);
+      if (has_next) {
+        mbar_wait(full_bar + 8 * ns, ((q + 1) / kStages) & 1);
+        load_bs(0, ns);
+      }
       {
         const uint32_t sa = sbase + kStageBytes * ns + a_rd0;
 #pragma unroll
         for (int i = 0; i < MB; i++) {
           mma16(fa[1][i], bb[1][0][0], acc[i][0][0]);
           mma16(fa[1][i], bb[1][0][1], acc[i][0][1]);
-          ldsm4(fa[0][i], sa + 2048 * i);
+          if (has_next) ldsm4(fa[0][i], sa + 2048 * i);
         }
       }
+      if (has_next) dequant_to(0);
 #pragma unroll
       for (int i = 0; i < MB; i++) {
         mma16(fa[1][i], bb[1][1][0], acc[i][1][0]);

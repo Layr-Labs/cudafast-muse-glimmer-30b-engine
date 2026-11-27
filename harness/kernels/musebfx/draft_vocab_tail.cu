@@ -544,6 +544,40 @@ __device__ __forceinline__ unsigned dvt_pop_static_warp_top6(
   return winner;
 }
 
+__device__ __forceinline__ void dvt_warp_cas_u64(uint64_t& v, int stride, int lane, bool asc) {
+  const uint32_t hi = __shfl_xor_sync(0xffffffffu, static_cast<uint32_t>(v >> 32), stride);
+  const uint32_t lo = __shfl_xor_sync(0xffffffffu, static_cast<uint32_t>(v), stride);
+  const uint64_t other = (static_cast<uint64_t>(hi) << 32) | lo;
+  const bool is_hi = ((lane & stride) != 0);
+  v = (is_hi == asc) ? ((v > other) ? v : other) : ((v < other) ? v : other);
+}
+
+__device__ __forceinline__ void dvt_warp_bitonic_merge64(
+    uint64_t& x, uint64_t& y, int lane, bool asc) {
+  const uint64_t lo = (x < y) ? x : y;
+  const uint64_t hi = (x > y) ? x : y;
+  x = asc ? lo : hi;
+  y = asc ? hi : lo;
+  dvt_warp_cas_u64(x, 16, lane, asc); dvt_warp_cas_u64(y, 16, lane, asc);
+  dvt_warp_cas_u64(x, 8, lane, asc);  dvt_warp_cas_u64(y, 8, lane, asc);
+  dvt_warp_cas_u64(x, 4, lane, asc);  dvt_warp_cas_u64(y, 4, lane, asc);
+  dvt_warp_cas_u64(x, 2, lane, asc);  dvt_warp_cas_u64(y, 2, lane, asc);
+  dvt_warp_cas_u64(x, 1, lane, asc);  dvt_warp_cas_u64(y, 1, lane, asc);
+}
+
+__device__ __forceinline__ void dvt_smem_bitonic_step(
+    uint64_t* __restrict__ s_cand, int tid, int k, int j) {
+  const int ixj_lo = ((tid & ~(j - 1)) << 1) | (tid & (j - 1));
+  const int ixj_hi = ixj_lo | j;
+  const bool desc = ((ixj_lo & k) == 0);
+  const uint64_t a = s_cand[ixj_lo];
+  const uint64_t b = s_cand[ixj_hi];
+  if (desc ? (a < b) : (a > b)) {
+    s_cand[ixj_lo] = b;
+    s_cand[ixj_hi] = a;
+  }
+}
+
 template <int kTopK, int kCtasPerRow, bool kFusedFinal, bool kPackedTop6 = false>
 __global__ void __launch_bounds__(256, 2) draft_vocab_tail_argmax_kernel(
     const __nv_bfloat16* __restrict__ A,
@@ -730,27 +764,76 @@ __global__ void __launch_bounds__(256, 2) draft_vocab_tail_argmax_kernel(
 
   unsigned static_keys[6] = {};
   if (cand_buf != nullptr) {
-    // Fast fused rescore path: sort the <= 512 per-CTA coarse candidates of row `m` in SMEM
-    // and rescore the global coarse top-`rescore_k` using exact NVFP4 `dvt_warp_nvfp4_dot`.
+    // Fast fused rescore path: warp-local register bitonic sort of <= 512 coarse candidates
+    // (stages k=2..64 and all j<=32 merge tails run 100% in registers via __shfl_xor_sync;
+    // reduces 45 block barriers & 45 divisions to 10 block barriers & 0 divisions, bit-exact).
     const uint64_t* row_cands = cand_buf + static_cast<size_t>(m) * num_cands;
-    s_cand[tid] = (tid < num_cands) ? row_cands[tid] : 0ull;
-    s_cand[tid + 256] = (tid + 256 < num_cands) ? row_cands[tid + 256] : 0ull;
+    const int w_base = warp << 6;
+    const int idx0 = w_base + lane;
+    const int idx1 = w_base + 32 + lane;
+    uint64_t cx = (idx0 < num_cands) ? row_cands[idx0] : 0ull;
+    uint64_t cy = (idx1 < num_cands) ? row_cands[idx1] : 0ull;
+
+    // k = 2, 4, 8, 16, 32, 64 entirely in warp registers (0 SMEM, 0 __syncthreads).
+    dvt_warp_cas_u64(cx, 1, lane, (lane & 2) != 0);
+    dvt_warp_cas_u64(cy, 1, lane, (lane & 2) != 0);
+    dvt_warp_cas_u64(cx, 2, lane, (lane & 4) != 0); dvt_warp_cas_u64(cy, 2, lane, (lane & 4) != 0);
+    dvt_warp_cas_u64(cx, 1, lane, (lane & 4) != 0); dvt_warp_cas_u64(cy, 1, lane, (lane & 4) != 0);
+    dvt_warp_cas_u64(cx, 4, lane, (lane & 8) != 0); dvt_warp_cas_u64(cy, 4, lane, (lane & 8) != 0);
+    dvt_warp_cas_u64(cx, 2, lane, (lane & 8) != 0); dvt_warp_cas_u64(cy, 2, lane, (lane & 8) != 0);
+    dvt_warp_cas_u64(cx, 1, lane, (lane & 8) != 0); dvt_warp_cas_u64(cy, 1, lane, (lane & 8) != 0);
+    dvt_warp_cas_u64(cx, 8, lane, (lane & 16) != 0); dvt_warp_cas_u64(cy, 8, lane, (lane & 16) != 0);
+    dvt_warp_cas_u64(cx, 4, lane, (lane & 16) != 0); dvt_warp_cas_u64(cy, 4, lane, (lane & 16) != 0);
+    dvt_warp_cas_u64(cx, 2, lane, (lane & 16) != 0); dvt_warp_cas_u64(cy, 2, lane, (lane & 16) != 0);
+    dvt_warp_cas_u64(cx, 1, lane, (lane & 16) != 0); dvt_warp_cas_u64(cy, 1, lane, (lane & 16) != 0);
+    // k = 32: cx descending (asc=false), cy ascending (asc=true).
+    dvt_warp_cas_u64(cx, 16, lane, false); dvt_warp_cas_u64(cy, 16, lane, true);
+    dvt_warp_cas_u64(cx, 8, lane, false);  dvt_warp_cas_u64(cy, 8, lane, true);
+    dvt_warp_cas_u64(cx, 4, lane, false);  dvt_warp_cas_u64(cy, 4, lane, true);
+    dvt_warp_cas_u64(cx, 2, lane, false);  dvt_warp_cas_u64(cy, 2, lane, true);
+    dvt_warp_cas_u64(cx, 1, lane, false);  dvt_warp_cas_u64(cy, 1, lane, true);
+    // k = 64: merge within each warp's 64-element tile.
+    dvt_warp_bitonic_merge64(cx, cy, lane, (warp & 1) != 0);
+
+    s_cand[idx0] = cx;
+    s_cand[idx1] = cy;
     __syncthreads();
 
-    for (int k = 2; k <= 512; k <<= 1) {
-      for (int j = k >> 1; j > 0; j >>= 1) {
-        const int ixj_lo = (tid / j) * (2 * j) + (tid & (j - 1));
-        const int ixj_hi = ixj_lo ^ j;
-        const bool desc = ((ixj_lo & k) == 0);
-        const uint64_t a = s_cand[ixj_lo];
-        const uint64_t b = s_cand[ixj_hi];
-        if (desc ? (a < b) : (a > b)) {
-          s_cand[ixj_lo] = b;
-          s_cand[ixj_hi] = a;
-        }
-        __syncthreads();
-      }
-    }
+    // k = 128: j = 64 in SMEM, j = 32..1 in registers.
+    dvt_smem_bitonic_step(s_cand, tid, 128, 64);
+    __syncthreads();
+    cx = s_cand[idx0];
+    cy = s_cand[idx1];
+    dvt_warp_bitonic_merge64(cx, cy, lane, (warp & 2) != 0);
+    s_cand[idx0] = cx;
+    s_cand[idx1] = cy;
+    __syncthreads();
+
+    // k = 256: j = 128, 64 in SMEM, j = 32..1 in registers.
+    dvt_smem_bitonic_step(s_cand, tid, 256, 128);
+    __syncthreads();
+    dvt_smem_bitonic_step(s_cand, tid, 256, 64);
+    __syncthreads();
+    cx = s_cand[idx0];
+    cy = s_cand[idx1];
+    dvt_warp_bitonic_merge64(cx, cy, lane, (warp & 4) != 0);
+    s_cand[idx0] = cx;
+    s_cand[idx1] = cy;
+    __syncthreads();
+
+    // k = 512 (global descending): j = 256, 128, 64 in SMEM, j = 32..1 in registers.
+    dvt_smem_bitonic_step(s_cand, tid, 512, 256);
+    __syncthreads();
+    dvt_smem_bitonic_step(s_cand, tid, 512, 128);
+    __syncthreads();
+    dvt_smem_bitonic_step(s_cand, tid, 512, 64);
+    __syncthreads();
+    cx = s_cand[idx0];
+    cy = s_cand[idx1];
+    dvt_warp_bitonic_merge64(cx, cy, lane, false);
+    s_cand[idx0] = cx;
+    s_cand[idx1] = cy;
+    __syncthreads();
 
     const int eff_rescore = (rescore_k < 512) ? rescore_k : 512;
     const int stride_warps = kCtasPerRow * kS2Warps;
