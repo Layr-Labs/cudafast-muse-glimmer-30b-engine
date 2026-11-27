@@ -19,6 +19,8 @@
 #include <cstdlib>
 #include <stdint.h>
 
+#include "nvfp4_rescore.cuh"
+
 bool draft_head_try_get_cands(
     const torch::Tensor& static_logits,
     const uint64_t*& out_cand_ptr,
@@ -91,13 +93,6 @@ static inline void dvt_launch_pdl(
   }
   cudaError_t err = cudaLaunchKernelEx(&lcfg, kernel, static_cast<KArgs>(args)...);
   TORCH_CHECK(err == cudaSuccess, "draft_vocab kernel launch failed: ", cudaGetErrorString(err));
-}
-
-// Zero-I2F exact 2x E2M1 magnitude decode ({0,1,2,3,4,6,8,12}) via FP32 16.0f bias + sign XOR.
-__device__ __forceinline__ float dvt_e2m1_x2_to_f32(uint32_t nib) {
-  const uint32_t mag_u = (0xC8643210u >> ((nib & 7u) << 2)) & 0xFu;
-  const float mag = __uint_as_float(0x41800000u | (mag_u << 19)) - 16.0f;
-  return __uint_as_float(__float_as_uint(mag) ^ ((nib & 8u) << 28));
 }
 
 __device__ __forceinline__ float dvt_fp8_e4m3_to_f32(uint8_t bits) {
@@ -418,28 +413,6 @@ __global__ void draft_vocab_update_tail_kernel(
 
 // Helper: 1 warp computes exact NVFP4 dot product for row `v` against SMEM/global `a_row`.
 // Vectorized 2-group (uint4 weights + uint16 scales) loop when num_g is even (e.g. K=6656 -> 416).
-__device__ __forceinline__ float dvt_nvfp4_group_dot(
-    uint32_t wlo, uint32_t whi, const uint4& a0, const uint4& a1) {
-  const __nv_bfloat162* ap0 = reinterpret_cast<const __nv_bfloat162*>(&a0);
-  const __nv_bfloat162* ap1 = reinterpret_cast<const __nv_bfloat162*>(&a1);
-  float gsum = 0.0f;
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const float2 af = __bfloat1622float2(ap0[i]);
-    gsum = __fmaf_rn(dvt_e2m1_x2_to_f32(wlo & 0xFu), af.x, gsum);
-    gsum = __fmaf_rn(dvt_e2m1_x2_to_f32((wlo >> 4) & 0xFu), af.y, gsum);
-    wlo >>= 8;
-  }
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const float2 af = __bfloat1622float2(ap1[i]);
-    gsum = __fmaf_rn(dvt_e2m1_x2_to_f32(whi & 0xFu), af.x, gsum);
-    gsum = __fmaf_rn(dvt_e2m1_x2_to_f32((whi >> 4) & 0xFu), af.y, gsum);
-    whi >>= 8;
-  }
-  return gsum;
-}
-
 __device__ __forceinline__ float dvt_warp_nvfp4_dot(
     const __nv_bfloat16* __restrict__ a_row,
     const uint4* __restrict__ s_a0,
@@ -467,8 +440,8 @@ __device__ __forceinline__ float dvt_warp_nvfp4_dot(
       const uint4 a01 = use_smem_a ? s_a1[g0] : *(reinterpret_cast<const uint4*>(a_row) + g0 * 2 + 1);
       const uint4 a10 = use_smem_a ? s_a0[g1] : *(reinterpret_cast<const uint4*>(a_row) + g1 * 2 + 0);
       const uint4 a11 = use_smem_a ? s_a1[g1] : *(reinterpret_cast<const uint4*>(a_row) + g1 * 2 + 1);
-      acc = __fmaf_rn(dvt_nvfp4_group_dot(w16.x, w16.y, a00, a01), sc0, acc);
-      acc = __fmaf_rn(dvt_nvfp4_group_dot(w16.z, w16.w, a10, a11), sc1, acc);
+      acc = __fmaf_rn(muse_nvfp4::group_dot(w16.x, w16.y, a00, a01), sc0, acc);
+      acc = __fmaf_rn(muse_nvfp4::group_dot(w16.z, w16.w, a10, a11), sc1, acc);
     }
   } else {
     for (int g = lane; g < num_g; g += 32) {
@@ -477,7 +450,7 @@ __device__ __forceinline__ float dvt_warp_nvfp4_dot(
       const uint4 a0 = use_smem_a ? s_a0[g] : *(reinterpret_cast<const uint4*>(a_row) + g * 2 + 0);
       const uint4 a1 = use_smem_a ? s_a1[g] : *(reinterpret_cast<const uint4*>(a_row) + g * 2 + 1);
       acc = __fmaf_rn(
-          dvt_nvfp4_group_dot(static_cast<uint32_t>(w8), static_cast<uint32_t>(w8 >> 32), a0, a1),
+          muse_nvfp4::group_dot(static_cast<uint32_t>(w8), static_cast<uint32_t>(w8 >> 32), a0, a1),
           sc_half, acc);
     }
   }

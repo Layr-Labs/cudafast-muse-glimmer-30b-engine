@@ -17,6 +17,8 @@
 #include <stdint.h>
 #include <tuple>
 
+#include "nvfp4_rescore.cuh"
+
 namespace {
 
 constexpr int kDhWarps = 4;
@@ -3371,29 +3373,6 @@ __global__ void dhf_select_topk_kernel(
   }
 }
 
-// Exact warp-level NVFP4 dot product (bit-identical to draft_vocab_tail.cu's dvt_warp_nvfp4_dot).
-__device__ __forceinline__ float dhf_nvfp4_group_dot(
-    uint32_t wlo, uint32_t whi, const uint4& a0, const uint4& a1) {
-  const __nv_bfloat162* ap0 = reinterpret_cast<const __nv_bfloat162*>(&a0);
-  const __nv_bfloat162* ap1 = reinterpret_cast<const __nv_bfloat162*>(&a1);
-  float gsum = 0.0f;
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const float2 af = __bfloat1622float2(ap0[i]);
-    gsum = __fmaf_rn(dhf_e2m1_x2_to_f32(wlo & 0xFu), af.x, gsum);
-    gsum = __fmaf_rn(dhf_e2m1_x2_to_f32((wlo >> 4) & 0xFu), af.y, gsum);
-    wlo >>= 8;
-  }
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const float2 af = __bfloat1622float2(ap1[i]);
-    gsum = __fmaf_rn(dhf_e2m1_x2_to_f32(whi & 0xFu), af.x, gsum);
-    gsum = __fmaf_rn(dhf_e2m1_x2_to_f32((whi >> 4) & 0xFu), af.y, gsum);
-    whi >>= 8;
-  }
-  return gsum;
-}
-
 __device__ __forceinline__ float dhf_warp_nvfp4_dot(
     const __nv_bfloat16* __restrict__ a_row,
     const uint4* __restrict__ s_a0,
@@ -3419,8 +3398,8 @@ __device__ __forceinline__ float dhf_warp_nvfp4_dot(
         const int g1 = g0 | 1;
         const float sc0 = dhf_fp8_e4m3_to_f32(static_cast<uint8_t>(s2 & 0xFFu)) * 0.5f;
         const float sc1 = dhf_fp8_e4m3_to_f32(static_cast<uint8_t>(s2 >> 8)) * 0.5f;
-        acc = __fmaf_rn(dhf_nvfp4_group_dot(w16.x, w16.y, s_a0[g0], s_a1[g0]), sc0, acc);
-        acc = __fmaf_rn(dhf_nvfp4_group_dot(w16.z, w16.w, s_a0[g1], s_a1[g1]), sc1, acc);
+        acc = __fmaf_rn(muse_nvfp4::group_dot(w16.x, w16.y, s_a0[g0], s_a1[g0]), sc0, acc);
+        acc = __fmaf_rn(muse_nvfp4::group_dot(w16.z, w16.w, s_a0[g1], s_a1[g1]), sc1, acc);
       }
     } else {
       for (int g2 = lane; g2 < num_g2; g2 += 32) {
@@ -3434,8 +3413,8 @@ __device__ __forceinline__ float dhf_warp_nvfp4_dot(
         const uint4 a01 = use_smem_a ? s_a1[g0] : __ldg(reinterpret_cast<const uint4*>(a_row) + g0 * 2 + 1);
         const uint4 a10 = use_smem_a ? s_a0[g1] : __ldg(reinterpret_cast<const uint4*>(a_row) + g1 * 2 + 0);
         const uint4 a11 = use_smem_a ? s_a1[g1] : __ldg(reinterpret_cast<const uint4*>(a_row) + g1 * 2 + 1);
-        acc = __fmaf_rn(dhf_nvfp4_group_dot(w16.x, w16.y, a00, a01), sc0, acc);
-        acc = __fmaf_rn(dhf_nvfp4_group_dot(w16.z, w16.w, a10, a11), sc1, acc);
+        acc = __fmaf_rn(muse_nvfp4::group_dot(w16.x, w16.y, a00, a01), sc0, acc);
+        acc = __fmaf_rn(muse_nvfp4::group_dot(w16.z, w16.w, a10, a11), sc1, acc);
       }
     }
   } else {
@@ -3445,7 +3424,7 @@ __device__ __forceinline__ float dhf_warp_nvfp4_dot(
       const uint4 a0 = use_smem_a ? s_a0[g] : __ldg(reinterpret_cast<const uint4*>(a_row) + g * 2 + 0);
       const uint4 a1 = use_smem_a ? s_a1[g] : __ldg(reinterpret_cast<const uint4*>(a_row) + g * 2 + 1);
       acc = __fmaf_rn(
-          dhf_nvfp4_group_dot(static_cast<uint32_t>(w8), static_cast<uint32_t>(w8 >> 32), a0, a1),
+          muse_nvfp4::group_dot(static_cast<uint32_t>(w8), static_cast<uint32_t>(w8 >> 32), a0, a1),
           sc_half, acc);
     }
   }
