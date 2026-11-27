@@ -49,15 +49,19 @@ HOLD_SLOW_FOR_KV = os.environ.get("MUSE_HOLD_SLOW_FOR_KV", "1").strip() not in (
 _SPONGE_STATE: dict[str, int] = {"ptr": 0, "len": 0}
 
 
-def _usable_buddyinfo_bytes(min_chunk: int = 2 << 20) -> int:
-    """Sum free bytes in Linux buddy orders >= min_chunk (2 MiB+) across all zones."""
+def _buddyinfo_order_stats(
+    min_chunk: int = 2 << 20,
+    order13_chunk: int = 32 << 20,
+) -> tuple[int, int, int]:
+    """Return (usable_2m_bytes, usable_order13_bytes, frag_sub_order13_bytes) from /proc/buddyinfo."""
     try:
         page = os.sysconf("SC_PAGE_SIZE")
         with open("/proc/buddyinfo") as fp:
             text = fp.read()
     except (OSError, ValueError):
-        return 0
-    total = 0
+        return (0, 0, 0)
+    usable_2m = 0
+    usable_o13 = 0
     for line in text.splitlines():
         parts = line.replace(",", " ").split()
         if len(parts) <= 4:
@@ -69,12 +73,22 @@ def _usable_buddyinfo_bytes(min_chunk: int = 2 << 20) -> int:
                 break
             blk = page << order
             if blk >= min_chunk:
-                total += cnt * blk
-    return total
+                usable_2m += cnt * blk
+            if blk >= order13_chunk:
+                usable_o13 += cnt * blk
+    frag_sub_o13 = max(0, usable_2m - usable_o13)
+    return (usable_2m, usable_o13, frag_sub_o13)
+
+
+def _usable_buddyinfo_bytes(min_chunk: int = 2 << 20) -> int:
+    """Sum free bytes in Linux buddy orders >= min_chunk (2 MiB+) across all zones."""
+    usable_2m, _, _ = _buddyinfo_order_stats(min_chunk=min_chunk, order13_chunk=max(min_chunk, 32 << 20))
+    return usable_2m
 
 
 def take_buddyinfo_sponge(need_bytes: int = 36 << 30) -> int:
-    """Temporarily commit fragmented small free blocks before weight loading so initial weights land on 32 MiB extents."""
+    """Temporarily commit fragmented sub-32 MiB free blocks before weight loading with a bounded
+    order-13 (32 MiB+) reserve so initial weights land on clean 32 MiB extents without OOM risk."""
     if not ENABLED or os.environ.get("MUSE_BUDDY_SPONGE", "1").strip() in ("0", "", "false", "no"):
         return 0
     if _SPONGE_STATE["ptr"] != 0:
@@ -85,30 +99,54 @@ def take_buddyinfo_sponge(need_bytes: int = 36 << 30) -> int:
         cap_gib = int(os.environ.get("MUSE_BUDDY_SPONGE_CAP_GIB", "72"))
         if cap_gib <= 0:
             return 0
-        usable = _usable_buddyinfo_bytes(2 << 20)
-        headroom = 18 << 30
+        usable_2m, usable_o13, frag_sub_o13 = _buddyinfo_order_stats(2 << 20, 32 << 20)
+        min_res_gib = int(os.environ.get("MUSE_BUDDY_SPONGE_MIN_RESERVE_GIB", "48"))
+        max_res_gib = int(os.environ.get("MUSE_BUDDY_SPONGE_MAX_RESERVE_GIB", "56"))
+        min_reserve = max(need_bytes + (12 << 30), min_res_gib << 30)
+        max_reserve = max(min_reserve, max_res_gib << 30)
+        # Preserve clean order-13 (32 MiB+) extents up to the bounded reserve while draining
+        # sub-32 MiB (order 9..12) fragments first; also bound against live MemAvailable.
+        o13_keep = min(usable_o13, max_reserve)
+        reserve = min(max_reserve, max(min_reserve, o13_keep))
         granule = 2 << 20
         least = 1 << 30
         most = cap_gib << 30
-        if usable <= need_bytes + headroom:
+        raw_len = usable_2m - reserve
+        avail = _mem_available()
+        if avail is not None:
+            raw_len = min(raw_len, avail - min_reserve)
+        if raw_len < least:
             return 0
-        length = (min(usable - (need_bytes + headroom), most) // granule) * granule
+        length = (min(raw_len, most) // granule) * granule
         if length < least:
             return 0
         cuda_drv = ctypes.CDLL("libcuda.so.1")
         dptr = ctypes.c_uint64(0)
-        if cuda_drv.cuMemAlloc_v2(ctypes.byref(dptr), ctypes.c_size_t(length)) != 0 or dptr.value == 0:
-            return 0
-        if cuda_drv.cuMemsetD8_v2(dptr, ctypes.c_ubyte(0), ctypes.c_size_t(length)) != 0:
-            cuda_drv.cuMemFree_v2(dptr)
+        alloc_len = length
+        for _ in range(4):
+            if alloc_len < least:
+                return 0
+            dptr = ctypes.c_uint64(0)
+            if cuda_drv.cuMemAlloc_v2(ctypes.byref(dptr), ctypes.c_size_t(alloc_len)) == 0 and dptr.value != 0:
+                if cuda_drv.cuMemsetD8_v2(dptr, ctypes.c_ubyte(0), ctypes.c_size_t(alloc_len)) == 0:
+                    break
+                cuda_drv.cuMemFree_v2(dptr)
+                dptr = ctypes.c_uint64(0)
+            alloc_len = ((alloc_len * 3) // 4 // granule) * granule
+        if dptr.value == 0:
             return 0
         _SPONGE_STATE["ptr"] = int(dptr.value)
-        _SPONGE_STATE["len"] = int(length)
+        _SPONGE_STATE["len"] = int(alloc_len)
         logger.info(
-            "Buddyinfo fragmentation sponge: held %.1f GiB (usable=%.1f GiB, reserve=%.1f GiB) while weights commit",
-            length / (1 << 30), usable / (1 << 30), (need_bytes + headroom) / (1 << 30),
+            "Buddyinfo order-13 bounded-reserve sponge: held %.1f GiB "
+            "(usable_2m=%.1f GiB, order13_32m=%.1f GiB, frag_sub32m=%.1f GiB, reserve=%.1f GiB)",
+            alloc_len / (1 << 30),
+            usable_2m / (1 << 30),
+            usable_o13 / (1 << 30),
+            frag_sub_o13 / (1 << 30),
+            reserve / (1 << 30),
         )
-        return int(length)
+        return int(alloc_len)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Buddyinfo sponge skipped: %s", exc)
         return 0
@@ -330,6 +368,7 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
         pass
     if len(spares) < count * 4:
         spares.clear()
+        torch.cuda.empty_cache()
         return None
     candidates = homes + spares
     times = _time_candidates(decode_linear, layers[0], candidates, n, k, 5, evict_buf)
@@ -364,6 +403,7 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
     for _, slow_buf in slow_tail:
         _SLOW_HOLD.append(slow_buf)
     del unused, slow_tail
+    ensure_slow_hold_headroom(HOST_HEADROOM_BYTES)
     before = sorted(times[:count])
     after.sort()
     return {
