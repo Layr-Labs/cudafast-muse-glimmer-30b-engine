@@ -3315,6 +3315,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else 0
         )
         _target_leaf_m = _native_leaf.select_verify_m(_leaf_req_id, _leaf_decoded)
+        if (
+            _target_leaf_m == 32
+            and _native_leaf._S.tree_m_ready == 16
+            and 32 in self._single_tree_prep_verified
+            and 16 not in self._single_tree_prep_verified
+        ):
+            # Verify M=16 fused prep once during warmup so the single-launch
+            # compound M=16/M=32 verify + UVA + DFlash step graph always arms.
+            _target_leaf_m = 16
         _emit_tgt = getattr(self, "_spec_emit_target_len", None)
         if _emit_tgt is not None and _leaf_req_idx is not None:
             _rem_toks = int(_emit_tgt) - int(

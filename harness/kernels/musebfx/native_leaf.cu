@@ -5060,6 +5060,110 @@ __global__ void __launch_bounds__(32) native_leaf_store_host_out_kernel(StoreHos
 
 }  // namespace
 
+
+// Conditional-body memcpy lowering. Some GB10 drivers crash inside cudaGraphInstantiate
+// (or refuse) when a conditional body graph holds a memcpy node, including memcpy
+// nodes inside child graphs captured by torch. Before instantiating the adaptive and
+// compound conditional graphs, every 1D memcpy node in a conditional body (recursing
+// through child graphs) is replaced by a kernel node that copies the same bytes with
+// the same dependencies. Host buffers are pinned and device-mapped (UVA), so the
+// device-side copy reads and writes the same memory the copy engine would.
+__global__ void native_leaf_copy_bytes_kernel(const unsigned char* __restrict__ src,
+                                              unsigned char* __restrict__ dst, unsigned long long n) {
+  const unsigned long long tid = blockIdx.x * static_cast<unsigned long long>(blockDim.x) + threadIdx.x;
+  const unsigned long long stride = static_cast<unsigned long long>(gridDim.x) * blockDim.x;
+  if (((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst) | n) & 15ull) == 0) {
+    const uint4* s4 = reinterpret_cast<const uint4*>(src);
+    uint4* d4 = reinterpret_cast<uint4*>(dst);
+    for (unsigned long long i = tid; i < (n >> 4); i += stride) d4[i] = s4[i];
+  } else {
+    for (unsigned long long i = tid; i < n; i += stride) dst[i] = src[i];
+  }
+  __threadfence_system();
+}
+
+struct NlCopyArgs { const unsigned char* src; unsigned char* dst; unsigned long long n; };
+
+static bool nl_device_view(const void* p, const void** out) {
+  cudaPointerAttributes at{};
+  if (cudaPointerGetAttributes(&at, p) != cudaSuccess) { cudaGetLastError(); return false; }
+  if (at.type == cudaMemoryTypeDevice || at.type == cudaMemoryTypeManaged) { *out = p; return true; }
+  if (at.type == cudaMemoryTypeHost) {
+    if (at.devicePointer == nullptr) return false;
+    *out = at.devicePointer; return true;
+  }
+  int pageable = 0; int dev = 0; cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev);
+  if (!pageable) return false;
+  *out = p; return true;
+}
+
+// Returns the number of memcpy nodes still present (0 when every one was lowered).
+static int nl_lower_memcpy_nodes(cudaGraph_t g, int depth) {
+  if (depth > 8) return 1;
+  size_t n = 0;
+  if (cudaGraphGetNodes(g, nullptr, &n) != cudaSuccess) { cudaGetLastError(); return 1; }
+  std::vector<cudaGraphNode_t> nodes(n);
+  if (n && cudaGraphGetNodes(g, nodes.data(), &n) != cudaSuccess) { cudaGetLastError(); return 1; }
+  int left = 0;
+  for (cudaGraphNode_t nd : nodes) {
+    cudaGraphNodeType t;
+    if (cudaGraphNodeGetType(nd, &t) != cudaSuccess) { cudaGetLastError(); return 1; }
+    if (t == cudaGraphNodeTypeGraph) {
+      cudaGraph_t cg = nullptr;
+      if (cudaGraphChildGraphNodeGetGraph(nd, &cg) != cudaSuccess) { cudaGetLastError(); return 1; }
+      left += nl_lower_memcpy_nodes(cg, depth + 1);
+      continue;
+    }
+    if (t != cudaGraphNodeTypeMemcpy) continue;
+    cudaMemcpy3DParms mp{};
+    if (cudaGraphMemcpyNodeGetParams(nd, &mp) != cudaSuccess) { cudaGetLastError(); ++left; continue; }
+    if (mp.srcArray || mp.dstArray || mp.extent.height > 1 || mp.extent.depth > 1 ||
+        mp.srcPos.y || mp.srcPos.z || mp.dstPos.y || mp.dstPos.z || mp.srcPtr.ptr == nullptr ||
+        mp.dstPtr.ptr == nullptr) { ++left; continue; }
+    const void* src_dev = nullptr; const void* dst_dev = nullptr;
+    const unsigned char* src_raw = static_cast<const unsigned char*>(mp.srcPtr.ptr) + mp.srcPos.x;
+    unsigned char* dst_raw = static_cast<unsigned char*>(mp.dstPtr.ptr) + mp.dstPos.x;
+    if (!nl_device_view(src_raw, &src_dev) || !nl_device_view(dst_raw, &dst_dev)) { ++left; continue; }
+    size_t nd_in = 0, nd_out = 0;
+    if (cudaGraphNodeGetDependencies(nd, nullptr, nullptr, &nd_in) != cudaSuccess ||
+        cudaGraphNodeGetDependentNodes(nd, nullptr, nullptr, &nd_out) != cudaSuccess) { cudaGetLastError(); ++left; continue; }
+    std::vector<cudaGraphNode_t> ins(nd_in), outs(nd_out);
+    if ((nd_in && cudaGraphNodeGetDependencies(nd, ins.data(), nullptr, &nd_in) != cudaSuccess) ||
+        (nd_out && cudaGraphNodeGetDependentNodes(nd, outs.data(), nullptr, &nd_out) != cudaSuccess)) { cudaGetLastError(); ++left; continue; }
+    NlCopyArgs ca{static_cast<const unsigned char*>(src_dev), static_cast<unsigned char*>(const_cast<void*>(dst_dev)),
+                  static_cast<unsigned long long>(mp.extent.width)};
+    cudaKernelNodeParams kp{};
+    kp.func = reinterpret_cast<void*>(native_leaf_copy_bytes_kernel);
+    const unsigned long long blocks = (ca.n + 4095ull) / 4096ull;
+    kp.gridDim = dim3(static_cast<unsigned>(blocks < 1 ? 1 : (blocks > 64 ? 64 : blocks)), 1, 1);
+    kp.blockDim = dim3(256, 1, 1);
+    kp.sharedMemBytes = 0;
+    void* kargs[3] = {&ca.src, &ca.dst, &ca.n};
+    kp.kernelParams = kargs;
+    cudaGraphNode_t kn = nullptr;
+    if (cudaGraphAddKernelNode(&kn, g, ins.empty() ? nullptr : ins.data(), ins.size(), &kp) != cudaSuccess) { cudaGetLastError(); ++left; continue; }
+    bool ok = true;
+    for (cudaGraphNode_t o : outs) {
+      if (cudaGraphAddDependencies(g, &kn, &o, nullptr, 1) != cudaSuccess) { ok = false; break; }
+    }
+    if (!ok) { cudaGetLastError(); cudaGraphDestroyNode(kn); ++left; continue; }
+    if (cudaGraphDestroyNode(nd) != cudaSuccess) { cudaGetLastError(); ++left; continue; }
+  }
+  return left;
+}
+
+static bool nl_lower_cond_bodies(std::initializer_list<cudaGraph_t> bodies, const char* tag) {
+  static const bool enabled = []() -> bool {
+    const char* s = std::getenv("MUSE_COND_MEMCPY_LOWER");
+    return !(s && *s && std::atoi(s) == 0);
+  }();
+  if (!enabled) return true;
+  int left = 0;
+  for (cudaGraph_t b : bodies) left += nl_lower_memcpy_nodes(b, 0);
+  if (left) fprintf(stderr, "native_leaf: %s graph keeps %d memcpy node(s) in a conditional body\n", tag, left);
+  return left == 0;
+}
 int64_t native_leaf_build_adaptive_verify_graph(
     std::vector<int64_t> m16_graphs,
     std::vector<int64_t> m32_graphs,
@@ -5148,6 +5252,10 @@ int64_t native_leaf_build_adaptive_verify_graph(
     TORCH_CHECK(false, "cudaGraphAddNode(cond32) failed");
   }
 
+  if (!nl_lower_cond_bodies({cp16.conditional.phGraph_out[0], cp32.conditional.phGraph_out[0]}, "adaptive")) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "adaptive verify graph: memcpy node left in a conditional body");
+  }
   cudaGraphExec_t outer_exec = nullptr;
   err = cudaGraphInstantiate(&outer_exec, outer_graph, 0);
   if (err != cudaSuccess) {
@@ -5373,6 +5481,10 @@ int64_t native_leaf_build_compound_step_graph(
   }
 
   cudaGraphExec_t outer_exec = nullptr;
+  if (!nl_lower_cond_bodies({cp16.conditional.phGraph_out[0], cp32.conditional.phGraph_out[0]}, "compound")) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "compound step graph: memcpy node left in a conditional body");
+  }
   err = cudaGraphInstantiate(&outer_exec, outer_graph, 0);
   if (err != cudaSuccess) {
     cudaGraphDestroy(outer_graph);
