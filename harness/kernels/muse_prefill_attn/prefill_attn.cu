@@ -788,7 +788,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   uint32_t (*o_tiles)[16][64] = reinterpret_cast<uint32_t (*)[16][64]>(kv_smem);
   #pragma unroll
   for (int dt = 0; dt < 16; ++dt) {
-    const int c32 = (dt << 2) + tid_in_grp;
+    const int c32 = ((dt ^ group_id) << 2) + tid_in_grp;
     const __nv_bfloat162 ob0 = __floats2bfloat162_rn(mul_ftz_f32(o_frag[dt][0], inv0), mul_ftz_f32(o_frag[dt][1], inv0));
     const __nv_bfloat162 ob1 = __floats2bfloat162_rn(mul_ftz_f32(o_frag[dt][2], inv1), mul_ftz_f32(o_frag[dt][3], inv1));
     o_tiles[warp_id][group_id][c32]     = *reinterpret_cast<const uint32_t*>(&ob0);
@@ -803,7 +803,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     #pragma unroll
     for (int u = 0; u < 8; ++u) {
       const int idx = (u << 5) + lane;
-      dst[idx] = o_v4[idx];
+      dst[idx] = o_v4[idx ^ ((idx >> 4) & 7)];
     }
   } else if constexpr (Mode == 1) {
     const uint4* g_v4 = reinterpret_cast<const uint4*>(gate_ptr + tok_head_base);
@@ -811,7 +811,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     #pragma unroll
     for (int u = 0; u < 8; ++u) {
       const int idx = (u << 5) + lane;
-      const uint4 ov = o_v4[idx];
+      const uint4 ov = o_v4[idx ^ ((idx >> 4) & 7)];
       const uint4 gv = g_v4[idx];
       const uint32_t ow[4] = {ov.x, ov.y, ov.z, ov.w};
       const uint32_t gw[4] = {gv.x, gv.y, gv.z, gv.w};
@@ -837,7 +837,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     #pragma unroll
     for (int u = 0; u < 8; ++u) {
       const int idx = (u << 5) + lane;
-      const uint4 ov = o_v4[idx];
+      const uint4 ov = o_v4[idx ^ ((idx >> 4) & 7)];
       const uint4 gv = g_v4[idx];
       const uint32_t ow[4] = {ov.x, ov.y, ov.z, ov.w};
       const uint32_t gw[4] = {gv.x, gv.y, gv.z, gv.w};
