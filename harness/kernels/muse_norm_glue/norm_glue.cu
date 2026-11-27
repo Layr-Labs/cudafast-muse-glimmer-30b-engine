@@ -264,17 +264,16 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
     const float* __restrict__ scale, float* __restrict__ sumsq_out,
     __nv_bfloat16* __restrict__ out_bf16_all, uint8_t* __restrict__ out_fp8_all) {
   __shared__ float red[2][8];
-  __shared__ uint2 sh_res[kPdl ? (kHidden / 4) : 1];
   const size_t row = blockIdx.x;
   const __nv_bfloat16* x = x_all + row * kHidden;
   const __nv_bfloat16* res = res_all + row * kHidden;
   uint2 ux[kChunks];
+  uint2 ur[kPdl ? kChunks : 1];
   float inv_scale = 0.f;
   if constexpr (kPdl) {
-    // Preload predecessor-independent residual (6.8 MB across 512 rows) into SMEM and scale before waiting for o_proj.
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) sh_res[c * 256 + threadIdx.x] = ld8_cs_v4(res, c);
+      if (chunk_valid(c)) ur[c] = ld8_cs_v4(res, c);
     }
     if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
     pdl_wait();
@@ -299,7 +298,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
       Row4 xv = unpack(ux[c]);
-      Row4 rv = unpack(kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_cs_v4(res, c));
+      Row4 rv = unpack(kPdl ? ur[c] : ld8_cs_v4(res, c));
       Row4 wv = unpack(ldg8_v4(w_post, c));
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
@@ -479,20 +478,17 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
     const __nv_bfloat16* __restrict__ w_in, const float* __restrict__ scale,
     __nv_bfloat16* __restrict__ out_bf16_all, uint8_t* __restrict__ out_fp8_all) {
   __shared__ float red[2][8];
-  __shared__ uint2 sh_res[kPdl ? (kHidden / 4) : 1];
   const size_t row = blockIdx.x;
   __nv_bfloat16* x = x_all + row * kHidden;
   const __nv_bfloat16* d = d_all + row * kHidden;
   const __nv_bfloat16* res = res_all + row * kHidden;
   uint2 ud[kChunks];
+  uint2 res0;
   float a = 0.f;
   float inv_scale = 0.f;
   if constexpr (kPdl) {
     const float s_x = __ldg(sumsq_x + row);
-#pragma unroll
-    for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) sh_res[c * 256 + threadIdx.x] = ld8_cs_v4(res, c);
-    }
+    res0 = ld8_cs_v4(res, 0);
     a = inv_rms(s_x, 1e-08f);
     if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
     pdl_wait();
@@ -520,7 +516,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
       Row4 xv = unpack(ld8_cs_v4(x, c)), dv = unpack(ud[c]),
-           rv = unpack(kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_cs_v4(res, c));
+           rv = unpack((kPdl && c == 0) ? res0 : ld8_cs_v4(res, c));
       Row4 wv = unpack(ldg8_v4(w_post, c)), fv = unpack(ldg8_v4(w_ff, c));
       float h2[4];
 #pragma unroll
