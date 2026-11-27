@@ -277,6 +277,87 @@ class DecodePlacementLogicTest(unittest.TestCase):
         self.assertEqual(mod.take_buddyinfo_sponge(), 0)
         mod.release_buddyinfo_sponge()
 
+    def test_drop_model_page_cache_runs_before_buddyinfo_sponge(self):
+        mod = _load_dp_module({"MUSE_PLACE_M32": "1", "MUSE_BUDDY_SPONGE": "1"})
+        call_order = []
+
+        def fake_drop():
+            call_order.append("drop")
+
+        def fake_usable(_min_chunk=2 << 20):
+            call_order.append("usable")
+            return 10 << 30  # below reserve -> exits cleanly without libcuda
+
+        with mock.patch.object(mod, "_drop_model_page_cache", side_effect=fake_drop), \
+             mock.patch.object(mod, "_usable_buddyinfo_bytes", side_effect=fake_usable):
+            self.assertEqual(mod.take_buddyinfo_sponge(), 0)
+        self.assertEqual(call_order, ["drop", "usable"])
+
+    def test_partition_fast_pool_bandwidth_gates_slow_slabs(self):
+        mod = _load_dp_module({"MUSE_PLACE_M32": "1"})
+        # Clean boot: 200 unused slabs all within 1.08x of best (0.530 ms -> cut 0.5724 ms)
+        clean_unused = [(0.535 + 0.0001 * i, f"b{i}") for i in range(200)]
+        fast_c, rest_c = mod._partition_fast_pool(clean_unused, best_time=0.530, max_fast_keep=180, ratio=1.08)
+        self.assertEqual(len(fast_c), 180)
+        self.assertEqual(len(rest_c), 20)
+
+        # Fragmented boot (like w68b_full_37): best=0.555 ms (cut=0.5994 ms), only 12 unused slabs <= 0.5994,
+        # remaining 188 are slow 0.66-0.79 ms -> MUST NOT poison fast_pool with slow slabs!
+        frag_unused = [(0.560 + 0.003 * i, f"f{i}") for i in range(12)] + [
+            (0.660 + 0.001 * i, f"s{i}") for i in range(188)
+        ]
+        fast_f, rest_f = mod._partition_fast_pool(frag_unused, best_time=0.555, max_fast_keep=180, ratio=1.08)
+        self.assertEqual(len(fast_f), 12)
+        self.assertEqual(len(rest_f), 188)
+
+    def test_adaptive_retry_trigger_clean_vs_fragmented_boot(self):
+        mod = _load_dp_module({"MUSE_PLACE_M32": "1"})
+        # Clean boot (w68b_det12x2: 6656x19968 min=0.287, med=0.289, max=0.290) -> NO retry!
+        clean_times = [0.287 + 0.0001 * i for i in range(40)]
+        self.assertEqual(mod._select_retry_indices(clean_times, 1.08), [])
+
+        # Fragmented boot (w68b_full_37: 6656x19968 min=0.299, 10 fast + 30 slow @ 0.362-0.383) -> retries ONLY the 30 slow!
+        frag_times = [0.299 + 0.001 * i for i in range(10)] + [0.350 + 0.001 * i for i in range(30)]
+        slow_ids = mod._select_retry_indices(frag_times, 1.08)
+        self.assertEqual(slow_ids, list(range(10, 40)))
+
+        # Legacy disabled (ratio=0.0) -> NO retry
+        self.assertEqual(mod._select_retry_indices(frag_times, 0.0), [])
+
+    def test_wave83_fast_pool_tight_ratio_with_fallback_and_cross_group_floor(self):
+        mod = _load_dp_module({"MUSE_PLACE_M32": "1"})
+        self.assertAlmostEqual(mod.FAST_POOL_RATIO, 1.035)
+        self.assertAlmostEqual(mod.ADAPTIVE_RETRY_RATIO, 1.04)
+        self.assertAlmostEqual(mod.DOWN_GU_GBPS_RATIO, 0.922)
+
+        # Clean boot with 140 slabs <= 1.035x and 60 slabs at 1.05..1.07x -> keeps ONLY the 140 tight slabs!
+        mixed = [(0.530 + 0.0001 * i, f"t{i}") for i in range(140)] + [
+            (0.558 + 0.0002 * i, f"m{i}") for i in range(60)
+        ]
+        fast_t, rest_t = mod._partition_fast_pool(
+            mixed, best_time=0.530, max_fast_keep=180, ratio=1.035, fallback_ratio=1.08, min_slabs=110
+        )
+        self.assertEqual(len(fast_t), 140)
+        self.assertEqual(len(rest_t), 60)
+
+        # Mildly fragmented boot: only 50 slabs <= 1.035x (<110) -> auto-relaxes to 1.08x (110 more slabs <= 0.5724)
+        sparse = [(0.530 + 0.0002 * i, f"t{i}") for i in range(50)] + [
+            (0.555 + 0.0001 * i, f"m{i}") for i in range(100)
+        ] + [(0.650 + 0.001 * i, f"s{i}") for i in range(50)]
+        fast_s, rest_s = mod._partition_fast_pool(
+            sparse, best_time=0.530, max_fast_keep=180, ratio=1.035, fallback_ratio=1.08, min_slabs=110
+        )
+        self.assertEqual(len(fast_s), 150)
+        self.assertEqual(len(rest_s), 50)
+
+        # Cross-group floor check for 6656x19968 (w82c_clean_det12x2: min=0.2929, med=0.2977 vs floor 0.2935)
+        down_degraded = [0.2929] * 5 + [0.2977] * 35
+        self.assertEqual(mod._select_retry_indices(down_degraded, 1.04), [])
+        self.assertEqual(mod._select_retry_indices(down_degraded, 1.04, floor_max_ms=0.2935), list(range(5, 40)))
+        # Clean 6656x19968 (med=0.2898 <= 0.2935) -> NO retry!
+        down_clean = [0.2867 + 0.00015 * i for i in range(40)]
+        self.assertEqual(mod._select_retry_indices(down_clean, 1.04, floor_max_ms=0.2935), [])
+
 
 if __name__ == "__main__":
     unittest.main()

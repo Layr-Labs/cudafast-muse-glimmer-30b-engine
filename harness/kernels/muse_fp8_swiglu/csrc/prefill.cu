@@ -533,10 +533,20 @@ extern "C" int swiglu_ws_init(cudaStream_t stream) {
   if (e == cudaSuccess) e = set_smem(swiglu_ws9_st3_lut_kernel<true, true, true>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(fp8_6656_ws8_256_st2_st4_kernel<19968, false>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(fp8_6656_ws8_256_st2_st4_kernel<19968, true>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_ws9_256_st2_st4_kernel<19968, false>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_ws9_256_st2_st4_kernel<19968, true>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_ws8_256_st2_st4_kernel<4096, false>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_ws8_256_st2_st4_kernel<4096, true>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_ws9_256_st2_st4_kernel<4096, false>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_ws9_256_st2_st4_kernel<4096, true>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(fp8_dual_a_ws8_256_kernel<false>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(fp8_dual_a_ws8_256_kernel<true>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_dual_a_ws9_256_kernel<false>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_dual_a_ws9_256_kernel<true>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(bf16_dual_ws8_256_kernel<false>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(bf16_dual_ws8_256_kernel<true>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(bf16_dual_ws9_256_kernel<false>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(bf16_dual_ws9_256_kernel<true>, SMEM_MAX);
   if (e != cudaSuccess) return int(e);
   int diffs = 0;
   e = cudaMemcpyToSymbolAsync(ws_silu_diffs, &diffs, sizeof(int), 0, cudaMemcpyHostToDevice, stream);
@@ -593,16 +603,63 @@ extern "C" int muse_fp8_set_gemm_pdl(int on) {
   return old;
 }
 
+static bool fp8_6656_ws9_enabled() {
+  static const bool on = []() {
+    const char* env = std::getenv("MUSE_FP8_6656_WS9");
+    return env && *env && std::strtol(env, nullptr, 10) != 0;
+  }();
+  return on;
+}
+
+static bool fp8_oproj_ws9_enabled() {
+  static const bool on = []() {
+    const char* env = std::getenv("MUSE_FP8_OPROJ_WS9");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  return on;
+}
+
+static bool fp8_dual_a_ws9_enabled() {
+  static const bool on = []() {
+    const char* env = std::getenv("MUSE_FP8_DUAL_A_WS9");
+    return env && *env && std::strtol(env, nullptr, 10) != 0;
+  }();
+  return on;
+}
+
+static bool bf16_dual_ws9_enabled() {
+  static const bool on = []() {
+    const char* env = std::getenv("MUSE_BF16_DUAL_WS9");
+    return env && *env && std::strtol(env, nullptr, 10) != 0;
+  }();
+  return on;
+}
+
 extern "C" int muse_fp8_gemm_6656(int mode, int pdl, const void* a, const void* b, const float* sa, const float* sb,
                                   void* c, int k, cudaStream_t stream) {
   using namespace swiglu_ws;
-  if (!encode || k != 19968 || (((uintptr_t)a | (uintptr_t)b | (uintptr_t)c) & 15)) return -1;
+  if (!encode || (k != 19968 && k != 4096) || (((uintptr_t)a | (uintptr_t)b | (uintptr_t)c) & 15)) return -1;
   __nv_bfloat16* out = static_cast<__nv_bfloat16*>(c);
   CUtensorMap tmA256, tmA128, tmB128, tmB48, tmB32;
   if (!encode_tma2d(&tmA256, a, k, M_DIM, 256) || !encode_tma2d(&tmA128, a, k, M_DIM, 128)) return -3;
   if (!encode_tma2d(&tmB128, b, k, 6656, 128) || !encode_tma2d(&tmB48, b, k, 6656, 48) ||
       !encode_tma2d(&tmB32, b, k, 6656, 32)) return -4;
   const int use_pdl = (pdl < 0) ? gemm_pdl_enabled() : pdl;
+  if (k == 4096) {
+    if (fp8_oproj_ws9_enabled()) {
+      if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws9_256_st2_st4_kernel<4096, true>, 48, NT_WS9, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out));
+      fp8_6656_ws9_256_st2_st4_kernel<4096, false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out);
+      return int(cudaGetLastError());
+    }
+    if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws8_256_st2_st4_kernel<4096, true>, 48, NT, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out));
+    fp8_6656_ws8_256_st2_st4_kernel<4096, false><<<48, NT, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out);
+    return int(cudaGetLastError());
+  }
+  if (fp8_6656_ws9_enabled()) {
+    if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws9_256_st2_st4_kernel<19968, true>, 48, NT_WS9, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out));
+    fp8_6656_ws9_256_st2_st4_kernel<19968, false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out);
+    return int(cudaGetLastError());
+  }
   if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws8_256_st2_st4_kernel<19968, true>, 48, NT, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out));
   fp8_6656_ws8_256_st2_st4_kernel<19968, false><<<48, NT, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out);
   return int(cudaGetLastError());
@@ -621,6 +678,11 @@ extern "C" int muse_fp8_dual_a(int mode, int pdl, const void* a0, const void* a1
   if (!encode_tma2d(&tmB1_128, b1, 6656, 4096, 128) || !encode_tma2d(&tmB1_112, b1, 6656, 4096, 112) ||
       !encode_tma2d(&tmB1_96, b1, 6656, 4096, 96)) return -5;
   const int use_pdl = (pdl < 0) ? gemm_pdl_enabled() : pdl;
+  if (fp8_dual_a_ws9_enabled()) {
+    if (use_pdl) return int(launch_pdl_ex(fp8_dual_a_ws9_256_kernel<true>, 48, NT_WS9, SMEM_MAX, stream, tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1));
+    fp8_dual_a_ws9_256_kernel<false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1);
+    return int(cudaGetLastError());
+  }
   if (use_pdl) return int(launch_pdl_ex(fp8_dual_a_ws8_256_kernel<true>, 48, NT, SMEM_MAX, stream, tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1));
   fp8_dual_a_ws8_256_kernel<false><<<48, NT, SMEM_MAX, stream>>>(tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1);
   return int(cudaGetLastError());
@@ -636,6 +698,11 @@ extern "C" int muse_bf16_dual_stacked(int mode, int pdl, const void* a, const vo
   __nv_bfloat16* o0 = static_cast<__nv_bfloat16*>(c0);
   __nv_bfloat16* o1 = static_cast<__nv_bfloat16*>(c1);
   const int use_pdl = (pdl < 0) ? gemm_pdl_enabled() : pdl;
+  if (bf16_dual_ws9_enabled()) {
+    if (use_pdl) return int(launch_pdl_ex(bf16_dual_ws9_256_kernel<true>, 48, NT_WS9, SMEM_MAX, stream, tmA256, tmB_128, tmB_112, tmB_96, o0, o1));
+    bf16_dual_ws9_256_kernel<false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA256, tmB_128, tmB_112, tmB_96, o0, o1);
+    return int(cudaGetLastError());
+  }
   if (use_pdl) return int(launch_pdl_ex(bf16_dual_ws8_256_kernel<true>, 48, NT, SMEM_MAX, stream, tmA256, tmB_128, tmB_112, tmB_96, o0, o1));
   bf16_dual_ws8_256_kernel<false><<<48, NT, SMEM_MAX, stream>>>(tmA256, tmB_128, tmB_112, tmB_96, o0, o1);
   return int(cudaGetLastError());

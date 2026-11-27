@@ -58,6 +58,8 @@ _OPROJ_SIGMOID_FUSE_M = os.environ.get("MUSE_OPROJ_SIGMOID_FUSE_M", "1") != "0"
 # loses -49..-115 us/cyc vs standalone mul_sigmoid_bf16 + .cg o_proj (while M<=16 wins -89 us/cyc).
 _OPROJ_SIGMOID_FUSE_M_MAX = int(os.environ.get("MUSE_OPROJ_SIGMOID_FUSE_M_MAX", "16"))
 _MUL_SILU_SLICE_GLUE = os.environ.get("MUSE_MUL_SILU_SLICE_GLUE", "1") != "0"
+_NORM_GLUE_XMMA = os.environ.get("MUSE_NORM_GLUE_XMMA", "1").strip() not in ("0", "", "false", "no")
+_NORM_GLUE_XMMA_MASK = int(os.environ.get("MUSE_NORM_GLUE_XMMA_MASK", "15"))
 _REQUANT = "triton_poi_fused__to_copy_clamp_mul_reciprocal_0"
 _REQUANT_BODY = "f7a07e4acde4818e0fe4bcb2f62a211fa163724414f5efcce3d93ee433b8300f"
 _SIGMOID_FP8_HASH = "68ddaaf112b7f2fbd8d452b5eb8b93c39567cfe29e167a625d3194458669ad01"
@@ -94,6 +96,46 @@ _pending_oproj_sigmoid = None   # (out_ptr, gate, attn, skipped)
 _oproj_fuse_state = "unchecked"    # M=1: "unchecked" -> "admitted" | "rejected"
 _oproj_fuse_m_state = "unchecked"  # M=2..8: "unchecked" -> "admitted" | "rejected"
 _oproj_sig_counts = Counter()
+_xmma_admitted_scales: dict[int, int] = {}  # scale_ptr -> K for admitted muserans layers
+_xmma_ready: dict[tuple[int, int], tuple[int, int]] = {}  # (buf_ptr, scale_ptr) -> (rows, K)
+_xmma_counts = Counter()
+_xmma_native_ready = False
+
+
+def _xmma_native_ok() -> bool:
+    global _xmma_native_ready
+    if _xmma_native_ready:
+        return True
+    try:
+        import muse_norm_glue as G
+        import muse_rans_ext as _rans
+
+        lib = G.lib()
+        ok = (
+            lib is not None
+            and hasattr(lib, "muse_norm_glue_mul_sigmoid_fp8_xmma")
+            and hasattr(lib, "muse_norm_glue_mul_silu_slice_fp8_xmma")
+            and hasattr(lib, "muse_norm_glue_post_attn_xmma")
+            and hasattr(lib, "muse_norm_glue_post_ff_gate_xmma")
+            and hasattr(lib, "muse_norm_glue_input_fp8_gate_xmma")
+            and hasattr(_rans, "rans_gemm_m_xmma_auto")
+        )
+        if ok:
+            _xmma_native_ready = True
+        return ok
+    except Exception:
+        return False
+
+
+def _can_emit_xmma(bit: int, rows: int, scale_ptr: int, k: int, out_ptr: int) -> bool:
+    return (
+        _NORM_GLUE_XMMA
+        and (_NORM_GLUE_XMMA_MASK & bit) != 0
+        and rows in (16, 32)
+        and (out_ptr & 15) == 0
+        and _xmma_admitted_scales.get(scale_ptr) == k
+        and _xmma_native_ok()
+    )
 
 
 def consume_oproj_sigmoid(
@@ -213,8 +255,28 @@ def consume_down_swiglu(x: torch.Tensor, down_gs_ptr: int) -> torch.Tensor | Non
 def consume_rans_prologue(
     A: torch.Tensor, As: torch.Tensor, packed: torch.Tensor, n: int, k: int, Bs: torch.Tensor
 ) -> torch.Tensor | None:
-    """Consume a pending M=1..16 fused activation+FP8 prologue inside muse_fp8_scaled_mm."""
+    """Consume a pending M=1..16 fused activation+FP8 prologue or M=16/32 direct x_mma operand."""
     global _pending_rans_prologue
+    m_cur = int(A.shape[0]) if A.ndim == 2 else 1
+    if _NORM_GLUE_XMMA and k in (4096, 6656, 19968):
+        s_cur = As.data_ptr()
+        if s_cur not in _xmma_admitted_scales:
+            _xmma_admitted_scales[s_cur] = k
+        ready = _xmma_ready.pop((A.data_ptr(), s_cur), None)
+        if ready is not None:
+            if ready != (m_cur, k):
+                raise RuntimeError(f"muse_glimmer_norm_glue: x_mma shape mismatch {ready} vs {(m_cur, k)}")
+            import muse_rans_ext as _rans
+
+            out = torch.empty((m_cur, n), dtype=torch.bfloat16, device=A.device)
+            _rans.rans_gemm_m_xmma_auto(packed, A, Bs.reshape(-1), As.reshape(-1), out, n, k)
+            _xmma_counts["xmma_launches"] += 1
+            if _xmma_counts["xmma_launches"] in (1, 112):
+                logger.info(
+                    "Decode fused norm_glue->x_mma rANS: %d fused launches (%d scales registered)",
+                    _xmma_counts["xmma_launches"], len(_xmma_admitted_scales),
+                )
+            return out
     if _pending_rans_prologue is None:
         return None
     ptr, act_mode, x0, x1, scale_ptr, skipped = _pending_rans_prologue
@@ -637,7 +699,13 @@ class _RansPrologueHook:
             self.silu_fp8_glue_state = "admitted" if ok else "rejected"
             logger.info("Decode M>1 mul_silu_slice_fp8 glue: %s", self.silu_fp8_glue_state)
             return True
-        G.mul_silu_slice_fp8(gu, scale, out, rows, stream)
+        if _can_emit_xmma(4, rows, scale.data_ptr(), 19968, out.data_ptr()):
+            G.mul_silu_slice_fp8_xmma(gu, scale, out, rows, stream)
+            _xmma_ready[(out.data_ptr(), scale.data_ptr())] = (rows, 19968)
+            _xmma_counts["silu_fp8"] += 1
+        else:
+            _xmma_ready.pop((out.data_ptr(), scale.data_ptr()), None)
+            G.mul_silu_slice_fp8(gu, scale, out, rows, stream)
         return True
 
     def _try_prefill_sigmoid_fp8(self, kernel, orig_run, args, kwargs) -> bool:
@@ -697,7 +765,14 @@ class _RansPrologueHook:
             return True
         if _consume_gqa16_prefill(attn, gate, out, scale, stream):
             return True
-        G.mul_sigmoid_fp8(gate, attn, scale, out, n_el, stream)
+        m_rows = n_el >> 12
+        if _can_emit_xmma(1, m_rows, scale.data_ptr(), 4096, out.data_ptr()):
+            G.mul_sigmoid_fp8_xmma(gate, attn, scale, out, m_rows, stream)
+            _xmma_ready[(out.data_ptr(), scale.data_ptr())] = (m_rows, 4096)
+            _xmma_counts["sigmoid_fp8"] += 1
+        else:
+            _xmma_ready.pop((out.data_ptr(), scale.data_ptr()), None)
+            G.mul_sigmoid_fp8(gate, attn, scale, out, n_el, stream)
         return True
 
     def run(self, kernel, orig_run, args, kwargs):
@@ -1046,7 +1121,13 @@ class _NormSwap:
                 G.post_attn(0, rows, x, res, wp, wq, None, s, o, None, stream)
             else:
                 sc, s, q = tensors[4:7]
-                G.post_attn(1, rows, x, res, wp, wq, sc, s, None, q, stream)
+                if not for_check and _can_emit_xmma(8, rows, sc.data_ptr(), _H, q.data_ptr()):
+                    G.post_attn_xmma(rows, x, res, wp, wq, sc, s, q, stream)
+                    _xmma_ready[(q.data_ptr(), sc.data_ptr())] = (rows, _H)
+                    _xmma_counts["post_attn"] += 1
+                else:
+                    _xmma_ready.pop((q.data_ptr(), sc.data_ptr()), None)
+                    G.post_attn(1, rows, x, res, wp, wq, sc, s, None, q, stream)
         elif self.kind == 2:
             d, res, x, sx, wp, wf, wi, h2, o = tensors
             G.post_ff_final(rows, d, res, x, sx, wp, wf, wi, h2, o, 1 if for_check else int(not _DROP_BF16), stream)
@@ -1265,10 +1346,34 @@ class _NormSwap:
 
             if self.op == "input_norm":
                 x, wi, sc, o, q = tensors
-                G.input_fp8_gate(self.input_warps, rows, x, wi, sc, o, q, glayer.gate_scale, glayer.buffer, int(not _DROP_BF16), stream)
+                use_xmma = (
+                    _can_emit_xmma(2, rows, sc.data_ptr(), _H, q.data_ptr())
+                    and _can_emit_xmma(2, rows, glayer.gate_scale.data_ptr(), _H, glayer.buffer.data_ptr())
+                )
+                if use_xmma:
+                    G.input_fp8_gate_xmma(self.input_warps, rows, x, wi, sc, o, q, glayer.gate_scale, glayer.buffer, int(not _DROP_BF16), stream)
+                    _xmma_ready[(q.data_ptr(), sc.data_ptr())] = (rows, _H)
+                    _xmma_ready[(glayer.buffer.data_ptr(), glayer.gate_scale.data_ptr())] = (rows, _H)
+                    _xmma_counts["input_fp8_gate"] += 1
+                else:
+                    _xmma_ready.pop((q.data_ptr(), sc.data_ptr()), None)
+                    _xmma_ready.pop((glayer.buffer.data_ptr(), glayer.gate_scale.data_ptr()), None)
+                    G.input_fp8_gate(self.input_warps, rows, x, wi, sc, o, q, glayer.gate_scale, glayer.buffer, int(not _DROP_BF16), stream)
             else:
                 x, d, res, sx, wp, wf, wi, sc, o, q = tensors
-                G.post_ff_gate(rows, x, d, res, sx, wp, wf, wi, sc, o, q, glayer.gate_scale, glayer.buffer, int(not _DROP_BF16), stream)
+                use_xmma = (
+                    _can_emit_xmma(2, rows, sc.data_ptr(), _H, q.data_ptr())
+                    and _can_emit_xmma(2, rows, glayer.gate_scale.data_ptr(), _H, glayer.buffer.data_ptr())
+                )
+                if use_xmma:
+                    G.post_ff_gate_xmma(rows, x, d, res, sx, wp, wf, wi, sc, o, q, glayer.gate_scale, glayer.buffer, int(not _DROP_BF16), stream)
+                    _xmma_ready[(q.data_ptr(), sc.data_ptr())] = (rows, _H)
+                    _xmma_ready[(glayer.buffer.data_ptr(), glayer.gate_scale.data_ptr())] = (rows, _H)
+                    _xmma_counts["post_ff_gate"] += 1
+                else:
+                    _xmma_ready.pop((q.data_ptr(), sc.data_ptr()), None)
+                    _xmma_ready.pop((glayer.buffer.data_ptr(), glayer.gate_scale.data_ptr()), None)
+                    G.post_ff_gate(rows, x, d, res, sx, wp, wf, wi, sc, o, q, glayer.gate_scale, glayer.buffer, int(not _DROP_BF16), stream)
             _pending_decode = (o.data_ptr(), glayer, rows, True)
             _gate_counts["folded_launches"] += 1
         elif glayer is not None and glayer.state == "unchecked" and not capturing:

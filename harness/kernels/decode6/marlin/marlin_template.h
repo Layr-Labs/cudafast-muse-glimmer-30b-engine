@@ -1119,11 +1119,19 @@ __global__ void Marlin(
                 "TMA4 rANS scales require M = 1 decode config (128 or 256 threads)");
   constexpr int kTmaWarps = threads / 32;
   constexpr int RANS_CAP = (fixed_shape == 3) ? 4096 : ((threads == 256) ? 3200 : 2048);
+  // 1D hardware TMA (cp.async.bulk + L2::evict_first) for lm_head multi-M B weights (641 MiB):
+  // restores L2::evict_first where cp.async.cg.L2::cache_hint hit SM121 odd-UR, keeping A (426 KiB)
+  // and lmpost_lut (128 KiB) L2-hot across all 33 tiles/CTA with 0 odd-UR and 1 TMA issue/stage.
+  constexpr bool tma_b = fuse_lmpost && down_ilv && fixed_shape == 3 && multi_m && tma_ovlp;
+  static_assert(!tma_b || (!fuse_mul_sigmoid && b_gl_stride == b_sh_stride && b_sh_wr_iters == 2 &&
+                           b_thread_vecs == 1 && stages <= 4),
+                "tma_b requires contiguous 8 KiB down_ilv B stages");
   uint32_t* sh_states = reinterpret_cast<uint32_t*>(sh_pal + (fast_pal16 ? 128 : 64));
   unsigned char* sh_rslot = reinterpret_cast<unsigned char*>(sh_states + threads);
   uint32_t* sh_rlut = reinterpret_cast<uint32_t*>(sh_rslot + 2 * RANS_CAP);
   uint64_t* sh_rbar = reinterpret_cast<uint64_t*>(sh_rlut + 1024);
-  sh_red = reinterpret_cast<int4*>(sh_rbar + 4);
+  sh_red = reinterpret_cast<int4*>(sh_rbar + (tma_b ? 8 : 4));
+  [[maybe_unused]] uint32_t tma_b_par = 0u;
   const uint32_t* tma_u32 = reinterpret_cast<const uint32_t*>(g_idx);
   const uint32_t tma_tot_sbs = tma_u32[1024];
   const uint32_t tma_max_sbs = tma_u32[1026];
@@ -1141,10 +1149,20 @@ __global__ void Marlin(
   auto tma_bar = [&](int i) { return static_cast<uint32_t>(__cvta_generic_to_shared(sh_rbar + i)); };
   auto tma_bulk = [&](void* dst, const void* src, int bytes, int bar) {
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(tma_bar(bar)), "r"(bytes) : "memory");
+#ifdef MUSE_B_EVICT_FIRST
+    uint64_t tma_pol;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(tma_pol));
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint "
+        "[%0], [%1], %2, [%3], %4;" ::"r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst))),
+        "l"(src), "r"(bytes), "r"(tma_bar(bar)), "l"(tma_pol)
+        : "memory");
+#else
     asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
                      static_cast<uint32_t>(__cvta_generic_to_shared(dst))),
                  "l"(src), "r"(bytes), "r"(tma_bar(bar))
                  : "memory");
+#endif
   };
   auto tma_wait = [&](int bar, uint32_t parity) {
     asm volatile(
@@ -1167,8 +1185,9 @@ __global__ void Marlin(
     tma_bulk(sh_rslot + slot * RANS_CAP, tma_var_g + static_cast<size_t>(o0) * 16, bytes, 1 + slot);
   };
   if (threadIdx.x == 0) {
+    constexpr int kInitBars = tma_b ? (3 + stages) : 3;
   #pragma unroll
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < kInitBars; i++)
       asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(tma_bar(i)) : "memory");
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(tma_bar(0)),
@@ -1176,11 +1195,25 @@ __global__ void Marlin(
     asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
                      static_cast<uint32_t>(__cvta_generic_to_shared(sh_rlut))),
                  "l"(g_idx), "r"(4096), "r"(tma_bar(0)) : "memory");
+#ifdef MUSE_B_EVICT_FIRST
+    {
+      uint64_t st_pol;
+      asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(st_pol));
+      asm volatile(
+          "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;" ::"r"(
+              static_cast<uint32_t>(__cvta_generic_to_shared(sh_states))),
+          "l"(reinterpret_cast<const unsigned char*>(scales_ptr) +
+              static_cast<size_t>(blockIdx.x) * threads * 4),
+          "r"(threads * 4), "r"(tma_bar(0)), "l"(st_pol)
+          : "memory");
+    }
+#else
     asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
                      static_cast<uint32_t>(__cvta_generic_to_shared(sh_states))),
                  "l"(reinterpret_cast<const unsigned char*>(scales_ptr) +
                      static_cast<size_t>(blockIdx.x) * threads * 4),
                  "r"(threads * 4), "r"(tma_bar(0)) : "memory");
+#endif
     if (tma_num_sbs > 0) tma_issue(0);
     if (tma_num_sbs > 1) tma_issue(1);
   }
@@ -1531,14 +1564,24 @@ __global__ void Marlin(
       }
       if constexpr (!(fuse_mul_sigmoid && multi_m)) {
         int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+#ifdef MUSE_SCALE_TMA4
+        if constexpr (tma_b) {
+          if (threadIdx.x == 0) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            tma_bulk(sh_b_stage, &B[b_gl_rd], b_sh_stage * static_cast<int>(sizeof(int4)), 3 + pipe);
+          }
+        } else
+#endif
+        {
   #pragma unroll
-        for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++) {
-          constexpr int count = div_ceil(b_sh_stride, threads);
-          int b_gl_idx =
-              b_gl_rd + (i % count) * threads +
-              b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
+          for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++) {
+            constexpr int count = div_ceil(b_sh_stride, threads);
+            int b_gl_idx =
+                b_gl_rd + (i % count) * threads +
+                b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
 
-          cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
+            cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
+          }
         }
       }
 
@@ -1614,17 +1657,24 @@ __global__ void Marlin(
     cp_async_fence();
   };
 #ifdef MUSE_SCALE_TMA4
-  // SM121 PDL consumer pre-wait fetch: issue B weight cp.async and advance ILV pointers without touching A.
+  // SM121 PDL consumer pre-wait fetch: issue B weight cp.async (or 1D TMA) and advance ILV pointers without touching A.
   auto fetch_b_only_to_shared = [&](int pipe, bool pred = true) {
     if (pred) {
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+      if constexpr (tma_b) {
+        if (threadIdx.x == 0) {
+          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+          tma_bulk(sh_b_stage, &B[b_gl_rd], b_sh_stage * static_cast<int>(sizeof(int4)), 3 + pipe);
+        }
+      } else {
   #pragma unroll
-      for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++) {
-        constexpr int count = div_ceil(b_sh_stride, threads);
-        int b_gl_idx =
-            b_gl_rd + (i % count) * threads +
-            b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
-        cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
+        for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++) {
+          constexpr int count = div_ceil(b_sh_stride, threads);
+          int b_gl_idx =
+              b_gl_rd + (i % count) * threads +
+              b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
+          cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
+        }
       }
       if constexpr (down_ilv) {
         if constexpr (gate_v48) {
@@ -1667,12 +1717,20 @@ __global__ void Marlin(
   };
 
   // Wait until the next thread tile has been loaded to shared memory.
-  auto wait_for_stage = [&]() {
+  auto wait_for_stage = [&](int wait_stage = 0, bool do_tma_b = false) {
     // We only have `stages - 2` active fetches since we are double buffering
     // and can only issue the next fetch when it is guaranteed that the previous
     // shared memory load is fully complete (as it may otherwise be
     // overwritten).
     cp_async_wait<stages - 2>();
+#ifdef MUSE_SCALE_TMA4
+    if constexpr (tma_b) {
+      if (do_tma_b && threadIdx.x == 0) {
+        tma_wait(3 + wait_stage, (tma_b_par >> wait_stage) & 1u);
+        tma_b_par ^= (1u << wait_stage);
+      }
+    }
+#endif
     __syncthreads();
   };
 
@@ -2314,9 +2372,52 @@ __global__ void Marlin(
     constexpr int red_off = threads / b_sh_stride_threads / 2;
     if (red_off >= 1) {
       auto red_idx = threadIdx.x / b_sh_stride_threads;
+      if constexpr (multi_m && !m_block_size_8 && !is_a_8bit && thread_m_blocks == 2 && red_off == 2 &&
+                    (fixed_shape != 3 || stages == 3)) {
+        // 1-step direct 4-way reduction for M=32 (red_idx=1,2,3 write to 3 disjoint slots simultaneously):
+        // - stages==3 (lm_head): red_j_chunk=8 -> 2 passes (3 syncs vs 11 on fuse_lmpost; sh_red=24,576 B -> <= 94 KiB).
+        // - stages==4 (gate_up/down): red_j_chunk=4 -> 4 passes (7 syncs vs 12; sh_red=12,288 B -> <= 96 KiB).
+        // Exact per-element FP32 addition order v0 + (v1 + (v3 + v2)) (strict 0-ULP).
+        constexpr int red_j_chunk = (stages == 3) ? 8 : 4;
+        constexpr int red_sh_stride = b_sh_stride_threads * red_j_chunk;
+        const int red_tid = threadIdx.x % b_sh_stride_threads;
+  #pragma unroll
+        for (int m_block = 0; m_block < 2; m_block++) {
+  #pragma unroll
+          for (int j_base = 0; j_base < 8; j_base += red_j_chunk) {
+            if (red_idx > 0) {
+              const int wr_base = (red_idx - 1) * red_sh_stride + red_tid;
+  #pragma unroll
+              for (int jl = 0; jl < red_j_chunk; jl++) {
+                sh_red[wr_base + b_sh_stride_threads * jl] =
+                    reinterpret_cast<int4*>(&frag_c)[8 * m_block + j_base + jl];
+              }
+            }
+            __syncthreads();
+            if (red_idx == 0) {
+  #pragma unroll
+              for (int jl = 0; jl < red_j_chunk; jl++) {
+                const int off = b_sh_stride_threads * jl + red_tid;
+                const float4 v1 = reinterpret_cast<const float4*>(sh_red)[off];
+                const float4 v2 = reinterpret_cast<const float4*>(sh_red)[red_sh_stride + off];
+                const float4 v3 = reinterpret_cast<const float4*>(sh_red)[2 * red_sh_stride + off];
+                float* dst = reinterpret_cast<float*>(&reinterpret_cast<FragC*>(frag_c)[8 * m_block + j_base + jl]);
+                dst[0] = __fadd_rn(dst[0], __fadd_rn(v1.x, __fadd_rn(v3.x, v2.x)));
+                dst[1] = __fadd_rn(dst[1], __fadd_rn(v1.y, __fadd_rn(v3.y, v2.y)));
+                dst[2] = __fadd_rn(dst[2], __fadd_rn(v1.z, __fadd_rn(v3.z, v2.z)));
+                dst[3] = __fadd_rn(dst[3], __fadd_rn(v1.w, __fadd_rn(v3.w, v2.w)));
+              }
+            }
+            if (!fuse_lmpost || !(m_block == 1 && j_base + red_j_chunk >= 8)) {
+              __syncthreads();
+            }
+          }
+        }
+        return;
+      }
       if constexpr (multi_m && !m_block_size_8 && !is_a_8bit) {
         // Chunked reduction over j = 0..7:
-        // - fixed_shape != 3: 3 passes (3+3+2) -> 9 syncs, sh_red = 6,144 B (keeps SMEM <= 62 KiB at st=3 / 74 KiB at st=4;
+        // - fixed_shape != 3: 3 passes (3+3+2) -> 8 syncs, sh_red = 6,144 B (keeps SMEM <= 62 KiB at st=3 / 74 KiB at st=4;
         //   red_j_chunk=8 at 84 KiB regressed M=16 gate_up +5.6 us & down +1.5 us on w36dec12).
         // - fixed_shape == 3 (lm_head, RANS_CAP=4096): 4 passes (2+2+2+2) -> sh_red = 4,096 B (total <= 62 KiB).
         // Preserves exact per-element FP32 addition order (strict 0-ULP).
@@ -2368,7 +2469,9 @@ __global__ void Marlin(
                 }
               }
             }
-            __syncthreads();
+            if (!fuse_lmpost || !(m_block == thread_m_blocks - 1 && j_base + red_j_chunk >= 8)) {
+              __syncthreads();
+            }
           }
         }
         return;
@@ -2625,14 +2728,12 @@ __global__ void Marlin(
       } else {
   #pragma unroll
         for (int k = 0; k < th_size; k += (m_block_size_8 ? 2 : 1)) {
-          sh_red[threadIdx.x] =
-              C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
-
-          float* sh_c_ptr = reinterpret_cast<float*>(&sh_red[threadIdx.x]);
-  #pragma unroll
-          for (int f = 0; f < 4; f++) {
-            frag_c_ptr[k * 4 + f] += sh_c_ptr[f];
-          }
+          const float4 v =
+              reinterpret_cast<const float4*>(C_tmp)[c_cur_offset + active_threads * k + threadIdx.x];
+          frag_c_ptr[k * 4 + 0] += v.x;
+          frag_c_ptr[k * 4 + 1] += v.y;
+          frag_c_ptr[k * 4 + 2] += v.z;
+          frag_c_ptr[k * 4 + 3] += v.w;
         }
       }
     }
@@ -2804,28 +2905,45 @@ __global__ void Marlin(
           int4* const my_slot = C0 + prob_m * 2496 + m_pair * (prob_m * 32) + (is_up ? prob_m * 16 : 0);
           const int4* const other_slot = C0 + prob_m * 2496 + m_pair * (prob_m * 32) + (is_up ? 0 : prob_m * 16);
           int* const plock = (pair_locks != nullptr ? pair_locks : (locks + 24)) + m_pair;
-          for (int idx = threadIdx.x; idx < prob_m * 16; idx += threads) {
-            const int r_s = idx >> 4;
-            const int c_s = idx & 15;
-            const int4 v = sh_red[r_s * c_sh_stride + c_s];
-            asm volatile("st.global.wb.v4.b32 [%0], {%1, %2, %3, %4};\n"
-                         :
-                         : "l"(my_slot + idx), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
-                         : "memory");
-          }
-          __syncthreads();
-          if (threadIdx.x == 0) {
-            int old = 0;
-            asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;\n"
-                         : "=r"(old)
-                         : "l"(plock)
-                         : "memory");
-            if (old == 1) {
-              asm volatile("st.global.wb.b32 [%0], 0;\n" ::"l"(plock) : "memory");
+          bool fast_done = false;
+          if (is_up) {
+            // Part-2 up slices nearly always finish after Part-1 gate slices: check plock first to skip
+            // dead 8 KiB my_slot global writes, 1 CTA barrier, and global atomicAdd when gate is already ready.
+            if (threadIdx.x == 0) {
+              int cur = 0;
+              asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(cur) : "l"(plock) : "memory");
+              if (cur == 1) {
+                asm volatile("st.global.wb.b32 [%0], 0;\n" ::"l"(plock) : "memory");
+              }
+              sh_red[prob_m * c_sh_stride].x = cur;
             }
-            sh_red[prob_m * c_sh_stride].x = old;
+            __syncthreads();
+            fast_done = (sh_red[prob_m * c_sh_stride].x == 1);
           }
-          __syncthreads();
+          if (!fast_done) {
+            for (int idx = threadIdx.x; idx < prob_m * 16; idx += threads) {
+              const int r_s = idx >> 4;
+              const int c_s = idx & 15;
+              const int4 v = sh_red[r_s * c_sh_stride + c_s];
+              asm volatile("st.global.wb.v4.b32 [%0], {%1, %2, %3, %4};\n"
+                           :
+                           : "l"(my_slot + idx), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                           : "memory");
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+              int old = 0;
+              asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;\n"
+                           : "=r"(old)
+                           : "l"(plock)
+                           : "memory");
+              if (old == 1) {
+                asm volatile("st.global.wb.b32 [%0], 0;\n" ::"l"(plock) : "memory");
+              }
+              sh_red[prob_m * c_sh_stride].x = old;
+            }
+            __syncthreads();
+          }
           if (sh_red[prob_m * c_sh_stride].x == 1) {
             for (int idx = threadIdx.x; idx < prob_m * 16; idx += threads) {
               const int r = idx >> 4;
@@ -2947,7 +3065,13 @@ __global__ void Marlin(
         }
       }
     }
+#ifdef MUSE_SCALE_TMA4
+    if constexpr (!down_ilv) {
+      __syncthreads();
+    }
+#else
     __syncthreads();
+#endif
   };
 
 #ifdef MUSE_SCALE_TMA4
@@ -3081,7 +3205,7 @@ __global__ void Marlin(
       }
     }
 #endif
-    wait_for_stage();
+    wait_for_stage(0, total_rem > 0);
 #ifdef MUSE_SCALE_TMA4
     if constexpr (!tma_ovlp) {
       if (!tma_started) {
@@ -3165,7 +3289,7 @@ __global__ void Marlin(
           if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
 #endif
           pipe++;
-          wait_for_stage();
+          wait_for_stage(pipe % stages, total_rem > 1);
           fetch_to_registers(2, pipe % stages);
           fetch_scales_to_registers(2, pipe);
           matmul(1, pipe - 1);
@@ -3179,7 +3303,7 @@ __global__ void Marlin(
               fetch_to_shared((pipe + stages - 1) % stages, pipe,
                               total_rem >= stages);
               pipe++;
-              wait_for_stage();
+              wait_for_stage(pipe % stages, total_rem > 1);
 #ifdef MUSE_SCALE_TMA4
               tma_q++;
               if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
@@ -3685,56 +3809,105 @@ __global__ void Marlin(
               }
             } else {
               const int r0 = lane >> 2;
-              const bool has_r0 = r0 < prob_m;
-              const bool has_r1 = (r0 + 8) < prob_m;
-              const bool has_r2 = (thread_m_blocks == 2) && ((r0 + 16) < prob_m);
-              const bool has_r3 = (thread_m_blocks == 2) && ((r0 + 24) < prob_m);
               const int base_col = slice_col * (thread_n_blocks * 16) + 64 * (threadIdx.x >> 5) + ((lane & 3) << 1);
-              auto upd = [&](float raw_c, int col, float& bv, int& bi) {
+              auto ldg_lut = [&](float raw_c) -> uint16_t {
                 const __nv_bfloat16 bf = Cdtype::float2num(raw_c * global_scale_f32);
-                const uint16_t m = __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&bf));
+                return __ldg(lmpost_lut + *reinterpret_cast<const uint16_t*>(&bf));
+              };
+              auto upd_val = [&](uint16_t m, int col, float& bv, int& bi) {
                 const float v = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&m));
                 if ((v > bv) || (v == bv && col < bi)) {
                   bv = v;
                   bi = col;
                 }
               };
+              auto upd = [&](float raw_c, int col, float& bv, int& bi) {
+                upd_val(ldg_lut(raw_c), col, bv, bi);
+              };
+              if constexpr (thread_m_blocks == 2) {
+                if (__builtin_expect(
+                        prob_m == 32 &&
+                            (slice_col * (thread_n_blocks * 16) + (thread_n_blocks * 16) <= org_vocab_size),
+                        1)) {
+                  auto upd4 = [&](float c0, float c1, float c2, float c3, int col) {
+                    const uint16_t m0 = ldg_lut(c0);
+                    const uint16_t m1 = ldg_lut(c1);
+                    const uint16_t m2 = ldg_lut(c2);
+                    const uint16_t m3 = ldg_lut(c3);
+                    upd_val(m0, col, lm_bv, lm_bi);
+                    upd_val(m1, col, lm_bv1, lm_bi1);
+                    upd_val(m2, col, lm_bv2, lm_bi2);
+                    upd_val(m3, col, lm_bv3, lm_bi3);
+                  };
   #pragma unroll
-              for (int j = 0; j < 4; ++j) {
-                const int ca0 = base_col + 16 * j;
-                const int ca1 = ca0 + 1;
-                if (ca0 < org_vocab_size) {
-                  if (has_r0) upd(frag_c[0][j][0][0], ca0, lm_bv, lm_bi);
-                  if (has_r1) upd(frag_c[0][j][0][2], ca0, lm_bv1, lm_bi1);
-                  if constexpr (thread_m_blocks == 2) {
-                    if (has_r2) upd(frag_c[1][j][0][0], ca0, lm_bv2, lm_bi2);
-                    if (has_r3) upd(frag_c[1][j][0][2], ca0, lm_bv3, lm_bi3);
+                  for (int j = 0; j < 4; ++j) {
+                    const int ca0 = base_col + 16 * j;
+                    upd4(frag_c[0][j][0][0], frag_c[0][j][0][2], frag_c[1][j][0][0], frag_c[1][j][0][2], ca0);
+                    upd4(frag_c[0][j][0][1], frag_c[0][j][0][3], frag_c[1][j][0][1], frag_c[1][j][0][3], ca0 + 1);
+                    upd4(frag_c[0][j][1][0], frag_c[0][j][1][2], frag_c[1][j][1][0], frag_c[1][j][1][2], ca0 + 8);
+                    upd4(frag_c[0][j][1][1], frag_c[0][j][1][3], frag_c[1][j][1][1], frag_c[1][j][1][3], ca0 + 9);
+                  }
+                } else {
+                  const bool has_r0 = r0 < prob_m;
+                  const bool has_r1 = (r0 + 8) < prob_m;
+                  const bool has_r2 = (r0 + 16) < prob_m;
+                  const bool has_r3 = (r0 + 24) < prob_m;
+  #pragma unroll
+                  for (int j = 0; j < 4; ++j) {
+                    const int ca0 = base_col + 16 * j;
+                    const int ca1 = ca0 + 1;
+                    if (ca0 < org_vocab_size) {
+                      if (has_r0) upd(frag_c[0][j][0][0], ca0, lm_bv, lm_bi);
+                      if (has_r1) upd(frag_c[0][j][0][2], ca0, lm_bv1, lm_bi1);
+                      if (has_r2) upd(frag_c[1][j][0][0], ca0, lm_bv2, lm_bi2);
+                      if (has_r3) upd(frag_c[1][j][0][2], ca0, lm_bv3, lm_bi3);
+                    }
+                    if (ca1 < org_vocab_size) {
+                      if (has_r0) upd(frag_c[0][j][0][1], ca1, lm_bv, lm_bi);
+                      if (has_r1) upd(frag_c[0][j][0][3], ca1, lm_bv1, lm_bi1);
+                      if (has_r2) upd(frag_c[1][j][0][1], ca1, lm_bv2, lm_bi2);
+                      if (has_r3) upd(frag_c[1][j][0][3], ca1, lm_bv3, lm_bi3);
+                    }
+                    const int cb0 = ca0 + 8;
+                    const int cb1 = cb0 + 1;
+                    if (cb0 < org_vocab_size) {
+                      if (has_r0) upd(frag_c[0][j][1][0], cb0, lm_bv, lm_bi);
+                      if (has_r1) upd(frag_c[0][j][1][2], cb0, lm_bv1, lm_bi1);
+                      if (has_r2) upd(frag_c[1][j][1][0], cb0, lm_bv2, lm_bi2);
+                      if (has_r3) upd(frag_c[1][j][1][2], cb0, lm_bv3, lm_bi3);
+                    }
+                    if (cb1 < org_vocab_size) {
+                      if (has_r0) upd(frag_c[0][j][1][1], cb1, lm_bv, lm_bi);
+                      if (has_r1) upd(frag_c[0][j][1][3], cb1, lm_bv1, lm_bi1);
+                      if (has_r2) upd(frag_c[1][j][1][1], cb1, lm_bv2, lm_bi2);
+                      if (has_r3) upd(frag_c[1][j][1][3], cb1, lm_bv3, lm_bi3);
+                    }
                   }
                 }
-                if (ca1 < org_vocab_size) {
-                  if (has_r0) upd(frag_c[0][j][0][1], ca1, lm_bv, lm_bi);
-                  if (has_r1) upd(frag_c[0][j][0][3], ca1, lm_bv1, lm_bi1);
-                  if constexpr (thread_m_blocks == 2) {
-                    if (has_r2) upd(frag_c[1][j][0][1], ca1, lm_bv2, lm_bi2);
-                    if (has_r3) upd(frag_c[1][j][0][3], ca1, lm_bv3, lm_bi3);
+              } else {
+                const bool has_r0 = r0 < prob_m;
+                const bool has_r1 = (r0 + 8) < prob_m;
+  #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                  const int ca0 = base_col + 16 * j;
+                  const int ca1 = ca0 + 1;
+                  if (ca0 < org_vocab_size) {
+                    if (has_r0) upd(frag_c[0][j][0][0], ca0, lm_bv, lm_bi);
+                    if (has_r1) upd(frag_c[0][j][0][2], ca0, lm_bv1, lm_bi1);
                   }
-                }
-                const int cb0 = ca0 + 8;
-                const int cb1 = cb0 + 1;
-                if (cb0 < org_vocab_size) {
-                  if (has_r0) upd(frag_c[0][j][1][0], cb0, lm_bv, lm_bi);
-                  if (has_r1) upd(frag_c[0][j][1][2], cb0, lm_bv1, lm_bi1);
-                  if constexpr (thread_m_blocks == 2) {
-                    if (has_r2) upd(frag_c[1][j][1][0], cb0, lm_bv2, lm_bi2);
-                    if (has_r3) upd(frag_c[1][j][1][2], cb0, lm_bv3, lm_bi3);
+                  if (ca1 < org_vocab_size) {
+                    if (has_r0) upd(frag_c[0][j][0][1], ca1, lm_bv, lm_bi);
+                    if (has_r1) upd(frag_c[0][j][0][3], ca1, lm_bv1, lm_bi1);
                   }
-                }
-                if (cb1 < org_vocab_size) {
-                  if (has_r0) upd(frag_c[0][j][1][1], cb1, lm_bv, lm_bi);
-                  if (has_r1) upd(frag_c[0][j][1][3], cb1, lm_bv1, lm_bi1);
-                  if constexpr (thread_m_blocks == 2) {
-                    if (has_r2) upd(frag_c[1][j][1][1], cb1, lm_bv2, lm_bi2);
-                    if (has_r3) upd(frag_c[1][j][1][3], cb1, lm_bv3, lm_bi3);
+                  const int cb0 = ca0 + 8;
+                  const int cb1 = cb0 + 1;
+                  if (cb0 < org_vocab_size) {
+                    if (has_r0) upd(frag_c[0][j][1][0], cb0, lm_bv, lm_bi);
+                    if (has_r1) upd(frag_c[0][j][1][2], cb0, lm_bv1, lm_bi1);
+                  }
+                  if (cb1 < org_vocab_size) {
+                    if (has_r0) upd(frag_c[0][j][1][1], cb1, lm_bv, lm_bi);
+                    if (has_r1) upd(frag_c[0][j][1][3], cb1, lm_bv1, lm_bi1);
                   }
                 }
               }

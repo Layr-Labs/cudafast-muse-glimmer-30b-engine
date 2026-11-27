@@ -248,15 +248,17 @@ int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* 
       return cudaSuccess;
     };
     if constexpr (MultiM && !MBlock8 && ThreadMBlocks == 2 && TileN == 128 && Threads == 256 && Stages == 4 && FastPal16 && FixedShape != 3) {
-      // Exact M<=32 st=4 SMEM: sh_b(32768)+sh_s(8192)+sh_a(32768)+pal(128)+states(1024)+rslot(6400)+rlut(4096)+rbar(32)+sh_red(8720)
-      // = 94,128 B = 91.92 KiB <= 93 KiB (<= 99 KiB SM121 opt-in SMEM).
-      shared = 93 * 1024;
+      // Exact M<=32 st=4 SMEM (1-step 3-slot sh_red=12,288 B):
+      // sh_b(32768)+sh_s(8192)+sh_a(32768)+pal(128)+states(1024)+rslot(6400)+rlut(4096)+rbar(32)+sh_red(12288)
+      // = 97,696 B = 95.41 KiB <= 96 KiB (<= 99 KiB SM121 opt-in SMEM).
+      shared = 96 * 1024;
       auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
       if (status != cudaSuccess) { (void)cudaGetLastError(); return status; }
     } else if constexpr (MultiM && !MBlock8 && ThreadMBlocks == 2 && TileN == 128 && Threads == 256 && Stages == 3 && FastPal16) {
-      // Exact M<=32 SMEM: sh_b(24576)+sh_s(8192)+sh_a(24576)+pal(128)+states(1024)+rslot(6400|8192)+rlut(4096)+rbar(32)+sh_red(8720)
-      // = 77,744 B (FixedShape!=3) <= 77 KiB / 79,520 B (FixedShape==3) <= 79 KiB (<= 99 KiB opt-in SMEM).
-      shared = (FixedShape == 3) ? (79 * 1024) : (77 * 1024);
+      // Exact M<=32 st=3 SMEM (1-step 3-slot red_j_chunk=8 sh_red=24,576 B; sh_rbar=64 B on FuseLmPost):
+      // sh_b(24576)+sh_s(8192)+sh_a(24576)+pal(128)+states(1024)+rslot(6400|8192)+rlut(4096)+rbar(32|64)+sh_red(24576)
+      // = 93,600 B (<= 92 KiB) / 95,424 B (<= 94 KiB <= 99 KiB SM121 opt-in SMEM; same 28 KiB L1 carveout as 79 KiB).
+      shared = (FixedShape == 3) ? (94 * 1024) : (92 * 1024);
       auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
       if (status != cudaSuccess) { (void)cudaGetLastError(); return status; }
     } else if constexpr (MultiM && !MBlock8 && ThreadMBlocks == 1 && TileN == 128 && Threads == 256 && Stages == 3 && FastPal16) {
@@ -921,7 +923,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
           input, weight, output, partials, coded, palette, global_scale, locks, n, k, 24, device, stream,
           nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
     }
-    if (m <= 16 && g_st == 4) {
+    if (g_st == 4) {
       return launch_tma4_m<128, 256, false, true, false, false, false, false, 4, false, 0, false, true, false, true>(
           input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
           nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);

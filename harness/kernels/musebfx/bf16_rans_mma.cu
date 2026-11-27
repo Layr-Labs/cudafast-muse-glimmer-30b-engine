@@ -56,7 +56,18 @@ __device__ __forceinline__ uint64_t br_pol_ef() {
 }
 
 __device__ __forceinline__ void br_cp_async16_ef(uint32_t sd, const void* gs, uint64_t pol) {
-  asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(sd), "l"(gs), "l"(pol));
+  asm volatile("cp.async.cg.shared.global.L2::256B.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(sd), "l"(gs), "l"(pol));
+}
+
+__device__ __forceinline__ uint32_t br_lop3_ea(uint32_t a, uint32_t b, uint32_t c) {
+  uint32_t d;
+  asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+  return d;
+}
+
+__device__ __forceinline__ uint32_t br_pack_bf16x2(uint32_t sm_pair, uint32_t e_pair_sh7) {
+  const uint32_t t = br_lop3_ea(sm_pair << 8, 0x80008000u, e_pair_sh7);
+  return br_lop3_ea(sm_pair, 0x007F007Fu, t);
 }
 
 __device__ __forceinline__ void br_cp_async16_ca(uint32_t sd, const void* gs) {
@@ -903,8 +914,8 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
 
             const uint32_t sm01 = __byte_perm(sm_w0, 0u, 0x4140);
             const uint32_t sm23 = __byte_perm(sm_w0, 0u, 0x4342);
-            const uint32_t b0 = ((sm01 & 0x00800080u) << 8) | (sm01 & 0x007F007Fu) | (e0 << 7) | (e1 << 23);
-            const uint32_t b1 = ((sm23 & 0x00800080u) << 8) | (sm23 & 0x007F007Fu) | (e2 << 7) | (e3 << 23);
+            const uint32_t b0 = br_pack_bf16x2(sm01, __byte_perm(e0, e1, 0x7470) << 7);
+            const uint32_t b1 = br_pack_bf16x2(sm23, __byte_perm(e2, e3, 0x7470) << 7);
             if constexpr (kM16) {
               bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
               if constexpr (kM32) {
@@ -916,8 +927,8 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
 
             const uint32_t sm45 = __byte_perm(sm_w1, 0u, 0x4140);
             const uint32_t sm67 = __byte_perm(sm_w1, 0u, 0x4342);
-            const uint32_t b2 = ((sm45 & 0x00800080u) << 8) | (sm45 & 0x007F007Fu) | (e4 << 7) | (e5 << 23);
-            const uint32_t b3 = ((sm67 & 0x00800080u) << 8) | (sm67 & 0x007F007Fu) | (e6 << 7) | (e7 << 23);
+            const uint32_t b2 = br_pack_bf16x2(sm45, __byte_perm(e4, e5, 0x7470) << 7);
+            const uint32_t b3 = br_pack_bf16x2(sm67, __byte_perm(e6, e7, 0x7470) << 7);
             if constexpr (kM16) {
               bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a4, a5, a6, a7, b2, b3);
               if constexpr (kM32) {

@@ -80,6 +80,37 @@ __device__ __forceinline__ float triton_sigmoid(float x) {
   return full_divide(1.0f, __fadd_rn(1.0f, e));
 }
 
+// Exhaustive 65,536-entry BF16 -> FP32 triton_sigmoid LUT (256 KiB, 0-ULP verified across all 2^16 BF16 patterns).
+__device__ float bf16_sigmoid_lut[65536];
+__device__ int bf16_sigmoid_diffs;
+
+__global__ void init_bf16_sigmoid_lut_kernel() {
+  const unsigned w = blockIdx.x * 256u + threadIdx.x;
+  const float x = __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(w)));
+  bf16_sigmoid_lut[w] = triton_sigmoid(x);
+}
+
+__global__ void verify_bf16_sigmoid_lut_kernel() {
+  const unsigned w = blockIdx.x * 256u + threadIdx.x;
+  const float x = __bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(w)));
+  const float direct = triton_sigmoid(x);
+  const float lut = __ldg(bf16_sigmoid_lut + w);
+  if (__float_as_uint(direct) != __float_as_uint(lut)) {
+    atomicAdd(&bf16_sigmoid_diffs, 1);
+  }
+}
+
+static bool g_sigmoid_lut_ready = false;
+
+static bool sigmoid_lut_enabled() {
+  static const bool on = []() -> bool {
+    const char* env = std::getenv("MUSE_PREFILL_ATTN_SIGMOID_LUT");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  return on;
+}
+
+// Single-instruction NaN canonicalizer matching triton_helpers clamp + cvt.rn.satfinite.e4m3x2 on sm_121a.
 __device__ __forceinline__ float canonicalize_nan(float y) {
   float r;
   asm("min.NaN.f32 %0, %1, %1;" : "=f"(r) : "f"(y));
@@ -339,11 +370,16 @@ __device__ __forceinline__ void q_norm_rope_4heads(
   }
 }
 
+__device__ __forceinline__ void st2_cs(void* ptr, uint2 v) {
+  asm volatile("st.global.cs.v2.u32 [%0], {%1, %2};"
+               :: "l"(ptr), "r"(v.x), "r"(v.y) : "memory");
+}
+
 // =================================================================================================
 // Stage 1: Tiny KV-Only K-RMSNorm + RoPE + paged kv_cache + contiguous kv_flat[2][2][seqlen][128]
 // =================================================================================================
 template <bool UseRope, bool CacheFP32, bool kPdl, bool kDiscardKV>
-__global__ __launch_bounds__(64) void prefill_kv_only_kernel(
+__global__ __launch_bounds__(256) void prefill_kv_only_kernel(
     const __nv_bfloat16* __restrict__ qkv,
     const int64_t* __restrict__ positions,
     const void* __restrict__ cos_sin_cache,
@@ -361,10 +397,11 @@ __global__ __launch_bounds__(64) void prefill_kv_only_kernel(
     size_t dead_lines0,
     const char* __restrict__ dead_ptr1,
     size_t dead_lines1) {
-  const int tid_global = static_cast<int>(blockIdx.x) * 64 + static_cast<int>(threadIdx.x);
-  const int total_threads = static_cast<int>(gridDim.x) * 64;
-  const int warp_global = (static_cast<int>(blockIdx.x) << 1) + (static_cast<int>(threadIdx.x) >> 5);
-  const int total_warps = static_cast<int>(gridDim.x) << 1;
+  const int tid_global = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+  const int total_threads = static_cast<int>(gridDim.x) * static_cast<int>(blockDim.x);
+  const int warps_per_blk = static_cast<int>(blockDim.x) >> 5;
+  const int warp_global = static_cast<int>(blockIdx.x) * warps_per_blk + (static_cast<int>(threadIdx.x) >> 5);
+  const int total_warps = static_cast<int>(gridDim.x) * warps_per_blk;
   const int lane = static_cast<int>(threadIdx.x) & 31;
 
   if constexpr (kPdl) {
@@ -412,10 +449,10 @@ __global__ __launch_bounds__(64) void prefill_kv_only_kernel(
                         : ((block_size == 64) ? (slot & 63) : (slot - blk * block_size));
       __nv_bfloat16* dst0 = kv_cache + blk * stride_block + off * stride_slot + lane * 4;
       __nv_bfloat16* dst1 = dst0 + stride_kv_head;
-      *reinterpret_cast<uint2*>(dst0) = k0_out;
-      *reinterpret_cast<uint2*>(dst0 + 128) = v0_raw;
-      *reinterpret_cast<uint2*>(dst1) = k1_out;
-      *reinterpret_cast<uint2*>(dst1 + 128) = v1_raw;
+      st2_cs(dst0, k0_out);
+      st2_cs(dst0 + 128, v0_raw);
+      st2_cs(dst1, k1_out);
+      st2_cs(dst1 + 128, v1_raw);
     }
   }
 
@@ -484,7 +521,7 @@ __device__ __forceinline__ void prefill_qk_half(
   }
 }
 
-template <int Mode, bool UseRope, bool CacheFP32, bool kPdl, bool kDiscardL2>
+template <int Mode, bool UseRope, bool CacheFP32, bool kPdl, bool kDiscardL2, bool kLutSigmoid = false>
 __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     const __nv_bfloat16* __restrict__ qkv,
     const int64_t* __restrict__ positions,
@@ -834,9 +871,16 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
       #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const float2 of = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ow[i]));
-        const float2 gf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gw[i]));
-        const __nv_bfloat162 r = __floats2bfloat162_rn(__fmul_rn(triton_sigmoid(gf.x), of.x),
-                                                       __fmul_rn(triton_sigmoid(gf.y), of.y));
+        float sx, sy;
+        if constexpr (kLutSigmoid) {
+          sx = __ldg(bf16_sigmoid_lut + (gw[i] & 0xffffu));
+          sy = __ldg(bf16_sigmoid_lut + (gw[i] >> 16));
+        } else {
+          const float2 gf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gw[i]));
+          sx = triton_sigmoid(gf.x);
+          sy = triton_sigmoid(gf.y);
+        }
+        const __nv_bfloat162 r = __floats2bfloat162_rn(__fmul_rn(sx, of.x), __fmul_rn(sy, of.y));
         rw[i] = *reinterpret_cast<const uint32_t*>(&r);
       }
       dst[idx] = make_uint4(rw[0], rw[1], rw[2], rw[3]);
@@ -860,9 +904,17 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
       #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const float2 of = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ow[i]));
-        const float2 gf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gw[i]));
-        qw[i] = fp8x2(canonicalize_nan(__fmul_rn(__fmul_rn(triton_sigmoid(gf.x), of.x), inv_s)),
-                      canonicalize_nan(__fmul_rn(__fmul_rn(triton_sigmoid(gf.y), of.y), inv_s)));
+        float sx, sy;
+        if constexpr (kLutSigmoid) {
+          sx = __ldg(bf16_sigmoid_lut + (gw[i] & 0xffffu));
+          sy = __ldg(bf16_sigmoid_lut + (gw[i] >> 16));
+        } else {
+          const float2 gf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gw[i]));
+          sx = triton_sigmoid(gf.x);
+          sy = triton_sigmoid(gf.y);
+        }
+        qw[i] = fp8x2(canonicalize_nan(__fmul_rn(__fmul_rn(sx, of.x), inv_s)),
+                      canonicalize_nan(__fmul_rn(__fmul_rn(sy, of.y), inv_s)));
       }
       dst[idx] = make_uint2(static_cast<uint32_t>(qw[0]) | (static_cast<uint32_t>(qw[1]) << 16),
                             static_cast<uint32_t>(qw[2]) | (static_cast<uint32_t>(qw[3]) << 16));
@@ -924,7 +976,7 @@ __device__ __forceinline__ uint2 ldg8_direct(const __nv_bfloat16* base, int c) {
   return __ldg(reinterpret_cast<const uint2*>(base + c * 1024 + threadIdx.x * 4));
 }
 
-template <bool kBf16Out, bool kFp8Out, bool kCsX, bool kCsRes, bool kPdl = true>
+template <bool kBf16Out, bool kFp8Out, bool kCsX, bool kCsRes, int kPdlMode = 2>
 __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
     const __nv_bfloat16* __restrict__ x_all,
     const __nv_bfloat16* __restrict__ res_all,
@@ -937,14 +989,14 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
     const char* __restrict__ dead_ptr,
     size_t dead_lines) {
   __shared__ float red[2][8];
-  __shared__ uint2 sh_res[kPdl ? (kHidden / 4) : 1];
+  __shared__ uint2 sh_res[kPdlMode == 1 ? (kHidden / 4) : 1];
   const size_t row = blockIdx.x;
   const __nv_bfloat16* x = x_all + row * kHidden;
   const __nv_bfloat16* res = res_all + row * kHidden;
   float inv_scale = 0.0f;
 
-  if constexpr (kPdl) {
-    // Preload predecessor-independent residual (6.8 MB) into SMEM before waiting on o_proj!
+  if constexpr (kPdlMode == 1) {
+    // Legacy full PDL: preload predecessor-independent residual (6.8 MB) into SMEM before waiting on o_proj.
     #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid_6656(c)) {
@@ -956,12 +1008,16 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
     asm volatile("griddepcontrol.launch_dependents;");
   }
 
-  // Discard dead attn_out strictly AFTER pdl_wait() so o_proj has finished reading it!
-  if (dead_ptr) {
-    const size_t gid = row * 256 + threadIdx.x;
-    const size_t gstride = static_cast<size_t>(gridDim.x) * 256;
-    for (size_t i = gid; i < dead_lines; i += gstride) {
-      discard_l2_128(dead_ptr + (i << 7));
+  // Discard dead attn_out strictly AFTER pdl_wait() for kPdlMode != 2; for producer-only
+  // kPdlMode == 2, hoist discard AFTER launch_dependents + final output stores so downstream
+  // gateup/swiglu TMA weight preloads overlap sooner and output stores land in L2 first.
+  if constexpr (kPdlMode != 2) {
+    if (dead_ptr) {
+      const size_t gid = row * 256 + threadIdx.x;
+      const size_t gstride = static_cast<size_t>(gridDim.x) * 256;
+      for (size_t i = gid; i < dead_lines; i += gstride) {
+        discard_l2_128(dead_ptr + (i << 7));
+      }
     }
   }
 
@@ -988,7 +1044,7 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
   #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid_6656(c)) {
-      const uint2 rv_u = kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_direct<kCsRes>(res, c);
+      const uint2 rv_u = (kPdlMode == 1) ? sh_res[c * 256 + threadIdx.x] : ld8_direct<kCsRes>(res, c);
       const uint2 wv_u = ldg8_direct(w_post, c);
       const float xv[4] = {bf_lo(ux[c].x), bf_hi(ux[c].x), bf_lo(ux[c].y), bf_hi(ux[c].y)};
       const float rv[4] = {bf_lo(rv_u.x), bf_hi(rv_u.x), bf_lo(rv_u.y), bf_hi(rv_u.y)};
@@ -1001,8 +1057,13 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
     }
   }
   const float s_h = row_sum_256(acc2, red[1]);
+  if constexpr (kPdlMode == 2) {
+    // Producer-only PDL: zero sh_res SMEM overhead, yet still signals downstream gateup/swiglu
+    // to overlap TMA/LUT weight preloads with this kernel's final store epilogue.
+    asm volatile("griddepcontrol.launch_dependents;");
+  }
   const float b = inv_rms_6656(s_h, 1e-05f);
-  if constexpr (!kPdl && kFp8Out) inv_scale = fast_rcpf(__ldg(scale));
+  if constexpr (kPdlMode != 1 && kFp8Out) inv_scale = fast_rcpf(__ldg(scale));
 
   __nv_bfloat16* const out_bf16_row = kBf16Out ? (out_bf16_all + row * kHidden) : nullptr;
   uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
@@ -1028,14 +1089,25 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
       }
     }
   }
+  if constexpr (kPdlMode == 2) {
+    if (dead_ptr) {
+      const size_t gid = row * 256 + threadIdx.x;
+      const size_t gstride = static_cast<size_t>(gridDim.x) * 256;
+      for (size_t i = gid; i < dead_lines; i += gstride) {
+        discard_l2_128(dead_ptr + (i << 7));
+      }
+    }
+  }
 }
 
-static bool post_attn_pdl_enabled() {
-  static const bool on = []() {
+static int post_attn_pdl_mode() {
+  static const int mode = []() -> int {
     const char* env = std::getenv("MUSE_PREFILL_POST_ATTN_PDL");
-    return env && *env && std::strtol(env, nullptr, 10) != 0;
+    if (!env || !*env) return 2;  // 0=off, 1=legacy full (sh_res+wait+launch), 2=producer-only default
+    long v = std::strtol(env, nullptr, 10);
+    return (v == 0 || v == 1 || v == 2) ? static_cast<int>(v) : 2;
   }();
-  return on;
+  return mode;
 }
 
 // =================================================================================================
@@ -1075,7 +1147,7 @@ static inline void align_discard(const void* ptr, size_t n_bytes, const char*& o
   out_lines = n_lines;
 }
 
-template <int Mode, bool kPdl, bool kDiscard>
+template <int Mode, bool kPdl, bool kDiscard, bool kLutSigmoid>
 static inline cudaError_t dispatch_attn_rope(
     int use_rope, int cache_fp32, cudaStream_t st,
     const __nv_bfloat16* qkv, const int64_t* pos, const void* cos_sin,
@@ -1086,16 +1158,30 @@ static inline cudaError_t dispatch_attn_rope(
   if (use_rope) {
     if (cache_fp32) {
       return launch_ex(kPdl, grid, block, st,
-                       prefill_attn_fused_512_kernel<Mode, true, true, kPdl, kDiscard>,
+                       prefill_attn_fused_512_kernel<Mode, true, true, kPdl, kDiscard, kLutSigmoid>,
                        qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
     }
     return launch_ex(kPdl, grid, block, st,
-                     prefill_attn_fused_512_kernel<Mode, true, false, kPdl, kDiscard>,
+                     prefill_attn_fused_512_kernel<Mode, true, false, kPdl, kDiscard, kLutSigmoid>,
                      qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
   }
   return launch_ex(kPdl, grid, block, st,
-                   prefill_attn_fused_512_kernel<Mode, false, true, kPdl, kDiscard>,
+                   prefill_attn_fused_512_kernel<Mode, false, true, kPdl, kDiscard, kLutSigmoid>,
                    qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+}
+
+template <int Mode, bool kLutSigmoid>
+static inline cudaError_t dispatch_attn_pdl_lut(
+    int pdl, int discard_l2, int use_rope, int cache_fp32, cudaStream_t st,
+    const __nv_bfloat16* qkv, const int64_t* pos, const void* cos_sin,
+    const __nv_bfloat16* kv_flat, const __nv_bfloat16* gate, const float* fp8_scale,
+    void* out, int cache_rows, float eps, float qscale, float scale_log2) {
+  if (pdl) {
+    if (discard_l2) return dispatch_attn_rope<Mode, true, true, kLutSigmoid>(use_rope, cache_fp32, st, qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+    return dispatch_attn_rope<Mode, true, false, kLutSigmoid>(use_rope, cache_fp32, st, qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+  }
+  if (discard_l2) return dispatch_attn_rope<Mode, false, true, kLutSigmoid>(use_rope, cache_fp32, st, qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+  return dispatch_attn_rope<Mode, false, false, kLutSigmoid>(use_rope, cache_fp32, st, qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
 }
 
 template <int Mode>
@@ -1104,12 +1190,12 @@ static inline cudaError_t dispatch_attn_pdl(
     const __nv_bfloat16* qkv, const int64_t* pos, const void* cos_sin,
     const __nv_bfloat16* kv_flat, const __nv_bfloat16* gate, const float* fp8_scale,
     void* out, int cache_rows, float eps, float qscale, float scale_log2) {
-  if (pdl) {
-    if (discard_l2) return dispatch_attn_rope<Mode, true, true>(use_rope, cache_fp32, st, qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
-    return dispatch_attn_rope<Mode, true, false>(use_rope, cache_fp32, st, qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+  if constexpr (Mode != 0) {
+    if (g_sigmoid_lut_ready && sigmoid_lut_enabled()) {
+      return dispatch_attn_pdl_lut<Mode, true>(pdl, discard_l2, use_rope, cache_fp32, st, qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+    }
   }
-  if (discard_l2) return dispatch_attn_rope<Mode, false, true>(use_rope, cache_fp32, st, qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
-  return dispatch_attn_rope<Mode, false, false>(use_rope, cache_fp32, st, qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+  return dispatch_attn_pdl_lut<Mode, false>(pdl, discard_l2, use_rope, cache_fp32, st, qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
 }
 
 template <bool kPdl, bool kDiscard>
@@ -1120,8 +1206,21 @@ static inline cudaError_t dispatch_kv_only(
     int num_tokens, int cache_rows, int block_size,
     int64_t stride_block, int64_t stride_slot, int64_t stride_kv_head, float eps,
     const char* d0, size_t l0, const char* d1, size_t l1) {
-  const dim3 grid(48u, 1u, 1u);
-  const dim3 block(64u, 1u, 1u);
+  static const unsigned kv_blocks = []() -> unsigned {
+    const char* env = std::getenv("MUSE_PREFILL_KV_ONLY_BLOCKS");
+    if (!env || !*env) return 64u;
+    long v = std::strtol(env, nullptr, 10);
+    return (v >= 16 && v <= 256) ? static_cast<unsigned>(v) : 64u;
+  }();
+  static const unsigned kv_threads = []() -> unsigned {
+    const char* env = std::getenv("MUSE_PREFILL_KV_ONLY_THREADS");
+    if (!env || !*env) return 256u;
+    long v = std::strtol(env, nullptr, 10);
+    if (v == 64 || v == 128 || v == 256) return static_cast<unsigned>(v);
+    return 256u;
+  }();
+  const dim3 grid(kv_blocks, 1u, 1u);
+  const dim3 block(kv_threads, 1u, 1u);
   if (use_rope) {
     if (cache_fp32) {
       return launch_ex(kPdl, grid, block, st,
@@ -1160,6 +1259,30 @@ __global__ __launch_bounds__(256) void discard_l2_multi2_kernel(
 }
 
 }  // namespace muse_pf_attn
+
+extern "C" int muse_prefill_init_sigmoid_lut(void* cuda_stream) {
+  if (muse_pf_attn::g_sigmoid_lut_ready) return 0;
+  const cudaStream_t st = static_cast<cudaStream_t>(cuda_stream);
+  int diffs = 0;
+  muse_pf_attn::init_bf16_sigmoid_lut_kernel<<<256, 256, 0, st>>>();
+  cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) return static_cast<int>(e);
+  e = cudaMemcpyToSymbolAsync(muse_pf_attn::bf16_sigmoid_diffs, &diffs, sizeof(int), 0, cudaMemcpyHostToDevice, st);
+  if (e != cudaSuccess) return static_cast<int>(e);
+  muse_pf_attn::verify_bf16_sigmoid_lut_kernel<<<256, 256, 0, st>>>();
+  e = cudaGetLastError();
+  if (e != cudaSuccess) return static_cast<int>(e);
+  e = cudaMemcpyFromSymbolAsync(&diffs, muse_pf_attn::bf16_sigmoid_diffs, sizeof(int), 0, cudaMemcpyDeviceToHost, st);
+  if (e != cudaSuccess) return static_cast<int>(e);
+  e = cudaStreamSynchronize(st);
+  if (e != cudaSuccess) return static_cast<int>(e);
+  if (diffs != 0) {
+    muse_pf_attn::g_sigmoid_lut_ready = false;
+    return -5;
+  }
+  muse_pf_attn::g_sigmoid_lut_ready = true;
+  return 0;
+}
 
 extern "C" int muse_prefill_kv_only(
     const void* qkv_ptr, const void* pos_ptr, const void* cos_sin_ptr,
@@ -1272,37 +1395,55 @@ extern "C" int muse_prefill_post_attn_norm(
   const cudaStream_t st = static_cast<cudaStream_t>(cuda_stream);
   const char* dp = nullptr; size_t dl = 0;
   muse_pf_attn::align_discard(dead_ptr, dead_bytes, dp, dl);
-  const bool pdl = muse_pf_attn::post_attn_pdl_enabled();
+  const int pdl_mode = muse_pf_attn::post_attn_pdl_mode();
   const dim3 grid(static_cast<unsigned>(rows), 1u, 1u);
   const dim3 block(256u, 1u, 1u);
   if (kind == 0) {
-    if (pdl) {
+    if (pdl_mode == 1) {
       if (cs_mode == 0)
-        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, true>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
+        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, 1>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
       if (cs_mode == 2)
-        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, true>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
-      return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, true>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
+        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, 1>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
+      return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, 1>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
     }
-    if (cs_mode == 0)
-      muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, false><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
-    else if (cs_mode == 2)
-      muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, false><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
-    else
-      muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, false><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+    if (pdl_mode == 2) {
+      if (cs_mode == 0)
+        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+      else if (cs_mode == 2)
+        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+      else
+        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+    } else {
+      if (cs_mode == 0)
+        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+      else if (cs_mode == 2)
+        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+      else
+        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+    }
   } else if (kind == 1) {
-    if (pdl) {
+    if (pdl_mode == 1) {
       if (cs_mode == 0)
-        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, true>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
+        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, 1>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
       if (cs_mode == 2)
-        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, true>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
-      return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, true>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
+        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, 1>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
+      return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, 1>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
     }
-    if (cs_mode == 0)
-      muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, false><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
-    else if (cs_mode == 2)
-      muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, false><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
-    else
-      muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, false><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+    if (pdl_mode == 2) {
+      if (cs_mode == 0)
+        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+      else if (cs_mode == 2)
+        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+      else
+        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+    } else {
+      if (cs_mode == 0)
+        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+      else if (cs_mode == 2)
+        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+      else
+        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+    }
   } else {
     return 1;
   }

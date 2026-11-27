@@ -61,6 +61,9 @@ try:
     _lib.muse_prefill_discard_l2.restype = ctypes.c_int
     _lib.muse_prefill_discard_l2_multi2.argtypes = [_p, ctypes.c_size_t, _p, ctypes.c_size_t, _p]
     _lib.muse_prefill_discard_l2_multi2.restype = ctypes.c_int
+    if hasattr(_lib, "muse_prefill_init_sigmoid_lut"):
+        _lib.muse_prefill_init_sigmoid_lut.argtypes = [_p]
+        _lib.muse_prefill_init_sigmoid_lut.restype = ctypes.c_int
 except OSError:
     _lib = None
 
@@ -137,6 +140,11 @@ def self_check(device: torch.device) -> bool:
         sk_512 = torch.tensor([512], dtype=torch.int32, device=device)
         kv_flat, _, _ = _get_scratch(device)
         stream = torch.cuda.current_stream(device).cuda_stream
+
+        if hasattr(_lib, "muse_prefill_init_sigmoid_lut"):
+            rc_lut = _lib.muse_prefill_init_sigmoid_lut(stream)
+            if rc_lut != 0:
+                logger.warning("muse_prefill_attn: bf16_sigmoid_lut init/verify failed (rc=%d), using direct sigmoid", rc_lut)
 
         for cand_mode in (1, 3):
             all_match = True

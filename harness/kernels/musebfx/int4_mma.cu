@@ -430,7 +430,11 @@ __global__ void int4_pack_kernel(
   const int num_kg = K >> 6;
   const int n_blocks = N / kRowsPerCTA;
   size_t dst_off = 0;
-  if (k_major < 0) {
+  if (k_major <= -10000) {
+    const int fc_grid = -(k_major + 10000);
+    const size_t step_slot = int4_n32_sk_step_slot(cta_n, kg, n_blocks, num_kg, fc_grid);
+    dst_off = step_slot * kStepWBytes + static_cast<size_t>(sub_tile) * kTileBytes;
+  } else if (k_major < 0) {
     const int sk_grid = -k_major;
     const int num_n32 = N >> 5;
     const int cta_n32 = n_tile >> 2;
@@ -1723,7 +1727,7 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_swiglu_kernel(
 //   - kWholeSplit=false (51990a52 + 3-part extension): balanced Stream-K across all CTAs with
 //     deterministic non-atomic float2 reduction on ALL 2-part AND 3-part tiles (100% of tiles on
 //     fc, fkv, qkv_proj, o_proj at grid=144/192), falling back to sk_partials only for >=4-part tiles.
-template <bool kM16, bool kAux5, bool kWholeSplit, bool kNf4 = false>
+template <bool kM16, bool kAux5, bool kWholeSplit, bool kNf4 = false, bool kTma = true, bool kSkIlv = false>
 __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
     const __nv_bfloat16* __restrict__ A,
     Aux5Desc aux5,
@@ -1732,7 +1736,7 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
     float* __restrict__ sk_partials,    // [max_n_blocks, 16, 64] zero-initialized & self-zeroing (>=4-part fallback)
     float* __restrict__ sk_multi_part,  // [max_n_blocks, 3, 16, 64] uninitialized non-atomic 2/3-part slots (nullptr disables)
     int* __restrict__ sk_done,          // [max_n_blocks] zero-initialized & self-zeroing
-    int M, int N, int K, int n_blocks, int grid_ctas, int pdl_mode, int allow_3part, int use_tma) {
+    int M, int N, int K, int n_blocks, int grid_ctas, int pdl_mode, int allow_3part) {
   __shared__ Int4StageSmem<kM16 ? 16 : 8> smem;
   __shared__ int s_is_last;
   const int tid = threadIdx.x;
@@ -1764,13 +1768,14 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
   const int my_iters = iter_end - iter_start;
   if (my_iters <= 0) return;
 
-  if (use_tma) {
+  if constexpr (kTma) {
     if (tid == 0) {
       int4_mbar_init(smem.mbar, kStages);
     }
     __syncthreads();
   }
-  const uint64_t w_pol = use_tma ? int4_pol_evict_first() : 0ull;
+  const uint64_t w_pol = kTma ? int4_pol_evict_first() : 0ull;
+  const int q_iters = total_iters / grid_ctas;
 
   if (cta_id == 0) {
     const size_t total_bytes = static_cast<size_t>(total_iters) * kStepWBytes;
@@ -1778,6 +1783,19 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
       asm volatile("prefetch.global.L2 [%0];" ::"l"(W_packed + off));
     }
   }
+
+  auto step_w_ptr = [&](int w_iter) -> const uint8_t* {
+    if constexpr (kSkIlv && !kWholeSplit) {
+      const int loc = w_iter - iter_start;
+      const size_t slot = (loc < q_iters)
+          ? (static_cast<size_t>(loc) * grid_ctas + cta_id)
+          : static_cast<size_t>(static_cast<int64_t>(q_iters) * grid_ctas +
+                                (iter_start - static_cast<int64_t>(cta_id) * q_iters));
+      return W_packed + slot * kStepWBytes;
+    } else {
+      return W_packed + static_cast<size_t>(w_iter) * kStepWBytes;
+    }
+  };
 
   int cur_n = iter_start / num_kg;
   int cur_kg = iter_start - cur_n * num_kg;
@@ -1800,12 +1818,12 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
       if (need_fence) {
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
       }
-      int4_tma_bulk_w(&smem.w[st][0], W_packed + static_cast<size_t>(w_iter) * kStepWBytes, kStepWBytes, &smem.mbar[st], w_pol);
+      int4_tma_bulk_w(&smem.w[st][0], step_w_ptr(w_iter), kStepWBytes, &smem.mbar[st], w_pol);
     }
   };
 
   auto issue_w_only = [&](int st, int w_iter) {
-    const uint8_t* w_src = W_packed + static_cast<size_t>(w_iter) * kStepWBytes;
+    const uint8_t* w_src = step_w_ptr(w_iter);
     {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
       int4_cp_async16_w(sd, w_src + tid * 16);
@@ -1862,12 +1880,12 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
   };
 
   auto issue_next = [&](int st, bool need_fence) {
-    if (use_tma) {
+    if constexpr (kTma) {
       issue_w_tma_only(st, pre_iter, need_fence);
       issue_a_next(st);
       return;
     }
-    const uint8_t* w_src = W_packed + static_cast<size_t>(pre_iter) * kStepWBytes;
+    const uint8_t* w_src = step_w_ptr(pre_iter);
     {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
       int4_cp_async16_w(sd, w_src + tid * 16);
@@ -1883,7 +1901,7 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
   constexpr int kPreload = kStages - 1;  // 4
   const int preload = (my_iters < kPreload) ? my_iters : kPreload;
   if ((pdl_mode & 1) != 0) {
-    if (use_tma) {
+    if constexpr (kTma) {
       for (int i = 0; i < preload; ++i) {
         issue_w_tma_only(i, pre_iter + i, false);
       }
@@ -1946,7 +1964,7 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
     } else {
       asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     }
-    if (use_tma) {
+    if constexpr (kTma) {
       int4_mbar_wait(&smem.mbar[st], mbar_phase);
     }
     __syncthreads();
@@ -2300,16 +2318,35 @@ int int4_tma_enabled();
 bool int4_n32_pair_tma_for_shape(int N, int K) {
   const int num_n32 = N >> 5;
   const int n_blocks = N / kRowsPerCTA;
-  if (num_n32 <= 0 || num_n32 > 336 || (K & 127) != 0 || K > 8192 || (n_blocks % 48) == 0) return false;
-  auto eval = [&](int en) -> bool {
+  if (num_n32 <= 0 || num_n32 > 336 || (K & 127) != 0 || K > 8192) return false;
+  auto eval = [&](int en, int qkv_en) -> bool {
+    if ((n_blocks % 48) == 0 && (qkv_en == 0 || num_n32 > 288)) return false;
     return (en != 0) && (int4_mode() == 0) && (int4_query_mode() == 0) &&
            (int4_tma_enabled() != 0) && (int4_n32_sk_grid_for_shape(N, K) == 0);
   };
   if (int4_bench_dyn_env()) {
-    return eval(int4_read_env_int("MUSE_INT4_N32_PAIR_TMA", 1));
+    return eval(int4_read_env_int("MUSE_INT4_N32_PAIR_TMA", 1),
+                int4_read_env_int("MUSE_INT4_N32_PAIR_TMA_QKV", 1));
   }
   static const int cached_en = int4_read_env_int("MUSE_INT4_N32_PAIR_TMA", 1);
-  return eval(cached_en);
+  static const int cached_qkv = int4_read_env_int("MUSE_INT4_N32_PAIR_TMA_QKV", 1);
+  return eval(cached_en, cached_qkv);
+}
+
+int int4_fc_sk_ilv_grid(int N, int K) {
+  const int n_blocks = N / kRowsPerCTA;
+  const int num_kg = K >> 6;
+  if (n_blocks <= 0 || num_kg < 2 || K < 16384) return 0;
+  if (int4_mode() != 0 || int4_fc_mode() != 0) return 0;
+  const int en = int4_bench_dyn_env() ? int4_read_env_int("MUSE_INT4_FC_SK_ILV", 1) : []() {
+    static const int v = int4_read_env_int("MUSE_INT4_FC_SK_ILV", 1);
+    return v;
+  }();
+  if (en == 0) return 0;
+  const int sk_g = int4_sk_grid();
+  if (sk_g <= 0) return 0;
+  const int total_iters = n_blocks * num_kg;
+  return (sk_g < total_iters) ? sk_g : total_iters;
 }
 
 bool int4_k_major_for_shape(int N, int K) {
@@ -2427,12 +2464,26 @@ static void int4_set_carveout_nf4() {
   cudaFuncSetAttribute(int4_mma_gemm_n32_kernel<true, true, true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int4_mma_gemm_swiglu_kernel<false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int4_mma_gemm_swiglu_kernel<true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, true, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, true, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, true, false, kNf4, true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, true, false, kNf4, true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, true, false, kNf4, false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, true, false, kNf4, false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, true, false, kNf4, true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, true, false, kNf4, true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, true, false, kNf4, false, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, true, false, kNf4, false, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, false, kNf4, true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, false, kNf4, true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, false, kNf4, false, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, false, kNf4, false, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, false, kNf4, true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, false, kNf4, true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, false, kNf4, false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, false, kNf4, false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, true, kNf4, true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, true, kNf4, true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, true, kNf4, false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, true, kNf4, false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int4_mma_n32_tma_det_sk_kernel<false, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int4_mma_n32_tma_det_sk_kernel<true, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int4_mma_n32_tma_det_sk_kernel<false, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
@@ -2492,6 +2543,39 @@ static torch::Tensor launch_int4_gemm_impl(
     return C;
   }
 
+  const int fc_sk_ilv = int4_fc_sk_ilv_grid(static_cast<int>(N), static_cast<int>(K));
+  if (fc_sk_ilv > 0) {
+    float* p_ptr = nullptr;
+    float* mp_ptr = nullptr;
+    int* d_ptr = nullptr;
+    ensure_int4_sk_scratch(opts, n_blocks, p_ptr, mp_ptr, d_ptr, red_mode);
+    const __nv_bfloat16* a_arg = is_aux5 ? static_cast<const __nv_bfloat16*>(nullptr) : A_ptr;
+#define INT4_LAUNCH_FC_SK(M16, AUX5, TMA) \
+    int4_launch_pdl( \
+        int4_mma_streamk_kernel<M16, AUX5, false, kNf4, TMA, true>, dim3(fc_sk_ilv, 1, 1), kThreads, st, pdl_mode, \
+        a_arg, aux5, W_packed.data_ptr<uint8_t>(), reinterpret_cast<__nv_bfloat16*>(C.data_ptr()), \
+        p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, fc_sk_ilv, pdl_mode, allow_3part)
+    if (is_aux5) {
+      if (use_tma) {
+        if (use_m16) INT4_LAUNCH_FC_SK(true, true, true);
+        else INT4_LAUNCH_FC_SK(false, true, true);
+      } else {
+        if (use_m16) INT4_LAUNCH_FC_SK(true, true, false);
+        else INT4_LAUNCH_FC_SK(false, true, false);
+      }
+    } else {
+      if (use_tma) {
+        if (use_m16) INT4_LAUNCH_FC_SK(true, false, true);
+        else INT4_LAUNCH_FC_SK(false, false, true);
+      } else {
+        if (use_m16) INT4_LAUNCH_FC_SK(true, false, false);
+        else INT4_LAUNCH_FC_SK(false, false, false);
+      }
+    }
+#undef INT4_LAUNCH_FC_SK
+    return C;
+  }
+
   if (is_aux5 && fc_mode == 0 && sk_grid > 0) {
     const int total_iters = n_blocks * num_kg;
     const int grid = (sk_grid < total_iters) ? sk_grid : total_iters;
@@ -2499,18 +2583,34 @@ static torch::Tensor launch_int4_gemm_impl(
     float* mp_ptr = nullptr;
     int* d_ptr = nullptr;
     ensure_int4_sk_scratch(opts, n_blocks, p_ptr, mp_ptr, d_ptr, red_mode);
-    if (use_m16) {
-      int4_launch_pdl(
-          int4_mma_streamk_kernel<true, true, false, kNf4>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
-          static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
-          reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part, use_tma);
+    if (use_tma) {
+      if (use_m16) {
+        int4_launch_pdl(
+            int4_mma_streamk_kernel<true, true, false, kNf4, true, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+            static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
+            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+            p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+      } else {
+        int4_launch_pdl(
+            int4_mma_streamk_kernel<false, true, false, kNf4, true, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+            static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
+            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+            p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+      }
     } else {
-      int4_launch_pdl(
-          int4_mma_streamk_kernel<false, true, false, kNf4>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
-          static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
-          reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-          p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part, use_tma);
+      if (use_m16) {
+        int4_launch_pdl(
+            int4_mma_streamk_kernel<true, true, false, kNf4, false, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+            static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
+            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+            p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+      } else {
+        int4_launch_pdl(
+            int4_mma_streamk_kernel<false, true, false, kNf4, false, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+            static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
+            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+            p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+      }
     }
     return C;
   }
@@ -2599,32 +2699,64 @@ static torch::Tensor launch_int4_gemm_impl(
         int* d_ptr = nullptr;
         ensure_int4_sk_scratch(opts, n_blocks, p_ptr, mp_ptr, d_ptr, use_whole ? std::max(red_mode, 1) : red_mode);
         if (use_whole) {
-          if (use_m16) {
-            int4_launch_pdl(
-                int4_mma_streamk_kernel<true, false, true, kNf4>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
-                A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
-                reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-                p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part, use_tma);
+          if (use_tma) {
+            if (use_m16) {
+              int4_launch_pdl(
+                  int4_mma_streamk_kernel<true, false, true, kNf4, true, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                  A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+                  reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+                  p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+            } else {
+              int4_launch_pdl(
+                  int4_mma_streamk_kernel<false, false, true, kNf4, true, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                  A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+                  reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+                  p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+            }
           } else {
-            int4_launch_pdl(
-                int4_mma_streamk_kernel<false, false, true, kNf4>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
-                A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
-                reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-                p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part, use_tma);
+            if (use_m16) {
+              int4_launch_pdl(
+                  int4_mma_streamk_kernel<true, false, true, kNf4, false, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                  A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+                  reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+                  p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+            } else {
+              int4_launch_pdl(
+                  int4_mma_streamk_kernel<false, false, true, kNf4, false, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                  A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+                  reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+                  p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+            }
           }
         } else {
-          if (use_m16) {
-            int4_launch_pdl(
-                int4_mma_streamk_kernel<true, false, false, kNf4>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
-                A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
-                reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-                p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part, use_tma);
+          if (use_tma) {
+            if (use_m16) {
+              int4_launch_pdl(
+                  int4_mma_streamk_kernel<true, false, false, kNf4, true, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                  A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+                  reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+                  p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+            } else {
+              int4_launch_pdl(
+                  int4_mma_streamk_kernel<false, false, false, kNf4, true, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                  A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+                  reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+                  p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+            }
           } else {
-            int4_launch_pdl(
-                int4_mma_streamk_kernel<false, false, false, kNf4>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
-                A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
-                reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-                p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part, use_tma);
+            if (use_m16) {
+              int4_launch_pdl(
+                  int4_mma_streamk_kernel<true, false, false, kNf4, false, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                  A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+                  reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+                  p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+            } else {
+              int4_launch_pdl(
+                  int4_mma_streamk_kernel<false, false, false, kNf4, false, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                  A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+                  reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+                  p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+            }
           }
         }
         return C;
@@ -2745,8 +2877,10 @@ torch::Tensor int4_pack(torch::Tensor W, bool mse_opt = true) {
   auto out = torch::empty({total_bytes}, W.options().dtype(torch::kUInt8));
   dim3 grid(N / 8, K / 64);
   auto st = c10::cuda::getCurrentCUDAStream().stream();
+  const int fc_sk_ilv = int4_fc_sk_ilv_grid(N, K);
   const int n32_sk = int4_n32_sk_grid_for_shape(N, K);
-  const int k_major = (n32_sk > 0) ? (-n32_sk) : (int4_n32_pair_tma_for_shape(N, K) ? 2 : (int4_k_major_for_shape(N, K) ? 1 : 0));
+  const int k_major = (fc_sk_ilv > 0) ? (-(10000 + fc_sk_ilv))
+      : ((n32_sk > 0) ? (-n32_sk) : (int4_n32_pair_tma_for_shape(N, K) ? 2 : (int4_k_major_for_shape(N, K) ? 1 : 0)));
   if (int4_nf4_for_shape(K)) {
     if (mse_opt) {
       int4_pack_kernel<true, true><<<grid, 32, 0, st>>>(

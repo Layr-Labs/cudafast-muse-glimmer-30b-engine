@@ -53,6 +53,26 @@ def lib():
     if ss8 is not None:
         ss8.argtypes = [p, p, p, ctypes.c_int, p]
         ss8.restype = ctypes.c_int
+    pa_x = getattr(native, "muse_norm_glue_post_attn_xmma", None)
+    if pa_x is not None:
+        pa_x.argtypes = [ctypes.c_int] + [p] * 7 + [p]
+        pa_x.restype = ctypes.c_int
+    fg_x = getattr(native, "muse_norm_glue_post_ff_gate_xmma", None)
+    if fg_x is not None:
+        fg_x.argtypes = [ctypes.c_int] + [p] * 12 + [ctypes.c_int, p]
+        fg_x.restype = ctypes.c_int
+    ig_x = getattr(native, "muse_norm_glue_input_fp8_gate_xmma", None)
+    if ig_x is not None:
+        ig_x.argtypes = [ctypes.c_int, ctypes.c_int] + [p] * 7 + [ctypes.c_int, p]
+        ig_x.restype = ctypes.c_int
+    ms8_x = getattr(native, "muse_norm_glue_mul_sigmoid_fp8_xmma", None)
+    if ms8_x is not None:
+        ms8_x.argtypes = [p, p, p, p, ctypes.c_int, p]
+        ms8_x.restype = ctypes.c_int
+    ss8_x = getattr(native, "muse_norm_glue_mul_silu_slice_fp8_xmma", None)
+    if ss8_x is not None:
+        ss8_x.argtypes = [p, p, p, ctypes.c_int, p]
+        ss8_x.restype = ctypes.c_int
     pdl = getattr(native, "muse_norm_glue_set_pdl", None)
     if pdl is not None:
         pdl.argtypes = [ctypes.c_int]
@@ -174,3 +194,53 @@ def mul_silu_slice_fp8(gu, scale, out, rows, stream):
     err = fn(_ptr(gu), _ptr(scale), _ptr(out), int(rows), stream)
     if err:
         raise RuntimeError(f"muse_norm_glue mul_silu_slice_fp8 launch returned CUDA status {err}")
+
+
+def post_attn_xmma(rows, x, res, w_post, w_pre, scale, sumsq_out, out_fp8, stream):
+    fn = getattr(lib(), "muse_norm_glue_post_attn_xmma", None)
+    if fn is None:
+        raise RuntimeError("muse_norm_glue_post_attn_xmma unavailable")
+    err = fn(int(rows), _ptr(x), _ptr(res), _ptr(w_post), _ptr(w_pre), _ptr(scale),
+             _ptr(sumsq_out), _ptr(out_fp8), stream)
+    if err:
+        raise RuntimeError(f"muse_norm_glue post_attn_xmma launch returned CUDA status {err}")
+
+
+def post_ff_gate_xmma(rows, x, d, res, sumsq_x, w_post, w_ff, w_in, scale, out_bf16, out_fp8,
+                      gate_scale, out_gate, write_bf16, stream):
+    fn = getattr(lib(), "muse_norm_glue_post_ff_gate_xmma", None)
+    if fn is None:
+        raise RuntimeError("muse_norm_glue_post_ff_gate_xmma unavailable")
+    err = fn(int(rows), _ptr(x), _ptr(d), _ptr(res), _ptr(sumsq_x), _ptr(w_post), _ptr(w_ff), _ptr(w_in),
+             _ptr(scale), _ptr(out_bf16), _ptr(out_fp8), _ptr(gate_scale), _ptr(out_gate),
+             int(bool(write_bf16)), stream)
+    if err:
+        raise RuntimeError(f"muse_norm_glue post_ff_gate_xmma launch returned CUDA status {err}")
+
+
+def input_fp8_gate_xmma(warps, rows, x, w_in, scale, out_bf16, out_fp8, gate_scale, out_gate, write_bf16, stream):
+    fn = getattr(lib(), "muse_norm_glue_input_fp8_gate_xmma", None)
+    if fn is None:
+        raise RuntimeError("muse_norm_glue_input_fp8_gate_xmma unavailable")
+    err = fn(int(warps), int(rows), _ptr(x), _ptr(w_in), _ptr(scale), _ptr(out_bf16), _ptr(out_fp8),
+             _ptr(gate_scale), _ptr(out_gate), int(bool(write_bf16)), stream)
+    if err:
+        raise RuntimeError(f"muse_norm_glue input_fp8_gate_xmma launch returned CUDA status {err}")
+
+
+def mul_sigmoid_fp8_xmma(gate, attn, scale, out, rows, stream):
+    fn = getattr(lib(), "muse_norm_glue_mul_sigmoid_fp8_xmma", None)
+    if fn is None:
+        raise RuntimeError("muse_norm_glue_mul_sigmoid_fp8_xmma unavailable")
+    err = fn(_ptr(gate), _ptr(attn), _ptr(scale), _ptr(out), int(rows), stream)
+    if err:
+        raise RuntimeError(f"muse_norm_glue mul_sigmoid_fp8_xmma launch returned CUDA status {err}")
+
+
+def mul_silu_slice_fp8_xmma(gu, scale, out, rows, stream):
+    fn = getattr(lib(), "muse_norm_glue_mul_silu_slice_fp8_xmma", None)
+    if fn is None:
+        raise RuntimeError("muse_norm_glue_mul_silu_slice_fp8_xmma unavailable")
+    err = fn(_ptr(gu), _ptr(scale), _ptr(out), int(rows), stream)
+    if err:
+        raise RuntimeError(f"muse_norm_glue mul_silu_slice_fp8_xmma launch returned CUDA status {err}")

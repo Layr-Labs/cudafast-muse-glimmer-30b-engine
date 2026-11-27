@@ -9,10 +9,12 @@ import torch
 
 _HIDDEN = 6656
 _INNER = 19968
+_OPROJ_K = 4096
 _ROWS = 512
 _USE_WS = os.environ.get("MUSE_FP8_SWIGLU_WS", "1") != "0"
 _USE_FP8WS_ACCEL = os.environ.get("MUSE_FP8_SWIGLU_FP8WS", "1") != "0"
 _USE_DOWN = _USE_FP8WS_ACCEL and os.environ.get("MUSE_FP8_SWIGLU_DOWN", "1") != "0"
+_USE_OPROJ = _USE_FP8WS_ACCEL and os.environ.get("MUSE_FP8_OPROJ_256", "0") != "0"
 _USE_DUAL_A = _USE_FP8WS_ACCEL and os.environ.get("MUSE_FP8_SWIGLU_DUAL_A", "1") != "0"
 _USE_BF16_DUAL = _USE_FP8WS_ACCEL and os.environ.get("MUSE_FP8_SWIGLU_BF16_DUAL", "1") != "0"
 
@@ -21,6 +23,7 @@ _sms: dict[int, int] = {}
 _ws_ready: dict[int, bool] = {}
 _ws_admitted: dict[int, bool] = {}
 _down_admitted: dict[int, bool] = {}
+_oproj_admitted: dict[int, bool] = {}
 _dual_a_admitted: dict[int, bool] = {}
 _bf16_dual_admitted: dict[int, bool] = {}
 _scratch_buf: dict[int, torch.Tensor] = {}
@@ -232,38 +235,44 @@ def _install_fp8ws_accel() -> None:
 
         _fp8ws.set_pdl = _set_pdl_both
 
-    if _USE_DOWN and orig_gemm is not None:
+    if (_USE_DOWN or _USE_OPROJ) and orig_gemm is not None:
         def _gemm_accel(a: torch.Tensor, b: torch.Tensor, sa: torch.Tensor, sb: torch.Tensor) -> torch.Tensor:
+            k_dim = 0
+            admit_map = None
+            if b.ndim == 2 and a.ndim == 2 and b.shape[1] == _HIDDEN and a.shape[0] == _ROWS:
+                if _USE_DOWN and b.shape[0] == _INNER and a.shape[1] == _INNER:
+                    k_dim = _INNER
+                    admit_map = _down_admitted
+                elif _USE_OPROJ and b.shape[0] == _OPROJ_K and a.shape[1] == _OPROJ_K:
+                    k_dim = _OPROJ_K
+                    admit_map = _oproj_admitted
             if (
-                b.ndim == 2
-                and b.shape == (_INNER, _HIDDEN)
-                and a.ndim == 2
-                and a.shape == (_ROWS, _INNER)
+                k_dim != 0
                 and a.is_cuda
                 and b.device == a.device
                 and a.dtype == torch.float8_e4m3fn
                 and b.dtype == torch.float8_e4m3fn
                 and a.is_contiguous()
-                and b.stride() == (1, _INNER)
+                and b.stride() == (1, k_dim)
                 and ((a.data_ptr() | b.data_ptr()) & 15) == 0
             ):
                 dev_idx = a.device.index if a.device.index is not None else torch.cuda.current_device()
-                admitted = _down_admitted.get(dev_idx)
+                admitted = admit_map.get(dev_idx)
                 if admitted is None and not torch.cuda.is_current_stream_capturing():
                     admitted = False
                     if _ensure_ws_ready(dev_idx) and hasattr(_library, "muse_fp8_gemm_6656"):
                         try:
                             dev = a.device
                             st = torch.cuda.current_stream(dev_idx)
-                            g = torch.Generator(device=dev).manual_seed(20261127)
-                            a_r = (torch.randn((_ROWS, _INNER), device=dev, generator=g, dtype=torch.float32) * 12.0).clamp(
+                            g = torch.Generator(device=dev).manual_seed(20261127 + k_dim)
+                            a_r = (torch.randn((_ROWS, k_dim), device=dev, generator=g, dtype=torch.float32) * 12.0).clamp(
                                 -448.0, 448.0
                             ).to(torch.float8_e4m3fn)
                             bits = (
-                                torch.arange(_ROWS * _INNER, device=dev, dtype=torch.int64) * 7
-                                + torch.arange(_ROWS, device=dev, dtype=torch.int64).repeat_interleave(_INNER)
+                                torch.arange(_ROWS * k_dim, device=dev, dtype=torch.int64) * 7
+                                + torch.arange(_ROWS, device=dev, dtype=torch.int64).repeat_interleave(k_dim)
                             )
-                            a_b = (bits % 256).to(torch.uint8).view(torch.float8_e4m3fn).reshape(_ROWS, _INNER)
+                            a_b = (bits % 256).to(torch.uint8).view(torch.float8_e4m3fn).reshape(_ROWS, k_dim)
                             ok = True
                             for act in (a, a_r, a_b):
                                 ref = orig_gemm(act, b, sa, sb)
@@ -273,7 +282,7 @@ def _install_fp8ws_accel() -> None:
                                     break
                                 rc = _library.muse_fp8_gemm_6656(
                                     2, -1, act.data_ptr(), b.data_ptr(), sa.data_ptr(), sb.data_ptr(),
-                                    got.data_ptr(), _INNER, st.cuda_stream,
+                                    got.data_ptr(), k_dim, st.cuda_stream,
                                 )
                                 st.synchronize()
                                 if rc != 0 or not torch.equal(ref.view(torch.int16), got.view(torch.int16)):
@@ -282,13 +291,13 @@ def _install_fp8ws_accel() -> None:
                             admitted = ok
                         except Exception:  # noqa: BLE001
                             admitted = False
-                    _down_admitted[dev_idx] = admitted
+                    admit_map[dev_idx] = admitted
                 if admitted:
                     out = torch.empty((_ROWS, _HIDDEN), device=a.device, dtype=torch.bfloat16)
                     if (out.data_ptr() & 15) == 0:
                         rc = _library.muse_fp8_gemm_6656(
                             2, -1, a.data_ptr(), b.data_ptr(), sa.data_ptr(), sb.data_ptr(),
-                            out.data_ptr(), _INNER, torch.cuda.current_stream(dev_idx).cuda_stream,
+                            out.data_ptr(), k_dim, torch.cuda.current_stream(dev_idx).cuda_stream,
                         )
                         if rc == 0:
                             return out

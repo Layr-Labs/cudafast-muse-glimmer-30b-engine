@@ -137,14 +137,20 @@ __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* map, int 
 // (one per kw warp row). produce(g, dst, bar) (thread 0 only) starts the TMA copies of k-tile g into the stage at
 // shared address dst, completing on mbarrier bar; on_tile(t) runs before k-tile t. b_rd / s_rd: this thread's
 // int4 / int offsets of its codes and scales inside a stage, to which 4 b_row / s_row per k16 row are added.
+template <int V>
+struct IntTag {
+  static constexpr int value = V;
+};
+
 // A CTA may run several tiles back to back (kTilesPerCta): q0 is the position of this tile's first k-tile in the CTA's
 // k-tile stream of length `total`, and the copies keep running across the tile boundary.
 template <int MB, bool kPdl = false, bool kPdlProd = false, int kEpiExtraVal = 0, bool kSingleFa = false,
-          int kPdlLead = 8, class Produce, class OnTile>
+          int kPdlLead = 8, bool kUnroll4 = false, bool kAlignedNoCuts = false, class Produce, class OnTile>
 __device__ __forceinline__ void k_loop(
     float (&acc)[MB][2][2][4], const int iters, const int b_rd, const int b_row, const int s_rd, const int s_row,
     Produce&& produce, OnTile&& on_tile, const int q0 = 0, const int total_or_0 = 0,
     const float4* const resume = nullptr, const int t0 = 0) {
+  static_assert(!kUnroll4 || kStages == 4, "kUnroll4 assumes kStages == 4");
   const int total = total_or_0 ? total_or_0 : iters;
   extern __shared__ int4 sh[];
   const int tid = threadIdx.x;
@@ -153,8 +159,8 @@ __device__ __forceinline__ void k_loop(
   const int kw = warp >> 2;  // k16 pair of each k-tile: chain A0 / A1
   // Stages start on 1 KiB boundaries of the shared window (TMA swizzles by shared address).
   const uint32_t sbase = (static_cast<uint32_t>(__cvta_generic_to_shared(sh)) + 1023u) & ~1023u;
-  const int4* shb = reinterpret_cast<const int4*>(
-      reinterpret_cast<const char*>(sh) + (sbase - static_cast<uint32_t>(__cvta_generic_to_shared(sh))));
+  const uint32_t b_base = sbase + static_cast<uint32_t>(4 * (b_rd + b_row * (2 * kw)));
+  const uint32_t sc_base = sbase + static_cast<uint32_t>(4 * (s_rd + s_row * (2 * kw)));
   // ldmatrix: m-block j of k-half kk sits at 16 (a_rd[kk] + 128 j) (the swizzle term does not depend on j)
   const uint32_t a_rd0 = 16 * (8 * (lane & 15) + (((lane >> 4) + 4 * kw) ^ (lane & 7)));
   const uint32_t a_rd1 = 16 * (8 * (lane & 15) + (((lane >> 4) + 4 * kw + 2) ^ (lane & 7)));
@@ -176,7 +182,7 @@ __device__ __forceinline__ void k_loop(
   // occupant (k-tile g - kStages).
   auto start_copy = [&](const int g) {
     const int sg = g & (kStages - 1);
-    if (g >= t0 + kStages) mbar_wait(empty_bar + 8 * sg, ((g - kStages) / kStages) & 1);
+    if (g >= t0 + kStages) mbar_wait(empty_bar + 8 * sg, ((g - kStages) >> 2) & 1);
     produce(g, sbase + sg * kStageBytes, full_bar + 8 * sg, 0);
   };
   if constexpr (kPdl) {
@@ -209,25 +215,30 @@ __device__ __forceinline__ void k_loop(
     }
   }
 
+  // down_tile (kSingleBb=true) wins -1.17 ms from single-bb deferred dequant + lower reg pressure;
+  // gateup_ilv (kSingleBb=false) wins -0.94 ms from double-buffered bb[2][2][2] + 4-stage unroll.
+  constexpr bool kSingleBb = !(kUnroll4 && kAlignedNoCuts);
   FragA fa[kSingleFa ? 1 : 2][MB];
-  int2 fbq[2];
-  int fsq[2];
-  FragB bb[2][2][2];  // dequantized B operands [k-half][32-column quarter][n8 block]
+  int2 fbq[kSingleBb ? 1 : 2];
+  int fsq[kSingleBb ? 1 : 2];
+  FragB bb[kSingleBb ? 1 : 2][2][2];
 
-  auto load_bs = [&](const int o, const int stage) {
-    const int4* sa = shb + (kStageBytes / 16) * stage;
-    const int g = 2 * kw + o;
-    fbq[o] = *reinterpret_cast<const int2*>(reinterpret_cast<const int*>(sa) + b_rd + b_row * g);
-    fsq[o] = reinterpret_cast<const int*>(sa)[s_rd + s_row * g];
+  auto load_bs_off = [&](const int o, const uint32_t stage_off) {
+    const int idx = kSingleBb ? 0 : o;
+    const uint32_t ba = b_base + stage_off + static_cast<uint32_t>(4 * b_row * o);
+    const uint32_t sa = sc_base + stage_off + static_cast<uint32_t>(4 * s_row * o);
+    asm volatile("ld.shared.v2.b32 {%0, %1}, [%2];" : "=r"(fbq[idx].x), "=r"(fbq[idx].y) : "r"(ba));
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(fsq[idx]) : "r"(sa));
   };
   auto dequant_to = [&](const int o) {
+    const int idx = kSingleBb ? 0 : o;
     nv_bfloat162 sc[2];
-    dequant_fp8_scales<nv_bfloat162, vllm::kFE4M3fn.id()>(fsq[o], sc);
+    dequant_fp8_scales<nv_bfloat162, vllm::kFE4M3fn.id()>(fsq[idx], sc);
 #pragma unroll
     for (int jj = 0; jj < 2; jj++) {
-      FragB& b0 = bb[o][jj][0];
-      FragB& b1 = bb[o][jj][1];
-      const int bq1 = jj == 0 ? fbq[o].x : fbq[o].y;
+      FragB& b0 = bb[idx][jj][0];
+      FragB& b1 = bb[idx][jj][1];
+      const int bq1 = jj == 0 ? fbq[idx].x : fbq[idx].y;
       // The four registers of dequant<.., kFE2M1f, true>(bq1 << 8) and (bq1), bit for bit: per register the two
       // nibbles are isolated, copied to the sign position and to the exponent/mantissa position by one multiply
       // (the copies cannot overlap) and masked: bit 15 <- sign, bits 8:6 <- e1 e0 m, the same in the upper half.
@@ -255,33 +266,58 @@ __device__ __forceinline__ void k_loop(
 #pragma unroll
     for (int i = 0; i < MB * 16; i++) reinterpret_cast<float*>(acc)[i] = 0.0f;
   }
-  mbar_wait(full_bar + 8 * (q0 & (kStages - 1)), (q0 / kStages) & 1);
+  const int s_init = kAlignedNoCuts ? 0 : (q0 & (kStages - 1));
+  const uint32_t s_init_off = static_cast<uint32_t>(kStageBytes) * static_cast<uint32_t>(s_init);
+  mbar_wait(full_bar + 8 * s_init, (q0 >> 2) & 1);
 #pragma unroll
-  for (int j = 0; j < MB; j++) ldsm4(fa[0][j], sbase + kStageBytes * (q0 & (kStages - 1)) + a_rd0 + 2048 * j);
-  load_bs(0, q0 & (kStages - 1));
+  for (int j = 0; j < MB; j++) ldsm4(fa[0][j], sbase + s_init_off + a_rd0 + 2048 * j);
+  load_bs_off(0, s_init_off);
   dequant_to(0);
 
-  // on_tile(t) returns the k-tile before which it wants to run next: the loop over the k-tiles in between carries
-  // none of its code (compiled into the loop it becomes predicated instructions that every k-tile pays for).
-#pragma unroll 1
-  for (int t = t0; t < iters;) {
-  const int stop = on_tile(t);
-#pragma unroll 1
-  for (; t < stop; t++) {
+  const int pdl_t = (iters - kPdlLead > t0) ? (iters - kPdlLead) : t0;
+
+  // One compile-time stage step (s = kStep, ns = (kStep + 1) & 3) for the 4-stage unrolled gateup fast path.
+  // Uses double-buffered bb[2][2][2] (kSingleBb=false, 112.62 ms on gateup_ilv).
+  auto run_step_const = [&](const int t_base, const int par, auto step_tag) {
+    constexpr int kStep = decltype(step_tag)::value;
+    constexpr int kS = kStep;
+    constexpr int kNs = (kStep + 1) & 3;
+    constexpr int kSg = (kStep + kDist) & 3;
+    constexpr uint32_t kSOff = static_cast<uint32_t>(kStageBytes * kS);
+    constexpr uint32_t kNsOff = static_cast<uint32_t>(kStageBytes * kNs);
     if constexpr (kPdlProd) {
-      if (t == ((iters - kPdlLead > t0) ? (iters - kPdlLead) : t0) && q0 + iters == total) pdl_launch_dependents();
+      if constexpr (kAlignedNoCuts) {
+        if constexpr (kStep == 0) {
+          if (t_base == pdl_t && q0 + iters == total) pdl_launch_dependents();
+        }
+      } else {
+        if (t_base + kStep == pdl_t && q0 + iters == total) pdl_launch_dependents();
+      }
     }
-    const int q = q0 + t;
-    const int s = q & (kStages - 1);
-    const int ns = (q + 1) & (kStages - 1);
-    if (tid == 0 && q + kDist < total) start_copy(q + kDist);
-    // k-half 0 of k-tile t (operands already in registers); meanwhile k-half 1 of the same stage is loaded.
-    load_bs(1, s);
-#ifdef MARLINW_TMA_GATEUP
+    const int q_chunk = q0 + t_base;
+    const int g = q_chunk + kStep + kDist;
+    if constexpr (kAlignedNoCuts && kStep == 0) {
+      if (tid == 0) {
+        if (q_chunk > 0) mbar_wait(empty_bar + 8 * kSg, par ^ 1);
+        produce(g, sbase + kSg * kStageBytes, full_bar + 8 * kSg, 0);
+      }
+    } else {
+      if (tid == 0 && g < total) {
+        if constexpr (kStep == 0) {
+          if (q_chunk > 0) mbar_wait(empty_bar + 8 * kSg, par ^ 1);
+        } else {
+          mbar_wait(empty_bar + 8 * kSg, par);
+        }
+        produce(g, sbase + kSg * kStageBytes, full_bar + 8 * kSg, 0);
+      }
+    }
+    load_bs_off(1, kSOff);
     dequant_to(1);
-#endif
+    const int next_par = (kStep == 3) ? (par ^ 1) : par;
+    const bool has_next = (kStep < 3) ? true : (t_base + 4 < iters);
+    constexpr int b1i = kSingleBb ? 0 : 1;
     if constexpr (kSingleFa) {
-      const uint32_t sa = sbase + kStageBytes * s + a_rd1;
+      const uint32_t sa = sbase + kSOff + a_rd1;
 #pragma unroll
       for (int i = 0; i < MB; i++) {
         mma16(fa[0][i], bb[0][0][0], acc[i][0][0]);
@@ -291,30 +327,103 @@ __device__ __forceinline__ void k_loop(
         ldsm4(fa[0][i], sa + 2048 * i);
       }
       __syncwarp();
-#ifndef MARLINW_TMA_GATEUP
-      dequant_to(1);
-#endif
-      if (lane == 0) mbar_arrive(empty_bar + 8 * s);
-      const bool has_next = (t + 1 < iters);
+      if (lane == 0) mbar_arrive(empty_bar + 8 * kS);
       if (has_next) {
-        mbar_wait(full_bar + 8 * ns, ((q + 1) / kStages) & 1);
-        load_bs(0, ns);
+        mbar_wait(full_bar + 8 * kNs, next_par);
+        load_bs_off(0, kNsOff);
         dequant_to(0);
       }
       {
-        const uint32_t sa0 = sbase + kStageBytes * ns + a_rd0;
+        const uint32_t sa0 = sbase + kNsOff + a_rd0;
 #pragma unroll
         for (int i = 0; i < MB; i++) {
-          mma16(fa[0][i], bb[1][0][0], acc[i][0][0]);
-          mma16(fa[0][i], bb[1][0][1], acc[i][0][1]);
-          mma16(fa[0][i], bb[1][1][0], acc[i][1][0]);
-          mma16(fa[0][i], bb[1][1][1], acc[i][1][1]);
+          mma16(fa[0][i], bb[b1i][0][0], acc[i][0][0]);
+          mma16(fa[0][i], bb[b1i][0][1], acc[i][0][1]);
+          mma16(fa[0][i], bb[b1i][1][0], acc[i][1][0]);
+          mma16(fa[0][i], bb[b1i][1][1], acc[i][1][1]);
           if (has_next) ldsm4(fa[0][i], sa0 + 2048 * i);
         }
       }
     } else {
       {
-        const uint32_t sa = sbase + kStageBytes * s + a_rd1;
+        const uint32_t sa = sbase + kSOff + a_rd1;
+#pragma unroll
+        for (int i = 0; i < MB; i++) {
+          mma16(fa[0][i], bb[0][0][0], acc[i][0][0]);
+          mma16(fa[0][i], bb[0][0][1], acc[i][0][1]);
+          ldsm4(fa[1][i], sa + 2048 * i);
+        }
+      }
+      __syncwarp();
+      if (lane == 0) mbar_arrive(empty_bar + 8 * kS);
+#pragma unroll
+      for (int i = 0; i < MB; i++) {
+        mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
+        mma16(fa[0][i], bb[0][1][1], acc[i][1][1]);
+      }
+      if (has_next) mbar_wait(full_bar + 8 * kNs, next_par);
+      load_bs_off(0, kNsOff);
+      dequant_to(0);
+      {
+        const uint32_t sa = sbase + kNsOff + a_rd0;
+#pragma unroll
+        for (int i = 0; i < MB; i++) {
+          mma16(fa[1][i], bb[b1i][0][0], acc[i][0][0]);
+          mma16(fa[1][i], bb[b1i][0][1], acc[i][0][1]);
+          ldsm4(fa[0][i], sa + 2048 * i);
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < MB; i++) {
+        mma16(fa[1][i], bb[b1i][1][0], acc[i][1][0]);
+        mma16(fa[1][i], bb[b1i][1][1], acc[i][1][1]);
+      }
+    }
+  };
+
+  auto run_step_scalar = [&](const int t) {
+    const int q = q0 + t;
+    const int s = q & (kStages - 1);
+    const int ns = (q + 1) & (kStages - 1);
+    const uint32_t s_off = static_cast<uint32_t>(kStageBytes) * static_cast<uint32_t>(s);
+    const uint32_t ns_off = static_cast<uint32_t>(kStageBytes) * static_cast<uint32_t>(ns);
+    if (tid == 0 && q + kDist < total) start_copy(q + kDist);
+    // Issue k-half 1 weight load from stage s before HMMA+ldsm4+mbar_arrive; defer E2M1 dequant
+    // past mbar_arrive & bb's last k-half 0 use (hides LDS latency, releases stage earlier, saves 8+ regs).
+    load_bs_off(1, s_off);
+    if constexpr (kSingleFa) {
+      const uint32_t sa = sbase + s_off + a_rd1;
+#pragma unroll
+      for (int i = 0; i < MB; i++) {
+        mma16(fa[0][i], bb[0][0][0], acc[i][0][0]);
+        mma16(fa[0][i], bb[0][0][1], acc[i][0][1]);
+        mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
+        mma16(fa[0][i], bb[0][1][1], acc[i][1][1]);
+        ldsm4(fa[0][i], sa + 2048 * i);
+      }
+      __syncwarp();
+      if (lane == 0) mbar_arrive(empty_bar + 8 * s);
+      dequant_to(1);
+      const bool has_next = (t + 1 < iters);
+      if (has_next) {
+        mbar_wait(full_bar + 8 * ns, ((q + 1) >> 2) & 1);
+        load_bs_off(0, ns_off);
+      }
+      {
+        const uint32_t sa0 = sbase + ns_off + a_rd0;
+#pragma unroll
+        for (int i = 0; i < MB; i++) {
+          mma16(fa[0][i], bb[0][0][0], acc[i][0][0]);
+          mma16(fa[0][i], bb[0][0][1], acc[i][0][1]);
+          mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
+          mma16(fa[0][i], bb[0][1][1], acc[i][1][1]);
+          if (has_next) ldsm4(fa[0][i], sa0 + 2048 * i);
+        }
+      }
+      if (has_next) dequant_to(0);
+    } else {
+      {
+        const uint32_t sa = sbase + s_off + a_rd1;
 #pragma unroll
         for (int i = 0; i < MB; i++) {
           mma16(fa[0][i], bb[0][0][0], acc[i][0][0]);
@@ -324,34 +433,65 @@ __device__ __forceinline__ void k_loop(
       }
       __syncwarp();
       if (lane == 0) mbar_arrive(empty_bar + 8 * s);  // warp-aggregated empty signal
-#ifndef MARLINW_TMA_GATEUP
-      dequant_to(1);
-#endif
 #pragma unroll
       for (int i = 0; i < MB; i++) {
         mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
         mma16(fa[0][i], bb[0][1][1], acc[i][1][1]);
       }
+      dequant_to(1);
       // k-half 1 of k-tile t; meanwhile k-half 0 of k-tile t + 1 is loaded.
-      if (t + 1 < iters) mbar_wait(full_bar + 8 * ns, ((q + 1) / kStages) & 1);
-      load_bs(0, ns);
-      dequant_to(0);
+      if (t + 1 < iters) mbar_wait(full_bar + 8 * ns, ((q + 1) >> 2) & 1);
+      load_bs_off(0, ns_off);
       {
-        const uint32_t sa = sbase + kStageBytes * ns + a_rd0;
+        const uint32_t sa = sbase + ns_off + a_rd0;
 #pragma unroll
         for (int i = 0; i < MB; i++) {
-          mma16(fa[1][i], bb[1][0][0], acc[i][0][0]);
-          mma16(fa[1][i], bb[1][0][1], acc[i][0][1]);
+          mma16(fa[1][i], bb[0][0][0], acc[i][0][0]);
+          mma16(fa[1][i], bb[0][0][1], acc[i][0][1]);
           ldsm4(fa[0][i], sa + 2048 * i);
         }
       }
 #pragma unroll
       for (int i = 0; i < MB; i++) {
-        mma16(fa[1][i], bb[1][1][0], acc[i][1][0]);
-        mma16(fa[1][i], bb[1][1][1], acc[i][1][1]);
+        mma16(fa[1][i], bb[0][1][0], acc[i][1][0]);
+        mma16(fa[1][i], bb[0][1][1], acc[i][1][1]);
+      }
+      dequant_to(0);
+    }
+  };
+
+  if constexpr (kUnroll4 && kAlignedNoCuts) {
+    int par = (q0 >> 2) & 1;
+#pragma unroll 1
+    for (int t = 0; t < iters; t += kStages) {
+      run_step_const(t, par, IntTag<0>{});
+      run_step_const(t, par, IntTag<1>{});
+      run_step_const(t, par, IntTag<2>{});
+      run_step_const(t, par, IntTag<3>{});
+      par ^= 1;
+    }
+  } else {
+    // on_tile(t) returns the k-tile before which it wants to run next: hoist pdl_launch_dependents()
+    // to segment boundaries as well so the inner scalar loop carries zero PDL compare/branch overhead.
+    bool pdl_armed = kPdlProd && (q0 + iters == total);
+#pragma unroll 1
+    for (int t = t0; t < iters;) {
+      int stop = on_tile(t);
+      if constexpr (kPdlProd) {
+        if (pdl_armed) {
+          if (t == pdl_t) {
+            pdl_launch_dependents();
+            pdl_armed = false;
+          } else if (pdl_t > t && pdl_t < stop) {
+            stop = pdl_t;
+          }
+        }
+      }
+#pragma unroll 1
+      for (; t < stop; t++) {
+        run_step_scalar(t);
       }
     }
-  }
   }
 }
 
@@ -374,12 +514,8 @@ __device__ __forceinline__ uint32_t sel4_u32(uint32_t v0, uint32_t v1, uint32_t 
 constexpr int kColumns = 6656;
 constexpr int kInner = 19968;
 
-template <int V>
-struct IntTag {
-  static constexpr int value = V;
-};
-
-template <int MB, bool kLater, int kCols, bool kShflEpi = true, int kPdlMode = 0, int kPdlLead = 8>  // kPdlMode: 0=off, 1=prod-only, 2=dual
+template <int MB, bool kLater, int kCols, bool kShflEpi = true, int kPdlMode = 0, int kPdlLead = 8,
+          bool kWeightEf = (kCols == 6656)>  // kPdlMode: 0=off, 1=prod-only, 2=dual
 __device__ __forceinline__ void down_tile(
     const CUtensorMap* tmA, const CUtensorMap* tmB, const CUtensorMap* tmS, int4* __restrict__ C0,
     float4* __restrict__ scratch, const float gs, const int row0, const int col, const int slot, const int cut_a,
@@ -397,8 +533,9 @@ __device__ __forceinline__ void down_tile(
 
   float acc[MB][2][2][4];
   const int n_first = 4 - ((row0 >> 4) & 3);  // m-blocks in the chunk containing row0
-  float4* my_scratch = scratch + ((size_t)slot * 256 + tid) * 32;
-  float4* my_scratch2 = scratch + ((size_t)(slot + 1) * 256 + tid) * 32;
+  // Coalesced K-cut scratch layout: slot_base[(i * 4 + e) * kThreads + tid] (full 512 B / warp transactions).
+  float4* const slot_base = scratch + static_cast<size_t>(slot) * (kThreads * 32);
+  float4* const slot_base2 = scratch + static_cast<size_t>(slot + 1) * (kThreads * 32);
   // K pieces. piece = k0 | role << 10 | index << 12: this CTA runs k-tiles [k0, k0 + k_tiles) of its tile (k0 a
   // multiple of 8). role 0: the whole tile. 1: first piece (chains from +0, state stored at the end). 2: middle piece
   // (state loaded, state stored). 3: last piece (state loaded, epilogue). The state is every thread's accumulator
@@ -418,28 +555,28 @@ __device__ __forceinline__ void down_tile(
     }
   }
   // Runs before k-tile t; returns the k-tile before which it has to run again (the next cut, or the end).
+  // Thread-private registers & thread-private global scratch lanes: no CTA barrier needed here (epilogue reads
+  // scratch strictly after the post-k_loop __syncthreads(), and K-split handoffs publish via __threadfence()).
   auto cuts = [&](const int t) {
     if (t == cut_a || t == cut_b || (kTwoCuts && (t == cut_a2 || t == cut_b2))) {
-      __syncthreads();
 #pragma unroll
       for (int i = 0; i < MB; i++) {
         const int ci = i < n_first ? cut_a : cut_b;
         if (ci == t) {
 #pragma unroll
-          for (int e = 0; e < 4; e++) my_scratch[i * 4 + e] = reinterpret_cast<float4*>(acc[i])[e];
+          for (int e = 0; e < 4; e++) slot_base[(i * 4 + e) * kThreads + tid] = reinterpret_cast<float4*>(acc[i])[e];
 #pragma unroll
           for (int e = 0; e < 16; e++) reinterpret_cast<float*>(acc[i])[e] = 0.0f;
         } else if constexpr (kTwoCuts) {
           const int ci2 = i < n_first ? cut_a2 : cut_b2;
           if (ci2 == t) {
 #pragma unroll
-            for (int e = 0; e < 4; e++) my_scratch2[i * 4 + e] = reinterpret_cast<float4*>(acc[i])[e];
+            for (int e = 0; e < 4; e++) slot_base2[(i * 4 + e) * kThreads + tid] = reinterpret_cast<float4*>(acc[i])[e];
 #pragma unroll
             for (int e = 0; e < 16; e++) reinterpret_cast<float*>(acc[i])[e] = 0.0f;
           }
         }
       }
-      __syncthreads();
     }
     int stop = k1;
     if (cut_a > t && cut_a < stop) stop = cut_a;
@@ -454,7 +591,7 @@ __device__ __forceinline__ void down_tile(
     if (mode == 0) {
       mbar_expect_tx(bar, MB * 16 * 128 + kBBytes + kSBytes);
       tma2d_hint(dst, tmA, 128 * g, row0, bar, tma_pol_el());                         // bytes, rows
-      if constexpr (kCols == 6656) {
+      if constexpr (kWeightEf) {
         tma2d_hint(dst + kABytes, tmB, 256 * col, 4 * g, bar, tma_pol_ef());          // uint32, k16 rows
         tma2d_hint(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar, tma_pol_ef());// bytes, k16 rows
       } else {
@@ -463,7 +600,7 @@ __device__ __forceinline__ void down_tile(
       }
     } else if (mode == 1) {
       mbar_expect_tx_only(bar, kBBytes + kSBytes);
-      if constexpr (kCols == 6656) {
+      if constexpr (kWeightEf) {
         tma2d_hint(dst + kABytes, tmB, 256 * col, 4 * g, bar, tma_pol_ef());
         tma2d_hint(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar, tma_pol_ef());
       } else {
@@ -476,7 +613,8 @@ __device__ __forceinline__ void down_tile(
     }
   };
   // codes: int4 (64 g + 32 nb + lane), int2 sh2 of it; scales: int 32 g + 2 (8 nb + lane / 4) + sh2
-  k_loop<MB, (kPdlMode == 2), (kPdlMode != 0), 0, false, kPdlLead>(
+  // Keep kUnroll4=false on down_tile (avoids +1.62 ms icache/scheduling regression in down<6656>).
+  k_loop<MB, (kPdlMode == 2), (kPdlMode != 0), 0, false, kPdlLead, false, false>(
       acc, k1, kABytes / 4 + 4 * (32 * nb + lane) + 2 * sh2, 256,
       (kABytes + kBBytes) / 4 + 2 * (8 * nb + (lane >> 2)) + sh2, 32, produce, cuts, 0, 0,
       kLater ? scratch + (size_t)(piece >> 12) * (kThreads * 32) : nullptr, k0);
@@ -530,10 +668,10 @@ __device__ __forceinline__ void down_tile(
         }
       }
       if (cut_a >= 0 || cut_b >= 0) {
-        const float4* s0 = scratch + ((size_t)slot * 256 + t128) * 32;
-        const float4* s1 = scratch + ((size_t)slot * 256 + t128 + 128) * 32;
-        const float4* s0_2 = scratch + ((size_t)(slot + 1) * 256 + t128) * 32;
-        const float4* s1_2 = scratch + ((size_t)(slot + 1) * 256 + t128 + 128) * 32;
+        const float4* const s0 = scratch + static_cast<size_t>(slot) * (kThreads * 32) + t128;
+        const float4* const s1 = s0 + 128;
+        const float4* const s0_2 = scratch + static_cast<size_t>(slot + 1) * (kThreads * 32) + t128;
+        const float4* const s1_2 = s0_2 + 128;
 #pragma unroll
         for (int ii = 0; ii < 4; ii++) {
           const int i = kBase + ii;
@@ -544,8 +682,9 @@ __device__ __forceinline__ void down_tile(
               if (ci2 >= 0) {
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
-                  const float4 x = s0[i * 4 + e], y = s1[i * 4 + e];
-                  const float4 x2 = s0_2[i * 4 + e], y2 = s1_2[i * 4 + e];
+                  const int off = (i * 4 + e) * kThreads;
+                  const float4 x = s0[off], y = s1[off];
+                  const float4 x2 = s0_2[off], y2 = s1_2[off];
                   float* c = reinterpret_cast<float*>(acc[kBase + ii]) + 4 * e;
                   c[0] = (x.x + y.x) + ((x2.x + y2.x) + c[0]);
                   c[1] = (x.y + y.y) + ((x2.y + y2.y) + c[1]);
@@ -555,7 +694,8 @@ __device__ __forceinline__ void down_tile(
               } else {
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
-                  const float4 x = s0[i * 4 + e], y = s1[i * 4 + e];
+                  const int off = (i * 4 + e) * kThreads;
+                  const float4 x = s0[off], y = s1[off];
                   float* c = reinterpret_cast<float*>(acc[kBase + ii]) + 4 * e;
                   c[0] = (x.x + y.x) + c[0];
                   c[1] = (x.y + y.y) + c[1];
@@ -566,7 +706,8 @@ __device__ __forceinline__ void down_tile(
             } else {
 #pragma unroll
               for (int e = 0; e < 4; e++) {
-                const float4 x = s0[i * 4 + e], y = s1[i * 4 + e];
+                const int off = (i * 4 + e) * kThreads;
+                const float4 x = s0[off], y = s1[off];
                 float* c = reinterpret_cast<float*>(acc[kBase + ii]) + 4 * e;
                 c[0] = (x.x + y.x) + c[0];
                 c[1] = (x.y + y.y) + c[1];
@@ -646,10 +787,10 @@ __device__ __forceinline__ void down_tile(
         c[0] += r.x; c[1] += r.y; c[2] += r.z; c[3] += r.w;
       }
       if (cut_a >= 0 || cut_b >= 0) {
-        const float4* s0 = scratch + ((size_t)slot * 256 + tid) * 32;
-        const float4* s1 = scratch + ((size_t)slot * 256 + tid + 128) * 32;
-        const float4* s0_2 = scratch + ((size_t)(slot + 1) * 256 + tid) * 32;
-        const float4* s1_2 = scratch + ((size_t)(slot + 1) * 256 + tid + 128) * 32;
+        const float4* const s0 = scratch + static_cast<size_t>(slot) * (kThreads * 32) + tid;
+        const float4* const s1 = s0 + 128;
+        const float4* const s0_2 = scratch + static_cast<size_t>(slot + 1) * (kThreads * 32) + tid;
+        const float4* const s1_2 = s0_2 + 128;
 #pragma unroll
         for (int i = 0; i < MB; i++) {
           const int ci = i < n_first ? cut_a : cut_b;
@@ -659,8 +800,9 @@ __device__ __forceinline__ void down_tile(
               if (ci2 >= 0) {
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
-                  const float4 x = s0[i * 4 + e], y = s1[i * 4 + e];
-                  const float4 x2 = s0_2[i * 4 + e], y2 = s1_2[i * 4 + e];
+                  const int off = (i * 4 + e) * kThreads;
+                  const float4 x = s0[off], y = s1[off];
+                  const float4 x2 = s0_2[off], y2 = s1_2[off];
                   float* c = reinterpret_cast<float*>(acc[i]) + 4 * e;
                   c[0] = (x.x + y.x) + ((x2.x + y2.x) + c[0]);
                   c[1] = (x.y + y.y) + ((x2.y + y2.y) + c[1]);
@@ -670,7 +812,8 @@ __device__ __forceinline__ void down_tile(
               } else {
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
-                  const float4 x = s0[i * 4 + e], y = s1[i * 4 + e];
+                  const int off = (i * 4 + e) * kThreads;
+                  const float4 x = s0[off], y = s1[off];
                   float* c = reinterpret_cast<float*>(acc[i]) + 4 * e;
                   c[0] = (x.x + y.x) + c[0];
                   c[1] = (x.y + y.y) + c[1];
@@ -681,7 +824,8 @@ __device__ __forceinline__ void down_tile(
             } else {
 #pragma unroll
               for (int e = 0; e < 4; e++) {
-                const float4 x = s0[i * 4 + e], y = s1[i * 4 + e];
+                const int off = (i * 4 + e) * kThreads;
+                const float4 x = s0[off], y = s1[off];
                 float* c = reinterpret_cast<float*>(acc[i]) + 4 * e;
                 c[0] = (x.x + y.x) + c[0];
                 c[1] = (x.y + y.y) + c[1];
@@ -746,7 +890,7 @@ __device__ __forceinline__ void down_tile(
 }
 
 
-template <int kCols, bool kShflEpi = true, int kPdlMode = 0>
+template <int kCols, bool kShflEpi = true, int kPdlMode = 0, bool kWeightEf = (kCols == 6656)>
 __global__ void __launch_bounds__(kThreads, 1) down(
     const __grid_constant__ CUtensorMap tmA8, const __grid_constant__ CUtensorMap tmB,
     const __grid_constant__ CUtensorMap tmS, int4* __restrict__ C0, float4* __restrict__ scratch,
@@ -758,10 +902,12 @@ __global__ void __launch_bounds__(kThreads, 1) down(
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmS) : "memory");
   }
-  if (blockIdx.x == 0 && w_raw != nullptr) {
+  if (w_raw != nullptr) {
     constexpr size_t kTpf = 2048u << 10;
-    for (size_t off = static_cast<size_t>(threadIdx.x) * kTpf; off < w_bytes;
-         off += static_cast<size_t>(kThreads) * kTpf) {
+    const size_t g_step = static_cast<size_t>(gridDim.x) * kTpf;
+    for (size_t off = (static_cast<size_t>(blockIdx.x) +
+                       static_cast<size_t>(threadIdx.x) * static_cast<size_t>(gridDim.x)) * kTpf;
+         off < w_bytes; off += static_cast<size_t>(kThreads) * g_step) {
       asm volatile("prefetch.global.L2 [%0];" ::"l"(w_raw + off));
     }
   }
@@ -772,13 +918,13 @@ __global__ void __launch_bounds__(kThreads, 1) down(
   const int cut_b2 = (kCols == 4096) ? static_cast<int>(static_cast<int16_t>((w0.z >> 16) & 0xFFFF)) : -1;
   if constexpr (kCols == 6656) {
     if (w1.w & 2048)
-      down_tile<8, true, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
+      down_tile<8, true, kCols, kShflEpi, kPdlMode, 8, kWeightEf>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
                          reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
     else
-      down_tile<8, false, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
+      down_tile<8, false, kCols, kShflEpi, kPdlMode, 8, kWeightEf>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
                           reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
   } else {
-    down_tile<8, false, kCols, kShflEpi, kPdlMode>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
+    down_tile<8, false, kCols, kShflEpi, kPdlMode, 8, kWeightEf>(&tmA8, &tmB, &tmS, C0, scratch, gs, w0.x, w0.y, w0.w, w1.x, w1.y, w1.z, w1.w,
                         reinterpret_cast<volatile int*>(work + 2 * gridDim.x), cut_a2, cut_b2);
   }
 }
@@ -798,17 +944,19 @@ __global__ void __launch_bounds__(kThreads, 1) down_dual(
     int4* __restrict__ work,
     const uint8_t* __restrict__ wq_raw, size_t wq_bytes,
     const uint8_t* __restrict__ wg_raw, size_t wg_bytes) {
-  if (blockIdx.x == 0) {
+  {
     constexpr size_t kTpf = 2048u << 10;
+    const size_t g_step = static_cast<size_t>(gridDim.x) * kTpf;
+    const size_t t_off = (static_cast<size_t>(blockIdx.x) +
+                          static_cast<size_t>(threadIdx.x) * static_cast<size_t>(gridDim.x)) * kTpf;
+    const size_t t_stride = static_cast<size_t>(kThreads) * g_step;
     if (wq_raw != nullptr) {
-      for (size_t off = static_cast<size_t>(threadIdx.x) * kTpf; off < wq_bytes;
-           off += static_cast<size_t>(kThreads) * kTpf) {
+      for (size_t off = t_off; off < wq_bytes; off += t_stride) {
         asm volatile("prefetch.global.L2 [%0];" ::"l"(wq_raw + off));
       }
     }
     if (wg_raw != nullptr) {
-      for (size_t off = static_cast<size_t>(threadIdx.x) * kTpf; off < wg_bytes;
-           off += static_cast<size_t>(kThreads) * kTpf) {
+      for (size_t off = t_off; off < wg_bytes; off += t_stride) {
         asm volatile("prefetch.global.L2 [%0];" ::"l"(wg_raw + off));
       }
     }
@@ -875,11 +1023,13 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmS) : "memory");
   }
-  if (blockIdx.x == 0 && w_raw != nullptr) {
+  if (w_raw != nullptr) {
     constexpr size_t kTpf = 2048u << 10;
     constexpr size_t kWBytes = (static_cast<size_t>(kFused) * 6656u) >> 1;
-    for (size_t off = static_cast<size_t>(tid) * kTpf; off < kWBytes;
-         off += static_cast<size_t>(kThreads) * kTpf) {
+    const size_t g_step = static_cast<size_t>(gridDim.x) * kTpf;
+    for (size_t off = (static_cast<size_t>(blockIdx.x) +
+                       static_cast<size_t>(tid) * static_cast<size_t>(gridDim.x)) * kTpf;
+         off < kWBytes; off += static_cast<size_t>(kThreads) * g_step) {
       asm volatile("prefetch.global.L2 [%0];" ::"l"(w_raw + off));
     }
   }
@@ -924,7 +1074,7 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
 #pragma unroll 1
   for (int ti = 0; ti < kTilesPerCta; ti++) {
   const int slice_col = col0 + ti;
-  k_loop<8, (kPdlMode == 2), (kPdlMode != 0), kEpiExtraVal>(
+  k_loop<8, (kPdlMode == 2), (kPdlMode != 0), kEpiExtraVal, false, 8, true, true>(
       c, kTiles, kABytes / 4 + 4 * (128 * cw + lane) + 2 * jh, 128,
       (kABytes + kBBytes) / 4 + 64 * cw + 2 * (lane >> 2) + jh, 16, produce, [](int) { return kTiles; }, ti * kTiles,
       kTilesPerCta * kTiles);
@@ -1064,7 +1214,7 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
 //   Unconditional __syncthreads() eliminates ptxas ti==T-1 epilogue peeling (240 MUFU -> 64 MUFU = 3.75x smaller epilogue),
 //   runs all 8 warps (2 warps/sub-partition) in parallel, saves 1 barrier/wave, and frees c[4..7] (64 regs) before SwiGLU!
 template <int kPdlMode = 2, int kTilesPerCta = 26, bool kCsOut = true, bool kPolEf = false,
-          bool kSingleFa = false, bool kEpi8w = true>
+          bool kSingleFa = false, bool kEpi8w = true, bool kLutSilu = true>
 __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
     const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
     const __grid_constant__ CUtensorMap tmS, char* __restrict__ out,
@@ -1085,11 +1235,13 @@ __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
     asm volatile("prefetch.tensormap [%0];" ::"l"(&tmS) : "memory");
   }
-  if (blockIdx.x == 0 && w_raw != nullptr) {
+  if (w_raw != nullptr) {
     constexpr size_t kTpf = 2048u << 10;
     constexpr size_t kWBytes = (static_cast<size_t>(kFused) * 6656u) >> 1;
-    for (size_t off = static_cast<size_t>(tid) * kTpf; off < kWBytes;
-         off += static_cast<size_t>(kThreads) * kTpf) {
+    const size_t g_step = static_cast<size_t>(gridDim.x) * kTpf;
+    for (size_t off = (static_cast<size_t>(blockIdx.x) +
+                       static_cast<size_t>(tid) * static_cast<size_t>(gridDim.x)) * kTpf;
+         off < kWBytes; off += static_cast<size_t>(kThreads) * g_step) {
       asm volatile("prefetch.global.L2 [%0];" ::"l"(w_raw + off));
     }
   }
@@ -1136,7 +1288,7 @@ __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
       tma2d_hint(dst, &tmA, 128 * g, 128 * chunk, bar, tma_pol_el());
     }
   };
-  k_loop<8, (kPdlMode == 2), (kPdlMode != 0), kEpiExtraVal, kSingleFa>(
+  k_loop<8, (kPdlMode == 2), (kPdlMode != 0), kEpiExtraVal, kSingleFa, 8, true, true>(
       c, kTiles, kABytes / 4 + 4 * (32 * nb + lane) + 2 * sh2, 256,
       (kABytes + kBBytes) / 4 + 2 * (8 * nb + (lane >> 2)) + sh2, 32, produce, [](int) { return kTiles; },
       q_base, kTilesPerCta * kTiles);
@@ -1260,6 +1412,10 @@ __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
     const int q = lane & 3;
     const int r0 = 128 * chunk + (kEpi8w ? 64 * kw : 0) + (lane >> 2);
     const int out_col0 = 64 * slice_col + 16 * (2 * nb + sh2);
+    auto eval_silu = [&](__nv_bfloat16 bg) -> float {
+      if constexpr (kLutSilu) return __ldg(bf16_silu + __bfloat16_as_ushort(bg));
+      else                    return swiglu_silu(__bfloat162float(bg));
+    };
 #ifdef MARLINW_TMA_FP8
     uint8_t* out_u8 = reinterpret_cast<uint8_t*>(out);
     auto eval_fp8_pair = [&](float g0, float u0, float g1, float u1) -> uint32_t {
@@ -1267,8 +1423,8 @@ __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
       const __nv_bfloat16 bu0 = __float2bfloat16_rn(u0 * gs);
       const __nv_bfloat16 bg1 = __float2bfloat16_rn(g1 * gs);
       const __nv_bfloat16 bu1 = __float2bfloat16_rn(u1 * gs);
-      const float q0 = __fmul_rn(__fmul_rn(swiglu_silu(__bfloat162float(bg0)), __bfloat162float(bu0)), inverse);
-      const float q1 = __fmul_rn(__fmul_rn(swiglu_silu(__bfloat162float(bg1)), __bfloat162float(bu1)), inverse);
+      const float q0 = __fmul_rn(__fmul_rn(eval_silu(bg0), __bfloat162float(bu0)), inverse);
+      const float q1 = __fmul_rn(__fmul_rn(eval_silu(bg1), __bfloat162float(bu1)), inverse);
       uint16_t conv;
       asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(conv) : "f"(q1), "f"(q0));
       return static_cast<uint32_t>(conv);
@@ -1305,8 +1461,8 @@ __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
       const __nv_bfloat16 bu0 = __float2bfloat16_rn(u0 * gs);
       const __nv_bfloat16 bg1 = __float2bfloat16_rn(g1 * gs);
       const __nv_bfloat16 bu1 = __float2bfloat16_rn(u1 * gs);
-      const __nv_bfloat16 p0 = __float2bfloat16_rn(__fmul_rn(swiglu_silu(__bfloat162float(bg0)), __bfloat162float(bu0)));
-      const __nv_bfloat16 p1 = __float2bfloat16_rn(__fmul_rn(swiglu_silu(__bfloat162float(bg1)), __bfloat162float(bu1)));
+      const __nv_bfloat16 p0 = __float2bfloat16_rn(__fmul_rn(eval_silu(bg0), __bfloat162float(bu0)));
+      const __nv_bfloat16 p1 = __float2bfloat16_rn(__fmul_rn(eval_silu(bg1), __bfloat162float(bu1)));
       const __nv_bfloat162 r = __halves2bfloat162(p0, p1);
       return *reinterpret_cast<const uint32_t*>(&r);
     };
@@ -1420,33 +1576,33 @@ extern "C" void marlinw_down128_set_shfl_epi(int enable) {
   g_shfl_epi = (enable != 0);
 }
 
-template <int kCols>
+template <int kCols, bool kWeightEf = (kCols == 6656)>
 static int init_down_shape(int* active_blocks) {
   using namespace MARLIN_NAMESPACE_NAME;
   auto status = find_encode();
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(down<kCols, true, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  status = cudaFuncSetAttribute(down<kCols, true, 0, kWeightEf>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(down<kCols, false, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  status = cudaFuncSetAttribute(down<kCols, false, 0, kWeightEf>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(down<kCols, true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  status = cudaFuncSetAttribute(down<kCols, true, 1, kWeightEf>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(down<kCols, false, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  status = cudaFuncSetAttribute(down<kCols, false, 1, kWeightEf>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(down<kCols, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  status = cudaFuncSetAttribute(down<kCols, true, 2, kWeightEf>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
   if (status != cudaSuccess) return status;
-  status = cudaFuncSetAttribute(down<kCols, false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
+  status = cudaFuncSetAttribute(down<kCols, false, 2, kWeightEf>, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
   if (status != cudaSuccess) return status;
   int occ_shfl = 0, occ_stock = 0;
-  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_shfl, down<kCols, true, 1>, kThreads, kShared);
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_shfl, down<kCols, true, 1, kWeightEf>, kThreads, kShared);
   if (status != cudaSuccess) return status;
-  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_stock, down<kCols, false, 1>, kThreads, kShared);
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ_stock, down<kCols, false, 1, kWeightEf>, kThreads, kShared);
   if (status != cudaSuccess) return status;
   *active_blocks = occ_shfl < occ_stock ? occ_shfl : occ_stock;
   return cudaSuccess;
 }
 
-template <int kCols>
+template <int kCols, bool kWeightEf = (kCols == 6656)>
 static int launch_down_shape(
     const int4* input, const int4* weight, int4* output, float4* scratch, const int4* scales,
     const float* global_scale, const int4* work, int grid, int k, int row_stride, cudaStream_t stream) {
@@ -1462,45 +1618,48 @@ static int launch_down_shape(
   const size_t w_bytes = (static_cast<size_t>(kCols) * static_cast<size_t>(k)) >> 1;
   const uint8_t* w_raw = reinterpret_cast<const uint8_t*>(weight);
   if (pm == 2) {
-    auto kernel = g_shfl_epi ? down<kCols, true, 2> : down<kCols, false, 2>;
+    auto kernel = g_shfl_epi ? down<kCols, true, 2, kWeightEf> : down<kCols, false, 2, kWeightEf>;
     return launch_ex_pdl(kernel, grid, kThreads, kShared, stream, tmA8, tmB, tmS, output, scratch, global_scale,
                          const_cast<int4*>(work), w_raw, w_bytes);
   }
-  auto kernel = (pm == 1) ? (g_shfl_epi ? down<kCols, true, 1> : down<kCols, false, 1>)
-                          : (g_shfl_epi ? down<kCols, true, 0> : down<kCols, false, 0>);
+  auto kernel = (pm == 1) ? (g_shfl_epi ? down<kCols, true, 1, kWeightEf> : down<kCols, false, 1, kWeightEf>)
+                          : (g_shfl_epi ? down<kCols, true, 0, kWeightEf> : down<kCols, false, 0, kWeightEf>);
   kernel<<<grid, kThreads, kShared, stream>>>(tmA8, tmB, tmS, output, scratch, global_scale,
                                               const_cast<int4*>(work), w_raw, w_bytes);
   return cudaGetLastError();
 }
 
 extern "C" int marlinw_down128_init(int* active_blocks) {
-  return init_down_shape<6656>(active_blocks);
+  return init_down_shape<6656, true>(active_blocks);
 }
 extern "C" int marlinw_down128_main(
     const int4* input, const int4* weight, int4* output, float4* scratch, const int4* scales,
     const float* global_scale, const int4* work, int grid, int row_stride, cudaStream_t stream) {
-  return launch_down_shape<6656>(input, weight, output, scratch, scales, global_scale, work, grid, 19968,
-                                 row_stride, stream);
+  return launch_down_shape<6656, true>(input, weight, output, scratch, scales, global_scale, work, grid, 19968,
+                                       row_stride, stream);
 }
 extern "C" int marlinw_down128_shape_tma_init(int n, int k, int* active_blocks) {
   if (k % 64 != 0) return cudaErrorInvalidValue;
-  if (n == 6656) return init_down_shape<6656>(active_blocks);
-  if (n == 4608) return init_down_shape<4608>(active_blocks);
-  if (n == 4096) return init_down_shape<4096>(active_blocks);
+  if (n == 6656) return (k == 4096) ? init_down_shape<6656, false>(active_blocks)
+                                    : init_down_shape<6656, true>(active_blocks);
+  if (n == 4608) return init_down_shape<4608, false>(active_blocks);
+  if (n == 4096) return init_down_shape<4096, false>(active_blocks);
   return cudaErrorInvalidValue;
 }
 extern "C" int marlinw_down128_shape_tma_main(
     const int4* input, const int4* weight, int4* output, float4* scratch, const int4* scales,
     const float* global_scale, const int4* work, int grid, int n, int k, int row_stride, cudaStream_t stream) {
   if (n == 6656)
-    return launch_down_shape<6656>(input, weight, output, scratch, scales, global_scale, work, grid, k, row_stride,
-                                   stream);
+    return (k == 4096) ? launch_down_shape<6656, false>(input, weight, output, scratch, scales, global_scale, work,
+                                                        grid, k, row_stride, stream)
+                       : launch_down_shape<6656, true>(input, weight, output, scratch, scales, global_scale, work,
+                                                       grid, k, row_stride, stream);
   if (n == 4608)
-    return launch_down_shape<4608>(input, weight, output, scratch, scales, global_scale, work, grid, k, row_stride,
-                                   stream);
+    return launch_down_shape<4608, false>(input, weight, output, scratch, scales, global_scale, work, grid, k,
+                                          row_stride, stream);
   if (n == 4096)
-    return launch_down_shape<4096>(input, weight, output, scratch, scales, global_scale, work, grid, k, row_stride,
-                                   stream);
+    return launch_down_shape<4096, false>(input, weight, output, scratch, scales, global_scale, work, grid, k,
+                                          row_stride, stream);
   return cudaErrorInvalidValue;
 }
 
@@ -1641,6 +1800,13 @@ static bool gateup_ilv_epi8w() {
   }();
   return on;
 }
+static bool gateup_ilv_lut_silu() {
+  static const bool on = []() -> bool {
+    const char* env = std::getenv("MARLINW_GATEUP_LUT_SILU");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  return on;
+}
 static int gateup_ilv_pdl_mode() {
   if (g_tma_pdl_override >= 0) return g_tma_pdl_override;
   static const int mode = []() -> int {
@@ -1673,6 +1839,7 @@ static cudaError_t set_gateup_attrs() {
   set1(gateup_ilv<0, 26, true, false, false, true>, kSharedFor<26>());
   set1(gateup_ilv<1, 26, true, false, false, true>, kSharedFor<26>());
   set1(gateup_ilv<2, 26, true, false, false, true>, kSharedFor<26>());
+  set1(gateup_ilv<2, 26, true, false, false, true, false>, kSharedFor<26>());
   set1(gateup_ilv<2, 26, true, true, false, true>, kSharedFor<26>());
   set1(gateup_ilv<2, 13, true, false, false, true>, kSharedFor<13>());
   set1(gateup_ilv<2, 2, true, false, false, true>, kSharedFor<2>());
@@ -1685,7 +1852,7 @@ static cudaError_t set_gateup_attrs() {
   return s;
 }
 template <typename... Extra>
-static cudaError_t dispatch_gateup_ilv(int pm, int tpc, bool cs, bool ef, bool epi8w, cudaStream_t stream,
+static cudaError_t dispatch_gateup_ilv(int pm, int tpc, bool cs, bool ef, bool epi8w, bool lut_silu, cudaStream_t stream,
                                        const CUtensorMap& tmA, const CUtensorMap& tmB, const CUtensorMap& tmS,
                                        char* out, const float* global, const uint8_t* w_raw, Extra... extra) {
   constexpr int m = 512, n = kFused;
@@ -1698,10 +1865,10 @@ static cudaError_t dispatch_gateup_ilv(int pm, int tpc, bool cs, bool ef, bool e
     static_assert((n / 128) % kT == 0, "tiles per CTA");
     constexpr int grid = (m / 128) * (n / 128) / kT;
     if constexpr (kP == 2) {
-      return launch_ex_pdl(gateup_ilv<2, kT, true, kE, false, kE8>, grid, kThreads, kSharedFor<kT>(), stream,
+      return launch_ex_pdl(gateup_ilv<2, kT, true, kE, false, kE8, true>, grid, kThreads, kSharedFor<kT>(), stream,
                            tmA, tmB, tmS, out, global, w_raw, extra...);
     } else {
-      gateup_ilv<kP, kT, true, kE, false, kE8><<<grid, kThreads, kSharedFor<kT>(), stream>>>(
+      gateup_ilv<kP, kT, true, kE, false, kE8, true><<<grid, kThreads, kSharedFor<kT>(), stream>>>(
           tmA, tmB, tmS, out, global, w_raw, extra...);
       return cudaGetLastError();
     }
@@ -1717,6 +1884,11 @@ static cudaError_t dispatch_gateup_ilv(int pm, int tpc, bool cs, bool ef, bool e
   if (tpc == 26) {
     if (pm == 0) return launch(std::integral_constant<int, 0>{}, std::integral_constant<int, 26>{}, std::false_type{}, std::true_type{});
     if (pm == 1) return launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 26>{}, std::false_type{}, std::true_type{});
+    if (!ef && !lut_silu) {
+      constexpr int grid = (m / 128) * (n / 128) / 26;
+      return launch_ex_pdl(gateup_ilv<2, 26, true, false, false, true, false>, grid, kThreads, kSharedFor<26>(), stream,
+                           tmA, tmB, tmS, out, global, w_raw, extra...);
+    }
     return ef ? launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 26>{}, std::true_type{}, std::true_type{})
               : launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 26>{}, std::false_type{}, std::true_type{});
   }
@@ -1815,7 +1987,7 @@ extern "C" int swiglu_fp8_gemm_ilv(const void* x, const void* w_ilv, const void*
       !map2d(&tmS, scales_ilv, 1, n, k / 16, n, 128, 4, false))
     return cudaErrorInvalidValue;
   return dispatch_gateup_ilv(gateup_ilv_pdl_mode(), gateup_ilv_tiles_per_cta(), gateup_cs_out(), gateup_ilv_b_ef(),
-                             gateup_ilv_epi8w(), stream, tmA, tmB, tmS, static_cast<char*>(out),
+                             gateup_ilv_epi8w(), gateup_ilv_lut_silu(), stream, tmA, tmB, tmS, static_cast<char*>(out),
                              static_cast<const float*>(global), reinterpret_cast<const uint8_t*>(w_ilv),
                              down_input_scale);
 }
@@ -1864,7 +2036,7 @@ extern "C" int swiglu_gemm_ilv(const void* x, const void* w_ilv, const void* sca
       !map2d(&tmS, scales_ilv, 1, n, k / 16, n, 128, 4, false))
     return cudaErrorInvalidValue;
   return dispatch_gateup_ilv(gateup_ilv_pdl_mode(), gateup_ilv_tiles_per_cta(), gateup_cs_out(), gateup_ilv_b_ef(),
-                             gateup_ilv_epi8w(), stream, tmA, tmB, tmS, static_cast<char*>(out),
+                             gateup_ilv_epi8w(), gateup_ilv_lut_silu(), stream, tmA, tmB, tmS, static_cast<char*>(out),
                              static_cast<const float*>(global), reinterpret_cast<const uint8_t*>(w_ilv));
 }
 #endif

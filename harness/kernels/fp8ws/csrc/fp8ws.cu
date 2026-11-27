@@ -348,6 +348,87 @@ __device__ __forceinline__ void consume_stage_pipe(uint32_t abase, uint32_t wbas
   }
 }
 
+template <bool IsBf16 = false>
+__device__ __forceinline__ void consume_stage_pipe_4x8(
+    uint32_t abase, uint32_t wbase, int wm, int wn, int ar, int ach, int br, int bch, float (&acc)[4][8][4]) {
+  auto load_a_i = [&](int ks, int i, uint32_t (&ai)[4]) {
+    const int r = wm * 64 + i * 16 + ar;
+    ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, ai);
+  };
+  auto load_b_p = [&](int ks, int p, uint32_t (&bp)[4]) {
+    const int r = wn * 64 + p * 16 + br;
+    ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, bp);
+  };
+  uint32_t a[2][4][4], bbuf[2][4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) load_a_i(0, i, a[0][i]);
+  load_b_p(0, 0, bbuf[0]);
+#pragma unroll
+  for (int ks = 0; ks < KT / 32; ++ks) {
+    const int acur = ks & 1, anxt = acur ^ 1;
+#pragma unroll
+    for (int jp = 0; jp < 4; ++jp) {
+      const int q = (ks << 2) + jp;
+      uint32_t (&bc)[4] = bbuf[q & 1];
+      uint32_t (&bn)[4] = bbuf[(q + 1) & 1];
+      if (jp + 1 < 4)            load_b_p(ks, jp + 1, bn);
+      else if (ks + 1 < KT / 32) load_b_p(ks + 1, 0, bn);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        if constexpr (IsBf16) {
+          mma_bf16(a[acur][i], bc[0], bc[1], acc[i][2 * jp]);
+          mma_bf16(a[acur][i], bc[2], bc[3], acc[i][2 * jp + 1]);
+        } else {
+          mma(a[acur][i], bc[0], bc[1], acc[i][2 * jp]);
+          mma(a[acur][i], bc[2], bc[3], acc[i][2 * jp + 1]);
+        }
+        if (jp == 2 && ks + 1 < KT / 32) load_a_i(ks + 1, i, a[anxt][i]);
+      }
+    }
+  }
+}
+
+template <int MW, int NW_CUR, bool IsBf16 = false>
+__device__ __forceinline__ void consume_stage_pipe_opt(
+    uint32_t abase, uint32_t wbase, int wm, int wn, int ar, int ach, int br, int bch, float (&acc)[MW][NW_CUR][4]) {
+  constexpr int NP = NW_CUR / 2;
+  auto load_a_i = [&](int ks, int i, uint32_t (&ai)[4]) {
+    const int r = wm * MW * 16 + i * 16 + ar;
+    ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, ai);
+  };
+  auto load_b_p = [&](int ks, int p, uint32_t (&bp)[4]) {
+    const int r = wn * NW_CUR * 8 + p * 16 + br;
+    ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, bp);
+  };
+  uint32_t a[2][MW][4], bbuf[2][4];
+#pragma unroll
+  for (int i = 0; i < MW; ++i) load_a_i(0, i, a[0][i]);
+  load_b_p(0, 0, bbuf[0]);
+#pragma unroll
+  for (int ks = 0; ks < KT / 32; ++ks) {
+    const int acur = ks & 1, anxt = acur ^ 1;
+#pragma unroll
+    for (int jp = 0; jp < NP; ++jp) {
+      const int q = ks * NP + jp;
+      uint32_t (&bc)[4] = bbuf[q & 1];
+      uint32_t (&bn)[4] = bbuf[(q + 1) & 1];
+      if (jp + 1 < NP)           load_b_p(ks, jp + 1, bn);
+      else if (ks + 1 < KT / 32) load_b_p(ks + 1, 0, bn);
+#pragma unroll
+      for (int i = 0; i < MW; ++i) {
+        if constexpr (IsBf16) {
+          mma_bf16(a[acur][i], bc[0], bc[1], acc[i][2 * jp]);
+          mma_bf16(a[acur][i], bc[2], bc[3], acc[i][2 * jp + 1]);
+        } else {
+          mma(a[acur][i], bc[0], bc[1], acc[i][2 * jp]);
+          mma(a[acur][i], bc[2], bc[3], acc[i][2 * jp + 1]);
+        }
+        if (jp == (NP >= 2 ? NP - 2 : 0) && ks + 1 < KT / 32) load_a_i(ks + 1, i, a[anxt][i]);
+      }
+    }
+  }
+}
+
 template <int N, int K, bool kPdl = false>
 __global__ void __launch_bounds__(NT, 1)
 gemm(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB, const Params p) {
@@ -435,8 +516,9 @@ gemm(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMa
     if (tid == 0 && g + ST - 1 < total) produce(g + ST - 1);
     mbar_wait(full0 + 8 * s, n & 1);
     const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-    if constexpr (MW == 2) consume_stage_pipe<MW>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
-    else                   consume_stage<MW>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+    if constexpr (MW == 4)      consume_stage_pipe_4x8<false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+    else if constexpr (MW == 2) consume_stage_pipe<MW>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+    else                        consume_stage<MW>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
     __syncwarp();
     if (lane == 0) mbar_arrive(empty0 + 8 * s);
     if (++kt == NKT) {
@@ -511,7 +593,7 @@ gemm_hybrid_6656(const __grid_constant__ CUtensorMap tmA256, const __grid_consta
       if (tid == 0 && g + ST1 - 1 < total1) produce1(g + ST1 - 1);
       mbar_wait(full0 + 8 * s, n & 1);
       const uint32_t abase = sbase + s * STB1, wbase = abase + ASZ1;
-      consume_stage<MW1>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+      consume_stage_pipe_4x8<false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
       if (++kt == NKT) {
@@ -562,7 +644,7 @@ gemm_hybrid_6656(const __grid_constant__ CUtensorMap tmA256, const __grid_consta
       if (tid == 0 && g + ST2 - 1 < NKT) produce2(g + ST2 - 1);
       mbar_wait(full0 + 8 * s, n & 1);
       const uint32_t abase = sbase + s * STB2, wbase = abase + ASZ2;
-      consume_stage<1>(abase, wbase, wm, wn, ar, ach, br, bch, acc2);
+      consume_stage_pipe_opt<1, NW, false>(abase, wbase, wm, wn, ar, ach, br, bch, acc2);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
     }
@@ -645,7 +727,7 @@ gemm_hybrid_6656_nsplit128(const __grid_constant__ CUtensorMap tmA256,
       if (tid == 0 && g + 1 < total1) produce1(g + 1);
       mbar_wait(full0 + 8 * s, n & 1);
       const uint32_t abase = sbase + s * STB1, wbase = abase + ASZ1;
-      consume_stage<MW1, NW, false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+      consume_stage_pipe_4x8<false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
       if (++kt == NKT) {
@@ -701,7 +783,7 @@ gemm_hybrid_6656_nsplit128(const __grid_constant__ CUtensorMap tmA256,
         if (tid == 0 && g + ST2 - 1 < NKT) produce2(g + ST2 - 1);
         mbar_wait(full0 + 8 * s, n & 1);
         const uint32_t abase = sbase + s * STB2, wbase = abase + ASZ2;
-        consume_stage<1, 6, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
+        consume_stage_pipe_opt<1, 6, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
         __syncwarp();
         if (lane == 0) mbar_arrive(empty0 + 8 * s);
       }
@@ -716,7 +798,7 @@ gemm_hybrid_6656_nsplit128(const __grid_constant__ CUtensorMap tmA256,
         if (tid == 0 && g + ST2 - 1 < NKT) produce2(g + ST2 - 1);
         mbar_wait(full0 + 8 * s, n & 1);
         const uint32_t abase = sbase + s * STB2, wbase = abase + ASZ2;
-        consume_stage<1, 4, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
+        consume_stage_pipe_opt<1, 4, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
         __syncwarp();
         if (lane == 0) mbar_arrive(empty0 + 8 * s);
       }
@@ -787,7 +869,7 @@ gemm_dual(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUten
     if (tid == 0 && g + ST - 1 < total) produce(g + ST - 1);
     mbar_wait(full0 + 8 * s, n & 1);
     const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-    consume_stage<MW>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+    consume_stage_pipe_4x8<false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
     __syncwarp();
     if (lane == 0) mbar_arrive(empty0 + 8 * s);
     if (++kt == NKT) {
@@ -875,7 +957,7 @@ gemm_dual_a(const __grid_constant__ CUtensorMap tmA0, const __grid_constant__ CU
     if (tid == 0 && g + ST2 - 1 < total) produce(g + ST2 - 1);
     mbar_wait(full0 + 8 * s, n & 1);
     const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-    consume_stage<MW>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+    consume_stage_pipe_4x8<false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
     __syncwarp();
     if (lane == 0) mbar_arrive(empty0 + 8 * s);
     if (++kt == NKT) {
@@ -1010,7 +1092,7 @@ gemm_dual_a_seamless(const __grid_constant__ CUtensorMap tmA0,
       if (tid == 0) produce(g + 1);
       mbar_wait(full0 + 8 * s, n & 1);
       const uint32_t abase = sbase + s * STB1, wbase = abase + ASZ1;
-      consume_stage<4, NW, false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+      consume_stage_pipe_4x8<false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
       if (++kt == NKT) {
@@ -1041,7 +1123,7 @@ gemm_dual_a_seamless(const __grid_constant__ CUtensorMap tmA0,
       if (tid == 0 && g + 1 < total_all) produce(g + 1);
       mbar_wait(full0 + 8 * s, n & 1);
       const uint32_t abase = sbase + s * STB1, wbase = abase + ASZ1;
-      consume_stage<2, 14, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
+      consume_stage_pipe_opt<2, 14, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
     }
@@ -1057,7 +1139,7 @@ gemm_dual_a_seamless(const __grid_constant__ CUtensorMap tmA0,
       if (tid == 0 && g + 1 < total_all) produce(g + 1);
       mbar_wait(full0 + 8 * s, n & 1);
       const uint32_t abase = sbase + s * STB1, wbase = abase + ASZ1;
-      consume_stage<2, 12, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
+      consume_stage_pipe_opt<2, 12, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
     }
@@ -1121,7 +1203,7 @@ gemm_bf16_dual_stacked(const __grid_constant__ CUtensorMap tmA, const __grid_con
     if (tid == 0 && g + ST - 1 < total) produce(g + ST - 1);
     mbar_wait(full0 + 8 * s, n & 1);
     const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-    consume_stage<MW, NW, true>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+    consume_stage_pipe_4x8<true>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
     __syncwarp();
     if (lane == 0) mbar_arrive(empty0 + 8 * s);
     if (++kt == NKT) {
@@ -1238,7 +1320,7 @@ gemm_bf16_dual_seamless(const __grid_constant__ CUtensorMap tmA,
       if (tid == 0) produce(g + 1);
       mbar_wait(full0 + 8 * s, n & 1);
       const uint32_t abase = sbase + s * STB1, wbase = abase + ASZ1;
-      consume_stage<4, NW, true>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+      consume_stage_pipe_4x8<true>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
       if (++kt == NKT) {
@@ -1269,7 +1351,7 @@ gemm_bf16_dual_seamless(const __grid_constant__ CUtensorMap tmA,
       if (tid == 0 && g + 1 < total_all) produce(g + 1);
       mbar_wait(full0 + 8 * s, n & 1);
       const uint32_t abase = sbase + s * STB1, wbase = abase + ASZ1;
-      consume_stage<2, 14, true>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
+      consume_stage_pipe_opt<2, 14, true>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
     }
@@ -1285,7 +1367,7 @@ gemm_bf16_dual_seamless(const __grid_constant__ CUtensorMap tmA,
       if (tid == 0 && g + 1 < total_all) produce(g + 1);
       mbar_wait(full0 + 8 * s, n & 1);
       const uint32_t abase = sbase + s * STB1, wbase = abase + ASZ1;
-      consume_stage<2, 12, true>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
+      consume_stage_pipe_opt<2, 12, true>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
     }
@@ -1313,7 +1395,6 @@ gemm_hybrid_6656_st3(const __grid_constant__ CUtensorMap tmA128,
   extern __shared__ uint8_t sm_raw[];
   __shared__ __align__(8) unsigned long long bars[2 * ST];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
-  if (b == 0) prewarm_tlb_2m(p.b_raw, p.b_bytes, tid, NT_WS);
   const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
   const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST;
 
@@ -1463,10 +1544,6 @@ gemm_dual_a_st3(const __grid_constant__ CUtensorMap tmA0,
   extern __shared__ uint8_t sm_raw[];
   __shared__ __align__(8) unsigned long long bars[2 * ST];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
-  if (b == 0) {
-    prewarm_tlb_2m(p.b0_raw, p.b0_bytes, tid, NT_WS);
-    prewarm_tlb_2m(p.b1_raw, p.b1_bytes, tid, NT_WS);
-  }
   const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
   const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST;
 
@@ -1629,7 +1706,6 @@ gemm_bf16_dual_st3(const __grid_constant__ CUtensorMap tmA,
   extern __shared__ uint8_t sm_raw[];
   __shared__ __align__(8) unsigned long long bars[2 * ST];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
-  if (b == 0) prewarm_tlb_2m(p.b_raw, p.b_bytes, tid, NT_WS);
   const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
   const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST;
 
@@ -1770,85 +1846,6 @@ gemm_bf16_dual_st3(const __grid_constant__ CUtensorMap tmA,
   }
 }
 
-template <bool IsBf16 = false>
-__device__ __forceinline__ void consume_stage_pipe_4x8(
-    uint32_t abase, uint32_t wbase, int wm, int wn, int ar, int ach, int br, int bch, float (&acc)[4][8][4]) {
-  auto load_a_i = [&](int ks, int i, uint32_t (&ai)[4]) {
-    const int r = wm * 64 + i * 16 + ar;
-    ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, ai);
-  };
-  auto load_b_p = [&](int ks, int p, uint32_t (&bp)[4]) {
-    const int r = wn * 64 + p * 16 + br;
-    ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, bp);
-  };
-  uint32_t a[4][4], bbuf[2][4];
-#pragma unroll
-  for (int i = 0; i < 4; ++i) load_a_i(0, i, a[i]);
-  load_b_p(0, 0, bbuf[0]);
-#pragma unroll
-  for (int ks = 0; ks < KT / 32; ++ks) {
-#pragma unroll
-    for (int jp = 0; jp < 4; ++jp) {
-      const int q = (ks << 2) + jp;
-      uint32_t (&bc)[4] = bbuf[q & 1];
-      uint32_t (&bn)[4] = bbuf[(q + 1) & 1];
-      if (jp + 1 < 4)            load_b_p(ks, jp + 1, bn);
-      else if (ks + 1 < KT / 32) load_b_p(ks + 1, 0, bn);
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        if constexpr (IsBf16) {
-          mma_bf16(a[i], bc[0], bc[1], acc[i][2 * jp]);
-          mma_bf16(a[i], bc[2], bc[3], acc[i][2 * jp + 1]);
-        } else {
-          mma(a[i], bc[0], bc[1], acc[i][2 * jp]);
-          mma(a[i], bc[2], bc[3], acc[i][2 * jp + 1]);
-        }
-        if (jp == 3 && ks + 1 < KT / 32) load_a_i(ks + 1, i, a[i]);
-      }
-    }
-  }
-}
-
-template <int MW, int NW_CUR, bool IsBf16 = false>
-__device__ __forceinline__ void consume_stage_pipe_opt(
-    uint32_t abase, uint32_t wbase, int wm, int wn, int ar, int ach, int br, int bch, float (&acc)[MW][NW_CUR][4]) {
-  constexpr int NP = NW_CUR / 2;
-  auto load_a_i = [&](int ks, int i, uint32_t (&ai)[4]) {
-    const int r = wm * MW * 16 + i * 16 + ar;
-    ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, ai);
-  };
-  auto load_b_p = [&](int ks, int p, uint32_t (&bp)[4]) {
-    const int r = wn * NW_CUR * 8 + p * 16 + br;
-    ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, bp);
-  };
-  uint32_t a[MW][4], bbuf[2][4];
-#pragma unroll
-  for (int i = 0; i < MW; ++i) load_a_i(0, i, a[i]);
-  load_b_p(0, 0, bbuf[0]);
-#pragma unroll
-  for (int ks = 0; ks < KT / 32; ++ks) {
-#pragma unroll
-    for (int jp = 0; jp < NP; ++jp) {
-      const int q = ks * NP + jp;
-      uint32_t (&bc)[4] = bbuf[q & 1];
-      uint32_t (&bn)[4] = bbuf[(q + 1) & 1];
-      if (jp + 1 < NP)           load_b_p(ks, jp + 1, bn);
-      else if (ks + 1 < KT / 32) load_b_p(ks + 1, 0, bn);
-#pragma unroll
-      for (int i = 0; i < MW; ++i) {
-        if constexpr (IsBf16) {
-          mma_bf16(a[i], bc[0], bc[1], acc[i][2 * jp]);
-          mma_bf16(a[i], bc[2], bc[3], acc[i][2 * jp + 1]);
-        } else {
-          mma(a[i], bc[0], bc[1], acc[i][2 * jp]);
-          mma(a[i], bc[2], bc[3], acc[i][2 * jp + 1]);
-        }
-        if (jp == NP - 1 && ks + 1 < KT / 32) load_a_i(ks + 1, i, a[i]);
-      }
-    }
-  }
-}
-
 template <int K, bool kPdl>
 __global__ void __launch_bounds__(NT, 1)
 gemm_6656_ws8_256_st2_st4(const __grid_constant__ CUtensorMap tmA256,
@@ -1862,7 +1859,6 @@ gemm_6656_ws8_256_st2_st4(const __grid_constant__ CUtensorMap tmA256,
   extern __shared__ uint8_t sm_raw[];
   __shared__ __align__(8) unsigned long long bars[2 * ST2];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
-  if (b == 0) prewarm_tlb_2m(p.b_raw, p.b_bytes, tid, NT);
   const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
   const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST2;
   const int wm = warp % WM, wn = warp / WM;
@@ -1880,10 +1876,7 @@ gemm_6656_ws8_256_st2_st4(const __grid_constant__ CUtensorMap tmA256,
     __syncthreads();
     auto produce1 = [&](int gl) {
       const int s = gl & 1, n = gl >> 1;
-      if (gl >= ST1) {
-        mbar_wait(empty0 + 8 * s, (n - 1) & 1);
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      }
+      if (gl >= ST1) mbar_wait(empty0 + 8 * s, (n - 1) & 1);
       const int ti = gl / NKT, kt = gl - ti * NKT;
       const int t = b + ti * 48, nt = t >> 1, band = t & 1;
       const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB1;
@@ -1968,10 +1961,7 @@ gemm_6656_ws8_256_st2_st4(const __grid_constant__ CUtensorMap tmA256,
     __syncthreads();
     auto produce2 = [&](int gl) {
       const int s = gl & 3, n = gl >> 2;
-      if (gl >= ST2) {
-        mbar_wait(empty0 + 8 * s, (n - 1) & 1);
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      }
+      if (gl >= ST2) mbar_wait(empty0 + 8 * s, (n - 1) & 1);
       const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB2;
       mbar_expect_tx(bar, tx2);
       tma2d_hint(dst, &tmA128, gl * KT, row0_2, bar, tma_pol_el());
@@ -2030,10 +2020,6 @@ gemm_dual_a_ws8_256_st2_st3(const __grid_constant__ CUtensorMap tmA0_256,
   extern __shared__ uint8_t sm_raw[];
   __shared__ __align__(8) unsigned long long bars[2 * ST2];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
-  if (b == 0) {
-    prewarm_tlb_2m(p.b0_raw, p.b0_bytes, tid, NT);
-    prewarm_tlb_2m(p.b1_raw, p.b1_bytes, tid, NT);
-  }
   const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
   const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST2;
   const int wm = warp % WM, wn = warp / WM;
@@ -2051,10 +2037,7 @@ gemm_dual_a_ws8_256_st2_st3(const __grid_constant__ CUtensorMap tmA0_256,
     __syncthreads();
     auto produce1 = [&](int gl) {
       const int s = gl & 1, n = gl >> 1;
-      if (gl >= ST1) {
-        mbar_wait(empty0 + 8 * s, (n - 1) & 1);
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      }
+      if (gl >= ST1) mbar_wait(empty0 + 8 * s, (n - 1) & 1);
       const int ti = gl / NKT, kt = gl - ti * NKT;
       const int t = b + ti * 48, nt = t >> 1, band = t & 1;
       const bool is1 = nt >= NTN0;
@@ -2148,10 +2131,7 @@ gemm_dual_a_ws8_256_st2_st3(const __grid_constant__ CUtensorMap tmA0_256,
     __syncthreads();
     auto produce2 = [&](int gl) {
       const int s = gl % ST2, n = gl / ST2;
-      if (gl >= ST2) {
-        mbar_wait(empty0 + 8 * s, (n - 1) & 1);
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      }
+      if (gl >= ST2) mbar_wait(empty0 + 8 * s, (n - 1) & 1);
       const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB2;
       if (gl < NKT) {
         mbar_expect_tx(bar, STB2);
@@ -2231,7 +2211,6 @@ gemm_bf16_dual_ws8_256_st2_st3(const __grid_constant__ CUtensorMap tmA256,
   extern __shared__ uint8_t sm_raw[];
   __shared__ __align__(8) unsigned long long bars[2 * ST2];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
-  if (b == 0) prewarm_tlb_2m(p.b_raw, p.b_bytes, tid, NT);
   const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
   const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST2;
   const int wm = warp % WM, wn = warp / WM;
@@ -2248,10 +2227,7 @@ gemm_bf16_dual_ws8_256_st2_st3(const __grid_constant__ CUtensorMap tmA256,
     __syncthreads();
     auto produce1 = [&](int gl) {
       const int s = gl & 1, n = gl >> 1;
-      if (gl >= ST1) {
-        mbar_wait(empty0 + 8 * s, (n - 1) & 1);
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      }
+      if (gl >= ST1) mbar_wait(empty0 + 8 * s, (n - 1) & 1);
       const int ti = gl / NKT, kt = gl - ti * NKT;
       const int t = b + ti * 48, nt = t >> 1, band = t & 1;
       const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB1;
@@ -2341,10 +2317,7 @@ gemm_bf16_dual_ws8_256_st2_st3(const __grid_constant__ CUtensorMap tmA256,
     __syncthreads();
     auto produce2 = [&](int gl) {
       const int s = gl % ST2, n = gl / ST2;
-      if (gl >= ST2) {
-        mbar_wait(empty0 + 8 * s, (n - 1) & 1);
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      }
+      if (gl >= ST2) mbar_wait(empty0 + 8 * s, (n - 1) & 1);
       const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB2;
       if (gl < NKT) {
         mbar_expect_tx(bar, STB2);
