@@ -149,7 +149,7 @@ impl ResidentSession {
             .try_clone()
             .map_err(|e| format!("cannot clone the resident socket: {e}"))?;
         let mut session = Self {
-            reader: BufReader::new(stream),
+            reader: BufReader::with_capacity(64 * 1024, stream),
             writer,
             hello: ResidentHello {
                 vocab_size: 0,

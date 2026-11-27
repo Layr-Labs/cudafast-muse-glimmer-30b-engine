@@ -661,4 +661,3 @@ extern "C" int swiglu_ws_run(const void* a, const void* b, const float* sa, cons
   const int pdl = (g_ws_pdl_override >= 0) ? (g_ws_pdl_override != 0 ? 2 : 0) : sw_pdl_def;
   return swiglu_ws_run_mode(sw_mode, pdl, a, b, sa, sb, down, d, stream);
 }
-
