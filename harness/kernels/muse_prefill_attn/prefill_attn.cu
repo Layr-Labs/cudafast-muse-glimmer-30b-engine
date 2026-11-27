@@ -515,7 +515,6 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
 
   // ---------------------------------------------------------------------------
   // 1. 4-head Interleaved Fused Q-RMSNorm + qscale + NEOX RoPE directly from raw qkv!
-  //    Loads 4 heads per batch via L1-cached 16B even-lane loads + 4x ILP norm/RoPE -> swizzled SMEM.
   //    Runs BEFORE griddepcontrol.wait so Wave-1 CTAs hide kv_only completely!
   // ---------------------------------------------------------------------------
   uint32_t q_frag[8][4];
