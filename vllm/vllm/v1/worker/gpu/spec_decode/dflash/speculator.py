@@ -770,6 +770,12 @@ class DFlashSpeculator(DraftModelSpeculator):
                                 context_slots,
                             )
                     main_st.wait_stream(cap_st)
+                    try:
+                        from vllm.v1.worker.gpu.cudagraph_utils import upload_cudagraph
+
+                        upload_cudagraph(g, cap_st)
+                    except Exception:
+                        pass
                     self._ctx_kv_cg_entries[cg_key] = g
                 except Exception as exc:
                     self._ctx_kv_cg_rejected.add(cg_key)

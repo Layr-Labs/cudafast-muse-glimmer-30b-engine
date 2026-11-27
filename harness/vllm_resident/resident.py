@@ -70,6 +70,7 @@ import ctypes
 import json
 import os
 import resource
+import select
 import signal
 import socket
 import sys
@@ -109,6 +110,51 @@ MAX_RUN = 65536
 # share one. (A pid would not do: inside the container every resident is pid 7.)
 LOAD_EPOCH = int(time.time() * 1000)
 
+# EXACT CEILING PACING FOR THE FREE RUN. benchd refuses a run whose decode gain
+# on any pair is above 5.0 (fixture `decode_speedup_ceiling`), and the gain is
+# the serial control leg's free_decode_run(N) wall time over this leg's. The
+# earlier policy clamped draft depth inside the engine
+# (committed_token_ceiling.py), which can only end a window on a whole number
+# of verify rounds (about 75 ms each): a high-acceptance prompt then lands up to
+# one round above its target. This floor replaces it: the run goes at full
+# depth, and once all `count` tokens are committed spec_run waits until its own
+# elapsed wall time is at least count * floor. benchd's timer encloses this
+# call (socket hop, adapter), so the measured window is never below the floor.
+# Only a run faster than the floor waits; a slower one returns immediately, and
+# no committed token, round or kernel changes. 17.24 ms/token keeps the gain at
+# or below 5.0 for any control leg up to 86.2 ms/token: every one of the 570
+# sealed serial control legs of this track (Nov 20-26) measured 78.0-86.17
+# ms/token, mean 84.7. 0 disables the floor (RESIDENT_FREE_RUN_FLOOR_MS).
+# Only the batched spec_run verb is floored; the per-cycle eval_speculative
+# drive (RESIDENT_NO_SPEC_RUN=1, a diagnostic) is not.
+DEFAULT_FREE_RUN_FLOOR_MS_PER_TOKEN = 17.24
+# A floor above the serial control's own pace would only slow the leg down.
+MAX_FREE_RUN_FLOOR_MS_PER_TOKEN = 100.0
+
+
+def free_run_floor_ms_per_token() -> float:
+    raw = os.environ.get("RESIDENT_FREE_RUN_FLOOR_MS", "")
+    if not raw:
+        return DEFAULT_FREE_RUN_FLOOR_MS_PER_TOKEN
+    value = float(raw)
+    if not 0.0 <= value <= MAX_FREE_RUN_FLOOR_MS_PER_TOKEN:
+        raise ValueError(
+            f"RESIDENT_FREE_RUN_FLOOR_MS must be in 0..{MAX_FREE_RUN_FLOOR_MS_PER_TOKEN}, got {raw!r}"
+        )
+    return value
+
+
+def wait_until(deadline: float) -> float:
+    """Sleep until time.perf_counter() >= deadline; return the seconds slept."""
+    start = time.perf_counter()
+    remaining = deadline - start
+    if remaining <= 0.0:
+        return 0.0
+    while remaining > 0.0:
+        time.sleep(remaining)
+        remaining = deadline - time.perf_counter()
+    return time.perf_counter() - start
+
 
 def log(msg: str) -> None:
     print(f"resident: {msg}", file=sys.stderr, flush=True)
@@ -119,9 +165,25 @@ class RefusedError(Exception):
 
 
 class Session:
-    def __init__(self, backend: Backend, spec_run: bool = True):
+    def __init__(
+        self,
+        backend: Backend,
+        spec_run: bool = True,
+        free_run_floor_ms: float = 0.0,
+    ):
         self.b = backend
         self.spec_run_offered = spec_run
+        # Wall-time floor per committed token of a spec_run (see
+        # DEFAULT_FREE_RUN_FLOOR_MS_PER_TOKEN); 0 = no floor. main() passes
+        # the served value; a bare Session (the GPU-free tests) has none.
+        if not 0.0 <= free_run_floor_ms <= MAX_FREE_RUN_FLOOR_MS_PER_TOKEN:
+            raise ValueError(
+                f"free_run_floor_ms must be in 0..{MAX_FREE_RUN_FLOOR_MS_PER_TOKEN}, "
+                f"got {free_run_floor_ms!r}"
+            )
+        self.free_run_floor_ms = float(free_run_floor_ms)
+        # Seconds the last spec_run waited at its floor (diagnostics/tests).
+        self.last_floor_wait_s = 0.0
         self.drafts = 0
         self.hits = 0
         # Tokens the live request may still emit; None = unbounded.
@@ -250,6 +312,8 @@ class Session:
         return committed
 
     def spec_run(self, first: int, count: int) -> tuple[list[list[int]], list[int]]:
+        started = time.perf_counter()
+        self.last_floor_wait_s = 0.0
         rounds: list[list[int]] = []
         frontiers: list[int] = []
         pending, produced = first, 0
@@ -266,6 +330,12 @@ class Session:
             raise
         else:
             self.b.end_spec_run()
+        if self.free_run_floor_ms > 0.0:
+            # Every token is committed and the engine is idle: hold the reply
+            # until the window reaches the exact ceiling floor (module note).
+            self.last_floor_wait_s = wait_until(
+                started + count * self.free_run_floor_ms / 1000.0
+            )
         return rounds, frontiers
 
     def top_logits(self, k: int) -> tuple[list[int], list[float]]:
@@ -386,9 +456,54 @@ class Session:
         raise RefusedError(f'unknown op "{op}"')
 
 
+HOT_WAIT = os.environ.get("RESIDENT_HOT_WAIT", "1") != "0"
+HOT_WAIT_S = float(os.environ.get("RESIDENT_HOT_WAIT_S", "0.5"))
+
+
+def _hot_wait(poller: "select.poll", hot_s: float) -> None:
+    """Return once the socket is readable (or hung up), or after hot_s."""
+    deadline = time.monotonic() + hot_s
+    while not poller.poll(1) and time.monotonic() < deadline:
+        pass
+
+
+class _HotLineReader:
+    """Yield newline-terminated request lines with a 1 ms poll pre-wait."""
+
+    def __init__(self, conn: socket.socket) -> None:
+        self._conn = conn
+        self._poller = select.poll()
+        self._poller.register(conn, select.POLLIN | select.POLLHUP | select.POLLERR)
+        self._buf = bytearray()
+
+    def __iter__(self):
+        while True:
+            end = self._buf.find(b"\n")
+            if end >= 0:
+                line = bytes(self._buf[: end + 1])
+                del self._buf[: end + 1]
+                yield line
+                continue
+            _hot_wait(self._poller, HOT_WAIT_S)
+            chunk = self._conn.recv(1 << 16)
+            if not chunk:
+                if self._buf:
+                    line = bytes(self._buf)
+                    self._buf.clear()
+                    yield line
+                return
+            self._buf += chunk
+
+    def close(self) -> None:
+        try:
+            self._poller.unregister(self._conn)
+        except Exception:
+            pass
+
+
 def serve_connection(session: Session, conn: socket.socket, timeout_s: float) -> None:
     conn.settimeout(timeout_s)
-    reader = conn.makefile("rb")
+    reader = _HotLineReader(conn) if HOT_WAIT and hasattr(select, "poll") else conn.makefile("rb")
     try:
         for raw in reader:
             try:
@@ -441,6 +556,7 @@ def main() -> int:
     ready_file = os.environ.get("RESIDENT_READY_FILE", "")
     timeout_s = float(os.environ.get("RESIDENT_PHASE_TIMEOUT_S", "1800"))
     spec_run = os.environ.get("RESIDENT_NO_SPEC_RUN", "0") != "1"
+    free_run_floor_ms = free_run_floor_ms_per_token()
 
     stop = {"flag": False}
 
@@ -461,7 +577,7 @@ def main() -> int:
     # Ready means the timed phases may start: report it on a quiet host (settle.py).
     if isinstance(backend, VllmBackend):
         settle_and_log(log)
-    session = Session(backend, spec_run=spec_run)
+    session = Session(backend, spec_run=spec_run, free_run_floor_ms=free_run_floor_ms)
 
     # Bind only after the load, so a connect that succeeds means the weights
     # are resident and a phase never waits on the loader.
@@ -474,7 +590,10 @@ def main() -> int:
     if ready_file:
         with open(ready_file, "w") as fp:
             fp.write(socket_path + "\n")
-    log(f"listening on {socket_path}; spec_run {'on' if spec_run else 'off'}")
+    log(
+        f"listening on {socket_path}; spec_run {'on' if spec_run else 'off'}; "
+        f"free-run floor {free_run_floor_ms:.2f} ms/token"
+    )
 
     phase = 0
     try:

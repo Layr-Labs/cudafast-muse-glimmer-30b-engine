@@ -491,28 +491,43 @@ __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
       __syncthreads();
     }
     const int scan_end = valid_tail_len + (include_bonus ? 1 : 0);
-    for (int i = tid; i < scan_end; i += 256) {
-      const int64_t raw_tok = (i < valid_tail_len)
-          ? static_cast<int64_t>(target_input_ids[ctx_start + i])
-          : static_cast<int64_t>(bonus_token);
-      if (raw_tok >= 0 && raw_tok < vocab_size) {
-        const int tok = static_cast<int>(raw_tok);
-        if (in_static_vocab[tok] == 0) {
-          if (atomicExch(&tail_seen[tok], 1) == 0) {
-            const int slot = atomicAdd(tail_count, 1);
-            if (slot < max_tail) {
-              tail_ids[slot] = tok;
-            } else {
-              tail_seen[tok] = 0;
-            }
+    if (tid < 32) {
+      const uint32_t lane_lt = (1u << tid) - 1u;
+      int cur_cnt = tail_count[0];
+      if (cur_cnt < 0) cur_cnt = 0;
+      for (int base = 0; base < scan_end; base += 32) {
+        const int i = base + tid;
+        int tok = -1;
+        bool cand = false;
+        if (i < scan_end) {
+          const int64_t raw_tok = (i < valid_tail_len)
+              ? static_cast<int64_t>(target_input_ids[ctx_start + i])
+              : static_cast<int64_t>(bonus_token);
+          if (raw_tok >= 0 && raw_tok < vocab_size) {
+            tok = static_cast<int>(raw_tok);
+            cand = (in_static_vocab[tok] == 0);
           }
         }
+        bool admit = false;
+        if (cand && atomicExch(&tail_seen[tok], 1) == 0) {
+          admit = true;
+        }
+        const uint32_t msk = __ballot_sync(0xffffffffu, admit);
+        const int slot = cur_cnt + __popc(msk & lane_lt);
+        if (admit) {
+          if (slot < max_tail) {
+            tail_ids[slot] = tok;
+          } else {
+            tail_seen[tok] = 0;
+          }
+        }
+        cur_cnt += __popc(msk);
+      }
+      if (tid == 0) {
+        tail_count[0] = (cur_cnt > max_tail) ? max_tail : cur_cnt;
       }
     }
     __syncthreads();
-    if (tid == 0 && tail_count[0] > max_tail) {
-      tail_count[0] = max_tail;
-    }
   }
 
   if (s_hist_write) {
