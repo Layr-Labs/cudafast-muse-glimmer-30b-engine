@@ -3251,7 +3251,6 @@ __device__ __forceinline__ uint32_t dhf_f32_to_key(float f) {
   return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
 }
 
-// Kernel 2: Exact 3-pass 8-bit MSB radix select from N_in (<=1536) CTA shortlist -> K_cand (<=256).
 // Grid: M blocks, Block: 256 threads (~3 us, L2-resident).
 __global__ void dhf_select_topk_kernel(
     const float* __restrict__ cta_vals,
@@ -3298,31 +3297,40 @@ __global__ void dhf_select_topk_kernel(
     const uint32_t shift = static_cast<uint32_t>(24 - pass * 8);
     const uint32_t mask = (pass == 0) ? 0u : (~0u << (32 - pass * 8));
     const uint32_t pref = s_prefix;
+    const uint32_t need = tid < 32 ? s_rem_k : 0u;
     s_hist[tid] = 0u;
     __syncthreads();
 
     for (int i = tid; i < N_in; i += 256) {
       const uint32_t k = s_keys[i];
       if ((k & mask) == pref) {
-        atomicAdd(&s_hist[(k >> shift) & 0xFFu], 1u);
+        const uint32_t bucket = (k >> shift) & 0xffu;
+        atomicAdd(&s_hist[(bucket >> 3) + (bucket & 7u) * 32], 1u);
       }
     }
     __syncthreads();
 
-    if (tid == 0) {
-      uint32_t acc = 0u;
-      const uint32_t need = s_rem_k;
-      uint32_t chosen = 0u;
-      for (int b = 255; b >= 0; --b) {
-        const uint32_t c = s_hist[b];
-        if (acc + c >= need) {
-          chosen = static_cast<uint32_t>(b);
-          s_rem_k = need - acc;
-          break;
-        }
-        acc += c;
+    if (tid < 32) {
+      const int group = 31 - tid;
+      uint32_t count = 0;
+      for (int i = 0; i < 8; ++i) count += s_hist[group + i * 32];
+      uint32_t inclusive = count;
+      for (int delta = 1; delta < 32; delta <<= 1) {
+        const uint32_t peer = __shfl_up_sync(0xffffffffu, inclusive, delta);
+        if (tid >= delta) inclusive += peer;
       }
-      s_prefix = pref | (chosen << shift);
+      uint32_t before = inclusive - count;
+      if (need == 0u ? tid == 0 : before < need && need <= inclusive) {
+        for (int i = 7; i >= 0; --i) {
+          const uint32_t c = s_hist[group + i * 32];
+          if (before + c >= need) {
+            s_rem_k = need - before;
+            s_prefix = pref | (static_cast<uint32_t>(group * 8 + i) << shift);
+            break;
+          }
+          before += c;
+        }
+      }
     }
     __syncthreads();
   }
@@ -4122,7 +4130,6 @@ torch::Tensor dhead_fast_argmax(
   else if (mode == 158) launch_s1(std::integral_constant<int, 158>{});
   else launch_s1(std::integral_constant<int, 2>{});
 
-  // Kernel 2: Exact 3-pass radix select -> top K_cand target token IDs per row m.
   dhf_launch_pdl(
       &dhf_select_topk_kernel, dim3(M, 1, 1), 256, st, pdl_mode,
       static_cast<const float*>(sc.cta_vals.data_ptr<float>()),

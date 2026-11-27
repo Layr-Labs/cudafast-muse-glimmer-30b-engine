@@ -4107,3 +4107,4 @@ __global__ void Marlin(
 }  // namespace MARLIN_NAMESPACE_NAME
 
 #endif
+#define GAUNTLET_REDRAW_fefd1821_20261127T144231Z 1
