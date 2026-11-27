@@ -438,7 +438,6 @@ __global__ __launch_bounds__(64) void prefill_kv_only_kernel(
 // =================================================================================================
 // Stage 2 (v3): Lean 128-CTA Exact-12-Tile Ordered Fused Q-Norm/RoPE + Causal GQA-16 Attention
 //   - Single unified loop (NO duplicated half_only body -> compact ~5,600 SASS insns!)
-//   - 4-head interleaved Q-norm/RoPE directly from L1-cached qkv -> SMEM (4x ILP, 0 extra SMEM pass)
 //   - Single-insn min.NaN / max.NaN clamp448
 //   - Normal L1-cached gate load + inline discard.global.L2 on dead qkv & gate lines
 // =================================================================================================
@@ -457,6 +456,33 @@ __device__ __forceinline__ int map_m_grp_128(int g) {
     default: base = 0; break;
   }
   return base + idx;
+}
+
+template <bool kTrim>
+__device__ __forceinline__ void prefill_qk_half(
+    const uint32_t (&q)[8][4], const uint4 (&k)[64][16],
+    float (*scores)[4], int lane, int pairs) {
+  uint32_t b_cur[4], b_nxt[4];
+  ldsm4_k_pair64(b_cur, k, 0, 0, lane);
+  #pragma unroll
+  for (int ks = 0; ks < 8; ++ks) {
+    #pragma unroll
+    for (int sp = 0; sp < 4; ++sp) {
+      if (!kTrim || sp < pairs) {
+        const bool next_pair = sp + 1 < (kTrim ? pairs : 4);
+        const int next_ks = ks + (next_pair ? 0 : 1);
+        if (next_ks < 8) {
+          ldsm4_k_pair64(b_nxt, k, next_pair ? sp + 1 : 0, next_ks, lane);
+        }
+        mma_m16n8k16_bf16(q[ks], b_cur[0], b_cur[1], scores[sp * 2]);
+        mma_m16n8k16_bf16(q[ks], b_cur[2], b_cur[3], scores[sp * 2 + 1]);
+        if (next_ks < 8) {
+          b_cur[0] = b_nxt[0]; b_cur[1] = b_nxt[1];
+          b_cur[2] = b_nxt[2]; b_cur[3] = b_nxt[3];
+        }
+      }
+    }
+  }
 }
 
 template <int Mode, bool UseRope, bool CacheFP32, bool kPdl, bool kDiscardL2>
@@ -490,7 +516,6 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
 
   // ---------------------------------------------------------------------------
   // 1. 4-head Interleaved Fused Q-RMSNorm + qscale + NEOX RoPE directly from raw qkv!
-  //    Loads 4 heads per batch via L1-cached 16B even-lane loads + 4x ILP norm/RoPE -> swizzled SMEM.
   //    Runs BEFORE griddepcontrol.wait so Wave-1 CTAs hide kv_only completely!
   // ---------------------------------------------------------------------------
   uint32_t q_frag[8][4];
@@ -505,21 +530,13 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         qkv + static_cast<int64_t>(q_tok) * 4608 + static_cast<int64_t>(kv_head * 16) * 128;
     const int c_log = lane >> 1;
     const int c_half = lane & 1;
-    const int even_lane = lane & ~1;
 
-    // Issue ALL 16 heads in 4 batches of 4 heads (16B coalesced loads via even-lane uint4 + shfl)
     #pragma unroll
     for (int hb = 0; hb < 16; hb += 4) {
       uint2 raw[4];
       #pragma unroll
       for (int h = 0; h < 4; ++h) {
-        uint4 v = make_uint4(0u, 0u, 0u, 0u);
-        if ((lane & 1) == 0) {
-          v = *reinterpret_cast<const uint4*>(q_row + (hb + h) * 128 + even_lane * 4);
-        }
-        const uint32_t hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
-        const uint32_t hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
-        raw[h] = ((lane & 1) == 0) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+        raw[h] = *reinterpret_cast<const uint2*>(q_row + (hb + h) * 128 + lane * 4);
       }
       uint2 ov[4];
       q_norm_rope_4heads<UseRope>(raw, ov, eps, qscale, lane, c0, c1, c2, c3, s0, s1, s2, s3);
@@ -566,6 +583,9 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     const int block_tok_base = nb << 7;
     const bool is_diag = (nb == nb_max - 1);
     const bool skip_hi = is_diag && half_only;
+    const int diag_pairs = ((m_grp & 15) >> 1) + 1;
+    const int lo_pairs = is_diag && skip_hi ? diag_pairs : 4;
+    const int hi_pairs = is_diag ? diag_pairs - 4 : 4;
 
     float s_frag[16][4];
     #pragma unroll
@@ -583,21 +603,10 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
       cp_async_wait<1>();
     }
     __syncthreads();
-    {
-      uint32_t b_cur[4], b_nxt[4];
-      ldsm4_k_pair64(b_cur, kv_smem[0], 0, 0, lane);
-      #pragma unroll
-      for (int ks = 0; ks < 8; ++ks) {
-        #pragma unroll
-        for (int sp = 0; sp < 4; ++sp) {
-          const int n_sp = (sp + 1) & 3;
-          const int n_ks = ks + (sp == 3 ? 1 : 0);
-          if (n_ks < 8) ldsm4_k_pair64(b_nxt, kv_smem[0], n_sp, n_ks, lane);
-          mma_m16n8k16_bf16(q_frag[ks], b_cur[0], b_cur[1], s_frag[sp * 2 + 0]);
-          mma_m16n8k16_bf16(q_frag[ks], b_cur[2], b_cur[3], s_frag[sp * 2 + 1]);
-          b_cur[0] = b_nxt[0]; b_cur[1] = b_nxt[1]; b_cur[2] = b_nxt[2]; b_cur[3] = b_nxt[3];
-        }
-      }
+    if (lo_pairs < 4) {
+      prefill_qk_half<true>(q_frag, kv_smem[0], s_frag, lane, lo_pairs);
+    } else {
+      prefill_qk_half<false>(q_frag, kv_smem[0], s_frag, lane, 4);
     }
     __syncthreads();
 
@@ -606,21 +615,10 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
       cp_async_commit();
       cp_async_wait<1>();
       __syncthreads();
-      {
-        uint32_t b_cur[4], b_nxt[4];
-        ldsm4_k_pair64(b_cur, kv_smem[1], 0, 0, lane);
-        #pragma unroll
-        for (int ks = 0; ks < 8; ++ks) {
-          #pragma unroll
-          for (int sp = 0; sp < 4; ++sp) {
-            const int n_sp = (sp + 1) & 3;
-            const int n_ks = ks + (sp == 3 ? 1 : 0);
-            if (n_ks < 8) ldsm4_k_pair64(b_nxt, kv_smem[1], n_sp, n_ks, lane);
-            mma_m16n8k16_bf16(q_frag[ks], b_cur[0], b_cur[1], s_frag[8 + sp * 2 + 0]);
-            mma_m16n8k16_bf16(q_frag[ks], b_cur[2], b_cur[3], s_frag[8 + sp * 2 + 1]);
-            b_cur[0] = b_nxt[0]; b_cur[1] = b_nxt[1]; b_cur[2] = b_nxt[2]; b_cur[3] = b_nxt[3];
-          }
-        }
+      if (hi_pairs < 4) {
+        prefill_qk_half<true>(q_frag, kv_smem[1], s_frag + 8, lane, hi_pairs);
+      } else {
+        prefill_qk_half<false>(q_frag, kv_smem[1], s_frag + 8, lane, 4);
       }
       __syncthreads();
       issue_kv64_flat(kv_smem[1], v_flat, block_tok_base + 64, tid);
@@ -630,6 +628,10 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     float m0 = -INFINITY, m1 = -INFINITY;
     #pragma unroll
     for (int ni = 0; ni < 16; ++ni) {
+      if (is_diag && ni >= 2 * diag_pairs) {
+        s_frag[ni][0] = s_frag[ni][1] = s_frag[ni][2] = s_frag[ni][3] = -INFINITY;
+        continue;
+      }
       if (is_diag) {
         const int col0 = block_tok_base + (ni << 3) + (tid_in_grp << 1);
         const int col1 = col0 + 1;
@@ -667,10 +669,17 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
 
     const float max_sc0 = (row_max0 == -INFINITY) ? 0.0f : mul_ftz_f32(scale_log2, row_max0);
     const float max_sc1 = (row_max1 == -INFINITY) ? 0.0f : mul_ftz_f32(scale_log2, row_max1);
+    const bool skip_masked_exp = is_diag && scale_log2 >= 0x1p-126f &&
+        scale_log2 < INFINITY && fabsf(max_sc0) < INFINITY && fabsf(max_sc1) < INFINITY;
 
     uint32_t p_frag[8][4];
     #pragma unroll
     for (int ni = 0; ni < 16; ++ni) {
+      if (skip_masked_exp && ni >= 2 * diag_pairs) {
+        p_frag[ni >> 1][(ni & 1) << 1] = 0;
+        p_frag[ni >> 1][((ni & 1) << 1) + 1] = 0;
+        continue;
+      }
       const float p0 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][0], scale_log2), max_sc0));
       const float p1 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][1], scale_log2), max_sc0));
       const float p2 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][2], scale_log2), max_sc1));

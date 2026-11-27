@@ -49,8 +49,8 @@ TREE_WIDE_M = (
     else 0
 )
 TREE_WIDE_GATE = os.environ.get("MUSE_NATIVE_TREE_WIDE_GATE", "cpc").strip().lower()
-TREE_WIDE_CPC = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_CPC", "3.25"))
-TREE_WIDE_MIN_ROUNDS = int(os.environ.get("MUSE_NATIVE_TREE_WIDE_MIN_ROUNDS", "3"))
+TREE_WIDE_CPC = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_CPC", "4.8"))
+TREE_WIDE_MIN_ROUNDS = int(os.environ.get("MUSE_NATIVE_TREE_WIDE_MIN_ROUNDS", "0"))
 TREE_WIDE_SM = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_SM", "2.0"))
 
 
@@ -275,6 +275,8 @@ def select_verify_m(req_id: str | None, decoded_tokens: int) -> int:
         return wide_m if sm_val < TREE_WIDE_SM else base_m
     # Default zero-sync `cpc` gate: start on fast M=16 for the first TREE_WIDE_MIN_ROUNDS steps,
     # then switch to wide M=32 only when running verify cpc < TREE_WIDE_CPC (hard <3.25 tok/step prose!).
+    if _S._host_rounds == 0 and TREE_WIDE_MIN_ROUNDS <= 0:
+        return wide_m
     if _S._host_rounds < TREE_WIDE_MIN_ROUNDS:
         return base_m
     verify_committed = max(0, int(decoded_tokens))
