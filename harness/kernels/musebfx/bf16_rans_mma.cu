@@ -56,7 +56,7 @@ __device__ __forceinline__ uint64_t br_pol_ef() {
 }
 
 __device__ __forceinline__ void br_cp_async16_ef(uint32_t sd, const void* gs, uint64_t pol) {
-  asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(sd), "l"(gs), "l"(pol));
+  asm volatile("cp.async.cg.shared.global.L2::256B.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(sd), "l"(gs), "l"(pol));
 }
 
 __device__ __forceinline__ void br_cp_async16_ca(uint32_t sd, const void* gs) {
@@ -73,6 +73,13 @@ __device__ __forceinline__ uint32_t br_lds16(uint32_t a) {
   unsigned short v;
   asm volatile("ld.shared.u16 %0, [%1];" : "=h"(v) : "r"(a));
   return static_cast<uint32_t>(v);
+}
+
+__device__ __forceinline__ uint32_t br_pack_bf16x2_lop3(uint32_t u_dup, uint32_t e_lo, uint32_t e_hi) {
+  const uint32_t e_sh7 = __byte_perm(e_lo, e_hi, 0x5410) << 7;
+  uint32_t out;
+  asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(out) : "r"(u_dup), "r"(0x807F807Fu), "r"(e_sh7));
+  return out;
 }
 
 __device__ __forceinline__ void br_xpose4(
@@ -424,18 +431,14 @@ __global__ void __launch_bounds__(128) br_pair_unpack_kernel(
           }
         }
       }
-      const uint32_t sm01 = __byte_perm(sm_w0, 0u, 0x4140);
-      const uint32_t sm23 = __byte_perm(sm_w0, 0u, 0x4342);
-      const uint32_t sm45 = __byte_perm(sm_w1, 0u, 0x4140);
-      const uint32_t sm67 = __byte_perm(sm_w1, 0u, 0x4342);
       *reinterpret_cast<uint32_t*>(orow + 32 * s + 2 * t) =
-          ((sm01 & 0x00800080u) << 8) | (sm01 & 0x007F007Fu) | (ex[0] << 7) | (ex[1] << 23);
+          br_pack_bf16x2_lop3(__byte_perm(sm_w0, 0u, 0x1100), ex[0], ex[1]);
       *reinterpret_cast<uint32_t*>(orow + 32 * s + 8 + 2 * t) =
-          ((sm23 & 0x00800080u) << 8) | (sm23 & 0x007F007Fu) | (ex[2] << 7) | (ex[3] << 23);
+          br_pack_bf16x2_lop3(__byte_perm(sm_w0, 0u, 0x3322), ex[2], ex[3]);
       *reinterpret_cast<uint32_t*>(orow + 32 * s + 16 + 2 * t) =
-          ((sm45 & 0x00800080u) << 8) | (sm45 & 0x007F007Fu) | (ex[4] << 7) | (ex[5] << 23);
+          br_pack_bf16x2_lop3(__byte_perm(sm_w1, 0u, 0x1100), ex[4], ex[5]);
       *reinterpret_cast<uint32_t*>(orow + 32 * s + 24 + 2 * t) =
-          ((sm67 & 0x00800080u) << 8) | (sm67 & 0x007F007Fu) | (ex[6] << 7) | (ex[7] << 23);
+          br_pack_bf16x2_lop3(__byte_perm(sm_w1, 0u, 0x3322), ex[6], ex[7]);
     }
   }
   bool bad = false;
@@ -901,10 +904,8 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
 #undef BR_ESC_P
             }
 
-            const uint32_t sm01 = __byte_perm(sm_w0, 0u, 0x4140);
-            const uint32_t sm23 = __byte_perm(sm_w0, 0u, 0x4342);
-            const uint32_t b0 = ((sm01 & 0x00800080u) << 8) | (sm01 & 0x007F007Fu) | (e0 << 7) | (e1 << 23);
-            const uint32_t b1 = ((sm23 & 0x00800080u) << 8) | (sm23 & 0x007F007Fu) | (e2 << 7) | (e3 << 23);
+            const uint32_t b0 = br_pack_bf16x2_lop3(__byte_perm(sm_w0, 0u, 0x1100), e0, e1);
+            const uint32_t b1 = br_pack_bf16x2_lop3(__byte_perm(sm_w0, 0u, 0x3322), e2, e3);
             if constexpr (kM16) {
               bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
               if constexpr (kM32) {
@@ -914,10 +915,8 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
               bf16_mma_m16n8k16(c0, c1, c2, c3, a0, a2, b0, b1);
             }
 
-            const uint32_t sm45 = __byte_perm(sm_w1, 0u, 0x4140);
-            const uint32_t sm67 = __byte_perm(sm_w1, 0u, 0x4342);
-            const uint32_t b2 = ((sm45 & 0x00800080u) << 8) | (sm45 & 0x007F007Fu) | (e4 << 7) | (e5 << 23);
-            const uint32_t b3 = ((sm67 & 0x00800080u) << 8) | (sm67 & 0x007F007Fu) | (e6 << 7) | (e7 << 23);
+            const uint32_t b2 = br_pack_bf16x2_lop3(__byte_perm(sm_w1, 0u, 0x1100), e4, e5);
+            const uint32_t b3 = br_pack_bf16x2_lop3(__byte_perm(sm_w1, 0u, 0x3322), e6, e7);
             if constexpr (kM16) {
               bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a4, a5, a6, a7, b2, b3);
               if constexpr (kM32) {

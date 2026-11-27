@@ -277,9 +277,7 @@ __device__ __forceinline__ void k_loop(
     if (tid == 0 && q + kDist < total) start_copy(q + kDist);
     // k-half 0 of k-tile t (operands already in registers); meanwhile k-half 1 of the same stage is loaded.
     load_bs(1, s);
-#ifdef MARLINW_TMA_GATEUP
     dequant_to(1);
-#endif
     if constexpr (kSingleFa) {
       const uint32_t sa = sbase + kStageBytes * s + a_rd1;
 #pragma unroll
@@ -291,9 +289,6 @@ __device__ __forceinline__ void k_loop(
         ldsm4(fa[0][i], sa + 2048 * i);
       }
       __syncwarp();
-#ifndef MARLINW_TMA_GATEUP
-      dequant_to(1);
-#endif
       if (lane == 0) mbar_arrive(empty_bar + 8 * s);
       const bool has_next = (t + 1 < iters);
       if (has_next) {
@@ -324,9 +319,6 @@ __device__ __forceinline__ void k_loop(
       }
       __syncwarp();
       if (lane == 0) mbar_arrive(empty_bar + 8 * s);  // warp-aggregated empty signal
-#ifndef MARLINW_TMA_GATEUP
-      dequant_to(1);
-#endif
 #pragma unroll
       for (int i = 0; i < MB; i++) {
         mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
