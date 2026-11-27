@@ -2912,7 +2912,6 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
   if ((pdl_mode & 1) != 0) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
-  __shared__ int32_t s_raw_u[32];
   __shared__ uint32_t s_exact_mask;
   __shared__ uint32_t s_matched_mask;
   __shared__ int32_t s_eff_raw_ns;
@@ -2923,9 +2922,10 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
   __shared__ int32_t s_do_tr;
   __shared__ int32_t s_do_oov;
 
+  constexpr unsigned kWarpMask = 0xffffffffu;
   const int32_t init_ns = num_sampled[0];
+  int32_t uv = -1;
   if (lane < tree_m) {
-    int32_t uv = -1;
     if (no_hit_mode == 0) {
       if (lane < 7) {
         const int chain_lim = (chain_all_valid != 0) ? 7 : ((init_ns < 0) ? 0 : ((init_ns < 7) ? init_ns : 7));
@@ -2938,16 +2938,47 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
         uv = (v >= 0 && v < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v) : -1;
       }
     }
-    s_raw_u[lane] = uv;
   }
-  __syncwarp();
+
+  const int mode = __shfl_sync(kWarpMask, lane == 0 ? leaf_flag[0] : 0, 0);
+  uint32_t matched_mask = 0u;
+  int32_t hit_src0 = 0;
+  int32_t hit_len = 0;
+  if (mode < 0 && init_ns >= 1 && init_ns <= 6 && no_hit_mode == 0) {
+    const bool is_leaf = lane >= 7 && lane < tree_m;
+    const int64_t leaf_tok = is_leaf ? saved_leaf_toks[lane] : -1;
+    const int32_t leaf_k = is_leaf ? saved_leaf_k[lane] : -1;
+    const int32_t leaf_parent =
+        is_leaf && saved_leaf_parent != nullptr ? saved_leaf_parent[lane] : -1;
+    int32_t cur_parent = -1;
+    int64_t tok = sampled_tokens[init_ns - 1];
+    for (int32_t dst = init_ns; dst <= 6; ++dst) {
+      const uint32_t matches = __ballot_sync(
+          kWarpMask, leaf_parent == cur_parent && leaf_k == dst &&
+                         leaf_tok >= 0 && tok == leaf_tok);
+      if (matches == 0u) break;
+      const int32_t row = __ffs(matches) - 1;
+      const int32_t next_tok = __shfl_sync(kWarpMask, uv, row);
+      if (next_tok < 0) break;
+      if (lane == 0) {
+        sampled_tokens[dst] = static_cast<int64_t>(next_tok);
+        if (hit_flag_len >= 2 + 2 * (hit_len + 1)) {
+          hit_flag[2 + 2 * hit_len] = dst;
+          hit_flag[3 + 2 * hit_len] = row;
+        }
+      }
+      if (hit_len == 0) hit_src0 = row;
+      ++hit_len;
+      matched_mask |= 1u << row;
+      tok = static_cast<int64_t>(next_tok);
+      cur_parent = row;
+    }
+  }
 
   if (lane == 0) {
-    const int mode = leaf_flag[0];
-    leaf_flag[0] = 0;  // Clear immediately so non-tree steps see 0.
-    int32_t ns = init_ns;
-    int32_t nr = num_rejected[0];
-    const int32_t raw_ns = ns;
+    leaf_flag[0] = 0;
+    const int32_t ns = init_ns + hit_len;
+    const int32_t raw_ns = init_ns;
     uint32_t casc_row_mask = 0u;
     int32_t casc_m_div1 = 0;
     if (cascade_meta != nullptr) {
@@ -2956,52 +2987,11 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
       cascade_meta[5] = 0;
       cascade_meta[6] = 0;
     }
-    int32_t casc_hit_cnt = 0;
-    uint32_t matched_mask = 0u;
-    int32_t hit_dst0 = 0;
-    int32_t hit_src0 = 0;
-    int32_t hit_len = 0;
-
-    // Supports arbitrary-depth (1..6-level) commits up to ns == 7 (nr == 0) strictly preserving ns + nr == 7.
-    if (mode < 0 && ns >= 1 && ns <= 6 && no_hit_mode == 0) {
-      int32_t cur_parent = -1;
-      for (int stage = 0; stage < 6 && ns <= 6; ++stage) {
-        const int64_t tok_k = sampled_tokens[ns - 1];
-        int matched_r = -1;
-        for (int r = 7; r < tree_m; ++r) {
-          const int32_t par = (saved_leaf_parent != nullptr) ? saved_leaf_parent[r] : -1;
-          if (par == cur_parent && saved_leaf_k[r] == ns &&
-              saved_leaf_toks[r] >= 0 && tok_k == saved_leaf_toks[r]) {
-            matched_r = r;
-            break;
-          }
-        }
-        if (matched_r < 0) break;
-        const int32_t u_r = s_raw_u[matched_r];
-        if (u_r < 0) break;
-        matched_mask |= (1u << matched_r);
-        const int32_t dst_r = ns;
-        sampled_tokens[dst_r] = static_cast<int64_t>(u_r);
-        if ((casc_row_mask & (1u << matched_r)) != 0u) {
-          casc_hit_cnt += 1;
-        }
-        if (hit_len == 0) {
-          hit_dst0 = dst_r;
-          hit_src0 = matched_r;
-        }
-        if (hit_flag_len >= 2 + 2 * (hit_len + 1)) {
-          hit_flag[2 + 2 * hit_len] = dst_r;
-          hit_flag[3 + 2 * hit_len] = matched_r;
-        }
-        hit_len += 1;
-        ns += 1;
-        nr -= 1;
-        cur_parent = matched_r;
-      }
-      if (hit_len > 0) {
-        num_sampled[0] = ns;
-        num_rejected[0] = nr;
-      }
+    const int32_t hit_dst0 = hit_len > 0 ? init_ns : 0;
+    const int32_t casc_hit_cnt = __popc(casc_row_mask & matched_mask);
+    if (hit_len > 0) {
+      num_sampled[0] = ns;
+      num_rejected[0] -= hit_len;
     }
 
     hit_flag[0] = hit_dst0;
@@ -3188,7 +3178,7 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
             : (((s_exact_mask & (1u << lane)) != 0u) || lane <= s_eff_raw_ns ||
                ((s_matched_mask & (1u << lane)) != 0u));
         if (row_ok) {
-          tok_cone = s_raw_u[lane];
+          tok_cone = uv;
         }
       }
       admit_warp_tok(tok_cone);
@@ -3198,10 +3188,9 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
   // Warp-parallel 32-lane coalesced int4 append to tr_log (~1.5 us vs ~35 us scalar).
   if (s_do_tr != 0) {
     int4 ctx4 = make_int4(-1, -1, -1, -1);
-    int32_t u_t = -1;
+    const int32_t u_t = uv;
     if (lane < tree_m) {
       ctx4 = reinterpret_cast<const int4*>(saved_row_ctx)[lane];
-      u_t = s_raw_u[lane];
     }
     const bool valid = (lane < tree_m && ctx4.x >= 0 && ctx4.x < vocab_size && u_t >= 0 && u_t < vocab_size);
     const uint32_t vmask = __ballot_sync(0xffffffffu, valid);

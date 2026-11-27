@@ -871,8 +871,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             const uint32_t Pw01 = __byte_perm(e0, e1, 0x7740);
             const uint32_t Pw23 = __byte_perm(e2, e3, 0x7740);
             const uint32_t Pw = __byte_perm(Pw01, Pw23, 0x5410);
-            const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
-            const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
+            const uint32_t hiE3 = (Pw >> 1) & 0x78787878u, loE3 = (Pw << 3) & 0x78787878u;
+            const uint32_t E0 = __byte_perm(hiE3, loE3, 0x5140), E1 = __byte_perm(hiE3, loE3, 0x7362);
             if constexpr (!kXsmem && kXGlobalMode == 1) {
               if ((s & 1) == 0) {
                 rans_xpose4(v_lo, t, a.x, a.y, a_next.x, a_next.y);
@@ -906,8 +906,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             const uint32_t r3 = n3 ? rans_lds16(ro3) : 0u;
             // Assemble FP8 B-operand from nw + E0/E1, issue MMA (hides r0..r3 LDS latency), commit states.
             const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-            const uint32_t bw0 = rans_pack_e4m3x4(u0, E0 << 3);
-            const uint32_t bw1 = rans_pack_e4m3x4(u1, E1 << 3);
+            const uint32_t bw0 = rans_pack_e4m3x4(u0, E0);
+            const uint32_t bw1 = rans_pack_e4m3x4(u1, E1);
             if constexpr (kM16) {
               rans_mma_e4m3_m16(c0, c1, c2, c3, a.x, a_hi.x, a.y, a_hi.y, bw0, bw1);
               if constexpr (kM32) {
@@ -1026,11 +1026,11 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
         if (need) x = (x << 16) | rans_lds16(ring_s | ((pwb + (__popc(m & lt) << 1)) & (RB - 1u)));
         pwb += __popc(m) << 1;
       }
-      const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
-      const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
+      const uint32_t hiE3 = (Pw >> 1) & 0x78787878u, loE3 = (Pw << 3) & 0x78787878u;
+      const uint32_t E0 = __byte_perm(hiE3, loE3, 0x5140), E1 = __byte_perm(hiE3, loE3, 0x7362);
       const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-      const uint32_t bw0 = rans_pack_e4m3x4(u0, E0 << 3);
-      const uint32_t bw1 = rans_pack_e4m3x4(u1, E1 << 3);
+      const uint32_t bw0 = rans_pack_e4m3x4(u0, E0);
+      const uint32_t bw1 = rans_pack_e4m3x4(u1, E1);
       uint2 a = make_uint2(0u, 0u);
       uint2 a_hi = make_uint2(0u, 0u);
       if (g < pb.M) {
@@ -1437,16 +1437,25 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   const size_t dsmem_xsmem = (size_t)((M > 8) ? kRansXsmemBytes : kRansXsmemBytesM8) + ((size_t)rg << 9) + (size_t)wpb * ((size_t)rg << 9);
   const bool x_aligned16 = ((reinterpret_cast<uintptr_t>(x) & 15u) == 0u) &&
                            (act_mode != 1 || ((reinterpret_cast<uintptr_t>(x_aux) & 15u) == 0u));
+  static const bool xsmem_fused_m8 = []() {
+    const char* env = std::getenv("MUSERANS_XSMEM_FUSED_M8");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  const bool can_xsmem_fused = par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 20 &&
+                               x_aligned16 && ((K >> 5) % 16 == 0) &&
+                               dsmem_xsmem <= (size_t)(RANS_MAX_SMEM - RANS_LUT_BYTES);
   bool use_xsmem_fused = false;
   if (M > 1) {
-    // M rows: stage M*K bytes of x if M<=8 and it fits with this wpb (for act_mode 0 or 1);
-    // for M>8 (or act_mode 2 where M*K doesn't fit), use chunked SMEM (kXsmem) or global __ldg.
-    if (act_mode != 2 && M <= 8 && rans_fits(M * K, wpb, 9, rg)) {
+    // Route M=2..8 fused mul_sigmoid (act_mode==1, e.g. 42x o_proj) to the pipelined kXsmem+ldmatrix
+    // path (kMaxThreads=576, #pragma unroll 4, 55.3 KiB SMEM) instead of the legacy full-M*K SMEM
+    // prologue (kMaxThreads=640, no unroll, 67.6 KiB SMEM).
+    if (act_mode == 1 && M <= 8 && xsmem_fused_m8 && can_xsmem_fused) {
+      pb.x_global = 1;
+      use_xsmem_fused = true;
+      dsmem = dsmem_xsmem;
+    } else if (act_mode != 2 && M <= 8 && rans_fits(M * K, wpb, 9, rg)) {
       dsmem = rans_dsmem(M * K, wpb, 9, rg);
     } else if (act_mode == 1 || act_mode == 2) {
-      const bool can_xsmem_fused = par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 20 &&
-                                   x_aligned16 && ((K >> 5) % 16 == 0) &&
-                                   dsmem_xsmem <= (size_t)(RANS_MAX_SMEM - RANS_LUT_BYTES);
       TORCH_CHECK(can_xsmem_fused, "rans fused multi-M requires par4/ns4/rg4/ilv9, 16B-aligned x, S%16==0, and smem fit");
       pb.x_global = 1;
       use_xsmem_fused = true;
