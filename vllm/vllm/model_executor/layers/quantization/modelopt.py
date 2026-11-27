@@ -1449,7 +1449,7 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                 and (k_dim % 128 == 0)
                 and os.environ.get("MUSE_DHEAD_FAST", "1") != "0"
             )
-            dhead_impl = os.environ.get("MUSE_DHEAD_IMPL", "4d64").strip().lower()
+            dhead_impl = os.environ.get("MUSE_DHEAD_IMPL", "hadamard").strip().lower()
             if want_fast_dhead and dhead_impl != "hadamard":
                 try:
                     import muse_bfx_ext as _bfx
@@ -1750,8 +1750,8 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                         sent_chk = _bfx.draft_head_topc(
                             x_chk, w_packed, ids, len(draft_ids), k_dim, dhead_ctas, dhead_mode, dhead_rk
                         )
-                        tt_chk = torch.empty((36,), dtype=torch.long, device=dev)
-                        tv_chk = torch.empty((36,), dtype=torch.float32, device=dev)
+                        tt_chk = torch.empty((48,), dtype=torch.long, device=dev)
+                        tv_chk = torch.empty((48,), dtype=torch.float32, device=dev)
                         got_arg = _bfx.draft_vocab_tail_argmax(
                             x_chk, sent_chk, ids, tail_ids, tail_count,
                             raw_w_full, raw_s_full, raw_gs_full, 1.0,

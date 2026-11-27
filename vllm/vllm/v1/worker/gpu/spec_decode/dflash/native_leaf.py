@@ -223,7 +223,8 @@ def select_verify_m(req_id: str | None, decoded_tokens: int) -> int:
     if TREE_WIDE_GATE == "sm":
         if _S._host_rounds == 0 or _S.tree_vals is None or _S.tree_vals.numel() < 36:
             return wide_m
-        sm_val = float((_S.tree_vals[0:36:6] - _S.tree_vals[1:36:6]).mean().item())
+        _tk = 8 if _S.tree_vals.numel() >= 48 else 6
+        sm_val = float((_S.tree_vals[0 : 6 * _tk : _tk] - _S.tree_vals[1 : 6 * _tk : _tk]).mean().item())
         return wide_m if sm_val < TREE_WIDE_SM else base_m
     # Default zero-sync `cpc` gate: enable wide_m on step 0 or while running verify cpc < TREE_WIDE_CPC.
     # decoded_tokens = num_computed_tokens - prefill_len == sum(committed_tokens[0..round-1]).
@@ -297,38 +298,38 @@ def get_margin_buf(device: torch.device) -> torch.Tensor | None:
 
 
 def get_tree_top_buf(device: torch.device) -> torch.Tensor | None:
-    """Return fixed-address int64[36] ([6, 6]) buffer for drafter rows 0..5 top-6 IDs (CUDA-graph safe)."""
+    """Return fixed-address int64[48] ([6, 8]) buffer for drafter rows 0..5 top-8 IDs (CUDA-graph safe)."""
     if not ENABLED or TREE_M == 0 or device.type != "cuda":
         return None
     if (
         _S.tree_top is not None
         and _S.tree_top.device == device
-        and _S.tree_top.numel() >= 36
+        and _S.tree_top.numel() >= 48
         and not _S.tree_top.is_inference()
     ):
         return _S.tree_top
     if torch.cuda.is_current_stream_capturing():
         return _S.tree_top if (_S.tree_top is not None and _S.tree_top.device == device) else None
     with torch.inference_mode(False):
-        _S.tree_top = torch.full((36,), -1, dtype=torch.int64, device=device)
+        _S.tree_top = torch.full((48,), -1, dtype=torch.int64, device=device)
     return _S.tree_top
 
 
 def get_tree_vals_buf(device: torch.device) -> torch.Tensor | None:
-    """Return fixed-address float32[36] ([6, 6]) buffer for drafter rows 0..5 top-6 logits (CUDA-graph safe)."""
+    """Return fixed-address float32[48] ([6, 8]) buffer for drafter rows 0..5 top-8 logits (CUDA-graph safe)."""
     if not ENABLED or TREE_M == 0 or device.type != "cuda":
         return None
     if (
         _S.tree_vals is not None
         and _S.tree_vals.device == device
-        and _S.tree_vals.numel() >= 36
+        and _S.tree_vals.numel() >= 48
         and not _S.tree_vals.is_inference()
     ):
         return _S.tree_vals
     if torch.cuda.is_current_stream_capturing():
         return _S.tree_vals if (_S.tree_vals is not None and _S.tree_vals.device == device) else None
     with torch.inference_mode(False):
-        _S.tree_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
+        _S.tree_vals = torch.full((48,), -1e30, dtype=torch.float32, device=device)
     return _S.tree_vals
 
 
@@ -549,19 +550,19 @@ def init_kv_table(
         if (
             _S.tree_top is None
             or _S.tree_top.device != device
-            or _S.tree_top.numel() < 36
+            or _S.tree_top.numel() < 48
             or _S.tree_top.is_inference()
         ):
-            _S.tree_top = torch.full((36,), -1, dtype=torch.int64, device=device)
+            _S.tree_top = torch.full((48,), -1, dtype=torch.int64, device=device)
         else:
             _S.tree_top.fill_(-1)
         if (
             _S.tree_vals is None
             or _S.tree_vals.device != device
-            or _S.tree_vals.numel() < 36
+            or _S.tree_vals.numel() < 48
             or _S.tree_vals.is_inference()
         ):
-            _S.tree_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
+            _S.tree_vals = torch.full((48,), -1e30, dtype=torch.float32, device=device)
         else:
             _S.tree_vals.fill_(-1e30)
         if (

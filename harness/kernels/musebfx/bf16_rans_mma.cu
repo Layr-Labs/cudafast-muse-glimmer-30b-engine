@@ -69,6 +69,22 @@ __device__ __forceinline__ uint32_t br_lds32(uint32_t a) {
   return v;
 }
 
+__device__ __forceinline__ void br_lds64(uint32_t a, uint32_t& v0, uint32_t& v1) {
+  asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];" : "=r"(v0), "=r"(v1) : "r"(a));
+}
+
+__device__ __forceinline__ uint32_t br_lop3_ea(uint32_t a, uint32_t b, uint32_t c) {
+  uint32_t d;
+  asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+  return d;
+}
+
+__device__ __forceinline__ uint32_t br_pack_bf16x2(uint32_t sm_pair, uint32_t e_lo, uint32_t e_hi) {
+  const uint32_t exp_bits = (e_lo << 7) | (e_hi << 23);
+  const uint32_t se = br_lop3_ea(sm_pair << 8, 0x80008000u, exp_bits);
+  return br_lop3_ea(sm_pair, 0x007F007Fu, se);
+}
+
 __device__ __forceinline__ uint32_t br_lds16(uint32_t a) {
   unsigned short v;
   asm volatile("ld.shared.u16 %0, [%1];" : "=h"(v) : "r"(a));
@@ -856,7 +872,9 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
             }
 
             uint32_t sm_w0, sm_w1;
-            if ((pwb_n & 2u) == 0u) {
+            if ((pwb_n & 7u) == 0u) {
+              br_lds64(ring_s + (na & (kRB - 1u)), sm_w0, sm_w1);
+            } else if ((pwb_n & 2u) == 0u) {
               sm_w0 = br_lds32(ring_s + (na & (kRB - 1u)));
               sm_w1 = br_lds32(ring_s + ((na + 4u) & (kRB - 1u)));
             } else {
@@ -902,8 +920,8 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
 
             const uint32_t sm01 = __byte_perm(sm_w0, 0u, 0x4140);
             const uint32_t sm23 = __byte_perm(sm_w0, 0u, 0x4342);
-            const uint32_t b0 = ((sm01 & 0x00800080u) << 8) | (sm01 & 0x007F007Fu) | (e0 << 7) | (e1 << 23);
-            const uint32_t b1 = ((sm23 & 0x00800080u) << 8) | (sm23 & 0x007F007Fu) | (e2 << 7) | (e3 << 23);
+            const uint32_t b0 = br_pack_bf16x2(sm01, e0, e1);
+            const uint32_t b1 = br_pack_bf16x2(sm23, e2, e3);
             if constexpr (kM16) {
               bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
               if constexpr (kM32) {
@@ -915,8 +933,8 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
 
             const uint32_t sm45 = __byte_perm(sm_w1, 0u, 0x4140);
             const uint32_t sm67 = __byte_perm(sm_w1, 0u, 0x4342);
-            const uint32_t b2 = ((sm45 & 0x00800080u) << 8) | (sm45 & 0x007F007Fu) | (e4 << 7) | (e5 << 23);
-            const uint32_t b3 = ((sm67 & 0x00800080u) << 8) | (sm67 & 0x007F007Fu) | (e6 << 7) | (e7 << 23);
+            const uint32_t b2 = br_pack_bf16x2(sm45, e4, e5);
+            const uint32_t b3 = br_pack_bf16x2(sm67, e6, e7);
             if constexpr (kM16) {
               bf16_mma_m16n8k16_m16(c0, c1, c2, c3, a4, a5, a6, a7, b2, b3);
               if constexpr (kM32) {

@@ -1432,7 +1432,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._lmhead_cg_step += 1
             graphs[slot].replay()
             return outs[slot]
-        if sig in self._lmhead_cg_rejected or len(entries) >= 4:
+        if sig in self._lmhead_cg_rejected or len(entries) >= 16:
             return None
 
         mult = self.model.output_multiplier
@@ -1564,7 +1564,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._verify_lmhead_cg_step += 1
             graphs[slot].replay()
             return slots[slot]
-        if sig in self._verify_lmhead_cg_rejected or len(entries) >= 16:
+        if sig in self._verify_lmhead_cg_rejected or len(entries) >= 32:
             return None
         try:
             ref_buf = torch.full((1, buf_cols), -1, dtype=torch.int64, device=self.device)
@@ -1656,7 +1656,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or not self.cudagraph_manager._graphs_captured
             or torch.cuda.is_current_stream_capturing()
             or input_batch.num_reqs != 1
-            or not (1 <= input_batch.num_tokens <= 16)
+            or not (1 <= input_batch.num_tokens <= 32)
             or input_batch.num_tokens_after_padding != input_batch.num_tokens
             or int(input_batch.num_computed_tokens_np[0]) < int(input_batch.prefill_len_np[0])
         ):
@@ -1716,7 +1716,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 and getattr(_me, "is_single_kernel_m1", lambda: False)()
             )
             can_direct_mm = (
-                1 < n_tok <= 16
+                1 < n_tok <= 32
                 and getattr(_me, "is_single_kernel_m", lambda: False)()
             )
             if (
