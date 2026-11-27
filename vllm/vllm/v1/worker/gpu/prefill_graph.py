@@ -283,6 +283,10 @@ class PrefillGraph:
         self._zp_stage_graph: torch.cuda.CUDAGraph | None = None
         self._zp_stage_sig: tuple | None = None
         self._zp_stage_graph_failed = False
+        self._prelaunch_enabled = os.environ.get("VLLM_PREFILL_PRELAUNCH", "1") != "0"
+        self._canonical_bids: tuple[tuple[int, ...], ...] | None = None
+        self._prelaunched_bids: tuple[tuple[int, ...], ...] | None = None
+        self._prelaunch_count = 0
         self._logged_refusal = False
 
         model_state = runner.model_state
@@ -345,12 +349,15 @@ class PrefillGraph:
         with torch.cuda.graph(self.graph, self.pool):
             self.model_output = self._forward()
             get_offloader().join_after_forward()
-        try:
-            from vllm.v1.worker.gpu.cudagraph_utils import upload_cudagraph
+        if os.environ.get("VLLM_CUDAGRAPH_UPLOAD", "1") != "0" and hasattr(
+            self.graph, "raw_cuda_graph_exec"
+        ):
+            try:
+                import muse_bfx_ext as _bfx_up
 
-            upload_cudagraph(self.graph)
-        except Exception:  # noqa: BLE001
-            pass
+                _bfx_up.cuda_graph_upload(int(self.graph.raw_cuda_graph_exec()))
+            except Exception:
+                pass
         torch.accelerator.synchronize()
         if isinstance(self.model_output, tuple):
             if (
@@ -415,13 +422,10 @@ class PrefillGraph:
             self._zp_zero_1_np = np.zeros(1, dtype=np.int32)
             self._zp_is_pref_np = np.array([True], dtype=np.bool_)
             self._zp_seq_ub = torch.from_numpy(self._zp_num_sched_np.copy())
-            self._zp_last_block_ids: tuple[tuple[int, ...], ...] | None = None
-            self._zp_canonical_block_ids: tuple[tuple[int, ...], ...] | None = None
             self._zp_const_graph: torch.cuda.CUDAGraph | None = None
             self._zp_const_skip_pad = False
             try:
                 from vllm import envs
-                from vllm.v1.worker.gpu.cudagraph_utils import upload_cudagraph
                 skip_pad = bool(envs.VLLM_MOE_SKIP_PADDING)
                 raw_pos = ib.positions[:n]
                 raw_pad = ib.is_padding[:n]
@@ -439,7 +443,6 @@ class PrefillGraph:
                     raw_pos.copy_(self._zp_positions_gpu, non_blocking=True)
                     ib.seq_lens[:1].copy_(self._zp_seq_lens_gpu[:1], non_blocking=True)
                     ib.query_start_loc[:2].copy_(self._zp_qsl_gpu[:2], non_blocking=True)
-                upload_cudagraph(cg)
                 torch.cuda.synchronize(dev)
                 self._zp_const_graph = cg
                 self._zp_const_skip_pad = skip_pad
@@ -615,36 +618,31 @@ class PrefillGraph:
             bt_view = block_tables.input_block_tables[g][:1]
             if (bt_view.data_ptr(), tuple(bt_view.shape), tuple(bt_view.stride())) != sig:
                 return False
-        bids_key = tuple(tuple(b) for b in block_ids)
-        nbs = tuple(len(b) for b in block_ids)
-        sig = (
-            nbs,
-            bool(skip_padding),
-            input_buffers.seq_lens.data_ptr(),
-            input_buffers.query_start_loc.data_ptr(),
-        )
-        if (
-            self._zp_stage_graph is not None
-            and self._zp_stage_sig == sig
-            and bids_key == self._zp_last_block_ids
-        ):
-            self._zp_pin_ids_np[:] = prefill_token_ids
-            self._zp_stage_graph.replay()
-            return True
+        nbs_list: list[int] = []
         for g in range(block_tables.num_kv_cache_groups):
             bs = block_tables.block_sizes[g]
             bids = block_ids[g]
             nb = len(bids)
             if nb * bs < n or nb > self._zp_pin_bt_np[g].shape[0]:
                 return False
+            nbs_list.append(nb)
             bids_arr = np.asarray(bids, dtype=np.int64)
             slots_full = (bids_arr[:, None] * bs + self._zp_bs_offsets[g][None, :]).reshape(-1)
             self._zp_pin_slots_np[g, :] = slots_full[:n]
             bt_np = self._zp_pin_bt_np[g]
             bt_np[:nb] = bids_arr
-        self._zp_last_block_ids = bids_key
         self._zp_pin_ids_np[:] = prefill_token_ids
+        nbs = tuple(nbs_list)
+        cur_bids = tuple(tuple(int(x) for x in block_ids[g]) for g in range(block_tables.num_kv_cache_groups))
+        sig = (
+            nbs,
+            bool(skip_padding),
+            input_buffers.seq_lens.data_ptr(),
+            input_buffers.query_start_loc.data_ptr(),
+        )
         if self._zp_stage_graph is not None and self._zp_stage_sig == sig:
+            self._canonical_bids = cur_bids
+            self._canonical_primed_bids = cur_bids
             self._zp_stage_graph.replay()
             return True
 
@@ -675,14 +673,19 @@ class PrefillGraph:
                 sg = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(sg, pool=self.pool):
                     _emit_copies()
-                try:
-                    from vllm.v1.worker.gpu.cudagraph_utils import upload_cudagraph
+                if os.environ.get("VLLM_CUDAGRAPH_UPLOAD", "1") != "0" and hasattr(
+                    sg, "raw_cuda_graph_exec"
+                ):
+                    try:
+                        import muse_bfx_ext as _bfx_up
 
-                    upload_cudagraph(sg)
-                except Exception:  # noqa: BLE001
-                    pass
+                        _bfx_up.cuda_graph_upload(int(sg.raw_cuda_graph_exec()))
+                    except Exception:
+                        pass
                 self._zp_stage_graph = sg
                 self._zp_stage_sig = sig
+                self._canonical_bids = cur_bids
+                self._canonical_primed_bids = cur_bids
                 self._zp_stage_graph.replay()
                 logger.info("Prefill graph: captured zero-prep staging CUDA graph (nbs=%s)", nbs)
                 return True
@@ -690,5 +693,38 @@ class PrefillGraph:
                 self._zp_stage_graph_failed = True
                 logger.warning("Prefill graph: zero-prep staging graph skipped (%s); using direct copies", exc)
 
+        self._canonical_primed_bids = None
         _emit_copies()
+        return True
+
+    def pre_launch_canonical(self, prefill_token_ids: list[int]) -> bool:
+        """Launch canonical 512-token prefill immediately before Python add_request/schedule."""
+        if (
+            not self._prelaunch_enabled
+            or not self._zp_verified
+            or self._zp_failed
+            or self._zp_stage_graph is None
+            or self._canonical_bids is None
+            or len(prefill_token_ids) != self.num_tokens
+        ):
+            return False
+        if getattr(self, "_canonical_primed_bids", None) != self._canonical_bids:
+            for g, bids in enumerate(self._canonical_bids):
+                nb = len(bids)
+                bs = int(self._zp_bs_offsets[g].shape[0])
+                bids_arr = np.asarray(bids, dtype=np.int64)
+                slots_full = (bids_arr[:, None] * bs + self._zp_bs_offsets[g][None, :]).reshape(-1)
+                self._zp_pin_slots_np[g, :] = slots_full[: self.num_tokens]
+                self._zp_pin_bt_np[g][:nb] = bids_arr
+            self._canonical_primed_bids = self._canonical_bids
+        self._zp_pin_ids_np[:] = prefill_token_ids
+        get_offloader().sync_prev_onload()
+        self._zp_stage_graph.replay()
+        self.graph.replay()
+        self.replays += 1
+        self._fast_replays += 1
+        self._prelaunch_count += 1
+        self._prelaunched_bids = self._canonical_bids
+        if self._prelaunch_count == 1:
+            logger.info("Prefill graph: canonical pre-launch active (SamplingParams + schedule hidden behind GPU)")
         return True

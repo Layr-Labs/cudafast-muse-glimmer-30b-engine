@@ -116,8 +116,9 @@ struct BgEbKnobs {
   int shf_cal;          // 0=off (use ck.shf), 1=use shf_hi if (alt, dk[j]) in history else shf_lo
   float shf_lo;
   float shf_hi;
-  // Downward-bounded online Empirical-Bayes a_shift from req_acc_state [rounds, committed]
+  // Downward-bounded online Empirical-Bayes a_shift from req_acc_state [rounds, committed, high_acc, raw_acc, raw_trials]
   int eb_mode;          // 0=off, 1=enabled
+  int eb_raw;           // 1=unbiased censored raw-chain MLE from req_acc_state[3]/req_acc_state[4]
   int eb_min_r;
   float eb_p0;
   float eb_tau;
@@ -125,6 +126,29 @@ struct BgEbKnobs {
   float eb_lo;
   float eb_hi;
 };
+
+__device__ __forceinline__ float compute_eb_delta_a(
+    const BgEbKnobs& bg, const int32_t* req_acc_state, int req_acc_state_len) {
+  if (bg.eb_mode == 0 || req_acc_state == nullptr) return 0.0f;
+  const int32_t rr = req_acc_state[0];
+  const int32_t cc = req_acc_state[1];
+  if (rr < bg.eb_min_r || cc <= 0) return 0.0f;
+  float p_hat = 0.0f;
+  if (bg.eb_raw != 0 && req_acc_state_len >= 5 && req_acc_state[4] > 0) {
+    p_hat = static_cast<float>(req_acc_state[3]) / static_cast<float>(req_acc_state[4]);
+  } else {
+    const float mean_ns = static_cast<float>(cc) / static_cast<float>(rr);
+    const float den_m = (mean_ns - 0.35f > 0.25f) ? (mean_ns - 0.35f) : 0.25f;
+    p_hat = (mean_ns - 1.35f) / den_m;
+  }
+  if (p_hat < 0.35f) p_hat = 0.35f;
+  if (p_hat > 0.92f) p_hat = 0.92f;
+  const float p0 = bg.eb_p0;
+  const float p_post = (static_cast<float>(rr) * p_hat + bg.eb_tau * p0) /
+                       (static_cast<float>(rr) + bg.eb_tau);
+  const float da = (__logf(p_post / (1.0f - p_post)) - __logf(p0 / (1.0f - p0))) * bg.eb_scale;
+  return (da < bg.eb_lo) ? bg.eb_lo : ((da > bg.eb_hi) ? bg.eb_hi : da);
+}
 
 constexpr int kTrActiveCap = 512;
 
@@ -528,16 +552,44 @@ __global__ void __launch_bounds__(64) dflash_cascade_post_restore_kernel(
 //       1) n-gram + 30B target-recycle confirmation/boosting of DFlash top-6 candidates (r=0..5) at depths j=0..5,
 //       2) standalone OOV prompt-lookup & monomorphic 30B recycled roots + multi-step continuation chains.
 //   - selftest_mode!=0: places a full deep chain (6-level on M=16, 5-level on M=12) mirroring d1..d6.
+static int leaf_pdl_mode() {
+  static const int mode = []() -> int {
+    const char* s = std::getenv("MUSE_LEAF_PDL");
+    if (!s || !*s) return 3;
+    return (std::atoi(s) != 0) ? 3 : 0;
+  }();
+  return mode;
+}
+
+template <typename... KArgs, typename... Args>
+static inline void leaf_launch_pdl(
+    void (*kernel)(KArgs...), unsigned blocks, unsigned threads, cudaStream_t st, int pdl_mode, Args... args) {
+  cudaLaunchConfig_t lcfg = {};
+  lcfg.gridDim = dim3(blocks, 1u, 1u);
+  lcfg.blockDim = dim3(threads, 1u, 1u);
+  lcfg.dynamicSmemBytes = 0;
+  lcfg.stream = st;
+  cudaLaunchAttribute attr[1];
+  if ((pdl_mode & 1) != 0) {
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    lcfg.attrs = attr;
+    lcfg.numAttrs = 1;
+  }
+  cudaError_t err = cudaLaunchKernelEx(&lcfg, kernel, static_cast<KArgs>(args)...);
+  TORCH_CHECK(err == cudaSuccess, "native_leaf launch failed: ", cudaGetErrorString(err));
+}
+
 __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
-    int32_t* __restrict__ leaf_flag,
-    const int64_t* __restrict__ tree_top,
-    const float* __restrict__ tree_vals,
-    const int32_t* __restrict__ req_acc_state,
-    int32_t* __restrict__ input_ids,
-    int64_t* __restrict__ positions,
-    int64_t* __restrict__ saved_leaf_toks,
-    int32_t* __restrict__ saved_leaf_k,
-    int32_t* __restrict__ saved_leaf_parent,
+    int32_t* leaf_flag,
+    const int64_t* tree_top,
+    const float* tree_vals,
+    const int32_t* req_acc_state,
+    int32_t* input_ids,
+    int64_t* positions,
+    int64_t* saved_leaf_toks,
+    int32_t* saved_leaf_k,
+    int32_t* saved_leaf_parent,
     int tree_m,
     int tree_k,
     int selftest_mode,
@@ -552,28 +604,32 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     int adapt_gamma,
     int calib_mode,
     CalibKnobs ck,
-    const int32_t* __restrict__ hist,
-    const int32_t* __restrict__ hist_len,
+    const int32_t* hist,
+    const int32_t* hist_len,
     int hist_cap,
-    int64_t* __restrict__ saved_pos0,
-    int64_t* __restrict__ stats,
+    int64_t* saved_pos0,
+    int64_t* stats,
     int stats_len,
     PlKnobs pl,
     BgEbKnobs bg,
     TrKnobs tr,
-    int32_t* __restrict__ saved_row_ctx,
-    const int32_t* __restrict__ tr_log,
-    int32_t* __restrict__ tr_state,
+    int32_t* saved_row_ctx,
+    const int32_t* tr_log,
+    int32_t* tr_state,
     int tr_cap,
     int vocab_size,
     AntiChimeraKnobs ac,
-    int32_t* __restrict__ cascade_meta,
-    const int64_t* __restrict__ cascade_toks,
-    const float* __restrict__ cascade_vals,
-    CascadeKnobs csk) {
+    int32_t* cascade_meta,
+    const int64_t* cascade_toks,
+    const float* cascade_vals,
+    CascadeKnobs csk,
+    int pdl_mode) {
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
+  if ((pdl_mode & 1) != 0) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
   if (tid == 0 && saved_pos0 != nullptr) {
     saved_pos0[0] = positions[0];
   }
@@ -692,6 +748,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       if (saved_row_ctx != nullptr) {
         saved_row_ctx[3] = -1;
       }
+    }
+    if ((pdl_mode & 2) != 0) {
+      asm volatile("griddepcontrol.launch_dependents;");
     }
     return;
   }
@@ -1293,23 +1352,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     const int base = tid * tree_k;
     const float z0 = s_z0[tid];
     const bool row_ok = (s_valid_row[tid] != 0);
-    float eb_delta_a = 0.0f;
-    if (calib_mode != 0 && bg.eb_mode != 0 && req_acc_state != nullptr) {
-      const int32_t rr = req_acc_state[0];
-      const int32_t cc = req_acc_state[1];
-      if (rr >= bg.eb_min_r && cc > 0) {
-        const float mean_ns = static_cast<float>(cc) / static_cast<float>(rr);
-        const float den_m = (mean_ns - 0.35f > 0.25f) ? (mean_ns - 0.35f) : 0.25f;
-        float p_hat = (mean_ns - 1.35f) / den_m;
-        if (p_hat < 0.35f) p_hat = 0.35f;
-        if (p_hat > 0.92f) p_hat = 0.92f;
-        const float p0 = bg.eb_p0;
-        const float p_post = (static_cast<float>(rr) * p_hat + bg.eb_tau * p0) /
-                             (static_cast<float>(rr) + bg.eb_tau);
-        const float da = (__logf(p_post / (1.0f - p_post)) - __logf(p0 / (1.0f - p0))) * bg.eb_scale;
-        eb_delta_a = (da < bg.eb_lo) ? bg.eb_lo : ((da > bg.eb_hi) ? bg.eb_hi : da);
-      }
-    }
+    const float eb_delta_a = (calib_mode != 0) ? compute_eb_delta_a(bg, req_acc_state, 5) : 0.0f;
     const float sm_mean = (s_margin[0] + s_margin[1] + s_margin[2] +
                            s_margin[3] + s_margin[4] + s_margin[5]) * (1.0f / 6.0f);
     if (row_ok) {
@@ -2507,46 +2550,54 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       cascade_meta[5] = static_cast<int32_t>(casc_row_mask);
     }
     leaf_flag[0] = s_any_active ? -1 : 0;
+    if ((pdl_mode & 2) != 0) {
+      asm volatile("griddepcontrol.launch_dependents;");
+    }
   }
 }
 
 __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
-    int32_t* __restrict__ leaf_flag,
-    int32_t* __restrict__ prev_ns,
-    int32_t* __restrict__ hit_flag,
+    int32_t* leaf_flag,
+    int32_t* prev_ns,
+    int32_t* hit_flag,
     int hit_flag_len,
-    int32_t* __restrict__ hit_src_row,
-    const int64_t* __restrict__ saved_leaf_toks,
-    const int32_t* __restrict__ saved_leaf_k,
-    const int32_t* __restrict__ saved_leaf_parent,
-    const int64_t* __restrict__ leaf_u_toks,
-    int64_t* __restrict__ sampled_tokens,
-    int32_t* __restrict__ num_sampled,
-    int32_t* __restrict__ num_rejected,
-    int64_t* __restrict__ stats,
+    int32_t* hit_src_row,
+    const int64_t* saved_leaf_toks,
+    const int32_t* saved_leaf_k,
+    const int32_t* saved_leaf_parent,
+    const int64_t* leaf_u_toks,
+    int64_t* sampled_tokens,
+    int32_t* num_sampled,
+    int32_t* num_rejected,
+    int64_t* stats,
     int stats_len,
-    int32_t* __restrict__ req_acc_state,
+    int32_t* req_acc_state,
     int tree_m,
     int no_hit_mode,
     float high_acc_cpc,
-    int32_t* __restrict__ hist,
-    int32_t* __restrict__ hist_len,
+    int32_t* hist,
+    int32_t* hist_len,
     int hist_cap,
-    const int64_t* __restrict__ saved_pos0,
-    int32_t* __restrict__ saved_row_ctx,
-    int32_t* __restrict__ tr_log,
-    int32_t* __restrict__ tr_state,
+    const int64_t* saved_pos0,
+    int32_t* saved_row_ctx,
+    int32_t* tr_log,
+    int32_t* tr_state,
     int tr_cap,
     int vocab_size,
     int chain_all_valid,
-    int32_t* __restrict__ cascade_meta,
+    int32_t* cascade_meta,
     const uint8_t* __restrict__ in_static_vocab,
-    int32_t* __restrict__ tail_ids,
-    int32_t* __restrict__ tail_count,
-    int32_t* __restrict__ tail_seen,
+    int32_t* tail_ids,
+    int32_t* tail_count,
+    int32_t* tail_seen,
     int max_tail,
-    int oov_preadmit_mode) {
+    int oov_preadmit_mode,
+    uint8_t* hit_cond_u8,
+    int pdl_mode) {
   const int lane = threadIdx.x;
+  if ((pdl_mode & 1) != 0) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
   __shared__ int32_t s_raw_u[32];
   __shared__ uint32_t s_exact_mask;
   __shared__ uint32_t s_matched_mask;
@@ -2644,6 +2695,9 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
       hit_flag[1] = hit_len;
     }
     hit_src_row[0] = hit_src0;
+    if (hit_cond_u8 != nullptr) {
+      *hit_cond_u8 = (hit_dst0 > 0) ? 1u : 0u;
+    }
     prev_ns[0] = ns;
     s_eff_raw_ns = raw_ns;
     s_final_ns = ns;
@@ -2718,6 +2772,10 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
       req_acc_state[1] = c;
       req_acc_state[2] =
           (high_acc_cpc > 0.0f && r >= 4 && static_cast<float>(c) > high_acc_cpc * static_cast<float>(r)) ? 1 : 0;
+      const int32_t raw_acc = (raw_ns > 1) ? ((raw_ns - 1 <= 6) ? (raw_ns - 1) : 6) : 0;
+      const int32_t raw_tr = (raw_ns >= 6) ? 6 : ((raw_ns >= 1) ? raw_ns : 1);
+      req_acc_state[3] += raw_acc;
+      req_acc_state[4] += raw_tr;
     }
 
     if (stats != nullptr && stats_len >= 4) {
@@ -2852,6 +2910,9 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
         stats[39] += appended;
       }
     }
+  }
+  if ((pdl_mode & 2) != 0) {
+    asm volatile("griddepcontrol.launch_dependents;");
   }
 }
 
@@ -3020,19 +3081,29 @@ __global__ void native_leaf_commit_kernel(
 // Supports arbitrary-depth 1..6 multi-node copy when hit_flag_len >= 14 && hit_flag[1] > 0;
 // falls back to single-row legacy M=7/8 copy otherwise. Early-exits in ~1 us when hit_flag[0] == 0.
 __global__ void native_leaf_fix_hidden_kernel(
-    const int32_t* __restrict__ hit_flag,
+    const int32_t* hit_flag,
     int hit_flag_len,
-    const int32_t* __restrict__ src_row_ptr,
+    const int32_t* src_row_ptr,
     const uint64_t* __restrict__ tensor_ptrs,
     int num_tensors,
     int64_t row_stride_u4,
     int64_t copy_u4,
-    int src_row) {
-  const int dst0 = hit_flag[0];
-  if (dst0 <= 0) return;
+    int src_row,
+    int pdl_mode) {
   const int b = blockIdx.x;
-  if (b >= num_tensors) return;
-  uint4* base = reinterpret_cast<uint4*>(static_cast<uintptr_t>(tensor_ptrs[b]));
+  uint4* base = (b < num_tensors)
+      ? reinterpret_cast<uint4*>(static_cast<uintptr_t>(tensor_ptrs[b]))
+      : nullptr;
+  if ((pdl_mode & 1) != 0) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
+  const int dst0 = hit_flag[0];
+  if (dst0 <= 0 || b >= num_tensors) {
+    if ((pdl_mode & 2) != 0) {
+      asm volatile("griddepcontrol.launch_dependents;");
+    }
+    return;
+  }
 
   if (hit_flag_len >= 14 && hit_flag[1] > 0) {
     int h_len = hit_flag[1];
@@ -3047,15 +3118,22 @@ __global__ void native_leaf_fix_hidden_kernel(
         dst[i] = src[i];
       }
     }
+    if ((pdl_mode & 2) != 0) {
+      asm volatile("griddepcontrol.launch_dependents;");
+    }
     return;
   }
 
   const int eff_src = (src_row_ptr != nullptr) ? src_row_ptr[0] : src_row;
-  if (eff_src <= 0) return;
-  uint4* dst = base + static_cast<int64_t>(dst0) * row_stride_u4;
-  const uint4* src = base + static_cast<int64_t>(eff_src) * row_stride_u4;
-  for (int64_t i = threadIdx.x; i < copy_u4; i += blockDim.x) {
-    dst[i] = src[i];
+  if (eff_src > 0) {
+    uint4* dst = base + static_cast<int64_t>(dst0) * row_stride_u4;
+    const uint4* src = base + static_cast<int64_t>(eff_src) * row_stride_u4;
+    for (int64_t i = threadIdx.x; i < copy_u4; i += blockDim.x) {
+      dst[i] = src[i];
+    }
+  }
+  if ((pdl_mode & 2) != 0) {
+    asm volatile("griddepcontrol.launch_dependents;");
   }
 }
 
@@ -3063,10 +3141,10 @@ __global__ void native_leaf_fix_hidden_kernel(
 // across all target GQA-16 layers in a single launch (supports 1..6 multi-node deep tree hits).
 // Grid: (num_layers), Block: 64 threads (1 uint4 per thread -> 2 heads x 32 uint4 = 1024 B).
 __global__ void native_leaf_fix_kv_all_layers_kernel(
-    const int32_t* __restrict__ hit_flag,
+    const int32_t* hit_flag,
     int hit_flag_len,
-    const int32_t* __restrict__ src_row_ptr,
-    const int64_t* __restrict__ slot_mappings,
+    const int32_t* src_row_ptr,
+    const int64_t* slot_mappings,
     int64_t slot_stride,
     const uint64_t* __restrict__ kv_ptrs,
     const int64_t* __restrict__ stride_block,
@@ -3075,22 +3153,32 @@ __global__ void native_leaf_fix_kv_all_layers_kernel(
     const int32_t* __restrict__ block_size,
     const int32_t* __restrict__ layer_gid,
     int num_layers,
-    int src_row) {
-  const int dst0 = hit_flag[0];
-  if (dst0 <= 0) return;
+    int src_row,
+    int pdl_mode) {
   const int L = blockIdx.x;
-  if (L >= num_layers) return;
-
-  const int gi = layer_gid[L];
+  const int gi = (L < num_layers) ? layer_gid[L] : 0;
   const int64_t gi_off = static_cast<int64_t>(gi) * slot_stride;
-  const int64_t bs = static_cast<int64_t>(block_size[L]);
+  const int64_t bs = (L < num_layers) ? static_cast<int64_t>(block_size[L]) : 16;
   const int t = threadIdx.x;
   const int h = t >> 5;     // 0 or 1 (2 KV heads)
   const int vec = t & 31;   // 0..31 (32 * 16B = 512B = 256 bf16 = 128 K + 128 V)
-  __nv_bfloat16* kv = reinterpret_cast<__nv_bfloat16*>(static_cast<uintptr_t>(kv_ptrs[L]));
-  const int64_t sB = stride_block[L];
-  const int64_t sH = stride_head[L];
-  const int64_t sS = stride_slot[L];
+  __nv_bfloat16* kv = (L < num_layers)
+      ? reinterpret_cast<__nv_bfloat16*>(static_cast<uintptr_t>(kv_ptrs[L]))
+      : nullptr;
+  const int64_t sB = (L < num_layers) ? stride_block[L] : 0;
+  const int64_t sH = (L < num_layers) ? stride_head[L] : 0;
+  const int64_t sS = (L < num_layers) ? stride_slot[L] : 0;
+
+  if ((pdl_mode & 1) != 0) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
+  const int dst0 = hit_flag[0];
+  if (dst0 <= 0 || L >= num_layers) {
+    if ((pdl_mode & 2) != 0) {
+      asm volatile("griddepcontrol.launch_dependents;");
+    }
+    return;
+  }
 
   if (hit_flag_len >= 14 && hit_flag[1] > 0) {
     int h_len = hit_flag[1];
@@ -3110,21 +3198,29 @@ __global__ void native_leaf_fix_kv_all_layers_kernel(
       const uint4* src = reinterpret_cast<const uint4*>(kv + blk_src * sB + h * sH + off_src * sS);
       dst[vec] = src[vec];
     }
+    if ((pdl_mode & 2) != 0) {
+      asm volatile("griddepcontrol.launch_dependents;");
+    }
     return;
   }
 
   const int eff_src = (src_row_ptr != nullptr) ? src_row_ptr[0] : src_row;
-  if (eff_src <= 0) return;
-  const int64_t s_dst = slot_mappings[gi_off + dst0];
-  const int64_t s_src = slot_mappings[gi_off + eff_src];
-  if (s_dst < 0 || s_src < 0) return;
-  const int64_t blk_dst = s_dst / bs;
-  const int64_t off_dst = s_dst - blk_dst * bs;
-  const int64_t blk_src = s_src / bs;
-  const int64_t off_src = s_src - blk_src * bs;
-  uint4* dst = reinterpret_cast<uint4*>(kv + blk_dst * sB + h * sH + off_dst * sS);
-  const uint4* src = reinterpret_cast<const uint4*>(kv + blk_src * sB + h * sH + off_src * sS);
-  dst[vec] = src[vec];
+  if (eff_src > 0) {
+    const int64_t s_dst = slot_mappings[gi_off + dst0];
+    const int64_t s_src = slot_mappings[gi_off + eff_src];
+    if (s_dst >= 0 && s_src >= 0) {
+      const int64_t blk_dst = s_dst / bs;
+      const int64_t off_dst = s_dst - blk_dst * bs;
+      const int64_t blk_src = s_src / bs;
+      const int64_t off_src = s_src - blk_src * bs;
+      uint4* dst = reinterpret_cast<uint4*>(kv + blk_dst * sB + h * sH + off_dst * sS);
+      const uint4* src = reinterpret_cast<const uint4*>(kv + blk_src * sB + h * sH + off_src * sS);
+      dst[vec] = src[vec];
+    }
+  }
+  if ((pdl_mode & 2) != 0) {
+    asm volatile("griddepcontrol.launch_dependents;");
+  }
 }
 
 static const CalibKnobs& get_calib_knobs_env() {
@@ -3179,6 +3275,7 @@ static const BgEbKnobs& get_bgeb_knobs_env() {
     v.shf_lo = env_f("MUSE_SHF_LO", 0.015f);
     v.shf_hi = env_f("MUSE_SHF_HI", 0.11f);
     v.eb_mode = env_i("MUSE_EB_MODE", 1);
+    v.eb_raw = env_i("MUSE_EB_RAW", 1);
     v.eb_min_r = env_i("MUSE_EB_MIN_R", 4);
     v.eb_p0 = env_f("MUSE_EB_P0", 0.72f);
     v.eb_tau = env_f("MUSE_EB_TAU", 6.0f);
@@ -3509,7 +3606,9 @@ void native_leaf_setup_tree(
   const AntiChimeraKnobs& ac_env = get_ac_knobs_env();
   const CascadeKnobs& csk_env = get_cascade_knobs_env();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  native_leaf_setup_tree_kernel<<<1, 256, 0, st>>>(
+  const int pdl = leaf_pdl_mode();
+  leaf_launch_pdl(
+      native_leaf_setup_tree_kernel, 1u, 256u, st, pdl,
       leaf_flag.data_ptr<int32_t>(),
       tree_top.data_ptr<int64_t>(),
       vals_ptr,
@@ -3551,7 +3650,8 @@ void native_leaf_setup_tree(
       casc_meta_ptr,
       casc_toks_ptr,
       casc_vals_ptr,
-      csk_env);
+      csk_env,
+      pdl);
 }
 
 void native_leaf_commit_tree(
@@ -3582,7 +3682,8 @@ void native_leaf_commit_tree(
     c10::optional<torch::Tensor> in_static_vocab,
     c10::optional<torch::Tensor> tail_ids,
     c10::optional<torch::Tensor> tail_count,
-    c10::optional<torch::Tensor> tail_seen) {
+    c10::optional<torch::Tensor> tail_seen,
+    c10::optional<torch::Tensor> hit_cond) {
   TORCH_CHECK(tree_m >= 8 && tree_m <= 32, "tree_m must be in 8..32");
   TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32);
   TORCH_CHECK(prev_ns.is_cuda() && prev_ns.scalar_type() == torch::kInt32);
@@ -3695,8 +3796,17 @@ void native_leaf_commit_tree(
     t_seen_ptr = tail_seen.value().data_ptr<int32_t>();
     max_tail = static_cast<int>(tail_ids.value().numel());
   }
+  uint8_t* hit_cond_ptr = nullptr;
+  if (hit_cond.has_value() && hit_cond.value().defined() && hit_cond.value().numel() >= 1) {
+    TORCH_CHECK(hit_cond.value().is_cuda() &&
+                (hit_cond.value().scalar_type() == torch::kUInt8 ||
+                 hit_cond.value().scalar_type() == torch::kBool));
+    hit_cond_ptr = reinterpret_cast<uint8_t*>(hit_cond.value().data_ptr());
+  }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  native_leaf_commit_tree_kernel<<<1, 32, 0, st>>>(
+  const int pdl = leaf_pdl_mode();
+  leaf_launch_pdl(
+      native_leaf_commit_tree_kernel, 1u, 32u, st, pdl,
       leaf_flag.data_ptr<int32_t>(),
       prev_ns.data_ptr<int32_t>(),
       hit_flag.data_ptr<int32_t>(),
@@ -3731,7 +3841,9 @@ void native_leaf_commit_tree(
       t_cnt_ptr,
       t_seen_ptr,
       max_tail,
-      oov_preadmit_env);
+      oov_preadmit_env,
+      hit_cond_ptr,
+      pdl);
 }
 
 void native_leaf_setup(
@@ -3854,7 +3966,9 @@ void native_leaf_fix_hidden(
     src_ptr = src_row_buf.value().data_ptr<int32_t>();
   }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  native_leaf_fix_hidden_kernel<<<num_tensors, 256, 0, st>>>(
+  const int pdl = leaf_pdl_mode();
+  leaf_launch_pdl(
+      native_leaf_fix_hidden_kernel, static_cast<unsigned>(num_tensors), 256u, st, pdl,
       hit_flag.data_ptr<int32_t>(),
       static_cast<int>(hit_flag.numel()),
       src_ptr,
@@ -3862,7 +3976,8 @@ void native_leaf_fix_hidden(
       num_tensors,
       row_stride_bytes >> 4,
       copy_bytes >> 4,
-      static_cast<int>(src_row));
+      static_cast<int>(src_row),
+      pdl);
 }
 
 void native_leaf_fix_kv(
@@ -3887,7 +4002,9 @@ void native_leaf_fix_kv(
     src_ptr = src_row_buf.value().data_ptr<int32_t>();
   }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  native_leaf_fix_kv_all_layers_kernel<<<num_layers, 64, 0, st>>>(
+  const int pdl = leaf_pdl_mode();
+  leaf_launch_pdl(
+      native_leaf_fix_kv_all_layers_kernel, static_cast<unsigned>(num_layers), 64u, st, pdl,
       hit_flag.data_ptr<int32_t>(),
       static_cast<int>(hit_flag.numel()),
       src_ptr,
@@ -3900,7 +4017,8 @@ void native_leaf_fix_kv(
       block_size.data_ptr<int32_t>(),
       layer_gid.data_ptr<int32_t>(),
       num_layers,
-      static_cast<int>(src_row));
+      static_cast<int>(src_row),
+      pdl);
 }
 
 namespace {
@@ -4199,11 +4317,595 @@ int64_t dflash_cascade_build_cond_graph(
     cudaGraphDestroy(outer_graph);
     TORCH_CHECK(false, "cudaGraphInstantiate(cond) failed: ", cudaGetErrorString(err));
   }
+  {
+    auto st_up = c10::cuda::getCurrentCUDAStream().stream();
+    cudaError_t up_err = cudaGraphUpload(outer_exec, st_up);
+    if (up_err != cudaSuccess) cudaGetLastError();
+  }
 
   std::lock_guard<std::mutex> lk(g_cond_mu);
   const int64_t exec_id = g_next_exec_id++;
   g_cond_execs[exec_id] = CondGraphEntry{outer_graph, outer_exec};
   return exec_id;
+}
+
+namespace {
+
+struct AdaptiveVerifyGateArgs {
+  const float* tree_vals;
+  const int32_t* req_acc_state;
+  int tree_k;
+  int min_rounds;
+  float wide_cpc;
+  float mid_cpc;
+  float early_sm;
+  float early_m0;
+  float skip_wide_sm;
+  float skip_wide_m0;
+  float burst_wide_sm;
+  float burst_wide_m0;
+  int force_mode;  // 0=adaptive, 1=always M=16, 2=always M=32
+  cudaGraphConditionalHandle h_m16;
+  cudaGraphConditionalHandle h_m32;
+};
+
+__global__ void __launch_bounds__(32) native_leaf_choose_m_cond_kernel(AdaptiveVerifyGateArgs a) {
+  if (threadIdx.x != 0) return;
+  bool use_m32 = false;
+  if (a.force_mode == 2) {
+    use_m32 = true;
+  } else if (a.force_mode == 1) {
+    use_m32 = false;
+  } else {
+    const int tk = (a.tree_k >= 8) ? 8 : 6;
+    float min_m03 = 2.5f;
+    float sm4_sum = 0.0f;
+    if (a.tree_vals != nullptr) {
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float z0 = a.tree_vals[j * tk + 0];
+        const float z1 = a.tree_vals[j * tk + 1];
+        const float mj = (z0 > -1e20f && z1 > -1e20f) ? (z0 - z1) : 2.5f;
+        if (j == 0 || mj < min_m03) min_m03 = mj;
+        sm4_sum += mj;
+      }
+    } else {
+      sm4_sum = 10.0f;
+    }
+    const float sm4 = 0.25f * sm4_sum;
+    const int32_t rounds = (a.req_acc_state != nullptr) ? a.req_acc_state[0] : 0;
+    const int32_t committed = (a.req_acc_state != nullptr) ? a.req_acc_state[1] : 0;
+    if (rounds <= 0) {
+      use_m32 = (a.min_rounds <= 0) ? true : (sm4 < a.early_sm && min_m03 < a.early_m0);
+    } else if (rounds < a.min_rounds) {
+      use_m32 = (sm4 < a.early_sm && min_m03 < a.early_m0);
+    } else {
+      const float cpc = static_cast<float>(committed) / static_cast<float>(rounds);
+      if (cpc < a.wide_cpc) {
+        use_m32 = !(sm4 >= a.skip_wide_sm && min_m03 >= a.skip_wide_m0);
+      } else if (cpc < a.mid_cpc) {
+        use_m32 = (sm4 < a.burst_wide_sm && min_m03 < a.burst_wide_m0);
+      } else {
+        use_m32 = false;
+      }
+    }
+  }
+  cudaGraphSetConditional(a.h_m32, use_m32 ? 1u : 0u);
+  cudaGraphSetConditional(a.h_m16, use_m32 ? 0u : 1u);
+}
+
+struct PacedL2PrefetchArgs {
+  uint64_t ptr0;
+  uint64_t span0;
+  uint32_t hot0;
+  uint64_t ptr1;
+  uint64_t span1;
+  uint32_t hot1;
+  uint32_t step_ns;
+};
+
+struct CompoundL2PfConfig {
+  uint64_t fc_ptr = 0;
+  uint64_t fc_span = 0;
+  uint64_t fkv_ptr = 0;
+  uint64_t fkv_span = 0;
+  uint64_t l0_qkv_ptr = 0;
+  uint64_t l0_qkv_span = 0;
+  uint64_t l0_gate_ptr = 0;
+  uint64_t l0_gate_span = 0;
+};
+static CompoundL2PfConfig g_l2pf_cfg{};
+
+__device__ __forceinline__ void muse_bulk_pf_16k(const uint8_t* p, uint32_t n) {
+  uint64_t pol;
+  asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(pol));
+  asm volatile("cp.async.bulk.prefetch.L2.global.L2::cache_hint [%0], %1, %2;\n"
+               :: "l"(p), "r"(n), "l"(pol) : "memory");
+}
+
+__global__ void __launch_bounds__(64) muse_paced_l2_prefetch_kernel(PacedL2PrefetchArgs a) {
+  const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t nthr = gridDim.x * blockDim.x;
+  // Phase 1: Warm 2 MiB GMMU TLB pages across full weight spans (~1 us).
+  constexpr uint64_t kPage = 1ull << 21;
+  const uint32_t pages0 = static_cast<uint32_t>((a.span0 + kPage - 1ull) >> 21);
+  const uint32_t pages1 = static_cast<uint32_t>((a.span1 + kPage - 1ull) >> 21);
+  for (uint32_t pg = tid; pg < pages0 + pages1; pg += nthr) {
+    const uint8_t* p = (pg < pages0)
+        ? (reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(a.ptr0)) + (static_cast<uint64_t>(pg) << 21))
+        : (reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(a.ptr1)) + (static_cast<uint64_t>(pg - pages0) << 21));
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+  }
+  // Phase 2: %globaltimer-paced 16 KiB bulk L2::evict_last prefetch on hot Wave-0 prefix.
+  constexpr uint32_t kPiece = 16384u;
+  const uint32_t h0 = (a.ptr0 != 0 && (a.ptr0 & 15ull) == 0) ? (a.hot0 & ~15u) : 0u;
+  const uint32_t h1 = (a.ptr1 != 0 && (a.ptr1 & 15ull) == 0) ? (a.hot1 & ~15u) : 0u;
+  const uint32_t c0 = (h0 + kPiece - 1u) / kPiece;
+  const uint32_t c1 = (h1 + kPiece - 1u) / kPiece;
+  const uint32_t total_c = c0 + c1;
+  uint64_t t_start = 0;
+  if (a.step_ns > 0 && total_c > 0) {
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_start));
+  }
+  uint32_t round_idx = 0;
+  for (uint32_t idx = tid; idx < total_c; idx += nthr, ++round_idx) {
+    if (a.step_ns > 0 && round_idx > 0) {
+      const uint64_t target = t_start + static_cast<uint64_t>(round_idx) * static_cast<uint64_t>(a.step_ns);
+      uint64_t now = 0;
+      for (int spin = 0; spin < 64; ++spin) {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+        if (now >= target) break;
+      }
+    }
+    if (idx < c0) {
+      const uint32_t off = idx * kPiece;
+      const uint32_t len = (h0 - off < kPiece) ? (h0 - off) : kPiece;
+      if (len >= 16u) {
+        muse_bulk_pf_16k(reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(a.ptr0)) + off, len & ~15u);
+      }
+    } else {
+      const uint32_t off = (idx - c0) * kPiece;
+      const uint32_t len = (h1 - off < kPiece) ? (h1 - off) : kPiece;
+      if (len >= 16u) {
+        muse_bulk_pf_16k(reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(a.ptr1)) + off, len & ~15u);
+      }
+    }
+  }
+}
+
+static bool chain_child_graphs(cudaGraph_t body, const std::vector<int64_t>& ptrs) {
+  cudaGraphNode_t prev = nullptr;
+  for (int64_t raw : ptrs) {
+    if (raw == 0) continue;
+    cudaGraph_t cg = reinterpret_cast<cudaGraph_t>(static_cast<uintptr_t>(raw));
+    cudaGraphNode_t cur = nullptr;
+    cudaError_t err = cudaGraphAddChildGraphNode(
+        &cur, body, (prev != nullptr) ? &prev : nullptr, (prev != nullptr) ? 1 : 0, cg);
+    if (err != cudaSuccess) return false;
+    prev = cur;
+  }
+  return true;
+}
+
+static bool chain_verify_branch_with_l2pf(
+    cudaGraph_t body,
+    const std::vector<int64_t>& ptrs,
+    bool enable_l2pf,
+    const PacedL2PrefetchArgs& l0_args,
+    const PacedL2PrefetchArgs& fc_args) {
+  if (!enable_l2pf || ptrs.size() != 4) {
+    return chain_child_graphs(body, ptrs);
+  }
+  cudaGraph_t cg_pre = reinterpret_cast<cudaGraph_t>(static_cast<uintptr_t>(ptrs[0]));
+  cudaGraph_t cg_full = reinterpret_cast<cudaGraph_t>(static_cast<uintptr_t>(ptrs[1]));
+  cudaGraph_t cg_lmp = reinterpret_cast<cudaGraph_t>(static_cast<uintptr_t>(ptrs[2]));
+  cudaGraph_t cg_cf = reinterpret_cast<cudaGraph_t>(static_cast<uintptr_t>(ptrs[3]));
+
+  cudaGraphNode_t pre_node = nullptr;
+  if (cudaGraphAddChildGraphNode(&pre_node, body, nullptr, 0, cg_pre) != cudaSuccess) return false;
+
+  cudaGraphNode_t full_deps[2] = {pre_node, nullptr};
+  size_t n_full_deps = 1;
+  if (l0_args.ptr0 != 0 || l0_args.ptr1 != 0) {
+    PacedL2PrefetchArgs l0_local = l0_args;
+    cudaKernelNodeParams kp{};
+    kp.func = reinterpret_cast<void*>(muse_paced_l2_prefetch_kernel);
+    kp.gridDim = dim3(2, 1, 1);
+    kp.blockDim = dim3(64, 1, 1);
+    kp.sharedMemBytes = 0;
+    void* kargs[1] = {&l0_local};
+    kp.kernelParams = kargs;
+    cudaGraphNode_t l0_pf_node = nullptr;
+    if (cudaGraphAddKernelNode(&l0_pf_node, body, nullptr, 0, &kp) != cudaSuccess) return false;
+    full_deps[1] = l0_pf_node;
+    n_full_deps = 2;
+  }
+
+  cudaGraphNode_t full_node = nullptr;
+  if (cudaGraphAddChildGraphNode(&full_node, body, full_deps, n_full_deps, cg_full) != cudaSuccess) return false;
+
+  cudaGraphNode_t lmp_node = nullptr;
+  if (cudaGraphAddChildGraphNode(&lmp_node, body, &full_node, 1, cg_lmp) != cudaSuccess) return false;
+
+  cudaGraphNode_t cf_node = nullptr;
+  if (cudaGraphAddChildGraphNode(&cf_node, body, &lmp_node, 1, cg_cf) != cudaSuccess) return false;
+
+  if (fc_args.ptr0 != 0 || fc_args.ptr1 != 0) {
+    PacedL2PrefetchArgs fc_local = fc_args;
+    cudaKernelNodeParams kp{};
+    kp.func = reinterpret_cast<void*>(muse_paced_l2_prefetch_kernel);
+    kp.gridDim = dim3(2, 1, 1);
+    kp.blockDim = dim3(64, 1, 1);
+    kp.sharedMemBytes = 0;
+    void* kargs[1] = {&fc_local};
+    kp.kernelParams = kargs;
+    cudaGraphNode_t fc_pf_node = nullptr;
+    if (cudaGraphAddKernelNode(&fc_pf_node, body, &lmp_node, 1, &kp) != cudaSuccess) return false;
+  }
+  return true;
+}
+
+struct StoreHostOutArgs {
+  const int64_t* sampled_tokens;
+  const int32_t* num_sampled;
+  int64_t* uva_dst;
+};
+
+__global__ void __launch_bounds__(32) native_leaf_store_host_out_kernel(StoreHostOutArgs a) {
+  const int lane = threadIdx.x & 31;
+  if (lane < 7) {
+    a.uva_dst[lane] = a.sampled_tokens[lane];
+  } else if (lane == 7) {
+    a.uva_dst[7] = static_cast<int64_t>(a.num_sampled[0]);
+  }
+  __threadfence_system();
+}
+
+}  // namespace
+
+int64_t native_leaf_build_adaptive_verify_graph(
+    std::vector<int64_t> m16_graphs,
+    std::vector<int64_t> m32_graphs,
+    torch::Tensor tree_vals,
+    torch::Tensor req_acc_state,
+    int64_t tree_k,
+    int64_t min_rounds,
+    double wide_cpc,
+    double mid_cpc,
+    int64_t force_mode) {
+  TORCH_CHECK(!m16_graphs.empty() && !m32_graphs.empty(), "empty m16/m32 graph list");
+  TORCH_CHECK(tree_vals.is_cuda() && tree_vals.scalar_type() == torch::kFloat32);
+  TORCH_CHECK(req_acc_state.is_cuda() && req_acc_state.scalar_type() == torch::kInt32);
+
+  auto env_f = [](const char* name, float def) -> float {
+    const char* s = std::getenv(name);
+    return (s && *s) ? static_cast<float>(std::strtod(s, nullptr)) : def;
+  };
+
+  cudaGraph_t outer_graph = nullptr;
+  cudaError_t err = cudaGraphCreate(&outer_graph, 0);
+  TORCH_CHECK(err == cudaSuccess && outer_graph != nullptr,
+              "cudaGraphCreate(adaptive) failed: ", cudaGetErrorString(err));
+
+  cudaGraphConditionalHandle h_m16{}, h_m32{};
+  if (cudaGraphConditionalHandleCreate(&h_m16, outer_graph, 1u, cudaGraphCondAssignDefault) != cudaSuccess ||
+      cudaGraphConditionalHandleCreate(&h_m32, outer_graph, 0u, cudaGraphCondAssignDefault) != cudaSuccess) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "cudaGraphConditionalHandleCreate(adaptive) failed");
+  }
+
+  AdaptiveVerifyGateArgs gargs{};
+  gargs.tree_vals = tree_vals.data_ptr<float>();
+  gargs.req_acc_state = req_acc_state.data_ptr<int32_t>();
+  gargs.tree_k = static_cast<int>(tree_k);
+  gargs.min_rounds = static_cast<int>(min_rounds);
+  gargs.wide_cpc = static_cast<float>(wide_cpc);
+  gargs.mid_cpc = static_cast<float>(mid_cpc);
+  gargs.early_sm = env_f("MUSE_ADAPT_EARLY_SM", 1.35f);
+  gargs.early_m0 = env_f("MUSE_ADAPT_EARLY_M0", 1.40f);
+  gargs.skip_wide_sm = env_f("MUSE_ADAPT_SKIP_WIDE_SM", 99.0f);
+  gargs.skip_wide_m0 = env_f("MUSE_ADAPT_SKIP_WIDE_M0", 99.0f);
+  gargs.burst_wide_sm = env_f("MUSE_ADAPT_BURST_WIDE_SM", 1.10f);
+  gargs.burst_wide_m0 = env_f("MUSE_ADAPT_BURST_WIDE_M0", 0.95f);
+  gargs.force_mode = static_cast<int>(force_mode);
+  gargs.h_m16 = h_m16;
+  gargs.h_m32 = h_m32;
+
+  cudaKernelNodeParams kparams{};
+  kparams.func = reinterpret_cast<void*>(native_leaf_choose_m_cond_kernel);
+  kparams.gridDim = dim3(1, 1, 1);
+  kparams.blockDim = dim3(32, 1, 1);
+  kparams.sharedMemBytes = 0;
+  void* kargs[1] = {&gargs};
+  kparams.kernelParams = kargs;
+
+  cudaGraphNode_t gate_node = nullptr;
+  if (cudaGraphAddKernelNode(&gate_node, outer_graph, nullptr, 0, &kparams) != cudaSuccess) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "cudaGraphAddKernelNode(gate) failed");
+  }
+
+  cudaGraphNodeParams cp16{};
+  cp16.type = cudaGraphNodeTypeConditional;
+  cp16.conditional.handle = h_m16;
+  cp16.conditional.type = cudaGraphCondTypeIf;
+  cp16.conditional.size = 1;
+  cudaGraphNode_t cond16_node = nullptr;
+  if (cudaGraphAddNode(&cond16_node, outer_graph, &gate_node, nullptr, 1, &cp16) != cudaSuccess ||
+      !chain_child_graphs(cp16.conditional.phGraph_out[0], m16_graphs)) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "cudaGraphAddNode(cond16) failed");
+  }
+
+  cudaGraphNodeParams cp32{};
+  cp32.type = cudaGraphNodeTypeConditional;
+  cp32.conditional.handle = h_m32;
+  cp32.conditional.type = cudaGraphCondTypeIf;
+  cp32.conditional.size = 1;
+  cudaGraphNode_t cond32_node = nullptr;
+  if (cudaGraphAddNode(&cond32_node, outer_graph, &cond16_node, nullptr, 1, &cp32) != cudaSuccess ||
+      !chain_child_graphs(cp32.conditional.phGraph_out[0], m32_graphs)) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "cudaGraphAddNode(cond32) failed");
+  }
+
+  cudaGraphExec_t outer_exec = nullptr;
+  err = cudaGraphInstantiate(&outer_exec, outer_graph, 0);
+  if (err != cudaSuccess) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "cudaGraphInstantiate(adaptive) failed: ", cudaGetErrorString(err));
+  }
+  {
+    auto st_up = c10::cuda::getCurrentCUDAStream().stream();
+    cudaError_t up_err = cudaGraphUpload(outer_exec, st_up);
+    if (up_err != cudaSuccess) cudaGetLastError();
+  }
+
+  std::lock_guard<std::mutex> lk(g_cond_mu);
+  const int64_t exec_id = g_next_exec_id++;
+  g_cond_execs[exec_id] = CondGraphEntry{outer_graph, outer_exec};
+  return exec_id;
+}
+
+int64_t native_leaf_build_compound_step_graph(
+    std::vector<int64_t> m16_graphs,
+    std::vector<int64_t> m32_graphs,
+    std::vector<int64_t> tail_graphs,
+    torch::Tensor sampled_tokens,
+    torch::Tensor num_sampled,
+    torch::Tensor host_out_row,
+    int64_t raw_cuda_event,
+    torch::Tensor tree_vals,
+    torch::Tensor req_acc_state,
+    int64_t tree_k,
+    int64_t min_rounds,
+    double wide_cpc,
+    double mid_cpc,
+    int64_t force_mode) {
+  TORCH_CHECK(!m16_graphs.empty() && !m32_graphs.empty() && !tail_graphs.empty(),
+              "empty m16/m32/tail graph list");
+  TORCH_CHECK(sampled_tokens.is_cuda() && sampled_tokens.scalar_type() == torch::kInt64 &&
+              sampled_tokens.numel() >= 7);
+  TORCH_CHECK(num_sampled.is_cuda() && num_sampled.scalar_type() == torch::kInt32 &&
+              num_sampled.numel() >= 1);
+  TORCH_CHECK(!host_out_row.is_cuda() && host_out_row.scalar_type() == torch::kInt64 &&
+              host_out_row.is_contiguous() && host_out_row.numel() >= 8,
+              "host_out_row must be contiguous CPU int64[>=8] pinned tensor");
+  TORCH_CHECK(raw_cuda_event != 0, "raw_cuda_event must be materialized before capture");
+  TORCH_CHECK(tree_vals.is_cuda() && tree_vals.scalar_type() == torch::kFloat32);
+  TORCH_CHECK(req_acc_state.is_cuda() && req_acc_state.scalar_type() == torch::kInt32);
+
+  void* uva_raw = nullptr;
+  cudaError_t herr = cudaHostGetDevicePointer(&uva_raw, host_out_row.data_ptr<int64_t>(), 0);
+  TORCH_CHECK(herr == cudaSuccess && uva_raw != nullptr,
+              "cudaHostGetDevicePointer(compound) failed: ", cudaGetErrorString(herr));
+
+  auto env_f = [](const char* name, float def) -> float {
+    const char* s = std::getenv(name);
+    return (s && *s) ? static_cast<float>(std::strtod(s, nullptr)) : def;
+  };
+
+  cudaGraph_t outer_graph = nullptr;
+  cudaError_t err = cudaGraphCreate(&outer_graph, 0);
+  TORCH_CHECK(err == cudaSuccess && outer_graph != nullptr,
+              "cudaGraphCreate(compound) failed: ", cudaGetErrorString(err));
+
+  cudaGraphConditionalHandle h_m16{}, h_m32{};
+  if (cudaGraphConditionalHandleCreate(&h_m16, outer_graph, 1u, cudaGraphCondAssignDefault) != cudaSuccess ||
+      cudaGraphConditionalHandleCreate(&h_m32, outer_graph, 0u, cudaGraphCondAssignDefault) != cudaSuccess) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "cudaGraphConditionalHandleCreate(compound) failed");
+  }
+
+  AdaptiveVerifyGateArgs gargs{};
+  gargs.tree_vals = tree_vals.data_ptr<float>();
+  gargs.req_acc_state = req_acc_state.data_ptr<int32_t>();
+  gargs.tree_k = static_cast<int>(tree_k);
+  gargs.min_rounds = static_cast<int>(min_rounds);
+  gargs.wide_cpc = static_cast<float>(wide_cpc);
+  gargs.mid_cpc = static_cast<float>(mid_cpc);
+  gargs.early_sm = env_f("MUSE_ADAPT_EARLY_SM", 1.35f);
+  gargs.early_m0 = env_f("MUSE_ADAPT_EARLY_M0", 1.40f);
+  gargs.skip_wide_sm = env_f("MUSE_ADAPT_SKIP_WIDE_SM", 99.0f);
+  gargs.skip_wide_m0 = env_f("MUSE_ADAPT_SKIP_WIDE_M0", 99.0f);
+  gargs.burst_wide_sm = env_f("MUSE_ADAPT_BURST_WIDE_SM", 1.10f);
+  gargs.burst_wide_m0 = env_f("MUSE_ADAPT_BURST_WIDE_M0", 0.95f);
+  gargs.force_mode = static_cast<int>(force_mode);
+  gargs.h_m16 = h_m16;
+  gargs.h_m32 = h_m32;
+
+  cudaKernelNodeParams kparams{};
+  kparams.func = reinterpret_cast<void*>(native_leaf_choose_m_cond_kernel);
+  kparams.gridDim = dim3(1, 1, 1);
+  kparams.blockDim = dim3(32, 1, 1);
+  kparams.sharedMemBytes = 0;
+  void* kargs[1] = {&gargs};
+  kparams.kernelParams = kargs;
+
+  cudaGraphNode_t gate_node = nullptr;
+  if (cudaGraphAddKernelNode(&gate_node, outer_graph, nullptr, 0, &kparams) != cudaSuccess) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "cudaGraphAddKernelNode(compound gate) failed");
+  }
+
+  cudaGraphNodeParams cp16{};
+  cp16.type = cudaGraphNodeTypeConditional;
+  cp16.conditional.handle = h_m16;
+  cp16.conditional.type = cudaGraphCondTypeIf;
+  cp16.conditional.size = 1;
+  const char* l2pf_env = std::getenv("MUSE_COMPOUND_L2PF");
+  const bool enable_l2pf = (l2pf_env && l2pf_env[0] == '1');
+  const uint32_t l0_kb = static_cast<uint32_t>(env_f("MUSE_L2PF_L0_KB", 1536.0f)) * 1024u;
+  const uint32_t fc_kb = static_cast<uint32_t>(env_f("MUSE_L2PF_FC_KB", 2048.0f)) * 1024u;
+  const uint32_t pf_step_ns = static_cast<uint32_t>(env_f("MUSE_L2PF_STEP_NS", 80.0f));
+  PacedL2PrefetchArgs l0_pf{};
+  l0_pf.ptr0 = g_l2pf_cfg.l0_qkv_ptr;
+  l0_pf.span0 = g_l2pf_cfg.l0_qkv_span;
+  l0_pf.hot0 = (g_l2pf_cfg.l0_qkv_span > 0 && l0_kb < g_l2pf_cfg.l0_qkv_span)
+      ? l0_kb : static_cast<uint32_t>(g_l2pf_cfg.l0_qkv_span);
+  l0_pf.ptr1 = g_l2pf_cfg.l0_gate_ptr;
+  l0_pf.span1 = g_l2pf_cfg.l0_gate_span;
+  l0_pf.hot1 = (g_l2pf_cfg.l0_gate_span > 0 && (l0_kb / 2u) < g_l2pf_cfg.l0_gate_span)
+      ? (l0_kb / 2u) : static_cast<uint32_t>(g_l2pf_cfg.l0_gate_span);
+  l0_pf.step_ns = pf_step_ns;
+
+  PacedL2PrefetchArgs fc_pf{};
+  fc_pf.ptr0 = g_l2pf_cfg.fc_ptr;
+  fc_pf.span0 = g_l2pf_cfg.fc_span;
+  fc_pf.hot0 = (g_l2pf_cfg.fc_span > 0 && fc_kb < g_l2pf_cfg.fc_span)
+      ? fc_kb : static_cast<uint32_t>(g_l2pf_cfg.fc_span);
+  fc_pf.ptr1 = g_l2pf_cfg.fkv_ptr;
+  fc_pf.span1 = g_l2pf_cfg.fkv_span;
+  fc_pf.hot1 = (g_l2pf_cfg.fkv_span > 0 && 524288u < g_l2pf_cfg.fkv_span)
+      ? 524288u : static_cast<uint32_t>(g_l2pf_cfg.fkv_span);
+  fc_pf.step_ns = pf_step_ns;
+
+  cudaGraphNode_t cond16_node = nullptr;
+  if (cudaGraphAddNode(&cond16_node, outer_graph, &gate_node, nullptr, 1, &cp16) != cudaSuccess ||
+      !chain_verify_branch_with_l2pf(cp16.conditional.phGraph_out[0], m16_graphs, enable_l2pf, l0_pf, fc_pf)) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "cudaGraphAddNode(compound cond16) failed");
+  }
+
+  cudaGraphNodeParams cp32{};
+  cp32.type = cudaGraphNodeTypeConditional;
+  cp32.conditional.handle = h_m32;
+  cp32.conditional.type = cudaGraphCondTypeIf;
+  cp32.conditional.size = 1;
+  cudaGraphNode_t cond32_node = nullptr;
+  if (cudaGraphAddNode(&cond32_node, outer_graph, &cond16_node, nullptr, 1, &cp32) != cudaSuccess ||
+      !chain_verify_branch_with_l2pf(cp32.conditional.phGraph_out[0], m32_graphs, enable_l2pf, l0_pf, fc_pf)) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "cudaGraphAddNode(compound cond32) failed");
+  }
+
+  StoreHostOutArgs sh_args{};
+  sh_args.sampled_tokens = sampled_tokens.data_ptr<int64_t>();
+  sh_args.num_sampled = num_sampled.data_ptr<int32_t>();
+  sh_args.uva_dst = reinterpret_cast<int64_t*>(uva_raw);
+
+  cudaKernelNodeParams sparams{};
+  sparams.func = reinterpret_cast<void*>(native_leaf_store_host_out_kernel);
+  sparams.gridDim = dim3(1, 1, 1);
+  sparams.blockDim = dim3(32, 1, 1);
+  sparams.sharedMemBytes = 0;
+  void* sargs[1] = {&sh_args};
+  sparams.kernelParams = sargs;
+
+  cudaGraphNode_t store_node = nullptr;
+  if (cudaGraphAddKernelNode(&store_node, outer_graph, &cond32_node, 1, &sparams) != cudaSuccess) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "cudaGraphAddKernelNode(store_host_out) failed");
+  }
+
+  cudaEvent_t cev = reinterpret_cast<cudaEvent_t>(static_cast<uintptr_t>(raw_cuda_event));
+  cudaGraphNode_t ev_node = nullptr;
+  if (cudaGraphAddEventRecordNode(&ev_node, outer_graph, &store_node, 1, cev) != cudaSuccess) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "cudaGraphAddEventRecordNode(copy_event) failed");
+  }
+
+  if (tail_graphs.size() == 4 && tail_graphs[0] != 0 && tail_graphs[1] != 0 &&
+      tail_graphs[2] != 0 && tail_graphs[3] != 0) {
+    // 2-branch Diamond DAG:
+    //   Arm A: store_node -> ev_node -> post_prep_node (tail_graphs[0])
+    //   Arm B: cond32_node -> ctx_proj_node (tail_graphs[1]: fc + hidden_norm + fkv)
+    //   Join:  {post_prep_node, ctx_proj_node} -> ctx_kv_post_node (tail_graphs[2]) -> query_node (tail_graphs[3])
+    cudaGraph_t cg_pp = reinterpret_cast<cudaGraph_t>(static_cast<uintptr_t>(tail_graphs[0]));
+    cudaGraph_t cg_proj = reinterpret_cast<cudaGraph_t>(static_cast<uintptr_t>(tail_graphs[1]));
+    cudaGraph_t cg_kvp = reinterpret_cast<cudaGraph_t>(static_cast<uintptr_t>(tail_graphs[2]));
+    cudaGraph_t cg_qry = reinterpret_cast<cudaGraph_t>(static_cast<uintptr_t>(tail_graphs[3]));
+
+    cudaGraphNode_t pp_node = nullptr;
+    cudaGraphNode_t proj_node = nullptr;
+    if (cudaGraphAddChildGraphNode(&pp_node, outer_graph, &ev_node, 1, cg_pp) != cudaSuccess ||
+        cudaGraphAddChildGraphNode(&proj_node, outer_graph, &cond32_node, 1, cg_proj) != cudaSuccess) {
+      cudaGraphDestroy(outer_graph);
+      TORCH_CHECK(false, "cudaGraphAddChildGraphNode(diamond arm A/B) failed");
+    }
+    cudaGraphNode_t join_deps[2] = {pp_node, proj_node};
+    cudaGraphNode_t kvp_node = nullptr;
+    cudaGraphNode_t qry_node = nullptr;
+    if (cudaGraphAddChildGraphNode(&kvp_node, outer_graph, join_deps, 2, cg_kvp) != cudaSuccess ||
+        cudaGraphAddChildGraphNode(&qry_node, outer_graph, &kvp_node, 1, cg_qry) != cudaSuccess) {
+      cudaGraphDestroy(outer_graph);
+      TORCH_CHECK(false, "cudaGraphAddChildGraphNode(diamond join) failed");
+    }
+  } else {
+    cudaGraphNode_t prev = ev_node;
+    for (int64_t raw : tail_graphs) {
+      if (raw == 0) continue;
+      cudaGraph_t cg = reinterpret_cast<cudaGraph_t>(static_cast<uintptr_t>(raw));
+      cudaGraphNode_t cur = nullptr;
+      if (cudaGraphAddChildGraphNode(&cur, outer_graph, &prev, 1, cg) != cudaSuccess) {
+        cudaGraphDestroy(outer_graph);
+        TORCH_CHECK(false, "cudaGraphAddChildGraphNode(tail) failed");
+      }
+      prev = cur;
+    }
+  }
+
+  cudaGraphExec_t outer_exec = nullptr;
+  err = cudaGraphInstantiate(&outer_exec, outer_graph, 0);
+  if (err != cudaSuccess) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "cudaGraphInstantiate(compound) failed: ", cudaGetErrorString(err));
+  }
+  {
+    auto st_up = c10::cuda::getCurrentCUDAStream().stream();
+    cudaError_t up_err = cudaGraphUpload(outer_exec, st_up);
+    if (up_err != cudaSuccess) cudaGetLastError();
+  }
+
+  std::lock_guard<std::mutex> lk(g_cond_mu);
+  const int64_t exec_id = g_next_exec_id++;
+  g_cond_execs[exec_id] = CondGraphEntry{outer_graph, outer_exec};
+  return exec_id;
+}
+
+void cuda_graph_upload(int64_t raw_exec_ptr) {
+  if (raw_exec_ptr == 0) return;
+  auto st = c10::cuda::getCurrentCUDAStream().stream();
+  cudaError_t err = cudaGraphUpload(
+      reinterpret_cast<cudaGraphExec_t>(static_cast<uintptr_t>(raw_exec_ptr)), st);
+  if (err != cudaSuccess) {
+    cudaGetLastError();
+  }
+}
+
+void native_leaf_set_compound_l2pf_ranges(
+    int64_t fc_ptr, int64_t fc_span,
+    int64_t fkv_ptr, int64_t fkv_span,
+    int64_t l0_qkv_ptr, int64_t l0_qkv_span,
+    int64_t l0_gate_ptr, int64_t l0_gate_span) {
+  g_l2pf_cfg.fc_ptr = static_cast<uint64_t>(fc_ptr);
+  g_l2pf_cfg.fc_span = static_cast<uint64_t>(fc_span > 0 ? fc_span : 0);
+  g_l2pf_cfg.fkv_ptr = static_cast<uint64_t>(fkv_ptr);
+  g_l2pf_cfg.fkv_span = static_cast<uint64_t>(fkv_span > 0 ? fkv_span : 0);
+  g_l2pf_cfg.l0_qkv_ptr = static_cast<uint64_t>(l0_qkv_ptr);
+  g_l2pf_cfg.l0_qkv_span = static_cast<uint64_t>(l0_qkv_span > 0 ? l0_qkv_span : 0);
+  g_l2pf_cfg.l0_gate_ptr = static_cast<uint64_t>(l0_gate_ptr);
+  g_l2pf_cfg.l0_gate_span = static_cast<uint64_t>(l0_gate_span > 0 ? l0_gate_span : 0);
 }
 
 void dflash_cascade_launch_cond_graph(int64_t exec_id) {

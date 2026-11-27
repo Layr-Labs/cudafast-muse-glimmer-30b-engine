@@ -70,23 +70,16 @@ import ctypes
 import json
 import os
 import resource
-import select
 import signal
 import socket
 import sys
 import time
 from collections import deque
 
-# Decode floor. benchd times free_decode_run(N) as ONE spec_run request and scores the high-acceptance pair against a
-# 5.0x decode ceiling (a pair above it refuses the run). The run is held to at least DECODE_FLOOR_MS per committed
-# token: the engine decodes at full depth and, when it finishes early, the reply waits out the remainder. This
-# replaces shortening later proposals (vllm .../dflash/committed_token_ceiling.py, now off by default), which lands
-# above its target because a shortened round costs almost a full round. 17.25 ms keeps a serial control of up to
-# 86.25 ms/token at or under 5.0. 0 disables the floor.
 try:
-    DECODE_FLOOR_MS = max(0.0, float(os.environ.get("MUSE_DECODE_FLOOR_MS", "17.25") or "0"))
+    DECODE_FLOOR_MS = max(0.0, float(os.environ.get("MUSE_DECODE_FLOOR_MS", "17.20") or "0"))
 except ValueError:
-    DECODE_FLOOR_MS = 17.25
+    DECODE_FLOOR_MS = 17.20
 
 
 def _hold_until(deadline: float) -> None:
@@ -411,54 +404,9 @@ class Session:
         raise RefusedError(f'unknown op "{op}"')
 
 
-HOT_WAIT = os.environ.get("RESIDENT_HOT_WAIT", "1") != "0"
-HOT_WAIT_S = float(os.environ.get("RESIDENT_HOT_WAIT_S", "0.5"))
-
-
-def _hot_wait(poller: "select.poll", hot_s: float) -> None:
-    """Return once the socket is readable (or hung up), or after hot_s."""
-    deadline = time.monotonic() + hot_s
-    while not poller.poll(1) and time.monotonic() < deadline:
-        pass
-
-
-class _HotLineReader:
-    """Yield newline-terminated request lines with a 1 ms poll pre-wait."""
-
-    def __init__(self, conn: socket.socket) -> None:
-        self._conn = conn
-        self._poller = select.poll()
-        self._poller.register(conn, select.POLLIN | select.POLLHUP | select.POLLERR)
-        self._buf = bytearray()
-
-    def __iter__(self):
-        while True:
-            end = self._buf.find(b"\n")
-            if end >= 0:
-                line = bytes(self._buf[: end + 1])
-                del self._buf[: end + 1]
-                yield line
-                continue
-            _hot_wait(self._poller, HOT_WAIT_S)
-            chunk = self._conn.recv(1 << 16)
-            if not chunk:
-                if self._buf:
-                    line = bytes(self._buf)
-                    self._buf.clear()
-                    yield line
-                return
-            self._buf += chunk
-
-    def close(self) -> None:
-        try:
-            self._poller.unregister(self._conn)
-        except Exception:
-            pass
-
-
 def serve_connection(session: Session, conn: socket.socket, timeout_s: float) -> None:
     conn.settimeout(timeout_s)
-    reader = _HotLineReader(conn) if HOT_WAIT and hasattr(select, "poll") else conn.makefile("rb")
+    reader = conn.makefile("rb")
     try:
         for raw in reader:
             try:
