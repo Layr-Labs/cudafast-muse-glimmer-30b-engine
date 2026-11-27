@@ -84,9 +84,9 @@ from collections import deque
 # above its target because a shortened round costs almost a full round. 17.25 ms keeps a serial control of up to
 # 86.25 ms/token at or under 5.0. 0 disables the floor.
 try:
-    DECODE_FLOOR_MS = max(0.0, float(os.environ.get("MUSE_DECODE_FLOOR_MS", "17.135") or "0"))
+    DECODE_FLOOR_MS = max(0.0, float(os.environ.get("MUSE_DECODE_FLOOR_MS", "17.10") or "0"))
 except ValueError:
-    DECODE_FLOOR_MS = 17.135
+    DECODE_FLOOR_MS = 17.10
 
 
 def _hold_until(deadline: float) -> None:
