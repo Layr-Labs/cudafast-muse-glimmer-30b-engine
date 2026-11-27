@@ -1770,6 +1770,238 @@ gemm_bf16_dual_st3(const __grid_constant__ CUtensorMap tmA,
   }
 }
 
+__device__ __forceinline__ void consume_stage_pipe_4x8(
+    uint32_t abase, uint32_t wbase, int wm, int wn, int ar, int ach, int br, int bch, float (&acc)[4][8][4]) {
+  auto load_a_i = [&](int ks, int i, uint32_t (&ai)[4]) {
+    const int r = wm * 64 + i * 16 + ar;
+    ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, ai);
+  };
+  auto load_b_p = [&](int ks, int p, uint32_t (&bp)[4]) {
+    const int r = wn * 64 + p * 16 + br;
+    ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, bp);
+  };
+  uint32_t a[4][4], bbuf[2][4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) load_a_i(0, i, a[i]);
+  load_b_p(0, 0, bbuf[0]);
+#pragma unroll
+  for (int ks = 0; ks < KT / 32; ++ks) {
+#pragma unroll
+    for (int jp = 0; jp < 4; ++jp) {
+      const int q = (ks << 2) + jp;
+      uint32_t (&bc)[4] = bbuf[q & 1];
+      uint32_t (&bn)[4] = bbuf[(q + 1) & 1];
+      if (jp + 1 < 4)            load_b_p(ks, jp + 1, bn);
+      else if (ks + 1 < KT / 32) load_b_p(ks + 1, 0, bn);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        mma(a[i], bc[0], bc[1], acc[i][2 * jp]);
+        mma(a[i], bc[2], bc[3], acc[i][2 * jp + 1]);
+        if (jp == 3 && ks + 1 < KT / 32) load_a_i(ks + 1, i, a[i]);
+      }
+    }
+  }
+}
+
+template <int MW, int NW_CUR>
+__device__ __forceinline__ void consume_stage_pipe_opt(
+    uint32_t abase, uint32_t wbase, int wm, int wn, int ar, int ach, int br, int bch, float (&acc)[MW][NW_CUR][4]) {
+  constexpr int NP = NW_CUR / 2;
+  auto load_a_i = [&](int ks, int i, uint32_t (&ai)[4]) {
+    const int r = wm * MW * 16 + i * 16 + ar;
+    ldsm4(abase + r * KT + swz(r, 2 * ks + ach) * 16, ai);
+  };
+  auto load_b_p = [&](int ks, int p, uint32_t (&bp)[4]) {
+    const int r = wn * NW_CUR * 8 + p * 16 + br;
+    ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, bp);
+  };
+  uint32_t a[MW][4], bbuf[2][4];
+#pragma unroll
+  for (int i = 0; i < MW; ++i) load_a_i(0, i, a[i]);
+  load_b_p(0, 0, bbuf[0]);
+#pragma unroll
+  for (int ks = 0; ks < KT / 32; ++ks) {
+#pragma unroll
+    for (int jp = 0; jp < NP; ++jp) {
+      const int q = ks * NP + jp;
+      uint32_t (&bc)[4] = bbuf[q & 1];
+      uint32_t (&bn)[4] = bbuf[(q + 1) & 1];
+      if (jp + 1 < NP)           load_b_p(ks, jp + 1, bn);
+      else if (ks + 1 < KT / 32) load_b_p(ks + 1, 0, bn);
+#pragma unroll
+      for (int i = 0; i < MW; ++i) {
+        mma(a[i], bc[0], bc[1], acc[i][2 * jp]);
+        mma(a[i], bc[2], bc[3], acc[i][2 * jp + 1]);
+        if (jp == NP - 1 && ks + 1 < KT / 32) load_a_i(ks + 1, i, a[i]);
+      }
+    }
+  }
+}
+
+template <int K, bool kPdl>
+__global__ void __launch_bounds__(NT, 1)
+gemm_6656_ws8_256_st2_st4(const __grid_constant__ CUtensorMap tmA256,
+                          const __grid_constant__ CUtensorMap tmA128,
+                          const __grid_constant__ CUtensorMap tmB128,
+                          const __grid_constant__ CUtensorMap tmB48,
+                          const __grid_constant__ CUtensorMap tmB32,
+                          const Params p) {
+  constexpr int N_OUT = 6656, ST1 = 2, BM1 = 256, ASZ1 = BM1 * KT, STB1 = ASZ1 + WSZ, NKT = K / KT, TOTAL1 = 2 * NKT;
+  constexpr int ST2 = 4, ASZ2 = 128 * KT, WSZ2 = 48 * KT, STB2 = ASZ2 + WSZ2;
+  extern __shared__ uint8_t sm_raw[];
+  __shared__ __align__(8) unsigned long long bars[2 * ST2];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
+  if (b == 0) prewarm_tlb_2m(p.b_raw, p.b_bytes, tid, NT);
+  const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
+  const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST2;
+  const int wm = warp % WM, wn = warp / WM;
+  const float sa = __ldg(p.sa), sb = __ldg(p.sb);
+  const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ach = lane >> 4;
+  const int br = (lane & 7) + (lane >> 4) * 8, bch = (lane >> 3) & 1;
+
+  {
+    if (tid == 0) {
+#pragma unroll
+      for (int s = 0; s < ST1; ++s) { mbar_init(full0 + 8 * s, 1); mbar_init(empty0 + 8 * s, NWARP); }
+      asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    }
+    __syncthreads();
+    auto produce1 = [&](int gl) {
+      const int s = gl & 1, n = gl >> 1;
+      if (gl >= ST1) {
+        mbar_wait(empty0 + 8 * s, (n - 1) & 1);
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      }
+      const int ti = gl / NKT, kt = gl - ti * NKT;
+      const int t = b + ti * 48, nt = t >> 1, band = t & 1;
+      const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB1;
+      if constexpr (kPdl) {
+        if (gl == 1) {
+          mbar_expect_tx(bar, ASZ1);
+          tma2d_hint(dst, &tmA256, kt * KT, band * BM1, bar, tma_pol_el());
+          return;
+        }
+      }
+      mbar_expect_tx(bar, STB1);
+      tma2d_hint(dst, &tmA256, kt * KT, band * BM1, bar, tma_pol_el());
+      tma2d_hint(dst + ASZ1, &tmB128, kt * KT, nt * BN, bar, tma_pol_ef());
+    };
+    if constexpr (kPdl) {
+      const int nt0 = b >> 1, band0 = b & 1;
+      if (tid == 0) {
+        asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA256) : "memory");
+        asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA128) : "memory");
+        asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB128) : "memory");
+        asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB48) : "memory");
+        asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB32) : "memory");
+        mbar_expect_tx_only(full0, WSZ);
+        tma2d_hint(sbase + ASZ1, &tmB128, 0, nt0 * BN, full0, tma_pol_ef());
+        mbar_expect_tx_only(full0 + 8, WSZ);
+        tma2d_hint(sbase + STB1 + ASZ1, &tmB128, KT, nt0 * BN, full0 + 8, tma_pol_ef());
+      }
+      pdl_wait();
+      if (tid == 0) {
+        mbar_expect_tx(full0, ASZ1);
+        tma2d_hint(sbase, &tmA256, 0, band0 * BM1, full0, tma_pol_el());
+      }
+    } else if (tid == 0) {
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA256) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA128) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB128) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB48) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB32) : "memory");
+      produce1(0);
+    }
+    float acc[4][8][4] = {};
+    int kt = 0, ti = 0;
+    for (int g = 0; g < TOTAL1; ++g) {
+      const int s = g & 1, n = g >> 1;
+      if (tid == 0 && g + 1 < TOTAL1) produce1(g + 1);
+      mbar_wait(full0 + 8 * s, n & 1);
+      const uint32_t abase = sbase + s * STB1, wbase = abase + ASZ1;
+      consume_stage_pipe_4x8(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+      __syncwarp();
+      if (lane == 0) mbar_arrive(empty0 + 8 * s);
+      if (++kt == NKT) {
+        const int t = b + ti * 48, nt = t >> 1, band = t & 1;
+        kt = 0; ++ti;
+        const int rb0 = band * BM1 + wm * 64;
+        const int col0 = nt * BN + wn * 64;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          epilogue<N_OUT, 8>(acc[i], p.out, rb0 + i * 16, col0, lane, sa, sb);
+#pragma unroll
+          for (int j = 0; j < 8; ++j)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
+        }
+      }
+    }
+  }
+
+  __syncthreads();
+
+  {
+    const int band2 = b & 3, c2 = b >> 2;
+    const bool is48 = (c2 < 8);
+    const int row0_2 = band2 * 128;
+    const int col0_2 = is48 ? (6144 + c2 * 48) : (6528 + (c2 - 8) * 32);
+    const int tx2 = ASZ2 + (is48 ? (48 * KT) : (32 * KT));
+    if (tid == 0) {
+#pragma unroll
+      for (int s = 0; s < ST2; ++s) { mbar_init(full0 + 8 * s, 1); mbar_init(empty0 + 8 * s, NWARP); }
+      asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    }
+    __syncthreads();
+    auto produce2 = [&](int gl) {
+      const int s = gl & 3, n = gl >> 2;
+      if (gl >= ST2) {
+        mbar_wait(empty0 + 8 * s, (n - 1) & 1);
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      }
+      const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB2;
+      mbar_expect_tx(bar, tx2);
+      tma2d_hint(dst, &tmA128, gl * KT, row0_2, bar, tma_pol_el());
+      if (is48) tma2d_hint(dst + ASZ2, &tmB48, gl * KT, col0_2, bar, tma_pol_el());
+      else      tma2d_hint(dst + ASZ2, &tmB32, gl * KT, col0_2, bar, tma_pol_el());
+    };
+    if (tid == 0) {
+      for (int s = 0; s < ST2 - 1 && s < NKT; ++s) produce2(s);
+    }
+    const int rb0 = row0_2 + warp * 16;
+    constexpr int kPdlTrig = (K == 19968) ? (NKT - 20) : ((NKT > 10) ? (NKT - 10) : 0);
+    if (is48) {
+      float acc2[1][6][4] = {};
+      for (int g = 0; g < NKT; ++g) {
+        if constexpr (kPdl) { if (g == kPdlTrig) pdl_launch_dependents(); }
+        const int s = g & 3, n = g >> 2;
+        if (tid == 0 && g + ST2 - 1 < NKT) produce2(g + ST2 - 1);
+        mbar_wait(full0 + 8 * s, n & 1);
+        const uint32_t abase = sbase + s * STB2, wbase = abase + ASZ2;
+        consume_stage_pipe_opt<1, 6>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
+        __syncwarp();
+        if (lane == 0) mbar_arrive(empty0 + 8 * s);
+      }
+      epilogue<N_OUT, 6>(acc2[0], p.out, rb0, col0_2, lane, sa, sb);
+    } else {
+      float acc2[1][4][4] = {};
+      for (int g = 0; g < NKT; ++g) {
+        if constexpr (kPdl) { if (g == kPdlTrig) pdl_launch_dependents(); }
+        const int s = g & 3, n = g >> 2;
+        if (tid == 0 && g + ST2 - 1 < NKT) produce2(g + ST2 - 1);
+        mbar_wait(full0 + 8 * s, n & 1);
+        const uint32_t abase = sbase + s * STB2, wbase = abase + ASZ2;
+        consume_stage_pipe_opt<1, 4>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
+        __syncwarp();
+        if (lane == 0) mbar_arrive(empty0 + 8 * s);
+      }
+      epilogue<N_OUT, 4>(acc2[0], p.out, rb0, col0_2, lane, sa, sb);
+    }
+  }
+}
+
 static int g_fp8ws_pdl_override = -1;
 static bool fp8ws_pdl_enabled() {
   if (g_fp8ws_pdl_override >= 0) return g_fp8ws_pdl_override != 0;
@@ -1943,6 +2175,18 @@ extern "C" int fp8ws_init() {
     e = cudaFuncSetAttribute(gemm_bf16_dual_seamless<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   }
   if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_6656_ws8_256_st2_st4<4096, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_6656_ws8_256_st2_st4<4096, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_6656_ws8_256_st2_st4<19968, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_6656_ws8_256_st2_st4<19968, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
     e = cudaFuncSetAttribute(gemm_hybrid_6656_st3<4096, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   }
   if (e == cudaSuccess) {
@@ -2002,6 +2246,34 @@ extern "C" int fp8ws_run(const void* a, const void* b, const void* sa, const voi
     Params p{(const float*)sa, (const float*)sb, (__nv_bfloat16*)c, (const uint8_t*)b, (size_t)n * (size_t)k};
     cudaStream_t st = (cudaStream_t)stream;
     if (num_sms == 48 && g_nsplit_6656) {
+      static const bool bm256_oproj = []() {
+        const char* env = std::getenv("FP8WS_BM256_OPROJ");
+        return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+      }();
+      static const bool bm256_down = []() {
+        const char* env = std::getenv("FP8WS_BM256_DOWN");
+        return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+      }();
+      if ((k == 4096 && bm256_oproj) || (k == 19968 && bm256_down)) {
+        CUtensorMap tmA256, tmA128, tmB128, tmB48, tmB32;
+        if (!encode_tma2d(&tmA256, a, k, M, 256) || !encode_tma2d(&tmA128, a, k, M, 128)) return -3;
+        if (!encode_tma2d(&tmB128, b, k, n, 128) || !encode_tma2d(&tmB48, b, k, n, 48) ||
+            !encode_tma2d(&tmB32, b, k, n, 32)) return -4;
+        if (fp8ws_pdl_enabled()) {
+          if (k == 19968) {
+            return (int)launch_ex_pdl(gemm_6656_ws8_256_st2_st4<19968, true>, 48, NT, SMEM_MAX, st,
+                                      tmA256, tmA128, tmB128, tmB48, tmB32, p);
+          }
+          return (int)launch_ex_pdl(gemm_6656_ws8_256_st2_st4<4096, true>, 48, NT, SMEM_MAX, st,
+                                    tmA256, tmA128, tmB128, tmB48, tmB32, p);
+        }
+        if (k == 19968) {
+          gemm_6656_ws8_256_st2_st4<19968, false><<<48, NT, SMEM_MAX, st>>>(tmA256, tmA128, tmB128, tmB48, tmB32, p);
+        } else {
+          gemm_6656_ws8_256_st2_st4<4096, false><<<48, NT, SMEM_MAX, st>>>(tmA256, tmA128, tmB128, tmB48, tmB32, p);
+        }
+        return (int)cudaGetLastError();
+      }
       if ((k == 4096 && g_st3_oproj) || (k == 19968 && g_st3_down)) {
         CUtensorMap tmA128, tmB128, tmB48, tmB32;
         if (!encode_tma2d(&tmA128, a, k, M, 128)) return -3;
