@@ -1459,10 +1459,10 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                         and hasattr(_bfx, "dhead_fast_argmax")
                         and hasattr(_bfx, "draft_vocab_score_rows")
                     ):
-                        dh_bits = int(os.environ.get("MUSE_DHEAD_BITS", "150"))
-                        if dh_bits not in (150, 158, 2):
+                        dh_bits = int(os.environ.get("MUSE_DHEAD_BITS", "100"))
+                        if dh_bits not in (100, 150, 158, 2):
                             raise ValueError(f"unsupported MUSE_DHEAD_BITS={dh_bits}")
-                        default_topk = 192 if dh_bits in (150, 158) else 128
+                        default_topk = 256 if dh_bits == 100 else (192 if dh_bits in (150, 158) else 128)
                         dh_topk = max(
                             16,
                             min(256, int(os.environ.get("MUSE_DHEAD_TOPK", str(default_topk)))),
@@ -1622,7 +1622,7 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                             draft_head.prompt_tail_admitted = True
                             fast_dhead_admitted = True
                             object.__setattr__(layer, "_draft_vocab_head", draft_head)
-                            bpw = 1.500 if dh_bits == 150 else (1.625 if dh_bits == 158 else 2.000)
+                            bpw = 1.000 if dh_bits == 100 else (1.500 if dh_bits == 150 else (1.625 if dh_bits == 158 else 2.000))
                             logger.info(
                                 "Fast 2-stage 4D-64 draft head admitted (mode=%d, bpw=%.3f, blob=%.1f MB, "
                                 "topk=%d, peaked_top1=%d/%d, rescore_err=%.6f, lat=%.3f ms)",

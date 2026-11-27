@@ -404,6 +404,9 @@ class VllmBackend:
             if i == 0:
                 for _ in range(self.WARMUP_SEED_DECODE_STEPS):
                     self.step()
+                runner, _ = self._get_runner_and_core()
+                if runner is not None and hasattr(runner, "warmup_all_decode_graphs"):
+                    runner.warmup_all_decode_graphs()
             self.abort()
 
     def _params(self, prompt_len: int, max_tokens: int | None = None, top_logits: bool = True):

@@ -745,7 +745,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 ran_ctx_graph = True
             elif (
                 cg_key not in self._ctx_kv_cg_rejected
-                and len(self._ctx_kv_cg_entries) < 16
+                and len(self._ctx_kv_cg_entries) < 64
             ):
                 context_hidden_states = _build_ctx_hidden()
                 self.model.precompute_and_store_context_kv(
@@ -758,7 +758,10 @@ class DFlashSpeculator(DraftModelSpeculator):
                     main_st = torch.cuda.current_stream(self.device)
                     cap_st = self._ctx_kv_cg_stream
                     cap_st.wait_stream(main_st)
-                    g = torch.cuda.CUDAGraph()
+                    try:
+                        g = torch.cuda.CUDAGraph(keep_graph=True)
+                    except TypeError:
+                        g = torch.cuda.CUDAGraph()
                     with torch.cuda.stream(cap_st):
                         with torch.cuda.graph(
                             g, pool=self._ctx_kv_cg_pool, stream=cap_st
@@ -770,12 +773,15 @@ class DFlashSpeculator(DraftModelSpeculator):
                                 context_slots,
                             )
                     main_st.wait_stream(cap_st)
-                    try:
-                        from vllm.v1.worker.gpu.cudagraph_utils import upload_cudagraph
+                    if os.environ.get("VLLM_CUDAGRAPH_UPLOAD", "1") != "0" and hasattr(
+                        g, "raw_cuda_graph_exec"
+                    ):
+                        try:
+                            import muse_bfx_ext as _bfx_up
 
-                        upload_cudagraph(g, cap_st)
-                    except Exception:
-                        pass
+                            _bfx_up.cuda_graph_upload(int(g.raw_cuda_graph_exec()))
+                        except Exception:
+                            pass
                     self._ctx_kv_cg_entries[cg_key] = g
                 except Exception as exc:
                     self._ctx_kv_cg_rejected.add(cg_key)
@@ -835,6 +841,301 @@ class DFlashSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
         return self.draft_tokens[:num_reqs]
+
+    def emit_cpp_prep_for_capture(
+        self,
+        input_batch: InputBatch,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        post_sampled_tokens: torch.Tensor | None = None,
+        post_num_computed_tokens: torch.Tensor | None = None,
+        post_all_token_ids: torch.Tensor | None = None,
+        post_total_len: torch.Tensor | None = None,
+        post_output_bin_counts: torch.Tensor | None = None,
+    ) -> bool:
+        """Emit dflash_prepare_inputs onto current capture stream for bs=1 verify."""
+        if (
+            input_batch.num_reqs != 1
+            or self.sample_from_anchor
+            or len(self.draft_kv_cache_group_ids) != 1
+            or os.environ.get("MUSE_DFLASH_CPP_PREP", "1") == "0"
+        ):
+            return False
+        import muse_bfx_ext as _bfx
+        from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _nl
+
+        gid0 = self.draft_kv_cache_group_ids[0]
+        bt0 = self.block_tables.input_block_tables[gid0]
+        lm_head = getattr(self.model, "lm_head", None)
+        num_target_tokens = int(input_batch.num_tokens)
+        want_ids_base = (
+            num_target_tokens > 0
+            and input_batch.input_ids.is_cuda
+            and input_batch.input_ids.is_contiguous()
+        )
+        want_tail = (
+            want_ids_base
+            and lm_head is not None
+            and getattr(lm_head, "prompt_tail_admitted", False)
+        )
+        hist_buf = _nl._S.hist if (want_ids_base and _nl.ENABLED and _nl._S.ready) else None
+        hist_len_buf = _nl._S.hist_len if hist_buf is not None else None
+        want_ids = want_tail or (hist_buf is not None)
+        _bfx.dflash_prepare_inputs(
+            self.input_buffers.input_ids,
+            self.input_buffers.positions,
+            self.input_buffers.query_start_loc,
+            self.input_buffers.seq_lens,
+            self.block_tables.slot_mappings[gid0],
+            self.context_positions,
+            self._context_slot_mappings[0],
+            self.sample_indices,
+            self.sample_pos,
+            self.sample_idx_mapping,
+            self.temperature,
+            self.seeds,
+            input_batch.positions,
+            input_batch.query_start_loc,
+            input_batch.idx_mapping,
+            last_sampled,
+            next_prefill_tokens,
+            num_sampled,
+            num_rejected,
+            temperature,
+            seeds,
+            bt0,
+            bt0.stride(0),
+            self.parallel_drafting_token_id,
+            self.block_tables.kernel_block_sizes[gid0],
+            self.num_query_per_req,
+            self.num_speculative_steps,
+            self.max_num_reqs,
+            self.max_num_tokens,
+            self.max_model_len,
+            PAD_SLOT_ID,
+            input_batch.input_ids if want_ids else None,
+            num_target_tokens if want_ids else 0,
+            lm_head.in_static_vocab if want_tail else None,
+            lm_head.tail_ids if want_tail else None,
+            lm_head.tail_count if want_tail else None,
+            lm_head.tail_seen if want_tail else None,
+            hist_buf,
+            hist_len_buf,
+            post_sampled_tokens,
+            post_num_computed_tokens,
+            post_all_token_ids,
+            post_total_len,
+            post_output_bin_counts,
+        )
+        return True
+
+    def get_decode_compound_child_graphs(
+        self,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_target_tokens: int = 7,
+    ) -> tuple[torch.cuda.CUDAGraph, torch.cuda.CUDAGraph] | None:
+        """Return (ctx_kv_cg, query_full_cg) for bs=1 steady decode if already captured."""
+        if (
+            self.query_cudagraph_manager is None
+            or not self.query_cudagraph_manager._graphs_captured
+            or not aux_hidden_states
+            or len(aux_hidden_states) != 5
+            or not getattr(self, "_single_ctx_group", False)
+        ):
+            return None
+        context_slots = self._context_slot_mappings[self._single_ctx_gidx][:num_target_tokens]
+        ctx_pos_slice = self.context_positions[:num_target_tokens]
+        cg_key: tuple = (
+            num_target_tokens,
+            aux_hidden_states[0].data_ptr(),
+            aux_hidden_states[0].stride(0),
+            aux_hidden_states[1].data_ptr(),
+            aux_hidden_states[2].data_ptr(),
+            aux_hidden_states[3].data_ptr(),
+            aux_hidden_states[4].data_ptr(),
+            ctx_pos_slice.data_ptr(),
+            context_slots.data_ptr(),
+        )
+        ctx_cg = self._ctx_kv_cg_entries.get(cg_key)
+        if ctx_cg is None:
+            return None
+        batch_desc, _ = dispatch_cg_and_sync_dp(
+            self.query_cudagraph_manager,
+            1,
+            self.num_query_per_req,
+            uniform_token_count=self.num_query_per_req,
+            dp_size=self.dp_size,
+            dp_rank=self.dp_rank,
+            need_eager=False,
+        )
+        if batch_desc.cg_mode != CUDAGraphMode.FULL or batch_desc not in self.query_cudagraph_manager.graphs:
+            return None
+        return ctx_cg, self.query_cudagraph_manager.graphs[batch_desc]
+
+    def get_decode_compound_diamond_graphs(
+        self,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_target_tokens: int = 7,
+    ) -> tuple[torch.cuda.CUDAGraph, torch.cuda.CUDAGraph, torch.cuda.CUDAGraph] | None:
+        """Return (ctx_proj_cg, ctx_kv_post_cg, query_full_cg) so fc+fkv run in parallel with post_prep."""
+        if (
+            os.environ.get("MUSE_COMPOUND_DIAMOND_FC", "0") in ("0", "", "false", "no")
+            or self.query_cudagraph_manager is None
+            or not self.query_cudagraph_manager._graphs_captured
+            or not aux_hidden_states
+            or len(aux_hidden_states) != 5
+            or not getattr(self, "_single_ctx_group", False)
+            or not hasattr(self.model, "combine_hidden_states_aux5")
+        ):
+            return None
+        dmodel = getattr(self.model, "model", None)
+        cache_entry = getattr(dmodel, "_dflash_kv_post_cache", None) if dmodel is not None else None
+        if cache_entry is None or cache_entry[1] is None:
+            return None
+        _, kv_post_fn, k_caches, v_caches, block_size = cache_entry
+        context_slots = self._context_slot_mappings[self._single_ctx_gidx][:num_target_tokens]
+        ctx_pos_slice = self.context_positions[:num_target_tokens]
+        if not context_slots.is_contiguous() or not ctx_pos_slice.is_contiguous():
+            return None
+        batch_desc, _ = dispatch_cg_and_sync_dp(
+            self.query_cudagraph_manager,
+            1,
+            self.num_query_per_req,
+            uniform_token_count=self.num_query_per_req,
+            dp_size=self.dp_size,
+            dp_rank=self.dp_rank,
+            need_eager=False,
+        )
+        if batch_desc.cg_mode != CUDAGraphMode.FULL or batch_desc not in self.query_cudagraph_manager.graphs:
+            return None
+        query_cg = self.query_cudagraph_manager.graphs[batch_desc]
+
+        d_key = (
+            num_target_tokens,
+            aux_hidden_states[0].data_ptr(),
+            aux_hidden_states[0].stride(0),
+            aux_hidden_states[1].data_ptr(),
+            aux_hidden_states[2].data_ptr(),
+            aux_hidden_states[3].data_ptr(),
+            aux_hidden_states[4].data_ptr(),
+            ctx_pos_slice.data_ptr(),
+            context_slots.data_ptr(),
+        )
+        d_cache = getattr(self, "_compound_diamond_cg_cache", None)
+        if d_cache is None:
+            d_cache = {}
+            self._compound_diamond_cg_cache = d_cache
+        hit = d_cache.get(d_key)
+        if hit is not None:
+            return hit[0], hit[1], query_cg
+        try:
+            cos_sin_cache = dmodel._rope_cos_sin_cache
+            if cos_sin_cache.dtype != torch.bfloat16:
+                cast_cache = getattr(dmodel, "_rope_cos_sin_cache_cast", None)
+                if cast_cache is None or cast_cache.dtype != torch.bfloat16 or cast_cache.device != self.device:
+                    cast_cache = cos_sin_cache.to(device=self.device, dtype=torch.bfloat16)
+                    dmodel._rope_cos_sin_cache_cast = cast_cache
+                cos_sin_cache = cast_cache
+            slots_list = [context_slots] * int(dmodel._num_attn_layers)
+
+            proj_pool = torch.cuda.graph_pool_handle()
+            post_pool = torch.cuda.graph_pool_handle()
+            main_st = torch.cuda.current_stream(self.device)
+            cap_st = self._ctx_kv_cg_stream
+            cap_st.wait_stream(main_st)
+            ctx_proj_cg = torch.cuda.CUDAGraph(keep_graph=True)
+            ctx_kv_post_cg = torch.cuda.CUDAGraph(keep_graph=True)
+            all_kv_ref = None
+            with torch.cuda.stream(cap_st):
+                with torch.cuda.graph(ctx_proj_cg, pool=proj_pool, stream=cap_st):
+                    ctx_h = self.model.combine_hidden_states_aux5(aux_hidden_states, num_target_tokens)
+                    if ctx_h is None or not ctx_h.is_contiguous():
+                        raise RuntimeError("combine_hidden_states_aux5 non-contiguous in diamond capture")
+                    all_kv_flat = dmodel._project_context_kv_flat(ctx_h)
+                    if not all_kv_flat.is_contiguous():
+                        all_kv_flat = all_kv_flat.contiguous()
+                    all_kv_ref = all_kv_flat
+                with torch.cuda.graph(ctx_kv_post_cg, pool=post_pool, stream=cap_st):
+                    kv_post_fn(
+                        all_kv_ref,
+                        ctx_pos_slice,
+                        dmodel._k_norm_weights,
+                        cos_sin_cache,
+                        k_caches,
+                        v_caches,
+                        slots_list,
+                        int(dmodel._num_kv_heads),
+                        int(block_size),
+                        float(dmodel._rms_norm_eps),
+                        bool(dmodel._rope_is_neox),
+                    )
+            main_st.wait_stream(cap_st)
+            d_cache[d_key] = (ctx_proj_cg, ctx_kv_post_cg, all_kv_ref, proj_pool, post_pool)
+            return ctx_proj_cg, ctx_kv_post_cg, query_cg
+        except Exception as exc:
+            logger.warning("Compound diamond fc+fkv split skipped (%s); using monolithic ctx_kv graph", exc)
+            return None
+
+    def warmup_ctx_kv_graphs(self, aux_base: list[torch.Tensor] | None) -> int:
+        """Pre-capture and cudaGraphUpload _ctx_kv_cg_entries for num_target_tokens in 1..7 at boot."""
+        if (
+            self._ctx_kv_cg_stream is None
+            or not aux_base
+            or len(aux_base) != 5
+            or not getattr(self, "_single_ctx_group", False)
+        ):
+            return 0
+        captured = 0
+        for n_tok in range(1, 8):
+            aux_n = [h[:n_tok] for h in aux_base]
+            context_slots = self._context_slot_mappings[self._single_ctx_gidx][:n_tok]
+            ctx_pos_slice = self.context_positions[:n_tok]
+            cg_key = (
+                n_tok,
+                aux_n[0].data_ptr(),
+                aux_n[0].stride(0),
+                aux_n[1].data_ptr(),
+                aux_n[2].data_ptr(),
+                aux_n[3].data_ptr(),
+                aux_n[4].data_ptr(),
+                ctx_pos_slice.data_ptr(),
+                context_slots.data_ptr(),
+            )
+            if cg_key in self._ctx_kv_cg_entries or cg_key in self._ctx_kv_cg_rejected:
+                continue
+            try:
+                main_st = torch.cuda.current_stream(self.device)
+                cap_st = self._ctx_kv_cg_stream
+                cap_st.wait_stream(main_st)
+                try:
+                    g = torch.cuda.CUDAGraph(keep_graph=True)
+                except TypeError:
+                    g = torch.cuda.CUDAGraph()
+                with torch.cuda.stream(cap_st):
+                    with torch.cuda.graph(g, pool=self._ctx_kv_cg_pool, stream=cap_st):
+                        ctx_h = self.model.combine_hidden_states_aux5(aux_n, n_tok)
+                        if ctx_h is None:
+                            ctx_h = self.model.combine_hidden_states(torch.cat(aux_n, dim=-1))[:n_tok]
+                        if not ctx_h.is_contiguous():
+                            ctx_h = ctx_h.contiguous()
+                        self.model.precompute_and_store_context_kv(ctx_h, ctx_pos_slice, context_slots)
+                main_st.wait_stream(cap_st)
+                if os.environ.get("VLLM_CUDAGRAPH_UPLOAD", "1") != "0" and hasattr(g, "raw_cuda_graph_exec"):
+                    try:
+                        import muse_bfx_ext as _bfx_up
+
+                        _bfx_up.cuda_graph_upload(int(g.raw_cuda_graph_exec()))
+                    except Exception:
+                        pass
+                self._ctx_kv_cg_entries[cg_key] = g
+                captured += 1
+            except Exception:
+                self._ctx_kv_cg_rejected.add(cg_key)
+        return captured
 
 
 @triton.jit

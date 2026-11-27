@@ -506,7 +506,11 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
-                        graph = torch.cuda.CUDAGraph()
+                        _keep_raw = desc.cg_mode == CUDAGraphMode.FULL and desc.num_tokens in (7, 16, 32)
+                        try:
+                            graph = torch.cuda.CUDAGraph(keep_graph=_keep_raw)
+                        except TypeError:
+                            graph = torch.cuda.CUDAGraph()
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
@@ -521,7 +525,7 @@ class CudaGraphManager:
                             )
                         cap_stream = torch.cuda.graph.default_capture_stream
                         if (
-                            1 <= desc.num_tokens <= 32
+                            1 <= desc.num_tokens <= 16
                             and persist_arena is not None
                             and persist_arena_bytes > 0
                         ):

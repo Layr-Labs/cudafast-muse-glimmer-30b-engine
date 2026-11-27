@@ -22,7 +22,6 @@
 //! resident's `load_epoch` and identity.
 
 use std::io::{self, BufWriter};
-use std::os::fd::AsFd;
 use std::process::ExitCode;
 
 use protocol_adapter::Adapter;
@@ -138,17 +137,7 @@ fn main() -> ExitCode {
             hello.ident
         );
         let backend = hello.backend_string();
-        let input = match stdin.as_fd().try_clone_to_owned() {
-            Ok(fd) => protocol_adapter::hotwait::HotReader::new(
-                std::fs::File::from(fd),
-                std::time::Duration::from_millis(500),
-            ),
-            Err(err) => {
-                eprintln!("cuda-engine: cannot duplicate stdin: {err}");
-                return ExitCode::FAILURE;
-            }
-        };
-        Adapter::with_backend(factory, backend, cuda_device()).run(input, out)
+        Adapter::with_backend(factory, backend, cuda_device()).run(stdin.lock(), out)
     } else {
         use protocol_adapter::mock::{MOCK_BACKEND, MOCK_DEVICE};
         eprintln!(

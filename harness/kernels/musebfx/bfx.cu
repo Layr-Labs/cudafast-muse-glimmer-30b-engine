@@ -162,7 +162,12 @@ void dflash_prepare_inputs(
     c10::optional<torch::Tensor> tail_count = c10::nullopt,
     c10::optional<torch::Tensor> tail_seen = c10::nullopt,
     c10::optional<torch::Tensor> hist = c10::nullopt,
-    c10::optional<torch::Tensor> hist_len = c10::nullopt);
+    c10::optional<torch::Tensor> hist_len = c10::nullopt,
+    c10::optional<torch::Tensor> post_sampled_tokens = c10::nullopt,
+    c10::optional<torch::Tensor> post_num_computed_tokens = c10::nullopt,
+    c10::optional<torch::Tensor> post_all_token_ids = c10::nullopt,
+    c10::optional<torch::Tensor> post_total_len = c10::nullopt,
+    c10::optional<torch::Tensor> post_output_bin_counts = c10::nullopt);
 void draft_vocab_update_tail(
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor in_static_vocab,
     torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor tail_seen,
@@ -255,7 +260,39 @@ void native_leaf_commit_tree(
     c10::optional<torch::Tensor> in_static_vocab = c10::nullopt,
     c10::optional<torch::Tensor> tail_ids = c10::nullopt,
     c10::optional<torch::Tensor> tail_count = c10::nullopt,
-    c10::optional<torch::Tensor> tail_seen = c10::nullopt);
+    c10::optional<torch::Tensor> tail_seen = c10::nullopt,
+    c10::optional<torch::Tensor> hit_cond = c10::nullopt);
+void cuda_graph_upload(int64_t raw_exec_ptr);
+void native_leaf_set_compound_l2pf_ranges(
+    int64_t fc_ptr, int64_t fc_span,
+    int64_t fkv_ptr, int64_t fkv_span,
+    int64_t l0_qkv_ptr, int64_t l0_qkv_span,
+    int64_t l0_gate_ptr, int64_t l0_gate_span);
+int64_t native_leaf_build_adaptive_verify_graph(
+    std::vector<int64_t> m16_graphs,
+    std::vector<int64_t> m32_graphs,
+    torch::Tensor tree_vals,
+    torch::Tensor req_acc_state,
+    int64_t tree_k = 8,
+    int64_t min_rounds = 3,
+    double wide_cpc = 3.25,
+    double mid_cpc = 3.55,
+    int64_t force_mode = 0);
+int64_t native_leaf_build_compound_step_graph(
+    std::vector<int64_t> m16_graphs,
+    std::vector<int64_t> m32_graphs,
+    std::vector<int64_t> tail_graphs,
+    torch::Tensor sampled_tokens,
+    torch::Tensor num_sampled,
+    torch::Tensor host_out_row,
+    int64_t raw_cuda_event,
+    torch::Tensor tree_vals,
+    torch::Tensor req_acc_state,
+    int64_t tree_k = 8,
+    int64_t min_rounds = 3,
+    double wide_cpc = 3.25,
+    double mid_cpc = 3.55,
+    int64_t force_mode = 0);
 void dflash_cascade_gate_prep(
     torch::Tensor input_ids, torch::Tensor query_positions,
     torch::Tensor draft_tokens, torch::Tensor tree_top, torch::Tensor tree_vals,
@@ -376,7 +413,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("tail_count") = c10::nullopt,
         pybind11::arg("tail_seen") = c10::nullopt,
         pybind11::arg("hist") = c10::nullopt,
-        pybind11::arg("hist_len") = c10::nullopt);
+        pybind11::arg("hist_len") = c10::nullopt,
+        pybind11::arg("post_sampled_tokens") = c10::nullopt,
+        pybind11::arg("post_num_computed_tokens") = c10::nullopt,
+        pybind11::arg("post_all_token_ids") = c10::nullopt,
+        pybind11::arg("post_total_len") = c10::nullopt,
+        pybind11::arg("post_output_bin_counts") = c10::nullopt);
   m.def("draft_vocab_update_tail", &draft_vocab_update_tail,
         pybind11::arg("input_ids"), pybind11::arg("positions"), pybind11::arg("in_static_vocab"),
         pybind11::arg("tail_ids"), pybind11::arg("tail_count"), pybind11::arg("tail_seen"),
@@ -469,7 +511,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("in_static_vocab") = c10::nullopt,
         pybind11::arg("tail_ids") = c10::nullopt,
         pybind11::arg("tail_count") = c10::nullopt,
-        pybind11::arg("tail_seen") = c10::nullopt);
+        pybind11::arg("tail_seen") = c10::nullopt,
+        pybind11::arg("hit_cond") = c10::nullopt);
+  m.def("cuda_graph_upload", &cuda_graph_upload, pybind11::arg("raw_exec_ptr"));
+  m.def("native_leaf_set_compound_l2pf_ranges", &native_leaf_set_compound_l2pf_ranges,
+        pybind11::arg("fc_ptr") = 0, pybind11::arg("fc_span") = 0,
+        pybind11::arg("fkv_ptr") = 0, pybind11::arg("fkv_span") = 0,
+        pybind11::arg("l0_qkv_ptr") = 0, pybind11::arg("l0_qkv_span") = 0,
+        pybind11::arg("l0_gate_ptr") = 0, pybind11::arg("l0_gate_span") = 0);
+  m.def("native_leaf_build_adaptive_verify_graph", &native_leaf_build_adaptive_verify_graph,
+        pybind11::arg("m16_graphs"), pybind11::arg("m32_graphs"),
+        pybind11::arg("tree_vals"), pybind11::arg("req_acc_state"),
+        pybind11::arg("tree_k") = 8, pybind11::arg("min_rounds") = 3,
+        pybind11::arg("wide_cpc") = 3.25, pybind11::arg("mid_cpc") = 3.55,
+        pybind11::arg("force_mode") = 0);
+  m.def("native_leaf_build_compound_step_graph", &native_leaf_build_compound_step_graph,
+        pybind11::arg("m16_graphs"), pybind11::arg("m32_graphs"), pybind11::arg("tail_graphs"),
+        pybind11::arg("sampled_tokens"), pybind11::arg("num_sampled"),
+        pybind11::arg("host_out_row"), pybind11::arg("raw_cuda_event"),
+        pybind11::arg("tree_vals"), pybind11::arg("req_acc_state"),
+        pybind11::arg("tree_k") = 8, pybind11::arg("min_rounds") = 3,
+        pybind11::arg("wide_cpc") = 3.25, pybind11::arg("mid_cpc") = 3.55,
+        pybind11::arg("force_mode") = 0);
   m.def("dflash_cascade_gate_prep", &dflash_cascade_gate_prep,
         pybind11::arg("input_ids"), pybind11::arg("query_positions"),
         pybind11::arg("draft_tokens"), pybind11::arg("tree_top"), pybind11::arg("tree_vals"),

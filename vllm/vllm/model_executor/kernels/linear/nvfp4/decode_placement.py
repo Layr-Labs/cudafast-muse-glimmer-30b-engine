@@ -94,10 +94,13 @@ def take_buddyinfo_sponge(need_bytes: int = 36 << 30) -> int:
     try:
         import ctypes
 
-        cap_gib = int(os.environ.get("MUSE_BUDDY_SPONGE_CAP_GIB", "72"))
+        cap_gib = int(os.environ.get("MUSE_BUDDY_SPONGE_CAP_GIB", "24"))
         if cap_gib <= 0:
             return 0
         usable = _usable_buddyinfo_bytes(2 << 20)
+        avail = _mem_available()
+        if avail is not None and avail > 0:
+            usable = min(usable, avail)
         headroom = 18 << 30
         granule = 2 << 20
         least = 1 << 30

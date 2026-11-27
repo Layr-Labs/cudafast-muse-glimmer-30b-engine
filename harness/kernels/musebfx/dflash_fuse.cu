@@ -300,28 +300,28 @@ __global__ void dflash_qkv_norm_rope_kernel(
 
 template <typename LastSampT, typename TailIdT>
 __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
-    int32_t* __restrict__ out_input_ids,
-    int64_t* __restrict__ out_query_positions,
-    int32_t* __restrict__ out_query_start_loc,
-    int32_t* __restrict__ out_seq_lens,
-    int64_t* __restrict__ out_query_slot_mapping,
-    int64_t* __restrict__ out_context_positions,
-    int64_t* __restrict__ out_context_slot_mapping,
-    int64_t* __restrict__ out_sample_indices,
-    int64_t* __restrict__ out_sample_pos,
-    int32_t* __restrict__ out_sample_idx_mapping,
-    float* __restrict__ out_temperature,
-    int64_t* __restrict__ out_seeds,
-    const int64_t* __restrict__ target_positions,
-    const int32_t* __restrict__ target_query_start_loc,
-    const int32_t* __restrict__ idx_mapping,
-    const LastSampT* __restrict__ last_sampled,
-    const int32_t* __restrict__ next_prefill_tokens,
-    const int32_t* __restrict__ num_sampled,
-    const int32_t* __restrict__ num_rejected,
-    const float* __restrict__ in_temperature,
-    const int64_t* __restrict__ in_seeds,
-    const int32_t* __restrict__ block_table,
+    int32_t* out_input_ids,
+    int64_t* out_query_positions,
+    int32_t* out_query_start_loc,
+    int32_t* out_seq_lens,
+    int64_t* out_query_slot_mapping,
+    int64_t* out_context_positions,
+    int64_t* out_context_slot_mapping,
+    int64_t* out_sample_indices,
+    int64_t* out_sample_pos,
+    int32_t* out_sample_idx_mapping,
+    float* out_temperature,
+    int64_t* out_seeds,
+    const int64_t* target_positions,
+    const int32_t* target_query_start_loc,
+    const int32_t* idx_mapping,
+    LastSampT* last_sampled,
+    const int32_t* next_prefill_tokens,
+    const int32_t* num_sampled,
+    const int32_t* num_rejected,
+    const float* in_temperature,
+    const int64_t* in_seeds,
+    const int32_t* block_table,
     int64_t block_table_stride,
     int32_t parallel_drafting_token_id,
     int64_t block_size,
@@ -331,18 +331,29 @@ __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
     int max_num_tokens,
     int64_t max_model_len,
     int64_t pad_slot_id,
-    const TailIdT* __restrict__ target_input_ids,
+    const TailIdT* target_input_ids,
     int tail_num_tokens,
     const uint8_t* __restrict__ in_static_vocab,
-    int32_t* __restrict__ tail_ids,
-    int32_t* __restrict__ tail_count,
-    int32_t* __restrict__ tail_seen,
+    int32_t* tail_ids,
+    int32_t* tail_count,
+    int32_t* tail_seen,
     int vocab_size,
     int max_tail,
     int include_bonus,
-    int32_t* __restrict__ hist,
-    int32_t* __restrict__ hist_len,
-    int hist_cap) {
+    int32_t* hist,
+    int32_t* hist_len,
+    int hist_cap,
+    const int64_t* post_sampled_tokens,
+    int32_t* post_num_computed_tokens,
+    int32_t* post_all_token_ids,
+    int64_t post_all_tok_stride,
+    int32_t* post_total_len,
+    int32_t* post_output_bin_counts,
+    int64_t post_bin_stride,
+    int pdl_mode) {
+  if ((pdl_mode & 1) != 0) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
   __shared__ int32_t s_req_state_idx;
   __shared__ int32_t s_ctx_start;
   __shared__ int32_t s_num_ctx;
@@ -364,6 +375,29 @@ __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
     const int32_t nr = num_rejected[0];
     const int32_t valid_ctx_end = ctx_end - nr;
     const int32_t ns = num_sampled[0];
+    if (post_sampled_tokens != nullptr && req_state_idx >= 0) {
+      const int32_t tl_old = post_total_len[req_state_idx];
+      if (ns > 0) {
+        const int64_t last_tok = post_sampled_tokens[ns - 1];
+        last_sampled[req_state_idx] = static_cast<LastSampT>(last_tok);
+        post_total_len[req_state_idx] = tl_old + ns;
+      }
+      int32_t* all_row = post_all_token_ids + static_cast<int64_t>(req_state_idx) * post_all_tok_stride + tl_old;
+      int32_t* bin_row = (post_output_bin_counts != nullptr)
+          ? (post_output_bin_counts + static_cast<int64_t>(req_state_idx) * post_bin_stride)
+          : nullptr;
+      for (int i = 0; i < ns; ++i) {
+        const int64_t tok_i = post_sampled_tokens[i];
+        all_row[i] = static_cast<int32_t>(tok_i);
+        if (bin_row != nullptr) {
+          bin_row[tok_i] += 1;
+        }
+      }
+      const int32_t computed_delta = num_ctx - nr;
+      if (computed_delta != 0) {
+        post_num_computed_tokens[req_state_idx] += computed_delta;
+      }
+    }
     const int32_t bonus_token = (ns > 0)
         ? static_cast<int32_t>(last_sampled[req_state_idx])
         : static_cast<int32_t>(next_prefill_tokens[req_state_idx]);
@@ -546,6 +580,9 @@ __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
       }
       hist_len[0] = (s_hist_need_len <= hist_cap) ? static_cast<int32_t>(s_hist_need_len) : -1;
     }
+  }
+  if ((pdl_mode & 2) != 0) {
+    asm volatile("griddepcontrol.launch_dependents;");
   }
 }
 
@@ -867,7 +904,12 @@ void dflash_prepare_inputs(
     c10::optional<torch::Tensor> tail_count,
     c10::optional<torch::Tensor> tail_seen,
     c10::optional<torch::Tensor> hist,
-    c10::optional<torch::Tensor> hist_len) {
+    c10::optional<torch::Tensor> hist_len,
+    c10::optional<torch::Tensor> post_sampled_tokens,
+    c10::optional<torch::Tensor> post_num_computed_tokens,
+    c10::optional<torch::Tensor> post_all_token_ids,
+    c10::optional<torch::Tensor> post_total_len,
+    c10::optional<torch::Tensor> post_output_bin_counts) {
   TORCH_CHECK(out_input_ids.scalar_type() == torch::kInt32 && out_query_positions.scalar_type() == torch::kInt64 &&
                   out_query_start_loc.scalar_type() == torch::kInt32 && out_seq_lens.scalar_type() == torch::kInt32 &&
                   out_query_slot_mapping.scalar_type() == torch::kInt64 &&
@@ -934,13 +976,52 @@ void dflash_prepare_inputs(
   TORCH_CHECK(ls_i64 || last_sampled.scalar_type() == torch::kInt32, "bad last_sampled dtype");
   TORCH_CHECK(next_prefill_tokens.scalar_type() == torch::kInt32, "bad next_prefill_tokens dtype");
 
+  const int64_t* post_samp_ptr = nullptr;
+  int32_t* post_ncomp_ptr = nullptr;
+  int32_t* post_all_ptr = nullptr;
+  int64_t post_all_stride = 0;
+  int32_t* post_tlen_ptr = nullptr;
+  int32_t* post_bin_ptr = nullptr;
+  int64_t post_bin_stride = 0;
+  if (post_sampled_tokens.has_value() && post_sampled_tokens->defined()) {
+    TORCH_CHECK(post_sampled_tokens->is_cuda() && post_sampled_tokens->scalar_type() == torch::kInt64 &&
+                    post_sampled_tokens->stride(-1) == 1,
+                "dflash_prepare_inputs bad post_sampled_tokens");
+    TORCH_CHECK(post_num_computed_tokens.has_value() && post_num_computed_tokens->defined() &&
+                    post_num_computed_tokens->scalar_type() == torch::kInt32 &&
+                    post_num_computed_tokens->is_contiguous(),
+                "dflash_prepare_inputs bad post_num_computed_tokens");
+    TORCH_CHECK(post_all_token_ids.has_value() && post_all_token_ids->defined() &&
+                    post_all_token_ids->scalar_type() == torch::kInt32 &&
+                    post_all_token_ids->stride(-1) == 1,
+                "dflash_prepare_inputs bad post_all_token_ids");
+    TORCH_CHECK(post_total_len.has_value() && post_total_len->defined() &&
+                    post_total_len->scalar_type() == torch::kInt32 &&
+                    post_total_len->is_contiguous(),
+                "dflash_prepare_inputs bad post_total_len");
+    post_samp_ptr = post_sampled_tokens->data_ptr<int64_t>();
+    post_ncomp_ptr = post_num_computed_tokens->data_ptr<int32_t>();
+    post_all_ptr = post_all_token_ids->data_ptr<int32_t>();
+    post_all_stride = post_all_token_ids->stride(0);
+    post_tlen_ptr = post_total_len->data_ptr<int32_t>();
+    if (post_output_bin_counts.has_value() && post_output_bin_counts->defined()) {
+      TORCH_CHECK(post_output_bin_counts->scalar_type() == torch::kInt32 &&
+                      post_output_bin_counts->stride(-1) == 1,
+                  "dflash_prepare_inputs bad post_output_bin_counts");
+      post_bin_ptr = post_output_bin_counts->data_ptr<int32_t>();
+      post_bin_stride = post_output_bin_counts->stride(0);
+    }
+  }
+
   static const int include_bonus = []() -> int {
     const char* s = std::getenv("MUSE_TAIL_ZERO_LAG");
     return (!s || !*s || std::atoi(s) != 0) ? 1 : 0;
   }();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
+  const int pdl = dflash_fuse_pdl_mode();
 #define LAUNCH_PREP(LST, TIDT) \
-  dflash_prepare_inputs_kernel<LST, TIDT><<<1, 256, 0, st>>>( \
+  dflash_launch_pdl( \
+      dflash_prepare_inputs_kernel<LST, TIDT>, 1, 256, st, pdl, \
       out_input_ids.data_ptr<int32_t>(), \
       out_query_positions.data_ptr<int64_t>(), \
       out_query_start_loc.data_ptr<int32_t>(), \
@@ -983,7 +1064,15 @@ void dflash_prepare_inputs(
       include_bonus, \
       hist_ptr, \
       hist_len_ptr, \
-      hist_cap)
+      hist_cap, \
+      post_samp_ptr, \
+      post_ncomp_ptr, \
+      post_all_ptr, \
+      post_all_stride, \
+      post_tlen_ptr, \
+      post_bin_ptr, \
+      post_bin_stride, \
+      pdl)
 
   if (ls_i64) {
     if (tail_i64) { LAUNCH_PREP(int64_t, int64_t); }

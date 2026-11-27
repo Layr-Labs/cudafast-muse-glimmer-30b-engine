@@ -446,12 +446,22 @@ __device__ __forceinline__ void down_tile(
     if (mode == 0) {
       mbar_expect_tx(bar, MB * 16 * 128 + kBBytes + kSBytes);
       tma2d_hint(dst, tmA, 128 * g, row0, bar, tma_pol_el());                         // bytes, rows
-      tma2d_hint(dst + kABytes, tmB, 256 * col, 4 * g, bar, tma_pol_ef());            // uint32, k16 rows
-      tma2d_hint(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar, tma_pol_ef());  // bytes, k16 rows
+      if constexpr (kCols == 6656) {
+        tma2d_hint(dst + kABytes, tmB, 256 * col, 4 * g, bar, tma_pol_ef());          // uint32, k16 rows
+        tma2d_hint(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar, tma_pol_ef());// bytes, k16 rows
+      } else {
+        tma2d(dst + kABytes, tmB, 256 * col, 4 * g, bar);
+        tma2d(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar);
+      }
     } else if (mode == 1) {
       mbar_expect_tx_only(bar, kBBytes + kSBytes);
-      tma2d_hint(dst + kABytes, tmB, 256 * col, 4 * g, bar, tma_pol_ef());
-      tma2d_hint(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar, tma_pol_ef());
+      if constexpr (kCols == 6656) {
+        tma2d_hint(dst + kABytes, tmB, 256 * col, 4 * g, bar, tma_pol_ef());
+        tma2d_hint(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar, tma_pol_ef());
+      } else {
+        tma2d(dst + kABytes, tmB, 256 * col, 4 * g, bar);
+        tma2d(dst + kABytes + kBBytes, tmS, 128 * col, 4 * g, bar);
+      }
     } else {
       mbar_expect_tx(bar, MB * 16 * 128);
       tma2d_hint(dst, tmA, 128 * g, row0, bar, tma_pol_el());
@@ -1622,7 +1632,7 @@ static bool gateup_ilv_b_ef() {
 static bool gateup_ilv_epi8w() {
   static const bool on = []() -> bool {
     const char* env = std::getenv("MARLINW_GATEUP_ILV_EPI8W");
-    return env && *env && std::strtol(env, nullptr, 10) != 0;
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
   return on;
 }

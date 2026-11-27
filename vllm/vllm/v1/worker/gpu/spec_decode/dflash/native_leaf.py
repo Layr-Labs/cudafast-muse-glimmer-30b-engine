@@ -49,8 +49,8 @@ TREE_WIDE_M = (
     else 0
 )
 TREE_WIDE_GATE = os.environ.get("MUSE_NATIVE_TREE_WIDE_GATE", "cpc").strip().lower()
-TREE_WIDE_CPC = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_CPC", "3.25"))
-TREE_WIDE_MIN_ROUNDS = int(os.environ.get("MUSE_NATIVE_TREE_WIDE_MIN_ROUNDS", "3"))
+TREE_WIDE_CPC = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_CPC", "4.8"))
+TREE_WIDE_MIN_ROUNDS = int(os.environ.get("MUSE_NATIVE_TREE_WIDE_MIN_ROUNDS", "0"))
 TREE_WIDE_SM = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_SM", "2.0"))
 
 
@@ -152,6 +152,11 @@ class _NativeLeafState:
         self.layer_gid: torch.Tensor | None = None
         # Cached device pointer array for hidden_states + aux_hidden_states (0 H2D copies steady state).
         self._hid_ptr_cache: dict[tuple[int, ...], torch.Tensor] = {}
+        self.hit_cond: torch.Tensor | None = None
+        self._cf_cg_cache: dict[tuple, torch.cuda.CUDAGraph] = {}
+        self._cf_cg_rejected: set[tuple] = set()
+        self._cf_cg_pool: object = None
+        self._cf_cg_stream: torch.cuda.Stream | None = None
         self._last_req_id: str | None = None
         self._hist_req_id: str | None = None
         self._host_req_id: str | None = None
@@ -189,8 +194,6 @@ def register_draft_tail_bufs(
 def _reset_draft_tail_state() -> None:
     if torch.cuda.is_current_stream_capturing():
         return
-    if _S.tail_ids is not None and not _S.tail_ids.is_inference():
-        _S.tail_ids.fill_(-1)
     if _S.tail_count is not None and not _S.tail_count.is_inference():
         _S.tail_count.zero_()
     if _S.tail_seen is not None and not _S.tail_seen.is_inference():
@@ -275,6 +278,8 @@ def select_verify_m(req_id: str | None, decoded_tokens: int) -> int:
         return wide_m if sm_val < TREE_WIDE_SM else base_m
     # Default zero-sync `cpc` gate: start on fast M=16 for the first TREE_WIDE_MIN_ROUNDS steps,
     # then switch to wide M=32 only when running verify cpc < TREE_WIDE_CPC (hard <3.25 tok/step prose!).
+    if _S._host_rounds == 0 and TREE_WIDE_MIN_ROUNDS <= 0:
+        return wide_m
     if _S._host_rounds < TREE_WIDE_MIN_ROUNDS:
         return base_m
     verify_committed = max(0, int(decoded_tokens))
@@ -649,7 +654,10 @@ def init_kv_table(
         _S.stride_slot = torch.tensor(s_slot, dtype=torch.int64, device=device)
         _S.block_size = torch.tensor(b_sz, dtype=torch.int32, device=device)
         _S.layer_gid = torch.tensor(gids, dtype=torch.int32, device=device)
+        _S.hit_cond = torch.zeros((1,), dtype=torch.bool, device=device)
         _S._hid_ptr_cache.clear()
+        _S._cf_cg_cache.clear()
+        _S._cf_cg_rejected.clear()
         _S._last_req_id = None
         _S._hist_req_id = None
         _S._host_req_id = None
@@ -764,6 +772,86 @@ def prepare_tree(positions: torch.Tensor, seq_lens: torch.Tensor, verify_m: int)
         bfx.native_leaf_prepare_tree(positions, seq_lens, verify_m)
         return True
     return False
+
+
+@torch.no_grad()
+def ensure_req_step_ready(req_id: str) -> None:
+    """Host-side per-request state check before launching adaptive conditional tree graph."""
+    if not _S.ready:
+        return
+    if req_id != _S._hist_req_id:
+        _reset_hist_for_req(req_id)
+    if req_id != _S._last_req_id:
+        if LEAF_STATS and _S._last_req_id is not None:
+            _dump_stats(str(_S._last_req_id))
+        _S._last_req_id = req_id
+        _S._host_req_id = req_id
+        _S._host_rounds = 0
+        if _S.prev_ns is not None:
+            _S.prev_ns.fill_(7)
+        if _S.alt_ids is not None:
+            _S.alt_ids.fill_(-1)
+        if _S.alt_margins is not None:
+            _S.alt_margins.fill_(1e30)
+        if _S.tree_top is not None:
+            _S.tree_top.fill_(-1)
+        if _S.tree_vals is not None:
+            _S.tree_vals.fill_(-1e30)
+        if _S.cascade_meta is not None:
+            _S.cascade_meta.zero_()
+        if _S.req_acc_state is not None:
+            _S.req_acc_state.zero_()
+        _reset_tr_state()
+    _S._host_rounds += 1
+
+
+@torch.no_grad()
+def launch_setup_tree_only(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    verify_m: int,
+) -> bool:
+    """Capture-safe pure GPU launch of native_leaf_setup_tree for verify_m (16 or 32)."""
+    if not _S.ready or verify_m <= 8:
+        return False
+    bfx = _get_bfx()
+    if bfx is None or _S.tree_top is None or _S.saved_leaf_toks is None or _S.saved_leaf_k is None:
+        return False
+    tr_log_arg = _S.tr_log if TR_ENABLED else None
+    tr_state_arg = _S.tr_state if TR_ENABLED else None
+    bfx.native_leaf_setup_tree(
+        _S.leaf_flag,
+        _S.tree_top,
+        input_ids,
+        positions,
+        _S.saved_leaf_toks,
+        _S.saved_leaf_k,
+        verify_m,
+        SELFTEST,
+        _S.req_acc_state,
+        _S.tree_vals,
+        TREE_DYNAMIC,
+        TREE_TEMP,
+        TREE_TAIL,
+        TREE_GAMMA,
+        _S.saved_leaf_parent,
+        TREE_MAX_DEPTH,
+        TREE_SUB_COEF,
+        TREE_SHF_COEF,
+        TREE_CONT_DECAY,
+        _S.hist,
+        _S.hist_len,
+        _S.saved_pos0,
+        _S.stats,
+        _S.saved_row_ctx,
+        tr_log_arg,
+        tr_state_arg,
+        _S.vocab_size,
+        _S.cascade_meta,
+        _S.cascade_toks,
+        _S.cascade_vals,
+    )
+    return True
 
 
 @torch.no_grad()
@@ -921,6 +1009,246 @@ def setup_step(
     return True
 
 
+def _resolve_hid_ptr_groups(
+    hidden_states: torch.Tensor | None,
+    aux_hidden_states: list[torch.Tensor] | None,
+    extra_hidden: torch.Tensor | None,
+    min_rows: int,
+    device: torch.device,
+) -> tuple[list[tuple[int, int, torch.Tensor]], tuple]:
+    tensors: list[torch.Tensor] = []
+    seen_ptrs: set[int] = set()
+    for t in ([hidden_states, extra_hidden] + (list(aux_hidden_states) if aux_hidden_states else [])):
+        if (
+            t is not None
+            and t.is_cuda
+            and t.dim() == 2
+            and t.shape[0] >= min_rows
+            and t.stride(1) == 1
+            and t.data_ptr() not in seen_ptrs
+        ):
+            seen_ptrs.add(t.data_ptr())
+            tensors.append(t)
+    resolved: list[tuple[int, int, torch.Tensor]] = []
+    sig_parts: list[tuple[int, int, tuple[int, ...]]] = []
+    if tensors:
+        groups: dict[tuple[int, int], list[int]] = {}
+        for t in tensors:
+            eb = t.element_size()
+            rsb = t.stride(0) * eb
+            cb = t.shape[1] * eb
+            if (rsb & 15) == 0 and (cb & 15) == 0 and (t.data_ptr() & 15) == 0:
+                groups.setdefault((rsb, cb), []).append(t.data_ptr())
+        for (rsb, cb), ptrs in groups.items():
+            key = tuple(ptrs)
+            ptr_t = _S._hid_ptr_cache.get(key)
+            if ptr_t is None:
+                if torch.cuda.is_current_stream_capturing():
+                    continue
+                if len(_S._hid_ptr_cache) >= 64:
+                    _S._hid_ptr_cache.clear()
+                with torch.inference_mode(False):
+                    ptr_t = torch.tensor(ptrs, dtype=torch.int64, device=device)
+                _S._hid_ptr_cache[key] = ptr_t
+            resolved.append((rsb, cb, ptr_t))
+            sig_parts.append((rsb, cb, key))
+    return resolved, tuple(sig_parts)
+
+
+def _emit_tree_commit_ops(
+    bfx,
+    sampled_tokens: torch.Tensor,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    leaf_u_tok: torch.Tensor,
+    resolved_groups: list[tuple[int, int, torch.Tensor]],
+    slot_mappings: torch.Tensor | None,
+    eff_m: int,
+    chain_all_valid: bool,
+    cond_graph: torch.cuda.CUDAGraph | None = None,
+) -> None:
+    src_row = eff_m - 1
+    tr_log_arg = _S.tr_log if TR_ENABLED else None
+    tr_state_arg = _S.tr_state if TR_ENABLED else None
+    in_sv_arg = _S.in_static_vocab if OOV_PREADMIT else None
+    t_ids_arg = _S.tail_ids if OOV_PREADMIT else None
+    t_cnt_arg = _S.tail_count if OOV_PREADMIT else None
+    t_seen_arg = _S.tail_seen if OOV_PREADMIT else None
+    hit_cond_arg = _S.hit_cond if cond_graph is not None else None
+    try:
+        bfx.native_leaf_commit_tree(
+            _S.leaf_flag,
+            _S.prev_ns,
+            _S.hit_flag,
+            _S.hit_src_row,
+            _S.saved_leaf_toks,
+            _S.saved_leaf_k,
+            leaf_u_tok,
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            eff_m,
+            _S.stats,
+            NOHIT,
+            _S.req_acc_state,
+            _S.saved_leaf_parent,
+            _S.hist,
+            _S.hist_len,
+            _S.saved_pos0,
+            _S.saved_row_ctx,
+            tr_log_arg,
+            tr_state_arg,
+            _S.vocab_size,
+            chain_all_valid,
+            _S.cascade_meta,
+            in_sv_arg,
+            t_ids_arg,
+            t_cnt_arg,
+            t_seen_arg,
+            hit_cond_arg,
+        )
+    except TypeError:
+        if cond_graph is not None:
+            raise
+        bfx.native_leaf_commit_tree(
+            _S.leaf_flag,
+            _S.prev_ns,
+            _S.hit_flag,
+            _S.hit_src_row,
+            _S.saved_leaf_toks,
+            _S.saved_leaf_k,
+            leaf_u_tok,
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            eff_m,
+            _S.stats,
+            NOHIT,
+            _S.req_acc_state,
+            _S.saved_leaf_parent,
+            _S.hist,
+            _S.hist_len,
+            _S.saved_pos0,
+            _S.saved_row_ctx,
+            tr_log_arg,
+            tr_state_arg,
+            _S.vocab_size,
+            chain_all_valid,
+            _S.cascade_meta,
+            in_sv_arg,
+            t_ids_arg,
+            t_cnt_arg,
+            t_seen_arg,
+        )
+    if cond_graph is not None:
+        cond_graph.begin_capture_to_if_node(_S.hit_cond)
+    try:
+        for rsb, cb, ptr_t in resolved_groups:
+            bfx.native_leaf_fix_hidden(_S.hit_flag, ptr_t, rsb, cb, src_row, _S.hit_src_row)
+        if slot_mappings is not None and _S.num_layers > 0:
+            bfx.native_leaf_fix_kv(
+                _S.hit_flag,
+                slot_mappings,
+                _S.kv_ptrs,
+                _S.stride_block,
+                _S.stride_head,
+                _S.stride_slot,
+                _S.block_size,
+                _S.layer_gid,
+                src_row,
+                _S.hit_src_row,
+            )
+    finally:
+        if cond_graph is not None:
+            cond_graph.end_capture_to_conditional_node()
+
+
+@torch.no_grad()
+def get_or_capture_commit_fix_graph(
+    sampled_tokens: torch.Tensor,
+    num_sampled: torch.Tensor,
+    num_rejected: torch.Tensor,
+    leaf_u_tok: torch.Tensor,
+    hidden_states: torch.Tensor | None,
+    aux_hidden_states: list[torch.Tensor] | None,
+    slot_mappings: torch.Tensor | None,
+    extra_hidden: torch.Tensor | None = None,
+    verify_m: int = 16,
+    chain_all_valid: bool = True,
+    plain_for_child: bool = False,
+) -> torch.cuda.CUDAGraph | None:
+    """Capture or return cached CUDA graph for tree commit_and_fix."""
+    if not _S.ready or verify_m <= 8 or torch.cuda.is_current_stream_capturing():
+        return None
+    bfx = _get_bfx()
+    if bfx is None or _S.hit_src_row is None or _S.saved_leaf_toks is None or _S.saved_leaf_k is None:
+        return None
+    resolved_groups, hid_sig = _resolve_hid_ptr_groups(
+        hidden_states, aux_hidden_states, extra_hidden, verify_m, sampled_tokens.device
+    )
+    use_if = (
+        not plain_for_child
+        and _S.hit_cond is not None
+        and os.environ.get("MUSE_LEAF_COND_IF", "1") != "0"
+        and hasattr(torch.cuda.CUDAGraph, "begin_capture_to_if_node")
+        and hasattr(torch.cuda.CUDAGraph, "end_capture_to_conditional_node")
+    )
+    sig = (
+        int(verify_m),
+        int(chain_all_valid),
+        int(use_if),
+        sampled_tokens.data_ptr(),
+        num_sampled.data_ptr(),
+        num_rejected.data_ptr(),
+        leaf_u_tok.data_ptr(),
+        slot_mappings.data_ptr() if slot_mappings is not None else 0,
+        hid_sig,
+    )
+    g = _S._cf_cg_cache.get(sig)
+    if g is not None:
+        return g
+    if sig in _S._cf_cg_rejected or len(_S._cf_cg_cache) >= 32:
+        return None
+    try:
+        if _S._cf_cg_pool is None:
+            _S._cf_cg_pool = torch.cuda.graph_pool_handle()
+            _S._cf_cg_stream = torch.cuda.Stream(device=sampled_tokens.device)
+        main_st = torch.cuda.current_stream(sampled_tokens.device)
+        cap_st = _S._cf_cg_stream
+        assert cap_st is not None
+        cap_st.wait_stream(main_st)
+        try:
+            g = torch.cuda.CUDAGraph(keep_graph=bool(plain_for_child))
+        except TypeError:
+            g = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(cap_st):
+            with torch.cuda.graph(g, pool=_S._cf_cg_pool, stream=cap_st):
+                _emit_tree_commit_ops(
+                    bfx,
+                    sampled_tokens,
+                    num_sampled,
+                    num_rejected,
+                    leaf_u_tok,
+                    resolved_groups,
+                    slot_mappings,
+                    verify_m,
+                    chain_all_valid,
+                    cond_graph=g if use_if else None,
+                )
+        main_st.wait_stream(cap_st)
+        if os.environ.get("VLLM_CUDAGRAPH_UPLOAD", "1") != "0" and hasattr(g, "raw_cuda_graph_exec"):
+            try:
+                bfx.cuda_graph_upload(int(g.raw_cuda_graph_exec()))
+            except Exception:
+                pass
+        _S._cf_cg_cache[sig] = g
+        return g
+    except Exception as exc:  # noqa: BLE001
+        _S._cf_cg_rejected.add(sig)
+        logger.warning("native_leaf commit_and_fix graph capture skipped (%s); keeping eager path", exc)
+        return None
+
+
 @torch.no_grad()
 def commit_and_fix(
     sampled_tokens: torch.Tensor,
@@ -956,6 +1284,33 @@ def commit_and_fix(
 
     eff_m = verify_m if verify_m is not None else (8 if m8_mode else 7)
     is_tree = eff_m > 8
+    if (
+        is_tree
+        and os.environ.get("MUSE_LEAF_COND_FIX", "1") != "0"
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        cf_g = get_or_capture_commit_fix_graph(
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            leaf_u_tok,
+            hidden_states,
+            aux_hidden_states,
+            slot_mappings,
+            extra_hidden=extra_hidden,
+            verify_m=eff_m,
+            chain_all_valid=chain_all_valid,
+            plain_for_child=False,
+        )
+        if cf_g is not None:
+            cf_g.replay()
+            if not _S._logged_active:
+                _S._logged_active = True
+                logger.info(
+                    "native_leaf: active on verify path (verify_m=%d, policy=%s, conditional 1-launch commit+fix graph)",
+                    eff_m, _POLICY_RAW,
+                )
+            return
     src_row = eff_m - 1
     src_row_buf = None
     if is_tree:
