@@ -233,7 +233,10 @@ __device__ __forceinline__ void k_loop(
       // (the copies cannot overlap) and masked: bit 15 <- sign, bits 8:6 <- e1 e0 m, the same in the upper half.
       {
         const unsigned u = static_cast<unsigned>(bq1);
-        reinterpret_cast<unsigned*>(&b1)[1] = (u & 0x80008000u) | ((u >> 6) & 0x01c001c0u);
+        unsigned b1_hi;
+        asm("lop3.b32 %0, %1, %2, %3, 0xEA;"
+            : "=r"(b1_hi) : "r"(u), "r"(0x80008000u), "r"((u >> 6) & 0x01c001c0u));
+        reinterpret_cast<unsigned*>(&b1)[1] = b1_hi;
         reinterpret_cast<unsigned*>(&b1)[0] = (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
         reinterpret_cast<unsigned*>(&b0)[1] = ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
         reinterpret_cast<unsigned*>(&b0)[0] = ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;

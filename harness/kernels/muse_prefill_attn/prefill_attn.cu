@@ -176,7 +176,8 @@ __device__ __forceinline__ void issue_kv64_flat(
     uint4 smem_tile[64][16],
     const __nv_bfloat16* __restrict__ flat_base,
     int tok_base,
-    int tid) {
+    int tid,
+    int n_u = 4) {
   const int r_in_16 = tid >> 4;
   const int c = tid & 15;
   const int c_phys = c ^ (r_in_16 & 7);
@@ -184,8 +185,10 @@ __device__ __forceinline__ void issue_kv64_flat(
       flat_base + static_cast<int64_t>(tok_base) * 128) + r_in_16 * 16 + c;
   #pragma unroll
   for (int u = 0; u < 4; ++u) {
-    const int r = (u << 4) + r_in_16;
-    cp_async_16(smem_u32(&smem_tile[r][c_phys]), src + u * 256);
+    if (u < n_u) {
+      const int r = (u << 4) + r_in_16;
+      cp_async_16(smem_u32(&smem_tile[r][c_phys]), src + u * 256);
+    }
   }
 }
 
@@ -486,6 +489,33 @@ __device__ __forceinline__ void prefill_qk_half(
   }
 }
 
+template <bool kTrim>
+__device__ __forceinline__ void prefill_pv_half(
+    const uint32_t (*p)[4], const uint4 (&v)[64][16],
+    float (*o)[4], int lane, int pairs) {
+  uint32_t v_cur[4], v_nxt[4];
+  ldsm4_v_pair64(v_cur, v, 0, 0, lane);
+  #pragma unroll
+  for (int ks_local = 0; ks_local < 4; ++ks_local) {
+    if (!kTrim || ks_local < pairs) {
+      #pragma unroll
+      for (int dp = 0; dp < 8; ++dp) {
+        const int n_dp = (dp + 1) & 7;
+        const int n_ks = ks_local + (dp == 7 ? 1 : 0);
+        if (n_ks < (kTrim ? pairs : 4)) {
+          ldsm4_v_pair64(v_nxt, v, n_dp, n_ks, lane);
+        }
+        mma_m16n8k16_bf16(p[ks_local], v_cur[0], v_cur[1], o[dp * 2 + 0]);
+        mma_m16n8k16_bf16(p[ks_local], v_cur[2], v_cur[3], o[dp * 2 + 1]);
+        if (n_ks < (kTrim ? pairs : 4)) {
+          v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1];
+          v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
+        }
+      }
+    }
+  }
+}
+
 template <int Mode, bool UseRope, bool CacheFP32, bool kPdl, bool kDiscardL2>
 __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     const __nv_bfloat16* __restrict__ qkv,
@@ -586,7 +616,8 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   float row_max0 = -INFINITY, row_max1 = -INFINITY;
   float row_sum0 = 0.0f, row_sum1 = 0.0f;
 
-  issue_kv64_flat(kv_smem[0], k_flat, (nb_max - 1) << 7, tid);
+  const int init_diag_pairs = ((m_grp & 15) >> 1) + 1;
+  issue_kv64_flat(kv_smem[0], k_flat, (nb_max - 1) << 7, tid, half_only ? init_diag_pairs : 4);
   cp_async_commit();
 
   for (int nb = nb_max - 1; nb >= 0; --nb) {
@@ -604,11 +635,11 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     }
 
     if (!skip_hi) {
-      issue_kv64_flat(kv_smem[1], k_flat, block_tok_base + 64, tid);
+      issue_kv64_flat(kv_smem[1], k_flat, block_tok_base + 64, tid, hi_pairs);
       cp_async_commit();
       cp_async_wait<1>();
     } else {
-      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base, tid);
+      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base, tid, lo_pairs);
       cp_async_commit();
       cp_async_wait<1>();
     }
@@ -631,7 +662,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         prefill_qk_half<false>(q_frag, kv_smem[1], s_frag + 8, lane, 4);
       }
       __syncthreads();
-      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base + 64, tid);
+      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base + 64, tid, hi_pairs);
       cp_async_commit();
     }
 
@@ -727,40 +758,16 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         }
       }
       __syncthreads();
-      uint32_t v_cur[4], v_nxt[4];
-      ldsm4_v_pair64(v_cur, kv_smem[1], 0, 0, lane);
-      #pragma unroll
-      for (int ks_local = 0; ks_local < 4; ++ks_local) {
-        #pragma unroll
-        for (int dp = 0; dp < 8; ++dp) {
-          const int n_dp = (dp + 1) & 7;
-          const int n_ks = ks_local + (dp == 7 ? 1 : 0);
-          if (n_ks < 4) ldsm4_v_pair64(v_nxt, kv_smem[1], n_dp, n_ks, lane);
-          mma_m16n8k16_bf16(p_frag[ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
-          mma_m16n8k16_bf16(p_frag[ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
-          v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
-        }
+      if (skip_masked_exp && lo_pairs < 4) {
+        prefill_pv_half<true>(p_frag, kv_smem[1], o_frag, lane, lo_pairs);
+      } else {
+        prefill_pv_half<false>(p_frag, kv_smem[1], o_frag, lane, 4);
       }
       __syncthreads();
     } else {
       cp_async_wait<1>();
       __syncthreads();
-      {
-        uint32_t v_cur[4], v_nxt[4];
-        ldsm4_v_pair64(v_cur, kv_smem[0], 0, 0, lane);
-        #pragma unroll
-        for (int ks_local = 0; ks_local < 4; ++ks_local) {
-          #pragma unroll
-          for (int dp = 0; dp < 8; ++dp) {
-            const int n_dp = (dp + 1) & 7;
-            const int n_ks = ks_local + (dp == 7 ? 1 : 0);
-            if (n_ks < 4) ldsm4_v_pair64(v_nxt, kv_smem[0], n_dp, n_ks, lane);
-            mma_m16n8k16_bf16(p_frag[ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
-            mma_m16n8k16_bf16(p_frag[ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
-            v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
-          }
-        }
-      }
+      prefill_pv_half<false>(p_frag, kv_smem[0], o_frag, lane, 4);
       __syncthreads();
 
       if (nb > 0) {
@@ -774,21 +781,10 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         }
       }
       __syncthreads();
-      {
-        uint32_t v_cur[4], v_nxt[4];
-        ldsm4_v_pair64(v_cur, kv_smem[1], 0, 0, lane);
-        #pragma unroll
-        for (int ks_local = 0; ks_local < 4; ++ks_local) {
-          #pragma unroll
-          for (int dp = 0; dp < 8; ++dp) {
-            const int n_dp = (dp + 1) & 7;
-            const int n_ks = ks_local + (dp == 7 ? 1 : 0);
-            if (n_ks < 4) ldsm4_v_pair64(v_nxt, kv_smem[1], n_dp, n_ks, lane);
-            mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
-            mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
-            v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
-          }
-        }
+      if (skip_masked_exp && hi_pairs < 4) {
+        prefill_pv_half<true>(p_frag + 4, kv_smem[1], o_frag, lane, hi_pairs);
+      } else {
+        prefill_pv_half<false>(p_frag + 4, kv_smem[1], o_frag, lane, 4);
       }
       __syncthreads();
     }
