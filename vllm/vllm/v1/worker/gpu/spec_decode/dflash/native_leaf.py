@@ -49,8 +49,8 @@ TREE_WIDE_M = (
     else 0
 )
 TREE_WIDE_GATE = os.environ.get("MUSE_NATIVE_TREE_WIDE_GATE", "cpc").strip().lower()
-TREE_WIDE_CPC = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_CPC", "3.25"))
-TREE_WIDE_MIN_ROUNDS = int(os.environ.get("MUSE_NATIVE_TREE_WIDE_MIN_ROUNDS", "3"))
+TREE_WIDE_CPC = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_CPC", "4.6"))
+TREE_WIDE_MIN_ROUNDS = int(os.environ.get("MUSE_NATIVE_TREE_WIDE_MIN_ROUNDS", "0"))
 TREE_WIDE_SM = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_SM", "2.0"))
 
 
