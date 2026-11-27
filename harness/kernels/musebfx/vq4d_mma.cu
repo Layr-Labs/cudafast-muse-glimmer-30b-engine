@@ -53,7 +53,7 @@ __host__ __device__ constexpr int vq4d_lut_size() {
   return (kBits == 9) ? 256 : 512;
 }
 
-__constant__ float4 kVq4dAnti256[256] = {
+__device__ const float4 kVq4dAnti256[256] = {
     {+0.08544921875f, +0.1176757812f, -0.314453125f, -0.1591796875f}, {+0.2734375f, +0.1079101562f, +0.001815795898f, +0.515625f},
     {+0.408203125f, -0.42578125f, +0.005645751953f, -0.28515625f}, {+0.55859375f, +0.27734375f, +0.150390625f, -0.1552734375f},
     {+0.1845703125f, -0.458984375f, -0.55078125f, +0.06591796875f}, {+0.2060546875f, +0.099609375f, +0.39453125f, -0.609375f},
@@ -184,7 +184,7 @@ __constant__ float4 kVq4dAnti256[256] = {
     {+1.2890625f, +1.34375f, +1.2890625f, -2.015625f}, {+2.015625f, +1.0703125f, -1.96875f, +0.7109375f},
 };
 
-__constant__ float4 kVq4dAnti512[512] = {
+__device__ const float4 kVq4dAnti512[512] = {
     {+0.056640625f, +0.2275390625f, +0.19140625f, -0.04077148438f}, {+0.435546875f, -0.263671875f, +0.07080078125f, -0.111328125f},
     {+0.2890625f, +0.40625f, -0.26953125f, -0.04443359375f}, {+0.1630859375f, -0.154296875f, +0.412109375f, +0.32421875f},
     {+0.287109375f, -0.2099609375f, -0.12890625f, +0.453125f}, {+0.25390625f, +0.041015625f, -0.1069335938f, -0.546875f},
@@ -443,6 +443,15 @@ __constant__ float4 kVq4dAnti512[512] = {
     {+0.796875f, +0.265625f, +2.703125f, -1.78125f}, {+1.3046875f, -1.828125f, -2.484375f, +0.283203125f},
 };
 
+template <int kBits>
+__device__ __forceinline__ float4 vq4d_load_centroid(int i) {
+  if constexpr (kBits == 9) {
+    return __ldg(&kVq4dAnti256[i]);
+  } else {
+    return __ldg(&kVq4dAnti512[i]);
+  }
+}
+
 static bool vq4d_dyn_env() {
   static const bool dyn = (std::getenv("MUSE_BENCH_DYN_ENV") != nullptr);
   return dyn;
@@ -658,12 +667,7 @@ template <int kBits>
 __device__ __forceinline__ void vq4d_init_lut(uint2* __restrict__ lut, int tid) {
   constexpr int kLut = vq4d_lut_size<kBits>();
   for (int i = tid; i < kLut; i += kVqThreads) {
-    float4 c;
-    if constexpr (kBits == 9) {
-      c = kVq4dAnti256[i];
-    } else {
-      c = kVq4dAnti512[i];
-    }
+    const float4 c = vq4d_load_centroid<kBits>(i);
     lut[i] = make_uint2(vq4d_bf16x2_u32(c.x, c.y), vq4d_bf16x2_u32(c.z, c.w));
   }
 }
@@ -762,12 +766,7 @@ __device__ __forceinline__ void vq4d_pack_tile_body(
   const int lane = tid & 31;
 
   for (int i = tid; i < kLut; i += 256) {
-    float4 c;
-    if constexpr (kBits == 9) {
-      c = kVq4dAnti256[i];
-    } else {
-      c = kVq4dAnti512[i];
-    }
+    const float4 c = vq4d_load_centroid<kBits>(i);
     s_cb[i] = c;
     s_hcn2[i] = 0.5f * (__fmaf_rn(c.x, c.x, __fmaf_rn(c.y, c.y, __fmaf_rn(c.z, c.z, c.w * c.w))));
   }
