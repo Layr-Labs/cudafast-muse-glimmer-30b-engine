@@ -211,6 +211,14 @@ int l2pf_set_persisting_window(const void* base_ptr, size_t num_bytes, size_t li
   return l2pf_set_stream_window(base_ptr, num_bytes, 1.0f, 0, stream);
 }
 
+int l2pf_graph_upload(void* graph_exec, void* stream) {
+  if (!graph_exec) return -1;
+  cudaError_t e = cudaGraphUpload(reinterpret_cast<cudaGraphExec_t>(graph_exec),
+                                  reinterpret_cast<cudaStream_t>(stream));
+  if (e != cudaSuccess) (void)cudaGetLastError();
+  return (int)e;
+}
+
 #ifdef __linux__
 static std::atomic<bool> g_tickle_started{false};
 

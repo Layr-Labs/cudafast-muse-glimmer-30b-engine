@@ -53,8 +53,6 @@ pub mod session_backend;
 // resident holds the engine, this speaks NDJSON to it -- so it is proven with a
 // stub server on any box.
 #[cfg(unix)]
-pub mod hotwait;
-#[cfg(unix)]
 pub mod resident;
 
 pub use adapter::{Adapter, FREE_RUN_MAX_COUNT};

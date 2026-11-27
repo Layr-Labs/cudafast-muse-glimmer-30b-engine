@@ -76,8 +76,34 @@ def lib():
     if hasattr(h, "l2pf_prime_persisting"):
         h.l2pf_prime_persisting.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
         h.l2pf_prime_persisting.restype = ctypes.c_int
+    if hasattr(h, "l2pf_graph_upload"):
+        h.l2pf_graph_upload.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        h.l2pf_graph_upload.restype = ctypes.c_int
     _lib = h
     return h
+
+
+UPLOAD_ENABLED = os.environ.get("VLLM_CUDA_GRAPH_UPLOAD", "1") != "0"
+
+
+def upload_graph(graph: torch.cuda.CUDAGraph, stream: torch.cuda.Stream | None = None) -> bool:
+    """Pre-upload an instantiated CUDAGraph onto the device so first replay never stalls."""
+    if not UPLOAD_ENABLED:
+        return False
+    h = lib()
+    if h is None or not hasattr(h, "l2pf_graph_upload"):
+        return False
+    raw_fn = getattr(graph, "raw_cuda_graph_exec", None)
+    if raw_fn is None:
+        return False
+    try:
+        exec_ptr = int(raw_fn())
+    except Exception:
+        return False
+    if not exec_ptr:
+        return False
+    st = (stream if stream is not None else torch.cuda.current_stream()).cuda_stream
+    return h.l2pf_graph_upload(exec_ptr, st) == 0
 
 
 def set_persisting_limit(limit_bytes: int) -> bool:
