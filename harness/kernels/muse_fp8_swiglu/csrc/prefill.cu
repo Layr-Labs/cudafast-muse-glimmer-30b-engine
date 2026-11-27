@@ -147,6 +147,9 @@ __device__ __forceinline__ uint64_t tma_pol_el() {
 __device__ __forceinline__ uint64_t tma_pol_ef() {
   uint64_t p; asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p)); return p;
 }
+__device__ __forceinline__ uint64_t tma_pol_b_shared() {
+  uint64_t p; asm("createpolicy.fractional.L2::evict_last.b64 %0, 0.25;" : "=l"(p)); return p;
+}
 __device__ __forceinline__ void tma2d_hint(uint32_t dst, const CUtensorMap* map, int x, int y, uint32_t bar, uint64_t pol) {
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;"

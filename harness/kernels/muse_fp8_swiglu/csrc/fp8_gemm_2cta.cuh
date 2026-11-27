@@ -342,13 +342,14 @@ swiglu_ws9_st3_lut_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
       int s = 0, par = 0, g = 0;
       const uint64_t pol_el = tma_pol_el(), pol_ef = tma_pol_ef();
+      const uint64_t pol_b = ((b & 3) < 3) ? tma_pol_b_shared() : pol_ef;
       if constexpr (kPdlPrologue) {
         const int nt0 = b >> 2;
 #pragma unroll
         for (int ps = 0; ps < ST_T; ++ps) {
           const uint32_t bar = full0 + 8 * ps, dst = sbase + ps * STB;
           mbar_expect_tx_only(bar, WSZ);
-          tma2d_hint(dst + ASZ, &tmB, ps * KT, nt0 * BN, bar, pol_ef);
+          tma2d_hint(dst + ASZ, &tmB, ps * KT, nt0 * BN, bar, pol_b);
         }
         pdl_wait();
       }
@@ -372,7 +373,7 @@ swiglu_ws9_st3_lut_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_
           }
           mbar_expect_tx(bar, STB);
           tma2d_hint(dst, &tmA, kt * KT, row0, bar, pol_el);
-          tma2d_hint(dst + ASZ, &tmB, kt * KT, col0, bar, pol_ef);
+          tma2d_hint(dst + ASZ, &tmB, kt * KT, col0, bar, pol_b);
           ++g;
           if (++s == ST_T) { s = 0; par ^= 1; }
         }

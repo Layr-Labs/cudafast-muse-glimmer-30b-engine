@@ -68,6 +68,11 @@ __device__ __forceinline__ uint64_t tma_pol_ef() {
   asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p));
   return p;
 }
+__device__ __forceinline__ uint64_t tma_pol_b_shared() {
+  uint64_t p;
+  asm("createpolicy.fractional.L2::evict_last.b64 %0, 0.25;" : "=l"(p));
+  return p;
+}
 __device__ __forceinline__ void tma2d_hint(uint32_t dst, const CUtensorMap* map, int x, int y, uint32_t bar,
                                            uint64_t pol) {
   asm volatile(
@@ -1339,6 +1344,7 @@ gemm_hybrid_6656_st3(const __grid_constant__ CUtensorMap tmA128,
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB32) : "memory");
       int s = 0, par = 0, g = 0;
       const uint64_t pol_el = tma_pol_el(), pol_ef = tma_pol_ef();
+      const uint64_t pol_b = kPolEf ? pol_ef : (((b & 3) < 3) ? tma_pol_b_shared() : pol_ef);
       if constexpr (kPdl) {
         const int nt0 = b >> 2;
         const int col0_0 = nt0 * BN;
@@ -1346,7 +1352,7 @@ gemm_hybrid_6656_st3(const __grid_constant__ CUtensorMap tmA128,
         for (int ps = 0; ps < ST; ++ps) {
           const uint32_t bar = full0 + 8 * ps, dst = sbase + ps * STB;
           mbar_expect_tx_only(bar, WSZ);
-          tma2d_b<kPolEf>(dst + ASZ, &tmB128, ps * KT, col0_0, bar, pol_ef);
+          tma2d_hint(dst + ASZ, &tmB128, ps * KT, col0_0, bar, pol_b);
         }
         pdl_wait();
       }
@@ -1370,7 +1376,7 @@ gemm_hybrid_6656_st3(const __grid_constant__ CUtensorMap tmA128,
           }
           mbar_expect_tx(bar, STB);
           tma2d_hint(dst, &tmA128, kt * KT, row0, bar, pol_el);
-          tma2d_b<kPolEf>(dst + ASZ, &tmB128, kt * KT, col0, bar, pol_ef);
+          tma2d_hint(dst + ASZ, &tmB128, kt * KT, col0, bar, pol_b);
           ++g;
           if (++s == ST) { s = 0; par ^= 1; }
         }
@@ -1494,6 +1500,7 @@ gemm_dual_a_st3(const __grid_constant__ CUtensorMap tmA0,
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB1_64) : "memory");
       int s = 0, par = 0, g = 0;
       const uint64_t pol_el = tma_pol_el(), pol_ef = tma_pol_ef();
+      const uint64_t pol_b = kPolEf ? pol_ef : (((b & 3) < 3) ? tma_pol_b_shared() : pol_ef);
       if constexpr (kPdl) {
         const int nt0 = b >> 2;
         const int col0_0 = nt0 * BN;
@@ -1501,7 +1508,7 @@ gemm_dual_a_st3(const __grid_constant__ CUtensorMap tmA0,
         for (int ps = 0; ps < ST; ++ps) {
           const uint32_t bar = full0 + 8 * ps, dst = sbase + ps * STB;
           mbar_expect_tx_only(bar, WSZ);
-          tma2d_b<kPolEf>(dst + ASZ, &tmB0, ps * KT, col0_0, bar, pol_ef);
+          tma2d_hint(dst + ASZ, &tmB0, ps * KT, col0_0, bar, pol_b);
         }
         pdl_wait();
       }
@@ -1529,7 +1536,7 @@ gemm_dual_a_st3(const __grid_constant__ CUtensorMap tmA0,
           }
           mbar_expect_tx(bar, STB);
           tma2d_hint(dst, mapA, kt * KT, row0, bar, pol_el);
-          tma2d_b<kPolEf>(dst + ASZ, mapB, kt * KT, col0, bar, pol_ef);
+          tma2d_hint(dst + ASZ, mapB, kt * KT, col0, bar, pol_b);
           ++g;
           if (++s == ST) { s = 0; par ^= 1; }
         }
