@@ -332,7 +332,11 @@ class VllmBackend:
         # timed run enables it only after its exact token count is known.
         self._async_core = None
         self._spec_run_pipelined = False
+        self._gpu_runner = None
         core = getattr(client, "engine_core", None)
+        if core is not None:
+            w = getattr(getattr(getattr(core, "model_executor", None), "driver_worker", None), "worker", None)
+            self._gpu_runner = getattr(w, "model_runner", None)
         if cfg.depth > 0 and core is not None and core.batch_queue is not None:
             core.step_fn = core.step
             self._async_core = core
@@ -378,7 +382,7 @@ class VllmBackend:
     WARMUP_DECODE_STEPS = 64
     WARMUP_ROUNDS = 3
     WARMUP_SEED_TOKENS = 512
-    WARMUP_SEED_DECODE_STEPS = 12
+    WARMUP_SEED_DECODE_STEPS = 4
 
     def _warm_up(self) -> None:
         prompt = [(i * 7919) % 30000 + 1000 for i in range(self.WARMUP_PROMPT_TOKENS)]
@@ -390,20 +394,22 @@ class VllmBackend:
             for _ in range(self.WARMUP_DECODE_STEPS):
                 self.step()
             self.abort()
-        # Exercise both low-acceptance (wide M=32 + M=16 4-slot verify_lmpost rings)
-        # and high-acceptance (ctx_kv[7] + ceiling clamp) 512-token seed shapes, then
-        # finish with 2 canonical max_tokens=1 seed prefills so _zp_canonical_block_ids
-        # and _zp_stage_graph are warm before reporting READY.
-        rep_seed = [1000 + (i % 8) for i in range(self.WARMUP_SEED_TOKENS)]
-        self.start(rep_seed, top_logits=False)
-        for _ in range(8):
-            self.step()
-        self.abort()
+        rep_prompt = [1000 + (k % 8) for k in range(self.WARMUP_SEED_TOKENS)]
         for i in range(3):
-            self.start(prompt[: self.WARMUP_SEED_TOKENS], max_tokens=(None if i == 0 else 1), top_logits=False)
+            self.start(
+                rep_prompt if i == 1 else prompt[: self.WARMUP_SEED_TOKENS],
+                top_logits=False,
+            )
             if i == 0:
-                for _ in range(self.WARMUP_SEED_DECODE_STEPS):
+                for _ in range(max(self.WARMUP_SEED_DECODE_STEPS, 12)):
                     self.step()
+                if self._gpu_runner is not None and hasattr(self._gpu_runner, "warmup_all_decode_graphs"):
+                    self._gpu_runner.warmup_all_decode_graphs()
+            elif i == 1:
+                for _ in range(8):
+                    self.step()
+            else:
+                self.step()
             self.abort()
 
     def _params(self, prompt_len: int, max_tokens: int | None = None, top_logits: bool = True):
@@ -417,7 +423,6 @@ class VllmBackend:
             logprobs=TOP_K if top_logits else None,
             detokenize=False,
             output_kind=self._delta,
-            skip_clone=True,
         )
 
     def _collect(self) -> list[Emit]:
@@ -437,56 +442,27 @@ class VllmBackend:
                 emitted.append(Emit(int(token), top))
         return emitted
 
-    def _get_runner_and_core(self):
-        try:
-            core = self._async_core or self._engine.engine_core.engine_core
-            runner = core.model_executor.driver_worker.worker.model_runner
-            return runner, core
-        except Exception:
-            return None, None
-
-    def _pre_launch(self, tokens: list[int]) -> None:
-        try:
-            runner, core = self._get_runner_and_core()
-            if runner is None or core is None:
-                return
-            pre = getattr(runner, "pre_launch_prefill", None)
-            if pre is None:
-                return
-            pool = core.scheduler.kv_cache_manager.block_pool
-            from vllm.v1.core import block_pool as _bp
-
-            pool_free = (
-                bool(getattr(_bp, "_CANONICAL_HEAD", 0))
-                and not pool.enable_caching
-                and not core.scheduler.has_unfinished_requests()
-                and pool.free_block_queue.num_free_blocks == pool.num_gpu_blocks - 1
-            )
-            pre(tokens, pool_free)
-        except Exception:
-            return
-
-    def _set_spec_emit_target_len(self, target_len: int | None) -> None:
-        runner, _ = self._get_runner_and_core()
-        if runner is not None:
-            runner._spec_emit_target_len = target_len
-
     def start(
         self, tokens: list[int], max_tokens: int | None = None, top_logits: bool = True
     ) -> list[Emit]:
         self.abort()
-        self._set_spec_emit_target_len(None)
         if len(tokens) + self.depth + 2 > self.ctx_size:
             raise RuntimeError(f"{len(tokens)} tokens do not fit the {self.ctx_size}-token context")
+        want_top = top_logits or not self._argmax_only
+        runner = self._gpu_runner
+        if (
+            not want_top
+            and runner is not None
+            and getattr(runner, "prefill_graph", None) is not None
+            and len(tokens) == runner.prefill_graph.num_tokens
+        ):
+            runner.try_pre_launch_prefill(tokens)
         self._rid += 1
         self._live = f"r{self._rid}"
-        use_top_logits = top_logits or not self._argmax_only
-        if not use_top_logits:
-            self._pre_launch(tokens)
         self._engine.add_request(
             self._live,
             {"prompt_token_ids": list(tokens)},
-            self._params(len(tokens), max_tokens, use_top_logits),
+            self._params(len(tokens), max_tokens, top_logits or not self._argmax_only),
         )
         emitted: list[Emit] = []
         while not emitted:
@@ -528,16 +504,10 @@ class VllmBackend:
         request.max_tokens = request.num_output_tokens + count
         if request.sampling_params is not None:
             request.sampling_params.max_tokens = request.max_tokens
-        try:
-            plen = len(request.prompt_token_ids) if request.prompt_token_ids is not None else int(request.num_prompt_tokens)
-            self._set_spec_emit_target_len(plen + int(request.max_tokens))
-        except Exception:
-            self._set_spec_emit_target_len(None)
         core.step_fn = core.step_with_batch_queue
         self._spec_run_pipelined = True
 
     def end_spec_run(self) -> None:
-        self._set_spec_emit_target_len(None)
         core = self._async_core
         if core is None or not self._spec_run_pipelined:
             return
@@ -547,7 +517,6 @@ class VllmBackend:
         self._spec_run_pipelined = False
 
     def abort(self) -> bool:
-        self._set_spec_emit_target_len(None)
         running = False
         if self._live is not None:
             running = self._engine.has_unfinished_requests()
