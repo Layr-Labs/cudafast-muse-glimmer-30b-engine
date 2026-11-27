@@ -759,6 +759,22 @@ int launch_kvcache_decode_m_impl(
     int num_tokens, int cache_rows, int block_size,
     int64_t stride_block, int64_t stride_slot, int64_t stride_kv_head,
     float eps, float qscale, int use_rope, int cache_fp32, cudaStream_t stream) {
+  static bool carveout_done = false;
+  if (!carveout_done) {
+    static const bool en = []() {
+      const char* env = std::getenv("MUSE_NORM_GLUE_CARVEOUT100");
+      return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+    }();
+    if (en) {
+      cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+      cudaThreadExchangeStreamCaptureMode(&mode);
+      (void)cudaFuncSetAttribute(qk_norm_rope_kvcache_decode_m_kernel<true, true, true, kPdlProd>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+      (void)cudaFuncSetAttribute(qk_norm_rope_kvcache_decode_m_kernel<true, false, true, kPdlProd>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+      (void)cudaFuncSetAttribute(qk_norm_rope_kvcache_decode_m_kernel<false, true, true, kPdlProd>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+      cudaThreadExchangeStreamCaptureMode(&mode);
+    }
+    carveout_done = true;
+  }
   const int threads = (num_tokens <= 16) ? 64 : 128;
   const int wpb = threads >> 5;
   const int blocks = (num_tokens * 18 + wpb - 1) / wpb;

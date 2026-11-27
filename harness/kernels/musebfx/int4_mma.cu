@@ -2300,16 +2300,19 @@ int int4_tma_enabled();
 bool int4_n32_pair_tma_for_shape(int N, int K) {
   const int num_n32 = N >> 5;
   const int n_blocks = N / kRowsPerCTA;
-  if (num_n32 <= 0 || num_n32 > 336 || (K & 127) != 0 || K > 8192 || (n_blocks % 48) == 0) return false;
-  auto eval = [&](int en) -> bool {
+  if (num_n32 <= 0 || num_n32 > 336 || (K & 127) != 0 || K > 8192) return false;
+  auto eval = [&](int en, int qkv_en) -> bool {
+    if ((n_blocks % 48) == 0 && (qkv_en == 0 || num_n32 > 240)) return false;
     return (en != 0) && (int4_mode() == 0) && (int4_query_mode() == 0) &&
            (int4_tma_enabled() != 0) && (int4_n32_sk_grid_for_shape(N, K) == 0);
   };
   if (int4_bench_dyn_env()) {
-    return eval(int4_read_env_int("MUSE_INT4_N32_PAIR_TMA", 1));
+    return eval(int4_read_env_int("MUSE_INT4_N32_PAIR_TMA", 1),
+                int4_read_env_int("MUSE_INT4_N32_PAIR_QKV", 1));
   }
   static const int cached_en = int4_read_env_int("MUSE_INT4_N32_PAIR_TMA", 1);
-  return eval(cached_en);
+  static const int cached_qkv = int4_read_env_int("MUSE_INT4_N32_PAIR_QKV", 1);
+  return eval(cached_en, cached_qkv);
 }
 
 bool int4_k_major_for_shape(int N, int K) {

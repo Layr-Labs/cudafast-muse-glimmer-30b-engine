@@ -78,6 +78,10 @@ __device__ __forceinline__ uint16_t fp8x2(float lo, float hi) {
   return static_cast<uint16_t>(s);
 }
 
+__device__ __forceinline__ uint32_t pack_fp8x4(uint16_t lo, uint16_t hi) {
+  return __byte_perm(static_cast<uint32_t>(lo), static_cast<uint32_t>(hi), 0x5410);
+}
+
 __device__ __forceinline__ bool chunk_valid(int c) {
   return c < kChunks - 1 || threadIdx.x < 128;
 }
@@ -242,8 +246,9 @@ __global__ void __launch_bounds__(kThreads) post_attn_norm_decode(
         st8_v4(out_bf16_row, c, o);
       }
       if constexpr (kFp8Out) {
-        uint32_t q = static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]))) |
-                     (static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]))) << 16);
+        uint32_t q = pack_fp8x4(
+            fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1])),
+            fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3])));
         st4_v2(out_fp8_row, c, q);
       }
     }
@@ -320,8 +325,9 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
         st8_v4(out_bf16_row, c, o);
       }
       if constexpr (kFp8Out) {
-        uint32_t q = static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]))) |
-                     (static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]))) << 16);
+        uint32_t q = pack_fp8x4(
+            fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1])),
+            fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3])));
         st4_v2(out_fp8_row, c, q);
       }
     }
@@ -450,14 +456,16 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
         st8_v4(out_bf16_row, c, o);
       }
       if constexpr (kFp8Out) {
-        uint32_t q = static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]))) |
-                     (static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]))) << 16);
+        uint32_t q = pack_fp8x4(
+            fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1])),
+            fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3])));
         st4_v2(out_fp8_row, c, q);
       }
       if constexpr (kGateOut) {
         const float g0 = bf_lo(o.x), g1 = bf_hi(o.x), g2 = bf_lo(o.y), g3 = bf_hi(o.y);
-        uint32_t gq = static_cast<uint32_t>(fp8x2(__fmul_rn(gate_inv, g0), __fmul_rn(gate_inv, g1))) |
-                      (static_cast<uint32_t>(fp8x2(__fmul_rn(gate_inv, g2), __fmul_rn(gate_inv, g3))) << 16);
+        uint32_t gq = pack_fp8x4(
+            fp8x2(__fmul_rn(gate_inv, g0), __fmul_rn(gate_inv, g1)),
+            fp8x2(__fmul_rn(gate_inv, g2), __fmul_rn(gate_inv, g3)));
         st4_v2(out_gate_row, c, gq);
       }
     }
@@ -545,8 +553,9 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
       o.y = pack_bf16x2(y[2], y[3]);
       st8_v4(out_bf16_row, c, o);
       if constexpr (kFp8Out) {
-        uint32_t q = static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]))) |
-                     (static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]))) << 16);
+        uint32_t q = pack_fp8x4(
+            fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1])),
+            fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3])));
         st4_v2(out_fp8_row, c, q);
       }
     }
@@ -595,14 +604,17 @@ __device__ __forceinline__ float triton_silu(float gate) {
   return result;
 }
 
-template <bool kStreamCS = false, bool kPdl = false>
-__global__ void __launch_bounds__(256) mul_sigmoid_bf16_kernel(
+template <int kThreads = 256, bool kStreamCS = false, bool kPdl = false>
+__global__ void __launch_bounds__(kThreads) mul_sigmoid_bf16_kernel(
     const uint4* __restrict__ gate, const uint4* __restrict__ attn, uint4* __restrict__ out, int vec8) {
-  const int idx = blockIdx.x * 256 + threadIdx.x;
-  if constexpr (kPdl) pdl_launch_dependents();
+  const int idx = blockIdx.x * kThreads + threadIdx.x;
+  if constexpr (kPdl) {
+    pdl_wait();
+    pdl_launch_dependents();
+  }
   if (idx >= vec8) return;
-  const uint4 g = kStreamCS ? ld16_cs(gate + idx) : gate[idx];
-  const uint4 a = kStreamCS ? ld16_cs(attn + idx) : attn[idx];
+  const uint4 g = kStreamCS ? ld16_cs(gate + idx) : __ldg(gate + idx);
+  const uint4 a = kStreamCS ? ld16_cs(attn + idx) : __ldg(attn + idx);
   const uint32_t gw[4] = {g.x, g.y, g.z, g.w}, aw[4] = {a.x, a.y, a.z, a.w};
   uint32_t ow[4];
 #pragma unroll
@@ -614,15 +626,19 @@ __global__ void __launch_bounds__(256) mul_sigmoid_bf16_kernel(
   out[idx] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
 }
 
-template <bool kPdl = false>
-__global__ void __launch_bounds__(256) mul_sigmoid_fp8_kernel(
+template <int kThreads = 256, bool kStreamCS = true, bool kPdl = false>
+__global__ void __launch_bounds__(kThreads) mul_sigmoid_fp8_kernel(
     const uint4* __restrict__ gate, const uint4* __restrict__ attn,
     const float* __restrict__ scale, uint2* __restrict__ out, int vec8) {
-  const int idx = blockIdx.x * 256 + threadIdx.x;
-  if constexpr (kPdl) pdl_launch_dependents();
-  if (idx >= vec8) return;
+  const int idx = blockIdx.x * kThreads + threadIdx.x;
   const float inv_s = full_divide(1.0f, __ldg(scale));
-  const uint4 g = ld16_cs(gate + idx), a = ld16_cs(attn + idx);
+  if constexpr (kPdl) {
+    pdl_wait();
+    pdl_launch_dependents();
+  }
+  if (idx >= vec8) return;
+  const uint4 g = kStreamCS ? ld16_cs(gate + idx) : __ldg(gate + idx);
+  const uint4 a = kStreamCS ? ld16_cs(attn + idx) : __ldg(attn + idx);
   const uint32_t gw[4] = {g.x, g.y, g.z, g.w}, aw[4] = {a.x, a.y, a.z, a.w};
   uint16_t ow[4];
 #pragma unroll
@@ -633,21 +649,25 @@ __global__ void __launch_bounds__(256) mul_sigmoid_fp8_kernel(
     const float qh = __fmul_rn(__fmul_rn(triton_sigmoid(gh), ah), inv_s);
     ow[i] = fp8x2(ql, qh);
   }
-  const uint32_t lo = static_cast<uint32_t>(ow[0]) | (static_cast<uint32_t>(ow[1]) << 16);
-  const uint32_t hi = static_cast<uint32_t>(ow[2]) | (static_cast<uint32_t>(ow[3]) << 16);
+  const uint32_t lo = pack_fp8x4(ow[0], ow[1]);
+  const uint32_t hi = pack_fp8x4(ow[2], ow[3]);
   out[idx] = make_uint2(lo, hi);
 }
 
-constexpr int kInterVec8 = 19968 / 8;  // 2496 uint4s per 19968-element BF16 half-row
+constexpr int kInterVec8 = 19968 / 8;  // 2496 = 13 * 192 exact uint4s per 19968-element BF16 half-row
 
-__global__ void __launch_bounds__(128) mul_silu_slice_bf16_kernel(
+template <bool kPdl = false>
+__global__ void __launch_bounds__(192) mul_silu_slice_bf16_kernel(
     const uint4* __restrict__ gu_all, uint4* __restrict__ out_all) {
-  const int col = blockIdx.x * 128 + threadIdx.x;
-  if (col >= kInterVec8) return;
+  if constexpr (kPdl) {
+    pdl_wait();
+    pdl_launch_dependents();
+  }
+  const int col = blockIdx.x * 192 + threadIdx.x;
   const size_t row = blockIdx.y;
   const uint4* gu = gu_all + row * (2 * kInterVec8);
-  const uint4 g = gu[col];
-  const uint4 u = gu[col + kInterVec8];
+  const uint4 g = ld16_cs(gu + col);
+  const uint4 u = ld16_cs(gu + col + kInterVec8);
   const uint32_t gw[4] = {g.x, g.y, g.z, g.w}, uw[4] = {u.x, u.y, u.z, u.w};
   uint32_t ow[4];
 #pragma unroll
@@ -659,11 +679,15 @@ __global__ void __launch_bounds__(128) mul_silu_slice_bf16_kernel(
   out_all[row * kInterVec8 + col] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
 }
 
-__global__ void __launch_bounds__(128) mul_silu_slice_fp8_kernel(
+template <bool kPdl = false>
+__global__ void __launch_bounds__(192) mul_silu_slice_fp8_kernel(
     const uint4* __restrict__ gu_all, const float* __restrict__ scale, uint2* __restrict__ out_all) {
-  const int col = blockIdx.x * 128 + threadIdx.x;
-  if (col >= kInterVec8) return;
   const float inv_s = full_divide(1.0f, __ldg(scale));
+  if constexpr (kPdl) {
+    pdl_wait();
+    pdl_launch_dependents();
+  }
+  const int col = blockIdx.x * 192 + threadIdx.x;
   const size_t row = blockIdx.y;
   const uint4* gu = gu_all + row * (2 * kInterVec8);
   const uint4 g = ld16_cs(gu + col);
@@ -678,8 +702,8 @@ __global__ void __launch_bounds__(128) mul_silu_slice_fp8_kernel(
     const float qh = __fmul_rn(__fmul_rn(triton_silu(gh), uh), inv_s);
     ow[i] = fp8x2(ql, qh);
   }
-  const uint32_t lo = static_cast<uint32_t>(ow[0]) | (static_cast<uint32_t>(ow[1]) << 16);
-  const uint32_t hi = static_cast<uint32_t>(ow[2]) | (static_cast<uint32_t>(ow[3]) << 16);
+  const uint32_t lo = pack_fp8x4(ow[0], ow[1]);
+  const uint32_t hi = pack_fp8x4(ow[2], ow[3]);
   out_all[row * kInterVec8 + col] = make_uint2(lo, hi);
 }
 
@@ -861,13 +885,15 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
       if constexpr (kWriteBf16) {
         st8_v4(out_bf16_row, c, o);
       }
-      uint32_t q = static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]))) |
-                   (static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]))) << 16);
+      uint32_t q = pack_fp8x4(
+          fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1])),
+          fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3])));
       st4_v2(out_fp8_row, c, q);
       if constexpr (kGateOut) {
         const float g0 = bf_lo(o.x), g1 = bf_hi(o.x), g2 = bf_lo(o.y), g3 = bf_hi(o.y);
-        uint32_t gq = static_cast<uint32_t>(fp8x2(__fmul_rn(gate_inv, g0), __fmul_rn(gate_inv, g1))) |
-                      (static_cast<uint32_t>(fp8x2(__fmul_rn(gate_inv, g2), __fmul_rn(gate_inv, g3))) << 16);
+        uint32_t gq = pack_fp8x4(
+            fp8x2(__fmul_rn(gate_inv, g0), __fmul_rn(gate_inv, g1)),
+            fp8x2(__fmul_rn(gate_inv, g2), __fmul_rn(gate_inv, g3)));
         st4_v2(out_gate_row, c, gq);
       }
     }
@@ -1007,8 +1033,72 @@ static bool norm_glue_prefill_pdl_enabled() {
   return env_on;
 }
 
+static void ensure_norm_glue_carveout() {
+  static bool done = false;
+  if (done) return;
+  static const bool en = []() {
+    const char* env = std::getenv("MUSE_NORM_GLUE_CARVEOUT100");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  if (en) {
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    auto set100 = [](auto fn) {
+      (void)cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    };
+    set100(post_attn_norm_decode<true, false, true>);
+    set100(post_attn_norm_decode<true, false, false>);
+    set100(post_attn_norm_decode<false, true, true>);
+    set100(post_attn_norm_decode<false, true, false>);
+    set100(post_ff_norm_decode<false, false, true, true>);
+    set100(post_ff_norm_decode<false, false, true, false>);
+    set100(post_ff_norm_decode<true, false, true, true>);
+    set100(post_ff_norm_decode<true, false, true, false>);
+    set100(post_ff_norm_decode<true, true, true, true>);
+    set100(post_ff_norm_decode<true, true, false, true>);
+    set100(post_ff_norm_decode<true, true, true, false>);
+    set100(post_ff_norm_decode<true, true, false, false>);
+    set100(post_ff_final_norm<true, true>);
+    set100(post_ff_final_norm<false, true>);
+    set100(post_ff_final_norm<true, false>);
+    set100(post_ff_final_norm<false, false>);
+    set100(input_norm_fp8_w16<false, true, true>);
+    set100(input_norm_fp8_w16<false, true, false>);
+    set100(input_norm_fp8_w16<true, true, true>);
+    set100(input_norm_fp8_w16<true, false, true>);
+    set100(input_norm_fp8_w8<false, true, true>);
+    set100(input_norm_fp8_w8<true, true, true>);
+    set100(input_norm_fp8_w8<true, false, true>);
+    set100(mul_sigmoid_bf16_kernel<256, false, true>);
+    set100(mul_sigmoid_bf16_kernel<352, false, true>);
+    set100(mul_sigmoid_fp8_kernel<256, false, true>);
+    set100(mul_sigmoid_fp8_kernel<352, false, true>);
+    set100(mul_silu_slice_bf16_kernel<true>);
+    set100(mul_silu_slice_fp8_kernel<true>);
+    cudaThreadExchangeStreamCaptureMode(&mode);
+  }
+  done = true;
+}
+
+template <typename... KArgs, typename... Args>
+cudaError_t launch_pdl_grid(void (*kernel)(KArgs...), dim3 grid, int threads, cudaStream_t stream, Args... args) {
+  ensure_norm_glue_carveout();
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = grid;
+  cfg.blockDim = dim3(threads, 1, 1);
+  cfg.dynamicSmemBytes = 0;
+  cfg.stream = stream;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+}
+
 template <typename... KArgs, typename... Args>
 cudaError_t launch_pdl(void (*kernel)(KArgs...), int rows, int threads, cudaStream_t stream, Args... args) {
+  ensure_norm_glue_carveout();
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3(rows, 1, 1);
   cfg.blockDim = dim3(threads, 1, 1);
@@ -1275,19 +1365,26 @@ int muse_norm_glue_mul_sigmoid_bf16(const void* gate, const void* attn, void* ou
                                     cudaStream_t stream) {
   if (n <= 0 || (n & 7) != 0) return -1;
   const int vec8 = n >> 3;
-  const int blocks = (vec8 + 255) / 256;
-  if (n <= 4096 * 16) {
-    mul_sigmoid_bf16_kernel<false, false><<<blocks, 256, 0, stream>>>(
-        static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
-        static_cast<uint4*>(out), vec8);
+  const auto* Gp = static_cast<const uint4*>(gate);
+  const auto* Ap = static_cast<const uint4*>(attn);
+  auto* Op = static_cast<uint4*>(out);
+  if (n <= 4096 * 32) {
+    const bool use_pdl = norm_glue_pdl_enabled();
+    if (vec8 <= 48 * 256) {
+      const int blocks = (vec8 + 255) / 256;
+      if (use_pdl) return static_cast<int>(launch_pdl(mul_sigmoid_bf16_kernel<256, false, true>, blocks, 256, stream, Gp, Ap, Op, vec8));
+      mul_sigmoid_bf16_kernel<256, false, false><<<blocks, 256, 0, stream>>>(Gp, Ap, Op, vec8);
+    } else {
+      const int blocks = (vec8 + 351) / 352;
+      if (use_pdl) return static_cast<int>(launch_pdl(mul_sigmoid_bf16_kernel<352, false, true>, blocks, 352, stream, Gp, Ap, Op, vec8));
+      mul_sigmoid_bf16_kernel<352, false, false><<<blocks, 352, 0, stream>>>(Gp, Ap, Op, vec8);
+    }
   } else if (norm_glue_prefill_pdl_enabled()) {
-    mul_sigmoid_bf16_kernel<true, true><<<blocks, 256, 0, stream>>>(
-        static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
-        static_cast<uint4*>(out), vec8);
+    const int blocks = (vec8 + 255) / 256;
+    return static_cast<int>(launch_pdl(mul_sigmoid_bf16_kernel<256, true, true>, blocks, 256, stream, Gp, Ap, Op, vec8));
   } else {
-    mul_sigmoid_bf16_kernel<true, false><<<blocks, 256, 0, stream>>>(
-        static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
-        static_cast<uint4*>(out), vec8);
+    const int blocks = (vec8 + 255) / 256;
+    mul_sigmoid_bf16_kernel<256, true, false><<<blocks, 256, 0, stream>>>(Gp, Ap, Op, vec8);
   }
   return static_cast<int>(cudaGetLastError());
 }
@@ -1296,31 +1393,51 @@ int muse_norm_glue_mul_sigmoid_fp8(const void* gate, const void* attn, const voi
                                    cudaStream_t stream) {
   if (n <= 0 || (n & 7) != 0) return -1;
   const int vec8 = n >> 3;
-  const int blocks = (vec8 + 255) / 256;
-  if (n > 4096 * 16 && norm_glue_prefill_pdl_enabled()) {
-    mul_sigmoid_fp8_kernel<true><<<blocks, 256, 0, stream>>>(
-        static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
-        static_cast<const float*>(scale), static_cast<uint2*>(out), vec8);
+  const auto* Gp = static_cast<const uint4*>(gate);
+  const auto* Ap = static_cast<const uint4*>(attn);
+  const auto* Sp = static_cast<const float*>(scale);
+  auto* Op = static_cast<uint2*>(out);
+  if (n <= 4096 * 32) {
+    const bool use_pdl = norm_glue_pdl_enabled();
+    if (vec8 <= 48 * 256) {
+      const int blocks = (vec8 + 255) / 256;
+      if (use_pdl) return static_cast<int>(launch_pdl(mul_sigmoid_fp8_kernel<256, false, true>, blocks, 256, stream, Gp, Ap, Sp, Op, vec8));
+      mul_sigmoid_fp8_kernel<256, false, false><<<blocks, 256, 0, stream>>>(Gp, Ap, Sp, Op, vec8);
+    } else {
+      const int blocks = (vec8 + 351) / 352;
+      if (use_pdl) return static_cast<int>(launch_pdl(mul_sigmoid_fp8_kernel<352, false, true>, blocks, 352, stream, Gp, Ap, Sp, Op, vec8));
+      mul_sigmoid_fp8_kernel<352, false, false><<<blocks, 352, 0, stream>>>(Gp, Ap, Sp, Op, vec8);
+    }
+  } else if (norm_glue_prefill_pdl_enabled()) {
+    const int blocks = (vec8 + 255) / 256;
+    return static_cast<int>(launch_pdl(mul_sigmoid_fp8_kernel<256, true, true>, blocks, 256, stream, Gp, Ap, Sp, Op, vec8));
   } else {
-    mul_sigmoid_fp8_kernel<false><<<blocks, 256, 0, stream>>>(
-        static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
-        static_cast<const float*>(scale), static_cast<uint2*>(out), vec8);
+    const int blocks = (vec8 + 255) / 256;
+    mul_sigmoid_fp8_kernel<256, true, false><<<blocks, 256, 0, stream>>>(Gp, Ap, Sp, Op, vec8);
   }
   return static_cast<int>(cudaGetLastError());
 }
 
 int muse_norm_glue_mul_silu_slice_bf16(const void* gu, void* out, int rows, cudaStream_t stream) {
   if (rows <= 0) return -1;
-  const dim3 grid((kInterVec8 + 127) / 128, static_cast<unsigned>(rows));
-  mul_silu_slice_bf16_kernel<<<grid, 128, 0, stream>>>(
+  const dim3 grid(static_cast<unsigned>(kInterVec8 / 192), static_cast<unsigned>(rows), 1);
+  if (rows <= 32 && norm_glue_pdl_enabled()) {
+    return static_cast<int>(launch_pdl_grid(mul_silu_slice_bf16_kernel<true>, grid, 192, stream,
+        static_cast<const uint4*>(gu), static_cast<uint4*>(out)));
+  }
+  mul_silu_slice_bf16_kernel<false><<<grid, 192, 0, stream>>>(
       static_cast<const uint4*>(gu), static_cast<uint4*>(out));
   return static_cast<int>(cudaGetLastError());
 }
 
 int muse_norm_glue_mul_silu_slice_fp8(const void* gu, const void* scale, void* out, int rows, cudaStream_t stream) {
   if (rows <= 0) return -1;
-  const dim3 grid((kInterVec8 + 127) / 128, static_cast<unsigned>(rows));
-  mul_silu_slice_fp8_kernel<<<grid, 128, 0, stream>>>(
+  const dim3 grid(static_cast<unsigned>(kInterVec8 / 192), static_cast<unsigned>(rows), 1);
+  if (rows <= 32 && norm_glue_pdl_enabled()) {
+    return static_cast<int>(launch_pdl_grid(mul_silu_slice_fp8_kernel<true>, grid, 192, stream,
+        static_cast<const uint4*>(gu), static_cast<const float*>(scale), static_cast<uint2*>(out)));
+  }
+  mul_silu_slice_fp8_kernel<false><<<grid, 192, 0, stream>>>(
       static_cast<const uint4*>(gu), static_cast<const float*>(scale), static_cast<uint2*>(out));
   return static_cast<int>(cudaGetLastError());
 }

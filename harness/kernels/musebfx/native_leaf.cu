@@ -806,6 +806,11 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __shared__ uint32_t s_w_tri_key[8];
   __shared__ int s_w_sh[10][8];
   __shared__ int s_w_tr[17][8];
+  __shared__ uint32_t s_h_bloom[32];
+  __shared__ uint32_t s_tr_bloom[32];
+  __shared__ int s_scan_cmd;
+  __shared__ int s_scan_r;
+  __shared__ int s_scan_kw;
   __shared__ int s_hist_ok;
   __shared__ int s_win;
   __shared__ int s_h_base;
@@ -975,6 +980,25 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   if (tid < 5) {
     s_skip_bg[tid] = 0u;
   }
+  if (tid < 32) {
+    s_h_bloom[tid] = 0u;
+    s_tr_bloom[tid] = 0u;
+  }
+  auto bloom_add = [](uint32_t* blm, int32_t tok_v) {
+    const uint32_t u = static_cast<uint32_t>(tok_v);
+    const uint32_t h1 = (u * 2654435761u) >> 22;
+    const uint32_t h2 = (u * 2246822519u) >> 22;
+    atomicOr(&blm[h1 >> 5], 1u << (h1 & 31u));
+    atomicOr(&blm[h2 >> 5], 1u << (h2 & 31u));
+  };
+  auto bloom_has = [](const uint32_t* blm, int32_t tok_v) -> bool {
+    if (tok_v < 0) return false;
+    const uint32_t u = static_cast<uint32_t>(tok_v);
+    const uint32_t h1 = (u * 2654435761u) >> 22;
+    const uint32_t h2 = (u * 2246822519u) >> 22;
+    return ((blm[h1 >> 5] & (1u << (h1 & 31u))) != 0u) &&
+           ((blm[h2 >> 5] & (1u << (h2 & 31u))) != 0u);
+  };
   __syncthreads();
 
   // Pass 2: collaborative 256-thread SMEM scan of history window for multi-depth suffix matches,
@@ -1009,6 +1033,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     const int32_t anchors[6] = {s_ctx[15], s_ctx[16], s_ctx[17], s_ctx[18], s_ctx[19], s_ctx[20]};
     for (int i = tid; i < win - 1; i += 256) {
       const int32_t h_i = s_h[i];
+      if (h_i >= 0) bloom_add(s_h_bloom, h_i);
       const int32_t nxt = s_h[i + 1];
       if (nxt < 0) continue;
       if (scan_anc) {
@@ -1136,7 +1161,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         const uint32_t msk = __ballot_sync(0xffffffffu, keep);
         const int dst = out_n + __popc(msk & lane_lt);
         if (keep && dst < kTrActiveCap) {
-          s_tr_cur[dst] = tr_log[base8 + 1];
+          const int32_t tr_cur_v = tr_log[base8 + 1];
+          s_tr_cur[dst] = tr_cur_v;
+          if (tr_cur_v >= 0) bloom_add(s_tr_bloom, tr_cur_v);
           s_tr_p1[dst] = tr_log[base8 + 2];
           s_tr_p2[dst] = tr_log[base8 + 3];
           s_tr_u[dst] = u_val;
@@ -1881,9 +1908,176 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
 
   uint32_t casc_row_mask = 0u;
   const int eff_max_tr_dp = tr_w32 ? ((tr.max_tr_dp < 6) ? 6 : tr.max_tr_dp) : tr.max_tr_dp;
+  auto run_sh_scan_worker = [&](int r_arg) {
+    const int32_t tok32 = s_leaf_tok_r[r_arg];
+    const int32_t pv_r = s_leaf_prv_r[r_arg];
+    const int32_t pv2_r = s_leaf_prv2_r[r_arg];
+    const int win_m1 = s_win - 1;
+
+    uint32_t best_tri_key = 0u;
+    int u_c = 0, u_min = 2147483647, u_max = -1;
+    int bg_c = 0, bg_min = 2147483647, bg_max = -1, bg_hp = -1;
+    int tri_c = 0, tri_min = 2147483647, tri_max = -1;
+
+    for (int hi = tid; hi < win_m1; hi += 256) {
+      if (s_h[hi] != tok32) continue;
+      const int32_t nxt = s_h[hi + 1];
+      if (nxt < 0) continue;
+      u_c += 1;
+      if (nxt < u_min) u_min = nxt;
+      if (nxt > u_max) u_max = nxt;
+
+      if (pv_r >= 0 && hi >= 1 && s_h[hi - 1] == pv_r) {
+        bg_c += 1;
+        if (nxt < bg_min) bg_min = nxt;
+        if (nxt > bg_max) bg_max = nxt;
+        if (hi + 1 > bg_hp) bg_hp = hi + 1;
+
+        if (pv2_r >= 0 && hi >= 2 && s_h[hi - 2] == pv2_r) {
+          tri_c += 1;
+          if (nxt < tri_min) tri_min = nxt;
+          if (nxt > tri_max) tri_max = nxt;
+          const uint32_t tk_key = (3u << 16) | static_cast<uint32_t>(hi);
+          if (tk_key > best_tri_key) best_tri_key = tk_key;
+        }
+      }
+    }
+
+    const uint32_t w_tk = __reduce_max_sync(0xffffffffu, best_tri_key);
+    const int w_uc = __reduce_add_sync(0xffffffffu, u_c);
+    const int w_umin = __reduce_min_sync(0xffffffffu, u_min);
+    const int w_umax = __reduce_max_sync(0xffffffffu, u_max);
+    const int w_bgc = __reduce_add_sync(0xffffffffu, bg_c);
+    const int w_bgmin = __reduce_min_sync(0xffffffffu, bg_min);
+    const int w_bgmax = __reduce_max_sync(0xffffffffu, bg_max);
+    const int w_bghp = __reduce_max_sync(0xffffffffu, bg_hp);
+    const int w_tc = __reduce_add_sync(0xffffffffu, tri_c);
+    const int w_tmin = __reduce_min_sync(0xffffffffu, tri_min);
+    const int w_tmax = __reduce_max_sync(0xffffffffu, tri_max);
+    if (lane == 0) {
+      s_w_tri_key[warp] = w_tk;
+      s_w_sh[0][warp] = w_uc;
+      s_w_sh[1][warp] = w_umin;
+      s_w_sh[2][warp] = w_umax;
+      s_w_sh[3][warp] = w_bgc;
+      s_w_sh[4][warp] = w_bgmin;
+      s_w_sh[5][warp] = w_bgmax;
+      s_w_sh[6][warp] = w_bghp;
+      s_w_sh[7][warp] = w_tc;
+      s_w_sh[8][warp] = w_tmin;
+      s_w_sh[9][warp] = w_tmax;
+    }
+  };
+  auto run_tr_scan_worker = [&](int r_arg, int kw_arg) {
+    const int32_t tok32 = s_leaf_tok_r[r_arg];
+    const int32_t pv_r = s_leaf_prv_r[r_arg];
+    const int32_t pv2_r = s_leaf_prv2_r[r_arg];
+    const int n_act = s_tr_active_n;
+    const int cur_st = s_tr_cur_step;
+    const int pos_leaf = static_cast<int>(positions[0]) + kw_arg;
+
+    int u_tot_c = 0, t0_u_c = 0, u_min_c = 2147483647, u_max_c = -1;
+    int bg_t0_c = 0, bg_min_c = 2147483647, bg_max_c = -1;
+    int tri_t0_c = 0, tri_min_c = 2147483647, tri_max_c = -1;
+    int a1_bg_c = 0, a1_bg_min = 2147483647, a1_bg_max = -1;
+    int a1_tri_c = 0, a1_tri_min = 2147483647, a1_tri_max = -1;
+    int near_c = 0;
+
+    for (int idx = tid; idx < n_act; idx += 256) {
+      if (s_tr_cur[idx] != tok32) continue;
+      const int32_t u_t = s_tr_u[idx];
+      const int32_t p1_t = s_tr_p1[idx];
+      const int32_t p2_t = s_tr_p2[idx];
+      const int age = cur_st - s_tr_st[idx];
+      const int pt = s_tr_pos_tier[idx];
+      const int pos_t = pt >> 1;
+      const int tier_t = pt & 1;
+      const int dist = (pos_leaf >= pos_t) ? (pos_leaf - pos_t) : (pos_t - pos_leaf);
+
+      u_tot_c += 1;
+      if (tier_t == 0) t0_u_c += 1;
+      if (u_t < u_min_c) u_min_c = u_t;
+      if (u_t > u_max_c) u_max_c = u_t;
+      if (age <= 2 && dist <= 12) near_c += 1;
+      if (pv_r >= 0 && p1_t == pv_r) {
+        if (tier_t == 0) {
+          bg_t0_c += 1;
+          if (u_t < bg_min_c) bg_min_c = u_t;
+          if (u_t > bg_max_c) bg_max_c = u_t;
+          if (pv2_r >= 0 && p2_t == pv2_r) {
+            tri_t0_c += 1;
+            if (u_t < tri_min_c) tri_min_c = u_t;
+            if (u_t > tri_max_c) tri_max_c = u_t;
+          }
+        }
+        if (age == 1 && dist <= 8) {
+          a1_bg_c += 1;
+          if (u_t < a1_bg_min) a1_bg_min = u_t;
+          if (u_t > a1_bg_max) a1_bg_max = u_t;
+          if (pv2_r >= 0 && p2_t == pv2_r) {
+            a1_tri_c += 1;
+            if (u_t < a1_tri_min) a1_tri_min = u_t;
+            if (u_t > a1_tri_max) a1_tri_max = u_t;
+          }
+        }
+      }
+    }
+
+    const int w_utot = __reduce_add_sync(0xffffffffu, u_tot_c);
+    const int w_t0u = __reduce_add_sync(0xffffffffu, t0_u_c);
+    const int w_umin = __reduce_min_sync(0xffffffffu, u_min_c);
+    const int w_umax = __reduce_max_sync(0xffffffffu, u_max_c);
+    const int w_near = __reduce_add_sync(0xffffffffu, near_c);
+    const int w_bgc = __reduce_add_sync(0xffffffffu, bg_t0_c);
+    const int w_bgmin = __reduce_min_sync(0xffffffffu, bg_min_c);
+    const int w_bgmax = __reduce_max_sync(0xffffffffu, bg_max_c);
+    const int w_tric = __reduce_add_sync(0xffffffffu, tri_t0_c);
+    const int w_trimin = __reduce_min_sync(0xffffffffu, tri_min_c);
+    const int w_trimax = __reduce_max_sync(0xffffffffu, tri_max_c);
+    const int w_a1bgc = __reduce_add_sync(0xffffffffu, a1_bg_c);
+    const int w_a1bgmin = __reduce_min_sync(0xffffffffu, a1_bg_min);
+    const int w_a1bgmax = __reduce_max_sync(0xffffffffu, a1_bg_max);
+    const int w_a1tric = __reduce_add_sync(0xffffffffu, a1_tri_c);
+    const int w_a1trimin = __reduce_min_sync(0xffffffffu, a1_tri_min);
+    const int w_a1trimax = __reduce_max_sync(0xffffffffu, a1_tri_max);
+    if (lane == 0) {
+      s_w_tr[0][warp] = w_utot;
+      s_w_tr[1][warp] = w_t0u;
+      s_w_tr[2][warp] = w_umin;
+      s_w_tr[3][warp] = w_umax;
+      s_w_tr[4][warp] = w_near;
+      s_w_tr[5][warp] = w_bgc;
+      s_w_tr[6][warp] = w_bgmin;
+      s_w_tr[7][warp] = w_bgmax;
+      s_w_tr[8][warp] = w_tric;
+      s_w_tr[9][warp] = w_trimin;
+      s_w_tr[10][warp] = w_trimax;
+      s_w_tr[11][warp] = w_a1bgc;
+      s_w_tr[12][warp] = w_a1bgmin;
+      s_w_tr[13][warp] = w_a1bgmax;
+      s_w_tr[14][warp] = w_a1tric;
+      s_w_tr[15][warp] = w_a1trimin;
+      s_w_tr[16][warp] = w_a1trimax;
+    }
+  };
+
+  if (warp != 0) {
+    for (;;) {
+      __syncthreads();
+      const int cmd = s_scan_cmd;
+      if (cmd == 0) break;
+      const int r_srv = s_scan_r;
+      const int kw_srv = s_scan_kw;
+      if ((cmd & 1) != 0) run_sh_scan_worker(r_srv);
+      if ((cmd & 2) != 0) run_tr_scan_worker(r_srv, kw_srv);
+      __syncthreads();
+    }
+    return;
+  }
+
   for (int li = 0; li < num_leaves; ++li) {
     const int r = 7 + li;
-    if (warp == 0) {
+    {
       const int nc = s_num_cands;
       float best_s_w = (tid < nc) ? s_cand_score[tid] : -1.0f;
       int best_idx_w = tid;
@@ -1929,8 +2123,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         }
       }
     }
-    // Barrier #1: broadcasts s_sel_* and s_leaf_*_r[r] to all 256 threads.
-    __syncthreads();
+    __syncwarp();
 
     const float best_s = s_sel_s;
     const int best_idx = s_sel_idx;
@@ -1947,171 +2140,29 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     const bool want_tr_scan =
         can_scan && tr.mode != 0 && tr.cont_mode != 0 && s_tr_active_n > 0 &&
         dp_w < eff_max_depth && dp_w < eff_max_tr_dp && k_w < 6 && best_prob_w >= 0.015f;
+    const int32_t sel_tok32 = can_scan ? s_leaf_tok_r[r] : -1;
+    const bool do_sh_scan = want_sh_scan && bloom_has(s_h_bloom, sel_tok32);
+    const bool do_tr_scan = want_tr_scan && bloom_has(s_tr_bloom, sel_tok32);
+    const int cmd = (do_sh_scan ? 1 : 0) | (do_tr_scan ? 2 : 0);
 
-    // Fused 256-thread (8-warp) s_h + 30B Target Recycling scan sharing ONE __syncthreads() barrier.
-    if (want_sh_scan) {
-      const int32_t tok32 = s_leaf_tok_r[r];
-      const int32_t pv_r = s_leaf_prv_r[r];
-      const int32_t pv2_r = s_leaf_prv2_r[r];
-      const int win_m1 = s_win - 1;
-
-      uint32_t best_tri_key = 0u;
-      int u_c = 0, u_min = 2147483647, u_max = -1;
-      int bg_c = 0, bg_min = 2147483647, bg_max = -1, bg_hp = -1;
-      int tri_c = 0, tri_min = 2147483647, tri_max = -1;
-
-      for (int hi = tid; hi < win_m1; hi += 256) {
-        if (s_h[hi] != tok32) continue;
-        const int32_t nxt = s_h[hi + 1];
-        if (nxt < 0) continue;
-        u_c += 1;
-        if (nxt < u_min) u_min = nxt;
-        if (nxt > u_max) u_max = nxt;
-
-        if (pv_r >= 0 && hi >= 1 && s_h[hi - 1] == pv_r) {
-          bg_c += 1;
-          if (nxt < bg_min) bg_min = nxt;
-          if (nxt > bg_max) bg_max = nxt;
-          if (hi + 1 > bg_hp) bg_hp = hi + 1;
-
-          if (pv2_r >= 0 && hi >= 2 && s_h[hi - 2] == pv2_r) {
-            tri_c += 1;
-            if (nxt < tri_min) tri_min = nxt;
-            if (nxt > tri_max) tri_max = nxt;
-            const uint32_t tk_key = (3u << 16) | static_cast<uint32_t>(hi);
-            if (tk_key > best_tri_key) best_tri_key = tk_key;
-          }
-        }
-      }
-
-      const uint32_t w_tk = __reduce_max_sync(0xffffffffu, best_tri_key);
-      const int w_uc = __reduce_add_sync(0xffffffffu, u_c);
-      const int w_umin = __reduce_min_sync(0xffffffffu, u_min);
-      const int w_umax = __reduce_max_sync(0xffffffffu, u_max);
-      const int w_bgc = __reduce_add_sync(0xffffffffu, bg_c);
-      const int w_bgmin = __reduce_min_sync(0xffffffffu, bg_min);
-      const int w_bgmax = __reduce_max_sync(0xffffffffu, bg_max);
-      const int w_bghp = __reduce_max_sync(0xffffffffu, bg_hp);
-      const int w_tc = __reduce_add_sync(0xffffffffu, tri_c);
-      const int w_tmin = __reduce_min_sync(0xffffffffu, tri_min);
-      const int w_tmax = __reduce_max_sync(0xffffffffu, tri_max);
+    if (cmd != 0) {
       if (lane == 0) {
-        s_w_tri_key[warp] = w_tk;
-        s_w_sh[0][warp] = w_uc;
-        s_w_sh[1][warp] = w_umin;
-        s_w_sh[2][warp] = w_umax;
-        s_w_sh[3][warp] = w_bgc;
-        s_w_sh[4][warp] = w_bgmin;
-        s_w_sh[5][warp] = w_bgmax;
-        s_w_sh[6][warp] = w_bghp;
-        s_w_sh[7][warp] = w_tc;
-        s_w_sh[8][warp] = w_tmin;
-        s_w_sh[9][warp] = w_tmax;
+        s_scan_cmd = cmd;
+        s_scan_r = r;
+        s_scan_kw = k_w;
       }
+      __syncthreads();
+      if (do_sh_scan) run_sh_scan_worker(r);
+      if (do_tr_scan) run_tr_scan_worker(r, k_w);
+      __syncthreads();
     }
 
-    if (want_tr_scan) {
-      const int32_t tok32 = s_leaf_tok_r[r];
-      const int32_t pv_r = s_leaf_prv_r[r];
-      const int32_t pv2_r = s_leaf_prv2_r[r];
-      const int n_act = s_tr_active_n;
-      const int cur_st = s_tr_cur_step;
-      const int pos_leaf = static_cast<int>(positions[0]) + k_w;
-
-      int u_tot_c = 0, t0_u_c = 0, u_min_c = 2147483647, u_max_c = -1;
-      int bg_t0_c = 0, bg_min_c = 2147483647, bg_max_c = -1;
-      int tri_t0_c = 0, tri_min_c = 2147483647, tri_max_c = -1;
-      int a1_bg_c = 0, a1_bg_min = 2147483647, a1_bg_max = -1;
-      int a1_tri_c = 0, a1_tri_min = 2147483647, a1_tri_max = -1;
-      int near_c = 0;
-
-      for (int idx = tid; idx < n_act; idx += 256) {
-        if (s_tr_cur[idx] != tok32) continue;
-        const int32_t u_t = s_tr_u[idx];
-        const int32_t p1_t = s_tr_p1[idx];
-        const int32_t p2_t = s_tr_p2[idx];
-        const int age = cur_st - s_tr_st[idx];
-        const int pt = s_tr_pos_tier[idx];
-        const int pos_t = pt >> 1;
-        const int tier_t = pt & 1;
-        const int dist = (pos_leaf >= pos_t) ? (pos_leaf - pos_t) : (pos_t - pos_leaf);
-
-        u_tot_c += 1;
-        if (tier_t == 0) t0_u_c += 1;
-        if (u_t < u_min_c) u_min_c = u_t;
-        if (u_t > u_max_c) u_max_c = u_t;
-        if (age <= 2 && dist <= 12) near_c += 1;
-        if (pv_r >= 0 && p1_t == pv_r) {
-          if (tier_t == 0) {
-            bg_t0_c += 1;
-            if (u_t < bg_min_c) bg_min_c = u_t;
-            if (u_t > bg_max_c) bg_max_c = u_t;
-            if (pv2_r >= 0 && p2_t == pv2_r) {
-              tri_t0_c += 1;
-              if (u_t < tri_min_c) tri_min_c = u_t;
-              if (u_t > tri_max_c) tri_max_c = u_t;
-            }
-          }
-          if (age == 1 && dist <= 8) {
-            a1_bg_c += 1;
-            if (u_t < a1_bg_min) a1_bg_min = u_t;
-            if (u_t > a1_bg_max) a1_bg_max = u_t;
-            if (pv2_r >= 0 && p2_t == pv2_r) {
-              a1_tri_c += 1;
-              if (u_t < a1_tri_min) a1_tri_min = u_t;
-              if (u_t > a1_tri_max) a1_tri_max = u_t;
-            }
-          }
-        }
-      }
-
-      const int w_utot = __reduce_add_sync(0xffffffffu, u_tot_c);
-      const int w_t0u = __reduce_add_sync(0xffffffffu, t0_u_c);
-      const int w_umin = __reduce_min_sync(0xffffffffu, u_min_c);
-      const int w_umax = __reduce_max_sync(0xffffffffu, u_max_c);
-      const int w_near = __reduce_add_sync(0xffffffffu, near_c);
-      const int w_bgc = __reduce_add_sync(0xffffffffu, bg_t0_c);
-      const int w_bgmin = __reduce_min_sync(0xffffffffu, bg_min_c);
-      const int w_bgmax = __reduce_max_sync(0xffffffffu, bg_max_c);
-      const int w_tric = __reduce_add_sync(0xffffffffu, tri_t0_c);
-      const int w_trimin = __reduce_min_sync(0xffffffffu, tri_min_c);
-      const int w_trimax = __reduce_max_sync(0xffffffffu, tri_max_c);
-      const int w_a1bgc = __reduce_add_sync(0xffffffffu, a1_bg_c);
-      const int w_a1bgmin = __reduce_min_sync(0xffffffffu, a1_bg_min);
-      const int w_a1bgmax = __reduce_max_sync(0xffffffffu, a1_bg_max);
-      const int w_a1tric = __reduce_add_sync(0xffffffffu, a1_tri_c);
-      const int w_a1trimin = __reduce_min_sync(0xffffffffu, a1_tri_min);
-      const int w_a1trimax = __reduce_max_sync(0xffffffffu, a1_tri_max);
-      if (lane == 0) {
-        s_w_tr[0][warp] = w_utot;
-        s_w_tr[1][warp] = w_t0u;
-        s_w_tr[2][warp] = w_umin;
-        s_w_tr[3][warp] = w_umax;
-        s_w_tr[4][warp] = w_near;
-        s_w_tr[5][warp] = w_bgc;
-        s_w_tr[6][warp] = w_bgmin;
-        s_w_tr[7][warp] = w_bgmax;
-        s_w_tr[8][warp] = w_tric;
-        s_w_tr[9][warp] = w_trimin;
-        s_w_tr[10][warp] = w_trimax;
-        s_w_tr[11][warp] = w_a1bgc;
-        s_w_tr[12][warp] = w_a1bgmin;
-        s_w_tr[13][warp] = w_a1bgmax;
-        s_w_tr[14][warp] = w_a1tric;
-        s_w_tr[15][warp] = w_a1trimin;
-        s_w_tr[16][warp] = w_a1trimax;
-      }
-    }
-
-    // Barrier #2 (final barrier of leaf iteration): all 256 threads finished reading s_sel_* and writing s_w_sh/s_w_tr.
-    __syncthreads();
-
-    if (warp == 0) {
+    {
       int sh_u_c = 0, sh_u_min = 2147483647, sh_u_max = -1;
       int sh_bg_c = 0, sh_bg_min = 2147483647, sh_bg_max = -1;
       int sh_tri_c = 0, sh_tri_min = 2147483647, sh_tri_max = -1;
 
-      if (want_sh_scan && lane < 8) {
+      if (do_sh_scan && lane < 8) {
         const uint32_t g_tri_key = __reduce_max_sync(0xffu, s_w_tri_key[lane]);
         const int g_u_c = __reduce_add_sync(0xffu, s_w_sh[0][lane]);
         const int g_u_min = __reduce_min_sync(0xffu, s_w_sh[1][lane]);
@@ -2170,7 +2221,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         }
       }
 
-      if (want_tr_scan) {
+      if (do_tr_scan) {
         int g_utot = 0, g_t0u = 0, g_umin = 2147483647, g_umax = -1, g_near = 0;
         int g_bgc = 0, g_bgmin = 2147483647, g_bgmax = -1;
         int g_tric = 0, g_trimin = 2147483647, g_trimax = -1;
@@ -2228,10 +2279,11 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
                                (sh_bg_c > 0 && (sh_bg_min != g_a1_bgmin || sh_bg_max != g_a1_bgmin));
               sh_tri_conflict = (sh_tri_c > 0 && (sh_tri_min != g_trimin || sh_tri_max != g_trimin));
             }
-          } else if (!is_tri_mono && (is_tri1_cand ||
-                                      (g_bgc >= 1 && g_bgmin == g_bgmax) ||
-                                      (g_a1_bgc >= 1 && g_a1_bgmin == g_a1_bgmax) ||
-                                      (g_umin == g_umax && g_umin != tok32))) {
+          } else if (!is_tri_mono && bloom_has(s_h_bloom, tok32) &&
+                     (is_tri1_cand ||
+                      (g_bgc >= 1 && g_bgmin == g_bgmax) ||
+                      (g_a1_bgc >= 1 && g_a1_bgmin == g_a1_bgmax) ||
+                      (g_umin == g_umax && g_umin != tok32))) {
             int my_occ = 0;
             int my_conf = 0;
             int my_bg_conf = 0;
@@ -2360,15 +2412,22 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           const int j_par = k_r - 1;  // 0..4
           const int j_ch = k_r;       // 1..5
           int n_spawned = 0;
+          uint64_t spawn_bloom = 0ull;
           auto already_spawned = [&](int64_t t) -> bool {
             const int32_t t32 = static_cast<int32_t>(t);
+            const uint64_t bit = 1ull << ((static_cast<uint32_t>(t32) * 2654435761u) >> 26);
+            if ((spawn_bloom & bit) == 0ull) return false;
             for (int si = 0; si < n_spawned; ++si) {
               if (s_spawned[si] == t32) return true;
             }
             return false;
           };
           auto record_spawn = [&](int64_t t) {
-            if (n_spawned < 16) s_spawned[n_spawned++] = static_cast<int32_t>(t);
+            if (n_spawned < 16) {
+              const int32_t t32 = static_cast<int32_t>(t);
+              s_spawned[n_spawned++] = t32;
+              spawn_bloom |= (1ull << ((static_cast<uint32_t>(t32) * 2654435761u) >> 26));
+            }
           };
           const int root_ml = (kind == 5) ? (ml - (dp - 1)) : ml;
           int max_pl_dp;
@@ -2831,11 +2890,24 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       }
       }  // end if (tid == 0)
       __syncwarp();
-    }  // end if (warp == 0)
+    }  // end leaf body
   }
+  if (lane == 0) {
+    s_scan_cmd = 0;
+  }
+  __syncthreads();
 
-  // Record per-row (cur, prv1, prv2, pos_r) for up to 32-row 30B Target Recycling commit in 1 parallel cycle.
+  // Signal dependent embed_norm_m immediately once warps 1..7 exit and input_ids/positions are ready.
   if (warp == 0) {
+    if (tid == 0) {
+      if (cascade_meta != nullptr) {
+        cascade_meta[5] = static_cast<int32_t>(casc_row_mask);
+      }
+      leaf_flag[0] = s_any_active ? -1 : 0;
+    }
+    if ((pdl_mode & 2) != 0) {
+      asm volatile("griddepcontrol.launch_dependents;");
+    }
     if (tid < tree_m && saved_row_ctx != nullptr) {
       const int p0_i32 = static_cast<int>(positions[0]);
       const int32_t p_m1 = (s_hist_ok != 0 && s_ctx[14] >= 0) ? s_ctx[14] : -1;
@@ -2855,16 +2927,6 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         }
       }
       reinterpret_cast<int4*>(saved_row_ctx)[tid] = make_int4(cur_r, prv1_r, prv2_r, pos_r);
-    }
-
-    if (tid == 0) {
-      if (cascade_meta != nullptr) {
-        cascade_meta[5] = static_cast<int32_t>(casc_row_mask);
-      }
-      leaf_flag[0] = s_any_active ? -1 : 0;
-    }
-    if ((pdl_mode & 2) != 0) {
-      asm volatile("griddepcontrol.launch_dependents;");
     }
   }
 }

@@ -387,9 +387,17 @@ def _marlin_fp4_wide(
                 _count_mlp_route("slab")
                 return out
         if marlinw_down128 is not None and weight.data_ptr() in _down128_weights:
+            if hasattr(marlinw_down128, "consume_dead_mlp_in"):
+                marlinw_down128.consume_dead_mlp_in((x, weight, weight_scale, weight_global_scale))
             out = marlinw_down128.gemm_auto(x, weight, weight_scale, weight_global_scale)
             if out is not None:
                 _count_mlp_route("down128")
+                if x.shape == (512, 19968):
+                    try:
+                        import muse_sandwich as _ms
+                        _ms.stash_dead_down_in(x)
+                    except Exception:
+                        pass
                 return out
         out = marlinw_down.gemm(
             x, weight, weight_scale, weight_global_scale, down_work, down_work_ptr, down_slots
@@ -511,6 +519,11 @@ def _marlin_fp4_narrow_attn(
                         _pending_nvfp4_dual_gate = (
                             x.data_ptr(), gate_layer.weight.data_ptr(), gate_out
                         )
+                        try:
+                            import muse_prefill_attn as _mpa
+                            _mpa.stash_dead_xnorm(x)
+                        except Exception:
+                            pass
                         return qkv_out
             out = marlinw_down128.gemm_shape(
                 x, weight, weight_scale, weight_global_scale, size_n, size_k
@@ -574,7 +587,10 @@ def _marlin_fp4_swiglu(
             return out
     uses_128 = getattr(marlin_swiglu, "uses_128", None)
     _count_mlp_route("gate_128" if uses_128 is not None and uses_128(weight) else "gate_64")
-    return marlin_swiglu.gemm(x, weight, scales, global_scale)
+    out = marlin_swiglu.gemm(x, weight, scales, global_scale)
+    if x.shape == (512, 6656) and marlinw_down128 is not None and hasattr(marlinw_down128, "stash_dead_mlp_in"):
+        marlinw_down128.stash_dead_mlp_in(x)
+    return out
 
 
 def _marlin_fp4_swiglu_fake(
@@ -594,7 +610,14 @@ def _marlin_fp4_swiglu_fp8(
     x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, global_scale: torch.Tensor,
     down_scale: torch.Tensor,
 ) -> torch.Tensor:
-    return marlin_swiglu_fp8.gemm(x, weight, scales, global_scale, down_scale)
+    out = marlin_swiglu_fp8.gemm(x, weight, scales, global_scale, down_scale)
+    if x.shape == (512, 6656):
+        try:
+            import muse_fp8_swiglu as _mf8
+            _mf8.stash_dead_mlp_in(x)
+        except Exception:
+            pass
+    return out
 
 
 def _marlin_fp4_swiglu_fp8_fake(
