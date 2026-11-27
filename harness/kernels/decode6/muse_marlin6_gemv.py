@@ -167,7 +167,7 @@ def _nv6_gate_blocks() -> int:
         return int(_get_gate_blocks())
     env = os.environ.get("MUSE_NV6_GATE_BLOCKS", "")
     if not env:
-        return 24
+        return 48
     try:
         v = int(env)
     except ValueError:
