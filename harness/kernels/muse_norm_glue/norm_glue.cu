@@ -73,13 +73,6 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
   return *reinterpret_cast<uint32_t*>(&p);
 }
 
-__device__ __forceinline__ float clamp448(float y) {
-  // triton_helpers.maximum / minimum (NaN propagating) against -448 / 448
-  if (!(y > -448.0f) && !(y != y)) y = -448.0f;
-  if (!(y < 448.0f) && !(y != y)) y = 448.0f;
-  return y;
-}
-
 __device__ __forceinline__ uint16_t fp8x2(float lo, float hi) {
   __nv_fp8x2_storage_t s = __nv_cvt_float2_to_fp8x2(make_float2(lo, hi), __NV_SATFINITE, __NV_E4M3);
   return static_cast<uint16_t>(s);
@@ -249,8 +242,8 @@ __global__ void __launch_bounds__(kThreads) post_attn_norm_decode(
         st8_v4(out_bf16_row, c, o);
       }
       if constexpr (kFp8Out) {
-        uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
-                     (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
+        uint32_t q = static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]))) |
+                     (static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]))) << 16);
         st4_v2(out_fp8_row, c, q);
       }
     }
@@ -327,8 +320,8 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
         st8_v4(out_bf16_row, c, o);
       }
       if constexpr (kFp8Out) {
-        uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
-                     (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
+        uint32_t q = static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]))) |
+                     (static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]))) << 16);
         st4_v2(out_fp8_row, c, q);
       }
     }
@@ -457,14 +450,14 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
         st8_v4(out_bf16_row, c, o);
       }
       if constexpr (kFp8Out) {
-        uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
-                     (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
+        uint32_t q = static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]))) |
+                     (static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]))) << 16);
         st4_v2(out_fp8_row, c, q);
       }
       if constexpr (kGateOut) {
         const float g0 = bf_lo(o.x), g1 = bf_hi(o.x), g2 = bf_lo(o.y), g3 = bf_hi(o.y);
-        uint32_t gq = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g0)), clamp448(__fmul_rn(gate_inv, g1)))) |
-                      (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g2)), clamp448(__fmul_rn(gate_inv, g3)))) << 16);
+        uint32_t gq = static_cast<uint32_t>(fp8x2(__fmul_rn(gate_inv, g0), __fmul_rn(gate_inv, g1))) |
+                      (static_cast<uint32_t>(fp8x2(__fmul_rn(gate_inv, g2), __fmul_rn(gate_inv, g3))) << 16);
         st4_v2(out_gate_row, c, gq);
       }
     }
@@ -552,8 +545,8 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
       o.y = pack_bf16x2(y[2], y[3]);
       st8_v4(out_bf16_row, c, o);
       if constexpr (kFp8Out) {
-        uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
-                     (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
+        uint32_t q = static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]))) |
+                     (static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]))) << 16);
         st4_v2(out_fp8_row, c, q);
       }
     }
@@ -565,7 +558,7 @@ __global__ void gate_formula_kernel(const uint16_t* bits, const float* gate_scal
   if (i >= n) return;
   const float gate_inv = full_divide(1.0f, *gate_scale);
   const float v = __uint_as_float(static_cast<uint32_t>(bits[i]) << 16);
-  out[i] = static_cast<uint8_t>(fp8x2(clamp448(__fmul_rn(gate_inv, v)), 0.0f) & 0xff);
+  out[i] = static_cast<uint8_t>(fp8x2(__fmul_rn(gate_inv, v), 0.0f) & 0xff);
 }
 
 __device__ __forceinline__ float triton_sigmoid(float g) {
@@ -636,8 +629,8 @@ __global__ void __launch_bounds__(256) mul_sigmoid_fp8_kernel(
   for (int i = 0; i < 4; ++i) {
     const float gl = bf_lo(gw[i]), gh = bf_hi(gw[i]);
     const float al = bf_lo(aw[i]), ah = bf_hi(aw[i]);
-    const float ql = clamp448(__fmul_rn(__fmul_rn(triton_sigmoid(gl), al), inv_s));
-    const float qh = clamp448(__fmul_rn(__fmul_rn(triton_sigmoid(gh), ah), inv_s));
+    const float ql = __fmul_rn(__fmul_rn(triton_sigmoid(gl), al), inv_s);
+    const float qh = __fmul_rn(__fmul_rn(triton_sigmoid(gh), ah), inv_s);
     ow[i] = fp8x2(ql, qh);
   }
   const uint32_t lo = static_cast<uint32_t>(ow[0]) | (static_cast<uint32_t>(ow[1]) << 16);
@@ -681,8 +674,8 @@ __global__ void __launch_bounds__(128) mul_silu_slice_fp8_kernel(
   for (int i = 0; i < 4; ++i) {
     const float gl = bf_lo(gw[i]), gh = bf_hi(gw[i]);
     const float ul = bf_lo(uw[i]), uh = bf_hi(uw[i]);
-    const float ql = clamp448(__fmul_rn(__fmul_rn(triton_silu(gl), ul), inv_s));
-    const float qh = clamp448(__fmul_rn(__fmul_rn(triton_silu(gh), uh), inv_s));
+    const float ql = __fmul_rn(__fmul_rn(triton_silu(gl), ul), inv_s);
+    const float qh = __fmul_rn(__fmul_rn(triton_silu(gh), uh), inv_s);
     ow[i] = fp8x2(ql, qh);
   }
   const uint32_t lo = static_cast<uint32_t>(ow[0]) | (static_cast<uint32_t>(ow[1]) << 16);
@@ -868,13 +861,13 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
       if constexpr (kWriteBf16) {
         st8_v4(out_bf16_row, c, o);
       }
-      uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
-                   (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
+      uint32_t q = static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]))) |
+                   (static_cast<uint32_t>(fp8x2(__fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]))) << 16);
       st4_v2(out_fp8_row, c, q);
       if constexpr (kGateOut) {
         const float g0 = bf_lo(o.x), g1 = bf_hi(o.x), g2 = bf_lo(o.y), g3 = bf_hi(o.y);
-        uint32_t gq = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g0)), clamp448(__fmul_rn(gate_inv, g1)))) |
-                      (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g2)), clamp448(__fmul_rn(gate_inv, g3)))) << 16);
+        uint32_t gq = static_cast<uint32_t>(fp8x2(__fmul_rn(gate_inv, g0), __fmul_rn(gate_inv, g1))) |
+                      (static_cast<uint32_t>(fp8x2(__fmul_rn(gate_inv, g2), __fmul_rn(gate_inv, g3))) << 16);
         st4_v2(out_gate_row, c, gq);
       }
     }
@@ -965,10 +958,9 @@ __global__ void __launch_bounds__(512) input_norm_fp8_w16(
     const float y0 = __fmul_rn(__fmul_rn(r, xv[2 * i]), __fadd_rn(bf_lo(iw[i]), 1.0f));
     const float y1 = __fmul_rn(__fmul_rn(r, xv[2 * i + 1]), __fadd_rn(bf_hi(iw[i]), 1.0f));
     ob[i] = pack_bf16x2(y0, y1);
-    qf[i] = fp8x2(clamp448(__fmul_rn(inv_scale, y0)), clamp448(__fmul_rn(inv_scale, y1)));
+    qf[i] = fp8x2(__fmul_rn(inv_scale, y0), __fmul_rn(inv_scale, y1));
     if constexpr (kGateOut) {
-      qg[i] = fp8x2(clamp448(__fmul_rn(gate_inv, bf_lo(ob[i]))),
-                    clamp448(__fmul_rn(gate_inv, bf_hi(ob[i]))));
+      qg[i] = fp8x2(__fmul_rn(gate_inv, bf_lo(ob[i])), __fmul_rn(gate_inv, bf_hi(ob[i])));
     }
   }
   const size_t off = row * kHidden + t * 16;
