@@ -2912,7 +2912,6 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
   if ((pdl_mode & 1) != 0) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
-  __shared__ int32_t s_raw_u[32];
   __shared__ uint32_t s_exact_mask;
   __shared__ uint32_t s_matched_mask;
   __shared__ int32_t s_eff_raw_ns;
@@ -2924,84 +2923,79 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
   __shared__ int32_t s_do_oov;
 
   const int32_t init_ns = num_sampled[0];
-  if (lane < tree_m) {
-    int32_t uv = -1;
-    if (no_hit_mode == 0) {
-      if (lane < 7) {
-        const int chain_lim = (chain_all_valid != 0) ? 7 : ((init_ns < 0) ? 0 : ((init_ns < 7) ? init_ns : 7));
-        if (lane < chain_lim) {
-          const int64_t v = sampled_tokens[lane];
-          uv = (v >= 0 && v < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v) : -1;
-        }
-      } else {
-        const int64_t v = leaf_u_toks[lane - 7];
-        uv = (v >= 0 && v < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v) : -1;
+  const int mode = leaf_flag[0];
+  int32_t u_lane = -1;
+  if (lane < tree_m && no_hit_mode == 0) {
+    if (lane < 7) {
+      const int chain_lim = (chain_all_valid != 0) ? 7 : ((init_ns < 0) ? 0 : ((init_ns < 7) ? init_ns : 7));
+      if (lane < chain_lim) {
+        const int64_t v = sampled_tokens[lane];
+        u_lane = (v >= 0 && v < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v) : -1;
       }
+    } else {
+      const int64_t v = leaf_u_toks[lane - 7];
+      u_lane = (v >= 0 && v < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v) : -1;
     }
-    s_raw_u[lane] = uv;
   }
   __syncwarp();
 
+  int32_t ns = init_ns;
+  uint32_t matched_mask = 0u;
+  int32_t hit_dst0 = 0;
+  int32_t hit_src0 = 0;
+  int32_t hit_len = 0;
+  if (mode < 0 && ns >= 1 && ns <= 6 && no_hit_mode == 0) {
+    int32_t parent = -1;
+    int32_t depth = 0;
+    int64_t tok = -1;
+    if (lane >= 7 && lane < tree_m) {
+      parent = (saved_leaf_parent != nullptr) ? saved_leaf_parent[lane] : -1;
+      depth = saved_leaf_k[lane];
+      tok = saved_leaf_toks[lane];
+    }
+    int64_t current = (lane == 0) ? sampled_tokens[ns - 1] : -1;
+    current = __shfl_sync(0xffffffffu, static_cast<long long>(current), 0);
+    int32_t cur_parent = -1;
+    for (; ns <= 6; ++ns) {
+      const bool match = lane >= 7 && lane < tree_m && parent == cur_parent &&
+                         depth == ns && tok >= 0 && tok == current;
+      const uint32_t matches = __ballot_sync(0xffffffffu, match);
+      if (matches == 0u) break;
+      const int winner = __ffs(matches) - 1;
+      const int32_t next = __shfl_sync(0xffffffffu, u_lane, winner);
+      if (next < 0) break;
+      matched_mask |= 1u << winner;
+      if (lane == 0) {
+        sampled_tokens[ns] = static_cast<int64_t>(next);
+        if (hit_len == 0) {
+          hit_dst0 = ns;
+          hit_src0 = winner;
+        }
+        if (hit_flag_len >= 2 + 2 * (hit_len + 1)) {
+          hit_flag[2 + 2 * hit_len] = ns;
+          hit_flag[3 + 2 * hit_len] = winner;
+        }
+      }
+      ++hit_len;
+      cur_parent = winner;
+      current = static_cast<int64_t>(next);
+    }
+  }
+
   if (lane == 0) {
-    const int mode = leaf_flag[0];
-    leaf_flag[0] = 0;  // Clear immediately so non-tree steps see 0.
-    int32_t ns = init_ns;
-    int32_t nr = num_rejected[0];
-    const int32_t raw_ns = ns;
-    uint32_t casc_row_mask = 0u;
+    leaf_flag[0] = 0;
+    const int32_t raw_ns = init_ns;
+    int32_t casc_hit_cnt = 0;
     int32_t casc_m_div1 = 0;
     if (cascade_meta != nullptr) {
-      casc_row_mask = static_cast<uint32_t>(cascade_meta[5]);
+      casc_hit_cnt = __popc(matched_mask & static_cast<uint32_t>(cascade_meta[5]));
       casc_m_div1 = cascade_meta[6];
       cascade_meta[5] = 0;
       cascade_meta[6] = 0;
     }
-    int32_t casc_hit_cnt = 0;
-    uint32_t matched_mask = 0u;
-    int32_t hit_dst0 = 0;
-    int32_t hit_src0 = 0;
-    int32_t hit_len = 0;
-
-    // Supports arbitrary-depth (1..6-level) commits up to ns == 7 (nr == 0) strictly preserving ns + nr == 7.
-    if (mode < 0 && ns >= 1 && ns <= 6 && no_hit_mode == 0) {
-      int32_t cur_parent = -1;
-      for (int stage = 0; stage < 6 && ns <= 6; ++stage) {
-        const int64_t tok_k = sampled_tokens[ns - 1];
-        int matched_r = -1;
-        for (int r = 7; r < tree_m; ++r) {
-          const int32_t par = (saved_leaf_parent != nullptr) ? saved_leaf_parent[r] : -1;
-          if (par == cur_parent && saved_leaf_k[r] == ns &&
-              saved_leaf_toks[r] >= 0 && tok_k == saved_leaf_toks[r]) {
-            matched_r = r;
-            break;
-          }
-        }
-        if (matched_r < 0) break;
-        const int32_t u_r = s_raw_u[matched_r];
-        if (u_r < 0) break;
-        matched_mask |= (1u << matched_r);
-        const int32_t dst_r = ns;
-        sampled_tokens[dst_r] = static_cast<int64_t>(u_r);
-        if ((casc_row_mask & (1u << matched_r)) != 0u) {
-          casc_hit_cnt += 1;
-        }
-        if (hit_len == 0) {
-          hit_dst0 = dst_r;
-          hit_src0 = matched_r;
-        }
-        if (hit_flag_len >= 2 + 2 * (hit_len + 1)) {
-          hit_flag[2 + 2 * hit_len] = dst_r;
-          hit_flag[3 + 2 * hit_len] = matched_r;
-        }
-        hit_len += 1;
-        ns += 1;
-        nr -= 1;
-        cur_parent = matched_r;
-      }
-      if (hit_len > 0) {
-        num_sampled[0] = ns;
-        num_rejected[0] = nr;
-      }
+    if (hit_len > 0) {
+      num_sampled[0] = ns;
+      num_rejected[0] -= hit_len;
     }
 
     hit_flag[0] = hit_dst0;
@@ -3188,7 +3182,7 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
             : (((s_exact_mask & (1u << lane)) != 0u) || lane <= s_eff_raw_ns ||
                ((s_matched_mask & (1u << lane)) != 0u));
         if (row_ok) {
-          tok_cone = s_raw_u[lane];
+          tok_cone = u_lane;
         }
       }
       admit_warp_tok(tok_cone);
@@ -3201,7 +3195,7 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
     int32_t u_t = -1;
     if (lane < tree_m) {
       ctx4 = reinterpret_cast<const int4*>(saved_row_ctx)[lane];
-      u_t = s_raw_u[lane];
+      u_t = u_lane;
     }
     const bool valid = (lane < tree_m && ctx4.x >= 0 && ctx4.x < vocab_size && u_t >= 0 && u_t < vocab_size);
     const uint32_t vmask = __ballot_sync(0xffffffffu, valid);

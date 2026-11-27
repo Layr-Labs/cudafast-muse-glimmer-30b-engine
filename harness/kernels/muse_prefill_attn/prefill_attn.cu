@@ -517,7 +517,6 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
 
   // ---------------------------------------------------------------------------
   // 1. 4-head Interleaved Fused Q-RMSNorm + qscale + NEOX RoPE directly from raw qkv!
-  //    Loads 4 heads per batch via L1-cached 16B even-lane loads + 4x ILP norm/RoPE -> swizzled SMEM.
   //    Runs BEFORE griddepcontrol.wait so Wave-1 CTAs hide kv_only completely!
   // ---------------------------------------------------------------------------
   uint32_t q_frag[8][4];
@@ -532,21 +531,13 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         qkv + static_cast<int64_t>(q_tok) * 4608 + static_cast<int64_t>(kv_head * 16) * 128;
     const int c_log = lane >> 1;
     const int c_half = lane & 1;
-    const int even_lane = lane & ~1;
 
-    // Issue ALL 16 heads in 4 batches of 4 heads (16B coalesced loads via even-lane uint4 + shfl)
     #pragma unroll
     for (int hb = 0; hb < 16; hb += 4) {
       uint2 raw[4];
       #pragma unroll
       for (int h = 0; h < 4; ++h) {
-        uint4 v = make_uint4(0u, 0u, 0u, 0u);
-        if ((lane & 1) == 0) {
-          v = *reinterpret_cast<const uint4*>(q_row + (hb + h) * 128 + even_lane * 4);
-        }
-        const uint32_t hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
-        const uint32_t hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
-        raw[h] = ((lane & 1) == 0) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+        raw[h] = *reinterpret_cast<const uint2*>(q_row + (hb + h) * 128 + lane * 4);
       }
       uint2 ov[4];
       q_norm_rope_4heads<UseRope>(raw, ov, eps, qscale, lane, c0, c1, c2, c3, s0, s1, s2, s3);
