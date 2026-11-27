@@ -257,7 +257,7 @@ def _marlin_fp4_single(
     decode_fixed_grid: bool = False,
 ) -> torch.Tensor:
     if (
-        1 <= x.shape[0] <= 32
+        1 <= x.shape[0] <= 48
         and x.dtype == torch.bfloat16
         and decode_weight is not None
         and decode_scales is not None
@@ -269,15 +269,18 @@ def _marlin_fp4_single(
                     x, decode_weight, decode_scales, decode_palette, weight_global_scale, workspace,
                     size_n, size_k, decode_fixed_grid,
                 )
-        elif x.shape[0] == 1 or (
-            os.environ.get("MUSE_TILED_DECODE_M32", "1") != "0"
-            and _is_tiled_m32_admitted is not None
-            and _is_tiled_m32_admitted(decode_scales)
+        elif x.shape[0] <= 32 and (
+            x.shape[0] == 1
+            or (
+                os.environ.get("MUSE_TILED_DECODE_M32", "1") != "0"
+                and _is_tiled_m32_admitted is not None
+                and _is_tiled_m32_admitted(decode_scales)
+            )
         ):
             return torch.ops.vllm.marlin_tiled_decode.default(
                 x, decode_weight, decode_scales, weight_global_scale, workspace, size_n, size_k
             )
-    if x.shape[0] > 16 and x.shape[0] <= 32 and x.dtype == torch.bfloat16:
+    if x.shape[0] > 16 and x.shape[0] <= 48 and x.dtype == torch.bfloat16:
         # Stock ops.marlin_gemm switches (1,8,8) -> (2,16,4) at M>16 causing 1-ULP KV drift;
         # split into 16-row chunks as a 0-ULP safety net if tiled decode M32 was not admitted.
         out = x.new_empty((x.shape[0], size_n))
@@ -387,9 +390,17 @@ def _marlin_fp4_wide(
                 _count_mlp_route("slab")
                 return out
         if marlinw_down128 is not None and weight.data_ptr() in _down128_weights:
+            if hasattr(marlinw_down128, "consume_dead_mlp_in"):
+                marlinw_down128.consume_dead_mlp_in((x, weight, weight_scale, weight_global_scale))
             out = marlinw_down128.gemm_auto(x, weight, weight_scale, weight_global_scale)
             if out is not None:
                 _count_mlp_route("down128")
+                if x.shape == (512, 19968):
+                    try:
+                        import muse_sandwich as _ms
+                        _ms.stash_dead_down_in(x)
+                    except Exception:
+                        pass
                 return out
         out = marlinw_down.gemm(
             x, weight, weight_scale, weight_global_scale, down_work, down_work_ptr, down_slots
@@ -511,6 +522,11 @@ def _marlin_fp4_narrow_attn(
                         _pending_nvfp4_dual_gate = (
                             x.data_ptr(), gate_layer.weight.data_ptr(), gate_out
                         )
+                        try:
+                            import muse_prefill_attn as _mpa
+                            _mpa.stash_dead_xnorm(x)
+                        except Exception:
+                            pass
                         return qkv_out
             out = marlinw_down128.gemm_shape(
                 x, weight, weight_scale, weight_global_scale, size_n, size_k
@@ -574,7 +590,10 @@ def _marlin_fp4_swiglu(
             return out
     uses_128 = getattr(marlin_swiglu, "uses_128", None)
     _count_mlp_route("gate_128" if uses_128 is not None and uses_128(weight) else "gate_64")
-    return marlin_swiglu.gemm(x, weight, scales, global_scale)
+    out = marlin_swiglu.gemm(x, weight, scales, global_scale)
+    if x.shape == (512, 6656) and marlinw_down128 is not None and hasattr(marlinw_down128, "stash_dead_mlp_in"):
+        marlinw_down128.stash_dead_mlp_in(x)
+    return out
 
 
 def _marlin_fp4_swiglu_fake(
@@ -594,7 +613,14 @@ def _marlin_fp4_swiglu_fp8(
     x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, global_scale: torch.Tensor,
     down_scale: torch.Tensor,
 ) -> torch.Tensor:
-    return marlin_swiglu_fp8.gemm(x, weight, scales, global_scale, down_scale)
+    out = marlin_swiglu_fp8.gemm(x, weight, scales, global_scale, down_scale)
+    if x.shape == (512, 6656):
+        try:
+            import muse_fp8_swiglu as _mf8
+            _mf8.stash_dead_mlp_in(x)
+        except Exception:
+            pass
+    return out
 
 
 def _marlin_fp4_swiglu_fp8_fake(

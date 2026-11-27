@@ -1197,7 +1197,7 @@ class _GateSideStream:
 
     def __init__(self) -> None:
         self.max_tokens = int(
-            os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "32")
+            os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "48")
         )
         self.stream: torch.cuda.Stream | None = None
         self.fork_event: torch.cuda.Event | None = None
@@ -1252,7 +1252,7 @@ class _GateSideStream:
             if x.shape[0] == 1:
                 if getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
                     return
-            elif 2 <= x.shape[0] <= 32:
+            elif 2 <= x.shape[0] <= 48:
                 if layer_idx in _BF16_DUAL_RANS_M_LAYERS:
                     return
                 if getattr(bf16_gate, "muse_bf16_rans_m", None) is None:
@@ -1470,7 +1470,7 @@ def _muse_qk_norm_rope_impl(
                         muse_qk_glue.PDL_PROD_ENABLED
                         and q_first_row == 0
                         and getattr(attn_layer.impl, "_gqa16_decode_eligible", False)
-                        and (2 <= qkv.shape[0] <= 32 or qkv.shape[0] == 512)
+                        and (2 <= qkv.shape[0] <= 48 or qkv.shape[0] == 512)
                     ):
                         try:
                             import muse_gqa16_attn as _mga
@@ -1494,7 +1494,7 @@ def _muse_qk_norm_rope_impl(
                                     and getattr(layer_meta, "causal", False) is True
                                     and getattr(layer_meta, "block_table", None) is not None
                                 )
-                                if has_single_seq and 2 <= qkv.shape[0] <= 32:
+                                if has_single_seq and 2 <= qkv.shape[0] <= 48:
                                     _mq_pdl_ok = qkv.shape[0] <= 16 or (
                                         os.environ.get("MUSE_GQA16_MULTIQ_PDL", "1").strip()
                                         not in ("0", "", "false", "no")
@@ -1602,7 +1602,7 @@ def _muse_bf16_qkv_or_stacked_impl(
         out = torch.mm(x, w_cat.t())
         return out[:, :4608].contiguous(), out[:, 4608:].contiguous()
     if (
-        2 <= x.shape[0] <= 32
+        2 <= x.shape[0] <= 48
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16
@@ -1663,7 +1663,7 @@ def _muse_bf16_gate_fill_impl(
             if rc == 0:
                 return
     if (
-        2 <= x.shape[0] <= 32
+        2 <= x.shape[0] <= 48
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16

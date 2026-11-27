@@ -168,7 +168,7 @@ def _muse_fp8_scaled_mm(
             "attention gate GEMV on %d blocks",
             _stats["admitted"], _stats["rans"], tpf_note, _stats["rejected"], gate_blks,
         )
-    if A.shape[0] <= 32 and _decode_gemm_operand is not None:
+    if A.shape[0] <= 48 and _decode_gemm_operand is not None:
         A = _decode_gemm_operand(A)
     k, n = B.shape
     if A.shape[0] == 1 and packed.numel() > 0 and A.is_contiguous() and _scales_ok(As, Bs, n):
@@ -188,7 +188,7 @@ def _muse_fp8_scaled_mm(
             _rans.rans_gemv_auto(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
         return out
     if (
-        1 < A.shape[0] <= 32
+        1 < A.shape[0] <= 48
         and _RANS_M
         and packed.numel() > 0
         and packed.numel() != n * k

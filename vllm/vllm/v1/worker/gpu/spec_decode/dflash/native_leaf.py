@@ -31,21 +31,21 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 DEFAULT_TREE_M = "16"
-DEFAULT_TREE_WIDE_M = "32"
+DEFAULT_TREE_WIDE_M = "48"
 ENABLED = os.environ.get("MUSE_NATIVE_LEAF", "1").strip() not in ("0", "", "false", "no")
 M8_ENABLED = os.environ.get("MUSE_NATIVE_LEAF_M8", "1").strip() not in ("0", "", "false", "no")
 try:
     _TREE_M_RAW = int(os.environ.get("MUSE_NATIVE_TREE_M", DEFAULT_TREE_M).strip() or "0")
 except ValueError:
     _TREE_M_RAW = 0
-TREE_M = _TREE_M_RAW if _TREE_M_RAW in (12, 16, 20, 24, 32) else 0
+TREE_M = _TREE_M_RAW if _TREE_M_RAW in (12, 16, 20, 24, 32, 48) else 0
 try:
     _TREE_WIDE_M_RAW = int(os.environ.get("MUSE_NATIVE_TREE_WIDE_M", DEFAULT_TREE_WIDE_M).strip() or "0")
 except ValueError:
     _TREE_WIDE_M_RAW = 0
 TREE_WIDE_M = (
     _TREE_WIDE_M_RAW
-    if (_TREE_WIDE_M_RAW in (20, 24, 32) and TREE_M > 0 and _TREE_WIDE_M_RAW > TREE_M)
+    if (_TREE_WIDE_M_RAW in (20, 24, 32, 48) and TREE_M > 0 and _TREE_WIDE_M_RAW > TREE_M)
     else 0
 )
 TREE_WIDE_GATE = os.environ.get("MUSE_NATIVE_TREE_WIDE_GATE", "cpc").strip().lower()
@@ -58,7 +58,7 @@ def desired_verify_ms() -> tuple[int, ...]:
     """Configured bs=1 depth-6 verify widths > 7 to capture as FULL CUDA graphs."""
     if not ENABLED:
         return ()
-    if TREE_M in (12, 16, 20, 24, 32):
+    if TREE_M in (12, 16, 20, 24, 32, 48):
         if TREE_WIDE_M > TREE_M:
             return (TREE_M, TREE_WIDE_M)
         return (TREE_M,)
@@ -90,10 +90,10 @@ LEAF_STATS = os.environ.get("MUSE_LEAF_STATS", "0").strip() in ("1", "true", "ye
 TR_ENABLED = os.environ.get("MUSE_TR_MODE", "1").strip() not in ("0", "", "false", "no")
 OOV_PREADMIT = os.environ.get("MUSE_OOV_PREADMIT", "2").strip() not in ("0", "", "false", "no")
 try:
-    _TREE_K_RAW = int(os.environ.get("MUSE_TREE_K", "8").strip() or "8")
+    _TREE_K_RAW = int(os.environ.get("MUSE_TREE_K", "12").strip() or "12")
 except ValueError:
     _TREE_K_RAW = 8
-TREE_K = 8 if _TREE_K_RAW >= 8 else 6
+TREE_K = 16 if _TREE_K_RAW >= 16 else (12 if _TREE_K_RAW >= 12 else (8 if _TREE_K_RAW >= 8 else 6))
 TREE_TOP_LEN = 6 * TREE_K
 HIST_CAP = 16384
 TR_LOG_CAP = 4096
@@ -248,7 +248,7 @@ def active_verify_m() -> int:
     """Return active base verify width for bs=1 depth-6 verify: 32, 24, 20, 16, 12, 8, or 7."""
     if not (ENABLED and _S.ready):
         return 7
-    if _S.tree_m_ready in (12, 16, 20, 24, 32):
+    if _S.tree_m_ready in (12, 16, 20, 24, 32, 48):
         return _S.tree_m_ready
     if M8_ENABLED and _S.m8_ready:
         return 8
@@ -628,13 +628,13 @@ def init_kv_table(
         else:
             _S.req_acc_state.zero_()
         _S.saved_alt_tok = torch.full((1,), -1, dtype=torch.int64, device=device)
-        _S.saved_leaf_toks = torch.full((32,), -1, dtype=torch.int64, device=device)
-        _S.saved_leaf_k = torch.zeros((32,), dtype=torch.int32, device=device)
-        _S.saved_leaf_parent = torch.full((32,), -1, dtype=torch.int32, device=device)
+        _S.saved_leaf_toks = torch.full((48,), -1, dtype=torch.int64, device=device)
+        _S.saved_leaf_k = torch.zeros((48,), dtype=torch.int32, device=device)
+        _S.saved_leaf_parent = torch.full((48,), -1, dtype=torch.int32, device=device)
         _S.hist = torch.full((HIST_CAP,), -1, dtype=torch.int32, device=device)
         _S.hist_len = torch.zeros((1,), dtype=torch.int32, device=device)
         _S.saved_pos0 = torch.full((1,), -1, dtype=torch.int64, device=device)
-        _S.saved_row_ctx = torch.full((32, 4), -1, dtype=torch.int32, device=device)
+        _S.saved_row_ctx = torch.full((48, 4), -1, dtype=torch.int32, device=device)
         _S.tr_log = torch.zeros((TR_LOG_CAP, 8), dtype=torch.int32, device=device)
         _S.tr_state = torch.tensor([0, 0, -1, 0], dtype=torch.int32, device=device)
         if (
@@ -671,7 +671,7 @@ def init_kv_table(
         _S.tree_m_ready = (
             TREE_M
             if (
-                TREE_M in (12, 16, 20, 24, 32)
+                TREE_M in (12, 16, 20, 24, 32, 48)
                 and lf.numel() >= 1 + 3 * TREE_M
                 and _has_tree_ops
             )
@@ -760,7 +760,7 @@ def prepare_m8(positions: torch.Tensor, seq_lens: torch.Tensor) -> bool:
 @torch.no_grad()
 def prepare_tree(positions: torch.Tensor, seq_lens: torch.Tensor, verify_m: int) -> bool:
     """Zero-sync GPU prep: positions[7..verify_m-1] = p+7..p+verify_m-1, seq_lens[0] += verify_m-7."""
-    if not is_ready() or verify_m < 8 or verify_m > 32:
+    if not is_ready() or verify_m < 8 or verify_m > 48:
         return False
     bfx = _get_bfx()
     if bfx is None:

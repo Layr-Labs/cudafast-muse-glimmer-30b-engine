@@ -506,7 +506,7 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
-                        _keep_raw = desc.cg_mode == CUDAGraphMode.FULL and desc.num_tokens in (7, 16, 32)
+                        _keep_raw = desc.cg_mode == CUDAGraphMode.FULL and desc.num_tokens in (7, 16, 32, 48)
                         try:
                             graph = torch.cuda.CUDAGraph(keep_graph=_keep_raw)
                         except TypeError:

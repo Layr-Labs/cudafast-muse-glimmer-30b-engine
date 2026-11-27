@@ -251,7 +251,7 @@ def update_m_rans(index: torch.Tensor, blob: torch.Tensor) -> None:
 def _decode(x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor,
             index: torch.Tensor) -> torch.Tensor:
     n = weight.shape[0]
-    if (2 <= x.shape[0] <= 32 and x.ndim == 2 and x.shape[1] == _WIDTH
+    if (2 <= x.shape[0] <= 48 and x.ndim == 2 and x.shape[1] == _WIDTH
             and x.dtype == torch.bfloat16 and x.is_cuda and x.is_contiguous()
             and n in _ROWS):
         entry = _M_RANS.get(index.data_ptr())
@@ -340,8 +340,8 @@ class _MuseBF16Lane(UnquantizedLinearMethod):
             return super().apply(layer, x, bias)
         args = (x, layer.weight, packed, layer.muse_bf16_lane_index)
         if torch.compiler.is_compiling():
-            return torch.cond(x.shape[0] <= 32, _packed_branch, _dense_branch, args)
-        if 1 <= x.shape[0] <= 32:
+            return torch.cond(x.shape[0] <= 48, _packed_branch, _dense_branch, args)
+        if 1 <= x.shape[0] <= 48:
             return _packed_branch(*args)
         return super().apply(layer, x, bias)
 

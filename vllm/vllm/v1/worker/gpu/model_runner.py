@@ -434,7 +434,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # for draft steps of 1..max(decode_query_len, 32) tokens, built once here so a
         # step reads it instead of a pin + H2D copy (query_start_loc,
         # cu_num_logits) and an expand kernel. Only read downstream.
-        _n_max = max(self.decode_query_len, 32)
+        _n_max = max(self.decode_query_len, 48)
         for _nt in range(1, _n_max + 1):
             if _nt not in self._qsl_const_gpu:
                 self._qsl_const_gpu[_nt] = torch.tensor(
@@ -443,10 +443,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     device=self.device,
                 )
         self._qsl_tree_np = {
-            _tm: np.array([0, _tm], dtype=np.int32) for _tm in (8, 12, 16, 20, 24, 32)
+            _tm: np.array([0, _tm], dtype=np.int32) for _tm in (8, 12, 16, 20, 24, 32, 48)
         }
         self._num_sched_tree_np = {
-            _tm: np.array([_tm], dtype=np.int32) for _tm in (8, 12, 16, 20, 24, 32)
+            _tm: np.array([_tm], dtype=np.int32) for _tm in (8, 12, 16, 20, 24, 32, 48)
         }
         self._spec_cu_logits_np = [
             np.array([0, _n], dtype=np.int32) for _n in range(_n_max + 1)
@@ -1672,7 +1672,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or not self.cudagraph_manager._graphs_captured
             or torch.cuda.is_current_stream_capturing()
             or input_batch.num_reqs != 1
-            or not (1 <= input_batch.num_tokens <= 32)
+            or not (1 <= input_batch.num_tokens <= 48)
             or input_batch.num_tokens_after_padding != input_batch.num_tokens
             or int(input_batch.num_computed_tokens_np[0]) < int(input_batch.prefill_len_np[0])
         ):
@@ -1732,7 +1732,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 and getattr(_me, "is_single_kernel_m1", lambda: False)()
             )
             can_direct_mm = (
-                1 < n_tok <= 32
+                1 < n_tok <= 48
                 and getattr(_me, "is_single_kernel_m", lambda: False)()
             )
             if (
@@ -2557,11 +2557,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or scheduler_output.scheduled_encoder_inputs
             or scheduler_output.has_structured_output_requests
             or not _native_leaf._S.ready
-            or _native_leaf._S.tree_m_ready != 16
-            or _native_leaf._S.tree_wide_m_ready != 32
+            or _native_leaf._S.tree_m_ready not in (16, 32)
+            or _native_leaf._S.tree_wide_m_ready not in (32, 48)
+            or _native_leaf._S.tree_wide_m_ready <= _native_leaf._S.tree_m_ready
             or _native_leaf.TREE_WIDE_GATE != "cpc"
-            or 16 not in self._single_tree_prep_verified
-            or 32 not in self._single_tree_prep_verified
+            or _native_leaf._S.tree_m_ready not in self._single_tree_prep_verified
+            or _native_leaf._S.tree_wide_m_ready not in self._single_tree_prep_verified
             or torch.cuda.is_current_stream_capturing()
         ):
             return False
@@ -2572,7 +2573,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if (
             num_comp_pref < pref_len
             or num_comp < pref_len
-            or num_comp + 32 > self.max_model_len
+            or num_comp + int(_native_leaf._S.tree_wide_m_ready) > self.max_model_len
             or (_emit_tgt is not None and num_comp + 7 >= int(_emit_tgt))
         ):
             return False
@@ -2610,20 +2611,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if not hasattr(_bfx, "native_leaf_build_adaptive_verify_graph"):
                     self._adapt_verify_disabled = True
                     return False
+                _base_m = int(_native_leaf._S.tree_m_ready)
+                _wide_m = int(_native_leaf._S.tree_wide_m_ready)
                 desc16, _ = dispatch_cg_and_sync_dp(
-                    self.cudagraph_manager, 1, 16, 16, self.dp_size, self.dp_rank,
+                    self.cudagraph_manager, 1, _base_m, _base_m, self.dp_size, self.dp_rank,
                     need_eager=False, num_active_loras=num_active_loras,
                 )
                 desc32, _ = dispatch_cg_and_sync_dp(
-                    self.cudagraph_manager, 1, 32, 32, self.dp_size, self.dp_rank,
+                    self.cudagraph_manager, 1, _wide_m, _wide_m, self.dp_size, self.dp_rank,
                     need_eager=False, num_active_loras=num_active_loras,
                 )
                 if (
                     desc16.cg_mode != CUDAGraphMode.FULL
-                    or desc16.num_tokens != 16
+                    or desc16.num_tokens != _base_m
                     or desc16 not in self.cudagraph_manager.graphs
                     or desc32.cg_mode != CUDAGraphMode.FULL
-                    or desc32.num_tokens != 32
+                    or desc32.num_tokens != _wide_m
                     or desc32 not in self.cudagraph_manager.graphs
                     or self.cudagraph_manager.hidden_states is None
                 ):
@@ -2665,7 +2668,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
                         return _launch
 
-                    enc_fn = (_make_embed_launcher(16), _make_embed_launcher(32))
+                    enc_fn = (_make_embed_launcher(_base_m), _make_embed_launcher(_wide_m))
 
                 idx_mapping = self._req_idx_views[req_idx]
                 pad_buf = self.input_buffers.is_padding if envs.VLLM_MOE_SKIP_PADDING else None
@@ -2713,7 +2716,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     lut = _lmp._get_lut(self.device, float(self.model.output_multiplier), self.model.final_logit_softcapping)
                     self._cached_lmp_lut = lut
 
-                s_bufs = [torch.full((1, 32), -1, dtype=torch.int64, device=self.device) for _ in range(4)]
+                s_bufs = [torch.full((1, _wide_m), -1, dtype=torch.int64, device=self.device) for _ in range(4)]
                 n_ss = [torch.empty((1,), dtype=torch.int32, device=self.device) for _ in range(4)]
                 n_rs = [torch.empty((1,), dtype=torch.int32, device=self.device) for _ in range(4)]
 
@@ -2721,9 +2724,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 cap_st = self._adapt_verify_stream
                 cap_st.wait_stream(main_st)
                 pre_graphs: dict[int, torch.cuda.CUDAGraph] = {}
-                lmp_graphs: dict[int, list[torch.cuda.CUDAGraph]] = {16: [], 32: []}
+                lmp_graphs: dict[int, list[torch.cuda.CUDAGraph]] = {_base_m: [], _wide_m: []}
                 with torch.cuda.stream(cap_st):
-                    for idx_m, m_rows in enumerate((16, 32)):
+                    for idx_m, m_rows in enumerate((_base_m, _wide_m)):
                         fwd_m = _make_dummy_fwd(m_rows)
                         g_pre = torch.cuda.CUDAGraph(keep_graph=True)
                         with torch.cuda.graph(g_pre, pool=self._adapt_verify_pool, stream=cap_st):
@@ -2773,13 +2776,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             lmp_graphs[m_rows].append(g_lmp)
                 main_st.wait_stream(cap_st)
 
-                cf_graphs: dict[int, list[torch.cuda.CUDAGraph]] = {16: [], 32: []}
+                cf_graphs: dict[int, list[torch.cuda.CUDAGraph]] = {_base_m: [], _wide_m: []}
                 pre_hc_base = (
                     self.model.get_mtp_target_hidden_states()
                     if hasattr(self.model, "get_mtp_target_hidden_states")
                     else None
                 )
-                for m_rows in (16, 32):
+                for m_rows in (_base_m, _wide_m):
                     h_m = self.cudagraph_manager.hidden_states[:m_rows]
                     aux_m = (
                         [x[:m_rows] for x in self.cudagraph_manager.aux_hidden_states]
@@ -2812,16 +2815,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 exec_ids: list[int] = []
                 for slot in range(4):
                     m16_vec = [
-                        int(pre_graphs[16].raw_cuda_graph()),
+                        int(pre_graphs[_base_m].raw_cuda_graph()),
                         full16_raw,
-                        int(lmp_graphs[16][slot].raw_cuda_graph()),
-                        int(cf_graphs[16][slot].raw_cuda_graph()),
+                        int(lmp_graphs[_base_m][slot].raw_cuda_graph()),
+                        int(cf_graphs[_base_m][slot].raw_cuda_graph()),
                     ]
                     m32_vec = [
-                        int(pre_graphs[32].raw_cuda_graph()),
+                        int(pre_graphs[_wide_m].raw_cuda_graph()),
                         full32_raw,
-                        int(lmp_graphs[32][slot].raw_cuda_graph()),
-                        int(cf_graphs[32][slot].raw_cuda_graph()),
+                        int(lmp_graphs[_wide_m][slot].raw_cuda_graph()),
+                        int(cf_graphs[_wide_m][slot].raw_cuda_graph()),
                     ]
                     eid = _bfx.native_leaf_build_adaptive_verify_graph(
                         m16_vec,
@@ -2951,12 +2954,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             )
                         except Exception:
                             pass
+                    _base_m_c = int(_native_leaf._S.tree_m_ready)
+                    _wide_m_c = int(_native_leaf._S.tree_wide_m_ready)
                     desc16_c, _ = dispatch_cg_and_sync_dp(
-                        self.cudagraph_manager, 1, 16, 16, self.dp_size, self.dp_rank,
+                        self.cudagraph_manager, 1, _base_m_c, _base_m_c, self.dp_size, self.dp_rank,
                         need_eager=False, num_active_loras=num_active_loras,
                     )
                     desc32_c, _ = dispatch_cg_and_sync_dp(
-                        self.cudagraph_manager, 1, 32, 32, self.dp_size, self.dp_rank,
+                        self.cudagraph_manager, 1, _wide_m_c, _wide_m_c, self.dp_size, self.dp_rank,
                         need_eager=False, num_active_loras=num_active_loras,
                     )
                     full16_c = int(self.cudagraph_manager.graphs[desc16_c].raw_cuda_graph())
@@ -3030,16 +3035,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     comp_exec_ids: list[int] = []
                     for s_idx in range(4):
                         m16_v = [
-                            int(pre_graphs[16].raw_cuda_graph()),
+                            int(pre_graphs[_base_m_c].raw_cuda_graph()),
                             full16_c,
-                            int(lmp_graphs[16][s_idx].raw_cuda_graph()),
-                            int(cf_graphs[16][s_idx].raw_cuda_graph()),
+                            int(lmp_graphs[_base_m_c][s_idx].raw_cuda_graph()),
+                            int(cf_graphs[_base_m_c][s_idx].raw_cuda_graph()),
                         ]
                         m32_v = [
-                            int(pre_graphs[32].raw_cuda_graph()),
+                            int(pre_graphs[_wide_m_c].raw_cuda_graph()),
                             full32_c,
-                            int(lmp_graphs[32][s_idx].raw_cuda_graph()),
-                            int(cf_graphs[32][s_idx].raw_cuda_graph()),
+                            int(lmp_graphs[_wide_m_c][s_idx].raw_cuda_graph()),
+                            int(cf_graphs[_wide_m_c][s_idx].raw_cuda_graph()),
                         ]
                         tail_v = [int(post_prep_graphs[s_idx].raw_cuda_graph()), *tail_suffix]
                         ceid = _bfx.native_leaf_build_compound_step_graph(
@@ -3315,6 +3320,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else 0
         )
         _target_leaf_m = _native_leaf.select_verify_m(_leaf_req_id, _leaf_decoded)
+        _bm_r = _native_leaf._S.tree_m_ready
+        _wm_r = _native_leaf._S.tree_wide_m_ready
+        if (
+            _wm_r > _bm_r
+            and _target_leaf_m == _wm_r
+            and _bm_r in (16, 32)
+            and _wm_r in self._single_tree_prep_verified
+            and _bm_r not in self._single_tree_prep_verified
+        ):
+            _target_leaf_m = _bm_r
         _emit_tgt = getattr(self, "_spec_emit_target_len", None)
         if _emit_tgt is not None and _leaf_req_idx is not None:
             _rem_toks = int(_emit_tgt) - int(

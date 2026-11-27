@@ -1203,12 +1203,13 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         if static_logits.dim() == 2 and static_logits.shape[0] >= 1:
             if tree_top_buf is not None and tree_top_buf.numel() >= 48:
                 n_tt = min(6, static_logits.shape[0])
-                tk8 = static_logits[:n_tt].topk(8, dim=-1)
+                _tk = 16 if tree_top_buf.numel() >= 96 else (12 if tree_top_buf.numel() >= 72 else 8)
+                tk8 = static_logits[:n_tt].topk(_tk, dim=-1)
                 tree_top_buf.fill_(-1)
-                tree_top_buf[: 8 * n_tt].copy_(vocab_map[tk8.indices].reshape(-1))
-                if tree_vals_buf is not None and tree_vals_buf.numel() >= 48:
+                tree_top_buf[: _tk * n_tt].copy_(vocab_map[tk8.indices].reshape(-1))
+                if tree_vals_buf is not None and tree_vals_buf.numel() >= 6 * _tk:
                     tree_vals_buf.fill_(-1e30)
-                    tree_vals_buf[: 8 * n_tt].copy_(tk8.values.to(torch.float32).reshape(-1))
+                    tree_vals_buf[: _tk * n_tt].copy_(tk8.values.to(torch.float32).reshape(-1))
                 if alt_buf is not None:
                     n_t2 = min(2, n_tt, alt_buf.numel() // 2)
                     alt_buf[: 2 * n_t2].copy_(vocab_map[tk8.indices[:n_t2, :2]].reshape(-1))

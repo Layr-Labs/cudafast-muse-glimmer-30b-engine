@@ -492,7 +492,7 @@ extern "C" int muse_embed_norm_m(const void* ids, int ids_64, const void* table,
                                  void* out, int rows, int width, cudaStream_t stream) {
   if (rows <= 0 || rows > 4096 || width <= 0 || (width & 7) != 0 || width > 8192)
     return cudaErrorInvalidValue;
-  const bool use_pdl = (rows <= 32) && decode_tail_pdl_enabled();
+  const bool use_pdl = (rows <= 48) && decode_tail_pdl_enabled();
   if (use_pdl) {
     if (ids_64)
       return static_cast<int>(launch_pdl(
@@ -578,7 +578,7 @@ extern "C" int muse_single_tree_prep(
     const void* src_bt_ptrs, const void* dst_bt_ptrs, const void* bt_strides,
     const void* num_blocks, int64_t num_blocks_stride, const void* block_sizes,
     void* slot_mappings, int64_t slot_mappings_stride, cudaStream_t stream) {
-  if (num_groups <= 0 || num_draft < 1 || num_draft > 7 || verify_m <= num_draft || verify_m > 32 ||
+  if (num_groups <= 0 || num_draft < 1 || num_draft > 7 || verify_m <= num_draft || verify_m > 48 ||
       seq_lens_len < 1 || qsl_len < 2) {
     return cudaErrorInvalidValue;
   }

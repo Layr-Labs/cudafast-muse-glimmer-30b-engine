@@ -343,7 +343,7 @@ __device__ __forceinline__ void q_norm_rope_4heads(
 // Stage 1: Tiny KV-Only K-RMSNorm + RoPE + paged kv_cache + contiguous kv_flat[2][2][seqlen][128]
 // =================================================================================================
 template <bool UseRope, bool CacheFP32, bool kPdl, bool kDiscardKV>
-__global__ __launch_bounds__(64) void prefill_kv_only_kernel(
+__global__ __launch_bounds__(256) void prefill_kv_only_kernel(
     const __nv_bfloat16* __restrict__ qkv,
     const int64_t* __restrict__ positions,
     const void* __restrict__ cos_sin_cache,
@@ -361,10 +361,10 @@ __global__ __launch_bounds__(64) void prefill_kv_only_kernel(
     size_t dead_lines0,
     const char* __restrict__ dead_ptr1,
     size_t dead_lines1) {
-  const int tid_global = static_cast<int>(blockIdx.x) * 64 + static_cast<int>(threadIdx.x);
-  const int total_threads = static_cast<int>(gridDim.x) * 64;
-  const int warp_global = (static_cast<int>(blockIdx.x) << 1) + (static_cast<int>(threadIdx.x) >> 5);
-  const int total_warps = static_cast<int>(gridDim.x) << 1;
+  const int tid_global = static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x);
+  const int total_threads = static_cast<int>(gridDim.x) * 256;
+  const int warp_global = (static_cast<int>(blockIdx.x) << 3) + (static_cast<int>(threadIdx.x) >> 5);
+  const int total_warps = static_cast<int>(gridDim.x) << 3;
   const int lane = static_cast<int>(threadIdx.x) & 31;
 
   if constexpr (kPdl) {
@@ -1120,8 +1120,8 @@ static inline cudaError_t dispatch_kv_only(
     int num_tokens, int cache_rows, int block_size,
     int64_t stride_block, int64_t stride_slot, int64_t stride_kv_head, float eps,
     const char* d0, size_t l0, const char* d1, size_t l1) {
-  const dim3 grid(48u, 1u, 1u);
-  const dim3 block(64u, 1u, 1u);
+  const dim3 grid(64u, 1u, 1u);
+  const dim3 block(256u, 1u, 1u);
   if (use_rope) {
     if (cache_fp32) {
       return launch_ex(kPdl, grid, block, st,

@@ -274,7 +274,7 @@ __device__ __forceinline__ void issue_kv_tile_async(
     int tid,
     int leaf_remap_base = -1,
     int leaf_p_start = 0,
-    uint32_t leaf_remap_packed = 0u) {
+    uint64_t leaf_remap_packed = 0ull) {
   const bool is_bs64_aligned = (block_size == 64) && ((tok_base & 31) == 0);
   int phys_blk0 = 0, slot_base0 = 0;
   const bool half0_any = (tok_base < seqlen_k) && (tok_base + 16 > k_start);
@@ -337,7 +337,7 @@ __device__ __forceinline__ void issue_kv_tile_async(
       const int tok = tok_base + r;
       if (tok >= k_start && tok < seqlen_k) {
         const int tok_eff = (leaf_remap_base >= 0 && tok >= leaf_remap_base)
-            ? (leaf_p_start + static_cast<int>((leaf_remap_packed >> ((tok - leaf_remap_base) * 5)) & 0x1Fu))
+            ? (leaf_p_start + static_cast<int>((leaf_remap_packed >> ((tok - leaf_remap_base) * 6)) & 0x3Full))
             : tok;
         const int lb = (block_size == 16) ? (tok_eff >> 4)
                      : ((block_size == 64) ? (tok_eff >> 6) : (tok_eff / block_size));
@@ -2194,7 +2194,7 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
   int seqlen_k = seqused_k_ptr[0];
   int leaf_remap_base = -1;
   int leaf_p_start = 0;
-  uint32_t leaf_remap_packed = 0u;
+  uint64_t leaf_remap_packed = 0ull;
   if constexpr (kMultiQDirect) {
     const int q0 = cu_seqlens_q_ptr[0];
     const int actual_m = cu_seqlens_q_ptr[1] - q0;
@@ -2202,18 +2202,18 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
     if (q_idx >= actual_m) return;
     q_ptr += static_cast<int64_t>(q0 + q_idx) * q_tok_stride;
     out_ptr += static_cast<int64_t>(q0 + q_idx) * out_tok_stride;
-    if (leaf_flag_ptr != nullptr && leaf_flag_ptr[0] < 0 && actual_m <= 32 && seqlen_k >= actual_m) {
+    if (leaf_flag_ptr != nullptr && leaf_flag_ptr[0] < 0 && actual_m <= 48 && seqlen_k >= actual_m) {
       // Generalized arbitrary-depth (1..6-level) bit-packed tree remap table (sentinel leaf_flag_ptr[0] == -1):
       // entry q_idx sits at [1 + 3*q_idx + {0: seq_sub, 1: base_sub, 2: remap_packed}] inside int32[49].
       // For base_sub >= 0, logical KV positions tok = (seqlen_k - base_sub) + j (j = 0..5) remap to
       // physical slot (seqlen_k - actual_m) + ((remap_packed >> (4*j)) & 0xF).
-      const int base = 1 + q_idx * 3;
+      const int base = 1 + q_idx * 4;
       const int seq_sub = leaf_flag_ptr[base];
       const int base_sub = leaf_flag_ptr[base + 1];
       if (base_sub >= 0) {
         leaf_p_start = seqlen_k - actual_m;
         leaf_remap_base = seqlen_k - base_sub;
-        leaf_remap_packed = static_cast<uint32_t>(leaf_flag_ptr[base + 2]);
+        leaf_remap_packed = static_cast<uint64_t>(static_cast<uint32_t>(leaf_flag_ptr[base + 2])) | (static_cast<uint64_t>(static_cast<uint32_t>(leaf_flag_ptr[base + 3])) << 32);
       }
       seqlen_k -= seq_sub;
     } else if (q_idx == 7 && actual_m == 8 && leaf_flag_ptr != nullptr) {
@@ -2776,7 +2776,7 @@ __global__ __launch_bounds__(128, 1) void gqa16_fa2_block128_pipe_multiq_kernel(
   int nb_min_arr[kQBatch];
   int remap_base_arr[kQBatch];
   int p_start_arr[kQBatch];
-  uint32_t remap_packed_arr[kQBatch];
+  uint64_t remap_packed_arr[kQBatch];
 
   bool any_active = false;
   int safe_tok_end = raw_seqlen_k;
@@ -2800,15 +2800,15 @@ __global__ __launch_bounds__(128, 1) void gqa16_fa2_block128_pipe_multiq_kernel(
     int sk = raw_seqlen_k;
     int lrb = -1;
     int lps = 0;
-    uint32_t lrp = 0u;
-    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 32 && sk >= actual_m) {
-      const int base = 1 + q_idx * 3;
+    uint64_t lrp = 0ull;
+    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 48 && sk >= actual_m) {
+      const int base = 1 + q_idx * 4;
       const int seq_sub = leaf_flag_ptr[base];
       const int base_sub = leaf_flag_ptr[base + 1];
       if (base_sub >= 0) {
         lps = sk - actual_m;
         lrb = sk - base_sub;
-        lrp = static_cast<uint32_t>(leaf_flag_ptr[base + 2]);
+        lrp = static_cast<uint64_t>(static_cast<uint32_t>(leaf_flag_ptr[base + 2])) | (static_cast<uint64_t>(static_cast<uint32_t>(leaf_flag_ptr[base + 3])) << 32);
       }
       sk -= seq_sub;
     } else if (q_idx == 7 && actual_m == 8 && leaf_flag_ptr != nullptr) {
@@ -3190,7 +3190,7 @@ __global__ __launch_bounds__(128, 1) void gqa16_fa2_block128_pipe_multiq_kernel(
 // ============================================================================
 struct __align__(128) VerifyV3Storage {
   uint4 kv[2][64][16];       // 32,768 B (aliases q_tiles[8][16][16] during Q preload)
-  uint4 tree_kv[32][16];     //  8,192 B (up to 32 tree K/V rows for remapped tail block)
+  uint4 tree_kv[48][16];     //  8,192 B (up to 32 tree K/V rows for remapped tail block)
   uint4 zero_row[16];        //    256 B (constant +0.0 BF16 row for out-of-range lanes)
   int32_t nb_max_w[8];       //     32 B
   int32_t nb_min_w[8];       //     32 B
@@ -3199,7 +3199,7 @@ struct __align__(128) VerifyV3Storage {
   int32_t remap_base_w[8];   //     32 B
   uint8_t active_w[8];       //      8 B
 };                           // 41,408 B (< 48 KiB static SMEM; 2 CTAs/SM for kWarps=4)
-static_assert(sizeof(VerifyV3Storage) <= 45440,
+static_assert(sizeof(VerifyV3Storage) <= 49152,
               "VerifyV3Storage must stay <= 45,440 B for static SMEM / 2-CTA carveout");
 
 __device__ __forceinline__ void mma_m16n8k16_bf16_u2(
@@ -3240,13 +3240,13 @@ __device__ __forceinline__ void ldsm4_v_pair64_v3(
 __device__ __forceinline__ void ldsm4_k_pair64_remap(
     uint32_t (&b)[4],
     const uint4 tile[64][16],
-    const uint4 tree_tile[32][16],
+    const uint4 tree_tile[48][16],
     const uint4 zero_row[16],
     int chunk_tok_base,
     int my_k_start,
     int my_seqlen_k,
     int my_remap_base,
-    uint32_t my_remap_packed,
+    uint64_t my_remap_packed,
     int sub_pair,
     int ks,
     int lane) {
@@ -3259,7 +3259,7 @@ __device__ __forceinline__ void ldsm4_k_pair64_remap(
   uint32_t addr;
   if (tok >= my_k_start && tok < my_seqlen_k) {
     if (my_remap_base >= 0 && tok >= my_remap_base) {
-      const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+      const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 6)) & 0x3Full);
       addr = smem_u32(&tree_tile[rr][c_log ^ (rr & 7)]);
     } else {
       addr = smem_u32(&tile[r][c_log ^ r_local]);
@@ -3275,13 +3275,13 @@ __device__ __forceinline__ void ldsm4_k_pair64_remap(
 __device__ __forceinline__ void ldsm4_v_pair64_remap(
     uint32_t (&v)[4],
     const uint4 tile[64][16],
-    const uint4 tree_tile[32][16],
+    const uint4 tree_tile[48][16],
     const uint4 zero_row[16],
     int chunk_tok_base,
     int my_k_start,
     int my_seqlen_k,
     int my_remap_base,
-    uint32_t my_remap_packed,
+    uint64_t my_remap_packed,
     int dt_pair,
     int ks_local,
     int lane) {
@@ -3292,7 +3292,7 @@ __device__ __forceinline__ void ldsm4_v_pair64_remap(
   uint32_t addr;
   if (tok >= my_k_start && tok < my_seqlen_k) {
     if (my_remap_base >= 0 && tok >= my_remap_base) {
-      const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+      const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 6)) & 0x3Full);
       addr = smem_u32(&tree_tile[rr][dt ^ (rr & 7)]);
     } else {
       addr = smem_u32(&tile[r][dt ^ (r & 7)]);
@@ -3357,7 +3357,7 @@ __device__ __forceinline__ void issue_kv64_verify(
 
 template <bool IsV, int kWarps>
 __device__ __forceinline__ void issue_tree_kv_verify(
-    uint4 tree_tile[32][16],
+    uint4 tree_tile[48][16],
     const __nv_bfloat16* __restrict__ kv_ptr,
     const int32_t* __restrict__ block_table,
     int cta_p_start,
@@ -3369,7 +3369,7 @@ __device__ __forceinline__ void issue_tree_kv_verify(
     int64_t stride_kv_head,
     int tid) {
   constexpr int kRowsPerStep = (kWarps * 32) >> 4;
-  constexpr int kTreeSteps = 32 / kRowsPerStep;
+  constexpr int kTreeSteps = 48 / kRowsPerStep;
   const int64_t head_v_off = static_cast<int64_t>(kv_head) * stride_kv_head + (IsV ? 128 : 0);
   const int r_sub = tid >> 4;
   const int c = tid & 15;
@@ -3441,19 +3441,19 @@ __global__ __launch_bounds__(kWarps * 32, (kWarps == 4 ? 2 : 1)) void gqa16_veri
   int my_num_nb = 0;
   int my_nb_min = 0;
   int my_remap_base = -1;
-  uint32_t my_remap_packed = 0u;
+  uint64_t my_remap_packed = 0ull;
 
   if (my_q_idx < actual_m) {
     int sk = raw_seqlen_k;
     int lrb = -1;
-    uint32_t lrp = 0u;
-    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 32 && sk >= actual_m) {
-      const int base = 1 + my_q_idx * 3;
+    uint64_t lrp = 0ull;
+    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 48 && sk >= actual_m) {
+      const int base = 1 + my_q_idx * 4;
       const int seq_sub = leaf_flag_ptr[base];
       const int base_sub = leaf_flag_ptr[base + 1];
       if (base_sub >= 0) {
         lrb = sk - base_sub;
-        lrp = static_cast<uint32_t>(leaf_flag_ptr[base + 2]);
+        lrp = static_cast<uint64_t>(static_cast<uint32_t>(leaf_flag_ptr[base + 2])) | (static_cast<uint64_t>(static_cast<uint32_t>(leaf_flag_ptr[base + 3])) << 32);
       }
       sk -= seq_sub;
     } else if (my_q_idx == 7 && actual_m == 8 && leaf_flag_ptr != nullptr) {
@@ -3951,7 +3951,7 @@ __global__ __launch_bounds__(kWarps * 32, (kWarps == 4 ? 2 : 1)) void gqa16_veri
 // ============================================================================
 struct __align__(128) VerifyV4Storage {
   uint4 kv[2][64][16];         // 32,768 B (aliases q_tiles[4][16][16] during Q preload)
-  uint4 tree_kv[32][16];       //  8,192 B (up to 32 tree K/V rows for remapped tail block)
+  uint4 tree_kv[48][16];       //  8,192 B (up to 32 tree K/V rows for remapped tail block)
   uint4 zero_row[16];          //    256 B (constant +0.0 BF16 row for out-of-range lanes)
   float4 p_hi_f32[4][8][32];   // 16,384 B (w_sub=1 -> w_sub=0 exact ni=8..15 row_sum + p_hi)
   uint4 p_lo_bf16[4][4][32];   //  8,192 B (w_sub=0 -> w_sub=1 packed BF16x2 P[0..3])
@@ -4025,7 +4025,7 @@ __device__ __forceinline__ void issue_kv64_v4(
 
 template <bool IsV>
 __device__ __forceinline__ void issue_tree_kv_v4(
-    uint4 tree_tile[32][16],
+    uint4 tree_tile[48][16],
     const __nv_bfloat16* __restrict__ kv_ptr,
     const int32_t* __restrict__ block_table,
     int cta_p_start,
@@ -4041,7 +4041,7 @@ __device__ __forceinline__ void issue_tree_kv_v4(
   const int c = tid & 15;
   const int c_phys = c ^ (r_sub & 7);
   #pragma unroll
-  for (int u = 0; u < 2; ++u) {
+  for (int u = 0; u < 3; ++u) {
     const int r = (u << 4) + r_sub;
     if (r < actual_m) {
       const int tok = cta_p_start + r;
@@ -4123,19 +4123,19 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_kernel(
   int my_num_nb = 0;
   int my_nb_min = 0;
   int my_remap_base = -1;
-  uint32_t my_remap_packed = 0u;
+  uint64_t my_remap_packed = 0ull;
 
   if (my_q_idx < actual_m) {
     int sk = raw_seqlen_k;
     int lrb = -1;
-    uint32_t lrp = 0u;
-    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 32 && sk >= actual_m) {
-      const int base = 1 + my_q_idx * 3;
+    uint64_t lrp = 0ull;
+    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 48 && sk >= actual_m) {
+      const int base = 1 + my_q_idx * 4;
       const int seq_sub = leaf_flag_ptr[base];
       const int base_sub = leaf_flag_ptr[base + 1];
       if (base_sub >= 0) {
         lrb = sk - base_sub;
-        lrp = static_cast<uint32_t>(leaf_flag_ptr[base + 2]);
+        lrp = static_cast<uint64_t>(static_cast<uint32_t>(leaf_flag_ptr[base + 2])) | (static_cast<uint64_t>(static_cast<uint32_t>(leaf_flag_ptr[base + 3])) << 32);
       }
       sk -= seq_sub;
     } else if (my_q_idx == 7 && actual_m == 8 && leaf_flag_ptr != nullptr) {
@@ -4342,7 +4342,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_kernel(
           const int tok = chunk_base + r;
           if (tok >= my_k_start && tok < my_seqlen_k) {
             if (my_remap_base >= 0 && tok >= my_remap_base) {
-              const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+              const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 6)) & 0x3Full);
               k_row_base[sp] = smem_u32(&smem.tree_kv[rr][0]);
               k_swz[sp] = rr & 7;
             } else {
@@ -4611,7 +4611,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_kernel(
             const int tok = block_tok_base + r;
             if (tok >= my_k_start && tok < my_seqlen_k) {
               if (my_remap_base >= 0 && tok >= my_remap_base) {
-                const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+                const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 6)) & 0x3Full);
                 v_row_base[kl] = smem_u32(&smem.tree_kv[rr][0]);
                 v_swz[kl] = rr & 7;
               } else {
@@ -4675,7 +4675,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_kernel(
             const int tok = block_tok_base + 64 + r;
             if (tok >= my_k_start && tok < my_seqlen_k) {
               if (my_remap_base >= 0 && tok >= my_remap_base) {
-                const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+                const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 6)) & 0x3Full);
                 v_row_base[kl] = smem_u32(&smem.tree_kv[rr][0]);
                 v_swz[kl] = rr & 7;
               } else {
@@ -4778,7 +4778,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_kernel(
 // ============================================================================
 struct __align__(128) VerifyV4_2Q4WStorage {
   uint4 kv[2][64][16];         // 32,768 B (aliases q_tiles[2][16][16] during Q preload)
-  uint4 tree_kv[32][16];       //  8,192 B (up to 32 tree K/V rows for remapped tail block)
+  uint4 tree_kv[48][16];       //  8,192 B (up to 32 tree K/V rows for remapped tail block)
   uint4 zero_row[16];          //    256 B (constant +0.0 BF16 row for out-of-range lanes)
   float4 p_hi_f32[2][12][32];  // 12,288 B (w_sub=1..3 -> w_sub=0 exact ni=4..15 row_sum)
   uint4 p_bf16[2][8][32];      //  8,192 B (all 4 warps publish/read packed BF16x2 P[0..7])
@@ -4791,7 +4791,7 @@ struct __align__(128) VerifyV4_2Q4WStorage {
   int32_t remap_base_q[2];     //      8 B
   uint8_t active_q[2];         //      2 B
 };                             // 62,464 B (<= 64 KiB SMEM carveout on sm_121a!)
-static_assert(sizeof(VerifyV4_2Q4WStorage) <= 65536, "VerifyV4_2Q4WStorage must fit 64 KiB carveout");
+static_assert(sizeof(VerifyV4_2Q4WStorage) <= 73728, "VerifyV4_2Q4WStorage must fit 64 KiB carveout");
 
 template <bool kPdl = false>
 __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_2q4w_kernel(
@@ -4845,19 +4845,19 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_2q4w_kernel(
   int my_num_nb = 0;
   int my_nb_min = 0;
   int my_remap_base = -1;
-  uint32_t my_remap_packed = 0u;
+  uint64_t my_remap_packed = 0ull;
 
   if (my_q_idx < actual_m) {
     int sk = raw_seqlen_k;
     int lrb = -1;
-    uint32_t lrp = 0u;
-    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 32 && sk >= actual_m) {
-      const int base = 1 + my_q_idx * 3;
+    uint64_t lrp = 0ull;
+    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 48 && sk >= actual_m) {
+      const int base = 1 + my_q_idx * 4;
       const int seq_sub = leaf_flag_ptr[base];
       const int base_sub = leaf_flag_ptr[base + 1];
       if (base_sub >= 0) {
         lrb = sk - base_sub;
-        lrp = static_cast<uint32_t>(leaf_flag_ptr[base + 2]);
+        lrp = static_cast<uint64_t>(static_cast<uint32_t>(leaf_flag_ptr[base + 2])) | (static_cast<uint64_t>(static_cast<uint32_t>(leaf_flag_ptr[base + 3])) << 32);
       }
       sk -= seq_sub;
     } else if (my_q_idx == 7 && actual_m == 8 && leaf_flag_ptr != nullptr) {
@@ -5065,7 +5065,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_2q4w_kernel(
           const int tok = half_base + r;
           if (tok >= my_k_start && tok < my_seqlen_k) {
             if (my_remap_base >= 0 && tok >= my_remap_base) {
-              const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+              const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 6)) & 0x3Full);
               k_row_base[sp] = smem_u32(&smem.tree_kv[rr][0]);
               k_swz[sp] = rr & 7;
             } else {
@@ -5314,7 +5314,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_2q4w_kernel(
             const int tok = block_tok_base + r;
             if (tok >= my_k_start && tok < my_seqlen_k) {
               if (my_remap_base >= 0 && tok >= my_remap_base) {
-                const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+                const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 6)) & 0x3Full);
                 v_row_base[kl] = smem_u32(&smem.tree_kv[rr][0]);
                 v_swz[kl] = rr & 7;
               } else {
@@ -5364,7 +5364,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_2q4w_kernel(
             const int tok = block_tok_base + 64 + r;
             if (tok >= my_k_start && tok < my_seqlen_k) {
               if (my_remap_base >= 0 && tok >= my_remap_base) {
-                const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+                const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 6)) & 0x3Full);
                 v_row_base[kl] = smem_u32(&smem.tree_kv[rr][0]);
                 v_swz[kl] = rr & 7;
               } else {
@@ -6234,7 +6234,7 @@ struct Wg2RowInfo {
   int gnb;
   int lrb;
   int lps;
-  uint32_t lrp;
+  uint64_t lrp;
   uint8_t active;
   uint8_t empty;
 };
@@ -6278,7 +6278,7 @@ __device__ __forceinline__ void issue_kv_tile_async_256(
     int tid,
     int leaf_remap_base = -1,
     int leaf_p_start = 0,
-    uint32_t leaf_remap_packed = 0u) {
+    uint64_t leaf_remap_packed = 0ull) {
   const bool is_bs64_aligned = (block_size == 64) && ((tok_base & 31) == 0);
   int phys_blk0 = 0, slot_base0 = 0;
   const bool half0_any = (tok_base < seqlen_k) && (tok_base + 16 > k_start);
@@ -6328,7 +6328,7 @@ __device__ __forceinline__ void issue_kv_tile_async_256(
       const int tok = tok_base + r;
       if (tok >= k_start && tok < seqlen_k) {
         const int tok_eff = (leaf_remap_base >= 0 && tok >= leaf_remap_base)
-            ? (leaf_p_start + static_cast<int>((leaf_remap_packed >> ((tok - leaf_remap_base) * 5)) & 0x1Fu))
+            ? (leaf_p_start + static_cast<int>((leaf_remap_packed >> ((tok - leaf_remap_base) * 6)) & 0x3Full))
             : tok;
         const int lb = (block_size == 16) ? (tok_eff >> 4)
                      : ((block_size == 64) ? (tok_eff >> 6) : (tok_eff / block_size));
@@ -6583,15 +6583,15 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_wg2_kernel(
     if (q_idx < actual_m) {
       int sk = raw_seqlen_k;
       int lrb = -1, lps = 0;
-      uint32_t lrp = 0u;
-      if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 32 && sk >= actual_m) {
-        const int base = 1 + q_idx * 3;
+      uint64_t lrp = 0ull;
+      if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 48 && sk >= actual_m) {
+        const int base = 1 + q_idx * 4;
         const int seq_sub = leaf_flag_ptr[base];
         const int base_sub = leaf_flag_ptr[base + 1];
         if (base_sub >= 0) {
           lps = sk - actual_m;
           lrb = sk - base_sub;
-          lrp = static_cast<uint32_t>(leaf_flag_ptr[base + 2]);
+          lrp = static_cast<uint64_t>(static_cast<uint32_t>(leaf_flag_ptr[base + 2])) | (static_cast<uint64_t>(static_cast<uint32_t>(leaf_flag_ptr[base + 3])) << 32);
         }
         sk -= seq_sub;
       } else if (q_idx == 7 && actual_m == 8 && leaf_flag_ptr != nullptr) {
@@ -7080,7 +7080,7 @@ extern "C" int muse_gqa16_verify_leaf(
     const void* leaf_flag_ptr,
     void* cuda_stream) {
   if (!q_ptr || !kv_ptr || !out_ptr || !seqused_k_ptr || !block_table_ptr || !cu_seqlens_q_ptr ||
-      max_q < 1 || max_q > 32 ||
+      max_q < 1 || max_q > 48 ||
       (grid_splits != 1 && grid_splits != 4 && grid_splits != 8 && grid_splits != 16) ||
       block_size < 16 || (block_size & 15) != 0) {
     return 1;

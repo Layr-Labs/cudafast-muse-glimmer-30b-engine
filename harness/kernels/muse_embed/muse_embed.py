@@ -199,7 +199,7 @@ def fast_single_tree_prep(
         or _single_tree_prep_fn is None
         or num_groups <= 0
         or not (1 <= num_draft <= 7)
-        or not (num_draft < verify_m <= 32)
+        or not (num_draft < verify_m <= 48)
         or idx_mapping.dtype != torch.int32
         or num_computed_tokens.dtype != torch.int32
         or last_sampled_tokens.dtype != torch.int64

@@ -839,7 +839,7 @@ def decode_linear6(
         _consume_down_swiglu is not None
         and not fixed_grid
         and (n, k) == (DOWN_N, DOWN_K)
-        and (x.numel() == k or (x.ndim == 2 and 1 <= x.shape[0] <= 32 and x.shape[1] == k))
+        and (x.numel() == k or (x.ndim == 2 and 1 <= x.shape[0] <= 48 and x.shape[1] == k))
     ):
         x_sw = _consume_down_swiglu(x, global_scale.data_ptr())
         if x_sw is not None:
@@ -852,7 +852,7 @@ def decode_linear6(
             (x.numel() == k and global_scale.data_ptr() in _GATED_OPROJ and is_tma4(scales6))
             or (
                 x.ndim == 2
-                and 1 < x.shape[0] <= 32
+                and 1 < x.shape[0] <= 48
                 and x.shape[1] == k
                 and global_scale.data_ptr() in _GATED_OPROJ_M
                 and is_tma4_ilv(scales6)
@@ -870,7 +870,7 @@ def decode_linear6(
     eff_n = LM_HEAD_PAD128_N if lm_pad128 else n
     blocks = 96 if (n, k) == (LM_HEAD_N, LM_HEAD_K) and is_lm_split2(scales6) else 48
     tile_n = 128 if eff_n % 128 == 0 else 64
-    part_m = 32 if (x.ndim == 2 and x.shape[0] > 16) else 16
+    part_m = 48 if (x.ndim == 2 and x.shape[0] > 32) else (32 if (x.ndim == 2 and x.shape[0] > 16) else 16)
     partials = x.new_empty((blocks, part_m, tile_n), dtype=torch.float32)
     with torch.cuda.device(x.device):
         use_grid = fixed_grid and _gate_up is not None and x.numel() == k and (n, k) == (39936, 6656)
@@ -913,7 +913,7 @@ def decode_linear6(
                 raise RuntimeError(f"SM121 Marlin gate_up SwiGLU launch failed with CUDA error {status}")
             _notify_gate_up_swiglu(out_buf.data_ptr(), sw_entry, True, None)
             return out_buf
-        if x.ndim == 2 and 1 < x.shape[0] <= 32 and is_tma4_ilv(scales6) and _sk_tma4_ilv_m is not None:
+        if x.ndim == 2 and 1 < x.shape[0] <= 48 and is_tma4_ilv(scales6) and _sk_tma4_ilv_m is not None:
             m = int(x.shape[0])
             sw_entry_m = (
                 _SWIGLU_GATE_UP.get(global_scale.data_ptr())
@@ -1040,17 +1040,19 @@ def _get_lmpost_bufs(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     return bufs
 
 
-def _get_lmpost_m_bufs(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """Dedicated scratch/partials for MultiM (M=2..32) lm_head+lmpost so g_bv/g_bi
-    and g_done (int32[4096] for M<=16, int32[8192] for M=17..32) never overlap M=1."""
+def _get_lmpost_m_bufs(dev: torch.device, m: int = 48) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dedicated per-bucket (M<=16, M<=32, M<=48) scratch/partials for MultiM lm_head+lmpost
+    so g_bv/g_bi for M=48 (g_stride=6144) never clobber g_done for M=16 (offset 4096) or M=32."""
     idx = dev.index if dev.index is not None else torch.cuda.current_device()
-    bufs = _LMPOST_M_BUFS.get(idx)
+    bucket = 16 if m <= 16 else (32 if m <= 32 else 48)
+    key = (idx, bucket)
+    bufs = _LMPOST_M_BUFS.get(key)
     if bufs is None:
         bufs = (
-            torch.zeros(4112, dtype=torch.int64, device=dev),
-            torch.empty((96, 32, 128), dtype=torch.float32, device=dev),
+            torch.zeros(6160, dtype=torch.int64, device=dev),
+            torch.empty((96, 48, 128), dtype=torch.float32, device=dev),
         )
-        _LMPOST_M_BUFS[idx] = bufs
+        _LMPOST_M_BUFS[key] = bufs
     return bufs
 
 
@@ -1178,7 +1180,7 @@ def launch_lmhead_lmpost6_m(
         or not x.is_contiguous()
         or x.data_ptr() % 16 != 0
         or x.ndim != 2
-        or not (1 <= x.shape[0] <= 32)
+        or not (1 <= x.shape[0] <= 48)
         or x.shape[1] != layer.input_size_per_partition
         or not out_tokens.is_contiguous()
         or out_tokens.dtype != torch.int64
@@ -1190,7 +1192,7 @@ def launch_lmhead_lmpost6_m(
     lm_pad128 = (n, k) == (LM_HEAD_N, LM_HEAD_K) and is_lm_pad128(s6)
     eff_n = LM_HEAD_PAD128_N if lm_pad128 else n
     blocks = 96 if is_lm_split2(s6) else 48
-    scratch, partials = _get_lmpost_m_bufs(x.device)
+    scratch, partials = _get_lmpost_m_bufs(x.device, int(x.shape[0]))
     with torch.cuda.device(x.device):
         rc = _sk_tma4_ilv_lmpost_m(
             x.data_ptr(),
@@ -1241,9 +1243,9 @@ def admit_tma4_lmpost_m(
     if (n, k) != (LM_HEAD_N, LM_HEAD_K) or not (0 < org_vocab_size <= n):
         return False
     dev = scales6.device
-    scratch, _ = _get_lmpost_m_bufs(dev)
     gen = torch.Generator(device=dev).manual_seed(20261128)
-    for cm in (7, 12, 16, 32, 2):
+    for cm in (7, 12, 16, 32, 48, 2):
+        scratch, _ = _get_lmpost_m_bufs(dev, cm)
         out_tok = torch.empty((1, cm), dtype=torch.int64, device=dev)
         for mag in (0.05, 1.5, 16.0):
             x = (torch.randn((cm, k), generator=gen, device=dev) * mag).to(torch.bfloat16).contiguous()
@@ -1264,7 +1266,7 @@ def admit_tma4_lmpost_m(
             if not launch_lmhead_lmpost6_m(x, layer, lut, out_tok, org_vocab_size):
                 return False
             torch.cuda.synchronize(dev)
-            done_idx = 8192
+            done_idx = 12288 if cm > 32 else 8192
             if (
                 not torch.equal(out_tok, ref)
                 or int(torch.count_nonzero(layer.workspace).item()) != 0
@@ -1419,7 +1421,7 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
 
         swiglu_out = torch.empty((1, GATE_UP_N), dtype=torch.bfloat16, device=dev)
         swiglu_fp8_out = torch.empty((1, DOWN_K), dtype=torch.float8_e4m3fn, device=dev) if is_fp8 else None
-        partials = torch.empty((48, 32, 128), dtype=torch.float32, device=dev)
+        partials = torch.empty((48, 48, 128), dtype=torch.float32, device=dev)
         ok = True
         with torch.cuda.device(dev):
             stream = torch.cuda.current_stream().cuda_stream
@@ -1549,9 +1551,9 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
             ):
                 try:
                     gen_fm = torch.Generator(device=dev).manual_seed(20261129 + count_fp8)
-                    sw_buf_m = torch.empty((32, GATE_UP_N), dtype=torch.bfloat16, device=dev)
-                    sw_fp8_buf_m = torch.empty((32, DOWN_K), dtype=torch.float8_e4m3fn, device=dev)
-                    check_ms = (7, 16, 32) if count_fp8 == 0 else (7, 32)
+                    sw_buf_m = torch.empty((48, GATE_UP_N), dtype=torch.bfloat16, device=dev)
+                    sw_fp8_buf_m = torch.empty((48, DOWN_K), dtype=torch.float8_e4m3fn, device=dev)
+                    check_ms = (7, 16, 32, 48) if count_fp8 == 0 else (7, 48)
                     fm_ok = True
                     for cm in check_ms:
                         xm = (torch.randn((cm, GATE_UP_K), generator=gen_fm, device=dev) * 0.6).to(torch.bfloat16).contiguous()
@@ -1622,8 +1624,8 @@ def register_all_gate_up_swiglu(model: torch.nn.Module) -> int:
                 try:
                     import muse_norm_glue as G
                     gen_m = torch.Generator(device=dev).manual_seed(20261127 + count_bf16)
-                    sw_buf_m = torch.empty((32, GATE_UP_N), dtype=torch.bfloat16, device=dev)
-                    check_ms = (7, 16, 32) if count_bf16 == 0 else (7, 32)
+                    sw_buf_m = torch.empty((48, GATE_UP_N), dtype=torch.bfloat16, device=dev)
+                    check_ms = (7, 16, 32, 48) if count_bf16 == 0 else (7, 48)
                     m_ok = True
                     for cm in check_ms:
                         xm = (torch.randn((cm, GATE_UP_K), generator=gen_m, device=dev) * 0.6).to(torch.bfloat16).contiguous()
@@ -1714,13 +1716,13 @@ def launch_oproj_gated6_m(
     if _sk_tma4_ilv_gated_m is None or not is_tma4_ilv(scales6):
         raise RuntimeError("SM121 Marlin multi-M o_proj gated kernel unavailable")
     m = int(gate.numel() // OPROJ_K)
-    if m < 1 or m > 32 or gate.numel() != m * OPROJ_K or attn.numel() != m * OPROJ_K:
+    if m < 1 or m > 48 or gate.numel() != m * OPROJ_K or attn.numel() != m * OPROJ_K:
         raise RuntimeError(f"SM121 Marlin multi-M o_proj gated invalid shape: m={m}")
     if not gate.is_contiguous() or gate.data_ptr() % 16:
         gate = gate.clone(memory_format=torch.contiguous_format)
     if not attn.is_contiguous() or attn.data_ptr() % 16:
         attn = attn.clone(memory_format=torch.contiguous_format)
-    partials = gate.new_empty((48, 32 if m > 16 else 16, 128), dtype=torch.float32)
+    partials = gate.new_empty((48, 48 if m > 32 else (32 if m > 16 else 16), 128), dtype=torch.float32)
     output = gate.new_empty(out_shape)
     with torch.cuda.device(gate.device):
         status = _sk_tma4_ilv_gated_m(
@@ -1805,7 +1807,7 @@ def register_all_oproj_sigmoid(model: torch.nn.Module) -> int:
                 try:
                     with torch.cuda.device(dev):
                         stream = torch.cuda.current_stream().cuda_stream
-                        m_checks = ((7, (0.05, 1.0, 5.0, 24.0)), (16, (1.0,)), (32, (0.05, 5.0))) if admitted_m == 0 else ((7, (0.05, 1.0, 5.0, 24.0)), (32, (1.0,)))
+                        m_checks = ((7, (0.05, 1.0, 5.0, 24.0)), (16, (1.0,)), (32, (0.05, 5.0)), (48, (0.05, 5.0))) if admitted_m == 0 else ((7, (0.05, 1.0, 5.0, 24.0)), (48, (1.0,)))
                         for cm, sigs in m_checks:
                             tmpm = torch.empty((cm, OPROJ_K), dtype=torch.bfloat16, device=dev)
                             for sig in sigs:

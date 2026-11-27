@@ -279,11 +279,11 @@ def self_check(device: torch.device) -> bool:
             )
             stream = torch.cuda.current_stream(device).cuda_stream
             if pkvok:
-                for m_p in (16, 32, 512):
+                for m_p in (16, 32, 48, 512):
                     hpw_p = (
                         DECODE_KV_HPW
                         if m_p <= 16
-                        else (DECODE_KV_HPW_M32 if m_p <= 32 else PREFILL_KV_HPW)
+                        else (DECODE_KV_HPW_M32 if m_p <= 48 else PREFILL_KV_HPW)
                     )
                     pos_p = torch.arange(m_p, dtype=torch.int64, device=device) % int(cache.shape[0])
                     for layout in ("NHD", "HND"):
@@ -693,9 +693,9 @@ def run_qk_norm_rope_kvcache_prefill(
         and _kv_decode_m is not None
         and _kv_decode_m_state.get("admitted")
         and q_first == 0
-        and 2 <= num_tokens <= 32
+        and 2 <= num_tokens <= 48
     )
-    hpw = DECODE_KV_HPW if num_tokens <= 16 else (DECODE_KV_HPW_M32 if num_tokens <= 32 else PREFILL_KV_HPW)
+    hpw = DECODE_KV_HPW if num_tokens <= 16 else (DECODE_KV_HPW_M32 if num_tokens <= 48 else PREFILL_KV_HPW)
     with torch.cuda.device(qkv.device):
         stream = torch.cuda.current_stream(qkv.device).cuda_stream
         if use_balanced:

@@ -509,9 +509,9 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             return (args[2],)
         if kind in ("cutlass_fp8", "mm"):
             return (args[1],)
-        if kind == "muse_bf16_lane" and 1 <= args[0].shape[0] <= 32 and args[0].is_contiguous():
+        if kind == "muse_bf16_lane" and 1 <= args[0].shape[0] <= 48 and args[0].is_contiguous():
             return (args[2],)
-        if kind == "muse_bf16_stacked" and 1 <= args[0].shape[0] <= 32 and args[0].is_contiguous():
+        if kind == "muse_bf16_stacked" and 1 <= args[0].shape[0] <= 48 and args[0].is_contiguous():
             if args[0].shape[0] == 1:
                 return (args[3],)
             try:
@@ -525,7 +525,7 @@ def _weights_of(kind: str, args) -> tuple[torch.Tensor, ...] | None:
             except Exception:  # noqa: BLE001
                 pass
             return (args[3],)
-        if kind == "muse_bf16_gate" and 1 <= args[1].shape[0] <= 32 and args[1].is_contiguous():
+        if kind == "muse_bf16_gate" and 1 <= args[1].shape[0] <= 48 and args[1].is_contiguous():
             return (args[3],)
         if kind == "marlin_tiled":
             return (args[1], args[2])
@@ -679,7 +679,7 @@ class Session:
                 site.mlp = "act" if prev_big else "norm"
                 site.role = "down" if prev_big else "gate_up"
                 if m_rows > 1 and TRIM_M7 and (
-                    kind == "musefp8" or (TRIM_M7_MARLIN and kind == "marlin_tiled")
+                    kind == "musefp8" or (TRIM_M7_MARLIN and kind in ("marlin_tiled", "marlin"))
                 ):
                     # muse_rans.cu and gemv6_tma4.cu (MUSE_DECODE6_TLB_PREFETCH=2048) already issue
                     # internal 2 MiB TLB prefetches in block 0; skip contending side-stream MLP launches.

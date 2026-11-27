@@ -4124,31 +4124,40 @@ __global__ void dhf_select_topk_kernel(
     const uint32_t shift = static_cast<uint32_t>(24 - pass * 8);
     const uint32_t mask = (pass == 0) ? 0u : (~0u << (32 - pass * 8));
     const uint32_t pref = s_prefix;
+    const uint32_t need = tid < 32 ? s_rem_k : 0u;
     s_hist[tid] = 0u;
     __syncthreads();
 
     for (int i = tid; i < N_in; i += 256) {
       const uint32_t k = s_keys[i];
       if ((k & mask) == pref) {
-        atomicAdd(&s_hist[(k >> shift) & 0xFFu], 1u);
+        const uint32_t bucket = (k >> shift) & 0xffu;
+        atomicAdd(&s_hist[(bucket >> 3) + (bucket & 7u) * 32], 1u);
       }
     }
     __syncthreads();
 
-    if (tid == 0) {
-      uint32_t acc = 0u;
-      const uint32_t need = s_rem_k;
-      uint32_t chosen = 0u;
-      for (int b = 255; b >= 0; --b) {
-        const uint32_t c = s_hist[b];
-        if (acc + c >= need) {
-          chosen = static_cast<uint32_t>(b);
-          s_rem_k = need - acc;
-          break;
-        }
-        acc += c;
+    if (tid < 32) {
+      const int group = 31 - tid;
+      uint32_t count = 0;
+      for (int i = 0; i < 8; ++i) count += s_hist[group + i * 32];
+      uint32_t inclusive = count;
+      for (int delta = 1; delta < 32; delta <<= 1) {
+        const uint32_t peer = __shfl_up_sync(0xffffffffu, inclusive, delta);
+        if (tid >= delta) inclusive += peer;
       }
-      s_prefix = pref | (chosen << shift);
+      uint32_t before = inclusive - count;
+      if (need == 0u ? tid == 0 : before < need && need <= inclusive) {
+        for (int i = 7; i >= 0; --i) {
+          const uint32_t c = s_hist[group + i * 32];
+          if (before + c >= need) {
+            s_rem_k = need - before;
+            s_prefix = pref | (static_cast<uint32_t>(group * 8 + i) << shift);
+            break;
+          }
+          before += c;
+        }
+      }
     }
     __syncthreads();
   }
@@ -4641,31 +4650,40 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_fused_kernel(
     const uint32_t shift = static_cast<uint32_t>(24 - pass * 8);
     const uint32_t mask = (pass == 0) ? 0u : (~0u << (32 - pass * 8));
     const uint32_t pref = s_prefix;
+    const uint32_t need = tid < 32 ? s_rem_k : 0u;
     s_hist[tid] = 0u;
     __syncthreads();
 
     for (int i = tid; i < N_in; i += 256) {
       const uint32_t k = s_keys[i];
       if ((k & mask) == pref) {
-        atomicAdd(&s_hist[(k >> shift) & 0xFFu], 1u);
+        const uint32_t bucket = (k >> shift) & 0xffu;
+        atomicAdd(&s_hist[(bucket >> 3) + (bucket & 7u) * 32], 1u);
       }
     }
     __syncthreads();
 
-    if (tid == 0) {
-      uint32_t acc = 0u;
-      const uint32_t need = s_rem_k;
-      uint32_t chosen = 0u;
-      for (int b = 255; b >= 0; --b) {
-        const uint32_t c = s_hist[b];
-        if (acc + c >= need) {
-          chosen = static_cast<uint32_t>(b);
-          s_rem_k = need - acc;
-          break;
-        }
-        acc += c;
+    if (tid < 32) {
+      const int group = 31 - tid;
+      uint32_t count = 0;
+      for (int i = 0; i < 8; ++i) count += s_hist[group + i * 32];
+      uint32_t inclusive = count;
+      for (int delta = 1; delta < 32; delta <<= 1) {
+        const uint32_t peer = __shfl_up_sync(0xffffffffu, inclusive, delta);
+        if (tid >= delta) inclusive += peer;
       }
-      s_prefix = pref | (chosen << shift);
+      uint32_t before = inclusive - count;
+      if (need == 0u ? tid == 0 : before < need && need <= inclusive) {
+        for (int i = 7; i >= 0; --i) {
+          const uint32_t c = s_hist[group + i * 32];
+          if (before + c >= need) {
+            s_rem_k = need - before;
+            s_prefix = pref | (static_cast<uint32_t>(group * 8 + i) << shift);
+            break;
+          }
+          before += c;
+        }
+      }
     }
     __syncthreads();
   }
@@ -4784,7 +4802,84 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_fused_kernel(
   }
   __syncthreads();
 
-  if (s_is_last && tid < 32) {
+  if (s_is_last) {
+    if (tree_k > 8) {
+      constexpr int kTot = kS2CTAsPerRow * 8;
+      constexpr int kNW = (kTot + 31) >> 5;
+      float* s_fv = reinterpret_cast<float*>(s_a0);
+      for (int idx = tid; idx < kTot; idx += 256) {
+        const size_t idx_g = static_cast<size_t>(m) * kTot + idx;
+        const float fv = dhf_ldcg_f(&s2_vals[idx_g]);
+        const int32_t fi = dhf_ldcg_i(&s2_ids[idx_g]);
+        s_fv[idx] = fv;
+        s_ids[idx] = fi;
+        s_keys[idx] = (fi == 0x7fffffff) ? 0u : dhf_f32_to_key(fv);
+      }
+      __syncthreads();
+      for (int r = 0; r < tree_k; ++r) {
+        uint32_t my_k = (tid < kTot) ? s_keys[tid] : 0u;
+        int my_i = (tid < kTot) ? s_ids[tid] : 0x7fffffff;
+        int my_p = tid;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+          const uint32_t ok = __shfl_down_sync(0xffffffffu, my_k, o);
+          const int oi = __shfl_down_sync(0xffffffffu, my_i, o);
+          const int op = __shfl_down_sync(0xffffffffu, my_p, o);
+          if (ok > my_k || (ok == my_k && oi < my_i)) {
+            my_k = ok; my_i = oi; my_p = op;
+          }
+        }
+        if (lane == 0 && warp < kNW) {
+          s_hist[warp] = my_k;
+          s_hist[16 + warp] = static_cast<uint32_t>(my_i);
+          s_hist[32 + warp] = static_cast<uint32_t>(my_p);
+        }
+        __syncthreads();
+        if (tid == 0) {
+          uint32_t bk = s_hist[0];
+          int bi = static_cast<int>(s_hist[16]);
+          int bp = static_cast<int>(s_hist[32]);
+          for (int w = 1; w < kNW; ++w) {
+            const uint32_t ok = s_hist[w];
+            const int oi = static_cast<int>(s_hist[16 + w]);
+            const int op = static_cast<int>(s_hist[32 + w]);
+            if (ok > bk || (ok == bk && oi < bi)) {
+              bk = ok; bi = oi; bp = op;
+            }
+          }
+          const bool valid = (bi != 0x7fffffff && bk != 0u);
+          const float bv = valid ? s_fv[bp] : -1e30f;
+          if (valid) s_keys[bp] = 0u;
+          if (r == 0) {
+            out[m] = static_cast<int64_t>(bi);
+            if (out_top2_row0 != nullptr && m < top2_rows) {
+              out_top2_row0[2 * m + 0] = static_cast<int64_t>(bi);
+            }
+            s_fv[kTot] = bv;
+          } else if (r == 1) {
+            if (out_top2_row0 != nullptr && m < top2_rows) {
+              out_top2_row0[2 * m + 1] = valid ? static_cast<int64_t>(bi) : out[m];
+            }
+            if (out_margins != nullptr && m < margin_rows) {
+              out_margins[m] = valid ? (s_fv[kTot] - bv) : 100.0f;
+            }
+          }
+          if (out_tree_top != nullptr && m < tree_top_rows) {
+            out_tree_top[tree_k * m + r] = valid ? static_cast<int64_t>(bi) : -1;
+            if (out_tree_vals != nullptr) {
+              out_tree_vals[tree_k * m + r] = bv;
+            }
+          }
+        }
+        __syncthreads();
+      }
+      if (tid == 0) {
+        atomicExch(&s2_done[m], 0);
+        if ((pdl_mode & 2) != 0) {
+          asm volatile("griddepcontrol.launch_dependents;");
+        }
+      }
+    } else if (tid < 32) {
     float fv1 = -1e38f, fv2 = -1e38f, fv3 = -1e38f, fv4 = -1e38f;
     float fv5 = -1e38f, fv6 = -1e38f, fv7 = -1e38f, fv8 = -1e38f;
     int fi1 = 0x7fffffff, fi2 = 0x7fffffff, fi3 = 0x7fffffff, fi4 = 0x7fffffff;
@@ -4877,6 +4972,7 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_fused_kernel(
       if ((pdl_mode & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;");
       }
+    }
     }
   }
 }
@@ -5201,7 +5297,13 @@ torch::Tensor dhead_fast_argmax(
   if (out_tree_top.has_value() && out_tree_top.value().defined() && out_tree_top.value().numel() >= 4) {
     TORCH_CHECK(out_tree_top.value().is_cuda() && out_tree_top.value().scalar_type() == torch::kInt64);
     tree_top_ptr = out_tree_top.value().data_ptr<int64_t>();
-    if (out_tree_top.value().numel() >= 48) {
+    if (out_tree_top.value().numel() >= 96) {
+      tree_k = 16;
+      tree_top_rows = std::min(6, std::min(M, static_cast<int>(out_tree_top.value().numel() / 16)));
+    } else if (out_tree_top.value().numel() >= 72) {
+      tree_k = 12;
+      tree_top_rows = std::min(6, std::min(M, static_cast<int>(out_tree_top.value().numel() / 12)));
+    } else if (out_tree_top.value().numel() >= 48) {
       tree_k = 8;
       tree_top_rows = std::min(6, std::min(M, static_cast<int>(out_tree_top.value().numel() / 8)));
     } else if (out_tree_top.value().numel() >= 36) {

@@ -40,7 +40,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _H = 6656
-_MAX_ROWS = 32
+_MAX_ROWS = 48
 _MAX_POST_ATTN_ROWS = 4096
 # Diagnostics only: compare both kernels on every eligible launch made outside graph capture (real
 # activations of short prompts, which run without graphs). Off by default.
@@ -468,7 +468,7 @@ class _MulSiluSliceSwap:
                     n_sw = int(numel_t)
                 except Exception:
                     n_sw = -1
-                if n_sw > 0 and n_sw % 19968 == 0 and (n_sw // 19968) <= 32 and gu_t.data_ptr() == gu_ptr:
+                if n_sw > 0 and n_sw % 19968 == 0 and (n_sw // 19968) <= 48 and gu_t.data_ptr() == gu_ptr:
                     m_rows = n_sw // 19968
                     if fused_launched:
                         if m_rows == 1:

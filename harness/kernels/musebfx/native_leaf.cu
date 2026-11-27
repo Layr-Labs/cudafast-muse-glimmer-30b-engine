@@ -71,6 +71,7 @@ struct CalibKnobs {
   float z0_center;
   float shf;
   float alt2_scale;
+  float c_tail_step;
 };
 
 constexpr int kPlWindowMax = 4096;
@@ -645,17 +646,18 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
 
   // Chain rows 0..6: plain causal lengths p+1 .. p+7, no KV remap.
   if (tid < 7) {
-    leaf_flag[1 + 3 * tid + 0] = tree_m - 1 - tid;
-    leaf_flag[1 + 3 * tid + 1] = -1;
-    leaf_flag[1 + 3 * tid + 2] = 0;
+    leaf_flag[1 + 4 * tid + 0] = tree_m - 1 - tid;
+    leaf_flag[1 + 4 * tid + 1] = -1;
+    leaf_flag[1 + 4 * tid + 2] = 0;
+    leaf_flag[1 + 4 * tid + 3] = 0;
     if (saved_leaf_parent != nullptr) {
       saved_leaf_parent[tid] = -1;
     }
   }
 
-  __shared__ int s_row_base_sub[32];
-  __shared__ int s_row_depth[32];
-  __shared__ uint32_t s_row_packed[32];
+  __shared__ int s_row_base_sub[48];
+  __shared__ int s_row_depth[48];
+  __shared__ uint64_t s_row_packed[48];
 
   const int num_leaves = tree_m - 7;
   if (dynamic_mode == 0 || selftest_mode != 0 || tree_vals == nullptr || tree_k < 6) {
@@ -665,8 +667,8 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         cascade_meta[5] = 0;
         cascade_meta[6] = 0;
       }
-      constexpr int kLeafK[9] = {1, 1, 2, 2, 3, 1, 3, 4, 5};
-      constexpr int kLeafRank[9] = {1, 2, 1, 2, 1, 3, 2, 1, 1};
+      static constexpr int kLeafK[9] = {1, 1, 2, 2, 3, 1, 3, 4, 5};
+      static constexpr int kLeafRank[9] = {1, 2, 1, 2, 1, 3, 2, 1, 1};
       bool any_active = false;
       for (int li = 0; li < num_leaves; ++li) {
         const int r = 7 + li;
@@ -698,15 +700,15 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           any_active = true;
           int b_sub = 0;
           int dp = 1;
-          uint32_t pkd = 0u;
+          uint64_t pkd = 0ull;
           if (par < 0) {
             b_sub = tree_m - k;
             dp = 1;
-            pkd = static_cast<uint32_t>(r) & 0x1Fu;
+            pkd = static_cast<uint64_t>(r) & 0x3Full;
           } else {
             b_sub = s_row_base_sub[par];
             dp = s_row_depth[par] + 1;
-            pkd = s_row_packed[par] | ((static_cast<uint32_t>(r) & 0x1Fu) << (5 * (dp - 1)));
+            pkd = s_row_packed[par] | ((static_cast<uint64_t>(r) & 0x3Full) << (6 * (dp - 1)));
           }
           s_row_base_sub[r] = b_sub;
           s_row_depth[r] = dp;
@@ -718,22 +720,24 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           if (saved_leaf_parent != nullptr) {
             saved_leaf_parent[r] = par;
           }
-          leaf_flag[1 + 3 * r + 0] = tree_m - (k + 1);
-          leaf_flag[1 + 3 * r + 1] = b_sub;
-          leaf_flag[1 + 3 * r + 2] = static_cast<int32_t>(pkd);
+          leaf_flag[1 + 4 * r + 0] = tree_m - (k + 1);
+          leaf_flag[1 + 4 * r + 1] = b_sub;
+          leaf_flag[1 + 4 * r + 2] = static_cast<int32_t>(pkd & 0xffffffffull);
+          leaf_flag[1 + 4 * r + 3] = static_cast<int32_t>((pkd >> 32) & 0xffffffffull);
         } else {
           s_row_base_sub[r] = -1;
           s_row_depth[r] = 0;
-          s_row_packed[r] = 0u;
+          s_row_packed[r] = 0ull;
           input_ids[r] = input_ids[0];
           saved_leaf_toks[r] = -1;
           saved_leaf_k[r] = 0;
           if (saved_leaf_parent != nullptr) {
             saved_leaf_parent[r] = -1;
           }
-          leaf_flag[1 + 3 * r + 0] = tree_m - 1 - r;
-          leaf_flag[1 + 3 * r + 1] = -1;
-          leaf_flag[1 + 3 * r + 2] = 0;
+          leaf_flag[1 + 4 * r + 0] = tree_m - 1 - r;
+          leaf_flag[1 + 4 * r + 1] = -1;
+          leaf_flag[1 + 4 * r + 2] = 0;
+          leaf_flag[1 + 4 * r + 3] = 0;
         }
       }
       leaf_flag[0] = any_active ? -1 : 0;
@@ -747,16 +751,18 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     return;
   }
 
-  const int tk = (tree_k >= 8) ? 8 : 6;
+  const int tk_ext = (tree_k >= 16) ? 16 : ((tree_k >= 12) ? 12 : ((tree_k >= 8) ? 8 : 6));
+  const int tk = (tk_ext >= 8) ? 8 : 6;
 
   // Dynamic per-step GPU arbitrary-depth (1..6-level) tree allocator + fused prompt lookup (up to 192 candidates).
-  __shared__ int32_t s_h[kPlWindowMax];
+  __shared__ __align__(16) int32_t s_h[kPlWindowMax];
   __shared__ int32_t s_ctx[22];
   __shared__ int32_t s_top[6][kMaxTreeK];
-  __shared__ uint32_t s_w_pl_key[8][6];
-  __shared__ uint32_t s_w_cand_key[8][6][kMaxTreeK];
   __shared__ uint32_t s_pl_key[6];
   __shared__ uint32_t s_cand_key[6][kMaxTreeK];
+  __shared__ int8_t s_leaf_k_r[48];
+  __shared__ int8_t s_leaf_par_r[48];
+  __shared__ int8_t s_leaf_ok_r[48];
   // Wave-62/69 smoothed Markov bigram/trigram coherence + 0.00ms Anti-Chimera incoming counts (~3.4 KiB SMEM).
   __shared__ uint32_t s_alt_cnt[5][kMaxTreeK];
   __shared__ uint32_t s_in_cnt[5][kMaxTreeK];
@@ -768,6 +774,22 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __shared__ int32_t s_uniq_min[5][kMaxTreeK];
   __shared__ int32_t s_uniq_max[5][kMaxTreeK];
   __shared__ int32_t s_uniq_hp[5][kMaxTreeK];
+  // O(1) deduplicated token hash tables + 512-bit TR Bloom filter (~2.44 KiB SMEM, total < 46.1 KiB <= 48 KiB).
+  __shared__ int8_t s_ht_anc[64];
+  __shared__ int32_t s_uanc_tok[6];
+  __shared__ uint8_t s_uanc_mask[6];
+  __shared__ int8_t s_ht_nxt[256];
+  __shared__ int32_t s_unxt_tok[40];
+  __shared__ uint64_t s_unxt_mask[40];
+  __shared__ uint32_t s_unxt_cnt[40];
+  __shared__ int8_t s_ht_src[256];
+  __shared__ int32_t s_usrc_tok[40];
+  __shared__ uint64_t s_usrc_mask[40];
+  __shared__ uint32_t s_usrc_cnt[40];
+  __shared__ int32_t s_usrc_umin[40];
+  __shared__ int32_t s_usrc_umax[40];
+  __shared__ int32_t s_usrc_uhp[40];
+  __shared__ uint32_t s_tr_bloom[16];
   // Wave-63 anchor monomorphism & L2-resident 30B Target Recycling active buffer (~12.8 KiB SMEM).
   __shared__ uint32_t s_anc_u1_cnt[6];
   __shared__ uint32_t s_anc_bg2_cnt[6];
@@ -789,20 +811,20 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __shared__ float s_tr_b_rk[6][kMaxTreeK];
   __shared__ int32_t s_tr_oov_tok[6];
   __shared__ float s_tr_oov_w[6];
-  __shared__ int32_t s_leaf_tok_r[32];
-  __shared__ int32_t s_leaf_prv_r[32];
-  __shared__ int32_t s_leaf_prv2_r[32];
+  __shared__ int32_t s_leaf_tok_r[48];
+  __shared__ int32_t s_leaf_prv_r[48];
+  __shared__ int32_t s_leaf_prv2_r[48];
   __shared__ int64_t s_tr_ch_tok;
   __shared__ float s_tr_ch_p;
   __shared__ int64_t s_sh_ch_tok;
   __shared__ float s_sh_ch_p;
   __shared__ int s_sh_ch_hp;
   __shared__ int s_sh_ch_ml;
-  __shared__ float s_sel_s;
-  __shared__ int s_sel_idx;
-  __shared__ float s_sel_prob;
-  __shared__ int s_sel_hpos;
-  __shared__ int s_sel_ml;
+  __shared__ float s_sel_s[2];
+  __shared__ int s_sel_idx[2];
+  __shared__ float s_sel_prob[2];
+  __shared__ int s_sel_hpos[2];
+  __shared__ int s_sel_ml[2];
   __shared__ uint32_t s_w_tri_key[8];
   __shared__ int s_w_sh[10][8];
   __shared__ int s_w_tr[17][8];
@@ -817,10 +839,10 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __shared__ float s_p1post[6];
   __shared__ float s_p2post[6];
   __shared__ float s_pr[6][kMaxTreeK];
+  __shared__ float s_pr_ext[6][8];
   __shared__ float s_e0[6][kMaxTreeK];
   __shared__ float s_e1[6][kMaxTreeK];
   __shared__ float s_p_post_vec[kMaxTreeK];
-  __shared__ int32_t s_spawned[16];
   __shared__ float s_den1[6];
   __shared__ float s_z0[6];
   __shared__ float s_margin[6];
@@ -828,7 +850,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __shared__ uint8_t s_valid_row[6];
   __shared__ int s_any_active;
 
-  constexpr int kCandCap = 192;
+  constexpr int kCandCap = 256;
   __shared__ float s_cand_score[kCandCap];
   __shared__ float s_cand_prob[kCandCap];
   __shared__ int64_t s_cand_tok[kCandCap];
@@ -972,16 +994,41 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     s_uniq_max[j][r] = -1;
     s_uniq_hp[j][r] = -1;
   }
-  if (tid < 5) {
-    s_skip_bg[tid] = 0u;
+  if (tid < 6) {
+    s_pl_key[tid] = 0u;
+    if (tid < 5) s_skip_bg[tid] = 0u;
+  }
+  if (tid < 48) {
+    s_cand_key[tid >> 3][tid & 7] = 0u;
+  }
+  s_ht_nxt[tid] = -1;
+  s_ht_src[tid] = -1;
+  if (tid < 64) {
+    s_ht_anc[tid] = -1;
+  }
+  if (tid < 16) {
+    s_tr_bloom[tid] = 0u;
   }
   __syncthreads();
 
-  // Pass 2: collaborative 256-thread SMEM scan of history window for multi-depth suffix matches,
-  // Markov bigram/trigram co-occurrence counts, Anti-Chimera incoming counts, shift-bigram flags,
-  // unique OOV successors, and 30B recycle log.
+  auto hash64 = [](int32_t tok) -> uint32_t {
+    return (static_cast<uint32_t>(tok) * 0x9E3779B1u) >> 26;
+  };
+  auto hash256 = [](int32_t tok) -> uint32_t {
+    return (static_cast<uint32_t>(tok) * 0x9E3779B1u) >> 24;
+  };
+  auto tr_bloom_has = [&](int32_t tok) -> bool {
+    if (tok < 0) return true;
+    const uint32_t hb = (static_cast<uint32_t>(tok) * 0x9E3779B1u) >> 23;
+    return (s_tr_bloom[hb >> 5] & (1u << (hb & 31u))) != 0u;
+  };
+
+  // Pass 2: collaborative 256-thread SMEM scan of history window using O(1) token hash tables +
+  // warp-aggregated __match_any_sync counts + read-before-atomic min/max filters (0-ULP bit-exact).
   const bool scan_bg = (bg.bg_mode != 0 || bg.uniq_mode != 0 || bg.shf_cal != 0 || ac.ac_mode != 0);
   const bool scan_anc = (pl.mode != 0 || tr.mode != 0 || tr.det_sh_root != 0 || ac.skip_root_bg > 0.0f);
+  const bool need_nxt_ht = scan_bg && (bg.bg_mode != 0 || ac.ac_mode != 0);
+  const int r_start_bg = (ac.ac_mode != 0 || (bg.bg_sub != 0 && bg.bg_mode != 0)) ? 0 : 1;
   if ((scan_anc || scan_bg) && s_hist_ok != 0 && s_win >= 2) {
     const int win = s_win;
     const int h_base = s_h_base;
@@ -992,30 +1039,115 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     if (tid < 15) {
       const int hi = win - 16 + tid;
       s_ctx[tid] = (hi >= 0) ? s_h[hi] : -2;
+    } else if (tid == 32 && scan_anc) {
+      int na = 0;
+      for (int j = 0; j < 6; ++j) {
+        const int32_t tok = s_ctx[15 + j];
+        uint32_t h = hash64(tok);
+        int8_t u = s_ht_anc[h];
+        while (u >= 0 && s_uanc_tok[u] != tok) {
+          h = (h + 1u) & 63u;
+          u = s_ht_anc[h];
+        }
+        if (u < 0) {
+          u = static_cast<int8_t>(na++);
+          s_ht_anc[h] = u;
+          s_uanc_tok[u] = tok;
+          s_uanc_mask[u] = static_cast<uint8_t>(1u << j);
+        } else {
+          s_uanc_mask[u] |= static_cast<uint8_t>(1u << j);
+        }
+      }
+    } else if (tid == 64 && need_nxt_ht) {
+      int nn = 0;
+      for (int j = 0; j < 5; ++j) {
+        for (int rp = 0; rp < tk; ++rp) {
+          const int32_t tok = s_top[j + 1][rp];
+          if (tok < 0) continue;
+          uint32_t h = hash256(tok);
+          int8_t u = s_ht_nxt[h];
+          while (u >= 0 && s_unxt_tok[u] != tok) {
+            h = (h + 1u) & 255u;
+            u = s_ht_nxt[h];
+          }
+          const uint64_t bit = 1ULL << (j * 8 + rp);
+          if (u < 0) {
+            u = static_cast<int8_t>(nn++);
+            s_ht_nxt[h] = u;
+            s_unxt_tok[u] = tok;
+            s_unxt_mask[u] = bit;
+            s_unxt_cnt[u] = 0u;
+          } else {
+            s_unxt_mask[u] |= bit;
+          }
+        }
+      }
+    } else if (tid == 96 && scan_bg) {
+      int ns = 0;
+      for (int j = 0; j < 5; ++j) {
+        for (int r = r_start_bg; r < tk; ++r) {
+          const int32_t tok = s_top[j][r];
+          if (tok < 0) continue;
+          uint32_t h = hash256(tok);
+          int8_t u = s_ht_src[h];
+          while (u >= 0 && s_usrc_tok[u] != tok) {
+            h = (h + 1u) & 255u;
+            u = s_ht_src[h];
+          }
+          const uint64_t bit = 1ULL << (j * 8 + r);
+          if (u < 0) {
+            u = static_cast<int8_t>(ns++);
+            s_ht_src[h] = u;
+            s_usrc_tok[u] = tok;
+            s_usrc_mask[u] = bit;
+            s_usrc_cnt[u] = 0u;
+            s_usrc_umin[u] = 2147483647;
+            s_usrc_umax[u] = -1;
+            s_usrc_uhp[u] = -1;
+          } else {
+            s_usrc_mask[u] |= bit;
+          }
+        }
+      }
     }
     __syncthreads();
 
-    uint32_t pl_k[6] = {0u, 0u, 0u, 0u, 0u, 0u};
-    uint32_t u1_c[6] = {0u, 0u, 0u, 0u, 0u, 0u};
-    uint32_t c_k[6][kMaxTreeK];
-#pragma unroll
-    for (int j = 0; j < 6; ++j) {
-#pragma unroll
-      for (int r = 0; r < kMaxTreeK; ++r) {
-        c_k[j][r] = 0u;
-      }
-    }
+    const int32_t a1 = s_ctx[16], a2 = s_ctx[17], a3 = s_ctx[18], a4 = s_ctx[19], a5 = s_ctx[20];
+    const int win_m1 = win - 1;
+    const int win_iters = (win_m1 + 255) & ~255;
+    for (int i = tid; i < win_iters; i += 256) {
+      const bool valid = (i < win_m1);
+      const int32_t h_i = valid ? s_h[i] : -1;
+      const int32_t nxt = valid ? s_h[i + 1] : -1;
+      const bool ok = valid && (nxt >= 0);
 
-    const int32_t anchors[6] = {s_ctx[15], s_ctx[16], s_ctx[17], s_ctx[18], s_ctx[19], s_ctx[20]};
-    for (int i = tid; i < win - 1; i += 256) {
-      const int32_t h_i = s_h[i];
-      const int32_t nxt = s_h[i + 1];
-      if (nxt < 0) continue;
       if (scan_anc) {
-#pragma unroll
-        for (int j = 0; j < 6; ++j) {
-          if (h_i == anchors[j]) {
-            ++u1_c[j];
+        int ua_i = -1;
+        if (ok) {
+          uint32_t ha = hash64(h_i);
+          int8_t ua = s_ht_anc[ha];
+          while (ua >= 0 && s_uanc_tok[ua] != h_i) {
+            ha = (ha + 1u) & 63u;
+            ua = s_ht_anc[ha];
+          }
+          ua_i = static_cast<int>(ua);
+        }
+        if (__any_sync(0xffffffffu, ua_i >= 0)) {
+        const uint32_t eq_a = __match_any_sync(0xffffffffu, ua_i);
+        if (ua_i >= 0) {
+          uint32_t jm = static_cast<uint32_t>(s_uanc_mask[ua_i]);
+          if (lane == (__ffs(eq_a) - 1)) {
+            const uint32_t add_n = static_cast<uint32_t>(__popc(eq_a));
+            uint32_t jm0 = jm;
+            while (jm0) {
+              const int j0 = __ffs(jm0) - 1;
+              jm0 &= jm0 - 1u;
+              atomicAdd(&s_anc_u1_cnt[j0], add_n);
+            }
+          }
+          while (jm) {
+            const int j = __ffs(jm) - 1;
+            jm &= jm - 1u;
             if (j < 5 && ac.skip_root_bg > 0.0f && nxt == s_ctx[16 + j + 1]) {
               s_skip_bg[j] = 1u;
             }
@@ -1026,95 +1158,123 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             if (tr.mode != 0 || tr.det_sh_root != 0) {
               if (ml >= 2) {
                 atomicAdd(&s_anc_bg2_cnt[j], 1u);
-                atomicMin(&s_anc_bg2_min[j], nxt);
-                atomicMax(&s_anc_bg2_max[j], nxt);
-                atomicMax(&s_anc_bg2_hp[j], i + 1);
+                if (nxt < s_anc_bg2_min[j]) atomicMin(&s_anc_bg2_min[j], nxt);
+                if (nxt > s_anc_bg2_max[j]) atomicMax(&s_anc_bg2_max[j], nxt);
+                if (i + 1 > s_anc_bg2_hp[j]) atomicMax(&s_anc_bg2_hp[j], i + 1);
               }
               if (ml >= 3) {
                 atomicAdd(&s_anc_tri3_cnt[j], 1u);
-                atomicMin(&s_anc_tri3_min[j], nxt);
-                atomicMax(&s_anc_tri3_max[j], nxt);
-                atomicMax(&s_anc_tri3_hp[j], i + 1);
+                if (nxt < s_anc_tri3_min[j]) atomicMin(&s_anc_tri3_min[j], nxt);
+                if (nxt > s_anc_tri3_max[j]) atomicMax(&s_anc_tri3_max[j], nxt);
+                if (i + 1 > s_anc_tri3_hp[j]) atomicMax(&s_anc_tri3_hp[j], i + 1);
               }
             }
             if (pl.mode != 0) {
               const uint32_t key = (static_cast<uint32_t>(ml) << 16) | static_cast<uint32_t>(i);
-              if (nxt != s_ctx[16 + j] && key > pl_k[j]) {
-                pl_k[j] = key;
+              if (nxt != s_ctx[16 + j] && key > s_pl_key[j]) {
+                atomicMax(&s_pl_key[j], key);
               }
-#pragma unroll
-              for (int r = 0; r < kMaxTreeK; ++r) {
-                if (r < tk && nxt == s_top[j][r] && key > c_k[j][r]) {
-                  c_k[j][r] = key;
+#pragma unroll 1
+              for (int r = 0; r < tk; ++r) {
+                if (nxt == s_top[j][r] && key > s_cand_key[j][r]) {
+                  atomicMax(&s_cand_key[j][r], key);
                 }
               }
             }
           }
+        }
         }
       }
+
       if (scan_bg) {
-        if (ac.ac_mode != 0) {
-#pragma unroll
-          for (int j = 0; j < 5; ++j) {
-#pragma unroll
-            for (int rp = 0; rp < kMaxTreeK; ++rp) {
-              if (rp < tk && nxt == s_top[j + 1][rp]) {
-                atomicAdd(&s_in_cnt[j][rp], 1u);
+        int u_nxt = -1;
+        if (need_nxt_ht && ok) {
+          uint32_t hn = hash256(nxt);
+          int8_t un = s_ht_nxt[hn];
+          while (un >= 0 && s_unxt_tok[un] != nxt) {
+            hn = (hn + 1u) & 255u;
+            un = s_ht_nxt[hn];
+          }
+          u_nxt = static_cast<int>(un);
+        }
+        if (ac.ac_mode != 0 && __any_sync(0xffffffffu, u_nxt >= 0)) {
+          const uint32_t eq_n = __match_any_sync(0xffffffffu, u_nxt);
+          if (u_nxt >= 0 && lane == (__ffs(eq_n) - 1)) {
+            atomicAdd(&s_unxt_cnt[u_nxt], static_cast<uint32_t>(__popc(eq_n)));
+          }
+        }
+
+        int u_src = -1;
+        if (ok && h_i >= 0) {
+          uint32_t hs = hash256(h_i);
+          int8_t us = s_ht_src[hs];
+          while (us >= 0 && s_usrc_tok[us] != h_i) {
+            hs = (hs + 1u) & 255u;
+            us = s_ht_src[hs];
+          }
+          u_src = static_cast<int>(us);
+        }
+        if (__any_sync(0xffffffffu, u_src >= 0)) {
+        const uint32_t eq_s = __match_any_sync(0xffffffffu, u_src);
+        if (u_src >= 0) {
+          if (lane == (__ffs(eq_s) - 1)) {
+            atomicAdd(&s_usrc_cnt[u_src], static_cast<uint32_t>(__popc(eq_s)));
+          }
+          if (bg.uniq_mode != 0) {
+            if (nxt < s_usrc_umin[u_src]) atomicMin(&s_usrc_umin[u_src], nxt);
+            if (nxt > s_usrc_umax[u_src]) atomicMax(&s_usrc_umax[u_src], nxt);
+            if (i + 1 > s_usrc_uhp[u_src]) atomicMax(&s_usrc_uhp[u_src], i + 1);
+          }
+          const uint64_t smask = s_usrc_mask[u_src];
+          if (bg.shf_cal != 0 &&
+              (nxt == a1 || nxt == a2 || nxt == a3 || nxt == a4 || nxt == a5)) {
+            uint64_t m = smask;
+            while (m) {
+              const int bit = __ffsll(m) - 1;
+              m &= m - 1ULL;
+              const int j = bit >> 3;
+              const int r = bit & 7;
+              if (r >= 1 && nxt == s_ctx[16 + j]) {
+                s_shf_bg[j][r - 1] = 1u;
+              }
+            }
+          }
+          if (need_nxt_ht && u_nxt >= 0) {
+            const uint64_t nmask = s_unxt_mask[u_nxt];
+            uint64_t m = smask;
+            while (m) {
+              const int bit = __ffsll(m) - 1;
+              m &= m - 1ULL;
+              const int j = bit >> 3;
+              const int r = bit & 7;
+              uint32_t rpm = static_cast<uint32_t>((nmask >> (j * 8)) & 0xFFu);
+              if (rpm == 0u) continue;
+              int ml_b = 1;
+              if (i >= 1 && s_h[i - 1] == s_ctx[15 + j]) {
+                ml_b = 2;
+                while (ml_b < 16 && i - ml_b >= 0 &&
+                       s_h[i - ml_b] == s_ctx[15 + j - (ml_b - 1)]) {
+                  ++ml_b;
+                }
+              }
+              if (ml_b >= 2) {
+                atomicOr(&s_bg3_mask[j][r], rpm);
+              }
+              const uint32_t kv = (static_cast<uint32_t>(ml_b) << 16) | static_cast<uint32_t>(i + 1);
+              while (rpm) {
+                const int rp = __ffs(rpm) - 1;
+                rpm &= rpm - 1u;
+                atomicAdd(&s_bg_cnt[j][r][rp], 1u);
+                if (kv > s_bg_key[j][r][rp]) atomicMax(&s_bg_key[j][r][rp], kv);
               }
             }
           }
         }
-        const int r_start = (ac.ac_mode != 0 || (bg.bg_sub != 0 && bg.bg_mode != 0)) ? 0 : 1;
-#pragma unroll
-        for (int j = 0; j < 5; ++j) {
-          const int32_t anc_j = anchors[j];
-          const int32_t dk_j = s_ctx[16 + j];
-          for (int r = r_start; r < tk; ++r) {
-            const int32_t tok_r = s_top[j][r];
-            if (tok_r >= 0 && h_i == tok_r) {
-              atomicAdd(&s_alt_cnt[j][r], 1u);
-              if (r >= 1) {
-                if (bg.uniq_mode != 0) {
-                  atomicMin(&s_uniq_min[j][r - 1], nxt);
-                  atomicMax(&s_uniq_max[j][r - 1], nxt);
-                  atomicMax(&s_uniq_hp[j][r - 1], i + 1);
-                }
-                if (bg.shf_cal != 0 && nxt == dk_j) {
-                  s_shf_bg[j][r - 1] = 1u;
-                }
-              }
-              if (bg.bg_mode != 0 || ac.ac_mode != 0) {
-                bool tri_checked = false;
-                int ml_b = 1;
-#pragma unroll
-                for (int rp = 0; rp < kMaxTreeK; ++rp) {
-                  if (rp < tk && nxt == s_top[j + 1][rp]) {
-                    atomicAdd(&s_bg_cnt[j][r][rp], 1u);
-                    if (!tri_checked) {
-                      tri_checked = true;
-                      if (i >= 1 && s_h[i - 1] == anc_j) {
-                        ml_b = 2;
-                        while (ml_b < 16 && i - ml_b >= 0 &&
-                               s_h[i - ml_b] == s_ctx[15 + j - (ml_b - 1)]) {
-                          ++ml_b;
-                        }
-                      }
-                    }
-                    if (ml_b >= 2) {
-                      atomicOr(&s_bg3_mask[j][r], 1u << rp);
-                    }
-                    const uint32_t kv = (static_cast<uint32_t>(ml_b) << 16) | static_cast<uint32_t>(i + 1);
-                    atomicMax(&s_bg_key[j][r][rp], kv);
-                  }
-                }
-              }
-            }
-          }
         }
       }
     }
 
-    // Pass 2b: warp-0 deterministic (__ballot_sync + __popc, zero atomicAdd) anti-echo compaction of active 30B recycle log entries into SMEM.
+    // Pass 2b: warp-0 deterministic (__ballot_sync + __popc) compaction of active 30B recycle log + 512-bit Bloom.
     if (warp == 0 && tr.mode != 0 && tr_log != nullptr && tr_state != nullptr && tr_cap > 0) {
       int n_log = tr_state[0];
       if (n_log > tr_cap) n_log = tr_cap;
@@ -1136,12 +1296,17 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         const uint32_t msk = __ballot_sync(0xffffffffu, keep);
         const int dst = out_n + __popc(msk & lane_lt);
         if (keep && dst < kTrActiveCap) {
-          s_tr_cur[dst] = tr_log[base8 + 1];
+          const int32_t tc = tr_log[base8 + 1];
+          s_tr_cur[dst] = tc;
           s_tr_p1[dst] = tr_log[base8 + 2];
           s_tr_p2[dst] = tr_log[base8 + 3];
           s_tr_u[dst] = u_val;
           s_tr_st[dst] = st_t;
           s_tr_pos_tier[dst] = (tr_log[base8 + 6] << 1) | (tier_t & 1);
+          if (tc >= 0) {
+            const uint32_t hb = (static_cast<uint32_t>(tc) * 0x9E3779B1u) >> 23;
+            atomicOr(&s_tr_bloom[hb >> 5], 1u << (hb & 31u));
+          }
         }
         out_n += __popc(msk);
       }
@@ -1150,39 +1315,45 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       }
     }
 
-#pragma unroll
-    for (int j = 0; j < 6; ++j) {
-      const uint32_t wm = __reduce_max_sync(0xffffffffu, pl_k[j]);
-      const uint32_t wu = __reduce_add_sync(0xffffffffu, u1_c[j]);
-      if (lane == 0) {
-        s_w_pl_key[warp][j] = wm;
-        if (wu > 0u) atomicAdd(&s_anc_u1_cnt[j], wu);
-      }
-#pragma unroll
-      for (int r = 0; r < kMaxTreeK; ++r) {
-        const uint32_t cwm = __reduce_max_sync(0xffffffffu, c_k[j][r]);
-        if (lane == 0) s_w_cand_key[warp][j][r] = cwm;
-      }
-    }
     __syncthreads();
 
-    if (warp == 0) {
-      if (lane == 0 && s_tr_active_n > kTrActiveCap) {
-        s_tr_active_n = kTrActiveCap;
-      }
-      if (lane < 8) {
-#pragma unroll
-        for (int j = 0; j < 6; ++j) {
-          const uint32_t fm = __reduce_max_sync(0xffu, s_w_pl_key[lane][j]);
-          if (lane == 0) s_pl_key[j] = fm;
-#pragma unroll
-          for (int r = 0; r < kMaxTreeK; ++r) {
-            const uint32_t cfm = __reduce_max_sync(0xffu, s_w_cand_key[lane][j][r]);
-            if (lane == 0) s_cand_key[j][r] = cfm;
+    if (warp == 6 && scan_bg) {
+      // Scatter deduplicated unique-token aggregates back to s_in_cnt / s_alt_cnt / s_uniq_* in parallel.
+      for (int idx = lane; idx < 5 * tk; idx += 32) {
+        const int j = idx / tk;
+        const int r = idx - j * tk;
+        if (ac.ac_mode != 0) {
+          const int32_t nt = s_top[j + 1][r];
+          if (nt >= 0) {
+            uint32_t hn = hash256(nt);
+            int8_t un = s_ht_nxt[hn];
+            while (un >= 0 && s_unxt_tok[un] != nt) {
+              hn = (hn + 1u) & 255u;
+              un = s_ht_nxt[hn];
+            }
+            if (un >= 0) s_in_cnt[j][r] = s_unxt_cnt[un];
+          }
+        }
+        if (r >= r_start_bg) {
+          const int32_t st_tok = s_top[j][r];
+          if (st_tok >= 0) {
+            uint32_t hs = hash256(st_tok);
+            int8_t us = s_ht_src[hs];
+            while (us >= 0 && s_usrc_tok[us] != st_tok) {
+              hs = (hs + 1u) & 255u;
+              us = s_ht_src[hs];
+            }
+            if (us >= 0) {
+              s_alt_cnt[j][r] = s_usrc_cnt[us];
+              if (r >= 1 && bg.uniq_mode != 0) {
+                s_uniq_min[j][r - 1] = s_usrc_umin[us];
+                s_uniq_max[j][r - 1] = s_usrc_umax[us];
+                s_uniq_hp[j][r - 1] = s_usrc_uhp[us];
+              }
+            }
           }
         }
       }
-      __syncwarp();
     }
   } else {
     if (warp == 0) {
@@ -1197,6 +1368,165 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     }
   }
 
+  // Pass 2c: 6-warp parallel hardware Redux reduction of 30B Target Recycling features across anchors j=0..5
+  // (runs in parallel with warp 6's scatter above; one __syncthreads() publishes all results to warp 0).
+  if (warp < 6 && calib_mode != 0 && tr.mode != 0 && s_hist_ok != 0 && s_tr_active_n > 0) {
+    const int n_act = s_tr_active_n;
+    const int cur_st = s_tr_cur_step;
+    const int p0_i32 = static_cast<int>(positions[0]);
+    const int j = warp;
+    if (s_valid_row[j]) {
+      const int32_t cur = s_ctx[15 + j];
+      if (tr_bloom_has(cur)) {
+        const int32_t prv1 = s_ctx[14 + j];
+        const int32_t prv2 = s_ctx[13 + j];
+        const int pos_j = p0_i32 + j;
+
+        int u_cnt = 0, u_min = 2147483647, u_max = -1;
+        int bg_c = 0, bg_t0_c = 0, bg_min = 2147483647, bg_max = -1;
+        int tri_c = 0, tri_min = 2147483647, tri_max = -1;
+        int near_c = 0, near_min = 2147483647, near_max = -1;
+        int a1_pos_c = 0, a1_pos_min = 2147483647, a1_pos_max = -1;
+        int a1_bg_c = 0, a1_bg_min = 2147483647, a1_bg_max = -1;
+        int tot_a1 = 0, a1_v1 = 0, a1_v2 = 0, a1_v3 = 0, a1_v4 = 0, a1_v5 = 0, a1_v6 = 0, a1_v7 = 0;
+        const int32_t t1 = s_top[j][1], t2 = s_top[j][2], t3 = s_top[j][3], t4 = s_top[j][4];
+        const int32_t t5 = s_top[j][5], t6 = s_top[j][6], t7 = s_top[j][7];
+
+        for (int idx = lane; idx < n_act; idx += 32) {
+          if (s_tr_cur[idx] != cur) continue;
+          const int32_t u_t = s_tr_u[idx];
+          const int32_t p1_t = s_tr_p1[idx];
+          const int32_t p2_t = s_tr_p2[idx];
+          const int age = cur_st - s_tr_st[idx];
+          const int pt = s_tr_pos_tier[idx];
+          const int pos_t = pt >> 1;
+          const int tier_t = pt & 1;
+          const int dist = (pos_j >= pos_t) ? (pos_j - pos_t) : (pos_t - pos_j);
+
+          u_cnt += 1;
+          if (u_t < u_min) u_min = u_t;
+          if (u_t > u_max) u_max = u_t;
+
+          if (age == 1 && dist <= 8) {
+            const int w = (tier_t == 0) ? 2 : 1;
+            tot_a1 += w;
+            if (u_t == t1) a1_v1 += w;
+            if (u_t == t2) a1_v2 += w;
+            if (u_t == t3) a1_v3 += w;
+            if (u_t == t4) a1_v4 += w;
+            if (u_t == t5) a1_v5 += w;
+            if (u_t == t6) a1_v6 += w;
+            if (u_t == t7) a1_v7 += w;
+          }
+          if (age == 1 && dist <= 3 && u_t != cur) {
+            a1_pos_c += 1;
+            if (u_t < a1_pos_min) a1_pos_min = u_t;
+            if (u_t > a1_pos_max) a1_pos_max = u_t;
+            if (prv1 >= 0 && p1_t == prv1) {
+              a1_bg_c += 1;
+              if (u_t < a1_bg_min) a1_bg_min = u_t;
+              if (u_t > a1_bg_max) a1_bg_max = u_t;
+            }
+          }
+          if (age <= 2 && dist <= 12) {
+            near_c += 1;
+            if (u_t < near_min) near_min = u_t;
+            if (u_t > near_max) near_max = u_t;
+          }
+          if (prv1 >= 0 && p1_t == prv1) {
+            bg_c += 1;
+            if (tier_t == 0) bg_t0_c += 1;
+            if (u_t < bg_min) bg_min = u_t;
+            if (u_t > bg_max) bg_max = u_t;
+            if (prv2 >= 0 && p2_t == prv2) {
+              tri_c += 1;
+              if (u_t < tri_min) tri_min = u_t;
+              if (u_t > tri_max) tri_max = u_t;
+            }
+          }
+        }
+
+        u_cnt = __reduce_add_sync(0xffffffffu, u_cnt);
+        if (u_cnt > 0) {
+          u_min = __reduce_min_sync(0xffffffffu, u_min);
+          u_max = __reduce_max_sync(0xffffffffu, u_max);
+          bg_c = __reduce_add_sync(0xffffffffu, bg_c);
+          bg_t0_c = __reduce_add_sync(0xffffffffu, bg_t0_c);
+          bg_min = __reduce_min_sync(0xffffffffu, bg_min);
+          bg_max = __reduce_max_sync(0xffffffffu, bg_max);
+          tri_c = __reduce_add_sync(0xffffffffu, tri_c);
+          tri_min = __reduce_min_sync(0xffffffffu, tri_min);
+          tri_max = __reduce_max_sync(0xffffffffu, tri_max);
+          near_c = __reduce_add_sync(0xffffffffu, near_c);
+          near_min = __reduce_min_sync(0xffffffffu, near_min);
+          near_max = __reduce_max_sync(0xffffffffu, near_max);
+          a1_pos_c = __reduce_add_sync(0xffffffffu, a1_pos_c);
+          a1_pos_min = __reduce_min_sync(0xffffffffu, a1_pos_min);
+          a1_pos_max = __reduce_max_sync(0xffffffffu, a1_pos_max);
+          a1_bg_c = __reduce_add_sync(0xffffffffu, a1_bg_c);
+          a1_bg_min = __reduce_min_sync(0xffffffffu, a1_bg_min);
+          a1_bg_max = __reduce_max_sync(0xffffffffu, a1_bg_max);
+          tot_a1 = __reduce_add_sync(0xffffffffu, tot_a1);
+          a1_v1 = __reduce_add_sync(0xffffffffu, a1_v1);
+          a1_v2 = __reduce_add_sync(0xffffffffu, a1_v2);
+          a1_v3 = __reduce_add_sync(0xffffffffu, a1_v3);
+          a1_v4 = __reduce_add_sync(0xffffffffu, a1_v4);
+          a1_v5 = __reduce_add_sync(0xffffffffu, a1_v5);
+          a1_v6 = __reduce_add_sync(0xffffffffu, a1_v6);
+          a1_v7 = __reduce_add_sync(0xffffffffu, a1_v7);
+
+          if (lane == 0) {
+            const uint32_t anc_u1 = s_anc_u1_cnt[j];
+            const int32_t dk0 = s_top[j][0];
+            if (dk0 >= 0) {
+              float b0 = 0.0f;
+              if (tri_c >= 1 && tri_min == tri_max && tri_min == dk0 && tr.b_d1_tri > b0) b0 = tr.b_d1_tri;
+              if (bg_t0_c >= 1 && bg_min == bg_max && bg_min == dk0 && tr.b_d1_bg > b0) b0 = tr.b_d1_bg;
+              s_tr_b_rk[j][0] = b0;
+            }
+#pragma unroll 1
+            for (int rk = 1; rk < kMaxTreeK; ++rk) {
+              if (rk < tk) {
+                const int32_t cand = s_top[j][rk];
+                if (cand >= 0) {
+                  const int a1_vr = (rk == 1) ? a1_v1 : ((rk == 2) ? a1_v2 : ((rk == 3) ? a1_v3 :
+                                    ((rk == 4) ? a1_v4 : ((rk == 5) ? a1_v5 : ((rk == 6) ? a1_v6 : a1_v7)))));
+                  float b = 0.0f;
+                  if (tri_c >= 1 && tri_min == tri_max && tri_min == cand && tr.b_t6_tri > b) b = tr.b_t6_tri;
+                  if (bg_c >= 1 && bg_min == bg_max && bg_min == cand && tr.b_t6_bg > b) b = tr.b_t6_bg;
+                  if (near_c >= 1 && near_min == near_max && near_min == cand && u_min == u_max && anc_u1 <= 3u) {
+                    if (tr.b_t6_near > b) b = tr.b_t6_near;
+                  } else if (tot_a1 >= 2 && a1_vr * 3 >= tot_a1 * 2 && anc_u1 <= 3u) {
+                    if (tr.b_t6_near > b) b = tr.b_t6_near;
+                  }
+                  s_tr_b_rk[j][rk] = b;
+                }
+              }
+            }
+            const int32_t dk32 = static_cast<int32_t>(s_dk[j]);
+            if (tri_c >= 2 && tri_min == tri_max && tri_min != dk32 && tr.oov_tri_p > 0.0f) {
+              s_tr_oov_tok[j] = tri_min;
+              s_tr_oov_w[j] = tr.oov_tri_p;
+            } else if (a1_bg_c >= 1 && a1_bg_min == a1_bg_max && a1_bg_min != dk32 &&
+                       s_anc_bg2_cnt[j] == 0u && tr.oov_a1_bg_p > 0.0f) {
+              s_tr_oov_tok[j] = a1_bg_min;
+              s_tr_oov_w[j] = tr.oov_a1_bg_p;
+            } else if (a1_pos_c >= 2 && a1_pos_min == a1_pos_max && a1_pos_min != dk32 &&
+                       anc_u1 <= 4u && tr.oov_a1_pos2_p > 0.0f) {
+              s_tr_oov_tok[j] = a1_pos_min;
+              s_tr_oov_w[j] = tr.oov_a1_pos2_p;
+            } else if (near_c >= 1 && near_min == near_max && u_min == u_max && anc_u1 == 0u &&
+                       near_min != cur && near_min != dk32 && tr.oov_fresh_p > 0.0f) {
+              s_tr_oov_tok[j] = near_min;
+              s_tr_oov_w[j] = tr.oov_fresh_p;
+            }
+          }
+        }
+      }
+    }
+  }
+  __syncthreads();
+
   const bool pl_w32 = (tree_m > 16 && pl.m32_wide != 0);
   const bool tr_w32 = (tree_m > 16 && tr.m32_wide != 0);
   auto cand_lh = [&](int k_pos, int hpos_v, int ml_v) -> float {
@@ -1209,161 +1539,6 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   };
 
   if (warp == 0) {
-  // Pass 2c (warp 0): hardware Redux reduction of 30B Target Recycling features across anchors j=0..5 (~0.5 us).
-  if (calib_mode != 0 && tr.mode != 0 && s_hist_ok != 0 && s_tr_active_n > 0) {
-    const int n_act = s_tr_active_n;
-    const int cur_st = s_tr_cur_step;
-    const int p0_i32 = static_cast<int>(positions[0]);
-    for (int j = 0; j < 6; ++j) {
-      if (!s_valid_row[j]) continue;
-      const int32_t cur = s_ctx[15 + j];
-      const int32_t prv1 = s_ctx[14 + j];
-      const int32_t prv2 = s_ctx[13 + j];
-      const int pos_j = p0_i32 + j;
-
-      int u_cnt = 0, u_min = 2147483647, u_max = -1;
-      int bg_c = 0, bg_t0_c = 0, bg_min = 2147483647, bg_max = -1;
-      int tri_c = 0, tri_min = 2147483647, tri_max = -1;
-      int near_c = 0, near_min = 2147483647, near_max = -1;
-      int a1_pos_c = 0, a1_pos_min = 2147483647, a1_pos_max = -1;
-      int a1_bg_c = 0, a1_bg_min = 2147483647, a1_bg_max = -1;
-      int tot_a1 = 0, a1_v1 = 0, a1_v2 = 0, a1_v3 = 0, a1_v4 = 0, a1_v5 = 0, a1_v6 = 0, a1_v7 = 0;
-      const int32_t t1 = s_top[j][1], t2 = s_top[j][2], t3 = s_top[j][3], t4 = s_top[j][4];
-      const int32_t t5 = s_top[j][5], t6 = s_top[j][6], t7 = s_top[j][7];
-
-      for (int idx = lane; idx < n_act; idx += 32) {
-        if (s_tr_cur[idx] != cur) continue;
-        const int32_t u_t = s_tr_u[idx];
-        const int32_t p1_t = s_tr_p1[idx];
-        const int32_t p2_t = s_tr_p2[idx];
-        const int age = cur_st - s_tr_st[idx];
-        const int pt = s_tr_pos_tier[idx];
-        const int pos_t = pt >> 1;
-        const int tier_t = pt & 1;
-        const int dist = (pos_j >= pos_t) ? (pos_j - pos_t) : (pos_t - pos_j);
-
-        u_cnt += 1;
-        if (u_t < u_min) u_min = u_t;
-        if (u_t > u_max) u_max = u_t;
-
-        if (age == 1 && dist <= 8) {
-          const int w = (tier_t == 0) ? 2 : 1;
-          tot_a1 += w;
-          if (u_t == t1) a1_v1 += w;
-          if (u_t == t2) a1_v2 += w;
-          if (u_t == t3) a1_v3 += w;
-          if (u_t == t4) a1_v4 += w;
-          if (u_t == t5) a1_v5 += w;
-          if (u_t == t6) a1_v6 += w;
-          if (u_t == t7) a1_v7 += w;
-        }
-        if (age == 1 && dist <= 3 && u_t != cur) {
-          a1_pos_c += 1;
-          if (u_t < a1_pos_min) a1_pos_min = u_t;
-          if (u_t > a1_pos_max) a1_pos_max = u_t;
-          if (prv1 >= 0 && p1_t == prv1) {
-            a1_bg_c += 1;
-            if (u_t < a1_bg_min) a1_bg_min = u_t;
-            if (u_t > a1_bg_max) a1_bg_max = u_t;
-          }
-        }
-        if (age <= 2 && dist <= 12) {
-          near_c += 1;
-          if (u_t < near_min) near_min = u_t;
-          if (u_t > near_max) near_max = u_t;
-        }
-        if (prv1 >= 0 && p1_t == prv1) {
-          bg_c += 1;
-          if (tier_t == 0) bg_t0_c += 1;
-          if (u_t < bg_min) bg_min = u_t;
-          if (u_t > bg_max) bg_max = u_t;
-          if (prv2 >= 0 && p2_t == prv2) {
-            tri_c += 1;
-            if (u_t < tri_min) tri_min = u_t;
-            if (u_t > tri_max) tri_max = u_t;
-          }
-        }
-      }
-
-      u_cnt = __reduce_add_sync(0xffffffffu, u_cnt);
-      if (u_cnt > 0) {
-        u_min = __reduce_min_sync(0xffffffffu, u_min);
-        u_max = __reduce_max_sync(0xffffffffu, u_max);
-        bg_c = __reduce_add_sync(0xffffffffu, bg_c);
-        bg_t0_c = __reduce_add_sync(0xffffffffu, bg_t0_c);
-        bg_min = __reduce_min_sync(0xffffffffu, bg_min);
-        bg_max = __reduce_max_sync(0xffffffffu, bg_max);
-        tri_c = __reduce_add_sync(0xffffffffu, tri_c);
-        tri_min = __reduce_min_sync(0xffffffffu, tri_min);
-        tri_max = __reduce_max_sync(0xffffffffu, tri_max);
-        near_c = __reduce_add_sync(0xffffffffu, near_c);
-        near_min = __reduce_min_sync(0xffffffffu, near_min);
-        near_max = __reduce_max_sync(0xffffffffu, near_max);
-        a1_pos_c = __reduce_add_sync(0xffffffffu, a1_pos_c);
-        a1_pos_min = __reduce_min_sync(0xffffffffu, a1_pos_min);
-        a1_pos_max = __reduce_max_sync(0xffffffffu, a1_pos_max);
-        a1_bg_c = __reduce_add_sync(0xffffffffu, a1_bg_c);
-        a1_bg_min = __reduce_min_sync(0xffffffffu, a1_bg_min);
-        a1_bg_max = __reduce_max_sync(0xffffffffu, a1_bg_max);
-        tot_a1 = __reduce_add_sync(0xffffffffu, tot_a1);
-        a1_v1 = __reduce_add_sync(0xffffffffu, a1_v1);
-        a1_v2 = __reduce_add_sync(0xffffffffu, a1_v2);
-        a1_v3 = __reduce_add_sync(0xffffffffu, a1_v3);
-        a1_v4 = __reduce_add_sync(0xffffffffu, a1_v4);
-        a1_v5 = __reduce_add_sync(0xffffffffu, a1_v5);
-        a1_v6 = __reduce_add_sync(0xffffffffu, a1_v6);
-        a1_v7 = __reduce_add_sync(0xffffffffu, a1_v7);
-
-        if (lane == 0) {
-          const uint32_t anc_u1 = s_anc_u1_cnt[j];
-          const int32_t dk0 = s_top[j][0];
-          if (dk0 >= 0) {
-            float b0 = 0.0f;
-            if (tri_c >= 1 && tri_min == tri_max && tri_min == dk0 && tr.b_d1_tri > b0) b0 = tr.b_d1_tri;
-            if (bg_t0_c >= 1 && bg_min == bg_max && bg_min == dk0 && tr.b_d1_bg > b0) b0 = tr.b_d1_bg;
-            s_tr_b_rk[j][0] = b0;
-          }
-#pragma unroll
-          for (int rk = 1; rk < kMaxTreeK; ++rk) {
-            if (rk < tk) {
-              const int32_t cand = s_top[j][rk];
-              if (cand >= 0) {
-                const int a1_vr = (rk == 1) ? a1_v1 : ((rk == 2) ? a1_v2 : ((rk == 3) ? a1_v3 :
-                                  ((rk == 4) ? a1_v4 : ((rk == 5) ? a1_v5 : ((rk == 6) ? a1_v6 : a1_v7)))));
-                float b = 0.0f;
-                if (tri_c >= 1 && tri_min == tri_max && tri_min == cand && tr.b_t6_tri > b) b = tr.b_t6_tri;
-                if (bg_c >= 1 && bg_min == bg_max && bg_min == cand && tr.b_t6_bg > b) b = tr.b_t6_bg;
-                if (near_c >= 1 && near_min == near_max && near_min == cand && u_min == u_max && anc_u1 <= 3u) {
-                  if (tr.b_t6_near > b) b = tr.b_t6_near;
-                } else if (tot_a1 >= 2 && a1_vr * 3 >= tot_a1 * 2 && anc_u1 <= 3u) {
-                  if (tr.b_t6_near > b) b = tr.b_t6_near;
-                }
-                s_tr_b_rk[j][rk] = b;
-              }
-            }
-          }
-          const int32_t dk32 = static_cast<int32_t>(s_dk[j]);
-          if (tri_c >= 2 && tri_min == tri_max && tri_min != dk32 && tr.oov_tri_p > 0.0f) {
-            s_tr_oov_tok[j] = tri_min;
-            s_tr_oov_w[j] = tr.oov_tri_p;
-          } else if (a1_bg_c >= 1 && a1_bg_min == a1_bg_max && a1_bg_min != dk32 &&
-                     s_anc_bg2_cnt[j] == 0u && tr.oov_a1_bg_p > 0.0f) {
-            s_tr_oov_tok[j] = a1_bg_min;
-            s_tr_oov_w[j] = tr.oov_a1_bg_p;
-          } else if (a1_pos_c >= 2 && a1_pos_min == a1_pos_max && a1_pos_min != dk32 &&
-                     anc_u1 <= 4u && tr.oov_a1_pos2_p > 0.0f) {
-            s_tr_oov_tok[j] = a1_pos_min;
-            s_tr_oov_w[j] = tr.oov_a1_pos2_p;
-          } else if (near_c >= 1 && near_min == near_max && u_min == u_max && anc_u1 == 0u &&
-                     near_min != cur && near_min != dk32 && tr.oov_fresh_p > 0.0f) {
-            s_tr_oov_tok[j] = near_min;
-            s_tr_oov_w[j] = tr.oov_fresh_p;
-          }
-        }
-      }
-    }
-    __syncwarp();
-  }
 
   // Pass 3 (warp 0 only): calibrated probabilities + online Empirical-Bayes + DDTree (0 stack spill).
   if (tid < 6) {
@@ -1387,7 +1562,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         const float a_pre = a_base + ck.w_sm_pre * sm_c + ck.w_z0_pre * z0_c;
         const float a_post = a_base + ck.a2 + ck.w_z0_post * z0_c;
         float den0 = 1.0f, den1 = 1.0f;
-#pragma unroll
+#pragma unroll 1
         for (int rk = 0; rk < kMaxTreeK; ++rk) {
           float v0 = 0.0f;
           float v1 = 0.0f;
@@ -1417,9 +1592,31 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           den0 += v0;
           den1 += v1;
         }
+        if (tk_ext > 8) {
+          for (int rk = 8; rk < tk_ext; ++rk) {
+            const int64_t tok_r = tree_top[base + rk];
+            const float zr = tree_vals[base + rk];
+            float v0 = 0.0f;
+            if (tok_r >= 0 && zr > -1e20f) {
+              const float dz = zr - z0;
+              const float c_rk = kCalC[7] - ck.c_tail_step * static_cast<float>(rk - 7);
+              v0 = __expf(a_pre + c_rk + ck.beta * dz);
+            }
+            s_pr_ext[tid][rk - 8] = v0;
+            den0 += v0;
+          }
+          for (int rk = tk_ext; rk < 16; ++rk) {
+            s_pr_ext[tid][rk - 8] = 0.0f;
+          }
+        }
 #pragma unroll
         for (int rk = 0; rk < kMaxTreeK; ++rk) {
           s_pr[tid][rk] = s_e0[tid][rk] / den0;
+        }
+        if (tk_ext > 8) {
+          for (int rk = 0; rk < 8; ++rk) {
+            s_pr_ext[tid][rk] /= den0;
+          }
         }
         s_den1[tid] = den1;
         s_p1post[tid] = s_e1[tid][0] / den1;
@@ -1430,7 +1627,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       } else {
         float sum_e = 1.0f;
         float last_e = 0.0f;
-#pragma unroll
+#pragma unroll 1
         for (int rk = 1; rk < kMaxTreeK; ++rk) {
           if (rk < tk) {
             const int64_t tok_r = tree_top[base + rk];
@@ -1532,6 +1729,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __syncwarp();
 
   const int num_1lvl = 6 * (tk - 1);
+  const int num_ext = (tk_ext > 8) ? (6 * (tk_ext - 8)) : 0;
   if (tid == 0) {
     float a = 1.0f;
     for (int j = 0; j < 6; ++j) {
@@ -1543,7 +1741,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       }
     }
     s_any_active = 0;
-    s_num_cands = num_1lvl;
+    s_num_cands = num_1lvl + num_ext;
   }
   __syncwarp();
 
@@ -1601,6 +1799,48 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         s_cand_depth[ci] = 1;
         s_cand_kind[ci] = 0;
         s_cand_rk[ci] = static_cast<int8_t>(rank);
+      }
+    }
+  }
+  if (num_ext > 0) {
+    const int ext_k = tk_ext - 8;
+    for (int ei = tid; ei < num_ext; ei += 32) {
+      const int row_idx = ei / ext_k;
+      const int er = ei - row_idx * ext_k;
+      const int rank = 8 + er;
+      const int ci = num_1lvl + ei;
+      if (s_valid_row[row_idx] && s_A[row_idx] > 0.0f) {
+        const int base = row_idx * tree_k;
+        const int64_t cand = tree_top[base + rank];
+        const float zr = tree_vals[base + rank];
+        const int64_t dk = s_dk[row_idx];
+        bool ok = (cand >= 0 && cand != dk && zr > -1e20f);
+        if (ok) {
+          for (int pr = 1; pr < rank; ++pr) {
+            if (tree_top[base + pr] == cand) {
+              ok = false;
+              break;
+            }
+          }
+        }
+        if (ok) {
+          const float pr = (calib_mode != 0)
+              ? s_pr_ext[row_idx][er]
+              : (eff_gamma * __expf((zr - s_z0[row_idx]) * inv_temp) / s_Z[row_idx]);
+          const float cprob = s_A[row_idx] * pr;
+          float lh = cand_lh(row_idx + 1, -1, 0);
+          if (ac.skip_lh_w > 0.0f && row_idx < 5 && s_valid_row[row_idx + 1] != 0 && cand == s_dk[row_idx + 1]) {
+            lh *= (1.0f + ac.skip_lh_w * s_p1[row_idx + 1]);
+          }
+          s_cand_prob[ci] = cprob;
+          s_cand_score[ci] = cprob * lh;
+          s_cand_tok[ci] = cand;
+          s_cand_k[ci] = static_cast<int8_t>(row_idx + 1);
+          s_cand_par[ci] = -1;
+          s_cand_depth[ci] = 1;
+          s_cand_kind[ci] = 0;
+          s_cand_rk[ci] = -1;
+        }
       }
     }
   }
@@ -1883,6 +2123,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   const int eff_max_tr_dp = tr_w32 ? ((tr.max_tr_dp < 6) ? 6 : tr.max_tr_dp) : tr.max_tr_dp;
   for (int li = 0; li < num_leaves; ++li) {
     const int r = 7 + li;
+    const int sb = li & 1;
     if (warp == 0) {
       const int nc = s_num_cands;
       float best_s_w = (tid < nc) ? s_cand_score[tid] : -1.0f;
@@ -1908,11 +2149,11 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         }
       }
       if (tid == 0) {
-        s_sel_s = best_s_w;
-        s_sel_idx = best_idx_w;
-        s_sel_prob = (best_s_w > 0.0f) ? s_cand_prob[best_idx_w] : 0.0f;
-        s_sel_hpos = (best_s_w > 0.0f) ? static_cast<int>(s_cand_hpos[best_idx_w]) : -1;
-        s_sel_ml = (best_s_w > 0.0f) ? static_cast<int>(s_cand_ml[best_idx_w]) : 0;
+        s_sel_s[sb] = best_s_w;
+        s_sel_idx[sb] = best_idx_w;
+        s_sel_prob[sb] = (best_s_w > 0.0f) ? s_cand_prob[best_idx_w] : 0.0f;
+        s_sel_hpos[sb] = (best_s_w > 0.0f) ? static_cast<int>(s_cand_hpos[best_idx_w]) : -1;
+        s_sel_ml[sb] = (best_s_w > 0.0f) ? static_cast<int>(s_cand_ml[best_idx_w]) : 0;
         if (best_s_w > 0.0f) {
           const int32_t tok32 = static_cast<int32_t>(s_cand_tok[best_idx_w]);
           const int k_r = static_cast<int>(s_cand_k[best_idx_w]);
@@ -1929,14 +2170,14 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         }
       }
     }
-    // Barrier #1: broadcasts s_sel_* and s_leaf_*_r[r] to all 256 threads.
+    // Barrier #1: broadcasts double-buffered s_sel_*[sb] and s_leaf_*_r[r] to all 256 threads.
     __syncthreads();
 
-    const float best_s = s_sel_s;
-    const int best_idx = s_sel_idx;
-    const float best_prob_w = s_sel_prob;
-    const int sel_hpos_w = s_sel_hpos;
-    const int sel_ml_w = s_sel_ml;
+    const float best_s = s_sel_s[sb];
+    const int best_idx = s_sel_idx[sb];
+    const float best_prob_w = s_sel_prob[sb];
+    const int sel_hpos_w = s_sel_hpos[sb];
+    const int sel_ml_w = s_sel_ml[sb];
     const bool can_scan = (best_s > 0.0f && li + 1 < num_leaves && calib_mode != 0 &&
                            s_hist_ok != 0 && saved_leaf_parent != nullptr);
     const int dp_w = can_scan ? static_cast<int>(s_cand_depth[best_idx]) : 99;
@@ -1947,9 +2188,16 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     const bool want_tr_scan =
         can_scan && tr.mode != 0 && tr.cont_mode != 0 && s_tr_active_n > 0 &&
         dp_w < eff_max_depth && dp_w < eff_max_tr_dp && k_w < 6 && best_prob_w >= 0.015f;
+    const int rk_w = can_scan ? static_cast<int>(s_cand_rk[best_idx]) : -1;
+    const bool sh_known_zero =
+        want_sh_scan && scan_bg && rk_w >= r_start_bg && k_w >= 1 && k_w <= 5 &&
+        (s_alt_cnt[k_w - 1][rk_w] == 0u);
+    const bool sh_may_hit = want_sh_scan && !sh_known_zero;
+    const bool tr_may_hit = want_tr_scan && tr_bloom_has(s_leaf_tok_r[r]);
 
-    // Fused 256-thread (8-warp) s_h + 30B Target Recycling scan sharing ONE __syncthreads() barrier.
-    if (want_sh_scan) {
+    // Fused 256-thread (8-warp) int4-vectorized s_h + 30B Target Recycling scan sharing ONE barrier
+    // (skipped entirely when both sh_may_hit and tr_may_hit are proven false!).
+    if (sh_may_hit) {
       const int32_t tok32 = s_leaf_tok_r[r];
       const int32_t pv_r = s_leaf_prv_r[r];
       const int32_t pv2_r = s_leaf_prv2_r[r];
@@ -1960,26 +2208,41 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       int bg_c = 0, bg_min = 2147483647, bg_max = -1, bg_hp = -1;
       int tri_c = 0, tri_min = 2147483647, tri_max = -1;
 
-      for (int hi = tid; hi < win_m1; hi += 256) {
-        if (s_h[hi] != tok32) continue;
-        const int32_t nxt = s_h[hi + 1];
-        if (nxt < 0) continue;
-        u_c += 1;
-        if (nxt < u_min) u_min = nxt;
-        if (nxt > u_max) u_max = nxt;
-
-        if (pv_r >= 0 && hi >= 1 && s_h[hi - 1] == pv_r) {
-          bg_c += 1;
-          if (nxt < bg_min) bg_min = nxt;
-          if (nxt > bg_max) bg_max = nxt;
-          if (hi + 1 > bg_hp) bg_hp = hi + 1;
-
-          if (pv2_r >= 0 && hi >= 2 && s_h[hi - 2] == pv2_r) {
-            tri_c += 1;
-            if (nxt < tri_min) tri_min = nxt;
-            if (nxt > tri_max) tri_max = nxt;
-            const uint32_t tk_key = (3u << 16) | static_cast<uint32_t>(hi);
-            if (tk_key > best_tri_key) best_tri_key = tk_key;
+      const int win_q = win_m1 >> 2;
+      const int4* s_h4 = reinterpret_cast<const int4*>(s_h);
+      for (int qi = tid; qi <= win_q; qi += 256) {
+        uint32_t hm = 0u;
+        const int base_hi = qi << 2;
+        if (qi < win_q) {
+          const int4 v = s_h4[qi];
+          hm = (v.x == tok32 ? 1u : 0u) | (v.y == tok32 ? 2u : 0u) |
+               (v.z == tok32 ? 4u : 0u) | (v.w == tok32 ? 8u : 0u);
+        } else {
+          for (int k = 0; k < 4 && base_hi + k < win_m1; ++k) {
+            if (s_h[base_hi + k] == tok32) hm |= (1u << k);
+          }
+        }
+        while (hm) {
+          const int b = __ffs(hm) - 1;
+          hm &= hm - 1u;
+          const int hi = base_hi + b;
+          const int32_t nxt = s_h[hi + 1];
+          if (nxt < 0) continue;
+          u_c += 1;
+          if (nxt < u_min) u_min = nxt;
+          if (nxt > u_max) u_max = nxt;
+          if (pv_r >= 0 && hi >= 1 && s_h[hi - 1] == pv_r) {
+            bg_c += 1;
+            if (nxt < bg_min) bg_min = nxt;
+            if (nxt > bg_max) bg_max = nxt;
+            if (hi + 1 > bg_hp) bg_hp = hi + 1;
+            if (pv2_r >= 0 && hi >= 2 && s_h[hi - 2] == pv2_r) {
+              tri_c += 1;
+              if (nxt < tri_min) tri_min = nxt;
+              if (nxt > tri_max) tri_max = nxt;
+              const uint32_t tk_key = (3u << 16) | static_cast<uint32_t>(hi);
+              if (tk_key > best_tri_key) best_tri_key = tk_key;
+            }
           }
         }
       }
@@ -2010,7 +2273,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       }
     }
 
-    if (want_tr_scan) {
+    if (tr_may_hit) {
       const int32_t tok32 = s_leaf_tok_r[r];
       const int32_t pv_r = s_leaf_prv_r[r];
       const int32_t pv2_r = s_leaf_prv2_r[r];
@@ -2103,15 +2366,17 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
       }
     }
 
-    // Barrier #2 (final barrier of leaf iteration): all 256 threads finished reading s_sel_* and writing s_w_sh/s_w_tr.
-    __syncthreads();
+    // Barrier #2: skipped whenever neither scan ran (double-buffered s_sel_*[sb] keeps warps 1..7 hazard-free).
+    if (sh_may_hit || tr_may_hit) {
+      __syncthreads();
+    }
 
     if (warp == 0) {
       int sh_u_c = 0, sh_u_min = 2147483647, sh_u_max = -1;
       int sh_bg_c = 0, sh_bg_min = 2147483647, sh_bg_max = -1;
       int sh_tri_c = 0, sh_tri_min = 2147483647, sh_tri_max = -1;
 
-      if (want_sh_scan && lane < 8) {
+      if (sh_may_hit && lane < 8) {
         const uint32_t g_tri_key = __reduce_max_sync(0xffu, s_w_tri_key[lane]);
         const int g_u_c = __reduce_add_sync(0xffu, s_w_sh[0][lane]);
         const int g_u_min = __reduce_min_sync(0xffu, s_w_sh[1][lane]);
@@ -2136,9 +2401,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
           const int j_ch = k_w;
           auto in_ch_topK = [&](int32_t cand_c) -> bool {
             if (!s_valid_row[j_ch]) return false;
-#pragma unroll
-            for (int rp = 0; rp < kMaxTreeK; ++rp) {
-              if (rp < tk && s_top[j_ch][rp] == cand_c) return true;
+#pragma unroll 1
+            for (int rp = 0; rp < tk; ++rp) {
+              if (s_top[j_ch][rp] == cand_c) return true;
             }
             return false;
           };
@@ -2170,7 +2435,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         }
       }
 
-      if (want_tr_scan) {
+      if (tr_may_hit) {
         int g_utot = 0, g_t0u = 0, g_umin = 2147483647, g_umax = -1, g_near = 0;
         int g_bgc = 0, g_bgmin = 2147483647, g_bgmax = -1;
         int g_tric = 0, g_trimin = 2147483647, g_trimax = -1;
@@ -2238,8 +2503,24 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             int my_a1_conf = 0;
             int my_tri_conf = 0;
             const int win_m1 = s_win - 1;
-            for (int hi = lane; hi < win_m1; hi += 32) {
-              if (s_h[hi] == tok32) {
+            const int win_q = win_m1 >> 2;
+            const int4* s_h4 = reinterpret_cast<const int4*>(s_h);
+            for (int qi = lane; qi <= win_q; qi += 32) {
+              uint32_t hm = 0u;
+              const int base_hi = qi << 2;
+              if (qi < win_q) {
+                const int4 v = s_h4[qi];
+                hm = (v.x == tok32 ? 1u : 0u) | (v.y == tok32 ? 2u : 0u) |
+                     (v.z == tok32 ? 4u : 0u) | (v.w == tok32 ? 8u : 0u);
+              } else {
+                for (int k = 0; k < 4 && base_hi + k < win_m1; ++k) {
+                  if (s_h[base_hi + k] == tok32) hm |= (1u << k);
+                }
+              }
+              while (hm) {
+                const int b = __ffs(hm) - 1;
+                hm &= hm - 1u;
+                const int hi = base_hi + b;
                 my_occ += 1;
                 const int32_t nxt_h = s_h[hi + 1];
                 if (nxt_h != g_umin) my_conf = 1;
@@ -2263,9 +2544,9 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
             const int j_ch = k_w;
             auto in_ch_topK = [&](int32_t cand_c) -> bool {
               if (!s_valid_row[j_ch]) return false;
-#pragma unroll
-              for (int rp = 0; rp < kMaxTreeK; ++rp) {
-                if (rp < tk && s_top[j_ch][rp] == cand_c) return true;
+#pragma unroll 1
+              for (int rp = 0; rp < tk; ++rp) {
+                if (s_top[j_ch][rp] == cand_c) return true;
               }
               return false;
             };
@@ -2306,293 +2587,321 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
         }
       }
 
+      // Parallel Warp-0 (16-lane) post-miss distribution + child candidate spawner + __match_any_sync dedup (0-ULP bit-exact!).
+      int do_spawn_w = 0;
+      int k_r_w = 0, dp_w2 = 0, kind_w = 0, hpos_w = -1, ml_w = 0, rk_in_row_w = -1;
+      int32_t tok32_w = -1;
+      float best_prob_sp = -1.0f;
       if (tid == 0) {
-      const float best_prob = (best_s > 0.0f) ? s_cand_prob[best_idx] : -1.0f;
-      if (best_s > 0.0f) {
-        s_cand_score[best_idx] = -1.0f;
-        s_cand_prob[best_idx] = -1.0f;
-      }
-      const int64_t sel_tok = (best_s > 0.0f) ? s_cand_tok[best_idx] : -1;
-      if (best_s > 0.0f && sel_tok >= 0 && sel_tok < static_cast<int64_t>(vocab_size)) {
-        const int64_t tok = sel_tok;
-        const int k_r = static_cast<int>(s_cand_k[best_idx]);
-        const int par = static_cast<int>(s_cand_par[best_idx]);
-        const int dp = static_cast<int>(s_cand_depth[best_idx]);
-        const int kind = static_cast<int>(s_cand_kind[best_idx]);
-        const int hpos = static_cast<int>(s_cand_hpos[best_idx]);
-        const int ml = static_cast<int>(s_cand_ml[best_idx]);
-        const int rk_in_row = static_cast<int>(s_cand_rk[best_idx]);
-        if (kind == 8 || kind == 9) {
-          casc_row_mask |= (1u << r);
-          if (stats != nullptr && stats_len >= 48) {
-            stats[43] += 1;
-          }
+        const float best_prob = (best_s > 0.0f) ? s_cand_prob[best_idx] : -1.0f;
+        if (best_s > 0.0f) {
+          s_cand_score[best_idx] = -1.0f;
+          s_cand_prob[best_idx] = -1.0f;
         }
-
-        int b_sub = 0;
-        uint32_t pkd = 0u;
-        if (par < 0) {
-          b_sub = tree_m - k_r;
-          pkd = static_cast<uint32_t>(r) & 0x1Fu;
-        } else {
-          b_sub = s_row_base_sub[par];
-          pkd = s_row_packed[par] | ((static_cast<uint32_t>(r) & 0x1Fu) << (5 * (dp - 1)));
-        }
-        s_row_base_sub[r] = b_sub;
-        s_row_depth[r] = dp;
-        s_row_packed[r] = pkd;
-
-        input_ids[r] = static_cast<int32_t>(tok);
-        positions[r] = positions[k_r];
-        saved_leaf_toks[r] = tok;
-        saved_leaf_k[r] = k_r;
-        if (saved_leaf_parent != nullptr) {
-          saved_leaf_parent[r] = par;
-        }
-        leaf_flag[1 + 3 * r + 0] = tree_m - (k_r + 1);
-        leaf_flag[1 + 3 * r + 1] = b_sub;
-        leaf_flag[1 + 3 * r + 2] = static_cast<int32_t>(pkd);
-        s_any_active = 1;
-
-        // Dynamically spawn depth+1 children (up to eff_max_depth <= 6, k_child <= 6, 0 stack spill).
-        if (li + 1 < num_leaves && dp < eff_max_depth && k_r < 6 && saved_leaf_parent != nullptr) {
-          const int k_child = k_r + 1;
-          const int j_par = k_r - 1;  // 0..4
-          const int j_ch = k_r;       // 1..5
-          int n_spawned = 0;
-          auto already_spawned = [&](int64_t t) -> bool {
-            const int32_t t32 = static_cast<int32_t>(t);
-            for (int si = 0; si < n_spawned; ++si) {
-              if (s_spawned[si] == t32) return true;
+        const int64_t sel_tok = (best_s > 0.0f) ? s_cand_tok[best_idx] : -1;
+        if (best_s > 0.0f && sel_tok >= 0 && sel_tok < static_cast<int64_t>(vocab_size)) {
+          const int k_r = static_cast<int>(s_cand_k[best_idx]);
+          const int par = static_cast<int>(s_cand_par[best_idx]);
+          const int dp = static_cast<int>(s_cand_depth[best_idx]);
+          const int kind = static_cast<int>(s_cand_kind[best_idx]);
+          const int hpos = static_cast<int>(s_cand_hpos[best_idx]);
+          const int ml = static_cast<int>(s_cand_ml[best_idx]);
+          const int rk_in_row = static_cast<int>(s_cand_rk[best_idx]);
+          if ((kind == 8 || kind == 9) && r < 32) {
+            casc_row_mask |= (1u << r);
+            if (stats != nullptr && stats_len >= 48) {
+              stats[43] += 1;
             }
-            return false;
-          };
-          auto record_spawn = [&](int64_t t) {
-            if (n_spawned < 16) s_spawned[n_spawned++] = static_cast<int32_t>(t);
-          };
-          const int root_ml = (kind == 5) ? (ml - (dp - 1)) : ml;
-          int max_pl_dp;
-          if (pl_w32) {
-            const int dp4 = (pl.max_dp_4 < 4) ? 4 : pl.max_dp_4;
-            const int dp5 = (pl.max_dp_5 < 6) ? 6 : pl.max_dp_5;
-            const int dp6 = (pl.max_dp_6 < 6) ? 6 : pl.max_dp_6;
-            max_pl_dp = (root_ml <= 3) ? 3 : ((root_ml == 4) ? dp4 : ((root_ml == 5) ? dp5 : dp6));
+          }
+          int b_sub = 0;
+          uint64_t pkd = 0ull;
+          if (par < 0) {
+            b_sub = tree_m - k_r;
+            pkd = static_cast<uint64_t>(r) & 0x3Full;
           } else {
-            max_pl_dp = (root_ml <= 4) ? pl.max_dp_4 : ((root_ml == 5) ? pl.max_dp_5 : pl.max_dp_6);
+            b_sub = s_row_base_sub[par];
+            pkd = s_row_packed[par] | ((static_cast<uint64_t>(r) & 0x3Full) << (6 * (dp - 1)));
           }
-          const bool can_pl_cont = (pl.mode != 0 && s_hist_ok != 0 && hpos >= 0 && hpos + 1 < s_win &&
-                                    dp < max_pl_dp && (kind == 4 || kind == 5 || ml >= pl.cont_from_df_n));
-          const int64_t pl_next_tok = can_pl_cont ? static_cast<int64_t>(s_h[hpos + 1]) : -1;
-          const int next_ml = (ml < 16) ? (ml + 1) : 16;
-          const int next_ml_b = (next_ml > 6) ? 6 : next_ml;
-          const float pl_cp = (can_pl_cont && next_ml_b >= 1) ? pl.cont_p[next_ml_b] : 0.0f;
-          const int64_t tr_ch_tok = s_tr_ch_tok;
-          const float tr_ch_p = s_tr_ch_p;
-          const int64_t sh_ch_tok = s_sh_ch_tok;
-          const float sh_ch_p = s_sh_ch_p;
-          const int sh_ch_hp = s_sh_ch_hp;
-          const int sh_ch_ml = s_sh_ch_ml;
-          if (tr_ch_tok >= 0 && tr_ch_p > 0.0f && stats != nullptr && stats_len >= 40) {
-            stats[38] += 1;
+          s_row_base_sub[r] = b_sub;
+          s_row_depth[r] = dp;
+          s_row_packed[r] = pkd;
+          s_leaf_k_r[r] = static_cast<int8_t>(k_r);
+          s_leaf_par_r[r] = static_cast<int8_t>(par);
+          s_leaf_ok_r[r] = 1;
+          s_any_active = 1;
+          if (li + 1 < num_leaves && dp < eff_max_depth && k_r < 6 && saved_leaf_parent != nullptr) {
+            do_spawn_w = 1;
+            k_r_w = k_r;
+            dp_w2 = dp;
+            kind_w = kind;
+            hpos_w = hpos;
+            ml_w = ml;
+            rk_in_row_w = rk_in_row;
+            tok32_w = static_cast<int32_t>(sel_tok);
+            best_prob_sp = best_prob;
+            if (s_tr_ch_tok >= 0 && s_tr_ch_p > 0.0f && stats != nullptr && stats_len >= 40) {
+              stats[38] += 1;
+            }
           }
+        } else {
+          s_row_base_sub[r] = -1;
+          s_row_depth[r] = 0;
+          s_row_packed[r] = 0ull;
+          s_leaf_k_r[r] = 0;
+          s_leaf_par_r[r] = -1;
+          s_leaf_ok_r[r] = 0;
+        }
+      }
+      do_spawn_w = __shfl_sync(0xffffffffu, do_spawn_w, 0);
+      if (do_spawn_w) {
+        const int k_r = __shfl_sync(0xffffffffu, k_r_w, 0);
+        const int dp = __shfl_sync(0xffffffffu, dp_w2, 0);
+        const int kind = __shfl_sync(0xffffffffu, kind_w, 0);
+        const int hpos = __shfl_sync(0xffffffffu, hpos_w, 0);
+        const int ml = __shfl_sync(0xffffffffu, ml_w, 0);
+        const int rk_in_row = __shfl_sync(0xffffffffu, rk_in_row_w, 0);
+        const int64_t tok = static_cast<int64_t>(__shfl_sync(0xffffffffu, tok32_w, 0));
+        const float best_prob = __shfl_sync(0xffffffffu, best_prob_sp, 0);
 
-          // Compute smoothed Markov bigram/trigram + 0.00ms Anti-Chimera post-miss distribution (SMEM scratch).
-          const bool allow_bg_kind =
-              (kind == 0) || (bg.bg_sub != 0 && kind == 1) || (bg.bg_off != 0 && (kind == 3 || kind == 6));
-          const bool use_bg = (calib_mode != 0 && (bg.bg_mode != 0 || ac.ac_mode != 0) && s_hist_ok != 0 &&
-                               s_valid_row[j_ch] != 0 && rk_in_row >= 0 && allow_bg_kind);
-          const uint32_t ac_u = use_bg ? s_alt_cnt[j_par][rk_in_row] : 0u;
-          const uint32_t m3 = use_bg ? s_bg3_mask[j_par][rk_in_row] : 0u;
-          uint32_t bg_mask = 0u;
-          bool has_p_post_vec = false;
-          if (calib_mode != 0 && s_valid_row[j_ch] != 0 && (kind < 8 || kind == 10)) {
-            bool any_delta = false;
-            float den1_mod = 1.0f;
-            const float inv_den = (ac_u > 0u) ? (1.0f / (static_cast<float>(ac_u) + bg.bg_alpha)) : 0.0f;
-            const float min_p = (kind == 1) ? bg.sub_min_p : bg.bg_min_p;
-            const float fwd_pen = (ac.ac_mode != 0 && use_bg && static_cast<int>(ac_u) >= ac.min_u)
+        const int k_child = k_r + 1;
+        const int j_par = k_r - 1;  // 0..4
+        const int j_ch = k_r;       // 1..5
+        const int root_ml = (kind == 5) ? (ml - (dp - 1)) : ml;
+        int max_pl_dp;
+        if (pl_w32) {
+          const int dp4 = (pl.max_dp_4 < 4) ? 4 : pl.max_dp_4;
+          const int dp5 = (pl.max_dp_5 < 6) ? 6 : pl.max_dp_5;
+          const int dp6 = (pl.max_dp_6 < 6) ? 6 : pl.max_dp_6;
+          max_pl_dp = (root_ml <= 3) ? 3 : ((root_ml == 4) ? dp4 : ((root_ml == 5) ? dp5 : dp6));
+        } else {
+          max_pl_dp = (root_ml <= 4) ? pl.max_dp_4 : ((root_ml == 5) ? pl.max_dp_5 : pl.max_dp_6);
+        }
+        const bool can_pl_cont = (pl.mode != 0 && s_hist_ok != 0 && hpos >= 0 && hpos + 1 < s_win &&
+                                  dp < max_pl_dp && (kind == 4 || kind == 5 || ml >= pl.cont_from_df_n));
+        const int64_t pl_next_tok = can_pl_cont ? static_cast<int64_t>(s_h[hpos + 1]) : -1;
+        const int next_ml = (ml < 16) ? (ml + 1) : 16;
+        const int next_ml_b = (next_ml > 6) ? 6 : next_ml;
+        const float pl_cp = (can_pl_cont && next_ml_b >= 1) ? pl.cont_p[next_ml_b] : 0.0f;
+        const int64_t tr_ch_tok = s_tr_ch_tok;
+        const float tr_ch_p = s_tr_ch_p;
+        const int64_t sh_ch_tok = s_sh_ch_tok;
+        const float sh_ch_p = s_sh_ch_p;
+        const int sh_ch_hp = s_sh_ch_hp;
+        const int sh_ch_ml = s_sh_ch_ml;
+
+        // Step A: 8-lane parallel s_p_post_vec[0..7] with exact sequential FP32 den1_mod sum (0-ULP bit-exact!).
+        const bool allow_bg_kind =
+            (kind == 0) || (bg.bg_sub != 0 && kind == 1) || (bg.bg_off != 0 && (kind == 3 || kind == 6));
+        const bool use_bg = (calib_mode != 0 && (bg.bg_mode != 0 || ac.ac_mode != 0) && s_hist_ok != 0 &&
+                             s_valid_row[j_ch] != 0 && rk_in_row >= 0 && allow_bg_kind);
+        const uint32_t ac_u = use_bg ? s_alt_cnt[j_par][rk_in_row] : 0u;
+        const uint32_t m3 = use_bg ? s_bg3_mask[j_par][rk_in_row] : 0u;
+        uint32_t bg_mask = 0u;
+        bool has_p_post_vec = false;
+        if (calib_mode != 0 && s_valid_row[j_ch] != 0 && (kind < 8 || kind == 10)) {
+          float inv_den = 0.0f;
+          float fwd_pen = 0.0f;
+          if (lane == 0) {
+            inv_den = (ac_u > 0u) ? (1.0f / (static_cast<float>(ac_u) + bg.bg_alpha)) : 0.0f;
+            fwd_pen = (ac.ac_mode != 0 && use_bg && static_cast<int>(ac_u) >= ac.min_u)
                 ? fminf(ac.fwd_cap, ac.fwd_lambda * __logf(1.0f + static_cast<float>(ac_u) / ac.fwd_alpha))
                 : 0.0f;
-#pragma unroll
-            for (int rp = 0; rp < kMaxTreeK; ++rp) {
-              float ev = 0.0f;
-              if (rp < tk) {
-                ev = s_e1[j_ch][rp];
-                float dv = 0.0f;
-                const uint32_t cnt_rp = (use_bg && ac_u > 0u) ? s_bg_cnt[j_par][rk_in_row][rp] : 0u;
-                if (bg.bg_mode != 0 && cnt_rp > 0u) {
-                  const float p_bg = static_cast<float>(cnt_rp) * inv_den;
-                  const bool is3 = ((m3 & (1u << rp)) != 0u) && (p_bg >= bg.tri_min_p);
-                  if (p_bg >= min_p) dv += bg.f2 + bg.w2 * p_bg;
-                  if (is3) dv += bg.f3 + bg.w3 * p_bg;
-                  if (dv > 0.0f) bg_mask |= (1u << rp);
-                } else if (ac.ac_mode != 0 && cnt_rp == 0u) {
-                  if (fwd_pen > 0.0f) {
-                    dv -= (kind == 1) ? (0.5f * fwd_pen) : fwd_pen;
-                  }
-                  if (use_bg && kind != 1 && rk_in_row >= 1) {
-                    const uint32_t vin = s_in_cnt[j_par][rp];
-                    const uint32_t own_cnt = s_bg_cnt[j_par][0][rp];
-                    if (static_cast<int>(vin) >= ac.min_v && own_cnt > 0u) {
-                      const float ofrac = static_cast<float>(own_cnt) / (static_cast<float>(vin) + ac.rev_alpha);
-                      dv -= fminf(ac.rev_cap, ac.rev_lambda * ofrac);
-                    }
-                  }
-                  if (rp == 0 && kind == 0 && ac.ent_lambda > 0.0f &&
-                      s_margin[j_par] < 2.0f && s_p1[j_ch] < 0.75f) {
-                    dv -= ac.ent_lambda * (1.0f - s_p1[j_ch]) * (1.0f - 0.5f * s_margin[j_par]);
+          }
+          inv_den = __shfl_sync(0xffffffffu, inv_den, 0);
+          fwd_pen = __shfl_sync(0xffffffffu, fwd_pen, 0);
+          const float min_p = (kind == 1) ? bg.sub_min_p : bg.bg_min_p;
+
+          float ev = 0.0f;
+          bool my_bg = false;
+          bool my_delta = false;
+          if (lane < kMaxTreeK) {
+            const int rp = lane;
+            if (rp < tk) {
+              ev = s_e1[j_ch][rp];
+              float dv = 0.0f;
+              const uint32_t cnt_rp = (use_bg && ac_u > 0u) ? s_bg_cnt[j_par][rk_in_row][rp] : 0u;
+              if (bg.bg_mode != 0 && cnt_rp > 0u) {
+                const float p_bg = static_cast<float>(cnt_rp) * inv_den;
+                const bool is3 = ((m3 & (1u << rp)) != 0u) && (p_bg >= bg.tri_min_p);
+                if (p_bg >= min_p) dv += bg.f2 + bg.w2 * p_bg;
+                if (is3) dv += bg.f3 + bg.w3 * p_bg;
+                if (dv > 0.0f) my_bg = true;
+              } else if (ac.ac_mode != 0 && cnt_rp == 0u) {
+                if (fwd_pen > 0.0f) {
+                  dv -= (kind == 1) ? (0.5f * fwd_pen) : fwd_pen;
+                }
+                if (use_bg && kind != 1 && rk_in_row >= 1) {
+                  const uint32_t vin = s_in_cnt[j_par][rp];
+                  const uint32_t own_cnt = s_bg_cnt[j_par][0][rp];
+                  if (static_cast<int>(vin) >= ac.min_v && own_cnt > 0u) {
+                    const float ofrac = static_cast<float>(own_cnt) / (static_cast<float>(vin) + ac.rev_alpha);
+                    dv -= fminf(ac.rev_cap, ac.rev_lambda * ofrac);
                   }
                 }
-                if (dv != 0.0f) {
-                  any_delta = true;
-                  if (ev > 0.0f) ev *= __expf(dv);
+                if (rp == 0 && kind == 0 && ac.ent_lambda > 0.0f &&
+                    s_margin[j_par] < 2.0f && s_p1[j_ch] < 0.75f) {
+                  dv -= ac.ent_lambda * (1.0f - s_p1[j_ch]) * (1.0f - 0.5f * s_margin[j_par]);
                 }
               }
-              s_p_post_vec[rp] = ev;
-              den1_mod += ev;
-            }
-            if (any_delta) {
-              const float inv_d1 = 1.0f / den1_mod;
-#pragma unroll
-              for (int rp = 0; rp < kMaxTreeK; ++rp) {
-                s_p_post_vec[rp] *= inv_d1;
+              if (dv != 0.0f) {
+                my_delta = true;
+                if (ev > 0.0f) ev *= __expf(dv);
               }
-              has_p_post_vec = true;
             }
           }
-
-          auto resolve_bg_hpos = [&](int rp, bool agrees_pl, int16_t& out_hp, int8_t& out_ml) {
-            if (agrees_pl) {
-              out_hp = static_cast<int16_t>(hpos + 1);
-              out_ml = static_cast<int8_t>(next_ml);
-              return;
+          bg_mask = __ballot_sync(0xffffffffu, my_bg) & 0xFFu;
+          const bool any_delta = (__ballot_sync(0xffffffffu, my_delta) & 0xFFu) != 0u;
+          if (any_delta) {
+            const float ev0 = __shfl_sync(0xffffffffu, ev, 0);
+            const float ev1 = __shfl_sync(0xffffffffu, ev, 1);
+            const float ev2 = __shfl_sync(0xffffffffu, ev, 2);
+            const float ev3 = __shfl_sync(0xffffffffu, ev, 3);
+            const float ev4 = __shfl_sync(0xffffffffu, ev, 4);
+            const float ev5 = __shfl_sync(0xffffffffu, ev, 5);
+            const float ev6 = __shfl_sync(0xffffffffu, ev, 6);
+            const float ev7 = __shfl_sync(0xffffffffu, ev, 7);
+            float inv_d1 = 0.0f;
+            if (lane == 0) {
+              float den1_mod = 1.0f;
+              den1_mod += ev0; den1_mod += ev1; den1_mod += ev2; den1_mod += ev3;
+              den1_mod += ev4; den1_mod += ev5; den1_mod += ev6; den1_mod += ev7;
+              inv_d1 = 1.0f / den1_mod;
             }
-            out_hp = -1;
-            out_ml = 0;
-            if (!use_bg || ac_u == 0u) return;
-            const uint32_t cnt_rp = s_bg_cnt[j_par][rk_in_row][rp];
-            if (cnt_rp == 0u) return;
-            const float p_bg = static_cast<float>(cnt_rp) / (static_cast<float>(ac_u) + bg.bg_alpha);
-            const bool is3 = ((m3 & (1u << rp)) != 0u) && (p_bg >= bg.tri_min_p);
-            const bool ok_hp = is3 || (bg.chp_bg2 != 0 && cnt_rp >= 2u && p_bg >= 0.45f);
-            if (ok_hp) {
-              const uint32_t bk = s_bg_key[j_par][rk_in_row][rp];
-              if (bk != 0u) {
-                const int bk_hp = static_cast<int>(bk & 0xFFFFu);
-                const int bk_ml = static_cast<int>(bk >> 16);
-                out_hp = static_cast<int16_t>(bk_hp);
-                out_ml = static_cast<int8_t>((bk_ml < 3) ? 3 : bk_ml);
-              }
+            inv_d1 = __shfl_sync(0xffffffffu, inv_d1, 0);
+            if (lane < kMaxTreeK) {
+              s_p_post_vec[lane] = ev * inv_d1;
             }
-          };
+            has_p_post_vec = true;
+          }
+          __syncwarp();
+        }
 
-          // 0) Multi-Future Cascade coherent continuation (`casc_chain` kind=8, `casc_alt` kind=9).
-          if ((kind == 8 || kind == 9) && s_casc_mode != 0 && s_num_cands < kCandCap) {
-            const int64_t c1 = s_casc_top[j_ch][0];
-            if (c1 >= 0 && c1 < static_cast<int64_t>(vocab_size) && !already_spawned(c1)) {
-              const bool agrees_pl1 = (can_pl_cont && pl_next_tok == c1 && pl_cp > 0.0f);
-              const bool agrees_tr1 = (tr_ch_tok == c1 && tr_ch_p > 0.0f);
-              float p_c1 = (kind == 8) ? s_casc_p1[j_ch] : (s_casc_p1[j_ch] * 0.55f);
-              if (agrees_pl1 && pl_cp > p_c1) p_c1 = pl_cp;
-              if (agrees_tr1 && tr_ch_p > p_c1) p_c1 = tr_ch_p;
-              const float ch_prob1 = best_prob * p_c1;
-              if (ch_prob1 > 0.0f) {
-                const float lh1 = (kind == 8 && j_ch + 1 < 6 && li + 2 < num_leaves)
+        auto resolve_bg_hpos = [&](int rp, bool agrees_pl, int16_t& out_hp, int8_t& out_ml) {
+          if (agrees_pl) {
+            out_hp = static_cast<int16_t>(hpos + 1);
+            out_ml = static_cast<int8_t>(next_ml);
+            return;
+          }
+          out_hp = -1;
+          out_ml = 0;
+          if (!use_bg || ac_u == 0u) return;
+          const uint32_t cnt_rp = s_bg_cnt[j_par][rk_in_row][rp];
+          if (cnt_rp == 0u) return;
+          const float p_bg = static_cast<float>(cnt_rp) / (static_cast<float>(ac_u) + bg.bg_alpha);
+          const bool is3 = ((m3 & (1u << rp)) != 0u) && (p_bg >= bg.tri_min_p);
+          const bool ok_hp = is3 || (bg.chp_bg2 != 0 && cnt_rp >= 2u && p_bg >= 0.45f);
+          if (ok_hp) {
+            const uint32_t bk = s_bg_key[j_par][rk_in_row][rp];
+            if (bk != 0u) {
+              const int bk_hp = static_cast<int>(bk & 0xFFFFu);
+              const int bk_ml = static_cast<int>(bk >> 16);
+              out_hp = static_cast<int16_t>(bk_hp);
+              out_ml = static_cast<int8_t>((bk_ml < 3) ? 3 : bk_ml);
+            }
+          }
+        };
+
+        // Step B: Warp-uniform outer guards + unified 8-lane rp=0..7 SIMT evaluation (exact priority order 0..15, 0-ULP!).
+        bool c_valid = false;
+        int64_t c_tok = -1;
+        float c_prob = 0.0f;
+        float c_score = 0.0f;
+        int8_t c_kind = 0;
+        int16_t c_hp = -1;
+        int8_t c_ml = 0;
+        int8_t c_rk = -1;
+
+        // 0a, 0b) Cascade continuations (lanes 0, 1) — warp-uniform skip when not cascade (~92% of leaves)!
+        if ((kind == 8 || kind == 9) && s_casc_mode != 0) {
+          if (lane < 2 && (lane == 0 || kind == 8)) {
+            const int64_t ck_tok = s_casc_top[j_ch][lane];
+            if (ck_tok >= 0 && ck_tok < static_cast<int64_t>(vocab_size)) {
+              const bool agrees_pl = (can_pl_cont && pl_next_tok == ck_tok && pl_cp > 0.0f);
+              const bool agrees_tr = (tr_ch_tok == ck_tok && tr_ch_p > 0.0f);
+              float p_c = (lane == 0)
+                  ? ((kind == 8) ? s_casc_p1[j_ch] : (s_casc_p1[j_ch] * 0.55f))
+                  : s_casc_p2[j_ch];
+              if (agrees_pl && pl_cp > p_c) p_c = pl_cp;
+              if (agrees_tr && tr_ch_p > p_c) p_c = tr_ch_p;
+              const float ch_prob = best_prob * p_c;
+              if (ch_prob > 0.0f) {
+                const float lh = (lane == 0 && kind == 8 && j_ch + 1 < 6 && li + 2 < num_leaves)
                     ? (1.0f + csk.lookahead_w * s_casc_p1[j_ch + 1])
                     : 1.0f;
-                const int slot = s_num_cands++;
-                s_cand_prob[slot] = ch_prob1;
-                s_cand_score[slot] = ch_prob1 * lh1;
-                s_cand_tok[slot] = c1;
-                s_cand_k[slot] = static_cast<int8_t>(k_child);
-                s_cand_par[slot] = static_cast<int8_t>(r);
-                s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-                s_cand_kind[slot] = 8;
-                s_cand_hpos[slot] = agrees_pl1 ? static_cast<int16_t>(hpos + 1) : -1;
-                s_cand_ml[slot] = agrees_pl1 ? static_cast<int8_t>(next_ml) : 0;
-                s_cand_rk[slot] = -1;
-                record_spawn(c1);
+                c_valid = true; c_tok = ck_tok; c_prob = ch_prob; c_score = ch_prob * lh;
+                c_kind = static_cast<int8_t>(8 + lane);
+                c_hp = agrees_pl ? static_cast<int16_t>(hpos + 1) : -1;
+                c_ml = agrees_pl ? static_cast<int8_t>(next_ml) : 0; c_rk = -1;
               }
             }
-            if (kind == 8 && s_num_cands < kCandCap) {
-              const int64_t c2 = s_casc_top[j_ch][1];
-              if (c2 >= 0 && c2 < static_cast<int64_t>(vocab_size) && !already_spawned(c2)) {
-                const bool agrees_pl2 = (can_pl_cont && pl_next_tok == c2 && pl_cp > 0.0f);
-                const bool agrees_tr2 = (tr_ch_tok == c2 && tr_ch_p > 0.0f);
-                float p_c2 = s_casc_p2[j_ch];
-                if (agrees_pl2 && pl_cp > p_c2) p_c2 = pl_cp;
-                if (agrees_tr2 && tr_ch_p > p_c2) p_c2 = tr_ch_p;
-                const float ch_prob2 = best_prob * p_c2;
-                if (ch_prob2 > 0.0f) {
-                  const int slot = s_num_cands++;
-                  s_cand_prob[slot] = ch_prob2;
-                  s_cand_score[slot] = ch_prob2;
-                  s_cand_tok[slot] = c2;
-                  s_cand_k[slot] = static_cast<int8_t>(k_child);
-                  s_cand_par[slot] = static_cast<int8_t>(r);
-                  s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-                  s_cand_kind[slot] = 9;
-                  s_cand_hpos[slot] = agrees_pl2 ? static_cast<int16_t>(hpos + 1) : -1;
-                  s_cand_ml[slot] = agrees_pl2 ? static_cast<int8_t>(next_ml) : 0;
-                  s_cand_rk[slot] = -1;
-                  record_spawn(c2);
+          }
+        }
+
+        // 1) sub (lane 2, rp=0) + 2) alt2/coh_cont (lanes 4..10, rp=1..7) — UNIFIED 8-LANE ZERO-DIVERGENCE BLOCK!
+        if (s_valid_row[j_ch] && (kind < 8 || kind == 10)) {
+          const int rp = (lane == 2) ? 0 : ((lane >= 4 && lane <= 10) ? (lane - 3) : -1);
+          if (rp >= 0 && rp < tk && (rp == 0 ? (kind != 2) : (calib_mode != 0))) {
+            const int64_t ctok = (rp == 0) ? s_dk[j_ch] : static_cast<int64_t>(s_top[j_ch][rp]);
+            if (ctok >= 0) {
+              const bool is_bg_hit = ((bg_mask & (1u << rp)) != 0u);
+              const bool agrees_tr = (tr_ch_tok == ctok && tr_ch_p > 0.0f);
+              const bool agrees_sh = (sh_ch_tok == ctok && sh_ch_p > 0.0f);
+              bool gate_ok = (rp == 0);
+              if (rp > 0) {
+                const bool allow_wide = (tree_m > 16) &&
+                    (((kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 6 || kind == 7 || kind == 10) &&
+                      (rp == 1 || rp == 2)) ||
+                     (rp == 3 && kind == 0 && k_r <= 2 && s_margin[j_ch] < 1.8f));
+                gate_ok = ((kind == 0 || kind == 4 || kind == 7) && rp == 1) || allow_wide || is_bg_hit || agrees_tr || agrees_sh;
+              }
+              if (gate_ok) {
+                const bool agrees_pl = (can_pl_cont && pl_next_tok == ctok && pl_cp > 0.0f);
+                float p_c;
+                if (rp == 0) {
+                  if (kind == 1) {
+                    p_c = s_p1[j_ch];
+                    if (has_p_post_vec && is_bg_hit && s_p_post_vec[0] > p_c) p_c = s_p_post_vec[0];
+                  } else {
+                    p_c = has_p_post_vec ? s_p_post_vec[0] : s_p1post[j_ch];
+                  }
+                } else {
+                  p_c = has_p_post_vec
+                      ? ((rp == 1) ? (s_p_post_vec[1] * ck.alt2_scale) : s_p_post_vec[rp])
+                      : ((rp == 1) ? s_p2post[j_ch] : (s_e1[j_ch][rp] / s_den1[j_ch]));
+                }
+                if (agrees_pl && pl_cp > p_c) p_c = pl_cp;
+                if (agrees_tr && tr_ch_p > p_c) p_c = tr_ch_p;
+                if (agrees_sh && sh_ch_p > p_c) p_c = sh_ch_p;
+                if (rp == 0 && ctok == tok && !agrees_pl && !agrees_tr && !agrees_sh && !is_bg_hit) {
+                  p_c *= ac.stutter_scale;
+                }
+                const float child_p = (rp == 0 && calib_mode == 0)
+                    ? (best_prob * ((kind == 0) ? sub_coef : cont_decay) * s_p1[j_ch])
+                    : (best_prob * p_c);
+                if (child_p > 0.0f) {
+                  int16_t ch_hp = -1;
+                  int8_t ch_ml = 0;
+                  resolve_bg_hpos(rp, agrees_pl, ch_hp, ch_ml);
+                  if (agrees_sh && sh_ch_hp >= 0 && (ch_hp < 0 || sh_ch_ml > static_cast<int>(ch_ml))) {
+                    ch_hp = static_cast<int16_t>(sh_ch_hp);
+                    ch_ml = static_cast<int8_t>(sh_ch_ml);
+                  }
+                  c_valid = true; c_tok = ctok; c_prob = child_p;
+                  c_score = child_p * cand_lh(k_child, static_cast<int>(ch_hp), static_cast<int>(ch_ml));
+                  c_kind = (rp == 0) ? 1 : ((rp == 1) ? 3 : 6);
+                  c_hp = ch_hp; c_ml = ch_ml; c_rk = static_cast<int8_t>(rp);
                 }
               }
             }
           }
+        }
 
-          // 1) Aligned substitution continuation (`sub`, kind=1): d_{k_r+1}#1 = s_dk[k_r] (with anti-stutter).
-          if ((kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 5 || kind == 6 || kind == 7 || kind == 10) &&
-              s_valid_row[j_ch] && s_num_cands < kCandCap) {
-            const int64_t sub_tok = s_dk[j_ch];
-            const bool agrees_pl = (can_pl_cont && pl_next_tok == sub_tok && pl_cp > 0.0f);
-            const bool agrees_tr = (tr_ch_tok == sub_tok && tr_ch_p > 0.0f);
-            const bool agrees_sh = (sh_ch_tok == sub_tok && sh_ch_p > 0.0f);
-            float p_cont;
-            if (kind == 1) {
-              p_cont = s_p1[j_ch];
-              if (has_p_post_vec && ((bg_mask & 1u) != 0u) && s_p_post_vec[0] > p_cont) {
-                p_cont = s_p_post_vec[0];
-              }
-            } else {
-              p_cont = has_p_post_vec ? s_p_post_vec[0] : s_p1post[j_ch];
-            }
-            if (agrees_pl && pl_cp > p_cont) p_cont = pl_cp;
-            if (agrees_tr && tr_ch_p > p_cont) p_cont = tr_ch_p;
-            if (agrees_sh && sh_ch_p > p_cont) p_cont = sh_ch_p;
-            if (sub_tok == tok && !agrees_pl && !agrees_tr && !agrees_sh && ((bg_mask & 1u) == 0u)) {
-              p_cont *= ac.stutter_scale;
-            }
-            const float child_p = (calib_mode != 0)
-                ? (best_prob * p_cont)
-                : (best_prob * ((kind == 0) ? sub_coef : cont_decay) * s_p1[j_ch]);
-            if (child_p > 0.0f && sub_tok >= 0 && !already_spawned(sub_tok)) {
-              int16_t ch_hp = -1;
-              int8_t ch_ml = 0;
-              resolve_bg_hpos(0, agrees_pl, ch_hp, ch_ml);
-              if (agrees_sh && sh_ch_hp >= 0 && (ch_hp < 0 || sh_ch_ml > static_cast<int>(ch_ml))) {
-                ch_hp = static_cast<int16_t>(sh_ch_hp);
-                ch_ml = static_cast<int8_t>(sh_ch_ml);
-              }
-              const int slot = s_num_cands++;
-              s_cand_prob[slot] = child_p;
-              s_cand_score[slot] = child_p * cand_lh(k_child, static_cast<int>(ch_hp), static_cast<int>(ch_ml));
-              s_cand_tok[slot] = sub_tok;
-              s_cand_k[slot] = static_cast<int8_t>(k_child);
-              s_cand_par[slot] = static_cast<int8_t>(r);
-              s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-              s_cand_kind[slot] = 1;
-              s_cand_hpos[slot] = ch_hp;
-              s_cand_ml[slot] = ch_ml;
-              s_cand_rk[slot] = 0;
-              record_spawn(sub_tok);
-            }
-          }
-          // 1b) Left-shift / deletion recovery (`skip-1`, kind=10): s_dk[k_r + 1] when tok == s_dk[k_r] or kind==10.
-          if (calib_mode != 0 && ac.skip_coef > 0.0f && k_r + 1 < 6 && s_valid_row[k_r + 1] != 0 &&
-              (tok == s_dk[k_r] || kind == 10) && s_num_cands < kCandCap) {
+        // 1b) skip-1 (lane 3) — warp-uniform skip (~95% skipped in 1 cycle)!
+        if (calib_mode != 0 && ac.skip_coef > 0.0f && k_r + 1 < 6 && s_valid_row[k_r + 1] != 0 &&
+            (tok == s_dk[k_r] || kind == 10)) {
+          if (lane == 3) {
             const int64_t skip_tok = s_dk[k_r + 1];
-            if (skip_tok >= 0 && !already_spawned(skip_tok)) {
+            if (skip_tok >= 0) {
               const bool agrees_pl = (can_pl_cont && pl_next_tok == skip_tok && pl_cp > 0.0f);
               const bool agrees_tr = (tr_ch_tok == skip_tok && tr_ch_p > 0.0f);
               const bool agrees_sh = (sh_ch_tok == skip_tok && sh_ch_p > 0.0f);
@@ -2612,72 +2921,18 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
                 if (ac.skip_lh_w > 0.0f && k_r + 2 < 6 && s_valid_row[k_r + 2] != 0) {
                   sk_lh *= (1.0f + ac.skip_lh_w * s_p1[k_r + 2]);
                 }
-                const int slot = s_num_cands++;
-                s_cand_prob[slot] = child_p;
-                s_cand_score[slot] = child_p * sk_lh;
-                s_cand_tok[slot] = skip_tok;
-                s_cand_k[slot] = static_cast<int8_t>(k_child);
-                s_cand_par[slot] = static_cast<int8_t>(r);
-                s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-                s_cand_kind[slot] = 10;
-                s_cand_hpos[slot] = static_cast<int16_t>(ch_hp_i);
-                s_cand_ml[slot] = static_cast<int8_t>(ch_ml_i);
-                s_cand_rk[slot] = -1;
-                record_spawn(skip_tok);
+                c_valid = true; c_tok = skip_tok; c_prob = child_p; c_score = child_p * sk_lh;
+                c_kind = 10; c_hp = static_cast<int16_t>(ch_hp_i); c_ml = static_cast<int8_t>(ch_ml_i); c_rk = -1;
               }
             }
           }
-          // 2) Post-miss top-2 (`alt2`, kind=3) + Markov-coherent / 30B-recycled / s_h-confirmed / wide r'=2..tk-1 (`coh_cont`, kind=6).
-          if (calib_mode != 0 && s_valid_row[j_ch] && (kind < 8 || kind == 10)) {
-            for (int rp = 1; rp < tk; ++rp) {
-              if (s_num_cands >= kCandCap) break;
-              const int64_t ctok = tree_top[j_ch * tree_k + rp];
-              if (ctok < 0 || already_spawned(ctok)) continue;
-              const bool is_bg_hit = ((bg_mask & (1u << rp)) != 0u);
-              const bool agrees_tr = (tr_ch_tok == ctok && tr_ch_p > 0.0f);
-              const bool agrees_sh = (sh_ch_tok == ctok && sh_ch_p > 0.0f);
-              const bool allow_wide = (tree_m > 16) &&
-                  (((kind == 0 || kind == 1 || kind == 3 || kind == 4 || kind == 6 || kind == 7 || kind == 10) &&
-                    (rp == 1 || rp == 2)) ||
-                   (rp == 3 && kind == 0 && k_r <= 2 && s_margin[j_ch] < 1.8f));
-              if (!(((kind == 0 || kind == 4 || kind == 7) && rp == 1) || allow_wide || is_bg_hit || agrees_tr || agrees_sh)) {
-                continue;
-              }
-              const bool agrees_pl = (can_pl_cont && pl_next_tok == ctok && pl_cp > 0.0f);
-              float p_c = has_p_post_vec
-                  ? ((rp == 1) ? (s_p_post_vec[1] * ck.alt2_scale) : s_p_post_vec[rp])
-                  : ((rp == 1) ? s_p2post[j_ch] : (s_e1[j_ch][rp] / s_den1[j_ch]));
-              if (agrees_pl && pl_cp > p_c) p_c = pl_cp;
-              if (agrees_tr && tr_ch_p > p_c) p_c = tr_ch_p;
-              if (agrees_sh && sh_ch_p > p_c) p_c = sh_ch_p;
-              const float child_p = best_prob * p_c;
-              if (child_p > 0.0f) {
-                int16_t ch_hp = -1;
-                int8_t ch_ml = 0;
-                resolve_bg_hpos(rp, agrees_pl, ch_hp, ch_ml);
-                if (agrees_sh && sh_ch_hp >= 0 && (ch_hp < 0 || sh_ch_ml > static_cast<int>(ch_ml))) {
-                  ch_hp = static_cast<int16_t>(sh_ch_hp);
-                  ch_ml = static_cast<int8_t>(sh_ch_ml);
-                }
-                const int slot = s_num_cands++;
-                s_cand_prob[slot] = child_p;
-                s_cand_score[slot] = child_p * cand_lh(k_child, static_cast<int>(ch_hp), static_cast<int>(ch_ml));
-                s_cand_tok[slot] = ctok;
-                s_cand_k[slot] = static_cast<int8_t>(k_child);
-                s_cand_par[slot] = static_cast<int8_t>(r);
-                s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-                s_cand_kind[slot] = (rp == 1) ? 3 : 6;
-                s_cand_hpos[slot] = ch_hp;
-                s_cand_ml[slot] = ch_ml;
-                s_cand_rk[slot] = static_cast<int8_t>(rp);
-                record_spawn(ctok);
-              }
-            }
-          }
-          // 3) Off-by-1 shift recovery (`shf`, kind=2): d_{k_r}#1 = s_dk[k_r - 1].
-          if ((kind == 0 || kind == 2 || kind == 4 || kind == 7) && s_valid_row[k_r - 1] && s_num_cands < kCandCap) {
+        }
+
+        // 3) shf (lane 11) — warp-uniform outer guard!
+        if ((kind == 0 || kind == 2 || kind == 4 || kind == 7) && s_valid_row[k_r - 1]) {
+          if (lane == 11) {
             const int64_t shf_tok = s_dk[k_r - 1];
-            if (shf_tok >= 0 && !already_spawned(shf_tok)) {
+            if (shf_tok >= 0) {
               const bool agrees_pl = (can_pl_cont && pl_next_tok == shf_tok && pl_cp > 0.0f);
               const bool agrees_tr = (tr_ch_tok == shf_tok && tr_ch_p > 0.0f);
               const bool agrees_sh = (sh_ch_tok == shf_tok && sh_ch_p > 0.0f);
@@ -2707,51 +2962,38 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
                   ch_hp_i = sh_ch_hp;
                   ch_ml_i = sh_ch_ml;
                 }
-                const int slot = s_num_cands++;
-                s_cand_prob[slot] = child_p;
-                s_cand_score[slot] = child_p * cand_lh(k_child, ch_hp_i, ch_ml_i);
-                s_cand_tok[slot] = shf_tok;
-                s_cand_k[slot] = static_cast<int8_t>(k_child);
-                s_cand_par[slot] = static_cast<int8_t>(r);
-                s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-                s_cand_kind[slot] = 2;
-                s_cand_hpos[slot] = static_cast<int16_t>(ch_hp_i);
-                s_cand_ml[slot] = static_cast<int8_t>(ch_ml_i);
-                s_cand_rk[slot] = -1;
-                record_spawn(shf_tok);
+                c_valid = true; c_tok = shf_tok; c_prob = child_p;
+                c_score = child_p * cand_lh(k_child, ch_hp_i, ch_ml_i);
+                c_kind = 2; c_hp = static_cast<int16_t>(ch_hp_i); c_ml = static_cast<int8_t>(ch_ml_i); c_rk = -1;
               }
             }
           }
-          // 4) Prompt-lookup copy continuation (`pl_cont`, kind=5): s_h[hpos + 1].
-          if (can_pl_cont && pl_next_tok >= 0 && pl_cp > 0.0f &&
-              !already_spawned(pl_next_tok) && s_num_cands < kCandCap) {
+        }
+
+        // 4) pl_cont (lane 12) — warp-uniform skip!
+        if (can_pl_cont && pl_next_tok >= 0 && pl_cp > 0.0f) {
+          if (lane == 12) {
             float p_use = (tr_ch_tok == pl_next_tok && tr_ch_p > pl_cp) ? tr_ch_p : pl_cp;
             if (sh_ch_tok == pl_next_tok && sh_ch_p > p_use) p_use = sh_ch_p;
             const float child_p = best_prob * p_use;
             if (child_p > 0.0f) {
-              const int slot = s_num_cands++;
-              s_cand_prob[slot] = child_p;
-              s_cand_score[slot] = child_p * cand_lh(k_child, hpos + 1, next_ml);
-              s_cand_tok[slot] = pl_next_tok;
-              s_cand_k[slot] = static_cast<int8_t>(k_child);
-              s_cand_par[slot] = static_cast<int8_t>(r);
-              s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-              s_cand_kind[slot] = 5;
-              s_cand_hpos[slot] = static_cast<int16_t>(hpos + 1);
-              s_cand_ml[slot] = static_cast<int8_t>(next_ml);
-              s_cand_rk[slot] = -1;
-              record_spawn(pl_next_tok);
+              c_valid = true; c_tok = pl_next_tok; c_prob = child_p;
+              c_score = child_p * cand_lh(k_child, hpos + 1, next_ml);
+              c_kind = 5; c_hp = static_cast<int16_t>(hpos + 1); c_ml = static_cast<int8_t>(next_ml); c_rk = -1;
             }
           }
-          // 5) Branch-conditioned unique OOV successor (deterministic nxt occurring >=2 times in s_h).
-          if (calib_mode != 0 && bg.uniq_mode != 0 && s_hist_ok != 0 && rk_in_row >= 1 &&
-              (kind == 0 || (bg.bg_off != 0 && (kind == 3 || kind == 6))) && s_num_cands < kCandCap) {
-            const uint32_t uc = s_alt_cnt[j_par][rk_in_row];
-            const int32_t umin = s_uniq_min[j_par][rk_in_row - 1];
-            const int32_t umax = s_uniq_max[j_par][rk_in_row - 1];
-            if (uc >= 2u && umin >= 0 && umin == umax) {
-              const int64_t utok = static_cast<int64_t>(umin);
-              if (!already_spawned(utok)) {
+        }
+
+        // 5) uniq OOV (lane 13) — warp-uniform skip!
+        if (calib_mode != 0 && bg.uniq_mode != 0 && s_hist_ok != 0 && rk_in_row >= 1 &&
+            (kind == 0 || (bg.bg_off != 0 && (kind == 3 || kind == 6)))) {
+          const uint32_t uc = s_alt_cnt[j_par][rk_in_row];
+          if (uc >= 2u) {
+            if (lane == 13) {
+              const int32_t umin = s_uniq_min[j_par][rk_in_row - 1];
+              const int32_t umax = s_uniq_max[j_par][rk_in_row - 1];
+              if (umin >= 0 && umin == umax) {
+                const int64_t utok = static_cast<int64_t>(umin);
                 float p_u = (uc == 2u) ? bg.uniq_p2 : bg.uniq_p3;
                 if (tr_ch_tok == utok && tr_ch_p > p_u) p_u = tr_ch_p;
                 if (sh_ch_tok == utok && sh_ch_p > p_u) p_u = sh_ch_p;
@@ -2759,102 +3001,122 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
                 if (child_p > 0.0f) {
                   const int hp_u = static_cast<int>(s_uniq_hp[j_par][rk_in_row - 1]);
                   const int ml_u = (uc == 2u) ? 3 : 4;
-                  const int slot = s_num_cands++;
-                  s_cand_prob[slot] = child_p;
-                  s_cand_score[slot] = child_p * cand_lh(k_child, hp_u, ml_u);
-                  s_cand_tok[slot] = utok;
-                  s_cand_k[slot] = static_cast<int8_t>(k_child);
-                  s_cand_par[slot] = static_cast<int8_t>(r);
-                  s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-                  s_cand_kind[slot] = 5;
-                  s_cand_hpos[slot] = static_cast<int16_t>(hp_u);
-                  s_cand_ml[slot] = static_cast<int8_t>(ml_u);
-                  s_cand_rk[slot] = -1;
-                  record_spawn(utok);
+                  c_valid = true; c_tok = utok; c_prob = child_p;
+                  c_score = child_p * cand_lh(k_child, hp_u, ml_u);
+                  c_kind = 5; c_hp = static_cast<int16_t>(hp_u); c_ml = static_cast<int8_t>(ml_u); c_rk = -1;
                 }
               }
             }
           }
-          // 5b) Fused 256-thread branch-conditioned s_h OOV continuation (`mono_tri` / `bg2_mono` / `u2_mono`).
-          if (calib_mode != 0 && sh_ch_tok >= 0 && sh_ch_p > 0.0f &&
-              !already_spawned(sh_ch_tok) && s_num_cands < kCandCap) {
+        }
+
+        // 5b) sh_ch (lane 14) — warp-uniform skip!
+        if (calib_mode != 0 && sh_ch_tok >= 0 && sh_ch_p > 0.0f) {
+          if (lane == 14) {
             const float p_use = (tr_ch_tok == sh_ch_tok && tr_ch_p > sh_ch_p) ? tr_ch_p : sh_ch_p;
             const float child_p = best_prob * p_use;
             if (child_p > 0.0f) {
-              const int slot = s_num_cands++;
-              s_cand_prob[slot] = child_p;
-              s_cand_score[slot] = child_p * cand_lh(k_child, sh_ch_hp, sh_ch_ml);
-              s_cand_tok[slot] = sh_ch_tok;
-              s_cand_k[slot] = static_cast<int8_t>(k_child);
-              s_cand_par[slot] = static_cast<int8_t>(r);
-              s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-              s_cand_kind[slot] = 5;
-              s_cand_hpos[slot] = static_cast<int16_t>(sh_ch_hp);
-              s_cand_ml[slot] = static_cast<int8_t>(sh_ch_ml);
-              s_cand_rk[slot] = -1;
-              record_spawn(sh_ch_tok);
+              c_valid = true; c_tok = sh_ch_tok; c_prob = child_p;
+              c_score = child_p * cand_lh(k_child, sh_ch_hp, sh_ch_ml);
+              c_kind = 5; c_hp = static_cast<int16_t>(sh_ch_hp); c_ml = static_cast<int8_t>(sh_ch_ml); c_rk = -1;
             }
           }
-          // 6) Pure 30B Target-Recycled OOV continuation (`tr_cont`, kind=7).
-          if (calib_mode != 0 && tr_ch_tok >= 0 && tr_ch_p > 0.0f &&
-              !already_spawned(tr_ch_tok) && s_num_cands < kCandCap) {
+        }
+
+        // 6) tr_cont (lane 15) — warp-uniform skip!
+        if (calib_mode != 0 && tr_ch_tok >= 0 && tr_ch_p > 0.0f) {
+          if (lane == 15) {
             const float child_p = best_prob * tr_ch_p;
             if (child_p > 0.0f) {
-              const int slot = s_num_cands++;
-              s_cand_prob[slot] = child_p;
-              s_cand_score[slot] = child_p;
-              s_cand_tok[slot] = tr_ch_tok;
-              s_cand_k[slot] = static_cast<int8_t>(k_child);
-              s_cand_par[slot] = static_cast<int8_t>(r);
-              s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
-              s_cand_kind[slot] = 7;
-              s_cand_hpos[slot] = -1;
-              s_cand_ml[slot] = 0;
-              s_cand_rk[slot] = -1;
-              record_spawn(tr_ch_tok);
+              c_valid = true; c_tok = tr_ch_tok; c_prob = child_p; c_score = child_p;
+              c_kind = 7; c_hp = -1; c_ml = 0; c_rk = -1;
             }
           }
         }
-      } else {
-        s_row_base_sub[r] = -1;
-        s_row_depth[r] = 0;
-        s_row_packed[r] = 0u;
-        input_ids[r] = input_ids[0];
-        saved_leaf_toks[r] = -1;
-        saved_leaf_k[r] = 0;
-        if (saved_leaf_parent != nullptr) {
-          saved_leaf_parent[r] = -1;
+
+        // Step C: Exact priority-order __match_any_sync deduplication + parallel SMEM compaction!
+        const int32_t match_key = c_valid ? static_cast<int32_t>(c_tok) : (-2 - lane);
+        const uint32_t dup_msk = __match_any_sync(0xffffffffu, match_key) & 0xFFFFu;
+        const uint32_t lane_lt = (1u << lane) - 1u;
+        const bool keep = c_valid && ((dup_msk & lane_lt) == 0u);
+        const uint32_t keep_msk = __ballot_sync(0xffffffffu, keep) & 0xFFFFu;
+        if (keep_msk != 0u) {
+          const int base_nc = s_num_cands;
+          const int slot = base_nc + __popc(keep_msk & lane_lt);
+          if (keep && slot < kCandCap) {
+            s_cand_prob[slot] = c_prob;
+            s_cand_score[slot] = c_score;
+            s_cand_tok[slot] = c_tok;
+            s_cand_k[slot] = static_cast<int8_t>(k_child);
+            s_cand_par[slot] = static_cast<int8_t>(r);
+            s_cand_depth[slot] = static_cast<int8_t>(dp + 1);
+            s_cand_kind[slot] = c_kind;
+            s_cand_hpos[slot] = c_hp;
+            s_cand_ml[slot] = c_ml;
+            s_cand_rk[slot] = c_rk;
+          }
+          if (lane == 0) {
+            const int new_nc = base_nc + __popc(keep_msk);
+            s_num_cands = (new_nc < kCandCap) ? new_nc : kCandCap;
+          }
         }
-        leaf_flag[1 + 3 * r + 0] = tree_m - 1 - r;
-        leaf_flag[1 + 3 * r + 1] = -1;
-        leaf_flag[1 + 3 * r + 2] = 0;
       }
-      }  // end if (tid == 0)
       __syncwarp();
     }  // end if (warp == 0)
   }
 
-  // Record per-row (cur, prv1, prv2, pos_r) for up to 32-row 30B Target Recycling commit in 1 parallel cycle.
+  // Flush all r=7..tree_m-1 leaf outputs + saved_row_ctx in warp-0 bursts (handles M<=48 cleanly).
   if (warp == 0) {
-    if (tid < tree_m && saved_row_ctx != nullptr) {
+    const int32_t tok0_i32 = input_ids[0];
+    for (int r = tid; r < tree_m; r += 32) {
+      if (r >= 7) {
+        if (s_leaf_ok_r[r] != 0) {
+          const int k_r = static_cast<int>(s_leaf_k_r[r]);
+          const int32_t tok32 = s_leaf_tok_r[r];
+          const uint64_t pkd = s_row_packed[r];
+          input_ids[r] = tok32;
+          positions[r] = positions[k_r];
+          saved_leaf_toks[r] = static_cast<int64_t>(tok32);
+          saved_leaf_k[r] = k_r;
+          if (saved_leaf_parent != nullptr) saved_leaf_parent[r] = static_cast<int>(s_leaf_par_r[r]);
+          leaf_flag[1 + 4 * r + 0] = tree_m - (k_r + 1);
+          leaf_flag[1 + 4 * r + 1] = s_row_base_sub[r];
+          leaf_flag[1 + 4 * r + 2] = static_cast<int32_t>(pkd & 0xffffffffull);
+          leaf_flag[1 + 4 * r + 3] = static_cast<int32_t>((pkd >> 32) & 0xffffffffull);
+        } else {
+          input_ids[r] = tok0_i32;
+          saved_leaf_toks[r] = -1;
+          saved_leaf_k[r] = 0;
+          if (saved_leaf_parent != nullptr) saved_leaf_parent[r] = -1;
+          leaf_flag[1 + 4 * r + 0] = tree_m - 1 - r;
+          leaf_flag[1 + 4 * r + 1] = -1;
+          leaf_flag[1 + 4 * r + 2] = 0;
+          leaf_flag[1 + 4 * r + 3] = 0;
+        }
+      }
+    }
+    __syncwarp();
+    if (saved_row_ctx != nullptr) {
       const int p0_i32 = static_cast<int>(positions[0]);
       const int32_t p_m1 = (s_hist_ok != 0 && s_ctx[14] >= 0) ? s_ctx[14] : -1;
       const int32_t p_m2 = (s_hist_ok != 0 && s_ctx[13] >= 0) ? s_ctx[13] : -1;
-      int32_t cur_r = -1, prv1_r = -1, prv2_r = -1, pos_r = -1;
-      if (!high_acc) {
-        if (tid < 7) {
-          cur_r = input_ids[tid];
-          prv1_r = (tid == 0) ? p_m1 : input_ids[tid - 1];
-          prv2_r = (tid == 0) ? p_m2 : ((tid == 1) ? p_m1 : input_ids[tid - 2]);
-          pos_r = p0_i32 + tid;
-        } else if (s_leaf_tok_r[tid] >= 0 && saved_leaf_k[tid] > 0) {
-          cur_r = s_leaf_tok_r[tid];
-          prv1_r = (s_leaf_prv_r[tid] >= 0) ? s_leaf_prv_r[tid] : -1;
-          prv2_r = (s_leaf_prv2_r[tid] >= 0) ? s_leaf_prv2_r[tid] : -1;
-          pos_r = p0_i32 + saved_leaf_k[tid];
+      for (int r = tid; r < tree_m; r += 32) {
+        int32_t cur_r = -1, prv1_r = -1, prv2_r = -1, pos_r = -1;
+        if (!high_acc) {
+          if (r < 7) {
+            cur_r = input_ids[r];
+            prv1_r = (r == 0) ? p_m1 : input_ids[r - 1];
+            prv2_r = (r == 0) ? p_m2 : ((r == 1) ? p_m1 : input_ids[r - 2]);
+            pos_r = p0_i32 + r;
+          } else if (s_leaf_ok_r[r] != 0 && s_leaf_tok_r[r] >= 0 && s_leaf_k_r[r] > 0) {
+            cur_r = s_leaf_tok_r[r];
+            prv1_r = (s_leaf_prv_r[r] >= 0) ? s_leaf_prv_r[r] : -1;
+            prv2_r = (s_leaf_prv2_r[r] >= 0) ? s_leaf_prv2_r[r] : -1;
+            pos_r = p0_i32 + static_cast<int>(s_leaf_k_r[r]);
+          }
         }
+        reinterpret_cast<int4*>(saved_row_ctx)[r] = make_int4(cur_r, prv1_r, prv2_r, pos_r);
       }
-      reinterpret_cast<int4*>(saved_row_ctx)[tid] = make_int4(cur_r, prv1_r, prv2_r, pos_r);
     }
 
     if (tid == 0) {
@@ -2912,8 +3174,8 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
   if ((pdl_mode & 1) != 0) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
-  __shared__ uint32_t s_exact_mask;
-  __shared__ uint32_t s_matched_mask;
+  __shared__ uint64_t s_exact_mask;
+  __shared__ uint64_t s_matched_mask;
   __shared__ int32_t s_eff_raw_ns;
   __shared__ int32_t s_final_ns;
   __shared__ int32_t s_len0;
@@ -2924,6 +3186,7 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
 
   const int32_t init_ns = num_sampled[0];
   int32_t u_lane = -1;
+  int32_t u_lane1 = -1;
   if (lane < tree_m) {
     if (no_hit_mode == 0) {
       if (lane < 7) {
@@ -2938,19 +3201,29 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
       }
     }
   }
-  int32_t lpar = -1;
-  int32_t lk = 0;
-  int64_t ltok = -1;
+  const int r1 = lane + 32;
+  if (r1 < tree_m && no_hit_mode == 0) {
+    const int64_t v1 = leaf_u_toks[r1 - 7];
+    u_lane1 = (v1 >= 0 && v1 < static_cast<int64_t>(vocab_size)) ? static_cast<int32_t>(v1) : -1;
+  }
+  int32_t lpar = -1, lpar1 = -1;
+  int32_t lk = 0, lk1 = 0;
+  int64_t ltok = -1, ltok1 = -1;
   if (lane >= 7 && lane < tree_m) {
     lpar = (saved_leaf_parent != nullptr) ? saved_leaf_parent[lane] : -1;
     lk = saved_leaf_k[lane];
     ltok = saved_leaf_toks[lane];
   }
+  if (r1 < tree_m) {
+    lpar1 = (saved_leaf_parent != nullptr) ? saved_leaf_parent[r1] : -1;
+    lk1 = saved_leaf_k[r1];
+    ltok1 = saved_leaf_toks[r1];
+  }
 
   const int mode_w = leaf_flag[0];
   int32_t ns_w = init_ns;
   int32_t nr_w = num_rejected[0];
-  uint32_t matched_mask_w = 0u;
+  uint64_t matched_mask_w = 0ull;
   int32_t hit_dst0_w = 0;
   int32_t hit_src0_w = 0;
   int32_t hit_len_w = 0;
@@ -2965,14 +3238,25 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
     int32_t u_w = 0;
     for (int stage = 0; stage < 6 && ns_w <= 6; ++stage) {
       const int64_t tok_k = (hit_len_w == 0) ? sampled_tokens[ns_w - 1] : static_cast<int64_t>(u_w);
-      const bool pred = (lane >= 7) && (lpar == cur_parent) && (lk == ns_w) &&
-                        (ltok >= 0) && (ltok == tok_k);
-      const uint32_t match = __ballot_sync(0xffffffffu, pred);
-      if (match == 0u) break;
-      const int winner = __ffs(match) - 1;
-      const int32_t u_w_new = __shfl_sync(0xffffffffu, u_lane, winner);
+      const bool pred0 = (lane >= 7 && lane < tree_m) && (lpar == cur_parent) && (lk == ns_w) &&
+                         (ltok >= 0) && (ltok == tok_k);
+      const bool pred1 = (r1 < tree_m) && (lpar1 == cur_parent) && (lk1 == ns_w) &&
+                         (ltok1 >= 0) && (ltok1 == tok_k);
+      const uint32_t match0 = __ballot_sync(0xffffffffu, pred0);
+      const uint32_t match1 = __ballot_sync(0xffffffffu, pred1);
+      if (match0 == 0u && match1 == 0u) break;
+      int winner = 0;
+      int32_t u_w_new = -1;
+      if (match0 != 0u) {
+        winner = __ffs(match0) - 1;
+        u_w_new = __shfl_sync(0xffffffffu, u_lane, winner);
+      } else {
+        const int w1 = __ffs(match1) - 1;
+        winner = 32 + w1;
+        u_w_new = __shfl_sync(0xffffffffu, u_lane1, w1);
+      }
       if (u_w_new < 0) break;
-      matched_mask_w |= (1u << winner);
+      matched_mask_w |= (1ull << winner);
       if (lane == 0) {
         const int32_t dst_r = ns_w;
         sampled_tokens[dst_r] = static_cast<int64_t>(u_w_new);
@@ -2985,7 +3269,7 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
           hit_flag[3 + 2 * hit_len_w] = winner;
         }
       }
-      if ((casc_row_mask_w & (1u << winner)) != 0u) {
+      if (winner < 32 && (casc_row_mask_w & (1u << winner)) != 0u) {
         casc_hit_cnt_w += 1;
       }
       hit_len_w += 1;
@@ -3013,7 +3297,7 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
     const int32_t ns = ns_w;
     const int32_t raw_ns = init_ns;
     const int32_t casc_hit_cnt = casc_hit_cnt_w;
-    const uint32_t matched_mask = matched_mask_w;
+    const uint64_t matched_mask = matched_mask_w;
     const int32_t hit_dst0 = hit_dst0_w;
     const int32_t hit_src0 = hit_src0_w;
     const int32_t hit_len = hit_len_w;
@@ -3032,7 +3316,7 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
     s_eff_raw_ns = raw_ns;
     s_final_ns = ns;
     s_matched_mask = matched_mask;
-    s_exact_mask = 0u;
+    s_exact_mask = 0ull;
     s_do_oov = (no_hit_mode == 0 && oov_preadmit_mode > 0 &&
                 in_static_vocab != nullptr && tail_ids != nullptr &&
                 tail_count != nullptr && tail_seen != nullptr && max_tail > 0 &&
@@ -3068,9 +3352,9 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
           len = 0;
           step_id = 0;
         }
-        uint32_t exact_mask = 0u;
+        uint64_t exact_mask = 0ull;
         for (int r = 0; r < 7 && r < tree_m; ++r) {
-          if (r < raw_ns) exact_mask |= (1u << r);
+          if (r < raw_ns) exact_mask |= (1ull << r);
         }
         for (int r = 7; r < tree_m; ++r) {
           if (saved_row_ctx[r * 4 + 0] < 0) continue;
@@ -3080,9 +3364,9 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
           if (par < 0) {
             ex = (k > 0 && k <= raw_ns);
           } else if (par >= 7 && par < r) {
-            ex = ((exact_mask & (1u << par)) != 0u) && ((matched_mask & (1u << par)) != 0u);
+            ex = ((exact_mask & (1ull << par)) != 0ull) && ((matched_mask & (1ull << par)) != 0ull);
           }
-          if (ex) exact_mask |= (1u << r);
+          if (ex) exact_mask |= (1ull << r);
         }
         s_exact_mask = exact_mask;
         s_len0 = len;
@@ -3197,21 +3481,29 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
     admit_warp_tok(tok_commit);
 
     if (oov_preadmit_mode >= 2 && chain_all_valid != 0) {
-      int32_t tok_cone = -1;
+      int32_t tok_cone0 = -1;
       if (lane < tree_m) {
-        const bool row_ok = (oov_preadmit_mode >= 3)
+        const bool row_ok0 = (oov_preadmit_mode >= 3)
             ? (lane <= 6 || saved_leaf_k[lane] > 0)
-            : (((s_exact_mask & (1u << lane)) != 0u) || lane <= s_eff_raw_ns ||
-               ((s_matched_mask & (1u << lane)) != 0u));
-        if (row_ok) {
-          tok_cone = u_lane;
-        }
+            : (((s_exact_mask & (1ull << lane)) != 0ull) || lane <= s_eff_raw_ns ||
+               ((s_matched_mask & (1ull << lane)) != 0ull));
+        if (row_ok0) tok_cone0 = u_lane;
       }
-      admit_warp_tok(tok_cone);
+      admit_warp_tok(tok_cone0);
+      if (tree_m > 32) {
+        int32_t tok_cone1 = -1;
+        if (r1 < tree_m) {
+          const bool row_ok1 = (oov_preadmit_mode >= 3)
+              ? (saved_leaf_k[r1] > 0)
+              : (((s_exact_mask & (1ull << r1)) != 0ull) || ((s_matched_mask & (1ull << r1)) != 0ull));
+          if (row_ok1) tok_cone1 = u_lane1;
+        }
+        admit_warp_tok(tok_cone1);
+      }
     }
   }
 
-  // Warp-parallel 32-lane coalesced int4 append to tr_log (~1.5 us vs ~35 us scalar).
+  // Warp-parallel 32-lane coalesced int4 append to tr_log (handles M<=48 in 2 warp passes).
   if (s_do_tr != 0) {
     int4 ctx4 = make_int4(-1, -1, -1, -1);
     int32_t u_t = -1;
@@ -3219,19 +3511,40 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
       ctx4 = reinterpret_cast<const int4*>(saved_row_ctx)[lane];
       u_t = u_lane;
     }
-    const bool valid = (lane < tree_m && ctx4.x >= 0 && ctx4.x < vocab_size && u_t >= 0 && u_t < vocab_size);
-    const uint32_t vmask = __ballot_sync(0xffffffffu, valid);
-    const int off = __popc(vmask & ((1u << lane) - 1u));
-    const int dst = s_len0 + off;
-    if (valid && dst < tr_cap) {
+    const bool valid0 = (lane < tree_m && ctx4.x >= 0 && ctx4.x < vocab_size && u_t >= 0 && u_t < vocab_size);
+    const uint32_t vmask0 = __ballot_sync(0xffffffffu, valid0);
+    const int off0 = __popc(vmask0 & ((1u << lane) - 1u));
+    const int dst0 = s_len0 + off0;
+    if (valid0 && dst0 < tr_cap) {
       int4* tr4 = reinterpret_cast<int4*>(tr_log);
       const int32_t pos_val = (lane == 0) ? s_ctx_p0 : ctx4.w;
-      const int32_t tier_val = ((s_exact_mask & (1u << lane)) != 0u) ? 0 : 1;
-      tr4[dst * 2 + 0] = make_int4(lane, ctx4.x, ctx4.y, ctx4.z);
-      tr4[dst * 2 + 1] = make_int4(u_t, s_step_id, pos_val, tier_val);
+      const int32_t tier_val = ((s_exact_mask & (1ull << lane)) != 0ull) ? 0 : 1;
+      tr4[dst0 * 2 + 0] = make_int4(lane, ctx4.x, ctx4.y, ctx4.z);
+      tr4[dst0 * 2 + 1] = make_int4(u_t, s_step_id, pos_val, tier_val);
+    }
+    const int total_v0 = __popc(vmask0);
+    int total_v1 = 0;
+    if (tree_m > 32) {
+      int4 ctx4_1 = make_int4(-1, -1, -1, -1);
+      int32_t u_t1 = -1;
+      if (r1 < tree_m) {
+        ctx4_1 = reinterpret_cast<const int4*>(saved_row_ctx)[r1];
+        u_t1 = u_lane1;
+      }
+      const bool valid1 = (r1 < tree_m && ctx4_1.x >= 0 && ctx4_1.x < vocab_size && u_t1 >= 0 && u_t1 < vocab_size);
+      const uint32_t vmask1 = __ballot_sync(0xffffffffu, valid1);
+      const int off1 = __popc(vmask1 & ((1u << lane) - 1u));
+      const int dst1 = s_len0 + total_v0 + off1;
+      if (valid1 && dst1 < tr_cap) {
+        int4* tr4 = reinterpret_cast<int4*>(tr_log);
+        const int32_t tier_val1 = ((s_exact_mask & (1ull << r1)) != 0ull) ? 0 : 1;
+        tr4[dst1 * 2 + 0] = make_int4(r1, ctx4_1.x, ctx4_1.y, ctx4_1.z);
+        tr4[dst1 * 2 + 1] = make_int4(u_t1, s_step_id, ctx4_1.w, tier_val1);
+      }
+      total_v1 = __popc(vmask1);
     }
     if (lane == 0) {
-      const int total_v = __popc(vmask);
+      const int total_v = total_v0 + total_v1;
       const int new_len = (s_len0 + total_v <= tr_cap) ? (s_len0 + total_v) : tr_cap;
       const int appended = (new_len > s_len0) ? (new_len - s_len0) : 0;
       saved_row_ctx[3] = -1;
@@ -3572,6 +3885,7 @@ static const CalibKnobs& get_calib_knobs_env() {
         env_f("MUSE_CAL_Z0_CENTER", 36.0f),
         env_f("MUSE_CAL_SHIFT", CAL_SHIFT),
         env_f("MUSE_CAL_ALT2", 1.20f),
+        env_f("MUSE_CAL_C_TAIL_STEP", 0.18f),
     };
   }();
   return ck;
@@ -3699,7 +4013,7 @@ void native_leaf_prepare_tree(
     torch::Tensor positions,
     torch::Tensor seq_lens,
     int64_t tree_m) {
-  TORCH_CHECK(tree_m >= 8 && tree_m <= 32, "tree_m must be in 8..32");
+  TORCH_CHECK(tree_m >= 8 && tree_m <= 48, "tree_m must be in 8..48");
   TORCH_CHECK(positions.is_cuda() && positions.scalar_type() == torch::kInt64 && positions.numel() >= tree_m);
   TORCH_CHECK(seq_lens.is_cuda() && seq_lens.scalar_type() == torch::kInt32 && seq_lens.numel() >= 1);
   auto st = c10::cuda::getCurrentCUDAStream().stream();
@@ -3740,8 +4054,8 @@ void native_leaf_setup_tree(
     c10::optional<torch::Tensor> cascade_meta,
     c10::optional<torch::Tensor> cascade_toks,
     c10::optional<torch::Tensor> cascade_vals) {
-  TORCH_CHECK(tree_m >= 8 && tree_m <= 32, "tree_m must be in 8..32");
-  TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32 && leaf_flag.numel() >= 1 + tree_m * 3);
+  TORCH_CHECK(tree_m >= 8 && tree_m <= 48, "tree_m must be in 8..48");
+  TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32 && leaf_flag.numel() >= 1 + tree_m * 4);
   TORCH_CHECK(tree_top.is_cuda() && tree_top.scalar_type() == torch::kInt64 && tree_top.numel() >= 20);
   TORCH_CHECK(input_ids.is_cuda() && input_ids.scalar_type() == torch::kInt32 && input_ids.numel() >= tree_m);
   TORCH_CHECK(positions.is_cuda() && positions.scalar_type() == torch::kInt64 && positions.numel() >= tree_m);
@@ -3749,7 +4063,7 @@ void native_leaf_setup_tree(
               saved_leaf_toks.numel() >= tree_m);
   TORCH_CHECK(saved_leaf_k.is_cuda() && saved_leaf_k.scalar_type() == torch::kInt32 &&
               saved_leaf_k.numel() >= tree_m);
-  const int tree_k = (tree_top.numel() >= 48) ? 8 : ((tree_top.numel() >= 36) ? 6 : 4);
+  const int tree_k = (tree_top.numel() >= 96) ? 16 : ((tree_top.numel() >= 72) ? 12 : ((tree_top.numel() >= 48) ? 8 : ((tree_top.numel() >= 36) ? 6 : 4)));
   const int32_t* acc_ptr = nullptr;
   int acc_len = 0;
   if (req_acc_state.has_value() && req_acc_state.value().defined() && req_acc_state.value().numel() >= 3) {
@@ -4022,7 +4336,7 @@ void native_leaf_commit_tree(
     c10::optional<torch::Tensor> tail_count,
     c10::optional<torch::Tensor> tail_seen,
     c10::optional<torch::Tensor> hit_cond) {
-  TORCH_CHECK(tree_m >= 8 && tree_m <= 32, "tree_m must be in 8..32");
+  TORCH_CHECK(tree_m >= 8 && tree_m <= 48, "tree_m must be in 8..48");
   TORCH_CHECK(leaf_flag.is_cuda() && leaf_flag.scalar_type() == torch::kInt32);
   TORCH_CHECK(prev_ns.is_cuda() && prev_ns.scalar_type() == torch::kInt32);
   TORCH_CHECK(hit_flag.is_cuda() && hit_flag.scalar_type() == torch::kInt32 && hit_flag.numel() >= 1);
@@ -4692,6 +5006,9 @@ struct AdaptiveVerifyGateArgs {
   float burst_wide_sm;
   float burst_wide_m0;
   int force_mode;  // 0=adaptive, 1=always M=16, 2=always M=32
+  int narrow_leaves;
+  int wide_leaves;
+  float c_tail_step;
   cudaGraphConditionalHandle h_m16;
   cudaGraphConditionalHandle h_m32;
 };
@@ -4699,6 +5016,7 @@ struct AdaptiveVerifyGateArgs {
 __global__ void __launch_bounds__(32) native_leaf_choose_m_cond_kernel(AdaptiveVerifyGateArgs a) {
   const int lane = threadIdx.x & 31;
   __shared__ float s_p[6][8];
+  __shared__ float s_p_ext[6][8];
   __shared__ float s_p1post[6];
   __shared__ float s_p2post[6];
   __shared__ float s_A[6];
@@ -4714,14 +5032,14 @@ __global__ void __launch_bounds__(32) native_leaf_choose_m_cond_kernel(AdaptiveV
     use_m32 = false;
   } else if (a.opt_rho <= 0.0f) {
     if (lane == 0) {
-      const int tk = (a.tree_k >= 8) ? 8 : 6;
+      const int row_stride = (a.tree_k >= 16) ? 16 : ((a.tree_k >= 12) ? 12 : ((a.tree_k >= 8) ? 8 : 6));
       float min_m03 = 2.5f;
       float sm4_sum = 0.0f;
       if (a.tree_vals != nullptr) {
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          const float z0 = a.tree_vals[j * tk + 0];
-          const float z1 = a.tree_vals[j * tk + 1];
+          const float z0 = a.tree_vals[j * row_stride + 0];
+          const float z1 = a.tree_vals[j * row_stride + 1];
           const float mj = (z0 > -1e20f && z1 > -1e20f) ? (z0 - z1) : 2.5f;
           if (j == 0 || mj < min_m03) min_m03 = mj;
           sm4_sum += mj;
@@ -4750,10 +5068,11 @@ __global__ void __launch_bounds__(32) native_leaf_choose_m_cond_kernel(AdaptiveV
   } else {
     // 1-warp OPT-Tree Expected-Acceptance DP over calibrated 96-node speculative tree:
     // selects M=32 iff marginal expected token gain (sum25 - sum9) exceeds opt_rho * E_16.
-    const int tk = (a.tree_k >= 8) ? 8 : 6;
+    const int row_stride = (a.tree_k >= 16) ? 16 : ((a.tree_k >= 12) ? 12 : ((a.tree_k >= 8) ? 8 : 6));
+    const int tk = (row_stride >= 8) ? 8 : 6;
     if (lane < 6) {
-      const float z0 = (a.tree_vals != nullptr) ? a.tree_vals[lane * tk + 0] : -1e30f;
-      const float z1 = (a.tree_vals != nullptr) ? a.tree_vals[lane * tk + 1] : -1e30f;
+      const float z0 = (a.tree_vals != nullptr) ? a.tree_vals[lane * row_stride + 0] : -1e30f;
+      const float z1 = (a.tree_vals != nullptr) ? a.tree_vals[lane * row_stride + 1] : -1e30f;
       const int ok = (z0 > -1e20f) ? 1 : 0;
       s_valid[lane] = ok;
       s_z0[lane] = z0;
@@ -4781,7 +5100,7 @@ __global__ void __launch_bounds__(32) native_leaf_choose_m_cond_kernel(AdaptiveV
         for (int rk = 0; rk < 8; ++rk) {
           float v0 = 0.0f, v1 = 0.0f;
           if (rk < tk) {
-            const float zr = a.tree_vals[lane * tk + rk];
+            const float zr = a.tree_vals[lane * row_stride + rk];
             if (rk == 0 || zr > -1e20f) {
               const float dz = zr - s_z0[lane];
               v0 = __expf(a_pre + kCalC[rk] + CAL_BETA * dz);
@@ -4794,15 +5113,34 @@ __global__ void __launch_bounds__(32) native_leaf_choose_m_cond_kernel(AdaptiveV
           den0 += v0;
           den1 += v1;
         }
+        float e0_ext[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        if (row_stride > 8) {
+          for (int rk = 8; rk < row_stride; ++rk) {
+            const float zr = a.tree_vals[lane * row_stride + rk];
+            if (zr > -1e20f) {
+              const float dz = zr - s_z0[lane];
+              const float c_rk = kCalC[7] - a.c_tail_step * static_cast<float>(rk - 7);
+              const float v0 = __expf(a_pre + c_rk + CAL_BETA * dz);
+              e0_ext[rk - 8] = v0;
+              den0 += v0;
+            }
+          }
+        }
         const float inv0 = 1.0f / den0;
         const float inv1 = 1.0f / den1;
 #pragma unroll
-        for (int rk = 0; rk < 8; ++rk) s_p[lane][rk] = e0[rk] * inv0;
+        for (int rk = 0; rk < 8; ++rk) {
+          s_p[lane][rk] = e0[rk] * inv0;
+          s_p_ext[lane][rk] = e0_ext[rk] * inv0;
+        }
         s_p1post[lane] = e1_0 * inv1;
         s_p2post[lane] = e1_1 * inv1 * 1.20f;
       } else {
 #pragma unroll
-        for (int rk = 0; rk < 8; ++rk) s_p[lane][rk] = 0.0f;
+        for (int rk = 0; rk < 8; ++rk) {
+          s_p[lane][rk] = 0.0f;
+          s_p_ext[lane][rk] = 0.0f;
+        }
         s_p1post[lane] = 0.0f;
         s_p2post[lane] = 0.0f;
       }
@@ -4825,10 +5163,10 @@ __global__ void __launch_bounds__(32) native_leaf_choose_m_cond_kernel(AdaptiveV
     }
     __syncwarp();
 
-    float cv[3] = {0.0f, 0.0f, 0.0f};
+    float cv[5] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-    for (int u = 0; u < 3; ++u) {
-      const int idx = lane * 3 + u;
+    for (int u = 0; u < 5; ++u) {
+      const int idx = lane * 5 + u;
       float val = 0.0f;
       if (idx < 42) {
         const int j = idx / 7;
@@ -4844,23 +5182,33 @@ __global__ void __launch_bounds__(32) native_leaf_choose_m_cond_kernel(AdaptiveV
         const int j = (t < 8) ? (t >> 1) : (t - 8);
         const int rk = (t < 8) ? (1 + (t & 1)) : 3;
         val = s_A[j] * s_p[j][rk] * s_p1post[j + 1] * s_p[j + 2][0];
-      } else {
+      } else if (idx < 96) {
         const int t = idx - 87;
         const int j = t / 3;
         const int rk = 1 + (t - j * 3);
         val = s_A[j] * s_p[j][rk] * s_p2post[j + 1];
+      } else if (idx < 144 && row_stride > 8) {
+        const int t = idx - 96;
+        const int j = t >> 3;
+        const int er = t & 7;
+        if (8 + er < row_stride) {
+          val = s_A[j] * s_p_ext[j][er];
+        }
       }
       cv[u] = val;
     }
 
-    float sum9 = 0.0f;
-    float sum25 = 0.0f;
-#pragma unroll
-    for (int k = 0; k < 25; ++k) {
+    const int n_narrow = (a.narrow_leaves > 0) ? a.narrow_leaves : 9;
+    const int n_wide = (a.wide_leaves >= n_narrow) ? a.wide_leaves : 25;
+    float sum_narrow = 0.0f;
+    float sum_wide = 0.0f;
+    for (int k = 0; k < n_wide; ++k) {
       int best_u = 0;
       float my_max = cv[0];
       if (cv[1] > my_max) { my_max = cv[1]; best_u = 1; }
       if (cv[2] > my_max) { my_max = cv[2]; best_u = 2; }
+      if (cv[3] > my_max) { my_max = cv[3]; best_u = 3; }
+      if (cv[4] > my_max) { my_max = cv[4]; best_u = 4; }
       float w_max = my_max;
       int w_lane = lane;
 #pragma unroll
@@ -4873,15 +5221,15 @@ __global__ void __launch_bounds__(32) native_leaf_choose_m_cond_kernel(AdaptiveV
         }
       }
       if (lane == w_lane) cv[best_u] = -1.0f;
-      if (k < 9) sum9 += w_max;
-      sum25 += w_max;
+      if (k < n_narrow) sum_narrow += w_max;
+      sum_wide += w_max;
     }
 
     if (lane == 0) {
-      const float e16 = s_echain + sum9;
-      const float de = sum25 - sum9;
+      const float e_narrow = s_echain + sum_narrow;
+      const float de = sum_wide - sum_narrow;
       const bool high_acc = (a.req_acc_state != nullptr && a.req_acc_state[2] != 0);
-      use_m32 = (!high_acc) && (de > a.opt_rho * e16);
+      use_m32 = (!high_acc) && (de > a.opt_rho * e_narrow);
     }
   }
 
@@ -5060,6 +5408,110 @@ __global__ void __launch_bounds__(32) native_leaf_store_host_out_kernel(StoreHos
 
 }  // namespace
 
+
+// Conditional-body memcpy lowering. Some GB10 drivers crash inside cudaGraphInstantiate
+// (or refuse) when a conditional body graph holds a memcpy node, including memcpy
+// nodes inside child graphs captured by torch. Before instantiating the adaptive and
+// compound conditional graphs, every 1D memcpy node in a conditional body (recursing
+// through child graphs) is replaced by a kernel node that copies the same bytes with
+// the same dependencies. Host buffers are pinned and device-mapped (UVA), so the
+// device-side copy reads and writes the same memory the copy engine would.
+__global__ void native_leaf_copy_bytes_kernel(const unsigned char* __restrict__ src,
+                                              unsigned char* __restrict__ dst, unsigned long long n) {
+  const unsigned long long tid = blockIdx.x * static_cast<unsigned long long>(blockDim.x) + threadIdx.x;
+  const unsigned long long stride = static_cast<unsigned long long>(gridDim.x) * blockDim.x;
+  if (((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst) | n) & 15ull) == 0) {
+    const uint4* s4 = reinterpret_cast<const uint4*>(src);
+    uint4* d4 = reinterpret_cast<uint4*>(dst);
+    for (unsigned long long i = tid; i < (n >> 4); i += stride) d4[i] = s4[i];
+  } else {
+    for (unsigned long long i = tid; i < n; i += stride) dst[i] = src[i];
+  }
+  __threadfence_system();
+}
+
+struct NlCopyArgs { const unsigned char* src; unsigned char* dst; unsigned long long n; };
+
+static bool nl_device_view(const void* p, const void** out) {
+  cudaPointerAttributes at{};
+  if (cudaPointerGetAttributes(&at, p) != cudaSuccess) { cudaGetLastError(); return false; }
+  if (at.type == cudaMemoryTypeDevice || at.type == cudaMemoryTypeManaged) { *out = p; return true; }
+  if (at.type == cudaMemoryTypeHost) {
+    if (at.devicePointer == nullptr) return false;
+    *out = at.devicePointer; return true;
+  }
+  int pageable = 0; int dev = 0; cudaGetDevice(&dev);
+  cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccessUsesHostPageTables, dev);
+  if (!pageable) return false;
+  *out = p; return true;
+}
+
+// Returns the number of memcpy nodes still present (0 when every one was lowered).
+static int nl_lower_memcpy_nodes(cudaGraph_t g, int depth) {
+  if (depth > 8) return 1;
+  size_t n = 0;
+  if (cudaGraphGetNodes(g, nullptr, &n) != cudaSuccess) { cudaGetLastError(); return 1; }
+  std::vector<cudaGraphNode_t> nodes(n);
+  if (n && cudaGraphGetNodes(g, nodes.data(), &n) != cudaSuccess) { cudaGetLastError(); return 1; }
+  int left = 0;
+  for (cudaGraphNode_t nd : nodes) {
+    cudaGraphNodeType t;
+    if (cudaGraphNodeGetType(nd, &t) != cudaSuccess) { cudaGetLastError(); return 1; }
+    if (t == cudaGraphNodeTypeGraph) {
+      cudaGraph_t cg = nullptr;
+      if (cudaGraphChildGraphNodeGetGraph(nd, &cg) != cudaSuccess) { cudaGetLastError(); return 1; }
+      left += nl_lower_memcpy_nodes(cg, depth + 1);
+      continue;
+    }
+    if (t != cudaGraphNodeTypeMemcpy) continue;
+    cudaMemcpy3DParms mp{};
+    if (cudaGraphMemcpyNodeGetParams(nd, &mp) != cudaSuccess) { cudaGetLastError(); ++left; continue; }
+    if (mp.srcArray || mp.dstArray || mp.extent.height > 1 || mp.extent.depth > 1 ||
+        mp.srcPos.y || mp.srcPos.z || mp.dstPos.y || mp.dstPos.z || mp.srcPtr.ptr == nullptr ||
+        mp.dstPtr.ptr == nullptr) { ++left; continue; }
+    const void* src_dev = nullptr; const void* dst_dev = nullptr;
+    const unsigned char* src_raw = static_cast<const unsigned char*>(mp.srcPtr.ptr) + mp.srcPos.x;
+    unsigned char* dst_raw = static_cast<unsigned char*>(mp.dstPtr.ptr) + mp.dstPos.x;
+    if (!nl_device_view(src_raw, &src_dev) || !nl_device_view(dst_raw, &dst_dev)) { ++left; continue; }
+    size_t nd_in = 0, nd_out = 0;
+    if (cudaGraphNodeGetDependencies(nd, nullptr, nullptr, &nd_in) != cudaSuccess ||
+        cudaGraphNodeGetDependentNodes(nd, nullptr, nullptr, &nd_out) != cudaSuccess) { cudaGetLastError(); ++left; continue; }
+    std::vector<cudaGraphNode_t> ins(nd_in), outs(nd_out);
+    if ((nd_in && cudaGraphNodeGetDependencies(nd, ins.data(), nullptr, &nd_in) != cudaSuccess) ||
+        (nd_out && cudaGraphNodeGetDependentNodes(nd, outs.data(), nullptr, &nd_out) != cudaSuccess)) { cudaGetLastError(); ++left; continue; }
+    NlCopyArgs ca{static_cast<const unsigned char*>(src_dev), static_cast<unsigned char*>(const_cast<void*>(dst_dev)),
+                  static_cast<unsigned long long>(mp.extent.width)};
+    cudaKernelNodeParams kp{};
+    kp.func = reinterpret_cast<void*>(native_leaf_copy_bytes_kernel);
+    const unsigned long long blocks = (ca.n + 4095ull) / 4096ull;
+    kp.gridDim = dim3(static_cast<unsigned>(blocks < 1 ? 1 : (blocks > 64 ? 64 : blocks)), 1, 1);
+    kp.blockDim = dim3(256, 1, 1);
+    kp.sharedMemBytes = 0;
+    void* kargs[3] = {&ca.src, &ca.dst, &ca.n};
+    kp.kernelParams = kargs;
+    cudaGraphNode_t kn = nullptr;
+    if (cudaGraphAddKernelNode(&kn, g, ins.empty() ? nullptr : ins.data(), ins.size(), &kp) != cudaSuccess) { cudaGetLastError(); ++left; continue; }
+    bool ok = true;
+    for (cudaGraphNode_t o : outs) {
+      if (cudaGraphAddDependencies(g, &kn, &o, nullptr, 1) != cudaSuccess) { ok = false; break; }
+    }
+    if (!ok) { cudaGetLastError(); cudaGraphDestroyNode(kn); ++left; continue; }
+    if (cudaGraphDestroyNode(nd) != cudaSuccess) { cudaGetLastError(); ++left; continue; }
+  }
+  return left;
+}
+
+static bool nl_lower_cond_bodies(std::initializer_list<cudaGraph_t> bodies, const char* tag) {
+  static const bool enabled = []() -> bool {
+    const char* s = std::getenv("MUSE_COND_MEMCPY_LOWER");
+    return !(s && *s && std::atoi(s) == 0);
+  }();
+  if (!enabled) return true;
+  int left = 0;
+  for (cudaGraph_t b : bodies) left += nl_lower_memcpy_nodes(b, 0);
+  if (left) fprintf(stderr, "native_leaf: %s graph keeps %d memcpy node(s) in a conditional body\n", tag, left);
+  return left == 0;
+}
 int64_t native_leaf_build_adaptive_verify_graph(
     std::vector<int64_t> m16_graphs,
     std::vector<int64_t> m32_graphs,
@@ -5107,6 +5559,13 @@ int64_t native_leaf_build_adaptive_verify_graph(
   gargs.burst_wide_sm = env_f("MUSE_ADAPT_BURST_WIDE_SM", 1.10f);
   gargs.burst_wide_m0 = env_f("MUSE_ADAPT_BURST_WIDE_M0", 0.95f);
   gargs.force_mode = static_cast<int>(force_mode);
+  {
+    const int nm = static_cast<int>(env_f("MUSE_NATIVE_TREE_M", 16.0f));
+    const int wm = static_cast<int>(env_f("MUSE_NATIVE_TREE_WIDE_M", 48.0f));
+    gargs.narrow_leaves = std::max(1, std::min(41, nm - 7));
+    gargs.wide_leaves = std::max(gargs.narrow_leaves, std::min(41, wm - 7));
+    gargs.c_tail_step = env_f("MUSE_CAL_C_TAIL_STEP", 0.18f);
+  }
   gargs.h_m16 = h_m16;
   gargs.h_m32 = h_m32;
 
@@ -5148,6 +5607,10 @@ int64_t native_leaf_build_adaptive_verify_graph(
     TORCH_CHECK(false, "cudaGraphAddNode(cond32) failed");
   }
 
+  if (!nl_lower_cond_bodies({cp16.conditional.phGraph_out[0], cp32.conditional.phGraph_out[0]}, "adaptive")) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "adaptive verify graph: memcpy node left in a conditional body");
+  }
   cudaGraphExec_t outer_exec = nullptr;
   err = cudaGraphInstantiate(&outer_exec, outer_graph, 0);
   if (err != cudaSuccess) {
@@ -5232,6 +5695,13 @@ int64_t native_leaf_build_compound_step_graph(
   gargs.burst_wide_sm = env_f("MUSE_ADAPT_BURST_WIDE_SM", 1.10f);
   gargs.burst_wide_m0 = env_f("MUSE_ADAPT_BURST_WIDE_M0", 0.95f);
   gargs.force_mode = static_cast<int>(force_mode);
+  {
+    const int nm = static_cast<int>(env_f("MUSE_NATIVE_TREE_M", 16.0f));
+    const int wm = static_cast<int>(env_f("MUSE_NATIVE_TREE_WIDE_M", 48.0f));
+    gargs.narrow_leaves = std::max(1, std::min(41, nm - 7));
+    gargs.wide_leaves = std::max(gargs.narrow_leaves, std::min(41, wm - 7));
+    gargs.c_tail_step = env_f("MUSE_CAL_C_TAIL_STEP", 0.18f);
+  }
   gargs.h_m16 = h_m16;
   gargs.h_m32 = h_m32;
 
@@ -5373,6 +5843,10 @@ int64_t native_leaf_build_compound_step_graph(
   }
 
   cudaGraphExec_t outer_exec = nullptr;
+  if (!nl_lower_cond_bodies({cp16.conditional.phGraph_out[0], cp32.conditional.phGraph_out[0]}, "compound")) {
+    cudaGraphDestroy(outer_graph);
+    TORCH_CHECK(false, "compound step graph: memcpy node left in a conditional body");
+  }
   err = cudaGraphInstantiate(&outer_exec, outer_graph, 0);
   if (err != cudaSuccess) {
     cudaGraphDestroy(outer_graph);
