@@ -205,7 +205,8 @@ __device__ __forceinline__ void issue_kv64_flat(
     uint4 smem_tile[64][16],
     const __nv_bfloat16* __restrict__ flat_base,
     int tok_base,
-    int tid) {
+    int tid,
+    int pairs = 4) {
   const int r_in_16 = tid >> 4;
   const int c = tid & 15;
   const int c_phys = c ^ (r_in_16 & 7);
@@ -213,8 +214,10 @@ __device__ __forceinline__ void issue_kv64_flat(
       flat_base + static_cast<int64_t>(tok_base) * 128) + r_in_16 * 16 + c;
   #pragma unroll
   for (int u = 0; u < 4; ++u) {
-    const int r = (u << 4) + r_in_16;
-    cp_async_16(smem_u32(&smem_tile[r][c_phys]), src + u * 256);
+    if (u == 0 || u < pairs) {
+      const int r = (u << 4) + r_in_16;
+      cp_async_16(smem_u32(&smem_tile[r][c_phys]), src + u * 256);
+    }
   }
 }
 
@@ -613,15 +616,16 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   float row_max0 = -INFINITY, row_max1 = -INFINITY;
   float row_sum0 = 0.0f, row_sum1 = 0.0f;
 
-  issue_kv64_flat(kv_smem[0], k_flat, (nb_max - 1) << 7, tid);
+  const int diag_pairs = ((m_grp & 15) >> 1) + 1;
+  const int diag_lo_pairs = half_only ? diag_pairs : 4;
+  issue_kv64_flat(kv_smem[0], k_flat, (nb_max - 1) << 7, tid, diag_lo_pairs);
   cp_async_commit();
 
   for (int nb = nb_max - 1; nb >= 0; --nb) {
     const int block_tok_base = nb << 7;
     const bool is_diag = (nb == nb_max - 1);
     const bool skip_hi = is_diag && half_only;
-    const int diag_pairs = ((m_grp & 15) >> 1) + 1;
-    const int lo_pairs = is_diag && skip_hi ? diag_pairs : 4;
+    const int lo_pairs = is_diag ? diag_lo_pairs : 4;
     const int hi_pairs = is_diag ? diag_pairs - 4 : 4;
 
     float s_frag[16][4];
@@ -631,7 +635,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     }
 
     if (!skip_hi) {
-      issue_kv64_flat(kv_smem[1], k_flat, block_tok_base + 64, tid);
+      issue_kv64_flat(kv_smem[1], k_flat, block_tok_base + 64, tid, hi_pairs);
       cp_async_commit();
       cp_async_wait<1>();
     } else {
