@@ -1438,15 +1438,21 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   const bool x_aligned16 = ((reinterpret_cast<uintptr_t>(x) & 15u) == 0u) &&
                            (act_mode != 1 || ((reinterpret_cast<uintptr_t>(x_aux) & 15u) == 0u));
   bool use_xsmem_fused = false;
+  static const bool xsmem_fused_m8 = []() {
+    const char* env = std::getenv("MUSERANS_XSMEM_FUSED_M8");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
   if (M > 1) {
     // M rows: stage M*K bytes of x if M<=8 and it fits with this wpb (for act_mode 0 or 1);
-    // for M>8 (or act_mode 2 where M*K doesn't fit), use chunked SMEM (kXsmem) or global __ldg.
-    if (act_mode != 2 && M <= 8 && rans_fits(M * K, wpb, 9, rg)) {
+    // for M>8 (or act_mode 2 where M*K doesn't fit, or M=6..8 act_mode 1 when xsmem_fused_m8 is on),
+    // use chunked SMEM (kXsmem) or global __ldg.
+    const bool can_xsmem_fused = par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 20 &&
+                                 x_aligned16 && ((K >> 5) % 16 == 0) &&
+                                 dsmem_xsmem <= (size_t)(RANS_MAX_SMEM - RANS_LUT_BYTES);
+    const bool prefer_xsmem_m8 = xsmem_fused_m8 && act_mode == 1 && M >= 6 && M <= 8 && can_xsmem_fused;
+    if (act_mode != 2 && M <= 8 && !prefer_xsmem_m8 && rans_fits(M * K, wpb, 9, rg)) {
       dsmem = rans_dsmem(M * K, wpb, 9, rg);
     } else if (act_mode == 1 || act_mode == 2) {
-      const bool can_xsmem_fused = par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 20 &&
-                                   x_aligned16 && ((K >> 5) % 16 == 0) &&
-                                   dsmem_xsmem <= (size_t)(RANS_MAX_SMEM - RANS_LUT_BYTES);
       TORCH_CHECK(can_xsmem_fused, "rans fused multi-M requires par4/ns4/rg4/ilv9, 16B-aligned x, S%16==0, and smem fit");
       pb.x_global = 1;
       use_xsmem_fused = true;
