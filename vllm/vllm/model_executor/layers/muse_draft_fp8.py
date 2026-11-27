@@ -31,6 +31,7 @@ MAX_M_FP8 = 16
 MAX_M_NVFP4 = 8
 MAX_M_INT3 = 16
 MAX_M_INT4 = 16
+os.environ.setdefault("MUSE_INT4_SYM_H64", "1")
 _NAMES = ("qkv_proj", "o_proj", "gate_up_proj", "down_proj", "fc")
 _MLP_FC_NAMES = ("gate_up_proj", "down_proj", "fc")
 _CTX_ATTN_NAMES = ("fc", "fkv", "qkv_proj", "o_proj")
@@ -107,8 +108,10 @@ def _vq4d_mode() -> int:
       6 = all 10 MLPs H64 + NF3-sym 3.125 bpw (762.5 MB, ~15.5dB)
       7 = hybrid: 5x gate_up H64 + NF3-sym 3.125 bpw (~15.5dB) + 5x down_proj 2.375 bpw (4D-256) (672 MB)
       8 = hybrid: 5x gate_up H64 + NF3-sym 3.125 bpw (~15.5dB) + 5x down_proj 2.625 bpw (4D-512) (702 MB)
+      12 = hybrid: 5x gate_up H64 + NF3-sym 3.125 bpw + 5x down_proj 2.875 bpw (4D-1024, +1.47dB) (728 MB)
+      13 = hybrid: 5x gate_up 3.125 bpw (4D-2048, +1.35dB) + 5x down_proj 2.875 bpw (4D-1024, +1.47dB) [default]
     """
-    raw = os.environ.get("MUSE_DRAFT_VQ2375", "8").strip().lower()
+    raw = os.environ.get("MUSE_DRAFT_VQ2375", "14").strip().lower()
     if raw in ("", "0", "off", "false", "none"):
         return 0
     if raw in ("1", "all9", "2375"):
@@ -127,21 +130,46 @@ def _vq4d_mode() -> int:
         return 7
     if raw in ("8", "h64nf3_vq10"):
         return 8
+    if raw in ("9", "all11", "2875"):
+        return 9
     if raw in ("10", "h64gu"):
         return 10
+    if raw in ("11", "vq11_vq10"):
+        return 11
+    if raw in ("12", "h64nf3_vq11"):
+        return 12
+    if raw in ("13", "vq12_vq11"):
+        return 13
+    if raw in ("14", "vq12_vq10"):
+        return 14
+    if raw in ("15", "all12", "vq12"):
+        return 15
     try:
         v = int(raw)
-        return v if v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 10) else 0
+        return v if v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15) else 0
     except ValueError:
         return 0
 
 
-def _vq4d_bits_for_swiglu() -> int:
+def _vq4d_bits_for_swiglu(name: str = "") -> int:
+    sel10 = _parse_layer_selectors("MUSE_DRAFT_GU_VQ10")
+    if sel10 and name and _matches_selectors(name, "gate_up_proj", sel10):
+        return 10
+    sel11 = _parse_layer_selectors("MUSE_DRAFT_GU_VQ11")
+    if sel11 and name and _matches_selectors(name, "gate_up_proj", sel11):
+        return 11
+    sel12 = _parse_layer_selectors("MUSE_DRAFT_GU_VQ12")
+    if sel12 and name and _matches_selectors(name, "gate_up_proj", sel12):
+        return 12
     m = _vq4d_mode()
     if m == 1:
         return 9
     if m in (3, 4):
         return 10
+    if m in (9, 11):
+        return 11
+    if m in (13, 14, 15):
+        return 12
     return 0
 
 
@@ -151,17 +179,23 @@ def _vq4d_bits_for_linear(leaf: str) -> int:
         return 9
     if m == 3:
         return 10
+    if m == 9:
+        return 11
+    if m == 15:
+        return 12
     if leaf == "down_proj":
         if m in (2, 4, 7):
             return 9
-        if m in (5, 8):
+        if m in (5, 8, 11, 14):
             return 10
+        if m in (12, 13):
+            return 11
     return 0
 
 
 def _int3_h64_for_swiglu() -> bool:
     m = _vq4d_mode()
-    return (m in (6, 7, 8, 10)) or (m == 0 and _int3_sym_mode() == 3)
+    return (m in (6, 7, 8, 9, 10, 11, 12, 13, 14, 15)) or (m == 0 and _int3_sym_mode() == 3)
 
 
 def _int3_h64_for_linear() -> bool:
@@ -722,11 +756,11 @@ def _try_vq4d_buffer(
     if not hasattr(_bfx, "vq4d_pack") or not hasattr(_bfx, "vq4d_gemm"):
         return None
     n, k = w.shape
-    if n % 64 != 0 or k % 64 != 0 or bits not in (9, 10):
+    if n % 64 != 0 or k % 64 != 0 or bits not in (9, 10, 11, 12):
         return None
     w_c = w.contiguous()
     blob = _bfx.vq4d_pack(w_c, bits)
-    min_cos = 0.955 if bits == 9 else 0.96
+    min_cos = 0.955 if bits == 9 else (0.96 if bits == 10 else 0.968)
     gen = torch.Generator(device=w.device)
     gen.manual_seed(3037 + n + 17 * k)
     for m in (1, 7, 8, 16):
@@ -757,7 +791,7 @@ def _try_vq4d_swiglu_buffer(
     if not hasattr(_bfx, "vq4d_pack_swiglu") or not hasattr(_bfx, "vq4d_gemm_swiglu"):
         return None
     n2, k = w.shape
-    if n2 % 64 != 0 or k % 64 != 0 or bits not in (9, 10):
+    if n2 % 64 != 0 or k % 64 != 0 or bits not in (9, 10, 11, 12):
         return None
     inter = n2 // 2
     w_c = w.contiguous()
@@ -779,7 +813,8 @@ def _try_vq4d_swiglu_buffer(
         got_f = got.float()
         cos = F.cosine_similarity(got_f.flatten(), dense.flatten(), dim=0).item()
         snr = _snr_db(dense, got_f)
-        if not (cos >= min_cos and snr >= min_snr):
+        eff_cos = (min_cos - 0.005) if m == 1 else min_cos
+        if not (cos >= eff_cos and snr >= min_snr):
             logger.warning(
                 "muse_draft_vq4d_swiglu: quality check failed on (%d,%d) M=%d (bits=%d, SNR=%.2fdB cos=%.5f)",
                 n2, k, m, bits, snr, cos,
@@ -825,7 +860,8 @@ def _try_int4_buffer(
         dense = F.linear(x, w_c).float()
         got_f = got.float()
         cos = F.cosine_similarity(got_f.flatten(), dense.flatten(), dim=0).item()
-        if not cos >= 0.99:
+        min_i4_cos = 0.985 if m == 1 else 0.99
+        if not cos >= min_i4_cos:
             logger.warning("muse_draft_int4: low cosine %.5f on (%d,%d) M=%d", cos, n, k, m)
             return None
         if m == 7 and metrics is not None:
@@ -1325,7 +1361,7 @@ def attach_mlp_swiglu(mlp: torch.nn.Module, name: str = "", mode: str = "int3") 
     inter = n2 // 2
     label = name or f"mlp_swiglu_{n2}x{k}"
     use_i4 = (mode == "int4")
-    vq_bits = 0 if use_i4 else _vq4d_bits_for_swiglu()
+    vq_bits = 0 if use_i4 else _vq4d_bits_for_swiglu(label)
     use_h64 = (not use_i4) and _int3_h64_for_swiglu()
     use_sym = (not use_i4) and (use_h64 or (_int3_sym_mode() in (1, 3)))
     try:
@@ -1335,7 +1371,7 @@ def attach_mlp_swiglu(mlp: torch.nn.Module, name: str = "", mode: str = "int3") 
         if use_i4:
             blob = _try_int4_swiglu_buffer(w.data, metrics=m)
         else:
-            if vq_bits in (9, 10):
+            if vq_bits in (9, 10, 11, 12):
                 blob = _try_vq4d_swiglu_buffer(w.data, bits=vq_bits, metrics=m)
                 if blob is not None:
                     used_vq = vq_bits
@@ -1371,6 +1407,10 @@ def attach_mlp_swiglu(mlp: torch.nn.Module, name: str = "", mode: str = "int3") 
                 tag = "vq9swg"
             elif used_vq == 10:
                 tag = "vq10swg"
+            elif used_vq == 11:
+                tag = "vq11swg"
+            elif used_vq == 12:
+                tag = "vq12swg"
             elif use_h64:
                 tag = "h64i3swg"
             else:
@@ -1425,7 +1465,9 @@ def attach_linear(layer: torch.nn.Module, mode: str = "int3", name: str = "", le
                 _stats["bytes_bf16"] += n * k * 2
                 _stats["bytes_quant"] += qbytes
                 if "snr_db" in m:
-                    _layer_metrics.append((label, "int4", (n, k), m["snr_db"], m["cos"], qbytes))
+                    ntiles = (n // 8) * (k // 64)
+                    i4_tag = "vq2d7" if qbytes == ntiles * 232 + 32 else ("vq2d8" if qbytes == ntiles * 264 + 32 else "int4")
+                    _layer_metrics.append((label, i4_tag, (n, k), m["snr_db"], m["cos"], qbytes))
                 _free_query_only_bf16(layer, leaf)
                 return True
         except Exception as e:  # noqa: BLE001
@@ -1440,7 +1482,7 @@ def attach_linear(layer: torch.nn.Module, mode: str = "int3", name: str = "", le
             use_sym = use_h64 or (sym_m in (1, 3)) or (sym_m == 2 and leaf == "down_proj")
             blob = None
             used_vq = 0
-            if vq_bits in (9, 10):
+            if vq_bits in (9, 10, 11, 12):
                 blob = _try_vq4d_buffer(w.data, bits=vq_bits, metrics=m)
                 if blob is not None:
                     used_vq = vq_bits
@@ -1468,6 +1510,10 @@ def attach_linear(layer: torch.nn.Module, mode: str = "int3", name: str = "", le
                         tag = "vq9"
                     elif used_vq == 10:
                         tag = "vq10"
+                    elif used_vq == 11:
+                        tag = "vq11"
+                    elif used_vq == 12:
+                        tag = "vq12"
                     elif use_h64:
                         tag = "h64i3"
                     else:
@@ -1553,7 +1599,9 @@ def attach_tensor(mod: torch.nn.Module, prefix: str, w: torch.Tensor, mode: str 
                 _stats["bytes_bf16"] += n * k * 2
                 _stats["bytes_quant"] += qbytes
                 if "snr_db" in m:
-                    _layer_metrics.append((prefix, "int4", (n, k), m["snr_db"], m["cos"], qbytes))
+                    ntiles = (n // 8) * (k // 64)
+                    i4_tag = "vq2d7" if qbytes == ntiles * 232 + 32 else ("vq2d8" if qbytes == ntiles * 264 + 32 else "int4")
+                    _layer_metrics.append((prefix, i4_tag, (n, k), m["snr_db"], m["cos"], qbytes))
                 return True
         except Exception as e:  # noqa: BLE001
             logger.warning("muse_draft_int4: tensor %s attach failed (%s); trying NVFP4", prefix, e)
@@ -1703,7 +1751,8 @@ def draft_int3_swiglu_linear(x: torch.Tensor, blob: torch.Tensor, inter: int, k:
     import muse_bfx_ext as _bfx
 
     i4_bytes = (inter // 4) * (k // 64) * 288
-    if blob.numel() == i4_bytes:
+    i4_sym_bytes = (inter // 4) * (k // 64) * 264 + 32
+    if blob.numel() in (i4_bytes, i4_sym_bytes):
         out = _run_chunked(x2, MAX_M_INT4, lambda xc: _bfx.int4_gemm_swiglu(xc, blob, inter, k))
     else:
         out = _run_chunked(x2, MAX_M_INT3, lambda xc: _bfx.int3_gemm_swiglu(xc, blob, inter, k))
@@ -2061,7 +2110,7 @@ def place_drafter_quant(model: torch.nn.Module) -> int:
         if not spares:
             continue
 
-        m_place = 7 if (kind in ("nvfp4", "fp8") or k >= 20000 or n == 10240) else 16
+        m_place = 7
         x = ((torch.arange(m_place * k, device=dev) % 7).float() - 3.0).to(torch.bfloat16).reshape(m_place, k)
         meta0 = items[0][2]
 

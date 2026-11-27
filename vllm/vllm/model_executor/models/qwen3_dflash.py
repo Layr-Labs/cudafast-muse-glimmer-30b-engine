@@ -1281,7 +1281,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         aux_hidden_states: list[torch.Tensor],
         num_tokens: int,
     ) -> torch.Tensor | None:
-        """Zero-cat 5-aux-tensor INT4 fc projection for small M <= 16 (CUDA-graph safe)."""
+        """Zero-cat 5-aux-tensor INT4 fc projection for small M <= 16 (w82 vq8+vq12+vq10)."""
         if (
             not self.model.use_aux_hidden_state
             or len(aux_hidden_states) != 5
