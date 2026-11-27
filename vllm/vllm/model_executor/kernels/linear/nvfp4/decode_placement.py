@@ -46,90 +46,6 @@ _L2_FLUSH_INTS = 16 << 20  # 64 MiB (> 2.5x GB10's 24 MiB L2)
 # Quarantine below-median (slow) buffers from place_decode_weights through place_prefill_weights (and KV-cache init).
 _SLOW_HOLD: list[torch.Tensor] = []
 HOLD_SLOW_FOR_KV = os.environ.get("MUSE_HOLD_SLOW_FOR_KV", "1").strip() not in ("0", "", "false", "no")
-_SPONGE_STATE: dict[str, int] = {"ptr": 0, "len": 0}
-
-
-def _usable_buddyinfo_bytes(min_chunk: int = 2 << 20) -> int:
-    """Sum free bytes in Linux buddy orders >= min_chunk (2 MiB+) across all zones."""
-    try:
-        page = os.sysconf("SC_PAGE_SIZE")
-        with open("/proc/buddyinfo") as fp:
-            text = fp.read()
-    except (OSError, ValueError):
-        return 0
-    total = 0
-    for line in text.splitlines():
-        parts = line.replace(",", " ").split()
-        if len(parts) <= 4:
-            continue
-        for order, tok in enumerate(parts[4:]):
-            try:
-                cnt = int(tok)
-            except ValueError:
-                break
-            blk = page << order
-            if blk >= min_chunk:
-                total += cnt * blk
-    return total
-
-
-def take_buddyinfo_sponge(need_bytes: int = 36 << 30) -> int:
-    """Temporarily commit fragmented small free blocks before weight loading so initial weights land on 32 MiB extents."""
-    if not ENABLED or os.environ.get("MUSE_BUDDY_SPONGE", "1").strip() in ("0", "", "false", "no"):
-        return 0
-    if _SPONGE_STATE["ptr"] != 0:
-        return _SPONGE_STATE["len"]
-    try:
-        import ctypes
-
-        cap_gib = int(os.environ.get("MUSE_BUDDY_SPONGE_CAP_GIB", "72"))
-        if cap_gib <= 0:
-            return 0
-        usable = _usable_buddyinfo_bytes(2 << 20)
-        headroom = 18 << 30
-        granule = 2 << 20
-        least = 1 << 30
-        most = cap_gib << 30
-        if usable <= need_bytes + headroom:
-            return 0
-        length = (min(usable - (need_bytes + headroom), most) // granule) * granule
-        if length < least:
-            return 0
-        cuda_drv = ctypes.CDLL("libcuda.so.1")
-        dptr = ctypes.c_uint64(0)
-        if cuda_drv.cuMemAlloc_v2(ctypes.byref(dptr), ctypes.c_size_t(length)) != 0 or dptr.value == 0:
-            return 0
-        if cuda_drv.cuMemsetD8_v2(dptr, ctypes.c_ubyte(0), ctypes.c_size_t(length)) != 0:
-            cuda_drv.cuMemFree_v2(dptr)
-            return 0
-        _SPONGE_STATE["ptr"] = int(dptr.value)
-        _SPONGE_STATE["len"] = int(length)
-        logger.info(
-            "Buddyinfo fragmentation sponge: held %.1f GiB (usable=%.1f GiB, reserve=%.1f GiB) while weights commit",
-            length / (1 << 30), usable / (1 << 30), (need_bytes + headroom) / (1 << 30),
-        )
-        return int(length)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Buddyinfo sponge skipped: %s", exc)
-        return 0
-
-
-def release_buddyinfo_sponge() -> None:
-    """Release temporary buddyinfo sponge buffer."""
-    ptr = _SPONGE_STATE.get("ptr", 0)
-    length = _SPONGE_STATE.get("len", 0)
-    if not ptr:
-        return
-    _SPONGE_STATE["ptr"] = 0
-    _SPONGE_STATE["len"] = 0
-    try:
-        import ctypes
-
-        cuda_drv = ctypes.CDLL("libcuda.so.1")
-        cuda_drv.cuMemFree_v2(ctypes.c_uint64(ptr))
-        logger.info("Buddyinfo fragmentation sponge: released %.1f GiB", length / (1 << 30))
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def ensure_slow_hold_headroom(min_free_bytes: int) -> None:
@@ -186,6 +102,54 @@ def _drop_model_page_cache() -> None:
 def _flush_l2(evict_buf: torch.Tensor) -> None:
     """Read-only L2 eviction pass (never writes, avoiding dirty-line writeback overhead)."""
     _ = evict_buf.sum()
+
+
+def _usable_buddy_bytes(min_chunk: int = 2 << 20) -> int:
+    """Free bytes in Linux buddy orders >= min_chunk across /proc/buddyinfo."""
+    try:
+        page = os.sysconf("SC_PAGE_SIZE")
+        total = 0
+        with open("/proc/buddyinfo") as fp:
+            for line in fp:
+                parts = line.replace(",", " ").split()
+                if len(parts) <= 4:
+                    continue
+                for order, tok in enumerate(parts[4:]):
+                    cnt = int(tok)
+                    blk = page << order
+                    if blk >= min_chunk:
+                        total += cnt * blk
+        return total
+    except Exception:
+        return 0
+
+
+def _alloc_buddy_sponge(need_bytes: int) -> torch.Tensor | None:
+    """Temporarily absorb fragmented lower-order free pages before allocating large
+    unfragmented Order-13 (32 MiB) weight spares; never fails the load."""
+    if os.environ.get("MUSE_BUDDY_SPONGE", "0").strip() in ("0", "", "false", "no"):
+        return None
+    try:
+        usable = _usable_buddy_bytes(2 << 20)
+        avail = _mem_available()
+        if avail is not None:
+            usable = min(usable, avail)
+        keep = need_bytes + HOST_HEADROOM_BYTES
+        if usable <= keep:
+            return None
+        sponge_bytes = min(usable - keep, 48 << 30) & ~((2 << 20) - 1)
+        if sponge_bytes < (1 << 30):
+            return None
+        t = torch.empty((sponge_bytes,), dtype=torch.uint8, device="cuda")
+        t[::4096] = 0  # commit physical pages on first touch
+        torch.cuda.synchronize()
+        logger.info(
+            "Buddyinfo fragmentation sponge: committed %.1f GiB (usable >=2MiB: %.1f GiB) for high-order placement",
+            sponge_bytes / (1 << 30), usable / (1 << 30),
+        )
+        return t
+    except Exception:
+        return None
 
 
 def _mem_available() -> int | None:
@@ -1075,7 +1039,6 @@ def place_decode_weights(model: torch.nn.Module) -> None:
     rejected_hold: list[torch.Tensor] = []
     _post_reg_done = False
     try:
-        release_buddyinfo_sponge()
         _drop_model_page_cache()
         evict_buf = torch.empty((_L2_FLUSH_INTS,), dtype=torch.int32, device="cuda")
         groups: dict[tuple, list] = {}
@@ -1145,71 +1108,39 @@ def place_decode_weights(model: torch.nn.Module) -> None:
         )
         deferred_single = [(k, v) for k, v in ordered_groups if len(v) == 1]
         multi_nvfp4 = [(k, v) for k, v in ordered_groups if len(v) > 1]
-        _rans_ext = None
-        if rans_groups or (PLACE_ATTN and attn_rans_groups):
+        # Place 641 MiB lm_head FIRST (while physical RAM is completely unfragmented by _SLOW_HOLD)
+        # using a short-lived /proc/buddyinfo sponge so lm_head lands on contiguous Order-13 (32 MiB) extents,
+        # then immediately clear PyTorch's cache before FULL_RAM_SCAN scans 127 MiB slabs.
+        if deferred_single and os.environ.get("MUSE_EARLY_LM_HEAD_PLACE", "1").strip() not in ("0", "", "false", "no"):
+            lm_bytes = sum(
+                layers[0]._buffers[_NAME].numel() * layers[0]._buffers[_NAME].element_size() * (LM_HEAD_SPARES + 2)
+                for _, layers in deferred_single
+            )
+            sponge = _alloc_buddy_sponge(lm_bytes)
+            early_hold: list[torch.Tensor] = []
             try:
-                import muse_rans_ext as _rans_ext
-            except (ImportError, OSError):
-                _rans_ext = None
-        large_rans_first = os.environ.get("MUSE_PLACE_LARGE_FIRST", "1").strip() not in ("0", "", "false", "no")
-        if large_rans_first:
-            # Place >128 MiB weights (641 MiB lm_head and >128 MiB FP8 rANS) FIRST while ~65 GiB of unfragmented
-            # physical RAM is free, then flush rejected >128 MiB spares BEFORE _place_group_full_ram_scan seeds
-            # PyTorch's <=128 MiB fast pool (preventing a late empty_cache() from wiping the fast pool before prefill!).
-            for (n, k, *_), layers in deferred_single:
-                try:
-                    stats = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
-                except Exception as err:  # noqa: BLE001
-                    logger.warning("Decode weight placement skipped for %dx%d: %s", n, k, err)
-                    continue
-                if stats is None:
-                    continue
-                n_groups += 1
-                b, a = stats["before"], stats["after"]
-                saved_ms += b[3] - a[3]
-                gbps = stats["payload_bytes"] / 1e6
-                logger.info(
-                    "Decode weight placement %dx%d: %d weights of %.0f MiB, %d spare buffers, %d moved; "
-                    "GEMV ms min/median/max %.4f/%.4f/%.4f -> %.4f/%.4f/%.4f "
-                    "(weight-only %.0f/%.0f/%.0f -> %.0f/%.0f/%.0f GB/s), sum %.3f -> %.3f ms",
-                    n, k, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
-                    b[0], b[1], b[2], a[0], a[1], a[2],
-                    gbps / b[0], gbps / b[1], gbps / b[2], gbps / a[0], gbps / a[1], gbps / a[2], b[3], a[3],
-                )
-            deferred_single = []
-            if rans_groups and _rans_ext is not None:
-                early_large = [
-                    ((n, k), layers)
-                    for (n, k), layers in sorted(
-                        rans_groups.items(),
-                        key=lambda kv: -(len(kv[1]) * max(l._buffers["muse_fp8_packed"].numel() for l in kv[1])),
-                    )
-                    if max(l._buffers["muse_fp8_packed"].numel() for l in layers) > (128 << 20)
-                ]
-                for (n, k), layers in early_large:
-                    rans_groups.pop((n, k), None)
-                    try:
-                        stats = _place_muserans_group(_rans_ext, layers, n, k, evict_buf, rejected_hold)
-                    except Exception as err:  # noqa: BLE001
-                        logger.warning("Decode rANS placement skipped for %dx%d: %s", n, k, err)
-                        continue
+                for (n, k, *_), layers in deferred_single:
+                    stats = _place_group(decode_linear, layers, n, k, evict_buf, early_hold)
                     if stats is None:
                         continue
                     n_groups += 1
                     b, a = stats["before"], stats["after"]
                     saved_ms += b[3] - a[3]
+                    gbps = stats["payload_bytes"] / 1e6
                     logger.info(
-                        "Decode rANS placement %dx%d: %d weights of ~%.0f MiB, %d spare buffers, %d moved; "
-                        "GEMV ms min/median/max %.4f/%.4f/%.4f -> %.4f/%.4f/%.4f, sum %.3f -> %.3f ms",
+                        "Early Order-13 weight placement %dx%d: %d weights of %.0f MiB, %d spare buffers, %d moved; "
+                        "GEMV ms min/median/max %.4f/%.4f/%.4f -> %.4f/%.4f/%.4f "
+                        "(weight-only %.0f/%.0f/%.0f -> %.0f/%.0f/%.0f GB/s), sum %.3f -> %.3f ms",
                         n, k, stats["count"], stats["payload_bytes"] / (1 << 20), stats["spares"], stats["moved"],
-                        b[0], b[1], b[2], a[0], a[1], a[2], b[3], a[3],
+                        b[0], b[1], b[2], a[0], a[1], a[2],
+                        gbps / b[0], gbps / b[1], gbps / b[2], gbps / a[0], gbps / a[1], gbps / a[2], b[3], a[3],
                     )
-            if rejected_hold:
-                rejected_hold.clear()
-                torch.cuda.empty_cache()
-            # Cap >128 MiB slow-hold footprint so FULL_RAM_SCAN still sees ~55+ GiB for 127 MiB fast-pool seeding.
-            while sum(t.numel() * t.element_size() for t in _SLOW_HOLD) > (8 << 30):
-                _SLOW_HOLD.pop(0)
+                deferred_single = []
+            except Exception as err:  # noqa: BLE001
+                logger.warning("Early lm_head placement skipped (will retry deferred): %s", err)
+            finally:
+                early_hold.clear()
+                del sponge
                 torch.cuda.empty_cache()
         for (n, k, *_), layers in multi_nvfp4:
             try:
