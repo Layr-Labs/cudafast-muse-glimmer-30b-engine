@@ -56,7 +56,7 @@ __device__ __forceinline__ uint64_t br_pol_ef() {
 }
 
 __device__ __forceinline__ void br_cp_async16_ef(uint32_t sd, const void* gs, uint64_t pol) {
-  asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(sd), "l"(gs), "l"(pol));
+  asm volatile("cp.async.cg.shared.global.L2::256B.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(sd), "l"(gs), "l"(pol));
 }
 
 __device__ __forceinline__ void br_cp_async16_ca(uint32_t sd, const void* gs) {
@@ -462,6 +462,7 @@ struct BrProb {
   int tw;
   int pdl_mode;
   int xsmem_async;
+  int unroll4;
   uint32_t base_m1;
   size_t stream_bytes;
   size_t tpf_stride;
@@ -737,8 +738,8 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
         }
         if (do_nb) {
           const int s_end = kXsmem ? (cs + kChunkSteps) : S;
-          for (int s = cs; s < s_end; ++s) {
-            if (s == trig_s) {
+          auto do_k_step = [&](int s, bool check_trig) __attribute__((always_inline)) {
+            if (check_trig && s == trig_s) {
               asm volatile("griddepcontrol.launch_dependents;");
             }
             // Early-issue cp.async ring refill before LUT/ALU/xpose4 so DRAM/L2 latency overlaps compute.
@@ -855,14 +856,14 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
               __syncwarp();
             }
 
-            uint32_t sm_w0, sm_w1;
-            if ((pwb_n & 2u) == 0u) {
-              sm_w0 = br_lds32(ring_s + (na & (kRB - 1u)));
-              sm_w1 = br_lds32(ring_s + ((na + 4u) & (kRB - 1u)));
-            } else {
-              sm_w0 = br_lds16(ring_s + (na & (kRB - 1u))) | (br_lds16(ring_s + ((na + 2u) & (kRB - 1u))) << 16);
-              sm_w1 = br_lds16(ring_s + ((na + 4u) & (kRB - 1u))) | (br_lds16(ring_s + ((na + 6u) & (kRB - 1u))) << 16);
-            }
+            // Branchless 4B-aligned LDS.32 + __funnelshift_r (matches muse_rans.cu; 0-ULP identical to 4x LDS.U16).
+            const uint32_t na_a = na & ~3u;
+            const uint32_t sh = (pwb_n & 2u) << 3;
+            const uint32_t w0 = br_lds32(ring_s + (na_a & (kRB - 1u)));
+            const uint32_t w1 = br_lds32(ring_s + ((na_a + 4u) & (kRB - 1u)));
+            const uint32_t w2 = ((pwb_n & 2u) != 0u) ? br_lds32(ring_s + ((na_a + 8u) & (kRB - 1u))) : 0u;
+            const uint32_t sm_w0 = __funnelshift_r(w0, w1, sh);
+            const uint32_t sm_w1 = __funnelshift_r(w1, w2, sh);
 
             // Issue all 4 conditional lds16 renorms in parallel.
             const uint32_t r0 = n0 ? br_lds16(ro0) : 0u;
@@ -931,6 +932,24 @@ __global__ void __launch_bounds__(640, 1) br_pair_mma_gemm_kernel(BrProb pb) {
               st[1] = n1 ? ((x1 << 16) | r1) : x1;
               st[2] = n2 ? ((x2 << 16) | r2) : x2;
               st[3] = n3 ? ((x3 << 16) | r3) : x3;
+            }
+          };
+          if constexpr (kXsmem) {
+            if (pb.unroll4 && cs + kChunkSteps <= S && (trig_s < cs || trig_s >= cs + kChunkSteps)) {
+#pragma unroll 4
+              for (int sl = 0; sl < kChunkSteps; ++sl) {
+                do_k_step(cs + sl, false);
+              }
+            } else {
+#pragma unroll 1
+              for (int s = cs; s < s_end; ++s) {
+                do_k_step(s, true);
+              }
+            }
+          } else {
+#pragma unroll 1
+            for (int s = cs; s < s_end; ++s) {
+              do_k_step(s, true);
             }
           }
         }
@@ -1506,6 +1525,11 @@ static void bf16_rans_gemm_launch(
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
   pb.xsmem_async = xsmem_async_en ? 1 : 0;
+  static const bool unroll4_en = []() {
+    const char* env = std::getenv("MUSE_BF16_RANS_UNROLL4");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  pb.unroll4 = unroll4_en ? 1 : 0;
   pb.base_m1 = static_cast<uint32_t>(base_exp) - 1u;
   pb.stream_bytes = (blob_bytes > soff + 64u) ? (blob_bytes - soff - 64u) : 0u;
   pb.tpf_stride = br_tpf_stride();

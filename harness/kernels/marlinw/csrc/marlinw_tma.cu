@@ -1057,7 +1057,7 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
 //   Unconditional __syncthreads() eliminates ptxas ti==T-1 epilogue peeling (240 MUFU -> 64 MUFU = 3.75x smaller epilogue),
 //   runs all 8 warps (2 warps/sub-partition) in parallel, saves 1 barrier/wave, and frees c[4..7] (64 regs) before SwiGLU!
 template <int kPdlMode = 2, int kTilesPerCta = 26, bool kCsOut = true, bool kPolEf = false,
-          bool kSingleFa = false, bool kEpi8w = true>
+          bool kSingleFa = false, bool kEpi8w = true, bool kLutSilu = true>
 __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
     const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
     const __grid_constant__ CUtensorMap tmS, char* __restrict__ out,
@@ -1253,6 +1253,10 @@ __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
     const int q = lane & 3;
     const int r0 = 128 * chunk + (kEpi8w ? 64 * kw : 0) + (lane >> 2);
     const int out_col0 = 64 * slice_col + 16 * (2 * nb + sh2);
+    auto eval_silu = [&](__nv_bfloat16 bg) -> float {
+      if constexpr (kLutSilu) return __ldg(bf16_silu + __bfloat16_as_ushort(bg));
+      else                    return swiglu_silu(__bfloat162float(bg));
+    };
 #ifdef MARLINW_TMA_FP8
     uint8_t* out_u8 = reinterpret_cast<uint8_t*>(out);
     auto eval_fp8_pair = [&](float g0, float u0, float g1, float u1) -> uint32_t {
@@ -1260,8 +1264,8 @@ __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
       const __nv_bfloat16 bu0 = __float2bfloat16_rn(u0 * gs);
       const __nv_bfloat16 bg1 = __float2bfloat16_rn(g1 * gs);
       const __nv_bfloat16 bu1 = __float2bfloat16_rn(u1 * gs);
-      const float q0 = __fmul_rn(__fmul_rn(swiglu_silu(__bfloat162float(bg0)), __bfloat162float(bu0)), inverse);
-      const float q1 = __fmul_rn(__fmul_rn(swiglu_silu(__bfloat162float(bg1)), __bfloat162float(bu1)), inverse);
+      const float q0 = __fmul_rn(__fmul_rn(eval_silu(bg0), __bfloat162float(bu0)), inverse);
+      const float q1 = __fmul_rn(__fmul_rn(eval_silu(bg1), __bfloat162float(bu1)), inverse);
       const float s0 = q0 < -448.0f ? -448.0f : (q0 > 448.0f ? 448.0f : q0);
       const float s1 = q1 < -448.0f ? -448.0f : (q1 > 448.0f ? 448.0f : q1);
       uint16_t conv;
@@ -1300,8 +1304,8 @@ __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
       const __nv_bfloat16 bu0 = __float2bfloat16_rn(u0 * gs);
       const __nv_bfloat16 bg1 = __float2bfloat16_rn(g1 * gs);
       const __nv_bfloat16 bu1 = __float2bfloat16_rn(u1 * gs);
-      const __nv_bfloat16 p0 = __float2bfloat16_rn(__fmul_rn(swiglu_silu(__bfloat162float(bg0)), __bfloat162float(bu0)));
-      const __nv_bfloat16 p1 = __float2bfloat16_rn(__fmul_rn(swiglu_silu(__bfloat162float(bg1)), __bfloat162float(bu1)));
+      const __nv_bfloat16 p0 = __float2bfloat16_rn(__fmul_rn(eval_silu(bg0), __bfloat162float(bu0)));
+      const __nv_bfloat16 p1 = __float2bfloat16_rn(__fmul_rn(eval_silu(bg1), __bfloat162float(bu1)));
       const __nv_bfloat162 r = __halves2bfloat162(p0, p1);
       return *reinterpret_cast<const uint32_t*>(&r);
     };
@@ -1636,6 +1640,13 @@ static bool gateup_ilv_epi8w() {
   }();
   return on;
 }
+static bool gateup_ilv_lut_silu() {
+  static const bool on = []() -> bool {
+    const char* env = std::getenv("MARLINW_GATEUP_LUT_SILU");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  return on;
+}
 static int gateup_ilv_pdl_mode() {
   if (g_tma_pdl_override >= 0) return g_tma_pdl_override;
   static const int mode = []() -> int {
@@ -1668,6 +1679,7 @@ static cudaError_t set_gateup_attrs() {
   set1(gateup_ilv<0, 26, true, false, false, true>, kSharedFor<26>());
   set1(gateup_ilv<1, 26, true, false, false, true>, kSharedFor<26>());
   set1(gateup_ilv<2, 26, true, false, false, true>, kSharedFor<26>());
+  set1(gateup_ilv<2, 26, true, false, false, true, false>, kSharedFor<26>());
   set1(gateup_ilv<2, 26, true, true, false, true>, kSharedFor<26>());
   set1(gateup_ilv<2, 13, true, false, false, true>, kSharedFor<13>());
   set1(gateup_ilv<2, 2, true, false, false, true>, kSharedFor<2>());
@@ -1680,7 +1692,7 @@ static cudaError_t set_gateup_attrs() {
   return s;
 }
 template <typename... Extra>
-static cudaError_t dispatch_gateup_ilv(int pm, int tpc, bool cs, bool ef, bool epi8w, cudaStream_t stream,
+static cudaError_t dispatch_gateup_ilv(int pm, int tpc, bool cs, bool ef, bool epi8w, bool lut_silu, cudaStream_t stream,
                                        const CUtensorMap& tmA, const CUtensorMap& tmB, const CUtensorMap& tmS,
                                        char* out, const float* global, const uint8_t* w_raw, Extra... extra) {
   constexpr int m = 512, n = kFused;
@@ -1693,10 +1705,10 @@ static cudaError_t dispatch_gateup_ilv(int pm, int tpc, bool cs, bool ef, bool e
     static_assert((n / 128) % kT == 0, "tiles per CTA");
     constexpr int grid = (m / 128) * (n / 128) / kT;
     if constexpr (kP == 2) {
-      return launch_ex_pdl(gateup_ilv<2, kT, true, kE, false, kE8>, grid, kThreads, kSharedFor<kT>(), stream,
+      return launch_ex_pdl(gateup_ilv<2, kT, true, kE, false, kE8, true>, grid, kThreads, kSharedFor<kT>(), stream,
                            tmA, tmB, tmS, out, global, w_raw, extra...);
     } else {
-      gateup_ilv<kP, kT, true, kE, false, kE8><<<grid, kThreads, kSharedFor<kT>(), stream>>>(
+      gateup_ilv<kP, kT, true, kE, false, kE8, true><<<grid, kThreads, kSharedFor<kT>(), stream>>>(
           tmA, tmB, tmS, out, global, w_raw, extra...);
       return cudaGetLastError();
     }
@@ -1712,6 +1724,11 @@ static cudaError_t dispatch_gateup_ilv(int pm, int tpc, bool cs, bool ef, bool e
   if (tpc == 26) {
     if (pm == 0) return launch(std::integral_constant<int, 0>{}, std::integral_constant<int, 26>{}, std::false_type{}, std::true_type{});
     if (pm == 1) return launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 26>{}, std::false_type{}, std::true_type{});
+    if (!ef && !lut_silu) {
+      constexpr int grid = (m / 128) * (n / 128) / 26;
+      return launch_ex_pdl(gateup_ilv<2, 26, true, false, false, true, false>, grid, kThreads, kSharedFor<26>(), stream,
+                           tmA, tmB, tmS, out, global, w_raw, extra...);
+    }
     return ef ? launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 26>{}, std::true_type{}, std::true_type{})
               : launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 26>{}, std::false_type{}, std::true_type{});
   }
@@ -1810,7 +1827,7 @@ extern "C" int swiglu_fp8_gemm_ilv(const void* x, const void* w_ilv, const void*
       !map2d(&tmS, scales_ilv, 1, n, k / 16, n, 128, 4, false))
     return cudaErrorInvalidValue;
   return dispatch_gateup_ilv(gateup_ilv_pdl_mode(), gateup_ilv_tiles_per_cta(), gateup_cs_out(), gateup_ilv_b_ef(),
-                             gateup_ilv_epi8w(), stream, tmA, tmB, tmS, static_cast<char*>(out),
+                             gateup_ilv_epi8w(), gateup_ilv_lut_silu(), stream, tmA, tmB, tmS, static_cast<char*>(out),
                              static_cast<const float*>(global), reinterpret_cast<const uint8_t*>(w_ilv),
                              down_input_scale);
 }
@@ -1859,7 +1876,7 @@ extern "C" int swiglu_gemm_ilv(const void* x, const void* w_ilv, const void* sca
       !map2d(&tmS, scales_ilv, 1, n, k / 16, n, 128, 4, false))
     return cudaErrorInvalidValue;
   return dispatch_gateup_ilv(gateup_ilv_pdl_mode(), gateup_ilv_tiles_per_cta(), gateup_cs_out(), gateup_ilv_b_ef(),
-                             gateup_ilv_epi8w(), stream, tmA, tmB, tmS, static_cast<char*>(out),
+                             gateup_ilv_epi8w(), gateup_ilv_lut_silu(), stream, tmA, tmB, tmS, static_cast<char*>(out),
                              static_cast<const float*>(global), reinterpret_cast<const uint8_t*>(w_ilv));
 }
 #endif

@@ -5450,7 +5450,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_2q4w_kernel(
 static int gqa16_verify_v4_mode() {
   static const int mode = []() -> int {
     const char* env = std::getenv("MUSE_GQA16_VERIFY_V4");
-    if (!env || !*env) return 1;  // default 1 = 4Q x 2-warp/Q (v4, min_q=17 -> M=32 51.3us + M=16 fa2 43.4us); 2 = v4.1; 0 = legacy
+    if (!env || !*env) return 1;  // default 1 = 4Q x 2-warp/Q (16 CTAs on M=32, zero gate contention); 2 = v4.1 (guarded by min_q=17); 0 = legacy
     long v = std::strtol(env, nullptr, 10);
     if (v <= 0) return 0;
     if (v == 1) return 1;
@@ -7127,7 +7127,7 @@ extern "C" int muse_gqa16_verify_leaf(
       return !env || !*env || std::strtol(env, nullptr, 10) != 0;
     }();
     const int v4_mode = (max_q >= 2) ? muse_gqa16::gqa16_verify_v4_mode() : 0;
-    if (v4_mode == 2) {
+    if (v4_mode == 2 && max_q >= muse_gqa16::gqa16_verify_v4_min_q()) {
       muse_gqa16::gqa16_multiq_set_attrs_once();
       const dim3 v4_grid(1u, 2u, static_cast<unsigned>((max_q + 1) >> 1));
       constexpr size_t v4_smem = sizeof(muse_gqa16::VerifyV4_2Q4WStorage);

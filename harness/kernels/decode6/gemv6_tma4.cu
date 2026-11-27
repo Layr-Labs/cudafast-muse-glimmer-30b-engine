@@ -183,6 +183,18 @@ static int decode6_lm128_stages(int blocks) {
   return (blocks == 96) ? 3 : env_st;
 }
 
+static int decode6_lm128_m32_stages(int blocks) {
+  static const int env_st = []() -> int {
+    const char* env = std::getenv("MUSE_LM128_M32_STAGES");
+    if (env && *env) {
+      long v = std::strtol(env, nullptr, 10);
+      if (v == 3 || v == 4) return static_cast<int>(v);
+    }
+    return 3;
+  }();
+  return (blocks == 96) ? 3 : env_st;
+}
+
 static int g_tma4_pdl_override = -1;
 
 static int decode6_tma4_pdl() {
@@ -247,10 +259,12 @@ int launch_tma4_impl(const int4* input, const int4* weight, int4* output, int4* 
       }
       return cudaSuccess;
     };
-    if constexpr (MultiM && !MBlock8 && ThreadMBlocks == 2 && TileN == 128 && Threads == 256 && Stages == 4 && FastPal16 && FixedShape != 3) {
-      // Exact M<=32 st=4 SMEM: sh_b(32768)+sh_s(8192)+sh_a(32768)+pal(128)+states(1024)+rslot(6400)+rlut(4096)+rbar(32)+sh_red(8720)
-      // = 94,128 B = 91.92 KiB <= 93 KiB (<= 99 KiB SM121 opt-in SMEM).
-      shared = 93 * 1024;
+    if constexpr (MultiM && !MBlock8 && ThreadMBlocks == 2 && TileN == 128 && Threads == 256 && Stages == 4 && FastPal16) {
+      // Exact M<=32 st=4 SMEM (sh_a_gated is unused when MultiM=true):
+      //   FixedShape!=3: sh_b(32768)+sh_s(8192)+sh_a(32768)+pal(128)+states(1024)+rslot(6400)+rlut(4096)+rbar(32)+sh_red(8704)
+      //                  = 94,112 B = 91.91 KiB <= 93 KiB (<= 99 KiB SM121 opt-in SMEM).
+      //   FixedShape==3: same with rslot(8192) = 95,904 B = 93.66 KiB <= 95 KiB (<= 99 KiB SM121 opt-in SMEM).
+      shared = (FixedShape == 3) ? (95 * 1024) : (93 * 1024);
       auto status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
       if (status != cudaSuccess) { (void)cudaGetLastError(); return status; }
     } else if constexpr (MultiM && !MBlock8 && ThreadMBlocks == 2 && TileN == 128 && Threads == 256 && Stages == 3 && FastPal16) {
@@ -542,7 +556,7 @@ int launch_tma4_m(const int4* input, const int4* weight, int4* output, int4* par
                   uint8_t* fp8_out, int prob_m) {
   if (prob_m > 16) {
     if constexpr (TileN == 128 && Threads == 256 &&
-                  (Stages == 3 || (Stages == 4 && FixedShape != 3 && !FuseLmPost && !FuseMulSigmoid)) &&
+                  (Stages == 3 || Stages == 4) &&
                   !Split2 && !HalfSplit) {
       return launch_tma4_impl<TileN, Threads, GateUpGrid, DownIlv, GateV48, GateUpSwiglu,
                               FuseLmPost, FuseMulSigmoid, Stages, Split2, FixedShape,
@@ -749,8 +763,8 @@ extern "C" int muse_marlin6_sk_tma4_ilv_lmpost_m(
     return cudaErrorInvalidValue;
   }
   if (n == 202112) {
-    const int st = decode6_lm128_stages(blocks);
-    if (m > 16 || st == 3) {
+    const int st = (m > 16) ? decode6_lm128_m32_stages(blocks) : decode6_lm128_stages(blocks);
+    if (st == 3) {
       return launch_tma4_m<128, 256, false, true, false, false, true, false, 3, false, 3, false, true, false, true>(
           input, weight, scratch, partials, coded, palette, global_scale, locks,
           n, k, blocks, device, stream, nullptr, lmpost_lut, lmpost_out, org_vocab_size,
@@ -885,7 +899,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
                                           int blocks, int device, cudaStream_t stream) {
   if (m < 1 || m > 32) return cudaErrorInvalidValue;
   if (n == 202112 && k == 6656 && (blocks == 48 || blocks == 96)) {
-    const int st = (m > 16) ? 3 : decode6_lm128_stages(blocks);
+    const int st = (m > 16) ? decode6_lm128_m32_stages(blocks) : decode6_lm128_stages(blocks);
     if (st == 3) {
       return launch_tma4_m<128, 256, false, true, false, false, false, false, 3, false, 3, false, true, false, true>(
           input, weight, output, partials, coded, palette, global_scale, locks, n, k, blocks, device, stream,
@@ -921,7 +935,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
           input, weight, output, partials, coded, palette, global_scale, locks, n, k, 24, device, stream,
           nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
     }
-    if (m <= 16 && g_st == 4) {
+    if (g_st == 4) {
       return launch_tma4_m<128, 256, false, true, false, false, false, false, 4, false, 0, false, true, false, true>(
           input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
           nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
@@ -939,7 +953,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
       }
       return 0;
     }();
-    const int dn_st = (dn_env != 0) ? dn_env : ((m > 8) ? 4 : 3);
+    const int dn_st = (dn_env != 0) ? dn_env : 4;
     if (dn_st == 4) {
       return launch_tma4_m<128, 256, false, true, false, false, false, false, 4, false, 1, false, true, false, true>(
           input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
@@ -961,7 +975,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
         nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
   }
   const int m_st = decode6_tma4_m_stages(m);
-  if (m <= 16 && m_st == 4) {
+  if (m_st == 4) {
     return launch_tma4_m<128, 256, false, true, false, false, false, false, 4, false, 0, false, true, false, true>(
         input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
         nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
@@ -978,7 +992,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_gated_m(
   if (m < 1 || m > 32 || n != 6656 || k != 4096 || blocks != 48 || gate == nullptr || attn == nullptr)
     return cudaErrorInvalidValue;
   const int m_st = decode6_tma4_m_stages(m);
-  if (m <= 16 && m_st == 4) {
+  if (m_st == 4) {
     return launch_tma4_m<128, 256, false, true, false, false, false, true, 4, false, 0, false, true, false, true>(
         gate, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
         nullptr, nullptr, nullptr, 0, attn, nullptr, nullptr, m);

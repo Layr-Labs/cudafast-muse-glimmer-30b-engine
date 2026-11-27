@@ -679,7 +679,7 @@ class Session:
                 site.mlp = "act" if prev_big else "norm"
                 site.role = "down" if prev_big else "gate_up"
                 if m_rows > 1 and TRIM_M7 and (
-                    kind == "musefp8" or (TRIM_M7_MARLIN and kind == "marlin_tiled")
+                    kind == "musefp8" or (TRIM_M7_MARLIN and kind in ("marlin_tiled", "marlin"))
                 ):
                     # muse_rans.cu and gemv6_tma4.cu (MUSE_DECODE6_TLB_PREFETCH=2048) already issue
                     # internal 2 MiB TLB prefetches in block 0; skip contending side-stream MLP launches.

@@ -94,6 +94,41 @@ __device__ __forceinline__ void int4_cp_async16_a_pred(uint32_t sd, const void* 
   asm volatile("cp.async.ca.shared.global [%0], [%1], 16, %2;\n" ::"r"(sd), "l"(gs), "r"(src_sz));
 }
 
+__device__ __forceinline__ uint64_t int4_pol_evict_first() {
+  uint64_t pol;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  return pol;
+}
+
+__device__ __forceinline__ void int4_mbar_init(uint64_t* mbar, int count) {
+  for (int s = 0; s < count; ++s) {
+    const uint32_t b = static_cast<uint32_t>(__cvta_generic_to_shared(&mbar[s]));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(b) : "memory");
+  }
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+
+__device__ __forceinline__ void int4_tma_bulk_w(
+    void* smem_dst, const void* gmem_src, int bytes, uint64_t* mbar, uint64_t pol) {
+  const uint32_t b = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
+  const uint32_t d = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(b), "r"(bytes) : "memory");
+  asm volatile(
+      "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
+      ::"r"(d), "l"(gmem_src), "r"(bytes), "r"(b), "l"(pol)
+      : "memory");
+}
+
+__device__ __forceinline__ void int4_mbar_wait(uint64_t* mbar, uint32_t parity) {
+  const uint32_t b = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
+  asm volatile(
+      "{\n\t.reg .pred P1;\n\tINT4_MBAR_WAIT_%=:\n\t"
+      "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n\t"
+      "@!P1 bra INT4_MBAR_WAIT_%=;\n\t}"
+      ::"r"(b), "r"(parity)
+      : "memory");
+}
+
 __device__ __forceinline__ void int4_ldmatrix_x2(uint32_t& a0, uint32_t& a2, uint32_t addr) {
   asm volatile(
       "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
@@ -439,7 +474,14 @@ struct alignas(16) Int4StageSmem {
   __nv_bfloat16 a[kStages][kMaxM][64];     // 5 * 1024 = 5120 B (M<=8) or 10240 B (M<=16), XOR-swizzled
 };                                         // Total = 16.25 KiB (M<=8) or 21.25 KiB (M<=16) -> 4 CTAs/SM
 
-template <bool kSplitK, bool kM16, bool kAux5, bool kNf4 = false>
+template <int kMaxM>
+struct alignas(128) Int4StreamKSmem {
+  alignas(128) uint8_t w[kStages][kStepWBytes];     // 5 * 2304 = 11520 B (2304 = 18*128B, exact 128B TMA-aligned)
+  alignas(128) __nv_bfloat16 a[kStages][kMaxM][64]; // 5 * 1024 = 5120 B (M<=8) or 10240 B (M<=16), XOR-swizzled
+  alignas(8) uint64_t mbar[kStages];                // 40 B -> 16.29 KiB (M<=8) or 21.29 KiB (M<=16) -> 4 CTAs/SM
+};
+
+template <bool kSplitK, bool kM16, bool kAux5, bool kNf4 = false, bool kTma = false>
 __global__ void __launch_bounds__(128, 4) int4_mma_gemm_kernel(
     const __nv_bfloat16* __restrict__ A,
     Aux5Desc aux5,
@@ -447,7 +489,7 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_kernel(
     __nv_bfloat16* __restrict__ C,
     float* __restrict__ C_fp32,
     int M, int N, int K, int split_k, int pdl_mode, int k_major) {
-  __shared__ Int4StageSmem<kM16 ? 16 : 8> smem;
+  __shared__ Int4StreamKSmem<kM16 ? 16 : 8> smem;
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
@@ -463,6 +505,13 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_kernel(
   if (kg_end > num_kg) kg_end = num_kg;
   const int my_kgs = kg_end - kg_start;
   if (my_kgs <= 0) return;
+
+  if constexpr (kTma) {
+    if (tid == 0) {
+      int4_mbar_init(smem.mbar, kStages);
+    }
+    __syncthreads();
+  }
 
   const int n_blocks = N / kRowsPerCTA;
   const size_t cta_stride_bytes = static_cast<size_t>(num_kg) * kStepWBytes;
@@ -489,16 +538,23 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_kernel(
 
   auto issue_w_only = [&](int kg, int st) {
     const uint8_t* w_src = w_cta + static_cast<size_t>(kg) * w_kg_stride;
-    {
-      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
-      int4_cp_async16_w(sd, w_src + tid * 16);
+    if constexpr (kTma) {
+      if (tid == 0) {
+        const uint64_t pol = int4_pol_evict_first();
+        int4_tma_bulk_w(smem.w[st], w_src, kStepWBytes, &smem.mbar[st], pol);
+      }
+    } else {
+      {
+        const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
+        int4_cp_async16_w(sd, w_src + tid * 16);
+      }
+      if (tid < (kStepWU4 - kThreads)) {
+        const int idx = kThreads + tid;
+        const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][idx * 16]));
+        int4_cp_async16_w(sd, w_src + idx * 16);
+      }
+      asm volatile("cp.async.commit_group;\n" ::: "memory");
     }
-    if (tid < (kStepWU4 - kThreads)) {
-      const int idx = kThreads + tid;
-      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][idx * 16]));
-      int4_cp_async16_w(sd, w_src + idx * 16);
-    }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
   };
 
   auto load_a_sync = [&](int kg, int st) {
@@ -528,16 +584,26 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_kernel(
     }
   };
 
-  auto issue_stage = [&](int kg, int st) {
+  auto issue_stage = [&](int kg, int st, bool need_fence) {
     const uint8_t* w_src = w_cta + static_cast<size_t>(kg) * w_kg_stride;
-    {
-      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
-      int4_cp_async16_w(sd, w_src + tid * 16);
-    }
-    if (tid < (kStepWU4 - kThreads)) {
-      const int idx = kThreads + tid;
-      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][idx * 16]));
-      int4_cp_async16_w(sd, w_src + idx * 16);
+    if constexpr (kTma) {
+      if (tid == 0) {
+        if (need_fence) {
+          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        }
+        const uint64_t pol = int4_pol_evict_first();
+        int4_tma_bulk_w(smem.w[st], w_src, kStepWBytes, &smem.mbar[st], pol);
+      }
+    } else {
+      {
+        const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
+        int4_cp_async16_w(sd, w_src + tid * 16);
+      }
+      if (tid < (kStepWU4 - kThreads)) {
+        const int idx = kThreads + tid;
+        const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][idx * 16]));
+        int4_cp_async16_w(sd, w_src + idx * 16);
+      }
     }
 
     const __nv_bfloat16* a_base = nullptr;
@@ -574,7 +640,7 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_kernel(
     }
   } else {
     for (int i = 0; i < preload; ++i) {
-      issue_stage(kg_start + i, i);
+      issue_stage(kg_start + i, i, false);
     }
   }
 
@@ -586,9 +652,13 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_kernel(
   const int trig_i = ((pdl_mode & 2) != 0) ? ((my_kgs > 6) ? (my_kgs - 6) : 0) : -1;
 
   int st = 0;
+  uint32_t parity = 0u;
   for (int i = 0; i < my_kgs; ++i) {
     if (i == trig_i) {
       asm volatile("griddepcontrol.launch_dependents;");
+    }
+    if constexpr (kTma) {
+      int4_mbar_wait(&smem.mbar[st], parity);
     }
     const int rem = my_kgs - 1 - i;
     if (rem >= 3) {
@@ -605,7 +675,7 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_kernel(
     const int next_i = i + kPreload;
     if (next_i < my_kgs) {
       const int next_st = (st == 0) ? (kStages - 1) : (st - 1);
-      issue_stage(kg_start + next_i, next_st);
+      issue_stage(kg_start + next_i, next_st, true);
     }
 
     const uint8_t* wt0 = &smem.w[st][(warp * 2 + 0) * kTileBytes];
@@ -653,7 +723,10 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_kernel(
       }
     }
 
-    st = (st + 1 == kStages) ? 0 : (st + 1);
+    if (++st == kStages) {
+      st = 0;
+      parity ^= 1u;
+    }
   }
 
   const int col0 = cta_n * kRowsPerCTA + (warp * 2 + 0) * 8 + 2 * t;
@@ -1137,7 +1210,7 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_swiglu_kernel(
 //   - kWholeSplit=false (51990a52 + 3-part extension): balanced Stream-K across all CTAs with
 //     deterministic non-atomic float2 reduction on ALL 2-part AND 3-part tiles (100% of tiles on
 //     fc, fkv, qkv_proj, o_proj at grid=144/192), falling back to sk_partials only for >=4-part tiles.
-template <bool kM16, bool kAux5, bool kWholeSplit, bool kNf4 = false>
+template <bool kM16, bool kAux5, bool kWholeSplit, bool kNf4 = false, bool kTma = false>
 __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
     const __nv_bfloat16* __restrict__ A,
     Aux5Desc aux5,
@@ -1147,7 +1220,7 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
     float* __restrict__ sk_multi_part,  // [max_n_blocks, 3, 16, 64] uninitialized non-atomic 2/3-part slots (nullptr disables)
     int* __restrict__ sk_done,          // [max_n_blocks] zero-initialized & self-zeroing
     int M, int N, int K, int n_blocks, int grid_ctas, int pdl_mode, int allow_3part) {
-  __shared__ Int4StageSmem<kM16 ? 16 : 8> smem;
+  __shared__ Int4StreamKSmem<kM16 ? 16 : 8> smem;
   __shared__ int s_is_last;
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -1178,6 +1251,13 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
   const int my_iters = iter_end - iter_start;
   if (my_iters <= 0) return;
 
+  if constexpr (kTma) {
+    if (tid == 0) {
+      int4_mbar_init(smem.mbar, kStages);
+    }
+    __syncthreads();
+  }
+
   if (cta_id == 0) {
     const size_t total_bytes = static_cast<size_t>(total_iters) * kStepWBytes;
     for (size_t off = static_cast<size_t>(tid) << 21; off < total_bytes; off += static_cast<size_t>(kThreads) << 21) {
@@ -1203,16 +1283,23 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
 
   auto issue_w_only = [&](int st, int w_iter) {
     const uint8_t* w_src = W_packed + static_cast<size_t>(w_iter) * kStepWBytes;
-    {
-      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
-      int4_cp_async16_w(sd, w_src + tid * 16);
+    if constexpr (kTma) {
+      if (tid == 0) {
+        const uint64_t pol = int4_pol_evict_first();
+        int4_tma_bulk_w(smem.w[st], w_src, kStepWBytes, &smem.mbar[st], pol);
+      }
+    } else {
+      {
+        const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
+        int4_cp_async16_w(sd, w_src + tid * 16);
+      }
+      if (tid < (kStepWU4 - kThreads)) {
+        const int idx = kThreads + tid;
+        const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][idx * 16]));
+        int4_cp_async16_w(sd, w_src + idx * 16);
+      }
+      asm volatile("cp.async.commit_group;\n" ::: "memory");
     }
-    if (tid < (kStepWU4 - kThreads)) {
-      const int idx = kThreads + tid;
-      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][idx * 16]));
-      int4_cp_async16_w(sd, w_src + idx * 16);
-    }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
   };
 
   auto load_a_sync = [&](int st, const __nv_bfloat16* a_base, int64_t a_stride, int a_col_base) {
@@ -1231,16 +1318,26 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
     }
   };
 
-  auto issue_next = [&](int st) {
+  auto issue_next = [&](int st, bool need_fence) {
     const uint8_t* w_src = W_packed + static_cast<size_t>(pre_iter) * kStepWBytes;
-    {
-      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
-      int4_cp_async16_w(sd, w_src + tid * 16);
-    }
-    if (tid < (kStepWU4 - kThreads)) {
-      const int idx = kThreads + tid;
-      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][idx * 16]));
-      int4_cp_async16_w(sd, w_src + idx * 16);
+    if constexpr (kTma) {
+      if (tid == 0) {
+        if (need_fence) {
+          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        }
+        const uint64_t pol = int4_pol_evict_first();
+        int4_tma_bulk_w(smem.w[st], w_src, kStepWBytes, &smem.mbar[st], pol);
+      }
+    } else {
+      {
+        const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
+        int4_cp_async16_w(sd, w_src + tid * 16);
+      }
+      if (tid < (kStepWU4 - kThreads)) {
+        const int idx = kThreads + tid;
+        const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][idx * 16]));
+        int4_cp_async16_w(sd, w_src + idx * 16);
+      }
     }
 
     const __nv_bfloat16* a_base = A;
@@ -1296,7 +1393,7 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
     }
   } else {
     for (int i = 0; i < preload; ++i) {
-      issue_next(i);
+      issue_next(i, false);
     }
   }
 
@@ -1310,9 +1407,13 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
   const int trig_i = ((pdl_mode & 2) != 0) ? ((my_iters > 6) ? (my_iters - 6) : 0) : -1;
 
   int st = 0;
+  uint32_t parity = 0u;
   for (int i = 0; i < my_iters; ++i) {
     if (i == trig_i) {
       asm volatile("griddepcontrol.launch_dependents;");
+    }
+    if constexpr (kTma) {
+      int4_mbar_wait(&smem.mbar[st], parity);
     }
     const int rem = my_iters - 1 - i;
     if (rem >= 3) {
@@ -1328,7 +1429,7 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
 
     if (i + kPreload < my_iters) {
       const int next_st = (st == 0) ? (kStages - 1) : (st - 1);
-      issue_next(next_st);
+      issue_next(next_st, true);
     }
 
     const uint8_t* wt0 = &smem.w[st][(warp * 2 + 0) * kTileBytes];
@@ -1376,7 +1477,10 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
       }
     }
 
-    st = (st + 1 == kStages) ? 0 : (st + 1);
+    if (++st == kStages) {
+      st = 0;
+      parity ^= 1u;
+    }
 
     const bool tile_done = (cur_kg + 1 == num_kg) || (i + 1 == my_iters);
     if (tile_done) {
@@ -1670,6 +1774,12 @@ int int4_pdl_mode() {
   return mode;
 }
 
+bool int4_tma_enabled() {
+  if (int4_bench_dyn_env()) return int4_read_env_int("MUSE_INT4_TMA", 1) != 0;
+  static const bool en = (int4_read_env_int("MUSE_INT4_TMA", 1) != 0);
+  return en;
+}
+
 template <typename... KArgs, typename... Args>
 static inline void int4_launch_pdl(
     void (*kernel)(KArgs...), dim3 grid, int block, cudaStream_t st, int pdl_mode, Args... args) {
@@ -1736,14 +1846,22 @@ void ensure_int4_sk_scratch(const torch::TensorOptions& opts, int n_blocks,
 
 template <bool kNf4>
 static void int4_set_carveout_nf4() {
-  cudaFuncSetAttribute(int4_mma_gemm_kernel<false, false, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_gemm_kernel<false, true, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_gemm_kernel<false, false, true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_gemm_kernel<false, true, true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_gemm_kernel<true, false, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_gemm_kernel<true, true, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_gemm_kernel<true, false, true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_gemm_kernel<true, true, true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<false, false, false, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<false, true, false, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<false, false, true, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<false, true, true, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<true, false, false, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<true, true, false, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<true, false, true, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<true, true, true, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<false, false, false, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<false, true, false, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<false, false, true, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<false, true, true, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<true, false, false, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<true, true, false, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<true, false, true, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_kernel<true, true, true, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int4_mma_gemm_n32_kernel<false, false, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int4_mma_gemm_n32_kernel<false, true, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int4_mma_gemm_n32_kernel<false, false, true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
@@ -1754,12 +1872,18 @@ static void int4_set_carveout_nf4() {
   cudaFuncSetAttribute(int4_mma_gemm_n32_kernel<true, true, true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int4_mma_gemm_swiglu_kernel<false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int4_mma_gemm_swiglu_kernel<true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, true, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, true, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, true, false, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, true, false, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, false, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, false, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, true, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, true, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, true, false, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, true, false, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, false, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, false, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<false, false, true, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_streamk_kernel<true, false, true, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
 }
 
 static void int4_ensure_carveout() {
@@ -1793,6 +1917,7 @@ static torch::Tensor launch_int4_gemm_impl(
   const int pdl_mode = int4_pdl_mode();
   const int red_mode = int4_two_part_red_mode();
   const int allow_3part = (red_mode >= 2) ? 1 : 0;
+  const bool use_tma = int4_tma_enabled() && ((reinterpret_cast<uintptr_t>(W_packed.data_ptr()) & 15u) == 0u);
 
   if (is_aux5 && fc_mode == 1 && n32_blocks <= 288) {
     if (use_m16) {
@@ -1818,15 +1943,29 @@ static torch::Tensor launch_int4_gemm_impl(
     float* mp_ptr = nullptr;
     int* d_ptr = nullptr;
     ensure_int4_sk_scratch(opts, n_blocks, p_ptr, mp_ptr, d_ptr, red_mode);
-    if (use_m16) {
+    if (use_tma) {
+      if (use_m16) {
+        int4_launch_pdl(
+            int4_mma_streamk_kernel<true, true, false, kNf4, true>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+            static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
+            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+            p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+      } else {
+        int4_launch_pdl(
+            int4_mma_streamk_kernel<false, true, false, kNf4, true>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+            static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
+            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+            p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+      }
+    } else if (use_m16) {
       int4_launch_pdl(
-          int4_mma_streamk_kernel<true, true, false, kNf4>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+          int4_mma_streamk_kernel<true, true, false, kNf4, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
           static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
           p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
     } else {
       int4_launch_pdl(
-          int4_mma_streamk_kernel<false, true, false, kNf4>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+          int4_mma_streamk_kernel<false, true, false, kNf4, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
           static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
           reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
           p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
@@ -1871,29 +2010,57 @@ static torch::Tensor launch_int4_gemm_impl(
         int* d_ptr = nullptr;
         ensure_int4_sk_scratch(opts, n_blocks, p_ptr, mp_ptr, d_ptr, use_whole ? std::max(red_mode, 1) : red_mode);
         if (use_whole) {
-          if (use_m16) {
+          if (use_tma) {
+            if (use_m16) {
+              int4_launch_pdl(
+                  int4_mma_streamk_kernel<true, false, true, kNf4, true>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                  A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+                  reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+                  p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+            } else {
+              int4_launch_pdl(
+                  int4_mma_streamk_kernel<false, false, true, kNf4, true>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                  A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+                  reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+                  p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+            }
+          } else if (use_m16) {
             int4_launch_pdl(
-                int4_mma_streamk_kernel<true, false, true, kNf4>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                int4_mma_streamk_kernel<true, false, true, kNf4, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
                 A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
                 reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
                 p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
           } else {
             int4_launch_pdl(
-                int4_mma_streamk_kernel<false, false, true, kNf4>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                int4_mma_streamk_kernel<false, false, true, kNf4, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
                 A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
                 reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
                 p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
           }
         } else {
-          if (use_m16) {
+          if (use_tma) {
+            if (use_m16) {
+              int4_launch_pdl(
+                  int4_mma_streamk_kernel<true, false, false, kNf4, true>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                  A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+                  reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+                  p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+            } else {
+              int4_launch_pdl(
+                  int4_mma_streamk_kernel<false, false, false, kNf4, true>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                  A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+                  reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+                  p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
+            }
+          } else if (use_m16) {
             int4_launch_pdl(
-                int4_mma_streamk_kernel<true, false, false, kNf4>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                int4_mma_streamk_kernel<true, false, false, kNf4, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
                 A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
                 reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
                 p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
           } else {
             int4_launch_pdl(
-                int4_mma_streamk_kernel<false, false, false, kNf4>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
+                int4_mma_streamk_kernel<false, false, false, kNf4, false>, dim3(grid, 1, 1), kThreads, st, pdl_mode,
                 A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
                 reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
                 p_ptr, mp_ptr, d_ptr, M, static_cast<int>(N), static_cast<int>(K), n_blocks, grid, pdl_mode, allow_3part);
@@ -1931,67 +2098,83 @@ static torch::Tensor launch_int4_gemm_impl(
   }
   if (split_k == 1) {
     const dim3 grid(n_blocks, 1, 1);
-    if (is_aux5) {
-      if (use_m16) {
-        int4_launch_pdl(
-            int4_mma_gemm_kernel<false, true, true, kNf4>, grid, kThreads, st, pdl_mode,
-            static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
-            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-            static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1, pdl_mode, 0);
+    auto run_gemm_direct = [&](auto tma_tag) {
+      constexpr bool kTma = decltype(tma_tag)::value;
+      if (is_aux5) {
+        if (use_m16) {
+          int4_launch_pdl(
+              int4_mma_gemm_kernel<false, true, true, kNf4, kTma>, grid, kThreads, st, pdl_mode,
+              static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
+              reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+              static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1, pdl_mode, 0);
+        } else {
+          int4_launch_pdl(
+              int4_mma_gemm_kernel<false, false, true, kNf4, kTma>, grid, kThreads, st, pdl_mode,
+              static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
+              reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+              static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1, pdl_mode, 0);
+        }
       } else {
-        int4_launch_pdl(
-            int4_mma_gemm_kernel<false, false, true, kNf4>, grid, kThreads, st, pdl_mode,
-            static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
-            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-            static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1, pdl_mode, 0);
+        if (use_m16) {
+          int4_launch_pdl(
+              int4_mma_gemm_kernel<false, true, false, kNf4, kTma>, grid, kThreads, st, pdl_mode,
+              A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+              reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+              static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1, pdl_mode, k_major);
+        } else {
+          int4_launch_pdl(
+              int4_mma_gemm_kernel<false, false, false, kNf4, kTma>, grid, kThreads, st, pdl_mode,
+              A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+              reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+              static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1, pdl_mode, k_major);
+        }
       }
+    };
+    if (use_tma) {
+      run_gemm_direct(std::true_type{});
     } else {
-      if (use_m16) {
-        int4_launch_pdl(
-            int4_mma_gemm_kernel<false, true, false, kNf4>, grid, kThreads, st, pdl_mode,
-            A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
-            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-            static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1, pdl_mode, k_major);
-      } else {
-        int4_launch_pdl(
-            int4_mma_gemm_kernel<false, false, false, kNf4>, grid, kThreads, st, pdl_mode,
-            A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
-            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
-            static_cast<float*>(nullptr), M, static_cast<int>(N), static_cast<int>(K), 1, pdl_mode, k_major);
-      }
+      run_gemm_direct(std::false_type{});
     }
   } else {
     const int64_t need = static_cast<int64_t>(split_k) * M * N;
     float* partials_ptr = ensure_int4_splitk_partials(opts, need);
     const dim3 grid(n_blocks, split_k, 1);
-    if (is_aux5) {
-      if (use_m16) {
-        int4_launch_pdl(
-            int4_mma_gemm_kernel<true, true, true, kNf4>, grid, kThreads, st, pdl_mode,
-            static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
-            static_cast<__nv_bfloat16*>(nullptr), partials_ptr,
-            M, static_cast<int>(N), static_cast<int>(K), split_k, pdl_mode, 0);
+    auto run_gemm_splitk = [&](auto tma_tag) {
+      constexpr bool kTma = decltype(tma_tag)::value;
+      if (is_aux5) {
+        if (use_m16) {
+          int4_launch_pdl(
+              int4_mma_gemm_kernel<true, true, true, kNf4, kTma>, grid, kThreads, st, pdl_mode,
+              static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
+              static_cast<__nv_bfloat16*>(nullptr), partials_ptr,
+              M, static_cast<int>(N), static_cast<int>(K), split_k, pdl_mode, 0);
+        } else {
+          int4_launch_pdl(
+              int4_mma_gemm_kernel<true, false, true, kNf4, kTma>, grid, kThreads, st, pdl_mode,
+              static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
+              static_cast<__nv_bfloat16*>(nullptr), partials_ptr,
+              M, static_cast<int>(N), static_cast<int>(K), split_k, pdl_mode, 0);
+        }
       } else {
-        int4_launch_pdl(
-            int4_mma_gemm_kernel<true, false, true, kNf4>, grid, kThreads, st, pdl_mode,
-            static_cast<const __nv_bfloat16*>(nullptr), aux5, W_packed.data_ptr<uint8_t>(),
-            static_cast<__nv_bfloat16*>(nullptr), partials_ptr,
-            M, static_cast<int>(N), static_cast<int>(K), split_k, pdl_mode, 0);
+        if (use_m16) {
+          int4_launch_pdl(
+              int4_mma_gemm_kernel<true, true, false, kNf4, kTma>, grid, kThreads, st, pdl_mode,
+              A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+              static_cast<__nv_bfloat16*>(nullptr), partials_ptr,
+              M, static_cast<int>(N), static_cast<int>(K), split_k, pdl_mode, k_major);
+        } else {
+          int4_launch_pdl(
+              int4_mma_gemm_kernel<true, false, false, kNf4, kTma>, grid, kThreads, st, pdl_mode,
+              A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
+              static_cast<__nv_bfloat16*>(nullptr), partials_ptr,
+              M, static_cast<int>(N), static_cast<int>(K), split_k, pdl_mode, k_major);
+        }
       }
+    };
+    if (use_tma) {
+      run_gemm_splitk(std::true_type{});
     } else {
-      if (use_m16) {
-        int4_launch_pdl(
-            int4_mma_gemm_kernel<true, true, false, kNf4>, grid, kThreads, st, pdl_mode,
-            A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
-            static_cast<__nv_bfloat16*>(nullptr), partials_ptr,
-            M, static_cast<int>(N), static_cast<int>(K), split_k, pdl_mode, k_major);
-      } else {
-        int4_launch_pdl(
-            int4_mma_gemm_kernel<true, false, false, kNf4>, grid, kThreads, st, pdl_mode,
-            A_ptr, aux5, W_packed.data_ptr<uint8_t>(),
-            static_cast<__nv_bfloat16*>(nullptr), partials_ptr,
-            M, static_cast<int>(N), static_cast<int>(K), split_k, pdl_mode, k_major);
-      }
+      run_gemm_splitk(std::false_type{});
     }
     const int vtotal = (M * static_cast<int>(N)) >> 2;
     const dim3 rgrid((vtotal + 255) / 256, 1, 1);

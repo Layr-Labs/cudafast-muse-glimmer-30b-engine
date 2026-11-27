@@ -11,13 +11,15 @@ constexpr int Tiles = (Vectors + Threads - 1) / Threads;
 static bool g_prefill_cs = true;
 static int g_sandwich_pdl_override = -1;
 
-static bool sandwich_pdl_enabled() {
-    if (g_sandwich_pdl_override >= 0) return g_sandwich_pdl_override != 0;
-    static const bool env_on = []() {
+static int sandwich_pdl_mode() {
+    if (g_sandwich_pdl_override >= 0) return g_sandwich_pdl_override;
+    static const int env_mode = []() -> int {
         const char* env = std::getenv("MUSE_SANDWICH_PDL");
-        return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+        if (!env || !*env) return 2;  // 0=off, 1=legacy full (h1_pre+wait), 2=producer-only default
+        long v = std::strtol(env, nullptr, 10);
+        return (v == 0 || v == 1 || v == 2) ? static_cast<int>(v) : 2;
     }();
-    return env_on;
+    return env_mode;
 }
 
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
@@ -127,66 +129,41 @@ __device__ __forceinline__ void discard_l2_128(const void* ptr) {
     asm volatile("discard.global.L2 [%0], 128;" :: "l"(ptr) : "memory");
 }
 
-// 16B coalesced load/store via even-lane uint4 + warp-pair shuffle (0-ULP identical lane layout;
-// safe for tile 6 because active threads [0..127] are 4 full warps).
+// Direct 8B/4B coalesced load/store (0-ULP identical per-thread layout; eliminates even/odd lane
+// divergence and __shfl_xor_sync overhead on SM121, matching norm_glue.cu) + hoisted evict_last policy.
+__device__ __forceinline__ unsigned long long make_policy_evict_last() {
+    unsigned long long policy;
+    asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
+    return policy;
+}
+
 template <bool kCs>
 __device__ __forceinline__ uint2 ld2_v4(const uint2* row_base, unsigned offset) {
-    uint4 v = make_uint4(0u, 0u, 0u, 0u);
-    const unsigned even_off = offset & ~1u;
-    if ((threadIdx.x & 1u) == 0u) {
-        const uint4* p = reinterpret_cast<const uint4*>(row_base + even_off);
-        v = kCs ? load4_cs(p) : *p;
-    }
-    const unsigned hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
-    const unsigned hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
-    return ((threadIdx.x & 1u) == 0u) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+    return kCs ? load2_cs(row_base + offset) : row_base[offset];
 }
 
 __device__ __forceinline__ uint2 ldg2_v4(const uint2* base, unsigned offset) {
-    uint4 v = make_uint4(0u, 0u, 0u, 0u);
-    const unsigned even_off = offset & ~1u;
-    if ((threadIdx.x & 1u) == 0u) {
-        v = __ldg(reinterpret_cast<const uint4*>(base + even_off));
-    }
-    const unsigned hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
-    const unsigned hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
-    return ((threadIdx.x & 1u) == 0u) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+    return __ldg(base + offset);
 }
 
 __device__ __forceinline__ void st2_v4(uint2* row_base, unsigned offset, uint2 val) {
-    const unsigned odd_x = __shfl_xor_sync(0xffffffffu, val.x, 1);
-    const unsigned odd_y = __shfl_xor_sync(0xffffffffu, val.y, 1);
-    if ((threadIdx.x & 1u) == 0u) {
-        *reinterpret_cast<uint4*>(row_base + offset) = make_uint4(val.x, val.y, odd_x, odd_y);
-    }
+    row_base[offset] = val;
 }
 
-__device__ __forceinline__ void st2_v4_evict_last(uint2* row_base, unsigned offset, uint2 val) {
-    const unsigned odd_x = __shfl_xor_sync(0xffffffffu, val.x, 1);
-    const unsigned odd_y = __shfl_xor_sync(0xffffffffu, val.y, 1);
-    if ((threadIdx.x & 1u) == 0u) {
-        unsigned long long policy;
-        asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
-        asm volatile("st.global.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;"
-                     :: "l"(row_base + offset), "r"(val.x), "r"(val.y), "r"(odd_x), "r"(odd_y), "l"(policy) : "memory");
-    }
+__device__ __forceinline__ void st2_v4_evict_last(uint2* row_base, unsigned offset, uint2 val,
+                                                  unsigned long long policy) {
+    asm volatile("st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
+                 :: "l"(row_base + offset), "r"(val.x), "r"(val.y), "l"(policy) : "memory");
 }
 
 __device__ __forceinline__ void st1_v2(unsigned* row_base, unsigned offset, unsigned val) {
-    const unsigned odd_v = __shfl_xor_sync(0xffffffffu, val, 1);
-    if ((threadIdx.x & 1u) == 0u) {
-        *reinterpret_cast<uint2*>(row_base + offset) = make_uint2(val, odd_v);
-    }
+    row_base[offset] = val;
 }
 
-__device__ __forceinline__ void st1_v2_evict_last(unsigned* row_base, unsigned offset, unsigned val) {
-    const unsigned odd_v = __shfl_xor_sync(0xffffffffu, val, 1);
-    if ((threadIdx.x & 1u) == 0u) {
-        unsigned long long policy;
-        asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
-        asm volatile("st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
-                     :: "l"(row_base + offset), "r"(val), "r"(odd_v), "l"(policy) : "memory");
-    }
+__device__ __forceinline__ void st1_v2_evict_last(unsigned* row_base, unsigned offset, unsigned val,
+                                                  unsigned long long policy) {
+    asm volatile("st.global.L2::cache_hint.b32 [%0], %1, %2;"
+                 :: "l"(row_base + offset), "r"(val), "l"(policy) : "memory");
 }
 
 // Gate (prefill3): also emit the FP8 input of the attention output-gate projection, i.e. what the compiled
@@ -393,7 +370,7 @@ __global__ __launch_bounds__(Threads) void sandwich(
 // Safe for tile 6 because active threads [0..127] are 4 full warps; requires 16B alignment on all row pointers
 // (and 128B alignment on `down` when DiscardDown is true; 6656*2 = 13312 = 104 * 128 B per row).
 template <bool Quantize, bool Gate, bool WriteHidden, bool GateEvictLast,
-          bool ResidualEvictLast, bool CsLoads, bool Pdl, bool DiscardDown>
+          bool ResidualEvictLast, bool CsLoads, int PdlMode, bool DiscardDown>
 __global__ __launch_bounds__(Threads) void sandwich_v4(
     uint2* __restrict__ post_attn, const uint2* __restrict__ down, const uint2* __restrict__ residual,
     const float* __restrict__ previous_sum, const uint2* __restrict__ post_attn_weight,
@@ -407,10 +384,14 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
     uint2* const pa_row = post_attn + base;
     const uint2* const dn_row = down + base;
     const uint2* const rs_row = residual + base;
-    float h1_pre[Pdl ? Tiles : 1][4];
+    unsigned long long el_policy = 0ull;
+    if constexpr (ResidualEvictLast || GateEvictLast) {
+        el_policy = make_policy_evict_last();
+    }
+    float h1_pre[PdlMode == 1 ? Tiles : 1][4];
     float scale_inv_pre = 1.f;
     float gate_inv_pre = 1.f;
-    if constexpr (Pdl) {
+    if constexpr (PdlMode == 1) {
         const float prev_s_pre = __ldg(previous_sum + blockIdx.x);
         const float attn_inv_pre = inverse_rms(prev_s_pre, 1.e-8f);
         if constexpr (Quantize) scale_inv_pre = full_divide(1.f, __ldg(scale));
@@ -454,7 +435,7 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
         }
     }
     float attn_inverse = 0.f;
-    if constexpr (!Pdl) {
+    if constexpr (PdlMode != 1) {
         attn_inverse = inverse_rms(__ldg(previous_sum + blockIdx.x), 1.e-8f);
     }
     #pragma unroll
@@ -465,7 +446,7 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
         if (offset < Vectors) {
             const uint2 d = saved[tile];
             float values[4];
-            if constexpr (Pdl) {
+            if constexpr (PdlMode == 1) {
                 const uint2 wd = ldg2_v4(post_ff_weight, offset);
                 #pragma unroll
                 for (int channel = 0; channel < 4; ++channel) {
@@ -492,7 +473,7 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
             const uint2 rounded = make_uint2(pack_bf16(values[0], values[1]),
                                              pack_bf16(values[2], values[3]));
             if constexpr (ResidualEvictLast) {
-                st2_v4_evict_last(pa_row, offset, rounded);
+                st2_v4_evict_last(pa_row, offset, rounded, el_policy);
             } else {
                 st2_v4(pa_row, offset, rounded);
             }
@@ -500,9 +481,14 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
         }
     }
     const float input_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-5f);
-    const float scale_inv = Pdl ? scale_inv_pre
+    if constexpr (PdlMode == 2) {
+        // Producer-only PDL: zero h1_pre reg/preload overhead, launched via standard <<<...>>>,
+        // signaling downstream qkv_proj to overlap TMA weight preloads with the final store epilogue.
+        pdl_launch_dependents();
+    }
+    const float scale_inv = (PdlMode == 1) ? scale_inv_pre
                                 : (Quantize ? full_divide(1.f, __ldg(scale)) : 1.f);
-    const float gate_inv = Pdl ? gate_inv_pre
+    const float gate_inv = (PdlMode == 1) ? gate_inv_pre
                                : (Gate ? full_divide(1.f, __ldg(gate_scale)) : 1.f);
     uint2* const hid_row = WriteHidden ? (hidden + base) : nullptr;
     unsigned* const q_row = Quantize ? (quantized + base) : nullptr;
@@ -533,7 +519,7 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
                     gate_values[channel] = bf16(rounded_hidden, channel);
                 }
                 if constexpr (GateEvictLast) {
-                    st1_v2_evict_last(g_row, offset, pack_fp8(gate_values, gate_inv));
+                    st1_v2_evict_last(g_row, offset, pack_fp8(gate_values, gate_inv), el_policy);
                 } else {
                     st1_v2(g_row, offset, pack_fp8(gate_values, gate_inv));
                 }
@@ -582,14 +568,19 @@ static inline cudaError_t dispatch_v4(
     const uint2* a4, const uint2* a5, const uint2* a6,
     const float* a7, uint2* a8, unsigned* a9,
     const float* a10, unsigned* a11) {
-    const bool use_pdl = sandwich_pdl_enabled();
+    const int pdl_mode = sandwich_pdl_mode();
     const bool disc = sandwich_discard_enabled() && ((reinterpret_cast<uintptr_t>(a1) & 127u) == 0u);
-    if (use_pdl) {
-        if (disc) return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, true, true>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-        return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, true, false>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+    if (pdl_mode == 1) {
+        if (disc) return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, true>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+        return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, false>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
     }
-    if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, false, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-    else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, false, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+    if (pdl_mode == 2) {
+        if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+        else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+        return cudaGetLastError();
+    }
+    if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+    else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
     return cudaGetLastError();
 }
 
@@ -611,7 +602,7 @@ void launch(const void* const* args, int rows, cudaStream_t stream) {
                 rows, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, nullptr, nullptr);
             return;
         }
-        if (sandwich_pdl_enabled()) {
+        if (sandwich_pdl_mode() == 1) {
             launch_ex_pdl(sandwich<Quantize, true, false, true, false, false, CsLoads, true>, rows, Threads,
                           Vectors * sizeof(uint2), stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9,
                           static_cast<const float*>(nullptr), static_cast<unsigned*>(nullptr));
@@ -628,8 +619,8 @@ extern "C" void muse_sandwich_set_prefill_cs(int enable) {
 }
 
 extern "C" int muse_sandwich_set_pdl(int enable) {
-    const int old = sandwich_pdl_enabled() ? 1 : 0;
-    g_sandwich_pdl_override = (enable < 0) ? -1 : (enable != 0 ? 1 : 0);
+    const int old = sandwich_pdl_mode();
+    g_sandwich_pdl_override = (enable < 0) ? -1 : ((enable == 0 || enable == 1 || enable == 2) ? enable : 2);
     return old;
 }
 
@@ -665,7 +656,7 @@ void launch_gate(const void* const* args, int rows, cudaStream_t stream) {
                 rows, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
             return;
         }
-        if (sandwich_pdl_enabled()) {
+        if (sandwich_pdl_mode() == 1) {
             launch_ex_pdl(sandwich<true, true, true, WriteHidden, EvictLast, false, CsLoads, true>, rows, Threads,
                           Vectors * sizeof(uint2), stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
             return;
@@ -716,7 +707,7 @@ extern "C" int muse_sandwich_gate_evict_last(const void* const* args, int rows, 
 template <bool GateEL, bool ResEL, bool CsLoads>
 int launch_hint(const void* const* args, int rows, int mode, cudaStream_t stream) {
     const size_t smem = Vectors * sizeof(uint2);
-    const bool use_pdl = sandwich_pdl_enabled();
+    const bool use_pdl = (sandwich_pdl_mode() == 1);
     if (mode == 0) {
         auto* a0 = static_cast<uint2*>(const_cast<void*>(args[0]));
         const auto* a1 = static_cast<const uint2*>(args[1]);
