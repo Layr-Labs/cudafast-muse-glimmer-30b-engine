@@ -23,7 +23,7 @@ SMS = 48
 ENABLED = os.environ.get("MARLIN_DOWN128", "1") == "1"
 ATTN_ENABLED = os.environ.get("MARLIN_ATTN128", "1") == "1"
 _ALL_ATTN_SHAPES = {(4608, 6656): "qkv", (6656, 4096): "o_proj", (4096, 6656): "gate"}
-_raw_attn_shapes = os.environ.get("MARLIN_ATTN128_SHAPES", "qkv,o_proj,gate")
+_raw_attn_shapes = os.environ.get("MARLIN_ATTN128_SHAPES", "qkv,gate")
 _enabled_attn = set() if _raw_attn_shapes in ("", "0") else set(_raw_attn_shapes.split(","))
 ATTN_SHAPES = {k: v for k, v in _ALL_ATTN_SHAPES.items() if v in _enabled_attn}
 ATTN_TMA_ENABLED = ATTN_ENABLED and os.environ.get("MARLIN_ATTN_TMA", "1") == "1"
@@ -90,11 +90,46 @@ if TMA_ENABLED or ATTN_TMA_ENABLED:
             _tma_set_shfl_epi.restype = None
             _cur_shfl_epi = 1 if TMA_SHFL_EPI else 0
             _tma_set_shfl_epi(_cur_shfl_epi)
+        _tma_set_next_dead = getattr(_tma_library, "marlinw_down128_set_next_dead", None)
+        if _tma_set_next_dead is not None:
+            _tma_set_next_dead.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            _tma_set_next_dead.restype = None
         _tma_set_pdl = getattr(_tma_library, "marlinw_tma_set_pdl", None)
         if _tma_set_pdl is not None:
             _tma_set_pdl.argtypes = [ctypes.c_int]
             _tma_set_pdl.restype = ctypes.c_int
 
+
+_L2_DISCARD_V2 = os.environ.get("MUSE_PREFILL_L2_DISCARD_V2", "1") != "0"
+_dead_mlp_in = None
+
+def stash_dead_mlp_in(t) -> None:
+    global _dead_mlp_in
+    if _L2_DISCARD_V2:
+        _dead_mlp_in = t
+
+def consume_dead_mlp_in(live_tensors) -> None:
+    global _dead_mlp_in
+    t = _dead_mlp_in
+    _dead_mlp_in = None
+    fn = globals().get("_tma_set_next_dead")
+    if fn is None:
+        return
+    if not _L2_DISCARD_V2 or t is None or not t.is_cuda or not t.is_contiguous():
+        fn(0, 0)
+        return
+    dp = t.data_ptr()
+    db = t.numel() * t.element_size()
+    de = dp + db
+    for lt in live_tensors:
+        if lt is None:
+            continue
+        lp = lt.data_ptr()
+        le = lp + lt.numel() * lt.element_size()
+        if not (de <= lp or le <= dp):
+            fn(0, 0)
+            return
+    fn(dp, db)
 
 def set_tma_pdl(mode: int) -> int | None:
     fn = globals().get("_tma_set_pdl")

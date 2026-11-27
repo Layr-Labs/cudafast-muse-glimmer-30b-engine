@@ -54,6 +54,9 @@ def _load():
         if hasattr(lib, "muse_fp8_dual_a"):
             lib.muse_fp8_dual_a.argtypes = [ci, ci] + [ptr] * 11
             lib.muse_fp8_dual_a.restype = ci
+        if hasattr(lib, "muse_fp8_down_set_next_dead"):
+            lib.muse_fp8_down_set_next_dead.argtypes = [ptr, ctypes.c_size_t]
+            lib.muse_fp8_down_set_next_dead.restype = None
         if hasattr(lib, "muse_bf16_dual_stacked"):
             lib.muse_bf16_dual_stacked.argtypes = [ci, ci] + [ptr] * 5
             lib.muse_bf16_dual_stacked.restype = ci
@@ -286,11 +289,17 @@ def _install_fp8ws_accel() -> None:
                 if admitted:
                     out = torch.empty((_ROWS, _HIDDEN), device=a.device, dtype=torch.bfloat16)
                     if (out.data_ptr() & 15) == 0:
+                        _consume_dead_mlp_in((a, b, sa, sb, out))
                         rc = _library.muse_fp8_gemm_6656(
                             2, -1, a.data_ptr(), b.data_ptr(), sa.data_ptr(), sb.data_ptr(),
                             out.data_ptr(), _INNER, torch.cuda.current_stream(dev_idx).cuda_stream,
                         )
                         if rc == 0:
+                            try:
+                                import muse_sandwich as _ms
+                                _ms.stash_dead_down_in(a)
+                            except Exception:
+                                pass
                             return out
             return orig_gemm(a, b, sa, sb)
 
@@ -437,6 +446,11 @@ def _install_fp8ws_accel() -> None:
                             o0.data_ptr(), o1.data_ptr(), torch.cuda.current_stream(dev_idx).cuda_stream,
                         )
                         if rc == 0:
+                            try:
+                                import muse_prefill_attn as _mpa
+                                _mpa.stash_dead_xnorm(a)
+                            except Exception:
+                                pass
                             return o0, o1
             return orig_bf16_dual(a, w_cat)
 
@@ -444,5 +458,37 @@ def _install_fp8ws_accel() -> None:
 
     _fp8ws._muse_fp8_swiglu_hooked = True
 
+
+
+_L2_DISCARD_V2 = os.environ.get("MUSE_PREFILL_L2_DISCARD_V2", "1") != "0"
+_dead_mlp_in = None
+
+def stash_dead_mlp_in(t) -> None:
+    global _dead_mlp_in
+    if _L2_DISCARD_V2:
+        _dead_mlp_in = t
+
+def _consume_dead_mlp_in(live_tensors) -> None:
+    global _dead_mlp_in
+    t = _dead_mlp_in
+    _dead_mlp_in = None
+    fn = getattr(_library, "muse_fp8_down_set_next_dead", None) if _library is not None else None
+    if fn is None:
+        return
+    if not _L2_DISCARD_V2 or t is None or not t.is_cuda or not t.is_contiguous():
+        fn(0, 0)
+        return
+    dp = t.data_ptr()
+    db = t.numel() * t.element_size()
+    de = dp + db
+    for lt in live_tensors:
+        if lt is None:
+            continue
+        lp = lt.data_ptr()
+        le = lp + lt.numel() * lt.element_size()
+        if not (de <= lp or le <= dp):
+            fn(0, 0)
+            return
+    fn(dp, db)
 
 _install_fp8ws_accel()

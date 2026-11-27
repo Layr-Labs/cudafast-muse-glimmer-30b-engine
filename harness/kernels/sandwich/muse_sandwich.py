@@ -44,6 +44,40 @@ if _set_prefill_cs is not None:
     _set_prefill_cs.argtypes = [ctypes.c_int]
     _set_prefill_cs.restype = None
     _set_prefill_cs(1 if PREFILL_CS else 0)
+_set_next_dead = getattr(_library, "muse_sandwich_set_next_dead", None)
+if _set_next_dead is not None:
+    _set_next_dead.argtypes = [_pointer, ctypes.c_size_t]
+    _set_next_dead.restype = None
+_L2_DISCARD_V2 = os.environ.get("MUSE_PREFILL_L2_DISCARD_V2", "1") != "0"
+_dead_down_in = None
+
+def stash_dead_down_in(t) -> None:
+    global _dead_down_in
+    if _L2_DISCARD_V2:
+        _dead_down_in = t
+
+def _apply_dead_down_in(live_tensors) -> None:
+    global _dead_down_in
+    t = _dead_down_in
+    _dead_down_in = None
+    if _set_next_dead is None:
+        return
+    if not _L2_DISCARD_V2 or t is None or not t.is_cuda or not t.is_contiguous():
+        _set_next_dead(0, 0)
+        return
+    dp = t.data_ptr()
+    db = t.numel() * t.element_size()
+    de = dp + db
+    for lt in live_tensors:
+        if lt is None or not hasattr(lt, "data_ptr"):
+            continue
+        lp = lt.data_ptr()
+        le = lp + lt.numel() * lt.element_size()
+        if not (de <= lp or le <= dp):
+            _set_next_dead(0, 0)
+            return
+    _set_next_dead(dp, db)
+
 _set_pdl = getattr(_library, "muse_sandwich_set_pdl", None)
 if _set_pdl is not None:
     _set_pdl.argtypes = [ctypes.c_int]
@@ -184,6 +218,10 @@ def install():
                 quantize, rows, addresses = match
                 if quantize and rows == _ROWS and _layers and _fold_sandwich(args, addresses, stream):
                     return None
+                if rows == _ROWS:
+                    _apply_dead_down_in(args[:-2])
+                elif _set_next_dead is not None:
+                    _set_next_dead(0, 0)
                 pointers = (_pointer * len(addresses))(*addresses)
                 if not quantize and rows == _ROWS and RESIDUAL_EVICT_LAST and active and _hint_launch is not None:
                     status = _hint_launch(pointers, rows, 0, 0, 1, stream)
@@ -234,6 +272,7 @@ def _fold_sandwich(args, addresses, stream) -> bool:
     capturing = torch.cuda.is_current_stream_capturing()
     hidden = args[8]
     if layer.state == "admitted":
+        _apply_dead_down_in((*args[:-2], layer.buffer))
         if (EVICT_LAST or RESIDUAL_EVICT_LAST) and DROP_HIDDEN and _hint_launch is not None:
             status = _hint_launch(_gate_pointers(addresses, layer), _ROWS, 1, int(EVICT_LAST), int(RESIDUAL_EVICT_LAST),
                                   stream)
@@ -354,6 +393,11 @@ def gemm_hook(a, b, sa, sb, compute):
                 raise RuntimeError("muse_sandwich dual qkv+gate launch failed")
             layer.gate_out = outs[1]
             _fold_counts["dual_launches"] += 1
+            try:
+                import muse_prefill_attn as _mpa
+                _mpa.stash_dead_xnorm(a, layer.buffer)
+            except Exception:
+                pass
             return outs[0]
         out = compute(a)
         if layer.state == "admitted" and DUAL and layer.dual == "unchecked" and not torch.cuda.is_current_stream_capturing():

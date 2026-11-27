@@ -1176,6 +1176,9 @@ torch::Tensor dflash_rms_norm(torch::Tensor input, torch::Tensor weight, double 
       (M <= 16 && (K & 63) == 0 && dflash_norm_fuse_rot_enabled())
           ? vq4d_alloc_norm_prerot(out.data_ptr(), w_tag, M, K, out.options())
           : nullptr;
+  if (M > 16) {
+    vq4d_clear_all_prerot();
+  }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int pdl = dflash_fuse_pdl_mode();
   auto k = (rot_out != nullptr) ? dflash_rms_norm_kernel<false, false, true>
@@ -1224,6 +1227,9 @@ std::tuple<torch::Tensor, torch::Tensor> dflash_fused_add_rms_norm(
       (M <= 16 && (K & 63) == 0 && dflash_norm_fuse_rot_enabled())
           ? vq4d_alloc_norm_prerot(out.data_ptr(), w_tag, M, K, out.options())
           : nullptr;
+  if (M > 16) {
+    vq4d_clear_all_prerot();
+  }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int pdl = dflash_fuse_pdl_mode();
   const bool preload_res = (input.data_ptr() != residual.data_ptr());

@@ -65,6 +65,24 @@ __device__ float inverse_rms(float total, float eps) {
     return result;
 }
 
+__device__ __forceinline__ float reduce_1bar(const float (&partial)[4], float* warp_totals, unsigned thread) {
+    float sum = __fadd_rn(__fadd_rn(__fadd_rn(partial[0], partial[1]), partial[2]), partial[3]);
+    #pragma unroll
+    for (int delta = 16; delta > 0; delta /= 2) {
+        sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffff, sum, delta));
+    }
+    if ((thread & 31u) == 0u) {
+        warp_totals[thread >> 5] = sum;
+    }
+    __syncthreads();
+    sum = warp_totals[thread & 7u];
+    #pragma unroll
+    for (int delta = 4; delta > 0; delta /= 2) {
+        sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffff, sum, delta, 8));
+    }
+    return __shfl_sync(0xffffffff, sum, 0, 8);
+}
+
 __device__ float reduce(const float (&partial)[4], float* warp_totals, unsigned thread) {
     // Match Inductor's [1,4] elements per lane, then XOR within a warp and
     // across the eight warps. Each channel carries its own 1024-strided chain.
@@ -126,66 +144,30 @@ __device__ __forceinline__ void discard_l2_128(const void* ptr) {
     asm volatile("discard.global.L2 [%0], 128;" :: "l"(ptr) : "memory");
 }
 
-// 16B coalesced load/store via even-lane uint4 + warp-pair shuffle (0-ULP identical lane layout;
-// safe for tile 6 because active threads [0..127] are 4 full warps).
 template <bool kCs>
 __device__ __forceinline__ uint2 ld2_v4(const uint2* row_base, unsigned offset) {
-    uint4 v = make_uint4(0u, 0u, 0u, 0u);
-    const unsigned even_off = offset & ~1u;
-    if ((threadIdx.x & 1u) == 0u) {
-        const uint4* p = reinterpret_cast<const uint4*>(row_base + even_off);
-        v = kCs ? load4_cs(p) : *p;
-    }
-    const unsigned hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
-    const unsigned hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
-    return ((threadIdx.x & 1u) == 0u) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+    return kCs ? load2_cs(row_base + offset) : row_base[offset];
 }
-
 __device__ __forceinline__ uint2 ldg2_v4(const uint2* base, unsigned offset) {
-    uint4 v = make_uint4(0u, 0u, 0u, 0u);
-    const unsigned even_off = offset & ~1u;
-    if ((threadIdx.x & 1u) == 0u) {
-        v = __ldg(reinterpret_cast<const uint4*>(base + even_off));
-    }
-    const unsigned hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
-    const unsigned hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
-    return ((threadIdx.x & 1u) == 0u) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+    return __ldg(base + offset);
 }
-
 __device__ __forceinline__ void st2_v4(uint2* row_base, unsigned offset, uint2 val) {
-    const unsigned odd_x = __shfl_xor_sync(0xffffffffu, val.x, 1);
-    const unsigned odd_y = __shfl_xor_sync(0xffffffffu, val.y, 1);
-    if ((threadIdx.x & 1u) == 0u) {
-        *reinterpret_cast<uint4*>(row_base + offset) = make_uint4(val.x, val.y, odd_x, odd_y);
-    }
+    row_base[offset] = val;
 }
-
 __device__ __forceinline__ void st2_v4_evict_last(uint2* row_base, unsigned offset, uint2 val) {
-    const unsigned odd_x = __shfl_xor_sync(0xffffffffu, val.x, 1);
-    const unsigned odd_y = __shfl_xor_sync(0xffffffffu, val.y, 1);
-    if ((threadIdx.x & 1u) == 0u) {
-        unsigned long long policy;
-        asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
-        asm volatile("st.global.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;"
-                     :: "l"(row_base + offset), "r"(val.x), "r"(val.y), "r"(odd_x), "r"(odd_y), "l"(policy) : "memory");
-    }
+    unsigned long long policy;
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
+    asm volatile("st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
+                 :: "l"(row_base + offset), "r"(val.x), "r"(val.y), "l"(policy) : "memory");
 }
-
 __device__ __forceinline__ void st1_v2(unsigned* row_base, unsigned offset, unsigned val) {
-    const unsigned odd_v = __shfl_xor_sync(0xffffffffu, val, 1);
-    if ((threadIdx.x & 1u) == 0u) {
-        *reinterpret_cast<uint2*>(row_base + offset) = make_uint2(val, odd_v);
-    }
+    row_base[offset] = val;
 }
-
 __device__ __forceinline__ void st1_v2_evict_last(unsigned* row_base, unsigned offset, unsigned val) {
-    const unsigned odd_v = __shfl_xor_sync(0xffffffffu, val, 1);
-    if ((threadIdx.x & 1u) == 0u) {
-        unsigned long long policy;
-        asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
-        asm volatile("st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
-                     :: "l"(row_base + offset), "r"(val), "r"(odd_v), "l"(policy) : "memory");
-    }
+    unsigned long long policy;
+    asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
+    asm volatile("st.global.L2::cache_hint.b32 [%0], %1, %2;"
+                 :: "l"(row_base + offset), "r"(val), "l"(policy) : "memory");
 }
 
 // Gate (prefill3): also emit the FP8 input of the attention output-gate projection, i.e. what the compiled
@@ -398,8 +380,9 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
     const float* __restrict__ previous_sum, const uint2* __restrict__ post_attn_weight,
     const uint2* __restrict__ post_ff_weight, const uint2* __restrict__ next_pre_attn_weight,
     const float* __restrict__ scale, uint2* __restrict__ hidden, unsigned* __restrict__ quantized,
-    const float* __restrict__ gate_scale = nullptr, unsigned* __restrict__ gate_quantized = nullptr) {
-    __shared__ float warp_totals[8];
+    const float* __restrict__ gate_scale = nullptr, unsigned* __restrict__ gate_quantized = nullptr,
+    const char* __restrict__ dead_ptr = nullptr, size_t dead_lines = 0) {
+    __shared__ float warp_totals[2][8];
     uint2 saved[Tiles];
     const unsigned thread = threadIdx.x;
     const size_t base = static_cast<size_t>(blockIdx.x) * Vectors;
@@ -445,11 +428,18 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
             }
         }
     }
-    const float down_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-8f);
+    const float down_inverse = inverse_rms(reduce_1bar(partial, warp_totals[0], thread), 1.e-8f);
     if constexpr (DiscardDown) {
         // reduce() already synchronized the CTA; all 104 cache lines (13312 B) of dn_row are now dead.
         if (thread < 104u) {
             discard_l2_128(reinterpret_cast<const char*>(dn_row) + (thread << 7));
+        }
+        if (dead_ptr) {
+            const size_t gid = static_cast<size_t>(blockIdx.x) * Threads + thread;
+            const size_t gstride = static_cast<size_t>(gridDim.x) * Threads;
+            for (size_t i = gid; i < dead_lines; i += gstride) {
+                discard_l2_128(dead_ptr + (i << 7));
+            }
         }
     }
     float attn_inverse = 0.f;
@@ -498,7 +488,7 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
             saved[tile] = rounded;
         }
     }
-    const float input_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-5f);
+    const float input_inverse = inverse_rms(reduce_1bar(partial, warp_totals[1], thread), 1.e-5f);
     const float scale_inv = Pdl ? scale_inv_pre
                                 : (Quantize ? full_divide(1.f, __ldg(scale)) : 1.f);
     const float gate_inv = Pdl ? gate_inv_pre
@@ -574,6 +564,22 @@ static inline bool aligned16_row_ptrs(const void* a0, const void* a1, const void
     return true;
 }
 
+static const void* g_next_dead_ptr = nullptr;
+static size_t g_next_dead_bytes = 0;
+
+static inline void align_dead_128(const void* ptr, size_t nbytes, const char*& out_p, size_t& out_lines) {
+    out_p = nullptr;
+    out_lines = 0;
+    if (!ptr || nbytes < 128u) return;
+    const uintptr_t p0 = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t s = (p0 + 127u) & ~uintptr_t(127u);
+    const uintptr_t e = (p0 + nbytes) & ~uintptr_t(127u);
+    if (e > s) {
+        out_p = reinterpret_cast<const char*>(s);
+        out_lines = static_cast<size_t>((e - s) >> 7);
+    }
+}
+
 template <bool Quantize, bool Gate, bool WriteHidden, bool GateEvictLast, bool ResidualEvictLast, bool CsLoads>
 static inline cudaError_t dispatch_v4(
     int rows, cudaStream_t stream,
@@ -581,14 +587,21 @@ static inline cudaError_t dispatch_v4(
     const uint2* a4, const uint2* a5, const uint2* a6,
     const float* a7, uint2* a8, unsigned* a9,
     const float* a10, unsigned* a11) {
+    const void* raw_dp = g_next_dead_ptr;
+    const size_t raw_db = g_next_dead_bytes;
+    g_next_dead_ptr = nullptr;
+    g_next_dead_bytes = 0;
+    const char* dp = nullptr;
+    size_t dl = 0;
     const bool use_pdl = sandwich_pdl_enabled();
     const bool disc = sandwich_discard_enabled() && ((reinterpret_cast<uintptr_t>(a1) & 127u) == 0u);
+    if (disc && rows == 512) align_dead_128(raw_dp, raw_db, dp, dl);
     if (use_pdl) {
-        if (disc) return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, true, true>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-        return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, true, false>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+        if (disc) return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, true, true>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
+        return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, true, false>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, static_cast<const char*>(nullptr), size_t(0));
     }
-    if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, false, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-    else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, false, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+    if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, false, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
+    else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, false, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, nullptr, 0);
     return cudaGetLastError();
 }
 
@@ -636,6 +649,11 @@ extern "C" int muse_sandwich_set_v4(int enable) {
     const int old = sandwich_v4_enabled() ? 1 : 0;
     g_sandwich_v4_override = (enable < 0) ? -1 : (enable != 0 ? 1 : 0);
     return old;
+}
+
+extern "C" void muse_sandwich_set_next_dead(const void* ptr, size_t nbytes) {
+    g_next_dead_ptr = ptr;
+    g_next_dead_bytes = nbytes;
 }
 
 extern "C" int muse_sandwich_set_discard(int enable) {
