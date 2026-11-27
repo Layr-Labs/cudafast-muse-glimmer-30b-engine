@@ -53,7 +53,7 @@ __host__ __device__ constexpr int vq4d_lut_size() {
   return (kBits == 9) ? 256 : 512;
 }
 
-__constant__ float4 kVq4dAnti256[256] = {
+__device__ const float4 kVq4dAnti256[256] = {
     {+0.08544921875f, +0.1176757812f, -0.314453125f, -0.1591796875f}, {+0.2734375f, +0.1079101562f, +0.001815795898f, +0.515625f},
     {+0.408203125f, -0.42578125f, +0.005645751953f, -0.28515625f}, {+0.55859375f, +0.27734375f, +0.150390625f, -0.1552734375f},
     {+0.1845703125f, -0.458984375f, -0.55078125f, +0.06591796875f}, {+0.2060546875f, +0.099609375f, +0.39453125f, -0.609375f},
@@ -184,7 +184,7 @@ __constant__ float4 kVq4dAnti256[256] = {
     {+1.2890625f, +1.34375f, +1.2890625f, -2.015625f}, {+2.015625f, +1.0703125f, -1.96875f, +0.7109375f},
 };
 
-__constant__ float4 kVq4dAnti512[512] = {
+__device__ const float4 kVq4dAnti512[512] = {
     {+0.056640625f, +0.2275390625f, +0.19140625f, -0.04077148438f}, {+0.435546875f, -0.263671875f, +0.07080078125f, -0.111328125f},
     {+0.2890625f, +0.40625f, -0.26953125f, -0.04443359375f}, {+0.1630859375f, -0.154296875f, +0.412109375f, +0.32421875f},
     {+0.287109375f, -0.2099609375f, -0.12890625f, +0.453125f}, {+0.25390625f, +0.041015625f, -0.1069335938f, -0.546875f},
@@ -443,6 +443,15 @@ __constant__ float4 kVq4dAnti512[512] = {
     {+0.796875f, +0.265625f, +2.703125f, -1.78125f}, {+1.3046875f, -1.828125f, -2.484375f, +0.283203125f},
 };
 
+template <int kBits>
+__device__ __forceinline__ float4 vq4d_load_centroid(int i) {
+  if constexpr (kBits == 9) {
+    return __ldg(&kVq4dAnti256[i]);
+  } else {
+    return __ldg(&kVq4dAnti512[i]);
+  }
+}
+
 static bool vq4d_dyn_env() {
   static const bool dyn = (std::getenv("MUSE_BENCH_DYN_ENV") != nullptr);
   return dyn;
@@ -484,6 +493,55 @@ static bool vq4d_n32_tma_enabled() {
     return (!s || !*s) ? false : (std::atoi(s) != 0);
   }();
   return en;
+}
+
+__device__ __forceinline__ float4 vq4d_ldcg_f4(const float4* ptr) {
+  float4 v;
+  asm volatile("ld.global.cg.v4.f32 {%0, %1, %2, %3}, [%4];"
+               : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+               : "l"(ptr));
+  return v;
+}
+
+__host__ __device__ __forceinline__ size_t vq4d_n32_sk_pair_slot(
+    int cta_n, int p, int num_cta, int num_pairs, int grid_ctas) {
+  const int64_t total = static_cast<int64_t>(num_cta) * num_pairs;
+  const int64_t lin = static_cast<int64_t>(cta_n) * num_pairs + p;
+  const int c = static_cast<int>(((lin + 1) * grid_ctas - 1) / total);
+  const int64_t iter_s = (static_cast<int64_t>(c) * total) / grid_ctas;
+  const int64_t loc = lin - iter_s;
+  const int64_t q = total / grid_ctas;
+  if (loc < q) {
+    return static_cast<size_t>(loc * grid_ctas + c);
+  }
+  return static_cast<size_t>(q * grid_ctas + (iter_s - static_cast<int64_t>(c) * q));
+}
+
+static int vq4d_n32_sk_grid(int N, int K) {
+  if ((K & 127) != 0) return 0;
+  const int num_cta = N >> 5;
+  if (num_cta <= 0 || num_cta > 288) return 0;
+  auto parse = [&]() -> int {
+    const char* s = std::getenv("MUSE_VQ4D_N32_SK_GRID");
+    const int g = (!s || !*s) ? 240 : std::atoi(s);
+    if (g <= num_cta || (g % 48) != 0 || g > 288) return 0;
+    const int num_pairs = K >> 7;
+    const int64_t total = static_cast<int64_t>(num_cta) * num_pairs;
+    const int min_my_pairs = static_cast<int>(total / g);
+    // Guarantee num_parts <= 3 per N-tile: 2 * min_my_pairs + 1 > num_pairs
+    if (2 * min_my_pairs < num_pairs) return 0;
+    return g;
+  };
+  if (vq4d_dyn_env()) return parse();
+  static const int cached_env = []() -> int {
+    const char* s = std::getenv("MUSE_VQ4D_N32_SK_GRID");
+    return (!s || !*s) ? 240 : std::atoi(s);
+  }();
+  if (cached_env <= num_cta || (cached_env % 48) != 0 || cached_env > 288) return 0;
+  const int num_pairs = K >> 7;
+  const int min_my_pairs = static_cast<int>((static_cast<int64_t>(num_cta) * num_pairs) / cached_env);
+  if (2 * min_my_pairs < num_pairs) return 0;
+  return cached_env;
 }
 
 static int vq4d_n32_wave_ilv(int N) {
@@ -658,12 +716,7 @@ template <int kBits>
 __device__ __forceinline__ void vq4d_init_lut(uint2* __restrict__ lut, int tid) {
   constexpr int kLut = vq4d_lut_size<kBits>();
   for (int i = tid; i < kLut; i += kVqThreads) {
-    float4 c;
-    if constexpr (kBits == 9) {
-      c = kVq4dAnti256[i];
-    } else {
-      c = kVq4dAnti512[i];
-    }
+    const float4 c = vq4d_load_centroid<kBits>(i);
     lut[i] = make_uint2(vq4d_bf16x2_u32(c.x, c.y), vq4d_bf16x2_u32(c.z, c.w));
   }
 }
@@ -762,12 +815,7 @@ __device__ __forceinline__ void vq4d_pack_tile_body(
   const int lane = tid & 31;
 
   for (int i = tid; i < kLut; i += 256) {
-    float4 c;
-    if constexpr (kBits == 9) {
-      c = kVq4dAnti256[i];
-    } else {
-      c = kVq4dAnti512[i];
-    }
+    const float4 c = vq4d_load_centroid<kBits>(i);
     s_cb[i] = c;
     s_hcn2[i] = 0.5f * (__fmaf_rn(c.x, c.x, __fmaf_rn(c.y, c.y, __fmaf_rn(c.z, c.z, c.w * c.w))));
   }
@@ -803,7 +851,7 @@ __device__ __forceinline__ void vq4d_pack_tile_body(
 
   uint32_t best_code = 0u;
 #pragma unroll
-  for (int pass = 0; pass < 2; ++pass) {
+  for (int pass = 0; pass < 4; ++pass) {
     const float inv_sc = (cur_sc > 1e-30f) ? (1.0f / cur_sc) : 0.0f;
     const float u0 = x0 * inv_sc;
     const float u1 = x1 * inv_sc;
@@ -829,19 +877,72 @@ __device__ __forceinline__ void vq4d_pack_tile_body(
                     ? peer_code
                     : my_code;
 
-    const uint32_t idx_c = best_code & kIdxMask;
-    const float sgn = (best_code & kSgnBit) ? -1.0f : 1.0f;
-    const float4 c = s_cb[idx_c];
-    const float lnum = (half == 0)
-                           ? (sgn * __fmaf_rn(x0, c.x, __fmaf_rn(x1, c.y, __fmaf_rn(x2, c.z, x3 * c.w))))
-                           : 0.0f;
-    const float lden = (half == 0) ? (2.0f * s_hcn2[idx_c]) : 0.0f;
-    const float num = vq4d_warp_sum(lnum);
-    const float den = vq4d_warp_sum(lden);
-    if (den > 1e-12f && num > 0.0f) {
-      sc_code = vq4d_encode_ue4m4(num / den, base_shifted);
-      cur_sc = __bfloat162float(vq4d_decode_ue4m4(sc_code, base_shifted));
+    if (pass < 3) {
+      const uint32_t idx_c = best_code & kIdxMask;
+      const float sgn = (best_code & kSgnBit) ? -1.0f : 1.0f;
+      const float4 c = s_cb[idx_c];
+      const float lnum = (half == 0)
+                             ? (sgn * __fmaf_rn(x0, c.x, __fmaf_rn(x1, c.y, __fmaf_rn(x2, c.z, x3 * c.w))))
+                             : 0.0f;
+      const float lden = (half == 0) ? (2.0f * s_hcn2[idx_c]) : 0.0f;
+      const float num = vq4d_warp_sum(lnum);
+      const float den = vq4d_warp_sum(lden);
+      if (den > 1e-12f && num > 0.0f) {
+        sc_code = vq4d_encode_ue4m4(num / den, base_shifted);
+        cur_sc = __bfloat162float(vq4d_decode_ue4m4(sc_code, base_shifted));
+      }
     }
+  }
+
+  // Exact UE4M4 neighbor search {sc_code - 1, sc_code, sc_code + 1} minimizing actual BF16 dequant MSE.
+  {
+    const uint8_t center_sc = sc_code;
+    float best_row_err = 1e30f;
+    uint8_t win_sc = center_sc;
+    uint32_t win_code = best_code;
+    for (int delta = -1; delta <= 1; ++delta) {
+      const int cand_i = static_cast<int>(center_sc) + delta;
+      if (cand_i < 0 || cand_i > 255) continue;
+      const uint8_t cand_sc = static_cast<uint8_t>(cand_i);
+      const float sc_f = __bfloat162float(vq4d_decode_ue4m4(cand_sc, base_shifted));
+      const float inv_sc = (sc_f > 1e-30f) ? (1.0f / sc_f) : 0.0f;
+      const float u0 = x0 * inv_sc, u1 = x1 * inv_sc, u2 = x2 * inv_sc, u3 = x3 * inv_sc;
+      float b_score = -1e30f;
+      uint32_t m_code = static_cast<uint32_t>(k_start);
+#pragma unroll 8
+      for (int k = k_start; k < k_end; ++k) {
+        const float4 c = s_cb[k];
+        const float dot = __fmaf_rn(u0, c.x, __fmaf_rn(u1, c.y, __fmaf_rn(u2, c.z, u3 * c.w)));
+        const float sc_val = fabsf(dot) - s_hcn2[k];
+        if (sc_val > b_score) {
+          b_score = sc_val;
+          m_code = static_cast<uint32_t>(k) | ((dot < 0.0f) ? kSgnBit : 0u);
+        }
+      }
+      const float p_score = __shfl_xor_sync(0xffffffffu, b_score, 16);
+      const uint32_t p_code = __shfl_xor_sync(0xffffffffu, m_code, 16);
+      const uint32_t c_code = (p_score > b_score || (p_score == b_score && p_code < m_code)) ? p_code : m_code;
+      const uint32_t idx_c = c_code & kIdxMask;
+      const float sgn = (c_code & kSgnBit) ? -1.0f : 1.0f;
+      const float4 c = s_cb[idx_c];
+      float vec_err = 0.0f;
+      if (half == 0) {
+        const float q0 = __bfloat162float(__float2bfloat16_rn(__bfloat162float(__float2bfloat16_rn(c.x)) * sgn * sc_f));
+        const float q1 = __bfloat162float(__float2bfloat16_rn(__bfloat162float(__float2bfloat16_rn(c.y)) * sgn * sc_f));
+        const float q2 = __bfloat162float(__float2bfloat16_rn(__bfloat162float(__float2bfloat16_rn(c.z)) * sgn * sc_f));
+        const float q3 = __bfloat162float(__float2bfloat16_rn(__bfloat162float(__float2bfloat16_rn(c.w)) * sgn * sc_f));
+        const float e0 = x0 - q0, e1 = x1 - q1, e2 = x2 - q2, e3 = x3 - q3;
+        vec_err = __fmaf_rn(e0, e0, __fmaf_rn(e1, e1, __fmaf_rn(e2, e2, e3 * e3)));
+      }
+      const float row_err = vq4d_warp_sum(vec_err);
+      if (row_err < best_row_err) {
+        best_row_err = row_err;
+        win_sc = cand_sc;
+        win_code = c_code;
+      }
+    }
+    sc_code = win_sc;
+    best_code = win_code;
   }
 
   if (half == 0) {
@@ -896,7 +997,18 @@ __global__ void __launch_bounds__(256) vq4d_pack_kernel(
   const int num_kg = K >> 6;
 
   size_t tile_off = 0;
-  if (n32_ilv > 0) {
+  if (n32_ilv < 0) {
+    const int cta_n = n_tile >> 2;
+    const int sub_n = n_tile & 3;
+    const int num_cta = N >> 5;
+    const int num_kg2 = num_kg >> 1;
+    const int kg2 = kg >> 1;
+    const int h = kg & 1;
+    const size_t pair_slot = vq4d_n32_sk_pair_slot(cta_n, kg2, num_cta, num_kg2, -n32_ilv);
+    tile_off = pair_slot * (2 * kN32StepWB) +
+               static_cast<size_t>(h) * kN32StepWB +
+               static_cast<size_t>(sub_n) * kTileB;
+  } else if (n32_ilv > 0) {
     const int cta_n = n_tile >> 2;
     const int sub_n = n_tile & 3;
     const int num_cta = N >> 5;
@@ -1220,6 +1332,309 @@ __global__ void __launch_bounds__(128, 6) vq4d_mma_gemm_n32_pair_kernel(
   if constexpr (kM16) {
     if (has_hi) {
       *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * N + col0) = vq4d_bf16x2_u32(d2, d3);
+    }
+  }
+}
+
+// 240/288-CTA (5/6 CTAs/SM) BK=128 deterministic wave-interleaved Hardware-TMA + Dual-PDL Stream-K down_proj kernel.
+template <bool kM16, int kBits, bool kTma>
+__global__ void __launch_bounds__(128, 6) vq4d_mma_n32_pair_det_sk_kernel(
+    const __nv_bfloat16* __restrict__ A,
+    const uint8_t* __restrict__ W_packed,
+    __nv_bfloat16* __restrict__ C,
+    float* __restrict__ sk_partials,
+    int* __restrict__ sk_done,
+    int M, int N, int K, int grid_ctas, int pdl_mode) {
+  constexpr int kTileB = vq4d_tile_bytes<kBits>();
+  constexpr int kN32StepWB = vq4d_n32_step_bytes<kBits>();
+  constexpr int kPairStepWB = 2 * kN32StepWB;
+  constexpr int kPairStepU4 = kPairStepWB / 16;
+  __shared__ Vq4dN32PairSmem<kM16 ? 16 : 8, kBits> smem;
+  __shared__ int s_is_last;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const int num_pairs = K >> 7;
+  const int num_cta = N >> 5;
+  const int cta_id = blockIdx.x;
+  const int total_pairs = num_cta * num_pairs;
+  const int q_pairs = total_pairs / grid_ctas;
+  const int pair_start = static_cast<int>((static_cast<int64_t>(cta_id) * total_pairs) / grid_ctas);
+  const int pair_end = static_cast<int>((static_cast<int64_t>(cta_id + 1) * total_pairs) / grid_ctas);
+  const int my_pairs = pair_end - pair_start;
+  if (my_pairs <= 0) return;
+
+  vq4d_init_lut<kBits>(smem.lut, tid);
+
+  if constexpr (kTma) {
+    if (tid == 0) {
+      vq4d_mbar_init(smem.mbar, 3);
+    }
+    __syncthreads();
+  }
+
+  const size_t total_bytes = static_cast<size_t>(total_pairs) * kPairStepWB;
+  const uint32_t base_shifted = __ldg(reinterpret_cast<const uint32_t*>(W_packed + total_bytes) + 1);
+
+  if (cta_id == 0) {
+    for (size_t off = static_cast<size_t>(tid) << 21; off < total_bytes; off += static_cast<size_t>(kVqThreads) << 21) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(W_packed + off));
+    }
+  }
+
+  auto pair_w_ptr = [&](int idx) -> const uint8_t* {
+    const size_t slot = (idx < q_pairs)
+        ? (static_cast<size_t>(idx) * grid_ctas + cta_id)
+        : static_cast<size_t>(static_cast<int64_t>(q_pairs) * grid_ctas +
+                              (pair_start - static_cast<int64_t>(cta_id) * q_pairs));
+    return W_packed + slot * kPairStepWB;
+  };
+
+  const int a_row = kM16 ? (tid >> 3) : ((tid & 63) >> 3);
+  const int a_col8 = tid & 7;
+  const int a_phys_col8 = a_col8 ^ (a_row & 7);
+  const bool a_valid = (a_row < M);
+  const int a_src_sz = a_valid ? 16 : 0;
+  const int a_safe_row = a_valid ? a_row : 0;
+  const int a_half_m8 = tid >> 6;
+
+  auto load_a_sync = [&](int p, int st_a) {
+    const int k_base = p * 128;
+    if constexpr (kM16) {
+      *reinterpret_cast<uint4*>(&smem.a[st_a][0][a_row][a_phys_col8 * 8]) =
+          a_valid ? __ldg(reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + k_base + a_col8 * 8))
+                  : make_uint4(0u, 0u, 0u, 0u);
+      *reinterpret_cast<uint4*>(&smem.a[st_a][1][a_row][a_phys_col8 * 8]) =
+          a_valid ? __ldg(reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + k_base + 64 + a_col8 * 8))
+                  : make_uint4(0u, 0u, 0u, 0u);
+    } else {
+      *reinterpret_cast<uint4*>(&smem.a[st_a][a_half_m8][a_row][a_phys_col8 * 8]) =
+          a_valid ? __ldg(reinterpret_cast<const uint4*>(
+                        A + static_cast<size_t>(a_row) * K + k_base + a_half_m8 * 64 + a_col8 * 8))
+                  : make_uint4(0u, 0u, 0u, 0u);
+    }
+  };
+
+  auto issue_a_async = [&](int p, int st_a) {
+    const int k_base = p * 128;
+    if constexpr (kM16) {
+      const uint32_t sd0 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st_a][0][a_row][a_phys_col8 * 8]));
+      const uint32_t sd1 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st_a][1][a_row][a_phys_col8 * 8]));
+      vq4d_cp_async16_a_pred(sd0, A + static_cast<size_t>(a_safe_row) * K + k_base + a_col8 * 8, a_src_sz);
+      vq4d_cp_async16_a_pred(sd1, A + static_cast<size_t>(a_safe_row) * K + k_base + 64 + a_col8 * 8, a_src_sz);
+    } else {
+      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st_a][a_half_m8][a_row][a_phys_col8 * 8]));
+      vq4d_cp_async16_a_pred(sd, A + static_cast<size_t>(a_safe_row) * K + k_base + a_half_m8 * 64 + a_col8 * 8, a_src_sz);
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  };
+
+  auto issue_w_tma = [&](int idx, int st_w, bool need_fence) {
+    if (tid == 0) {
+      if (need_fence) {
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      }
+      const uint64_t pol = vq4d_pol_evict_first();
+      vq4d_tma_bulk_w(smem.w[st_w], pair_w_ptr(idx), kPairStepWB, &smem.mbar[st_w], pol);
+    }
+  };
+
+  auto issue_w_cpasync = [&](int idx, int st_w) {
+    if (tid < kPairStepU4) {
+      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st_w][tid * 16]));
+      vq4d_cp_async16_w(sd, pair_w_ptr(idx) + tid * 16);
+    }
+  };
+
+  int cur_n = pair_start / num_pairs;
+  int cur_p = pair_start - cur_n * num_pairs;
+
+  float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+  const bool has_hi = kM16 && ((g + 8) < M);
+  const int ldm_row = kM16 ? (lane & 15) : (lane & 7);
+  const int ldm_col_off = kM16 ? (lane >> 4) : ((lane >> 3) & 1);
+  const int trig_i = ((pdl_mode & 2) != 0) ? ((my_pairs > 2) ? (my_pairs - 2) : 0) : -1;
+
+  auto flush_tile_if_done = [&](int i) {
+    const bool tile_done = (cur_p + 1 == num_pairs) || (i + 1 == my_pairs);
+    if (tile_done) {
+      const int c_first = static_cast<int>(((static_cast<int64_t>(cur_n) * num_pairs + 1) * grid_ctas - 1) / total_pairs);
+      const int c_last = static_cast<int>(((static_cast<int64_t>(cur_n + 1) * num_pairs) * grid_ctas - 1) / total_pairs);
+      const int num_parts = c_last - c_first + 1;
+      const int col0 = cur_n * 32 + warp * 8 + 2 * t;
+      if (num_parts == 1) {
+        if (g < M) {
+          *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col0) = vq4d_bf16x2_u32(d0, d1);
+        }
+        if constexpr (kM16) {
+          if (has_hi) {
+            *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * N + col0) = vq4d_bf16x2_u32(d2, d3);
+          }
+        }
+      } else {
+        const int part_idx = cta_id - c_first;
+        float4* p_tile = reinterpret_cast<float4*>(sk_partials) + static_cast<size_t>(cur_n) * 384;
+        p_tile[part_idx * 128 + tid] = make_float4(d0, d1, d2, d3);
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+          s_is_last = (atomicAdd(&sk_done[cur_n], 1) + 1 == num_parts) ? 1 : 0;
+        }
+        __syncthreads();
+        if (s_is_last) {
+          if (tid == 0) {
+            atomicExch(&sk_done[cur_n], 0);
+          }
+          float4 s = vq4d_ldcg_f4(&p_tile[tid]);
+          const float4 p1 = vq4d_ldcg_f4(&p_tile[128 + tid]);
+          s.x = __fadd_rn(s.x, p1.x);
+          s.y = __fadd_rn(s.y, p1.y);
+          s.z = __fadd_rn(s.z, p1.z);
+          s.w = __fadd_rn(s.w, p1.w);
+          if (num_parts == 3) {
+            const float4 p2 = vq4d_ldcg_f4(&p_tile[256 + tid]);
+            s.x = __fadd_rn(s.x, p2.x);
+            s.y = __fadd_rn(s.y, p2.y);
+            s.z = __fadd_rn(s.z, p2.z);
+            s.w = __fadd_rn(s.w, p2.w);
+          }
+          if (g < M) {
+            *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col0) = vq4d_bf16x2_u32(s.x, s.y);
+          }
+          if constexpr (kM16) {
+            if (has_hi) {
+              *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * N + col0) = vq4d_bf16x2_u32(s.z, s.w);
+            }
+          }
+        }
+      }
+      d0 = d1 = d2 = d3 = 0.0f;
+      ++cur_n;
+      cur_p = 0;
+    } else {
+      ++cur_p;
+    }
+  };
+
+  if constexpr (kTma) {
+    const int w_pre = (my_pairs < 2) ? my_pairs : 2;
+    for (int i = 0; i < w_pre; ++i) {
+      issue_w_tma(i, i, false);
+    }
+    if ((pdl_mode & 1) != 0) {
+      asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    load_a_sync(cur_p, 0);
+    __syncthreads();
+    int next_a_p = (cur_p + 1 == num_pairs) ? 0 : (cur_p + 1);
+    if (my_pairs > 1) {
+      issue_a_async(next_a_p, 1);
+      if (++next_a_p == num_pairs) next_a_p = 0;
+    }
+
+    int st_w = 0;
+    uint32_t par_w = 0u;
+    for (int i = 0; i < my_pairs; ++i) {
+      if (i == trig_i) {
+        asm volatile("griddepcontrol.launch_dependents;");
+      }
+      const int st_a = i & 1;
+      vq4d_mbar_wait(&smem.mbar[st_w], par_w);
+      if (i > 0) {
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+      }
+      __syncthreads();
+
+      if (i + 2 < my_pairs) {
+        const int next_st_w = (st_w == 0) ? 2 : (st_w - 1);
+        issue_w_tma(i + 2, next_st_w, true);
+      }
+      if (i >= 1 && i + 1 < my_pairs) {
+        issue_a_async(next_a_p, st_a ^ 1);
+        if (++next_a_p == num_pairs) next_a_p = 0;
+      }
+
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        uint32_t lo, hi;
+        __nv_bfloat162 sc_pos, sc_neg;
+        vq4d_load_tile_words<kBits>(
+            &smem.w[st_w][h * kN32StepWB + warp * kTileB], lane, g, t, base_shifted, lo, hi, sc_pos, sc_neg);
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+          const int pcol8 = (2 * s + ldm_col_off) ^ (ldm_row & 7);
+          const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st_a][h][ldm_row][pcol8 * 8]));
+          uint32_t a0, a1, a2, a3;
+          if constexpr (kM16) {
+            vq4d_ldmatrix_x4(a0, a1, a2, a3, addr);
+          } else {
+            vq4d_ldmatrix_x2(a0, a2, addr);
+          }
+          uint32_t b0, b1;
+          vq4d_deq_k16<kBits>(smem.lut, lo, hi, s, sc_pos, sc_neg, b0, b1);
+          if constexpr (kM16) {
+            vq4d_mma_m16n8k16_full(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+          } else {
+            vq4d_mma_m16n8k16(d0, d1, d2, d3, a0, a2, b0, b1);
+          }
+        }
+      }
+
+      if (++st_w == 3) {
+        st_w = 0;
+        par_w ^= 1u;
+      }
+      flush_tile_if_done(i);
+    }
+  } else {
+    issue_w_cpasync(0, 0);
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    if ((pdl_mode & 1) != 0) {
+      asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    load_a_sync(cur_p, 0);
+    int next_a_p = (cur_p + 1 == num_pairs) ? 0 : (cur_p + 1);
+
+    for (int i = 0; i < my_pairs; ++i) {
+      if (i == trig_i) {
+        asm volatile("griddepcontrol.launch_dependents;");
+      }
+      const int st = i & 1;
+      asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+      __syncthreads();
+      if (i + 1 < my_pairs) {
+        issue_w_cpasync(i + 1, st ^ 1);
+        issue_a_async(next_a_p, st ^ 1);
+        if (++next_a_p == num_pairs) next_a_p = 0;
+      }
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        uint32_t lo, hi;
+        __nv_bfloat162 sc_pos, sc_neg;
+        vq4d_load_tile_words<kBits>(
+            &smem.w[st][h * kN32StepWB + warp * kTileB], lane, g, t, base_shifted, lo, hi, sc_pos, sc_neg);
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+          const int pcol8 = (2 * s + ldm_col_off) ^ (ldm_row & 7);
+          const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][h][ldm_row][pcol8 * 8]));
+          uint32_t a0, a1, a2, a3;
+          if constexpr (kM16) {
+            vq4d_ldmatrix_x4(a0, a1, a2, a3, addr);
+          } else {
+            vq4d_ldmatrix_x2(a0, a2, addr);
+          }
+          uint32_t b0, b1;
+          vq4d_deq_k16<kBits>(smem.lut, lo, hi, s, sc_pos, sc_neg, b0, b1);
+          if constexpr (kM16) {
+            vq4d_mma_m16n8k16_full(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
+          } else {
+            vq4d_mma_m16n8k16(d0, d1, d2, d3, a0, a2, b0, b1);
+          }
+        }
+      }
+      flush_tile_if_done(i);
     }
   }
 }
@@ -1791,6 +2206,8 @@ static void vq4d_set_carveout_one() {
   cudaFuncSetAttribute(vq4d_mma_gemm_n32_kernel<true, kBits, kTma>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(vq4d_mma_gemm_n32_pair_kernel<false, kBits, kTma>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(vq4d_mma_gemm_n32_pair_kernel<true, kBits, kTma>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(vq4d_mma_n32_pair_det_sk_kernel<false, kBits, kTma>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(vq4d_mma_n32_pair_det_sk_kernel<true, kBits, kTma>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(vq4d_mma_gemm_kernel<false, kBits, kTma>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(vq4d_mma_gemm_kernel<true, kBits, kTma>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(vq4d_mma_gemm_swiglu_kernel<false, kBits, kTma>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
@@ -1852,6 +2269,29 @@ static torch::Tensor launch_vq4d_gemm_impl(
   const bool use_m16 = (M > 8);
   if (n32_ilv > 0) {
     const int n32_blocks = static_cast<int>(N / 32);
+    const int n32_sk = vq4d_n32_sk_grid(static_cast<int>(N), static_cast<int>(K));
+    if (n32_sk > 0) {
+      auto partials = torch::empty({static_cast<int64_t>(n32_blocks) * 1536}, A.options().dtype(torch::kFloat32));
+      auto done = torch::zeros({n32_blocks}, A.options().dtype(torch::kInt32));
+      float* p_ptr = partials.data_ptr<float>();
+      int* d_ptr = done.data_ptr<int>();
+      if (use_m16) {
+        vq4d_launch_pdl(
+            vq4d_mma_n32_pair_det_sk_kernel<true, kBits, kTma>,
+            dim3(static_cast<unsigned>(n32_sk), 1u, 1u), kVqThreads, st, pdl,
+            static_cast<const __nv_bfloat16*>(a_rot), W_packed.data_ptr<uint8_t>(),
+            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()), p_ptr, d_ptr,
+            M, static_cast<int>(N), static_cast<int>(K), n32_sk, pdl);
+      } else {
+        vq4d_launch_pdl(
+            vq4d_mma_n32_pair_det_sk_kernel<false, kBits, kTma>,
+            dim3(static_cast<unsigned>(n32_sk), 1u, 1u), kVqThreads, st, pdl,
+            static_cast<const __nv_bfloat16*>(a_rot), W_packed.data_ptr<uint8_t>(),
+            reinterpret_cast<__nv_bfloat16*>(C.data_ptr()), p_ptr, d_ptr,
+            M, static_cast<int>(N), static_cast<int>(K), n32_sk, pdl);
+      }
+      return C;
+    }
     if ((K & 127) == 0) {
       if (use_m16) {
         vq4d_launch_pdl(
@@ -1964,7 +2404,8 @@ torch::Tensor vq4d_pack(torch::Tensor W, int64_t bits = 10) {
   const int64_t payload_bytes = static_cast<int64_t>(N / 8) * static_cast<int64_t>(K / 64) * tile_b;
   auto out = torch::empty({payload_bytes + kVqFooterBytes}, W.options().dtype(torch::kUInt8));
   const uint32_t base_shifted = vq4d_compute_base_shifted(W);
-  const int n32_ilv = vq4d_n32_wave_ilv(N);
+  const int n32_sk = vq4d_n32_sk_grid(N, K);
+  const int n32_ilv = (n32_sk > 0) ? (-n32_sk) : vq4d_n32_wave_ilv(N);
   dim3 grid(N / 8, K / 64);
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   if (bits == 9) {

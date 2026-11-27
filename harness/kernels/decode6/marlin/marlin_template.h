@@ -250,11 +250,10 @@ __device__ __forceinline__ float marlin_full_rcp(float s) {
 }
 
 __device__ __forceinline__ uint16_t marlin_pack_fp8x2(float v0, float v1) {
-  auto cl = [](float v) {
-    return (v != v) ? 448.0f : (v < -448.0f ? -448.0f : (v > 448.0f ? 448.0f : v));
-  };
+  const float hi0 = fminf(v0, 448.0f);
+  const float hi1 = fminf(v1, 448.0f);
   uint16_t lo;
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(cl(v1)), "f"(cl(v0)));
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(hi1), "f"(hi0));
   return lo;
 }
 
@@ -2009,10 +2008,9 @@ __global__ void Marlin(
   if constexpr (b_type_id == vllm::kFE2M1f.id() &&
                 a_type_id == vllm::kBFloat16.id() && dequant_skip_flop &&
                 !has_act_order && !has_zp && !is_a_8bit && group_blocks != -1 &&
-                thread_m_blocks == 1) {
+                (thread_m_blocks == 1 || (thread_m_blocks == 2 && !m_block_size_8))) {
     // 1-step software-pipelined j = 0..3 E2M1 dequant + BF16 scale -> HMMA overlap
-    // strictly for thread_m_blocks == 1 (M <= 16), leaving thread_m_blocks == 2 (M = 32)
-    // untouched to avoid accumulator register spill.
+    // for thread_m_blocks == 1 (M <= 16) and thread_m_blocks == 2 (!m_block_size_8, M = 32).
     auto dequant_nvfp4_j = [&](int jj, FragB& b0, FragB& b1) {
       const uint32_t u = static_cast<uint32_t>(frag_b_quant[k2][0][jj]);
       reinterpret_cast<uint32_t*>(&b1)[1] =
@@ -2608,6 +2606,22 @@ __global__ void Marlin(
           frag_c_ptr[k * 4 + 1] += rd[k].y;
           frag_c_ptr[k * 4 + 2] += rd[k].z;
           frag_c_ptr[k * 4 + 3] += rd[k].w;
+        }
+      } else if constexpr (!m_block_size_8 && fixed_shape != 3 && thread_m_blocks == 2) {
+  #pragma unroll
+        for (int kb = 0; kb < th_size; kb += 4) {
+          float4 rd[4];
+  #pragma unroll
+          for (int k = 0; k < 4; k++) {
+            rd[k] = reinterpret_cast<const float4*>(C_tmp)[c_cur_offset + active_threads * (kb + k) + threadIdx.x];
+          }
+  #pragma unroll
+          for (int k = 0; k < 4; k++) {
+            frag_c_ptr[(kb + k) * 4 + 0] += rd[k].x;
+            frag_c_ptr[(kb + k) * 4 + 1] += rd[k].y;
+            frag_c_ptr[(kb + k) * 4 + 2] += rd[k].z;
+            frag_c_ptr[(kb + k) * 4 + 3] += rd[k].w;
+          }
         }
       } else if constexpr (m_block_size_8 && fixed_shape != 3) {
         constexpr int kh_size = th_size / 2;
