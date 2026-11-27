@@ -38,6 +38,11 @@ except Exception:  # noqa: BLE001
 
 _RANS_M = _rans is not None and hasattr(_rans, "rans_gemm_m_auto") and os.environ.get("MUSERANS_M", "1") != "0"
 _stats = {"admitted": 0, "rejected": 0, "rans": 0, "logged": False, "fused_m_checked": set()}
+# Tree-wide verify width M = 33..48 (kM48, one pass over the weight stream). Admitted per (n, k) by a bitwise
+# row-slice self-check that never affects the M <= 32 admission; a shape that fails runs as <= 32-row slices
+# (exact, but re-reads the weights) and logs a warning.
+_M_MAX = 48
+_m48_ok: dict[tuple[int, int], bool] = {}
 _decode_gemm_operand = None
 _consume_rans_prologue = None
 
@@ -116,6 +121,8 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
                         if not torch.equal(fgot.view(torch.int16), fref.view(torch.int16)):
                             raise RuntimeError(f"muserans fused M={cm} act_mode={act_mode} self-check mismatch")
                     _stats["fused_m_checked"].add((n, k))
+                if _RANS_M and (n, k) not in _m48_ok:
+                    _m48_ok[(n, k)] = _check_m48(blob, ws, xs, n, k, w.device)
                 _stats["admitted"] += 1
                 _stats["rans"] += 1
                 # The magic byte 'A' at blob[0] marks the compressed format for the op (one uint8 buffer either way).
@@ -135,6 +142,27 @@ def prepare(layer: torch.nn.Module, w_name: str, w_s_name: str, i_s_name: str) -
     # A buffer, so the weight-range bookkeeping (l2pf) sees it as model memory.
     layer.register_buffer("muse_fp8_packed", packed, persistent=False)
     return packed
+
+
+def _check_m48(blob: torch.Tensor, ws: torch.Tensor, xs: torch.Tensor, n: int, k: int, dev) -> bool:
+    """kM48 rows must equal the same rows computed in 8-row slices (kM16/M<=8 kernels) bitwise."""
+    try:
+        for cm in (33, 40, 48):
+            gen_m = torch.Generator(device=dev).manual_seed(n * 151 + k + 23 + cm)
+            xm = (torch.randn(cm, k, generator=gen_m, device=dev) * 1.5 / xs.float().reshape(1, 1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+            got_m = torch.empty(cm, n, dtype=torch.bfloat16, device=dev)
+            _rans.rans_gemm_m_auto(blob, xm, ws.reshape(-1), xs.reshape(-1), got_m, n, k)
+            for s0 in range(0, cm, 8):
+                s1 = min(cm, s0 + 8)
+                ref_s = torch.empty(s1 - s0, n, dtype=torch.bfloat16, device=dev)
+                _rans.rans_gemm_m_auto(blob, xm[s0:s1].contiguous(), ws.reshape(-1), xs.reshape(-1), ref_s, n, k)
+                if not torch.equal(got_m[s0:s1].view(torch.int16), ref_s.view(torch.int16)):
+                    logger.warning("muserans kM48 self-check mismatch at M=%d slice [%d:%d] (%dx%d)", cm, s0, s1, n, k)
+                    return False
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("muserans kM48 self-check failed (%dx%d): %s", n, k, e)
+        return False
 
 
 def _self_check(run, w_kn: torch.Tensor, sb: torch.Tensor, sa: torch.Tensor) -> bool:
@@ -168,7 +196,7 @@ def _muse_fp8_scaled_mm(
             "attention gate GEMV on %d blocks",
             _stats["admitted"], _stats["rans"], tpf_note, _stats["rejected"], gate_blks,
         )
-    if A.shape[0] <= 32 and _decode_gemm_operand is not None:
+    if A.shape[0] <= _M_MAX and _decode_gemm_operand is not None:
         A = _decode_gemm_operand(A)
     k, n = B.shape
     if A.shape[0] == 1 and packed.numel() > 0 and A.is_contiguous() and _scales_ok(As, Bs, n):
@@ -188,7 +216,7 @@ def _muse_fp8_scaled_mm(
             _rans.rans_gemv_auto(packed, A.view(-1), Bs.reshape(-1), As.reshape(-1), out, n, k)
         return out
     if (
-        1 < A.shape[0] <= 32
+        1 < A.shape[0] <= _M_MAX
         and _RANS_M
         and packed.numel() > 0
         and packed.numel() != n * k
@@ -202,6 +230,13 @@ def _muse_fp8_scaled_mm(
                 return fused
         # verify-width rows: the same rANS stream and the same per-row MMA chain as the M == 1 GEMV
         out = torch.empty((A.shape[0], n), dtype=torch.bfloat16, device=A.device)
+        if A.shape[0] > 32 and not _m48_ok.get((n, k), False):
+            logger.warning_once("muserans kM48 not admitted for %dx%d: M=%d runs as <=32-row slices (re-reads weights)",
+                                n, k, int(A.shape[0]))
+            for s0 in range(0, A.shape[0], 32):
+                s1 = min(A.shape[0], s0 + 32)
+                _rans.rans_gemm_m_auto(packed, A[s0:s1], Bs.reshape(-1), As.reshape(-1), out[s0:s1], n, k)
+            return out
         _rans.rans_gemm_m_auto(packed, A, Bs.reshape(-1), As.reshape(-1), out, n, k)
         return out
     return _small_row_fp8(A, B, As, Bs)

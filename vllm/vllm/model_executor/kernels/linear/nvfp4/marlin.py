@@ -257,27 +257,28 @@ def _marlin_fp4_single(
     decode_fixed_grid: bool = False,
 ) -> torch.Tensor:
     if (
-        1 <= x.shape[0] <= 32
+        1 <= x.shape[0] <= 48
         and x.dtype == torch.bfloat16
         and decode_weight is not None
         and decode_scales is not None
     ):
         if decode_palette is not None:
-            # decode_scales holds the layer's 6-bit codes into decode_palette
+            # decode_scales holds the layer's 6-bit codes into decode_palette; M = 33..48 (tree-wide verify) runs the
+            # TMA4-ILV ThreadMBlocks = 3 kernel (one pass over the weights, per-row identical to M <= 32).
             if x.shape[0] == 1 or (_is_tma4_ilv is not None and _is_tma4_ilv(decode_scales)):
                 return torch.ops.vllm.marlin_tiled_decode6.default(
                     x, decode_weight, decode_scales, decode_palette, weight_global_scale, workspace,
                     size_n, size_k, decode_fixed_grid,
                 )
-        elif x.shape[0] == 1 or (
+        elif x.shape[0] <= 32 and (x.shape[0] == 1 or (
             os.environ.get("MUSE_TILED_DECODE_M32", "1") != "0"
             and _is_tiled_m32_admitted is not None
             and _is_tiled_m32_admitted(decode_scales)
-        ):
+        )):
             return torch.ops.vllm.marlin_tiled_decode.default(
                 x, decode_weight, decode_scales, weight_global_scale, workspace, size_n, size_k
             )
-    if x.shape[0] > 16 and x.shape[0] <= 32 and x.dtype == torch.bfloat16:
+    if x.shape[0] > 16 and x.shape[0] <= 48 and x.dtype == torch.bfloat16:
         # Stock ops.marlin_gemm switches (1,8,8) -> (2,16,4) at M>16 causing 1-ULP KV drift;
         # split into 16-row chunks as a 0-ULP safety net if tiled decode M32 was not admitted.
         out = x.new_empty((x.shape[0], size_n))

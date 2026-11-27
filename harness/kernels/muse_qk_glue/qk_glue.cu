@@ -595,7 +595,8 @@ __global__ void qk_norm_rope_kvcache_prefill_kernel(
   }
 }
 
-// Balanced 18-warp-per-token fused QK-norm + RoPE + KV-cache kernel for multi-token decode (M = 2..32).
+// Balanced 18-warp-per-token fused QK-norm + RoPE + KV-cache kernel for multi-token decode (M = 2..48;
+// M=48 wide tree verify: 216 CTAs x 128 threads, per-warp work identical to M<=32).
 // Warps 0..15: 2 Q heads each; warp 16: 2 K heads; warp 17: 2 V heads (pure copy, zero norm/RoPE).
 // At M=16 (threads=64) and M=32 (threads=128), launches 144 CTAs = exact 3.0 CTAs/SM on 48-SM GB10
 // with zero tail-warp load imbalance (vs 24/48 CTAs and 33% tail imbalance in HPW=6 prefill kernel).

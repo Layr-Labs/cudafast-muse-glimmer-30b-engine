@@ -35,6 +35,9 @@
 constexpr uint32_t kRansXRowU4 = 64u;                          // 32 K-steps * 2 uint4/step = 64 uint4 (1024 B/row, 128B XOR swizzled)
 constexpr uint32_t kRansXsmemBytes = 2u * 16u * kRansXRowU4 * 16u;     // 32,768 B (saves 2 KiB SMEM, 0 bank conflicts with ldmatrix)
 constexpr uint32_t kRansXsmemBytesM8 = 2u * 8u * kRansXRowU4 * 16u;    // 16,384 B for M<=8
+// M = 33..48 (kM48): 8 K-steps/chunk (16 uint4 = 256 B per row), 2 buffers x 48 rows = 24,576 B (< kM32's 32,768 B, so it
+// fits every wpb <= 19 config: 24,576 + 2,048 + 19 x 2,048 = 65,536 <= 84,992 B dynamic). Chunking only changes x staging.
+constexpr uint32_t kRansXsmemBytesM48 = 2u * 48u * 16u * 16u;
 #ifndef RANS_PREISSUE
 #define RANS_PREISSUE 1
 #endif
@@ -111,6 +114,25 @@ __device__ __forceinline__ void rans_ldsm4_x32(
                : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr0));
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
                : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(addr1));
+}
+// kM48 x chunk: rows of 16 uint4 (8 K-steps); rows 0..15 / 16..31 / 32..47 -> three m16 A fragments.
+__device__ __forceinline__ void rans_ldsm4_x48(
+    uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3,
+    uint32_t& b0, uint32_t& b1, uint32_t& b2, uint32_t& b3,
+    uint32_t& d0, uint32_t& d1, uint32_t& d2, uint32_t& d3,
+    uint32_t buf_base_b, int s_local, int lane) {
+  const int m_row = lane & 15;
+  const int c_log = (s_local << 1) + (lane >> 4);
+  const int c_phys = c_log ^ (m_row & 7);
+  const uint32_t addr0 = buf_base_b + static_cast<uint32_t>(((m_row << 4) + c_phys) << 4);
+  const uint32_t addr1 = addr0 + (16u * 16u * 16u);
+  const uint32_t addr2 = addr0 + (2u * 16u * 16u * 16u);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+               : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr0));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+               : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(addr1));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+               : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3) : "r"(addr2));
 }
 __device__ __forceinline__ void rans_ldsm2_x8(uint32_t& a0, uint32_t& a2, uint32_t buf_base_b, int s_local, int lane) {
   const int m_row = lane & 7;
@@ -399,8 +421,10 @@ static size_t rans_tpf_stride() {
   return stride;
 }
 
-template <int NS, int GBS, int RG, int kIlvMode = 0, int kXGlobalMode = 2, bool kPar4 = false, int kMaxThreads = 1024, bool kM16 = false, bool kXsmem = false, int kActMode = 0, bool kM32 = false>
+template <int NS, int GBS, int RG, int kIlvMode = 0, int kXGlobalMode = 2, bool kPar4 = false, int kMaxThreads = 1024, bool kM16 = false, bool kXsmem = false, int kActMode = 0, bool kM32 = false, bool kM48 = false>
 __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) {
+  static_assert(!kM48 || (kM16 && kM32 && kPar4 && NS == 4 && GBS == 9 && kIlvMode == 1 && kActMode == 0),
+                "kM48 (M = 33..48) is built only for the par4 act_mode-0 verify GEMM");
   constexpr uint32_t GB = 1u << GBS;
   constexpr uint32_t RB = GB * (uint32_t)RG;
   __shared__ __align__(16) uint32_t lut_s[4096];
@@ -410,7 +434,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
   uint2* xs = (uint2*)smem;
   uint4* const x_smem_u4 = reinterpret_cast<uint4*>(smem);
   const bool x_global = (kXGlobalMode == 1) ? true : ((kXGlobalMode == 0) ? false : (pb.x_global != 0));
-  constexpr uint32_t kMyXsmemBytes = kM16 ? kRansXsmemBytes : kRansXsmemBytesM8;
+  constexpr uint32_t kMyXsmemBytes = kM48 ? kRansXsmemBytesM48 : (kM16 ? kRansXsmemBytes : kRansXsmemBytesM8);
   const int xbytes = kXsmem ? (int)kMyXsmemBytes : (x_global ? 0 : pb.M * ((K + 15) & ~15));
   const uint32_t sbase0 = (uint32_t)__cvta_generic_to_shared(smem) + (uint32_t)xbytes;
   const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + (uint32_t)wib * RB;
@@ -509,17 +533,17 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
   const bool xsmem_async = (pb.xsmem_async != 0);
   const float sa_v = (kPar4 && NS == 4 && GBS == 9 && kIlvMode == 1) ? __ldg(pb.sa) : 0.f;
   const float inv_sa = (kPar4 && NS == 4 && GBS == 9 && kIlvMode == 1 && kActMode != 0) ? rans_full_rcp(sa_v) : 0.f;
-  constexpr int kXRows = kM32 ? 32 : (kM16 ? 16 : 8);
-  constexpr int kRowShift = kM32 ? 5 : 6;
+  constexpr int kXRows = kM48 ? 48 : (kM32 ? 32 : (kM16 ? 16 : 8));
+  constexpr int kRowShift = kM48 ? 4 : (kM32 ? 5 : 6);
   constexpr uint32_t kRowU4 = 1u << kRowShift;
-  constexpr int kChunkSteps = kM32 ? 16 : 32;
+  constexpr int kChunkSteps = kM48 ? 8 : (kM32 ? 16 : 32);
   constexpr uint32_t kXBufU4 = (uint32_t)kXRows * kRowU4;
   auto load_x_chunk_sync = [&](int buf, int s_base) {
     const int rem_s = S - s_base;
-    const int n_steps = kM32 ? 16 : ((rem_s >= 32) ? 32 : 16);
+    const int n_steps = kM48 ? 8 : (kM32 ? 16 : ((rem_s >= 32) ? 32 : 16));
     const int total_u4 = (n_steps << 1) * pb.M;
-    const int m_sh = (n_steps == 32) ? 6 : 5;
-    const int c_mask = (n_steps == 32) ? 63 : 31;
+    const int m_sh = kM48 ? 4 : ((n_steps == 32) ? 6 : 5);
+    const int c_mask = kM48 ? 15 : ((n_steps == 32) ? 63 : 31);
     const uint32_t buf_u4 = (uint32_t)buf * kXBufU4;
     if constexpr (kActMode == 0) {
       for (int base_i = tid; base_i < total_u4; base_i += 3 * (int)blockDim.x) {
@@ -599,10 +623,10 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
   auto load_x_chunk_async = [&](int buf, int s_base) {
     if constexpr (kActMode == 0) {
       const int rem_s = S - s_base;
-      const int n_steps = kM32 ? 16 : ((rem_s >= 32) ? 32 : 16);
+      const int n_steps = kM48 ? 8 : (kM32 ? 16 : ((rem_s >= 32) ? 32 : 16));
       const int total_u4 = (n_steps << 1) * pb.M;
-      const int m_sh = (n_steps == 32) ? 6 : 5;
-      const int c_mask = (n_steps == 32) ? 63 : 31;
+      const int m_sh = kM48 ? 4 : ((n_steps == 32) ? 6 : 5);
+      const int c_mask = kM48 ? 15 : ((n_steps == 32) ? 63 : 31);
       const uint32_t buf_b = x_smem_base + (uint32_t)(buf * kXBufU4 * 16u);
       for (int idx = tid; idx < total_u4; idx += blockDim.x) {
         const int m = idx >> m_sh;
@@ -737,12 +761,16 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
     const bool valid_m_hi = kM16 && ((g + 8) < pb.M);
     const bool valid_m16 = kM32 && ((g + 16) < pb.M);
     const bool valid_m24 = kM32 && ((g + 24) < pb.M);
+    const bool valid_m32 = kM48 && ((g + 32) < pb.M);
+    const bool valid_m40 = kM48 && ((g + 40) < pb.M);
     const int stride_s = 4 * pb.M;
     // Vectorized 2-step (64 B = 4 uint4 across t=0..3) activation pointers for kXGlobalMode == 1 (K%64==0 -> S even).
     const uint4* const x_u4_base = valid_m ? reinterpret_cast<const uint4*>(pb.x + (size_t)g * K + 16 * t) : nullptr;
     const uint4* const x_u4_hi = valid_m_hi ? reinterpret_cast<const uint4*>(pb.x + (size_t)(g + 8) * K + 16 * t) : nullptr;
     const uint4* const x_u4_m16 = valid_m16 ? reinterpret_cast<const uint4*>(pb.x + (size_t)(g + 16) * K + 16 * t) : nullptr;
     const uint4* const x_u4_m24 = valid_m24 ? reinterpret_cast<const uint4*>(pb.x + (size_t)(g + 24) * K + 16 * t) : nullptr;
+    const uint4* const x_u4_m32 = valid_m32 ? reinterpret_cast<const uint4*>(pb.x + (size_t)(g + 32) * K + 16 * t) : nullptr;
+    const uint4* const x_u4_m40 = valid_m40 ? reinterpret_cast<const uint4*>(pb.x + (size_t)(g + 40) * K + 16 * t) : nullptr;
     const int R_max = (NB + pb.tw - 1) / pb.tw;
     const float sb_s = pb.sb_scalar ? __ldg(pb.sb) : 0.0f;
     int cur_buf = 0;
@@ -751,10 +779,13 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
       const bool do_nb = active && (nb < NB);
       float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
       float c4 = 0.f, c5 = 0.f, c6 = 0.f, c7 = 0.f;
+      [[maybe_unused]] float c8 = 0.f, c9 = 0.f, c10 = 0.f, c11 = 0.f;
       uint2 a_next = make_uint2(0u, 0u);
       uint2 a_hi_next = make_uint2(0u, 0u);
       uint2 a2_next = make_uint2(0u, 0u);
       uint2 a2_hi_next = make_uint2(0u, 0u);
+      [[maybe_unused]] uint2 a3_next = make_uint2(0u, 0u);
+      [[maybe_unused]] uint2 a3_hi_next = make_uint2(0u, 0u);
       // SM121 PDL producer trigger: emit launch_dependents ~12.5 us (16 k-steps) before the final chunk
       // completes so the following 1-CTA norm can preload its 66 KB cold weights on the idle SM.
       const int trig_s = (do_nb && (pb.pdl_mode & 2) && (nb + pb.tw >= NB)) ? ((S > 16) ? (S - 16) : 0) : -1;
@@ -816,9 +847,16 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             uint4 v_hi = make_uint4(0u, 0u, 0u, 0u);
             uint4 v_m16 = make_uint4(0u, 0u, 0u, 0u);
             uint4 v_m24 = make_uint4(0u, 0u, 0u, 0u);
+            [[maybe_unused]] uint2 a3 = make_uint2(0u, 0u);
+            [[maybe_unused]] uint2 a3_hi = make_uint2(0u, 0u);
+            [[maybe_unused]] uint4 v_m32 = make_uint4(0u, 0u, 0u, 0u);
+            [[maybe_unused]] uint4 v_m40 = make_uint4(0u, 0u, 0u, 0u);
             if constexpr (kXsmem) {
               const uint32_t buf_b = x_smem_base + (uint32_t)(cur_buf * kXBufU4 * 16u);
-              if constexpr (kM32) {
+              if constexpr (kM48) {
+                rans_ldsm4_x48(a.x, a_hi.x, a.y, a_hi.y, a2.x, a2_hi.x, a2.y, a2_hi.y,
+                               a3.x, a3_hi.x, a3.y, a3_hi.y, buf_b, s - cs, lane);
+              } else if constexpr (kM32) {
                 rans_ldsm4_x32(a.x, a_hi.x, a.y, a_hi.y, a2.x, a2_hi.x, a2.y, a2_hi.y, buf_b, s - cs, lane);
               } else if constexpr (kM16) {
                 rans_ldsm4_x16(a.x, a_hi.x, a.y, a_hi.y, buf_b, s - cs, lane);
@@ -834,6 +872,10 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
                 if constexpr (kM32) {
                   if (valid_m16) v_m16 = __ldg(x_u4_m16 + (s << 1));
                   if (valid_m24) v_m24 = __ldg(x_u4_m24 + (s << 1));
+                }
+                if constexpr (kM48) {
+                  if (valid_m32) v_m32 = __ldg(x_u4_m32 + (s << 1));
+                  if (valid_m40) v_m40 = __ldg(x_u4_m40 + (s << 1));
                 }
               }
             } else {
@@ -883,10 +925,15 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
                   rans_xpose4(v_m16, t, a2.x, a2.y, a2_next.x, a2_next.y);
                   rans_xpose4(v_m24, t, a2_hi.x, a2_hi.y, a2_hi_next.x, a2_hi_next.y);
                 }
+                if constexpr (kM48) {
+                  rans_xpose4(v_m32, t, a3.x, a3.y, a3_next.x, a3_next.y);
+                  rans_xpose4(v_m40, t, a3_hi.x, a3_hi.y, a3_hi_next.x, a3_hi_next.y);
+                }
               } else {
                 a = a_next;
                 if constexpr (kM16) a_hi = a_hi_next;
                 if constexpr (kM32) { a2 = a2_next; a2_hi = a2_hi_next; }
+                if constexpr (kM48) { a3 = a3_next; a3_hi = a3_hi_next; }
               }
             }
             // Wait for ring group right before reading nw and r0..r3 in parallel.
@@ -912,6 +959,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
               rans_mma_e4m3_m16(c0, c1, c2, c3, a.x, a_hi.x, a.y, a_hi.y, bw0, bw1);
               if constexpr (kM32) {
                 rans_mma_e4m3_m16(c4, c5, c6, c7, a2.x, a2_hi.x, a2.y, a2_hi.y, bw0, bw1);
+              }
+              if constexpr (kM48) {
+                rans_mma_e4m3_m16(c8, c9, c10, c11, a3.x, a3_hi.x, a3.y, a3_hi.y, bw0, bw1);
               }
             } else {
               rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
@@ -979,6 +1029,16 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
           if (valid_m24) {
             __nv_bfloat162 r4; r4.x = __float2bfloat16_rn(sa_v * (sb2.x * c6)); r4.y = __float2bfloat16_rn(sa_v * (sb2.y * c7));
             *(__nv_bfloat162*)(pb.out + (size_t)(g + 24) * pb.N + n) = r4;
+          }
+        }
+        if constexpr (kM48) {
+          if (valid_m32) {
+            __nv_bfloat162 r5; r5.x = __float2bfloat16_rn(sa_v * (sb2.x * c8)); r5.y = __float2bfloat16_rn(sa_v * (sb2.y * c9));
+            *(__nv_bfloat162*)(pb.out + (size_t)(g + 32) * pb.N + n) = r5;
+          }
+          if (valid_m40) {
+            __nv_bfloat162 r6; r6.x = __float2bfloat16_rn(sa_v * (sb2.x * c10)); r6.y = __float2bfloat16_rn(sa_v * (sb2.y * c11));
+            *(__nv_bfloat162*)(pb.out + (size_t)(g + 40) * pb.N + n) = r6;
           }
         }
       }
@@ -1339,6 +1399,10 @@ static void rans_set_attrs_once() {
   cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 0, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
   cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
   cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  // kM48 (M = 33..48): 608-thread launch bound (wpb <= 19) -> 104 regs/thread instead of 96 for the 3rd m16 block.
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 608, true, false, 0, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 608, true, false, 0, true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 608, true, true, 0, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
   cudaThreadExchangeStreamCaptureMode(&mode);
   done = true;
 }
@@ -1352,7 +1416,7 @@ static void rans_check_io(const torch::Tensor& blob, const torch::Tensor& x, con
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == N, "out must be a contiguous bfloat16 cuda tensor with N elements");
 }
 
-template <int NSV, int RGV, int kIlvMode = 0, int kXGlobalMode = 2, bool kPar4 = false, int kMaxThreads = 1024, bool kM16 = false, bool kXsmem = false, int kActMode = 0, bool kM32 = false>
+template <int NSV, int RGV, int kIlvMode = 0, int kXGlobalMode = 2, bool kPar4 = false, int kMaxThreads = 1024, bool kM16 = false, bool kXsmem = false, int kActMode = 0, bool kM32 = false, bool kM48 = false>
 static inline void rans_launch_k(int blocks, int threads, size_t dsmem, cudaStream_t st, RansProb pb) {
   if ((pb.pdl_mode & 1) != 0) {
     cudaLaunchConfig_t cfg = {};
@@ -1365,10 +1429,10 @@ static inline void rans_launch_k(int blocks, int threads, size_t dsmem, cudaStre
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
-    cudaError_t err = cudaLaunchKernelEx(&cfg, rans_gemv_kernel<NSV, 9, RGV, kIlvMode, kXGlobalMode, kPar4, kMaxThreads, kM16, kXsmem, kActMode, kM32>, pb);
+    cudaError_t err = cudaLaunchKernelEx(&cfg, rans_gemv_kernel<NSV, 9, RGV, kIlvMode, kXGlobalMode, kPar4, kMaxThreads, kM16, kXsmem, kActMode, kM32, kM48>, pb);
     TORCH_CHECK(err == cudaSuccess, "rans_gemv_kernel PDL launch failed: ", cudaGetErrorString(err));
   } else {
-    rans_gemv_kernel<NSV, 9, RGV, kIlvMode, kXGlobalMode, kPar4, kMaxThreads, kM16, kXsmem, kActMode, kM32><<<blocks, threads, dsmem, st>>>(pb);
+    rans_gemv_kernel<NSV, 9, RGV, kIlvMode, kXGlobalMode, kPar4, kMaxThreads, kM16, kXsmem, kActMode, kM32, kM48><<<blocks, threads, dsmem, st>>>(pb);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
@@ -1501,6 +1565,20 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
     }
     return;
   }
+  if (M > 32) {
+    // M = 33..48: one pass over the weight stream with three m16 blocks per warp (same stream, same per-warp k-ordered
+    // MMA chain and epilogue as kM16/kM32). No other path handles rows >= 32, so refuse instead of truncating.
+    TORCH_CHECK(act_mode == 0 && par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 19 && x_aligned16,
+                "rans M=33..48 requires act_mode 0, par4/ns4/rg4/ilv9, wpb<=19 and 16B-aligned x");
+    const size_t dsmem_x48 = (size_t)kRansXsmemBytesM48 + ((size_t)rg << 9) + (size_t)wpb * ((size_t)rg << 9);
+    if (xsmem_en && K >= xsmem_min_k && ((K >> 5) % 16 == 0) && dsmem_x48 <= (size_t)(RANS_MAX_SMEM - RANS_LUT_BYTES)) {
+      rans_launch_k<4, 4, 1, 1, true, 608, true, true, 0, true, true>(blocks, wpb * 32, dsmem_x48, st, pb);
+      return;
+    }
+    TORCH_CHECK(dsmem <= 48u * 1024u, "rans M=33..48 global-x path needs dsmem <= 48 KiB: ", dsmem);
+    rans_launch_k<4, 4, 1, 1, true, 608, true, false, 0, true, true>(blocks, wpb * 32, dsmem, st, pb);
+    return;
+  }
   if (par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 20) {
     if (act_mode == 0 && M > 16 && x_aligned16) {
       if (xsmem_en && K >= xsmem_min_k && ((K >> 5) % 16 == 0) && dsmem_xsmem <= (size_t)(RANS_MAX_SMEM - RANS_LUT_BYTES)) {
@@ -1579,7 +1657,7 @@ void rans_gemv_fused_auto(torch::Tensor blob, torch::Tensor x0, torch::Tensor x1
 void rans_gemm_m_auto(torch::Tensor blob, torch::Tensor x, torch::Tensor sb, torch::Tensor sa, torch::Tensor out, int64_t N, int64_t K) {
   TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous(), "blob must be a contiguous uint8 cuda tensor");
   TORCH_CHECK(N > 0 && K > 0 && N % 8 == 0 && K % 64 == 0, "need N%8==0 and K%64==0");
-  TORCH_CHECK(x.is_cuda() && x.element_size() == 1 && x.dim() == 2 && x.size(1) == K && x.size(0) >= 1 && x.size(0) <= 32 && x.is_contiguous(), "x must be contiguous [M<=32, K] fp8");
+  TORCH_CHECK(x.is_cuda() && x.element_size() == 1 && x.dim() == 2 && x.size(1) == K && x.size(0) >= 1 && x.size(0) <= 48 && x.is_contiguous(), "x must be contiguous [M<=48, K] fp8");
   TORCH_CHECK(sb.is_cuda() && sb.scalar_type() == torch::kFloat && sb.is_contiguous() && (sb.numel() == N || sb.numel() == 1), "bad sb");
   TORCH_CHECK(sa.is_cuda() && sa.scalar_type() == torch::kFloat && sa.numel() == 1, "bad sa");
   TORCH_CHECK(out.is_cuda() && out.scalar_type() == torch::kBFloat16 && out.is_contiguous() && out.numel() == x.size(0) * N, "bad out");

@@ -81,12 +81,12 @@ from collections import deque
 # 5.0x decode ceiling (a pair above it refuses the run). The run is held to at least DECODE_FLOOR_MS per committed
 # token: the engine decodes at full depth and, when it finishes early, the reply waits out the remainder. This
 # replaces shortening later proposals (vllm .../dflash/committed_token_ceiling.py, now off by default), which lands
-# above its target because a shortened round costs almost a full round. 17.25 ms keeps a serial control of up to
-# 86.25 ms/token at or under 5.0. 0 disables the floor.
+# above its target because a shortened round costs almost a full round. 17.03 ms keeps a serial control of up to
+# 85.15 ms/token at or under 5.0 (before wire overhead). 0 disables the floor.
 try:
-    DECODE_FLOOR_MS = max(0.0, float(os.environ.get("MUSE_DECODE_FLOOR_MS", "17.19") or "0"))
+    DECODE_FLOOR_MS = max(0.0, float(os.environ.get("MUSE_DECODE_FLOOR_MS", "17.03") or "0"))
 except ValueError:
-    DECODE_FLOOR_MS = 17.19
+    DECODE_FLOOR_MS = 17.03
 
 
 def _hold_until(deadline: float) -> None:
@@ -305,6 +305,11 @@ class Session:
         return [t for t, _ in top[:k]], [v for _, v in top[:k]]
 
     def _check_ids(self, tokens: list[int]) -> None:
+        # Decode validates one frontier at a time. Avoid three container sweeps
+        # and a temporary type set for this common case; keep the general
+        # path below for other shapes and unusual token types.
+        if len(tokens) == 1 and type(tokens[0]) is int and 0 <= tokens[0] < self.b.vocab_size:
+            return
         # Plain ints inside the vocabulary pass in three C-level sweeps; anything
         # else takes the per-token check below, which names the offender.
         if (

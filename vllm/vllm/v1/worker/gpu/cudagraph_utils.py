@@ -280,7 +280,7 @@ class CudaGraphManager:
         else:
             decode_query_lens = [self.decode_query_len]
 
-        # Native multi-leaf tree (M=12/16/20/24/32) or M=8 zero-clamp verify: capture ONLY
+        # Native multi-leaf tree (M=12/16/20/24/32/48) or M=8 zero-clamp verify: capture ONLY
         # the bs=1 FULL (num_tokens=target_m, num_reqs=1, uniform_token_count=target_m)
         # graph(s) alongside (7, 1, 7), without polluting decode_query_lens with multi-req graphs.
         _target_leaf_ms: tuple[int, ...] = ()
@@ -506,7 +506,7 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
-                        _keep_raw = desc.cg_mode == CUDAGraphMode.FULL and desc.num_tokens in (7, 16, 32)
+                        _keep_raw = desc.cg_mode == CUDAGraphMode.FULL and desc.num_tokens in (7, 16, 32, 48)
                         try:
                             graph = torch.cuda.CUDAGraph(keep_graph=_keep_raw)
                         except TypeError:

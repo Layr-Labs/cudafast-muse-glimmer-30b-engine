@@ -956,7 +956,9 @@ class FlashAttentionImpl(AttentionImpl):
                 ):
                     return output
             elif (
-                2 <= num_actual_tokens <= 32
+                # 2..32: gqa16 verify (unchanged); 33..48: wide M=48 tree verify (v4<48>), taken only when
+                # muse_gqa16_attn admitted it (else try_verify_gqa16 returns False -> stock FA2 below).
+                2 <= num_actual_tokens <= 48
                 and attn_metadata.max_query_len == num_actual_tokens
             ):
                 window = (

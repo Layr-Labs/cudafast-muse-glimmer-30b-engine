@@ -1197,7 +1197,7 @@ class _GateSideStream:
 
     def __init__(self) -> None:
         self.max_tokens = int(
-            os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "32")
+            os.environ.get("VLLM_MUSE_GLIMMER_GATE_STREAM_MAX_TOKENS", "48")
         )
         self.stream: torch.cuda.Stream | None = None
         self.fork_event: torch.cuda.Event | None = None
@@ -1252,7 +1252,7 @@ class _GateSideStream:
             if x.shape[0] == 1:
                 if getattr(bf16_gate, "muse_bf16_lane_weight", None) is None:
                     return
-            elif 2 <= x.shape[0] <= 32:
+            elif 2 <= x.shape[0] <= _BF16_RANS_M_MAX:
                 if layer_idx in _BF16_DUAL_RANS_M_LAYERS:
                     return
                 if getattr(bf16_gate, "muse_bf16_rans_m", None) is None:
@@ -1470,7 +1470,7 @@ def _muse_qk_norm_rope_impl(
                         muse_qk_glue.PDL_PROD_ENABLED
                         and q_first_row == 0
                         and getattr(attn_layer.impl, "_gqa16_decode_eligible", False)
-                        and (2 <= qkv.shape[0] <= 32 or qkv.shape[0] == 512)
+                        and (2 <= qkv.shape[0] <= _QK_PDL_PROD_M_MAX or qkv.shape[0] == 512)
                     ):
                         try:
                             import muse_gqa16_attn as _mga
@@ -1494,7 +1494,7 @@ def _muse_qk_norm_rope_impl(
                                     and getattr(layer_meta, "causal", False) is True
                                     and getattr(layer_meta, "block_table", None) is not None
                                 )
-                                if has_single_seq and 2 <= qkv.shape[0] <= 32:
+                                if has_single_seq and 2 <= qkv.shape[0] <= _QK_PDL_PROD_M_MAX:
                                     _mq_pdl_ok = qkv.shape[0] <= 16 or (
                                         os.environ.get("MUSE_GQA16_MULTIQ_PDL", "1").strip()
                                         not in ("0", "", "false", "no")
@@ -1578,6 +1578,13 @@ _BF16_DUAL_WS_ADMITTED: set[int] = set()
 _BF16_DUAL_RANS_M: dict[int, tuple[torch.Tensor, int]] = {}
 _BF16_DUAL_RANS_M_GATE_PTRS: set[int] = set()
 _BF16_DUAL_RANS_M_LAYERS: set[int] = set()
+# Multi-M BF16 rANS MMA routing cap: M=2..32 exactly as before; M=33..48 (TREE_WIDE_M=48 verify) only where the
+# M=48 kernel is admitted (dual qkv+gate: per-layer row-split self-check below; single gate: muse_bf16_lane).
+_BF16_RANS_M_MAX = max(32, min(48, int(os.environ.get("MUSE_BF16_RANS_M_MAX", "48") or "48")))
+_BF16_DUAL_RANS_M48: set[int] = set()  # qkv lane-index ptrs whose dual rANS passed the M=48 row-split check
+_BF16_DUAL_RANS_M48_GATE_PTRS: set[int] = set()
+# qk_glue fused KV writer PDL producer (gqa16 multi-q verify consumer) row cap: 32 before, 48 for wide verify.
+_QK_PDL_PROD_M_MAX = max(32, min(48, int(os.environ.get("MUSE_QK_PDL_PROD_M_MAX", "48") or "48")))
 
 
 def update_bf16_dual_rans_m(idx_qkv: torch.Tensor, blob: torch.Tensor) -> None:
@@ -1602,7 +1609,10 @@ def _muse_bf16_qkv_or_stacked_impl(
         out = torch.mm(x, w_cat.t())
         return out[:, :4608].contiguous(), out[:, 4608:].contiguous()
     if (
-        2 <= x.shape[0] <= 32
+        (
+            2 <= x.shape[0] <= 32
+            or (x.shape[0] <= _BF16_RANS_M_MAX and idx_qkv.data_ptr() in _BF16_DUAL_RANS_M48)
+        )
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16
@@ -1663,7 +1673,7 @@ def _muse_bf16_gate_fill_impl(
             if rc == 0:
                 return
     if (
-        2 <= x.shape[0] <= 32
+        2 <= x.shape[0] <= _BF16_RANS_M_MAX
         and x.ndim == 2
         and x.shape[1] == 6656
         and x.dtype == torch.bfloat16
@@ -1671,11 +1681,18 @@ def _muse_bf16_gate_fill_impl(
         and x.is_contiguous()
         and gate.is_contiguous()
     ):
-        if idx_gate.data_ptr() in _BF16_DUAL_RANS_M_GATE_PTRS:
+        # Gate already written by the dual qkv+gate rANS call (same M bucket as its admission above).
+        if idx_gate.data_ptr() in (
+            _BF16_DUAL_RANS_M_GATE_PTRS if x.shape[0] <= 32 else _BF16_DUAL_RANS_M48_GATE_PTRS
+        ):
             return
         import muse_bf16_lane as _bf16
 
         entry = _bf16.get_m_rans(idx_gate) if hasattr(_bf16, "get_m_rans") else None
+        if entry is not None and x.shape[0] > 32 and not (
+            hasattr(_bf16, "m48_ok") and _bf16.m48_ok(idx_gate)
+        ):
+            entry = None  # kM48 rANS not admitted for this layer: lane op below slices exactly
         if entry is not None:
             import muse_bfx_ext as _bfx
 
@@ -2834,6 +2851,47 @@ class MuseGlimmerForCausalLM(
                                         )
                                         _BF16_DUAL_RANS_M_LAYERS.add(attn.layer_idx)
                                         bf16_dual_rans_cnt += 1
+                                        if _BF16_RANS_M_MAX >= 48:
+                                            # M=48 wide verify: rows must equal the same rows at M=32 / M=16
+                                            # (independent m-blocks). Separate try: never affects M<=32 routing.
+                                            ok48 = False
+                                            try:
+                                                x48 = (
+                                                    torch.randn((48, 6656), generator=g2, device=qw.device)
+                                                    * 1.5
+                                                ).to(torch.bfloat16)
+                                                gq, gg = _bfx.rans_gemm_dual(
+                                                    x48, blob_cat, 4608, 4096, 6656, bexp_cat
+                                                )
+                                                rq0, rg0 = _bfx.rans_gemm_dual(
+                                                    x48[:32].contiguous(), blob_cat, 4608, 4096, 6656, bexp_cat
+                                                )
+                                                rq1, rg1 = _bfx.rans_gemm_dual(
+                                                    x48[32:].contiguous(), blob_cat, 4608, 4096, 6656, bexp_cat
+                                                )
+                                                ok48 = (
+                                                    torch.equal(gq[:32].view(torch.int16), rq0.view(torch.int16))
+                                                    and torch.equal(gq[32:].view(torch.int16), rq1.view(torch.int16))
+                                                    and torch.equal(gg[:32].view(torch.int16), rg0.view(torch.int16))
+                                                    and torch.equal(gg[32:].view(torch.int16), rg1.view(torch.int16))
+                                                )
+                                            except Exception as exc48:  # noqa: BLE001
+                                                logger.warning(
+                                                    "BF16 dual rANS M=48 check raised on layer %d: %s",
+                                                    attn.layer_idx,
+                                                    exc48,
+                                                )
+                                            if ok48:
+                                                _BF16_DUAL_RANS_M48.add(qkv.muse_bf16_lane_index.data_ptr())
+                                                _BF16_DUAL_RANS_M48_GATE_PTRS.add(
+                                                    gate.muse_bf16_lane_index.data_ptr()
+                                                )
+                                            else:
+                                                logger.warning(
+                                                    "BF16 dual rANS M=48 NOT admitted on layer %d; M=33..48 "
+                                                    "uses the BF16 lane fallback (wide-48 verify not exact)",
+                                                    attn.layer_idx,
+                                                )
                                     else:
                                         del blob_cat
                             except Exception as exc:  # noqa: BLE001

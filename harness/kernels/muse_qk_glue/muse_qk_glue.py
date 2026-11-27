@@ -105,6 +105,9 @@ DECODE_HPW = int(os.environ.get("MUSE_QK_DECODE_HPW", "2"))
 DECODE_KV_HPW = int(os.environ.get("MUSE_QK_DECODE_KV_HPW", "6"))
 DECODE_KV_HPW_M32 = int(os.environ.get("MUSE_QK_DECODE_KV_HPW_M32", "17"))
 PREFILL_KV_HPW = int(os.environ.get("MUSE_QK_PREFILL_KV_HPW", "6"))
+# Balanced 18-warp decode KV writer: one warp per (token, head pair), no cross-token state, so M=33..48 rows are
+# bit-identical to the same rows at M<=32 (grid just grows: 48*18/4 = 216 CTAs at 128 threads).
+DECODE_BALANCED_MAX_M = 48
 DECODE_BALANCED = os.environ.get("MUSE_QK_DECODE_BALANCED", "1").strip() not in ("0", "", "false", "no")
 PDL_PROD_ENABLED = os.environ.get("MUSE_QK_GLUE_PDL_PROD", "1").strip() not in ("0", "", "false", "no")
 FUSE_KVCACHE = os.environ.get("MUSE_QK_FUSE_KVCACHE", "1").strip() not in ("0", "", "false", "no")
@@ -373,7 +376,7 @@ def self_check(device: torch.device) -> bool:
         if ok and _kv_decode_m is not None and DECODE_BALANCED and FUSE_KVCACHE_PREFILL and _kv_decode_m_state["admitted"] is None:
             dmok = True
             stream = torch.cuda.current_stream(device).cuda_stream
-            for m_p in (2, 7, 16, 32):
+            for m_p in (2, 7, 16, 32, 48):
                 pos_p = torch.arange(m_p, dtype=torch.int64, device=device) % int(cache.shape[0])
                 for layout in ("NHD", "HND"):
                     for block_size in (16, 32):
@@ -440,7 +443,7 @@ def self_check(device: torch.device) -> bool:
                     break
             _kv_decode_m_state["admitted"] = dmok
             logger.info(
-                "muse_qk_glue: M=2..32 balanced 18-warp QK-norm+RoPE+KV-cache kernel %s (pdl_prod=%d)",
+                "muse_qk_glue: M=2..48 balanced 18-warp QK-norm+RoPE+KV-cache kernel %s (pdl_prod=%d)",
                 "admitted" if dmok else "REJECTED", int(PDL_PROD_ENABLED),
             )
     except Exception:  # noqa: BLE001
@@ -693,7 +696,7 @@ def run_qk_norm_rope_kvcache_prefill(
         and _kv_decode_m is not None
         and _kv_decode_m_state.get("admitted")
         and q_first == 0
-        and 2 <= num_tokens <= 32
+        and 2 <= num_tokens <= DECODE_BALANCED_MAX_M
     )
     hpw = DECODE_KV_HPW if num_tokens <= 16 else (DECODE_KV_HPW_M32 if num_tokens <= 32 else PREFILL_KV_HPW)
     with torch.cuda.device(qkv.device):

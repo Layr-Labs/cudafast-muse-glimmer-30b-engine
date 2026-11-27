@@ -31,7 +31,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 DEFAULT_TREE_M = "16"
-DEFAULT_TREE_WIDE_M = "32"
+DEFAULT_TREE_WIDE_M = "48"
 ENABLED = os.environ.get("MUSE_NATIVE_LEAF", "1").strip() not in ("0", "", "false", "no")
 M8_ENABLED = os.environ.get("MUSE_NATIVE_LEAF_M8", "1").strip() not in ("0", "", "false", "no")
 try:
@@ -43,11 +43,15 @@ try:
     _TREE_WIDE_M_RAW = int(os.environ.get("MUSE_NATIVE_TREE_WIDE_M", DEFAULT_TREE_WIDE_M).strip() or "0")
 except ValueError:
     _TREE_WIDE_M_RAW = 0
+# Wide verify widths (binary conditional graph: TREE_M base vs TREE_WIDE_M wide). M=48 needs leaf_flag int32[1+3*48=145].
+TREE_WIDE_M_ALLOWED = (20, 24, 32, 48)
 TREE_WIDE_M = (
     _TREE_WIDE_M_RAW
-    if (_TREE_WIDE_M_RAW in (20, 24, 32) and TREE_M > 0 and _TREE_WIDE_M_RAW > TREE_M)
+    if (_TREE_WIDE_M_RAW in TREE_WIDE_M_ALLOWED and TREE_M > 0 and _TREE_WIDE_M_RAW > TREE_M)
     else 0
 )
+# Max verify width any tree buffer / kernel launch must hold (32 when TREE_WIDE_M<=32, 48 when TREE_WIDE_M=48).
+TREE_MAX_M = max(32, TREE_M, TREE_WIDE_M)
 TREE_WIDE_GATE = os.environ.get("MUSE_NATIVE_TREE_WIDE_GATE", "cpc").strip().lower()
 TREE_WIDE_CPC = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_CPC", "4.8"))
 TREE_WIDE_MIN_ROUNDS = int(os.environ.get("MUSE_NATIVE_TREE_WIDE_MIN_ROUNDS", "0"))
@@ -68,7 +72,7 @@ def desired_verify_ms() -> tuple[int, ...]:
 
 
 def desired_verify_m() -> int:
-    """Single source of truth for max configured bs=1 depth-6 verify width (32..7)."""
+    """Single source of truth for max configured bs=1 depth-6 verify width (48..7)."""
     ms = desired_verify_ms()
     return max(ms) if ms else 7
 LOW_THRESH = int(os.environ.get("MUSE_NATIVE_LEAF_THRESH", "3"))
@@ -110,23 +114,23 @@ class _NativeLeafState:
         self.tree_wide_m_ready: int = 0
         self.vocab_size: int = 202048
         self.device: torch.device | None = None
-        self.leaf_flag: torch.Tensor | None = None          # int32[97] shared with muse_gqa16_attn
+        self.leaf_flag: torch.Tensor | None = None          # int32[1+3*max_m] (97 / 145) shared with muse_gqa16_attn
         self.prev_ns: torch.Tensor | None = None            # int32[1]
         self.hit_flag: torch.Tensor | None = None           # int32[14] [dst0, hit_len, dst0, src0, ..., dst5, src5]
-        self.hit_src_row: torch.Tensor | None = None        # int32[1] (0=miss, r=winning initial leaf row 7..31)
+        self.hit_src_row: torch.Tensor | None = None        # int32[1] (0=miss, r=winning initial leaf row 7..M-1)
         self.alt_ids: torch.Tensor | None = None            # int64[4] (d1_b1, d1_b2, d2_b1, d2_b2)
         self.alt_margins: torch.Tensor | None = None        # float32[2] (margin_d1, margin_d2)
         self.tree_top: torch.Tensor | None = None           # int64[36] ([6, 6] top-6 for d1..d6)
         self.tree_vals: torch.Tensor | None = None          # float32[36] ([6, 6] top-6 logits for d1..d6)
         self.req_acc_state: torch.Tensor | None = None      # int32[5] [rounds, committed, high_acc, raw_acc, raw_tr]
         self.saved_alt_tok: torch.Tensor | None = None      # int64[1] (legacy M=7/M=8)
-        self.saved_leaf_toks: torch.Tensor | None = None    # int64[32] (tree mode)
-        self.saved_leaf_k: torch.Tensor | None = None       # int32[32] (tree mode)
-        self.saved_leaf_parent: torch.Tensor | None = None  # int32[32] (-1=1-level root, 7..31=parent row)
+        self.saved_leaf_toks: torch.Tensor | None = None    # int64[TREE_MAX_M] (tree mode)
+        self.saved_leaf_k: torch.Tensor | None = None       # int32[TREE_MAX_M] (tree mode)
+        self.saved_leaf_parent: torch.Tensor | None = None  # int32[TREE_MAX_M] (-1=1-level root, 7..M-1=parent row)
         self.hist: torch.Tensor | None = None               # int32[16384] exact committed token history
         self.hist_len: torch.Tensor | None = None           # int32[1] valid history length
         self.saved_pos0: torch.Tensor | None = None         # int64[1] step anchor position p0
-        self.saved_row_ctx: torch.Tensor | None = None      # int32[32, 4] per-row (cur, prv1, prv2, pos_r)
+        self.saved_row_ctx: torch.Tensor | None = None      # int32[TREE_MAX_M, 4] per-row (cur, prv1, prv2, pos_r)
         self.tr_log: torch.Tensor | None = None             # int32[4096, 8] per-request 30B target recycle log
         self.tr_state: torch.Tensor | None = None           # int32[4] [tr_len, tr_step, last_p0, reserved]
         self.in_static_vocab: torch.Tensor | None = None    # uint8[vocab] drafter static vocab mask
@@ -245,7 +249,7 @@ def is_m8_ready() -> bool:
 
 
 def active_verify_m() -> int:
-    """Return active base verify width for bs=1 depth-6 verify: 32, 24, 20, 16, 12, 8, or 7."""
+    """Return active base verify width for bs=1 depth-6 verify: 32, 24, 20, 16, 12, 8, or 7 (wide 48 is never base)."""
     if not (ENABLED and _S.ready):
         return 7
     if _S.tree_m_ready in (12, 16, 20, 24, 32):
@@ -256,7 +260,7 @@ def active_verify_m() -> int:
 
 
 def select_verify_m(req_id: str | None, decoded_tokens: int) -> int:
-    """Select per-step verify width (adaptive wide M=32 on hard steps vs base M=16 on easy steps).
+    """Select per-step verify width (adaptive wide M=TREE_WIDE_M (32/48) on hard steps vs base M=16 on easy steps).
 
     Default `cpc` gate is 100% zero-sync on the host: uses `decoded_tokens` (from
     `req_states.num_computed_tokens_np - prefill_len`) divided by host-counted verify rounds.
@@ -277,7 +281,7 @@ def select_verify_m(req_id: str | None, decoded_tokens: int) -> int:
         sm_val = float((_S.tree_vals[0 : 6 * _tk : _tk] - _S.tree_vals[1 : 6 * _tk : _tk]).mean().item())
         return wide_m if sm_val < TREE_WIDE_SM else base_m
     # Default zero-sync `cpc` gate: start on fast M=16 for the first TREE_WIDE_MIN_ROUNDS steps,
-    # then switch to wide M=32 only when running verify cpc < TREE_WIDE_CPC (hard <3.25 tok/step prose!).
+    # then switch to wide M=TREE_WIDE_M only when running verify cpc < TREE_WIDE_CPC (hard <3.25 tok/step prose!).
     if _S._host_rounds == 0 and TREE_WIDE_MIN_ROUNDS <= 0:
         return wide_m
     if _S._host_rounds < TREE_WIDE_MIN_ROUNDS:
@@ -628,13 +632,13 @@ def init_kv_table(
         else:
             _S.req_acc_state.zero_()
         _S.saved_alt_tok = torch.full((1,), -1, dtype=torch.int64, device=device)
-        _S.saved_leaf_toks = torch.full((32,), -1, dtype=torch.int64, device=device)
-        _S.saved_leaf_k = torch.zeros((32,), dtype=torch.int32, device=device)
-        _S.saved_leaf_parent = torch.full((32,), -1, dtype=torch.int32, device=device)
+        _S.saved_leaf_toks = torch.full((TREE_MAX_M,), -1, dtype=torch.int64, device=device)
+        _S.saved_leaf_k = torch.zeros((TREE_MAX_M,), dtype=torch.int32, device=device)
+        _S.saved_leaf_parent = torch.full((TREE_MAX_M,), -1, dtype=torch.int32, device=device)
         _S.hist = torch.full((HIST_CAP,), -1, dtype=torch.int32, device=device)
         _S.hist_len = torch.zeros((1,), dtype=torch.int32, device=device)
         _S.saved_pos0 = torch.full((1,), -1, dtype=torch.int64, device=device)
-        _S.saved_row_ctx = torch.full((32, 4), -1, dtype=torch.int32, device=device)
+        _S.saved_row_ctx = torch.full((TREE_MAX_M, 4), -1, dtype=torch.int32, device=device)
         _S.tr_log = torch.zeros((TR_LOG_CAP, 8), dtype=torch.int32, device=device)
         _S.tr_state = torch.tensor([0, 0, -1, 0], dtype=torch.int32, device=device)
         if (
@@ -684,9 +688,20 @@ def init_kv_table(
                 and TREE_WIDE_M > _S.tree_m_ready
                 and lf.numel() >= 1 + 3 * TREE_WIDE_M
                 and _has_tree_ops
+                # M > 32 needs the gqa16 wide (6-bit remap, v4<48>) tree verify self-check to pass; otherwise the
+                # attention backend would fall through to causal FA2 for an active tree (wrong leaf rows).
+                and (
+                    TREE_WIDE_M <= 32
+                    or (
+                        hasattr(g16, "is_wide_tree_verify_admitted")
+                        and bool(g16.is_wide_tree_verify_admitted(device))
+                    )
+                )
             )
             else 0
         )
+        if TREE_WIDE_M > 32 and _S.tree_wide_m_ready == 0:
+            logger.warning("native_leaf: wide M=%d NOT armed (wide tree verify not admitted or leaf_flag too small)", TREE_WIDE_M)
         _S.ready = True
         if LEAF_STATS and not _S._atexit_registered:
             _S._atexit_registered = True
@@ -760,7 +775,7 @@ def prepare_m8(positions: torch.Tensor, seq_lens: torch.Tensor) -> bool:
 @torch.no_grad()
 def prepare_tree(positions: torch.Tensor, seq_lens: torch.Tensor, verify_m: int) -> bool:
     """Zero-sync GPU prep: positions[7..verify_m-1] = p+7..p+verify_m-1, seq_lens[0] += verify_m-7."""
-    if not is_ready() or verify_m < 8 or verify_m > 32:
+    if not is_ready() or verify_m < 8 or verify_m > TREE_MAX_M:
         return False
     bfx = _get_bfx()
     if bfx is None:
@@ -811,7 +826,7 @@ def launch_setup_tree_only(
     positions: torch.Tensor,
     verify_m: int,
 ) -> bool:
-    """Capture-safe pure GPU launch of native_leaf_setup_tree for verify_m (16 or 32)."""
+    """Capture-safe pure GPU launch of native_leaf_setup_tree for verify_m (TREE_M or TREE_WIDE_M)."""
     if not _S.ready or verify_m <= 8:
         return False
     bfx = _get_bfx()

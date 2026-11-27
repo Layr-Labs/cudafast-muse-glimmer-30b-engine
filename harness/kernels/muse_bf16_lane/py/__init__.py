@@ -195,6 +195,11 @@ def _prepare(weight):
 
 _M_RANS: dict[int, tuple[torch.Tensor, int]] = {}
 _M_RANS_STATS = {"admitted": 0, "rejected": 0, "logged": False}
+# Tree-wide verify width: M = 33..48 runs the kM48 rANS MMA (one pass over the weights). Admitted per layer by a
+# bitwise row-slice self-check kept separate from the M <= 32 admission; a layer that fails runs as <= 32-row
+# slices (exact, re-reads the weights). The dense F.linear path is NOT bit-exact with the rANS kernel rows.
+_M_MAX = 48
+_M48_OK: set[int] = set()
 
 
 def _prepare_m_rans(weight: torch.Tensor) -> tuple[torch.Tensor, int] | None:
@@ -238,6 +243,30 @@ def _prepare_m_rans(weight: torch.Tensor) -> tuple[torch.Tensor, int] | None:
     return blob, bexp
 
 
+def _check_m48(blob: torch.Tensor, bexp: int, n: int, k: int, dev) -> bool:
+    try:
+        import muse_bfx_ext as _bfx
+        gen = torch.Generator(device=dev)
+        gen.manual_seed(n * 197 + k + 29)
+        for cm in (33, 40, 48):
+            xm = (torch.randn((cm, k), generator=gen, device=dev) * 1.5).to(torch.bfloat16)
+            got_m = _bfx.rans_gemm(xm, blob, n, k, bexp)
+            for s0 in range(0, cm, 8):
+                s1 = min(cm, s0 + 8)
+                ref_s = _bfx.rans_gemm(xm[s0:s1].contiguous(), blob, n, k, bexp)
+                if not torch.equal(got_m[s0:s1].view(torch.int16), ref_s.view(torch.int16)):
+                    logger.warning("muse_bf16_lane kM48 self-check mismatch (n=%d, M=%d, rows %d:%d)", n, cm, s0, s1)
+                    return False
+        return True
+    except Exception as error:  # noqa: BLE001
+        logger.warning("muse_bf16_lane kM48 self-check failed (n=%d): %s", n, error)
+        return False
+
+
+def m48_ok(index: torch.Tensor) -> bool:
+    return index.data_ptr() in _M48_OK
+
+
 def get_m_rans(index: torch.Tensor) -> tuple[torch.Tensor, int] | None:
     return _M_RANS.get(index.data_ptr())
 
@@ -251,7 +280,7 @@ def update_m_rans(index: torch.Tensor, blob: torch.Tensor) -> None:
 def _decode(x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor,
             index: torch.Tensor) -> torch.Tensor:
     n = weight.shape[0]
-    if (2 <= x.shape[0] <= 32 and x.ndim == 2 and x.shape[1] == _WIDTH
+    if (2 <= x.shape[0] <= _M_MAX and x.ndim == 2 and x.shape[1] == _WIDTH
             and x.dtype == torch.bfloat16 and x.is_cuda and x.is_contiguous()
             and n in _ROWS):
         entry = _M_RANS.get(index.data_ptr())
@@ -260,8 +289,13 @@ def _decode(x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor,
             blob, bexp = entry
             if not _M_RANS_STATS["logged"]:
                 _M_RANS_STATS["logged"] = True
-                logger.info("muse_bf16_lane multi-M rANS MMA: %d target BF16 layers admitted bitwise (0-ULP)",
-                            _M_RANS_STATS["admitted"])
+                logger.info("muse_bf16_lane multi-M rANS MMA: %d target BF16 layers admitted bitwise (0-ULP), "
+                            "%d with M<=48", _M_RANS_STATS["admitted"], len(_M48_OK))
+            if x.shape[0] > 32 and index.data_ptr() not in _M48_OK:
+                logger.warning_once("muse_bf16_lane kM48 not admitted (n=%d): M=%d runs as <=32-row slices", n,
+                                    int(x.shape[0]))
+                return torch.cat([_bfx.rans_gemm(x[s0:s0 + 32], blob, n, _WIDTH, bexp)
+                                  for s0 in range(0, x.shape[0], 32)], dim=0)
             return _bfx.rans_gemm(x, blob, n, _WIDTH, bexp)
     idx_ok = index.numel() == 1 or index.shape == (n, _INDEX_BYTES)
     if (x.shape != (1, _WIDTH) or x.dtype != torch.bfloat16
@@ -330,6 +364,10 @@ class _MuseBF16Lane(UnquantizedLinearMethod):
             layer.muse_bf16_rans_m = blob_m
             _M_RANS[layer.muse_bf16_lane_index.data_ptr()] = (blob_m, bexp_m)
             _M_RANS_STATS["admitted"] += 1
+            n_w, k_w = layer.weight.shape
+            with torch.no_grad():
+                if _check_m48(blob_m, bexp_m, n_w, k_w, layer.weight.device):
+                    _M48_OK.add(layer.muse_bf16_lane_index.data_ptr())
         else:
             _M_RANS_STATS["rejected"] += 1
 
@@ -340,8 +378,8 @@ class _MuseBF16Lane(UnquantizedLinearMethod):
             return super().apply(layer, x, bias)
         args = (x, layer.weight, packed, layer.muse_bf16_lane_index)
         if torch.compiler.is_compiling():
-            return torch.cond(x.shape[0] <= 32, _packed_branch, _dense_branch, args)
-        if 1 <= x.shape[0] <= 32:
+            return torch.cond(x.shape[0] <= _M_MAX, _packed_branch, _dense_branch, args)
+        if 1 <= x.shape[0] <= _M_MAX:
             return _packed_branch(*args)
         return super().apply(layer, x, bias)
 

@@ -578,7 +578,7 @@ extern "C" int muse_single_tree_prep(
     const void* src_bt_ptrs, const void* dst_bt_ptrs, const void* bt_strides,
     const void* num_blocks, int64_t num_blocks_stride, const void* block_sizes,
     void* slot_mappings, int64_t slot_mappings_stride, cudaStream_t stream) {
-  if (num_groups <= 0 || num_draft < 1 || num_draft > 7 || verify_m <= num_draft || verify_m > 32 ||
+  if (num_groups <= 0 || num_draft < 1 || num_draft > 7 || verify_m <= num_draft || verify_m > 48 ||  // 48 = TREE_WIDE_M max (128-thread kernel: tid < verify_m)
       seq_lens_len < 1 || qsl_len < 2) {
     return cudaErrorInvalidValue;
   }

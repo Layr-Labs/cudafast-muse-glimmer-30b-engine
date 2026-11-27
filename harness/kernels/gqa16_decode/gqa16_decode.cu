@@ -17,6 +17,22 @@
 #include <cmath>
 #include <cstdlib>
 
+// ---------------------------------------------------------------------------
+// bs=1 tree-verify KV remap contract (encoder: musebfx/native_leaf.cu tree_remap_root/tree_remap_child).
+//   leaf_flag int32[1 + 3*M] (M <= kGqa16TreeMaxM): entry r = {seq_sub, base_sub, remap_packed}.
+//   remap_packed (uint32): 6-bit slots j = 0..4, slot j = physical row (0..47) of logical token
+//   (seqlen_k - base_sub) + j. j == 5 (only reachable by a depth-6 leaf's own token) is NOT stored:
+//   phys(j) = (j == 5) ? r_self : ((pk >> (6*j)) & 0x3F).
+// Single-leaf M=7/M=8 modes keep their literal row in slot 0 (6u / 7u) and only ever decode j == 0.
+// ---------------------------------------------------------------------------
+constexpr int kGqa16TreeMaxM = 48;     // max tree verify width handled by the per-row remap decoders
+constexpr int kGqa16TreeRowsM32 = 32;  // historical tree_kv tile height (M <= 32 kernel instantiations)
+static_assert(kGqa16TreeMaxM <= 64, "remap slot is 6 bits");
+
+__device__ __forceinline__ int gqa16_tree_remap_row(uint32_t pk, int j, int r_self) {
+  return (j >= 5) ? r_self : static_cast<int>((pk >> (6 * j)) & 0x3Fu);
+}
+
 namespace muse_gqa16 {
 
 constexpr int kMaxSplits = 64;
@@ -274,7 +290,8 @@ __device__ __forceinline__ void issue_kv_tile_async(
     int tid,
     int leaf_remap_base = -1,
     int leaf_p_start = 0,
-    uint32_t leaf_remap_packed = 0u) {
+    uint32_t leaf_remap_packed = 0u,
+    int leaf_self_row = 0) {
   const bool is_bs64_aligned = (block_size == 64) && ((tok_base & 31) == 0);
   int phys_blk0 = 0, slot_base0 = 0;
   const bool half0_any = (tok_base < seqlen_k) && (tok_base + 16 > k_start);
@@ -337,7 +354,7 @@ __device__ __forceinline__ void issue_kv_tile_async(
       const int tok = tok_base + r;
       if (tok >= k_start && tok < seqlen_k) {
         const int tok_eff = (leaf_remap_base >= 0 && tok >= leaf_remap_base)
-            ? (leaf_p_start + static_cast<int>((leaf_remap_packed >> ((tok - leaf_remap_base) * 5)) & 0x1Fu))
+            ? (leaf_p_start + gqa16_tree_remap_row(leaf_remap_packed, tok - leaf_remap_base, leaf_self_row))
             : tok;
         const int lb = (block_size == 16) ? (tok_eff >> 4)
                      : ((block_size == 64) ? (tok_eff >> 6) : (tok_eff / block_size));
@@ -2195,6 +2212,7 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
   int leaf_remap_base = -1;
   int leaf_p_start = 0;
   uint32_t leaf_remap_packed = 0u;
+  int leaf_self_row = 0;
   if constexpr (kMultiQDirect) {
     const int q0 = cu_seqlens_q_ptr[0];
     const int actual_m = cu_seqlens_q_ptr[1] - q0;
@@ -2202,11 +2220,11 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
     if (q_idx >= actual_m) return;
     q_ptr += static_cast<int64_t>(q0 + q_idx) * q_tok_stride;
     out_ptr += static_cast<int64_t>(q0 + q_idx) * out_tok_stride;
-    if (leaf_flag_ptr != nullptr && leaf_flag_ptr[0] < 0 && actual_m <= 32 && seqlen_k >= actual_m) {
+    if (leaf_flag_ptr != nullptr && leaf_flag_ptr[0] < 0 && actual_m <= kGqa16TreeMaxM && seqlen_k >= actual_m) {
       // Generalized arbitrary-depth (1..6-level) bit-packed tree remap table (sentinel leaf_flag_ptr[0] == -1):
-      // entry q_idx sits at [1 + 3*q_idx + {0: seq_sub, 1: base_sub, 2: remap_packed}] inside int32[49].
+      // entry q_idx sits at [1 + 3*q_idx + {0: seq_sub, 1: base_sub, 2: remap_packed}] inside int32[1 + 3*M].
       // For base_sub >= 0, logical KV positions tok = (seqlen_k - base_sub) + j (j = 0..5) remap to
-      // physical slot (seqlen_k - actual_m) + ((remap_packed >> (4*j)) & 0xF).
+      // physical slot (seqlen_k - actual_m) + gqa16_tree_remap_row(remap_packed, j, q_idx).
       const int base = 1 + q_idx * 3;
       const int seq_sub = leaf_flag_ptr[base];
       const int base_sub = leaf_flag_ptr[base + 1];
@@ -2214,6 +2232,7 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
         leaf_p_start = seqlen_k - actual_m;
         leaf_remap_base = seqlen_k - base_sub;
         leaf_remap_packed = static_cast<uint32_t>(leaf_flag_ptr[base + 2]);
+        leaf_self_row = q_idx;
       }
       seqlen_k -= seq_sub;
     } else if (q_idx == 7 && actual_m == 8 && leaf_flag_ptr != nullptr) {
@@ -2299,12 +2318,12 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
       for (int ch = 0; ch < 4; ++ch) {
         issue_kv_tile_async<false>(smem.kv[ch], kv_ptr, block_table, block_tok_base + (ch << 5),
                                    k_start, seqlen_k, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-                                   leaf_remap_base, leaf_p_start, leaf_remap_packed);
+                                   leaf_remap_base, leaf_p_start, leaf_remap_packed, leaf_self_row);
         cp_async_commit();
       }
       issue_kv_tile_async<true>(smem.kv[4], kv_ptr, block_table, block_tok_base,
                                 k_start, seqlen_k, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-                                leaf_remap_base, leaf_p_start, leaf_remap_packed);
+                                leaf_remap_base, leaf_p_start, leaf_remap_packed, leaf_self_row);
       cp_async_commit();
 
       cp_async_wait<4>();
@@ -2318,7 +2337,7 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
       __syncthreads();
       issue_kv_tile_async<true>(smem.kv[0], kv_ptr, block_table, block_tok_base + 32,
                                 k_start, seqlen_k, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-                                leaf_remap_base, leaf_p_start, leaf_remap_packed);
+                                leaf_remap_base, leaf_p_start, leaf_remap_packed, leaf_self_row);
       cp_async_commit();
 
       cp_async_wait<4>();
@@ -2332,7 +2351,7 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
       __syncthreads();
       issue_kv_tile_async<true>(smem.kv[1], kv_ptr, block_table, block_tok_base + 64,
                                 k_start, seqlen_k, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-                                leaf_remap_base, leaf_p_start, leaf_remap_packed);
+                                leaf_remap_base, leaf_p_start, leaf_remap_packed, leaf_self_row);
       cp_async_commit();
 
       cp_async_wait<4>();
@@ -2346,7 +2365,7 @@ __global__ __launch_bounds__(128, 2) void gqa16_fa2_block128_pipe_kernel(
       __syncthreads();
       issue_kv_tile_async<true>(smem.kv[2], kv_ptr, block_table, block_tok_base + 96,
                                 k_start, seqlen_k, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-                                leaf_remap_base, leaf_p_start, leaf_remap_packed);
+                                leaf_remap_base, leaf_p_start, leaf_remap_packed, leaf_self_row);
       cp_async_commit();
 
       cp_async_wait<4>();
@@ -2801,7 +2820,7 @@ __global__ __launch_bounds__(128, 1) void gqa16_fa2_block128_pipe_multiq_kernel(
     int lrb = -1;
     int lps = 0;
     uint32_t lrp = 0u;
-    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 32 && sk >= actual_m) {
+    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= kGqa16TreeMaxM && sk >= actual_m) {
       const int base = 1 + q_idx * 3;
       const int seq_sub = leaf_flag_ptr[base];
       const int base_sub = leaf_flag_ptr[base + 1];
@@ -2929,13 +2948,13 @@ __global__ __launch_bounds__(128, 1) void gqa16_fa2_block128_pipe_multiq_kernel(
         issue_kv_tile_async<false>(smem.base.kv[ch], kv_ptr, block_table, block_tok_base + (ch << 5),
                                    k_start_arr[qb], seqlen_k_arr[qb], block_size, kv_head,
                                    stride_block, stride_slot, stride_kv_head, tid,
-                                   remap_base_arr[qb], p_start_arr[qb], remap_packed_arr[qb]);
+                                   remap_base_arr[qb], p_start_arr[qb], remap_packed_arr[qb], q_base + qb);
         cp_async_commit();
       }
       issue_kv_tile_async<true>(smem.base.kv[4], kv_ptr, block_table, block_tok_base,
                                 k_start_arr[qb], seqlen_k_arr[qb], block_size, kv_head,
                                 stride_block, stride_slot, stride_kv_head, tid,
-                                remap_base_arr[qb], p_start_arr[qb], remap_packed_arr[qb]);
+                                remap_base_arr[qb], p_start_arr[qb], remap_packed_arr[qb], q_base + qb);
       cp_async_commit();
 
       cp_async_wait<4>();
@@ -2951,7 +2970,7 @@ __global__ __launch_bounds__(128, 1) void gqa16_fa2_block128_pipe_multiq_kernel(
       issue_kv_tile_async<true>(smem.base.kv[0], kv_ptr, block_table, block_tok_base + 32,
                                 k_start_arr[qb], seqlen_k_arr[qb], block_size, kv_head,
                                 stride_block, stride_slot, stride_kv_head, tid,
-                                remap_base_arr[qb], p_start_arr[qb], remap_packed_arr[qb]);
+                                remap_base_arr[qb], p_start_arr[qb], remap_packed_arr[qb], q_base + qb);
       cp_async_commit();
 
       cp_async_wait<4>();
@@ -2967,7 +2986,7 @@ __global__ __launch_bounds__(128, 1) void gqa16_fa2_block128_pipe_multiq_kernel(
       issue_kv_tile_async<true>(smem.base.kv[1], kv_ptr, block_table, block_tok_base + 64,
                                 k_start_arr[qb], seqlen_k_arr[qb], block_size, kv_head,
                                 stride_block, stride_slot, stride_kv_head, tid,
-                                remap_base_arr[qb], p_start_arr[qb], remap_packed_arr[qb]);
+                                remap_base_arr[qb], p_start_arr[qb], remap_packed_arr[qb], q_base + qb);
       cp_async_commit();
 
       cp_async_wait<4>();
@@ -2983,7 +3002,7 @@ __global__ __launch_bounds__(128, 1) void gqa16_fa2_block128_pipe_multiq_kernel(
       issue_kv_tile_async<true>(smem.base.kv[2], kv_ptr, block_table, block_tok_base + 96,
                                 k_start_arr[qb], seqlen_k_arr[qb], block_size, kv_head,
                                 stride_block, stride_slot, stride_kv_head, tid,
-                                remap_base_arr[qb], p_start_arr[qb], remap_packed_arr[qb]);
+                                remap_base_arr[qb], p_start_arr[qb], remap_packed_arr[qb], q_base + qb);
       cp_async_commit();
 
       cp_async_wait<4>();
@@ -3247,6 +3266,7 @@ __device__ __forceinline__ void ldsm4_k_pair64_remap(
     int my_seqlen_k,
     int my_remap_base,
     uint32_t my_remap_packed,
+    int my_self_row,
     int sub_pair,
     int ks,
     int lane) {
@@ -3259,7 +3279,7 @@ __device__ __forceinline__ void ldsm4_k_pair64_remap(
   uint32_t addr;
   if (tok >= my_k_start && tok < my_seqlen_k) {
     if (my_remap_base >= 0 && tok >= my_remap_base) {
-      const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+      const int rr = gqa16_tree_remap_row(my_remap_packed, tok - my_remap_base, my_self_row);
       addr = smem_u32(&tree_tile[rr][c_log ^ (rr & 7)]);
     } else {
       addr = smem_u32(&tile[r][c_log ^ r_local]);
@@ -3282,6 +3302,7 @@ __device__ __forceinline__ void ldsm4_v_pair64_remap(
     int my_seqlen_k,
     int my_remap_base,
     uint32_t my_remap_packed,
+    int my_self_row,
     int dt_pair,
     int ks_local,
     int lane) {
@@ -3292,7 +3313,7 @@ __device__ __forceinline__ void ldsm4_v_pair64_remap(
   uint32_t addr;
   if (tok >= my_k_start && tok < my_seqlen_k) {
     if (my_remap_base >= 0 && tok >= my_remap_base) {
-      const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+      const int rr = gqa16_tree_remap_row(my_remap_packed, tok - my_remap_base, my_self_row);
       addr = smem_u32(&tree_tile[rr][dt ^ (rr & 7)]);
     } else {
       addr = smem_u32(&tile[r][dt ^ (r & 7)]);
@@ -3447,7 +3468,7 @@ __global__ __launch_bounds__(kWarps * 32, (kWarps == 4 ? 2 : 1)) void gqa16_veri
     int sk = raw_seqlen_k;
     int lrb = -1;
     uint32_t lrp = 0u;
-    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 32 && sk >= actual_m) {
+    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= kGqa16TreeRowsM32 && sk >= actual_m) {
       const int base = 1 + my_q_idx * 3;
       const int seq_sub = leaf_flag_ptr[base];
       const int base_sub = leaf_flag_ptr[base + 1];
@@ -3673,7 +3694,7 @@ __global__ __launch_bounds__(kWarps * 32, (kWarps == 4 ? 2 : 1)) void gqa16_veri
             uint32_t b_cur[4];
             ldsm4_k_pair64_remap(
                 b_cur, smem.kv[0], smem.tree_kv, smem.zero_row,
-                block_tok_base, my_k_start, my_seqlen_k, my_remap_base, my_remap_packed,
+                block_tok_base, my_k_start, my_seqlen_k, my_remap_base, my_remap_packed, my_q_idx,
                 sp, ks, lane);
             mma_m16n8k16_bf16_u2(q_frag[ks], b_cur[0], b_cur[1], s_frag[sp * 2 + 0]);
             mma_m16n8k16_bf16_u2(q_frag[ks], b_cur[2], b_cur[3], s_frag[sp * 2 + 1]);
@@ -3686,7 +3707,7 @@ __global__ __launch_bounds__(kWarps * 32, (kWarps == 4 ? 2 : 1)) void gqa16_veri
             uint32_t b_cur[4];
             ldsm4_k_pair64_remap(
                 b_cur, smem.kv[1], smem.tree_kv, smem.zero_row,
-                block_tok_base + 64, my_k_start, my_seqlen_k, my_remap_base, my_remap_packed,
+                block_tok_base + 64, my_k_start, my_seqlen_k, my_remap_base, my_remap_packed, my_q_idx,
                 sp, ks, lane);
             mma_m16n8k16_bf16_u2(q_frag[ks], b_cur[0], b_cur[1], s_frag[8 + sp * 2 + 0]);
             mma_m16n8k16_bf16_u2(q_frag[ks], b_cur[2], b_cur[3], s_frag[8 + sp * 2 + 1]);
@@ -3869,7 +3890,7 @@ __global__ __launch_bounds__(kWarps * 32, (kWarps == 4 ? 2 : 1)) void gqa16_veri
             uint32_t v_cur[4];
             ldsm4_v_pair64_remap(
                 v_cur, smem.kv[0], smem.tree_kv, smem.zero_row,
-                block_tok_base, my_k_start, my_seqlen_k, my_remap_base, my_remap_packed,
+                block_tok_base, my_k_start, my_seqlen_k, my_remap_base, my_remap_packed, my_q_idx,
                 dp, ks_local, lane);
             mma_m16n8k16_bf16_u2(p_cur, v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
             mma_m16n8k16_bf16_u2(p_cur, v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
@@ -3888,7 +3909,7 @@ __global__ __launch_bounds__(kWarps * 32, (kWarps == 4 ? 2 : 1)) void gqa16_veri
             uint32_t v_cur[4];
             ldsm4_v_pair64_remap(
                 v_cur, smem.kv[1], smem.tree_kv, smem.zero_row,
-                block_tok_base + 64, my_k_start, my_seqlen_k, my_remap_base, my_remap_packed,
+                block_tok_base + 64, my_k_start, my_seqlen_k, my_remap_base, my_remap_packed, my_q_idx,
                 dp, ks_local, lane);
             mma_m16n8k16_bf16_u2(p_cur, v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
             mma_m16n8k16_bf16_u2(p_cur, v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
@@ -3949,9 +3970,12 @@ __global__ __launch_bounds__(kWarps * 32, (kWarps == 4 ? 2 : 1)) void gqa16_veri
 //   - Hoisted per-lane SMEM row pointers + double-buffered ldmatrix in nb_has_remap.
 //   - Fast block_size == 64 (1 block_table load/chunk) & block_size == 16 paths.
 // ============================================================================
-struct __align__(128) VerifyV4Storage {
+// kTreeRows = 32 (M <= 32, historical layout, 66,688 B) or 48 (wide M = 48 verify only, 70,784 B).
+template <int kTreeRows>
+struct __align__(128) VerifyV4StorageT {
+  static_assert(kTreeRows % 16 == 0 && kTreeRows <= kGqa16TreeMaxM, "tree tile rows");
   uint4 kv[2][64][16];         // 32,768 B (aliases q_tiles[4][16][16] during Q preload)
-  uint4 tree_kv[32][16];       //  8,192 B (up to 32 tree K/V rows for remapped tail block)
+  uint4 tree_kv[kTreeRows][16];//  8,192 B @32 / 12,288 B @48 (all tree K/V rows for remapped tail block)
   uint4 zero_row[16];          //    256 B (constant +0.0 BF16 row for out-of-range lanes)
   float4 p_hi_f32[4][8][32];   // 16,384 B (w_sub=1 -> w_sub=0 exact ni=8..15 row_sum + p_hi)
   uint4 p_lo_bf16[4][4][32];   //  8,192 B (w_sub=0 -> w_sub=1 packed BF16x2 P[0..3])
@@ -3964,7 +3988,11 @@ struct __align__(128) VerifyV4Storage {
   int32_t remap_base_q[4];     //     16 B
   uint8_t active_q[4];         //      4 B
 };                             // 66,688 B (<= 99 KiB dynamic SMEM on sm_121a)
+using VerifyV4Storage = VerifyV4StorageT<kGqa16TreeRowsM32>;
+using VerifyV4StorageM48 = VerifyV4StorageT<kGqa16TreeMaxM>;
+static_assert(sizeof(VerifyV4Storage) == 66688, "M<=32 VerifyV4Storage layout must stay unchanged");
 static_assert(sizeof(VerifyV4Storage) <= 99328, "VerifyV4Storage must fit SM121 dynamic SMEM");
+static_assert(sizeof(VerifyV4StorageM48) <= 99328, "VerifyV4StorageM48 must fit SM121 dynamic SMEM");
 
 template <bool IsV>
 __device__ __forceinline__ void issue_kv64_v4(
@@ -4023,9 +4051,9 @@ __device__ __forceinline__ void issue_kv64_v4(
   }
 }
 
-template <bool IsV>
+template <bool IsV, int kTreeRows = kGqa16TreeRowsM32>
 __device__ __forceinline__ void issue_tree_kv_v4(
-    uint4 tree_tile[32][16],
+    uint4 tree_tile[kTreeRows][16],
     const __nv_bfloat16* __restrict__ kv_ptr,
     const int32_t* __restrict__ block_table,
     int cta_p_start,
@@ -4041,7 +4069,7 @@ __device__ __forceinline__ void issue_tree_kv_v4(
   const int c = tid & 15;
   const int c_phys = c ^ (r_sub & 7);
   #pragma unroll
-  for (int u = 0; u < 2; ++u) {
+  for (int u = 0; u < (kTreeRows >> 4); ++u) {  // 16 rows / step (256 threads): 2 steps @32, 3 steps @48
     const int r = (u << 4) + r_sub;
     if (r < actual_m) {
       const int tok = cta_p_start + r;
@@ -4071,7 +4099,7 @@ __device__ __forceinline__ void ldsm4_trans_raw_addr(uint32_t (&v)[4], uint32_t 
       : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]) : "r"(addr));
 }
 
-template <bool kPdl = false>
+template <bool kPdl = false, int kTreeRows = kGqa16TreeRowsM32>
 __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
     const __nv_bfloat16* __restrict__ kv_ptr,
@@ -4091,7 +4119,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_kernel(
     int64_t out_tok_stride,
     const int32_t* __restrict__ leaf_flag_ptr) {
   extern __shared__ __align__(128) uint8_t smem_raw[];
-  VerifyV4Storage& smem = *reinterpret_cast<VerifyV4Storage*>(smem_raw);
+  VerifyV4StorageT<kTreeRows>& smem = *reinterpret_cast<VerifyV4StorageT<kTreeRows>*>(smem_raw);
 
   const int kv_head    = blockIdx.y;
   const int tid        = threadIdx.x;
@@ -4129,7 +4157,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_kernel(
     int sk = raw_seqlen_k;
     int lrb = -1;
     uint32_t lrp = 0u;
-    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 32 && sk >= actual_m) {
+    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= kTreeRows && sk >= actual_m) {
       const int base = 1 + my_q_idx * 3;
       const int seq_sub = leaf_flag_ptr[base];
       const int base_sub = leaf_flag_ptr[base + 1];
@@ -4321,7 +4349,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_kernel(
           smem.kv[1], kv_ptr, block_table, block_tok_base + 64,
           cta_k_start, cta_seqlen_k, block_size, kv_head,
           stride_block, stride_slot, stride_kv_head, tid);
-      issue_tree_kv_v4<false>(
+      issue_tree_kv_v4<false, kTreeRows>(
           smem.tree_kv, kv_ptr, block_table, cta_p_start, actual_m,
           block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid);
       cp_async_commit();
@@ -4342,7 +4370,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_kernel(
           const int tok = chunk_base + r;
           if (tok >= my_k_start && tok < my_seqlen_k) {
             if (my_remap_base >= 0 && tok >= my_remap_base) {
-              const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+              const int rr = gqa16_tree_remap_row(my_remap_packed, tok - my_remap_base, my_q_idx);
               k_row_base[sp] = smem_u32(&smem.tree_kv[rr][0]);
               k_swz[sp] = rr & 7;
             } else {
@@ -4423,7 +4451,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_kernel(
           smem.kv[1], kv_ptr, block_table, block_tok_base + 64,
           cta_k_start, cta_seqlen_k, block_size, kv_head,
           stride_block, stride_slot, stride_kv_head, tid);
-      issue_tree_kv_v4<true>(
+      issue_tree_kv_v4<true, kTreeRows>(
           smem.tree_kv, kv_ptr, block_table, cta_p_start, actual_m,
           block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid);
       cp_async_commit();
@@ -4611,7 +4639,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_kernel(
             const int tok = block_tok_base + r;
             if (tok >= my_k_start && tok < my_seqlen_k) {
               if (my_remap_base >= 0 && tok >= my_remap_base) {
-                const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+                const int rr = gqa16_tree_remap_row(my_remap_packed, tok - my_remap_base, my_q_idx);
                 v_row_base[kl] = smem_u32(&smem.tree_kv[rr][0]);
                 v_swz[kl] = rr & 7;
               } else {
@@ -4675,7 +4703,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_kernel(
             const int tok = block_tok_base + 64 + r;
             if (tok >= my_k_start && tok < my_seqlen_k) {
               if (my_remap_base >= 0 && tok >= my_remap_base) {
-                const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+                const int rr = gqa16_tree_remap_row(my_remap_packed, tok - my_remap_base, my_q_idx);
                 v_row_base[kl] = smem_u32(&smem.tree_kv[rr][0]);
                 v_swz[kl] = rr & 7;
               } else {
@@ -4851,7 +4879,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_2q4w_kernel(
     int sk = raw_seqlen_k;
     int lrb = -1;
     uint32_t lrp = 0u;
-    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 32 && sk >= actual_m) {
+    if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= kGqa16TreeRowsM32 && sk >= actual_m) {
       const int base = 1 + my_q_idx * 3;
       const int seq_sub = leaf_flag_ptr[base];
       const int base_sub = leaf_flag_ptr[base + 1];
@@ -5065,7 +5093,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_2q4w_kernel(
           const int tok = half_base + r;
           if (tok >= my_k_start && tok < my_seqlen_k) {
             if (my_remap_base >= 0 && tok >= my_remap_base) {
-              const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+              const int rr = gqa16_tree_remap_row(my_remap_packed, tok - my_remap_base, my_q_idx);
               k_row_base[sp] = smem_u32(&smem.tree_kv[rr][0]);
               k_swz[sp] = rr & 7;
             } else {
@@ -5314,7 +5342,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_2q4w_kernel(
             const int tok = block_tok_base + r;
             if (tok >= my_k_start && tok < my_seqlen_k) {
               if (my_remap_base >= 0 && tok >= my_remap_base) {
-                const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+                const int rr = gqa16_tree_remap_row(my_remap_packed, tok - my_remap_base, my_q_idx);
                 v_row_base[kl] = smem_u32(&smem.tree_kv[rr][0]);
                 v_swz[kl] = rr & 7;
               } else {
@@ -5364,7 +5392,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_2q4w_kernel(
             const int tok = block_tok_base + 64 + r;
             if (tok >= my_k_start && tok < my_seqlen_k) {
               if (my_remap_base >= 0 && tok >= my_remap_base) {
-                const int rr = static_cast<int>((my_remap_packed >> ((tok - my_remap_base) * 5)) & 0x1Fu);
+                const int rr = gqa16_tree_remap_row(my_remap_packed, tok - my_remap_base, my_q_idx);
                 v_row_base[kl] = smem_u32(&smem.tree_kv[rr][0]);
                 v_swz[kl] = rr & 7;
               } else {
@@ -5498,6 +5526,17 @@ static void gqa16_multiq_set_attrs_once() {
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(sizeof(VerifyV4Storage)));
   cudaFuncSetAttribute(gqa16_verify_v4_kernel<true>,
+                       cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  // Wide M=48 tree verify instantiation (tree_kv[48][16]); M<=32 launches never use it.
+  cudaFuncSetAttribute(gqa16_verify_v4_kernel<false, kGqa16TreeMaxM>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(sizeof(VerifyV4StorageM48)));
+  cudaFuncSetAttribute(gqa16_verify_v4_kernel<false, kGqa16TreeMaxM>,
+                       cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(gqa16_verify_v4_kernel<true, kGqa16TreeMaxM>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(sizeof(VerifyV4StorageM48)));
+  cudaFuncSetAttribute(gqa16_verify_v4_kernel<true, kGqa16TreeMaxM>,
                        cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(gqa16_verify_v4_2q4w_kernel<false>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -6278,7 +6317,8 @@ __device__ __forceinline__ void issue_kv_tile_async_256(
     int tid,
     int leaf_remap_base = -1,
     int leaf_p_start = 0,
-    uint32_t leaf_remap_packed = 0u) {
+    uint32_t leaf_remap_packed = 0u,
+    int leaf_self_row = 0) {
   const bool is_bs64_aligned = (block_size == 64) && ((tok_base & 31) == 0);
   int phys_blk0 = 0, slot_base0 = 0;
   const bool half0_any = (tok_base < seqlen_k) && (tok_base + 16 > k_start);
@@ -6328,7 +6368,7 @@ __device__ __forceinline__ void issue_kv_tile_async_256(
       const int tok = tok_base + r;
       if (tok >= k_start && tok < seqlen_k) {
         const int tok_eff = (leaf_remap_base >= 0 && tok >= leaf_remap_base)
-            ? (leaf_p_start + static_cast<int>((leaf_remap_packed >> ((tok - leaf_remap_base) * 5)) & 0x1Fu))
+            ? (leaf_p_start + gqa16_tree_remap_row(leaf_remap_packed, tok - leaf_remap_base, leaf_self_row))
             : tok;
         const int lb = (block_size == 16) ? (tok_eff >> 4)
                      : ((block_size == 64) ? (tok_eff >> 6) : (tok_eff / block_size));
@@ -6584,7 +6624,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_wg2_kernel(
       int sk = raw_seqlen_k;
       int lrb = -1, lps = 0;
       uint32_t lrp = 0u;
-      if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= 32 && sk >= actual_m) {
+      if (leaf_flag_ptr != nullptr && lf0 < 0 && actual_m <= kGqa16TreeMaxM && sk >= actual_m) {
         const int base = 1 + q_idx * 3;
         const int seq_sub = leaf_flag_ptr[base];
         const int base_sub = leaf_flag_ptr[base + 1];
@@ -6719,13 +6759,13 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_wg2_kernel(
           issue_kv_tile_async_256<false>(
               smem.kv[ch], kv_ptr, block_table, block_tok_base + (ch << 5),
               r.ks, r.sk, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-              r.lrb, r.lps, r.lrp);
+              r.lrb, r.lps, r.lrp, q_base + qb);
           cp_async_commit();
         }
         issue_kv_tile_async_256<true>(
             smem.kv[4], kv_ptr, block_table, block_tok_base,
             r.ks, r.sk, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-            r.lrb, r.lps, r.lrp);
+            r.lrb, r.lps, r.lrp, q_base + qb);
         cp_async_commit();
 
         cp_async_wait<4>();
@@ -6742,7 +6782,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_wg2_kernel(
         issue_kv_tile_async_256<true>(
             smem.kv[0], kv_ptr, block_table, block_tok_base + 32,
             r.ks, r.sk, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-            r.lrb, r.lps, r.lrp);
+            r.lrb, r.lps, r.lrp, q_base + qb);
         cp_async_commit();
 
         cp_async_wait<4>();
@@ -6759,7 +6799,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_wg2_kernel(
         issue_kv_tile_async_256<true>(
             smem.kv[1], kv_ptr, block_table, block_tok_base + 64,
             r.ks, r.sk, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-            r.lrb, r.lps, r.lrp);
+            r.lrb, r.lps, r.lrp, q_base + qb);
         cp_async_commit();
 
         cp_async_wait<4>();
@@ -6776,7 +6816,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_wg2_kernel(
         issue_kv_tile_async_256<true>(
             smem.kv[2], kv_ptr, block_table, block_tok_base + 96,
             r.ks, r.sk, block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid,
-            r.lrb, r.lps, r.lrp);
+            r.lrb, r.lps, r.lrp, q_base + qb);
         cp_async_commit();
 
         cp_async_wait<4>();
@@ -7080,7 +7120,8 @@ extern "C" int muse_gqa16_verify_leaf(
     const void* leaf_flag_ptr,
     void* cuda_stream) {
   if (!q_ptr || !kv_ptr || !out_ptr || !seqused_k_ptr || !block_table_ptr || !cu_seqlens_q_ptr ||
-      max_q < 1 || max_q > 32 ||
+      max_q < 1 || max_q > kGqa16TreeMaxM ||
+      (max_q > 32 && (grid_splits != 1 || leaf_flag_ptr == nullptr)) ||  // M>32: tree verify only
       (grid_splits != 1 && grid_splits != 4 && grid_splits != 8 && grid_splits != 16) ||
       block_size < 16 || (block_size & 15) != 0) {
     return 1;
@@ -7126,6 +7167,26 @@ extern "C" int muse_gqa16_verify_leaf(
       const char* env = std::getenv("MUSE_GQA16_MULTIQ_PDL");
       return !env || !*env || std::strtol(env, nullptr, 10) != 0;
     }();
+    if (max_q > 32) {
+      // Wide M=48 tree verify: the only variant with a 48-row tree_kv tile is v4<kTreeRows=48>
+      // (70,784 B dynamic SMEM, 1 CTA/SM, grid z = 12). Every env-selected v3/v4.1/wg2/multiq/pipe mode is
+      // bypassed here (v3/v4.1 hold tree_kv[32]); M<=32 dispatch below is untouched.
+      muse_gqa16::gqa16_multiq_set_attrs_once();
+      const dim3 v4_grid(1u, 2u, static_cast<unsigned>((max_q + 3) / 4));
+      constexpr size_t v4_smem = sizeof(muse_gqa16::VerifyV4StorageM48);
+      if (multiq_pdl) {
+        return launch_pdl_blk(
+            muse_gqa16::gqa16_verify_v4_kernel<true, kGqa16TreeMaxM>, v4_grid, dim3(256u, 1u, 1u), v4_smem,
+            q, kv, out, sk, bt, block_size, window_left, scale_log2,
+            q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
+            cuq, q_tok_stride, out_tok_stride, leaf_flag);
+      }
+      muse_gqa16::gqa16_verify_v4_kernel<false, kGqa16TreeMaxM><<<v4_grid, dim3(256u, 1u, 1u), v4_smem, stream>>>(
+          q, kv, out, sk, bt, block_size, window_left, scale_log2,
+          q_head_stride, out_head_stride, stride_block, stride_slot, stride_kv_head,
+          cuq, q_tok_stride, out_tok_stride, leaf_flag);
+      return static_cast<int>(cudaGetLastError());
+    }
     const int v4_mode = (max_q >= 2) ? muse_gqa16::gqa16_verify_v4_mode() : 0;
     if (v4_mode == 2) {
       muse_gqa16::gqa16_multiq_set_attrs_once();

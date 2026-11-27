@@ -271,7 +271,7 @@ class Scheduler(SchedulerInterface):
                 # DFlash requires an extra lookahead slot since it uses in-fill-style
                 # decoding instead of standard next-token sampling, so it has a query
                 # for the last sampled token plus queries for each draft token.
-                # When native multi-leaf tree (M=12/16) or M=8 zero-clamp 1-leaf verify
+                # When native multi-leaf tree (M=12/16, wide 32/48) or M=8 zero-clamp 1-leaf verify
                 # is active at depth=6, reserve extra KV lookahead slots so rows 7..M-1
                 # are always backed in the request's block table.
                 _extra_leaf_slots = 0

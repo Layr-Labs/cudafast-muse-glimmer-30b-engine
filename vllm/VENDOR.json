@@ -306,6 +306,10 @@
     {
       "file": "vllm/model_executor/layers/quantization/modelopt.py, vllm/model_executor/models/qwen3_dflash.py, vllm/model_executor/models/muse_glimmer.py, vllm/model_executor/kernels/linear/nvfp4/decode_placement.py, vllm/v1/core/block_pool.py, vllm/v1/worker/gpu_worker.py, vllm/v1/worker/gpu/async_utils.py, vllm/v1/worker/gpu/cudagraph_utils.py, vllm/v1/worker/gpu/prefill_graph.py, vllm/v1/worker/gpu/model_runner.py, vllm/v1/worker/gpu/spec_decode/dflash/speculator.py, vllm/v1/worker/gpu/spec_decode/dflash/committed_token_ceiling.py, vllm/v1/worker/gpu/spec_decode/dflash/native_leaf.py",
       "why": "Antipodal 8D-256 1.000 bpw lut8 draft_head mode=100 default, linear single-stream Compound Step Graph with PreRecordedAsyncOutput, boot warmup_all_decode_graphs, persist<=16 L2 carve-out, bounded 24 GiB MemAvailable-aware buddyinfo sponge, dynamic OOV tail buffer registration, NO_LOGPROBS speculative tree guard, canonical BlockPool head with pre-launch 512-token PrefillGraph replay, and cudaGraphUpload pre-upload"
+    },
+    {
+      "file": "harness/vllm_resident/resident.py",
+      "why": "Muse r1b filler base by GPT-6 / Codex / Superharness on promoted b13db2d: retain the officially exercised 17.03 ms hard reply endpoint without A12; fast-path valid plain-int singleton token validation while retaining the general validation and refusal behavior. No target/drafter arithmetic or verification changes. Other proposed fillers (last-cycle draft elision and 512-row sandwich fusion) are already present in the promoted base."
     }
   ],
   "carried_from": {
