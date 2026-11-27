@@ -48,7 +48,15 @@ TREE_WIDE_M = (
     if (_TREE_WIDE_M_RAW in (20, 24, 32) and TREE_M > 0 and _TREE_WIDE_M_RAW > TREE_M)
     else 0
 )
-TREE_WIDE_GATE = os.environ.get("MUSE_NATIVE_TREE_WIDE_GATE", "cpc").strip().lower()
+# Default "always": every bs=1 depth-6 verify round runs the wide (M=32) tree. The "cpc" gate below reads
+# decoded_tokens from the scheduler's optimistic CPU mirror (num_computed_tokens - prefill_len), which under the
+# batch-queue async scheduler already counts the in-flight round's 7 scheduled tokens. At round k it therefore
+# compares (C[k-2] + 7) / (k-1) with TREE_WIDE_CPC instead of the true running rate C[k-1] / (k-1): a prompt at
+# ~3.0 committed tokens/round only goes wide after round ~17 and one at ~3.2 practically never does. Neither width
+# changes a committed token (both are captured as FULL graphs and admitted at boot; the target's greedy verify
+# decides every commit), and the M=32 tree is the M=16 tree plus 16 more best-first leaves, so it only trades about
+# 1 ms of verify time per round for a longer expected accept. "cpc" and "sm" stay selectable through the env var.
+TREE_WIDE_GATE = os.environ.get("MUSE_NATIVE_TREE_WIDE_GATE", "always").strip().lower()
 TREE_WIDE_CPC = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_CPC", "3.25"))
 TREE_WIDE_MIN_ROUNDS = int(os.environ.get("MUSE_NATIVE_TREE_WIDE_MIN_ROUNDS", "3"))
 TREE_WIDE_SM = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_SM", "2.0"))

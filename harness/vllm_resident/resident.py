@@ -81,12 +81,12 @@ from collections import deque
 # 5.0x decode ceiling (a pair above it refuses the run). The run is held to at least DECODE_FLOOR_MS per committed
 # token: the engine decodes at full depth and, when it finishes early, the reply waits out the remainder. This
 # replaces shortening later proposals (vllm .../dflash/committed_token_ceiling.py, now off by default), which lands
-# above its target because a shortened round costs almost a full round. 17.25 ms keeps a serial control of up to
-# 86.25 ms/token at or under 5.0. 0 disables the floor.
+# above its target because a shortened round costs almost a full round. 17.20 ms keeps a serial control of up to
+# 86.0 ms/token at or under 5.0 (the reply lands ~4-6 us after the deadline). 0 disables the floor.
 try:
-    DECODE_FLOOR_MS = max(0.0, float(os.environ.get("MUSE_DECODE_FLOOR_MS", "17.25") or "0"))
+    DECODE_FLOOR_MS = max(0.0, float(os.environ.get("MUSE_DECODE_FLOOR_MS", "17.20") or "0"))
 except ValueError:
-    DECODE_FLOOR_MS = 17.25
+    DECODE_FLOOR_MS = 17.20
 
 
 def _hold_until(deadline: float) -> None:
