@@ -1437,16 +1437,25 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   const size_t dsmem_xsmem = (size_t)((M > 8) ? kRansXsmemBytes : kRansXsmemBytesM8) + ((size_t)rg << 9) + (size_t)wpb * ((size_t)rg << 9);
   const bool x_aligned16 = ((reinterpret_cast<uintptr_t>(x) & 15u) == 0u) &&
                            (act_mode != 1 || ((reinterpret_cast<uintptr_t>(x_aux) & 15u) == 0u));
+  static const bool xsmem_fused_m8 = []() {
+    const char* env = std::getenv("MUSERANS_XSMEM_FUSED_M8");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  const bool can_xsmem_fused = par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 20 &&
+                               x_aligned16 && ((K >> 5) % 16 == 0) &&
+                               dsmem_xsmem <= (size_t)(RANS_MAX_SMEM - RANS_LUT_BYTES);
   bool use_xsmem_fused = false;
   if (M > 1) {
-    // M rows: stage M*K bytes of x if M<=8 and it fits with this wpb (for act_mode 0 or 1);
-    // for M>8 (or act_mode 2 where M*K doesn't fit), use chunked SMEM (kXsmem) or global __ldg.
-    if (act_mode != 2 && M <= 8 && rans_fits(M * K, wpb, 9, rg)) {
+    // Route M=2..8 fused mul_sigmoid (act_mode==1, e.g. 42x o_proj) to the pipelined kXsmem+ldmatrix
+    // path (kMaxThreads=576, #pragma unroll 4, 55.3 KiB SMEM) instead of the legacy full-M*K SMEM
+    // prologue (kMaxThreads=640, no unroll, 67.6 KiB SMEM).
+    if (act_mode == 1 && M <= 8 && xsmem_fused_m8 && can_xsmem_fused) {
+      pb.x_global = 1;
+      use_xsmem_fused = true;
+      dsmem = dsmem_xsmem;
+    } else if (act_mode != 2 && M <= 8 && rans_fits(M * K, wpb, 9, rg)) {
       dsmem = rans_dsmem(M * K, wpb, 9, rg);
     } else if (act_mode == 1 || act_mode == 2) {
-      const bool can_xsmem_fused = par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 20 &&
-                                   x_aligned16 && ((K >> 5) % 16 == 0) &&
-                                   dsmem_xsmem <= (size_t)(RANS_MAX_SMEM - RANS_LUT_BYTES);
       TORCH_CHECK(can_xsmem_fused, "rans fused multi-M requires par4/ns4/rg4/ilv9, 16B-aligned x, S%16==0, and smem fit");
       pb.x_global = 1;
       use_xsmem_fused = true;
