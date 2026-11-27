@@ -176,7 +176,8 @@ __device__ __forceinline__ void issue_kv64_flat(
     uint4 smem_tile[64][16],
     const __nv_bfloat16* __restrict__ flat_base,
     int tok_base,
-    int tid) {
+    int tid,
+    int n_u = 4) {
   const int r_in_16 = tid >> 4;
   const int c = tid & 15;
   const int c_phys = c ^ (r_in_16 & 7);
@@ -184,8 +185,10 @@ __device__ __forceinline__ void issue_kv64_flat(
       flat_base + static_cast<int64_t>(tok_base) * 128) + r_in_16 * 16 + c;
   #pragma unroll
   for (int u = 0; u < 4; ++u) {
-    const int r = (u << 4) + r_in_16;
-    cp_async_16(smem_u32(&smem_tile[r][c_phys]), src + u * 256);
+    if (u < n_u) {
+      const int r = (u << 4) + r_in_16;
+      cp_async_16(smem_u32(&smem_tile[r][c_phys]), src + u * 256);
+    }
   }
 }
 
@@ -459,33 +462,6 @@ __device__ __forceinline__ int map_m_grp_128(int g) {
   return base + idx;
 }
 
-template <bool kTrim>
-__device__ __forceinline__ void prefill_qk_half(
-    const uint32_t (&q)[8][4], const uint4 (&k)[64][16],
-    float (*scores)[4], int lane, int pairs) {
-  uint32_t b_cur[4], b_nxt[4];
-  ldsm4_k_pair64(b_cur, k, 0, 0, lane);
-  #pragma unroll
-  for (int ks = 0; ks < 8; ++ks) {
-    #pragma unroll
-    for (int sp = 0; sp < 4; ++sp) {
-      if (!kTrim || sp < pairs) {
-        const bool next_pair = sp + 1 < (kTrim ? pairs : 4);
-        const int next_ks = ks + (next_pair ? 0 : 1);
-        if (next_ks < 8) {
-          ldsm4_k_pair64(b_nxt, k, next_pair ? sp + 1 : 0, next_ks, lane);
-        }
-        mma_m16n8k16_bf16(q[ks], b_cur[0], b_cur[1], scores[sp * 2]);
-        mma_m16n8k16_bf16(q[ks], b_cur[2], b_cur[3], scores[sp * 2 + 1]);
-        if (next_ks < 8) {
-          b_cur[0] = b_nxt[0]; b_cur[1] = b_nxt[1];
-          b_cur[2] = b_nxt[2]; b_cur[3] = b_nxt[3];
-        }
-      }
-    }
-  }
-}
-
 template <int Mode, bool UseRope, bool CacheFP32, bool kPdl, bool kDiscardL2>
 __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     const __nv_bfloat16* __restrict__ qkv,
@@ -514,66 +490,142 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   const int q_tok = (m_grp << 3) + warp_id;
   const int nb_max = (m_grp >> 4) + 1;           // 1..4
   const bool half_only = ((m_grp & 15) < 8);     // true when diagonal upper 64 KV tokens are 100% masked
+  // CTA-uniform causal diagonal tile bounds:
+  // Every warp in CTA m_grp lies in the same 8-col softmax chunk ((m_grp & 15)) and 16-row K/V tile (diag_u).
+  const int diag_ni_end = (m_grp & 15) + 1;      // 1..16 valid 8-col softmax chunks on diagonal block
+  const int diag_u = ((m_grp & 7) >> 1) + 1;     // 1..4 valid 16-row K/V tiles in the active diagonal 64-tok half
 
   // ---------------------------------------------------------------------------
-  // 1. 4-head Interleaved Fused Q-RMSNorm + qscale + NEOX RoPE directly from raw qkv!
-  //    Loads 4 heads per batch via L1-cached 16B even-lane loads + 4x ILP norm/RoPE -> swizzled SMEM.
+  // 1. Lane-Local Register Q-RMSNorm + qscale + NEOX RoPE directly into q_frag[8][4]!
+  //    Each 4-lane sub-warp (group_id=0..7, tid_in_grp=0..3) owns exactly 2 heads (g, g+8),
+  //    preserving exact 0-ULP delta=16,8,4,2,1 reduction order, 0 RoPE shuffles (d & d+64 in same lane),
+  //    8x fewer div/rsqrt SFU ops, 0 q_tiles SMEM writes, 0 ldmatrix.x4 reads, and 0 kv_smem aliasing.
   //    Runs BEFORE griddepcontrol.wait so Wave-1 CTAs hide kv_only completely!
   // ---------------------------------------------------------------------------
   uint32_t q_frag[8][4];
   {
-    uint4 (*q_tiles)[16][16] = reinterpret_cast<uint4 (*)[16][16]>(kv_smem);
-    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
-    if constexpr (UseRope) {
-      load_rope_cs<true, CacheFP32>(__ldg(positions + q_tok), cache_rows, cos_sin_cache, lane,
-                                    c0, c1, c2, c3, s0, s1, s2, s3);
-    }
     const __nv_bfloat16* const q_row =
         qkv + static_cast<int64_t>(q_tok) * 4608 + static_cast<int64_t>(kv_head * 16) * 128;
-    const int c_log = lane >> 1;
-    const int c_half = lane & 1;
-    const int even_lane = lane & ~1;
+    int64_t pos_q = 0;
+    if constexpr (UseRope) {
+      pos_q = __ldg(positions + q_tok);
+      if (pos_q < 0) pos_q += cache_rows;
+    }
+    const int sub_base = lane & ~3;
+    const int src_lo = sub_base | (tid_in_grp >> 1);
+    const int src_hi = src_lo | 2;
+    const bool take_hi = (tid_in_grp & 1) != 0;
 
-    // Issue ALL 16 heads in 4 batches of 4 heads (16B coalesced loads via even-lane uint4 + shfl)
     #pragma unroll
-    for (int hb = 0; hb < 16; hb += 4) {
-      uint2 raw[4];
+    for (int hh = 0; hh < 2; ++hh) {
+      const __nv_bfloat16* const h_ptr = q_row + (group_id + (hh << 3)) * 128;
+      uint2 raw[8];
+      float s_lo[8];
       #pragma unroll
-      for (int h = 0; h < 4; ++h) {
-        uint4 v = make_uint4(0u, 0u, 0u, 0u);
-        if ((lane & 1) == 0) {
-          v = *reinterpret_cast<const uint4*>(q_row + (hb + h) * 128 + even_lane * 4);
+      for (int ks = 0; ks < 8; ++ks) {
+        raw[ks] = *reinterpret_cast<const uint2*>(h_ptr + (ks << 4) + (tid_in_grp << 2));
+        const __nv_bfloat16* vb = reinterpret_cast<const __nv_bfloat16*>(&raw[ks]);
+        const float x0 = __bfloat162float(vb[0]);
+        const float x1 = __bfloat162float(vb[1]);
+        const float x2 = __bfloat162float(vb[2]);
+        const float x3 = __bfloat162float(vb[3]);
+        float v = __fmaf_rn(x0, x0, 0.0f);
+        v = __fmaf_rn(x1, x1, v);
+        v = __fmaf_rn(x2, x2, v);
+        s_lo[ks] = __fmaf_rn(x3, x3, v);
+      }
+      // Exact 0-ULP delta=16,8,4,2,1 reduction tree matching q_norm_rope_4heads.
+      const float t1_0 = __fadd_rn(s_lo[0], s_lo[4]);
+      const float t1_1 = __fadd_rn(s_lo[1], s_lo[5]);
+      const float t1_2 = __fadd_rn(s_lo[2], s_lo[6]);
+      const float t1_3 = __fadd_rn(s_lo[3], s_lo[7]);
+      const float t2_0 = __fadd_rn(t1_0, t1_2);
+      const float t2_1 = __fadd_rn(t1_1, t1_3);
+      float ss = __fadd_rn(t2_0, t2_1);
+      ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 2));
+      ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 1));
+      float mv, r;
+      asm("div.full.f32 %0, %1, 0f43000000;" : "=f"(mv) : "f"(ss));
+      asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(mv + eps));
+
+      #pragma unroll
+      for (int ks = 0; ks < 4; ++ks) {
+        const __nv_bfloat16* v0 = reinterpret_cast<const __nv_bfloat16*>(&raw[ks]);
+        const __nv_bfloat16* v1 = reinterpret_cast<const __nv_bfloat16*>(&raw[ks + 4]);
+        const float y0_0 = __fmul_rn(__fmul_rn(__bfloat162float(v0[0]), r), qscale);
+        const float y0_1 = __fmul_rn(__fmul_rn(__bfloat162float(v0[1]), r), qscale);
+        const float y0_2 = __fmul_rn(__fmul_rn(__bfloat162float(v0[2]), r), qscale);
+        const float y0_3 = __fmul_rn(__fmul_rn(__bfloat162float(v0[3]), r), qscale);
+        const float y1_0 = __fmul_rn(__fmul_rn(__bfloat162float(v1[0]), r), qscale);
+        const float y1_1 = __fmul_rn(__fmul_rn(__bfloat162float(v1[1]), r), qscale);
+        const float y1_2 = __fmul_rn(__fmul_rn(__bfloat162float(v1[2]), r), qscale);
+        const float y1_3 = __fmul_rn(__fmul_rn(__bfloat162float(v1[3]), r), qscale);
+        float o0_0 = y0_0, o0_1 = y0_1, o0_2 = y0_2, o0_3 = y0_3;
+        float o1_0 = y1_0, o1_1 = y1_1, o1_2 = y1_2, o1_3 = y1_3;
+        if constexpr (UseRope) {
+          const int d_lo = (ks << 4) + (tid_in_grp << 2);
+          float c0, c1, c2, c3, s0, s1, s2, s3;
+          if constexpr (CacheFP32) {
+            const float* crow = reinterpret_cast<const float*>(cos_sin_cache) + pos_q * 128;
+            const float4 cv = __ldg(reinterpret_cast<const float4*>(crow + d_lo));
+            const float4 sv = __ldg(reinterpret_cast<const float4*>(crow + 64 + d_lo));
+            c0 = cv.x; c1 = cv.y; c2 = cv.z; c3 = cv.w;
+            s0 = sv.x; s1 = sv.y; s2 = sv.z; s3 = sv.w;
+          } else {
+            const __nv_bfloat16* crow = reinterpret_cast<const __nv_bfloat16*>(cos_sin_cache) + pos_q * 128;
+            const uint2 cv = __ldg(reinterpret_cast<const uint2*>(crow + d_lo));
+            const uint2 sv = __ldg(reinterpret_cast<const uint2*>(crow + 64 + d_lo));
+            const __nv_bfloat16* cb = reinterpret_cast<const __nv_bfloat16*>(&cv);
+            const __nv_bfloat16* sb = reinterpret_cast<const __nv_bfloat16*>(&sv);
+            c0 = __bfloat162float(cb[0]); c1 = __bfloat162float(cb[1]);
+            c2 = __bfloat162float(cb[2]); c3 = __bfloat162float(cb[3]);
+            s0 = __bfloat162float(sb[0]); s1 = __bfloat162float(sb[1]);
+            s2 = __bfloat162float(sb[2]); s3 = __bfloat162float(sb[3]);
+          }
+          o0_0 = __fmaf_rn(y0_0, c0, -__fmul_rn(y1_0, s0));
+          o0_1 = __fmaf_rn(y0_1, c1, -__fmul_rn(y1_1, s1));
+          o0_2 = __fmaf_rn(y0_2, c2, -__fmul_rn(y1_2, s2));
+          o0_3 = __fmaf_rn(y0_3, c3, -__fmul_rn(y1_3, s3));
+          o1_0 = __fmaf_rn(y1_0, c0, __fmul_rn(y0_0, s0));
+          o1_1 = __fmaf_rn(y1_1, c1, __fmul_rn(y0_1, s1));
+          o1_2 = __fmaf_rn(y1_2, c2, __fmul_rn(y0_2, s2));
+          o1_3 = __fmaf_rn(y1_3, c3, __fmul_rn(y0_3, s3));
         }
-        const uint32_t hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
-        const uint32_t hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
-        raw[h] = ((lane & 1) == 0) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
-      }
-      uint2 ov[4];
-      q_norm_rope_4heads<UseRope>(raw, ov, eps, qscale, lane, c0, c1, c2, c3, s0, s1, s2, s3);
-      #pragma unroll
-      for (int h = 0; h < 4; ++h) {
-        const int h_loc = hb + h;
-        const int c_phys = c_log ^ (h_loc & 7);
-        reinterpret_cast<uint2*>(&q_tiles[warp_id][h_loc][c_phys])[c_half] = ov[h];
+        const __nv_bfloat162 b00 = __floats2bfloat162_rn(o0_0, o0_1);
+        const __nv_bfloat162 b01 = __floats2bfloat162_rn(o0_2, o0_3);
+        const __nv_bfloat162 b10 = __floats2bfloat162_rn(o1_0, o1_1);
+        const __nv_bfloat162 b11 = __floats2bfloat162_rn(o1_2, o1_3);
+        const uint32_t u0_lo = *reinterpret_cast<const uint32_t*>(&b00);
+        const uint32_t u0_hi = *reinterpret_cast<const uint32_t*>(&b01);
+        const uint32_t u1_lo = *reinterpret_cast<const uint32_t*>(&b10);
+        const uint32_t u1_hi = *reinterpret_cast<const uint32_t*>(&b11);
+        const uint32_t f00_lo = __shfl_sync(0xffffffffu, u0_lo, src_lo);
+        const uint32_t f00_hi = __shfl_sync(0xffffffffu, u0_hi, src_lo);
+        const uint32_t f02_lo = __shfl_sync(0xffffffffu, u0_lo, src_hi);
+        const uint32_t f02_hi = __shfl_sync(0xffffffffu, u0_hi, src_hi);
+        const uint32_t f10_lo = __shfl_sync(0xffffffffu, u1_lo, src_lo);
+        const uint32_t f10_hi = __shfl_sync(0xffffffffu, u1_hi, src_lo);
+        const uint32_t f12_lo = __shfl_sync(0xffffffffu, u1_lo, src_hi);
+        const uint32_t f12_hi = __shfl_sync(0xffffffffu, u1_hi, src_hi);
+        q_frag[ks][hh]         = take_hi ? f00_hi : f00_lo;
+        q_frag[ks][2 + hh]     = take_hi ? f02_hi : f02_lo;
+        q_frag[ks + 4][hh]     = take_hi ? f10_hi : f10_lo;
+        q_frag[ks + 4][2 + hh] = take_hi ? f12_hi : f12_lo;
       }
     }
-    __syncwarp();
     if constexpr (kDiscardL2) {
+      __syncwarp();
       discard_l2_128(reinterpret_cast<const char*>(q_row) + (lane << 7));
-    }
-    #pragma unroll
-    for (int ks = 0; ks < 8; ++ks) {
-      ldsm4_swizzled(q_frag[ks], q_tiles[warp_id], ks, lane);
     }
   }
 
   if constexpr (kPdl) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
-  __syncthreads();
 
   // ---------------------------------------------------------------------------
   // 2. Single Unified 2-Buffer 32 KiB SMEM Causal Attention Loop (strict 0-ULP FA2 order)
+  //    Compact single-loop CTA-uniform diagonal tile pruning (NO duplicated MMA loops!).
   // ---------------------------------------------------------------------------
   const __nv_bfloat16* const k_flat = kv_flat + static_cast<int64_t>(kv_head) * (2 * 512 * 128);
   const __nv_bfloat16* const v_flat = k_flat + (512 * 128);
@@ -586,16 +638,16 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   float row_max0 = -INFINITY, row_max1 = -INFINITY;
   float row_sum0 = 0.0f, row_sum1 = 0.0f;
 
-  issue_kv64_flat(kv_smem[0], k_flat, (nb_max - 1) << 7, tid);
+  issue_kv64_flat(kv_smem[0], k_flat, (nb_max - 1) << 7, tid, half_only ? diag_u : 4);
   cp_async_commit();
 
   for (int nb = nb_max - 1; nb >= 0; --nb) {
     const int block_tok_base = nb << 7;
     const bool is_diag = (nb == nb_max - 1);
     const bool skip_hi = is_diag && half_only;
-    const int diag_pairs = ((m_grp & 15) >> 1) + 1;
-    const int lo_pairs = is_diag && skip_hi ? diag_pairs : 4;
-    const int hi_pairs = is_diag ? diag_pairs - 4 : 4;
+    const int ni_lim = is_diag ? diag_ni_end : 16;
+    const int sp0_lim = skip_hi ? diag_u : 4;
+    const int sp1_lim = is_diag ? diag_u : 4;
 
     float s_frag[16][4];
     #pragma unroll
@@ -604,19 +656,28 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     }
 
     if (!skip_hi) {
-      issue_kv64_flat(kv_smem[1], k_flat, block_tok_base + 64, tid);
+      issue_kv64_flat(kv_smem[1], k_flat, block_tok_base + 64, tid, sp1_lim);
       cp_async_commit();
       cp_async_wait<1>();
     } else {
-      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base, tid);
+      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base, tid, diag_u);
       cp_async_commit();
       cp_async_wait<1>();
     }
     __syncthreads();
-    if (lo_pairs < 4) {
-      prefill_qk_half<true>(q_frag, kv_smem[0], s_frag, lane, lo_pairs);
-    } else {
-      prefill_qk_half<false>(q_frag, kv_smem[0], s_frag, lane, 4);
+    #pragma unroll
+    for (int sp = 0; sp < 4; ++sp) {
+      if (sp < sp0_lim) {
+        uint32_t b_cur[4], b_nxt[4];
+        ldsm4_k_pair64(b_cur, kv_smem[0], sp, 0, lane);
+        #pragma unroll
+        for (int ks = 0; ks < 8; ++ks) {
+          if (ks + 1 < 8) ldsm4_k_pair64(b_nxt, kv_smem[0], sp, ks + 1, lane);
+          mma_m16n8k16_bf16(q_frag[ks], b_cur[0], b_cur[1], s_frag[sp * 2 + 0]);
+          mma_m16n8k16_bf16(q_frag[ks], b_cur[2], b_cur[3], s_frag[sp * 2 + 1]);
+          b_cur[0] = b_nxt[0]; b_cur[1] = b_nxt[1]; b_cur[2] = b_nxt[2]; b_cur[3] = b_nxt[3];
+        }
+      }
     }
     __syncthreads();
 
@@ -625,31 +686,38 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
       cp_async_commit();
       cp_async_wait<1>();
       __syncthreads();
-      if (hi_pairs < 4) {
-        prefill_qk_half<true>(q_frag, kv_smem[1], s_frag + 8, lane, hi_pairs);
-      } else {
-        prefill_qk_half<false>(q_frag, kv_smem[1], s_frag + 8, lane, 4);
+      #pragma unroll
+      for (int sp = 0; sp < 4; ++sp) {
+        if (sp < sp1_lim) {
+          uint32_t b_cur[4], b_nxt[4];
+          ldsm4_k_pair64(b_cur, kv_smem[1], sp, 0, lane);
+          #pragma unroll
+          for (int ks = 0; ks < 8; ++ks) {
+            if (ks + 1 < 8) ldsm4_k_pair64(b_nxt, kv_smem[1], sp, ks + 1, lane);
+            mma_m16n8k16_bf16(q_frag[ks], b_cur[0], b_cur[1], s_frag[8 + sp * 2 + 0]);
+            mma_m16n8k16_bf16(q_frag[ks], b_cur[2], b_cur[3], s_frag[8 + sp * 2 + 1]);
+            b_cur[0] = b_nxt[0]; b_cur[1] = b_nxt[1]; b_cur[2] = b_nxt[2]; b_cur[3] = b_nxt[3];
+          }
+        }
       }
       __syncthreads();
-      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base + 64, tid);
+      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base + 64, tid, sp1_lim);
       cp_async_commit();
     }
 
     float m0 = -INFINITY, m1 = -INFINITY;
     #pragma unroll
     for (int ni = 0; ni < 16; ++ni) {
-      if (is_diag && ni >= 2 * diag_pairs) {
-        s_frag[ni][0] = s_frag[ni][1] = s_frag[ni][2] = s_frag[ni][3] = -INFINITY;
-        continue;
+      if (ni < ni_lim) {
+        if (is_diag && ni == ni_lim - 1) {
+          const int col0 = block_tok_base + (ni << 3) + (tid_in_grp << 1);
+          const int col1 = col0 + 1;
+          if (col0 > q_tok) { s_frag[ni][0] = -INFINITY; s_frag[ni][2] = -INFINITY; }
+          if (col1 > q_tok) { s_frag[ni][1] = -INFINITY; s_frag[ni][3] = -INFINITY; }
+        }
+        m0 = max_ftz_f32(m0, max_ftz_f32(s_frag[ni][0], s_frag[ni][1]));
+        m1 = max_ftz_f32(m1, max_ftz_f32(s_frag[ni][2], s_frag[ni][3]));
       }
-      if (is_diag) {
-        const int col0 = block_tok_base + (ni << 3) + (tid_in_grp << 1);
-        const int col1 = col0 + 1;
-        if (col0 > q_tok) { s_frag[ni][0] = -INFINITY; s_frag[ni][2] = -INFINITY; }
-        if (col1 > q_tok) { s_frag[ni][1] = -INFINITY; s_frag[ni][3] = -INFINITY; }
-      }
-      m0 = max_ftz_f32(m0, max_ftz_f32(s_frag[ni][0], s_frag[ni][1]));
-      m1 = max_ftz_f32(m1, max_ftz_f32(s_frag[ni][2], s_frag[ni][3]));
     }
     m0 = max_ftz_f32(m0, __shfl_xor_sync(0xffffffffu, m0, 2));
     m0 = max_ftz_f32(m0, __shfl_xor_sync(0xffffffffu, m0, 1));
@@ -679,39 +747,37 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
 
     const float max_sc0 = (row_max0 == -INFINITY) ? 0.0f : mul_ftz_f32(scale_log2, row_max0);
     const float max_sc1 = (row_max1 == -INFINITY) ? 0.0f : mul_ftz_f32(scale_log2, row_max1);
-    const bool skip_masked_exp = is_diag && scale_log2 >= 0x1p-126f &&
-        scale_log2 < INFINITY && fabsf(max_sc0) < INFINITY && fabsf(max_sc1) < INFINITY;
 
     uint32_t p_frag[8][4];
     #pragma unroll
     for (int ni = 0; ni < 16; ++ni) {
-      if (skip_masked_exp && ni >= 2 * diag_pairs) {
-        p_frag[ni >> 1][(ni & 1) << 1] = 0;
-        p_frag[ni >> 1][((ni & 1) << 1) + 1] = 0;
-        continue;
-      }
-      const float p0 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][0], scale_log2), max_sc0));
-      const float p1 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][1], scale_log2), max_sc0));
-      const float p2 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][2], scale_log2), max_sc1));
-      const float p3 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][3], scale_log2), max_sc1));
-      if (ni == 0) {
-        if (is_diag) {
-          row_sum0 = add_ftz_f32(p0, p1);
-          row_sum1 = add_ftz_f32(p2, p3);
-        } else {
-          row_sum0 = add_ftz_f32(fma_rn_ftz_f32(row_sum0, sc0, p0), p1);
-          row_sum1 = add_ftz_f32(fma_rn_ftz_f32(row_sum1, sc1, p2), p3);
-        }
-      } else {
-        row_sum0 = add_ftz_f32(add_ftz_f32(row_sum0, p0), p1);
-        row_sum1 = add_ftz_f32(add_ftz_f32(row_sum1, p2), p3);
-      }
-      const __nv_bfloat162 pb0 = __floats2bfloat162_rn(p0, p1);
-      const __nv_bfloat162 pb1 = __floats2bfloat162_rn(p2, p3);
       const int kp = ni >> 1;
       const int hi = (ni & 1) << 1;
-      p_frag[kp][hi + 0] = *reinterpret_cast<const uint32_t*>(&pb0);
-      p_frag[kp][hi + 1] = *reinterpret_cast<const uint32_t*>(&pb1);
+      if (ni < ni_lim) {
+        const float p0 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][0], scale_log2), max_sc0));
+        const float p1 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][1], scale_log2), max_sc0));
+        const float p2 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][2], scale_log2), max_sc1));
+        const float p3 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][3], scale_log2), max_sc1));
+        if (ni == 0) {
+          if (is_diag) {
+            row_sum0 = add_ftz_f32(p0, p1);
+            row_sum1 = add_ftz_f32(p2, p3);
+          } else {
+            row_sum0 = add_ftz_f32(fma_rn_ftz_f32(row_sum0, sc0, p0), p1);
+            row_sum1 = add_ftz_f32(fma_rn_ftz_f32(row_sum1, sc1, p2), p3);
+          }
+        } else {
+          row_sum0 = add_ftz_f32(add_ftz_f32(row_sum0, p0), p1);
+          row_sum1 = add_ftz_f32(add_ftz_f32(row_sum1, p2), p3);
+        }
+        const __nv_bfloat162 pb0 = __floats2bfloat162_rn(p0, p1);
+        const __nv_bfloat162 pb1 = __floats2bfloat162_rn(p2, p3);
+        p_frag[kp][hi + 0] = *reinterpret_cast<const uint32_t*>(&pb0);
+        p_frag[kp][hi + 1] = *reinterpret_cast<const uint32_t*>(&pb1);
+      } else if (ni == ni_lim && (ni & 1) != 0) {
+        p_frag[kp][2] = 0u;
+        p_frag[kp][3] = 0u;
+      }
     }
 
     if (skip_hi) {
@@ -727,18 +793,18 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         }
       }
       __syncthreads();
-      uint32_t v_cur[4], v_nxt[4];
-      ldsm4_v_pair64(v_cur, kv_smem[1], 0, 0, lane);
       #pragma unroll
       for (int ks_local = 0; ks_local < 4; ++ks_local) {
-        #pragma unroll
-        for (int dp = 0; dp < 8; ++dp) {
-          const int n_dp = (dp + 1) & 7;
-          const int n_ks = ks_local + (dp == 7 ? 1 : 0);
-          if (n_ks < 4) ldsm4_v_pair64(v_nxt, kv_smem[1], n_dp, n_ks, lane);
-          mma_m16n8k16_bf16(p_frag[ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
-          mma_m16n8k16_bf16(p_frag[ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
-          v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
+        if (ks_local < diag_u) {
+          uint32_t v_cur[4], v_nxt[4];
+          ldsm4_v_pair64(v_cur, kv_smem[1], 0, ks_local, lane);
+          #pragma unroll
+          for (int dp = 0; dp < 8; ++dp) {
+            if (dp + 1 < 8) ldsm4_v_pair64(v_nxt, kv_smem[1], dp + 1, ks_local, lane);
+            mma_m16n8k16_bf16(p_frag[ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
+            mma_m16n8k16_bf16(p_frag[ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
+            v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
+          }
         }
       }
       __syncthreads();
@@ -774,16 +840,14 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         }
       }
       __syncthreads();
-      {
-        uint32_t v_cur[4], v_nxt[4];
-        ldsm4_v_pair64(v_cur, kv_smem[1], 0, 0, lane);
-        #pragma unroll
-        for (int ks_local = 0; ks_local < 4; ++ks_local) {
+      #pragma unroll
+      for (int ks_local = 0; ks_local < 4; ++ks_local) {
+        if (ks_local < sp1_lim) {
+          uint32_t v_cur[4], v_nxt[4];
+          ldsm4_v_pair64(v_cur, kv_smem[1], 0, ks_local, lane);
           #pragma unroll
           for (int dp = 0; dp < 8; ++dp) {
-            const int n_dp = (dp + 1) & 7;
-            const int n_ks = ks_local + (dp == 7 ? 1 : 0);
-            if (n_ks < 4) ldsm4_v_pair64(v_nxt, kv_smem[1], n_dp, n_ks, lane);
+            if (dp + 1 < 8) ldsm4_v_pair64(v_nxt, kv_smem[1], dp + 1, ks_local, lane);
             mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
             mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
             v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
