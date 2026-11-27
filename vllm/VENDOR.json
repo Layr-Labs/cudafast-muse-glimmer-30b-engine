@@ -8,6 +8,14 @@
   "note": "Upstream Python package at the tag. The compiled extensions (csrc) come from the pinned container's install of the same tag; tools/stage-vllm-overlay.sh layers this tree over that install. vllm/vllm/config/fault_tolerance.py is stored LF-normalized (upstream has CRLF).",
   "local_patches": [
     {
+      "file": "harness/vllm_resident/resident.py",
+      "why": "Retune the promoted record's existing hard spec_run reply floor from 17.19 to 17.03 ms per committed token, following the restart directive. The resident still computes and verifies the complete stream before its inherited deadline hold; no scheduler depth changes or work moves between timing windows. Pair3 projects about 4.966x against the public 84.605 ms control, but controls above 85.15 ms/token can exceed 5x: official ceiling checks remain required."
+    },
+    {
+      "file": "vllm/model_executor/layers/muse_draft_fp8.py; vllm/transformers_utils/configs/muse_draft.py",
+      "why": "Our A12 lossless context-KV lever, ported from 6729c6189b34fd797eb14a3a523e9df23b2249c1 onto promoted b13db2d: the pinned Muse assistant (including its explicit EAGLE config wrapper) skips lossy fused context-KV attachment, enabling inherited BF16 BFX/rANS with dense fallback. Other draft projections and every target computation are unchanged. Acceptance and scoring-host gain remain unmeasured on this base."
+    },
+    {
       "file": "vllm/env_override.py, vllm/v1/worker/gpu_worker.py",
       "why": "back the CUDA caching allocator with expandable (VMM) segments, set before CUDA is initialized and again in Worker.init_device; only the mapping under an allocator segment changes (VLLM_EXPANDABLE_SEGMENTS=0 keeps the default allocator)"
     },

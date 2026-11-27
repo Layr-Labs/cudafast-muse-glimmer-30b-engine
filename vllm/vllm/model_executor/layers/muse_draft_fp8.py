@@ -8,7 +8,8 @@ drafter once; at verify width (M <= 8 rows) these GEMMs are weight-bandwidth bou
 
 At load, each bias-free BF16 drafter linear (qkv/o/gate_up/down of the 5 layers, `fc`, and the fused
 context-KV projection `fkv`) gets a quantized weight-only copy (`MUSE_DRAFT_QUANT=int3|nvfp4|hybrid|fp8|bf16`).
-Context-path weights (`fc`, `fkv`) retain their BF16 weights for M > 8 (512-row prompt prefill).
+Muse context-KV (`fkv`) keeps the inherited lossless BF16 path at every row count.
+Other context-path weights retain their BF16 weights for long prompt prefill.
 Query-only weights (`qkv_proj`, `o_proj`, `gate_up_proj`, `down_proj`) release their unused BF16
 storage after admission (`MUSE_DRAFT_FREE_BF16=1`, freeing ~4.67 GB UMA before DRAM placement).
 DRAM placement uses a 48 MiB read-only L2 eviction buffer (`evict_buf.sum()`), largest-first group
@@ -24,6 +25,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.logger import init_logger
+from vllm.transformers_utils.configs.muse_draft import is_muse_glimmer_assistant
 
 logger = init_logger(__name__)
 
@@ -2173,7 +2175,16 @@ def attach_drafter(model: torch.nn.Module) -> int:
         if leaf in _NAMES:
             lm = _resolve_layer_mode(name, leaf, mode, sens_fp8, sens_nvfp4, sens_int4)
             n += attach_linear(mod, mode=lm, name=name, leaf=leaf)
-    if getattr(model, "_fused_kv_weight", None) is not None and getattr(model, "_fused_kv_bias", None) is None:
+    # Context keys/values persist across rounds. Preserve the pinned assistant's
+    # BF16 values through the existing lossless BFX/rANS or dense fallback.
+    keep_context_bf16 = is_muse_glimmer_assistant(getattr(model, "config", None))
+    if keep_context_bf16:
+        logger.info("Muse DFlash: fused context KV keeps lossless BF16 path")
+    if (
+        not keep_context_bf16
+        and getattr(model, "_fused_kv_weight", None) is not None
+        and getattr(model, "_fused_kv_bias", None) is None
+    ):
         fkv_mode = _resolve_layer_mode("fkv", "fkv", mode, sens_fp8, sens_nvfp4, sens_int4)
         n += attach_tensor(model, "fkv", model._fused_kv_weight, mode=fkv_mode)
     pack_s = time.perf_counter() - t0
