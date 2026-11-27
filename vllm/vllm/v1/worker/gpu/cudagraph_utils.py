@@ -488,7 +488,7 @@ class CudaGraphManager:
                             )
                         cap_stream = torch.cuda.graph.default_capture_stream
                         if (
-                            1 <= desc.num_tokens <= 16
+                            1 <= desc.num_tokens <= 32
                             and persist_arena is not None
                             and persist_arena_bytes > 0
                         ):
