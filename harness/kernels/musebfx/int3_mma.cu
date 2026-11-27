@@ -155,6 +155,24 @@ __device__ __forceinline__ void int3_init_lut(uint32_t* __restrict__ lut64, int 
   }
 }
 
+template <bool kNf3>
+__device__ __forceinline__ void int3_init_lut_reg(uint32_t& lut_lo, uint32_t& lut_hi, int lane) {
+  lut_lo = int3_bf16x2_u32(
+      int3_deq_f32<kNf3>(static_cast<uint32_t>(lane & 7)),
+      int3_deq_f32<kNf3>(static_cast<uint32_t>((lane >> 3) & 7)));
+  const int hi = lane + 32;
+  lut_hi = int3_bf16x2_u32(
+      int3_deq_f32<kNf3>(static_cast<uint32_t>(hi & 7)),
+      int3_deq_f32<kNf3>(static_cast<uint32_t>((hi >> 3) & 7)));
+}
+
+__device__ __forceinline__ uint32_t int3_lut64_shfl(uint32_t lut_lo, uint32_t lut_hi, uint32_t idx) {
+  const int src = static_cast<int>(idx & 31u);
+  const uint32_t lo = __shfl_sync(0xffffffffu, lut_lo, src);
+  const uint32_t hi = __shfl_sync(0xffffffffu, lut_hi, src);
+  return ((idx & 32u) != 0u) ? hi : lo;
+}
+
 __device__ __forceinline__ void int3_load_tile_words(
     const uint8_t* __restrict__ wt, int lane, int g,
     uint32_t& w01, uint32_t& w23, __nv_bfloat162& sc2, __nv_bfloat162& zr2) {
@@ -176,6 +194,21 @@ __device__ __forceinline__ void int3_deq4_k16(
   const int sh = (s & 1) * 12;
   const uint32_t q01 = lut64[(word >> sh) & 63u];
   const uint32_t q23 = lut64[(word >> (sh + 6)) & 63u];
+  const __nv_bfloat162 v01 = __hfma2(*reinterpret_cast<const __nv_bfloat162*>(&q01), sc2, zr2);
+  const __nv_bfloat162 v23 = __hfma2(*reinterpret_cast<const __nv_bfloat162*>(&q23), sc2, zr2);
+  b0 = *reinterpret_cast<const uint32_t*>(&v01);
+  b1 = *reinterpret_cast<const uint32_t*>(&v23);
+}
+
+__device__ __forceinline__ void int3_deq4_k16_reg(
+    uint32_t lut_lo, uint32_t lut_hi,
+    uint32_t w01, uint32_t w23, int s,
+    __nv_bfloat162 sc2, __nv_bfloat162 zr2,
+    uint32_t& b0, uint32_t& b1) {
+  const uint32_t word = (s < 2) ? w01 : w23;
+  const int sh = (s & 1) * 12;
+  const uint32_t q01 = int3_lut64_shfl(lut_lo, lut_hi, (word >> sh) & 63u);
+  const uint32_t q23 = int3_lut64_shfl(lut_lo, lut_hi, (word >> (sh + 6)) & 63u);
   const __nv_bfloat162 v01 = __hfma2(*reinterpret_cast<const __nv_bfloat162*>(&q01), sc2, zr2);
   const __nv_bfloat162 v23 = __hfma2(*reinterpret_cast<const __nv_bfloat162*>(&q23), sc2, zr2);
   b0 = *reinterpret_cast<const uint32_t*>(&v01);
@@ -470,7 +503,8 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 6) int3_mma_gemm_kernel(
   const int t = lane & 3;
   const int num_kg = K >> 6;
 
-  int3_init_lut<kNf3>(smem.lut64, tid);
+  uint32_t lut_lo, lut_hi;
+  int3_init_lut_reg<kNf3>(lut_lo, lut_hi, lane);
 
   const int cta_n = blockIdx.x;
   const int sk_idx = kSplitK ? blockIdx.y : 0;
@@ -566,8 +600,8 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 6) int3_mma_gemm_kernel(
         int3_ldmatrix_x2(a0, a2, addr);
       }
       uint32_t b0, b1, c0, c1;
-      int3_deq4_k16(smem.lut64, w01_0, w23_0, s, sc0, zr0, b0, b1);
-      int3_deq4_k16(smem.lut64, w01_1, w23_1, s, sc1, zr1, c0, c1);
+      int3_deq4_k16_reg(lut_lo, lut_hi, w01_0, w23_0, s, sc0, zr0, b0, b1);
+      int3_deq4_k16_reg(lut_lo, lut_hi, w01_1, w23_1, s, sc1, zr1, c0, c1);
       if constexpr (kM16) {
         int3_mma_m16n8k16_full(d0_0, d1_0, d2_0, d3_0, a0, a1, a2, a3, b0, b1);
         int3_mma_m16n8k16_full(d0_1, d1_1, d2_1, d3_1, a0, a1, a2, a3, c0, c1);
@@ -626,7 +660,8 @@ __global__ void __launch_bounds__(128, 6) int3_mma_gemm_n32_kernel(
   const int num_kg = K >> 6;
   const int num_cta = N >> 5;
 
-  int3_init_lut<kNf3>(smem.lut64, tid);
+  uint32_t lut_lo, lut_hi;
+  int3_init_lut_reg<kNf3>(lut_lo, lut_hi, lane);
 
   const int cta_n = blockIdx.x;
   const int sk_idx = kSplitK ? blockIdx.y : 0;
@@ -755,7 +790,7 @@ __global__ void __launch_bounds__(128, 6) int3_mma_gemm_n32_kernel(
         int3_ldmatrix_x2(a0, a2, addr);
       }
       uint32_t b0, b1;
-      int3_deq4_k16(smem.lut64, w01_0, w23_0, s, sc0, zr0, b0, b1);
+      int3_deq4_k16_reg(lut_lo, lut_hi, w01_0, w23_0, s, sc0, zr0, b0, b1);
       if constexpr (kM16) {
         int3_mma_m16n8k16_full(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1);
       } else {
@@ -833,7 +868,8 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_gemm_swiglu_kernel
   const int num_cta = I >> 5;
   const int cta_n = blockIdx.x;
 
-  int3_init_lut<kNf3>(smem.lut64, tid);
+  uint32_t lut_lo, lut_hi;
+  int3_init_lut_reg<kNf3>(lut_lo, lut_hi, lane);
 
   const int wave = cta_n / swg_ilv;
   const int in_wave = cta_n - wave * swg_ilv;
@@ -955,8 +991,8 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_gemm_swiglu_kernel
         int3_ldmatrix_x2(a0, a2, addr);
       }
       uint32_t b0, b1, c0, c1;
-      int3_deq4_k16(smem.lut64, w01_g, w23_g, s, scg, zrg, b0, b1);
-      int3_deq4_k16(smem.lut64, w01_u, w23_u, s, scu, zru, c0, c1);
+      int3_deq4_k16_reg(lut_lo, lut_hi, w01_g, w23_g, s, scg, zrg, b0, b1);
+      int3_deq4_k16_reg(lut_lo, lut_hi, w01_u, w23_u, s, scu, zru, c0, c1);
       if constexpr (kM16) {
         int3_mma_m16n8k16_full(d0_g, d1_g, d2_g, d3_g, a0, a1, a2, a3, b0, b1);
         int3_mma_m16n8k16_full(d0_u, d1_u, d2_u, d3_u, a0, a1, a2, a3, c0, c1);
@@ -1001,7 +1037,8 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 6) int3_mma_streamk_kernel(
   const int num_kg = K >> 6;
   const int total_iters = n_blocks * num_kg;
 
-  int3_init_lut<kNf3>(smem.lut64, tid);
+  uint32_t lut_lo, lut_hi;
+  int3_init_lut_reg<kNf3>(lut_lo, lut_hi, lane);
 
   const int cta_id = blockIdx.x;
   const int iter_start = static_cast<int>((static_cast<int64_t>(cta_id) * total_iters) / grid_ctas);
@@ -1093,8 +1130,8 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 6) int3_mma_streamk_kernel(
         int3_ldmatrix_x2(a0, a2, addr);
       }
       uint32_t b0, b1, c0, c1;
-      int3_deq4_k16(smem.lut64, w01_0, w23_0, s, sc0, zr0, b0, b1);
-      int3_deq4_k16(smem.lut64, w01_1, w23_1, s, sc1, zr1, c0, c1);
+      int3_deq4_k16_reg(lut_lo, lut_hi, w01_0, w23_0, s, sc0, zr0, b0, b1);
+      int3_deq4_k16_reg(lut_lo, lut_hi, w01_1, w23_1, s, sc1, zr1, c0, c1);
       if constexpr (kM16) {
         int3_mma_m16n8k16_full(d0_0, d1_0, d2_0, d3_0, a0, a1, a2, a3, b0, b1);
         int3_mma_m16n8k16_full(d0_1, d1_1, d2_1, d3_1, a0, a1, a2, a3, c0, c1);

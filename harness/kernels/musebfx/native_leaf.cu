@@ -2545,7 +2545,8 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
     int32_t* __restrict__ tail_count,
     int32_t* __restrict__ tail_seen,
     int max_tail,
-    int oov_preadmit_mode) {
+    int oov_preadmit_mode,
+    int eb_raw_chain) {
   const int lane = threadIdx.x;
   __shared__ int32_t s_raw_u[32];
   __shared__ uint32_t s_exact_mask;
@@ -2713,7 +2714,8 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
 
     if (req_acc_state != nullptr) {
       const int32_t r = req_acc_state[0] + 1;
-      const int32_t c = req_acc_state[1] + ns;
+      const int32_t c_add = (eb_raw_chain != 0) ? raw_ns : ns;
+      const int32_t c = req_acc_state[1] + c_add;
       req_acc_state[0] = r;
       req_acc_state[1] = c;
       req_acc_state[2] =
@@ -3695,6 +3697,10 @@ void native_leaf_commit_tree(
     t_seen_ptr = tail_seen.value().data_ptr<int32_t>();
     max_tail = static_cast<int>(tail_ids.value().numel());
   }
+  static const int eb_raw_chain_env = []() -> int {
+    const char* env = std::getenv("MUSE_EB_RAW_CHAIN");
+    return (!env || !*env || std::strtol(env, nullptr, 10) != 0) ? 1 : 0;
+  }();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   native_leaf_commit_tree_kernel<<<1, 32, 0, st>>>(
       leaf_flag.data_ptr<int32_t>(),
@@ -3731,7 +3737,8 @@ void native_leaf_commit_tree(
       t_cnt_ptr,
       t_seen_ptr,
       max_tail,
-      oov_preadmit_env);
+      oov_preadmit_env,
+      eb_raw_chain_env);
 }
 
 void native_leaf_setup(

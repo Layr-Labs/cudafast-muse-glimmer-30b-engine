@@ -925,6 +925,18 @@ __global__ void __launch_bounds__(128, 3) draft_head_fast_kernel(
   }
   __syncthreads();
 
+  // Warp-register codebook for kMode == 0 (64 entries across 2 regs/lane) and kMode == 1
+  // (32 entries across 1 reg/lane): replaces bank-conflicted smem.lut LDS loads with 0-conflict
+  // register shuffles while preserving bitwise-identical BF16x2 weights.
+  uint32_t lut_reg_lo = 0u;
+  uint32_t lut_reg_hi = 0u;
+  if constexpr (kMode < 2) {
+    lut_reg_lo = smem.lut[lane];
+  }
+  if constexpr (kMode == 0) {
+    lut_reg_hi = smem.lut[32 + lane];
+  }
+
   uint64_t my_top[4] = {0ull, 0ull, 0ull, 0ull};
   float d0_0 = 0.0f, d1_0 = 0.0f, d2_0 = 0.0f, d3_0 = 0.0f;
   float d0_1 = 0.0f, d1_1 = 0.0f, d2_1 = 0.0f, d3_1 = 0.0f;
@@ -1009,31 +1021,66 @@ __global__ void __launch_bounds__(128, 3) draft_head_fast_kernel(
           w2_1 >> 20,
       };
 
+      auto lut64_shfl = [&](uint32_t idx) -> uint32_t {
+        const int src = static_cast<int>(idx & 31u);
+        const uint32_t lo = __shfl_sync(0xffffffffu, lut_reg_lo, src);
+        const uint32_t hi = __shfl_sync(0xffffffffu, lut_reg_hi, src);
+        return ((idx & 32u) != 0u) ? hi : lo;
+      };
+
+      uint32_t a0_cur, a2_cur;
+      {
+        const int pcol8_0 = ldm_col_off ^ ldm_row;
+        const uint32_t addr0 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.pipe.a[st][0][ldm_row][pcol8_0 * 8]));
+        dh_ldmatrix_x2(a0_cur, a2_cur, addr0);
+      }
+      uint32_t q01_0_cur = lut64_shfl(c0_arr[0] & 63u);
+      uint32_t q23_0_cur = lut64_shfl(c0_arr[0] >> 6);
+      uint32_t q01_1_cur = lut64_shfl(c1_arr[0] & 63u);
+      uint32_t q23_1_cur = lut64_shfl(c1_arr[0] >> 6);
+      __nv_bfloat162 b01_0_cur = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q01_0_cur), sc0);
+      __nv_bfloat162 b23_0_cur = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q23_0_cur), sc0);
+      __nv_bfloat162 b01_1_cur = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q01_1_cur), sc1);
+      __nv_bfloat162 b23_1_cur = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q23_1_cur), sc1);
+
 #pragma unroll
       for (int s = 0; s < 8; ++s) {
-        const int h = s >> 2;
-        const int s4 = s & 3;
-        const int pcol8 = (2 * s4 + ldm_col_off) ^ ldm_row;
-        const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.pipe.a[st][h][ldm_row][pcol8 * 8]));
-        uint32_t a0, a2;
-        dh_ldmatrix_x2(a0, a2, addr);
+        uint32_t a0_nxt = 0u, a2_nxt = 0u;
+        __nv_bfloat162 b01_0_nxt = b01_0_cur, b23_0_nxt = b23_0_cur, b01_1_nxt = b01_1_cur, b23_1_nxt = b23_1_cur;
+        if (s + 1 < 8) {
+          const int ns = s + 1;
+          const int nh = ns >> 2;
+          const int ns4 = ns & 3;
+          const int npcol8 = (2 * ns4 + ldm_col_off) ^ ldm_row;
+          const uint32_t naddr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.pipe.a[st][nh][ldm_row][npcol8 * 8]));
+          dh_ldmatrix_x2(a0_nxt, a2_nxt, naddr);
 
-        const uint32_t q01_0 = smem.lut[c0_arr[s] & 63u];
-        const uint32_t q23_0 = smem.lut[c0_arr[s] >> 6];
-        const __nv_bfloat162 b01_0 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q01_0), sc0);
-        const __nv_bfloat162 b23_0 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q23_0), sc0);
+          const uint32_t q01_0 = lut64_shfl(c0_arr[ns] & 63u);
+          const uint32_t q23_0 = lut64_shfl(c0_arr[ns] >> 6);
+          b01_0_nxt = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q01_0), sc0);
+          b23_0_nxt = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q23_0), sc0);
 
-        const uint32_t q01_1 = smem.lut[c1_arr[s] & 63u];
-        const uint32_t q23_1 = smem.lut[c1_arr[s] >> 6];
-        const __nv_bfloat162 b01_1 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q01_1), sc1);
-        const __nv_bfloat162 b23_1 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q23_1), sc1);
+          const uint32_t q01_1 = lut64_shfl(c1_arr[ns] & 63u);
+          const uint32_t q23_1 = lut64_shfl(c1_arr[ns] >> 6);
+          b01_1_nxt = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q01_1), sc1);
+          b23_1_nxt = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q23_1), sc1);
+        }
 
-        dh_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0, a2,
-                        *reinterpret_cast<const uint32_t*>(&b01_0),
-                        *reinterpret_cast<const uint32_t*>(&b23_0));
-        dh_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0, a2,
-                        *reinterpret_cast<const uint32_t*>(&b01_1),
-                        *reinterpret_cast<const uint32_t*>(&b23_1));
+        dh_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0_cur, a2_cur,
+                        *reinterpret_cast<const uint32_t*>(&b01_0_cur),
+                        *reinterpret_cast<const uint32_t*>(&b23_0_cur));
+        dh_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0_cur, a2_cur,
+                        *reinterpret_cast<const uint32_t*>(&b01_1_cur),
+                        *reinterpret_cast<const uint32_t*>(&b23_1_cur));
+
+        if (s + 1 < 8) {
+          a0_cur = a0_nxt;
+          a2_cur = a2_nxt;
+          b01_0_cur = b01_0_nxt;
+          b23_0_cur = b23_0_nxt;
+          b01_1_cur = b01_1_nxt;
+          b23_1_cur = b23_1_nxt;
+        }
       }
     } else if constexpr (kMode == 1) {
       const uint32_t w0_0 = reinterpret_cast<const uint32_t*>(wt0 + 0)[lane];
@@ -1067,31 +1114,59 @@ __global__ void __launch_bounds__(128, 3) draft_head_fast_kernel(
           (w2_1 >> 6) & 0x3FFu,
       };
 
+      uint32_t a0_cur, a2_cur;
+      {
+        const int pcol8_0 = ldm_col_off ^ ldm_row;
+        const uint32_t addr0 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.pipe.a[st][0][ldm_row][pcol8_0 * 8]));
+        dh_ldmatrix_x2(a0_cur, a2_cur, addr0);
+      }
+      uint32_t q01_0_cur = __shfl_sync(0xffffffffu, lut_reg_lo, static_cast<int>(c0_arr[0] & 31u));
+      uint32_t q23_0_cur = __shfl_sync(0xffffffffu, lut_reg_lo, static_cast<int>(c0_arr[0] >> 5));
+      uint32_t q01_1_cur = __shfl_sync(0xffffffffu, lut_reg_lo, static_cast<int>(c1_arr[0] & 31u));
+      uint32_t q23_1_cur = __shfl_sync(0xffffffffu, lut_reg_lo, static_cast<int>(c1_arr[0] >> 5));
+      __nv_bfloat162 b01_0_cur = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q01_0_cur), sc0);
+      __nv_bfloat162 b23_0_cur = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q23_0_cur), sc0);
+      __nv_bfloat162 b01_1_cur = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q01_1_cur), sc1);
+      __nv_bfloat162 b23_1_cur = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q23_1_cur), sc1);
+
 #pragma unroll
       for (int s = 0; s < 8; ++s) {
-        const int h = s >> 2;
-        const int s4 = s & 3;
-        const int pcol8 = (2 * s4 + ldm_col_off) ^ ldm_row;
-        const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.pipe.a[st][h][ldm_row][pcol8 * 8]));
-        uint32_t a0, a2;
-        dh_ldmatrix_x2(a0, a2, addr);
+        uint32_t a0_nxt = 0u, a2_nxt = 0u;
+        __nv_bfloat162 b01_0_nxt = b01_0_cur, b23_0_nxt = b23_0_cur, b01_1_nxt = b01_1_cur, b23_1_nxt = b23_1_cur;
+        if (s + 1 < 8) {
+          const int ns = s + 1;
+          const int nh = ns >> 2;
+          const int ns4 = ns & 3;
+          const int npcol8 = (2 * ns4 + ldm_col_off) ^ ldm_row;
+          const uint32_t naddr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.pipe.a[st][nh][ldm_row][npcol8 * 8]));
+          dh_ldmatrix_x2(a0_nxt, a2_nxt, naddr);
 
-        const uint32_t q01_0 = smem.lut[c0_arr[s] & 31u];
-        const uint32_t q23_0 = smem.lut[c0_arr[s] >> 5];
-        const __nv_bfloat162 b01_0 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q01_0), sc0);
-        const __nv_bfloat162 b23_0 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q23_0), sc0);
+          const uint32_t q01_0 = __shfl_sync(0xffffffffu, lut_reg_lo, static_cast<int>(c0_arr[ns] & 31u));
+          const uint32_t q23_0 = __shfl_sync(0xffffffffu, lut_reg_lo, static_cast<int>(c0_arr[ns] >> 5));
+          b01_0_nxt = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q01_0), sc0);
+          b23_0_nxt = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q23_0), sc0);
 
-        const uint32_t q01_1 = smem.lut[c1_arr[s] & 31u];
-        const uint32_t q23_1 = smem.lut[c1_arr[s] >> 5];
-        const __nv_bfloat162 b01_1 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q01_1), sc1);
-        const __nv_bfloat162 b23_1 = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q23_1), sc1);
+          const uint32_t q01_1 = __shfl_sync(0xffffffffu, lut_reg_lo, static_cast<int>(c1_arr[ns] & 31u));
+          const uint32_t q23_1 = __shfl_sync(0xffffffffu, lut_reg_lo, static_cast<int>(c1_arr[ns] >> 5));
+          b01_1_nxt = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q01_1), sc1);
+          b23_1_nxt = __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&q23_1), sc1);
+        }
 
-        dh_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0, a2,
-                        *reinterpret_cast<const uint32_t*>(&b01_0),
-                        *reinterpret_cast<const uint32_t*>(&b23_0));
-        dh_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0, a2,
-                        *reinterpret_cast<const uint32_t*>(&b01_1),
-                        *reinterpret_cast<const uint32_t*>(&b23_1));
+        dh_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0_cur, a2_cur,
+                        *reinterpret_cast<const uint32_t*>(&b01_0_cur),
+                        *reinterpret_cast<const uint32_t*>(&b23_0_cur));
+        dh_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0_cur, a2_cur,
+                        *reinterpret_cast<const uint32_t*>(&b01_1_cur),
+                        *reinterpret_cast<const uint32_t*>(&b23_1_cur));
+
+        if (s + 1 < 8) {
+          a0_cur = a0_nxt;
+          a2_cur = a2_nxt;
+          b01_0_cur = b01_0_nxt;
+          b23_0_cur = b23_0_nxt;
+          b01_1_cur = b01_1_nxt;
+          b23_1_cur = b23_1_nxt;
+        }
       }
     } else if constexpr (kMode == 2) {
       const uint32_t w0_0 = reinterpret_cast<const uint32_t*>(wt0 + 0)[lane];
