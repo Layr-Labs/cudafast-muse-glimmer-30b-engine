@@ -25,3 +25,4 @@ These commands test each side on its own. `test_adapter_e2e.py` then runs the
 real `cuda-engine` against the real resident (fake backend) at depths 0 to 6,
 and requires the committed stream to equal the serial stream.
 <!-- build 1 -->
+<!-- re-measurement of 8b966d84 (5) -->
