@@ -1662,8 +1662,15 @@ __device__ __forceinline__ void dhf_mma_m16n8k16(
       : "r"(a0), "r"(0u), "r"(a2), "r"(0u), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ void dhf_cp_async16_cg(uint32_t sd, const void* gs) {
-  asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;" ::"r"(sd), "l"(gs));
+__device__ __forceinline__ uint64_t dhf_pol_evict_first() {
+  uint64_t pol;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  return pol;
+}
+
+__device__ __forceinline__ void dhf_cp_async16_cg_ef(uint32_t sd, const void* gs, uint64_t pol) {
+  asm volatile("cp.async.cg.shared.global.L2::256B.L2::cache_hint [%0], [%1], 16, %2;"
+               ::"r"(sd), "l"(gs), "l"(pol));
 }
 
 __device__ __forceinline__ void dhf_cp_async16_ca_z(uint32_t sd, const void* gs, int src_bytes) {
@@ -2406,11 +2413,13 @@ __global__ void __launch_bounds__(128, 4) dhf_stage1_kernel(
            (static_cast<size_t>(wave_base) * num_kg + static_cast<size_t>(kg) * w_size + slot) * kStepWBytes;
   };
 
+  const uint64_t w_pol = dhf_pol_evict_first();
+
   auto issue_w_only = [&](int w_iter, int kg, int st) {
     if (w_loader) {
       const uint8_t* w_src = w_ptr_for(w_iter, kg);
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][w_u4_idx * 16]));
-      dhf_cp_async16_cg(sd, w_src + w_u4_idx * 16);
+      dhf_cp_async16_cg_ef(sd, w_src + w_u4_idx * 16, w_pol);
     }
     asm volatile("cp.async.commit_group;\n" ::: "memory");
   };
@@ -2429,7 +2438,7 @@ __global__ void __launch_bounds__(128, 4) dhf_stage1_kernel(
     if (w_loader) {
       const uint8_t* w_src = w_ptr_for(w_iter, kg);
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][w_u4_idx * 16]));
-      dhf_cp_async16_cg(sd, w_src + w_u4_idx * 16);
+      dhf_cp_async16_cg_ef(sd, w_src + w_u4_idx * 16, w_pol);
     } else if (tid < 64) {
       const uint32_t sd = static_cast<uint32_t>(
           __cvta_generic_to_shared(&smem.a[st][a_row][a_swiz8 * 8]));
@@ -2510,8 +2519,8 @@ __global__ void __launch_bounds__(128, 4) dhf_stage1_kernel(
     if constexpr (kMode == 150) {
       const uint32_t* u0 = reinterpret_cast<const uint32_t*>(wt0);
       const uint32_t* u1 = reinterpret_cast<const uint32_t*>(wt1);
-      const uint32_t c24_0 = __funnelshift_r(u0[w_idx150], need_hi150 ? u0[w_idx150 + 1] : 0u, b_off150) & 0x00FFFFFFu;
-      const uint32_t c24_1 = __funnelshift_r(u1[w_idx150], need_hi150 ? u1[w_idx150 + 1] : 0u, b_off150) & 0x00FFFFFFu;
+      const uint32_t c24_0 = __funnelshift_r(u0[w_idx150], need_hi150 ? u0[w_idx150 + 1] : 0u, b_off150);
+      const uint32_t c24_1 = __funnelshift_r(u1[w_idx150], need_hi150 ? u1[w_idx150 + 1] : 0u, b_off150);
 #pragma unroll
       for (int s = 0; s < 4; ++s) {
         uint32_t a0, a2;
@@ -2668,9 +2677,13 @@ __global__ void dhf_select_topk_kernel(
   __shared__ uint32_t s_keys[kWaveCTAs * kCtaTopK];
   __shared__ int32_t s_ids[kWaveCTAs * kCtaTopK];
   __shared__ uint32_t s_hist[256];
+  __shared__ uint32_t s_wsum[8];
+  __shared__ uint32_t s_wbase[8];
   __shared__ uint32_t s_prefix;
   __shared__ uint32_t s_rem_k;
   __shared__ uint32_t s_out_cnt;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
 
   if ((pdl_mode & 1) != 0) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -2713,20 +2726,40 @@ __global__ void dhf_select_topk_kernel(
     }
     __syncthreads();
 
-    if (tid == 0) {
-      uint32_t acc = 0u;
-      const uint32_t need = s_rem_k;
-      uint32_t chosen = 0u;
-      for (int b = 255; b >= 0; --b) {
-        const uint32_t c = s_hist[b];
-        if (acc + c >= need) {
-          chosen = static_cast<uint32_t>(b);
-          s_rem_k = need - acc;
-          break;
-        }
-        acc += c;
+    // Parallel 8-warp reverse prefix sum over s_hist[255..0] (bit-identical to serial scan).
+    const uint32_t need = s_rem_k;
+    const uint32_t c = s_hist[255 - tid];
+    uint32_t winc = c;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+      const uint32_t up = __shfl_up_sync(0xffffffffu, winc, off);
+      if (lane >= off) winc += up;
+    }
+    if (lane == 31) s_wsum[warp] = winc;
+    __syncthreads();
+    if (warp == 0) {
+      uint32_t wb = (lane < 8) ? s_wsum[lane] : 0u;
+      const uint32_t my_w = wb;
+#pragma unroll
+      for (int off = 1; off < 8; off <<= 1) {
+        const uint32_t up = __shfl_up_sync(0xffffffffu, wb, off);
+        if (lane >= off) wb += up;
       }
-      s_prefix = pref | (chosen << shift);
+      if (lane < 8) s_wbase[lane] = wb - my_w;
+    }
+    __syncthreads();
+    const uint32_t inc = winc + s_wbase[warp];
+    const uint32_t exc = inc - c;
+    if (need == 0u) {
+      if (tid == 0) {
+        s_prefix = pref | (255u << shift);
+        s_rem_k = 0u;
+      }
+    } else if (exc < need && inc >= need) {
+      s_prefix = pref | (static_cast<uint32_t>(255 - tid) << shift);
+      s_rem_k = need - exc;
+    } else if (tid == 255 && inc < need) {
+      s_prefix = pref;
     }
     __syncthreads();
   }
