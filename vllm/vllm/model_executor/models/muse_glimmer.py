@@ -1496,7 +1496,7 @@ def _muse_qk_norm_rope_impl(
                                 )
                                 if has_single_seq and 2 <= qkv.shape[0] <= 32:
                                     _mq_pdl_ok = qkv.shape[0] <= 16 or (
-                                        os.environ.get("MUSE_GQA16_MULTIQ_PDL", "0").strip()
+                                        os.environ.get("MUSE_GQA16_MULTIQ_PDL", "1").strip()
                                         not in ("0", "", "false", "no")
                                     )
                                     pdl_prod = (
@@ -2627,7 +2627,7 @@ class MuseGlimmerForCausalLM(
         want_bf16_stack = os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_PREFILL", "1") != "0"
         want_bf16_stack_decode = (
             want_bf16_stack
-            and os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_DECODE", "0") != "0"
+            and os.environ.get("VLLM_MUSE_GLIMMER_BF16_STACKED_DECODE", "1") != "0"
             and os.environ.get("MUSE_BF16_RANS_M", "1") != "0"
         )
         bf16_stack_cnt = 0
@@ -2789,7 +2789,24 @@ class MuseGlimmerForCausalLM(
                                                 ok_dual = False
                                                 break
                                     if ok_dual:
-                                        for cm in (12, 16):
+                                        for cm0 in (2, 3, 5):
+                                            x0 = (
+                                                torch.randn((cm0, 6656), generator=g2, device=qw.device)
+                                                * 1.5
+                                            ).to(torch.bfloat16)
+                                            rq = torch.nn.functional.linear(x0, w_cat[:4608])
+                                            rg = torch.nn.functional.linear(x0, w_cat[4608:])
+                                            gq, gg = _bfx.rans_gemm_dual(
+                                                x0, blob_cat, 4608, 4096, 6656, bexp_cat
+                                            )
+                                            if not (
+                                                torch.equal(gq.view(torch.int16), rq.view(torch.int16))
+                                                and torch.equal(gg.view(torch.int16), rg.view(torch.int16))
+                                            ):
+                                                ok_dual = False
+                                                break
+                                    if ok_dual:
+                                        for cm in (12, 16, 24, 32):
                                             xm = (
                                                 torch.randn((cm, 6656), generator=g2, device=qw.device)
                                                 * 1.5

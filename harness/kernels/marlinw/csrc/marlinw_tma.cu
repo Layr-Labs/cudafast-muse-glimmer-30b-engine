@@ -277,7 +277,6 @@ __device__ __forceinline__ void k_loop(
     if (tid == 0 && q + kDist < total) start_copy(q + kDist);
     // k-half 0 of k-tile t (operands already in registers); meanwhile k-half 1 of the same stage is loaded.
     load_bs(1, s);
-    dequant_to(1);
     if constexpr (kSingleFa) {
       const uint32_t sa = sbase + kStageBytes * s + a_rd1;
 #pragma unroll
@@ -288,6 +287,7 @@ __device__ __forceinline__ void k_loop(
         mma16(fa[0][i], bb[0][1][1], acc[i][1][1]);
         ldsm4(fa[0][i], sa + 2048 * i);
       }
+      dequant_to(1);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty_bar + 8 * s);
       const bool has_next = (t + 1 < iters);
@@ -317,6 +317,7 @@ __device__ __forceinline__ void k_loop(
           ldsm4(fa[1][i], sa + 2048 * i);
         }
       }
+      dequant_to(1);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty_bar + 8 * s);  // warp-aggregated empty signal
 #pragma unroll

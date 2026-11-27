@@ -351,36 +351,68 @@ __global__ void draft_vocab_update_tail_kernel(
     __syncthreads();
   }
 
-  auto try_add = [&](int64_t raw_tok) {
-    if (raw_tok >= 0 && raw_tok < vocab_size) {
-      const int tok = static_cast<int>(raw_tok);
-      if (in_static_vocab[tok] == 0) {
-        if (atomicExch(&tail_seen[tok], 1) == 0) {
-          const int slot = atomicAdd(tail_count, 1);
+  const int eff_tokens = s_eff_tokens;
+  if (tid < 32) {
+    const uint32_t lane_lt = (1u << tid) - 1u;
+    int cur_cnt = tail_count[0];
+    if (cur_cnt < 0) cur_cnt = 0;
+    for (int base = 0; base < eff_tokens; base += 32) {
+      const int idx = base + tid;
+      int tok = -1;
+      bool cand = false;
+      if (idx < eff_tokens) {
+        const int64_t raw_tok = static_cast<int64_t>(input_ids[idx]);
+        if (raw_tok >= 0 && raw_tok < vocab_size) {
+          tok = static_cast<int>(raw_tok);
+          cand = (in_static_vocab[tok] == 0);
+        }
+      }
+      bool admit = false;
+      if (cand && atomicExch(&tail_seen[tok], 1) == 0) {
+        admit = true;
+      }
+      const uint32_t msk = __ballot_sync(0xffffffffu, admit);
+      const int slot = cur_cnt + __popc(msk & lane_lt);
+      if (admit) {
+        if (slot < max_tail) {
+          tail_ids[slot] = tok;
+        } else {
+          tail_seen[tok] = 0;
+        }
+      }
+      cur_cnt += __popc(msk);
+    }
+    if (extra_ids != nullptr && num_extra > 0) {
+      for (int base = 0; base < num_extra; base += 32) {
+        const int idx = base + tid;
+        int tok = -1;
+        bool cand = false;
+        if (idx < num_extra) {
+          const int64_t raw_tok = static_cast<int64_t>(extra_ids[idx]);
+          if (raw_tok >= 0 && raw_tok < vocab_size) {
+            tok = static_cast<int>(raw_tok);
+            cand = (in_static_vocab[tok] == 0);
+          }
+        }
+        bool admit = false;
+        if (cand && atomicExch(&tail_seen[tok], 1) == 0) {
+          admit = true;
+        }
+        const uint32_t msk = __ballot_sync(0xffffffffu, admit);
+        const int slot = cur_cnt + __popc(msk & lane_lt);
+        if (admit) {
           if (slot < max_tail) {
             tail_ids[slot] = tok;
           } else {
-            // Did not fit in tail_ids -> release seen mark so future reset stays clean.
             tail_seen[tok] = 0;
           }
         }
+        cur_cnt += __popc(msk);
       }
     }
-  };
-
-  const int eff_tokens = s_eff_tokens;
-  for (int i = tid; i < eff_tokens; i += blockDim.x) {
-    try_add(static_cast<int64_t>(input_ids[i]));
-  }
-  if (extra_ids != nullptr && num_extra > 0) {
-    for (int i = tid; i < num_extra; i += blockDim.x) {
-      try_add(static_cast<int64_t>(extra_ids[i]));
+    if (tid == 0) {
+      tail_count[0] = (cur_cnt > max_tail) ? max_tail : cur_cnt;
     }
-  }
-  __syncthreads();
-
-  if (tid == 0 && tail_count[0] > max_tail) {
-    tail_count[0] = max_tail;
   }
 }
 
@@ -431,10 +463,10 @@ __device__ __forceinline__ float dvt_warp_nvfp4_dot(
       const int g1 = g0 | 1;
       const float sc0 = dvt_fp8_e4m3_to_f32(static_cast<uint8_t>(s2 & 0xFFu)) * 0.5f;
       const float sc1 = dvt_fp8_e4m3_to_f32(static_cast<uint8_t>(s2 >> 8)) * 0.5f;
-      const uint4 a00 = use_smem_a ? s_a0[g0] : __ldg(reinterpret_cast<const uint4*>(a_row) + g0 * 2 + 0);
-      const uint4 a01 = use_smem_a ? s_a1[g0] : __ldg(reinterpret_cast<const uint4*>(a_row) + g0 * 2 + 1);
-      const uint4 a10 = use_smem_a ? s_a0[g1] : __ldg(reinterpret_cast<const uint4*>(a_row) + g1 * 2 + 0);
-      const uint4 a11 = use_smem_a ? s_a1[g1] : __ldg(reinterpret_cast<const uint4*>(a_row) + g1 * 2 + 1);
+      const uint4 a00 = use_smem_a ? s_a0[g0] : *(reinterpret_cast<const uint4*>(a_row) + g0 * 2 + 0);
+      const uint4 a01 = use_smem_a ? s_a1[g0] : *(reinterpret_cast<const uint4*>(a_row) + g0 * 2 + 1);
+      const uint4 a10 = use_smem_a ? s_a0[g1] : *(reinterpret_cast<const uint4*>(a_row) + g1 * 2 + 0);
+      const uint4 a11 = use_smem_a ? s_a1[g1] : *(reinterpret_cast<const uint4*>(a_row) + g1 * 2 + 1);
       acc = __fmaf_rn(dvt_nvfp4_group_dot(w16.x, w16.y, a00, a01), sc0, acc);
       acc = __fmaf_rn(dvt_nvfp4_group_dot(w16.z, w16.w, a10, a11), sc1, acc);
     }
@@ -442,8 +474,8 @@ __device__ __forceinline__ float dvt_warp_nvfp4_dot(
     for (int g = lane; g < num_g; g += 32) {
       const float sc_half = dvt_fp8_e4m3_to_f32(__ldg(&s_row[g])) * 0.5f;
       const uint64_t w8 = __ldg(reinterpret_cast<const uint64_t*>(w_row + g * 8));
-      const uint4 a0 = use_smem_a ? s_a0[g] : __ldg(reinterpret_cast<const uint4*>(a_row) + g * 2 + 0);
-      const uint4 a1 = use_smem_a ? s_a1[g] : __ldg(reinterpret_cast<const uint4*>(a_row) + g * 2 + 1);
+      const uint4 a0 = use_smem_a ? s_a0[g] : *(reinterpret_cast<const uint4*>(a_row) + g * 2 + 0);
+      const uint4 a1 = use_smem_a ? s_a1[g] : *(reinterpret_cast<const uint4*>(a_row) + g * 2 + 1);
       acc = __fmaf_rn(
           dvt_nvfp4_group_dot(static_cast<uint32_t>(w8), static_cast<uint32_t>(w8 >> 32), a0, a1),
           sc_half, acc);
@@ -634,8 +666,8 @@ __global__ void __launch_bounds__(256, 2) draft_vocab_tail_argmax_kernel(
   if (use_smem_a) {
     const uint4* src_u4 = reinterpret_cast<const uint4*>(a_row);
     for (int g = tid; g < num_g; g += kS2Warps * 32) {
-      s_a0[g] = __ldg(src_u4 + g * 2 + 0);
-      s_a1[g] = __ldg(src_u4 + g * 2 + 1);
+      s_a0[g] = src_u4[g * 2 + 0];
+      s_a1[g] = src_u4[g * 2 + 1];
     }
     __syncthreads();
   }
@@ -681,7 +713,7 @@ __global__ void __launch_bounds__(256, 2) draft_vocab_tail_argmax_kernel(
   if (n_tail > 0) {
     const int stride_warps = kCtasPerRow * kS2Warps;
     for (int ti = cta_c * kS2Warps + warp; ti < n_tail; ti += stride_warps) {
-      const int tok = __ldg(&tail_ids[ti]);
+      const int tok = tail_ids[ti];
       if (tok >= 0) {
         const float val = dvt_warp_nvfp4_dot(
             a_row, s_a0, s_a1, use_smem_a, raw_w, raw_s, tok, K, num_g, lane, total_scale);
@@ -701,8 +733,8 @@ __global__ void __launch_bounds__(256, 2) draft_vocab_tail_argmax_kernel(
     // Fast fused rescore path: sort the <= 512 per-CTA coarse candidates of row `m` in SMEM
     // and rescore the global coarse top-`rescore_k` using exact NVFP4 `dvt_warp_nvfp4_dot`.
     const uint64_t* row_cands = cand_buf + static_cast<size_t>(m) * num_cands;
-    s_cand[tid] = (tid < num_cands) ? __ldg(&row_cands[tid]) : 0ull;
-    s_cand[tid + 256] = (tid + 256 < num_cands) ? __ldg(&row_cands[tid + 256]) : 0ull;
+    s_cand[tid] = (tid < num_cands) ? row_cands[tid] : 0ull;
+    s_cand[tid + 256] = (tid + 256 < num_cands) ? row_cands[tid + 256] : 0ull;
     __syncthreads();
 
     for (int k = 2; k <= 512; k <<= 1) {
