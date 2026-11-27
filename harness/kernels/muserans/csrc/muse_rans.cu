@@ -63,6 +63,12 @@ __device__ __forceinline__ void rans_cp_async16_ca(uint32_t smem_dst, const void
 __device__ __forceinline__ void rans_cp_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
 template <int N>
 __device__ __forceinline__ void rans_cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
+__device__ __forceinline__ uint32_t rans_pack_e4m3_lop3(uint32_t u, uint32_t e_sh3) {
+  uint32_t t, out;
+  asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(t) : "r"(u), "r"(0x80078007u), "r"(e_sh3));
+  asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(out) : "r"(u >> 4), "r"(0x07800780u), "r"(t));
+  return out;
+}
 __device__ __forceinline__ uint32_t rans_lds32(uint32_t addr) { uint32_t v; asm volatile("ld.shared.u32 %0, [%1];" : "=r"(v) : "r"(addr)); return v; }
 __device__ __forceinline__ uint32_t rans_lds16(uint32_t addr) { unsigned short v; asm volatile("ld.shared.u16 %0, [%1];" : "=h"(v) : "r"(addr)); return (uint32_t)v; }
 __device__ __forceinline__ void rans_xpose4(uint4 v, int t, uint32_t& o0, uint32_t& o1, uint32_t& o2, uint32_t& o3) {
@@ -862,8 +868,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             const uint32_t Pw01 = __byte_perm(e0, e1, 0x7740);
             const uint32_t Pw23 = __byte_perm(e2, e3, 0x7740);
             const uint32_t Pw = __byte_perm(Pw01, Pw23, 0x5410);
-            const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
-            const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
+            const uint32_t hiE3 = (Pw >> 1) & 0x78787878u, loE3 = (Pw << 3) & 0x78787878u;
+            const uint32_t E0s = __byte_perm(hiE3, loE3, 0x5140), E1s = __byte_perm(hiE3, loE3, 0x7362);
             if constexpr (!kXsmem && kXGlobalMode == 1) {
               if ((s & 1) == 0) {
                 rans_xpose4(v_lo, t, a.x, a.y, a_next.x, a_next.y);
@@ -893,10 +899,10 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             const uint32_t r1 = n1 ? rans_lds16(ro1) : 0u;
             const uint32_t r2 = n2 ? rans_lds16(ro2) : 0u;
             const uint32_t r3 = n3 ? rans_lds16(ro3) : 0u;
-            // Assemble FP8 B-operand from nw + E0/E1, issue MMA (hides r0..r3 LDS latency), commit states.
+            // Assemble FP8 B-operand from nw + E0s/E1s via lop3.b32, issue MMA (hides r0..r3 LDS latency), commit states.
             const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-            const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
-            const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
+            const uint32_t bw0 = rans_pack_e4m3_lop3(u0, E0s);
+            const uint32_t bw1 = rans_pack_e4m3_lop3(u1, E1s);
             if constexpr (kM16) {
               rans_mma_e4m3_m16(c0, c1, c2, c3, a.x, a_hi.x, a.y, a_hi.y, bw0, bw1);
               if constexpr (kM32) {
@@ -1015,11 +1021,11 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
         if (need) x = (x << 16) | rans_lds16(ring_s | ((pwb + (__popc(m & lt) << 1)) & (RB - 1u)));
         pwb += __popc(m) << 1;
       }
-      const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
-      const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
+      const uint32_t hiE3 = (Pw >> 1) & 0x78787878u, loE3 = (Pw << 3) & 0x78787878u;
+      const uint32_t E0s = __byte_perm(hiE3, loE3, 0x5140), E1s = __byte_perm(hiE3, loE3, 0x7362);
       const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-      const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
-      const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
+      const uint32_t bw0 = rans_pack_e4m3_lop3(u0, E0s);
+      const uint32_t bw1 = rans_pack_e4m3_lop3(u1, E1s);
       uint2 a = make_uint2(0u, 0u);
       uint2 a_hi = make_uint2(0u, 0u);
       if (g < pb.M) {

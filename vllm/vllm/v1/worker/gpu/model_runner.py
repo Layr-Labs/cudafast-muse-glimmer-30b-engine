@@ -76,6 +76,7 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
+    build_compound_cudagraph,
     get_uniform_token_count,
     upload_cudagraph,
 )
@@ -1433,7 +1434,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._lmhead_cg_step += 1
             graphs[slot].replay()
             return outs[slot]
-        if sig in self._lmhead_cg_rejected or len(entries) >= 4:
+        if sig in self._lmhead_cg_rejected or len(entries) >= 16:
             return None
 
         mult = self.model.output_multiplier
@@ -1566,7 +1567,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._verify_lmhead_cg_step += 1
             graphs[slot].replay()
             return slots[slot]
-        if sig in self._verify_lmhead_cg_rejected or len(entries) >= 16:
+        if sig in self._verify_lmhead_cg_rejected or len(entries) >= 32:
             return None
         try:
             ref_buf = torch.full((1, buf_cols), -1, dtype=torch.int64, device=self.device)
@@ -1641,6 +1642,299 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._verify_lmhead_cg_rejected.add(sig)
             logger.warning("verify lm_head+lmpost graph capture skipped (%s); keeping eager path", exc)
             return None
+
+    def _can_compound_verify_step(
+        self,
+        batch_desc: BatchExecutionDescriptor,
+        input_batch: InputBatch,
+        dummy_run: bool,
+        is_profile: bool,
+        skip_compiled: bool,
+    ) -> dict[str, Any] | None:
+        if (
+            dummy_run
+            or is_profile
+            or skip_compiled
+            or envs.os.environ.get("VLLM_COMPOUND_VERIFY_GRAPH", "1") == "0"
+            or envs.os.environ.get("VLLM_VERIFY_LMHEAD_GRAPH", "1") == "0"
+            or torch.cuda.is_current_stream_capturing()
+            or self.cudagraph_manager is None
+            or not self.cudagraph_manager._graphs_captured
+            or not self.cudagraph_manager.is_last_pp_rank
+            or self.cudagraph_manager.hidden_states is None
+            or batch_desc not in self.cudagraph_manager.graphs
+            or not getattr(self, "_leaf_step", False)
+            or getattr(self, "_leaf_slot_mappings", None) is None
+            or input_batch.num_reqs != 1
+            or input_batch.num_draft_tokens != 6
+            or input_batch.has_structured_output_reqs
+            or input_batch.input_ids.dtype != torch.int32
+            or self.rejection_sampler is None
+            or self.rejection_sampler.synthetic_conditional_rates is not None
+            or self.sampler is None
+            or self.sampler.compute_nans
+            or not _native_leaf.ENABLED
+            or not _native_leaf._S.ready
+        ):
+            return None
+        leaf_verify_m = int(getattr(self, "_leaf_verify_m", 7))
+        if leaf_verify_m not in (16, 32) or int(batch_desc.num_tokens) != leaf_verify_m:
+            return None
+        verify_m = int(input_batch.cu_num_logits_np[1])
+        if (
+            verify_m != 7
+            or int(input_batch.query_start_loc_np[1]) != verify_m
+            or int(input_batch.num_computed_tokens_np[0])
+            + int(input_batch.num_scheduled_tokens[0])
+            < int(input_batch.prefill_len_np[0])
+        ):
+            return None
+        idx_mapping_np = input_batch.idx_mapping_np
+        states = self.sampler.sampling_states
+        if (
+            states.temperature.np[idx_mapping_np[0]] != 0.0
+            or states.max_num_logprobs(idx_mapping_np) != NO_LOGPROBS
+            or self.sampler.logprob_token_ids_state.max_num_token_ids(idx_mapping_np) != 0
+            or self.sampler._requires_logits_processing(idx_mapping_np)
+        ):
+            return None
+        if getattr(self.model, "_lmpost_softcap_argmax", None) is None:
+            return None
+        lm_head = self.model.lm_head
+        if not getattr(lm_head, "marlin_decode6_lmpost_m_admitted", False):
+            return None
+        lp = self.model.logits_processor
+        if (
+            getattr(lm_head, "tp_size", 1) != 1
+            or getattr(lm_head, "bias", None) is not None
+            or getattr(lp, "logits_as_input", False)
+            or getattr(lp, "soft_cap", None) is not None
+            or float(getattr(lp, "scale", 1.0)) != 1.0
+        ):
+            return None
+        _lmp = getattr(self, "_cached_lmp_mod", None)
+        _m6 = getattr(self, "_cached_m6_mod", None)
+        lut = getattr(self, "_cached_lmp_lut", None)
+        if _lmp is None or _m6 is None or lut is None:
+            return None
+        cm = self.cudagraph_manager
+        hidden_states = cm.hidden_states[:leaf_verify_m]
+        if (
+            hidden_states.dtype != torch.bfloat16
+            or not hidden_states.is_contiguous()
+            or (hidden_states.data_ptr() & 15) != 0
+        ):
+            return None
+        leaf_slots = self._leaf_slot_mappings
+        if not isinstance(leaf_slots, torch.Tensor) or not leaf_slots.is_cuda:
+            return None
+        extra_h = None
+        if hasattr(self.model, "get_mtp_target_hidden_states"):
+            pre_hc = self.model.get_mtp_target_hidden_states()
+            if pre_hc is not None and pre_hc.shape[0] >= leaf_verify_m:
+                extra_h = pre_hc[:leaf_verify_m]
+        aux_ptrs = (
+            tuple(int(x.data_ptr()) for x in cm.aux_hidden_states)
+            if cm.use_aux_hidden_state_outputs
+            else ()
+        )
+        org_vocab = int(
+            getattr(lp, "org_vocab_size", getattr(lm_head, "org_vocab_size", 0))
+        )
+        out_cols = self.rejection_sampler.num_speculative_steps + 1
+        buf_cols = max(out_cols, leaf_verify_m)
+        sig = (
+            batch_desc,
+            leaf_verify_m,
+            int(hidden_states.data_ptr()),
+            aux_ptrs,
+            int(extra_h.data_ptr()) if extra_h is not None else 0,
+            int(input_batch.input_ids.data_ptr()),
+            int(leaf_slots.data_ptr()),
+            tuple(leaf_slots.shape),
+            id(lm_head),
+            int(lut.data_ptr()),
+            org_vocab,
+            verify_m,
+            buf_cols,
+            out_cols,
+        )
+        return {
+            "sig": sig,
+            "batch_desc": batch_desc,
+            "leaf_verify_m": leaf_verify_m,
+            "verify_m": verify_m,
+            "buf_cols": buf_cols,
+            "out_cols": out_cols,
+            "org_vocab": org_vocab,
+            "lm_head": lm_head,
+            "lut": lut,
+            "input_ids": input_batch.input_ids,
+            "leaf_slots": leaf_slots,
+            "m6": _m6,
+            "lmp": _lmp,
+        }
+
+    def _try_run_compound_verify_step(
+        self,
+        batch_desc: BatchExecutionDescriptor,
+        input_batch: InputBatch,
+        dummy_run: bool,
+        is_profile: bool,
+        skip_compiled: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | None:
+        ctx = self._can_compound_verify_step(
+            batch_desc, input_batch, dummy_run, is_profile, skip_compiled
+        )
+        if ctx is None:
+            return None
+        sig = ctx["sig"]
+        rejected = getattr(self, "_compound_verify_rejected", None)
+        if rejected is not None and sig in rejected:
+            return None
+        entries = getattr(self, "_compound_verify_entries", None)
+        entry = entries.get(sig) if entries is not None else None
+        if entry is None:
+            self._compound_pending_capture = ctx
+            return None
+        mode, execs, slots = entry
+        step = getattr(self, "_compound_verify_step", 0)
+        slot_idx = step & 3
+        self._compound_verify_step = step + 1
+        cm = self.cudagraph_manager
+        assert cm is not None and cm.hidden_states is not None
+        from vllm.model_executor.offloader.base import get_offloader
+
+        get_offloader().sync_prev_onload()
+        if mode == "single":
+            execs[slot_idx].replay(self.main_stream)
+        else:
+            backbone_g, verify_g = execs[slot_idx]
+            backbone_g.replay()
+            verify_g.replay()
+        self._compound_step_res = slots[slot_idx]
+        hidden_states = cm.hidden_states[: batch_desc.num_tokens]
+        if not cm.use_aux_hidden_state_outputs:
+            return hidden_states
+        return hidden_states, [x[: batch_desc.num_tokens] for x in cm.aux_hidden_states]
+
+    def _capture_compound_verify_step(
+        self,
+        ctx: dict[str, Any],
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        extra_h: torch.Tensor | None,
+    ) -> None:
+        sig = ctx["sig"]
+        if not hasattr(self, "_compound_verify_entries"):
+            self._compound_verify_entries = {}
+            self._compound_verify_rejected = set()
+        if sig in self._compound_verify_entries or sig in self._compound_verify_rejected:
+            return
+        if len(self._compound_verify_entries) >= 8:
+            return
+        cm = self.cudagraph_manager
+        if cm is None:
+            return
+        batch_desc = ctx["batch_desc"]
+        backbone_graph = cm.graphs.get(batch_desc)
+        if backbone_graph is None:
+            return
+        leaf_verify_m = ctx["leaf_verify_m"]
+        verify_m = ctx["verify_m"]
+        buf_cols = ctx["buf_cols"]
+        out_cols = ctx["out_cols"]
+        org_vocab = ctx["org_vocab"]
+        lm_head = ctx["lm_head"]
+        lut = ctx["lut"]
+        input_ids = ctx["input_ids"]
+        leaf_slots = ctx["leaf_slots"]
+        _m6 = ctx["m6"]
+        _lmp = ctx["lmp"]
+        sample_hidden = hidden_states[:leaf_verify_m]
+        if (
+            int(sample_hidden.data_ptr()) != sig[2]
+            or sample_hidden.dtype != torch.bfloat16
+            or not sample_hidden.is_contiguous()
+        ):
+            return
+        try:
+            dev = sample_hidden.device
+            if getattr(self, "_compound_verify_pool", None) is None:
+                self._compound_verify_pool = torch.cuda.graph_pool_handle()
+            if getattr(self, "_compound_verify_cap_stream", None) is None:
+                self._compound_verify_cap_stream = torch.cuda.Stream(device=dev)
+            slot_bufs: list[torch.Tensor] = []
+            slots: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+            for _ in range(4):
+                s_buf = torch.full((1, buf_cols), -1, dtype=torch.int64, device=dev)
+                n_s = torch.empty((1,), dtype=torch.int32, device=dev)
+                n_r = torch.empty((1,), dtype=torch.int32, device=dev)
+                slot_bufs.append(s_buf)
+                slots.append((s_buf[:, :out_cols], n_s, n_r))
+            main_st = torch.cuda.current_stream(dev)
+            cap_st = self._compound_verify_cap_stream
+            cap_st.wait_stream(main_st)
+            verify_graphs: list[torch.cuda.CUDAGraph] = []
+            with torch.cuda.stream(cap_st):
+                for slot in range(4):
+                    vg = torch.cuda.CUDAGraph()
+                    s_buf = slot_bufs[slot]
+                    s_v, n_s, n_r = slots[slot]
+                    leaf_u = s_buf[0, 7:leaf_verify_m]
+                    with torch.cuda.graph(
+                        vg, pool=self._compound_verify_pool, stream=cap_st
+                    ):
+                        if not (
+                            _m6.launch_lmhead_lmpost6_m(
+                                sample_hidden, lm_head, lut, s_buf, org_vocab
+                            )
+                            and _lmp.greedy_verify(
+                                s_v, input_ids, None, n_s, n_r, verify_m
+                            )
+                        ):
+                            raise RuntimeError(
+                                "compound verify lm_head+lmpost refused during capture"
+                            )
+                        _native_leaf.commit_and_fix(
+                            s_v,
+                            n_s,
+                            n_r,
+                            leaf_u,
+                            hidden_states,
+                            aux_hidden_states,
+                            leaf_slots,
+                            extra_hidden=extra_h,
+                            verify_m=leaf_verify_m,
+                            chain_all_valid=True,
+                        )
+                    upload_cudagraph(vg, cap_st)
+                    verify_graphs.append(vg)
+                single_execs = [
+                    build_compound_cudagraph([backbone_graph, vg], cap_st)
+                    for vg in verify_graphs
+                ]
+            main_st.wait_stream(cap_st)
+            if all(ex is not None for ex in single_execs):
+                self._compound_verify_entries[sig] = ("single", single_execs, slots)
+                logger.info(
+                    "Captured 1-launch compound verify+commit step CUDA graph (M=%d, 4-slot ring)",
+                    leaf_verify_m,
+                )
+            else:
+                split_execs = [(backbone_graph, vg) for vg in verify_graphs]
+                self._compound_verify_entries[sig] = ("split", split_execs, slots)
+                logger.info(
+                    "Captured 2-launch verify+commit step CUDA graph fallback (M=%d, 4-slot ring)",
+                    leaf_verify_m,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._compound_verify_rejected.add(sig)
+            logger.warning(
+                "compound verify+commit step graph capture skipped (M=%d, %s); keeping stock path",
+                leaf_verify_m,
+                exc,
+            )
 
     def _try_decode_embed_graph(
         self,
@@ -2570,6 +2864,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         self._flush_deferred_zp_writes()
         self._flush_deferred_zp_leaf_reset()
+        self._compound_step_res = None
+        self._compound_pending_capture = None
         pre_prefill = getattr(self, "_prelaunched_prefill", None)
         self._prelaunched_prefill = None
         was_pool_free = bool(getattr(self, "_next_prefill_pool_free", False))
@@ -3219,7 +3515,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            model_output = self._try_run_compound_verify_step(
+                batch_desc, input_batch, dummy_run, is_profile, skip_compiled
+            )
+            if model_output is None:
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -3407,39 +3707,65 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             forward_done = torch.cuda.Event(blocking=True)
             forward_done.record(self.main_stream)
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output, compact_sample=compact_sample
-        )
+        comp_res = getattr(self, "_compound_step_res", None)
+        self._compound_step_res = None
+        pending_comp = getattr(self, "_compound_pending_capture", None)
+        self._compound_pending_capture = None
         leaf_verify_m = int(getattr(self, "_leaf_verify_m", 7))
         self._leaf_verify_m = 7
-        if getattr(self, "_leaf_step", False):
-            leaf_u = getattr(self, "_leaf_u_tok", None)
-            leaf_chain_all = bool(getattr(self, "_leaf_chain_all_valid", False))
-            leaf_slots = getattr(self, "_leaf_slot_mappings", None)
+        if comp_res is not None and grammar_output is None:
+            s_v, num_sampled, num_rejected = comp_res
+            sampler_output = SamplerOutput(
+                sampled_token_ids=s_v,
+                logprobs_tensors=None,
+                num_nans=None,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+            )
             self._leaf_step = False
             self._leaf_u_tok = None
             self._leaf_chain_all_valid = False
             self._leaf_slot_mappings = None
-            if leaf_u is not None:
-                extra_h = None
-                if hasattr(self.model, "get_mtp_target_hidden_states"):
-                    pre_hc = self.model.get_mtp_target_hidden_states()
-                    if pre_hc is not None and hidden_states is not None:
-                        extra_h = pre_hc[: hidden_states.shape[0]]
-                _native_leaf.commit_and_fix(
-                    sampler_output.sampled_token_ids,
-                    num_sampled,
-                    num_rejected,
-                    leaf_u,
-                    hidden_states,
-                    aux_hidden_states,
-                    leaf_slots,
-                    extra_hidden=extra_h,
-                    verify_m=leaf_verify_m,
-                    chain_all_valid=leaf_chain_all,
-                )
-            else:
-                _native_leaf.on_non_leaf_step(None, 0)
+        else:
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output, compact_sample=compact_sample
+            )
+            if getattr(self, "_leaf_step", False):
+                leaf_u = getattr(self, "_leaf_u_tok", None)
+                leaf_chain_all = bool(getattr(self, "_leaf_chain_all_valid", False))
+                leaf_slots = getattr(self, "_leaf_slot_mappings", None)
+                self._leaf_step = False
+                self._leaf_u_tok = None
+                self._leaf_chain_all_valid = False
+                self._leaf_slot_mappings = None
+                if leaf_u is not None:
+                    extra_h = None
+                    if hasattr(self.model, "get_mtp_target_hidden_states"):
+                        pre_hc = self.model.get_mtp_target_hidden_states()
+                        if pre_hc is not None and hidden_states is not None:
+                            extra_h = pre_hc[: hidden_states.shape[0]]
+                    _native_leaf.commit_and_fix(
+                        sampler_output.sampled_token_ids,
+                        num_sampled,
+                        num_rejected,
+                        leaf_u,
+                        hidden_states,
+                        aux_hidden_states,
+                        leaf_slots,
+                        extra_hidden=extra_h,
+                        verify_m=leaf_verify_m,
+                        chain_all_valid=leaf_chain_all,
+                    )
+                    if (
+                        pending_comp is not None
+                        and grammar_output is None
+                        and leaf_chain_all
+                    ):
+                        self._capture_compound_verify_step(
+                            pending_comp, hidden_states, aux_hidden_states, extra_h
+                        )
+                else:
+                    _native_leaf.on_non_leaf_step(None, 0)
         if leaf_verify_m > 7:
             if hidden_states is not None and hidden_states.shape[0] > 7:
                 hidden_states = hidden_states[:7]

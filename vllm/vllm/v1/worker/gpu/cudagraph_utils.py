@@ -147,6 +147,154 @@ def upload_cudagraph(
         pass
 
 
+_cudart_compound_api: Any = False
+
+
+def _get_cudart_compound_api() -> Any:
+    """Lazy-bind libcudart C API for sequential child-graph compounding."""
+    global _cudart_compound_api
+    if _cudart_compound_api is False:
+        try:
+            import ctypes
+
+            lib = ctypes.CDLL("libcudart.so")
+            lib.cudaGraphCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+            lib.cudaGraphCreate.restype = ctypes.c_int
+            lib.cudaGraphAddChildGraphNode.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_size_t,
+                ctypes.c_void_p,
+            ]
+            lib.cudaGraphAddChildGraphNode.restype = ctypes.c_int
+            lib.cudaGraphInstantiateWithFlags.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+                ctypes.c_ulonglong,
+            ]
+            lib.cudaGraphInstantiateWithFlags.restype = ctypes.c_int
+            lib.cudaGraphUpload.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            lib.cudaGraphUpload.restype = ctypes.c_int
+            lib.cudaGraphLaunch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            lib.cudaGraphLaunch.restype = ctypes.c_int
+            lib.cudaGraphDestroy.argtypes = [ctypes.c_void_p]
+            lib.cudaGraphDestroy.restype = ctypes.c_int
+            lib.cudaGraphExecDestroy.argtypes = [ctypes.c_void_p]
+            lib.cudaGraphExecDestroy.restype = ctypes.c_int
+            _cudart_compound_api = lib
+        except Exception:
+            _cudart_compound_api = None
+    return _cudart_compound_api
+
+
+class CompoundGraphExec:
+    """Owns a single instantiated cudaGraphExec_t combining sequential child graphs."""
+
+    def __init__(self, exec_ptr: int, lib: Any, keepalive: tuple[Any, ...]) -> None:
+        self._exec_ptr = int(exec_ptr)
+        self._lib = lib
+        self._keepalive = keepalive
+
+    def replay(self, stream: torch.cuda.Stream | None = None) -> None:
+        import ctypes
+
+        st = stream if stream is not None else current_platform.current_stream()
+        rc = self._lib.cudaGraphLaunch(
+            ctypes.c_void_p(self._exec_ptr), ctypes.c_void_p(int(st.cuda_stream))
+        )
+        if rc != 0:
+            raise RuntimeError(f"cudaGraphLaunch failed with rc={rc}")
+
+    def __del__(self) -> None:
+        exec_ptr = getattr(self, "_exec_ptr", 0)
+        lib = getattr(self, "_lib", None)
+        if exec_ptr and lib is not None:
+            try:
+                import ctypes
+
+                lib.cudaGraphExecDestroy(ctypes.c_void_p(exec_ptr))
+            except Exception:
+                pass
+            self._exec_ptr = 0
+
+
+def build_compound_cudagraph(
+    graphs: list[torch.cuda.CUDAGraph],
+    stream: torch.cuda.Stream | None = None,
+) -> CompoundGraphExec | None:
+    """Combine multiple captured torch.cuda.CUDAGraphs into one sequential cudaGraphExec_t
+    via cudaGraphAddChildGraphNode + cudaGraphInstantiateWithFlags + cudaGraphUpload."""
+    lib = _get_cudart_compound_api()
+    if lib is None or not graphs:
+        return None
+    import ctypes
+
+    parent = ctypes.c_void_p(0)
+    exec_handle = ctypes.c_void_p(0)
+    try:
+        raw_ptrs: list[int] = []
+        for g in graphs:
+            fn = getattr(g, "raw_cuda_graph", None)
+            if fn is None:
+                return None
+            p = int(fn())
+            if not p:
+                return None
+            raw_ptrs.append(p)
+        if lib.cudaGraphCreate(ctypes.byref(parent), ctypes.c_uint(0)) != 0:
+            return None
+        prev_node = ctypes.c_void_p(0)
+        for i, raw_p in enumerate(raw_ptrs):
+            node = ctypes.c_void_p(0)
+            if i == 0:
+                rc = lib.cudaGraphAddChildGraphNode(
+                    ctypes.byref(node),
+                    parent,
+                    None,
+                    ctypes.c_size_t(0),
+                    ctypes.c_void_p(raw_p),
+                )
+            else:
+                dep = (ctypes.c_void_p * 1)(prev_node)
+                rc = lib.cudaGraphAddChildGraphNode(
+                    ctypes.byref(node),
+                    parent,
+                    dep,
+                    ctypes.c_size_t(1),
+                    ctypes.c_void_p(raw_p),
+                )
+            if rc != 0:
+                lib.cudaGraphDestroy(parent)
+                return None
+            prev_node = node
+        if (
+            lib.cudaGraphInstantiateWithFlags(
+                ctypes.byref(exec_handle), parent, ctypes.c_ulonglong(0)
+            )
+            != 0
+        ):
+            lib.cudaGraphDestroy(parent)
+            return None
+        lib.cudaGraphDestroy(parent)
+        parent = ctypes.c_void_p(0)
+        st = stream if stream is not None else current_platform.current_stream()
+        lib.cudaGraphUpload(exec_handle, ctypes.c_void_p(int(st.cuda_stream)))
+        return CompoundGraphExec(int(exec_handle.value), lib, tuple(graphs))
+    except Exception:
+        if exec_handle.value:
+            try:
+                lib.cudaGraphExecDestroy(exec_handle)
+            except Exception:
+                pass
+        if parent.value:
+            try:
+                lib.cudaGraphDestroy(parent)
+            except Exception:
+                pass
+        return None
+
+
 class CudaGraphManager:
     def __init__(
         self,
