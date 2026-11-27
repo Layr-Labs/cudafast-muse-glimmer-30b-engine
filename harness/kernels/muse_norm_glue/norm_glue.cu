@@ -136,55 +136,26 @@ __device__ __forceinline__ uint4 ld16_cs(const uint4* ptr) {
   return r;
 }
 
-// 16B coalesced load/store via even-lane uint4 + warp-pair shuffle (0-ULP identical per-thread uint2
-// layout to ld8/st8; safe inside chunk_valid(c) because chunk 6 active set [0..127] is 4 full warps).
+// Direct coalesced 8B (uint2) and 4B (uint32_t) loads/stores (0-ULP identical per-thread layout;
+// eliminates even/odd lane divergence and __shfl_xor_sync pairs across all 52 layers).
 __device__ __forceinline__ uint2 ld8_v4(const __nv_bfloat16* base, int c) {
-  uint4 v = make_uint4(0u, 0u, 0u, 0u);
-  const int even_t = threadIdx.x & ~1;
-  if ((threadIdx.x & 1) == 0) {
-    v = *reinterpret_cast<const uint4*>(base + c * 1024 + even_t * 4);
-  }
-  const uint32_t hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
-  const uint32_t hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
-  return ((threadIdx.x & 1) == 0) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+  return ld8(base, c);
 }
 
 __device__ __forceinline__ uint2 ld8_cs_v4(const __nv_bfloat16* base, int c) {
-  uint4 v = make_uint4(0u, 0u, 0u, 0u);
-  const int even_t = threadIdx.x & ~1;
-  if ((threadIdx.x & 1) == 0) {
-    v = ld16_cs(reinterpret_cast<const uint4*>(base + c * 1024 + even_t * 4));
-  }
-  const uint32_t hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
-  const uint32_t hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
-  return ((threadIdx.x & 1) == 0) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+  return ld8_cs(base, c);
 }
 
 __device__ __forceinline__ uint2 ldg8_v4(const __nv_bfloat16* base, int c) {
-  uint4 v = make_uint4(0u, 0u, 0u, 0u);
-  const int even_t = threadIdx.x & ~1;
-  if ((threadIdx.x & 1) == 0) {
-    v = __ldg(reinterpret_cast<const uint4*>(base + c * 1024 + even_t * 4));
-  }
-  const uint32_t hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
-  const uint32_t hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
-  return ((threadIdx.x & 1) == 0) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+  return ldg8(base, c);
 }
 
 __device__ __forceinline__ void st8_v4(__nv_bfloat16* base, int c, uint2 val) {
-  const uint32_t odd_x = __shfl_xor_sync(0xffffffffu, val.x, 1);
-  const uint32_t odd_y = __shfl_xor_sync(0xffffffffu, val.y, 1);
-  if ((threadIdx.x & 1) == 0) {
-    *reinterpret_cast<uint4*>(base + c * 1024 + threadIdx.x * 4) =
-        make_uint4(val.x, val.y, odd_x, odd_y);
-  }
+  *reinterpret_cast<uint2*>(base + c * 1024 + threadIdx.x * 4) = val;
 }
 
 __device__ __forceinline__ void st4_v2(uint8_t* base, int c, uint32_t val) {
-  const uint32_t odd_v = __shfl_xor_sync(0xffffffffu, val, 1);
-  if ((threadIdx.x & 1) == 0) {
-    *reinterpret_cast<uint2*>(base + c * 1024 + threadIdx.x * 4) = make_uint2(val, odd_v);
-  }
+  *reinterpret_cast<uint32_t*>(base + c * 1024 + threadIdx.x * 4) = val;
 }
 
 // ---------------------------------------------------------------------------------------------------------

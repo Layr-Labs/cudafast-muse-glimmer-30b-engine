@@ -419,6 +419,23 @@ struct Aux5Desc {
   int kg_sub;
 };
 
+// Branchless compile-time-indexed select on Aux5Desc (prevents ptxas local-memory stack spills
+// caused by runtime-indexed aux5.p[seg] / aux5.stride[seg] inside hot K-loops).
+__device__ __forceinline__ void int4_aux5_select(
+    const Aux5Desc& aux5, int seg,
+    const __nv_bfloat16*& a_base, int64_t& a_stride) {
+  a_base = (seg == 0) ? aux5.p[0]
+         : (seg == 1) ? aux5.p[1]
+         : (seg == 2) ? aux5.p[2]
+         : (seg == 3) ? aux5.p[3]
+                      : aux5.p[4];
+  a_stride = (seg == 0) ? aux5.stride[0]
+           : (seg == 1) ? aux5.stride[1]
+           : (seg == 2) ? aux5.stride[2]
+           : (seg == 3) ? aux5.stride[3]
+                        : aux5.stride[4];
+}
+
 template <int kMaxM>
 struct alignas(16) Int4StageSmem {
   uint8_t w[kStages][kStepWBytes];         // 5 * 2304 = 11520 B
@@ -494,8 +511,7 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_kernel(
     if constexpr (kAux5) {
       const int seg = kg / aux5.kg_sub;
       const int local_kg = kg - seg * aux5.kg_sub;
-      a_base = aux5.p[seg];
-      a_stride = aux5.stride[seg];
+      int4_aux5_select(aux5, seg, a_base, a_stride);
       a_col_base = local_kg * 64;
     } else {
       a_base = A;
@@ -533,8 +549,7 @@ __global__ void __launch_bounds__(128, 4) int4_mma_gemm_kernel(
     if constexpr (kAux5) {
       const int seg = kg / aux5.kg_sub;
       const int local_kg = kg - seg * aux5.kg_sub;
-      a_base = aux5.p[seg];
-      a_stride = aux5.stride[seg];
+      int4_aux5_select(aux5, seg, a_base, a_stride);
       a_col_base = local_kg * 64;
     } else {
       a_base = A;
@@ -742,8 +757,7 @@ __global__ void __launch_bounds__(128, 6) int4_mma_gemm_n32_kernel(
     if constexpr (kAux5) {
       const int seg = kg / aux5.kg_sub;
       const int local_kg = kg - seg * aux5.kg_sub;
-      a_base = aux5.p[seg];
-      a_stride = aux5.stride[seg];
+      int4_aux5_select(aux5, seg, a_base, a_stride);
       a_col_base = local_kg * 64;
     } else {
       a_base = A;
@@ -774,8 +788,7 @@ __global__ void __launch_bounds__(128, 6) int4_mma_gemm_n32_kernel(
     if constexpr (kAux5) {
       const int seg = kg / aux5.kg_sub;
       const int local_kg = kg - seg * aux5.kg_sub;
-      a_base = aux5.p[seg];
-      a_stride = aux5.stride[seg];
+      int4_aux5_select(aux5, seg, a_base, a_stride);
       a_col_base = local_kg * 64;
     } else {
       a_base = A;
@@ -1233,8 +1246,11 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
       int4_cp_async16_w(sd, w_src + idx * 16);
     }
 
-    const __nv_bfloat16* a_base = kAux5 ? aux5.p[pre_seg] : A;
-    const int64_t a_stride = kAux5 ? aux5.stride[pre_seg] : static_cast<int64_t>(K);
+    const __nv_bfloat16* a_base = A;
+    int64_t a_stride = static_cast<int64_t>(K);
+    if constexpr (kAux5) {
+      int4_aux5_select(aux5, pre_seg, a_base, a_stride);
+    }
     const int a_col_base = kAux5 ? (pre_local_kg * 64) : (pre_kg * 64);
 
     if constexpr (kM16) {
@@ -1264,8 +1280,11 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
     }
     asm volatile("griddepcontrol.wait;" ::: "memory");
     for (int i = 0; i < preload; ++i) {
-      const __nv_bfloat16* a_base = kAux5 ? aux5.p[pre_seg] : A;
-      const int64_t a_stride = kAux5 ? aux5.stride[pre_seg] : static_cast<int64_t>(K);
+      const __nv_bfloat16* a_base = A;
+      int64_t a_stride = static_cast<int64_t>(K);
+      if constexpr (kAux5) {
+        int4_aux5_select(aux5, pre_seg, a_base, a_stride);
+      }
       const int a_col_base = kAux5 ? (pre_local_kg * 64) : (pre_kg * 64);
       load_a_sync(i, a_base, a_stride, a_col_base);
       ++pre_iter;

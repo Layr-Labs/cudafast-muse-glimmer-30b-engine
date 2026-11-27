@@ -909,7 +909,7 @@ __device__ __forceinline__ uint2 ldg8_direct(const __nv_bfloat16* base, int c) {
   return __ldg(reinterpret_cast<const uint2*>(base + c * 1024 + threadIdx.x * 4));
 }
 
-template <bool kBf16Out, bool kFp8Out, bool kCsX, bool kCsRes, bool kPdl = true>
+template <bool kBf16Out, bool kFp8Out, bool kCsX, bool kCsRes, int kPdlMode = 2>
 __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
     const __nv_bfloat16* __restrict__ x_all,
     const __nv_bfloat16* __restrict__ res_all,
@@ -922,14 +922,14 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
     const char* __restrict__ dead_ptr,
     size_t dead_lines) {
   __shared__ float red[2][8];
-  __shared__ uint2 sh_res[kPdl ? (kHidden / 4) : 1];
+  __shared__ uint2 sh_res[kPdlMode == 1 ? (kHidden / 4) : 1];
   const size_t row = blockIdx.x;
   const __nv_bfloat16* x = x_all + row * kHidden;
   const __nv_bfloat16* res = res_all + row * kHidden;
   float inv_scale = 0.0f;
 
-  if constexpr (kPdl) {
-    // Preload predecessor-independent residual (6.8 MB) into SMEM before waiting on o_proj!
+  if constexpr (kPdlMode == 1) {
+    // Legacy full PDL: preload predecessor-independent residual (6.8 MB) into SMEM before waiting on o_proj.
     #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid_6656(c)) {
@@ -973,7 +973,7 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
   #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid_6656(c)) {
-      const uint2 rv_u = kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_direct<kCsRes>(res, c);
+      const uint2 rv_u = (kPdlMode == 1) ? sh_res[c * 256 + threadIdx.x] : ld8_direct<kCsRes>(res, c);
       const uint2 wv_u = ldg8_direct(w_post, c);
       const float xv[4] = {bf_lo(ux[c].x), bf_hi(ux[c].x), bf_lo(ux[c].y), bf_hi(ux[c].y)};
       const float rv[4] = {bf_lo(rv_u.x), bf_hi(rv_u.x), bf_lo(rv_u.y), bf_hi(rv_u.y)};
@@ -986,8 +986,13 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
     }
   }
   const float s_h = row_sum_256(acc2, red[1]);
+  if constexpr (kPdlMode == 2) {
+    // Producer-only PDL: zero sh_res SMEM overhead, yet still signals downstream gateup/swiglu
+    // to overlap TMA/LUT weight preloads with this kernel's final store epilogue.
+    asm volatile("griddepcontrol.launch_dependents;");
+  }
   const float b = inv_rms_6656(s_h, 1e-05f);
-  if constexpr (!kPdl && kFp8Out) inv_scale = fast_rcpf(__ldg(scale));
+  if constexpr (kPdlMode != 1 && kFp8Out) inv_scale = fast_rcpf(__ldg(scale));
 
   __nv_bfloat16* const out_bf16_row = kBf16Out ? (out_bf16_all + row * kHidden) : nullptr;
   uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
@@ -1013,12 +1018,14 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
   }
 }
 
-static bool post_attn_pdl_enabled() {
-  static const bool on = []() {
+static int post_attn_pdl_mode() {
+  static const int mode = []() -> int {
     const char* env = std::getenv("MUSE_PREFILL_POST_ATTN_PDL");
-    return env && *env && std::strtol(env, nullptr, 10) != 0;
+    if (!env || !*env) return 2;  // 0=off, 1=legacy full (sh_res+wait+launch), 2=producer-only default
+    long v = std::strtol(env, nullptr, 10);
+    return (v == 0 || v == 1 || v == 2) ? static_cast<int>(v) : 2;
   }();
-  return on;
+  return mode;
 }
 
 // =================================================================================================
@@ -1255,37 +1262,55 @@ extern "C" int muse_prefill_post_attn_norm(
   const cudaStream_t st = static_cast<cudaStream_t>(cuda_stream);
   const char* dp = nullptr; size_t dl = 0;
   muse_pf_attn::align_discard(dead_ptr, dead_bytes, dp, dl);
-  const bool pdl = muse_pf_attn::post_attn_pdl_enabled();
+  const int pdl_mode = muse_pf_attn::post_attn_pdl_mode();
   const dim3 grid(static_cast<unsigned>(rows), 1u, 1u);
   const dim3 block(256u, 1u, 1u);
   if (kind == 0) {
-    if (pdl) {
+    if (pdl_mode == 1) {
       if (cs_mode == 0)
-        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, true>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
+        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, 1>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
       if (cs_mode == 2)
-        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, true>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
-      return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, true>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
+        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, 1>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
+      return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, 1>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
     }
-    if (cs_mode == 0)
-      muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, false><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
-    else if (cs_mode == 2)
-      muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, false><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
-    else
-      muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, false><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+    if (pdl_mode == 2) {
+      if (cs_mode == 0)
+        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+      else if (cs_mode == 2)
+        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+      else
+        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+    } else {
+      if (cs_mode == 0)
+        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+      else if (cs_mode == 2)
+        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+      else
+        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+    }
   } else if (kind == 1) {
-    if (pdl) {
+    if (pdl_mode == 1) {
       if (cs_mode == 0)
-        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, true>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
+        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, 1>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
       if (cs_mode == 2)
-        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, true>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
-      return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, true>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
+        return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, 1>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
+      return static_cast<int>(muse_pf_attn::launch_ex(true, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, 1>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
     }
-    if (cs_mode == 0)
-      muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, false><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
-    else if (cs_mode == 2)
-      muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, false><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
-    else
-      muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, false><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+    if (pdl_mode == 2) {
+      if (cs_mode == 0)
+        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+      else if (cs_mode == 2)
+        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+      else
+        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+    } else {
+      if (cs_mode == 0)
+        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+      else if (cs_mode == 2)
+        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+      else
+        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+    }
   } else {
     return 1;
   }
