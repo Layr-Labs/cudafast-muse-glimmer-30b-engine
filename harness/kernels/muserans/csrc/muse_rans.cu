@@ -65,6 +65,15 @@ template <int N>
 __device__ __forceinline__ void rans_cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
 __device__ __forceinline__ uint32_t rans_lds32(uint32_t addr) { uint32_t v; asm volatile("ld.shared.u32 %0, [%1];" : "=r"(v) : "r"(addr)); return v; }
 __device__ __forceinline__ uint32_t rans_lds16(uint32_t addr) { unsigned short v; asm volatile("ld.shared.u16 %0, [%1];" : "=h"(v) : "r"(addr)); return (uint32_t)v; }
+__device__ __forceinline__ uint32_t rans_lop3_ea(uint32_t a, uint32_t b, uint32_t c) {
+  uint32_t d;
+  asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+  return d;
+}
+__device__ __forceinline__ uint32_t rans_pack_e4m3x4(uint32_t u, uint32_t e_shl3) {
+  const uint32_t hi = rans_lop3_ea(u >> 4, 0x07800780u, e_shl3);
+  return rans_lop3_ea(u, 0x80078007u, hi);
+}
 __device__ __forceinline__ void rans_xpose4(uint4 v, int t, uint32_t& o0, uint32_t& o1, uint32_t& o2, uint32_t& o3) {
   const bool t1 = (t & 1) != 0;
   const bool t2 = (t & 2) != 0;
@@ -895,8 +904,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             const uint32_t r3 = n3 ? rans_lds16(ro3) : 0u;
             // Assemble FP8 B-operand from nw + E0/E1, issue MMA (hides r0..r3 LDS latency), commit states.
             const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-            const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
-            const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
+            const uint32_t bw0 = rans_pack_e4m3x4(u0, E0 << 3);
+            const uint32_t bw1 = rans_pack_e4m3x4(u1, E1 << 3);
             if constexpr (kM16) {
               rans_mma_e4m3_m16(c0, c1, c2, c3, a.x, a_hi.x, a.y, a_hi.y, bw0, bw1);
               if constexpr (kM32) {
@@ -1018,8 +1027,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
       const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
       const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
       const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-      const uint32_t bw0 = (u0 & 0x80078007u) | ((u0 >> 4) & 0x07800780u) | (E0 << 3);
-      const uint32_t bw1 = (u1 & 0x80078007u) | ((u1 >> 4) & 0x07800780u) | (E1 << 3);
+      const uint32_t bw0 = rans_pack_e4m3x4(u0, E0 << 3);
+      const uint32_t bw1 = rans_pack_e4m3x4(u1, E1 << 3);
       uint2 a = make_uint2(0u, 0u);
       uint2 a_hi = make_uint2(0u, 0u);
       if (g < pb.M) {

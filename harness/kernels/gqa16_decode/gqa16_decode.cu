@@ -3875,6 +3875,16 @@ __global__ __launch_bounds__(kWarps * 32, (kWarps == 4 ? 2 : 1)) void gqa16_veri
             mma_m16n8k16_bf16_u2(p_cur, v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
           }
         }
+      }
+      __syncthreads();
+      if (nb > cta_nb_min) {
+        issue_kv64_verify<false, kWarps>(
+            smem.kv[0], kv_ptr, block_table, (nb - 1) << 7,
+            cta_k_start, cta_seqlen_k, block_size, kv_head,
+            stride_block, stride_slot, stride_kv_head, tid);
+        cp_async_commit();
+      }
+      if (my_in_block) {
         #pragma unroll
         for (int ks_local = 0; ks_local < 4; ++ks_local) {
           const uint32_t p_cur[4] = {
@@ -3896,13 +3906,6 @@ __global__ __launch_bounds__(kWarps * 32, (kWarps == 4 ? 2 : 1)) void gqa16_veri
         }
       }
       __syncthreads();
-      if (nb > cta_nb_min) {
-        issue_kv64_verify<false, kWarps>(
-            smem.kv[0], kv_ptr, block_table, (nb - 1) << 7,
-            cta_k_start, cta_seqlen_k, block_size, kv_head,
-            stride_block, stride_slot, stride_kv_head, tid);
-        cp_async_commit();
-      }
     }
   }
 
