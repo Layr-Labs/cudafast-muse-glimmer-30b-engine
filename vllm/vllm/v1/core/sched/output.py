@@ -268,6 +268,9 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Request IDs guaranteed to reach max_tokens on this scheduled step.
+    finishing_req_ids: set[str] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

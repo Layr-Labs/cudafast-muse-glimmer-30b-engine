@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -499,6 +500,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        finishing_req_ids: set[str] = set()
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
 
@@ -567,6 +569,30 @@ class Scheduler(SchedulerInterface):
                 )
                 if allowed_depth < len(request.spec_token_ids):
                     request.spec_token_ids = request.spec_token_ids[:allowed_depth]
+
+            if (
+                request.max_tokens is not None
+                and not request.is_prefill_chunk
+                and getattr(self, "_emit_budget_enabled", None) is not False
+            ):
+                if getattr(self, "_emit_budget_enabled", None) is None:
+                    self._emit_budget_enabled = os.environ.get("MUSE_EMIT_BUDGET", "1") != "0"
+                if self._emit_budget_enabled:
+                    _ceil_obj = self.dflash_committed_token_ceiling
+                    _ceil_states = getattr(_ceil_obj, "_states", None) if _ceil_obj is not None else None
+                    _c_st = _ceil_states.get(request.request_id) if _ceil_states else None
+                    if _c_st is None or not _c_st.high_acceptance_seen:
+                        _in_fl = max(int(request.num_output_placeholders), 0)
+                        _rem = (
+                            int(request.num_prompt_tokens)
+                            + int(request.max_tokens)
+                            - int(request.num_tokens)
+                            - (1 if _in_fl > 0 else 0)
+                        )
+                        if _rem == 1:
+                            if request.spec_token_ids:
+                                request.spec_token_ids = []
+                            finishing_req_ids.add(request.request_id)
 
             num_new_tokens = (
                 request.num_tokens_with_spec
@@ -1294,6 +1320,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            finishing_req_ids=finishing_req_ids if finishing_req_ids else None,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             scheduled_encoder_input_stats=scheduled_encoder_input_stats,
             num_common_prefix_blocks=num_common_prefix_blocks,

@@ -58,7 +58,7 @@ __device__ __forceinline__ void rans_mma_e4m3_m16(float& d0, float& d1, float& d
 #endif
 }
 __device__ __forceinline__ uint64_t rans_policy_evict_first() { uint64_t pol; asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol)); return pol; }
-__device__ __forceinline__ void rans_cp_async16_s(uint32_t smem_dst, const void* gsrc, uint64_t pol) { asm volatile("cp.async.cg.shared.global.L2::256B.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(smem_dst), "l"(gsrc), "l"(pol)); }
+__device__ __forceinline__ void rans_cp_async16_s(uint32_t smem_dst, const void* gsrc, uint64_t pol) { asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(smem_dst), "l"(gsrc), "l"(pol)); }
 __device__ __forceinline__ void rans_cp_async16_ca(uint32_t smem_dst, const void* gsrc) { asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(smem_dst), "l"(gsrc)); }
 __device__ __forceinline__ void rans_cp_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
 template <int N>
@@ -885,10 +885,12 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
               rans_cp_wait<RG - 2>();
               __syncwarp();
             }
-            const uint32_t na_a = na & ~3u;
-            const uint32_t nw_lo = rans_lds32(ring_s | (na_a & (RB - 1u)));
-            const uint32_t nw_hi = ((pwb_n & 2u) != 0u) ? rans_lds32(ring_s | ((na_a + 4u) & (RB - 1u))) : 0u;
-            const uint32_t nw = __funnelshift_r(nw_lo, nw_hi, (pwb_n & 2u) << 3);
+            uint32_t nw;
+            if ((pwb_n & 2u) == 0u) {
+              nw = rans_lds32(ring_s | (na & (RB - 1u)));
+            } else {
+              nw = rans_lds16(ring_s | (na & (RB - 1u))) | (rans_lds16(ring_s | ((na + 2u) & (RB - 1u))) << 16);
+            }
             const uint32_t r0 = n0 ? rans_lds16(ro0) : 0u;
             const uint32_t r1 = n1 ? rans_lds16(ro1) : 0u;
             const uint32_t r2 = n2 ? rans_lds16(ro2) : 0u;
@@ -1315,24 +1317,19 @@ static void rans_set_attrs_once() {
   // cap dynamic SMEM at 48 KiB and request 50% carveout -> 64 KiB L1 data cache instead of 28 KiB.
   cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
   cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
-#define RANS_ATTR_MT(MT) \
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, MT, true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024); \
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, MT, true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50); \
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, MT, true, true, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES)); \
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, MT, true, true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES)); \
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, MT, true, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES)); \
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, MT, false, true, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES)); \
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, MT, false, true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES)); \
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, MT, false, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES)); \
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, MT, true, false, 0, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024); \
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, MT, true, false, 0, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 50); \
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, MT, true, true, 0, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES)); \
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, MT, true, true, 1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES)); \
-  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, MT, true, true, 2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
-  RANS_ATTR_MT(448)
-  RANS_ATTR_MT(576)
-  RANS_ATTR_MT(640)
-#undef RANS_ATTR_MT
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, false, true, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, false, true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, false, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, false, 0, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 48 * 1024);
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, false, 0, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 0, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
+  cudaFuncSetAttribute(rans_gemv_kernel<4, 9, 4, 1, 1, true, 640, true, true, 2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(RANS_MAX_SMEM - RANS_LUT_BYTES));
   cudaThreadExchangeStreamCaptureMode(&mode);
   done = true;
 }
@@ -1473,29 +1470,24 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   }();
   const int xsmem_min_k = (g_rans_xsmem_min_k_ovr >= 0) ? g_rans_xsmem_min_k_ovr : xsmem_min_k_def;
   pb.unroll2 = (g_rans_unroll2_ovr >= 0) ? g_rans_unroll2_ovr : unroll2_def;
-#define RANS_LAUNCH_MT(K_M16, K_XS, K_ACT, K_M32, DSM) do { \
-  if (wpb <= 14)      rans_launch_k<4, 4, 1, 1, true, 448, K_M16, K_XS, K_ACT, K_M32>(blocks, wpb * 32, (DSM), st, pb); \
-  else if (wpb <= 18) rans_launch_k<4, 4, 1, 1, true, 576, K_M16, K_XS, K_ACT, K_M32>(blocks, wpb * 32, (DSM), st, pb); \
-  else                rans_launch_k<4, 4, 1, 1, true, 640, K_M16, K_XS, K_ACT, K_M32>(blocks, wpb * 32, (DSM), st, pb); \
-} while (0)
   if (use_xsmem_fused) {
     if (M > 16) {
       if (act_mode == 1) {
-        RANS_LAUNCH_MT(true, true, 1, true, dsmem_xsmem);
+        rans_launch_k<4, 4, 1, 1, true, 640, true, true, 1, true>(blocks, wpb * 32, dsmem_xsmem, st, pb);
       } else {
-        RANS_LAUNCH_MT(true, true, 2, true, dsmem_xsmem);
+        rans_launch_k<4, 4, 1, 1, true, 640, true, true, 2, true>(blocks, wpb * 32, dsmem_xsmem, st, pb);
       }
     } else if (M > 8) {
       if (act_mode == 1) {
-        RANS_LAUNCH_MT(true, true, 1, false, dsmem_xsmem);
+        rans_launch_k<4, 4, 1, 1, true, 640, true, true, 1>(blocks, wpb * 32, dsmem_xsmem, st, pb);
       } else {
-        RANS_LAUNCH_MT(true, true, 2, false, dsmem_xsmem);
+        rans_launch_k<4, 4, 1, 1, true, 640, true, true, 2>(blocks, wpb * 32, dsmem_xsmem, st, pb);
       }
     } else {
       if (act_mode == 1) {
-        RANS_LAUNCH_MT(false, true, 1, false, dsmem_xsmem);
+        rans_launch_k<4, 4, 1, 1, true, 640, false, true, 1>(blocks, wpb * 32, dsmem_xsmem, st, pb);
       } else {
-        RANS_LAUNCH_MT(false, true, 2, false, dsmem_xsmem);
+        rans_launch_k<4, 4, 1, 1, true, 640, false, true, 2>(blocks, wpb * 32, dsmem_xsmem, st, pb);
       }
     }
     return;
@@ -1503,25 +1495,25 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   if (par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 20) {
     if (act_mode == 0 && M > 16 && x_aligned16) {
       if (xsmem_en && K >= xsmem_min_k && ((K >> 5) % 16 == 0) && dsmem_xsmem <= (size_t)(RANS_MAX_SMEM - RANS_LUT_BYTES)) {
-        RANS_LAUNCH_MT(true, true, 0, true, dsmem_xsmem);
+        rans_launch_k<4, 4, 1, 1, true, 640, true, true, 0, true>(blocks, wpb * 32, dsmem_xsmem, st, pb);
         return;
       } else if (dsmem <= 48u * 1024u) {
-        RANS_LAUNCH_MT(true, false, 0, true, dsmem);
+        rans_launch_k<4, 4, 1, 1, true, 640, true, false, 0, true>(blocks, wpb * 32, dsmem, st, pb);
         return;
       }
     } else if (act_mode == 0 && M > 8 && x_aligned16) {
       if (xsmem_en && K >= xsmem_min_k && ((K >> 5) % 16 == 0) && dsmem_xsmem <= (size_t)(RANS_MAX_SMEM - RANS_LUT_BYTES)) {
-        RANS_LAUNCH_MT(true, true, 0, false, dsmem_xsmem);
+        rans_launch_k<4, 4, 1, 1, true, 640, true, true, 0>(blocks, wpb * 32, dsmem_xsmem, st, pb);
         return;
       } else if (dsmem <= 48u * 1024u) {
-        RANS_LAUNCH_MT(true, false, 0, false, dsmem);
+        rans_launch_k<4, 4, 1, 1, true, 640, true, false, 0>(blocks, wpb * 32, dsmem, st, pb);
         return;
       }
     } else if (act_mode == 0 && M <= 8 && (pb.x_global ? (M >= 2) : (M >= 6)) &&
                x_aligned16 && xsmem_en && K >= xsmem_min_k && ((K >> 5) % 16 == 0) &&
                dsmem_xsmem <= (size_t)(RANS_MAX_SMEM - RANS_LUT_BYTES)) {
       pb.x_global = 1;
-      RANS_LAUNCH_MT(false, true, 0, false, dsmem_xsmem);
+      rans_launch_k<4, 4, 1, 1, true, 640, false, true, 0>(blocks, wpb * 32, dsmem_xsmem, st, pb);
       return;
     } else if (act_mode == 0 && pb.x_global && x_aligned16 && dsmem <= 48u * 1024u) {
       rans_launch_k<4, 4, 1, 1, true, 640, false, false, 0>(blocks, wpb * 32, dsmem, st, pb);
@@ -1531,7 +1523,6 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
       return;
     }
   }
-#undef RANS_LAUNCH_MT
   TORCH_CHECK(act_mode == 0 || !pb.x_global, "rans fused act_mode requires SMEM or xsmem_fused path");
 #define RANS_L2(NSV, RGV) \
   if (ns == NSV && rg == RGV) rans_launch_k<NSV, RGV>(blocks, wpb * 32, dsmem, st, pb);

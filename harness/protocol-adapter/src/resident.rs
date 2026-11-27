@@ -35,7 +35,6 @@
 //! read as a fast phase.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -70,7 +69,6 @@ pub const RESIDENT_BACKEND: &str = "vllm-resident";
 /// Generous: one `sync` of a long prompt is a real prefill on the box. The
 /// resident has its own, shorter, idle ceiling in the other direction.
 const VERB_TIMEOUT: Duration = Duration::from_secs(1800);
-const REPLY_HOT_WAIT: Duration = Duration::from_secs(5);
 
 /// What the resident answered `hello` with: the identity of the process that
 /// actually holds the weights.
@@ -229,9 +227,6 @@ impl ResidentSession {
                 format!("the resident engine closed while a request was going out: {e}")
             })?;
         let mut reply = String::new();
-        if self.reader.buffer().is_empty() {
-            crate::hotwait::wait_readable(self.reader.get_ref().as_raw_fd(), REPLY_HOT_WAIT);
-        }
         let read = self
             .reader
             .read_line(&mut reply)
