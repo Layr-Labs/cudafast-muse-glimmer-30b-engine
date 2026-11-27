@@ -300,28 +300,28 @@ __global__ void dflash_qkv_norm_rope_kernel(
 
 template <typename LastSampT, typename TailIdT>
 __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
-    int32_t* __restrict__ out_input_ids,
-    int64_t* __restrict__ out_query_positions,
-    int32_t* __restrict__ out_query_start_loc,
-    int32_t* __restrict__ out_seq_lens,
-    int64_t* __restrict__ out_query_slot_mapping,
-    int64_t* __restrict__ out_context_positions,
-    int64_t* __restrict__ out_context_slot_mapping,
-    int64_t* __restrict__ out_sample_indices,
-    int64_t* __restrict__ out_sample_pos,
-    int32_t* __restrict__ out_sample_idx_mapping,
-    float* __restrict__ out_temperature,
-    int64_t* __restrict__ out_seeds,
-    const int64_t* __restrict__ target_positions,
-    const int32_t* __restrict__ target_query_start_loc,
-    const int32_t* __restrict__ idx_mapping,
-    const LastSampT* __restrict__ last_sampled,
-    const int32_t* __restrict__ next_prefill_tokens,
-    const int32_t* __restrict__ num_sampled,
-    const int32_t* __restrict__ num_rejected,
-    const float* __restrict__ in_temperature,
-    const int64_t* __restrict__ in_seeds,
-    const int32_t* __restrict__ block_table,
+    int32_t* out_input_ids,
+    int64_t* out_query_positions,
+    int32_t* out_query_start_loc,
+    int32_t* out_seq_lens,
+    int64_t* out_query_slot_mapping,
+    int64_t* out_context_positions,
+    int64_t* out_context_slot_mapping,
+    int64_t* out_sample_indices,
+    int64_t* out_sample_pos,
+    int32_t* out_sample_idx_mapping,
+    float* out_temperature,
+    int64_t* out_seeds,
+    const int64_t* target_positions,
+    const int32_t* target_query_start_loc,
+    const int32_t* idx_mapping,
+    const LastSampT* last_sampled,
+    const int32_t* next_prefill_tokens,
+    const int32_t* num_sampled,
+    const int32_t* num_rejected,
+    const float* in_temperature,
+    const int64_t* in_seeds,
+    const int32_t* block_table,
     int64_t block_table_stride,
     int32_t parallel_drafting_token_id,
     int64_t block_size,
@@ -331,18 +331,22 @@ __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
     int max_num_tokens,
     int64_t max_model_len,
     int64_t pad_slot_id,
-    const TailIdT* __restrict__ target_input_ids,
+    const TailIdT* target_input_ids,
     int tail_num_tokens,
     const uint8_t* __restrict__ in_static_vocab,
-    int32_t* __restrict__ tail_ids,
-    int32_t* __restrict__ tail_count,
-    int32_t* __restrict__ tail_seen,
+    int32_t* tail_ids,
+    int32_t* tail_count,
+    int32_t* tail_seen,
     int vocab_size,
     int max_tail,
     int include_bonus,
-    int32_t* __restrict__ hist,
-    int32_t* __restrict__ hist_len,
-    int hist_cap) {
+    int32_t* hist,
+    int32_t* hist_len,
+    int hist_cap,
+    int pdl_mode) {
+  if ((pdl_mode & 1) != 0) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
   __shared__ int32_t s_req_state_idx;
   __shared__ int32_t s_ctx_start;
   __shared__ int32_t s_num_ctx;
@@ -546,6 +550,9 @@ __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
       }
       hist_len[0] = (s_hist_need_len <= hist_cap) ? static_cast<int32_t>(s_hist_need_len) : -1;
     }
+  }
+  if ((pdl_mode & 2) != 0) {
+    asm volatile("griddepcontrol.launch_dependents;");
   }
 }
 
@@ -939,8 +946,10 @@ void dflash_prepare_inputs(
     return (!s || !*s || std::atoi(s) != 0) ? 1 : 0;
   }();
   auto st = c10::cuda::getCurrentCUDAStream().stream();
+  const int pdl = dflash_fuse_pdl_mode();
 #define LAUNCH_PREP(LST, TIDT) \
-  dflash_prepare_inputs_kernel<LST, TIDT><<<1, 256, 0, st>>>( \
+  dflash_launch_pdl( \
+      dflash_prepare_inputs_kernel<LST, TIDT>, 1, 256, st, pdl, \
       out_input_ids.data_ptr<int32_t>(), \
       out_query_positions.data_ptr<int64_t>(), \
       out_query_start_loc.data_ptr<int32_t>(), \
@@ -983,7 +992,8 @@ void dflash_prepare_inputs(
       include_bonus, \
       hist_ptr, \
       hist_len_ptr, \
-      hist_cap)
+      hist_cap, \
+      pdl)
 
   if (ls_i64) {
     if (tail_i64) { LAUNCH_PREP(int64_t, int64_t); }

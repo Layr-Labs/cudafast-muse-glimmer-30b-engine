@@ -34,6 +34,8 @@ adapter/projection stack.
 import math
 import os
 import re
+
+os.environ.setdefault("MUSE_GQA16_MULTIQ_PDL", "1")
 from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 from typing import Annotated, Literal
