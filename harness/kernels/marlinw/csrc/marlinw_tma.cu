@@ -277,7 +277,9 @@ __device__ __forceinline__ void k_loop(
     if (tid == 0 && q + kDist < total) start_copy(q + kDist);
     // k-half 0 of k-tile t (operands already in registers); meanwhile k-half 1 of the same stage is loaded.
     load_bs(1, s);
+#ifdef MARLINW_TMA_GATEUP
     dequant_to(1);
+#endif
     if constexpr (kSingleFa) {
       const uint32_t sa = sbase + kStageBytes * s + a_rd1;
 #pragma unroll
@@ -289,6 +291,9 @@ __device__ __forceinline__ void k_loop(
         ldsm4(fa[0][i], sa + 2048 * i);
       }
       __syncwarp();
+#ifndef MARLINW_TMA_GATEUP
+      dequant_to(1);
+#endif
       if (lane == 0) mbar_arrive(empty_bar + 8 * s);
       const bool has_next = (t + 1 < iters);
       if (has_next) {
@@ -319,6 +324,9 @@ __device__ __forceinline__ void k_loop(
       }
       __syncwarp();
       if (lane == 0) mbar_arrive(empty_bar + 8 * s);  // warp-aggregated empty signal
+#ifndef MARLINW_TMA_GATEUP
+      dequant_to(1);
+#endif
 #pragma unroll
       for (int i = 0; i < MB; i++) {
         mma16(fa[0][i], bb[0][1][0], acc[i][1][0]);
@@ -1005,8 +1013,7 @@ __global__ void __launch_bounds__(kThreads, 1) gateup(
         auto up = reinterpret_cast<const __nv_bfloat16*>(&ups)[e];
         const float silu = swiglu_silu(__bfloat162float(gate));
         const float product = __fmul_rn(silu, __bfloat162float(up));
-        const float q = __fmul_rn(product, inverse);
-        scaled[e] = q < -448.0f ? -448.0f : (q > 448.0f ? 448.0f : q);
+        scaled[e] = __fmul_rn(product, inverse);
       }
       uint16_t converted;
       asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(converted) : "f"(scaled[1]), "f"(scaled[0]));
@@ -1262,10 +1269,8 @@ __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
       const __nv_bfloat16 bu1 = __float2bfloat16_rn(u1 * gs);
       const float q0 = __fmul_rn(__fmul_rn(swiglu_silu(__bfloat162float(bg0)), __bfloat162float(bu0)), inverse);
       const float q1 = __fmul_rn(__fmul_rn(swiglu_silu(__bfloat162float(bg1)), __bfloat162float(bu1)), inverse);
-      const float s0 = q0 < -448.0f ? -448.0f : (q0 > 448.0f ? 448.0f : q0);
-      const float s1 = q1 < -448.0f ? -448.0f : (q1 > 448.0f ? 448.0f : q1);
       uint16_t conv;
-      asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(conv) : "f"(s1), "f"(s0));
+      asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(conv) : "f"(q1), "f"(q0));
       return static_cast<uint32_t>(conv);
     };
 #pragma unroll

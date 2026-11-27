@@ -15,7 +15,51 @@
 #include <cstring>
 #include <stdint.h>
 
+__nv_bfloat16* vq4d_alloc_swg_prerot(
+    const void* src_ptr, int M, int64_t I, const torch::TensorOptions& opts, int*& out_pair_done);
+void vq4d_clear_all_prerot();
+void vq4d_reset_norm_rot_table();
+
 namespace {
+
+static bool int3_swg_fuse_rot_enabled() {
+  static const bool dyn = (std::getenv("MUSE_BENCH_DYN_ENV") != nullptr);
+  if (dyn) {
+    const char* s = std::getenv("MUSE_DFLASH_SWG_FUSE_ROT");
+    return (!s || !*s) ? false : (std::atoi(s) != 0);
+  }
+  static const bool en = []() -> bool {
+    const char* s = std::getenv("MUSE_DFLASH_SWG_FUSE_ROT");
+    return (!s || !*s) ? false : (std::atoi(s) != 0);
+  }();
+  return en;
+}
+
+static bool int3_swg_n64_enabled() {
+  static const bool dyn = (std::getenv("MUSE_BENCH_DYN_ENV") != nullptr);
+  if (dyn) {
+    const char* s = std::getenv("MUSE_INT3_SWG_N64");
+    return (!s || !*s) ? false : (std::atoi(s) != 0);
+  }
+  static const bool en = []() -> bool {
+    const char* s = std::getenv("MUSE_INT3_SWG_N64");
+    return (!s || !*s) ? false : (std::atoi(s) != 0);
+  }();
+  return en;
+}
+
+static bool int3_swg_n64_rot_enabled() {
+  static const bool dyn = (std::getenv("MUSE_BENCH_DYN_ENV") != nullptr);
+  if (dyn) {
+    const char* s = std::getenv("MUSE_INT3_SWG_N64_ROT");
+    return (!s || !*s) ? true : (std::atoi(s) != 0);
+  }
+  static const bool en = []() -> bool {
+    const char* s = std::getenv("MUSE_INT3_SWG_N64_ROT");
+    return (!s || !*s) ? true : (std::atoi(s) != 0);
+  }();
+  return en;
+}
 
 constexpr int kWarpsPerBlock = 4;
 constexpr int kThreads = kWarpsPerBlock * 32;                    // 128
@@ -29,6 +73,7 @@ constexpr int kN32StepWBytes = 4 * kTileBytes;                   // 896 = 56 * 1
 constexpr int kN32StepWU4 = kN32StepWBytes / 16;                 // 56
 constexpr int kSymTileBytes = 200;                               // 192 B (3-bit) + 8 B (UE4M4 scales) = 3.125 bpw
 constexpr int kSymStepWBytes = kNTilesPerCTA * kSymTileBytes;    // 1600 = 100 * 16 (64B aligned, TMA-valid)
+constexpr int kSymN64StepWBytes = 16 * kSymTileBytes;            // 3200 = 25 * 128 (128B aligned, TMA-valid)
 constexpr int kSymN32StepWBytes = 4 * kSymTileBytes;             // 800 = 50 * 16 (32B aligned, TMA-valid)
 constexpr int kSymFooterBytes = 16;                              // [magic, base_shifted, 0, 0]
 constexpr int kSymH64FooterBytes = 32;                           // distinct size for H64 + sym NF3
@@ -37,7 +82,9 @@ constexpr uint32_t kSymH64Magic = 0x48363433u;                   // "H643"
 constexpr int kStages = 4;
 constexpr int kN32Stages = 5;
 constexpr int kSwgStages = 5;
+constexpr int kSwgN64Stages = 3;
 constexpr int kDefaultSwgWaveIlv = 192;                          // 48 SMs * 4 CTAs/SM (optimal for Q=16 & M=6)
+constexpr int kDefaultSwgN64Ilv = 336;                           // 48 SMs * 7 CTAs/SM >= 312 (1-wave at I=19968)
 
 static bool int3_bench_dyn_env() {
   static const bool dyn = (std::getenv("MUSE_BENCH_DYN_ENV") != nullptr);
@@ -205,6 +252,28 @@ __device__ __forceinline__ void int3_ldmatrix_x4(
 __device__ __forceinline__ uint32_t int3_bf16x2_u32(float f0, float f1) {
   __nv_bfloat162 v = __floats2bfloat162_rn(f0, f1);
   return *reinterpret_cast<const uint32_t*>(&v);
+}
+
+__device__ __forceinline__ float4 int3_ldcg_f4(const float4* ptr) {
+  float4 v;
+  asm volatile("ld.global.cg.v4.f32 {%0, %1, %2, %3}, [%4];"
+               : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+               : "l"(ptr));
+  return v;
+}
+
+__host__ __device__ __forceinline__ size_t int3_swg_sk_step_slot(
+    int cta_n, int kg, int num_cta, int num_kg, int grid_ctas) {
+  const int64_t total = static_cast<int64_t>(num_cta) * num_kg;
+  const int64_t lin = static_cast<int64_t>(cta_n) * num_kg + kg;
+  const int c = static_cast<int>(((lin + 1) * grid_ctas - 1) / total);
+  const int64_t iter_s = (static_cast<int64_t>(c) * total) / grid_ctas;
+  const int64_t loc = lin - iter_s;
+  const int64_t q = total / grid_ctas;
+  if (loc < q) {
+    return static_cast<size_t>(loc * grid_ctas + c);
+  }
+  return static_cast<size_t>(q * grid_ctas + (iter_s - static_cast<int64_t>(c) * q));
 }
 
 __device__ __forceinline__ float int3_subwarp4_sum(float v) {
@@ -572,12 +641,18 @@ __global__ void int3_pack_swiglu_kernel(
   const int sub_tile = ((g_tile & 3) << 1) | is_up;
   const int num_kg = K >> 6;
   const int num_cta = I >> 5;
-  const int wave = cta_n / swg_ilv;
-  const int in_wave = cta_n - wave * swg_ilv;
-  const int wave_sz = ((wave + 1) * swg_ilv <= num_cta) ? swg_ilv : (num_cta - wave * swg_ilv);
-  const size_t tile_off = (static_cast<size_t>(wave * swg_ilv) * num_kg +
-                           static_cast<size_t>(kg) * wave_sz + in_wave) * kStepWBytes +
-                          static_cast<size_t>(sub_tile) * kTileBytes;
+  size_t tile_off = 0;
+  if (swg_ilv < 0) {
+    tile_off = int3_swg_sk_step_slot(cta_n, kg, num_cta, num_kg, -swg_ilv) * kStepWBytes +
+               static_cast<size_t>(sub_tile) * kTileBytes;
+  } else {
+    const int wave = cta_n / swg_ilv;
+    const int in_wave = cta_n - wave * swg_ilv;
+    const int wave_sz = ((wave + 1) * swg_ilv <= num_cta) ? swg_ilv : (num_cta - wave * swg_ilv);
+    tile_off = (static_cast<size_t>(wave * swg_ilv) * num_kg +
+                static_cast<size_t>(kg) * wave_sz + in_wave) * kStepWBytes +
+               static_cast<size_t>(sub_tile) * kTileBytes;
+  }
 
   uint8_t* dst = out + tile_off;
   reinterpret_cast<uint32_t*>(dst)[lane] = pk_lo;
@@ -880,12 +955,29 @@ __global__ void __launch_bounds__(256) int3_pack_swiglu_sym_h64_kernel(
     const int sub_tile = ((g_tile & 3) << 1) | is_up;
     const int num_kg = K >> 6;
     const int num_cta = I >> 5;
-    const int wave = cta_n / swg_ilv;
-    const int in_wave = cta_n - wave * swg_ilv;
-    const int wave_sz = ((wave + 1) * swg_ilv <= num_cta) ? swg_ilv : (num_cta - wave * swg_ilv);
-    const size_t tile_off = (static_cast<size_t>(wave * swg_ilv) * num_kg +
-                             static_cast<size_t>(kg) * wave_sz + in_wave) * kSymStepWBytes +
-                            static_cast<size_t>(sub_tile) * kSymTileBytes;
+    size_t tile_off = 0;
+    if (swg_ilv >= 10000) {
+      const int ilv64 = swg_ilv - 10000;
+      const int cta_n64 = g_tile >> 3;
+      const int sub_tile16 = ((g_tile & 7) << 1) | is_up;
+      const int num_cta64 = I >> 6;
+      const int wave = cta_n64 / ilv64;
+      const int in_wave = cta_n64 - wave * ilv64;
+      const int wave_sz = ((wave + 1) * ilv64 <= num_cta64) ? ilv64 : (num_cta64 - wave * ilv64);
+      tile_off = (static_cast<size_t>(wave * ilv64) * num_kg +
+                  static_cast<size_t>(kg) * wave_sz + in_wave) * kSymN64StepWBytes +
+                 static_cast<size_t>(sub_tile16) * kSymTileBytes;
+    } else if (swg_ilv < 0) {
+      tile_off = int3_swg_sk_step_slot(cta_n, kg, num_cta, num_kg, -swg_ilv) * kSymStepWBytes +
+                 static_cast<size_t>(sub_tile) * kSymTileBytes;
+    } else {
+      const int wave = cta_n / swg_ilv;
+      const int in_wave = cta_n - wave * swg_ilv;
+      const int wave_sz = ((wave + 1) * swg_ilv <= num_cta) ? swg_ilv : (num_cta - wave * swg_ilv);
+      tile_off = (static_cast<size_t>(wave * swg_ilv) * num_kg +
+                  static_cast<size_t>(kg) * wave_sz + in_wave) * kSymStepWBytes +
+                 static_cast<size_t>(sub_tile) * kSymTileBytes;
+    }
 
     uint8_t* dst = out + tile_off;
     reinterpret_cast<uint32_t*>(dst)[lane] = pk_lo;
@@ -897,7 +989,7 @@ __global__ void __launch_bounds__(256) int3_pack_swiglu_sym_h64_kernel(
       uint32_t* ftr = reinterpret_cast<uint32_t*>(out + payload_bytes);
       ftr[0] = kSymH64Magic;
       ftr[1] = base_shifted;
-      ftr[2] = 0u;
+      ftr[2] = (swg_ilv >= 10000) ? (0x4E363400u | static_cast<uint32_t>(swg_ilv - 10000)) : 0u;
       ftr[3] = 0u;
       ftr[4] = 0u;
       ftr[5] = 0u;
@@ -932,12 +1024,18 @@ __global__ void int3_pack_swiglu_sym_kernel(
   const int sub_tile = ((g_tile & 3) << 1) | is_up;
   const int num_kg = K >> 6;
   const int num_cta = I >> 5;
-  const int wave = cta_n / swg_ilv;
-  const int in_wave = cta_n - wave * swg_ilv;
-  const int wave_sz = ((wave + 1) * swg_ilv <= num_cta) ? swg_ilv : (num_cta - wave * swg_ilv);
-  const size_t tile_off = (static_cast<size_t>(wave * swg_ilv) * num_kg +
-                           static_cast<size_t>(kg) * wave_sz + in_wave) * kSymStepWBytes +
-                          static_cast<size_t>(sub_tile) * kSymTileBytes;
+  size_t tile_off = 0;
+  if (swg_ilv < 0) {
+    tile_off = int3_swg_sk_step_slot(cta_n, kg, num_cta, num_kg, -swg_ilv) * kSymStepWBytes +
+               static_cast<size_t>(sub_tile) * kSymTileBytes;
+  } else {
+    const int wave = cta_n / swg_ilv;
+    const int in_wave = cta_n - wave * swg_ilv;
+    const int wave_sz = ((wave + 1) * swg_ilv <= num_cta) ? swg_ilv : (num_cta - wave * swg_ilv);
+    tile_off = (static_cast<size_t>(wave * swg_ilv) * num_kg +
+                static_cast<size_t>(kg) * wave_sz + in_wave) * kSymStepWBytes +
+               static_cast<size_t>(sub_tile) * kSymTileBytes;
+  }
 
   uint8_t* dst = out + tile_off;
   reinterpret_cast<uint32_t*>(dst)[lane] = pk_lo;
@@ -1235,12 +1333,12 @@ __global__ void __launch_bounds__(128, 6) int3_mma_gemm_n32_kernel(
     if constexpr (kM16) {
       *reinterpret_cast<uint4*>(&smem.a[st][a_row][a_phys_col8 * 8]) =
           a_valid
-              ? __ldg(reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8))
+              ? *reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8)
               : make_uint4(0u, 0u, 0u, 0u);
     } else if (tid < 64) {
       *reinterpret_cast<uint4*>(&smem.a[st][a_row][a_phys_col8 * 8]) =
           a_valid
-              ? __ldg(reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8))
+              ? *reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8)
               : make_uint4(0u, 0u, 0u, 0u);
     }
   };
@@ -1458,15 +1556,15 @@ __global__ void __launch_bounds__(128, 6) int3_mma_gemm_n32_pair_kernel(
     const int k_base = p * 128;
     if constexpr (kM16) {
       *reinterpret_cast<uint4*>(&smem.a[st_a][0][a_row][a_phys_col8 * 8]) =
-          a_valid ? __ldg(reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + k_base + a_col8 * 8))
+          a_valid ? *reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + k_base + a_col8 * 8)
                   : make_uint4(0u, 0u, 0u, 0u);
       *reinterpret_cast<uint4*>(&smem.a[st_a][1][a_row][a_phys_col8 * 8]) =
-          a_valid ? __ldg(reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + k_base + 64 + a_col8 * 8))
+          a_valid ? *reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + k_base + 64 + a_col8 * 8)
                   : make_uint4(0u, 0u, 0u, 0u);
     } else {
       *reinterpret_cast<uint4*>(&smem.a[st_a][a_half_m8][a_row][a_phys_col8 * 8]) =
-          a_valid ? __ldg(reinterpret_cast<const uint4*>(
-                        A + static_cast<size_t>(a_row) * K + k_base + a_half_m8 * 64 + a_col8 * 8))
+          a_valid ? *reinterpret_cast<const uint4*>(
+                        A + static_cast<size_t>(a_row) * K + k_base + a_half_m8 * 64 + a_col8 * 8)
                   : make_uint4(0u, 0u, 0u, 0u);
     }
   };
@@ -1645,6 +1743,8 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_gemm_swiglu_kernel
     const __nv_bfloat16* __restrict__ A,
     const uint8_t* __restrict__ W_packed,
     __nv_bfloat16* __restrict__ C,
+    __nv_bfloat16* __restrict__ C_prerot,
+    int* __restrict__ pair_done,
     int M, int I, int K, int swg_ilv, int pdl_mode) {
   constexpr int kTileB = kSym ? kSymTileBytes : kTileBytes;
   constexpr int kStepWB = kSym ? kSymStepWBytes : kStepWBytes;
@@ -1711,12 +1811,12 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_gemm_swiglu_kernel
     if constexpr (kM16) {
       *reinterpret_cast<uint4*>(&smem.a[st][a_row][a_phys_col8 * 8]) =
           a_valid
-              ? __ldg(reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8))
+              ? *reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8)
               : make_uint4(0u, 0u, 0u, 0u);
     } else if (tid < 64) {
       *reinterpret_cast<uint4*>(&smem.a[st][a_row][a_phys_col8 * 8]) =
           a_valid
-              ? __ldg(reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8))
+              ? *reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8)
               : make_uint4(0u, 0u, 0u, 0u);
     }
   };
@@ -1838,9 +1938,631 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_gemm_swiglu_kernel
   if constexpr (kM16) {
     if (has_hi) {
       *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * I + col) =
-          int3_bf16x2_u32(int3_swiglu_f32(d2_g, d2_u), int3_swiglu_f32(d3_g, d3_u));
+           int3_bf16x2_u32(int3_swiglu_f32(d2_g, d2_u), int3_swiglu_f32(d3_g, d3_u));
     }
   }
+  if (C_prerot != nullptr) {
+    __shared__ int s_pair_ready;
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+      const int p64 = cta_n >> 1;
+      int prev;
+      asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;"
+                   : "=r"(prev)
+                   : "l"(&pair_done[p64])
+                   : "memory");
+      if (prev == 1) {
+        pair_done[p64] = 0;
+        s_pair_ready = 1;
+      } else {
+        s_pair_ready = 0;
+      }
+    }
+    __syncthreads();
+    if (s_pair_ready) {
+      __threadfence();
+      const int p64 = cta_n >> 1;
+      const int col0 = p64 * 64 + 2 * lane;
+      for (int r = warp; r < M; r += 4) {
+        uint32_t raw_u32;
+        asm volatile("ld.global.cg.u32 %0, [%1];"
+                     : "=r"(raw_u32)
+                     : "l"(reinterpret_cast<const uint32_t*>(C + static_cast<size_t>(r) * I + col0)));
+        const __nv_bfloat162 raw = *reinterpret_cast<const __nv_bfloat162*>(&raw_u32);
+        const float2 rf = __bfloat1622float2(raw);
+        float v0 = rf.x * int3_rad_sign(col0 + 0);
+        float v1 = rf.y * int3_rad_sign(col0 + 1);
+        int3_warp_fwht64(v0, v1, lane);
+        *reinterpret_cast<__nv_bfloat162*>(C_prerot + static_cast<size_t>(r) * I + col0) =
+            __floats2bfloat162_rn(v0, v1);
+      }
+    }
+  }
+}
+
+template <int kMaxM>
+struct alignas(128) Int3SwgN64Smem {
+  alignas(128) uint8_t w[kSwgN64Stages][kSymN64StepWBytes];  // 3 * 3200 = 9600 B (exact 128B TMA)
+  alignas(128) __nv_bfloat16 a[kSwgN64Stages][kMaxM][64];    // 3 * 1024 = 3072 B (M<=8) or 6144 B (M<=16)
+  alignas(8) uint32_t lut64[64];                             // 256 B
+  alignas(8) uint64_t mbar[kSwgN64Stages];                   // 24 B -> 13,056 B (7 CTAs/SM = 336 >= 312!)
+};
+
+// Single-wave 312-CTA (7 CTAs/SM at M<=8) N64 SwiGLU kernel (64 output cols/CTA, 3200B Hardware-TMA,
+// 2x A reuse across N, and zero-atomic in-CTA SMEM C_prerot epilogue — 100.000% 0-ULP bit-identical!).
+template <bool kM16, bool kTma>
+__global__ void __launch_bounds__(128, kM16 ? 5 : 7) int3_mma_gemm_swiglu_n64_kernel(
+    const __nv_bfloat16* __restrict__ A,
+    const uint8_t* __restrict__ W_packed,
+    __nv_bfloat16* __restrict__ C,
+    __nv_bfloat16* __restrict__ C_prerot,
+    int M, int I, int K, int ilv64, int pdl_mode) {
+  constexpr int kTileB = kSymTileBytes;
+  constexpr int kStepWB = kSymN64StepWBytes;
+  constexpr int kStepU4 = kStepWB / 16;  // 200
+  __shared__ Int3SwgN64Smem<kM16 ? 16 : 8> smem;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const int num_kg = K >> 6;
+  const int num_cta64 = I >> 6;
+  const int cta_n64 = blockIdx.x;
+
+  int3_init_lut<true, true>(smem.lut64, tid);
+
+  if constexpr (kTma) {
+    if (tid == 0) {
+      int3_mbar_init(smem.mbar, kSwgN64Stages);
+    }
+    __syncthreads();
+  }
+
+  const int wave = cta_n64 / ilv64;
+  const int in_wave = cta_n64 - wave * ilv64;
+  const int wave_sz = ((wave + 1) * ilv64 <= num_cta64) ? ilv64 : (num_cta64 - wave * ilv64);
+  const size_t total_bytes = static_cast<size_t>(num_cta64) * num_kg * kStepWB;
+  const uint32_t base_shifted = __ldg(reinterpret_cast<const uint32_t*>(W_packed + total_bytes) + 1);
+  const uint8_t* w_base = W_packed +
+                          (static_cast<size_t>(wave * ilv64) * num_kg + in_wave) * kStepWB;
+  const size_t w_kg_stride = static_cast<size_t>(wave_sz) * kStepWB;
+
+  if (cta_n64 == 0) {
+    for (size_t off = static_cast<size_t>(tid) << 21; off < total_bytes; off += static_cast<size_t>(kThreads) << 21) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(W_packed + off));
+    }
+  }
+
+  const int a_row = tid >> 3;
+  const int a_col8 = tid & 7;
+  const int a_phys_col8 = a_col8 ^ (a_row & 7);
+  const bool a_valid = (a_row < M);
+  const int a_src_sz = a_valid ? 16 : 0;
+  const int a_safe_row = a_valid ? a_row : 0;
+
+  auto issue_w_tma_only = [&](int kg, int st, bool need_fence) {
+    if (tid == 0) {
+      if (need_fence) {
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      }
+      const uint64_t pol = int3_pol_evict_first();
+      int3_tma_bulk_w(
+          smem.w[st], w_base + static_cast<size_t>(kg) * w_kg_stride, kStepWB, &smem.mbar[st], pol);
+    }
+  };
+
+  auto issue_w_cpasync_only = [&](int kg, int st) {
+    const uint8_t* ws = w_base + static_cast<size_t>(kg) * w_kg_stride;
+    for (int u = tid; u < kStepU4; u += kThreads) {
+      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][u * 16]));
+      int3_cp_async16_w(sd, ws + u * 16);
+    }
+  };
+
+  auto issue_a_only = [&](int kg, int st) {
+    if constexpr (kM16) {
+      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][a_row][a_phys_col8 * 8]));
+      int3_cp_async16_a_pred(sd, A + static_cast<size_t>(a_safe_row) * K + kg * 64 + a_col8 * 8, a_src_sz);
+    } else if (tid < 64) {
+      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][a_row][a_phys_col8 * 8]));
+      int3_cp_async16_a_pred(sd, A + static_cast<size_t>(a_safe_row) * K + kg * 64 + a_col8 * 8, a_src_sz);
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  };
+
+  auto issue_stage = [&](int kg, int st, bool need_fence) {
+    if constexpr (kTma) {
+      issue_w_tma_only(kg, st, need_fence);
+    } else {
+      issue_w_cpasync_only(kg, st);
+    }
+    issue_a_only(kg, st);
+  };
+
+  constexpr int kPreload = kSwgN64Stages - 1;  // 2
+  const int preload = (num_kg < kPreload) ? num_kg : kPreload;
+  if ((pdl_mode & 1) != 0) {
+    for (int i = 0; i < preload; ++i) {
+      if constexpr (kTma) {
+        issue_w_tma_only(i, i, false);
+      } else {
+        issue_w_cpasync_only(i, i);
+        asm volatile("cp.async.commit_group;\n" ::: "memory");
+      }
+    }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    if constexpr (kTma) {
+      for (int i = 0; i < preload; ++i) {
+        issue_a_only(i, i);
+      }
+    } else {
+      for (int i = 0; i < preload; ++i) {
+        if constexpr (kM16) {
+          *reinterpret_cast<uint4*>(&smem.a[i][a_row][a_phys_col8 * 8]) =
+              a_valid ? *reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + i * 64 + a_col8 * 8)
+                      : make_uint4(0u, 0u, 0u, 0u);
+        } else if (tid < 64) {
+          *reinterpret_cast<uint4*>(&smem.a[i][a_row][a_phys_col8 * 8]) =
+              a_valid ? *reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + i * 64 + a_col8 * 8)
+                      : make_uint4(0u, 0u, 0u, 0u);
+        }
+      }
+    }
+  } else {
+    for (int i = 0; i < preload; ++i) {
+      issue_stage(i, i, false);
+    }
+  }
+
+  float d0_g0 = 0.0f, d1_g0 = 0.0f, d2_g0 = 0.0f, d3_g0 = 0.0f;
+  float d0_u0 = 0.0f, d1_u0 = 0.0f, d2_u0 = 0.0f, d3_u0 = 0.0f;
+  float d0_g1 = 0.0f, d1_g1 = 0.0f, d2_g1 = 0.0f, d3_g1 = 0.0f;
+  float d0_u1 = 0.0f, d1_u1 = 0.0f, d2_u1 = 0.0f, d3_u1 = 0.0f;
+  const bool has_hi = kM16 && ((g + 8) < M);
+  const int ldm_row = kM16 ? (lane & 15) : (lane & 7);
+  const int ldm_col_off = kM16 ? (lane >> 4) : ((lane >> 3) & 1);
+  const int trig_i = ((pdl_mode & 2) != 0) ? ((num_kg > 3) ? (num_kg - 3) : 0) : -1;
+
+  int st = 0;
+  uint32_t parity = 0u;
+  for (int i = 0; i < num_kg; ++i) {
+    if (i == trig_i) {
+      asm volatile("griddepcontrol.launch_dependents;");
+    }
+    if constexpr (kTma) {
+      int3_mbar_wait(&smem.mbar[st], parity);
+    }
+    const int rem = num_kg - 1 - i;
+    if (rem >= 1) {
+      asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+    } else {
+      asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    }
+    __syncthreads();
+
+    const int next_i = i + kPreload;
+    if (next_i < num_kg) {
+      const int next_st = (st == 0) ? (kSwgN64Stages - 1) : (st - 1);
+      issue_stage(next_i, next_st, true);
+    }
+
+    uint32_t a0_s[4], a1_s[4], a2_s[4], a3_s[4];
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const int pcol8 = (2 * s + ldm_col_off) ^ (ldm_row & 7);
+      const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][ldm_row][pcol8 * 8]));
+      if constexpr (kM16) {
+        int3_ldmatrix_x4(a0_s[s], a1_s[s], a2_s[s], a3_s[s], addr);
+      } else {
+        int3_ldmatrix_x2(a0_s[s], a2_s[s], addr);
+      }
+    }
+
+    {
+      uint32_t w01_g, w23_g, w01_u, w23_u;
+      __nv_bfloat162 scg, zrg, scu, zru;
+      int3_load_tile_words<true>(&smem.w[st][(warp * 4 + 0) * kTileB], lane, g, base_shifted, w01_g, w23_g, scg, zrg);
+      int3_load_tile_words<true>(&smem.w[st][(warp * 4 + 1) * kTileB], lane, g, base_shifted, w01_u, w23_u, scu, zru);
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        uint32_t b0, b1, c0, c1;
+        int3_deq4_k16<true>(smem.lut64, w01_g, w23_g, s, scg, zrg, b0, b1);
+        int3_deq4_k16<true>(smem.lut64, w01_u, w23_u, s, scu, zru, c0, c1);
+        if constexpr (kM16) {
+          int3_mma_m16n8k16_full(d0_g0, d1_g0, d2_g0, d3_g0, a0_s[s], a1_s[s], a2_s[s], a3_s[s], b0, b1);
+          int3_mma_m16n8k16_full(d0_u0, d1_u0, d2_u0, d3_u0, a0_s[s], a1_s[s], a2_s[s], a3_s[s], c0, c1);
+        } else {
+          int3_mma_m16n8k16(d0_g0, d1_g0, d2_g0, d3_g0, a0_s[s], a2_s[s], b0, b1);
+          int3_mma_m16n8k16(d0_u0, d1_u0, d2_u0, d3_u0, a0_s[s], a2_s[s], c0, c1);
+        }
+      }
+    }
+
+    {
+      uint32_t w01_g, w23_g, w01_u, w23_u;
+      __nv_bfloat162 scg, zrg, scu, zru;
+      int3_load_tile_words<true>(&smem.w[st][(warp * 4 + 2) * kTileB], lane, g, base_shifted, w01_g, w23_g, scg, zrg);
+      int3_load_tile_words<true>(&smem.w[st][(warp * 4 + 3) * kTileB], lane, g, base_shifted, w01_u, w23_u, scu, zru);
+#pragma unroll
+      for (int s = 0; s < 4; ++s) {
+        uint32_t b0, b1, c0, c1;
+        int3_deq4_k16<true>(smem.lut64, w01_g, w23_g, s, scg, zrg, b0, b1);
+        int3_deq4_k16<true>(smem.lut64, w01_u, w23_u, s, scu, zru, c0, c1);
+        if constexpr (kM16) {
+          int3_mma_m16n8k16_full(d0_g1, d1_g1, d2_g1, d3_g1, a0_s[s], a1_s[s], a2_s[s], a3_s[s], b0, b1);
+          int3_mma_m16n8k16_full(d0_u1, d1_u1, d2_u1, d3_u1, a0_s[s], a1_s[s], a2_s[s], a3_s[s], c0, c1);
+        } else {
+          int3_mma_m16n8k16(d0_g1, d1_g1, d2_g1, d3_g1, a0_s[s], a2_s[s], b0, b1);
+          int3_mma_m16n8k16(d0_u1, d1_u1, d2_u1, d3_u1, a0_s[s], a2_s[s], c0, c1);
+        }
+      }
+    }
+
+    if (++st == kSwgN64Stages) {
+      st = 0;
+      parity ^= 1u;
+    }
+  }
+
+  const int c_lo = (warp * 2 + 0) * 8 + 2 * t;
+  const int c_hi = (warp * 2 + 1) * 8 + 2 * t;
+  const int col_base = cta_n64 * 64;
+  uint32_t vlo_lo = 0u, vhi_lo = 0u, vlo_hi = 0u, vhi_hi = 0u;
+  if (g < M) {
+    vlo_lo = int3_bf16x2_u32(int3_swiglu_f32(d0_g0, d0_u0), int3_swiglu_f32(d1_g0, d1_u0));
+    vhi_lo = int3_bf16x2_u32(int3_swiglu_f32(d0_g1, d0_u1), int3_swiglu_f32(d1_g1, d1_u1));
+    *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * I + col_base + c_lo) = vlo_lo;
+    *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * I + col_base + c_hi) = vhi_lo;
+  }
+  if constexpr (kM16) {
+    if (has_hi) {
+      vlo_hi = int3_bf16x2_u32(int3_swiglu_f32(d2_g0, d2_u0), int3_swiglu_f32(d3_g0, d3_u0));
+      vhi_hi = int3_bf16x2_u32(int3_swiglu_f32(d2_g1, d2_u1), int3_swiglu_f32(d3_g1, d3_u1));
+      *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * I + col_base + c_lo) = vlo_hi;
+      *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * I + col_base + c_hi) = vhi_hi;
+    }
+  }
+  if (C_prerot != nullptr) {
+    __syncthreads();
+    __nv_bfloat16 (*s_c)[64] = reinterpret_cast<__nv_bfloat16 (*)[64]>(&smem.w[0][0]);
+    if (g < M) {
+      *reinterpret_cast<uint32_t*>(&s_c[g][c_lo]) = vlo_lo;
+      *reinterpret_cast<uint32_t*>(&s_c[g][c_hi]) = vhi_lo;
+    }
+    if constexpr (kM16) {
+      if (has_hi) {
+        *reinterpret_cast<uint32_t*>(&s_c[g + 8][c_lo]) = vlo_hi;
+        *reinterpret_cast<uint32_t*>(&s_c[g + 8][c_hi]) = vhi_hi;
+      }
+    }
+    __syncthreads();
+    const int col0 = col_base + 2 * lane;
+    const float rs0 = int3_rad_sign(col0 + 0);
+    const float rs1 = int3_rad_sign(col0 + 1);
+    for (int r = warp; r < M; r += 4) {
+      const __nv_bfloat162 raw = *reinterpret_cast<const __nv_bfloat162*>(&s_c[r][2 * lane]);
+      const float2 rf = __bfloat1622float2(raw);
+      float v0 = rf.x * rs0;
+      float v1 = rf.y * rs1;
+      int3_warp_fwht64(v0, v1, lane);
+      *reinterpret_cast<__nv_bfloat162*>(C_prerot + static_cast<size_t>(r) * I + col0) =
+          __floats2bfloat162_rn(v0, v1);
+    }
+  }
+}
+
+// 5-stage 192-CTA deterministic wave-interleaved Hardware-TMA + Dual-PDL Stream-K SwiGLU kernel (0 float atomics!).
+template <bool kM16, bool kNf3 = true, bool kTma = false, bool kSym = false>
+__global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_swiglu_det_sk_kernel(
+    const __nv_bfloat16* __restrict__ A,
+    const uint8_t* __restrict__ W_packed,
+    __nv_bfloat16* __restrict__ C,
+    float* __restrict__ sk_partials,
+    int* __restrict__ sk_done,
+    int M, int I, int K, int grid_ctas, int pdl_mode) {
+  constexpr int kTileB = kSym ? kSymTileBytes : kTileBytes;
+  constexpr int kStepWB = kSym ? kSymStepWBytes : kStepWBytes;
+  constexpr int kStepU4 = kStepWB / 16;
+  __shared__ Int3SwgStageSmem<kM16 ? 16 : 8, kStepWB> smem;
+  __shared__ int s_is_last;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const int num_kg = K >> 6;
+  const int num_cta = I >> 5;
+  const int cta_id = blockIdx.x;
+  const int total_iters = num_cta * num_kg;
+  const int q_iters = total_iters / grid_ctas;
+  const int iter_start = static_cast<int>((static_cast<int64_t>(cta_id) * total_iters) / grid_ctas);
+  const int iter_end = static_cast<int>((static_cast<int64_t>(cta_id + 1) * total_iters) / grid_ctas);
+  const int my_iters = iter_end - iter_start;
+  if (my_iters <= 0) return;
+
+  int3_init_lut<kNf3, kSym>(smem.lut64, tid);
+
+  if constexpr (kTma) {
+    if (tid == 0) {
+      int3_mbar_init(smem.mbar, kSwgStages);
+    }
+    __syncthreads();
+  }
+
+  const size_t total_bytes = static_cast<size_t>(total_iters) * kStepWB;
+  const uint32_t base_shifted =
+      kSym ? __ldg(reinterpret_cast<const uint32_t*>(W_packed + total_bytes) + 1) : 0u;
+
+  if (cta_id == 0) {
+    for (size_t off = static_cast<size_t>(tid) << 21; off < total_bytes; off += static_cast<size_t>(kThreads) << 21) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(W_packed + off));
+    }
+  }
+
+  auto step_w_ptr = [&](int idx) -> const uint8_t* {
+    const size_t slot = (idx < q_iters)
+        ? (static_cast<size_t>(idx) * grid_ctas + cta_id)
+        : static_cast<size_t>(static_cast<int64_t>(q_iters) * grid_ctas +
+                              (iter_start - static_cast<int64_t>(cta_id) * q_iters));
+    return W_packed + slot * kStepWB;
+  };
+
+  const int a_row = tid >> 3;
+  const int a_col8 = tid & 7;
+  const int a_phys_col8 = a_col8 ^ (a_row & 7);
+  const bool a_valid = (a_row < M);
+  const int a_src_sz = a_valid ? 16 : 0;
+  const int a_safe_row = a_valid ? a_row : 0;
+
+  auto issue_w_only = [&](int idx, int st) {
+    const uint8_t* wp = step_w_ptr(idx);
+    if constexpr (kTma) {
+      if (tid == 0) {
+        const uint64_t pol = int3_pol_evict_first();
+        int3_tma_bulk_w(smem.w[st], wp, kStepWB, &smem.mbar[st], pol);
+      }
+    } else {
+      if (tid < kStepU4) {
+        const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
+        int3_cp_async16_w(sd, wp + tid * 16);
+      }
+      asm volatile("cp.async.commit_group;\n" ::: "memory");
+    }
+  };
+
+  auto load_a_sync = [&](int kg, int st) {
+    if constexpr (kM16) {
+      *reinterpret_cast<uint4*>(&smem.a[st][a_row][a_phys_col8 * 8]) =
+          a_valid
+              ? *reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8)
+              : make_uint4(0u, 0u, 0u, 0u);
+    } else if (tid < 64) {
+      *reinterpret_cast<uint4*>(&smem.a[st][a_row][a_phys_col8 * 8]) =
+          a_valid
+              ? *reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8)
+              : make_uint4(0u, 0u, 0u, 0u);
+    }
+  };
+
+  auto issue_stage = [&](int idx, int kg, int st, bool need_fence) {
+    const uint8_t* wp = step_w_ptr(idx);
+    if constexpr (kTma) {
+      if (tid == 0) {
+        if (need_fence) {
+          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        }
+        const uint64_t pol = int3_pol_evict_first();
+        int3_tma_bulk_w(smem.w[st], wp, kStepWB, &smem.mbar[st], pol);
+      }
+    } else {
+      if (tid < kStepU4) {
+        const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
+        int3_cp_async16_w(sd, wp + tid * 16);
+      }
+    }
+    if constexpr (kM16) {
+      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][a_row][a_phys_col8 * 8]));
+      int3_cp_async16_a_pred(sd, A + static_cast<size_t>(a_safe_row) * K + kg * 64 + a_col8 * 8, a_src_sz);
+    } else if (tid < 64) {
+      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][a_row][a_phys_col8 * 8]));
+      int3_cp_async16_a_pred(sd, A + static_cast<size_t>(a_safe_row) * K + kg * 64 + a_col8 * 8, a_src_sz);
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  };
+
+  int cur_n = iter_start / num_kg;
+  int cur_kg = iter_start - cur_n * num_kg;
+  int seg_start_kg = cur_kg;
+
+  constexpr int kPreload = kSwgStages - 1;  // 4
+  const int preload = (my_iters < kPreload) ? my_iters : kPreload;
+  int next_kg = cur_kg;
+  if ((pdl_mode & 1) != 0) {
+    for (int p = 0; p < preload; ++p) {
+      issue_w_only(p, p);
+    }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    for (int p = 0; p < preload; ++p) {
+      load_a_sync(next_kg, p);
+      if (++next_kg == num_kg) next_kg = 0;
+    }
+  } else {
+    for (int p = 0; p < preload; ++p) {
+      issue_stage(p, next_kg, p, false);
+      if (++next_kg == num_kg) next_kg = 0;
+    }
+  }
+
+  float d0_g = 0.0f, d1_g = 0.0f, d2_g = 0.0f, d3_g = 0.0f;
+  float d0_u = 0.0f, d1_u = 0.0f, d2_u = 0.0f, d3_u = 0.0f;
+  const bool has_hi = kM16 && ((g + 8) < M);
+  const int ldm_row = kM16 ? (lane & 15) : (lane & 7);
+  const int ldm_col_off = kM16 ? (lane >> 4) : ((lane >> 3) & 1);
+  const int trig_i = ((pdl_mode & 2) != 0) ? ((my_iters > 4) ? (my_iters - 4) : 0) : -1;
+
+  int st = 0;
+  uint32_t parity = 0u;
+  for (int i = 0; i < my_iters; ++i) {
+    if (i == trig_i) {
+      asm volatile("griddepcontrol.launch_dependents;");
+    }
+    if constexpr (kTma) {
+      int3_mbar_wait(&smem.mbar[st], parity);
+    }
+    const int rem = my_iters - 1 - i;
+    if (rem >= 3) {
+      asm volatile("cp.async.wait_group 3;\n" ::: "memory");
+    } else if (rem == 2) {
+      asm volatile("cp.async.wait_group 2;\n" ::: "memory");
+    } else if (rem == 1) {
+      asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+    } else {
+      asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    }
+    __syncthreads();
+
+    const int next_i = i + kPreload;
+    if (next_i < my_iters) {
+      const int next_st = (st == 0) ? (kSwgStages - 1) : (st - 1);
+      issue_stage(next_i, next_kg, next_st, true);
+      if (++next_kg == num_kg) next_kg = 0;
+    }
+
+    uint32_t w01_g, w23_g, w01_u, w23_u;
+    __nv_bfloat162 scg, zrg, scu, zru;
+    int3_load_tile_words<kSym>(&smem.w[st][(warp * 2 + 0) * kTileB], lane, g, base_shifted, w01_g, w23_g, scg, zrg);
+    int3_load_tile_words<kSym>(&smem.w[st][(warp * 2 + 1) * kTileB], lane, g, base_shifted, w01_u, w23_u, scu, zru);
+
+#pragma unroll
+    for (int s = 0; s < 4; ++s) {
+      const int pcol8 = (2 * s + ldm_col_off) ^ (ldm_row & 7);
+      const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][ldm_row][pcol8 * 8]));
+      uint32_t a0, a1, a2, a3;
+      if constexpr (kM16) {
+        int3_ldmatrix_x4(a0, a1, a2, a3, addr);
+      } else {
+        int3_ldmatrix_x2(a0, a2, addr);
+      }
+      uint32_t b0, b1, c0, c1;
+      int3_deq4_k16<kSym>(smem.lut64, w01_g, w23_g, s, scg, zrg, b0, b1);
+      int3_deq4_k16<kSym>(smem.lut64, w01_u, w23_u, s, scu, zru, c0, c1);
+      if constexpr (kM16) {
+        int3_mma_m16n8k16_full(d0_g, d1_g, d2_g, d3_g, a0, a1, a2, a3, b0, b1);
+        int3_mma_m16n8k16_full(d0_u, d1_u, d2_u, d3_u, a0, a1, a2, a3, c0, c1);
+      } else {
+        int3_mma_m16n8k16(d0_g, d1_g, d2_g, d3_g, a0, a2, b0, b1);
+        int3_mma_m16n8k16(d0_u, d1_u, d2_u, d3_u, a0, a2, c0, c1);
+      }
+    }
+
+    if (++st == kSwgStages) {
+      st = 0;
+      parity ^= 1u;
+    }
+
+    const bool tile_done = (cur_kg + 1 == num_kg) || (i + 1 == my_iters);
+    if (tile_done) {
+      const int seg_kgs = (cur_kg + 1) - seg_start_kg;
+      const int col = cur_n * 32 + warp * 8 + 2 * t;
+      if (seg_kgs == num_kg) {
+        if (g < M) {
+          *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * I + col) =
+              int3_bf16x2_u32(int3_swiglu_f32(d0_g, d0_u), int3_swiglu_f32(d1_g, d1_u));
+        }
+        if constexpr (kM16) {
+          if (has_hi) {
+            *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * I + col) =
+                int3_bf16x2_u32(int3_swiglu_f32(d2_g, d2_u), int3_swiglu_f32(d3_g, d3_u));
+          }
+        }
+      } else {
+        const int part_idx = (seg_start_kg == 0) ? 0 : 1;
+        float4* p_tile = reinterpret_cast<float4*>(sk_partials) + static_cast<size_t>(cur_n) * 512;
+        float4* p_me = p_tile + part_idx * 256;
+        p_me[tid] = make_float4(d0_g, d1_g, d2_g, d3_g);
+        p_me[128 + tid] = make_float4(d0_u, d1_u, d2_u, d3_u);
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+          s_is_last = (atomicAdd(&sk_done[cur_n], 1) == 1) ? 1 : 0;
+        }
+        __syncthreads();
+        if (s_is_last) {
+          if (tid == 0) {
+            atomicExch(&sk_done[cur_n], 0);
+          }
+          const float4 g0 = int3_ldcg_f4(&p_tile[tid]);
+          const float4 u0 = int3_ldcg_f4(&p_tile[128 + tid]);
+          const float4 g1 = int3_ldcg_f4(&p_tile[256 + tid]);
+          const float4 u1 = int3_ldcg_f4(&p_tile[384 + tid]);
+          if (g < M) {
+            *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * I + col) = int3_bf16x2_u32(
+                int3_swiglu_f32(__fadd_rn(g0.x, g1.x), __fadd_rn(u0.x, u1.x)),
+                int3_swiglu_f32(__fadd_rn(g0.y, g1.y), __fadd_rn(u0.y, u1.y)));
+          }
+          if constexpr (kM16) {
+            if (has_hi) {
+              *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g + 8) * I + col) = int3_bf16x2_u32(
+                  int3_swiglu_f32(__fadd_rn(g0.z, g1.z), __fadd_rn(u0.z, u1.z)),
+                  int3_swiglu_f32(__fadd_rn(g0.w, g1.w), __fadd_rn(u0.w, u1.w)));
+            }
+          }
+        }
+      }
+      d0_g = d1_g = d2_g = d3_g = 0.0f;
+      d0_u = d1_u = d2_u = d3_u = 0.0f;
+      ++cur_n;
+      cur_kg = 0;
+      seg_start_kg = 0;
+    } else {
+      ++cur_kg;
+    }
+  }
+}
+
+void ensure_int3_swg_sk_scratch(const torch::TensorOptions& opts, int n_blocks,
+                                float*& partials_ptr, int*& done_ptr) {
+  static torch::Tensor g_swg_partials;
+  static torch::Tensor g_swg_done;
+  static int g_swg_cap = 0;
+  static uint32_t g_swg_slot = 0;
+  if (!g_swg_partials.defined() || g_swg_partials.device() != opts.device() || g_swg_cap < n_blocks) {
+    const int cap = (n_blocks > 1024) ? n_blocks : 1024;
+    g_swg_partials = torch::empty({2, static_cast<int64_t>(cap) * 512 * 4}, opts.dtype(torch::kFloat32));
+    g_swg_done = torch::zeros({2, cap}, opts.dtype(torch::kInt32));
+    g_swg_cap = cap;
+  }
+  const int slot = static_cast<int>(g_swg_slot & 1u);
+  g_swg_slot ^= 1u;
+  partials_ptr = g_swg_partials.data_ptr<float>() + static_cast<size_t>(slot) * static_cast<size_t>(g_swg_cap) * 2048;
+  done_ptr = g_swg_done.data_ptr<int>() + static_cast<size_t>(slot) * static_cast<size_t>(g_swg_cap);
+}
+
+static int int3_swg_sk_grid(int I, int K, int mode) {
+  if (mode >= 3) return 0;
+  const int num_cta = I >> 5;
+  const int num_kg = K >> 6;
+  if (num_cta <= 0 || num_kg <= 0) return 0;
+  auto eval_grid = [&](int g) -> int {
+    if (g <= 0 || (g % 48) != 0 || num_cta < g || (num_cta % g) == 0) return 0;
+    return g;
+  };
+  if (int3_bench_dyn_env()) {
+    const char* en = std::getenv("MUSE_INT3_SWG_SK");
+    if (en && *en && std::atoi(en) == 0) return 0;
+    const char* gs = std::getenv("MUSE_INT3_SWG_SK_GRID");
+    const int g = (!gs || !*gs) ? kDefaultSwgWaveIlv : std::atoi(gs);
+    return eval_grid(g);
+  }
+  static const int cached_g = []() -> int {
+    const char* en = std::getenv("MUSE_INT3_SWG_SK");
+    if (en && *en && std::atoi(en) == 0) return 0;
+    const char* gs = std::getenv("MUSE_INT3_SWG_SK_GRID");
+    return (!gs || !*gs) ? kDefaultSwgWaveIlv : std::atoi(gs);
+  }();
+  return eval_grid(cached_g);
 }
 
 // 4-stage persistent Stream-K W3A16 GEMM + SwiGLU.
@@ -2194,10 +2916,18 @@ static void int3_set_carveout_impl() {
   cudaFuncSetAttribute(int3_mma_gemm_n32_kernel<true, true, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int3_mma_gemm_swiglu_kernel<false, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int3_mma_gemm_swiglu_kernel<true, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int3_mma_swiglu_det_sk_kernel<false, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int3_mma_swiglu_det_sk_kernel<true, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int3_mma_streamk_kernel<false, false, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int3_mma_streamk_kernel<true, false, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int3_mma_streamk_kernel<false, true, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int3_mma_streamk_kernel<true, true, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+}
+
+static int int3_swg_n64_ilv(int I, int mode) {
+  if (mode >= 3 || (I & 63) != 0 || !int3_swg_n64_enabled()) return 0;
+  const int num_cta64 = I >> 6;
+  return (kDefaultSwgN64Ilv <= num_cta64) ? kDefaultSwgN64Ilv : num_cta64;
 }
 
 static void int3_ensure_carveout() {
@@ -2214,6 +2944,10 @@ static void int3_ensure_carveout() {
     cudaFuncSetAttribute(int3_mma_gemm_n32_pair_kernel<true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
     cudaFuncSetAttribute(int3_mma_gemm_n32_pair_kernel<false, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
     cudaFuncSetAttribute(int3_mma_gemm_n32_pair_kernel<true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(int3_mma_gemm_swiglu_n64_kernel<false, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(int3_mma_gemm_swiglu_n64_kernel<true, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(int3_mma_gemm_swiglu_n64_kernel<false, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(int3_mma_gemm_swiglu_n64_kernel<true, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   }
 }
 
@@ -2363,7 +3097,8 @@ static torch::Tensor launch_int3_gemm_impl(
 
 template <bool kNf3, bool kTma, bool kSym>
 static torch::Tensor launch_int3_gemm_swiglu_impl(
-    torch::Tensor A, const __nv_bfloat16* A_ptr, torch::Tensor W_packed, int M, int64_t I, int64_t K) {
+    torch::Tensor A, const __nv_bfloat16* A_ptr, torch::Tensor W_packed, int M, int64_t I, int64_t K,
+    bool emit_out_rot = false) {
   auto C = torch::empty({M, I}, A.options());
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int n_blocks = static_cast<int>(I / 32);
@@ -2391,6 +3126,58 @@ static torch::Tensor launch_int3_gemm_swiglu_impl(
     }
     return C;
   }
+  if constexpr (kSym) {
+    if (emit_out_rot) {
+      const int n64_ilv = int3_swg_n64_ilv(static_cast<int>(I), mode);
+      if (n64_ilv > 0 && int3_swg_sk_grid(static_cast<int>(I), static_cast<int>(K), mode) == 0) {
+        int* pd_unused = nullptr;
+        __nv_bfloat16* c_rot64 =
+            (M <= 16 && int3_swg_n64_rot_enabled())
+                ? vq4d_alloc_swg_prerot(C.data_ptr(), M, I, A.options(), pd_unused)
+                : nullptr;
+        const int n64_blocks = static_cast<int>(I >> 6);
+        if (M > 8) {
+          int3_launch_pdl(
+              int3_mma_gemm_swiglu_n64_kernel<true, kTma>,
+              dim3(static_cast<unsigned>(n64_blocks), 1u, 1u), kThreads, st, pdl,
+              A_ptr, W_packed.data_ptr<uint8_t>(), reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+              c_rot64, M, static_cast<int>(I), static_cast<int>(K), n64_ilv, pdl);
+        } else {
+          int3_launch_pdl(
+              int3_mma_gemm_swiglu_n64_kernel<false, kTma>,
+              dim3(static_cast<unsigned>(n64_blocks), 1u, 1u), kThreads, st, pdl,
+              A_ptr, W_packed.data_ptr<uint8_t>(), reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+              c_rot64, M, static_cast<int>(I), static_cast<int>(K), n64_ilv, pdl);
+        }
+        return C;
+      }
+    }
+  }
+  const int swg_sk = int3_swg_sk_grid(static_cast<int>(I), static_cast<int>(K), mode);
+  if (swg_sk > 0) {
+    float* p_ptr = nullptr;
+    int* d_ptr = nullptr;
+    ensure_int3_swg_sk_scratch(A.options(), n_blocks, p_ptr, d_ptr);
+    if (M > 8) {
+      int3_launch_pdl(
+          int3_mma_swiglu_det_sk_kernel<true, kNf3, kTma, kSym>,
+          dim3(static_cast<unsigned>(swg_sk), 1u, 1u), kThreads, st, pdl,
+          A_ptr, W_packed.data_ptr<uint8_t>(), reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+          p_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), swg_sk, pdl);
+    } else {
+      int3_launch_pdl(
+          int3_mma_swiglu_det_sk_kernel<false, kNf3, kTma, kSym>,
+          dim3(static_cast<unsigned>(swg_sk), 1u, 1u), kThreads, st, pdl,
+          A_ptr, W_packed.data_ptr<uint8_t>(), reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+          p_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), swg_sk, pdl);
+    }
+    return C;
+  }
+  int* pd_ptr = nullptr;
+  __nv_bfloat16* c_rot =
+      (emit_out_rot && (I & 63) == 0 && M <= 16 && int3_swg_fuse_rot_enabled())
+          ? vq4d_alloc_swg_prerot(C.data_ptr(), M, I, A.options(), pd_ptr)
+          : nullptr;
   const int swg_ilv = int3_swg_wave_ilv(static_cast<int>(I), mode);
   if (M > 8) {
     int3_launch_pdl(
@@ -2399,6 +3186,7 @@ static torch::Tensor launch_int3_gemm_swiglu_impl(
         A_ptr,
         W_packed.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+        c_rot, pd_ptr,
         M, static_cast<int>(I), static_cast<int>(K), swg_ilv, pdl);
   } else {
     int3_launch_pdl(
@@ -2407,6 +3195,7 @@ static torch::Tensor launch_int3_gemm_swiglu_impl(
         A_ptr,
         W_packed.data_ptr<uint8_t>(),
         reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+        c_rot, pd_ptr,
         M, static_cast<int>(I), static_cast<int>(K), swg_ilv, pdl);
   }
   return C;
@@ -2419,6 +3208,7 @@ torch::Tensor vq4d_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
 torch::Tensor vq4d_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K);
 
 torch::Tensor int3_pack(torch::Tensor W, bool mse_opt = true, bool sym = false, bool h64 = false) {
+  vq4d_reset_norm_rot_table();
   TORCH_CHECK(W.is_cuda() && W.scalar_type() == torch::kBFloat16 && W.dim() == 2 && W.is_contiguous(),
               "int3_pack expects contiguous CUDA BF16 [N, K]");
   const int N = static_cast<int>(W.size(0));
@@ -2501,10 +3291,13 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
     if (W_packed.numel() == sym_h64_bytes) {
       auto st = c10::cuda::getCurrentCUDAStream().stream();
       a_ptr = vq4d_rot_a_ptr(A, M, K, st, int3_pdl_mode());
+    } else {
+      vq4d_clear_all_prerot();
     }
     return use_tma ? launch_int3_gemm_impl<true, true, true>(A, a_ptr, W_packed, M, N, K)
                    : launch_int3_gemm_impl<true, false, true>(A, a_ptr, W_packed, M, N, K);
   }
+  vq4d_clear_all_prerot();
   const bool use_tma = int3_n32_tma_enabled() && aligned16;
   const __nv_bfloat16* a_ptr = reinterpret_cast<const __nv_bfloat16*>(A.data_ptr());
   if (int3_nf3_enabled()) {
@@ -2516,6 +3309,7 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
 }
 
 torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true, bool sym = false, bool h64 = false) {
+  vq4d_reset_norm_rot_table();
   TORCH_CHECK(W.is_cuda() && W.scalar_type() == torch::kBFloat16 && W.dim() == 2 && W.is_contiguous(),
               "int3_pack_swiglu expects contiguous CUDA BF16 [2*I, K]");
   const int N2 = static_cast<int>(W.size(0));
@@ -2524,7 +3318,10 @@ torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true, bool sym = 
   const int I = N2 / 2;
   dim3 grid(N2 / 8, K / 64);
   auto st = c10::cuda::getCurrentCUDAStream().stream();
-  const int swg_ilv = int3_swg_wave_ilv(I, int3_mode());
+  const int mode = int3_mode();
+  const int swg_sk = int3_swg_sk_grid(I, K, mode);
+  const int n64_ilv = (h64 && swg_sk == 0) ? int3_swg_n64_ilv(I, mode) : 0;
+  const int swg_ilv = (n64_ilv > 0) ? (10000 + n64_ilv) : ((swg_sk > 0) ? (-swg_sk) : int3_swg_wave_ilv(I, mode));
   if (sym || h64) {
     const int64_t payload_bytes = static_cast<int64_t>(N2 / 8) * static_cast<int64_t>(K / 64) * kSymTileBytes;
     const int64_t ftr_bytes = h64 ? kSymH64FooterBytes : kSymFooterBytes;
@@ -2592,13 +3389,17 @@ torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t 
   const int64_t sym_h64_bytes = sym_payload + kSymH64FooterBytes;
   if (W_packed.numel() == sym_bytes || W_packed.numel() == sym_h64_bytes) {
     const __nv_bfloat16* a_ptr = reinterpret_cast<const __nv_bfloat16*>(A.data_ptr());
-    if (W_packed.numel() == sym_h64_bytes) {
+    const bool is_h64 = (W_packed.numel() == sym_h64_bytes);
+    if (is_h64) {
       auto st = c10::cuda::getCurrentCUDAStream().stream();
       a_ptr = vq4d_rot_a_ptr(A, M, K, st, int3_pdl_mode());
+    } else {
+      vq4d_clear_all_prerot();
     }
-    return use_tma ? launch_int3_gemm_swiglu_impl<true, true, true>(A, a_ptr, W_packed, M, I, K)
-                   : launch_int3_gemm_swiglu_impl<true, false, true>(A, a_ptr, W_packed, M, I, K);
+    return use_tma ? launch_int3_gemm_swiglu_impl<true, true, true>(A, a_ptr, W_packed, M, I, K, is_h64)
+                   : launch_int3_gemm_swiglu_impl<true, false, true>(A, a_ptr, W_packed, M, I, K, is_h64);
   }
+  vq4d_clear_all_prerot();
   const __nv_bfloat16* a_ptr = reinterpret_cast<const __nv_bfloat16*>(A.data_ptr());
   if (int3_nf3_enabled()) {
     return use_tma ? launch_int3_gemm_swiglu_impl<true, true, false>(A, a_ptr, W_packed, M, I, K)

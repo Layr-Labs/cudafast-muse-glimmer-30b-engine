@@ -14,7 +14,51 @@
 #include <tuple>
 #include <vector>
 
+__nv_bfloat16* vq4d_alloc_norm_prerot(
+    const void* src_ptr, const void* weight_ptr, int M, int64_t K, const torch::TensorOptions& opts);
+void vq4d_clear_all_prerot();
+
 namespace {
+
+static bool dflash_norm_fuse_rot_enabled() {
+  static const bool dyn = (std::getenv("MUSE_BENCH_DYN_ENV") != nullptr);
+  if (dyn) {
+    const char* s = std::getenv("MUSE_DFLASH_NORM_FUSE_ROT");
+    return (!s || !*s) ? false : (std::atoi(s) != 0);
+  }
+  static const bool en = []() -> bool {
+    const char* s = std::getenv("MUSE_DFLASH_NORM_FUSE_ROT");
+    return (!s || !*s) ? false : (std::atoi(s) != 0);
+  }();
+  return en;
+}
+
+__device__ __forceinline__ float dflash_rad_sign(int k) {
+  uint32_t x = static_cast<uint32_t>(k) * 0x9E3779B9u + 0x7F4A7C15u;
+  x = (x ^ (x >> 16)) * 0x85EBCA6Bu;
+  x = (x ^ (x >> 13)) * 0xC2B2AE35u;
+  x ^= (x >> 16);
+  return (x & 1u) ? -1.0f : 1.0f;
+}
+
+__device__ __forceinline__ void dflash_warp_fwht64(float& v0, float& v1, int lane) {
+  {
+    const float s = v0 + v1;
+    const float d = v0 - v1;
+    v0 = s;
+    v1 = d;
+  }
+#pragma unroll
+  for (int mask = 1; mask <= 16; mask <<= 1) {
+    const float o0 = __shfl_xor_sync(0xffffffffu, v0, mask);
+    const float o1 = __shfl_xor_sync(0xffffffffu, v1, mask);
+    const bool hi = (lane & mask) != 0;
+    v0 = hi ? (o0 - v0) : (v0 + o0);
+    v1 = hi ? (o1 - v1) : (v1 + o1);
+  }
+  v0 *= 0.125f;
+  v1 *= 0.125f;
+}
 
 constexpr int kHeadDim = 128;
 constexpr int kMaxLayers = 8;
@@ -586,16 +630,18 @@ __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
   }
 }
 
-template <bool kFusedAdd, bool kPreloadRes = false>
+template <bool kFusedAdd, bool kPreloadRes = false, bool kEmitRot = false>
 __global__ void __launch_bounds__(256) dflash_rms_norm_kernel(
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ residual_in,
     const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ out,
     __nv_bfloat16* __restrict__ residual_out,
+    __nv_bfloat16* __restrict__ rot_out,
     int K,
     float eps,
     int pdl_mode) {
+  __shared__ alignas(16) __nv_bfloat16 s_norm[kEmitRot ? 8192 : 8];
   __shared__ float s_warp[8];
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
@@ -696,16 +742,34 @@ __global__ void __launch_bounds__(256) dflash_rms_norm_kernel(
 
   uint4* out_u4 = reinterpret_cast<uint4*>(out + static_cast<size_t>(row) * K);
   uint4* rout_u4 = kFusedAdd ? reinterpret_cast<uint4*>(residual_out + static_cast<size_t>(row) * K) : nullptr;
+  uint4* sn_u4 = reinterpret_cast<uint4*>(s_norm);
 #pragma unroll
   for (int c = 0; c < 4; ++c) {
     const int idx8 = tid + c * 256;
     if (idx8 < k8) {
       out_u4[idx8] = out_reg[c];
+      if constexpr (kEmitRot) {
+        sn_u4[idx8] = out_reg[c];
+      }
       if constexpr (kFusedAdd) {
         if (rout_u4 != nullptr) {
           rout_u4[idx8] = h_reg[c];
         }
       }
+    }
+  }
+  if constexpr (kEmitRot) {
+    __syncthreads();
+    const int num_kg = K >> 6;
+    __nv_bfloat16* rot_row = rot_out + static_cast<size_t>(row) * K;
+    for (int kg = warp; kg < num_kg; kg += 8) {
+      const int col0 = kg * 64 + 2 * lane;
+      const __nv_bfloat162 raw = *reinterpret_cast<const __nv_bfloat162*>(&s_norm[col0]);
+      const float2 rf = __bfloat1622float2(raw);
+      float v0 = rf.x * dflash_rad_sign(col0 + 0);
+      float v1 = rf.y * dflash_rad_sign(col0 + 1);
+      dflash_warp_fwht64(v0, v1, lane);
+      *reinterpret_cast<__nv_bfloat162*>(rot_row + col0) = __floats2bfloat162_rn(v0, v1);
     }
   }
 }
@@ -1082,6 +1146,7 @@ void dflash_prepare_inputs(
     else { LAUNCH_PREP(int32_t, int32_t); }
   }
 #undef LAUNCH_PREP
+  vq4d_clear_all_prerot();
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1098,16 +1163,31 @@ torch::Tensor dflash_rms_norm(torch::Tensor input, torch::Tensor weight, double 
               (reinterpret_cast<uintptr_t>(weight.data_ptr()) & 15u) == 0u,
               "dflash_rms_norm expects 16B-aligned tensors");
   auto out = torch::empty_like(input);
-  if (M == 0) return out;
+  if (M == 0) {
+    vq4d_clear_all_prerot();
+    return out;
+  }
+  static const bool selective_rot = []() -> bool {
+    const char* s = std::getenv("MUSE_DFLASH_NORM_SELECTIVE");
+    return (!s || !*s) ? true : (std::atoi(s) != 0);
+  }();
+  const void* w_tag = selective_rot ? weight.data_ptr() : nullptr;
+  __nv_bfloat16* rot_out =
+      (M <= 16 && (K & 63) == 0 && dflash_norm_fuse_rot_enabled())
+          ? vq4d_alloc_norm_prerot(out.data_ptr(), w_tag, M, K, out.options())
+          : nullptr;
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int pdl = dflash_fuse_pdl_mode();
+  auto k = (rot_out != nullptr) ? dflash_rms_norm_kernel<false, false, true>
+                                : dflash_rms_norm_kernel<false, false, false>;
   dflash_launch_pdl(
-      dflash_rms_norm_kernel<false>, M, 256, st, pdl,
+      k, M, 256, st, pdl,
       reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
       static_cast<const __nv_bfloat16*>(nullptr),
       reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
       static_cast<__nv_bfloat16*>(nullptr),
+      rot_out,
       K, static_cast<float>(eps), pdl);
   return out;
 }
@@ -1131,11 +1211,25 @@ std::tuple<torch::Tensor, torch::Tensor> dflash_fused_add_rms_norm(
               "dflash_fused_add_rms_norm expects 16B-aligned tensors");
   auto out = torch::empty_like(input);
   auto res_out = torch::empty_like(residual);
-  if (M == 0) return std::make_tuple(out, res_out);
+  if (M == 0) {
+    vq4d_clear_all_prerot();
+    return std::make_tuple(out, res_out);
+  }
+  static const bool selective_rot = []() -> bool {
+    const char* s = std::getenv("MUSE_DFLASH_NORM_SELECTIVE");
+    return (!s || !*s) ? true : (std::atoi(s) != 0);
+  }();
+  const void* w_tag = selective_rot ? weight.data_ptr() : nullptr;
+  __nv_bfloat16* rot_out =
+      (M <= 16 && (K & 63) == 0 && dflash_norm_fuse_rot_enabled())
+          ? vq4d_alloc_norm_prerot(out.data_ptr(), w_tag, M, K, out.options())
+          : nullptr;
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int pdl = dflash_fuse_pdl_mode();
   const bool preload_res = (input.data_ptr() != residual.data_ptr());
-  auto k = preload_res ? dflash_rms_norm_kernel<true, true> : dflash_rms_norm_kernel<true, false>;
+  auto k = (rot_out != nullptr)
+               ? (preload_res ? dflash_rms_norm_kernel<true, true, true> : dflash_rms_norm_kernel<true, false, true>)
+               : (preload_res ? dflash_rms_norm_kernel<true, true, false> : dflash_rms_norm_kernel<true, false, false>);
   dflash_launch_pdl(
       k, M, 256, st, pdl,
       reinterpret_cast<const __nv_bfloat16*>(input.data_ptr()),
@@ -1143,6 +1237,7 @@ std::tuple<torch::Tensor, torch::Tensor> dflash_fused_add_rms_norm(
       reinterpret_cast<const __nv_bfloat16*>(weight.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(res_out.data_ptr()),
+      rot_out,
       K, static_cast<float>(eps), pdl);
   return std::make_tuple(out, res_out);
 }

@@ -17,6 +17,9 @@
 #include <stdint.h>
 #include <tuple>
 
+void vq4d_clear_all_prerot();
+void vq4d_reset_norm_rot_table();
+
 namespace {
 
 constexpr int kDhWarps = 4;
@@ -1493,8 +1496,8 @@ constexpr int kRowsPerCTA = kNTilesPerCTA * 8;                 // 64
 constexpr int kWaveCTAs = 192;                                 // 4 CTAs/SM * 48 SMs on GB10
 constexpr int kStages = 8;                                     // 8-stage continuous cross-wave cp.async (<=19.5 KiB SMEM)
 constexpr int kCtaTopK = 8;                                    // per-CTA shortlist per row m
-constexpr int kMaxCand = 256;                                  // max Stage-2 shortlist per row m
-constexpr int kS2CTAsPerRow = 16;                              // 96 CTAs at M=6 (2 CTAs/SM)
+constexpr int kMaxCand = 512;                                  // max Stage-2 shortlist per row m (supports topk=256..512)
+constexpr int kS2CTAsPerRow = 16;                              // 96 CTAs at M=6 (exact 2 CTAs/SM * 48 SMs single wave!)
 constexpr int kS2Warps = 8;
 constexpr int kS2MaxGroups = 512;                              // K <= 8192 (16 KiB SMEM)
 
@@ -1624,6 +1627,45 @@ bool dhf_pair_waves_enabled() {
   return en;
 }
 
+bool dhf_tma100_enabled() {
+  static const bool dyn = (std::getenv("MUSE_BENCH_DYN_ENV") != nullptr);
+  if (dyn) {
+    const char* s = std::getenv("MUSE_DHF_TMA100");
+    return (!s || !*s) ? true : (std::atoi(s) != 0);
+  }
+  static const bool en = []() -> bool {
+    const char* s = std::getenv("MUSE_DHF_TMA100");
+    return (!s || !*s) ? true : (std::atoi(s) != 0);
+  }();
+  return en;
+}
+
+bool dhf_tma100_pair_enabled() {
+  static const bool dyn = (std::getenv("MUSE_BENCH_DYN_ENV") != nullptr);
+  if (dyn) {
+    const char* s = std::getenv("MUSE_DHF_TMA100_PAIR");
+    return (!s || !*s) ? true : (std::atoi(s) != 0);
+  }
+  static const bool en = []() -> bool {
+    const char* s = std::getenv("MUSE_DHF_TMA100_PAIR");
+    return (!s || !*s) ? true : (std::atoi(s) != 0);
+  }();
+  return en;
+}
+
+bool dhf_fuse_select_enabled() {
+  static const bool dyn = (std::getenv("MUSE_BENCH_DYN_ENV") != nullptr);
+  if (dyn) {
+    const char* s = std::getenv("MUSE_DHF_FUSE_SELECT");
+    return (!s || !*s) ? true : (std::atoi(s) != 0);
+  }
+  static const bool en = []() -> bool {
+    const char* s = std::getenv("MUSE_DHF_FUSE_SELECT");
+    return (!s || !*s) ? true : (std::atoi(s) != 0);
+  }();
+  return en;
+}
+
 template <typename... KArgs, typename... Args>
 static inline void dhf_launch_pdl(
     void (*kernel)(KArgs...), dim3 grid, int block, cudaStream_t st, int pdl_mode, Args... args) {
@@ -1650,6 +1692,45 @@ __device__ __host__ __forceinline__ size_t dhf_wave_step_idx(
   const int wave_base = wave * kWaveCTAs;
   const int w_size = (n_blocks - wave_base < kWaveCTAs) ? (n_blocks - wave_base) : kWaveCTAs;
   return static_cast<size_t>(wave_base) * num_kg + static_cast<size_t>(kg) * w_size + slot;
+}
+
+__device__ __host__ __forceinline__ size_t dhf_wave_bk128_step_idx(
+    int cta_n, int kg, int n_blocks, int num_kg) {
+  const int wave = cta_n / kWaveCTAs;
+  const int slot = cta_n - wave * kWaveCTAs;
+  const int wave_base = wave * kWaveCTAs;
+  const int w_size = (n_blocks - wave_base < kWaveCTAs) ? (n_blocks - wave_base) : kWaveCTAs;
+  const int kg2 = kg >> 1;
+  const int kh = kg & 1;
+  return ((static_cast<size_t>(wave_base) * (num_kg >> 1) +
+           static_cast<size_t>(kg2) * w_size + slot)
+          << 1) |
+         static_cast<size_t>(kh);
+}
+
+__device__ __host__ __forceinline__ size_t dhf_wave_pair_bk128_step_idx(
+    int cta_n, int kg, int n_blocks, int num_kg) {
+  const int full_pairs = n_blocks / (2 * kWaveCTAs);
+  const int pair_limit = full_pairs * (2 * kWaveCTAs);
+  const int num_kg2 = num_kg >> 1;
+  const int kg2 = kg >> 1;
+  const int kh = kg & 1;
+  if (cta_n < pair_limit) {
+    const int wave = cta_n / kWaveCTAs;
+    const int slot = cta_n - wave * kWaveCTAs;
+    const int wp = wave >> 1;
+    const int wh = wave & 1;
+    return (((static_cast<size_t>(wp) * num_kg2 + kg2) * kWaveCTAs + slot) << 2) |
+           static_cast<size_t>((kh << 1) | wh);
+  }
+  const int wave = cta_n / kWaveCTAs;
+  const int slot = cta_n - wave * kWaveCTAs;
+  const int wave_base = wave * kWaveCTAs;
+  const int w_size = (n_blocks - wave_base < kWaveCTAs) ? (n_blocks - wave_base) : kWaveCTAs;
+  return ((static_cast<size_t>(wave_base) * num_kg2 +
+           static_cast<size_t>(kg2) * w_size + slot)
+          << 1) |
+         static_cast<size_t>(kh);
 }
 
 __device__ __host__ __forceinline__ size_t dhf_wave_pair_step_idx(
@@ -1708,6 +1789,55 @@ __device__ __forceinline__ void dhf_cp_async16_cg(uint32_t sd, const void* gs, u
   } else {
     asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;" ::"r"(sd), "l"(gs));
   }
+}
+
+__device__ __forceinline__ void dhf_mbar_init(uint64_t* mbar, int count) {
+  for (int s = 0; s < count; ++s) {
+    const uint32_t b = static_cast<uint32_t>(__cvta_generic_to_shared(&mbar[s]));
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(b) : "memory");
+  }
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+
+template <bool kEvictFirst = true>
+__device__ __forceinline__ void dhf_tma_bulk_w(
+    void* smem_dst, const void* gmem_src, int bytes, uint64_t* mbar, uint64_t pol) {
+  const uint32_t b = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
+  const uint32_t d = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(b), "r"(bytes) : "memory");
+  if constexpr (kEvictFirst) {
+    asm volatile(
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
+        ::"r"(d), "l"(gmem_src), "r"(bytes), "r"(b), "l"(pol)
+        : "memory");
+  } else {
+    asm volatile(
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+        ::"r"(d), "l"(gmem_src), "r"(bytes), "r"(b)
+        : "memory");
+  }
+}
+
+__device__ __forceinline__ void dhf_mbar_wait(uint64_t* mbar, uint32_t parity) {
+  const uint32_t b = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));
+  asm volatile(
+      "{\n\t.reg .pred P1;\n\tDHF_MBAR_WAIT_%=:\n\t"
+      "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n\t"
+      "@!P1 bra DHF_MBAR_WAIT_%=;\n\t}"
+      ::"r"(b), "r"(parity)
+      : "memory");
+}
+
+__device__ __forceinline__ float dhf_ldcg_f(const float* ptr) {
+  float v;
+  asm volatile("ld.global.cg.f32 %0, [%1];" : "=f"(v) : "l"(ptr));
+  return v;
+}
+
+__device__ __forceinline__ int32_t dhf_ldcg_i(const int32_t* ptr) {
+  int32_t v;
+  asm volatile("ld.global.cg.s32 %0, [%1];" : "=r"(v) : "l"(ptr));
+  return v;
 }
 
 __device__ __forceinline__ uint32_t dhf_vq8d128_encode(
@@ -2310,7 +2440,7 @@ __device__ __forceinline__ float dhf_decode_nvfp4_elem(
 
 // Pass 3: Pack wave-interleaved 8x64 tiles for mode=158 (104 B/tile) or mode=2 (128 B/tile).
 // Grid: (V_static / 8, K / 64), Block: 32 threads (1 warp per 8x64 tile).
-template <int kMode, bool kPairWaves = false>
+template <int kMode, int kLayout = 0>
 __global__ void dhf_pack_tiles_kernel(
     const uint8_t* __restrict__ raw_w,
     const uint8_t* __restrict__ raw_s,
@@ -2338,9 +2468,14 @@ __global__ void dhf_pack_tiles_kernel(
   const int sub_tile = n_tile & 7;
   const int n_blocks = V_static / kRowsPerCTA;
   const int num_kg = K >> 6;
-  const size_t step_slot = (kMode == 100 && kPairWaves)
-                               ? dhf_wave_pair_step_idx(cta_n, kg, n_blocks, num_kg)
-                               : dhf_wave_step_idx(cta_n, kg, n_blocks, num_kg);
+  const size_t step_slot =
+      (kMode == 100 && kLayout == 3)
+          ? dhf_wave_pair_bk128_step_idx(cta_n, kg, n_blocks, num_kg)
+          : ((kMode == 100 && kLayout == 2)
+                 ? dhf_wave_bk128_step_idx(cta_n, kg, n_blocks, num_kg)
+                 : ((kMode == 100 && kLayout == 1)
+                        ? dhf_wave_pair_step_idx(cta_n, kg, n_blocks, num_kg)
+                        : dhf_wave_step_idx(cta_n, kg, n_blocks, num_kg)));
   const size_t tile_idx = step_slot * kNTilesPerCTA + sub_tile;
 
   __shared__ float4 s_cb0[(kMode == 100) ? 128 : 1];
@@ -2643,8 +2778,8 @@ __global__ void __launch_bounds__(128, 4) dhf_stage1_mode100_pair_kernel(
     if (tid < 64) {
       *reinterpret_cast<uint4*>(&smem.a[st][a_row][a_swiz8 * 8]) =
           a_valid
-              ? __ldg(reinterpret_cast<const uint4*>(
-                    A_scaled + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8))
+              ? *reinterpret_cast<const uint4*>(
+                    A_scaled + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8)
               : make_uint4(0u, 0u, 0u, 0u);
     }
   };
@@ -2861,6 +2996,697 @@ __global__ void __launch_bounds__(128, 4) dhf_stage1_mode100_pair_kernel(
   }
 }
 
+constexpr int kTma100Stages = 5;
+constexpr int kBk128StepWBytes100 = 2 * kStepWBytes100;  // 1024 B = 8 * 128 B
+
+struct alignas(128) DhfTma100Bk128Smem {
+  alignas(128) uint8_t w[kTma100Stages][kBk128StepWBytes100];  // 5 * 1024 = 5120 B
+  alignas(128) __nv_bfloat16 a[kTma100Stages][2][kMaxM][64];   // 5 * 2048 = 10240 B
+  uint4 lut8[256];                                             // 4096 B
+  float s_scores[kMaxM][kRowsPerCTA];                          // 2048 B
+  int32_t s_toks[kRowsPerCTA];                                 // 256 B
+  float s_topv[kMaxM][kCtaTopK];                               // 256 B
+  int32_t s_topi[kMaxM][kCtaTopK];                             // 256 B
+  alignas(8) uint64_t mbar[kTma100Stages];                     // 40 B -> 22,400 B (4 CTAs/SM!)
+};
+
+// BK=128 Hardware-TMA (1024B cp.async.bulk + L2::evict_first) persistent Stage-1 kernel for mode=100:
+// Halves __syncthreads() barriers (832 -> 416), utilizes 100% of 128 threads on A cp.async while
+// dedicated SM121 TMA streams contiguous 1024B weight blocks — 100.0000% 0-ULP bit-identical to dhf_stage1_kernel<100>!
+template <bool kEvictFirst = true>
+__global__ void __launch_bounds__(128, 4) dhf_stage1_tma100_bk128_kernel(
+    const __nv_bfloat16* __restrict__ A_scaled,
+    const uint8_t* __restrict__ W_packed,
+    const float* __restrict__ row_scales,
+    const float* __restrict__ col_scales,
+    const int32_t* __restrict__ packed_tok_ids,
+    float* __restrict__ cta_vals,
+    int32_t* __restrict__ cta_ids,
+    int M, int V_static, int K, int pdl_mode) {
+  __shared__ DhfTma100Bk128Smem smem;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const int num_kg2 = K >> 7;
+  const int n_blocks = V_static / kRowsPerCTA;
+  const int bid = blockIdx.x;
+  const int grid_ctas = gridDim.x;
+  if (bid >= n_blocks) return;
+
+  {
+    const float* cb = col_scales + K + tid * 8;
+    const uint4 pos = make_uint4(
+        dhf_bf16x2_u32(cb[0], cb[1]),
+        dhf_bf16x2_u32(cb[2], cb[3]),
+        dhf_bf16x2_u32(cb[4], cb[5]),
+        dhf_bf16x2_u32(cb[6], cb[7]));
+    smem.lut8[tid] = pos;
+    smem.lut8[tid + 128] = make_uint4(
+        pos.x ^ 0x80008000u,
+        pos.y ^ 0x80008000u,
+        pos.z ^ 0x80008000u,
+        pos.w ^ 0x80008000u);
+  }
+  if (tid < kMaxM * kCtaTopK) {
+    smem.s_topv[tid >> 3][tid & 7] = -1e38f;
+    smem.s_topi[tid >> 3][tid & 7] = -1;
+  }
+  if (tid == 0) {
+    dhf_mbar_init(smem.mbar, kTma100Stages);
+  }
+  __syncthreads();
+
+  if (bid == 0) {
+    const size_t total_bytes = static_cast<size_t>(n_blocks) * num_kg2 * kBk128StepWBytes100;
+    for (size_t off = static_cast<size_t>(tid) << 21; off < total_bytes;
+         off += static_cast<size_t>(kThreads) << 21) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(W_packed + off));
+    }
+  }
+
+  const int a_kh = tid >> 6;          // 0 for tid<64, 1 for tid>=64
+  const int a_row = (tid >> 3) & 7;   // 0..7
+  const int a_col8 = tid & 7;         // 0..7
+  const int a_swiz8 = a_col8 ^ a_row;
+  const bool a_valid = (a_row < M);
+  const int a_safe_row = a_valid ? a_row : 0;
+  const int a_src_bytes = a_valid ? 16 : 0;
+
+  uint32_t ldm_off[4];
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    const int ldm_col8 = (2 * s + ((lane >> 3) & 1)) ^ (lane & 7);
+    ldm_off[s] = static_cast<uint32_t>(
+        __cvta_generic_to_shared(&smem.a[0][0][lane & 7][ldm_col8 * 8]) -
+        __cvta_generic_to_shared(&smem.a[0][0][0][0]));
+  }
+
+  const int num_waves = (n_blocks - bid + grid_ctas - 1) / grid_ctas;
+  const int total_steps = num_waves * num_kg2;
+  const uint64_t w_pol = kEvictFirst ? dhf_pol_evict_first() : 0ull;
+
+  auto w_ptr_for = [&](int w_iter, int kg2) -> const uint8_t* {
+    const int cta_n = bid + w_iter * grid_ctas;
+    const int wave = cta_n / kWaveCTAs;
+    const int slot = cta_n - wave * kWaveCTAs;
+    const int wave_base = wave * kWaveCTAs;
+    const int w_size = (n_blocks - wave_base < kWaveCTAs) ? (n_blocks - wave_base) : kWaveCTAs;
+    return W_packed +
+           (static_cast<size_t>(wave_base) * num_kg2 + static_cast<size_t>(kg2) * w_size + slot) *
+               kBk128StepWBytes100;
+  };
+
+  auto issue_w_tma = [&](int w_iter, int kg2, int st, bool need_fence) {
+    if (tid == 0) {
+      if (need_fence) {
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      }
+      dhf_tma_bulk_w<kEvictFirst>(
+          &smem.w[st][0], w_ptr_for(w_iter, kg2), kBk128StepWBytes100, &smem.mbar[st], w_pol);
+    }
+  };
+
+  auto issue_a_async = [&](int kg2, int st) {
+    const uint32_t sd = static_cast<uint32_t>(
+        __cvta_generic_to_shared(&smem.a[st][a_kh][a_row][a_swiz8 * 8]));
+    const __nv_bfloat16* gs =
+        A_scaled + static_cast<size_t>(a_safe_row) * K + (kg2 * 128 + a_kh * 64) + a_col8 * 8;
+    dhf_cp_async16_ca_z(sd, gs, a_src_bytes);
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  };
+
+  constexpr int kPreload = kTma100Stages - 1;  // 4
+  const int preload = (total_steps < kPreload) ? total_steps : kPreload;
+  int pf_w = 0, pf_kg2 = 0;
+  auto adv_pf = [&]() {
+    if (++pf_kg2 == num_kg2) {
+      pf_kg2 = 0;
+      ++pf_w;
+    }
+  };
+
+  if ((pdl_mode & 1) != 0) {
+    for (int i = 0; i < preload; ++i) {
+      issue_w_tma(pf_w, pf_kg2, i, false);
+      adv_pf();
+    }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    int akg2 = 0;
+    for (int i = 0; i < preload; ++i) {
+      issue_a_async(akg2, i);
+      if (++akg2 == num_kg2) akg2 = 0;
+    }
+  } else {
+    for (int i = 0; i < preload; ++i) {
+      issue_w_tma(pf_w, pf_kg2, i, false);
+      issue_a_async(pf_kg2, i);
+      adv_pf();
+    }
+  }
+
+  float d0_0 = 0.0f, d1_0 = 0.0f, d2_0 = 0.0f, d3_0 = 0.0f;
+  float d0_1 = 0.0f, d1_1 = 0.0f, d2_1 = 0.0f, d3_1 = 0.0f;
+  const int trig_gs = ((pdl_mode & 2) != 0) ? ((total_steps > 4) ? (total_steps - 4) : 0) : -1;
+
+  int cur_w = 0;
+  int cur_kg2 = 0;
+  int st = 0;
+  uint32_t mbar_phase = 0u;
+  for (int gs = 0; gs < total_steps; ++gs) {
+    if (gs == trig_gs) {
+      asm volatile("griddepcontrol.launch_dependents;");
+    }
+    const int rem = total_steps - 1 - gs;
+    if (rem >= 3) {
+      asm volatile("cp.async.wait_group 3;\n" ::: "memory");
+    } else if (rem == 2) {
+      asm volatile("cp.async.wait_group 2;\n" ::: "memory");
+    } else if (rem == 1) {
+      asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+    } else {
+      asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    }
+    dhf_mbar_wait(&smem.mbar[st], mbar_phase);
+    __syncthreads();
+
+    if (gs + kPreload < total_steps) {
+      const int next_st = (st == 0) ? (kTma100Stages - 1) : (st - 1);
+      issue_w_tma(pf_w, pf_kg2, next_st, true);
+      issue_a_async(pf_kg2, next_st);
+      adv_pf();
+    }
+
+#pragma unroll
+    for (int kh = 0; kh < 2; ++kh) {
+      const uint8_t* w_kh = &smem.w[st][kh * kStepWBytes100];
+      const uint16_t c0 = reinterpret_cast<const uint16_t*>(w_kh + (warp * 2 + 0) * kTileBytes100)[lane];
+      const uint16_t c1 = reinterpret_cast<const uint16_t*>(w_kh + (warp * 2 + 1) * kTileBytes100)[lane];
+      const uint32_t a_stage_base = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][kh][0][0]));
+#pragma unroll
+      for (int half = 0; half < 2; ++half) {
+        const uint4 q0 = smem.lut8[(half == 0) ? (c0 & 0xFFu) : (c0 >> 8)];
+        const uint4 q1 = smem.lut8[(half == 0) ? (c1 & 0xFFu) : (c1 >> 8)];
+        {
+          uint32_t a0, a2;
+          dhf_ldmatrix_x2(a0, a2, a_stage_base + ldm_off[2 * half + 0]);
+          dhf_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0, a2, q0.x, q0.y);
+          dhf_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0, a2, q1.x, q1.y);
+        }
+        {
+          uint32_t a0, a2;
+          dhf_ldmatrix_x2(a0, a2, a_stage_base + ldm_off[2 * half + 1]);
+          dhf_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0, a2, q0.z, q0.w);
+          dhf_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0, a2, q1.z, q1.w);
+        }
+      }
+    }
+
+    if (++st == kTma100Stages) {
+      st = 0;
+      mbar_phase ^= 1u;
+    }
+
+    if (++cur_kg2 == num_kg2) {
+      const int cta_n = bid + cur_w * grid_ctas;
+      const int row_base = cta_n * kRowsPerCTA;
+      if (tid < kRowsPerCTA) {
+        smem.s_toks[tid] = __ldg(&packed_tok_ids[row_base + tid]);
+      }
+      if (g < M) {
+        const int c0 = (warp * 2 + 0) * 8 + 2 * t;
+        const int c1 = (warp * 2 + 1) * 8 + 2 * t;
+        smem.s_scores[g][c0 + 0] = d0_0 * __ldg(&row_scales[row_base + c0 + 0]);
+        smem.s_scores[g][c0 + 1] = d1_0 * __ldg(&row_scales[row_base + c0 + 1]);
+        smem.s_scores[g][c1 + 0] = d0_1 * __ldg(&row_scales[row_base + c1 + 0]);
+        smem.s_scores[g][c1 + 1] = d1_1 * __ldg(&row_scales[row_base + c1 + 1]);
+      }
+      __syncthreads();
+
+      for (int m = warp; m < M; m += kWarpsPerCTA) {
+        const float thresh = smem.s_topv[m][7];
+        const float v0 = smem.s_scores[m][lane];
+        const float v1 = smem.s_scores[m][lane + 32];
+        uint32_t m0 = __ballot_sync(0xffffffffu, v0 >= thresh);
+        uint32_t m1 = __ballot_sync(0xffffffffu, v1 >= thresh);
+        if (lane == 0 && ((m0 | m1) != 0u)) {
+          float tv1 = smem.s_topv[m][0], tv2 = smem.s_topv[m][1];
+          float tv3 = smem.s_topv[m][2], tv4 = smem.s_topv[m][3];
+          float tv5 = smem.s_topv[m][4], tv6 = smem.s_topv[m][5];
+          float tv7 = smem.s_topv[m][6], tv8 = smem.s_topv[m][7];
+          int ti1 = smem.s_topi[m][0], ti2 = smem.s_topi[m][1];
+          int ti3 = smem.s_topi[m][2], ti4 = smem.s_topi[m][3];
+          int ti5 = smem.s_topi[m][4], ti6 = smem.s_topi[m][5];
+          int ti7 = smem.s_topi[m][6], ti8 = smem.s_topi[m][7];
+          while (m0 != 0u) {
+            const int j = __ffs(m0) - 1;
+            m0 &= m0 - 1u;
+            dhf_top8_insert(tv1, ti1, tv2, ti2, tv3, ti3, tv4, ti4,
+                            tv5, ti5, tv6, ti6, tv7, ti7, tv8, ti8,
+                            smem.s_scores[m][j], smem.s_toks[j]);
+          }
+          while (m1 != 0u) {
+            const int j = 32 + __ffs(m1) - 1;
+            m1 &= m1 - 1u;
+            dhf_top8_insert(tv1, ti1, tv2, ti2, tv3, ti3, tv4, ti4,
+                            tv5, ti5, tv6, ti6, tv7, ti7, tv8, ti8,
+                            smem.s_scores[m][j], smem.s_toks[j]);
+          }
+          smem.s_topv[m][0] = tv1; smem.s_topi[m][0] = ti1;
+          smem.s_topv[m][1] = tv2; smem.s_topi[m][1] = ti2;
+          smem.s_topv[m][2] = tv3; smem.s_topi[m][2] = ti3;
+          smem.s_topv[m][3] = tv4; smem.s_topi[m][3] = ti4;
+          smem.s_topv[m][4] = tv5; smem.s_topi[m][4] = ti5;
+          smem.s_topv[m][5] = tv6; smem.s_topi[m][5] = ti6;
+          smem.s_topv[m][6] = tv7; smem.s_topi[m][6] = ti7;
+          smem.s_topv[m][7] = tv8; smem.s_topi[m][7] = ti8;
+        }
+      }
+      __syncthreads();
+      d0_0 = 0.0f; d1_0 = 0.0f; d2_0 = 0.0f, d3_0 = 0.0f;
+      d0_1 = 0.0f; d1_1 = 0.0f; d2_1 = 0.0f, d3_1 = 0.0f;
+      cur_kg2 = 0;
+      ++cur_w;
+    }
+  }
+
+  const int row_stride = grid_ctas * kCtaTopK;
+  if (tid < M * kCtaTopK) {
+    const int m = tid >> 3;
+    const int k = tid & 7;
+    cta_vals[static_cast<size_t>(m) * row_stride + bid * kCtaTopK + k] = smem.s_topv[m][k];
+    cta_ids[static_cast<size_t>(m) * row_stride + bid * kCtaTopK + k] = smem.s_topi[m][k];
+  }
+}
+
+constexpr int kTma100PairWStages = 3;
+constexpr int kPairBk128StepWBytes100 = 4 * kStepWBytes100;  // 2048 B = 16 * 128 B
+
+struct alignas(128) DhfTma100PairBk128Smem {
+  alignas(128) uint8_t w[kTma100PairWStages][kPairBk128StepWBytes100];  // 3 * 2048 = 6144 B
+  alignas(128) __nv_bfloat16 a[kTma100PairWStages][2][kMaxM][64];       // 3 * 2048 = 6144 B
+  uint4 lut8[256];                                                      // 4096 B
+  float s_scores[kMaxM][2 * kRowsPerCTA];                               // 4096 B
+  int32_t s_toks[2 * kRowsPerCTA];                                      // 512 B
+  float s_topv[kMaxM][kCtaTopK];                                        // 256 B
+  int32_t s_topi[kMaxM][kCtaTopK];                                      // 256 B
+  alignas(8) uint64_t mbar[kTma100PairWStages];                         // 24 B -> 21,632 B (4 CTAs/SM!)
+};
+
+// Paired-wave (128 vocab rows/CTA) + BK=128 2048B Hardware-TMA Stage-1 kernel for mode=100:
+// Halves total_steps, barriers, A_scaled cp.async, and ldmatrix.x2 vs dhf_stage1_tma100_bk128_kernel,
+// works for ALL V_static (64*k), and is 100.0000% 0-ULP bit-identical!
+template <bool kEvictFirst = true>
+__global__ void __launch_bounds__(128, 4) dhf_stage1_tma100_pair_bk128_kernel(
+    const __nv_bfloat16* __restrict__ A_scaled,
+    const uint8_t* __restrict__ W_packed,
+    const float* __restrict__ row_scales,
+    const float* __restrict__ col_scales,
+    const int32_t* __restrict__ packed_tok_ids,
+    float* __restrict__ cta_vals,
+    int32_t* __restrict__ cta_ids,
+    int M, int V_static, int K, int pdl_mode) {
+  __shared__ DhfTma100PairBk128Smem smem;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const int num_kg2 = K >> 7;
+  const int n_blocks = V_static / kRowsPerCTA;
+  const int bid = blockIdx.x;
+  const int grid_ctas = gridDim.x;
+  if (bid >= n_blocks) return;
+
+  {
+    const float* cb = col_scales + K + tid * 8;
+    const uint4 pos = make_uint4(
+        dhf_bf16x2_u32(cb[0], cb[1]),
+        dhf_bf16x2_u32(cb[2], cb[3]),
+        dhf_bf16x2_u32(cb[4], cb[5]),
+        dhf_bf16x2_u32(cb[6], cb[7]));
+    smem.lut8[tid] = pos;
+    smem.lut8[tid + 128] = make_uint4(
+        pos.x ^ 0x80008000u,
+        pos.y ^ 0x80008000u,
+        pos.z ^ 0x80008000u,
+        pos.w ^ 0x80008000u);
+  }
+  if (tid < kMaxM * kCtaTopK) {
+    smem.s_topv[tid >> 3][tid & 7] = -1e38f;
+    smem.s_topi[tid >> 3][tid & 7] = -1;
+  }
+  if (tid == 0) {
+    dhf_mbar_init(smem.mbar, kTma100PairWStages);
+  }
+  __syncthreads();
+
+  if (bid == 0) {
+    const size_t total_bytes = static_cast<size_t>(n_blocks) * num_kg2 * kBk128StepWBytes100;
+    for (size_t off = static_cast<size_t>(tid) << 21; off < total_bytes;
+         off += static_cast<size_t>(kThreads) << 21) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(W_packed + off));
+    }
+  }
+
+  const int a_kh = tid >> 6;
+  const int a_row = (tid >> 3) & 7;
+  const int a_col8 = tid & 7;
+  const int a_swiz8 = a_col8 ^ a_row;
+  const bool a_valid = (a_row < M);
+  const int a_safe_row = a_valid ? a_row : 0;
+  const int a_src_bytes = a_valid ? 16 : 0;
+
+  uint32_t ldm_off[4];
+#pragma unroll
+  for (int s = 0; s < 4; ++s) {
+    const int ldm_col8 = (2 * s + ((lane >> 3) & 1)) ^ (lane & 7);
+    ldm_off[s] = static_cast<uint32_t>(
+        __cvta_generic_to_shared(&smem.a[0][0][lane & 7][ldm_col8 * 8]) -
+        __cvta_generic_to_shared(&smem.a[0][0][0][0]));
+  }
+
+  const int full_pairs = n_blocks / (2 * kWaveCTAs);
+  const int rem_waves = (n_blocks - (full_pairs * 2 * kWaveCTAs) - bid + kWaveCTAs - 1);
+  const int tail_waves = (rem_waves > 0) ? (rem_waves / kWaveCTAs) : 0;
+  const int total_LogicalWaves = full_pairs + tail_waves;
+  const int total_steps = total_LogicalWaves * num_kg2;
+  const uint64_t w_pol = kEvictFirst ? dhf_pol_evict_first() : 0ull;
+
+  auto issue_w_tma = [&](int lw, int kg2, int st, bool need_fence) {
+    if (tid == 0) {
+      if (need_fence) {
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      }
+      if (lw < full_pairs) {
+        const uint8_t* wp = W_packed +
+            (static_cast<size_t>(lw * num_kg2 + kg2) * kWaveCTAs + bid) * kPairBk128StepWBytes100;
+        dhf_tma_bulk_w<kEvictFirst>(&smem.w[st][0], wp, kPairBk128StepWBytes100, &smem.mbar[st], w_pol);
+      } else {
+        const int wave = full_pairs * 2 + (lw - full_pairs);
+        const int wave_base = wave * kWaveCTAs;
+        const int w_size = (n_blocks - wave_base < kWaveCTAs) ? (n_blocks - wave_base) : kWaveCTAs;
+        const uint8_t* wp = W_packed +
+            (static_cast<size_t>(wave_base) * num_kg2 + static_cast<size_t>(kg2) * w_size + bid) * kBk128StepWBytes100;
+        dhf_tma_bulk_w<kEvictFirst>(&smem.w[st][0], wp, kBk128StepWBytes100, &smem.mbar[st], w_pol);
+      }
+    }
+  };
+
+  auto issue_a_async = [&](int kg2, int st) {
+    const uint32_t sd = static_cast<uint32_t>(
+        __cvta_generic_to_shared(&smem.a[st][a_kh][a_row][a_swiz8 * 8]));
+    const __nv_bfloat16* gs =
+        A_scaled + static_cast<size_t>(a_safe_row) * K + (kg2 * 128 + a_kh * 64) + a_col8 * 8;
+    dhf_cp_async16_ca_z(sd, gs, a_src_bytes);
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  };
+
+  constexpr int kPreload = kTma100PairWStages - 1;  // 2
+  const int preload = (total_steps < kPreload) ? total_steps : kPreload;
+  int pf_lw = 0, pf_kg2 = 0;
+  auto adv_pf = [&]() {
+    if (++pf_kg2 == num_kg2) {
+      pf_kg2 = 0;
+      ++pf_lw;
+    }
+  };
+
+  if ((pdl_mode & 1) != 0) {
+    for (int i = 0; i < preload; ++i) {
+      issue_w_tma(pf_lw, pf_kg2, i, false);
+      adv_pf();
+    }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    int akg2 = 0;
+    for (int i = 0; i < preload; ++i) {
+      issue_a_async(akg2, i);
+      if (++akg2 == num_kg2) akg2 = 0;
+    }
+  } else {
+    for (int i = 0; i < preload; ++i) {
+      issue_w_tma(pf_lw, pf_kg2, i, false);
+      issue_a_async(pf_kg2, i);
+      adv_pf();
+    }
+  }
+
+  float d0_0 = 0.0f, d1_0 = 0.0f, d2_0 = 0.0f, d3_0 = 0.0f;
+  float d0_1 = 0.0f, d1_1 = 0.0f, d2_1 = 0.0f, d3_1 = 0.0f;
+  float e0_0 = 0.0f, e1_0 = 0.0f, e2_0 = 0.0f, e3_0 = 0.0f;
+  float e0_1 = 0.0f, e1_1 = 0.0f, e2_1 = 0.0f, e3_1 = 0.0f;
+  const int trig_gs = ((pdl_mode & 2) != 0) ? ((total_steps > 3) ? (total_steps - 3) : 0) : -1;
+
+  int cur_lw = 0;
+  int cur_kg2 = 0;
+  int st = 0;
+  uint32_t mbar_phase = 0u;
+  for (int gs = 0; gs < total_steps; ++gs) {
+    if (gs == trig_gs) {
+      asm volatile("griddepcontrol.launch_dependents;");
+    }
+    dhf_mbar_wait(&smem.mbar[st], mbar_phase);
+    const int rem = total_steps - 1 - gs;
+    if (rem >= 1) {
+      asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+    } else {
+      asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    }
+    __syncthreads();
+
+    if (gs + kPreload < total_steps) {
+      const int next_st = (st == 0) ? (kTma100PairWStages - 1) : (st - 1);
+      issue_w_tma(pf_lw, pf_kg2, next_st, true);
+      issue_a_async(pf_kg2, next_st);
+      adv_pf();
+    }
+
+    const bool is_pair = (cur_lw < full_pairs);
+    if (is_pair) {
+#pragma unroll
+      for (int kh = 0; kh < 2; ++kh) {
+        const uint8_t* w_kh = &smem.w[st][kh * 1024];
+        const uint16_t c0 = reinterpret_cast<const uint16_t*>(w_kh + (warp * 2 + 0) * kTileBytes100)[lane];
+        const uint16_t c1 = reinterpret_cast<const uint16_t*>(w_kh + (warp * 2 + 1) * kTileBytes100)[lane];
+        const uint16_t c2 = reinterpret_cast<const uint16_t*>(w_kh + 512 + (warp * 2 + 0) * kTileBytes100)[lane];
+        const uint16_t c3 = reinterpret_cast<const uint16_t*>(w_kh + 512 + (warp * 2 + 1) * kTileBytes100)[lane];
+        const uint32_t a_stage_base = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][kh][0][0]));
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+          const uint4 q0 = smem.lut8[(half == 0) ? (c0 & 0xFFu) : (c0 >> 8)];
+          const uint4 q1 = smem.lut8[(half == 0) ? (c1 & 0xFFu) : (c1 >> 8)];
+          const uint4 q2 = smem.lut8[(half == 0) ? (c2 & 0xFFu) : (c2 >> 8)];
+          const uint4 q3 = smem.lut8[(half == 0) ? (c3 & 0xFFu) : (c3 >> 8)];
+          {
+            uint32_t a0, a2;
+            dhf_ldmatrix_x2(a0, a2, a_stage_base + ldm_off[2 * half + 0]);
+            dhf_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0, a2, q0.x, q0.y);
+            dhf_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0, a2, q1.x, q1.y);
+            dhf_mma_m16n8k16(e0_0, e1_0, e2_0, e3_0, a0, a2, q2.x, q2.y);
+            dhf_mma_m16n8k16(e0_1, e1_1, e2_1, e3_1, a0, a2, q3.x, q3.y);
+          }
+          {
+            uint32_t a0, a2;
+            dhf_ldmatrix_x2(a0, a2, a_stage_base + ldm_off[2 * half + 1]);
+            dhf_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0, a2, q0.z, q0.w);
+            dhf_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0, a2, q1.z, q1.w);
+            dhf_mma_m16n8k16(e0_0, e1_0, e2_0, e3_0, a0, a2, q2.z, q2.w);
+            dhf_mma_m16n8k16(e0_1, e1_1, e2_1, e3_1, a0, a2, q3.z, q3.w);
+          }
+        }
+      }
+    } else {
+#pragma unroll
+      for (int kh = 0; kh < 2; ++kh) {
+        const uint8_t* w_kh = &smem.w[st][kh * kStepWBytes100];
+        const uint16_t c0 = reinterpret_cast<const uint16_t*>(w_kh + (warp * 2 + 0) * kTileBytes100)[lane];
+        const uint16_t c1 = reinterpret_cast<const uint16_t*>(w_kh + (warp * 2 + 1) * kTileBytes100)[lane];
+        const uint32_t a_stage_base = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][kh][0][0]));
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+          const uint4 q0 = smem.lut8[(half == 0) ? (c0 & 0xFFu) : (c0 >> 8)];
+          const uint4 q1 = smem.lut8[(half == 0) ? (c1 & 0xFFu) : (c1 >> 8)];
+          {
+            uint32_t a0, a2;
+            dhf_ldmatrix_x2(a0, a2, a_stage_base + ldm_off[2 * half + 0]);
+            dhf_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0, a2, q0.x, q0.y);
+            dhf_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0, a2, q1.x, q1.y);
+          }
+          {
+            uint32_t a0, a2;
+            dhf_ldmatrix_x2(a0, a2, a_stage_base + ldm_off[2 * half + 1]);
+            dhf_mma_m16n8k16(d0_0, d1_0, d2_0, d3_0, a0, a2, q0.z, q0.w);
+            dhf_mma_m16n8k16(d0_1, d1_1, d2_1, d3_1, a0, a2, q1.z, q1.w);
+          }
+        }
+      }
+    }
+
+    if (++st == kTma100PairWStages) {
+      st = 0;
+      mbar_phase ^= 1u;
+    }
+
+    if (++cur_kg2 == num_kg2) {
+      if (is_pair) {
+        const int cta_n0 = bid + (2 * cur_lw) * kWaveCTAs;
+        const int row_base0 = cta_n0 * kRowsPerCTA;
+        const int row_base1 = (cta_n0 + kWaveCTAs) * kRowsPerCTA;
+        smem.s_toks[tid] = __ldg(&packed_tok_ids[(tid < 64) ? (row_base0 + tid) : (row_base1 + tid - 64)]);
+        if (g < M) {
+          const int col0 = (warp * 2 + 0) * 8 + 2 * t;
+          const int col1 = (warp * 2 + 1) * 8 + 2 * t;
+          smem.s_scores[g][col0 + 0] = d0_0 * __ldg(&row_scales[row_base0 + col0 + 0]);
+          smem.s_scores[g][col0 + 1] = d1_0 * __ldg(&row_scales[row_base0 + col0 + 1]);
+          smem.s_scores[g][col1 + 0] = d0_1 * __ldg(&row_scales[row_base0 + col1 + 0]);
+          smem.s_scores[g][col1 + 1] = d1_1 * __ldg(&row_scales[row_base0 + col1 + 1]);
+          smem.s_scores[g][64 + col0 + 0] = e0_0 * __ldg(&row_scales[row_base1 + col0 + 0]);
+          smem.s_scores[g][64 + col0 + 1] = e1_0 * __ldg(&row_scales[row_base1 + col0 + 1]);
+          smem.s_scores[g][64 + col1 + 0] = e0_1 * __ldg(&row_scales[row_base1 + col1 + 0]);
+          smem.s_scores[g][64 + col1 + 1] = e1_1 * __ldg(&row_scales[row_base1 + col1 + 1]);
+        }
+        __syncthreads();
+
+        for (int m = warp; m < M; m += kWarpsPerCTA) {
+          const float thresh0 = smem.s_topv[m][7];
+          const float v0 = smem.s_scores[m][lane];
+          const float v1 = smem.s_scores[m][lane + 32];
+          const float v2 = smem.s_scores[m][lane + 64];
+          const float v3 = smem.s_scores[m][lane + 96];
+          uint32_t m0 = __ballot_sync(0xffffffffu, v0 >= thresh0);
+          uint32_t m1 = __ballot_sync(0xffffffffu, v1 >= thresh0);
+          uint32_t m2 = __ballot_sync(0xffffffffu, v2 >= thresh0);
+          uint32_t m3 = __ballot_sync(0xffffffffu, v3 >= thresh0);
+          if (lane == 0 && ((m0 | m1 | m2 | m3) != 0u)) {
+            float tv1 = smem.s_topv[m][0], tv2 = smem.s_topv[m][1];
+            float tv3 = smem.s_topv[m][2], tv4 = smem.s_topv[m][3];
+            float tv5 = smem.s_topv[m][4], tv6 = smem.s_topv[m][5];
+            float tv7 = smem.s_topv[m][6], tv8 = smem.s_topv[m][7];
+            int ti1 = smem.s_topi[m][0], ti2 = smem.s_topi[m][1];
+            int ti3 = smem.s_topi[m][2], ti4 = smem.s_topi[m][3];
+            int ti5 = smem.s_topi[m][4], ti6 = smem.s_topi[m][5];
+            int ti7 = smem.s_topi[m][6], ti8 = smem.s_topi[m][7];
+            while (m0 != 0u) {
+              const int j = __ffs(m0) - 1;
+              m0 &= m0 - 1u;
+              dhf_top8_insert(tv1, ti1, tv2, ti2, tv3, ti3, tv4, ti4,
+                              tv5, ti5, tv6, ti6, tv7, ti7, tv8, ti8,
+                              smem.s_scores[m][j], smem.s_toks[j]);
+            }
+            while (m1 != 0u) {
+              const int j = 32 + __ffs(m1) - 1;
+              m1 &= m1 - 1u;
+              dhf_top8_insert(tv1, ti1, tv2, ti2, tv3, ti3, tv4, ti4,
+                              tv5, ti5, tv6, ti6, tv7, ti7, tv8, ti8,
+                              smem.s_scores[m][j], smem.s_toks[j]);
+            }
+            while (m2 != 0u) {
+              const int j = 64 + __ffs(m2) - 1;
+              m2 &= m2 - 1u;
+              if (smem.s_scores[m][j] >= tv8) {
+                dhf_top8_insert(tv1, ti1, tv2, ti2, tv3, ti3, tv4, ti4,
+                                tv5, ti5, tv6, ti6, tv7, ti7, tv8, ti8,
+                                smem.s_scores[m][j], smem.s_toks[j]);
+              }
+            }
+            while (m3 != 0u) {
+              const int j = 96 + __ffs(m3) - 1;
+              m3 &= m3 - 1u;
+              if (smem.s_scores[m][j] >= tv8) {
+                dhf_top8_insert(tv1, ti1, tv2, ti2, tv3, ti3, tv4, ti4,
+                                tv5, ti5, tv6, ti6, tv7, ti7, tv8, ti8,
+                                smem.s_scores[m][j], smem.s_toks[j]);
+              }
+            }
+            smem.s_topv[m][0] = tv1; smem.s_topi[m][0] = ti1;
+            smem.s_topv[m][1] = tv2; smem.s_topi[m][1] = ti2;
+            smem.s_topv[m][2] = tv3; smem.s_topi[m][2] = ti3;
+            smem.s_topv[m][3] = tv4; smem.s_topi[m][3] = ti4;
+            smem.s_topv[m][4] = tv5; smem.s_topi[m][4] = ti5;
+            smem.s_topv[m][5] = tv6; smem.s_topi[m][5] = ti6;
+            smem.s_topv[m][6] = tv7; smem.s_topi[m][6] = ti7;
+            smem.s_topv[m][7] = tv8; smem.s_topi[m][7] = ti8;
+          }
+        }
+      } else {
+        const int wave = full_pairs * 2 + (cur_lw - full_pairs);
+        const int cta_n = bid + wave * kWaveCTAs;
+        const int row_base = cta_n * kRowsPerCTA;
+        if (tid < kRowsPerCTA) {
+          smem.s_toks[tid] = __ldg(&packed_tok_ids[row_base + tid]);
+        }
+        if (g < M) {
+          const int c0 = (warp * 2 + 0) * 8 + 2 * t;
+          const int c1 = (warp * 2 + 1) * 8 + 2 * t;
+          smem.s_scores[g][c0 + 0] = d0_0 * __ldg(&row_scales[row_base + c0 + 0]);
+          smem.s_scores[g][c0 + 1] = d1_0 * __ldg(&row_scales[row_base + c0 + 1]);
+          smem.s_scores[g][c1 + 0] = d0_1 * __ldg(&row_scales[row_base + c1 + 0]);
+          smem.s_scores[g][c1 + 1] = d1_1 * __ldg(&row_scales[row_base + c1 + 1]);
+        }
+        __syncthreads();
+
+        for (int m = warp; m < M; m += kWarpsPerCTA) {
+          const float thresh = smem.s_topv[m][7];
+          const float v0 = smem.s_scores[m][lane];
+          const float v1 = smem.s_scores[m][lane + 32];
+          uint32_t m0 = __ballot_sync(0xffffffffu, v0 >= thresh);
+          uint32_t m1 = __ballot_sync(0xffffffffu, v1 >= thresh);
+          if (lane == 0 && ((m0 | m1) != 0u)) {
+            float tv1 = smem.s_topv[m][0], tv2 = smem.s_topv[m][1];
+            float tv3 = smem.s_topv[m][2], tv4 = smem.s_topv[m][3];
+            float tv5 = smem.s_topv[m][4], tv6 = smem.s_topv[m][5];
+            float tv7 = smem.s_topv[m][6], tv8 = smem.s_topv[m][7];
+            int ti1 = smem.s_topi[m][0], ti2 = smem.s_topi[m][1];
+            int ti3 = smem.s_topi[m][2], ti4 = smem.s_topi[m][3];
+            int ti5 = smem.s_topi[m][4], ti6 = smem.s_topi[m][5];
+            int ti7 = smem.s_topi[m][6], ti8 = smem.s_topi[m][7];
+            while (m0 != 0u) {
+              const int j = __ffs(m0) - 1;
+              m0 &= m0 - 1u;
+              dhf_top8_insert(tv1, ti1, tv2, ti2, tv3, ti3, tv4, ti4,
+                              tv5, ti5, tv6, ti6, tv7, ti7, tv8, ti8,
+                              smem.s_scores[m][j], smem.s_toks[j]);
+            }
+            while (m1 != 0u) {
+              const int j = 32 + __ffs(m1) - 1;
+              m1 &= m1 - 1u;
+              dhf_top8_insert(tv1, ti1, tv2, ti2, tv3, ti3, tv4, ti4,
+                              tv5, ti5, tv6, ti6, tv7, ti7, tv8, ti8,
+                              smem.s_scores[m][j], smem.s_toks[j]);
+            }
+            smem.s_topv[m][0] = tv1; smem.s_topi[m][0] = ti1;
+            smem.s_topv[m][1] = tv2; smem.s_topi[m][1] = ti2;
+            smem.s_topv[m][2] = tv3; smem.s_topi[m][2] = ti3;
+            smem.s_topv[m][3] = tv4; smem.s_topi[m][3] = ti4;
+            smem.s_topv[m][4] = tv5; smem.s_topi[m][4] = ti5;
+            smem.s_topv[m][5] = tv6; smem.s_topi[m][5] = ti6;
+            smem.s_topv[m][6] = tv7; smem.s_topi[m][6] = ti7;
+            smem.s_topv[m][7] = tv8; smem.s_topi[m][7] = ti8;
+          }
+        }
+      }
+      __syncthreads();
+      d0_0 = 0.0f; d1_0 = 0.0f; d2_0 = 0.0f; d3_0 = 0.0f;
+      d0_1 = 0.0f; d1_1 = 0.0f; d2_1 = 0.0f; d3_1 = 0.0f;
+      e0_0 = 0.0f; e1_0 = 0.0f; e2_0 = 0.0f; e3_0 = 0.0f;
+      e0_1 = 0.0f; e1_1 = 0.0f; e2_1 = 0.0f; e3_1 = 0.0f;
+      cur_kg2 = 0;
+      ++cur_lw;
+    }
+  }
+
+  const int row_stride = grid_ctas * kCtaTopK;
+  if (tid < M * kCtaTopK) {
+    const int m = tid >> 3;
+    const int k = tid & 7;
+    cta_vals[static_cast<size_t>(m) * row_stride + bid * kCtaTopK + k] = smem.s_topv[m][k];
+    cta_ids[static_cast<size_t>(m) * row_stride + bid * kCtaTopK + k] = smem.s_topi[m][k];
+  }
+}
+
 // Kernel 1: Persistent 192-CTA fused Stage-1 compressed MMA + in-CTA top-8 shortlist extraction
 // with continuous 8-stage cross-wave cp.async.cg.L2::256B + L2::evict_first pipeline (zero wave drains).
 template <int kMode, bool kEvictFirst = true>
@@ -2995,8 +3821,8 @@ __global__ void __launch_bounds__(128, 4) dhf_stage1_kernel(
     if (tid < 64) {
       *reinterpret_cast<uint4*>(&smem.a[st][a_row][a_swiz8 * 8]) =
           a_valid
-              ? __ldg(reinterpret_cast<const uint4*>(
-                    A_scaled + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8))
+              ? *reinterpret_cast<const uint4*>(
+                    A_scaled + static_cast<size_t>(a_row) * K + kg * 64 + a_col8 * 8)
               : make_uint4(0u, 0u, 0u, 0u);
     }
   };
@@ -3430,10 +4256,10 @@ __device__ __forceinline__ float dhf_warp_nvfp4_dot(
         const int g1 = g0 | 1;
         const float sc0 = dhf_fp8_e4m3_to_f32(static_cast<uint8_t>(s2 & 0xFFu)) * 0.5f;
         const float sc1 = dhf_fp8_e4m3_to_f32(static_cast<uint8_t>(s2 >> 8)) * 0.5f;
-        const uint4 a00 = use_smem_a ? s_a0[g0] : __ldg(reinterpret_cast<const uint4*>(a_row) + g0 * 2 + 0);
-        const uint4 a01 = use_smem_a ? s_a1[g0] : __ldg(reinterpret_cast<const uint4*>(a_row) + g0 * 2 + 1);
-        const uint4 a10 = use_smem_a ? s_a0[g1] : __ldg(reinterpret_cast<const uint4*>(a_row) + g1 * 2 + 0);
-        const uint4 a11 = use_smem_a ? s_a1[g1] : __ldg(reinterpret_cast<const uint4*>(a_row) + g1 * 2 + 1);
+        const uint4 a00 = use_smem_a ? s_a0[g0] : *(reinterpret_cast<const uint4*>(a_row) + g0 * 2 + 0);
+        const uint4 a01 = use_smem_a ? s_a1[g0] : *(reinterpret_cast<const uint4*>(a_row) + g0 * 2 + 1);
+        const uint4 a10 = use_smem_a ? s_a0[g1] : *(reinterpret_cast<const uint4*>(a_row) + g1 * 2 + 0);
+        const uint4 a11 = use_smem_a ? s_a1[g1] : *(reinterpret_cast<const uint4*>(a_row) + g1 * 2 + 1);
         acc = __fmaf_rn(dhf_nvfp4_group_dot(w16.x, w16.y, a00, a01), sc0, acc);
         acc = __fmaf_rn(dhf_nvfp4_group_dot(w16.z, w16.w, a10, a11), sc1, acc);
       }
@@ -3442,8 +4268,8 @@ __device__ __forceinline__ float dhf_warp_nvfp4_dot(
     for (int g = lane; g < num_g; g += 32) {
       const float sc_half = dhf_fp8_e4m3_to_f32(__ldg(&s_row[g])) * 0.5f;
       const uint64_t w8 = __ldg(reinterpret_cast<const uint64_t*>(w_row + g * 8));
-      const uint4 a0 = use_smem_a ? s_a0[g] : __ldg(reinterpret_cast<const uint4*>(a_row) + g * 2 + 0);
-      const uint4 a1 = use_smem_a ? s_a1[g] : __ldg(reinterpret_cast<const uint4*>(a_row) + g * 2 + 1);
+      const uint4 a0 = use_smem_a ? s_a0[g] : *(reinterpret_cast<const uint4*>(a_row) + g * 2 + 0);
+      const uint4 a1 = use_smem_a ? s_a1[g] : *(reinterpret_cast<const uint4*>(a_row) + g * 2 + 1);
       acc = __fmaf_rn(
           dhf_nvfp4_group_dot(static_cast<uint32_t>(w8), static_cast<uint32_t>(w8 >> 32), a0, a1),
           sc_half, acc);
@@ -3453,9 +4279,8 @@ __device__ __forceinline__ float dhf_warp_nvfp4_dot(
   return __bfloat162float(__float2bfloat16_rn(acc * total_scale));
 }
 
-// Kernel 3: Stage 2 exact NVFP4 rescore of K_cand shortlist + prompt tail.
-// Grid: (16, M), Block: 256 threads (8 warps, 2 CTAs/SM).
-// Always tracks top-8 per warp/block (negligible cost on <= 32 candidates/CTA), feeding Kernel 4.
+// Kernel 3: Fused 1-wave Stage-2 exact NVFP4 rescore + deterministic last-CTA final top-8 merge.
+// Grid: (8, M) = 48 CTAs at M=6 (exact 1 CTA/SM on GB10), Block: 256 threads (8 warps).
 __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_kernel(
     const __nv_bfloat16* __restrict__ A,
     const int32_t* __restrict__ cand_ids,
@@ -3466,6 +4291,16 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_kernel(
     const float* __restrict__ global_scale,
     float* __restrict__ s2_vals,
     int32_t* __restrict__ s2_ids,
+    int32_t* __restrict__ s2_done,
+    int64_t* __restrict__ out,
+    int64_t* __restrict__ out_top2_row0,
+    int top2_rows,
+    float* __restrict__ out_margins,
+    int margin_rows,
+    int64_t* __restrict__ out_tree_top,
+    float* __restrict__ out_tree_vals,
+    int tree_top_rows,
+    int tree_k,
     int K_cand, int K, int max_tail, float logit_scale, int pdl_mode) {
   const int bid = blockIdx.x;
   const int m = blockIdx.y;
@@ -3479,6 +4314,7 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_kernel(
   __shared__ uint4 s_a1[kS2MaxGroups];
   __shared__ float wv[kS2Warps][8];
   __shared__ int32_t wi[kS2Warps][8];
+  __shared__ int s_is_last;
 
   const __nv_bfloat16* a_row = A + static_cast<size_t>(m) * K;
   if (use_smem_a) {
@@ -3496,7 +4332,7 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_kernel(
   int i5 = 0x7fffffff, i6 = 0x7fffffff, i7 = 0x7fffffff, i8 = 0x7fffffff;
 
   const float total_scale = __ldg(global_scale) * logit_scale;
-  const int stride_w = kS2CTAsPerRow * kS2Warps;  // 128
+  const int stride_w = kS2CTAsPerRow * kS2Warps;  // 64
 
   // Phase A (before PDL wait): score dynamic prompt-tail OOV rows (already ready in memory!).
   int tcnt = tail_count[0];
@@ -3544,9 +4380,6 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_kernel(
   __syncthreads();
 
   if (tid < 32) {
-    if (tid == 0 && (pdl_mode & 2) != 0) {
-      asm volatile("griddepcontrol.launch_dependents;");
-    }
     float bv1 = (tid < kS2Warps) ? wv[tid][0] : -1e38f;
     float bv2 = (tid < kS2Warps) ? wv[tid][1] : -1e38f;
     float bv3 = (tid < kS2Warps) ? wv[tid][2] : -1e38f;
@@ -3595,14 +4428,125 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_kernel(
       s2_vals[base + 5] = bv6; s2_ids[base + 5] = bi6;
       s2_vals[base + 6] = bv7; s2_ids[base + 6] = bi7;
       s2_vals[base + 7] = bv8; s2_ids[base + 7] = bi8;
+      __threadfence();
+      s_is_last = (atomicAdd(&s2_done[m], 1) + 1 == kS2CTAsPerRow) ? 1 : 0;
+    }
+  }
+  __syncthreads();
+
+  if (s_is_last && tid < 32) {
+    float fv1 = -1e38f, fv2 = -1e38f, fv3 = -1e38f, fv4 = -1e38f;
+    float fv5 = -1e38f, fv6 = -1e38f, fv7 = -1e38f, fv8 = -1e38f;
+    int fi1 = 0x7fffffff, fi2 = 0x7fffffff, fi3 = 0x7fffffff, fi4 = 0x7fffffff;
+    int fi5 = 0x7fffffff, fi6 = 0x7fffffff, fi7 = 0x7fffffff, fi8 = 0x7fffffff;
+    if (tid < kS2CTAsPerRow) {
+      const size_t base = (static_cast<size_t>(m) * kS2CTAsPerRow + tid) * 8;
+      fv1 = dhf_ldcg_f(&s2_vals[base + 0]); fi1 = dhf_ldcg_i(&s2_ids[base + 0]);
+      fv2 = dhf_ldcg_f(&s2_vals[base + 1]); fi2 = dhf_ldcg_i(&s2_ids[base + 1]);
+      fv3 = dhf_ldcg_f(&s2_vals[base + 2]); fi3 = dhf_ldcg_i(&s2_ids[base + 2]);
+      fv4 = dhf_ldcg_f(&s2_vals[base + 3]); fi4 = dhf_ldcg_i(&s2_ids[base + 3]);
+      fv5 = dhf_ldcg_f(&s2_vals[base + 4]); fi5 = dhf_ldcg_i(&s2_ids[base + 4]);
+      fv6 = dhf_ldcg_f(&s2_vals[base + 5]); fi6 = dhf_ldcg_i(&s2_ids[base + 5]);
+      fv7 = dhf_ldcg_f(&s2_vals[base + 6]); fi7 = dhf_ldcg_i(&s2_ids[base + 6]);
+      fv8 = dhf_ldcg_f(&s2_vals[base + 7]); fi8 = dhf_ldcg_i(&s2_ids[base + 7]);
+    }
+#pragma unroll
+    for (int o = (kS2CTAsPerRow >> 1); o > 0; o >>= 1) {
+      const float ov1 = __shfl_down_sync(0xffffffffu, fv1, o);
+      const int oi1 = __shfl_down_sync(0xffffffffu, fi1, o);
+      const float ov2 = __shfl_down_sync(0xffffffffu, fv2, o);
+      const int oi2 = __shfl_down_sync(0xffffffffu, fi2, o);
+      const float ov3 = __shfl_down_sync(0xffffffffu, fv3, o);
+      const int oi3 = __shfl_down_sync(0xffffffffu, fi3, o);
+      const float ov4 = __shfl_down_sync(0xffffffffu, fv4, o);
+      const int oi4 = __shfl_down_sync(0xffffffffu, fi4, o);
+      const float ov5 = __shfl_down_sync(0xffffffffu, fv5, o);
+      const int oi5 = __shfl_down_sync(0xffffffffu, fi5, o);
+      const float ov6 = __shfl_down_sync(0xffffffffu, fv6, o);
+      const int oi6 = __shfl_down_sync(0xffffffffu, fi6, o);
+      const float ov7 = __shfl_down_sync(0xffffffffu, fv7, o);
+      const int oi7 = __shfl_down_sync(0xffffffffu, fi7, o);
+      const float ov8 = __shfl_down_sync(0xffffffffu, fv8, o);
+      const int oi8 = __shfl_down_sync(0xffffffffu, fi8, o);
+      dhf_top8_merge(
+          fv1, fi1, fv2, fi2, fv3, fi3, fv4, fi4, fv5, fi5, fv6, fi6, fv7, fi7, fv8, fi8,
+          ov1, oi1, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6, ov7, oi7, ov8, oi8);
+    }
+    if (tid == 0) {
+      atomicExch(&s2_done[m], 0);
+      out[m] = static_cast<int64_t>(fi1);
+      if (out_top2_row0 != nullptr && m < top2_rows) {
+        out_top2_row0[2 * m + 0] = static_cast<int64_t>(fi1);
+        out_top2_row0[2 * m + 1] = (fi2 == 0x7fffffff) ? static_cast<int64_t>(fi1) : static_cast<int64_t>(fi2);
+      }
+      if (out_margins != nullptr && m < margin_rows) {
+        out_margins[m] = (fi2 == 0x7fffffff) ? 100.0f : (fv1 - fv2);
+      }
+      if (out_tree_top != nullptr && m < tree_top_rows) {
+        if (tree_k >= 8) {
+          out_tree_top[8 * m + 0] = static_cast<int64_t>(fi1);
+          out_tree_top[8 * m + 1] = (fi2 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi2);
+          out_tree_top[8 * m + 2] = (fi3 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi3);
+          out_tree_top[8 * m + 3] = (fi4 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi4);
+          out_tree_top[8 * m + 4] = (fi5 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi5);
+          out_tree_top[8 * m + 5] = (fi6 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi6);
+          out_tree_top[8 * m + 6] = (fi7 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi7);
+          out_tree_top[8 * m + 7] = (fi8 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi8);
+          if (out_tree_vals != nullptr) {
+            out_tree_vals[8 * m + 0] = (fi1 == 0x7fffffff) ? -1e30f : fv1;
+            out_tree_vals[8 * m + 1] = (fi2 == 0x7fffffff) ? -1e30f : fv2;
+            out_tree_vals[8 * m + 2] = (fi3 == 0x7fffffff) ? -1e30f : fv3;
+            out_tree_vals[8 * m + 3] = (fi4 == 0x7fffffff) ? -1e30f : fv4;
+            out_tree_vals[8 * m + 4] = (fi5 == 0x7fffffff) ? -1e30f : fv5;
+            out_tree_vals[8 * m + 5] = (fi6 == 0x7fffffff) ? -1e30f : fv6;
+            out_tree_vals[8 * m + 6] = (fi7 == 0x7fffffff) ? -1e30f : fv7;
+            out_tree_vals[8 * m + 7] = (fi8 == 0x7fffffff) ? -1e30f : fv8;
+          }
+        } else if (tree_k >= 6) {
+          out_tree_top[6 * m + 0] = static_cast<int64_t>(fi1);
+          out_tree_top[6 * m + 1] = (fi2 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi2);
+          out_tree_top[6 * m + 2] = (fi3 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi3);
+          out_tree_top[6 * m + 3] = (fi4 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi4);
+          out_tree_top[6 * m + 4] = (fi5 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi5);
+          out_tree_top[6 * m + 5] = (fi6 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi6);
+          if (out_tree_vals != nullptr) {
+            out_tree_vals[6 * m + 0] = (fi1 == 0x7fffffff) ? -1e30f : fv1;
+            out_tree_vals[6 * m + 1] = (fi2 == 0x7fffffff) ? -1e30f : fv2;
+            out_tree_vals[6 * m + 2] = (fi3 == 0x7fffffff) ? -1e30f : fv3;
+            out_tree_vals[6 * m + 3] = (fi4 == 0x7fffffff) ? -1e30f : fv4;
+            out_tree_vals[6 * m + 4] = (fi5 == 0x7fffffff) ? -1e30f : fv5;
+            out_tree_vals[6 * m + 5] = (fi6 == 0x7fffffff) ? -1e30f : fv6;
+          }
+        } else {
+          out_tree_top[4 * m + 0] = static_cast<int64_t>(fi1);
+          out_tree_top[4 * m + 1] = (fi2 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi2);
+          out_tree_top[4 * m + 2] = (fi3 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi3);
+          out_tree_top[4 * m + 3] = (fi4 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi4);
+        }
+      }
+      if ((pdl_mode & 2) != 0) {
+        asm volatile("griddepcontrol.launch_dependents;");
+      }
     }
   }
 }
 
-// Kernel 4: Final 16-block merge per row m -> exact output contract matching draft_vocab_tail_argmax.
-__global__ void dhf_final_reduce_kernel(
-    const float* __restrict__ s2_vals,
-    const int32_t* __restrict__ s2_ids,
+// Fused 1-wave Stage-2 kernel (96 CTAs = 2 CTAs/SM on GB10):
+// Phase A (A -> SMEM + OOV tail NVFP4 rescoring) overlaps Stage-1 tail BEFORE griddepcontrol.wait,
+// then runs exact 4-pass radix select in SMEM (eliminating dhf_select_topk_kernel + global cand_ids),
+// then rescores static shortlist candidates and performs deterministic last-CTA top-8 merge!
+__global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_fused_kernel(
+    const __nv_bfloat16* __restrict__ A,
+    const float* __restrict__ cta_vals,
+    const int32_t* __restrict__ cta_ids,
+    const int32_t* __restrict__ tail_ids,
+    const int32_t* __restrict__ tail_count,
+    const uint8_t* __restrict__ raw_w,
+    const uint8_t* __restrict__ raw_s,
+    const float* __restrict__ global_scale,
+    float* __restrict__ s2_vals,
+    int32_t* __restrict__ s2_ids,
+    int32_t* __restrict__ s2_done,
     int64_t* __restrict__ out,
     int64_t* __restrict__ out_top2_row0,
     int top2_rows,
@@ -3612,14 +4556,36 @@ __global__ void dhf_final_reduce_kernel(
     float* __restrict__ out_tree_vals,
     int tree_top_rows,
     int tree_k,
-    int M,
-    int pdl_mode) {
-  const int m = blockIdx.x;
-  const int lane = threadIdx.x;
-  if (m >= M) return;
+    int N_in, int K_cand, int K, int max_tail, float logit_scale, int pdl_mode) {
+  const int bid = blockIdx.x;
+  const int m = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int num_g = K >> 4;
+  const bool use_smem_a = (num_g <= kS2MaxGroups);
 
-  if ((pdl_mode & 1) != 0) {
-    asm volatile("griddepcontrol.wait;" ::: "memory");
+  __shared__ uint4 s_a0[kS2MaxGroups];
+  __shared__ uint4 s_a1[kS2MaxGroups];
+  __shared__ uint32_t s_keys[kWaveCTAs * kCtaTopK];
+  __shared__ int32_t s_ids[kWaveCTAs * kCtaTopK];
+  __shared__ uint32_t s_hist[256];
+  __shared__ int32_t s_cand[kMaxCand];
+  __shared__ float wv[kS2Warps][8];
+  __shared__ int32_t wi[kS2Warps][8];
+  __shared__ uint32_t s_prefix;
+  __shared__ uint32_t s_rem_k;
+  __shared__ uint32_t s_out_cnt;
+  __shared__ int s_is_last;
+
+  const __nv_bfloat16* a_row = A + static_cast<size_t>(m) * K;
+  if (use_smem_a) {
+    const uint4* a_u4 = reinterpret_cast<const uint4*>(a_row);
+    for (int g = tid; g < num_g; g += 256) {
+      s_a0[g] = a_u4[g * 2 + 0];
+      s_a1[g] = a_u4[g * 2 + 1];
+    }
+    __syncthreads();
   }
 
   float v1 = -1e38f, v2 = -1e38f, v3 = -1e38f, v4 = -1e38f;
@@ -3627,89 +4593,289 @@ __global__ void dhf_final_reduce_kernel(
   int i1 = 0x7fffffff, i2 = 0x7fffffff, i3 = 0x7fffffff, i4 = 0x7fffffff;
   int i5 = 0x7fffffff, i6 = 0x7fffffff, i7 = 0x7fffffff, i8 = 0x7fffffff;
 
-  if (lane < kS2CTAsPerRow) {
-    const size_t base = (static_cast<size_t>(m) * kS2CTAsPerRow + lane) * 8;
-    v1 = s2_vals[base + 0]; i1 = s2_ids[base + 0];
-    v2 = s2_vals[base + 1]; i2 = s2_ids[base + 1];
-    v3 = s2_vals[base + 2]; i3 = s2_ids[base + 2];
-    v4 = s2_vals[base + 3]; i4 = s2_ids[base + 3];
-    v5 = s2_vals[base + 4]; i5 = s2_ids[base + 4];
-    v6 = s2_vals[base + 5]; i6 = s2_ids[base + 5];
-    v7 = s2_vals[base + 6]; i7 = s2_ids[base + 6];
-    v8 = s2_vals[base + 7]; i8 = s2_ids[base + 7];
+  const float total_scale = __ldg(global_scale) * logit_scale;
+  const int stride_w = kS2CTAsPerRow * kS2Warps;
+
+  // Phase A (before PDL wait, overlapping Stage-1 tail): score dynamic prompt-tail OOV rows.
+  int tcnt = tail_count[0];
+  if (tcnt < 0) tcnt = 0;
+  if (tcnt > max_tail) tcnt = max_tail;
+  for (int idx = bid * kS2Warps + warp; idx < tcnt; idx += stride_w) {
+    const int tok = tail_ids[idx];
+    if (tok >= 0) {
+      const float val = dhf_warp_nvfp4_dot(
+          a_row, s_a0, s_a1, use_smem_a, raw_w, raw_s, tok, K, num_g, lane, total_scale);
+      if (lane == 0) {
+        dhf_top8_insert(v1, i1, v2, i2, v3, i3, v4, i4, v5, i5, v6, i6, v7, i7, v8, i8, val, tok);
+      }
+    }
   }
 
+  // Wait for Stage-1 (cta_vals, cta_ids) via SM121 PDL.
+  if ((pdl_mode & 1) != 0) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
+
+  // In-SMEM exact 4-pass MSB radix select (100% bit-identical to dhf_select_topk_kernel).
+  const float* v_in = cta_vals + static_cast<size_t>(m) * N_in;
+  const int32_t* i_in = cta_ids + static_cast<size_t>(m) * N_in;
+  for (int i = tid; i < N_in; i += 256) {
+    float v = v_in[i];
+    int32_t id = i_in[i];
+    if (isnan(v) || id < 0) {
+      v = -1e38f;
+      id = -1;
+    }
+    s_keys[i] = dhf_f32_to_key(v);
+    s_ids[i] = id;
+  }
+  if (tid == 0) {
+    s_prefix = 0u;
+    s_rem_k = static_cast<uint32_t>((K_cand < N_in) ? K_cand : N_in);
+    s_out_cnt = 0u;
+  }
+  __syncthreads();
+
 #pragma unroll
-  for (int o = 8; o > 0; o >>= 1) {
-    const float ov1 = __shfl_down_sync(0xffffffffu, v1, o);
-    const int oi1 = __shfl_down_sync(0xffffffffu, i1, o);
-    const float ov2 = __shfl_down_sync(0xffffffffu, v2, o);
-    const int oi2 = __shfl_down_sync(0xffffffffu, i2, o);
-    const float ov3 = __shfl_down_sync(0xffffffffu, v3, o);
-    const int oi3 = __shfl_down_sync(0xffffffffu, i3, o);
-    const float ov4 = __shfl_down_sync(0xffffffffu, v4, o);
-    const int oi4 = __shfl_down_sync(0xffffffffu, i4, o);
-    const float ov5 = __shfl_down_sync(0xffffffffu, v5, o);
-    const int oi5 = __shfl_down_sync(0xffffffffu, i5, o);
-    const float ov6 = __shfl_down_sync(0xffffffffu, v6, o);
-    const int oi6 = __shfl_down_sync(0xffffffffu, i6, o);
-    const float ov7 = __shfl_down_sync(0xffffffffu, v7, o);
-    const int oi7 = __shfl_down_sync(0xffffffffu, i7, o);
-    const float ov8 = __shfl_down_sync(0xffffffffu, v8, o);
-    const int oi8 = __shfl_down_sync(0xffffffffu, i8, o);
-    dhf_top8_merge(v1, i1, v2, i2, v3, i3, v4, i4, v5, i5, v6, i6, v7, i7, v8, i8,
-                   ov1, oi1, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6, ov7, oi7, ov8, oi8);
+  for (int pass = 0; pass < 4; ++pass) {
+    const uint32_t shift = static_cast<uint32_t>(24 - pass * 8);
+    const uint32_t mask = (pass == 0) ? 0u : (~0u << (32 - pass * 8));
+    const uint32_t pref = s_prefix;
+    s_hist[tid] = 0u;
+    __syncthreads();
+
+    for (int i = tid; i < N_in; i += 256) {
+      const uint32_t k = s_keys[i];
+      if ((k & mask) == pref) {
+        atomicAdd(&s_hist[(k >> shift) & 0xFFu], 1u);
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      uint32_t acc = 0u;
+      const uint32_t need = s_rem_k;
+      uint32_t chosen = 0u;
+      for (int b = 255; b >= 0; --b) {
+        const uint32_t c = s_hist[b];
+        if (acc + c >= need) {
+          chosen = static_cast<uint32_t>(b);
+          s_rem_k = need - acc;
+          break;
+        }
+        acc += c;
+      }
+      s_prefix = pref | (chosen << shift);
+    }
+    __syncthreads();
+  }
+
+  const uint32_t thresh = s_prefix;
+  if (tid < 32) {
+    uint32_t cur = 0u;
+    const uint32_t cap = static_cast<uint32_t>(K_cand);
+    for (int base = 0; base < N_in && cur < cap; base += 32) {
+      const int i = base + tid;
+      const bool hit = (i < N_in) && (s_keys[i] > thresh) && (s_ids[i] >= 0);
+      const uint32_t bmask = __ballot_sync(0xffffffffu, hit);
+      if (bmask != 0u) {
+        const uint32_t slot = cur + static_cast<uint32_t>(__popc(bmask & ((1u << tid) - 1u)));
+        if (hit && slot < cap) {
+          s_cand[slot] = s_ids[i];
+        }
+        cur += static_cast<uint32_t>(__popc(bmask));
+      }
+    }
+    for (int base = 0; base < N_in && cur < cap; base += 32) {
+      const int i = base + tid;
+      const bool hit = (i < N_in) && (s_keys[i] == thresh) && (s_ids[i] >= 0);
+      const uint32_t bmask = __ballot_sync(0xffffffffu, hit);
+      if (bmask != 0u) {
+        const uint32_t slot = cur + static_cast<uint32_t>(__popc(bmask & ((1u << tid) - 1u)));
+        if (hit && slot < cap) {
+          s_cand[slot] = s_ids[i];
+        }
+        cur += static_cast<uint32_t>(__popc(bmask));
+      }
+    }
+    if (tid == 0) {
+      s_out_cnt = (cur < cap) ? cur : cap;
+    }
+  }
+  __syncthreads();
+
+  // Phase B: score static shortlist candidates against exact raw NVFP4 weights.
+  const int cand_lim = static_cast<int>(s_out_cnt);
+  for (int idx = bid * kS2Warps + warp; idx < cand_lim; idx += stride_w) {
+    const int tok = s_cand[idx];
+    if (tok >= 0) {
+      const float val = dhf_warp_nvfp4_dot(
+          a_row, s_a0, s_a1, use_smem_a, raw_w, raw_s, tok, K, num_g, lane, total_scale);
+      if (lane == 0) {
+        dhf_top8_insert(v1, i1, v2, i2, v3, i3, v4, i4, v5, i5, v6, i6, v7, i7, v8, i8, val, tok);
+      }
+    }
   }
 
   if (lane == 0) {
-    out[m] = static_cast<int64_t>(i1);
-    if (out_top2_row0 != nullptr && m < top2_rows) {
-      out_top2_row0[2 * m + 0] = static_cast<int64_t>(i1);
-      out_top2_row0[2 * m + 1] = (i2 == 0x7fffffff) ? static_cast<int64_t>(i1) : static_cast<int64_t>(i2);
+    wv[warp][0] = v1; wi[warp][0] = i1;
+    wv[warp][1] = v2; wi[warp][1] = i2;
+    wv[warp][2] = v3; wi[warp][2] = i3;
+    wv[warp][3] = v4; wi[warp][3] = i4;
+    wv[warp][4] = v5; wi[warp][4] = i5;
+    wv[warp][5] = v6; wi[warp][5] = i6;
+    wv[warp][6] = v7; wi[warp][6] = i7;
+    wv[warp][7] = v8; wi[warp][7] = i8;
+  }
+  __syncthreads();
+
+  if (tid < 32) {
+    float bv1 = (tid < kS2Warps) ? wv[tid][0] : -1e38f;
+    float bv2 = (tid < kS2Warps) ? wv[tid][1] : -1e38f;
+    float bv3 = (tid < kS2Warps) ? wv[tid][2] : -1e38f;
+    float bv4 = (tid < kS2Warps) ? wv[tid][3] : -1e38f;
+    float bv5 = (tid < kS2Warps) ? wv[tid][4] : -1e38f;
+    float bv6 = (tid < kS2Warps) ? wv[tid][5] : -1e38f;
+    float bv7 = (tid < kS2Warps) ? wv[tid][6] : -1e38f;
+    float bv8 = (tid < kS2Warps) ? wv[tid][7] : -1e38f;
+    int bi1 = (tid < kS2Warps) ? wi[tid][0] : 0x7fffffff;
+    int bi2 = (tid < kS2Warps) ? wi[tid][1] : 0x7fffffff;
+    int bi3 = (tid < kS2Warps) ? wi[tid][2] : 0x7fffffff;
+    int bi4 = (tid < kS2Warps) ? wi[tid][3] : 0x7fffffff;
+    int bi5 = (tid < kS2Warps) ? wi[tid][4] : 0x7fffffff;
+    int bi6 = (tid < kS2Warps) ? wi[tid][5] : 0x7fffffff;
+    int bi7 = (tid < kS2Warps) ? wi[tid][6] : 0x7fffffff;
+    int bi8 = (tid < kS2Warps) ? wi[tid][7] : 0x7fffffff;
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) {
+      const float ov1 = __shfl_down_sync(0xffffffffu, bv1, o);
+      const int oi1 = __shfl_down_sync(0xffffffffu, bi1, o);
+      const float ov2 = __shfl_down_sync(0xffffffffu, bv2, o);
+      const int oi2 = __shfl_down_sync(0xffffffffu, bi2, o);
+      const float ov3 = __shfl_down_sync(0xffffffffu, bv3, o);
+      const int oi3 = __shfl_down_sync(0xffffffffu, bi3, o);
+      const float ov4 = __shfl_down_sync(0xffffffffu, bv4, o);
+      const int oi4 = __shfl_down_sync(0xffffffffu, bi4, o);
+      const float ov5 = __shfl_down_sync(0xffffffffu, bv5, o);
+      const int oi5 = __shfl_down_sync(0xffffffffu, bi5, o);
+      const float ov6 = __shfl_down_sync(0xffffffffu, bv6, o);
+      const int oi6 = __shfl_down_sync(0xffffffffu, bi6, o);
+      const float ov7 = __shfl_down_sync(0xffffffffu, bv7, o);
+      const int oi7 = __shfl_down_sync(0xffffffffu, bi7, o);
+      const float ov8 = __shfl_down_sync(0xffffffffu, bv8, o);
+      const int oi8 = __shfl_down_sync(0xffffffffu, bi8, o);
+      dhf_top8_merge(
+          bv1, bi1, bv2, bi2, bv3, bi3, bv4, bi4, bv5, bi5, bv6, bi6, bv7, bi7, bv8, bi8,
+          ov1, oi1, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6, ov7, oi7, ov8, oi8);
     }
-    if (out_margins != nullptr && m < margin_rows) {
-      out_margins[m] = (i2 == 0x7fffffff) ? 100.0f : (v1 - v2);
+    if (tid == 0) {
+      const size_t base = (static_cast<size_t>(m) * kS2CTAsPerRow + bid) * 8;
+      s2_vals[base + 0] = bv1; s2_ids[base + 0] = bi1;
+      s2_vals[base + 1] = bv2; s2_ids[base + 1] = bi2;
+      s2_vals[base + 2] = bv3; s2_ids[base + 2] = bi3;
+      s2_vals[base + 3] = bv4; s2_ids[base + 3] = bi4;
+      s2_vals[base + 4] = bv5; s2_ids[base + 4] = bi5;
+      s2_vals[base + 5] = bv6; s2_ids[base + 5] = bi6;
+      s2_vals[base + 6] = bv7; s2_ids[base + 6] = bi7;
+      s2_vals[base + 7] = bv8; s2_ids[base + 7] = bi8;
+      __threadfence();
+      s_is_last = (atomicAdd(&s2_done[m], 1) + 1 == kS2CTAsPerRow) ? 1 : 0;
     }
-    if (out_tree_top != nullptr && m < tree_top_rows) {
-      if (tree_k >= 8) {
-        out_tree_top[8 * m + 0] = static_cast<int64_t>(i1);
-        out_tree_top[8 * m + 1] = (i2 == 0x7fffffff) ? -1 : static_cast<int64_t>(i2);
-        out_tree_top[8 * m + 2] = (i3 == 0x7fffffff) ? -1 : static_cast<int64_t>(i3);
-        out_tree_top[8 * m + 3] = (i4 == 0x7fffffff) ? -1 : static_cast<int64_t>(i4);
-        out_tree_top[8 * m + 4] = (i5 == 0x7fffffff) ? -1 : static_cast<int64_t>(i5);
-        out_tree_top[8 * m + 5] = (i6 == 0x7fffffff) ? -1 : static_cast<int64_t>(i6);
-        out_tree_top[8 * m + 6] = (i7 == 0x7fffffff) ? -1 : static_cast<int64_t>(i7);
-        out_tree_top[8 * m + 7] = (i8 == 0x7fffffff) ? -1 : static_cast<int64_t>(i8);
-        if (out_tree_vals != nullptr) {
-          out_tree_vals[8 * m + 0] = (i1 == 0x7fffffff) ? -1e30f : v1;
-          out_tree_vals[8 * m + 1] = (i2 == 0x7fffffff) ? -1e30f : v2;
-          out_tree_vals[8 * m + 2] = (i3 == 0x7fffffff) ? -1e30f : v3;
-          out_tree_vals[8 * m + 3] = (i4 == 0x7fffffff) ? -1e30f : v4;
-          out_tree_vals[8 * m + 4] = (i5 == 0x7fffffff) ? -1e30f : v5;
-          out_tree_vals[8 * m + 5] = (i6 == 0x7fffffff) ? -1e30f : v6;
-          out_tree_vals[8 * m + 6] = (i7 == 0x7fffffff) ? -1e30f : v7;
-          out_tree_vals[8 * m + 7] = (i8 == 0x7fffffff) ? -1e30f : v8;
+  }
+  __syncthreads();
+
+  if (s_is_last && tid < 32) {
+    float fv1 = -1e38f, fv2 = -1e38f, fv3 = -1e38f, fv4 = -1e38f;
+    float fv5 = -1e38f, fv6 = -1e38f, fv7 = -1e38f, fv8 = -1e38f;
+    int fi1 = 0x7fffffff, fi2 = 0x7fffffff, fi3 = 0x7fffffff, fi4 = 0x7fffffff;
+    int fi5 = 0x7fffffff, fi6 = 0x7fffffff, fi7 = 0x7fffffff, fi8 = 0x7fffffff;
+    if (tid < kS2CTAsPerRow) {
+      const size_t base = (static_cast<size_t>(m) * kS2CTAsPerRow + tid) * 8;
+      fv1 = dhf_ldcg_f(&s2_vals[base + 0]); fi1 = dhf_ldcg_i(&s2_ids[base + 0]);
+      fv2 = dhf_ldcg_f(&s2_vals[base + 1]); fi2 = dhf_ldcg_i(&s2_ids[base + 1]);
+      fv3 = dhf_ldcg_f(&s2_vals[base + 2]); fi3 = dhf_ldcg_i(&s2_ids[base + 2]);
+      fv4 = dhf_ldcg_f(&s2_vals[base + 3]); fi4 = dhf_ldcg_i(&s2_ids[base + 3]);
+      fv5 = dhf_ldcg_f(&s2_vals[base + 4]); fi5 = dhf_ldcg_i(&s2_ids[base + 4]);
+      fv6 = dhf_ldcg_f(&s2_vals[base + 5]); fi6 = dhf_ldcg_i(&s2_ids[base + 5]);
+      fv7 = dhf_ldcg_f(&s2_vals[base + 6]); fi7 = dhf_ldcg_i(&s2_ids[base + 6]);
+      fv8 = dhf_ldcg_f(&s2_vals[base + 7]); fi8 = dhf_ldcg_i(&s2_ids[base + 7]);
+    }
+#pragma unroll
+    for (int o = (kS2CTAsPerRow >> 1); o > 0; o >>= 1) {
+      const float ov1 = __shfl_down_sync(0xffffffffu, fv1, o);
+      const int oi1 = __shfl_down_sync(0xffffffffu, fi1, o);
+      const float ov2 = __shfl_down_sync(0xffffffffu, fv2, o);
+      const int oi2 = __shfl_down_sync(0xffffffffu, fi2, o);
+      const float ov3 = __shfl_down_sync(0xffffffffu, fv3, o);
+      const int oi3 = __shfl_down_sync(0xffffffffu, fi3, o);
+      const float ov4 = __shfl_down_sync(0xffffffffu, fv4, o);
+      const int oi4 = __shfl_down_sync(0xffffffffu, fi4, o);
+      const float ov5 = __shfl_down_sync(0xffffffffu, fv5, o);
+      const int oi5 = __shfl_down_sync(0xffffffffu, fi5, o);
+      const float ov6 = __shfl_down_sync(0xffffffffu, fv6, o);
+      const int oi6 = __shfl_down_sync(0xffffffffu, fi6, o);
+      const float ov7 = __shfl_down_sync(0xffffffffu, fv7, o);
+      const int oi7 = __shfl_down_sync(0xffffffffu, fi7, o);
+      const float ov8 = __shfl_down_sync(0xffffffffu, fv8, o);
+      const int oi8 = __shfl_down_sync(0xffffffffu, fi8, o);
+      dhf_top8_merge(
+          fv1, fi1, fv2, fi2, fv3, fi3, fv4, fi4, fv5, fi5, fv6, fi6, fv7, fi7, fv8, fi8,
+          ov1, oi1, ov2, oi2, ov3, oi3, ov4, oi4, ov5, oi5, ov6, oi6, ov7, oi7, ov8, oi8);
+    }
+    if (tid == 0) {
+      atomicExch(&s2_done[m], 0);
+      out[m] = static_cast<int64_t>(fi1);
+      if (out_top2_row0 != nullptr && m < top2_rows) {
+        out_top2_row0[2 * m + 0] = static_cast<int64_t>(fi1);
+        out_top2_row0[2 * m + 1] = (fi2 == 0x7fffffff) ? static_cast<int64_t>(fi1) : static_cast<int64_t>(fi2);
+      }
+      if (out_margins != nullptr && m < margin_rows) {
+        out_margins[m] = (fi2 == 0x7fffffff) ? 100.0f : (fv1 - fv2);
+      }
+      if (out_tree_top != nullptr && m < tree_top_rows) {
+        if (tree_k >= 8) {
+          out_tree_top[8 * m + 0] = static_cast<int64_t>(fi1);
+          out_tree_top[8 * m + 1] = (fi2 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi2);
+          out_tree_top[8 * m + 2] = (fi3 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi3);
+          out_tree_top[8 * m + 3] = (fi4 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi4);
+          out_tree_top[8 * m + 4] = (fi5 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi5);
+          out_tree_top[8 * m + 5] = (fi6 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi6);
+          out_tree_top[8 * m + 6] = (fi7 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi7);
+          out_tree_top[8 * m + 7] = (fi8 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi8);
+          if (out_tree_vals != nullptr) {
+            out_tree_vals[8 * m + 0] = (fi1 == 0x7fffffff) ? -1e30f : fv1;
+            out_tree_vals[8 * m + 1] = (fi2 == 0x7fffffff) ? -1e30f : fv2;
+            out_tree_vals[8 * m + 2] = (fi3 == 0x7fffffff) ? -1e30f : fv3;
+            out_tree_vals[8 * m + 3] = (fi4 == 0x7fffffff) ? -1e30f : fv4;
+            out_tree_vals[8 * m + 4] = (fi5 == 0x7fffffff) ? -1e30f : fv5;
+            out_tree_vals[8 * m + 5] = (fi6 == 0x7fffffff) ? -1e30f : fv6;
+            out_tree_vals[8 * m + 6] = (fi7 == 0x7fffffff) ? -1e30f : fv7;
+            out_tree_vals[8 * m + 7] = (fi8 == 0x7fffffff) ? -1e30f : fv8;
+          }
+        } else if (tree_k >= 6) {
+          out_tree_top[6 * m + 0] = static_cast<int64_t>(fi1);
+          out_tree_top[6 * m + 1] = (fi2 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi2);
+          out_tree_top[6 * m + 2] = (fi3 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi3);
+          out_tree_top[6 * m + 3] = (fi4 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi4);
+          out_tree_top[6 * m + 4] = (fi5 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi5);
+          out_tree_top[6 * m + 5] = (fi6 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi6);
+          if (out_tree_vals != nullptr) {
+            out_tree_vals[6 * m + 0] = (fi1 == 0x7fffffff) ? -1e30f : fv1;
+            out_tree_vals[6 * m + 1] = (fi2 == 0x7fffffff) ? -1e30f : fv2;
+            out_tree_vals[6 * m + 2] = (fi3 == 0x7fffffff) ? -1e30f : fv3;
+            out_tree_vals[6 * m + 3] = (fi4 == 0x7fffffff) ? -1e30f : fv4;
+            out_tree_vals[6 * m + 4] = (fi5 == 0x7fffffff) ? -1e30f : fv5;
+            out_tree_vals[6 * m + 5] = (fi6 == 0x7fffffff) ? -1e30f : fv6;
+          }
+        } else {
+          out_tree_top[4 * m + 0] = static_cast<int64_t>(fi1);
+          out_tree_top[4 * m + 1] = (fi2 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi2);
+          out_tree_top[4 * m + 2] = (fi3 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi3);
+          out_tree_top[4 * m + 3] = (fi4 == 0x7fffffff) ? -1 : static_cast<int64_t>(fi4);
         }
-      } else if (tree_k >= 6) {
-        out_tree_top[6 * m + 0] = static_cast<int64_t>(i1);
-        out_tree_top[6 * m + 1] = (i2 == 0x7fffffff) ? -1 : static_cast<int64_t>(i2);
-        out_tree_top[6 * m + 2] = (i3 == 0x7fffffff) ? -1 : static_cast<int64_t>(i3);
-        out_tree_top[6 * m + 3] = (i4 == 0x7fffffff) ? -1 : static_cast<int64_t>(i4);
-        out_tree_top[6 * m + 4] = (i5 == 0x7fffffff) ? -1 : static_cast<int64_t>(i5);
-        out_tree_top[6 * m + 5] = (i6 == 0x7fffffff) ? -1 : static_cast<int64_t>(i6);
-        if (out_tree_vals != nullptr) {
-          out_tree_vals[6 * m + 0] = (i1 == 0x7fffffff) ? -1e30f : v1;
-          out_tree_vals[6 * m + 1] = (i2 == 0x7fffffff) ? -1e30f : v2;
-          out_tree_vals[6 * m + 2] = (i3 == 0x7fffffff) ? -1e30f : v3;
-          out_tree_vals[6 * m + 3] = (i4 == 0x7fffffff) ? -1e30f : v4;
-          out_tree_vals[6 * m + 4] = (i5 == 0x7fffffff) ? -1e30f : v5;
-          out_tree_vals[6 * m + 5] = (i6 == 0x7fffffff) ? -1e30f : v6;
-        }
-      } else {
-        out_tree_top[4 * m + 0] = static_cast<int64_t>(i1);
-        out_tree_top[4 * m + 1] = (i2 == 0x7fffffff) ? -1 : static_cast<int64_t>(i2);
-        out_tree_top[4 * m + 2] = (i3 == 0x7fffffff) ? -1 : static_cast<int64_t>(i3);
-        out_tree_top[4 * m + 3] = (i4 == 0x7fffffff) ? -1 : static_cast<int64_t>(i4);
+      }
+      if ((pdl_mode & 2) != 0) {
+        asm volatile("griddepcontrol.launch_dependents;");
       }
     }
   }
@@ -3722,6 +4888,7 @@ struct DHeadFastScratch {
   torch::Tensor cand_ids;
   torch::Tensor s2_vals;
   torch::Tensor s2_ids;
+  torch::Tensor s2_done;
   int cap_k = 0;
   c10::DeviceIndex dev = -1;
 };
@@ -3738,6 +4905,7 @@ DHeadFastScratch& get_dhf_scratch(torch::Device device, int K) {
     sc.cand_ids = torch::empty({kMaxM, kMaxCand}, opt_i32);
     sc.s2_vals = torch::empty({kMaxM, kS2CTAsPerRow, 8}, opt_f32);
     sc.s2_ids = torch::empty({kMaxM, kS2CTAsPerRow, 8}, opt_i32);
+    sc.s2_done = torch::zeros({kMaxM}, opt_i32);
     sc.cap_k = K;
     sc.dev = device.index();
   }
@@ -3762,6 +4930,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> dhead_fas
     torch::Tensor global_scale,
     torch::Tensor vocab_map,
     int64_t mode) {
+  vq4d_reset_norm_rot_table();
   using namespace dhf4d;
   TORCH_CHECK(raw_w.is_cuda() && raw_w.scalar_type() == torch::kUInt8 && raw_w.dim() == 2 && raw_w.is_contiguous());
   TORCH_CHECK(raw_s.is_cuda() && raw_s.dim() == 2 && raw_s.is_contiguous());
@@ -3893,8 +5062,36 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> dhead_fas
   if (mode == 100) {
     const int n_blocks = V_static / kRowsPerCTA;
     const bool use_pair = dhf_pair_waves_enabled() && ((n_blocks % (2 * kWaveCTAs)) == 0);
+    const bool use_tma_pair_bk128 =
+        !use_pair && dhf_tma100_enabled() && dhf_tma100_pair_enabled() && ((K & 127) == 0) &&
+        (n_blocks >= 8 * kWaveCTAs) && ((reinterpret_cast<uintptr_t>(blob.data_ptr()) & 15u) == 0u);
+    const bool use_tma_bk128 =
+        !use_pair && !use_tma_pair_bk128 && dhf_tma100_enabled() && ((K & 127) == 0) &&
+        ((reinterpret_cast<uintptr_t>(blob.data_ptr()) & 15u) == 0u);
     if (use_pair) {
-      dhf_pack_tiles_kernel<100, true><<<pack_grid, 32, 0, st>>>(
+      dhf_pack_tiles_kernel<100, 1><<<pack_grid, 32, 0, st>>>(
+          raw_w.data_ptr<uint8_t>(),
+          reinterpret_cast<const uint8_t*>(raw_s.data_ptr()),
+          global_scale.data_ptr<float>(),
+          packed_tok_ids.data_ptr<int32_t>(),
+          col_mean.data_ptr<float>(),
+          col_std.data_ptr<float>(),
+          row_thresh.data_ptr<float>(),
+          blob.data_ptr<uint8_t>(),
+          V_static, K);
+    } else if (use_tma_pair_bk128) {
+      dhf_pack_tiles_kernel<100, 3><<<pack_grid, 32, 0, st>>>(
+          raw_w.data_ptr<uint8_t>(),
+          reinterpret_cast<const uint8_t*>(raw_s.data_ptr()),
+          global_scale.data_ptr<float>(),
+          packed_tok_ids.data_ptr<int32_t>(),
+          col_mean.data_ptr<float>(),
+          col_std.data_ptr<float>(),
+          row_thresh.data_ptr<float>(),
+          blob.data_ptr<uint8_t>(),
+          V_static, K);
+    } else if (use_tma_bk128) {
+      dhf_pack_tiles_kernel<100, 2><<<pack_grid, 32, 0, st>>>(
           raw_w.data_ptr<uint8_t>(),
           reinterpret_cast<const uint8_t*>(raw_s.data_ptr()),
           global_scale.data_ptr<float>(),
@@ -3905,7 +5102,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> dhead_fas
           blob.data_ptr<uint8_t>(),
           V_static, K);
     } else {
-      dhf_pack_tiles_kernel<100, false><<<pack_grid, 32, 0, st>>>(
+      dhf_pack_tiles_kernel<100, 0><<<pack_grid, 32, 0, st>>>(
           raw_w.data_ptr<uint8_t>(),
           reinterpret_cast<const uint8_t*>(raw_s.data_ptr()),
           global_scale.data_ptr<float>(),
@@ -3972,6 +5169,7 @@ torch::Tensor dhead_fast_argmax(
     c10::optional<torch::Tensor> out_margins = c10::nullopt,
     c10::optional<torch::Tensor> out_tree_top = c10::nullopt,
     c10::optional<torch::Tensor> out_tree_vals = c10::nullopt) {
+  vq4d_clear_all_prerot();
   using namespace dhf4d;
   TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous());
   TORCH_CHECK(blob.is_cuda() && blob.scalar_type() == torch::kUInt8 && blob.is_contiguous());
@@ -4048,10 +5246,16 @@ torch::Tensor dhead_fast_argmax(
     carveout_set = true;
     cudaFuncSetAttribute(dhf_stage1_mode100_pair_kernel<true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
     cudaFuncSetAttribute(dhf_stage1_mode100_pair_kernel<false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(dhf_stage1_tma100_pair_bk128_kernel<true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(dhf_stage1_tma100_pair_bk128_kernel<false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(dhf_stage1_tma100_bk128_kernel<true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(dhf_stage1_tma100_bk128_kernel<false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
     cudaFuncSetAttribute(dhf_stage1_kernel<100, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
     cudaFuncSetAttribute(dhf_stage1_kernel<100, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
     cudaFuncSetAttribute(dhf_stage1_kernel<150, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
     cudaFuncSetAttribute(dhf_stage1_kernel<150, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(dhf_stage2_rescore_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(dhf_stage2_rescore_fused_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   }
   static const bool dyn_ev = (std::getenv("MUSE_BENCH_DYN_ENV") != nullptr);
   static const bool evict_first_cached = []() {
@@ -4066,7 +5270,8 @@ torch::Tensor dhead_fast_argmax(
   auto launch_s1 = [&](auto mode_tag) {
     constexpr int KM = decltype(mode_tag)::value;
     if constexpr (KM == 100) {
-      if (dhf_pair_waves_enabled() && ((n_blocks % (2 * kWaveCTAs)) == 0)) {
+      const bool use_pair = dhf_pair_waves_enabled() && ((n_blocks % (2 * kWaveCTAs)) == 0);
+      if (use_pair) {
         if (evict_first) {
           dhf_launch_pdl(
               &dhf_stage1_mode100_pair_kernel<true>, dim3(kWaveCTAs, 1, 1), kThreads, st, pdl_mode,
@@ -4081,6 +5286,60 @@ torch::Tensor dhead_fast_argmax(
         } else {
           dhf_launch_pdl(
               &dhf_stage1_mode100_pair_kernel<false>, dim3(kWaveCTAs, 1, 1), kThreads, st, pdl_mode,
+              reinterpret_cast<const __nv_bfloat16*>(sc.a_scaled.data_ptr()),
+              blob.data_ptr<uint8_t>(),
+              row_scales.data_ptr<float>(),
+              col_scales.data_ptr<float>(),
+              packed_tok_ids.data_ptr<int32_t>(),
+              sc.cta_vals.data_ptr<float>(),
+              sc.cta_ids.data_ptr<int32_t>(),
+              M, V_static, K, pdl_mode);
+        }
+        return;
+      }
+      if (dhf_tma100_enabled() && dhf_tma100_pair_enabled() && ((K & 127) == 0) &&
+          (n_blocks >= 8 * kWaveCTAs) && ((reinterpret_cast<uintptr_t>(blob.data_ptr()) & 15u) == 0u)) {
+        if (evict_first) {
+          dhf_launch_pdl(
+              &dhf_stage1_tma100_pair_bk128_kernel<true>, dim3(grid_ctas, 1, 1), kThreads, st, pdl_mode,
+              reinterpret_cast<const __nv_bfloat16*>(sc.a_scaled.data_ptr()),
+              blob.data_ptr<uint8_t>(),
+              row_scales.data_ptr<float>(),
+              col_scales.data_ptr<float>(),
+              packed_tok_ids.data_ptr<int32_t>(),
+              sc.cta_vals.data_ptr<float>(),
+              sc.cta_ids.data_ptr<int32_t>(),
+              M, V_static, K, pdl_mode);
+        } else {
+          dhf_launch_pdl(
+              &dhf_stage1_tma100_pair_bk128_kernel<false>, dim3(grid_ctas, 1, 1), kThreads, st, pdl_mode,
+              reinterpret_cast<const __nv_bfloat16*>(sc.a_scaled.data_ptr()),
+              blob.data_ptr<uint8_t>(),
+              row_scales.data_ptr<float>(),
+              col_scales.data_ptr<float>(),
+              packed_tok_ids.data_ptr<int32_t>(),
+              sc.cta_vals.data_ptr<float>(),
+              sc.cta_ids.data_ptr<int32_t>(),
+              M, V_static, K, pdl_mode);
+        }
+        return;
+      }
+      if (dhf_tma100_enabled() && ((K & 127) == 0) &&
+          ((reinterpret_cast<uintptr_t>(blob.data_ptr()) & 15u) == 0u)) {
+        if (evict_first) {
+          dhf_launch_pdl(
+              &dhf_stage1_tma100_bk128_kernel<true>, dim3(grid_ctas, 1, 1), kThreads, st, pdl_mode,
+              reinterpret_cast<const __nv_bfloat16*>(sc.a_scaled.data_ptr()),
+              blob.data_ptr<uint8_t>(),
+              row_scales.data_ptr<float>(),
+              col_scales.data_ptr<float>(),
+              packed_tok_ids.data_ptr<int32_t>(),
+              sc.cta_vals.data_ptr<float>(),
+              sc.cta_ids.data_ptr<int32_t>(),
+              M, V_static, K, pdl_mode);
+        } else {
+          dhf_launch_pdl(
+              &dhf_stage1_tma100_bk128_kernel<false>, dim3(grid_ctas, 1, 1), kThreads, st, pdl_mode,
               reinterpret_cast<const __nv_bfloat16*>(sc.a_scaled.data_ptr()),
               blob.data_ptr<uint8_t>(),
               row_scales.data_ptr<float>(),
@@ -4122,6 +5381,28 @@ torch::Tensor dhead_fast_argmax(
   else if (mode == 158) launch_s1(std::integral_constant<int, 158>{});
   else launch_s1(std::integral_constant<int, 2>{});
 
+  if (dhf_fuse_select_enabled()) {
+    dhf_launch_pdl(
+        &dhf_stage2_rescore_fused_kernel, dim3(kS2CTAsPerRow, M, 1), 256, st, pdl_mode,
+        reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
+        static_cast<const float*>(sc.cta_vals.data_ptr<float>()),
+        static_cast<const int32_t*>(sc.cta_ids.data_ptr<int32_t>()),
+        tail_ids.data_ptr<int32_t>(),
+        tail_count.data_ptr<int32_t>(),
+        raw_w.data_ptr<uint8_t>(),
+        reinterpret_cast<const uint8_t*>(raw_s.data_ptr()),
+        global_scale.data_ptr<float>(),
+        sc.s2_vals.data_ptr<float>(),
+        sc.s2_ids.data_ptr<int32_t>(),
+        sc.s2_done.data_ptr<int32_t>(),
+        out.data_ptr<int64_t>(),
+        top2_ptr, top2_rows,
+        margin_ptr, margin_rows,
+        tree_top_ptr, tree_vals_ptr, tree_top_rows, tree_k,
+        N_in, K_cand, K, max_tail, static_cast<float>(logit_scale), pdl_mode);
+    return out;
+  }
+
   // Kernel 2: Exact 3-pass radix select -> top K_cand target token IDs per row m.
   dhf_launch_pdl(
       &dhf_select_topk_kernel, dim3(M, 1, 1), 256, st, pdl_mode,
@@ -4130,7 +5411,7 @@ torch::Tensor dhead_fast_argmax(
       sc.cand_ids.data_ptr<int32_t>(),
       N_in, K_cand, pdl_mode);
 
-  // Kernel 3: Stage 2 exact NVFP4 rescore (prompt tail before PDL wait + shortlist after).
+  // Kernel 3: Fused 1-wave Stage 2 exact NVFP4 rescore + deterministic last-CTA final top-8 reduction.
   dhf_launch_pdl(
       &dhf_stage2_rescore_kernel, dim3(kS2CTAsPerRow, M, 1), 256, st, pdl_mode,
       reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
@@ -4142,18 +5423,12 @@ torch::Tensor dhead_fast_argmax(
       global_scale.data_ptr<float>(),
       sc.s2_vals.data_ptr<float>(),
       sc.s2_ids.data_ptr<int32_t>(),
-      K_cand, K, max_tail, static_cast<float>(logit_scale), pdl_mode);
-
-  // Kernel 4: Final exact top-1 / top-2 / margin / tree top-4/6/8 reduction.
-  dhf_launch_pdl(
-      &dhf_final_reduce_kernel, dim3(M, 1, 1), 32, st, (pdl_mode & 1),
-      static_cast<const float*>(sc.s2_vals.data_ptr<float>()),
-      static_cast<const int32_t*>(sc.s2_ids.data_ptr<int32_t>()),
+      sc.s2_done.data_ptr<int32_t>(),
       out.data_ptr<int64_t>(),
       top2_ptr, top2_rows,
       margin_ptr, margin_rows,
       tree_top_ptr, tree_vals_ptr, tree_top_rows, tree_k,
-      M, (pdl_mode & 1));
+      K_cand, K, max_tail, static_cast<float>(logit_scale), pdl_mode);
 
   return out;
 }
