@@ -3269,7 +3269,10 @@ torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
   const int64_t num_tiles = static_cast<int64_t>(N / 8) * static_cast<int64_t>(K / 64);
   const int64_t vq9_bytes = num_tiles * 152 + 16;
   const int64_t vq10_bytes = num_tiles * 168 + 16;
-  if (W_packed.numel() == vq9_bytes || W_packed.numel() == vq10_bytes) {
+  const int64_t vq11_bytes = num_tiles * 184 + 16;
+  const int64_t vq12_bytes = num_tiles * 200 + 48;
+  if (W_packed.numel() == vq9_bytes || W_packed.numel() == vq10_bytes ||
+      W_packed.numel() == vq11_bytes || W_packed.numel() == vq12_bytes) {
     return vq4d_gemm(A, W_packed, N, K);
   }
   TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous(),
@@ -3374,7 +3377,10 @@ torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t 
   const int64_t num_tiles = static_cast<int64_t>((2 * I) / 8) * static_cast<int64_t>(K / 64);
   const int64_t vq9_bytes = num_tiles * 152 + 16;
   const int64_t vq10_bytes = num_tiles * 168 + 16;
-  if (W_packed.numel() == vq9_bytes || W_packed.numel() == vq10_bytes) {
+  const int64_t vq11_bytes = num_tiles * 184 + 16;
+  const int64_t vq12_bytes = num_tiles * 200 + 48;
+  if (W_packed.numel() == vq9_bytes || W_packed.numel() == vq10_bytes ||
+      W_packed.numel() == vq11_bytes || W_packed.numel() == vq12_bytes) {
     return vq4d_gemm_swiglu(A, W_packed, I, K);
   }
   TORCH_CHECK(A.is_cuda() && A.scalar_type() == torch::kBFloat16 && A.dim() == 2 && A.is_contiguous(),
