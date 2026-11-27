@@ -646,7 +646,7 @@ extern "C" int swiglu_ws_run(const void* a, const void* b, const float* sa, cons
   using namespace swiglu_ws;
   static const int sw_mode = []() {
     const char* env = std::getenv("MUSE_FP8_SWIGLU_MODE");
-    return (env && *env) ? int(std::strtol(env, nullptr, 10)) : 3;
+    return (env && *env) ? int(std::strtol(env, nullptr, 10)) : 2;
   }();
   static const int sw_pdl_def = []() {
     const char* env = std::getenv("MUSE_FP8_SWIGLU_PDL");
