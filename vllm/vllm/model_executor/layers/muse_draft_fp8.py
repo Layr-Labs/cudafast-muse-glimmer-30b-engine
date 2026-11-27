@@ -716,6 +716,7 @@ def _try_vq4d_buffer(
     w: torch.Tensor,
     bits: int,
     metrics: dict[str, float] | None = None,
+    name: str = "",
 ) -> torch.Tensor | None:
     import muse_bfx_ext as _bfx
 
@@ -729,6 +730,8 @@ def _try_vq4d_buffer(
     min_cos = 0.955 if bits == 9 else 0.96
     gen = torch.Generator(device=w.device)
     gen.manual_seed(3037 + n + 17 * k)
+    m7_snr = 0.0
+    m7_cos = 0.0
     for m in (1, 7, 8, 16):
         x = (torch.randn((m, k), generator=gen, device=w.device) * 0.5).to(w.dtype)
         got = _bfx.int3_gemm(x, blob, n, k)
@@ -740,10 +743,24 @@ def _try_vq4d_buffer(
         if not cos >= min_cos:
             logger.warning("muse_draft_vq4d: low cosine %.5f on (%d,%d) M=%d (bits=%d)", cos, n, k, m, bits)
             return None
-        if m == 7 and metrics is not None:
-            metrics["cos"] = cos
-            metrics["snr_db"] = _snr_db(dense, got_f)
+        if m == 7:
+            m7_cos = cos
+            m7_snr = _snr_db(dense, got_f)
+            if metrics is not None:
+                metrics["cos"] = m7_cos
+                metrics["snr_db"] = m7_snr
     torch.cuda.synchronize(w.device)
+    has_custom_lut = blob.numel() > (n // 8) * (k // 64) * (152 if bits == 9 else 168) + 16
+    logger.info(
+        "muse_draft_vq4d: %s (%dx%d, %db, lloyd=%d): M=7 GEMM SNR=%.2f dB cos=%.5f",
+        name or "linear",
+        n,
+        k,
+        bits,
+        int(has_custom_lut),
+        m7_snr,
+        m7_cos,
+    )
     return blob
 
 
@@ -751,6 +768,7 @@ def _try_vq4d_swiglu_buffer(
     w: torch.Tensor,
     bits: int,
     metrics: dict[str, float] | None = None,
+    name: str = "",
 ) -> torch.Tensor | None:
     import muse_bfx_ext as _bfx
 
@@ -768,6 +786,8 @@ def _try_vq4d_swiglu_buffer(
     min_snr = 10.5 if bits == 9 else 11.5
     gen = torch.Generator(device=w.device)
     gen.manual_seed(3571 + n2 + 23 * k)
+    m7_snr = 0.0
+    m7_cos = 0.0
     for m in (1, 7, 8, 16):
         x = (torch.randn((m, k), generator=gen, device=w.device) * 0.5).to(w.dtype)
         got = _bfx.int3_gemm_swiglu(x, blob, inter, k)
@@ -785,10 +805,24 @@ def _try_vq4d_swiglu_buffer(
                 n2, k, m, bits, snr, cos,
             )
             return None
-        if m == 7 and metrics is not None:
-            metrics["cos"] = cos
-            metrics["snr_db"] = snr
+        if m == 7:
+            m7_cos = cos
+            m7_snr = snr
+            if metrics is not None:
+                metrics["cos"] = m7_cos
+                metrics["snr_db"] = m7_snr
     torch.cuda.synchronize(w.device)
+    has_custom_lut = blob.numel() > (n2 // 8) * (k // 64) * (152 if bits == 9 else 168) + 16
+    logger.info(
+        "muse_draft_vq4d_swiglu: %s (%dx%d, %db, lloyd=%d): M=7 SwiGLU SNR=%.2f dB cos=%.5f",
+        name or "gate_up_proj",
+        n2,
+        k,
+        bits,
+        int(has_custom_lut),
+        m7_snr,
+        m7_cos,
+    )
     return blob
 
 
@@ -1336,7 +1370,7 @@ def attach_mlp_swiglu(mlp: torch.nn.Module, name: str = "", mode: str = "int3") 
             blob = _try_int4_swiglu_buffer(w.data, metrics=m)
         else:
             if vq_bits in (9, 10):
-                blob = _try_vq4d_swiglu_buffer(w.data, bits=vq_bits, metrics=m)
+                blob = _try_vq4d_swiglu_buffer(w.data, bits=vq_bits, metrics=m, name=name)
                 if blob is not None:
                     used_vq = vq_bits
             if blob is None:
@@ -1441,7 +1475,7 @@ def attach_linear(layer: torch.nn.Module, mode: str = "int3", name: str = "", le
             blob = None
             used_vq = 0
             if vq_bits in (9, 10):
-                blob = _try_vq4d_buffer(w.data, bits=vq_bits, metrics=m)
+                blob = _try_vq4d_buffer(w.data, bits=vq_bits, metrics=m, name=name)
                 if blob is not None:
                     used_vq = vq_bits
             if blob is None:
@@ -2207,12 +2241,13 @@ def attach_drafter(model: torch.nn.Module) -> int:
                     lcos,
                 )
     logger.info(
-        "muse_draft_quant (%s, nf4=%s, nf3=%d, i3_sym=%d, vq4d=%d, i3_mse=%d, i4_mse=%d, aux5=%d, qsk=%d, pack=%.2fs): %d INT4-g64 + %d INT4-SwiGLU + %d INT3-SwiGLU + %d INT3-g64 + %d NVFP4-TMA4 + %d FP8-Marlin drafter linears (%d rejected), %.2f GB -> %.2f GB per step (freed %.2f GB dead BF16)%s",
+        "muse_draft_quant (%s, nf4=%s, nf3=%d, i3_sym=%d, vq4d=%d, vq_lloyd=%s, i3_mse=%d, i4_mse=%d, aux5=%d, qsk=%d, pack=%.2fs): %d INT4-g64 + %d INT4-SwiGLU + %d INT3-SwiGLU + %d INT3-g64 + %d NVFP4-TMA4 + %d FP8-Marlin drafter linears (%d rejected), %.2f GB -> %.2f GB per step (freed %.2f GB dead BF16)%s",
         mode,
         os.environ.get("MUSE_INT4_NF4", "0"),
         int(os.environ.get("MUSE_INT3_NF3", "1") != "0"),
         _int3_sym_mode(),
         _vq4d_mode(),
+        os.environ.get("MUSE_VQ4D_LLOYD", "1"),
         int(_int3_mse_enabled()),
         int(_int4_mse_enabled()),
         int(aux5_admitted),

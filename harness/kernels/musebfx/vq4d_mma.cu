@@ -15,6 +15,10 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <c10/cuda/CUDAStream.h>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdint.h>
@@ -51,6 +55,11 @@ __host__ __device__ constexpr int vq4d_n32_step_bytes() {
 template <int kBits>
 __host__ __device__ constexpr int vq4d_lut_size() {
   return (kBits == 9) ? 256 : 512;
+}
+
+template <int kBits>
+__host__ __device__ constexpr int vq4d_custom_lut_bytes() {
+  return vq4d_lut_size<kBits>() * static_cast<int>(sizeof(uint2));  // 2048 B (9b) or 4096 B (10b)
 }
 
 __constant__ float4 kVq4dAnti256[256] = {
@@ -486,6 +495,30 @@ static bool vq4d_n32_tma_enabled() {
   return en;
 }
 
+static bool vq4d_lloyd_enabled() {
+  if (vq4d_dyn_env()) {
+    const char* s = std::getenv("MUSE_VQ4D_LLOYD");
+    return (!s || !*s) ? true : (std::atoi(s) != 0);
+  }
+  static const bool en = []() -> bool {
+    const char* s = std::getenv("MUSE_VQ4D_LLOYD");
+    return (!s || !*s) ? true : (std::atoi(s) != 0);
+  }();
+  return en;
+}
+
+static int vq4d_lloyd_iters() {
+  auto parse = []() -> int {
+    const char* s = std::getenv("MUSE_VQ4D_LLOYD_ITERS");
+    if (!s || !*s) return 20;
+    const int v = std::atoi(s);
+    return (v < 1) ? 1 : ((v > 64) ? 64 : v);
+  };
+  if (vq4d_dyn_env()) return parse();
+  static const int it = parse();
+  return it;
+}
+
 static int vq4d_n32_wave_ilv(int N) {
   const int num_cta = N >> 5;
   return (num_cta <= 288) ? num_cta : 0;
@@ -655,16 +688,129 @@ __device__ __forceinline__ float vq4d_swiglu_f32(float gate, float up) {
 }
 
 template <int kBits>
-__device__ __forceinline__ void vq4d_init_lut(uint2* __restrict__ lut, int tid) {
+__device__ __forceinline__ void vq4d_init_lut(
+    uint2* __restrict__ lut, const uint2* __restrict__ custom_lut, int tid) {
   constexpr int kLut = vq4d_lut_size<kBits>();
-  for (int i = tid; i < kLut; i += kVqThreads) {
-    float4 c;
-    if constexpr (kBits == 9) {
-      c = kVq4dAnti256[i];
-    } else {
-      c = kVq4dAnti512[i];
+  if (custom_lut != nullptr) {
+    for (int i = tid; i < kLut; i += kVqThreads) {
+      lut[i] = __ldg(&custom_lut[i]);
     }
-    lut[i] = make_uint2(vq4d_bf16x2_u32(c.x, c.y), vq4d_bf16x2_u32(c.z, c.w));
+  } else {
+    for (int i = tid; i < kLut; i += kVqThreads) {
+      float4 c;
+      if constexpr (kBits == 9) {
+        c = kVq4dAnti256[i];
+      } else {
+        c = kVq4dAnti512[i];
+      }
+      lut[i] = make_uint2(vq4d_bf16x2_u32(c.x, c.y), vq4d_bf16x2_u32(c.z, c.w));
+    }
+  }
+}
+
+template <int kBits>
+__global__ void vq4d_copy_static_cb_kernel(float4* __restrict__ dst) {
+  constexpr int kLut = vq4d_lut_size<kBits>();
+  for (int i = threadIdx.x; i < kLut; i += blockDim.x) {
+    if constexpr (kBits == 9) {
+      dst[i] = kVq4dAnti256[i];
+    } else {
+      dst[i] = kVq4dAnti512[i];
+    }
+  }
+}
+
+// Extract n_grp * 16 energy-weighted, RMS-normalized, H64+Rademacher MMA-aligned 4D samples from W [N, K].
+__global__ void __launch_bounds__(32) vq4d_extract_4d_samples_kernel(
+    const __nv_bfloat16* __restrict__ W,
+    float* __restrict__ X_out,
+    float* __restrict__ w_out,
+    int N, int K, int n_grp) {
+  __shared__ float s_row[64];
+  const int b = blockIdx.x;
+  if (b >= n_grp) return;
+  const int lane = threadIdx.x;
+  const int num_kg = K >> 6;
+  const int64_t total_grp = static_cast<int64_t>(N) * num_kg;
+  const int64_t grp_idx = (static_cast<int64_t>(b) * total_grp) / n_grp;
+  const int row = static_cast<int>(grp_idx / num_kg);
+  const int kg = static_cast<int>(grp_idx - static_cast<int64_t>(row) * num_kg);
+  const int k_base = kg << 6;
+  const __nv_bfloat16* wrow = W + static_cast<size_t>(row) * K + k_base;
+  const int col0 = k_base + 2 * lane;
+  float v0 = __bfloat162float(wrow[2 * lane + 0]) * vq4d_rad_sign(col0 + 0);
+  float v1 = __bfloat162float(wrow[2 * lane + 1]) * vq4d_rad_sign(col0 + 1);
+  vq4d_warp_fwht64(v0, v1, lane);
+  s_row[2 * lane + 0] = v0;
+  s_row[2 * lane + 1] = v1;
+  const float ss = vq4d_warp_sum(__fmaf_rn(v0, v0, v1 * v1));
+  const float mean_sq = ss * (1.0f / 64.0f);
+  const float inv_rms = (mean_sq > 1e-24f) ? rsqrtf(mean_sq) : 0.0f;
+  __syncwarp();
+  if (lane < 16) {
+    const int s_k = lane >> 2;
+    const int t_k = lane & 3;
+    const int kb = s_k * 16 + 2 * t_k;
+    const size_t out_idx = static_cast<size_t>(b) * 16 + lane;
+    X_out[out_idx * 4 + 0] = s_row[kb + 0] * inv_rms;
+    X_out[out_idx * 4 + 1] = s_row[kb + 1] * inv_rms;
+    X_out[out_idx * 4 + 2] = s_row[kb + 8] * inv_rms;
+    X_out[out_idx * 4 + 3] = s_row[kb + 9] * inv_rms;
+    w_out[out_idx] = (mean_sq > 1e-24f) ? mean_sq : 0.0f;
+  }
+}
+
+// Bit-deterministic fixed-point int64 energy-weighted antipodal Lloyd-Max accumulation.
+// Uses two's-complement uint64 atomicAdd (associative & commutative) with scale 2^28:
+// sum(w_s) == n_samples <= 65536 and |X[i,d]| <= sqrt(64) = 8 ->
+// max denom = 65536 * 2^28 = 1.76e13 (524,288x below INT64_MAX),
+// max |num| = 524288 * 2^28 = 1.41e14 (65,536x below INT64_MAX), 28-bit fractional precision.
+__global__ void vq4d_lloyd_weighted_accum_i64_kernel(
+    const float* __restrict__ X,
+    const float* __restrict__ w_s,
+    const float* __restrict__ dots,
+    const int64_t* __restrict__ best_idx,
+    unsigned long long* __restrict__ sum_u64,
+    unsigned long long* __restrict__ wsum_u64,
+    int N, int K_cb) {
+  static_assert(sizeof(unsigned long long) == sizeof(int64_t), "64-bit atomicAdd requires 8-byte ULL");
+  constexpr double kScale = 268435456.0;  // 2^28
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+  const int k = static_cast<int>(best_idx[i]);
+  const float wf_raw = w_s[i];
+  const double wd = (isfinite(wf_raw) && wf_raw > 0.0f)
+                        ? fmin(static_cast<double>(wf_raw), 65536.0)
+                        : 0.0;
+  if (wd == 0.0) return;
+  const double sgn = (dots[static_cast<size_t>(i) * K_cb + k] >= 0.0f) ? 1.0 : -1.0;
+  const double ws = wd * sgn;
+  const float* xi = X + static_cast<size_t>(i) * 4;
+#pragma unroll
+  for (int d = 0; d < 4; ++d) {
+    const float xr = xi[d];
+    const double xd = isfinite(xr) ? fmin(fmax(static_cast<double>(xr), -16.0), 16.0) : 0.0;
+    const int64_t q = static_cast<int64_t>(llround(xd * ws * kScale));
+    atomicAdd(&sum_u64[k * 4 + d], static_cast<unsigned long long>(q));
+  }
+  const int64_t qw = static_cast<int64_t>(llround(wd * kScale));
+  atomicAdd(&wsum_u64[k], static_cast<unsigned long long>(qw));
+}
+
+__global__ void vq4d_lloyd_weighted_update_cb_kernel(
+    const unsigned long long* __restrict__ sum_u64,
+    const unsigned long long* __restrict__ wsum_u64,
+    float* __restrict__ C,
+    int K_cb) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k >= K_cb) return;
+  const int64_t ws = static_cast<int64_t>(wsum_u64[k]);
+  if (ws > 0) {
+    const double inv = 1.0 / static_cast<double>(ws);
+#pragma unroll
+    for (int d = 0; d < 4; ++d) {
+      C[k * 4 + d] = static_cast<float>(static_cast<double>(static_cast<int64_t>(sum_u64[k * 4 + d])) * inv);
+    }
   }
 }
 
@@ -745,7 +891,8 @@ template <int kBits>
 __device__ __forceinline__ void vq4d_pack_tile_body(
     const __nv_bfloat16* __restrict__ W,
     uint8_t* __restrict__ dst,
-    int row_base, int k_base, int K, uint32_t base_shifted) {
+    int row_base, int k_base, int K, uint32_t base_shifted,
+    const float4* __restrict__ cb_override) {
   constexpr int kLut = vq4d_lut_size<kBits>();
   constexpr int kHalfLut = kLut / 2;
   constexpr uint32_t kSgnBit = 1u << (kBits - 1);
@@ -763,7 +910,9 @@ __device__ __forceinline__ void vq4d_pack_tile_body(
 
   for (int i = tid; i < kLut; i += 256) {
     float4 c;
-    if constexpr (kBits == 9) {
+    if (cb_override != nullptr) {
+      c = __ldg(&cb_override[i]);
+    } else if constexpr (kBits == 9) {
       c = kVq4dAnti256[i];
     } else {
       c = kVq4dAnti512[i];
@@ -888,9 +1037,11 @@ template <int kBits>
 __global__ void __launch_bounds__(256) vq4d_pack_kernel(
     const __nv_bfloat16* __restrict__ W,
     uint8_t* __restrict__ out,
-    int N, int K, int n32_ilv, uint32_t base_shifted, size_t payload_bytes) {
+    int N, int K, int n32_ilv, uint32_t base_shifted, size_t payload_bytes,
+    const float4* __restrict__ cb_override) {
   constexpr int kTileB = vq4d_tile_bytes<kBits>();
   constexpr int kN32StepWB = vq4d_n32_step_bytes<kBits>();
+  constexpr int kLut = vq4d_lut_size<kBits>();
   const int n_tile = blockIdx.x;
   const int kg = blockIdx.y;
   const int num_kg = K >> 6;
@@ -923,14 +1074,23 @@ __global__ void __launch_bounds__(256) vq4d_pack_kernel(
     tile_off = tile_idx * kTileB;
   }
 
-  vq4d_pack_tile_body<kBits>(W, out + tile_off, n_tile * 8, kg * 64, K, base_shifted);
+  vq4d_pack_tile_body<kBits>(W, out + tile_off, n_tile * 8, kg * 64, K, base_shifted, cb_override);
 
-  if (n_tile == 0 && kg == 0 && threadIdx.x == 0) {
-    uint32_t* ftr = reinterpret_cast<uint32_t*>(out + payload_bytes);
-    ftr[0] = (kBits == 9) ? kVqMagic9 : kVqMagic10;
-    ftr[1] = base_shifted;
-    ftr[2] = 0u;
-    ftr[3] = 0u;
+  if (n_tile == 0 && kg == 0) {
+    if (threadIdx.x == 0) {
+      uint32_t* ftr = reinterpret_cast<uint32_t*>(out + payload_bytes);
+      ftr[0] = (kBits == 9) ? kVqMagic9 : kVqMagic10;
+      ftr[1] = base_shifted;
+      ftr[2] = (cb_override != nullptr) ? 1u : 0u;
+      ftr[3] = 0u;
+    }
+    if (cb_override != nullptr) {
+      uint2* dst_lut = reinterpret_cast<uint2*>(out + payload_bytes + kVqFooterBytes);
+      for (int i = threadIdx.x; i < kLut; i += 256) {
+        const float4 c = __ldg(&cb_override[i]);
+        dst_lut[i] = make_uint2(vq4d_bf16x2_u32(c.x, c.y), vq4d_bf16x2_u32(c.z, c.w));
+      }
+    }
   }
 }
 
@@ -938,9 +1098,11 @@ template <int kBits>
 __global__ void __launch_bounds__(256) vq4d_pack_swiglu_kernel(
     const __nv_bfloat16* __restrict__ W,
     uint8_t* __restrict__ out,
-    int I, int K, int swg_ilv, uint32_t base_shifted, size_t payload_bytes) {
+    int I, int K, int swg_ilv, uint32_t base_shifted, size_t payload_bytes,
+    const float4* __restrict__ cb_override) {
   constexpr int kTileB = vq4d_tile_bytes<kBits>();
   constexpr int kStepWB = vq4d_step_bytes<kBits>();
+  constexpr int kLut = vq4d_lut_size<kBits>();
   const int pair_tile = blockIdx.x;
   const int kg = blockIdx.y;
   const int g_tile = pair_tile >> 1;
@@ -958,14 +1120,23 @@ __global__ void __launch_bounds__(256) vq4d_pack_swiglu_kernel(
                            static_cast<size_t>(kg) * wave_sz + in_wave) * kStepWB +
                           static_cast<size_t>(sub_tile) * kTileB;
 
-  vq4d_pack_tile_body<kBits>(W, out + tile_off, row_base, kg * 64, K, base_shifted);
+  vq4d_pack_tile_body<kBits>(W, out + tile_off, row_base, kg * 64, K, base_shifted, cb_override);
 
-  if (pair_tile == 0 && kg == 0 && threadIdx.x == 0) {
-    uint32_t* ftr = reinterpret_cast<uint32_t*>(out + payload_bytes);
-    ftr[0] = (kBits == 9) ? kVqMagic9 : kVqMagic10;
-    ftr[1] = base_shifted;
-    ftr[2] = 0u;
-    ftr[3] = 0u;
+  if (pair_tile == 0 && kg == 0) {
+    if (threadIdx.x == 0) {
+      uint32_t* ftr = reinterpret_cast<uint32_t*>(out + payload_bytes);
+      ftr[0] = (kBits == 9) ? kVqMagic9 : kVqMagic10;
+      ftr[1] = base_shifted;
+      ftr[2] = (cb_override != nullptr) ? 1u : 0u;
+      ftr[3] = 0u;
+    }
+    if (cb_override != nullptr) {
+      uint2* dst_lut = reinterpret_cast<uint2*>(out + payload_bytes + kVqFooterBytes);
+      for (int i = threadIdx.x; i < kLut; i += 256) {
+        const float4 c = __ldg(&cb_override[i]);
+        dst_lut[i] = make_uint2(vq4d_bf16x2_u32(c.x, c.y), vq4d_bf16x2_u32(c.z, c.w));
+      }
+    }
   }
 }
 
@@ -1014,7 +1185,15 @@ __global__ void __launch_bounds__(128, 6) vq4d_mma_gemm_n32_pair_kernel(
   const int num_cta = N >> 5;
   const int cta_n = blockIdx.x;
 
-  vq4d_init_lut<kBits>(smem.lut, tid);
+  const int wave = cta_n / n32_ilv;
+  const int in_wave = cta_n - wave * n32_ilv;
+  const int wave_sz = ((wave + 1) * n32_ilv <= num_cta) ? n32_ilv : (num_cta - wave * n32_ilv);
+  const size_t total_bytes = static_cast<size_t>(num_cta) * num_pairs * kPairStepWB;
+  const uint32_t* ftr = reinterpret_cast<const uint32_t*>(W_packed + total_bytes);
+  const uint32_t base_shifted = __ldg(ftr + 1);
+  const uint2* custom_lut =
+      ((__ldg(ftr + 2) & 1u) != 0u) ? reinterpret_cast<const uint2*>(W_packed + total_bytes + kVqFooterBytes) : nullptr;
+  vq4d_init_lut<kBits>(smem.lut, custom_lut, tid);
 
   if constexpr (kTma) {
     if (tid == 0) {
@@ -1023,11 +1202,6 @@ __global__ void __launch_bounds__(128, 6) vq4d_mma_gemm_n32_pair_kernel(
     __syncthreads();
   }
 
-  const int wave = cta_n / n32_ilv;
-  const int in_wave = cta_n - wave * n32_ilv;
-  const int wave_sz = ((wave + 1) * n32_ilv <= num_cta) ? n32_ilv : (num_cta - wave * n32_ilv);
-  const size_t total_bytes = static_cast<size_t>(num_cta) * num_pairs * kPairStepWB;
-  const uint32_t base_shifted = __ldg(reinterpret_cast<const uint32_t*>(W_packed + total_bytes) + 1);
   const uint8_t* w_base = W_packed +
                           (static_cast<size_t>(wave * n32_ilv) * num_pairs + in_wave) * kPairStepWB;
   const size_t w_pair_stride = static_cast<size_t>(wave_sz) * kPairStepWB;
@@ -1252,7 +1426,15 @@ __global__ void __launch_bounds__(128, (kM16 && kBits == 10) ? 5 : 6) vq4d_mma_g
   const int num_cta = N >> 5;
   const int cta_n = blockIdx.x;
 
-  vq4d_init_lut<kBits>(smem.lut, tid);
+  const int wave = cta_n / n32_ilv;
+  const int in_wave = cta_n - wave * n32_ilv;
+  const int wave_sz = ((wave + 1) * n32_ilv <= num_cta) ? n32_ilv : (num_cta - wave * n32_ilv);
+  const size_t total_bytes = static_cast<size_t>(num_cta) * num_kg * kN32StepWB;
+  const uint32_t* ftr = reinterpret_cast<const uint32_t*>(W_packed + total_bytes);
+  const uint32_t base_shifted = __ldg(ftr + 1);
+  const uint2* custom_lut =
+      ((__ldg(ftr + 2) & 1u) != 0u) ? reinterpret_cast<const uint2*>(W_packed + total_bytes + kVqFooterBytes) : nullptr;
+  vq4d_init_lut<kBits>(smem.lut, custom_lut, tid);
 
   if constexpr (kTma) {
     if (tid == 0) {
@@ -1261,11 +1443,6 @@ __global__ void __launch_bounds__(128, (kM16 && kBits == 10) ? 5 : 6) vq4d_mma_g
     __syncthreads();
   }
 
-  const int wave = cta_n / n32_ilv;
-  const int in_wave = cta_n - wave * n32_ilv;
-  const int wave_sz = ((wave + 1) * n32_ilv <= num_cta) ? n32_ilv : (num_cta - wave * n32_ilv);
-  const size_t total_bytes = static_cast<size_t>(num_cta) * num_kg * kN32StepWB;
-  const uint32_t base_shifted = __ldg(reinterpret_cast<const uint32_t*>(W_packed + total_bytes) + 1);
   const uint8_t* w_base = W_packed +
                           (static_cast<size_t>(wave * n32_ilv) * num_kg + in_wave) * kN32StepWB;
   const size_t w_kg_stride = static_cast<size_t>(wave_sz) * kN32StepWB;
@@ -1447,7 +1624,13 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) vq4d_mma_gemm_kernel(
   const int num_kg = K >> 6;
   const int cta_n = blockIdx.x;
 
-  vq4d_init_lut<kBits>(smem.lut, tid);
+  const size_t cta_stride_bytes = static_cast<size_t>(num_kg) * kStepWB;
+  const size_t total_bytes = static_cast<size_t>(N / kVqRowsPerCTA) * cta_stride_bytes;
+  const uint32_t* ftr = reinterpret_cast<const uint32_t*>(W_packed + total_bytes);
+  const uint32_t base_shifted = __ldg(ftr + 1);
+  const uint2* custom_lut =
+      ((__ldg(ftr + 2) & 1u) != 0u) ? reinterpret_cast<const uint2*>(W_packed + total_bytes + kVqFooterBytes) : nullptr;
+  vq4d_init_lut<kBits>(smem.lut, custom_lut, tid);
 
   if constexpr (kTma) {
     if (tid == 0) {
@@ -1456,9 +1639,6 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) vq4d_mma_gemm_kernel(
     __syncthreads();
   }
 
-  const size_t cta_stride_bytes = static_cast<size_t>(num_kg) * kStepWB;
-  const size_t total_bytes = static_cast<size_t>(N / kVqRowsPerCTA) * cta_stride_bytes;
-  const uint32_t base_shifted = __ldg(reinterpret_cast<const uint32_t*>(W_packed + total_bytes) + 1);
   const uint8_t* w_cta = W_packed + static_cast<size_t>(cta_n) * cta_stride_bytes;
 
   if ((pdl_mode & 1) != 0) {
@@ -1602,7 +1782,15 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) vq4d_mma_gemm_swiglu_kernel
   const int num_cta = I >> 5;
   const int cta_n = blockIdx.x;
 
-  vq4d_init_lut<kBits>(smem.lut, tid);
+  const int wave = cta_n / swg_ilv;
+  const int in_wave = cta_n - wave * swg_ilv;
+  const int wave_sz = ((wave + 1) * swg_ilv <= num_cta) ? swg_ilv : (num_cta - wave * swg_ilv);
+  const size_t total_bytes = static_cast<size_t>(num_cta) * num_kg * kStepWB;
+  const uint32_t* ftr = reinterpret_cast<const uint32_t*>(W_packed + total_bytes);
+  const uint32_t base_shifted = __ldg(ftr + 1);
+  const uint2* custom_lut =
+      ((__ldg(ftr + 2) & 1u) != 0u) ? reinterpret_cast<const uint2*>(W_packed + total_bytes + kVqFooterBytes) : nullptr;
+  vq4d_init_lut<kBits>(smem.lut, custom_lut, tid);
 
   if constexpr (kTma) {
     if (tid == 0) {
@@ -1611,11 +1799,6 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) vq4d_mma_gemm_swiglu_kernel
     __syncthreads();
   }
 
-  const int wave = cta_n / swg_ilv;
-  const int in_wave = cta_n - wave * swg_ilv;
-  const int wave_sz = ((wave + 1) * swg_ilv <= num_cta) ? swg_ilv : (num_cta - wave * swg_ilv);
-  const size_t total_bytes = static_cast<size_t>(num_cta) * num_kg * kStepWB;
-  const uint32_t base_shifted = __ldg(reinterpret_cast<const uint32_t*>(W_packed + total_bytes) + 1);
   const uint8_t* w_base = W_packed +
                           (static_cast<size_t>(wave * swg_ilv) * num_kg + in_wave) * kStepWB;
   const size_t w_kg_stride = static_cast<size_t>(wave_sz) * kStepWB;
@@ -1941,6 +2124,111 @@ static torch::Tensor launch_vq4d_gemm_swiglu_impl(
   return C;
 }
 
+static torch::Tensor vq4d_fit_lloyd_codebook(const torch::Tensor& W, int64_t bits) {
+  if (!vq4d_lloyd_enabled()) {
+    return torch::Tensor();
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  const int N = static_cast<int>(W.size(0));
+  const int K = static_cast<int>(W.size(1));
+  const int kLut = (bits == 9) ? 256 : 512;
+  const int64_t total_grp = static_cast<int64_t>(N) * (K >> 6);
+  const int n_grp = static_cast<int>(std::min<int64_t>(4096, total_grp));
+  if (n_grp <= 0) {
+    return torch::Tensor();
+  }
+  const int n_samples = n_grp * 16;
+  auto opt_f32 = W.options().dtype(torch::kFloat32);
+  auto st = c10::cuda::getCurrentCUDAStream().stream();
+
+  auto X = torch::empty({n_samples, 4}, opt_f32);
+  auto w_s = torch::empty({n_samples}, opt_f32);
+  vq4d_extract_4d_samples_kernel<<<n_grp, 32, 0, st>>>(
+      reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()),
+      X.data_ptr<float>(),
+      w_s.data_ptr<float>(),
+      N, K, n_grp);
+
+  const double w_sum = w_s.sum().item<double>();
+  if (!(w_sum > 1e-24)) {
+    return torch::Tensor();
+  }
+  w_s = w_s * static_cast<float>(static_cast<double>(n_samples) / w_sum);
+  auto x_norm2 = (X * X).sum(1);
+  const double sig_e = (w_s * x_norm2).sum().item<double>();
+  if (!(sig_e > 1e-24)) {
+    return torch::Tensor();
+  }
+
+  // Initialize from static Gaussian antipodal optimum so weighted MSE is monotonically <= static.
+  auto C = torch::empty({kLut, 4}, opt_f32);
+  if (bits == 9) {
+    vq4d_copy_static_cb_kernel<9><<<1, 256, 0, st>>>(reinterpret_cast<float4*>(C.data_ptr<float>()));
+  } else {
+    vq4d_copy_static_cb_kernel<10><<<1, 256, 0, st>>>(reinterpret_cast<float4*>(C.data_ptr<float>()));
+  }
+
+  auto sum_i64 = torch::zeros({kLut, 4}, W.options().dtype(torch::kInt64));
+  auto wsum_i64 = torch::zeros({kLut}, W.options().dtype(torch::kInt64));
+  const int acc_blocks = (n_samples + 255) / 256;
+  const int upd_blocks = (kLut + 255) / 256;
+  const int n_iters = vq4d_lloyd_iters();
+  double err_before = sig_e;
+  for (int it = 0; it < n_iters; ++it) {
+    auto dots = torch::mm(X, C.t());
+    auto cn2 = 0.5f * (C * C).sum(1, true).t();
+    auto best = (dots.abs() - cn2).max(1);
+    auto max_val = std::get<0>(best);
+    auto best_idx = std::get<1>(best);
+    if (it == 0) {
+      err_before = (w_s * (x_norm2 - 2.0f * max_val).clamp_min(0.0f)).sum().item<double>();
+    }
+    sum_i64.zero_();
+    wsum_i64.zero_();
+    vq4d_lloyd_weighted_accum_i64_kernel<<<acc_blocks, 256, 0, st>>>(
+        X.data_ptr<float>(),
+        w_s.data_ptr<float>(),
+        dots.data_ptr<float>(),
+        best_idx.data_ptr<int64_t>(),
+        reinterpret_cast<unsigned long long*>(sum_i64.data_ptr<int64_t>()),
+        reinterpret_cast<unsigned long long*>(wsum_i64.data_ptr<int64_t>()),
+        n_samples, kLut);
+    vq4d_lloyd_weighted_update_cb_kernel<<<upd_blocks, 256, 0, st>>>(
+        reinterpret_cast<const unsigned long long*>(sum_i64.data_ptr<int64_t>()),
+        reinterpret_cast<const unsigned long long*>(wsum_i64.data_ptr<int64_t>()),
+        C.data_ptr<float>(),
+        kLut);
+  }
+
+  // Round to exact BF16 before packing so packer LS scales match runtime BF16x2 LUT with 0-ULP parity.
+  C = C.to(torch::kBFloat16).to(torch::kFloat32).contiguous();
+  double err_after = err_before;
+  {
+    auto dots = torch::mm(X, C.t());
+    auto cn2 = 0.5f * (C * C).sum(1, true).t();
+    auto max_val = std::get<0>((dots.abs() - cn2).max(1));
+    err_after = (w_s * (x_norm2 - 2.0f * max_val).clamp_min(0.0f)).sum().item<double>();
+  }
+
+  const double snr_before = 10.0 * std::log10(sig_e / std::max(err_before, 1e-30));
+  const double snr_after = 10.0 * std::log10(sig_e / std::max(err_after, 1e-30));
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (!(err_after < err_before)) {
+    std::fprintf(
+        stderr,
+        "vq4d_lloyd: %dx%d (%ldb, %d iters, %d samples): no gain (%.2f -> %.2f dB); keeping static codebook (%.1f ms)\n",
+        N, K, static_cast<long>(bits), n_iters, n_samples, snr_before, snr_after, ms);
+    std::fflush(stderr);
+    return torch::Tensor();
+  }
+  std::fprintf(
+      stderr,
+      "vq4d_lloyd: %dx%d (%ldb, %d iters, %d samples): codebook SNR %.2f -> %.2f dB (%+.2f dB) in %.1f ms\n",
+      N, K, static_cast<long>(bits), n_iters, n_samples, snr_before, snr_after, snr_after - snr_before, ms);
+  std::fflush(stderr);
+  return C;
+}
+
 }  // namespace
 
 const __nv_bfloat16* vq4d_rot_a_ptr(torch::Tensor A, int M, int64_t K, cudaStream_t st, int pdl) {
@@ -1962,7 +2250,12 @@ torch::Tensor vq4d_pack(torch::Tensor W, int64_t bits = 10) {
   TORCH_CHECK(N % kVqRowsPerCTA == 0 && K % 64 == 0, "vq4d_pack requires N%64==0 and K%64==0");
   const int64_t tile_b = (bits == 9) ? vq4d_tile_bytes<9>() : vq4d_tile_bytes<10>();
   const int64_t payload_bytes = static_cast<int64_t>(N / 8) * static_cast<int64_t>(K / 64) * tile_b;
-  auto out = torch::empty({payload_bytes + kVqFooterBytes}, W.options().dtype(torch::kUInt8));
+  auto cb_custom = vq4d_fit_lloyd_codebook(W, bits);
+  const int64_t extra_lut_b = cb_custom.defined()
+                                  ? ((bits == 9) ? vq4d_custom_lut_bytes<9>() : vq4d_custom_lut_bytes<10>())
+                                  : 0;
+  const float4* cb_ptr = cb_custom.defined() ? reinterpret_cast<const float4*>(cb_custom.data_ptr<float>()) : nullptr;
+  auto out = torch::empty({payload_bytes + kVqFooterBytes + extra_lut_b}, W.options().dtype(torch::kUInt8));
   const uint32_t base_shifted = vq4d_compute_base_shifted(W);
   const int n32_ilv = vq4d_n32_wave_ilv(N);
   dim3 grid(N / 8, K / 64);
@@ -1970,11 +2263,11 @@ torch::Tensor vq4d_pack(torch::Tensor W, int64_t bits = 10) {
   if (bits == 9) {
     vq4d_pack_kernel<9><<<grid, 256, 0, st>>>(
         reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), out.data_ptr<uint8_t>(),
-        N, K, n32_ilv, base_shifted, static_cast<size_t>(payload_bytes));
+        N, K, n32_ilv, base_shifted, static_cast<size_t>(payload_bytes), cb_ptr);
   } else {
     vq4d_pack_kernel<10><<<grid, 256, 0, st>>>(
         reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), out.data_ptr<uint8_t>(),
-        N, K, n32_ilv, base_shifted, static_cast<size_t>(payload_bytes));
+        N, K, n32_ilv, base_shifted, static_cast<size_t>(payload_bytes), cb_ptr);
   }
   return out;
 }
@@ -1992,12 +2285,15 @@ torch::Tensor vq4d_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int6
   const bool use_tma = tma_want && ((reinterpret_cast<uintptr_t>(W_packed.data_ptr()) & 15u) == 0u);
   const int64_t num_tiles = static_cast<int64_t>(N / 8) * static_cast<int64_t>(K / 64);
   const int64_t b9 = num_tiles * vq4d_tile_bytes<9>() + kVqFooterBytes;
+  const int64_t b9_c = b9 + vq4d_custom_lut_bytes<9>();
   const int64_t b10 = num_tiles * vq4d_tile_bytes<10>() + kVqFooterBytes;
-  if (W_packed.numel() == b9) {
+  const int64_t b10_c = b10 + vq4d_custom_lut_bytes<10>();
+  const int64_t nb = W_packed.numel();
+  if (nb == b9 || nb == b9_c) {
     return use_tma ? launch_vq4d_gemm_impl<9, true>(A, W_packed, M, N, K)
                    : launch_vq4d_gemm_impl<9, false>(A, W_packed, M, N, K);
   }
-  TORCH_CHECK(W_packed.numel() == b10, "vq4d_gemm: unexpected blob size ", W_packed.numel());
+  TORCH_CHECK(nb == b10 || nb == b10_c, "vq4d_gemm: unexpected blob size ", nb);
   return use_tma ? launch_vq4d_gemm_impl<10, true>(A, W_packed, M, N, K)
                  : launch_vq4d_gemm_impl<10, false>(A, W_packed, M, N, K);
 }
@@ -2012,7 +2308,12 @@ torch::Tensor vq4d_pack_swiglu(torch::Tensor W, int64_t bits = 10) {
   const int I = N2 / 2;
   const int64_t tile_b = (bits == 9) ? vq4d_tile_bytes<9>() : vq4d_tile_bytes<10>();
   const int64_t payload_bytes = static_cast<int64_t>(N2 / 8) * static_cast<int64_t>(K / 64) * tile_b;
-  auto out = torch::empty({payload_bytes + kVqFooterBytes}, W.options().dtype(torch::kUInt8));
+  auto cb_custom = vq4d_fit_lloyd_codebook(W, bits);
+  const int64_t extra_lut_b = cb_custom.defined()
+                                  ? ((bits == 9) ? vq4d_custom_lut_bytes<9>() : vq4d_custom_lut_bytes<10>())
+                                  : 0;
+  const float4* cb_ptr = cb_custom.defined() ? reinterpret_cast<const float4*>(cb_custom.data_ptr<float>()) : nullptr;
+  auto out = torch::empty({payload_bytes + kVqFooterBytes + extra_lut_b}, W.options().dtype(torch::kUInt8));
   const uint32_t base_shifted = vq4d_compute_base_shifted(W);
   const int swg_ilv = vq4d_swg_wave_ilv(I);
   dim3 grid(N2 / 8, K / 64);
@@ -2020,11 +2321,11 @@ torch::Tensor vq4d_pack_swiglu(torch::Tensor W, int64_t bits = 10) {
   if (bits == 9) {
     vq4d_pack_swiglu_kernel<9><<<grid, 256, 0, st>>>(
         reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), out.data_ptr<uint8_t>(),
-        I, K, swg_ilv, base_shifted, static_cast<size_t>(payload_bytes));
+        I, K, swg_ilv, base_shifted, static_cast<size_t>(payload_bytes), cb_ptr);
   } else {
     vq4d_pack_swiglu_kernel<10><<<grid, 256, 0, st>>>(
         reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), out.data_ptr<uint8_t>(),
-        I, K, swg_ilv, base_shifted, static_cast<size_t>(payload_bytes));
+        I, K, swg_ilv, base_shifted, static_cast<size_t>(payload_bytes), cb_ptr);
   }
   return out;
 }
@@ -2039,12 +2340,15 @@ torch::Tensor vq4d_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t 
   const bool use_tma = vq4d_swg_tma_enabled() && ((reinterpret_cast<uintptr_t>(W_packed.data_ptr()) & 15u) == 0u);
   const int64_t num_tiles = static_cast<int64_t>((2 * I) / 8) * static_cast<int64_t>(K / 64);
   const int64_t b9 = num_tiles * vq4d_tile_bytes<9>() + kVqFooterBytes;
+  const int64_t b9_c = b9 + vq4d_custom_lut_bytes<9>();
   const int64_t b10 = num_tiles * vq4d_tile_bytes<10>() + kVqFooterBytes;
-  if (W_packed.numel() == b9) {
+  const int64_t b10_c = b10 + vq4d_custom_lut_bytes<10>();
+  const int64_t nb = W_packed.numel();
+  if (nb == b9 || nb == b9_c) {
     return use_tma ? launch_vq4d_gemm_swiglu_impl<9, true>(A, W_packed, M, I, K)
                    : launch_vq4d_gemm_swiglu_impl<9, false>(A, W_packed, M, I, K);
   }
-  TORCH_CHECK(W_packed.numel() == b10, "vq4d_gemm_swiglu: unexpected blob size ", W_packed.numel());
+  TORCH_CHECK(nb == b10 || nb == b10_c, "vq4d_gemm_swiglu: unexpected blob size ", nb);
   return use_tma ? launch_vq4d_gemm_swiglu_impl<10, true>(A, W_packed, M, I, K)
                  : launch_vq4d_gemm_swiglu_impl<10, false>(A, W_packed, M, I, K);
 }

@@ -4932,8 +4932,8 @@ int64_t native_leaf_build_adaptive_verify_graph(
   gargs.mid_cpc = static_cast<float>(mid_cpc);
   gargs.early_sm = env_f("MUSE_ADAPT_EARLY_SM", 1.35f);
   gargs.early_m0 = env_f("MUSE_ADAPT_EARLY_M0", 1.40f);
-  gargs.skip_wide_sm = env_f("MUSE_ADAPT_SKIP_WIDE_SM", 99.0f);
-  gargs.skip_wide_m0 = env_f("MUSE_ADAPT_SKIP_WIDE_M0", 99.0f);
+  gargs.skip_wide_sm = env_f("MUSE_ADAPT_SKIP_WIDE_SM", 2.5f);
+  gargs.skip_wide_m0 = env_f("MUSE_ADAPT_SKIP_WIDE_M0", 1.8f);
   gargs.burst_wide_sm = env_f("MUSE_ADAPT_BURST_WIDE_SM", 1.10f);
   gargs.burst_wide_m0 = env_f("MUSE_ADAPT_BURST_WIDE_M0", 0.95f);
   gargs.force_mode = static_cast<int>(force_mode);
@@ -5055,8 +5055,8 @@ int64_t native_leaf_build_compound_step_graph(
   gargs.mid_cpc = static_cast<float>(mid_cpc);
   gargs.early_sm = env_f("MUSE_ADAPT_EARLY_SM", 1.35f);
   gargs.early_m0 = env_f("MUSE_ADAPT_EARLY_M0", 1.40f);
-  gargs.skip_wide_sm = env_f("MUSE_ADAPT_SKIP_WIDE_SM", 99.0f);
-  gargs.skip_wide_m0 = env_f("MUSE_ADAPT_SKIP_WIDE_M0", 99.0f);
+  gargs.skip_wide_sm = env_f("MUSE_ADAPT_SKIP_WIDE_SM", 2.5f);
+  gargs.skip_wide_m0 = env_f("MUSE_ADAPT_SKIP_WIDE_M0", 1.8f);
   gargs.burst_wide_sm = env_f("MUSE_ADAPT_BURST_WIDE_SM", 1.10f);
   gargs.burst_wide_m0 = env_f("MUSE_ADAPT_BURST_WIDE_M0", 0.95f);
   gargs.force_mode = static_cast<int>(force_mode);

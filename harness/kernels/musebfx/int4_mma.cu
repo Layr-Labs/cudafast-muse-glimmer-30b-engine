@@ -1635,8 +1635,8 @@ int int4_two_part_red_mode() {
 //   2 = balanced Stream-K + 2/3-part non-atomic float2
 //   3 = smart hybrid
 int int4_query_mode() {
-  if (int4_bench_dyn_env()) return int4_read_env_int("MUSE_INT4_QUERY_MODE", 0);
-  static const int m = int4_read_env_int("MUSE_INT4_QUERY_MODE", 0);
+  if (int4_bench_dyn_env()) return int4_read_env_int("MUSE_INT4_QUERY_MODE", 3);
+  static const int m = int4_read_env_int("MUSE_INT4_QUERY_MODE", 3);
   return m;
 }
 

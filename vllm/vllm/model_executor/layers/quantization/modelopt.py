@@ -1462,10 +1462,10 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                         dh_bits = int(os.environ.get("MUSE_DHEAD_BITS", "100"))
                         if dh_bits not in (100, 150, 158, 2):
                             raise ValueError(f"unsupported MUSE_DHEAD_BITS={dh_bits}")
-                        default_topk = 256 if dh_bits == 100 else (192 if dh_bits in (150, 158) else 128)
+                        default_topk = 384 if dh_bits == 100 else (192 if dh_bits in (150, 158) else 128)
                         dh_topk = max(
                             16,
-                            min(256, int(os.environ.get("MUSE_DHEAD_TOPK", str(default_topk)))),
+                            min(384, int(os.environ.get("MUSE_DHEAD_TOPK", str(default_topk)))),
                         )
 
                         dh_blob, dh_rscales, dh_cscales, dh_toks = _bfx.dhead_fast_pack(
@@ -1486,7 +1486,7 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                         best_lat_ms = 0.0
                         if os.environ.get("MUSE_DRAFT_VOCAB_PLACE", "1") != "0":
                             try:
-                                spares = [torch.empty_like(dh_blob) for _ in range(6)]
+                                spares = [torch.empty_like(dh_blob) for _ in range(10)]
                                 for sp in spares:
                                     sp.copy_(dh_blob)
                                 evict = torch.ones((48 << 20) // 4, dtype=torch.float32, device=dev)
@@ -1516,15 +1516,44 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                                 times_dh = [median(s) for s in samples_dh]
                                 best_i = min(range(len(cands)), key=times_dh.__getitem__)
                                 best_lat_ms = times_dh[best_i]
-                                if best_i > 0 and times_dh[0] - times_dh[best_i] >= 0.005:
-                                    dh_blob = cands[best_i]
+                                base_lat_ms = times_dh[0]
+                                best_buf = cands[best_i]
+                                # If wave 1 landed in a contiguous slow DRAM bank (>0.530 ms),
+                                # hold wave-1 spares alive and probe 1 retry wave of 10 spares.
+                                if best_lat_ms > 0.530:
+                                    spares2 = [torch.empty_like(dh_blob) for _ in range(10)]
+                                    for sp in spares2:
+                                        sp.copy_(dh_blob)
+                                    samples_dh2: list[list[float]] = [[] for _ in spares2]
+                                    for _ in range(5):
+                                        for ci, buf in enumerate(spares2):
+                                            _ = evict.sum()
+                                            se = torch.cuda.Event(enable_timing=True)
+                                            ee = torch.cuda.Event(enable_timing=True)
+                                            se.record()
+                                            _ = _bfx.dhead_fast_argmax(
+                                                x_chk, buf, dh_rscales, dh_cscales, dh_toks,
+                                                tail_ids, tail_count, raw_w_full, raw_s_full, raw_gs_full,
+                                                1.0, dh_bits, dh_topk,
+                                            )
+                                            ee.record()
+                                            torch.cuda.synchronize(dev)
+                                            samples_dh2[ci].append(se.elapsed_time(ee))
+                                    times_dh2 = [median(s) for s in samples_dh2]
+                                    best_i2 = min(range(len(spares2)), key=times_dh2.__getitem__)
+                                    if times_dh2[best_i2] < best_lat_ms:
+                                        best_lat_ms = times_dh2[best_i2]
+                                        best_buf = spares2[best_i2]
+                                    del spares2
+                                if best_buf is not dh_blob and base_lat_ms - best_lat_ms >= 0.005:
+                                    dh_blob = best_buf
                                     logger.info(
                                         "Fast 4D-64 draft head DRAM placement: saved %.3f ms (%.3f -> %.3f ms)",
-                                        times_dh[0] - times_dh[best_i],
-                                        times_dh[0],
-                                        times_dh[best_i],
+                                        base_lat_ms - best_lat_ms,
+                                        base_lat_ms,
+                                        best_lat_ms,
                                     )
-                                del spares, cands, evict
+                                del spares, cands, evict, best_buf
                                 torch.cuda.empty_cache()
                             except Exception as exc_pl:  # noqa: BLE001
                                 logger.warning("Fast 4D-64 draft head DRAM placement skipped (%s)", exc_pl)

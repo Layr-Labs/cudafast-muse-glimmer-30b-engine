@@ -2065,6 +2065,33 @@ __global__ void Marlin(
         cur_b1 = nxt_b1;
       }
     }
+  } else if constexpr (b_type_id == vllm::kFE2M1f.id() &&
+                       a_type_id == vllm::kBFloat16.id() && dequant_skip_flop &&
+                       !has_act_order && !has_zp && !is_a_8bit &&
+                       group_blocks != -1 && thread_m_blocks == 2) {
+    // Zero-extra-register M=32 (thread_m_blocks == 2) E2M1 dequant/scale/HMMA interleave:
+    // dequant+scale only frag_b0 first, hide frag_b1 dequant behind mma(i=0, b0) and
+    // scale(frag_b1) behind mma(i=1, b0). Strictly 0-ULP identical operand/accumulation order.
+  #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const uint32_t u = static_cast<uint32_t>(frag_b_quant[k2][0][j]);
+      FragB frag_b0;
+      reinterpret_cast<uint32_t*>(&frag_b0)[0] =
+          ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
+      reinterpret_cast<uint32_t*>(&frag_b0)[1] =
+          ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
+      scale<a_type_id>(frag_b0, frag_s[k2][j], 0);
+      mma<a_type_id, use_fp16_accum>(frag_a[k2][0], frag_b0, frag_c[0][j][0]);
+      FragB frag_b1;
+      reinterpret_cast<uint32_t*>(&frag_b1)[0] =
+          (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
+      reinterpret_cast<uint32_t*>(&frag_b1)[1] =
+          lop3<(0xf0 & 0xcc) | 0xaa>(u, 0x80008000, (u >> 6) & 0x01c001c0u);
+      mma<a_type_id, use_fp16_accum>(frag_a[k2][1], frag_b0, frag_c[1][j][0]);
+      scale<a_type_id>(frag_b1, frag_s[k2][j], 1);
+      mma<a_type_id, use_fp16_accum>(frag_a[k2][0], frag_b1, frag_c[0][j][1]);
+      mma<a_type_id, use_fp16_accum>(frag_a[k2][1], frag_b1, frag_c[1][j][1]);
+    }
   } else {
   #pragma unroll
     for (int j = 0; j < 4; j++) {
@@ -2609,7 +2636,7 @@ __global__ void Marlin(
           frag_c_ptr[k * 4 + 2] += rd[k].z;
           frag_c_ptr[k * 4 + 3] += rd[k].w;
         }
-      } else if constexpr (m_block_size_8 && fixed_shape != 3) {
+      } else if constexpr (m_block_size_8) {
         constexpr int kh_size = th_size / 2;
         float4 rd[kh_size];
   #pragma unroll
@@ -2624,15 +2651,26 @@ __global__ void Marlin(
           frag_c_ptr[kh * 8 + 3] += rd[kh].w;
         }
       } else {
+        // Chunked 4-float4 direct register loads for thread_m_blocks==2 (M=32) & fixed_shape==3 (lm_head):
+        // eliminates serialized sh_red[tid] SMEM bounce while capping temp registers at <=16 (strict 0-ULP).
+        constexpr int kChunk = 4;
   #pragma unroll
-        for (int k = 0; k < th_size; k += (m_block_size_8 ? 2 : 1)) {
-          sh_red[threadIdx.x] =
-              C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
-
-          float* sh_c_ptr = reinterpret_cast<float*>(&sh_red[threadIdx.x]);
+        for (int kb = 0; kb < th_size; kb += kChunk) {
+          float4 rd[kChunk];
   #pragma unroll
-          for (int f = 0; f < 4; f++) {
-            frag_c_ptr[k * 4 + f] += sh_c_ptr[f];
+          for (int c = 0; c < kChunk; c++) {
+            if (kb + c < th_size) {
+              rd[c] = reinterpret_cast<const float4*>(C_tmp)[c_cur_offset + active_threads * (kb + c) + threadIdx.x];
+            }
+          }
+  #pragma unroll
+          for (int c = 0; c < kChunk; c++) {
+            if (kb + c < th_size) {
+              frag_c_ptr[(kb + c) * 4 + 0] += rd[c].x;
+              frag_c_ptr[(kb + c) * 4 + 1] += rd[c].y;
+              frag_c_ptr[(kb + c) * 4 + 2] += rd[c].z;
+              frag_c_ptr[(kb + c) * 4 + 3] += rd[c].w;
+            }
           }
         }
       }

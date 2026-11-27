@@ -127,66 +127,41 @@ __device__ __forceinline__ void discard_l2_128(const void* ptr) {
     asm volatile("discard.global.L2 [%0], 128;" :: "l"(ptr) : "memory");
 }
 
-// 16B coalesced load/store via even-lane uint4 + warp-pair shuffle (0-ULP identical lane layout;
-// safe for tile 6 because active threads [0..127] are 4 full warps).
+// Direct 8B/4B coalesced load/store (0-ULP identical per-thread layout; eliminates even/odd lane
+// divergence and __shfl_xor_sync overhead on SM121, matching norm_glue.cu) + hoisted evict_last policy.
+__device__ __forceinline__ unsigned long long make_policy_evict_last() {
+    unsigned long long policy;
+    asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
+    return policy;
+}
+
 template <bool kCs>
 __device__ __forceinline__ uint2 ld2_v4(const uint2* row_base, unsigned offset) {
-    uint4 v = make_uint4(0u, 0u, 0u, 0u);
-    const unsigned even_off = offset & ~1u;
-    if ((threadIdx.x & 1u) == 0u) {
-        const uint4* p = reinterpret_cast<const uint4*>(row_base + even_off);
-        v = kCs ? load4_cs(p) : *p;
-    }
-    const unsigned hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
-    const unsigned hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
-    return ((threadIdx.x & 1u) == 0u) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+    return kCs ? load2_cs(row_base + offset) : row_base[offset];
 }
 
 __device__ __forceinline__ uint2 ldg2_v4(const uint2* base, unsigned offset) {
-    uint4 v = make_uint4(0u, 0u, 0u, 0u);
-    const unsigned even_off = offset & ~1u;
-    if ((threadIdx.x & 1u) == 0u) {
-        v = __ldg(reinterpret_cast<const uint4*>(base + even_off));
-    }
-    const unsigned hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
-    const unsigned hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
-    return ((threadIdx.x & 1u) == 0u) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
+    return __ldg(base + offset);
 }
 
 __device__ __forceinline__ void st2_v4(uint2* row_base, unsigned offset, uint2 val) {
-    const unsigned odd_x = __shfl_xor_sync(0xffffffffu, val.x, 1);
-    const unsigned odd_y = __shfl_xor_sync(0xffffffffu, val.y, 1);
-    if ((threadIdx.x & 1u) == 0u) {
-        *reinterpret_cast<uint4*>(row_base + offset) = make_uint4(val.x, val.y, odd_x, odd_y);
-    }
+    row_base[offset] = val;
 }
 
-__device__ __forceinline__ void st2_v4_evict_last(uint2* row_base, unsigned offset, uint2 val) {
-    const unsigned odd_x = __shfl_xor_sync(0xffffffffu, val.x, 1);
-    const unsigned odd_y = __shfl_xor_sync(0xffffffffu, val.y, 1);
-    if ((threadIdx.x & 1u) == 0u) {
-        unsigned long long policy;
-        asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
-        asm volatile("st.global.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;"
-                     :: "l"(row_base + offset), "r"(val.x), "r"(val.y), "r"(odd_x), "r"(odd_y), "l"(policy) : "memory");
-    }
+__device__ __forceinline__ void st2_v4_evict_last(uint2* row_base, unsigned offset, uint2 val,
+                                                  unsigned long long policy) {
+    asm volatile("st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
+                 :: "l"(row_base + offset), "r"(val.x), "r"(val.y), "l"(policy) : "memory");
 }
 
 __device__ __forceinline__ void st1_v2(unsigned* row_base, unsigned offset, unsigned val) {
-    const unsigned odd_v = __shfl_xor_sync(0xffffffffu, val, 1);
-    if ((threadIdx.x & 1u) == 0u) {
-        *reinterpret_cast<uint2*>(row_base + offset) = make_uint2(val, odd_v);
-    }
+    row_base[offset] = val;
 }
 
-__device__ __forceinline__ void st1_v2_evict_last(unsigned* row_base, unsigned offset, unsigned val) {
-    const unsigned odd_v = __shfl_xor_sync(0xffffffffu, val, 1);
-    if ((threadIdx.x & 1u) == 0u) {
-        unsigned long long policy;
-        asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
-        asm volatile("st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
-                     :: "l"(row_base + offset), "r"(val), "r"(odd_v), "l"(policy) : "memory");
-    }
+__device__ __forceinline__ void st1_v2_evict_last(unsigned* row_base, unsigned offset, unsigned val,
+                                                  unsigned long long policy) {
+    asm volatile("st.global.L2::cache_hint.b32 [%0], %1, %2;"
+                 :: "l"(row_base + offset), "r"(val), "l"(policy) : "memory");
 }
 
 // Gate (prefill3): also emit the FP8 input of the attention output-gate projection, i.e. what the compiled
@@ -407,6 +382,10 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
     uint2* const pa_row = post_attn + base;
     const uint2* const dn_row = down + base;
     const uint2* const rs_row = residual + base;
+    unsigned long long el_policy = 0ull;
+    if constexpr (ResidualEvictLast || GateEvictLast) {
+        el_policy = make_policy_evict_last();
+    }
     float h1_pre[Pdl ? Tiles : 1][4];
     float scale_inv_pre = 1.f;
     float gate_inv_pre = 1.f;
@@ -492,7 +471,7 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
             const uint2 rounded = make_uint2(pack_bf16(values[0], values[1]),
                                              pack_bf16(values[2], values[3]));
             if constexpr (ResidualEvictLast) {
-                st2_v4_evict_last(pa_row, offset, rounded);
+                st2_v4_evict_last(pa_row, offset, rounded, el_policy);
             } else {
                 st2_v4(pa_row, offset, rounded);
             }
@@ -533,7 +512,7 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
                     gate_values[channel] = bf16(rounded_hidden, channel);
                 }
                 if constexpr (GateEvictLast) {
-                    st1_v2_evict_last(g_row, offset, pack_fp8(gate_values, gate_inv));
+                    st1_v2_evict_last(g_row, offset, pack_fp8(gate_values, gate_inv), el_policy);
                 } else {
                     st1_v2(g_row, offset, pack_fp8(gate_values, gate_inv));
                 }
