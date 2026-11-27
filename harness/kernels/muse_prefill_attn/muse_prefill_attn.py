@@ -78,7 +78,7 @@ def _get_scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torc
     idx = device.index if device.index is not None else torch.cuda.current_device()
     s = _scratch.get(idx)
     if s is None:
-        kv_flat = torch.empty((2, 2, 512, 128), dtype=torch.bfloat16, device=device)
+        kv_flat = torch.empty((2, 512, 128), dtype=torch.bfloat16, device=device)
         q_stub = torch.empty((512, 4096), dtype=torch.bfloat16, device=device)
         k_stub = torch.empty((512, 256), dtype=torch.bfloat16, device=device)
         s = (kv_flat, q_stub, k_stub)

@@ -172,20 +172,23 @@ __device__ __forceinline__ void ldsm4_v_pair64(
       : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]) : "r"(addr));
 }
 
-__device__ __forceinline__ void issue_kv64_flat(
+template <int RowStride>
+__device__ __forceinline__ void issue_kv64(
     uint4 smem_tile[64][16],
-    const __nv_bfloat16* __restrict__ flat_base,
+    const __nv_bfloat16* __restrict__ base,
     int tok_base,
     int tid) {
   const int r_in_16 = tid >> 4;
   const int c = tid & 15;
   const int c_phys = c ^ (r_in_16 & 7);
-  const uint4* src = reinterpret_cast<const uint4*>(
-      flat_base + static_cast<int64_t>(tok_base) * 128) + r_in_16 * 16 + c;
+  constexpr int kVectorsPerRow = RowStride / 8;
+  static_assert(RowStride % 8 == 0);
+  const uint4* src = reinterpret_cast<const uint4*>(base) +
+      tok_base * kVectorsPerRow + r_in_16 * kVectorsPerRow + c;
   #pragma unroll
   for (int u = 0; u < 4; ++u) {
     const int r = (u << 4) + r_in_16;
-    cp_async_16(smem_u32(&smem_tile[r][c_phys]), src + u * 256);
+    cp_async_16(smem_u32(&smem_tile[r][c_phys]), src + u * 16 * kVectorsPerRow);
   }
 }
 
@@ -342,7 +345,6 @@ __device__ __forceinline__ void q_norm_rope_4heads(
 }
 
 // =================================================================================================
-// Stage 1: Tiny KV-Only K-RMSNorm + RoPE + paged kv_cache + contiguous kv_flat[2][2][seqlen][128]
 // =================================================================================================
 template <bool UseRope, bool CacheFP32, bool kPdl, bool kDiscardKV>
 __global__ __launch_bounds__(64) void prefill_kv_only_kernel(
@@ -374,8 +376,7 @@ __global__ __launch_bounds__(64) void prefill_kv_only_kernel(
     asm volatile("griddepcontrol.launch_dependents;");
   }
 
-  const int64_t flat_v_stride = static_cast<int64_t>(num_tokens) * 128;
-  const int64_t flat_h_stride = flat_v_stride * 2;
+  const int64_t flat_h_stride = static_cast<int64_t>(num_tokens) * 128;
 
   for (int t = warp_global; t < num_tokens; t += total_warps) {
     const int64_t slot = __ldg(slot_mapping + t);
@@ -388,12 +389,10 @@ __global__ __launch_bounds__(64) void prefill_kv_only_kernel(
     const __nv_bfloat16* row_kv = qkv + static_cast<int64_t>(t) * 4608 + 4096;
     const uint2 k0_raw = ld2_cs(row_kv + lane * 4);
     const uint2 k1_raw = ld2_cs(row_kv + 128 + lane * 4);
-    const uint2 v0_raw = ld2_cs(row_kv + 256 + lane * 4);
-    const uint2 v1_raw = ld2_cs(row_kv + 384 + lane * 4);
 
     if constexpr (kDiscardKV) {
       __syncwarp();
-      if (lane < 8) {
+      if (lane < 4) {
         discard_l2_128(reinterpret_cast<const char*>(row_kv) + (lane << 7));
       }
     }
@@ -403,11 +402,11 @@ __global__ __launch_bounds__(64) void prefill_kv_only_kernel(
 
     const int64_t t_off = static_cast<int64_t>(t) * 128 + lane * 4;
     *reinterpret_cast<uint2*>(kv_flat + t_off) = k0_out;
-    *reinterpret_cast<uint2*>(kv_flat + flat_v_stride + t_off) = v0_raw;
     *reinterpret_cast<uint2*>(kv_flat + flat_h_stride + t_off) = k1_out;
-    *reinterpret_cast<uint2*>(kv_flat + flat_h_stride + flat_v_stride + t_off) = v1_raw;
 
     if (slot >= 0) {
+      const uint2 v0_raw = ld2_cs(row_kv + 256 + lane * 4);
+      const uint2 v1_raw = ld2_cs(row_kv + 384 + lane * 4);
       const int64_t blk = (block_size == 16) ? (slot >> 4)
                         : ((block_size == 64) ? (slot >> 6) : (slot / block_size));
       const int64_t off = (block_size == 16) ? (slot & 15)
@@ -548,8 +547,8 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   // ---------------------------------------------------------------------------
   // 2. Single Unified 2-Buffer 32 KiB SMEM Causal Attention Loop (strict 0-ULP FA2 order)
   // ---------------------------------------------------------------------------
-  const __nv_bfloat16* const k_flat = kv_flat + static_cast<int64_t>(kv_head) * (2 * 512 * 128);
-  const __nv_bfloat16* const v_flat = k_flat + (512 * 128);
+  const __nv_bfloat16* const k_flat = kv_flat + kv_head * (512 * 128);
+  const __nv_bfloat16* const v_raw = qkv + 4352 + kv_head * 128;
 
   float o_frag[16][4];
   #pragma unroll
@@ -559,7 +558,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   float row_max0 = -INFINITY, row_max1 = -INFINITY;
   float row_sum0 = 0.0f, row_sum1 = 0.0f;
 
-  issue_kv64_flat(kv_smem[0], k_flat, (nb_max - 1) << 7, tid);
+  issue_kv64<128>(kv_smem[0], k_flat, (nb_max - 1) << 7, tid);
   cp_async_commit();
 
   for (int nb = nb_max - 1; nb >= 0; --nb) {
@@ -574,11 +573,11 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     }
 
     if (!skip_hi) {
-      issue_kv64_flat(kv_smem[1], k_flat, block_tok_base + 64, tid);
+      issue_kv64<128>(kv_smem[1], k_flat, block_tok_base + 64, tid);
       cp_async_commit();
       cp_async_wait<1>();
     } else {
-      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base, tid);
+      issue_kv64<4608>(kv_smem[1], v_raw, block_tok_base, tid);
       cp_async_commit();
       cp_async_wait<1>();
     }
@@ -602,7 +601,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     __syncthreads();
 
     if (!skip_hi) {
-      issue_kv64_flat(kv_smem[0], v_flat, block_tok_base, tid);
+      issue_kv64<4608>(kv_smem[0], v_raw, block_tok_base, tid);
       cp_async_commit();
       cp_async_wait<1>();
       __syncthreads();
@@ -623,7 +622,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         }
       }
       __syncthreads();
-      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base + 64, tid);
+      issue_kv64<4608>(kv_smem[1], v_raw, block_tok_base + 64, tid);
       cp_async_commit();
     }
 
@@ -698,7 +697,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     if (skip_hi) {
       // V0 is in kv_smem[1]; pre-issue next K0 into kv_smem[0] right now!
       if (nb > 0) {
-        issue_kv64_flat(kv_smem[0], k_flat, (nb - 1) << 7, tid);
+        issue_kv64<128>(kv_smem[0], k_flat, (nb - 1) << 7, tid);
         cp_async_commit();
         cp_async_wait<1>();
       } else {
@@ -745,7 +744,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
       __syncthreads();
 
       if (nb > 0) {
-        issue_kv64_flat(kv_smem[0], k_flat, (nb - 1) << 7, tid);
+        issue_kv64<128>(kv_smem[0], k_flat, (nb - 1) << 7, tid);
         cp_async_commit();
         cp_async_wait<1>();
       } else {
