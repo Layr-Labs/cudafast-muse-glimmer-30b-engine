@@ -93,8 +93,9 @@ __device__ float apply_norm(float value, float inverse, float weight) {
 
 __device__ __forceinline__ float bounded_fp8(float value, float scale_inv) {
     const float scaled = __fmul_rn(value, scale_inv);
-    float r;
-    asm("min.NaN.f32 %0, %1, %1;" : "=f"(r) : "f"(scaled));
+    float t, r;
+    asm("max.NaN.f32 %0, %1, 0fC3E00000;" : "=f"(t) : "f"(scaled));
+    asm("min.NaN.f32 %0, %1, 0f43E00000;" : "=f"(r) : "f"(t));
     return r;
 }
 

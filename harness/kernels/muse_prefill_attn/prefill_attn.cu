@@ -80,9 +80,11 @@ __device__ __forceinline__ float triton_sigmoid(float x) {
   return full_divide(1.0f, __fadd_rn(1.0f, e));
 }
 
-__device__ __forceinline__ float canonicalize_nan(float y) {
-  float r;
-  asm("min.NaN.f32 %0, %1, %1;" : "=f"(r) : "f"(y));
+// Single-instruction NaN-propagating clamp matching triton_helpers.maximum/minimum on sm_121a!
+__device__ __forceinline__ float clamp448(float y) {
+  float t, r;
+  asm("max.NaN.f32 %0, %1, 0fC3E00000;" : "=f"(t) : "f"(y));
+  asm("min.NaN.f32 %0, %1, 0f43E00000;" : "=f"(r) : "f"(t));
   return r;
 }
 
@@ -530,13 +532,21 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         qkv + static_cast<int64_t>(q_tok) * 4608 + static_cast<int64_t>(kv_head * 16) * 128;
     const int c_log = lane >> 1;
     const int c_half = lane & 1;
+    const int even_lane = lane & ~1;
 
+    // Issue ALL 16 heads in 4 batches of 4 heads (16B coalesced loads via even-lane uint4 + shfl)
     #pragma unroll
     for (int hb = 0; hb < 16; hb += 4) {
       uint2 raw[4];
       #pragma unroll
       for (int h = 0; h < 4; ++h) {
-        raw[h] = *reinterpret_cast<const uint2*>(q_row + (hb + h) * 128 + lane * 4);
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if ((lane & 1) == 0) {
+          v = *reinterpret_cast<const uint4*>(q_row + (hb + h) * 128 + even_lane * 4);
+        }
+        const uint32_t hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
+        const uint32_t hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
+        raw[h] = ((lane & 1) == 0) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
       }
       uint2 ov[4];
       q_norm_rope_4heads<UseRope>(raw, ov, eps, qscale, lane, c0, c1, c2, c3, s0, s1, s2, s3);
@@ -861,8 +871,8 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
       for (int i = 0; i < 4; ++i) {
         const float2 of = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ow[i]));
         const float2 gf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gw[i]));
-        qw[i] = fp8x2(canonicalize_nan(__fmul_rn(__fmul_rn(triton_sigmoid(gf.x), of.x), inv_s)),
-                      canonicalize_nan(__fmul_rn(__fmul_rn(triton_sigmoid(gf.y), of.y), inv_s)));
+        qw[i] = fp8x2(clamp448(__fmul_rn(__fmul_rn(triton_sigmoid(gf.x), of.x), inv_s)),
+                      clamp448(__fmul_rn(__fmul_rn(triton_sigmoid(gf.y), of.y), inv_s)));
       }
       dst[idx] = make_uint2(static_cast<uint32_t>(qw[0]) | (static_cast<uint32_t>(qw[1]) << 16),
                             static_cast<uint32_t>(qw[2]) | (static_cast<uint32_t>(qw[3]) << 16));
@@ -1020,10 +1030,8 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
       }
       if constexpr (kFp8Out) {
         const uint32_t q =
-            static_cast<uint32_t>(fp8x2(canonicalize_nan(__fmul_rn(inv_scale, y[0])),
-                                        canonicalize_nan(__fmul_rn(inv_scale, y[1])))) |
-            (static_cast<uint32_t>(fp8x2(canonicalize_nan(__fmul_rn(inv_scale, y[2])),
-                                         canonicalize_nan(__fmul_rn(inv_scale, y[3])))) << 16);
+            static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
+            (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
         *reinterpret_cast<uint32_t*>(out_fp8_row + off) = q;
       }
     }
