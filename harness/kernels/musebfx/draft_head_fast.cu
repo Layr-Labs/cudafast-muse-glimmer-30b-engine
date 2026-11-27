@@ -4647,25 +4647,36 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_fused_kernel(
     for (int i = tid; i < N_in; i += 256) {
       const uint32_t k = s_keys[i];
       if ((k & mask) == pref) {
-        atomicAdd(&s_hist[(k >> shift) & 0xFFu], 1u);
+        const uint32_t bucket = (k >> shift) & 0xffu;
+        atomicAdd(&s_hist[(bucket >> 3) + (bucket & 7u) * 32], 1u);
       }
     }
     __syncthreads();
 
-    if (tid == 0) {
-      uint32_t acc = 0u;
-      const uint32_t need = s_rem_k;
-      uint32_t chosen = 0u;
-      for (int b = 255; b >= 0; --b) {
-        const uint32_t c = s_hist[b];
-        if (acc + c >= need) {
-          chosen = static_cast<uint32_t>(b);
-          s_rem_k = need - acc;
-          break;
-        }
-        acc += c;
+    if (tid < 32) {
+      const uint32_t need = __shfl_sync(0xffffffffu, lane == 0 ? s_rem_k : 0u, 0);
+      const int group = 31 - lane;
+      uint32_t count = 0;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) count += s_hist[group + i * 32];
+      uint32_t inclusive = count;
+#pragma unroll
+      for (int delta = 1; delta < 32; delta <<= 1) {
+        const uint32_t peer = __shfl_up_sync(0xffffffffu, inclusive, delta);
+        if (lane >= delta) inclusive += peer;
       }
-      s_prefix = pref | (chosen << shift);
+      uint32_t before = inclusive - count;
+      if (need == 0u ? lane == 0 : (before < need && need <= inclusive)) {
+        for (int i = 7; i >= 0; --i) {
+          const uint32_t c = s_hist[group + i * 32];
+          if (before + c >= need) {
+            s_rem_k = need - before;
+            s_prefix = pref | (static_cast<uint32_t>(group * 8 + i) << shift);
+            break;
+          }
+          before += c;
+        }
+      }
     }
     __syncthreads();
   }
@@ -5432,3 +5443,4 @@ torch::Tensor dhead_fast_argmax(
 
   return out;
 }
+#define GAUNTLET_REDRAW_eed789ba_20261127T182616Z 1
