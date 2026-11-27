@@ -448,13 +448,27 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        with (
-            self._maybe_get_memory_pool_context(tag="weights"),
-            set_current_vllm_config(self.vllm_config),
-            # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
-            self._scoped_allocator_max_split(max_split_size_mb=20),
-        ):
-            self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        try:
+            from vllm.model_executor.kernels.linear.nvfp4.decode_placement import (
+                release_buddyinfo_sponge,
+                take_buddyinfo_sponge,
+            )
+        except Exception:  # noqa: BLE001
+            take_buddyinfo_sponge = None
+            release_buddyinfo_sponge = None
+        if take_buddyinfo_sponge is not None and not load_dummy_weights:
+            take_buddyinfo_sponge()
+        try:
+            with (
+                self._maybe_get_memory_pool_context(tag="weights"),
+                set_current_vllm_config(self.vllm_config),
+                # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
+                self._scoped_allocator_max_split(max_split_size_mb=20),
+            ):
+                self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        finally:
+            if release_buddyinfo_sponge is not None:
+                release_buddyinfo_sponge()
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(

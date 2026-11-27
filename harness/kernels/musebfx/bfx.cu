@@ -247,7 +247,11 @@ void native_leaf_commit_tree(
     c10::optional<torch::Tensor> tr_state = c10::nullopt,
     int64_t vocab_size = 202048,
     bool chain_all_valid = false,
-    c10::optional<torch::Tensor> cascade_meta = c10::nullopt);
+    c10::optional<torch::Tensor> cascade_meta = c10::nullopt,
+    c10::optional<torch::Tensor> in_static_vocab = c10::nullopt,
+    c10::optional<torch::Tensor> tail_ids = c10::nullopt,
+    c10::optional<torch::Tensor> tail_count = c10::nullopt,
+    c10::optional<torch::Tensor> tail_seen = c10::nullopt);
 void dflash_cascade_gate_prep(
     torch::Tensor input_ids, torch::Tensor query_positions,
     torch::Tensor draft_tokens, torch::Tensor tree_top, torch::Tensor tree_vals,
@@ -453,7 +457,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("tr_state") = c10::nullopt,
         pybind11::arg("vocab_size") = 202048,
         pybind11::arg("chain_all_valid") = false,
-        pybind11::arg("cascade_meta") = c10::nullopt);
+        pybind11::arg("cascade_meta") = c10::nullopt,
+        pybind11::arg("in_static_vocab") = c10::nullopt,
+        pybind11::arg("tail_ids") = c10::nullopt,
+        pybind11::arg("tail_count") = c10::nullopt,
+        pybind11::arg("tail_seen") = c10::nullopt);
   m.def("dflash_cascade_gate_prep", &dflash_cascade_gate_prep,
         pybind11::arg("input_ids"), pybind11::arg("query_positions"),
         pybind11::arg("draft_tokens"), pybind11::arg("tree_top"), pybind11::arg("tree_vals"),
