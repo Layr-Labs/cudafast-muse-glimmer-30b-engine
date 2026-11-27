@@ -277,6 +277,53 @@ class DecodePlacementLogicTest(unittest.TestCase):
         self.assertEqual(mod.take_buddyinfo_sponge(), 0)
         mod.release_buddyinfo_sponge()
 
+    def test_drop_model_page_cache_runs_before_buddyinfo_sponge(self):
+        mod = _load_dp_module({"MUSE_PLACE_M32": "1", "MUSE_BUDDY_SPONGE": "1"})
+        call_order = []
+
+        def fake_drop():
+            call_order.append("drop")
+
+        def fake_usable(_min_chunk=2 << 20):
+            call_order.append("usable")
+            return 10 << 30  # below reserve -> exits cleanly without libcuda
+
+        with mock.patch.object(mod, "_drop_model_page_cache", side_effect=fake_drop), \
+             mock.patch.object(mod, "_usable_buddyinfo_bytes", side_effect=fake_usable):
+            self.assertEqual(mod.take_buddyinfo_sponge(), 0)
+        self.assertEqual(call_order, ["drop", "usable"])
+
+    def test_partition_fast_pool_bandwidth_gates_slow_slabs(self):
+        mod = _load_dp_module({"MUSE_PLACE_M32": "1"})
+        # Clean boot: 200 unused slabs all within 1.08x of best (0.530 ms -> cut 0.5724 ms)
+        clean_unused = [(0.535 + 0.0001 * i, f"b{i}") for i in range(200)]
+        fast_c, rest_c = mod._partition_fast_pool(clean_unused, best_time=0.530, max_fast_keep=180, ratio=1.08)
+        self.assertEqual(len(fast_c), 180)
+        self.assertEqual(len(rest_c), 20)
+
+        # Fragmented boot (like w68b_full_37): best=0.555 ms (cut=0.5994 ms), only 12 unused slabs <= 0.5994,
+        # remaining 188 are slow 0.66-0.79 ms -> MUST NOT poison fast_pool with slow slabs!
+        frag_unused = [(0.560 + 0.003 * i, f"f{i}") for i in range(12)] + [
+            (0.660 + 0.001 * i, f"s{i}") for i in range(188)
+        ]
+        fast_f, rest_f = mod._partition_fast_pool(frag_unused, best_time=0.555, max_fast_keep=180, ratio=1.08)
+        self.assertEqual(len(fast_f), 12)
+        self.assertEqual(len(rest_f), 188)
+
+    def test_adaptive_retry_trigger_clean_vs_fragmented_boot(self):
+        mod = _load_dp_module({"MUSE_PLACE_M32": "1"})
+        # Clean boot (w68b_det12x2: 6656x19968 min=0.287, med=0.289, max=0.290) -> NO retry!
+        clean_times = [0.287 + 0.0001 * i for i in range(40)]
+        self.assertEqual(mod._select_retry_indices(clean_times, 1.08), [])
+
+        # Fragmented boot (w68b_full_37: 6656x19968 min=0.299, 10 fast + 30 slow @ 0.362-0.383) -> retries ONLY the 30 slow!
+        frag_times = [0.299 + 0.001 * i for i in range(10)] + [0.350 + 0.001 * i for i in range(30)]
+        slow_ids = mod._select_retry_indices(frag_times, 1.08)
+        self.assertEqual(slow_ids, list(range(10, 40)))
+
+        # Legacy disabled (ratio=0.0) -> NO retry
+        self.assertEqual(mod._select_retry_indices(frag_times, 0.0), [])
+
 
 if __name__ == "__main__":
     unittest.main()

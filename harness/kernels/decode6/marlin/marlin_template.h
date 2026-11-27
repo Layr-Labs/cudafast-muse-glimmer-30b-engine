@@ -2009,10 +2009,9 @@ __global__ void Marlin(
   if constexpr (b_type_id == vllm::kFE2M1f.id() &&
                 a_type_id == vllm::kBFloat16.id() && dequant_skip_flop &&
                 !has_act_order && !has_zp && !is_a_8bit && group_blocks != -1 &&
-                thread_m_blocks == 1) {
+                (thread_m_blocks == 1 || (thread_m_blocks == 2 && !m_block_size_8))) {
     // 1-step software-pipelined j = 0..3 E2M1 dequant + BF16 scale -> HMMA overlap
-    // strictly for thread_m_blocks == 1 (M <= 16), leaving thread_m_blocks == 2 (M = 32)
-    // untouched to avoid accumulator register spill.
+    // for thread_m_blocks == 1 (M <= 16) and thread_m_blocks == 2 (!m_block_size_8, M = 32).
     auto dequant_nvfp4_j = [&](int jj, FragB& b0, FragB& b1) {
       const uint32_t u = static_cast<uint32_t>(frag_b_quant[k2][0][jj]);
       reinterpret_cast<uint32_t*>(&b1)[1] =
@@ -2609,7 +2608,7 @@ __global__ void Marlin(
           frag_c_ptr[k * 4 + 2] += rd[k].z;
           frag_c_ptr[k * 4 + 3] += rd[k].w;
         }
-      } else if constexpr (m_block_size_8 && fixed_shape != 3) {
+      } else if constexpr (m_block_size_8) {
         constexpr int kh_size = th_size / 2;
         float4 rd[kh_size];
   #pragma unroll
@@ -2624,15 +2623,26 @@ __global__ void Marlin(
           frag_c_ptr[kh * 8 + 3] += rd[kh].w;
         }
       } else {
+        // Chunked 4-float4 direct register loads for thread_m_blocks==2 (M=32) & fixed_shape==3 (lm_head):
+        // eliminates serialized sh_red[tid] SMEM bounce while capping temp registers at <=16 (strict 0-ULP).
+        constexpr int kChunk = 4;
   #pragma unroll
-        for (int k = 0; k < th_size; k += (m_block_size_8 ? 2 : 1)) {
-          sh_red[threadIdx.x] =
-              C_tmp[c_cur_offset + active_threads * k + threadIdx.x];
-
-          float* sh_c_ptr = reinterpret_cast<float*>(&sh_red[threadIdx.x]);
+        for (int kb = 0; kb < th_size; kb += kChunk) {
+          float4 rd[kChunk];
   #pragma unroll
-          for (int f = 0; f < 4; f++) {
-            frag_c_ptr[k * 4 + f] += sh_c_ptr[f];
+          for (int c = 0; c < kChunk; c++) {
+            if (kb + c < th_size) {
+              rd[c] = reinterpret_cast<const float4*>(C_tmp)[c_cur_offset + active_threads * (kb + c) + threadIdx.x];
+            }
+          }
+  #pragma unroll
+          for (int c = 0; c < kChunk; c++) {
+            if (kb + c < th_size) {
+              frag_c_ptr[(kb + c) * 4 + 0] += rd[c].x;
+              frag_c_ptr[(kb + c) * 4 + 1] += rd[c].y;
+              frag_c_ptr[(kb + c) * 4 + 2] += rd[c].z;
+              frag_c_ptr[(kb + c) * 4 + 3] += rd[c].w;
+            }
           }
         }
       }

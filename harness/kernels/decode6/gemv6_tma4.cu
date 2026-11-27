@@ -542,7 +542,7 @@ int launch_tma4_m(const int4* input, const int4* weight, int4* output, int4* par
                   uint8_t* fp8_out, int prob_m) {
   if (prob_m > 16) {
     if constexpr (TileN == 128 && Threads == 256 &&
-                  (Stages == 3 || (Stages == 4 && FixedShape != 3 && !FuseLmPost && !FuseMulSigmoid)) &&
+                  (Stages == 3 || (Stages == 4 && FixedShape != 3 && !FuseLmPost)) &&
                   !Split2 && !HalfSplit) {
       return launch_tma4_impl<TileN, Threads, GateUpGrid, DownIlv, GateV48, GateUpSwiglu,
                               FuseLmPost, FuseMulSigmoid, Stages, Split2, FixedShape,
@@ -951,7 +951,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
   }
   if (k == 6656 && n >= 16384 && n % 128 == 0) {
     static const int dh_st = decode6_tma4_stages("MUSE_TMA4_DRAFT_HEAD_STAGES", 4);
-    if (m <= 16 && dh_st == 4) {
+    if (dh_st == 4) {
       return launch_tma4_m<128, 256, false, true, false, false, false, false, 4, false, 0, false, true, false, true>(
           input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
           nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
@@ -961,7 +961,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
         nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
   }
   const int m_st = decode6_tma4_m_stages(m);
-  if (m <= 16 && m_st == 4) {
+  if (m_st == 4) {
     return launch_tma4_m<128, 256, false, true, false, false, false, false, 4, false, 0, false, true, false, true>(
         input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
         nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, m);
@@ -978,7 +978,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_gated_m(
   if (m < 1 || m > 32 || n != 6656 || k != 4096 || blocks != 48 || gate == nullptr || attn == nullptr)
     return cudaErrorInvalidValue;
   const int m_st = decode6_tma4_m_stages(m);
-  if (m <= 16 && m_st == 4) {
+  if (m_st == 4) {
     return launch_tma4_m<128, 256, false, true, false, false, false, true, 4, false, 0, false, true, false, true>(
         gate, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
         nullptr, nullptr, nullptr, 0, attn, nullptr, nullptr, m);

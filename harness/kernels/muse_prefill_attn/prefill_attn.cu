@@ -341,6 +341,11 @@ __device__ __forceinline__ void q_norm_rope_4heads(
   }
 }
 
+__device__ __forceinline__ void st2_cs(void* ptr, uint2 v) {
+  asm volatile("st.global.cs.v2.u32 [%0], {%1, %2};"
+               :: "l"(ptr), "r"(v.x), "r"(v.y) : "memory");
+}
+
 // =================================================================================================
 // Stage 1: Tiny KV-Only K-RMSNorm + RoPE + paged kv_cache + contiguous kv_flat[2][2][seqlen][128]
 // =================================================================================================
@@ -414,10 +419,10 @@ __global__ __launch_bounds__(64) void prefill_kv_only_kernel(
                         : ((block_size == 64) ? (slot & 63) : (slot - blk * block_size));
       __nv_bfloat16* dst0 = kv_cache + blk * stride_block + off * stride_slot + lane * 4;
       __nv_bfloat16* dst1 = dst0 + stride_kv_head;
-      *reinterpret_cast<uint2*>(dst0) = k0_out;
-      *reinterpret_cast<uint2*>(dst0 + 128) = v0_raw;
-      *reinterpret_cast<uint2*>(dst1) = k1_out;
-      *reinterpret_cast<uint2*>(dst1 + 128) = v1_raw;
+      st2_cs(dst0, k0_out);
+      st2_cs(dst0 + 128, v0_raw);
+      st2_cs(dst1, k1_out);
+      st2_cs(dst1 + 128, v1_raw);
     }
   }
 

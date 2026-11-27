@@ -38,8 +38,11 @@ PLACE_SCALES6 = os.environ.get("MUSE_PLACE_SCALES6", "1").strip() not in ("0", "
 PLACE_M32 = os.environ.get("MUSE_PLACE_M32", "1").strip() not in ("0", "", "false", "no")
 PLACE_M = max(1, min(32, int(os.environ.get("MUSE_PLACE_M", "32" if PLACE_M32 else "1"))))
 SURPLUS = float(os.environ.get("MUSE_DECODE_PLACEMENT_SURPLUS", "3.0"))
+DOWN_SURPLUS = float(os.environ.get("MUSE_DOWN_PLACEMENT_SURPLUS", "5.0" if PLACE_M32 else str(SURPLUS)))
 LARGE_RANS_SURPLUS = float(os.environ.get("MUSE_LARGE_RANS_SURPLUS", "6.0"))
 LM_HEAD_SPARES = int(os.environ.get("MUSE_LM_HEAD_SPARES", "24"))
+FAST_POOL_RATIO = float(os.environ.get("MUSE_FAST_POOL_RATIO", "1.08" if PLACE_M32 else "0.0"))
+ADAPTIVE_RETRY_RATIO = float(os.environ.get("MUSE_PLACE_RETRY_RATIO", "1.08" if PLACE_M32 else "0.0"))
 ROUNDS = 5
 S1_ROUNDS = max(1, int(os.environ.get("MUSE_PLACE_S1_ROUNDS", "3" if PLACE_M32 else str(ROUNDS))))
 S2_ROUNDS = max(0, int(os.environ.get("MUSE_PLACE_S2_ROUNDS", "7" if PLACE_M32 else "0")))
@@ -94,6 +97,9 @@ def take_buddyinfo_sponge(need_bytes: int = 36 << 30) -> int:
     try:
         import ctypes
 
+        # Drop stale checkpoint file page cache BEFORE reading /proc/buddyinfo so usable 2 MiB+ RAM
+        # reflects true free physical memory, while keeping the proven 24 GiB MemAvailable-bounded cap.
+        _drop_model_page_cache()
         cap_gib = int(os.environ.get("MUSE_BUDDY_SPONGE_CAP_GIB", "24"))
         if cap_gib <= 0:
             return 0
@@ -242,6 +248,36 @@ def _merge_s1_s2_scores(times_s1: list[float], score_map: dict[int, float]) -> l
     ratios = [score_map[i] / times_s1[i] for i in score_map if times_s1[i] > 0.0]
     scale = median(ratios) if ratios else 1.0
     return [score_map[i] if i in score_map else times_s1[i] * scale for i in range(len(times_s1))]
+
+
+def _partition_fast_pool(
+    unused_sorted: list[tuple[float, object]],
+    best_time: float,
+    max_fast_keep: int,
+    ratio: float,
+) -> tuple[list[tuple[float, object]], list[tuple[float, object]]]:
+    """Bandwidth-gate fast_pool seeding: keep only unused slabs within ``ratio`` of ``best_time`` (capped at
+    ``max_fast_keep``) so slow fragmented slabs never poison PyTorch's caching allocator for subsequent groups."""
+    if ratio > 0.0 and best_time > 0.0:
+        fast_cut = best_time * ratio
+        fast_n = 0
+        limit = min(max_fast_keep, len(unused_sorted))
+        while fast_n < limit and unused_sorted[fast_n][0] <= fast_cut:
+            fast_n += 1
+    else:
+        fast_n = min(max_fast_keep, len(unused_sorted))
+    return unused_sorted[:fast_n], unused_sorted[fast_n:]
+
+
+def _select_retry_indices(home_times: list[float], ratio: float) -> list[int]:
+    """Return indices of slow homes (> best * ratio) iff the group median lags best by more than ``ratio``."""
+    if ratio <= 0.0 or len(home_times) < 2:
+        return []
+    best = min(home_times)
+    if best <= 0.0 or median(home_times) <= best * ratio:
+        return []
+    cutoff = best * ratio
+    return [i for i, t in enumerate(home_times) if t > cutoff]
 
 
 def ensure_slow_hold_headroom(min_free_bytes: int) -> None:
@@ -533,8 +569,11 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
     unused.sort(key=lambda pair: pair[0])
     fast_keep = min(len(unused), max(180, int(len(unused) * 0.42)))
     if PLACE_M32:
-        fast_pool = [buf for _, buf in unused[:fast_keep]]
-        rest = unused[fast_keep:]
+        best_t = min(all_scores)
+        fast_items, rest = _partition_fast_pool(unused, best_t, fast_keep, FAST_POOL_RATIO)
+        fast_pool = [buf for _, buf in fast_items]
+        n_fast_seeded = len(fast_pool)
+        n_unused_total = len(unused)
         scan_cap = min(_SLOW_HOLD_SCAN_CAP, _SLOW_HOLD_MAX_SLABS)
         byte_budget = max(0, _SLOW_HOLD_MAX_BYTES - _slow_hold_bytes())
         if payload_bytes > 0:
@@ -545,12 +584,19 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
         else:
             middle_overflow = []
             slow_tail = rest
+        n_quarantined = len(slow_tail)
         for _, slow_buf in slow_tail:
             _SLOW_HOLD.append(slow_buf)
-        del homes, unused, rest, slow_tail, spares, candidates, displaced_homes
+        del homes, unused, fast_items, rest, slow_tail, spares, candidates, displaced_homes
         middle_overflow.clear()
         torch.cuda.empty_cache()
         del fast_pool
+        logger.info(
+            "Full-RAM fast pool seeded: %d/%d unused 127 MiB slabs <= %.4f ms (best=%.4f x %.2f), "
+            "%d quarantined in _SLOW_HOLD",
+            n_fast_seeded, n_unused_total, best_t * FAST_POOL_RATIO if FAST_POOL_RATIO > 0 else 0.0,
+            best_t, FAST_POOL_RATIO, n_quarantined,
+        )
     else:
         slow_tail = unused[fast_keep:]
         if len(slow_tail) > 175:
@@ -558,6 +604,7 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
         for _, slow_buf in slow_tail:
             _SLOW_HOLD.append(slow_buf)
         del unused, slow_tail
+    home_times = list(after)
     before = sorted(score_map[i] for i in range(count))
     after.sort()
     return {
@@ -565,15 +612,32 @@ def _place_group_full_ram_scan(decode_linear, layers, n: int, k: int, evict_buf:
         "payload_bytes": payload_bytes,
         "before": (before[0], median(before), before[-1], sum(before)),
         "after": (after[0], median(after), after[-1], sum(after)),
+        "home_times": home_times,
     }
 
 
-def _place_group(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor, rejected_hold: list) -> dict | None:
+def _place_group(
+    decode_linear,
+    layers,
+    n: int,
+    k: int,
+    evict_buf: torch.Tensor,
+    rejected_hold: list,
+    *,
+    surplus_override: float | None = None,
+) -> dict | None:
     homes = [layer._buffers[_NAME] for layer in layers]
     count = len(homes)
     payload_bytes = homes[0].numel() * homes[0].element_size()
     is_small = payload_bytes < MIN_PAYLOAD_BYTES
-    surplus = ATTN_SURPLUS if is_small else SURPLUS
+    if surplus_override is not None:
+        surplus = surplus_override
+    elif is_small:
+        surplus = ATTN_SURPLUS
+    elif (n, k) == (6656, 19968):
+        surplus = DOWN_SURPLUS
+    else:
+        surplus = SURPLUS
     wanted = max(LM_HEAD_SPARES if count == 1 else 1, math.ceil(count * surplus)) if surplus > 0 else 0
     spares_count = _ensure_spares_room(wanted, payload_bytes, rejected_hold, allow_slow_trim=not is_small)
     if spares_count <= 0 or (is_small and spares_count < count):
@@ -632,13 +696,114 @@ def _place_group(decode_linear, layers, n: int, k: int, evict_buf: torch.Tensor,
             rejected_hold.append(spare)
             if all_scores[idx] > slow_cut and _can_append_slow_hold(payload_bytes):
                 _SLOW_HOLD.append(spare)
+    home_times = list(after)
     before = sorted(score_map[i] for i in range(count))
     after.sort()
     return {
         "count": count, "spares": len(spares), "moved": moved, "payload_bytes": payload_bytes,
         "before": (before[0], median(before), before[-1], sum(before)),
         "after": (after[0], median(after), after[-1], sum(after)),
+        "home_times": home_times,
     }
+
+
+def _retry_slow_nvfp4_homes(
+    decode_linear,
+    layers,
+    n: int,
+    k: int,
+    home_times: list[float],
+    evict_buf: torch.Tensor,
+    rejected_hold: list,
+) -> dict | None:
+    """When a fragmented boot leaves median(after) > min(after) * ADAPTIVE_RETRY_RATIO, flush non-_SLOW_HOLD
+    cached spares and run one targeted placement pass on only the slow homes against fresh OS extents."""
+    slow_ids = _select_retry_indices(home_times, ADAPTIVE_RETRY_RATIO)
+    if not slow_ids:
+        return None
+    rejected_hold.clear()
+    torch.cuda.empty_cache()
+    retry_layers = [layers[i] for i in slow_ids]
+    retry_surplus = max(3.0, DOWN_SURPLUS if (n, k) == (6656, 19968) else 3.5)
+    stats = _place_group(
+        decode_linear, retry_layers, n, k, evict_buf, rejected_hold, surplus_override=retry_surplus
+    )
+    if stats is not None:
+        rb, ra = stats["before"], stats["after"]
+        gbps = stats["payload_bytes"] / 1e6
+        logger.info(
+            "Decode weight adaptive retry %dx%d: %d/%d slow homes (> %.4f ms), %d spares, %d moved; "
+            "GEMV ms min/median/max %.4f/%.4f/%.4f -> %.4f/%.4f/%.4f "
+            "(weight-only %.0f/%.0f/%.0f -> %.0f/%.0f/%.0f GB/s), sum %.3f -> %.3f ms",
+            n, k, len(slow_ids), len(layers), min(home_times) * ADAPTIVE_RETRY_RATIO,
+            stats["spares"], stats["moved"],
+            rb[0], rb[1], rb[2], ra[0], ra[1], ra[2],
+            gbps / rb[0], gbps / rb[1], gbps / rb[2], gbps / ra[0], gbps / ra[1], gbps / ra[2], rb[3], ra[3],
+        )
+    return stats
+
+
+def _relocate_scales6_to_fast_pool(model: torch.nn.Module) -> None:
+    """Move _marlin_decode_scales6 buffers into fast pool (run AFTER 39936x6656 & 6656x19968 claim big slabs)."""
+    try:
+        import muse_marlin6_gemv as _m6
+        ilv_set = getattr(_m6, "_DOWN_ILV_SCALES", None)
+        lm_split2_set = getattr(_m6, "_LM_SPLIT2_SCALES", None)
+        lm_split2_cache = getattr(_m6, "_LM_SPLIT2_CACHE", None)
+        lm_pad128_set = getattr(_m6, "_LM_PAD128_SCALES", None)
+        lm_pad128_cache = getattr(_m6, "_LM_PAD128_CACHE", None)
+    except (ImportError, OSError):
+        ilv_set = None
+        lm_split2_set = None
+        lm_split2_cache = None
+        lm_pad128_set = None
+        lm_pad128_cache = None
+    moved_s6, bytes_s6 = 0, 0
+    for m in model.modules():
+        s6 = m._buffers.get("_marlin_decode_scales6")
+        if s6 is not None and s6.is_cuda and s6.numel() * s6.element_size() >= (64 << 10):
+            try:
+                old_ptr = s6.data_ptr()
+                if s6.dim() == 2 and s6.shape[1] == 32 and (s6.shape[0] + 64) * 32 < (1 << 20):
+                    dst_base = torch.empty((s6.shape[0] + 64, 32), dtype=s6.dtype, device=s6.device)
+                    dst = dst_base[: s6.shape[0]]
+                elif (
+                    s6.dim() == 2
+                    and s6.shape[1] == 32
+                    and getattr(m, "output_size_per_partition", None) == 39936
+                    and getattr(m, "input_size_per_partition", None) == 6656
+                ):
+                    # Reserve +128 KiB fast-pool headroom so register_all_gate_up_swiglu
+                    # always updates paired scales6 in-place without spilling to slow DRAM.
+                    dst_base = torch.empty((s6.shape[0] + 4096, 32), dtype=s6.dtype, device=s6.device)
+                    dst = dst_base[: s6.shape[0]]
+                else:
+                    dst = torch.empty_like(s6)
+                dst.copy_(s6)
+                if torch.equal(dst, s6):
+                    m._buffers["_marlin_decode_scales6"] = dst
+                    if ilv_set is not None and old_ptr in ilv_set:
+                        ilv_set.discard(old_ptr)
+                        ilv_set.add(dst.data_ptr())
+                    if lm_split2_set is not None and old_ptr in lm_split2_set:
+                        lm_split2_set.discard(old_ptr)
+                        lm_split2_set.add(dst.data_ptr())
+                    if lm_split2_cache is not None and old_ptr in lm_split2_cache:
+                        lm_split2_cache[dst.data_ptr()] = lm_split2_cache.pop(old_ptr)
+                    if lm_pad128_set is not None and old_ptr in lm_pad128_set:
+                        lm_pad128_set.discard(old_ptr)
+                        lm_pad128_set.add(dst.data_ptr())
+                    if lm_pad128_cache is not None and old_ptr in lm_pad128_cache:
+                        lm_pad128_cache[dst.data_ptr()] = lm_pad128_cache.pop(old_ptr)
+                    moved_s6 += 1
+                    bytes_s6 += dst.numel() * dst.element_size()
+            except RuntimeError:
+                break
+    if moved_s6:
+        logger.info(
+            "Decode scales6 fast-pool relocation: %d buffers (%.1f MiB) moved into fast pool",
+            moved_s6, bytes_s6 / (1 << 20),
+        )
 
 
 def _place_muserans_group(rans_ext, layers, n: int, k: int, evict_buf: torch.Tensor, rejected_hold: list) -> dict | None:
@@ -1589,71 +1754,14 @@ def place_decode_weights(model: torch.nn.Module) -> None:
             while sum(t.numel() * t.element_size() for t in _SLOW_HOLD) > (4 << 30):
                 _SLOW_HOLD.pop(0)
                 torch.cuda.empty_cache()
+        full_ram_ran = False
         for (n, k, *_), layers in multi_nvfp4:
             try:
                 stats = None
                 if FULL_RAM_SCAN and (n, k) == (39936, 6656) and len(layers) >= 32:
                     stats = _place_group_full_ram_scan(decode_linear, layers, n, k, evict_buf)
-                    if stats is not None and PLACE_SCALES6:
-                        try:
-                            import muse_marlin6_gemv as _m6
-                            ilv_set = getattr(_m6, "_DOWN_ILV_SCALES", None)
-                            lm_split2_set = getattr(_m6, "_LM_SPLIT2_SCALES", None)
-                            lm_split2_cache = getattr(_m6, "_LM_SPLIT2_CACHE", None)
-                            lm_pad128_set = getattr(_m6, "_LM_PAD128_SCALES", None)
-                            lm_pad128_cache = getattr(_m6, "_LM_PAD128_CACHE", None)
-                        except (ImportError, OSError):
-                            ilv_set = None
-                            lm_split2_set = None
-                            lm_split2_cache = None
-                            lm_pad128_set = None
-                            lm_pad128_cache = None
-                        moved_s6, bytes_s6 = 0, 0
-                        for m in model.modules():
-                            s6 = m._buffers.get("_marlin_decode_scales6")
-                            if s6 is not None and s6.is_cuda and s6.numel() * s6.element_size() >= (64 << 10):
-                                try:
-                                    old_ptr = s6.data_ptr()
-                                    if s6.dim() == 2 and s6.shape[1] == 32 and (s6.shape[0] + 64) * 32 < (1 << 20):
-                                        dst_base = torch.empty((s6.shape[0] + 64, 32), dtype=s6.dtype, device=s6.device)
-                                        dst = dst_base[: s6.shape[0]]
-                                    elif (
-                                        s6.dim() == 2
-                                        and s6.shape[1] == 32
-                                        and getattr(m, "output_size_per_partition", None) == 39936
-                                        and getattr(m, "input_size_per_partition", None) == 6656
-                                    ):
-                                        # Reserve +128 KiB fast-pool headroom so register_all_gate_up_swiglu
-                                        # always updates paired scales6 in-place without spilling to slow DRAM.
-                                        dst_base = torch.empty((s6.shape[0] + 4096, 32), dtype=s6.dtype, device=s6.device)
-                                        dst = dst_base[: s6.shape[0]]
-                                    else:
-                                        dst = torch.empty_like(s6)
-                                    dst.copy_(s6)
-                                    if torch.equal(dst, s6):
-                                        m._buffers["_marlin_decode_scales6"] = dst
-                                        if ilv_set is not None and old_ptr in ilv_set:
-                                            ilv_set.discard(old_ptr)
-                                            ilv_set.add(dst.data_ptr())
-                                        if lm_split2_set is not None and old_ptr in lm_split2_set:
-                                            lm_split2_set.discard(old_ptr)
-                                            lm_split2_set.add(dst.data_ptr())
-                                        if lm_split2_cache is not None and old_ptr in lm_split2_cache:
-                                            lm_split2_cache[dst.data_ptr()] = lm_split2_cache.pop(old_ptr)
-                                        if lm_pad128_set is not None and old_ptr in lm_pad128_set:
-                                            lm_pad128_set.discard(old_ptr)
-                                            lm_pad128_set.add(dst.data_ptr())
-                                        if lm_pad128_cache is not None and old_ptr in lm_pad128_cache:
-                                            lm_pad128_cache[dst.data_ptr()] = lm_pad128_cache.pop(old_ptr)
-                                        moved_s6 += 1
-                                        bytes_s6 += dst.numel() * dst.element_size()
-                                except RuntimeError:
-                                    break
-                        if moved_s6:
-                            logger.info(
-                                "Decode scales6 fast-pool relocation: %d buffers (%.1f MiB) moved into fast pool",
-                                moved_s6, bytes_s6 / (1 << 20),
-                            )
+                    if stats is not None:
+                        full_ram_ran = True
                 if stats is None:
                     stats = _place_group(decode_linear, layers, n, k, evict_buf, rejected_hold)
             except Exception as err:  # noqa: BLE001 - this group stays where it was
@@ -1673,6 +1781,19 @@ def place_decode_weights(model: torch.nn.Module) -> None:
                 b[0], b[1], b[2], a[0], a[1], a[2],
                 gbps / b[0], gbps / b[1], gbps / b[2], gbps / a[0], gbps / a[1], gbps / a[2], b[3], a[3],
             )
+            if (n, k) in ((39936, 6656), (6656, 19968)) and stats.get("home_times"):
+                try:
+                    retry_stats = _retry_slow_nvfp4_homes(
+                        decode_linear, layers, n, k, stats["home_times"], evict_buf, rejected_hold
+                    )
+                    if retry_stats is not None:
+                        saved_ms += retry_stats["before"][3] - retry_stats["after"][3]
+                except Exception as err:  # noqa: BLE001
+                    logger.warning("Decode weight adaptive retry skipped for %dx%d: %s", n, k, err)
+        # Relocate _marlin_decode_scales6 AFTER 39936x6656 and 6656x19968 so 130 tiny scale buffers never
+        # carve holes in 127 MiB fast-pool slabs before 6656x19968 down_proj allocates.
+        if full_ram_ran and PLACE_SCALES6:
+            _relocate_scales6_to_fast_pool(model)
         deferred_large_rans: list[tuple[tuple[int, int], list]] = []
         if rans_groups and _rans_ext is not None:
             ordered_rans = sorted(
