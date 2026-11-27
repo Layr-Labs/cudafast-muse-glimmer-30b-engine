@@ -727,18 +727,21 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         }
       }
       __syncthreads();
+      const int pv_lo_lim = skip_masked_exp ? lo_pairs : 4;
       uint32_t v_cur[4], v_nxt[4];
       ldsm4_v_pair64(v_cur, kv_smem[1], 0, 0, lane);
       #pragma unroll
       for (int ks_local = 0; ks_local < 4; ++ks_local) {
-        #pragma unroll
-        for (int dp = 0; dp < 8; ++dp) {
-          const int n_dp = (dp + 1) & 7;
-          const int n_ks = ks_local + (dp == 7 ? 1 : 0);
-          if (n_ks < 4) ldsm4_v_pair64(v_nxt, kv_smem[1], n_dp, n_ks, lane);
-          mma_m16n8k16_bf16(p_frag[ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
-          mma_m16n8k16_bf16(p_frag[ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
-          v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
+        if (ks_local < pv_lo_lim) {
+          #pragma unroll
+          for (int dp = 0; dp < 8; ++dp) {
+            const int n_dp = (dp + 1) & 7;
+            const int n_ks = ks_local + (dp == 7 ? 1 : 0);
+            if (n_ks < pv_lo_lim) ldsm4_v_pair64(v_nxt, kv_smem[1], n_dp, n_ks, lane);
+            mma_m16n8k16_bf16(p_frag[ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
+            mma_m16n8k16_bf16(p_frag[ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
+            v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
+          }
         }
       }
       __syncthreads();
@@ -775,18 +778,21 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
       }
       __syncthreads();
       {
+        const int pv_hi_lim = skip_masked_exp ? hi_pairs : 4;
         uint32_t v_cur[4], v_nxt[4];
         ldsm4_v_pair64(v_cur, kv_smem[1], 0, 0, lane);
         #pragma unroll
         for (int ks_local = 0; ks_local < 4; ++ks_local) {
-          #pragma unroll
-          for (int dp = 0; dp < 8; ++dp) {
-            const int n_dp = (dp + 1) & 7;
-            const int n_ks = ks_local + (dp == 7 ? 1 : 0);
-            if (n_ks < 4) ldsm4_v_pair64(v_nxt, kv_smem[1], n_dp, n_ks, lane);
-            mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
-            mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
-            v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
+          if (ks_local < pv_hi_lim) {
+            #pragma unroll
+            for (int dp = 0; dp < 8; ++dp) {
+              const int n_dp = (dp + 1) & 7;
+              const int n_ks = ks_local + (dp == 7 ? 1 : 0);
+              if (n_ks < pv_hi_lim) ldsm4_v_pair64(v_nxt, kv_smem[1], n_dp, n_ks, lane);
+              mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
+              mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
+              v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
+            }
           }
         }
       }

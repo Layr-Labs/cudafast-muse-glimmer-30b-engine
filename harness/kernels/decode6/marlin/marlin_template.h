@@ -2009,10 +2009,9 @@ __global__ void Marlin(
   if constexpr (b_type_id == vllm::kFE2M1f.id() &&
                 a_type_id == vllm::kBFloat16.id() && dequant_skip_flop &&
                 !has_act_order && !has_zp && !is_a_8bit && group_blocks != -1 &&
-                thread_m_blocks == 1) {
+                (thread_m_blocks == 1 || (thread_m_blocks == 2 && !m_block_size_8))) {
     // 1-step software-pipelined j = 0..3 E2M1 dequant + BF16 scale -> HMMA overlap
-    // strictly for thread_m_blocks == 1 (M <= 16), leaving thread_m_blocks == 2 (M = 32)
-    // untouched to avoid accumulator register spill.
+    // for thread_m_blocks == 1 (M <= 16) and thread_m_blocks == 2 (!m_block_size_8, M = 32).
     auto dequant_nvfp4_j = [&](int jj, FragB& b0, FragB& b1) {
       const uint32_t u = static_cast<uint32_t>(frag_b_quant[k2][0][jj]);
       reinterpret_cast<uint32_t*>(&b1)[1] =
