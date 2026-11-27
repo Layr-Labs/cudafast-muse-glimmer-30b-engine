@@ -4671,35 +4671,56 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_fused_kernel(
   }
 
   const uint32_t thresh = s_prefix;
-  if (tid < 32) {
-    uint32_t cur = 0u;
+  {
+    constexpr int kMaxChunks = (kWaveCTAs * kCtaTopK + 31) / 32;
+    static_assert(2 * kMaxChunks + kS2Warps <= 256);
+    static_assert(kWaveCTAs * kCtaTopK < (1 << 16));
+    uint32_t* const warp_counts = s_hist + 2 * kMaxChunks;
+    const int chunks = (N_in + 31) / 32;
+    const int per_warp = (chunks + kS2Warps - 1) / kS2Warps;
+    const int first = warp * per_warp;
+    const int last = min(first + per_warp, chunks);
+    uint32_t counts = 0;
+    for (int chunk = first; chunk < last; ++chunk) {
+      const int i = chunk * 32 + lane;
+      const bool valid = i < N_in && s_ids[i] >= 0;
+      const uint32_t key = valid ? s_keys[i] : 0u;
+      const uint32_t gt = __ballot_sync(0xffffffffu, valid && key > thresh);
+      const uint32_t eq = __ballot_sync(0xffffffffu, valid && key == thresh);
+      if (lane == 0) {
+        s_hist[2 * chunk] = gt;
+        s_hist[2 * chunk + 1] = eq;
+        counts += static_cast<uint32_t>(__popc(gt)) |
+                  (static_cast<uint32_t>(__popc(eq)) << 16);
+      }
+    }
+    if (lane == 0) warp_counts[warp] = counts;
+    __syncthreads();
+
+    const uint32_t slab = lane < kS2Warps ? warp_counts[lane] : 0u;
+    const uint32_t total = __reduce_add_sync(0xffffffffu, slab);
+    const uint32_t prior = __reduce_add_sync(0xffffffffu, lane < warp ? slab : 0u);
+    const uint32_t n_gt = total & 0xffffu;
     const uint32_t cap = static_cast<uint32_t>(K_cand);
-    for (int base = 0; base < N_in && cur < cap; base += 32) {
-      const int i = base + tid;
-      const bool hit = (i < N_in) && (s_keys[i] > thresh) && (s_ids[i] >= 0);
-      const uint32_t bmask = __ballot_sync(0xffffffffu, hit);
-      if (bmask != 0u) {
-        const uint32_t slot = cur + static_cast<uint32_t>(__popc(bmask & ((1u << tid) - 1u)));
-        if (hit && slot < cap) {
-          s_cand[slot] = s_ids[i];
-        }
-        cur += static_cast<uint32_t>(__popc(bmask));
+    if (tid == 0) s_out_cnt = min(cap, n_gt + (total >> 16));
+
+    uint32_t gt_base = prior & 0xffffu;
+    uint32_t eq_base = n_gt + (prior >> 16);
+    const uint32_t bit = 1u << lane;
+    const uint32_t lower = bit - 1u;
+    for (int chunk = first; chunk < last; ++chunk) {
+      const uint32_t gt = s_hist[2 * chunk];
+      const uint32_t eq = s_hist[2 * chunk + 1];
+      const int i = chunk * 32 + lane;
+      if (gt & bit) {
+        const uint32_t slot = gt_base + __popc(gt & lower);
+        if (slot < cap) s_cand[slot] = s_ids[i];
+      } else if (eq & bit) {
+        const uint32_t slot = eq_base + __popc(eq & lower);
+        if (slot < cap) s_cand[slot] = s_ids[i];
       }
-    }
-    for (int base = 0; base < N_in && cur < cap; base += 32) {
-      const int i = base + tid;
-      const bool hit = (i < N_in) && (s_keys[i] == thresh) && (s_ids[i] >= 0);
-      const uint32_t bmask = __ballot_sync(0xffffffffu, hit);
-      if (bmask != 0u) {
-        const uint32_t slot = cur + static_cast<uint32_t>(__popc(bmask & ((1u << tid) - 1u)));
-        if (hit && slot < cap) {
-          s_cand[slot] = s_ids[i];
-        }
-        cur += static_cast<uint32_t>(__popc(bmask));
-      }
-    }
-    if (tid == 0) {
-      s_out_cnt = (cur < cap) ? cur : cap;
+      gt_base += __popc(gt);
+      eq_base += __popc(eq);
     }
   }
   __syncthreads();
