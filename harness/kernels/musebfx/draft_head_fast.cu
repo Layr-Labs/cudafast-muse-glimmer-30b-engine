@@ -2732,21 +2732,22 @@ __global__ void dhf_select_topk_kernel(
   }
 
   const uint32_t thresh = s_prefix;  // exact 32-bit float key threshold
-  // Emit strictly greater items first (strictly < K_cand items match, so all of them fit).
-  for (int i = tid; i < N_in; i += 256) {
-    if (s_keys[i] > thresh && s_ids[i] >= 0) {
-      const uint32_t slot = atomicAdd(&s_out_cnt, 1u);
-      if (slot < static_cast<uint32_t>(K_cand)) {
-        out[slot] = s_ids[i];
+  // Deterministically compact strictly-greater items, then exact tie-bucket items on warp 0.
+  if (tid < 32) {
+    uint32_t cur = 0u;
+    const uint32_t cap = static_cast<uint32_t>(K_cand);
+    for (int base = 0; base < N_in && cur < cap; base += 32) {
+      const int i = base + tid;
+      const bool hit = (i < N_in) && (s_keys[i] > thresh) && (s_ids[i] >= 0);
+      const uint32_t bmask = __ballot_sync(0xffffffffu, hit);
+      if (bmask != 0u) {
+        const uint32_t slot = cur + static_cast<uint32_t>(__popc(bmask & ((1u << tid) - 1u)));
+        if (hit && slot < cap) {
+          out[slot] = s_ids[i];
+        }
+        cur += static_cast<uint32_t>(__popc(bmask));
       }
     }
-  }
-  __syncthreads();
-
-  // Deterministically compact remaining slots up to K_cand from exact 32-bit tie bucket on warp 0.
-  if (tid < 32) {
-    uint32_t cur = s_out_cnt;
-    const uint32_t cap = static_cast<uint32_t>(K_cand);
     for (int base = 0; base < N_in && cur < cap; base += 32) {
       const int i = base + tid;
       const bool hit = (i < N_in) && (s_keys[i] == thresh) && (s_ids[i] >= 0);

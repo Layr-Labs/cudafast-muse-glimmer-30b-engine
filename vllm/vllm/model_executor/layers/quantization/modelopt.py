@@ -1449,7 +1449,7 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                 and (k_dim % 128 == 0)
                 and os.environ.get("MUSE_DHEAD_FAST", "1") != "0"
             )
-            dhead_impl = os.environ.get("MUSE_DHEAD_IMPL", "hadamard").strip().lower()
+            dhead_impl = os.environ.get("MUSE_DHEAD_IMPL", "4d64").strip().lower()
             if want_fast_dhead and dhead_impl != "hadamard":
                 try:
                     import muse_bfx_ext as _bfx
