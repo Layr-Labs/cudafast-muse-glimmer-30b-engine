@@ -1384,51 +1384,37 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
         if constexpr (kWholeSplit) {
           num_parts = 2;
           part_role = (seg_start_kg != 0) ? 1 : 0;
-        } else if (sk_multi_part != nullptr) {
+        } else if (sk_multi_part != nullptr && total_iters >= grid_ctas) {
           const int tile_lo = cur_n * num_kg;
           const int tile_hi = tile_lo + num_kg;
-          if (seg_start_kg == 0 && cur_kg + 1 < num_kg) {
-            const int end1 = static_cast<int>((static_cast<int64_t>(cta_id + 2) * total_iters) / grid_ctas);
-            if (cta_id + 1 < grid_ctas && end1 >= tile_hi) {
-              num_parts = 2;
-              part_role = 0;
-            } else if (allow_3part && cta_id + 2 < grid_ctas) {
-              const int end2 = static_cast<int>((static_cast<int64_t>(cta_id + 3) * total_iters) / grid_ctas);
-              if (end2 >= tile_hi) {
-                num_parts = 3;
-                part_role = 0;
-              }
-            }
-          } else if (seg_start_kg > 0 && cur_kg + 1 == num_kg) {
-            const int prev_start = static_cast<int>((static_cast<int64_t>(cta_id - 1) * total_iters) / grid_ctas);
-            if (cta_id > 0 && prev_start <= tile_lo) {
-              num_parts = 2;
-              part_role = 1;
-            } else if (allow_3part && cta_id >= 2) {
-              const int prev2_start = static_cast<int>((static_cast<int64_t>(cta_id - 2) * total_iters) / grid_ctas);
-              if (prev2_start <= tile_lo) {
-                num_parts = 3;
-                part_role = 2;
-              }
-            }
-          } else if (allow_3part && seg_start_kg > 0 && cur_kg + 1 < num_kg) {
-            if (cta_id > 0 && cta_id + 1 < grid_ctas) {
-              const int prev_start = static_cast<int>((static_cast<int64_t>(cta_id - 1) * total_iters) / grid_ctas);
-              const int next_end = static_cast<int>((static_cast<int64_t>(cta_id + 2) * total_iters) / grid_ctas);
-              if (prev_start <= tile_lo && next_end >= tile_hi) {
-                num_parts = 3;
-                part_role = 1;
-              }
-            }
+          const int max_parts = allow_3part ? 4 : 2;
+          int first_c = cta_id;
+          while (first_c > 0 && (cta_id - first_c) < max_parts &&
+                 static_cast<int>((static_cast<int64_t>(first_c) * total_iters) / grid_ctas) > tile_lo) {
+            --first_c;
+          }
+          const bool lo_ok =
+              (static_cast<int>((static_cast<int64_t>(first_c) * total_iters) / grid_ctas) <= tile_lo);
+          int last_c = cta_id;
+          while (last_c + 1 < grid_ctas && (last_c - first_c + 1) <= max_parts &&
+                 static_cast<int>((static_cast<int64_t>(last_c + 1) * total_iters) / grid_ctas) < tile_hi) {
+            ++last_c;
+          }
+          const bool hi_ok =
+              (static_cast<int>((static_cast<int64_t>(last_c + 1) * total_iters) / grid_ctas) >= tile_hi);
+          const int np = last_c - first_c + 1;
+          if (lo_ok && hi_ok && np >= 2 && np <= max_parts) {
+            num_parts = np;
+            part_role = cta_id - first_c;
           }
         }
 
-        if (num_parts == 2 || num_parts == 3) {
-          // Deterministic non-atomic float2 reduction (2-part & 3-part):
+        if (num_parts >= 2 && num_parts <= 4) {
+          // Deterministic non-atomic float2 reduction (2-part, 3-part & 4-part):
           // coalesced float2 stores + 1 int32 arrival counter + L2-coherent ld.global.cg.v2.f32 loads.
           // 2-part: IEEE-754 float+ is commutative => bit-deterministic.
-          // 3-part: strict fixed-order ((v0 + v1) + v2) => bit-deterministic independent of CTA arrival order.
-          float* tile_mp = sk_multi_part + static_cast<size_t>(cur_n) * (3 * 16 * 64);
+          // 3/4-part: strict fixed-order (((v0 + v1) + v2) + v3) => 100% bit-deterministic across all 64 fc tiles!
+          float* tile_mp = sk_multi_part + static_cast<size_t>(cur_n) * (4 * 16 * 64);
           float* my_p = tile_mp + static_cast<size_t>(part_role) * (16 * 64);
           if (g < M) {
             float* row_p = my_p + g * 64;
@@ -1472,36 +1458,38 @@ __global__ void __launch_bounds__(128, 4) int4_mma_streamk_kernel(
                 }
               }
             } else {
-              const float* pA = tile_mp + static_cast<size_t>((part_role == 0) ? 1 : 0) * (16 * 64);
-              const float* pB = tile_mp + static_cast<size_t>((part_role == 2) ? 1 : 2) * (16 * 64);
-              auto sum3_pair = [&](float m0, float m1, float2 a, float2 b) -> uint32_t {
-                float x0, x1, x2, y0, y1, y2;
-                if (part_role == 0) {
-                  x0 = m0; y0 = m1; x1 = a.x; y1 = a.y; x2 = b.x; y2 = b.y;
-                } else if (part_role == 1) {
-                  x0 = a.x; y0 = a.y; x1 = m0; y1 = m1; x2 = b.x; y2 = b.y;
-                } else {
-                  x0 = a.x; y0 = a.y; x1 = b.x; y1 = b.y; x2 = m0; y2 = m1;
+              auto sum_k_pair = [&](int row_off, int col_off, float m0, float m1) -> uint32_t {
+                float sx = 0.0f;
+                float sy = 0.0f;
+                for (int r = 0; r < num_parts; ++r) {
+                  float rx, ry;
+                  if (r == part_role) {
+                    rx = m0;
+                    ry = m1;
+                  } else {
+                    const float2 pv = int4_ldcg_f2(reinterpret_cast<const float2*>(
+                        tile_mp + static_cast<size_t>(r) * (16 * 64) + row_off * 64 + col_off));
+                    rx = pv.x;
+                    ry = pv.y;
+                  }
+                  sx = (r == 0) ? rx : __fadd_rn(sx, rx);
+                  sy = (r == 0) ? ry : __fadd_rn(sy, ry);
                 }
-                return int4_bf16x2_u32(__fadd_rn(__fadd_rn(x0, x1), x2), __fadd_rn(__fadd_rn(y0, y1), y2));
+                return int4_bf16x2_u32(sx, sy);
               };
               if (g < M) {
-                const float2 a0 = int4_ldcg_f2(reinterpret_cast<const float2*>(pA + g * 64 + local_c0));
-                const float2 b0 = int4_ldcg_f2(reinterpret_cast<const float2*>(pB + g * 64 + local_c0));
-                const float2 a1 = int4_ldcg_f2(reinterpret_cast<const float2*>(pA + g * 64 + local_c1));
-                const float2 b1 = int4_ldcg_f2(reinterpret_cast<const float2*>(pB + g * 64 + local_c1));
-                *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col0) = sum3_pair(d0_0, d1_0, a0, b0);
-                *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col1) = sum3_pair(d0_1, d1_1, a1, b1);
+                *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col0) =
+                    sum_k_pair(g, local_c0, d0_0, d1_0);
+                *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(g) * N + col1) =
+                    sum_k_pair(g, local_c1, d0_1, d1_1);
               }
               if constexpr (kM16) {
                 if (has_hi) {
                   const int ghi = g + 8;
-                  const float2 a0 = int4_ldcg_f2(reinterpret_cast<const float2*>(pA + ghi * 64 + local_c0));
-                  const float2 b0 = int4_ldcg_f2(reinterpret_cast<const float2*>(pB + ghi * 64 + local_c0));
-                  const float2 a1 = int4_ldcg_f2(reinterpret_cast<const float2*>(pA + ghi * 64 + local_c1));
-                  const float2 b1 = int4_ldcg_f2(reinterpret_cast<const float2*>(pB + ghi * 64 + local_c1));
-                  *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(ghi) * N + col0) = sum3_pair(d2_0, d3_0, a0, b0);
-                  *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(ghi) * N + col1) = sum3_pair(d2_1, d3_1, a1, b1);
+                  *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(ghi) * N + col0) =
+                      sum_k_pair(ghi, local_c0, d2_0, d3_0);
+                  *reinterpret_cast<uint32_t*>(C + static_cast<size_t>(ghi) * N + col1) =
+                      sum_k_pair(ghi, local_c1, d2_1, d3_1);
                 }
               }
             }
@@ -1718,14 +1706,14 @@ void ensure_int4_sk_scratch(const torch::TensorOptions& opts, int n_blocks,
   const bool use_mp = (red_mode != 0);
   if (use_mp && (!g_sk_multi_part.defined() || g_sk_multi_part.device() != opts.device() || g_sk_mp_cap < n_blocks)) {
     const int mp_cap = (n_blocks > 256) ? n_blocks : 256;
-    g_sk_multi_part = torch::empty({2, static_cast<int64_t>(mp_cap) * 3 * 16 * 64}, opts.dtype(torch::kFloat32));
+    g_sk_multi_part = torch::empty({2, static_cast<int64_t>(mp_cap) * 4 * 16 * 64}, opts.dtype(torch::kFloat32));
     g_sk_mp_cap = mp_cap;
   }
   const int slot = static_cast<int>(g_sk_slot & 1u);
   g_sk_slot ^= 1u;
   partials_ptr = g_sk_partials.data_ptr<float>() + static_cast<size_t>(slot) * static_cast<size_t>(g_sk_cap) * 16 * 64;
   multi_part_ptr = use_mp
-      ? (g_sk_multi_part.data_ptr<float>() + static_cast<size_t>(slot) * static_cast<size_t>(g_sk_mp_cap) * 3 * 16 * 64)
+      ? (g_sk_multi_part.data_ptr<float>() + static_cast<size_t>(slot) * static_cast<size_t>(g_sk_mp_cap) * 4 * 16 * 64)
       : nullptr;
   done_ptr = g_sk_done.data_ptr<int>() + static_cast<size_t>(slot) * static_cast<size_t>(g_sk_cap);
 }

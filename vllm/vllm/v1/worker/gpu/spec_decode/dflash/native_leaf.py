@@ -49,7 +49,8 @@ TREE_WIDE_M = (
     else 0
 )
 TREE_WIDE_GATE = os.environ.get("MUSE_NATIVE_TREE_WIDE_GATE", "cpc").strip().lower()
-TREE_WIDE_CPC = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_CPC", "4.8"))
+TREE_WIDE_CPC = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_CPC", "3.25"))
+TREE_WIDE_MIN_ROUNDS = int(os.environ.get("MUSE_NATIVE_TREE_WIDE_MIN_ROUNDS", "3"))
 TREE_WIDE_SM = float(os.environ.get("MUSE_NATIVE_TREE_WIDE_SM", "2.0"))
 
 
@@ -87,6 +88,13 @@ TREE_CALIB = os.environ.get("MUSE_TREE_CALIB", "1").strip() not in ("0", "", "fa
 TREE_HIGH_ACC_CPC = float(os.environ.get("MUSE_TREE_HIGH_ACC_CPC", "0"))
 LEAF_STATS = os.environ.get("MUSE_LEAF_STATS", "0").strip() in ("1", "true", "yes")
 TR_ENABLED = os.environ.get("MUSE_TR_MODE", "1").strip() not in ("0", "", "false", "no")
+OOV_PREADMIT = os.environ.get("MUSE_OOV_PREADMIT", "2").strip() not in ("0", "", "false", "no")
+try:
+    _TREE_K_RAW = int(os.environ.get("MUSE_TREE_K", "8").strip() or "8")
+except ValueError:
+    _TREE_K_RAW = 8
+TREE_K = 8 if _TREE_K_RAW >= 8 else 6
+TREE_TOP_LEN = 6 * TREE_K
 HIST_CAP = 16384
 TR_LOG_CAP = 4096
 _ST_RAW = os.environ.get("MUSE_NATIVE_LEAF_SELFTEST", "0").strip().lower()
@@ -121,6 +129,10 @@ class _NativeLeafState:
         self.saved_row_ctx: torch.Tensor | None = None      # int32[32, 4] per-row (cur, prv1, prv2, pos_r)
         self.tr_log: torch.Tensor | None = None             # int32[4096, 8] per-request 30B target recycle log
         self.tr_state: torch.Tensor | None = None           # int32[4] [tr_len, tr_step, last_p0, reserved]
+        self.in_static_vocab: torch.Tensor | None = None    # uint8[vocab] drafter static vocab mask
+        self.tail_ids: torch.Tensor | None = None           # int32[512] drafter dynamic OOV tail IDs
+        self.tail_count: torch.Tensor | None = None         # int32[1] drafter dynamic OOV tail count
+        self.tail_seen: torch.Tensor | None = None          # int32[vocab] drafter OOV dedup bitmap
         self.stats: torch.Tensor | None = None              # int64[52] telemetry counters
         self.cascade_meta: torch.Tensor | None = None       # int32[8] Pass-2 cascade metadata & row mask
         self.cascade_toks: torch.Tensor | None = None       # int64[36] Pass-2 / backup top-6 tokens
@@ -151,12 +163,47 @@ class _NativeLeafState:
 _S = _NativeLeafState()
 
 
+def register_draft_tail_bufs(
+    in_static_vocab: torch.Tensor | None,
+    tail_ids: torch.Tensor | None,
+    tail_count: torch.Tensor | None,
+    tail_seen: torch.Tensor | None,
+) -> None:
+    """Register drafter lm_head OOV tail buffers for 32-row 30B cone OOV pre-admission."""
+    if (
+        not OOV_PREADMIT
+        or in_static_vocab is None
+        or tail_ids is None
+        or tail_count is None
+        or tail_seen is None
+    ):
+        return
+    if _S.tail_ids is tail_ids and _S.in_static_vocab is in_static_vocab:
+        return
+    _S.in_static_vocab = in_static_vocab
+    _S.tail_ids = tail_ids
+    _S.tail_count = tail_count
+    _S.tail_seen = tail_seen
+
+
+def _reset_draft_tail_state() -> None:
+    if torch.cuda.is_current_stream_capturing():
+        return
+    if _S.tail_ids is not None and not _S.tail_ids.is_inference():
+        _S.tail_ids.fill_(-1)
+    if _S.tail_count is not None and not _S.tail_count.is_inference():
+        _S.tail_count.zero_()
+    if _S.tail_seen is not None and not _S.tail_seen.is_inference():
+        _S.tail_seen.zero_()
+
+
 def _reset_tr_state() -> None:
     if _S.tr_state is not None:
         _S.tr_state[:2].zero_()
         _S.tr_state[2:3].fill_(-1)
     if _S.saved_row_ctx is not None:
         _S.saved_row_ctx.fill_(-1)
+    _reset_draft_tail_state()
 
 
 def _dump_stats(tag: str) -> None:
@@ -223,12 +270,13 @@ def select_verify_m(req_id: str | None, decoded_tokens: int) -> int:
     if TREE_WIDE_GATE == "sm":
         if _S._host_rounds == 0 or _S.tree_vals is None or _S.tree_vals.numel() < 36:
             return wide_m
-        sm_val = float((_S.tree_vals[0:36:6] - _S.tree_vals[1:36:6]).mean().item())
+        _tk = max(6, int(_S.tree_vals.numel()) // 6)
+        sm_val = float((_S.tree_vals[0 : 6 * _tk : _tk] - _S.tree_vals[1 : 6 * _tk : _tk]).mean().item())
         return wide_m if sm_val < TREE_WIDE_SM else base_m
-    # Default zero-sync `cpc` gate: enable wide_m on step 0 or while running verify cpc < TREE_WIDE_CPC.
-    # decoded_tokens = num_computed_tokens - prefill_len == sum(committed_tokens[0..round-1]).
-    if _S._host_rounds == 0:
-        return wide_m
+    # Default zero-sync `cpc` gate: start on fast M=16 for the first TREE_WIDE_MIN_ROUNDS steps,
+    # then switch to wide M=32 only when running verify cpc < TREE_WIDE_CPC (hard <3.25 tok/step prose!).
+    if _S._host_rounds < TREE_WIDE_MIN_ROUNDS:
+        return base_m
     verify_committed = max(0, int(decoded_tokens))
     return wide_m if (float(verify_committed) < TREE_WIDE_CPC * float(_S._host_rounds)) else base_m
 
@@ -297,38 +345,38 @@ def get_margin_buf(device: torch.device) -> torch.Tensor | None:
 
 
 def get_tree_top_buf(device: torch.device) -> torch.Tensor | None:
-    """Return fixed-address int64[36] ([6, 6]) buffer for drafter rows 0..5 top-6 IDs (CUDA-graph safe)."""
+    """Return fixed-address int64[6*TREE_K] buffer for drafter rows 0..5 top-K IDs (CUDA-graph safe)."""
     if not ENABLED or TREE_M == 0 or device.type != "cuda":
         return None
     if (
         _S.tree_top is not None
         and _S.tree_top.device == device
-        and _S.tree_top.numel() >= 36
+        and _S.tree_top.numel() >= TREE_TOP_LEN
         and not _S.tree_top.is_inference()
     ):
         return _S.tree_top
     if torch.cuda.is_current_stream_capturing():
         return _S.tree_top if (_S.tree_top is not None and _S.tree_top.device == device) else None
     with torch.inference_mode(False):
-        _S.tree_top = torch.full((36,), -1, dtype=torch.int64, device=device)
+        _S.tree_top = torch.full((TREE_TOP_LEN,), -1, dtype=torch.int64, device=device)
     return _S.tree_top
 
 
 def get_tree_vals_buf(device: torch.device) -> torch.Tensor | None:
-    """Return fixed-address float32[36] ([6, 6]) buffer for drafter rows 0..5 top-6 logits (CUDA-graph safe)."""
+    """Return fixed-address float32[6*TREE_K] buffer for drafter rows 0..5 top-K logits (CUDA-graph safe)."""
     if not ENABLED or TREE_M == 0 or device.type != "cuda":
         return None
     if (
         _S.tree_vals is not None
         and _S.tree_vals.device == device
-        and _S.tree_vals.numel() >= 36
+        and _S.tree_vals.numel() >= TREE_TOP_LEN
         and not _S.tree_vals.is_inference()
     ):
         return _S.tree_vals
     if torch.cuda.is_current_stream_capturing():
         return _S.tree_vals if (_S.tree_vals is not None and _S.tree_vals.device == device) else None
     with torch.inference_mode(False):
-        _S.tree_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
+        _S.tree_vals = torch.full((TREE_TOP_LEN,), -1e30, dtype=torch.float32, device=device)
     return _S.tree_vals
 
 
@@ -549,19 +597,19 @@ def init_kv_table(
         if (
             _S.tree_top is None
             or _S.tree_top.device != device
-            or _S.tree_top.numel() < 36
+            or _S.tree_top.numel() < TREE_TOP_LEN
             or _S.tree_top.is_inference()
         ):
-            _S.tree_top = torch.full((36,), -1, dtype=torch.int64, device=device)
+            _S.tree_top = torch.full((TREE_TOP_LEN,), -1, dtype=torch.int64, device=device)
         else:
             _S.tree_top.fill_(-1)
         if (
             _S.tree_vals is None
             or _S.tree_vals.device != device
-            or _S.tree_vals.numel() < 36
+            or _S.tree_vals.numel() < TREE_TOP_LEN
             or _S.tree_vals.is_inference()
         ):
-            _S.tree_vals = torch.full((36,), -1e30, dtype=torch.float32, device=device)
+            _S.tree_vals = torch.full((TREE_TOP_LEN,), -1e30, dtype=torch.float32, device=device)
         else:
             _S.tree_vals.fill_(-1e30)
         if (
@@ -917,6 +965,10 @@ def commit_and_fix(
         )
         tr_log_arg = _S.tr_log if TR_ENABLED else None
         tr_state_arg = _S.tr_state if TR_ENABLED else None
+        in_sv_arg = _S.in_static_vocab if OOV_PREADMIT else None
+        t_ids_arg = _S.tail_ids if OOV_PREADMIT else None
+        t_cnt_arg = _S.tail_count if OOV_PREADMIT else None
+        t_seen_arg = _S.tail_seen if OOV_PREADMIT else None
         try:
             bfx.native_leaf_commit_tree(
                 _S.leaf_flag,
@@ -943,6 +995,10 @@ def commit_and_fix(
                 _S.vocab_size,
                 chain_all_valid,
                 _S.cascade_meta,
+                in_sv_arg,
+                t_ids_arg,
+                t_cnt_arg,
+                t_seen_arg,
             )
         except TypeError:
             try:
