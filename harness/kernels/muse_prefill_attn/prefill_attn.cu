@@ -1016,7 +1016,7 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
 static bool post_attn_pdl_enabled() {
   static const bool on = []() {
     const char* env = std::getenv("MUSE_PREFILL_POST_ATTN_PDL");
-    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+    return env && *env && std::strtol(env, nullptr, 10) != 0;
   }();
   return on;
 }

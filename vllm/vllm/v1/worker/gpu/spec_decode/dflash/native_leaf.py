@@ -118,7 +118,7 @@ class _NativeLeafState:
         self.alt_margins: torch.Tensor | None = None        # float32[2] (margin_d1, margin_d2)
         self.tree_top: torch.Tensor | None = None           # int64[36] ([6, 6] top-6 for d1..d6)
         self.tree_vals: torch.Tensor | None = None          # float32[36] ([6, 6] top-6 logits for d1..d6)
-        self.req_acc_state: torch.Tensor | None = None      # int32[3] [rounds, committed, high_acc_flag]
+        self.req_acc_state: torch.Tensor | None = None      # int32[5] [rounds, committed, high_acc, raw_acc, raw_tr]
         self.saved_alt_tok: torch.Tensor | None = None      # int64[1] (legacy M=7/M=8)
         self.saved_leaf_toks: torch.Tensor | None = None    # int64[32] (tree mode)
         self.saved_leaf_k: torch.Tensor | None = None       # int32[32] (tree mode)
@@ -409,6 +409,7 @@ def get_cascade_bufs(
         and _S.p1_save_alt is not None
         and _S.p1_save_margins is not None
         and _S.req_acc_state is not None
+        and _S.req_acc_state.numel() >= 5
         and _S.stats is not None
         and _S.stats.numel() >= 52
     ):
@@ -438,10 +439,10 @@ def get_cascade_bufs(
         if (
             _S.req_acc_state is None
             or _S.req_acc_state.device != device
-            or _S.req_acc_state.numel() < 3
+            or _S.req_acc_state.numel() < 5
             or _S.req_acc_state.is_inference()
         ):
-            _S.req_acc_state = torch.zeros((3,), dtype=torch.int32, device=device)
+            _S.req_acc_state = torch.zeros((5,), dtype=torch.int32, device=device)
         if (
             _S.stats is None
             or _S.stats.device != device
@@ -615,10 +616,10 @@ def init_kv_table(
         if (
             _S.req_acc_state is None
             or _S.req_acc_state.device != device
-            or _S.req_acc_state.numel() < 3
+            or _S.req_acc_state.numel() < 5
             or _S.req_acc_state.is_inference()
         ):
-            _S.req_acc_state = torch.zeros((3,), dtype=torch.int32, device=device)
+            _S.req_acc_state = torch.zeros((5,), dtype=torch.int32, device=device)
         else:
             _S.req_acc_state.zero_()
         _S.saved_alt_tok = torch.full((1,), -1, dtype=torch.int64, device=device)

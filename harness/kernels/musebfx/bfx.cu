@@ -106,10 +106,14 @@ void bf16_rans_gemm_dual_out(
     torch::Tensor x, torch::Tensor blob, torch::Tensor out1, torch::Tensor out2,
     int64_t N1, int64_t N2, int64_t K, int64_t base_exp);
 int64_t bf16_rans_base(torch::Tensor blob);
-torch::Tensor int3_pack(torch::Tensor W, bool mse_opt = true);
+torch::Tensor int3_pack(torch::Tensor W, bool mse_opt = true, bool sym = false, bool h64 = false);
 torch::Tensor int3_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
-torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true);
+torch::Tensor int3_pack_swiglu(torch::Tensor W, bool mse_opt = true, bool sym = false, bool h64 = false);
 torch::Tensor int3_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K);
+torch::Tensor vq4d_pack(torch::Tensor W, int64_t bits = 10);
+torch::Tensor vq4d_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K);
+torch::Tensor vq4d_pack_swiglu(torch::Tensor W, int64_t bits = 10);
+torch::Tensor vq4d_gemm_swiglu(torch::Tensor A, torch::Tensor W_packed, int64_t I, int64_t K);
 torch::Tensor int4_pack(torch::Tensor W, bool mse_opt = true);
 torch::Tensor int4_gemm(torch::Tensor A, torch::Tensor W_packed, int64_t N, int64_t K, bool query_streamk = false);
 torch::Tensor int4_pack_swiglu(torch::Tensor W, bool mse_opt = true);
@@ -322,10 +326,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rans_gemm_dual", &bf16_rans_gemm_dual);
   m.def("rans_gemm_dual_out", &bf16_rans_gemm_dual_out);
   m.def("rans_base", &bf16_rans_base);
-  m.def("int3_pack", &int3_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
+  m.def("int3_pack", &int3_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true, pybind11::arg("sym") = false, pybind11::arg("h64") = false);
   m.def("int3_gemm", &int3_gemm);
-  m.def("int3_pack_swiglu", &int3_pack_swiglu, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
+  m.def("int3_pack_swiglu", &int3_pack_swiglu, pybind11::arg("W"), pybind11::arg("mse_opt") = true, pybind11::arg("sym") = false, pybind11::arg("h64") = false);
   m.def("int3_gemm_swiglu", &int3_gemm_swiglu);
+  m.def("vq4d_pack", &vq4d_pack, pybind11::arg("W"), pybind11::arg("bits") = 10);
+  m.def("vq4d_gemm", &vq4d_gemm);
+  m.def("vq4d_pack_swiglu", &vq4d_pack_swiglu, pybind11::arg("W"), pybind11::arg("bits") = 10);
+  m.def("vq4d_gemm_swiglu", &vq4d_gemm_swiglu);
   m.def("int4_pack", &int4_pack, pybind11::arg("W"), pybind11::arg("mse_opt") = true);
   m.def("int4_gemm", &int4_gemm, pybind11::arg("A"), pybind11::arg("W_packed"),
         pybind11::arg("N"), pybind11::arg("K"), pybind11::arg("query_streamk") = false);

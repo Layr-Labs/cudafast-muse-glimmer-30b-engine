@@ -84,6 +84,91 @@ def _int3_swiglu_enabled() -> bool:
     return os.environ.get("MUSE_DRAFT_INT3_SWIGLU", "1") != "0"
 
 
+def _int3_sym_mode() -> int:
+    """0=asym 3.50 bpw, 1=all 10 MLPs sym UE4M4 3.125 bpw (default), 2=down_proj only, 3=H64+sym 3.125 bpw."""
+    raw = os.environ.get("MUSE_INT3_SYM", "0").strip().lower()
+    if raw in ("0", "off", "false", "none"):
+        return 0
+    if raw in ("2", "down", "down_proj"):
+        return 2
+    if raw in ("3", "h64", "h64nf3"):
+        return 3
+    return 1
+
+
+def _vq4d_mode() -> int:
+    """H64 + 4D-AntiVQ / H64+NF3-sym drafter MLP mode (MUSE_DRAFT_VQ2375):
+      0 = off (use MUSE_INT3_SYM)
+      1 = all 10 MLPs 2.375 bpw (4D-256, 9b/4w, 581 MB)
+      2 = 5x down_proj 2.375 bpw (4D-256), gate_up unchanged
+      3 = all 10 MLPs 2.625 bpw (4D-512, 10b/4w, 642 MB, >=13.4dB) [default]
+      4 = hybrid: 5x gate_up 2.625 bpw (4D-512) + 5x down_proj 2.375 bpw (4D-256) (612 MB)
+      5 = 5x down_proj 2.625 bpw (4D-512), gate_up unchanged
+      6 = all 10 MLPs H64 + NF3-sym 3.125 bpw (762.5 MB, ~15.5dB)
+      7 = hybrid: 5x gate_up H64 + NF3-sym 3.125 bpw (~15.5dB) + 5x down_proj 2.375 bpw (4D-256) (672 MB)
+      8 = hybrid: 5x gate_up H64 + NF3-sym 3.125 bpw (~15.5dB) + 5x down_proj 2.625 bpw (4D-512) (702 MB)
+    """
+    raw = os.environ.get("MUSE_DRAFT_VQ2375", "8").strip().lower()
+    if raw in ("", "0", "off", "false", "none"):
+        return 0
+    if raw in ("1", "all9", "2375"):
+        return 1
+    if raw in ("2", "down", "down9", "down_proj"):
+        return 2
+    if raw in ("3", "all10", "2625"):
+        return 3
+    if raw in ("4", "hybrid"):
+        return 4
+    if raw in ("5", "down10"):
+        return 5
+    if raw in ("6", "h64nf3"):
+        return 6
+    if raw in ("7", "h64nf3_vq9"):
+        return 7
+    if raw in ("8", "h64nf3_vq10"):
+        return 8
+    if raw in ("10", "h64gu"):
+        return 10
+    try:
+        v = int(raw)
+        return v if v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 10) else 0
+    except ValueError:
+        return 0
+
+
+def _vq4d_bits_for_swiglu() -> int:
+    m = _vq4d_mode()
+    if m == 1:
+        return 9
+    if m in (3, 4):
+        return 10
+    return 0
+
+
+def _vq4d_bits_for_linear(leaf: str) -> int:
+    m = _vq4d_mode()
+    if m == 1:
+        return 9
+    if m == 3:
+        return 10
+    if leaf == "down_proj":
+        if m in (2, 4, 7):
+            return 9
+        if m in (5, 8):
+            return 10
+    return 0
+
+
+def _int3_h64_for_swiglu() -> bool:
+    m = _vq4d_mode()
+    return (m in (6, 7, 8, 10)) or (m == 0 and _int3_sym_mode() == 3)
+
+
+def _int3_h64_for_linear() -> bool:
+    m = _vq4d_mode()
+    return (m == 6) or (m == 0 and _int3_sym_mode() == 3)
+
+
 def _free_bf16_enabled() -> bool:
     return os.environ.get("MUSE_DRAFT_FREE_BF16", "1") != "0"
 
@@ -531,6 +616,8 @@ def _try_nvfp4_tma4_buffers(w: torch.Tensor, metrics: dict[str, float] | None = 
 def _try_int3_buffer(
     w: torch.Tensor,
     metrics: dict[str, float] | None = None,
+    sym: bool = False,
+    h64: bool = False,
 ) -> torch.Tensor | None:
     import muse_bfx_ext as _bfx
 
@@ -542,9 +629,15 @@ def _try_int3_buffer(
     w_c = w.contiguous()
     mse_opt = _int3_mse_enabled()
     try:
-        blob = _bfx.int3_pack(w_c, mse_opt)
+        blob = _bfx.int3_pack(w_c, mse_opt, sym, h64)
     except TypeError:
-        blob = _bfx.int3_pack(w_c)
+        try:
+            blob = _bfx.int3_pack(w_c, mse_opt, sym)
+        except TypeError:
+            try:
+                blob = _bfx.int3_pack(w_c, mse_opt)
+            except TypeError:
+                blob = _bfx.int3_pack(w_c)
     gen = torch.Generator(device=w.device)
     gen.manual_seed(3037 + n + 17 * k)
     for m in (1, 7, 8, 16):
@@ -556,7 +649,7 @@ def _try_int3_buffer(
         got_f = got.float()
         cos = F.cosine_similarity(got_f.flatten(), dense.flatten(), dim=0).item()
         if not cos >= 0.96:
-            logger.warning("muse_draft_int3: low cosine %.5f on (%d,%d) M=%d", cos, n, k, m)
+            logger.warning("muse_draft_int3: low cosine %.5f on (%d,%d) M=%d (sym=%d h64=%d)", cos, n, k, m, int(sym), int(h64))
             return None
         if m == 7 and metrics is not None:
             metrics["cos"] = cos
@@ -568,6 +661,8 @@ def _try_int3_buffer(
 def _try_int3_swiglu_buffer(
     w: torch.Tensor,
     metrics: dict[str, float] | None = None,
+    sym: bool = False,
+    h64: bool = False,
 ) -> torch.Tensor | None:
     import muse_bfx_ext as _bfx
 
@@ -582,9 +677,15 @@ def _try_int3_swiglu_buffer(
     w_up = w_c[inter:]
     mse_opt = _int3_mse_enabled()
     try:
-        blob = _bfx.int3_pack_swiglu(w_c, mse_opt)
+        blob = _bfx.int3_pack_swiglu(w_c, mse_opt, sym, h64)
     except TypeError:
-        blob = _bfx.int3_pack_swiglu(w_c)
+        try:
+            blob = _bfx.int3_pack_swiglu(w_c, mse_opt, sym)
+        except TypeError:
+            try:
+                blob = _bfx.int3_pack_swiglu(w_c, mse_opt)
+            except TypeError:
+                blob = _bfx.int3_pack_swiglu(w_c)
     gen = torch.Generator(device=w.device)
     gen.manual_seed(3571 + n2 + 23 * k)
     for m in (1, 7, 8, 16):
@@ -600,8 +701,88 @@ def _try_int3_swiglu_buffer(
         snr = _snr_db(dense, got_f)
         if not (cos >= 0.965 and snr >= 11.5):
             logger.warning(
-                "muse_draft_int3_swiglu: quality check failed on (%d,%d) M=%d (SNR=%.2fdB cos=%.5f)",
-                n2, k, m, snr, cos,
+                "muse_draft_int3_swiglu: quality check failed on (%d,%d) M=%d (sym=%d h64=%d, SNR=%.2fdB cos=%.5f)",
+                n2, k, m, int(sym), int(h64), snr, cos,
+            )
+            return None
+        if m == 7 and metrics is not None:
+            metrics["cos"] = cos
+            metrics["snr_db"] = snr
+    torch.cuda.synchronize(w.device)
+    return blob
+
+
+def _try_vq4d_buffer(
+    w: torch.Tensor,
+    bits: int,
+    metrics: dict[str, float] | None = None,
+) -> torch.Tensor | None:
+    import muse_bfx_ext as _bfx
+
+    if not hasattr(_bfx, "vq4d_pack") or not hasattr(_bfx, "vq4d_gemm"):
+        return None
+    n, k = w.shape
+    if n % 64 != 0 or k % 64 != 0 or bits not in (9, 10):
+        return None
+    w_c = w.contiguous()
+    blob = _bfx.vq4d_pack(w_c, bits)
+    min_cos = 0.955 if bits == 9 else 0.96
+    gen = torch.Generator(device=w.device)
+    gen.manual_seed(3037 + n + 17 * k)
+    for m in (1, 7, 8, 16):
+        x = (torch.randn((m, k), generator=gen, device=w.device) * 0.5).to(w.dtype)
+        got = _bfx.int3_gemm(x, blob, n, k)
+        if got.shape != (m, n) or not bool(torch.isfinite(got).all()):
+            return None
+        dense = F.linear(x, w_c).float()
+        got_f = got.float()
+        cos = F.cosine_similarity(got_f.flatten(), dense.flatten(), dim=0).item()
+        if not cos >= min_cos:
+            logger.warning("muse_draft_vq4d: low cosine %.5f on (%d,%d) M=%d (bits=%d)", cos, n, k, m, bits)
+            return None
+        if m == 7 and metrics is not None:
+            metrics["cos"] = cos
+            metrics["snr_db"] = _snr_db(dense, got_f)
+    torch.cuda.synchronize(w.device)
+    return blob
+
+
+def _try_vq4d_swiglu_buffer(
+    w: torch.Tensor,
+    bits: int,
+    metrics: dict[str, float] | None = None,
+) -> torch.Tensor | None:
+    import muse_bfx_ext as _bfx
+
+    if not hasattr(_bfx, "vq4d_pack_swiglu") or not hasattr(_bfx, "vq4d_gemm_swiglu"):
+        return None
+    n2, k = w.shape
+    if n2 % 64 != 0 or k % 64 != 0 or bits not in (9, 10):
+        return None
+    inter = n2 // 2
+    w_c = w.contiguous()
+    w_gate = w_c[:inter]
+    w_up = w_c[inter:]
+    blob = _bfx.vq4d_pack_swiglu(w_c, bits)
+    min_cos = 0.955 if bits == 9 else 0.965
+    min_snr = 10.5 if bits == 9 else 11.5
+    gen = torch.Generator(device=w.device)
+    gen.manual_seed(3571 + n2 + 23 * k)
+    for m in (1, 7, 8, 16):
+        x = (torch.randn((m, k), generator=gen, device=w.device) * 0.5).to(w.dtype)
+        got = _bfx.int3_gemm_swiglu(x, blob, inter, k)
+        if got.shape != (m, inter) or not bool(torch.isfinite(got).all()):
+            return None
+        dg = F.linear(x, w_gate).float()
+        du = F.linear(x, w_up).float()
+        dense = F.silu(dg) * du
+        got_f = got.float()
+        cos = F.cosine_similarity(got_f.flatten(), dense.flatten(), dim=0).item()
+        snr = _snr_db(dense, got_f)
+        if not (cos >= min_cos and snr >= min_snr):
+            logger.warning(
+                "muse_draft_vq4d_swiglu: quality check failed on (%d,%d) M=%d (bits=%d, SNR=%.2fdB cos=%.5f)",
+                n2, k, m, bits, snr, cos,
             )
             return None
         if m == 7 and metrics is not None:
@@ -1144,9 +1325,31 @@ def attach_mlp_swiglu(mlp: torch.nn.Module, name: str = "", mode: str = "int3") 
     inter = n2 // 2
     label = name or f"mlp_swiglu_{n2}x{k}"
     use_i4 = (mode == "int4")
+    vq_bits = 0 if use_i4 else _vq4d_bits_for_swiglu()
+    use_h64 = (not use_i4) and _int3_h64_for_swiglu()
+    use_sym = (not use_i4) and (use_h64 or (_int3_sym_mode() in (1, 3)))
     try:
         m: dict[str, float] = {}
-        blob = _try_int4_swiglu_buffer(w.data, metrics=m) if use_i4 else _try_int3_swiglu_buffer(w.data, metrics=m)
+        blob = None
+        used_vq = 0
+        if use_i4:
+            blob = _try_int4_swiglu_buffer(w.data, metrics=m)
+        else:
+            if vq_bits in (9, 10):
+                blob = _try_vq4d_swiglu_buffer(w.data, bits=vq_bits, metrics=m)
+                if blob is not None:
+                    used_vq = vq_bits
+            if blob is None:
+                m = {}
+                blob = _try_int3_swiglu_buffer(w.data, metrics=m, sym=use_sym, h64=use_h64)
+                if blob is None and use_h64:
+                    m = {}
+                    use_h64 = False
+                    blob = _try_int3_swiglu_buffer(w.data, metrics=m, sym=use_sym, h64=False)
+                if blob is None and use_sym:
+                    m = {}
+                    blob = _try_int3_swiglu_buffer(w.data, metrics=m, sym=False, h64=False)
+                    use_sym = False
         if blob is None:
             return False
         mlp.register_buffer("_mi3_swiglu_blob", blob, persistent=False)
@@ -1162,7 +1365,17 @@ def attach_mlp_swiglu(mlp: torch.nn.Module, name: str = "", mode: str = "int3") 
         _stats["bytes_bf16"] += n2 * k * 2
         _stats["bytes_quant"] += qbytes
         if "snr_db" in m:
-            _layer_metrics.append((label, "i4swg" if use_i4 else "i3swg", (n2, k), m["snr_db"], m["cos"], qbytes))
+            if use_i4:
+                tag = "i4swg"
+            elif used_vq == 9:
+                tag = "vq9swg"
+            elif used_vq == 10:
+                tag = "vq10swg"
+            elif use_h64:
+                tag = "h64i3swg"
+            else:
+                tag = "i3swg_sym" if use_sym else "i3swg"
+            _layer_metrics.append((label, tag, (n2, k), m["snr_db"], m["cos"], qbytes))
         _free_query_only_bf16(gate_up, "gate_up_proj")
         return True
     except Exception as e:  # noqa: BLE001
@@ -1221,7 +1434,27 @@ def attach_linear(layer: torch.nn.Module, mode: str = "int3", name: str = "", le
     if mode == "int3":
         try:
             m = {}
-            blob = _try_int3_buffer(w.data, metrics=m)
+            vq_bits = _vq4d_bits_for_linear(leaf)
+            use_h64 = _int3_h64_for_linear()
+            sym_m = _int3_sym_mode()
+            use_sym = use_h64 or (sym_m in (1, 3)) or (sym_m == 2 and leaf == "down_proj")
+            blob = None
+            used_vq = 0
+            if vq_bits in (9, 10):
+                blob = _try_vq4d_buffer(w.data, bits=vq_bits, metrics=m)
+                if blob is not None:
+                    used_vq = vq_bits
+            if blob is None:
+                m = {}
+                blob = _try_int3_buffer(w.data, metrics=m, sym=use_sym, h64=use_h64)
+                if blob is None and use_h64:
+                    m = {}
+                    use_h64 = False
+                    blob = _try_int3_buffer(w.data, metrics=m, sym=use_sym, h64=False)
+                if blob is None and use_sym:
+                    m = {}
+                    blob = _try_int3_buffer(w.data, metrics=m, sym=False, h64=False)
+                    use_sym = False
             if blob is not None:
                 layer.register_buffer("_mi3_blob", blob, persistent=False)
                 layer._mi3 = (n, k)
@@ -1231,7 +1464,15 @@ def attach_linear(layer: torch.nn.Module, mode: str = "int3", name: str = "", le
                 _stats["bytes_bf16"] += n * k * 2
                 _stats["bytes_quant"] += qbytes
                 if "snr_db" in m:
-                    _layer_metrics.append((label, "int3", (n, k), m["snr_db"], m["cos"], qbytes))
+                    if used_vq == 9:
+                        tag = "vq9"
+                    elif used_vq == 10:
+                        tag = "vq10"
+                    elif use_h64:
+                        tag = "h64i3"
+                    else:
+                        tag = "i3sym" if use_sym else "int3"
+                    _layer_metrics.append((label, tag, (n, k), m["snr_db"], m["cos"], qbytes))
                 _free_query_only_bf16(layer, leaf)
                 return True
         except Exception as e:  # noqa: BLE001
@@ -1966,10 +2207,12 @@ def attach_drafter(model: torch.nn.Module) -> int:
                     lcos,
                 )
     logger.info(
-        "muse_draft_quant (%s, nf4=%s, nf3=%d, i3_mse=%d, i4_mse=%d, aux5=%d, qsk=%d, pack=%.2fs): %d INT4-g64 + %d INT4-SwiGLU + %d INT3-SwiGLU + %d INT3-g64 + %d NVFP4-TMA4 + %d FP8-Marlin drafter linears (%d rejected), %.2f GB -> %.2f GB per step (freed %.2f GB dead BF16)%s",
+        "muse_draft_quant (%s, nf4=%s, nf3=%d, i3_sym=%d, vq4d=%d, i3_mse=%d, i4_mse=%d, aux5=%d, qsk=%d, pack=%.2fs): %d INT4-g64 + %d INT4-SwiGLU + %d INT3-SwiGLU + %d INT3-g64 + %d NVFP4-TMA4 + %d FP8-Marlin drafter linears (%d rejected), %.2f GB -> %.2f GB per step (freed %.2f GB dead BF16)%s",
         mode,
         os.environ.get("MUSE_INT4_NF4", "0"),
         int(os.environ.get("MUSE_INT3_NF3", "1") != "0"),
+        _int3_sym_mode(),
+        _vq4d_mode(),
         int(_int3_mse_enabled()),
         int(_int4_mse_enabled()),
         int(aux5_admitted),

@@ -79,6 +79,19 @@ __device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* map, int 
       "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
       ::"r"(dst), "l"(map), "r"(x), "r"(y), "r"(bar) : "memory");
 }
+template <bool kPolEf>
+__device__ __forceinline__ void tma2d_b(uint32_t dst, const CUtensorMap* map, int x, int y, uint32_t bar,
+                                        uint64_t pol_ef) {
+  if constexpr (kPolEf) tma2d_hint(dst, map, x, y, bar, pol_ef);
+  else                  tma2d(dst, map, x, y, bar);
+}
+__device__ __forceinline__ void prewarm_tlb_2m(const uint8_t* ptr, size_t nbytes, int tid, int nthreads) {
+  if (ptr == nullptr) return;
+  constexpr size_t kStep = 2048u << 10;
+  for (size_t off = static_cast<size_t>(tid) * kStep; off < nbytes; off += static_cast<size_t>(nthreads) * kStep) {
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(ptr + off));
+  }
+}
 __device__ __forceinline__ void ldsm4(uint32_t a, uint32_t (&r)[4]) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
@@ -124,6 +137,8 @@ struct Params {
   const float* sa;
   const float* sb;
   __nv_bfloat16* out;
+  const uint8_t* b_raw = nullptr;
+  size_t b_bytes = 0;
 };
 
 struct ParamsDual {
@@ -141,11 +156,17 @@ struct ParamsDualA {
   const float* sb1;
   __nv_bfloat16* out0;
   __nv_bfloat16* out1;
+  const uint8_t* b0_raw = nullptr;
+  size_t b0_bytes = 0;
+  const uint8_t* b1_raw = nullptr;
+  size_t b1_bytes = 0;
 };
 
 struct ParamsBf16Dual {
   __nv_bfloat16* out0;
   __nv_bfloat16* out1;
+  const uint8_t* b_raw = nullptr;
+  size_t b_bytes = 0;
 };
 
 template <int N0, int N1, int K>
@@ -1281,7 +1302,7 @@ gemm_bf16_dual_seamless(const __grid_constant__ CUtensorMap tmA,
 // =================================================================================================
 constexpr int NT_WS = (NWARP + 1) * 32;  // 288 threads: warps 0..7 MMA consumers, warp 8 TMA producer
 
-template <int K, bool kPdl = false>
+template <int K, bool kPdl = false, bool kPolEf = false>
 __global__ void __launch_bounds__(NT_WS, 1)
 gemm_hybrid_6656_st3(const __grid_constant__ CUtensorMap tmA128,
                      const __grid_constant__ CUtensorMap tmB128,
@@ -1292,6 +1313,7 @@ gemm_hybrid_6656_st3(const __grid_constant__ CUtensorMap tmA128,
   extern __shared__ uint8_t sm_raw[];
   __shared__ __align__(8) unsigned long long bars[2 * ST];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
+  if (b == 0) prewarm_tlb_2m(p.b_raw, p.b_bytes, tid, NT_WS);
   const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
   const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST;
 
@@ -1324,7 +1346,7 @@ gemm_hybrid_6656_st3(const __grid_constant__ CUtensorMap tmA128,
         for (int ps = 0; ps < ST; ++ps) {
           const uint32_t bar = full0 + 8 * ps, dst = sbase + ps * STB;
           mbar_expect_tx_only(bar, WSZ);
-          tma2d_hint(dst + ASZ, &tmB128, ps * KT, col0_0, bar, pol_ef);
+          tma2d_b<kPolEf>(dst + ASZ, &tmB128, ps * KT, col0_0, bar, pol_ef);
         }
         pdl_wait();
       }
@@ -1348,7 +1370,7 @@ gemm_hybrid_6656_st3(const __grid_constant__ CUtensorMap tmA128,
           }
           mbar_expect_tx(bar, STB);
           tma2d_hint(dst, &tmA128, kt * KT, row0, bar, pol_el);
-          tma2d_hint(dst + ASZ, &tmB128, kt * KT, col0, bar, pol_ef);
+          tma2d_b<kPolEf>(dst + ASZ, &tmB128, kt * KT, col0, bar, pol_ef);
           ++g;
           if (++s == ST) { s = 0; par ^= 1; }
         }
@@ -1427,7 +1449,7 @@ gemm_hybrid_6656_st3(const __grid_constant__ CUtensorMap tmA128,
   }
 }
 
-template <bool kPdl = false>
+template <bool kPdl = false, bool kPolEf = false>
 __global__ void __launch_bounds__(NT_WS, 1)
 gemm_dual_a_st3(const __grid_constant__ CUtensorMap tmA0,
                 const __grid_constant__ CUtensorMap tmA1,
@@ -1441,6 +1463,10 @@ gemm_dual_a_st3(const __grid_constant__ CUtensorMap tmA0,
   extern __shared__ uint8_t sm_raw[];
   __shared__ __align__(8) unsigned long long bars[2 * ST];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
+  if (b == 0) {
+    prewarm_tlb_2m(p.b0_raw, p.b0_bytes, tid, NT_WS);
+    prewarm_tlb_2m(p.b1_raw, p.b1_bytes, tid, NT_WS);
+  }
   const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
   const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST;
 
@@ -1475,7 +1501,7 @@ gemm_dual_a_st3(const __grid_constant__ CUtensorMap tmA0,
         for (int ps = 0; ps < ST; ++ps) {
           const uint32_t bar = full0 + 8 * ps, dst = sbase + ps * STB;
           mbar_expect_tx_only(bar, WSZ);
-          tma2d_hint(dst + ASZ, &tmB0, ps * KT, col0_0, bar, pol_ef);
+          tma2d_b<kPolEf>(dst + ASZ, &tmB0, ps * KT, col0_0, bar, pol_ef);
         }
         pdl_wait();
       }
@@ -1503,7 +1529,7 @@ gemm_dual_a_st3(const __grid_constant__ CUtensorMap tmA0,
           }
           mbar_expect_tx(bar, STB);
           tma2d_hint(dst, mapA, kt * KT, row0, bar, pol_el);
-          tma2d_hint(dst + ASZ, mapB, kt * KT, col0, bar, pol_ef);
+          tma2d_b<kPolEf>(dst + ASZ, mapB, kt * KT, col0, bar, pol_ef);
           ++g;
           if (++s == ST) { s = 0; par ^= 1; }
         }
@@ -1515,7 +1541,7 @@ gemm_dual_a_st3(const __grid_constant__ CUtensorMap tmA0,
         const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB;
         mbar_expect_tx(bar, tx2);
         tma2d_hint(dst, &tmA1, kt * KT, row0_2, bar, pol_el);
-        tma2d_hint(dst + ASZ, mapB2, kt * KT, col0_2, bar, pol_ef);
+        tma2d_b<kPolEf>(dst + ASZ, mapB2, kt * KT, col0_2, bar, pol_ef);
         if (++s == ST) { s = 0; par ^= 1; }
       }
     }
@@ -1591,7 +1617,7 @@ static bool g_st3_bf16 = []() {
   return !env || !*env || std::strtol(env, nullptr, 10) != 0;
 }();
 
-template <bool kPdl = false>
+template <bool kPdl = false, bool kPolEf = false>
 __global__ void __launch_bounds__(NT_WS, 1)
 gemm_bf16_dual_st3(const __grid_constant__ CUtensorMap tmA,
                    const __grid_constant__ CUtensorMap tmB_128,
@@ -1603,6 +1629,7 @@ gemm_bf16_dual_st3(const __grid_constant__ CUtensorMap tmA,
   extern __shared__ uint8_t sm_raw[];
   __shared__ __align__(8) unsigned long long bars[2 * ST];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
+  if (b == 0) prewarm_tlb_2m(p.b_raw, p.b_bytes, tid, NT_WS);
   const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
   const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST;
 
@@ -1636,7 +1663,7 @@ gemm_bf16_dual_st3(const __grid_constant__ CUtensorMap tmA,
         for (int ps = 0; ps < ST; ++ps) {
           const uint32_t bar = full0 + 8 * ps, dst = sbase + ps * STB;
           mbar_expect_tx_only(bar, WSZ);
-          tma2d_hint(dst + ASZ, &tmB_128, ps * KT, wrow0_0, bar, pol_ef);
+          tma2d_b<kPolEf>(dst + ASZ, &tmB_128, ps * KT, wrow0_0, bar, pol_ef);
         }
         pdl_wait();
       }
@@ -1661,7 +1688,7 @@ gemm_bf16_dual_st3(const __grid_constant__ CUtensorMap tmA,
           }
           mbar_expect_tx(bar, STB);
           tma2d_hint(dst, &tmA, kt * KT, row0, bar, pol_el);
-          tma2d_hint(dst + ASZ, &tmB_128, kt * KT, wrow0, bar, pol_ef);
+          tma2d_b<kPolEf>(dst + ASZ, &tmB_128, kt * KT, wrow0, bar, pol_ef);
           ++g;
           if (++s == ST) { s = 0; par ^= 1; }
         }
@@ -1673,7 +1700,7 @@ gemm_bf16_dual_st3(const __grid_constant__ CUtensorMap tmA,
         const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB;
         mbar_expect_tx(bar, tx2);
         tma2d_hint(dst, &tmA, kt * KT, row0_2, bar, pol_el);
-        tma2d_hint(dst + ASZ, mapB2, kt * KT, w_row0_2, bar, pol_ef);
+        tma2d_b<kPolEf>(dst + ASZ, mapB2, kt * KT, w_row0_2, bar, pol_ef);
         if (++s == ST) { s = 0; par ^= 1; }
       }
     }
@@ -1749,6 +1776,13 @@ static bool fp8ws_pdl_enabled() {
   static const bool env_on = []() {
     const char* env = std::getenv("FP8WS_PDL");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  return env_on;
+}
+static bool fp8ws_tmab_ef() {
+  static const bool env_on = []() {
+    const char* env = std::getenv("MUSE_FP8_TMAB_EF");
+    return env && *env && std::strtol(env, nullptr, 10) != 0;
   }();
   return env_on;
 }
@@ -1909,28 +1943,52 @@ extern "C" int fp8ws_init() {
     e = cudaFuncSetAttribute(gemm_bf16_dual_seamless<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   }
   if (e == cudaSuccess) {
-    e = cudaFuncSetAttribute(gemm_hybrid_6656_st3<4096, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+    e = cudaFuncSetAttribute(gemm_hybrid_6656_st3<4096, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   }
   if (e == cudaSuccess) {
-    e = cudaFuncSetAttribute(gemm_hybrid_6656_st3<4096, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+    e = cudaFuncSetAttribute(gemm_hybrid_6656_st3<4096, true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   }
   if (e == cudaSuccess) {
-    e = cudaFuncSetAttribute(gemm_hybrid_6656_st3<19968, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+    e = cudaFuncSetAttribute(gemm_hybrid_6656_st3<4096, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   }
   if (e == cudaSuccess) {
-    e = cudaFuncSetAttribute(gemm_hybrid_6656_st3<19968, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+    e = cudaFuncSetAttribute(gemm_hybrid_6656_st3<4096, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   }
   if (e == cudaSuccess) {
-    e = cudaFuncSetAttribute(gemm_dual_a_st3<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+    e = cudaFuncSetAttribute(gemm_hybrid_6656_st3<19968, true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   }
   if (e == cudaSuccess) {
-    e = cudaFuncSetAttribute(gemm_dual_a_st3<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+    e = cudaFuncSetAttribute(gemm_hybrid_6656_st3<19968, false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   }
   if (e == cudaSuccess) {
-    e = cudaFuncSetAttribute(gemm_bf16_dual_st3<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+    e = cudaFuncSetAttribute(gemm_hybrid_6656_st3<19968, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   }
   if (e == cudaSuccess) {
-    e = cudaFuncSetAttribute(gemm_bf16_dual_st3<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+    e = cudaFuncSetAttribute(gemm_hybrid_6656_st3<19968, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_dual_a_st3<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_dual_a_st3<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_dual_a_st3<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_dual_a_st3<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_bf16_dual_st3<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_bf16_dual_st3<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_bf16_dual_st3<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_bf16_dual_st3<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   }
   return (int)e;
 }
@@ -1941,7 +1999,7 @@ extern "C" int fp8ws_run(const void* a, const void* b, const void* sa, const voi
   if (m != M || !encode || num_sms <= 0) return (int)cudaErrorInvalidValue;
   if (((uintptr_t)a & 15) || ((uintptr_t)b & 15) || ((uintptr_t)c & 15)) return (int)cudaErrorInvalidValue;
   if (n == 6656 && (k == 4096 || k == 19968)) {
-    Params p{(const float*)sa, (const float*)sb, (__nv_bfloat16*)c};
+    Params p{(const float*)sa, (const float*)sb, (__nv_bfloat16*)c, (const uint8_t*)b, (size_t)n * (size_t)k};
     cudaStream_t st = (cudaStream_t)stream;
     if (num_sms == 48 && g_nsplit_6656) {
       if ((k == 4096 && g_st3_oproj) || (k == 19968 && g_st3_down)) {
@@ -1949,14 +2007,22 @@ extern "C" int fp8ws_run(const void* a, const void* b, const void* sa, const voi
         if (!encode_tma2d(&tmA128, a, k, M, 128)) return -3;
         if (!encode_tma2d(&tmB128, b, k, n, 128) || !encode_tma2d(&tmB48, b, k, n, 48) ||
             !encode_tma2d(&tmB32, b, k, n, 32)) return -4;
+        const bool ef = fp8ws_tmab_ef();
         if (fp8ws_pdl_enabled()) {
-          if (k == 19968) return (int)launch_ex_pdl(gemm_hybrid_6656_st3<19968, true>, 48, NT_WS, SMEM_MAX, st,
-                                                    tmA128, tmB128, tmB48, tmB32, p);
-          return (int)launch_ex_pdl(gemm_hybrid_6656_st3<4096, true>, 48, NT_WS, SMEM_MAX, st,
-                                    tmA128, tmB128, tmB48, tmB32, p);
+          if (k == 19968) {
+            return ef ? (int)launch_ex_pdl(gemm_hybrid_6656_st3<19968, true, true>, 48, NT_WS, SMEM_MAX, st, tmA128, tmB128, tmB48, tmB32, p)
+                      : (int)launch_ex_pdl(gemm_hybrid_6656_st3<19968, true, false>, 48, NT_WS, SMEM_MAX, st, tmA128, tmB128, tmB48, tmB32, p);
+          }
+          return ef ? (int)launch_ex_pdl(gemm_hybrid_6656_st3<4096, true, true>, 48, NT_WS, SMEM_MAX, st, tmA128, tmB128, tmB48, tmB32, p)
+                    : (int)launch_ex_pdl(gemm_hybrid_6656_st3<4096, true, false>, 48, NT_WS, SMEM_MAX, st, tmA128, tmB128, tmB48, tmB32, p);
         }
-        if (k == 19968) gemm_hybrid_6656_st3<19968, false><<<48, NT_WS, SMEM_MAX, st>>>(tmA128, tmB128, tmB48, tmB32, p);
-        else            gemm_hybrid_6656_st3<4096, false><<<48, NT_WS, SMEM_MAX, st>>>(tmA128, tmB128, tmB48, tmB32, p);
+        if (k == 19968) {
+          if (ef) gemm_hybrid_6656_st3<19968, false, true><<<48, NT_WS, SMEM_MAX, st>>>(tmA128, tmB128, tmB48, tmB32, p);
+          else    gemm_hybrid_6656_st3<19968, false, false><<<48, NT_WS, SMEM_MAX, st>>>(tmA128, tmB128, tmB48, tmB32, p);
+        } else {
+          if (ef) gemm_hybrid_6656_st3<4096, false, true><<<48, NT_WS, SMEM_MAX, st>>>(tmA128, tmB128, tmB48, tmB32, p);
+          else    gemm_hybrid_6656_st3<4096, false, false><<<48, NT_WS, SMEM_MAX, st>>>(tmA128, tmB128, tmB48, tmB32, p);
+        }
         return (int)cudaGetLastError();
       }
       CUtensorMap tmA256, tmA128, tmB128, tmB48, tmB32;
@@ -2020,7 +2086,8 @@ extern "C" int fp8ws_run_dual_a(const void* a0, const void* a1, const void* b0, 
       ((uintptr_t)c0 & 15) || ((uintptr_t)c1 & 15))
     return (int)cudaErrorInvalidValue;
   ParamsDualA p{(const float*)sa0, (const float*)sa1, (const float*)sb0, (const float*)sb1, (__nv_bfloat16*)c0,
-                (__nv_bfloat16*)c1};
+                (__nv_bfloat16*)c1, (const uint8_t*)b0, (size_t)n0 * (size_t)k, (const uint8_t*)b1,
+                (size_t)n1 * (size_t)k};
   if (num_sms == 48 && g_dual_seamless) {
     if (g_st3_dual) {
       CUtensorMap tmA0, tmA1, tmB0, tmB1_128, tmB1_96, tmB1_64;
@@ -2028,11 +2095,16 @@ extern "C" int fp8ws_run_dual_a(const void* a0, const void* a1, const void* b0, 
       if (!encode_tma2d(&tmB0, b0, k, n0, BN)) return -4;
       if (!encode_tma2d(&tmB1_128, b1, k, n1, 128) || !encode_tma2d(&tmB1_96, b1, k, n1, 96) ||
           !encode_tma2d(&tmB1_64, b1, k, n1, 64)) return -5;
+      const bool ef = fp8ws_tmab_ef();
       if (fp8ws_pdl_enabled()) {
-        return (int)launch_ex_pdl(gemm_dual_a_st3<true>, 48, NT_WS, SMEM_MAX, (cudaStream_t)stream,
-                                  tmA0, tmA1, tmB0, tmB1_128, tmB1_96, tmB1_64, p);
+        return ef ? (int)launch_ex_pdl(gemm_dual_a_st3<true, true>, 48, NT_WS, SMEM_MAX, (cudaStream_t)stream,
+                                       tmA0, tmA1, tmB0, tmB1_128, tmB1_96, tmB1_64, p)
+                  : (int)launch_ex_pdl(gemm_dual_a_st3<true, false>, 48, NT_WS, SMEM_MAX, (cudaStream_t)stream,
+                                       tmA0, tmA1, tmB0, tmB1_128, tmB1_96, tmB1_64, p);
       }
-      gemm_dual_a_st3<false><<<48, NT_WS, SMEM_MAX, (cudaStream_t)stream>>>(
+      if (ef) gemm_dual_a_st3<false, true><<<48, NT_WS, SMEM_MAX, (cudaStream_t)stream>>>(
+          tmA0, tmA1, tmB0, tmB1_128, tmB1_96, tmB1_64, p);
+      else    gemm_dual_a_st3<false, false><<<48, NT_WS, SMEM_MAX, (cudaStream_t)stream>>>(
           tmA0, tmA1, tmB0, tmB1_128, tmB1_96, tmB1_64, p);
       return (int)cudaGetLastError();
     }
@@ -2067,7 +2139,8 @@ extern "C" int bf16ws_run_dual_stacked(const void* a, const void* w_cat, void* c
     return (int)cudaErrorInvalidValue;
   if (((uintptr_t)a & 15) || ((uintptr_t)w_cat & 15) || ((uintptr_t)c0 & 15) || ((uintptr_t)c1 & 15))
     return (int)cudaErrorInvalidValue;
-  ParamsBf16Dual p{(__nv_bfloat16*)c0, (__nv_bfloat16*)c1};
+  ParamsBf16Dual p{(__nv_bfloat16*)c0, (__nv_bfloat16*)c1, (const uint8_t*)w_cat,
+                   (size_t)(n0 + n1) * (size_t)k * 2u};
   if (num_sms == 48 && g_bf16_seamless) {
     if (g_st3_bf16) {
       CUtensorMap tmA, tmB_128, tmB_96, tmB_64;
@@ -2075,11 +2148,15 @@ extern "C" int bf16ws_run_dual_stacked(const void* a, const void* w_cat, void* c
       if (!encode_tma2d(&tmB_128, w_cat, 2 * k, n0 + n1, 128) ||
           !encode_tma2d(&tmB_96, w_cat, 2 * k, n0 + n1, 96) ||
           !encode_tma2d(&tmB_64, w_cat, 2 * k, n0 + n1, 64)) return -4;
+      const bool ef = fp8ws_tmab_ef();
       if (fp8ws_pdl_enabled()) {
-        return (int)launch_ex_pdl(gemm_bf16_dual_st3<true>, 48, NT_WS, SMEM_MAX, (cudaStream_t)stream,
-                                  tmA, tmB_128, tmB_96, tmB_64, p);
+        return ef ? (int)launch_ex_pdl(gemm_bf16_dual_st3<true, true>, 48, NT_WS, SMEM_MAX, (cudaStream_t)stream,
+                                       tmA, tmB_128, tmB_96, tmB_64, p)
+                  : (int)launch_ex_pdl(gemm_bf16_dual_st3<true, false>, 48, NT_WS, SMEM_MAX, (cudaStream_t)stream,
+                                       tmA, tmB_128, tmB_96, tmB_64, p);
       }
-      gemm_bf16_dual_st3<false><<<48, NT_WS, SMEM_MAX, (cudaStream_t)stream>>>(tmA, tmB_128, tmB_96, tmB_64, p);
+      if (ef) gemm_bf16_dual_st3<false, true><<<48, NT_WS, SMEM_MAX, (cudaStream_t)stream>>>(tmA, tmB_128, tmB_96, tmB_64, p);
+      else    gemm_bf16_dual_st3<false, false><<<48, NT_WS, SMEM_MAX, (cudaStream_t)stream>>>(tmA, tmB_128, tmB_96, tmB_64, p);
       return (int)cudaGetLastError();
     }
     CUtensorMap tmA, tmB_128, tmB_112, tmB_96;
