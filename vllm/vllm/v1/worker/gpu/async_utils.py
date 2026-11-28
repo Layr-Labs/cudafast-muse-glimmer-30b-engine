@@ -142,34 +142,6 @@ class AsyncOutput(AsyncModelRunnerOutput):
         return self.model_runner_output
 
 
-class PreRecordedAsyncOutput(AsyncModelRunnerOutput):
-    """Zero-DMA UVA pinned host ring output for compound verify+draft CUDA graphs."""
-
-    def __init__(
-        self,
-        model_runner_output: ModelRunnerOutput,
-        host_row_np: np.ndarray,
-        copy_event: torch.cuda.Event,
-        forward_done: torch.cuda.Event | None = None,
-    ):
-        self.model_runner_output = model_runner_output
-        self.host_row_np = host_row_np
-        self.copy_event = copy_event
-        self.forward_done = forward_done if _TWO_STAGE_WAIT else None
-
-    def get_output(self) -> ModelRunnerOutput:
-        wait_for_output(self.copy_event, self.forward_done)
-        ns = int(self.host_row_np[7])
-        if ns < 0:
-            ns = 0
-        elif ns > 7:
-            ns = 7
-        self.model_runner_output.sampled_token_ids = [
-            self.host_row_np[:ns].tolist()
-        ]
-        return self.model_runner_output
-
-
 class AsyncPoolingOutput(AsyncModelRunnerOutput):
     def __init__(
         self,

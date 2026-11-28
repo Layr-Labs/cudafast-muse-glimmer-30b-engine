@@ -19,32 +19,6 @@ _lib2 = None
 _lib3 = None
 _fast = set()  # weight data pointers whose layer passed the comparison (128-row kernel)
 _fast3 = set()  # the subset that also passed it with the TMA-fed kernel
-_ilv_layers: dict[int, object] = {}  # layer.weight.data_ptr() -> layer (when interleaved 3-TMA kernel admitted)
-
-
-def _ilv_enabled() -> bool:
-    return os.environ.get("MARLINW_GATEUP_ILV", "1") != "0"
-
-
-def ensure_interleaved_buffers(layer):
-    """Build or reuse shared [g16 | u16] interleaved Marlin weight/scale buffers on `layer`."""
-    bufs = getattr(layer, "_buffers", None)
-    if bufs is not None and "paired_marlin_swiglu_weight" in bufs and "paired_marlin_swiglu_scale" in bufs:
-        return bufs["paired_marlin_swiglu_weight"], bufs["paired_marlin_swiglu_scale"]
-    w = layer.weight
-    s = layer.weight_scale
-    if (w.dtype != torch.int32 or tuple(w.shape) != (416, 79872) or not w.is_contiguous()
-            or s.dtype != torch.float8_e4m3fn or tuple(s.shape) != (416, 39936) or not s.is_contiguous()):
-        return None, None
-    k16 = w.shape[0]
-    w_ilv = w.view(k16, 2, 312, 32, 2, 2).permute(0, 2, 4, 3, 5, 1).contiguous().view(k16, 79872)
-    s_ilv = (
-        s.view(torch.uint8).view(k16, 2, 312, 8, 2, 2, 2)
-        .permute(0, 2, 4, 3, 6, 5, 1).contiguous().view(k16, 39936).view(s.dtype)
-    )
-    layer.register_buffer("paired_marlin_swiglu_weight", w_ilv, persistent=False)
-    layer.register_buffer("paired_marlin_swiglu_scale", s_ilv, persistent=False)
-    return w_ilv, s_ilv
 
 
 def _load(name):
@@ -56,10 +30,6 @@ def _load(name):
     lib.swiglu_prepare.restype = ctypes.c_int
     lib.swiglu_gemm.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int, ctypes.c_void_p]
     lib.swiglu_gemm.restype = ctypes.c_int
-    ilv = getattr(lib, "swiglu_gemm_ilv", None)
-    if ilv is not None:
-        ilv.argtypes = [ctypes.c_void_p] * 5 + [ctypes.c_int, ctypes.c_void_p]
-        ilv.restype = ctypes.c_int
     sp = getattr(lib, "marlinw_tma_set_pdl", None)
     if sp is not None:
         sp.argtypes = [ctypes.c_int]
@@ -82,17 +52,6 @@ def _run(lib, x, weight, scales, global_scale):
                                  torch.cuda.current_stream(x.device).cuda_stream)
     if status:
         raise RuntimeError(f"Paired SwiGLU launch returned CUDA status {status}")
-    return out
-
-
-def _run_ilv(lib, x, w_ilv, s_ilv, global_scale):
-    out = x.new_empty((512, 19968))
-    with torch.cuda.device(x.device):
-        status = lib.swiglu_gemm_ilv(x.data_ptr(), w_ilv.data_ptr(), s_ilv.data_ptr(),
-                                     global_scale.data_ptr(), out.data_ptr(), x.stride(0),
-                                     torch.cuda.current_stream(x.device).cuda_stream)
-    if status:
-        raise RuntimeError(f"Paired SwiGLU ilv launch returned CUDA status {status}")
     return out
 
 
@@ -131,31 +90,7 @@ def prepare(layer):
         _fast.add(layer.weight.data_ptr())
         if _lib3 is not None and _check(layer, _lib3):
             _fast3.add(layer.weight.data_ptr())
-            if _ilv_enabled() and hasattr(_lib3, "swiglu_gemm_ilv"):
-                w_ilv, s_ilv = ensure_interleaved_buffers(layer)
-                if w_ilv is not None and _check_ilv(layer, _lib3, w_ilv, s_ilv):
-                    _ilv_layers[layer.weight.data_ptr()] = layer
-                elif hasattr(layer, "_buffers"):
-                    layer._buffers.pop("paired_marlin_swiglu_weight", None)
-                    layer._buffers.pop("paired_marlin_swiglu_scale", None)
     return True
-
-
-def _check_ilv(layer, lib, w_ilv, s_ilv):
-    """Bitwise comparison of the interleaved 3-TMA 128-row kernel against the 64-row reference."""
-    try:
-        weight, scales, gs = layer.weight, layer.weight_scale, layer.weight_global_scale
-        gen = torch.Generator(device=weight.device)
-        gen.manual_seed(6656 * 31 + 39936)
-        for _ in range(2):
-            x = _check_input(gen, weight.device)
-            a = _run(_lib, x, weight, scales, gs)
-            b = _run_ilv(lib, x, w_ilv, s_ilv, gs)
-            if not torch.equal(a.view(torch.int16), b.view(torch.int16)):
-                return False
-        return True
-    except Exception:  # noqa: BLE001
-        return False
 
 
 def _check(layer, lib):
@@ -185,18 +120,9 @@ def uses_tma(weight) -> bool:
     return _lib3 is not None and weight.data_ptr() in _fast3
 
 
-def uses_ilv(weight) -> bool:
-    """True if this weight's layer passed the interleaved 3-TMA register-SwiGLU comparison."""
-    return _lib3 is not None and weight.data_ptr() in _ilv_layers
-
-
 def counts() -> tuple[int, int]:
     """Layers on the 128-row kernels: (cp.async-fed or TMA-fed, of which TMA-fed)."""
     return len(_fast), len(_fast3)
-
-
-def ilv_count() -> int:
-    return len(_ilv_layers)
 
 
 def choose_feed(layers, x, timer, margin=0.997):
@@ -245,13 +171,6 @@ def gemm_with(x, weight, scales, global_scale, fast: bool):
     return _run(lib, x, weight, scales, global_scale)
 
 
-def gemm_ilv(x, w_ilv, s_ilv, global_scale):
-    """Direct launch of the interleaved 3-TMA kernel (used by prefill weight placement)."""
-    if x.device not in _ready or _lib3 is None:
-        raise RuntimeError("Interleaved paired SwiGLU is not ready")
-    return _run_ilv(_lib3, x, w_ilv, s_ilv, global_scale)
-
-
 def moved(old_ptr: int, new_ptr: int) -> None:
     """A placed weight moved to another buffer with the same bytes: it keeps its kernel (Muse Glimmer)."""
     if old_ptr in _fast:
@@ -260,8 +179,6 @@ def moved(old_ptr: int, new_ptr: int) -> None:
     if old_ptr in _fast3:
         _fast3.discard(old_ptr)
         _fast3.add(new_ptr)
-    if old_ptr in _ilv_layers:
-        _ilv_layers[new_ptr] = _ilv_layers.pop(old_ptr)
     try:
         from . import swiglu_fp8
         swiglu_fp8.moved(old_ptr, new_ptr)
@@ -276,9 +193,5 @@ def gemm(x, weight, scales, global_scale):
     if x.device not in _ready:
         raise RuntimeError("Paired SwiGLU was called before layer preparation")
     ptr = weight.data_ptr()
-    layer = _ilv_layers.get(ptr)
-    if layer is not None and _lib3 is not None:
-        bufs = layer._buffers
-        return _run_ilv(_lib3, x, bufs["paired_marlin_swiglu_weight"], bufs["paired_marlin_swiglu_scale"], global_scale)
     lib = _lib3 if ptr in _fast3 else (_lib2 if ptr in _fast else _lib)
     return _run(lib, x, weight, scales, global_scale)

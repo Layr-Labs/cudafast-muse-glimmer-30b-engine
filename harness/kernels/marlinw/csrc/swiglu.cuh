@@ -46,7 +46,8 @@ __device__ __forceinline__ uint16_t swiglu_fp8_pair(uint32_t gates, uint32_t ups
         const auto up = reinterpret_cast<const __nv_bfloat16*>(&ups)[e];
         const float silu = __ldg(bf16_silu + __bfloat16_as_ushort(gate));
         const float product = __fmul_rn(silu, __bfloat162float(up));
-        scaled[e] = __fmul_rn(product, inverse);
+        const float q = __fmul_rn(product, inverse);
+        scaled[e] = q < -448.0f ? -448.0f : (q > 448.0f ? 448.0f : q);
       }
       uint16_t converted;
       asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(converted) : "f"(scaled[1]), "f"(scaled[0]));

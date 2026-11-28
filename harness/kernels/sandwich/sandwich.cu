@@ -1,5 +1,4 @@
 #include <cuda_runtime.h>
-#include <cstdint>
 #include <cstdlib>
 
 namespace {
@@ -11,15 +10,13 @@ constexpr int Tiles = (Vectors + Threads - 1) / Threads;
 static bool g_prefill_cs = true;
 static int g_sandwich_pdl_override = -1;
 
-static int sandwich_pdl_mode() {
-    if (g_sandwich_pdl_override >= 0) return g_sandwich_pdl_override;
-    static const int env_mode = []() -> int {
+static bool sandwich_pdl_enabled() {
+    if (g_sandwich_pdl_override >= 0) return g_sandwich_pdl_override != 0;
+    static const bool env_on = []() {
         const char* env = std::getenv("MUSE_SANDWICH_PDL");
-        if (!env || !*env) return 2;  // 0=off, 1=legacy full (h1_pre+wait), 2=producer-only default
-        long v = std::strtol(env, nullptr, 10);
-        return (v == 0 || v == 1 || v == 2) ? static_cast<int>(v) : 2;
+        return !env || !*env || std::strtol(env, nullptr, 10) != 0;
     }();
-    return env_mode;
+    return env_on;
 }
 
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
@@ -93,11 +90,11 @@ __device__ float apply_norm(float value, float inverse, float weight) {
     return __fmul_rn(__fmul_rn(value, inverse), __fadd_rn(weight, 1.f));
 }
 
-__device__ __forceinline__ float bounded_fp8(float value, float scale_inv) {
-    const float scaled = __fmul_rn(value, scale_inv);
-    float r;
-    asm("min.NaN.f32 %0, %1, %1;" : "=f"(r) : "f"(scaled));
-    return r;
+__device__ float bounded_fp8(float value, float scale_inv) {
+    float scaled = __fmul_rn(value, scale_inv);
+    if (scaled < -448.f) scaled = -448.f;
+    if (scaled > 448.f) scaled = 448.f;
+    return scaled;
 }
 
 __device__ unsigned pack_fp8(const float (&values)[4], float scale_inv) {
@@ -115,59 +112,6 @@ __device__ __forceinline__ uint2 load2_cs(const uint2* address) {
     uint2 r;
     asm("ld.global.cs.v2.u32 {%0, %1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(address));
     return r;
-}
-
-__device__ __forceinline__ uint4 load4_cs(const uint4* address) {
-    uint4 r;
-    asm("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
-        : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(address));
-    return r;
-}
-
-__device__ __forceinline__ void discard_l2_128(const void* ptr) {
-    asm volatile("discard.global.L2 [%0], 128;" :: "l"(ptr) : "memory");
-}
-
-// Direct 8B/4B coalesced load/store (0-ULP identical per-thread layout; eliminates even/odd lane
-// divergence and __shfl_xor_sync overhead on SM121, matching norm_glue.cu) + hoisted evict_last policy.
-__device__ __forceinline__ unsigned long long make_policy_evict_last() {
-    unsigned long long policy;
-    asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
-    return policy;
-}
-
-template <bool kCs>
-__device__ __forceinline__ uint2 ld2_v4(const uint2* row_base, unsigned offset) {
-    return kCs ? load2_cs(row_base + offset) : row_base[offset];
-}
-
-__device__ __forceinline__ uint2 ldg2_v4(const uint2* base, unsigned offset) {
-    return __ldg(base + offset);
-}
-
-__device__ __forceinline__ void st2_v4(uint2* row_base, unsigned offset, uint2 val) {
-    row_base[offset] = val;
-}
-
-__device__ __forceinline__ void st2_v4_cs(uint2* row_base, unsigned offset, uint2 val) {
-    asm volatile("st.global.cs.v2.u32 [%0], {%1, %2};"
-                 :: "l"(row_base + offset), "r"(val.x), "r"(val.y) : "memory");
-}
-
-__device__ __forceinline__ void st2_v4_evict_last(uint2* row_base, unsigned offset, uint2 val,
-                                                  unsigned long long policy) {
-    asm volatile("st.global.L2::cache_hint.v2.b32 [%0], {%1, %2}, %3;"
-                 :: "l"(row_base + offset), "r"(val.x), "r"(val.y), "l"(policy) : "memory");
-}
-
-__device__ __forceinline__ void st1_v2(unsigned* row_base, unsigned offset, unsigned val) {
-    row_base[offset] = val;
-}
-
-__device__ __forceinline__ void st1_v2_evict_last(unsigned* row_base, unsigned offset, unsigned val,
-                                                  unsigned long long policy) {
-    asm volatile("st.global.L2::cache_hint.b32 [%0], %1, %2;"
-                 :: "l"(row_base + offset), "r"(val), "l"(policy) : "memory");
 }
 
 // Gate (prefill3): also emit the FP8 input of the attention output-gate projection, i.e. what the compiled
@@ -369,251 +313,6 @@ __global__ __launch_bounds__(Threads) void sandwich(
     }
 }
 
-// High-bandwidth 16B uint4 coalesced M=512 prefill sandwich + inline discard.global.L2 on dead `down` (6.82 MB).
-// Strict 0-ULP identical FP32/BF16/FP8 arithmetic & reduction order to sandwich<...>.
-// Safe for tile 6 because active threads [0..127] are 4 full warps; requires 16B alignment on all row pointers
-// (and 128B alignment on `down` when DiscardDown is true; 6656*2 = 13312 = 104 * 128 B per row).
-template <bool Quantize, bool Gate, bool WriteHidden, bool GateEvictLast,
-          bool ResidualEvictLast, bool CsLoads, int PdlMode, bool DiscardDown, bool ResidualCs = false>
-__global__ __launch_bounds__(Threads) void sandwich_v4(
-    uint2* __restrict__ post_attn, const uint2* __restrict__ down, const uint2* __restrict__ residual,
-    const float* __restrict__ previous_sum, const uint2* __restrict__ post_attn_weight,
-    const uint2* __restrict__ post_ff_weight, const uint2* __restrict__ next_pre_attn_weight,
-    const float* __restrict__ scale, uint2* __restrict__ hidden, unsigned* __restrict__ quantized,
-    const float* __restrict__ gate_scale = nullptr, unsigned* __restrict__ gate_quantized = nullptr) {
-    __shared__ float warp_totals[8];
-    uint2 saved[Tiles];
-    const unsigned thread = threadIdx.x;
-    const size_t base = static_cast<size_t>(blockIdx.x) * Vectors;
-    uint2* const pa_row = post_attn + base;
-    const uint2* const dn_row = down + base;
-    const uint2* const rs_row = residual + base;
-    unsigned long long el_policy = 0ull;
-    if constexpr (ResidualEvictLast || GateEvictLast) {
-        el_policy = make_policy_evict_last();
-    }
-    float h1_pre[PdlMode == 1 ? Tiles : 1][4];
-    float scale_inv_pre = 1.f;
-    float gate_inv_pre = 1.f;
-    if constexpr (PdlMode == 1) {
-        const float prev_s_pre = __ldg(previous_sum + blockIdx.x);
-        const float attn_inv_pre = inverse_rms(prev_s_pre, 1.e-8f);
-        if constexpr (Quantize) scale_inv_pre = full_divide(1.f, __ldg(scale));
-        if constexpr (Gate) gate_inv_pre = full_divide(1.f, __ldg(gate_scale));
-        #pragma unroll
-        for (int tile = 0; tile < Tiles; ++tile) {
-            const unsigned offset = tile * Threads + thread;
-            if (offset < Vectors) {
-                const uint2 a = ld2_v4<CsLoads>(pa_row, offset);
-                const uint2 r = ld2_v4<CsLoads>(rs_row, offset);
-                const uint2 wa = ldg2_v4(post_attn_weight, offset);
-                #pragma unroll
-                for (int channel = 0; channel < 4; ++channel) {
-                    const float attention = apply_norm(bf16(a, channel), attn_inv_pre, bf16(wa, channel));
-                    h1_pre[tile][channel] = __fadd_rn(bf16(r, channel), attention);
-                }
-            }
-        }
-        pdl_wait();
-        pdl_launch_dependents();
-    }
-    float partial[4] = {};
-    #pragma unroll
-    for (int tile = 0; tile < Tiles; ++tile) {
-        const unsigned offset = tile * Threads + thread;
-        if (offset < Vectors) {
-            const uint2 values = ld2_v4<CsLoads>(dn_row, offset);
-            saved[tile] = values;
-            #pragma unroll
-            for (int channel = 0; channel < 4; ++channel) {
-                const float value = bf16(values, channel);
-                partial[channel] = __fmaf_rn(value, value, partial[channel]);
-            }
-        }
-    }
-    const float down_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-8f);
-    if constexpr (DiscardDown && PdlMode != 2) {
-        // reduce() already synchronized the CTA; all 104 cache lines (13312 B) of dn_row are now dead.
-        if (thread < 104u) {
-            discard_l2_128(reinterpret_cast<const char*>(dn_row) + (thread << 7));
-        }
-    }
-    float attn_inverse = 0.f;
-    if constexpr (PdlMode != 1) {
-        attn_inverse = inverse_rms(__ldg(previous_sum + blockIdx.x), 1.e-8f);
-    }
-    #pragma unroll
-    for (int channel = 0; channel < 4; ++channel) partial[channel] = 0.f;
-    #pragma unroll
-    for (int tile = 0; tile < Tiles; ++tile) {
-        const unsigned offset = tile * Threads + thread;
-        if (offset < Vectors) {
-            const uint2 d = saved[tile];
-            float values[4];
-            if constexpr (PdlMode == 1) {
-                const uint2 wd = ldg2_v4(post_ff_weight, offset);
-                #pragma unroll
-                for (int channel = 0; channel < 4; ++channel) {
-                    const float feed_forward = __fmul_rn(bf16(d, channel), down_inverse);
-                    const float value = __fmaf_rn(feed_forward, __fadd_rn(bf16(wd, channel), 1.f), h1_pre[tile][channel]);
-                    values[channel] = value;
-                    partial[channel] = __fmaf_rn(value, value, partial[channel]);
-                }
-            } else {
-                const uint2 a = ld2_v4<CsLoads>(pa_row, offset);
-                const uint2 r = ld2_v4<CsLoads>(rs_row, offset);
-                const uint2 wa = ldg2_v4(post_attn_weight, offset);
-                const uint2 wd = ldg2_v4(post_ff_weight, offset);
-                #pragma unroll
-                for (int channel = 0; channel < 4; ++channel) {
-                    const float attention = apply_norm(bf16(a, channel), attn_inverse, bf16(wa, channel));
-                    const float feed_forward = __fmul_rn(bf16(d, channel), down_inverse);
-                    const float attention_sum = __fadd_rn(bf16(r, channel), attention);
-                    const float value = __fmaf_rn(feed_forward, __fadd_rn(bf16(wd, channel), 1.f), attention_sum);
-                    values[channel] = value;
-                    partial[channel] = __fmaf_rn(value, value, partial[channel]);
-                }
-            }
-            const uint2 rounded = make_uint2(pack_bf16(values[0], values[1]),
-                                             pack_bf16(values[2], values[3]));
-            if constexpr (ResidualEvictLast) {
-                st2_v4_evict_last(pa_row, offset, rounded, el_policy);
-            } else if constexpr (ResidualCs) {
-                st2_v4_cs(pa_row, offset, rounded);
-            } else {
-                st2_v4(pa_row, offset, rounded);
-            }
-            saved[tile] = rounded;
-        }
-    }
-    const float input_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-5f);
-    if constexpr (PdlMode == 2) {
-        // Producer-only PDL: zero h1_pre reg/preload overhead, launched via standard <<<...>>>,
-        // signaling downstream qkv_proj to overlap TMA weight preloads with the final store epilogue.
-        pdl_launch_dependents();
-    }
-    const float scale_inv = (PdlMode == 1) ? scale_inv_pre
-                                : (Quantize ? full_divide(1.f, __ldg(scale)) : 1.f);
-    const float gate_inv = (PdlMode == 1) ? gate_inv_pre
-                               : (Gate ? full_divide(1.f, __ldg(gate_scale)) : 1.f);
-    uint2* const hid_row = WriteHidden ? (hidden + base) : nullptr;
-    unsigned* const q_row = Quantize ? (quantized + base) : nullptr;
-    unsigned* const g_row = Gate ? (gate_quantized + base) : nullptr;
-    #pragma unroll
-    for (int tile = 0; tile < Tiles; ++tile) {
-        const unsigned offset = tile * Threads + thread;
-        if (offset < Vectors) {
-            const uint2 r = saved[tile];
-            const uint2 w = ldg2_v4(next_pre_attn_weight, offset);
-            float values[4];
-            #pragma unroll
-            for (int channel = 0; channel < 4; ++channel) {
-                values[channel] = apply_norm(bf16(r, channel), input_inverse, bf16(w, channel));
-            }
-            const uint2 rounded_hidden = make_uint2(pack_bf16(values[0], values[1]),
-                                                    pack_bf16(values[2], values[3]));
-            if constexpr (WriteHidden) {
-                st2_v4(hid_row, offset, rounded_hidden);
-            }
-            if constexpr (Quantize) {
-                st1_v2(q_row, offset, pack_fp8(values, scale_inv));
-            }
-            if constexpr (Gate) {
-                float gate_values[4];
-                #pragma unroll
-                for (int channel = 0; channel < 4; ++channel) {
-                    gate_values[channel] = bf16(rounded_hidden, channel);
-                }
-                if constexpr (GateEvictLast) {
-                    st1_v2_evict_last(g_row, offset, pack_fp8(gate_values, gate_inv), el_policy);
-                } else {
-                    st1_v2(g_row, offset, pack_fp8(gate_values, gate_inv));
-                }
-            }
-        }
-    }
-    if constexpr (DiscardDown && PdlMode == 2) {
-        // Hoisted after pdl_launch_dependents() + final output stores so downstream qkv_proj TMA
-        // weight preloads overlap sooner and L2-hot hidden/q/g outputs land before discarding dn_row.
-        if (thread < 104u) {
-            discard_l2_128(reinterpret_cast<const char*>(dn_row) + (thread << 7));
-        }
-    }
-}
-
-static int g_sandwich_res_cs_override = -1;
-static bool sandwich_res_cs_enabled() {
-    if (g_sandwich_res_cs_override >= 0) return g_sandwich_res_cs_override != 0;
-    static const bool env_on = []() {
-        const char* env = std::getenv("MUSE_SANDWICH_RES_CS");
-        return env && *env && std::strtol(env, nullptr, 10) != 0;
-    }();
-    return env_on;
-}
-
-static int g_sandwich_v4_override = -1;
-static bool sandwich_v4_enabled() {
-    if (g_sandwich_v4_override >= 0) return g_sandwich_v4_override != 0;
-    static const bool env_on = []() {
-        const char* env = std::getenv("MUSE_SANDWICH_V4");
-        return !env || !*env || std::strtol(env, nullptr, 10) != 0;
-    }();
-    return env_on;
-}
-
-static int g_sandwich_discard_override = -1;
-static bool sandwich_discard_enabled() {
-    if (g_sandwich_discard_override >= 0) return g_sandwich_discard_override != 0;
-    static const bool env_on = []() {
-        const char* env = std::getenv("MUSE_SANDWICH_DISCARD_L2");
-        return !env || !*env || std::strtol(env, nullptr, 10) != 0;
-    }();
-    return env_on;
-}
-
-static inline bool aligned16_row_ptrs(const void* a0, const void* a1, const void* a2,
-                                      const void* a4, const void* a5, const void* a6,
-                                      const void* a8, const void* a9, const void* a11) {
-    uintptr_t u = reinterpret_cast<uintptr_t>(a0) | reinterpret_cast<uintptr_t>(a1)
-                | reinterpret_cast<uintptr_t>(a2) | reinterpret_cast<uintptr_t>(a4)
-                | reinterpret_cast<uintptr_t>(a5) | reinterpret_cast<uintptr_t>(a6);
-    if (a8) u |= reinterpret_cast<uintptr_t>(a8);
-    if ((u & 15u) != 0u) return false;
-    if (a9 && (reinterpret_cast<uintptr_t>(a9) & 7u) != 0u) return false;
-    if (a11 && (reinterpret_cast<uintptr_t>(a11) & 7u) != 0u) return false;
-    return true;
-}
-
-template <bool Quantize, bool Gate, bool WriteHidden, bool GateEvictLast, bool ResidualEvictLast, bool CsLoads>
-static inline cudaError_t dispatch_v4(
-    int rows, cudaStream_t stream,
-    uint2* a0, const uint2* a1, const uint2* a2, const float* a3,
-    const uint2* a4, const uint2* a5, const uint2* a6,
-    const float* a7, uint2* a8, unsigned* a9,
-    const float* a10, unsigned* a11) {
-    const int pdl_mode = sandwich_pdl_mode();
-    const bool disc = sandwich_discard_enabled() && ((reinterpret_cast<uintptr_t>(a1) & 127u) == 0u);
-    if (pdl_mode == 1) {
-        if (disc) return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, true>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-        return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, false>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-    }
-    if (pdl_mode == 2) {
-        if constexpr (!ResidualEvictLast && CsLoads) {
-            if (sandwich_res_cs_enabled()) {
-                if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-                else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, false, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-                return cudaGetLastError();
-            }
-        }
-        if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-        else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, false, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-        return cudaGetLastError();
-    }
-    if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-    else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-    return cudaGetLastError();
-}
-
 template <bool Quantize, bool Shared, bool CsLoads = false>
 void launch(const void* const* args, int rows, cudaStream_t stream) {
     auto* a0 = static_cast<uint2*>(const_cast<void*>(args[0]));
@@ -627,12 +326,7 @@ void launch(const void* const* args, int rows, cudaStream_t stream) {
     auto* a8 = static_cast<uint2*>(const_cast<void*>(args[Quantize ? 8 : 7]));
     auto* a9 = Quantize ? static_cast<unsigned*>(const_cast<void*>(args[9])) : nullptr;
     if constexpr (Shared) {
-        if (sandwich_v4_enabled() && aligned16_row_ptrs(a0, a1, a2, a4, a5, a6, a8, a9, nullptr)) {
-            (void)dispatch_v4<Quantize, false, true, false, false, CsLoads>(
-                rows, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, nullptr, nullptr);
-            return;
-        }
-        if (sandwich_pdl_mode() == 1) {
+        if (sandwich_pdl_enabled()) {
             launch_ex_pdl(sandwich<Quantize, true, false, true, false, false, CsLoads, true>, rows, Threads,
                           Vectors * sizeof(uint2), stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9,
                           static_cast<const float*>(nullptr), static_cast<unsigned*>(nullptr));
@@ -649,20 +343,8 @@ extern "C" void muse_sandwich_set_prefill_cs(int enable) {
 }
 
 extern "C" int muse_sandwich_set_pdl(int enable) {
-    const int old = sandwich_pdl_mode();
-    g_sandwich_pdl_override = (enable < 0) ? -1 : ((enable == 0 || enable == 1 || enable == 2) ? enable : 2);
-    return old;
-}
-
-extern "C" int muse_sandwich_set_v4(int enable) {
-    const int old = sandwich_v4_enabled() ? 1 : 0;
-    g_sandwich_v4_override = (enable < 0) ? -1 : (enable != 0 ? 1 : 0);
-    return old;
-}
-
-extern "C" int muse_sandwich_set_discard(int enable) {
-    const int old = sandwich_discard_enabled() ? 1 : 0;
-    g_sandwich_discard_override = (enable < 0) ? -1 : (enable != 0 ? 1 : 0);
+    const int old = sandwich_pdl_enabled() ? 1 : 0;
+    g_sandwich_pdl_override = (enable < 0) ? -1 : (enable != 0 ? 1 : 0);
     return old;
 }
 
@@ -681,12 +363,7 @@ void launch_gate(const void* const* args, int rows, cudaStream_t stream) {
     const auto* a10 = static_cast<const float*>(args[10]);
     auto* a11 = static_cast<unsigned*>(const_cast<void*>(args[11]));
     if constexpr (Shared) {
-        if (sandwich_v4_enabled() && aligned16_row_ptrs(a0, a1, a2, a4, a5, a6, WriteHidden ? a8 : nullptr, a9, a11)) {
-            (void)dispatch_v4<true, true, WriteHidden, EvictLast, false, CsLoads>(
-                rows, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-            return;
-        }
-        if (sandwich_pdl_mode() == 1) {
+        if (sandwich_pdl_enabled()) {
             launch_ex_pdl(sandwich<true, true, true, WriteHidden, EvictLast, false, CsLoads, true>, rows, Threads,
                           Vectors * sizeof(uint2), stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
             return;
@@ -737,7 +414,7 @@ extern "C" int muse_sandwich_gate_evict_last(const void* const* args, int rows, 
 template <bool GateEL, bool ResEL, bool CsLoads>
 int launch_hint(const void* const* args, int rows, int mode, cudaStream_t stream) {
     const size_t smem = Vectors * sizeof(uint2);
-    const bool use_pdl = (sandwich_pdl_mode() == 1);
+    const bool use_pdl = sandwich_pdl_enabled();
     if (mode == 0) {
         auto* a0 = static_cast<uint2*>(const_cast<void*>(args[0]));
         const auto* a1 = static_cast<const uint2*>(args[1]);
@@ -747,10 +424,6 @@ int launch_hint(const void* const* args, int rows, int mode, cudaStream_t stream
         const auto* a5 = static_cast<const uint2*>(args[5]);
         const auto* a6 = static_cast<const uint2*>(args[6]);
         auto* a7 = static_cast<uint2*>(const_cast<void*>(args[7]));
-        if (sandwich_v4_enabled() && aligned16_row_ptrs(a0, a1, a2, a4, a5, a6, a7, nullptr, nullptr)) {
-            return static_cast<int>(dispatch_v4<false, false, true, false, ResEL, CsLoads>(
-                rows, stream, a0, a1, a2, a3, a4, a5, a6, nullptr, a7, nullptr, nullptr, nullptr));
-        }
         if (use_pdl) {
             return static_cast<int>(launch_ex_pdl(
                 sandwich<false, true, false, true, false, ResEL, CsLoads, true>, rows, Threads, smem, stream,
@@ -772,10 +445,6 @@ int launch_hint(const void* const* args, int rows, int mode, cudaStream_t stream
         auto* a9 = static_cast<unsigned*>(const_cast<void*>(args[9]));
         const auto* a10 = static_cast<const float*>(args[10]);
         auto* a11 = static_cast<unsigned*>(const_cast<void*>(args[11]));
-        if (sandwich_v4_enabled() && aligned16_row_ptrs(a0, a1, a2, a4, a5, a6, nullptr, a9, a11)) {
-            return static_cast<int>(dispatch_v4<true, true, false, GateEL, ResEL, CsLoads>(
-                rows, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11));
-        }
         if (use_pdl) {
             return static_cast<int>(launch_ex_pdl(
                 sandwich<true, true, true, false, GateEL, ResEL, CsLoads, true>, rows, Threads, smem, stream,

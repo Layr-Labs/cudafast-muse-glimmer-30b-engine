@@ -14,13 +14,9 @@ from vllm.v1.worker.gpu.buffer_utils import (
 )
 
 try:
-    from muse_embed import (
-        fast_single_decode_prep as _fast_single_decode_prep,
-        fast_single_tree_prep as _fast_single_tree_prep,
-    )
+    from muse_embed import fast_single_decode_prep as _fast_single_decode_prep
 except (ImportError, OSError):
     _fast_single_decode_prep = None
-    _fast_single_tree_prep = None
 
 
 class BlockTables:
@@ -269,48 +265,6 @@ class BlockTables:
         return (
             tuple(bt[:1] for bt in self.input_block_tables),
             self.slot_mappings[:, :1],
-        )
-
-    def prepare_single_tree_step(
-        self,
-        idx_mapping: torch.Tensor,
-        num_computed_tokens: torch.Tensor,
-        last_sampled_tokens: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        num_draft: int,
-        verify_m: int,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        seq_lens: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        is_padding: torch.Tensor | None,
-    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor] | None:
-        if _fast_single_tree_prep is None:
-            return None
-        if not _fast_single_tree_prep(
-            self.num_kv_cache_groups,
-            idx_mapping,
-            num_computed_tokens,
-            last_sampled_tokens,
-            draft_tokens,
-            num_draft,
-            verify_m,
-            input_ids,
-            positions,
-            seq_lens,
-            query_start_loc,
-            is_padding,
-            self.block_table_ptrs,
-            self.input_block_table_ptrs,
-            self.block_table_strides,
-            self.num_blocks.gpu,
-            self.block_sizes_tensor,
-            self.slot_mappings,
-        ):
-            return None
-        return (
-            tuple(bt[:1] for bt in self.input_block_tables),
-            self.slot_mappings[:, :verify_m],
         )
 
 
