@@ -9,6 +9,19 @@
 
 namespace swiglu_ws {
 
+constexpr int NT_WS12 = (NWARP + 4) * 32;
+
+__device__ __forceinline__ void wg_reg_dec_24() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 24;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void wg_reg_inc_232() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 232;" ::: "memory");
+#endif
+}
+
 __device__ __forceinline__ uint32_t cvt2_scaled_bf16(float lo, float hi, float sa, float sb) {
   const float x = __fmul_rn(__fmul_rn(lo, sb), sa);
   const float y = __fmul_rn(__fmul_rn(hi, sb), sa);
@@ -319,6 +332,104 @@ swiglu_ws8_256x128_st2_kernel(const __grid_constant__ CUtensorMap tmA256, const 
 }
 
 template <bool kPdlPrologue, bool kPdlLaunch, bool kLutSilu>
+__global__ void __launch_bounds__(NT_WS12, 1)
+swiglu_ws12_256x128_st2_kernel(const __grid_constant__ CUtensorMap tmA256, const __grid_constant__ CUtensorMap tmB128,
+                               const float* sa_p, const float* sb_p, const float* down_p, uint8_t* out) {
+  constexpr int BM_T = 256, ST_T = 2, ASZ = BM_T * KT, STB = ASZ + WSZ, NKT = K_DIM / KT;
+  extern __shared__ uint8_t sm_raw[];
+  __shared__ __align__(8) unsigned long long bars[2 * ST_T];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
+  const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
+  const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST_T;
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < ST_T; ++s) { mbar_init(full0 + 8 * s, 1); mbar_init(empty0 + 8 * s, NWARP); }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+  }
+  __syncthreads();
+
+  if (warp >= NWARP) {
+    wg_reg_dec_24();
+    if (warp == NWARP && lane == 0) {
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA256) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB128) : "memory");
+      const uint64_t pol_el = tma_pol_el(), pol_ef = tma_pol_ef();
+      int s = 0, par = 0, g = 0;
+      if constexpr (kPdlPrologue) {
+        const int nt0 = b >> 1;
+#pragma unroll
+        for (int ps = 0; ps < ST_T; ++ps) {
+          const uint32_t bar = full0 + 8 * ps, dst = sbase + ps * STB;
+          mbar_expect_tx_only(bar, WSZ);
+          tma2d_hint(dst + ASZ, &tmB128, ps * KT, nt0 * BN, bar, pol_ef);
+        }
+        pdl_wait();
+      }
+      for (int ti = 0; ti < 13; ++ti) {
+        const int t = b + ti * 48, nt = t >> 1, band = t & 1;
+        const int row0 = band * BM_T, col0 = nt * BN;
+        for (int kt = 0; kt < NKT; ++kt) {
+          if (g >= ST_T) {
+            mbar_wait(empty0 + 8 * s, par ^ 1);
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+          }
+          const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB;
+          if constexpr (kPdlPrologue) {
+            if (g < ST_T) {
+              mbar_expect_tx(bar, ASZ);
+              tma2d_hint(dst, &tmA256, kt * KT, row0, bar, pol_el);
+              ++g;
+              if (++s == ST_T) { s = 0; par ^= 1; }
+              continue;
+            }
+          }
+          mbar_expect_tx(bar, STB);
+          tma2d_hint(dst, &tmA256, kt * KT, row0, bar, pol_el);
+          tma2d_hint(dst + ASZ, &tmB128, kt * KT, col0, bar, pol_ef);
+          ++g;
+          if (++s == ST_T) { s = 0; par ^= 1; }
+        }
+      }
+    }
+    return;
+  }
+
+  wg_reg_inc_232();
+  if constexpr (kPdlPrologue) pdl_wait();
+  const int wm = warp % WM, wn = warp / WM;
+  const float sa = __ldg(sa_p), sb = __ldg(sb_p);
+  float inv_down;
+  asm("div.full.f32 %0, 0f3F800000, %1;" : "=f"(inv_down) : "f"(__ldg(down_p)));
+  const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ach = lane >> 4;
+  const int br = (lane & 7) + (lane >> 4) * 8, bch = (lane >> 3) & 1;
+  float acc[4][8][4] = {};
+  int s = 0, par = 0;
+  for (int ti = 0; ti < 13; ++ti) {
+    const int t = b + ti * 48, nt = t >> 1, band = t & 1;
+    for (int kt = 0; kt < NKT; ++kt) {
+      if constexpr (kPdlLaunch) { if (ti == 12 && kt == NKT - 12) pdl_launch_dependents(); }
+      mbar_wait(full0 + 8 * s, par);
+      const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
+      consume_stage_pipe_4x8<false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+      __syncwarp();
+      if (lane == 0) mbar_arrive(empty0 + 8 * s);
+      if (++s == ST_T) { s = 0; par ^= 1; }
+    }
+    const int rb0 = band * BM_T + wm * 64;
+    const int out_col0 = (nt * BN + wn * 64) / 2;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      epilogue_swiglu_prmt<8, kLutSilu>(acc[i], out, rb0 + i * 16, out_col0, lane, sa, sb, inv_down);
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
+    }
+  }
+}
+
+template <bool kPdlPrologue, bool kPdlLaunch, bool kLutSilu>
 __global__ void __launch_bounds__(NT_WS9, 1)
 swiglu_ws9_st3_lut_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
                           const float* sa_p, const float* sb_p, const float* down_p, uint8_t* out) {
@@ -420,7 +531,8 @@ fp8_6656_ws8_256_st2_st4_kernel(const __grid_constant__ CUtensorMap tmA256,
                                 const __grid_constant__ CUtensorMap tmB128,
                                 const __grid_constant__ CUtensorMap tmB48,
                                 const __grid_constant__ CUtensorMap tmB32,
-                                const float* sa_p, const float* sb_p, __nv_bfloat16* out) {
+                                const float* sa_p, const float* sb_p, __nv_bfloat16* out,
+                                const char* dead_ptr = nullptr, size_t dead_lines = 0) {
   constexpr int N_OUT = 6656, ST1 = 2, BM1 = 256, ASZ1 = BM1 * KT, STB1 = ASZ1 + WSZ, NKT = K / KT, TOTAL1 = 2 * NKT;
   constexpr int ST2 = 4, ASZ2 = 128 * KT, WSZ2 = 48 * KT, STB2 = ASZ2 + WSZ2;
   static_assert(STB2 % 1024 == 0 && ST2 * STB2 + 1024 <= SMEM_MAX, "Phase-2 SWIZZLE_128B alignment");
@@ -487,6 +599,13 @@ fp8_6656_ws8_256_st2_st4_kernel(const __grid_constant__ CUtensorMap tmA256,
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB48) : "memory");
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB32) : "memory");
       produce1(0);
+    }
+    if (dead_ptr) {
+      const size_t gid = static_cast<size_t>(b) * NT + tid;
+      constexpr size_t gstride = 48u * NT;
+      for (size_t i = gid; i < dead_lines; i += gstride) {
+        asm volatile("discard.global.L2 [%0], 128;" :: "l"(dead_ptr + (i << 7)) : "memory");
+      }
     }
     float acc[4][8][4] = {};
     int kt = 0, ti = 0;
@@ -891,8 +1010,160 @@ bf16_dual_ws8_256_kernel(const __grid_constant__ CUtensorMap tmA256,
   }
 }
 
+template <typename Kernel, typename... Args>
+static inline cudaError_t launch_pdl_ex(Kernel kernel, int blocks, int threads, size_t smem, cudaStream_t st,
+                                        const Args&... args) {
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = dim3(blocks, 1, 1);
+  cfg.blockDim = dim3(threads, 1, 1);
+  cfg.dynamicSmemBytes = smem;
+  cfg.stream = st;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  return cudaLaunchKernelEx(&cfg, kernel, args...);
+}
+
+
 template <int K, bool kPdl>
 __global__ void __launch_bounds__(NT_WS9, 1)
+fp8_6656_4wave_ws9_kernel(const __grid_constant__ CUtensorMap tmA128,
+                          const __grid_constant__ CUtensorMap tmB160,
+                          const __grid_constant__ CUtensorMap tmB128,
+                          const float* sa_p, const float* sb_p, __nv_bfloat16* out) {
+  constexpr int N_OUT = 6656, BM_T = 128, ST_T = 2, ASZ = BM_T * KT;
+  constexpr int WSZ160 = 160 * KT, WSZ128 = 128 * KT;
+  constexpr int STB = ASZ + WSZ160;
+  constexpr int NKT = K / KT;
+  static_assert(STB % 1024 == 0 && ST_T * STB + 1024 <= SMEM_MAX, "4wave SMEM alignment");
+  extern __shared__ uint8_t sm_raw[];
+  __shared__ __align__(8) unsigned long long bars[2 * ST_T];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
+  const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
+  const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST_T;
+
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < ST_T; ++s) { mbar_init(full0 + 8 * s, 1); mbar_init(empty0 + 8 * s, NWARP); }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+  }
+  __syncthreads();
+
+  if (warp == NWARP) {
+    if (lane == 0) {
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA128) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB160) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB128) : "memory");
+      const uint64_t pol_el = tma_pol_el(), pol_ef = tma_pol_ef();
+      int s = 0, par = 0, g = 0;
+      if constexpr (kPdl) {
+        const int nt0 = b >> 2;
+#pragma unroll
+        for (int ps = 0; ps < ST_T; ++ps) {
+          const uint32_t bar = full0 + 8 * ps, dst = sbase + ps * STB;
+          mbar_expect_tx_only(bar, WSZ160);
+          tma2d_hint(dst + ASZ, &tmB160, ps * KT, nt0 * 160, bar, pol_ef);
+        }
+        pdl_wait();
+      }
+      for (int ti = 0; ti < 4; ++ti) {
+        const int t = b + ti * 48, nt = t >> 2, band = t & 3;
+        const int row0 = band * BM_T;
+        const bool is160 = (nt < 16);
+        const int col0 = is160 ? (nt * 160) : (2560 + (nt - 16) * 128);
+        const int tx = ASZ + (is160 ? WSZ160 : WSZ128);
+        for (int kt = 0; kt < NKT; ++kt) {
+          if (g >= ST_T) {
+            mbar_wait(empty0 + 8 * s, par ^ 1);
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+          }
+          const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB;
+          if constexpr (kPdl) {
+            if (g < ST_T) {
+              mbar_expect_tx(bar, ASZ);
+              tma2d_hint(dst, &tmA128, kt * KT, row0, bar, pol_el);
+              ++g;
+              if (++s == ST_T) { s = 0; par ^= 1; }
+              continue;
+            }
+          }
+          mbar_expect_tx(bar, tx);
+          tma2d_hint(dst, &tmA128, kt * KT, row0, bar, pol_el);
+          if (is160) tma2d_hint(dst + ASZ, &tmB160, kt * KT, col0, bar, pol_ef);
+          else       tma2d_hint(dst + ASZ, &tmB128, kt * KT, col0, bar, pol_ef);
+          ++g;
+          if (++s == ST_T) { s = 0; par ^= 1; }
+        }
+      }
+    }
+    return;
+  }
+
+  const int wm = warp % WM, wn = warp / WM;
+  const float sa = __ldg(sa_p), sb = __ldg(sb_p);
+  const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ach = lane >> 4;
+  const int br = (lane & 7) + (lane >> 4) * 8, bch = (lane >> 3) & 1;
+  const int n160 = (b < 16) ? 2 : 1;
+  int s = 0, par = 0;
+
+  {
+    float acc10[2][10][4] = {};
+    for (int ti = 0; ti < n160; ++ti) {
+      const int t = b + ti * 48, nt = t >> 2, band = t & 3;
+      for (int kt = 0; kt < NKT; ++kt) {
+        mbar_wait(full0 + 8 * s, par);
+        const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
+        consume_stage_qpipe_2xN<10, false>(abase, wbase, wm, wn, ar, ach, br, bch, acc10);
+        __syncwarp();
+        if (lane == 0) mbar_arrive(empty0 + 8 * s);
+        if (++s == ST_T) { s = 0; par ^= 1; }
+      }
+      const int rb0 = band * BM_T + wm * 32;
+      const int col0 = nt * 160 + wn * 80;
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        epilogue_bf16_sel4<N_OUT, 10, true>(acc10[i], out, rb0 + i * 16, col0, lane, sa, sb);
+#pragma unroll
+        for (int j = 0; j < 10; ++j)
+#pragma unroll
+          for (int c = 0; c < 4; ++c) acc10[i][j][c] = 0.f;
+      }
+    }
+  }
+
+  constexpr int kPdlTrig = (K == 19968) ? (NKT - 24) : ((NKT > 10) ? (NKT - 10) : 0);
+  {
+    float acc8[2][8][4] = {};
+    for (int ti = n160; ti < 4; ++ti) {
+      const int t = b + ti * 48, nt = t >> 2, band = t & 3;
+      for (int kt = 0; kt < NKT; ++kt) {
+        if constexpr (kPdl) { if (ti == 3 && kt == kPdlTrig) pdl_launch_dependents(); }
+        mbar_wait(full0 + 8 * s, par);
+        const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
+        consume_stage_qpipe_2xN<8, false>(abase, wbase, wm, wn, ar, ach, br, bch, acc8);
+        __syncwarp();
+        if (lane == 0) mbar_arrive(empty0 + 8 * s);
+        if (++s == ST_T) { s = 0; par ^= 1; }
+      }
+      const int rb0 = band * BM_T + wm * 32;
+      const int col0 = 2560 + (nt - 16) * 128 + wn * 64;
+#pragma unroll
+      for (int i = 0; i < 2; ++i) {
+        epilogue_bf16_sel4<N_OUT, 8, true>(acc8[i], out, rb0 + i * 16, col0, lane, sa, sb);
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+#pragma unroll
+          for (int c = 0; c < 4; ++c) acc8[i][j][c] = 0.f;
+      }
+    }
+  }
+}
+
+template <int K, bool kPdl>
+__global__ void __launch_bounds__(NT_WS12, 1)
 fp8_6656_ws9_256_st2_st4_kernel(const __grid_constant__ CUtensorMap tmA256,
                                 const __grid_constant__ CUtensorMap tmA128,
                                 const __grid_constant__ CUtensorMap tmB128,
@@ -902,14 +1173,11 @@ fp8_6656_ws9_256_st2_st4_kernel(const __grid_constant__ CUtensorMap tmA256,
   constexpr int N_OUT = 6656, ST1 = 2, BM1 = 256, ASZ1 = BM1 * KT, STB1 = ASZ1 + WSZ, NKT = K / KT;
   constexpr int ST2 = 4, ASZ2 = 128 * KT, WSZ2 = 48 * KT, STB2 = ASZ2 + WSZ2;
   static_assert(STB2 % 1024 == 0 && ST2 * STB2 + 1024 <= SMEM_MAX, "Phase-2 SWIZZLE_128B alignment");
-  static_assert(NKT >= ST1 && (NKT % 2) == 0, "Phase-1 drain parity");
   extern __shared__ uint8_t sm_raw[];
-  __shared__ __align__(8) unsigned long long bars1[2 * ST1];
-  __shared__ __align__(8) unsigned long long bars2[2 * ST2];
+  __shared__ __align__(8) unsigned long long bars[2 * ST2];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
   const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
-  const uint32_t full1 = (uint32_t)__cvta_generic_to_shared(&bars1[0]), empty1 = full1 + 8 * ST1;
-  const uint32_t full2 = (uint32_t)__cvta_generic_to_shared(&bars2[0]), empty2 = full2 + 8 * ST2;
+  const uint32_t full0 = (uint32_t)__cvta_generic_to_shared(&bars[0]), empty0 = full0 + 8 * ST2;
 
   const int band2 = b & 3, c2 = b >> 2;
   const bool is48 = (c2 < 8);
@@ -919,15 +1187,15 @@ fp8_6656_ws9_256_st2_st4_kernel(const __grid_constant__ CUtensorMap tmA256,
 
   if (tid == 0) {
 #pragma unroll
-    for (int s = 0; s < ST1; ++s) { mbar_init(full1 + 8 * s, 1); mbar_init(empty1 + 8 * s, NWARP); }
-#pragma unroll
-    for (int s = 0; s < ST2; ++s) { mbar_init(full2 + 8 * s, 1); mbar_init(empty2 + 8 * s, NWARP); }
+    for (int s = 0; s < ST1; ++s) { mbar_init(full0 + 8 * s, 1); mbar_init(empty0 + 8 * s, NWARP); }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
   }
   __syncthreads();
 
-  if (warp == NWARP) {
+  if (warp >= NWARP) {
+    wg_reg_dec_24();
+    if (warp != NWARP) return;
     if (lane == 0) {
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA256) : "memory");
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA128) : "memory");
@@ -935,24 +1203,26 @@ fp8_6656_ws9_256_st2_st4_kernel(const __grid_constant__ CUtensorMap tmA256,
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB48) : "memory");
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB32) : "memory");
       const uint64_t pol_el = tma_pol_el(), pol_ef = tma_pol_ef();
+      int s = 0, par = 0, g = 0;
       if constexpr (kPdl) {
         const int nt0 = b >> 1;
-        mbar_expect_tx_only(full1, WSZ);
-        tma2d_hint(sbase + ASZ1, &tmB128, 0, nt0 * BN, full1, pol_ef);
-        mbar_expect_tx_only(full1 + 8, WSZ);
-        tma2d_hint(sbase + STB1 + ASZ1, &tmB128, KT, nt0 * BN, full1 + 8, pol_ef);
+#pragma unroll
+        for (int ps = 0; ps < ST1; ++ps) {
+          const uint32_t bar = full0 + 8 * ps, dst = sbase + ps * STB1;
+          mbar_expect_tx_only(bar, WSZ);
+          tma2d_hint(dst + ASZ1, &tmB128, ps * KT, nt0 * BN, bar, pol_ef);
+        }
         pdl_wait();
       }
-      int s = 0, par = 0, g = 0;
       for (int ti = 0; ti < 2; ++ti) {
         const int t = b + ti * 48, nt = t >> 1, band = t & 1;
         const int row0 = band * BM1, col0 = nt * BN;
         for (int kt = 0; kt < NKT; ++kt) {
           if (g >= ST1) {
-            mbar_wait(empty1 + 8 * s, par ^ 1);
+            mbar_wait(empty0 + 8 * s, par ^ 1);
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
           }
-          const uint32_t bar = full1 + 8 * s, dst = sbase + s * STB1;
+          const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB1;
           if constexpr (kPdl) {
             if (g < ST1) {
               mbar_expect_tx(bar, ASZ1);
@@ -969,44 +1239,45 @@ fp8_6656_ws9_256_st2_st4_kernel(const __grid_constant__ CUtensorMap tmA256,
           if (++s == ST1) { s = 0; par ^= 1; }
         }
       }
-      // Wait for all 8 consumer warps to finish reading both Phase-1 SMEM stages, then immediately
-      // fill all 4 Phase-2 TMA stages while consumers execute the Phase-1 tile-1 epilogue stores.
-      mbar_wait(empty1 + 0, par ^ 1);
-      mbar_wait(empty1 + 8, par ^ 1);
-      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      const CUtensorMap* tmB2 = is48 ? &tmB48 : &tmB32;
-      int s2 = 0, par2 = 0;
+    }
+    asm volatile("bar.sync 1, 288;" ::: "memory");
+    asm volatile("bar.sync 1, 288;" ::: "memory");
+    if (lane == 0) {
+      const uint64_t pol_el = tma_pol_el();
+      int s = 0, par = 0;
       for (int kt = 0; kt < NKT; ++kt) {
         if (kt >= ST2) {
-          mbar_wait(empty2 + 8 * s2, par2 ^ 1);
+          mbar_wait(empty0 + 8 * s, par ^ 1);
           asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         }
-        const uint32_t bar = full2 + 8 * s2, dst = sbase + s2 * STB2;
+        const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB2;
         mbar_expect_tx(bar, tx2);
         tma2d_hint(dst, &tmA128, kt * KT, row0_2, bar, pol_el);
-        tma2d_hint(dst + ASZ2, tmB2, kt * KT, col0_2, bar, pol_el);
-        if (++s2 == ST2) { s2 = 0; par2 ^= 1; }
+        if (is48) tma2d_hint(dst + ASZ2, &tmB48, kt * KT, col0_2, bar, pol_el);
+        else      tma2d_hint(dst + ASZ2, &tmB32, kt * KT, col0_2, bar, pol_el);
+        if (++s == ST2) { s = 0; par ^= 1; }
       }
     }
     return;
   }
 
+  wg_reg_inc_232();
+  if constexpr (kPdl) pdl_wait();
   const int wm = warp % WM, wn = warp / WM;
   const float sa = __ldg(sa_p), sb = __ldg(sb_p);
   const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ach = lane >> 4;
   const int br = (lane & 7) + (lane >> 4) * 8, bch = (lane >> 3) & 1;
-
   {
     float acc[4][8][4] = {};
     int s = 0, par = 0;
     for (int ti = 0; ti < 2; ++ti) {
       const int t = b + ti * 48, nt = t >> 1, band = t & 1;
       for (int kt = 0; kt < NKT; ++kt) {
-        mbar_wait(full1 + 8 * s, par);
+        mbar_wait(full0 + 8 * s, par);
         const uint32_t abase = sbase + s * STB1, wbase = abase + ASZ1;
         consume_stage_pipe_4x8<false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
         __syncwarp();
-        if (lane == 0) mbar_arrive(empty1 + 8 * s);
+        if (lane == 0) mbar_arrive(empty0 + 8 * s);
         if (++s == ST1) { s = 0; par ^= 1; }
       }
       const int rb0 = band * BM1 + wm * 64;
@@ -1014,48 +1285,55 @@ fp8_6656_ws9_256_st2_st4_kernel(const __grid_constant__ CUtensorMap tmA256,
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         epilogue_bf16_sel4<N_OUT, 8, true>(acc[i], out, rb0 + i * 16, col0, lane, sa, sb);
-        if (ti == 0) {
 #pragma unroll
-          for (int j = 0; j < 8; ++j)
+        for (int j = 0; j < 8; ++j)
 #pragma unroll
-            for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
-        }
+          for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
       }
     }
   }
 
+  asm volatile("bar.sync 1, 288;" ::: "memory");
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < ST2; ++s) { mbar_init(full0 + 8 * s, 1); mbar_init(empty0 + 8 * s, NWARP); }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+  }
+  asm volatile("bar.sync 1, 288;" ::: "memory");
+
   const int rb0 = row0_2 + warp * 16;
-  constexpr int kPdlTrig = (K == 19968) ? (NKT - 20) : ((NKT > 10) ? (NKT - 10) : 0);
-  int s2 = 0, par2 = 0;
+  constexpr int kPdlTrig = (K == 19968) ? (NKT - 24) : ((NKT > 10) ? (NKT - 10) : 0);
+  int s = 0, par = 0;
   if (is48) {
     float acc2[1][6][4] = {};
     for (int kt = 0; kt < NKT; ++kt) {
       if constexpr (kPdl) { if (kt == kPdlTrig) pdl_launch_dependents(); }
-      mbar_wait(full2 + 8 * s2, par2);
-      const uint32_t abase = sbase + s2 * STB2, wbase = abase + ASZ2;
+      mbar_wait(full0 + 8 * s, par);
+      const uint32_t abase = sbase + s * STB2, wbase = abase + ASZ2;
       consume_stage_pipe_opt<1, 6, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
       __syncwarp();
-      if (lane == 0) mbar_arrive(empty2 + 8 * s2);
-      if (++s2 == ST2) { s2 = 0; par2 ^= 1; }
+      if (lane == 0) mbar_arrive(empty0 + 8 * s);
+      if (++s == ST2) { s = 0; par ^= 1; }
     }
     epilogue_bf16_sel4<N_OUT, 6, true>(acc2[0], out, rb0, col0_2, lane, sa, sb);
   } else {
     float acc2[1][4][4] = {};
     for (int kt = 0; kt < NKT; ++kt) {
       if constexpr (kPdl) { if (kt == kPdlTrig) pdl_launch_dependents(); }
-      mbar_wait(full2 + 8 * s2, par2);
-      const uint32_t abase = sbase + s2 * STB2, wbase = abase + ASZ2;
+      mbar_wait(full0 + 8 * s, par);
+      const uint32_t abase = sbase + s * STB2, wbase = abase + ASZ2;
       consume_stage_pipe_opt<1, 4, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
       __syncwarp();
-      if (lane == 0) mbar_arrive(empty2 + 8 * s2);
-      if (++s2 == ST2) { s2 = 0; par2 ^= 1; }
+      if (lane == 0) mbar_arrive(empty0 + 8 * s);
+      if (++s == ST2) { s = 0; par ^= 1; }
     }
     epilogue_bf16_sel4<N_OUT, 4, true>(acc2[0], out, rb0, col0_2, lane, sa, sb);
   }
 }
 
 template <bool kPdl>
-__global__ void __launch_bounds__(NT_WS9, 1)
+__global__ void __launch_bounds__(NT_WS12, 1)
 fp8_dual_a_ws9_256_kernel(const __grid_constant__ CUtensorMap tmA0,
                           const __grid_constant__ CUtensorMap tmA1,
                           const __grid_constant__ CUtensorMap tmB0,
@@ -1087,8 +1365,9 @@ fp8_dual_a_ws9_256_kernel(const __grid_constant__ CUtensorMap tmA0,
   }
   __syncthreads();
 
-  if (warp == NWARP) {
-    if (lane == 0) {
+  if (warp >= NWARP) {
+    wg_reg_dec_24();
+    if (warp == NWARP && lane == 0) {
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA0) : "memory");
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA1) : "memory");
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB0) : "memory");
@@ -1096,25 +1375,27 @@ fp8_dual_a_ws9_256_kernel(const __grid_constant__ CUtensorMap tmA0,
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB1_112) : "memory");
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB1_96) : "memory");
       const uint64_t pol_el = tma_pol_el(), pol_ef = tma_pol_ef();
+      int s = 0, par = 0, g = 0;
       if constexpr (kPdl) {
         const int nt0 = b >> 1;
         const bool is1_0 = nt0 >= NTN0;
+        const CUtensorMap* mapB0 = is1_0 ? &tmB1_128 : &tmB0;
         const int col0_0 = (is1_0 ? (nt0 - NTN0) : nt0) * BN;
-        const CUtensorMap* tmB_0 = is1_0 ? &tmB1_128 : &tmB0;
-        mbar_expect_tx_only(full0, WSZ);
-        tma2d_hint(sbase + ASZ, tmB_0, 0, col0_0, full0, pol_ef);
-        mbar_expect_tx_only(full0 + 8, WSZ);
-        tma2d_hint(sbase + STB + ASZ, tmB_0, KT, col0_0, full0 + 8, pol_ef);
+#pragma unroll
+        for (int ps = 0; ps < ST_T; ++ps) {
+          const uint32_t bar = full0 + 8 * ps, dst = sbase + ps * STB;
+          mbar_expect_tx_only(bar, WSZ);
+          tma2d_hint(dst + ASZ, mapB0, ps * KT, col0_0, bar, pol_ef);
+        }
         pdl_wait();
       }
-      int s = 0, par = 0, g = 0;
       for (int ti = 0; ti < 2; ++ti) {
         const int t = b + ti * 48, nt = t >> 1, band = t & 1;
-        const bool is1 = nt >= NTN0;
         const int row0 = band * 256;
+        const bool is1 = nt >= NTN0;
         const int col0 = (is1 ? (nt - NTN0) : nt) * BN;
-        const CUtensorMap* tmA = is1 ? &tmA1 : &tmA0;
-        const CUtensorMap* tmB = is1 ? &tmB1_128 : &tmB0;
+        const CUtensorMap* mapA = is1 ? &tmA1 : &tmA0;
+        const CUtensorMap* mapB = is1 ? &tmB1_128 : &tmB0;
         for (int kt = 0; kt < NKT; ++kt) {
           if (g >= ST_T) {
             mbar_wait(empty0 + 8 * s, par ^ 1);
@@ -1124,39 +1405,41 @@ fp8_dual_a_ws9_256_kernel(const __grid_constant__ CUtensorMap tmA0,
           if constexpr (kPdl) {
             if (g < ST_T) {
               mbar_expect_tx(bar, ASZ);
-              tma2d_hint(dst, tmA, kt * KT, row0, bar, pol_el);
+              tma2d_hint(dst, mapA, kt * KT, row0, bar, pol_el);
               ++g;
               if (++s == ST_T) { s = 0; par ^= 1; }
               continue;
             }
           }
           mbar_expect_tx(bar, STB);
-          tma2d_hint(dst, tmA, kt * KT, row0, bar, pol_el);
-          tma2d_hint(dst + ASZ, tmB, kt * KT, col0, bar, pol_ef);
+          tma2d_hint(dst, mapA, kt * KT, row0, bar, pol_el);
+          tma2d_hint(dst + ASZ, mapB, kt * KT, col0, bar, pol_ef);
           ++g;
           if (++s == ST_T) { s = 0; par ^= 1; }
         }
       }
-      const CUtensorMap* tmB2 = is112 ? &tmB1_112 : &tmB1_96;
+      const CUtensorMap* mapB2 = is112 ? &tmB1_112 : &tmB1_96;
       for (int kt = 0; kt < NKT; ++kt) {
         mbar_wait(empty0 + 8 * s, par ^ 1);
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB;
         mbar_expect_tx(bar, tx2);
         tma2d_hint(dst, &tmA1, kt * KT, row0_2, bar, pol_el);
-        tma2d_hint(dst + ASZ, tmB2, kt * KT, col0_2, bar, pol_ef);
+        tma2d_hint(dst + ASZ, mapB2, kt * KT, col0_2, bar, pol_ef);
         if (++s == ST_T) { s = 0; par ^= 1; }
       }
     }
     return;
   }
 
+  wg_reg_inc_232();
+  if constexpr (kPdl) pdl_wait();
   const int wm = warp % WM, wn = warp / WM;
   const float sa0 = __ldg(sa0_p), sa1 = __ldg(sa1_p), sb0 = __ldg(sb0_p), sb1 = __ldg(sb1_p);
   const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ach = lane >> 4;
   const int br = (lane & 7) + (lane >> 4) * 8, bch = (lane >> 3) & 1;
-
   int s = 0, par = 0;
+
   {
     float acc[4][8][4] = {};
     for (int ti = 0; ti < 2; ++ti) {
@@ -1176,18 +1459,16 @@ fp8_dual_a_ws9_256_kernel(const __grid_constant__ CUtensorMap tmA0,
       for (int i = 0; i < 4; ++i) {
         if (is1) epilogue_bf16_sel4<N1, 8, true>(acc[i], out1, rb0 + i * 16, col0, lane, sa1, sb1);
         else     epilogue_bf16_sel4<N0, 8, true>(acc[i], out0, rb0 + i * 16, col0, lane, sa0, sb0);
-        if (ti == 0) {
 #pragma unroll
-          for (int j = 0; j < 8; ++j)
+        for (int j = 0; j < 8; ++j)
 #pragma unroll
-            for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
-        }
+          for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
       }
     }
   }
 
   const int rb0 = row0_2 + warp * 32;
-  constexpr int kPdlTrig = NKT - 16;
+  constexpr int kPdlTrig = NKT - 8;
   if (is112) {
     float acc2[2][14][4] = {};
     for (int kt = 0; kt < NKT; ++kt) {
@@ -1218,7 +1499,7 @@ fp8_dual_a_ws9_256_kernel(const __grid_constant__ CUtensorMap tmA0,
 }
 
 template <bool kPdl>
-__global__ void __launch_bounds__(NT_WS9, 1)
+__global__ void __launch_bounds__(NT_WS12, 1)
 bf16_dual_ws9_256_kernel(const __grid_constant__ CUtensorMap tmA256,
                          const __grid_constant__ CUtensorMap tmB_128,
                          const __grid_constant__ CUtensorMap tmB_112,
@@ -1247,25 +1528,28 @@ bf16_dual_ws9_256_kernel(const __grid_constant__ CUtensorMap tmA256,
   }
   __syncthreads();
 
-  if (warp == NWARP) {
-    if (lane == 0) {
+  if (warp >= NWARP) {
+    wg_reg_dec_24();
+    if (warp == NWARP && lane == 0) {
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA256) : "memory");
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB_128) : "memory");
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB_112) : "memory");
       asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB_96) : "memory");
       const uint64_t pol_el = tma_pol_el(), pol_ef = tma_pol_ef();
+      int s = 0, par = 0, g = 0;
       if constexpr (kPdl) {
         const int nt0 = b >> 1;
-        mbar_expect_tx_only(full0, WSZ);
-        tma2d_hint(sbase + ASZ, &tmB_128, 0, nt0 * BN, full0, pol_ef);
-        mbar_expect_tx_only(full0 + 8, WSZ);
-        tma2d_hint(sbase + STB + ASZ, &tmB_128, KT, nt0 * BN, full0 + 8, pol_ef);
+#pragma unroll
+        for (int ps = 0; ps < ST_T; ++ps) {
+          const uint32_t bar = full0 + 8 * ps, dst = sbase + ps * STB;
+          mbar_expect_tx_only(bar, WSZ);
+          tma2d_hint(dst + ASZ, &tmB_128, ps * KT, nt0 * BN, bar, pol_ef);
+        }
         pdl_wait();
       }
-      int s = 0, par = 0, g = 0;
       for (int ti = 0; ti < 2; ++ti) {
         const int t = b + ti * 48, nt = t >> 1, band = t & 1;
-        const int row0 = band * 256, col0 = nt * BN;
+        const int row0 = band * 256, wrow0 = nt * BN;
         for (int kt = 0; kt < NKT; ++kt) {
           if (g >= ST_T) {
             mbar_wait(empty0 + 8 * s, par ^ 1);
@@ -1283,30 +1567,32 @@ bf16_dual_ws9_256_kernel(const __grid_constant__ CUtensorMap tmA256,
           }
           mbar_expect_tx(bar, STB);
           tma2d_hint(dst, &tmA256, kt * KT, row0, bar, pol_el);
-          tma2d_hint(dst + ASZ, &tmB_128, kt * KT, col0, bar, pol_ef);
+          tma2d_hint(dst + ASZ, &tmB_128, kt * KT, wrow0, bar, pol_ef);
           ++g;
           if (++s == ST_T) { s = 0; par ^= 1; }
         }
       }
-      const CUtensorMap* tmB2 = is112 ? &tmB_112 : &tmB_96;
+      const CUtensorMap* mapB2 = is112 ? &tmB_112 : &tmB_96;
       for (int kt = 0; kt < NKT; ++kt) {
         mbar_wait(empty0 + 8 * s, par ^ 1);
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         const uint32_t bar = full0 + 8 * s, dst = sbase + s * STB;
         mbar_expect_tx(bar, tx2);
         tma2d_hint(dst, &tmA256, kt * KT, row0_2, bar, pol_el);
-        tma2d_hint(dst + ASZ, tmB2, kt * KT, w_row0_2, bar, pol_ef);
+        tma2d_hint(dst + ASZ, mapB2, kt * KT, w_row0_2, bar, pol_ef);
         if (++s == ST_T) { s = 0; par ^= 1; }
       }
     }
     return;
   }
 
+  wg_reg_inc_232();
+  if constexpr (kPdl) pdl_wait();
   const int wm = warp % WM, wn = warp / WM;
   const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ach = lane >> 4;
   const int br = (lane & 7) + (lane >> 4) * 8, bch = (lane >> 3) & 1;
-
   int s = 0, par = 0;
+
   {
     float acc[4][8][4] = {};
     for (int ti = 0; ti < 2; ++ti) {
@@ -1326,12 +1612,10 @@ bf16_dual_ws9_256_kernel(const __grid_constant__ CUtensorMap tmA256,
       for (int i = 0; i < 4; ++i) {
         if (is1) epilogue_bf16_sel4<N1, 8, false>(acc[i], out1, rb0 + i * 16, col0, lane, 1.f, 1.f);
         else     epilogue_bf16_sel4<N0, 8, false>(acc[i], out0, rb0 + i * 16, col0, lane, 1.f, 1.f);
-        if (ti == 0) {
 #pragma unroll
-          for (int j = 0; j < 8; ++j)
+        for (int j = 0; j < 8; ++j)
 #pragma unroll
-            for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
-        }
+          for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
       }
     }
   }
@@ -1365,22 +1649,6 @@ bf16_dual_ws9_256_kernel(const __grid_constant__ CUtensorMap tmA256,
 #pragma unroll
     for (int i = 0; i < 2; ++i) epilogue_bf16_sel4<N1, 12, false>(acc2[i], out1, rb0 + i * 16, col0_2, lane, 1.f, 1.f);
   }
-}
-
-template <typename Kernel, typename... Args>
-static inline cudaError_t launch_pdl_ex(Kernel kernel, int blocks, int threads, size_t smem, cudaStream_t st,
-                                        const Args&... args) {
-  cudaLaunchConfig_t cfg = {};
-  cfg.gridDim = dim3(blocks, 1, 1);
-  cfg.blockDim = dim3(threads, 1, 1);
-  cfg.dynamicSmemBytes = smem;
-  cfg.stream = st;
-  cudaLaunchAttribute attr[1];
-  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attr[0].val.programmaticStreamSerializationAllowed = 1;
-  cfg.attrs = attr;
-  cfg.numAttrs = 1;
-  return cudaLaunchKernelEx(&cfg, kernel, args...);
 }
 
 }  // namespace swiglu_ws
