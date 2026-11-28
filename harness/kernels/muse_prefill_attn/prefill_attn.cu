@@ -218,6 +218,23 @@ __device__ __forceinline__ void issue_kv64_flat(
   }
 }
 
+__device__ __forceinline__ void issue_kv64_flat_128(
+    uint4 smem_tile[64][16],
+    const __nv_bfloat16* __restrict__ flat_base,
+    int tok_base,
+    int tid) {
+  const int r_in_8 = tid >> 4;
+  const int c = tid & 15;
+  const int c_phys = c ^ r_in_8;
+  const uint4* src = reinterpret_cast<const uint4*>(
+      flat_base + static_cast<int64_t>(tok_base) * 128) + r_in_8 * 16 + c;
+  #pragma unroll
+  for (int u = 0; u < 8; ++u) {
+    const int r = (u << 3) + r_in_8;
+    cp_async_16(smem_u32(&smem_tile[r][c_phys]), src + u * 128);
+  }
+}
+
 template <bool UseRope, bool CacheFP32>
 __device__ __forceinline__ void load_rope_cs(
     int64_t pos, int cache_rows, const void* __restrict__ cos_sin_cache, int lane,
@@ -404,20 +421,75 @@ __global__ __launch_bounds__(256) void prefill_kv_only_kernel(
   const int total_warps = static_cast<int>(gridDim.x) * warps_per_blk;
   const int lane = static_cast<int>(threadIdx.x) & 31;
 
+  const int64_t flat_v_stride = static_cast<int64_t>(num_tokens) * 128;
+  const int64_t flat_h_stride = flat_v_stride * 2;
+
+  int64_t slot0 = -1;
+  __nv_bfloat16* dst0_pre = nullptr;
+  __nv_bfloat16* dst1_pre = nullptr;
+  float c0_pre = 0.f, c1_pre = 0.f, c2_pre = 0.f, c3_pre = 0.f;
+  float s0_pre = 0.f, s1_pre = 0.f, s2_pre = 0.f, s3_pre = 0.f;
   if constexpr (kPdl) {
+    if (warp_global < num_tokens) {
+      slot0 = __ldg(slot_mapping + warp_global);
+      if constexpr (UseRope) {
+        load_rope_cs<true, CacheFP32>(__ldg(positions + warp_global), cache_rows, cos_sin_cache, lane,
+                                      c0_pre, c1_pre, c2_pre, c3_pre, s0_pre, s1_pre, s2_pre, s3_pre);
+      }
+      if (slot0 >= 0) {
+        const int64_t blk = (block_size == 16) ? (slot0 >> 4)
+                          : ((block_size == 64) ? (slot0 >> 6) : (slot0 / block_size));
+        const int64_t off = (block_size == 16) ? (slot0 & 15)
+                          : ((block_size == 64) ? (slot0 & 63) : (slot0 - blk * block_size));
+        dst0_pre = kv_cache + blk * stride_block + off * stride_slot + lane * 4;
+        dst1_pre = dst0_pre + stride_kv_head;
+      }
+    }
     asm volatile("griddepcontrol.wait;" ::: "memory");
     asm volatile("griddepcontrol.launch_dependents;");
   }
 
-  const int64_t flat_v_stride = static_cast<int64_t>(num_tokens) * 128;
-  const int64_t flat_h_stride = flat_v_stride * 2;
-
   for (int t = warp_global; t < num_tokens; t += total_warps) {
-    const int64_t slot = __ldg(slot_mapping + t);
+    int64_t slot;
     float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
-    if constexpr (UseRope) {
-      load_rope_cs<true, CacheFP32>(__ldg(positions + t), cache_rows, cos_sin_cache, lane,
-                                    c0, c1, c2, c3, s0, s1, s2, s3);
+    __nv_bfloat16* dst0 = nullptr;
+    __nv_bfloat16* dst1 = nullptr;
+    if constexpr (kPdl) {
+      if (t == warp_global) {
+        slot = slot0;
+        c0 = c0_pre; c1 = c1_pre; c2 = c2_pre; c3 = c3_pre;
+        s0 = s0_pre; s1 = s1_pre; s2 = s2_pre; s3 = s3_pre;
+        dst0 = dst0_pre;
+        dst1 = dst1_pre;
+      } else {
+        slot = __ldg(slot_mapping + t);
+        if constexpr (UseRope) {
+          load_rope_cs<true, CacheFP32>(__ldg(positions + t), cache_rows, cos_sin_cache, lane,
+                                        c0, c1, c2, c3, s0, s1, s2, s3);
+        }
+        if (slot >= 0) {
+          const int64_t blk = (block_size == 16) ? (slot >> 4)
+                            : ((block_size == 64) ? (slot >> 6) : (slot / block_size));
+          const int64_t off = (block_size == 16) ? (slot & 15)
+                            : ((block_size == 64) ? (slot & 63) : (slot - blk * block_size));
+          dst0 = kv_cache + blk * stride_block + off * stride_slot + lane * 4;
+          dst1 = dst0 + stride_kv_head;
+        }
+      }
+    } else {
+      slot = __ldg(slot_mapping + t);
+      if constexpr (UseRope) {
+        load_rope_cs<true, CacheFP32>(__ldg(positions + t), cache_rows, cos_sin_cache, lane,
+                                      c0, c1, c2, c3, s0, s1, s2, s3);
+      }
+      if (slot >= 0) {
+        const int64_t blk = (block_size == 16) ? (slot >> 4)
+                          : ((block_size == 64) ? (slot >> 6) : (slot / block_size));
+        const int64_t off = (block_size == 16) ? (slot & 15)
+                          : ((block_size == 64) ? (slot & 63) : (slot - blk * block_size));
+        dst0 = kv_cache + blk * stride_block + off * stride_slot + lane * 4;
+        dst1 = dst0 + stride_kv_head;
+      }
     }
 
     const __nv_bfloat16* row_kv = qkv + static_cast<int64_t>(t) * 4608 + 4096;
@@ -426,15 +498,64 @@ __global__ __launch_bounds__(256) void prefill_kv_only_kernel(
     const uint2 v0_raw = ld2_cs(row_kv + 256 + lane * 4);
     const uint2 v1_raw = ld2_cs(row_kv + 384 + lane * 4);
 
-    if constexpr (kDiscardKV) {
-      __syncwarp();
-      if (lane < 8) {
-        discard_l2_128(reinterpret_cast<const char*>(row_kv) + (lane << 7));
-      }
+    float kx[2][4];
+    float kss[2];
+    const uint2 kraw[2] = {k0_raw, k1_raw};
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const __nv_bfloat16* vb = reinterpret_cast<const __nv_bfloat16*>(&kraw[h]);
+      kx[h][0] = __bfloat162float(vb[0]);
+      kx[h][1] = __bfloat162float(vb[1]);
+      kx[h][2] = __bfloat162float(vb[2]);
+      kx[h][3] = __bfloat162float(vb[3]);
+      float s = __fmaf_rn(kx[h][0], kx[h][0], 0.0f);
+      s = __fmaf_rn(kx[h][1], kx[h][1], s);
+      s = __fmaf_rn(kx[h][2], kx[h][2], s);
+      kss[h] = __fmaf_rn(kx[h][3], kx[h][3], s);
     }
-
-    const uint2 k0_out = qk_norm_rope_head<UseRope, false>(k0_raw, eps, 1.0f, lane, c0, c1, c2, c3, s0, s1, s2, s3);
-    const uint2 k1_out = qk_norm_rope_head<UseRope, false>(k1_raw, eps, 1.0f, lane, c0, c1, c2, c3, s0, s1, s2, s3);
+    #pragma unroll
+    for (int delta = 16; delta >= 1; delta >>= 1) {
+      kss[0] = __fadd_rn(kss[0], __shfl_xor_sync(0xffffffffu, kss[0], delta));
+      kss[1] = __fadd_rn(kss[1], __shfl_xor_sync(0xffffffffu, kss[1], delta));
+    }
+    float kr[2];
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      float mv;
+      asm("div.full.f32 %0, %1, 0f43000000;" : "=f"(mv) : "f"(kss[h]));
+      asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(kr[h]) : "f"(mv + eps));
+    }
+    uint2 kout[2];
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      float y0 = __fmul_rn(kx[h][0], kr[h]);
+      float y1 = __fmul_rn(kx[h][1], kr[h]);
+      float y2 = __fmul_rn(kx[h][2], kr[h]);
+      float y3 = __fmul_rn(kx[h][3], kr[h]);
+      float o0 = y0, o1 = y1, o2 = y2, o3 = y3;
+      if constexpr (UseRope) {
+        const float p0 = __shfl_xor_sync(0xffffffffu, y0, 16);
+        const float p1 = __shfl_xor_sync(0xffffffffu, y1, 16);
+        const float p2 = __shfl_xor_sync(0xffffffffu, y2, 16);
+        const float p3 = __shfl_xor_sync(0xffffffffu, y3, 16);
+        if (lane < 16) {
+          o0 = __fmaf_rn(y0, c0, -__fmul_rn(p0, s0));
+          o1 = __fmaf_rn(y1, c1, -__fmul_rn(p1, s1));
+          o2 = __fmaf_rn(y2, c2, -__fmul_rn(p2, s2));
+          o3 = __fmaf_rn(y3, c3, -__fmul_rn(p3, s3));
+        } else {
+          o0 = __fmaf_rn(y0, c0, __fmul_rn(p0, s0));
+          o1 = __fmaf_rn(y1, c1, __fmul_rn(p1, s1));
+          o2 = __fmaf_rn(y2, c2, __fmul_rn(p2, s2));
+          o3 = __fmaf_rn(y3, c3, __fmul_rn(p3, s3));
+        }
+      }
+      const __nv_bfloat162 b0 = __floats2bfloat162_rn(o0, o1);
+      const __nv_bfloat162 b1 = __floats2bfloat162_rn(o2, o3);
+      kout[h] = make_uint2(*reinterpret_cast<const uint32_t*>(&b0), *reinterpret_cast<const uint32_t*>(&b1));
+    }
+    const uint2 k0_out = kout[0];
+    const uint2 k1_out = kout[1];
 
     const int64_t t_off = static_cast<int64_t>(t) * 128 + lane * 4;
     *reinterpret_cast<uint2*>(kv_flat + t_off) = k0_out;
@@ -443,16 +564,17 @@ __global__ __launch_bounds__(256) void prefill_kv_only_kernel(
     *reinterpret_cast<uint2*>(kv_flat + flat_h_stride + flat_v_stride + t_off) = v1_raw;
 
     if (slot >= 0) {
-      const int64_t blk = (block_size == 16) ? (slot >> 4)
-                        : ((block_size == 64) ? (slot >> 6) : (slot / block_size));
-      const int64_t off = (block_size == 16) ? (slot & 15)
-                        : ((block_size == 64) ? (slot & 63) : (slot - blk * block_size));
-      __nv_bfloat16* dst0 = kv_cache + blk * stride_block + off * stride_slot + lane * 4;
-      __nv_bfloat16* dst1 = dst0 + stride_kv_head;
       st2_cs(dst0, k0_out);
       st2_cs(dst0 + 128, v0_raw);
       st2_cs(dst1, k1_out);
       st2_cs(dst1 + 128, v1_raw);
+    }
+
+    if constexpr (kDiscardKV) {
+      __syncwarp();
+      if (lane < 8) {
+        discard_l2_128(reinterpret_cast<const char*>(row_kv) + (lane << 7));
+      }
     }
   }
 
@@ -927,6 +1049,662 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
 }
 
 // =================================================================================================
+// =================================================================================================
+template <bool kTrim>
+__device__ __forceinline__ void prefill_pv_half(
+    const uint32_t (*p_frag)[4], const uint4 (&v)[64][16],
+    float (&o_frag)[16][4], int lane, int lim) {
+  uint32_t v_cur[4], v_nxt[4];
+  ldsm4_v_pair64(v_cur, v, 0, 0, lane);
+  #pragma unroll
+  for (int ks_local = 0; ks_local < 4; ++ks_local) {
+    if (!kTrim || ks_local < lim) {
+      #pragma unroll
+      for (int dp = 0; dp < 8; ++dp) {
+        const int n_dp = (dp + 1) & 7;
+        const int n_ks = ks_local + (dp == 7 ? 1 : 0);
+        if (n_ks < (kTrim ? lim : 4)) {
+          ldsm4_v_pair64(v_nxt, v, n_dp, n_ks, lane);
+        }
+        mma_m16n8k16_bf16(p_frag[ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
+        mma_m16n8k16_bf16(p_frag[ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
+        v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
+      }
+    }
+  }
+}
+
+template <bool UseRope, bool CacheFP32, bool kDiscardL2>
+__device__ __forceinline__ void prefill_q_prologue_db(
+    uint32_t (&q_frag)[8][4], uint4 (*q_tiles)[16][16],
+    const __nv_bfloat16* __restrict__ qkv, const int64_t* __restrict__ positions,
+    const void* __restrict__ cos_sin_cache, int cache_rows,
+    float eps, float qscale, int q_tok, int kv_head, int warp_id, int lane) {
+  float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+  if constexpr (UseRope) {
+    load_rope_cs<true, CacheFP32>(__ldg(positions + q_tok), cache_rows, cos_sin_cache, lane,
+                                  c0, c1, c2, c3, s0, s1, s2, s3);
+  }
+  const __nv_bfloat16* const q_row =
+      qkv + static_cast<int64_t>(q_tok) * 4608 + static_cast<int64_t>(kv_head * 16) * 128;
+  const int c_log = lane >> 1;
+  const int c_half = lane & 1;
+
+  uint2 raw_cur[4];
+  #pragma unroll
+  for (int h = 0; h < 4; ++h) {
+    raw_cur[h] = *reinterpret_cast<const uint2*>(q_row + h * 128 + lane * 4);
+  }
+  #pragma unroll
+  for (int hb = 0; hb < 16; hb += 4) {
+    uint2 raw_nxt[4];
+    if (hb + 4 < 16) {
+      #pragma unroll
+      for (int h = 0; h < 4; ++h) {
+        raw_nxt[h] = *reinterpret_cast<const uint2*>(q_row + (hb + 4 + h) * 128 + lane * 4);
+      }
+    }
+    uint2 ov[4];
+    q_norm_rope_4heads<UseRope>(raw_cur, ov, eps, qscale, lane, c0, c1, c2, c3, s0, s1, s2, s3);
+    #pragma unroll
+    for (int h = 0; h < 4; ++h) {
+      const int h_loc = hb + h;
+      const int c_phys = c_log ^ (h_loc & 7);
+      reinterpret_cast<uint2*>(&q_tiles[warp_id][h_loc][c_phys])[c_half] = ov[h];
+    }
+    if (hb + 4 < 16) {
+      #pragma unroll
+      for (int h = 0; h < 4; ++h) raw_cur[h] = raw_nxt[h];
+    }
+  }
+  __syncwarp();
+  if constexpr (kDiscardL2) {
+    discard_l2_128(reinterpret_cast<const char*>(q_row) + (lane << 7));
+  }
+  #pragma unroll
+  for (int ks = 0; ks < 8; ++ks) {
+    ldsm4_swizzled(q_frag[ks], q_tiles[warp_id], ks, lane);
+  }
+}
+
+__device__ __forceinline__ bool prefill_softmax_diag(
+    float (&s_frag)[16][4], uint32_t (&p_frag)[8][4],
+    float& row_max0, float& row_max1, float& row_sum0, float& row_sum1,
+    int block_tok_base, int q_tok, int diag_pairs, int tid_in_grp, float scale_log2) {
+  float m0 = -INFINITY, m1 = -INFINITY;
+  #pragma unroll
+  for (int ni = 0; ni < 16; ++ni) {
+    if (ni >= 2 * diag_pairs) {
+      s_frag[ni][0] = s_frag[ni][1] = s_frag[ni][2] = s_frag[ni][3] = -INFINITY;
+      continue;
+    }
+    const int col0 = block_tok_base + (ni << 3) + (tid_in_grp << 1);
+    const int col1 = col0 + 1;
+    if (col0 > q_tok) { s_frag[ni][0] = -INFINITY; s_frag[ni][2] = -INFINITY; }
+    if (col1 > q_tok) { s_frag[ni][1] = -INFINITY; s_frag[ni][3] = -INFINITY; }
+    m0 = max_ftz_f32(m0, max_ftz_f32(s_frag[ni][0], s_frag[ni][1]));
+    m1 = max_ftz_f32(m1, max_ftz_f32(s_frag[ni][2], s_frag[ni][3]));
+  }
+  m0 = max_ftz_f32(m0, __shfl_xor_sync(0xffffffffu, m0, 2));
+  m0 = max_ftz_f32(m0, __shfl_xor_sync(0xffffffffu, m0, 1));
+  m1 = max_ftz_f32(m1, __shfl_xor_sync(0xffffffffu, m1, 2));
+  m1 = max_ftz_f32(m1, __shfl_xor_sync(0xffffffffu, m1, 1));
+  row_max0 = m0;
+  row_max1 = m1;
+
+  const float max_sc0 = (row_max0 == -INFINITY) ? 0.0f : mul_ftz_f32(scale_log2, row_max0);
+  const float max_sc1 = (row_max1 == -INFINITY) ? 0.0f : mul_ftz_f32(scale_log2, row_max1);
+  const bool skip_masked_exp = scale_log2 >= 0x1p-126f &&
+      scale_log2 < INFINITY && fabsf(max_sc0) < INFINITY && fabsf(max_sc1) < INFINITY;
+
+  #pragma unroll
+  for (int ni = 0; ni < 16; ++ni) {
+    if (skip_masked_exp && ni >= 2 * diag_pairs) {
+      p_frag[ni >> 1][(ni & 1) << 1] = 0;
+      p_frag[ni >> 1][((ni & 1) << 1) + 1] = 0;
+      continue;
+    }
+    const float p0 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][0], scale_log2), max_sc0));
+    const float p1 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][1], scale_log2), max_sc0));
+    const float p2 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][2], scale_log2), max_sc1));
+    const float p3 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][3], scale_log2), max_sc1));
+    if (ni == 0) {
+      row_sum0 = add_ftz_f32(p0, p1);
+      row_sum1 = add_ftz_f32(p2, p3);
+    } else {
+      row_sum0 = add_ftz_f32(add_ftz_f32(row_sum0, p0), p1);
+      row_sum1 = add_ftz_f32(add_ftz_f32(row_sum1, p2), p3);
+    }
+    const __nv_bfloat162 pb0 = __floats2bfloat162_rn(p0, p1);
+    const __nv_bfloat162 pb1 = __floats2bfloat162_rn(p2, p3);
+    const int kp = ni >> 1;
+    const int hi = (ni & 1) << 1;
+    p_frag[kp][hi + 0] = *reinterpret_cast<const uint32_t*>(&pb0);
+    p_frag[kp][hi + 1] = *reinterpret_cast<const uint32_t*>(&pb1);
+  }
+  return skip_masked_exp;
+}
+
+__device__ __forceinline__ void prefill_softmax_full(
+    const float (&s_frag)[16][4], uint32_t (&p_frag)[8][4],
+    float (&o_frag)[16][4],
+    float& row_max0, float& row_max1, float& row_sum0, float& row_sum1,
+    float scale_log2) {
+  float m0 = -INFINITY, m1 = -INFINITY;
+  #pragma unroll
+  for (int ni = 0; ni < 16; ++ni) {
+    m0 = max_ftz_f32(m0, max_ftz_f32(s_frag[ni][0], s_frag[ni][1]));
+    m1 = max_ftz_f32(m1, max_ftz_f32(s_frag[ni][2], s_frag[ni][3]));
+  }
+  m0 = max_ftz_f32(m0, __shfl_xor_sync(0xffffffffu, m0, 2));
+  m0 = max_ftz_f32(m0, __shfl_xor_sync(0xffffffffu, m0, 1));
+  m1 = max_ftz_f32(m1, __shfl_xor_sync(0xffffffffu, m1, 2));
+  m1 = max_ftz_f32(m1, __shfl_xor_sync(0xffffffffu, m1, 1));
+
+  const float prev0 = row_max0, prev1 = row_max1;
+  row_max0 = max_ftz_f32(prev0, m0);
+  row_max1 = max_ftz_f32(prev1, m1);
+  const float cur0 = (row_max0 == -INFINITY) ? 0.0f : row_max0;
+  const float cur1 = (row_max1 == -INFINITY) ? 0.0f : row_max1;
+  const float sc0 = fast_exp2f(mul_ftz_f32(scale_log2, sub_ftz_f32(prev0, cur0)));
+  const float sc1 = fast_exp2f(mul_ftz_f32(scale_log2, sub_ftz_f32(prev1, cur1)));
+  #pragma unroll
+  for (int dt = 0; dt < 16; ++dt) {
+    o_frag[dt][0] = mul_ftz_f32(o_frag[dt][0], sc0);
+    o_frag[dt][1] = mul_ftz_f32(o_frag[dt][1], sc0);
+    o_frag[dt][2] = mul_ftz_f32(o_frag[dt][2], sc1);
+    o_frag[dt][3] = mul_ftz_f32(o_frag[dt][3], sc1);
+  }
+
+  const float max_sc0 = (row_max0 == -INFINITY) ? 0.0f : mul_ftz_f32(scale_log2, row_max0);
+  const float max_sc1 = (row_max1 == -INFINITY) ? 0.0f : mul_ftz_f32(scale_log2, row_max1);
+
+  #pragma unroll
+  for (int ni = 0; ni < 16; ++ni) {
+    const float p0 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][0], scale_log2), max_sc0));
+    const float p1 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][1], scale_log2), max_sc0));
+    const float p2 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][2], scale_log2), max_sc1));
+    const float p3 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s_frag[ni][3], scale_log2), max_sc1));
+    if (ni == 0) {
+      row_sum0 = add_ftz_f32(fma_rn_ftz_f32(row_sum0, sc0, p0), p1);
+      row_sum1 = add_ftz_f32(fma_rn_ftz_f32(row_sum1, sc1, p2), p3);
+    } else {
+      row_sum0 = add_ftz_f32(add_ftz_f32(row_sum0, p0), p1);
+      row_sum1 = add_ftz_f32(add_ftz_f32(row_sum1, p2), p3);
+    }
+    const __nv_bfloat162 pb0 = __floats2bfloat162_rn(p0, p1);
+    const __nv_bfloat162 pb1 = __floats2bfloat162_rn(p2, p3);
+    const int kp = ni >> 1;
+    const int hi = (ni & 1) << 1;
+    p_frag[kp][hi + 0] = *reinterpret_cast<const uint32_t*>(&pb0);
+    p_frag[kp][hi + 1] = *reinterpret_cast<const uint32_t*>(&pb1);
+  }
+}
+
+template <int Mode, bool kDiscardL2, bool kLutSigmoid>
+__device__ __forceinline__ void prefill_epilogue_fast(
+    const float (&o_frag)[16][4], uint32_t (*o_tiles)[16][64],
+    float row_sum0, float row_sum1,
+    const __nv_bfloat16* __restrict__ gate_ptr,
+    const float* __restrict__ fp8_scale_ptr,
+    void* __restrict__ out_ptr,
+    int q_tok, int kv_head, int warp_id, int lane, int group_id, int tid_in_grp) {
+  row_sum0 = add_ftz_f32(row_sum0, __shfl_xor_sync(0xffffffffu, row_sum0, 2));
+  row_sum0 = add_ftz_f32(row_sum0, __shfl_xor_sync(0xffffffffu, row_sum0, 1));
+  row_sum1 = add_ftz_f32(row_sum1, __shfl_xor_sync(0xffffffffu, row_sum1, 2));
+  row_sum1 = add_ftz_f32(row_sum1, __shfl_xor_sync(0xffffffffu, row_sum1, 1));
+  const float inv0 = (row_sum0 == 0.0f || row_sum0 != row_sum0) ? 1.0f : fast_rcpf(row_sum0);
+  const float inv1 = (row_sum1 == 0.0f || row_sum1 != row_sum1) ? 1.0f : fast_rcpf(row_sum1);
+
+  #pragma unroll
+  for (int dt = 0; dt < 16; ++dt) {
+    const int c32 = (dt << 2) + tid_in_grp;
+    const __nv_bfloat162 ob0 = __floats2bfloat162_rn(mul_ftz_f32(o_frag[dt][0], inv0), mul_ftz_f32(o_frag[dt][1], inv0));
+    const __nv_bfloat162 ob1 = __floats2bfloat162_rn(mul_ftz_f32(o_frag[dt][2], inv1), mul_ftz_f32(o_frag[dt][3], inv1));
+    o_tiles[warp_id][group_id][c32]     = *reinterpret_cast<const uint32_t*>(&ob0);
+    o_tiles[warp_id][group_id + 8][c32] = *reinterpret_cast<const uint32_t*>(&ob1);
+  }
+  __syncwarp();
+
+  const int64_t tok_head_base = static_cast<int64_t>(q_tok) * 4096 + static_cast<int64_t>(kv_head * 16) * 128;
+  const uint4* o_v4 = reinterpret_cast<const uint4*>(o_tiles[warp_id]);
+  if constexpr (Mode == 0) {
+    uint4* dst = reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(out_ptr) + tok_head_base);
+    #pragma unroll
+    for (int u = 0; u < 8; ++u) {
+      const int idx = (u << 5) + lane;
+      dst[idx] = o_v4[idx];
+    }
+  } else if constexpr (Mode == 1) {
+    const uint4* g_v4 = reinterpret_cast<const uint4*>(gate_ptr + tok_head_base);
+    uint4* dst = reinterpret_cast<uint4*>(static_cast<__nv_bfloat16*>(out_ptr) + tok_head_base);
+    #pragma unroll
+    for (int u = 0; u < 8; ++u) {
+      const int idx = (u << 5) + lane;
+      const uint4 ov = o_v4[idx];
+      const uint4 gv = g_v4[idx];
+      const uint32_t ow[4] = {ov.x, ov.y, ov.z, ov.w};
+      const uint32_t gw[4] = {gv.x, gv.y, gv.z, gv.w};
+      uint32_t rw[4];
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float2 of = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ow[i]));
+        float sx, sy;
+        if constexpr (kLutSigmoid) {
+          sx = __ldg(bf16_sigmoid_lut + (gw[i] & 0xffffu));
+          sy = __ldg(bf16_sigmoid_lut + (gw[i] >> 16));
+        } else {
+          const float2 gf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gw[i]));
+          sx = triton_sigmoid(gf.x);
+          sy = triton_sigmoid(gf.y);
+        }
+        const __nv_bfloat162 r = __floats2bfloat162_rn(__fmul_rn(sx, of.x), __fmul_rn(sy, of.y));
+        rw[i] = *reinterpret_cast<const uint32_t*>(&r);
+      }
+      dst[idx] = make_uint4(rw[0], rw[1], rw[2], rw[3]);
+    }
+    if constexpr (kDiscardL2) {
+      __syncwarp();
+      discard_l2_128(reinterpret_cast<const char*>(g_v4) + (lane << 7));
+    }
+  } else {
+    const float inv_s = full_divide(1.0f, __ldg(fp8_scale_ptr));
+    const uint4* g_v4 = reinterpret_cast<const uint4*>(gate_ptr + tok_head_base);
+    uint2* dst = reinterpret_cast<uint2*>(static_cast<uint8_t*>(out_ptr) + tok_head_base);
+    #pragma unroll
+    for (int u = 0; u < 8; ++u) {
+      const int idx = (u << 5) + lane;
+      const uint4 ov = o_v4[idx];
+      const uint4 gv = g_v4[idx];
+      const uint32_t ow[4] = {ov.x, ov.y, ov.z, ov.w};
+      const uint32_t gw[4] = {gv.x, gv.y, gv.z, gv.w};
+      uint16_t qw[4];
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float2 of = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ow[i]));
+        float sx, sy;
+        if constexpr (kLutSigmoid) {
+          sx = __ldg(bf16_sigmoid_lut + (gw[i] & 0xffffu));
+          sy = __ldg(bf16_sigmoid_lut + (gw[i] >> 16));
+        } else {
+          const float2 gf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gw[i]));
+          sx = triton_sigmoid(gf.x);
+          sy = triton_sigmoid(gf.y);
+        }
+        qw[i] = fp8x2(canonicalize_nan(__fmul_rn(__fmul_rn(sx, of.x), inv_s)),
+                      canonicalize_nan(__fmul_rn(__fmul_rn(sy, of.y), inv_s)));
+      }
+      dst[idx] = make_uint2(static_cast<uint32_t>(qw[0]) | (static_cast<uint32_t>(qw[1]) << 16),
+                            static_cast<uint32_t>(qw[2]) | (static_cast<uint32_t>(qw[3]) << 16));
+    }
+    if constexpr (kDiscardL2) {
+      __syncwarp();
+      discard_l2_128(reinterpret_cast<const char*>(g_v4) + (lane << 7));
+    }
+  }
+}
+
+template <int Mode, bool UseRope, bool CacheFP32, bool kPdl, bool kDiscardL2, bool kLutSigmoid = false>
+__global__ __launch_bounds__(128, 2) void prefill_attn_fused_512_v4_128_kernel(
+    const __nv_bfloat16* __restrict__ qkv,
+    const int64_t* __restrict__ positions,
+    const void* __restrict__ cos_sin_cache,
+    const __nv_bfloat16* __restrict__ kv_flat,
+    const __nv_bfloat16* __restrict__ gate_ptr,
+    const float* __restrict__ fp8_scale_ptr,
+    void* __restrict__ out_ptr,
+    int cache_rows,
+    float eps,
+    float qscale,
+    float scale_log2) {
+  __shared__ __align__(128) uint4 kv_smem[2][64][16];
+
+  const int lin = static_cast<int>(blockIdx.x);
+  const int kv_head = lin & 1;
+  const int m_grp4 = 127 - (lin >> 1);
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int group_id = lane >> 2;
+  const int tid_in_grp = lane & 3;
+
+  const int q_tok = (m_grp4 << 2) + warp_id;
+  const int diag_nb = (m_grp4 >> 5);
+  const bool half_only = ((m_grp4 & 31) < 16);
+  const int diag_pairs = ((m_grp4 & 31) >> 2) + 1;
+
+  uint32_t q_frag[8][4];
+  prefill_q_prologue_db<UseRope, CacheFP32, kDiscardL2>(
+      q_frag, reinterpret_cast<uint4 (*)[16][16]>(kv_smem),
+      qkv, positions, cos_sin_cache, cache_rows, eps, qscale, q_tok, kv_head, warp_id, lane);
+
+  if constexpr (kPdl) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
+  __syncthreads();
+
+  const __nv_bfloat16* const k_flat = kv_flat + static_cast<int64_t>(kv_head) * (2 * 512 * 128);
+  const __nv_bfloat16* const v_flat = k_flat + (512 * 128);
+
+  float o_frag[16][4];
+  #pragma unroll
+  for (int dt = 0; dt < 16; ++dt) {
+    o_frag[dt][0] = 0.0f; o_frag[dt][1] = 0.0f; o_frag[dt][2] = 0.0f; o_frag[dt][3] = 0.0f;
+  }
+  float row_max0 = -INFINITY, row_max1 = -INFINITY;
+  float row_sum0 = 0.0f, row_sum1 = 0.0f;
+
+  issue_kv64_flat_128(kv_smem[0], k_flat, diag_nb << 7, tid);
+  cp_async_commit();
+
+  {
+    const int block_tok_base = diag_nb << 7;
+    float s_frag[16][4];
+    #pragma unroll
+    for (int ni = 0; ni < 16; ++ni) {
+      s_frag[ni][0] = 0.0f; s_frag[ni][1] = 0.0f; s_frag[ni][2] = 0.0f; s_frag[ni][3] = 0.0f;
+    }
+    uint32_t p_frag[8][4];
+    if (half_only) {
+      issue_kv64_flat_128(kv_smem[1], v_flat, block_tok_base, tid);
+      cp_async_commit();
+      cp_async_wait<1>();
+      __syncthreads();
+      prefill_qk_half<true>(q_frag, kv_smem[0], s_frag, lane, diag_pairs);
+      __syncthreads();
+      if (diag_nb > 0) {
+        issue_kv64_flat_128(kv_smem[0], k_flat, (diag_nb - 1) << 7, tid);
+        cp_async_commit();
+      }
+    } else {
+      const int hi_pairs = diag_pairs - 4;
+      issue_kv64_flat_128(kv_smem[1], k_flat, block_tok_base + 64, tid);
+      cp_async_commit();
+      cp_async_wait<1>();
+      __syncthreads();
+      prefill_qk_half<false>(q_frag, kv_smem[0], s_frag, lane, 4);
+      __syncthreads();
+
+      issue_kv64_flat_128(kv_smem[0], v_flat, block_tok_base, tid);
+      cp_async_commit();
+      cp_async_wait<1>();
+      __syncthreads();
+      prefill_qk_half<true>(q_frag, kv_smem[1], s_frag + 8, lane, hi_pairs);
+      __syncthreads();
+
+      issue_kv64_flat_128(kv_smem[1], v_flat, block_tok_base + 64, tid);
+      cp_async_commit();
+    }
+
+    const bool skip_masked_exp = prefill_softmax_diag(
+        s_frag, p_frag, row_max0, row_max1, row_sum0, row_sum1,
+        block_tok_base, q_tok, diag_pairs, tid_in_grp, scale_log2);
+
+    if (half_only) {
+      if (diag_nb > 0) {
+        cp_async_wait<1>();
+      } else {
+        cp_async_wait<0>();
+        if constexpr (kPdl) asm volatile("griddepcontrol.launch_dependents;");
+      }
+      __syncthreads();
+      const int pv_lo_lim = skip_masked_exp ? diag_pairs : 4;
+      prefill_pv_half<true>(p_frag, kv_smem[1], o_frag, lane, pv_lo_lim);
+      if (diag_nb > 0) __syncthreads();
+    } else {
+      const int hi_pairs = diag_pairs - 4;
+      cp_async_wait<1>();
+      __syncthreads();
+      prefill_pv_half<false>(p_frag, kv_smem[0], o_frag, lane, 4);
+      __syncthreads();
+
+      if (diag_nb > 0) {
+        issue_kv64_flat_128(kv_smem[0], k_flat, (diag_nb - 1) << 7, tid);
+        cp_async_commit();
+        cp_async_wait<1>();
+      } else {
+        cp_async_wait<0>();
+        if constexpr (kPdl) asm volatile("griddepcontrol.launch_dependents;");
+      }
+      __syncthreads();
+      const int pv_hi_lim = skip_masked_exp ? hi_pairs : 4;
+      prefill_pv_half<true>(p_frag + 4, kv_smem[1], o_frag, lane, pv_hi_lim);
+      if (diag_nb > 0) __syncthreads();
+    }
+  }
+
+  for (int nb = diag_nb - 1; nb >= 0; --nb) {
+    const int block_tok_base = nb << 7;
+    float s_frag[16][4];
+    #pragma unroll
+    for (int ni = 0; ni < 16; ++ni) {
+      s_frag[ni][0] = 0.0f; s_frag[ni][1] = 0.0f; s_frag[ni][2] = 0.0f; s_frag[ni][3] = 0.0f;
+    }
+
+    issue_kv64_flat_128(kv_smem[1], k_flat, block_tok_base + 64, tid);
+    cp_async_commit();
+    cp_async_wait<1>();
+    __syncthreads();
+    prefill_qk_half<false>(q_frag, kv_smem[0], s_frag, lane, 4);
+    __syncthreads();
+
+    issue_kv64_flat_128(kv_smem[0], v_flat, block_tok_base, tid);
+    cp_async_commit();
+    cp_async_wait<1>();
+    __syncthreads();
+    prefill_qk_half<false>(q_frag, kv_smem[1], s_frag + 8, lane, 4);
+    __syncthreads();
+
+    issue_kv64_flat_128(kv_smem[1], v_flat, block_tok_base + 64, tid);
+    cp_async_commit();
+
+    uint32_t p_frag[8][4];
+    prefill_softmax_full(s_frag, p_frag, o_frag, row_max0, row_max1, row_sum0, row_sum1, scale_log2);
+
+    cp_async_wait<1>();
+    __syncthreads();
+    prefill_pv_half<false>(p_frag, kv_smem[0], o_frag, lane, 4);
+    __syncthreads();
+
+    if (nb > 0) {
+      issue_kv64_flat_128(kv_smem[0], k_flat, (nb - 1) << 7, tid);
+      cp_async_commit();
+      cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
+      if constexpr (kPdl) asm volatile("griddepcontrol.launch_dependents;");
+    }
+    __syncthreads();
+    prefill_pv_half<false>(p_frag + 4, kv_smem[1], o_frag, lane, 4);
+    if (nb > 0) __syncthreads();
+  }
+
+  prefill_epilogue_fast<Mode, kDiscardL2, kLutSigmoid>(
+      o_frag, reinterpret_cast<uint32_t (*)[16][64]>(kv_smem),
+      row_sum0, row_sum1, gate_ptr, fp8_scale_ptr, out_ptr,
+      q_tok, kv_head, warp_id, lane, group_id, tid_in_grp);
+}
+
+template <int Mode, bool UseRope, bool CacheFP32, bool kPdl, bool kDiscardL2, bool kLutSigmoid = false>
+__global__ __launch_bounds__(128, 2) void prefill_attn_fused_512_v4_128_st3_kernel(
+    const __nv_bfloat16* __restrict__ qkv,
+    const int64_t* __restrict__ positions,
+    const void* __restrict__ cos_sin_cache,
+    const __nv_bfloat16* __restrict__ kv_flat,
+    const __nv_bfloat16* __restrict__ gate_ptr,
+    const float* __restrict__ fp8_scale_ptr,
+    void* __restrict__ out_ptr,
+    int cache_rows,
+    float eps,
+    float qscale,
+    float scale_log2) {
+  extern __shared__ uint4 dyn_smem[];
+  uint4 (*const kv_smem)[64][16] = reinterpret_cast<uint4 (*)[64][16]>(dyn_smem);
+
+  const int lin = static_cast<int>(blockIdx.x);
+  const int kv_head = lin & 1;
+  const int m_grp4 = 127 - (lin >> 1);
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int group_id = lane >> 2;
+  const int tid_in_grp = lane & 3;
+
+  const int q_tok = (m_grp4 << 2) + warp_id;
+  const int diag_nb = (m_grp4 >> 5);
+  const bool half_only = ((m_grp4 & 31) < 16);
+  const int diag_pairs = ((m_grp4 & 31) >> 2) + 1;
+
+  uint32_t q_frag[8][4];
+  prefill_q_prologue_db<UseRope, CacheFP32, kDiscardL2>(
+      q_frag, reinterpret_cast<uint4 (*)[16][16]>(kv_smem[0]),
+      qkv, positions, cos_sin_cache, cache_rows, eps, qscale, q_tok, kv_head, warp_id, lane);
+
+  if constexpr (kPdl) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
+
+  const __nv_bfloat16* const k_flat = kv_flat + static_cast<int64_t>(kv_head) * (2 * 512 * 128);
+  const __nv_bfloat16* const v_flat = k_flat + (512 * 128);
+
+  float o_frag[16][4];
+  #pragma unroll
+  for (int dt = 0; dt < 16; ++dt) {
+    o_frag[dt][0] = 0.0f; o_frag[dt][1] = 0.0f; o_frag[dt][2] = 0.0f; o_frag[dt][3] = 0.0f;
+  }
+  float row_max0 = -INFINITY, row_max1 = -INFINITY;
+  float row_sum0 = 0.0f, row_sum1 = 0.0f;
+
+  issue_kv64_flat_128(kv_smem[1], k_flat, diag_nb << 7, tid);
+  cp_async_commit();
+
+  int s0, s1, s2;
+  {
+    const int block_tok_base = diag_nb << 7;
+    float s_frag[16][4];
+    #pragma unroll
+    for (int ni = 0; ni < 16; ++ni) {
+      s_frag[ni][0] = 0.0f; s_frag[ni][1] = 0.0f; s_frag[ni][2] = 0.0f; s_frag[ni][3] = 0.0f;
+    }
+    uint32_t p_frag[8][4];
+    if (half_only) {
+      issue_kv64_flat_128(kv_smem[2], v_flat, block_tok_base, tid);
+      cp_async_commit();
+      cp_async_wait<1>();
+      __syncthreads();
+      prefill_qk_half<true>(q_frag, kv_smem[1], s_frag, lane, diag_pairs);
+      if (diag_nb > 0) {
+        issue_kv64_flat_128(kv_smem[0], k_flat, (diag_nb - 1) << 7, tid);
+        cp_async_commit();
+      }
+      const bool skip_masked_exp = prefill_softmax_diag(
+          s_frag, p_frag, row_max0, row_max1, row_sum0, row_sum1,
+          block_tok_base, q_tok, diag_pairs, tid_in_grp, scale_log2);
+      if (diag_nb > 0) {
+        cp_async_wait<1>();
+      } else {
+        cp_async_wait<0>();
+        if constexpr (kPdl) asm volatile("griddepcontrol.launch_dependents;");
+      }
+      __syncthreads();
+      const int pv_lo_lim = skip_masked_exp ? diag_pairs : 4;
+      prefill_pv_half<true>(p_frag, kv_smem[2], o_frag, lane, pv_lo_lim);
+      s0 = 0; s1 = 1; s2 = 2;
+    } else {
+      const int hi_pairs = diag_pairs - 4;
+      issue_kv64_flat_128(kv_smem[2], k_flat, block_tok_base + 64, tid);
+      cp_async_commit();
+      cp_async_wait<1>();
+      __syncthreads();
+      issue_kv64_flat_128(kv_smem[0], v_flat, block_tok_base, tid);
+      cp_async_commit();
+      prefill_qk_half<false>(q_frag, kv_smem[1], s_frag, lane, 4);
+
+      cp_async_wait<1>();
+      __syncthreads();
+      issue_kv64_flat_128(kv_smem[1], v_flat, block_tok_base + 64, tid);
+      cp_async_commit();
+      prefill_qk_half<true>(q_frag, kv_smem[2], s_frag + 8, lane, hi_pairs);
+
+      const bool skip_masked_exp = prefill_softmax_diag(
+          s_frag, p_frag, row_max0, row_max1, row_sum0, row_sum1,
+          block_tok_base, q_tok, diag_pairs, tid_in_grp, scale_log2);
+
+      cp_async_wait<1>();
+      __syncthreads();
+      if (diag_nb > 0) {
+        issue_kv64_flat_128(kv_smem[2], k_flat, (diag_nb - 1) << 7, tid);
+        cp_async_commit();
+      }
+      prefill_pv_half<false>(p_frag, kv_smem[0], o_frag, lane, 4);
+
+      if (diag_nb > 0) {
+        cp_async_wait<1>();
+      } else {
+        cp_async_wait<0>();
+        if constexpr (kPdl) asm volatile("griddepcontrol.launch_dependents;");
+      }
+      __syncthreads();
+      const int pv_hi_lim = skip_masked_exp ? hi_pairs : 4;
+      prefill_pv_half<true>(p_frag + 4, kv_smem[1], o_frag, lane, pv_hi_lim);
+      s0 = 2; s1 = 0; s2 = 1;
+    }
+  }
+
+  for (int nb = diag_nb - 1; nb >= 0; --nb) {
+    const int block_tok_base = nb << 7;
+    float s_frag[16][4];
+    #pragma unroll
+    for (int ni = 0; ni < 16; ++ni) {
+      s_frag[ni][0] = 0.0f; s_frag[ni][1] = 0.0f; s_frag[ni][2] = 0.0f; s_frag[ni][3] = 0.0f;
+    }
+
+    issue_kv64_flat_128(kv_smem[s1], k_flat, block_tok_base + 64, tid);
+    cp_async_commit();
+    cp_async_wait<1>();
+    __syncthreads();
+    issue_kv64_flat_128(kv_smem[s2], v_flat, block_tok_base, tid);
+    cp_async_commit();
+    prefill_qk_half<false>(q_frag, kv_smem[s0], s_frag, lane, 4);
+
+    cp_async_wait<1>();
+    __syncthreads();
+    issue_kv64_flat_128(kv_smem[s0], v_flat, block_tok_base + 64, tid);
+    cp_async_commit();
+    prefill_qk_half<false>(q_frag, kv_smem[s1], s_frag + 8, lane, 4);
+
+    uint32_t p_frag[8][4];
+    prefill_softmax_full(s_frag, p_frag, o_frag, row_max0, row_max1, row_sum0, row_sum1, scale_log2);
+
+    cp_async_wait<1>();
+    __syncthreads();
+    if (nb > 0) {
+      issue_kv64_flat_128(kv_smem[s1], k_flat, (nb - 1) << 7, tid);
+      cp_async_commit();
+    }
+    prefill_pv_half<false>(p_frag, kv_smem[s2], o_frag, lane, 4);
+
+    if (nb > 0) {
+      cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
+      if constexpr (kPdl) asm volatile("griddepcontrol.launch_dependents;");
+    }
+    __syncthreads();
+    prefill_pv_half<false>(p_frag + 4, kv_smem[s0], o_frag, lane, 4);
+
+    const int tmp = s0; s0 = s1; s1 = s2; s2 = tmp;
+  }
+
+  prefill_epilogue_fast<Mode, kDiscardL2, kLutSigmoid>(
+      o_frag, reinterpret_cast<uint32_t (*)[16][64]>(kv_smem[s1]),
+      row_sum0, row_sum1, gate_ptr, fp8_scale_ptr, out_ptr,
+      q_tok, kv_head, warp_id, lane, group_id, tid_in_grp);
+}
+
+// =================================================================================================
 // Stage 3: Fast Prefill post_attn_norm (0-ULP exact, 16B uint4 coalesced, no harmful sh_res SMEM,
 //          optional inline L2 discard of dead attn_out in 0 extra launches!)
 // =================================================================================================
@@ -1113,6 +1891,29 @@ static int post_attn_pdl_mode() {
 // =================================================================================================
 // Launch & Dispatch Helpers
 // =================================================================================================
+static int prefill_glue_carveout100_mode() {
+  static const int mode = []() -> int {
+    const char* env = std::getenv("MUSE_PREFILL_GLUE_CARVEOUT100");
+    if (!env || !*env) return 1;
+    return static_cast<int>(std::strtol(env, nullptr, 10));
+  }();
+  return mode;
+}
+
+template <auto Kernel, int kMinLevel = 1>
+static inline void ensure_pf_carveout100() {
+  static bool configured = false;
+  if (!configured) {
+    if (prefill_glue_carveout100_mode() >= kMinLevel) {
+      cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+      cudaThreadExchangeStreamCaptureMode(&mode);
+      (void)cudaFuncSetAttribute(Kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+      cudaThreadExchangeStreamCaptureMode(&mode);
+    }
+    configured = true;
+  }
+}
+
 template <typename... KArgs, typename... Args>
 static inline cudaError_t launch_ex(
     bool pdl, dim3 grid, dim3 block, cudaStream_t st,
@@ -1147,12 +1948,95 @@ static inline void align_discard(const void* ptr, size_t n_bytes, const char*& o
   out_lines = n_lines;
 }
 
+static int prefill_attn_v4_mode() {
+  static const int mode = []() -> int {
+    const char* env = std::getenv("MUSE_PREFILL_ATTN_V4");
+    if (env && *env) {
+      long v = std::strtol(env, nullptr, 10);
+      if (v == 0 || v == 2 || v == 3) return static_cast<int>(v);
+    }
+    return 2;
+  }();
+  return mode;
+}
+
+template <auto Kernel, typename... Args>
+static inline cudaError_t launch_ex_smem(
+    bool pdl, dim3 grid, dim3 block, size_t dyn_smem, cudaStream_t st, Args... args) {
+  if (dyn_smem >= 48u * 1024u) {
+    static bool smem_configured = false;
+    if (!smem_configured) {
+      cudaError_t err = cudaFuncSetAttribute(
+          Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(dyn_smem));
+      if (err != cudaSuccess) return err;
+      err = cudaFuncSetAttribute(
+          Kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+      if (err != cudaSuccess) return err;
+      smem_configured = true;
+    }
+  }
+  if (pdl) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = dyn_smem;
+    cfg.stream = st;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    return cudaLaunchKernelEx(&cfg, Kernel, args...);
+  }
+  Kernel<<<grid, block, dyn_smem, st>>>(args...);
+  return cudaGetLastError();
+}
+
 template <int Mode, bool kPdl, bool kDiscard, bool kLutSigmoid>
 static inline cudaError_t dispatch_attn_rope(
     int use_rope, int cache_fp32, cudaStream_t st,
     const __nv_bfloat16* qkv, const int64_t* pos, const void* cos_sin,
     const __nv_bfloat16* kv_flat, const __nv_bfloat16* gate, const float* fp8_scale,
     void* out, int cache_rows, float eps, float qscale, float scale_log2) {
+  const int v4 = prefill_attn_v4_mode();
+  if (v4 == 3) {
+    const dim3 grid(256u, 1u, 1u);
+    const dim3 block(128u, 1u, 1u);
+    constexpr size_t kSmem48 = 48u * 1024u;
+    if (use_rope) {
+      if (cache_fp32) {
+        return launch_ex_smem<prefill_attn_fused_512_v4_128_st3_kernel<Mode, true, true, kPdl, kDiscard, kLutSigmoid>>(
+            kPdl, grid, block, kSmem48, st,
+            qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+      }
+      return launch_ex_smem<prefill_attn_fused_512_v4_128_st3_kernel<Mode, true, false, kPdl, kDiscard, kLutSigmoid>>(
+          kPdl, grid, block, kSmem48, st,
+          qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+    }
+    return launch_ex_smem<prefill_attn_fused_512_v4_128_st3_kernel<Mode, false, true, kPdl, kDiscard, kLutSigmoid>>(
+        kPdl, grid, block, kSmem48, st,
+        qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+  }
+  if (v4 == 2) {
+    const dim3 grid(256u, 1u, 1u);
+    const dim3 block(128u, 1u, 1u);
+    if (use_rope) {
+      if (cache_fp32) {
+        constexpr auto k = prefill_attn_fused_512_v4_128_kernel<Mode, true, true, kPdl, kDiscard, kLutSigmoid>;
+        ensure_pf_carveout100<k, 2>();
+        return launch_ex(kPdl, grid, block, st, k,
+                         qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+      }
+      constexpr auto k = prefill_attn_fused_512_v4_128_kernel<Mode, true, false, kPdl, kDiscard, kLutSigmoid>;
+      ensure_pf_carveout100<k, 2>();
+      return launch_ex(kPdl, grid, block, st, k,
+                       qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+    }
+    constexpr auto k = prefill_attn_fused_512_v4_128_kernel<Mode, false, true, kPdl, kDiscard, kLutSigmoid>;
+    ensure_pf_carveout100<k, 2>();
+    return launch_ex(kPdl, grid, block, st, k,
+                     qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+  }
   const dim3 grid(128u, 1u, 1u);
   const dim3 block(256u, 1u, 1u);
   if (use_rope) {
@@ -1223,18 +2107,21 @@ static inline cudaError_t dispatch_kv_only(
   const dim3 block(kv_threads, 1u, 1u);
   if (use_rope) {
     if (cache_fp32) {
-      return launch_ex(kPdl, grid, block, st,
-          prefill_kv_only_kernel<true, true, kPdl, kDiscard>,
+      constexpr auto k = prefill_kv_only_kernel<true, true, kPdl, kDiscard>;
+      ensure_pf_carveout100<k, 1>();
+      return launch_ex(kPdl, grid, block, st, k,
           qkv, pos, cos_sin, kvc, kvf, slots, num_tokens, cache_rows, block_size,
           stride_block, stride_slot, stride_kv_head, eps, d0, l0, d1, l1);
     }
-    return launch_ex(kPdl, grid, block, st,
-        prefill_kv_only_kernel<true, false, kPdl, kDiscard>,
+    constexpr auto k = prefill_kv_only_kernel<true, false, kPdl, kDiscard>;
+    ensure_pf_carveout100<k, 1>();
+    return launch_ex(kPdl, grid, block, st, k,
         qkv, pos, cos_sin, kvc, kvf, slots, num_tokens, cache_rows, block_size,
         stride_block, stride_slot, stride_kv_head, eps, d0, l0, d1, l1);
   }
-  return launch_ex(kPdl, grid, block, st,
-      prefill_kv_only_kernel<false, true, kPdl, kDiscard>,
+  constexpr auto k = prefill_kv_only_kernel<false, true, kPdl, kDiscard>;
+  ensure_pf_carveout100<k, 1>();
+  return launch_ex(kPdl, grid, block, st, k,
       qkv, pos, cos_sin, kvc, kvf, slots, num_tokens, cache_rows, block_size,
       stride_block, stride_slot, stride_kv_head, eps, d0, l0, d1, l1);
 }
@@ -1398,6 +2285,34 @@ extern "C" int muse_prefill_post_attn_norm(
   const int pdl_mode = muse_pf_attn::post_attn_pdl_mode();
   const dim3 grid(static_cast<unsigned>(rows), 1u, 1u);
   const dim3 block(256u, 1u, 1u);
+  static bool pan_carveout_done = false;
+  if (!pan_carveout_done) {
+    if (muse_pf_attn::prefill_glue_carveout100_mode() >= 1) {
+      cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+      cudaThreadExchangeStreamCaptureMode(&mode);
+      auto s100 = [](auto fn) { (void)cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100); };
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, 1>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, 1>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, 1>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, 2>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, 2>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, 2>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, 0>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, 0>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, 0>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, 1>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, 1>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, 1>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, 2>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, 2>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, 2>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, 0>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, 0>);
+      s100(muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, 0>);
+      cudaThreadExchangeStreamCaptureMode(&mode);
+    }
+    pan_carveout_done = true;
+  }
   if (kind == 0) {
     if (pdl_mode == 1) {
       if (cs_mode == 0)

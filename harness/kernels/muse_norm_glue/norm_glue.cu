@@ -376,6 +376,7 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
     __nv_bfloat16* out_bf16_all, uint8_t* out_fp8_all,
     const float* gate_scale = nullptr, uint8_t* out_gate_all = nullptr) {
   __shared__ float red[2][8];
+  __shared__ float gate_inv_shared;
   const size_t row = blockIdx.x;
   __nv_bfloat16* x = x_all + row * kHidden;
   const __nv_bfloat16* d = d_all + row * kHidden;
@@ -383,12 +384,13 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
   uint2 ud[kChunks], uf[kChunks], ui[kChunks];
   float h1_pre[kChunks][4];
   float inv_scale = 0.f;
-  float gate_inv = 0.f;
+  if constexpr (kGateOut) {
+    if (threadIdx.x == 0) gate_inv_shared = full_divide(1.0f, __ldg(gate_scale));
+  }
   if constexpr (kPdl) {
     const float s_x = __ldg(sumsq_x + row);
     const float a = inv_rms(s_x, 1e-08f);
     if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
-    if constexpr (kGateOut) gate_inv = full_divide(1.0f, __ldg(gate_scale));
     // Precompute h1_pre chunk-by-chunk before pdl_wait() so ux/ur/uw never consume live regs post-wait.
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
@@ -463,7 +465,7 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
   const float s_h = row_sum(acc2, red[1]);
   const float e_r = inv_rms(s_h, 1e-05f);
   if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
-  if constexpr (!kPdl && kGateOut) gate_inv = full_divide(1.0f, __ldg(gate_scale));
+  const float gate_inv = kGateOut ? gate_inv_shared : 0.f;
   __nv_bfloat16* const out_bf16_row = kWriteBf16 ? (out_bf16_all + row * kHidden) : nullptr;
   uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
   uint8_t* const out_gate_row = kGateOut ? (out_gate_all + row * kHidden) : nullptr;
@@ -878,18 +880,19 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
     const float* scale, __nv_bfloat16* out_bf16_all, uint8_t* out_fp8_all,
     const float* gate_scale = nullptr, uint8_t* out_gate_all = nullptr) {
   __shared__ float red[8];
+  __shared__ float scale_inv_shared, gate_inv_shared;
   const size_t row = blockIdx.x;
   const __nv_bfloat16* x = x_all + row * kHidden;
   uint2 ux[kChunks], ui[kChunks];
-  float inv_scale = 0.f;
-  float gate_inv = 0.f;
+  if (threadIdx.x == 0) {
+    scale_inv_shared = full_divide(1.0f, __ldg(scale));
+    if constexpr (kGateOut) gate_inv_shared = full_divide(1.0f, __ldg(gate_scale));
+  }
   if constexpr (kPdl) {
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) ui[c] = ldg8_v4(w_in, c);
     }
-    inv_scale = full_divide(1.0f, __ldg(scale));
-    if constexpr (kGateOut) gate_inv = full_divide(1.0f, __ldg(gate_scale));
     pdl_wait();
     pdl_launch_dependents();
 #pragma unroll
@@ -916,10 +919,8 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
   }
   const float s_x = row_sum(acc, red);
   const float r = inv_rms(s_x, 1e-05f);
-  if constexpr (!kPdl) {
-    inv_scale = full_divide(1.0f, __ldg(scale));
-    if constexpr (kGateOut) gate_inv = full_divide(1.0f, __ldg(gate_scale));
-  }
+  const float inv_scale = scale_inv_shared;
+  const float gate_inv = kGateOut ? gate_inv_shared : 0.f;
   __nv_bfloat16* const out_bf16_row = kWriteBf16 ? (out_bf16_all + row * kHidden) : nullptr;
   uint8_t* const out_fp8_row = out_fp8_all + row * kHidden;
   uint8_t* const out_gate_row = kGateOut ? (out_gate_all + row * kHidden) : nullptr;
@@ -969,20 +970,21 @@ __global__ void __launch_bounds__(512) input_norm_fp8_w16(
     const float* scale, __nv_bfloat16* out_bf16_all, uint8_t* out_fp8_all,
     const float* gate_scale = nullptr, uint8_t* out_gate_all = nullptr) {
   __shared__ float red[16];
+  __shared__ float scale_inv_shared, gate_inv_shared;
   const size_t row = blockIdx.x;
   const int t = threadIdx.x;
   const bool valid = t < 416;
   uint4 ux0 = {0, 0, 0, 0}, ux1 = {0, 0, 0, 0};
   uint4 ui0 = {0, 0, 0, 0}, ui1 = {0, 0, 0, 0};
-  float inv_scale = 0.f;
-  float gate_inv = 0.f;
+  if (t == 0) {
+    scale_inv_shared = full_divide(1.0f, *scale);
+    if constexpr (kGateOut) gate_inv_shared = full_divide(1.0f, *gate_scale);
+  }
   if constexpr (kPdl) {
     if (valid) {
       const uint4* ip = reinterpret_cast<const uint4*>(w_in + t * 16);
       ui0 = ip[0];
       ui1 = ip[1];
-      inv_scale = full_divide(1.0f, *scale);
-      if constexpr (kGateOut) gate_inv = full_divide(1.0f, *gate_scale);
     }
     pdl_wait();
     pdl_launch_dependents();
@@ -1032,10 +1034,8 @@ __global__ void __launch_bounds__(512) input_norm_fp8_w16(
   __syncthreads();
   if (!valid) return;
   const float r = inv_rms(red[0], 1e-05f);
-  if constexpr (!kPdl) {
-    inv_scale = full_divide(1.0f, *scale);
-    if constexpr (kGateOut) gate_inv = full_divide(1.0f, *gate_scale);
-  }
+  const float inv_scale = scale_inv_shared;
+  const float gate_inv = kGateOut ? gate_inv_shared : 0.f;
   const uint32_t iw[8] = {ui0.x, ui0.y, ui0.z, ui0.w, ui1.x, ui1.y, ui1.z, ui1.w};
   uint32_t ob[8];
   uint16_t qf[8];
@@ -1118,8 +1118,94 @@ static bool norm_glue_prefill_pdl_enabled() {
   return env_on;
 }
 
+static void ensure_norm_glue_carveout() {
+  static bool done = false;
+  if (done) return;
+  static const bool en = []() {
+    const char* env = std::getenv("MUSE_NORM_GLUE_CARVEOUT100");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  if (en) {
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    auto set100 = [](auto fn) {
+      (void)cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    };
+    set100(post_attn_norm_decode<true, false, true, 0>);
+    set100(post_attn_norm_decode<true, false, false, 0>);
+    set100(post_attn_norm_decode<false, true, true, 0>);
+    set100(post_attn_norm_decode<false, true, false, 0>);
+    set100(post_attn_norm_decode<false, true, true, 1>);
+    set100(post_attn_norm_decode<false, true, false, 1>);
+    set100(post_attn_norm_decode<false, true, true, 2>);
+    set100(post_attn_norm_decode<false, true, false, 2>);
+    set100(post_attn_norm<true, false, true>);
+    set100(post_attn_norm<true, false, false>);
+    set100(post_attn_norm<false, true, true>);
+    set100(post_attn_norm<false, true, false>);
+    set100(post_ff_norm_decode<false, false, true, true, 0>);
+    set100(post_ff_norm_decode<false, false, true, false, 0>);
+    set100(post_ff_norm_decode<true, false, true, true, 0>);
+    set100(post_ff_norm_decode<true, false, true, false, 0>);
+    set100(post_ff_norm_decode<true, true, true, true, 0>);
+    set100(post_ff_norm_decode<true, true, false, true, 0>);
+    set100(post_ff_norm_decode<true, true, true, false, 0>);
+    set100(post_ff_norm_decode<true, true, false, false, 0>);
+    set100(post_ff_norm_decode<true, true, true, true, 1>);
+    set100(post_ff_norm_decode<true, true, false, true, 1>);
+    set100(post_ff_norm_decode<true, true, true, false, 1>);
+    set100(post_ff_norm_decode<true, true, false, false, 1>);
+    set100(post_ff_norm_decode<true, true, true, true, 2>);
+    set100(post_ff_norm_decode<true, true, false, true, 2>);
+    set100(post_ff_norm_decode<true, true, true, false, 2>);
+    set100(post_ff_norm_decode<true, true, false, false, 2>);
+    set100(post_ff_norm_prefill<false, true>);
+    set100(post_ff_norm_prefill<false, false>);
+    set100(post_ff_norm_prefill<true, true>);
+    set100(post_ff_norm_prefill<true, false>);
+    set100(post_ff_final_norm<true, true>);
+    set100(post_ff_final_norm<false, true>);
+    set100(post_ff_final_norm<true, false>);
+    set100(post_ff_final_norm<false, false>);
+    set100(input_norm_fp8_w16<false, true, true, 0>);
+    set100(input_norm_fp8_w16<false, true, false, 0>);
+    set100(input_norm_fp8_w16<true, true, true, 0>);
+    set100(input_norm_fp8_w16<true, false, true, 0>);
+    set100(input_norm_fp8_w16<true, true, true, 1>);
+    set100(input_norm_fp8_w16<true, false, true, 1>);
+    set100(input_norm_fp8_w16<true, true, true, 2>);
+    set100(input_norm_fp8_w16<true, false, true, 2>);
+    set100(input_norm_fp8_w8<false, true, true, 0>);
+    set100(input_norm_fp8_w8<true, true, true, 0>);
+    set100(input_norm_fp8_w8<true, false, true, 0>);
+    set100(input_norm_fp8_w8<true, true, true, 1>);
+    set100(input_norm_fp8_w8<true, false, true, 1>);
+    set100(input_norm_fp8_w8<true, true, true, 2>);
+    set100(input_norm_fp8_w8<true, false, true, 2>);
+    set100(mul_sigmoid_bf16_kernel<false, true>);
+    set100(mul_sigmoid_bf16_kernel<false, false>);
+    set100(mul_sigmoid_bf16_kernel<true, true>);
+    set100(mul_sigmoid_bf16_kernel<true, false>);
+    set100(mul_sigmoid_fp8_kernel<256, true, true, 0>);
+    set100(mul_sigmoid_fp8_kernel<352, true, true, 0>);
+    set100(mul_sigmoid_fp8_kernel<256, true, true, 1>);
+    set100(mul_sigmoid_fp8_kernel<352, true, true, 2>);
+    set100(mul_sigmoid_fp8_kernel<256, false, true, 0>);
+    set100(mul_sigmoid_fp8_kernel<256, false, false, 0>);
+    set100(mul_silu_slice_bf16_kernel<true>);
+    set100(mul_silu_slice_bf16_kernel<false>);
+    set100(mul_silu_slice_fp8_kernel<true, true, 0>);
+    set100(mul_silu_slice_fp8_kernel<true, true, 1>);
+    set100(mul_silu_slice_fp8_kernel<true, true, 2>);
+    set100(mul_silu_slice_fp8_kernel<false, false, 0>);
+    cudaThreadExchangeStreamCaptureMode(&mode);
+  }
+  done = true;
+}
+
 template <typename... KArgs, typename... Args>
 cudaError_t launch_pdl_grid(void (*kernel)(KArgs...), dim3 grid, int threads, cudaStream_t stream, Args... args) {
+  ensure_norm_glue_carveout();
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = grid;
   cfg.blockDim = dim3(threads, 1, 1);
@@ -1390,6 +1476,7 @@ int muse_norm_glue_gate_formula(const void* bits, const void* gate_scale, void* 
 int muse_norm_glue_mul_sigmoid_bf16(const void* gate, const void* attn, void* out, int n,
                                     cudaStream_t stream) {
   if (n <= 0 || (n & 7) != 0) return -1;
+  ensure_norm_glue_carveout();
   const int vec8 = n >> 3;
   const int blocks = (vec8 + 255) / 256;
   if (n <= 4096 * 16) {
@@ -1449,6 +1536,7 @@ int muse_norm_glue_mul_sigmoid_fp8(const void* gate, const void* attn, const voi
 
 int muse_norm_glue_mul_silu_slice_bf16(const void* gu, void* out, int rows, cudaStream_t stream) {
   if (rows <= 0) return -1;
+  ensure_norm_glue_carveout();
   const dim3 grid((kInterVec8 + 191) / 192, static_cast<unsigned>(rows));
   if (rows <= 32 && norm_glue_pdl_enabled()) {
     mul_silu_slice_bf16_kernel<true><<<grid, 192, 0, stream>>>(

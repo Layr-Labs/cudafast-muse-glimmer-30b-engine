@@ -335,12 +335,9 @@ __device__ __forceinline__ float rans_triton_silu(float gate) {
   return result;
 }
 __device__ __forceinline__ uint32_t rans_pack_fp8x4(float v0, float v1, float v2, float v3) {
-  auto cl = [](float v) {
-    return (v != v) ? 448.0f : (v < -448.0f ? -448.0f : (v > 448.0f ? 448.0f : v));
-  };
   uint16_t lo, hi;
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(cl(v1)), "f"(cl(v0)));
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(cl(v3)), "f"(cl(v2)));
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(v1), "f"(v0));
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(v3), "f"(v2));
   return (uint32_t)lo | ((uint32_t)hi << 16);
 }
 
@@ -415,7 +412,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
   constexpr uint32_t kMyXsmemBytes = kM16 ? kRansXsmemBytes : kRansXsmemBytesM8;
   const int xbytes = kXsmem ? (int)kMyXsmemBytes : (x_global ? 0 : pb.M * ((K + 15) & ~15));
   const uint32_t sbase0 = (uint32_t)__cvta_generic_to_shared(smem) + (uint32_t)xbytes;
-  const uint32_t ring_s = ((sbase0 + RB - 1u) & ~(RB - 1u)) + (uint32_t)wib * RB;
+  const uint32_t ring_s = ((sbase0 + 15u) & ~15u) + (uint32_t)wib * RB;
   int w;
   bool active;
   if (pb.w_split > 0) {
@@ -726,7 +723,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
     __syncwarp();
 #pragma unroll
     for (int state = 0; state < NS; ++state) {
-      states[state] = rans_lds32(ring_s | ((128u * state + 4u * lane) & (RB - 1u)));
+      states[state] = rans_lds32(ring_s + ((128u * state + 4u * lane) & (RB - 1u)));
     }
   }
   if constexpr (kXMma) {
@@ -807,6 +804,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             const bool need_refill = (issued <= curg + (RG - 1));
             if (need_refill) {
               __syncwarp();
+#pragma unroll 1
               do {
                 const uint32_t boff = ((uint32_t)issued << GBS) + lane16;
                 if (boff < wbytes) {
@@ -889,19 +887,23 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             const uint32_t m2 = __ballot_sync(0xffffffffu, n2);
             const uint32_t m3 = __ballot_sync(0xffffffffu, n3);
             const uint32_t p0 = pwb_n + 128u;
-            const uint32_t p1 = p0 + (__popc(m0) << 1);
-            const uint32_t p2 = p1 + (__popc(m1) << 1);
-            const uint32_t p3 = p2 + (__popc(m2) << 1);
-            pwb = p3 + (__popc(m3) << 1);
-            const uint32_t ro0 = ring_s | ((p0 + (__popc(m0 & lt) << 1)) & (RB - 1u));
-            const uint32_t ro1 = ring_s | ((p1 + (__popc(m1 & lt) << 1)) & (RB - 1u));
-            const uint32_t ro2 = ring_s | ((p2 + (__popc(m2 & lt) << 1)) & (RB - 1u));
-            const uint32_t ro3 = ring_s | ((p3 + (__popc(m3 & lt) << 1)) & (RB - 1u));
+            const uint32_t c0_b = __popc(m0) << 1;
+            const uint32_t c1_b = __popc(m1) << 1;
+            const uint32_t c2_b = __popc(m2) << 1;
+            const uint32_t c3_b = __popc(m3) << 1;
+            const uint32_t p1 = p0 + c0_b;
+            const uint32_t p2 = p0 + (c0_b + c1_b);
+            const uint32_t p3 = p2 + c2_b;
+            pwb = p2 + (c2_b + c3_b);
+            const uint32_t ro0 = ring_s + ((p0 + (__popc(m0 & lt) << 1)) & (RB - 1u));
+            const uint32_t ro1 = ring_s + ((p1 + (__popc(m1 & lt) << 1)) & (RB - 1u));
+            const uint32_t ro2 = ring_s + ((p2 + (__popc(m2 & lt) << 1)) & (RB - 1u));
+            const uint32_t ro3 = ring_s + ((p3 + (__popc(m3 & lt) << 1)) & (RB - 1u));
             const uint32_t Pw01 = __byte_perm(e0, e1, 0x7740);
             const uint32_t Pw23 = __byte_perm(e2, e3, 0x7740);
             const uint32_t Pw = __byte_perm(Pw01, Pw23, 0x5410);
-            const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
-            const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
+            const uint32_t hiE3 = (Pw >> 1) & 0x78787878u, loE3 = (Pw << 3) & 0x78787878u;
+            const uint32_t E0 = __byte_perm(hiE3, loE3, 0x5140), E1 = __byte_perm(hiE3, loE3, 0x7362);
             if constexpr (!kXMma && !kXsmem && kXGlobalMode == 1) {
               if ((s & 1) == 0) {
                 rans_xpose4(v_lo, t, a.x, a.y, a_next.x, a_next.y);
@@ -918,25 +920,28 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
                 if constexpr (kM32) { a2 = a2_next; a2_hi = a2_hi_next; }
               }
             }
-            // Wait for ring group right before reading nw and r0..r3 in parallel.
             if (need_refill) {
               rans_cp_wait<RG - 2>();
               __syncwarp();
             }
+            uint32_t r0 = 0u, r1 = 0u, r2 = 0u, r3 = 0u;
+            if (n0) r0 = rans_lds16(ro0);
+            if (n1) r1 = rans_lds16(ro1);
+            if (n2) r2 = rans_lds16(ro2);
+            if (n3) r3 = rans_lds16(ro3);
             uint32_t nw;
             if ((pwb_n & 2u) == 0u) {
-              nw = rans_lds32(ring_s | (na & (RB - 1u)));
+              nw = rans_lds32(ring_s + (na & (RB - 1u)));
             } else {
-              nw = rans_lds16(ring_s | (na & (RB - 1u))) | (rans_lds16(ring_s | ((na + 2u) & (RB - 1u))) << 16);
+              nw = __byte_perm(rans_lds16(ring_s + (na & (RB - 1u))), rans_lds16(ring_s + ((na + 2u) & (RB - 1u))), 0x5410);
             }
-            const uint32_t r0 = n0 ? rans_lds16(ro0) : 0u;
-            const uint32_t r1 = n1 ? rans_lds16(ro1) : 0u;
-            const uint32_t r2 = n2 ? rans_lds16(ro2) : 0u;
-            const uint32_t r3 = n3 ? rans_lds16(ro3) : 0u;
-            // Assemble FP8 B-operand from nw + E0/E1, issue MMA (hides r0..r3 LDS latency), commit states.
             const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-            const uint32_t bw0 = rans_pack_e4m3x4(u0, E0 << 3);
-            const uint32_t bw1 = rans_pack_e4m3x4(u1, E1 << 3);
+            const uint32_t bw0 = rans_pack_e4m3x4(u0, E0);
+            const uint32_t bw1 = rans_pack_e4m3x4(u1, E1);
+            states[0] = n0 ? __byte_perm(r0, x0, 0x5410) : x0;
+            states[1] = n1 ? __byte_perm(r1, x1, 0x5410) : x1;
+            states[2] = n2 ? __byte_perm(r2, x2, 0x5410) : x2;
+            states[3] = n3 ? __byte_perm(r3, x3, 0x5410) : x3;
             if constexpr (kM16) {
               rans_mma_e4m3_m16(c0, c1, c2, c3, a.x, a_hi.x, a.y, a_hi.y, bw0, bw1);
               if constexpr (kM32) {
@@ -945,11 +950,6 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             } else {
               rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
             }
-            // Commit next-iteration rANS states.
-            states[0] = n0 ? ((x0 << 16) | r0) : x0;
-            states[1] = n1 ? ((x1 << 16) | r1) : x1;
-            states[2] = n2 ? ((x2 << 16) | r2) : x2;
-            states[3] = n3 ? ((x3 << 16) | r3) : x3;
           };
           if constexpr (kXMma) {
             const int n_s = s_end - cs;
@@ -1059,9 +1059,9 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
       const uint32_t na = pwb + 4u * (uint32_t)lane;
       uint32_t nw;
       if ((pwb & 2u) == 0u) {
-        nw = rans_lds32(ring_s | (na & (RB - 1u)));
+        nw = rans_lds32(ring_s + (na & (RB - 1u)));
       } else {
-        nw = rans_lds16(ring_s | (na & (RB - 1u))) | (rans_lds16(ring_s | ((na + 2u) & (RB - 1u))) << 16);
+        nw = rans_lds16(ring_s + (na & (RB - 1u))) | (rans_lds16(ring_s + ((na + 2u) & (RB - 1u))) << 16);
       }
       pwb += 128u;
       uint32_t Pw = 0;
@@ -1074,14 +1074,14 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
         Pw = __byte_perm(Pw, e, (q == 0) ? 0x3214 : (q == 1) ? 0x3240 : (q == 2) ? 0x3410 : 0x4210);
         bool need = x < RANS_L;
         uint32_t m = __ballot_sync(0xffffffffu, need);
-        if (need) x = (x << 16) | rans_lds16(ring_s | ((pwb + (__popc(m & lt) << 1)) & (RB - 1u)));
+        if (need) x = (x << 16) | rans_lds16(ring_s + ((pwb + (__popc(m & lt) << 1)) & (RB - 1u)));
         pwb += __popc(m) << 1;
       }
-      const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
-      const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
+      const uint32_t hiE3 = (Pw >> 1) & 0x78787878u, loE3 = (Pw << 3) & 0x78787878u;
+      const uint32_t E0 = __byte_perm(hiE3, loE3, 0x5140), E1 = __byte_perm(hiE3, loE3, 0x7362);
       const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-      const uint32_t bw0 = rans_pack_e4m3x4(u0, E0 << 3);
-      const uint32_t bw1 = rans_pack_e4m3x4(u1, E1 << 3);
+      const uint32_t bw0 = rans_pack_e4m3x4(u0, E0);
+      const uint32_t bw1 = rans_pack_e4m3x4(u1, E1);
       uint2 a = make_uint2(0u, 0u);
       uint2 a_hi = make_uint2(0u, 0u);
       if (g < pb.M) {
@@ -1144,7 +1144,7 @@ struct RansCfg { int tw; int wpb; int ns; int rg; int ilv; };
 static inline size_t rans_round16(size_t v) { return (v + 15) & ~(size_t)15; }
 static inline size_t rans_woff_off() { return RANS_HDR_BYTES + RANS_LUT_BYTES; }
 static inline size_t rans_stream_off(int tw) { return (rans_woff_off() + (size_t)(2 * tw + 1) * 4 + 511) & ~(size_t)511; }
-static inline size_t rans_dsmem(int K, int wpb, int gbs, int rg) { size_t rb = (size_t)rg << gbs; return rans_round16((size_t)K) + rb + (size_t)wpb * rb; }
+static inline size_t rans_dsmem(int K, int wpb, int gbs, int rg) { size_t rb = (size_t)rg << gbs; return rans_round16((size_t)K) + 16u + (size_t)wpb * rb; }
 static inline bool rans_fits(int K, int wpb, int gbs, int rg) { return rans_dsmem(K, wpb, gbs, rg) + RANS_LUT_BYTES + 1024 <= (size_t)RANS_MAX_SMEM; }
 
 static RansCfg rans_pick_cfg(int N, int K) {
@@ -1683,7 +1683,7 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
   }
   pb.pdl_mode = pdl_mode;
   size_t dsmem = rans_dsmem(K, wpb, 9, rg);
-  const size_t dsmem_xsmem = (size_t)((M > 8) ? kRansXsmemBytes : kRansXsmemBytesM8) + ((size_t)rg << 9) + (size_t)wpb * ((size_t)rg << 9);
+  const size_t dsmem_xsmem = (size_t)((M > 8) ? kRansXsmemBytes : kRansXsmemBytesM8) + 16u + (size_t)wpb * ((size_t)rg << 9);
   const bool x_aligned16 = ((reinterpret_cast<uintptr_t>(x) & 15u) == 0u) &&
                            (act_mode != 1 || ((reinterpret_cast<uintptr_t>(x_aux) & 15u) == 0u));
   static const bool xsmem_fused_m8 = []() {
@@ -1770,12 +1770,15 @@ static void rans_launch(const uint8_t* blob, size_t blob_bytes, int tw, int ns, 
     const char* env = std::getenv("MUSERANS_XMMA_OPROJ_RG8");
     return env && *env && std::strtol(env, nullptr, 10) != 0;
   }();
-  static const int xmma_sync_steps = []() -> int {
+  static const int xmma_sync_steps_ovr = []() -> int {
     const char* env = std::getenv("MUSERANS_XMMA_SYNC_STEPS");
-    if (!env || !*env) return 128;
+    if (!env || !*env) return -1;
     long v = std::strtol(env, nullptr, 10);
-    return (v >= 0 && v <= 4096) ? static_cast<int>(v) : 128;
+    return (v >= 0 && v <= 4096) ? static_cast<int>(v) : -1;
   }();
+  const int xmma_sync_steps = (xmma_sync_steps_ovr >= 0)
+                                  ? xmma_sync_steps_ovr
+                                  : ((K == 4096 || N == 4096 || K == 19968) ? 0 : 128);
   if (x_is_xmma) {
     TORCH_CHECK(par4_en && ns == 4 && rg == 4 && ilv == 9 && wpb <= 20 && act_mode == 0 && (M == 16 || M == 32) && x_aligned16 && (K & 63) == 0,
                 "rans_gemm_m_xmma_auto requires par4/ns4/rg4/ilv9, M in {16,32}, 16B-aligned x_mma, K%64==0");
