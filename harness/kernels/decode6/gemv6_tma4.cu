@@ -1048,3 +1048,4 @@ extern "C" int muse_tma4_pass2(const uint8_t* sym_tiled, int k_tiles,
     return cudaErrorInvalidValue;
   return cudaError_t(cudaGetLastError());
 }
+#define GAUNTLET_REDRAW_95017dd6_20261128T143054Z 1
