@@ -246,66 +246,6 @@ __device__ __forceinline__ void load_rope_cs(
   }
 }
 
-template <bool UseRope, bool ApplyQScale>
-__device__ __forceinline__ uint2 qk_norm_rope_head(
-    uint2 raw, float eps, float qscale, int lane,
-    float c0, float c1, float c2, float c3,
-    float s0, float s1, float s2, float s3) {
-  const __nv_bfloat16* vb = reinterpret_cast<const __nv_bfloat16*>(&raw);
-  const float x0 = __bfloat162float(vb[0]);
-  const float x1 = __bfloat162float(vb[1]);
-  const float x2 = __bfloat162float(vb[2]);
-  const float x3 = __bfloat162float(vb[3]);
-  float ss = __fmaf_rn(x0, x0, 0.0f);
-  ss = __fmaf_rn(x1, x1, ss);
-  ss = __fmaf_rn(x2, x2, ss);
-  ss = __fmaf_rn(x3, x3, ss);
-  ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 16));
-  ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 8));
-  ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 4));
-  ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 2));
-  ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 1));
-  float mean_v;
-  asm("div.full.f32 %0, %1, 0f43000000;" : "=f"(mean_v) : "f"(ss));
-  float r;
-  asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(mean_v + eps));
-  float y0 = __fmul_rn(x0, r);
-  float y1 = __fmul_rn(x1, r);
-  float y2 = __fmul_rn(x2, r);
-  float y3 = __fmul_rn(x3, r);
-  if constexpr (ApplyQScale) {
-    y0 = __fmul_rn(y0, qscale);
-    y1 = __fmul_rn(y1, qscale);
-    y2 = __fmul_rn(y2, qscale);
-    y3 = __fmul_rn(y3, qscale);
-  }
-  float o0 = y0, o1 = y1, o2 = y2, o3 = y3;
-  if constexpr (UseRope) {
-    const float p0 = __shfl_xor_sync(0xffffffffu, y0, 16);
-    const float p1 = __shfl_xor_sync(0xffffffffu, y1, 16);
-    const float p2 = __shfl_xor_sync(0xffffffffu, y2, 16);
-    const float p3 = __shfl_xor_sync(0xffffffffu, y3, 16);
-    if (lane < 16) {
-      o0 = __fmaf_rn(y0, c0, -__fmul_rn(p0, s0));
-      o1 = __fmaf_rn(y1, c1, -__fmul_rn(p1, s1));
-      o2 = __fmaf_rn(y2, c2, -__fmul_rn(p2, s2));
-      o3 = __fmaf_rn(y3, c3, -__fmul_rn(p3, s3));
-    } else {
-      o0 = __fmaf_rn(y0, c0, __fmul_rn(p0, s0));
-      o1 = __fmaf_rn(y1, c1, __fmul_rn(p1, s1));
-      o2 = __fmaf_rn(y2, c2, __fmul_rn(p2, s2));
-      o3 = __fmaf_rn(y3, c3, __fmul_rn(p3, s3));
-    }
-  }
-  uint2 out_v;
-  __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(&out_v);
-  ob[0] = __float2bfloat16_rn(o0);
-  ob[1] = __float2bfloat16_rn(o1);
-  ob[2] = __float2bfloat16_rn(o2);
-  ob[3] = __float2bfloat16_rn(o3);
-  return out_v;
-}
-
 // 4-head interleaved Q-RMSNorm + qscale + RoPE directly from registers (4x ILP on shfl/div/rsqrt!)
 template <bool UseRope>
 __device__ __forceinline__ void q_norm_rope_4heads(
@@ -375,11 +315,64 @@ __device__ __forceinline__ void st2_cs(void* ptr, uint2 v) {
                :: "l"(ptr), "r"(v.x), "r"(v.y) : "memory");
 }
 
+// 2-head interleaved K-RMSNorm + RoPE directly from registers (2x ILP on shfl/div/rsqrt, 0-ULP identical)
+template <bool UseRope>
+__device__ __forceinline__ void k_norm_rope_2heads(
+    uint2 raw0, uint2 raw1, uint2& out0, uint2& out1, float eps, int lane,
+    float c0, float c1, float c2, float c3,
+    float s0, float s1, float s2, float s3) {
+  const __nv_bfloat16* vb0 = reinterpret_cast<const __nv_bfloat16*>(&raw0);
+  const __nv_bfloat16* vb1 = reinterpret_cast<const __nv_bfloat16*>(&raw1);
+  const float x00 = __bfloat162float(vb0[0]), x01 = __bfloat162float(vb0[1]);
+  const float x02 = __bfloat162float(vb0[2]), x03 = __bfloat162float(vb0[3]);
+  const float x10 = __bfloat162float(vb1[0]), x11 = __bfloat162float(vb1[1]);
+  const float x12 = __bfloat162float(vb1[2]), x13 = __bfloat162float(vb1[3]);
+  float ss0 = __fmaf_rn(x03, x03, __fmaf_rn(x02, x02, __fmaf_rn(x01, x01, __fmaf_rn(x00, x00, 0.0f))));
+  float ss1 = __fmaf_rn(x13, x13, __fmaf_rn(x12, x12, __fmaf_rn(x11, x11, __fmaf_rn(x10, x10, 0.0f))));
+  #pragma unroll
+  for (int delta = 16; delta >= 1; delta >>= 1) {
+    ss0 = __fadd_rn(ss0, __shfl_xor_sync(0xffffffffu, ss0, delta));
+    ss1 = __fadd_rn(ss1, __shfl_xor_sync(0xffffffffu, ss1, delta));
+  }
+  float mv0, mv1, r0, r1;
+  asm("div.full.f32 %0, %1, 0f43000000;" : "=f"(mv0) : "f"(ss0));
+  asm("div.full.f32 %0, %1, 0f43000000;" : "=f"(mv1) : "f"(ss1));
+  asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r0) : "f"(mv0 + eps));
+  asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r1) : "f"(mv1 + eps));
+  const float y00 = __fmul_rn(x00, r0), y01 = __fmul_rn(x01, r0), y02 = __fmul_rn(x02, r0), y03 = __fmul_rn(x03, r0);
+  const float y10 = __fmul_rn(x10, r1), y11 = __fmul_rn(x11, r1), y12 = __fmul_rn(x12, r1), y13 = __fmul_rn(x13, r1);
+  float o00 = y00, o01 = y01, o02 = y02, o03 = y03;
+  float o10 = y10, o11 = y11, o12 = y12, o13 = y13;
+  if constexpr (UseRope) {
+    const float p00 = __shfl_xor_sync(0xffffffffu, y00, 16), p01 = __shfl_xor_sync(0xffffffffu, y01, 16);
+    const float p02 = __shfl_xor_sync(0xffffffffu, y02, 16), p03 = __shfl_xor_sync(0xffffffffu, y03, 16);
+    const float p10 = __shfl_xor_sync(0xffffffffu, y10, 16), p11 = __shfl_xor_sync(0xffffffffu, y11, 16);
+    const float p12 = __shfl_xor_sync(0xffffffffu, y12, 16), p13 = __shfl_xor_sync(0xffffffffu, y13, 16);
+    if (lane < 16) {
+      o00 = __fmaf_rn(y00, c0, -__fmul_rn(p00, s0)); o01 = __fmaf_rn(y01, c1, -__fmul_rn(p01, s1));
+      o02 = __fmaf_rn(y02, c2, -__fmul_rn(p02, s2)); o03 = __fmaf_rn(y03, c3, -__fmul_rn(p03, s3));
+      o10 = __fmaf_rn(y10, c0, -__fmul_rn(p10, s0)); o11 = __fmaf_rn(y11, c1, -__fmul_rn(p11, s1));
+      o12 = __fmaf_rn(y12, c2, -__fmul_rn(p12, s2)); o13 = __fmaf_rn(y13, c3, -__fmul_rn(p13, s3));
+    } else {
+      o00 = __fmaf_rn(y00, c0, __fmul_rn(p00, s0)); o01 = __fmaf_rn(y01, c1, __fmul_rn(p01, s1));
+      o02 = __fmaf_rn(y02, c2, __fmul_rn(p02, s2)); o03 = __fmaf_rn(y03, c3, __fmul_rn(p03, s3));
+      o10 = __fmaf_rn(y10, c0, __fmul_rn(p10, s0)); o11 = __fmaf_rn(y11, c1, __fmul_rn(p11, s1));
+      o12 = __fmaf_rn(y12, c2, __fmul_rn(p12, s2)); o13 = __fmaf_rn(y13, c3, __fmul_rn(p13, s3));
+    }
+  }
+  const __nv_bfloat162 b00 = __floats2bfloat162_rn(o00, o01);
+  const __nv_bfloat162 b01 = __floats2bfloat162_rn(o02, o03);
+  const __nv_bfloat162 b10 = __floats2bfloat162_rn(o10, o11);
+  const __nv_bfloat162 b11 = __floats2bfloat162_rn(o12, o13);
+  out0 = make_uint2(*reinterpret_cast<const uint32_t*>(&b00), *reinterpret_cast<const uint32_t*>(&b01));
+  out1 = make_uint2(*reinterpret_cast<const uint32_t*>(&b10), *reinterpret_cast<const uint32_t*>(&b11));
+}
+
 // =================================================================================================
 // Stage 1: Tiny KV-Only K-RMSNorm + RoPE + paged kv_cache + contiguous kv_flat[2][2][seqlen][128]
 // =================================================================================================
 template <bool UseRope, bool CacheFP32, bool kPdl, bool kDiscardKV>
-__global__ __launch_bounds__(256) void prefill_kv_only_kernel(
+__global__ __launch_bounds__(384, 1) void prefill_kv_only_kernel(
     const __nv_bfloat16* __restrict__ qkv,
     const int64_t* __restrict__ positions,
     const void* __restrict__ cos_sin_cache,
@@ -433,8 +426,8 @@ __global__ __launch_bounds__(256) void prefill_kv_only_kernel(
       }
     }
 
-    const uint2 k0_out = qk_norm_rope_head<UseRope, false>(k0_raw, eps, 1.0f, lane, c0, c1, c2, c3, s0, s1, s2, s3);
-    const uint2 k1_out = qk_norm_rope_head<UseRope, false>(k1_raw, eps, 1.0f, lane, c0, c1, c2, c3, s0, s1, s2, s3);
+    uint2 k0_out, k1_out;
+    k_norm_rope_2heads<UseRope>(k0_raw, k1_raw, k0_out, k1_out, eps, lane, c0, c1, c2, c3, s0, s1, s2, s3);
 
     const int64_t t_off = static_cast<int64_t>(t) * 128 + lane * 4;
     *reinterpret_cast<uint2*>(kv_flat + t_off) = k0_out;
@@ -491,7 +484,9 @@ __device__ __forceinline__ int map_m_grp_128(int g) {
     case 6: base = 8;  break;
     default: base = 0; break;
   }
-  return base + idx;
+  // Reverse idx within Waves 2-3 (grp >= 3) so fastest-finishing Wave-1 SMs (small diag_pairs)
+  // pick the heaviest Wave-2/3 partners (large diag_pairs), reducing 48-SM makespan across all C_fix.
+  return base + ((grp >= 3) ? (7 - idx) : idx);
 }
 
 template <bool kTrim>
@@ -596,6 +591,9 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
 
   if constexpr (kPdl) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
+    // Wake downstream o_proj immediately once Wave-3 CTAs enter so free SMs preload o_proj TMA weights
+    // during the entire Wave-3 tail instead of only the final PV half.
+    asm volatile("griddepcontrol.launch_dependents;");
   }
   __syncthreads();
 
@@ -749,9 +747,6 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         cp_async_wait<1>();
       } else {
         cp_async_wait<0>();
-        if constexpr (kPdl) {
-          asm volatile("griddepcontrol.launch_dependents;");
-        }
       }
       __syncthreads();
       const int pv_lo_lim = skip_masked_exp ? lo_pairs : 4;
@@ -791,17 +786,13 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
           }
         }
       }
-      __syncthreads();
-
       if (nb > 0) {
+        __syncthreads();
         issue_kv64_flat(kv_smem[0], k_flat, (nb - 1) << 7, tid);
         cp_async_commit();
         cp_async_wait<1>();
       } else {
         cp_async_wait<0>();
-        if constexpr (kPdl) {
-          asm volatile("griddepcontrol.launch_dependents;");
-        }
       }
       __syncthreads();
       {
@@ -840,7 +831,8 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   uint32_t (*o_tiles)[16][64] = reinterpret_cast<uint32_t (*)[16][64]>(kv_smem);
   #pragma unroll
   for (int dt = 0; dt < 16; ++dt) {
-    const int c32 = (dt << 2) + tid_in_grp;
+    // XOR-swizzle uint4 column by group_id (0..7) so all 32 lanes hit distinct SMEM banks (8-way -> 1-way).
+    const int c32 = ((dt ^ group_id) << 2) + tid_in_grp;
     const __nv_bfloat162 ob0 = __floats2bfloat162_rn(mul_ftz_f32(o_frag[dt][0], inv0), mul_ftz_f32(o_frag[dt][1], inv0));
     const __nv_bfloat162 ob1 = __floats2bfloat162_rn(mul_ftz_f32(o_frag[dt][2], inv1), mul_ftz_f32(o_frag[dt][3], inv1));
     o_tiles[warp_id][group_id][c32]     = *reinterpret_cast<const uint32_t*>(&ob0);
@@ -855,7 +847,8 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     #pragma unroll
     for (int u = 0; u < 8; ++u) {
       const int idx = (u << 5) + lane;
-      dst[idx] = o_v4[idx];
+      const int o_idx = (idx & ~15) | ((idx & 15) ^ ((idx >> 4) & 7));
+      dst[idx] = o_v4[o_idx];
     }
   } else if constexpr (Mode == 1) {
     const uint4* g_v4 = reinterpret_cast<const uint4*>(gate_ptr + tok_head_base);
@@ -863,7 +856,8 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     #pragma unroll
     for (int u = 0; u < 8; ++u) {
       const int idx = (u << 5) + lane;
-      const uint4 ov = o_v4[idx];
+      const int o_idx = (idx & ~15) | ((idx & 15) ^ ((idx >> 4) & 7));
+      const uint4 ov = o_v4[o_idx];
       const uint4 gv = g_v4[idx];
       const uint32_t ow[4] = {ov.x, ov.y, ov.z, ov.w};
       const uint32_t gw[4] = {gv.x, gv.y, gv.z, gv.w};
@@ -896,7 +890,8 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     #pragma unroll
     for (int u = 0; u < 8; ++u) {
       const int idx = (u << 5) + lane;
-      const uint4 ov = o_v4[idx];
+      const int o_idx = (idx & ~15) | ((idx & 15) ^ ((idx >> 4) & 7));
+      const uint4 ov = o_v4[o_idx];
       const uint4 gv = g_v4[idx];
       const uint32_t ow[4] = {ov.x, ov.y, ov.z, ov.w};
       const uint32_t gw[4] = {gv.x, gv.y, gv.z, gv.w};
@@ -916,8 +911,9 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
         qw[i] = fp8x2(canonicalize_nan(__fmul_rn(__fmul_rn(sx, of.x), inv_s)),
                       canonicalize_nan(__fmul_rn(__fmul_rn(sy, of.y), inv_s)));
       }
-      dst[idx] = make_uint2(static_cast<uint32_t>(qw[0]) | (static_cast<uint32_t>(qw[1]) << 16),
-                            static_cast<uint32_t>(qw[2]) | (static_cast<uint32_t>(qw[3]) << 16));
+      dst[idx] = make_uint2(
+          __byte_perm(static_cast<uint32_t>(qw[0]), static_cast<uint32_t>(qw[1]), 0x5410),
+          __byte_perm(static_cast<uint32_t>(qw[2]), static_cast<uint32_t>(qw[3]), 0x5410));
     }
     if constexpr (kDiscardL2) {
       __syncwarp();
@@ -1006,6 +1002,10 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
     if constexpr (kFp8Out) inv_scale = fast_rcpf(__ldg(scale));
     asm volatile("griddepcontrol.wait;" ::: "memory");
     asm volatile("griddepcontrol.launch_dependents;");
+  } else if constexpr (kPdlMode == 2) {
+    // Producer-only PDL: signal immediately at entry so downstream gateup/swiglu preloads read-only
+    // TMA weights on free SMs across the entire tail wave (still waits on griddepcontrol.wait).
+    asm volatile("griddepcontrol.launch_dependents;");
   }
 
   // Discard dead attn_out strictly AFTER pdl_wait() for kPdlMode != 2; for producer-only
@@ -1057,11 +1057,6 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
     }
   }
   const float s_h = row_sum_256(acc2, red[1]);
-  if constexpr (kPdlMode == 2) {
-    // Producer-only PDL: zero sh_res SMEM overhead, yet still signals downstream gateup/swiglu
-    // to overlap TMA/LUT weight preloads with this kernel's final store epilogue.
-    asm volatile("griddepcontrol.launch_dependents;");
-  }
   const float b = inv_rms_6656(s_h, 1e-05f);
   if constexpr (kPdlMode != 1 && kFp8Out) inv_scale = fast_rcpf(__ldg(scale));
 
@@ -1080,11 +1075,12 @@ __global__ void __launch_bounds__(256, 4) prefill_post_attn_norm_kernel(
         *reinterpret_cast<uint2*>(out_bf16_row + off) = make_uint2(pack_bf16x2(y[0], y[1]), pack_bf16x2(y[2], y[3]));
       }
       if constexpr (kFp8Out) {
-        const uint32_t q =
+        const uint32_t q = __byte_perm(
             static_cast<uint32_t>(fp8x2(canonicalize_nan(__fmul_rn(inv_scale, y[0])),
-                                        canonicalize_nan(__fmul_rn(inv_scale, y[1])))) |
-            (static_cast<uint32_t>(fp8x2(canonicalize_nan(__fmul_rn(inv_scale, y[2])),
-                                         canonicalize_nan(__fmul_rn(inv_scale, y[3])))) << 16);
+                                        canonicalize_nan(__fmul_rn(inv_scale, y[1])))),
+            static_cast<uint32_t>(fp8x2(canonicalize_nan(__fmul_rn(inv_scale, y[2])),
+                                        canonicalize_nan(__fmul_rn(inv_scale, y[3])))),
+            0x5410);
         *reinterpret_cast<uint32_t*>(out_fp8_row + off) = q;
       }
     }
@@ -1113,10 +1109,29 @@ static int post_attn_pdl_mode() {
 // =================================================================================================
 // Launch & Dispatch Helpers
 // =================================================================================================
+static inline void ensure_carveout100(const void* fn) {
+  static const bool en = []() {
+    const char* env = std::getenv("MUSE_PREFILL_CARVEOUT100");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  if (!en) return;
+  static const void* seen[128];
+  static int n_seen = 0;
+  for (int i = 0; i < n_seen; ++i) {
+    if (seen[i] == fn) return;
+  }
+  cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+  cudaThreadExchangeStreamCaptureMode(&mode);
+  (void)cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaThreadExchangeStreamCaptureMode(&mode);
+  if (n_seen < 128) seen[n_seen++] = fn;
+}
+
 template <typename... KArgs, typename... Args>
 static inline cudaError_t launch_ex(
     bool pdl, dim3 grid, dim3 block, cudaStream_t st,
     void (*kernel)(KArgs...), Args... args) {
+  ensure_carveout100(reinterpret_cast<const void*>(kernel));
   if (pdl) {
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = grid;
@@ -1208,16 +1223,16 @@ static inline cudaError_t dispatch_kv_only(
     const char* d0, size_t l0, const char* d1, size_t l1) {
   static const unsigned kv_blocks = []() -> unsigned {
     const char* env = std::getenv("MUSE_PREFILL_KV_ONLY_BLOCKS");
-    if (!env || !*env) return 64u;
+    if (!env || !*env) return 48u;
     long v = std::strtol(env, nullptr, 10);
-    return (v >= 16 && v <= 256) ? static_cast<unsigned>(v) : 64u;
+    return (v >= 16 && v <= 256) ? static_cast<unsigned>(v) : 48u;
   }();
   static const unsigned kv_threads = []() -> unsigned {
     const char* env = std::getenv("MUSE_PREFILL_KV_ONLY_THREADS");
-    if (!env || !*env) return 256u;
+    if (!env || !*env) return 384u;
     long v = std::strtol(env, nullptr, 10);
-    if (v == 64 || v == 128 || v == 256) return static_cast<unsigned>(v);
-    return 256u;
+    if (v == 64 || v == 128 || v == 256 || v == 384) return static_cast<unsigned>(v);
+    return 384u;
   }();
   const dim3 grid(kv_blocks, 1u, 1u);
   const dim3 block(kv_threads, 1u, 1u);
@@ -1408,19 +1423,16 @@ extern "C" int muse_prefill_post_attn_norm(
     }
     if (pdl_mode == 2) {
       if (cs_mode == 0)
-        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
-      else if (cs_mode == 2)
-        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
-      else
-        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
-    } else {
-      if (cs_mode == 0)
-        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
-      else if (cs_mode == 2)
-        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
-      else
-        muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, nullptr, Ss, Ob, nullptr, dp, dl);
+        return static_cast<int>(muse_pf_attn::launch_ex(false, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, 2>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
+      if (cs_mode == 2)
+        return static_cast<int>(muse_pf_attn::launch_ex(false, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, 2>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
+      return static_cast<int>(muse_pf_attn::launch_ex(false, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, 2>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
     }
+    if (cs_mode == 0)
+      return static_cast<int>(muse_pf_attn::launch_ex(false, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, false, 0>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
+    if (cs_mode == 2)
+      return static_cast<int>(muse_pf_attn::launch_ex(false, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, false, true, 0>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
+    return static_cast<int>(muse_pf_attn::launch_ex(false, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<true, false, true, true, 0>, X, Rs, Wp, Wq, static_cast<const float*>(nullptr), Ss, Ob, static_cast<uint8_t*>(nullptr), dp, dl));
   } else if (kind == 1) {
     if (pdl_mode == 1) {
       if (cs_mode == 0)
@@ -1431,29 +1443,26 @@ extern "C" int muse_prefill_post_attn_norm(
     }
     if (pdl_mode == 2) {
       if (cs_mode == 0)
-        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
-      else if (cs_mode == 2)
-        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
-      else
-        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, 2><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
-    } else {
-      if (cs_mode == 0)
-        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
-      else if (cs_mode == 2)
-        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
-      else
-        muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, 0><<<rows, 256, 0, st>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of, dp, dl);
+        return static_cast<int>(muse_pf_attn::launch_ex(false, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, 2>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
+      if (cs_mode == 2)
+        return static_cast<int>(muse_pf_attn::launch_ex(false, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, 2>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
+      return static_cast<int>(muse_pf_attn::launch_ex(false, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, 2>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
     }
+    if (cs_mode == 0)
+      return static_cast<int>(muse_pf_attn::launch_ex(false, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, false, 0>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
+    if (cs_mode == 2)
+      return static_cast<int>(muse_pf_attn::launch_ex(false, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, false, true, 0>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
+    return static_cast<int>(muse_pf_attn::launch_ex(false, grid, block, st, muse_pf_attn::prefill_post_attn_norm_kernel<false, true, true, true, 0>, X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of, dp, dl));
   } else {
     return 1;
   }
-  return static_cast<int>(cudaGetLastError());
 }
 
 extern "C" int muse_prefill_discard_l2(const void* ptr, size_t n_bytes, void* cuda_stream) {
   const char* p = nullptr; size_t n_lines = 0;
   muse_pf_attn::align_discard(ptr, n_bytes, p, n_lines);
   if (!p || n_lines == 0) return 0;
+  muse_pf_attn::ensure_carveout100(reinterpret_cast<const void*>(muse_pf_attn::discard_l2_range_kernel));
   muse_pf_attn::discard_l2_range_kernel<<<48, 256, 0, static_cast<cudaStream_t>(cuda_stream)>>>(p, n_lines);
   return static_cast<int>(cudaGetLastError());
 }
@@ -1467,6 +1476,7 @@ extern "C" int muse_prefill_discard_l2_multi2(
   muse_pf_attn::align_discard(ptr1, n_bytes1, p1, l1);
   if (l0 == 0 && l1 == 0) return 0;
   if (l0 == 0) { p0 = p1; l0 = l1; p1 = nullptr; l1 = 0; }
+  muse_pf_attn::ensure_carveout100(reinterpret_cast<const void*>(muse_pf_attn::discard_l2_multi2_kernel));
   muse_pf_attn::discard_l2_multi2_kernel<<<48, 256, 0, static_cast<cudaStream_t>(cuda_stream)>>>(p0, l0, p1, l1);
   return static_cast<int>(cudaGetLastError());
 }

@@ -2346,6 +2346,17 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_swiglu_det_sk_kern
     }
   };
 
+  auto issue_a_only = [&](int kg, int st) {
+    if constexpr (kM16) {
+      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][a_row][a_phys_col8 * 8]));
+      int3_cp_async16_a_pred(sd, A + static_cast<size_t>(a_safe_row) * K + kg * 64 + a_col8 * 8, a_src_sz);
+    } else if (tid < 64) {
+      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][a_row][a_phys_col8 * 8]));
+      int3_cp_async16_a_pred(sd, A + static_cast<size_t>(a_safe_row) * K + kg * 64 + a_col8 * 8, a_src_sz);
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  };
+
   auto issue_stage = [&](int idx, int kg, int st, bool need_fence) {
     const uint8_t* wp = step_w_ptr(idx);
     if constexpr (kTma) {
@@ -2362,14 +2373,7 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_swiglu_det_sk_kern
         int3_cp_async16_w(sd, wp + tid * 16);
       }
     }
-    if constexpr (kM16) {
-      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][a_row][a_phys_col8 * 8]));
-      int3_cp_async16_a_pred(sd, A + static_cast<size_t>(a_safe_row) * K + kg * 64 + a_col8 * 8, a_src_sz);
-    } else if (tid < 64) {
-      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][a_row][a_phys_col8 * 8]));
-      int3_cp_async16_a_pred(sd, A + static_cast<size_t>(a_safe_row) * K + kg * 64 + a_col8 * 8, a_src_sz);
-    }
-    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    issue_a_only(kg, st);
   };
 
   int cur_n = iter_start / num_kg;
@@ -2384,9 +2388,21 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_swiglu_det_sk_kern
       issue_w_only(p, p);
     }
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    for (int p = 0; p < preload; ++p) {
-      load_a_sync(next_kg, p);
-      if (++next_kg == num_kg) next_kg = 0;
+    if constexpr (kTma) {
+      // Load only stage 0 synchronously; overlap stages 1..preload-1 via cp.async with MMA!
+      if (preload > 0) {
+        load_a_sync(next_kg, 0);
+        if (++next_kg == num_kg) next_kg = 0;
+        for (int p = 1; p < preload; ++p) {
+          issue_a_only(next_kg, p);
+          if (++next_kg == num_kg) next_kg = 0;
+        }
+      }
+    } else {
+      for (int p = 0; p < preload; ++p) {
+        load_a_sync(next_kg, p);
+        if (++next_kg == num_kg) next_kg = 0;
+      }
     }
   } else {
     for (int p = 0; p < preload; ++p) {

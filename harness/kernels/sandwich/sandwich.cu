@@ -25,9 +25,28 @@ static int sandwich_pdl_mode() {
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void pdl_launch_dependents() { asm volatile("griddepcontrol.launch_dependents;"); }
 
+static inline void ensure_carveout100(const void* fn) {
+    static const bool en = []() {
+        const char* env = std::getenv("MUSE_PREFILL_CARVEOUT100");
+        return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+    }();
+    if (!en) return;
+    static const void* seen[128];
+    static int n_seen = 0;
+    for (int i = 0; i < n_seen; ++i) {
+        if (seen[i] == fn) return;
+    }
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    (void)cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    if (n_seen < 128) seen[n_seen++] = fn;
+}
+
 template <typename... KArgs, typename... Args>
 static cudaError_t launch_ex_pdl(void (*kernel)(KArgs...), int rows, int threads, size_t smem, cudaStream_t stream,
                                  Args... args) {
+    ensure_carveout100(reinterpret_cast<const void*>(kernel));
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(rows, 1, 1);
     cfg.blockDim = dim3(threads, 1, 1);
@@ -39,6 +58,14 @@ static cudaError_t launch_ex_pdl(void (*kernel)(KArgs...), int rows, int threads
     cfg.attrs = attr;
     cfg.numAttrs = 1;
     return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+}
+
+template <typename... KArgs, typename... Args>
+static cudaError_t launch_plain(void (*kernel)(KArgs...), int rows, int threads, size_t smem, cudaStream_t stream,
+                                Args... args) {
+    ensure_carveout100(reinterpret_cast<const void*>(kernel));
+    kernel<<<rows, threads, smem, stream>>>(static_cast<KArgs>(args)...);
+    return cudaGetLastError();
 }
 
 __device__ float bf16(uint2 packed, int channel) {
@@ -65,6 +92,24 @@ __device__ float inverse_rms(float total, float eps) {
     float result;
     asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(variance));
     return result;
+}
+
+__device__ __forceinline__ float reduce_1bar(const float (&partial)[4], float* warp_totals, unsigned thread) {
+    float sum = __fadd_rn(__fadd_rn(__fadd_rn(partial[0], partial[1]), partial[2]), partial[3]);
+    #pragma unroll
+    for (int delta = 16; delta > 0; delta /= 2) {
+        sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffff, sum, delta));
+    }
+    if ((thread & 31u) == 0u) {
+        warp_totals[thread >> 5] = sum;
+    }
+    __syncthreads();
+    sum = warp_totals[thread & 7u];
+    #pragma unroll
+    for (int delta = 4; delta > 0; delta /= 2) {
+        sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffff, sum, delta, 8));
+    }
+    return __shfl_sync(0xffffffff, sum, 0, 8);
 }
 
 __device__ float reduce(const float (&partial)[4], float* warp_totals, unsigned thread) {
@@ -199,7 +244,7 @@ __global__ __launch_bounds__(Threads) void sandwich(
     const float* gate_scale = nullptr, unsigned* gate_quantized = nullptr) {
     constexpr bool UseCs = Shared && CsLoads;
     constexpr bool UsePdl = Shared && Pdl;
-    __shared__ float warp_totals[8];
+    __shared__ float warp_totals[2][8];
     extern __shared__ uint2 shared_row[];
     uint2 saved[Tiles];
     const unsigned thread = threadIdx.x;
@@ -260,7 +305,7 @@ __global__ __launch_bounds__(Threads) void sandwich(
             }
         }
     }
-    const float down_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-8f);
+    const float down_inverse = inverse_rms(reduce_1bar(partial, warp_totals[0], thread), 1.e-8f);
     float attn_inverse = 0.f;
     if constexpr (!UsePdl) {
         const float prev_s = UseCs ? __ldg(previous_sum + blockIdx.x) : previous_sum[blockIdx.x];
@@ -324,7 +369,7 @@ __global__ __launch_bounds__(Threads) void sandwich(
             }
         }
     }
-    const float input_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-5f);
+    const float input_inverse = inverse_rms(reduce_1bar(partial, warp_totals[1], thread), 1.e-5f);
     const float scale_inv = UsePdl ? scale_inv_pre
                                    : (Quantize ? full_divide(1.f, UseCs ? __ldg(scale) : *scale) : 1.f);
     const float gate_inv = UsePdl ? gate_inv_pre
@@ -380,8 +425,9 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
     const float* __restrict__ previous_sum, const uint2* __restrict__ post_attn_weight,
     const uint2* __restrict__ post_ff_weight, const uint2* __restrict__ next_pre_attn_weight,
     const float* __restrict__ scale, uint2* __restrict__ hidden, unsigned* __restrict__ quantized,
-    const float* __restrict__ gate_scale = nullptr, unsigned* __restrict__ gate_quantized = nullptr) {
-    __shared__ float warp_totals[8];
+    const float* __restrict__ gate_scale = nullptr, unsigned* __restrict__ gate_quantized = nullptr,
+    const char* __restrict__ dead_ptr = nullptr, size_t dead_lines = 0) {
+    __shared__ float warp_totals[2][8];
     uint2 saved[Tiles];
     const unsigned thread = threadIdx.x;
     const size_t base = static_cast<size_t>(blockIdx.x) * Vectors;
@@ -416,6 +462,10 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
         }
         pdl_wait();
         pdl_launch_dependents();
+    } else if constexpr (PdlMode == 2) {
+        // Producer-only PDL: signal immediately at entry so downstream qkv_proj/gate_proj preloads
+        // read-only TMA weights on free SMs across the entire tail wave (still waits on pdl_wait).
+        pdl_launch_dependents();
     }
     float partial[4] = {};
     #pragma unroll
@@ -431,11 +481,18 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
             }
         }
     }
-    const float down_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-8f);
+    const float down_inverse = inverse_rms(reduce_1bar(partial, warp_totals[0], thread), 1.e-8f);
     if constexpr (DiscardDown && PdlMode != 2) {
-        // reduce() already synchronized the CTA; all 104 cache lines (13312 B) of dn_row are now dead.
+        // reduce_1bar() already synchronized the CTA; all 104 cache lines (13312 B) of dn_row are now dead.
         if (thread < 104u) {
             discard_l2_128(reinterpret_cast<const char*>(dn_row) + (thread << 7));
+        }
+        if (dead_ptr) {
+            const size_t gid = static_cast<size_t>(blockIdx.x) * Threads + thread;
+            const size_t gstride = static_cast<size_t>(gridDim.x) * Threads;
+            for (size_t i = gid; i < dead_lines; i += gstride) {
+                discard_l2_128(dead_ptr + (i << 7));
+            }
         }
     }
     float attn_inverse = 0.f;
@@ -486,12 +543,7 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
             saved[tile] = rounded;
         }
     }
-    const float input_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-5f);
-    if constexpr (PdlMode == 2) {
-        // Producer-only PDL: zero h1_pre reg/preload overhead, launched via standard <<<...>>>,
-        // signaling downstream qkv_proj to overlap TMA weight preloads with the final store epilogue.
-        pdl_launch_dependents();
-    }
+    const float input_inverse = inverse_rms(reduce_1bar(partial, warp_totals[1], thread), 1.e-5f);
     const float scale_inv = (PdlMode == 1) ? scale_inv_pre
                                 : (Quantize ? full_divide(1.f, __ldg(scale)) : 1.f);
     const float gate_inv = (PdlMode == 1) ? gate_inv_pre
@@ -537,6 +589,13 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
         // weight preloads overlap sooner and L2-hot hidden/q/g outputs land before discarding dn_row.
         if (thread < 104u) {
             discard_l2_128(reinterpret_cast<const char*>(dn_row) + (thread << 7));
+        }
+        if (dead_ptr) {
+            const size_t gid = static_cast<size_t>(blockIdx.x) * Threads + thread;
+            const size_t gstride = static_cast<size_t>(gridDim.x) * Threads;
+            for (size_t i = gid; i < dead_lines; i += gstride) {
+                discard_l2_128(dead_ptr + (i << 7));
+            }
         }
     }
 }
@@ -584,6 +643,22 @@ static inline bool aligned16_row_ptrs(const void* a0, const void* a1, const void
     return true;
 }
 
+static const void* g_next_dead_ptr = nullptr;
+static size_t g_next_dead_bytes = 0;
+
+static inline void align_dead_128(const void* ptr, size_t nbytes, const char*& out_p, size_t& out_lines) {
+    out_p = nullptr;
+    out_lines = 0;
+    if (!ptr || nbytes < 128u) return;
+    const uintptr_t p0 = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t s = (p0 + 127u) & ~uintptr_t(127u);
+    const uintptr_t e = (p0 + nbytes) & ~uintptr_t(127u);
+    if (e > s) {
+        out_p = reinterpret_cast<const char*>(s);
+        out_lines = static_cast<size_t>((e - s) >> 7);
+    }
+}
+
 template <bool Quantize, bool Gate, bool WriteHidden, bool GateEvictLast, bool ResidualEvictLast, bool CsLoads>
 static inline cudaError_t dispatch_v4(
     int rows, cudaStream_t stream,
@@ -591,27 +666,31 @@ static inline cudaError_t dispatch_v4(
     const uint2* a4, const uint2* a5, const uint2* a6,
     const float* a7, uint2* a8, unsigned* a9,
     const float* a10, unsigned* a11) {
+    const void* raw_dp = g_next_dead_ptr;
+    const size_t raw_db = g_next_dead_bytes;
+    g_next_dead_ptr = nullptr;
+    g_next_dead_bytes = 0;
+    const char* dp = nullptr;
+    size_t dl = 0;
     const int pdl_mode = sandwich_pdl_mode();
     const bool disc = sandwich_discard_enabled() && ((reinterpret_cast<uintptr_t>(a1) & 127u) == 0u);
+    if (disc && rows == 512) align_dead_128(raw_dp, raw_db, dp, dl);
     if (pdl_mode == 1) {
-        if (disc) return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, true>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-        return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, false>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+        if (disc) return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, true>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
+        return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, false>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, static_cast<const char*>(nullptr), size_t(0));
     }
     if (pdl_mode == 2) {
         if constexpr (!ResidualEvictLast && CsLoads) {
             if (sandwich_res_cs_enabled()) {
-                if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-                else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, false, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-                return cudaGetLastError();
+                if (disc) return launch_plain(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, true>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
+                return launch_plain(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, false, true>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, static_cast<const char*>(nullptr), size_t(0));
             }
         }
-        if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-        else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, false, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-        return cudaGetLastError();
+        if (disc) return launch_plain(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, false>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
+        return launch_plain(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, false, false>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, static_cast<const char*>(nullptr), size_t(0));
     }
-    if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-    else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-    return cudaGetLastError();
+    if (disc) return launch_plain(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, true>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
+    return launch_plain(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, false>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, static_cast<const char*>(nullptr), size_t(0));
 }
 
 template <bool Quantize, bool Shared, bool CsLoads = false>
@@ -639,6 +718,7 @@ void launch(const void* const* args, int rows, cudaStream_t stream) {
             return;
         }
     }
+    ensure_carveout100(reinterpret_cast<const void*>(sandwich<Quantize, Shared, false, true, false, false, CsLoads, false>));
     sandwich<Quantize, Shared, false, true, false, false, CsLoads, false><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
         a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
 }
@@ -658,6 +738,11 @@ extern "C" int muse_sandwich_set_v4(int enable) {
     const int old = sandwich_v4_enabled() ? 1 : 0;
     g_sandwich_v4_override = (enable < 0) ? -1 : (enable != 0 ? 1 : 0);
     return old;
+}
+
+extern "C" void muse_sandwich_set_next_dead(const void* ptr, size_t nbytes) {
+    g_next_dead_ptr = ptr;
+    g_next_dead_bytes = nbytes;
 }
 
 extern "C" int muse_sandwich_set_discard(int enable) {
@@ -692,6 +777,7 @@ void launch_gate(const void* const* args, int rows, cudaStream_t stream) {
             return;
         }
     }
+    ensure_carveout100(reinterpret_cast<const void*>(sandwich<true, Shared, true, WriteHidden, EvictLast, false, CsLoads, false>));
     sandwich<true, Shared, true, WriteHidden, EvictLast, false, CsLoads, false><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
         a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
 }
@@ -757,6 +843,7 @@ int launch_hint(const void* const* args, int rows, int mode, cudaStream_t stream
                 a0, a1, a2, a3, a4, a5, a6, static_cast<const float*>(nullptr), a7,
                 static_cast<unsigned*>(nullptr), static_cast<const float*>(nullptr), static_cast<unsigned*>(nullptr)));
         }
+        ensure_carveout100(reinterpret_cast<const void*>(sandwich<false, true, false, true, false, ResEL, CsLoads, false>));
         sandwich<false, true, false, true, false, ResEL, CsLoads, false><<<rows, Threads, smem, stream>>>(
             a0, a1, a2, a3, a4, a5, a6, nullptr, a7, nullptr);
     } else {
@@ -781,6 +868,7 @@ int launch_hint(const void* const* args, int rows, int mode, cudaStream_t stream
                 sandwich<true, true, true, false, GateEL, ResEL, CsLoads, true>, rows, Threads, smem, stream,
                 a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11));
         }
+        ensure_carveout100(reinterpret_cast<const void*>(sandwich<true, true, true, false, GateEL, ResEL, CsLoads, false>));
         sandwich<true, true, true, false, GateEL, ResEL, CsLoads, false><<<rows, Threads, smem, stream>>>(
             a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
     }
