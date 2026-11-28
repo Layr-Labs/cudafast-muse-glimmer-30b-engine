@@ -72,9 +72,32 @@ static int dflash_fuse_pdl_mode() {
   return mode;
 }
 
+static bool dflash_carveout100_enabled() {
+  static const bool en = []() -> bool {
+    const char* s = std::getenv("MUSE_DRAFTER_CARVEOUT100");
+    return !s || !*s || std::atoi(s) != 0;
+  }();
+  return en;
+}
+
+static inline void dflash_set_carveout100_once(const void* fn) {
+  if (!dflash_carveout100_enabled()) return;
+  static const void* seen[32] = {};
+  static int n_seen = 0;
+  for (int i = 0; i < n_seen; ++i) {
+    if (seen[i] == fn) return;
+  }
+  if (n_seen < 32) seen[n_seen++] = fn;
+  cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+  cudaThreadExchangeStreamCaptureMode(&mode);
+  cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaThreadExchangeStreamCaptureMode(&mode);
+}
+
 template <typename... KArgs, typename... Args>
 static inline void dflash_launch_pdl(
     void (*kernel)(KArgs...), int blocks, int threads, cudaStream_t st, int pdl_mode, Args... args) {
+  dflash_set_carveout100_once(reinterpret_cast<const void*>(kernel));
   cudaLaunchConfig_t lcfg = {};
   lcfg.gridDim = dim3(static_cast<unsigned>(blocks), 1u, 1u);
   lcfg.blockDim = dim3(static_cast<unsigned>(threads), 1u, 1u);
@@ -1176,6 +1199,9 @@ torch::Tensor dflash_rms_norm(torch::Tensor input, torch::Tensor weight, double 
       (M <= 16 && (K & 63) == 0 && dflash_norm_fuse_rot_enabled())
           ? vq4d_alloc_norm_prerot(out.data_ptr(), w_tag, M, K, out.options())
           : nullptr;
+  if (M > 16) {
+    vq4d_clear_all_prerot();
+  }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int pdl = dflash_fuse_pdl_mode();
   auto k = (rot_out != nullptr) ? dflash_rms_norm_kernel<false, false, true>
@@ -1224,6 +1250,9 @@ std::tuple<torch::Tensor, torch::Tensor> dflash_fused_add_rms_norm(
       (M <= 16 && (K & 63) == 0 && dflash_norm_fuse_rot_enabled())
           ? vq4d_alloc_norm_prerot(out.data_ptr(), w_tag, M, K, out.options())
           : nullptr;
+  if (M > 16) {
+    vq4d_clear_all_prerot();
+  }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int pdl = dflash_fuse_pdl_mode();
   const bool preload_res = (input.data_ptr() != residual.data_ptr());
