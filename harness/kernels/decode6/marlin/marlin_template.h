@@ -1119,13 +1119,16 @@ __global__ void Marlin(
                 "TMA4 rANS scales require M = 1 decode config (128 or 256 threads)");
   constexpr int kTmaWarps = threads / 32;
   constexpr int RANS_CAP = (fixed_shape == 3) ? 4096 : ((threads == 256) ? 3200 : 2048);
-  // 1D hardware TMA (cp.async.bulk + L2::evict_first) for lm_head multi-M B weights (641 MiB):
-  // restores L2::evict_first where cp.async.cg.L2::cache_hint hit SM121 odd-UR, keeping A (426 KiB)
-  // and lmpost_lut (128 KiB) L2-hot across all 33 tiles/CTA with 0 odd-UR and 1 TMA issue/stage.
-  constexpr bool tma_b = fuse_lmpost && down_ilv && fixed_shape == 3 && multi_m && tma_ovlp;
-  static_assert(!tma_b || (!fuse_mul_sigmoid && b_gl_stride == b_sh_stride && b_sh_wr_iters == 2 &&
+  // 1D hardware TMA (cp.async.bulk + L2::evict_first) for all contiguous down_ilv multi-M B weights:
+  // replaces 512 (or 256) per-thread cp.async.cg + createpolicy instructions/stage with 1 hardware
+  // TMA 8 KiB (or 4 KiB) bulk transfer/stage across all NVFP4 decode projections (qkv, output_gate,
+  // o_proj, gate_up, down_proj, lm_head), keeping A and lmpost_lut L2-hot with 0 odd-UR and +32 B SMEM.
+  constexpr bool tma_b = down_ilv && multi_m && tma_ovlp &&
+                         (b_gl_stride == b_sh_stride) && (b_sh_wr_iters == 2) &&
+                         (b_thread_vecs == 1) && (stages <= 4);
+  static_assert(!tma_b || (b_gl_stride == b_sh_stride && b_sh_wr_iters == 2 &&
                            b_thread_vecs == 1 && stages <= 4),
-                "tma_b requires contiguous 8 KiB down_ilv B stages");
+                "tma_b requires contiguous down_ilv B stages");
   uint32_t* sh_states = reinterpret_cast<uint32_t*>(sh_pal + (fast_pal16 ? 128 : 64));
   unsigned char* sh_rslot = reinterpret_cast<unsigned char*>(sh_states + threads);
   uint32_t* sh_rlut = reinterpret_cast<uint32_t*>(sh_rslot + 2 * RANS_CAP);
@@ -1516,17 +1519,28 @@ __global__ void Marlin(
                                      : (a_gl_rd + a_gl_rd_delta_o * a_off);
       if constexpr (fuse_mul_sigmoid) {
         if constexpr (multi_m) {
-          // Issue async B-weight DRAM fetches BEFORE synchronous gate/attn __ldg + sigmoid SFU math
-          // so B latency overlaps load_mul_sigmoid_int4 (disjoint sh_b_stage vs sh_a_stage, strict 0-ULP).
+          // Issue async B-weight DRAM fetches (1D TMA bulk when tma_b) BEFORE synchronous gate/attn
+          // __ldg + sigmoid SFU math so B latency overlaps load_mul_sigmoid_int4 (disjoint sh_b_stage
+          // vs sh_a_stage, strict 0-ULP).
           int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+#ifdef MUSE_SCALE_TMA4
+          if constexpr (tma_b) {
+            if (threadIdx.x == 0) {
+              asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+              tma_bulk(sh_b_stage, &B[b_gl_rd], b_sh_stage * static_cast<int>(sizeof(int4)), 3 + pipe);
+            }
+          } else
+#endif
+          {
   #pragma unroll
-          for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++) {
-            constexpr int count = div_ceil(b_sh_stride, threads);
-            int b_gl_idx =
-                b_gl_rd + (i % count) * threads +
-                b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
+            for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++) {
+              constexpr int count = div_ceil(b_sh_stride, threads);
+              int b_gl_idx =
+                  b_gl_rd + (i % count) * threads +
+                  b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
 
-            cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
+              cp_async4_stream(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
+            }
           }
   #pragma unroll
           for (int i = 0; i < a_sh_wr_iters; i++) {
@@ -3273,6 +3287,43 @@ __global__ void Marlin(
   // Main loop.
   while (slice_iters) {
     if constexpr (cont_pipe) {
+      if constexpr (multi_m && thread_m_blocks >= 2 && kloop_ovlp && b_sh_wr_iters == 2 && !has_act_order && !is_a_8bit && !has_zp) {
+        // I-cache-resident K-loop strictly for M=32 (thread_m_blocks >= 2) NVFP4 kernels whose
+        // 3-4x unrolled SASS overflows SM121's 32 KiB L1I cache; M<=16 stays fully unrolled so
+        // stage offsets fold into compile-time immediates (0-ULP identical arithmetic).
+  #pragma unroll 1
+        for (int p = pipe_start; p < stages; p++) {
+          const int pipe = p;
+          const int next_pipe = (p + 1 == stages) ? 0 : (p + 1);
+          const int prev_pipe = (p == 0) ? (stages - 1) : (p - 1);
+          fetch_to_registers(1, pipe);
+          fetch_scales_to_registers(1, pipe);
+          fetch_to_shared(prev_pipe, pipe, total_rem >= stages);
+          matmul(0, pipe);
+#ifdef MUSE_SCALE_TMA4
+          tma_q++;
+          if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
+#endif
+          wait_for_stage(next_pipe, total_rem > 1);
+          fetch_to_registers(2, next_pipe);
+          fetch_scales_to_registers(2, next_pipe);
+          matmul(1, pipe);
+          total_rem--;
+#ifdef MUSE_SCALE_TMA4
+          if ((tma_pdl_mode & 2) && total_rem == 8) {
+            asm volatile("griddepcontrol.launch_dependents;");
+          }
+#endif
+          slice_iters--;
+          if (slice_iters == 0) {
+            pipe_start = next_pipe;
+            break;
+          }
+        }
+        if (slice_iters != 0) {
+          pipe_start = 0;
+        }
+      } else {
   #pragma unroll
       for (int p = 0; p < stages; p++) {
         if (p < pipe_start) continue;
@@ -3397,6 +3448,7 @@ __global__ void Marlin(
       }
       if (slice_iters != 0) {
         pipe_start = 0;
+      }
       }
     } else {
   #pragma unroll
