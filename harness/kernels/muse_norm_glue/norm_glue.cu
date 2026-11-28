@@ -1118,8 +1118,94 @@ static bool norm_glue_prefill_pdl_enabled() {
   return env_on;
 }
 
+static void ensure_norm_glue_carveout() {
+  static bool done = false;
+  if (done) return;
+  static const bool en = []() {
+    const char* env = std::getenv("MUSE_NORM_GLUE_CARVEOUT100");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  if (en) {
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    auto set100 = [](auto fn) {
+      (void)cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    };
+    set100(post_attn_norm_decode<true, false, true, 0>);
+    set100(post_attn_norm_decode<true, false, false, 0>);
+    set100(post_attn_norm_decode<false, true, true, 0>);
+    set100(post_attn_norm_decode<false, true, false, 0>);
+    set100(post_attn_norm_decode<false, true, true, 1>);
+    set100(post_attn_norm_decode<false, true, false, 1>);
+    set100(post_attn_norm_decode<false, true, true, 2>);
+    set100(post_attn_norm_decode<false, true, false, 2>);
+    set100(post_attn_norm<true, false, true>);
+    set100(post_attn_norm<true, false, false>);
+    set100(post_attn_norm<false, true, true>);
+    set100(post_attn_norm<false, true, false>);
+    set100(post_ff_norm_decode<false, false, true, true, 0>);
+    set100(post_ff_norm_decode<false, false, true, false, 0>);
+    set100(post_ff_norm_decode<true, false, true, true, 0>);
+    set100(post_ff_norm_decode<true, false, true, false, 0>);
+    set100(post_ff_norm_decode<true, true, true, true, 0>);
+    set100(post_ff_norm_decode<true, true, false, true, 0>);
+    set100(post_ff_norm_decode<true, true, true, false, 0>);
+    set100(post_ff_norm_decode<true, true, false, false, 0>);
+    set100(post_ff_norm_decode<true, true, true, true, 1>);
+    set100(post_ff_norm_decode<true, true, false, true, 1>);
+    set100(post_ff_norm_decode<true, true, true, false, 1>);
+    set100(post_ff_norm_decode<true, true, false, false, 1>);
+    set100(post_ff_norm_decode<true, true, true, true, 2>);
+    set100(post_ff_norm_decode<true, true, false, true, 2>);
+    set100(post_ff_norm_decode<true, true, true, false, 2>);
+    set100(post_ff_norm_decode<true, true, false, false, 2>);
+    set100(post_ff_norm_prefill<false, true>);
+    set100(post_ff_norm_prefill<false, false>);
+    set100(post_ff_norm_prefill<true, true>);
+    set100(post_ff_norm_prefill<true, false>);
+    set100(post_ff_final_norm<true, true>);
+    set100(post_ff_final_norm<false, true>);
+    set100(post_ff_final_norm<true, false>);
+    set100(post_ff_final_norm<false, false>);
+    set100(input_norm_fp8_w16<false, true, true, 0>);
+    set100(input_norm_fp8_w16<false, true, false, 0>);
+    set100(input_norm_fp8_w16<true, true, true, 0>);
+    set100(input_norm_fp8_w16<true, false, true, 0>);
+    set100(input_norm_fp8_w16<true, true, true, 1>);
+    set100(input_norm_fp8_w16<true, false, true, 1>);
+    set100(input_norm_fp8_w16<true, true, true, 2>);
+    set100(input_norm_fp8_w16<true, false, true, 2>);
+    set100(input_norm_fp8_w8<false, true, true, 0>);
+    set100(input_norm_fp8_w8<true, true, true, 0>);
+    set100(input_norm_fp8_w8<true, false, true, 0>);
+    set100(input_norm_fp8_w8<true, true, true, 1>);
+    set100(input_norm_fp8_w8<true, false, true, 1>);
+    set100(input_norm_fp8_w8<true, true, true, 2>);
+    set100(input_norm_fp8_w8<true, false, true, 2>);
+    set100(mul_sigmoid_bf16_kernel<false, true>);
+    set100(mul_sigmoid_bf16_kernel<false, false>);
+    set100(mul_sigmoid_bf16_kernel<true, true>);
+    set100(mul_sigmoid_bf16_kernel<true, false>);
+    set100(mul_sigmoid_fp8_kernel<256, true, true, 0>);
+    set100(mul_sigmoid_fp8_kernel<352, true, true, 0>);
+    set100(mul_sigmoid_fp8_kernel<256, true, true, 1>);
+    set100(mul_sigmoid_fp8_kernel<352, true, true, 2>);
+    set100(mul_sigmoid_fp8_kernel<256, false, true, 0>);
+    set100(mul_sigmoid_fp8_kernel<256, false, false, 0>);
+    set100(mul_silu_slice_bf16_kernel<true>);
+    set100(mul_silu_slice_bf16_kernel<false>);
+    set100(mul_silu_slice_fp8_kernel<true, true, 0>);
+    set100(mul_silu_slice_fp8_kernel<true, true, 1>);
+    set100(mul_silu_slice_fp8_kernel<true, true, 2>);
+    set100(mul_silu_slice_fp8_kernel<false, false, 0>);
+    cudaThreadExchangeStreamCaptureMode(&mode);
+  }
+  done = true;
+}
+
 template <typename... KArgs, typename... Args>
 cudaError_t launch_pdl_grid(void (*kernel)(KArgs...), dim3 grid, int threads, cudaStream_t stream, Args... args) {
+  ensure_norm_glue_carveout();
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = grid;
   cfg.blockDim = dim3(threads, 1, 1);
@@ -1390,6 +1476,7 @@ int muse_norm_glue_gate_formula(const void* bits, const void* gate_scale, void* 
 int muse_norm_glue_mul_sigmoid_bf16(const void* gate, const void* attn, void* out, int n,
                                     cudaStream_t stream) {
   if (n <= 0 || (n & 7) != 0) return -1;
+  ensure_norm_glue_carveout();
   const int vec8 = n >> 3;
   const int blocks = (vec8 + 255) / 256;
   if (n <= 4096 * 16) {
@@ -1449,6 +1536,7 @@ int muse_norm_glue_mul_sigmoid_fp8(const void* gate, const void* attn, const voi
 
 int muse_norm_glue_mul_silu_slice_bf16(const void* gu, void* out, int rows, cudaStream_t stream) {
   if (rows <= 0) return -1;
+  ensure_norm_glue_carveout();
   const dim3 grid((kInterVec8 + 191) / 192, static_cast<unsigned>(rows));
   if (rows <= 32 && norm_glue_pdl_enabled()) {
     mul_silu_slice_bf16_kernel<true><<<grid, 192, 0, stream>>>(
