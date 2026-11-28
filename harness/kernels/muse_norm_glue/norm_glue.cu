@@ -158,22 +158,29 @@ __device__ __forceinline__ void st4_v2(uint8_t* base, int c, uint32_t val) {
   *reinterpret_cast<uint32_t*>(base + c * 1024 + threadIdx.x * 4) = val;
 }
 
-// Store 4 consecutive FP8 bytes at (row, col) directly into muserans kXMma layout:
-//   kM32 (M==32): uint32_t[(s << 8) | ((row >> 4) << 7) | (lane << 2) | comp]
-//   kM16 (M==16): uint32_t[(s << 7) | (lane << 2) | comp]
-// where s = col >> 5, h = (col >> 4) & 1, t = (col >> 2) & 3,
-//       lane = ((row & 7) << 2) | t, comp = (h << 1) | ((row >> 3) & 1).
 template <bool kM32>
-__device__ __forceinline__ void st4_xmma(uint8_t* base, size_t row, int col, uint32_t val) {
-  const size_t s = static_cast<size_t>(col) >> 5;
-  const size_t h = (static_cast<size_t>(col) >> 4) & 1u;
-  const size_t t = (static_cast<size_t>(col) >> 2) & 3u;
-  const size_t lane = ((row & 7u) << 2) | t;
-  const size_t comp = (h << 1) | ((row >> 3) & 1u);
-  const size_t idx = kM32
-      ? ((s << 8) | (((row >> 4) & 1u) << 7) | (lane << 2) | comp)
-      : ((s << 7) | (lane << 2) | comp);
-  reinterpret_cast<uint32_t*>(base)[idx] = val;
+constexpr unsigned kXMmaGroupWords = kM32 ? 256 : 128;
+
+template <bool kM32>
+__device__ __forceinline__ unsigned xmma_word_index(unsigned row, unsigned word_col) {
+  const unsigned group = (word_col >> 3) * kXMmaGroupWords<kM32>;
+  const unsigned half_row = kM32 ? ((row & 16u) << 3) : 0u;
+  return group | half_row | ((row & 7u) << 4) | ((word_col & 3u) << 2) |
+         ((word_col & 4u) >> 1) | ((row >> 3) & 1u);
+}
+
+template <bool kM32>
+__device__ __forceinline__ void st8_xmma(uint32_t* base, unsigned row, unsigned word_col, uint32_t lo, uint32_t hi) {
+  uint32_t* dst = base + xmma_word_index<kM32>(row, word_col);
+  dst[0] = lo;
+  dst[4] = hi;
+}
+
+__device__ __forceinline__ void st16_xmma(uint32_t* dst, uint4 values) {
+  dst[0] = values.x;
+  dst[4] = values.y;
+  dst[8] = values.z;
+  dst[12] = values.w;
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -253,6 +260,7 @@ __global__ void __launch_bounds__(kThreads) post_attn_norm_decode(
   if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
   __nv_bfloat16* const out_bf16_row = kBf16Out ? (out_bf16_all + row * kHidden) : nullptr;
   uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
+  const unsigned xmma_base = kXMmaMode == 0 ? 0u : xmma_word_index<kXMmaMode == 2>(row, threadIdx.x);
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
@@ -269,10 +277,9 @@ __global__ void __launch_bounds__(kThreads) post_attn_norm_decode(
       if constexpr (kFp8Out) {
         uint32_t q = pack_fp8x4(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]),
                                 __fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]));
-        if constexpr (kXMmaMode == 2) {
-          st4_xmma<true>(out_fp8_all, row, c * 1024 + threadIdx.x * 4, q);
-        } else if constexpr (kXMmaMode == 1) {
-          st4_xmma<false>(out_fp8_all, row, c * 1024 + threadIdx.x * 4, q);
+        if constexpr (kXMmaMode != 0) {
+          const unsigned idx = xmma_base + c * 32 * kXMmaGroupWords<kXMmaMode == 2>;
+          reinterpret_cast<uint32_t*>(out_fp8_all)[idx] = q;
         } else {
           st4_v2(out_fp8_row, c, q);
         }
@@ -467,6 +474,7 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
   __nv_bfloat16* const out_bf16_row = kWriteBf16 ? (out_bf16_all + row * kHidden) : nullptr;
   uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
   uint8_t* const out_gate_row = kGateOut ? (out_gate_all + row * kHidden) : nullptr;
+  const unsigned xmma_base = kXMmaMode == 0 ? 0u : xmma_word_index<kXMmaMode == 2>(row, threadIdx.x);
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
@@ -480,13 +488,12 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
       if constexpr (kWriteBf16) {
         st8_v4(out_bf16_row, c, o);
       }
+      const unsigned xmma_idx = xmma_base + c * 32 * kXMmaGroupWords<kXMmaMode == 2>;
       if constexpr (kFp8Out) {
         uint32_t q = pack_fp8x4(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]),
                                 __fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]));
-        if constexpr (kXMmaMode == 2) {
-          st4_xmma<true>(out_fp8_all, row, c * 1024 + threadIdx.x * 4, q);
-        } else if constexpr (kXMmaMode == 1) {
-          st4_xmma<false>(out_fp8_all, row, c * 1024 + threadIdx.x * 4, q);
+        if constexpr (kXMmaMode != 0) {
+          reinterpret_cast<uint32_t*>(out_fp8_all)[xmma_idx] = q;
         } else {
           st4_v2(out_fp8_row, c, q);
         }
@@ -495,10 +502,8 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
         const float g0 = bf_lo(o.x), g1 = bf_hi(o.x), g2 = bf_lo(o.y), g3 = bf_hi(o.y);
         uint32_t gq = pack_fp8x4(__fmul_rn(gate_inv, g0), __fmul_rn(gate_inv, g1),
                                  __fmul_rn(gate_inv, g2), __fmul_rn(gate_inv, g3));
-        if constexpr (kXMmaMode == 2) {
-          st4_xmma<true>(out_gate_all, row, c * 1024 + threadIdx.x * 4, gq);
-        } else if constexpr (kXMmaMode == 1) {
-          st4_xmma<false>(out_gate_all, row, c * 1024 + threadIdx.x * 4, gq);
+        if constexpr (kXMmaMode != 0) {
+          reinterpret_cast<uint32_t*>(out_gate_all)[xmma_idx] = gq;
         } else {
           st4_v2(out_gate_row, c, gq);
         }
@@ -679,18 +684,8 @@ __global__ void __launch_bounds__(kThreads) mul_sigmoid_fp8_kernel(
   }
   const uint32_t lo = __byte_perm(static_cast<uint32_t>(ow[0]), static_cast<uint32_t>(ow[1]), 0x5410);
   const uint32_t hi = __byte_perm(static_cast<uint32_t>(ow[2]), static_cast<uint32_t>(ow[3]), 0x5410);
-  if constexpr (kXMmaMode == 2) {
-    const size_t row = static_cast<size_t>(idx) >> 9;
-    const int col = (idx & 511) << 3;
-    uint8_t* const out_u8 = reinterpret_cast<uint8_t*>(out);
-    st4_xmma<true>(out_u8, row, col, lo);
-    st4_xmma<true>(out_u8, row, col + 4, hi);
-  } else if constexpr (kXMmaMode == 1) {
-    const size_t row = static_cast<size_t>(idx) >> 9;
-    const int col = (idx & 511) << 3;
-    uint8_t* const out_u8 = reinterpret_cast<uint8_t*>(out);
-    st4_xmma<false>(out_u8, row, col, lo);
-    st4_xmma<false>(out_u8, row, col + 4, hi);
+  if constexpr (kXMmaMode != 0) {
+    st8_xmma<kXMmaMode == 2>(reinterpret_cast<uint32_t*>(out), idx >> 9, (idx & 511) << 1, lo, hi);
   } else {
     out[idx] = make_uint2(lo, hi);
   }
@@ -743,16 +738,8 @@ __global__ void __launch_bounds__(192) mul_silu_slice_fp8_kernel(
   }
   const uint32_t lo = __byte_perm(static_cast<uint32_t>(ow[0]), static_cast<uint32_t>(ow[1]), 0x5410);
   const uint32_t hi = __byte_perm(static_cast<uint32_t>(ow[2]), static_cast<uint32_t>(ow[3]), 0x5410);
-  if constexpr (kXMmaMode == 2) {
-    uint8_t* const out_u8 = reinterpret_cast<uint8_t*>(out_all);
-    const int elem_col = col << 3;
-    st4_xmma<true>(out_u8, row, elem_col, lo);
-    st4_xmma<true>(out_u8, row, elem_col + 4, hi);
-  } else if constexpr (kXMmaMode == 1) {
-    uint8_t* const out_u8 = reinterpret_cast<uint8_t*>(out_all);
-    const int elem_col = col << 3;
-    st4_xmma<false>(out_u8, row, elem_col, lo);
-    st4_xmma<false>(out_u8, row, elem_col + 4, hi);
+  if constexpr (kXMmaMode != 0) {
+    st8_xmma<kXMmaMode == 2>(reinterpret_cast<uint32_t*>(out_all), row, col << 1, lo, hi);
   } else {
     out_all[row * kInterVec8 + col] = make_uint2(lo, hi);
   }
@@ -923,6 +910,7 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
   __nv_bfloat16* const out_bf16_row = kWriteBf16 ? (out_bf16_all + row * kHidden) : nullptr;
   uint8_t* const out_fp8_row = out_fp8_all + row * kHidden;
   uint8_t* const out_gate_row = kGateOut ? (out_gate_all + row * kHidden) : nullptr;
+  const unsigned xmma_base = kXMmaMode == 0 ? 0u : xmma_word_index<kXMmaMode == 2>(row, threadIdx.x);
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
@@ -936,12 +924,11 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
       if constexpr (kWriteBf16) {
         st8_v4(out_bf16_row, c, o);
       }
+      const unsigned xmma_idx = xmma_base + c * 32 * kXMmaGroupWords<kXMmaMode == 2>;
       uint32_t q = pack_fp8x4(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]),
                               __fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]));
-      if constexpr (kXMmaMode == 2) {
-        st4_xmma<true>(out_fp8_all, row, c * 1024 + threadIdx.x * 4, q);
-      } else if constexpr (kXMmaMode == 1) {
-        st4_xmma<false>(out_fp8_all, row, c * 1024 + threadIdx.x * 4, q);
+      if constexpr (kXMmaMode != 0) {
+        reinterpret_cast<uint32_t*>(out_fp8_all)[xmma_idx] = q;
       } else {
         st4_v2(out_fp8_row, c, q);
       }
@@ -949,10 +936,8 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
         const float g0 = bf_lo(o.x), g1 = bf_hi(o.x), g2 = bf_lo(o.y), g3 = bf_hi(o.y);
         uint32_t gq = pack_fp8x4(__fmul_rn(gate_inv, g0), __fmul_rn(gate_inv, g1),
                                  __fmul_rn(gate_inv, g2), __fmul_rn(gate_inv, g3));
-        if constexpr (kXMmaMode == 2) {
-          st4_xmma<true>(out_gate_all, row, c * 1024 + threadIdx.x * 4, gq);
-        } else if constexpr (kXMmaMode == 1) {
-          st4_xmma<false>(out_gate_all, row, c * 1024 + threadIdx.x * 4, gq);
+        if constexpr (kXMmaMode != 0) {
+          reinterpret_cast<uint32_t*>(out_gate_all)[xmma_idx] = gq;
         } else {
           st4_v2(out_gate_row, c, gq);
         }
@@ -1064,32 +1049,17 @@ __global__ void __launch_bounds__(512) input_norm_fp8_w16(
         __byte_perm(static_cast<uint32_t>(a4), static_cast<uint32_t>(a5), 0x5410),
         __byte_perm(static_cast<uint32_t>(a6), static_cast<uint32_t>(a7), 0x5410));
   };
+  const unsigned xmma_idx = kXMmaMode == 0 ? 0u : xmma_word_index<kXMmaMode == 2>(row, t * 4);
   const uint4 qv = pack4x16(qf[0], qf[1], qf[2], qf[3], qf[4], qf[5], qf[6], qf[7]);
-  if constexpr (kXMmaMode == 2) {
-    st4_xmma<true>(out_fp8_all, row, t * 16 + 0, qv.x);
-    st4_xmma<true>(out_fp8_all, row, t * 16 + 4, qv.y);
-    st4_xmma<true>(out_fp8_all, row, t * 16 + 8, qv.z);
-    st4_xmma<true>(out_fp8_all, row, t * 16 + 12, qv.w);
-  } else if constexpr (kXMmaMode == 1) {
-    st4_xmma<false>(out_fp8_all, row, t * 16 + 0, qv.x);
-    st4_xmma<false>(out_fp8_all, row, t * 16 + 4, qv.y);
-    st4_xmma<false>(out_fp8_all, row, t * 16 + 8, qv.z);
-    st4_xmma<false>(out_fp8_all, row, t * 16 + 12, qv.w);
+  if constexpr (kXMmaMode != 0) {
+    st16_xmma(reinterpret_cast<uint32_t*>(out_fp8_all) + xmma_idx, qv);
   } else {
     *reinterpret_cast<uint4*>(out_fp8_all + off) = qv;
   }
   if constexpr (kGateOut) {
     const uint4 gv = pack4x16(qg[0], qg[1], qg[2], qg[3], qg[4], qg[5], qg[6], qg[7]);
-    if constexpr (kXMmaMode == 2) {
-      st4_xmma<true>(out_gate_all, row, t * 16 + 0, gv.x);
-      st4_xmma<true>(out_gate_all, row, t * 16 + 4, gv.y);
-      st4_xmma<true>(out_gate_all, row, t * 16 + 8, gv.z);
-      st4_xmma<true>(out_gate_all, row, t * 16 + 12, gv.w);
-    } else if constexpr (kXMmaMode == 1) {
-      st4_xmma<false>(out_gate_all, row, t * 16 + 0, gv.x);
-      st4_xmma<false>(out_gate_all, row, t * 16 + 4, gv.y);
-      st4_xmma<false>(out_gate_all, row, t * 16 + 8, gv.z);
-      st4_xmma<false>(out_gate_all, row, t * 16 + 12, gv.w);
+    if constexpr (kXMmaMode != 0) {
+      st16_xmma(reinterpret_cast<uint32_t*>(out_gate_all) + xmma_idx, gv);
     } else {
       *reinterpret_cast<uint4*>(out_gate_all + off) = gv;
     }
