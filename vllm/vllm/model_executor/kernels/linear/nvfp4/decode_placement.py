@@ -55,14 +55,14 @@ MIN_PAYLOAD_BYTES = 48 << 20
 # Payloads <= 64 MiB can partially linger in GB10's 24 MiB L2 across consecutive candidates.
 _L2_FLUSH_THRESHOLD_BYTES = 64 << 20
 # Host memory that must stay available while the spares exist.
-HOST_HEADROOM_BYTES = 20 << 30
+HOST_HEADROOM_BYTES = int(os.environ.get("MUSE_HOST_HEADROOM_GIB", "32")) << 30
 _NAME = "_marlin_decode_weight"
 _L2_FLUSH_INTS = 16 << 20  # 64 MiB (> 2.5x GB10's 24 MiB L2)
 # Quarantine below-median (slow) buffers from place_decode_weights through place_prefill_weights (and KV-cache init).
 _SLOW_HOLD: list[torch.Tensor] = []
 _SLOW_HOLD_SCAN_CAP = int(os.environ.get("MUSE_SLOW_HOLD_SCAN_CAP", "140"))
 _SLOW_HOLD_MAX_SLABS = int(os.environ.get("MUSE_SLOW_HOLD_MAX_SLABS", "180"))
-_SLOW_HOLD_MAX_BYTES = int(os.environ.get("MUSE_SLOW_HOLD_MAX_BYTES_GIB", "18")) << 30
+_SLOW_HOLD_MAX_BYTES = int(os.environ.get("MUSE_SLOW_HOLD_MAX_BYTES_GIB", "8")) << 30
 HOLD_SLOW_FOR_KV = os.environ.get("MUSE_HOLD_SLOW_FOR_KV", "1").strip() not in ("0", "", "false", "no")
 _SPONGE_STATE: dict[str, int] = {"ptr": 0, "len": 0}
 
@@ -91,6 +91,22 @@ def _usable_buddyinfo_bytes(min_chunk: int = 2 << 20) -> int:
     return total
 
 
+def _wait_mem_available_settle(min_bytes: int = 75 << 30, max_wait_s: float = 5.0, poll_s: float = 0.25) -> None:
+    """Wait briefly for unified memory from a prior stopped resident process to finish draining."""
+    avail = _mem_available()
+    if avail is None or avail >= min_bytes or max_wait_s <= 0.0:
+        return
+    t0 = time.monotonic()
+    deadline = t0 + max_wait_s
+    while avail is not None and avail < min_bytes and time.monotonic() < deadline:
+        time.sleep(min(poll_s, max(0.0, deadline - time.monotonic())))
+        avail = _mem_available()
+    logger.info(
+        "MemAvailable settle poll: %.1f GiB after %.2f s (target %.1f GiB)",
+        (avail or 0) / (1 << 30), time.monotonic() - t0, min_bytes / (1 << 30),
+    )
+
+
 def take_buddyinfo_sponge(need_bytes: int = 36 << 30) -> int:
     """Temporarily commit fragmented small free blocks before weight loading so initial weights land on 32 MiB extents."""
     if not ENABLED or os.environ.get("MUSE_BUDDY_SPONGE", "1").strip() in ("0", "", "false", "no"):
@@ -103,14 +119,15 @@ def take_buddyinfo_sponge(need_bytes: int = 36 << 30) -> int:
         # Drop stale checkpoint file page cache BEFORE reading /proc/buddyinfo so usable 2 MiB+ RAM
         # reflects true free physical memory (~80+ GiB) and the sponge reliably absorbs small-order fragments.
         _drop_model_page_cache()
-        cap_gib = int(os.environ.get("MUSE_BUDDY_SPONGE_CAP_GIB", "24"))
+        _wait_mem_available_settle(75 << 30, 5.0)
+        cap_gib = min(24, int(os.environ.get("MUSE_BUDDY_SPONGE_CAP_GIB", "24")))
         if cap_gib <= 0:
             return 0
         usable = _usable_buddyinfo_bytes(2 << 20)
         avail = _mem_available()
         if avail is not None and avail > 0:
             usable = min(usable, avail)
-        headroom = 18 << 30
+        headroom = 30 << 30
         granule = 2 << 20
         least = 1 << 30
         most = cap_gib << 30
@@ -1335,9 +1352,10 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
     """Move 512-row NVFP4 & FP8 MLP weights that landed on slow device memory; never raises."""
     if not PREFILL_ENABLED or not torch.cuda.is_available():
         return
-    ensure_slow_hold_headroom(32 << 30)
+    ensure_slow_hold_headroom(max(36 << 30, HOST_HEADROOM_BYTES))
     began = time.perf_counter()
     rejected_hold: list[torch.Tensor] = []
+    saved_pdl: list[tuple] = []
     try:
         try:
             from marlinw import swiglu as _swiglu
@@ -1624,6 +1642,22 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
                             _marlin_attn.gemm(x, weight, ref.weight_scale, ref.weight_global_scale, *plan)
                         on_mv = _route.down128_moved if _route is not None else None
                     groups.append((gname, glayers, run_nv_attn, on_mv, False))
+        # Disable PDL while stress-timing isolated DRAM slabs (placement only ranks DRAM bandwidth;
+        # restoring original PDL modes in finally keeps steady-state inference untouched).
+        for mod, fn_name, off_val in (
+            (_swiglu, "set_tma_pdl", 0),
+            (getattr(_route, "marlinw_down128", None), "set_tma_pdl", 0),
+            (_fp8ws, "set_pdl", False),
+            (_fp8sw, "set_pdl", False),
+        ):
+            fn = getattr(mod, fn_name, None) if mod is not None else None
+            if fn is not None:
+                try:
+                    prev = fn(off_val)
+                    if prev is not None:
+                        saved_pdl.append((fn, prev))
+                except Exception:  # noqa: BLE001
+                    pass
         for name, layers, run, on_move, fast in groups:
             try:
                 if name == "fp8_swiglu_39936x6656":
@@ -1656,6 +1690,11 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
     except Exception as err:  # noqa: BLE001 - the load must go on
         logger.warning("Prefill weight placement failed and was skipped: %s", err)
     finally:
+        for fn, prev in reversed(saved_pdl):
+            try:
+                fn(prev)
+            except Exception:  # noqa: BLE001
+                pass
         rejected_hold.clear()
         if HOLD_SLOW_FOR_KV and _SLOW_HOLD:
             ensure_slow_hold_headroom(HOST_HEADROOM_BYTES)

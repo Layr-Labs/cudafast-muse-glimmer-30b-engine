@@ -147,10 +147,10 @@ class DecodePlacementLogicTest(unittest.TestCase):
         mod = _load_dp_module({"MUSE_PLACE_M32": "1"})
         mod._SLOW_HOLD.clear()
         mod._SLOW_HOLD.extend([None] * 175)  # post full_ram_scan state!
-        with mock.patch.object(mod, "_mem_available", return_value=40 << 30):
+        with mock.patch.object(mod, "_mem_available", return_value=48 << 30):
             self.assertTrue(mod._can_append_slow_hold(64 << 20))
-        with mock.patch.object(mod, "_mem_available", return_value=22 << 30):
-            # Below HOST_HEADROOM_BYTES (20 GiB) + 4 GiB margin -> refuse!
+        with mock.patch.object(mod, "_mem_available", return_value=36 << 30):
+            # Below HOST_HEADROOM_BYTES (32 GiB) + 8 GiB margin -> refuse!
             self.assertFalse(mod._can_append_slow_hold(64 << 20))
         mod._SLOW_HOLD.clear()
 

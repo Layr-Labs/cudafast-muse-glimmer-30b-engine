@@ -5,6 +5,8 @@ import os
 
 import torch
 
+_PREFILL_L2_DISCARD_V2 = os.environ.get("MUSE_PREFILL_L2_DISCARD_V2", "1") != "0"
+
 import vllm._custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
@@ -390,6 +392,12 @@ def _marlin_fp4_wide(
             out = marlinw_down128.gemm_auto(x, weight, weight_scale, weight_global_scale)
             if out is not None:
                 _count_mlp_route("down128")
+                if _PREFILL_L2_DISCARD_V2 and x.shape == (512, 19968) and torch.cuda.is_current_stream_capturing():
+                    try:
+                        import muse_sandwich as _ms
+                        _ms.stash_dead_down_in(x)
+                    except Exception:  # noqa: BLE001
+                        pass
                 return out
         out = marlinw_down.gemm(
             x, weight, weight_scale, weight_global_scale, down_work, down_work_ptr, down_slots
@@ -511,6 +519,12 @@ def _marlin_fp4_narrow_attn(
                         _pending_nvfp4_dual_gate = (
                             x.data_ptr(), gate_layer.weight.data_ptr(), gate_out
                         )
+                        if _PREFILL_L2_DISCARD_V2 and torch.cuda.is_current_stream_capturing():
+                            try:
+                                import muse_prefill_attn as _mpa
+                                _mpa.stash_dead_xnorm(x)
+                            except Exception:  # noqa: BLE001
+                                pass
                         return qkv_out
             out = marlinw_down128.gemm_shape(
                 x, weight, weight_scale, weight_global_scale, size_n, size_k
@@ -574,7 +588,16 @@ def _marlin_fp4_swiglu(
             return out
     uses_128 = getattr(marlin_swiglu, "uses_128", None)
     _count_mlp_route("gate_128" if uses_128 is not None and uses_128(weight) else "gate_64")
-    return marlin_swiglu.gemm(x, weight, scales, global_scale)
+    out = marlin_swiglu.gemm(x, weight, scales, global_scale)
+    if (
+        _PREFILL_L2_DISCARD_V2
+        and x.shape == (512, 6656)
+        and torch.cuda.is_current_stream_capturing()
+        and marlinw_down128 is not None
+        and hasattr(marlinw_down128, "stash_dead_mlp_in")
+    ):
+        marlinw_down128.stash_dead_mlp_in(x)
+    return out
 
 
 def _marlin_fp4_swiglu_fake(
@@ -594,7 +617,14 @@ def _marlin_fp4_swiglu_fp8(
     x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, global_scale: torch.Tensor,
     down_scale: torch.Tensor,
 ) -> torch.Tensor:
-    return marlin_swiglu_fp8.gemm(x, weight, scales, global_scale, down_scale)
+    out = marlin_swiglu_fp8.gemm(x, weight, scales, global_scale, down_scale)
+    if _PREFILL_L2_DISCARD_V2 and x.shape == (512, 6656) and torch.cuda.is_current_stream_capturing():
+        try:
+            import muse_fp8_swiglu as _mf8
+            _mf8.stash_dead_mlp_in(x)
+        except Exception:  # noqa: BLE001
+            pass
+    return out
 
 
 def _marlin_fp4_swiglu_fp8_fake(

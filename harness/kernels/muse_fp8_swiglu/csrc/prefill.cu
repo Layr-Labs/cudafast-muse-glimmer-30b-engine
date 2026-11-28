@@ -147,10 +147,24 @@ __device__ __forceinline__ uint64_t tma_pol_el() {
 __device__ __forceinline__ uint64_t tma_pol_ef() {
   uint64_t p; asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p)); return p;
 }
+__device__ __forceinline__ void tma2d(uint32_t dst, const CUtensorMap* map, int x, int y, uint32_t bar) {
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+      ::"r"(dst), "l"(map), "r"(x), "r"(y), "r"(bar) : "memory");
+}
 __device__ __forceinline__ void tma2d_hint(uint32_t dst, const CUtensorMap* map, int x, int y, uint32_t bar, uint64_t pol) {
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;"
       ::"r"(dst), "l"(map), "r"(x), "r"(y), "r"(bar), "l"(pol) : "memory");
+}
+__device__ __forceinline__ void tma2d_b(uint32_t dst, const CUtensorMap* map, int x, int y, uint32_t bar,
+                                        int b_ef, uint64_t pol_ef) {
+  if (b_ef) tma2d_hint(dst, map, x, y, bar, pol_ef);
+  else      tma2d(dst, map, x, y, bar);
+}
+__device__ __forceinline__ void ldsm2(uint32_t a, uint32_t (&r)[2]) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+               : "=r"(r[0]), "=r"(r[1]) : "r"(a));
 }
 __device__ __forceinline__ void ldsm4(uint32_t a, uint32_t (&r)[4]) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
@@ -508,6 +522,7 @@ extern "C" int swiglu_ws_query_occ(int mode) {
     case 0: cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, swiglu_ws9_st3_kernel<false>, NT_WS9, SMEM_MAX); break;
     case 2: cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, swiglu_ws8_256x128_st2_kernel<false, false, true>, NT, SMEM_MAX); break;
     case 3: cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, swiglu_ws9_st3_lut_kernel<false, false, true>, NT_WS9, SMEM_MAX); break;
+    case 4: cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, swiglu_ws12_256x128_st2_kernel<false, false, true>, NT_WS12, SMEM_MAX); break;
   }
   return nb;
 }
@@ -531,6 +546,17 @@ extern "C" int swiglu_ws_init(cudaStream_t stream) {
   if (e == cudaSuccess) e = set_smem(swiglu_ws9_st3_lut_kernel<false, false, true>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(swiglu_ws9_st3_lut_kernel<true, false, true>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(swiglu_ws9_st3_lut_kernel<true, true, true>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(swiglu_ws12_256x128_st2_kernel<false, false, true>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(swiglu_ws12_256x128_st2_kernel<true, false, true>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(swiglu_ws12_256x128_st2_kernel<true, true, true>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_4wave_ws9_kernel<19968, false>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_4wave_ws9_kernel<19968, true>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_4wave_ws9_kernel<4096, false>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_4wave_ws9_kernel<4096, true>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_3wave_ws12_kernel<19968, false>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_3wave_ws12_kernel<19968, true>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_3wave_ws12_kernel<4096, false>, SMEM_MAX);
+  if (e == cudaSuccess) e = set_smem(fp8_6656_3wave_ws12_kernel<4096, true>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(fp8_6656_ws8_256_st2_st4_kernel<19968, false>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(fp8_6656_ws8_256_st2_st4_kernel<19968, true>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(fp8_6656_ws9_256_st2_st4_kernel<19968, false>, SMEM_MAX);
@@ -559,11 +585,23 @@ extern "C" int swiglu_ws_init(cudaStream_t stream) {
   return diffs == 0 ? 0 : -5;
 }
 
+static int fp8_b_ef_mask() {
+  static const int mask = []() -> int {
+    const char* env = std::getenv("MUSE_FP8_B_EF_MASK");
+    if (env && *env) return int(std::strtol(env, nullptr, 0));
+    const char* e2 = std::getenv("MUSE_FP8_B_EF");
+    if (e2 && *e2) return (std::strtol(e2, nullptr, 10) != 0) ? 0x1f : 0;
+    return 0x1f;  // keep L2::evict_first on tmB across all 5 shapes so tmA stays L2-resident
+  }();
+  return mask;
+}
+
 extern "C" int swiglu_ws_run_mode(int mode, int pdl, const void* a, const void* b, const float* sa, const float* sb,
                                   const float* down, void* d, cudaStream_t stream) {
   using namespace swiglu_ws;
   if (!encode || (((uintptr_t)a | (uintptr_t)b | (uintptr_t)d) & 15)) return -1;
   uint8_t* out = static_cast<uint8_t*>(d);
+  const int b_ef = (fp8_b_ef_mask() & 1) ? 1 : 0;
   CUtensorMap tmA, tmB;
   switch (mode) {
     case 0:
@@ -582,6 +620,12 @@ extern "C" int swiglu_ws_run_mode(int mode, int pdl, const void* a, const void* 
       if (pdl >= 2) return int(launch_pdl_ex(swiglu_ws9_st3_lut_kernel<true, true, true>, 48, NT_WS9, SMEM_MAX, stream, tmA, tmB, sa, sb, down, out));
       if (pdl == 1) return int(launch_pdl_ex(swiglu_ws9_st3_lut_kernel<true, false, true>, 48, NT_WS9, SMEM_MAX, stream, tmA, tmB, sa, sb, down, out));
       swiglu_ws9_st3_lut_kernel<false, false, true><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA, tmB, sa, sb, down, out);
+      return int(cudaGetLastError());
+    case 4:
+      if (!encode_tma2d(&tmA, a, K_DIM, M_DIM, 256) || !encode_tma2d(&tmB, b, K_DIM, N_DIM, 128)) return -3;
+      if (pdl >= 2) return int(launch_pdl_ex(swiglu_ws12_256x128_st2_kernel<true, true, true>, 48, NT_WS12, SMEM_MAX, stream, tmA, tmB, sa, sb, down, out, b_ef));
+      if (pdl == 1) return int(launch_pdl_ex(swiglu_ws12_256x128_st2_kernel<true, false, true>, 48, NT_WS12, SMEM_MAX, stream, tmA, tmB, sa, sb, down, out, b_ef));
+      swiglu_ws12_256x128_st2_kernel<false, false, true><<<48, NT_WS12, SMEM_MAX, stream>>>(tmA, tmB, sa, sb, down, out, b_ef);
       return int(cudaGetLastError());
   }
   return -2;
@@ -603,26 +647,19 @@ extern "C" int muse_fp8_set_gemm_pdl(int on) {
   return old;
 }
 
-static bool fp8_6656_ws9_enabled() {
-  static const bool on = []() {
-    const char* env = std::getenv("MUSE_FP8_6656_WS9");
-    return env && *env && std::strtol(env, nullptr, 10) != 0;
-  }();
-  return on;
-}
+static const void* g_fp8_down_next_dead_ptr = nullptr;
+static size_t g_fp8_down_next_dead_bytes = 0;
 
-static bool fp8_oproj_ws9_enabled() {
-  static const bool on = []() {
-    const char* env = std::getenv("MUSE_FP8_OPROJ_WS9");
-    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
-  }();
-  return on;
+extern "C" void muse_fp8_down_set_next_dead(const void* ptr, size_t nbytes) {
+  g_fp8_down_next_dead_ptr = ptr;
+  g_fp8_down_next_dead_bytes = nbytes;
 }
 
 static bool fp8_dual_a_ws9_enabled() {
   static const bool on = []() {
-    const char* env = std::getenv("MUSE_FP8_DUAL_A_WS9");
-    return env && *env && std::strtol(env, nullptr, 10) != 0;
+    const char* env = std::getenv("MUSE_FP8_DUAL_WS9");
+    if (!env || !*env) env = std::getenv("MUSE_FP8_DUAL_A_WS9");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
   return on;
 }
@@ -630,7 +667,7 @@ static bool fp8_dual_a_ws9_enabled() {
 static bool bf16_dual_ws9_enabled() {
   static const bool on = []() {
     const char* env = std::getenv("MUSE_BF16_DUAL_WS9");
-    return env && *env && std::strtol(env, nullptr, 10) != 0;
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
   return on;
 }
@@ -640,28 +677,88 @@ extern "C" int muse_fp8_gemm_6656(int mode, int pdl, const void* a, const void* 
   using namespace swiglu_ws;
   if (!encode || (k != 19968 && k != 4096) || (((uintptr_t)a | (uintptr_t)b | (uintptr_t)c) & 15)) return -1;
   __nv_bfloat16* out = static_cast<__nv_bfloat16*>(c);
+  const int use_pdl = (pdl < 0) ? gemm_pdl_enabled() : pdl;
+  static const int down_mode_env = []() -> int {
+    const char* env = std::getenv("MUSE_FP8_6656_MODE");
+    if (env && *env) return int(std::strtol(env, nullptr, 10));
+    const char* ws9 = std::getenv("MUSE_FP8_6656_WS9");
+    if (ws9 && *ws9 && std::strtol(ws9, nullptr, 10) != 0) return 1;
+    return -1;
+  }();
+  static const int k4096_mode_env = []() -> int {
+    const char* env = std::getenv("MUSE_FP8_6656_K4096_MODE");
+    return (env && *env) ? int(std::strtol(env, nullptr, 10)) : -1;
+  }();
+  static const int k19968_mode_env = []() -> int {
+    const char* env = std::getenv("MUSE_FP8_6656_K19968_MODE");
+    return (env && *env) ? int(std::strtol(env, nullptr, 10)) : -1;
+  }();
+  // eff_mode: 0=ws8_256_st2_st4, 1=ws12_256_st2_st4 (232/24), 2=4wave_ws9 (16x160+32x128), 3=3wave_ws12 (BM=256, 96/64).
+  // Auto default: 3 (3wave_ws12) on both K=4096 (42L o_proj) and K=19968 (12L down); override per shape via env.
+  const int shape_env = (k == 4096) ? k4096_mode_env : k19968_mode_env;
+  const int eff_mode = (shape_env >= 0) ? shape_env : ((down_mode_env >= 0) ? down_mode_env : 3);
+  const int b_ef = (fp8_b_ef_mask() & ((k == 4096) ? 4 : 2)) ? 1 : 0;
+  const char* dp = nullptr;
+  size_t dl = 0;
+  if (k == 19968) {
+    const void* raw_dp = g_fp8_down_next_dead_ptr;
+    const size_t raw_db = g_fp8_down_next_dead_bytes;
+    g_fp8_down_next_dead_ptr = nullptr;
+    g_fp8_down_next_dead_bytes = 0;
+    if (raw_dp && raw_db >= 128u) {
+      const uintptr_t p0 = reinterpret_cast<uintptr_t>(raw_dp);
+      const uintptr_t s0 = (p0 + 127u) & ~uintptr_t(127u);
+      const uintptr_t e0 = (p0 + raw_db) & ~uintptr_t(127u);
+      if (e0 > s0) { dp = reinterpret_cast<const char*>(s0); dl = static_cast<size_t>((e0 - s0) >> 7); }
+    }
+  }
+  if (eff_mode == 3) {
+    CUtensorMap tmA256, tmB96, tmB64;
+    if (!encode_tma2d(&tmA256, a, k, M_DIM, 256)) return -3;
+    if (!encode_tma2d(&tmB96, b, k, 6656, 96) || !encode_tma2d(&tmB64, b, k, 6656, 64)) return -4;
+    if (k == 4096) {
+      if (use_pdl) return int(launch_pdl_ex(fp8_6656_3wave_ws12_kernel<4096, true>, 48, NT_WS12, SMEM_MAX, stream, tmA256, tmB96, tmB64, sa, sb, out, static_cast<const char*>(nullptr), size_t(0), b_ef));
+      fp8_6656_3wave_ws12_kernel<4096, false><<<48, NT_WS12, SMEM_MAX, stream>>>(tmA256, tmB96, tmB64, sa, sb, out, nullptr, 0, b_ef);
+      return int(cudaGetLastError());
+    }
+    if (use_pdl) return int(launch_pdl_ex(fp8_6656_3wave_ws12_kernel<19968, true>, 48, NT_WS12, SMEM_MAX, stream, tmA256, tmB96, tmB64, sa, sb, out, dp, dl, b_ef));
+    fp8_6656_3wave_ws12_kernel<19968, false><<<48, NT_WS12, SMEM_MAX, stream>>>(tmA256, tmB96, tmB64, sa, sb, out, dp, dl, b_ef);
+    return int(cudaGetLastError());
+  }
+  if (eff_mode == 2) {
+    CUtensorMap tmA128, tmB160, tmB128;
+    if (!encode_tma2d(&tmA128, a, k, M_DIM, 128)) return -3;
+    if (!encode_tma2d(&tmB160, b, k, 6656, 160) || !encode_tma2d(&tmB128, b, k, 6656, 128)) return -4;
+    if (k == 4096) {
+      if (use_pdl) return int(launch_pdl_ex(fp8_6656_4wave_ws9_kernel<4096, true>, 48, NT_WS9, SMEM_MAX, stream, tmA128, tmB160, tmB128, sa, sb, out, b_ef));
+      fp8_6656_4wave_ws9_kernel<4096, false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA128, tmB160, tmB128, sa, sb, out, b_ef);
+      return int(cudaGetLastError());
+    }
+    if (use_pdl) return int(launch_pdl_ex(fp8_6656_4wave_ws9_kernel<19968, true>, 48, NT_WS9, SMEM_MAX, stream, tmA128, tmB160, tmB128, sa, sb, out, b_ef));
+    fp8_6656_4wave_ws9_kernel<19968, false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA128, tmB160, tmB128, sa, sb, out, b_ef);
+    return int(cudaGetLastError());
+  }
   CUtensorMap tmA256, tmA128, tmB128, tmB48, tmB32;
   if (!encode_tma2d(&tmA256, a, k, M_DIM, 256) || !encode_tma2d(&tmA128, a, k, M_DIM, 128)) return -3;
   if (!encode_tma2d(&tmB128, b, k, 6656, 128) || !encode_tma2d(&tmB48, b, k, 6656, 48) ||
       !encode_tma2d(&tmB32, b, k, 6656, 32)) return -4;
-  const int use_pdl = (pdl < 0) ? gemm_pdl_enabled() : pdl;
   if (k == 4096) {
-    if (fp8_oproj_ws9_enabled()) {
-      if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws9_256_st2_st4_kernel<4096, true>, 48, NT_WS9, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out));
-      fp8_6656_ws9_256_st2_st4_kernel<4096, false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out);
+    if (eff_mode == 1) {
+      if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws9_256_st2_st4_kernel<4096, true>, 48, NT_WS12, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out, static_cast<const char*>(nullptr), size_t(0), b_ef));
+      fp8_6656_ws9_256_st2_st4_kernel<4096, false><<<48, NT_WS12, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out, nullptr, 0, b_ef);
       return int(cudaGetLastError());
     }
-    if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws8_256_st2_st4_kernel<4096, true>, 48, NT, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out));
-    fp8_6656_ws8_256_st2_st4_kernel<4096, false><<<48, NT, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out);
+    if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws8_256_st2_st4_kernel<4096, true>, 48, NT, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out, static_cast<const char*>(nullptr), size_t(0), b_ef));
+    fp8_6656_ws8_256_st2_st4_kernel<4096, false><<<48, NT, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out, nullptr, 0, b_ef);
     return int(cudaGetLastError());
   }
-  if (fp8_6656_ws9_enabled()) {
-    if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws9_256_st2_st4_kernel<19968, true>, 48, NT_WS9, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out));
-    fp8_6656_ws9_256_st2_st4_kernel<19968, false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out);
+  if (eff_mode == 1) {
+    if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws9_256_st2_st4_kernel<19968, true>, 48, NT_WS12, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out, dp, dl, b_ef));
+    fp8_6656_ws9_256_st2_st4_kernel<19968, false><<<48, NT_WS12, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out, dp, dl, b_ef);
     return int(cudaGetLastError());
   }
-  if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws8_256_st2_st4_kernel<19968, true>, 48, NT, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out));
-  fp8_6656_ws8_256_st2_st4_kernel<19968, false><<<48, NT, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out);
+  if (use_pdl) return int(launch_pdl_ex(fp8_6656_ws8_256_st2_st4_kernel<19968, true>, 48, NT, SMEM_MAX, stream, tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out, dp, dl, b_ef));
+  fp8_6656_ws8_256_st2_st4_kernel<19968, false><<<48, NT, SMEM_MAX, stream>>>(tmA256, tmA128, tmB128, tmB48, tmB32, sa, sb, out, dp, dl, b_ef);
   return int(cudaGetLastError());
 }
 
@@ -678,13 +775,15 @@ extern "C" int muse_fp8_dual_a(int mode, int pdl, const void* a0, const void* a1
   if (!encode_tma2d(&tmB1_128, b1, 6656, 4096, 128) || !encode_tma2d(&tmB1_112, b1, 6656, 4096, 112) ||
       !encode_tma2d(&tmB1_96, b1, 6656, 4096, 96)) return -5;
   const int use_pdl = (pdl < 0) ? gemm_pdl_enabled() : pdl;
-  if (fp8_dual_a_ws9_enabled()) {
-    if (use_pdl) return int(launch_pdl_ex(fp8_dual_a_ws9_256_kernel<true>, 48, NT_WS9, SMEM_MAX, stream, tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1));
-    fp8_dual_a_ws9_256_kernel<false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1);
+  const int b_ef = (fp8_b_ef_mask() & 8) ? 1 : 0;
+  const bool use_ws9 = (mode == 3) || (mode != 0 && fp8_dual_a_ws9_enabled());
+  if (use_ws9) {
+    if (use_pdl) return int(launch_pdl_ex(fp8_dual_a_ws9_256_kernel<true>, 48, NT_WS12, SMEM_MAX, stream, tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1, b_ef));
+    fp8_dual_a_ws9_256_kernel<false><<<48, NT_WS12, SMEM_MAX, stream>>>(tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1, b_ef);
     return int(cudaGetLastError());
   }
-  if (use_pdl) return int(launch_pdl_ex(fp8_dual_a_ws8_256_kernel<true>, 48, NT, SMEM_MAX, stream, tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1));
-  fp8_dual_a_ws8_256_kernel<false><<<48, NT, SMEM_MAX, stream>>>(tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1);
+  if (use_pdl) return int(launch_pdl_ex(fp8_dual_a_ws8_256_kernel<true>, 48, NT, SMEM_MAX, stream, tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1, b_ef));
+  fp8_dual_a_ws8_256_kernel<false><<<48, NT, SMEM_MAX, stream>>>(tmA0, tmA1, tmB0, tmB1_128, tmB1_112, tmB1_96, sa0, sa1, sb0, sb1, o0, o1, b_ef);
   return int(cudaGetLastError());
 }
 
@@ -698,13 +797,15 @@ extern "C" int muse_bf16_dual_stacked(int mode, int pdl, const void* a, const vo
   __nv_bfloat16* o0 = static_cast<__nv_bfloat16*>(c0);
   __nv_bfloat16* o1 = static_cast<__nv_bfloat16*>(c1);
   const int use_pdl = (pdl < 0) ? gemm_pdl_enabled() : pdl;
-  if (bf16_dual_ws9_enabled()) {
-    if (use_pdl) return int(launch_pdl_ex(bf16_dual_ws9_256_kernel<true>, 48, NT_WS9, SMEM_MAX, stream, tmA256, tmB_128, tmB_112, tmB_96, o0, o1));
-    bf16_dual_ws9_256_kernel<false><<<48, NT_WS9, SMEM_MAX, stream>>>(tmA256, tmB_128, tmB_112, tmB_96, o0, o1);
+  const int b_ef = (fp8_b_ef_mask() & 16) ? 1 : 0;
+  const bool use_ws9 = (mode == 3) || (mode != 0 && bf16_dual_ws9_enabled());
+  if (use_ws9) {
+    if (use_pdl) return int(launch_pdl_ex(bf16_dual_ws9_256_kernel<true>, 48, NT_WS12, SMEM_MAX, stream, tmA256, tmB_128, tmB_112, tmB_96, o0, o1, b_ef));
+    bf16_dual_ws9_256_kernel<false><<<48, NT_WS12, SMEM_MAX, stream>>>(tmA256, tmB_128, tmB_112, tmB_96, o0, o1, b_ef);
     return int(cudaGetLastError());
   }
-  if (use_pdl) return int(launch_pdl_ex(bf16_dual_ws8_256_kernel<true>, 48, NT, SMEM_MAX, stream, tmA256, tmB_128, tmB_112, tmB_96, o0, o1));
-  bf16_dual_ws8_256_kernel<false><<<48, NT, SMEM_MAX, stream>>>(tmA256, tmB_128, tmB_112, tmB_96, o0, o1);
+  if (use_pdl) return int(launch_pdl_ex(bf16_dual_ws8_256_kernel<true>, 48, NT, SMEM_MAX, stream, tmA256, tmB_128, tmB_112, tmB_96, o0, o1, b_ef));
+  bf16_dual_ws8_256_kernel<false><<<48, NT, SMEM_MAX, stream>>>(tmA256, tmB_128, tmB_112, tmB_96, o0, o1, b_ef);
   return int(cudaGetLastError());
 }
 
@@ -713,7 +814,7 @@ extern "C" int swiglu_ws_run(const void* a, const void* b, const float* sa, cons
   using namespace swiglu_ws;
   static const int sw_mode = []() {
     const char* env = std::getenv("MUSE_FP8_SWIGLU_MODE");
-    return (env && *env) ? int(std::strtol(env, nullptr, 10)) : 2;
+    return (env && *env) ? int(std::strtol(env, nullptr, 10)) : 4;
   }();
   static const int sw_pdl_def = []() {
     const char* env = std::getenv("MUSE_FP8_SWIGLU_PDL");

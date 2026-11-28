@@ -28,6 +28,8 @@ _enabled_attn = set() if _raw_attn_shapes in ("", "0") else set(_raw_attn_shapes
 ATTN_SHAPES = {k: v for k, v in _ALL_ATTN_SHAPES.items() if v in _enabled_attn}
 ATTN_TMA_ENABLED = ATTN_ENABLED and os.environ.get("MARLIN_ATTN_TMA", "1") == "1"
 ATTN_DUAL_TMA_ENABLED = ATTN_TMA_ENABLED and os.environ.get("MARLIN_ATTN_DUAL_TMA", "1") != "0"
+OPROJ_ROW_TAIL = os.environ.get("MARLIN_OPROJ_ROW_TAIL", "1") != "0"
+ATTN_DUAL_W6_SPLIT = os.environ.get("MARLIN_ATTN_DUAL_W6_SPLIT", "1") != "0"
 TMA_SHFL_EPI = os.environ.get("MARLIN_TMA_SHFL_EPI", "1") != "0"
 TMA_ATTN_SHFL_EPI = os.environ.get("MARLIN_TMA_ATTN_SHFL_EPI", "1") != "0"
 _cur_shfl_epi: int | None = None
@@ -90,10 +92,58 @@ if TMA_ENABLED or ATTN_TMA_ENABLED:
             _tma_set_shfl_epi.restype = None
             _cur_shfl_epi = 1 if TMA_SHFL_EPI else 0
             _tma_set_shfl_epi(_cur_shfl_epi)
+        _tma_set_next_dead = getattr(_tma_library, "marlinw_down128_set_next_dead", None)
+        if _tma_set_next_dead is not None:
+            _tma_set_next_dead.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            _tma_set_next_dead.restype = None
         _tma_set_pdl = getattr(_tma_library, "marlinw_tma_set_pdl", None)
         if _tma_set_pdl is not None:
             _tma_set_pdl.argtypes = [ctypes.c_int]
             _tma_set_pdl.restype = ctypes.c_int
+
+
+_L2_DISCARD_V2 = os.environ.get("MUSE_PREFILL_L2_DISCARD_V2", "1") != "0"
+_dead_mlp_in = None
+_hold_dead_mlp_in = None
+
+
+def stash_dead_mlp_in(t) -> None:
+    global _dead_mlp_in, _hold_dead_mlp_in
+    if _L2_DISCARD_V2 and torch.cuda.is_current_stream_capturing():
+        _dead_mlp_in = t
+    else:
+        _dead_mlp_in = None
+        _hold_dead_mlp_in = None
+
+
+def _consume_dead_mlp_in(live_tensors):
+    global _dead_mlp_in, _hold_dead_mlp_in
+    t = _dead_mlp_in
+    _dead_mlp_in = None
+    fn = globals().get("_tma_set_next_dead")
+    if not _L2_DISCARD_V2 or not torch.cuda.is_current_stream_capturing():
+        _hold_dead_mlp_in = None
+        if fn is not None:
+            fn(0, 0)
+        return None
+    if fn is None:
+        return None
+    if t is None or not t.is_cuda or not t.is_contiguous():
+        fn(0, 0)
+        return None
+    dp = t.data_ptr()
+    db = t.numel() * t.element_size()
+    de = dp + db
+    for lt in live_tensors:
+        if lt is None:
+            continue
+        lp = lt.data_ptr()
+        le = lp + lt.numel() * lt.element_size()
+        if not (de <= lp or le <= dp):
+            fn(0, 0)
+            return None
+    fn(dp, db)
+    return t
 
 
 def set_tma_pdl(mode: int) -> int | None:
@@ -256,6 +306,29 @@ def tma_work_lists_shape(n: int, k: int, shared_bytes: int):
         work = [row for both in blocks for row in both] + [(0, 0, 0, 0)]
         return work, len(blocks), max(slots, 1)
     if (n, k) == (6656, 4096):
+        if OPROJ_ROW_TAIL:
+            # 192 whole MB=8 tiles (4 full waves) + 48 row-split tail CTAs (32x MB=3 + 16x MB=2):
+            # zero K-split scratch handoffs, zero __threadfence()/flag spin-waits, strict 0-ULP stock K-cuts.
+            split_n = 16
+            whole, tail_tiles = order[:-split_n], order[-split_n:]
+            blocks = [block(tile, 0, k_tiles, 0, 0) for tile in whole]
+            for col, pair in tail_tiles:
+                (c0, c0_2), (c1, c1_2) = cut[(col // 2, 2 * pair)], cut[(col // 2, 2 * pair + 1)]
+                if c0_2 >= 0 or c1_2 >= 0:
+                    raise ValueError(f"unexpected 2nd K-cut for shape {n}x{k}")
+                base = 128 * pair
+                for r0, mb in ((0, 3), (48, 3), (96, 2)):
+                    chunk0 = (base + r0) // 64 - 2 * pair
+                    ca = c0 if chunk0 == 0 else c1
+                    cb = c1 if chunk0 == 0 else -1
+                    slot = 0
+                    if ca >= 0 or cb >= 0:
+                        slot = slots
+                        slots += 1
+                    blocks.append([(base + r0, col, mb, slot), (ca, cb, k_tiles, 0)])
+            assert len(blocks) == 240
+            work = [row for both in blocks for row in both] + [(0, 0, 0, 0)]
+            return work, len(blocks), max(slots, 1)
         # 208 tiles = 192 whole + 16 split into 3 K pieces (24, 24, 16) -> exact same wave schedule as down.
         split_n = 16
         sizes = (24, 24, 16)
@@ -352,6 +425,13 @@ def tma_work_lists_dual_qkv_gate(shared_bytes: int):
         col, pair = tile
         return [(128 * pair, col, 8, 0), (-1, -1, k_tiles, 0)]
 
+    def qkv_tail_blocks(col):
+        # Exact 512-row partition: 2x MB=6 (96 rows) + 4x MB=5 (80 rows) = 512 rows, 0 K-cuts.
+        return [
+            [(row0, col, mb, 0), (-1, -1, k_tiles, 0)]
+            for row0, mb in ((0, 6), (96, 6), (192, 5), (272, 5), (352, 5), (432, 5))
+        ]
+
     def gate_block(tile):
         nonlocal slots
         col, pair = tile
@@ -370,11 +450,21 @@ def tma_work_lists_dual_qkv_gate(shared_bytes: int):
         # Bit 30 selects gate (4096) in down_dual.
         return [(128 * pair, col, w0_z, slot), (ca, cb, k_tiles, 1 << 30)]
 
-    blocks = (
-        [gate_block((col, pair)) for col in range(32) for pair in range(4)]
-        + [qkv_block((col, pair)) for col in range(36) for pair in range(4)]
-    )
-    assert len(blocks) == 272
+    if ATTN_DUAL_W6_SPLIT:
+        # 128 gate (cols 0..31) + 112 qkv MB=8 (cols 0..27) = 240 CTAs (5 full waves) +
+        # 48 qkv Wave-6 CTAs (cols 28..35 x 6 CTAs/col: 16x MB=6 + 32x MB=5) = 288 CTAs (6 full waves).
+        blocks = (
+            [gate_block((col, pair)) for col in range(32) for pair in range(4)]
+            + [qkv_block((col, pair)) for col in range(28) for pair in range(4)]
+            + [blk for col in range(28, 36) for blk in qkv_tail_blocks(col)]
+        )
+        assert len(blocks) == 288
+    else:
+        blocks = (
+            [gate_block((col, pair)) for col in range(32) for pair in range(4)]
+            + [qkv_block((col, pair)) for col in range(36) for pair in range(4)]
+        )
+        assert len(blocks) == 272
     work = [row for both in blocks for row in both]
     return work, len(blocks), max(slots, 1)
 
@@ -488,6 +578,15 @@ def prepare(device: torch.device) -> Prepared:
     return prepare_shape(device, COLUMNS, INNER)
 
 
+def _clear_dead_mlp_in() -> None:
+    global _dead_mlp_in, _hold_dead_mlp_in
+    _dead_mlp_in = None
+    _hold_dead_mlp_in = None
+    fn = globals().get("_tma_set_next_dead")
+    if fn is not None:
+        fn(0, 0)
+
+
 def gemm(x, weight, scales, global_scale, p: Prepared, tma: bool = False):
     if (
         x.shape != (ROWS, p.k)
@@ -497,24 +596,30 @@ def gemm(x, weight, scales, global_scale, p: Prepared, tma: bool = False):
         or x.stride(0) % 8
         or x.data_ptr() % 16
     ):
+        if (p.n, p.k) == (COLUMNS, INNER):
+            _clear_dead_mlp_in()
         return None
     if tma and p.tma_work is None:
+        if (p.n, p.k) == (COLUMNS, INNER):
+            _clear_dead_mlp_in()
         return None
     out = x.new_empty((ROWS, p.n))
     scratch = _get_scratch(x.device, p.tma_slots if tma else p.slots)
     stream = torch.cuda.current_stream(x.device).cuda_stream
     with torch.cuda.device(x.device):
         if tma:
-            global _cur_shfl_epi
+            global _cur_shfl_epi, _hold_dead_mlp_in
             if (p.n, p.k) == (COLUMNS, INNER):
                 want_shfl = 1 if TMA_SHFL_EPI else 0
                 if _tma_set_shfl_epi is not None and _cur_shfl_epi != want_shfl:
                     _tma_set_shfl_epi(want_shfl)
                     _cur_shfl_epi = want_shfl
+                dead_t = _consume_dead_mlp_in((x, weight, scales, global_scale, out, scratch))
                 status = _tma_main(
                     x.data_ptr(), weight.data_ptr(), out.data_ptr(), scratch.data_ptr(),
                     scales.data_ptr(), global_scale.data_ptr(), p.tma_work.data_ptr(), p.tma_grid,
                     x.stride(0), stream)
+                _hold_dead_mlp_in = dead_t
             else:
                 want_shfl = 1 if (TMA_SHFL_EPI or TMA_ATTN_SHFL_EPI) else 0
                 if _tma_set_shfl_epi is not None and _cur_shfl_epi != want_shfl:
@@ -525,6 +630,7 @@ def gemm(x, weight, scales, global_scale, p: Prepared, tma: bool = False):
                     scales.data_ptr(), global_scale.data_ptr(), p.tma_work.data_ptr(), p.tma_grid,
                     p.n, p.k, x.stride(0), stream)
         elif (p.n, p.k) == (COLUMNS, INNER):
+            _clear_dead_mlp_in()
             status = _main(
                 x.data_ptr(), weight.data_ptr(), out.data_ptr(), scratch.data_ptr(),
                 scales.data_ptr(), global_scale.data_ptr(), p.work.data_ptr(), p.grid,
