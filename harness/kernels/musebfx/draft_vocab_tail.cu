@@ -730,16 +730,58 @@ __global__ void __launch_bounds__(256, 2) draft_vocab_tail_argmax_kernel(
 
   unsigned static_keys[6] = {};
   if (cand_buf != nullptr) {
-    // Fast fused rescore path: sort the <= 512 per-CTA coarse candidates of row `m` in SMEM
-    // and rescore the global coarse top-`rescore_k` using exact NVFP4 `dvt_warp_nvfp4_dot`.
+    // Warp-local 512-element register bitonic sort: replaces 45 CTA barriers & integer divisions
+    // with 10 CTA barriers + warp-shuffle register merges (0-ULP bit-identical descending order).
     const uint64_t* row_cands = cand_buf + static_cast<size_t>(m) * num_cands;
-    s_cand[tid] = (tid < num_cands) ? row_cands[tid] : 0ull;
-    s_cand[tid + 256] = (tid + 256 < num_cands) ? row_cands[tid + 256] : 0ull;
+    const int base_w = warp << 6;
+    const int i0 = base_w + lane;
+    const int i1 = base_w + lane + 32;
+    uint64_t r0 = (i0 < num_cands) ? row_cands[i0] : 0ull;
+    uint64_t r1 = (i1 < num_cands) ? row_cands[i1] : 0ull;
+    auto warp_shfl_u64 = [](uint64_t v, int mask) -> uint64_t {
+      const uint32_t lo = __shfl_xor_sync(0xffffffffu, static_cast<uint32_t>(v), mask);
+      const uint32_t hi = __shfl_xor_sync(0xffffffffu, static_cast<uint32_t>(v >> 32), mask);
+      return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+    };
+    auto warp_cas = [&](uint64_t& val, int j, bool asc) {
+      const uint64_t other = warp_shfl_u64(val, j);
+      const bool take_max = ((lane & j) != 0) ? asc : !asc;
+      val = take_max ? ((val >= other) ? val : other) : ((val <= other) ? val : other);
+    };
+    auto sort32 = [&](uint64_t& val, bool global_asc) {
+#pragma unroll
+      for (int k = 2; k <= 32; k <<= 1) {
+        const bool dir_asc = (k == 32) ? global_asc : ((lane & k) != 0);
+#pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) {
+          warp_cas(val, j, dir_asc);
+        }
+      }
+    };
+    auto merge64_regs = [&](uint64_t& a, uint64_t& b, bool asc) {
+      if (asc ? (a > b) : (a < b)) {
+        const uint64_t t = a; a = b; b = t;
+      }
+#pragma unroll
+      for (int j = 16; j > 0; j >>= 1) {
+        warp_cas(a, j, asc);
+        warp_cas(b, j, asc);
+      }
+    };
+    sort32(r0, false);
+    sort32(r1, true);
+    const bool w_asc = ((warp & 1) != 0);
+    merge64_regs(r0, r1, w_asc);
+    s_cand[i0] = r0;
+    s_cand[i1] = r1;
     __syncthreads();
 
-    for (int k = 2; k <= 512; k <<= 1) {
-      for (int j = k >> 1; j > 0; j >>= 1) {
-        const int ixj_lo = (tid / j) * (2 * j) + (tid & (j - 1));
+#pragma unroll
+    for (int k_log = 7; k_log <= 9; ++k_log) {
+      const int k = 1 << k_log;
+      for (int j_log = k_log - 1; j_log >= 6; --j_log) {
+        const int j = 1 << j_log;
+        const int ixj_lo = ((tid >> j_log) << (j_log + 1)) | (tid & (j - 1));
         const int ixj_hi = ixj_lo ^ j;
         const bool desc = ((ixj_lo & k) == 0);
         const uint64_t a = s_cand[ixj_lo];
@@ -750,6 +792,13 @@ __global__ void __launch_bounds__(256, 2) draft_vocab_tail_argmax_kernel(
         }
         __syncthreads();
       }
+      uint64_t a = s_cand[i0];
+      uint64_t b = s_cand[i1];
+      const bool asc = ((base_w & k) != 0);
+      merge64_regs(a, b, asc);
+      s_cand[i0] = a;
+      s_cand[i1] = b;
+      __syncthreads();
     }
 
     const int eff_rescore = (rescore_k < 512) ? rescore_k : 512;

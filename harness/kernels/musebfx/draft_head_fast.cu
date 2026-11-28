@@ -4077,7 +4077,56 @@ __device__ __forceinline__ uint32_t dhf_f32_to_key(float f) {
   return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
 }
 
-// Kernel 2: Exact 3-pass 8-bit MSB radix select from N_in (<=1536) CTA shortlist -> K_cand (<=256).
+// 32-lane warp-parallel descending 256-bin prefix scan for exact 8-bit MSB radix threshold select:
+// replaces 256-step serial tid==0 SMEM scan (1,024 serial loads/branches across 4 passes) with 8-bin
+// register load + 5-step warp Hillis-Steele scan + ballot/ffs (0 extra barriers, 100% bit-identical).
+__device__ __forceinline__ void dhf_warp_radix_select_step(
+    const uint32_t* __restrict__ s_hist,
+    uint32_t pref, uint32_t shift, int tid,
+    uint32_t& s_rem_k, uint32_t& s_prefix) {
+  if (tid < 32) {
+    uint32_t bins[8];
+    uint32_t my_sum = 0u;
+    const int base_b = 255 - (tid << 3);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const uint32_t c = s_hist[base_b - j];
+      bins[j] = c;
+      my_sum += c;
+    }
+    uint32_t incl = my_sum;
+#pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+      const uint32_t prev = __shfl_up_sync(0xffffffffu, incl, off);
+      if (tid >= off) incl += prev;
+    }
+    const uint32_t excl = incl - my_sum;
+    const uint32_t need = s_rem_k;
+    const uint32_t hit_mask = __ballot_sync(0xffffffffu, incl >= need);
+    if (hit_mask != 0u) {
+      const int win_lane = __ffs(hit_mask) - 1;
+      if (tid == win_lane) {
+        uint32_t acc = excl;
+        uint32_t chosen = 0u;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const uint32_t c = bins[j];
+          if (acc + c >= need) {
+            chosen = static_cast<uint32_t>(base_b - j);
+            s_rem_k = need - acc;
+            break;
+          }
+          acc += c;
+        }
+        s_prefix = pref | (chosen << shift);
+      }
+    } else if (tid == 0) {
+      s_prefix = pref;
+    }
+  }
+}
+
+// Kernel 2: Exact 4-pass 8-bit MSB radix select from N_in (<=1536) CTA shortlist -> K_cand (<=256).
 // Grid: M blocks, Block: 256 threads (~3 us, L2-resident).
 __global__ void dhf_select_topk_kernel(
     const float* __restrict__ cta_vals,
@@ -4135,21 +4184,7 @@ __global__ void dhf_select_topk_kernel(
     }
     __syncthreads();
 
-    if (tid == 0) {
-      uint32_t acc = 0u;
-      const uint32_t need = s_rem_k;
-      uint32_t chosen = 0u;
-      for (int b = 255; b >= 0; --b) {
-        const uint32_t c = s_hist[b];
-        if (acc + c >= need) {
-          chosen = static_cast<uint32_t>(b);
-          s_rem_k = need - acc;
-          break;
-        }
-        acc += c;
-      }
-      s_prefix = pref | (chosen << shift);
-    }
+    dhf_warp_radix_select_step(s_hist, pref, shift, tid, s_rem_k, s_prefix);
     __syncthreads();
   }
 
@@ -4652,21 +4687,7 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_fused_kernel(
     }
     __syncthreads();
 
-    if (tid == 0) {
-      uint32_t acc = 0u;
-      const uint32_t need = s_rem_k;
-      uint32_t chosen = 0u;
-      for (int b = 255; b >= 0; --b) {
-        const uint32_t c = s_hist[b];
-        if (acc + c >= need) {
-          chosen = static_cast<uint32_t>(b);
-          s_rem_k = need - acc;
-          break;
-        }
-        acc += c;
-      }
-      s_prefix = pref | (chosen << shift);
-    }
+    dhf_warp_radix_select_step(s_hist, pref, shift, tid, s_rem_k, s_prefix);
     __syncthreads();
   }
 

@@ -31,8 +31,7 @@ template<class Fragment> struct PairSwiGLU {
             float inverse;
             asm("div.full.f32 %0, %1, %2;" : "=f"(inverse) : "f"(1.0f), "f"(scale[i]));
             const float q=__fmul_rn(__fmul_rn(silu,halves[i+1]),inverse);
-            const float clamped=q < -448.f ? -448.f : (q>448.f ? 448.f : q);
-            unsigned value=__nv_cvt_float_to_fp8(clamped,__NV_SATFINITE,__NV_E4M3);
+            unsigned value=__nv_cvt_float_to_fp8(q,__NV_SATFINITE,__NV_E4M3);
             out[i]=cutlass::float_e2m1_t::bitcast(value&15);
             out[i+1]=cutlass::float_e2m1_t::bitcast(value>>4);
         }
@@ -521,7 +520,11 @@ extern "C" int swiglu_ws_init(cudaStream_t stream) {
     encode = (EncodeFn)fn;
   }
   auto set_smem = [](auto k, int bytes) -> cudaError_t {
-    return cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    cudaError_t err = cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    if (err == cudaSuccess) {
+      cudaFuncSetAttribute(k, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    }
+    return err;
   };
   cudaError_t e = set_smem(swiglu_ws9_st3_kernel<true>, SMEM_MAX);
   if (e == cudaSuccess) e = set_smem(swiglu_ws9_st3_kernel<false>, SMEM_MAX);

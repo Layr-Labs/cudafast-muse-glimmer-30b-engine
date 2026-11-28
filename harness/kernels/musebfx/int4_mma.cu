@@ -1026,25 +1026,30 @@ __global__ void __launch_bounds__(128, 6) int4_mma_gemm_n32_kernel(
   }
 }
 
-constexpr int kN32PairTmaStages = 3;
 constexpr int kN32PairStepWBytes = 2 * kN32StepWBytes;  // 2304 = 18 * 128 B
 
 template <int kMaxM>
 struct alignas(128) Int4N32PairTmaSmem {
-  alignas(128) uint8_t w[kN32PairTmaStages][kN32PairStepWBytes];   // 3 * 2304 = 6912 B
-  alignas(128) __nv_bfloat16 a[kN32PairTmaStages][2][kMaxM][64];   // 3 * 2048 = 6144 B (M<=8) or 12288 B (M<=16)
-  alignas(8) uint64_t mbar[kN32PairTmaStages];                     // 24 B -> 13,184 B (7 CTAs/SM = 336!)
+  static constexpr int kWStages = (kMaxM <= 8) ? 4 : 3;
+  alignas(128) uint8_t w[kWStages][kN32PairStepWBytes];   // 4*2304=9216 B (M<=8) or 3*2304=6912 B (M<=16)
+  alignas(128) __nv_bfloat16 a[2][2][kMaxM][64];          // 2 stages x BK=128: 4096 B (M<=8) or 8192 B (M<=16)
+  alignas(8) uint64_t mbar[kWStages];                     // 32 B -> 13,440 B (7 CTAs/SM = 336!) / 15,232 B (5 CTAs/SM!)
 };
+static_assert(sizeof(Int4N32PairTmaSmem<8>) <= 14482 && sizeof(Int4N32PairTmaSmem<16>) <= 20275,
+              "Int4N32PairTmaSmem must preserve 7 CTAs/SM (M<=8) and 5 CTAs/SM (M<=16) on SM121");
 
 // Single-wave (<=336 CTAs at 7 CTAs/SM) BK=128 paired 2304B Hardware-TMA N32 kernel:
-// 100.000% 0-ULP bit-identical to int4_mma_gemm_kernel, halving barriers and crushing o_proj/qkv/fkv tail waves!
+// 100.000% 0-ULP bit-identical to int4_mma_gemm_kernel, decoupled 4-stage W / 2-stage A ring!
 template <bool kM16, bool kNf4>
 __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int4_mma_gemm_n32_pair_tma_kernel(
     const __nv_bfloat16* __restrict__ A,
     const uint8_t* __restrict__ W_packed,
     __nv_bfloat16* __restrict__ C,
     int M, int N, int K, int pdl_mode) {
-  __shared__ Int4N32PairTmaSmem<kM16 ? 16 : 8> smem;
+  using PairSmem = Int4N32PairTmaSmem<kM16 ? 16 : 8>;
+  constexpr int kWStages = PairSmem::kWStages;
+  constexpr int kWPre = kWStages - 1;  // 3 (M<=8) or 2 (M<=16)
+  __shared__ PairSmem smem;
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
@@ -1055,7 +1060,7 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int4_mma_gemm_n32_pair_tma_
   const int cta_n32 = blockIdx.x;
 
   if (tid == 0) {
-    int4_mbar_init(smem.mbar, kN32PairTmaStages);
+    int4_mbar_init(smem.mbar, kWStages);
   }
   __syncthreads();
 
@@ -1087,35 +1092,49 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int4_mma_gemm_n32_pair_tma_
     }
   };
 
-  auto issue_a_only = [&](int p, int st) {
+  auto load_a_sync = [&](int p, int st_a) {
     const int k_base = p * 128;
     if constexpr (kM16) {
-      const uint32_t sd0 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][0][a_row][a_phys_col8 * 8]));
-      const uint32_t sd1 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][1][a_row][a_phys_col8 * 8]));
+      *reinterpret_cast<uint4*>(&smem.a[st_a][0][a_row][a_phys_col8 * 8]) =
+          a_valid ? *reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + k_base + a_col8 * 8)
+                  : make_uint4(0u, 0u, 0u, 0u);
+      *reinterpret_cast<uint4*>(&smem.a[st_a][1][a_row][a_phys_col8 * 8]) =
+          a_valid ? *reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + k_base + 64 + a_col8 * 8)
+                  : make_uint4(0u, 0u, 0u, 0u);
+    } else {
+      *reinterpret_cast<uint4*>(&smem.a[st_a][a_kh_m8][a_row][a_phys_col8 * 8]) =
+          a_valid ? *reinterpret_cast<const uint4*>(A + static_cast<size_t>(a_row) * K + k_base + a_kh_m8 * 64 + a_col8 * 8)
+                  : make_uint4(0u, 0u, 0u, 0u);
+    }
+  };
+
+  auto issue_a_only = [&](int p, int st_a) {
+    const int k_base = p * 128;
+    if constexpr (kM16) {
+      const uint32_t sd0 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st_a][0][a_row][a_phys_col8 * 8]));
+      const uint32_t sd1 = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st_a][1][a_row][a_phys_col8 * 8]));
       int4_cp_async16_a_pred(sd0, A + static_cast<size_t>(a_safe_row) * K + k_base + a_col8 * 8, a_src_sz);
       int4_cp_async16_a_pred(sd1, A + static_cast<size_t>(a_safe_row) * K + k_base + 64 + a_col8 * 8, a_src_sz);
     } else {
-      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][a_kh_m8][a_row][a_phys_col8 * 8]));
+      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st_a][a_kh_m8][a_row][a_phys_col8 * 8]));
       int4_cp_async16_a_pred(sd, A + static_cast<size_t>(a_safe_row) * K + k_base + a_kh_m8 * 64 + a_col8 * 8, a_src_sz);
     }
     asm volatile("cp.async.commit_group;\n" ::: "memory");
   };
 
-  constexpr int kPreload = kN32PairTmaStages - 1;  // 2
-  const int preload = (num_pairs < kPreload) ? num_pairs : kPreload;
+  const int w_pre = (num_pairs < kWPre) ? num_pairs : kWPre;
+  for (int i = 0; i < w_pre; ++i) {
+    issue_w_tma(i, i, false);
+  }
   if ((pdl_mode & 1) != 0) {
-    for (int i = 0; i < preload; ++i) {
-      issue_w_tma(i, i, false);
-    }
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    for (int i = 0; i < preload; ++i) {
-      issue_a_only(i, i);
-    }
-  } else {
-    for (int i = 0; i < preload; ++i) {
-      issue_w_tma(i, i, false);
-      issue_a_only(i, i);
-    }
+  }
+  if (num_pairs > 0) {
+    load_a_sync(0, 0);
+  }
+  __syncthreads();
+  if (num_pairs > 1) {
+    issue_a_only(1, 1);
   }
 
   float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
@@ -1130,20 +1149,20 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int4_mma_gemm_n32_pair_tma_
     if (p == trig_p) {
       asm volatile("griddepcontrol.launch_dependents;");
     }
+    const int st_a = p & 1;
     int4_mbar_wait(&smem.mbar[st], parity);
-    const int rem = num_pairs - 1 - p;
-    if (rem >= 1) {
-      asm volatile("cp.async.wait_group 1;\n" ::: "memory");
-    } else {
+    if (p > 0) {
       asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     }
     __syncthreads();
 
-    const int next_p = p + kPreload;
+    const int next_p = p + kWPre;
     if (next_p < num_pairs) {
-      const int next_st = (st == 0) ? (kN32PairTmaStages - 1) : (st - 1);
+      const int next_st = (st == 0) ? (kWStages - 1) : (st - 1);
       issue_w_tma(next_p, next_st, true);
-      issue_a_only(next_p, next_st);
+    }
+    if (p >= 1 && p + 1 < num_pairs) {
+      issue_a_only(p + 1, st_a ^ 1);
     }
 
 #pragma unroll
@@ -1160,7 +1179,7 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int4_mma_gemm_n32_pair_tma_
 #pragma unroll
       for (int s = 0; s < 4; ++s) {
         const int pcol8 = (2 * s + ldm_col_off) ^ (ldm_row & 7);
-        const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][kh][ldm_row][pcol8 * 8]));
+        const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st_a][kh][ldm_row][pcol8 * 8]));
         uint32_t a0, a1, a2, a3;
         if constexpr (kM16) {
           int4_ldmatrix_x4(a0, a1, a2, a3, addr);
@@ -1181,7 +1200,7 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int4_mma_gemm_n32_pair_tma_
       }
     }
 
-    if (++st == kN32PairTmaStages) {
+    if (++st == kWStages) {
       st = 0;
       parity ^= 1u;
     }
@@ -1198,16 +1217,17 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int4_mma_gemm_n32_pair_tma_
   }
 }
 
-constexpr int kN32TmaStages = 5;
-
 template <int kMaxM>
 struct alignas(128) Int4N32TmaSmem {
-  alignas(128) uint8_t w[kN32TmaStages][kN32StepWBytes];   // 5 * 1152 = 5760 B (each stage 128B aligned!)
-  alignas(128) __nv_bfloat16 a[kN32TmaStages][kMaxM][64];  // 5 * 1024 = 5120 B (M<=8) or 10240 B (M<=16)
-  alignas(8) uint64_t mbar[kN32TmaStages];                 // 40 B -> 10.8 KiB (M<=8) or 15.8 KiB (M<=16) -> 5-6 CTAs/SM!
+  static constexpr int kStages = (kMaxM <= 8) ? 7 : 6;
+  alignas(128) uint8_t w[kStages][kN32StepWBytes];   // 7*1152=8064 B (M<=8) or 6*1152=6912 B (M<=16)
+  alignas(128) __nv_bfloat16 a[kStages][kMaxM][64];  // 7*1024=7168 B (M<=8) or 6*2048=12288 B (M<=16)
+  alignas(8) uint64_t mbar[kStages];                 // 56 B -> 15.3 KiB (6 CTAs/SM) / 19.3 KiB (5 CTAs/SM)!
 };
+static_assert(sizeof(Int4N32TmaSmem<8>) <= 16384 && sizeof(Int4N32TmaSmem<16>) <= 20275,
+              "Int4N32TmaSmem must preserve 5-6 CTAs/SM on SM121");
 
-// 192/240-CTA (4/5 CTAs/SM) 5-stage 1152B Hardware-TMA + L2::evict_first + Dual-PDL N32 deterministic Stream-K kernel.
+// 192/240-CTA (4/5 CTAs/SM) 7-stage (M<=8) / 6-stage (M<=16) 1152B Hardware-TMA + L2::evict_first + Dual-PDL N32 Stream-K.
 template <bool kM16, bool kNf4, bool kTma>
 __global__ void __launch_bounds__(128, 5) int4_mma_n32_tma_det_sk_kernel(
     const __nv_bfloat16* __restrict__ A,
@@ -1216,7 +1236,9 @@ __global__ void __launch_bounds__(128, 5) int4_mma_n32_tma_det_sk_kernel(
     float* __restrict__ sk_partials,
     int* __restrict__ sk_done,
     int M, int N, int K, int grid_ctas, int pdl_mode) {
-  __shared__ Int4N32TmaSmem<kM16 ? 16 : 8> smem;
+  using TmaSmem = Int4N32TmaSmem<kM16 ? 16 : 8>;
+  constexpr int kTmaStages = TmaSmem::kStages;
+  __shared__ TmaSmem smem;
   __shared__ int s_is_last;
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -1235,7 +1257,7 @@ __global__ void __launch_bounds__(128, 5) int4_mma_n32_tma_det_sk_kernel(
 
   if constexpr (kTma) {
     if (tid == 0) {
-      int4_mbar_init(smem.mbar, kN32TmaStages);
+      int4_mbar_init(smem.mbar, kTmaStages);
     }
     __syncthreads();
   }
@@ -1321,7 +1343,7 @@ __global__ void __launch_bounds__(128, 5) int4_mma_n32_tma_det_sk_kernel(
   int cur_n = iter_start / num_kg;
   int cur_kg = iter_start - cur_n * num_kg;
 
-  constexpr int kPreload = kN32TmaStages - 1;  // 4
+  constexpr int kPreload = kTmaStages - 1;  // 6 (M<=8) or 5 (M<=16)
   const int preload = (my_iters < kPreload) ? my_iters : kPreload;
   int next_kg = cur_kg;
   if ((pdl_mode & 1) != 0) {
@@ -1356,20 +1378,38 @@ __global__ void __launch_bounds__(128, 5) int4_mma_n32_tma_det_sk_kernel(
       int4_mbar_wait(&smem.mbar[st], parity);
     }
     const int rem = my_iters - 1 - i;
-    if (rem >= 3) {
-      asm volatile("cp.async.wait_group 3;\n" ::: "memory");
-    } else if (rem == 2) {
-      asm volatile("cp.async.wait_group 2;\n" ::: "memory");
-    } else if (rem == 1) {
-      asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+    if constexpr (kTmaStages == 7) {
+      if (rem >= 5) {
+        asm volatile("cp.async.wait_group 5;\n" ::: "memory");
+      } else if (rem == 4) {
+        asm volatile("cp.async.wait_group 4;\n" ::: "memory");
+      } else if (rem == 3) {
+        asm volatile("cp.async.wait_group 3;\n" ::: "memory");
+      } else if (rem == 2) {
+        asm volatile("cp.async.wait_group 2;\n" ::: "memory");
+      } else if (rem == 1) {
+        asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+      } else {
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+      }
     } else {
-      asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+      if (rem >= 4) {
+        asm volatile("cp.async.wait_group 4;\n" ::: "memory");
+      } else if (rem == 3) {
+        asm volatile("cp.async.wait_group 3;\n" ::: "memory");
+      } else if (rem == 2) {
+        asm volatile("cp.async.wait_group 2;\n" ::: "memory");
+      } else if (rem == 1) {
+        asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+      } else {
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+      }
     }
     __syncthreads();
 
     const int next_i = i + kPreload;
     if (next_i < my_iters) {
-      const int next_st = (st == 0) ? (kN32TmaStages - 1) : (st - 1);
+      const int next_st = (st == 0) ? (kTmaStages - 1) : (st - 1);
       issue_stage(next_i, next_kg, next_st, true);
       if (++next_kg == num_kg) next_kg = 0;
     }
@@ -1406,7 +1446,7 @@ __global__ void __launch_bounds__(128, 5) int4_mma_n32_tma_det_sk_kernel(
       }
     }
 
-    if (++st == kN32TmaStages) {
+    if (++st == kTmaStages) {
       st = 0;
       parity ^= 1u;
     }
