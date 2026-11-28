@@ -276,7 +276,8 @@ class Session:
         rounds: list[list[int]] = []
         frontiers: list[int] = []
         pending, produced = first, 0
-        self.b.begin_spec_run(count)
+        if self.b.begin_spec_run(count):
+            self.left = count
         try:
             while produced < count:
                 committed = self.cycle(pending, count - produced)

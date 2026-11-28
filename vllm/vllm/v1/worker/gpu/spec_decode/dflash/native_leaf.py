@@ -89,6 +89,8 @@ TREE_HIGH_ACC_CPC = float(os.environ.get("MUSE_TREE_HIGH_ACC_CPC", "0"))
 LEAF_STATS = os.environ.get("MUSE_LEAF_STATS", "0").strip() in ("1", "true", "yes")
 TR_ENABLED = os.environ.get("MUSE_TR_MODE", "1").strip() not in ("0", "", "false", "no")
 OOV_PREADMIT = os.environ.get("MUSE_OOV_PREADMIT", "2").strip() not in ("0", "", "false", "no")
+WINDOW_TREE = os.environ.get("MUSE_NATIVE_TREE_WINDOW", "1") != "0"
+REQ_ACC_SIZE = 7 if WINDOW_TREE else 5
 try:
     _TREE_K_RAW = int(os.environ.get("MUSE_TREE_K", "8").strip() or "8")
 except ValueError:
@@ -118,7 +120,8 @@ class _NativeLeafState:
         self.alt_margins: torch.Tensor | None = None        # float32[2] (margin_d1, margin_d2)
         self.tree_top: torch.Tensor | None = None           # int64[36] ([6, 6] top-6 for d1..d6)
         self.tree_vals: torch.Tensor | None = None          # float32[36] ([6, 6] top-6 logits for d1..d6)
-        self.req_acc_state: torch.Tensor | None = None      # int32[5] [rounds, committed, high_acc, raw_acc, raw_tr]
+        # [rounds, committed, high_acc, raw_acc, raw_tr, (output_end, added_rows)]
+        self.req_acc_state: torch.Tensor | None = None
         self.saved_alt_tok: torch.Tensor | None = None      # int64[1] (legacy M=7/M=8)
         self.saved_leaf_toks: torch.Tensor | None = None    # int64[32] (tree mode)
         self.saved_leaf_k: torch.Tensor | None = None       # int32[32] (tree mode)
@@ -414,7 +417,7 @@ def get_cascade_bufs(
         and _S.p1_save_alt is not None
         and _S.p1_save_margins is not None
         and _S.req_acc_state is not None
-        and _S.req_acc_state.numel() >= 5
+        and _S.req_acc_state.numel() >= REQ_ACC_SIZE
         and _S.stats is not None
         and _S.stats.numel() >= 52
     ):
@@ -444,10 +447,10 @@ def get_cascade_bufs(
         if (
             _S.req_acc_state is None
             or _S.req_acc_state.device != device
-            or _S.req_acc_state.numel() < 5
+            or _S.req_acc_state.numel() < REQ_ACC_SIZE
             or _S.req_acc_state.is_inference()
         ):
-            _S.req_acc_state = torch.zeros((5,), dtype=torch.int32, device=device)
+            _S.req_acc_state = torch.zeros((REQ_ACC_SIZE,), dtype=torch.int32, device=device)
         if (
             _S.stats is None
             or _S.stats.device != device
@@ -621,10 +624,10 @@ def init_kv_table(
         if (
             _S.req_acc_state is None
             or _S.req_acc_state.device != device
-            or _S.req_acc_state.numel() < 5
+            or _S.req_acc_state.numel() < REQ_ACC_SIZE
             or _S.req_acc_state.is_inference()
         ):
-            _S.req_acc_state = torch.zeros((5,), dtype=torch.int32, device=device)
+            _S.req_acc_state = torch.zeros((REQ_ACC_SIZE,), dtype=torch.int32, device=device)
         else:
             _S.req_acc_state.zero_()
         _S.saved_alt_tok = torch.full((1,), -1, dtype=torch.int64, device=device)
@@ -803,6 +806,22 @@ def ensure_req_step_ready(req_id: str) -> None:
             _S.req_acc_state.zero_()
         _reset_tr_state()
     _S._host_rounds += 1
+
+
+@torch.no_grad()
+def set_output_end(req_id: str, output_end: int) -> bool:
+    """Give captured tree kernels the exclusive sequence endpoint."""
+    state = _S.req_acc_state
+    if (
+        not WINDOW_TREE
+        or not _S.ready
+        or _S._last_req_id != req_id
+        or state is None
+        or state.numel() < REQ_ACC_SIZE
+    ):
+        return False
+    state[5:6].fill_(output_end)
+    return True
 
 
 @torch.no_grad()

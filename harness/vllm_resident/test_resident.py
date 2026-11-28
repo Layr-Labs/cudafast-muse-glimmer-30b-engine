@@ -109,6 +109,21 @@ class SessionTests(unittest.TestCase):
             rounds, _ = s.spec_run(seed, count)
             self.assertEqual(sum(len(r) for r in rounds), count)
 
+    def test_spec_run_that_finishes_the_request_marks_its_frontier_spent(self):
+        class BoundedRunBackend(FakeBackend):
+            def begin_spec_run(self, count):
+                self._left = count
+                return True
+
+        backend = BoundedRunBackend(depth=6)
+        session = Session(backend)
+        seed = session.sync(PROMPT)
+        rounds, frontiers = session.spec_run(seed, 3)
+        self.assertEqual(sum(map(len, rounds)), 3)
+        self.assertEqual(session.left, 0)
+        self.assertEqual(session.eval(frontiers[-1]), serial_stream(4)[-1])
+        self.assertEqual(backend.starts, 2)
+
     def test_overhang_is_consumed_by_the_next_run(self):
         want = serial_stream(20)
         s = Session(FakeBackend(depth=6))

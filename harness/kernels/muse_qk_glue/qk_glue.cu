@@ -221,10 +221,9 @@ __global__ void qk_norm_rope_multi_kernel(
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 4));
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 2));
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 1));
-    float mean_v;
-    asm("div.full.f32 %0, %1, 0f43000000;" : "=f"(mean_v) : "f"(ss));
+    const float mean_v = __fmul_rn(ss, 0.0078125f);
     float r;
-    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(mean_v + eps));
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(__fadd_rn(mean_v, eps)));
     float y0 = __fmul_rn(x0, r);
     float y1 = __fmul_rn(x1, r);
     float y2 = __fmul_rn(x2, r);
@@ -359,10 +358,9 @@ __global__ __launch_bounds__(288) void qk_norm_rope_kvcache_m1_kernel(
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 4));
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 2));
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 1));
-    float mean_v;
-    asm("div.full.f32 %0, %1, 0f43000000;" : "=f"(mean_v) : "f"(ss));
+    const float mean_v = __fmul_rn(ss, 0.0078125f);
     float r;
-    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(mean_v + eps));
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(__fadd_rn(mean_v, eps)));
     float y0 = __fmul_rn(x0, r);
     float y1 = __fmul_rn(x1, r);
     float y2 = __fmul_rn(x2, r);
@@ -470,19 +468,37 @@ __global__ void qk_norm_rope_kvcache_prefill_kernel(
 
   float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
   if constexpr (UseRope) {
-    int64_t pos = __ldg(positions + t);
+    int64_t pos;
+    if constexpr (kPdl) {
+      asm volatile("ld.global.s64 %0, [%1];" : "=l"(pos) : "l"(positions + t));
+    } else {
+      pos = __ldg(positions + t);
+    }
     if (pos < 0) pos += cache_rows;
     const int d_lo = (lane & 15) * 4;
     if constexpr (CacheFP32) {
       const float* row = reinterpret_cast<const float*>(cos_sin_cache) + pos * 128;
-      const float4 cv = __ldg(reinterpret_cast<const float4*>(row + d_lo));
-      const float4 sv = __ldg(reinterpret_cast<const float4*>(row + 64 + d_lo));
-      c0 = cv.x; c1 = cv.y; c2 = cv.z; c3 = cv.w;
-      s0 = sv.x; s1 = sv.y; s2 = sv.z; s3 = sv.w;
+      if constexpr (kPdl) {
+        asm volatile("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+                     : "=f"(c0), "=f"(c1), "=f"(c2), "=f"(c3) : "l"(row + d_lo));
+        asm volatile("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+                     : "=f"(s0), "=f"(s1), "=f"(s2), "=f"(s3) : "l"(row + 64 + d_lo));
+      } else {
+        const float4 cv = __ldg(reinterpret_cast<const float4*>(row + d_lo));
+        const float4 sv = __ldg(reinterpret_cast<const float4*>(row + 64 + d_lo));
+        c0 = cv.x; c1 = cv.y; c2 = cv.z; c3 = cv.w;
+        s0 = sv.x; s1 = sv.y; s2 = sv.z; s3 = sv.w;
+      }
     } else {
       const __nv_bfloat16* row = reinterpret_cast<const __nv_bfloat16*>(cos_sin_cache) + pos * 128;
-      const uint2 cv = __ldg(reinterpret_cast<const uint2*>(row + d_lo));
-      const uint2 sv = __ldg(reinterpret_cast<const uint2*>(row + 64 + d_lo));
+      uint2 cv, sv;
+      if constexpr (kPdl) {
+        asm volatile("ld.global.v2.u32 {%0, %1}, [%2];" : "=r"(cv.x), "=r"(cv.y) : "l"(row + d_lo));
+        asm volatile("ld.global.v2.u32 {%0, %1}, [%2];" : "=r"(sv.x), "=r"(sv.y) : "l"(row + 64 + d_lo));
+      } else {
+        cv = __ldg(reinterpret_cast<const uint2*>(row + d_lo));
+        sv = __ldg(reinterpret_cast<const uint2*>(row + 64 + d_lo));
+      }
       const __nv_bfloat16* cb = reinterpret_cast<const __nv_bfloat16*>(&cv);
       const __nv_bfloat16* sb = reinterpret_cast<const __nv_bfloat16*>(&sv);
       c0 = __bfloat162float(cb[0]); c1 = __bfloat162float(cb[1]);
@@ -503,7 +519,17 @@ __global__ void qk_norm_rope_kvcache_prefill_kernel(
 
   // Wait for preceding qkv GEMM strictly after all independent loads (slot_mapping, positions, cos_sin_cache),
   // then immediately emit launch_dependents for PDL-safe consumers (gqa16_prefill / gate GEMM).
-  if constexpr (kPdl) pdl_wait();
+  if constexpr (kPdl) {
+    if constexpr (UseRope) {
+      asm volatile("griddepcontrol.wait;"
+                   : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3),
+                     "+f"(s0), "+f"(s1), "+f"(s2), "+f"(s3),
+                     "+l"(kv_base)
+                   :: "memory");
+    } else {
+      asm volatile("griddepcontrol.wait;" : "+l"(kv_base) :: "memory");
+    }
+  }
   if constexpr (kPdlProd) pdl_launch_dependents();
 
   // Stream dead qkv rows (.cs) so they do not evict q_out + kv_cache (4.7 MB) from L2 before gqa16_prefill.
@@ -546,10 +572,9 @@ __global__ void qk_norm_rope_kvcache_prefill_kernel(
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 4));
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 2));
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 1));
-    float mean_v;
-    asm("div.full.f32 %0, %1, 0f43000000;" : "=f"(mean_v) : "f"(ss));
+    const float mean_v = __fmul_rn(ss, 0.0078125f);
     float r;
-    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(mean_v + eps));
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(__fadd_rn(mean_v, eps)));
     float y0 = __fmul_rn(x0, r);
     float y1 = __fmul_rn(x1, r);
     float y2 = __fmul_rn(x2, r);
@@ -633,7 +658,9 @@ __global__ void qk_norm_rope_kvcache_decode_m_kernel(
                         : ((block_size == 16) ? (slot & 15) : (slot - blk * block_size));
       dst = kv_cache + blk * stride_block + off * stride_slot + 128 + lane * 4;
     }
-    if constexpr (kPdlWait) pdl_wait();
+    if constexpr (kPdlWait) {
+      asm volatile("griddepcontrol.wait;" : "+l"(dst) :: "memory");
+    }
     if constexpr (kPdlProd) pdl_launch_dependents();
     if (dst != nullptr) {
       const uint2 v0 = *reinterpret_cast<const uint2*>(qkv_row + 4352);
@@ -658,19 +685,37 @@ __global__ void qk_norm_rope_kvcache_decode_m_kernel(
 
   float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
   if constexpr (UseRope) {
-    int64_t pos = positions[t];
+    int64_t pos;
+    if constexpr (kPdlWait) {
+      asm volatile("ld.global.s64 %0, [%1];" : "=l"(pos) : "l"(positions + t));
+    } else {
+      pos = positions[t];
+    }
     if (pos < 0) pos += cache_rows;
     const int d_lo = (lane & 15) * 4;
     if constexpr (CacheFP32) {
       const float* row = reinterpret_cast<const float*>(cos_sin_cache) + pos * 128;
-      const float4 cv = *reinterpret_cast<const float4*>(row + d_lo);
-      const float4 sv = *reinterpret_cast<const float4*>(row + 64 + d_lo);
-      c0 = cv.x; c1 = cv.y; c2 = cv.z; c3 = cv.w;
-      s0 = sv.x; s1 = sv.y; s2 = sv.z; s3 = sv.w;
+      if constexpr (kPdlWait) {
+        asm volatile("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+                     : "=f"(c0), "=f"(c1), "=f"(c2), "=f"(c3) : "l"(row + d_lo));
+        asm volatile("ld.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+                     : "=f"(s0), "=f"(s1), "=f"(s2), "=f"(s3) : "l"(row + 64 + d_lo));
+      } else {
+        const float4 cv = *reinterpret_cast<const float4*>(row + d_lo);
+        const float4 sv = *reinterpret_cast<const float4*>(row + 64 + d_lo);
+        c0 = cv.x; c1 = cv.y; c2 = cv.z; c3 = cv.w;
+        s0 = sv.x; s1 = sv.y; s2 = sv.z; s3 = sv.w;
+      }
     } else {
       const __nv_bfloat16* row = reinterpret_cast<const __nv_bfloat16*>(cos_sin_cache) + pos * 128;
-      const uint2 cv = *reinterpret_cast<const uint2*>(row + d_lo);
-      const uint2 sv = *reinterpret_cast<const uint2*>(row + 64 + d_lo);
+      uint2 cv, sv;
+      if constexpr (kPdlWait) {
+        asm volatile("ld.global.v2.u32 {%0, %1}, [%2];" : "=r"(cv.x), "=r"(cv.y) : "l"(row + d_lo));
+        asm volatile("ld.global.v2.u32 {%0, %1}, [%2];" : "=r"(sv.x), "=r"(sv.y) : "l"(row + 64 + d_lo));
+      } else {
+        cv = *reinterpret_cast<const uint2*>(row + d_lo);
+        sv = *reinterpret_cast<const uint2*>(row + 64 + d_lo);
+      }
       const __nv_bfloat16* cb = reinterpret_cast<const __nv_bfloat16*>(&cv);
       const __nv_bfloat16* sb = reinterpret_cast<const __nv_bfloat16*>(&sv);
       c0 = __bfloat162float(cb[0]); c1 = __bfloat162float(cb[1]);
@@ -680,9 +725,19 @@ __global__ void qk_norm_rope_kvcache_decode_m_kernel(
     }
   }
 
-  if constexpr (kPdlWait) pdl_wait();
+  if constexpr (kPdlWait) {
+    if constexpr (UseRope) {
+      asm volatile("griddepcontrol.wait;"
+                   : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3),
+                     "+f"(s0), "+f"(s1), "+f"(s2), "+f"(s3),
+                     "+l"(k_cache_base)
+                   :: "memory");
+    } else {
+      asm volatile("griddepcontrol.wait;" : "+l"(k_cache_base) :: "memory");
+    }
+  }
   if constexpr (kPdlProd) pdl_launch_dependents();
-  if (w == 16 && k_cache_base == nullptr) return;
+  if (__all_sync(0xffffffffu, w == 16 && k_cache_base == nullptr)) return;
 
   const int h0 = w * 2;
   uint2 raw[2];
@@ -706,10 +761,9 @@ __global__ void qk_norm_rope_kvcache_decode_m_kernel(
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 4));
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 2));
     ss = __fadd_rn(ss, __shfl_xor_sync(0xffffffffu, ss, 1));
-    float mean_v;
-    asm("div.full.f32 %0, %1, 0f43000000;" : "=f"(mean_v) : "f"(ss));
+    const float mean_v = __fmul_rn(ss, 0.0078125f);
     float r;
-    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(mean_v + eps));
+    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(__fadd_rn(mean_v, eps)));
     float y0 = __fmul_rn(x0, r);
     float y1 = __fmul_rn(x1, r);
     float y2 = __fmul_rn(x2, r);
@@ -759,6 +813,28 @@ int launch_kvcache_decode_m_impl(
     int num_tokens, int cache_rows, int block_size,
     int64_t stride_block, int64_t stride_slot, int64_t stride_kv_head,
     float eps, float qscale, int use_rope, int cache_fp32, cudaStream_t stream) {
+  static bool carveout_done = false;
+  if (!carveout_done) {
+    static const bool en = []() {
+      const char* env = std::getenv("MUSE_NORM_GLUE_CARVEOUT100");
+      return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+    }();
+    if (en) {
+      cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+      cudaThreadExchangeStreamCaptureMode(&mode);
+      auto set100 = [](auto fn) {
+        (void)cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+      };
+      set100(qk_norm_rope_kvcache_decode_m_kernel<true, true, true, kPdlProd>);
+      set100(qk_norm_rope_kvcache_decode_m_kernel<true, false, true, kPdlProd>);
+      set100(qk_norm_rope_kvcache_decode_m_kernel<false, true, true, kPdlProd>);
+      set100(qk_norm_rope_kvcache_decode_m_kernel<true, true, false, kPdlProd>);
+      set100(qk_norm_rope_kvcache_decode_m_kernel<true, false, false, kPdlProd>);
+      set100(qk_norm_rope_kvcache_decode_m_kernel<false, true, false, kPdlProd>);
+      cudaThreadExchangeStreamCaptureMode(&mode);
+    }
+    carveout_done = true;
+  }
   const int threads = (num_tokens <= 16) ? 64 : 128;
   const int wpb = threads >> 5;
   const int blocks = (num_tokens * 18 + wpb - 1) / wpb;

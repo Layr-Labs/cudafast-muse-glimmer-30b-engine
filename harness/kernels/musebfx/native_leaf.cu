@@ -600,6 +600,21 @@ static int leaf_pdl_mode() {
   return mode;
 }
 
+static int leaf_oov_preadmit_mode() {
+  static const int mode = []() -> int {
+    const char* s = std::getenv("MUSE_OOV_PREADMIT");
+    return (!s || !*s) ? 2 : static_cast<int>(std::strtol(s, nullptr, 10));
+  }();
+  return mode;
+}
+
+__device__ __forceinline__ int leaf_tail_count(
+    const int32_t* state, int state_len, int64_t anchor) {
+  if (state_len < 7 || state[5] <= 0) return 0;
+  const int64_t left = state[5] - anchor - 1;
+  return left >= 1 && left <= 6 ? static_cast<int>(left) : 0;
+}
+
 template <typename... KArgs, typename... Args>
 static inline void leaf_launch_pdl(
     void (*kernel)(KArgs...), unsigned blocks, unsigned threads, cudaStream_t st, int pdl_mode, Args... args) {
@@ -619,11 +634,12 @@ static inline void leaf_launch_pdl(
   TORCH_CHECK(err == cudaSuccess, "native_leaf launch failed: ", cudaGetErrorString(err));
 }
 
+template <bool Bounded>
 __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     int32_t* leaf_flag,
     const int64_t* tree_top,
     const float* tree_vals,
-    const int32_t* req_acc_state,
+    int32_t* req_acc_state,
     int32_t* input_ids,
     int64_t* positions,
     int64_t* saved_leaf_toks,
@@ -663,6 +679,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     const float* cascade_vals,
     CascadeKnobs csk,
     int req_acc_state_len,
+    int oov_preadmit_mode,
     int pdl_mode) {
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -673,7 +690,10 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   if (tid == 0 && saved_pos0 != nullptr) {
     saved_pos0[0] = positions[0];
   }
-  const bool high_acc = (req_acc_state != nullptr && req_acc_state[2] != 0);
+  const int tail_count = Bounded ? leaf_tail_count(req_acc_state, req_acc_state_len, positions[0]) : 0;
+  if (tid == 0 && tail_count > 0) req_acc_state[6] = 0;
+  const bool terminal = tail_count == 1;
+  const bool high_acc = terminal || (req_acc_state != nullptr && req_acc_state[2] != 0);
   const int eff_max_depth = (max_depth < 1) ? 1 : ((max_depth > 6) ? 6 : max_depth);
   // Online request-adaptive gamma_eff (used only when calib_mode == 0).
   float eff_gamma = gamma;
@@ -706,7 +726,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   __shared__ uint32_t s_row_packed[32];
 
   const int num_leaves = tree_m - 7;
-  if (dynamic_mode == 0 || selftest_mode != 0 || tree_vals == nullptr || tree_k < 6) {
+  if (terminal || dynamic_mode == 0 || selftest_mode != 0 || tree_vals == nullptr || tree_k < 6) {
     if (tid == 0) {
       if (cascade_meta != nullptr) {
         cascade_meta[0] = 0;
@@ -2837,12 +2857,71 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
     __syncwarp();
   }
 
+  uint32_t added_rows = 0u;
+  if (tail_count > 1 && !high_acc && saved_leaf_parent != nullptr) {
+    const int cap = tail_count - 1;
+    // With two outputs left, a failed extension leaves one output. On a
+    // longer tail, retain deep rows if any can change a later proposal.
+    const bool records_predictions = tr_state != nullptr && tr_log != nullptr &&
+        (tr_state[0] < tr_cap || p0_i32_w0 <= tr_state[2]);
+    const bool replace_deep = tail_count == 2 ||
+        (!records_predictions && oov_preadmit_mode <= 2);
+    uint32_t free_rows = __ballot_sync(0xffffffffu, lane >= 7 && lane < tree_m &&
+        (saved_leaf_k[lane] == 0 || (replace_deep && saved_leaf_k[lane] > cap)));
+    while (free_rows != 0u) {
+      const int row = __ffs(free_rows) - 1;
+      const uint32_t bit = 1u << row;
+      free_rows &= ~bit;
+      float score = 0.0f;
+      int best = kCandCap;
+      for (int i = lane; i < s_num_cands; i += 32) {
+        const float candidate_score = s_cand_score[i];
+        if (candidate_score > score && s_cand_k[i] <= cap && s_cand_par[i] < row) {
+          best = i;
+          score = candidate_score;
+        }
+      }
+      for (int delta = 16; delta > 0; delta >>= 1) {
+        const float other_score = __shfl_xor_sync(0xffffffffu, score, delta);
+        const int other = __shfl_xor_sync(0xffffffffu, best, delta);
+        if (other_score > score || (other_score == score && other < best)) {
+          best = other;
+          score = other_score;
+        }
+      }
+      if (best == kCandCap) continue;
+      added_rows |= bit;
+      const int kind = s_cand_kind[best];
+      casc_row_mask = (casc_row_mask & ~bit) | ((kind == 8 || kind == 9) ? bit : 0u);
+      if (lane == 0) {
+        const int k = s_cand_k[best];
+        const int par = s_cand_par[best];
+        const int64_t token = s_cand_tok[best];
+        input_ids[row] = static_cast<int32_t>(token);
+        positions[row] = positions[k];
+        saved_leaf_toks[row] = token;
+        saved_leaf_k[row] = k;
+        saved_leaf_parent[row] = par;
+        leaf_flag[1 + 3 * row] = tree_m - (k + 1);
+        leaf_flag[1 + 3 * row + 1] = par < 0 ? tree_m - k : s_row_base_sub[par];
+        leaf_flag[1 + 3 * row + 2] = par < 0 ? row :
+            s_row_packed[par] | (static_cast<uint32_t>(row) << (5 * s_row_depth[par]));
+        s_cand_score[best] = -1.0f;
+        s_any_active = 1;
+      }
+      __syncwarp();
+    }
+  }
+  if (lane == 0 && tail_count > 1) {
+    req_acc_state[6] = static_cast<int32_t>(added_rows);
+  }
+
   // Record per-row (cur, prv1, prv2, pos_r) for up to 32-row 30B Target Recycling commit in 1 parallel cycle.
   if (lane < tree_m && saved_row_ctx != nullptr) {
     const int32_t p_m1 = (s_hist_ok != 0 && s_ctx[14] >= 0) ? s_ctx[14] : -1;
     const int32_t p_m2 = (s_hist_ok != 0 && s_ctx[13] >= 0) ? s_ctx[13] : -1;
     int32_t cur_r = -1, prv1_r = -1, prv2_r = -1, pos_r = -1;
-    if (!high_acc) {
+    if (!high_acc && (added_rows & (1u << lane)) == 0u) {
       if (lane < 7) {
         cur_r = input_ids[lane];
         prv1_r = (lane == 0) ? p_m1 : input_ids[lane - 1];
@@ -2869,6 +2948,7 @@ __global__ void __launch_bounds__(256) native_leaf_setup_tree_kernel(
   }
 }
 
+template <bool Bounded>
 __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
     int32_t* leaf_flag,
     int32_t* prev_ns,
@@ -2948,14 +3028,41 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
   }
 
   const int mode_w = leaf_flag[0];
+  const int tokens_left = Bounded && saved_pos0 != nullptr ?
+      leaf_tail_count(req_acc_state, req_acc_state_len, saved_pos0[0]) : 0;
+  const uint32_t added_rows = tokens_left > 1 ? static_cast<uint32_t>(req_acc_state[6]) : 0u;
+  uint32_t rejected_rows = added_rows;
+  if (added_rows != 0u && mode_w < 0 && no_hit_mode == 0 &&
+      init_ns >= 1 && init_ns < tokens_left) {
+    // Explore the augmented path without updating request state. It replaces
+    // the original commit only when it can reach the request endpoint.
+    int ns = init_ns;
+    int parent = -1;
+    int64_t next = sampled_tokens[ns - 1];
+    while (ns < tokens_left) {
+      const uint32_t match = __ballot_sync(0xffffffffu,
+          lane >= 7 && lpar == parent && lk == ns && ltok == next && ltok >= 0);
+      if (match == 0u) break;
+      parent = __ffs(match) - 1;
+      next = __shfl_sync(0xffffffffu, u_lane, parent);
+      if (next < 0) break;
+      ++ns;
+    }
+    if (ns == tokens_left) rejected_rows = 0u;
+  }
   int32_t ns_w = init_ns;
   int32_t nr_w = num_rejected[0];
+  if (tokens_left > 0 && ns_w > tokens_left) {
+    nr_w += ns_w - tokens_left;
+    ns_w = tokens_left;
+  }
+  const int commit_limit = tokens_left > 0 ? tokens_left : 7;
   uint32_t matched_mask_w = 0u;
   int32_t hit_dst0_w = 0;
   int32_t hit_src0_w = 0;
   int32_t hit_len_w = 0;
   int32_t casc_hit_cnt_w = 0;
-  if (mode_w < 0 && ns_w >= 1 && ns_w <= 6 && no_hit_mode == 0) {
+  if (mode_w < 0 && ns_w >= 1 && ns_w < commit_limit && no_hit_mode == 0) {
     uint32_t casc_row_mask_w = 0u;
     if (lane == 0 && cascade_meta != nullptr) {
       casc_row_mask_w = static_cast<uint32_t>(cascade_meta[5]);
@@ -2963,10 +3070,11 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
     casc_row_mask_w = __shfl_sync(0xffffffffu, casc_row_mask_w, 0);
     int32_t cur_parent = -1;
     int32_t u_w = 0;
-    for (int stage = 0; stage < 6 && ns_w <= 6; ++stage) {
+    for (int stage = 0; stage < 6 && ns_w < commit_limit; ++stage) {
       const int64_t tok_k = (hit_len_w == 0) ? sampled_tokens[ns_w - 1] : static_cast<int64_t>(u_w);
       const bool pred = (lane >= 7) && (lpar == cur_parent) && (lk == ns_w) &&
-                        (ltok >= 0) && (ltok == tok_k);
+                        (ltok >= 0) && (ltok == tok_k) &&
+                        ((rejected_rows & (1u << lane)) == 0u);
       const uint32_t match = __ballot_sync(0xffffffffu, pred);
       if (match == 0u) break;
       const int winner = __ffs(match) - 1;
@@ -3003,7 +3111,7 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
       cascade_meta[5] = 0;
       cascade_meta[6] = 0;
     }
-    if (hit_len_w > 0) {
+    if (ns_w != init_ns) {
       num_sampled[0] = ns_w;
       num_rejected[0] = nr_w;
     }
@@ -3198,7 +3306,7 @@ __global__ void __launch_bounds__(32) native_leaf_commit_tree_kernel(
 
     if (oov_preadmit_mode >= 2 && chain_all_valid != 0) {
       int32_t tok_cone = -1;
-      if (lane < tree_m) {
+      if (lane < tree_m && (added_rows & (1u << lane)) == 0u) {
         const bool row_ok = (oov_preadmit_mode >= 3)
             ? (lane <= 6 || saved_leaf_k[lane] > 0)
             : (((s_exact_mask & (1u << lane)) != 0u) || lane <= s_eff_raw_ns ||
@@ -3750,7 +3858,7 @@ void native_leaf_setup_tree(
   TORCH_CHECK(saved_leaf_k.is_cuda() && saved_leaf_k.scalar_type() == torch::kInt32 &&
               saved_leaf_k.numel() >= tree_m);
   const int tree_k = (tree_top.numel() >= 48) ? 8 : ((tree_top.numel() >= 36) ? 6 : 4);
-  const int32_t* acc_ptr = nullptr;
+  int32_t* acc_ptr = nullptr;
   int acc_len = 0;
   if (req_acc_state.has_value() && req_acc_state.value().defined() && req_acc_state.value().numel() >= 3) {
     TORCH_CHECK(req_acc_state.value().is_cuda() && req_acc_state.value().scalar_type() == torch::kInt32);
@@ -3945,7 +4053,8 @@ void native_leaf_setup_tree(
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int pdl = leaf_pdl_mode();
   leaf_launch_pdl(
-      native_leaf_setup_tree_kernel, 1u, 256u, st, pdl,
+      acc_len >= 7 ? native_leaf_setup_tree_kernel<true> : native_leaf_setup_tree_kernel<false>,
+      1u, 256u, st, pdl,
       leaf_flag.data_ptr<int32_t>(),
       tree_top.data_ptr<int64_t>(),
       vals_ptr,
@@ -3989,6 +4098,7 @@ void native_leaf_setup_tree(
       casc_vals_ptr,
       csk_env,
       acc_len,
+      leaf_oov_preadmit_mode(),
       pdl);
 }
 
@@ -4105,10 +4215,7 @@ void native_leaf_commit_tree(
     casc_meta_ptr = cascade_meta.value().data_ptr<int32_t>();
   }
   const int eff_vocab = static_cast<int>(vocab_size > 0 ? vocab_size : 202048);
-  static const int oov_preadmit_env = []() -> int {
-    const char* s = std::getenv("MUSE_OOV_PREADMIT");
-    return (!s || !*s) ? 2 : static_cast<int>(std::strtol(s, nullptr, 10));
-  }();
+  const int oov_preadmit_env = leaf_oov_preadmit_mode();
   const uint8_t* in_sv_ptr = nullptr;
   int32_t* t_ids_ptr = nullptr;
   int32_t* t_cnt_ptr = nullptr;
@@ -4146,7 +4253,8 @@ void native_leaf_commit_tree(
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int pdl = leaf_pdl_mode();
   leaf_launch_pdl(
-      native_leaf_commit_tree_kernel, 1u, 32u, st, pdl,
+      acc_len >= 7 ? native_leaf_commit_tree_kernel<true> : native_leaf_commit_tree_kernel<false>,
+      1u, 32u, st, pdl,
       leaf_flag.data_ptr<int32_t>(),
       prev_ns.data_ptr<int32_t>(),
       hit_flag.data_ptr<int32_t>(),
