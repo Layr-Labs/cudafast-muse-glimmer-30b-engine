@@ -7290,9 +7290,6 @@ __device__ __forceinline__ float triton_sigmoid(float x) {
   return full_divide(1.0f, __fadd_rn(1.0f, e));
 }
 
-__device__ __forceinline__ float clamp448(float x) {
-  return fminf(fmaxf(x, -448.0f), 448.0f);
-}
 
 __device__ __forceinline__ uint16_t fp8x2(float a, float b) {
   uint16_t r;
@@ -7692,8 +7689,8 @@ __global__ __launch_bounds__(256, 1) void gqa16_prefill_v3_kernel(
       for (int i = 0; i < 4; ++i) {
         const float2 of = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ow[i]));
         const float2 gf = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gw[i]));
-        qw[i] = fp8x2(clamp448(__fmul_rn(__fmul_rn(triton_sigmoid(gf.x), of.x), inv_s)),
-                      clamp448(__fmul_rn(__fmul_rn(triton_sigmoid(gf.y), of.y), inv_s)));
+        qw[i] = fp8x2(__fmul_rn(__fmul_rn(triton_sigmoid(gf.x), of.x), inv_s),
+                      __fmul_rn(__fmul_rn(triton_sigmoid(gf.y), of.y), inv_s));
       }
       dst[idx] = make_uint2(static_cast<uint32_t>(qw[0]) | (static_cast<uint32_t>(qw[1]) << 16),
                             static_cast<uint32_t>(qw[2]) | (static_cast<uint32_t>(qw[3]) << 16));

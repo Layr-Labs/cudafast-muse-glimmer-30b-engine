@@ -250,11 +250,8 @@ __device__ __forceinline__ float marlin_full_rcp(float s) {
 }
 
 __device__ __forceinline__ uint16_t marlin_pack_fp8x2(float v0, float v1) {
-  auto cl = [](float v) {
-    return (v != v) ? 448.0f : (v < -448.0f ? -448.0f : (v > 448.0f ? 448.0f : v));
-  };
   uint16_t lo;
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(cl(v1)), "f"(cl(v0)));
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(v1), "f"(v0));
   return lo;
 }
 
