@@ -544,6 +544,60 @@ __device__ __forceinline__ unsigned dvt_pop_static_warp_top6(
   return winner;
 }
 
+__device__ __forceinline__ uint64_t dvt_warp_bitonic_exchange(
+    uint64_t key, int index, int width, int distance) {
+  const uint64_t peer = __shfl_xor_sync(0xffffffffu, key, distance);
+  const bool take_max = ((index & width) == 0) == ((index & distance) == 0);
+  return (take_max ? key < peer : key > peer) ? peer : key;
+}
+
+__device__ __forceinline__ void dvt_sort_coarse_candidates(
+    const uint64_t* row_cands, int count, uint64_t* scratch) {
+  const int tid = threadIdx.x;
+  constexpr int kHalf = 256;
+  constexpr int kWarp = 32;
+  const int upper = tid + kHalf;
+  uint64_t lo = tid < count ? row_cands[tid] : 0ull;
+  uint64_t hi = upper < count ? row_cands[upper] : 0ull;
+
+  #pragma unroll
+  for (int width = 2; width <= kWarp; width <<= 1) {
+    #pragma unroll
+    for (int distance = width >> 1; distance > 0; distance >>= 1) {
+      lo = dvt_warp_bitonic_exchange(lo, tid, width, distance);
+      hi = dvt_warp_bitonic_exchange(hi, upper, width, distance);
+    }
+  }
+  scratch[tid] = lo;
+  scratch[upper] = hi;
+  __syncthreads();
+
+  for (int width = 2 * kWarp; width <= 2 * kHalf; width <<= 1) {
+    for (int distance = width >> 1; distance >= kWarp; distance >>= 1) {
+      const int low = ((tid & -distance) << 1) | (tid & (distance - 1));
+      const int high = low + distance;
+      const uint64_t a = scratch[low];
+      const uint64_t b = scratch[high];
+      if ((low & width) == 0 ? a < b : a > b) {
+        scratch[low] = b;
+        scratch[high] = a;
+      }
+      __syncthreads();
+    }
+
+    lo = scratch[tid];
+    hi = scratch[upper];
+    #pragma unroll
+    for (int distance = kWarp >> 1; distance > 0; distance >>= 1) {
+      lo = dvt_warp_bitonic_exchange(lo, tid, width, distance);
+      hi = dvt_warp_bitonic_exchange(hi, upper, width, distance);
+    }
+    scratch[tid] = lo;
+    scratch[upper] = hi;
+    __syncthreads();
+  }
+}
+
 template <int kTopK, int kCtasPerRow, bool kFusedFinal, bool kPackedTop6 = false>
 __global__ void __launch_bounds__(256, 2) draft_vocab_tail_argmax_kernel(
     const __nv_bfloat16* __restrict__ A,
@@ -733,24 +787,7 @@ __global__ void __launch_bounds__(256, 2) draft_vocab_tail_argmax_kernel(
     // Fast fused rescore path: sort the <= 512 per-CTA coarse candidates of row `m` in SMEM
     // and rescore the global coarse top-`rescore_k` using exact NVFP4 `dvt_warp_nvfp4_dot`.
     const uint64_t* row_cands = cand_buf + static_cast<size_t>(m) * num_cands;
-    s_cand[tid] = (tid < num_cands) ? row_cands[tid] : 0ull;
-    s_cand[tid + 256] = (tid + 256 < num_cands) ? row_cands[tid + 256] : 0ull;
-    __syncthreads();
-
-    for (int k = 2; k <= 512; k <<= 1) {
-      for (int j = k >> 1; j > 0; j >>= 1) {
-        const int ixj_lo = (tid / j) * (2 * j) + (tid & (j - 1));
-        const int ixj_hi = ixj_lo ^ j;
-        const bool desc = ((ixj_lo & k) == 0);
-        const uint64_t a = s_cand[ixj_lo];
-        const uint64_t b = s_cand[ixj_hi];
-        if (desc ? (a < b) : (a > b)) {
-          s_cand[ixj_lo] = b;
-          s_cand[ixj_hi] = a;
-        }
-        __syncthreads();
-      }
-    }
+    dvt_sort_coarse_candidates(row_cands, num_cands, s_cand);
 
     const int eff_rescore = (rescore_k < 512) ? rescore_k : 512;
     const int stride_warps = kCtasPerRow * kS2Warps;
