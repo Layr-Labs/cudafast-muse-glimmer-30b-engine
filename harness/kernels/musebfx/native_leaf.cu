@@ -52,7 +52,7 @@ __constant__ float kCalA[6] = {1.675690f, 1.258784f, 1.070196f, 1.171448f, 1.102
 __constant__ float kCalC[8] = {
     0.000000f, -0.402942f, -0.763639f, -0.817452f,
     -1.416669f, -1.642223f, -1.860000f, -2.060000f};
-#define CAL_A2 (-1.614419f)
+#define CAL_A2 (-1.937303f)
 #define CAL_BETA 0.851144f
 #define CAL_BETA_POST 0.326972f
 #define CAL_W_SM_PRE 0.472339f
