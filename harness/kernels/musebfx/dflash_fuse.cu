@@ -72,9 +72,32 @@ static int dflash_fuse_pdl_mode() {
   return mode;
 }
 
+static bool dflash_carveout100_enabled() {
+  static const bool en = []() -> bool {
+    const char* s = std::getenv("MUSE_DRAFTER_CARVEOUT100");
+    return !s || !*s || std::atoi(s) != 0;
+  }();
+  return en;
+}
+
+static inline void dflash_set_carveout100_once(const void* fn) {
+  if (!dflash_carveout100_enabled()) return;
+  static const void* seen[32] = {};
+  static int n_seen = 0;
+  for (int i = 0; i < n_seen; ++i) {
+    if (seen[i] == fn) return;
+  }
+  if (n_seen < 32) seen[n_seen++] = fn;
+  cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+  cudaThreadExchangeStreamCaptureMode(&mode);
+  cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaThreadExchangeStreamCaptureMode(&mode);
+}
+
 template <typename... KArgs, typename... Args>
 static inline void dflash_launch_pdl(
     void (*kernel)(KArgs...), int blocks, int threads, cudaStream_t st, int pdl_mode, Args... args) {
+  dflash_set_carveout100_once(reinterpret_cast<const void*>(kernel));
   cudaLaunchConfig_t lcfg = {};
   lcfg.gridDim = dim3(static_cast<unsigned>(blocks), 1u, 1u);
   lcfg.blockDim = dim3(static_cast<unsigned>(threads), 1u, 1u);
@@ -394,6 +417,7 @@ __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
     int32_t* post_total_len,
     int32_t* post_output_bin_counts,
     int64_t post_bin_stride,
+    int ctx_buf_len,
     int pdl_mode) {
   if ((pdl_mode & 1) != 0) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -401,6 +425,8 @@ __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
   __shared__ int32_t s_req_state_idx;
   __shared__ int32_t s_ctx_start;
   __shared__ int32_t s_num_ctx;
+  __shared__ int32_t s_valid_ctx_len;
+  __shared__ int32_t s_eff_ctx_len;
   __shared__ int32_t s_valid_tail_len;
   __shared__ int32_t s_bonus_token;
   __shared__ int64_t s_last_valid_pos;
@@ -447,6 +473,11 @@ __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
         : static_cast<int32_t>(next_prefill_tokens[req_state_idx]);
     const int64_t last_valid_pos = target_positions[valid_ctx_end - 1];
 
+    const int32_t eff_ctx_len = (ctx_buf_len > num_ctx) ? ctx_buf_len : num_ctx;
+    int32_t valid_ctx_len = valid_ctx_end - ctx_start;
+    if (valid_ctx_len < 0) valid_ctx_len = 0;
+    if (valid_ctx_len > eff_ctx_len) valid_ctx_len = eff_ctx_len;
+
     int32_t valid_end = valid_ctx_end;
     if (valid_end > tail_num_tokens) valid_end = tail_num_tokens;
     int32_t valid_tail_len = valid_end - ctx_start;
@@ -455,6 +486,8 @@ __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
     s_req_state_idx = req_state_idx;
     s_ctx_start = ctx_start;
     s_num_ctx = num_ctx;
+    s_valid_ctx_len = valid_ctx_len;
+    s_eff_ctx_len = eff_ctx_len;
     s_valid_tail_len = valid_tail_len;
     s_bonus_token = bonus_token;
     s_last_valid_pos = last_valid_pos;
@@ -501,18 +534,25 @@ __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
   const int32_t req_state_idx = s_req_state_idx;
   const int32_t ctx_start = s_ctx_start;
   const int32_t num_ctx = s_num_ctx;
+  const int32_t valid_ctx_len = s_valid_ctx_len;
+  const int32_t eff_ctx_len = s_eff_ctx_len;
   const int32_t valid_tail_len = s_valid_tail_len;
   const int32_t bonus_token = s_bonus_token;
   const int64_t last_valid_pos = s_last_valid_pos;
 
-  for (int j = tid; j < num_ctx; j += 256) {
-    const int64_t ctx_pos = target_positions[ctx_start + j];
-    int64_t ctx_blk = (block_size == 16) ? (ctx_pos >> 4) : (ctx_pos / block_size);
-    if (ctx_blk > block_table_stride - 1) ctx_blk = block_table_stride - 1;
-    const int64_t ctx_bid = static_cast<int64_t>(block_table[ctx_blk]);
-    const int64_t ctx_off = (block_size == 16) ? (ctx_pos & 15) : (ctx_pos % block_size);
-    out_context_positions[ctx_start + j] = ctx_pos;
-    out_context_slot_mapping[ctx_start + j] = ctx_bid * block_size + ctx_off;
+  for (int j = tid; j < eff_ctx_len; j += 256) {
+    if (ctx_buf_len > num_ctx && j >= valid_ctx_len) {
+      out_context_positions[ctx_start + j] = 0;
+      out_context_slot_mapping[ctx_start + j] = pad_slot_id;
+    } else {
+      const int64_t ctx_pos = target_positions[ctx_start + j];
+      int64_t ctx_blk = (block_size == 16) ? (ctx_pos >> 4) : (ctx_pos / block_size);
+      if (ctx_blk > block_table_stride - 1) ctx_blk = block_table_stride - 1;
+      const int64_t ctx_bid = static_cast<int64_t>(block_table[ctx_blk]);
+      const int64_t ctx_off = (block_size == 16) ? (ctx_pos & 15) : (ctx_pos % block_size);
+      out_context_positions[ctx_start + j] = ctx_pos;
+      out_context_slot_mapping[ctx_start + j] = ctx_bid * block_size + ctx_off;
+    }
   }
 
   for (int q = tid; q < num_query_per_req; q += 256) {
@@ -973,7 +1013,8 @@ void dflash_prepare_inputs(
     c10::optional<torch::Tensor> post_num_computed_tokens,
     c10::optional<torch::Tensor> post_all_token_ids,
     c10::optional<torch::Tensor> post_total_len,
-    c10::optional<torch::Tensor> post_output_bin_counts) {
+    c10::optional<torch::Tensor> post_output_bin_counts,
+    int64_t ctx_buf_len) {
   TORCH_CHECK(out_input_ids.scalar_type() == torch::kInt32 && out_query_positions.scalar_type() == torch::kInt64 &&
                   out_query_start_loc.scalar_type() == torch::kInt32 && out_seq_lens.scalar_type() == torch::kInt32 &&
                   out_query_slot_mapping.scalar_type() == torch::kInt64 &&
@@ -1136,6 +1177,7 @@ void dflash_prepare_inputs(
       post_tlen_ptr, \
       post_bin_ptr, \
       post_bin_stride, \
+      static_cast<int>(ctx_buf_len), \
       pdl)
 
   if (ls_i64) {
@@ -1176,6 +1218,9 @@ torch::Tensor dflash_rms_norm(torch::Tensor input, torch::Tensor weight, double 
       (M <= 16 && (K & 63) == 0 && dflash_norm_fuse_rot_enabled())
           ? vq4d_alloc_norm_prerot(out.data_ptr(), w_tag, M, K, out.options())
           : nullptr;
+  if (M > 16) {
+    vq4d_clear_all_prerot();
+  }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int pdl = dflash_fuse_pdl_mode();
   auto k = (rot_out != nullptr) ? dflash_rms_norm_kernel<false, false, true>
@@ -1224,6 +1269,9 @@ std::tuple<torch::Tensor, torch::Tensor> dflash_fused_add_rms_norm(
       (M <= 16 && (K & 63) == 0 && dflash_norm_fuse_rot_enabled())
           ? vq4d_alloc_norm_prerot(out.data_ptr(), w_tag, M, K, out.options())
           : nullptr;
+  if (M > 16) {
+    vq4d_clear_all_prerot();
+  }
   auto st = c10::cuda::getCurrentCUDAStream().stream();
   const int pdl = dflash_fuse_pdl_mode();
   const bool preload_res = (input.data_ptr() != residual.data_ptr());

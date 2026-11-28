@@ -179,8 +179,9 @@ class Session:
         if not emitted:
             raise RefusedError("the engine step emitted nothing")
         if self.b.depth > 0:
-            self.drafts += self.b.depth
-            self.hits += len(emitted) - 1
+            step_hits = max(0, len(emitted) - 1)
+            self.drafts += max(self.b.depth, step_hits)
+            self.hits += step_hits
         if self.left is not None:
             self.left -= len(emitted)
         return emitted

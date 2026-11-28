@@ -119,9 +119,15 @@ class DFlashCommittedTokenCeiling:
         state.rounds += 1
         state.committed_tokens += committed_tokens
         if (
-            state.rounds >= HIGH_ACCEPTANCE_MIN_ROUNDS
-            and state.committed_tokens
-            > HIGH_ACCEPTANCE_TRIGGER_TOKENS_PER_ROUND * state.rounds
+            (
+                state.rounds >= HIGH_ACCEPTANCE_MIN_ROUNDS
+                and state.committed_tokens
+                > HIGH_ACCEPTANCE_TRIGGER_TOKENS_PER_ROUND * state.rounds
+            )
+            or (
+                state.rounds >= 3
+                and (state.committed_tokens - 1) >= 8 * (state.rounds - 1)
+            )
         ):
             # Latch this for the request. Once the limiter shortens proposals,
             # the observed mean naturally falls; that must not disable the
@@ -173,6 +179,13 @@ class DFlashCommittedTokenCeiling:
             )
             state.cumulative_decode_ms += credited_ms
             state.measured_decode_rounds += 1
+
+    def is_high_acceptance(self, req_id: str) -> bool:
+        """Return whether high-acceptance ceiling pacing has latched for req_id."""
+        if not self.enabled:
+            return False
+        state = self._states.get(req_id)
+        return bool(state is not None and state.high_acceptance_seen)
 
     def limit_next(
         self,

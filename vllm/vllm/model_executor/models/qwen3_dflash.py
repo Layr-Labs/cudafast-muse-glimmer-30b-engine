@@ -270,11 +270,13 @@ class DFlashQwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         tail_slice_m6: bool = False,
+        tail_slice_len: int = 0,
     ) -> torch.Tensor:
         """DFlash attention assumes that the KV cache is already populated
         with the context K/V from the target model's hidden states. This forward op
         computes attention for the query tokens only.
         See also: precompute_and_store_context_kv"""
+        eff_tail = tail_slice_len if tail_slice_len > 0 else (6 if tail_slice_m6 else 0)
         qkv, _ = self.qkv_proj(hidden_states)
         if (
             getattr(self, "_dflash_fuse_qkv_ok", False)
@@ -296,8 +298,8 @@ class DFlashQwen3Attention(nn.Module):
             )
             v = qkv[..., self.q_size + self.kv_size :]
             attn_output = self.attn(q, k, v)
-            if tail_slice_m6:
-                attn_output = attn_output[1:7]
+            if eff_tail > 0:
+                attn_output = attn_output[1 : 1 + eff_tail]
             output, _ = self.o_proj(attn_output)
             return output
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -314,8 +316,8 @@ class DFlashQwen3Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
-        if tail_slice_m6:
-            attn_output = attn_output[1:7]
+        if eff_tail > 0:
+            attn_output = attn_output[1 : 1 + eff_tail]
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -383,7 +385,9 @@ class DFlashQwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         tail_slice_m6: bool = False,
+        tail_slice_len: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        eff_tail = tail_slice_len if tail_slice_len > 0 else (6 if tail_slice_m6 else 0)
         use_fuse_norm = (
             getattr(self, "_dflash_fuse_norm_ok", False)
             and hidden_states.dtype == torch.bfloat16
@@ -416,9 +420,10 @@ class DFlashQwen3DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             tail_slice_m6=tail_slice_m6,
+            tail_slice_len=eff_tail,
         )
-        if tail_slice_m6:
-            residual = residual[1:7]
+        if eff_tail > 0:
+            residual = residual[1 : 1 + eff_tail]
 
         if use_fuse_norm:
             hidden_states, residual = torch.ops.muse.dflash_fused_add_rms_norm(
@@ -912,8 +917,9 @@ class DFlashQwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
+        tail_slice_len: int = 6,
     ) -> torch.Tensor:
-        """Eager/CUDA-graph forward slicing Layer-4 post-attention [1:7] -> M=6 (0-ULP exact)."""
+        """Eager/CUDA-graph forward slicing Layer-4 post-attention [1:1+L] (0-ULP exact)."""
         if input_embeds is None:
             input_embeds = self.embed_input_ids(input_ids)
 
@@ -925,7 +931,8 @@ class DFlashQwen3Model(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
-                tail_slice_m6=(idx == last_idx),
+                tail_slice_m6=(idx == last_idx and tail_slice_len == 6),
+                tail_slice_len=(tail_slice_len if idx == last_idx else 0),
             )
         if (
             getattr(self, "_dflash_fuse_norm_ok", False)
@@ -1015,9 +1022,16 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         tail_slice_m6: bool = False,
+        tail_slice_len: int = 0,
     ) -> torch.Tensor:
+        if tail_slice_len > 0:
+            return self.model.forward_tail_m6(
+                input_ids, positions, inputs_embeds, tail_slice_len=tail_slice_len
+            )
         if tail_slice_m6:
-            return self.model.forward_tail_m6(input_ids, positions, inputs_embeds)
+            return self.model.forward_tail_m6(
+                input_ids, positions, inputs_embeds, tail_slice_len=6
+            )
         return self.model(input_ids, positions, inputs_embeds)
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
@@ -1097,7 +1111,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             and hidden_states.is_cuda
             and hidden_states.dtype == torch.bfloat16
             and hidden_states.dim() == 2
-            and 1 <= hidden_states.shape[0] <= 8
+            and 1 <= hidden_states.shape[0] <= 16
         ):
             import muse_bfx_ext as _bfx
 
@@ -1130,7 +1144,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             and hidden_states.is_cuda
             and hidden_states.dtype == torch.bfloat16
             and hidden_states.dim() == 2
-            and 1 <= hidden_states.shape[0] <= 8
+            and 1 <= hidden_states.shape[0] <= 16
             and static_logits.dtype == torch.bfloat16
         ):
             import muse_bfx_ext as _bfx
@@ -1202,11 +1216,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                     )
         if static_logits.dim() == 2 and static_logits.shape[0] >= 1:
             if tree_top_buf is not None and tree_top_buf.numel() >= 48:
-                n_tt = min(6, static_logits.shape[0])
+                n_tt = min(tree_top_buf.numel() // 8, static_logits.shape[0])
                 tk8 = static_logits[:n_tt].topk(8, dim=-1)
                 tree_top_buf.fill_(-1)
                 tree_top_buf[: 8 * n_tt].copy_(vocab_map[tk8.indices].reshape(-1))
-                if tree_vals_buf is not None and tree_vals_buf.numel() >= 48:
+                if tree_vals_buf is not None and tree_vals_buf.numel() >= 8 * n_tt:
                     tree_vals_buf.fill_(-1e30)
                     tree_vals_buf[: 8 * n_tt].copy_(tk8.values.to(torch.float32).reshape(-1))
                 if alt_buf is not None:

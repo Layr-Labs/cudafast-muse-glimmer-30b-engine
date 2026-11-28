@@ -247,6 +247,21 @@ class SessionTests(unittest.TestCase):
         with self.assertRaises(RefusedError):
             s.sync([1, 2, 131072])
 
+    def test_depth_ext_emission_keeps_drafts_ge_hits(self):
+        from backends import Emit
+
+        backend = FakeBackend(depth=6)
+        s = Session(backend)
+        seed = s.sync(PROMPT)
+        # Simulate a depth-extension verify step returning 11 tokens (> depth + 1 = 7).
+        fake_emitted = [Emit(token=1000 + i, top=()) for i in range(11)]
+        with patch.object(backend, "step", return_value=fake_emitted):
+            rounds, frontiers = s.spec_run(seed, 11)
+        self.assertEqual(sum(len(r) for r in rounds), 11)
+        self.assertEqual(s.hits, 10)
+        self.assertGreaterEqual(s.drafts, s.hits)
+        self.assertEqual(frontiers[-1], fake_emitted[-1].token)
+
     def test_hello_reports_depth_in_the_reference_convention(self):
         self.assertEqual(Session(FakeBackend(depth=0)).hello()["draft_tokens"], 1)
         h = Session(FakeBackend(depth=3)).hello()

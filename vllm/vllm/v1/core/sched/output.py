@@ -268,6 +268,10 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Whether the DFlash committed-token ceiling has latched high-acceptance mode
+    # for the single scheduled request (lets the worker disable depth-ext cleanly).
+    dflash_high_acc: bool = False
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

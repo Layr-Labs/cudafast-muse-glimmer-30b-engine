@@ -278,9 +278,12 @@ class Scheduler(SchedulerInterface):
                 if self.num_spec_tokens == 6:
                     from vllm.v1.worker.gpu.spec_decode.dflash.native_leaf import (
                         desired_verify_m,
+                        dext_possible,
                     )
 
-                    _extra_leaf_slots = max(0, desired_verify_m() - 7)
+                    _extra_leaf_slots = max(0, desired_verify_m() - 7) + (
+                        12 if dext_possible() else 0
+                    )
                 from vllm.model_executor.models.qwen3_dflash import dflash_query_len
 
                 _draft_cfg = getattr(
@@ -1288,6 +1291,12 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs
             )
 
+        dflash_high_acc = (
+            ceiling is not None
+            and len(num_scheduled_tokens) == 1
+            and ceiling.is_high_acceptance(next(iter(num_scheduled_tokens)))
+        )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1308,6 +1317,7 @@ class Scheduler(SchedulerInterface):
             kv_cache_block_copies=pending_kv_cache_block_copies,
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            dflash_high_acc=dflash_high_acc,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
 
@@ -1868,7 +1878,7 @@ class Scheduler(SchedulerInterface):
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
-                    num_accepted_tokens=num_accepted,
+                    num_accepted_tokens=min(num_accepted, num_draft_tokens),
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )

@@ -271,8 +271,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         tail_slice_m6: bool = False,
+        tail_slice_len: int = 0,
     ) -> torch.Tensor:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+        eff_tail = tail_slice_len if tail_slice_len > 0 else (6 if tail_slice_m6 else 0)
         with set_forward_context(
             attn_metadata,
             self.vllm_config,
@@ -283,7 +285,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             batch_descriptor=batch_descriptor,
         ):
             if (
-                tail_slice_m6
+                eff_tail > 0
                 and hasattr(self.model, "model")
                 and hasattr(self.model.model, "forward_tail_m6")
             ):
@@ -291,7 +293,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                     input_ids=self.input_buffers.input_ids[:num_tokens],
                     positions=self.input_buffers.positions[:num_tokens],
                     inputs_embeds=None,
-                    tail_slice_m6=True,
+                    tail_slice_m6=(eff_tail == 6),
+                    tail_slice_len=eff_tail,
                 )
             else:
                 last_hidden_states = self.model(
@@ -310,6 +313,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
+        from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _nl
+
         num_sample = num_reqs * self.num_speculative_steps
         use_tail_slice = (
             num_reqs == 1
@@ -320,16 +325,18 @@ class DFlashSpeculator(DraftModelSpeculator):
             and os.environ.get("MUSE_DFLASH_FAST_SAMPLE", "1") != "0"
             and os.environ.get("MUSE_DFLASH_LAST_LAYER_SLICE", "1") != "0"
         )
+        tail_len = 12 if (use_tail_slice and _nl.p1_dext_enabled()) else (6 if use_tail_slice else 0)
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
             slot_mappings,
             num_tokens_across_dp,
             cudagraph_runtime_mode,
-            tail_slice_m6=use_tail_slice,
+            tail_slice_m6=(tail_len == 6),
+            tail_slice_len=tail_len,
         )
 
-        if use_tail_slice and last_hidden_states.shape[0] == num_sample:
+        if tail_len > 0 and last_hidden_states.shape[0] == tail_len:
             sample_hidden_states = last_hidden_states
         elif (
             num_reqs == 1
@@ -350,8 +357,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         ):
             fast_toks = self.model.draft_argmax(sample_hidden_states)
             if fast_toks is not None:
-                self.draft_tokens[:1] = fast_toks.view(1, self.num_speculative_steps)
+                self.draft_tokens[:1] = fast_toks[: self.num_speculative_steps].view(
+                    1, self.num_speculative_steps
+                )
                 return
+        if sample_hidden_states.shape[0] > num_sample:
+            sample_hidden_states = sample_hidden_states[:num_sample]
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
         draft_tokens = self.sample_draft(
@@ -419,9 +430,18 @@ class DFlashSpeculator(DraftModelSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        ctx_buf_len: int = 0,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
+        eff_ctx_tokens = num_target_tokens
+        if (
+            ctx_buf_len > num_target_tokens
+            and num_reqs == 1
+            and last_hidden_states.shape[0] >= ctx_buf_len
+            and (not aux_hidden_states or aux_hidden_states[0].shape[0] >= ctx_buf_len)
+        ):
+            eff_ctx_tokens = ctx_buf_len
         num_query_tokens = num_reqs * self.num_query_per_req
         if num_reqs == 1:
             max_seq_len = int(input_batch.seq_lens_cpu_upper_bound.numpy()[0])
@@ -442,19 +462,19 @@ class DFlashSpeculator(DraftModelSpeculator):
                     and hasattr(self.model, "combine_hidden_states_aux5")
                 ):
                     out = self.model.combine_hidden_states_aux5(
-                        aux_hidden_states, num_target_tokens
+                        aux_hidden_states, eff_ctx_tokens
                     )
                     if out is not None:
                         return out if out.is_contiguous() else out.contiguous()
-                if aux_hidden_states[0].shape[0] > num_target_tokens:
+                if aux_hidden_states[0].shape[0] > eff_ctx_tokens:
                     aux_cat = torch.cat(
-                        [h[:num_target_tokens] for h in aux_hidden_states], dim=-1
+                        [h[:eff_ctx_tokens] for h in aux_hidden_states], dim=-1
                     )
                 else:
                     aux_cat = torch.cat(aux_hidden_states, dim=-1)
-                out = self.model.combine_hidden_states(aux_cat)[:num_target_tokens]
+                out = self.model.combine_hidden_states(aux_cat)[:eff_ctx_tokens]
             else:
-                out = last_hidden_states[:num_target_tokens]
+                out = last_hidden_states[:eff_ctx_tokens]
             if not out.is_contiguous():
                 out = out.contiguous()
             return out
@@ -554,13 +574,19 @@ class DFlashSpeculator(DraftModelSpeculator):
                             self.max_model_len,
                             PAD_SLOT_ID,
                             input_batch.input_ids if want_ids else None,
-                            num_target_tokens if want_ids else 0,
+                            eff_ctx_tokens if want_ids else 0,
                             lm_head.in_static_vocab if want_tail else None,
                             lm_head.tail_ids if want_tail else None,
                             lm_head.tail_count if want_tail else None,
                             lm_head.tail_seen if want_tail else None,
                             hist_buf,
                             hist_len_buf,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            eff_ctx_tokens if eff_ctx_tokens > num_target_tokens else 0,
                         )
                     except TypeError:
                         _bfx.dflash_prepare_inputs(
@@ -647,16 +673,16 @@ class DFlashSpeculator(DraftModelSpeculator):
             context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
         elif getattr(self, "_single_ctx_group", False):
             context_slots = self._context_slot_mappings[self._single_ctx_gidx][
-                :num_target_tokens
+                :eff_ctx_tokens
             ]
         elif self._layer_group_idx is not None:
             context_slots = [
-                self._context_slot_mappings[gidx][:num_target_tokens]
+                self._context_slot_mappings[gidx][:eff_ctx_tokens]
                 for gidx in self._layer_group_idx
             ]
         else:
-            context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        ctx_pos_slice = self.context_positions[:num_target_tokens]
+            context_slots = self._context_slot_mappings[0][:eff_ctx_tokens]
+        ctx_pos_slice = self.context_positions[:eff_ctx_tokens]
         if (
             not ran_fused_tail
             and not dummy_run
@@ -665,7 +691,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             and hasattr(self.model, "update_draft_prompt_tail")
         ):
             self.model.update_draft_prompt_tail(
-                input_batch.input_ids[:num_target_tokens],
+                input_batch.input_ids[:eff_ctx_tokens],
                 ctx_pos_slice,
                 num_rejected=num_rejected,
                 extra_ids=self.input_buffers.input_ids[:1],
@@ -677,7 +703,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             and not dummy_run
             and not is_profile
             and num_reqs == 1
-            and 1 <= num_target_tokens <= self.num_query_per_req
+            and 1 <= eff_ctx_tokens <= self.num_query_per_req
             and not torch.cuda.is_current_stream_capturing()
             and self.query_cudagraph_manager is not None
             and self.query_cudagraph_manager._graphs_captured
@@ -688,7 +714,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 and isinstance(context_slots, torch.Tensor)
             ):
                 cg_key: tuple = (
-                    num_target_tokens,
+                    eff_ctx_tokens,
                     aux_hidden_states[0].data_ptr(),
                     aux_hidden_states[0].stride(0),
                     aux_hidden_states[1].data_ptr(),
@@ -738,7 +764,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                         else None,
                     )
                 )
-                cg_key = (num_target_tokens, src_sig, pos_sig, slot_sig)
+                cg_key = (eff_ctx_tokens, src_sig, pos_sig, slot_sig)
             cg = self._ctx_kv_cg_entries.get(cg_key)
             if cg is not None:
                 cg.replay()
@@ -856,6 +882,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         post_all_token_ids: torch.Tensor | None = None,
         post_total_len: torch.Tensor | None = None,
         post_output_bin_counts: torch.Tensor | None = None,
+        ctx_buf_len: int = 0,
     ) -> bool:
         """Emit dflash_prepare_inputs onto current capture stream for bs=1 verify."""
         if (
@@ -872,8 +899,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         bt0 = self.block_tables.input_block_tables[gid0]
         lm_head = getattr(self.model, "lm_head", None)
         num_target_tokens = int(input_batch.num_tokens)
+        eff_ctx_tokens = max(num_target_tokens, int(ctx_buf_len))
         want_ids_base = (
-            num_target_tokens > 0
+            eff_ctx_tokens > 0
             and input_batch.input_ids.is_cuda
             and input_batch.input_ids.is_contiguous()
         )
@@ -918,7 +946,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.max_model_len,
             PAD_SLOT_ID,
             input_batch.input_ids if want_ids else None,
-            num_target_tokens if want_ids else 0,
+            eff_ctx_tokens if want_ids else 0,
             lm_head.in_static_vocab if want_tail else None,
             lm_head.tail_ids if want_tail else None,
             lm_head.tail_count if want_tail else None,
@@ -930,6 +958,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             post_all_token_ids,
             post_total_len,
             post_output_bin_counts,
+            eff_ctx_tokens if eff_ctx_tokens > num_target_tokens else 0,
         )
         return True
 
@@ -1081,7 +1110,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             return None
 
     def warmup_ctx_kv_graphs(self, aux_base: list[torch.Tensor] | None) -> int:
-        """Pre-capture and cudaGraphUpload _ctx_kv_cg_entries for num_target_tokens in 1..7 at boot."""
+        """Pre-capture and cudaGraphUpload _ctx_kv_cg_entries for num_target_tokens in 1..7 (+DEXT_MAX_NS) at boot."""
         if (
             self._ctx_kv_cg_stream is None
             or not aux_base
@@ -1089,8 +1118,13 @@ class DFlashSpeculator(DraftModelSpeculator):
             or not getattr(self, "_single_ctx_group", False)
         ):
             return 0
+        from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _nl
+
+        sizes = list(range(1, 8))
+        if _nl.dext_possible() and _nl.DEXT_MAX_NS > 7 and _nl.DEXT_MAX_NS <= aux_base[0].shape[0]:
+            sizes.append(_nl.DEXT_MAX_NS)
         captured = 0
-        for n_tok in range(1, 8):
+        for n_tok in sizes:
             aux_n = [h[:n_tok] for h in aux_base]
             context_slots = self._context_slot_mappings[self._single_ctx_gidx][:n_tok]
             ctx_pos_slice = self.context_positions[:n_tok]

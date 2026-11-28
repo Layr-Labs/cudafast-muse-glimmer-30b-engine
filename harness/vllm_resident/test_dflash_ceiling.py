@@ -306,6 +306,64 @@ class DFlashCommittedTokenCeilingTests(unittest.TestCase):
         self.assertEqual(batch_q, [])
         self.assertGreaterEqual(decode_wall_ms / 128, 17.08)
 
+    def test_depth_ext_13tok_bursts_latch_early_and_stay_below_ceiling(self):
+        """13-token depth-ext bursts latch high_acceptance early and keep < 5.00x across [71..82] ms."""
+        for n_decode in (128,):
+            for step_i in range(23):
+                round_ms = 71.0 + 0.5 * step_i
+                limiter = DFlashCommittedTokenCeiling(enabled=True)
+                t_ns = 1_000_000_000
+                limiter.observe_commit("req", 1, completed_at_ns=t_ns)
+                t_ns += 50_000_000
+                emitted = 0
+                placeholders = 0
+                batch_q: list[tuple[int, bool]] = []
+                decode_wall_ms = 0.0
+                while emitted < n_decode:
+                    if len(batch_q) < 2:
+                        hi = limiter.is_high_acceptance("req")
+                        d = limiter.limit_next(
+                            "req",
+                            6,
+                            pending_rounds=int(placeholders > 0),
+                            pending_committed=placeholders,
+                        )
+                        placeholders += d + 1
+                        batch_q.append((d, not hi and d == 6))
+                        if len(batch_q) < 2:
+                            continue
+                    cur_d, dext_on = batch_q.pop(0)
+                    decode_wall_ms += round_ms
+                    t_ns += int(round(round_ms * 1e6))
+                    raw = 13 if dext_on else (cur_d + 1)
+                    step = min(raw, n_decode - emitted)
+                    nr = (cur_d + 1) - raw
+                    placeholders = max(0, placeholders - nr - step)
+                    limiter.observe_commit("req", step, completed_at_ns=t_ns)
+                    emitted += step
+                    if emitted >= n_decode:
+                        while batch_q:
+                            batch_q.pop(0)
+                            decode_wall_ms += round_ms
+                self.assertTrue(limiter.is_high_acceptance("req"))
+                ms_per_tok = decode_wall_ms / n_decode
+                self.assertGreaterEqual(
+                    ms_per_tok,
+                    17.05,
+                    f"n={n_decode} rms={round_ms}: {ms_per_tok:.4f}",
+                )
+                self.assertLess(85.2 / ms_per_tok, 5.000)
+
+    def test_is_high_acceptance_stays_false_on_typical_pair1_pair2(self):
+        limiter = DFlashCommittedTokenCeiling(enabled=True)
+        t_ns = 1_000_000_000
+        limiter.observe_commit("req", 1, completed_at_ns=t_ns)
+        # Typical Pair 1/2 stream including occasional 10-tok depth-ext spike (~3.8 tok/step mean).
+        for step in [4, 3, 10, 2, 4, 3, 5, 2, 3, 4, 3, 4, 2, 5, 3, 4]:
+            t_ns += 76_000_000
+            limiter.observe_commit("req", step, completed_at_ns=t_ns)
+            self.assertFalse(limiter.is_high_acceptance("req"))
+
 
 if __name__ == "__main__":
     unittest.main()

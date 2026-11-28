@@ -94,7 +94,20 @@ try:
 except ValueError:
     _TREE_K_RAW = 8
 TREE_K = 8 if _TREE_K_RAW >= 8 else 6
-TREE_TOP_LEN = 6 * TREE_K
+P1_DEXT_ENABLED = os.environ.get("MUSE_DFLASH_P1_DEXT", "1").strip() not in ("0", "", "false", "no")
+DEXT_MAX_NS = max(7, min(13, int(os.environ.get("MUSE_DFLASH_DEXT_MAX_NS", "13"))))
+
+
+def p1_dext_enabled() -> bool:
+    return bool(ENABLED and P1_DEXT_ENABLED and DEXT_MAX_NS > 7 and TREE_M >= 16)
+
+
+def dext_possible() -> bool:
+    return p1_dext_enabled()
+
+
+TREE_ROWS = 12 if p1_dext_enabled() else 6
+TREE_TOP_LEN = TREE_ROWS * TREE_K
 HIST_CAP = 16384
 TR_LOG_CAP = 4096
 _ST_RAW = os.environ.get("MUSE_NATIVE_LEAF_SELFTEST", "0").strip().lower()
@@ -108,6 +121,7 @@ class _NativeLeafState:
         self.m8_ready: bool = False
         self.tree_m_ready: int = 0
         self.tree_wide_m_ready: int = 0
+        self.ceiling_high_acc: bool = False
         self.vocab_size: int = 202048
         self.device: torch.device | None = None
         self.leaf_flag: torch.Tensor | None = None          # int32[97] shared with muse_gqa16_attn
@@ -168,6 +182,19 @@ class _NativeLeafState:
 _S = _NativeLeafState()
 
 
+def set_ceiling_high_acc(high_acc: bool) -> None:
+    _S.ceiling_high_acc = bool(high_acc)
+
+
+def dext_active() -> bool:
+    return bool(
+        dext_possible()
+        and _S.ready
+        and _S.tree_m_ready >= 16
+        and not _S.ceiling_high_acc
+    )
+
+
 def register_draft_tail_bufs(
     in_static_vocab: torch.Tensor | None,
     tail_ids: torch.Tensor | None,
@@ -225,6 +252,8 @@ def _dump_stats(tag: str) -> None:
                     f" casc[ev={st[40]} br={st[41]} dn={st[42]} "
                     f"pl={st[43]} hit={st[44]} ex={st[45]} dn_chg/hit={st[46]}/{st[47]}]"
                 )
+            if len(st) >= 50 and st[48] > 0:
+                pl_extra += f" dext_hits/toks={st[48]}/{st[49]}"
             logger.info(
                 "native_leaf_stats[%s]: steps=%d active=%d hits=%d deep_hits=%d extra_toks=%d deep_bonus=%d "
                 "total_ns=%d max_len=%d len1..6=%s k1..6=%s slots0..8=%s reached_d2/3/4+=%d/%d/%d%s",
@@ -273,7 +302,7 @@ def select_verify_m(req_id: str | None, decoded_tokens: int) -> int:
     if TREE_WIDE_GATE == "sm":
         if _S._host_rounds == 0 or _S.tree_vals is None or _S.tree_vals.numel() < 36:
             return wide_m
-        _tk = max(6, int(_S.tree_vals.numel()) // 6)
+        _tk = TREE_K
         sm_val = float((_S.tree_vals[0 : 6 * _tk : _tk] - _S.tree_vals[1 : 6 * _tk : _tk]).mean().item())
         return wide_m if sm_val < TREE_WIDE_SM else base_m
     # Default zero-sync `cpc` gate: start on fast M=16 for the first TREE_WIDE_MIN_ROUNDS steps,
@@ -810,6 +839,8 @@ def launch_setup_tree_only(
     input_ids: torch.Tensor,
     positions: torch.Tensor,
     verify_m: int,
+    dext_enabled: bool = False,
+    max_ns: int = DEXT_MAX_NS,
 ) -> bool:
     """Capture-safe pure GPU launch of native_leaf_setup_tree for verify_m (16 or 32)."""
     if not _S.ready or verify_m <= 8:
@@ -819,6 +850,8 @@ def launch_setup_tree_only(
         return False
     tr_log_arg = _S.tr_log if TR_ENABLED else None
     tr_state_arg = _S.tr_state if TR_ENABLED else None
+    eff_dext = bool(dext_enabled and verify_m >= 16 and max_ns > 7)
+    eff_max_ns = max_ns if eff_dext else 7
     bfx.native_leaf_setup_tree(
         _S.leaf_flag,
         _S.tree_top,
@@ -850,6 +883,8 @@ def launch_setup_tree_only(
         _S.cascade_meta,
         _S.cascade_toks,
         _S.cascade_vals,
+        eff_dext,
+        eff_max_ns,
     )
     return True
 
@@ -862,6 +897,8 @@ def setup_step(
     slot_mappings: torch.Tensor,
     m8_mode: bool = False,
     verify_m: int | None = None,
+    dext_enabled: bool | None = None,
+    max_ns: int = DEXT_MAX_NS,
 ) -> bool:
     """Zero-sync GPU setup for a bs=1, depth=6 verify step (tree M=12/16, M=8 zero-clamp, or legacy M=7)."""
     if not _S.ready:
@@ -917,6 +954,8 @@ def setup_step(
         )
         tr_log_arg = _S.tr_log if TR_ENABLED else None
         tr_state_arg = _S.tr_state if TR_ENABLED else None
+        eff_dext = dext_active() if dext_enabled is None else bool(dext_enabled and eff_m >= 16 and max_ns > 7)
+        eff_max_ns = max_ns if eff_dext else 7
         try:
             bfx.native_leaf_setup_tree(
                 _S.leaf_flag,
@@ -949,6 +988,8 @@ def setup_step(
                 _S.cascade_meta,
                 _S.cascade_toks,
                 _S.cascade_vals,
+                eff_dext,
+                eff_max_ns,
             )
         except TypeError:
             try:
@@ -1066,6 +1107,10 @@ def _emit_tree_commit_ops(
     eff_m: int,
     chain_all_valid: bool,
     cond_graph: torch.cuda.CUDAGraph | None = None,
+    target_input_ids: torch.Tensor | None = None,
+    target_positions: torch.Tensor | None = None,
+    dext_enabled: bool = False,
+    max_ns: int = DEXT_MAX_NS,
 ) -> None:
     src_row = eff_m - 1
     tr_log_arg = _S.tr_log if TR_ENABLED else None
@@ -1075,6 +1120,8 @@ def _emit_tree_commit_ops(
     t_cnt_arg = _S.tail_count if OOV_PREADMIT else None
     t_seen_arg = _S.tail_seen if OOV_PREADMIT else None
     hit_cond_arg = _S.hit_cond if cond_graph is not None else None
+    eff_dext = bool(dext_enabled and eff_m >= 16 and sampled_tokens.numel() >= max_ns and max_ns > 7)
+    eff_max_ns = max_ns if eff_dext else 7
     try:
         bfx.native_leaf_commit_tree(
             _S.leaf_flag,
@@ -1106,6 +1153,10 @@ def _emit_tree_commit_ops(
             t_cnt_arg,
             t_seen_arg,
             hit_cond_arg,
+            target_input_ids if eff_dext else None,
+            target_positions if eff_dext else None,
+            eff_dext,
+            eff_max_ns,
         )
     except TypeError:
         if cond_graph is not None:
@@ -1176,6 +1227,10 @@ def get_or_capture_commit_fix_graph(
     verify_m: int = 16,
     chain_all_valid: bool = True,
     plain_for_child: bool = False,
+    target_input_ids: torch.Tensor | None = None,
+    target_positions: torch.Tensor | None = None,
+    dext_enabled: bool = False,
+    max_ns: int = DEXT_MAX_NS,
 ) -> torch.cuda.CUDAGraph | None:
     """Capture or return cached CUDA graph for tree commit_and_fix."""
     if not _S.ready or verify_m <= 8 or torch.cuda.is_current_stream_capturing():
@@ -1193,15 +1248,20 @@ def get_or_capture_commit_fix_graph(
         and hasattr(torch.cuda.CUDAGraph, "begin_capture_to_if_node")
         and hasattr(torch.cuda.CUDAGraph, "end_capture_to_conditional_node")
     )
+    eff_dext = bool(dext_enabled and verify_m >= 16 and sampled_tokens.numel() >= max_ns and max_ns > 7)
     sig = (
         int(verify_m),
         int(chain_all_valid),
         int(use_if),
+        int(eff_dext),
+        int(max_ns if eff_dext else 7),
         sampled_tokens.data_ptr(),
         num_sampled.data_ptr(),
         num_rejected.data_ptr(),
         leaf_u_tok.data_ptr(),
         slot_mappings.data_ptr() if slot_mappings is not None else 0,
+        target_input_ids.data_ptr() if (eff_dext and target_input_ids is not None) else 0,
+        target_positions.data_ptr() if (eff_dext and target_positions is not None) else 0,
         hid_sig,
     )
     g = _S._cf_cg_cache.get(sig)
@@ -1234,6 +1294,10 @@ def get_or_capture_commit_fix_graph(
                     verify_m,
                     chain_all_valid,
                     cond_graph=g if use_if else None,
+                    target_input_ids=target_input_ids if eff_dext else None,
+                    target_positions=target_positions if eff_dext else None,
+                    dext_enabled=eff_dext,
+                    max_ns=max_ns if eff_dext else 7,
                 )
         main_st.wait_stream(cap_st)
         if os.environ.get("VLLM_CUDAGRAPH_UPLOAD", "1") != "0" and hasattr(g, "raw_cuda_graph_exec"):
@@ -1262,6 +1326,10 @@ def commit_and_fix(
     m8_mode: bool = False,
     verify_m: int | None = None,
     chain_all_valid: bool = False,
+    target_input_ids: torch.Tensor | None = None,
+    target_positions: torch.Tensor | None = None,
+    dext_enabled: bool = False,
+    max_ns: int = DEXT_MAX_NS,
 ) -> None:
     """Commit leaf hit/clamp and fix hidden/aux states + all 52 target KV layers in 3 tiny launches."""
     if not _S.ready:
@@ -1284,6 +1352,8 @@ def commit_and_fix(
 
     eff_m = verify_m if verify_m is not None else (8 if m8_mode else 7)
     is_tree = eff_m > 8
+    eff_dext = bool(dext_enabled and eff_m >= 16 and sampled_tokens.numel() >= max_ns and max_ns > 7)
+    eff_max_ns = max_ns if eff_dext else 7
     if (
         is_tree
         and os.environ.get("MUSE_LEAF_COND_FIX", "1") != "0"
@@ -1301,6 +1371,10 @@ def commit_and_fix(
             verify_m=eff_m,
             chain_all_valid=chain_all_valid,
             plain_for_child=False,
+            target_input_ids=target_input_ids if eff_dext else None,
+            target_positions=target_positions if eff_dext else None,
+            dext_enabled=eff_dext,
+            max_ns=eff_max_ns,
         )
         if cf_g is not None:
             cf_g.replay()
@@ -1355,6 +1429,11 @@ def commit_and_fix(
                 t_ids_arg,
                 t_cnt_arg,
                 t_seen_arg,
+                None,
+                target_input_ids if eff_dext else None,
+                target_positions if eff_dext else None,
+                eff_dext,
+                eff_max_ns,
             )
         except TypeError:
             try:

@@ -159,11 +159,16 @@ class PreRecordedAsyncOutput(AsyncModelRunnerOutput):
 
     def get_output(self) -> ModelRunnerOutput:
         wait_for_output(self.copy_event, self.forward_done)
-        ns = int(self.host_row_np[7])
+        if self.host_row_np.shape[0] >= 16:
+            ns = int(self.host_row_np[15])
+            max_ns = 13
+        else:
+            ns = int(self.host_row_np[7])
+            max_ns = 7
         if ns < 0:
             ns = 0
-        elif ns > 7:
-            ns = 7
+        elif ns > max_ns:
+            ns = max_ns
         self.model_runner_output.sampled_token_ids = [
             self.host_row_np[:ns].tolist()
         ]

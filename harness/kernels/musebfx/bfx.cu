@@ -167,7 +167,8 @@ void dflash_prepare_inputs(
     c10::optional<torch::Tensor> post_num_computed_tokens = c10::nullopt,
     c10::optional<torch::Tensor> post_all_token_ids = c10::nullopt,
     c10::optional<torch::Tensor> post_total_len = c10::nullopt,
-    c10::optional<torch::Tensor> post_output_bin_counts = c10::nullopt);
+    c10::optional<torch::Tensor> post_output_bin_counts = c10::nullopt,
+    int64_t ctx_buf_len = 0);
 void draft_vocab_update_tail(
     torch::Tensor input_ids, torch::Tensor positions, torch::Tensor in_static_vocab,
     torch::Tensor tail_ids, torch::Tensor tail_count, torch::Tensor tail_seen,
@@ -237,7 +238,9 @@ void native_leaf_setup_tree(
     int64_t vocab_size = 202048,
     c10::optional<torch::Tensor> cascade_meta = c10::nullopt,
     c10::optional<torch::Tensor> cascade_toks = c10::nullopt,
-    c10::optional<torch::Tensor> cascade_vals = c10::nullopt);
+    c10::optional<torch::Tensor> cascade_vals = c10::nullopt,
+    bool dext_enabled = false,
+    int64_t max_ns = 7);
 void native_leaf_commit_tree(
     torch::Tensor leaf_flag, torch::Tensor prev_ns,
     torch::Tensor hit_flag, torch::Tensor hit_src_row,
@@ -261,7 +264,11 @@ void native_leaf_commit_tree(
     c10::optional<torch::Tensor> tail_ids = c10::nullopt,
     c10::optional<torch::Tensor> tail_count = c10::nullopt,
     c10::optional<torch::Tensor> tail_seen = c10::nullopt,
-    c10::optional<torch::Tensor> hit_cond = c10::nullopt);
+    c10::optional<torch::Tensor> hit_cond = c10::nullopt,
+    c10::optional<torch::Tensor> target_input_ids = c10::nullopt,
+    c10::optional<torch::Tensor> target_positions = c10::nullopt,
+    bool dext_enabled = false,
+    int64_t max_ns = 7);
 void cuda_graph_upload(int64_t raw_exec_ptr);
 void native_leaf_set_compound_l2pf_ranges(
     int64_t fc_ptr, int64_t fc_span,
@@ -418,7 +425,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("post_num_computed_tokens") = c10::nullopt,
         pybind11::arg("post_all_token_ids") = c10::nullopt,
         pybind11::arg("post_total_len") = c10::nullopt,
-        pybind11::arg("post_output_bin_counts") = c10::nullopt);
+        pybind11::arg("post_output_bin_counts") = c10::nullopt,
+        pybind11::arg("ctx_buf_len") = 0);
   m.def("draft_vocab_update_tail", &draft_vocab_update_tail,
         pybind11::arg("input_ids"), pybind11::arg("positions"), pybind11::arg("in_static_vocab"),
         pybind11::arg("tail_ids"), pybind11::arg("tail_count"), pybind11::arg("tail_seen"),
@@ -488,7 +496,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("vocab_size") = 202048,
         pybind11::arg("cascade_meta") = c10::nullopt,
         pybind11::arg("cascade_toks") = c10::nullopt,
-        pybind11::arg("cascade_vals") = c10::nullopt);
+        pybind11::arg("cascade_vals") = c10::nullopt,
+        pybind11::arg("dext_enabled") = false,
+        pybind11::arg("max_ns") = 7);
   m.def("native_leaf_commit_tree", &native_leaf_commit_tree,
         pybind11::arg("leaf_flag"), pybind11::arg("prev_ns"),
         pybind11::arg("hit_flag"), pybind11::arg("hit_src_row"),
@@ -512,7 +522,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("tail_ids") = c10::nullopt,
         pybind11::arg("tail_count") = c10::nullopt,
         pybind11::arg("tail_seen") = c10::nullopt,
-        pybind11::arg("hit_cond") = c10::nullopt);
+        pybind11::arg("hit_cond") = c10::nullopt,
+        pybind11::arg("target_input_ids") = c10::nullopt,
+        pybind11::arg("target_positions") = c10::nullopt,
+        pybind11::arg("dext_enabled") = false,
+        pybind11::arg("max_ns") = 7);
   m.def("cuda_graph_upload", &cuda_graph_upload, pybind11::arg("raw_exec_ptr"));
   m.def("native_leaf_set_compound_l2pf_ranges", &native_leaf_set_compound_l2pf_ranges,
         pybind11::arg("fc_ptr") = 0, pybind11::arg("fc_span") = 0,

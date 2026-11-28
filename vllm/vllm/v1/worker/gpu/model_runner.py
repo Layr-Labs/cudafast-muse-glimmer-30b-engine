@@ -1954,7 +1954,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                 lm_head, lut, org_vocab, lmpost_argmax, mult, cap
                             )
                         if getattr(lm_head, "marlin_decode6_lmpost_m_admitted", False):
-                            out_cols = self.rejection_sampler.num_speculative_steps + 1
+                            leaf_dext = bool(
+                                extra_leaf and getattr(self, "_leaf_dext_step", False)
+                            )
+                            out_cols = (
+                                min(_native_leaf.DEXT_MAX_NS, leaf_verify_m)
+                                if leaf_dext
+                                else (self.rejection_sampler.num_speculative_steps + 1)
+                            )
                             buf_cols = max(out_cols, leaf_verify_m) if extra_leaf else out_cols
                             logits_idx_arg = None if can_verify_slice else input_batch.logits_indices
                             cg_res = self._try_verify_lmpost_graph(
@@ -2556,6 +2563,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or self.model_state.num_new_sampled_tokens_per_step != 1
             or scheduler_output.scheduled_encoder_inputs
             or scheduler_output.has_structured_output_requests
+            or (
+                _native_leaf.dext_possible()
+                and bool(getattr(scheduler_output, "dflash_high_acc", False))
+            )
             or not _native_leaf._S.ready
             or _native_leaf._S.tree_m_ready != 16
             or _native_leaf._S.tree_wide_m_ready != 32
@@ -2569,11 +2580,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         pref_len = int(self.req_states.prefill_len.np[req_idx])
         num_comp_pref = int(self.req_states.num_computed_prefill_tokens[req_idx])
         _emit_tgt = getattr(self, "_spec_emit_target_len", None)
+        _d1_fix = envs.os.environ.get("MUSE_D1_REM_FIX", "1") != "0"
         if (
             num_comp_pref < pref_len
             or num_comp < pref_len
             or num_comp + 32 > self.max_model_len
-            or (_emit_tgt is not None and num_comp + 7 >= int(_emit_tgt))
+            or (not _d1_fix and _emit_tgt is not None and num_comp + 7 >= int(_emit_tgt))
         ):
             return False
         idx_mapping_np = np.array([req_idx], dtype=np.int32)
@@ -2713,6 +2725,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     lut = _lmp._get_lut(self.device, float(self.model.output_multiplier), self.model.final_logit_softcapping)
                     self._cached_lmp_lut = lut
 
+                _use_dext = _native_leaf.dext_possible()
+                _max_ns = _native_leaf.DEXT_MAX_NS if _use_dext else 7
                 s_bufs = [torch.full((1, 32), -1, dtype=torch.int64, device=self.device) for _ in range(4)]
                 n_ss = [torch.empty((1,), dtype=torch.int32, device=self.device) for _ in range(4)]
                 n_rs = [torch.empty((1,), dtype=torch.int32, device=self.device) for _ in range(4)]
@@ -2747,6 +2761,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                 self.input_buffers.input_ids[:m_rows],
                                 self.input_buffers.positions[:m_rows],
                                 m_rows,
+                                dext_enabled=_use_dext,
+                                max_ns=_max_ns,
                             ):
                                 raise RuntimeError(f"launch_setup_tree_only(M={m_rows}) refused")
                             self.model_state.preprocess_state(
@@ -2790,7 +2806,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     slots_m = self.block_tables.slot_mappings[:, :m_rows]
                     for slot in range(4):
                         g_cf = _native_leaf.get_or_capture_commit_fix_graph(
-                            s_bufs[slot][:, :7],
+                            s_bufs[slot][:, :_max_ns],
                             n_ss[slot],
                             n_rs[slot],
                             s_bufs[slot][0, 7:m_rows],
@@ -2801,6 +2817,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             verify_m=m_rows,
                             chain_all_valid=True,
                             plain_for_child=True,
+                            target_input_ids=self.input_buffers.input_ids if _use_dext else None,
+                            target_positions=self.input_buffers.positions if _use_dext else None,
+                            dext_enabled=_use_dext,
+                            max_ns=_max_ns,
                         )
                         if g_cf is None:
                             raise RuntimeError(f"commit_fix graph(M={m_rows}, slot={slot}) refused")
@@ -2850,6 +2870,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 return False
 
+        _use_dext = _native_leaf.dext_possible()
+        _max_ns = _native_leaf.DEXT_MAX_NS if _use_dext else 7
         exec_ids, s_bufs, n_ss, n_rs, pre_graphs, lmp_graphs, cf_graphs, _bfx, _offloader = entry
         idx_mapping = self._req_idx_views[req_idx]
         cu_num_logits_np, cu_num_logits, expanded_idx_mapping, expanded_local_pos = spec_meta
@@ -2869,16 +2891,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc=self._qsl_const_gpu[7][:2],
             query_start_loc_np=self._qsl_7_np,
             seq_lens=self.input_buffers.seq_lens[:1],
-            seq_lens_cpu_upper_bound=torch.from_numpy(np.array([num_comp + 7], dtype=np.int32)),
+            seq_lens_cpu_upper_bound=torch.from_numpy(np.array([num_comp + _max_ns], dtype=np.int32)),
             dcp_local_seq_lens=None,
             num_computed_tokens_np=np.array([num_comp], dtype=np.int32),
             prefill_len_np=np.array([pref_len], dtype=np.int32),
             num_computed_prefill_tokens_np=np.array([num_comp_pref], dtype=np.int32),
             is_prefilling_np=self._false_1_np,
             max_seq_len_np=None,
-            input_ids=self.input_buffers.input_ids[:7],
-            positions=self.input_buffers.positions[:7],
-            is_padding=self.input_buffers.is_padding[:7],
+            input_ids=self.input_buffers.input_ids[:_max_ns],
+            positions=self.input_buffers.positions[:_max_ns],
+            is_padding=self.input_buffers.is_padding[:_max_ns],
             logits_indices=self._logits_indices_7_gpu,
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
@@ -2886,9 +2908,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_lens=None,
         )
         assert self.cudagraph_manager.hidden_states is not None
-        h7 = self.cudagraph_manager.hidden_states[:7]
+        h7 = self.cudagraph_manager.hidden_states[:_max_ns]
         aux7 = (
-            [x[:7] for x in self.cudagraph_manager.aux_hidden_states]
+            [x[:_max_ns] for x in self.cudagraph_manager.aux_hidden_states]
             if self.use_aux_hidden_state_outputs
             else None
         )
@@ -2913,14 +2935,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.speculator.draft_tokens.data_ptr() == self.req_states.draft_tokens.data_ptr()
         ):
             child_diamond = (
-                self.speculator.get_decode_compound_diamond_graphs(aux7, 7)
+                self.speculator.get_decode_compound_diamond_graphs(aux7, _max_ns)
                 if hasattr(self.speculator, "get_decode_compound_diamond_graphs")
                 else None
             )
             child_pair = (
                 None
                 if child_diamond is not None
-                else self.speculator.get_decode_compound_child_graphs(aux7, 7)
+                else self.speculator.get_decode_compound_child_graphs(aux7, _max_ns)
             )
             if child_diamond is not None or child_pair is not None:
                 try:
@@ -2961,7 +2983,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                     full16_c = int(self.cudagraph_manager.graphs[desc16_c].raw_cuda_graph())
                     full32_c = int(self.cudagraph_manager.graphs[desc32_c].raw_cuda_graph())
-                    host_ring = torch.zeros((4, 8), dtype=torch.int64, pin_memory=True)
+                    host_ring = torch.zeros((4, 16 if _use_dext else 8), dtype=torch.int64, pin_memory=True)
                     host_ring_np = host_ring.numpy()
                     main_st = torch.cuda.current_stream(self.device)
                     copy_events = [torch.cuda.Event(blocking=True) for _ in range(4)]
@@ -2988,7 +3010,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                 if not _fuse_post:
                                     self.postprocess_sampled(
                                         idx_mapping,
-                                        s_bufs[s_idx][:, :7],
+                                        s_bufs[s_idx][:, :_max_ns],
                                         n_ss[s_idx],
                                         n_rs[s_idx],
                                         self._qsl_const_gpu[7][:2],
@@ -3001,11 +3023,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                     self.req_states.next_prefill_tokens,
                                     self.sampler.sampling_states.temperature.gpu,
                                     self.sampler.sampling_states.seeds.gpu,
-                                    post_sampled_tokens=s_bufs[s_idx][:, :7] if _fuse_post else None,
+                                    post_sampled_tokens=s_bufs[s_idx][:, :_max_ns] if _fuse_post else None,
                                     post_num_computed_tokens=self.req_states.num_computed_tokens.gpu if _fuse_post else None,
                                     post_all_token_ids=self.req_states.all_token_ids.gpu if _fuse_post else None,
                                     post_total_len=self.req_states.total_len.gpu if _fuse_post else None,
                                     post_output_bin_counts=_out_bin_cnt if _fuse_post else None,
+                                    ctx_buf_len=_max_ns if _use_dext else 0,
                                 ):
                                     raise RuntimeError("emit_cpp_prep_for_capture refused")
                             post_prep_graphs.append(g_pp)
@@ -3046,7 +3069,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             m16_v,
                             m32_v,
                             tail_v,
-                            s_bufs[s_idx][:, :7],
+                            s_bufs[s_idx][:, :_max_ns],
                             n_ss[s_idx],
                             host_ring[s_idx],
                             int(copy_events[s_idx].cuda_event),
@@ -3070,8 +3093,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                     comp_entries[req_idx] = comp_entry
                     logger.info(
-                        "Armed single-launch %s M=16/M=32 verify + UVA out + DFlash step graph (4-slot ring)",
+                        "Armed single-launch %s M=16/M=32 verify + UVA out + DFlash step graph (4-slot ring, max_ns=%d)",
                         "diamond-fc+l2pf compound" if child_diamond is not None else "full compound",
+                        _max_ns,
                     )
                 except Exception as exc:  # noqa: BLE001
                     self._compound_step_disabled = True
@@ -3088,6 +3112,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         _offloader.sync_prev_onload()
         self._leaf_step = False
         self._leaf_verify_m = 7
+        self._leaf_dext_step = False
         self._leaf_u_tok = None
         self._leaf_chain_all_valid = False
         self._leaf_slot_mappings = None
@@ -3099,7 +3124,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             _bfx.dflash_cascade_launch_cond_graph(exec_ids[slot])
             self._compound_pending = None
-            self._adapt_verify_pending_out = (s_bufs[slot][:, :7], n_ss[slot], n_rs[slot])
+            self._adapt_verify_pending_out = (s_bufs[slot][:, :_max_ns], n_ss[slot], n_rs[slot])
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=None,
@@ -3308,6 +3333,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and _leaf_req_id is not None
             and _leaf_req_id in _fin_reqs
         )
+        _dflash_high_acc = bool(getattr(scheduler_output, "dflash_high_acc", False))
+        self._dflash_high_acc = _dflash_high_acc
+        _native_leaf.set_ceiling_high_acc(_dflash_high_acc)
         _leaf_decoded = (
             int(self.req_states.num_computed_tokens_np[_leaf_req_idx])
             - int(self.req_states.prefill_len.np[_leaf_req_idx])
@@ -3329,10 +3357,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             _rem_toks = int(_emit_tgt) - int(
                 self.req_states.num_computed_tokens_np[_leaf_req_idx]
             )
-            if _rem_toks <= 1:
-                _target_leaf_m = 7
-            elif _rem_toks <= 6 and _target_leaf_m > 16:
-                _target_leaf_m = 16
+            if envs.os.environ.get("MUSE_D1_REM_FIX", "1") != "0":
+                if _rem_toks <= -5:
+                    _target_leaf_m = 7
+            else:
+                if _rem_toks <= 1:
+                    _target_leaf_m = 7
+                elif _rem_toks <= 6 and _target_leaf_m > 16:
+                    _target_leaf_m = 16
         _leaf_no_logprobs = (
             self.sampler is not None
             and _leaf_req_idx is not None
@@ -3440,6 +3472,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self._leaf_step = False
         self._leaf_verify_m = 7
+        self._leaf_dext_step = False
         self._leaf_u_tok = None
         self._leaf_chain_all_valid = False
         self._leaf_slot_mappings = None
@@ -3485,14 +3518,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         + (_target_leaf_m - 7),
                     )
                     block_tables, slot_mappings = self.prepare_attn(fwd_batch)
+                _step_dext = bool(
+                    _native_leaf.dext_active() and _target_leaf_m >= 16
+                )
                 self._leaf_step = _native_leaf.setup_step(
                     input_batch.req_ids[0],
                     input_batch.input_ids,
                     input_batch.positions,
                     slot_mappings,
                     verify_m=_target_leaf_m,
+                    dext_enabled=_step_dext,
+                    max_ns=_native_leaf.DEXT_MAX_NS,
                 )
                 self._leaf_verify_m = _target_leaf_m
+                self._leaf_dext_step = bool(self._leaf_step and _step_dext)
                 if self._leaf_step:
                     self._leaf_slot_mappings = slot_mappings
             else:
@@ -4037,10 +4076,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         _adapt_out = getattr(self, "_adapt_verify_pending_out", None)
         self._adapt_verify_pending_out = None
         _emit_tgt_end = getattr(self, "_spec_emit_target_len", None)
+        _final_off = -5 if envs.os.environ.get("MUSE_D1_REM_FIX", "1") != "0" else 1
         _is_final_spec_step = (
             _emit_tgt_end is not None
             and input_batch.num_reqs == 1
-            and int(self.req_states.num_computed_tokens_np[input_batch.idx_mapping_np[0]]) + 1
+            and int(self.req_states.num_computed_tokens_np[input_batch.idx_mapping_np[0]]) + _final_off
             >= int(_emit_tgt_end)
         )
         # Speculative verify steps (num_draft_tokens > 0) are decode steps: no
@@ -4067,7 +4107,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states, input_batch, grammar_output, compact_sample=compact_sample
             )
         leaf_verify_m = int(getattr(self, "_leaf_verify_m", 7))
+        leaf_dext_step = bool(getattr(self, "_leaf_dext_step", False))
         self._leaf_verify_m = 7
+        self._leaf_dext_step = False
+        eff_dext = False
         if getattr(self, "_leaf_step", False):
             leaf_u = getattr(self, "_leaf_u_tok", None)
             leaf_chain_all = bool(getattr(self, "_leaf_chain_all_valid", False))
@@ -4077,6 +4120,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._leaf_chain_all_valid = False
             self._leaf_slot_mappings = None
             if leaf_u is not None:
+                eff_dext = bool(
+                    leaf_dext_step
+                    and leaf_verify_m >= 16
+                    and sampler_output.sampled_token_ids.shape[1]
+                    >= _native_leaf.DEXT_MAX_NS
+                )
                 extra_h = None
                 if hasattr(self.model, "get_mtp_target_hidden_states"):
                     pre_hc = self.model.get_mtp_target_hidden_states()
@@ -4093,15 +4142,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     extra_hidden=extra_h,
                     verify_m=leaf_verify_m,
                     chain_all_valid=leaf_chain_all,
+                    target_input_ids=self.input_buffers.input_ids if eff_dext else None,
+                    target_positions=self.input_buffers.positions if eff_dext else None,
+                    dext_enabled=eff_dext,
+                    max_ns=_native_leaf.DEXT_MAX_NS,
                 )
             else:
                 _native_leaf.on_non_leaf_step(None, 0)
-        if leaf_verify_m > 7:
-            if hidden_states is not None and hidden_states.shape[0] > 7:
-                hidden_states = hidden_states[:7]
+        keep_ctx_rows = _native_leaf.DEXT_MAX_NS if (eff_dext or (_adapt_out is not None and _native_leaf.dext_possible())) else 7
+        if leaf_verify_m > keep_ctx_rows:
+            if hidden_states is not None and hidden_states.shape[0] > keep_ctx_rows:
+                hidden_states = hidden_states[:keep_ctx_rows]
             if aux_hidden_states is not None:
                 aux_hidden_states = [
-                    h[:7] if h.shape[0] > 7 else h for h in aux_hidden_states
+                    h[:keep_ctx_rows] if h.shape[0] > keep_ctx_rows else h
+                    for h in aux_hidden_states
                 ]
 
         if self.pp_handler is not None:
@@ -4198,8 +4253,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if hasattr(self.model, "get_mtp_target_hidden_states"):
                     pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                     spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+                propose_kwargs: dict[str, Any] = {"mm_inputs": mm_inputs}
+                propose_batch = input_batch
+                if keep_ctx_rows > 7:
+                    from dataclasses import replace as _dc_replace
+
+                    propose_kwargs["ctx_buf_len"] = keep_ctx_rows
+                    propose_batch = _dc_replace(
+                        input_batch,
+                        input_ids=self.input_buffers.input_ids[:keep_ctx_rows],
+                        positions=self.input_buffers.positions[:keep_ctx_rows],
+                    )
                 draft_tokens = self.speculator.propose(
-                    input_batch,
+                    propose_batch,
                     attn_metadata,
                     slot_mappings_by_layer,
                     spec_hidden_states,
@@ -4210,7 +4276,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.req_states.next_prefill_tokens,
                     self.sampler.sampling_states.temperature.gpu,
                     self.sampler.sampling_states.seeds.gpu,
-                    mm_inputs=mm_inputs,
+                    **propose_kwargs,
                 )
                 if (
                     input_batch.num_reqs == 1
