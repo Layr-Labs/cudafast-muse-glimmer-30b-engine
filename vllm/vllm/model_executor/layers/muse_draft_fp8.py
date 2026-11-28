@@ -108,7 +108,7 @@ def _vq4d_mode() -> int:
       7 = hybrid: 5x gate_up H64 + NF3-sym 3.125 bpw (~15.5dB) + 5x down_proj 2.375 bpw (4D-256) (672 MB)
       8 = hybrid: 5x gate_up H64 + NF3-sym 3.125 bpw (~15.5dB) + 5x down_proj 2.625 bpw (4D-512) (702 MB)
     """
-    raw = os.environ.get("MUSE_DRAFT_VQ2375", "8").strip().lower()
+    raw = os.environ.get("MUSE_DRAFT_VQ2375", "7").strip().lower()
     if raw in ("", "0", "off", "false", "none"):
         return 0
     if raw in ("1", "all9", "2375"):

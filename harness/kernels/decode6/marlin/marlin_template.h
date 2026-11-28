@@ -1119,10 +1119,10 @@ __global__ void Marlin(
                 "TMA4 rANS scales require M = 1 decode config (128 or 256 threads)");
   constexpr int kTmaWarps = threads / 32;
   constexpr int RANS_CAP = (fixed_shape == 3) ? 4096 : ((threads == 256) ? 3200 : 2048);
-  // 1D hardware TMA (cp.async.bulk + L2::evict_first) for lm_head multi-M B weights (641 MiB):
-  // restores L2::evict_first where cp.async.cg.L2::cache_hint hit SM121 odd-UR, keeping A (426 KiB)
-  // and lmpost_lut (128 KiB) L2-hot across all 33 tiles/CTA with 0 odd-UR and 1 TMA issue/stage.
-  constexpr bool tma_b = fuse_lmpost && down_ilv && fixed_shape == 3 && multi_m && tma_ovlp;
+  // 1D hardware TMA (cp.async.bulk + L2::evict_first) for lm_head B weights (641 MiB, both M=1 prefill & multi-M decode):
+  // restores L2::evict_first where cp.async.cg.L2::cache_hint hit SM121 odd-UR, keeping A and lmpost_lut L2-hot
+  // across all 33 tiles/CTA with 0 odd-UR and 1 TMA issue/stage.
+  constexpr bool tma_b = down_ilv && fixed_shape == 3 && tma_ovlp && (fuse_lmpost || !multi_m);
   static_assert(!tma_b || (!fuse_mul_sigmoid && b_gl_stride == b_sh_stride && b_sh_wr_iters == 2 &&
                            b_thread_vecs == 1 && stages <= 4),
                 "tma_b requires contiguous 8 KiB down_ilv B stages");
@@ -3273,6 +3273,38 @@ __global__ void Marlin(
   // Main loop.
   while (slice_iters) {
     if constexpr (cont_pipe) {
+#ifdef MUSE_SCALE_TMA4
+      if constexpr (multi_m && down_ilv && kloop_ovlp && b_sh_wr_iters == 2 &&
+                    !has_act_order && !is_a_8bit && !has_zp) {
+        // Single-stage K-loop (no stages-way unroll): cuts M=32 K-loop SASS from 27-46 KiB to
+        // 9-13 KiB (100% SM121 L1 I-cache resident), 0 spills, 0 odd-UR, strict 0-ULP.
+        int pipe = pipe_start;
+        do {
+          fetch_to_registers(1, pipe);
+          fetch_scales_to_registers(1, pipe);
+          const int prev_pipe = (stages == 4) ? ((pipe + 3) & 3)
+                                              : ((pipe == 0) ? (stages - 1) : (pipe - 1));
+          fetch_to_shared(prev_pipe, pipe, total_rem >= stages);
+          matmul(0, pipe);
+          tma_q++;
+          if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
+          const int next_pipe = (stages == 4) ? ((pipe + 1) & 3)
+                                              : ((pipe + 1 == stages) ? 0 : (pipe + 1));
+          wait_for_stage(next_pipe, total_rem > 1);
+          fetch_to_registers(2, next_pipe);
+          fetch_scales_to_registers(2, next_pipe);
+          matmul(1, pipe);
+          pipe = next_pipe;
+          total_rem--;
+          if ((tma_pdl_mode & 2) && total_rem == 8) {
+            asm volatile("griddepcontrol.launch_dependents;");
+          }
+          slice_iters--;
+        } while (slice_iters > 0);
+        pipe_start = pipe;
+      } else
+#endif
+      {
   #pragma unroll
       for (int p = 0; p < stages; p++) {
         if (p < pipe_start) continue;
@@ -3397,6 +3429,7 @@ __global__ void Marlin(
       }
       if (slice_iters != 0) {
         pipe_start = 0;
+      }
       }
     } else {
   #pragma unroll

@@ -74,7 +74,15 @@ _scratch: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}  # dev
 _stashed_qk: tuple | None = None
 _pending_attn: tuple | None = None
 _last_attn_out: torch.Tensor | None = None
-_counts = {"kv_only": 0, "fused0": 0, "fused1": 0, "fused2": 0, "fallback_q": 0, "post_attn0": 0, "post_attn1": 0}
+_dead_xnorm: tuple[torch.Tensor | None, torch.Tensor | None] | None = None
+_L2_DISCARD_V2 = os.environ.get("MUSE_PREFILL_L2_DISCARD_V2", "1") != "0"
+_counts = {"kv_only": 0, "kv_dead": 0, "fused0": 0, "fused1": 0, "fused2": 0, "fallback_q": 0, "post_attn0": 0, "post_attn1": 0}
+
+
+def stash_dead_xnorm(t0: torch.Tensor | None, t1: torch.Tensor | None = None) -> None:
+    global _dead_xnorm
+    if _L2_DISCARD_V2 and DISCARD_L2:
+        _dead_xnorm = (t0, t1)
 
 
 def _get_scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -364,13 +372,39 @@ def run_kv_only_and_stash(
     kv_flat, q_stub, k_stub = _get_scratch(device)
     block_size = int(kv_cache.shape[2])
     stream = torch.cuda.current_stream(device).cuda_stream
-    rc = _lib.muse_prefill_kv_only(
-        qkv.data_ptr(), pos_ptr, cache_ptr,
-        kv_cache.data_ptr(), kv_flat.data_ptr(), slot_mapping.data_ptr(),
-        512, cache_rows, block_size,
-        kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
-        float(eps), int(use_rope), cache_fp32, int(PDL_ENABLED), int(DISCARD_L2), stream,
-    )
+    global _dead_xnorm
+    dx = _dead_xnorm
+    _dead_xnorm = None
+    d0_p = d0_b = d1_p = d1_b = 0
+    if _L2_DISCARD_V2 and DISCARD_L2 and dx is not None:
+        live = (qkv, positions, cos_sin_cache, kv_cache, kv_flat, slot_mapping)
+        t0, t1 = dx
+        if t0 is not None and t0.is_cuda and t0.device == device and t0.is_contiguous():
+            p0, b0 = t0.data_ptr(), t0.numel() * t0.element_size()
+            if b0 >= 128 and _ranges_disjoint(p0, b0, live):
+                d0_p, d0_b = p0, b0
+        if t1 is not None and t1.is_cuda and t1.device == device and t1.is_contiguous():
+            p1, b1 = t1.data_ptr(), t1.numel() * t1.element_size()
+            if b1 >= 128 and _ranges_disjoint(p1, b1, live) and (d0_p == 0 or d0_p + d0_b <= p1 or p1 + b1 <= d0_p):
+                d1_p, d1_b = p1, b1
+    if d0_p or d1_p:
+        rc = _lib.muse_prefill_kv_only_ex(
+            qkv.data_ptr(), pos_ptr, cache_ptr,
+            kv_cache.data_ptr(), kv_flat.data_ptr(), slot_mapping.data_ptr(),
+            512, cache_rows, block_size,
+            kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
+            float(eps), int(use_rope), cache_fp32, int(PDL_ENABLED), int(DISCARD_L2),
+            d0_p, d0_b, d1_p, d1_b, stream,
+        )
+        _counts["kv_dead"] += 1
+    else:
+        rc = _lib.muse_prefill_kv_only(
+            qkv.data_ptr(), pos_ptr, cache_ptr,
+            kv_cache.data_ptr(), kv_flat.data_ptr(), slot_mapping.data_ptr(),
+            512, cache_rows, block_size,
+            kv_cache.stride(0), kv_cache.stride(2), kv_cache.stride(1),
+            float(eps), int(use_rope), cache_fp32, int(PDL_ENABLED), int(DISCARD_L2), stream,
+        )
     if rc != 0:
         raise RuntimeError(f"muse_prefill_kv_only failed with CUDA error {rc}")
     _counts["kv_only"] += 1

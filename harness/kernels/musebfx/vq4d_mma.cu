@@ -766,30 +766,29 @@ __global__ void __launch_bounds__(128) vq4d_rot_a_kernel(
     const __nv_bfloat16* __restrict__ A,
     __nv_bfloat16* __restrict__ A_rot,
     int M, int K, int pdl_mode) {
-  if ((pdl_mode & 1) != 0) {
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-  }
   const int num_kg = K >> 6;
   const int total_grp = M * num_kg;
   const int grp = blockIdx.x * 4 + (threadIdx.x >> 5);
   const int lane = threadIdx.x & 31;
+  const int m = (grp < total_grp) ? (grp / num_kg) : 0;
+  const int kg = (grp < total_grp) ? (grp - m * num_kg) : 0;
+  const int col0 = kg * 64 + 2 * lane;
+  const float rs0 = (grp < total_grp) ? vq4d_rad_sign(col0 + 0) : 0.0f;
+  const float rs1 = (grp < total_grp) ? vq4d_rad_sign(col0 + 1) : 0.0f;
+  if ((pdl_mode & 1) != 0) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
+  if ((pdl_mode & 2) != 0) {
+    asm volatile("griddepcontrol.launch_dependents;");
+  }
   if (grp < total_grp) {
-    const int m = grp / num_kg;
-    const int kg = grp - m * num_kg;
-    const int col0 = kg * 64 + 2 * lane;
     const __nv_bfloat162 raw = *reinterpret_cast<const __nv_bfloat162*>(A + static_cast<size_t>(m) * K + col0);
     const float2 rf = __bfloat1622float2(raw);
-    float v0 = rf.x * vq4d_rad_sign(col0 + 0);
-    float v1 = rf.y * vq4d_rad_sign(col0 + 1);
+    float v0 = rf.x * rs0;
+    float v1 = rf.y * rs1;
     vq4d_warp_fwht64(v0, v1, lane);
     *reinterpret_cast<__nv_bfloat162*>(A_rot + static_cast<size_t>(m) * K + col0) =
         __floats2bfloat162_rn(v0, v1);
-  }
-  if ((pdl_mode & 2) != 0) {
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      asm volatile("griddepcontrol.launch_dependents;");
-    }
   }
 }
 
@@ -1189,13 +1188,13 @@ __global__ void __launch_bounds__(128, 6) vq4d_mma_gemm_n32_pair_kernel(
     asm volatile("cp.async.commit_group;\n" ::: "memory");
   };
 
+  const uint64_t w_pol = kTma ? vq4d_pol_evict_first() : 0ull;
   auto issue_w_tma = [&](int p, int st_w, bool need_fence) {
     if (tid == 0) {
       if (need_fence) {
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
       }
-      const uint64_t pol = vq4d_pol_evict_first();
-      vq4d_tma_bulk_w(smem.w[st_w], w_base + static_cast<size_t>(p) * w_pair_stride, kPairStepWB, &smem.mbar[st_w], pol);
+      vq4d_tma_bulk_w(smem.w[st_w], w_base + static_cast<size_t>(p) * w_pair_stride, kPairStepWB, &smem.mbar[st_w], w_pol);
     }
   };
 
@@ -1431,13 +1430,13 @@ __global__ void __launch_bounds__(128, 6) vq4d_mma_n32_pair_det_sk_kernel(
     asm volatile("cp.async.commit_group;\n" ::: "memory");
   };
 
+  const uint64_t w_pol = kTma ? vq4d_pol_evict_first() : 0ull;
   auto issue_w_tma = [&](int idx, int st_w, bool need_fence) {
     if (tid == 0) {
       if (need_fence) {
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
       }
-      const uint64_t pol = vq4d_pol_evict_first();
-      vq4d_tma_bulk_w(smem.w[st_w], pair_w_ptr(idx), kPairStepWB, &smem.mbar[st_w], pol);
+      vq4d_tma_bulk_w(smem.w[st_w], pair_w_ptr(idx), kPairStepWB, &smem.mbar[st_w], w_pol);
     }
   };
 
@@ -2236,10 +2235,17 @@ static void vq4d_ensure_carveout() {
   static bool init = false;
   if (!init) {
     init = true;
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    cudaThreadExchangeStreamCaptureMode(&mode);
     vq4d_set_carveout_one<9, false>();
     vq4d_set_carveout_one<9, true>();
     vq4d_set_carveout_one<10, false>();
     vq4d_set_carveout_one<10, true>();
+    const char* s = std::getenv("MUSE_DRAFTER_CARVEOUT100");
+    if (!s || !*s || std::atoi(s) != 0) {
+      cudaFuncSetAttribute(vq4d_rot_a_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    }
+    cudaThreadExchangeStreamCaptureMode(&mode);
   }
 }
 
