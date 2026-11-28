@@ -737,20 +737,51 @@ __global__ void __launch_bounds__(256, 2) draft_vocab_tail_argmax_kernel(
     s_cand[tid + 256] = (tid + 256 < num_cands) ? row_cands[tid + 256] : 0ull;
     __syncthreads();
 
+    uint64_t v0 = s_cand[tid];
+    uint64_t v1 = s_cand[tid + 256];
+    bool in_regs = true;
     for (int k = 2; k <= 512; k <<= 1) {
       for (int j = k >> 1; j > 0; j >>= 1) {
-        const int ixj_lo = (tid / j) * (2 * j) + (tid & (j - 1));
-        const int ixj_hi = ixj_lo ^ j;
-        const bool desc = ((ixj_lo & k) == 0);
-        const uint64_t a = s_cand[ixj_lo];
-        const uint64_t b = s_cand[ixj_hi];
-        if (desc ? (a < b) : (a > b)) {
-          s_cand[ixj_lo] = b;
-          s_cand[ixj_hi] = a;
+        if (j < 32) {
+          if (!in_regs) {
+            v0 = s_cand[tid];
+            v1 = s_cand[tid + 256];
+            in_regs = true;
+          }
+          const bool lower = (tid & j) == 0;
+          const bool desc0 = ((tid & k) == 0);
+          const bool desc1 = (((tid + 256) & k) == 0);
+          const uint64_t o0 = __shfl_xor_sync(0xffffffffu, v0, j);
+          const uint64_t o1 = __shfl_xor_sync(0xffffffffu, v1, j);
+          const bool keepmax0 = (lower == desc0);
+          v0 = keepmax0 ? ((v0 >= o0) ? v0 : o0) : ((v0 <= o0) ? v0 : o0);
+          const bool keepmax1 = (lower == desc1);
+          v1 = keepmax1 ? ((v1 >= o1) ? v1 : o1) : ((v1 <= o1) ? v1 : o1);
+        } else {
+          if (in_regs) {
+            s_cand[tid] = v0;
+            s_cand[tid + 256] = v1;
+            in_regs = false;
+            __syncthreads();
+          }
+          const int ixj_lo = (tid / j) * (2 * j) + (tid & (j - 1));
+          const int ixj_hi = ixj_lo ^ j;
+          const bool desc = ((ixj_lo & k) == 0);
+          const uint64_t a = s_cand[ixj_lo];
+          const uint64_t b = s_cand[ixj_hi];
+          if (desc ? (a < b) : (a > b)) {
+            s_cand[ixj_lo] = b;
+            s_cand[ixj_hi] = a;
+          }
+          __syncthreads();
         }
-        __syncthreads();
       }
     }
+    if (in_regs) {
+      s_cand[tid] = v0;
+      s_cand[tid + 256] = v1;
+    }
+    __syncthreads();
 
     const int eff_rescore = (rescore_k < 512) ? rescore_k : 512;
     const int stride_warps = kCtasPerRow * kS2Warps;
