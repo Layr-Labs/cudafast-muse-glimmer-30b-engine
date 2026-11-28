@@ -521,6 +521,8 @@ __device__ __forceinline__ void prefill_qk_half(
   }
 }
 
+constexpr size_t kPrefillAttnPipe4Smem = 65536u;  // 4x16 KiB (k_smem[2] + v_smem[2])
+
 template <int Mode, bool UseRope, bool CacheFP32, bool kPdl, bool kDiscardL2, bool kLutSigmoid = false>
 __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     const __nv_bfloat16* __restrict__ qkv,
@@ -534,7 +536,9 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
     float eps,
     float qscale,
     float scale_log2) {
-  __shared__ __align__(128) uint4 kv_smem[2][64][16];  // 32 KiB static SMEM
+  extern __shared__ __align__(128) uint8_t smem_raw[];
+  uint4 (*k_smem)[64][16] = reinterpret_cast<uint4 (*)[64][16]>(smem_raw);            // 32 KiB: K[0], K[1] (aliases q_tiles / o_tiles)
+  uint4 (*v_smem)[64][16] = reinterpret_cast<uint4 (*)[64][16]>(smem_raw + 32768u);   // 32 KiB: V[0], V[1]
 
   const int lin = static_cast<int>(blockIdx.x);   // 0..127
   const int kv_head = lin & 1;
@@ -557,7 +561,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   // ---------------------------------------------------------------------------
   uint32_t q_frag[8][4];
   {
-    uint4 (*q_tiles)[16][16] = reinterpret_cast<uint4 (*)[16][16]>(kv_smem);
+    uint4 (*q_tiles)[16][16] = reinterpret_cast<uint4 (*)[16][16]>(k_smem);
     float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f, s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
     if constexpr (UseRope) {
       load_rope_cs<true, CacheFP32>(__ldg(positions + q_tok), cache_rows, cos_sin_cache, lane,
@@ -600,7 +604,8 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   __syncthreads();
 
   // ---------------------------------------------------------------------------
-  // 2. Single Unified 2-Buffer 32 KiB SMEM Causal Attention Loop (strict 0-ULP FA2 order)
+  // 2. 4-Slot Pipe-Four 64 KiB SMEM Causal Attention Loop (3 barriers/block vs 7, strict 0-ULP FA2 order)
+  //    k_smem[0..1] holds K[0], K[1]; v_smem[0..1] holds V[0], V[1] with zero QK0/QK1 or PV0/PV1 stalls.
   // ---------------------------------------------------------------------------
   const __nv_bfloat16* const k_flat = kv_flat + static_cast<int64_t>(kv_head) * (2 * 512 * 128);
   const __nv_bfloat16* const v_flat = k_flat + (512 * 128);
@@ -613,8 +618,15 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   float row_max0 = -INFINITY, row_max1 = -INFINITY;
   float row_sum0 = 0.0f, row_sum1 = 0.0f;
 
-  issue_kv64_flat(kv_smem[0], k_flat, (nb_max - 1) << 7, tid);
-  cp_async_commit();
+  // Prime block-0 K[0] (+ K[1] iff !half_only) in one combined cp.async group.
+  {
+    const int nb0_base = (nb_max - 1) << 7;
+    issue_kv64_flat(k_smem[0], k_flat, nb0_base, tid);
+    if (!half_only) {
+      issue_kv64_flat(k_smem[1], k_flat, nb0_base + 64, tid);
+    }
+    cp_async_commit();
+  }
 
   for (int nb = nb_max - 1; nb >= 0; --nb) {
     const int block_tok_base = nb << 7;
@@ -630,35 +642,37 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
       s_frag[ni][0] = 0.0f; s_frag[ni][1] = 0.0f; s_frag[ni][2] = 0.0f; s_frag[ni][3] = 0.0f;
     }
 
-    if (!skip_hi) {
-      issue_kv64_flat(kv_smem[1], k_flat, block_tok_base + 64, tid);
-      cp_async_commit();
-      cp_async_wait<1>();
-    } else {
-      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base, tid);
-      cp_async_commit();
-      cp_async_wait<1>();
-    }
-    __syncthreads();
-    if (lo_pairs < 4) {
-      prefill_qk_half<true>(q_frag, kv_smem[0], s_frag, lane, lo_pairs);
-    } else {
-      prefill_qk_half<false>(q_frag, kv_smem[0], s_frag, lane, 4);
-    }
+    // Barrier #1: K[0] (& K[1]) ready in k_smem[0..1]; v_smem[0..1] from prior PV is now free!
+    cp_async_wait<0>();
     __syncthreads();
 
+    // Issue BOTH V[0] & V[1] ahead of QK^T so V downloads overlap QK0 + QK1 + Softmax.
+    issue_kv64_flat(v_smem[0], v_flat, block_tok_base, tid);
     if (!skip_hi) {
-      issue_kv64_flat(kv_smem[0], v_flat, block_tok_base, tid);
-      cp_async_commit();
-      cp_async_wait<1>();
-      __syncthreads();
+      issue_kv64_flat(v_smem[1], v_flat, block_tok_base + 64, tid);
+    }
+    cp_async_commit();
+
+    // Back-to-back QK^T Half 0 & Half 1 with ZERO intermediate barrier.
+    if (lo_pairs < 4) {
+      prefill_qk_half<true>(q_frag, k_smem[0], s_frag, lane, lo_pairs);
+    } else {
+      prefill_qk_half<false>(q_frag, k_smem[0], s_frag, lane, 4);
+    }
+    if (!skip_hi) {
       if (hi_pairs < 4) {
-        prefill_qk_half<true>(q_frag, kv_smem[1], s_frag + 8, lane, hi_pairs);
+        prefill_qk_half<true>(q_frag, k_smem[1], s_frag + 8, lane, hi_pairs);
       } else {
-        prefill_qk_half<false>(q_frag, kv_smem[1], s_frag + 8, lane, 4);
+        prefill_qk_half<false>(q_frag, k_smem[1], s_frag + 8, lane, 4);
       }
-      __syncthreads();
-      issue_kv64_flat(kv_smem[1], v_flat, block_tok_base + 64, tid);
+    }
+
+    // Barrier #2: k_smem[0..1] is now free; issue next block K[0] & K[1] ahead of Softmax + PV0 + PV1!
+    __syncthreads();
+    if (nb > 0) {
+      const int next_base = (nb - 1) << 7;
+      issue_kv64_flat(k_smem[0], k_flat, next_base, tid);
+      issue_kv64_flat(k_smem[1], k_flat, next_base + 64, tid);
       cp_async_commit();
     }
 
@@ -741,22 +755,22 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
       p_frag[kp][hi + 1] = *reinterpret_cast<const uint32_t*>(&pb1);
     }
 
-    if (skip_hi) {
-      // V0 is in kv_smem[1]; pre-issue next K0 into kv_smem[0] right now!
-      if (nb > 0) {
-        issue_kv64_flat(kv_smem[0], k_flat, (nb - 1) << 7, tid);
-        cp_async_commit();
-        cp_async_wait<1>();
-      } else {
-        cp_async_wait<0>();
-        if constexpr (kPdl) {
-          asm volatile("griddepcontrol.launch_dependents;");
-        }
+    // Barrier #3: BOTH V[0] & V[1] are ready in v_smem[0..1] (next K[0..1] stays in flight if nb > 0).
+    if (nb > 0) {
+      cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
+      if constexpr (kPdl) {
+        asm volatile("griddepcontrol.launch_dependents;");
       }
-      __syncthreads();
-      const int pv_lo_lim = skip_masked_exp ? lo_pairs : 4;
+    }
+    __syncthreads();
+
+    // Back-to-back PV Half 0 (v_smem[0]) & PV Half 1 (v_smem[1]) with ZERO intermediate or tail barrier!
+    {
+      const int pv_lo_lim = (skip_hi && skip_masked_exp) ? lo_pairs : 4;
       uint32_t v_cur[4], v_nxt[4];
-      ldsm4_v_pair64(v_cur, kv_smem[1], 0, 0, lane);
+      ldsm4_v_pair64(v_cur, v_smem[0], 0, 0, lane);
       #pragma unroll
       for (int ks_local = 0; ks_local < 4; ++ks_local) {
         if (ks_local < pv_lo_lim) {
@@ -764,71 +778,38 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
           for (int dp = 0; dp < 8; ++dp) {
             const int n_dp = (dp + 1) & 7;
             const int n_ks = ks_local + (dp == 7 ? 1 : 0);
-            if (n_ks < pv_lo_lim) ldsm4_v_pair64(v_nxt, kv_smem[1], n_dp, n_ks, lane);
+            if (n_ks < pv_lo_lim) ldsm4_v_pair64(v_nxt, v_smem[0], n_dp, n_ks, lane);
             mma_m16n8k16_bf16(p_frag[ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
             mma_m16n8k16_bf16(p_frag[ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
             v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
           }
         }
       }
-      __syncthreads();
-    } else {
-      cp_async_wait<1>();
-      __syncthreads();
-      {
-        uint32_t v_cur[4], v_nxt[4];
-        ldsm4_v_pair64(v_cur, kv_smem[0], 0, 0, lane);
-        #pragma unroll
-        for (int ks_local = 0; ks_local < 4; ++ks_local) {
+    }
+    if (!skip_hi) {
+      const int pv_hi_lim = skip_masked_exp ? hi_pairs : 4;
+      uint32_t v_cur[4], v_nxt[4];
+      ldsm4_v_pair64(v_cur, v_smem[1], 0, 0, lane);
+      #pragma unroll
+      for (int ks_local = 0; ks_local < 4; ++ks_local) {
+        if (ks_local < pv_hi_lim) {
           #pragma unroll
           for (int dp = 0; dp < 8; ++dp) {
             const int n_dp = (dp + 1) & 7;
             const int n_ks = ks_local + (dp == 7 ? 1 : 0);
-            if (n_ks < 4) ldsm4_v_pair64(v_nxt, kv_smem[0], n_dp, n_ks, lane);
-            mma_m16n8k16_bf16(p_frag[ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
-            mma_m16n8k16_bf16(p_frag[ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
+            if (n_ks < pv_hi_lim) ldsm4_v_pair64(v_nxt, v_smem[1], n_dp, n_ks, lane);
+            mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
+            mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
             v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
           }
         }
       }
-      __syncthreads();
-
-      if (nb > 0) {
-        issue_kv64_flat(kv_smem[0], k_flat, (nb - 1) << 7, tid);
-        cp_async_commit();
-        cp_async_wait<1>();
-      } else {
-        cp_async_wait<0>();
-        if constexpr (kPdl) {
-          asm volatile("griddepcontrol.launch_dependents;");
-        }
-      }
-      __syncthreads();
-      {
-        const int pv_hi_lim = skip_masked_exp ? hi_pairs : 4;
-        uint32_t v_cur[4], v_nxt[4];
-        ldsm4_v_pair64(v_cur, kv_smem[1], 0, 0, lane);
-        #pragma unroll
-        for (int ks_local = 0; ks_local < 4; ++ks_local) {
-          if (ks_local < pv_hi_lim) {
-            #pragma unroll
-            for (int dp = 0; dp < 8; ++dp) {
-              const int n_dp = (dp + 1) & 7;
-              const int n_ks = ks_local + (dp == 7 ? 1 : 0);
-              if (n_ks < pv_hi_lim) ldsm4_v_pair64(v_nxt, kv_smem[1], n_dp, n_ks, lane);
-              mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
-              mma_m16n8k16_bf16(p_frag[4 + ks_local], v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
-              v_cur[0] = v_nxt[0]; v_cur[1] = v_nxt[1]; v_cur[2] = v_nxt[2]; v_cur[3] = v_nxt[3];
-            }
-          }
-        }
-      }
-      __syncthreads();
     }
   }
 
   // ---------------------------------------------------------------------------
   // 3. Fused Epilogue (L1-cached gate load + single-insn NaN clamp + inline L2 discard)
+  //    o_tiles aliases k_smem ([0..32767]), untouched since Barrier #2 of nb==0 -> 0 extra barrier!
   // ---------------------------------------------------------------------------
   row_sum0 = add_ftz_f32(row_sum0, __shfl_xor_sync(0xffffffffu, row_sum0, 2));
   row_sum0 = add_ftz_f32(row_sum0, __shfl_xor_sync(0xffffffffu, row_sum0, 1));
@@ -837,7 +818,7 @@ __global__ __launch_bounds__(256, 1) void prefill_attn_fused_512_kernel(
   const float inv0 = (row_sum0 == 0.0f || row_sum0 != row_sum0) ? 1.0f : fast_rcpf(row_sum0);
   const float inv1 = (row_sum1 == 0.0f || row_sum1 != row_sum1) ? 1.0f : fast_rcpf(row_sum1);
 
-  uint32_t (*o_tiles)[16][64] = reinterpret_cast<uint32_t (*)[16][64]>(kv_smem);
+  uint32_t (*o_tiles)[16][64] = reinterpret_cast<uint32_t (*)[16][64]>(k_smem);
   #pragma unroll
   for (int dt = 0; dt < 16; ++dt) {
     const int c32 = (dt << 2) + tid_in_grp;
@@ -1114,14 +1095,21 @@ static int post_attn_pdl_mode() {
 // Launch & Dispatch Helpers
 // =================================================================================================
 template <typename... KArgs, typename... Args>
-static inline cudaError_t launch_ex(
-    bool pdl, dim3 grid, dim3 block, cudaStream_t st,
+static inline cudaError_t launch_ex_smem(
+    bool pdl, dim3 grid, dim3 block, size_t smem_bytes, cudaStream_t st,
     void (*kernel)(KArgs...), Args... args) {
+  if (smem_bytes > 49152u) {
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+    cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaThreadExchangeStreamCaptureMode(&mode);
+  }
   if (pdl) {
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = grid;
     cfg.blockDim = block;
-    cfg.dynamicSmemBytes = 0;
+    cfg.dynamicSmemBytes = smem_bytes;
     cfg.stream = st;
     cudaLaunchAttribute attr[1];
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -1130,8 +1118,15 @@ static inline cudaError_t launch_ex(
     cfg.numAttrs = 1;
     return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
   }
-  kernel<<<grid, block, 0, st>>>(static_cast<KArgs>(args)...);
+  kernel<<<grid, block, smem_bytes, st>>>(static_cast<KArgs>(args)...);
   return cudaGetLastError();
+}
+
+template <typename... KArgs, typename... Args>
+static inline cudaError_t launch_ex(
+    bool pdl, dim3 grid, dim3 block, cudaStream_t st,
+    void (*kernel)(KArgs...), Args... args) {
+  return launch_ex_smem(pdl, grid, block, 0u, st, kernel, args...);
 }
 
 static inline void align_discard(const void* ptr, size_t n_bytes, const char*& out_ptr, size_t& out_lines) {
@@ -1157,17 +1152,17 @@ static inline cudaError_t dispatch_attn_rope(
   const dim3 block(256u, 1u, 1u);
   if (use_rope) {
     if (cache_fp32) {
-      return launch_ex(kPdl, grid, block, st,
-                       prefill_attn_fused_512_kernel<Mode, true, true, kPdl, kDiscard, kLutSigmoid>,
-                       qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+      return launch_ex_smem(kPdl, grid, block, kPrefillAttnPipe4Smem, st,
+                            prefill_attn_fused_512_kernel<Mode, true, true, kPdl, kDiscard, kLutSigmoid>,
+                            qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
     }
-    return launch_ex(kPdl, grid, block, st,
-                     prefill_attn_fused_512_kernel<Mode, true, false, kPdl, kDiscard, kLutSigmoid>,
-                     qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+    return launch_ex_smem(kPdl, grid, block, kPrefillAttnPipe4Smem, st,
+                          prefill_attn_fused_512_kernel<Mode, true, false, kPdl, kDiscard, kLutSigmoid>,
+                          qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
   }
-  return launch_ex(kPdl, grid, block, st,
-                   prefill_attn_fused_512_kernel<Mode, false, true, kPdl, kDiscard, kLutSigmoid>,
-                   qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
+  return launch_ex_smem(kPdl, grid, block, kPrefillAttnPipe4Smem, st,
+                        prefill_attn_fused_512_kernel<Mode, false, true, kPdl, kDiscard, kLutSigmoid>,
+                        qkv, pos, cos_sin, kv_flat, gate, fp8_scale, out, cache_rows, eps, qscale, scale_log2);
 }
 
 template <int Mode, bool kLutSigmoid>

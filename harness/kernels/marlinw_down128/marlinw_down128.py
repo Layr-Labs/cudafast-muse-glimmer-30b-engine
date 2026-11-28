@@ -564,10 +564,31 @@ def uses_tma(weight) -> bool:
     return weight.data_ptr() in _tma_weights or len(_tma_weights) == _admitted
 
 
+_sandwich_stash_fn = None
+_sandwich_stash_checked = False
+
+
+def _stash_dead_down_input(act, out) -> None:
+    global _sandwich_stash_fn, _sandwich_stash_checked
+    if not _sandwich_stash_checked:
+        _sandwich_stash_checked = True
+        try:
+            import muse_sandwich
+            _sandwich_stash_fn = getattr(muse_sandwich, "stash_dead_down_input", None)
+        except Exception:  # noqa: BLE001
+            _sandwich_stash_fn = None
+    fn = _sandwich_stash_fn
+    if fn is not None:
+        fn(act, out)
+
+
 def gemm_auto(x, weight, scales, global_scale):
     """Down projection with the per-device cached work list (None when x does not fit the kernel)."""
     plan = _plan(x.device)
-    return gemm(x, weight, scales, global_scale, plan, x.device in _tma_ready and uses_tma(weight))
+    out = gemm(x, weight, scales, global_scale, plan, x.device in _tma_ready and uses_tma(weight))
+    if out is not None:
+        _stash_dead_down_input(x, out)
+    return out
 
 
 def gemm_tma(x, weight, scales, global_scale):

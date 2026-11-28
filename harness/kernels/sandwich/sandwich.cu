@@ -380,7 +380,8 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
     const float* __restrict__ previous_sum, const uint2* __restrict__ post_attn_weight,
     const uint2* __restrict__ post_ff_weight, const uint2* __restrict__ next_pre_attn_weight,
     const float* __restrict__ scale, uint2* __restrict__ hidden, unsigned* __restrict__ quantized,
-    const float* __restrict__ gate_scale = nullptr, unsigned* __restrict__ gate_quantized = nullptr) {
+    const float* __restrict__ gate_scale = nullptr, unsigned* __restrict__ gate_quantized = nullptr,
+    const char* __restrict__ dead_extra_ptr = nullptr, size_t dead_extra_lines = 0) {
     __shared__ float warp_totals[8];
     uint2 saved[Tiles];
     const unsigned thread = threadIdx.x;
@@ -436,6 +437,13 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
         // reduce() already synchronized the CTA; all 104 cache lines (13312 B) of dn_row are now dead.
         if (thread < 104u) {
             discard_l2_128(reinterpret_cast<const char*>(dn_row) + (thread << 7));
+        }
+        if (dead_extra_ptr != nullptr) {
+            const size_t gid = static_cast<size_t>(blockIdx.x) * Threads + thread;
+            const size_t gstride = static_cast<size_t>(gridDim.x) * Threads;
+            for (size_t line = gid; line < dead_extra_lines; line += gstride) {
+                discard_l2_128(dead_extra_ptr + (line << 7));
+            }
         }
     }
     float attn_inverse = 0.f;
@@ -534,9 +542,17 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
     }
     if constexpr (DiscardDown && PdlMode == 2) {
         // Hoisted after pdl_launch_dependents() + final output stores so downstream qkv_proj TMA
-        // weight preloads overlap sooner and L2-hot hidden/q/g outputs land before discarding dn_row.
+        // weight preloads overlap sooner and L2-hot hidden/q/g outputs land before discarding dn_row
+        // and the immediately preceding dead down_proj input (swiglu_out).
         if (thread < 104u) {
             discard_l2_128(reinterpret_cast<const char*>(dn_row) + (thread << 7));
+        }
+        if (dead_extra_ptr != nullptr) {
+            const size_t gid = static_cast<size_t>(blockIdx.x) * Threads + thread;
+            const size_t gstride = static_cast<size_t>(gridDim.x) * Threads;
+            for (size_t line = gid; line < dead_extra_lines; line += gstride) {
+                discard_l2_128(dead_extra_ptr + (line << 7));
+            }
         }
     }
 }
@@ -584,6 +600,32 @@ static inline bool aligned16_row_ptrs(const void* a0, const void* a1, const void
     return true;
 }
 
+static const void* g_dead_extra_ptr = nullptr;
+static size_t g_dead_extra_bytes = 0;
+
+static inline void clear_dead_extra() {
+    g_dead_extra_ptr = nullptr;
+    g_dead_extra_bytes = 0;
+}
+
+static inline void pop_dead_extra(const char*& out_ptr, size_t& out_lines) {
+    const void* raw = g_dead_extra_ptr;
+    const size_t nbytes = g_dead_extra_bytes;
+    g_dead_extra_ptr = nullptr;
+    g_dead_extra_bytes = 0;
+    out_ptr = nullptr;
+    out_lines = 0;
+    if (!raw || nbytes < 128u) return;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(raw);
+    const uintptr_t end = base + nbytes;
+    if (end <= base) return;
+    const uintptr_t aligned_start = (base + 127u) & ~static_cast<uintptr_t>(127u);
+    const uintptr_t aligned_end = end & ~static_cast<uintptr_t>(127u);
+    if (aligned_end <= aligned_start) return;
+    out_ptr = reinterpret_cast<const char*>(aligned_start);
+    out_lines = static_cast<size_t>((aligned_end - aligned_start) >> 7);
+}
+
 template <bool Quantize, bool Gate, bool WriteHidden, bool GateEvictLast, bool ResidualEvictLast, bool CsLoads>
 static inline cudaError_t dispatch_v4(
     int rows, cudaStream_t stream,
@@ -593,23 +635,30 @@ static inline cudaError_t dispatch_v4(
     const float* a10, unsigned* a11) {
     const int pdl_mode = sandwich_pdl_mode();
     const bool disc = sandwich_discard_enabled() && ((reinterpret_cast<uintptr_t>(a1) & 127u) == 0u);
+    const char* dead_ptr = nullptr;
+    size_t dead_lines = 0;
+    pop_dead_extra(dead_ptr, dead_lines);
+    if (!disc) {
+        dead_ptr = nullptr;
+        dead_lines = 0;
+    }
     if (pdl_mode == 1) {
-        if (disc) return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, true>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-        return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, false>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+        if (disc) return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, true>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dead_ptr, dead_lines);
+        return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, false>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, static_cast<const char*>(nullptr), static_cast<size_t>(0));
     }
     if (pdl_mode == 2) {
         if constexpr (!ResidualEvictLast && CsLoads) {
             if (sandwich_res_cs_enabled()) {
-                if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+                if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dead_ptr, dead_lines);
                 else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, false, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
                 return cudaGetLastError();
             }
         }
-        if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+        if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dead_ptr, dead_lines);
         else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, false, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
         return cudaGetLastError();
     }
-    if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+    if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dead_ptr, dead_lines);
     else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
     return cudaGetLastError();
 }
@@ -632,16 +681,24 @@ void launch(const void* const* args, int rows, cudaStream_t stream) {
                 rows, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, nullptr, nullptr);
             return;
         }
+        clear_dead_extra();
         if (sandwich_pdl_mode() == 1) {
             launch_ex_pdl(sandwich<Quantize, true, false, true, false, false, CsLoads, true>, rows, Threads,
                           Vectors * sizeof(uint2), stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9,
                           static_cast<const float*>(nullptr), static_cast<unsigned*>(nullptr));
             return;
         }
+    } else {
+        clear_dead_extra();
     }
     sandwich<Quantize, Shared, false, true, false, false, CsLoads, false><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
         a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
 }
+}
+
+extern "C" void muse_sandwich_set_dead_extra(const void* ptr, size_t nbytes) {
+    g_dead_extra_ptr = ptr;
+    g_dead_extra_bytes = nbytes;
 }
 
 extern "C" void muse_sandwich_set_prefill_cs(int enable) {
@@ -686,11 +743,14 @@ void launch_gate(const void* const* args, int rows, cudaStream_t stream) {
                 rows, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
             return;
         }
+        clear_dead_extra();
         if (sandwich_pdl_mode() == 1) {
             launch_ex_pdl(sandwich<true, true, true, WriteHidden, EvictLast, false, CsLoads, true>, rows, Threads,
                           Vectors * sizeof(uint2), stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
             return;
         }
+    } else {
+        clear_dead_extra();
     }
     sandwich<true, Shared, true, WriteHidden, EvictLast, false, CsLoads, false><<<rows, Threads, Shared ? Vectors * sizeof(uint2) : 0, stream>>>(
         a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
@@ -751,6 +811,7 @@ int launch_hint(const void* const* args, int rows, int mode, cudaStream_t stream
             return static_cast<int>(dispatch_v4<false, false, true, false, ResEL, CsLoads>(
                 rows, stream, a0, a1, a2, a3, a4, a5, a6, nullptr, a7, nullptr, nullptr, nullptr));
         }
+        clear_dead_extra();
         if (use_pdl) {
             return static_cast<int>(launch_ex_pdl(
                 sandwich<false, true, false, true, false, ResEL, CsLoads, true>, rows, Threads, smem, stream,
@@ -776,6 +837,7 @@ int launch_hint(const void* const* args, int rows, int mode, cudaStream_t stream
             return static_cast<int>(dispatch_v4<true, true, false, GateEL, ResEL, CsLoads>(
                 rows, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11));
         }
+        clear_dead_extra();
         if (use_pdl) {
             return static_cast<int>(launch_ex_pdl(
                 sandwich<true, true, true, false, GateEL, ResEL, CsLoads, true>, rows, Threads, smem, stream,

@@ -206,6 +206,24 @@ def apply(a, b, scale_a, scale_b, down_scale):
         return out
 
 
+_sandwich_stash_fn = None
+_sandwich_stash_checked = False
+
+
+def _stash_dead_down_input(act, out) -> None:
+    global _sandwich_stash_fn, _sandwich_stash_checked
+    if not _sandwich_stash_checked:
+        _sandwich_stash_checked = True
+        try:
+            import muse_sandwich
+            _sandwich_stash_fn = getattr(muse_sandwich, "stash_dead_down_input", None)
+        except Exception:  # noqa: BLE001
+            _sandwich_stash_fn = None
+    fn = _sandwich_stash_fn
+    if fn is not None:
+        fn(act, out)
+
+
 def _install_fp8ws_accel() -> None:
     if not _USE_FP8WS_ACCEL:
         return
@@ -300,8 +318,13 @@ def _install_fp8ws_accel() -> None:
                             out.data_ptr(), k_dim, torch.cuda.current_stream(dev_idx).cuda_stream,
                         )
                         if rc == 0:
+                            if k_dim == _INNER:
+                                _stash_dead_down_input(a, out)
                             return out
-            return orig_gemm(a, b, sa, sb)
+            out = orig_gemm(a, b, sa, sb)
+            if k_dim == _INNER and out is not None:
+                _stash_dead_down_input(a, out)
+            return out
 
         _fp8ws.gemm = _gemm_accel
 

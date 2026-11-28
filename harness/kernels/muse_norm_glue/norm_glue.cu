@@ -113,6 +113,9 @@ __device__ __forceinline__ float row_sum(const float (&acc)[4], float* red) {
 // then immediately signal dependent launch for the following GEMV so it can overlap our reduction.
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void pdl_launch_dependents() { asm volatile("griddepcontrol.launch_dependents;"); }
+__device__ __forceinline__ void discard_l2_128(const void* ptr) {
+  asm volatile("discard.global.L2 [%0], 128;" :: "l"(ptr) : "memory");
+}
 
 __device__ __forceinline__ uint2 ld8(const __nv_bfloat16* base, int c) {
   return *reinterpret_cast<const uint2*>(base + c * 1024 + threadIdx.x * 4);
@@ -281,21 +284,21 @@ __global__ void __launch_bounds__(kThreads) post_attn_norm_decode(
   }
 }
 
-template <bool kBf16Out, bool kFp8Out, bool kPdl = false>
+template <bool kBf16Out, bool kFp8Out, int kPdlMode = 0>
 __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
     const __nv_bfloat16* __restrict__ x_all, const __nv_bfloat16* __restrict__ res_all,
     const __nv_bfloat16* __restrict__ w_post, const __nv_bfloat16* __restrict__ w_pre,
     const float* __restrict__ scale, float* __restrict__ sumsq_out,
     __nv_bfloat16* __restrict__ out_bf16_all, uint8_t* __restrict__ out_fp8_all) {
   __shared__ float red[2][8];
-  __shared__ uint2 sh_res[kPdl ? (kHidden / 4) : 1];
+  __shared__ uint2 sh_res[kPdlMode == 1 ? (kHidden / 4) : 1];
   const size_t row = blockIdx.x;
   const __nv_bfloat16* x = x_all + row * kHidden;
   const __nv_bfloat16* res = res_all + row * kHidden;
   uint2 ux[kChunks];
   float inv_scale = 0.f;
-  if constexpr (kPdl) {
-    // Preload predecessor-independent residual (6.8 MB across 512 rows) into SMEM and scale before waiting for o_proj.
+  if constexpr (kPdlMode == 1) {
+    // Legacy full PDL: preload predecessor-independent residual into SMEM before waiting for o_proj.
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) sh_res[c * 256 + threadIdx.x] = ld8_cs_v4(res, c);
@@ -323,7 +326,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
       Row4 xv = unpack(ux[c]);
-      Row4 rv = unpack(kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_cs_v4(res, c));
+      Row4 rv = unpack((kPdlMode == 1) ? sh_res[c * 256 + threadIdx.x] : ld8_cs_v4(res, c));
       Row4 wv = unpack(ldg8_v4(w_post, c));
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
@@ -333,8 +336,13 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
     }
   }
   const float s_h = row_sum(acc2, red[1]);
+  if constexpr (kPdlMode == 2) {
+    // Zero-contention producer-only PDL: no sh_res preload contending with o_proj, yet still
+    // signals downstream gateup/swiglu to overlap TMA weight preloads with final output stores.
+    pdl_launch_dependents();
+  }
   const float b = inv_rms(s_h, 1e-05f);
-  if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
+  if constexpr (kPdlMode != 1 && kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
   __nv_bfloat16* const out_bf16_row = kBf16Out ? (out_bf16_all + row * kHidden) : nullptr;
   uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
 #pragma unroll
@@ -507,7 +515,7 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
   }
 }
 
-template <bool kFp8Out, bool kPdl = false>
+template <bool kFp8Out, int kPdlMode = 0>
 __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
     __nv_bfloat16* __restrict__ x_all, const __nv_bfloat16* __restrict__ d_all,
     const __nv_bfloat16* __restrict__ res_all, const float* __restrict__ sumsq_x,
@@ -515,7 +523,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
     const __nv_bfloat16* __restrict__ w_in, const float* __restrict__ scale,
     __nv_bfloat16* __restrict__ out_bf16_all, uint8_t* __restrict__ out_fp8_all) {
   __shared__ float red[2][8];
-  __shared__ uint2 sh_res[kPdl ? (kHidden / 4) : 1];
+  __shared__ uint2 sh_res[kPdlMode == 1 ? (kHidden / 4) : 1];
   const size_t row = blockIdx.x;
   __nv_bfloat16* x = x_all + row * kHidden;
   const __nv_bfloat16* d = d_all + row * kHidden;
@@ -523,7 +531,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
   uint2 ud[kChunks];
   float a = 0.f;
   float inv_scale = 0.f;
-  if constexpr (kPdl) {
+  if constexpr (kPdlMode == 1) {
     const float s_x = __ldg(sumsq_x + row);
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
@@ -544,7 +552,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
       for (int e = 0; e < 4; ++e) acc[e] = __fmaf_rn(v.v[e], v.v[e], acc[e]);
     }
   }
-  if constexpr (!kPdl) {
+  if constexpr (kPdlMode != 1) {
     const float s_x = __ldg(sumsq_x + row);
     a = inv_rms(s_x, 1e-08f);
   }
@@ -556,7 +564,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
       Row4 xv = unpack(ld8_cs_v4(x, c)), dv = unpack(ud[c]),
-           rv = unpack(kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_cs_v4(res, c));
+           rv = unpack((kPdlMode == 1) ? sh_res[c * 256 + threadIdx.x] : ld8_cs_v4(res, c));
       Row4 wv = unpack(ldg8_v4(w_post, c)), fv = unpack(ldg8_v4(w_ff, c));
       float h2[4];
 #pragma unroll
@@ -572,8 +580,13 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
     }
   }
   const float s_h = row_sum(acc2, red[1]);
+  if constexpr (kPdlMode == 2) {
+    // Zero-contention producer-only PDL: zero sh_res SMEM overhead (64 B SMEM -> max L1),
+    // yet signals downstream qkv+gate TMA weight preloads ahead of final output stores.
+    pdl_launch_dependents();
+  }
   const float e_r = inv_rms(s_h, 1e-05f);
-  if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
+  if constexpr (kPdlMode != 1 && kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
   __nv_bfloat16* const out_bf16_row = out_bf16_all + row * kHidden;
   uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
 #pragma unroll
@@ -592,6 +605,13 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
                                 __fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]));
         st4_v2(out_fp8_row, c, q);
       }
+    }
+  }
+  if constexpr (kPdlMode == 2) {
+    // Inline L2 discard of this CTA's dead down_proj output row (6656 * 2 B = 13,312 B = 104 x 128 B
+    // exact cache lines -> 6.82 MiB/layer x 52 = 355 MiB avoided dirty DRAM writebacks, 0 cross-CTA race).
+    if (threadIdx.x < 104 && ((reinterpret_cast<uintptr_t>(d) & 127u) == 0u)) {
+      discard_l2_128(reinterpret_cast<const char*>(d) + (static_cast<size_t>(threadIdx.x) << 7));
     }
   }
 }
@@ -1168,11 +1188,11 @@ int muse_norm_glue_post_attn(int kind, int rows, const void* x, const void* res,
       post_attn_norm_decode<true, false><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, nullptr,
           static_cast<float*>(sumsq_out), static_cast<__nv_bfloat16*>(out_bf16), nullptr);
     } else if (use_prefill_pdl) {
-      return static_cast<int>(launch_pdl(post_attn_norm<true, false, true>, rows, kThreads, stream,
-          X, Rs, Wp, Wq, static_cast<const float*>(nullptr), static_cast<float*>(sumsq_out),
-          static_cast<__nv_bfloat16*>(out_bf16), static_cast<uint8_t*>(nullptr)));
+      post_attn_norm<true, false, 2><<<rows, kThreads, 0, stream>>>(
+          X, Rs, Wp, Wq, nullptr, static_cast<float*>(sumsq_out),
+          static_cast<__nv_bfloat16*>(out_bf16), nullptr);
     } else {
-      post_attn_norm<true, false><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, nullptr,
+      post_attn_norm<true, false, 0><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, nullptr,
           static_cast<float*>(sumsq_out), static_cast<__nv_bfloat16*>(out_bf16), nullptr);
     }
   } else if (kind == 1) {
@@ -1184,11 +1204,11 @@ int muse_norm_glue_post_attn(int kind, int rows, const void* x, const void* res,
       post_attn_norm_decode<false, true><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, static_cast<const float*>(scale),
           static_cast<float*>(sumsq_out), nullptr, static_cast<uint8_t*>(out_fp8));
     } else if (use_prefill_pdl) {
-      return static_cast<int>(launch_pdl(post_attn_norm<false, true, true>, rows, kThreads, stream,
+      post_attn_norm<false, true, 2><<<rows, kThreads, 0, stream>>>(
           X, Rs, Wp, Wq, static_cast<const float*>(scale), static_cast<float*>(sumsq_out),
-          static_cast<__nv_bfloat16*>(nullptr), static_cast<uint8_t*>(out_fp8)));
+          nullptr, static_cast<uint8_t*>(out_fp8));
     } else {
-      post_attn_norm<false, true><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, static_cast<const float*>(scale),
+      post_attn_norm<false, true, 0><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, static_cast<const float*>(scale),
           static_cast<float*>(sumsq_out), nullptr, static_cast<uint8_t*>(out_fp8));
     }
   } else {
@@ -1224,11 +1244,10 @@ int muse_norm_glue_post_ff(int kind, int rows, void* x, const void* d, const voi
       post_ff_norm_decode<false><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, nullptr,
           static_cast<__nv_bfloat16*>(out_bf16), nullptr);
     } else if (use_prefill_pdl) {
-      return static_cast<int>(launch_pdl(post_ff_norm_prefill<false, true>, rows, kThreads, stream,
-          X, D, Rs, S, Wp, Wf, Wi, static_cast<const float*>(nullptr),
-          static_cast<__nv_bfloat16*>(out_bf16), static_cast<uint8_t*>(nullptr)));
+      post_ff_norm_prefill<false, 2><<<rows, kThreads, 0, stream>>>(
+          X, D, Rs, S, Wp, Wf, Wi, nullptr, static_cast<__nv_bfloat16*>(out_bf16), nullptr);
     } else {
-      post_ff_norm_prefill<false><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, nullptr,
+      post_ff_norm_prefill<false, 0><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, nullptr,
           static_cast<__nv_bfloat16*>(out_bf16), nullptr);
     }
   } else if (kind == 1) {
@@ -1240,11 +1259,11 @@ int muse_norm_glue_post_ff(int kind, int rows, void* x, const void* d, const voi
       post_ff_norm_decode<true><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, static_cast<const float*>(scale),
           static_cast<__nv_bfloat16*>(out_bf16), static_cast<uint8_t*>(out_fp8));
     } else if (use_prefill_pdl) {
-      return static_cast<int>(launch_pdl(post_ff_norm_prefill<true, true>, rows, kThreads, stream,
+      post_ff_norm_prefill<true, 2><<<rows, kThreads, 0, stream>>>(
           X, D, Rs, S, Wp, Wf, Wi, static_cast<const float*>(scale),
-          static_cast<__nv_bfloat16*>(out_bf16), static_cast<uint8_t*>(out_fp8)));
+          static_cast<__nv_bfloat16*>(out_bf16), static_cast<uint8_t*>(out_fp8));
     } else {
-      post_ff_norm_prefill<true><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, static_cast<const float*>(scale),
+      post_ff_norm_prefill<true, 0><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, static_cast<const float*>(scale),
           static_cast<__nv_bfloat16*>(out_bf16), static_cast<uint8_t*>(out_fp8));
     }
   } else {
