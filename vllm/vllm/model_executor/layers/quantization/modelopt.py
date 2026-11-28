@@ -1462,7 +1462,7 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
                         dh_bits = int(os.environ.get("MUSE_DHEAD_BITS", "100"))
                         if dh_bits not in (100, 150, 158, 2):
                             raise ValueError(f"unsupported MUSE_DHEAD_BITS={dh_bits}")
-                        default_topk = 256 if dh_bits == 100 else (192 if dh_bits in (150, 158) else 128)
+                        default_topk = 384 if dh_bits == 100 else (192 if dh_bits in (150, 158) else 128)
                         dh_topk = max(
                             16,
                             min(512, int(os.environ.get("MUSE_DHEAD_TOPK", str(default_topk)))),

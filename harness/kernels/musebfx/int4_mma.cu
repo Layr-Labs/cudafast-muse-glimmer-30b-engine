@@ -1029,22 +1029,22 @@ __global__ void __launch_bounds__(128, 6) int4_mma_gemm_n32_kernel(
 constexpr int kN32PairTmaStages = 3;
 constexpr int kN32PairStepWBytes = 2 * kN32StepWBytes;  // 2304 = 18 * 128 B
 
-template <int kMaxM>
+template <int kMaxM, int kWStages = kN32PairTmaStages, int kAStages = kN32PairTmaStages>
 struct alignas(128) Int4N32PairTmaSmem {
-  alignas(128) uint8_t w[kN32PairTmaStages][kN32PairStepWBytes];   // 3 * 2304 = 6912 B
-  alignas(128) __nv_bfloat16 a[kN32PairTmaStages][2][kMaxM][64];   // 3 * 2048 = 6144 B (M<=8) or 12288 B (M<=16)
-  alignas(8) uint64_t mbar[kN32PairTmaStages];                     // 24 B -> 13,184 B (7 CTAs/SM = 336!)
+  alignas(128) uint8_t w[kWStages][kN32PairStepWBytes];     // 3..5 * 2304 = 6912..11520 B
+  alignas(128) __nv_bfloat16 a[kAStages][2][kMaxM][64];     // 2..3 * 2048/4096 B
+  alignas(8) uint64_t mbar[kWStages];                       // <=40 B -> M<=8 w4/a2=13440B (7 CTAs/SM), M<=16 w5/a2=19840B (5 CTAs/SM)
 };
 
 // Single-wave (<=336 CTAs at 7 CTAs/SM) BK=128 paired 2304B Hardware-TMA N32 kernel:
 // 100.000% 0-ULP bit-identical to int4_mma_gemm_kernel, halving barriers and crushing o_proj/qkv/fkv tail waves!
-template <bool kM16, bool kNf4>
+template <bool kM16, bool kNf4, int kWStages = kN32PairTmaStages, int kAStages = kN32PairTmaStages>
 __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int4_mma_gemm_n32_pair_tma_kernel(
     const __nv_bfloat16* __restrict__ A,
     const uint8_t* __restrict__ W_packed,
     __nv_bfloat16* __restrict__ C,
     int M, int N, int K, int pdl_mode) {
-  __shared__ Int4N32PairTmaSmem<kM16 ? 16 : 8> smem;
+  __shared__ Int4N32PairTmaSmem<kM16 ? 16 : 8, kWStages, kAStages> smem;
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
@@ -1055,7 +1055,7 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int4_mma_gemm_n32_pair_tma_
   const int cta_n32 = blockIdx.x;
 
   if (tid == 0) {
-    int4_mbar_init(smem.mbar, kN32PairTmaStages);
+    int4_mbar_init(smem.mbar, kWStages);
   }
   __syncthreads();
 
@@ -1101,19 +1101,23 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int4_mma_gemm_n32_pair_tma_
     asm volatile("cp.async.commit_group;\n" ::: "memory");
   };
 
-  constexpr int kPreload = kN32PairTmaStages - 1;  // 2
-  const int preload = (num_pairs < kPreload) ? num_pairs : kPreload;
+  constexpr int kWPreload = kWStages - 1;
+  constexpr int kAPreload = kAStages - 1;
+  const int w_preload = (num_pairs < kWPreload) ? num_pairs : kWPreload;
+  const int a_preload = (num_pairs < kAPreload) ? num_pairs : kAPreload;
   if ((pdl_mode & 1) != 0) {
-    for (int i = 0; i < preload; ++i) {
+    for (int i = 0; i < w_preload; ++i) {
       issue_w_tma(i, i, false);
     }
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    for (int i = 0; i < preload; ++i) {
+    for (int i = 0; i < a_preload; ++i) {
       issue_a_only(i, i);
     }
   } else {
-    for (int i = 0; i < preload; ++i) {
+    for (int i = 0; i < w_preload; ++i) {
       issue_w_tma(i, i, false);
+    }
+    for (int i = 0; i < a_preload; ++i) {
       issue_a_only(i, i);
     }
   }
@@ -1124,31 +1128,40 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int4_mma_gemm_n32_pair_tma_
   const int ldm_col_off = kM16 ? (lane >> 4) : ((lane >> 3) & 1);
   const int trig_p = ((pdl_mode & 2) != 0) ? ((num_pairs > 3) ? (num_pairs - 3) : 0) : -1;
 
-  int st = 0;
+  int st_w = 0;
+  int st_a = 0;
   uint32_t parity = 0u;
   for (int p = 0; p < num_pairs; ++p) {
     if (p == trig_p) {
       asm volatile("griddepcontrol.launch_dependents;");
     }
-    int4_mbar_wait(&smem.mbar[st], parity);
+    int4_mbar_wait(&smem.mbar[st_w], parity);
     const int rem = num_pairs - 1 - p;
-    if (rem >= 1) {
-      asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+    if constexpr (kAPreload >= 2) {
+      if (rem >= 1) {
+        asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+      } else {
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+      }
     } else {
       asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     }
     __syncthreads();
 
-    const int next_p = p + kPreload;
-    if (next_p < num_pairs) {
-      const int next_st = (st == 0) ? (kN32PairTmaStages - 1) : (st - 1);
-      issue_w_tma(next_p, next_st, true);
-      issue_a_only(next_p, next_st);
+    const int next_wp = p + kWPreload;
+    if (next_wp < num_pairs) {
+      const int next_st_w = (st_w == 0) ? (kWStages - 1) : (st_w - 1);
+      issue_w_tma(next_wp, next_st_w, true);
+    }
+    const int next_ap = p + kAPreload;
+    if (next_ap < num_pairs) {
+      const int next_st_a = (st_a == 0) ? (kAStages - 1) : (st_a - 1);
+      issue_a_only(next_ap, next_st_a);
     }
 
 #pragma unroll
     for (int kh = 0; kh < 2; ++kh) {
-      const uint8_t* wt0 = &smem.w[st][kh * kN32StepWBytes + warp * kTileBytes];
+      const uint8_t* wt0 = &smem.w[st_w][kh * kN32StepWBytes + warp * kTileBytes];
       const uint32_t q0_lo = reinterpret_cast<const uint32_t*>(wt0)[lane];
       const uint32_t q0_hi = reinterpret_cast<const uint32_t*>(wt0 + 128)[lane];
       const __nv_bfloat162 sz0 = reinterpret_cast<const __nv_bfloat162*>(wt0 + 256)[g];
@@ -1160,7 +1173,7 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int4_mma_gemm_n32_pair_tma_
 #pragma unroll
       for (int s = 0; s < 4; ++s) {
         const int pcol8 = (2 * s + ldm_col_off) ^ (ldm_row & 7);
-        const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][kh][ldm_row][pcol8 * 8]));
+        const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st_a][kh][ldm_row][pcol8 * 8]));
         uint32_t a0, a1, a2, a3;
         if constexpr (kM16) {
           int4_ldmatrix_x4(a0, a1, a2, a3, addr);
@@ -1181,9 +1194,12 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int4_mma_gemm_n32_pair_tma_
       }
     }
 
-    if (++st == kN32PairTmaStages) {
-      st = 0;
+    if (++st_w == kWStages) {
+      st_w = 0;
       parity ^= 1u;
+    }
+    if (++st_a == kAStages) {
+      st_a = 0;
     }
   }
 
@@ -2488,8 +2504,11 @@ static void int4_set_carveout_nf4() {
   cudaFuncSetAttribute(int4_mma_n32_tma_det_sk_kernel<true, kNf4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int4_mma_n32_tma_det_sk_kernel<false, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int4_mma_n32_tma_det_sk_kernel<true, kNf4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_gemm_n32_pair_tma_kernel<false, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(int4_mma_gemm_n32_pair_tma_kernel<true, kNf4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_n32_pair_tma_kernel<false, kNf4, 3, 3>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_n32_pair_tma_kernel<true, kNf4, 3, 3>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_n32_pair_tma_kernel<false, kNf4, 4, 2>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_n32_pair_tma_kernel<true, kNf4, 4, 2>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(int4_mma_gemm_n32_pair_tma_kernel<true, kNf4, 5, 2>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
 }
 
 static void int4_ensure_carveout() {
@@ -2651,14 +2670,23 @@ static torch::Tensor launch_int4_gemm_impl(
   }
 
   if (!is_aux5 && use_tma && int4_n32_pair_tma_for_shape(static_cast<int>(N), static_cast<int>(K))) {
+    const int pw = int4_bench_dyn_env() ? int4_read_env_int("MUSE_INT4_PAIR_WSTAGES", 4) : []() {
+      static const int v = int4_read_env_int("MUSE_INT4_PAIR_WSTAGES", 4);
+      return v;
+    }();
     if (use_m16) {
+      auto kptr = (pw >= 5) ? int4_mma_gemm_n32_pair_tma_kernel<true, kNf4, 5, 2>
+                : ((pw == 4) ? int4_mma_gemm_n32_pair_tma_kernel<true, kNf4, 4, 2>
+                             : int4_mma_gemm_n32_pair_tma_kernel<true, kNf4, 3, 3>);
       int4_launch_pdl(
-          int4_mma_gemm_n32_pair_tma_kernel<true, kNf4>, dim3(n32_blocks, 1, 1), kThreads, st, pdl_mode,
+          kptr, dim3(n32_blocks, 1, 1), kThreads, st, pdl_mode,
           A_ptr, W_packed.data_ptr<uint8_t>(), reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
           M, static_cast<int>(N), static_cast<int>(K), pdl_mode);
     } else {
+      auto kptr = (pw >= 4) ? int4_mma_gemm_n32_pair_tma_kernel<false, kNf4, 4, 2>
+                            : int4_mma_gemm_n32_pair_tma_kernel<false, kNf4, 3, 3>;
       int4_launch_pdl(
-          int4_mma_gemm_n32_pair_tma_kernel<false, kNf4>, dim3(n32_blocks, 1, 1), kThreads, st, pdl_mode,
+          kptr, dim3(n32_blocks, 1, 1), kThreads, st, pdl_mode,
           A_ptr, W_packed.data_ptr<uint8_t>(), reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
           M, static_cast<int>(N), static_cast<int>(K), pdl_mode);
     }
