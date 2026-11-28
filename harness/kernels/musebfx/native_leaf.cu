@@ -3589,7 +3589,7 @@ static const BgEbKnobs& get_bgeb_knobs_env() {
     };
     BgEbKnobs v{};
     v.bg_mode = env_i("MUSE_BG_MODE", 1);
-    v.bg_sub = env_i("MUSE_BG_SUB", 1);
+    v.bg_sub = env_i("MUSE_BG_SUB", 0);
     v.bg_off = env_i("MUSE_BG_OFF", 1);
     v.chp_bg2 = env_i("MUSE_BG_CHP_BG2", 1);
     v.bg_alpha = env_f("MUSE_BG_ALPHA", 4.0f);
