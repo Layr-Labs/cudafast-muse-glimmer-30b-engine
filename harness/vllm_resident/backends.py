@@ -89,8 +89,8 @@ class Backend(Protocol):
 
     def step(self) -> list[Emit]: ...
 
-    def begin_spec_run(self, count: int) -> None:
-        """Bound and pipeline the one timed speculative run."""
+    def begin_spec_run(self, count: int) -> bool | None:
+        """Set the run bound. Return True when the live request stops at it."""
         ...
 
     def end_spec_run(self) -> None:
@@ -358,6 +358,7 @@ class VllmBackend:
         self.draft_model_path = cfg.draft_model_dir if cfg.depth > 0 and cfg.spec_method == "dflash" else ""
         self._rid = 0
         self._live: str | None = None
+        self._live_core_id: str | None = None
         self._warm_up()
         _shutdown_inductor_workers()
         if muse_sandwich is not None and (summary := muse_sandwich.launch_summary()):
@@ -486,7 +487,7 @@ class VllmBackend:
         use_top_logits = top_logits or not self._argmax_only
         if not use_top_logits:
             self._pre_launch(tokens)
-        self._engine.add_request(
+        self._live_core_id = self._engine.add_request(
             self._live,
             {"prompt_token_ids": list(tokens)},
             self._params(len(tokens), max_tokens, use_top_logits),
@@ -508,7 +509,7 @@ class VllmBackend:
             emitted = self._collect()
         return emitted
 
-    def begin_spec_run(self, count: int) -> None:
+    def begin_spec_run(self, count: int) -> bool | None:
         core = self._async_core
         if core is None:
             return
@@ -518,6 +519,25 @@ class VllmBackend:
             raise RuntimeError("cannot pipeline with an occupied batch queue")
         if self._live is None:
             raise RuntimeError("cannot pipeline without a live request")
+        if self.depth == 6:
+            from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf
+
+            core_id = self._live_core_id
+            live = core.scheduler.requests.get(core_id)
+            if (
+                native_leaf.WINDOW_TREE
+                and live is not None
+                and live.num_output_tokens == 1
+                and live.max_tokens >= count + 1
+                and native_leaf.set_output_end(core_id, live.num_prompt_tokens + count + 1)
+            ):
+                # Keep the existing verify-width policy. The tree kernel gets
+                # the committed device position, including when host positions
+                # would be optimistic due to outstanding reservations.
+                live.max_tokens = count + 1
+                if live.sampling_params is not None:
+                    live.sampling_params.max_tokens = live.max_tokens
+                return True
         request = core.scheduler.requests.get(self._live)
         # A bounded sync (used by diagnostics and correctness probes) may have
         # completed the request already.  Its next cycle will start a fresh
@@ -559,6 +579,7 @@ class VllmBackend:
             while self._engine.has_unfinished_requests():
                 self._engine.step()
             self._live = None
+            self._live_core_id = None
         if self._settle_core is not None:
             # Nothing is live now: the core may still own a deferred cleanup.
             self._settle_core()
