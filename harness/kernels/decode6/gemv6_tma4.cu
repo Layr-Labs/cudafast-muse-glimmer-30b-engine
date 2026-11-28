@@ -645,7 +645,15 @@ extern "C" int muse_marlin6_sk_tma4_ilv_swiglu_m(
     int* locks, int m, int n, int k, int blocks, int device, cudaStream_t stream) {
   if (m < 1 || m > 32 || n != 39936 || k != 6656 || blocks != 48)
     return cudaErrorInvalidValue;
-  static const int gu_st = decode6_tma4_stages("MUSE_TMA4_SWIGLU_M_STAGES", 4);  // 4-stage multi-M gate_up (74 KiB M<=16 / 91.9 KiB M<=32 <= 99 KiB SMEM)
+  static const int gu_env = []() -> int {
+    const char* env = std::getenv("MUSE_TMA4_SWIGLU_M_STAGES");
+    if (env && *env) {
+      long v = std::strtol(env, nullptr, 10);
+      if (v == 3 || v == 4) return static_cast<int>(v);
+    }
+    return 0;
+  }();
+  const int gu_st = (gu_env != 0) ? gu_env : ((m > 16) ? 4 : 3);
   if (gu_st == 3)
     return launch_tma4_m<128, 256, false, true, false, true, false, false, 3, false, 0, false, true, false, true>(
         input, weight, output, partials, coded, palette, global_scale, locks,
@@ -684,7 +692,15 @@ extern "C" int muse_marlin6_sk_tma4_ilv_swiglu_fp8_m(
   if (m < 1 || m > 32 || n != 39936 || k != 6656 || blocks != 48 ||
       fp8_scale == nullptr || fp8_out == nullptr)
     return cudaErrorInvalidValue;
-  static const int gu_st = decode6_tma4_stages("MUSE_TMA4_SWIGLU_M_STAGES", 4);
+  static const int gu_env = []() -> int {
+    const char* env = std::getenv("MUSE_TMA4_SWIGLU_M_STAGES");
+    if (env && *env) {
+      long v = std::strtol(env, nullptr, 10);
+      if (v == 3 || v == 4) return static_cast<int>(v);
+    }
+    return 0;
+  }();
+  const int gu_st = (gu_env != 0) ? gu_env : ((m > 16) ? 4 : 3);
   if (gu_st == 3)
     return launch_tma4_m<128, 256, false, true, false, true, false, false, 3, false, 0, true, true, false, true>(
         input, weight, scratch_out, partials, coded, palette, global_scale, locks,
@@ -878,7 +894,7 @@ static int decode6_tma4_m_stages(int m) {
     }
     return 0;
   }();
-  return (m_env != 0) ? m_env : ((m > 8) ? 4 : 3);
+  return (m_env != 0) ? m_env : ((m > 16) ? 4 : 3);
 }
 
 extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight, int4* output,
@@ -941,7 +957,7 @@ extern "C" int muse_marlin6_sk_tma4_ilv_m(const int4* input, const int4* weight,
       }
       return 0;
     }();
-    const int dn_st = (dn_env != 0) ? dn_env : ((m > 8) ? 4 : 3);
+    const int dn_st = (dn_env != 0) ? dn_env : ((m > 16) ? 4 : 3);
     if (dn_st == 4) {
       return launch_tma4_m<128, 256, false, true, false, false, false, false, 4, false, 1, false, true, false, true>(
           input, weight, output, partials, coded, palette, global_scale, locks, n, k, 48, device, stream,
