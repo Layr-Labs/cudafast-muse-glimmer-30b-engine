@@ -52,6 +52,7 @@
 namespace MARLIN_NAMESPACE_NAME {
 
 constexpr int kThreads = 256;
+constexpr int kThreadsWs12 = 384;  // 12 warps = 3 warpgroups (8 consumer @ 232 regs + 4 producer @ 40 regs = 64,512 <= 65,536)
 constexpr int kStages = 4;  // power of two
 constexpr int kDist = 3;    // k-tiles copied ahead of the one being multiplied (<= kStages - 1)
 static_assert((kStages & (kStages - 1)) == 0 && kDist >= 1 && kDist < kStages, "stages");
@@ -106,6 +107,15 @@ __device__ __forceinline__ void mbar_expect_tx_only(uint32_t a, int bytes) {
 }
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 __device__ __forceinline__ void pdl_launch_dependents() { asm volatile("griddepcontrol.launch_dependents;"); }
+__device__ __forceinline__ void wg_reg_alloc_232() {
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 232;\n" ::: "memory");
+}
+__device__ __forceinline__ void wg_reg_dealloc_40() {
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 40;\n" ::: "memory");
+}
+__device__ __forceinline__ void consumer_bar_sync() {
+  asm volatile("bar.sync 1, 256;\n" ::: "memory");
+}
 __device__ __forceinline__ void mbar_wait(uint32_t a, int parity) {
   asm volatile(
       "{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
@@ -1495,6 +1505,370 @@ __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
   }
   }  // tiles of this CTA
 }
+
+// SM121 Warpgroup-Specialized 12-Warp (WS12, 232/40-reg) NVFP4 Gate/Up + SwiGLU kernel:
+//   - Warpgroup 2 (warps 8..11) deallocates to 40 regs/thread and warp 8 lane 0 streams all
+//     kTilesPerCta * kTiles (2,704) TMA stages asynchronously without ever stalling MMA warps.
+//   - Warpgroups 0..1 (warps 0..7) reallocate to 232 regs/thread (59,392 + 5,120 = 64,512 <= 65,536,
+//     per-subcore 504 <= 512), synchronize epilogue reduction via bar.sync 1, 256, and defer
+//     empty_bar[3] arrival on g==kTiles-1 until after epi completes so Stages 0..2 of tile ti+1
+//     prefetch in parallel with tile ti's epilogue (0-ULP bit-identical to gateup_ilv).
+template <int kPdlMode = 2, int kTilesPerCta = 26, bool kCsOut = true, bool kPolEf = false, bool kLutSilu = true>
+__global__ void __launch_bounds__(kThreadsWs12) gateup_ilv_ws12(
+    const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
+    const __grid_constant__ CUtensorMap tmS, char* __restrict__ out,
+    const float* __restrict__ global_scale_ptr,
+    const uint8_t* __restrict__ w_raw
+#ifdef MARLINW_TMA_FP8
+    , const float* __restrict__ down_input_scale
+#endif
+    ) {
+  static_assert(kTilesPerCta > 1 && (kTiles % 4) == 0 && kStages == 4, "gateup_ilv_ws12 invariants");
+  constexpr int kEpiExtraVal = kEpiExtraFor<kTilesPerCta>();
+  constexpr int kColStride = (kFused / 128) / kTilesPerCta;
+  constexpr int kTotal = kTilesPerCta * kTiles;
+  extern __shared__ int4 sh[];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int chunk = blockIdx.x & 3, col_b = blockIdx.x >> 2;
+  const uint32_t sbase = (static_cast<uint32_t>(__cvta_generic_to_shared(sh)) + 1023u) & ~1023u;
+  const uint32_t full_bar = sbase + kStages * kStageBytes + kEpiExtraVal;
+  const uint32_t empty_bar = full_bar + 8 * kStages;
+
+  if (tid == 0) {
+#pragma unroll
+    for (int i = 0; i < kStages; i++) {
+      mbar_init(full_bar + 8 * i, 1);
+      mbar_init(empty_bar + 8 * i, 8);
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+  }
+  __syncthreads();
+
+  if (warp >= 8) {
+    wg_reg_dealloc_40();
+    if (warp == 8 && lane == 0) {
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmS) : "memory");
+      const uint64_t pol_el = tma_pol_el();
+      const uint64_t pol_ef = kPolEf ? tma_pol_ef() : 0ull;
+      auto tma_bs = [&](uint32_t dst, const CUtensorMap* map, int x, int y, uint32_t bar) {
+        if constexpr (kPolEf) {
+          tma2d_hint(dst, map, x, y, bar, pol_ef);
+        } else {
+          tma2d(dst, map, x, y, bar);
+        }
+      };
+      if constexpr (kPdlMode == 2) {
+#pragma unroll
+        for (int g = 0; g < kDist; ++g) {
+          const uint32_t dst = sbase + g * kStageBytes, bar = full_bar + 8 * g;
+          mbar_expect_tx_only(bar, kBBytes + kSBytes);
+          tma_bs(dst + kABytes, &tmB, 256 * col_b, 4 * g, bar);
+          tma_bs(dst + kABytes + kBBytes, &tmS, 128 * col_b, 4 * g, bar);
+        }
+        pdl_wait();
+#pragma unroll
+        for (int g = 0; g < kDist; ++g) {
+          const uint32_t dst = sbase + g * kStageBytes, bar = full_bar + 8 * g;
+          mbar_expect_tx(bar, kABytes);
+          tma2d_hint(dst, &tmA, 128 * g, 128 * chunk, bar, pol_el);
+        }
+      } else {
+#pragma unroll
+        for (int g = 0; g < kDist; ++g) {
+          const uint32_t dst = sbase + g * kStageBytes, bar = full_bar + 8 * g;
+          mbar_expect_tx(bar, kABytes + kBBytes + kSBytes);
+          tma2d_hint(dst, &tmA, 128 * g, 128 * chunk, bar, pol_el);
+          tma_bs(dst + kABytes, &tmB, 256 * col_b, 4 * g, bar);
+          tma_bs(dst + kABytes + kBBytes, &tmS, 128 * col_b, 4 * g, bar);
+        }
+      }
+      int cur_ti = 0, cur_g = kDist;
+      for (int q = kDist; q < kTotal; ++q) {
+        const int sg = q & 3;
+        if (q >= kStages) {
+          mbar_wait(empty_bar + 8 * sg, ((q - kStages) >> 2) & 1);
+          // Explicit async-proxy fence orders consumer generic-proxy ldmatrix / epi st.shared
+          // before producer async-proxy TMA overwrites this SMEM stage on SM121.
+          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        }
+        const int sc = col_b + cur_ti * kColStride;
+        const uint32_t dst = sbase + sg * kStageBytes, bar = full_bar + 8 * sg;
+        mbar_expect_tx(bar, kABytes + kBBytes + kSBytes);
+        tma2d_hint(dst, &tmA, 128 * cur_g, 128 * chunk, bar, pol_el);
+        tma_bs(dst + kABytes, &tmB, 256 * sc, 4 * cur_g, bar);
+        tma_bs(dst + kABytes + kBBytes, &tmS, 128 * sc, 4 * cur_g, bar);
+        if (++cur_g == kTiles) {
+          cur_g = 0;
+          ++cur_ti;
+        }
+      }
+    }
+    return;
+  }
+
+  wg_reg_alloc_232();
+  const int kw = warp >> 2, nb = (warp >> 1) & 1, sh2 = warp & 1;
+  if (w_raw != nullptr) {
+    constexpr size_t kTpf = 2048u << 10;
+    constexpr size_t kWBytes = (static_cast<size_t>(kFused) * 6656u) >> 1;
+    const size_t g_step = static_cast<size_t>(gridDim.x) * kTpf;
+    for (size_t off = (static_cast<size_t>(blockIdx.x) +
+                       static_cast<size_t>(tid) * static_cast<size_t>(gridDim.x)) * kTpf;
+         off < kWBytes; off += static_cast<size_t>(kThreads) * g_step) {
+      asm volatile("prefetch.global.L2 [%0];" ::"l"(w_raw + off));
+    }
+  }
+  const float gs = global_scale_ptr[0];
+#ifdef MARLINW_TMA_FP8
+  float inverse;
+  asm("div.full.f32 %0, 0f3F800000, %1;" : "=f"(inverse) : "f"(*down_input_scale));
+#endif
+  const int b_rd = kABytes / 4 + 4 * (32 * nb + lane) + 2 * sh2;
+  const int s_rd = (kABytes + kBBytes) / 4 + 2 * (8 * nb + (lane >> 2)) + sh2;
+  constexpr int b_row = 256, s_row = 32;
+  const uint32_t b_base = sbase + static_cast<uint32_t>(4 * (b_rd + b_row * (2 * kw)));
+  const uint32_t sc_base = sbase + static_cast<uint32_t>(4 * (s_rd + s_row * (2 * kw)));
+  const uint32_t a_rd0 = 16 * (8 * (lane & 15) + (((lane >> 4) + 4 * kw) ^ (lane & 7)));
+  const uint32_t a_rd1 = 16 * (8 * (lane & 15) + (((lane >> 4) + 4 * kw + 2) ^ (lane & 7)));
+  int4* const epi = reinterpret_cast<int4*>(
+      reinterpret_cast<char*>(sh) + (sbase - static_cast<uint32_t>(__cvta_generic_to_shared(sh))) +
+      (kStages - 1) * kStageBytes);
+  const int t128 = tid & 127;
+
+  float c[8][2][2][4];
+  FragA fa[2][8];
+  int2 fbq[2];
+  int fsq[2];
+  FragB bb[2][2][2];
+
+  auto load_bs_off = [&](const int o, const uint32_t stage_off) {
+    const uint32_t ba = b_base + stage_off + static_cast<uint32_t>(4 * b_row * o);
+    const uint32_t sa = sc_base + stage_off + static_cast<uint32_t>(4 * s_row * o);
+    asm volatile("ld.shared.v2.b32 {%0, %1}, [%2];" : "=r"(fbq[o].x), "=r"(fbq[o].y) : "r"(ba));
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(fsq[o]) : "r"(sa));
+  };
+  auto dequant_to = [&](const int o) {
+    nv_bfloat162 sc[2];
+    dequant_fp8_scales<nv_bfloat162, vllm::kFE4M3fn.id()>(fsq[o], sc);
+#pragma unroll
+    for (int jj = 0; jj < 2; jj++) {
+      FragB& b0 = bb[o][jj][0];
+      FragB& b1 = bb[o][jj][1];
+      const unsigned u = static_cast<unsigned>(jj == 0 ? fbq[o].x : fbq[o].y);
+      reinterpret_cast<unsigned*>(&b1)[1] = (u & 0x80008000u) | ((u >> 6) & 0x01c001c0u);
+      reinterpret_cast<unsigned*>(&b1)[0] = (((u & 0x0f000f00u) >> 2) * 65u) & 0x81c081c0u;
+      reinterpret_cast<unsigned*>(&b0)[1] = ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
+      reinterpret_cast<unsigned*>(&b0)[0] = ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
+      const nv_bfloat162 s = sc[jj];
+      const nv_bfloat162 s0 = __bfloat162bfloat162(reinterpret_cast<const nv_bfloat16*>(&s)[0]);
+      const nv_bfloat162 s1 = __bfloat162bfloat162(reinterpret_cast<const nv_bfloat16*>(&s)[1]);
+      b0[0] = __hmul2(b0[0], s0);
+      b0[1] = __hmul2(b0[1], s0);
+      b1[0] = __hmul2(b1[0], s1);
+      b1[1] = __hmul2(b1[1], s1);
+    }
+  };
+
+#pragma unroll 1
+  for (int ti = 0; ti < kTilesPerCta; ti++) {
+    const int slice_col = col_b + ti * kColStride;
+    const int q_base = ti * kTiles;
+#pragma unroll
+    for (int i = 0; i < 8 * 16; i++) reinterpret_cast<float*>(c)[i] = 0.0f;
+
+    mbar_wait(full_bar, (q_base >> 2) & 1);
+#pragma unroll
+    for (int j = 0; j < 8; j++) ldsm4(fa[0][j], sbase + a_rd0 + 2048 * j);
+    load_bs_off(0, 0u);
+    dequant_to(0);
+
+    auto run_step_ws12 = [&](const int t_base, const int par, auto step_tag) {
+      constexpr int kStep = decltype(step_tag)::value;
+      constexpr int kS = kStep;
+      constexpr int kNs = (kStep + 1) & 3;
+      constexpr uint32_t kSOff = static_cast<uint32_t>(kStageBytes * kS);
+      constexpr uint32_t kNsOff = static_cast<uint32_t>(kStageBytes * kNs);
+      if constexpr (kPdlMode != 0 && kStep == 0) {
+        if (ti == kTilesPerCta - 1 && t_base == kTiles - 8) pdl_launch_dependents();
+      }
+      load_bs_off(1, kSOff);
+      dequant_to(1);
+      const int next_par = (kStep == 3) ? (par ^ 1) : par;
+      const bool has_next = (kStep < 3) ? true : (t_base + 4 < kTiles);
+      {
+        const uint32_t sa = sbase + kSOff + a_rd1;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          mma16(fa[0][i], bb[0][0][0], c[i][0][0]);
+          mma16(fa[0][i], bb[0][0][1], c[i][0][1]);
+          ldsm4(fa[1][i], sa + 2048 * i);
+        }
+      }
+      __syncwarp();
+      // Hold empty_bar[3] on the final K-tile of tile ti until epi (aliasing Stage 3) completes.
+      if (has_next || kStep != 3) {
+        if (lane == 0) mbar_arrive(empty_bar + 8 * kS);
+      }
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        mma16(fa[0][i], bb[0][1][0], c[i][1][0]);
+        mma16(fa[0][i], bb[0][1][1], c[i][1][1]);
+      }
+      if (has_next) {
+        mbar_wait(full_bar + 8 * kNs, next_par);
+        load_bs_off(0, kNsOff);
+        dequant_to(0);
+      }
+      {
+        const uint32_t sa = sbase + kNsOff + a_rd0;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          mma16(fa[1][i], bb[1][0][0], c[i][0][0]);
+          mma16(fa[1][i], bb[1][0][1], c[i][0][1]);
+          if (has_next) ldsm4(fa[0][i], sa + 2048 * i);
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        mma16(fa[1][i], bb[1][1][0], c[i][1][0]);
+        mma16(fa[1][i], bb[1][1][1], c[i][1][1]);
+      }
+    };
+
+#pragma unroll 1
+    for (int t_base = 0; t_base < kTiles; t_base += 4) {
+      const int par = ((q_base + t_base) >> 2) & 1;
+      run_step_ws12(t_base, par, IntTag<0>{});
+      run_step_ws12(t_base, par, IntTag<1>{});
+      run_step_ws12(t_base, par, IntTag<2>{});
+      run_step_ws12(t_base, par, IntTag<3>{});
+    }
+
+    // Consumer-only epilogue reduction in `epi` (aliases Stage 3; producer already prefetching Stages 0..2).
+    consumer_bar_sync();
+    int4* red = epi;
+    if (kw == 1) {
+#pragma unroll
+      for (int q = 0; q < 16; q++) red[q * 128 + t128] = reinterpret_cast<int4*>(&c[0])[q];
+    }
+    consumer_bar_sync();
+    if (kw == 0) {
+#pragma unroll
+      for (int q = 0; q < 16; q++) {
+        const int4 v = red[q * 128 + t128];
+        float* cf = reinterpret_cast<float*>(&c[0]) + 4 * q;
+        cf[0] += __int_as_float(v.x);
+        cf[1] += __int_as_float(v.y);
+        cf[2] += __int_as_float(v.z);
+        cf[3] += __int_as_float(v.w);
+        red[q * 128 + t128] = reinterpret_cast<int4*>(&c[4])[q];
+      }
+    }
+    consumer_bar_sync();
+    if (kw == 1) {
+#pragma unroll
+      for (int q = 0; q < 16; q++) {
+        const int4 v = red[q * 128 + t128];
+        const float* c4 = reinterpret_cast<const float*>(&c[4]) + 4 * q;
+        float* c0 = reinterpret_cast<float*>(&c[0]) + 4 * q;
+        c0[0] = __int_as_float(v.x) + c4[0];
+        c0[1] = __int_as_float(v.y) + c4[1];
+        c0[2] = __int_as_float(v.z) + c4[2];
+        c0[3] = __int_as_float(v.w) + c4[3];
+      }
+    }
+    consumer_bar_sync();
+    // `epi` (Stage 3) is now free: release empty_bar[3] so producer fills Stage 3 of tile ti+1 behind SwiGLU stores!
+    if (lane == 0) mbar_arrive(empty_bar + 8 * 3);
+
+    const int q = lane & 3;
+    const int r0 = 128 * chunk + 64 * kw + (lane >> 2);
+    const int out_col0 = 64 * slice_col + 16 * (2 * nb + sh2);
+    auto eval_silu = [&](__nv_bfloat16 bg) -> float {
+      if constexpr (kLutSilu) return __ldg(bf16_silu + __bfloat16_as_ushort(bg));
+      else                    return swiglu_silu(__bfloat162float(bg));
+    };
+#ifdef MARLINW_TMA_FP8
+    uint8_t* out_u8 = reinterpret_cast<uint8_t*>(out);
+    auto eval_fp8_pair = [&](float g0, float u0, float g1, float u1) -> uint32_t {
+      const __nv_bfloat16 bg0 = __float2bfloat16_rn(g0 * gs);
+      const __nv_bfloat16 bu0 = __float2bfloat16_rn(u0 * gs);
+      const __nv_bfloat16 bg1 = __float2bfloat16_rn(g1 * gs);
+      const __nv_bfloat16 bu1 = __float2bfloat16_rn(u1 * gs);
+      const float q0 = __fmul_rn(__fmul_rn(eval_silu(bg0), __bfloat162float(bu0)), inverse);
+      const float q1 = __fmul_rn(__fmul_rn(eval_silu(bg1), __bfloat162float(bu1)), inverse);
+      uint16_t conv;
+      asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(conv) : "f"(q1), "f"(q0));
+      return static_cast<uint32_t>(conv);
+    };
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const uint32_t v0 = eval_fp8_pair(c[i][0][0][0], c[i][1][0][0], c[i][0][0][1], c[i][1][0][1]);
+      const uint32_t v1 = eval_fp8_pair(c[i][0][0][2], c[i][1][0][2], c[i][0][0][3], c[i][1][0][3]);
+      const uint32_t v2 = eval_fp8_pair(c[i][0][1][0], c[i][1][1][0], c[i][0][1][1], c[i][1][1][1]);
+      const uint32_t v3 = eval_fp8_pair(c[i][0][1][2], c[i][1][1][2], c[i][0][1][3], c[i][1][1][3]);
+      const uint32_t r1 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 1), 1);
+      const uint32_t r2 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 2), 2);
+      const uint32_t r3 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 3), 3);
+      const uint32_t own = sel4_u32(v0, v1, v2, v3, q);
+      const uint32_t x0 = sel4_u32(own, r1, r2, r3, 0 ^ q);
+      const uint32_t x1 = sel4_u32(own, r1, r2, r3, 1 ^ q);
+      const uint32_t x2 = sel4_u32(own, r1, r2, r3, 2 ^ q);
+      const uint32_t x3 = sel4_u32(own, r1, r2, r3, 3 ^ q);
+      const uint32_t w0 = x0 | (x1 << 16);
+      const uint32_t w1 = x2 | (x3 << 16);
+      const int r_out = r0 + 16 * i + (q & 1) * 8;
+      const int c_out = out_col0 + (q >> 1) * 8;
+      uint2* dst_p = reinterpret_cast<uint2*>(&out_u8[(size_t)r_out * (kFused / 2) + c_out]);
+      if constexpr (kCsOut) {
+        asm volatile("st.global.cs.v2.u32 [%0], {%1,%2};" :: "l"(dst_p), "r"(w0), "r"(w1) : "memory");
+      } else {
+        *dst_p = make_uint2(w0, w1);
+      }
+    }
+#else
+    __nv_bfloat16* out_bf16 = reinterpret_cast<__nv_bfloat16*>(out);
+    auto eval_bf16_pair = [&](float g0, float u0, float g1, float u1) -> uint32_t {
+      const __nv_bfloat16 bg0 = __float2bfloat16_rn(g0 * gs);
+      const __nv_bfloat16 bu0 = __float2bfloat16_rn(u0 * gs);
+      const __nv_bfloat16 bg1 = __float2bfloat16_rn(g1 * gs);
+      const __nv_bfloat16 bu1 = __float2bfloat16_rn(u1 * gs);
+      const __nv_bfloat16 p0 = __float2bfloat16_rn(__fmul_rn(eval_silu(bg0), __bfloat162float(bu0)));
+      const __nv_bfloat16 p1 = __float2bfloat16_rn(__fmul_rn(eval_silu(bg1), __bfloat162float(bu1)));
+      const __nv_bfloat162 r = __halves2bfloat162(p0, p1);
+      return *reinterpret_cast<const uint32_t*>(&r);
+    };
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const uint32_t v0 = eval_bf16_pair(c[i][0][0][0], c[i][1][0][0], c[i][0][0][1], c[i][1][0][1]);
+      const uint32_t v1 = eval_bf16_pair(c[i][0][0][2], c[i][1][0][2], c[i][0][0][3], c[i][1][0][3]);
+      const uint32_t v2 = eval_bf16_pair(c[i][0][1][0], c[i][1][1][0], c[i][0][1][1], c[i][1][1][1]);
+      const uint32_t v3 = eval_bf16_pair(c[i][0][1][2], c[i][1][1][2], c[i][0][1][3], c[i][1][1][3]);
+      const uint32_t r1 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 1), 1);
+      const uint32_t r2 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 2), 2);
+      const uint32_t r3 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 3), 3);
+      const uint32_t own = sel4_u32(v0, v1, v2, v3, q);
+      uint4 w;
+      w.x = sel4_u32(own, r1, r2, r3, 0 ^ q);
+      w.y = sel4_u32(own, r1, r2, r3, 1 ^ q);
+      w.z = sel4_u32(own, r1, r2, r3, 2 ^ q);
+      w.w = sel4_u32(own, r1, r2, r3, 3 ^ q);
+      const int r_out = r0 + 16 * i + (q & 1) * 8;
+      const int c_out = out_col0 + (q >> 1) * 8;
+      uint4* dst_p = reinterpret_cast<uint4*>(&out_bf16[(size_t)r_out * (kFused / 2) + c_out]);
+      if constexpr (kCsOut) {
+        asm volatile("st.global.cs.v4.u32 [%0], {%1,%2,%3,%4};"
+                     :: "l"(dst_p), "r"(w.x), "r"(w.y), "r"(w.z), "r"(w.w) : "memory");
+      } else {
+        *dst_p = w;
+      }
+    }
+#endif
+  }  // tiles of this CTA
+}
 #endif
 
 // ---- host side: tensor maps --------------------------------------------------------------------------------------
@@ -1817,10 +2191,21 @@ static int gateup_ilv_pdl_mode() {
   }();
   return mode;
 }
+static bool gateup_ilv_ws12_enabled() {
+  static const bool on = []() -> bool {
+    const char* env = std::getenv("MARLINW_GATEUP_WS12");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  return on;
+}
 static cudaError_t set_gateup_attrs() {
   cudaError_t s = cudaSuccess;
   auto set1 = [&](auto fn, int smem) {
     if (s == cudaSuccess) s = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  };
+  auto set1_ws12 = [&](auto fn, int smem) {
+    if (s == cudaSuccess) s = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (s == cudaSuccess) cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   };
   set1(gateup<0, 1, false, true>, kSharedFor<1>());
   set1(gateup<1, 1, false, false>, kSharedFor<1>());
@@ -1849,6 +2234,12 @@ static cudaError_t set_gateup_attrs() {
   set1(gateup_ilv<2, 26, true, false, false, false>, kSharedFor<26>());
   set1(gateup_ilv<1, 26, true, false, false, false>, kSharedFor<26>());
   set1(gateup_ilv<1, 1, true, false, false, false>, kSharedFor<1>());
+  // SM121 WS12 (232/40-reg) 26-tile gateup_ilv variants (MARLINW_GATEUP_WS12=1)
+  set1_ws12(gateup_ilv_ws12<0, 26, true, false, true>, kSharedFor<26>());
+  set1_ws12(gateup_ilv_ws12<1, 26, true, false, true>, kSharedFor<26>());
+  set1_ws12(gateup_ilv_ws12<2, 26, true, false, true>, kSharedFor<26>());
+  set1_ws12(gateup_ilv_ws12<2, 26, true, false, false>, kSharedFor<26>());
+  set1_ws12(gateup_ilv_ws12<2, 26, true, true, true>, kSharedFor<26>());
   return s;
 }
 template <typename... Extra>
@@ -1882,6 +2273,27 @@ static cudaError_t dispatch_gateup_ilv(int pm, int tpc, bool cs, bool ef, bool e
     return launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 1>{}, std::false_type{}, std::false_type{});
   }
   if (tpc == 26) {
+    if (gateup_ilv_ws12_enabled()) {
+      constexpr int grid = (m / 128) * (n / 128) / 26;
+      if (pm == 0) {
+        gateup_ilv_ws12<0, 26, true, false, true><<<grid, kThreadsWs12, kSharedFor<26>(), stream>>>(
+            tmA, tmB, tmS, out, global, w_raw, extra...);
+        return cudaGetLastError();
+      }
+      if (pm == 1) {
+        gateup_ilv_ws12<1, 26, true, false, true><<<grid, kThreadsWs12, kSharedFor<26>(), stream>>>(
+            tmA, tmB, tmS, out, global, w_raw, extra...);
+        return cudaGetLastError();
+      }
+      if (!ef && !lut_silu) {
+        return launch_ex_pdl(gateup_ilv_ws12<2, 26, true, false, false>, grid, kThreadsWs12, kSharedFor<26>(), stream,
+                             tmA, tmB, tmS, out, global, w_raw, extra...);
+      }
+      return ef ? launch_ex_pdl(gateup_ilv_ws12<2, 26, true, true, true>, grid, kThreadsWs12, kSharedFor<26>(), stream,
+                                tmA, tmB, tmS, out, global, w_raw, extra...)
+                : launch_ex_pdl(gateup_ilv_ws12<2, 26, true, false, true>, grid, kThreadsWs12, kSharedFor<26>(), stream,
+                                tmA, tmB, tmS, out, global, w_raw, extra...);
+    }
     if (pm == 0) return launch(std::integral_constant<int, 0>{}, std::integral_constant<int, 26>{}, std::false_type{}, std::true_type{});
     if (pm == 1) return launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 26>{}, std::false_type{}, std::true_type{});
     if (!ef && !lut_silu) {

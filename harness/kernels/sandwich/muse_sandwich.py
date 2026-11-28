@@ -48,6 +48,11 @@ _set_pdl = getattr(_library, "muse_sandwich_set_pdl", None)
 if _set_pdl is not None:
     _set_pdl.argtypes = [ctypes.c_int]
     _set_pdl.restype = ctypes.c_int
+_set_dead_extra = getattr(_library, "muse_sandwich_set_dead_extra", None)
+if _set_dead_extra is not None:
+    _set_dead_extra.argtypes = [_pointer, ctypes.c_size_t]
+    _set_dead_extra.restype = None
+DISCARD_SWIGLU = os.environ.get("MUSE_SANDWICH_DISCARD_SWIGLU", "1") != "0" and _set_dead_extra is not None
 
 
 def set_pdl(on: bool) -> bool | None:
@@ -85,8 +90,62 @@ class _Layer:
 _layers = {}  # qkv input-scale data_ptr -> _Layer
 _pending = None  # (data_ptr of the hidden rows, _Layer) of the last folding / checked sandwich launch
 _expect = None  # (requant output data_ptr, _Layer, folded) awaiting the next 512-row FP8 GEMM
+_dead_extra = None  # (act_tensor, down_out_data_ptr) for zero-race inline L2 discard of dead swiglu_out
 active = FOLD  # runtime switch (diagnostics: a graph captured with active False runs the plain kernels)
 _fold_counts = Counter()
+
+
+def stash_dead_down_input(act, out) -> None:
+    """Stash a 512-row down_proj input (swiglu_out) and its output (down_out) so the immediately
+    following sandwich launch can issue discard.global.L2 on swiglu_out after verifying exact down_out
+    match and zero byte-range overlap. Holding `act` until sandwich launches prevents allocator reuse
+    for sandwich's own outputs in both eager execution and CUDA graph capture."""
+    global _dead_extra
+    if not DISCARD_SWIGLU or act is None or out is None:
+        return
+    if not (act.is_cuda and out.is_cuda and act.is_contiguous()):
+        return
+    if act.numel() * act.element_size() < 128:
+        return
+    _dead_extra = (act, out.data_ptr())
+
+
+def _clear_dead_extra():
+    global _dead_extra
+    _dead_extra = None
+    return None
+
+
+def _pop_and_arm_dead_extra(args, addresses, extra_tensors=()):
+    """Pop stashed down_proj input and arm one-shot L2 discard if exact down_out matches with zero overlap.
+    Returns the tensor so the caller keeps it alive until after the CUDA launch returns."""
+    global _dead_extra
+    entry = _dead_extra
+    _dead_extra = None
+    if entry is None or not DISCARD_SWIGLU:
+        return None
+    dead_tensor, expected_down_ptr = entry
+    if len(addresses) < 2 or addresses[1] != expected_down_ptr:
+        return None
+    d_start = dead_tensor.data_ptr()
+    d_bytes = dead_tensor.numel() * dead_tensor.element_size()
+    if d_bytes < 128:
+        return None
+    d_end = d_start + d_bytes
+    for t in args[:-2]:
+        if hasattr(t, "data_ptr"):
+            t_start = t.data_ptr()
+            t_end = t_start + t.numel() * t.element_size()
+            if d_start < t_end and t_start < d_end:
+                return None
+    for t in extra_tensors:
+        if t is not None and hasattr(t, "data_ptr"):
+            t_start = t.data_ptr()
+            t_end = t_start + t.numel() * t.element_size()
+            if d_start < t_end and t_start < d_end:
+                return None
+    _set_dead_extra(d_start, d_bytes)
+    return dead_tensor
 
 
 def register_gate(qkv_scale, gate_scale) -> bool:
@@ -184,11 +243,15 @@ def install():
                 quantize, rows, addresses = match
                 if quantize and rows == _ROWS and _layers and _fold_sandwich(args, addresses, stream):
                     return None
-                pointers = (_pointer * len(addresses))(*addresses)
-                if not quantize and rows == _ROWS and RESIDUAL_EVICT_LAST and active and _hint_launch is not None:
-                    status = _hint_launch(pointers, rows, 0, 0, 1, stream)
-                else:
-                    status = _launch(pointers, rows, quantize, rows == 512, stream)
+                keep_dead = _pop_and_arm_dead_extra(args, addresses) if rows == _ROWS else _clear_dead_extra()
+                try:
+                    pointers = (_pointer * len(addresses))(*addresses)
+                    if not quantize and rows == _ROWS and RESIDUAL_EVICT_LAST and active and _hint_launch is not None:
+                        status = _hint_launch(pointers, rows, 0, 0, 1, stream)
+                    else:
+                        status = _launch(pointers, rows, quantize, rows == 512, stream)
+                finally:
+                    keep_dead = None
                 if status:
                     raise RuntimeError(f"CUDA sandwich launch failed with error {status}")
                 _launch_counts[rows, quantize] += 1
@@ -234,11 +297,15 @@ def _fold_sandwich(args, addresses, stream) -> bool:
     capturing = torch.cuda.is_current_stream_capturing()
     hidden = args[8]
     if layer.state == "admitted":
-        if (EVICT_LAST or RESIDUAL_EVICT_LAST) and DROP_HIDDEN and _hint_launch is not None:
-            status = _hint_launch(_gate_pointers(addresses, layer), _ROWS, 1, int(EVICT_LAST), int(RESIDUAL_EVICT_LAST),
-                                  stream)
-        else:
-            status = _gate_launch(_gate_pointers(addresses, layer), _ROWS, True, not DROP_HIDDEN, stream)
+        keep_dead = _pop_and_arm_dead_extra(args, addresses, (layer.buffer,))
+        try:
+            if (EVICT_LAST or RESIDUAL_EVICT_LAST) and DROP_HIDDEN and _hint_launch is not None:
+                status = _hint_launch(_gate_pointers(addresses, layer), _ROWS, 1, int(EVICT_LAST), int(RESIDUAL_EVICT_LAST),
+                                      stream)
+            else:
+                status = _gate_launch(_gate_pointers(addresses, layer), _ROWS, True, not DROP_HIDDEN, stream)
+        finally:
+            keep_dead = None
         if status:
             raise RuntimeError(f"CUDA folding sandwich launch failed with error {status}")
         _pending = (hidden.data_ptr(), layer, args[9].data_ptr())
@@ -247,6 +314,7 @@ def _fold_sandwich(args, addresses, stream) -> bool:
         return True
     if capturing or layer.state != "unchecked":
         return False  # checks run only on eager launches; until then the plain sandwich runs
+    _clear_dead_extra()
     # Check: the plain native sandwich writes the real outputs; the folding one writes copies from the same inputs.
     snapshot = [t.clone() for t in args[:10]]
     pointers = (_pointer * 10)(*addresses)
