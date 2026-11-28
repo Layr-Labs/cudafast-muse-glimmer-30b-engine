@@ -185,7 +185,10 @@ def fp8_gate_swiglu(
     a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor,
     down_scale: torch.Tensor,
 ) -> torch.Tensor:
-    return _swiglu.apply(a, b, scale_a, scale_b, down_scale)
+    out = _swiglu.apply(a, b, scale_a, scale_b, down_scale)
+    if a.shape == (512, 6656) and hasattr(_swiglu, "stash_dead_mlp_in"):
+        _swiglu.stash_dead_mlp_in(a)
+    return out
 
 
 @fp8_gate_swiglu.register_fake
