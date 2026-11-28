@@ -65,6 +65,7 @@ __device__ __forceinline__ void rans_cp_commit() { asm volatile("cp.async.commit
 template <int N>
 __device__ __forceinline__ void rans_cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
 __device__ __forceinline__ uint32_t rans_lds32(uint32_t addr) { uint32_t v; asm volatile("ld.shared.u32 %0, [%1];" : "=r"(v) : "r"(addr)); return v; }
+__device__ __forceinline__ uint32_t rans_lut_addr(uint32_t lut_sa, uint32_t st) { uint32_t idx, addr; asm("and.b32 %0, %1, 4095;" : "=r"(idx) : "r"(st)); asm("mad.lo.u32 %0, %1, 4, %2;" : "=r"(addr) : "r"(idx), "r"(lut_sa)); return addr; }
 __device__ __forceinline__ uint32_t rans_lds16(uint32_t addr) { unsigned short v; asm volatile("ld.shared.u16 %0, [%1];" : "=h"(v) : "r"(addr)); return (uint32_t)v; }
 __device__ __forceinline__ uint32_t rans_lop3_ea(uint32_t a, uint32_t b, uint32_t c) {
   uint32_t d;
@@ -448,10 +449,10 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
   // pre-issue and the per-warp stream offsets are loaded next to it, so neither queues in DRAM behind the
   // pre-issued groups; the prologue (x staging) then overlaps them and the main loop starts ~2-3 us earlier.
   // Same table, same offsets, same stream: bit-identical output.
+  const uint32_t lut_sa = (uint32_t)__cvta_generic_to_shared(lut_s);
   const bool lut_first = pb.lut_first != 0;
   int pre_wo0 = 0, pre_wo1 = 0, pre_tof = 0, pre_gmin = 0;
   if (lut_first) {
-    const uint32_t lut_sa = (uint32_t)__cvta_generic_to_shared(lut_s);
     for (int i = tid; i < RANS_LUT_BYTES / 16; i += blockDim.x)
       asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(lut_sa + 16u * (uint32_t)i), "l"(((const uint4*)pb.lut) + i));
     rans_cp_commit();
@@ -728,6 +729,11 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
     for (int state = 0; state < NS; ++state) {
       states[state] = rans_lds32(ring_s | ((128u * state + 4u * lane) & (RB - 1u)));
     }
+#if RANS_PREISSUE
+    if constexpr (kPar4 && NS == 4 && GBS == 9 && kIlvMode == 1 && RG >= 2) {
+      RANS_ISSUE();
+    }
+#endif
   }
   if constexpr (kXMma) {
     if (pb.pdl_mode & 1) {
@@ -737,7 +743,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
     }
     if (!active && pb.xmma_sync_steps == 0) return;
   }
-  const float sa_v = kXMma ? __ldg(pb.sa) : sa_v_early;
+  const float sa_v = kXMma ? 0.f : sa_v_early;
   uint32_t pwb = 128u * NS;
 
   if constexpr (kPar4 && NS == 4 && GBS == 9 && kIlvMode == 1) {
@@ -760,7 +766,7 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
     const int xmma_sync_step = (kXMma && pb.xmma_sync_steps > 0) ? pb.xmma_sync_steps : S;
     const bool use_xmma_sync = kXMma && (pb.xmma_sync_steps > 0);
     const int R_max = (NB + pb.tw - 1) / pb.tw;
-    const float sb_s = pb.sb_scalar ? __ldg(pb.sb) : 0.0f;
+    const float sb_s = (!kXMma && pb.sb_scalar) ? __ldg(pb.sb) : 0.0f;
     int cur_buf = 0;
     for (int r_i = 0; r_i < R_max; ++r_i) {
       const int nb = w + r_i * pb.tw;
@@ -803,10 +809,26 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
               asm volatile("griddepcontrol.launch_dependents;");
             }
             // Early-issue cp.async ring refill before LUT/ALU/xpose4 so DRAM/L2 latency overlaps compute.
+            // With GBS==9 (512 B) and NS==4 (max 384 B/step) + group RG-1 pre-issued above, curg advances
+            // by <=1 per step, so at most 1 ring group is ever needed (eliminates nvcc's 7x-unrolled refill loop).
             const int curg = (int)(pwb >> GBS);
             const bool need_refill = (issued <= curg + (RG - 1));
             if (need_refill) {
               __syncwarp();
+#if RANS_PREISSUE
+              {
+                const uint32_t boff = ((uint32_t)issued << GBS) + lane16;
+                if (boff < wbytes) {
+                  const uint8_t* src = (issued < gmin) ? ilv_ptr : (tail_w + ((size_t)(issued - gmin) << GBS));
+                  rans_cp_async16_s(ring_lane + (((uint32_t)issued << GBS) & (RB - 1u)), src, pol);
+                }
+                if (issued < gmin) ilv_ptr += stride_g;
+                rans_cp_commit();
+                if constexpr (kXsmem) x_commits++;
+                issued++;
+              }
+#else
+#pragma unroll 1
               do {
                 const uint32_t boff = ((uint32_t)issued << GBS) + lane16;
                 if (boff < wbytes) {
@@ -818,12 +840,13 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
                 if constexpr (kXsmem) x_commits++;
                 issued++;
               } while (issued <= curg + (RG - 1));
+#endif
             }
             // Pre-issue all 4 independent LUT loads and activation load while ring refill is in flight.
-            const uint32_t e0 = ((const uint32_t*)lut_s)[states[0] & 4095u];
-            const uint32_t e1 = ((const uint32_t*)lut_s)[states[1] & 4095u];
-            const uint32_t e2 = ((const uint32_t*)lut_s)[states[2] & 4095u];
-            const uint32_t e3 = ((const uint32_t*)lut_s)[states[3] & 4095u];
+            const uint32_t e0 = rans_lds32(rans_lut_addr(lut_sa, states[0]));
+            const uint32_t e1 = rans_lds32(rans_lut_addr(lut_sa, states[1]));
+            const uint32_t e2 = rans_lds32(rans_lut_addr(lut_sa, states[2]));
+            const uint32_t e3 = rans_lds32(rans_lut_addr(lut_sa, states[3]));
             uint2 a = make_uint2(0u, 0u);
             uint2 a_hi = make_uint2(0u, 0u);
             uint2 a2 = make_uint2(0u, 0u);
@@ -889,10 +912,14 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             const uint32_t m2 = __ballot_sync(0xffffffffu, n2);
             const uint32_t m3 = __ballot_sync(0xffffffffu, n3);
             const uint32_t p0 = pwb_n + 128u;
-            const uint32_t p1 = p0 + (__popc(m0) << 1);
-            const uint32_t p2 = p1 + (__popc(m1) << 1);
-            const uint32_t p3 = p2 + (__popc(m2) << 1);
-            pwb = p3 + (__popc(m3) << 1);
+            const uint32_t c0_b = __popc(m0) << 1;
+            const uint32_t c1_b = __popc(m1) << 1;
+            const uint32_t c2_b = __popc(m2) << 1;
+            const uint32_t c3_b = __popc(m3) << 1;
+            const uint32_t p1 = p0 + c0_b;
+            const uint32_t p2 = p0 + (c0_b + c1_b);
+            const uint32_t p3 = p2 + c2_b;
+            pwb = p2 + (c2_b + c3_b);
             const uint32_t ro0 = ring_s | ((p0 + (__popc(m0 & lt) << 1)) & (RB - 1u));
             const uint32_t ro1 = ring_s | ((p1 + (__popc(m1 & lt) << 1)) & (RB - 1u));
             const uint32_t ro2 = ring_s | ((p2 + (__popc(m2 & lt) << 1)) & (RB - 1u));
@@ -900,8 +927,8 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             const uint32_t Pw01 = __byte_perm(e0, e1, 0x7740);
             const uint32_t Pw23 = __byte_perm(e2, e3, 0x7740);
             const uint32_t Pw = __byte_perm(Pw01, Pw23, 0x5410);
-            const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
-            const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
+            const uint32_t hiE3 = (Pw >> 1) & 0x78787878u, loE3 = (Pw << 3) & 0x78787878u;
+            const uint32_t E0 = __byte_perm(hiE3, loE3, 0x5140), E1 = __byte_perm(hiE3, loE3, 0x7362);
             if constexpr (!kXMma && !kXsmem && kXGlobalMode == 1) {
               if ((s & 1) == 0) {
                 rans_xpose4(v_lo, t, a.x, a.y, a_next.x, a_next.y);
@@ -918,25 +945,44 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
                 if constexpr (kM32) { a2 = a2_next; a2_hi = a2_hi_next; }
               }
             }
-            // Wait for ring group right before reading nw and r0..r3 in parallel.
+            uint32_t ro0_r = ro0, ro1_r = ro1, ro2_r = ro2, ro3_r = ro3, e0_r = E0, e1_r = E1;
+            if constexpr (kXMma) {
+              asm volatile("" : "+r"(ro0_r), "+r"(ro1_r), "+r"(ro2_r), "+r"(ro3_r), "+r"(pwb), "+r"(e0_r), "+r"(e1_r) :: "memory");
+            }
+            // Wait for ring group, issue critical-path r0..r3 BEFORE nw, commit states early so unroll overlaps next LUT gather with MMA.
             if (need_refill) {
               rans_cp_wait<RG - 2>();
               __syncwarp();
             }
+            uint32_t r0, r1, r2, r3;
+            asm volatile(
+                "{\n"
+                "  .reg .pred p0, p1, p2, p3;\n"
+                "  setp.lt.u32 p0, %8, 65536;\n"
+                "  setp.lt.u32 p1, %9, 65536;\n"
+                "  setp.lt.u32 p2, %10, 65536;\n"
+                "  setp.lt.u32 p3, %11, 65536;\n"
+                "  @p0 ld.shared.u16 %0, [%4];\n"
+                "  @p1 ld.shared.u16 %1, [%5];\n"
+                "  @p2 ld.shared.u16 %2, [%6];\n"
+                "  @p3 ld.shared.u16 %3, [%7];\n"
+                "}\n"
+                : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                : "r"(ro0_r), "r"(ro1_r), "r"(ro2_r), "r"(ro3_r), "r"(x0), "r"(x1), "r"(x2), "r"(x3));
             uint32_t nw;
             if ((pwb_n & 2u) == 0u) {
               nw = rans_lds32(ring_s | (na & (RB - 1u)));
             } else {
-              nw = rans_lds16(ring_s | (na & (RB - 1u))) | (rans_lds16(ring_s | ((na + 2u) & (RB - 1u))) << 16);
+              nw = __byte_perm(rans_lds16(ring_s | (na & (RB - 1u))), rans_lds16(ring_s | ((na + 2u) & (RB - 1u))), 0x5410);
             }
-            const uint32_t r0 = n0 ? rans_lds16(ro0) : 0u;
-            const uint32_t r1 = n1 ? rans_lds16(ro1) : 0u;
-            const uint32_t r2 = n2 ? rans_lds16(ro2) : 0u;
-            const uint32_t r3 = n3 ? rans_lds16(ro3) : 0u;
-            // Assemble FP8 B-operand from nw + E0/E1, issue MMA (hides r0..r3 LDS latency), commit states.
+            // Assemble FP8 B-operand from nw + pre-shifted E0/E1, commit states early via single PRMT, issue MMA.
             const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-            const uint32_t bw0 = rans_pack_e4m3x4(u0, E0 << 3);
-            const uint32_t bw1 = rans_pack_e4m3x4(u1, E1 << 3);
+            const uint32_t bw0 = rans_pack_e4m3x4(u0, e0_r);
+            const uint32_t bw1 = rans_pack_e4m3x4(u1, e1_r);
+            states[0] = n0 ? __byte_perm(r0, x0, 0x5410) : x0;
+            states[1] = n1 ? __byte_perm(r1, x1, 0x5410) : x1;
+            states[2] = n2 ? __byte_perm(r2, x2, 0x5410) : x2;
+            states[3] = n3 ? __byte_perm(r3, x3, 0x5410) : x3;
             if constexpr (kM16) {
               rans_mma_e4m3_m16(c0, c1, c2, c3, a.x, a_hi.x, a.y, a_hi.y, bw0, bw1);
               if constexpr (kM32) {
@@ -945,45 +991,45 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             } else {
               rans_mma_e4m3(c0, c1, c2, c3, a.x, a.y, bw0, bw1);
             }
-            // Commit next-iteration rANS states.
-            states[0] = n0 ? ((x0 << 16) | r0) : x0;
-            states[1] = n1 ? ((x1 << 16) | r1) : x1;
-            states[2] = n2 ? ((x2 << 16) | r2) : x2;
-            states[3] = n3 ? ((x3 << 16) | r3) : x3;
           };
           if constexpr (kXMma) {
-            const int n_s = s_end - cs;
-            if (pb.unroll2 == 2 && (n_s & 3) == 0 && (trig_s < cs || trig_s >= s_end)) {
+            if (trig_s == cs) {
+              asm volatile("griddepcontrol.launch_dependents;");
+            }
+            int s = cs;
+            int s_lim = (trig_s > cs && trig_s < s_end) ? trig_s : s_end;
+            for (;;) {
+              const int n_s = s_lim - s;
+              if (pb.unroll2 && (n_s & 3) == 0) {
 #pragma unroll 4
-              for (int s = cs; s < s_end; ++s) {
-                do_k_step(s, false);
-              }
-            } else if (pb.unroll2 && (n_s & 1) == 0 && (trig_s < cs || trig_s >= s_end)) {
-#pragma unroll 2
-              for (int s = cs; s < s_end; ++s) {
-                do_k_step(s, false);
-              }
-            } else {
+                for (; s < s_lim; ++s) {
+                  do_k_step(s, false);
+                }
+              } else {
 #pragma unroll 1
-              for (int s = cs; s < s_end; ++s) {
-                do_k_step(s, true);
+                for (; s < s_lim; ++s) {
+                  do_k_step(s, false);
+                }
               }
+              if (s_lim == s_end) break;
+              asm volatile("griddepcontrol.launch_dependents;");
+              s_lim = s_end;
             }
           } else if constexpr (kXsmem) {
-            if (pb.unroll2 == 2 && cs + kChunkSteps <= S && (trig_s < cs || trig_s >= cs + kChunkSteps)) {
+            const bool trig_at_cs = (trig_s == cs);
+            if (trig_at_cs) {
+              asm volatile("griddepcontrol.launch_dependents;");
+            }
+            const bool trig_inside = (!trig_at_cs && trig_s > cs && trig_s < cs + kChunkSteps);
+            if (pb.unroll2 && cs + kChunkSteps <= S && !trig_inside) {
 #pragma unroll 4
-              for (int sl = 0; sl < kChunkSteps; ++sl) {
-                do_k_step(cs + sl, false);
-              }
-            } else if (pb.unroll2 && cs + kChunkSteps <= S && (trig_s < cs || trig_s >= cs + kChunkSteps)) {
-#pragma unroll 2
               for (int sl = 0; sl < kChunkSteps; ++sl) {
                 do_k_step(cs + sl, false);
               }
             } else {
 #pragma unroll 1
               for (int s = cs; s < s_end; s++) {
-                do_k_step(s, true);
+                do_k_step(s, !trig_at_cs);
               }
             }
           } else {
@@ -1012,23 +1058,25 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
       }
       if (do_nb && valid_m) {
         const int n = nb * 8 + 2 * t;
-        const float2 sb2 = pb.sb_scalar ? make_float2(sb_s, sb_s)
+        const float sa_out = kXMma ? __ldg(pb.sa) : sa_v;
+        const float sb_out = (kXMma && pb.sb_scalar) ? __ldg(pb.sb) : sb_s;
+        const float2 sb2 = pb.sb_scalar ? make_float2(sb_out, sb_out)
                                         : __ldg(reinterpret_cast<const float2*>(pb.sb + n));
-        __nv_bfloat162 r; r.x = __float2bfloat16_rn(sa_v * (sb2.x * c0)); r.y = __float2bfloat16_rn(sa_v * (sb2.y * c1));
+        __nv_bfloat162 r; r.x = __float2bfloat16_rn(sa_out * (sb2.x * c0)); r.y = __float2bfloat16_rn(sa_out * (sb2.y * c1));
         *(__nv_bfloat162*)(pb.out + (size_t)g * pb.N + n) = r;
         if constexpr (kM16) {
           if (valid_m_hi) {
-            __nv_bfloat162 r2; r2.x = __float2bfloat16_rn(sa_v * (sb2.x * c2)); r2.y = __float2bfloat16_rn(sa_v * (sb2.y * c3));
+            __nv_bfloat162 r2; r2.x = __float2bfloat16_rn(sa_out * (sb2.x * c2)); r2.y = __float2bfloat16_rn(sa_out * (sb2.y * c3));
             *(__nv_bfloat162*)(pb.out + (size_t)(g + 8) * pb.N + n) = r2;
           }
         }
         if constexpr (kM32) {
           if (valid_m16) {
-            __nv_bfloat162 r3; r3.x = __float2bfloat16_rn(sa_v * (sb2.x * c4)); r3.y = __float2bfloat16_rn(sa_v * (sb2.y * c5));
+            __nv_bfloat162 r3; r3.x = __float2bfloat16_rn(sa_out * (sb2.x * c4)); r3.y = __float2bfloat16_rn(sa_out * (sb2.y * c5));
             *(__nv_bfloat162*)(pb.out + (size_t)(g + 16) * pb.N + n) = r3;
           }
           if (valid_m24) {
-            __nv_bfloat162 r4; r4.x = __float2bfloat16_rn(sa_v * (sb2.x * c6)); r4.y = __float2bfloat16_rn(sa_v * (sb2.y * c7));
+            __nv_bfloat162 r4; r4.x = __float2bfloat16_rn(sa_out * (sb2.x * c6)); r4.y = __float2bfloat16_rn(sa_out * (sb2.y * c7));
             *(__nv_bfloat162*)(pb.out + (size_t)(g + 24) * pb.N + n) = r4;
           }
         }
@@ -1077,11 +1125,11 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
         if (need) x = (x << 16) | rans_lds16(ring_s | ((pwb + (__popc(m & lt) << 1)) & (RB - 1u)));
         pwb += __popc(m) << 1;
       }
-      const uint32_t hiE = (Pw >> 4) & 0x0F0F0F0Fu, loE = Pw & 0x0F0F0F0Fu;
-      const uint32_t E0 = __byte_perm(hiE, loE, 0x5140), E1 = __byte_perm(hiE, loE, 0x7362);
+      const uint32_t hiE3 = (Pw >> 1) & 0x78787878u, loE3 = (Pw << 3) & 0x78787878u;
+      const uint32_t E0 = __byte_perm(hiE3, loE3, 0x5140), E1 = __byte_perm(hiE3, loE3, 0x7362);
       const uint32_t u0 = __byte_perm(nw, 0u, 0x1100), u1 = __byte_perm(nw, 0u, 0x3322);
-      const uint32_t bw0 = rans_pack_e4m3x4(u0, E0 << 3);
-      const uint32_t bw1 = rans_pack_e4m3x4(u1, E1 << 3);
+      const uint32_t bw0 = rans_pack_e4m3x4(u0, E0);
+      const uint32_t bw1 = rans_pack_e4m3x4(u1, E1);
       uint2 a = make_uint2(0u, 0u);
       uint2 a_hi = make_uint2(0u, 0u);
       if (g < pb.M) {
@@ -1427,13 +1475,16 @@ __global__ void __launch_bounds__(256) rans_pack_x_mma_kernel(
     const int off = sp << 2;
     const uint4 q0 = v0 ? __ldg(r0 + off) : z4;
     const uint4 q1 = v1 ? __ldg(r1 + off) : z4;
+    uint4 q2 = z4, q3 = z4;
+    if constexpr (kM32) {
+      q2 = v2 ? __ldg(r2 + off) : z4;
+      q3 = v3 ? __ldg(r3 + off) : z4;
+    }
     uint32_t a0x, a0y, b0x, b0y, a1x, a1y, b1x, b1y;
     rans_xpose4(q0, t, a0x, a0y, b0x, b0y);
     rans_xpose4(q1, t, a1x, a1y, b1x, b1y);
     const int s0 = sp << 1;
     if constexpr (kM32) {
-      const uint4 q2 = v2 ? __ldg(r2 + off) : z4;
-      const uint4 q3 = v3 ? __ldg(r3 + off) : z4;
       uint32_t a2x, a2y, b2x, b2y, a3x, a3y, b3x, b3y;
       rans_xpose4(q2, t, a2x, a2y, b2x, b2y);
       rans_xpose4(q3, t, a3x, a3y, b3x, b3y);

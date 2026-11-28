@@ -3564,7 +3564,7 @@ static const CalibKnobs& get_calib_knobs_env() {
     return CalibKnobs{
         env_f("MUSE_CAL_A_SHIFT", -0.18f),
         env_f("MUSE_CAL_A2", CAL_A2),
-        env_f("MUSE_CAL_BETA", CAL_BETA),
+        env_f("MUSE_CAL_BETA", 0.75f),
         env_f("MUSE_CAL_BETA_POST", CAL_BETA_POST),
         env_f("MUSE_CAL_W_SM", CAL_W_SM_PRE),
         env_f("MUSE_CAL_W_Z0", CAL_W_Z0_PRE),
