@@ -6259,12 +6259,9 @@ struct __align__(128) VerifyV4_2Q4W_Ring3Storage {
   uint4 p_bf16[2][8][32];      //  8,192 B (all 4 warps publish/read packed BF16x2 P[0..7])
   float max_exch[2][4][16];    //    512 B (4-warp QK row max exchange)
   float inv_exch[2][16];       //    128 B (final inv_row_sum broadcast to w_sub=1..3)
-  int32_t nb_max_q[2];         //      8 B
-  int32_t nb_min_q[2];         //      8 B
   int32_t k_start_q[2];        //      8 B
   int32_t seqlen_q[2];         //      8 B
   int32_t remap_base_q[2];     //      8 B
-  uint8_t active_q[2];         //      2 B
 };                             // 78,848 B (<= 99,328 B dynamic SMEM on sm_121a)
 static_assert(sizeof(VerifyV4_2Q4W_Ring3Storage) <= 99328, "VerifyV4_2Q4W_Ring3Storage must fit SM121 dynamic SMEM");
 
@@ -6371,9 +6368,6 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_2q4w_ring3_kernel(
   }
 
   if (w_sub == 0 && lane == 0) {
-    smem.active_q[q_slot] = my_active ? 1u : 0u;
-    smem.nb_max_q[q_slot] = my_active ? my_num_nb : 0;
-    smem.nb_min_q[q_slot] = my_active ? my_nb_min : 0x7fffffff;
     smem.k_start_q[q_slot] = my_active ? my_k_start : 0x7fffffff;
     smem.seqlen_q[q_slot] = my_active ? my_seqlen_k : 0;
     smem.remap_base_q[q_slot] = (my_active && my_remap_base >= 0) ? my_remap_base : 0x7fffffff;
@@ -6383,23 +6377,9 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_2q4w_ring3_kernel(
   }
   __syncthreads();
 
-  bool cta_any_active = false;
-  int cta_nb_max = 0;
-  int cta_nb_min = 0x7fffffff;
-  int cta_k_start = 0x7fffffff;
-  int cta_seqlen_k = 0;
-  int cta_remap_min_base = 0x7fffffff;
-  #pragma unroll
-  for (int qs = 0; qs < 2; ++qs) {
-    if (smem.active_q[qs]) {
-      cta_any_active = true;
-      if (smem.nb_max_q[qs] > cta_nb_max) cta_nb_max = smem.nb_max_q[qs];
-      if (smem.nb_min_q[qs] < cta_nb_min) cta_nb_min = smem.nb_min_q[qs];
-      if (smem.k_start_q[qs] < cta_k_start) cta_k_start = smem.k_start_q[qs];
-      if (smem.seqlen_q[qs] > cta_seqlen_k) cta_seqlen_k = smem.seqlen_q[qs];
-      if (smem.remap_base_q[qs] < cta_remap_min_base) cta_remap_min_base = smem.remap_base_q[qs];
-    }
-  }
+  const int cta_k_start = min(smem.k_start_q[0], smem.k_start_q[1]);
+  const int cta_seqlen_k = max(smem.seqlen_q[0], smem.seqlen_q[1]);
+  const int cta_remap_min_base = min(smem.remap_base_q[0], smem.remap_base_q[1]);
   const bool cta_has_remap = (cta_remap_min_base < 0x7fffffff);
   const int cta_p_start = raw_seqlen_k - actual_m;
 
@@ -6419,12 +6399,15 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_2q4w_ring3_kernel(
           make_uint4(0u, 0u, 0u, 0u);
     }
   }
-  if (!cta_any_active) {
+  if (cta_seqlen_k == 0) {
     if constexpr (kPdl) {
       asm volatile("griddepcontrol.launch_dependents;");
     }
     return;
   }
+
+  const int cta_nb_min = cta_k_start >> 7;
+  const int cta_nb_max = ((cta_seqlen_k - 1) >> 7) + 1;
 
   // Prologue: load Q into kv[2] while priming block-0 K[0]/K[1](/tree_K) into kv[0]/kv[1](/tree_kv).
   const uint64_t kv_l2_pol = (kKvL2 == 2) ? kv_pol_evict_last() : 0ull;
