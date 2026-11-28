@@ -400,6 +400,32 @@ __device__ __forceinline__ void consume_stage_pipe_opt(
     const int r = wn * NW_CUR * 8 + p * 16 + br;
     ldsm4(wbase + r * KT + swz(r, 2 * ks + bch) * 16, bp);
   };
+  if constexpr (MW == 1) {
+    uint32_t a[2][4], b[2][NP][4];
+    load_a_i(0, 0, a[0]);
+#pragma unroll
+    for (int jp = 0; jp < NP; ++jp) load_b_p(0, jp, b[0][jp]);
+#pragma unroll
+    for (int ks = 0; ks < KT / 32; ++ks) {
+      const int cur = ks & 1, nxt = cur ^ 1;
+      if (ks + 1 < KT / 32) {
+        load_a_i(ks + 1, 0, a[nxt]);
+#pragma unroll
+        for (int jp = 0; jp < NP; ++jp) load_b_p(ks + 1, jp, b[nxt][jp]);
+      }
+#pragma unroll
+      for (int jp = 0; jp < NP; ++jp) {
+        if constexpr (IsBf16) {
+          mma_bf16(a[cur], b[cur][jp][0], b[cur][jp][1], acc[0][2 * jp]);
+          mma_bf16(a[cur], b[cur][jp][2], b[cur][jp][3], acc[0][2 * jp + 1]);
+        } else {
+          mma(a[cur], b[cur][jp][0], b[cur][jp][1], acc[0][2 * jp]);
+          mma(a[cur], b[cur][jp][2], b[cur][jp][3], acc[0][2 * jp + 1]);
+        }
+      }
+    }
+    return;
+  }
   uint32_t a[2][MW][4], bbuf[2][4];
 #pragma unroll
   for (int i = 0; i < MW; ++i) load_a_i(0, i, a[0][i]);
@@ -1383,6 +1409,17 @@ gemm_bf16_dual_seamless(const __grid_constant__ CUtensorMap tmA,
 // fence.proxy.async.shared::cta across the warp-8 async TMA <-> warps-0..7 generic ldmatrix proxy.
 // =================================================================================================
 constexpr int NT_WS = (NWARP + 1) * 32;  // 288 threads: warps 0..7 MMA consumers, warp 8 TMA producer
+constexpr int NT_WS12 = (NWARP + 4) * 32;  // 384 threads: WG0+WG1 math (232 regs), WG2 TMA producer (24 regs)
+__device__ __forceinline__ void wg_reg_dec_24() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 24;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void wg_reg_inc_232() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 232;" ::: "memory");
+#endif
+}
 
 template <int K, bool kPdl = false, bool kPolEf = false>
 __global__ void __launch_bounds__(NT_WS, 1)
@@ -2003,6 +2040,173 @@ gemm_6656_ws8_256_st2_st4(const __grid_constant__ CUtensorMap tmA256,
   }
 }
 
+// 12-warp setmaxnreg (WG0+WG1=232 regs math, WG2=24 regs TMA) BM=256 ST1=2 + zero-drain BM=128 ST2=4 for 42L o_proj.
+// All SM121 async-proxy fences (fence.proxy.async.shared::cta) preserved after every mbar_wait(empty).
+template <int K, bool kPdl>
+__global__ void __launch_bounds__(NT_WS12, 1)
+gemm_6656_ws12_256_st2_st4(const __grid_constant__ CUtensorMap tmA256,
+                           const __grid_constant__ CUtensorMap tmA128,
+                           const __grid_constant__ CUtensorMap tmB128,
+                           const __grid_constant__ CUtensorMap tmB48,
+                           const __grid_constant__ CUtensorMap tmB32,
+                           const Params p) {
+  constexpr int N_OUT = 6656, ST1 = 2, BM1 = 256, ASZ1 = BM1 * KT, STB1 = ASZ1 + WSZ, NKT = K / KT;
+  constexpr int ST2 = 4, ASZ2 = 128 * KT, WSZ2 = 48 * KT, STB2 = ASZ2 + WSZ2;
+  static_assert(STB2 % 1024 == 0 && ST2 * STB2 + 1024 <= SMEM_MAX, "Phase-2 alignment");
+  static_assert(NKT >= ST1 && (NKT % 2) == 0, "Phase-1 parity");
+  extern __shared__ uint8_t sm_raw[];
+  __shared__ __align__(8) unsigned long long bars1[2 * ST1];
+  __shared__ __align__(8) unsigned long long bars2[2 * ST2];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, b = blockIdx.x;
+  const uint32_t sbase = ((uint32_t)__cvta_generic_to_shared(sm_raw) + 1023u) & ~1023u;
+  const uint32_t full1 = (uint32_t)__cvta_generic_to_shared(&bars1[0]), empty1 = full1 + 8 * ST1;
+  const uint32_t full2 = (uint32_t)__cvta_generic_to_shared(&bars2[0]), empty2 = full2 + 8 * ST2;
+
+  const int band2 = b & 3, c2 = b >> 2;
+  const bool is48 = (c2 < 8);
+  const int row0_2 = band2 * 128;
+  const int col0_2 = is48 ? (6144 + c2 * 48) : (6528 + (c2 - 8) * 32);
+  const int tx2 = ASZ2 + (is48 ? (48 * KT) : (32 * KT));
+
+  if (tid == 0) {
+#pragma unroll
+    for (int s = 0; s < ST1; ++s) { mbar_init(full1 + 8 * s, 1); mbar_init(empty1 + 8 * s, NWARP); }
+#pragma unroll
+    for (int s = 0; s < ST2; ++s) { mbar_init(full2 + 8 * s, 1); mbar_init(empty2 + 8 * s, NWARP); }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+  }
+  __syncthreads();
+
+  if (warp >= NWARP) {
+    wg_reg_dec_24();
+    if (warp == NWARP && lane == 0) {
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA256) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmA128) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB128) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB48) : "memory");
+      asm volatile("prefetch.tensormap [%0];" ::"l"(&tmB32) : "memory");
+      const uint64_t pol_el = tma_pol_el(), pol_ef = tma_pol_ef();
+      if constexpr (kPdl) {
+        const int nt0 = b >> 1;
+        mbar_expect_tx_only(full1, WSZ);
+        tma2d_hint(sbase + ASZ1, &tmB128, 0, nt0 * BN, full1, pol_ef);
+        mbar_expect_tx_only(full1 + 8, WSZ);
+        tma2d_hint(sbase + STB1 + ASZ1, &tmB128, KT, nt0 * BN, full1 + 8, pol_ef);
+        pdl_wait();
+      }
+      int s = 0, par = 0, g = 0;
+      for (int ti = 0; ti < 2; ++ti) {
+        const int t = b + ti * 48, nt = t >> 1, band = t & 1;
+        const int row0 = band * BM1, col0 = nt * BN;
+        for (int kt = 0; kt < NKT; ++kt) {
+          if (g >= ST1) {
+            mbar_wait(empty1 + 8 * s, par ^ 1);
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+          }
+          const uint32_t bar = full1 + 8 * s, dst = sbase + s * STB1;
+          if constexpr (kPdl) {
+            if (g < ST1) {
+              mbar_expect_tx(bar, ASZ1);
+              tma2d_hint(dst, &tmA256, kt * KT, row0, bar, pol_el);
+              ++g;
+              if (++s == ST1) { s = 0; par ^= 1; }
+              continue;
+            }
+          }
+          mbar_expect_tx(bar, STB1);
+          tma2d_hint(dst, &tmA256, kt * KT, row0, bar, pol_el);
+          tma2d_hint(dst + ASZ1, &tmB128, kt * KT, col0, bar, pol_ef);
+          ++g;
+          if (++s == ST1) { s = 0; par ^= 1; }
+        }
+      }
+      // Drain both Phase-1 SMEM stages, then immediately prefill all 4 Phase-2 stages behind tile-1 epilogue!
+      mbar_wait(empty1 + 0, par ^ 1);
+      mbar_wait(empty1 + 8, par ^ 1);
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      const CUtensorMap* tmB2 = is48 ? &tmB48 : &tmB32;
+      int s2 = 0, par2 = 0;
+      for (int kt = 0; kt < NKT; ++kt) {
+        if (kt >= ST2) {
+          mbar_wait(empty2 + 8 * s2, par2 ^ 1);
+          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        }
+        const uint32_t bar = full2 + 8 * s2, dst = sbase + s2 * STB2;
+        mbar_expect_tx(bar, tx2);
+        tma2d_hint(dst, &tmA128, kt * KT, row0_2, bar, pol_el);
+        tma2d_hint(dst + ASZ2, tmB2, kt * KT, col0_2, bar, pol_el);
+        if (++s2 == ST2) { s2 = 0; par2 ^= 1; }
+      }
+    }
+    return;
+  }
+
+  wg_reg_inc_232();
+  const int wm = warp % WM, wn = warp / WM;
+  const float sa = __ldg(p.sa), sb = __ldg(p.sb);
+  const int ar = (lane & 7) + ((lane >> 3) & 1) * 8, ach = lane >> 4;
+  const int br = (lane & 7) + (lane >> 4) * 8, bch = (lane >> 3) & 1;
+
+  {
+    float acc[4][8][4] = {};
+    int s = 0, par = 0;
+    for (int ti = 0; ti < 2; ++ti) {
+      for (int kt = 0; kt < NKT; ++kt) {
+        mbar_wait(full1 + 8 * s, par);
+        const uint32_t abase = sbase + s * STB1, wbase = abase + ASZ1;
+        consume_stage_pipe_4x8(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+        __syncwarp();
+        if (lane == 0) mbar_arrive(empty1 + 8 * s);
+        if (++s == ST1) { s = 0; par ^= 1; }
+      }
+      const int t = b + ti * 48, nt = t >> 1, band = t & 1;
+      const int rb0 = band * BM1 + wm * 64;
+      const int col0 = nt * BN + wn * 64;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        epilogue<N_OUT, 8>(acc[i], p.out, rb0 + i * 16, col0, lane, sa, sb);
+        if (ti == 0) {
+#pragma unroll
+          for (int j = 0; j < 8; ++j)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[i][j][c] = 0.f;
+        }
+      }
+    }
+  }
+
+  const int rb0 = row0_2 + warp * 16;
+  constexpr int kPdlTrig = (K == 19968) ? (NKT - 20) : ((NKT > 10) ? (NKT - 10) : 0);
+  if (is48) {
+    float acc2[1][6][4] = {};
+    int s2 = 0, par2 = 0;
+    for (int kt = 0; kt < NKT; ++kt) {
+      if constexpr (kPdl) { if (kt == kPdlTrig) pdl_launch_dependents(); }
+      mbar_wait(full2 + 8 * s2, par2);
+      const uint32_t abase = sbase + s2 * STB2, wbase = abase + ASZ2;
+      consume_stage_pipe_opt<1, 6>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
+      __syncwarp();
+      if (lane == 0) mbar_arrive(empty2 + 8 * s2);
+      if (++s2 == ST2) { s2 = 0; par2 ^= 1; }
+    }
+    epilogue<N_OUT, 6>(acc2[0], p.out, rb0, col0_2, lane, sa, sb);
+  } else {
+    float acc2[1][4][4] = {};
+    int s2 = 0, par2 = 0;
+    for (int kt = 0; kt < NKT; ++kt) {
+      if constexpr (kPdl) { if (kt == kPdlTrig) pdl_launch_dependents(); }
+      mbar_wait(full2 + 8 * s2, par2);
+      const uint32_t abase = sbase + s2 * STB2, wbase = abase + ASZ2;
+      consume_stage_pipe_opt<1, 4>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
+      __syncwarp();
+      if (lane == 0) mbar_arrive(empty2 + 8 * s2);
+      if (++s2 == ST2) { s2 = 0; par2 ^= 1; }
+    }
+    epilogue<N_OUT, 4>(acc2[0], p.out, rb0, col0_2, lane, sa, sb);
+  }
+}
+
 // Wave-81: 8-warp BM=256 ST1=2 (6144 cols = 70.6%) + seamless BM=128 ST2=3 (1536 + 1024 cols) for 28x FP8 dual_a
 template <bool kPdl>
 __global__ void __launch_bounds__(NT, 1)
@@ -2558,6 +2762,12 @@ extern "C" int fp8ws_init() {
     e = cudaFuncSetAttribute(gemm_6656_ws8_256_st2_st4<4096, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   }
   if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_6656_ws12_256_st2_st4<4096, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
+    e = cudaFuncSetAttribute(gemm_6656_ws12_256_st2_st4<4096, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+  }
+  if (e == cudaSuccess) {
     e = cudaFuncSetAttribute(gemm_6656_ws8_256_st2_st4<4096, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
   }
   if (e == cudaSuccess) {
@@ -2651,9 +2861,17 @@ extern "C" int fp8ws_run(const void* a, const void* b, const void* sa, const voi
         if (!encode_tma2d(&tmA256, a, k, M, 256) || !encode_tma2d(&tmA128, a, k, M, 128)) return -3;
         if (!encode_tma2d(&tmB128, b, k, n, 128) || !encode_tma2d(&tmB48, b, k, n, 48) ||
             !encode_tma2d(&tmB32, b, k, n, 32)) return -4;
+        static const bool oproj_ws12 = []() {
+          const char* env = std::getenv("FP8WS_OPROJ_WS12");
+          return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+        }();
         if (fp8ws_pdl_enabled()) {
           if (k == 19968) {
             return (int)launch_ex_pdl(gemm_6656_ws8_256_st2_st4<19968, true>, 48, NT, SMEM_MAX, st,
+                                      tmA256, tmA128, tmB128, tmB48, tmB32, p);
+          }
+          if (oproj_ws12) {
+            return (int)launch_ex_pdl(gemm_6656_ws12_256_st2_st4<4096, true>, 48, NT_WS12, SMEM_MAX, st,
                                       tmA256, tmA128, tmB128, tmB48, tmB32, p);
           }
           return (int)launch_ex_pdl(gemm_6656_ws8_256_st2_st4<4096, true>, 48, NT, SMEM_MAX, st,
@@ -2661,6 +2879,8 @@ extern "C" int fp8ws_run(const void* a, const void* b, const void* sa, const voi
         }
         if (k == 19968) {
           gemm_6656_ws8_256_st2_st4<19968, false><<<48, NT, SMEM_MAX, st>>>(tmA256, tmA128, tmB128, tmB48, tmB32, p);
+        } else if (oproj_ws12) {
+          gemm_6656_ws12_256_st2_st4<4096, false><<<48, NT_WS12, SMEM_MAX, st>>>(tmA256, tmA128, tmB128, tmB48, tmB32, p);
         } else {
           gemm_6656_ws8_256_st2_st4<4096, false><<<48, NT, SMEM_MAX, st>>>(tmA256, tmA128, tmB128, tmB48, tmB32, p);
         }
