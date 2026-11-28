@@ -9,7 +9,11 @@ per-tensor scales (both scalars), no bias, bf16 output and the shapes listed in 
 512-row qkv (4608x6656) and attention output-gate (4096x6656) GEMMs run on fp8ws (SP5D's kernel, Yukon submission
 98c1361e) once their shape passed its bitwise admission; everything else calls ops.cutlass_scaled_mm unchanged.
 The shape test is inside an opaque custom op."""
+import os
+
 import torch
+
+_PREFILL_L2_DISCARD_V2 = os.environ.get("MUSE_PREFILL_L2_DISCARD_V2", "1") != "0"
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
@@ -185,7 +189,15 @@ def fp8_gate_swiglu(
     a: torch.Tensor, b: torch.Tensor, scale_a: torch.Tensor, scale_b: torch.Tensor,
     down_scale: torch.Tensor,
 ) -> torch.Tensor:
-    return _swiglu.apply(a, b, scale_a, scale_b, down_scale)
+    out = _swiglu.apply(a, b, scale_a, scale_b, down_scale)
+    if (
+        _PREFILL_L2_DISCARD_V2
+        and a.shape == (512, 6656)
+        and torch.cuda.is_current_stream_capturing()
+        and hasattr(_swiglu, "stash_dead_mlp_in")
+    ):
+        _swiglu.stash_dead_mlp_in(a)
+    return out
 
 
 @fp8_gate_swiglu.register_fake

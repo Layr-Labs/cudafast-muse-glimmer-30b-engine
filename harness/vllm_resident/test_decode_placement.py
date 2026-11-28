@@ -149,8 +149,8 @@ class DecodePlacementLogicTest(unittest.TestCase):
         mod._SLOW_HOLD.extend([None] * 175)  # post full_ram_scan state!
         with mock.patch.object(mod, "_mem_available", return_value=40 << 30):
             self.assertTrue(mod._can_append_slow_hold(64 << 20))
-        with mock.patch.object(mod, "_mem_available", return_value=22 << 30):
-            # Below HOST_HEADROOM_BYTES (20 GiB) + 4 GiB margin -> refuse!
+        with mock.patch.object(mod, "_mem_available", return_value=30 << 30):
+            # Below HOST_HEADROOM_BYTES (24 GiB) + 8 GiB margin -> refuse!
             self.assertFalse(mod._can_append_slow_hold(64 << 20))
         mod._SLOW_HOLD.clear()
 
@@ -357,6 +357,64 @@ class DecodePlacementLogicTest(unittest.TestCase):
         # Clean 6656x19968 (med=0.2898 <= 0.2935) -> NO retry!
         down_clean = [0.2867 + 0.00015 * i for i in range(40)]
         self.assertEqual(mod._select_retry_indices(down_clean, 1.04, floor_max_ms=0.2935), [])
+
+    def test_ensure_slow_hold_headroom_flushes_cache_before_trimming(self):
+        mod = _load_dp_module({"MUSE_PLACE_M32": "1"})
+        mod._SLOW_HOLD.clear()
+        mod._SLOW_HOLD.extend([object() for _ in range(16)])
+        state = {"avail": 22 << 30, "flushes": 0}
+
+        def fake_empty_cache():
+            state["flushes"] += 1
+            # Flushing cleared rejected_hold recovers 14 GiB -> 36 GiB >= 32 GiB without losing any _SLOW_HOLD!
+            state["avail"] = 36 << 30
+
+        fake_torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: True, empty_cache=fake_empty_cache)
+        )
+        with mock.patch.object(mod, "torch", fake_torch), \
+             mock.patch.object(mod, "_mem_available", side_effect=lambda: state["avail"]):
+            mod.ensure_slow_hold_headroom(32 << 30)
+        self.assertEqual(state["flushes"], 1)
+        self.assertEqual(len(mod._SLOW_HOLD), 16)
+        mod._SLOW_HOLD.clear()
+
+    def test_spares_room_enforces_hard_os_mem_floor(self):
+        mod = _load_dp_module({"MUSE_PLACE_M32": "1"})
+        mod._SLOW_HOLD.clear()
+        mod._SLOW_HOLD.extend([object() for _ in range(8)])
+        hold_list = [object() for _ in range(8)]
+        state = {"avail": 14 << 30, "cached": 24 << 30, "flushes": 0}
+
+        def fake_empty_cache():
+            state["flushes"] += 1
+            if state["cached"] > 0:
+                state["avail"] += 12 << 30
+                state["cached"] = 0
+
+        fake_torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(
+                is_available=lambda: True,
+                empty_cache=fake_empty_cache,
+                memory_reserved=lambda: state["cached"],
+                memory_allocated=lambda: 0,
+            )
+        )
+        with mock.patch.object(mod, "torch", fake_torch), \
+             mock.patch.object(mod, "_mem_available", side_effect=lambda: state["avail"]):
+            # 1) Hard 16 GiB OS floor: cached_free (24 GiB) MUST NOT mask avail=14 GiB!
+            self.assertEqual(mod._spares_allowed(10, 64 << 20), 0)
+            # 2) Even with allow_slow_trim=False (is_small attn), low OS MemAvailable (<18 GiB)
+            #    must flush hold_list + empty_cache() to recover OS headroom before returning!
+            allowed = mod._ensure_spares_room(10, 32 << 20, hold_list, allow_slow_trim=False)
+            self.assertGreaterEqual(state["flushes"], 1)
+            self.assertGreaterEqual(state["avail"], 20 << 30)
+            self.assertGreater(allowed, 0)
+            # 3) >128 MiB per-iteration guard stops when avail - payload < 16 GiB
+            state["avail"] = 16 << 30
+            self.assertFalse(mod._os_headroom_ok(256 << 20))
+            self.assertTrue(mod._os_headroom_ok(64 << 20))
+        mod._SLOW_HOLD.clear()
 
 
 if __name__ == "__main__":

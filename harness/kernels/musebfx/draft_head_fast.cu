@@ -2613,24 +2613,29 @@ __global__ void dhf_pack_tiles_kernel(
 // ============================================================================
 
 // Kernel 0: Scale input A [M, K] by col_scales [K] -> A_scaled [M, K] (L2-hot, ~2 us).
-__global__ void dhf_prep_a_kernel(
+__global__ void __launch_bounds__(256) dhf_prep_a_kernel(
     const __nv_bfloat16* __restrict__ A,
     const float* __restrict__ col_scales,
     __nv_bfloat16* __restrict__ A_scaled,
     int M, int K, int pdl_mode) {
   const int m = blockIdx.x;
   if (m >= M) return;
+  const int k2 = K >> 1;
+  // Wait for predecessor (Layer-4 final norm) before reading A, then fire launch_dependents
+  // so Stage-1 TMA weight preloads overlap the col_scales scaling loop.
+  if ((pdl_mode & 1) != 0) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
+  if ((pdl_mode & 2) != 0) {
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  }
   const __nv_bfloat16* a_in = A + static_cast<size_t>(m) * K;
   __nv_bfloat16* a_out = A_scaled + static_cast<size_t>(m) * K;
-  const int k2 = K >> 1;
   for (int i = threadIdx.x; i < k2; i += blockDim.x) {
     const __nv_bfloat162 av = reinterpret_cast<const __nv_bfloat162*>(a_in)[i];
     const float2 af = __bfloat1622float2(av);
-    const float2 cs = reinterpret_cast<const float2*>(col_scales)[i];
+    const float2 cs = __ldg(reinterpret_cast<const float2*>(col_scales) + i);
     reinterpret_cast<__nv_bfloat162*>(a_out)[i] = __floats2bfloat162_rn(af.x * cs.x, af.y * cs.y);
-  }
-  if ((pdl_mode & 2) != 0 && threadIdx.x == 0) {
-    asm volatile("griddepcontrol.launch_dependents;");
   }
 }
 
@@ -4565,11 +4570,16 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_fused_kernel(
   const int num_g = K >> 4;
   const bool use_smem_a = (num_g <= kS2MaxGroups);
 
+  constexpr int kMaxMaskWords = (kWaveCTAs * kCtaTopK + 31) >> 5;
   __shared__ uint4 s_a0[kS2MaxGroups];
   __shared__ uint4 s_a1[kS2MaxGroups];
   __shared__ uint32_t s_keys[kWaveCTAs * kCtaTopK];
   __shared__ int32_t s_ids[kWaveCTAs * kCtaTopK];
   __shared__ uint32_t s_hist[256];
+  __shared__ uint32_t s_gt_mask[kMaxMaskWords];
+  __shared__ uint32_t s_eq_mask[kMaxMaskWords];
+  __shared__ uint32_t s_gt_off[kMaxMaskWords];
+  __shared__ uint32_t s_eq_off[kMaxMaskWords];
   __shared__ int32_t s_cand[kMaxCand];
   __shared__ float wv[kS2Warps][8];
   __shared__ int32_t wi[kS2Warps][8];
@@ -4652,54 +4662,118 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_fused_kernel(
     }
     __syncthreads();
 
-    if (tid == 0) {
-      uint32_t acc = 0u;
-      const uint32_t need = s_rem_k;
-      uint32_t chosen = 0u;
-      for (int b = 255; b >= 0; --b) {
-        const uint32_t c = s_hist[b];
-        if (acc + c >= need) {
-          chosen = static_cast<uint32_t>(b);
-          s_rem_k = need - acc;
-          break;
-        }
-        acc += c;
+    if (tid < 32) {
+      const int b_lo = (31 - tid) << 3;
+      const uint32_t c7 = s_hist[b_lo + 7];
+      const uint32_t c6 = s_hist[b_lo + 6];
+      const uint32_t c5 = s_hist[b_lo + 5];
+      const uint32_t c4 = s_hist[b_lo + 4];
+      const uint32_t c3 = s_hist[b_lo + 3];
+      const uint32_t c2 = s_hist[b_lo + 2];
+      const uint32_t c1 = s_hist[b_lo + 1];
+      const uint32_t c0 = s_hist[b_lo + 0];
+      const uint32_t lsum = c7 + c6 + c5 + c4 + c3 + c2 + c1 + c0;
+      uint32_t wscan = lsum;
+#pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        const uint32_t up = __shfl_up_sync(0xffffffffu, wscan, off);
+        if (tid >= off) wscan += up;
       }
-      s_prefix = pref | (chosen << shift);
+      const uint32_t prev_acc = wscan - lsum;
+      const uint32_t need = s_rem_k;
+      const uint32_t hit_mask = __ballot_sync(0xffffffffu, wscan >= need);
+      const int win_lane = (hit_mask != 0u) ? (__ffs(hit_mask) - 1) : 31;
+      if (tid == win_lane) {
+        uint32_t acc = prev_acc;
+        uint32_t chosen = 0u;
+        const uint32_t cs[8] = {c7, c6, c5, c4, c3, c2, c1, c0};
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          if (acc + cs[j] >= need) {
+            chosen = static_cast<uint32_t>(b_lo + 7 - j);
+            s_rem_k = need - acc;
+            break;
+          }
+          acc += cs[j];
+        }
+        s_prefix = pref | (chosen << shift);
+      }
     }
     __syncthreads();
   }
 
   const uint32_t thresh = s_prefix;
+  const int n_words = (N_in + 31) >> 5;
+  for (int w = warp; w < n_words; w += kS2Warps) {
+    const int i = (w << 5) + lane;
+    const bool valid = (i < N_in) && (s_ids[i] >= 0);
+    const uint32_t kv = valid ? s_keys[i] : 0u;
+    s_gt_mask[w] = __ballot_sync(0xffffffffu, valid && (kv > thresh));
+    s_eq_mask[w] = __ballot_sync(0xffffffffu, valid && (kv == thresh));
+  }
+  __syncthreads();
+
   if (tid < 32) {
-    uint32_t cur = 0u;
+    uint32_t acc = 0u;
     const uint32_t cap = static_cast<uint32_t>(K_cand);
-    for (int base = 0; base < N_in && cur < cap; base += 32) {
-      const int i = base + tid;
-      const bool hit = (i < N_in) && (s_keys[i] > thresh) && (s_ids[i] >= 0);
-      const uint32_t bmask = __ballot_sync(0xffffffffu, hit);
-      if (bmask != 0u) {
-        const uint32_t slot = cur + static_cast<uint32_t>(__popc(bmask & ((1u << tid) - 1u)));
-        if (hit && slot < cap) {
-          s_cand[slot] = s_ids[i];
-        }
-        cur += static_cast<uint32_t>(__popc(bmask));
+    for (int wb = 0; wb < n_words; wb += 32) {
+      const int w = wb + tid;
+      const uint32_t cnt = (w < n_words) ? static_cast<uint32_t>(__popc(s_gt_mask[w])) : 0u;
+      uint32_t sc = cnt;
+#pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        const uint32_t up = __shfl_up_sync(0xffffffffu, sc, off);
+        if (tid >= off) sc += up;
       }
+      if (w < n_words) {
+        s_gt_off[w] = acc + sc - cnt;
+      }
+      acc += __shfl_sync(0xffffffffu, sc, 31);
     }
-    for (int base = 0; base < N_in && cur < cap; base += 32) {
-      const int i = base + tid;
-      const bool hit = (i < N_in) && (s_keys[i] == thresh) && (s_ids[i] >= 0);
-      const uint32_t bmask = __ballot_sync(0xffffffffu, hit);
-      if (bmask != 0u) {
-        const uint32_t slot = cur + static_cast<uint32_t>(__popc(bmask & ((1u << tid) - 1u)));
-        if (hit && slot < cap) {
-          s_cand[slot] = s_ids[i];
-        }
-        cur += static_cast<uint32_t>(__popc(bmask));
+    for (int wb = 0; wb < n_words; wb += 32) {
+      const int w = wb + tid;
+      const uint32_t cnt = (w < n_words) ? static_cast<uint32_t>(__popc(s_eq_mask[w])) : 0u;
+      uint32_t sc = cnt;
+#pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        const uint32_t up = __shfl_up_sync(0xffffffffu, sc, off);
+        if (tid >= off) sc += up;
       }
+      if (w < n_words) {
+        s_eq_off[w] = acc + sc - cnt;
+      }
+      acc += __shfl_sync(0xffffffffu, sc, 31);
     }
     if (tid == 0) {
-      s_out_cnt = (cur < cap) ? cur : cap;
+      s_out_cnt = (acc < cap) ? acc : cap;
+    }
+  }
+  __syncthreads();
+
+  {
+    const uint32_t cap = static_cast<uint32_t>(K_cand);
+    const uint32_t lane_lt = (1u << lane) - 1u;
+    for (int w = warp; w < n_words; w += kS2Warps) {
+      const uint32_t gm = s_gt_mask[w];
+      if (gm != 0u) {
+        const uint32_t base_off = s_gt_off[w];
+        if (base_off < cap && ((gm >> lane) & 1u)) {
+          const uint32_t slot = base_off + static_cast<uint32_t>(__popc(gm & lane_lt));
+          if (slot < cap) {
+            s_cand[slot] = s_ids[(w << 5) + lane];
+          }
+        }
+      }
+      const uint32_t em = s_eq_mask[w];
+      if (em != 0u) {
+        const uint32_t base_off = s_eq_off[w];
+        if (base_off < cap && ((em >> lane) & 1u)) {
+          const uint32_t slot = base_off + static_cast<uint32_t>(__popc(em & lane_lt));
+          if (slot < cap) {
+            s_cand[slot] = s_ids[(w << 5) + lane];
+          }
+        }
+      }
     }
   }
   __syncthreads();
@@ -5232,31 +5306,41 @@ torch::Tensor dhead_fast_argmax(
   if (K_cand > kMaxCand) K_cand = kMaxCand;
   if (K_cand > N_in) K_cand = N_in;
 
-  // Kernel 0: Scale A by col_scales (does not wait on PDL; triggers Stage 1).
+  // Capture-safe uniform carveout=100 across prep_a, Stage-1, and Stage-2 kernels.
+  static bool carveout_set = false;
+  if (!carveout_set) {
+    cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+    const bool capturing = (cudaStreamIsCapturing(st, &cap_st) == cudaSuccess &&
+                            cap_st != cudaStreamCaptureStatusNone);
+    if (!capturing) {
+      carveout_set = true;
+      auto set100 = [](const void* fn) {
+        (void)cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        (void)cudaGetLastError();
+      };
+      set100(reinterpret_cast<const void*>(dhf_prep_a_kernel));
+      set100(reinterpret_cast<const void*>(dhf_stage1_mode100_pair_kernel<true>));
+      set100(reinterpret_cast<const void*>(dhf_stage1_mode100_pair_kernel<false>));
+      set100(reinterpret_cast<const void*>(dhf_stage1_tma100_pair_bk128_kernel<true>));
+      set100(reinterpret_cast<const void*>(dhf_stage1_tma100_pair_bk128_kernel<false>));
+      set100(reinterpret_cast<const void*>(dhf_stage1_tma100_bk128_kernel<true>));
+      set100(reinterpret_cast<const void*>(dhf_stage1_tma100_bk128_kernel<false>));
+      set100(reinterpret_cast<const void*>(dhf_stage1_kernel<100, true>));
+      set100(reinterpret_cast<const void*>(dhf_stage1_kernel<100, false>));
+      set100(reinterpret_cast<const void*>(dhf_stage1_kernel<150, true>));
+      set100(reinterpret_cast<const void*>(dhf_stage1_kernel<150, false>));
+      set100(reinterpret_cast<const void*>(dhf_stage2_rescore_kernel));
+      set100(reinterpret_cast<const void*>(dhf_stage2_rescore_fused_kernel));
+    }
+  }
+
+  // Kernel 0: Scale A by col_scales (full PDL wait + early launch_dependents into Stage 1).
   dhf_launch_pdl(
-      &dhf_prep_a_kernel, dim3(M, 1, 1), 256, st, (pdl_mode & 2),
+      &dhf_prep_a_kernel, dim3(M, 1, 1), 256, st, pdl_mode,
       reinterpret_cast<const __nv_bfloat16*>(A.data_ptr()),
       col_scales.data_ptr<float>(),
       reinterpret_cast<__nv_bfloat16*>(sc.a_scaled.data_ptr()),
-      M, K, (pdl_mode & 2));
-
-  // Kernel 1: Persistent Stage 1 compressed MMA + in-CTA top-8 shortlist.
-  static bool carveout_set = false;
-  if (!carveout_set) {
-    carveout_set = true;
-    cudaFuncSetAttribute(dhf_stage1_mode100_pair_kernel<true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-    cudaFuncSetAttribute(dhf_stage1_mode100_pair_kernel<false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-    cudaFuncSetAttribute(dhf_stage1_tma100_pair_bk128_kernel<true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-    cudaFuncSetAttribute(dhf_stage1_tma100_pair_bk128_kernel<false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-    cudaFuncSetAttribute(dhf_stage1_tma100_bk128_kernel<true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-    cudaFuncSetAttribute(dhf_stage1_tma100_bk128_kernel<false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-    cudaFuncSetAttribute(dhf_stage1_kernel<100, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-    cudaFuncSetAttribute(dhf_stage1_kernel<100, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-    cudaFuncSetAttribute(dhf_stage1_kernel<150, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-    cudaFuncSetAttribute(dhf_stage1_kernel<150, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-    cudaFuncSetAttribute(dhf_stage2_rescore_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-    cudaFuncSetAttribute(dhf_stage2_rescore_fused_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  }
+      M, K, pdl_mode);
   static const bool dyn_ev = (std::getenv("MUSE_BENCH_DYN_ENV") != nullptr);
   static const bool evict_first_cached = []() {
     const char* s = std::getenv("MUSE_DHF_EVICT_FIRST");

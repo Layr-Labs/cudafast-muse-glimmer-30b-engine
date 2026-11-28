@@ -1289,6 +1289,53 @@ def _verify_dflash_rms_norm(model: torch.nn.Module) -> None:
             model._dflash_fuse_norm_ok = True
             for layer in getattr(model, "layers", ()):
                 layer._dflash_fuse_norm_ok = True
+            # Verify 0-ULP bit-identical fused embed_tokens + Layer-0 input_layernorm.
+            embed_ok = False
+            if (
+                os.environ.get("MUSE_DFLASH_FUSE_EMBED_NORM", "1") != "0"
+                and hasattr(_bfx, "dflash_embed_rms_norm")
+                and not getattr(model, "has_separate_mask_embedding", False)
+            ):
+                emb_mod = getattr(model, "embed_tokens", None)
+                emb_w = getattr(emb_mod, "weight", None)
+                layers = getattr(model, "layers", ())
+                l0_norm = getattr(layers[0], "input_layernorm", None) if layers else None
+                l0_w = getattr(l0_norm, "weight", None)
+                if (
+                    emb_w is not None
+                    and l0_w is not None
+                    and getattr(emb_mod, "tp_size", 1) == 1
+                    and getattr(emb_mod, "vocab_start_index", 0) == 0
+                    and emb_w.is_cuda
+                    and emb_w.dtype == torch.bfloat16
+                    and emb_w.dim() == 2
+                    and emb_w.is_contiguous()
+                    and emb_w.shape[1] == k
+                    and l0_w.is_cuda
+                    and l0_w.dtype == torch.bfloat16
+                    and l0_w.shape == (k,)
+                ):
+                    v_sz = int(emb_w.shape[0])
+                    l0_eps = float(getattr(l0_norm, "variance_epsilon", eps))
+                    l0_wc = l0_w.contiguous()
+                    embed_ok = True
+                    for id_dt in (torch.int32, torch.int64):
+                        for m in (6, 7, 16):
+                            tids = torch.randint(0, v_sz, (m,), generator=gen, device=dev, dtype=torch.int64).to(id_dt)
+                            ref_e = F.embedding(tids.long(), emb_w)
+                            ref_n = _bfx.dflash_rms_norm(ref_e, l0_wc, l0_eps)
+                            got_n, got_r = _bfx.dflash_embed_rms_norm(tids, emb_w, l0_wc, l0_eps)
+                            if not (
+                                torch.equal(got_r.view(torch.int16), ref_e.view(torch.int16))
+                                and torch.equal(got_n.view(torch.int16), ref_n.view(torch.int16))
+                            ):
+                                embed_ok = False
+                                break
+                        if not embed_ok:
+                            break
+                    if embed_ok:
+                        model._dflash_fuse_embed_norm_ok = True
+            logger.info("dflash_fuse: embed_rms_norm=%s", "admitted (0-ULP)" if embed_ok else "off")
     except Exception as exc:  # noqa: BLE001
         logger.warning("dflash_fuse: rms_norm self-check failed (%s); keeping stock path", exc)
     torch.cuda.synchronize(dev)
@@ -1673,6 +1720,27 @@ def dflash_fused_add_rms_norm_op(
 @dflash_fused_add_rms_norm_op.register_fake
 def _(x, residual, weight, eps):
     return torch.empty_like(x), torch.empty_like(residual)
+
+
+@torch.library.custom_op("muse::dflash_embed_rms_norm", mutates_args=())
+def dflash_embed_rms_norm_op(
+    input_ids: torch.Tensor,
+    embed_weight: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import muse_bfx_ext as _bfx
+
+    ids_c = input_ids if input_ids.is_contiguous() else input_ids.contiguous()
+    ew_c = embed_weight if embed_weight.is_contiguous() else embed_weight.contiguous()
+    nw_c = norm_weight if norm_weight.is_contiguous() else norm_weight.contiguous()
+    return _bfx.dflash_embed_rms_norm(ids_c, ew_c, nw_c, eps)
+
+
+@dflash_embed_rms_norm_op.register_fake
+def _(input_ids, embed_weight, norm_weight, eps):
+    shape = (input_ids.shape[0], embed_weight.shape[1])
+    return embed_weight.new_empty(shape), embed_weight.new_empty(shape)
 
 
 @torch.library.custom_op("muse::draft_int4_aux5_linear", mutates_args=())

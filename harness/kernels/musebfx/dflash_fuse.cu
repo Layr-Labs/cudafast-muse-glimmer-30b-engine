@@ -72,9 +72,35 @@ static int dflash_fuse_pdl_mode() {
   return mode;
 }
 
+static bool dflash_fuse_carveout100_enabled() {
+  static const bool en = []() -> bool {
+    const char* s = std::getenv("MUSE_DFLASH_FUSE_CARVEOUT100");
+    return (!s || !*s) ? true : (std::atoi(s) != 0);
+  }();
+  return en;
+}
+
+static inline void dflash_ensure_carveout100(const void* fn, cudaStream_t st) {
+  if (!dflash_fuse_carveout100_enabled()) return;
+  static const void* seen[64];
+  static int n_seen = 0;
+  for (int i = 0; i < n_seen; ++i) {
+    if (seen[i] == fn) return;
+  }
+  cudaStreamCaptureStatus cap_st = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(st, &cap_st) == cudaSuccess &&
+      cap_st != cudaStreamCaptureStatusNone) {
+    return;
+  }
+  (void)cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  (void)cudaGetLastError();
+  if (n_seen < 64) seen[n_seen++] = fn;
+}
+
 template <typename... KArgs, typename... Args>
 static inline void dflash_launch_pdl(
     void (*kernel)(KArgs...), int blocks, int threads, cudaStream_t st, int pdl_mode, Args... args) {
+  dflash_ensure_carveout100(reinterpret_cast<const void*>(kernel), st);
   cudaLaunchConfig_t lcfg = {};
   lcfg.gridDim = dim3(static_cast<unsigned>(blocks), 1u, 1u);
   lcfg.blockDim = dim3(static_cast<unsigned>(threads), 1u, 1u);
@@ -240,7 +266,7 @@ __global__ void dflash_kv_post_kernel(
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
   if ((pdl_mode & 2) != 0) {
-    asm volatile("griddepcontrol.launch_dependents;");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   }
   if (slot < 0) return;
 
@@ -302,7 +328,7 @@ __global__ void dflash_qkv_norm_rope_kernel(
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
   if ((pdl_mode & 2) != 0) {
-    asm volatile("griddepcontrol.launch_dependents;");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   }
 
   const size_t qkv_stride = static_cast<size_t>(nq + 2 * nkv) * kHeadDim;
@@ -626,7 +652,7 @@ __global__ void __launch_bounds__(256) dflash_prepare_inputs_kernel(
     }
   }
   if ((pdl_mode & 2) != 0) {
-    asm volatile("griddepcontrol.launch_dependents;");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   }
 }
 
@@ -670,7 +696,7 @@ __global__ void __launch_bounds__(256) dflash_rms_norm_kernel(
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
   if ((pdl_mode & 2) != 0) {
-    asm volatile("griddepcontrol.launch_dependents;");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   }
 
   const uint4* x_u4 = reinterpret_cast<const uint4*>(input + static_cast<size_t>(row) * K);
@@ -774,7 +800,155 @@ __global__ void __launch_bounds__(256) dflash_rms_norm_kernel(
   }
 }
 
+template <typename IdT>
+__global__ void __launch_bounds__(256) dflash_embed_rms_norm_kernel(
+    const IdT* __restrict__ input_ids,
+    const __nv_bfloat16* __restrict__ embed_weight,
+    const __nv_bfloat16* __restrict__ norm_weight,
+    __nv_bfloat16* __restrict__ norm_out,
+    __nv_bfloat16* __restrict__ residual_out,
+    int64_t vocab_size,
+    int K,
+    float eps,
+    int pdl_mode) {
+  __shared__ float s_warp[8];
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int k8 = K >> 3;
+
+  // Preload immutable norm weight before PDL wait so it overlaps predecessor tail.
+  const uint4* w_u4 = reinterpret_cast<const uint4*>(norm_weight);
+  uint4 w_reg[4];
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    const int idx8 = tid + c * 256;
+    if (idx8 < k8) {
+      w_reg[c] = __ldg(w_u4 + idx8);
+    }
+  }
+  if ((pdl_mode & 1) != 0) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
+  if ((pdl_mode & 2) != 0) {
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  }
+
+  const int64_t tok_id = static_cast<int64_t>(input_ids[row]);
+  const bool valid_tok = (tok_id >= 0 && tok_id < vocab_size);
+  const uint4* e_u4 = valid_tok
+      ? reinterpret_cast<const uint4*>(embed_weight + static_cast<size_t>(tok_id) * K)
+      : nullptr;
+
+  uint4 h_reg[4];
+  float ss = 0.0f;
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    const int idx8 = tid + c * 256;
+    if (idx8 < k8) {
+      const uint4 ev = valid_tok ? __ldg(e_u4 + idx8) : make_uint4(0u, 0u, 0u, 0u);
+      h_reg[c] = ev;
+      const __nv_bfloat162* ep = reinterpret_cast<const __nv_bfloat162*>(&ev);
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+        const float2 ef = __bfloat1622float2(ep[p]);
+        ss = __fmaf_rn(ef.x, ef.x, ss);
+        ss = __fmaf_rn(ef.y, ef.y, ss);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  }
+  if (lane == 0) s_warp[warp] = ss;
+  __syncthreads();
+  float tot = s_warp[lane & 7];
+#pragma unroll
+  for (int o = 4; o > 0; o >>= 1) {
+    tot += __shfl_xor_sync(0xffffffffu, tot, o);
+  }
+  tot = __shfl_sync(0xffffffffu, tot, 0);
+  const float inv_rms = rsqrtf(tot / static_cast<float>(K) + eps);
+
+  uint4* out_u4 = reinterpret_cast<uint4*>(norm_out + static_cast<size_t>(row) * K);
+  uint4* res_u4 = reinterpret_cast<uint4*>(residual_out + static_cast<size_t>(row) * K);
+#pragma unroll
+  for (int c = 0; c < 4; ++c) {
+    const int idx8 = tid + c * 256;
+    if (idx8 < k8) {
+      res_u4[idx8] = h_reg[c];
+      const __nv_bfloat162* hp = reinterpret_cast<const __nv_bfloat162*>(&h_reg[c]);
+      const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&w_reg[c]);
+      uint4 ov;
+      __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&ov);
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+        const float2 hf = __bfloat1622float2(hp[p]);
+        const float2 wf = __bfloat1622float2(wp[p]);
+        op[p] = __floats2bfloat162_rn(hf.x * inv_rms * wf.x, hf.y * inv_rms * wf.y);
+      }
+      out_u4[idx8] = ov;
+    }
+  }
+}
+
 }  // namespace
+
+std::tuple<torch::Tensor, torch::Tensor> dflash_embed_rms_norm(
+    torch::Tensor input_ids,
+    torch::Tensor embed_weight,
+    torch::Tensor norm_weight,
+    double eps) {
+  TORCH_CHECK(input_ids.is_cuda() && input_ids.dim() == 1 && input_ids.is_contiguous() &&
+                  (input_ids.scalar_type() == torch::kInt32 || input_ids.scalar_type() == torch::kInt64),
+              "dflash_embed_rms_norm expects contiguous CUDA int32/int64 1D input_ids");
+  TORCH_CHECK(embed_weight.is_cuda() && embed_weight.scalar_type() == torch::kBFloat16 &&
+                  embed_weight.dim() == 2 && embed_weight.is_contiguous(),
+              "dflash_embed_rms_norm expects contiguous CUDA BF16 [V, K] embed_weight");
+  TORCH_CHECK(norm_weight.is_cuda() && norm_weight.scalar_type() == torch::kBFloat16 &&
+                  norm_weight.dim() == 1 && norm_weight.is_contiguous(),
+              "dflash_embed_rms_norm expects contiguous CUDA BF16 [K] norm_weight");
+  const int M = static_cast<int>(input_ids.size(0));
+  const int64_t V = embed_weight.size(0);
+  const int K = static_cast<int>(embed_weight.size(1));
+  TORCH_CHECK(norm_weight.size(0) == K && K > 0 && K <= 8192 && (K % 8) == 0,
+              "dflash_embed_rms_norm expects K<=8192 and K%8==0");
+  TORCH_CHECK((reinterpret_cast<uintptr_t>(embed_weight.data_ptr()) & 15u) == 0u &&
+                  (reinterpret_cast<uintptr_t>(norm_weight.data_ptr()) & 15u) == 0u,
+              "dflash_embed_rms_norm expects 16B-aligned weights");
+  auto opts = embed_weight.options();
+  auto norm_out = torch::empty({M, K}, opts);
+  auto res_out = torch::empty({M, K}, opts);
+  vq4d_clear_all_prerot();
+  if (M == 0) {
+    return std::make_tuple(norm_out, res_out);
+  }
+  auto st = c10::cuda::getCurrentCUDAStream().stream();
+  const int pdl = dflash_fuse_pdl_mode();
+  if (input_ids.scalar_type() == torch::kInt64) {
+    dflash_launch_pdl(
+        dflash_embed_rms_norm_kernel<int64_t>, M, 256, st, pdl,
+        input_ids.data_ptr<int64_t>(),
+        reinterpret_cast<const __nv_bfloat16*>(embed_weight.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(norm_weight.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(norm_out.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(res_out.data_ptr()),
+        V, K, static_cast<float>(eps), pdl);
+  } else {
+    dflash_launch_pdl(
+        dflash_embed_rms_norm_kernel<int32_t>, M, 256, st, pdl,
+        input_ids.data_ptr<int32_t>(),
+        reinterpret_cast<const __nv_bfloat16*>(embed_weight.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(norm_weight.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(norm_out.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(res_out.data_ptr()),
+        V, K, static_cast<float>(eps), pdl);
+  }
+  return std::make_tuple(norm_out, res_out);
+}
 
 void dflash_kv_post(
     torch::Tensor all_kv_flat,

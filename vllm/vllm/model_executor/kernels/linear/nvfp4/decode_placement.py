@@ -55,14 +55,16 @@ MIN_PAYLOAD_BYTES = 48 << 20
 # Payloads <= 64 MiB can partially linger in GB10's 24 MiB L2 across consecutive candidates.
 _L2_FLUSH_THRESHOLD_BYTES = 64 << 20
 # Host memory that must stay available while the spares exist.
-HOST_HEADROOM_BYTES = 20 << 30
+HOST_HEADROOM_BYTES = int(os.environ.get("MUSE_HOST_HEADROOM_GIB", "24")) << 30
+# Hard OS MemAvailable floor that cached_free (PyTorch fast pool) is never allowed to mask.
+_MIN_OS_MEM_AVAILABLE = int(os.environ.get("MUSE_MIN_OS_MEM_GIB", "16")) << 30
 _NAME = "_marlin_decode_weight"
 _L2_FLUSH_INTS = 16 << 20  # 64 MiB (> 2.5x GB10's 24 MiB L2)
 # Quarantine below-median (slow) buffers from place_decode_weights through place_prefill_weights (and KV-cache init).
 _SLOW_HOLD: list[torch.Tensor] = []
 _SLOW_HOLD_SCAN_CAP = int(os.environ.get("MUSE_SLOW_HOLD_SCAN_CAP", "140"))
 _SLOW_HOLD_MAX_SLABS = int(os.environ.get("MUSE_SLOW_HOLD_MAX_SLABS", "180"))
-_SLOW_HOLD_MAX_BYTES = int(os.environ.get("MUSE_SLOW_HOLD_MAX_BYTES_GIB", "18")) << 30
+_SLOW_HOLD_MAX_BYTES = int(os.environ.get("MUSE_SLOW_HOLD_MAX_BYTES_GIB", "12")) << 30
 HOLD_SLOW_FOR_KV = os.environ.get("MUSE_HOLD_SLOW_FOR_KV", "1").strip() not in ("0", "", "false", "no")
 _SPONGE_STATE: dict[str, int] = {"ptr": 0, "len": 0}
 
@@ -91,6 +93,22 @@ def _usable_buddyinfo_bytes(min_chunk: int = 2 << 20) -> int:
     return total
 
 
+def _wait_mem_available_settle(min_bytes: int = 75 << 30, max_wait_s: float = 5.0, poll_s: float = 0.25) -> None:
+    """Wait briefly for unified memory from a prior stopped resident process to finish draining."""
+    avail = _mem_available()
+    if avail is None or avail >= min_bytes or max_wait_s <= 0.0:
+        return
+    t0 = time.monotonic()
+    deadline = t0 + max_wait_s
+    while avail is not None and avail < min_bytes and time.monotonic() < deadline:
+        time.sleep(min(poll_s, max(0.0, deadline - time.monotonic())))
+        avail = _mem_available()
+    logger.info(
+        "MemAvailable settle poll: %.1f GiB after %.2f s (target %.1f GiB)",
+        (avail or 0) / (1 << 30), time.monotonic() - t0, min_bytes / (1 << 30),
+    )
+
+
 def take_buddyinfo_sponge(need_bytes: int = 36 << 30) -> int:
     """Temporarily commit fragmented small free blocks before weight loading so initial weights land on 32 MiB extents."""
     if not ENABLED or os.environ.get("MUSE_BUDDY_SPONGE", "1").strip() in ("0", "", "false", "no"):
@@ -103,7 +121,8 @@ def take_buddyinfo_sponge(need_bytes: int = 36 << 30) -> int:
         # Drop stale checkpoint file page cache BEFORE reading /proc/buddyinfo so usable 2 MiB+ RAM
         # reflects true free physical memory (~80+ GiB) and the sponge reliably absorbs small-order fragments.
         _drop_model_page_cache()
-        cap_gib = int(os.environ.get("MUSE_BUDDY_SPONGE_CAP_GIB", "24"))
+        _wait_mem_available_settle(75 << 30, 5.0)
+        cap_gib = min(24, int(os.environ.get("MUSE_BUDDY_SPONGE_CAP_GIB", "24")))
         if cap_gib <= 0:
             return 0
         usable = _usable_buddyinfo_bytes(2 << 20)
@@ -303,9 +322,15 @@ def _select_retry_indices(
 
 
 def ensure_slow_hold_headroom(min_free_bytes: int) -> None:
-    """Trim oldest _SLOW_HOLD slabs only if available host memory is below min_free_bytes."""
+    """Trim oldest _SLOW_HOLD slabs only if available host memory is below min_free_bytes.
+    Flushes PyTorch's caching allocator FIRST (returning cleared rejected_hold blocks to OS)
+    before discarding any quarantined slow slabs."""
     if not _SLOW_HOLD or not torch.cuda.is_available():
         return
+    avail = _mem_available()
+    if avail is None or avail >= min_free_bytes:
+        return
+    torch.cuda.empty_cache()
     while _SLOW_HOLD:
         avail = _mem_available()
         if avail is None or avail >= min_free_bytes:
@@ -369,13 +394,24 @@ def _mem_available() -> int | None:
     return None
 
 
+def _os_headroom_ok(payload_bytes: int) -> bool:
+    """Per-iteration OS MemAvailable guard for >128 MiB spare loops (prevents tight-loop OOM SIGKILL)."""
+    if payload_bytes <= (128 << 20):
+        return True
+    avail = _mem_available()
+    return avail is None or (avail - payload_bytes) >= _MIN_OS_MEM_AVAILABLE
+
+
 def _spares_allowed(wanted: int, payload_bytes: int) -> int:
     """Spare buffers the host can carry right now, at most ``wanted``.
-    Only count PyTorch's cached-free 127 MiB fast pool for allocations <= 128 MiB that can actually reuse it."""
+    Only count PyTorch's cached-free 127 MiB fast pool for allocations <= 128 MiB that can actually reuse it,
+    and never let cached_free mask an OS MemAvailable below _MIN_OS_MEM_AVAILABLE."""
     available = _mem_available()
     if available is None:
         return 0
     if payload_bytes <= (128 << 20):
+        if available < _MIN_OS_MEM_AVAILABLE:
+            return 0
         cached_free = max(0, torch.cuda.memory_reserved() - torch.cuda.memory_allocated())
         effective = available + cached_free
     else:
@@ -384,23 +420,34 @@ def _spares_allowed(wanted: int, payload_bytes: int) -> int:
 
 
 def _ensure_spares_room(wanted: int, payload_bytes: int, hold_list: list, allow_slow_trim: bool = True) -> int:
-    """Release oldest fast spares back to PyTorch's cache first; only trim _SLOW_HOLD + empty_cache if still short."""
+    """Release oldest fast spares back to PyTorch's cache first; only trim _SLOW_HOLD + empty_cache if still short.
+    Under real OS pressure (MemAvailable < _MIN_OS_MEM_AVAILABLE + 2 GiB), force cache flush + slow-hold trim
+    even for small-payload groups so unified memory never crosses into Linux OOM-killer."""
+    low_os_thresh = _MIN_OS_MEM_AVAILABLE + (2 << 30)
+    avail = _mem_available()
+    low_os = avail is not None and avail < low_os_thresh
     spares_count = _spares_allowed(wanted, payload_bytes)
-    if spares_count >= wanted:
+    if spares_count >= wanted and not low_os:
         return spares_count
-    need_flush = payload_bytes > (128 << 20)
-    while hold_list and _spares_allowed(wanted, payload_bytes) < wanted:
+    need_flush = payload_bytes > (128 << 20) or low_os
+    while hold_list and (_spares_allowed(wanted, payload_bytes) < wanted or low_os):
         del hold_list[: max(1, len(hold_list) // 4)]
         if need_flush:
             torch.cuda.empty_cache()
+        avail = _mem_available()
+        low_os = avail is not None and avail < low_os_thresh
     spares_count = _spares_allowed(wanted, payload_bytes)
-    if need_flush and spares_count < wanted:
+    if need_flush and (spares_count < wanted or low_os):
         torch.cuda.empty_cache()
+        avail = _mem_available()
+        low_os = avail is not None and avail < low_os_thresh
         spares_count = _spares_allowed(wanted, payload_bytes)
-    if allow_slow_trim and spares_count < wanted and _SLOW_HOLD:
-        while _SLOW_HOLD and _spares_allowed(wanted, payload_bytes) < wanted:
+    if (allow_slow_trim or low_os) and (spares_count < wanted or low_os) and _SLOW_HOLD:
+        while _SLOW_HOLD and (_spares_allowed(wanted, payload_bytes) < wanted or low_os):
             del _SLOW_HOLD[: max(1, len(_SLOW_HOLD) // 4)]
             torch.cuda.empty_cache()
+            avail = _mem_available()
+            low_os = avail is not None and avail < low_os_thresh
     return _spares_allowed(wanted, payload_bytes)
 
 
@@ -673,6 +720,8 @@ def _place_group(
     spares = []
     try:
         for _ in range(spares_count):
+            if not _os_headroom_ok(payload_bytes):
+                break
             spare = torch.empty_like(homes[0])
             spare.copy_(homes[0])  # every page written once before it is timed
             spares.append(spare)
@@ -901,6 +950,8 @@ def _place_muserans_group(rans_ext, layers, n: int, k: int, evict_buf: torch.Ten
     spares = []
     try:
         for _ in range(spares_count):
+            if not _os_headroom_ok(max_bytes):
+                break
             spare = torch.empty((max_bytes,), dtype=torch.uint8, device=homes[0].device)
             spare[:ref_len].copy_(ref_blob)
             spares.append(spare)
@@ -1015,6 +1066,8 @@ def _place_bf16_rans_group(bf16_lib, layers, n: int, k: int, evict_buf: torch.Te
     spares = []
     try:
         for _ in range(spares_count):
+            if not _os_headroom_ok(max_bytes):
+                break
             spare = torch.empty((max_bytes,), dtype=torch.uint8, device=homes[0].device)
             spare[:ref_len].copy_(ref_blob)
             spares.append(spare)
@@ -1266,6 +1319,8 @@ def _place_prefill_group(layers, run, on_move=None, evict_buf=None, rejected_hol
     spares = []
     try:
         for _ in range(spares_count):
+            if not _os_headroom_ok(payload_bytes):
+                break
             if col_major:
                 spare = torch.empty(
                     (homes[0].shape[1], homes[0].shape[0]),
@@ -1338,6 +1393,7 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
     ensure_slow_hold_headroom(32 << 30)
     began = time.perf_counter()
     rejected_hold: list[torch.Tensor] = []
+    saved_pdl: list[tuple] = []
     try:
         try:
             from marlinw import swiglu as _swiglu
@@ -1624,6 +1680,22 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
                             _marlin_attn.gemm(x, weight, ref.weight_scale, ref.weight_global_scale, *plan)
                         on_mv = _route.down128_moved if _route is not None else None
                     groups.append((gname, glayers, run_nv_attn, on_mv, False))
+        # Disable PDL while stress-timing isolated DRAM slabs (placement only ranks DRAM bandwidth;
+        # restoring original PDL modes in finally keeps steady-state inference untouched).
+        for mod, fn_name, off_val in (
+            (_swiglu, "set_tma_pdl", 0),
+            (getattr(_route, "marlinw_down128", None), "set_tma_pdl", 0),
+            (_fp8ws, "set_pdl", False),
+            (_fp8sw, "set_pdl", False),
+        ):
+            fn = getattr(mod, fn_name, None) if mod is not None else None
+            if fn is not None:
+                try:
+                    prev = fn(off_val)
+                    if prev is not None:
+                        saved_pdl.append((fn, prev))
+                except Exception:  # noqa: BLE001
+                    pass
         for name, layers, run, on_move, fast in groups:
             try:
                 if name == "fp8_swiglu_39936x6656":
@@ -1656,7 +1728,13 @@ def place_prefill_weights(model: torch.nn.Module) -> None:
     except Exception as err:  # noqa: BLE001 - the load must go on
         logger.warning("Prefill weight placement failed and was skipped: %s", err)
     finally:
+        for fn, prev in reversed(saved_pdl):
+            try:
+                fn(prev)
+            except Exception:  # noqa: BLE001
+                pass
         rejected_hold.clear()
+        torch.cuda.empty_cache()
         if HOLD_SLOW_FOR_KV and _SLOW_HOLD:
             ensure_slow_hold_headroom(HOST_HEADROOM_BYTES)
         else:

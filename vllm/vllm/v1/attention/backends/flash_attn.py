@@ -3,6 +3,7 @@
 """Attention layer with FlashAttention."""
 
 import copy
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -80,6 +81,306 @@ try:
     import muse_prefill_attn
 except (ImportError, OSError):
     muse_prefill_attn = None
+
+_DFLASH_DRAFT_ATTN_STATE: dict[int, bool] = {}
+_DFLASH_DRAFT_ATTN_EXT = None
+
+
+def _draft_attn_fast_enabled() -> bool:
+    return os.environ.get("MUSE_DRAFT_ATTN_FAST", "1").strip().lower() not in (
+        "0",
+        "",
+        "false",
+        "off",
+        "no",
+        "none",
+    )
+
+
+def _self_check_dflash_draft_attn(ext, device: torch.device) -> bool:
+    """Verify dflash_draft_attn against FP32 SDPA across Q=16/8, kv_len=128/512/2048/2060/2116/2560,
+    bs=16/64, full & sliding_window=(2047, 2047), 4D (B,H,N,2D) and 5D (2,B,N,H,D) KV layouts,
+    non-sequential block tables, and optional sinks before admitting it for non-causal drafter
+    attention."""
+    gen = torch.Generator(device=device)
+    gen.manual_seed(20261128)
+    head_dim = 128
+    scale = head_dim**-0.5
+    cases = (
+        # (M, kv_len, nq, nkv, block_size, layout, w_left, w_right, use_sinks)
+        (16, 128, 32, 2, 16, "4d", -1, -1, False),
+        (16, 512, 32, 2, 16, "4d", 2047, 2047, False),
+        (16, 2048, 32, 2, 16, "4d", 2047, 2047, False),
+        (16, 2060, 32, 2, 16, "4d", 2047, 2047, False),
+        (16, 2116, 32, 2, 16, "4d", 2047, 2047, False),
+        (16, 2560, 32, 2, 16, "4d", 2047, 2047, False),
+        (8, 128, 32, 2, 16, "4d", -1, -1, False),
+        (8, 512, 32, 2, 16, "4d", 2047, 2047, False),
+        (8, 2560, 32, 2, 64, "4d", 2047, 2047, False),
+        (7, 512, 32, 2, 16, "4d", 2047, 2047, False),
+        (7, 2116, 32, 2, 16, "4d", 2047, 2047, False),
+        (16, 523, 32, 2, 16, "5d", 255, 255, False),
+        (8, 517, 16, 2, 64, "5d", 2047, 2047, True),
+    )
+    max_err_all = 0.0
+    min_cos_all = 1.0
+
+    def _run_case(m, kv_len, nq, nkv, bs, layout, w_left, w_right, use_sinks):
+        perm = block_table = q = kv4 = kv5 = k_cache = v_cache = out = None
+        seqused_k = cu_seqlens_q = sinks = bt_idx = k_seq = v_seq = None
+        k_rep = v_rep = q_f32 = scores = q_pos = k_pos = mask = None
+        sink_col = scores_aug = probs = ref = got = None
+        try:
+            n_used_blocks = (kv_len + bs - 1) // bs
+            num_blocks = n_used_blocks + 5
+            perm = torch.randperm(num_blocks, generator=gen, device=device, dtype=torch.int32)
+            block_table = perm[:n_used_blocks].unsqueeze(0).contiguous()
+            q = torch.randn((m, nq, head_dim), generator=gen, device=device, dtype=torch.bfloat16) * 0.5
+            if layout == "4d":
+                kv4 = torch.randn(
+                    (num_blocks, nkv, bs, 2 * head_dim),
+                    generator=gen,
+                    device=device,
+                    dtype=torch.bfloat16,
+                ) * 0.5
+                k_cache, v_cache = kv4.transpose(1, 2).split(head_dim, dim=-1)
+            else:
+                kv5 = torch.randn(
+                    (2, num_blocks, bs, nkv, head_dim),
+                    generator=gen,
+                    device=device,
+                    dtype=torch.bfloat16,
+                ) * 0.5
+                k_cache, v_cache = kv5[0], kv5[1]
+            out = torch.empty_like(q)
+            seqused_k = torch.tensor([kv_len], dtype=torch.int32, device=device)
+            cu_seqlens_q = torch.tensor([0, m], dtype=torch.int32, device=device)
+            sinks = (
+                torch.randn((nq,), generator=gen, device=device, dtype=torch.float32) * 0.5
+                if use_sinks
+                else None
+            )
+            ext.dflash_draft_attn(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                seqused_k,
+                block_table,
+                cu_seqlens_q,
+                scale,
+                w_left,
+                w_right,
+                m,
+                sinks,
+            )
+
+            # Reference FP32 non-causal GQA SDPA with exact FA2 local window bounds.
+            bt_idx = block_table[0].to(torch.int64)
+            k_seq = k_cache[bt_idx].reshape(-1, nkv, head_dim)[:kv_len].float()
+            v_seq = v_cache[bt_idx].reshape(-1, nkv, head_dim)[:kv_len].float()
+            gqa = nq // nkv
+            k_rep = k_seq.repeat_interleave(gqa, dim=1).transpose(0, 1)  # [nq, kv_len, D]
+            v_rep = v_seq.repeat_interleave(gqa, dim=1).transpose(0, 1)  # [nq, kv_len, D]
+            q_f32 = q.float().transpose(0, 1)  # [nq, M, D]
+            scores = torch.matmul(q_f32, k_rep.transpose(-1, -2)) * scale  # [nq, M, kv_len]
+            if w_left >= 0 or w_right >= 0:
+                q_pos = torch.arange(m, device=device).view(m, 1) + (kv_len - m)
+                k_pos = torch.arange(kv_len, device=device).view(1, kv_len)
+                mask = torch.zeros((m, kv_len), dtype=torch.bool, device=device)
+                if w_left >= 0:
+                    mask |= k_pos < (q_pos - w_left)
+                if w_right >= 0:
+                    mask |= k_pos > (q_pos + w_right)
+                scores = scores.masked_fill(mask.unsqueeze(0), float("-inf"))
+            if sinks is not None:
+                sink_col = sinks.float().view(nq, 1, 1).expand(nq, m, 1)
+                scores_aug = torch.cat([scores, sink_col], dim=-1)
+                probs = torch.softmax(scores_aug, dim=-1)[..., :-1]
+            else:
+                probs = torch.softmax(scores, dim=-1)
+            ref = torch.matmul(probs, v_rep).transpose(0, 1)  # [M, nq, D]
+
+            got = out.float()
+            max_abs = float((got - ref).abs().max().item())
+            cos = float(
+                torch.nn.functional.cosine_similarity(
+                    got.reshape(-1), ref.reshape(-1), dim=0
+                ).item()
+            )
+            return max_abs, cos
+        finally:
+            del (
+                perm, block_table, q, kv4, kv5, k_cache, v_cache, out,
+                seqused_k, cu_seqlens_q, sinks, bt_idx, k_seq, v_seq,
+                k_rep, v_rep, q_f32, scores, q_pos, k_pos, mask,
+                sink_col, scores_aug, probs, ref, got,
+            )
+
+    try:
+        for m, kv_len, nq, nkv, bs, layout, w_left, w_right, use_sinks in cases:
+            max_abs, cos = _run_case(m, kv_len, nq, nkv, bs, layout, w_left, w_right, use_sinks)
+            max_err_all = max(max_err_all, max_abs)
+            min_cos_all = min(min_cos_all, cos)
+            if not (max_abs < 5e-3 and cos > 0.99999):
+                logger.warning(
+                    "dflash_draft_attn self-check FAILED on M=%d kv_len=%d nq=%d nkv=%d "
+                    "bs=%d layout=%s win=(%d,%d) sinks=%s: max_abs=%.6f cos=%.7f (falling back to FA2)",
+                    m,
+                    kv_len,
+                    nq,
+                    nkv,
+                    bs,
+                    layout,
+                    w_left,
+                    w_right,
+                    use_sinks,
+                    max_abs,
+                    cos,
+                )
+                return False
+        logger.info(
+            "dflash_draft_attn self-check PASSED (%d cases incl. SWA 2048: max_abs=%.6f < 5e-3, min_cos=%.7f > 0.99999)",
+            len(cases),
+            max_err_all,
+            min_cos_all,
+        )
+        return True
+    finally:
+        del gen
+        torch.cuda.empty_cache()
+
+
+def _ensure_dflash_draft_attn_ready(device: torch.device):
+    global _DFLASH_DRAFT_ATTN_EXT
+    if not _draft_attn_fast_enabled():
+        return None
+    dev_idx = device.index if device.index is not None else 0
+    admitted = _DFLASH_DRAFT_ATTN_STATE.get(dev_idx)
+    if admitted is not None:
+        return _DFLASH_DRAFT_ATTN_EXT if admitted else None
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    try:
+        import muse_bfx_ext as _bfx
+    except (ImportError, OSError):
+        _DFLASH_DRAFT_ATTN_STATE[dev_idx] = False
+        return None
+    if not hasattr(_bfx, "dflash_draft_attn"):
+        _DFLASH_DRAFT_ATTN_STATE[dev_idx] = False
+        return None
+    try:
+        with torch.inference_mode(False), torch.no_grad():
+            ok = _self_check_dflash_draft_attn(_bfx, device)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "dflash_draft_attn self-check raised %s; falling back to FA2", exc
+        )
+        ok = False
+    _DFLASH_DRAFT_ATTN_EXT = _bfx
+    _DFLASH_DRAFT_ATTN_STATE[dev_idx] = ok
+    return _bfx if ok else None
+
+
+def _try_dflash_draft_attn(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    output: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    sliding_window_size: list[int] | None,
+    sinks: torch.Tensor | None,
+) -> bool:
+    w_left = int(sliding_window_size[0]) if sliding_window_size is not None else -1
+    w_right = int(sliding_window_size[1]) if sliding_window_size is not None else -1
+    # SWA (w_left >= 0) naturally caps per-CTA work to <= w_left + 16 tokens;
+    # for non-SWA full attention, keep very long contexts on FA2 split-KV.
+    if w_left < 0 and max_seqlen_k > 2048:
+        return False
+    if (
+        softmax_scale <= 0.0
+        or query.dtype != torch.bfloat16
+        or key_cache.dtype != torch.bfloat16
+        or value_cache.dtype != torch.bfloat16
+        or output.dtype != torch.bfloat16
+        or seqused_k.dtype != torch.int32
+        or cu_seqlens_q.dtype != torch.int32
+        or block_table.dtype != torch.int32
+        or query.dim() != 3
+        or output.dim() != 3
+        or key_cache.dim() != 4
+        or value_cache.dim() != 4
+        or block_table.dim() not in (1, 2)
+        or not query.is_cuda
+        or not output.is_cuda
+        or not key_cache.is_cuda
+        or not value_cache.is_cuda
+        or not seqused_k.is_cuda
+        or not cu_seqlens_q.is_cuda
+        or not block_table.is_cuda
+        or seqused_k.numel() < 1
+        or cu_seqlens_q.numel() < 2
+        or not cu_seqlens_q.is_contiguous()
+        or block_table.stride(-1) != 1
+        or query.shape != output.shape
+        or query.size(2) != 128
+        or key_cache.size(3) != 128
+        or value_cache.size(3) != 128
+        or key_cache.size(1) <= 0
+        or key_cache.size(1) != value_cache.size(1)
+        or key_cache.size(2) <= 0
+        or key_cache.size(2) != value_cache.size(2)
+        or (query.size(1) % key_cache.size(2)) != 0
+        or query.stride(2) != 1
+        or output.stride(2) != 1
+        or key_cache.stride(3) != 1
+        or value_cache.stride(3) != 1
+        or (query.stride(0) & 7) != 0
+        or (query.stride(1) & 7) != 0
+        or (key_cache.stride(0) & 7) != 0
+        or (key_cache.stride(1) & 7) != 0
+        or (key_cache.stride(2) & 7) != 0
+        or (value_cache.stride(0) & 7) != 0
+        or (value_cache.stride(1) & 7) != 0
+        or (value_cache.stride(2) & 7) != 0
+        or (output.stride(0) & 1) != 0
+        or (output.stride(1) & 1) != 0
+        or (query.data_ptr() & 15) != 0
+        or (key_cache.data_ptr() & 15) != 0
+        or (value_cache.data_ptr() & 15) != 0
+        or (output.data_ptr() & 3) != 0
+    ):
+        return False
+    if sinks is not None and (
+        not sinks.is_cuda
+        or sinks.dim() != 1
+        or not sinks.is_contiguous()
+        or sinks.size(0) != query.size(1)
+        or sinks.dtype not in (torch.float32, torch.bfloat16)
+    ):
+        return False
+    ext = _ensure_dflash_draft_attn_ready(query.device)
+    if ext is None:
+        return False
+    ext.dflash_draft_attn(
+        query,
+        key_cache,
+        value_cache,
+        output,
+        seqused_k,
+        block_table,
+        cu_seqlens_q,
+        softmax_scale,
+        w_left,
+        w_right,
+        int(query.size(0)),
+        sinks,
+    )
+    return True
 
 logger = init_logger(__name__)
 
@@ -899,6 +1200,15 @@ class FlashAttentionImpl(AttentionImpl):
                 "fused output quantization is not yet supported for FlashAttentionImpl"
             )
 
+        if (
+            not _DFLASH_DRAFT_ATTN_STATE
+            and self.head_size == 128
+            and query.is_cuda
+            and not torch.cuda.is_current_stream_capturing()
+            and not torch.compiler.is_compiling()
+        ):
+            _ensure_dflash_draft_attn_ready(query.device)
+
         if attn_metadata is None:
             # Profiling run.
             return output.fill_(0)
@@ -1187,6 +1497,36 @@ class FlashAttentionImpl(AttentionImpl):
                         softmax_scale=self.scale,
                         window=sliding_window_size,
                         allow_defer=(tail is None),
+                    )
+                ):
+                    return output
+
+                if (
+                    causal is False
+                    and dynamic_causal is None
+                    and tail is None
+                    and mm_mask_mod is None
+                    and rswa_mask_mod_fn is None
+                    and self.alibi_slopes is None
+                    and self.logits_soft_cap == 0
+                    and self.head_size == 128
+                    and self.num_heads % self.num_kv_heads == 0
+                    and not is_quantized_kv_cache(self.kv_cache_dtype)
+                    and 1 <= num_actual_tokens <= 16
+                    and max_seqlen_q == num_actual_tokens
+                    and cu_seqlens_q.shape[0] >= 2
+                    and _try_dflash_draft_attn(
+                        query=q_arg,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        output=out_arg,
+                        seqused_k=seqused_k,
+                        block_table=block_table,
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        sliding_window_size=sliding_window_size,
+                        sinks=self.sinks,
                     )
                 ):
                     return output

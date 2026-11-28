@@ -1138,6 +1138,36 @@ cudaError_t launch_pdl(void (*kernel)(KArgs...), int rows, int threads, cudaStre
   return launch_pdl_grid(kernel, dim3(rows, 1, 1), threads, stream, args...);
 }
 
+static void ensure_prefill_norm_glue_carveout() {
+  static bool done = false;
+  if (done) return;
+  static const bool enabled = []() {
+    const char* env = std::getenv("MUSE_NORM_GLUE_PREFILL_CARVEOUT100");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  if (enabled) {
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    auto set100 = [](auto fn) {
+      (void)cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+      (void)cudaGetLastError();
+    };
+    // Strictly prefill-only kernels (rows > 32 / n > 4096*32) to match 100% SMEM carveout
+    // of marlinw_tma / fp8_gemm_2cta / prefill_attn; ZERO decode kernels touched.
+    set100(post_attn_norm<true, false, true>);
+    set100(post_attn_norm<true, false, false>);
+    set100(post_attn_norm<false, true, true>);
+    set100(post_attn_norm<false, true, false>);
+    set100(post_ff_norm_prefill<false, true>);
+    set100(post_ff_norm_prefill<false, false>);
+    set100(post_ff_norm_prefill<true, true>);
+    set100(post_ff_norm_prefill<true, false>);
+    set100(mul_sigmoid_fp8_kernel<256, false, true, 0>);
+    cudaThreadExchangeStreamCaptureMode(&mode);
+  }
+  done = true;
+}
+
 }  // namespace
 
 extern "C" {
@@ -1159,6 +1189,7 @@ int muse_norm_glue_post_attn(int kind, int rows, const void* x, const void* res,
   const auto* Wq = static_cast<const __nv_bfloat16*>(w_pre);
   const bool use_pdl = (rows <= 32) && norm_glue_pdl_enabled();
   const bool use_prefill_pdl = (rows > 32) && norm_glue_prefill_pdl_enabled();
+  if (rows > 32) ensure_prefill_norm_glue_carveout();
   if (kind == 0) {
     if (use_pdl) {
       return static_cast<int>(launch_pdl(post_attn_norm_decode<true, false, true>, rows, kThreads, stream,
@@ -1215,6 +1246,7 @@ int muse_norm_glue_post_ff(int kind, int rows, void* x, const void* d, const voi
   }();
   const bool use_pdl = (rows <= 32) && norm_glue_pdl_enabled();
   const bool use_prefill_pdl = (rows > 32) && norm_glue_prefill_pdl_enabled();
+  if (rows > 32) ensure_prefill_norm_glue_carveout();
   if (kind == 0) {
     if (use_pdl) {
       return static_cast<int>(launch_pdl(post_ff_norm_decode<false, false, true, true>, rows, kThreads, stream,
@@ -1440,6 +1472,7 @@ int muse_norm_glue_mul_sigmoid_fp8(const void* gate, const void* attn, const voi
   }
   const int blocks = (vec8 + 255) / 256;
   if (norm_glue_prefill_pdl_enabled()) {
+    ensure_prefill_norm_glue_carveout();
     mul_sigmoid_fp8_kernel<256, false, true><<<blocks, 256, 0, stream>>>(g_ptr, a_ptr, s_ptr, o_ptr, vec8);
   } else {
     mul_sigmoid_fp8_kernel<256, false, false><<<blocks, 256, 0, stream>>>(g_ptr, a_ptr, s_ptr, o_ptr, vec8);

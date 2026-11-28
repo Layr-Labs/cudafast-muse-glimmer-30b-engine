@@ -124,6 +124,8 @@ torch::Tensor int4_gemm_aux5(
 torch::Tensor dflash_rms_norm(torch::Tensor input, torch::Tensor weight, double eps);
 std::tuple<torch::Tensor, torch::Tensor> dflash_fused_add_rms_norm(
     torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
+std::tuple<torch::Tensor, torch::Tensor> dflash_embed_rms_norm(
+    torch::Tensor input_ids, torch::Tensor embed_weight, torch::Tensor norm_weight, double eps);
 void dflash_kv_post(
     torch::Tensor all_kv_flat, torch::Tensor positions, torch::Tensor k_norm_w,
     torch::Tensor cos_sin_cache,
@@ -139,6 +141,11 @@ std::tuple<torch::Tensor, torch::Tensor> dflash_qkv_norm_rope(
     c10::optional<torch::Tensor> k_cache = c10::nullopt,
     c10::optional<torch::Tensor> v_cache = c10::nullopt,
     int64_t block_size = 16);
+void dflash_draft_attn(
+    torch::Tensor q, torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor out,
+    torch::Tensor seqused_k, torch::Tensor block_table, torch::Tensor cu_seqlens_q,
+    double softmax_scale, int64_t window_left = -1, int64_t window_right = -1,
+    int64_t max_q = 16, c10::optional<torch::Tensor> sinks = c10::nullopt);
 void dflash_prepare_inputs(
     torch::Tensor out_input_ids, torch::Tensor out_query_positions,
     torch::Tensor out_query_start_loc, torch::Tensor out_seq_lens,
@@ -379,6 +386,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int4_gemm_aux5", &int4_gemm_aux5);
   m.def("dflash_rms_norm", &dflash_rms_norm);
   m.def("dflash_fused_add_rms_norm", &dflash_fused_add_rms_norm);
+  m.def("dflash_embed_rms_norm", &dflash_embed_rms_norm);
   m.def("dflash_kv_post", &dflash_kv_post);
   m.def("dflash_qkv_norm_rope", &dflash_qkv_norm_rope,
         pybind11::arg("qkv"), pybind11::arg("positions"),
@@ -597,4 +605,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("stride_slot"), pybind11::arg("block_size"), pybind11::arg("layer_gid"),
         pybind11::arg("src_row") = 6,
         pybind11::arg("src_row_buf") = c10::nullopt);
+  m.def("dflash_draft_attn", &dflash_draft_attn,
+        pybind11::arg("q"), pybind11::arg("k_cache"), pybind11::arg("v_cache"),
+        pybind11::arg("out"), pybind11::arg("seqused_k"), pybind11::arg("block_table"),
+        pybind11::arg("cu_seqlens_q"), pybind11::arg("softmax_scale"),
+        pybind11::arg("window_left") = -1, pybind11::arg("window_right") = -1,
+        pybind11::arg("max_q") = 16, pybind11::arg("sinks") = c10::nullopt);
 }

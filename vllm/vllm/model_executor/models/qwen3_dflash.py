@@ -383,6 +383,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         tail_slice_m6: bool = False,
+        skip_input_norm: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         use_fuse_norm = (
             getattr(self, "_dflash_fuse_norm_ok", False)
@@ -391,26 +392,27 @@ class DFlashQwen3DecoderLayer(nn.Module):
             and hidden_states.shape[-1] <= 8192
             and hidden_states.shape[-1] % 8 == 0
         )
-        if residual is not None:
-            if use_fuse_norm:
-                hidden_states, residual = torch.ops.muse.dflash_fused_add_rms_norm(
-                    hidden_states,
-                    residual,
-                    self.input_layernorm.weight,
-                    float(self.input_layernorm.variance_epsilon),
-                )
+        if not skip_input_norm:
+            if residual is not None:
+                if use_fuse_norm:
+                    hidden_states, residual = torch.ops.muse.dflash_fused_add_rms_norm(
+                        hidden_states,
+                        residual,
+                        self.input_layernorm.weight,
+                        float(self.input_layernorm.variance_epsilon),
+                    )
+                else:
+                    hidden_states, residual = self.input_layernorm(hidden_states, residual)
             else:
-                hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        else:
-            residual = hidden_states
-            if use_fuse_norm:
-                hidden_states = torch.ops.muse.dflash_rms_norm(
-                    hidden_states,
-                    self.input_layernorm.weight,
-                    float(self.input_layernorm.variance_epsilon),
-                )
-            else:
-                hidden_states = self.input_layernorm(hidden_states)
+                residual = hidden_states
+                if use_fuse_norm:
+                    hidden_states = torch.ops.muse.dflash_rms_norm(
+                        hidden_states,
+                        self.input_layernorm.weight,
+                        float(self.input_layernorm.variance_epsilon),
+                    )
+                else:
+                    hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -877,17 +879,35 @@ class DFlashQwen3Model(nn.Module):
         positions: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            input_embeds = self.embed_input_ids(input_ids)
+        skip_l0_norm = False
+        if (
+            input_embeds is None
+            and getattr(self, "_dflash_fuse_embed_norm_ok", False)
+            and len(self.layers) > 0
+            and input_ids.is_cuda
+            and input_ids.dim() == 1
+            and input_ids.dtype in (torch.int32, torch.int64)
+        ):
+            l0_norm = self.layers[0].input_layernorm
+            hidden_states, residual = torch.ops.muse.dflash_embed_rms_norm(
+                input_ids,
+                self.embed_tokens.weight,
+                l0_norm.weight,
+                float(l0_norm.variance_epsilon),
+            )
+            skip_l0_norm = True
+        else:
+            if input_embeds is None:
+                input_embeds = self.embed_input_ids(input_ids)
+            hidden_states = input_embeds
+            residual = None
 
-        hidden_states = input_embeds
-
-        residual = None
-        for layer in self.layers:
+        for idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+                skip_input_norm=(skip_l0_norm and idx == 0),
             )
         if (
             getattr(self, "_dflash_fuse_norm_ok", False)
@@ -914,11 +934,29 @@ class DFlashQwen3Model(nn.Module):
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Eager/CUDA-graph forward slicing Layer-4 post-attention [1:7] -> M=6 (0-ULP exact)."""
-        if input_embeds is None:
-            input_embeds = self.embed_input_ids(input_ids)
+        skip_l0_norm = False
+        if (
+            input_embeds is None
+            and getattr(self, "_dflash_fuse_embed_norm_ok", False)
+            and len(self.layers) > 0
+            and input_ids.is_cuda
+            and input_ids.dim() == 1
+            and input_ids.dtype in (torch.int32, torch.int64)
+        ):
+            l0_norm = self.layers[0].input_layernorm
+            hidden_states, residual = torch.ops.muse.dflash_embed_rms_norm(
+                input_ids,
+                self.embed_tokens.weight,
+                l0_norm.weight,
+                float(l0_norm.variance_epsilon),
+            )
+            skip_l0_norm = True
+        else:
+            if input_embeds is None:
+                input_embeds = self.embed_input_ids(input_ids)
+            hidden_states = input_embeds
+            residual = None
 
-        hidden_states = input_embeds
-        residual = None
         last_idx = len(self.layers) - 1
         for idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(
@@ -926,6 +964,7 @@ class DFlashQwen3Model(nn.Module):
                 hidden_states=hidden_states,
                 residual=residual,
                 tail_slice_m6=(idx == last_idx),
+                skip_input_norm=(skip_l0_norm and idx == 0),
             )
         if (
             getattr(self, "_dflash_fuse_norm_ok", False)
