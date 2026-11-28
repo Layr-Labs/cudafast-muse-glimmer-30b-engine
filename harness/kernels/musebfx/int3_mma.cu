@@ -1730,12 +1730,12 @@ __global__ void __launch_bounds__(128, 6) int3_mma_gemm_n32_pair_kernel(
   }
 }
 
-template <int kMaxM, int kStepWB = kStepWBytes>
+template <int kMaxM, int kStepWB = kStepWBytes, int kWStages = kSwgStages, int kAStages = kSwgStages>
 struct alignas(128) Int3SwgStageSmem {
-  alignas(128) uint8_t w[kSwgStages][kStepWB];          // 5 * 1792 = 8960 B (asym) or 5 * 1600 = 8000 B (sym)
-  alignas(128) __nv_bfloat16 a[kSwgStages][kMaxM][64];  // 5 * 1024 = 5120 B (M<=8) or 10240 B (M<=16), XOR-swizzled
-  alignas(8) uint32_t lut64[64];                        // 256 B
-  alignas(8) uint64_t mbar[kSwgStages];                 // 40 B -> 13.1-14.0 KiB (M<=8) or 18.1-19.0 KiB (M<=16)
+  alignas(128) uint8_t w[kWStages][kStepWB];
+  alignas(128) __nv_bfloat16 a[kAStages][kMaxM][64];
+  alignas(8) uint32_t lut64[64];
+  alignas(8) uint64_t mbar[kWStages];
 };
 
 template <bool kM16, bool kNf3 = true, bool kTma = false, bool kSym = false>
@@ -2253,9 +2253,8 @@ __global__ void __launch_bounds__(128, kM16 ? 5 : 7) int3_mma_gemm_swiglu_n64_ke
   }
 }
 
-// 5-stage 192-CTA deterministic wave-interleaved Hardware-TMA + Dual-PDL Stream-K SwiGLU kernel (0 float atomics!).
-template <bool kM16, bool kNf3 = true, bool kTma = false, bool kSym = false>
-__global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_swiglu_det_sk_kernel(
+template <bool kM16, bool kNf3 = true, bool kTma = false, bool kSym = false, int kWStages = kSwgStages, int kAStages = kSwgStages>
+__global__ void __launch_bounds__(128, (kM16 || kWStages > 7) ? 4 : 6) int3_mma_swiglu_det_sk_kernel(
     const __nv_bfloat16* __restrict__ A,
     const uint8_t* __restrict__ W_packed,
     __nv_bfloat16* __restrict__ C,
@@ -2265,7 +2264,7 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_swiglu_det_sk_kern
   constexpr int kTileB = kSym ? kSymTileBytes : kTileBytes;
   constexpr int kStepWB = kSym ? kSymStepWBytes : kStepWBytes;
   constexpr int kStepU4 = kStepWB / 16;
-  __shared__ Int3SwgStageSmem<kM16 ? 16 : 8, kStepWB> smem;
+  __shared__ Int3SwgStageSmem<kM16 ? 16 : 8, kStepWB, kWStages, kAStages> smem;
   __shared__ int s_is_last;
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
@@ -2286,10 +2285,12 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_swiglu_det_sk_kern
 
   if constexpr (kTma) {
     if (tid == 0) {
-      int3_mbar_init(smem.mbar, kSwgStages);
+      int3_mbar_init(smem.mbar, kWStages);
     }
     __syncthreads();
   }
+
+  const uint64_t w_pol = kTma ? int3_pol_evict_first() : 0ull;
 
   const size_t total_bytes = static_cast<size_t>(total_iters) * kStepWB;
   const uint32_t base_shifted =
@@ -2316,12 +2317,14 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_swiglu_det_sk_kern
   const int a_src_sz = a_valid ? 16 : 0;
   const int a_safe_row = a_valid ? a_row : 0;
 
-  auto issue_w_only = [&](int idx, int st) {
+  auto issue_w_only = [&](int idx, int st, bool need_fence = false) {
     const uint8_t* wp = step_w_ptr(idx);
     if constexpr (kTma) {
       if (tid == 0) {
-        const uint64_t pol = int3_pol_evict_first();
-        int3_tma_bulk_w(smem.w[st], wp, kStepWB, &smem.mbar[st], pol);
+        if (need_fence) {
+          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        }
+        int3_tma_bulk_w(smem.w[st], wp, kStepWB, &smem.mbar[st], w_pol);
       }
     } else {
       if (tid < kStepU4) {
@@ -2346,22 +2349,7 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_swiglu_det_sk_kern
     }
   };
 
-  auto issue_stage = [&](int idx, int kg, int st, bool need_fence) {
-    const uint8_t* wp = step_w_ptr(idx);
-    if constexpr (kTma) {
-      if (tid == 0) {
-        if (need_fence) {
-          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-        }
-        const uint64_t pol = int3_pol_evict_first();
-        int3_tma_bulk_w(smem.w[st], wp, kStepWB, &smem.mbar[st], pol);
-      }
-    } else {
-      if (tid < kStepU4) {
-        const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
-        int3_cp_async16_w(sd, wp + tid * 16);
-      }
-    }
+  auto issue_a_only = [&](int kg, int st) {
     if constexpr (kM16) {
       const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][a_row][a_phys_col8 * 8]));
       int3_cp_async16_a_pred(sd, A + static_cast<size_t>(a_safe_row) * K + kg * 64 + a_col8 * 8, a_src_sz);
@@ -2372,26 +2360,47 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_swiglu_det_sk_kern
     asm volatile("cp.async.commit_group;\n" ::: "memory");
   };
 
+  auto issue_stage_cpasync = [&](int idx, int kg, int st) {
+    const uint8_t* wp = step_w_ptr(idx);
+    if (tid < kStepU4) {
+      const uint32_t sd = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.w[st][tid * 16]));
+      int3_cp_async16_w(sd, wp + tid * 16);
+    }
+    issue_a_only(kg, st);
+  };
+
   int cur_n = iter_start / num_kg;
   int cur_kg = iter_start - cur_n * num_kg;
   int seg_start_kg = cur_kg;
 
-  constexpr int kPreload = kSwgStages - 1;  // 4
-  const int preload = (my_iters < kPreload) ? my_iters : kPreload;
+  constexpr int kWPreload = kWStages - 1;
+  constexpr int kAPreload = kAStages - 1;
+  const int w_preload = (my_iters < kWPreload) ? my_iters : kWPreload;
+  const int a_preload = (my_iters < kAPreload) ? my_iters : kAPreload;
   int next_kg = cur_kg;
   if ((pdl_mode & 1) != 0) {
-    for (int p = 0; p < preload; ++p) {
+    for (int p = 0; p < w_preload; ++p) {
       issue_w_only(p, p);
     }
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    for (int p = 0; p < preload; ++p) {
+    for (int p = 0; p < a_preload; ++p) {
       load_a_sync(next_kg, p);
       if (++next_kg == num_kg) next_kg = 0;
     }
   } else {
-    for (int p = 0; p < preload; ++p) {
-      issue_stage(p, next_kg, p, false);
-      if (++next_kg == num_kg) next_kg = 0;
+    if constexpr (kTma) {
+      for (int p = 0; p < w_preload; ++p) {
+        issue_w_only(p, p);
+      }
+      for (int p = 0; p < a_preload; ++p) {
+        issue_a_only(next_kg, p);
+        if (++next_kg == num_kg) next_kg = 0;
+      }
+    } else {
+      for (int p = 0; p < w_preload; ++p) {
+        issue_stage_cpasync(p, next_kg, p);
+        if (++next_kg == num_kg) next_kg = 0;
+      }
     }
   }
 
@@ -2402,43 +2411,66 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_swiglu_det_sk_kern
   const int ldm_col_off = kM16 ? (lane >> 4) : ((lane >> 3) & 1);
   const int trig_i = ((pdl_mode & 2) != 0) ? ((my_iters > 4) ? (my_iters - 4) : 0) : -1;
 
-  int st = 0;
+  int st_w = 0;
+  int st_a = 0;
   uint32_t parity = 0u;
   for (int i = 0; i < my_iters; ++i) {
     if (i == trig_i) {
       asm volatile("griddepcontrol.launch_dependents;");
     }
     if constexpr (kTma) {
-      int3_mbar_wait(&smem.mbar[st], parity);
+      int3_mbar_wait(&smem.mbar[st_w], parity);
     }
     const int rem = my_iters - 1 - i;
-    if (rem >= 3) {
-      asm volatile("cp.async.wait_group 3;\n" ::: "memory");
-    } else if (rem == 2) {
-      asm volatile("cp.async.wait_group 2;\n" ::: "memory");
-    } else if (rem == 1) {
-      asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+    if constexpr (kAPreload >= 4) {
+      if (rem >= 3) {
+        asm volatile("cp.async.wait_group 3;\n" ::: "memory");
+      } else if (rem == 2) {
+        asm volatile("cp.async.wait_group 2;\n" ::: "memory");
+      } else if (rem == 1) {
+        asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+      } else {
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+      }
     } else {
-      asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+      if (rem >= 2) {
+        asm volatile("cp.async.wait_group 2;\n" ::: "memory");
+      } else if (rem == 1) {
+        asm volatile("cp.async.wait_group 1;\n" ::: "memory");
+      } else {
+        asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+      }
     }
     __syncthreads();
 
-    const int next_i = i + kPreload;
-    if (next_i < my_iters) {
-      const int next_st = (st == 0) ? (kSwgStages - 1) : (st - 1);
-      issue_stage(next_i, next_kg, next_st, true);
-      if (++next_kg == num_kg) next_kg = 0;
+    if constexpr (kTma) {
+      if (i + kWPreload < my_iters) {
+        const int next_st_w = (st_w == 0) ? (kWStages - 1) : (st_w - 1);
+        issue_w_only(i + kWPreload, next_st_w, true);
+      }
+      if (i + kAPreload < my_iters) {
+        const int next_st_a = (st_a == 0) ? (kAStages - 1) : (st_a - 1);
+        issue_a_only(next_kg, next_st_a);
+        if (++next_kg == num_kg) next_kg = 0;
+      }
+    } else {
+      const int next_i = i + kWPreload;
+      if (next_i < my_iters) {
+        const int next_st = (st_w == 0) ? (kWStages - 1) : (st_w - 1);
+        issue_stage_cpasync(next_i, next_kg, next_st);
+        if (++next_kg == num_kg) next_kg = 0;
+      }
     }
 
     uint32_t w01_g, w23_g, w01_u, w23_u;
     __nv_bfloat162 scg, zrg, scu, zru;
-    int3_load_tile_words<kSym>(&smem.w[st][(warp * 2 + 0) * kTileB], lane, g, base_shifted, w01_g, w23_g, scg, zrg);
-    int3_load_tile_words<kSym>(&smem.w[st][(warp * 2 + 1) * kTileB], lane, g, base_shifted, w01_u, w23_u, scu, zru);
+    int3_load_tile_words<kSym>(&smem.w[st_w][(warp * 2 + 0) * kTileB], lane, g, base_shifted, w01_g, w23_g, scg, zrg);
+    int3_load_tile_words<kSym>(&smem.w[st_w][(warp * 2 + 1) * kTileB], lane, g, base_shifted, w01_u, w23_u, scu, zru);
 
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
       const int pcol8 = (2 * s + ldm_col_off) ^ (ldm_row & 7);
-      const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st][ldm_row][pcol8 * 8]));
+      const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(&smem.a[st_a][ldm_row][pcol8 * 8]));
       uint32_t a0, a1, a2, a3;
       if constexpr (kM16) {
         int3_ldmatrix_x4(a0, a1, a2, a3, addr);
@@ -2457,9 +2489,12 @@ __global__ void __launch_bounds__(128, kM16 ? 4 : 6) int3_mma_swiglu_det_sk_kern
       }
     }
 
-    if (++st == kSwgStages) {
-      st = 0;
+    if (++st_w == kWStages) {
+      st_w = 0;
       parity ^= 1u;
+    }
+    if (++st_a == kAStages) {
+      st_a = 0;
     }
 
     const bool tile_done = (cur_kg + 1 == num_kg) || (i + 1 == my_iters);
@@ -2917,6 +2952,11 @@ static void int3_set_carveout_impl() {
   cudaFuncSetAttribute(int3_mma_gemm_swiglu_kernel<false, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int3_mma_gemm_swiglu_kernel<true, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int3_mma_swiglu_det_sk_kernel<false, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  if constexpr (kTma && kSym) {
+    cudaFuncSetAttribute(int3_mma_swiglu_det_sk_kernel<false, kNf3, true, true, 7, 4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(int3_mma_swiglu_det_sk_kernel<false, kNf3, true, true, 10, 4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    cudaFuncSetAttribute(int3_mma_swiglu_det_sk_kernel<false, kNf3, true, true, 12, 4>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  }
   cudaFuncSetAttribute(int3_mma_swiglu_det_sk_kernel<true, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int3_mma_streamk_kernel<false, false, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
   cudaFuncSetAttribute(int3_mma_streamk_kernel<true, false, kNf3, kTma, kSym>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
@@ -3165,6 +3205,38 @@ static torch::Tensor launch_int3_gemm_swiglu_impl(
           A_ptr, W_packed.data_ptr<uint8_t>(), reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
           p_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), swg_sk, pdl);
     } else {
+      if constexpr (kTma && kSym) {
+        auto read_ws = []() -> int {
+          const char* ws = std::getenv("MUSE_INT3_WSTAGES");
+          if (ws && *ws) return std::atoi(ws);
+          const char* p7 = std::getenv("MUSE_INT3_PIPE7");
+          if (p7 && *p7) return (std::atoi(p7) != 0) ? 7 : 5;
+          return 7;
+        };
+        const int wstages = int3_bench_dyn_env() ? read_ws() : ([&]() { static const int v = read_ws(); return v; }());
+        if (wstages >= 12) {
+          int3_launch_pdl(
+              int3_mma_swiglu_det_sk_kernel<false, kNf3, true, true, 12, 4>,
+              dim3(static_cast<unsigned>(swg_sk), 1u, 1u), kThreads, st, pdl,
+              A_ptr, W_packed.data_ptr<uint8_t>(), reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+              p_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), swg_sk, pdl);
+          return C;
+        } else if (wstages >= 10) {
+          int3_launch_pdl(
+              int3_mma_swiglu_det_sk_kernel<false, kNf3, true, true, 10, 4>,
+              dim3(static_cast<unsigned>(swg_sk), 1u, 1u), kThreads, st, pdl,
+              A_ptr, W_packed.data_ptr<uint8_t>(), reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+              p_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), swg_sk, pdl);
+          return C;
+        } else if (wstages >= 7) {
+          int3_launch_pdl(
+              int3_mma_swiglu_det_sk_kernel<false, kNf3, true, true, 7, 4>,
+              dim3(static_cast<unsigned>(swg_sk), 1u, 1u), kThreads, st, pdl,
+              A_ptr, W_packed.data_ptr<uint8_t>(), reinterpret_cast<__nv_bfloat16*>(C.data_ptr()),
+              p_ptr, d_ptr, M, static_cast<int>(I), static_cast<int>(K), swg_sk, pdl);
+          return C;
+        }
+      }
       int3_launch_pdl(
           int3_mma_swiglu_det_sk_kernel<false, kNf3, kTma, kSym>,
           dim3(static_cast<unsigned>(swg_sk), 1u, 1u), kThreads, st, pdl,

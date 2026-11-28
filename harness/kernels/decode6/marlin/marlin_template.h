@@ -250,11 +250,8 @@ __device__ __forceinline__ float marlin_full_rcp(float s) {
 }
 
 __device__ __forceinline__ uint16_t marlin_pack_fp8x2(float v0, float v1) {
-  auto cl = [](float v) {
-    return (v != v) ? 448.0f : (v < -448.0f ? -448.0f : (v > 448.0f ? 448.0f : v));
-  };
   uint16_t lo;
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(cl(v1)), "f"(cl(v0)));
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(v1), "f"(v0));
   return lo;
 }
 
@@ -1119,10 +1116,7 @@ __global__ void Marlin(
                 "TMA4 rANS scales require M = 1 decode config (128 or 256 threads)");
   constexpr int kTmaWarps = threads / 32;
   constexpr int RANS_CAP = (fixed_shape == 3) ? 4096 : ((threads == 256) ? 3200 : 2048);
-  // 1D hardware TMA (cp.async.bulk + L2::evict_first) for lm_head multi-M B weights (641 MiB):
-  // restores L2::evict_first where cp.async.cg.L2::cache_hint hit SM121 odd-UR, keeping A (426 KiB)
-  // and lmpost_lut (128 KiB) L2-hot across all 33 tiles/CTA with 0 odd-UR and 1 TMA issue/stage.
-  constexpr bool tma_b = fuse_lmpost && down_ilv && fixed_shape == 3 && multi_m && tma_ovlp;
+  constexpr bool tma_b = down_ilv && fixed_shape == 3 && tma_ovlp && (fuse_lmpost || !multi_m);
   static_assert(!tma_b || (!fuse_mul_sigmoid && b_gl_stride == b_sh_stride && b_sh_wr_iters == 2 &&
                            b_thread_vecs == 1 && stages <= 4),
                 "tma_b requires contiguous 8 KiB down_ilv B stages");
@@ -2711,6 +2705,23 @@ __global__ void Marlin(
           frag_c_ptr[k * 4 + 2] += rd[k].z;
           frag_c_ptr[k * 4 + 3] += rd[k].w;
         }
+      } else if constexpr (!m_block_size_8 && fixed_shape != 3 && thread_m_blocks == 2) {
+  #pragma unroll
+        for (int c = 0; c < th_size; c += 4) {
+          float4 rd[4];
+  #pragma unroll
+          for (int u = 0; u < 4; u++) {
+            rd[u] = reinterpret_cast<const float4*>(C_tmp)[c_cur_offset + active_threads * (c + u) + threadIdx.x];
+          }
+  #pragma unroll
+          for (int u = 0; u < 4; u++) {
+            const int k = c + u;
+            frag_c_ptr[k * 4 + 0] += rd[u].x;
+            frag_c_ptr[k * 4 + 1] += rd[u].y;
+            frag_c_ptr[k * 4 + 2] += rd[u].z;
+            frag_c_ptr[k * 4 + 3] += rd[u].w;
+          }
+        }
       } else if constexpr (m_block_size_8 && fixed_shape != 3) {
         constexpr int kh_size = th_size / 2;
         float4 rd[kh_size];
@@ -3273,6 +3284,36 @@ __global__ void Marlin(
   // Main loop.
   while (slice_iters) {
     if constexpr (cont_pipe) {
+#ifdef MUSE_SCALE_TMA4
+      if constexpr (multi_m && down_ilv && kloop_ovlp && b_sh_wr_iters == 2 &&
+                    !has_act_order && !is_a_8bit && !has_zp) {
+        int pipe = pipe_start;
+        do {
+          fetch_to_registers(1, pipe);
+          fetch_scales_to_registers(1, pipe);
+          const int prev_pipe = (stages == 4) ? ((pipe + 3) & 3)
+                                              : ((pipe == 0) ? (stages - 1) : (pipe - 1));
+          fetch_to_shared(prev_pipe, pipe, total_rem >= stages);
+          matmul(0, pipe);
+          tma_q++;
+          if (tma_q + 1 < tma_iters) tma_decode(tma_q + 1);
+          const int next_pipe = (stages == 4) ? ((pipe + 1) & 3)
+                                              : ((pipe + 1 == stages) ? 0 : (pipe + 1));
+          wait_for_stage(next_pipe, total_rem > 1);
+          fetch_to_registers(2, next_pipe);
+          fetch_scales_to_registers(2, next_pipe);
+          matmul(1, pipe);
+          pipe = next_pipe;
+          total_rem--;
+          if ((tma_pdl_mode & 2) && total_rem == 8) {
+            asm volatile("griddepcontrol.launch_dependents;");
+          }
+          slice_iters--;
+        } while (slice_iters > 0);
+        pipe_start = pipe;
+      } else
+#endif
+      {
   #pragma unroll
       for (int p = 0; p < stages; p++) {
         if (p < pipe_start) continue;
@@ -3397,6 +3438,7 @@ __global__ void Marlin(
       }
       if (slice_iters != 0) {
         pipe_start = 0;
+      }
       }
     } else {
   #pragma unroll
