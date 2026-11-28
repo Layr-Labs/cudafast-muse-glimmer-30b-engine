@@ -4078,6 +4078,65 @@ __device__ __forceinline__ uint32_t dhf_f32_to_key(float f) {
 }
 
 // Kernel 2: Exact 3-pass 8-bit MSB radix select from N_in (<=1536) CTA shortlist -> K_cand (<=256).
+__device__ __forceinline__ void dhf_radix_scan_warp(
+    const volatile uint32_t* hist_perm, uint32_t pref, uint32_t shift,
+    uint32_t* s_prefix_p, uint32_t* s_rem_k_p) {
+  const int lane = threadIdx.x & 31;
+  const uint32_t need = *s_rem_k_p;
+  const int g = 31 - lane;
+  uint32_t c;
+  const uint32_t c0 = hist_perm[g];
+  const uint32_t c1 = hist_perm[g + 32];
+  const uint32_t c2 = hist_perm[g + 64];
+  const uint32_t c3 = hist_perm[g + 96];
+  const uint32_t c4 = hist_perm[g + 128];
+  const uint32_t c5 = hist_perm[g + 160];
+  const uint32_t c6 = hist_perm[g + 192];
+  const uint32_t c7 = hist_perm[g + 224];
+  c = c0 + c1; c = c + c2; c = c + c3; c = c + c4; c = c + c5; c = c + c6; c = c + c7;
+  uint32_t incl = c;
+  incl += __shfl_up_sync(0xffffffffu, incl, 1);
+  incl += __shfl_up_sync(0xffffffffu, incl, 2);
+  incl += __shfl_up_sync(0xffffffffu, incl, 4);
+  incl += __shfl_up_sync(0xffffffffu, incl, 8);
+  incl += __shfl_up_sync(0xffffffffu, incl, 16);
+  const uint32_t excl = incl - c;
+  const bool is_cross = (incl >= need) && ((excl < need) || (need == 0u && lane == 0));
+  const uint32_t cm = __ballot_sync(0xffffffffu, is_cross);
+  uint32_t chosen = 0u;
+  uint32_t rem_out = need;
+  bool rem_written = false;
+  if (cm != 0u) {
+    if (is_cross) {
+      uint32_t acc = excl;
+      #pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const uint32_t cc = hist_perm[g + (j << 5)];
+        if (!rem_written && acc + cc >= need) {
+          chosen = static_cast<uint32_t>(8 * g + (7 - j));
+          rem_out = need - acc;
+          rem_written = true;
+        }
+        acc += cc;
+      }
+    }
+    const int cl = __ffs(cm) - 1;
+    chosen = __shfl_sync(0xffffffffu, chosen, cl);
+    rem_out = __shfl_sync(0xffffffffu, rem_out, cl);
+    rem_written = static_cast<bool>(__shfl_sync(0xffffffffu, rem_written ? 1u : 0u, cl));
+    if (lane == 0) {
+      *s_prefix_p = pref | (chosen << shift);
+      if (rem_written) {
+        *s_rem_k_p = rem_out;
+      }
+    }
+  } else {
+    if (lane == 0) {
+      *s_prefix_p = pref;
+    }
+  }
+}
+
 // Grid: M blocks, Block: 256 threads (~3 us, L2-resident).
 __global__ void dhf_select_topk_kernel(
     const float* __restrict__ cta_vals,
@@ -4130,25 +4189,14 @@ __global__ void dhf_select_topk_kernel(
     for (int i = tid; i < N_in; i += 256) {
       const uint32_t k = s_keys[i];
       if ((k & mask) == pref) {
-        atomicAdd(&s_hist[(k >> shift) & 0xFFu], 1u);
+        const uint32_t bkt = (k >> shift) & 0xFFu;
+        atomicAdd(&s_hist[(bkt >> 3) + ((bkt & 7u) << 5)], 1u);
       }
     }
     __syncthreads();
 
-    if (tid == 0) {
-      uint32_t acc = 0u;
-      const uint32_t need = s_rem_k;
-      uint32_t chosen = 0u;
-      for (int b = 255; b >= 0; --b) {
-        const uint32_t c = s_hist[b];
-        if (acc + c >= need) {
-          chosen = static_cast<uint32_t>(b);
-          s_rem_k = need - acc;
-          break;
-        }
-        acc += c;
-      }
-      s_prefix = pref | (chosen << shift);
+    if (tid < 32) {
+      dhf_radix_scan_warp(s_hist, pref, shift, &s_prefix, &s_rem_k);
     }
     __syncthreads();
   }
@@ -4647,25 +4695,14 @@ __global__ void __launch_bounds__(256, 2) dhf_stage2_rescore_fused_kernel(
     for (int i = tid; i < N_in; i += 256) {
       const uint32_t k = s_keys[i];
       if ((k & mask) == pref) {
-        atomicAdd(&s_hist[(k >> shift) & 0xFFu], 1u);
+        const uint32_t bkt = (k >> shift) & 0xFFu;
+        atomicAdd(&s_hist[(bkt >> 3) + ((bkt & 7u) << 5)], 1u);
       }
     }
     __syncthreads();
 
-    if (tid == 0) {
-      uint32_t acc = 0u;
-      const uint32_t need = s_rem_k;
-      uint32_t chosen = 0u;
-      for (int b = 255; b >= 0; --b) {
-        const uint32_t c = s_hist[b];
-        if (acc + c >= need) {
-          chosen = static_cast<uint32_t>(b);
-          s_rem_k = need - acc;
-          break;
-        }
-        acc += c;
-      }
-      s_prefix = pref | (chosen << shift);
+    if (tid < 32) {
+      dhf_radix_scan_warp(s_hist, pref, shift, &s_prefix, &s_rem_k);
     }
     __syncthreads();
   }

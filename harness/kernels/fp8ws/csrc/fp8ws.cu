@@ -517,7 +517,7 @@ gemm(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMa
     mbar_wait(full0 + 8 * s, n & 1);
     const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
     if constexpr (MW == 4)      consume_stage_pipe_4x8<false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
-    else if constexpr (MW == 2) consume_stage_pipe<MW>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+    else if constexpr (MW == 2) consume_stage_pipe_opt<MW, NW>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
     else                        consume_stage<MW>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
     __syncwarp();
     if (lane == 0) mbar_arrive(empty0 + 8 * s);
@@ -1483,7 +1483,7 @@ gemm_hybrid_6656_st3(const __grid_constant__ CUtensorMap tmA128,
       for (int kt = 0; kt < NKT; ++kt) {
         mbar_wait(full0 + 8 * s, par);
         const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-        consume_stage_pipe<2, NW, false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+        consume_stage_pipe_opt<2, NW, false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
         __syncwarp();
         if (lane == 0) mbar_arrive(empty0 + 8 * s);
         if (++s == ST) { s = 0; par ^= 1; }
@@ -1509,7 +1509,7 @@ gemm_hybrid_6656_st3(const __grid_constant__ CUtensorMap tmA128,
       if constexpr (kPdl) { if (kt == kPdlTrig) pdl_launch_dependents(); }
       mbar_wait(full0 + 8 * s, par);
       const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-      consume_stage_pipe<1, 6, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
+      consume_stage_pipe_opt<1, 6, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
       if (++s == ST) { s = 0; par ^= 1; }
@@ -1521,7 +1521,7 @@ gemm_hybrid_6656_st3(const __grid_constant__ CUtensorMap tmA128,
       if constexpr (kPdl) { if (kt == kPdlTrig) pdl_launch_dependents(); }
       mbar_wait(full0 + 8 * s, par);
       const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-      consume_stage_pipe<1, 4, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
+      consume_stage_pipe_opt<1, 4, false>(abase, wbase, warp, 0, ar, ach, br, bch, acc2);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
       if (++s == ST) { s = 0; par ^= 1; }
@@ -1638,7 +1638,7 @@ gemm_dual_a_st3(const __grid_constant__ CUtensorMap tmA0,
       for (int kt = 0; kt < NKT; ++kt) {
         mbar_wait(full0 + 8 * s, par);
         const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-        consume_stage_pipe<2, NW, false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+        consume_stage_pipe_opt<2, NW, false>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
         __syncwarp();
         if (lane == 0) mbar_arrive(empty0 + 8 * s);
         if (++s == ST) { s = 0; par ^= 1; }
@@ -1666,7 +1666,7 @@ gemm_dual_a_st3(const __grid_constant__ CUtensorMap tmA0,
       if constexpr (kPdl) { if (kt == kPdlTrig) pdl_launch_dependents(); }
       mbar_wait(full0 + 8 * s, par);
       const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-      consume_stage_pipe<2, 6, false>(abase, wbase, wm, wn, ar, ach, br, bch, acc2);
+      consume_stage_pipe_opt<2, 6, false>(abase, wbase, wm, wn, ar, ach, br, bch, acc2);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
       if (++s == ST) { s = 0; par ^= 1; }
@@ -1679,7 +1679,7 @@ gemm_dual_a_st3(const __grid_constant__ CUtensorMap tmA0,
       if constexpr (kPdl) { if (kt == kPdlTrig) pdl_launch_dependents(); }
       mbar_wait(full0 + 8 * s, par);
       const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-      consume_stage_pipe<2, 4, false>(abase, wbase, wm, wn, ar, ach, br, bch, acc2);
+      consume_stage_pipe_opt<2, 4, false>(abase, wbase, wm, wn, ar, ach, br, bch, acc2);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
       if (++s == ST) { s = 0; par ^= 1; }
@@ -1795,7 +1795,7 @@ gemm_bf16_dual_st3(const __grid_constant__ CUtensorMap tmA,
       for (int kt = 0; kt < NKT; ++kt) {
         mbar_wait(full0 + 8 * s, par);
         const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-        consume_stage_pipe<2, NW, true>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
+        consume_stage_pipe_opt<2, NW, true>(abase, wbase, wm, wn, ar, ach, br, bch, acc);
         __syncwarp();
         if (lane == 0) mbar_arrive(empty0 + 8 * s);
         if (++s == ST) { s = 0; par ^= 1; }
@@ -1823,7 +1823,7 @@ gemm_bf16_dual_st3(const __grid_constant__ CUtensorMap tmA,
       if constexpr (kPdl) { if (kt == kPdlTrig) pdl_launch_dependents(); }
       mbar_wait(full0 + 8 * s, par);
       const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-      consume_stage_pipe<2, 6, true>(abase, wbase, wm, wn, ar, ach, br, bch, acc2);
+      consume_stage_pipe_opt<2, 6, true>(abase, wbase, wm, wn, ar, ach, br, bch, acc2);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
       if (++s == ST) { s = 0; par ^= 1; }
@@ -1836,7 +1836,7 @@ gemm_bf16_dual_st3(const __grid_constant__ CUtensorMap tmA,
       if constexpr (kPdl) { if (kt == kPdlTrig) pdl_launch_dependents(); }
       mbar_wait(full0 + 8 * s, par);
       const uint32_t abase = sbase + s * STB, wbase = abase + ASZ;
-      consume_stage_pipe<2, 4, true>(abase, wbase, wm, wn, ar, ach, br, bch, acc2);
+      consume_stage_pipe_opt<2, 4, true>(abase, wbase, wm, wn, ar, ach, br, bch, acc2);
       __syncwarp();
       if (lane == 0) mbar_arrive(empty0 + 8 * s);
       if (++s == ST) { s = 0; par ^= 1; }

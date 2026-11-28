@@ -335,12 +335,9 @@ __device__ __forceinline__ float rans_triton_silu(float gate) {
   return result;
 }
 __device__ __forceinline__ uint32_t rans_pack_fp8x4(float v0, float v1, float v2, float v3) {
-  auto cl = [](float v) {
-    return (v != v) ? 448.0f : (v < -448.0f ? -448.0f : (v > 448.0f ? 448.0f : v));
-  };
   uint16_t lo, hi;
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(cl(v1)), "f"(cl(v0)));
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(cl(v3)), "f"(cl(v2)));
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(fminf(v1, 448.0f)), "f"(fminf(v0, 448.0f)));
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(fminf(v3, 448.0f)), "f"(fminf(v2, 448.0f)));
   return (uint32_t)lo | ((uint32_t)hi << 16);
 }
 
