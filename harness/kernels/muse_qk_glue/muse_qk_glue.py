@@ -21,8 +21,6 @@ _lib = None
 _multi = None
 _kv_m1 = None
 _kv_prefill = None
-_kv_prefill_pdl = None
-_kv_decode_m = None
 try:
     _lib = ctypes.CDLL(str(Path(__file__).with_name("libmuse_qk_glue.so")))
     _lib.muse_qk_norm_rope.argtypes = [
@@ -58,28 +56,6 @@ try:
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
         ]
         _kv_prefill.restype = ctypes.c_int
-    _kv_prefill_pdl = getattr(_lib, "muse_qk_norm_rope_kvcache_prefill_pdl", None)
-    if _kv_prefill_pdl is not None:
-        _kv_prefill_pdl.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_float, ctypes.c_float,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
-        ]
-        _kv_prefill_pdl.restype = ctypes.c_int
-    _kv_decode_m = getattr(_lib, "muse_qk_norm_rope_kvcache_decode_m", None)
-    if _kv_decode_m is not None:
-        _kv_decode_m.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_float, ctypes.c_float,
-            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
-        ]
-        _kv_decode_m.restype = ctypes.c_int
     _set_pdl_fn = getattr(_lib, "muse_qk_glue_set_pdl", None)
     if _set_pdl_fn is not None:
         _set_pdl_fn.argtypes = [ctypes.c_int]
@@ -89,8 +65,6 @@ except OSError:
     _multi = None
     _kv_m1 = None
     _kv_prefill = None
-    _kv_prefill_pdl = None
-    _kv_decode_m = None
     _set_pdl_fn = None
 
 
@@ -103,17 +77,13 @@ MULTI_HPW = int(os.environ.get("MUSE_QK_MULTI_HPW", "9"))
 MULTI_MIN_TOKENS = 64
 DECODE_HPW = int(os.environ.get("MUSE_QK_DECODE_HPW", "2"))
 DECODE_KV_HPW = int(os.environ.get("MUSE_QK_DECODE_KV_HPW", "6"))
-DECODE_KV_HPW_M32 = int(os.environ.get("MUSE_QK_DECODE_KV_HPW_M32", "17"))
 PREFILL_KV_HPW = int(os.environ.get("MUSE_QK_PREFILL_KV_HPW", "6"))
-DECODE_BALANCED = os.environ.get("MUSE_QK_DECODE_BALANCED", "1").strip() not in ("0", "", "false", "no")
-PDL_PROD_ENABLED = os.environ.get("MUSE_QK_GLUE_PDL_PROD", "1").strip() not in ("0", "", "false", "no")
 FUSE_KVCACHE = os.environ.get("MUSE_QK_FUSE_KVCACHE", "1").strip() not in ("0", "", "false", "no")
 FUSE_KVCACHE_PREFILL = FUSE_KVCACHE and os.environ.get("MUSE_QK_FUSE_KVCACHE_PREFILL", "1").strip() not in ("0", "", "false", "no")
 _multi_state: dict[str, bool | None] = {"admitted": None}
 _decode_state: dict[str, bool | None] = {"admitted": None}
 _kv_m1_state: dict[str, bool | None] = {"admitted": None}
 _kv_prefill_state: dict[str, bool | None] = {"admitted": None}
-_kv_decode_m_state: dict[str, bool | None] = {"admitted": None}
 
 ENABLED = os.environ.get("VLLM_MUSE_GLIMMER_QK_FUSED", "1").strip() not in ("0", "", "false", "no")
 _checked: dict[int, bool] = {}
@@ -271,20 +241,11 @@ def self_check(device: torch.device) -> bool:
             _kv_m1_state["admitted"] = kvok
             logger.info("muse_qk_glue: M=1 fused QK-norm+RoPE+KV-cache kernel %s", "admitted" if kvok else "REJECTED")
         if ok and _kv_prefill is not None and FUSE_KVCACHE_PREFILL and _kv_prefill_state["admitted"] is None:
-            _allowed_kv_hpw = (2, 4, 5, 6, 9, 17)
-            pkvok = (
-                PREFILL_KV_HPW in _allowed_kv_hpw
-                and DECODE_KV_HPW in _allowed_kv_hpw
-                and DECODE_KV_HPW_M32 in _allowed_kv_hpw
-            )
+            pkvok = PREFILL_KV_HPW in (2, 4, 5, 6, 9) and DECODE_KV_HPW in (2, 4, 5, 6, 9)
             stream = torch.cuda.current_stream(device).cuda_stream
             if pkvok:
-                for m_p in (16, 32, 512):
-                    hpw_p = (
-                        DECODE_KV_HPW
-                        if m_p <= 16
-                        else (DECODE_KV_HPW_M32 if m_p <= 32 else PREFILL_KV_HPW)
-                    )
+                for m_p in (16, 512):
+                    hpw_p = DECODE_KV_HPW if m_p <= 16 else PREFILL_KV_HPW
                     pos_p = torch.arange(m_p, dtype=torch.int64, device=device) % int(cache.shape[0])
                     for layout in ("NHD", "HND"):
                         for block_size in (16, 32):
@@ -333,28 +294,6 @@ def self_check(device: torch.device) -> bool:
                                         ):
                                             pkvok = False
                                             break
-                                        if m_p == 512 and q_first == 0 and _kv_prefill_pdl is not None:
-                                            raw_got.copy_(raw_ref)
-                                            if layout == "NHD":
-                                                raw_got[blks, offs, :, :] = 0
-                                            else:
-                                                raw_got[blks, :, offs, :] = 0
-                                            q1.zero_()
-                                            st2 = _kv_prefill_pdl(
-                                                x.data_ptr(), p_ptr, c_ptr, q1.data_ptr(),
-                                                kv_got.data_ptr(), slots_p.data_ptr(),
-                                                m_p, q_first, c_rows, block_size,
-                                                kv_got.stride(0), kv_got.stride(2), kv_got.stride(1),
-                                                eps, qscale, int(use_rope), cf32, hpw_p, 1, stream,
-                                            )
-                                            torch.cuda.synchronize()
-                                            if (
-                                                st2
-                                                or not torch.equal(q0.view(torch.int16), q1.view(torch.int16))
-                                                or not torch.equal(raw_ref.view(torch.int16), raw_got.view(torch.int16))
-                                            ):
-                                                pkvok = False
-                                                break
                                     if not pkvok:
                                         break
                                 if not pkvok:
@@ -369,79 +308,6 @@ def self_check(device: torch.device) -> bool:
             logger.info(
                 "muse_qk_glue: M>1 (decode HPW=%d, prefill HPW=%d) fused QK-norm+RoPE+KV-cache kernel %s",
                 DECODE_KV_HPW, PREFILL_KV_HPW, "admitted" if pkvok else "REJECTED",
-            )
-        if ok and _kv_decode_m is not None and DECODE_BALANCED and FUSE_KVCACHE_PREFILL and _kv_decode_m_state["admitted"] is None:
-            dmok = True
-            stream = torch.cuda.current_stream(device).cuda_stream
-            for m_p in (2, 7, 16, 32):
-                pos_p = torch.arange(m_p, dtype=torch.int64, device=device) % int(cache.shape[0])
-                for layout in ("NHD", "HND"):
-                    for block_size in (16, 32):
-                        n_blk = (m_p // block_size) + 4
-                        raw_shape = (n_blk, block_size, 2, 256) if layout == "NHD" else (n_blk, 2, block_size, 256)
-                        for use_rope in (True, False):
-                            for cache_t in ((cache, cache.float()) if use_rope else (cache,)):
-                                x = (torch.randn((m_p, 4608), generator=gen, device=device) * 3.0).to(torch.bfloat16).contiguous()
-                                raw_ref = torch.randn(raw_shape, generator=gen, device=device, dtype=torch.bfloat16)
-                                raw_got = raw_ref.clone()
-                                kv_ref = raw_ref.permute(0, 2, 1, 3) if layout == "NHD" else raw_ref
-                                kv_got = raw_got.permute(0, 2, 1, 3) if layout == "NHD" else raw_got
-                                slots_p = torch.arange(m_p, dtype=torch.int64, device=device)
-                                slots_p[m_p // 2] = -1
-                                slots_p[-1] = (n_blk - 1) * block_size + (block_size - 1)
-                                q0 = torch.empty((m_p, 4096), dtype=x.dtype, device=device)
-                                k0 = torch.empty((m_p, 256), dtype=x.dtype, device=device)
-                                q1 = torch.empty_like(q0)
-                                cf32 = int(cache_t.dtype == torch.float32)
-                                c_rows = int(cache_t.shape[0]) if use_rope else 0
-                                p_ptr = pos_p.data_ptr() if use_rope else 0
-                                c_ptr = cache_t.data_ptr() if use_rope else 0
-                                st0 = _lib.muse_qk_norm_rope(
-                                    x.data_ptr(), p_ptr, c_ptr, q0.data_ptr(), k0.data_ptr(),
-                                    m_p, c_rows, eps, qscale, int(use_rope), cf32, stream,
-                                )
-                                valid_mask = slots_p >= 0
-                                valid_slots = slots_p[valid_mask]
-                                blks = valid_slots // block_size
-                                offs = valid_slots % block_size
-                                kv_ref[blks, :, offs, :128] = k0[valid_mask].view(-1, 2, 128)
-                                kv_ref[blks, :, offs, 128:] = x[valid_mask, 4352:].view(-1, 2, 128)
-                                for pdl_p in (0, 1):
-                                    raw_got.copy_(raw_ref)
-                                    if layout == "NHD":
-                                        raw_got[blks, offs, :, :] = 0
-                                    else:
-                                        raw_got[blks, :, offs, :] = 0
-                                    q1.zero_()
-                                    st1 = _kv_decode_m(
-                                        x.data_ptr(), p_ptr, c_ptr, q1.data_ptr(),
-                                        kv_got.data_ptr(), slots_p.data_ptr(),
-                                        m_p, c_rows, block_size,
-                                        kv_got.stride(0), kv_got.stride(2), kv_got.stride(1),
-                                        eps, qscale, int(use_rope), cf32, pdl_p, stream,
-                                    )
-                                    torch.cuda.synchronize()
-                                    if (
-                                        st0 or st1
-                                        or not torch.equal(q0.view(torch.int16), q1.view(torch.int16))
-                                        or not torch.equal(raw_ref.view(torch.int16), raw_got.view(torch.int16))
-                                    ):
-                                        dmok = False
-                                        break
-                                if not dmok:
-                                    break
-                            if not dmok:
-                                break
-                        if not dmok:
-                            break
-                    if not dmok:
-                        break
-                if not dmok:
-                    break
-            _kv_decode_m_state["admitted"] = dmok
-            logger.info(
-                "muse_qk_glue: M=2..32 balanced 18-warp QK-norm+RoPE+KV-cache kernel %s (pdl_prod=%d)",
-                "admitted" if dmok else "REJECTED", int(PDL_PROD_ENABLED),
             )
     except Exception:  # noqa: BLE001
         logger.warning("muse_qk_glue: self-check raised on cuda:%d", idx, exc_info=True)
@@ -611,7 +477,6 @@ def run_qk_norm_rope_kvcache_prefill(
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     q_first_row: int = 0,
-    pdl_prod: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, bool]:
     num_tokens = int(qkv.shape[0]) if qkv.ndim == 2 else -1
     if (
@@ -687,83 +552,30 @@ def run_qk_norm_rope_kvcache_prefill(
     q_out = qkv.new_empty((num_tokens, 4096))
     k_out = qkv.new_empty((num_tokens, 256))
 
-    eff_pdl_prod = 1 if (pdl_prod and PDL_PROD_ENABLED) else 0
-    use_balanced = (
-        DECODE_BALANCED
-        and _kv_decode_m is not None
-        and _kv_decode_m_state.get("admitted")
-        and q_first == 0
-        and 2 <= num_tokens <= 32
-    )
-    hpw = DECODE_KV_HPW if num_tokens <= 16 else (DECODE_KV_HPW_M32 if num_tokens <= 32 else PREFILL_KV_HPW)
+    hpw = DECODE_KV_HPW if num_tokens <= 16 else PREFILL_KV_HPW
     with torch.cuda.device(qkv.device):
         stream = torch.cuda.current_stream(qkv.device).cuda_stream
-        if use_balanced:
-            st = _kv_decode_m(
-                qkv.data_ptr(),
-                pos_ptr,
-                cache_ptr,
-                q_out.data_ptr(),
-                kv_cache.data_ptr(),
-                slot_mapping.data_ptr(),
-                num_tokens,
-                cache_rows,
-                block_size,
-                s_blk,
-                s_slot,
-                s_head,
-                float(eps),
-                float(qscale),
-                int(use_rope),
-                cache_fp32,
-                eff_pdl_prod,
-                stream,
-            )
-        elif eff_pdl_prod and _kv_prefill_pdl is not None:
-            st = _kv_prefill_pdl(
-                qkv.data_ptr(),
-                pos_ptr,
-                cache_ptr,
-                q_out.data_ptr(),
-                kv_cache.data_ptr(),
-                slot_mapping.data_ptr(),
-                num_tokens,
-                q_first,
-                cache_rows,
-                block_size,
-                s_blk,
-                s_slot,
-                s_head,
-                float(eps),
-                float(qscale),
-                int(use_rope),
-                cache_fp32,
-                hpw,
-                1,
-                stream,
-            )
-        else:
-            st = _kv_prefill(
-                qkv.data_ptr(),
-                pos_ptr,
-                cache_ptr,
-                q_out.data_ptr(),
-                kv_cache.data_ptr(),
-                slot_mapping.data_ptr(),
-                num_tokens,
-                q_first,
-                cache_rows,
-                block_size,
-                s_blk,
-                s_slot,
-                s_head,
-                float(eps),
-                float(qscale),
-                int(use_rope),
-                cache_fp32,
-                hpw,
-                stream,
-            )
+        st = _kv_prefill(
+            qkv.data_ptr(),
+            pos_ptr,
+            cache_ptr,
+            q_out.data_ptr(),
+            kv_cache.data_ptr(),
+            slot_mapping.data_ptr(),
+            num_tokens,
+            q_first,
+            cache_rows,
+            block_size,
+            s_blk,
+            s_slot,
+            s_head,
+            float(eps),
+            float(qscale),
+            int(use_rope),
+            cache_fp32,
+            hpw,
+            stream,
+        )
     if st:
         raise RuntimeError(f"muse_qk_norm_rope_kvcache_prefill failed with CUDA error {st}")
     return q_out, k_out, True

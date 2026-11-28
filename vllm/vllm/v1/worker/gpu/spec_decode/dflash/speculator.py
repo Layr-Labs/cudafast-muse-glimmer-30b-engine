@@ -110,6 +110,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         ).repeat(self.max_num_reqs)
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
+        self.tree_top_ids: torch.Tensor | None = None
+        self.tree_top_scores: torch.Tensor | None = None
         self.draft_kv_cache_group_id: int = -1
         self._ctx_kv_cg_entries: dict[tuple, torch.cuda.CUDAGraph] = {}
         self._ctx_kv_cg_rejected: set[tuple] = set()
@@ -255,12 +257,6 @@ class DFlashSpeculator(DraftModelSpeculator):
                         layer_names, self.model.get_draft_attn_causal()
                     )
                 }
-        self._single_ctx_group = (
-            self._layer_group_idx is None or len(set(self._layer_group_idx)) <= 1
-        )
-        self._single_ctx_gidx = (
-            0 if not self._layer_group_idx else self._layer_group_idx[0]
-        )
 
     @torch.inference_mode()
     def _run_model(
@@ -270,7 +266,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-        tail_slice_m6: bool = False,
     ) -> torch.Tensor:
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
@@ -282,23 +277,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
         ):
-            if (
-                tail_slice_m6
-                and hasattr(self.model, "model")
-                and hasattr(self.model.model, "forward_tail_m6")
-            ):
-                last_hidden_states = self.model(
-                    input_ids=self.input_buffers.input_ids[:num_tokens],
-                    positions=self.input_buffers.positions[:num_tokens],
-                    inputs_embeds=None,
-                    tail_slice_m6=True,
-                )
-            else:
-                last_hidden_states = self.model(
-                    input_ids=self.input_buffers.input_ids[:num_tokens],
-                    positions=self.input_buffers.positions[:num_tokens],
-                    inputs_embeds=None,
-                )
+            last_hidden_states = self.model(
+                input_ids=self.input_buffers.input_ids[:num_tokens],
+                positions=self.input_buffers.positions[:num_tokens],
+                inputs_embeds=None,
+            )
         return last_hidden_states
 
     def _generate_draft(
@@ -310,48 +293,32 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
-        num_sample = num_reqs * self.num_speculative_steps
-        use_tail_slice = (
-            num_reqs == 1
-            and not self.sample_from_anchor
-            and num_tokens_padded == 16
-            and num_sample == 6
-            and attn_metadata is not None
-            and os.environ.get("MUSE_DFLASH_FAST_SAMPLE", "1") != "0"
-            and os.environ.get("MUSE_DFLASH_LAST_LAYER_SLICE", "1") != "0"
-        )
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
             slot_mappings,
             num_tokens_across_dp,
             cudagraph_runtime_mode,
-            tail_slice_m6=use_tail_slice,
         )
 
-        if use_tail_slice and last_hidden_states.shape[0] == num_sample:
-            sample_hidden_states = last_hidden_states
-        elif (
-            num_reqs == 1
-            and not self.sample_from_anchor
-            and num_tokens_padded >= 1 + num_sample
-            and last_hidden_states.is_contiguous()
-            and os.environ.get("MUSE_DFLASH_FAST_SAMPLE", "1") != "0"
-        ):
-            sample_hidden_states = last_hidden_states[1 : 1 + num_sample]
-        else:
-            sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
-        if (
-            num_reqs == 1
-            and self.draft_logits is None
-            and not self.use_local_argmax_reduction
-            and hasattr(self.model, "draft_argmax")
-            and os.environ.get("MUSE_DFLASH_FAST_SAMPLE", "1") != "0"
-        ):
-            fast_toks = self.model.draft_argmax(sample_hidden_states)
-            if fast_toks is not None:
-                self.draft_tokens[:1] = fast_toks.view(1, self.num_speculative_steps)
-                return
+        num_sample = num_reqs * self.num_speculative_steps
+        sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        if self.tree_top_ids is not None and num_reqs == 1:
+            from vllm.v1.worker.gpu.spec_decode.dflash.tree import (
+                MAX_PATH,
+                PROPOSAL_TEMPERATURE,
+                TOP_K,
+            )
+
+            logits = self.model.compute_logits(sample_hidden_states)
+            assert logits is not None
+            draft_logits = logits[:MAX_PATH].float() / PROPOSAL_TEMPERATURE
+            values, ids = draft_logits.topk(TOP_K, dim=-1)
+            self.tree_top_ids.copy_(ids)
+            self.tree_top_scores.copy_(values - draft_logits.logsumexp(dim=-1, keepdim=True))
+            self.draft_tokens[:1] = logits.argmax(dim=-1).view(1, self.num_speculative_steps)
+            return
+
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
         draft_tokens = self.sample_draft(
@@ -423,10 +390,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
-        if num_reqs == 1:
-            max_seq_len = int(input_batch.seq_lens_cpu_upper_bound.numpy()[0])
-        else:
-            max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
@@ -437,15 +401,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         # request's query length to include any rejected positions.
         def _build_ctx_hidden() -> torch.Tensor:
             if aux_hidden_states:
-                if (
-                    len(aux_hidden_states) == 5
-                    and hasattr(self.model, "combine_hidden_states_aux5")
-                ):
-                    out = self.model.combine_hidden_states_aux5(
-                        aux_hidden_states, num_target_tokens
-                    )
-                    if out is not None:
-                        return out if out.is_contiguous() else out.contiguous()
                 if aux_hidden_states[0].shape[0] > num_target_tokens:
                     aux_cat = torch.cat(
                         [h[:num_target_tokens] for h in aux_hidden_states], dim=-1
@@ -484,160 +439,35 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
-        ran_cpp_prep = False
-        ran_fused_tail = False
-        if (
-            num_reqs == 1
-            and not self.sample_from_anchor
-            and len(self.draft_kv_cache_group_ids) == 1
-            and os.environ.get("MUSE_DFLASH_CPP_PREP", "1") != "0"
-        ):
-            try:
-                import muse_bfx_ext as _bfx
-
-                if hasattr(_bfx, "dflash_prepare_inputs"):
-                    from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _nl
-
-                    gid0 = self.draft_kv_cache_group_ids[0]
-                    bt0 = self.block_tables.input_block_tables[gid0]
-                    lm_head = getattr(self.model, "lm_head", None)
-                    want_ids_base = (
-                        not dummy_run
-                        and not is_profile
-                        and num_target_tokens > 0
-                        and input_batch.input_ids.is_cuda
-                        and input_batch.input_ids.is_contiguous()
-                    )
-                    want_tail = (
-                        want_ids_base
-                        and lm_head is not None
-                        and getattr(lm_head, "prompt_tail_admitted", False)
-                    )
-                    hist_req_id = input_batch.req_ids[0] if input_batch.req_ids else None
-                    hist_buf, hist_len_buf = (
-                        _nl.get_hist_bufs(self.device, hist_req_id)
-                        if (want_ids_base and _nl.ENABLED)
-                        else (None, None)
-                    )
-                    want_ids = want_tail or (hist_buf is not None)
-                    try:
-                        _bfx.dflash_prepare_inputs(
-                            self.input_buffers.input_ids,
-                            self.input_buffers.positions,
-                            self.input_buffers.query_start_loc,
-                            self.input_buffers.seq_lens,
-                            self.block_tables.slot_mappings[gid0],
-                            self.context_positions,
-                            self._context_slot_mappings[0],
-                            self.sample_indices,
-                            self.sample_pos,
-                            self.sample_idx_mapping,
-                            self.temperature,
-                            self.seeds,
-                            input_batch.positions,
-                            input_batch.query_start_loc,
-                            input_batch.idx_mapping,
-                            last_sampled,
-                            next_prefill_tokens,
-                            num_sampled,
-                            num_rejected,
-                            temperature,
-                            seeds,
-                            bt0,
-                            bt0.stride(0),
-                            self.parallel_drafting_token_id,
-                            self.block_tables.kernel_block_sizes[gid0],
-                            self.num_query_per_req,
-                            self.num_speculative_steps,
-                            self.max_num_reqs,
-                            self.max_num_tokens,
-                            self.max_model_len,
-                            PAD_SLOT_ID,
-                            input_batch.input_ids if want_ids else None,
-                            num_target_tokens if want_ids else 0,
-                            lm_head.in_static_vocab if want_tail else None,
-                            lm_head.tail_ids if want_tail else None,
-                            lm_head.tail_count if want_tail else None,
-                            lm_head.tail_seen if want_tail else None,
-                            hist_buf,
-                            hist_len_buf,
-                        )
-                    except TypeError:
-                        _bfx.dflash_prepare_inputs(
-                            self.input_buffers.input_ids,
-                            self.input_buffers.positions,
-                            self.input_buffers.query_start_loc,
-                            self.input_buffers.seq_lens,
-                            self.block_tables.slot_mappings[gid0],
-                            self.context_positions,
-                            self._context_slot_mappings[0],
-                            self.sample_indices,
-                            self.sample_pos,
-                            self.sample_idx_mapping,
-                            self.temperature,
-                            self.seeds,
-                            input_batch.positions,
-                            input_batch.query_start_loc,
-                            input_batch.idx_mapping,
-                            last_sampled,
-                            next_prefill_tokens,
-                            num_sampled,
-                            num_rejected,
-                            temperature,
-                            seeds,
-                            bt0,
-                            bt0.stride(0),
-                            self.parallel_drafting_token_id,
-                            self.block_tables.kernel_block_sizes[gid0],
-                            self.num_query_per_req,
-                            self.num_speculative_steps,
-                            self.max_num_reqs,
-                            self.max_num_tokens,
-                            self.max_model_len,
-                            PAD_SLOT_ID,
-                            input_batch.input_ids if want_tail else None,
-                            num_target_tokens if want_tail else 0,
-                            lm_head.in_static_vocab if want_tail else None,
-                            lm_head.tail_ids if want_tail else None,
-                            lm_head.tail_count if want_tail else None,
-                            lm_head.tail_seen if want_tail else None,
-                        )
-                    ran_cpp_prep = True
-                    ran_fused_tail = want_tail
-            except Exception:  # noqa: BLE001
-                ran_cpp_prep = False
-                ran_fused_tail = False
-
-        if not ran_cpp_prep:
-            # Support multiple draft KV cache groups by preparing inputs once for each
-            for i, gid in enumerate(self.draft_kv_cache_group_ids):
-                prepare_dflash_inputs(
-                    self.input_buffers,
-                    self.block_tables.slot_mappings[gid],
-                    self.context_positions,
-                    self._context_slot_mappings[i],
-                    self.sample_indices,
-                    self.sample_pos,
-                    self.sample_idx_mapping,
-                    self.temperature,
-                    self.seeds,
-                    input_batch,
-                    num_sampled,
-                    num_rejected,
-                    last_sampled,
-                    next_prefill_tokens,
-                    temperature,
-                    seeds,
-                    self.block_tables.input_block_tables[gid],
-                    self.block_tables.kernel_block_sizes[gid],
-                    self.parallel_drafting_token_id,
-                    self.num_query_per_req,
-                    self.num_speculative_steps,
-                    self.max_num_reqs,
-                    self.max_num_tokens,
-                    self.max_model_len,
-                    self.sample_from_anchor,
-                )
+        # Support multiple draft KV cache groups by preparing inputs once for each
+        for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            prepare_dflash_inputs(
+                self.input_buffers,
+                self.block_tables.slot_mappings[gid],
+                self.context_positions,
+                self._context_slot_mappings[i],
+                self.sample_indices,
+                self.sample_pos,
+                self.sample_idx_mapping,
+                self.temperature,
+                self.seeds,
+                input_batch,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                self.block_tables.input_block_tables[gid],
+                self.block_tables.kernel_block_sizes[gid],
+                self.parallel_drafting_token_id,
+                self.num_query_per_req,
+                self.num_speculative_steps,
+                self.max_num_reqs,
+                self.max_num_tokens,
+                self.max_model_len,
+                self.sample_from_anchor,
+            )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables
@@ -645,10 +475,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Each layer uses the context slots of its own kv-cache group.
         if dummy_run:
             context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
-        elif getattr(self, "_single_ctx_group", False):
-            context_slots = self._context_slot_mappings[self._single_ctx_gidx][
-                :num_target_tokens
-            ]
         elif self._layer_group_idx is not None:
             context_slots = [
                 self._context_slot_mappings[gidx][:num_target_tokens]
@@ -657,20 +483,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
         ctx_pos_slice = self.context_positions[:num_target_tokens]
-        if (
-            not ran_fused_tail
-            and not dummy_run
-            and not is_profile
-            and num_reqs == 1
-            and hasattr(self.model, "update_draft_prompt_tail")
-        ):
-            self.model.update_draft_prompt_tail(
-                input_batch.input_ids[:num_target_tokens],
-                ctx_pos_slice,
-                num_rejected=num_rejected,
-                extra_ids=self.input_buffers.input_ids[:1],
-            )
-
         ran_ctx_graph = False
         if (
             os.environ.get("VLLM_DFLASH_CTX_KV_GRAPH", "1") != "0"
@@ -682,70 +494,53 @@ class DFlashSpeculator(DraftModelSpeculator):
             and self.query_cudagraph_manager is not None
             and self.query_cudagraph_manager._graphs_captured
         ):
-            if (
-                aux_hidden_states
-                and len(aux_hidden_states) == 5
-                and isinstance(context_slots, torch.Tensor)
-            ):
-                cg_key: tuple = (
-                    num_target_tokens,
-                    aux_hidden_states[0].data_ptr(),
-                    aux_hidden_states[0].stride(0),
-                    aux_hidden_states[1].data_ptr(),
-                    aux_hidden_states[2].data_ptr(),
-                    aux_hidden_states[3].data_ptr(),
-                    aux_hidden_states[4].data_ptr(),
-                    ctx_pos_slice.data_ptr(),
-                    context_slots.data_ptr(),
+            if aux_hidden_states:
+                src_sig = tuple(
+                    (h.data_ptr(), h.dtype, tuple(h.shape), tuple(h.stride()))
+                    for h in aux_hidden_states
                 )
             else:
-                if aux_hidden_states:
-                    src_sig = tuple(
-                        (h.data_ptr(), h.dtype, tuple(h.shape), tuple(h.stride()))
-                        for h in aux_hidden_states
-                    )
-                else:
-                    src_sig = (
-                        (
-                            last_hidden_states.data_ptr(),
-                            last_hidden_states.dtype,
-                            tuple(last_hidden_states.shape),
-                            tuple(last_hidden_states.stride()),
-                        ),
-                    )
-                pos_sig = (
-                    ctx_pos_slice.data_ptr(),
-                    ctx_pos_slice.dtype,
-                    tuple(ctx_pos_slice.shape),
-                    tuple(ctx_pos_slice.stride()),
+                src_sig = (
+                    (
+                        last_hidden_states.data_ptr(),
+                        last_hidden_states.dtype,
+                        tuple(last_hidden_states.shape),
+                        tuple(last_hidden_states.stride()),
+                    ),
                 )
-                slot_sig = (
-                    tuple(
-                        (s.data_ptr(), s.dtype, tuple(s.shape), tuple(s.stride()))
-                        if s is not None
-                        else None
-                        for s in context_slots
-                    )
-                    if isinstance(context_slots, list)
-                    else (
-                        (
-                            context_slots.data_ptr(),
-                            context_slots.dtype,
-                            tuple(context_slots.shape),
-                            tuple(context_slots.stride()),
-                        )
-                        if context_slots is not None
-                        else None,
-                    )
+            pos_sig = (
+                ctx_pos_slice.data_ptr(),
+                ctx_pos_slice.dtype,
+                tuple(ctx_pos_slice.shape),
+                tuple(ctx_pos_slice.stride()),
+            )
+            slot_sig = (
+                tuple(
+                    (s.data_ptr(), s.dtype, tuple(s.shape), tuple(s.stride()))
+                    if s is not None
+                    else None
+                    for s in context_slots
                 )
-                cg_key = (num_target_tokens, src_sig, pos_sig, slot_sig)
+                if isinstance(context_slots, list)
+                else (
+                    (
+                        context_slots.data_ptr(),
+                        context_slots.dtype,
+                        tuple(context_slots.shape),
+                        tuple(context_slots.stride()),
+                    )
+                    if context_slots is not None
+                    else None,
+                )
+            )
+            cg_key = (num_target_tokens, src_sig, pos_sig, slot_sig)
             cg = self._ctx_kv_cg_entries.get(cg_key)
             if cg is not None:
                 cg.replay()
                 ran_ctx_graph = True
             elif (
                 cg_key not in self._ctx_kv_cg_rejected
-                and len(self._ctx_kv_cg_entries) < 64
+                and len(self._ctx_kv_cg_entries) < 16
             ):
                 context_hidden_states = _build_ctx_hidden()
                 self.model.precompute_and_store_context_kv(
@@ -758,10 +553,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                     main_st = torch.cuda.current_stream(self.device)
                     cap_st = self._ctx_kv_cg_stream
                     cap_st.wait_stream(main_st)
-                    try:
-                        g = torch.cuda.CUDAGraph(keep_graph=True)
-                    except TypeError:
-                        g = torch.cuda.CUDAGraph()
+                    g = torch.cuda.CUDAGraph()
                     with torch.cuda.stream(cap_st):
                         with torch.cuda.graph(
                             g, pool=self._ctx_kv_cg_pool, stream=cap_st
@@ -773,15 +565,6 @@ class DFlashSpeculator(DraftModelSpeculator):
                                 context_slots,
                             )
                     main_st.wait_stream(cap_st)
-                    if os.environ.get("VLLM_CUDAGRAPH_UPLOAD", "1") != "0" and hasattr(
-                        g, "raw_cuda_graph_exec"
-                    ):
-                        try:
-                            import muse_bfx_ext as _bfx_up
-
-                            _bfx_up.cuda_graph_upload(int(g.raw_cuda_graph_exec()))
-                        except Exception:
-                            pass
                     self._ctx_kv_cg_entries[cg_key] = g
                 except Exception as exc:
                     self._ctx_kv_cg_rejected.add(cg_key)
@@ -841,301 +624,6 @@ class DFlashSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
         return self.draft_tokens[:num_reqs]
-
-    def emit_cpp_prep_for_capture(
-        self,
-        input_batch: InputBatch,
-        num_sampled: torch.Tensor,
-        num_rejected: torch.Tensor,
-        last_sampled: torch.Tensor,
-        next_prefill_tokens: torch.Tensor,
-        temperature: torch.Tensor,
-        seeds: torch.Tensor,
-        post_sampled_tokens: torch.Tensor | None = None,
-        post_num_computed_tokens: torch.Tensor | None = None,
-        post_all_token_ids: torch.Tensor | None = None,
-        post_total_len: torch.Tensor | None = None,
-        post_output_bin_counts: torch.Tensor | None = None,
-    ) -> bool:
-        """Emit dflash_prepare_inputs onto current capture stream for bs=1 verify."""
-        if (
-            input_batch.num_reqs != 1
-            or self.sample_from_anchor
-            or len(self.draft_kv_cache_group_ids) != 1
-            or os.environ.get("MUSE_DFLASH_CPP_PREP", "1") == "0"
-        ):
-            return False
-        import muse_bfx_ext as _bfx
-        from vllm.v1.worker.gpu.spec_decode.dflash import native_leaf as _nl
-
-        gid0 = self.draft_kv_cache_group_ids[0]
-        bt0 = self.block_tables.input_block_tables[gid0]
-        lm_head = getattr(self.model, "lm_head", None)
-        num_target_tokens = int(input_batch.num_tokens)
-        want_ids_base = (
-            num_target_tokens > 0
-            and input_batch.input_ids.is_cuda
-            and input_batch.input_ids.is_contiguous()
-        )
-        want_tail = (
-            want_ids_base
-            and lm_head is not None
-            and getattr(lm_head, "prompt_tail_admitted", False)
-        )
-        hist_buf = _nl._S.hist if (want_ids_base and _nl.ENABLED and _nl._S.ready) else None
-        hist_len_buf = _nl._S.hist_len if hist_buf is not None else None
-        want_ids = want_tail or (hist_buf is not None)
-        _bfx.dflash_prepare_inputs(
-            self.input_buffers.input_ids,
-            self.input_buffers.positions,
-            self.input_buffers.query_start_loc,
-            self.input_buffers.seq_lens,
-            self.block_tables.slot_mappings[gid0],
-            self.context_positions,
-            self._context_slot_mappings[0],
-            self.sample_indices,
-            self.sample_pos,
-            self.sample_idx_mapping,
-            self.temperature,
-            self.seeds,
-            input_batch.positions,
-            input_batch.query_start_loc,
-            input_batch.idx_mapping,
-            last_sampled,
-            next_prefill_tokens,
-            num_sampled,
-            num_rejected,
-            temperature,
-            seeds,
-            bt0,
-            bt0.stride(0),
-            self.parallel_drafting_token_id,
-            self.block_tables.kernel_block_sizes[gid0],
-            self.num_query_per_req,
-            self.num_speculative_steps,
-            self.max_num_reqs,
-            self.max_num_tokens,
-            self.max_model_len,
-            PAD_SLOT_ID,
-            input_batch.input_ids if want_ids else None,
-            num_target_tokens if want_ids else 0,
-            lm_head.in_static_vocab if want_tail else None,
-            lm_head.tail_ids if want_tail else None,
-            lm_head.tail_count if want_tail else None,
-            lm_head.tail_seen if want_tail else None,
-            hist_buf,
-            hist_len_buf,
-            post_sampled_tokens,
-            post_num_computed_tokens,
-            post_all_token_ids,
-            post_total_len,
-            post_output_bin_counts,
-        )
-        return True
-
-    def get_decode_compound_child_graphs(
-        self,
-        aux_hidden_states: list[torch.Tensor] | None,
-        num_target_tokens: int = 7,
-    ) -> tuple[torch.cuda.CUDAGraph, torch.cuda.CUDAGraph] | None:
-        """Return (ctx_kv_cg, query_full_cg) for bs=1 steady decode if already captured."""
-        if (
-            self.query_cudagraph_manager is None
-            or not self.query_cudagraph_manager._graphs_captured
-            or not aux_hidden_states
-            or len(aux_hidden_states) != 5
-            or not getattr(self, "_single_ctx_group", False)
-        ):
-            return None
-        context_slots = self._context_slot_mappings[self._single_ctx_gidx][:num_target_tokens]
-        ctx_pos_slice = self.context_positions[:num_target_tokens]
-        cg_key: tuple = (
-            num_target_tokens,
-            aux_hidden_states[0].data_ptr(),
-            aux_hidden_states[0].stride(0),
-            aux_hidden_states[1].data_ptr(),
-            aux_hidden_states[2].data_ptr(),
-            aux_hidden_states[3].data_ptr(),
-            aux_hidden_states[4].data_ptr(),
-            ctx_pos_slice.data_ptr(),
-            context_slots.data_ptr(),
-        )
-        ctx_cg = self._ctx_kv_cg_entries.get(cg_key)
-        if ctx_cg is None:
-            return None
-        batch_desc, _ = dispatch_cg_and_sync_dp(
-            self.query_cudagraph_manager,
-            1,
-            self.num_query_per_req,
-            uniform_token_count=self.num_query_per_req,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
-            need_eager=False,
-        )
-        if batch_desc.cg_mode != CUDAGraphMode.FULL or batch_desc not in self.query_cudagraph_manager.graphs:
-            return None
-        return ctx_cg, self.query_cudagraph_manager.graphs[batch_desc]
-
-    def get_decode_compound_diamond_graphs(
-        self,
-        aux_hidden_states: list[torch.Tensor] | None,
-        num_target_tokens: int = 7,
-    ) -> tuple[torch.cuda.CUDAGraph, torch.cuda.CUDAGraph, torch.cuda.CUDAGraph] | None:
-        """Return (ctx_proj_cg, ctx_kv_post_cg, query_full_cg) so fc+fkv run in parallel with post_prep."""
-        if (
-            os.environ.get("MUSE_COMPOUND_DIAMOND_FC", "0") in ("0", "", "false", "no")
-            or self.query_cudagraph_manager is None
-            or not self.query_cudagraph_manager._graphs_captured
-            or not aux_hidden_states
-            or len(aux_hidden_states) != 5
-            or not getattr(self, "_single_ctx_group", False)
-            or not hasattr(self.model, "combine_hidden_states_aux5")
-        ):
-            return None
-        dmodel = getattr(self.model, "model", None)
-        cache_entry = getattr(dmodel, "_dflash_kv_post_cache", None) if dmodel is not None else None
-        if cache_entry is None or cache_entry[1] is None:
-            return None
-        _, kv_post_fn, k_caches, v_caches, block_size = cache_entry
-        context_slots = self._context_slot_mappings[self._single_ctx_gidx][:num_target_tokens]
-        ctx_pos_slice = self.context_positions[:num_target_tokens]
-        if not context_slots.is_contiguous() or not ctx_pos_slice.is_contiguous():
-            return None
-        batch_desc, _ = dispatch_cg_and_sync_dp(
-            self.query_cudagraph_manager,
-            1,
-            self.num_query_per_req,
-            uniform_token_count=self.num_query_per_req,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
-            need_eager=False,
-        )
-        if batch_desc.cg_mode != CUDAGraphMode.FULL or batch_desc not in self.query_cudagraph_manager.graphs:
-            return None
-        query_cg = self.query_cudagraph_manager.graphs[batch_desc]
-
-        d_key = (
-            num_target_tokens,
-            aux_hidden_states[0].data_ptr(),
-            aux_hidden_states[0].stride(0),
-            aux_hidden_states[1].data_ptr(),
-            aux_hidden_states[2].data_ptr(),
-            aux_hidden_states[3].data_ptr(),
-            aux_hidden_states[4].data_ptr(),
-            ctx_pos_slice.data_ptr(),
-            context_slots.data_ptr(),
-        )
-        d_cache = getattr(self, "_compound_diamond_cg_cache", None)
-        if d_cache is None:
-            d_cache = {}
-            self._compound_diamond_cg_cache = d_cache
-        hit = d_cache.get(d_key)
-        if hit is not None:
-            return hit[0], hit[1], query_cg
-        try:
-            cos_sin_cache = dmodel._rope_cos_sin_cache
-            if cos_sin_cache.dtype != torch.bfloat16:
-                cast_cache = getattr(dmodel, "_rope_cos_sin_cache_cast", None)
-                if cast_cache is None or cast_cache.dtype != torch.bfloat16 or cast_cache.device != self.device:
-                    cast_cache = cos_sin_cache.to(device=self.device, dtype=torch.bfloat16)
-                    dmodel._rope_cos_sin_cache_cast = cast_cache
-                cos_sin_cache = cast_cache
-            slots_list = [context_slots] * int(dmodel._num_attn_layers)
-
-            proj_pool = torch.cuda.graph_pool_handle()
-            post_pool = torch.cuda.graph_pool_handle()
-            main_st = torch.cuda.current_stream(self.device)
-            cap_st = self._ctx_kv_cg_stream
-            cap_st.wait_stream(main_st)
-            ctx_proj_cg = torch.cuda.CUDAGraph(keep_graph=True)
-            ctx_kv_post_cg = torch.cuda.CUDAGraph(keep_graph=True)
-            all_kv_ref = None
-            with torch.cuda.stream(cap_st):
-                with torch.cuda.graph(ctx_proj_cg, pool=proj_pool, stream=cap_st):
-                    ctx_h = self.model.combine_hidden_states_aux5(aux_hidden_states, num_target_tokens)
-                    if ctx_h is None or not ctx_h.is_contiguous():
-                        raise RuntimeError("combine_hidden_states_aux5 non-contiguous in diamond capture")
-                    all_kv_flat = dmodel._project_context_kv_flat(ctx_h)
-                    if not all_kv_flat.is_contiguous():
-                        all_kv_flat = all_kv_flat.contiguous()
-                    all_kv_ref = all_kv_flat
-                with torch.cuda.graph(ctx_kv_post_cg, pool=post_pool, stream=cap_st):
-                    kv_post_fn(
-                        all_kv_ref,
-                        ctx_pos_slice,
-                        dmodel._k_norm_weights,
-                        cos_sin_cache,
-                        k_caches,
-                        v_caches,
-                        slots_list,
-                        int(dmodel._num_kv_heads),
-                        int(block_size),
-                        float(dmodel._rms_norm_eps),
-                        bool(dmodel._rope_is_neox),
-                    )
-            main_st.wait_stream(cap_st)
-            d_cache[d_key] = (ctx_proj_cg, ctx_kv_post_cg, all_kv_ref, proj_pool, post_pool)
-            return ctx_proj_cg, ctx_kv_post_cg, query_cg
-        except Exception as exc:
-            logger.warning("Compound diamond fc+fkv split skipped (%s); using monolithic ctx_kv graph", exc)
-            return None
-
-    def warmup_ctx_kv_graphs(self, aux_base: list[torch.Tensor] | None) -> int:
-        """Pre-capture and cudaGraphUpload _ctx_kv_cg_entries for num_target_tokens in 1..7 at boot."""
-        if (
-            self._ctx_kv_cg_stream is None
-            or not aux_base
-            or len(aux_base) != 5
-            or not getattr(self, "_single_ctx_group", False)
-        ):
-            return 0
-        captured = 0
-        for n_tok in range(1, 8):
-            aux_n = [h[:n_tok] for h in aux_base]
-            context_slots = self._context_slot_mappings[self._single_ctx_gidx][:n_tok]
-            ctx_pos_slice = self.context_positions[:n_tok]
-            cg_key = (
-                n_tok,
-                aux_n[0].data_ptr(),
-                aux_n[0].stride(0),
-                aux_n[1].data_ptr(),
-                aux_n[2].data_ptr(),
-                aux_n[3].data_ptr(),
-                aux_n[4].data_ptr(),
-                ctx_pos_slice.data_ptr(),
-                context_slots.data_ptr(),
-            )
-            if cg_key in self._ctx_kv_cg_entries or cg_key in self._ctx_kv_cg_rejected:
-                continue
-            try:
-                main_st = torch.cuda.current_stream(self.device)
-                cap_st = self._ctx_kv_cg_stream
-                cap_st.wait_stream(main_st)
-                try:
-                    g = torch.cuda.CUDAGraph(keep_graph=True)
-                except TypeError:
-                    g = torch.cuda.CUDAGraph()
-                with torch.cuda.stream(cap_st):
-                    with torch.cuda.graph(g, pool=self._ctx_kv_cg_pool, stream=cap_st):
-                        ctx_h = self.model.combine_hidden_states_aux5(aux_n, n_tok)
-                        if ctx_h is None:
-                            ctx_h = self.model.combine_hidden_states(torch.cat(aux_n, dim=-1))[:n_tok]
-                        if not ctx_h.is_contiguous():
-                            ctx_h = ctx_h.contiguous()
-                        self.model.precompute_and_store_context_kv(ctx_h, ctx_pos_slice, context_slots)
-                main_st.wait_stream(cap_st)
-                if os.environ.get("VLLM_CUDAGRAPH_UPLOAD", "1") != "0" and hasattr(g, "raw_cuda_graph_exec"):
-                    try:
-                        import muse_bfx_ext as _bfx_up
-
-                        _bfx_up.cuda_graph_upload(int(g.raw_cuda_graph_exec()))
-                    except Exception:
-                        pass
-                self._ctx_kv_cg_entries[cg_key] = g
-                captured += 1
-            except Exception:
-                self._ctx_kv_cg_rejected.add(cg_key)
-        return captured
 
 
 @triton.jit

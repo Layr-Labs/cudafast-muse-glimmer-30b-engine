@@ -26,7 +26,7 @@ static int decode6_gate_blocks() {
       g_gate_blocks = 48;
     } else {
       int v = static_cast<int>(std::strtol(env, nullptr, 10));
-      g_gate_blocks = (v == 0 || v == 24) ? 24 : ((v == 32 || v == 48) ? v : 24);
+      g_gate_blocks = (v == 0 || v == 24) ? 24 : ((v == 32 || v == 48) ? v : 48);
     }
   }
   return g_gate_blocks;

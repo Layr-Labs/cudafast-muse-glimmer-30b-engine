@@ -73,16 +73,16 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
   return *reinterpret_cast<uint32_t*>(&p);
 }
 
-__device__ __forceinline__ uint16_t fp8x2(float lo, float hi) {
-  uint16_t s;
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(s) : "f"(hi), "f"(lo));
-  return s;
+__device__ __forceinline__ float clamp448(float y) {
+  // triton_helpers.maximum / minimum (NaN propagating) against -448 / 448
+  if (!(y > -448.0f) && !(y != y)) y = -448.0f;
+  if (!(y < 448.0f) && !(y != y)) y = 448.0f;
+  return y;
 }
 
-__device__ __forceinline__ uint32_t pack_fp8x4(float v0, float v1, float v2, float v3) {
-  const uint32_t lo = static_cast<uint32_t>(fp8x2(v0, v1));
-  const uint32_t hi = static_cast<uint32_t>(fp8x2(v2, v3));
-  return __byte_perm(lo, hi, 0x5410);
+__device__ __forceinline__ uint16_t fp8x2(float lo, float hi) {
+  __nv_fp8x2_storage_t s = __nv_cvt_float2_to_fp8x2(make_float2(lo, hi), __NV_SATFINITE, __NV_E4M3);
+  return static_cast<uint16_t>(s);
 }
 
 __device__ __forceinline__ bool chunk_valid(int c) {
@@ -136,44 +136,44 @@ __device__ __forceinline__ uint4 ld16_cs(const uint4* ptr) {
   return r;
 }
 
-// Direct 8B/4B coalesced load/store (0-ULP identical per-thread layout; eliminates even/odd lane
-// divergence and __shfl_xor_sync overhead across all 52 layers on SM121, matching prefill_attn.cu).
+// 16B coalesced load/store via even-lane uint4 + warp-pair shuffle (0-ULP identical per-thread uint2
+// layout to ld8/st8; safe inside chunk_valid(c) because chunk 6 active set [0..127] is 4 full warps).
 __device__ __forceinline__ uint2 ld8_v4(const __nv_bfloat16* base, int c) {
-  return ld8(base, c);
-}
-
-__device__ __forceinline__ uint2 ld8_cs_v4(const __nv_bfloat16* base, int c) {
-  return ld8_cs(base, c);
+  uint4 v = make_uint4(0u, 0u, 0u, 0u);
+  const int even_t = threadIdx.x & ~1;
+  if ((threadIdx.x & 1) == 0) {
+    v = *reinterpret_cast<const uint4*>(base + c * 1024 + even_t * 4);
+  }
+  const uint32_t hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
+  const uint32_t hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
+  return ((threadIdx.x & 1) == 0) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
 }
 
 __device__ __forceinline__ uint2 ldg8_v4(const __nv_bfloat16* base, int c) {
-  return ldg8(base, c);
+  uint4 v = make_uint4(0u, 0u, 0u, 0u);
+  const int even_t = threadIdx.x & ~1;
+  if ((threadIdx.x & 1) == 0) {
+    v = __ldg(reinterpret_cast<const uint4*>(base + c * 1024 + even_t * 4));
+  }
+  const uint32_t hi_x = __shfl_xor_sync(0xffffffffu, v.z, 1);
+  const uint32_t hi_y = __shfl_xor_sync(0xffffffffu, v.w, 1);
+  return ((threadIdx.x & 1) == 0) ? make_uint2(v.x, v.y) : make_uint2(hi_x, hi_y);
 }
 
 __device__ __forceinline__ void st8_v4(__nv_bfloat16* base, int c, uint2 val) {
-  *reinterpret_cast<uint2*>(base + c * 1024 + threadIdx.x * 4) = val;
+  const uint32_t odd_x = __shfl_xor_sync(0xffffffffu, val.x, 1);
+  const uint32_t odd_y = __shfl_xor_sync(0xffffffffu, val.y, 1);
+  if ((threadIdx.x & 1) == 0) {
+    *reinterpret_cast<uint4*>(base + c * 1024 + threadIdx.x * 4) =
+        make_uint4(val.x, val.y, odd_x, odd_y);
+  }
 }
 
 __device__ __forceinline__ void st4_v2(uint8_t* base, int c, uint32_t val) {
-  *reinterpret_cast<uint32_t*>(base + c * 1024 + threadIdx.x * 4) = val;
-}
-
-// Store 4 consecutive FP8 bytes at (row, col) directly into muserans kXMma layout:
-//   kM32 (M==32): uint32_t[(s << 8) | ((row >> 4) << 7) | (lane << 2) | comp]
-//   kM16 (M==16): uint32_t[(s << 7) | (lane << 2) | comp]
-// where s = col >> 5, h = (col >> 4) & 1, t = (col >> 2) & 3,
-//       lane = ((row & 7) << 2) | t, comp = (h << 1) | ((row >> 3) & 1).
-template <bool kM32>
-__device__ __forceinline__ void st4_xmma(uint8_t* base, size_t row, int col, uint32_t val) {
-  const size_t s = static_cast<size_t>(col) >> 5;
-  const size_t h = (static_cast<size_t>(col) >> 4) & 1u;
-  const size_t t = (static_cast<size_t>(col) >> 2) & 3u;
-  const size_t lane = ((row & 7u) << 2) | t;
-  const size_t comp = (h << 1) | ((row >> 3) & 1u);
-  const size_t idx = kM32
-      ? ((s << 8) | (((row >> 4) & 1u) << 7) | (lane << 2) | comp)
-      : ((s << 7) | (lane << 2) | comp);
-  reinterpret_cast<uint32_t*>(base)[idx] = val;
+  const uint32_t odd_v = __shfl_xor_sync(0xffffffffu, val, 1);
+  if ((threadIdx.x & 1) == 0) {
+    *reinterpret_cast<uint2*>(base + c * 1024 + threadIdx.x * 4) = make_uint2(val, odd_v);
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -184,7 +184,7 @@ __device__ __forceinline__ void st4_xmma(uint8_t* base, size_t row, int col, uin
 //   s_h = sum h^2,           b = inv_rms(s_h, 1e-5)
 //   y   = (b * h) * (w_pre + 1)                 (FMUL, FADD, FMUL)
 //   out_bf16 = bf16(y);  out_fp8 = e4m3(clamp(rcp(scale) * y))
-template <bool kBf16Out, bool kFp8Out, bool kPdl = false, int kXMmaMode = 0>
+template <bool kBf16Out, bool kFp8Out, bool kPdl = false>
 __global__ void __launch_bounds__(kThreads) post_attn_norm_decode(
     const __nv_bfloat16* x_all, const __nv_bfloat16* res_all,
     const __nv_bfloat16* __restrict__ w_post, const __nv_bfloat16* __restrict__ w_pre,
@@ -200,26 +200,26 @@ __global__ void __launch_bounds__(kThreads) post_attn_norm_decode(
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) {
-        ur[c] = ld8_v4(res, c);
-        uw[c] = ldg8_v4(w_post, c);
-        up[c] = ldg8_v4(w_pre, c);
+        ur[c] = ld8(res, c);
+        uw[c] = ld8(w_post, c);
+        up[c] = ld8(w_pre, c);
       }
     }
-    if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
+    if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(*scale);
     pdl_wait();
     pdl_launch_dependents();
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) ux[c] = ld8_v4(x, c);
+      if (chunk_valid(c)) ux[c] = ld8(x, c);
     }
   } else {
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) {
-        ux[c] = ld8_v4(x, c);
-        ur[c] = ld8_v4(res, c);
-        uw[c] = ldg8_v4(w_post, c);
-        up[c] = ldg8_v4(w_pre, c);
+        ux[c] = ld8(x, c);
+        ur[c] = ld8(res, c);
+        uw[c] = ld8(w_post, c);
+        up[c] = ld8(w_pre, c);
       }
     }
   }
@@ -250,9 +250,7 @@ __global__ void __launch_bounds__(kThreads) post_attn_norm_decode(
   }
   const float s_h = row_sum(acc2, red[1]);
   const float b = inv_rms(s_h, 1e-05f);
-  if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
-  __nv_bfloat16* const out_bf16_row = kBf16Out ? (out_bf16_all + row * kHidden) : nullptr;
-  uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
+  if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(*scale);
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
@@ -260,22 +258,17 @@ __global__ void __launch_bounds__(kThreads) post_attn_norm_decode(
       float y[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) y[e] = __fmul_rn(__fmul_rn(b, h[c][e]), __fadd_rn(pv.v[e], 1.0f));
+      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
       if constexpr (kBf16Out) {
         uint2 o;
         o.x = pack_bf16x2(y[0], y[1]);
         o.y = pack_bf16x2(y[2], y[3]);
-        st8_v4(out_bf16_row, c, o);
+        *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
       }
       if constexpr (kFp8Out) {
-        uint32_t q = pack_fp8x4(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]),
-                                __fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]));
-        if constexpr (kXMmaMode == 2) {
-          st4_xmma<true>(out_fp8_all, row, c * 1024 + threadIdx.x * 4, q);
-        } else if constexpr (kXMmaMode == 1) {
-          st4_xmma<false>(out_fp8_all, row, c * 1024 + threadIdx.x * 4, q);
-        } else {
-          st4_v2(out_fp8_row, c, q);
-        }
+        uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
+                     (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
+        *reinterpret_cast<uint32_t*>(out_fp8_all + off) = q;
       }
     }
   }
@@ -298,7 +291,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
     // Preload predecessor-independent residual (6.8 MB across 512 rows) into SMEM and scale before waiting for o_proj.
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) sh_res[c * 256 + threadIdx.x] = ld8_cs_v4(res, c);
+      if (chunk_valid(c)) sh_res[c * 256 + threadIdx.x] = ld8_cs(res, c);
     }
     if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
     pdl_wait();
@@ -308,7 +301,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
-      ux[c] = ld8_cs_v4(x, c);
+      ux[c] = ld8_cs(x, c);
       Row4 v = unpack(ux[c]);
 #pragma unroll
       for (int e = 0; e < 4; ++e) acc[e] = __fmaf_rn(v.v[e], v.v[e], acc[e]);
@@ -323,8 +316,8 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
       Row4 xv = unpack(ux[c]);
-      Row4 rv = unpack(kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_cs_v4(res, c));
-      Row4 wv = unpack(ldg8_v4(w_post, c));
+      Row4 rv = unpack(kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_cs(res, c));
+      Row4 wv = unpack(ldg8(w_post, c));
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
         h[c][e] = __fmaf_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f), rv.v[e]);
@@ -335,25 +328,24 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
   const float s_h = row_sum(acc2, red[1]);
   const float b = inv_rms(s_h, 1e-05f);
   if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
-  __nv_bfloat16* const out_bf16_row = kBf16Out ? (out_bf16_all + row * kHidden) : nullptr;
-  uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
-      Row4 pv = unpack(ldg8_v4(w_pre, c));
+      Row4 pv = unpack(ldg8(w_pre, c));
       float y[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) y[e] = __fmul_rn(__fmul_rn(b, h[c][e]), __fadd_rn(pv.v[e], 1.0f));
+      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
       if constexpr (kBf16Out) {
         uint2 o;
         o.x = pack_bf16x2(y[0], y[1]);
         o.y = pack_bf16x2(y[2], y[3]);
-        st8_v4(out_bf16_row, c, o);
+        *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
       }
       if constexpr (kFp8Out) {
-        uint32_t q = pack_fp8x4(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]),
-                                __fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]));
-        st4_v2(out_fp8_row, c, q);
+        uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
+                     (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
+        *reinterpret_cast<uint32_t*>(out_fp8_all + off) = q;
       }
     }
   }
@@ -367,7 +359,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_attn_norm(
 //   h2  = fma(c * d, w_ff + 1, h1)               (FMUL, FADD, FFMA)
 //   x  <- bf16(h2) (in place);  s_h = sum h2^2 (unrounded h2);  e = inv_rms(s_h, 1e-5)
 //   y   = (e * bf16(h2)) * (w_in + 1);  out_bf16 = bf16(y);  out_fp8 = e4m3(clamp(rcp(scale) * y))
-template <bool kFp8Out, bool kGateOut = false, bool kWriteBf16 = true, bool kPdl = false, int kXMmaMode = 0>
+template <bool kFp8Out, bool kGateOut = false, bool kWriteBf16 = true, bool kPdl = false>
 __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
     __nv_bfloat16* x_all, const __nv_bfloat16* d_all,
     const __nv_bfloat16* res_all, const float* sumsq_x,
@@ -481,27 +473,15 @@ __global__ void __launch_bounds__(kThreads) post_ff_norm_decode(
         st8_v4(out_bf16_row, c, o);
       }
       if constexpr (kFp8Out) {
-        uint32_t q = pack_fp8x4(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]),
-                                __fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]));
-        if constexpr (kXMmaMode == 2) {
-          st4_xmma<true>(out_fp8_all, row, c * 1024 + threadIdx.x * 4, q);
-        } else if constexpr (kXMmaMode == 1) {
-          st4_xmma<false>(out_fp8_all, row, c * 1024 + threadIdx.x * 4, q);
-        } else {
-          st4_v2(out_fp8_row, c, q);
-        }
+        uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
+                     (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
+        st4_v2(out_fp8_row, c, q);
       }
       if constexpr (kGateOut) {
         const float g0 = bf_lo(o.x), g1 = bf_hi(o.x), g2 = bf_lo(o.y), g3 = bf_hi(o.y);
-        uint32_t gq = pack_fp8x4(__fmul_rn(gate_inv, g0), __fmul_rn(gate_inv, g1),
-                                 __fmul_rn(gate_inv, g2), __fmul_rn(gate_inv, g3));
-        if constexpr (kXMmaMode == 2) {
-          st4_xmma<true>(out_gate_all, row, c * 1024 + threadIdx.x * 4, gq);
-        } else if constexpr (kXMmaMode == 1) {
-          st4_xmma<false>(out_gate_all, row, c * 1024 + threadIdx.x * 4, gq);
-        } else {
-          st4_v2(out_gate_row, c, gq);
-        }
+        uint32_t gq = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g0)), clamp448(__fmul_rn(gate_inv, g1)))) |
+                      (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g2)), clamp448(__fmul_rn(gate_inv, g3)))) << 16);
+        st4_v2(out_gate_row, c, gq);
       }
     }
   }
@@ -527,7 +507,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
     const float s_x = __ldg(sumsq_x + row);
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) sh_res[c * 256 + threadIdx.x] = ld8_cs_v4(res, c);
+      if (chunk_valid(c)) sh_res[c * 256 + threadIdx.x] = ld8_cs(res, c);
     }
     a = inv_rms(s_x, 1e-08f);
     if constexpr (kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
@@ -538,7 +518,7 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
-      ud[c] = ld8_cs_v4(d, c);
+      ud[c] = ld8_cs(d, c);
       Row4 v = unpack(ud[c]);
 #pragma unroll
       for (int e = 0; e < 4; ++e) acc[e] = __fmaf_rn(v.v[e], v.v[e], acc[e]);
@@ -555,9 +535,9 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
-      Row4 xv = unpack(ld8_cs_v4(x, c)), dv = unpack(ud[c]),
-           rv = unpack(kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_cs_v4(res, c));
-      Row4 wv = unpack(ldg8_v4(w_post, c)), fv = unpack(ldg8_v4(w_ff, c));
+      Row4 xv = unpack(ld8_cs(x, c)), dv = unpack(ud[c]),
+           rv = unpack(kPdl ? sh_res[c * 256 + threadIdx.x] : ld8_cs(res, c));
+      Row4 wv = unpack(ldg8(w_post, c)), fv = unpack(ldg8(w_ff, c));
       float h2[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
@@ -568,29 +548,28 @@ __global__ void __launch_bounds__(kThreads, 4) post_ff_norm_prefill(
       }
       hb[c].x = pack_bf16x2(h2[0], h2[1]);
       hb[c].y = pack_bf16x2(h2[2], h2[3]);
-      st8_v4(x, c, hb[c]);
+      *reinterpret_cast<uint2*>(x + c * 1024 + threadIdx.x * 4) = hb[c];
     }
   }
   const float s_h = row_sum(acc2, red[1]);
   const float e_r = inv_rms(s_h, 1e-05f);
   if constexpr (!kPdl && kFp8Out) inv_scale = rcp_approx_ftz(__ldg(scale));
-  __nv_bfloat16* const out_bf16_row = out_bf16_all + row * kHidden;
-  uint8_t* const out_fp8_row = kFp8Out ? (out_fp8_all + row * kHidden) : nullptr;
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
-      Row4 hv = unpack(hb[c]), iv = unpack(ldg8_v4(w_in, c));
+      Row4 hv = unpack(hb[c]), iv = unpack(ldg8(w_in, c));
       float y[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) y[e] = __fmul_rn(__fmul_rn(e_r, hv.v[e]), __fadd_rn(iv.v[e], 1.0f));
+      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
       uint2 o;
       o.x = pack_bf16x2(y[0], y[1]);
       o.y = pack_bf16x2(y[2], y[3]);
-      st8_v4(out_bf16_row, c, o);
+      *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
       if constexpr (kFp8Out) {
-        uint32_t q = pack_fp8x4(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]),
-                                __fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]));
-        st4_v2(out_fp8_row, c, q);
+        uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
+                     (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
+        *reinterpret_cast<uint32_t*>(out_fp8_all + off) = q;
       }
     }
   }
@@ -601,7 +580,7 @@ __global__ void gate_formula_kernel(const uint16_t* bits, const float* gate_scal
   if (i >= n) return;
   const float gate_inv = full_divide(1.0f, *gate_scale);
   const float v = __uint_as_float(static_cast<uint32_t>(bits[i]) << 16);
-  out[i] = static_cast<uint8_t>(fp8x2(__fmul_rn(gate_inv, v), 0.0f) & 0xff);
+  out[i] = static_cast<uint8_t>(fp8x2(clamp448(__fmul_rn(gate_inv, v)), 0.0f) & 0xff);
 }
 
 __device__ __forceinline__ float triton_sigmoid(float g) {
@@ -657,15 +636,14 @@ __global__ void __launch_bounds__(256) mul_sigmoid_bf16_kernel(
   out[idx] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
 }
 
-template <int kThreads = 256, bool kPdlWait = false, bool kPdlProd = false, int kXMmaMode = 0>
-__global__ void __launch_bounds__(kThreads) mul_sigmoid_fp8_kernel(
+template <bool kPdl = false>
+__global__ void __launch_bounds__(256) mul_sigmoid_fp8_kernel(
     const uint4* __restrict__ gate, const uint4* __restrict__ attn,
     const float* __restrict__ scale, uint2* __restrict__ out, int vec8) {
-  const int idx = blockIdx.x * kThreads + threadIdx.x;
-  const float inv_s = full_divide(1.0f, __ldg(scale));
-  if constexpr (kPdlWait) pdl_wait();
-  if constexpr (kPdlProd) pdl_launch_dependents();
+  const int idx = blockIdx.x * 256 + threadIdx.x;
+  if constexpr (kPdl) pdl_launch_dependents();
   if (idx >= vec8) return;
+  const float inv_s = full_divide(1.0f, __ldg(scale));
   const uint4 g = ld16_cs(gate + idx), a = ld16_cs(attn + idx);
   const uint32_t gw[4] = {g.x, g.y, g.z, g.w}, aw[4] = {a.x, a.y, a.z, a.w};
   uint16_t ow[4];
@@ -673,36 +651,20 @@ __global__ void __launch_bounds__(kThreads) mul_sigmoid_fp8_kernel(
   for (int i = 0; i < 4; ++i) {
     const float gl = bf_lo(gw[i]), gh = bf_hi(gw[i]);
     const float al = bf_lo(aw[i]), ah = bf_hi(aw[i]);
-    const float ql = __fmul_rn(__fmul_rn(triton_sigmoid(gl), al), inv_s);
-    const float qh = __fmul_rn(__fmul_rn(triton_sigmoid(gh), ah), inv_s);
+    const float ql = clamp448(__fmul_rn(__fmul_rn(triton_sigmoid(gl), al), inv_s));
+    const float qh = clamp448(__fmul_rn(__fmul_rn(triton_sigmoid(gh), ah), inv_s));
     ow[i] = fp8x2(ql, qh);
   }
-  const uint32_t lo = __byte_perm(static_cast<uint32_t>(ow[0]), static_cast<uint32_t>(ow[1]), 0x5410);
-  const uint32_t hi = __byte_perm(static_cast<uint32_t>(ow[2]), static_cast<uint32_t>(ow[3]), 0x5410);
-  if constexpr (kXMmaMode == 2) {
-    const size_t row = static_cast<size_t>(idx) >> 9;
-    const int col = (idx & 511) << 3;
-    uint8_t* const out_u8 = reinterpret_cast<uint8_t*>(out);
-    st4_xmma<true>(out_u8, row, col, lo);
-    st4_xmma<true>(out_u8, row, col + 4, hi);
-  } else if constexpr (kXMmaMode == 1) {
-    const size_t row = static_cast<size_t>(idx) >> 9;
-    const int col = (idx & 511) << 3;
-    uint8_t* const out_u8 = reinterpret_cast<uint8_t*>(out);
-    st4_xmma<false>(out_u8, row, col, lo);
-    st4_xmma<false>(out_u8, row, col + 4, hi);
-  } else {
-    out[idx] = make_uint2(lo, hi);
-  }
+  const uint32_t lo = static_cast<uint32_t>(ow[0]) | (static_cast<uint32_t>(ow[1]) << 16);
+  const uint32_t hi = static_cast<uint32_t>(ow[2]) | (static_cast<uint32_t>(ow[3]) << 16);
+  out[idx] = make_uint2(lo, hi);
 }
 
-constexpr int kInterVec8 = 19968 / 8;  // 2496 uint4s per 19968-element BF16 half-row (13 * 192 exact)
+constexpr int kInterVec8 = 19968 / 8;  // 2496 uint4s per 19968-element BF16 half-row
 
-template <bool kPdlProd = false>
-__global__ void __launch_bounds__(192) mul_silu_slice_bf16_kernel(
+__global__ void __launch_bounds__(128) mul_silu_slice_bf16_kernel(
     const uint4* __restrict__ gu_all, uint4* __restrict__ out_all) {
-  const int col = blockIdx.x * 192 + threadIdx.x;
-  if constexpr (kPdlProd) pdl_launch_dependents();
+  const int col = blockIdx.x * 128 + threadIdx.x;
   if (col >= kInterVec8) return;
   const size_t row = blockIdx.y;
   const uint4* gu = gu_all + row * (2 * kInterVec8);
@@ -719,14 +681,11 @@ __global__ void __launch_bounds__(192) mul_silu_slice_bf16_kernel(
   out_all[row * kInterVec8 + col] = make_uint4(ow[0], ow[1], ow[2], ow[3]);
 }
 
-template <bool kPdlWait = false, bool kPdlProd = false, int kXMmaMode = 0>
-__global__ void __launch_bounds__(192) mul_silu_slice_fp8_kernel(
+__global__ void __launch_bounds__(128) mul_silu_slice_fp8_kernel(
     const uint4* __restrict__ gu_all, const float* __restrict__ scale, uint2* __restrict__ out_all) {
-  const int col = blockIdx.x * 192 + threadIdx.x;
-  const float inv_s = full_divide(1.0f, __ldg(scale));
-  if constexpr (kPdlWait) pdl_wait();
-  if constexpr (kPdlProd) pdl_launch_dependents();
+  const int col = blockIdx.x * 128 + threadIdx.x;
   if (col >= kInterVec8) return;
+  const float inv_s = full_divide(1.0f, __ldg(scale));
   const size_t row = blockIdx.y;
   const uint4* gu = gu_all + row * (2 * kInterVec8);
   const uint4 g = ld16_cs(gu + col);
@@ -737,25 +696,13 @@ __global__ void __launch_bounds__(192) mul_silu_slice_fp8_kernel(
   for (int i = 0; i < 4; ++i) {
     const float gl = bf_lo(gw[i]), gh = bf_hi(gw[i]);
     const float ul = bf_lo(uw[i]), uh = bf_hi(uw[i]);
-    const float ql = __fmul_rn(__fmul_rn(triton_silu(gl), ul), inv_s);
-    const float qh = __fmul_rn(__fmul_rn(triton_silu(gh), uh), inv_s);
+    const float ql = clamp448(__fmul_rn(__fmul_rn(triton_silu(gl), ul), inv_s));
+    const float qh = clamp448(__fmul_rn(__fmul_rn(triton_silu(gh), uh), inv_s));
     ow[i] = fp8x2(ql, qh);
   }
-  const uint32_t lo = __byte_perm(static_cast<uint32_t>(ow[0]), static_cast<uint32_t>(ow[1]), 0x5410);
-  const uint32_t hi = __byte_perm(static_cast<uint32_t>(ow[2]), static_cast<uint32_t>(ow[3]), 0x5410);
-  if constexpr (kXMmaMode == 2) {
-    uint8_t* const out_u8 = reinterpret_cast<uint8_t*>(out_all);
-    const int elem_col = col << 3;
-    st4_xmma<true>(out_u8, row, elem_col, lo);
-    st4_xmma<true>(out_u8, row, elem_col + 4, hi);
-  } else if constexpr (kXMmaMode == 1) {
-    uint8_t* const out_u8 = reinterpret_cast<uint8_t*>(out_all);
-    const int elem_col = col << 3;
-    st4_xmma<false>(out_u8, row, elem_col, lo);
-    st4_xmma<false>(out_u8, row, elem_col + 4, hi);
-  } else {
-    out_all[row * kInterVec8 + col] = make_uint2(lo, hi);
-  }
+  const uint32_t lo = static_cast<uint32_t>(ow[0]) | (static_cast<uint32_t>(ow[1]) << 16);
+  const uint32_t hi = static_cast<uint32_t>(ow[2]) | (static_cast<uint32_t>(ow[3]) << 16);
+  out_all[row * kInterVec8 + col] = make_uint2(lo, hi);
 }
 
 // Layer-51 final post-FF norm + residual + model.norm (compiled bf5b0726...):
@@ -776,20 +723,26 @@ __global__ void __launch_bounds__(kThreads) post_ff_final_norm(
   const __nv_bfloat16* d = d_all + row * kHidden;
   const __nv_bfloat16* res = res_all + row * kHidden;
   const __nv_bfloat16* x = x_all + row * kHidden;
-  uint2 ud[kChunks], uf[kChunks], ui[kChunks];
+  uint2 ud[kChunks], ur[kChunks], ux[kChunks], uw[kChunks], uf[kChunks], ui[kChunks];
   float h1_pre[kChunks][4];
-  const float a = inv_rms(__ldg(sumsq_x + row), 1e-08f);
+  float a = 0.f;
   if constexpr (kPdl) {
-    // Precompute h1_pre chunk-by-chunk before pdl_wait() so ux/ur/uw never consume live regs post-wait.
+    const float s_x = sumsq_x[row];
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) {
-        const uint2 urc = ld8_v4(res, c);
-        const uint2 uxc = ld8_v4(x, c);
-        const uint2 uwc = ldg8_v4(w_post, c);
-        uf[c] = ldg8_v4(w_ff, c);
-        ui[c] = ldg8_v4(w_in, c);
-        Row4 xv = unpack(uxc), rv = unpack(urc), wv = unpack(uwc);
+        ur[c] = ld8(res, c);
+        ux[c] = ld8(x, c);
+        uw[c] = ld8(w_post, c);
+        uf[c] = ld8(w_ff, c);
+        ui[c] = ld8(w_in, c);
+      }
+    }
+    a = inv_rms(s_x, 1e-08f);
+#pragma unroll
+    for (int c = 0; c < kChunks; ++c) {
+      if (chunk_valid(c)) {
+        Row4 xv = unpack(ux[c]), rv = unpack(ur[c]), wv = unpack(uw[c]);
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
           const float t1 = __fmul_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f));
@@ -801,26 +754,21 @@ __global__ void __launch_bounds__(kThreads) post_ff_final_norm(
     pdl_launch_dependents();
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) ud[c] = ld8_v4(d, c);
+      if (chunk_valid(c)) ud[c] = ld8(d, c);
     }
   } else {
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) {
-        ud[c] = ld8_v4(d, c);
-        const uint2 urc = ld8_v4(res, c);
-        const uint2 uxc = ld8_v4(x, c);
-        const uint2 uwc = ldg8_v4(w_post, c);
-        uf[c] = ldg8_v4(w_ff, c);
-        ui[c] = ldg8_v4(w_in, c);
-        Row4 xv = unpack(uxc), rv = unpack(urc), wv = unpack(uwc);
-#pragma unroll
-        for (int e = 0; e < 4; ++e) {
-          const float t1 = __fmul_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f));
-          h1_pre[c][e] = __fadd_rn(rv.v[e], t1);
-        }
+        ud[c] = ld8(d, c);
+        ur[c] = ld8(res, c);
+        ux[c] = ld8(x, c);
+        uw[c] = ld8(w_post, c);
+        uf[c] = ld8(w_ff, c);
+        ui[c] = ld8(w_in, c);
       }
     }
+    a = inv_rms(sumsq_x[row], 1e-08f);
   }
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -839,10 +787,21 @@ __global__ void __launch_bounds__(kThreads) post_ff_final_norm(
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
       Row4 dv = unpack(ud[c]), fv = unpack(uf[c]);
+      if constexpr (kPdl) {
 #pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        h2[c][e] = __fmaf_rn(__fmul_rn(cd, dv.v[e]), __fadd_rn(fv.v[e], 1.0f), h1_pre[c][e]);
-        acc2[e] = __fmaf_rn(h2[c][e], h2[c][e], acc2[e]);
+        for (int e = 0; e < 4; ++e) {
+          h2[c][e] = __fmaf_rn(__fmul_rn(cd, dv.v[e]), __fadd_rn(fv.v[e], 1.0f), h1_pre[c][e]);
+          acc2[e] = __fmaf_rn(h2[c][e], h2[c][e], acc2[e]);
+        }
+      } else {
+        Row4 xv = unpack(ux[c]), rv = unpack(ur[c]), wv = unpack(uw[c]);
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          const float t1 = __fmul_rn(__fmul_rn(a, xv.v[e]), __fadd_rn(wv.v[e], 1.0f));
+          const float h1 = __fadd_rn(rv.v[e], t1);
+          h2[c][e] = __fmaf_rn(__fmul_rn(cd, dv.v[e]), __fadd_rn(fv.v[e], 1.0f), h1);
+          acc2[e] = __fmaf_rn(h2[c][e], h2[c][e], acc2[e]);
+        }
       }
       if constexpr (kWriteH2) {
         const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
@@ -853,7 +812,6 @@ __global__ void __launch_bounds__(kThreads) post_ff_final_norm(
   }
   const float s_h = row_sum(acc2, red[1]);
   const float e_r = inv_rms(s_h, 1e-05f);
-  __nv_bfloat16* const out_bf16_row = out_bf16_all + row * kHidden;
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
@@ -863,16 +821,17 @@ __global__ void __launch_bounds__(kThreads) post_ff_final_norm(
       for (int e = 0; e < 4; ++e) {
         y[e] = __fmul_rn(__fmul_rn(e_r, h2[c][e]), __fadd_rn(iv.v[e], 0.0f));
       }
+      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
       uint2 o;
       o.x = pack_bf16x2(y[0], y[1]);
       o.y = pack_bf16x2(y[2], y[3]);
-      st8_v4(out_bf16_row, c, o);
+      *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
     }
   }
 }
 
 // Layer-0 initial input_layernorm + FP8 qkv quant (+ optional gate FP8 quant fold), 8-warp (R0_BLOCK=1024) layout:
-template <bool kGateOut = false, bool kWriteBf16 = true, bool kPdl = false, int kXMmaMode = 0>
+template <bool kGateOut = false, bool kWriteBf16 = true, bool kPdl = false>
 __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
     const __nv_bfloat16* x_all, const __nv_bfloat16* __restrict__ w_in,
     const float* scale, __nv_bfloat16* out_bf16_all, uint8_t* out_fp8_all,
@@ -886,22 +845,22 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
   if constexpr (kPdl) {
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) ui[c] = ldg8_v4(w_in, c);
+      if (chunk_valid(c)) ui[c] = ld8(w_in, c);
     }
-    inv_scale = full_divide(1.0f, __ldg(scale));
-    if constexpr (kGateOut) gate_inv = full_divide(1.0f, __ldg(gate_scale));
+    inv_scale = full_divide(1.0f, *scale);
+    if constexpr (kGateOut) gate_inv = full_divide(1.0f, *gate_scale);
     pdl_wait();
     pdl_launch_dependents();
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
-      if (chunk_valid(c)) ux[c] = ld8_v4(x, c);
+      if (chunk_valid(c)) ux[c] = ld8(x, c);
     }
   } else {
 #pragma unroll
     for (int c = 0; c < kChunks; ++c) {
       if (chunk_valid(c)) {
-        ux[c] = ld8_v4(x, c);
-        ui[c] = ldg8_v4(w_in, c);
+        ux[c] = ld8(x, c);
+        ui[c] = ld8(w_in, c);
       }
     }
   }
@@ -917,12 +876,9 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
   const float s_x = row_sum(acc, red);
   const float r = inv_rms(s_x, 1e-05f);
   if constexpr (!kPdl) {
-    inv_scale = full_divide(1.0f, __ldg(scale));
-    if constexpr (kGateOut) gate_inv = full_divide(1.0f, __ldg(gate_scale));
+    inv_scale = full_divide(1.0f, *scale);
+    if constexpr (kGateOut) gate_inv = full_divide(1.0f, *gate_scale);
   }
-  __nv_bfloat16* const out_bf16_row = kWriteBf16 ? (out_bf16_all + row * kHidden) : nullptr;
-  uint8_t* const out_fp8_row = out_fp8_all + row * kHidden;
-  uint8_t* const out_gate_row = kGateOut ? (out_gate_all + row * kHidden) : nullptr;
 #pragma unroll
   for (int c = 0; c < kChunks; ++c) {
     if (chunk_valid(c)) {
@@ -930,32 +886,21 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
       float y[4];
 #pragma unroll
       for (int e = 0; e < 4; ++e) y[e] = __fmul_rn(__fmul_rn(r, xv.v[e]), __fadd_rn(iv.v[e], 1.0f));
+      const size_t off = row * kHidden + c * 1024 + threadIdx.x * 4;
       uint2 o;
       o.x = pack_bf16x2(y[0], y[1]);
       o.y = pack_bf16x2(y[2], y[3]);
       if constexpr (kWriteBf16) {
-        st8_v4(out_bf16_row, c, o);
+        *reinterpret_cast<uint2*>(out_bf16_all + off) = o;
       }
-      uint32_t q = pack_fp8x4(__fmul_rn(inv_scale, y[0]), __fmul_rn(inv_scale, y[1]),
-                              __fmul_rn(inv_scale, y[2]), __fmul_rn(inv_scale, y[3]));
-      if constexpr (kXMmaMode == 2) {
-        st4_xmma<true>(out_fp8_all, row, c * 1024 + threadIdx.x * 4, q);
-      } else if constexpr (kXMmaMode == 1) {
-        st4_xmma<false>(out_fp8_all, row, c * 1024 + threadIdx.x * 4, q);
-      } else {
-        st4_v2(out_fp8_row, c, q);
-      }
+      uint32_t q = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[0])), clamp448(__fmul_rn(inv_scale, y[1])))) |
+                   (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(inv_scale, y[2])), clamp448(__fmul_rn(inv_scale, y[3])))) << 16);
+      *reinterpret_cast<uint32_t*>(out_fp8_all + off) = q;
       if constexpr (kGateOut) {
         const float g0 = bf_lo(o.x), g1 = bf_hi(o.x), g2 = bf_lo(o.y), g3 = bf_hi(o.y);
-        uint32_t gq = pack_fp8x4(__fmul_rn(gate_inv, g0), __fmul_rn(gate_inv, g1),
-                                 __fmul_rn(gate_inv, g2), __fmul_rn(gate_inv, g3));
-        if constexpr (kXMmaMode == 2) {
-          st4_xmma<true>(out_gate_all, row, c * 1024 + threadIdx.x * 4, gq);
-        } else if constexpr (kXMmaMode == 1) {
-          st4_xmma<false>(out_gate_all, row, c * 1024 + threadIdx.x * 4, gq);
-        } else {
-          st4_v2(out_gate_row, c, gq);
-        }
+        uint32_t gq = static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g0)), clamp448(__fmul_rn(gate_inv, g1)))) |
+                      (static_cast<uint32_t>(fp8x2(clamp448(__fmul_rn(gate_inv, g2)), clamp448(__fmul_rn(gate_inv, g3)))) << 16);
+        *reinterpret_cast<uint32_t*>(out_gate_all + off) = gq;
       }
     }
   }
@@ -963,7 +908,7 @@ __global__ void __launch_bounds__(kThreads) input_norm_fp8_w8(
 
 // Layer-0 initial input_layernorm + FP8 qkv quant (+ optional gate FP8 quant fold), 16-warp (R0_BLOCK=8192) layout:
 //   sizePerThread = [1, 16], threadsPerWarp = [1, 32], warpsPerCTA = [1, 16] (512 threads; t < 416 owns 16 elements).
-template <bool kGateOut = false, bool kWriteBf16 = true, bool kPdl = false, int kXMmaMode = 0>
+template <bool kGateOut = false, bool kWriteBf16 = true, bool kPdl = false>
 __global__ void __launch_bounds__(512) input_norm_fp8_w16(
     const __nv_bfloat16* x_all, const __nv_bfloat16* __restrict__ w_in,
     const float* scale, __nv_bfloat16* out_bf16_all, uint8_t* out_fp8_all,
@@ -1045,9 +990,10 @@ __global__ void __launch_bounds__(512) input_norm_fp8_w16(
     const float y0 = __fmul_rn(__fmul_rn(r, xv[2 * i]), __fadd_rn(bf_lo(iw[i]), 1.0f));
     const float y1 = __fmul_rn(__fmul_rn(r, xv[2 * i + 1]), __fadd_rn(bf_hi(iw[i]), 1.0f));
     ob[i] = pack_bf16x2(y0, y1);
-    qf[i] = fp8x2(__fmul_rn(inv_scale, y0), __fmul_rn(inv_scale, y1));
+    qf[i] = fp8x2(clamp448(__fmul_rn(inv_scale, y0)), clamp448(__fmul_rn(inv_scale, y1)));
     if constexpr (kGateOut) {
-      qg[i] = fp8x2(__fmul_rn(gate_inv, bf_lo(ob[i])), __fmul_rn(gate_inv, bf_hi(ob[i])));
+      qg[i] = fp8x2(clamp448(__fmul_rn(gate_inv, bf_lo(ob[i]))),
+                    clamp448(__fmul_rn(gate_inv, bf_hi(ob[i]))));
     }
   }
   const size_t off = row * kHidden + t * 16;
@@ -1059,40 +1005,16 @@ __global__ void __launch_bounds__(512) input_norm_fp8_w16(
   auto pack4x16 = [](uint16_t a0, uint16_t a1, uint16_t a2, uint16_t a3,
                      uint16_t a4, uint16_t a5, uint16_t a6, uint16_t a7) -> uint4 {
     return make_uint4(
-        __byte_perm(static_cast<uint32_t>(a0), static_cast<uint32_t>(a1), 0x5410),
-        __byte_perm(static_cast<uint32_t>(a2), static_cast<uint32_t>(a3), 0x5410),
-        __byte_perm(static_cast<uint32_t>(a4), static_cast<uint32_t>(a5), 0x5410),
-        __byte_perm(static_cast<uint32_t>(a6), static_cast<uint32_t>(a7), 0x5410));
+        static_cast<uint32_t>(a0) | (static_cast<uint32_t>(a1) << 16),
+        static_cast<uint32_t>(a2) | (static_cast<uint32_t>(a3) << 16),
+        static_cast<uint32_t>(a4) | (static_cast<uint32_t>(a5) << 16),
+        static_cast<uint32_t>(a6) | (static_cast<uint32_t>(a7) << 16));
   };
-  const uint4 qv = pack4x16(qf[0], qf[1], qf[2], qf[3], qf[4], qf[5], qf[6], qf[7]);
-  if constexpr (kXMmaMode == 2) {
-    st4_xmma<true>(out_fp8_all, row, t * 16 + 0, qv.x);
-    st4_xmma<true>(out_fp8_all, row, t * 16 + 4, qv.y);
-    st4_xmma<true>(out_fp8_all, row, t * 16 + 8, qv.z);
-    st4_xmma<true>(out_fp8_all, row, t * 16 + 12, qv.w);
-  } else if constexpr (kXMmaMode == 1) {
-    st4_xmma<false>(out_fp8_all, row, t * 16 + 0, qv.x);
-    st4_xmma<false>(out_fp8_all, row, t * 16 + 4, qv.y);
-    st4_xmma<false>(out_fp8_all, row, t * 16 + 8, qv.z);
-    st4_xmma<false>(out_fp8_all, row, t * 16 + 12, qv.w);
-  } else {
-    *reinterpret_cast<uint4*>(out_fp8_all + off) = qv;
-  }
+  *reinterpret_cast<uint4*>(out_fp8_all + off) =
+      pack4x16(qf[0], qf[1], qf[2], qf[3], qf[4], qf[5], qf[6], qf[7]);
   if constexpr (kGateOut) {
-    const uint4 gv = pack4x16(qg[0], qg[1], qg[2], qg[3], qg[4], qg[5], qg[6], qg[7]);
-    if constexpr (kXMmaMode == 2) {
-      st4_xmma<true>(out_gate_all, row, t * 16 + 0, gv.x);
-      st4_xmma<true>(out_gate_all, row, t * 16 + 4, gv.y);
-      st4_xmma<true>(out_gate_all, row, t * 16 + 8, gv.z);
-      st4_xmma<true>(out_gate_all, row, t * 16 + 12, gv.w);
-    } else if constexpr (kXMmaMode == 1) {
-      st4_xmma<false>(out_gate_all, row, t * 16 + 0, gv.x);
-      st4_xmma<false>(out_gate_all, row, t * 16 + 4, gv.y);
-      st4_xmma<false>(out_gate_all, row, t * 16 + 8, gv.z);
-      st4_xmma<false>(out_gate_all, row, t * 16 + 12, gv.w);
-    } else {
-      *reinterpret_cast<uint4*>(out_gate_all + off) = gv;
-    }
+    *reinterpret_cast<uint4*>(out_gate_all + off) =
+        pack4x16(qg[0], qg[1], qg[2], qg[3], qg[4], qg[5], qg[6], qg[7]);
   }
 }
 
@@ -1119,9 +1041,9 @@ static bool norm_glue_prefill_pdl_enabled() {
 }
 
 template <typename... KArgs, typename... Args>
-cudaError_t launch_pdl_grid(void (*kernel)(KArgs...), dim3 grid, int threads, cudaStream_t stream, Args... args) {
+cudaError_t launch_pdl(void (*kernel)(KArgs...), int rows, int threads, cudaStream_t stream, Args... args) {
   cudaLaunchConfig_t cfg = {};
-  cfg.gridDim = grid;
+  cfg.gridDim = dim3(rows, 1, 1);
   cfg.blockDim = dim3(threads, 1, 1);
   cfg.dynamicSmemBytes = 0;
   cfg.stream = stream;
@@ -1131,11 +1053,6 @@ cudaError_t launch_pdl_grid(void (*kernel)(KArgs...), dim3 grid, int threads, cu
   cfg.attrs = attr;
   cfg.numAttrs = 1;
   return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
-}
-
-template <typename... KArgs, typename... Args>
-cudaError_t launch_pdl(void (*kernel)(KArgs...), int rows, int threads, cudaStream_t stream, Args... args) {
-  return launch_pdl_grid(kernel, dim3(rows, 1, 1), threads, stream, args...);
 }
 
 }  // namespace
@@ -1157,14 +1074,14 @@ int muse_norm_glue_post_attn(int kind, int rows, const void* x, const void* res,
   const auto* Rs = static_cast<const __nv_bfloat16*>(res);
   const auto* Wp = static_cast<const __nv_bfloat16*>(w_post);
   const auto* Wq = static_cast<const __nv_bfloat16*>(w_pre);
-  const bool use_pdl = (rows <= 32) && norm_glue_pdl_enabled();
-  const bool use_prefill_pdl = (rows > 32) && norm_glue_prefill_pdl_enabled();
+  const bool use_pdl = (rows <= 16) && norm_glue_pdl_enabled();
+  const bool use_prefill_pdl = (rows > 16) && norm_glue_prefill_pdl_enabled();
   if (kind == 0) {
     if (use_pdl) {
       return static_cast<int>(launch_pdl(post_attn_norm_decode<true, false, true>, rows, kThreads, stream,
           X, Rs, Wp, Wq, static_cast<const float*>(nullptr), static_cast<float*>(sumsq_out),
           static_cast<__nv_bfloat16*>(out_bf16), static_cast<uint8_t*>(nullptr)));
-    } else if (rows <= 32) {
+    } else if (rows <= 16) {
       post_attn_norm_decode<true, false><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, nullptr,
           static_cast<float*>(sumsq_out), static_cast<__nv_bfloat16*>(out_bf16), nullptr);
     } else if (use_prefill_pdl) {
@@ -1180,7 +1097,7 @@ int muse_norm_glue_post_attn(int kind, int rows, const void* x, const void* res,
       return static_cast<int>(launch_pdl(post_attn_norm_decode<false, true, true>, rows, kThreads, stream,
           X, Rs, Wp, Wq, static_cast<const float*>(scale), static_cast<float*>(sumsq_out),
           static_cast<__nv_bfloat16*>(nullptr), static_cast<uint8_t*>(out_fp8)));
-    } else if (rows <= 32) {
+    } else if (rows <= 16) {
       post_attn_norm_decode<false, true><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, static_cast<const float*>(scale),
           static_cast<float*>(sumsq_out), nullptr, static_cast<uint8_t*>(out_fp8));
     } else if (use_prefill_pdl) {
@@ -1213,14 +1130,14 @@ int muse_norm_glue_post_ff(int kind, int rows, void* x, const void* d, const voi
     const char* env = std::getenv("MUSE_POST_FF_PREFILL_CS");
     return !env || !*env || std::strtol(env, nullptr, 10) != 0;
   }();
-  const bool use_pdl = (rows <= 32) && norm_glue_pdl_enabled();
-  const bool use_prefill_pdl = (rows > 32) && norm_glue_prefill_pdl_enabled();
+  const bool use_pdl = (rows <= 16) && norm_glue_pdl_enabled();
+  const bool use_prefill_pdl = (rows > 16) && norm_glue_prefill_pdl_enabled();
   if (kind == 0) {
     if (use_pdl) {
       return static_cast<int>(launch_pdl(post_ff_norm_decode<false, false, true, true>, rows, kThreads, stream,
           X, D, Rs, S, Wp, Wf, Wi, static_cast<const float*>(nullptr), static_cast<__nv_bfloat16*>(out_bf16),
           static_cast<uint8_t*>(nullptr), static_cast<const float*>(nullptr), static_cast<uint8_t*>(nullptr)));
-    } else if (rows <= 32 || !prefill_cs) {
+    } else if (rows <= 16 || !prefill_cs) {
       post_ff_norm_decode<false><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, nullptr,
           static_cast<__nv_bfloat16*>(out_bf16), nullptr);
     } else if (use_prefill_pdl) {
@@ -1236,7 +1153,7 @@ int muse_norm_glue_post_ff(int kind, int rows, void* x, const void* d, const voi
       return static_cast<int>(launch_pdl(post_ff_norm_decode<true, false, true, true>, rows, kThreads, stream,
           X, D, Rs, S, Wp, Wf, Wi, static_cast<const float*>(scale), static_cast<__nv_bfloat16*>(out_bf16),
           static_cast<uint8_t*>(out_fp8), static_cast<const float*>(nullptr), static_cast<uint8_t*>(nullptr)));
-    } else if (rows <= 32 || !prefill_cs) {
+    } else if (rows <= 16 || !prefill_cs) {
       post_ff_norm_decode<true><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, static_cast<const float*>(scale),
           static_cast<__nv_bfloat16*>(out_bf16), static_cast<uint8_t*>(out_fp8));
     } else if (use_prefill_pdl) {
@@ -1257,7 +1174,7 @@ int muse_norm_glue_post_ff_final(int rows, const void* d, const void* res, const
                                  const void* w_post, const void* w_ff, const void* w_in,
                                  void* out_h2, void* out_bf16, int write_h2, cudaStream_t stream) {
   if (rows <= 0) return 0;
-  if (rows <= 32 && norm_glue_pdl_enabled()) {
+  if (rows <= 16 && norm_glue_pdl_enabled()) {
     auto k = write_h2 ? post_ff_final_norm<true, true> : post_ff_final_norm<false, true>;
     return static_cast<int>(launch_pdl(k, rows, kThreads, stream,
         static_cast<const __nv_bfloat16*>(d), static_cast<const __nv_bfloat16*>(res),
@@ -1292,7 +1209,7 @@ int muse_norm_glue_input_fp8(int warps, int rows, const void* x, const void* w_i
   const auto* Sc = static_cast<const float*>(scale);
   auto* Ob = static_cast<__nv_bfloat16*>(out_bf16);
   auto* Of = static_cast<uint8_t*>(out_fp8);
-  const bool use_pdl = (rows <= 32) && norm_glue_pdl_enabled();
+  const bool use_pdl = (rows <= 16) && norm_glue_pdl_enabled();
   if (warps == 16) {
     if (use_pdl) {
       return static_cast<int>(launch_pdl(input_norm_fp8_w16<false, true, true>, rows, 512, stream,
@@ -1322,7 +1239,7 @@ int muse_norm_glue_input_fp8_gate(int warps, int rows, const void* x, const void
   auto* Of = static_cast<uint8_t*>(out_fp8);
   const auto* Gs = static_cast<const float*>(gate_scale);
   auto* Og = static_cast<uint8_t*>(out_gate);
-  const bool use_pdl = (rows <= 32) && norm_glue_pdl_enabled();
+  const bool use_pdl = (rows <= 16) && norm_glue_pdl_enabled();
   if (warps == 16) {
     if (use_pdl) {
       auto k = write_bf16 ? input_norm_fp8_w16<true, true, true> : input_norm_fp8_w16<true, false, true>;
@@ -1366,7 +1283,7 @@ int muse_norm_glue_post_ff_gate(int rows, void* x, const void* d, const void* re
   auto* Ob = static_cast<__nv_bfloat16*>(out_bf16);
   auto* Of = static_cast<uint8_t*>(out_fp8);
   auto* Og = static_cast<uint8_t*>(out_gate);
-  if (rows <= 32 && norm_glue_pdl_enabled()) {
+  if (rows <= 16 && norm_glue_pdl_enabled()) {
     auto k = write_bf16 ? post_ff_norm_decode<true, true, true, true> : post_ff_norm_decode<true, true, false, true>;
     return static_cast<int>(launch_pdl(k, rows, kThreads, stream, X, D, Rs, S, Wp, Wf, Wi, Sc, Ob, Of, Gs, Og));
   }
@@ -1393,15 +1310,9 @@ int muse_norm_glue_mul_sigmoid_bf16(const void* gate, const void* attn, void* ou
   const int vec8 = n >> 3;
   const int blocks = (vec8 + 255) / 256;
   if (n <= 4096 * 16) {
-    if (norm_glue_pdl_enabled()) {
-      mul_sigmoid_bf16_kernel<false, true><<<blocks, 256, 0, stream>>>(
-          static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
-          static_cast<uint4*>(out), vec8);
-    } else {
-      mul_sigmoid_bf16_kernel<false, false><<<blocks, 256, 0, stream>>>(
-          static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
-          static_cast<uint4*>(out), vec8);
-    }
+    mul_sigmoid_bf16_kernel<false, false><<<blocks, 256, 0, stream>>>(
+        static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
+        static_cast<uint4*>(out), vec8);
   } else if (norm_glue_prefill_pdl_enabled()) {
     mul_sigmoid_bf16_kernel<true, true><<<blocks, 256, 0, stream>>>(
         static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
@@ -1418,227 +1329,32 @@ int muse_norm_glue_mul_sigmoid_fp8(const void* gate, const void* attn, const voi
                                    cudaStream_t stream) {
   if (n <= 0 || (n & 7) != 0) return -1;
   const int vec8 = n >> 3;
-  const auto* g_ptr = static_cast<const uint4*>(gate);
-  const auto* a_ptr = static_cast<const uint4*>(attn);
-  const auto* s_ptr = static_cast<const float*>(scale);
-  auto* o_ptr = static_cast<uint2*>(out);
-  if (n <= 4096 * 32) {
-    const bool use_pdl = norm_glue_pdl_enabled();
-    if (vec8 > 48 * 256 && vec8 <= 48 * 352) {
-      if (use_pdl) {
-        return static_cast<int>(launch_pdl(mul_sigmoid_fp8_kernel<352, true, true>, 48, 352, stream, g_ptr, a_ptr, s_ptr, o_ptr, vec8));
-      }
-      mul_sigmoid_fp8_kernel<352, false, false><<<48, 352, 0, stream>>>(g_ptr, a_ptr, s_ptr, o_ptr, vec8);
-    } else {
-      const int blocks = (vec8 + 255) / 256;
-      if (use_pdl) {
-        return static_cast<int>(launch_pdl(mul_sigmoid_fp8_kernel<256, true, true>, blocks, 256, stream, g_ptr, a_ptr, s_ptr, o_ptr, vec8));
-      }
-      mul_sigmoid_fp8_kernel<256, false, false><<<blocks, 256, 0, stream>>>(g_ptr, a_ptr, s_ptr, o_ptr, vec8);
-    }
-    return static_cast<int>(cudaGetLastError());
-  }
   const int blocks = (vec8 + 255) / 256;
-  if (norm_glue_prefill_pdl_enabled()) {
-    mul_sigmoid_fp8_kernel<256, false, true><<<blocks, 256, 0, stream>>>(g_ptr, a_ptr, s_ptr, o_ptr, vec8);
+  if (n > 4096 * 16 && norm_glue_prefill_pdl_enabled()) {
+    mul_sigmoid_fp8_kernel<true><<<blocks, 256, 0, stream>>>(
+        static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
+        static_cast<const float*>(scale), static_cast<uint2*>(out), vec8);
   } else {
-    mul_sigmoid_fp8_kernel<256, false, false><<<blocks, 256, 0, stream>>>(g_ptr, a_ptr, s_ptr, o_ptr, vec8);
+    mul_sigmoid_fp8_kernel<false><<<blocks, 256, 0, stream>>>(
+        static_cast<const uint4*>(gate), static_cast<const uint4*>(attn),
+        static_cast<const float*>(scale), static_cast<uint2*>(out), vec8);
   }
   return static_cast<int>(cudaGetLastError());
 }
 
 int muse_norm_glue_mul_silu_slice_bf16(const void* gu, void* out, int rows, cudaStream_t stream) {
   if (rows <= 0) return -1;
-  const dim3 grid((kInterVec8 + 191) / 192, static_cast<unsigned>(rows));
-  if (rows <= 32 && norm_glue_pdl_enabled()) {
-    mul_silu_slice_bf16_kernel<true><<<grid, 192, 0, stream>>>(
-        static_cast<const uint4*>(gu), static_cast<uint4*>(out));
-  } else {
-    mul_silu_slice_bf16_kernel<false><<<grid, 192, 0, stream>>>(
-        static_cast<const uint4*>(gu), static_cast<uint4*>(out));
-  }
+  const dim3 grid((kInterVec8 + 127) / 128, static_cast<unsigned>(rows));
+  mul_silu_slice_bf16_kernel<<<grid, 128, 0, stream>>>(
+      static_cast<const uint4*>(gu), static_cast<uint4*>(out));
   return static_cast<int>(cudaGetLastError());
 }
 
 int muse_norm_glue_mul_silu_slice_fp8(const void* gu, const void* scale, void* out, int rows, cudaStream_t stream) {
   if (rows <= 0) return -1;
-  const dim3 grid((kInterVec8 + 191) / 192, static_cast<unsigned>(rows));
-  if (rows <= 32 && norm_glue_pdl_enabled()) {
-    return static_cast<int>(launch_pdl_grid(
-        mul_silu_slice_fp8_kernel<true, true>, grid, 192, stream,
-        static_cast<const uint4*>(gu), static_cast<const float*>(scale), static_cast<uint2*>(out)));
-  }
-  mul_silu_slice_fp8_kernel<false, false><<<grid, 192, 0, stream>>>(
+  const dim3 grid((kInterVec8 + 127) / 128, static_cast<unsigned>(rows));
+  mul_silu_slice_fp8_kernel<<<grid, 128, 0, stream>>>(
       static_cast<const uint4*>(gu), static_cast<const float*>(scale), static_cast<uint2*>(out));
-  return static_cast<int>(cudaGetLastError());
-}
-
-int muse_norm_glue_post_attn_xmma(int rows, const void* x, const void* res, const void* w_post,
-                                  const void* w_pre, const void* scale, void* sumsq_out, void* out_fp8,
-                                  cudaStream_t stream) {
-  if (rows != 16 && rows != 32) return -1;
-  const auto* X = static_cast<const __nv_bfloat16*>(x);
-  const auto* Rs = static_cast<const __nv_bfloat16*>(res);
-  const auto* Wp = static_cast<const __nv_bfloat16*>(w_post);
-  const auto* Wq = static_cast<const __nv_bfloat16*>(w_pre);
-  const auto* Sc = static_cast<const float*>(scale);
-  auto* Ss = static_cast<float*>(sumsq_out);
-  auto* Of = static_cast<uint8_t*>(out_fp8);
-  const bool use_pdl = norm_glue_pdl_enabled();
-  if (rows == 32) {
-    if (use_pdl) {
-      return static_cast<int>(launch_pdl(post_attn_norm_decode<false, true, true, 2>, rows, kThreads, stream,
-          X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of));
-    }
-    post_attn_norm_decode<false, true, false, 2><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of);
-  } else {
-    if (use_pdl) {
-      return static_cast<int>(launch_pdl(post_attn_norm_decode<false, true, true, 1>, rows, kThreads, stream,
-          X, Rs, Wp, Wq, Sc, Ss, static_cast<__nv_bfloat16*>(nullptr), Of));
-    }
-    post_attn_norm_decode<false, true, false, 1><<<rows, kThreads, 0, stream>>>(X, Rs, Wp, Wq, Sc, Ss, nullptr, Of);
-  }
-  return static_cast<int>(cudaGetLastError());
-}
-
-int muse_norm_glue_post_ff_gate_xmma(int rows, void* x, const void* d, const void* res, const void* sumsq_x,
-                                     const void* w_post, const void* w_ff, const void* w_in, const void* scale,
-                                     void* out_bf16, void* out_fp8, const void* gate_scale, void* out_gate,
-                                     int write_bf16, cudaStream_t stream) {
-  if (rows != 16 && rows != 32) return -1;
-  auto* X = static_cast<__nv_bfloat16*>(x);
-  const auto* D = static_cast<const __nv_bfloat16*>(d);
-  const auto* Rs = static_cast<const __nv_bfloat16*>(res);
-  const auto* S = static_cast<const float*>(sumsq_x);
-  const auto* Wp = static_cast<const __nv_bfloat16*>(w_post);
-  const auto* Wf = static_cast<const __nv_bfloat16*>(w_ff);
-  const auto* Wi = static_cast<const __nv_bfloat16*>(w_in);
-  const auto* Sc = static_cast<const float*>(scale);
-  const auto* Gs = static_cast<const float*>(gate_scale);
-  auto* Ob = static_cast<__nv_bfloat16*>(out_bf16);
-  auto* Of = static_cast<uint8_t*>(out_fp8);
-  auto* Og = static_cast<uint8_t*>(out_gate);
-  const bool use_pdl = norm_glue_pdl_enabled();
-  if (rows == 32) {
-    if (use_pdl) {
-      auto k = write_bf16 ? post_ff_norm_decode<true, true, true, true, 2>
-                          : post_ff_norm_decode<true, true, false, true, 2>;
-      return static_cast<int>(launch_pdl(k, rows, kThreads, stream, X, D, Rs, S, Wp, Wf, Wi, Sc, Ob, Of, Gs, Og));
-    }
-    if (write_bf16) {
-      post_ff_norm_decode<true, true, true, false, 2><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, Sc, Ob, Of, Gs, Og);
-    } else {
-      post_ff_norm_decode<true, true, false, false, 2><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, Sc, Ob, Of, Gs, Og);
-    }
-  } else {
-    if (use_pdl) {
-      auto k = write_bf16 ? post_ff_norm_decode<true, true, true, true, 1>
-                          : post_ff_norm_decode<true, true, false, true, 1>;
-      return static_cast<int>(launch_pdl(k, rows, kThreads, stream, X, D, Rs, S, Wp, Wf, Wi, Sc, Ob, Of, Gs, Og));
-    }
-    if (write_bf16) {
-      post_ff_norm_decode<true, true, true, false, 1><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, Sc, Ob, Of, Gs, Og);
-    } else {
-      post_ff_norm_decode<true, true, false, false, 1><<<rows, kThreads, 0, stream>>>(X, D, Rs, S, Wp, Wf, Wi, Sc, Ob, Of, Gs, Og);
-    }
-  }
-  return static_cast<int>(cudaGetLastError());
-}
-
-int muse_norm_glue_input_fp8_gate_xmma(int warps, int rows, const void* x, const void* w_in, const void* scale,
-                                       void* out_bf16, void* out_fp8, const void* gate_scale, void* out_gate,
-                                       int write_bf16, cudaStream_t stream) {
-  if (rows != 16 && rows != 32) return -1;
-  const auto* X = static_cast<const __nv_bfloat16*>(x);
-  const auto* Wi = static_cast<const __nv_bfloat16*>(w_in);
-  const auto* Sc = static_cast<const float*>(scale);
-  auto* Ob = static_cast<__nv_bfloat16*>(out_bf16);
-  auto* Of = static_cast<uint8_t*>(out_fp8);
-  const auto* Gs = static_cast<const float*>(gate_scale);
-  auto* Og = static_cast<uint8_t*>(out_gate);
-  const bool use_pdl = norm_glue_pdl_enabled();
-  if (warps == 16) {
-    if (rows == 32) {
-      if (use_pdl) {
-        auto k = write_bf16 ? input_norm_fp8_w16<true, true, true, 2> : input_norm_fp8_w16<true, false, true, 2>;
-        return static_cast<int>(launch_pdl(k, rows, 512, stream, X, Wi, Sc, Ob, Of, Gs, Og));
-      }
-      if (write_bf16) input_norm_fp8_w16<true, true, false, 2><<<rows, 512, 0, stream>>>(X, Wi, Sc, Ob, Of, Gs, Og);
-      else input_norm_fp8_w16<true, false, false, 2><<<rows, 512, 0, stream>>>(X, Wi, Sc, Ob, Of, Gs, Og);
-    } else {
-      if (use_pdl) {
-        auto k = write_bf16 ? input_norm_fp8_w16<true, true, true, 1> : input_norm_fp8_w16<true, false, true, 1>;
-        return static_cast<int>(launch_pdl(k, rows, 512, stream, X, Wi, Sc, Ob, Of, Gs, Og));
-      }
-      if (write_bf16) input_norm_fp8_w16<true, true, false, 1><<<rows, 512, 0, stream>>>(X, Wi, Sc, Ob, Of, Gs, Og);
-      else input_norm_fp8_w16<true, false, false, 1><<<rows, 512, 0, stream>>>(X, Wi, Sc, Ob, Of, Gs, Og);
-    }
-  } else if (warps == 8) {
-    if (rows == 32) {
-      if (use_pdl) {
-        auto k = write_bf16 ? input_norm_fp8_w8<true, true, true, 2> : input_norm_fp8_w8<true, false, true, 2>;
-        return static_cast<int>(launch_pdl(k, rows, kThreads, stream, X, Wi, Sc, Ob, Of, Gs, Og));
-      }
-      if (write_bf16) input_norm_fp8_w8<true, true, false, 2><<<rows, kThreads, 0, stream>>>(X, Wi, Sc, Ob, Of, Gs, Og);
-      else input_norm_fp8_w8<true, false, false, 2><<<rows, kThreads, 0, stream>>>(X, Wi, Sc, Ob, Of, Gs, Og);
-    } else {
-      if (use_pdl) {
-        auto k = write_bf16 ? input_norm_fp8_w8<true, true, true, 1> : input_norm_fp8_w8<true, false, true, 1>;
-        return static_cast<int>(launch_pdl(k, rows, kThreads, stream, X, Wi, Sc, Ob, Of, Gs, Og));
-      }
-      if (write_bf16) input_norm_fp8_w8<true, true, false, 1><<<rows, kThreads, 0, stream>>>(X, Wi, Sc, Ob, Of, Gs, Og);
-      else input_norm_fp8_w8<true, false, false, 1><<<rows, kThreads, 0, stream>>>(X, Wi, Sc, Ob, Of, Gs, Og);
-    }
-  } else {
-    return -1;
-  }
-  return static_cast<int>(cudaGetLastError());
-}
-
-int muse_norm_glue_mul_sigmoid_fp8_xmma(const void* gate, const void* attn, const void* scale, void* out,
-                                        int rows, cudaStream_t stream) {
-  if (rows != 16 && rows != 32) return -1;
-  const int vec8 = rows * (4096 / 8);
-  const auto* g_ptr = static_cast<const uint4*>(gate);
-  const auto* a_ptr = static_cast<const uint4*>(attn);
-  const auto* s_ptr = static_cast<const float*>(scale);
-  auto* o_ptr = static_cast<uint2*>(out);
-  const bool use_pdl = norm_glue_pdl_enabled();
-  if (rows == 32) {
-    // Full 48-SM SFU + L2 parallelism (matches 243 us mul_sigmoid_fp8_kernel<352>) + direct st4_xmma!
-    if (use_pdl) {
-      return static_cast<int>(launch_pdl(mul_sigmoid_fp8_kernel<352, true, true, 2>, 48, 352, stream, g_ptr, a_ptr, s_ptr, o_ptr, vec8));
-    }
-    mul_sigmoid_fp8_kernel<352, false, false, 2><<<48, 352, 0, stream>>>(g_ptr, a_ptr, s_ptr, o_ptr, vec8);
-  } else {
-    const int blocks = (vec8 + 255) / 256;
-    if (use_pdl) {
-      return static_cast<int>(launch_pdl(mul_sigmoid_fp8_kernel<256, true, true, 1>, blocks, 256, stream, g_ptr, a_ptr, s_ptr, o_ptr, vec8));
-    }
-    mul_sigmoid_fp8_kernel<256, false, false, 1><<<blocks, 256, 0, stream>>>(g_ptr, a_ptr, s_ptr, o_ptr, vec8);
-  }
-  return static_cast<int>(cudaGetLastError());
-}
-
-int muse_norm_glue_mul_silu_slice_fp8_xmma(const void* gu, const void* scale, void* out, int rows,
-                                           cudaStream_t stream) {
-  if (rows != 16 && rows != 32) return -1;
-  const dim3 grid((kInterVec8 + 191) / 192, static_cast<unsigned>(rows));
-  const auto* gu_ptr = static_cast<const uint4*>(gu);
-  const auto* s_ptr = static_cast<const float*>(scale);
-  auto* o_ptr = static_cast<uint2*>(out);
-  const bool use_pdl = norm_glue_pdl_enabled();
-  if (rows == 32) {
-    if (use_pdl) {
-      return static_cast<int>(launch_pdl_grid(mul_silu_slice_fp8_kernel<true, true, 2>, grid, 192, stream, gu_ptr, s_ptr, o_ptr));
-    }
-    mul_silu_slice_fp8_kernel<false, false, 2><<<grid, 192, 0, stream>>>(gu_ptr, s_ptr, o_ptr);
-  } else {
-    if (use_pdl) {
-      return static_cast<int>(launch_pdl_grid(mul_silu_slice_fp8_kernel<true, true, 1>, grid, 192, stream, gu_ptr, s_ptr, o_ptr));
-    }
-    mul_silu_slice_fp8_kernel<false, false, 1><<<grid, 192, 0, stream>>>(gu_ptr, s_ptr, o_ptr);
-  }
   return static_cast<int>(cudaGetLastError());
 }
 

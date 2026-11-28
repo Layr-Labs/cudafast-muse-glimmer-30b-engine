@@ -50,68 +50,8 @@ fn disable_coredump() {
 #[cfg(not(target_os = "linux"))]
 fn disable_coredump() {}
 
-#[cfg(target_os = "linux")]
-fn pin_fast_cpus() {
-    if std::env::var("CUDA_ENGINE_PIN_FAST").is_ok_and(|v| v.trim() == "0") {
-        return;
-    }
-    extern "C" {
-        fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u64) -> i32;
-        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u64) -> i32;
-    }
-    let mut allowed = [0u64; 16];
-    if unsafe { sched_getaffinity(0, std::mem::size_of_val(&allowed), allowed.as_mut_ptr()) } != 0 {
-        return;
-    }
-    let mut caps: Vec<(usize, u64)> = Vec::new();
-    for cpu in 0..128usize {
-        if (allowed[cpu / 64] & (1u64 << (cpu % 64))) == 0 {
-            continue;
-        }
-        let cap = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/cpu_capacity"))
-            .or_else(|_| {
-                std::fs::read_to_string(format!(
-                    "/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq"
-                ))
-            })
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(0);
-        if cap > 0 {
-            caps.push((cpu, cap));
-        }
-    }
-    let Some(top) = caps.iter().map(|&(_, c)| c).max() else {
-        return;
-    };
-    let fast: Vec<usize> = caps
-        .iter()
-        .filter(|&&(_, c)| c * 100 >= top * 85)
-        .map(|&(cpu, _)| cpu)
-        .collect();
-    if fast.is_empty() || fast.len() == caps.len() {
-        return;
-    }
-    // Resident pins to the upper Cortex-X925 cluster (CPUs 15-19 on GB10);
-    // prefer the lower Cortex-X925 cluster (< 10) when present so the worker
-    // never contends on the resident's cores.
-    let lower: Vec<usize> = fast.iter().copied().filter(|&c| c < 10).collect();
-    let chosen = if lower.is_empty() { &fast } else { &lower };
-    let mut target = [0u64; 16];
-    for &cpu in chosen {
-        target[cpu / 64] |= 1u64 << (cpu % 64);
-    }
-    unsafe {
-        let _ = sched_setaffinity(0, std::mem::size_of_val(&target), target.as_ptr());
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pin_fast_cpus() {}
-
 fn main() -> ExitCode {
     disable_coredump();
-    pin_fast_cpus();
     let stdin = io::stdin();
     let stdout = io::stdout();
     let out = BufWriter::new(stdout.lock());

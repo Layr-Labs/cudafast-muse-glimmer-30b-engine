@@ -65,7 +65,6 @@ class SampleTile:
     attn_cu_q: torch.Tensor | None = None
     gate_decode1: Decode1Plan | None = None
     down_decode1: Decode1Plan | None = None
-    narrow_rows: int = TILE_ROWS
 
     @contextmanager
     def capture(self):
@@ -219,18 +218,7 @@ def prepare(layer_or_mlp, final_norm=None):
                 aplan = None
             if aplan is not None:
                 attn_plans[proj.weight.data_ptr()] = aplan
-    gate_d1 = _make_decode1(gate)
-    down_d1 = _make_decode1(down)
-    row1_all = (
-        gate_d1 is not None
-        and down_d1 is not None
-        and len(attn_plans) == 2
-        and all(p.decode1 is not None for p in attn_plans.values())
-    )
-    attn_addr, attn_tail_rows, attn_cu_q = _prepare_attn_tail(
-        self_attn, attn_plans, device, allow_tail24=row1_all
-    )
-    narrow_rows = 24 if (row1_all and attn_tail_rows in (8, 24, TILE_ROWS, 2 * TILE_ROWS)) else TILE_ROWS
+    attn_addr, attn_tail_rows, attn_cu_q = _prepare_attn_tail(self_attn, attn_plans, device)
     admitted_weight = getattr(gate, "swiglu_paired_weight", gate.weight)
     return SampleTile(
         admitted_weight.data_ptr(), gate.weight, gate.weight_scale, gate.weight_global_scale,
@@ -239,7 +227,7 @@ def prepare(layer_or_mlp, final_norm=None):
         *_restriction_addresses(layer_or_mlp, final_norm),
         _prepare_qkv(getattr(self_attn, "qkv_proj", None)),
         attn_addr, attn_tail_rows, attn_cu_q,
-        gate_d1, down_d1, narrow_rows,
+        _make_decode1(gate), _make_decode1(down),
     )
 
 
@@ -400,14 +388,14 @@ def _restriction_addresses(layer, final_norm):
     return w.data_ptr(), fw.data_ptr()
 
 
-def _narrow(args, rows_index, per_row, keep_rows: int = TILE_ROWS):
-    """Offset every 512-row tensor argument by (512 - keep_rows) rows; the row-count argument becomes keep_rows (x per_row)."""
-    first = ROWS - keep_rows
+def _narrow(args, rows_index, per_row):
+    """Offset every 512-row tensor argument by 448 rows; the row-count argument becomes 64 (x per_row)."""
+    first = ROWS - TILE_ROWS
     out = list(args)
     for i, t in enumerate(args):
         if isinstance(t, torch.Tensor) and t.dim() >= 1 and t.shape[0] == ROWS and t.numel() >= ROWS:
             out[i] = t[first:]
-    out[rows_index] = keep_rows * per_row
+    out[rows_index] = TILE_ROWS * per_row
     return out
 
 
@@ -423,22 +411,21 @@ def _install_restrict():
         active = _active.get()
         if RESTRICT and active is not None and not kwargs.get("benchmark_run", False):
             tile = active[0]
-            keep = tile.narrow_rows
             name = getattr(getattr(autotuner, "fn", None), "__name__", None)
             tensors = [a for a in args if isinstance(a, torch.Tensor)]
             if name in _POST_ATTN and len(args) >= 8 and args[-2] == ROWS and tile.post_attn_norm_address \
                     and args[2].data_ptr() == tile.post_attn_norm_address:
                 restrict_stats["post_attn"] += 1
-                return inner(autotuner, *_narrow(args, len(args) - 2, 1, keep), **kwargs)
+                return inner(autotuner, *_narrow(args, len(args) - 2, 1), **kwargs)
             if name == _FINAL and len(args) == 11 and args[9] == ROWS and tile.final_norm_address \
                     and args[6].data_ptr() == tile.final_norm_address:
                 restrict_stats["final_norm"] += 1
-                return inner(autotuner, *_narrow(args, 9, 1, keep), **kwargs)
+                return inner(autotuner, *_narrow(args, 9, 1), **kwargs)
             if name == _SIGMOID and len(args) == 4 and args[3] == ROWS * 4096 and any(
                     t.data_ptr() in _restricted_inputs for t in tensors[:2]):
                 if all(t.shape == (ROWS, 4096) and t.is_contiguous() for t in tensors[:3]):
                     restrict_stats["sigmoid"] += 1
-                    return inner(autotuner, *_narrow(args, 3, 4096, keep), **kwargs)
+                    return inner(autotuner, *_narrow(args, 3, 4096), **kwargs)
         return inner(autotuner, *args, **kwargs)
 
     CachingAutotuner.run = run
@@ -512,14 +499,8 @@ def _run_qkv(x, weight, scales, global_scale, qplan):
     return out
 
 
-def _prepare_attn_tail(
-    self_attn,
-    attn_plans: dict[int, AttnSlabPlan],
-    device: torch.device,
-    *,
-    allow_tail24: bool = False,
-):
-    """Bitwise-checked Q[-24:] / Q[-64:] (fallback Q[-128:]) FlashAttention pruning for Layer 51."""
+def _prepare_attn_tail(self_attn, attn_plans: dict[int, AttnSlabPlan], device: torch.device):
+    """Bitwise-checked Q[-64:] (fallback Q[-128:]) FlashAttention pruning for Layer 51."""
     if not RESTRICT or self_attn is None or len(attn_plans) != 2:
         return 0, 0, None
     attn = getattr(self_attn, "attn", None)
@@ -539,20 +520,14 @@ def _prepare_attn_tail(
         return 0, 0, None
     try:
         from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
-        try:
-            import muse_gqa16_attn as _gqa16
-        except Exception:
-            _gqa16 = None
         gen = torch.Generator(device=device).manual_seed(51 * 4096 + 64)
         scale = float(getattr(impl, "scale", 128.0 ** -0.5))
-        q = (torch.randn((ROWS, 32, 128), generator=gen, device=device) * 1.5).to(torch.bfloat16).contiguous()
-        kv_raw = (torch.randn((40, 2, 16, 256), generator=gen, device=device) * 0.5).to(torch.bfloat16).contiguous()
-        k_cache = kv_raw[:, :, :, :128].permute(0, 2, 1, 3)
-        v_cache = kv_raw[:, :, :, 128:].permute(0, 2, 1, 3)
-        bt = torch.arange(40, dtype=torch.int32, device=device).unsqueeze(0).contiguous()
+        q = (torch.randn((ROWS, 32, 128), generator=gen, device=device) * 1.5).to(torch.bfloat16)
+        k_cache = (torch.randn((40, 16, 2, 128), generator=gen, device=device) * 0.5).to(torch.bfloat16)
+        v_cache = (torch.randn((40, 16, 2, 128), generator=gen, device=device) * 0.5).to(torch.bfloat16)
+        bt = torch.arange(40, dtype=torch.int32, device=device).unsqueeze(0)
         cu_512 = torch.tensor([0, ROWS], dtype=torch.int32, device=device)
-        cands = (8, 24, TILE_ROWS, 2 * TILE_ROWS) if allow_tail24 else (TILE_ROWS, 2 * TILE_ROWS)
-        for tail_rows in cands:
+        for tail_rows in (TILE_ROWS, 2 * TILE_ROWS):
             cu_tail = torch.tensor([0, tail_rows], dtype=torch.int32, device=device)
             ok = True
             for seq_k in (ROWS, 640):
@@ -573,17 +548,6 @@ def _prepare_attn_tail(
                 if not torch.equal(ref[ROWS - tail_rows :].view(torch.int16), got.view(torch.int16)):
                     ok = False
                     break
-                if _gqa16 is not None and seq_k == ROWS:
-                    got_gqa = torch.empty((tail_rows, 32, 128), dtype=torch.bfloat16, device=device)
-                    if _gqa16.try_prefill_gqa16(
-                        query=q[ROWS - tail_rows :], kv_cache=kv_raw, output=got_gqa, block_table=bt,
-                        cu_seqlens_q=cu_tail, orig_max_seqlen_q=ROWS, max_seqlen_q=tail_rows,
-                        max_seqlen_k=ROWS, softmax_scale=scale, window=(-1, -1), allow_defer=False,
-                    ):
-                        torch.cuda.synchronize()
-                        if not torch.equal(ref[ROWS - tail_rows :].view(torch.int16), got_gqa.view(torch.int16)):
-                            ok = False
-                            break
             if ok:
                 return id(attn), tail_rows, cu_tail
     except Exception:

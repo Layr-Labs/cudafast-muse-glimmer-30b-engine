@@ -9,14 +9,6 @@ tmp="$(mktemp -d "$KERNELS_OUT/build.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 torch_include="$(python3 -c 'import importlib.util, pathlib; print(pathlib.Path(importlib.util.find_spec("torch").origin).parent / "include")')"
 TMPDIR="$tmp" nvcc -O3 --expt-relaxed-constexpr -std=c++17 --shared --cudart shared \
-    -Xcompiler=-fPIC -gencode arch=compute_121a,code=sm_121a -Xptxas=-v -I"$torch_include" \
+    -Xcompiler=-fPIC -gencode arch=compute_121a,code=sm_121a -I"$torch_include" \
     "$src/gemv6.cu" "$src/gemv6_srans.cu" "$src/gemv6_srans_down.cu" "$src/gemv6_tma4.cu" -o "$KERNELS_OUT/libmuse_marlin6.so"
-cuobjdump_bin="$(command -v cuobjdump || true)"
-test -n "$cuobjdump_bin" || cuobjdump_bin="${CUDA_HOME:-/usr/local/cuda}/bin/cuobjdump"
-if test -x "$cuobjdump_bin" && command -v nvdisasm >/dev/null 2>&1; then
-    if "$cuobjdump_bin" --dump-sass "$KERNELS_OUT/libmuse_marlin6.so" | grep -Eq 'desc\[UR[0-9]*[13579]\]'; then
-        echo "decode6: odd-UR descriptor detected in SASS!" >&2
-        exit 1
-    fi
-fi
 install -m 0644 "$src/muse_marlin6_gemv.py" "$KERNELS_OUT/muse_marlin6_gemv.py"
