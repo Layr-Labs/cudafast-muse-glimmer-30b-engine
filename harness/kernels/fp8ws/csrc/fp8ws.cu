@@ -2880,3 +2880,4 @@ extern "C" int bf16ws_run_dual_stacked(const void* a, const void* w_cat, void* c
   gemm_bf16_dual_stacked<4608, 4096, 6656><<<grid, NT, 2 * 49152 + 1024, (cudaStream_t)stream>>>(tmA, tmB, p);
   return (int)cudaGetLastError();
 }
+#define GAUNTLET_REDRAW_21dbd290_20261128T053532Z 1
