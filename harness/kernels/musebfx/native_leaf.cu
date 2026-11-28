@@ -3821,7 +3821,7 @@ void native_leaf_setup_tree(
     p.min_n = env_i("MUSE_PL_MIN_N", 4);
     p.mid_min_n = env_i("MUSE_PL_MID_MIN_N", 4);
     p.miss_gate = env_i("MUSE_PL_MISS_GATE", 3);
-    p.in_top6_floor = env_i("MUSE_PL_IN_TOP6_FLOOR", 1);
+    p.in_top6_floor = env_i("MUSE_PL_IN_TOP6_FLOOR", 0);
     p.cont_from_df_n = env_i("MUSE_PL_CONT_FROM_DF_N", 3);
     p.max_dp_4 = env_i("MUSE_PL_MAX_DP4", 3);
     p.max_dp_5 = env_i("MUSE_PL_MAX_DP5", 4);
