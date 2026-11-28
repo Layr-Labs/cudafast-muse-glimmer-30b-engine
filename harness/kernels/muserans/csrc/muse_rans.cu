@@ -335,13 +335,13 @@ __device__ __forceinline__ float rans_triton_silu(float gate) {
   return result;
 }
 __device__ __forceinline__ uint32_t rans_pack_fp8x4(float v0, float v1, float v2, float v3) {
-  auto cl = [](float v) {
-    return (v != v) ? 448.0f : (v < -448.0f ? -448.0f : (v > 448.0f ? 448.0f : v));
-  };
+  // Single-instruction fminf(v, 448.0f) (PTX min.f32 / IEEE minNum) maps NaN -> +448.0f (0x7E)
+  // while cvt.rn.satfinite.e4m3x2.f32 saturates all finite/±Inf values to [-448, +448] (exact 0-ULP
+  // across all 2^32 FP32 bit patterns).
   uint16_t lo, hi;
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(cl(v1)), "f"(cl(v0)));
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(cl(v3)), "f"(cl(v2)));
-  return (uint32_t)lo | ((uint32_t)hi << 16);
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(fminf(v1, 448.0f)), "f"(fminf(v0, 448.0f)));
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(fminf(v3, 448.0f)), "f"(fminf(v2, 448.0f)));
+  return __byte_perm(static_cast<uint32_t>(lo), static_cast<uint32_t>(hi), 0x5410u);
 }
 
 __device__ __forceinline__ uint32_t rans_inv_m24(int m) {
@@ -958,6 +958,17 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
               for (int s = cs; s < s_end; ++s) {
                 do_k_step(s, false);
               }
+            } else if (pb.unroll2 == 2 && trig_s >= cs && trig_s < s_end &&
+                       (((trig_s - cs) & 3) == 0) && (((s_end - trig_s) & 3) == 0)) {
+#pragma unroll 4
+              for (int s = cs; s < trig_s; ++s) {
+                do_k_step(s, false);
+              }
+              asm volatile("griddepcontrol.launch_dependents;");
+#pragma unroll 4
+              for (int s = trig_s; s < s_end; ++s) {
+                do_k_step(s, false);
+              }
             } else if (pb.unroll2 && (n_s & 1) == 0 && (trig_s < cs || trig_s >= s_end)) {
 #pragma unroll 2
               for (int s = cs; s < s_end; ++s) {
@@ -973,6 +984,16 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             if (pb.unroll2 == 2 && cs + kChunkSteps <= S && (trig_s < cs || trig_s >= cs + kChunkSteps)) {
 #pragma unroll 4
               for (int sl = 0; sl < kChunkSteps; ++sl) {
+                do_k_step(cs + sl, false);
+              }
+            } else if (pb.unroll2 == 2 && cs + kChunkSteps <= S && trig_s == cs + (kChunkSteps / 2)) {
+#pragma unroll 4
+              for (int sl = 0; sl < kChunkSteps / 2; ++sl) {
+                do_k_step(cs + sl, false);
+              }
+              asm volatile("griddepcontrol.launch_dependents;");
+#pragma unroll 4
+              for (int sl = kChunkSteps / 2; sl < kChunkSteps; ++sl) {
                 do_k_step(cs + sl, false);
               }
             } else if (pb.unroll2 && cs + kChunkSteps <= S && (trig_s < cs || trig_s >= cs + kChunkSteps)) {

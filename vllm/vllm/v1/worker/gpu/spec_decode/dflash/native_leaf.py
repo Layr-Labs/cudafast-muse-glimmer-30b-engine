@@ -88,7 +88,7 @@ TREE_CALIB = os.environ.get("MUSE_TREE_CALIB", "1").strip() not in ("0", "", "fa
 TREE_HIGH_ACC_CPC = float(os.environ.get("MUSE_TREE_HIGH_ACC_CPC", "0"))
 LEAF_STATS = os.environ.get("MUSE_LEAF_STATS", "0").strip() in ("1", "true", "yes")
 TR_ENABLED = os.environ.get("MUSE_TR_MODE", "1").strip() not in ("0", "", "false", "no")
-OOV_PREADMIT = os.environ.get("MUSE_OOV_PREADMIT", "2").strip() not in ("0", "", "false", "no")
+OOV_PREADMIT = os.environ.get("MUSE_OOV_PREADMIT", "3").strip() not in ("0", "", "false", "no")
 try:
     _TREE_K_RAW = int(os.environ.get("MUSE_TREE_K", "8").strip() or "8")
 except ValueError:

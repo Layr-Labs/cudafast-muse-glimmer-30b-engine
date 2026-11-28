@@ -250,11 +250,10 @@ __device__ __forceinline__ float marlin_full_rcp(float s) {
 }
 
 __device__ __forceinline__ uint16_t marlin_pack_fp8x2(float v0, float v1) {
-  auto cl = [](float v) {
-    return (v != v) ? 448.0f : (v < -448.0f ? -448.0f : (v > 448.0f ? 448.0f : v));
-  };
+  // Single-instruction fminf(v, 448.0f) maps NaN -> +448.0f (0x7E) while
+  // cvt.rn.satfinite.e4m3x2.f32 saturates finite/±Inf to [-448, +448] (0-ULP across all 2^32 FP32 patterns).
   uint16_t lo;
-  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(cl(v1)), "f"(cl(v0)));
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(fminf(v1, 448.0f)), "f"(fminf(v0, 448.0f)));
   return lo;
 }
 

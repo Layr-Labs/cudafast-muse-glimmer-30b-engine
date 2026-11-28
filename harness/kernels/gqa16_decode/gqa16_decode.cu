@@ -5021,18 +5021,19 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
     return;
   }
 
-  // Prologue: load Q into kv[2] (aliased as q_tiles[4][16][16]) AND prime block-0 K[0]/K[1](/tree_K)
+  // Prologue: load Q into kv[2] (dual-warp cooperative) AND prime block-0 K[0]/K[1](/tree_K)
   // into kv[0]/kv[1](/tree_kv) concurrently so block-0 K overlaps Q ldsm4 + accumulator init!
   const uint64_t kv_l2_pol = (kKvL2 == 2) ? kv_pol_evict_last() : 0ull;
   uint32_t q_frag[8][4];
   {
     uint4 (*q_tiles)[16][16] = reinterpret_cast<uint4 (*)[16][16]>(smem.kv[2]);
-    if (my_active && w_sub == 0) {
+    if (my_active) {
       const __nv_bfloat16* q_tok_base = q_ptr + static_cast<int64_t>(q0 + my_q_idx) * q_tok_stride +
                                         static_cast<int64_t>(kv_head * 16) * q_head_stride;
+      const int u0 = w_sub << 2;
       #pragma unroll
-      for (int u = 0; u < 8; ++u) {
-        const int idx = (u << 5) + lane;
+      for (int u = 0; u < 4; ++u) {
+        const int idx = ((u0 + u) << 5) + lane;
         const int m = idx >> 4;
         const int c = idx & 15;
         q_tiles[q_slot][m][c ^ (m & 7)] =
@@ -5044,10 +5045,12 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
         smem.kv[0], kv_ptr, block_table, nb0_tok_base,
         cta_k_start, cta_seqlen_k, block_size, kv_head,
         stride_block, stride_slot, stride_kv_head, tid, kv_l2_pol);
-    issue_kv64_v4<false, kKvL2>(
-        smem.kv[1], kv_ptr, block_table, nb0_tok_base + 64,
-        cta_k_start, cta_seqlen_k, block_size, kv_head,
-        stride_block, stride_slot, stride_kv_head, tid, kv_l2_pol);
+    if (nb0_tok_base + 64 < cta_seqlen_k) {
+      issue_kv64_v4<false, kKvL2>(
+          smem.kv[1], kv_ptr, block_table, nb0_tok_base + 64,
+          cta_k_start, cta_seqlen_k, block_size, kv_head,
+          stride_block, stride_slot, stride_kv_head, tid, kv_l2_pol);
+    }
     if (cta_has_remap && (nb0_tok_base + 128 > cta_remap_min_base)) {
       issue_tree_kv_v4<false, kKvL2>(
           smem.tree_kv, kv_ptr, block_table, cta_p_start, actual_m,
@@ -5077,8 +5080,10 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
 
   for (int nb = cta_nb_max - 1; nb >= cta_nb_min; --nb) {
     const int block_tok_base = nb << 7;
+    const bool has_hi = (block_tok_base + 64 < cta_seqlen_k);
     const bool nb_has_remap = cta_has_remap && (block_tok_base + 128 > cta_remap_min_base);
     const bool my_in_block = my_active && (nb < my_num_nb) && (nb >= my_nb_min);
+    const bool my_do_qk = my_in_block && (w_sub == 0 || has_hi);
 
     // Barrier #1: K[0] (kv[s0]) & K[1] (kv[s1]) ready; kv[s2] (prior Q or PV1) is now free!
     cp_async_wait<0>();
@@ -5108,10 +5113,10 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
     }
 
     // -------------------------------------------------------------------------
-    // 1. QK^T: w_sub=0 reads kv[s0] (0..63), w_sub=1 reads kv[s1] (64..127).
+    // 1. QK^T: w_sub=0 reads kv[s0] (0..63), w_sub=1 reads kv[s1] (64..127) iff has_hi.
     // -------------------------------------------------------------------------
     if (!nb_has_remap) {
-      if (my_in_block) {
+      if (my_do_qk) {
         const uint4 (*my_k_tile)[16] = (w_sub == 0) ? smem.kv[s0] : smem.kv[s1];
         uint32_t b_cur[4], b_nxt[4];
         ldsm4_k_pair64_v3(b_cur, my_k_tile, 0, 0, lane);
@@ -5129,7 +5134,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
         }
       }
     } else {
-      if (my_in_block) {
+      if (my_do_qk) {
         const uint4 (*my_k_tile)[16] = (w_sub == 0) ? smem.kv[s0] : smem.kv[s1];
         const int chunk_base = block_tok_base + (w_sub << 6);
         const int r_local = lane & 7;
@@ -5175,7 +5180,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
     }
 
     // Local QK masking + row max per half before Barrier #2 (publishes max_exch & frees kv[s0]/kv[s1]/tree_kv).
-    if (my_in_block) {
+    if (my_do_qk) {
       const int chunk_base = block_tok_base + (w_sub << 6);
       const bool need_mask = (chunk_base < my_k_start) || (chunk_base + 64 > my_seqlen_k);
       float m0 = -INFINITY, m1 = -INFINITY;
@@ -5214,11 +5219,13 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
           block_size, kv_head, stride_block, stride_slot, stride_kv_head, tid, kv_l2_pol);
       cp_async_commit();
     }
-    issue_kv64_v4<true, kKvL2>(
-        smem.kv[s0], kv_ptr, block_table, block_tok_base + 64,
-        cta_k_start, cta_seqlen_k, block_size, kv_head,
-        stride_block, stride_slot, stride_kv_head, tid, kv_l2_pol);
-    cp_async_commit();
+    if (has_hi) {
+      issue_kv64_v4<true, kKvL2>(
+          smem.kv[s0], kv_ptr, block_table, block_tok_base + 64,
+          cta_k_start, cta_seqlen_k, block_size, kv_head,
+          stride_block, stride_slot, stride_kv_head, tid, kv_l2_pol);
+      cp_async_commit();
+    }
     if (nb > cta_nb_min) {
       issue_kv64_v4<false, kKvL2>(
           smem.kv[s1], kv_ptr, block_table, (nb - 1) << 7,
@@ -5233,10 +5240,14 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
       }
     }
 
-    // Parallel softmax across both warps (exact FA2 math order).
+    // Parallel softmax across both warps (exact FA2 math order; skips dead upper half when !has_hi).
     if (my_in_block) {
-      const float m0 = max_ftz_f32(smem.max_exch[q_slot][0][group_id], smem.max_exch[q_slot][1][group_id]);
-      const float m1 = max_ftz_f32(smem.max_exch[q_slot][0][group_id + 8], smem.max_exch[q_slot][1][group_id + 8]);
+      const float m0 = has_hi
+          ? max_ftz_f32(smem.max_exch[q_slot][0][group_id], smem.max_exch[q_slot][1][group_id])
+          : smem.max_exch[q_slot][0][group_id];
+      const float m1 = has_hi
+          ? max_ftz_f32(smem.max_exch[q_slot][0][group_id + 8], smem.max_exch[q_slot][1][group_id + 8])
+          : smem.max_exch[q_slot][0][group_id + 8];
 
       float sc0 = 1.0f, sc1 = 1.0f;
       if (my_is_first) {
@@ -5259,59 +5270,67 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
         }
       }
 
-      const float max_sc0 = (row_max0 == -INFINITY) ? 0.0f : mul_ftz_f32(scale_log2, row_max0);
-      const float max_sc1 = (row_max1 == -INFINITY) ? 0.0f : mul_ftz_f32(scale_log2, row_max1);
-      #pragma unroll
-      for (int ni = 0; ni < 8; ++ni) {
-        const float s0_v = s_frag[ni][0];
-        const float s1_v = s_frag[ni][1];
-        const float s2_v = s_frag[ni][2];
-        const float s3_v = s_frag[ni][3];
-        const float p0 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s0_v, scale_log2), max_sc0));
-        const float p1 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s1_v, scale_log2), max_sc0));
-        const float p2 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s2_v, scale_log2), max_sc1));
-        const float p3 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s3_v, scale_log2), max_sc1));
-        if (w_sub == 0) {
-          if (ni == 0) {
-            if (my_is_first) {
-              row_sum0 = add_ftz_f32(p0, p1);
-              row_sum1 = add_ftz_f32(p2, p3);
+      if (w_sub == 0 || has_hi) {
+        const float max_sc0 = (row_max0 == -INFINITY) ? 0.0f : mul_ftz_f32(scale_log2, row_max0);
+        const float max_sc1 = (row_max1 == -INFINITY) ? 0.0f : mul_ftz_f32(scale_log2, row_max1);
+        #pragma unroll
+        for (int ni = 0; ni < 8; ++ni) {
+          const float s0_v = s_frag[ni][0];
+          const float s1_v = s_frag[ni][1];
+          const float s2_v = s_frag[ni][2];
+          const float s3_v = s_frag[ni][3];
+          const float p0 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s0_v, scale_log2), max_sc0));
+          const float p1 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s1_v, scale_log2), max_sc0));
+          const float p2 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s2_v, scale_log2), max_sc1));
+          const float p3 = fast_exp2f(sub_ftz_f32(mul_ftz_f32(s3_v, scale_log2), max_sc1));
+          if (w_sub == 0) {
+            if (ni == 0) {
+              if (my_is_first) {
+                row_sum0 = add_ftz_f32(p0, p1);
+                row_sum1 = add_ftz_f32(p2, p3);
+              } else {
+                row_sum0 = add_ftz_f32(fma_rn_ftz_f32(row_sum0, sc0, p0), p1);
+                row_sum1 = add_ftz_f32(fma_rn_ftz_f32(row_sum1, sc1, p2), p3);
+              }
             } else {
-              row_sum0 = add_ftz_f32(fma_rn_ftz_f32(row_sum0, sc0, p0), p1);
-              row_sum1 = add_ftz_f32(fma_rn_ftz_f32(row_sum1, sc1, p2), p3);
+              row_sum0 = add_ftz_f32(add_ftz_f32(row_sum0, p0), p1);
+              row_sum1 = add_ftz_f32(add_ftz_f32(row_sum1, p2), p3);
             }
           } else {
-            row_sum0 = add_ftz_f32(add_ftz_f32(row_sum0, p0), p1);
-            row_sum1 = add_ftz_f32(add_ftz_f32(row_sum1, p2), p3);
+            smem.p_hi_f32[q_slot][ni][lane] = make_float4(p0, p1, p2, p3);
           }
-        } else {
-          smem.p_hi_f32[q_slot][ni][lane] = make_float4(p0, p1, p2, p3);
+          const __nv_bfloat162 pb0 = __floats2bfloat162_rn(p0, p1);
+          const __nv_bfloat162 pb1 = __floats2bfloat162_rn(p2, p3);
+          const int kp = ni >> 1;
+          const int hi = (ni & 1) << 1;
+          s_frag[kp][hi + 0] = __uint_as_float(*reinterpret_cast<const uint32_t*>(&pb0));
+          s_frag[kp][hi + 1] = __uint_as_float(*reinterpret_cast<const uint32_t*>(&pb1));
         }
-        const __nv_bfloat162 pb0 = __floats2bfloat162_rn(p0, p1);
-        const __nv_bfloat162 pb1 = __floats2bfloat162_rn(p2, p3);
-        const int kp = ni >> 1;
-        const int hi = (ni & 1) << 1;
-        s_frag[kp][hi + 0] = __uint_as_float(*reinterpret_cast<const uint32_t*>(&pb0));
-        s_frag[kp][hi + 1] = __uint_as_float(*reinterpret_cast<const uint32_t*>(&pb1));
-      }
-      if (w_sub == 0) {
-        #pragma unroll
-        for (int kp = 0; kp < 4; ++kp) {
-          smem.p_lo_bf16[q_slot][kp][lane] = make_uint4(
-              __float_as_uint(s_frag[kp][0]),
-              __float_as_uint(s_frag[kp][1]),
-              __float_as_uint(s_frag[kp][2]),
-              __float_as_uint(s_frag[kp][3]));
+        if (w_sub == 0) {
+          #pragma unroll
+          for (int kp = 0; kp < 4; ++kp) {
+            smem.p_lo_bf16[q_slot][kp][lane] = make_uint4(
+                __float_as_uint(s_frag[kp][0]),
+                __float_as_uint(s_frag[kp][1]),
+                __float_as_uint(s_frag[kp][2]),
+                __float_as_uint(s_frag[kp][3]));
+          }
         }
       }
       my_is_first = false;
     }
 
-    // Barrier #3: V[0] (kv[s2]) (+ tree_V if remap), p_lo_bf16, and p_hi_f32 are ready!
-    if (nb > cta_nb_min) {
-      cp_async_wait<2>();
-    } else {
+    // Barrier #3: V[0] (kv[s2]) (+ tree_V if remap), p_lo_bf16, and p_hi_f32 (if has_hi) are ready!
+    if (has_hi) {
+      if (nb > cta_nb_min) {
+        cp_async_wait<2>();
+      } else {
+        cp_async_wait<1>();
+      }
+    } else if (nb > cta_nb_min) {
       cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
     }
     __syncthreads();
 
@@ -5341,7 +5360,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
             if (n_ks < 4) ldsm4_v_pair64_v3(v_nxt, smem.kv[s2], dp_base + n_dp, n_ks, lane);
             mma_m16n8k16_bf16_u2(p_cur, v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
             mma_m16n8k16_bf16_u2(p_cur, v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
-            if (w_sub == 0 && (dp == 0 || dp == 2)) {
+            if (has_hi && w_sub == 0 && (dp == 0 || dp == 2)) {
               const int ni = (ks_local << 1) + (dp >> 1);
               const float4 ph = smem.p_hi_f32[q_slot][ni][lane];
               row_sum0 = add_ftz_f32(add_ftz_f32(row_sum0, ph.x), ph.y);
@@ -5403,7 +5422,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
             }
             mma_m16n8k16_bf16_u2(p_cur, v_cur[0], v_cur[1], o_frag[dp * 2 + 0]);
             mma_m16n8k16_bf16_u2(p_cur, v_cur[2], v_cur[3], o_frag[dp * 2 + 1]);
-            if (w_sub == 0 && (dp == 0 || dp == 2)) {
+            if (has_hi && w_sub == 0 && (dp == 0 || dp == 2)) {
               const int ni = (ks_local << 1) + (dp >> 1);
               const float4 ph = smem.p_hi_f32[q_slot][ni][lane];
               row_sum0 = add_ftz_f32(add_ftz_f32(row_sum0, ph.x), ph.y);
@@ -5419,13 +5438,17 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
       }
     }
 
-    // Barrier #4: V[1] (kv[s0]) ready AND kv[s2] (V[0]) is now free for next K[1]!
-    if (nb > cta_nb_min) {
-      cp_async_wait<1>();
-    } else {
-      cp_async_wait<0>();
+    // Barrier #4: V[1] (kv[s0]) ready (if has_hi) AND kv[s2] (V[0]) is now free for next K[1]!
+    if (has_hi) {
+      if (nb > cta_nb_min) {
+        cp_async_wait<1>();
+      } else {
+        cp_async_wait<0>();
+      }
+      __syncthreads();
+    } else if (nb > cta_nb_min) {
+      __syncthreads();
     }
-    __syncthreads();
 
     // Issue next K[1] into free kv[s2] BEFORE PV Half 1 (hidden behind PV Half 1's 32 MMAs!).
     if (nb > cta_nb_min) {
@@ -5437,8 +5460,9 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
     }
 
     // -------------------------------------------------------------------------
-    // 3B. PV Half 1 (reads kv[s0] [+ tree_kv]); BOTH warps hold p_hi in s_frag[0..3]!
+    // 3B. PV Half 1 (reads kv[s0] [+ tree_kv]); skipped entirely when !has_hi!
     // -------------------------------------------------------------------------
+    if (has_hi) {
     if (!nb_has_remap) {
       if (my_in_block) {
         uint32_t v_cur[4], v_nxt[4];
@@ -5511,6 +5535,7 @@ __global__ __launch_bounds__(256, 1) void gqa16_verify_v4_ring3_kernel(
         }
       }
     }
+    }  // if (has_hi)
 
     // Rotate 3-slot ring with zero end-of-loop barrier:
     //   next s0 = s1 (next K[0]), next s1 = s2 (next K[1]), next s2 = s0 (old V[1], freed at next Barrier #1).
@@ -7291,7 +7316,9 @@ __device__ __forceinline__ float triton_sigmoid(float x) {
 }
 
 __device__ __forceinline__ float clamp448(float x) {
-  return fminf(fmaxf(x, -448.0f), 448.0f);
+  // Single-instruction fminf(x, 448.0f) maps NaN -> +448.0f (matching fminf(fmaxf(NaN,-448),448)=448)
+  // while cvt.rn.satfinite.e4m3x2.f32 saturates all finite/±Inf values to [-448, +448] (strict 0-ULP).
+  return fminf(x, 448.0f);
 }
 
 __device__ __forceinline__ uint16_t fp8x2(float a, float b) {

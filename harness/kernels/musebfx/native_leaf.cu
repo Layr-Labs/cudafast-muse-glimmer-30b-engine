@@ -4107,7 +4107,7 @@ void native_leaf_commit_tree(
   const int eff_vocab = static_cast<int>(vocab_size > 0 ? vocab_size : 202048);
   static const int oov_preadmit_env = []() -> int {
     const char* s = std::getenv("MUSE_OOV_PREADMIT");
-    return (!s || !*s) ? 2 : static_cast<int>(std::strtol(s, nullptr, 10));
+    return (!s || !*s) ? 3 : static_cast<int>(std::strtol(s, nullptr, 10));
   }();
   const uint8_t* in_sv_ptr = nullptr;
   int32_t* t_ids_ptr = nullptr;
