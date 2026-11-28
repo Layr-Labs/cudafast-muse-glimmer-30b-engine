@@ -1493,13 +1493,16 @@ __device__ __forceinline__ float int3_swiglu_f32(float gate, float up) {
 
 template <int kMaxM>
 struct alignas(128) Int3N32PairSmem {
-  alignas(128) uint8_t w[3][2 * kSymN32StepWBytes];     // 3 * 1600 B = 4800 B (exact 64B TMA-aligned!)
-  alignas(128) __nv_bfloat16 a[2][2][kMaxM][64];        // 2 stages x BK=128 (4 KiB M<=8, 8 KiB M<=16)
-  alignas(8) uint32_t lut64[64];                        // 256 B
-  alignas(8) uint64_t mbar[3];                          // 24 B -> 9.2 KiB (M<=8) / 13.3 KiB (M<=16) -> 6 CTAs/SM!
+  static constexpr int kWStages = (kMaxM <= 8) ? 7 : 4;
+  alignas(128) uint8_t w[kWStages][2 * kSymN32StepWBytes];  // 7*1600=11200 B (M<=8) or 4*1600=6400 B (M<=16)
+  alignas(128) __nv_bfloat16 a[2][2][kMaxM][64];            // 2 stages x BK=128 (4 KiB M<=8, 8 KiB M<=16)
+  alignas(8) uint32_t lut64[64];                            // 256 B
+  alignas(8) uint64_t mbar[kWStages];                       // 56 B -> 15.6 KiB (M<=8) / 14.9 KiB (M<=16) -> 6 CTAs/SM!
 };
+static_assert(sizeof(Int3N32PairSmem<8>) <= 16384 && sizeof(Int3N32PairSmem<16>) <= 16384,
+              "Int3N32PairSmem must preserve 6 CTAs/SM (288 single-wave) on SM121");
 
-// BK=128 paired 32-row/CTA sym NF3-g64 kernel (1600B Hardware-TMA + L2::evict_first, 6 CTAs/SM = 288 >= 208).
+// BK=128 paired 32-row/CTA sym NF3-g64 kernel (7-stage 1600B Hardware-TMA + L2::evict_first, 6 CTAs/SM = 288 >= 208).
 template <bool kM16, bool kTma>
 __global__ void __launch_bounds__(128, 6) int3_mma_gemm_n32_pair_kernel(
     const __nv_bfloat16* __restrict__ A,
@@ -1510,7 +1513,10 @@ __global__ void __launch_bounds__(128, 6) int3_mma_gemm_n32_pair_kernel(
   constexpr int kN32StepWB = kSymN32StepWBytes;
   constexpr int kPairStepWB = 2 * kSymN32StepWBytes;    // 1600 B = 25 * 64 B
   constexpr int kPairStepU4 = kPairStepWB / 16;         // 100 (< 128)
-  __shared__ Int3N32PairSmem<kM16 ? 16 : 8> smem;
+  using PairSmem = Int3N32PairSmem<kM16 ? 16 : 8>;
+  constexpr int kWStages = PairSmem::kWStages;
+  constexpr int kWPre = kWStages - 1;                   // 6 (M<=8) or 3 (M<=16)
+  __shared__ PairSmem smem;
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
@@ -1524,7 +1530,7 @@ __global__ void __launch_bounds__(128, 6) int3_mma_gemm_n32_pair_kernel(
 
   if constexpr (kTma) {
     if (tid == 0) {
-      int3_mbar_init(smem.mbar, 3);
+      int3_mbar_init(smem.mbar, kWStages);
     }
     __syncthreads();
   }
@@ -1607,7 +1613,7 @@ __global__ void __launch_bounds__(128, 6) int3_mma_gemm_n32_pair_kernel(
   const int trig_p = ((pdl_mode & 2) != 0) ? ((num_pairs > 2) ? (num_pairs - 2) : 0) : -1;
 
   if constexpr (kTma) {
-    const int w_pre = (num_pairs < 2) ? num_pairs : 2;
+    const int w_pre = (num_pairs < kWPre) ? num_pairs : kWPre;
     for (int i = 0; i < w_pre; ++i) {
       issue_w_tma(i, i, false);
     }
@@ -1633,9 +1639,9 @@ __global__ void __launch_bounds__(128, 6) int3_mma_gemm_n32_pair_kernel(
       }
       __syncthreads();
 
-      if (p + 2 < num_pairs) {
-        const int next_st_w = (st_w == 0) ? 2 : (st_w - 1);
-        issue_w_tma(p + 2, next_st_w, true);
+      if (p + kWPre < num_pairs) {
+        const int next_st_w = (st_w == 0) ? (kWStages - 1) : (st_w - 1);
+        issue_w_tma(p + kWPre, next_st_w, true);
       }
       if (p >= 1 && p + 1 < num_pairs) {
         issue_a_async(p + 1, st_a ^ 1);
@@ -1667,7 +1673,7 @@ __global__ void __launch_bounds__(128, 6) int3_mma_gemm_n32_pair_kernel(
         }
       }
 
-      if (++st_w == 3) {
+      if (++st_w == kWStages) {
         st_w = 0;
         par_w ^= 1u;
       }

@@ -1099,11 +1099,21 @@ struct alignas(128) Vq4dN32StageSmem {
 
 template <int kMaxM, int kBits>
 struct alignas(128) Vq4dN32PairSmem {
-  alignas(128) uint8_t w[3][2 * vq4d_n32_step_bytes<kBits>()];   // 3 * 1216 B or 3 * 1344 B (64B TMA-aligned!)
-  alignas(128) __nv_bfloat16 a[2][2][kMaxM][64];                 // 2 stages x BK=128 (4 KiB M<=8, 8 KiB M<=16)
-  alignas(8) uint2 lut[vq4d_lut_size<kBits>()];                  // 2 KiB or 4 KiB
-  alignas(8) uint64_t mbar[3];                                   // 24 B -> 13.9 KiB (9b) / 16.3 KiB (10b) -> 6 CTAs/SM!
+  // Deep-TMA weight ring sized to fit <= 16 KiB/CTA (exact 6 CTAs/SM = 288 single-wave on GB10):
+  //   M<=8, 10b: a(4096) + w[6](8064) + lut(4096) + mbar(48) = 16304 -> 16384 B (5 TMA stages in flight)
+  //   M<=8,  9b: a(4096) + w[8](9728) + lut(2048) + mbar(64) = 15936 -> 16000 B (7 TMA stages in flight)
+  //   M<=16,10b: a(8192) + w[3](4032) + lut(4096) + mbar(24) = 16344 -> 16384 B (placing a before w eliminates 64B pad)
+  static constexpr int kWStages = (kMaxM <= 8) ? ((kBits == 9) ? 8 : 6) : 3;
+  alignas(128) __nv_bfloat16 a[2][2][kMaxM][64];                       // 2 stages x BK=128 (4 KiB M<=8, 8 KiB M<=16)
+  alignas(128) uint8_t w[kWStages][2 * vq4d_n32_step_bytes<kBits>()];  // 64B TMA-aligned per stage
+  alignas(8) uint2 lut[vq4d_lut_size<kBits>()];                        // 2 KiB (9b) or 4 KiB (10b)
+  alignas(8) uint64_t mbar[kWStages];                                  // 24/48/64 B -> all <= 16384 B -> 6 CTAs/SM!
 };
+
+static_assert(sizeof(Vq4dN32PairSmem<8, 9>) <= 16384, "Vq4dN32PairSmem<8,9> must fit 6 CTAs/SM");
+static_assert(sizeof(Vq4dN32PairSmem<8, 10>) <= 16384, "Vq4dN32PairSmem<8,10> must fit 6 CTAs/SM");
+static_assert(sizeof(Vq4dN32PairSmem<16, 9>) <= 16384, "Vq4dN32PairSmem<16,9> must fit 6 CTAs/SM");
+static_assert(sizeof(Vq4dN32PairSmem<16, 10>) <= 16384, "Vq4dN32PairSmem<16,10> must fit 6 CTAs/SM");
 
 // BK=128 paired 32-row/CTA single-wave kernel (1216B/1344B Hardware-TMA + L2::evict_first, 6 CTAs/SM = 288 >= 208).
 template <bool kM16, int kBits, bool kTma>
@@ -1116,7 +1126,10 @@ __global__ void __launch_bounds__(128, 6) vq4d_mma_gemm_n32_pair_kernel(
   constexpr int kN32StepWB = vq4d_n32_step_bytes<kBits>();
   constexpr int kPairStepWB = 2 * kN32StepWB;  // 1216 B (9b) or 1344 B (10b)
   constexpr int kPairStepU4 = kPairStepWB / 16;  // 76 or 84 (< 128)
-  __shared__ Vq4dN32PairSmem<kM16 ? 16 : 8, kBits> smem;
+  using SmemT = Vq4dN32PairSmem<kM16 ? 16 : 8, kBits>;
+  constexpr int kWStages = SmemT::kWStages;
+  constexpr int kWPre = kWStages - 1;
+  __shared__ SmemT smem;
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
@@ -1130,7 +1143,7 @@ __global__ void __launch_bounds__(128, 6) vq4d_mma_gemm_n32_pair_kernel(
 
   if constexpr (kTma) {
     if (tid == 0) {
-      vq4d_mbar_init(smem.mbar, 3);
+      vq4d_mbar_init(smem.mbar, kWStages);
     }
     __syncthreads();
   }
@@ -1213,7 +1226,7 @@ __global__ void __launch_bounds__(128, 6) vq4d_mma_gemm_n32_pair_kernel(
   const int trig_p = ((pdl_mode & 2) != 0) ? ((num_pairs > 2) ? (num_pairs - 2) : 0) : -1;
 
   if constexpr (kTma) {
-    const int w_pre = (num_pairs < 2) ? num_pairs : 2;
+    const int w_pre = (num_pairs < kWPre) ? num_pairs : kWPre;
     for (int i = 0; i < w_pre; ++i) {
       issue_w_tma(i, i, false);
     }
@@ -1239,9 +1252,9 @@ __global__ void __launch_bounds__(128, 6) vq4d_mma_gemm_n32_pair_kernel(
       }
       __syncthreads();
 
-      if (p + 2 < num_pairs) {
-        const int next_st_w = (st_w == 0) ? 2 : (st_w - 1);
-        issue_w_tma(p + 2, next_st_w, true);
+      if (p + kWPre < num_pairs) {
+        const int next_st_w = (st_w == 0) ? (kWStages - 1) : (st_w - 1);
+        issue_w_tma(p + kWPre, next_st_w, true);
       }
       if (p >= 1 && p + 1 < num_pairs) {
         issue_a_async(p + 1, st_a ^ 1);
@@ -1273,7 +1286,7 @@ __global__ void __launch_bounds__(128, 6) vq4d_mma_gemm_n32_pair_kernel(
         }
       }
 
-      if (++st_w == 3) {
+      if (++st_w == kWStages) {
         st_w = 0;
         par_w ^= 1u;
       }

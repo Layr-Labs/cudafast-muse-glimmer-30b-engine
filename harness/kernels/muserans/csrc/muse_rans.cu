@@ -59,7 +59,7 @@ __device__ __forceinline__ void rans_mma_e4m3_m16(float& d0, float& d1, float& d
 #endif
 }
 __device__ __forceinline__ uint64_t rans_policy_evict_first() { uint64_t pol; asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol)); return pol; }
-__device__ __forceinline__ void rans_cp_async16_s(uint32_t smem_dst, const void* gsrc, uint64_t pol) { asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(smem_dst), "l"(gsrc), "l"(pol)); }
+__device__ __forceinline__ void rans_cp_async16_s(uint32_t smem_dst, const void* gsrc, uint64_t pol) { asm volatile("cp.async.cg.shared.global.L2::256B.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(smem_dst), "l"(gsrc), "l"(pol)); }
 __device__ __forceinline__ void rans_cp_async16_ca(uint32_t smem_dst, const void* gsrc) { asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(smem_dst), "l"(gsrc)); }
 __device__ __forceinline__ void rans_cp_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
 template <int N>
@@ -958,6 +958,17 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
               for (int s = cs; s < s_end; ++s) {
                 do_k_step(s, false);
               }
+            } else if (pb.unroll2 == 2 && trig_s >= cs && trig_s < s_end &&
+                       (((trig_s - cs) & 3) == 0) && (((s_end - trig_s) & 3) == 0)) {
+#pragma unroll 4
+              for (int s = cs; s < trig_s; ++s) {
+                do_k_step(s, false);
+              }
+              asm volatile("griddepcontrol.launch_dependents;");
+#pragma unroll 4
+              for (int s = trig_s; s < s_end; ++s) {
+                do_k_step(s, false);
+              }
             } else if (pb.unroll2 && (n_s & 1) == 0 && (trig_s < cs || trig_s >= s_end)) {
 #pragma unroll 2
               for (int s = cs; s < s_end; ++s) {
@@ -973,6 +984,16 @@ __global__ void __launch_bounds__(kMaxThreads, 1) rans_gemv_kernel(RansProb pb) 
             if (pb.unroll2 == 2 && cs + kChunkSteps <= S && (trig_s < cs || trig_s >= cs + kChunkSteps)) {
 #pragma unroll 4
               for (int sl = 0; sl < kChunkSteps; ++sl) {
+                do_k_step(cs + sl, false);
+              }
+            } else if (pb.unroll2 == 2 && cs + kChunkSteps <= S && trig_s == cs + (kChunkSteps / 2)) {
+#pragma unroll 4
+              for (int sl = 0; sl < kChunkSteps / 2; ++sl) {
+                do_k_step(cs + sl, false);
+              }
+              asm volatile("griddepcontrol.launch_dependents;");
+#pragma unroll 4
+              for (int sl = kChunkSteps / 2; sl < kChunkSteps; ++sl) {
                 do_k_step(cs + sl, false);
               }
             } else if (pb.unroll2 && cs + kChunkSteps <= S && (trig_s < cs || trig_s >= cs + kChunkSteps)) {
