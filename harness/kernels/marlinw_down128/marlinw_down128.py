@@ -90,11 +90,61 @@ if TMA_ENABLED or ATTN_TMA_ENABLED:
             _tma_set_shfl_epi.restype = None
             _cur_shfl_epi = 1 if TMA_SHFL_EPI else 0
             _tma_set_shfl_epi(_cur_shfl_epi)
+        _tma_set_next_dead = getattr(_tma_library, "marlinw_down128_set_next_dead", None)
+        if _tma_set_next_dead is not None:
+            _tma_set_next_dead.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            _tma_set_next_dead.restype = None
         _tma_set_pdl = getattr(_tma_library, "marlinw_tma_set_pdl", None)
         if _tma_set_pdl is not None:
             _tma_set_pdl.argtypes = [ctypes.c_int]
             _tma_set_pdl.restype = ctypes.c_int
 
+
+_L2_DISCARD_V2 = os.environ.get("MUSE_PREFILL_L2_DISCARD_V2", "1") != "0"
+_dead_mlp_in = None
+
+def stash_dead_mlp_in(t) -> None:
+    global _dead_mlp_in
+    if _L2_DISCARD_V2:
+        _dead_mlp_in = t
+    else:
+        _dead_mlp_in = None
+
+def _clear_dead_mlp_in() -> None:
+    global _dead_mlp_in
+    _dead_mlp_in = None
+    fn = globals().get("_tma_set_next_dead")
+    if fn is not None:
+        fn(0, 0)
+
+def consume_dead_mlp_in(live_tensors):
+    global _dead_mlp_in
+    t = _dead_mlp_in
+    _dead_mlp_in = None
+    fn = globals().get("_tma_set_next_dead")
+    if fn is None:
+        return None
+    if (
+        not _L2_DISCARD_V2
+        or t is None
+        or not t.is_cuda
+        or not t.is_contiguous()
+    ):
+        fn(0, 0)
+        return None
+    dp = t.data_ptr()
+    db = t.numel() * t.element_size()
+    de = dp + db
+    for lt in live_tensors:
+        if lt is None:
+            continue
+        lp = lt.data_ptr()
+        le = lp + lt.numel() * lt.element_size()
+        if not (de <= lp or le <= dp):
+            fn(0, 0)
+            return None
+    fn(dp, db)
+    return t
 
 def set_tma_pdl(mode: int) -> int | None:
     fn = globals().get("_tma_set_pdl")
@@ -333,24 +383,27 @@ def tma_work_lists(shared_bytes: int, sizes=PIECES):
 def tma_work_lists_dual_qkv_gate(shared_bytes: int):
     """Work list for the fused 4-stage TMA gate (4096x6656) + qkv (4608x6656) kernel.
 
-    272 whole column-major CTAs (128 gate cols 0..31 first, 144 qkv cols 0..35 last):
-    - Every 4 consecutive CTAs share one weight column across all 4 row-pairs (4x L2 weight reuse alongside
-      6.82 MiB evict_last A << 24 MiB L2).
-    - Zero split-K handover scratch or flag barriers (only 48 scratch slots for gate pair=3 K-cuts).
-    - Wave 6 runs 32 zero-cut qkv CTAs, leaving 16 free SMs for Dual PDL overlap with qk_norm_rope while
-      keeping qkv hot in L2 right when qk_norm_rope launches.
+    MARLIN_DUAL_KPIECE=1 (default): 240 whole tiles (128 gate + 112 qkv) + 32 zero-cut qkv tiles split
+    into 3 balanced K-pieces (16x (40,32,32) + 16x (32,40,32) = 96 pieces, 336 = 7x48 CTAs):
+    - Cuts theoretical makespan from 624 -> 592 K-tiles (-5.13%, 99.55% of 28288/48 = 589.33 lower bound),
+      zero spin-wait (each predecessor finishes 64..72 K-tiles before its successor launches), 100% 0-ULP
+      bit-exact HMMA-for-HMMA chains, 4-row-pair L2 weight sharing intact, 112 qkv tiles last for L2-hot
+      qk_norm_rope, and 16 SMs finish 8 K-tiles early (584 vs 592) for Dual PDL overlap.
+    MARLIN_DUAL_KPIECE=0: legacy 272 whole column-major CTAs (128 gate + 144 qkv).
     """
     k_tiles = 6656 // 64
     cut_q = _shape_cuts(4608, 6656, shared_bytes)
     if any(c != (-1, -1) for c in cut_q.values()):
         raise ValueError("unexpected K-cut in qkv (4608x6656) shape")
     cut_g = _shape_cuts(4096, 6656, shared_bytes)
-    slots = 0
+    use_kpiece = os.environ.get("MARLIN_DUAL_KPIECE", "1") != "0"
+    split_n = 32 if use_kpiece else 0
+    slots = split_n  # 0..31 reserved for 32 split qkv handover states when use_kpiece=True
     slot_of: dict[tuple[int, int], int] = {}
 
-    def qkv_block(tile):
+    def qkv_block(tile, k0=0, count=k_tiles, role=0, index=0):
         col, pair = tile
-        return [(128 * pair, col, 8, 0), (-1, -1, k_tiles, 0)]
+        return [(128 * pair, col, 8, 0), (-1, -1, count, k0 | (role << 10) | (index << 12))]
 
     def gate_block(tile):
         nonlocal slots
@@ -370,12 +423,34 @@ def tma_work_lists_dual_qkv_gate(shared_bytes: int):
         # Bit 30 selects gate (4096) in down_dual.
         return [(128 * pair, col, w0_z, slot), (ca, cb, k_tiles, 1 << 30)]
 
-    blocks = (
+    if not use_kpiece:
+        blocks = (
+            [gate_block((col, pair)) for col in range(32) for pair in range(4)]
+            + [qkv_block((col, pair)) for col in range(36) for pair in range(4)]
+        )
+        assert len(blocks) == 272
+        work = [row for both in blocks for row in both] + [(0, 0, 0, 0)]
+        return work, len(blocks), max(slots, 1)
+
+    whole = (
         [gate_block((col, pair)) for col in range(32) for pair in range(4)]
-        + [qkv_block((col, pair)) for col in range(36) for pair in range(4)]
+        + [qkv_block((col, pair)) for col in range(28) for pair in range(4)]
     )
-    assert len(blocks) == 272
-    work = [row for both in blocks for row in both]
+    assert len(whole) == 240
+    s0_tiles = [(col, pair) for col in range(28, 32) for pair in range(4)]  # 16 tiles: (40, 32, 32)
+    s1_tiles = [(col, pair) for col in range(32, 36) for pair in range(4)]  # 16 tiles: (32, 40, 32)
+    s0_p = lambda p, k0, cnt: [qkv_block(t, k0, cnt, p, i) for i, t in enumerate(s0_tiles)]
+    s1_p = lambda p, k0, cnt: [qkv_block(t, k0, cnt, p, 16 + i) for i, t in enumerate(s1_tiles)]
+    blocks = (
+        s0_p(1, 0, 40) + whole[0:32]
+        + s1_p(1, 0, 32) + whole[32:48]
+        + s0_p(2, 40, 32) + whole[48:64]
+        + s1_p(2, 32, 40) + whole[64:96]
+        + s0_p(3, 72, 32) + s1_p(3, 72, 32)
+        + whole[96:240]
+    )
+    assert len(blocks) == 336
+    work = [row for both in blocks for row in both] + [(0, 0, 0, 0)] * ((split_n + 3) // 4)
     return work, len(blocks), max(slots, 1)
 
 
@@ -489,6 +564,7 @@ def prepare(device: torch.device) -> Prepared:
 
 
 def gemm(x, weight, scales, global_scale, p: Prepared, tma: bool = False):
+    is_down = (p.n, p.k) == (COLUMNS, INNER)
     if (
         x.shape != (ROWS, p.k)
         or x.dtype != torch.bfloat16
@@ -497,16 +573,26 @@ def gemm(x, weight, scales, global_scale, p: Prepared, tma: bool = False):
         or x.stride(0) % 8
         or x.data_ptr() % 16
     ):
+        if is_down:
+            _clear_dead_mlp_in()
         return None
     if tma and p.tma_work is None:
+        if is_down:
+            _clear_dead_mlp_in()
         return None
     out = x.new_empty((ROWS, p.n))
     scratch = _get_scratch(x.device, p.tma_slots if tma else p.slots)
+    dead_t = None
+    if is_down:
+        if tma:
+            dead_t = consume_dead_mlp_in((x, weight, scales, global_scale, out, scratch, p.tma_work))
+        else:
+            _clear_dead_mlp_in()
     stream = torch.cuda.current_stream(x.device).cuda_stream
     with torch.cuda.device(x.device):
         if tma:
             global _cur_shfl_epi
-            if (p.n, p.k) == (COLUMNS, INNER):
+            if is_down:
                 want_shfl = 1 if TMA_SHFL_EPI else 0
                 if _tma_set_shfl_epi is not None and _cur_shfl_epi != want_shfl:
                     _tma_set_shfl_epi(want_shfl)
@@ -524,7 +610,7 @@ def gemm(x, weight, scales, global_scale, p: Prepared, tma: bool = False):
                     x.data_ptr(), weight.data_ptr(), out.data_ptr(), scratch.data_ptr(),
                     scales.data_ptr(), global_scale.data_ptr(), p.tma_work.data_ptr(), p.tma_grid,
                     p.n, p.k, x.stride(0), stream)
-        elif (p.n, p.k) == (COLUMNS, INNER):
+        elif is_down:
             status = _main(
                 x.data_ptr(), weight.data_ptr(), out.data_ptr(), scratch.data_ptr(),
                 scales.data_ptr(), global_scale.data_ptr(), p.work.data_ptr(), p.grid,
@@ -534,6 +620,7 @@ def gemm(x, weight, scales, global_scale, p: Prepared, tma: bool = False):
                 x.data_ptr(), weight.data_ptr(), out.data_ptr(), scratch.data_ptr(),
                 scales.data_ptr(), global_scale.data_ptr(), p.work.data_ptr(), p.grid,
                 p.n, p.k, x.stride(0), stream)
+    del dead_t
     if status:
         raise RuntimeError(f"MarlinW 128x128 ({p.n}x{p.k}) launch returned CUDA error {status}")
     return out

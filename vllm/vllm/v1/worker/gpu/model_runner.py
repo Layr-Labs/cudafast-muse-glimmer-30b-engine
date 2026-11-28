@@ -2569,11 +2569,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         pref_len = int(self.req_states.prefill_len.np[req_idx])
         num_comp_pref = int(self.req_states.num_computed_prefill_tokens[req_idx])
         _emit_tgt = getattr(self, "_spec_emit_target_len", None)
+        _d1_fix = envs.os.environ.get("MUSE_D1_REM_FIX", "1") != "0"
         if (
             num_comp_pref < pref_len
             or num_comp < pref_len
             or num_comp + 32 > self.max_model_len
-            or (_emit_tgt is not None and num_comp + 7 >= int(_emit_tgt))
+            or (not _d1_fix and _emit_tgt is not None and num_comp + 7 >= int(_emit_tgt))
         ):
             return False
         idx_mapping_np = np.array([req_idx], dtype=np.int32)
@@ -3329,10 +3330,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             _rem_toks = int(_emit_tgt) - int(
                 self.req_states.num_computed_tokens_np[_leaf_req_idx]
             )
-            if _rem_toks <= 1:
-                _target_leaf_m = 7
-            elif _rem_toks <= 6 and _target_leaf_m > 16:
-                _target_leaf_m = 16
+            if envs.os.environ.get("MUSE_D1_REM_FIX", "1") != "0":
+                if _rem_toks <= -5:
+                    _target_leaf_m = 7
+            else:
+                if _rem_toks <= 1:
+                    _target_leaf_m = 7
+                elif _rem_toks <= 6 and _target_leaf_m > 16:
+                    _target_leaf_m = 16
         _leaf_no_logprobs = (
             self.sampler is not None
             and _leaf_req_idx is not None
@@ -4037,10 +4042,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         _adapt_out = getattr(self, "_adapt_verify_pending_out", None)
         self._adapt_verify_pending_out = None
         _emit_tgt_end = getattr(self, "_spec_emit_target_len", None)
+        _final_off = -5 if envs.os.environ.get("MUSE_D1_REM_FIX", "1") != "0" else 1
         _is_final_spec_step = (
             _emit_tgt_end is not None
             and input_batch.num_reqs == 1
-            and int(self.req_states.num_computed_tokens_np[input_batch.idx_mapping_np[0]]) + 1
+            and int(self.req_states.num_computed_tokens_np[input_batch.idx_mapping_np[0]]) + _final_off
             >= int(_emit_tgt_end)
         )
         # Speculative verify steps (num_draft_tokens > 0) are decode steps: no
