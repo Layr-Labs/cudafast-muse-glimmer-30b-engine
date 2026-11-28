@@ -3593,8 +3593,8 @@ static const BgEbKnobs& get_bgeb_knobs_env() {
     v.bg_off = env_i("MUSE_BG_OFF", 1);
     v.chp_bg2 = env_i("MUSE_BG_CHP_BG2", 1);
     v.bg_alpha = env_f("MUSE_BG_ALPHA", 4.0f);
-    v.bg_min_p = env_f("MUSE_BG_MIN_P", 0.10f);
-    v.sub_min_p = env_f("MUSE_BG_SUB_MIN_P", 0.25f);
+    v.bg_min_p = env_f("MUSE_BG_MIN_P", 0.12f);
+    v.sub_min_p = env_f("MUSE_BG_SUB_MIN_P", 0.2f);
     v.tri_min_p = env_f("MUSE_BG_TRI_MIN_P", 0.06f);
     v.f2 = env_f("MUSE_BG_F2", 0.50f);
     v.w2 = env_f("MUSE_BG_W2", 3.00f);
