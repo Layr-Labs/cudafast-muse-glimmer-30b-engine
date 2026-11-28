@@ -15,9 +15,9 @@ static int sandwich_pdl_mode() {
     if (g_sandwich_pdl_override >= 0) return g_sandwich_pdl_override;
     static const int env_mode = []() -> int {
         const char* env = std::getenv("MUSE_SANDWICH_PDL");
-        if (!env || !*env) return 2;  // 0=off, 1=legacy full (h1_pre+wait), 2=producer-only default
+        if (!env || !*env) return 0;  // 0=off (default: early L2 discard + zero WS12 contention), 1=legacy full, 2=producer-only
         long v = std::strtol(env, nullptr, 10);
-        return (v == 0 || v == 1 || v == 2) ? static_cast<int>(v) : 2;
+        return (v == 0 || v == 1 || v == 2) ? static_cast<int>(v) : 0;
     }();
     return env_mode;
 }
@@ -89,6 +89,24 @@ __device__ float reduce(const float (&partial)[4], float* warp_totals, unsigned 
     return sum;
 }
 
+__device__ __forceinline__ float reduce_1bar(const float (&partial)[4], float* warp_totals, unsigned thread) {
+    float sum = __fadd_rn(__fadd_rn(__fadd_rn(partial[0], partial[1]), partial[2]), partial[3]);
+    #pragma unroll
+    for (int delta = 16; delta > 0; delta /= 2) {
+        sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffff, sum, delta));
+    }
+    if ((thread & 31u) == 0u) {
+        warp_totals[thread >> 5] = sum;
+    }
+    __syncthreads();
+    sum = warp_totals[thread & 7u];
+    #pragma unroll
+    for (int delta = 4; delta > 0; delta /= 2) {
+        sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffff, sum, delta, 8));
+    }
+    return __shfl_sync(0xffffffff, sum, 0, 8);
+}
+
 __device__ float apply_norm(float value, float inverse, float weight) {
     return __fmul_rn(__fmul_rn(value, inverse), __fadd_rn(weight, 1.f));
 }
@@ -108,19 +126,12 @@ __device__ unsigned pack_fp8(const float (&values)[4], float scale_inv) {
     float x3 = bounded_fp8(values[3], scale_inv);
     asm("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;" : "=h"(low) : "f"(x0), "f"(x1));
     asm("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;" : "=h"(high) : "f"(x2), "f"(x3));
-    return static_cast<unsigned>(low) | (static_cast<unsigned>(high) << 16);
+    return __byte_perm(static_cast<unsigned>(low), static_cast<unsigned>(high), 0x5410u);
 }
 
 __device__ __forceinline__ uint2 load2_cs(const uint2* address) {
     uint2 r;
     asm("ld.global.cs.v2.u32 {%0, %1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(address));
-    return r;
-}
-
-__device__ __forceinline__ uint4 load4_cs(const uint4* address) {
-    uint4 r;
-    asm("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
-        : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(address));
     return r;
 }
 
@@ -380,8 +391,9 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
     const float* __restrict__ previous_sum, const uint2* __restrict__ post_attn_weight,
     const uint2* __restrict__ post_ff_weight, const uint2* __restrict__ next_pre_attn_weight,
     const float* __restrict__ scale, uint2* __restrict__ hidden, unsigned* __restrict__ quantized,
-    const float* __restrict__ gate_scale = nullptr, unsigned* __restrict__ gate_quantized = nullptr) {
-    __shared__ float warp_totals[8];
+    const float* __restrict__ gate_scale = nullptr, unsigned* __restrict__ gate_quantized = nullptr,
+    const char* __restrict__ dead_ptr = nullptr, size_t dead_lines = 0) {
+    __shared__ float warp_totals[2][8];
     uint2 saved[Tiles];
     const unsigned thread = threadIdx.x;
     const size_t base = static_cast<size_t>(blockIdx.x) * Vectors;
@@ -431,11 +443,18 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
             }
         }
     }
-    const float down_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-8f);
+    const float down_inverse = inverse_rms(reduce_1bar(partial, warp_totals[0], thread), 1.e-8f);
     if constexpr (DiscardDown && PdlMode != 2) {
-        // reduce() already synchronized the CTA; all 104 cache lines (13312 B) of dn_row are now dead.
+        // reduce_1bar() already synchronized the CTA; all 104 cache lines (13312 B) of dn_row are now dead.
         if (thread < 104u) {
             discard_l2_128(reinterpret_cast<const char*>(dn_row) + (thread << 7));
+        }
+        if (dead_ptr) {
+            const size_t gid = static_cast<size_t>(blockIdx.x) * Threads + thread;
+            const size_t gstride = static_cast<size_t>(gridDim.x) * Threads;
+            for (size_t i = gid; i < dead_lines; i += gstride) {
+                discard_l2_128(dead_ptr + (i << 7));
+            }
         }
     }
     float attn_inverse = 0.f;
@@ -486,7 +505,7 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
             saved[tile] = rounded;
         }
     }
-    const float input_inverse = inverse_rms(reduce(partial, warp_totals, thread), 1.e-5f);
+    const float input_inverse = inverse_rms(reduce_1bar(partial, warp_totals[1], thread), 1.e-5f);
     if constexpr (PdlMode == 2) {
         // Producer-only PDL: zero h1_pre reg/preload overhead, launched via standard <<<...>>>,
         // signaling downstream qkv_proj to overlap TMA weight preloads with the final store epilogue.
@@ -538,6 +557,33 @@ __global__ __launch_bounds__(Threads) void sandwich_v4(
         if (thread < 104u) {
             discard_l2_128(reinterpret_cast<const char*>(dn_row) + (thread << 7));
         }
+        if (dead_ptr) {
+            const size_t gid = static_cast<size_t>(blockIdx.x) * Threads + thread;
+            const size_t gstride = static_cast<size_t>(gridDim.x) * Threads;
+            for (size_t i = gid; i < dead_lines; i += gstride) {
+                discard_l2_128(dead_ptr + (i << 7));
+            }
+        }
+    }
+}
+
+static const void* g_next_dead_ptr = nullptr;
+static size_t g_next_dead_bytes = 0;
+
+static inline void consume_next_dead(const char*& dp, size_t& dl) {
+    const void* p = g_next_dead_ptr;
+    const size_t n = g_next_dead_bytes;
+    g_next_dead_ptr = nullptr;
+    g_next_dead_bytes = 0;
+    dp = nullptr;
+    dl = 0;
+    if (!p || n < 128u) return;
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    const uintptr_t s = (a + 127u) & ~uintptr_t(127u);
+    const uintptr_t e = (a + n) & ~uintptr_t(127u);
+    if (e > s) {
+        dp = reinterpret_cast<const char*>(s);
+        dl = static_cast<size_t>((e - s) >> 7);
     }
 }
 
@@ -584,6 +630,28 @@ static inline bool aligned16_row_ptrs(const void* a0, const void* a1, const void
     return true;
 }
 
+static bool sandwich_carveout100_enabled() {
+    static const bool env_on = []() {
+        const char* env = std::getenv("MUSE_PREFILL_GLUE_CARVEOUT100");
+        return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+    }();
+    return env_on;
+}
+
+template <auto Kernel>
+static inline void ensure_sandwich_carveout100() {
+    static bool configured = false;
+    if (!configured) {
+        if (sandwich_carveout100_enabled()) {
+            cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+            cudaThreadExchangeStreamCaptureMode(&mode);
+            (void)cudaFuncSetAttribute(Kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            cudaThreadExchangeStreamCaptureMode(&mode);
+        }
+        configured = true;
+    }
+}
+
 template <bool Quantize, bool Gate, bool WriteHidden, bool GateEvictLast, bool ResidualEvictLast, bool CsLoads>
 static inline cudaError_t dispatch_v4(
     int rows, cudaStream_t stream,
@@ -593,24 +661,54 @@ static inline cudaError_t dispatch_v4(
     const float* a10, unsigned* a11) {
     const int pdl_mode = sandwich_pdl_mode();
     const bool disc = sandwich_discard_enabled() && ((reinterpret_cast<uintptr_t>(a1) & 127u) == 0u);
+    const char* dp = nullptr;
+    size_t dl = 0;
+    consume_next_dead(dp, dl);
     if (pdl_mode == 1) {
-        if (disc) return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, true>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-        return launch_ex_pdl(sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, false>, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+        if (disc) {
+            constexpr auto k = sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, true>;
+            ensure_sandwich_carveout100<k>();
+            return launch_ex_pdl(k, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
+        }
+        constexpr auto k = sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 1, false>;
+        ensure_sandwich_carveout100<k>();
+        return launch_ex_pdl(k, rows, Threads, 0, stream, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
     }
     if (pdl_mode == 2) {
         if constexpr (!ResidualEvictLast && CsLoads) {
             if (sandwich_res_cs_enabled()) {
-                if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-                else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, false, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+                if (disc) {
+                    constexpr auto k = sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, true>;
+                    ensure_sandwich_carveout100<k>();
+                    k<<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
+                } else {
+                    constexpr auto k = sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, false, true>;
+                    ensure_sandwich_carveout100<k>();
+                    k<<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
+                }
                 return cudaGetLastError();
             }
         }
-        if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-        else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, false, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+        if (disc) {
+            constexpr auto k = sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, true, false>;
+            ensure_sandwich_carveout100<k>();
+            k<<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
+        } else {
+            constexpr auto k = sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 2, false, false>;
+            ensure_sandwich_carveout100<k>();
+            k<<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
+        }
         return cudaGetLastError();
     }
-    if (disc) sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, true><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
-    else      sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, false><<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+    if (disc) {
+        constexpr auto k = sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, true>;
+        ensure_sandwich_carveout100<k>();
+        k<<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
+    } else {
+        constexpr auto k = sandwich_v4<Quantize, Gate, WriteHidden, GateEvictLast, ResidualEvictLast, CsLoads, 0, false>;
+        ensure_sandwich_carveout100<k>();
+        k<<<rows, Threads, 0, stream>>>(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, dp, dl);
+    }
     return cudaGetLastError();
 }
 
@@ -664,6 +762,11 @@ extern "C" int muse_sandwich_set_discard(int enable) {
     const int old = sandwich_discard_enabled() ? 1 : 0;
     g_sandwich_discard_override = (enable < 0) ? -1 : (enable != 0 ? 1 : 0);
     return old;
+}
+
+extern "C" void muse_sandwich_set_next_dead(const void* ptr, size_t nbytes) {
+    g_next_dead_ptr = ptr;
+    g_next_dead_bytes = nbytes;
 }
 
 template <bool Shared, bool WriteHidden, bool EvictLast = false, bool CsLoads = false>

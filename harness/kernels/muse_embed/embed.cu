@@ -460,11 +460,44 @@ __global__ void __launch_bounds__(128) single_tree_prep_kernel(
         b_num * static_cast<int64_t>(bs) + static_cast<int64_t>(b_off);
   }
 }
+static void ensure_embed_carveout() {
+  static bool done = false;
+  if (done) return;
+  static const bool en = []() {
+    const char* env = std::getenv("MUSE_NORM_GLUE_CARVEOUT100");
+    return !env || !*env || std::strtol(env, nullptr, 10) != 0;
+  }();
+  if (en) {
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    cudaThreadExchangeStreamCaptureMode(&mode);
+    auto set100 = [](auto fn) {
+      (void)cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    };
+    set100(embed_norm_m1<long long, true>);
+    set100(embed_norm_m1<int, true>);
+    set100(embed_norm_m1<long long, false>);
+    set100(embed_norm_m1<int, false>);
+    set100(embed_norm_m<long long, true>);
+    set100(embed_norm_m<int, true>);
+    set100(embed_norm_m<long long, false>);
+    set100(embed_norm_m<int, false>);
+    set100(post_update_m1_kernel<true>);
+    set100(post_update_m1_kernel<false>);
+    set100(single_decode_prep_kernel<true>);
+    set100(single_decode_prep_kernel<false>);
+    set100(single_tree_prep_kernel<true>);
+    set100(single_tree_prep_kernel<false>);
+    cudaThreadExchangeStreamCaptureMode(&mode);
+  }
+  done = true;
+}
+
 }  // namespace
 
 extern "C" int muse_embed_norm_m1(const void* ids, int ids_64, const void* table, float eps,
                                   void* out, int width, cudaStream_t stream) {
   if (width <= 0 || (width & 7) != 0 || width > 8192) return cudaErrorInvalidValue;
+  ensure_embed_carveout();
   const bool use_pdl = decode_tail_pdl_enabled();
   if (use_pdl) {
     if (ids_64)
@@ -492,6 +525,7 @@ extern "C" int muse_embed_norm_m(const void* ids, int ids_64, const void* table,
                                  void* out, int rows, int width, cudaStream_t stream) {
   if (rows <= 0 || rows > 4096 || width <= 0 || (width & 7) != 0 || width > 8192)
     return cudaErrorInvalidValue;
+  ensure_embed_carveout();
   const bool use_pdl = (rows <= 32) && decode_tail_pdl_enabled();
   if (use_pdl) {
     if (ids_64)
@@ -582,6 +616,7 @@ extern "C" int muse_single_tree_prep(
       seq_lens_len < 1 || qsl_len < 2) {
     return cudaErrorInvalidValue;
   }
+  ensure_embed_carveout();
   if (decode_tail_pdl_enabled()) {
     return static_cast<int>(launch_pdl(
         single_tree_prep_kernel<true>, num_groups, 128, stream,
