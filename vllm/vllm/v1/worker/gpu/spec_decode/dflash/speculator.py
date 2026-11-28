@@ -983,7 +983,7 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> tuple[torch.cuda.CUDAGraph, torch.cuda.CUDAGraph, torch.cuda.CUDAGraph] | None:
         """Return (ctx_proj_cg, ctx_kv_post_cg, query_full_cg) so fc+fkv run in parallel with post_prep."""
         if (
-            os.environ.get("MUSE_COMPOUND_DIAMOND_FC", "0") in ("0", "", "false", "no")
+            os.environ.get("MUSE_COMPOUND_DIAMOND_FC", "1") in ("0", "", "false", "no")
             or self.query_cudagraph_manager is None
             or not self.query_cudagraph_manager._graphs_captured
             or not aux_hidden_states
