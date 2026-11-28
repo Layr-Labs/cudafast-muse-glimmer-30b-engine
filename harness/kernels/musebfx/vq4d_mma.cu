@@ -2236,10 +2236,17 @@ static void vq4d_ensure_carveout() {
   static bool init = false;
   if (!init) {
     init = true;
+    cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+    cudaThreadExchangeStreamCaptureMode(&mode);
     vq4d_set_carveout_one<9, false>();
     vq4d_set_carveout_one<9, true>();
     vq4d_set_carveout_one<10, false>();
     vq4d_set_carveout_one<10, true>();
+    const char* s = std::getenv("MUSE_DRAFTER_CARVEOUT100");
+    if (!s || !*s || std::atoi(s) != 0) {
+      cudaFuncSetAttribute(vq4d_rot_a_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    }
+    cudaThreadExchangeStreamCaptureMode(&mode);
   }
 }
 
