@@ -78,6 +78,12 @@ using T = MarlinScalarType<kBF>;
 using FragA = T::FragA;
 using FragB = T::FragB;
 
+__device__ __forceinline__ uint32_t cvt2_bf16(float lo, float hi) {
+  uint32_t packed;
+  asm("cvt.rn.bf16x2.f32 %0, %2, %1;" : "=r"(packed) : "f"(lo), "f"(hi));
+  return packed;
+}
+
 __device__ __forceinline__ void mma16(const FragA& a, const FragB& b, float* c) {
   const uint32_t* ap = reinterpret_cast<const uint32_t*>(&a);
   const uint32_t* bp = reinterpret_cast<const uint32_t*>(&b);
@@ -232,8 +238,10 @@ __device__ __forceinline__ void k_loop(
   };
   auto dequant_to = [&](const int o) {
     const int idx = kSingleBb ? 0 : o;
-    nv_bfloat162 sc[2];
-    dequant_fp8_scales<nv_bfloat162, vllm::kFE4M3fn.id()>(fsq[idx], sc);
+    const uint32_t scales = static_cast<uint32_t>(fsq[idx]);
+    const uint32_t scale_lo = (scales << 4) & 0xf0f0f0f0u;
+    const uint32_t scale_hi =
+        ((scales >> 1) & 0x40404040u) | ((scales >> 4) & 0x07070707u);
 #pragma unroll
     for (int jj = 0; jj < 2; jj++) {
       FragB& b0 = bb[idx][jj][0];
@@ -249,9 +257,10 @@ __device__ __forceinline__ void k_loop(
         reinterpret_cast<unsigned*>(&b0)[1] = ((u & 0x00f000f0u) * 260u) & 0x81c081c0u;
         reinterpret_cast<unsigned*>(&b0)[0] = ((u & 0x000f000fu) * 4160u) & 0x81c081c0u;
       }
-      const nv_bfloat162 s = sc[jj];
-      const nv_bfloat162 s0 = __bfloat162bfloat162(reinterpret_cast<const nv_bfloat16*>(&s)[0]);
-      const nv_bfloat162 s1 = __bfloat162bfloat162(reinterpret_cast<const nv_bfloat16*>(&s)[1]);
+      const uint32_t s0_bits = __byte_perm(scale_lo, scale_hi, jj == 0 ? 0x4040 : 0x5151);
+      const uint32_t s1_bits = __byte_perm(scale_lo, scale_hi, jj == 0 ? 0x6262 : 0x7373);
+      const nv_bfloat162 s0 = *reinterpret_cast<const nv_bfloat162*>(&s0_bits);
+      const nv_bfloat162 s1 = *reinterpret_cast<const nv_bfloat162*>(&s1_bits);
       b0[0] = __hmul2(b0[0], s0);
       b0[1] = __hmul2(b0[1], s0);
       b1[0] = __hmul2(b1[0], s1);
@@ -729,14 +738,10 @@ __device__ __forceinline__ void down_tile(
 #pragma unroll
           for (int jj = 0; jj < 2; jj++) {
             const float* c = &acc[kBase + ii][jj][0][0];
-            const nv_bfloat162 lo0 = __halves2bfloat162(__float2bfloat16(c[0] * gs), __float2bfloat16(c[1] * gs));
-            const nv_bfloat162 hi0 = __halves2bfloat162(__float2bfloat16(c[2] * gs), __float2bfloat16(c[3] * gs));
-            const nv_bfloat162 lo1 = __halves2bfloat162(__float2bfloat16(c[4] * gs), __float2bfloat16(c[5] * gs));
-            const nv_bfloat162 hi1 = __halves2bfloat162(__float2bfloat16(c[6] * gs), __float2bfloat16(c[7] * gs));
-            const uint32_t v0 = *reinterpret_cast<const uint32_t*>(&lo0);
-            const uint32_t v1 = *reinterpret_cast<const uint32_t*>(&hi0);
-            const uint32_t v2 = *reinterpret_cast<const uint32_t*>(&lo1);
-            const uint32_t v3 = *reinterpret_cast<const uint32_t*>(&hi1);
+            const uint32_t v0 = cvt2_bf16(c[0] * gs, c[1] * gs);
+            const uint32_t v1 = cvt2_bf16(c[2] * gs, c[3] * gs);
+            const uint32_t v2 = cvt2_bf16(c[4] * gs, c[5] * gs);
+            const uint32_t v3 = cvt2_bf16(c[6] * gs, c[7] * gs);
             const uint32_t r1 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 1), 1);
             const uint32_t r2 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 2), 2);
             const uint32_t r3 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 3), 3);
@@ -846,14 +851,10 @@ __device__ __forceinline__ void down_tile(
 #pragma unroll
           for (int jj = 0; jj < 2; jj++) {
             const float* c = &acc[i][jj][0][0];
-            const nv_bfloat162 lo0 = __halves2bfloat162(__float2bfloat16(c[0] * gs), __float2bfloat16(c[1] * gs));
-            const nv_bfloat162 hi0 = __halves2bfloat162(__float2bfloat16(c[2] * gs), __float2bfloat16(c[3] * gs));
-            const nv_bfloat162 lo1 = __halves2bfloat162(__float2bfloat16(c[4] * gs), __float2bfloat16(c[5] * gs));
-            const nv_bfloat162 hi1 = __halves2bfloat162(__float2bfloat16(c[6] * gs), __float2bfloat16(c[7] * gs));
-            const uint32_t v0 = *reinterpret_cast<const uint32_t*>(&lo0);
-            const uint32_t v1 = *reinterpret_cast<const uint32_t*>(&hi0);
-            const uint32_t v2 = *reinterpret_cast<const uint32_t*>(&lo1);
-            const uint32_t v3 = *reinterpret_cast<const uint32_t*>(&hi1);
+            const uint32_t v0 = cvt2_bf16(c[0] * gs, c[1] * gs);
+            const uint32_t v1 = cvt2_bf16(c[2] * gs, c[3] * gs);
+            const uint32_t v2 = cvt2_bf16(c[4] * gs, c[5] * gs);
+            const uint32_t v3 = cvt2_bf16(c[6] * gs, c[7] * gs);
             const uint32_t r1 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 1), 1);
             const uint32_t r2 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 2), 2);
             const uint32_t r3 = __shfl_xor_sync(0xffffffffu, sel4_u32(v0, v1, v2, v3, q ^ 3), 3);
@@ -1461,10 +1462,9 @@ __global__ void __launch_bounds__(kThreads, 1) gateup_ilv(
       const __nv_bfloat16 bu0 = __float2bfloat16_rn(u0 * gs);
       const __nv_bfloat16 bg1 = __float2bfloat16_rn(g1 * gs);
       const __nv_bfloat16 bu1 = __float2bfloat16_rn(u1 * gs);
-      const __nv_bfloat16 p0 = __float2bfloat16_rn(__fmul_rn(eval_silu(bg0), __bfloat162float(bu0)));
-      const __nv_bfloat16 p1 = __float2bfloat16_rn(__fmul_rn(eval_silu(bg1), __bfloat162float(bu1)));
-      const __nv_bfloat162 r = __halves2bfloat162(p0, p1);
-      return *reinterpret_cast<const uint32_t*>(&r);
+      const float p0 = __fmul_rn(eval_silu(bg0), __bfloat162float(bu0));
+      const float p1 = __fmul_rn(eval_silu(bg1), __bfloat162float(bu1));
+      return cvt2_bf16(p0, p1);
     };
 #pragma unroll
     for (int i = 0; i < kMBlocks; i++) {
